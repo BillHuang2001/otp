@@ -767,6 +767,18 @@ pub struct TcpInetDriver {
     /// Whether the current command's caller-tag prefix has already been stripped from the output
     /// queue (see [`TcpInetDriver::caller_ref`]).
     caller_stripped: bool,
+    /// Whether the current command's **write-side framing** has already been decided — the
+    /// `{packet, 1|2|4}` length header is on the output queue in front of the payload (or the
+    /// command's `{packet, …}` code writes no header at all).
+    ///
+    /// The C decides this once per command, inside `tcp_sendv`/`tcp_send`
+    /// (`inet_drv.c:13744`-`:13769`, `:13861`-`:13885`), from the `desc->inet.htype` in force at
+    /// issue time. It must not be decided again for the retained remainder of a short write: a
+    /// second header would announce the remainder's length and the peer would read a corrupted
+    /// stream. Like [`TcpInetDriver::caller_stripped`] it is set on the **first** examination of a
+    /// command and cleared where that flag is — when the output queue drains
+    /// ([`TcpInetDriver::write_pending`]) — so the two per-command latches cannot drift.
+    out_framed: bool,
     /// Whether read readiness may move bytes out of the kernel on the **reactor's** behalf — the
     /// C's `FD_READ` **selection** state.
     ///
@@ -821,6 +833,7 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            out_framed: false,
             read_armed: true,
         }
     }
@@ -874,6 +887,7 @@ impl TcpInetDriver {
             async_ops: AsyncQueue::new(),
             caller_ref: None,
             caller_stripped: false,
+            out_framed: false,
             // A freshly adopted socket starts with its read side selected (see the field's note).
             read_armed: true,
         })
@@ -1495,10 +1509,14 @@ impl TcpInetDriver {
         }
 
         if ctx.output().is_empty() {
-            // The command is fully written, so the next one must be examined for a caller tag
-            // afresh. `caller_ref` is deliberately **not** cleared here: the reply it produces is
-            // staged by the caller ([`TcpInetDriver::settle_command`]).
+            // The command is fully written, so the next one must be examined afresh — for a caller
+            // tag *and* for its write-side framing. The two latches are cleared together, at the
+            // one point that knows the command is over, so neither can outlive it (a framing header
+            // kept past the drain would be prepended to an unrelated command's bytes).
+            // `caller_ref` is deliberately **not** cleared here: the reply it produces is staged by
+            // the caller ([`TcpInetDriver::settle_command`]).
             self.caller_stripped = false;
+            self.out_framed = false;
             if let Some(how) = self.pending_shutdown.take() {
                 shutdown_socket(fd, how)?;
                 if how == TCP_SHUT_WR || how == TCP_SHUT_RDWR {
@@ -1781,10 +1799,12 @@ impl TcpInetDriver {
     /// `{inet_reply, …}` rides [`DriverContext::deliver_completion`], which is how the
     /// `erlang:port_command/2` path ([`TcpInetDriver::write_command`]) answers its caller.
     ///
-    /// Note also that the `{packet, 1|2|4}` framing described above is applied by **this verb**
-    /// only: [`TcpInetDriver::output`]/[`TcpInetDriver::ready_output`] (the
-    /// `erlang:port_command/2` path) go to [`TcpInetDriver::write_command`], whose write of the
-    /// queued bytes is unframed.
+    /// Note that `{packet, 1|2|4}` framing is **not** particular to this verb:
+    /// [`TcpInetDriver::output`]/[`TcpInetDriver::ready_output`] (the `erlang:port_command/2`
+    /// path) reach [`TcpInetDriver::write_command`], which frames the queued payload with the very
+    /// same [`frame::write_header`] — the C frames on both routes (`tcp_send` and `tcp_sendv`).
+    /// What differs is only the **length** the header announces: the payload left after the
+    /// caller-tag strip, so the tag bytes are never counted in the frame.
     ///
     /// A `shutdown(SHUT_WR|SHUT_RDWR)` **deferred** because output was still queued
     /// ([`TcpInetDriver::pending_shutdown`]) rejects a further `send`, exactly as the C does:
@@ -1828,15 +1848,19 @@ impl TcpInetDriver {
         }
         // `{packet, 1|2|4}` frames the payload with a length header before the bytes reach the
         // queue; every other code (raw, line, ASN.1/…, the HTTP family) takes the C's `default:`
-        // arm and writes no header at all.
+        // arm and writes no header at all. This is the **same** framing the
+        // `erlang:port_command/2` route applies ([`TcpInetDriver::write_command`]): the C frames in
+        // `tcp_send` (`inet_drv.c:13861`-`:13885`) and in `tcp_sendv` (`:13744`-`:13769`) alike.
         //
         // This named verb carries **no** caller tag, so the command it queues must never be
         // examined for one: without this, a partially-written named send's remainder could later
         // be read as a `prim_inet` prefix by `ready_output` and stripped from the middle of the
         // data stream. `write_pending` clears the flag again once the queue drains, so the next
         // command (the `erlang:port_command/2` one, [`TcpInetDriver::write_command`]) is examined
-        // afresh.
+        // afresh. The framing latch is set with it for the same reason: this header is already on
+        // the queue, so a re-driven remainder must never be framed a second time.
         self.caller_stripped = true;
+        self.out_framed = true;
         self.caller_ref = None;
         let mut header_len = 0;
         if let Some(header) = frame::write_header(&self.options, arg.len()) {
@@ -2510,7 +2534,13 @@ mod stat_tests;
 mod tcp_shutdown_tests;
 #[cfg(test)]
 mod tests;
-
+// The **write-side** framing pin: the `{packet, 1|2|4}` length header the C prepends in
+// `tcp_sendv`/`tcp_send` (`inet_drv.c:13744`-`:13769`, `:13861`-`:13885`) on the
+// `erlang:port_command/2` route every `gen_tcp:send/2` takes — byte-compared against the far end of
+// a real loopback connection and against the `erl` oracle.
+#[cfg(test)]
+#[path = "write_frame_tests.rs"]
+mod write_frame_tests;
 /// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
 /// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
 /// halves state the format in one place.
