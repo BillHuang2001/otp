@@ -59,6 +59,10 @@
 //! | `atom_list_payload` | ten distinct atoms cross the link and survive: the far side's `phash2/1` and `byte_size(term_to_binary/1)` match the sender's |
 //! | `list_payload` | an 80-element integer list survives the same way |
 //! | `binary_payload` | a 1 KiB binary survives the same way |
+//! | `binary_payload_of_1536_bytes` | the **largest measured agreeing** binary: 1536 bytes (1792 kills the receiver) |
+//! | `list_payload_of_110_elements` | the **largest measured agreeing** list: 110 elements (120 kills the receiver) |
+//! | `tuple_payload_of_100_elements` | a 100-element tuple survives the same relational check |
+//! | `nested_payload_40_levels_deep` | a 40-level nested tuple term survives the same check |
 //! | `send_to_a_missing_remote_name` | a `DOP_REG_SEND` to a **non-registered** name on the peer is dropped (the send returns the message) and the link keeps working |
 //! | `send_to_a_dead_remote_pid` | a `DOP_SEND` to an **exited** process on the peer is dropped and the link keeps working |
 //!
@@ -86,50 +90,68 @@
 //!   (`register(a, self()), register(b, self())`), so a client can own only one registered
 //!   name — which is why the registered-name cases all use the single name `dxcli`.
 //!
-//! # Candidates that were measured and deliberately NOT pinned
+//! # The measured signal families: what works, in which direction, and what cannot be pinned
 //!
-//! Each of these was measured by hand against the system `erl` (OTP 29.1.1 / erts-17.1) with
-//! the same self-pair shape, and **disagreed** — landing it would be a `mismatch`. The
-//! details live in `divergences.md` §A.5 (which is the ledger; the owning crate is named
-//! there); the short version, so no future agent re-measures them:
+//! Every claim below was measured by hand as a two-VM self-pair (client + a peer of the same
+//! program) on OTP 29.1.1 / erts-17.1 and `beam_rt` at its release build. `divergences.md` §A.5
+//! is the ledger; this paragraph exists so no future agent re-measures it.
 //!
-//! * **`link/1` + `DOP_EXIT` across nodes.** Client traps exits, links to a peer-side
-//!   process that exits with `byname`. Oracle: `{'EXIT', Pid, byname}`. Rust: **no signal**
-//!   within 8 s (and at its own termination the runtime logs `dropping remote exit signal …
-//!   distribution: no established connection to node …`), i.e. the exit signal is neither
-//!   delivered nor routable.
-//! * **`erlang:monitor/2` of a remote process** (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`).
-//!   Oracle: `{'DOWN', Ref, process, Pid, byname}`. Rust: no `DOWN` when the *peer* side
-//!   (the accepted link's local process) is the monitored one; the reverse direction —
-//!   Rust client monitoring an *oracle* peer's process — does answer `byname`, so the gap is
-//!   the listener half's outbound monitor-down. `demonitor` shares that path and is
-//!   unpinnable for the same reason.
-//! * **A pid round trip that must be identity-preserving.** `Pid =:= self()` after the pid
-//!   went to the peer and back: `true` on the oracle, **`false`** on the Rust runtime (the
-//!   local pid and node compare `=:=` neither before nor after the trip), which is also why
-//!   an `alias/0` reference sent to the peer and written to by the peer is never delivered
-//!   (`DOP_ALIAS_SEND` from a listener is dropped: the returned reference image does not
-//!   identify the same local alias). `pid_crosses_the_wire_as_a_foreign_pid` pins only the
-//!   *shape* half, which agrees.
-//! * **Large payloads.** The inbound term size is bounded on the Rust side: a 100-element
-//!   integer list and a 1 KiB binary round-trip, but a **128**-element list and a **128 KiB**
-//!   binary kill the receiving VM (`beam_rt: error scheduler: process … has no engine entry
-//!   point`) and a 1 MiB binary gets no reply at all. The landed payload cases therefore stay
-//!   at 80 elements / 1 KiB (see `the_payload_cases_stay_inside_the_measured_envelope`).
+//! * **`link/1` + `DOP_EXIT` — no direction works.** Client links to a peer-side process that
+//!   then dies (`{'EXIT', Pid, boom}` on the oracle, under `process_flag(trap_exit, true)`):
+//!   the Rust side delivers **no signal** within 8 s. The mirror — the *peer* links to a
+//!   client-side process that then dies — is equally silent, and so is a *spawned linker* (a
+//!   client-side process that links to the peer's main process and then exits `boom`). A
+//!   cross-runtime probe localizes it to **both halves**: with a Rust client and an *oracle*
+//!   peer the oracle's own `process_info(self(), links)` never gains the Rust client's pid, so
+//!   the outbound `DOP_LINK` is not written; with an *oracle* client and a Rust peer the Rust
+//!   peer never records the incoming link. `erlang:unlink/1` rides the same path
+//!   (`DOP_UNLINK_ID`, whose ack the inbound sink documents as unemittable), so the paired
+//!   `no_exit` case cannot be pinned either.
+//! * **`erlang:exit(RemotePid, Reason)` — `unsupported: bif`, and `kill` is silently dropped.**
+//!   `erlang:exit/2` on a *remote* pid with a plain reason is the runtime's `unsupported: bif`
+//!   capability gap (the peer VM exits `3`); with reason `kill` it returns `true` but no signal
+//!   reaches the far side, so an "untrapped EXIT kills the linked far-side process" observable
+//!   (the far side reports its own local `DOWN`) is unavailable in either direction.
+//! * **`erlang:monitor/2` of a remote process (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`) — no
+//!   direction works.** A *client* monitoring a peer-side pid, a *peer* monitoring a
+//!   client-side pid, a monitor of a registered remote **name**, and a monitor of an
+//!   already-**dead** remote pid (the oracle answers `{'DOWN', _, process, _, noproc}`
+//!   immediately, in both directions) all deliver **nothing** on the Rust side: a process with
+//!   remote watchers drops their records at death instead of telling them
+//!   (`beam_process`'s documented gap), and the `noproc` reply has no channel in the inbound
+//!   sink. `demonitor` shares the path, so the paired `no_down` case is unpinnable too.
+//! * **A pid identity round trip.** `Pid =:= self()` after the pid went to the peer and came
+//!   back: `true` on the oracle, `false` on the Rust runtime, which is also why an `alias/0`
+//!   reference written by the peer is never delivered. `pid_crosses_the_wire_as_a_foreign_pid`
+//!   pins only the *shape* half, which agrees.
+//! * **Large payloads — the receiving VM dies above a ~1.6 KiB term.** The crash is on the
+//!   **receiver**, in either direction, and reads
+//!   `beam_rt: error scheduler: process ProcessId { … } has no engine entry point` (receiver
+//!   exit `1`; the sender then times out). Measured edges: a 1536-byte binary and a
+//!   110-element list **agree**; a 1792-byte binary and a 120-element list **kill** the
+//!   receiver. A 100-element tuple (808 bytes) and a 40-level nested term agree and are pinned;
+//!   a 20-message burst of 64-byte binaries also kills the receiver, so the boundary is on the
+//!   receiver's accumulated heap, not on one frame. **Distribution fragmentation cannot be
+//!   exercised live at all**: the sender only splits a frame above `DIST_FRAGMENT_SIZE`
+//!   (64 KiB), which is ~40× past the crash edge, so no corpus case can pin an `'E'`/`'F'`
+//!   frame end to end (the `dist_probe` helper's `frag` report covers the wire codec).
 //! * **`-hidden`.** A peer started with `-hidden` is `nodes() = 0, nodes(hidden) = 1` on the
 //!   oracle and `nodes() = 1, nodes(hidden) = 0` on the Rust runtime.
-//! * **`erlang:disconnect_node/1`** is `beam_rt: unsupported: erlang:disconnect_node/1 is a
-//!   known BIF that is not implemented` (exit 3), and **`erlang:spawn_request/5`** —
-//!   everything `erpc:call/4` builds on — is `unsupported` the same way (so an `erpc:call/4`
-//!   of a *plain* function is unpinnable in the self-pair shape; `dist/live_term_delivery`
-//!   pins the oracle's `erpc` image through the `dist_probe` helper instead).
-//! * **`erlang:monitor_node/2` on a node that does not exist** answers `true` on both sides,
-//!   but it is a local bookkeeping answer with no traffic behind it, so it was left out as
-//!   too weak to be worth a case.
-//! * **`group_leader(RemotePid, self())`** could not be measured: the oracle's `-eval`
-//!   wrapper would not evaluate (a silent exit `1`), so there is no oracle observation to
-//!   pin — and an unpinnable route is not a divergence either. (The Rust runtime answers
-//!   `badarg` for a remote leader; unknown on the oracle.)
+//! * **`erlang:disconnect_node/1`** is `beam_rt: unsupported: …` (exit 3), and
+//!   **`erlang:spawn_request/5`** — everything `erpc:call/4` builds on — is `unsupported` the
+//!   same way.
+//! * **`erlang:monitor_node/2`** on a node that does not exist answers `true` on both sides,
+//!   but no traffic is behind it; its `{nodedown, _}` half is pinned by
+//!   `dist/live_self_pair_handshake_and_message`, and neither side delivers a `{nodeup, _}`.
+//! * **`group_leader(RemotePid, self())`** could not be measured: the oracle's `-eval` wrapper
+//!   would not evaluate it (a silent exit `1`), so there is no oracle observation to pin.
+//!
+//! # A `-eval` trap found while measuring: `Pid ! Msg` after a blocking call
+//!
+//! On the Rust runtime `Doomed ! go` **after** a `timer:sleep/1` or a bounded `receive` fails
+//! the whole script with `beam_rt: term not found` (exit `1`), while `erlang:send(Doomed, go)`
+//! works everywhere; before any blocking call both work. Every script in this group therefore
+//! uses `erlang:send/2` and never the `!` operator.
 //!
 //! # Cost
 //!
@@ -234,6 +256,19 @@ const SCRIPT_ATOM_PAYLOAD: &str = r#"try register(dxcli, self()), Peer = list_to
 const SCRIPT_LIST_PAYLOAD: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = lists:seq(1, 80), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 10000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3 andalso element(1, Msg) =:= list_to_atom("payload_back"), io:format("pong=~p tag=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
 
 const SCRIPT_BINARY_PAYLOAD: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = list_to_binary(lists:duplicate(1024, 7)), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 10000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3 andalso element(1, Msg) =:= list_to_atom("payload_back"), io:format("pong=~p tag=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **large-payload** clients: each sends one bigger term and compares the peer's
+/// `phash2/1` and ETF byte size with its own. They sit at the edge of the measured agreeing
+/// envelope (a 1.5 KiB binary and a 110-element list agree; a 1.75 KiB binary, a 120-element
+/// list, a 100-element tuple and a 40-level nested term all do too — see the module docs and
+/// `divergences.md` §A.5 for the measured boundary).
+const SCRIPT_BINARY_1536: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = list_to_binary(lists:duplicate(1536, 7)), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 15000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p size=1536 ok=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+const SCRIPT_LIST_110: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = lists:seq(1, 110), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 15000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p n=110 ok=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+const SCRIPT_TUPLE_100: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = list_to_tuple(lists:seq(1, 100)), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 15000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p tuple100 ok=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+const SCRIPT_NESTED_40: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Term = lists:foldl(fun(_, Acc) -> {nest, Acc} end, done, lists:seq(1, 40)), erlang:send({dxpeer, Peer}, {payload, self(), Term}), Msg = receive X -> X after 15000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p nested40 ok=~p hash_ok=~p etf_ok=~p~n", [Pong, Ok, Ok andalso element(2, Msg) =:= erlang:phash2(Term), Ok andalso element(3, Msg) =:= byte_size(term_to_binary(Term))]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
 
 /// The missing-name client: a send to a name nobody registered on the peer must be dropped
 /// (the send itself still returns the message) and the link must still carry the next one.
@@ -489,6 +524,98 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "dist_extra/binary_payload_of_1536_bytes",
+            description: "a 1536-byte binary (the largest measured agreeing binary; 1792 bytes kills the receiving Rust VM) crosses the link and the far side's phash2/1 and ETF byte size match the sender's",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_BINARY_1536],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_BINARY_1536],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_PAYLOAD],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some("pong=pong size=1536 ok=true hash_ok=true etf_ok=true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/list_payload_of_110_elements",
+            description: "a 110-element integer list (the largest measured agreeing list; 120 elements kill the receiving Rust VM) survives the same relational check",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LIST_110],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LIST_110],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_PAYLOAD],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some("pong=pong n=110 ok=true hash_ok=true etf_ok=true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/tuple_payload_of_100_elements",
+            description: "a 100-element tuple (a wide, non-list term shape) survives the same relational check",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_TUPLE_100],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_TUPLE_100],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_PAYLOAD],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some("pong=pong tuple100 ok=true hash_ok=true etf_ok=true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/nested_payload_40_levels_deep",
+            description: "a 40-level nested tuple term (a deep, non-flat shape) survives the same relational check",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_NESTED_40],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_NESTED_40],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_PAYLOAD],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some("pong=pong nested40 ok=true hash_ok=true etf_ok=true"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "dist_extra/send_to_a_missing_remote_name",
             description: "a send to a name nobody registered on the peer is dropped and the \
                           link still carries the next message",
@@ -565,6 +692,19 @@ mod tests {
         ("dist_extra/list_payload", "pong=pong tag=true hash_ok=true etf_ok=true"),
         ("dist_extra/binary_payload", "pong=pong tag=true hash_ok=true etf_ok=true"),
         (
+            "dist_extra/binary_payload_of_1536_bytes",
+            "pong=pong size=1536 ok=true hash_ok=true etf_ok=true",
+        ),
+        ("dist_extra/list_payload_of_110_elements", "pong=pong n=110 ok=true hash_ok=true etf_ok=true"),
+        (
+            "dist_extra/tuple_payload_of_100_elements",
+            "pong=pong tuple100 ok=true hash_ok=true etf_ok=true",
+        ),
+        (
+            "dist_extra/nested_payload_40_levels_deep",
+            "pong=pong nested40 ok=true hash_ok=true etf_ok=true",
+        ),
+        (
             "dist_extra/send_to_a_missing_remote_name",
             "pong=pong send_ok=true survived=true",
         ),
@@ -585,6 +725,10 @@ mod tests {
         "dist_extra/atom_list_payload",
         "dist_extra/list_payload",
         "dist_extra/binary_payload",
+        "dist_extra/binary_payload_of_1536_bytes",
+        "dist_extra/list_payload_of_110_elements",
+        "dist_extra/tuple_payload_of_100_elements",
+        "dist_extra/nested_payload_40_levels_deep",
         "dist_extra/send_to_a_missing_remote_name",
         "dist_extra/send_to_a_dead_remote_pid",
     ];
@@ -761,35 +905,59 @@ mod tests {
         assert_eq!(super::PEER_NAME, "dxpeer");
     }
 
-    /// The payload cases stay inside the **measured** agreeing envelope: a 100-element list and
-    /// a 1 KiB binary round-trip, while a 128-element list and a 128 KiB binary kill the
-    /// receiving Rust VM (see the module docs and `divergences.md` §A.5). A future widening of
-    /// the payloads must be re-measured, so the sizes are pinned here.
+    /// The payload cases stay inside the **measured** agreeing envelope: 1536 bytes is the
+    /// largest agreeing binary (1792 kills the receiving VM) and 110 elements the largest
+    /// agreeing list (120 kills it). A future widening must be re-measured, so the sizes are
+    /// pinned here — see the module docs and `divergences.md` §A.5.
     #[test]
     fn the_payload_cases_stay_inside_the_measured_envelope() {
         let cases = group();
-        let list = cases
-            .iter()
-            .find(|case| case.id == "dist_extra/list_payload")
-            .expect("the list-payload case");
-        let CaseKind::Command(run) = &list.kind else {
-            panic!("list_payload must be a Command case");
+        let expr_of = |id: &str| {
+            let case = cases.iter().find(|case| case.id == id).unwrap_or_else(|| panic!("{id}"));
+            let CaseKind::Command(run) = &case.kind else {
+                panic!("{id} must be a Command case");
+            };
+            args_of(run.oracle.args, "-eval")
         };
         assert!(
-            args_of(run.oracle.args, "-eval").contains("lists:seq(1, 80)"),
-            "the list payload is 80 elements (100 is the measured ceiling, 128 fails)"
+            expr_of("dist_extra/list_payload").contains("lists:seq(1, 80)"),
+            "the original list payload is 80 elements"
         );
-        let binary = cases
-            .iter()
-            .find(|case| case.id == "dist_extra/binary_payload")
-            .expect("the binary-payload case");
-        let CaseKind::Command(run) = &binary.kind else {
-            panic!("binary_payload must be a Command case");
-        };
         assert!(
-            args_of(run.oracle.args, "-eval").contains("lists:duplicate(1024, 7)"),
-            "the binary payload is 1 KiB (128 KiB is the measured failure)"
+            expr_of("dist_extra/list_payload_of_110_elements").contains("lists:seq(1, 110)"),
+            "110 elements is the measured ceiling (120 kills the receiver)"
         );
+        assert!(
+            expr_of("dist_extra/binary_payload").contains("lists:duplicate(1024, 7)"),
+            "the original binary payload is 1 KiB"
+        );
+        assert!(
+            expr_of("dist_extra/binary_payload_of_1536_bytes")
+                .contains("lists:duplicate(1536, 7)"),
+            "1536 bytes is the measured ceiling (1792 kills the receiver)"
+        );
+        assert!(
+            expr_of("dist_extra/tuple_payload_of_100_elements").contains("lists:seq(1, 100)"),
+            "the tuple payload is 100 elements"
+        );
+        assert!(
+            expr_of("dist_extra/nested_payload_40_levels_deep").contains("lists:seq(1, 40)"),
+            "the nested payload is 40 levels deep"
+        );
+        // Nothing may ask for a size past the measured crash edge.
+        for case in &cases {
+            let CaseKind::Command(run) = &case.kind else {
+                panic!("{} must be a Command case", case.id);
+            };
+            let expr = args_of(run.oracle.args, "-eval");
+            for too_big in ["lists:seq(1, 120)", "lists:duplicate(1792, 7)", "lists:duplicate(2048, 7)"] {
+                assert!(
+                    !expr.contains(too_big),
+                    "{}: {too_big} is past the measured crash edge",
+                    case.id
+                );
+            }
+        }
     }
 
     /// The cookie case is the only one whose two halves run with **different** cookies, and its

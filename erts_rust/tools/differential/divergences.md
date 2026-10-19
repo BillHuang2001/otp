@@ -61,6 +61,27 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   agree (`17` = `STOP_CALLED|READ_CANCELLED`, then `1` = `STOP_CALLED`), only the callback count
   differs, and `ERL_NIF_SELECT_STOP_SCHEDULED` is unobservable for the same reason. Owner:
   `beam_abi` / the `beam_rt` select hook (`crates/beam_rt/src/nif_select.rs`).
+- **`enif_schedule_nif`'s success path** — the documented "yield" seam. Measured with a real NIF
+  that re-schedules itself (`enif_schedule_nif(env, "sched_resumed", 0, sched_resumed, 0, NULL)`
+  from the first entry, the resumed entry returning the call counter): the oracle resumes the call
+  on the same scheduler and the module receives the resumed entry's value (`2`), and it does the
+  same for `ERL_NIF_DIRTY_JOB_CPU_BOUND` (`2`, so dirty dispatch works there too). The Rust runtime
+  leaves `NifHost::schedule_nif` at its `None` default, so the C raises `badarg`
+  (`crates/beam_abi/src/nif/enif/process.rs`) and the module observes `error:badarg` — i.e. the
+  same root cause as the already-recorded `dirty_scheduler_support = 0`. The **refusal** half
+  (`argc > 255`, a flags bit outside the dirty-job pair) agrees and is pinned
+  (`nif_abi/schedule_nif_rejects_*`); only the success path is unpinnable. Owner: `beam_rt`
+  (`NifHost::schedule_nif`, `crates/beam_rt/src/nif.rs`) / `beam_abi`.
+- **`enif_send` from a NIF-created thread** — the documented thread-safe form (`env == NULL` plus a
+  message env built with `enif_alloc_env`). Measured by spawning a thread that allocates a message
+  env and sends `{from_nif_thread, 11}` to pid passed in from the caller: the oracle delivers it
+  (`enif_send` answers `1`, the term reaches the mailbox), while the Rust runtime answers
+  `enif_alloc_env() == NULL` on a thread that is **not** inside a NIF call (the per-call host is
+  published thread-locally by `NifEnv`, `crates/beam_abi/src/nif/enif/envs.rs`), so this idiom
+  cannot be used at all and nothing is delivered (the receiver's bounded `receive` reports
+  `timeout`). The two in-call forms (`msg_env == NULL` and a message env on the calling thread)
+  are live and pinned (`nif_rt/send_null_env_*`, `nif_rt/send_message_env_*`). Owner: `beam_abi`
+  (`nif/enif/envs.rs`) / the runtime's host publication on non-scheduler threads.
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - `driver_async_port_key(port)` answers the port's opaque `ErlDrvData`/pointer word in the oracle while
   the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,
@@ -698,15 +719,18 @@ divergence: both sides matched, and the route was not turned into a case for the
   `selfhost_chain/compiled_erl_scan_scans_the_next_module` stays an expression case. Owner:
   `beam_engine` / `beam_rt`.
 
-### Widened live two-node traffic measured while filling in `dist_extra` (`beam_rt`, `beam_process`)
+### Widened live two-node traffic measured while filling in `dist_extra` (`beam_rt`, `beam_process`, `beam_dist`)
 
-Measured 2025-xx with the system `erl` (OTP 29.1.1 / erts-17.1) against `beam_rt`, each as a two-VM **self-pair** (client + a peer of the same program), exactly the shape `src/corpus/dist.rs` and `src/corpus/dist_extra.rs` use. None of these is pinned by a case (each disagreed, or is a capability gap); the eleven self-pair shapes that DO agree are `dist_extra/*`.
+Measured with the system `erl` (OTP 29.1.1 / erts-17.1) against `beam_rt` (release build), each as a two-VM **self-pair** (client + a peer of the same program), exactly the shape `src/corpus/dist.rs` and `src/corpus/dist_extra.rs` use. The seventeen self-pair shapes that DO agree are `dist_extra/*` (eleven message/refusal/payload shapes plus the payload-envelope four and the pid/interleave/sequence family).
 
-- **`link/1` + `DOP_EXIT` across nodes** (owner `beam_process`/`beam_rt`): client traps exits and links a peer-side process that exits with `byname`. Oracle: `{\'EXIT\', Pid, byname}`; rust: no signal within 8 s, and at termination logs `dropping remote exit signal … distribution: no established connection to node …`.
-- **`erlang:monitor/2` of a remote process** (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`, owner `beam_process`): oracle `{\'DOWN\', Ref, process, Pid, byname}`; rust answers nothing when the monitored process lives on the **listener** (accepted-link) half — the reverse direction (`beam_rt` client monitoring an oracle peer) does answer `byname`. `demonitor/2` shares that path.
-- **Pid identity round trip** (owner `beam_term`/`beam_rt`): `Pid =:= self()` after the pid crossed the link and came back — oracle `true`, rust `false`; consequently an `alias/0` reference sent to the peer and written by the peer (`DOP_ALIAS_SEND`) is never delivered.
-- **Inbound term size bound:** a 100-element list and a 1 KiB binary round-trip; a 128-element list and a 128 KiB binary make the receiving rust VM die (`beam_rt: error scheduler: process … has no engine entry point`) and a 1 MiB binary gets no reply. The corpus stays at 80 elements / 1 KiB.
+- **`link/1` + `DOP_EXIT` across nodes — no direction works** (owner `beam_process`/`beam_rt`/`beam_dist`). Client links a peer-side process that then exits `boom`: oracle `{'EXIT', Pid, boom}` under `trap_exit`, rust **no signal** in 8 s. The mirror (peer links a client-side process that then dies) and a spawned *linker* (a client-side process links the peer's main process, then exits `boom`) are equally silent. Cross-runtime probes localize it to **both halves**: with a rust client and an *oracle* peer the oracle's own `process_info(self(), links)` never gains the rust client's pid (the outbound `DOP_LINK` is not written), and with an oracle client and a rust peer the rust peer never records the incoming link. `erlang:unlink/1` rides the same path (`DOP_UNLINK_ID`; the inbound sink documents the ack as unemittable), so its `no_exit` pairing is unpinnable too.
+- **`erlang:exit(RemotePid, Reason)` is `unsupported: bif` (exit 3) for a plain reason, and `kill` is silently dropped** (owner `beam_bifs`/`beam_process`): `exit(RemotePid, boom)` raises the capability gap on the *sender*, while `exit(RemotePid, kill)` returns `true` and delivers nothing, so an "untrapped EXIT kills the linked far-side process" observable is unavailable in either direction.
+- **`erlang:monitor/2` of a remote process (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`) — no direction works** (owner `beam_process`). Measured silent: client monitors a peer-side pid; peer monitors a client-side pid; monitor of a registered remote **name**; monitor of an already-dead remote pid (the oracle answers `{'DOWN', _, process, _, noproc}` immediately in both directions). The cause is `ProcessTable::terminate`'s documented gap — a process with remote watchers drops the records instead of telling them — plus the inbound sink's channel-less `noproc` reply. `demonitor/2` shares the path.
+- **Pid identity round trip** (owner `beam_term`/`beam_rt`): `Pid =:= self()` after the pid crossed the link and came back — oracle `true`, rust `false`; consequently an `alias/0` reference written by the peer (`DOP_ALIAS_SEND`) is never delivered.
+- **Inbound/outbound term size bound ≈ 1.6 KiB, and it kills the RECEIVER** (owner `beam_rt`/`beam_codec`/`beam_gc`). Measured in both directions (a crash on the receiver, exit `1`, with `beam_rt: error scheduler: process ProcessId { … } has no engine entry point`; the sender then times out): a **1536**-byte binary agrees, a **1792**-byte binary kills; a **110**-element integer list agrees, a **120**-element list kills (the earlier "100 OK / 128 fails" figures agree with this); a 100-element tuple (808 bytes) and a 40-level nested term agree. A burst of 20 messages of 64-byte binaries also kills the receiver, so the bound is the receiver's *accumulated* heap, not one frame.
+- **Distribution fragmentation cannot be exercised live at all**: the sender only splits a frame above `DIST_FRAGMENT_SIZE` (64 KiB, `beam_dist::fragment`), ~40× past the crash edge above, so no corpus case can pin an `'E'`/`'F'` frame end to end — only the `dist_probe` helper's `frag` report covers the wire codec.
 - **`-hidden`** (owner `beam_rt`): a peer started `-hidden` gives `nodes()=0, nodes(hidden)=1` on the oracle and `nodes()=1, nodes(hidden)=0` on rust.
 - **`erlang:disconnect_node/1`** is `beam_rt: unsupported: erlang:disconnect_node/1 is a known BIF that is not implemented` (exit 3); **`erlang:spawn_request/5`** likewise (`unsupported`), so an `erpc:call/4` over a plain self-pair is unpinnable.
 - **Cookie-refusal latency:** a refused handshake costs ~5 s per attempt on rust (its connect timeout) vs instantly on the oracle, so `dist_extra/cookie_mismatch` uses three bounded attempts.
 - **`group_leader(RemotePid, self())`** could not be measured — the oracle's `-eval` wrapper silently refuses to evaluate it (no stdout, exit 1); not a proven divergence. `erlang:monitor_node(MissingNode, true)` answers `true` on both, too weak to pin.
+- **A `-eval` trap met while measuring** (owner `beam_rt`, `-eval` evaluator): `Pid ! Msg` **after** a blocking call (`timer:sleep/1` or a bounded `receive`) fails the whole script with `beam_rt: term not found` (exit `1`), while `erlang:send(Pid, Msg)` works in the same position and `!` works before any blocking call. Every `dist_extra` script therefore uses `erlang:send/2`.
