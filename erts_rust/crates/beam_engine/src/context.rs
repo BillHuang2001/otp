@@ -2420,4 +2420,153 @@ mod tests {
         ctx.set_mailbox(Box::new(second));
         assert_eq!(ctx.receive_next().unwrap(), Some(Eterm::from_raw(0x42)));
     }
+
+    // ---- the BIF suspend channel (`BifOutcome`) ---------------------------
+    //
+    // Both outcome-aware doors are **defaulted**, so a host that predates the channel
+    // is byte-identical to the pre-seam engine: each default forwards to its older
+    // twin and wraps the answer in `BifOutcome::Return`.
+
+    /// A host that knows nothing about the suspend channel: only the two required
+    /// methods, with `call_bif` answering a known small integer.
+    struct PlainBifHost;
+
+    impl ExecutionContext for PlainBifHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Ok(beam_term::make_small(7))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_outcome_door_defaults_to_a_wrapped_return() {
+        // The defaulted `call_bif_outcome` forwards to `call_bif` and wraps the value,
+        // so a host that overrides only that door can never report a suspend and keeps
+        // the exact value it always answered.
+        let mut ctx = PlainBifHost;
+        assert_eq!(
+            ExecutionContext::call_bif_outcome(&mut ctx, "erlang", "self", 0, &[]).unwrap(),
+            BifOutcome::Return(beam_term::make_small(7)),
+            "the defaulted outcome door must forward to `call_bif` and wrap its value"
+        );
+    }
+
+    /// A host that opted into the **in-machine** door but knows nothing about the
+    /// suspend channel: the gate is on and only `call_bif_in_machine` is overridden
+    /// (`call_bif` rejects, so taking it would be observable).
+    struct InMachineBifHost;
+
+    impl ExecutionContext for InMachineBifHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn wants_bif_in_machine(&self) -> bool {
+            true
+        }
+
+        fn call_bif_in_machine(
+            &mut self,
+            _machine: &Machine,
+            _entry_module: &Module,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Ok(beam_term::make_small(9))
+        }
+    }
+
+    #[test]
+    fn the_in_machine_outcome_door_defaults_to_a_wrapped_return() {
+        // The in-machine twin forwards to `call_bif_in_machine` (never to `call_bif`)
+        // and wraps the value, so an opted-in host that predates the channel keeps its
+        // value route.
+        let mut ctx = InMachineBifHost;
+        let machine = Machine::new();
+        let entry = Module::default();
+
+        assert_eq!(
+            ExecutionContext::call_bif_in_machine_outcome(
+                &mut ctx,
+                &machine,
+                &entry,
+                "erlang",
+                "self",
+                0,
+                &[]
+            )
+            .unwrap(),
+            BifOutcome::Return(beam_term::make_small(9)),
+            "the defaulted in-machine outcome door must forward to `call_bif_in_machine`"
+        );
+        assert!(
+            ctx.call_bif("erlang", "self", 0, &[]).is_err(),
+            "`call_bif` rejects here, so the answer above came from the in-machine door"
+        );
+    }
+
+    #[test]
+    fn minimal_context_prefers_its_outcome_hook_and_falls_back_to_the_plain_one() {
+        // An installed outcome hook IS the door, so a suspend is expressible while the
+        // plain hook keeps answering the plain route.
+        let mut ctx = MinimalContext::with_bif_outcome_hook(Box::new(|_m, _f, _a, _args| {
+            Ok(BifOutcome::Suspend)
+        }));
+        ctx.set_bif_hook(Box::new(|_m, _f, _a, _args| Ok(beam_term::make_small(3))));
+        assert_eq!(
+            ctx.call_bif_outcome("erlang", "port_command", 2, &[])
+                .unwrap(),
+            BifOutcome::Suspend,
+            "an installed outcome hook must be consulted by the outcome door"
+        );
+        assert_eq!(
+            ctx.call_bif("erlang", "port_command", 2, &[]).unwrap(),
+            beam_term::make_small(3),
+            "the plain door must keep answering the plain hook"
+        );
+
+        // With no outcome hook the outcome door is the trait default: the plain answer,
+        // wrapped (so the pre-seam behaviour is exactly preserved).
+        let mut plain = MinimalContext::with_bif_hook(Box::new(|_m, _f, _a, _args| {
+            Ok(beam_term::make_small(4))
+        }));
+        assert_eq!(
+            plain.call_bif_outcome("lists", "reverse", 1, &[]).unwrap(),
+            BifOutcome::Return(beam_term::make_small(4)),
+            "without an outcome hook the door must forward and wrap"
+        );
+    }
 }

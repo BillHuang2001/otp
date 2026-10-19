@@ -1014,4 +1014,38 @@ mod tests {
             other => panic!("expected the typed blocked error, got {other:?}"),
         }
     }
+
+    /// The reason atom of a typed raise — the engine's only shape for its park
+    /// diagnostics — so two reasons are comparable and nameable in an assertion.
+    fn reason_atom(error: BeamError) -> String {
+        match error {
+            BeamError::Raise(raise) => raise
+                .reason
+                .as_atom()
+                .expect("the engine's park errors carry an atom reason")
+                .to_string(),
+            other => panic!("expected a typed raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_outcome_maps_a_suspend_to_the_typed_suspended_error() {
+        // A non-blocking entry cannot suspend the process, so it must report the park
+        // as the typed `suspended` error — and that reason must stay distinguishable
+        // from `blocked`'s, because a suspended BIF is not an empty mailbox.
+        use super::fold_outcome;
+
+        let err = fold_outcome(RunOutcome::Suspend { func: 3, pc: 7 })
+            .expect_err("a non-blocking entry cannot suspend the process");
+        assert_eq!(
+            reason_atom(err),
+            reason_atom(error::suspended()),
+            "`error::suspended()` is the single definition of the folded suspend reason"
+        );
+        assert_ne!(
+            reason_atom(error::suspended()),
+            reason_atom(error::blocked()),
+            "a suspended BIF must not read like a blocked receive"
+        );
+    }
 }
