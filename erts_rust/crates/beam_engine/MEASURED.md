@@ -157,15 +157,48 @@ Cranelift's one-time compile is ≈**6.5–60×** the baseline's (cheapest on `w
 The verdict is unchanged and slightly reinforced: `jit-cranelift` stays **default-OFF** and is **not reachable end-to-end** through `beam_rt` — `beam_rt/src/runner/tier.rs` has no `Tier::Cranelift` selection (`BEAM_RT_TIER` maps only to `JitMode::{Auto,Interpreter,Baseline}`), so the `foreign` / `list_walk` / `gc_bound churn` workloads are not measurable through the runtime and the in-crate harness (`src/jit/bench/**`, `src/jit/cranelift/bench.rs`) measures synthetic modules instead.
 
 ## Foreign workload decomposition (in-process, release, `taskset -c 3`)
-The workload is Cowboy's `cowboy_bstr:to_lower/1` over `<<"The Quick Brown Fox 0123456789">>` (30 bytes) — the `foreign` / `bstr_to_lower` bench case, which `../tools/bench/RESULTS.md` (m15) records at **338.4 ns/call** on the system ERTS against **13 344 ns/call** on the Rust runtime (**39.4×**; the `foreign` group spans 34.8×–86.3×).
+The workload is Cowboy's `cowboy_bstr:to_lower/1` over `<<"The Quick Brown Fox 0123456789">>` (30 bytes) — the `foreign` / `bstr_to_lower` bench case. Its cross-runtime cost is `../tools/bench/RESULTS.md`'s record (read the ratio there, never a copy here).
 The harness is `src/bench/` (`#[cfg(test)]`-only and in-process — no `beam_rt` boot and no scheduler in the timed loop): it compiles the real `cowboy_bstr.erl` with the system `erlc` into `$TMPDIR` and skips loudly when `erlc` is absent.
 `./erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib -- --ignored --nocapture foreign_bstr_to_lower_decomposition`; the knobs are `BENCH_ITERS`, `BENCH_BATCH`, `BENCH_WARMUP` and `BENCH_TIER=interpreter|baseline|both`.
 - **438 instructions per call** (~14.6 per character) and **0** `call_bif` calls: `char_to_lower/1` is a 27-clause pure-Erlang `select_val`, so no BIF is on the path.
-- `alloc_words_rooted`: **62 calls / 295 words → 32 calls / 163 words** after the in-place `private_append`.
+- `alloc_words_rooted`: **2 calls / 13 words** — the oracle's own figure (`erlang:statistics(garbage_collection)` reclaimed words = 13.00 for the same call). `bstr_capitalize_token/1` is identical (2 / 13).
 - The local-call seam is asked **61** times per call; `call_ext` requests are **0**.
 - `ensure_heap`/`ensure_heap_full`: **0**, because the shape has no `test_heap`/`allocate_heap` and `Instr::Allocate` requests nothing — the GC admission door is never reached, so the gap is **not** GC cadence for this shape.
-- Baseline tier: `jit_step_one`/`jit_step_ext`/`driver_interp_steps` **0/0/0** (the tier fully inlines it).
+- Baseline tier: `jit_step_one`/`jit_step_ext`/`driver_interp_steps` **0/0/0** (the tier fully inlines it), **3** driver round-trips per call and **30** in-block calls per call (the in-block links absorb the rest).
 - `perf` self time (`--comm` filtered to the harness): `BitWriter::push_bits_from` **27.38 % → below the 0.8 % cut-off**, and the top remaining frame is the single `bs_init_writable` carrier allocation (`<CarrierAllocator>::alloc_impl`, **17.31 %**).
-Interleaved A/B (`taskset -c 3`, 15 samples per side, alternating per round, ns per call min / median): interpreter **17 592 / 17 805 → 13 387 / 13 672** (**1.31×**); baseline JIT (the default tier) **12 726 / 12 812 → 7 119 / 7 204** (**1.79×**); `/proc/loadavg` 4.76/4.42/4.59 → 3.49/4.14/4.49.
-A confirmation sweep at the final tree on a busier host reproduces it with every deterministic counter identical: interpreter **17 776 / 18 258 → 13 293 / 13 617** (1.34×), baseline **12 771 / 13 277 → 7 233 / 7 382** (1.80×), `/proc/loadavg` 14.57/7.52/5.51 → 10.30/7.15/5.45.
+- The other three foreign workloads, same harness (per call): `emqx_base62:encode/1` **244** instructions, **4** `+/1` BIFs on the JIT tier (**20** on the interpreter, where `+` is not inlined), 1 `iolist_to_binary/1`, **18** rooted calls / **45** words, **7** round-trips / **16** in-block calls; `emqx_base62:decode/1` **531** instructions, **17** BIFs on the JIT tier (32 `-/2` + 32 `bit_size/1` + 1 `rem/2` on the interpreter), **32** rooted calls / **133** words; `cowboy_bstr:capitalize_token/1` **660** instructions, **57** local-call-seam requests, **2** rooted calls / **13** words.
 Caveat: the absolute ns are opt-level-3 shared-host figures; only the ratios and the deterministic counters are signal.
+
+## Cross-runtime record and the binary A/B (per-call dispatch cost)
+Two instruments, both pinned `taskset -c 3` under `setsid -w`, one process at a time, with `/proc/loadavg` recorded at every leg. **No wall clock is quoted as primary evidence** — the ratio is the figure and the deterministic counters below are the structural evidence.
+- **Matched cross-runtime rounds** (3 rounds, alternating `--runtime sys` / `--runtime rust` per round, `--quick`; 1-min load 1.02–2.37). `sys` = system OTP 29.1.1 / erts-17.1, `rust` = `beam_rt` at its default baseline tier.
+| workload | metric | sys | rust | rust/sys | per-round |
+|---|---|---|---|---|---|
+| `list_walk` | per element | 2.34 ns | 18.03 ns | **7.72×** | 7.59 7.82 7.72 |
+| `copy_bound` | `etf_roundtrip` | 657.87 ns | 1 433.16 ns | 2.16× | 2.24 2.16 2.15 |
+| `copy_bound` | `ets_copy` | 222.47 ns | 2 180.34 ns | 9.82× | 10.07 9.82 9.57 |
+| `copy_bound` | `send_recv` | 1 503.76 ns | 8 154.48 ns | 5.44× | 5.44 5.47 5.42 |
+| `copy_bound` | `send_recv_plain` | 669.20 ns | 1 965.28 ns | 2.91× | 2.91 2.91 2.94 |
+| `gc_bound` | `churn` | 4 257.75 ns | 62 478.60 ns | 14.77× | 14.78 14.77 14.59 |
+| `foreign` | `bstr_to_lower` | 337.18 ns | 3 174.91 ns | **9.42×** | 10.36 9.28 9.42 |
+| `foreign` | `bstr_capitalize_token` | 326.28 ns | 4 136.55 ns | **12.65×** | 12.50 13.47 12.65 |
+| `foreign` | `emqx_base62_encode` | 210.35 ns | 3 343.09 ns | **15.79×** | 15.79 16.25 15.66 |
+| `foreign` | `emqx_base62_decode` | 285.31 ns | 5 574.70 ns | **19.00×** | 18.52 19.67 19.00 |
+| `copy_bound` | `send_recv − send_recv_plain` | 0.81 µs/op | 6.19 µs/op | — | 6.10 6.28 6.19 |
+- **Binary A/B — the code-change evidence** (the same `bench` binary driving two `beam_rt` builds selected through `$BEAM_RT`, 5 rounds alternating order, 1-min load 1.02–1.60, both sides `--quick --runtime rust`). `OLD` = the pre-optimization tree, `NEW` = the current tree. Ratio < 1 ⇒ `NEW` cheaper.
+| rust-only metric | OLD | NEW | NEW/OLD | per-round |
+|---|---|---|---|---|
+| `list_walk` ns/element | 21.0 | 18.0 | **0.853×** | 0.80 0.83 0.87 0.85 0.86 |
+| `foreign/bstr_to_lower` | 5 198.6 ns | 3 244.9 ns | **0.624×** | 0.64 0.63 0.61 0.62 0.60 |
+| `foreign/bstr_capitalize_token` | 6 861.3 ns | 4 218.7 ns | **0.610×** | 0.61 0.58 0.64 0.62 0.59 |
+| `foreign/emqx_base62_encode` | 4 052.4 ns | 3 262.1 ns | **0.801×** | 0.80 0.79 0.80 0.81 0.80 |
+| `foreign/emqx_base62_decode` | 7 267.0 ns | 5 559.9 ns | **0.758×** | 0.76 0.76 0.77 0.76 0.75 |
+| `binary_append` ns/call | 2 964 037 | 1 333 404 | **0.449×** | 0.45 0.46 0.45 0.45 0.45 |
+| `gc_bound/churn` ns/op | 65 009.5 | 61 461.0 | 0.944× (widest spread: 0.93–1.00) | 0.93 1.00 0.94 0.94 0.99 |
+| `copy_bound/etf_roundtrip` | 1 419.9 ns | 1 426.8 ns | 1.018× (noise) | 1.04 1.02 0.99 1.02 1.00 |
+| `copy_bound/ets_copy` | 2 154.5 ns | 2 169.1 ns | 1.005× (noise) | 0.98 1.01 1.03 1.00 1.01 |
+| `copy_bound/send_recv` | 7 898.2 ns | 8 042.9 ns | 1.022× | 1.02 1.03 1.02 1.03 1.02 |
+| `copy_bound/send_recv_plain` | 1 924.0 ns | 1 965.5 ns | 1.026× | 1.03 1.03 1.01 1.03 1.02 |
+Every row produced a figure in all 5 rounds on both sides and all 10 legs exited 0; no row was withheld.
+- **Reading the two instruments together.** The A/B is the only cross-*session*-valid statement; the matched-round ratio moved further than the A/B because the sessions' host load differed (the oracle side is comparatively load-insensitive, the Rust side absorbs the variance). Quote the A/B for "did this change help" and the matched rounds only for "where do we stand against the oracle, in one window".
+- **The two `send_recv` rows are a small real regression, not noise**: all five rounds put `NEW` above `OLD` (sign test 5/5), so `NEW` costs ≈2 % more on the two-process copy path. That path is dominated by `beam_message`/`beam_rt` work this crate barely touches, and a ≤2.2 % effect at this magnitude is within code-layout reach; it has not been attributed further. It is reported rather than absorbed.
