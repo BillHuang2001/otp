@@ -153,6 +153,7 @@ use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
+use crate::port_task::{ActiveMode, ActiveSpend};
 
 use super::adopt_probe::adoption_reply;
 use super::opt::{get_options, OptScope, SocketOptions};
@@ -254,6 +255,21 @@ pub struct UdpInetDriver {
     /// C's `{inet_reply, S, {error, Reason}, Tag}` (`inet_reply_error`, `:2539`) when the command is
     /// settled. `None` while the send is healthy.
     send_error: Option<i32>,
+    /// The `{active, …}` grants a **delivery** has spent since the last drain, oldest first — the
+    /// notification half of the seam whose read half is [`Driver::active_mode`] (`ActiveSpend`,
+    /// drained by [`Driver::take_active_spends`]).
+    ///
+    /// Recorded in exactly one place, the per-datagram spend site
+    /// ([`UdpInetDriver::after_delivery`], the C's `INET_CHECK_ACTIVE_TO_PASSIVE`,
+    /// `inet_drv.c:1552`-`:1560`, invoked from `packet_reply_binary_data` `:4352`): an
+    /// `{active, once}` grant spent silently gets one `ActiveSpend::Once`, an `{active, N}` counter
+    /// reaching zero one `ActiveSpend::Multi`. The `setopts` walk's `landed_at_zero` path (the C's
+    /// `:6993`-`:6998`) delivers no datagram, so it records nothing. `{active, true}` and
+    /// `{active, false}` never record.
+    ///
+    /// **Invariant:** the burst stops the moment the mode flips passive (`:15566`-`:15573`), so at
+    /// most one grant is spent per round; the field is a `Vec` so the drain has one shape.
+    active_spends: Vec<ActiveSpend>,
 }impl UdpInetDriver {
     /// A UDP driver with no socket yet: the state a freshly opened port starts in.
     ///
@@ -279,6 +295,7 @@ pub struct UdpInetDriver {
             caller_ref: None,
             caller_stripped: false,
             send_error: None,
+            active_spends: Vec::new(),
         }
     }    /// Adopts an existing datagram socket, taking ownership of `fd` (closed on
     /// `stop`/`close`/`Drop`).
@@ -324,6 +341,7 @@ pub struct UdpInetDriver {
             caller_ref: None,
             caller_stripped: false,
             send_error: None,
+            active_spends: Vec::new(),
         })
     }
     /// The socket this port owns, if one has been opened.
@@ -1424,6 +1442,27 @@ impl Driver for UdpInetDriver {
         self.async_ops.has_pending()
     }
 
+    /// The port's `{active, …}` state — the C's `desc->inet.active`
+    /// (`INET_PASSIVE`/`INET_ACTIVE`/`INET_ONCE`/`INET_MULTI`) plus the running `active_count`
+    /// when the mode is the counter form (`inet_drv.c:1552`-`:1560`, the datagram twin of the
+    /// stream driver's).
+    ///
+    /// Both values live in this driver's own option store, written by the `setopts` walk
+    /// (`opt_state::set_active`, the C's `:6967`-`:7000`) and spent by
+    /// [`UdpInetDriver::after_delivery`].
+    fn active_mode(&self) -> ActiveMode {
+        ActiveMode::from_parts(self.options.active, self.options.active_count)
+    }
+
+    /// Drains the grants a **delivered datagram** spent since the last call, oldest first.
+    ///
+    /// Recorded only at [`UdpInetDriver::after_delivery`] (the C's `INET_CHECK_ACTIVE_TO_PASSIVE`,
+    /// `inet_drv.c:1552`-`:1560`, reached from `packet_reply_binary_data` `:4352`), never by the
+    /// `setopts` walk that drives an `{active, N}` counter to zero (`:6993`-`:6998`), which spends
+    /// nothing because it delivers nothing. Taking consumes, so a caller drains after every round.
+    fn take_active_spends(&mut self) -> Vec<ActiveSpend> {
+        core::mem::take(&mut self.active_spends)
+    }
     fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.drive_async_ops(ctx)
     }
@@ -1503,8 +1542,10 @@ mod udp_tests;
 #[cfg(test)]
 mod async_tests;
 
+// The `{active, …}` delivery suite; the module is published to the whole `inet` node because the
+// seam suite (`inet/active_seam_tests.rs`) drives this rig too.
 #[cfg(test)]
-mod active_tests;
+pub(in crate::drivers::inet) mod active_tests;
 #[cfg(test)]
 mod empty_datagram_tests;
 #[cfg(test)]

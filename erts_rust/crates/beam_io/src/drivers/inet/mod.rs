@@ -260,7 +260,7 @@ use crate::driver::{Driver, DriverContext, DriverFlags};
 use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
-use crate::port_task::ActiveInputEvent;
+use crate::port_task::{ActiveInputEvent, ActiveMode, ActiveSpend};
 
 // The TCP accept state machine (`INET_REQ_ACCEPT`'s multi-operation list, its per-port timer
 // entries, the sticky `INET_F_MULTI_CLIENT` bit and the listener's readiness arming), split out of
@@ -803,6 +803,23 @@ pub struct TcpInetDriver {
     /// from the start. It gates the **reactor's** read only — every explicit/queued read
     /// (the `recv` verbs, `TCP_REQ_RECV`) is unaffected.
     read_armed: bool,
+    /// The `{active, …}` grants a **delivery** has spent since the last drain, oldest first — the
+    /// notification half of the seam whose read half is [`Driver::active_mode`]
+    /// ([`ActiveSpend`], drained by [`Driver::take_active_spends`]).
+    ///
+    /// Recorded in exactly one place, the per-delivery spend site
+    /// ([`TcpInetDriver::count_delivery`], the C's `INET_CHECK_ACTIVE_TO_PASSIVE`,
+    /// `inet_drv.c:1552`-`:1561`): an `{active, once}` grant spent silently gets one
+    /// [`ActiveSpend::Once`], an `{active, N}` counter reaching zero one [`ActiveSpend::Multi`].
+    /// The `setopts` option walk that drives a counter to zero (`landed_at_zero`, the C's
+    /// `:6993`-`:6998`) delivers nothing, so it records nothing — the C spends a grant only per
+    /// delivered packet.
+    ///
+    /// **Invariant:** a burst spends at most one grant, because the delivery loop ends the moment
+    /// the mode flips passive (`if (! desc->inet.active)`, `:13108`-`:13114`), so this holds zero
+    /// or one entry per round in practice; it is a `Vec` rather than an `Option` so the drain has
+    /// one shape whatever a later tier does. `{active, true}` and `{active, false}` never record.
+    active_spends: Vec<ActiveSpend>,
 }
 
 impl TcpInetDriver {
@@ -835,6 +852,7 @@ impl TcpInetDriver {
             caller_stripped: false,
             out_framed: false,
             read_armed: true,
+            active_spends: Vec::new(),
         }
     }
 
@@ -890,6 +908,8 @@ impl TcpInetDriver {
             out_framed: false,
             // A freshly adopted socket starts with its read side selected (see the field's note).
             read_armed: true,
+            // Nothing has been delivered on a brand-new socket yet, so no grant is spent.
+            active_spends: Vec::new(),
         })
     }
 
@@ -2410,6 +2430,30 @@ impl Driver for TcpInetDriver {
     fn port_closed(&self) -> bool {
         self.peer_closed()
     }
+
+    /// The port's `{active, …}` state — the C's `desc->inet.active` (`INET_PASSIVE`/`INET_ACTIVE`/
+    /// `INET_ONCE`/`INET_MULTI`, `inet_drv.c:786`-`:789`) plus the running `active_count` when the
+    /// mode is the counter form (`:1552`-`:1560`).
+    ///
+    /// Both values live in this driver's own option store, written by the `setopts` walk
+    /// (`opt_state::set_active`, the C's `:6967`-`:7000`) and spent by
+    /// [`TcpInetDriver::count_delivery`] — so this is the only way a runtime can learn the
+    /// running counter, which no owner-facing message carries.
+    fn active_mode(&self) -> ActiveMode {
+        ActiveMode::from_parts(self.options.active, self.options.active_count)
+    }
+
+    /// Drains the grants a **delivery** spent since the last call, oldest first — the notification
+    /// half of [`Driver::active_mode`]'s state machine.
+    ///
+    /// Recorded only at [`TcpInetDriver::count_delivery`] (the C's
+    /// `INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552`-`:1561`), never by the `setopts` walk that
+    /// drives an `{active, N}` counter to zero (`:6993`-`:6998`), which spends nothing because it
+    /// delivers nothing. Taking consumes, so a caller drains after every round.
+    fn take_active_spends(&mut self) -> Vec<ActiveSpend> {
+        core::mem::take(&mut self.active_spends)
+    }
+
     fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.drive_async_ops(ctx)
     }
@@ -2484,7 +2528,11 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
 // (`inet_drv.c:13045`-`:13260`) that sends the owner a `{tcp, S, Data}` message instead of
 // filling the port input queue.
 mod active;
-
+// The `{active, …}` **state seam** (`Driver::active_mode` / `Driver::take_active_spends`) as both
+// socket drivers implement it: the running `{active, N}` counter, and the grants a **delivery**
+// spent (never the `setopts` walk's own zero).
+#[cfg(test)]
+mod active_seam_tests;
 #[cfg(test)]
 mod active_tests;
 #[cfg(test)]

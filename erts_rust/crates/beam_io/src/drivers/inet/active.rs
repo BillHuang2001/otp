@@ -107,7 +107,7 @@ use beam_common::Result;
 
 use crate::driver::DriverContext;
 use crate::poller::Interest;
-use crate::port_task::ActiveInputEvent;
+use crate::port_task::{ActiveInputEvent, ActiveSpend};
 
 use super::frame;
 use super::header;
@@ -120,7 +120,11 @@ impl TcpInetDriver {
     ///
     /// The C's test is the plain integer comparison `desc->active > 0` (`:7957`, `:7964`), which is
     /// what tells `{active, false}` from `{active, true|once|N}`.
-    fn active_mode(&self) -> bool {
+    ///
+    /// Named `is_active_mode` rather than `active_mode` because the `Driver` trait publishes the
+    /// same state as `Driver::active_mode` (an `ActiveMode`, the read half of the `{active, …}`
+    /// seam); an inherent method would shadow the trait method at every call site on this type.
+    fn is_active_mode(&self) -> bool {
         self.options.active > INET_PASSIVE
     }
 
@@ -158,7 +162,7 @@ impl TcpInetDriver {
     /// not refuse the enqueue's successor, and the C's own ladder refuses a receive on an already
     /// active port (`:12273`).
     pub(super) fn owns_readiness_for_active(&self) -> bool {
-        self.state.is_connected() && self.active_mode() && self.async_ops.recv().is_none()
+        self.state.is_connected() && self.is_active_mode() && self.async_ops.recv().is_none()
     }
 
     /// Delivers everything the socket holds on the **active-input channel** — the C's
@@ -221,7 +225,7 @@ impl TcpInetDriver {
                     self.deliver_data(ctx, payload)?;
                     // `if (! desc->inet.active)` (`:13108`): the mode the last delivery spent
                     // ends the burst here.
-                    if !self.active_mode() {
+                    if !self.is_active_mode() {
                         return Ok(());
                     }
                 }
@@ -285,15 +289,29 @@ impl TcpInetDriver {
     /// * `{active, N}` — the counter is decremented and, at zero, the socket goes passive **and**
     ///   `packet_passive_message` (`:4215`) is sent as [`ActiveInputEvent::Passive`];
     /// * `{active, true}` — never spent: no counter, no passive message.
+    ///
+    /// The two spending arms also **record** the spend ([`ActiveSpend::Once`] /
+    /// [`ActiveSpend::Multi`]) on [`TcpInetDriver::active_spends`], which
+    /// [`Driver::take_active_spends`] drains — the transition is invisible in the delivered terms
+    /// for `{active, once}` (no message at all) and only inferable for `{active, N}`.
+    ///
+    /// This is the **only** spend site: [`TcpInetDriver::after_setopts`]'s `landed_at_zero` path
+    /// drives the counter to zero from inside the option walk (the C's `inet_set_opts`,
+    /// `:6993`-`:6998`) and emits its `{tcp_passive, S}`, but the C spends a grant only per
+    /// delivered packet — no data was delivered there, so no spend is recorded.
     fn count_delivery(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         match self.options.active {
-            INET_ONCE => self.options.active = INET_PASSIVE,
+            INET_ONCE => {
+                self.options.active = INET_PASSIVE;
+                self.active_spends.push(ActiveSpend::Once);
+            }
             INET_MULTI => {
                 // The C's `--active_count == 0`. `wrapping_sub` keeps the C's arithmetic for the
                 // (unreachable) already-zero case instead of panicking.
                 self.options.active_count = self.options.active_count.wrapping_sub(1);
                 if self.options.active_count == 0 {
                     self.options.active = INET_PASSIVE;
+                    self.active_spends.push(ActiveSpend::Multi);
                     ctx.deliver_active_input(ActiveInputEvent::Passive)?;
                 }
             }
@@ -302,7 +320,7 @@ impl TcpInetDriver {
         // `if (! desc->inet.active) { … sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0); … }`
         // (`inet_drv.c:13106`-`:13114`): the delivery that emptied the grant deselects the socket's
         // read side, so a peer write during the spent window is never read by the reactor.
-        if !self.active_mode() {
+        if !self.is_active_mode() {
             self.read_armed = false;
         }
         Ok(())
@@ -384,7 +402,7 @@ impl TcpInetDriver {
         // `set_interest` answers `BadArg` without a socket, so the C's own
         // `(stream && connected) || (dgram && open)` gate is the guard here too.
         if self.state.is_connected() && self.has_socket() && before_active == INET_PASSIVE {
-            if self.active_mode() {
+            if self.is_active_mode() {
                 self.set_interest(ctx, Interest::READABLE)?;
                 // `sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` (`:7982`): an armed
                 // grant selects the socket's read side again, ending any spent-grant window
