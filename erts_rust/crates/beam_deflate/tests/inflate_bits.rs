@@ -263,15 +263,6 @@ fn finish_flush_on_an_incomplete_stream_is_a_buf_error() {
 // The window, the resets and `get_dictionary`
 // ---------------------------------------------------------------------------
 
-/// The 40 KiB repetitive oracle image (`rep40k_zlib`) — a body longer than the window,
-/// so the decoder has to slide it.
-const REP40K_ZLIB: &[u8] = &[120,156,237,197,65,17,0,32,8,0,176,172,8,8,253,19,152,195,187,237,179,56,89,125,103,195,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,109,219,182,237,143,127,65,237,211,163];
-
-/// The plaintext the window tests expect: `"abcdefgh"` repeated.
-fn rep40k() -> Vec<u8> {
-    b"abcdefgh".repeat(5120)
-}
-
 /// After a partial decode, `get_dictionary()` is exactly the history the stream has
 /// produced so far (`min(produced, 32 KiB)` of it), oldest first.
 #[test]

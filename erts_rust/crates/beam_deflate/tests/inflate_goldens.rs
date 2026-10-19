@@ -29,6 +29,11 @@
 //! instead of being pasted (40 KiB of decimal bytes would bury the tests); the small
 //! ones are pasted, and `mixed4k_plain` pins `mixed()` against the oracle.
 //!
+//! The `G_*` images are pasted verbatim from the oracle, one per oracle case, and their
+//! names are generated (lower-case, `G_`-prefixed) so a case name maps onto a constant
+//! without a rename step; the convention `non_upper_case_globals` is allowed for that.
+#![allow(non_upper_case_globals)]
+//!
 //! Coverage: the three framings zlib produces (`compress` → zlib/RFC 1950, `zip` → raw
 //! RFC 1951, `gzip` → RFC 1952) over literal-only, run-length, structured and
 //! >32 KiB bodies; the level/strategy matrix (`level 0` stored, `level 1`/`9` dynamic,
