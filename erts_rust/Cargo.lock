@@ -77,6 +77,7 @@ version = "0.1.0"
 dependencies = [
  "beam_alloc",
  "beam_common",
+ "beam_deflate",
  "beam_term",
  "flate2",
  "libc",
@@ -87,6 +88,13 @@ name = "beam_common"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "beam_deflate"
+version = "0.1.0"
+dependencies = [
+ "beam_common",
 ]
 
 [[package]]
