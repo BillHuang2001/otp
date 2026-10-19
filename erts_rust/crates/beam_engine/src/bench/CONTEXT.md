@@ -139,7 +139,7 @@ Paired `walk(20) − walk(0)`: one `build/2` in both phases, so the build (9 018
 | block-entry lookups / hits per element | — | 0.0001 / 0.0001 (misses 0) |
 | `step_one` / `step_ext` / driver interp steps per element | — | 0 / 0 / 0 |
 | deopts per element | — | **0** |
-| `census_ns_per_element` (the census pass' own loop) | — | 24.6 / — |
+| `census_ns_per_element` (the census pass' own loop) | — | 24.55 / 24.16 |
 
 Whole-call `instr_per_element` is **8.471**, so the build is 5.3 % of the call.
 The baseline tier pays **2 driver round-trips per 20 000-element call** (not per element): the walk's `call_only` is linked in-block, so the loop runs without returning to the driver, and the interpreter's extra BIF call per element is the small-int `+` the baseline tier inlines.
