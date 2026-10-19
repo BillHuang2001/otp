@@ -113,7 +113,7 @@
 //!   runtime's freshly *spawned* processes run ~9–16× slower than the calling process (an A.9
 //!   divergence recorded in `divergences.md`), and `selfhost` measured the `ordsets` compile at
 //!   ≈7.6 s (module-run) against ≈0.8 s (`-eval`). The two large-source cases
-//!   ([`compiled_lint_case`], [`compiled_scan_case`]) are therefore **expression** cases; the two
+//!   ([`compiler_pass_case`], [`compiled_scan_case`]) are therefore **expression** cases; the two
 //!   module-run cases here ([`two_stage_case`], [`moduledoc_file_case`]) compile only 3–4-line
 //!   staged modules, which keeps their spawn cost negligible.
 //! * **`erl_lint` itself is compiled on request but not as a corpus case**: compiling the real
@@ -192,28 +192,25 @@ const STAGED_RELATION_EXPR: &str = r#"begin File = "lib/stdlib/src/dets_sup.erl"
 /// * the raise is not caught: a runtime that cannot host the route reports its typed gap.
 const STAGED_CALL_EXPR: &str = r#"begin File = "lib/stdlib/src/erl_internal.erl", {ok, Forms0} = epp:parse_file(File, []), Forms = [case Form of {attribute, Anno, module, erl_internal} -> {attribute, Anno, module, selfhost_chain_internal}; _ -> Form end || Form <- Forms0], {ok, LintWarnings} = erl_lint:module(Forms), {ok, selfhost_chain_internal, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {ok, {selfhost_chain_internal, Md5}} = beam_lib:md5(Bin), {module, selfhost_chain_internal} = code:load_binary(selfhost_chain_internal, "selfhost_chain_internal.beam", Bin), {LintWarnings, byte_size(Md5), selfhost_chain_internal:arith_op('+', 2), selfhost_chain_internal:arith_op('foo', 2), selfhost_chain_internal:bool_op('and', 2), selfhost_chain_internal:bool_op('andalso', 2), selfhost_chain_internal:comp_op('=:=', 2), selfhost_chain_internal:bif(atom_to_list, 1), selfhost_chain_internal:bif(nonsense, 3), selfhost_chain_internal:guard_bif(size, 1), selfhost_chain_internal:type_test(is_atom, 1)} end"#;
 
-/// **The compiler compiling a compiler**: the runtime compiles `erl_lint` itself, and the fresh
-/// linter is the one that lints.
+/// **The compiler compiling one of the compiler's own passes**: the runtime compiles
+/// `erl_bifs`, and the fresh copy answers the compiler's purity/safety questions.
 ///
 /// Shape rules, all load-bearing:
 ///
-/// * the subject is the real `lib/stdlib/src/erl_lint.erl` (5899 source lines) — the diagnostic
-///   engine of every compile, so this is the toolchain's own linter, parsed and compiled by the
-///   runtime it is about to run on;
-/// * the module attribute is renamed (`erl_lint` → `selfhost_chain_lint`): the installation owns
-///   `erl_lint`, and the rename is what lets the *fresh* copy be loaded and called. `erl_lint`
-///   contains **no** self-qualified call and no `?MODULE`, so every internal call of the fresh
-///   copy stays inside the fresh copy — the observable really is this run's linter;
-/// * three subjects exercise the three result shapes `erl_lint:module/1` documents: a warnable
-///   module (`unused_var`), a clean one (`[]`), and one whose body reads an unbound variable
-///   (`{error, Errors, Warnings}`). Only the **diagnostics** are pinned — `{Line, Module,
-///   Description}` triples — never the file element of the diagnostic group (it is the
-///   `"nofile"` placeholder for a form list, a detail of the compiler's own bookkeeping);
-/// * `erlang:function_exported/3` and `code:is_loaded/1` pin that the fresh copy is registered
-///   under its own name (`code:is_loaded/1`'s `file` tag only — the file *name* would be a
-///   harness path);
-/// * the raise is not caught (a runtime that cannot compile `erl_lint` reports its typed gap).
-const COMPILED_LINT_EXPR: &str = r#"begin File = "lib/stdlib/src/erl_lint.erl", {ok, Forms0} = epp:parse_file(File, []), Forms = [case F of {attribute, A, module, erl_lint} -> {attribute, A, module, selfhost_chain_lint}; _ -> F end || F <- Forms0], {ok, selfhost_chain_lint, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {module, selfhost_chain_lint} = code:load_binary(selfhost_chain_lint, "selfhost_chain_lint.beam", Bin), Warned = [{attribute, 1, module, chain_warned}, {attribute, 2, export, [{f, 1}]}, {function, 3, f, 1, [{clause, 3, [{var, 3, 'X'}], [], [{atom, 3, ok}]}]}], Clean = [{attribute, 1, module, chain_clean}, {attribute, 2, export, [{g, 1}]}, {function, 3, g, 1, [{clause, 3, [{var, 3, 'Y'}], [], [{var, 3, 'Y'}]}]}], Broken = [{attribute, 1, module, chain_broken}, {attribute, 2, export, [{h, 0}]}, {function, 5, h, 0, [{clause, 5, [], [], [{var, 5, 'Z'}]}]}], Diags = fun(Result) -> case Result of {ok, Ws} -> [D || {_File, Items} <- Ws, D <- Items]; {error, Es, Ws} -> {[D || {_File, Items} <- Es, D <- Items], [D || {_File, Items} <- Ws, D <- Items]}; Other -> Other end end, {Diags(selfhost_chain_lint:module(Warned)), Diags(selfhost_chain_lint:module(Clean)), Diags(selfhost_chain_lint:module(Broken)), erlang:function_exported(selfhost_chain_lint, module, 2), element(1, code:is_loaded(selfhost_chain_lint))} end"#;
+/// * the subject is the real `lib/compiler/src/erl_bifs.erl` — the pass `sys_core_fold` and the
+///   SSA passes consult for "is this call pure?", "is it safe to evaluate early?", "is it an exit
+///   BIF?", so this is the compiler's own analysis code being parsed and compiled by the runtime
+///   it is about to run on;
+/// * the module attribute is renamed (`erl_bifs` → `selfhost_chain_erl_bifs`): the installation
+///   owns `erl_bifs`, and the rename is what lets the *fresh* copy be loaded and called.
+///   `erl_bifs` contains no self-qualified call and no `?MODULE`, so every internal call of the
+///   fresh copy stays inside the fresh copy;
+/// * the observable is the fresh copy's **answers**, in both polarities of each of the three
+///   tables (`is_pure`/`is_safe`/`is_exit_bif`), so a runtime that loaded the wrong module — or
+///   none — cannot produce the golden;
+/// * no hash, no byte length and no timing is pinned; the raise is not caught (a runtime that
+///   cannot compile the pass reports its typed gap).
+const COMPILER_PASS_EXPR: &str = r#"begin File = "lib/compiler/src/erl_bifs.erl", {ok, Forms0} = epp:parse_file(File, []), Forms = [case F of {attribute, A, module, erl_bifs} -> {attribute, A, module, selfhost_chain_erl_bifs}; _ -> F end || F <- Forms0], {ok, selfhost_chain_erl_bifs, Bin} = compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic]), {module, selfhost_chain_erl_bifs} = code:load_binary(selfhost_chain_erl_bifs, "selfhost_chain_erl_bifs.beam", Bin), {selfhost_chain_erl_bifs:is_pure(erlang, abs, 1), selfhost_chain_erl_bifs:is_pure(erlang, put, 2), selfhost_chain_erl_bifs:is_safe(erlang, is_atom, 1), selfhost_chain_erl_bifs:is_safe(erlang, put, 2), selfhost_chain_erl_bifs:is_exit_bif(erlang, exit, 1), selfhost_chain_erl_bifs:is_exit_bif(erlang, abs, 1)} end"#;
 
 /// **The fresh scanner drives the next stage**: `erl_scan` compiled by the runtime, then used to
 /// tokenize the source of the next module, which is parsed, compiled, loaded and called.
@@ -406,31 +403,27 @@ fn staged_call_case() -> Case {
     }
 }
 
-/// **The compiler compiling a compiler**: `erl_lint` compiled by the runtime, then used to lint.
-fn compiled_lint_case() -> Case {
+/// **The compiler compiling one of its own passes**: `erl_bifs` compiled, then asked.
+fn compiler_pass_case() -> Case {
     Case {
-        id: "selfhost_chain/compiled_erl_lint_lints_three_modules",
+        id: "selfhost_chain/compiler_pass_answers_from_the_freshly_compiled_copy",
         description: "the A.9 compiler-compiling-a-compiler chain: compile \
-                      lib/stdlib/src/erl_lint.erl (5899 source lines) in-process, load the fresh \
-                      copy as selfhost_chain_lint, and have IT lint three form lists — one with \
-                      an unused variable, one clean, one reading an unbound variable — reporting \
-                      the diagnostics it produces and the load-state shapes",
+                      lib/compiler/src/erl_bifs.erl (the purity/safety pass) in-process, load \
+                      the fresh copy as selfhost_chain_erl_bifs, and ask IT both polarities of \
+                      is_pure/is_safe/is_exit_bif — the answers the compiler's own analysis \
+                      gives on this runtime",
         contracts: &[Contract::BeamAsm, Contract::Build],
         kind: CaseKind::Eval {
-            expr: COMPILED_LINT_EXPR,
+            expr: COMPILER_PASS_EXPR,
             extra_argv: &[],
             probe: Probe::Value,
         },
         golden: Golden {
-            stdout: Some(
-                "ok {[{3,erl_lint,{unused_var,'X'}}],[],{[{5,erl_lint,{unbound_var,'Z'}}],[]},\
-                 true,file}",
-            ),
+            stdout: Some("ok {true,false,true,false,true,false}"),
             exit_code: 0,
         },
     }
 }
-
 /// The **fresh scanner drives the next stage** (`erl_scan` compiled, then used to tokenize).
 fn compiled_scan_case() -> Case {
     Case {
@@ -530,14 +523,15 @@ fn option_list_case() -> Case {
 ///
 /// Seven cases, in the order the module docs introduce them: the stage seam against the
 /// `compile:file/2` shortcut, the compile-load-call hand-off of that route, the compiler
-/// compiling a compiler (`erl_lint`) and a scanner (`erl_scan`) which are then *used*, the
+/// compiling one of its own passes (`erl_bifs`) and a scanner (`erl_scan`) which are then
+/// *used*, the
 /// three-hop case→A→B chain, `epp`'s file-borne documentation on the staged route, and the
 /// forms route's explicit option list.
 pub(crate) fn group() -> Vec<Case> {
     vec![
         staged_relation_case(),
         staged_call_case(),
-        compiled_lint_case(),
+        compiler_pass_case(),
         compiled_scan_case(),
         two_stage_case(),
         moduledoc_file_case(),
@@ -563,8 +557,8 @@ mod tests {
             "ok {[],16,true,false,true,false,true,true,false,true,true}",
         ),
         (
-            "selfhost_chain/compiled_erl_lint_lints_three_modules",
-            "ok {[{3,erl_lint,{unused_var,'X'}}],[],{[{5,erl_lint,{unbound_var,'Z'}}],[]},true,file}",
+            "selfhost_chain/compiler_pass_answers_from_the_freshly_compiled_copy",
+            "ok {true,false,true,false,true,false}",
         ),
         (
             "selfhost_chain/compiled_erl_scan_scans_the_next_module",
@@ -724,7 +718,7 @@ mod tests {
         for (index, source) in [
             (0usize, "lib/stdlib/src/dets_sup.erl"),
             (1, "lib/stdlib/src/erl_internal.erl"),
-            (2, "lib/stdlib/src/erl_lint.erl"),
+            (2, "lib/compiler/src/erl_bifs.erl"),
             (3, "lib/stdlib/src/erl_scan.erl"),
         ] {
             let expr = expr_of(&cases[index]);
@@ -903,31 +897,27 @@ mod tests {
     #[test]
     fn the_compiled_stages_are_loaded_and_then_used() {
         let cases = group();
-        let lint = expr_of(&cases[2]);
+        let pass = expr_of(&cases[2]);
         for needle in [
-            "epp:parse_file(\"lib/stdlib/src/erl_lint.erl\", [])",
-            "{attribute, A, module, selfhost_chain_lint}",
-            "code:load_binary(selfhost_chain_lint, \"selfhost_chain_lint.beam\", Bin)",
-            "selfhost_chain_lint:module(Warned)",
-            "selfhost_chain_lint:module(Clean)",
-            "selfhost_chain_lint:module(Broken)",
-            "erlang:function_exported(selfhost_chain_lint, module, 2)",
+            "epp:parse_file(\"lib/compiler/src/erl_bifs.erl\", [])",
+            "{attribute, A, module, selfhost_chain_erl_bifs}",
+            "code:load_binary(selfhost_chain_erl_bifs, \"selfhost_chain_erl_bifs.beam\", Bin)",
+            "selfhost_chain_erl_bifs:is_pure(erlang, abs, 1)",
+            "selfhost_chain_erl_bifs:is_pure(erlang, put, 2)",
+            "selfhost_chain_erl_bifs:is_safe(erlang, is_atom, 1)",
+            "selfhost_chain_erl_bifs:is_safe(erlang, put, 2)",
+            "selfhost_chain_erl_bifs:is_exit_bif(erlang, exit, 1)",
+            "selfhost_chain_erl_bifs:is_exit_bif(erlang, abs, 1)",
         ] {
-            assert!(lint.contains(needle), "the linter chain needs {needle:?}");
+            assert!(pass.contains(needle), "the compiler-pass chain needs {needle:?}");
         }
-        let load = lint.find("code:load_binary").expect("the load");
-        let first_lint = lint
-            .find("selfhost_chain_lint:module(Warned)")
-            .expect("the lint calls");
+        let load = pass.find("code:load_binary").expect("the load");
+        let first_ask = pass
+            .find("selfhost_chain_erl_bifs:is_pure")
+            .expect("the purity questions");
         assert!(
-            load < first_lint,
-            "the freshly compiled linter is loaded before it lints"
-        );
-        // Only the diagnostics are pinned, never the diagnostic group's file element (the
-        // compiler's `"nofile"` placeholder for a form list).
-        assert!(
-            !lint.contains("nofile"),
-            "the file element of a diagnostic group is not pinned"
+            load < first_ask,
+            "the freshly compiled pass is loaded before it is asked"
         );
 
         let scan = expr_of(&cases[3]);
