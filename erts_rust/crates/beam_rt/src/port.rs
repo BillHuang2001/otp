@@ -1846,8 +1846,12 @@ impl PortRegistry {
             .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
         // A `setopts` control op is also where a socket port's option block becomes part of its
         // mirror: record the argument the driver **accepted** — its reply's leading
-        // `INET_REP_OK` tag (`inet_drv.c:870`) — so an accepted socket can inherit it (see
-        // [`ops::inet_opts`]). The reply is read, never consumed: a refused `setopts` is the
+        // `INET_REP_OK` tag (`inet_drv.c:870`) — which is what maintains the port's own
+        // `mode`/`active`/`exit_on_close` latches: the *data* mode every inet payload renderer
+        // resolves through [`PortRegistry::data_mode`], and the two latches the `peer_closed`
+        // gate reads. An accepted socket's block is inherited inside its driver
+        // (`TcpInetDriver::from_accepted`), so nothing here is retained for a replay.
+        // The reply is read, never consumed: a refused `setopts` is the
         // `Ok([0]einval)` reply and records nothing, and a failing call keeps its own path.
         if ops::inet_opts::is_setopts_control(op) {
             if let Ok(bytes) = &reply {

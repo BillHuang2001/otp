@@ -1174,9 +1174,12 @@ mod tests {
             );
         }
 
-        // The accepted values, each in its own fresh runtime so the floor stays 233.
+        // The accepted values, built on **this** runtime: a `make_map` term lives on the runtime's
+        // own `eval_heap` arena, so a term built on a throwaway `Runtime` dangles as soon as that
+        // runtime is dropped — and the applying loop below reads the very `size` word it holds.
+        // Building changes no floor (`min_heap_words` is a spawn-time policy field), so one arena
+        // serves both halves.
         let accepted: Vec<(&str, Eterm)> = {
-            let mut rt = runtime();
             vec![
                 ("size 0", max_heap_arg(&mut rt, &[("size", Some(make_small(0)))])),
                 (
