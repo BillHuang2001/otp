@@ -1208,7 +1208,9 @@ struct EngineArgsLeg {
 /// Reads the worker's `engine_args_leg:` line out of its captured stdout.
 ///
 /// The captured stream is flattened first (`~w` output may itself carry a line break, and the test
-/// harness interleaves its own progress line), so the parse depends on the field names only.
+/// harness interleaves its own progress line), so the parse depends on the field names only: the
+/// record ends at the first token that is not a `key=value` field (libtest appends `ok`,
+/// `test result: ok. …`), so the five fields must all precede it.
 fn parse_engine_args_leg(stdout: &str) -> Option<EngineArgsLeg> {
     let flattened = stdout.replace('\n', " ");
     let start = flattened.find(ENGINE_ARGS_PREFIX)?;
@@ -1219,7 +1221,9 @@ fn parse_engine_args_leg(stdout: &str) -> Option<EngineArgsLeg> {
     let mut declines = None;
     let mut live = None;
     for field in line.split_whitespace() {
-        let (key, value) = field.split_once('=')?;
+        let Some((key, value)) = field.split_once('=') else {
+            break; // the first non-`key=value` token ends the record
+        };
         let number = |value: &str| -> Option<u64> {
             value
                 .parse()
