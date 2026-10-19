@@ -24,10 +24,11 @@
 //! entries: they reset the machine, seed the registers, push the bottom frame and
 //! run the dispatch loop ([`crate::interpreter`]) to the function's `return`.
 //! Their `*_outcome` counterparts report a `receive` that finds no message as
-//! [`RunOutcome::Wait`] instead of folding it into the typed
-//! [`crate::error::blocked`] error, and [`Machine::resume_outcome`] re-enters a
-//! suspended machine without resetting it. [`Machine::run_with_tier`] selects the
-//! execution tier ([`crate::jit::Tier`]).
+//! [`RunOutcome::Wait`] — and a BIF that could not complete without waiting as
+//! [`RunOutcome::Suspend`] — instead of folding them into the typed
+//! [`crate::error::blocked`]/[`crate::error::suspended`] errors, and
+//! [`Machine::resume_outcome`] re-enters a suspended machine without resetting it.
+//! [`Machine::run_with_tier`] selects the execution tier ([`crate::jit::Tier`]).
 
 use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
@@ -40,18 +41,20 @@ use crate::jit::Tier;
 
 use super::Machine;
 
-/// The outcome of one engine run: either it returned a value, or the process blocked
-/// in a `receive` with no message available (and must be resumed at `func`/`pc`).
+/// The outcome of one engine run: it returned a value, or the process parked — in a
+/// `receive` with no message available ([`RunOutcome::Wait`]), or on a BIF that could
+/// not complete without waiting ([`RunOutcome::Suspend`]) — and must be resumed at
+/// `func`/`pc`.
 ///
 /// Produced by the blocking-aware entries [`Machine::run_export_outcome`]/
 /// [`Machine::run_label_outcome`]/[`Machine::resume_outcome`]. The plain
 /// [`Machine::run_export`]/[`Machine::run_label`] (and the JIT backends'
 /// `run_export`) are **non-blocking**: they fold a [`RunOutcome::Wait`] into the
-/// typed `Err(`[`crate::error::blocked`]`)` rather than inventing a result.
+/// typed `Err(`[`crate::error::blocked`]`)` and a [`RunOutcome::Suspend`] into
+/// `Err(`[`crate::error::suspended`]`)` rather than inventing a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// The run finished; this is `x(0)`.
-    Returned(Eterm),
+    /// The run finished; this is `x(0)`.    Returned(Eterm),
     /// The process blocked on an empty `receive`; resume at code offset `pc` of the
     /// function at index `func` (into [`Module::functions`]) once a message arrives.
     Wait {
@@ -60,21 +63,42 @@ pub enum RunOutcome {
         /// The code offset within that function to resume at.
         pc: u32,
     },
+    /// A BIF could not complete without waiting
+    /// ([`BifOutcome::Suspend`](crate::BifOutcome::Suspend)): the instruction at
+    /// `(func, pc)` was **not applied** and must be **re-executed** when the host
+    /// resumes the process there.
+    ///
+    /// This is the counterpart of [`RunOutcome::Wait`] for the other release path:
+    /// `Wait` is released by an arriving message and the resume address is the one the
+    /// `receive` reported, while `Suspend` is released by the **host** pumping its own
+    /// waiting resource and re-issuing the BIF — so the resume address is the
+    /// un-applied instruction itself. Resume with
+    /// [`Machine::resume_outcome`]/[`Machine::resume_outcome_with_tier`] exactly as for
+    /// a `Wait`; the machine's registers, stack and FR file are its whole environment
+    /// (the engine keeps no suspended-BIF state).
+    Suspend {
+        /// The function index (into [`Module::functions`]) holding the instruction to
+        /// re-execute.
+        func: u32,
+        /// The code offset of the instruction to re-execute.
+        pc: u32,
+    },
 }
 
 /// Fold a run's [`RunOutcome`] into the `Result<Eterm>` the non-blocking entries
 /// return.
 ///
-/// A [`RunOutcome::Returned`] is the value; a [`RunOutcome::Wait`] becomes the
-/// typed [`crate::error::blocked`] error, because a non-blocking entry cannot
-/// suspend the process and must never substitute a wrong result for the block.
+/// A [`RunOutcome::Returned`] is the value; a [`RunOutcome::Wait`] becomes the typed
+/// [`crate::error::blocked`] error and a [`RunOutcome::Suspend`] the typed
+/// [`crate::error::suspended`] error, because a non-blocking entry cannot suspend the
+/// process and must never substitute a wrong result for the park.
 fn fold_outcome(outcome: RunOutcome) -> Result<Eterm> {
     match outcome {
         RunOutcome::Returned(value) => Ok(value),
         RunOutcome::Wait { .. } => Err(error::blocked()),
+        RunOutcome::Suspend { .. } => Err(error::suspended()),
     }
 }
-
 impl Machine {
     /// Run the exported `function/arity` to its `return`; yields `x(0)`.
     ///
@@ -117,7 +141,8 @@ impl Machine {
         }
     }
 
-    /// Resume the **current** machine state at a [`RunOutcome::Wait`] address.
+    /// Resume the **current** machine state at a [`RunOutcome::Wait`] or
+    /// [`RunOutcome::Suspend`] address.
     ///
     /// The machine must be the one a previous outcome reported its `(func, pc)` for
     /// (typically from the same `ExecutionContext`'s mailbox): this entry
@@ -129,9 +154,14 @@ impl Machine {
     /// [`Machine::run_loop`]'s body (literal binding + label map + dispatch loop,
     /// no reset), so this delegates to it.
     ///
+    /// A [`RunOutcome::Suspend`] address **re-executes** the instruction that was left
+    /// un-applied (that is the whole point of the suspend protocol: the engine holds no
+    /// suspended-BIF state, so the instruction re-reads its operands from the
+    /// registers/stack), exactly like a [`RunOutcome::Wait`] address re-examines the
+    /// mailbox.
+    ///
     /// An out-of-range `(func, pc)` is the loop's own typed error, never a panic.
-    pub fn resume_outcome(
-        &mut self,
+    pub fn resume_outcome(        &mut self,
         module: &Module,
         func: u32,
         pc: u32,
@@ -140,10 +170,10 @@ impl Machine {
         self.run_loop(module, func, pc, ctx)
     }
 
-    /// Resume a suspended machine at a [`RunOutcome::Wait`] address on a selected
-    /// execution tier, reporting whether the resumed slice returned or blocked again.
-    ///
-    /// This is [`Machine::resume_outcome`] with the tier selection of
+    /// Resume a suspended machine at a [`RunOutcome::Wait`] or
+    /// [`RunOutcome::Suspend`] address on a selected execution tier, reporting whether
+    /// the resumed slice returned or parked again.
+    ///    /// This is [`Machine::resume_outcome`] with the tier selection of
     /// [`Machine::run_export_outcome_with_tier`]: a slice that suspended on a native
     /// tier (or on the interpreter) resumes on the **same** tier the caller names, so
     /// the tier seam survives a suspension. As with the first-entry tier entries, the
@@ -169,9 +199,8 @@ impl Machine {
     ///   driver rather than recompiling or resetting.
     /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. A resume is handed
     ///   **no** compiled artifact and the tier has no path that would compile and
-    ///   bind one at a parked address on demand, so resuming a mid-function `wait`
-    ///   address is unserviceable natively: this is a typed
-    ///   [`unsupported`](crate::error::unsupported) error (or, with the
+    ///   bind one at a parked address on demand, so resuming a mid-function
+    ///   `wait`/`suspend` address is unserviceable natively: this is a typed    ///   [`unsupported`](crate::error::unsupported) error (or, with the
     ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
     ///   path reports) — never a panic and never a silent fallback to another tier.
     pub fn resume_outcome_with_tier(

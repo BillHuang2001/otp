@@ -32,8 +32,7 @@ use beam_term::{
     atom_val, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
 };
 
-use crate::context::ExecutionContext;
-use crate::error;
+use crate::context::{BifOutcome, ExecutionContext};use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
@@ -393,15 +392,17 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, func, pc, ctx)
                 .map_err(Box::new),
             Instr::Bif0 { bif, dst } => {
                 // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                 // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
                 // is no fail label, so any error is a raise; C routes the call
                 // through `call_light_bif`, whose error path is catch-aware.
-                self.exec_bif(entry_module, module, labels, *bif, &[], NO_FAIL, dst, ctx)
-                    .map_err(Box::new)
+                self.exec_bif(
+                    entry_module, module, labels, *bif, &[], NO_FAIL, dst, func, pc, ctx,
+                )
+                .map_err(Box::new)
             }
             // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
             // Like the `GcBif` arm minus the heap/live check: on failure, jump
@@ -414,9 +415,8 @@ impl Machine {
                 dst,
                 ..
             } => self
-                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, ctx)
-                .map_err(Box::new),
-            Instr::Call { target, arity } => {
+                .exec_bif(entry_module, module, labels, *bif, args, *fail, dst, func, pc, ctx)
+                .map_err(Box::new),            Instr::Call { target, arity } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
                 // The local-call seam: a host that serves this same-module callee as a
                 // BIF answers `true` and the callee's code never runs (see
@@ -1061,9 +1061,18 @@ impl Machine {
                         pc: target_pc,
                     },
                     None => match self.call_import(entry_module, module, labels, target, arity, ctx) {
-                        Ok(value) => ApplyTarget::Called(value),
-                        Err(e) => {
-                            // An import the host cannot resolve raises `undef`, and the
+                        Ok(BifOutcome::Return(value)) => ApplyTarget::Called(value),
+                        // The BIF could not complete without waiting. This site IS
+                        // re-execution-idempotent — `call_import` only *reads*
+                        // `x(0..arity)` — so parking here applies nothing: no
+                        // continuation is stored, no frame is popped and `x(0)` is
+                        // untouched, which is exactly what makes the engine's resume
+                        // (a re-execution of this instruction) produce the pending
+                        // call's own value. An `apply/3` import never reaches this arm
+                        // (it is handled by `resolve_call_ext_apply` above, the site
+                        // that must NOT park).
+                        Ok(BifOutcome::Suspend) => return Ok(Step::Suspend { func, pc }),
+                        Err(e) => {                            // An import the host cannot resolve raises `undef`, and the
                             // oracle's cooked trace then names the **callee** with its
                             // argument list as the innermost item (C's
                             // `erts_build_mfa_item` with the exception's saved args —
@@ -1174,10 +1183,15 @@ impl Machine {
             nregs,
             ctx,
         ) {
-            Ok(value) => value,
+            Ok(BifOutcome::Return(value)) => value,
+            // The served callee's BIF could not complete without waiting. Nothing has
+            // been applied yet (the seam reads `x(0..nregs)` only, and no continuation
+            // is stored, no frame popped before this point), so the seam reports a park
+            // on the *call instruction* — re-executing it re-asks the host, which
+            // re-issues the BIF with the same registers.
+            Ok(BifOutcome::Suspend) => return Ok(Some(Step::Suspend { func, pc })),
             Err(e) => return self.raise_bif_error(module, e, ctx).map_err(Box::new).map(Some),
-        };
-        self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
+        };        self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)
     }
     /// Apply an arm's own frame discipline to the [`ApplyTarget`]

@@ -120,8 +120,7 @@ use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Module, Operand};
 use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
 
-use crate::context::{ExecutionContext, RootSet};
-use crate::error;
+use crate::context::{BifOutcome, ExecutionContext, RootSet};use crate::error;
 use crate::families::exceptions::callee;
 use crate::machine::{namespace_atom, Continuation, Machine};
 use crate::operand::{
@@ -696,7 +695,21 @@ pub(crate) fn apply_target(
         &args,
         ctx,
     ) {
-        Ok(value) => Ok(ApplyTarget::Called(value)),
+        Ok(BifOutcome::Return(value)) => Ok(ApplyTarget::Called(value)),
+        // A suspend CANNOT be honoured here: this site is **not**
+        // re-execution-idempotent. Its caller has already rewritten the register file —
+        // `resolve_call_ext_apply` walked `apply/3`'s argument list into `x(0..N)` and
+        // put `M`/`F` in `x(N)`/`x(N+1)` (`interpreter/dispatch.rs`) — so re-executing
+        // the instruction on resume would re-read *clobbered* registers and apply a
+        // different call. Honouring it needs C's mechanism: `BIF_TRAP_N` writes the
+        // BIF's arguments into the process-private `c_arg_reg`/`arg_reg` array
+        // (`erts/emulator/beam/bif.h:406-423`, saved by `copy_out_registers` and
+        // restored by `copy_in_registers` — `beam_common.c:306`/`:336`) so the
+        // re-issued BIF sees the original operands. Until that exists, reporting the
+        // typed error (never a value, never a wrong call) is the only honest answer.
+        Ok(BifOutcome::Suspend) => Err(error::unsupported(
+            "bif suspend at a non-idempotent dispatch site: apply/3 rewrites x(0..arity)",
+        )),
         Err(e) => {
             let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
             Ok(ApplyTarget::Raised(
@@ -705,7 +718,6 @@ pub(crate) fn apply_target(
         }
     }
 }
-
 /// Raise the `badarg` semantic error through the machine, landing it in a live
 /// catch frame (or a typed [`BeamError::BadArg`] when there is none).
 ///

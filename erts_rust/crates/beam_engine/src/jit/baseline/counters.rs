@@ -612,7 +612,7 @@ pub(crate) fn record_block(ir_len: u64, allocation: &Allocation, bytes: u64) {
     });
 }
 
-/// The word class of a block-ABI word (`HALT`/`ERROR`/`ENTER`/`WAIT`/`GOTO`).
+/// The word class of a block-ABI word (`HALT`/`ERROR`/`ENTER`/`SUSPEND`/`WAIT`/`GOTO`).
 fn word_class(word: i64) -> &'static str {
     if word == super::HALT {
         "HALT"
@@ -620,13 +620,14 @@ fn word_class(word: i64) -> &'static str {
         "ERROR"
     } else if word == super::ENTER {
         "ENTER"
+    } else if word == super::SUSPEND {
+        "SUSPEND"
     } else if super::decode_wait(word).is_some() {
         "WAIT"
     } else {
         "GOTO"
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

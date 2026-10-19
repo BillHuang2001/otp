@@ -71,9 +71,10 @@ impl Machine {
     ///
     /// Reports a `receive` that finds no message as [`RunOutcome::Wait`] (leaving the
     /// machine untouched at the reported address, and the context in
-    /// [`Machine::current_context`] for the resume), and a `return`/halt as
-    /// [`RunOutcome::Returned`].
-    ///
+    /// [`Machine::current_context`] for the resume), a BIF that answered
+    /// [`crate::BifOutcome::Suspend`] as [`RunOutcome::Suspend`] (likewise untouched, at
+    /// the *un-applied* instruction's own address), and a `return`/halt as
+    /// [`RunOutcome::Returned`].    ///
     /// Also latches the A.8 tracing gate **once per run**: the per-instruction
     /// call/return arms read the plain `Machine::trace_on` `bool` instead of making a
     /// `trace_enabled()` vtable call per instruction, so an untraced run pays a
@@ -240,7 +241,15 @@ impl Machine {
                 Step::Wait { func: f, pc: p } => {
                     return Ok(RunOutcome::Wait { func: f, pc: p })
                 }
-                Step::Done => return self.finish().map(RunOutcome::Returned),
+                // A BIF answered `BifOutcome::Suspend`: the instruction at `(func, pc)`
+                // was NOT applied, so the reported address is the instruction itself and
+                // the host's resume **re-executes** it. The machine is left exactly as
+                // the pre-execution state (no register but `x(0)` — and not even that —
+                // was written by a suspending site), so the re-execution reads the same
+                // operands.
+                Step::Suspend { func: f, pc: p } => {
+                    return Ok(RunOutcome::Suspend { func: f, pc: p })
+                }                Step::Done => return self.finish().map(RunOutcome::Returned),
             }
         }
     }

@@ -29,7 +29,11 @@
 //! A raise is **not** a [`Step`]: it stays an `Err(beam_common::BeamError)` (the
 //! exception layer either folds it into a `Step::Goto` to a catch handler or lets
 //! it propagate out of the run).
-
+//!
+//! Two variants park the process instead of continuing, and both are `Copy` (so they
+//! carry no payload beyond the address): [`Step::Wait`] for a `receive` with no
+//! message (released by the mailbox) and [`Step::Suspend`] for a BIF that answered
+//! [`crate::BifOutcome::Suspend`] (released by the host, which re-issues the BIF).
 /// The control-flow decision an instruction family returns to the dispatch loop.
 ///
 /// Produced by the `crate::families` bodies; consumed by the interpreter's
@@ -61,9 +65,35 @@ pub(crate) enum Step {
         /// The code offset within that function to resume at.
         pc: u32,
     },
-    /// Switch the machine's **module context** and continue at `(func, pc)` in that
-    /// module.
+    /// The instruction at `(func, pc)` was **not applied** and must be re-executed when
+    /// the process resumes there.
     ///
+    /// Produced when a BIF answers
+    /// [`BifOutcome::Suspend`](crate::BifOutcome::Suspend) at a re-execution-idempotent
+    /// dispatch site: the BIF could not complete without waiting (a plain
+    /// `erlang:port_command/2,3` at a busy port, a blocking port write) and the host
+    /// will re-issue it from the same instruction with the same operands once it has
+    /// pumped. The difference from [`Step::Wait`] is only *who* releases the park: the
+    /// mailbox there, the host here — with [`Step::Wait`] the instruction (`loop_rec`)
+    /// *did* run and the resume address is the one it reports; with `Suspend` the
+    /// instruction did **not** run and the address is the instruction itself.
+    ///
+    /// The dispatch loop reports it as [`crate::RunOutcome::Suspend`] (leaving the
+    /// registers/frames untouched so the host can re-enter at the same address via
+    /// [`crate::Machine::resume_outcome`], which re-executes the instruction); a
+    /// **non-blocking** entry folds it into the typed
+    /// [`crate::error::suspended`] error instead. The engine keeps no suspended-BIF
+    /// state: the instruction's operands are re-read from `x`/`y`/literals/stack, i.e.
+    /// from the frozen [`crate::context::RootSet`], so they are rooted by construction.
+    Suspend {
+        /// The function index (into [`beam_loader::Module::functions`]) holding the
+        /// instruction to re-execute.
+        func: u32,
+        /// The code offset of the instruction to re-execute.
+        pc: u32,
+    },
+    /// Switch the machine's **module context** and continue at `(func, pc)` in that
+    /// module.    ///
     /// Produced by the two places where control crosses a module boundary *inside*
     /// one machine: the `call_ext*` arms, when the host resolved the cross-module
     /// call through

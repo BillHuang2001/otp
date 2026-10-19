@@ -115,9 +115,8 @@ mod step;
 mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
-pub use context::{ExecutionContext, Mailbox, MinimalContext, TraceEvent};
-pub use error::{bad_register, blocked, unknown_label, unsupported};
-pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
+pub use context::{BifOutcome, ExecutionContext, Mailbox, MinimalContext, TraceEvent};
+pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub use supplied_stacktrace::encode_supplied_stacktrace;
 pub(crate) use step::Step;
@@ -132,7 +131,7 @@ pub(crate) use step::Step;
 /// encoder [`encode_supplied_stacktrace`] (with its
 /// [`Machine::encode_supplied_stacktrace`] twin) into scope.
 pub mod prelude {
-    pub use crate::context::{ExecutionContext, Mailbox, MinimalContext, TraceEvent};
+    pub use crate::context::{BifOutcome, ExecutionContext, Mailbox, MinimalContext, TraceEvent};
     pub use crate::jit::Tier;
     pub use crate::machine::{Machine, RunOutcome, MAX_REGISTER};
     pub use crate::supplied_stacktrace::encode_supplied_stacktrace;

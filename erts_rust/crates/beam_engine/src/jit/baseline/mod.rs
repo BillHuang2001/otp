@@ -243,9 +243,8 @@ pub use code::CompiledModule;
 pub(crate) use code::CompiledFunction;
 pub use runtime::{
     decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, LOCAL_DECLINE,
-    WAIT_BIT,
-};
-pub(crate) use runtime::{
+    SUSPEND, WAIT_BIT,
+};pub(crate) use runtime::{
     jit_ext_call, jit_local_call, jit_set_position, jit_step_one, JitRuntime,
 };
 
@@ -800,17 +799,16 @@ pub(crate) fn run_native(
     match run_native_outcome(machine, module, function, arity, args, ctx, code)? {
         RunOutcome::Returned(value) => Ok(value),
         RunOutcome::Wait { .. } => Err(crate::error::blocked()),
+        RunOutcome::Suspend { .. } => Err(crate::error::suspended()),
     }
 }
-
 /// The outcome-aware driver loop both native tiers run on.
 ///
 /// The exact body of [`run_native`] with a [`RunOutcome`] result instead of the
 /// folded `x(0)`: the machine is reset, `x[0..arity)` is seeded from `args`, the
 /// bottom frame is pushed, the export label is resolved and the driver loop runs.
 ///
-/// Every way a suspension can reach the driver is reported as
-/// [`RunOutcome::Wait`](crate::RunOutcome::Wait) with the exact resume address the
+/// Every way a suspension can reach the driver is reported with the exact address the
 /// interpreter would report:
 ///
 /// * a compiled block that deopts to [`jit_step_one`] for a `wait`/`wait_timeout`
@@ -819,6 +817,11 @@ pub(crate) fn run_native(
 /// * the driver's own interpreter step returns [`Step::Wait`](crate::Step::Wait)
 ///   directly.
 ///
+/// A parked **BIF** ([`crate::BifOutcome::Suspend`]) is reported the same way: the
+/// [`SUSPEND`] word (with its address in [`JitRuntime::suspend`]) or a
+/// [`Step::Suspend`](crate::Step::Suspend) from the driver's own step becomes
+/// [`crate::RunOutcome::Suspend`] at the **un-applied** instruction, which the host's
+/// resume re-executes.///
 /// A [`HALT`] word finishes the run with `x(0)` and an [`ERROR`] word propagates
 /// `rt.error`; every other word is a `(func, pc)` continuation. Nothing is
 /// silently continued and nothing is invented.
@@ -1108,7 +1111,7 @@ fn drive(
         ctx: ctx_ptr,
         error: None,
         enter: None,
-        y_base: std::ptr::null_mut(),
+        suspend: None,        y_base: std::ptr::null_mut(),
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
@@ -1262,8 +1265,22 @@ fn drive(
                 pc = target_pc;
                 continue;
             }
-            if let Some((wait_func, wait_pc)) = decode_wait(word) {
-                // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
+            if word == SUSPEND {
+                // A block deopted at a BIF that answered `BifOutcome::Suspend`: the
+                // instruction was NOT applied and its exit already spilled the cached
+                // registers, so the machine is exactly the pre-execution state. The
+                // address rides the runtime's side channel (`SUSPEND` carries none) and
+                // the host resumes by re-executing that instruction.
+                let (suspend_func, suspend_pc) = rt
+                    .suspend
+                    .take()
+                    .ok_or_else(|| error::unsupported("jit: suspend word without an address"))?;
+                return Ok(RunOutcome::Suspend {
+                    func: suspend_func,
+                    pc: suspend_pc,
+                });
+            }
+            if let Some((wait_func, wait_pc)) = decode_wait(word) {                // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
                 // the cached registers, so the machine is exactly as the interpreter's
                 // own suspension leaves it and the host can resume at this address.
                 return Ok(RunOutcome::Wait {
@@ -1335,7 +1352,20 @@ fn drive(
                     pc: wait_pc,
                 })
             }
-            Step::Enter {
+            // A BIF answered `BifOutcome::Suspend` on the driver's own interpreter step:
+            // the instruction at `(func, pc)` was not applied, so the park address is the
+            // instruction itself and the host's resume re-executes it. Nothing to undo —
+            // the step left the register file untouched (the calling arm applies nothing
+            // on a suspend).
+            Step::Suspend {
+                func: suspend_func,
+                pc: suspend_pc,
+            } => {
+                return Ok(RunOutcome::Suspend {
+                    func: suspend_func,
+                    pc: suspend_pc,
+                })
+            }            Step::Enter {
                 context,
                 func: target_func,
                 pc: target_pc,

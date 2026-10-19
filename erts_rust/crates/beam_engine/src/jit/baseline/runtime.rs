@@ -72,6 +72,19 @@ pub const ERROR: i64 = -2;
 /// it can never be confused with a real [`encode_target`] continuation.
 pub const ENTER: i64 = -3;
 
+/// The `SUSPEND` block-return word: the block's per-instruction deopt hit a BIF that
+/// answered [`BifOutcome::Suspend`](crate::BifOutcome::Suspend)
+/// ([`Step::Suspend`]), and stored the **un-applied instruction's** `(func, pc)` in the
+/// runtime's [`JitRuntime::suspend`] slot.
+///
+/// A compiled block owns no host state and cannot park the process itself, so the word
+/// is a *driver* action exactly like [`ENTER`]: the driver takes the address from the
+/// side channel and reports [`crate::RunOutcome::Suspend`], leaving the register file
+/// and the frames untouched (the block's exit spilled its cached registers first, so
+/// the machine is exactly the pre-execution state a re-execution needs). Like
+/// [`HALT`]/[`ERROR`]/[`ENTER`] the word carries no address, and it is negative so it
+/// can never be confused with a real [`encode_target`] continuation.
+pub const SUSPEND: i64 = -5;
 /// Encodes a `(func, pc)` continuation as the block-return word.
 ///
 /// `func` is the function index into [`Module::functions`], `pc` the code offset
@@ -117,14 +130,19 @@ pub const fn encode_wait(func: u32, pc: u32) -> i64 {
 
 /// Decodes a [`Step::Wait`] block-return word into its `(func, pc)` resume address,
 /// or `None` for every other word (a real continuation, [`HALT`], [`ERROR`],
-/// [`ENTER`] or [`LOCAL_DECLINE`]).
+/// [`ENTER`], [`LOCAL_DECLINE`] or [`SUSPEND`]).
 pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
-    if word >= 0 || word == HALT || word == ERROR || word == ENTER || word == LOCAL_DECLINE {
+    if word >= 0
+        || word == HALT
+        || word == ERROR
+        || word == ENTER
+        || word == LOCAL_DECLINE
+        || word == SUSPEND
+    {
         return None;
     }
     decode_target(word & !WAIT_BIT)
 }
-
 /// The one argument a compiled block receives.
 ///
 /// A `#[repr(C)]` bag of raw pointers at the live driver-owned objects (valid for
@@ -199,8 +217,20 @@ pub(crate) struct JitRuntime<'a> {
     ///
     /// Read and written **only by Rust** (the driver and [`jit_step_one`]).
     pub(crate) enter: Option<(u32, u32, u32)>,
-    /// The base of the **literal area** the machine currently has bound — the first
-    /// word of `Module::literals.terms()` for the active module.
+    /// The `(func, pc)` of the **un-applied** instruction a helper reported with the
+    /// [`SUSPEND`] word; the driver takes it, reports
+    /// [`crate::RunOutcome::Suspend`] and leaves the machine untouched so the host's
+    /// resume re-executes that instruction.
+    ///
+    /// The [`JitRuntime::enter`] slot's twin: the block ABI has room for one small
+    /// negative sentinel but not for an address beside it, so the address rides the
+    /// runtime instead.
+    ///
+    /// Read and written **only by Rust** (the driver and the helpers), never by
+    /// generated code; its position in the struct is immaterial because every offset
+    /// emitted code uses is computed with [`mem::offset_of!`].
+    pub(crate) suspend: Option<(u32, u32)>,
+    /// The base of the **literal area** the machine currently has bound — the first    /// word of `Module::literals.terms()` for the active module.
     ///
     /// A compiled block loads `Operand::Literal(n)` through this field
     /// (`[literals_base + n*8]`, behind the guard below) instead of materialising the
@@ -607,7 +637,15 @@ pub(crate) fn fold_ok_step(runtime: &mut JitRuntime<'_>, step: Step, func: u32, 
         // the typed `blocked` error (never a wrong result and never a silent
         // continue at the `wait`'s own re-examination label).
         Step::Wait { func, pc } => encode_wait(func, pc),
-        // A module-context transfer (a `call_ext*` the host resolved through
+        // A BIF answered `BifOutcome::Suspend`: the instruction at `(func, pc)` was NOT
+        // applied, and the driver must report it (as `RunOutcome::Suspend`) so the host
+        // can resume by re-executing it. A word carries no address beside its sentinel,
+        // so the address rides the runtime's side channel — the [`Step::Enter`]
+        // precedent below.
+        Step::Suspend { func, pc } => {
+            runtime.suspend = Some((func, pc));
+            SUSPEND
+        }        // A module-context transfer (a `call_ext*` the host resolved through
         // `ExecutionContext::resolve_external_call`, a `return` onto a
         // caller-context continuation, or a raise landing in another context's catch
         // frame). A compiled block's code, label map and literal area are all bound
@@ -653,7 +691,10 @@ pub(crate) fn fold_err(runtime: &mut JitRuntime<'_>, err: BeamError) -> i64 {
 ///   it as [`crate::RunOutcome::Wait`] and a **non-blocking** one folds it into the
 ///   typed [`crate::error::blocked`] error (a `receive` that finds no message cannot
 ///   suspend such an entry),
-/// * [`Step::Done`] → [`HALT`],
+/// * [`Step::Suspend { func, pc }`] → [`SUSPEND`] with the address parked in
+///   [`JitRuntime::suspend`]: the instruction was **not** applied, so the driver
+///   reports [`crate::RunOutcome::Suspend`] and the host's resume re-executes it (a
+///   non-blocking entry folds it into [`crate::error::suspended`]),/// * [`Step::Done`] → [`HALT`],
 /// * `Err(error)` → the error is stored in `rt.error` and [`ERROR`] is returned.
 pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
