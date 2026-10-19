@@ -3018,7 +3018,7 @@ impl PortHook for RuntimePorts {
         if spec.kind == PortName::SpawnDriver {
             // The driver name is the prefix up to the first blank — the C's own rule (`io.c` walks
             // the name to the first blank before matching `driver_name`), the same rule
-            // [`driver_lookup`] applies to build the `.so` candidates.
+            // [`driver_lookup`] applies to build the driver-object candidates.
             let (candidates, driver_name) = driver_lookup(&spec.command);
             // The registry borrow is taken for the **whole** arm: neither branch re-enters a port
             // operation (`register` starting a driver cannot re-enter the port table, and the
@@ -3911,28 +3911,49 @@ fn driver_path_name(command: &str) -> &str {
 /// * a name that contains `/` is taken as the object's path, and the driver name validated against
 ///   the entry is the path's file stem with the platform suffix removed (`…/t` and `…/t.so` both
 ///   name the driver `t`). This is what lets a driver outside the loader's search path be reached;
-/// * a bare name is tried as itself, as `<name>.so` and as `./<name>` (the runtime's own
-///   directory), with `<name>` as the driver name — the C's answer for a name in its search path.
+/// * a bare name is tried as itself and as `./<name>` (the runtime's own directory), with `<name>`
+///   as the driver name — the C's answer for a name in its search path.
 ///
-/// `load_driver` appends the platform's shared-object suffix to a candidate that does not already
-/// carry it, so the `<name>` candidate resolves `<name>.so`. A name that reaches no object, or an
-/// object whose entry declares another name, is [`BeamError::BadArg`] at the call site — the oracle's
-/// own reason for an unknown driver.
+/// Every candidate is a **suffix-free spelling**, because the `dlopen` loader appends the platform's
+/// shared-object suffix unconditionally, exactly as the oracle does (`beam_abi::driver::loader::load`;
+/// `erts_sys_ddll_open` copies `FILE_EXT` after the given path,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`). So `…/t` and `…/t.so` both yield the
+/// candidate `…/t` (which the loader opens as `…/t.so`, never `…/t.so.so`), and a bare `foo.so` is
+/// searched as `foo`/`./foo` instead of as `foo.so.so` (the bare-name driver name stays the name as
+/// written). A name that reaches no object, or an object whose entry declares another name, is
+/// [`BeamError::BadArg`] at the call site — the oracle's own reason for an unknown driver.
 fn driver_lookup(name: &str) -> (Vec<String>, String) {
     let path = driver_path_name(name);
-    let mut candidates = vec![path.to_string(), format!("{path}.so")];
+    // The suffix-free spelling the loader expects — it appends the suffix itself, so a candidate
+    // that still carried one would be handed to `dlopen` as `<path>.so.so`.
+    let object = strip_shared_object_suffix(path);
+    let mut candidates = vec![object.to_string()];
     let driver_name = if path.contains('/') {
-        let base = std::path::Path::new(path)            .file_name()
+        let base = std::path::Path::new(path)
+            .file_name()
             .and_then(|stem| stem.to_str())
             .unwrap_or(path);
-        base.strip_suffix(".so").unwrap_or(base).to_string()
+        strip_shared_object_suffix(base).to_string()
     } else {
         // `dlopen` searches the loader's path for a name without a slash, never the current
         // directory, so the runtime's own directory is an explicit candidate.
-        candidates.push(format!("./{path}"));
+        candidates.push(format!("./{object}"));
         path.to_string()
     };
     (candidates, driver_name)
+}
+
+/// The platform shared-object suffix, i.e. what [`beam_abi::driver::loader::load`] appends to every
+/// path it is handed (`std::env::consts::DLL_SUFFIX`: `.so` on Unix, the oracle's `FILE_EXT`).
+const SHARED_OBJECT_SUFFIX: &str = std::env::consts::DLL_SUFFIX;
+
+/// `path` with one trailing shared-object suffix removed — the **suffix-free spelling** the driver
+/// loader expects, since [`beam_abi::driver::loader::load`] appends the platform's suffix
+/// unconditionally (`erts_sys_ddll_open`, `erl_unix_sys_ddll.c:104-118`). Only an *exact* trailing
+/// suffix is removed, so a driver object legitimately named `foo.so.1` is left alone (the oracle
+/// would open `foo.so.1.so`).
+fn strip_shared_object_suffix(path: &str) -> &str {
+    path.strip_suffix(SHARED_OBJECT_SUFFIX).unwrap_or(path)
 }
 
 /// The validated **non-empty** command/path a `{spawn, Cmd}`/`{spawn_executable, Path}` name

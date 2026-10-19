@@ -1893,11 +1893,12 @@ impl DriverHost for DriverPort {
 
 /// Loads the driver shared object for `name`, trying each of `candidates` in order.
 ///
-/// The candidate spellings are the caller's (typically the driver name as written in
-/// `open_port({spawn_driver, Name}, …)`, then the explicit `<Name>.so`); the `dlopen` loader appends
-/// the platform's shared-object suffix when a candidate does not already carry it
-/// (`beam_abi::driver::loader::load`), so `["t", "t.so"]` resolves `<dir>/t.so` on the first and the
-/// second attempt alike, and `["/abs/t"]` resolves `/abs/t.so`.
+/// Every candidate must be a **suffix-free spelling**: the `dlopen` loader appends the platform's
+/// shared-object suffix unconditionally, exactly as the oracle does
+/// (`beam_abi::driver::loader::load`; `erts_sys_ddll_open` copies `FILE_EXT` after the given path,
+/// `erts/emulator/sys/unix/erl_unix_sys_ddll.c:104-118`). So `["t"]` resolves `<dir>/t.so` via the
+/// loader's suffix, and `["/abs/t"]` resolves `/abs/t.so` — where a candidate that already carried
+/// `.so` would be handed to `dlopen` as `<path>.so.so`.
 ///
 /// A failure is the loader's own typed [`DriverLoadError`] (its [`DriverLoadError::reason_atom`] is
 /// the oracle's `{error, Reason}` atom) — never a fabricated success and never a panic. The **last**
