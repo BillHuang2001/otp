@@ -55,10 +55,17 @@
 //!   `catchlevel_value` consult that slot first;
 //! * clears the slot **immediately** after the nested call returns.
 //!
+//! The same window carries the **`binary` item's engine half**: when (and only when) the
+//! query names `binary`, the live machine's off-heap refc-binary reservoir
+//! ([`Machine::refc_binaries`]) is read into the published value too, so
+//! `erlang:process_info(self(), binary)` lists the payload the process just built —
+//! [`crate::native::memory`]'s `snapshot` takes it as the reservoir half of the roster
+//! union for the executing pid. A query that does not name `binary` reads no reservoir at
+//! all, and every other query keeps the runner-state route.
+//!
 //! Everything else — another pid, a nested query, a name that is not one of the five —
 //! falls straight through to the ordinary path, so a typed gap stays a typed gap and no
-//! frame is ever fabricated.
-//!
+//! frame is ever fabricated.//!
 //! # Soundness of the published terms
 //!
 //! The five values are the engine's own builders
@@ -68,12 +75,16 @@
 //! BIF call is in flight** (the engine publishes no root set at a BIF dispatch, so the
 //! heap-admission point is never reached from inside — `crate::context::gc`), and the
 //! window is exactly one nested `call_bif` with no `?` between publication and clearing.
-
+//!
+//! The `binary` roster is copied out as plain `usize` triples, never as a term: the payloads
+//! stay owned by the machine's own reservoir for the whole window (the machine is alive and
+//! nothing prunes it while a BIF runs), so the pointer, length and refcount are live figures,
+//! and the reply's integers are built from them afterwards rather than from the payload.
 use beam_common::Result;
-use beam_engine::{ExecutionContext, Machine};
+use beam_engine::{ExecutionContext, Machine, terms};
 use beam_loader::Module;
 use beam_process::ProcessId;
-use beam_term::{make_small, Eterm};
+use beam_term::{atom_val, is_atom, make_small, Eterm};
 
 use super::runtime_context::RuntimeContext;
 
@@ -101,8 +112,17 @@ pub(crate) struct InMachinePosition {
     current_stacktrace: Option<Eterm>,
     /// `catchlevel`: the live catch-frame depth.
     catchlevel: Option<Eterm>,
+    /// The `binary` item's engine half: the executing machine's off-heap refc-binary
+    /// reservoir ([`Machine::refc_binaries`]) as `(payload pointer, byte length,
+    /// refcount)` triples, in build order.
+    ///
+    /// `None` — the read is **gated** on the query naming the `binary` item (see
+    /// [`RuntimeContext::machine_position`]) — means "not read for this query", which is
+    /// every query but `process_info(self(), binary)` and a list form containing it, so
+    /// nothing else pays for the roster. `Some(vec)` is a real answer, possibly empty (a
+    /// process holding no off-heap payload).
+    off_heap_binaries: Option<Vec<(usize, usize, usize)>>,
 }
-
 impl InMachinePosition {
     /// The published value of the machine-sourced item `name`, or `None` when `name` is not
     /// one of the five machine-sourced items (or the machine has no such position).
@@ -187,6 +207,15 @@ impl RuntimeContext<'_> {
     /// Otherwise the five values are read **once**, from the live machine, against the run's
     /// entry module (the module the machine's context-`0` frames belong to — `beam_engine`
     /// threads it here because a [`Machine`] borrows context `0` rather than owning it).
+    ///
+    /// # The `binary` roster is read only when the query names it
+    ///
+    /// The machine's off-heap refc-binary reservoir is the `binary` item's engine half
+    /// (`crate::native::memory`), and reading it means one triple per payload. It is
+    /// therefore **gated**: [`RuntimeContext::names_binary_item`] is consulted first, and only
+    /// a query whose second argument is the atom `binary` — or a list containing it — pays.
+    /// Every other self query of `process_info/2` (and every `process_info/1`, whose fixed
+    /// key set has no `binary` item) stores `None` and reads nothing.
     fn machine_position(
         &mut self,
         machine: &Machine,
@@ -206,6 +235,24 @@ impl RuntimeContext<'_> {
         if pid != self.pid() {
             return Ok(None);
         }
+        let off_heap_binaries = if self.names_binary_item(args) {
+            // The reservoir is the one holder of the payloads this process's own compiled
+            // bitstring code built (`bs_create_bin`/`bs_init_writable` above
+            // `ERL_ONHEAP_BINARY_LIMIT`), and no collection can run while a BIF call is in
+            // flight, so each pointer stays live and `refcount()` is the live count for the
+            // whole published window.
+            Some(
+                machine
+                    .refc_binaries()
+                    .iter()
+                    .map(|binary| {
+                        (binary.data_ptr() as usize, binary.len(), binary.refcount())
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
         Ok(Some(InMachinePosition {
             pid,
             initial_call: machine.initial_call(entry_module, self)?,
@@ -213,9 +260,35 @@ impl RuntimeContext<'_> {
             current_location: machine.current_location(entry_module, self)?,
             current_stacktrace: Some(machine.current_stacktrace(entry_module, self)?),
             catchlevel: Some(make_small(machine.catch_frame_depth() as i64)),
+            off_heap_binaries,
         }))
     }
 
+    /// Whether this `erlang:process_info/2` call asks for the `binary` item — the atom
+    /// `binary` on its own, or a list of items containing it.
+    ///
+    /// The comparison is by **atom index** against the shared table (`binary` is interned by
+    /// the very call that asks for it), so no name is materialized: an atom inside the
+    /// process table is one word compare. Anything else — an arity-1 call (whose fixed key
+    /// set has no `binary` item), the `{dictionary, Key}` form, a non-atom, a non-list, an
+    /// improper list — answers `false`, so the roster is simply not read.
+    fn names_binary_item(&self, args: &[Eterm]) -> bool {
+        let Some(item) = args.get(1).copied() else {
+            return false;
+        };
+        let Some(binary) = self.runtime.code_server.atoms().lookup("binary") else {
+            return false;
+        };
+        let is_binary_atom =
+            |term: Eterm| is_atom(term) && atom_val(term) == binary;
+        if is_binary_atom(item) {
+            return true;
+        }
+        match terms::list_elements(item) {
+            Ok(items) => items.iter().any(|term| is_binary_atom(*term)),
+            Err(_) => false,
+        }
+    }
     /// The published machine answer for the item `name` of `pid`, when the in-machine door is
     /// open for exactly that pid.
     ///
@@ -229,5 +302,33 @@ impl RuntimeContext<'_> {
             return None;
         }
         position.value(name)
+    }
+
+    /// The `binary` item's engine half for `pid`, when the in-machine door published a roster
+    /// for exactly that pid.
+    ///
+    /// Consumed by [`crate::native::memory`]'s `snapshot` as the **reservoir half** of the
+    /// roster union: the executing process's own machine is out of the runner state for the
+    /// whole slice ([`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at)
+    /// answers nothing for it), so this is the only source that can name the payload a process
+    /// built earlier in the very slice that asks.
+    ///
+    /// `None` for every other read, so a caller falls through to
+    /// [`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at) unchanged:
+    /// * the door closed (a library caller with no
+    ///   [`Machine`], the `-eval` route's own tree-walker) — no roster is fabricated;
+    /// * a **different** pid (a nested non-self query while an outer door call is in flight);
+    /// * a query that does not name the `binary` item (the roster was never read).
+    ///
+    /// [`Machine`]: beam_engine::Machine
+    pub(crate) fn in_machine_off_heap_binaries(
+        &self,
+        pid: ProcessId,
+    ) -> Option<&[(usize, usize, usize)]> {
+        let position = self.runtime.in_machine.as_ref()?;
+        if position.pid != pid {
+            return None;
+        }
+        position.off_heap_binaries.as_deref()
     }
 }

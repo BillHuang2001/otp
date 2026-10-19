@@ -267,6 +267,16 @@ impl<'a> RuntimeContext<'a> {
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // The NIF-resource prune's scope for this run: the candidate set as it stands *before*
+            // the run starts, so its epilogue may release only the resource terms this run itself
+            // minted (see [`RuntimeContext::adopt_nested_payloads`]). A per-run local, because
+            // nested runs recurse.
+            let frontier = crate::eval::reclaim::Frontier::snapshot();
+            // The `-eval` statement window's latch for this run: the machine below holds its roots
+            // where the window's descent cannot see them, so a run that **wrote** on the runtime
+            // store latches the window (see `crate::eval::scratch` and
+            // `Runtime::pin_window_if_store_written`).
+            let store_used_before = this.runtime.eval_heap.used();
             let mut machine = Machine::new();
             let result = match machine.run_export_outcome(module, function, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
@@ -279,7 +289,8 @@ impl<'a> RuntimeContext<'a> {
             // this run cannot see it) may still point at one. Adopt them into the runtime's
             // escaped-payload store **before** that drop, and release the ones this run built
             // that nothing names any more (see [`RuntimeContext::adopt_nested_payloads`]).
-            this.adopt_nested_payloads(machine, &result);
+            this.adopt_nested_payloads(machine, &result, &frontier);
+            let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
     }
@@ -335,6 +346,12 @@ impl<'a> RuntimeContext<'a> {
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // As [`Self::run_export_blocking`]: this run's NIF-resource prune scope, taken before
+            // the body runs.
+            let frontier = crate::eval::reclaim::Frontier::snapshot();
+            // As [`Self::run_export_blocking`]: the `-eval` statement window's latch for this run,
+            // because the closure's `Machine` holds its roots outside the window's descent.
+            let store_used_before = this.runtime.eval_heap.used();
             let mut machine = Machine::new();
             let result = match machine.run_label_outcome(module, label, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
@@ -345,14 +362,16 @@ impl<'a> RuntimeContext<'a> {
             // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
             // before the machine holding them is dropped, and release the ones this run built
             // that nothing names any more.
-            this.adopt_nested_payloads(machine, &result);
+            this.adopt_nested_payloads(machine, &result, &frontier);
+            let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
     }
 
     /// The nested run's epilogue: adopt every off-heap payload handle the just-finished
-    /// `machine` built, and — when the escaped-payload store is due a prune — release the ones
-    /// **this run itself** built that no live term names.
+    /// `machine` built, then release the ones **this run itself** built that no live term names —
+    /// for both stores this runtime owns, the escaped refc-payload store and the ABI's NIF
+    /// **resource-term** registry.
     ///
     /// Adoption is unconditional: the returned term (and every term the callee stored where
     /// this run cannot see it) may name a payload whose only owner is about to be dropped, so
@@ -361,38 +380,65 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// # Publish, then prune
     ///
-    /// The root set of the prune is this machine's own: its X registers, its whole Erlang
+    /// The root set of both prunes is this machine's own: its X registers, its whole Erlang
     /// stack and its FR file, published through the engine's frozen root-set hand-off with
     /// [`RootSet::ALL_LIVE`] — an over-publish on purpose (a root set may be too large, never
     /// too small; the `live` field is a hint a collector clamps). The returned term is added to
     /// it as well: it is live by definition (the caller is about to receive it) and need not be
     /// in a register. The runtime's own named live sets and its unscanned term regions are
-    /// added by the prune itself.
+    /// added by the refc prune itself.
+    ///
+    /// The roots are collected **once** for both prunes, and only when at least one of them is
+    /// due: each `…_pending` gate is `O(1)` in its steady state (a handle-count compare for the
+    /// refc store, a length compare of two candidate snapshots for the resource registry), so an
+    /// ordinary call that built nothing off-heap pays two compares and no copy of the machine's
+    /// register file.
     ///
     /// # Why the machine is dropped between the two steps
     ///
-    /// The prune retains any payload whose `RefCount > 1` (another owner exists outside its
+    /// The refc prune retains any payload whose `RefCount > 1` (another owner exists outside its
     /// enumeration). While this machine lives **it** is such an owner for every payload it
     /// built, so a prune run before the drop would retain exactly the payloads this run is
     /// asking about. The adoption above has already cloned each handle into the store, so
-    /// dropping the machine here frees nothing.
+    /// dropping the machine here frees nothing. (A NIF resource *term* holds no such per-machine
+    /// reference — a copy of it shares the term binding — so the resource prune is unaffected by
+    /// the drop either way; it runs here so both prunes read one code path.)
     ///
-    /// # Why only this run's own payloads may be released
+    /// # Why only this run's own payloads and resource terms may be released
     ///
-    /// See [`Runtime::prune_off_heap`](crate::runtime::Runtime): a nested site can enumerate one
-    /// machine's roots, while the enclosing machines of the same process hold terms this crate
-    /// cannot see. A payload an earlier run built may already stand in one of them, so it is
-    /// retained — a bounded leak, never a dangle.
+    /// See [`Runtime::prune_off_heap`](crate::runtime::Runtime) and
+    /// [`crate::eval::reclaim`]'s resource half: a nested site can enumerate one machine's roots,
+    /// while the enclosing machines of the same process hold terms this crate cannot see. A payload
+    /// (or resource term) an earlier run built may already stand in one of them, so it is
+    /// retained — a bounded leak, never a dangle. For the resource half that rule is enforced by
+    /// `frontier`, the candidate set taken at **run entry**: only candidates minted during this run
+    /// are eligible.
     ///
     /// # Why the error path does not prune
     ///
     /// A raise's reason term is not part of the frozen root set — it escapes in
     /// [`beam_common::Raise`]'s live-reason slot — so a failed run takes the plain adopt path
-    /// and leaves the store alone (a bounded leak).
-    fn adopt_nested_payloads(&mut self, mut machine: Machine, result: &Result<Eterm>) {
-        let roots = match result {
-            Ok(term) => self.publish_nested_roots(&mut machine, *term),
-            Err(_) => None,
+    /// and leaves both stores alone (a bounded leak).
+    fn adopt_nested_payloads(
+        &mut self,
+        mut machine: Machine,
+        result: &Result<Eterm>,
+        frontier: &crate::eval::reclaim::Frontier,
+    ) {
+        // The two due gates, evaluated only on the returning path (a raise has no complete root set,
+        // so nothing may be published for it).
+        let (roots, refc_due, resources_due) = match result {
+            Ok(term) => {
+                let refc_due = self.runtime.off_heap_prune_pending();
+                let resources_due = crate::eval::reclaim::resources_pending(self.runtime, frontier);
+                if refc_due || resources_due {
+                    let roots = self.publish_nested_roots(&mut machine, *term);
+                    (Some(roots), refc_due, resources_due)
+                } else {
+                    (None, false, false)
+                }
+            }
+            Err(_) => (None, false, false),
         };
         self.runtime
             .adopt_escaped_binaries(machine.refc_binaries());
@@ -406,24 +452,28 @@ impl<'a> RuntimeContext<'a> {
         };
         // The machine must not outlive this point as a payload owner (see above).
         drop(machine);
-        if let Some(roots) = roots {
+        let Some(roots) = roots else {
+            return;
+        };
+        if refc_due {
             self.runtime.prune_off_heap(&roots, &adopted);
+        }
+        if resources_due {
+            let _ = crate::eval::reclaim::prune_beyond(self.runtime, &roots, frontier);
         }
     }
 
     /// This run's live root set, copied out of `machine` for
-    /// [`Runtime::prune_off_heap`](crate::runtime::Runtime) — or `None` when the
-    /// escaped-payload store is **not due a prune**, in which case the caller pays nothing but
-    /// the gate itself.
+    /// [`Runtime::prune_off_heap`](crate::runtime::Runtime) and the NIF-resource prune.
+    ///
+    /// The caller decides whether it is needed at all (the two stores' `…_pending` gates), so this
+    /// is where the machine's whole root set is copied and nowhere else.
     ///
     /// The words are raw [`Eterm`]s (integers), so copying them out is always safe; they stay
     /// valid because this context never arms the collection latch, so the pump's allocations
     /// fall back to the pointer-stable arena and nothing paused here is moved
     /// ([`RuntimeContext::run_export_blocking`]).
-    fn publish_nested_roots(&mut self, machine: &mut Machine, term: Eterm) -> Option<Vec<Eterm>> {
-        if !self.runtime.off_heap_prune_pending() {
-            return None;
-        }
+    fn publish_nested_roots(&mut self, machine: &mut Machine, term: Eterm) -> Vec<Eterm> {
         let mut roots = Vec::with_capacity(machine.register_count() as usize + 64);
         machine.with_roots(beam_engine::context::RootSet::ALL_LIVE, |rootset| {
             roots.extend_from_slice(rootset.x);
@@ -431,7 +481,7 @@ impl<'a> RuntimeContext<'a> {
             roots.extend_from_slice(rootset.fr);
         });
         roots.push(term);
-        Some(roots)
+        roots
     }
     /// One pump-and-resume of a blocked cross-module run: advance the scheduler, then resume
     /// `machine` at the address its [`RunOutcome::Wait`] reported.

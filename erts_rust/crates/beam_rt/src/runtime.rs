@@ -197,6 +197,31 @@ pub struct EvalOffHeapStats {
     pub any_engine: bool,
 }
 
+/// The **NIF-resource prune**, as this runtime's own bookkeeping sees it.
+///
+/// A live `enif_make_resource` term owns one reference on its resource object, and the reference is
+/// dropped only when nothing reachable names the term any more (`beam_abi`'s release seam, whose
+/// reachability predicate is the caller's). Three sites decide that: the runner's park arm
+/// ([`crate::context::gc`]'s `resources::reclaim`, for a scheduled process) plus the two **non-park**
+/// sites [`crate::eval::reclaim`]'s resource half adds — the `-eval` statement boundary and a nested
+/// run's epilogue. This snapshot is the runtime's observability of all of it; the oracle has no
+/// counterpart (its terms are refcounted straight off the process heap), so nothing here is a
+/// differential figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourcePruneStats {
+    /// How many live resource terms the ABI's registry holds right now (one per mint).
+    pub live_terms: usize,
+    /// How many resource terms the non-park sites have released (each is one dropped term
+    /// reference; a release whose count did not reach zero runs no destructor).
+    pub released: u64,
+    /// How many times a non-park site ran a reachability walk.
+    pub prunes: u64,
+    /// How many times a non-park site declined because soundness could not be shown.
+    pub declines: u64,
+    /// The reason of the most recent decline.
+    pub last_decline: Option<&'static str>,
+}
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -328,6 +353,13 @@ pub struct Runtime {
     /// difference is what it holds: only the terms the table-less route had to keep (a BIF's
     /// container results and the evaluator's own bitstrings), never a call's temporaries.
     pub(crate) eval_heap_retired: Vec<Heap>,
+    /// The `-eval` route's **statement window** on [`Runtime::eval_heap`]
+    /// ([`crate::eval::scratch`]): the mark the current expression's dead statement copies are
+    /// reclaimed from, the one-way pin that refuses a reset when a holder cannot be enumerated,
+    /// and the counters [`Runtime::eval_region_stats`] publishes.
+    ///
+    /// It is always present; its window is open only for the duration of one `-eval` driver run.
+    pub(crate) eval_scratch: crate::eval::scratch::ScratchState,
     /// The `-eval` route's escaped-payload store bookkeeping
     /// ([`crate::eval::reclaim::PruneState`]): the last observed handle count (the `O(1)`
     /// half of the prune trigger), the prune/decline counters and the most recent decline
@@ -341,6 +373,16 @@ pub struct Runtime {
     /// weaken any guard — it disables the reclaim, so the store simply grows, which is what the
     /// measurement compares against.
     eval_prune_enabled: bool,
+    /// The **NIF-resource prune**'s bookkeeping
+    /// ([`crate::eval::reclaim::ResourcePruneState`]): the `-eval` route's frontier slot (the
+    /// candidate set as of its previous statement boundary), the observed live-term count and the
+    /// prune/decline/release counters.
+    ///
+    /// It lives here rather than in a site because the `-eval` statement boundary must remember its
+    /// previous observation **across** statements. A nested run's frontier is deliberately *not*
+    /// here: nested runs recurse, so it is a per-run local (see [`crate::eval::reclaim`]'s resource
+    /// half).
+    pub(crate) resource_prune: crate::eval::reclaim::ResourcePruneState,
     /// Whether a process **engine** has ever been registered on this runtime — a sticky,
     /// `O(1)` signal (there is no way to enumerate
     /// [`Runtime::runner_state`](crate::runner::RunnerState)'s engines from outside
@@ -1217,8 +1259,10 @@ impl Runtime {
             eval_heap: Heap::new(heap_words)?,
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
+            eval_scratch: crate::eval::scratch::ScratchState::default(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
             eval_prune_enabled: true,
+            resource_prune: crate::eval::reclaim::ResourcePruneState::default(),
             engine_registered: false,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
@@ -1685,6 +1729,15 @@ impl Runtime {
     /// destination off-heap table ([`Runtime::eval_off_heap`]) adopts the handle, so the copied
     /// term points at the same bytes rather than at a materialized equivalent.
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
+        // A stabilized term is **runtime-lifetime** by construction — this is the gateway every
+        // store outside the enumerated root families goes through (a runner outcome, a
+        // `persistent_term` value, a pending timer's message, the exit reason, a native store) —
+        // so the `-eval` statement window must not reclaim the copy it is about to make
+        // (`crate::eval::scratch`).
+        crate::eval::scratch::pin(
+            self,
+            "a stabilized term may be kept by a store the statement window cannot enumerate",
+        );
         let copy = beam_message::copy_struct_simple(term, &mut self.eval_heap)
             .map_err(error::enforce_term_heap_limit)?;
         self.note_escaped_store_roots(term);
@@ -1796,6 +1849,12 @@ impl Runtime {
         if src.is_empty() {
             return self.stabilize_term(term);
         }
+        // As [`Runtime::stabilize_term`]: the copy below lands straight in the runtime store and
+        // is runtime-lifetime, so the statement window is latched (`crate::eval::scratch`).
+        crate::eval::scratch::pin(
+            self,
+            "a stabilized term may be kept by a store the statement window cannot enumerate",
+        );
         // The copy's source table: one clone (refcount++) per refc-binary handle (so the lookup
         // in `copy_refc_binary` resolves `term`'s `BinRef.val` to a live handle) and one clone per
         // MSO handle, pushed **in order** so the container terms' slots still name them.
@@ -1930,7 +1989,70 @@ impl Runtime {
     pub fn set_eval_prune_enabled(&mut self, enabled: bool) {
         self.eval_prune_enabled = enabled;
     }
-    /// Records that the store was rewritten and now holds `handles` payload handles, together
+
+    // -- the `-eval` route's statement window on the term store: the diagnostics and the kill
+    // switch (`crate::eval::scratch`) ------------------------------------------------------
+    /// The term store's region figures and the statement window's counters — the diagnostic a
+    /// measurement (and a test) reads instead of guessing.
+    ///
+    /// `used`/`capacity` are the **current** region ([`Runtime::eval_heap`]); `retired_*` are the
+    /// regions [`Runtime::grow_eval_heap`] replaced, which are never freed. `resets` and
+    /// `words_reclaimed` are what the window reclaimed, `declines`/`last_decline` why it did not.
+    ///
+    /// A run whose window works answers a `used` that does not move with the statement count —
+    /// that is the claim `src/eval/scratch/tests.rs` and `PERF.md` pin.
+    pub fn eval_region_stats(&self) -> crate::eval::scratch::EvalRegionStats {
+        let retired_regions = self.eval_heap_retired.len();
+        crate::eval::scratch::EvalRegionStats {
+            used: self.eval_heap.used(),
+            capacity: self.eval_heap.capacity(),
+            retired_regions,
+            retired_capacity_words: self
+                .eval_heap_retired
+                .iter()
+                .map(|heap| heap.capacity())
+                .sum(),
+            opens: self.eval_scratch.opens,
+            resets: self.eval_scratch.resets,
+            declines: self.eval_scratch.declines,
+            last_decline: self.eval_scratch.last_decline,
+            words_reclaimed: self.eval_scratch.words_reclaimed,
+        }
+    }
+
+    /// Turns the `-eval` route's statement window ([`crate::eval::scratch`]) on or off.
+    ///
+    /// It is **on** in every production route; this exists so a measurement can hold the
+    /// mechanism out of the picture and compare one expression against itself, which is what
+    /// falsifies a "bounded store" claim (`src/eval/scratch/tests.rs`, `PERF.md`). Nothing else
+    /// changes: every word stays valid either way — the only difference is that the words a
+    /// discarded statement copied are either reused or retained. Deliberately **not** a `-eval`
+    /// flag or an `ERL_*` switch, for the same reason as
+    /// [`Runtime::set_eval_prune_enabled`].
+    pub fn set_eval_scratch_enabled(&mut self, enabled: bool) {
+        self.eval_scratch.set_enabled(enabled);
+    }
+
+    /// Latches the statement window **only if** a nested run wrote on the store since
+    /// `used_before`, and answers whether it did.
+    ///
+    /// A nested [`RuntimeContext::run_export_blocking`] / `run_label_blocking` drives a `Machine`
+    /// whose registers and stack this module cannot enumerate — but that machine is dropped
+    /// inside the *same* top-level statement, so at the next statement boundary it names nothing
+    /// and the only survivors are its result (bound into the environment, or discarded) and any
+    /// runtime-lifetime store it wrote (which pins on its own). Latching on an actual write keeps
+    /// the window sound without paying a statement for a nested run that touched only
+    /// machine-heap terms, which is the common case for a plain Erlang helper call.
+    pub(crate) fn pin_window_if_store_written(&mut self, used_before: usize) -> bool {
+        if self.eval_heap.used() == used_before {
+            return false;
+        }
+        crate::eval::scratch::pin(
+            self,
+            "a nested run wrote on the store and its machine's roots cannot be enumerated",
+        );
+        true
+    }    /// Records that the store was rewritten and now holds `handles` payload handles, together
     /// with the budget verdict `over` derived from the store as the rewrite left it.
     pub(crate) fn note_eval_prune(&mut self, handles: usize, over: bool) {
         self.eval_prune.seen_handles = handles;
@@ -1985,14 +2107,74 @@ impl Runtime {
             any_engine: self.any_engine_ever(),
         }
     }
+    /// Turns the **NIF-resource** prune's two non-park sites ([`crate::eval::reclaim`]'s resource
+    /// half: the `-eval` statement boundary and a nested run's epilogue) on or off.
+    ///
+    /// It is **on** in every production route; this exists for the same reason
+    /// [`Runtime::set_eval_prune_enabled`] does — so a measurement can hold the mechanism out of the
+    /// picture and compare one loop against itself (the same expression with it off retains every
+    /// resource term the loop mints, which is what makes the "bounded" claim falsifiable). Nothing
+    /// else changes: the runner's park-arm resource prune is a different site and is not affected,
+    /// no guard is weakened, and while it is off the sites record no frontier (so turning it back on
+    /// starts from a clean slate and leaks one window).
+    ///
+    /// It is deliberately **not** a `-eval` flag or an `ERL_*` switch — a user-facing kill switch for
+    /// a memory reclaim would be a footgun.
+    pub fn set_resource_prune_enabled(&mut self, enabled: bool) {
+        self.resource_prune.enabled = enabled;
+    }
+    /// This runtime's own view of the NIF-resource prune (see [`ResourcePruneStats`]).
+    pub fn resource_prune_stats(&self) -> ResourcePruneStats {
+        ResourcePruneStats {
+            live_terms: beam_abi::nif::enif::resources::resource_terms().len(),
+            released: self.resource_prune.released,
+            prunes: self.resource_prune.prunes,
+            declines: self.resource_prune.declines,
+            last_decline: self.resource_prune.last_decline,
+        }
+    }
     /// Appends every **root** that can name an off-heap payload to `out` — the prune's
     /// completeness half (`crate::eval::reclaim`).
     ///
-    /// What this function collects is the **named live sets**: the escaped closures' capture
-    /// environments, the sequential-trace tokens, every live process's dictionary and mailbox
-    /// queue, and the pending-spawn records (entry fun + arguments). These hold terms no heap
-    /// region necessarily holds. Every one of them is a **real term**, so the walk started from
-    /// them (`crate::eval::reclaim::walk`) may legitimately dereference what it finds.
+    /// What this function collects is the **named live sets**, one clause each for why it is
+    /// gathered. Every one of them is a **real term**, so the walk started from them
+    /// (`crate::eval::reclaim::walk`) may legitimately dereference what it finds, and none of them
+    /// is named by any heap region the walk does not scan:
+    ///
+    /// * the escaped closures' capture environments (`Runtime::eval_closures`, via
+    ///   `FunBody::env_terms`) — a closure body's captures are named by nothing else, so a
+    ///   resource a `-eval` lambda closes over lives exactly as long as the closure does;
+    /// * the sequential-trace tokens (`SeqTrace::gather_off_heap_roots`) — `set_label`/`set_from`
+    ///   store the caller's term **unstabilized**, so a refc payload in one is named only here;
+    /// * every live process's **complete** published root set — its dictionary entries, its
+    ///   mailbox queue (`payload`/`token`/`from`), its registers (`x[0..live)`, the whole Erlang
+    ///   stack and the host-published extra roots), its saved arguments and its pending signals:
+    ///   the same five families `Process::collect` gathers, and the only names a process's terms
+    ///   have besides its own heap;
+    /// * the pending-spawn records — a spawn lives on the arena before it lives in the process
+    ///   table, so its entry fun and its arguments are named by no process yet;
+    /// * [`RunnerState::gather_off_heap_roots`]'s **two** sub-families: the arena-stable arguments
+    ///   (and entry fun) of an engine whose first run has not yet consumed them, and the **parked
+    ///   machine's own root set** for an engine parked in an **un-published** window whose pid is
+    ///   still in the process table;
+    /// * every pending timer **delivery** — its message and its sender (`Timers::gather_off_heap_roots`).
+    ///
+    /// A `receive` park contributes nothing through the registers: it opens a relocation-exempt
+    /// window, so `park_machine` skips the copy and the process's registers stay empty for the
+    /// whole window. That is exactly why the parked-machine sub-family consults the **machine** —
+    /// a parked machine's root set is a real root set (the engine's own), so publishing it is sound
+    /// where the process's empty registers name nothing.
+    ///
+    /// Two things make a family belong here. A **refc payload** needs a root when the term naming
+    /// it may have been stored *unstabilized* (the sequential-trace tokens) or when it is an
+    /// engine's own argument copy. A **NIF resource** term needs one wherever it is held at all,
+    /// because a resource's identity is its reference id and a copy of it — which the stabilization
+    /// is — carries the same id: the resource prune's second match tier
+    /// ([`crate::eval::reclaim::resource`]) recognises such a copy, so a family that is not
+    /// enumerated makes a live resource look unreachable and releases it. That is why the pending
+    /// timers, a stabilized engine's arguments, an un-published parked machine's root set and every
+    /// live process's registers, saved arguments and signals are here even where the refc half of
+    /// them can need nothing.
     ///
     /// What it deliberately does **not** collect is the word image of the runtime's own term
     /// regions — [`Runtime::eval_heap`], its retired generations, the pooled BIF heaps and the
@@ -2006,20 +2188,45 @@ impl Runtime {
     /// handled by [`Runtime::for_each_off_heap_region`] instead, whose scan reads word *patterns*
     /// only and dereferences nothing.
     ///
-    /// Terms that **cannot** name a payload are deliberately not rooted, each for a stated reason:
+    /// Families that are **not** rooted, each with the mechanism that makes them safe:
     ///
-    /// * `persistent_term` values — stabilized through
-    ///   [`Runtime::try_stabilize_escaped`](crate::runtime::gc), whose copy flattens a refc
-    ///   payload on-heap (no handle is registered, and the stored term is the flattened copy).
-    /// * timer messages ([`crate::timers`] `TimerAction::Deliver.message`) and `trace` match specs
-    ///   — stabilized the same way ([`Runtime::stabilize_term`]).
-    /// * ETS — the table copy deep-copies and re-materializes a refc window as on-heap sub-bits
-    ///   (`beam_ets`'s copy), so a stored term names no payload.
-    /// * [`Runtime::references`] — an all-immediate leaf block (a reference has no child slots).
+    /// * `persistent_term` values — the two storing BIFs copy every value through
+    ///   [`Runtime::try_stabilize_escaped`] before the store keeps it, and that copy **flattens**
+    ///   an off-heap refc binary into a fresh on-heap bitstring, so the stored term names no
+    ///   payload. (A resource term in a `persistent_term` value is still released by the resource
+    ///   prune: the copy keeps its identity and the store is not enumerated — the residual
+    ///   `crate::eval::reclaim::resource` records.)
+    /// * `trace` match specs — [`Runtime::stabilize_term`] flattens a refc payload on-heap before
+    ///   the spec is installed, the same way.
+    /// * ETS objects — `beam_ets`' table store **deep-copies** on insert and materializes a refc
+    ///   window as a self-contained on-heap bitstring, so a stored object names no payload. (Its
+    ///   copy of a resource block keeps the reference id, so a resource held *only* by a table is
+    ///   the same residual as the `persistent_term` one: closing it needs an object iterator over
+    ///   the table registry, which `beam_bifs` does not expose.)
+    /// * [`Runtime::references`] — keys and values are reference terms and `MonitorRef`s. A
+    ///   reference thing's four words are a header plus three small integers (node, serial, id),
+    ///   i.e. an all-immediate leaf block: it has no child slot that could name a payload.
     /// * the [`RuntimeContext`]/`DispatchMemo`/native-floor structs and every `thread_local!`
-    ///   site — they hold no `Eterm` a prune can run between, except the x-register/stack set of
-    ///   a *live* engine, which the `RefCount > 1` belt covers (see
-    ///   [`Runtime::any_engine_ever`]).
+    ///   site — each holds either immediates, or a borrowed handle into state already enumerated
+    ///   here (the atom table, the process table, a table registry cell).
+    ///
+    /// # Residuals
+    ///
+    /// * A **running** machine's root set cannot be enumerated from here. A scheduler pass *moves*
+    ///   [`RunnerState`] out of the [`Runtime`] for its duration, and the executing engine is
+    ///   removed from the engine table at `run()` entry (`src/runner/run.rs`), so neither its
+    ///   registers nor its machine is reachable while a process is actually running. During a pass
+    ///   the coverage is the in-pass park arm's own publication
+    ///   ([`crate::context::gc::resources::reclaim`], which parks the machine before it seeds its
+    ///   walk); this function's enumeration serves the two sites that run outside one — the `-eval`
+    ///   statement boundary and a nested run's epilogue.
+    /// * The parked-machine sub-family re-gathers a parked machine's **whole** live root set on
+    ///   every gather (measured: 33 parked boot engines, ~32 000 root words per gather, in a booted
+    ///   `-eval` runtime). A narrower live-`x` seam on `beam_engine::Machine` would cut it; that is
+    ///   another node's change.
+    /// * A resource's identity is an ordinary internal reference, so the reference-identity match
+    ///   tier cannot tell a copy of a resource from an unrelated plain reference with an equal id —
+    ///   an id collision **retains** a dead resource term (`M1_GAPS.md` *The resource-identity collision*).
     pub(crate) fn gather_off_heap_roots(&mut self, out: &mut Vec<Eterm>) {
         // The escaped closures' capture environments.
         for body in &self.eval_closures {
@@ -2027,7 +2234,11 @@ impl Runtime {
         }
         // The sequential-trace tokens: `set_label`/`set_from` store the term unstabilized.
         self.seq_trace.gather_off_heap_roots(out);
-        // Every live process's dictionary and mailbox queue.
+        // Every live process's **complete** published root set — the same five families
+        // `Process::collect` gathers (`crate::context::gc::resources::reclaim` mirrors them for
+        // one process): the registers (a parked process's published x registers + Erlang stack +
+        // the host-published extra roots), the mailbox queue, the dictionary, the saved arguments
+        // and the pending signals.
         for pid in self.processes.pids() {
             let Some(process) = self.processes.get(pid) else {
                 continue;
@@ -2041,6 +2252,9 @@ impl Runtime {
                 out.push(message.token());
                 out.push(message.from());
             }
+            process.registers().gather_roots(out);
+            process.saved_args().gather_roots(out);
+            process.signals().gather_roots(out);
         }
         // A spawn recorded but not yet absorbed into the process table.
         for spawn in &self.pending_spawns {
@@ -2049,6 +2263,21 @@ impl Runtime {
                 out.push(*fun);
             }
         }
+        // A live engine's terms (`RunnerState::gather_off_heap_roots`): the arena-stable arguments
+        // of a child that has not consumed them yet, and the root set of a machine parked in an
+        // **un-published** (relocation-exempt) window — the only family that names a live term of
+        // a process whose `receive` park published nothing into its registers.
+        // `RunnerState` is moved out of the runtime for the duration of a scheduler pass, so this
+        // covers the two sites that run outside one (the `-eval` statement boundary and a nested
+        // run's epilogue); the in-pass park arm publishes the machine's own root set instead.
+        let processes = &self.processes;
+        self.runner_state
+            .gather_off_heap_roots(out, |pid| processes.get(pid).is_some());
+        // Pending `erlang:send_after` deliveries. The message is an arena copy, so a refc payload
+        // in it is already flattened — but a NIF **resource** term's copy keeps its reference
+        // identity, which is how the resource prune recognises a copy, so the family must be a
+        // root or a resource named only by a pending timer is released while it is still live.
+        self.timers.gather_off_heap_roots(out);
     }
     /// Hands `visit` the **word image** of every term region this runtime owns: the never-reset
     /// `-eval`/single-pass store ([`Runtime::eval_heap`]), its retired generations, the pooled BIF

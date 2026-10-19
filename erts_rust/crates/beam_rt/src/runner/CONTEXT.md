@@ -67,7 +67,9 @@ characterisation and figures are in `PERF.md`).
   (the exit path) — whether the process **built** it or **received** it.
   The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
   holder of every payload the process's own compiled bitstring code built, so
-  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` and the
+  `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` for
+  **another** pid (and through the in-machine door's published roster for the **executing** one, the
+  machine the pass holds out of `RunnerState` for the whole slice) and the
   process's own off-heap table stays empty. That is what keeps `beam_gc::OffHeap`'s never-compacted slot
   space out of the per-call path — mirroring the reservoir onto the PCB hands that space a slot per
   payload per slice, and the O(slots) `overhead_bytes`/`sweep` walks it implies make a build-a-binary
@@ -717,8 +719,13 @@ term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mail
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`, the park's published
-  FR-prefix count `fr_published`, the park's publish/skip flag `parked_published` and the per-process
-  binary virtual heap `off_heap: Option<OffHeapReclaimer>`) + `RunnerState`
+  FR-prefix count `fr_published`, the park's publish/skip flag `parked_published`, the per-process
+  binary virtual heap `off_heap: Option<OffHeapReclaimer>` and the `arena_args` stability flag) +
+  `RunnerState::gather_off_heap_roots`, whose **two** sub-families are an `arena_args` engine's
+  **un-consumed** arguments (plus a `ProcessEntry::Fun` entry's fun term, which stays live for a fun
+  entry with no local target because that entry re-applies them on every run) and an **un-published**
+  parked machine's own root set for a pid still in the process table, and which is **empty during a
+  pass** (`RunnerState` is `mem::take`n out of the runtime for the pass's duration), + `RunnerState`
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the

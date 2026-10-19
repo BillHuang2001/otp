@@ -95,8 +95,7 @@
 //! | `suspending` | `[]` (no `suspend_process` in M1) |
 //! | `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer |
 //! | `memory` | this process's real bytes (heap + stack + off-heap) |
-//! | `binary` | a list of `{Ptr, Size, Refc}` 3-tuples for the process's off-heap refc binaries (payload pointer as an integer, payload byte length, payload refcount); the empty list `[]` when the process holds none |
-//!
+//! | `binary` | a list of `{Ptr, Size, Refc}` 3-tuples for the process's off-heap refc binaries (payload pointer as an integer, payload byte length, payload refcount); the empty list `[]` when the process holds none — for **any** pid, the executing one included (see below) |//!
 //! ## Items this runtime honestly cannot answer (`unsupported`)
 //!
 //! These are *valid* oracle item names, so answering `badarg` would be a lie. Each is a
@@ -130,8 +129,26 @@
 //! library or `-eval` caller that reaches `call_bif` without a `Machine`, so no door is
 //! open).
 //!
-//! ## `trace`
+//! ## `binary`
 //!
+//! The roster is the deduped union of the two places a payload can be owned: the process's
+//! engine **reservoir** ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries) via
+//! [`RunnerState::reservoir_at`](crate::runner::RunnerState::reservoir_at)) and the PCB's own
+//! off-heap table ([`Process::off_heap_binaries`](beam_process::Process::off_heap_binaries),
+//! empty in production). For the **executing** process the reservoir half comes from the
+//! in-machine BIF door instead ([`RuntimeContext::in_machine_off_heap_binaries`]), because the
+//! scheduler takes that machine out of the runner state for the whole slice: a process asking
+//! `erlang:process_info(self(), binary)` from its own compiled code lists the payload it built
+//! earlier in that very slice, exactly as the oracle does. A query about **another** pid keeps
+//! the runner-state route, and a pid this runtime holds no machine for (the `-eval` root
+//! process, a foreign pid) still answers `[]` rather than a fabricated roster.
+//!
+//! Only **compiled bitstring code** feeds the reservoir (`bs_create_bin`/`bs_init_writable`
+//! above `ERL_ONHEAP_BINARY_LIMIT`). A binary a `beam_bifs` BIF builds (`binary:copy/2`,
+//! `base64:encode/1`, …) is an on-heap block on this runtime, so it is not listed here — a
+//! representational deviation recorded in `M1_GAPS.md` §`process_info/1,2`.
+//!
+//! ## `trace`//!
 //! The C answers the process's **tracee-flag bitmask** as an *integer* —
 //! `res = make_small(ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS))` (`erl_bif_info.c:2133`) — never the
 //! atom list `erlang:trace_info(Pid, flags)` reports. Verified against the oracle (OTP 29.1.1 /
@@ -493,10 +510,10 @@ struct Snapshot {
     /// The process's **live owned off-heap refc binaries**, each as
     /// `(payload pointer, payload byte length, payload refcount)` — the value behind the
     /// `binary` item ([`RuntimeContext::binary_value`]). This is the **union** of the two
-    /// places a payload can be owned (see [`RuntimeContext::snapshot`]), copied out so the
-    /// reply can be built after the process table borrow ends.
-    off_heap_binaries: Vec<(usize, usize, usize)>,
-}
+    /// places a payload can be owned (see [`RuntimeContext::snapshot`], which reads the
+    /// **executing** process's roster from the in-machine BIF door instead of the runner
+    /// state), copied out so the reply can be built after the process table borrow ends.
+    off_heap_binaries: Vec<(usize, usize, usize)>,}
 
 /// The atom name of a boolean flag value (`true` / `false`).
 fn bool_atom(value: bool) -> &'static str {
@@ -1104,8 +1121,8 @@ impl RuntimeContext<'_> {
                 .iter()
                 .map(|watch| (false, watch.port.to_eterm())),
         );
-        // The off-heap refc-binary roster — the `binary` item — has **two** possible owners, so
-        // it is their deduped union:
+        // The off-heap refc-binary roster — the `binary` item — has **two** possible owners,
+        // so it is their deduped union:
         //
         // * the target's **engine reservoir** (`RunnerState::reservoir_at`), which is the real
         //   holder of every payload the process's own compiled bitstring code built. This is
@@ -1119,18 +1136,28 @@ impl RuntimeContext<'_> {
         // payload both sources know is listed once. The scan is linear in the (empty in
         // production) PCB roster, never in the reservoir.
         //
+        // For the **executing** process the reservoir half comes from the in-machine BIF door
+        // instead (`RuntimeContext::in_machine_off_heap_binaries`): a scheduler pass takes that
+        // process's engine *out* of the runner state to drive it, so `reservoir_at` answers
+        // nothing for the whole slice and a process asking about **itself**
+        // (`erlang:process_info(self(), binary)`) would otherwise be told `[]` while the oracle
+        // lists the payload it just built. It is a **substitution**, not a merge: a self query
+        // has no runner-state entry, and the door's roster is that very machine's reservoir.
+        //
         // Extracted **here**, before `Snapshot` is built, because the roster is read from a
         // table/state pair this `&self` borrow sees as one object while the reply is built later
         // on the engine heap. Nothing is copied out of the payloads themselves: the reservoir
         // never shrinks and holds the handles, so the pointers stay live and `refcount()` is the
         // live count.
         let mut off_heap_binaries: Vec<(usize, usize, usize)> = Vec::new();
-        {
+        if let Some(published) = self.in_machine_off_heap_binaries(pid) {
+            off_heap_binaries.extend_from_slice(published);
+        } else {
             // A scheduler pass **moves** the engine state out of the runtime exactly as it moves
             // the process table, so the live state is the pass's own when this context is a
             // slice (`RuntimeContext::engines`) and the runtime's otherwise. The one pid neither
             // answers for is the process the pass is *currently executing* (its engine is out
-            // for the whole slice — see `RunnerState::reservoir_at`).
+            // for the whole slice — the door above is its only route).
             let engines = match self.engines() {
                 Some(state) => state,
                 None => self.runtime.runner_state(),
@@ -1143,8 +1170,7 @@ impl RuntimeContext<'_> {
                 );
             }
         }
-        for binary in process.off_heap_binaries() {
-            let pointer = binary.data_ptr() as usize;
+        for binary in process.off_heap_binaries() {            let pointer = binary.data_ptr() as usize;
             if !off_heap_binaries.iter().any(|known| known.0 == pointer) {
                 off_heap_binaries.push((pointer, binary.len(), binary.refcount()));
             }

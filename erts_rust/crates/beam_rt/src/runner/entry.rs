@@ -29,6 +29,7 @@
 use std::sync::Arc;
 
 use beam_common::BeamError;
+use beam_engine::context::RootSet;
 use beam_engine::{Machine, Tier};
 use beam_loader::Module;
 use beam_process::ProcessId;
@@ -109,9 +110,44 @@ pub(super) struct ProcessEngine {
     pub(super) machine: Machine,
     /// Where the process starts and what it is called with.
     pub(super) entry: ProcessEntry,
-    /// The first run's arguments (seeded into `x(0..arity)`); unused once the process
-    /// has run, but kept so a re-run of a finished process is impossible to get wrong.
+    /// The first run's arguments (seeded into `x(0..arity)`).
+    ///
+    /// The first entry reads them ([`RunnerState::spawn`] hands them to the machine, which seeds
+    /// `x(0..arity)`); nothing reads them again once that entry has consumed them, which is what
+    /// [`ProcessEngine::args_consumed`] records. Their **provenance** decides whether they may be
+    /// handed over as a reclamation root — see [`ProcessEngine::arena_args`].
+    ///
+    /// They are published as a reclamation root exactly while `arena_args && !args_consumed`: from
+    /// the spawn until the process's first run has consumed them, and never afterwards. The one
+    /// exception is a [`ProcessEntry::Fun { target: None }`](ProcessEntry::Fun), which re-applies
+    /// `args` on **every** run and so stays `!args_consumed` for the engine's life.
     pub(super) args: Vec<Eterm>,
+    /// Whether the first run has already **consumed** [`ProcessEngine::args`] (and a
+    /// [`ProcessEntry::Fun`]'s fun value), i.e. whether they are dead state.
+    ///
+    /// The runner sets it at the end of an entry that can never read them again — every
+    /// [`ProcessEntry::Export`], and a [`ProcessEntry::Fun`] whose local target was resolved —
+    /// and leaves it `false` for a fun entry with **no** local label, which is re-applied from
+    /// `args` on every run.
+    ///
+    /// It is the liveness half of [`ProcessEngine::arena_args`]: a consumed argument set may not
+    /// be published as a reclamation root, because a resource term standing only in dead state
+    /// would be retained for the runtime's life (they are the child's *first* root set, and the
+    /// machine copies them into registers that are then the live roots). So publication ends at the
+    /// end of the child's first run for every entry shape but `ProcessEntry::Fun { target: None }`.
+    pub(super) args_consumed: bool,
+    /// Whether `args` (and a [`ProcessEntry::Fun`]'s fun) are copies on the **pointer-stable
+    /// arena** rather than terms of a heap a collection may move or a process's death may free.
+    ///
+    /// Only a spawn that stabilized its entry and arguments through
+    /// [`Runtime::try_stabilize_escaped`](crate::runtime::Runtime::try_stabilize_escaped) sets
+    /// this (the pending-spawn route, [`RunnerState::spawn_stable`]). It is the soundness gate
+    /// of [`RunnerState::gather_off_heap_roots`]: that function's caller **dereferences** what it
+    /// hands over, and a term that is not a live copy on a stable region must never be rooted —
+    /// which is why the un-stabilized spawn routes contribute nothing here (their terms are on
+    /// the spawning process's own heap, whose root set is the collection's business, not the
+    /// prune's).
+    pub(super) arena_args: bool,
     /// The `(func, pc)` a `receive` suspended at, until the process is woken.
     ///
     /// A [`ProcessEntry::Export`] process and a **`ProcessEntry::Fun`** process whose fun
@@ -244,13 +280,40 @@ impl RunnerState {
     }
 
     /// Registers the engine of a freshly spawned process.
+    ///
+    /// The arguments are **not** asserted stable ([`ProcessEngine::arena_args`] is `false`), so
+    /// this engine contributes no reclamation root; a spawn path that stabilized its terms uses
+    /// [`RunnerState::spawn_stable`] instead.
     pub(crate) fn spawn(&mut self, pid: ProcessId, entry: ProcessEntry, args: Vec<Eterm>) {
+        self.spawn_with_stability(pid, entry, args, false);
+    }
+
+    /// [`RunnerState::spawn`] for the spawn paths that copied the entry fun and every argument
+    /// onto the **pointer-stable arena** first ([`Runtime::note_pending_spawn`], i.e. the
+    /// `erlang:spawn*` calls made from inside a scheduler slice) — the only shape whose terms
+    /// [`RunnerState::gather_off_heap_roots`] may hand over.
+    ///
+    /// [`Runtime::note_pending_spawn`]: crate::runtime::Runtime::note_pending_spawn
+    pub(crate) fn spawn_stable(&mut self, pid: ProcessId, entry: ProcessEntry, args: Vec<Eterm>) {
+        self.spawn_with_stability(pid, entry, args, true);
+    }
+
+    /// The one engine constructor, so the two staged/stable entry points cannot drift.
+    fn spawn_with_stability(
+        &mut self,
+        pid: ProcessId,
+        entry: ProcessEntry,
+        args: Vec<Eterm>,
+        arena_args: bool,
+    ) {
         self.engines.insert(
             pid,
             ProcessEngine {
                 machine: Machine::new(),
                 entry,
                 args,
+                args_consumed: false,
+                arena_args,
                 parked: None,
                 parked_timeout: None,
                 // A freshly reset machine's FR file is all `NIL` (`fr_mark() == 0`), so its
@@ -277,6 +340,77 @@ impl RunnerState {
     /// resolved by that first run, not here.
     pub(crate) fn spawn_fun(&mut self, pid: ProcessId, fun: Eterm, args: Vec<Eterm>) {
         self.spawn(pid, ProcessEntry::Fun { fun, target: None }, args);
+    }
+
+    /// Appends every **stable** term a live engine still names to `out`, in **two** sub-families:
+    /// the arguments (and the fun term) of a [`ProcessEngine::arena_args`] engine whose first run
+    /// has **not** consumed them, and the root set of a machine parked in an **un-published**
+    /// window.
+    ///
+    /// An engine outlives the slice that created it (a `receive` resumes in the same machine), and
+    /// its first arguments are the child's **first root set** — the arena copies a spawn made
+    /// ([`RunnerState::spawn_stable`]). Nothing else in this runtime names them: they stand on the
+    /// pointer-stable arena, not in any process's mailbox or dictionary, so without them the
+    /// reclamation prunes (`crate::eval::reclaim`) answer a NIF resource a spawn argument carries
+    /// unreachable and release it while the child still holds it. A **consumed** argument set is
+    /// dead state and contributes nothing ([`ProcessEngine::args_consumed`]): the machine copied it
+    /// into registers, and those are published by the second family below. This family has no
+    /// liveness gate — its terms are arena copies, dereferenceable whatever became of the process —
+    /// so a child that terminates before its first run keeps its arguments published (a leak).
+    ///
+    /// # The parked machine's root set — the live family
+    ///
+    /// A process parked in a **relocation-exempt** window (every `receive` park, and a `Yield` park
+    /// whose slice ended with a live FR prefix) publishes **nothing** into its process
+    /// [`Registers`](beam_process::Registers): nothing can relocate its heap for the window, so the
+    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). A
+    /// `receive` park therefore contributes nothing through the process's `registers()` — they are
+    /// empty for the window — and the parked machine's live terms are named by nothing but
+    /// `machine.x`/`machine.stack`/`machine.fr` — exactly the `x(0)` a `receive` is about to match —
+    /// so a resource a parked child holds in a register is reachable **only** through this family.
+    ///
+    /// A machine parked in a **publishing** window is the opposite case: its roots were copied into
+    /// the process's `Registers`, which a collection may then relocate, leaving the machine's own
+    /// copy pointing into an abandoned space. Those words must therefore **not** be published —
+    /// the process's registers are the truth there, and [`Runtime::gather_off_heap_roots`] gathers
+    /// them (`crate::runtime::Runtime::gather_off_heap_roots`).
+    ///
+    /// This family is gated on the pid still being in the `live` process table: an engine is not
+    /// removed when its process terminates, and a terminated process's heap is gone, so its
+    /// machine's registers would be dangling words. Only **live**, **un-published** engines are
+    /// enumerated, and the enumeration is `O(1)` when there are no engines at all.
+    ///
+    /// `RunnerState` is moved out of the [`Runtime`](crate::runtime::Runtime) for the duration of
+    /// a scheduler pass, so this covers the sites that run outside one (the `-eval` statement
+    /// boundary and a nested run's epilogue); the in-pass park arm publishes the machine's own
+    /// root set instead.
+    pub(crate) fn gather_off_heap_roots(
+        &mut self,
+        out: &mut Vec<Eterm>,
+        live: impl Fn(ProcessId) -> bool,
+    ) {
+        for (pid, engine) in self.engines.iter_mut() {
+            if engine.arena_args && !engine.args_consumed {
+                out.extend_from_slice(&engine.args);
+                if let ProcessEntry::Fun { fun, .. } = &engine.entry {
+                    out.push(*fun);
+                }
+            }
+            // The parked machine's own root set: the only family that names a live term of a
+            // process parked in a relocation-exempt (un-published) window. Skipped for a
+            // publishing window (the process's registers hold the relocated truth) and for an
+            // engine whose process has terminated (its heap is gone).
+            if engine.parked_published || !live(*pid) {
+                continue;
+            }
+            let fr = engine.machine.fr_mark() as usize;
+            engine.machine.with_roots(RootSet::ALL_LIVE, |roots| {
+                out.extend_from_slice(roots.live_x());
+                out.extend_from_slice(roots.stack);
+                let fr = fr.min(roots.fr.len());
+                out.extend_from_slice(&roots.fr[..fr]);
+            });
+        }
     }
 
     /// Whether `pid` is a process this runtime spawned an engine for.

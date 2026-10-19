@@ -11,12 +11,12 @@ The measurement narrative lives in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md); the
 ## Current startup regime (read before quoting any `startup_ms` figure)
 
 Every CLI action except `-version` now drives a boot script before the action's own start instruction: the explicit `-boot FILE` value when given, else **this runtime's own** release's committed `bootstrap/bin/start.boot` (`CodeServer::own_bootstrap_boot_script`; the literal `start` resolves to `<Root>/bin/start.boot` only when the repo bootstrap is undiscoverable, e.g. an installed deployment).
-A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.35 s wall** on this host: paired medians of 12 alternating `taskset -c 3` rounds read **340.5 ms wall over 328.5 ms CPU** for `beam_rt -noshell -eval 'halt().'` (1-min `/proc/loadavg` ≈ 20 after the last round), i.e. the shape is CPU work plus whatever the shared host adds — absolute ms are host-dependent, and *The boot path's one live-but-idle port, and the poll budget* below carries that measurement in full.
-Every `startup_ms` figure in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band) and its ratio to the oracle is that snapshot's; those numbers do not describe the current whole-process wall.
+A bare `-eval 'ok.'` invocation therefore boots `start.boot` and is measured at **≈ 0.35 s wall** on this host: paired medians of 12 alternating `taskset -c 3` rounds read **340.5 ms wall over 328.5 ms CPU** for `beam_rt -noshell -eval 'halt().'` (1-min `/proc/loadavg` ≈ 20 after the last round), i.e. CPU work plus whatever the shared host adds — *The boot path's one live-but-idle port, and the poll budget* below carries that measurement in full.
+Every other `startup_ms` figure in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) is **that snapshot's own** preloaded-only-slice measurement (the ≈ 14–18 ms band), so it does not describe the current whole-process wall.
 The present whole-process wall is **CPU-bound and carries no fixed waits**: `strace -f -c -w` over a whole run shows **0 `clock_nanosleep`** calls and **≈ 4 ms** of `epoll_wait` in total, so a blocked round returns instead of sleeping and the residual wall is engine work (the oracle's own `erl -noshell -eval 'halt(0).'` boot is ≈ 0.12–0.15 s here).
-The wait a *blocked* pass pays is mechanism-agnostic, so read it as a property — bounded, never a spin — not as one syscall name: with a port live in the table (a booted kernel keeps the `inet_gethost` helper child open, which makes `PortRegistry::has_nothing_to_poll()` false from directive 18 on) the wait is that port's poll, its blocking form is taken only while a port **owes a reply**, and only by a round that ran **zero** slices — the rule and its measured figures are in *The boot path's one live-but-idle port, and the poll budget* below.
-Because that wall is this runtime's own CPU cost rather than a fixed sleep, the cross-runtime `startup_ms` ratio is **recorded at the head of *The boot path's one live-but-idle port, and the poll budget*** below: **2.649** against the oracle (`rust` 298.6 ms vs `sys` 112.7 ms, median of 3 alternating `--quick` `--workloads baseline` rounds), and **2.089** for the boot-dominated `slice` workload's summed per-case wall. Every other `startup` ratio in this file and in [`PERF_HISTORY.md`](PERF_HISTORY.md) belongs to its own dated snapshot.
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.35 s boot, so those rows measure the loop against a far larger whole-process wall than the dated snapshots in [`PERF_HISTORY.md`](PERF_HISTORY.md) record.
+The wait a *blocked* pass pays is therefore mechanism-agnostic — bounded, never a spin, not one syscall name: with a port live in the table (a booted kernel keeps the `inet_gethost` helper child open, which makes `PortRegistry::has_nothing_to_poll()` false from directive 18 on) the wait is that port's poll, its blocking form is taken only while a port **owes a reply**, and only by a round that ran **zero** slices (*The boot path's one live-but-idle port, and the poll budget*).
+The cross-runtime `startup_ms` ratios that do describe the present tree are **2.649** against the oracle (`rust` 298.6 ms vs `sys` 112.7 ms, median of 3 alternating `--quick` `--workloads baseline` rounds) and **2.089** for the boot-dominated `slice` workload's summed per-case wall.
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` **startup-cancelled marginals** still cancel whatever startup a sample pays (`(mean wall@N − mean wall@0) / N`), but every Rust sample now carries the ≈ 0.35 s boot, so those rows measure the loop against a far larger whole-process wall than the dated snapshots record.
 
 ## The boot path's one live-but-idle port, and the poll budget
 Directive 18 of the 22 in `bootstrap/bin/start.boot` starts the `kernel` application, so `kernel_sup`'s `inet_db` child runs `inet_config:init/0` (`lib/kernel/src/kernel.erl:211-216`, `lib/kernel/src/inet_db.erl:121-123`): it opens a UDP socket, asks `prim_inet` for the hostname, and — when that short name carries no dot — resolves it through `inet_gethost_native`, which opens the helper `{spawn_executable, <erts>/bin/inet_gethost}` port with `{packet,4}` (`lib/kernel/src/inet_gethost_native.erl:413-429`).
@@ -85,83 +85,54 @@ erts_rust/target/release/bench run --quick --runtime rust --workloads baseline
 #### Commands
 
 ```sh
-# build the runtime and the driver
 erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p bench -p beam_rt
-
-# 3 x the focused cross-runtime pass on the CURRENT default (Auto => baseline JIT)
+W=baseline,slice,foreign,list_walk,copy_bound,gc_bound
 for i in 1 2 3; do
-  erts_rust/target/release/bench run --full --runtime all \
-    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file $TMPDIR/perf-now/full$i.json
+  erts_rust/target/release/bench run --full --runtime all --workloads $W --out-file $TMPDIR/perf-now/full$i.json
   erts_rust/target/release/bench compare $TMPDIR/perf-now/full$i.json   # rust/sys within one report
-done
-
-# 3 x the SAME pass with the interpreter pinned — the tier-attribution point
-for i in 1 2 3; do
-  BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --full --runtime all \
-    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
-    --out-file $TMPDIR/perf-now/interp$i.json
+  BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --full --runtime all --workloads $W \
+    --out-file $TMPDIR/perf-now/interp$i.json                            # the tier-attribution pass
 done
 ```
 
-`bench` spawns the runtime with an **inherited environment**, so exporting `BEAM_RT_TIER=interpreter`
-on the driver reaches every spawned `beam_rt` (the same mechanism `AFTER` uses). The raw harness JSON
-was written under `$TMPDIR/perf-now/` and is **ephemeral** (not committed — re-run the commands above to regenerate).
+`bench` spawns the runtime with an **inherited environment**, so exporting `BEAM_RT_TIER=interpreter` on the driver reaches every spawned `beam_rt` (the same mechanism `AFTER` uses); the raw harness JSON under `$TMPDIR/perf-now/` is **ephemeral** (re-run to regenerate).
 
 #### Host-load caveat (read before quoting any absolute number)
 
-The host is the same shared/oversubscribed one `BEFORE`/`AFTER` describe, but this pass ran in a
-**light window**: the 1-min `/proc/loadavg` stayed at **≈ 0.8–14** (mostly below 8) against
-`BEFORE`/`AFTER`'s ≈ 20–55. **Absolute latencies here are therefore lower than the two earlier
-snapshots for that reason alone** — `sys` startup `min` reads **98.64 ms** against `AFTER`'s 160.47 ms,
-although the `sys` runtime did not change between the snapshots. **Absolute latencies are not
-comparable across the three snapshots**; only the **ratios** and the **minima** are signal, and the
-driver is runtime-major (all `sys` rows, then all `rust` rows) within one report, so the mitigation is
-again the three **block-interleaved** passes (`sys,rust | sys,rust | sys,rust`). Read the `CURRENT`
-figures as a **loaded-host measurement in a light window**, not a clean-machine number.
+This pass ran in a **light window** of the same shared host: the 1-min `/proc/loadavg` stayed at **≈ 0.8–14** (mostly below 8) against `BEFORE`/`AFTER`'s ≈ 20–55, so its **absolute** latencies are lower than those snapshots' for that reason alone (`sys` startup `min` reads **98.64 ms** against `AFTER`'s 160.47 ms although the `sys` runtime did not change). Only the **ratios** and the **minima** are signal; the driver is runtime-major within one report, so the mitigation is again three **block-interleaved** passes (`sys,rust | sys,rust | sys,rust`).
 
 ### Current figures (`rust` / `sys`, min of 3, `--full` focused cross-runtime pass)
 
-Same reading convention as `BEFORE`/`AFTER` in [`PERF_HISTORY.md`](PERF_HISTORY.md) (**< 1 ⇒ Rust cheaper, > 1 ⇒ Rust dearer**; the ratio is
-the headline). `sys` is the min-of-3 over the default set (the oracle does not see the tier); the two
-`rust` columns are the min-of-3 of the **default** and of the **`BEAM_RT_TIER=interpreter`** sets.
-`slice` is per-case **whole-process** wall (one call per process); the
-`foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals**
-(`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
-This snapshot's `baseline`/`slice` figures are its own preloaded-only-slice measurements; the current runtime pays the boot script on every action (see *Current startup regime*), so they are not the current whole-process wall.
+Same reading convention as `BEFORE`/`AFTER` in [`PERF_HISTORY.md`](PERF_HISTORY.md) (**< 1 ⇒ Rust cheaper, > 1 ⇒ Rust dearer**; the ratio is the headline).
+`sys` is the min-of-3 over the default set (the oracle does not see the tier); both `rust` ratios are the min-of-3 of their own set, and the absolute `rust` values of the two sets are the next section's columns.
+`slice` is per-case **whole-process** wall (one call per process); the `foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals** (`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
+This snapshot's `baseline`/`slice` figures are its own preloaded-only-slice measurements, so they are not the boot-paying whole-process wall of *Current startup regime*.
 
-| workload | case | metric (unit) | **rust/sys default (min3)** | range | rust/sys INTERP (min3) | sys (min3) | rust default (min3) | rust INTERP (min3) |
-|---|---|---|---|---|---|---|---|---|
-| `baseline` | — | `startup_ms` (ms) | **0.141** | 0.141–0.168 | 0.144 | 98.64 | 14.56 | 13.99 |
-| `slice` | `add` | `wall_ms` (ms) | **0.104** | 0.104–0.139 | 0.117 | 110.61 | 15.36 | 13.88 |
-| `slice` | `fib` | `wall_ms` (ms) | **0.107** | 0.107–0.141 | 0.134 | 110.34 | 12.77 | 15.38 |
-| `slice` | `pick` | `wall_ms` (ms) | **0.120** | 0.120–0.132 | 0.120 | 107.55 | 14.11 | 14.13 |
-| `slice` | `calendar_last_day` | `wall_ms` (ms) | **0.124** | 0.124–0.154 | 0.120 | 112.71 | 15.47 | 14.76 |
-| `slice` | `queue_from_size` | `wall_ms` (ms) | **0.185** | 0.185–0.197 | 0.137 | 107.66 | 20.80 | 17.09 |
-| `slice` | `gb_trees_size` | `wall_ms` (ms) | **0.124** | 0.124–0.151 | 0.126 | 113.64 | 14.62 | 14.71 |
-| `slice` | `base64_encode_size` | `wall_ms` (ms) | **0.118** | 0.118–0.145 | 0.138 | 109.70 | 14.42 | 16.23 |
-| `slice` | `ordsets_from_size` | `wall_ms` (ms) | **0.124** | 0.124–0.133 | 0.130 | 117.64 | 14.59 | 15.68 |
-| `slice` | `string_str_length` | `wall_ms` (ms) | **0.297** | 0.297–0.333 | 0.238 | 113.40 | 35.34 | 27.28 |
-| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` (ns) | **46.75** | 46.755–48.989 | 55.57 | 343.00 | 16 453.22 | 18 832.03 |
-| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` (ns) | **64.46** | 64.463–68.124 | 76.29 | 304.17 | 20 374.27 | 23 692.45 |
-| `foreign` | `emqx_base62:encode/1` | `ns_per_call` (ns) | **41.48** | 41.484–44.988 | 59.43 | 190.51 | 8 542.00 | 11 672.37 |
-| `foreign` | `emqx_base62:decode/1` | `ns_per_call` (ns) | **49.74** | 49.736–52.828 | 70.23 | 289.88 | 14 996.48 | 20 045.53 |
-| `list_walk` | — | `ns_per_element` (ns) | **58.14** | 58.145–60.106 | 63.74 | 2.45 | 143.40 | 156.15 |
-| `copy_bound` | `etf_roundtrip` | `ns_per_op` (ns) | **109.05** | 109.046–113.693 | 111.01 | 650.76 | 71 597.74 | 72 285.68 |
-| `copy_bound` | `ets_copy` | `ns_per_op` (ns) | **13.95** | 13.952–14.181 | 14.28 | 222.17 | 3 150.75 | 3 216.32 |
-| `copy_bound` | `send_recv` | `ns_per_op` (ns) | **145.51** | 145.511–150.696 | 101.65 | 1 455.51 | 215 321.19 | 147 862.60 |
-| `gc_bound` | `churn` | `ns_per_op` (ns) | **29.90** | 29.904–30.194 | 55.18 | 4 283.39 | 129 331.85 | 240 007.25 |
+| workload | case | metric (unit) | **rust/sys default (min3)** | range | rust/sys INTERP (min3) | sys (min3) |
+|---|---|---|---|---|---|---|
+| `baseline` | — | `startup_ms` (ms) | **0.141** | 0.141–0.168 | 0.144 | 98.64 |
+| `slice` | `add` | `wall_ms` (ms) | **0.104** | 0.104–0.139 | 0.117 | 110.61 |
+| `slice` | `fib` | `wall_ms` (ms) | **0.107** | 0.107–0.141 | 0.134 | 110.34 |
+| `slice` | `pick` | `wall_ms` (ms) | **0.120** | 0.120–0.132 | 0.120 | 107.55 |
+| `slice` | `calendar_last_day` | `wall_ms` (ms) | **0.124** | 0.124–0.154 | 0.120 | 112.71 |
+| `slice` | `queue_from_size` | `wall_ms` (ms) | **0.185** | 0.185–0.197 | 0.137 | 107.66 |
+| `slice` | `gb_trees_size` | `wall_ms` (ms) | **0.124** | 0.124–0.151 | 0.126 | 113.64 |
+| `slice` | `base64_encode_size` | `wall_ms` (ms) | **0.118** | 0.118–0.145 | 0.138 | 109.70 |
+| `slice` | `ordsets_from_size` | `wall_ms` (ms) | **0.124** | 0.124–0.133 | 0.130 | 117.64 |
+| `slice` | `string_str_length` | `wall_ms` (ms) | **0.297** | 0.297–0.333 | 0.238 | 113.40 |
+| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` (ns) | **46.75** | 46.755–48.989 | 55.57 | 343.00 |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` (ns) | **64.46** | 64.463–68.124 | 76.29 | 304.17 |
+| `foreign` | `emqx_base62:encode/1` | `ns_per_call` (ns) | **41.48** | 41.484–44.988 | 59.43 | 190.51 |
+| `foreign` | `emqx_base62:decode/1` | `ns_per_call` (ns) | **49.74** | 49.736–52.828 | 70.23 | 289.88 |
+| `list_walk` | — | `ns_per_element` (ns) | **58.14** | 58.145–60.106 | 63.74 | 2.45 |
+| `copy_bound` | `etf_roundtrip` | `ns_per_op` (ns) | **109.05** | 109.046–113.693 | 111.01 | 650.76 |
+| `copy_bound` | `ets_copy` | `ns_per_op` (ns) | **13.95** | 13.952–14.181 | 14.28 | 222.17 |
+| `copy_bound` | `send_recv` | `ns_per_op` (ns) | **145.51** | 145.511–150.696 | 101.65 | 1 455.51 |
+| `gc_bound` | `churn` | `ns_per_op` (ns) | **29.90** | 29.904–30.194 | 55.18 | 4 283.39 |
 
-**Reading.** Whole-process cost at this HEAD was still far lower under Rust (`baseline` startup
-**0.141×**, `slice` cases **0.104×–0.297×** — this snapshot's preloaded-only slice, not the boot-paying
-regime of *Current startup regime*), while the per-unit interpreter cost is still far higher
-(**13.9×–145.5×** across the startup-cancelled marginals). `slice` peak RSS remains the one
-like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB**
-→ rust **2.60× lower** (essentially unchanged from `AFTER`'s 2.46×); a loop workload's rust peak RSS
-is **not** comparable across runtimes — each shape's growth is its own, and only a shape measured at its
-own `N` says anything ([`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*). The `foreign`
-per-call gap vs the system runtime (**41×–64×**) sits in the same band as `AFTER`'s (**37×–55×**) — the
-`CURRENT` default runs the baseline tier on the *whole* process, so this is the tier-inclusive figure.
+**Reading.** The per-unit interpreter cost is far higher under Rust (**13.9×–145.5×** across the startup-cancelled marginals), and `slice` peak RSS is the one like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB** → rust **2.60× lower**.
+A loop workload's rust peak RSS is **not** comparable across runtimes — each shape's growth is its own ([`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*).
+The `foreign` per-call gap (**41×–64×**) sits in `AFTER`'s band (**37×–55×**), this default tiering the *whole* process.
 
 ### `rust` default vs `BEAM_RT_TIER=interpreter` — the tier effect (min of 3)
 
@@ -189,16 +160,9 @@ Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseli
 | `copy_bound` | `send_recv` | `ns_per_op` | 215 321.19 | 147 862.60 | **1.456× worse** |
 | `gc_bound` | `churn` | `ns_per_op` | 129 331.85 | 240 007.25 | **0.539×** |
 
-**Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
-**`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
-where the whole-process wall is dominated by `beam_rt` startup (this snapshot's preloaded-only slice; the
-current runtime pays the ≈ 0.35 s boot-script drive on every action, see *Current startup regime*), not
-the interpreted loop. The only real
-regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
-`queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
-the section below characterises. `fib`/`base64_encode_size`/`ordsets_from_size` read *better* on the
-default column, but by less than the per-pass spread (the `slice` range column above is up to ≈35 %), so
-they are not attributed to the tier.
+**Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and **`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases — where a preloaded-only one-shot's wall is dominated by `beam_rt` startup, not the interpreted loop.
+The only real regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**), `queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost the section below characterises.
+`fib`/`base64_encode_size`/`ordsets_from_size` read *better* on the default column, but by less than the per-pass spread (the `slice` range column above is up to ≈35 %), so they are not attributed to the tier.
 
 ### The one-shot cold-start cost — current characterisation
 
@@ -421,7 +385,7 @@ The three non-`encode` paired rows above therefore carry the same shape — a re
 
 **Correctness of the measured side.** `--lib -- runner::tests` **46 passed / 0 failed**, `--lib -- native::memory` **34 passed / 0 failed**, `--test process_info_items` **4 / 0**, `--test engine_off_heap_transport` **6 / 0**.
 The re-pointed path was probed directly — a compiled `<<0:N/unit:8>>` held live by a parked child, then `erlang:process_info(P, binary)` → `{1,true}` — and agrees with the system runtime.
-The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item**, which `tools/differential/src/corpus/gc.rs` documents as a deliberate capability gap.
+The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item** — [`tools/differential/src/corpus/gc.rs`](../tools/differential/src/corpus/gc.rs) keeps it out behind a stale capability-gap note, so that item's coverage is `tests/process_info_binary.rs`'s own oracle cross-check (*`process_info(self(), binary)`* below), not the corpus.
 
 **Where the memory ceiling is bounded.** The reservoir is not an accumulator: the runner's `Yield` arm prunes it at the slice boundary whenever the process's binary virtual heap is over its budget, releasing every payload its just-published roots no longer reach (`src/context/gc/bin_vheap.rs`), so `erlang:memory(binary)` is flat in the iteration count — the figures, the sawtooth envelope, the disabled-site A/B and the retained-payload half are [`CONTEXT.md`](CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, measured by `tests/off_heap_reclaim.rs`.
 The end-to-end effect on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, `PRE-FIX` `dc63fd7f49` vs `HEAD` vs the oracle, all three legs from the identical `.beam` — is [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*; the mirror A/B above is the per-call half of this machinery, never a memory one.
@@ -476,7 +440,8 @@ Each avoided refusal is worth ≈**4.2 µs**, which is the whole regression.
 
 The refusal machinery is gone from the profile; the new top-share symbols are the two **copies that remain** — `call_registered` 12.42 % and the copier's `shallow_unshared` 10.16 %, beside `beam_ets::TermStore::{alloc_words,copy_term,release}` (3.47 + 2.98 + 2.49 %) and allocator churn. That is the quantified `beam_bifs` double-copy handoff: the registry's own copy onto the pooled BIF heap is still paid on every `ets:lookup`.
 
-**One shape's cadence did move** (wall time unmoved): `gc_bound/churn`'s loop copies out a 257-word `list_to_tuple/1` result, so its growth now happens *before* the copy; one growth = one retired space = one unit of collection debt, so its schedule shifts from 13 971 collections / 2 997 majors to **15 346 / 2 514** at `N` = 2 000 (7.6728 collections per iteration, one major per iteration plus a fixed 514) against a wall change of 1.012×. The `MEASURED` table in `src/runner/tests/boundary_cost.rs` and `src/runner/CONTEXT.md` are re-derived from it; the door's own invariants (`checks == yields`, `unpublished == 0`, the `checks/9 … checks/7` ration, one young space, `capacity ≤ 610`) all still hold, so this is a table move, not a door regression.
+**One shape's cadence did move** (wall time unmoved): `gc_bound/churn`'s loop copies out a 257-word `list_to_tuple/1` result, so its growth now happens *before* the copy, and one growth = one retired space = one unit of collection debt — its schedule shifts from 13 971 collections / 2 997 majors to **15 346 / 2 514** at `N` = 2 000 (7.6728 collections per iteration, one major per iteration plus a fixed 514) against a wall change of 1.012×.
+That is a table move, not a door regression: `src/runner/tests/boundary_cost.rs` and `src/runner/CONTEXT.md`'s `MEASURED` table are re-derived from it, and the door's own invariants (`checks == yields`, `unpublished == 0`, the `checks/9 … checks/7` ration, one young space, `capacity ≤ 610`) all still hold.
 
 **Correctness of the measured side.** `--lib` **1 520 passed / 0 failed / 3 ignored**; `--lib -- runner` 47 / 0; `--lib -- copy_out` 3 / 0 (including the collecting-default-process case and its no-hint control, which refuses again); `--lib -- context::calls` 14 / 0 (1 ignored); `--test max_heap_enforce` 6 / 0, `--test max_heap_flag` 12 / 0, `--test process_info_items` 2 / 0, `--test engine_off_heap_transport` 4 / 0, `--test port_wake` 1 / 0. `build --release -p beam_rt -p bench --all-targets` is **warning-free**.
 
@@ -514,3 +479,124 @@ Measured on the `copy_bound/ets_copy` shape (250 000 rust ops, release `beam_rt`
 The host is shared (21–64 loadavg on 14 cores), so **one of the five pre-registered rounds** passed a strict load filter and only that pair is quoted as a ratio; the rest are retained as ranges, never as a single figure.
 Nothing outside the shape moved beyond **± 4 %**: `etf_roundtrip` **+0.5 %**, `list_walk` **−2.2 %**, while `send_recv` and `gc_bound churn` are **inconclusive** at this load.
 Read the structural word counts as the result and the −16 % as an indication; re-measure on an idle host before quoting a tighter ratio.
+
+## The NIF-resource prune's two non-park sites (deterministic counters, flat in N)
+
+**Nothing here is a timing.** A NIF resource's payload is a **host `malloc` block** outside every runtime allocator, so no `erlang:memory/1` figure can see the table and no wall clock is separable from it.
+Every number below is a **deterministic counter** — the C fixture's own destructor count, its live-object count, and `ResourcePruneStats`' fields — so this section needs no load filter and makes no latency claim; the load context is recorded only for reproducibility.
+Host: Linux `x86_64`, `nproc` = **14**, shared — 1-min `/proc/loadavg` **32–47** across the runs (33.79 at the transcription of this section). Both legs are **debug** builds (`erts_rust/scripts/cargo.sh test …`), which is the default for this crate's gates.
+
+**The mechanism.** A resource term owns one reference on its object (`beam_abi::nif::enif::resources`), and *which* terms are still live is only knowable by the host — hence `release_resource_terms(predicate)`.
+`src/context/gc/resources.rs::reclaim` is that predicate's caller for a **scheduled** process (the runner's `Yield` park arm, the one point with a published complete root set).
+The two **non-park** sites are the new ones, both in `src/eval/reclaim/resource.rs` and both sharing the refc walk's descent through a two-method `Reach` sink (`src/eval/reclaim.rs::walk<R: Reach>`), so there is **one** reachability implementation, not three:
+`prune_at_statement_boundary` runs between an `-eval` expression's top-level statements, and `prune_beyond` runs at a **nested run's epilogue** (`src/context/pump.rs::adopt_nested_payloads`, reached by every fun application and cross-module call).
+Neither site can enumerate its whole process, so both are gated by a **frontier** — a sorted snapshot of the live resource-term candidate set taken at statement entry / run entry — and release only candidates that appeared **inside** their own window and that their published live set does not name.
+That is the same soundness device as `prune_scoped`'s `only` list, and for the same measured reason.
+
+**Matching is two-tier**, because a `copy_struct` copy is a different *word* with the same *identity*: tier 1 is the candidate's own raw word (`binary_search`), tier 2 is `beam_term::boxed::internal_ref_id` on the term's id block. An identity that cannot be read is recorded as **reached** — "cannot identify it" must never become "it is dead".
+
+### The `-eval` statement boundary, N sweep (`tests/nif_resource_gc.rs`)
+
+One runtime, one process; the driver expression is `D0 = nif_resource_gc:dtor_count(), erlang:length([nif_resource_gc:probe()])` ×N, `{dtor_count() - D0, erlang:memory(total)}`.
+`erlang:length([probe()])` is load-bearing: it consumes the minted term as a function argument, so the term is genuinely **un-rooted** at the boundary (a bound-but-unused variable would still be a live `Env` value and a release would be a false one).
+
+| leg | mints (cumulative) | dtors | released | prunes | declines | live terms |
+|---|---|---:|---:|---:|---:|---|
+| prune ON | 10 | 10 | 10 | 10 | 0 | 0 → 0 |
+| prune ON | 100 (110) | 100 | 110 | 110 | 0 | 0 → 0 |
+| prune ON | 1 000 (1 110) | 1 000 | 1 110 | 1 110 | 0 | 0 → 0 |
+| prune OFF | 10 | 0 | 0 | 0 | 0 | 0 → 10 |
+| prune OFF | 100 | 0 | 0 | 0 | 0 | 10 → 110 |
+| prune OFF | 1 000 | 0 | 0 | 0 | 0 | 110 → 1 110 |
+
+**ON is exactly one destructor per minted-and-dropped term at every N, and the table does not grow by a single entry**; **OFF is exactly linear**, one entry per mint — the pre-fix shape, and the reason the OFF leg exists as a control rather than as a comment.
+`released == prunes == ΣN` is one walk per minting **statement** (not per mint), and `declines == 0` says no walk was refused, so the flat half is not a decline in disguise.
+The zero residual is real here rather than the documented one-statement leak: the run's very first boundary follows `init/1`, which mints nothing, so the frontier is already correct at the first mint.
+The A/B procedure is a **one-line flip** (`ResourcePruneState::default`'s `enabled: true → false`) plus a rebuild; with it flipped the cadence test fails at its first assertion (`left: 0, right: 10`), which is the revert evidence.
+
+### The nested-run epilogue (`tests/nif_resource_nested.rs`)
+
+Every probe is compared against the **system `erl`** on the identical `.beam`s, the identical `.so` and the identical expression text (OTP 29.1.1 / erts-17.1), so the table is an agreement, not a hard-coded expectation.
+
+| probe | prune ON | prune OFF | oracle |
+|---|---|---|---|
+| `dropped(10)` | `{10,0}` | `{0,10}` | `{10,0}` |
+| `dropped(200)` | `{200,0}` | `{0,200}` | `{200,0}` |
+| `mapped(10)` / `mapped(200)` | `{10,0}` / `{200,0}` | — | `{10,0}` / `{200,0}` |
+| `held(16)` (linear control) | `{16,0}` | — | `{16,0}` |
+| `keep_var` / `keep_tuple` / `keep_list` | `{8,0}` | — | `{8,0}` |
+| `plain` (probe discriminates) | `{error,8,0}` | — | `{error,8,0}` |
+
+`dropped(N)` is `{dtor_count, live_count}`, so flat in N means the destructor count tracks N while the live-object count returns to `0`; OFF is linear in the live count with no destructor at all.
+`mapped(N)` is the **scope** half — the `lists:map/2` shape that pinned the refc version: every element was minted by an *earlier* nested run than the one that reads it, and all of them still resolve through `enif_get_resource` (`probe/0` writes a `42` marker and `peek/1` answers `8` from `enif_sizeof_resource`, so a recycled block at the right address is refused rather than trusted).
+`held(16)` is the **non-vacuity** control: the same loop through `probe_held/0`, whose objects the NIF's own C reference keeps alive, is linear — so a broken live-object counter could not make the flat half pass silently.
+
+**Two honesty notes.** (1) The oracle defers a resource `dtor` to misc aux work, so its count only moves after a GC *and* a thread-progress point; the fixture's `dropped/2` does both (`erlang:garbage_collect/0` + `timer:sleep/1`), and because the oracle can still lag **strictly** behind under a loaded host, the dropped legs compare exactly first and otherwise only the shared shape `dtor + live == N`. (2) This runtime releases **synchronously** at each run's epilogue, so the same expression's destructor runs earlier — a timing difference, not a correctness one.
+
+### Cost, and the two device decisions worth recording
+
+**The O(1) steady state is one snapshot and one `Vec` compare per site.** `Frontier::snapshot()` reads `resource_terms()` into a sorted word list (an empty registry allocates nothing); `prune_beyond` then defers when the total word count is unchanged, when nothing is fresh, or when the kill switch is off — so a site with no NIF resource traffic costs one registry read and no walk at all, which is what makes the per-lambda-application price acceptable.
+The nested epilogue goes further: when **neither** store is due (neither the refc payload store nor the resource table), it does not copy the root set either.
+The park arm's host-seed collection (`Runtime::gather_off_heap_roots`) sits behind gate 1 (`candidates.is_empty()`), so a runtime that never minted a resource pays nothing for it.
+
+**There is no region word scan for resources, and that is a decision, not an omission.** The refc prune gets a region half for free because a payload *pointer* is a value written beside its header, so a `HEADER_BIN_REF` pattern scan finds it without dereferencing anything.
+A resource's identity instead lives **inside** its 4-word `[hdr][node][serial][id]` block, and the mint block itself stands in a runtime region (the pooled BIF heap) — so a word-pattern scan would match every candidate every time and make the prune a permanent no-op.
+Omitting it is sound for a specific reason: this descent is region-**agnostic** (it never consults the collector's scanned bounds), so every *live* copy of a resource term is reached from the named roots, while a copy sitting in a region nothing names is dead data — regions are never reset, so treating region words as roots would retain forever, which is the "false positive can only retain" argument pointing the other way.
+The residual is the one the park arm already documents: a resource held only by a store outside the walk's root families (another process's heap, an ETS table, `persistent_term`) is retained.
+
+### Reproduction
+
+```text
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_gc -- --ignored   # the control leg, own process
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test nif_resource_nested
+```
+
+The control leg must run in its **own process**: the ABI resource registry is process-global and `Registry::bind_term` evicts a binding whose word a new mint reuses, so a second `Runtime` in the same OS process mints at the same words and the frontier's candidate set is invariant (which would make every prune defer). Both the cadence test and the control carry a loud-skip guard for a dirty registry for exactly that reason.
+
+### See Also
+
+- [`src/eval/reclaim/resource.rs`](src/eval/reclaim/resource.rs) → the frontier, the two-tier sink, the three gates and the in-module unit tests.
+- [`src/context/gc/resources.rs`](src/context/gc/resources.rs) → the scheduled-site contract, its five decline gates and its residual class (this section extends it, it does not replace it).
+- [`M1_GAPS.md`](M1_GAPS.md) *NIF (A.3)* → the residual ledger: the first-boundary statement leak, the nested `Err` path, the pointer-reuse heuristic and the root-family completeness dependency.
+## The `-eval` statement window (deterministic word counts, not timings)
+**Nothing here is a timing**: every figure is a **word count** from `Runtime::eval_region_stats()` (`Runtime::eval_heap`'s `used`/`capacity` plus the window's counters), deterministic in the expression text, so no load filter applies — the load context is recorded for reproducibility only.
+Host: Linux `x86_64`, `nproc` **14**, shared, 1-min `/proc/loadavg` **2.3–4.6** across the runs; both legs are **debug** builds (this crate's gate default).
+**The growth this bounds.** `Runtime::eval_heap` is a pointer-stable `beam_alloc::Heap` whose frontier only moves forward; `Runtime::grow_eval_heap` doubles its capacity and pushes the replaced region onto `Runtime::eval_heap_retired`, **never freed**. A run's container results are copied onto it (`src/context/pool.rs::move_result_into_runtime_store`), so without a rewind a run's store is the **total volume it ever copied**, not its live set.
+`src/eval/scratch.rs` rewinds the dead prefix at the boundary **before** every top-level statement — the one instant a comma sequence's live set is exactly the evaluator's `Env` plus whatever a runtime-lifetime store kept.
+**The reproduction** is `discarded_builds(n)` (`src/eval/scratch/tests.rs`): `n` statements of `_ = lists:seq(1,2000), ` then `ok`.
+With the window off (the pre-fix behaviour, default **16 777 216**-word region, **0** retired regions) one `lists:seq(1,5000)` costs **10 000** words and two cost **20 000**; two `binary:copy(<<1>>,40000)` cost the pre-window note's **10 004**.
+| `n` | ON `used` | ON `resets` | ON `words_reclaimed` | OFF `used` |
+|---:|---:|---:|---:|---:|
+| 1 | 0 | 1 | 4 000 | 4 000 |
+| 10 | 0 | 10 | 40 000 | 40 000 |
+| 100 | 0 | 100 | 400 000 | 400 000 |
+| 1 000 | 0 | 1 000 | 4 000 000 | 4 000 000 |
+`declines` is **0** on every leg. **ON is flat at the baseline** (each statement's 4 000-word copy is reclaimed by the next boundary); **OFF is exactly `4 000 × n`**, the pre-fix shape — hence the OFF control.
+**The cost.** A boundary is one `Option` test plus one `usize` subtraction while the window is closed, pinned, or below `MIN_WINDOW_WORDS` (**1 024** words = 8 KiB); only a window worth reclaiming pays the reachability descent, which stops at its **first hit** (`Reach::done`). Every decline retains every word — a bounded leak of one statement, never a dangle.
+**The oracle cross-check** is [`tests/eval_region.rs`](tests/eval_region.rs): a `persistent_term` value, an environment binding and a mailbox message each survive **20** interposed builds, answering `6003000`/`6003000`/`2001000` on both runtimes.
+### Reproduction
+```text
+C="erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt"
+$C --lib -- eval::scratch                                                     # the 7 pins
+$C --lib -- eval::scratch::tests::the_growth_figures --ignored --nocapture     # the figures above
+$C --test eval_region                                                         # the oracle cross-check
+```
+## `process_info(self(), binary)` — the in-machine roster (deterministic counts, not timings)
+**Nothing here is a timing**: the figures are the canonical **integer lists** the query answers, deterministic in the fixture text, so no load filter applies.
+The item lists a process's off-heap reference-counted payloads as `[{Ptr, Size, Refc}, …]`; `Ptr` is an address, so two runtimes can agree on the shape, the byte length and the refcount, never on the number.
+The suite reduces each answer to `[Count, IsPositiveInt?, Size, Refc, …]` and asserts the raw 3-tuple shape (the item is the 2-tuple `{binary, …}`, every element an integer, the pointer positive) **before** reducing it, so a wrong shape cannot slip through as an empty list.
+| query | oracle (system `erl`, OTP 29 / `erts-17.1`) | `beam_rt` |
+|---|---|---|
+| self, one 40 000-byte off-heap binary built earlier in the slice | `[1,1,40000,1,40000]` | same |
+| self, nothing built | `[0]` | same |
+| another pid, parked holding one | `[1,1,40000,1]` | same |
+The **third** row is the unchanged route: `src/native/memory/mod.rs::snapshot` reads `RunnerState::reservoir_at`, exactly as before, because a scheduler pass takes the running process's engine out of the runner state for the whole slice.
+The first two rows are the reading that needed the engine's in-machine BIF door: the published window carries the reservoir too (`src/context/position.rs::in_machine_off_heap_binaries`, `InMachinePosition::off_heap_binaries: Option<Vec<(usize, usize, usize)>>`), and the snapshot takes it as the reservoir half when it names the queried pid.
+One `binary_value` builder serves both halves, so the two routes cannot drift.
+The reading is gated on the query naming `binary`, so no other `process_info` item pays the roster copy.
+### Reproduction
+```text
+C="erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt"
+$C --test process_info_binary        # the three legs, each oracle-cross-checked; no `erl` ⇒ a loud skip
+```

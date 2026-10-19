@@ -559,11 +559,19 @@ impl RuntimeContext<'_> {
     /// The term lives on the runtime's never-reset `-eval` arena, so it stays valid for the
     /// runtime's lifetime — the same home every other port message is built on.
     ///
+    /// Because the tag is then held in **runtime-level port state**, not in any root family the
+    /// `-eval` statement window's descent enumerates, this write latches that window
+    /// ([`crate::eval::scratch::pin`]).
+    ///
     /// # Errors
     ///
     /// Whatever [`beam_codec::decode_term`] reports for a malformed image (the caller then keeps
     /// the 3-tuple), or the arena's allocation failure.
     fn decode_caller_tag(&mut self, bytes: &[u8]) -> beam_common::Result<Eterm> {
+        crate::eval::scratch::pin(
+            self.runtime,
+            "a decoded port caller tag is kept in runtime-level port state",
+        );
         let (decoded, appended) = {
             // Disjoint field borrows of `Runtime`: the table is read-only here, the arena is the
             // destination. Committing a name is a separate step below, once this borrow is gone.

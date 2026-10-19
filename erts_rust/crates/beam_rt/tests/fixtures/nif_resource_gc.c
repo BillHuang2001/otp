@@ -41,7 +41,13 @@
  *   * `probe_unexported/0` -- alloc + release, never exported as a term, so the
  *                             allocator's reference is the last one and the release
  *                             destroys the object immediately (no GC involved);
- *   * `dtor_count/0`       -- how many times the type's destructor has run.
+ *   * `dtor_count/0`       -- how many times the type's destructor has run;
+ *   * `is_resource/1`      -- whether a term is still a term-bound resource, i.e. whether
+ *                             `enif_get_resource` resolves its reference to the object
+ *                             (`1`/`0`). This is the *independent* readability witness a
+ *                             destructor count cannot give: a term whose binding the
+ *                             resource prune released answers `0` from then on, so a
+ *                             survivor reports `1` and a dangling copy reports `0`.
  *
  * The destructor's *timing* differs by design (the C defers it as misc aux work, this
  * tree runs it synchronously), so only COUNTS are comparable -- which is exactly what
@@ -87,6 +93,12 @@ static ERL_NIF_TERM probe_unexported(ErlNifEnv *env, int argc, const ERL_NIF_TER
 static ERL_NIF_TERM dtor_count(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 { (void)argc; (void)argv; return enif_make_int(env, dtor_runs); }
 
+static ERL_NIF_TERM is_resource(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    void *obj;
+    if (argc != 1) return enif_make_badarg(env);
+    return enif_make_int(env, enif_get_resource(env, argv[0], gc_type, &obj) ? 1 : 0);
+}
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
     ErlNifResourceFlags tried;
@@ -97,7 +109,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 }
 
 static ErlNifFunc funcs[] = {
-    {"probe", 0, probe}, {"probe_unexported", 0, probe_unexported}, {"dtor_count", 0, dtor_count}
+    {"probe", 0, probe}, {"probe_unexported", 0, probe_unexported}, {"dtor_count", 0, dtor_count},
+    {"is_resource", 1, is_resource}
 };
-
 ERL_NIF_INIT(nif_resource_gc, funcs, load, NULL, NULL, NULL)

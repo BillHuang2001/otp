@@ -53,7 +53,18 @@
 //! * a **heap-admission door** inside a slice — the executing machine's root set is not published
 //!   there, and the door has no `&mut Machine` to publish it from;
 //! * a **BIF** — a BIF's arguments live on a pooled heap outside the process's root set;
-//! * the **`-eval` route** — the action process is never enqueued, so it never parks.
+//! * the **`-eval` route** — the action process is never enqueued, so it never parks. That route
+//!   is **not** left unreclaimed: it has its own two sites, in [`crate::eval::reclaim`]'s resource
+//!   half — the `-eval` statement boundary
+//!   ([`crate::eval::reclaim::prune_at_statement_boundary`], between the evaluator's top-level
+//!   statements) and a **nested run**'s epilogue
+//!   ([`crate::eval::reclaim::prune_beyond`], from `RuntimeContext::adopt_nested_payloads`, which a
+//!   cross-module call and a fun application both reach). Both run the **same** reachability
+//!   descent and the same two-tier (word, then reference-identity) match this module's walk uses,
+//!   under a different soundness device — a **frontier**, so a site releases only candidates minted
+//!   inside its own window, because neither site can enumerate its whole process the way a park
+//!   can. This module stays the scheduled-process site and its gates below stay exactly as they
+//!   are.
 //!
 //! # Cadence
 //!
@@ -77,10 +88,44 @@
 //!    reachable from the roots in a region the process's collector does not scan. This is the
 //!    soundness gate for this walk: a resource term inside a container from such a region is not
 //!    reliably reachable through the collector's geometry, so the prune declines **everything**
-//!    rather than answering "unreachable" for a resource a live foreign container still holds.
+//!    rather than answering "unreachable" for a resource a live foreign container still holds. It
+//!    is classified over the **process's own** roots alone; the host root sources below are seeded
+//!    into the reachability walk but deliberately kept out of this valve, because every host store
+//!    is a foreign region by construction and the valve would therefore decline every prune a
+//!    resource program ever attempts.
 //!
 //! # The residual (leak, never a dangle)
 //!
+//! The walk's roots are the process's own root set **plus** every host root source
+//! [`Runtime::gather_off_heap_roots`] enumerates that is live **during a scheduler pass** — the
+//! escaped-closure environments, the `seq_trace` tokens, the pending-spawn records and every pending
+//! timer **delivery** — so a resource named only by one of those stores is reached and retained.
+//! The two families that live in a per-pid table are **empty at this arm**, and that is a property
+//! of the pass rather than of the enumeration: a scheduler pass moves the process table *and*
+//! [`crate::runner::RunnerState`] out of the [`Runtime`] for its duration
+//! (`Runtime::take_processes`), so the enumeration here sees an equivalent **empty** table and a
+//! default runner state. Both families are live at the two **non-park** sites
+//! ([`crate::eval::reclaim::resource`]'s statement boundary and nested-run epilogue), which run with
+//! the runtime's own tables. Consequences:
+//!
+//! * **another live process's** registers, saved arguments, signals, mailbox and dictionary are not
+//!   visible at this arm, so a resource held *only* by another process's register is answered
+//!   unreachable here — the same class as one held only by another process's heap. The executing
+//!   process's own registers are this arm's **local** root list (below), not a host seed;
+//! * an **engine's** un-consumed spawn arguments and an un-published parked machine's root set
+//!   ([`crate::runner::RunnerState::gather_off_heap_roots`]'s two sub-families) are likewise empty
+//!   here, for the same reason: a child spawned through the pass's pending-spawn route keeps its
+//!   arena-stable arguments rooted at the two **non-park** sites, never here. An **exempt** park
+//!   (every `receive`) never reaches this arm at all — gate 3 below declines it — so a machine
+//!   parked in one keeps its resource terms instead of having them freed behind its back;
+//! * **a reference id is not an identity**: a resource term is minted as an ordinary internal
+//!   reference, so a plain reference the walk reaches whose id equals a live resource's cannot be
+//!   told from a **copy** of that resource, and the resource is retained (`M1_GAPS.md`
+//!   *The resource-identity collision*);
+//! * a `persistent_term` value and an **ETS object** are not enumerated at all: their copies keep a
+//!   resource's reference identity, so a resource held *only* by one of them is answered
+//!   unreachable and released. Closing ETS needs an object iterator the `beam_bifs` table registry
+//!   does not expose;
 //! * a resource held only by a **foreign** container (a pooled-BIF tuple, an arena fallback) is
 //!   kept alive by gate 5, forever if nothing ever drops that container;
 //! * a candidate whose **reference identity cannot be read** (its minted block no longer holds a
@@ -90,15 +135,7 @@
 //!   object alive through the copy's identity — [`super::super::gc_walk::reachable_resource_words`]
 //!   matches a reached reference term's id against the candidates' — so a copy that leaves no
 //!   reachable word and no identity behind is the only shape a release can still miss, and a
-//!   recycled-in-place minted block can only *narrow* the match (a leak), never invent one;
-//! * a term held by a **host-side** store outside the six gathered root families — a pending
-//!   [`TimerAction::Deliver`](crate::timers) message, a `ProcessEngine`'s spawn arguments/entry
-//!   fun, a persistent-term value, an execution-trace token — is invisible to the walk, so
-//!   **no prune runs at all** for a process whose roots reach such a store through no other path…
-//!   except that the store's own words are not roots, so a resource named *only* there would be
-//!   answered unreachable. This is the one open residual: closing it needs a host root-source
-//!   seam (`Runtime::root_terms`), which is a `src/runtime.rs` change and outside this node.
-
+//!   recycled-in-place minted block can only *narrow* the match (a leak), never invent one.
 use beam_process::{Process, ProcessId, ProcessTable};
 use beam_term::Eterm;
 
@@ -130,6 +167,24 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     if candidates.is_empty() {
         return Ok(0);
     }
+    // The host's root sources that are live **during** a scheduler pass — the escaped-closure
+    // environments, the `seq_trace` tokens, the pending-spawn records and every pending timer
+    // **delivery**. Gathered **before** the process borrow below, because `table` and `runtime` are
+    // separate parameters and only this order keeps both unborrowed at once.
+    //
+    // The two per-pid families are empty here and cannot be otherwise: the pass moved the process
+    // table (`Runtime::take_processes`, so the runtime's own is an equivalent empty placeholder) and
+    // `RunnerState` out of the runtime, which is exactly when this arm runs. They are live at the
+    // two **non-park** sites (`crate::eval::reclaim::resource`), which run with the runtime's own
+    // tables. The executing process's own root set is this arm's local list below.
+    //
+    // These words are handed to the **reachability walk only** (below), never to gate 5: a host
+    // store lives outside this process's scanned heap by definition, so every one of its container
+    // words is a `WordRegion::Foreign` root, and the payload valve declines on *any* such word —
+    // folding them in would decline every prune a resource program ever attempts.
+    let mut host: Vec<Eterm> = Vec::new();
+    runtime.gather_off_heap_roots(&mut host);
+
     let Some(process) = table.get_mut(pid) else {
         return Ok(0);
     };
@@ -172,11 +227,14 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     // The reachability decision itself: the reachable subset of `candidates`, over both regions, through
     // cons cells (so a resource held in `[Res]` or in a message payload is found), and by **reference
     // identity** as well as by word — a `copy_struct` copy (the send path, ETS) is a different word with
-    // the same id, and it designates the same object.
+    // the same id, and it designates the same object. The host root sources are seeded into the same
+    // walk, so a resource named **only** by a pending timer delivery (or a pending spawn, a
+    // `seq_trace` token, an escaped closure's environment) is reached and kept.
     let reached = super::super::gc_walk::reachable_resource_words(
         runtime.walk_scratch(),
         process,
         roots.iter(),
+        host.iter(),
         &candidates,
     );
 

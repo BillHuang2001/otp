@@ -178,6 +178,9 @@ use std::time::{Duration, Instant};
 pub mod driver;
 pub(crate) mod async_ready;
 use async_ready::AsyncReady;
+// The C's "the caller suspends until the port is idle, then the command is re-issued"
+// (`erts_port_output`'s `ERTS_PORT_OP_BUSY` arm), shared by `port_command/2,3` and `send/2,3`.
+pub(crate) mod busy_wait;
 pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
@@ -604,7 +607,8 @@ struct PortMeta {
     ///
     /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does (`io.c:1749-1764` and
     /// `erl_bif_port.c:192-220`): `nosuspend` on a busy port answers `false`, `force` bypasses the
-    /// busy check, and a plain command on a busy port suspends the caller. The handle also carries
+    /// busy check, and a plain command on a busy port waits for the idle state and is then
+    /// re-issued ([`busy_wait`]). The handle also carries
     /// whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, which decides the `force` arm.
     /// Seized from the host with [`driver::DriverPort::busy_flag`] before the host is moved into the
     /// port lifecycle (the boxed driver exposes no host), the same way [`PortMeta::driver_terms`],
@@ -1589,7 +1593,8 @@ impl PortRegistry {
     ///   `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`) — a fact about the entry, so it holds
     ///   on an idle port too;
     /// * otherwise a **busy** port is `ERTS_PORT_OP_BUSY` (`io.c:1749-1754`): nothing is queued,
-    ///   and the runtime answers `false` or suspends the caller.
+    ///   and the caller answers `false` (`[nosuspend]`) or hands itself to
+    ///   [`busy_wait::issue`]'s wait-and-re-issue for the idle state.
     ///
     /// `Some(outcome)` is that answer; `None` means the command is accepted so far and its bytes
     /// may be converted.
@@ -1750,10 +1755,12 @@ impl PortRegistry {
     /// Writes `bytes` to the port's stream — `erlang:port_command/2`, i.e. [`PortRegistry::command`]
     /// with **no** options.
     ///
-    /// A busy port is reported as the typed capability gap the runtime's `port_command` floor
-    /// raises for a plain command on one (this seam has no way to suspend the caller and re-issue
-    /// the command, which is what the C does); every other outcome is [`Ok`] — the bytes really
-    /// were handed to the stream, or the driver really did answer them.
+    /// A busy port is reported as the typed capability gap [`busy_wait::NO_PUMP_REASON`] raises
+    /// for a plain command on one: this seam holds no [`Runtime`](crate::runtime::Runtime) and so
+    /// has no authority to pump the scheduler, which is the wait the C's `erts_suspend` +
+    /// `ERTS_BIF_YIELD3` re-run needs. Every other outcome is [`Ok`] — the bytes really were handed
+    /// to the stream, or the driver really did answer them. The pumping callers (`port_command/2,3`
+    /// and `send/2,3`) go through [`busy_wait::issue`] instead.
     ///
     /// # Errors
     ///
@@ -1761,10 +1768,7 @@ impl PortRegistry {
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
         match self.command(id, bytes, PortCommandOptions::EMPTY)? {
             PortCommandOutcome::Done => Ok(()),
-            PortCommandOutcome::Busy => Err(error::unsupported(
-                "port_command on a busy port: suspending the caller until the port is idle is not \
-                 implemented",
-            )),
+            PortCommandOutcome::Busy => Err(error::unsupported(busy_wait::NO_PUMP_REASON)),
         }
     }
 
@@ -1933,9 +1937,9 @@ impl PortRegistry {
     /// `set_busy_port` (the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, `io.c:5208-5264`).
     ///
     /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does: a busy port answers
-    /// `false` for `nosuspend`, suspends the caller for a plain command, and lets `force` through —
-    /// when the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`
-    /// ([`PortRegistry::soft_busy`]).
+    /// `false` for `nosuspend`, waits for the idle state before a plain command is re-issued
+    /// ([`busy_wait`]), and lets `force` through — when the driver entry advertises
+    /// `ERL_DRV_FLAG_SOFT_BUSY` ([`PortRegistry::soft_busy`]).
     ///
     /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port and a
     /// built-in driver port), none of which can ever report busy — the oracle's own answer for a

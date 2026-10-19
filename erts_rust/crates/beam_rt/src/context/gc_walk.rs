@@ -1102,17 +1102,40 @@ impl<'a> Walk<'a> {
 /// region** is expanded, and a cons cell seeds both of its words, so a resource term in a list
 /// cell or a message payload is found — the shape a boxed-object-only view cannot see.
 ///
+/// # `host` — the extra roots, and why they are a separate argument
+///
+/// `host` is the caller's **host root sources** ([`Runtime::gather_off_heap_roots`]: the escaped
+/// closure environments, the `seq_trace` tokens, the pending spawns, every live process's
+/// dictionary/mailbox/registers/saved-args/signals, an engine's un-consumed arguments plus an
+/// un-published parked machine's root set, and the pending timer deliveries). They are seeded into
+/// the *same* walk but are deliberately **not** part of `roots`: `roots` is also what
+/// [`reaches_an_unscanned_word`] classifies, and that valve answers a *payload* question — "could
+/// a `BinRef` living in a region the collector does not scan name a payload this prune would
+/// free?" — for which **every** host root is a hit by construction, because a host store lives
+/// outside this process's scanned heap ([`WordRegion::Foreign`]). Folding them into `roots` would
+/// therefore decline every prune a resource program ever attempts, which is an unbounded leak
+/// rather than a bound.
+///
+/// Splitting them is sound because this walk's criterion is the region-agnostic one
+/// ([`Criterion::ResourcePrune`] expands containers in **either** region and has no hazard hit),
+/// and every host store is a **living, never-rewound** region — the pointer-stable arena, the
+/// `-eval` heap, another live process's own heap — so expanding a word from one reads a live
+/// object exactly as expanding a scanned one does. The pooled BIF heap, the one region whose words
+/// may have been recycled, is not a host root source: nothing in it is published as a root.
+///
 /// The answer is the reachable subset of `candidates`, sorted. It is **not** a verdict: the caller
 /// decides what an unreached candidate means (and must decline — treat everything as reachable —
 /// whenever its own gates say the root set is not complete).
-pub(crate) fn reachable_resource_words<'a, I>(
+pub(crate) fn reachable_resource_words<'a, I, H>(
     scratch: &mut WalkScratch,
     process: &Process,
     roots: I,
+    host: H,
     candidates: &[usize],
 ) -> Vec<usize>
 where
     I: IntoIterator<Item = &'a Eterm>,
+    H: IntoIterator<Item = &'a Eterm>,
 {
     debug_assert!(
         candidates.windows(2).all(|pair| pair[0] < pair[1]),
@@ -1121,6 +1144,9 @@ where
     let bounds = process.collector().scanned_bounds();
     let mut walk = Walk::begin_resource(scratch, bounds, candidates);
     for &word in roots {
+        walk.seed(process, word);
+    }
+    for &word in host {
         walk.seed(process, word);
     }
     walk.seed_process_roots(process);

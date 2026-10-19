@@ -27,10 +27,25 @@
 //! until this module existed it only ever grew: nothing removed an entry, so a route that
 //! builds and drops off-heap binaries retained every one of them for the runtime's life.
 //!
+//! # The second store this descent serves: NIF resource terms
+//!
+//! The same reachability question decides whether a NIF **resource term** (contract A.3,
+//! `enif_make_resource`) may have its reference dropped, and the process-park site that answers it
+//! for a scheduled process ([`crate::context::gc`]'s `resources::reclaim`) cannot answer it on
+//! either of the two routes this module exists for: the `-eval` action process is never enqueued
+//! (so it never parks) and a **nested** run's machine is not a scheduled process at all. The
+//! resource half therefore reuses **this** descent — [`Reach`] is the sink seam, so a second
+//! question costs one small `impl`, never a third copy of the traversal — and lives in its own
+//! child module, [`resource`], whose docs carry that half's sites, gates and region-proof. Nothing
+//! below in *this* module's docs is changed by it: the refc-payload prune's own site, guards and
+//! region scan are exactly as documented, and turning the resource half off
+//! ([`crate::runtime::Runtime::set_resource_prune_enabled`]) leaves them untouched.
+//!
 //! # Where it runs, and why only there
 //!
-//! One call site: [`Evaluator::run_top_level`](crate::eval::Evaluator), **between the top-level
-//! statements** of a `-eval` expression. That is the only point on this route where the
+//! One call site **for this store**: [`Evaluator::run_top_level`](crate::eval::Evaluator),
+//! **between the top-level statements** of a `-eval` expression. That is the only point on this
+//! route where the
 //! evaluator's live term set is fully nameable — its [`Env`](crate::eval) and the value of the
 //! statement just reduced — so it is the only point where the caller can hand this module a
 //! complete root list. A recursion-depth test inside the expression walker would *not* be
@@ -67,9 +82,10 @@
 //!    enter the walk, and the only real terms here are the named live sets below.
 //! 2. **Every root family that holds a term no heap region holds is enumerated** — the evaluator's
 //!    environment and reduced value (passed in as `extra`), the escaped closures' capture
-//!    environments, the sequential-trace tokens, every live process's dictionary and mailbox
-//!    queue, and the pending-spawn records. Every one of these is a real term, so the walk may
-//!    dereference what it reaches from them.
+//!    environments, the sequential-trace tokens, every live process's dictionary, mailbox queue,
+//!    registers, saved arguments and signals, the pending-spawn records, an engine's un-consumed
+//!    arguments plus an un-published parked machine's root set, and every pending timer delivery.
+//!    Every one of these is a real term, so the walk may dereference what it reaches from them.
 //! 3. **The walk is conservative.** Any doubt — an exhausted visit budget, a boxed header this
 //!    module does not know — **declines the whole prune** and retains everything. That is
 //!    deliberately the *opposite* of `RuntimeContext::graph_holds_reference`, whose exhaustion
@@ -124,15 +140,21 @@
 //! pid-attributable (a nested run inside a scheduled process grows it too), so that figure
 //! stays the runner's park-arm prune's.
 //!
-//! # A duplicate that is a deferral, not an accident
+//! # One descent, two questions
 //!
 //! The reachability descent here is the shape of `RuntimeContext::graph_holds_reference`
 //! (`crate::context::calls`): an inline worklist, the same word guards (`is_literal` /
 //! `is_term_word` / boxed-or-list / an aligned non-null pointer) and the same child enumeration
-//! ([`beam_term::layout::for_each_child_slot`]). It is a copy because that function answers a
-//! *different* question (and its exhaustion answer) and lives in a node this change may not edit;
-//! de-duplicating the two is a deferral (one helper taking a visitor over the reachable graph,
-//! owned by `src/context/calls.rs`).
+//! ([`beam_term::layout::for_each_child_slot`]). It is a copy of that function because it answers a
+//! *different* question (and gives a different exhaustion answer) and because that function lives
+//! in a node this module may not edit; de-duplicating the two is a deferral (one helper taking a
+//! visitor over the reachable graph, owned by `src/context/calls.rs`).
+//!
+//! Within **this** module the descent is not duplicated: [`walk`] takes a [`Reach`] sink, and the
+//! two answers it serves — the reachable refc payloads ([`Live`], `bin_ref`) and the reachable NIF
+//! resource terms ([`resource::ResourceSink`], `word`) — are two small `impl`s. The two questions
+//! share every guard, the same `WALK_VISIT_BUDGET` and the same "doubt ⇒ decline" rule, which is
+//! exactly why they must not be two traversals.
 // The narrow, documented `unsafe` override the workspace's policy sanctions for a term-graph walk
 // (`src/context/gc_walk.rs`'s precedent): the descent must read raw heap words. Every read is
 // guarded exactly as `graph_holds_reference`'s are, and the module allocates no pointer of its
@@ -147,6 +169,11 @@ use beam_term::Eterm;
 use crate::hasher::FastHashSet;
 use crate::runtime::Runtime;
 
+mod resource;
+
+pub(crate) use resource::{
+    prune_at_statement_boundary, prune_beyond, resources_pending, Frontier, ResourcePruneState,
+};
 /// The walk's step budget: enough for any term graph a `-eval` expression builds, small
 /// enough that a forged cycle cannot spin. Exhausting it **declines** the prune.
 const WALK_VISIT_BUDGET: usize = 1 << 20;
@@ -200,21 +227,56 @@ pub(crate) struct PruneState {
     pub(crate) last_decline: Option<&'static str>,
 }
 
-/// The reachable payloads the walk found.
+/// The walk's **sink**: one method per answer a caller can want from the reachable graph, both
+/// defaulted so an implementation writes only the half it needs.
+///
+/// This trait is what keeps the two questions this module answers sharing **one** traversal: the
+/// refc-payload question ([`Live`]) implements [`Reach::bin_ref`] and the NIF-resource question
+/// ([`resource::ResourceSink`]) implements [`Reach::word`]. Both inherit the walk's word guards,
+/// its visit budget and its "doubt ⇒ decline" rule, so a change to the descent's soundness reaches
+/// both (see the module docs, *One descent, two questions*).
+pub(crate) trait Reach {
+    /// Called for every dequeued word, **before** the literal/immediate/header skips — so a sink
+    /// can match a word pattern the descent itself does not care about.
+    ///
+    /// A sink that **dereferences** `term` must apply the descent's own guards first
+    /// ([`beam_term::literal::is_literal`], [`beam_term::tag::is_term_word`] /
+    /// [`beam_term::boxed::is_boxed_term`], a non-null aligned pointer): this hook runs *before*
+    /// them, so the words it sees include the ones the descent is about to skip.
+    fn word(&mut self, _term: Eterm) {}
+    /// A reached `[BinRef]` leaf: `val` is the payload's first data byte — the very value
+    /// [`beam_alloc::RefcBinary::data_ptr`] reports.
+    fn bin_ref(&mut self, _val: usize) {}
+    /// Whether this sink already has its answer, so the descent may stop early.
+    ///
+    /// Defaulted to `false` — a sink that has to see the *whole* graph never stops — and used by
+    /// [`crate::eval::scratch`]'s window probe, whose question ("does any reachable term stand in
+    /// this address range?") is answered by its first hit.
+    fn done(&self) -> bool {
+        false
+    }
+}
+
+/// The walk's verdict.
+pub(crate) enum Walk {
+    /// Every root was walked: the sink saw every reachable word.
+    Complete,
+    /// The walk could not be completed, so nothing may be released.
+    Declined(&'static str),
+}
+
+/// The reachable payloads the walk found — the refc-payload question's [`Reach`] sink.
 #[derive(Default)]
 struct Live {
     /// The payload addresses (`RefcBinary::data_ptr` values) the walk reached.
     payloads: FastHashSet<usize>,
 }
 
-/// The walk's verdict.
-enum Walk {
-    /// Every root was walked: `live` names the reachable payloads.
-    Complete(Live),
-    /// The walk could not be completed, so nothing may be released.
-    Declined(&'static str),
+impl Reach for Live {
+    fn bin_ref(&mut self, val: usize) {
+        self.payloads.insert(val);
+    }
 }
-
 /// Whether [`prune`] would do any work right now — its trigger, without its walk.
 ///
 /// This is [`prune`]'s own prelude, split out because a caller that must first **collect
@@ -301,10 +363,10 @@ pub(crate) fn prune_scoped(
     // The two halves of the enumeration: the named live sets, walked as terms (which may
     // decline), and the runtime's own term regions, scanned as **words** (which cannot fault
     // and cannot decline). See the module docs for why region words must never be roots.
-    let mut live = match walk(&roots) {
-        Walk::Complete(live) => live,
-        Walk::Declined(reason) => return decline(runtime, reason),
-    };
+    let mut live = Live::default();
+    if let Walk::Declined(reason) = walk(&roots, &mut live) {
+        return decline(runtime, reason);
+    }
     runtime.for_each_off_heap_region(|words| collect_region_payloads(words, &mut live));
     // The prune: drain (the table's only removal path), keep every payload that is reachable
     // or shared, and put the survivors back. Re-pushing also **de-duplicates by data pointer**
@@ -382,18 +444,29 @@ fn collect_region_payloads(words: &[Eterm], live: &mut Live) {
         }
     }
 }
-/// The region-agnostic reachable-payload walk.
+/// The region-agnostic reachability walk, reporting into `sink`.
 ///
 /// Every failure mode declines (see the module docs): the budget is spent, or a boxed header
 /// this module does not know is met, or a word looks like a container but names no readable
 /// address (which is *skipped* — no term word has that shape, so nothing is lost and the C
 /// faults there too).
-fn walk(roots: &[Eterm]) -> Walk {
-    let mut live = Live::default();
+///
+/// The sink is told about every dequeued word **first** ([`Reach::word`]) and about each reached
+/// `[BinRef]` leaf's payload ([`Reach::bin_ref`]); everything the descent decides (which words are
+/// containers, which region they stand in, whether to decline) is unchanged by the sink, which is
+/// what lets the two questions this module answers share it.
+pub(crate) fn walk<R: Reach>(roots: &[Eterm], sink: &mut R) -> Walk {
     let mut work: Vec<Eterm> = Vec::with_capacity(roots.len().max(16));
     work.extend_from_slice(roots);
     let mut budget = WALK_VISIT_BUDGET;
     while let Some(item) = work.pop() {
+        if sink.done() {
+            // The sink already has its answer: a sink that stops early is one whose question is
+            // monotone ("found a hit"), so there is nothing left to learn from the rest of the
+            // graph. A sink that needs the whole graph leaves `done` at its `false` default.
+            return Walk::Complete;
+        }
+        sink.word(item);
         // A literal is a frozen code constant (it can name nothing on these heaps), an
         // immediate is neither boxed nor a cons, and a bare header word is not a term at all.
         if beam_term::literal::is_literal(item)
@@ -432,7 +505,7 @@ fn walk(roots: &[Eterm]) -> Walk {
                 // first data byte — the very value `RefcBinary::data_ptr` reports.
                 beam_term::tag::BIN_REF_SUBTAG => {
                     let (val, _next) = beam_term::refc::bin_ref_parts(item);
-                    live.payloads.insert(val as usize);
+                    sink.bin_ref(val as usize);
                 }
                 // Every shape whose children are term slots — tuples, records, funs (their
                 // `env`), flat maps and HAMT nodes, and an `ErlSubBits` (whose single `orig`
@@ -461,7 +534,7 @@ fn walk(roots: &[Eterm]) -> Walk {
             }
         }
     }
-    Walk::Complete(live)
+    Walk::Complete
 }
 
 #[cfg(test)]
@@ -506,9 +579,11 @@ mod tests {
         let tuple = heap
             .tuple(&[beam_term::prelude::make_small(1), cons])
             .expect("the tuple");
-        let Walk::Complete(live) = walk(&[tuple]) else {
-            panic!("the walk over a well-formed graph completes");
-        };
+        let mut live = Live::default();
+        assert!(
+            matches!(walk(&[tuple], &mut live), Walk::Complete),
+            "the walk over a well-formed graph completes"
+        );
         assert!(
             live.payloads.contains(&(first.data_ptr() as usize)),
             "the pair's payload is reachable through the tuple and the cons"
@@ -526,9 +601,11 @@ mod tests {
         let mut heap = beam_term::heap::Heap::new(32);
         let binary = payload(96);
         let pair_term = pair(&mut heap, &binary, 96 * 8);
-        let Walk::Complete(live) = walk(&[pair_term]) else {
-            panic!("the walk over a lone pair completes");
-        };
+        let mut live = Live::default();
+        assert!(
+            matches!(walk(&[pair_term], &mut live), Walk::Complete),
+            "the walk over a lone pair completes"
+        );
         assert!(live.payloads.contains(&(binary.data_ptr() as usize)));
     }
 
