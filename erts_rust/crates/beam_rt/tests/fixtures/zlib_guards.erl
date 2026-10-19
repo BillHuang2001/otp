@@ -39,14 +39,13 @@
 
 %% The six guard-class reason atoms, **named** so they enter this module's atom table.
 %%
-%% This is load-bearing for this runtime and it is a *runtime* property, not a zlib one: a
-%% raise whose reason atom is not in the raising module's atom table is not catchable by that
-%% module's `try ... catch` — it escapes and terminates the process (`beam_rt: error
-%% not_initialized`, exit 1). `tests/zlib_guards.rs` pins that defect separately with the
-%% `zlib_guards_unnamed` fixture, which is the same probes without this atom reference; the
-%% classes themselves are identical either way, which is what this module's transcripts show.
-guard_atoms() ->
-    [not_initialized, already_initialized, stream_error, data_error, badarg,
+%% Documentation of the class set, not a requirement: a NIF-raised class has no atom literal in
+%% any module (`zlib.beam` never spells these — the C NIF's own static atoms carry them), yet
+%% `try ... catch` catches it and reports the class, because the runtime names a BIF raise's
+%% reason atom in its one shared atom table. `tests/zlib_guards.rs` pins that independently of
+%% any module's atom table with the `zlib_guards_unnamed` fixture, which is the same probes
+%% without this reference and prints the same transcripts.
+guard_atoms() ->    [not_initialized, already_initialized, stream_error, data_error, badarg,
      not_on_controlling_process].
 
 %% ---------------------------------------------------------------------------------------

@@ -154,12 +154,94 @@ fn the_pending_interner_reports_emptiness_so_the_commit_can_be_skipped() {
     );
 }
 
+/// **A failed call's reason atom is named in the runtime's ONE shared table**, so the engine's
+/// raise funnel can land it in a catch frame.
+///
+/// `beam_bifs`'s `zlib` stream surface raises its state guards as atom **names**
+/// (`Raise::error(ExitReason::atom("not_initialized"))`, the C's
+/// `enif_raise_exception(env, am_not_initialized)`), and no module names those atoms —
+/// `zlib.beam` does not either — so neither the live namespace nor a module snapshot can spell
+/// the reason, the engine declines, and a `try … catch` around the call could never see the
+/// raise. Naming it here (append-only, at exactly the index the interner predicts) is what the
+/// `tests/zlib_guards.rs` fixture observes end to end.
+#[test]
+fn a_failed_calls_reason_atom_is_interned_into_the_shared_table() {
+    use beam_common::{ExitReason, Raise};
+
+    let mut rt = runtime();
+    let name = "not_initialized_zzz_probe";
+    assert!(
+        rt.atoms().lookup(name).is_none(),
+        "premise: the boot seed does not hold the name"
+    );
+    let base = rt.atoms().len();
+    let raise = BeamError::Raise(Raise::error(ExitReason::atom(name)));
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.name_raise_reason_atom(&raise);
+    }
+    assert_eq!(
+        rt.atoms().lookup(name).map(|atom| atom.raw() as usize),
+        Some(base),
+        "the name lands at exactly the index the interner predicted"
+    );
+    assert_eq!(rt.atoms().len(), base + 1);
+
+    // Idempotent: a second identical raise finds the name and does not append again.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.name_raise_reason_atom(&raise);
+    }
+    assert_eq!(
+        rt.atoms().len(),
+        base + 1,
+        "an already-named reason atom is not interned twice"
+    );
+}
+
+/// The three shapes that must leave the shared table **byte-identical**: a capability gap (whose
+/// uncatchability is a CLI contract), an error with no nameable atom, and a name the boot seed
+/// already holds.
+#[test]
+fn a_failed_calls_reason_atom_is_left_alone_when_it_must_be() {
+    use beam_common::{ExitReason, Raise};
+
+    let mut rt = runtime();
+    let base = rt.atoms().len();
+    let cases = [
+        // A capability gap must stay uncatchable: interning it would let a program's own
+        // `try … catch` swallow the runtime's honest gap.
+        BeamError::Raise(Raise::error(ExitReason::atom(
+            "unsupported_opcode: some_future_op",
+        ))),
+        // No atom to name at all.
+        BeamError::TermNotFound,        BeamError::Raise(Raise::error(ExitReason::Structured)),
+        // Already seeded at boot.
+        BeamError::Raise(Raise::error(ExitReason::atom("badarg"))),
+        BeamError::BadArith,
+    ];
+    for error in &cases {
+        {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.name_raise_reason_atom(error);
+        }
+        assert_eq!(
+            rt.atoms().len(),
+            base,
+            "`{error}` must not add an atom to the shared table"
+        );
+    }
+    assert!(
+        rt.atoms().lookup("unsupported_opcode: some_future_op").is_none(),
+        "a capability gap's reason atom stays unnameable, so it stays uncatchable"
+    );
+}
+
 #[test]
 fn a_bif_interns_a_new_atom_into_the_shared_table() {
     let mut rt = runtime();
     let name = "a_fresh_atom_zzz";
-    assert!(rt.atoms().lookup(name).is_none(), "the name starts unknown");
-    let base = rt.atoms().len();
+    assert!(rt.atoms().lookup(name).is_none(), "the name starts unknown");    let base = rt.atoms().len();
     let mut ctx = RuntimeContext::new(&mut rt);
     let image = terms::make_heap_binary(&mut ctx, name.as_bytes()).expect("a binary");
     let atom = ctx

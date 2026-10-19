@@ -160,6 +160,12 @@ impl ExecutionContext for RuntimeContext<'_> {
                         self.mailbox_pid
                     ));
                 }
+                // A raise's reason may be an atom **name** rather than an atom term
+                // (`beam_bifs`'s `zlib` surface raises `error:not_initialized` exactly so).
+                // Name it in the shared table before the engine sees the error, so the
+                // engine's live-namespace resolution can land it in a catch frame —
+                // see [`RuntimeContext::name_raise_reason_atom`].
+                self.name_raise_reason_atom(&error);
                 return Err(error);
             }
         };

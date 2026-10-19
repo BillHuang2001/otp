@@ -19,21 +19,20 @@
 %%
 %% %CopyrightEnd%
 %%
-%% The `zlib` guard-class **defect fixture** for `tests/zlib_guards.rs`.
+%% The `zlib` guard-class **atom-table independence** fixture for `tests/zlib_guards.rs`.
 %%
 %% `zlib_guards.erl` names the six guard atoms in `guard_atoms/0`; this module is the same
 %% probe shape **without** that reference, so `not_initialized` / `already_initialized` /
-%% `stream_error` never enter this module's atom table. On this runtime a raise whose reason
-%% atom is absent from the raising module's atom table is not caught by `try ... catch` — it
-%% escapes `caught/1` and terminates the process (`beam_rt: error <atom>`, exit 1) — while the
-%% system `erl` oracle answers `{exception,error,<atom>}` for exactly the same code. That is a
-%% runtime defect (an atom-namespace/catch-frame issue, not a `zlib` one); the suite pins both
-%% sides verbatim so a fix trips the assertion.
+%% `stream_error` never enter this module's atom table — and `zlib.beam` never spells them
+%% either (the C NIF's own static atoms carry them). A raise whose reason atom no loaded module
+%% names must still be caught by `try ... catch` and answer its class, exactly as the system
+%% `erl` oracle does: the runtime names a BIF raise's reason atom in its one shared atom table,
+%% which is the table the engine's atom-namespace seam reads, so the raise's catchability does
+%% not depend on any module's load-time snapshot.
 %%
 %% Nothing here may name the guard atoms, not even in a comment that the compiler would not
 %% read: only *code* references load atoms, and only code references are what this fixture must
-%% stay free of.
--module(zlib_guards_unnamed).
+%% stay free of.-module(zlib_guards_unnamed).
 
 -export([deflate_end_twice/0, after_finish/0, deflate_init_twice/0]).
 
