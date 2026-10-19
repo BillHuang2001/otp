@@ -35,7 +35,7 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
 use super::arith::{FAST_C, SMALL_MASK};
-use super::link::Linker;
+use super::link::{ExitSpill, Linker};
 use super::operands::{
     emit_guarded_y_load, small_word, x_offset, x_register, y_addressable, y_register,
 };
@@ -761,7 +761,15 @@ pub(super) fn try_inline_test(
     // x-registers, leaves this frame and jumps to its entry); any other fail
     // target returns its `(func, pc)` word to the driver exactly as before.
     buffer.bind(failed)?;
-    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1, pc)?;
+    linker.emit_exit(
+        buffer,
+        allocation,
+        done,
+        plan.fail.0,
+        plan.fail.1,
+        pc,
+        ExitSpill::Required,
+    )?;
 
     // --- the lowering rejected an operand -----------------------------------
     // Two rejections reach this label: the small-int **guard** (a comparison operand
@@ -889,7 +897,15 @@ fn emit_test_helper(
     )?;
 
     buffer.bind(failed)?;
-    linker.emit_exit(buffer, allocation, done, fail_func, fail_pc, pc)?;
+    linker.emit_exit(
+        buffer,
+        allocation,
+        done,
+        fail_func,
+        fail_pc,
+        pc,
+        ExitSpill::Required,
+    )?;
 
     buffer.bind(after)?;
     Ok(true)

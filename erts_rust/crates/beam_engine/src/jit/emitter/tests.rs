@@ -244,6 +244,50 @@
     }
 
     #[test]
+    fn jumps_through_a_register() {
+        // The target buffer returns `a + b`; the caller *tail-transfers* to it through
+        // `jmp rax` after `mul`-free arithmetic of its own, so the target's `ret` returns
+        // straight to the caller's caller — the shape a same-function block resume uses
+        // (it leaves its own frame first and lets the target's prologue rebuild one).
+        let mut callee = CodeBuffer::new().unwrap();
+        callee.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        callee.add_rr(Reg::Rax, Reg::Rsi).unwrap();
+        callee.ret().unwrap();
+        callee.seal().unwrap();
+        let callee_fn: BinOp = callee.as_fn_ptr();
+        let callee_addr = callee_fn as usize as i64;
+        let mut caller = CodeBuffer::new().unwrap();
+        // A `push`/`pop` pair around the transfer would be wrong for a tail jump (the
+        // frame must be gone), so the caller keeps its own stack untouched and simply
+        // forwards its arguments.
+        caller.mov_ri(Reg::R11, callee_addr).unwrap();
+        caller.jmp_r(Reg::R11).unwrap();
+        caller.seal().unwrap();
+        let tail: BinOp = caller.as_fn_ptr();
+        assert_eq!(tail(10, 4), 14);
+        assert_eq!(tail(-3, 1), -2);
+        // `callee` must outlive every jump through it.
+        assert!(callee.is_sealed());
+        // The emitted encoding is `FF /4` with a REX.B prefix for `r8`-`r15`.
+        let mut plain = CodeBuffer::new().unwrap();
+        plain.jmp_r(Reg::Rax).unwrap();
+        let mut extended = CodeBuffer::new().unwrap();
+        extended.jmp_r(Reg::R12).unwrap();
+        let bytes = |buffer: &CodeBuffer| {
+            // SAFETY: `code_ptr()` is the start of the buffer's live mapping and `len()`
+            // bytes of it have been emitted, so `[ptr, ptr + len)` is a valid, initialized
+            // range; the slice borrows nothing that is mutated while it lives.
+            unsafe { std::slice::from_raw_parts(buffer.code_ptr(), buffer.len()).to_vec() }
+        };
+        assert_eq!(bytes(&plain), vec![0xFF, 0xE0]);
+        assert_eq!(bytes(&extended), vec![0x41, 0xFF, 0xE4]);
+        // …and `call_r` is the same ModRM shape with `/2`, so the two can never be swapped
+        // silently.
+        let mut indirect_call = CodeBuffer::new().unwrap();
+        indirect_call.call_r(Reg::Rax).unwrap();
+        assert_eq!(bytes(&indirect_call), vec![0xFF, 0xD0]);
+    }
+    #[test]
     fn emits_call_through_a_register() {
         // The callee returns `a - b`; the caller forwards its own arguments
         // (`rdi`/`rsi`) to it through `call rax`. `push rbx` keeps the stack

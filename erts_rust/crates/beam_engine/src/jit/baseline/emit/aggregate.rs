@@ -42,7 +42,7 @@ use beam_term::{
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::link::Linker;
+use super::link::{ExitSpill, Linker};
 use super::operands::{constant_word, x_register, Loc, Y_ADDR_SCRATCH};
 use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
@@ -343,12 +343,28 @@ pub(super) fn try_inline_select_tuple_arity(
     }
 
     // --- no alternative matched: branch to the fail label -------------------
-    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1, pc)?;
+    linker.emit_exit(
+        buffer,
+        allocation,
+        done,
+        plan.fail.0,
+        plan.fail.1,
+        pc,
+        ExitSpill::Required,
+    )?;
 
     // --- each alternative: branch to its target ----------------------------
     for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
         buffer.bind(*case_label)?;
-        linker.emit_exit(buffer, allocation, done, target.0, target.1, pc)?;
+        linker.emit_exit(
+            buffer,
+            allocation,
+            done,
+            target.0,
+            target.1,
+            pc,
+            ExitSpill::Required,
+        )?;
     }
 
     // Rejected (a non-tuple source): one interpreter step. The interpreter then

@@ -45,6 +45,28 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   bit position — C's `fmt_small_le`/`fmt_big_le` + `restore_and_shift`,
   `erl_bits.c:686/812/891`); `push_uint_le` (a `u64`-sized field) and `push_wide_int`'s
   little branch (a `fmt_big_le` byte array) both delegate to it.
+  **Whole-byte fast paths** serve the byte-wise shapes the compiler emits for real data
+  (a `<<C:8>>` match field, a `<<Acc/binary,C>>` accumulator), whose per-bit route costs a
+  `push_bit`/bit read per bit: `push_uint`/`push_uint_le`/`push_le_groups`/`push_wide_int`
+  take a byte-at-a-time arm when the width is a whole number of bytes **and** the
+  destination is byte-aligned, and `read_uint_be`/`extract_bits` do the same on the read
+  side. Every range/width check still runs **first**, so an out-of-range field keeps the
+  oracle's error; the bit-at-a-time rule stands for every non-aligned shape, because a
+  mid-byte destination needs `raw::InPlace::push_bit`'s byte-window handling (clearing an
+  entered byte, and masking the one byte the accumulator's window ends inside).
+  `read_size` and `decode_flags` are **hot/cold split**: an `#[inline(always)]` shell answers
+  the shape the compiler actually emits and forwards everything else to an `#[inline(never)]`
+  slow body, so the caller folds the decode into a discriminant test instead of paying a call
+  plus a `Result` returned through memory. `read_size`'s shell classifies a literal
+  `Operand::Integer`/`Operand::Character` size directly through `size_of_int` — it is by far the
+  hottest size shape (`<<V:8>>` *is* `Operand::Integer(8)`) and the general read would
+  materialise an integer term only to read that same value back — and forwards a runtime
+  `size(Expr)` register, a literal-area term and every reject case to `read_size_slow`. Its
+  reject case is the `#[cold] size_error`, shared by both halves. `decode_flags`'s shell answers
+  `Operand::Nil` (every flagless segment) with a plain zero and forwards a flag-atom list literal
+  to `decode_flags_slow`, which keeps the whole `flag_bit`/`native`-normalisation/`BSF_*` body
+  and the typed error unchanged. `is_all`/`flag_bit`/`small_value`/`sign_extend` and the hot
+  `BitWriter` methods carry `#[inline]`.
 - `raw.rs` → the family's **single** `#[allow(unsafe_code)]` module: `heap_bits` /
   `subject_bytes` (the subject triple), `ctx_parts`/`inner_orig`/`make_ctx`/
   `set_ctx_start` (the match context), `make_big`/`big_parts_safe` (bignums) and
@@ -62,21 +84,76 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `is_refc_binary` is a `#[cfg(test)]` safe wrapper over
   `beam_term::refc::is_refc_binary` for the node's test modules (which live under
   the crate-wide `#![deny(unsafe_code)]`), mirroring `big_parts_safe`.
+  `bit_size` is the host-facing `erlang:bit_size/1` reader — a heap bits/binary takes its
+  `size` word, a refc window **and** an `ErlSubBits` match context take `end - start`
+  (exactly `erts_bin_bits_size`), and a non-bitstring is `None` (→ the caller's `badarg`),
+  never a substituted size. It exists because a BIF living in this crate cannot reach this
+  module's `pub(super)` readers, and it is re-exported once from `bitstrings/mod.rs`
+  (`pub(crate) use raw::bit_size`, `#[allow(unused_imports)]`) for the BIF floor that serves
+  `bit_size/1`: the in-crate harness floor `src/bench/counting.rs`, which is what makes
+  `emqx_base62:decode/1` measurable (`instr_per_call` 531, `rooted_calls_per_call` 32).
+  The `#[allow(dead_code)]` on the function is load-bearing, not stale — its only caller is
+  `#[cfg(test)]`, so a plain `--lib` build would otherwise warn. The external test host
+  `tests/support/bifs.rs` still cannot reach it: integration tests see this crate from the
+  outside and `families` is a private module, so that floor would need a `pub` re-export.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
-    `bs_match_string`/`bs_test_tail2` opcodes.
+    `bs_match_string`/`bs_test_tail2` opcodes. `bs_get_integer2` commits its advance through
+    the term its own `read_ctx` already captured, re-reading the context operand only when the
+    field read actually reserved a heap term (`read_integer_field_tracked`'s allocation
+    witness) — the same one-sided rule `run_commands` follows.
+    `exec` tests `Instr::BsMatch` **before** the 18-arm jump table and hands everything else
+    to the outlined `exec_other`, so the dominant variant pays a `matches!` + a tail jump
+    instead of the table dispatch. Both `#[inline(never)]` markers are load-bearing: without
+    outlining, LLVM folds the pre-test back into the switch (no codegen change at all), and
+    without the outlined dispatcher the family entry grows past the inline budget and
+    `families::dispatch` stops inlining it (measured 1.03–1.06× slower).
   - `match_ctx.rs` → match entry (`enter_match`, the `reuse` path, `resolve_match4_fail`),
-    the context operand readers (`read_ctx`/`reread_ctx`) and `bs_set_position`
-    (`position_of`).
+    the context operand readers (`read_ctx`/`reread_ctx`) and the position ops
+    (`position_term`/`position_of`).
+    `enter_match`'s reuse arm returns the **same `Eterm`** the operand holds — C's
+    `$Dst = context` — so a re-entered match costs no reservation at all. The reuse predicate
+    is `raw::ctx_parts(value).is_some()` after a `raw::heap_bits` miss, which is exactly C's
+    `erl_sub_bits_is_match_context` because this engine never builds a non-match-context,
+    non-refc `ErlSubBits` (`make_binary` yields only an on-heap `ErlHeapBits` or the
+    `[BinRef][ErlSubBits]` pair). Identity is faithful: C re-reads neither `orig` nor
+    `start`/`end`. A `bs_start_match3`/`bs_start_match4`-resume whose `Dst` is its own `Src`
+    stays a no-op.
+    `Instr::BsGetPosition` publishes a **small integer** (`position_term` → `make_small`), C's
+    `$Dst = make_small(sb->start)` — zero allocation. The old whole-context snapshot survives
+    only as the over-large-position fallback, and `position_of` accepts both forms.
   - `commands.rs` → the flattened `bs_match` command interpreter (`run_commands`:
     `ensure_at_least`/`ensure_exactly`/`skip`/`integer`/`binary`/`get_tail`/`'=:='`) and
-    the `commit` write-back discipline.
+    the `commit` write-back discipline. The four cold command bodies (`skip`, `binary`,
+    `get_tail`, `'=:='`) are `#[inline(never)]` helpers `skip_cmd`/`binary_cmd`/
+    `get_tail_cmd`/`eq_cmd` reporting `CmdFlow { Done, Relocated, Fail }`; only the
+    `ensure_*`/`integer` arms, the capture and the `stale` re-read stay in `run_commands`
+    (a comprehension re-enters it once per byte with a **two-command** list, so the call was
+    paying for code it never runs). Classification is still `module.atom_name` (a `Vec`
+    index) plus a length-discriminated `&str` match — a precomputed atom-id table would cost
+    7 hash probes per invocation and does not pay.
+    `run_commands` captures the context term, its inner
+    `orig` and the subject byte view **once** and re-derives them only after a command that
+    can have allocated through the rooted seam: `integer` dirties only when its field did not
+    fit a small integer, `binary`/`get_tail` always (they build a bitstring every time), and
+    `ensure_at_least`/`ensure_exactly`/`skip`/`'=:='` never. The rule is deliberately
+    one-sided — a stale capture would be unsound, a redundant re-read only costs a read.
   - `reads.rs` → the fixed field readers: `read_integer_field`/`read_wide_integer_field`,
     `read_float_field` + `f16_to_f32`, `decode_utf8`/`decode_utf16`/`decode_utf32`, the
     shared `field_is_little` endianness resolver, and the byte/bit helpers they share.
+    `read_uint_le_bits` forwards a **byte-aligned** field to the shared whole-byte
+    `read_uint_le` and keeps its bit-granular loop only for a mid-byte start (the float/UTF
+    callers — `read_integer_field` routes an unaligned little-endian integer elsewhere).
   - `utf_tests.rs` → `#[cfg(test)]` instruction-arm regressions for the match reads'
     endianness flags (`BsGetUtf32`/`BsSkipUtf32`, and the raw-`BSF_NATIVE`
     float/integer/utf16 reads), oracle-derived.
+  - `elision_tests.rs` → `#[cfg(test)]` the allocation-aware re-read elision: a
+    non-allocating command list elaborates off one capture and advances the context exactly,
+    a 128-bit (bignum) `integer` still commits the full advance, `binary`/`get_tail` keep the
+    always-re-read commit (including `get_tail` targeting the context's own operand), `skip`
+    and `'=:='` elide, and the allocation witness agrees with the term the read built. A
+    `MinimalContext` never relocates, so what is observable here is that the elided route
+    changes nothing a caller can see (the reverse direction is a purity argument, not a test).
   - `rooted.rs` → `#[cfg(test)]` rooted-allocation tests for the match path.
   - `tests.rs` → `#[cfg(test)]` unit tests for the pure decoders the `bs_*` match opcodes
     call (`decode_utf8`/`utf16`/`utf32`, `read_float_field`) plus the instruction-level
@@ -84,19 +161,31 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     results.
 - `create/` → the construction side:
   - `mod.rs` → `exec` (`bs_init_writable`, `bs_create_bin`) and `assemble` (the flat
-    six-operand segment walk). A non-integer value is the bare `badarg` at **every**
+    six-operand segment walk).
+    A non-integer value is the bare `badarg` at **every**
     segment width (checked before the width dispatch, C's `erl_bits.c:952/1152`), and the
     `"integer"` arm routes a value to the shared `push_wide_int` (`mod.rs`, `> 64`-bit
     byte model) whenever `nbits > 64` **or** the value is a bignum, so a bignum is masked
     into a narrow field exactly as C's `fmt_big_be`/`fmt_big_le` do.
   - `segments.rs` → the per-segment-type sources and encoders (`segment_source`,
-    `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`). The
+    `string_source`, `float_source`, `put_float`/`f64_to_f16`, `put_utf8/16/32`), and the
+    **cold-body host**: `binary_segment`/`string_segment`/`float_segment`/`utf_segment`
+    return `Result<SegOutcome>` (`Written` | `Fail(Step)`), and
+    `float_source`/`put_float`/`put_utf8`/`put_utf16`/`put_utf32` are `#[inline(never)]`, so
+    `assemble`'s hot block (the `private_append` + `integer` walk) stays small.
+    `binary_segment` alone is `#[inline]` (a single call site on the accumulator hot path).
+    Inlining all four was measured a **net regression** (`decode` +3.5 %, `capitalize_token`
+    +1.8 %) — do not re-attempt it. The
     `float` source accepts a float, a small integer **or a bignum** (the nearest finite
     double via `beam_term::number::big_to_f64`, the `big_to_double` port); only a
     non-number or a magnitude that overflows a finite double is `badarg`
     (`erl_bits.c:1341/1373`).
   - `size.rs` → the segment size validation (`SegSize`/`segment_size`, `seg_nbits`,
-    `float_nbits`) and the `SegReason` raise (`fail_seg`).
+    `float_nbits`) and the `SegReason` raise (`fail_seg`). `segment_size` short-circuits a
+    literal `Operand::Integer`/`Operand::Character` through `literal_segment_size` (same
+    `BadArg`/`Small`/`SystemLimit` discrimination) instead of `read_operand` →
+    `make_integer_unrooted`; it pays on `long_append`/`decode` and costs `encode` ~0.8 %
+    (whose sizes arrive as register shadows, never a literal).
   - `tests.rs` → `#[cfg(test)]` unit tests for the segment encoders.
   - `wide_tests.rs` → `#[cfg(test)]` unit tests for the integer segment's value masking
     (a bignum into a narrow field, big/little endian, signed/unsigned, a literal-operand
@@ -139,7 +228,7 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
 - Files ~1000 lines; split by responsibility. `matching/mod.rs` holds only the family's
   opcode dispatch table plus the per-opcode arms; its unit tests live in
   `matching/tests.rs`, and new test cases go to `matching/tests.rs` /
-  `matching/utf_tests.rs` / `matching/rooted.rs`.
+  `matching/utf_tests.rs` / `matching/elision_tests.rs` / `matching/rooted.rs`.
 
 ## Test Strategy
 Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls (`raw.rs`,
@@ -150,16 +239,15 @@ toolchain is absent).
 Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: the whole-crate suite is authoritative —
-`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --offline
---no-fail-fast` must stay green (currently 1634 passed / 0 failed / 4 ignored across every target).
-This family's subset is `... -p beam_engine --offline --lib families::bitstrings`, and the build
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
+--no-fail-fast` must stay green (1764 passed / 0 failed / 7 ignored across its 77 targets).
+This family's subset is `... -p beam_engine --lib families::bitstrings` (135 passed), and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
-**Differential evidence:** the project gate `erts_rust/tools/differential` was run
-per-case over the whole `binary/` group plus every bitstring/binary-shaped corpus id
-(62 cases: `binary/*`, `semantics/bit_size_of_bitstring`, the `binary*`/bit-size BIF and
-`mexec_extra` ids, the four `gc/*binary*` cases, `phash2/non_byte_aligned_bitstring`,
-`errors/badmatch_binary_value`, `wire_extra/eval_wide_binary_segment_*`) — **62 agree /
-0 mismatch / 0 unsupported**, all exit 0.
+**Differential evidence:** `erts_rust/tools/differential` was run per-case over the whole `binary/`
+group plus every bitstring/binary-shaped corpus id
+(80 cases: all `binary/*`, `bits/*`, `semantics/bit*`, `wire/bit_binary*`,
+`wire_extra/eval_wide_binary*`, the four `gc/*binary*` cases and `errors/*binary*`) —
+**80 agree / 0 mismatch / 0 unsupported / 0 skipped**, all exit 0.
 **Corpus coverage hole (tools-owned):** no corpus case exercises a **bit-granular
 little-endian** integer write, a `float` segment, a `float-native` pattern or a
 `utf32-little` pattern (the `binary/bignum_*` LE cases are all byte-aligned 16/64-bit
@@ -180,6 +268,90 @@ fields), so those shapes are covered only by this node's oracle-derived unit tes
   falls to `goto find_func_info` → `handle_error`), and it IS reachable from compiled
   code (`<<1, X/binary, 2>>` emits a non-append `binary` segment with `{f,0}`). Verified
   oracle-identical for that shape — do not "fix" it into a silent continue.
+
+## Measured — per-call cost of the measured workloads
+All figures are the default (native baseline) tier on the shared host, pinned core, one process at
+a time, with the `/proc/loadavg` band recorded; only the **ratios** and the deterministic
+`*_per_call` counters are meaningful — an absolute moves with the host load (observed ±15 % between
+sessions, and up to 5× on a loaded one).
+Structural counters (deterministic; the primary evidence):
+
+| workload | `rooted_calls_per_call` | `rooted_words_per_call` | `instr_per_call` |
+|---|---|---|---|
+| `cowboy_bstr:to_lower` | 2 | 13 | 438 |
+| `cowboy_bstr:capitalize_token` | 2 | 13 | 660 |
+| `emqx_base62:encode` | 18 | 45 | 244 |
+| `emqx_base62:decode` | 32 | 133 | 531 |
+| `long_append:expand` | 2 | 13 | 98 318 |
+| `bench_list_walk:walk` | 1000 | 2000 | 169 418 |
+
+`decode`'s 32 calls / 133 words decompose **call-count-exactly**: `1 × 8` words (the `bs_init_writable`
+`[BinRef][ErlSubBits]` pair) + `1 × 5` (the outer accumulator's first `bs_start_match3`) + `15 × 3`
+(one `<<DecodeChar>>` 8-bit `ErlHeapBits` per iteration) + `15 × 5` (a fresh match context over that
+freshly-built field binary, where C's reuse arm cannot apply because the operand is not itself a
+context).
+Every element matches C's `bs_instrs.tab:571-586` (`<<Char>>` build) and `erl_bits.c:81-105`
+(`erts_bs_start_match_3`, `HeapOnlyAlloc` only when `!reuse`).
+The accumulator loop therefore reserves nothing beyond its own result binaries, and `encode`/`decode`
+add only their genuine results (`encode` additionally pays the `iolist_to_binary` calls of its BIF floor).
+
+**Oracle word parity — the standing parity claim.** Reclaimed words per call from
+`erlang:statistics(garbage_collection)` on the real system ERTS (OTP 29.1.1 / erts-17.1),
+`{min_heap_size, 233}`, N = 200 000, in a dedicated process, on the same inputs the harness uses
+(`<<"The Quick Brown Fox 0123456789">>`, `<<"the-quick-brown-fox-0123456789">>`, `<<1..12>>`,
+`<<"ABCDEFGHIJKLMNO">>`):
+
+| workload | ERTS words/call | ours | verdict |
+|---|---|---|---|
+| `cowboy_bstr:to_lower/1` | 13.00 | 13 | exact |
+| `cowboy_bstr:capitalize_token/1` | 13.00 | 13 | exact |
+| `emqx_base62:decode/1` | 133.00 | 133 | exact |
+| `emqx_base62:encode/1` | 57.00 | 45 | ours lower (the oracle's extra words are `iolist_to_binary/1` inside the harness BIF floor) |
+
+The three binary-comprehension workloads allocate **word-for-word what C allocates**, so **no
+avoidable allocation remains on these paths** — corroborated by a `perf` profile of `to_lower` in
+which no allocator symbol reaches the 1.1 % reporting floor.
+
+Wall clock (default tier, 19 alternating paired rounds, load band 1.23–2.12): `to_lower` 3 410.4 / 3 447.3 ns min/median at 7.87 ns per instruction,
+`capitalize_token` 4 376.7 / 4 404.2 at 6.67, `decode` 4 581.0 / 4 634.8 at 8.73, `encode`
+2 648.6 / 2 656.8 at 10.89, `list_walk` 373 065 / 374 416 at 2.21.
+Paired `post/pre` medians for the changes that landed (each its own ≥7-round alternating run):
+match-context reuse + `bs_get_position` small integer `to_lower` 0.958 / `capitalize_token` 0.908
+(interpreter 0.963 / 0.963), `bs_create_bin` cold-body outlining `to_lower` 0.995 /
+`capitalize_token` 0.992 / `encode` 0.990 / `long_append` 0.982, the `bs_match` dispatch pre-test
+`to_lower` 0.982 / `capitalize_token` 0.982 / `decode` 0.990 / `encode` 0.990, and the
+`read_size`/`decode_flags` hot/cold split (7 alternating rounds, load band 8.43–10.25)
+`capitalize_token` **0.934** (per-round 0.897–0.957), `to_lower` **0.953** (0.941–0.998),
+`encode` **0.971** (0.944–0.980), `decode` **0.972** (0.959–0.981) — 7/7 rounds below 1.0 on all
+four, with every structural counter unchanged.
+`list_walk` measures 0.995–1.005 median against every one of them (it executes no bitstring
+instruction), so the estimator carries no cross-workload bias.
+Function-level self time (`to_lower`, release, `perf record --call-graph dwarf`,
+`perf report --no-children`, ≥1.1 % self): `step_instruction_body` 15.43 %,
+`step_instruction_with_entry` 8.82 %, `create::assemble` **6.66 %**, `run_commands` **6.12 %**,
+`Machine::drive` 4.27 %, `beam_term::compare::cmp_impl` 3.96 %, `families::dispatch` 3.28 %,
+`jit::baseline::bitstr::jit_bitstr` 2.71 %, `interpreter::build_label_map` 2.33 %,
+`matching::exec_other` 2.27 %, `exec_census::on_instruction` 2.12 % (while **disabled**),
+`jit::baseline::runtime::enter_in_block` 1.99 %, `terms::number::make_integer_unrooted` 1.85 %,
+`create::exec` 1.80 %, `matching::match_ctx::read_ctx` 1.57 %, `Machine::reset` 1.28 %.
+`read_size` and `decode_flags` have no symbol of their own: both are folded into `run_commands`
+and `assemble` by their always-inlined shells (the inlined `size_of_int` is visible inside
+`run_commands`), so the two remaining in-node bodies are `assemble` and `run_commands`.
+Every remaining item is either outside this node (see `## Out-of-node findings`) or the
+`bs_match` interpretation C removes at load time.
+**Measured negatives, do not re-attempt** (each reverted on its own paired evidence):
+- recognising the six emitted `bs_match` command shapes as whole-operand-list slice patterns ahead
+  of the reference loop made `to_lower` **1.027×** *slower* (`capitalize_token` 1.016, `encode`
+  1.012; 9 alternating rounds, 9/9 rounds ≥ 1.0) — the shape test, `sizeable`/`atom_is` and the
+  extra branch cost more than the two-iteration loop it replaced;
+- inlining `matching::match_ctx::read_ctx`/`reread_ctx` (7 rounds): `#[inline(always)]` on both
+  `to_lower` **1.026** / `capitalize_token` **1.024** / `decode` **1.020** / `long_append` 1.014,
+  and `#[inline]` plus a `#[cold] not_a_match_context` split `capitalize_token` **1.050** /
+  `long_append` 1.019 — the 4-tuple return plus the `raw::ctx_parts` validation is cheaper as a
+  call than folded into its three callers;
+- testing `small_value` before `raw::big_parts_safe` in `create/mod.rs`'s integer-segment
+  classification made `to_lower` **1.023** / `capitalize_token` **1.022** / `encode` 1.009
+  slower (7 rounds), so the bignum arm stays first.
 
 ## Remaining typed capability gaps
 Every gap is a typed error, never a wrong value. Each remaining site is a guard for a
@@ -213,6 +385,37 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   (C's `big_to_double < 0`).
 
 ## Out-of-node findings (do not fix here)
+- **`crates/beam_loader` — the `bs_match` command-list generator expansion.** C never interprets a
+  flattened command list at run time: `emu/ops.tab:1102` + `emu/generators.tab:1096-1112` make the
+  loader/assembler generator explode `bs_match` into dedicated instructions at load time
+  (`i_bs_ensure_bits`/`i_bs_ensure_bits_unit`/`i_bs_read_bits`/`i_bs_eq`/`i_bs_extract_integer`/
+  `i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_get_tail`/`i_bs_skip`/`i_bs_drop`, incl.
+  the fused `i_bs_read_bits Ctx=x u==8 | i_bs_extract_integer u==8 Dst=x => i_bs_read_integer_8`).
+  Our loader preserves the raw list, so `run_commands` re-derives a load-time fact on **every**
+  execution (a comprehension enters it once per byte). Doing it in the loader would remove the
+  interpretation entirely; an in-family re-discovery of the shapes was measured a **regression**
+  (see `## Measured`), so this is the only route left.
+- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside
+  this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
+  (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
+  `pub(crate) mod families` (or targeted root re-exports) first.
+- **`src/interpreter/dispatch.rs:353-362` — `Instr::SelectVal` materializes every pair operand.** It
+  calls `read_operand` per pair (`Operand::Integer`/`Operand::Character` →
+  `terms::number::make_integer_unrooted`, `src/operand.rs:69,75`) and then a full `beam_term::cmp` per
+  pair, so a character-table `select_val` (what a per-character case/`select_val` compiles to) pays an
+  O(pairs) term-materialization + atom-namespace comparison per execution; the small-integer scrutinee
+  could be compared against a small/literal candidate directly.
+  Parent-owned; the measured contributor to this profile's `make_integer_unrooted` 2.61 % and
+  `cmp_impl` 2.92 %.
+- **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
+  small-value arm is `make_small` (no allocation), but the function is not inlined at its
+  `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
+- **`Machine::reset` 2.67 % + `interpreter::build_label_map` 3.16 %** are per-run entry costs in the
+  parent's `run_label_outcome`/`reset` path, material at this harness' batch granularity.
+  **OWNER: the parent `src/` node.**
+- **`src/exec_census.rs`** is 2.12 % of `to_lower`'s self time while **disabled** — the
+  thread-local `bool` load sits on the per-instruction funnel; the instrument has no call site in
+  this node.
 - **`tools/differential` corpus coverage hole** (see Test Strategy).
 
 ## `append` / `private_append` — in place while the payload is writable

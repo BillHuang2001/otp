@@ -144,6 +144,12 @@ mod test;
 #[cfg(test)]
 #[path = "spill_tests.rs"]
 mod spill_tests;
+// The fill model's unit tests (`liveness::fill_sets` / `Allocation::fill_slots`): which
+// registers enter the cache at all, and the `pc`-local join rule a post-helper refill
+// applies on top of block-local liveness.
+#[cfg(test)]
+#[path = "liveness_tests.rs"]
+mod liveness_tests;
 // The register cache — the `Allocation` and its spill/fill traffic — lives in the
 // `regs` submodule; re-exported here so `emit::Allocation`, `emit::spill`,
 // `emit::fill` and the item paths the other emitter submodules name stay unchanged.
@@ -368,11 +374,12 @@ pub(super) fn emit_step_and_continue(
 /// `Next` is the interpreter and wrote `machine.x`, so a cached register whose
 /// `machine.x` slot it wrote is stale. It is a **partial** refill
 /// ([`regs::fill`]): only the cached registers [`Allocation::fill_slots`] lists — the
-/// continuation's block-local liveness unioned with the block's write set, see
-/// [`liveness`] — are reloaded. A cached register left out keeps a stale word on
-/// purpose, which is safe because it is never read (a later read through its machine
-/// register makes it live here) and never stored (every store writes exactly the block's
-/// write set, which the fill set always contains).
+/// continuation's block-local liveness unioned with the inline write set of the
+/// instruction *at* that `pc` (the `pc`-local join rule, see [`liveness`]) — are reloaded.
+/// A cached register left out keeps a stale word on purpose, which is safe because it is
+/// never read (a later read through its machine register makes it live here) and never
+/// stored while stale (a store only ever stores a register an inline lowering wrote since
+/// the last syncing event).
 pub(super) fn emit_continue_check(
     buffer: &mut CodeBuffer,
     done: CodeLabel,
@@ -398,4 +405,31 @@ pub(super) fn emit_continue_check(
         emit_refresh_y(buffer)?;
     }
     Ok(())
+}
+
+/// [`emit_continue_check`] for a helper that has **already** re-published the Y window
+/// itself on its success path ([`jit_allocate_heap`](super::jit_allocate_heap): its
+/// `push_frame` is a frame change, and the admission before it may have collected).
+///
+/// Identical to [`emit_continue_check`] — the same "the next instruction" compare, the same
+/// typed-error passthrough on the block exit, the same register refill (mandatory: the
+/// helper reached the host's heap-admission door, which a collecting host answers by
+/// rewriting `machine.x` in place) — **without** the trailing `jit_refresh_y` call. The block
+/// therefore pays one helper call where it used to pay a helper call plus a refresh call, and
+/// the window is already live when the next instruction addresses a `Y` slot.
+///
+/// A helper that changes no frame keeps the plain [`emit_continue_check`] (and therefore the
+/// gated emitted refresh): its window is still the one the block published.
+pub(super) fn emit_continue_check_helper_refresh(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    // `rax` holds the helper's word; only "the next instruction" continues here.
+    buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::Ne, done)?;
+    fill(buffer, allocation, FillSite::Helper, pc)
 }

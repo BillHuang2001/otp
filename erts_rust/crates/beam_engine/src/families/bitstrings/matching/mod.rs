@@ -42,9 +42,20 @@
 //!
 //! `bs_match`'s `commands` operand is the raw flattened list the loader preserved
 //! (`instr.rs:730`); decoding the records is this module's job. A `pos` cursor
-//! advances locally through the commands and is written back into the context once
-//! the whole list has succeeded. `ensure_at_least`/`ensure_exactly` only test; the
-//! reads snapshot a value into a register.
+//! advances locally through the commands and is mirrored into the context **as each
+//! advancing command completes** — before that command binds its destination — so a
+//! later command in the same list always reads an up-to-date position.
+//! `ensure_at_least`/`ensure_exactly` only test; the reads snapshot a value into a
+//! register.
+//!
+//! # Re-reading the context after an allocation
+//!
+//! A match-context term and its byte view are only valid until something reserves
+//! through the rooted seam, whose moving collector may relocate the context block.
+//! Every site that captures a context therefore re-reads it after an *allocating*
+//! read, and only then: `bs_match`'s command loop and `bs_get_integer2` elide the
+//! re-read when the value they built is a small-integer immediate
+//! (`read_integer_field_tracked`'s flag), because such a read cannot have reserved.
 //!
 //! # Module layout
 //!
@@ -73,6 +84,8 @@ mod rooted;
 mod utf_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod elision_tests;
 
 // Every moved item is re-exported here so its existing
 // `crate::families::bitstrings::matching::…` path keeps resolving. Some are only
@@ -81,14 +94,23 @@ mod tests;
 #[allow(unused_imports)]
 pub(crate) use commands::{cmd_at, ensure_at_least, run_commands};
 #[allow(unused_imports)]
-pub(crate) use match_ctx::{enter_match, position_of, read_ctx, reread_ctx, resolve_match4_fail};
+pub(crate) use match_ctx::{
+    enter_match, position_of, position_term, read_ctx, reread_ctx, resolve_match4_fail,
+};
 #[allow(unused_imports)]
 pub(crate) use reads::{
     bit_at, bits_equal, decode_utf16, decode_utf32, decode_utf8, f16_to_f32, read_float_field,
-    read_integer_field, read_uint16, read_uint_le_bits, read_wide_integer_field, skip_utf,
-    trailing_bytes_for_utf8,
+    read_integer_field_tracked, read_uint16, read_uint_le_bits, read_wide_integer_field,
+    skip_utf, trailing_bytes_for_utf8,
 };
 /// Execute a bitstring **matching** instruction.
+///
+/// Kept out of line (`#[inline(never)]`) so the family entry
+/// [`super::exec`] stays small enough for the instruction router
+/// (`families::dispatch`) to keep inlining it: with this dispatcher inlined into
+/// the family entry, that entry grew past LLVM's inline budget and every
+/// bitstring instruction — `bs_match` included — started paying a call.
+#[inline(never)]
 pub(super) fn exec(
     machine: &mut Machine,
     module: &Module,
@@ -99,6 +121,41 @@ pub(super) fn exec(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     let _ = (func, pc);
+    // Hot-variant pre-test. `bs_match` is the variant a compiled binary
+    // comprehension or match loop re-enters on **every** iteration (the compiler
+    // fuses a fixed-size field read into one `bs_match` command list), so it is
+    // tested before the 18-arm `match` below: that one costs the variant's
+    // discriminant decode plus a bounds check and an indirect `jmp` through a jump
+    // table on every call. A direct compare and a well-predicted branch replace it
+    // for the common case.
+    //
+    // The rest of the dispatch is **outlined** ([`exec_other`], `#[inline(never)]`)
+    // on purpose: without a call boundary LLVM merges the pre-test back into the
+    // very switch it is meant to avoid (it did, when this was one function), which
+    // leaves the jump table on the hot path. The remaining arms stay reachable and
+    // unchanged; only `bs_match`'s body moved here, so nothing is duplicated.
+    if let Instr::BsMatch {
+        fail,
+        ctx: ctx_op,
+        commands,
+    } = instr
+    {
+        return run_commands(machine, module, labels, *fail, ctx_op, commands, ctx);
+    }
+    exec_other(machine, module, labels, instr, ctx)
+}
+
+/// The non-`bs_match` half of [`exec`]'s dispatch: the other 17 matching variants.
+///
+/// Outlined so the hot pre-test in [`exec`] stays a compare-and-branch (see there).
+#[inline(never)]
+fn exec_other(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    instr: &Instr,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
     match instr {
         Instr::BsStartMatch3 {
             fail,
@@ -146,9 +203,23 @@ pub(super) fn exec(
             live: _,
         } => {
             let (_, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_position")?;
-            // Reserve the snapshot first, then re-read the context operand so the
-            // snapshot's `orig` is the post-collection inner subject of the *current*
-            // context.
+            // C's `i_bs_get_position` publishes `make_small(sb->start)` — the bare bit
+            // position, an immediate, **no** allocation (`emu/bs_instrs.tab:1145-1149`; the
+            // ARCH_64 fused `i_bs_start_match3_gp` does the same for `$Pos`, `:1091`), and
+            // `bs_set_position` decodes it back into `sb->start` (`:1140-1143`). That pair
+            // is what the compiler brackets a match sequence with, so the save must not
+            // reserve a whole context block per attempt.
+            if let Some(position) = position_term(start) {
+                write_operand(machine, dst, position)?;
+                return Ok(Some(Step::Next));
+            }
+            // A position beyond the small-integer range. C builds a bignum here
+            // (`$GC_TEST_PRESERVE(BIG_UINT_HEAP_SIZE, …)`, `:1150-1163`); the engine cannot
+            // yet restore one (`position_of` reads the small form and a context), so it
+            // keeps its pre-existing whole-context snapshot rather than publishing a term
+            // `bs_set_position` would refuse. Reserve the snapshot first, then re-read the
+            // context operand so the snapshot's `orig` is the post-collection inner subject
+            // of the *current* context.
             let extra = operand_slack_words(ctx_op);
             let snapshot = raw::make_ctx(machine, ctx, start, end, extra, |m, slack| {
                 let value = read_operand_slack(m, ctx_op, slack)?;
@@ -207,7 +278,7 @@ pub(super) fn exec(
                 flags,
                 dst,
             } = &**b;
-            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
@@ -216,16 +287,23 @@ pub(super) fn exec(
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let (bytes, off) = raw::subject_bytes(orig)?;
-            let value = read_integer_field(machine, ctx, bytes, start + off, nbits, *flags)?;
-            // `read_integer_field` allocates (a bignum) through the rooted seam, so a
-            // moving collector may have relocated the context read above: re-read the
-            // context operand and commit the new position **before** binding `Dst`.
+            let (value, allocated) =
+                read_integer_field_tracked(machine, ctx, bytes, start + off, nbits, *flags)?;
+            // Only a field that does not fit a small integer reserves through the rooted
+            // seam (`read_integer_field_tracked`'s flag), and only such a reservation can
+            // have relocated the context read above: when the field was small the captured
+            // term is still live, so the commit writes into it instead of paying a second
+            // operand read.
             // The C advances `sb->start` inside `erts_bs_get_integer_2` *before* the
-            // instruction's `$Dst = _result`, and `Dst` may be the context's own
-            // operand (`beam_asm:filter_essentials/1` compiles to `ctx == dst == x(3)`),
-            // so binding first would clobber the context the commit re-reads (the frozen
-            // reserve, then read, then write ordering).
-            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
+            // instruction's `$Dst = _result`, and `Dst` may be the context's own operand
+            // (`beam_asm:filter_essentials/1` compiles to `ctx == dst == x(3)`), so the
+            // position is committed before `Dst` is bound (the frozen reserve, then read,
+            // then write ordering).
+            let term = if allocated {
+                reread_ctx(machine, ctx, ctx_op, "bs_get_integer2")?
+            } else {
+                term
+            };
             raw::set_ctx_start(term, start + nbits);
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
@@ -294,11 +372,8 @@ pub(super) fn exec(
             raw::set_ctx_start(term, next);
             Ok(Some(Step::Next))
         }
-        Instr::BsMatch {
-            fail,
-            ctx: ctx_op,
-            commands,
-        } => run_commands(machine, module, labels, *fail, ctx_op, commands, ctx),
+        // `bs_match` is executed by the hot-variant pre-test at the top of this
+        // function, so it never reaches this `match` (the body lives there, once).
         // `bs_match_string Fail Ctx Bits Offset` — compare the next `Bits` bits of
         // the context against the `StrT` string at byte `Offset`
         // (`i_bs_match_string`, `bs_instrs.tab:1004`). The comparison succeeds only

@@ -59,12 +59,13 @@
 //!
 //! [`fill`] is **partial**: it reloads only the cached registers a helper at that `pc`
 //! can still be observed through — the block-local liveness set of the continuation
-//! unioned with the block's write set ([`super::liveness::fill_sets`], and see that
-//! module for why the write set is part of the rule). A cached register left out of the
+//! unioned with the **instruction's own** inline write set ([`super::liveness::fill_sets`],
+//! and see that module for why the write set is part of the rule, and why it is the `pc`'s
+//! rather than the block's). A cached register left out of the
 //! fill set keeps a stale word, which is safe because it is never observed: a later
 //! **read** through that machine register would make the register live at that helper
 //! (so it is in the set), and every **store** of a cached register stores exactly the
-//! write set, which the fill set always contains.
+//! dirty set, whose entries are always in the fill set at the `pc` that dirtied them.
 
 use beam_common::Result;
 
@@ -144,6 +145,22 @@ pub(crate) struct Allocation {
     /// operand (each through its own syntactic shape predicate), and an `init_yregs`
     /// listing an addressable `Y` register.
     pub(crate) y_last: Option<u32>,
+    /// The **first pc of the block whose instruction accesses a `Y` slot**, or `None`
+    /// when no instruction of the block does — [`Allocation::y_last`]'s twin.
+    ///
+    /// Only [`Allocation::prologue_publishes_y`] reads it; it exists so the prologue can
+    /// tell a block that reaches a Y access *before* anything has published the window
+    /// from one whose every Y access follows a helper that re-published it already.
+    pub(crate) y_first: Option<u32>,
+    /// The **first pc of the block of an instruction whose native lowering is a
+    /// frame-changing helper that re-publishes the Y window itself** on its in-block
+    /// continue path: `allocate`/`allocate_heap` (`Machine::push_frame`) and `trim`
+    /// (`Machine::trim`). Each helper calls `JitRuntime::refresh_y_base` on its success
+    /// arm before answering "the next instruction" (`runtime.rs::jit_allocate` /
+    /// `jit_allocate_heap` / `jit_trim`); on a failure it answers `ERROR` and the block
+    /// leaves to the driver, so the only way to continue in-block past it is through that
+    /// re-publish. `None` when the block holds no such instruction.
+    pub(crate) frame_republish_first: Option<u32>,
     /// The block's **first pc** (`start`), the base `fill_sets` is indexed from.
     pub(crate) block_start: u32,
     /// The **fill set of every instruction of the block**, indexed by `pc - block_start`
@@ -159,9 +176,9 @@ pub(crate) struct Allocation {
     ///
     /// A cached register the block **writes before it reads** is not loaded: the writing
     /// instruction sets its machine register (never `machine.x`), and every later store of
-    /// that register stores the write set, which the fill set always contains — so the
-    /// stale machine register is only ever overwritten before it is read. Loading it would
-    /// be a redundant load of a word the block immediately replaces.
+    /// that register stores the dirty set, whose entries were all refilled at the `pc` that
+    /// dirtied them — so the stale machine register is only ever overwritten before it is
+    /// read. Loading it would be a redundant load of a word the block immediately replaces.
     ///
     /// `None` (a synthetic `Allocation` a unit test built directly) conservatively means
     /// the **whole** cache, which is the pre-live-in model.
@@ -231,7 +248,8 @@ impl Allocation {
     /// `(x-register index, machine register)` pairs.
     ///
     /// The set is the block-local liveness of the continuation at `pc` unioned with the
-    /// block's write set ([`super::liveness::fill_sets`]); a table that does not cover
+    /// **instruction at `pc`**'s own inline write set (the `pc`-local join rule —
+    /// [`super::liveness::fill_sets`]); a table that does not cover
     /// `pc` (an empty one — a synthetic allocation from a unit test) conservatively
     /// means the **whole** cache, which is the pre-liveness model.
     pub(crate) fn fill_slots(&self, pc: u32) -> Vec<(u32, Reg)> {
@@ -284,6 +302,33 @@ impl Allocation {
     /// round-trip ever refreshes.
     pub(crate) fn refresh_y_after(&self, pc: u32) -> bool {
         matches!(self.y_last, Some(last) if last > pc)
+    }
+    /// Whether the block's **prologue** must publish the current frame's Y window
+    /// ([`super::super::runtime::jit_publish_y`]) instead of only recording the position
+    /// ([`super::super::jit_set_position`]).
+    ///
+    /// A block that accesses no Y slot publishes nothing. A block that does publishes
+    /// **unless** every one of its Y accesses lies at or after an in-block helper that has
+    /// already re-published the window itself ([`Allocation::frame_republish_first`]: an
+    /// `allocate`/`allocate_heap`/`trim`, whose helper calls
+    /// `JitRuntime::refresh_y_base` on its success arm). A block's control flow is linear
+    /// — it is entered only at its own start and the only ways out of the middle are a
+    /// branch/exit into another range (each with **its own** prologue) — so reaching the
+    /// first Y access necessarily executed that helper first and the prologue's window is
+    /// overwritten before anything reads it: the publish would be dead work.
+    ///
+    /// **Conservative by construction**: an `Allocation` whose tables the analysis did not
+    /// fill (a synthetic one a unit test built directly — `y_last` set but `y_first`
+    /// absent) still publishes. The only failure direction is therefore a redundant
+    /// publish, never a Y access against a window nothing published.
+    pub(crate) fn prologue_publishes_y(&self) -> bool {
+        if self.y_last.is_none() {
+            return false;
+        }
+        match (self.y_first, self.frame_republish_first) {
+            (Some(first), Some(republish)) => first <= republish,
+            _ => true,
+        }
     }
 }
 

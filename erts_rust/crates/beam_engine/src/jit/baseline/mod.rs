@@ -203,12 +203,15 @@ use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
 mod bif_helper;
+mod bitstr;
 mod call;
 mod code;
 mod emit;
 mod family;
 mod receive;
-mod runtime;
+// `pub(crate)` because the tier's own tests build a `JitRuntime` by hand (the
+// `runtime` module's layout constants and `EntryTables` are the ABI they pin).
+pub(crate) mod runtime;
 mod test_helper;
 
 #[cfg(test)]
@@ -218,8 +221,13 @@ pub(crate) mod counters;
 mod census;
 
 #[cfg(test)]
+mod bitstr_tests;
+
+#[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod cross_tests;
 #[cfg(test)]
 #[path = "tail_exit_tests.rs"]
 mod tail_exit_tests;
@@ -232,6 +240,7 @@ mod y_operand_tests;
 // exactly what it was.
 pub(crate) use emit::compile_module;
 pub use code::CompiledModule;
+pub(crate) use code::CompiledFunction;
 pub use runtime::{
     decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, LOCAL_DECLINE,
     WAIT_BIT,
@@ -241,6 +250,23 @@ pub(crate) use runtime::{
 };
 
 use runtime::NativeBlock;
+
+/// The function a lookup last resolved, kept by the caller across block entries.
+///
+/// A lazy artifact is one sealed mapping **per function**, so resolving the owning
+/// function on every block entry would cost a `RefCell` probe plus an `Rc` clone even
+/// when the driver stays put — the common case, since a loop body's blocks, a jump
+/// between blocks of one function and a continuation sub-block all live in one function.
+/// Carrying the resolved `(func, CompiledFunction)` here turns those entries into the
+/// two-entry block-table probe alone
+/// ([`CompiledModule::native_entry_cached`]).
+///
+/// The handle is **per artifact**: two artifacts are two executable mappings with
+/// independent function tables, so a cache filled from one must never answer for
+/// another — that is why the driver keeps one for the context-`0` artifact and one per
+/// callee.
+pub(crate) type ResolvedFunction = Option<(u32, Rc<CompiledFunction>)>;
+
 // ---------------------------------------------------------------------------
 // The block ABI
 // ---------------------------------------------------------------------------
@@ -263,6 +289,28 @@ pub(crate) trait NativeCode {
     /// its first entry ([`CompiledModule::native_entry`]).
     fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64>;
 
+    /// [`NativeCode::enter`], told which function the previous entry resolved.
+    ///
+    /// A tier whose artifact resolves an address through a per-function table can keep
+    /// the last resolved function in `cached` and answer every entry **into that same
+    /// function** from it, instead of re-resolving per driver iteration; a tier without
+    /// such a table ignores it. Semantics are [`NativeCode::enter`]'s exactly — only the
+    /// resolution is amortised, never the answer.
+    ///
+    /// The **default forwards to [`NativeCode::enter`]** with the cache left untouched,
+    /// so an implementor that predates this method (the Cranelift tier) keeps its
+    /// behaviour byte-identical and pays nothing.
+    fn enter_cached(
+        &self,
+        rt: *mut JitRuntime<'_>,
+        module: &Module,
+        func: u32,
+        pc: u32,
+        cached: &mut ResolvedFunction,
+    ) -> Option<i64> {
+        let _ = cached;
+        self.enter(rt, module, func, pc)
+    }
     /// The compiled blocks this tier holds for `module` — a module the driver has
     /// switched **into** (a non-entry module context) — or `None` when it has none.
     ///
@@ -477,13 +525,13 @@ pub(crate) fn run_compiled_resume_outcome(
 
 /// The baseline tier's [`NativeCode`] lookup for `compiled`.
 ///
-/// The register-file guard is applied at entry time by [`enter_compiled`] (from the
-/// bound [`CompiledModule::native_entry`] returns), and the bound it uses depends on the
-/// artifact's layout: an **eager** artifact is guarded by the **whole-module** highest
-/// natively-touched register (its seal-time links may tail-call across functions inside
-/// the one shared mapping), while a **lazy** artifact is guarded by the bound of the
-/// single function being entered (a cross-function transfer round-trips through the
-/// driver and is re-checked there).
+/// The register-file guard is applied at entry time by [`enter_compiled_cached`] (from
+/// the bound [`CompiledModule::native_entry_cached`] returns), and the bound it uses
+/// depends on the artifact's layout: an **eager** artifact is guarded by the
+/// **whole-module** highest natively-touched register (its seal-time links may tail-call
+/// across functions inside the one shared mapping), while a **lazy** artifact is guarded
+/// by the bound of the single function being entered (a cross-function transfer
+/// round-trips through the driver and is re-checked there).
 fn block_entries(compiled: &CompiledModule) -> BlockEntries<'_> {
     BlockEntries { compiled }
 }
@@ -497,6 +545,20 @@ struct BlockEntries<'a> {
 impl NativeCode for BlockEntries<'_> {
     fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64> {
         enter_compiled(self.compiled, module, rt, func, pc)
+    }
+
+    /// The baseline tier's artifact knows which function it resolved last, so an entry
+    /// into that same function skips the per-function re-resolution (`RefCell` probe +
+    /// `Rc` clone) — see [`ResolvedFunction`].
+    fn enter_cached(
+        &self,
+        rt: *mut JitRuntime<'_>,
+        module: &Module,
+        func: u32,
+        pc: u32,
+        cached: &mut ResolvedFunction,
+    ) -> Option<i64> {
+        enter_compiled_cached(self.compiled, module, rt, func, pc, cached)
     }
 
     /// A cross-module callee is not part of the caller-owned artifact, so the tier's
@@ -534,6 +596,10 @@ impl NativeCode for BlockEntries<'_> {
 /// reports the entered **function's** own bound, which is sufficient because each
 /// function owns its mapping and a cross-function transfer returns to the driver (and
 /// is re-checked there on the target function's own entry).
+///
+/// This form resolves the function per call, so it serves the one-shot
+/// [`NativeCode::enter`] and the tests. The driver's per-block-entry path is
+/// [`enter_compiled_cached`], which carries the resolved function across calls.
 fn enter_compiled(
     compiled: &CompiledModule,
     module: &Module,
@@ -541,7 +607,26 @@ fn enter_compiled(
     func: u32,
     pc: u32,
 ) -> Option<i64> {
-    let entry = compiled.native_entry(module, func, pc);
+    let mut cache: ResolvedFunction = None;
+    enter_compiled_cached(compiled, module, rt, func, pc, &mut cache)
+}
+
+/// [`enter_compiled`] carrying the last resolved function in `cached`.
+///
+/// [`CompiledModule::native_entry_cached`] answers an entry into the function `cached`
+/// already names without a `RefCell` probe or an `Rc` clone, and re-resolves (compiling
+/// on first sight) for any other function — the same answers
+/// [`CompiledModule::native_entry`] gives, so the driver's blocks, counters and
+/// register-file guard are untouched.
+fn enter_compiled_cached(
+    compiled: &CompiledModule,
+    module: &Module,
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    cached: &mut ResolvedFunction,
+) -> Option<i64> {
+    let entry = compiled.native_entry_cached(module, func, pc, cached);
     // Structural counter: one driver block-entry lookup, hit or miss.
     #[cfg(test)]
     counters::record_block_entry(entry.is_some());
@@ -554,6 +639,27 @@ fn enter_compiled(
         if x_len <= highest as usize {
             return None;
         }
+    }
+    // Publish the function's block-entry tables so a **return** inside it can resolve its
+    // own continuation and jump there instead of leaving the block for the driver
+    // (`runtime::EntryTables`, `runtime::resume_in_block`). Published on exactly the
+    // iterations that enter native code, so it always names the function whose blocks may
+    // be executing; the driver clears it on the iterations that take an interpreter step
+    // instead.
+    //
+    // The artifact itself is published alongside, because a return can land in **another
+    // function of this artifact** (a call into a different function of the module returns
+    // into the caller's function, in another executable mapping of the same artifact); the
+    // helper resolves such a continuation through those tables
+    // (`runtime::cross_function_entry`) and re-publishes the target function's own.
+    //
+    // SAFETY: `rt` is the live driver-owned runtime block; writing two of its Rust-side
+    // fields touches no executable memory and no block is running here. `compiled` points at
+    // the artifact `code` is running from, which the caller owns (context `0`) or the
+    // driver's callee entry holds for the whole loop.
+    unsafe {
+        (*rt).tables = compiled.entry_tables(func, cached);
+        (*rt).compiled = compiled as *const CompiledModule;
     }
     // Structural counter: the lookup is entered (the register-file guard passed).
     #[cfg(test)]
@@ -637,7 +743,7 @@ fn enter_machine<'a>(
 /// per-instruction deopt, and it is also what happens for every address the tier
 /// compiled no entry point for (and, for the baseline tier, when the running
 /// machine's register file is too small for the function it would enter — see
-/// [`enter_compiled`]).
+/// [`enter_compiled_cached`]).
 ///
 /// This is the **non-blocking** form: a run that suspends in a `receive` (whether
 /// the suspension came from the driver's own interpreter step or from a block's
@@ -733,10 +839,16 @@ struct CalleeCode {
     /// The callee's compiled blocks, from the tier's own store
     /// ([`NativeCode::module_blocks`]); `None` when the tier has none, in which case the
     /// driver runs the module on its per-instruction interpreter step. The register-file
-    /// guard is applied at entry time ([`enter_compiled`]), not here.
+    /// guard is applied at entry time ([`enter_compiled_cached`]), not here.
     compiled: Option<Rc<CompiledModule>>,
+    /// The function `compiled`'s last entry resolved, so a block entry staying inside it
+    /// skips the per-function re-resolution ([`ResolvedFunction`]).
+    ///
+    /// Separate from the context-`0` cache on purpose: a callee is a **different
+    /// artifact** — its own executable mapping and its own function table — so a handle
+    /// cached here would name the wrong code in the entry module (and vice versa).
+    cached: ResolvedFunction,
 }
-
 /// The native driver's "which module is executing" state.
 ///
 /// The interpreter driver carries the same information as `module`/`labels` plus the
@@ -760,8 +872,12 @@ struct DriverContext {
     /// (or for a non-entry context the tier has no blocks for — the driver then takes
     /// its per-instruction interpreter step there).
     active: Option<usize>,
+    /// The function the context-`0` artifact's last entry resolved
+    /// ([`ResolvedFunction`]), so a block entry staying inside it skips the
+    /// per-function re-resolution. Kept apart from each [`CalleeCode::cached`] because
+    /// the entry artifact and a callee are different mappings.
+    entry_cached: ResolvedFunction,
 }
-
 /// Land the native driver in module context `context`, binding the active module, its
 /// label map and (for a non-entry context) its compiled blocks.
 ///
@@ -816,7 +932,11 @@ fn switch_into(
                 // runs it on its per-instruction interpreter step, exactly as it does an
                 // address its entry artifact did not compile.
                 let compiled = code.module_blocks(&handle.module);
-                state.callees.push(CalleeCode { context, compiled });
+                state.callees.push(CalleeCode {
+                    context,
+                    compiled,
+                    cached: None,
+                });
                 index
             }
         };
@@ -910,6 +1030,7 @@ fn drive(
         callee_module: None,
         callees: Vec::new(),
         active: None,
+        entry_cached: None,
     };
     let start_context = unsafe { (*machine_ptr).current_context() };
     if start_context != 0 {
@@ -941,6 +1062,9 @@ fn drive(
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
@@ -1002,23 +1126,43 @@ fn drive(
             unsafe { (*ctx_ptr).reduce(1) }?;
         }
         // Native entry for the ACTIVE module: the caller-owned artifact in context
-        // `0`, the callee's blocks (if the tier has any) in a non-entry context.
+        // `0`, the callee's blocks (if the tier has any) in a non-entry context. Each
+        // entry also carries the function that artifact's previous entry resolved, so a
+        // block entry staying inside one function costs the block-table probe alone
+        // ([`ResolvedFunction`]); the two caches are kept apart because the entry
+        // artifact and a callee are different executable mappings.
+        //
+        // `state.module` is read out first so the callee arm can borrow `state.callees`
+        // mutably while native code still gets a `&Module` for the active module.
+        let active_module: *const Module = state.module;
         let native = match state.active {
             // Context 0 is the caller-owned entry artifact; the active module there is
             // `state.module`, i.e. the run's entry module. `state.module` is a raw
             // pointer at a `Module` the driver holds alive for the whole loop (the
             // caller's entry module, or a callee's `Arc<Module>` in
             // `state.callee_module`), and no `&mut` aliases it while native code runs.
-            None if state.context == 0 => code.enter(&mut rt, unsafe { &*state.module }, func, pc),
+            None if state.context == 0 => code.enter_cached(
+                &mut rt,
+                unsafe { &*active_module },
+                func,
+                pc,
+                &mut state.entry_cached,
+            ),
             None => None,
             Some(index) => {
-                let resolved = &state.callees[index];
-                match &resolved.compiled {
-                    // SAFETY: `state.module` points at the live active module (see the
+                // Disjoint field borrows: the artifact comes out of the callee entry and
+                // its cache is a different field of the same entry.
+                let CalleeCode { compiled, cached, .. } = &mut state.callees[index];
+                match compiled {                    // SAFETY: `active_module` points at the live active module (see the
                     // context-0 arm above); no `&mut` aliases it while native code runs.
-                    Some(compiled) => {
-                        enter_compiled(compiled, unsafe { &*state.module }, &mut rt, func, pc)
-                    }
+                    Some(compiled) => enter_compiled_cached(
+                        &**compiled,
+                        unsafe { &*active_module },
+                        &mut rt,
+                        func,
+                        pc,
+                        cached,
+                    ),
                     None => None,
                 }
             }
@@ -1095,6 +1239,11 @@ fn drive(
             // deopt for an address the artifact compiled no block for).
             #[cfg(test)]
             counters::record_driver_interp_step();
+            // No native code is about to run, so no in-block return can be taken in this
+            // iteration's function: withdraw the published tables and artifact (a `return`
+            // reached through a *later* block republishes them on that block's own entry).
+            rt.tables = runtime::EntryTables::NONE;
+            rt.compiled = std::ptr::null();
         }
 
         // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;

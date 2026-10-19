@@ -693,3 +693,846 @@ fn the_call_store_sentinel_is_disjoint_from_every_other_block_word() {
         "the driver must never decode the store sentinel as a target"
     );
 }
+
+// ---------------------------------------------------------------------------
+// (g) the in-block non-tail `call` transfer (`runtime::enter_in_block`)
+// ---------------------------------------------------------------------------
+//
+// `jit_call_store_linked` stores the continuation, probes the host's local-call
+// seam, and — only on the *store* path — resolves the callee's native entry so the
+// block tail-jumps into it instead of handing the driver a `(func, pc)` word. The
+// transfer can only fire on the **lazy** per-function artifact (`CodeCache::
+// compiled_handle`, the layout `cache::run_baseline_cached*` stages), because that
+// is the only layout in which a *cross-function* callee is absent from the
+// compiling function's own block map (`Linker::is_compiled` false). An **eager**
+// artifact links the same call directly through `Linker::emit_exit` and therefore
+// never asks for the linking twin at all.
+//
+// The five tests below pin, respectively: the transfer is taken (and is net
+// cheaper than the round-trip it replaced); deep cross-function non-tail recursion
+// stays flat because the emitted arm tears its native frame down before the `jmp`;
+// a refused pre-emption charge parks at the *callee entry* and the resumed slice
+// replays nothing; a **served** local callee is never transferred to; and every
+// decline leaves the pre-existing driver/ interpreter-step behaviour untouched.
+
+/// Run exported `name/arity` with `args` on `tier` with the structural counters
+/// recording — the argument-taking sibling of `super::run_counting` (which is
+/// hard-coded to arity 0 and to a fresh [`MinimalContext`]).
+fn run_counting_args(
+    module: &Module,
+    name: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+    tier: Tier,
+) -> (Result<RunOutcome>, super::counters::Counters) {
+    super::counters::reset();
+    super::counters::set_enabled(true);
+    let mut machine = Machine::new();
+    let outcome = machine.run_export_outcome_with_tier(module, name, arity, args, ctx, tier);
+    super::counters::set_enabled(false);
+    (outcome, super::counters::snapshot())
+}
+
+/// `f/1` calls `g/1` **twice**, each time non-tail, and uses both results:
+///
+/// ```text
+/// f/1                        g/1
+///  0 label(1)                 0 label(3)
+///  1 label(2)                 1 bif host:inc/1 [x(0)] -> x(0)
+///  2 allocate 0 0             2 return
+///  3 call g/1 -> label(3)   <- continuation = pc 4, inside the block
+///  4 move x(0) -> x(1)
+///  5 call g/1 -> label(3)   <- continuation = pc 6, inside the block
+///  6 move x(1) -> x(0)
+///  7 deallocate_return 0
+/// ```
+///
+/// `f(10)`: `g(10) = 11` (kept in `x(1)`), `g(11) = 12`, then `x(0) <- x(1) = 11`.
+fn two_call_module() -> Module {
+    build_module(
+        "in_block_two_calls",
+        &[("host", "inc", 1)],
+        vec![
+            (
+                "f",
+                1,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(0),
+                        live: 1,
+                    },
+                    Instr::Call {
+                        arity: 1,
+                        target: Label(3),
+                    },
+                    Instr::Move {
+                        src: Operand::X(0),
+                        dst: Operand::X(1),
+                    },
+                    Instr::Call {
+                        arity: 1,
+                        target: Label(3),
+                    },
+                    Instr::Move {
+                        src: Operand::X(1),
+                        dst: Operand::X(0),
+                    },
+                    Instr::DeallocateReturn(0),
+                ],
+            ),
+            (
+                "g",
+                1,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Bif {
+                        arity: 1,
+                        bif: ImportRef(0),
+                        fail: NO_FAIL,
+                        args: vec![Operand::X(0)],
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 1, Label(2))],
+    )
+}
+
+/// A context serving `host:inc/1` (the callee's only value-producing instruction),
+/// counting how many times it ran — the callee's own `enter` counter.
+fn inc_context(calls: std::rc::Rc<std::cell::Cell<u32>>) -> MinimalContext {
+    MinimalContext::with_bif_hook(Box::new(
+        move |module: &str, function: &str, arity: u32, args: &[Eterm]| {
+            if module == "host"
+                && function == "inc"
+                && arity == 1
+                && args.len() == 1
+                && beam_term::is_small(args[0])
+            {
+                calls.set(calls.get() + 1);
+                return Ok(make_small(beam_term::signed_value(args[0]) + 1));
+            }
+            Err(crate::error::unsupported(&format!(
+                "in-block call bif {module}:{function}/{arity}"
+            )))
+        },
+    ))
+}
+
+/// **A lazy cross-function non-tail `call` is transferred in-block.**
+///
+/// Both calls of `two_call_module` resolve `g/1`'s entry in the helper and tail-jump
+/// into it, so neither costs a driver round-trip: the only word the driver decodes is
+/// the final `HALT` of the outermost `deallocate_return`. The evidence:
+///
+/// * the value is the interpreter's **and** the hand-computed one (`11`), so the
+///   transferred calls really executed their callee (the `inc` counter says twice);
+/// * `in_block_calls` counts the transfers and `in_block_call_declines` is zero; and
+/// * `driver_round_trips` is strictly smaller than the number of executed `call`
+///   instructions — the property the transfer exists for.
+#[test]
+fn a_lazy_cross_function_call_is_transferred_in_block() {
+    let module = two_call_module();
+    let name = export_atom(&module, "f");
+    let args = [make_small(10)];
+
+    // (1) The interpreter's answer, plus the hand-computed one.
+    let interpreted_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = inc_context(std::rc::Rc::clone(&interpreted_calls));
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            1,
+            &args,
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter run completes");
+    assert_eq!(
+        interpreted,
+        RunOutcome::Returned(make_small(11)),
+        "g(10) = 11 is kept in x(1), g(11) = 12 is discarded, so x(0) is 11"
+    );
+    assert_eq!(
+        interpreted_calls.get(),
+        2,
+        "both non-tail calls ran their callee"
+    );
+
+    // (2) The baseline tier, through the LAZY per-function artifact — the only layout
+    // where a cross-function callee is absent from the compiling function's block map.
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut ctx = inc_context(std::rc::Rc::clone(&calls));
+    let (outcome, snapshot) =
+        run_counting_args(&module, name, 1, &args, &mut ctx, Tier::BaselineJit);
+    assert_eq!(
+        outcome.expect("the baseline run completes"),
+        RunOutcome::Returned(make_small(11)),
+        "the transferred calls must still return the callee's value"
+    );
+    assert_eq!(calls.get(), 2, "the callee still ran exactly twice");
+    assert!(
+        snapshot.in_block_calls > 0,
+        "the lazy cross-function `call` must transfer in-block; counters: {:?}",
+        snapshot.in_block_calls,
+    );
+    assert_eq!(
+        snapshot.in_block_call_declines, 0,
+        "no transfer of this fixture may decline; counters: {:?}",
+        snapshot.in_block_call_declines,
+    );
+    assert!(
+        snapshot.driver_round_trips < 2,
+        "two executed `call`s must cost strictly fewer than two driver round-trips; \
+         saw {} round trip(s) ({:?})",
+        snapshot.driver_round_trips,
+        snapshot.round_trips_by_word,
+    );
+}
+
+/// `a/1` and `b/1` mutually recursive, each with a **non-tail** `call` into the other:
+///
+/// ```text
+/// a(N) -> case N of 0 -> 0; _ -> 1 + b(N - 1) end
+/// b(N) -> case N of 0 -> 0; _ -> 1 + a(N - 1) end
+/// ```
+///
+/// `1 + b(N-1)` is a frame-preserving call, so every level needs a continuation: the
+/// callee returns into the caller's continuation **sub-block**, which then adds `1`
+/// and returns in turn. Both levels' transfers are tail-jumps.
+fn mutual_non_tail_module() -> Module {
+    let branch = |fail: Label| {
+        vec![
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(0),
+                live: 1,
+            },
+            // `is_ne_exact x(0), 0`: the test SUCCEEDS when `N /= 0` (fall through to the
+            // recursive arm) and FAILS when `N == 0` (branch to the base arm at `fail`).
+            Instr::Test {
+                kind: TestKind::IsNeExact,
+                fail,
+                args: vec![Operand::X(0), Operand::Integer(0)],
+            },
+            // x(0) = N - 1
+            Instr::GcBif {
+                arity: 2,
+                bif: ImportRef(0),
+                fail: NO_FAIL,
+                live: 1,
+                args: vec![Operand::X(0), Operand::Integer(1)],
+                dst: Operand::X(0),
+            },
+        ]
+    };
+    build_module(
+        "mutual_non_tail",
+        &[("erlang", "-", 2), ("erlang", "+", 2)],
+        vec![
+            (
+                "a",
+                1,
+                {
+                    let mut code = vec![Instr::Label(Label(1)), Instr::Label(Label(2))];
+                    code.extend(branch(Label(5)));
+                    code.extend(vec![
+                        Instr::Call {
+                            arity: 1,
+                            target: Label(3),
+                        },
+                        // x(0) = x(0) + 1
+                        Instr::GcBif {
+                            arity: 2,
+                            bif: ImportRef(1),
+                            fail: NO_FAIL,
+                            live: 1,
+                            args: vec![Operand::X(0), Operand::Integer(1)],
+                            dst: Operand::X(0),
+                        },
+                        Instr::DeallocateReturn(0),
+                        Instr::Label(Label(5)),
+                        Instr::Move {
+                            src: Operand::Integer(0),
+                            dst: Operand::X(0),
+                        },
+                        Instr::DeallocateReturn(0),
+                    ]);
+                    code
+                },
+            ),
+            (
+                "b",
+                1,
+                {
+                    let mut code = vec![Instr::Label(Label(3))];
+                    code.extend(branch(Label(6)));
+                    code.extend(vec![
+                        Instr::Call {
+                            arity: 1,
+                            target: Label(2),
+                        },
+                        Instr::GcBif {
+                            arity: 2,
+                            bif: ImportRef(1),
+                            fail: NO_FAIL,
+                            live: 1,
+                            args: vec![Operand::X(0), Operand::Integer(1)],
+                            dst: Operand::X(0),
+                        },
+                        Instr::DeallocateReturn(0),
+                        Instr::Label(Label(6)),
+                        Instr::Move {
+                            src: Operand::Integer(0),
+                            dst: Operand::X(0),
+                        },
+                        Instr::DeallocateReturn(0),
+                    ]);
+                    code
+                },
+            ),
+        ],
+        &[("a", 1, Label(2))],
+    )
+}
+
+/// A context serving `erlang:'-'/2` and `erlang:'+'/2` (the emitter inlines the small-int
+/// shapes, so this is only reached for a rounded-up operand; it keeps the fixture
+/// independent of that choice).
+fn arith_context() -> MinimalContext {
+    MinimalContext::with_bif_hook(Box::new(
+        |module: &str, function: &str, arity: u32, args: &[Eterm]| {
+            if module != "erlang" || arity != 2 || args.len() != 2 {
+                return Err(crate::error::unsupported(&format!(
+                    "arith bif {module}:{function}/{arity}"
+                )));
+            }
+            if !beam_term::is_small(args[0]) || !beam_term::is_small(args[1]) {
+                return Err(beam_error_bad_arith());
+            }
+            let (a, b) = (beam_term::signed_value(args[0]), beam_term::signed_value(args[1]));
+            match function {
+                "+" => Ok(make_small(a + b)),
+                "-" => Ok(make_small(a - b)),
+                _ => Err(crate::error::unsupported(&format!("arith bif {function}/2"))),
+            }
+        },
+    ))
+}
+
+/// `error:badarith`, spelled through the public constructor the engine itself uses.
+fn beam_error_bad_arith() -> beam_common::BeamError {
+    beam_common::BeamError::BadArith
+}
+
+/// **Deep cross-function non-tail recursion does not grow the native stack.**
+///
+/// Every level of `mutual_non_tail_module` is entered by an in-block transfer, and the
+/// emitted arm (`emit::link::emit_in_block_call`) restores `rsp` and the callee-saved
+/// registers it pushed — [`emit_frame_teardown`] — **before** the `jmp r11`. Without
+/// that teardown each level would leave its native frame behind on the `jmp`, so a
+/// 20 000-deep recursion would consume 20 000 native frames and overflow the thread
+/// stack. The property is observable as the value: both tiers must unwind the whole
+/// chain to `20 000`.
+#[test]
+fn deep_cross_function_non_tail_recursion_does_not_grow_the_native_stack() {
+    const DEPTH: i64 = 20_000;
+    let module = mutual_non_tail_module();
+    let name = export_atom(&module, "a");
+    let args = [make_small(DEPTH)];
+
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = arith_context();
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            1,
+            &args,
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter unwinds the whole chain");
+    assert_eq!(
+        interpreted,
+        RunOutcome::Returned(make_small(DEPTH)),
+        "a(N) = N for every N >= 0"
+    );
+
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = arith_context();
+    let native = baseline
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            1,
+            &args,
+            &mut baseline_ctx,
+            Tier::BaselineJit,
+        )
+        .expect("the baseline tier unwinds the whole chain");
+    assert_eq!(
+        native,
+        RunOutcome::Returned(make_small(DEPTH)),
+        "the native recursion must return the interpreter's value"
+    );
+}
+
+/// `f/0` ticks, calls `g/0` **non-tail**, and returns; `g/0` ticks and returns its own
+/// value. The two ticks are the per-function entry counters a replayed block prefix would
+/// double.
+fn charge_parking_module() -> Module {
+    build_module(
+        "in_block_charge",
+        &[("host", "f_tick", 0), ("host", "g_tick", 0)],
+        vec![
+            (
+                "f",
+                0,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(0),
+                        live: 0,
+                    },
+                    Instr::Bif {
+                        arity: 0,
+                        bif: ImportRef(0),
+                        fail: NO_FAIL,
+                        args: vec![],
+                        dst: Operand::X(1),
+                    },
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(3),
+                    },
+                    Instr::DeallocateReturn(0),
+                ],
+            ),
+            (
+                "g",
+                0,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Bif {
+                        arity: 0,
+                        bif: ImportRef(1),
+                        fail: NO_FAIL,
+                        args: vec![],
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 0, Label(2))],
+    )
+}
+
+/// The host's own pre-emption diagnostic — the exact error the budget wrapper refuses with.
+const PREEMPTION: &str = "host: reduction budget exhausted";
+
+/// A [`MinimalContext`] behind a **pre-empting** host: `reduce` records every charge and,
+/// while a `budget` is set, refuses the first charge past it with its **own** typed error;
+/// the two `host:*_tick/0` BIFs count each function's entries.
+struct BudgetCtx {
+    inner: MinimalContext,
+    budget: Option<u32>,
+    charges: u32,
+    f_ticks: u32,
+    g_ticks: u32,
+}
+
+impl BudgetCtx {
+    fn new(budget: Option<u32>) -> BudgetCtx {
+        BudgetCtx {
+            inner: MinimalContext::new(),
+            budget,
+            charges: 0,
+            f_ticks: 0,
+            g_ticks: 0,
+        }
+    }
+}
+
+impl ExecutionContext for BudgetCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        if module == "host" && arity == 0 && args.is_empty() {
+            if function == "f_tick" {
+                self.f_ticks += 1;
+                return Ok(make_small(1));
+            }
+            if function == "g_tick" {
+                self.g_ticks += 1;
+                return Ok(make_small(42));
+            }
+        }
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        _heap_need: u32,
+        _live: u32,
+        _x_regs: &mut [Eterm],
+        _stack: &mut [Eterm],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+
+    fn reduce(&mut self, _n: u32) -> Result<()> {
+        self.charges += 1;
+        if let Some(budget) = self.budget {
+            if self.charges > budget {
+                return Err(crate::error::unsupported(PREEMPTION));
+            }
+        }
+        Ok(())
+    }
+
+    fn wants_reduce(&self) -> bool {
+        true
+    }
+}
+
+/// **A refused pre-emption charge parks at the callee entry and the resume replays
+/// nothing.**
+///
+/// The in-block transfer performs the driver iteration it replaces — publish the target
+/// position, bump the slice counter, offer `ExecutionContext::reduce(1)` — so a refusal is
+/// a clean pre-emption at the **callee's** entry (nothing of the callee's block has run),
+/// not a replayed prefix of the caller's. The pins:
+///
+/// (a) the run's error is the host's own typed error, unchanged;
+/// (b) `Machine::current_code` names the callee's `(function, entry pc)`;
+/// (c) after lifting the budget the resumed slice returns the unrefused run's value; and
+/// (d) each function's tick ran exactly **once** across both slices — no replayed `call`,
+///     no duplicated side effect.
+#[test]
+fn a_refused_preemption_charge_parks_at_the_callee_entry_and_resumes_exactly_once() {
+    let module = charge_parking_module();
+    let name = export_atom(&module, "f");
+    let labels = crate::interpreter::build_label_map(&module);
+    let (callee, callee_pc) = labels.resolve(Label(3)).expect("label 3 resolves");
+    assert_eq!(
+        (callee, callee_pc),
+        (1, 0),
+        "g/0 is the module's second function and `Label(3)` its entry"
+    );
+
+    // One accepted charge is the driver's own block entry for `f`; the second is the
+    // in-block transfer's, and it is refused.
+    let mut ctx = BudgetCtx::new(Some(1));
+    let mut machine = Machine::new();
+    let outcome = machine.run_export_outcome_with_tier(
+        &module,
+        name,
+        0,
+        &[],
+        &mut ctx,
+        Tier::BaselineJit,
+    );
+
+    // (a) The host's error, unchanged.
+    let err = outcome.expect_err("the transfer's charge ends the slice");
+    assert_eq!(
+        error_reason(&err),
+        error_reason(&crate::error::unsupported(PREEMPTION)),
+        "the driver must report the host's own typed error verbatim"
+    );
+    assert_eq!(
+        ctx.charges, 2,
+        "the driver's block-entry charge was accepted and the in-block transfer's refused"
+    );
+
+    // (b) The parked position is the CALLEE's entry.
+    assert_eq!(
+        machine.current_code(),
+        Some((callee, callee_pc)),
+        "a refused in-block charge parks on the callee's entry, not the caller's block"
+    );
+
+    // (c) Lift the budget and resume exactly there.
+    ctx.budget = None;
+    let resumed = machine
+        .resume_outcome_with_tier(&module, callee, callee_pc, &mut ctx, Tier::BaselineJit)
+        .expect("the resumed slice completes");
+    assert_eq!(
+        resumed,
+        RunOutcome::Returned(make_small(42)),
+        "the resumed slice must return the callee's value"
+    );
+
+    // (d) Each function's entry ran exactly once across the two slices.
+    assert_eq!(
+        (ctx.f_ticks, ctx.g_ticks),
+        (1, 1),
+        "no replayed `call` and no duplicated side effect: each tick ran once"
+    );
+
+    // The unrefused control agrees on both the value and the entry counts.
+    let mut control = BudgetCtx::new(None);
+    let mut control_machine = Machine::new();
+    let unrefused = control_machine
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut control,
+            Tier::BaselineJit,
+        )
+        .expect("the unrefused run completes");
+    assert_eq!(
+        unrefused,
+        RunOutcome::Returned(make_small(42)),
+        "the pre-empted slice must reach the same value as the unrefused run"
+    );
+    assert_eq!(
+        (control.f_ticks, control.g_ticks),
+        (1, 1),
+        "the unrefused run ticks each function exactly once, matching the resumed slice"
+    );
+}
+
+/// `f/0` calls `g/0` non-tail; `g`'s own body must never run (it would return `99`).
+fn served_local_call_module() -> Module {
+    build_module(
+        "served_local_call",
+        &[],
+        vec![
+            (
+                "f",
+                0,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(0),
+                        live: 0,
+                    },
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(3),
+                    },
+                    Instr::DeallocateReturn(0),
+                ],
+            ),
+            (
+                "g",
+                0,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Move {
+                        src: Operand::Integer(99),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 0, Label(2))],
+    )
+}
+
+/// A context whose `resolve_local_call` **serves** `g/0` as a BIF returning `42`, so the
+/// callee's code must never run and the call must never be transferred to.
+fn served_call_context() -> MinimalContext {
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(
+        |module: &str, function: &str, arity: u32, _args: &[Eterm]| {
+            if module == "served_local_call" && function == "g" && arity == 0 {
+                return Ok(make_small(42));
+            }
+            Err(crate::error::unsupported(&format!(
+                "served bif {module}:{function}/{arity}"
+            )))
+        },
+    ));
+    ctx.set_local_call_resolver(Box::new(
+        |module: &str, function: &str, arity: u32| {
+            Ok(module == "served_local_call" && function == "g" && arity == 0)
+        },
+    ));
+    ctx
+}
+
+/// **A served local callee is never transferred to.**
+///
+/// The helper runs the continuation store **and** the host's local-call seam before it
+/// resolves any entry, and a served callee returns a folded step instead of `CALL_STORED`
+/// — so the block leaves for the driver and `g`'s own code never runs (its `x(0) = 99` is
+/// never written; the value is the BIF's `42`). `in_block_calls` must therefore stay zero,
+/// and the interpreter run of the same served fixture must agree.
+#[test]
+fn a_served_local_call_is_never_transferred() {
+    let module = served_local_call_module();
+    let name = export_atom(&module, "f");
+
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = served_call_context();
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the served interpreter run completes");
+    assert_eq!(
+        interpreted,
+        RunOutcome::Returned(make_small(42)),
+        "a served local callee delivers the BIF's value, not the callee's body"
+    );
+
+    let mut ctx = served_call_context();
+    let (outcome, snapshot) = run_counting_args(&module, name, 0, &[], &mut ctx, Tier::BaselineJit);
+    assert_eq!(
+        outcome.expect("the served baseline run completes"),
+        RunOutcome::Returned(make_small(42)),
+        "the native tier must deliver the same served value"
+    );
+    assert_eq!(
+        snapshot.in_block_calls, 0,
+        "a served callee must never be transferred to (the continuation was not stored)"
+    );
+    assert_eq!(
+        snapshot.in_block_call_declines, 0,
+        "a served callee is neither a transfer nor a decline — the seam answered first"
+    );
+}
+
+/// The `local_call_case` caller, but with a callee the artifact lowers **no block** for.
+///
+/// `Instr::Generic` does **not** make a function uncompilable: the emitter's `_` arm sends
+/// it to `emit_deopt`, so the function compiles and its blocks are entered normally (the
+/// `Generic` instruction then deopts per-instruction at run time). The reachable form of
+/// the "address no block covers" decline is therefore a callee whose IR carries no
+/// **block**: `compile_function` still produces an artifact, but its entry tables hold
+/// nothing, so `native_entry` answers `None` for the address the label map names and the
+/// transfer declines exactly as a callee the tier cannot enter would.
+fn declined_callee_module() -> Module {
+    let mut module = build_module(
+        "declined_callee",
+        &[],
+        vec![
+            (
+                "f",
+                0,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Allocate {
+                        stack_need: beam_loader::HeapNeed::Words(0),
+                        live: 0,
+                    },
+                    Instr::Call {
+                        arity: 0,
+                        target: Label(3),
+                    },
+                    Instr::DeallocateReturn(0),
+                ],
+            ),
+            (
+                "g",
+                0,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Move {
+                        src: Operand::Integer(7),
+                        dst: Operand::X(0),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 0, Label(2))],
+    );
+    // The IR block decomposition is what `compile_function` iterates: with none, the
+    // callee lowers to an artifact that has no entry for any address.
+    module.functions[1].blocks.clear();
+    module
+}
+
+/// **A callee the artifact cannot enter declines to the driver.**
+///
+/// The decline is the pre-existing behaviour and must be untouched: the helper reports the
+/// resolved `(func, pc)` word, the block's emitted arm takes its `declined` path, and the
+/// driver serves the address with exactly one interpreter step — so the value is
+/// unchanged and the counters attribute the `call` to `in_block_call_declines`, never to
+/// `in_block_calls`.
+#[test]
+fn an_uncompilable_callee_declines_to_the_driver() {
+    let module = declined_callee_module();
+    let name = export_atom(&module, "f");
+    let labels = crate::interpreter::build_label_map(&module);
+    let (callee, callee_pc) = labels.resolve(Label(3)).expect("label 3 resolves");
+
+    // The premise, in two halves: the callee does produce an artifact, and that artifact
+    // has no native entry for the address the label map names.
+    assert!(
+        compile_function(&module, &labels, callee).is_ok(),
+        "the callee still lowers to an artifact (it is not a compile failure)"
+    );
+    let compiled = CompiledModule::lazy(&module);
+    assert!(
+        compiled.native_entry(&module, callee, callee_pc).is_none(),
+        "the premise: no native block covers the callee entry, so the transfer must decline"
+    );
+
+    // The interpreter's answer, for the unchanged-result assertion.
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = MinimalContext::new();
+    let interpreted = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter run completes");
+    assert_eq!(interpreted, RunOutcome::Returned(make_small(7)));
+
+    let mut ctx = MinimalContext::new();
+    let (outcome, snapshot) = run_counting_args(&module, name, 0, &[], &mut ctx, Tier::BaselineJit);
+    assert_eq!(
+        outcome.expect("the baseline run completes"),
+        RunOutcome::Returned(make_small(7)),
+        "a declined transfer must leave the result exactly as before the transfer existed"
+    );
+    assert!(
+        snapshot.in_block_call_declines > 0,
+        "the declined transfer must be counted: {:?}",
+        snapshot.in_block_call_declines,
+    );
+    assert_eq!(
+        snapshot.in_block_calls, 0,
+        "a declined transfer is never an in-block call: {:?}",
+        snapshot.in_block_calls,
+    );
+    assert!(
+        snapshot.driver_interp_steps > 0,
+        "the driver's own interpreter step serves the declined callee: {:?}",
+        snapshot.driver_interp_steps,
+    );
+}

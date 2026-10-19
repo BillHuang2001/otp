@@ -201,6 +201,40 @@ that owns a shared table.
 — the blocking-aware entries report `RunOutcome::Wait`; the non-blocking `run_export`/`run_label` fold it
 (Handoff #1, owner `beam_rt`).
 
+## The local-call seam's callee identity (the memo `Machine::local_callees`)
+The local-call arm (`dispatch.rs:413-515`, seams at `:421`/`:467`/`:496`) does **not** call
+`atom_name`/`atom_table.name` once per call: `atom_table.name` is a plain `Vec<Arc<str>>` index + deref
+(`beam_term/src/atom.rs:308-310`), but the three values it yields are **immutable for a loaded module**, so the
+derivation is memoized in `Machine::local_callees` (`../machine/local_callee.rs`, `LocalCallees`).
+`Machine::local_call_seam` (`dispatch.rs:1120-1174`) reads it in two phases.
+**Phase 1, every local call:** `self.local_callees.resolve(module, callee)` — a fixed `CAP = 8` array held
+as a compact 16-byte `keys` array (the only thing the scan reads) plus a parallel `targets` array of the owned
+identities. **A hit reorders nothing** (the entry keeps its slot) and only a **miss** inserts — at the front,
+dropping the oldest *insertion* — because the workloads this seam is priced on alternate two callees per element
+(an MRU move-to-front memmoved up to eight entries on *every* call; with the current policy the seam holds
+**1.85 %** of the interpreter's and **4.05 %** of the baseline tier's retired instructions, below the
+un-memoized derivation's 3.22 % / 7.93 %).
+The answer is the slot's `Option<CalleeTarget>` (`module`/`function` `Box<str>` + declared `arity`), whose inner
+`None` is the **memoized** "un-nameable callee" (no re-derivation, no consultation). Then the host's
+`resolve_local_call` is asked.
+**Phase 2, served only:** the rare path re-derives the names from the `module` **parameter** through
+`local_callee_identity` (`dispatch.rs:1270-1274`), so the `&str`s borrow the module and not `self` and the BIF
+dispatch keeps `&mut self` free; nothing is allocated on either path.
+The memo's key is `(module as *const Module as usize, func)` — the address plus the function index — which is why
+`Machine::reset` (`../machine/registers.rs`) clears it (the entries belong to the run that filled them, and every
+module a run entered is kept alive by the context registry, so no address can be recycled while the memo holds it);
+a resume does not reset.
+The in-crate empirical anchor for the derivation's price is the sibling `LabelMap` cache: ~**5 ns** per BIF call
+for resolving one import's two names against ~**0.5 ns** for the cached hit (`mod.rs:93-111`, `ImportTarget`,
+which stores the two names `Box<str>` **owned** because the map is reached through a bare pointer inside
+`JitRuntime` and cannot carry the module's lifetime) — the template `LocalCallees` follows.
+**`Machine::local_call_seam` is the ONE definition of the seam both tiers drive** — the interpreter's three
+local-call arms, `jit/baseline/call.rs::store_continuation` and `jit/baseline/runtime.rs::probe_local_call` — so the
+memo inside it benefits the baseline tier with **zero** `../jit/baseline/**` edits.
+The host's **verdict** is never memoized: exactly one `resolve_local_call` consultation and one reduction spend per
+local call (`beam_rt/src/runner/budget.rs:482-485`), because `erlang:load_nif/2` can install a stub mid-run; an
+un-nameable callee is consulted zero times. Pinned by `../machine/tests.rs`'s seam tests (2 calls → 2
+consultations, 1 derivation) and `../machine/local_callee.rs`'s unit tests (hits, eviction, `clear`, `fill_count`).
 ## Routing Table
 - `dispatch.rs` → the dispatcher + run entries; `Machine::step_instruction_with_entry` is the JIT helper's deopt
   target, and `Machine::call_ext_dispatch` + `ImportFrame` are the shared `call_ext*` body a tier drives.

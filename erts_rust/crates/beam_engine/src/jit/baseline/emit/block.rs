@@ -55,18 +55,19 @@ use super::aggregate::{
 use super::arith::try_inline_gc_bif;
 use super::bif::try_inline_bif;
 use super::compare::try_inline_comparison;
-use super::family;
+use super::family::{self, emit_bitstr};
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use super::heap::{emit_allocate, emit_allocate_heap, emit_test_heap, emit_trim};
-use super::link::{emit_frame_teardown, Linker};
+use super::link::{emit_frame_teardown, emit_in_block_call, ExitSpill, Linker};
 use super::operands;
 use super::prologue::emit_block_prologue;
 use super::r#move::{try_inline_move, try_inline_swap};
 use super::select::try_inline_select_val;
-use super::super::call::{jit_call_store, CALL_STORED};
+use super::super::call::{jit_call_store, jit_call_store_linked, CALL_STORED};
 use super::super::receive::jit_receive;
 use super::super::runtime::{
-    ExtCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, LOCAL_DECLINE,
+    encode_local_call, ExtCallHelper, LocalCallHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
+    EXT_CALL_ONLY, LOCAL_CALL_LAST, LOCAL_CALL_ONLY, LOCAL_DECLINE,
 };
 use super::super::{jit_ext_call, jit_local_call};
 use super::test::try_inline_test;
@@ -554,7 +555,16 @@ pub(crate) fn emit_block(
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
                     // returns the `(func, pc)` word to the driver exactly as before.
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    // No helper ran in front of this exit, so the exit owns its spill.
+                    linker.emit_exit(
+                        buffer,
+                        allocation,
+                        done,
+                        target_func,
+                        target_pc,
+                        pc,
+                        ExitSpill::Required,
+                    )?;
                     terminated = true;
                     break;
                 }
@@ -589,10 +599,20 @@ pub(crate) fn emit_block(
             // as a BIF means the callee never runs at all. A **decline** falls through to
             // the unchanged exit.
             Instr::CallLast {
-                target, deallocate, ..
+                target, arity, deallocate,
             } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
-                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
+                    emit_local_call_probe(
+                        buffer,
+                        allocation,
+                        done,
+                        func,
+                        pc,
+                        target_func,
+                        *arity,
+                        LOCAL_CALL_LAST,
+                        *deallocate,
+                    )?;
                     if linker.is_compiled(target_func, target_pc) {
                         linker.emit_tail_exit(
                             buffer,
@@ -601,7 +621,9 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        pc)?;
+                            pc,
+                            ExitSpill::Done,
+                        )?;
                     } else {
                         linker.emit_tail_exit_to_driver(
                             buffer,
@@ -610,7 +632,9 @@ pub(crate) fn emit_block(
                             target_func,
                             target_pc,
                             *deallocate,
-                        pc)?;
+                            pc,
+                            ExitSpill::Done,
+                        )?;
                     }
                     terminated = true;
                     break;
@@ -627,10 +651,28 @@ pub(crate) fn emit_block(
             // NIF-stub tail call takes), and a decline falls through to the unchanged
             // exit — which for a successor this compilation did not emit is
             // `emit_exit`'s return word, exactly as before.
-            Instr::CallOnly { target, .. } => match labels.resolve(*target) {
+            Instr::CallOnly { target, arity } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
-                    emit_local_call_probe(buffer, allocation, done, func, pc)?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    emit_local_call_probe(
+                        buffer,
+                        allocation,
+                        done,
+                        func,
+                        pc,
+                        target_func,
+                        *arity,
+                        LOCAL_CALL_ONLY,
+                        0,
+                    )?;
+                    linker.emit_exit(
+                        buffer,
+                        allocation,
+                        done,
+                        target_func,
+                        target_pc,
+                        pc,
+                        ExitSpill::Done,
+                    )?;
                     terminated = true;
                     break;
                 }
@@ -641,8 +683,7 @@ pub(crate) fn emit_block(
             // writes `Continuation::Address { func, pc: pc + 1, context }` into the
             // **live** frame, Rust-side `Machine` state (`Machine::frames`/`stack`) a
             // compiled block cannot address, so the store goes through the
-            // `jit_call_store` helper (`super::call`) while the transfer to the callee
-            // reuses the linker's exit exactly as `call_only` does.
+            // `jit_call_store*` helpers (`super::super::call`).
             //
             // The one helper call covers the store *and* the host's **local-call seam**
             // (`ExecutionContext::resolve_local_call`) — the interpreter's arm asks the
@@ -654,6 +695,21 @@ pub(crate) fn emit_block(
             // — the same probe-then-exit shape the two tail forms use through
             // [`emit_local_call_probe`].
             //
+            // The **transfer** then has two shapes, chosen here at compile time:
+            //
+            // * the callee's block is part of **this** compilation (`linker.is_compiled` —
+            //   the eager whole-module artifact, or a call inside this very function), so
+            //   the block reuses the linker's linked exit exactly as `call_only` does;
+            // * it is **another function** of the same module that the **lazy**
+            //   per-function artifact has not compiled — the shape every cross-function
+            //   non-tail call takes on the runtime path (`CodeCache::compiled_handle`) — so
+            //   the arm asks for `jit_call_store_linked`, which stores the continuation
+            //   **and** resolves the callee's native entry (lazily compiling that function
+            //   on first entry, checking its register-file bound and performing the driver
+            //   iteration the transfer replaces), and then tail-jumps into it
+            //   ([`emit_in_block_call`]). Without this the call cost a full driver
+            //   round-trip per invocation — the last one left on the call path.
+            //
             // The continuation check below is the **frame-only** body of `emit/heap.rs`'s
             // private `emit_frame_change_continue`, re-implemented here because the word
             // it compares against differs: a served non-tail local call folds its
@@ -663,18 +719,53 @@ pub(crate) fn emit_block(
             // has no x-register operand — and, like the two tail forms, it must not
             // refill either: the exit below spills first, which is the tier's whole
             // liveness/root-set model.
-            Instr::Call { target, .. } => match labels.resolve(*target) {
+            Instr::Call { target, arity } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
+                    // The helper is handed the **whole compile-time resolution** of the
+                    // instruction — the call site, the resolved callee (and its `pc`,
+                    // which the transfer enters) and the `arity` operand — so it never
+                    // re-reads `module.functions` nor re-resolves a label per call (see
+                    // `super::super::call`). `arity` is matched out of the pattern here
+                    // rather than ignored: it is the seam's register-argument count.
+                    //
+                    // The **linked** callee needs no resolution, so it keeps the plain
+                    // helper (byte-identical to before); an uncompiled one asks for the
+                    // linking twin.
+                    let linked = linker.is_compiled(target_func, target_pc);
+                    let helper: *const () = if linked {
+                        jit_call_store as *const ()
+                    } else {
+                        jit_call_store_linked as *const ()
+                    };
                     emit_helper_call(
                         buffer,
                         allocation,
-                        jit_call_store as *const (),
-                        &[i64::from(func), i64::from(pc)],
-                    pc)?;
+                        helper,
+                        &[
+                            i64::from(func),
+                            i64::from(pc),
+                            i64::from(target_func),
+                            i64::from(target_pc),
+                            i64::from(*arity),
+                        ],
+                        pc,
+                    )?;
                     buffer.mov_ri(Reg::R11, CALL_STORED)?;
                     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
                     buffer.jcc(Cond::Ne, done)?;
-                    linker.emit_exit(buffer, allocation, done, target_func, target_pc, pc)?;
+                    if linked {
+                        linker.emit_exit(
+                            buffer,
+                            allocation,
+                            done,
+                            target_func,
+                            target_pc,
+                            pc,
+                            ExitSpill::Done,
+                        )?;
+                    } else {
+                        emit_in_block_call(buffer, allocation, done, target_func, target_pc)?;
+                    }
                     terminated = true;
                     break;
                 }
@@ -788,6 +879,24 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
+            // The **whole bitstring family** — every `Bs*` variant
+            // [`crate::families::dispatch`] routes to `families::bitstrings` — reaches the
+            // family's own body **directly** instead of routing through the dispatcher's
+            // variant match (see [`super::super::bitstr`]). A binary decoder executes these
+            // once per byte of its subject, so the removed hop is the family's most
+            // frequently paid cost. The emitted sequence is the generic family arm's
+            // (`emit_bitstr` and `emit_family` share one emission), so the two are
+            // interchangeable and the outcome is interpreter-identical.
+            Instr::BsStartMatch3 { .. } | Instr::BsStartMatch4 { .. }
+            | Instr::BsGetPosition { .. } | Instr::BsSetPosition { .. }
+            | Instr::BsGetTail { .. } | Instr::BsTestTail2 { .. }
+            | Instr::BsGetInteger2(_) | Instr::BsGetBinary2(_) | Instr::BsSkipBits2 { .. }
+            | Instr::BsMatch { .. } | Instr::BsMatchString { .. } | Instr::BsGetFloat2(_)
+            | Instr::BsGetUtf8 { .. } | Instr::BsGetUtf16 { .. } | Instr::BsGetUtf32 { .. }
+            | Instr::BsSkipUtf8 { .. } | Instr::BsSkipUtf16 { .. } | Instr::BsSkipUtf32 { .. }
+            | Instr::BsInitWritable | Instr::BsCreateBin { .. } => {
+                emit_bitstr(buffer, allocation, done, func, pc)?
+            }
             // The **whole family-owned surface** the interpreter's `other` arm hands to
             // [`crate::families::dispatch`] — every variant [`crate::families::dispatch`]
             // claims and the interpreter's core arms above do **not** (the tuples/list
@@ -816,12 +925,6 @@ pub(crate) fn emit_block(
             | Instr::Fmove { .. } | Instr::Fconv { .. } | Instr::Fadd { .. } | Instr::Fsub { .. }
             | Instr::Fmul { .. } | Instr::Fdiv { .. } | Instr::Fnegate { .. }
             | Instr::GetMapElements { .. } | Instr::HasMapFields { .. } | Instr::PutMapAssoc(_) | Instr::PutMapExact(_)
-            | Instr::BsStartMatch3 { .. } | Instr::BsStartMatch4 { .. } | Instr::BsGetPosition { .. }
-            | Instr::BsSetPosition { .. } | Instr::BsGetTail { .. } | Instr::BsTestTail2 { .. }
-            | Instr::BsGetInteger2(_) | Instr::BsGetBinary2(_) | Instr::BsSkipBits2 { .. } | Instr::BsMatch { .. }
-            | Instr::BsMatchString { .. } | Instr::BsGetFloat2(_) | Instr::BsGetUtf8 { .. }
-            | Instr::BsGetUtf16 { .. } | Instr::BsGetUtf32 { .. } | Instr::BsSkipUtf8 { .. }
-            | Instr::BsSkipUtf16 { .. } | Instr::BsSkipUtf32 { .. } | Instr::BsInitWritable | Instr::BsCreateBin { .. }
             | Instr::RecvMarkerReserve { .. } | Instr::RecvMarkerBind { .. }
             | Instr::RecvMarkerUse { .. } | Instr::RecvMarkerClear { .. }
             => { family::emit_family(buffer, allocation, done, func, pc)? }
@@ -832,8 +935,17 @@ pub(crate) fn emit_block(
 
     if !terminated {
         // The block ran off its end: hand the next address back to the driver — or,
-        // when the following block starts exactly there, jump straight into it.
-        linker.emit_exit(buffer, allocation, done, func, end as u32, end as u32)?;
+        // when the following block starts exactly there, jump straight into it. No
+        // helper ran in front of this exit, so the exit owns its spill.
+        linker.emit_exit(
+            buffer,
+            allocation,
+            done,
+            func,
+            end as u32,
+            end as u32,
+            ExitSpill::Required,
+        )?;
     }
 
     // --- epilogue -----------------------------------------------------------
@@ -890,6 +1002,11 @@ fn emit_deopt(
 /// code cache shares blocks between runs and hosts, so whether a same-module callee is
 /// served as a BIF can only be decided while the block runs, never at compile time.
 ///
+/// The instruction's whole **compile-time** resolution is handed over as immediates —
+/// the caller's `(func, pc)`, the emitter's `callee`/`arity`, and the [`LOCAL_CALL_ONLY`]/
+/// [`LOCAL_CALL_LAST`] kind with its frame size — exactly as `jit_ext_call` receives its
+/// `ImportRef`/kind/size, so the helper re-derives nothing from `module.functions`.
+///
 /// The helper's word is left in `rax` (the block ABI's return register); the decline
 /// comparison is against a constant loaded into `r11` — never a `movabs` into `rax`,
 /// which must keep the word — and on a non-decline word the emitted code jumps to the
@@ -897,19 +1014,30 @@ fn emit_deopt(
 /// is the only path that runs on into the caller's static exit; it is safe there
 /// because a decline mutates nothing (see [`jit_local_call`]), so the cached
 /// x-registers that exit spills are still the values `machine.x` must receive.
+#[allow(clippy::too_many_arguments)]
 fn emit_local_call_probe(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
     done: CodeLabel,
     func: u32,
     pc: u32,
+    callee: u32,
+    arity: u32,
+    kind: u32,
+    deallocate: u32,
 ) -> Result<()> {
-    let helper: StepHelper = jit_local_call;
+    let helper: LocalCallHelper = jit_local_call;
     emit_helper_call(
         buffer,
         allocation,
         helper as *const (),
-        &[i64::from(func), i64::from(pc)],
+        &[
+            i64::from(func),
+            i64::from(pc),
+            encode_local_call(callee, arity),
+            i64::from(kind),
+            i64::from(deallocate),
+        ],
     pc)?;
     buffer.mov_ri(Reg::R11, LOCAL_DECLINE)?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;

@@ -37,7 +37,7 @@ use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
-use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome};
+use crate::machine::{namespace_atom, CalleeTarget, Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::terms::{reserve_slack, Sink};
@@ -1105,7 +1105,20 @@ impl Machine {
     /// The native baseline tier drives this same method from its `jit_local_call`
     /// helper ([`crate::jit::baseline`]), so the two tiers share **one** definition of
     /// the seam's behaviour and cannot drift.
+    ///
+    /// # Cost
+    ///
+    /// The callee's `(module, function, arity)` is **memoized** per
+    /// `(module address, function index)` ([`Machine::local_callees`],
+    /// [`crate::machine::LocalCallees`]): a repeat call is one fixed scan of an 8-entry
+    /// key array that **reorders nothing** (a hit leaves its slot where it is, so the
+    /// two-callee alternation `list_walk`'s inner loop performs is all hits after its
+    /// first cycle). The host's **verdict is never memoized** —
+    /// [`ExecutionContext::resolve_local_call`] is asked exactly once per (nameable)
+    /// local call, because a host spends one reduction unit per consultation and
+    /// `erlang:load_nif/2` can install a stub mid-run.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub(crate) fn local_call_seam(
         &mut self,
         entry_module: &Module,
@@ -1117,15 +1130,36 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> std::result::Result<Option<Step>, Box<BeamError>> {
-        let Some((module_name, function_name, arity)) = local_callee_identity(module, callee) else {
+        // Phase 1 — every local call: the memoized identity, then the host's **per-call**
+        // verdict. The memo borrows one field of `self`; `ctx` is a separate parameter,
+        // so the two never conflict.
+        let callee_id: &Option<CalleeTarget> = self.local_callees.resolve(module, callee);
+        let Some(target) = callee_id.as_ref() else {
+            // A memoized un-nameable callee: no function entry, or a name atom the
+            // module cannot resolve. Declining keeps the caller's in-machine jump and
+            // never asks the host about a fabricated name (nor spends a reduction).
             return Ok(None);
         };
         if !ctx
-            .resolve_local_call(module_name, function_name, arity)
+            .resolve_local_call(
+                target.module.as_ref(),
+                target.function.as_ref(),
+                target.arity,
+            )
             .map_err(Box::new)?
         {
             return Ok(None);
         }
+        // Phase 2 — rare (the host serves this callee as a BIF): re-derive the identity
+        // from the `module` **parameter** so the names borrow `module` rather than `self`,
+        // leaving `&mut self` free for the dispatch below. Nothing is allocated on either
+        // path; the memo's borrow ended with the `callee_id` reads above.
+        let Some((module_name, function_name, arity)) = local_callee_identity(module, callee) else {
+            // Unreachable: the memo named this callee, and both derivations are pure
+            // functions of the same immutable module image. Declining (the unchanged
+            // in-machine jump) is the only non-fabricating answer.
+            return Ok(None);
+        };
         let value = match self.call_bif_named(
             entry_module,
             module_name,
@@ -1140,7 +1174,6 @@ impl Machine {
         self.apply_import_target(ApplyTarget::Called(value), frame, func, pc)
             .map(Some)
     }
-
     /// Apply an arm's own frame discipline to the [`ApplyTarget`]
     /// [`Machine::call_ext_dispatch`] resolved for it (from either special-case
     /// seam, the host's cross-module seam, or the synchronous BIF route).
@@ -1231,6 +1264,11 @@ const MAX_ARG: usize = 255;
 /// site's operands: the label was already resolved, so this names the function that
 /// will really run. An un-nameable identity declines the local-call seam rather than
 /// asking the host about a fabricated name (see [`Machine::local_call_seam`]).
+///
+/// This is the seam's **cold-path** derivation: the every-call identity comes from the
+/// machine's memo ([`Machine::local_callees`]), and only a call the host actually serves
+/// re-derives the names here — borrowed from the `module` parameter, so the dispatch
+/// keeps `&mut self` free.
 fn local_callee_identity(module: &Module, func: u32) -> Option<(&str, &str, u32)> {
     let function = module.functions.get(func as usize)?;
     let name = module.atom_name(function.name)?;

@@ -154,14 +154,26 @@ use super::{
     decode_flags, is_all, push_wide_int, raw, read_size, small_value, BitWriter, Built, BSF_LITTLE,
 };
 
-use self::segments::{
-    float_source, put_float, put_utf16, put_utf32, put_utf8, segment_source, string_source,
-};
-use self::size::{fail_seg, float_nbits, seg_nbits, segment_size, SegReason, SegSize};
+use self::segments::{binary_segment, float_segment, string_segment, utf_segment};
+use self::size::{fail_seg, seg_nbits, segment_size, SegReason, SegSize};
 
 /// `erts_bs_init_writable`'s default payload capacity (`erl_bits.c:2023`):
 /// `bin_size = 1024` unless `x(0)` holds a non-negative small integer.
 const DEFAULT_WRITABLE_SIZE: usize = 1024;
+
+/// The outcome of one **out-of-line** segment body ([`segments`]).
+///
+/// The hot arms — `private_append`/`append` and `integer` — live in [`assemble`]
+/// itself because the compiler's accumulator loop is exactly that pair; every other
+/// segment kind is a separate `#[inline(never)]` body that reports back through this
+/// enum, so the general assembler stays small and cache-resident while a segment
+/// failure still reaches the caller as the completed `Step` it always was.
+pub(super) enum SegOutcome {
+    /// The bits are in the writer; continue with the next segment.
+    Written,
+    /// A segment failure: the caller returns this `Step` verbatim.
+    Fail(Step),
+}
 /// Execute a bitstring **construction** instruction.
 pub(super) fn exec(
     machine: &mut Machine,
@@ -225,8 +237,13 @@ pub(super) fn exec(
 ///
 /// `Err(step)` is a completed failure `Step` (a branch to `fail`, or a raise) — the
 /// caller returns it verbatim.
+///
+/// `pub(crate)` so a future native tier can lower a recognised `bs_create_bin` segment
+/// shape straight to this walk (the whole construction side of the family is reachable
+/// from outside this module: [`exec`] for the instruction, this for the assembly).
+/// Semantics are unchanged by the visibility.
 #[allow(clippy::type_complexity)]
-fn assemble(
+pub(crate) fn assemble(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,
@@ -308,101 +325,34 @@ fn assemble(
             }
             // `binary Unit Fs Value Size` — append a bitstring operand's bytes.
             "binary" => {
-                // The size loop's `is_not_bitstring(Src)` check
-                // (`emu/bs_instrs.tab:390`) fails **before** the size is even read.
-                let Some((bytes, src_off, src_bits)) =
-                    segment_source(machine, module, value_op, ctx)?
-                else {
-                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
-                };
-                let nbits = if is_all(module, size_op) {
-                    // `erts_bs_put_binary_all` (`erl_bits.c:1311`): a whole-tail
-                    // segment must be a multiple of the segment's unit.
-                    if unit != 1 && src_bits % unit != 0 {
-                        return fail_seg(machine, module, labels, fail, SegReason::BadArg);
-                    }
-                    src_bits
-                } else {
-                    let size = match segment_size(machine, ctx, size_op)? {
-                        SegSize::Small(n) => n,
-                        SegSize::Fail(reason) => {
-                            return fail_seg(machine, module, labels, fail, reason);
-                        }
-                    };
-                    // `$BS_SAFE_MUL` + the signed-size-fits check → `system_limit`.
-                    match seg_nbits(size, unit) {
-                        Ok(nbits) => nbits,
-                        Err(reason) => return fail_seg(machine, module, labels, fail, reason),
-                    }
-                };
-                if nbits > src_bits {
-                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
+                if let SegOutcome::Fail(step) = binary_segment(
+                    machine, module, labels, fail, unit, value_op, size_op, &mut writer, ctx,
+                )? {
+                    return Ok(Err(step));
                 }
-                writer.push_bits_from(bytes, src_off, nbits, machine)?;
             }
             // `string Unit Fs Offset Size` — append a constant byte string from the
-            // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
-            // `bs_instrs.tab:627-633`, `erl_bits.c:1641`). The compiler emits the
-            // *value* operand as the string's byte offset into `StrT`
-            // (`beam_asm.erl:771-773` writes it with `tag_u`) and the *size* operand
-            // as its byte count, always with unit 8
-            // (`beam_ssa_codegen.erl:1976`); C computes `size * 8` bits and no
-            // failure is possible here, so this segment never branches to `fail`.
-            "string" => {
-                let bytes = string_source(module, value_op, size_op, machine, ctx)?;
-                writer.push_bits_from(bytes, 0, bytes.len() * 8, machine)?;
-            }
+            // module's `StrT` table. C computes `size * 8` bits and no failure is
+            // possible here, so this segment never branches to `fail`.
+            "string" => string_segment(machine, module, value_op, size_op, &mut writer, ctx)?,
 
             // `float Unit Fs Value Size` — write a 16/32/64-bit float
-            // (`erts_bs_put_float`, `erl_bits.c:1341`). The field width is
-            // `Size * Unit`, the **same** size arm `BSC_INTEGER`/`BSC_BINARY` share
-            // in C (`emu/bs_instrs.tab:415-417`): a `size*unit` overflow — or a
-            // product whose signed value does not fit a word — is `system_limit`,
-            // and a width other than 16/32/64 (including `Size == 0`) is `badarg`;
-            // see [`float_nbits`]. `Size` is the bit *count* the compiler emits
-            // with unit 1; the bare `<<F/float>>` form is emitted as the constant
-            // 64, never `all`, so the `all` arm is only reachable from a
-            // hand-built module (the compiler rejects `<<F/all/float>>` with a
-            // syntax error) and keeps the C default of 64 bits.
+            // (`erts_bs_put_float`, `erl_bits.c:1341`).
             "float" => {
-                let nbits = if is_all(module, size_op) {
-                    64
-                } else {
-                    let size = match segment_size(machine, ctx, size_op)? {
-                        SegSize::Small(n) => n,
-                        SegSize::Fail(reason) => {
-                            return fail_seg(machine, module, labels, fail, reason);
-                        }
-                    };
-                    match float_nbits(size, unit) {
-                        Ok(nbits) => nbits,
-                        Err(reason) => {
-                            return fail_seg(machine, module, labels, fail, reason);
-                        }
-                    }
-                };
-                let value = read_value(machine, module, ctx, value_op)?;
-                let Some(f) = float_source(value) else {
-                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
-                };
-                let bytes = put_float(f, nbits, flags & BSF_LITTLE != 0);
-                writer.push_bits_from(&bytes, 0, nbits, machine)?;
+                if let SegOutcome::Fail(step) = float_segment(
+                    machine, module, labels, fail, unit, flags, value_op, size_op, &mut writer, ctx,
+                )? {
+                    return Ok(Err(step));
+                }
             }
 
             // `utf8`/`utf16`/`utf32` — the codepoint is variable-width; the
             // `Size`/`Unit` operands are not used (only the endianness flag is).
             "utf8" | "utf16" | "utf32" => {
-                let value = read_value(machine, module, ctx, value_op)?;
-                let encoded = match (kind, small_value(value)) {
-                    ("utf8", Some(v)) => put_utf8(v),
-                    ("utf16", Some(v)) => put_utf16(v, flags & BSF_LITTLE != 0),
-                    ("utf32", Some(v)) => put_utf32(v),
-                    // A non-small value (a bignum) can never be a scalar.
-                    _ => None,
-                };
-                match encoded {
-                    Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8, machine)?,
-                    None => return fail_seg(machine, module, labels, fail, SegReason::BadArg),
+                if let SegOutcome::Fail(step) = utf_segment(
+                    machine, module, labels, fail, kind, flags, value_op, &mut writer, ctx,
+                )? {
+                    return Ok(Err(step));
                 }
             }
             // `append`/`private_append` (`BSC_APPEND`/`BSC_PRIVATE_APPEND`,
@@ -474,6 +424,12 @@ fn seg_at(segments: &[Operand], index: usize) -> Result<&Operand> {
 
 /// Read a segment value operand: a `Literal` (a string constant) resolves through
 /// the module's literal area, everything else through the ordinary operand reader.
+///
+/// `#[inline(always)]` keeps the overwhelmingly common shape — a register operand, whose
+/// read is a bounds check and a load — inside the arm that wants it, so a segment
+/// build does not pay an out-of-line call per segment; the `Literal` arm (a
+/// `string` constant's `StrT` handle) is the cold one and stays outlined.
+#[inline(always)]
 fn read_value(
     machine: &Machine,
     module: &Module,
@@ -481,11 +437,17 @@ fn read_value(
     operand: &Operand,
 ) -> Result<Eterm> {
     match operand {
-        Operand::Literal(index) => module
-            .literal(*index)
-            .ok_or_else(|| error::unsupported("bs_create_bin: literal index out of range")),
+        Operand::Literal(index) => read_literal(module, *index),
         _ => read_operand(machine, ctx, operand),
     }
+}
+
+/// The `Literal` arm of [`read_value`]: the module's decoded `LitT` entry at `index`.
+#[inline(never)]
+fn read_literal(module: &Module, index: u32) -> Result<Eterm> {
+    module
+        .literal(index)
+        .ok_or_else(|| error::unsupported("bs_create_bin: literal index out of range"))
 }
 
 // ---------------------------------------------------------------------------

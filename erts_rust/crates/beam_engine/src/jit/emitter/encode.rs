@@ -197,6 +197,23 @@ impl CodeBuffer {
         self.emit_rel32(label)
     }
 
+    /// `jmp reg` (indirect, through a register).
+    ///
+    /// The encoding is `FF /4`: the same ModRM shape [`call_r`](Self::call_r) uses with
+    /// the `/4` opcode extension instead of `/2`. A block uses it for the one transfer
+    /// whose target is only known at run time — a **return** whose continuation resolves to
+    /// a block entry of the function that is already running (see
+    /// [`emit_return`](super::super::baseline::emit) and the tier's `resume_entry` slot) —
+    /// which is a tail transfer: it leaves the block's native frame first, so the target's
+    /// own prologue rebuilds one and the native stack does not grow.
+    pub fn jmp_r(&mut self, reg: Reg) -> Result<()> {
+        if ext(reg) != 0 {
+            self.emit_u8(0x41)?;
+        }
+        self.emit_u8(0xFF)?;
+        self.emit_u8(0xC0 | (0x4 << 3) | (reg.code() & 0x7))
+    }
+
     /// `call reg` (indirect, through a register).
     pub fn call_r(&mut self, reg: Reg) -> Result<()> {
         if ext(reg) != 0 {

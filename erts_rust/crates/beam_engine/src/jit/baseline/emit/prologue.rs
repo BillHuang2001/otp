@@ -77,11 +77,14 @@ pub(super) fn emit_block_prologue(
     //
     // A block that accesses a Y slot ([`Allocation::y_last`]) publishes the current
     // frame's Y window through `jit_publish_y` **instead**, which does the position
-    // store *and* refreshes the window in the one call — so publishing costs such a
-    // block nothing extra, and a Y-free block keeps emitting the plain position store
-    // (it pays literally nothing). See `jit_publish_y` for why the prologue is the
-    // sound, cheapest publish point.
-    if allocation.y_last.is_some() {
+    // store *and* refreshes the window in the one call — unless every one of its Y
+    // accesses follows an in-block `allocate`/`allocate_heap`/`trim`, whose helper
+    // re-published the window itself on its in-block continue arm
+    // ([`Allocation::prologue_publishes_y`]): then the prologue's window is overwritten
+    // before anything reads it, and the block keeps the plain position store. A Y-free
+    // block always keeps the plain position store (it pays literally nothing). See
+    // `jit_publish_y` for why the prologue is the sound, cheapest publish point.
+    if allocation.prologue_publishes_y() {
         emit_publish_y(buffer, func, start as u32)?;
     } else {
         emit_position_store(buffer, func, start as u32)?;
@@ -124,10 +127,12 @@ fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()
 /// records this block's entry `(func, pc)` as the machine's position *and* re-publishes
 /// the current frame's Y window.
 ///
-/// A block whose body accesses a Y slot ([`Allocation::y_last`]) emits this in place of
-/// [`emit_position_store`] — same three-argument call shape, so the block pays no extra
-/// call for publishing. The window must be live before the block's first Y access
-/// because the Erlang stack is a `Vec` a frame push may reallocate; see `jit_publish_y`.
+/// A block that must publish the window ([`Allocation::prologue_publishes_y`]: it
+/// accesses a Y slot, and not every one of those accesses follows a frame helper that
+/// re-published the window itself) emits this in place of [`emit_position_store`] — same
+/// three-argument call shape, so the block pays no extra call for publishing. The window
+/// must be live before the block's first Y access because the Erlang stack is a `Vec` a
+/// frame push may reallocate; see `jit_publish_y`.
 fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
     let helper: PositionHelper = jit_publish_y;
     emit_prologue_helper(buffer, func, pc, helper as *const ())

@@ -46,15 +46,154 @@
 //!   the compiler emits a same-module callee as a **local** `call_last {f,Label}` (which is why
 //!   the report shows `local_call_requests` and no `external_call_requests`), so the resolver
 //!   is the safety net for the `call_ext` shape rather than the path this workload takes.
+//!
+//! # The harness' own (tiny) BIF floor
+//!
+//! Most workloads here are **BIF-free by construction** (`cowboy_bstr:to_lower/1`,
+//! `cowboy_bstr:capitalize_token/1`, the `list_walk` program, the bitstring fixtures), so the
+//! inner host's rejecting default hook is exactly right for them. Two real foreign functions
+//! are not: `emqx_base62:encode/1` calls `erlang:iolist_to_binary/1` once per encoded group,
+//! `emqx_base62:decode/1` calls `erlang:bit_size/1` (in a guard and over its bitstring
+//! accumulator), and the base62 charset functions do small-integer arithmetic.
+//! [`CountingContext::host_bif`] therefore serves that **closed, documented set** —
+//! `iolist_to_binary/1`, `bit_size/1` plus the small-int `+ - * div rem abs` — and **every
+//! other BIF stays rejected** with the inner host's typed `unsupported_bif`.
+//!
+//! One rule makes that floor safe to trust: it **never guesses**. An operand that is not a
+//! small integer, an integer overflow, a non-`0..=255` byte, an improper list, a bitstring that
+//! is not byte-aligned, or a `bit_size` subject that is not a bitstring is a typed
+//! `BadArg`/`unsupported`, never a substituted value.
+//!
+//! `bit_size/1` is the case that rule was written for, so it is served by the **bitstring
+//! family's own** frozen-layout reader ([`crate::families::bitstrings::bit_size`], C's
+//! `erts_bin_bits_size`: heap bits, an off-heap refc window and an `ErlSubBits` match context)
+//! rather than by a local re-derivation. A half-correct `bit_size` would turn a *guard* failure
+//! into a silently wrong result — the engine folds a guard BIF's error into a failed guard — so
+//! the reader is the family's and a non-bitstring is [`refuse`]d.
+//!
+//! The allocating BIF (`iolist_to_binary/1`) is served **here**, not by the inner host's
+//! `set_bif_hook`: a [`BifHook`](crate::context::BifHook) receives `(module, function, arity,
+//! args)` and *no host handle*, so a hook cannot allocate. Serving it in the wrapper's
+//! [`call_bif`](ExecutionContext::call_bif) puts the result on the same region heap the machine
+//! is running on (`make_heap_binary` goes through this wrapper's own
+//! [`alloc_words`](ExecutionContext::alloc_words), so the floor's allocation is counted too) and
+//! survives `reset_inner` by construction, because the floor is a property of the wrapper rather
+//! than of the host it wraps.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_loader::{Label, Module};
-use beam_term::{Atom, AtomTable, Eterm};
+use beam_term::{is_small, make_small, signed_value, Atom, AtomTable, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::context::{ExecutionContext, MinimalContext, RootSet};
+use crate::families::bitstrings::bit_size;
+use crate::terms::{binary_bytes, list_elements, make_heap_binary};
+
+/// The deepest iolist nesting `erlang:iolist_to_binary/1`'s floor implementation will flatten.
+///
+/// A guard rail against a cyclic/absurd term turning a benchmark into a stack overflow; real
+/// iolists are a handful of levels deep.
+const MAX_IOLIST_DEPTH: usize = 64;
+
+/// One histogram key: the `(module, function, arity)` triple of a BIF dispatch.
+///
+/// The `Box<str>`s are minted **once per distinct key**, never per dispatch (see
+/// [`BifHistogram::record`]), which is the whole point of the type.
+#[derive(Debug)]
+struct BifName {
+    /// The BIF's owning module.
+    module: Box<str>,
+    /// The BIF's name.
+    function: Box<str>,
+    /// The call's arity.
+    arity: u32,
+}
+
+impl BifName {
+    /// `true` when this key names `module:function/arity`.
+    ///
+    /// Two `&str` comparisons (the arity first, because it is the cheapest field and a mismatch
+    /// there is the most common one), no allocation and no hashing — so the hot dispatch path
+    /// pays a `memcmp`, not a `format!`.
+    fn names(&self, module: &str, function: &str, arity: u32) -> bool {
+        self.arity == arity && self.module.as_ref() == module && self.function.as_ref() == function
+    }
+}
+
+/// The `call_bif` histogram: `module:function/arity` → dispatch count.
+///
+/// # Why this is not a `BTreeMap<String, u64>` keyed by `format!(…)`
+///
+/// It used to be exactly that, and the `format!` ran **once per dispatch**. A `perf` profile of
+/// the interpreter tier priced it at **~17 %** of `list_walk`'s per-element samples and **~7 %**
+/// of `emqx_base62:encode`'s (`alloc::fmt::format::format_inner` +
+/// `<String as fmt::Write>::write_str` + `core::fmt::write` + the `String`'s growth), i.e. the
+/// harness' own bookkeeping was inflating precisely the figure the harness exists to report.
+///
+/// The key set is tiny (a workload dispatches a handful of distinct BIFs; the harness' own floor
+/// serves seven names at most), so pairwise lookup is both the cheapest and the simplest
+/// structure — and the memo of the last key makes the common case (a run of calls to the same
+/// BIF) a single key comparison.
+///
+/// The display strings are built in [`BifHistogram::to_map`], once, at report time only.
+#[derive(Debug, Default)]
+pub(crate) struct BifHistogram {
+    /// The distinct keys, in first-seen order; parallel to `counts`.
+    keys: Vec<BifName>,
+    /// Dispatches per key.
+    counts: Vec<u64>,
+    /// The index of the most recently used key, so a repeated dispatch skips the search.
+    last: Option<usize>,
+}
+
+impl BifHistogram {
+    /// Count one `module:function/arity` dispatch. Allocates **only** when the key is new.
+    fn record(&mut self, module: &str, function: &str, arity: u32) {
+        if let Some(id) = self.last {
+            if self.keys[id].names(module, function, arity) {
+                self.counts[id] += 1;
+                return;
+            }
+        }
+        for (id, key) in self.keys.iter().enumerate() {
+            if key.names(module, function, arity) {
+                self.counts[id] += 1;
+                self.last = Some(id);
+                return;
+            }
+        }
+        self.keys.push(BifName {
+            module: module.into(),
+            function: function.into(),
+            arity,
+        });
+        self.counts.push(1);
+        self.last = Some(self.keys.len() - 1);
+    }
+
+    /// `true` when no BIF was dispatched at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The report form: `"module:function/arity"` → count, keyed exactly as the printed
+    /// `bif_histogram[…]` rows were before (byte-identical output; the `format!` now happens
+    /// here, once per distinct key, instead of once per dispatch).
+    pub(crate) fn to_map(&self) -> BTreeMap<String, u64> {
+        self.keys
+            .iter()
+            .zip(&self.counts)
+            .map(|(key, count)| {
+                (
+                    format!("{}:{}/{}", key.module, key.function, key.arity),
+                    *count,
+                )
+            })
+            .collect()
+    }
+}
 
 /// The counters one measured phase accumulates.
 ///
@@ -76,8 +215,10 @@ pub(crate) struct Counters {
     pub(crate) heap_words: u64,
     /// `call_bif` calls (an in-crate BIF dispatch).
     pub(crate) bif_calls: u64,
-    /// `call_bif` calls keyed `"module:function/arity"`.
-    pub(crate) bif_histogram: BTreeMap<String, u64>,
+    /// `call_bif` calls keyed `"module:function/arity"` (see [`BifHistogram`]: the dispatch
+    /// path allocates nothing, the display strings are built by
+    /// [`BifHistogram::to_map`] at report time).
+    pub(crate) bif_histogram: BifHistogram,
     /// `apply` calls (the general `apply`/`call_ext` hook).
     pub(crate) apply_calls: u64,
     /// `apply_fun` calls (the value-returning closure-application fallback).
@@ -91,6 +232,13 @@ pub(crate) struct Counters {
     pub(crate) local_call_requests: u64,
     /// `alloc_words` calls: the **unrooted** allocation path (no admission point).
     pub(crate) unrooted_calls: u64,
+    /// BIF dispatches the harness' own floor **recognised by name but declined** on the
+    /// operands it was given (see the module docs' "never guesses" rule).
+    ///
+    /// A decline is a bench-harness limitation, never an engine result: the workload's own
+    /// correctness predicate is what catches a decline that changed an answer, and the report
+    /// asserts this counter is zero so a reader never has to wonder.
+    pub(crate) floor_declines: u64,
 }
 
 /// A [`MinimalContext`] that counts what the engine asks it for.
@@ -135,6 +283,173 @@ impl CountingContext {
     pub(crate) fn inner_mut(&mut self) -> &mut MinimalContext {
         &mut self.inner
     }
+
+    /// The harness' **closed** BIF floor: `Some(result)` when the name is one the floor
+    /// models, `None` when the call belongs to the inner host (which rejects it).
+    ///
+    /// The served set is deliberately tiny and named in the module docs:
+    /// `erlang:iolist_to_binary/1`, `erlang:bit_size/1` plus the small-int `erlang:'+'/2`,
+    /// `'-'/2`, `'*'/2`, `div/2`, `rem/2` and `abs/1`. Every other `(module, function, arity)`
+    /// is `None`, so the call keeps the inner host's typed `unsupported_bif` — a workload that
+    /// needed it reports a loud skip rather than a figure.
+    ///
+    /// The floor **allocates through this context** ([`make_heap_binary`] →
+    /// [`ExecutionContext::alloc_words`]), so its traffic is counted like the engine's own and
+    /// it keeps working across [`Self::reset_inner`].
+    fn host_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Option<Result<Eterm>> {
+        if module != "erlang" || args.len() != arity as usize {
+            return None;
+        }
+        match (function, arity) {
+            ("iolist_to_binary", 1) => {
+                let mut bytes = Vec::new();
+                Some(match flatten_iolist(args[0], &mut bytes, 0) {
+                    Ok(()) => make_heap_binary(self, &bytes),
+                    Err(error) => Err(error),
+                })
+            }
+            ("+", 2) | ("-", 2) | ("*", 2) | ("div", 2) | ("rem", 2) => {
+                Some(small_int_arith(function, args[0], args[1]))
+            }
+            ("abs", 1) => Some(small_int_abs(args[0])),
+            ("bit_size", 1) => Some(bit_size_of(args[0])),
+            _ => None,
+        }
+    }
+}
+
+/// The bench harness' refusal: a typed error that names the floor, so a printed skip says
+/// "the harness declined this" rather than "the engine failed".
+fn refuse(what: &str) -> BeamError {
+    crate::error::unsupported(&format!("bench BIF floor: {what}"))
+}
+
+/// Flatten `term` — a byte, a binary or a proper (possibly nested) list of those — into
+/// `out`, reproducing `erlang:iolist_to_binary/1`.
+///
+/// Anything it cannot flatten **exactly** is [`refuse`]d: a non-byte small integer, a
+/// non-byte-aligned bitstring, an improper tail, an atom/float/tuple element, or nesting
+/// deeper than [`MAX_IOLIST_DEPTH`]. Nothing is ever coerced.
+fn flatten_iolist(term: Eterm, out: &mut Vec<u8>, depth: usize) -> Result<()> {
+    if depth > MAX_IOLIST_DEPTH {
+        return Err(refuse("iolist nesting is deeper than MAX_IOLIST_DEPTH"));
+    }
+    if is_small(term) {
+        // `is_byte` is the frozen `0..=255` small-int test, so a negative or wide integer is
+        // declined instead of being truncated to a byte.
+        if !beam_term::is_byte(term) {
+            return Err(refuse("iolist element is a small integer outside 0..=255"));
+        }
+        out.push(signed_value(term) as u8);
+        return Ok(());
+    }
+    if beam_term::is_nil(term) {
+        return Ok(());
+    }
+    // A byte-aligned binary — on-heap or off-heap refc. A non-byte-aligned bitstring is not a
+    // legal iolist element and `binary_bytes` rejects it, so it falls through to the refusal.
+    if let Ok(bytes) = binary_bytes(term) {
+        out.extend_from_slice(bytes);
+        return Ok(());
+    }
+    if beam_term::is_list(term) {
+        for element in list_elements(term)? {
+            flatten_iolist(element, out, depth + 1)?;
+        }
+        return Ok(());
+    }
+    Err(refuse(
+        "iolist element is neither a byte, a binary nor a proper list",
+    ))
+}
+
+/// One operand of the floor's arithmetic: a **small** integer, never a bignum, float or atom.
+fn small_operand(function: &str, term: Eterm) -> Result<i64> {
+    if !is_small(term) {
+        return Err(refuse(&format!(
+            "erlang:{function} was given a non-small-integer operand"
+        )));
+    }
+    Ok(signed_value(term))
+}
+
+/// A checked small-int result: outside [`MIN_SMALL`]`..=`[`MAX_SMALL`] is [`refuse`]d (the
+/// real BIF would promote to a bignum, which this floor does not model — declining is the
+/// honest answer, and [`Counters::floor_declines`] makes it visible).
+fn small_result(function: &str, value: i64) -> Result<Eterm> {
+    if value < MIN_SMALL || value > MAX_SMALL {
+        return Err(refuse(&format!(
+            "erlang:{function} left the small-integer range ({value})"
+        )));
+    }
+    Ok(make_small(value))
+}
+
+/// `erlang:bit_size/1` over a bitstring **or** a live match context.
+///
+/// The size comes from the bitstring family's own frozen-layout reader
+/// ([`crate::families::bitstrings::bit_size`]) — heap bits and an off-heap refc window take
+/// their size, an `ErlSubBits` match context its remaining window, which is what C's
+/// `erts_bin_bits_size` (`erl_bits.h`) does for every `SUB_BITS` thing. A subject that is
+/// neither is [`refuse`]d (the real BIF raises `badarg`), and a size outside the small-integer
+/// range is [`refuse`]d rather than truncated, so nothing is ever coerced into a value.
+///
+/// This is what makes `emqx_base62:decode/1` measurable: it asks `bit_size/1` about a binary in
+/// a **guard** and about its bitstring accumulator, and a wrong size would silently change the
+/// decode rather than fail it.
+fn bit_size_of(subject: Eterm) -> Result<Eterm> {
+    let Some(bits) = bit_size(subject) else {
+        return Err(refuse(
+            "erlang:bit_size/1 was given something that is neither a bitstring nor a match \
+             context",
+        ));
+    };
+    let Ok(bits) = i64::try_from(bits) else {
+        return Err(refuse("erlang:bit_size/1 does not fit a small integer"));
+    };
+    small_result("bit_size", bits)
+}
+
+/// `erlang:'+'/2`, `'-'/2`, `'*'/2`, `div/2`, `rem/2` over two small integers.
+fn small_int_arith(function: &str, lhs: Eterm, rhs: Eterm) -> Result<Eterm> {
+    let lhs = small_operand(function, lhs)?;
+    let rhs = small_operand(function, rhs)?;
+    let value = match function {
+        "+" => lhs.checked_add(rhs),
+        "-" => lhs.checked_sub(rhs),
+        "*" => lhs.checked_mul(rhs),
+        "div" => lhs.checked_div(rhs),
+        // `checked_rem` panics on `i64::MIN % -1` in debug builds, so exclude it explicitly.
+        "rem" => {
+            if rhs == 0 || (lhs == i64::MIN && rhs == -1) {
+                None
+            } else {
+                Some(lhs % rhs)
+            }
+        }
+        other => return Err(refuse(&format!("erlang:{other}/2 is not modelled"))),
+    };
+    let Some(value) = value else {
+        return Err(refuse(&format!(
+            "erlang:{function}/2 on {lhs} and {rhs} (zero divisor or overflow)"
+        )));
+    };
+    small_result(function, value)
+}
+
+/// `erlang:abs/1` over a small integer.
+fn small_int_abs(operand: Eterm) -> Result<Eterm> {
+    let value = small_operand("abs", operand)?;
+    let Some(value) = value.checked_abs() else {
+        return Err(refuse("erlang:abs/1 overflowed"));
+    };
+    small_result("abs", value)
 }
 
 /// A [`MinimalContext`] whose `call_ext` seam serves `module`'s own functions.
@@ -171,11 +486,18 @@ impl ExecutionContext for CountingContext {
         args: &[Eterm],
     ) -> Result<Eterm> {
         self.counters.bif_calls += 1;
-        *self
-            .counters
-            .bif_histogram
-            .entry(format!("{module}:{function}/{arity}"))
-            .or_insert(0) += 1;
+        // Deliberately the allocation-free form: `format!`ing the key here cost ~17 % of the
+        // interpreter `list_walk` per-element samples (see `BifHistogram`).
+        self.counters.bif_histogram.record(module, function, arity);
+        // The harness' own floor comes first; anything it does not model keeps the inner
+        // host's rejecting behaviour. A *declined* operand is counted so the report can
+        // assert the floor never silently shaped a result.
+        if let Some(result) = self.host_bif(module, function, arity, args) {
+            if result.is_err() {
+                self.counters.floor_declines += 1;
+            }
+            return result;
+        }
         self.inner.call_bif(module, function, arity, args)
     }
 

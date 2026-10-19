@@ -96,6 +96,9 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: super::runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -1253,8 +1256,102 @@ fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
     assert_eq!(eager.block_count(), 3, "sub-blocks add no block");
 }
 
-/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the
-/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
+/// A block entry that stays inside one function resolves from the caller's
+/// [`ResolvedFunction`] handle instead of re-resolving the lazy artifact's per-function
+/// table, and every answer stays identical to the uncached
+/// [`CompiledModule::native_entry`].
+///
+/// The observable is the thread-local `lazy_function_resolutions` counter, recorded by
+/// [`CompiledModule::native_entry_cached`] on each **successful** per-function
+/// resolution: a same-function entry must add none (that is the `RefCell` probe +
+/// `Rc::clone` the cache spares), an entry into another function must add exactly one,
+/// returning to a function the cache no longer holds must add one again, an address with
+/// no compiled block must add none, and the eager layout — which addresses its one shared
+/// table directly — must never resolve anything.
+#[test]
+fn a_same_function_block_entry_reuses_the_resolved_function() {
+    let (module, _) = local_call_case();
+    // `local_call_case` has two functions: `f/0` (block start pc 1, continuation pc 4)
+    // and `g/0` (block start pc 0).
+    let compiled = CompiledModule::lazy(&module);
+
+    // The uncached answers, taken before the counters are armed so the two forms can be
+    // compared without polluting the counts.
+    let (want_block, want_block_bound) = compiled.native_entry(&module, 0, 1).expect("pc 1");
+    let (want_sub, want_sub_bound) = compiled.native_entry(&module, 0, 4).expect("pc 4");
+    let (want_g, want_g_bound) = compiled.native_entry(&module, 1, 0).expect("g/0 pc 0");
+
+    super::counters::reset();
+    super::counters::set_enabled(true);
+    let mut cache: ResolvedFunction = None;
+
+    // A first entry into a function resolves it.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache),
+        Some((want_block, want_block_bound)),
+        "the cached entry must agree with `native_entry`"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 1);
+
+    // A different pc in the SAME function (here a continuation sub-block) is a cache hit.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 4, &mut cache),
+        Some((want_sub, want_sub_bound)),
+        "a same-function sub-block entry must agree with `native_entry`"
+    );
+    assert_eq!(
+        super::counters::snapshot().lazy_function_resolutions,
+        1,
+        "a same-function block entry must not re-resolve the function"
+    );
+
+    // A different function (and a different bound, its own) re-resolves once.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 1, 0, &mut cache),
+        Some((want_g, want_g_bound)),
+        "a cross-function entry must agree with `native_entry`"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 2);
+
+    // ... and the handle is single-slot, so going back resolves `f/0` again.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache),
+        Some((want_block, want_block_bound))
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+
+    // An address in the cached function with no compiled block resolves nothing and
+    // leaves the cache as it was, so the next same-function entry is still a hit.
+    assert_eq!(
+        compiled.native_entry_cached(&module, 0, 99, &mut cache),
+        None,
+        "an address past the end of the function has no entry"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+    assert!(
+        compiled.native_entry_cached(&module, 0, 1, &mut cache).is_some(),
+        "a miss must leave the cached function in place"
+    );
+    assert_eq!(super::counters::snapshot().lazy_function_resolutions, 3);
+
+    // The eager layout forwards to `native_entry` and carries nothing.
+    let eager = compile_module(&module).expect("the module compiles eagerly");
+    let mut eager_cache: ResolvedFunction = None;
+    assert_eq!(
+        eager.native_entry_cached(&module, 0, 1, &mut eager_cache),
+        eager.native_entry(&module, 0, 1),
+        "the eager layout's cached form is `native_entry` itself"
+    );
+    assert!(eager_cache.is_none(), "the eager layout caches nothing");
+    assert_eq!(
+        super::counters::snapshot().lazy_function_resolutions,
+        3,
+        "the eager layout resolves no function at all"
+    );
+    super::counters::set_enabled(false);
+}
+
+/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
 /// `pc + 1` a frame-preserving call returns to even though that address is not an IR block
 /// start. An address with no code at all still answers `None`, and `block_count` still
 /// counts the non-empty IR blocks only (sub-blocks are not blocks).
@@ -2329,6 +2426,9 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: super::runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -2724,6 +2824,9 @@ fn run_ext_call(
         y_end: std::ptr::null_mut(),
         literals_base: std::ptr::null(),
         literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: super::runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
@@ -3952,7 +4055,11 @@ fn the_move_y_gate_matches_the_move_inliner_exactly() {
 /// A block whose inlined Y moves follow an in-block helper call is covered by the
 /// compile-time gate: `y_last` names the last Y access, so the helper's deopt arm
 /// (`Allocate`, which may reallocate `machine.stack`) re-publishes the window
-/// (`refresh_y_after`) before the move reads it.
+/// (`refresh_y_after`) before the move reads it — and, for exactly that reason, the
+/// block's prologue **skips** its own publish
+/// ([`Allocation::prologue_publishes_y`]: every Y access follows the `allocate`, whose
+/// helper re-published the window on the arm that continued the block, so a prologue
+/// publish would be overwritten before anything read it).
 #[test]
 fn the_y_window_gate_covers_the_inlined_y_moves() {
     let code = vec![
@@ -3997,8 +4104,8 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
     let labels = crate::interpreter::build_label_map(&module);
     let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
     assert!(
-        code_contains_helper(&function, jit_publish_y as *const ()),
-        "a block with an inlined Y move publishes the window from its prologue"
+        !code_contains_helper(&function, jit_publish_y as *const ()),
+        "every Y access follows the `allocate`, so the prologue's publish would be dead"
     );
     assert!(
         code_contains_helper(&function, jit_refresh_y as *const ()),
@@ -4143,6 +4250,201 @@ fn the_y_window_publication_is_gated_at_compile_time() {
         !code_contains_helper(&x_function, jit_refresh_y as *const ()),
         "a Y-free block emits no window refresh"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the prologue's Y-window publish is skipped when a frame helper already made it
+// ---------------------------------------------------------------------------
+/// The prologue publishes the frame's Y window only when a Y access can reach it
+/// before anything published it.
+///
+/// A block whose **every** Y access lies after an in-block `allocate` /
+/// `allocate_heap` / `trim` skips the publish
+/// ([`Allocation::prologue_publishes_y`]): those three lowerings are the
+/// frame-changing helpers, and each one's helper calls `JitRuntime::refresh_y_base`
+/// on the very arm that continues the block in-block (`runtime.rs::jit_allocate` /
+/// `jit_allocate_heap` / `jit_trim`), so it has already re-published the window
+/// before the first Y access runs. A block's control flow is **linear** — it is
+/// entered only at its own start and its only ways out of the middle are a
+/// branch/exit into another range (each with its own prologue) or a continuation
+/// sub-block (a separate emitted range with its own `Allocation` and prologue) — so
+/// "instruction `h` precedes the first Y access" means `h` was necessarily executed
+/// first.
+///
+/// Four shapes, each compiled through [`compile_function`] with the structural
+/// counters on:
+///
+/// 1. `allocate` **before** every Y access — the compiler's `sum/1` recursion shape
+///    (`test is_nonempty_list` · `allocate` · `get_list {x,0} -> {y,0},{x,0}` ·
+///    `return`) — skips the publish and keeps `y_last` (so it still gets the gated
+///    post-helper refresh);
+/// 2. the mirrored shape with the Y access **before** the `allocate` publishes;
+/// 3. a Y-free block publishes nothing;
+/// 4. a Y access with **no** frame helper at all publishes (the conservative
+///    `frame_republish_first == None` arm).
+#[test]
+fn a_block_whose_y_accesses_all_follow_a_frame_helper_skips_the_prologue_publish() {
+    /// What one compiled shape produced: its block's [`Allocation`], whether the
+    /// prologue emitted the window publish, and the counters of that compilation.
+    struct Case {
+        allocation: Allocation,
+        publishes: bool,
+        counters: super::counters::Counters,
+    }
+    /// Compile `f/0` over a body whose **only** label is `Label(2)` at pc 0, so the
+    /// function is exactly one IR block `[0, code.len())` and the helper-address probe
+    /// below cannot see another block's prologue.
+    fn compile_case(name: &str, code: Vec<Instr>) -> Case {
+        let module = build_module(name, &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+        let code = &module.functions[0].code;
+        assert_eq!(
+            module.functions[0].blocks.len(),
+            1,
+            "the case must be exactly one IR block"
+        );
+        let start = module.functions[0].blocks[0].start;
+        let end = module.functions[0].blocks[0].end;
+        let allocation = allocate_registers(&module, code, start, end);
+        super::counters::reset();
+        super::counters::set_enabled(true);
+        let labels = crate::interpreter::build_label_map(&module);
+        let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+        super::counters::set_enabled(false);
+        Case {
+            publishes: code_contains_helper(&function, jit_publish_y as *const ()),
+            counters: super::counters::snapshot(),
+            allocation,
+        }
+    }
+    // (1) `allocate` before every Y access — the `sum/1` shape, whose `get_list` reads
+    // its `Y` slot only after the frame push.
+    let dead = compile_case(
+        "ypro_after_alloc",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Test {
+                kind: TestKind::IsNonemptyList,
+                fail: Label(2),
+                args: vec![Operand::X(0)],
+            },
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 1,
+            },
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::Y(0),
+                tail: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(dead.allocation.y_first, Some(3), "the `get_list` reads Y first");
+    assert_eq!(
+        dead.allocation.y_last,
+        Some(3),
+        "the same access is the block's last one: `y_last` keeps the post-helper refresh gate"
+    );
+    assert_eq!(
+        dead.allocation.frame_republish_first,
+        Some(2),
+        "the `allocate` is the block's first window-re-publishing helper"
+    );
+    assert!(
+        !dead.allocation.prologue_publishes_y(),
+        "every Y access follows the `allocate`, so the prologue publish is dead"
+    );
+    assert!(
+        !dead.publishes,
+        "the compiled prologue must not emit `jit_publish_y` for this shape"
+    );
+    assert_eq!(dead.counters.y_blocks, 1, "the block does touch Y");
+    assert_eq!(
+        dead.counters.y_prologue_publishes, 0,
+        "the dead prologue publish is removed"
+    );
+    // (2) The mirrored shape: the Y access precedes the `allocate`, so the window must
+    // be published before it can be read.
+    let live = compile_case(
+        "ypro_before_alloc",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Test {
+                kind: TestKind::IsNonemptyList,
+                fail: Label(2),
+                args: vec![Operand::X(0)],
+            },
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::Y(0),
+                tail: Operand::X(0),
+            },
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 1,
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(live.allocation.y_first, Some(2));
+    assert_eq!(live.allocation.frame_republish_first, Some(3));
+    assert!(
+        live.allocation.prologue_publishes_y(),
+        "a Y access before the frame helper needs the prologue's window"
+    );
+    assert!(
+        live.publishes,
+        "the compiled prologue must emit `jit_publish_y` for this shape"
+    );
+    assert_eq!(live.counters.y_blocks, 1);
+    assert_eq!(live.counters.y_prologue_publishes, 1);
+    // (3) A Y-free block publishes nothing at all.
+    let none = compile_case(
+        "ypro_free",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(none.allocation.y_first, None);
+    assert_eq!(none.allocation.y_last, None);
+    assert!(!none.allocation.prologue_publishes_y());
+    assert!(!none.publishes, "a Y-free block emits the plain position store");
+    assert_eq!(none.counters.y_blocks, 0);
+    assert_eq!(none.counters.y_prologue_publishes, 0);
+    // (4) A Y access with no frame helper in the block: nothing has published the
+    // window, so the prologue must (the conservative `None` arm).
+    let conservative = compile_case(
+        "ypro_no_helper",
+        vec![
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::Y(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    assert_eq!(conservative.allocation.y_first, Some(1));
+    assert_eq!(
+        conservative.allocation.frame_republish_first, None,
+        "the block holds no window-re-publishing helper"
+    );
+    assert!(
+        conservative.allocation.prologue_publishes_y(),
+        "with no helper to re-publish it, the prologue must publish"
+    );
+    assert!(conservative.publishes);
+    assert_eq!(conservative.counters.y_blocks, 1);
+    assert_eq!(conservative.counters.y_prologue_publishes, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -5132,6 +5434,13 @@ const Y_TRAFFIC_FIXTURES: [&str; 27] = [
 /// * `y_loads`/`y_stores` — the emitted guarded `Y` accesses (each is a frame-window guard
 ///   plus one load/store word) and `y_bytes`, the emitted size of all of them;
 /// * `y_blocks` — the emitted blocks whose body touches a `Y` slot at all;
+/// * `y_prologue_publishes` — the emitted block prologues that publish the frame's `Y`
+///   window (`Allocation::prologue_publishes_y`: the block touches `Y` and **not** every
+///   one of those accesses follows an in-block `allocate`/`allocate_heap`/`trim`, whose
+///   helper already re-published the window itself). Its complement within `y_blocks` is
+///   the dead publishes the gate elides: those blocks emit the plain position store
+///   instead, and the publish they drop is overwritten by the frame helper's own
+///   re-publish before any `Y` access reads the window;
 /// * `y_invalidations` — the in-block helper calls after which a **later** instruction of
 ///   the same block still touches `Y` (each is a re-publish site a `Y`-value cache would
 ///   also have to re-validate and reload through);
@@ -5201,7 +5510,8 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.blocks, snap.block_ir_instructions, snap.block_emitted_bytes,
     );
     println!(
-        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={}",
+        "  Y: loads={} stores={} (accesses={}) bytes={} blocks={} invalidations={} slot_repeats={} \
+         prologue_publishes={}",
         snap.y_loads,
         snap.y_stores,
         accesses,
@@ -5209,6 +5519,7 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.y_blocks,
         snap.y_invalidations,
         snap.y_slot_repeats,
+        snap.y_prologue_publishes,
     );
     println!(
         "  Y accesses per 1000 IR instructions: {:.1}",
@@ -5230,6 +5541,12 @@ fn the_y_window_traffic_of_the_committed_fixtures_is_measured() {
         snap.y_slot_repeats <= accesses,
         "a reuse is one of the accesses: {} > {accesses}",
         snap.y_slot_repeats,
+    );
+    assert!(
+        snap.y_prologue_publishes <= snap.y_blocks,
+        "a publishing prologue is one of the Y-touching blocks: {} > {}",
+        snap.y_prologue_publishes,
+        snap.y_blocks,
     );
 }
 
@@ -6244,3 +6561,7 @@ mod operand_tests;
 #[cfg(test)]
 #[path = "bif_tests.rs"]
 mod bif_tests;
+
+#[cfg(test)]
+#[path = "raise_tier_tests.rs"]
+mod raise_tier_tests;

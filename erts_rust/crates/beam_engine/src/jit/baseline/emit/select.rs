@@ -29,7 +29,7 @@ use beam_loader::{Instr, Label, Operand, NO_FAIL};
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel};
 
-use super::link::Linker;
+use super::link::{ExitSpill, Linker};
 use super::operands::constant_word;
 use super::test::{load_test_src, test_src, TestSrc, TEST_A, TEST_C, TEST_T};
 use super::{emit_step_and_continue, Allocation};
@@ -173,12 +173,28 @@ pub(super) fn try_inline_select_val(
     }
 
     // --- no alternative matched: branch to the fail label -------------------
-    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1, pc)?;
+    linker.emit_exit(
+        buffer,
+        allocation,
+        done,
+        plan.fail.0,
+        plan.fail.1,
+        pc,
+        ExitSpill::Required,
+    )?;
 
     // --- each alternative: branch to its target ----------------------------
     for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
         buffer.bind(*case_label)?;
-        linker.emit_exit(buffer, allocation, done, target.0, target.1, pc)?;
+        linker.emit_exit(
+            buffer,
+            allocation,
+            done,
+            target.0,
+            target.1,
+            pc,
+            ExitSpill::Required,
+        )?;
     }
 
     // --- the `Y` guard rejected the scrutinee: run the real instruction -----

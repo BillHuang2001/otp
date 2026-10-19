@@ -32,17 +32,26 @@
 //!   such a register must be reloaded. [`fill_sets`] computes exactly that set,
 //!   block-locally and conservatively (a register is live until a later instruction
 //!   writes it: `live = (live \ writes) ∪ reads`);
-//! * a register the block **may have diverged from `machine.x`**
-//!   ([`Allocation::written`]). This is not liveness: it is the join rule. A guarded
-//!   lowering that rejects branches to a `jit_step_one` fallback which *joins* the
-//!   block's fast path (the `move` module's Y-operand fallback, for instance): on the
-//!   fast path the destination's register is authoritative and `machine.x` stale, and
-//!   on the fallback path `machine.x` is authoritative and the register stale.
-//!   Reloading the write set on the fallback path makes the two agree — the register
-//!   then holds exactly `machine.x` — so the block's exit
-//!   [`spill`](super::regs::spill), which stores the write set on **both** paths, stays
-//!   exact. Without it the fallback would store a stale register over the interpreter's
-//!   fresh `machine.x`.
+//! * a register the block **may have diverged from `machine.x` at that very `pc`**
+//!   ([`super::regalloc::cacheable_writes`] of the instruction *at* the helper's `pc`).
+//!   This is not liveness: it is the join rule. A guarded lowering that rejects branches to
+//!   a `jit_step_one` fallback which *joins* the block's fast path (the `move` module's
+//!   Y-operand fallback, for instance): on the fast path the destination's register is
+//!   authoritative and `machine.x` stale, and on the fallback path `machine.x` is
+//!   authoritative and the register stale. Reloading the write set on the fallback path
+//!   makes the two agree — the register then holds exactly `machine.x` — so a later
+//!   [`spill`](super::regs::spill) of that register (the dirty-set walk marks it dirty from
+//!   this `pc` on) stores the fresh word on both paths.
+//!
+//! The join rule is **`pc`-local, not block-global**: the divergence a helper call can leave
+//! behind is exactly the write set of the instruction that call executes. A register the
+//! block writes *elsewhere* is not part of the merge — either it is read after `pc` (so it
+//! is in `live`) or its cached value is dead there (the dirty-set walk kills it at its own
+//! writing instruction and no store can carry a stale word out of the block). Narrowing the
+//! term from the block-wide union to `cacheable_writes(pc)` is what makes a
+//! helper-instruction-heavy block — a bitstring decoder, where ~90 `Bs*` helper calls
+//! follow one inline `move` — refill only what it can observe, instead of reloading every
+//! register the block ever wrote at every helper site.
 //!
 //! Nothing is live at the **end** of the block: the exit spill has already made
 //! `machine.x` authoritative for every register the block diverged, a register this
@@ -54,11 +63,13 @@
 //!
 //! # Why a partially-filled register may simply be dropped
 //!
-//! A cached register outside the fill set is left holding a stale word. It is never
-//! observed: a later **read** through its machine register implies the register is live
-//! at that helper (hence reloaded), and every **store** of a cached register — the
-//! pre-helper spill and the exit spill — stores the block's write set, which the fill
-//! set always contains. The stale word can therefore only be overwritten, never read.
+//! A cached register outside the fill set at `pc` is left holding a word `machine.x` may
+//! no longer match. It is never observed: a later **read** through its machine register
+//! makes the register live at `pc` (so it *is* reloaded), and a later **store** of it is
+//! a [`spill`](super::regs::spill), which only ever stores a **dirty** register — one an
+//! inline lowering wrote since the last syncing event, at which point the machine
+//! register holds that lowering's own (fresh) word. So the stale word can only be
+//! overwritten, never read *and* never carried out of the block.
 
 use beam_loader::{Instr, Module};
 
@@ -78,13 +89,13 @@ use super::Allocation;
 /// a slice shorter than the pc offset has no computed liveness and must be treated as
 /// **the whole cache** (see [`Allocation::fill_slots`]).
 ///
-/// The fill set is `(live ∪ written) ∩ slots`, where `live` is the block-local liveness
+/// The fill set is `(live ∪ writes(pc)) ∩ slots`, where `live` is the block-local liveness
 /// of the instruction *after* the helper (the interpreter has already executed the
-/// instruction at `pc`, so the continuation starts at `pc + 1`), `written` is the block's
-/// statically-derived write set (the join rule in the module docs) and `slots` the block's
-/// cache. The set is an over-approximation of what the continuation actually reads — a
-/// register it also lists but never reads is reloaded with the value it already holds —
-/// never an under-approximation.
+/// instruction at `pc`, so the continuation starts at `pc + 1`), `writes(pc)` is the inline
+/// write set of the instruction **at** `pc` (the `pc`-local join rule in the module docs)
+/// and `slots` the block's cache. The set is an over-approximation of what the continuation
+/// actually reads — a register it also lists but never reads is reloaded with the value it
+/// already holds — never an under-approximation.
 ///
 /// The walk steps *reads* back (`live = (live \ writes) ∪ reads`), so once every
 /// instruction has been stepped over `live` is the block's **live-in** set: the registers
@@ -94,8 +105,8 @@ use super::Allocation;
 /// reads), so the prologue loads it: a conservative extra load is a missed optimization,
 /// never a wrong result. A cached register the block writes before it reads is deliberately
 /// left **unloaded** — the writing instruction sets its machine register (never
-/// `machine.x`), and every later store of that register stores the write set, which the
-/// fill set always contains.
+/// `machine.x`), and a later store of that register only happens while it is dirty, i.e.
+/// after such a write.
 pub(super) fn fill_sets(
     module: &Module,
     labels: &LabelMap,
@@ -113,18 +124,21 @@ pub(super) fn fill_sets(
     // done (see the module docs).
     let mut live: Vec<u32> = Vec::new();
     for i in (start..end).rev() {
-        // The fill set of a helper at `pc = i`: the registers the continuation reads,
-        // plus every cached register the block may have diverged from `machine.x`.
+        // The instruction's **own** inline write set: the only cached registers a helper at
+        // this pc can leave diverged from `machine.x` (the `pc`-local join rule).
+        let writes = cacheable_writes(module, labels, &code[i]);
+        // The fill set of a helper at `pc = i`: the registers the continuation reads, plus
+        // every cached register this instruction's own fallback may have diverged.
         sets[i - start] = cached
             .iter()
             .copied()
-            .filter(|x| live.contains(x) || allocation.is_written(*x))
+            .filter(|x| live.contains(x) || writes.contains(x))
             .collect();
         // Step back over instruction `i` — what it writes is killed, what it reads is
         // generated (an over-approximation of "reads": a register a shape claims but
         // never actually reads is loaded, which the write set covers anyway).
-        for x in cacheable_writes(module, labels, &code[i]) {
-            live.retain(|v| *v != x);
+        for x in &writes {
+            live.retain(|v| v != x);
         }
         for x in cacheable_reads(module, labels, &code[i]) {
             if !live.contains(&x) {
