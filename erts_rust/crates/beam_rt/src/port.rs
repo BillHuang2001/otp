@@ -176,13 +176,8 @@ pub(crate) mod completion;
 pub(crate) mod exit;pub(crate) mod info_extras;
 pub(crate) mod ops;
 pub(crate) mod packet;
-// The general select seam (`enif_select` A.3 + `prim_tty:tty_select/2` A.7). Its
-// `prim_tty` half is live through [`PortRegistry::arm_tty_select`]; the `enif_select` half —
-// [`select::SelectWatch::stop`]/[`select::SelectWatch::cancel`] and the
-// [`select::SelectPayload::Custom`] shape — is the NIF ABI layer's caller, which is not landed
-// yet, so those items are unreachable from the runtime's own code today. The allow is scoped to
-// this one new module rather than scattered over each item it covers.
-#[allow(dead_code)]
+// The general select seam: `enif_select` (A.3) reached through `crate::nif_select`, plus
+// `prim_tty:tty_select/2` (A.7), which is the read-only special case of it.
 pub(crate) mod select;
 pub(crate) mod watch;
 use beam_alloc::Heap;

@@ -57,7 +57,7 @@
 //! `tty_select/2` **is** served: the C's resource check, a discarded `enif_select`, and the
 //! atom `ok` (the `("tty_select", 2)` arm of [`RuntimeContext::prim_tty_call`]). The read
 //! interest it arms is delivered as `{select, Handle, Ref, ready_input}` by the port layer
-//! ([`crate::port::tty`]) — the runtime's one poller owns the descriptor, so the *answer*
+//! ([`crate::port::select`]) — the runtime's one poller owns the descriptor, so the *answer*
 //! surface stays here and the *delivery* half lives there.
 //!
 //! # The opaque tty handle
