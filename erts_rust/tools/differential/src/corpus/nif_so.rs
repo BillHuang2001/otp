@@ -97,9 +97,15 @@
 //! so a `enif_raise_exception` in `load` is swallowed and the load still succeeds (`1`).
 //!
 //! Every `nif_rt/…` golden is the integer the **oracle** prints, verified per case with
-//! `differential run <id>`. The stateful families the A.3 C ABI also offers — `enif_send` to
-//! another process, `enif_monitor_process`, `enif_select` on a real fd, and the destructor of a
-//! term-exposed resource — were measured and are **not** cases: see the honest handoff below.
+//! `differential run <id>`. A **third** sub-block (selectors `16`-`29`) drives the stateful
+//! families the A.3 C ABI also offers — `enif_send` in both the `NULL`-env and the `msg_env`
+//! form, `enif_monitor_process` with its `down` callback / `enif_demonitor_process` /
+//! `enif_compare_monitors` / `enif_make_monitor_term`, `enif_select` on a real pipe
+//! descriptor, the destructor of a term-exposed resource, `enif_make_map_from_arrays`'s
+//! duplicate-key refusal, `enif_binary_to_term`'s consumed-byte report and
+//! `enif_term_to_binary` of a local fun. Each is a live side effect, so the case waits for it
+//! (a deadlined `receive`, a bounded poll) and reduces the whole observation to one integer —
+//! the harness's two-signal `unsupported` classification still applies to the Rust side.
 //!
 //! # Reachability rules this group depends on
 //!
@@ -154,35 +160,25 @@
 //!   `beam_abi` (the loader, which would need the module's code) and `beam_rt` (which has it
 //!   and could hand it over).
 //!
-//! The stateful families of the A.3 C ABI, measured the same way with a scratch library (each
-//! is a *plain value* difference, so a case would be a `mismatch` — every one is reported
-//! rather than pinned):
+//! The stateful families of the A.3 C ABI are **cases**, not handoff notes: every one of them
+//! was re-measured against this environment's oracle and the built `beam_rt`, agree, and is
+//! pinned by the `nif_rt/…` block above. One measurement in the family still diverges and is
+//! therefore reported rather than pinned (a pinned one would be a `mismatch`):
 //!
-//! * **`enif_send` to another Erlang process.** The oracle answers `1` and the message really
-//!   arrives; the Rust runtime answers `0` and nothing is delivered, because `NifHost::send`
-//!   is left at its `None` default by `beam_rt`'s `NifHostImpl` (owner: `beam_rt`).
-//! * **`enif_monitor_process` of a *live* pid.** Oracle `0` (monitor established), Rust `1`
-//!   (the documented "cannot establish" substitute), because the `monitor_process` /
-//!   `demonitor_process` hooks are unimplemented (owner: `beam_rt`).
-//! * **`enif_select` on a real pipe fd.** Oracle `0` (poll interest registered), Rust `-1`
-//!   (the `select` hook is unimplemented; owner: `beam_rt`).
-//! * **the destructor of a resource exposed as a term.** After `enif_make_resource` +
-//!   `enif_release_resource` and an `erlang:garbage_collect/0`, the oracle runs the type's
-//!   destructor exactly once; the Rust runtime never does (it has no "the term died" signal)
-//!   — a bounded, deliberate leak (owner: `beam_abi`, `nif/enif/resources.rs`).
-//! * **`enif_make_map_from_arrays` with duplicate keys.** Oracle refuses (the C's
-//!   `THE_NON_VALUE`, `erl_map.c:673-710`); the Rust runtime deduplicates last-value-wins and
-//!   returns a map (owner: `beam_abi`, `nif/enif/map.rs`).
-//! * **`enif_binary_to_term` over an image with trailing bytes.** Oracle decodes the first
-//!   term and reports the *consumed* byte count; the Rust runtime answers `0` (its host hook
-//!   decodes the whole slice strictly, so trailing bytes fail the decode). Owner: `beam_abi`
-//!   (`nif/enif/mem.rs` hands the whole slice to `NifHost::binary_to_term`) / `beam_rt`
-//!   (`NifHostImpl`'s codec call).
-//! * **`enif_term_to_binary` of a *local* fun.** Oracle encodes the module's `NEW_FUN_EXT`
-//!   image; the Rust runtime answers the C failure code `0` (its ETF encoder declines a
-//!   compiled local fun), which surfaces as `badarg` from `enif_term_to_binary`. The
-//!   *external* fun image (`EXPORT_EXT`) does agree and is pinned, inside the compound-term
-//!   encode case. Owner: `beam_rt` (`NifHostImpl::term_to_binary`) / `beam_codec`.
+//! * **`enif_term_size/1` of a reference.** The oracle reports `24` bytes (3 words — the C's
+//!   `ErtsORefThing`); the Rust runtime reports `32` (4 words), because it mints a four-word
+//!   internal-ref block. The 1-tuple control agrees at `16`, so the divergence is the ref block
+//!   shape alone. `enif_make_monitor_term/1` is consequently pinned only as far as
+//!   `enif_is_ref/1` (its build succeeds on both sides); its payload is a per-VM-start ref
+//!   image, so nothing about it may be a golden anyway. Owner: `beam_abi`
+//!   (`nif/enif/resources.rs`) / the internal-ref block in `beam_term`.
+//!
+//! The `nif_rt/…` stateful cases pin **relations and integer classes only**: a monitor's
+//! `enif_compare_monitors` result is reduced to "differs from the other handle / equals
+//! itself" (the C's `-1`/`0` are not pinned as values), and a local fun's ETF image is pinned
+//! by its `NEW_FUN_EXT` tag, its module and arity and its byte-equality with the module's own
+//! `term_to_binary/1` — never by the closure's identity bytes.
+
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
@@ -526,7 +522,10 @@ const REAL_NIF: NifFixture = NifFixture::CompiledLibrary {
 /// fixture [`NIF_RT_RAISE_C`] — so it is matched before the ordinary branch.
 const NIF_RT_MODULE_SOURCE: &str = r#"-module(nif_rt).
 -export([classify/1, probe/1, probe_term/2, encode/1, mk_hamt/0, mk_hamt_put/0, mk_list/0,
-         self_etf/0]).
+         self_etf/0, send_null/2, send_msg/2, mon_make/0, mon_arm/1, mon_arm_b/1,
+         mon_compare/0, mon_term/0, mon_demonitor/0, mon_downs/0, mon_down_pid_matches/1,
+         sel_arm/0, sel_poke/0, gc_probe/0, gc_count/0, map_dup/0, map_nodup/0,
+         b2t_trailing/1]).
 
 %% One stub per entry in the library's ErlNifFunc table: erlang:load_nif/2 refuses a library
 %% whose functions do not exist (and are not exported) in the loading module.
@@ -537,7 +536,23 @@ mk_hamt() -> erlang:nif_error(not_loaded).
 mk_hamt_put() -> erlang:nif_error(not_loaded).
 mk_list() -> erlang:nif_error(not_loaded).
 self_etf() -> erlang:nif_error(not_loaded).
-
+send_null(_, _) -> erlang:nif_error(not_loaded).
+send_msg(_, _) -> erlang:nif_error(not_loaded).
+mon_make() -> erlang:nif_error(not_loaded).
+mon_arm(_) -> erlang:nif_error(not_loaded).
+mon_arm_b(_) -> erlang:nif_error(not_loaded).
+mon_compare() -> erlang:nif_error(not_loaded).
+mon_term() -> erlang:nif_error(not_loaded).
+mon_demonitor() -> erlang:nif_error(not_loaded).
+mon_downs() -> erlang:nif_error(not_loaded).
+mon_down_pid_matches(_) -> erlang:nif_error(not_loaded).
+sel_arm() -> erlang:nif_error(not_loaded).
+sel_poke() -> erlang:nif_error(not_loaded).
+gc_probe() -> erlang:nif_error(not_loaded).
+gc_count() -> erlang:nif_error(not_loaded).
+map_dup() -> erlang:nif_error(not_loaded).
+map_nodup() -> erlang:nif_error(not_loaded).
+b2t_trailing(_) -> erlang:nif_error(not_loaded).
 %% The `load`-callback case loads its own library (the only fixture in that case's dir), so it
 %% must be matched before the ordinary branch.
 classify(50) ->
@@ -594,8 +609,250 @@ dispatch(13) -> M = nif_rt:mk_hamt_put(),
                    andalso term_to_binary(M) =:= term_to_binary(hamt_map()));
 dispatch(14) -> bool(nif_rt:mk_list() =:= lists:seq(1, 40));
 %% Atom keys live in the runtime's atom table, which the C-side map accessors do not receive.
-dispatch(15) -> bool(nif_rt:probe_term(15, #{alpha => 1, beta => 2}) =:= atom_keys()).
+dispatch(15) -> bool(nif_rt:probe_term(15, #{alpha => 1, beta => 2}) =:= atom_keys());
+%% ---- the stateful enif_* families ------------------------------------------------------
+%% A message a NIF sends really reaches the target's mailbox: both of the C's forms, and a
+%% send to the calling process itself.
+dispatch(16) -> send_code(send_case(fun ?MODULE:send_null/2));
+dispatch(17) -> send_code(send_case(fun ?MODULE:send_msg/2));
+%% A pid with no process is the C's `0` — no fabricated delivery.
+dispatch(18) -> refused_code(dead_pid_case());
+dispatch(19) -> send_code(self_send_case());
+%% enif_monitor_process of a LIVE pid arms (the C's `0`) and no `down` has fired yet.
+dispatch(20) -> arm_live_code(mon_arm_live());
+%% ... and the target's death fires `down` exactly once, on the armed pid.
+dispatch(21) -> down_code(mon_then_kill());
+%% enif_demonitor_process cancels an armed monitor, so the later death fires nothing.
+dispatch(22) -> demonitor_code(mon_demonitor_after_arm());
+%% The monitor handles: two arms, compare_monitors of a handle with itself and across two
+%% monitors, and the handle's rebuild as a reference.
+dispatch(23) -> handles_code(mon_handles());
+%% A dead target is the C's `1`, and nothing is fabricated for it.
+dispatch(24) -> dead_arm_code(mon_arm_dead());
+%% enif_select on a real pipe read end registers (the C's `0`) and delivers `ready_input`
+%% once the descriptor becomes readable — one-shot, and not before.
+dispatch(25) -> select_code(select_case());
+%% A term-exposed resource runs its type's destructor when the term dies (and only then).
+dispatch(26) -> dtor_code(gc_dtor_case());
+%% enif_make_map_from_arrays refuses a duplicate key instead of collapsing it.
+dispatch(27) -> map_code({nif_rt:map_dup(), nif_rt:map_nodup()});
+%% enif_binary_to_term decodes the FIRST term of an image with trailing bytes and reports the
+%% consumed byte count.
+dispatch(28) -> b2t_code(b2t_case());
+%% enif_term_to_binary of a local (closure) fun is the NEW_FUN_EXT image, byte-identical to
+%% the module's own term_to_binary/1.
+dispatch(29) -> fun_code(local_fun_case()).
 
+%% Every reduction maps one measured observation to a single integer, with a distinct code per
+%% failure mode, so a divergence is a diffable integer rather than a boolean. The goldens are
+%% the integers the oracle prints.
+
+%% A delivered message: the C's `1` and the payload the module sent.
+send_code({1, delivered_by_the_nif}) -> 1;
+send_code({1, loopback}) -> 1;
+send_code({1, timeout}) -> 2;
+send_code({1, _Other}) -> 3;
+send_code({0, _}) -> 4;
+send_code(_) -> 9.
+
+%% A send that must answer the C's `0`.
+refused_code(R) when is_integer(R) -> case R of 0 -> 1; _ -> 2 end;
+refused_code(_) -> 9.
+
+%% Armed on a live process: the C's `0` and no `down` yet.
+arm_live_code({0, 0, true}) -> 1;
+arm_live_code({0, Down, _}) when Down > 0 -> 2;
+arm_live_code({Code, _, _}) when Code =/= 0 -> 3;
+arm_live_code(_) -> 9.
+
+%% Arm, then kill: one `down`, handed the pid that was armed on.
+down_code({0, 1, 1}) -> 1;
+down_code({0, 1, 0}) -> 2;
+down_code({0, 0, _}) -> 3;
+down_code({0, _, _}) -> 4;
+down_code({_, _, _}) -> 5;
+down_code(_) -> 9.
+
+%% Demonitor while still armed: the C's `0`, and the later death fires nothing.
+demonitor_code({0, 0}) -> 1;
+demonitor_code({0, _}) -> 2;
+demonitor_code({1, 0}) -> 3;
+demonitor_code({_, _}) -> 4;
+demonitor_code(_) -> 9.
+
+%% The handle family: both arms established, a handle equals itself and differs from the other
+%% monitor, and the handle rebuilds as a reference.
+handles_code({0, 0, {1, Cross}, 1}) when Cross =/= 0 -> 1;
+handles_code({A1, A2, _, _}) when A1 =/= 0; A2 =/= 0 -> 2;
+handles_code({_, _, {Same, _}, _}) when Same =/= 1 -> 3;
+handles_code({_, _, _, 0}) -> 4;
+handles_code(_) -> 9.
+
+%% A target whose process is gone: the C's `1`, no fabricated `down`.
+dead_arm_code({1, 0}) -> 1;
+dead_arm_code({1, _}) -> 2;
+dead_arm_code({_, _}) -> 3;
+dead_arm_code(_) -> 9.
+
+%% enif_select on a pipe read end: registered, nothing before the write, then `ready_input`.
+select_code({0, timeout, 1, {delivered, ready_input}}) -> 1;
+select_code({0, timeout, 1, timeout}) -> 2;
+select_code({0, timeout, 1, _Other}) -> 3;
+select_code({0, Early, _, _}) when Early =/= timeout -> 4;
+select_code({Code, _, _, _}) when Code =/= 0 -> 5;
+select_code(_) -> 9.
+
+%% The destructor of a term-exposed resource: none run before, exactly one after the term dies.
+dtor_code({0, 1}) -> 1;
+dtor_code({0, 0}) -> 2;
+dtor_code({0, _}) -> 3;
+dtor_code({_, _}) -> 4;
+dtor_code(_) -> 9.
+
+%% The duplicate-key refusal, and its control (distinct keys accepted).
+map_code({0, 1}) -> 1;
+map_code({1, _}) -> 2;
+map_code(_) -> 9.
+
+%% The first term of an image with trailing bytes, and the bytes it consumed.
+b2t_code({3, 42}) -> 1;
+b2t_code({0, failed}) -> 2;
+b2t_code({Used, _}) when is_integer(Used) -> 3;
+b2t_code(_) -> 9.
+
+%% A local fun's image: NEW_FUN_EXT, the closure's own module and arity, and the very bytes the
+%% module's own term_to_binary/1 produces.
+fun_code({112, {module, M}, {arity, 1}, true}) when M =:= ?MODULE -> 1;
+fun_code({112, {module, _}, {arity, 1}, false}) -> 2;
+fun_code({112, _, _, _}) -> 3;
+fun_code({Tag, _, _, _}) when is_integer(Tag) -> 4;
+fun_code(_) -> 9.
+
+%% A child parks in `receive`, the parent sends to it through the NIF, and the child echoes
+%% what it got back: `{Sent, Delivered}`, with `timeout` when nothing arrived. Both receives
+%% carry a deadline (never a bare `receive`): a *deadlined* receive is pumped by the scheduler
+%% until it elapses, so a starved slice cannot fold the wait into the typed "blocked" gap.
+send_case(Send) ->
+    Parent = self(),
+    Waiter = spawn(fun() ->
+                           Parent ! {ready, self()},
+                           receive Msg -> Parent ! {echo, Msg} end
+                   end),
+    receive {ready, Waiter} -> ok after 5000 -> timeout end,
+    Sent = Send(Waiter, delivered_by_the_nif),
+    Delivered = receive {echo, What} -> What after 5000 -> timeout end,
+    {Sent, Delivered}.
+%% A pid whose process has already exited (the `'EXIT'` proves it) is the C's `0`.
+dead_pid_case() ->
+    process_flag(trap_exit, true),
+    Gone = spawn(fun() -> ok end),
+    receive {'EXIT', Gone, _} -> ok after 5000 -> ok end,
+    nif_rt:send_null(Gone, nobody_home).
+
+%% The `c_p == rp` arm: the receiver is the process running the NIF, so the message must land
+%% in its own mailbox and be there for the `receive` that follows.
+self_send_case() ->
+    Sent = nif_rt:send_null(self(), loopback),
+    Delivered = receive What -> What after 5000 -> timeout end,
+    {Sent, Delivered}.
+
+%% A process that stays alive until it is told to stop.
+victim() -> spawn(fun() -> receive stop -> ok end end).
+
+%% Wait until `P` really is gone: told to stop, then its `'DOWN'` is awaited — the only
+%% reliable proof of another process's death.
+stop_and_await(P) ->
+    Ref = erlang:monitor(process, P),
+    P ! stop,
+    receive {'DOWN', Ref, process, P, _} -> ok after 5000 -> timeout end.
+
+%% Poll the `down` count (up to 200 rounds of 5 ms): the callback is delivered
+%% asynchronously, so it is waited for, never assumed.
+wait_down(0) -> nif_rt:mon_downs();
+wait_down(N) ->
+    case nif_rt:mon_downs() of
+        0 -> receive after 5 -> ok end, wait_down(N - 1);
+        Count -> Count
+    end.
+
+mon_arm_live() ->
+    Res = nif_rt:mon_make(),
+    P = victim(),
+    {nif_rt:mon_arm(P), nif_rt:mon_downs(), Res =/= undefined}.
+
+mon_then_kill() ->
+    _Res = nif_rt:mon_make(),
+    P = victim(),
+    Armed = nif_rt:mon_arm(P),
+    exit(P, kill),
+    {Armed, wait_down(200), nif_rt:mon_down_pid_matches(P)}.
+
+mon_demonitor_after_arm() ->
+    _Res = nif_rt:mon_make(),
+    P = victim(),
+    _Armed = nif_rt:mon_arm(P),
+    Cancelled = nif_rt:mon_demonitor(),
+    exit(P, kill),
+    {Cancelled, wait_down(200)}.
+
+mon_handles() ->
+    _Res = nif_rt:mon_make(),
+    P1 = victim(),
+    P2 = victim(),
+    A1 = nif_rt:mon_arm(P1),
+    A2 = nif_rt:mon_arm_b(P2),
+    {A1, A2, nif_rt:mon_compare(), nif_rt:mon_term()}.
+
+mon_arm_dead() ->
+    _Res = nif_rt:mon_make(),
+    P = victim(),
+    ok = stop_and_await(P),
+    {nif_rt:mon_arm(P), nif_rt:mon_downs()}.
+
+%% Arm READ interest on a pipe read end, then write the byte that makes it readable.
+select_case() ->
+    Code = nif_rt:sel_arm(),
+    Early = receive M -> {early, M} after 100 -> timeout end,
+    Written = nif_rt:sel_poke(),
+    Late = receive
+               {select, _Res, _Ref, Ev} -> {delivered, Ev};
+               Other -> {other, Other}
+           after 5000 -> timeout
+           end,
+    {Code, Early, Written, Late}.
+
+%% The allocating tail loop: one cons cell per iteration, far above one slice's reduction
+%% budget, so the process is pre-empted and parks at slice boundaries — where the runtime's
+%% term-release prune runs, and where the oracle's deferred destructor has also settled.
+park(0, Acc) -> Acc;
+park(N, Acc) -> park(N - 1, [N | Acc]).
+
+%% Mint a term that holds the object's only reference, drop it, then park (twice, with a forced
+%% collection between) and read the destructor count.
+gc_dtor_case() ->
+    Fresh = nif_rt:gc_count(),
+    _Term = nif_rt:gc_probe(),
+    _ = park(100000, 0),
+    _ = erlang:garbage_collect(),
+    _ = park(100000, 0),
+    {Fresh, nif_rt:gc_count()}.
+
+%% An integer image (131, SMALL_INTEGER_EXT, 42) followed by four bytes of trailing garbage.
+b2t_case() ->
+    nif_rt:b2t_trailing(<<131, 97, 42, 0, 0, 0, 0>>).
+
+%% Encode the closure through the ABI, then read the image's structure back through the public
+%% API — never a hard-coded byte image (the `uniq` fields are compile-time identity).
+local_fun_case() ->
+    F = fun(X) -> X + 1 end,
+    Bin = nif_rt:encode(F),
+    case Bin of
+        <<131, Tag, _/binary>> ->
+            G = binary_to_term(Bin),
+            {Tag, erlang:fun_info(G, module), erlang:fun_info(G, arity),
+             Bin =:= term_to_binary(F)};
+        Other -> Other
+    end.
 %% A raise inside the `load` callback is *not* a refusal: the C's nif_load_nif never consults
 %% the callback env's exception slot (erl_nif.c:5001-5008), so the load still returns `ok`.
 raise_code(ok) -> 1;
@@ -649,19 +906,84 @@ const NIF_RT_C: &str = r#"/* A real NIF driving the enif_* term surface with rea
 #include <erl_nif.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* More than 32 keys, so every map built here is a hash-array-mapped trie rather than a
    flatmap: the build, the lookup and the iterator walks are all the hash ones. */
 #define HAMT_N 40
 
-/* The load callback: succeeds and stores no private state. */
-static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
-    (void) env;
-    (void) load_info;
-    *priv = NULL;
-    return 0;
+/* --- the stateful enif_* families: monitors, select, resource destructors --- */
+static ErlNifResourceType* mon_type = NULL;   /* carries a `down` callback */
+static ErlNifResourceType* sel_type = NULL;   /* carries a `stop` callback (`enif_select`) */
+static ErlNifResourceType* gc_type = NULL;    /* carries a destructor */
+
+/* The monitor object, kept alive by the library's own reference for the whole (short-lived)
+   run: a destroyed resource cancels its monitors without firing `down`, which would silently
+   disarm a later phase. */
+static void* mon_obj = NULL;
+static ErlNifMonitor mon_a, mon_b;
+static int mon_armed_a = 0, mon_armed_b = 0;
+static int mon_down_count = 0;
+static ERL_NIF_TERM mon_down_pid = 0;
+static int mon_down_seen = 0;
+
+/* The descriptors and object the last `sel_arm` registered (a STOP names the object by
+   pointer, so remembering it keeps the identical fixture valid on both runtimes). */
+static int sel_rd = -1, sel_wr = -1;
+static void* sel_obj = NULL;
+
+/* How many times the destructor of the term-exposed resource type has run. */
+static int gc_dtor_runs = 0;
+
+static void mon_dtor(ErlNifEnv* env, void* obj) { (void) env; (void) obj; }
+
+static void mon_down(ErlNifEnv* env, void* obj, ErlNifPid* pid, ErlNifMonitor* mon) {
+    (void) env; (void) obj; (void) mon;
+    mon_down_count++;
+    /* A word copy of the recorded target pid only — never a dereference (the target is dead by
+       definition here). */
+    if (pid) { mon_down_pid = pid->pid; mon_down_seen = 1; }
 }
 
+static void sel_dtor(ErlNifEnv* env, void* obj) {
+    (void) env;
+    if (obj == sel_obj) sel_obj = NULL;
+}
+
+/* The ERL_NIF_SELECT_STOP callback: the C's STOP path calls it unconditionally
+   (`erl_check_io.c:1530`), so a library without one would crash the oracle. */
+static void sel_stop(ErlNifEnv* env, void* obj, ErlNifEvent ev, int is_direct_call) {
+    (void) env; (void) obj; (void) ev; (void) is_direct_call;
+}
+
+static void gc_dtor(ErlNifEnv* env, void* obj) { (void) env; (void) obj; gc_dtor_runs++; }
+
+/* The load callback: succeeds, stores no private state, and opens the three resource types the
+   stateful families need. */
+static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM load_info) {
+    ErlNifResourceFlags tried;
+    ErlNifResourceTypeInit init;
+    (void) load_info;
+    *priv = NULL;
+    memset(&init, 0, sizeof(init));
+    init.dtor = mon_dtor;
+    init.down = mon_down;
+    init.members = 3;
+    mon_type = enif_init_resource_type(env, "nif_rt_mon", &init,
+                                       ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, &tried);
+    if (mon_type == NULL) return 1;
+    memset(&init, 0, sizeof(init));
+    init.dtor = sel_dtor;
+    init.stop = sel_stop;
+    init.members = 3;
+    sel_type = enif_init_resource_type(env, "nif_rt_sel", &init,
+                                       ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, &tried);
+    if (sel_type == NULL) return 2;
+    gc_type = enif_open_resource_type(env, NULL, "nif_rt_gc", gc_dtor,
+                                      ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, &tried);
+    if (gc_type == NULL) return 3;
+    return 0;
+}
 /* FNV-1a over the bytes, folded to 31 bits, so the module can recompute it in Erlang. */
 static unsigned int fnv(const unsigned char* p, size_t n) {
     uint32_t h = 2166136261u;
@@ -910,6 +1232,266 @@ static ERL_NIF_TERM self_etf(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
     return out;
 }
 
+/* ---- enif_send, both forms ------------------------------------------------------------------ */
+
+/* `enif_send(env, &to, NULL, msg)` — the message term belongs to the calling env. Answers the
+   C's `1` when the message was queued and `0` when it was not (a receiver with no process is
+   the `0`: `erts_proc_lookup` finds nothing). */
+static ERL_NIF_TERM send_null(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid to;
+    (void) argc;
+    if (!enif_get_local_pid(env, argv[0], &to))
+        return enif_make_atom(env, "not_a_pid");
+    return enif_make_int(env, enif_send(env, &to, NULL, argv[1]));
+}
+
+/* The `msg_env` form: a message env built with `enif_alloc_env`, the term copied into it with
+   `enif_make_copy`, then handed to `enif_send` as its own env. */
+static ERL_NIF_TERM send_msg(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid to;
+    ErlNifEnv* menv;
+    ERL_NIF_TERM copy;
+    int sent;
+    (void) argc;
+    if (!enif_get_local_pid(env, argv[0], &to))
+        return enif_make_atom(env, "not_a_pid");
+    menv = enif_alloc_env();
+    if (menv == NULL)
+        return enif_make_atom(env, "no_msg_env");
+    copy = enif_make_copy(menv, argv[1]);
+    sent = enif_send(env, &to, menv, copy);
+    enif_free_env(menv);
+    return enif_make_int(env, sent);
+}
+
+/* ---- enif_monitor_process / the resource's `down` callback ---------------------------------- */
+
+/* The resource object the monitors are armed through, as a term. */
+static ERL_NIF_TERM mon_make(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    if (mon_type == NULL)
+        return enif_make_badarg(env);
+    if (mon_obj == NULL) {
+        mon_obj = enif_alloc_resource(mon_type, sizeof(int));
+        if (mon_obj == NULL)
+            return enif_make_badarg(env);
+        *(int*) mon_obj = 0;
+        mon_down_count = 0;
+        mon_down_seen = 0;
+        mon_down_pid = 0;
+        mon_armed_a = mon_armed_b = 0;
+    }
+    return enif_make_resource(env, mon_obj);
+}
+
+/* Arm monitor A on `Pid`: the C's `0` established, `1` no live process. */
+static ERL_NIF_TERM mon_arm(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid pid;
+    int code;
+    (void) argc;
+    if (mon_obj == NULL)
+        return enif_make_atom(env, "no_monitor_object");
+    if (!enif_get_local_pid(env, argv[0], &pid))
+        return enif_make_atom(env, "not_a_pid");
+    memset(&mon_a, 0, sizeof(mon_a));
+    mon_armed_a = 0;
+    code = enif_monitor_process(env, mon_obj, &pid, &mon_a);
+    if (code == 0) mon_armed_a = 1;
+    return enif_make_int(env, code);
+}
+
+/* A second, independent monitor on another pid (the pair `enif_compare_monitors` needs). */
+static ERL_NIF_TERM mon_arm_b(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid pid;
+    int code;
+    (void) argc;
+    if (mon_obj == NULL)
+        return enif_make_atom(env, "no_monitor_object");
+    if (!enif_get_local_pid(env, argv[0], &pid))
+        return enif_make_atom(env, "not_a_pid");
+    memset(&mon_b, 0, sizeof(mon_b));
+    mon_armed_b = 0;
+    code = enif_monitor_process(env, mon_obj, &pid, &mon_b);
+    if (code == 0) mon_armed_b = 1;
+    return enif_make_int(env, code);
+}
+
+/* `{a_with_itself, a_against_b}`: `enif_compare_monitors` is `memcmp`-style over the payload,
+   so a handle compared with itself is `0` and two distinct monitors are never equal. Only the
+   *relation* is reported — the payload bytes themselves are a representation detail. */
+static ERL_NIF_TERM mon_compare(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM terms[2];
+    (void) argc;
+    (void) argv;
+    if (!mon_armed_a || !mon_armed_b)
+        return enif_make_atom(env, "not_armed");
+    terms[0] = enif_make_int(env, enif_compare_monitors(&mon_a, &mon_a) == 0 ? 1 : 0);
+    terms[1] = enif_make_int(env, enif_compare_monitors(&mon_a, &mon_b));
+    return enif_make_tuple_from_array(env, terms, 2);
+}
+
+/* `enif_make_monitor_term` of an armed handle: is what it rebuilt a reference? */
+static ERL_NIF_TERM mon_term(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM t;
+    (void) argc;
+    (void) argv;
+    if (!mon_armed_a)
+        return enif_make_int(env, -1);
+    t = enif_make_monitor_term(env, &mon_a);
+    return enif_make_int(env, enif_is_ref(env, t) ? 1 : 0);
+}
+
+/* Cancel monitor A: the C's `0` identified and removed, `1` could not be identified. */
+static ERL_NIF_TERM mon_demonitor(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int code;
+    (void) argc;
+    (void) argv;
+    if (mon_obj == NULL)
+        return enif_make_atom(env, "no_monitor_object");
+    if (!mon_armed_a)
+        return enif_make_int(env, 1);
+    code = enif_demonitor_process(env, mon_obj, &mon_a);
+    mon_armed_a = 0;
+    return enif_make_int(env, code);
+}
+
+/* How many times the `down` callback has run. */
+static ERL_NIF_TERM mon_downs(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    return enif_make_int(env, mon_down_count);
+}
+
+/* Whether the pid `down` was handed is the pid that was armed on. */
+static ERL_NIF_TERM mon_down_pid_matches(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid pid;
+    int same;
+    (void) argc;
+    if (!enif_get_local_pid(env, argv[0], &pid))
+        return enif_make_atom(env, "not_a_pid");
+    same = (mon_down_seen && pid.pid == mon_down_pid) ? 1 : 0;
+    return enif_make_int(env, same);
+}
+
+/* ---- enif_select on a real pipe ------------------------------------------------------------- */
+
+/* A fresh pipe, a resource of the library's own type for it, and READ interest registered on
+   the read end for the calling process (`pid == NULL`). Answers the raw `enif_select` code. */
+static ERL_NIF_TERM sel_arm(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int fds[2];
+    ERL_NIF_TERM ref;
+    int code;
+    (void) argc;
+    (void) argv;
+    if (pipe(fds) != 0)
+        return enif_make_int(env, -99);
+    sel_rd = fds[0];
+    sel_wr = fds[1];
+    sel_obj = enif_alloc_resource(sel_type, sizeof(int));
+    if (sel_obj == NULL)
+        return enif_make_int(env, -98);
+    *(int*) sel_obj = 1;
+    ref = enif_make_ref(env);
+    code = enif_select(env, (ErlNifEvent) sel_rd, ERL_NIF_SELECT_READ, sel_obj, NULL, ref);
+    return enif_make_int(env, code);
+}
+
+/* Write the one byte that makes the read end readable; answers the byte count. */
+static ERL_NIF_TERM sel_poke(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ssize_t n;
+    (void) argc;
+    (void) argv;
+    if (sel_wr < 0)
+        return enif_make_int(env, -1);
+    n = write(sel_wr, "x", 1);
+    return enif_make_int(env, (int) n);
+}
+
+/* ---- the destructor of a term-exposed resource ---------------------------------------------- */
+
+/* Mint a term that holds the object's ONLY reference: alloc (1) -> make_resource (2) ->
+   release (1), so the destructor can only run once the term itself dies. */
+static ERL_NIF_TERM gc_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    void* obj;
+    ERL_NIF_TERM term;
+    (void) argc;
+    (void) argv;
+    obj = enif_alloc_resource(gc_type, 8);
+    if (obj == NULL)
+        return enif_make_badarg(env);
+    *(unsigned char*) obj = 42;
+    term = enif_make_resource(env, obj);
+    enif_release_resource(obj);
+    return term;
+}
+
+/* How many times the destructor has run. */
+static ERL_NIF_TERM gc_count(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    return enif_make_int(env, gc_dtor_runs);
+}
+
+/* ---- enif_make_map_from_arrays: the duplicate-key refusal, and its control ------------------- */
+
+/* Keys 1, 2, 1: `erts_map_from_ks_and_vs` refuses a duplicate (the C returns 0 and leaves
+   THE_NON_VALUE in the out slot) instead of collapsing it last-value-wins. */
+static ERL_NIF_TERM map_dup(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM keys[3], vals[3], map = 0;
+    (void) argc;
+    (void) argv;
+    keys[0] = enif_make_int(env, 1);
+    keys[1] = enif_make_int(env, 2);
+    keys[2] = enif_make_int(env, 1);
+    vals[0] = enif_make_int(env, 10);
+    vals[1] = enif_make_int(env, 20);
+    vals[2] = enif_make_int(env, 99);
+    return enif_make_int(env, enif_make_map_from_arrays(env, keys, vals, 3, &map));
+}
+
+/* The same shape with distinct keys: 1 when the map was built. */
+static ERL_NIF_TERM map_nodup(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM keys[3], vals[3], map = 0;
+    (void) argc;
+    (void) argv;
+    keys[0] = enif_make_int(env, 1);
+    keys[1] = enif_make_int(env, 2);
+    keys[2] = enif_make_int(env, 3);
+    vals[0] = enif_make_int(env, 10);
+    vals[1] = enif_make_int(env, 20);
+    vals[2] = enif_make_int(env, 30);
+    return enif_make_int(env, enif_make_map_from_arrays(env, keys, vals, 3, &map));
+}
+
+/* ---- enif_binary_to_term over an image with trailing bytes ---------------------------------- */
+
+/* `{consumed_bytes, decoded_int}`; the C decodes the FIRST term and reports how many bytes it
+   used, so trailing garbage is not a failure. */
+static ERL_NIF_TERM b2t_trailing(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifBinary in;
+    ERL_NIF_TERM decoded = 0, terms[2];
+    size_t used;
+    int iv = -1;
+    (void) argc;
+    if (!enif_inspect_binary(env, argv[0], &in))
+        return enif_make_atom(env, "not_a_binary");
+    used = enif_binary_to_term(env, in.data, in.size, &decoded, 0);
+    if (used == 0) {
+        terms[0] = enif_make_int(env, 0);
+        terms[1] = enif_make_atom(env, "failed");
+        return enif_make_tuple_from_array(env, terms, 2);
+    }
+    if (!enif_get_int(env, decoded, &iv)) {
+        terms[0] = enif_make_int(env, (int) used);
+        terms[1] = enif_make_atom(env, "not_an_int");
+        return enif_make_tuple_from_array(env, terms, 2);
+    }
+    terms[0] = enif_make_int(env, (int) used);
+    terms[1] = enif_make_int(env, iv);
+    return enif_make_tuple_from_array(env, terms, 2);
+}
+
 static ErlNifFunc nif_rt_funcs[] = {
     {"probe", 1, probe, 0},
     {"probe_term", 2, probe_term, 0},
@@ -917,9 +1499,25 @@ static ErlNifFunc nif_rt_funcs[] = {
     {"mk_hamt", 0, mk_hamt, 0},
     {"mk_hamt_put", 0, mk_hamt_put, 0},
     {"mk_list", 0, mk_list, 0},
-    {"self_etf", 0, self_etf, 0}
+    {"self_etf", 0, self_etf, 0},
+    {"send_null", 2, send_null, 0},
+    {"send_msg", 2, send_msg, 0},
+    {"mon_make", 0, mon_make, 0},
+    {"mon_arm", 1, mon_arm, 0},
+    {"mon_arm_b", 1, mon_arm_b, 0},
+    {"mon_compare", 0, mon_compare, 0},
+    {"mon_term", 0, mon_term, 0},
+    {"mon_demonitor", 0, mon_demonitor, 0},
+    {"mon_downs", 0, mon_downs, 0},
+    {"mon_down_pid_matches", 1, mon_down_pid_matches, 0},
+    {"sel_arm", 0, sel_arm, 0},
+    {"sel_poke", 0, sel_poke, 0},
+    {"gc_probe", 0, gc_probe, 0},
+    {"gc_count", 0, gc_count, 0},
+    {"map_dup", 0, map_dup, 0},
+    {"map_nodup", 0, map_nodup, 0},
+    {"b2t_trailing", 1, b2t_trailing, 0}
 };
-
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_rt`), so this
    library may only be loaded as `nif_rt`. */
 ERL_NIF_INIT(nif_rt, nif_rt_funcs, load, NULL, NULL, NULL)
@@ -1286,9 +1884,111 @@ pub(crate) fn group() -> Vec<Case> {
                 c_source: NIF_RT_RAISE_C,
             },
         ),
+        // === the stateful enif_* families ==================================================
+        // Each of these drives a live side effect — a message really delivered, a monitor
+        // really armed, a descriptor really registered, a destructor really run — and reduces
+        // it to one integer (`1` = the oracle's observation). Every golden is the integer the
+        // oracle prints for that selector.
+        rt_case(
+            "nif_rt/send_null_env_reaches_a_waiting_process",
+            "enif_send's `msg_env == NULL` form answers 1 and the message really reaches the target's mailbox",
+            &[16],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/send_message_env_reaches_a_waiting_process",
+            "the enif_alloc_env/enif_make_copy form of enif_send answers 1 and the message is delivered",
+            &[17],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/send_to_a_dead_pid_answers_zero",
+            "enif_send to a pid whose process has exited is the C's 0, never a fabricated delivery",
+            &[18],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/send_to_the_calling_process_is_delivered",
+            "enif_send to the process running the NIF lands in its own mailbox (the C's c_p == rp arm)",
+            &[19],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/monitor_of_a_live_process_arms",
+            "enif_monitor_process of a live pid answers 0 and no down callback has fired yet",
+            &[20],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/monitor_down_fires_once_on_the_armed_pid",
+            "the monitored process's death fires the resource's down callback exactly once, on the armed pid",
+            &[21],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/demonitor_cancels_an_armed_monitor",
+            "enif_demonitor_process answers 0 while armed and the target's later death fires no down",
+            &[22],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/monitor_handles_compare_and_rebuild",
+            "two armed monitors are established; compare_monitors equates a handle with itself and separates the two; the handle rebuilds as a ref",
+            &[23],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/monitor_of_a_dead_process_is_refused",
+            "enif_monitor_process of a pid with no process is the C's 1 and fabricates no down",
+            &[24],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/select_on_a_pipe_delivers_ready_input",
+            "enif_select registers READ interest on a pipe read end (0), delivers nothing before the write, then {select,…} with ready_input",
+            &[25],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/resource_destructor_runs_when_the_term_dies",
+            "a term-exposed resource runs its type's destructor exactly once after the term is dropped and the process parks",
+            &[26],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/map_from_arrays_refuses_duplicate_keys",
+            "enif_make_map_from_arrays refuses a duplicate key (0) while the same arrays with distinct keys build a map (1)",
+            &[27],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/binary_to_term_reports_the_consumed_bytes",
+            "enif_binary_to_term decodes the first term of an image with trailing bytes and reports the consumed byte count (3) and the value (42)",
+            &[28],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/term_to_binary_of_a_local_fun_is_new_fun_ext",
+            "enif_term_to_binary of a closure emits the NEW_FUN_EXT image with the closure's module and arity, byte-identical to term_to_binary/1",
+            &[29],
+            "1",
+            NIF_RT,
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the A.3 end-to-end group: every case is a module-run case claiming

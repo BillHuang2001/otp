@@ -36,6 +36,13 @@
 //! `exit_status`/`eof`/`stream`/`{cd,_}` options. Every case here `agree`s; the port-*opening*
 //! error shapes the runtime must reject are pinned by the sibling [`super::driver_ports`] group.
 //!
+//! The port's **teardown payloads** are pinned too: a `spawn_executable` child that closes both
+//! its fds and *then* exits releases the pending no-EOL line as one `{data,{noeol,_}}` message
+//! beside the `{exit_status,0}`, and `driver/spawn_executable_close_both_fds_flushes_the_frame_and_exit_status`
+//! pins that pair as an order-free set — which of the two reaches the mailbox first is *not* a
+//! stable observable (the oracle always emits the exit status first, the Rust runtime sometimes
+//! the flush), so the order is a ledger entry, not a golden.
+//!
 //! The port's **identity and lifetime** surface is pinned by the `driver/port_*` /
 //! `driver/register_*` / `driver/spawn_driver_refused_*` cases: `open_port({spawn_driver, N}, _)`
 //! resolves exactly the statically linked names (`tcp_inet`/`udp_inet`/`ram_file_drv` open, a
@@ -1311,6 +1318,30 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "driver/spawn_executable_close_both_fds_flushes_the_frame_and_exit_status",
+            description: "a spawn_executable child that closes both its fds and then exits delivers exactly the pending no-EOL frame ({data,{noeol,<<\"abc\">>}}) and the exit status ({exit_status,0}) — the two payloads pinned as an order-free set, because their mailbox order is a race",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The child writes `abc`, closes stdout *and* stderr, then sleeps a second before
+                // exiting, so the write end is already gone when the port is torn down and the
+                // partial line is released on that teardown path — the flush and the exit status
+                // are produced by the same event. Which of the two lands in the mailbox first is
+                // **not** pinned: the oracle consistently emits the exit status first, while the
+                // Rust runtime emits either order (measured: 1 run in 5 the other way), so the
+                // two messages are compared through `lists:sort/1` — the *set* is exact, the
+                // order is left to the ledger (§A.4, "the spawn_executable close-both-fds
+                // ordering").
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,line,exit_status,{args,[\"-c\",\"printf abc; exec 1>&- 2>&-; sleep 1\"]}]), M1 = receive {P,D1} -> D1 after 3000 -> t1 end, M2 = receive {P,D2} -> D2 after 3000 -> t2 end, lists:sort([M1,M2]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                // `~w` of the sorted pair: the frame, then the exit status.
+                stdout: Some("ok [{data,{noeol,<<97,98,99>>}},{exit_status,0}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "driver/spawn_driver_refused_names_are_badarg",
             description: "open_port/2 resolves exactly the statically linked spawn_driver names: the three builtins open, efile and fd raise error:badarg",
             contracts: &[Contract::DriverAbi],
@@ -1738,6 +1769,32 @@ mod tests {
         assert_eq!(zero.golden.stdout, Some("ok <<131,97,0>>"));
         let nonzero = find_case("driver/exit_status_option_nonzero").expect("case present");
         assert_eq!(nonzero.golden.stdout, Some("ok <<131,97,1>>"));
+    }
+
+    /// The close-both-fds teardown case pins the *pair* of delivered messages — the pending
+    /// no-EOL frame beside the exit status — and deliberately not their mailbox order (which is
+    /// a race in the runtime), so the expression sorts before answering and the golden is the
+    /// oracle's sorted line.
+    #[test]
+    fn the_close_both_fds_teardown_case_pins_an_order_free_pair() {
+        let case =
+            find_case("driver/spawn_executable_close_both_fds_flushes_the_frame_and_exit_status")
+                .expect("case present");
+        assert_eq!(case.contracts, &[Contract::DriverAbi], "contract");
+        let CaseKind::Eval { expr, probe, .. } = case.kind else {
+            panic!("the teardown case must be a plain eval case");
+        };
+        assert_eq!(probe, Probe::Value, "probe");
+        assert!(
+            expr.contains("lists:sort([M1,M2])"),
+            "the two teardown messages must be compared order-free"
+        );
+        assert_eq!(
+            case.golden.stdout,
+            Some("ok [{data,{noeol,<<97,98,99>>}},{exit_status,0}]"),
+            "the oracle's sorted teardown pair"
+        );
+        assert_eq!(case.golden.exit_code, 0);
     }
 
     /// A case the oracle answers with an exception must carry that `exception …` line and

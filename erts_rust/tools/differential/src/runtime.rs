@@ -64,7 +64,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
@@ -623,15 +623,34 @@ const SPAWN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(
 /// total wait (155 ms) comfortably outlasts a writer held open by a concurrent `fork()`
 /// under parallel test load while staying bounded.
 pub(crate) fn output_with_retry(cmd: &mut Command) -> std::io::Result<std::process::Output> {
-    let mut attempt = 1;
+    retry_transient(|| cmd.output())
+}
+
+/// Spawn `cmd` (without waiting for it), retrying **only** the transient `ETXTBSY` race — the
+/// same bounded policy [`output_with_retry`] applies to a collected run.
+///
+/// A peer leg is spawned long enough before its first output that a transiently busy program
+/// would otherwise turn a healthy two-VM case into a skip; the retry is bounded and every
+/// other error is returned unchanged, exactly like [`output_with_retry`].
+fn spawn_with_retry(cmd: &mut Command) -> std::io::Result<Child> {
+    retry_transient(|| cmd.spawn())
+}
+
+/// Run `attempt` until it succeeds, retrying **only** a transient `ETXTBSY` (see
+/// [`output_with_retry`]) with a bounded, doubling backoff; every other error, and an
+/// `ETXTBSY` that survives all [`SPAWN_ATTEMPTS`] attempts, is returned unchanged.
+fn retry_transient<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut tries = 1;
     let mut backoff = SPAWN_BACKOFF;
     loop {
-        match cmd.output() {
-            Ok(output) => return Ok(output),
-            Err(err) if attempt < SPAWN_ATTEMPTS && is_transient_text_file_busy(&err) => {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) if tries < SPAWN_ATTEMPTS && is_transient_text_file_busy(&err) => {
                 std::thread::sleep(backoff);
                 backoff = backoff.saturating_mul(2).min(SPAWN_BACKOFF_MAX);
-                attempt += 1;
+                tries += 1;
             }
             Err(err) => return Err(err),
         }
@@ -726,6 +745,284 @@ pub fn own_env(env: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// How long a two-VM case's **peer leg** may take to print its ready line.
+///
+/// It is generous (a peer is a whole runtime boot) but **bounded**: the wait is what keeps a
+/// broken peer from hanging the suite, so it must never be unbounded.
+pub const PEER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the bounded ready wait re-reads the peer's stdout.
+const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How much of a failed peer's captured output is kept in the skip reason.
+const PEER_DETAIL_MAX: usize = 2000;
+
+/// The outcome of starting one side's **peer leg** (see [`crate::corpus::PeerRun`]).
+#[derive(Debug)]
+pub enum PeerStart {
+    /// The peer is up: it printed its ready line, and it is killed + reaped when the returned
+    /// [`PeerProcess`] is dropped.
+    Ready(PeerProcess),
+    /// The peer never became ready. This is a **loud skip reason** — never a pass, never
+    /// agreement — carrying what the peer printed and why the wait ended.
+    NotReady(String),
+}
+
+/// One side's running **peer leg**: a second process of that side's own runtime.
+///
+/// The peer exists only for the duration of the side's own run: dropping this value kills and
+/// reaps it (and removes its scratch directory), so **every** path — including an error or a
+/// panic in the caller — leaves no stray VM behind. Each peer is started in its **own process
+/// group** (an Erlang VM signals its own process group) so it can never signal the harness.
+#[derive(Debug)]
+pub struct PeerProcess {
+    child: Child,
+    /// The scratch directory holding the peer's captured stdout/stderr (removed on drop).
+    dir: PathBuf,
+    /// The ready line the peer printed (kept for diagnostics and tests).
+    ready_line: String,
+}
+
+impl PeerProcess {
+    /// The peer's process id (diagnostics; the harness itself never needs it).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The stdout line the peer printed to announce that it is up.
+    pub fn ready_line(&self) -> &str {
+        &self.ready_line
+    }
+}
+
+impl Drop for PeerProcess {
+    fn drop(&mut self) {
+        // A peer that already exited (it halts itself in the normal flow) is only reaped;
+        // one that is still running is killed first. Either way the directory goes away.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Start `spec.program` with `argv` as one side's **peer leg** and wait, **bounded** by
+/// `timeout`, for it to print a line starting with `ready_prefix`.
+///
+/// The peer runs in its own process group with its stdin closed and its stdout/stderr
+/// redirected to files in a private scratch directory: readiness is *polled* from the file, so
+/// nothing in this path can block (no reader thread has to outlive the case), and the peer's
+/// own output never reaches the harness's stdout/stderr. A peer that exits before it is ready,
+/// or that is still silent when the timeout expires, yields [`PeerStart::NotReady`] naming the
+/// argv, what it printed and how the wait ended — a loud skip, never a fabricated pass.
+pub fn spawn_peer(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    ready_prefix: &str,
+    timeout: std::time::Duration,
+) -> PeerStart {
+    let dir = match peer_scratch_dir() {
+        Ok(dir) => dir,
+        Err(reason) => return PeerStart::NotReady(reason),
+    };
+    let stdout_path = dir.join("stdout");
+    let stderr_path = dir.join("stderr");
+    let mut child = match start_peer_child(spec, argv, &stdout_path, &stderr_path) {
+        Ok(child) => child,
+        Err(reason) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return PeerStart::NotReady(reason);
+        }
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(line) = ready_line_in(&stdout_path, ready_prefix) {
+            return PeerStart::Ready(PeerProcess {
+                child,
+                dir,
+                ready_line: line,
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let situation = format!(
+                    "exited ({}) before printing its ready line ('{ready_prefix}')",
+                    exit_description(&status)
+                );
+                return abandon_peer(&mut child, &dir, &peer_skip_reason(spec, argv, &situation, &stdout_path, &stderr_path));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let situation = format!("could not be polled: {err}");
+                return abandon_peer(&mut child, &dir, &peer_skip_reason(spec, argv, &situation, &stdout_path, &stderr_path));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let situation = format!(
+                "printed no ready line ('{ready_prefix}') within {} ms",
+                timeout.as_millis()
+            );
+            return abandon_peer(&mut child, &dir, &peer_skip_reason(spec, argv, &situation, &stdout_path, &stderr_path));
+        }
+        std::thread::sleep(PEER_POLL);
+    }
+}
+
+/// A per-invocation unique suffix for the node names of a two-VM case's peer leg.
+///
+/// `epmd`'s name space is **machine-global** and shared with every other VM on the host —
+/// including other worktrees and the 16-way parallel corpus sweep — so a corpus case must
+/// never use a fixed node name. The suffix folds in a short hash of the case id (so the names
+/// are recognisable in `epmd -names`), the process id and a process-wide counter (so two runs
+/// *in the same process* differ), and the side (the oracle and the Rust leg of one case get
+/// different names, so a name is never reused before its previous owner has unregistered).
+///
+/// The result is lowercase alphanumeric only, which `-sname` (and an Erlang atom in a `-eval`
+/// expression) requires.
+pub fn peer_nonce(case_id: &str, side: RuntimeId) -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tag = match side {
+        RuntimeId::Oracle => 'o',
+        RuntimeId::Rust => 'r',
+    };
+    format!(
+        "{}{:x}{:x}{tag}",
+        case_id_tag(case_id),
+        std::process::id(),
+        seq
+    )
+}
+
+/// A fixed-width lowercase-hex tag derived from a case id (the readable part of [`peer_nonce`]).
+fn case_id_tag(case_id: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in case_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:06x}", hash & 0x00ff_ffff)
+}
+
+/// Create the private scratch directory of one peer leg.
+fn peer_scratch_dir() -> std::result::Result<PathBuf, String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "differential-peer-{}-{seq}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "cannot create the peer leg's scratch directory '{}': {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Spawn the peer child with its stdin closed and its stdout/stderr going to `stdout_path`
+/// and `stderr_path`.
+fn start_peer_child(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::result::Result<Child, String> {
+    let reason = |what: &str, err: &dyn std::fmt::Display| {
+        format!(
+            "cannot start the peer leg of the {} runtime '{}' with argv {:?}: {what}: {err}",
+            spec.id.id(),
+            spec.program.display(),
+            argv
+        )
+    };
+    let stdout = std::fs::File::create(stdout_path)
+        .map_err(|err| reason(&format!("cannot create '{}'", stdout_path.display()), &err))?;
+    let stderr = std::fs::File::create(stderr_path)
+        .map_err(|err| reason(&format!("cannot create '{}'", stderr_path.display()), &err))?;
+
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    // An Erlang VM signals its own **process group** (SIGUSR1 for the break handler, and
+    // `erl_child_setup` on the way down), so the peer gets a group of its own: it can never
+    // signal the harness or a sibling case.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    spawn_with_retry(&mut cmd).map_err(|err| reason("spawn failed", &err))
+}
+
+/// Kill and reap a peer that will not be used, remove its scratch directory, and answer the
+/// loud skip reason. Used on every failed [`spawn_peer`] path, so no stray VM is left behind.
+fn abandon_peer(child: &mut Child, dir: &Path, reason: &str) -> PeerStart {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(dir);
+    PeerStart::NotReady(reason.to_string())
+}
+
+/// The loud skip reason for a peer leg that never became ready.
+fn peer_skip_reason(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    situation: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> String {
+    format!(
+        "the peer leg of the {} runtime '{}' {situation}; argv {:?}; peer stdout {:?}; peer \
+         stderr {:?}",
+        spec.id.id(),
+        spec.program.display(),
+        argv,
+        captured_tail(stdout_path),
+        captured_tail(stderr_path),
+    )
+}
+
+/// The tail of a captured peer stream, for a skip reason (never fabricated: a missing or
+/// unreadable file is reported as such).
+fn captured_tail(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            tail(text.trim_end(), PEER_DETAIL_MAX).to_string()
+        }
+        Err(err) => format!("<unreadable: {err}>"),
+    }
+}
+
+/// The first **complete** line of `path` that starts with `prefix`.
+///
+/// Only newline-terminated lines are considered: a peer that is mid-write must not satisfy the
+/// prefix with half a line (readiness has to be a whole line the peer really printed).
+fn ready_line_in(path: &Path, prefix: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let complete = text.rsplit_once('\n')?.0;
+    complete
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .map(str::to_string)
+}
+
+/// The exit status of a peer, as it goes into a skip reason.
+fn exit_description(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit status {code}"),
+        None => "a signal".to_string(),
+    }
+}
+
 /// The file names tried when scanning `$PATH` for the oracle.
 fn oracle_program_names() -> &'static [&'static str] {
     #[cfg(windows)]
@@ -780,14 +1077,16 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry, own_env,
-        resolve_helper_from, resolve_oracle_from, resolve_rust_from, run, run_with_env, RuntimeId,
-        RuntimeSource, RuntimeSpec,
+        case_id_tag, eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry,
+        own_env, peer_nonce, ready_line_in, resolve_helper_from, resolve_oracle_from,
+        resolve_rust_from, run, run_with_env, spawn_peer, PeerStart, RuntimeId, RuntimeSource,
+        RuntimeSpec,
     };
     use crate::error::Error;
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
     /// A scratch directory that removes itself when dropped.
     struct Scratch {
@@ -1285,5 +1584,212 @@ mod tests {
         let _ = super::resolve_oracle();
         let _ = super::resolve_rust();
         assert!(Path::new(env!("CARGO_MANIFEST_DIR")).is_dir());
+    }
+
+    /// A `sh` runtime spec: the portable way to drive a peer leg without a whole Erlang VM.
+    fn sh_spec() -> RuntimeSpec {
+        RuntimeSpec {
+            id: RuntimeId::Rust,
+            program: PathBuf::from("sh"),
+            source: RuntimeSource::Path,
+        }
+    }
+
+    #[test]
+    fn case_id_tag_is_a_stable_six_char_lowercase_hex_tag() {
+        let tag = case_id_tag("dist/live_self_pair_handshake_and_message");
+        assert_eq!(tag.len(), 6, "fixed width keeps the node names short: {tag}");
+        assert!(
+            tag.chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)),
+            "lowercase hex only (a `-sname` name and an atom must accept it): {tag}"
+        );
+        assert_eq!(
+            tag,
+            case_id_tag("dist/live_self_pair_handshake_and_message"),
+            "the tag is a pure function of the case id, so the names are recognisable"
+        );
+        assert_ne!(
+            tag,
+            case_id_tag("dist/live_handshake_ping"),
+            "different cases must get different tags"
+        );
+    }
+
+    #[test]
+    fn peer_nonce_is_lowercase_alnum_and_unique_per_side_and_invocation() {
+        let case_id = "dist/live_self_pair_handshake_and_message";
+        let oracle = peer_nonce(case_id, RuntimeId::Oracle);
+        let rust = peer_nonce(case_id, RuntimeId::Rust);
+        let oracle_again = peer_nonce(case_id, RuntimeId::Oracle);
+        assert!(
+            oracle
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()),
+            "`-sname` and a bare atom accept only lowercase alphanumerics: {oracle}"
+        );
+        assert!(
+            oracle.starts_with(&case_id_tag(case_id)),
+            "the readable part identifies the case: {oracle}"
+        );
+        assert!(
+            oracle.ends_with('o') && rust.ends_with('r'),
+            "the two legs must never share a name: {oracle} vs {rust}"
+        );
+        assert_ne!(oracle, rust, "a side's names must differ");
+        assert_ne!(
+            oracle, oracle_again,
+            "each invocation must be unique: epmd names are machine-global"
+        );
+    }
+
+    #[test]
+    fn ready_line_in_only_counts_a_complete_matching_line() {
+        let dir = Scratch::new("ready-line");
+        let stdout = dir.dir.join("peer-stdout");
+        // A half-written line must never satisfy readiness.
+        std::fs::write(&stdout, b"PEER-READY").expect("write a partial line");
+        assert_eq!(ready_line_in(&stdout, "PEER-READY"), None);
+        std::fs::write(&stdout, b"PEER-READY now\n").expect("write a full line");
+        assert_eq!(
+            ready_line_in(&stdout, "PEER-READY"),
+            Some("PEER-READY now".to_string())
+        );
+        // The first matching complete line wins, noise before it is ignored …
+        std::fs::write(&stdout, b"noise\nPEER-READY second\nmore\n").expect("write three lines");
+        assert_eq!(
+            ready_line_in(&stdout, "PEER-READY"),
+            Some("PEER-READY second".to_string())
+        );
+        // … and a complete-but-different line is not readiness.
+        std::fs::write(&stdout, b"BOOTED\n").expect("write another line");
+        assert_eq!(ready_line_in(&stdout, "PEER-READY"), None);
+        // A missing stream is simply "not ready" — never a fabricated line.
+        assert_eq!(ready_line_in(&dir.dir.join("absent"), "PEER-READY"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_peer_accepts_a_ready_peer_and_reaps_it_on_drop() {
+        let spec = sh_spec();
+        let argv = vec![
+            "-c".to_string(),
+            String::from("echo 'PEER-READY one two'; sleep 30"),
+        ];
+        let peer = match spawn_peer(&spec, &argv, "PEER-READY", Duration::from_secs(20)) {
+            PeerStart::Ready(peer) => peer,
+            PeerStart::NotReady(reason) => panic!("the peer must become ready: {reason}"),
+        };
+        assert_eq!(peer.ready_line(), "PEER-READY one two");
+        assert!(peer.pid() > 0, "the peer is a real child process");
+        // Dropping kills + reaps: it must return promptly rather than block on the peer's
+        // 30 s sleep. (The peer's own process group keeps that signal off the harness.)
+        let started = std::time::Instant::now();
+        drop(peer);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "drop must not wait for the peer to finish on its own"
+        );
+    }
+
+    /// A peer that outlived its usefulness — one that has already exited on its own — is left
+    /// as an unreaped zombie until [`PeerProcess::drop`] collects it. `/proc` makes both halves
+    /// observable: the zombie's entry exists before the drop and is gone after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_an_exited_peer_reaps_it_instead_of_leaving_a_zombie() {
+        let spec = sh_spec();
+        let argv = vec![
+            "-c".to_string(),
+            String::from("echo PEER-READY; sleep 0.2; exit 7"),
+        ];
+        let peer = match spawn_peer(&spec, &argv, "PEER-READY", Duration::from_secs(20)) {
+            PeerStart::Ready(peer) => peer,
+            PeerStart::NotReady(reason) => panic!("the peer must become ready: {reason}"),
+        };
+        let entry = PathBuf::from(format!("/proc/{}", peer.pid()));
+        // The script exits 0.2 s after it announced itself; the child is not waited on in
+        // between, so its process entry survives as a zombie.
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(
+            entry.exists(),
+            "an unreaped child must still have a /proc entry: {}",
+            entry.display()
+        );
+        drop(peer);
+        assert!(
+            !entry.exists(),
+            "drop must reap the peer, not leave a zombie: {}",
+            entry.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_peer_reports_a_silent_peer_as_not_ready_and_kills_it() {
+        let spec = sh_spec();
+        let argv = vec!["-c".to_string(), String::from("sleep 30")];
+        let started = std::time::Instant::now();
+        let reason = match spawn_peer(&spec, &argv, "PEER-READY", Duration::from_millis(250)) {
+            PeerStart::Ready(peer) => panic!("a silent peer must never be ready: {peer:?}"),
+            PeerStart::NotReady(reason) => reason,
+        };
+        assert!(
+            reason.contains("printed no ready line ('PEER-READY')"),
+            "the reason must name the wait that expired: {reason}"
+        );
+        assert!(
+            reason.contains("sleep 30"),
+            "the reason must name the peer's argv: {reason}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the ready wait is bounded, so a broken peer cannot hang the suite"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_peer_reports_an_early_exit_as_not_ready() {
+        let spec = sh_spec();
+        let argv = vec![
+            "-c".to_string(),
+            String::from("echo 'not the prefix'; exit 3"),
+        ];
+        let reason = match spawn_peer(&spec, &argv, "PEER-READY", Duration::from_secs(20)) {
+            PeerStart::Ready(peer) => {
+                panic!("a peer that exits before its ready line must never be ready: {peer:?}")
+            }
+            PeerStart::NotReady(reason) => reason,
+        };
+        assert!(
+            reason.contains("exited (exit status 3) before printing its ready line"),
+            "the reason must report the early exit: {reason}"
+        );
+        assert!(
+            reason.contains("not the prefix"),
+            "the peer's own output must be quoted, not fabricated: {reason}"
+        );
+    }
+
+    #[test]
+    fn spawn_peer_reports_an_unspawnable_program_as_not_ready() {
+        let spec = RuntimeSpec {
+            id: RuntimeId::Rust,
+            program: PathBuf::from("/nonexistent/differential-peer-program"),
+            source: RuntimeSource::Path,
+        };
+        let reason = match spawn_peer(&spec, &[], "PEER-READY", Duration::from_secs(5)) {
+            PeerStart::Ready(peer) => panic!("a missing program cannot be ready: {peer:?}"),
+            PeerStart::NotReady(reason) => reason,
+        };
+        assert!(
+            reason.contains("spawn failed"),
+            "the reason must report the spawn failure: {reason}"
+        );
+        assert!(
+            reason.contains("/nonexistent/differential-peer-program"),
+            "the reason must name the program: {reason}"
+        );
     }
 }

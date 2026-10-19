@@ -40,16 +40,17 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   module identity): a wrong-**module** call the oracle refuses with `1` the Rust name match accepts
   with `0`. The `nif_extra` widening therefore passes the **matching** module atom; a wrong-module
   probe would be a `mismatch`.
-- `enif_monitor_process(env, res, pid, &mon)` with a **live** pid creates a real monitor in the
-  oracle (`0`, the monitor stored) while the Rust runtime answers `1` unless a host installs the
-  `monitor_process` hook, which `beam_rt` does not (`crates/beam_rt/src/nif.rs`). Only the
-  `enif_set_pid_undefined` target — which both answer `MONITOR_TARGET_DEAD` — is pinned.
 - `enif_thread_name(tid)` for the **scheduler** thread answers `"unknown"` in the oracle
   (`dtid->name == NULL` ⇒ the no-name form) but `NULL` in the Rust runtime; telling that apart from a
   NIF-created unnamed thread needs a longer-running aux thread, so neither shape is pinned.
 - `enif_term_size` of an **off-heap/refc** binary (above `ERL_ONHEAP_BINARY_LIMIT`) reports the 8-word
   refc pair in the oracle and the runtime's own counted size in the Rust implementation
   (`crates/beam_abi/src/nif/enif/mem.rs`); only on-heap sizes are pinned.
+- `enif_term_size` of a **reference** reports `24` bytes in the oracle (the C's `ErtsORefThing`,
+  three words) and `32` in the Rust runtime (a four-word internal-ref block); the 1-tuple control
+  term agrees at `16`, so only the ref block's size differs. A plain-integer difference, so a case
+  pinning it would be a `mismatch`; only `enif_is_ref/1` is pinned. Owner: `beam_abi`
+  (`crates/beam_abi/src/nif/enif/resources.rs`) / the internal-ref block in `beam_term`.
 - `enif_free_iovec` is a **probe hazard**: the only safe shape needs the *internal*
   `ERL_NIF_IOVEC_FLAGS_PREALLOC` (absent from the public `erl_nif.h`), and the freeing form of an
   env-attached vector is UB on the oracle — deliberately not pinned.
@@ -59,15 +60,22 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,
   `crates/beam_abi/src/driver/drv/lifecycle.rs`); even with the hook installed the value is
   pointer-derived, so no equality is pinnable. Owner: `crates/beam_rt` (`DriverHost::async_port_key`).
-- `erl_drv_set_os_pid/2`, `erl_drv_init_ack/2` and `driver_async/5` keep the `DriverHost` trait
-  defaults in the Rust runtime (no busy-port OS-pid record, no init ack, no async pool), so the code
-  they answer with is the trait's rather than the oracle's; none has a corpus case. The driver's own
-  **port-closing** family (`driver_failure`, `driver_failure_atom`/`_posix`/`_eof`, `driver_exit/2`)
-  is **not** in this list: both runtimes close the port and deliver the reason, and it is pinned by
-  the `driver_c` selectors `40`-`47` — each reason to a trapping owner (`driver_failure(P,0)`'s
-  `normal`, the C's eof flag, not reason `0`), `driver_exit/2`'s silent close, the `'DOWN'` a port
-  monitor sees, and the post-failure `port_info`/`port_close` refusals. Owner: `crates/beam_rt` /
-  `crates/beam_io`.
+- `erl_drv_init_ack/2` keeps the `DriverHost` trait default in the Rust runtime and has **no
+  observable at all**: it only acts on a port whose `start` callback answered
+  `ERL_DRV_ERROR_WAIT`, so there is no stable single-line shape to pin. Owner: `crates/beam_rt`.
+  The driver's own **port-closing** family (`driver_failure`, `driver_failure_atom`/`_posix`/`_eof`,
+  `driver_exit/2`) is **not** in this list: both runtimes close the port and deliver the reason, and
+  it is pinned by the `driver_c` selectors `40`-`47` — each reason to a trapping owner
+  (`driver_failure(P,0)`'s `normal`, the C's eof flag, not reason `0`), `driver_exit/2`'s silent
+  close, the `'DOWN'` a port monitor sees, and the post-failure `port_info`/`port_close` refusals.
+  Nor are `erl_drv_set_os_pid/2` (selector `72`) or the `driver_async/5` pool (selectors `70`/`71`),
+  which are pinned end to end. Owner: `crates/beam_rt` / `crates/beam_io`.
+- **`+A 0`**: the oracle **clamps** its async thread pool to one thread, so its `driver_async/5`
+  still queues a job (a positive id, measured `1`); `beam_rt` honours a genuine zero-thread pool
+  (job id `0`, with `async_invoke` still running and `ready_async` still firing). Behaviourally
+  identical apart from the return code, and the positive-id branch is unreachable on the oracle, so
+  the shape stays unpinned (`system_info(thread_pool_size)` answers `1` on **both** sides under the
+  switch). Owner: `beam_rt`.
 - `driver_dl_open` + `driver_dl_close` round trip is an **oracle-side hazard** — the system `erl`
   core-dumps on the close (the refusal half is pinned by the `driver_abi` selector 49), so the round
   trip is deliberately not pinned (a harness artifact, never a runtime difference).
@@ -95,13 +103,9 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   delivery family (`driver_abi` selectors `130..137`, images of `{7,42}`, `{ok,7}` and
   `{<<1,2,3>>,5}`; the delivered message is the term itself, never a `{Port, Term}` wrapper,
   `io.c:6162-6176`).
-- **`driver_async/5` schedules nothing.** Measured: the C's `driver_async(port, &key, invoke,
-  data, free)` answers a positive handle (oracle `1`, the queued job's id) and later runs
-  `async_invoke`; the Rust runtime keeps the [`beam_abi::DriverHost`] default and answers `-1`.
-  A case observing the handle is a plain-value `mismatch` (oracle `49` vs rust `11569`), so the
-  scheduler family stays unpinned. Owner: `beam_rt` / `beam_io`.
-- `erl_drv_monotonic_time/1` differs by **absolute phase** (oracle non-positive `0`, rust `1`);
-  the phase-free properties (monotonicity, unit conversions) agree and are pinned.
+- `erl_drv_monotonic_time/1` differs by **absolute phase** (a non-positive `0` in the oracle, a
+  positive value in the rust runtime); the phase-free properties (monotonicity, unit conversions)
+  agree and are pinned.
 - `erl_drv_time_offset/1` differs (oracle a non-zero offset, rust `0`).
 - An `ErlDrvTerm` `ERL_DRV_LIST N` spec differs: `INT 1, INT 2, INT 3, LIST 3` is the
   **improper** list `[1,2|3]` in the oracle (the last popped word is the tail) but the proper
@@ -114,23 +118,18 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   block.
 - `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the `driver_pdl_*` family stays unpinned
   (the PDL calls themselves succeed in both).
-- `driver_async_port_key/1` → oracle `3`, rust `0`; `erl_drv_consume_timeslice/2` → oracle
-  `1`/`1`, rust `0`/`0`.
-- `erl_drv_busy_msgq_limits` writes the handle in the rust runtime instead of leaving the
-  bounds; `erl_drv_getenv` sets `size` on an absent key in the rust runtime;
-  `driver_dl_error()`'s message length differs (33 vs 25); `driver_dl_open(NULL)` +
-  `driver_dl_sym` SIGSEGVs the oracle.
+- `driver_async_port_key/1` → oracle `3`, rust `0`; `erl_drv_consume_timeslice/2` → oracle `0` then
+  `1` (percent `1` then `100`), rust `0`/`0`.
+- `erl_drv_busy_msgq_limits` leaves the caller's bounds untouched in the oracle (measured `111`/`222`
+  before and after) and writes `SIZE_MAX` into both in the rust runtime; `erl_drv_getenv` on an
+  **absent** key answers `-1` and leaves `*size` at `capacity-1` (`63` for a 64-byte buffer) in the
+  oracle while the rust runtime answers `-1` and leaves `*size` at the capacity (`64`) — the
+  **present**-key round trip agrees (`put=0 present=0 size=3 val=abc` on both) and is pinned by
+  `driver_c/erl_drv_putenv_and_getenv_round_trip_inside_the_driver`; `driver_dl_error()` with no
+  prior failed `driver_dl_open` is a 33-byte message in the oracle and `NULL` in the rust runtime;
+  `driver_dl_open(NULL)` + `driver_dl_sym` SIGSEGVs the oracle.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
-- A `[compressed]` image is byte-identical only for a term whose image compresses to a single
-  stored block (e.g. `term_to_binary({ok,42}, [compressed])` matches exactly); beyond that the
-  framing (`131,80`), the 32-bit uncompressed size and the trailing Adler-32 still match but the
-  zlib deflate middle differs (measured for a larger term, `lists:seq(1,1000)`: oracle 1827 vs
-  rust 1802 bytes). Only `binary_to_term(term_to_binary(T, [compressed])) =:= T` round trips are
-  pinned.
-- The `[used]` byte count of `binary_to_term/2` on a `[compressed]` image differs —
-  a consequence of the differing zlib bodies above (the compressed image's size is not
-  byte-stable, so it is unpinnable; only the round trip is pinned).
 - A **multi-key atom-keyed** small map has **no pinnable interior order**. The Rust runtime
   keeps the map's construction order — both `term_to_binary(#{a => 1, b => 2})` and
   `term_to_binary(#{b => 2, a => 1})` emit the two keys in source order — while the oracle's
@@ -261,39 +260,18 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   where the oracle refuses it.
 
 ## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
-- **`port_command/2` on a socket-less inet port — measured and unpinnable, not a divergence.**
-  The oracle answers `true` and the port then dies via `driver_failure_posix(EINVAL)` (a following
-  `port_info(P,name)` is `undefined`, `port_close/1` raises `badarg`); with a caller-ref prefix
-  (`<<0,0,"hi">>`) the oracle still answers `true`, the port survives and no `{error,enotconn}`
-  ever arrives (a 500 ms receive times out). `beam_rt` raises `badarg` (`{'EXIT',{badarg,[]}}`) and
-  leaves the port alive. Neither the return value, the port's survival nor the reason is a stable
-  observable on both sides, so the shape is deliberately unpinned (a case would be a committed
-  `mismatch`). The related refusal that *does* agree is pinned (`udp/port_command_on_a_closed_port_is_badarg`).
-  Owner: `beam_rt` / `beam_io`.
 - **`port_info(P, memory)` after `port_set_data/2`**: the item agrees on a plain port
-  (`{memory, N}`), but the word count differs once a term is stored on it (oracle `136` vs rust
-  `120`) — an accounting residual, so only the plain-port item and the
-  `port_set_data/2`/`port_get_data/1` round trip (which returns `true`, not `ok`) are pinned.
-  Owner: `beam_rt`.
+  (`{memory,48}` on both), but the word count differs once a term is stored on it (`{memory,160}` in
+  the oracle against `{memory,120}` in the runtime for a 3-element list) — an accounting residual, so
+  only the plain-port item and the `port_set_data/2`/`port_get_data/1` round trip (which returns
+  `true`, not `ok`) are pinned. Owner: `beam_rt`.
 - **`port_connect/2` to another process only half-lands**: `erlang:port_connect(P, Other)` itself
   agrees (`port_info(P,connected)` is `{connected,Other}` on both), but once **`Other` has exited**
   the oracle kills the port — `port_info(P)` and every item are `undefined`, `port_close/1` raises
-  `badarg` — while `beam_rt` still reports the stale `{connected,Pid}` and closes normally. Only the
-  `port_connect(P, self())` forms are pinned (`driver/port_connect_answers_true`,
+  `badarg` (measured: `{true,undefined,{'EXIT',{badarg,…}}}`) — while `beam_rt` still reports the
+  stale `{connected,Pid}` and closes normally (`{true,[{name,"cat"},…,{connected,Pid},…],true}`).
+  Only the `port_connect(P, self())` forms are pinned (`driver/port_connect_answers_true`,
   `driver/erts_internal_port_connect_answers_true`). Owner: `beam_rt`.
-- **`gen_tcp:send/2` blocks** (owner `beam_rt`, the `tcp_inet` send path's reply wait): on a
-  **listening** socket the oracle answers `{error,enotconn}` and on a **connected** one `ok`, while
-  both shapes make the Rust runtime report
-  `beam_rt: unsupported: opcode: run: process blocked (no message available)`. A raw caller-tagged
-  `erlang:port_command/2` on that same connected port answers `{inet_reply,Port,ok,Tag}` on **both**
-  sides, so the bytes and the tagged reply shape are in place and the blocked wait is in the
-  stdlib send path above it.
-- **A datagram injected from outside the VM is never delivered** (owner `beam_rt` / `beam_io`): a
-  `gen_udp` socket opened `[binary,{active,true}]` on a fixed port answers `timeout` to a 3 s receive
-  where the oracle delivers `{udp, S, {127,0,0,1}, FromPort, <<"abc">>}` (measured with the datagram
-  sent from a separate OS process). The **in-VM** loopback pair agrees — `gen_udp:send/4` to the
-  socket's own port then `gen_udp:recv/3` returns `{ok, <<"hi">>}` on both sides — so the write path
-  and the `inet_reply` bridge are in place and the missing half is the external read path.
 - The `{fd,…}` port grammar is disjoint: `open_port({fd,1,1},[out])` opens under the oracle and is
   `error:badarg` under `beam_rt`, `open_port({fd,1},[out])` the reverse (measured:
   `{port,{exit,badarg}}` on the oracle against `{{exit,badarg},port}` on the runtime). `eof` is never
@@ -319,8 +297,27 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   - the **`spawn_executable`** path: a child that closes both fds before sleeping
     (`{spawn_executable,"/bin/sh"}` + `{args,["-c","printf abc; exec 1>&- 2>&-; sleep 1"]}`,
     `[binary,line,exit_status]`) ⇒ oracle `[{exit_status,0},{data,{noeol,<<"abc">>}}]` vs Rust
-    `[{data,{noeol,<<"abc">>}},{exit_status,0}]` (the flush leads). The same command under
-    `{spawn, …}` agrees, so it is confined to `spawn_executable`.
+    `[{data,{noeol,<<"abc">>}},{exit_status,0}]` (the flush leads). **It is a race, not a fixed
+    order**: the oracle came back exit-first 5/5 and the runtime flipped once in 5, so a case may pin
+    only the order-free pair, never the sequence. The same command under `{spawn, …}` agrees, so it
+    is confined to `spawn_executable`.
+
+- **The framed TCP *read* now agrees in all three block modes; the framed *write* does not.** A
+  block framing mode on the **sending** socket writes no length header on `beam_rt`: with
+  `{packet, 4}` on the connected client (`gen_tcp:connect/3`'s option list or an `inet:setopts/2`
+  after it), `gen_tcp:send(Cl, <<"hello">>)` reaches a raw peer as
+  `<<0,0,0,5,104,101,108,108,111>>` under the oracle and as `<<104,101,108,108,111>>` under
+  `beam_rt`; `{packet, 2}` is `<<0,5,…>>` vs the bare payload and `{packet, 1}` is `<<5,…>>` vs
+  the bare payload. A framed sender talking to a framed receiver is therefore the same shape seen
+  from the other end — measured `ok {ok,{data,<<104,101,108,108,111>>}}` on the oracle against
+  `ok {ok,timeout}` on `beam_rt` for the `{packet, 4}` both-ends probe. `{packet, line}` on a
+  sender agrees (line mode adds no prefix), and so does UDP output framing (`gen_udp:send` of
+  `<<"hi">>` under `{packet, 4}` arrives unframed on both sides), so the gap is confined to the
+  TCP **stream** writer. The read side is exact and **is** pinned —
+  `inet_control/packet4_framed_read`, `inet_control/packet2_framed_read`,
+  `inet_control/line_framed_read` and `inet_control/packet4_framed_read_buffers_across_segments`
+  (framing inherited from `gen_tcp:listen/2`, a truncated prefix withholding a message, and two
+  coalesced frames delivered as two messages all agree). Owner: `beam_rt` / `beam_io`.
 
 ## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
 - `-extra foo`: the oracle prints a SIGTERM info report and **hangs** (no exit within a 20 s timeout);
@@ -394,9 +391,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
   bare single-use ref where the oracle answers its own opaque `{Ref, _, _, Ref, _, _}` handle (so
   only the `{Matches, continuation}` split and the ref-ness are pinned).
-- `ets:match_spec_compile/1`: the empty **binary** `<<>>` is `badarg` on both (pinned by
-  `specs/match_spec_compile_empty_spec_is_badarg`), but the empty **list** `[]` is `badarg` in the
-  oracle and a compiled handle (`#Ref<…>`) in the Rust runtime. Owner: `beam_bifs`.
 - ETS access control: the mode set at `ets:new/2` **is** enforced — a non-owner `ets:lookup/2` of a
   `private` table and a non-owner `ets:insert/2` of a `private`/`protected` table raise
   `error:badarg` in both runtimes — but the raised **reason shape** differs: the rust runtime raises
@@ -466,21 +460,6 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   (`crates/beam_bifs/src/re/oracle.rs`) still passes because it builds the subject as raw bytes
   rather than through the `-eval` literal parser.
 
-## A.7 — zlib (owner: `beam_bifs`)
-- `zlib:zip/1`'s **compressed image is the encoder's own choice**: for the 100-byte body
-  `list_to_binary(lists:seq(1,100))` the oracle's stream is 102 bytes and the Rust runtime's 105
-  (both valid DEFLATE — a different block choice), so `byte_size(zlib:zip(…))` is unpinnable and
-  only the bodies the oracle reproduces byte for byte carry a byte-exact golden; the 100-byte body
-  is pinned by the round-trip identity only (`src/corpus/zlib.rs`).
-- The zlib-**wrapped** sibling `zlib:compress/1` diverges the same way on a repetitive body: the
-  1 KiB zero body compresses to 17 bytes in the oracle
-  (`<<120,156,99,96,24,5,163,96,20,140,84,0,0,4,0,0,1>>`) and 23 in the Rust runtime
-  (`<<120,156,237,192,1,1,0,0,0,130,32,255,175,110,72,80,192,171,1,4,0,0,1>>`) — both valid zlib
-  streams, so `byte_size(zlib:compress(<<0:8192>>))` (`ok 17` vs `ok 23`) is a plain-value
-  `mismatch` and stays unpinned. The tiny body is byte-identical
-  (`zlib:compress(<<"abc">>)` → `<<120,156,75,76,74,6,0,2,77,1,39>>` on both), so that form and the
-  `uncompress(compress(B)) =:= B` round trip are now pinned in `src/corpus/zlib.rs`.
-
 ## A.9 — boot/init (owner: beam_rt)
 
 - The runtime drives a real boot chain, so `init:script_id/0`, `whereis/1`, `application:*`,
@@ -515,18 +494,23 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   sibling shows (7.6 s versus 0.8 s). What is slow is work executed in a freshly spawned process,
   and the module-run entry process is one. Owner: `beam_rt` / `beam_engine` (execution-tier
   selection for spawned processes).
-- **Residual divergence: the `Docs` chunk's compressed image.** Every other chunk of the produced
-  artifact is byte-identical between the two runtimes — `AtU8`, `Code`, `StrT`, `ImpT`, `ExpT`,
-  `FunT`, `LitT`, `Meta`, `LocT`, `Attr`, `CInf`, `Dbgi`, `Line`, `Type` — and `beam_lib:md5/1`
-  (which covers `AtU8`/`Code`/`StrT`/`ImpT`/`ExpT`/`FunT`/`LitT`/`Meta`, i.e. the object code
-  itself) is the very same `<<212,65,234,56,60,147,88,139,85,190,88,223,28,10,50,95>>` on both
-  sides. Only `Docs` differs, and only in its **compressed image**: 4463 bytes on the oracle
-  against 4465 on the Rust runtime, while `binary_to_term/1` of either chunk yields the *identical*
-  `docs_v1` term (the module doc, the `#{otp_doc_vsn => {1,0,0}, behaviours => [], source_anno =>
-  {22,2}}` metadata and all 38 documented functions compare `=:=`). That is the known zlib encoder
-  choice (the A.7 zlib entries), not a compiler divergence, so **whole-file byte identity of the
-  artifact stays unpinnable** and the case pins the source-derived **export table** of the produced
-  image instead of a compiler-release hash.
+- **The default (spawned-compiler) `[binary]` route agrees but no case can carry it**:
+  `compile:file("lib/stdlib/src/timer.erl", [binary, return_errors])` answers `ok timer 13200` on
+  **both** sides, in 119–211 s on the runtime against 0.7 s on the oracle (six serial runs, 158/127/
+  211/169/130/119 s) — the spawned-process cost above, not a divergence. Owner: `beam_rt` /
+  `beam_engine`. **Load flake, not part of the agreement**: under a heavy machine load (several
+  concurrent workspace builds) this same route has twice died with exit `139` (SIGSEGV, empty
+  stdout) after 202 s / 328 s, and it runs clean whenever the machine is quiet — so a case pinning it
+  would flake, and the crash itself is a runtime robustness question for the owner, not a harness
+  artifact.
+- **`no_spawn_compiler_process` + `[binary]` on the same source is the cheap, honest route**: ≈2.3 s,
+  already a case (`selfhost/compile_file_of_a_module_folding_over_an_ordered_iterator`).
+- **No case pins a whole-file byte count or a hash value.** The artifact's `beam_lib:md5/1` image and
+  every md5-significant chunk are identical between the two runtimes, but a hash golden is
+  **release-dependent** (CI's oracle is OTP 28 while every golden here is measured on OTP 29), so the
+  artifact cases pin relations and structures instead — the produced `Code` chunk against the
+  module's own image, the chunk set, the `debug_info`/`attributes`/`Docs` shape and the export table.
+  Owner: `beam_bifs`.
 ## A.2 — term/ETF image (owner: `beam_bifs`)
 - `term_to_binary(Term, [local])` is served: the image is `131`, `LOCAL_EXT` (121), a 4-byte local
   node **hash**, then the ordinary ETF body. The hash is randomised per VM start on **both** sides,
@@ -543,47 +527,14 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   corpus classifies a map-valued result into sorted key/pair lists and probes with `Probe::Value`.
   An encoding-order choice, not a semantic divergence. Owner: `beam_codec` / `beam_bifs`.
 
-## A.3 — NIF C ABI: the stateful `enif_*` family (owner: `beam_rt` NifHost / `beam_abi`)
-Measured with a real `cc`-built `.so`, oracle OTP 29.1.1 / erts-17.1, while the `nif_rt/…` block was
-added. Each is a plain-value difference, so a case pinning one would be a `mismatch`.
-- **`enif_send` to another Erlang process never delivers.** Both the `NULL`-env and the `msg_env`
-  form: the oracle answers `1` and the message really reaches the target's mailbox; `beam_rt`
-  answers `0` and nothing is delivered — `NifHost::send` is left at its `None` default in
-  `NifHostImpl`. Owner: `beam_rt` (`crates/beam_rt/src/nif.rs`).
-- **`enif_monitor_process` of a live pid cannot be established.** The oracle answers `0` (the monitor
-  arms and a `'DOWN'` fires when the process dies); `beam_rt` answers `1` (it cannot establish it).
-  Owner: `beam_rt` (no `monitor_process` hook in `NifHostImpl`).
-- **`enif_select` on a real pipe fd registers nothing.** The oracle answers `0` (the interest is
-  registered and a `{select, …}` message is delivered); `beam_rt` answers `-1` (the hook is
-  unimplemented). Owner: `beam_rt`.
-- **A term-exposed resource's destructor never runs.** `enif_make_resource` +
-  `enif_release_resource` + a forced `erlang:garbage_collect/0`: the oracle's destructor count is
-  `1`, `beam_rt`'s `0` — a bounded, deliberate leak, because the runtime has no "the term died"
-  signal. Owner: `beam_abi` (`crates/beam_abi/src/nif/enif/resources.rs`).
-- **`enif_make_map_from_arrays` with duplicate keys builds a map where the oracle refuses.** The
-  oracle's C answers `THE_NON_VALUE` (`erts/emulator/beam/erl_map.c:673-710`); `beam_rt` dedups
-  last-value-wins and returns a map. Owner: `beam_abi` (`crates/beam_abi/src/nif/enif/map.rs`).
-- **`enif_binary_to_term` over an image with trailing bytes answers `0`.** The oracle decodes the
-  first term and reports the **consumed** byte count; `beam_rt`'s host hook strict-decodes the whole
-  slice and answers `0`. Owners: `beam_abi` (`crates/beam_abi/src/nif/enif/mem.rs`) / `beam_rt`
-  (`NifHostImpl::binary_to_term`).
-- **`enif_term_to_binary` of a local fun (a closure) fails.** The oracle emits `NEW_FUN_EXT`;
-  `beam_rt` returns the C failure code `0`, which surfaces as `badarg`. The **external**-fun
-  `EXPORT_EXT` image agrees and is pinned (`nif_rt/…`). Owners: `beam_rt`
-  (`NifHostImpl::term_to_binary`) / `beam_codec`.
-
-## A.4 — driver C ABI: the async pool and the empty-payload delivery (owner: `beam_abi` / `beam_rt`)
-- **`driver_async` schedules nothing, so `ready_async` never fires.** A fixture whose `output`
-  callback calls `driver_async(port, &key, invoke, data, NULL)` and answers the acceptance as one
-  byte: the oracle accepts the job — the reply byte decodes to `49` (`'1'`) and the allocated async
-  id is > 0 — and later runs the job on a driver thread; `beam_rt` answers `-1` (reply byte `48`,
-  `'0'`), because there is no async pool, hence no `ready_async` either. Owners: `beam_abi` (the
-  `driver_async`/`driver_async_cancel` slot) / `beam_rt` (`crates/beam_rt/src/port/driver.rs`,
-  "What is NOT wired yet").
-- **`driver_output2(NULL,0,NULL,0)`'s zero-length delivery is dropped by the Rust runtime, so it
-  stays unpinned.** Re-confirmed as the reason that candidate case was not added: the oracle delivers
-  `{Port,{data,<<>>}}` where `beam_rt`'s `PortRegistry::fold_notifications` folds an empty payload
-  away. Owner: `beam_rt`.
+## A.4 — driver C ABI: the zero-length delivery (owner: `beam_rt`)
+- **A wholly zero-length delivery never arrives in the Rust runtime, so it stays unpinned.**
+  Measured with a `cc`-built driver: `driver_output2(port, NULL, 0, NULL, 0)` delivers
+  `{Port,{data,[]}}` to the owner in the oracle and **nothing** in `beam_rt`, and a zero-length
+  `driver_output(port, "", 0)` delivers `{Port,{data,<<>>}}` there and nothing here — the runtime's
+  `PortRegistry::fold_notifications` folds an empty payload away. The `driver_c` empty-body selector
+  (`33`) does **not** cover this: its header is non-empty, so the term it pins is `[104,100|<<>>]`,
+  never an empty payload. Owner: `beam_rt`.
 
 ## A.5 — distribution / ETF wire (owner: `beam_rt`, `beam_codec`)
 
@@ -591,33 +542,59 @@ added. Each is a plain-value difference, so a case pinning one would be a `misma
 One Rust node and one system node were driven by hand (a `beam_rt -sname <name>` runtime and a
 system `erl -sname <peer>`), `net_kernel:verbose(3)` on the system side, `epmd -names` and `ss -tn`
 for the transport state.
-- **The Rust → ERTS direction completes.** `beam_rt -sname <name> -eval 'net_adm:ping(<peer>@<host>)'`
-  answers `pong`; the oracle's `verbose(3)` logs `{net_kernel,{accept,…}}` →
-  `{dist_ctrlr,…,<peer-node>,<pid>}` → `{nodeup,…}`, and on halt `{nodedown,…,normal}`. The Rust
-  node connects as **hidden**, so it appears in no side's `nodes/0` — the correct OTP answer for a
-  hidden node (`nodes(hidden)` would list it), not a divergence.
-- **The ERTS → Rust direction never completes.** With `beam_rt -noshell -sname <name>` bound and
-  published to `epmd` (confirmed by `epmd -names` and a LISTEN socket), the system side's
-  `net_adm:ping/1` answers **`pang` after ~7.15 s**; `verbose(3)` shows `{init_setup_check,…}` →
-  `{setup,…}` → `{conn_own_exit,…,setup_timer_timeout}` →
-  `{nodedown,…,pending,setup_timer_timeout}`, and `ss -tn` shows the peer's 30-byte `'n'` name
-  message sitting **unread** (Recv-Q 30) on the accepted link — no `'N'` reply is ever sent. Owner:
-  `beam_rt` (`crates/beam_rt/src/dist.rs`, the accept / `'N'` path).
-- **No corpus case can express cross-runtime traffic — two independent reasons.** (a) *Structural*:
-  `harness::execute` runs the oracle side to completion **first**, then the Rust side, and compares
-  each child's own stdout + exit status, so the two VMs never coexist; a `Command` oracle script
-  could only **hard-code** a cross-runtime observation (exactly the tautology the `Command`-kind rule
-  forbids), and making the oracle child spawn `beam_rt` would bake an artifact path into an argv —
-  against `runtime::resolve_rust`'s `$BEAM_RT`-else-workspace-relative resolution, since a tree holds
-  only one of `target/release`/`target/debug`. (b) *Capability*: the ERTS → Rust direction cannot
-  reach `nodeup`, so a case pinning it would be a permanent `mismatch`, and admitting it as
-  `unsupported` would open a second ratchet gap.
-- **Further A.5 capability gaps measured while probing** (each exits `3`, so an honest gap, never a
-  `mismatch`): `erlang:monitor_node/2` → `beam_rt: unsupported: erlang:monitor_node/2`;
-  `erlang:send/2` to a remote registered name → `beam_rt: unsupported: … distributed send is not
-  implemented`; `net_kernel:node()` → `undef`. Owner: `beam_rt`. The adjacent shapes agree and are
-  pinned: off the `-sname`/`-name` path `node()` is `nonode@nohost`, `is_alive()` is `false` and
-  `nodes()` is `[]`, and with `-sname` the node-name/aliveness shapes agree.
+- **Both directions complete.** The ERTS → Rust direction was audited fresh: the system side's
+  `net_adm:ping/1` answers `pong` in 28–200 ms, `verbose(3)` shows the full
+  `{auto_connect,…}` → `{init_setup_check,…}` → `{setup_check,…}` → `{setup,…}` →
+  `{dist_ctrlr,…}` → `{nodeup,…}` ladder with no `setup_timer_timeout`, and `ss -tn` shows
+  Recv-Q/Send-Q zero on both sides. The earlier `pang` / `setup_timer_timeout` symptom was a
+  **missing `net_kernel` service**, not a wire defect: `net_adm:ping/1` is a
+  `gen:call({net_kernel,Node}, '$gen_call', {is_auth,node()}, infinity)`, so with no process holding
+  the name the request was dropped and the caller parked in an untimed receive until the oracle's
+  setup timeout fired.
+- **The Rust node is a published node, not hidden**: it appears in the peer's `nodes/0`, a
+  `nodes(hidden)` call stays `[]`, and `DistNode::hidden` defaults to `false`.
+- **Both directions carry user traffic**: `{sink,Peer} ! Msg` reaches a registered process on the
+  other side and the peer's reply reaches the Rust side's plain `receive`; `erlang:monitor_node/2`
+  answers `true` and both `{nodeup,…}` and `{nodedown,…}` are genuinely delivered; and
+  `erlang:send/2` to a remote registered name auto-dials a reachable node.
+- **No corpus case can express cross-runtime traffic.** `harness::execute` runs the oracle leg to
+  completion **before** the Rust leg and compares each child's own stdout + exit status, so no case
+  can carry a message between the two runtimes; a `Command` oracle script could only **hard-code** a
+  cross-runtime observation (exactly the tautology the `Command`-kind rule forbids), and having the
+  oracle child spawn `beam_rt` would bake an artifact path into an argv — against
+  `runtime::resolve_rust`'s `$BEAM_RT`-else-workspace-relative resolution.
+- The genuine cross-runtime property is pinned instead by the crate-local
+  `crates/beam_rt/tests/dist_two_vm.rs` (two `#[ignore]`d tests, a private `epmd`, both sides
+  asserted).
+- **A per-side two-node pair IS expressible and is pinned**: `CommandRun.peer: Option<PeerRun>`
+  starts a second process of *that side's own* runtime (the Rust leg a harness-spawned `beam_rt`, the
+  oracle leg the system `erl`'s own `peer:start_link/1`), both legs isolated in their own process
+  group under a per-invocation nonce, and a peer that never becomes ready is a loud `Skipped`.
+  `dist/live_self_pair_handshake_and_message` therefore compares reachable-node behaviour
+  symmetrically: the handshake (`pong`), the published-node count (`nodes(hidden)` empty),
+  one message each way twice, and `{nodedown,_}`. What remains inexpressible is a leg that talks to
+  the **other** runtime — a peer leg is always the same runtime, precisely because the two legs never
+  coexist.
+
+### Distribution capability gaps and plain-value divergences (measured)
+- **A message to `net_kernel` that is not a `{'$gen_call', From, Request}` tuple is FATAL**: a peer
+  sending a plain term to `{net_kernel, Node}` kills the runtime with exit `3` (only the `up` line
+  has been printed), and a stray term is not catchable from `-eval`. Owner: `beam_rt`.
+- **`net_kernel`: `<request> is not served`** (e.g. `monitor_nodes/2`) and **`erlang:monitor_node/3`**
+  both exit `3` — honest capability gaps, never mismatches. Owner: `beam_rt`.
+- `erlang:send({RegName, UnreachableNode}, Msg)` **raises**
+  (`beam_rt: error distribution: no established connection to node …`) where the oracle silently
+  drops the message and returns it. Owner: `beam_rt`.
+- `erl_distribution:start_link()` on an already-distributed node answers `ignore` where the oracle
+  answers `{error,{already_started,<pid>}}`. Owner: `beam_rt`.
+- `net_adm:ping/1` with a **non-atom** is `badarg` where the oracle raises `function_clause`. Owner:
+  `beam_rt`.
+- `catch net_kernel:node()`'s **stacktrace** is one frame against the oracle's eight; the `undef`
+  class and reason themselves agree (`net_kernel:node()` is `undef` on **both** sides — not a gap), so
+  the probe wrapper pins them. Owner: `beam_rt`.
+- The adjacent shapes agree and are pinned: off the `-sname`/`-name` path `node()` is
+  `nonode@nohost`, `is_alive()` is `false` and `nodes()` is `[]`, and with `-sname` the
+  node-name/aliveness shapes agree.
 
 ### ETF decode bound (measured)
 - **A 3 000-deep nested list decodes on the oracle and raises here.**
