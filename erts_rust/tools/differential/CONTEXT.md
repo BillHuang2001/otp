@@ -139,7 +139,7 @@ Non-corpus modules:
 Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-corpus-map` skill** (enabled at this node) — every group's id prefix, case count and the behaviours it pins, plus its pinning traps. The A-contract → file map, with the counts that are easy to get wrong:
 - A.1 → `terms.rs`, `semantics.rs`, `errors.rs`, `ordered_walk.rs`
 - A.2 → `etf.rs` (84), `wire_ids.rs`
-- A.3 → `nif.rs`, `nif_so.rs` (45), `nif_res.rs` (30), `nif_abi.rs` (166), `nif_abi_extra.rs` (131), `nif_state.rs` (9)- A.4 → `driver_ports.rs`, `driver.rs`, `driver_c.rs` (54), `driver_abi.rs` (90), `driver_abi_extra.rs` (78)
+- A.3 → `nif.rs`, `nif_so.rs` (45), `nif_res.rs` (30), `nif_abi.rs` (166), `nif_abi_extra.rs` (131), `nif_state.rs` (9), `nif_thread.rs` (8)- A.4 → `driver_ports.rs`, `driver.rs`, `driver_c.rs` (54), `driver_abi.rs` (90), `driver_abi_extra.rs` (78)
 - A.4 built-in drivers → `udp.rs` (32), `ram_file.rs` (21), `inet_control.rs` (15), `inet_write.rs` (11)
 - A.5 → `wire.rs`, `wire_extra.rs` (443), `dist.rs` (5)
 - A.6 → `flags.rs`, `flags_apply.rs`
