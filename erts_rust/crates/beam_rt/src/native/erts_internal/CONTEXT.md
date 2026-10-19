@@ -50,7 +50,7 @@ Claiming any of them here would shadow a registry BIF (the floor's standing cons
 
 ## Test Strategy
 - The colocated unit suite lives with `../erts_internal.rs` and drives the floor through the crate's own dispatch (`../test_support.rs::call` ⇒ `call_bif` ⇒ `try_native`), so the served surface is pinned rather than an internal function.
-- `trace.rs` has no colocated tests: the tracing behaviour is pinned by `../../../tests/trace*.rs` (emitted vs deferred events, per-module routing — [`../../TRACE_AND_PERF.md`](../../TRACE_AND_PERF.md)).
+- `trace.rs` has no colocated tests: the tracing behaviour is pinned by `../../../tests/trace*.rs` (emitted vs deferred events, per-module routing — [`../../../TRACE_AND_PERF.md`](../../../TRACE_AND_PERF.md)).
 - `get_dflags/0` is pinned by byte-comparing the built term's `term_to_binary/1` image against the oracle's; `beamfile_chunk/2`/`beamfile_module_md5/1` are pinned over real `.beam` images.
 - Oracle values are quoted in each test's doc comment (re-verified against the system `erl`, OTP 29.1.1 / erts-17.1); a typed-gap row pins the `unsupported` outcome with a `// documented divergence:` comment.
 
