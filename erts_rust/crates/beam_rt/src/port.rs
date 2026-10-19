@@ -88,12 +88,18 @@
 //! (`deliver_read_message`, `erts/emulator/beam/io.c:3363-3442`); a `list` stream is every byte as
 //! a char list either way.
 //!
-//! A **built-in driver port**'s replies (`{spawn_driver, "ram_file_drv"}` and friends) come up
-//! through [`beam_io`]'s **flat** byte queue instead, which carries no split, so they are rendered
-//! as list elements on either stream — the C's header rendering ([`StreamShape::DriverOutput`]).
-//! That is exact for a header-only reply — every `ram_file_drv` `OK`/`NUMBER`/`ERROR` — and is the
-//! documented residual for a reply that carried a data part, whose binary tail the `beam_io` seam
-//! does not carry.
+//! An **in-tree driver**'s reply carries its own split: `ram_file_drv` hands every reply up as one
+//! [`ReadMessage`] ([`beam_io::DriverContext::deliver_read`],
+//! `beam_io/src/drivers/ram_file.rs:477`), so a header-only `OK`/`NUMBER`/`ERROR` is the proper list
+//! (`[3,0,0,0,0]` for a fresh `open`) and a `DATA` reply the improper `[2,0,0,0,2|<<97,98>>]` on a
+//! `[binary]` port — the oracle's own terms, on either stream.
+//!
+//! A **header-less** read of a built-in driver port is the one shape the [`StreamShape`] decides
+//! instead: it renders as list elements on either stream — the C's header rendering
+//! ([`StreamShape::DriverOutput`], `erts/emulator/beam/io.c:3404-3435`) — which is the answer for the
+//! two in-tree producers still on [`beam_io::DriverContext::input`], `tcp_inet`'s and `udp_inet`'s
+//! passive `recv` verb (`beam_io/src/drivers/inet/{async,udp}.rs`), where the C answers a binary on a
+//! `[binary]` port.
 //!
 //! The child's **stderr** follows the oracle exactly: it is *inherited* from the emulator
 //! by default (so it appears on `beam_rt`'s own stderr and is never port data), and the
@@ -361,12 +367,14 @@ pub enum PortName {
 }
 
 impl PortName {
-    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot    /// say about itself.
+    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot say
+    /// about itself.
     ///
-    /// A **built-in** driver port's bytes come up through [`beam_io::DriverContext::input`], a
-    /// flat byte queue that cannot say which `driver_output*` call wrote them, so they render
-    /// the C's header half ([`StreamShape::DriverOutput`]). Every other producer states its own
-    /// header/body split in the read ([`StreamShape::Data`]).
+    /// A **built-in** driver port renders through [`StreamShape::DriverOutput`], because its
+    /// header-less reads are the ones [`beam_io::DriverContext::input`] — the only sink with no
+    /// split attached — still feeds. Every other producer states its own header/body split in the
+    /// read ([`StreamShape::Data`]): a child's stdout, an `fd` port, a `dlopen`ed driver's
+    /// `driver_output*`.
     fn stream_shape(self) -> StreamShape {
         match self {
             PortName::SpawnDriverBuiltin => StreamShape::DriverOutput,
@@ -435,10 +443,11 @@ impl From<StreamType> for SpawnStream {
 /// `erts/emulator/drivers/common/ram_file_drv.c:197-228,448-489`), while a byte-stream *read* —
 /// a child's stdout, an `fd` port — is header-less and therefore a binary.
 ///
-/// What a read cannot say is whether its bytes came from a driver output call **at all**: a
-/// **built-in** driver port hands its bytes up through [`beam_io::DriverContext::input`], a flat
-/// byte queue with no split attached, so an in-tree driver's reply arrives as one header-less read.
-/// [`StreamShape::DriverOutput`] says exactly that.
+/// What a read cannot say is whether its producer stated a header: a header-less read is one body and
+/// no header whether it came from a plain `driver_output` or from [`beam_io`]'s flat
+/// [`beam_io::DriverContext::input`] sink, which carries no split at all.
+/// [`StreamShape::DriverOutput`] supplies exactly that one producer fact, and only for a header-less
+/// read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum StreamShape {
     /// The read's own header/body split decides the term (the table above): the header is a cons
@@ -451,28 +460,23 @@ pub(crate) enum StreamShape {
     /// emulator's.
     #[default]
     Data,
-    /// A **built-in driver port**'s payload: an in-tree driver ([`PortName::SpawnDriverBuiltin`] —
-    /// `ram_file_drv`, `tcp_inet`, `udp_inet`) answered through one of the four `driver_output*`
-    /// entry points, and [`beam_io`]'s flat byte queue does not say which.
+    /// A **built-in driver port**'s **header-less** read: an in-tree driver
+    /// ([`PortName::SpawnDriverBuiltin`] — `ram_file_drv`, `tcp_inet`, `udp_inet`) produced a read
+    /// with no header, the shape every push through [`beam_io`]'s flat
+    /// [`beam_io::DriverContext::input`] sink takes.
     ///
-    /// A **header-less** read of such a port renders as **list elements on either stream** — what
-    /// the C gives the header half of every output call (`deliver_read_message`,
-    /// `erts/emulator/beam/io.c:3404-3435`), so a `[binary]` port's `{data, D}` is a list of byte
-    /// integers rather than a binary.
+    /// Such a read renders as **list elements on either stream** — what the C gives the header half
+    /// of every output call (`deliver_read_message`, `erts/emulator/beam/io.c:3404-3435`), so a
+    /// `[binary]` port's `{data, D}` is a list of byte integers rather than a binary.
     ///
-    /// That rendering is **exact** when the driver answered header-only — `driver_output2(hbuf,
-    /// hlen, NULL, 0)`, which is every `ram_file_drv` `OK`/`NUMBER`/`ERROR`
-    /// (`ram_file_drv.c:181-228`) — and is the documented residual otherwise: a call that carried
-    /// a **data part** (a `DATA` reply, `driver_output_binary`, `:448`) has its binary tail
-    /// rendered as further list elements (`[2,0,0,0,2,97,98]` where the oracle delivers
-    /// `[2,0,0,0,2|<<97,98>>]`), and a header-less `driver_output` (an `inet` socket read) is
-    /// rendered as list elements where the oracle delivers a binary. Closing that residual needs
-    /// an in-tree driver to hand its bytes up through [`beam_io::DriverContext::deliver_read`]
-    /// instead of [`beam_io::DriverContext::input`] — a `beam_io` change, the handoff in this
-    /// node's `CONTEXT.md`.
+    /// That rendering is the oracle's **exact** proper list for a header-only reply, and diverges
+    /// where the C answers a binary on a `[binary]` port: the producers still on that flat sink are
+    /// `tcp_inet`'s and `udp_inet`'s passive `recv` verb
+    /// (`beam_io/src/drivers/inet/{async,udp}.rs`), whose payload is one body-only read.
     ///
-    /// A read that **does** carry a header contradicts the flat queue, so its own split wins (see
-    /// [`StreamShape::Data`]): the shape never hides bytes a producer really delivered as a header.
+    /// A read that **does** carry a header keeps its own split (see [`StreamShape::Data`]), whatever
+    /// the port's `Name` form: `ram_file_drv` hands its `OK`/`NUMBER`/`ERROR` up header-only and its
+    /// `DATA` reply with both halves, so both render the oracle's own terms.
     DriverOutput,
 }
 
@@ -537,10 +541,10 @@ struct PortMeta {
     /// Which `Name` form opened the port.
     ///
     /// The two message producers route on it (see [`PortName::stream_shape`] and
-    /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a
-    /// built-in driver port's bytes come up through [`beam_io::DriverContext::input`], a flat byte
-    /// queue that cannot say which `driver_output*` call wrote them, while a `dlopen`ed
-    /// `{spawn_driver, Name}` port's reads carry the C's header/body split.
+    /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a built-in
+    /// driver port's **header-less** reads render as list elements
+    /// ([`StreamShape::DriverOutput`]), while a `dlopen`ed `{spawn_driver, Name}` port's reads carry
+    /// the C's header/body split.
     kind: PortName,
     /// Whether this port's driver declares a **`control` callback** — the C's
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), captured from
@@ -764,10 +768,10 @@ enum PortEvent {
         /// The port's `binary`/`list` option.
         stream: StreamType,
         /// The producer-specific rendering rule: [`StreamShape::DriverOutput`] for a built-in
-        /// driver port's flat payload (rendered as list elements on either stream),
-        /// [`StreamShape::Data`] for every other producer here (a child's stream bytes, an `fd`
-        /// port, a `dlopen`ed driver's `driver_output`) and for every reassembled `{packet, N}`
-        /// packet.
+        /// driver port, which decides only a **header-less** read (rendered as list elements on
+        /// either stream), [`StreamShape::Data`] for every other producer here (a child's stream
+        /// bytes, an `fd` port, a `dlopen`ed driver's `driver_output`) and for every reassembled
+        /// `{packet, N}` packet.
         shape: StreamShape,
         /// The process the message belongs to.
         owner: ProcessId,
@@ -1121,7 +1125,7 @@ pub struct PortRegistry {
     /// ([`beam_io::Port::take_input_notifications`]), so a round run *outside* a pump would
     /// otherwise throw its bytes away. The one such round is
     /// [`PortRegistry::write_command`]'s — it runs the `OUTPUT` task that carried the command,
-    /// and a **built-in** driver (`ram_file_drv`, `efile`) writes its reply from that very
+    /// and a **built-in** driver (`ram_file_drv`) writes its reply from that very
     /// `output` call, so the reply is in that round's outcome. Folding it here retains it until
     /// the next pump reports it.
     ///
@@ -1635,14 +1639,13 @@ impl PortRegistry {
     /// ([`beam_io::Driver::ready_output`]'s default calls `output`), which is what the C's
     /// `port_command` on a loaded driver does.
     ///
-    /// That round is also what a **built-in** driver answers from: `ram_file_drv`/`efile` write
-    /// their reply into [`beam_io::DriverContext::input`] during the `OUTPUT` task, and the round
-    /// harvests it as a [`beam_io::PortNotification::Data`] — draining the port's input queue, so
-    /// no later round can see it. The outcome is therefore **folded into**
+    /// That round is also what a **built-in** driver answers from: `ram_file_drv` hands its reply up
+    /// as one completed read ([`beam_io::DriverContext::deliver_read`]) during the `OUTPUT` task, and
+    /// the round harvests it as a [`beam_io::PortNotification::Data`] — draining the port's read
+    /// queue, so no later round can see it. The outcome is therefore **folded into**
     /// [`PortRegistry::pending_events`] (through the same [`PortRegistry::fold_notifications`] the
-    /// pump uses) rather than dropped, and the next [`PortRegistry::pump`] reports it as the
-    /// owner's `{Port, {data, Data}}`. Dropping it was the defect: the reply never reached the
-    /// owner and `port_info(Port, input)` stayed `0`.
+    /// pump uses), and the next [`PortRegistry::pump`] reports it as the owner's
+    /// `{Port, {data, Data}}` with both byte counters advanced.
     ///
     /// # The byte accounting follows the accept
     ///
@@ -4487,9 +4490,9 @@ impl RuntimeContext<'_> {
     ///   both halves, an empty body rendering `[...|<<>>]` (a zero-length `DATA` reply, i.e. a read
     ///   at end-of-file) — and a read of nothing at all the empty proper list `[]`;
     /// * a **built-in driver port**'s **header-less** read ([`StreamShape::DriverOutput`]) is list
-    ///   elements on **either** stream — the C's header rendering, and the one shape the producer's
-    ///   flat byte queue cannot carry. A read that does carry a header keeps its own split (see
-    ///   that variant).
+    ///   elements on **either** stream — the C's header rendering (`io.c:3404-3435`). A read that
+    ///   carries a header keeps its own split (see that variant), so `ram_file_drv`'s header-only
+    ///   `OK`/`NUMBER`/`ERROR` and its two-halved `DATA` reply render the oracle's own terms.
     ///
     /// Every block is allocated on the runtime's pointer-stable `-eval` arena.
     ///
