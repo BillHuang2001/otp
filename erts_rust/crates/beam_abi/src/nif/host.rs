@@ -63,6 +63,40 @@ use beam_term::prelude::Eterm;
 use crate::common::{ErlDrvSysInfo, ErlNifSelectFlags};
 use crate::nif::term::ERL_NIF_TERM;
 use crate::nif::types::{ErlNifEnv, ErlNifEvent};
+
+/// The three-way result of [`NifHost::monitor_process_result`] (workspace contract **A.3**) — the
+/// NIF C ABI's *process monitor* outcome, mirroring the C's `0` / `1` / `-1` codes
+/// (`erts/emulator/beam/erl_nif.c:3954-4011`).
+///
+/// The C entry point has three outcomes and the Rust seam must be able to express all three, so the
+/// hook returns this enum rather than an `Option<Eterm>`:
+///
+/// * [`NifMonitorResult::Armed`] — the C's `0` (`:4010`): the monitor was armed and `*monitor` was
+///   filled with the 3-word internal-reference block the payload names.
+/// * [`NifMonitorResult::NotAlive`] — the C's `1` (`:3976` for an `enif_set_pid_undefined` target,
+///   `:4004` when the monitor signal cannot be sent because the target is already dead). The caller's
+///   holder is left **untouched**.
+/// * [`NifMonitorResult::NoDownCallback`] — the C's `-1` (`:3968-3972`): the resource's type was
+///   opened without a `down` callback, so it cannot hold monitors at all. The C tests this **before**
+///   it looks at the pid, so it wins over `NotAlive` for an undefined target too.
+///
+/// Deliberately **not** the same type as the driver family's
+/// [`MonitorResult`](crate::driver::host::MonitorResult): that one expresses the driver C ABI's
+/// `0` / `>0` / `<0` codes (`io.c:7012-7038`) and hands over an `ErlDrvMonitor`, this one expresses
+/// the NIF ABI's `0` / `1` / `-1` codes and hands over the `Eterm` internal reference the caller's
+/// `ErlNifMonitor` is a byte image of. See [`NifHost::monitor_process_result`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NifMonitorResult {
+    /// The C's `0`: the monitor was armed. The payload is the ordinary **internal reference** the C
+    /// mints with `erts_make_ref_in_buffer` (`erl_nif.c:3978`) — the term `enif_make_monitor_term`
+    /// rebuilds and `enif_demonitor_process` looks up.
+    Armed(Eterm),
+    /// The C's `1`: the target process is not alive (or the caller's `ErlNifPid` is undefined).
+    NotAlive,
+    /// The C's `-1`: the resource's type carries no `down` callback, so no monitor can be armed on it.
+    NoDownCallback,
+}
+
 /// Services the runtime provides to the `enif_*` implementations of one NIF call.
 pub trait NifHost {
     /// The term-allocation arena for the duration of the current call. Must not reallocate while a
@@ -265,11 +299,52 @@ pub trait NifHost {
 
     /// Monitor the process `pid`, returning the monitor term the caller stores (C
     /// `enif_monitor_process`); default: unsupported.
+    ///
+    /// **Legacy single-outcome form.** This hook can only say "armed, here is the reference" or
+    /// "nothing happened": `None` is folded into the C's `1` ("target not alive") by
+    /// [`enif_monitor_process`](crate::nif::enif::process::enif_monitor_process), so a host that uses
+    /// it cannot report the C's `-1` and cannot distinguish "unsupported" from "the target is dead".
+    /// A host that can tell those apart implements [`NifHost::monitor_process_result`] instead — it is
+    /// consulted first, and this hook is only reached when it answers `None`.
     fn monitor_process(&mut self, pid: Eterm) -> Option<Eterm> {
         let _ = pid;
         None
     }
 
+    /// The **three-way** monitor result (C `enif_monitor_process`,
+    /// `erts/emulator/beam/erl_nif.c:3954-4011`); default: unsupported (`None`), which makes
+    /// `enif_monitor_process` fall back to [`NifHost::monitor_process`].
+    ///
+    /// The C entry point has three distinct outcomes and the seam must be able to express all three:
+    ///
+    /// | outcome | C | meaning |
+    /// |---|---|---|
+    /// | [`NifMonitorResult::Armed`] | `0` (`:4010`) | the monitor was armed; the payload is `*monitor` |
+    /// | [`NifMonitorResult::NotAlive`] | `1` (`:3976`, `:4004`) | the target is dead or the `ErlNifPid` is undefined |
+    /// | [`NifMonitorResult::NoDownCallback`] | `-1` (`:3968-3972`) | the resource type has no `down` callback, so it cannot hold monitors |
+    ///
+    /// `Armed`'s payload is the **ordinary internal reference** the C builds with
+    /// `erts_make_ref_in_buffer` (`:3978`) — the host mints it, exactly as the driver side's
+    /// `MonitorResult::Ok` hands over an `ErlDrvMonitor`. The `enif_*` layer copies its 3-word block
+    /// into the caller's `ErlNifMonitor` (`erts_ref_to_driver_monitor`, `io.c:6994-7000`), so a host
+    /// that returns anything else is refused as `1` rather than stored.
+    ///
+    /// **Why this is a separate enum from [`MonitorResult`](crate::driver::host::MonitorResult).** The
+    /// two families are different C ABIs with different conventions: the driver side answers
+    /// `0` / `>0` / `<0` (`io.c:7012-7038`) and hands over an `ErlDrvMonitor`, while this side answers
+    /// `0` / `1` / `-1` and hands over an `Eterm` reference that the caller stores in an
+    /// `ErlNifMonitor`. Sharing one type would have to fake one family's payload.
+    ///
+    /// **Owner of the remaining work: `beam_rt`'s `NifHostImpl`.** Arming a real monitor means (1)
+    /// looking the pid up in the process table and answering [`NifMonitorResult::NotAlive`] when it is
+    /// already dead, (2) minting the internal reference the C's `erts_make_ref_in_buffer` mints, and
+    /// (3) delivering the `'DOWN'` message to the owning process when the target exits, keyed off the
+    /// same reference so that [`NifHost::demonitor_process`] can cancel it. Without the hook the ABI
+    /// layer answers the C's `1` for a live target — the one recorded ledger gap on this entry point.
+    fn monitor_process_result(&mut self, pid: Eterm) -> Option<NifMonitorResult> {
+        let _ = pid;
+        None
+    }
     /// Cancel the monitor identified by `monitor` (C `enif_demonitor_process`); default:
     /// unsupported.
     fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {

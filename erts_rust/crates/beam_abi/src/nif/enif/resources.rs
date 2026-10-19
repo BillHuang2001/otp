@@ -106,11 +106,17 @@
 //!    not find it (measured). This crate has no `load` session boundary (the loader owns it), so a
 //!    created type is visible immediately. Only `*tried` is pinned by the compatibility claim and it
 //!    is unaffected: the create branch reports `CREATE` either way.
-//! 6. **Not implemented (and therefore never faked):** monitors/`enif_monitor_process`, the
-//!    `ERL_NIF_SELECT_STOP` (`stop`) and `down` *callbacks* are stored but never invoked (they are
-//!    driven by `beam_io`/`beam_process`, which are not wired to this crate); no `rt_id`/`enif_select`
-//!    registration; the type is never freed (the C frees it on module unload) — the registry is
-//!    process-lifetime, exactly like the C's global `resource_type_list`.
+//! 6. **Not implemented (and therefore never faked):** the `ERL_NIF_SELECT_STOP` (`stop`) and `down`
+//!    *callbacks* are stored but never invoked (they are driven by `beam_io`/`beam_process`, which are
+//!    not wired to this crate), and this crate keeps no monitor tree — arming one is
+//!    `enif_monitor_process`'s host hook (`NifHost::monitor_process_result`), not a resource
+//!    registry job. What the registry *does* expose for that family is the one fact the C reads out
+//!    of the object (`ASSERT(!rsrc->monitors == !rsrc->type->fn.down)`, `erl_nif.c:3966`):
+//!    [`resource_type_has_down`], i.e. whether the object's type was opened WITH a `down` callback.
+//!    That is the C's `-1` gate (`:3968-3972`), and it must be answerable from the crate's own
+//!    knowledge, before any runtime hook is consulted. No `rt_id`/`enif_select` registration; the
+//!    type is never freed (the C frees it on module unload) — the registry is process-lifetime,
+//!    exactly like the C's global `resource_type_list`.
 //!
 //! # The destructor's timing — the deviation the C does not let us close
 //!
@@ -173,7 +179,7 @@
 use super::*;
 
 use libc::{c_char, c_int, c_void, size_t};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -268,8 +274,8 @@ struct ResourceType {
     /// `ErlNifResourceStop*` — stored, never invoked (needs `enif_select`; see the module docs).
     #[allow(dead_code)]
     stop: Option<ErlNifResourceStop>,
-    /// `ErlNifResourceDown*` — stored, never invoked (needs `enif_monitor_process`).
-    #[allow(dead_code)]
+    /// `ErlNifResourceDown*` — stored, never invoked (the callback needs a live monitor tree; only its
+    /// *presence* is observable, through [`resource_type_has_down`]).
     down: Option<ErlNifResourceDown>,
     /// `ErlNifResourceDynCall*` — invoked through [`enif_dynamic_resource_call`].
     dyncall: Option<ErlNifResourceDynCall>,
@@ -303,6 +309,16 @@ struct Registry {
     types: Vec<Box<ResourceType>>,
     /// `term word -> object` for every resource term this crate minted (see the module docs, point 1).
     terms: HashMap<usize, ResourceRef>,
+    /// The **live payload pointers** of every object this crate allocated, i.e. the set of `void*`
+    /// values that really are `&ErtsResource.data` in the C's sense.
+    ///
+    /// It exists so a `enif_*` entry point that is handed a bare `void*` `obj` can tell "an object
+    /// this crate minted" from "a pointer I must not dereference": the C reaches the owning
+    /// `ErtsResource` by pointer arithmetic on `obj` (`DATA_TO_RESOURCE`) and reads `rsrc->type`
+    /// unconditionally, which is only sound under the caller's "`obj` is one of mine" contract. The
+    /// entries are removed the moment the block is freed (see [`Registry::forget_object`]), so a
+    /// stale pointer never resolves.
+    objects: HashSet<usize>,
 }
 
 // SAFETY: the registry is a process-wide singleton guarded by a `Mutex`, and the raw pointers it
@@ -331,13 +347,33 @@ impl Registry {
         self.terms.insert(word, r);
     }
 
+    /// Record that `obj` is a **live** payload pointer this crate allocated.
+    fn register_object(&mut self, obj: *mut c_void) {
+        self.objects.insert(obj as usize);
+    }
+
+    /// Whether `obj` is a live payload pointer this crate allocated (`None` when it is not one, so
+    /// the caller must not dereference it).
+    fn object_type(&self, obj: *mut c_void) -> Option<*mut ResourceType> {
+        if !self.objects.contains(&(obj as usize)) {
+            return None;
+        }
+        // SAFETY: a registered payload pointer belongs to a block this crate `malloc`ed and has not
+        // freed (the entry is removed before the block is freed, under this very lock), so its
+        // `RESOURCE_HEADER_SIZE`-byte header is live. The header's `ty` is a `Box<ResourceType>` the
+        // registry owns and never frees.
+        Some(unsafe { (*header_ptr(obj)).ty })
+    }
+
     /// The object a resource term designates, if any.
     fn lookup_term(&self, word: usize) -> Option<ResourceRef> {
         self.terms.get(&word).copied()
     }
 
-    /// Drop every term binding to `obj` — called as the object is destroyed, so a term that still
-    /// designates it resolves to nothing instead of a dangling payload pointer.
+    /// Drop every term binding to `obj` **and** its liveness registration — called as the object is
+    /// destroyed, so a term that still designates it resolves to nothing (instead of a dangling
+    /// payload pointer) and a later [`Registry::object_type`] query answers `None` rather than reading
+    /// freed memory.
     ///
     /// An object exported as a resource term holds its own reference (module docs, point 3), so a
     /// normal alloc/export/release sequence never reaches here with bindings outstanding; this fires
@@ -346,6 +382,7 @@ impl Registry {
     /// pointer in the Rust runtime.
     fn forget_object(&mut self, obj: *mut c_void) {
         self.terms.retain(|_, r| r.obj != obj);
+        self.objects.remove(&(obj as usize));
     }
 }
 
@@ -619,7 +656,7 @@ pub unsafe extern "C" fn enif_alloc_resource(
     }
     // SAFETY: `block` owns `total = RESOURCE_HEADER_SIZE + size` bytes, so both the header and the
     // payload are in bounds; the payload is zeroed and returned.
-    unsafe {
+    let payload = unsafe {
         block.write(ResourceHeader {
             refcount: AtomicUsize::new(1),
             ty: ty.cast::<ResourceType>(),
@@ -628,7 +665,11 @@ pub unsafe extern "C" fn enif_alloc_resource(
         let payload = payload_ptr(block);
         core::ptr::write_bytes(payload, 0, size);
         payload.cast::<c_void>()
-    }
+    };
+    // Publish the payload as a live object of this crate, so a later `void*` operand (for instance
+    // `enif_monitor_process`'s `obj`) can be recognised as one of ours before it is dereferenced.
+    with_registry(|r| r.register_object(payload));
+    payload
 }
 
 /// Take one extra reference on a live resource object — the `erts_bin_inc_refc` increment that
@@ -751,6 +792,36 @@ pub unsafe extern "C" fn enif_sizeof_resource(obj: *mut c_void) -> size_t {
     }
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
     unsafe { (*header_ptr(obj)).data_sz }
+}
+
+/// Whether the resource object `obj` belongs to a type this crate opened **with** a `down` callback
+/// — the C's `rsrc->type->fn.down` presence, the fact `enif_monitor_process` gates its `-1` on
+/// (`erl_nif.c:3968-3972`, whose own `ASSERT(!rsrc->monitors == !rsrc->type->fn.down)` at `:3966`
+/// states the equivalence).
+///
+/// `None` means "no answer": `obj` is null, or it is not a live payload pointer this crate minted
+/// (an object from another NIF module, a term-shaped word, a freed block). The caller must then fall
+/// back to its own behaviour — this function **never** dereferences a pointer it does not recognise,
+/// where the C would read `DATA_TO_RESOURCE(obj)->type` unconditionally.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1, `tests/fixtures`-style NIF, both resource types
+/// opened from the `load` callback — the only place the C allows it, `erl_nif.c:2708`):
+/// `enif_open_resource_type` (`members = 1`, no `down`) ⇒ `enif_monitor_process` answers `-1` for
+/// both a live and an undefined target; `enif_init_resource_type` with `members = 3` and a `down` ⇒
+/// `0` for a live target and `1` for an undefined one.
+pub fn resource_type_has_down(obj: *mut c_void) -> Option<bool> {
+    if obj.is_null() {
+        return None;
+    }
+    with_registry(|r| {
+        let ty = r.object_type(obj)?;
+        if ty.is_null() {
+            return None;
+        }
+        // SAFETY: `ty` is the registry's own `Box<ResourceType>` (never freed), so reading its
+        // `down` slot is always in bounds.
+        Some(unsafe { (*ty).down }.is_some())
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
