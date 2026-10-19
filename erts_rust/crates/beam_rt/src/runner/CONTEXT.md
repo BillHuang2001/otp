@@ -272,6 +272,7 @@ Per-slice cost on a non-triggered bin vheap is **one cached observation**: `OffH
 A declined prune retains the whole reservoir, and the `-eval` route never prunes at all (its machine is not in `RunnerState` and allocates on the pointer-stable arena, so its park publishes nothing).
 A slice that never pre-empts never prunes either — the cadence is the **park** cadence, so a payload-building loop whose body crosses no refusing seam at all is not pruned until it parks, its envelope then bounded by one slice's worth of payloads.
 What is measured, and where the figures live: `erlang:memory(binary)` (`binary_alloc`'s live bytes) and the process's RSS across a build-a-binary loop, against the oracle's — the measured envelope and its caveats are [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, whose suite is [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) (the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md) carries the loop workloads' RSS).
+The end-to-end figures on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, `PRE-FIX` vs `POST-FIX` vs the oracle, all from the identical `.beam` — are *Measured* below.
 ## Per-slice (not per-instruction) host cost
 Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interpreter tier, the two
 `ensure_heap` doors, and a per-BIF/per-call `spend` on the native tier), one slice's prologue/epilogue
@@ -525,6 +526,26 @@ off-heap literal — not a container in a region the collector does not scan at 
 valve never declines, the descent latch stays closed, and the retired chain stays collapsed
 instead of growing with the iteration count. A constant payload a module *builds* would instead be
 a foreign container that forwards nothing scanned: also inert, so also collected.
+
+### The off-heap reclamation end to end — `emqx_base62:encode/1` on the unmodified EMQX module (`PRE-FIX` `dc63fd7f49` → `POST-FIX`)
+All three legs run the **identical** `.beam` — the unmodified `emqx_base62.erl` plus a driver loop — release builds, this runtime's default execution tier, **21 interleaved rounds** each.
+`PRE-FIX` is `dc63fd7f49`, the commit immediately before the reclamation change; the oracle is the system ERTS (`erl` on `PATH`, OTP 29.1.1 / erts-17.1) at its own loop count.
+The estimator is the **startup-cancelled paired marginal**, `median(wall@N − wall@0)/N`, each round sampling the `N`-op and the `0`-op pass **back to back**; rust loops are `N` = **60 000**, the oracle's `N` = **3 000 000**.
+The host is **shared and loaded** (`/proc/loadavg` 7–19 across the session), so the ratios here and the memory figures are the durable signal and the absolute wall times are not.
+These are **measured** figures rather than ones a test asserts: the mechanism's in-repo pin is the per-fixture suite named at the end of this section.
+
+| leg | ns/call | `erlang:memory(binary)` @N=1 000 | @N=10 000 | `VmHWM` @N=10 000 | `VmHWM` @N=600 000 |
+|---|---:|---:|---:|---:|---:|
+| `PRE-FIX` (`dc63fd7f49`) | 6 901.8 | 1 072 000 B | 10 720 000 B | 132.1 MB | 878.7 MB |
+| `POST-FIX` (HEAD) | 6 110.6 | 272 288 B | 315 168 B | 119.9 MB | 119.8 MB |
+| system-ERTS oracle | 223.4 | ~22 000 B | ~21 000–32 000 B | 69.9–70.9 MB | — |
+
+**The leak removed is exactly 1 072 B per call** — a 1 024-byte payload plus its 48-byte off-heap header — and it is perfectly linear pre-fix (`1 072 000` → `10 720 000` over the 10× step), so a process doing 10 M encodes holds ~10 GB.
+Post-fix that same 10× step adds **42 880 B**, a one-off heap growth and not a per-call trend, and the RSS is **flat**: `VmHWM` 119.9 MB at N = 10 000 against 119.8 MB at N = 600 000 (a 60× step), where the pre-fix side goes 132.1 → 878.7 MB.
+**Throughput:** `POST/PRE` = **0.885** and the independent 9-round pass' **0.958** agree in direction, but the size is load-dominated, so only a **4–12 %** speed-up is claimed; `POST/oracle` is **27.4×** against `PRE/oracle`'s **30.9×**.
+**This is a memory fix, not a throughput fix**: the leaked payloads were unreferenced and never traversed, so the pre-fix leak cost no measurable time and there is **no throughput cliff at 878 MB**.
+The per-fixture envelope — the N-step figures, the sawtooth ladder, the disabled-site A/B and the retained-payload half of [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) — lives in [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, which owns those figures.
+The `emqx_base62_encode` row of the `foreign` table above is the `bench` driver's own 8-round minimum-of-rounds pass at its own loop count, so its `rust/sys` ratio is not a like-for-like pair with this table's interleaved paired marginal; read each with its own method paragraph.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.

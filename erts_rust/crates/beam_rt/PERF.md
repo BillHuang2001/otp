@@ -157,8 +157,9 @@ This snapshot's `baseline`/`slice` figures are its own preloaded-only-slice meas
 regime of *Current startup regime*), while the per-unit interpreter cost is still far higher
 (**13.9×–145.5×** across the startup-cancelled marginals). `slice` peak RSS remains the one
 like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB**
-→ rust **2.60× lower** (essentially unchanged from `AFTER`'s 2.46×); the loop workloads' rust peak RSS
-grows with the per-runtime loop count `N` (`RESULTS.md` §6.7) and is **not** comparable. The `foreign`
+→ rust **2.60× lower** (essentially unchanged from `AFTER`'s 2.46×); a loop workload's rust peak RSS
+is **not** comparable across runtimes — each shape's growth is its own, and only a shape measured at its
+own `N` says anything ([`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*). The `foreign`
 per-call gap vs the system runtime (**41×–64×**) sits in the same band as `AFTER`'s (**37×–55×**) — the
 `CURRENT` default runs the baseline tier on the *whole* process, so this is the tier-inclusive figure.
 
@@ -423,6 +424,7 @@ The re-pointed path was probed directly — a compiled `<<0:N/unit:8>>` held liv
 The differential cases `gc/process_info_gc_key_set_is_stable`, `gc/process_info_memory_is_positive_integer` and `system_info/process_info_bulk_returns_list` all report `[AGREE]`; **no corpus case exercises the `binary` item**, which `tools/differential/src/corpus/gc.rs` documents as a deliberate capability gap.
 
 **Where the memory ceiling is bounded.** The reservoir is not an accumulator: the runner's `Yield` arm prunes it at the slice boundary whenever the process's binary virtual heap is over its budget, releasing every payload its just-published roots no longer reach (`src/context/gc/bin_vheap.rs`), so `erlang:memory(binary)` is flat in the iteration count — the figures, the sawtooth envelope, the disabled-site A/B and the retained-payload half are [`CONTEXT.md`](CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, measured by `tests/off_heap_reclaim.rs`.
+The end-to-end effect on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, `PRE-FIX` `dc63fd7f49` vs `HEAD` vs the oracle, all three legs from the identical `.beam` — is [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*; the mirror A/B above is the per-call half of this machinery, never a memory one.
 The residuals are that prune's own (a `Wait` park, a declined gate, an un-pre-empted slice, the `-eval` route) — a leak, never a dangle: [`src/context/CONTEXT.md`](src/context/CONTEXT.md) *The off-heap refc-binary reclamation*.
 `Process::sweep_off_heap_binaries` returns before touching the roster when nothing was declared dead, so an empty slot space costs nothing on the per-call path.
 
