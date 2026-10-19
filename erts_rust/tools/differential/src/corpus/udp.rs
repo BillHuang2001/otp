@@ -87,36 +87,31 @@
 //! itself, the `port_info(P, id)` index, the owning pid and the `ports/0` length are all
 //! specific to one VM, so they are compared **relative** to `self()`/before-open (`=:= self()`,
 //! `length(Links)`, `During - Before`) or only by their class (`is_integer/1`, `is_port/1`) —
-//! never by value. Every expression terminates on its own with no `receive`, so there is no
-//! `after` guard to need (and none is missing).
+//! never by value. Every expression terminates on its own: the only `receive` in the group is the
+//! bounded `after 500 -> timeout` wait of the caller-ref `port_command/2` row, and its **oracle**
+//! answer is the golden (no reply arrives on either side), so nothing depends on host load.
 //!
-//! # The datagram *data* path: the write half agrees, the external read half does not
+//! # The datagram data path: the write half, the read half and the port grammar agree
 //!
-//! The control/option verb transport above works on both runtimes, and so does the emulator's
-//! `inet:getstat/1` counter reply. So does the **write** path: `gen_udp:send/4` answers `ok` on
-//! both sides and the in-VM loopback pair (`gen_udp:send/4` to the socket's own port, then
-//! `gen_udp:recv/3`) agrees, so the `inet_reply` bridge is in place. Measured in this
-//! environment (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`) on a socket the
-//! `open`/`bind` verbs produced, what `beam_rt` still lacks is the datagram **delivery** and the
-//! socket-less port's `port_command/2` grammar:
+//! Measured in this environment (oracle OTP 29.1.1 / `erts-17.1`, and the built `beam_rt`)
+//! on a socket the `open`/`bind` verbs produced:
 //!
-//! * **an incoming datagram is never delivered.** With a `{active, true}` socket a datagram
-//!   injected from outside the VM (`os:cmd("printf abc > /dev/udp/127.0.0.1/P")`) arrives as
-//!   `{udp, S, {127,0,0,1}, _, <<"abc">>}` under the oracle and as nothing at all here;
-//!   `gen_udp:recv/3` answers `{error, einval}` under the oracle and raises
-//!   `{case_clause, {ok, …}}` inside `prim_inet:recvfrom0/3` here. So no read-path reassembly or
-//!   truncation refusal can be pinned. Owner: `beam_rt` / `beam_io`.
+//! * **an incoming datagram is delivered.** The module-level read half — an active-mode
+//!   `{udp, S, Ip, Port, Data}` delivery from a *second* socket in the same VM, the passive
+//!   `gen_udp:recv/3` that returns the payload, and the same delivery from a datagram injected by
+//!   a **separate OS process** — agrees, so the receive path is pinned in
+//!   [`super::inet_control`] (this group drives the bare port BIFs only). The write path agrees
+//!   too (`gen_udp:send/4` answers `ok`).
 //! * **`erlang:port_command/2` on the socket-less port** (a port whose `INET_REQ_OPEN` was never
-//!   sent) is the sharp edge of the same gap: the oracle answers `true` and then kills the port
-//!   (`init_caller` fails, `driver_failure_posix(EINVAL)`, `inet_drv.c:15055`, so `port_info/2`
-//!   is afterwards `undefined` and a second `port_close/1` is `badarg`), while `beam_rt` raises
-//!   `error:badarg` and leaves the port **alive** — the two sides share no observable there, so
-//!   this group pins `port_command/2` only on a **closed** port (both sides `badarg`) and the
-//!   socket-less pair is reported to the owner instead.
+//!   sent) now follows the C's grammar on both sides, so it *is* pinned here: a bare payload
+//!   answers `true` and then kills the port (`init_caller` fails,
+//!   `driver_failure_posix(EINVAL)`, `inet_drv.c:15055`, so `port_info/2` is afterwards
+//!   `undefined` and a following `port_close/1` is `badarg`), while a caller-ref prefixed
+//!   payload (`<<0, 0, "hi">>`) answers `true`, leaves the port alive and delivers no
+//!   `{inet_reply, _, _}` within a bounded wait. `udp/port_command_on_a_socket_less_port_kills_it`
+//!   and `udp/port_command_with_a_caller_ref_prefix_keeps_the_port` pin those two arms.
 //!
-//! Owner of both: `beam_rt` (the built-in-driver `port_command` bridge) / `beam_io` (the
-//! driver's `recv` verb). No row below pins either of them; the module docs of
-//! [`super::inet_control`] carry the full measured matrix.
+//! Owner of the port grammar: `beam_rt` / `beam_io`.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.4 `udp_inet` eval case.
@@ -462,6 +457,31 @@ pub(crate) fn group() -> Vec<Case> {
             "ok {0,true,true}",
         ),
         case(
+            "udp/port_command_on_a_socket_less_port_kills_it",
+            "erlang:port_command/2 on a socket-less udp_inet port (no INET_REQ_OPEN yet) answers true and the port then dies: port_info(P,name) is undefined and a following port_close/1 raises error:badarg",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             Sent = try erlang:port_command(P, <<\"hi\">>) \
+                    catch error:Rs -> {error, Rs} end, \
+             {Sent, erlang:port_info(P, name), \
+              try erlang:port_close(P) catch error:Cs -> {error, Cs} end} end",
+            "ok {true,undefined,{error,badarg}}",
+        ),
+        case(
+            "udp/port_command_with_a_caller_ref_prefix_keeps_the_port",
+            "erlang:port_command/2 with a two-byte caller-ref prefix (<<0,0,\"hi\">>) on a socket-less udp_inet port answers true, leaves the port alive and delivers no {inet_reply,_,_} reply within a bounded 500 ms wait",
+            &[Contract::DriverAbi],
+            "begin P = open_port({spawn_driver, \"udp_inet\"}, [binary]), \
+             Sent = try erlang:port_command(P, <<0, 0, \"hi\">>) \
+                    catch error:Rs -> {error, Rs} end, \
+             Rep = receive {inet_reply, P, St} -> {inet_reply_tag, St} \
+                   after 500 -> timeout end, \
+             Alive = erlang:port_info(P, name), \
+             true = erlang:port_close(P), \
+             {Sent, Rep, Alive} end",
+            "ok {true,timeout,{name,[117,100,112,95,105,110,101,116]}}",
+        ),
+        case(
             "udp/port_command_on_a_closed_port_is_badarg",
             "erlang:port_command/2 on an already closed udp_inet port raises error:badarg on both runtimes (caught inside the expression, so the observable is the reason atom)",
             &[Contract::DriverAbi],
@@ -483,7 +503,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_udp_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 30, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 32, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -527,41 +547,32 @@ mod tests {
         );
     }
 
-    /// The shapes that are out of the group stay out: the datagram *data* path (an incoming
-    /// datagram is never delivered, and a `gen_udp:recv/3` fails inside `prim_inet`) and the
-    /// `prim_inet` module whose calls would drive it (see the per-item comments below). The
-    /// datagram *write* path is no longer one of them — `gen_udp:send/4` answers `ok` on both
-    /// sides — so the ban below is simply "no row drives the data path".
+    /// This group drives the **bare port BIFs** only: the module-level socket API (`gen_udp:*`)
+    /// and the `prim_inet` verbs behind it belong to [`super::inet_control`], which owns the
+    /// datagram/stream data path. So the ban below is "no row goes through the module layer".
     ///
-    /// `port_command/2` is pinnable **only on a closed port** (both runtimes answer `badarg`):
-    /// on the socket-less port the two runtimes share no observable at all (the oracle answers
-    /// `true` and then kills the port, `beam_rt` raises `badarg` and keeps it — see the module
-    /// docs), so a `port_command` row must close the port first.
+    /// `port_command/2` on the socket-less port **is** pinnable on both sides now — the runtime
+    /// reproduces the C's `init_caller` grammar (a bare payload answers `true` and then kills the
+    /// port via `driver_failure_posix(EINVAL)`, a caller-ref-prefixed one answers `true` and the
+    /// port survives) — see `udp/port_command_on_a_socket_less_port_kills_it` and
+    /// `udp/port_command_with_a_caller_ref_prefix_keeps_the_port`, so there is no rule forcing a
+    /// `port_close/1` before the send any more. The closed-port refusal stays pinned too
+    /// (`udp/port_command_on_a_closed_port_is_badarg`).
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
             let expr = case.expr().expect("eval case");
             for forbidden in [
-                // The send verb: it drives the data path (and its `recv` half), which no row may
-                // pin until the delivered-datagram bridge exists.
+                // The module-level datagram verbs: they belong to the `inet_control/` group,
+                // which pins the read/write data path end to end.
                 "gen_udp:send",
-                // The read path: no datagram is ever delivered, so `recv` fails inside
-                // `prim_inet` (`{case_clause, {ok, …}}`) instead of answering.
                 "gen_udp:recv",
                 "prim_inet",
             ] {
                 assert!(
                     !expr.contains(forbidden),
-                    "case {} pins `{forbidden}`, a measured divergence (see the module docs)",
-                    case.id
-                );
-            }
-            if let Some(sent) = expr.find("port_command") {
-                assert!(
-                    expr.find("erlang:port_close(P)")
-                        .is_some_and(|closed| closed < sent),
-                    "case {} sends a port_command before closing the port — the socket-less \
-                     shape has no shared observable on the two runtimes (see the module docs)",
+                    "case {} reaches the module-level socket API (`{forbidden}`), which this \
+                     group does not drive (see the module docs)",
                     case.id
                 );
             }
