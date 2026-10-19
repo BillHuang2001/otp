@@ -73,3 +73,4 @@ The oracle-cross-checked goldens at the crate level are `tests/zlib*.rs` (the si
 - `stream/lifecycle.rs` → `open`/`close`/`set_controller`/`enqueue` and the three stash keys
 - `stream/deflate.rs` → the six `deflate*_nif` keys
 - `stream/inflate.rs` → the six `inflate*_nif` keys
+- `stream/tests.rs` → the golden suite (embedded oracle bytes: the per-level leaf-size vectors, level 6's 129-byte sync-flush stream, the one-shot images per framing/strategy, the `safeInflate` chunk sequence, the dictionary protocol, the `deflateParams` mid-stream total, the prologue/lifecycle guards, the stash round trip); long by design — 57 tests carrying the goldens inline, the same convention as `beam_deflate/tests/deflate_goldens.rs`
