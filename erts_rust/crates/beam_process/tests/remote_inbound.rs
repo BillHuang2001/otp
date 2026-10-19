@@ -29,9 +29,14 @@
 //! The one property every inbound entry point must have and the C's receipt arms do have
 //! (`dist.c:2258` `break; /* Done */`) is that it **never echoes the opcode it received**: the
 //! installed [`DistSignalRouter`] is a recording seam, and every case here asserts it stayed
-//! **empty** for the signal the API consumed. The only routed signal allowed in these tests is
-//! the one a *locally-initiated* setup step produced (e.g. the `DOP_MONITOR_P` an outgoing
-//! [`ProcessTable::monitor_term`] emits before the inbound DOWN is applied).
+//! **empty** for the signal the API consumed. The only routed signals allowed in these tests are
+//! the ones a *locally-initiated* setup step produced (e.g. the `DOP_MONITOR_P` an outgoing
+//! [`ProcessTable::monitor_term`] emits before the inbound DOWN is applied) and the one a
+//! **death** produces: resolving an incoming-watcher record by the watched process's death routes
+//! one [`DistSignal::MonitorExit`] per record (`DOP_MONITOR_P_EXIT`, the C's
+//! `erts_dsig_send_m_exit`) so the peer's `{'DOWN', Ref, …}` is actually sent — a receipt never
+//! does, but a death does (see [`DistSignal::MonitorExit`] and `tests/remote_monitor_exit.rs`,
+//! which pins that outbound half in full).
 //!
 //! Semantics are the C's: `dist.c`'s receipt switch (link/unlink/monitor/exit/group-leader arms)
 //! and `erl_proc_sig_queue.c`'s `handle_exit_signal` (the link-exit vs `exit/2` trap rules). The
@@ -653,11 +658,28 @@ fn an_incoming_watcher_record_dies_with_the_watched_process() {
     table
         .monitor_from_remote(watched, rpid, reference, MonitorKind::Process)
         .expect("watched is live");
+    assert!(log.borrow().is_empty(), "an inbound DOP_MONITOR_P is never echoed");
 
     table.terminate(watched, make_small(0)).expect("watched is live");
     assert!(!table.contains(watched));
     assert!(table.remote_watchers(watched).is_empty());
-    assert!(log.borrow().is_empty());
+
+    // The death is the resolution, not a silent drop: a remote process holding a
+    // `erlang:monitor(process, Watched)` must be told the subject is gone, so exactly one
+    // `DOP_MONITOR_P_EXIT` is routed (`erts_dsig_send_m_exit`,
+    // `{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}`, `dist.c:1497-1519`
+    // — watched first, the reverse of the monitor family's `{DOP_MONITOR_P, watcher, watched,
+    // ref}`). The reference goes back in the spelling the record holds.
+    assert_eq!(
+        log.borrow().as_slice(),
+        &[DistSignal::MonitorExit {
+            watched,
+            watcher: rpid,
+            reference: RemoteWatcherRef::Local(reference),
+            reason: make_small(0),
+        }],
+        "the watched process's death routes exactly one DOP_MONITOR_P_EXIT for its watcher"
+    );
 }
 
 #[test]
@@ -784,7 +806,19 @@ fn an_incoming_watcher_record_is_dropped_by_death_and_by_demonitor() {
     ));
     assert!(table.remote_watchers(dying).is_empty());
 
-    assert!(log.borrow().is_empty());
+    // The death **routes** the pending monitor-exit signal — one per record, the C's
+    // `erts_dsig_send_m_exit` (`dist.c:1497-1519`) — while the two `DOP_DEMONITOR_P` receipts
+    // above routed nothing. `demonitored` never died, so it contributes no signal.
+    assert_eq!(
+        log.borrow().as_slice(),
+        &[DistSignal::MonitorExit {
+            watched: dying,
+            watcher,
+            reference: RemoteWatcherRef::Local(reference),
+            reason: make_small(0),
+        }],
+        "the death resolves the one surviving record by routing its DOP_MONITOR_P_EXIT"
+    );
 }
 
 #[test]
