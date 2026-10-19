@@ -642,11 +642,19 @@ for the transport state.
   `mismatch`, so it stays out of the corpus. Owner: `beam_codec` (the decoder's nesting bound).
 
 ## A.9 — in-process compile: measured routes that cannot be cases (owner: `beam_bifs`, `beam_engine`/`beam_rt`)
-Each route below was measured while the `selfhost` artifact block was added. None is a divergence:
-both sides matched, and the route was not turned into a case for the reason given.
-- **`compile:string/2,3` and `compile:forms(…, [report])` are `undef` on both sides** — no such export
-  exists in the installed OTP 29 stdlib — so there is no observable at all. Nothing to close; the
-  owner-if-closed is `beam_bifs`.
+Each route below was measured while the `selfhost` and `selfhost_chain` blocks were added. None is a
+divergence: both sides matched, and the route was not turned into a case for the reason given.
+- **`compile:string/2,3` is `undef` on both sides** — no such export exists in the installed OTP 29
+  stdlib — so a "compile from a string" hop has no observable at all: the scan → parse → forms chain
+  (`selfhost_chain/compiled_erl_scan_scans_the_next_module`) is the shape that does exist. Nothing to
+  close; the owner-if-closed is `beam_bifs`.
+- **`compile:forms(Forms, [report])` prints its diagnostics to stdout** (measured:
+  `:5: Warning: function unused/0 is unused` — `report` is an *option*, served on both sides, and the
+  return is a 4-tuple when `return_warnings` accompanies it), which would put a compiler-diagnostic
+  line before the probe's single `ok …` line — an error-logger formatting detail, not a runtime
+  property. `selfhost_chain/forms_option_list_shapes_and_the_invariant_artifact` therefore exercises
+  `report` on **clean** forms only, where it is silent, and the printing route stays unpinned. Owner:
+  `beam_bifs`.
 - **A `{outdir,…}` + `-include` of a kernel/stdlib header is `{badmatch,error}` on both sides
   *without* `{i,…}`.** With `[{i,"lib/kernel/include"},{d,'BEFORE_REWRITE',true}]` both sides compile
   (≈16 s each) and produce **identical** export tables, so there is no discriminating observable; it
@@ -660,6 +668,35 @@ both sides matched, and the route was not turned into a case for the reason give
 - **`compile:forms/2` IS supported by `beam_rt`** — the two landed cases compile *and execute*
   through it — so the "measure first, drop if unsupported" rule did not bite there (recorded so a
   future pass does not re-measure it as a gap).
+- **Compiling the real `lib/stdlib/src/erl_lint.erl` (5899 source lines) in-process and linting with
+  the fresh copy agrees on both sides** — the fresh `selfhost_chain_lint` answers
+  `[{3,erl_lint,{unused_var,'X'}}]`, `[]` and `{[{5,erl_lint,{unbound_var,'Z'}}],[]}` — but the
+  compile alone costs ≈ **164 s** on the Rust runtime against ≈ **1.3 s** on the oracle (the compiler
+  runs ~50× slower here on a large source: an execution-engine property, not a divergence), far past
+  what a gate case may carry. The group pins the same "a fresh copy of the compiler's own code answers
+  the questions" claim on `lib/compiler/src/erl_bifs.erl`, which compiles in ≈ 1 s. Owner:
+  `beam_engine` / `beam_rt` (throughput of a large compile in the calling process).
+- **`beam_lib:md5/1` of a `compile:forms/2` image is not equal to the `compile:file/2` image's** — the
+  file route's image carries a `Meta` chunk (`[{enabled_features,[maybe_expr]}]`) that the forms
+  route's does not, and `Meta` is one of `beam_lib`'s md5-significant chunks; both runtimes produce the
+  same two images, so this is a property of OTP's compiler, not of the runtime. The stage-seam case
+  pins the relation at the md5-significant chunk list **minus `Meta`** instead. Owner-if-ever:
+  `beam_bifs` (the compile surface).
+- **A freshly compiled artifact loaded under a *stdlib* module name is refused with
+  `{error, sticky_directory}`**, so every case that loads what it compiled first renames the module
+  attribute — which is also what makes the hand-off observable (the module that runs is the one this
+  run produced, under a name no installation owns). The shape where the two rules do differ is the
+  *already-loaded* sticky module's own image (the A.9 code-server entry above). Owner: `beam_rt`
+  (code server).
+- **`beam_lib:all_chunks/1` returns a 3-tuple** (`{ok, Module, Chunks}`), so a case destructures the
+  third element and never matches `{ok, Chunks}`. Owner: `beam_bifs`.
+- **The `erl_scan` case is an expression case on cost grounds**: compiling the real
+  `lib/stdlib/src/erl_scan.erl` (2318 source lines) costs ≈ **36 s** in the calling process on the
+  Rust runtime against ≈ **0.7 s** on the oracle (measured), and the module-run argv would pay the
+  freshly-spawned-process penalty on top (≈ 9–16×, the entry in the A.9 in-process-compile section
+  above). 2318 source lines is the smallest source that still is the *real* scanner, so
+  `selfhost_chain/compiled_erl_scan_scans_the_next_module` stays an expression case. Owner:
+  `beam_engine` / `beam_rt`.
 
 ### Widened live two-node traffic measured while filling in `dist_extra` (`beam_rt`, `beam_process`)
 

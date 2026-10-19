@@ -585,11 +585,15 @@ mod tests {
     }
 
     /// The expression of a case, panicking when it is not an expression case.
+    ///
+    /// The expression is taken straight out of [`CaseKind::Eval`]: the assertions below search
+    /// the **raw** expression text (the repo-relative source binding, the staged calls, the
+    /// chunk list), never a rendered or re-quoted form of it.
     fn expr_of(case: &Case) -> &'static str {
-        let Some(expr) = case.expr() else {
-            panic!("case {} is not an expression case", case.id);
-        };
-        expr
+        match &case.kind {
+            CaseKind::Eval { expr, .. } => expr,
+            _ => panic!("case {} is not an expression case", case.id),
+        }
     }
 
     /// The module-run invocation of a case, panicking when it is not a module-run case.
@@ -722,10 +726,17 @@ mod tests {
             (3, "lib/stdlib/src/erl_scan.erl"),
         ] {
             let expr = expr_of(&cases[index]);
-            let needle = format!("epp:parse_file(\"{source}\"");
+            // The route binds the repo-relative path to `File` and hands *that* to the front
+            // end, so both halves are asserted: the named source and the parse of the binding.
+            let binding = format!("File = \"{source}\", ");
             assert!(
-                expr.contains(&needle),
-                "case {}: the staged route parses the repo-relative {source:?}",
+                expr.contains(&binding),
+                "case {}: the staged route binds the repo-relative {source:?}",
+                cases[index].id
+            );
+            assert!(
+                expr.contains("epp:parse_file(File, [])"),
+                "case {}: and parses exactly that source (the bound `File`)",
                 cases[index].id
             );
             let path = repo_root().join(source);
@@ -808,7 +819,8 @@ mod tests {
         let cases = group();
         let expr = expr_of(&cases[0]);
         for needle in [
-            "epp:parse_file(\"lib/stdlib/src/dets_sup.erl\", [])",
+            "File = \"lib/stdlib/src/dets_sup.erl\"",
+            "epp:parse_file(File, [])",
             "erl_lint:module(Forms)",
             "erl_scan:string(\"twice(N) -> 2 * N.\")",
             "compile:forms(Forms, [binary, no_spawn_compiler_process, deterministic])",
@@ -852,7 +864,8 @@ mod tests {
         let cases = group();
         let expr = expr_of(&cases[1]);
         for needle in [
-            "epp:parse_file(\"lib/stdlib/src/erl_internal.erl\", [])",
+            "File = \"lib/stdlib/src/erl_internal.erl\"",
+            "epp:parse_file(File, [])",
             "{attribute, Anno, module, selfhost_chain_internal}",
             "erl_lint:module(Forms)",
             "beam_lib:md5(Bin)",
@@ -876,12 +889,12 @@ mod tests {
                 && !expr.contains("erl_internal:bool_op"),
             "every call goes to the renamed, freshly loaded module"
         );
-        // Eight predicates, both polarities, so a runtime that loaded the wrong module (or none)
-        // cannot answer the golden.
+        // Nine predicates, both polarities, so a runtime that loaded the wrong module (or none)
+        // cannot answer the golden — one call per boolean the golden carries.
         assert_eq!(
             expr.matches("selfhost_chain_internal:").count(),
-            8,
-            "the case calls eight of the freshly loaded copy's predicates"
+            9,
+            "the case calls nine of the freshly loaded copy's predicates"
         );
         assert!(
             expr.contains("selfhost_chain_internal:arith_op('foo', 2)")
@@ -899,7 +912,8 @@ mod tests {
         let cases = group();
         let pass = expr_of(&cases[2]);
         for needle in [
-            "epp:parse_file(\"lib/compiler/src/erl_bifs.erl\", [])",
+            "File = \"lib/compiler/src/erl_bifs.erl\"",
+            "epp:parse_file(File, [])",
             "{attribute, A, module, selfhost_chain_erl_bifs}",
             "code:load_binary(selfhost_chain_erl_bifs, \"selfhost_chain_erl_bifs.beam\", Bin)",
             "selfhost_chain_erl_bifs:is_pure(erlang, abs, 1)",
@@ -922,7 +936,8 @@ mod tests {
 
         let scan = expr_of(&cases[3]);
         for needle in [
-            "epp:parse_file(\"lib/stdlib/src/erl_scan.erl\", [])",
+            "File = \"lib/stdlib/src/erl_scan.erl\"",
+            "epp:parse_file(File, [])",
             "{attribute, A, module, selfhost_chain_scan}",
             "code:load_binary(selfhost_chain_scan, \"selfhost_chain_scan.beam\", Bin)",
             "selfhost_chain_scan:string(\"-module(chain_scanned).\", 1)",
