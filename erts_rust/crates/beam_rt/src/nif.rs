@@ -446,8 +446,8 @@ pub(crate) trait NifHostServices {
     }
 }
 
-/// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
-/// and process table.///
+/// The concrete [`NifHostServices`] over the runtime's reference registry and process table (its
+/// `make_ref` draws from the one shared local reference-id space every producer uses).///
 /// The two fields are **disjoint borrows**: the runtime itself, and the caller-supplied process
 /// table when the call runs inside a scheduler slice. That table lives outside the runtime (a pass
 /// takes it out before running a process: the runner cannot lend the same table to both a
@@ -459,9 +459,9 @@ pub(crate) trait NifHostServices {
 /// what lets [`NifHostServices::send`] build the nested delivery context a `send` requires — a
 /// delivery is the runtime's ordinary [`RuntimeContext::send_message`] path, not a second copier.
 pub(crate) struct RuntimeNifServices<'a> {
-    /// The runtime the hooks draw on: its reference id space and registry (the NIF `make_ref`), its
-    /// process tables (a name lookup, the liveness answers, a delivery) and its port registry
-    /// (contract A.4).
+    /// The runtime the hooks draw on: the shared reference-id space and the reference registry (the
+    /// NIF `make_ref`), its process tables (a name lookup, the liveness answers, a delivery) and its
+    /// port registry (contract A.4).
     pub(crate) runtime: &'a mut crate::runtime::Runtime,
     /// The caller-supplied process table, when the NIF call runs inside a scheduler slice.
     pub(crate) mailbox: Option<&'a mut ProcessTable>,
@@ -583,8 +583,8 @@ impl NifHostServices for RuntimeNifServices<'_> {
     /// with the very relation [`NifHostServices::is_process_alive`] answers
     /// (`ProcessTable::is_process_alive`, the same one `erlang:is_process_alive/1` uses) so
     /// `enif_is_process_alive` and this hook can never disagree; (2) the identity is an ordinary
-    /// internal reference minted exactly as [`NifHostServices::make_ref`] mints one (the runtime's
-    /// own reference id space, registered as a **plain** reference); (3) the runtime records
+    /// internal reference minted exactly as [`NifHostServices::make_ref`] mints one (the one shared
+    /// local reference-id space, registered as a **plain** reference); (3) the runtime records
     /// `(monitor, target)` in its index, which is what the death path
     /// ([`crate::runtime::ets_owner`]) delivers the resource type's `down` callback from.
     ///
@@ -1143,7 +1143,7 @@ impl NifHost for NifHostImpl<'_> {
         self.atoms.lookup(name).map(make_atom)
     }
 
-    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's own reference id space.
+    /// `enif_make_ref()` — a fresh reference, drawn from the one shared local reference-id space.
     ///
     /// Delegates to the borrowed [`NifHostServices`]: the provider allocates the next id, builds
     /// the reference thing on **this host's** heap and registers it as a plain reference (so
@@ -2793,7 +2793,8 @@ mod tests {
     }
 
     /// The runtime provider **arms a real monitor** on a live process: it mints an ordinary
-    /// internal reference from the runtime's own id space, registers it as a plain reference, and
+    /// internal reference from the one shared local reference-id space, registers it as a plain
+    /// reference, and
     /// records `(monitor, pid)` in the runtime's monitor index — the state `enif_monitor_process`
     /// answers the C's `0` from. A dead pid and a non-pid are the C's `1`, and the demonitor
     /// answers its `0` exactly once.

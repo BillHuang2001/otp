@@ -63,12 +63,14 @@
 //!
 //! # The **provenance bridge** (how a destination is classified)
 //!
-//! A reference term carries an `id` word, but this runtime has **two independent** reference
-//! id spaces — [`Runtime::refs`](crate::Runtime) (fed by `erlang:make_ref/0`, the NIF
-//! `make_ref`, the timers and `seq_trace`) and the [`ProcessTable`]'s own allocator (fed by
-//! every `erlang:monitor/2,3` and `erlang:alias/1`). Both start at `0`, so the same id can
-//! name a bare `make_ref/0` term **and** a live alias, and resolving a destination by its
-//! parsed id alone would deliver to the wrong place.
+//! A reference term carries an `id` word, but an id alone does not say **which producer** minted
+//! the term: [`Runtime::refs`](crate::Runtime) feeds `erlang:make_ref/0`, the NIF `make_ref`, the
+//! timers and `seq_trace`, while the [`ProcessTable`]'s allocator feeds every
+//! `erlang:monitor/2,3` and `erlang:alias/1`. (Both are handles onto the *same* monotone
+//! process-wide id space — `beam_common::next_ref_id` — so an id is never issued twice; what
+//! provenance adds is the **kind** of reference, not its uniqueness.) Only a monitor/alias
+//! reference may be a live alias, so resolving a destination by its parsed id alone would ask the
+//! wrong question.
 //!
 //! So the destination is classified by **provenance first**, through the runtime's term-keyed
 //! registry ([`Runtime::local_reference`](crate::Runtime)):

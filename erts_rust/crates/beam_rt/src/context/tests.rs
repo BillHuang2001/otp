@@ -1501,44 +1501,36 @@ fn a_remote_reference_on_a_non_distributed_runtime_is_still_badarg() {
         ),
         "and so does the erlang:send/2 BIF"
     );
-}/// Puts the runtime's **own** reference allocator onto `id`, so its next draw mints exactly `id`.
-///
-/// [`beam_process::RefAllocator`] is monotone from `0`, so advancing a fresh allocator `id` times
-/// lands the *next* draw on `id`: the deterministic way to force the runtime's reference id space
-/// and the process table's onto the same number (the collision HAZARD-2 covers).
-fn force_next_reference_id(rt: &mut Runtime, id: u64) {
-    let mut allocator = beam_process::RefAllocator::new();
-    for _ in 0..id {
-        allocator.next();
-    }
-    rt.refs = allocator;
 }
 
-/// The **id-collision regression guard** for the provenance bridge
+/// The **provenance-first regression guard** for the destination classifier
 /// ([`super::alias::alias_destination`]).
 ///
-/// This runtime has **two independent** reference id spaces, both monotone `u64` from `0`, and both
-/// encode the very same on-heap thing `[make_header(3, REF_SUBTAG), node=0, serial=0, id]`:
+/// Every reference term in this runtime is the on-heap block
+/// `[make_header(3, REF_SUBTAG), node = 0, serial = 0, id]`, so a reference's **identity is its
+/// `id` word alone** — and resolving a `send` destination by that id alone would deliver a bare
+/// `make_ref/0` (or a timer reference) to the owner of a live alias whose id it happens to
+/// carry. The destination is therefore classified by **provenance first**
+/// ([`Runtime::local_reference`]), so a bare runtime-minted reference is never an alias, whatever
+/// its id says.
 ///
-/// * [`Runtime::refs`](crate::Runtime) — fed by `erlang:make_ref/0`, the NIF `make_ref`, the
-///   `erlang:send_after/3`/`start_timer` timer references and `seq_trace`;
-/// * the [`ProcessTable`]'s own allocator — fed by every `erlang:monitor/2,3` and `erlang:alias/0,1`
-///   (the `{alias, Mode}` monitor form included).
-///
-/// Resolving a `send` destination by its **decoded id** alone would therefore deliver a bare
-/// `make_ref/0` (or a timer reference) to a live alias's owner. The destination is classified by
-/// **provenance** first, so a bare runtime-minted reference is never an alias — even when its id
-/// coincides with one. The test forces the coincidence deterministically (both allocators are put on
-/// the same id), pins that the id-based lookup *would* have resolved (the pre-fix behaviour), and
-/// then asserts that all three `send` entry points reject the colliding reference with the typed
-/// `badarg` and deliver nothing.
+/// The coincidence is now **unrepresentable by minting**: every minted reference id — the
+/// runtime's own ref space and the process table's alike — is a draw of the one shared space
+/// ([`beam_common::next_ref_id`]), so no `make_ref/0` can ever carry a live alias's id (pinned
+/// positively by
+/// [`mints_from_the_runtime_and_the_process_table_never_share_an_id`]). This test therefore
+/// **fabricates** the colliding block explicitly, through [`MonitorRef::from_id`] — the one
+/// non-mint constructor — and records it as a bare runtime-minted reference, which is what keeps
+/// the classifier's property pinned against a future producer that draws from somewhere else.
+/// It then asserts that all three `send` entry points reject the colliding reference with the
+/// typed `badarg` and deliver nothing.
 #[test]
 fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias() {
     let mut rt = runtime();
     let owner = rt.self_pid();
 
     // 1. A live alias minted through the **real BIF** (so the runtime's provenance registry is
-    //    filled exactly as production fills it) from the process table's own allocator.
+    //    filled exactly as production fills it) from the process table's allocator.
     let alias_term = {
         let mut ctx = RuntimeContext::new(&mut rt);
         ctx.call_bif("erlang", "alias", 1, &[NIL])
@@ -1546,86 +1538,71 @@ fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias(
     };
     let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
 
-    // 2. Force the runtime's own allocator onto the alias's id before **each** mint, so the
-    //    `make_ref/0` and the timer reference both carry exactly the alias's id.
-    force_next_reference_id(&mut rt, alias.id());
-    let bare_term = {
-        let mut ctx = RuntimeContext::new(&mut rt);
-        ctx.call_bif("erlang", "make_ref", 0, &[])
-            .expect("erlang:make_ref/0")
+    // 2. The colliding bare reference, fabricated: `from_id` names the alias's id without
+    //    drawing one (no mint could produce this pair any more — that is the point of the
+    //    test), and `to_eterm` writes the very same frozen block a `make_ref/0` would.
+    let colliding_term = {
+        let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
+        MonitorRef::from_id(alias.id())
+            .to_eterm(&mut heap)
+            .expect("the four words fit")
     };
-    force_next_reference_id(&mut rt, alias.id());
-    let timer_term = {
-        let mut ctx = RuntimeContext::new(&mut rt);
-        ctx.call_bif(
-            "erlang",
-            "send_after",
-            3,
-            &[make_small(600_000), owner.to_eterm(), make_small(1)],
-        )
-        .expect("erlang:send_after/3")
-    };
+    // It is registered as a **bare** runtime-minted reference — the provenance `make_ref/0` and
+    // the timer mints record — so the classifier sees exactly the shape it must refuse.
+    rt.references.insert(colliding_term, None);
 
-    // 3. The coincidence is real: three references, one id — and the id-based lookup WOULD have
-    //    resolved both colliding references to the alias (the pre-fix wrong delivery).
+    // 3. The coincidence is real: the two references carry one id, so an id-based lookup WOULD
+    //    have resolved the bare reference to the alias (the wrong delivery the classifier
+    //    prevents).
     let id_of = |term: Eterm| MonitorRef::from_eterm(term).expect("a reference").id();
-    assert_eq!(id_of(bare_term), alias.id(), "the bare reference collides");
-    assert_eq!(id_of(timer_term), alias.id(), "the timer reference collides");
     assert_eq!(
-        rt.processes.resolve_alias(MonitorRef::from_eterm(bare_term).expect("a reference")),
+        id_of(colliding_term),
+        alias.id(),
+        "the fabricated reference collides with the alias"
+    );
+    assert_eq!(
+        rt.processes
+            .resolve_alias(MonitorRef::from_eterm(colliding_term).expect("a reference")),
         Some(owner),
         "a by-id lookup resolves the bare reference to the alias owner — the hazard being guarded"
     );
-    assert_eq!(
-        rt.processes.resolve_alias(MonitorRef::from_eterm(timer_term).expect("a reference")),
-        Some(owner),
-        "and the timer reference to the very same owner"
-    );
 
-    // 4. Provenance still tells the three apart.
+    // 4. Provenance still tells the two apart.
     assert_eq!(
         rt.local_reference(alias_term),
         Some(Some(alias)),
         "the alias term's provenance is the alias reference"
     );
     assert_eq!(
-        rt.local_reference(bare_term),
+        rt.local_reference(colliding_term),
         Some(None),
-        "a make_ref/0 term is a bare runtime-minted reference"
-    );
-    assert_eq!(
-        rt.local_reference(timer_term),
-        Some(None),
-        "a timer reference is a bare runtime-minted reference"
+        "the fabricated reference's provenance is 'bare, never an alias'"
     );
 
-    // 5. Every send entry point rejects both colliding references and nothing is delivered.
+    // 5. Every send entry point rejects the colliding reference and nothing is delivered.
     {
         let mut ctx = RuntimeContext::new(&mut rt);
         assert!(
-            matches!(ctx.resolve_send_target(bare_term), Err(BeamError::BadArg)),
+            matches!(
+                ctx.resolve_send_target(colliding_term),
+                Err(BeamError::BadArg)
+            ),
             "a bare reference must not resolve as the live alias it collides with"
         );
         assert!(
             matches!(
-                ctx.resolve_send_target(timer_term),
+                ctx.send_message(colliding_term, make_small(9)),
                 Err(BeamError::BadArg)
             ),
-            "a timer reference must not resolve as the live alias it collides with"
+            "the compiled send must reject the colliding reference"
         );
-        for (label, term) in [("make_ref/0", bare_term), ("timer", timer_term)] {
-            assert!(
-                matches!(ctx.send_message(term, make_small(9)), Err(BeamError::BadArg)),
-                "the compiled send must reject the colliding {label} reference"
-            );
-            assert!(
-                matches!(
-                    ctx.call_bif("erlang", "send", 2, &[term, make_small(9)]),
-                    Err(BeamError::BadArg)
-                ),
-                "the erlang:send/2 BIF must reject the colliding {label} reference"
-            );
-        }
+        assert!(
+            matches!(
+                ctx.call_bif("erlang", "send", 2, &[colliding_term, make_small(9)]),
+                Err(BeamError::BadArg)
+            ),
+            "the erlang:send/2 BIF must reject the colliding reference"
+        );
         assert_eq!(
             queued_payloads(ctx.runtime, owner),
             Vec::<Eterm>::new(),
@@ -1633,7 +1610,7 @@ fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias(
         );
     }
 
-    // 6. The live alias itself is untouched by the colliding references and still resolves.
+    // 6. The live alias itself is untouched by the colliding reference and still resolves.
     assert_eq!(
         rt.processes.resolve_alias(alias),
         Some(owner),
@@ -1644,7 +1621,11 @@ fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias(
         .resolve_send_target(alias_term)
         .expect("the live alias still resolves");
     assert_eq!(target, owner, "the alias still names its owner");
-    assert_eq!(consume, Some(alias), "and still yields the reference to consume");
+    assert_eq!(
+        consume,
+        Some(alias),
+        "and still yields the reference to consume"
+    );
 }
 
 /// The provenance classification changes **nothing** for the references the process table minted: a
@@ -1826,67 +1807,115 @@ fn local_reference_classifies_all_four_provenance_arms() {
     );
 }
 
-/// **HAZARD-2 — a known divergence from the oracle that `beam_rt` cannot close.**
+/// **The positive invariant: two mints never share an id.**
 ///
-/// This runtime has two **independent** reference id spaces
-/// ([`resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`]) and both mint
-/// the very same on-heap thing `[make_header(3, REF_SUBTAG), 0, 0, id]`. Term comparison
-/// ([`beam_term::compare::eq`] — `=:=`) compares that payload, so a bare `erlang:make_ref/0`
-/// reference and a monitor/alias reference that happen to carry the **same id** are `=:=` here. The
-/// oracle has **one** id space, so it can never produce such a pair: this is a divergence, not
-/// desirable behaviour.
+/// Every reference term in this runtime is the on-heap block
+/// `[make_header(3, REF_SUBTAG), node = 0, serial = 0, id]`, so a reference's identity is its
+/// `id` word alone — and every locally minted `id` is a draw of **one** shared monotone space
+/// ([`beam_common::next_ref_id`]). Both producers draw from it, which is what this test shows:
 ///
-/// It is **not closable from `beam_rt`**: the provenance registry that tells the two mints apart is
-/// keyed by the term *word* (which is why the send path is already correct), while `=:=` is a
-/// `beam_term` operation over the payload `[hdr, 0, 0, id]`. Closing it needs the two allocators
-/// unified onto one id space — or aliases keyed by the reference term — which is **owned by
-/// `../beam_process/`** (`RefAllocator`/`MonitorRef` vs `Runtime::refs`).
+/// * the **runtime's** ref space — `erlang:make_ref/0` and the `erlang:send_after/3` timer
+///   reference;
+/// * the **process table's** — `erlang:monitor/2` and `erlang:alias/1`.
+///
+/// The four ids are pairwise distinct and strictly increasing in mint order, so no two of these
+/// reference terms can ever be `=:=` (`beam_term` compares the `[hdr, 0, 0, id]` payload, so a
+/// difference in the `id` word is a difference in the term). An equal-id pair — and therefore a
+/// `=:=` pair — can now only be produced by **fabricating** a block through
+/// [`MonitorRef::from_id`], which draws nothing; that fabricated pair is asserted too, so the
+/// test also states what the remaining non-mint escape hatch costs: the fabricated block is
+/// word-identical to the alias that shares its id, and only the provenance registry can tell
+/// them apart (which is why the send path classifies by provenance —
+/// [`resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`]).
 #[test]
-fn a_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal() {
+fn mints_from_the_runtime_and_the_process_table_never_share_an_id() {
     let mut rt = runtime();
-    // A live alias minted through the real BIF, from the process table's own allocator.
-    let alias_term = {
+    let owner = rt.self_pid();
+    let process = rt.intern("process");
+
+    // Interleave the two producers so a per-producer run of ids would show up immediately.
+    let (bare_term, alias_term, timer_term, monitor_term) = {
         let mut ctx = RuntimeContext::new(&mut rt);
-        ctx.call_bif("erlang", "alias", 1, &[NIL])
-            .expect("erlang:alias([])")
+        let bare = ctx
+            .call_bif("erlang", "make_ref", 0, &[])
+            .expect("erlang:make_ref/0");
+        let alias = ctx
+            .call_bif("erlang", "alias", 1, &[NIL])
+            .expect("erlang:alias([])");
+        let timer = ctx
+            .call_bif(
+                "erlang",
+                "send_after",
+                3,
+                &[make_small(600_000), owner.to_eterm(), make_small(1)],
+            )
+            .expect("erlang:send_after/3");
+        let monitor = ctx
+            .call_bif("erlang", "monitor", 2, &[process, owner.to_eterm()])
+            .expect("erlang:monitor(process, self())");
+        (bare, alias, timer, monitor)
     };
     let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
 
-    // Put the runtime's own allocator on the alias's id, then mint a bare `make_ref/0` reference.
-    force_next_reference_id(&mut rt, alias.id());
-    let bare_term = {
-        let mut ctx = RuntimeContext::new(&mut rt);
-        ctx.call_bif("erlang", "make_ref", 0, &[])
-            .expect("erlang:make_ref/0")
-    };
+    // The mint order, so the monotonicity claim is stated over it.
+    let minted = [bare_term, alias_term, timer_term, monitor_term];
+    let ids: Vec<u64> = minted
+        .iter()
+        .map(|term| MonitorRef::from_eterm(*term).expect("a reference").id())
+        .collect();
 
-    // The two mints carry the same id ...
-    assert_eq!(
-        MonitorRef::from_eterm(bare_term).expect("a reference").id(),
-        alias.id(),
-        "the two references carry the same id"
-    );
-    // ... and compare `=:=` (the divergence): `beam_term` compares the `[hdr, 0, 0, id]` payload.
+    // (i) Pairwise distinct: two producers never issued the same id.
+    for (i, left) in ids.iter().enumerate() {
+        for (j, right) in ids.iter().enumerate().skip(i + 1) {
+            assert_ne!(
+                left, right,
+                "mints {i} and {j} must not share a reference id (one shared space)"
+            );
+        }
+    }
+    // (ii) Strictly increasing along the mint order: one monotone source, not merely disjoint.
+    for pair in ids.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "each later mint's id must exceed the earlier one: {ids:?}"
+        );
+    }
+    // (iii) Distinct ids ⇒ never `=:=`, and never arithmetic-`==`.
+    for (i, left) in minted.iter().enumerate() {
+        for right in minted.iter().skip(i + 1) {
+            assert!(
+                !beam_term::compare::eq(*left, *right, rt.atoms()),
+                "two distinct mints must not be =:= ({left:?} vs {right:?})"
+            );
+            assert!(
+                !beam_term::compare::cmp_arith(*left, *right, rt.atoms()).is_eq(),
+                "two distinct mints must not be == ({left:?} vs {right:?})"
+            );
+        }
+    }
+
+    // (iv) The **only** way left to make an equal-id pair is to fabricate one: `from_id` draws
+    // nothing and writes the same frozen block, so the fabricated reference *is* the alias word
+    // for word. Provenance — not the payload — is what still keeps them apart.
+    let fabricated_term = {
+        let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
+        MonitorRef::from_id(alias.id())
+            .to_eterm(&mut heap)
+            .expect("the four words fit")
+    };
     assert!(
-        beam_term::compare::eq(bare_term, alias_term, rt.atoms()),
-        "HAZARD-2: a bare make_ref/0 and a monitor/alias reference with the same id compare =:= \
-         here — a divergence from the oracle's single id space, not closable from beam_rt"
+        beam_term::compare::eq(fabricated_term, alias_term, rt.atoms()),
+        "a from_id-fabricated block with the alias's id is =:= to the alias"
     );
-    // The arithmetic `==` ordering agrees with `=:=` for two reference terms.
-    assert!(
-        beam_term::compare::cmp_arith(bare_term, alias_term, rt.atoms()).is_eq(),
-        "the arithmetic == ordering agrees with =:= for two references"
-    );
-    // Provenance still tells them apart — which is what keeps the *send* path correct.
     assert_eq!(
         rt.local_reference(alias_term),
         Some(Some(alias)),
-        "the alias's provenance is still the alias reference"
+        "the alias term's provenance is the alias reference"
     );
     assert_eq!(
-        rt.local_reference(bare_term),
-        Some(None),
-        "the bare reference's provenance is still 'not an alias'"
+        rt.local_reference(fabricated_term),
+        None,
+        "a fabricated term was never minted here, so its provenance is unknown"
     );
 }
 

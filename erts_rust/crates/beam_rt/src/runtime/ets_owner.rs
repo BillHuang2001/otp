@@ -136,7 +136,7 @@ use beam_common::{BeamError, Result};
 use beam_ets::{OwnerDeath, OwnerId};
 use beam_process::{
     MonitorRef, PortId, PortWatch, ProcessExit, ProcessExitObserver, ProcessId, ProcessTable,
-    RefAllocator, Scheduler,
+    Scheduler,
 };
 use beam_term::{make_atom, Atom, Eterm};
 
@@ -338,37 +338,33 @@ fn report_gift_failures(failures: &mut Vec<BeamError>, outcome: Result<usize>) -
 /// table-taking BIFs decode a tid with `beam_bifs::access::ref_thing_id`, i.e. the last payload
 /// word, so a tid that does not decode back to the handle must never be built).
 ///
-/// # Why this goes through [`MonitorRef`]
+/// # Why the id is not a draw of the shared reference-id space
+///
+/// Every other locally minted reference term draws its `id` from the one shared monotone space
+/// ([`beam_common::next_ref_id`], see [`beam_process::RefAllocator`]), and that is what makes two
+/// *mints*
+/// unable to alias. A tid cannot draw: its `id` is *prescribed* by the table handle it must
+/// decode back to, so it names a value from the **ETS table-handle band** (`beam_ets`'s
+/// global-monotone `TableId`) instead. That band is the one deliberate exception to "every
+/// reference id is a minted shared id". What keeps a tid apart is **provenance**, not the
+/// numeric band: a tid is built only here (an unnamed table's heir transfer), never by a mint,
+/// and a minted reference is never a valid tid — the table-taking BIFs resolve a tid by its
+/// handle-shaped id against the registry, so a minted reference is simply not one.
+///
+/// # Why this goes through [`MonitorRef::from_id`]
 ///
 /// The only producer of that frozen thing is `beam_bifs::access::make_ref_thing`, which is
-/// `pub(crate)`, and [`MonitorRef`] has no public `from_id` constructor (`id` is private; only
-/// [`RefAllocator::next`] mints one). [`MonitorRef::to_eterm`] is byte-identical to
-/// `make_ref_thing` (both write `[make_header(3, REF_SUBTAG), 0, 0, id]`), so it is the
-/// **substitution** used here: a fresh [`RefAllocator`] hands out ids `0, 1, 2, …`, so `handle`
-/// is reached after `handle + 1` draws.
-///
-/// The caveat is the cost: the draw count is the handle value. That is bounded by the number of
-/// tables this OS process has created (`beam_ets`'s `TableId` counter is global-monotonic from
-/// `1`), and this path only runs for an unnamed table that carries an installed arity-3 heir,
-/// so it is small in every real run — but it is *not* O(1). A public mint — widen
-/// `beam_bifs::access::make_ref_thing` to `pub`, or add `MonitorRef::from_id(u64)` — removes the
-/// loop; both are cross-crate changes reported as a handoff.
-///
-/// Using a fresh allocator (rather than the runtime's own [`Runtime::refs_mut`]) is deliberate:
-/// the runtime's ref space hands out *its own* next id, which is **not** the handle, so the tid
-/// would not resolve back to the table — a wrong tid, worse than any substitute.
+/// `pub(crate)`. [`MonitorRef::to_eterm`] is byte-identical to it (both write
+/// `[make_header(3, REF_SUBTAG), 0, 0, id]`), and [`MonitorRef::from_id`] is the one
+/// **non-mint** constructor — so the tid costs O(1) and draws **nothing** from the shared
+/// space.
 ///
 /// # Errors
 ///
 /// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
 /// four words.
 fn tid_ref_thing(heap: &mut Heap, handle: u64) -> Result<Eterm> {
-    let mut refs = RefAllocator::new();
-    let mut reference = refs.next(); // id 0
-    for _ in 0..handle {
-        reference = refs.next();
-    }
-    reference.to_eterm(heap)
+    MonitorRef::from_id(handle).to_eterm(heap)
 }
 
 impl Runtime {
@@ -776,21 +772,37 @@ mod tests {
         );
     }
 
-    /// The one non-obvious step of the [`tid_ref_thing`] substitution: a fresh [`RefAllocator`]
-    /// draws the ids `0, 1, 2, …`, so `handle + 1` draws land **exactly** on `handle`. An
-    /// off-by-one here would mint a tid that does not decode back to the table — the one
-    /// outcome the substitution must never produce. (The end-to-end proof that a tid built this
-    /// way really *resolves* is `tests/ets_owner.rs`'s unnamed-transfer flow, where the heir
-    /// `ets:insert/2`s through the received tid.)
+    /// The two properties the [`tid_ref_thing`] substitution must have, pinned together: the
+    /// built term's decoded id **is** the table handle (a tid that does not decode back to the
+    /// table would be the one outcome the substitution must never produce), and building it
+    /// draws **no** id from the shared reference-id space.
+    ///
+    /// Both halves matter. The first is what makes the tid usable by the table-taking BIFs
+    /// (`beam_bifs::access::ref_thing_id` reads the last payload word, which
+    /// [`MonitorRef::from_eterm`] parses the same way); the second is what keeps the tid off the
+    /// mint space, so building one cannot consume — or alias — a `make_ref`/monitor/timer/NIF
+    /// resource id.
     #[test]
     fn the_tid_substitution_lands_on_the_handle_id() {
-        for handle in [0u64, 1, 2, 7, 4096] {
-            let mut refs = RefAllocator::new();
-            let mut reference = refs.next();
-            for _ in 0..handle {
-                reference = refs.next();
-            }
-            assert_eq!(reference.id(), handle, "the substitution must land on {handle}");
+        // A large handle too: the id must be the handle for *any* value, not only a small one
+        // (`from_id` is total; only `to_eterm`'s small-int encoding bounds it).
+        for handle in [0u64, 1, 2, 7, 4096, 1 << 40] {
+            let mut heap = Heap::new(16).expect("a 16-word test heap");
+            let before = beam_common::next_ref_id();
+            let term = tid_ref_thing(&mut heap, handle).expect("the four words fit");
+            let after = beam_common::next_ref_id();
+
+            let reference =
+                MonitorRef::from_eterm(term).expect("the tid is a well-formed ref thing");
+            assert_eq!(reference.id(), handle, "the tid must land on handle {handle}");
+
+            // Exactly one draw happened across the build — the one bracketing pair, i.e. the
+            // build itself drew nothing.
+            assert_eq!(
+                after,
+                before + 1,
+                "building the tid for handle {handle} must draw no shared id"
+            );
         }
     }
 
@@ -801,8 +813,9 @@ mod tests {
     fn port_watches_are_recorded_append_only_and_taken_for_a_drain() {
         let port_a = PortId::new(4);
         let port_b = PortId::new(5);
-        // `MonitorRef` has no public constructor: references come out of the id allocator
-        // (the runtime's single ref space — see `crate::runtime::Runtime::refs_mut`).
+        // A *minted* reference comes out of the shared id space — the runtime's own ref space
+        // and the process table's `RefAllocator` are the same space (see
+        // `crate::runtime::Runtime::refs_mut`) — so three draws are three distinct ids.
         let mut refs = beam_process::RefAllocator::new();
         let (r1, r2, r3) = (refs.next(), refs.next(), refs.next());
         let mut index = OwnerIndex::default();

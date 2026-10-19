@@ -4,7 +4,7 @@ Every gap is a typed capability gap or a measured own-state difference — never
 
 **This file is the ledger's index and the small families; three bodies live in their own section files, byte-exact:**
 * [`HANDOFF.md`](HANDOFF.md) — *Cross-node handoff detail* (the per-owner asks: `beam_gc`, `beam_process`, `beam_engine`, `beam_bifs`/`beam_abi`, `beam_codec`/`beam_dist`, `beam_io`, A.7/A.9 boot, A.9 E0).
-* [`M1_GAPS_A3_NIF.md`](M1_GAPS_A3_NIF.md) — contract A.3 (the `NifHostServices` roster, the load/unload host, the resource-identity collision, the `[safe]` decode gap).
+* [`M1_GAPS_A3_NIF.md`](M1_GAPS_A3_NIF.md) — contract A.3 (the `NifHostServices` roster, the load/unload host, the `[safe]` decode gap).
 * [`M1_GAPS_A4_PORTS.md`](M1_GAPS_A4_PORTS.md) — contract A.4 (the read path, `port_command/2,3`, the failure channel, the send family, the driver-port residuals).
 * Contract A.5 is owned by [`src/dist/CONTEXT.md`](src/dist/CONTEXT.md) *Known A.5 gaps and residuals*; A.7/A.9 in-process compilation's measurements are [`tests/CONTEXT.md`](tests/CONTEXT.md) *The off-heap refc-binary reclamation measurements*.
 ## Own-state answers (differ by construction, not bugs)

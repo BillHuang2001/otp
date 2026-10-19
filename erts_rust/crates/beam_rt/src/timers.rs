@@ -420,18 +420,15 @@ impl Timers {
     ///
     /// A [`TimerAction::Resume`] contributes nothing: it names a `(func, pc)` address, no term.
     ///
-    /// # The imprecision the match tier cannot close
+    /// # Why an identity match is the right tier here
     ///
     /// Being a root is not the same as being **precise**. A resource term is minted as an ordinary
     /// internal reference — `[hdr(3, REF_SUBTAG), node, serial, id]` (`beam_abi`'s
-    /// `mint_resource_ref`), byte-identical to every plain reference this tree mints — and
-    /// `beam_abi`'s resource ids and `beam_process`'s `RefAllocator` ids are independent dense
-    /// counters (starting at 1 and 0), so a plain reference can carry an id a live resource also
-    /// carries. The reachability walk cannot tell such a reference from a **copy** of that
-    /// resource, so reaching one **retains** the resource: a leak, never a dangle. Closing it is a
-    /// `beam_abi` change (mint the resource as a distinct thing, as ERTS does with
-    /// `ERTS_MAGIC_REF_THING_HEADER`, or share one reference-id allocator) — `M1_GAPS.md`
-    /// *The resource-identity collision*.
+    /// `mint_resource_ref`) — and the stabilized copy on the arena is a **different word in a
+    /// different region** carrying the same `id`, so the walk must match on the identity rather
+    /// than on the word. Nothing else can carry that id: every locally minted reference id,
+    /// resources' included, is a draw of the one shared local reference-id space
+    /// (`beam_common::next_ref_id`).
     pub(crate) fn gather_off_heap_roots(&self, out: &mut Vec<Eterm>) {
         for pending in self.pending.values() {
             if let TimerAction::Deliver { from, message, .. } = pending.action {

@@ -53,41 +53,30 @@
 //!   [`a_dropped_resource_is_accounted_for_at_its_own_runs_epilogue`]): the exact `lists:map/2`
 //!   shape that pinned the refc scope. Elements built by an earlier nested run are collected into a
 //!   returned list, so each must still resolve (and no destructor may run for them); the companion
-//!   leg drops each minted term inside the fun, and the objects must **not** accumulate — held up to
-//!   the retention the `beam_abi` reference-id collision imposes (see below), never linearly in N.
+//!   leg drops each minted term inside the fun, and the objects must be released — flat in N, never
+//!   linear.
 //!
-//! # What the two `dropped` legs assert, and why the exact oracle equality is deferred
+//! # What the two `dropped` legs assert: exact parity with the oracle
 //!
-//! `dropped/2` mints `N` resource terms inside a `lists:foreach/2` and drops each one, so a prune
-//! that provably released what its own run no longer names would answer `{N,0}` — the oracle's
-//! answer at both N = 10 and N = 200. This runtime answers `{1,9}` at N = 10 and `{164,36}` at
-//! N = 200: it destroys part of the loop and **retains** the rest.
-//! The retention is a verified **cross-crate defect, not a property of this node's prune**: a NIF
-//! resource term is minted as an ordinary internal reference — `[hdr(3, REF_SUBTAG), small(0),
-//! small(0), small(id)]` (`crates/beam_abi/src/nif/enif/resources.rs`, `write_resource_ref`) — from
-//! a **private** monotonic counter (`resources.rs`, `next_resource_ref_id`), while plain references,
-//! monitors, aliases and timers draw from `beam_process`'s separate `ProcessTable::next_reference`
-//! (`crates/beam_process/src/ptab.rs`); the two id spaces are independent, so a plain `#Ref` whose
-//! id equals a live resource's is indistinguishable at word level and the prune's identity tier
-//! correctly answers "reached" for it.
-//! `beam_abi`'s own resources module records that hazard class and names its closure, so the fix
-//! belongs there (a distinct magic-ref header as ERTS mints, or one shared id allocator through the
-//! `NifHost` seam) and **nothing in `beam_rt` may narrow the match to hide it** — retention is the
-//! correct direction, and it is a **leak, never a dangle**.
-//! Until that closes, each leg asserts the four conditions that keep the divergence falsifiable
-//! ([`assert_dropped`]): the soundness invariant `dtor + live == N`; the exact anti-dangle half
-//! (every still-live object still resolves to its marker payload through
-//! `nif_resource_nested:peek_retained/0`); a prune that really ran (`prunes > 0`, `declines == 0`);
-//! and the retention **ratchet** `live <= LIVE_CEILING_N10` / `LIVE_CEILING_N200` — more retention
-//! than the measured figure fails loudly, less passes.
-//! When the collision closes, `live` is `0` at both sizes and those two legs must reinstate the
-//! **exact** oracle equality (`{10,0}` / `{200,0}`) in place of the ratchet.
+//! `dropped/2` mints `N` resource terms inside a `lists:foreach/2` and drops each one. The prune
+//! releases exactly what its own run no longer names, so the answer is `{N,0}` — every minted
+//! object destroyed, none retained — at both N = 10 and N = 200, which is what the system ERTS
+//! answers. [`assert_dropped`] asserts that equality (plus the soundness invariant
+//! `dtor + live == N`, the anti-dangle half through `nif_resource_nested:peek_retained/0`, and a
+//! prune that really ran with nothing declined) on the `-eval` route, on the retained-set probe and
+//! on the in-process leg; the oracle's own answers (`{10,0}`/`{200,0}` and `{10,0,0}`/`{200,0,0}`)
+//! are asserted too, on the identical `.beam`s and `.so`.
 //!
-//! One measured asymmetry, recorded rather than smoothed over: the in-process half — which drives
-//! the same expression with no boot script — retains **nothing** (`{10,0,0}` / `{200,0,0}` with
-//! `prunes` = N, `released` = N and `declines` = 0), so the retention above comes from state the
-//! boot leaves in the prune's root families and the non-vacuous half of the retained-set probe is
-//! the CLI route's (`{1,9,9}` / `{164,36,36}`, every retained object resolving at its own address).
+//! Zero retention is not an accident of this node's prune: a reference term's identity is its `id`
+//! word alone, and **every** locally minted id — `erlang:make_ref/0`, monitors, aliases, timers,
+//! `seq_trace` and NIF resource terms — is a draw of the **one** shared monotone space
+//! (`beam_common::next_ref_id`). Two producers therefore cannot issue the same id, so a dead
+//! resource term can never be word-identical to a live plain reference and the prune's identity
+//! tier can never answer "reached" for one.
+//!
+//! The in-process half — which drives the same expression with no boot script — agrees
+//! (`{10,0,0}` / `{200,0,0}` with `prunes` = N, `released` = N and `declines` = 0), so both routes
+//! release everything they mint.
 //!
 //! # Non-vacuity: the linear control
 //!
@@ -107,17 +96,15 @@
 //! |---|---|---|
 //! | `keep_var` / `keep_tuple` / `keep_list` | `{8,0}` | `{8,0}` |
 //! | `mapped(10)` / `mapped(200)` | `{10,0}` / `{200,0}` | `{10,0}` / `{200,0}` |
-//! | `dropped(10)` / `dropped(200)` | `{1,9}` / `{164,36}` | `{10,0}` / `{200,0}` |
+//! | `dropped(10)` / `dropped(200)` | `{10,0}` / `{200,0}` | `{10,0}` / `{200,0}` |
 //! | `held(16)` | `{16,0}` | `{16,0}` |
 //! | `plain` | `{error,8,0}` | `{error,8,0}` |
 //!
 //! The one *timing* difference is the destructor's: this runtime releases synchronously at each
 //! run's epilogue, while the C defers the `dtor` as misc aux work, so the oracle's count only moves
 //! once a GC and a thread-progress point have been reached (the fixture's `dropped/2` does exactly
-//! that, and does nothing for this runtime). Because the oracle can lag **strictly** behind under a
-//! loaded host, the dropped legs assert on its answer only the shared **shape** —
-//! `dtor + live == N`, i.e. every minted object is either destroyed or still alive — while recording
-//! it beside this runtime's own; [`assert_dropped`] is the whole of that.
+//! that, and does nothing for this runtime). The settled answers still coincide, so both sides are
+//! asserted to the same value — [`assert_dropped`] is the whole of that.
 //!
 //! # Skip policy
 //!
@@ -672,13 +659,6 @@ const DROPPED_WORKER: &str = "dropped_worker_leg";
 /// The prefix of the worker's one report line.
 const DROPPED_PREFIX: &str = "nif_resource_nested/dropped_leg:";
 
-/// The retention ratchet's ceiling at N = 10: the measured `live_count` at HEAD, which a further
-/// regression must exceed. An improvement (a smaller figure) passes.
-const LIVE_CEILING_N10: u64 = 9;
-
-/// ... and at N = 200.
-const LIVE_CEILING_N200: u64 = 36;
-
 /// One in-process drop leg: the fixture's own counters, the retained-set probe's count and the
 /// runtime's prune counters.
 #[derive(Debug, Clone)]
@@ -872,34 +852,34 @@ fn dropped_worker_leg() {
     fixture.cleanup();
 }
 
-/// Asserts the honest shape of a **`dropped` leg** — the four conditions that make the retention
-/// falsifiable — plus the ratchet that bounds it.
+/// Asserts a **`dropped` leg** against the oracle's exact answer: every minted object destroyed,
+/// nothing retained.
 ///
-/// The leg mints `mints` objects inside a `lists:foreach/2` and drops every term, so at HEAD this
-/// runtime destroys some of them and **retains** the rest. The retention is the `beam_abi`
-/// reference-id collision documented in the module docs: a leak, never a dangle. Asserted in order:
+/// The leg mints `mints` objects inside a `lists:foreach/2` and drops every term, so the answer is
+/// `{mints, 0}` — the system ERTS's answer at both N = 10 and N = 200. Asserted in order:
 ///
 /// 1. **Soundness** — `dtor + live == mints` on the CLI figure *and* on the in-process one: every
 ///    minted object is either destroyed or still alive, so nothing was released twice and nothing
-///    vanished.
-/// 2. **Anti-dangle, exact** — `peek_retained() == live`: every still-live object still resolves to
-///    its `42` marker payload at its own address, so a regression that freed the C object while
-///    keeping its bookkeeping cannot pass.
-/// 3. **The prune ran** — `prunes > 0` (the walk was not merely absent, which would make the
-///    retention vacuous) and `declines == 0` (nothing was refused; a decline is the other way to
-///    retain).
-/// 4. **The ratchet** — `live <= ceiling`, the measured figure at HEAD ([`LIVE_CEILING_N10`] /
-///    [`LIVE_CEILING_N200`]): a further regression retains more and fails here, while an
-///    improvement passes. When the `beam_abi` collision closes, `live` becomes `0` and the legs'
-///    **exact** oracle equality must be reinstated in place of this ratchet (`{10,0}` / `{200,0}`).
+///    vanished. (A weaker invariant than 2, kept because its failure mode — a double release or a
+///    lost object — reads differently from retention.)
+/// 2. **Exact parity** — `(dtor, live) == (mints, 0)` on the CLI figure, on the retained-set probe
+///    *and* on the in-process leg. Retention is now a hard failure, not a bounded ratchet: every
+///    locally minted reference id is a draw of the one shared space
+///    ([`beam_common::next_ref_id`]), so a dead resource term can never be word-identical to a live
+///    reference and the prune's identity tier can never answer "reached" for one.
+/// 3. **Anti-dangle, exact** — `peek_retained() == live`: every still-live object (there are none)
+///    would still have to resolve to its `42` marker payload at its own address, so a regression
+///    that freed the C object while keeping its bookkeeping cannot pass — and the check is
+///    non-vacuous because the same probe answers non-zero in
+///    [`a_reference_the_nif_itself_holds_is_never_reclaimed`].
+/// 4. **The prune ran** — `prunes > 0` (the walk was not merely absent, which would make the zeros
+///    vacuous) and `declines == 0` (nothing was refused; a decline is the other way to retain).
+/// 5. **The oracle agrees exactly** — the identical `.beam`/`.so`/expression under the system `erl`
+///    answers `{mints,0}` (and the retained probe `{mints,0,0}`), which is asserted rather than
+///    merely recorded.
 ///
-/// The oracle's own answer is always recorded beside this runtime's (`{10,0}` at N = 10, `{200,0}`
-/// at N = 200), and only its shared shape `dtor + live == mints` is asserted on it: its destructors
-/// are deferred misc aux work and can lag strictly behind under a loaded host.
-///
-/// `retained` is the same loop's `{dtor, live, resolved}` answer ([`CALLER_ERL`]'s `retained/2`): it
-/// carries condition 2's count, whose oracle counterpart is `{10,0,0}` / `{200,0,0}` (nothing is
-/// retained there, so nothing has to resolve). `leg` is the in-process half ([`run_drop_leg`]).
+/// `retained` is the same loop's `{dtor, live, resolved}` answer ([`CALLER_ERL`]'s `retained/2`).
+/// `leg` is the in-process half ([`run_drop_leg`]).
 #[track_caller]
 fn assert_dropped(
     observed: &Observed,
@@ -907,7 +887,6 @@ fn assert_dropped(
     leg: &DropLeg,
     function: &str,
     mints: u64,
-    ceiling: u64,
 ) {
     let (destroyed, live) = parse_pair(&observed.rust).unwrap_or_else(|| {
         panic!(
@@ -942,19 +921,28 @@ fn assert_dropped(
              object was destroyed twice, one above it that an object vanished"
         );
     }
-    // 2. Anti-dangle, exact: every still-live object still resolves to its marker payload at its
-    //    own address. This is the `-eval` route's figure (the in-process leg runs without a boot
-    //    script and retains nothing, so its copy of this check is trivially true).
+    // 2. Exact parity: every minted object destroyed, none retained — on the CLI figure, on the
+    //    retained-set probe and on the in-process leg alike.
+    for (side, destroyed, live) in [
+        ("the `-eval` route", destroyed, live),
+        ("the retained-set probe", probe_destroyed, probe_live),
+        ("the in-process leg", leg.destroyed, leg.live),
+    ] {
+        assert_eq!(
+            (destroyed, live),
+            (mints, 0),
+            "nested_caller:{function}: {side} must destroy all {mints} minted resources and retain \
+             none — the system ERTS's answer; it destroyed {destroyed} and retained {live} \
+             (in-process leg: {leg:?})"
+        );
+    }
+    // 3. Anti-dangle, exact: every still-live object still resolves to its marker payload at its
+    //    own address. With nothing retained this is `0 == 0`; the same probe answering non-zero in
+    //    `a_reference_the_nif_itself_holds_is_never_reclaimed` is what keeps it non-vacuous.
     assert_eq!(
         probe_resolved, probe_live,
         "nested_caller:{function}: all {probe_live} still-live resources must still resolve through \
          the fixture's marker probe, but only {probe_resolved} did"
-    );
-    assert_eq!(
-        (probe_destroyed, probe_live),
-        (destroyed, live),
-        "nested_caller:{function}: the retained-set probe and the plain answer must describe the \
-         same loop"
     );
     assert_eq!(
         leg.resolved, leg.live,
@@ -962,51 +950,53 @@ fn assert_dropped(
          ({} did)",
         leg.live, leg.resolved
     );
-    // 3. The prune really ran, and nothing was refused.
+    // 4. The prune really ran, and nothing was refused.
     assert!(
         leg.prunes > 0,
-        "nested_caller:{function}: the resource prune must run a walk at least once, or the \
-         retention below is vacuous: {leg:?}"
+        "nested_caller:{function}: the resource prune must run a walk at least once, or the zero \
+         retention is vacuous: {leg:?}"
     );
     assert_eq!(
         leg.declines, 0,
         "nested_caller:{function}: nothing may decline here: {leg:?}"
     );
-    // 4. The ratchet: more retention than the measured figure fails, less passes.
-    assert!(
-        live <= ceiling,
-        "nested_caller:{function}: at most {ceiling} of the {mints} minted resources may be \
-         retained (the measured figure at HEAD); this runtime retained {live} of the {mints} \
-         (dtor {destroyed}), which is a NEW leak, not the recorded one (the in-process leg of the \
-         same loop saw dtor={} live={}: {leg:?})",
-        leg.destroyed,
-        leg.live
-    );
-    // 5. The oracle, recorded beside this runtime's answers.
+    // 5. The oracle answers the same thing, exactly.
     let Some(oracle) = &observed.oracle else {
+        skip(&format!(
+            "nested_caller:{function}: the oracle could not be measured, so the exact-parity half of \
+             this leg did not run"
+        ));
         return;
     };
     let (oracle_destroyed, oracle_live) = parse_pair(oracle).unwrap_or_else(|| {
         panic!("nested_caller:{function}: the oracle answered a non-pair {oracle:?}")
     });
     assert_eq!(
-        oracle_destroyed + oracle_live,
-        mints,
-        "nested_caller:{function}: the oracle answered {oracle:?}, which does not account for the \
-         {mints} minted objects"
+        (oracle_destroyed, oracle_live),
+        (mints, 0),
+        "nested_caller:{function}: the oracle answered {oracle:?}, which is not the expected \
+         {{{mints},0}}"
     );
+    if let Some(probe_oracle) = &retained.oracle {
+        assert_eq!(
+            parse_triple(probe_oracle),
+            Some((mints, 0, 0)),
+            "nested_caller:{function}: the oracle's retained-set probe must answer \
+             {{{mints},0,0}}, got {probe_oracle:?}"
+        );
+    }
     println!(
-        "nested_caller:{function}: retained live={live} of {mints} (ceiling {ceiling}), \
-         dtor={destroyed}, resolved={probe_resolved} (probe oracle={:?}), in-process \
-         dtor/live={}/{}, prunes={} declines={} released={} live_terms={}; the exact oracle \
-         equality is deferred on the `beam_abi` reference-id collision",
-        retained.oracle,
-        leg.destroyed,
-        leg.live,
-        leg.prunes,
-        leg.declines,
-        leg.released,
-        leg.live_terms
+        "nested_caller:{function}: exact parity with the oracle — dtor/live={destroyed}/{live} of \
+         {mints} (retained-set probe {probe_destroyed}/{probe_live}/{probe_resolved}, oracle \
+         {retained_oracle:?}), in-process dtor/live={in_dtor}/{in_live}, prunes={prunes} \
+         declines={declines} released={released} live_terms={live_terms}",
+        retained_oracle = retained.oracle,
+        in_dtor = leg.destroyed,
+        in_live = leg.live,
+        prunes = leg.prunes,
+        declines = leg.declines,
+        released = leg.released,
+        live_terms = leg.live_terms,
     );
 }
 
@@ -1114,23 +1104,19 @@ fn a_small_nested_map_keeps_every_element_reachable() {
 /// **(B2)** The companion leg: the same `lists:foreach/2` loop, but each minted term is dropped
 /// inside the fun, so the only question left is what became of the objects.
 ///
-/// At HEAD this runtime destroys **part** of the loop and retains the rest — `{1,9}` at N = 10 —
-/// where the oracle answers `{10,0}`. The retention is the `beam_abi` reference-id collision
-/// described in the module docs: a leak, never a dangle, so the leg asserts the four conditions that
-/// keep the divergence falsifiable ([`assert_dropped`]): the soundness invariant `dtor + live == N`,
-/// the exact anti-dangle half (every still-live object still resolves through
-/// `nif_resource_nested:peek_retained/0`), a prune that really ran with nothing declined, and the
-/// retention **ratchet** `live <= LIVE_CEILING_N10` — a further regression fails, an improvement
-/// passes.
+/// The answer is the oracle's exactly — `{10,0}`: every minted object is destroyed and none is
+/// retained. [`assert_dropped`] asserts that on the `-eval` route, on the retained-set probe and on
+/// the in-process leg alike, together with the soundness invariant `dtor + live == N`, the
+/// anti-dangle half (every still-live object — there are none — would have to resolve through
+/// `nif_resource_nested:peek_retained/0`), and a prune that really ran with nothing declined.
 ///
 /// N = 10 is the small sample; [`dropping_them_in_a_longer_loop_keeps_the_retention_bounded`] is the
-/// 200-iteration one. Together they are the "bounded, not linear" claim: a fraction of the loop is
-/// retained at either size, never all of it.
+/// 200-iteration one. Together they are the "flat in N" claim: every minted object is released at
+/// either size.
 ///
-/// Oracle: `{10,0}` — recorded beside this runtime's answer, and its own `dtor + live == N` shape
-/// asserted. (`timer:sleep/1` in the fixture is the thread-progress point the **oracle** needs for
-/// its deferred destructors; this runtime needs nothing after its epilogue, and both answers are
-/// read after the same settle.)
+/// Oracle: `{10,0}`, asserted as an exact equality. (`timer:sleep/1` in the fixture is the
+/// thread-progress point the **oracle** needs for its deferred destructors; this runtime needs
+/// nothing after its epilogue, and both answers are read after the same settle.)
 #[test]
 fn a_dropped_resource_is_accounted_for_at_its_own_runs_epilogue() {
     let Some(observed) = run_case("dropped10", "dropped", &["10"]) else {
@@ -1142,14 +1128,13 @@ fn a_dropped_resource_is_accounted_for_at_its_own_runs_epilogue() {
     let Some(leg) = run_drop_leg(10) else {
         return;
     };
-    assert_dropped(&observed, &retained, &leg, "dropped", 10, LIVE_CEILING_N10);
+    assert_dropped(&observed, &retained, &leg, "dropped", 10);
 }
-/// **(B2 large)** ... and at N = 200 the same conditions hold with the measured retention `{164,36}`
-/// — a bounded residue, not the whole loop and not a different regime: the ratchet is
-/// `live <= LIVE_CEILING_N200`.
+
+/// **(B2 large)** ... and at N = 200 the same conditions hold with the same answer, `{200,0}`:
+/// the retention is zero at both sizes, so the figure is flat in N rather than a bounded residue.
 ///
-/// Oracle: `{200,0}` — recorded beside this runtime's answer. When the `beam_abi` collision closes,
-/// `live` becomes `0` at both sizes and the two legs' exact oracle equality is reinstated here.
+/// Oracle: `{200,0}`, asserted as an exact equality.
 #[test]
 fn dropping_them_in_a_longer_loop_keeps_the_retention_bounded() {
     let Some(observed) = run_case("dropped200", "dropped", &["200"]) else {
@@ -1161,7 +1146,7 @@ fn dropping_them_in_a_longer_loop_keeps_the_retention_bounded() {
     let Some(leg) = run_drop_leg(200) else {
         return;
     };
-    assert_dropped(&observed, &retained, &leg, "dropped", 200, LIVE_CEILING_N200);
+    assert_dropped(&observed, &retained, &leg, "dropped", 200);
 }
 
 /// **(C)** The non-vacuity control for `live_count/0`: the same loop through `probe_held/0`,

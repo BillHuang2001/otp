@@ -18,30 +18,27 @@
 //
 // %CopyrightEnd%
 
-//! The **two reference id spaces** and the **provenance bridge**, end to end at the
+//! The **one reference id space** and the **provenance bridge**, end to end at the
 //! **executable** boundary, cross-checked against the live system `erl` oracle.
 //!
-//! This runtime mints references from **two independent** monotone `u64` id spaces that both start
-//! at `0` and both encode the very same on-heap thing
-//! `[make_header(3, REF_SUBTAG), node=0, serial=0, id]`:
+//! This runtime mints every local reference term as the same on-heap thing
+//! `[make_header(3, REF_SUBTAG), node=0, serial=0, id]`, and every `id` is a draw of **one**
+//! process-wide monotone space (`beam_common::next_ref_id`) — whichever producer mints:
 //!
 //! * [`Runtime::refs`](beam_rt::Runtime) — fed by `erlang:make_ref/0`, the NIF `make_ref`, the
 //!   `erlang:send_after/3`/`erlang:start_timer/3` timer references and `seq_trace`;
-//! * the `ProcessTable`'s own allocator — fed by every `erlang:monitor/2,3` and `erlang:alias/0,1`
-//!   (the `{alias, Mode}` monitor form included).
+//! * the `ProcessTable`'s allocator — fed by every `erlang:monitor/2,3` and `erlang:alias/0,1`
+//!   (the `{alias, Mode}` monitor form included);
+//! * `beam_abi`'s NIF-resource mint (`enif_make_resource`).
 //!
-//! A `send` destination is therefore classified by **provenance** (the term-keyed runtime registry,
-//! `src/context/alias.rs`), never by the id the term decodes to — the guard the unit suite's
-//! `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias` pins directly.
-//! This suite pins the *observable* answers of every public mint route against every consumer path,
-//! with the live oracle as ground truth.
-//!
-//! # Why the collision itself is not in this file
-//!
-//! The two id spaces can only be forced onto the same number from **inside** the runtime (the unit
-//! test above does it by rewinding `Runtime::refs`). The oracle has **one** id space, so it can never
-//! produce a colliding pair and cannot answer that case at all: it is asserted only in the unit
-//! suite, never here.
+//! So two producers can never issue the same id, and a reference's identity is its **term**. A
+//! `send` destination is nevertheless classified by **provenance** (the term-keyed runtime
+//! registry, `src/context/alias.rs`), never by the id alone, because provenance is what says
+//! whether a reference may be a live alias — the guard the unit suite's
+//! `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias` pins directly
+//! (with a deliberately fabricated colliding block, since minting one is now impossible).
+//! This suite pins the *observable* answers of every public mint route against every consumer
+//! path, with the live oracle as ground truth.
 //!
 //! # How the cases are compared
 //!
@@ -71,15 +68,16 @@
 //!
 //! * a `send` to a reference that is **not** a live alias — a bare `make_ref/0`, a `monitor/2`
 //!   reference or a timer reference — is this runtime's typed `badarg` where the C silently drops the
-//!   message and reports the send value (documented at `src/context/alias.rs`; the provenance bridge
-//!   is what keeps a **colliding** bare reference from being *delivered* to an alias owner);
+//!   message and reports the send value (documented at `src/context/alias.rs`; provenance is what
+//!   keeps a bare reference from being *delivered* to an alias owner);
 //! * `erlang:monitor(process, self(), [{alias, _}])` registers an alias here where the C clears it for
 //!   a self-monitor (documented at `tests/alias.rs`);
 //! * `erlang:unalias/1` and `erlang:cancel_timer/1` on a **decoded copy** of a reference
 //!   (`binary_to_term(term_to_binary(R))`) miss the term-keyed registries, so they answer `false` /
 //!   `badarg` where the C reads the ref thing's payload and answers `true` / the remaining time. This
-//!   is the same "identity is the term, not the id" seam the HAZARD-2 unit test pins, and closing it
-//!   is owned by `../beam_process/` (unify the two allocators) — *not* by `beam_rt`.
+//!   is the "identity is the term, not the id" seam — a decoded copy was never minted here, so its
+//!   *provenance* is unknown even though its id is a real draw — and closing it is owned by
+//!   `../beam_process/`, *not* by `beam_rt`.
 //!
 //! A reference **without** a decoded copy (the live mint) is one of the agreeing cases, and a decoded
 //! copy of a **live alias** is a working `send` destination on both runtimes (the "unknown
@@ -252,8 +250,8 @@ const FIXTURES: [(&str, &str); 1] = [("refids", REFIDS_SRC)];
 // ---------------------------------------------------------------------------------------
 
 /// Every case the two runtimes must print identically: the label, the fixture entry point and the
-/// exact line both runtimes print for it. Two independent mint routes appear in most entries, so a
-/// regression in either id space is caught.
+/// exact line both runtimes print for it. Two producers' mint routes appear in most entries, so a
+/// regression in any of them is caught.
 const AGREEMENTS: [(&str, &str, &str); 9] = [
     (
         "make_ref/0 through is_reference, =:=, binary_to_term, demonitor and unalias",
@@ -607,10 +605,10 @@ fn the_eval_route_send_paths_match_the_live_oracle() {
 /// (see the module docs); pinning both sides keeps it visible and makes any future change to either
 /// side fail loudly and force this list to be revisited.
 ///
-/// The one this fix is *about* — a bare reference whose id **collides** with a live alias — is not
-/// here: forcing the collision needs the runtime's own internals (the unit suite's
-/// `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`), and the oracle's
-/// single id space can never produce such a pair.
+/// An id collision between two producers is **not** here, because it can no longer happen: every
+/// locally minted reference id is a draw of the one shared space, and the colliding pair the unit
+/// suite's `resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias` guards is
+/// fabricated through `MonitorRef::from_id` rather than minted.
 #[test]
 fn the_known_divergences_are_reported_with_both_observed_values() {
     let Some((oracle, fixtures)) = fixtures_or_skip() else {
