@@ -1584,7 +1584,14 @@ pub(crate) extern "C" fn jit_deallocate(
         machine.pop_frame_checked(deallocate)
     };
     match popped {
-        Ok(()) => encode_target(func, pc + 1),
+        // The pop is a frame change: `machine.stack` was truncated under the window the
+        // block published, so re-publish it here — the block may continue in-block with a
+        // later instruction that addresses a `Y` slot, and the emitted continue arm no
+        // longer pays a separate `jit_refresh_y` call for it.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1702,7 +1709,14 @@ pub(crate) extern "C" fn jit_allocate(
         machine.push_frame(stack_need)
     };
     match framed {
-        Ok(()) => encode_target(func, pc + 1),
+        // The push is a frame change (`machine.stack` may have been grown, and the window
+        // now belongs to the *new* frame), so re-publish it here: the block continues
+        // in-block after an `allocate`, and the emitted continue arm no longer pays a
+        // separate `jit_refresh_y` call for it.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1748,7 +1762,14 @@ pub(crate) extern "C" fn jit_allocate_heap(
             .and_then(|()| machine.push_frame(stack_need))
     };
     match framed {
-        Ok(()) => encode_target(func, pc + 1),
+        // The push is a frame change and the admission before it may have collected, so
+        // re-publish the Y window here; the emitted continue arm keeps its register refill
+        // (a collecting host rewrote `machine.x`) but no longer pays a separate
+        // `jit_refresh_y` call.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }
@@ -1816,7 +1837,13 @@ pub(crate) extern "C" fn jit_trim(
         machine.trim(n)
     };
     match trimmed {
-        Ok(()) => encode_target(func, pc + 1),
+        // `trim` moves the frame's base, so re-publish the window here; the block continues
+        // in-block after it and the emitted continue arm no longer pays a separate
+        // `jit_refresh_y` call.
+        Ok(()) => {
+            runtime.refresh_y_base();
+            encode_target(func, pc + 1)
+        }
         Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }

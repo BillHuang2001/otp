@@ -86,7 +86,7 @@ use super::super::runtime::{
     ReturnHelper, RUNTIME_RESUME_DISP,
 };
 use super::link::emit_frame_teardown;
-use super::{emit_helper_call, emit_refresh_y, Allocation, RUNTIME_SLOT_DISP};
+use super::{emit_helper_call, Allocation, RUNTIME_SLOT_DISP};
 
 /// Lower `deallocate N` — the frame pop, then continue in-block at `pc + 1`.
 ///
@@ -117,13 +117,9 @@ pub(super) fn emit_deallocate(
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
     // Deliberately **no** register refill (unlike `emit_continue_check`): the pop
-    // touches no x-register, so the cached registers are still current. The Y window
-    // is not: a frame was dropped, and `machine.stack` may have been truncated under
-    // the window the block published, so re-publish it before the next instruction
-    // when a later instruction of this block still accesses a Y slot.
-    if allocation.refresh_y_after(pc) {
-        emit_refresh_y(buffer)?;
-    }
+    // touches no x-register, so the cached registers are still current. The Y window is
+    // re-published *inside* `jit_deallocate` (a frame was dropped and `machine.stack` was
+    // truncated under the window the block published), so this arm emits no refresh call.
     Ok(())
 }
 
@@ -468,37 +464,38 @@ mod tests {
     }
 
     #[test]
-    fn a_y_accessing_deallocate_refreshes_the_window_but_a_y_free_one_does_not() {
-        // A block that accesses a Y slot *after* the pop must re-publish the window
-        // (the pop truncated `machine.stack` under it); a block that does not, must not.
+    fn a_deallocate_emits_no_separate_refresh_call() {
+        // A block that accesses a Y slot *after* the pop needs the window re-published (the
+        // pop truncated `machine.stack` under it) — but the helper that popped is the party
+        // that re-publishes it, on its own success path, so the arm emits no second call.
         let mut accessing = Allocation::default();
         accessing.y_last = Some(9);
         let refreshed = lowered(|buffer, done| emit_deallocate(buffer, &accessing, done, 0, 7, 2));
         let plain = lowered(|buffer, done| emit_deallocate(buffer, &Allocation::default(), done, 0, 7, 2));
         let refresh = helper_immediate(super::super::jit_refresh_y as *const ());
+        for (label, code) in [("y_accessing", &refreshed), ("y_free", &plain)] {
+            assert!(
+                !code
+                    .windows(refresh.len())
+                    .any(|window| window == refresh.as_slice()),
+                "{label}: the pop's window is re-published inside `jit_deallocate`"
+            );
+        }
+        // Both lowerings call the same helper and nothing else differs, so the arm is
+        // allocation-independent: there is no gated tail left to tell them apart.
+        assert_eq!(
+            refreshed.len(),
+            plain.len(),
+            "a `deallocate` arm no longer depends on the block's Y access: {} vs {} bytes",
+            refreshed.len(),
+            plain.len()
+        );
+        let helper = helper_immediate(jit_deallocate as *const ());
         assert!(
             refreshed
-                .windows(refresh.len())
-                .any(|window| window == refresh.as_slice()),
-            "a later Y access in the same block must re-publish the window"
-        );
-        assert!(
-            !plain.windows(refresh.len()).any(|window| window == refresh.as_slice()),
-            "a Y-free block pays nothing"
-        );
-        // The refresh is the *only* difference: both lowerings call the same helper,
-        // and the refresh sits **after** the continue check (the pop it follows is what
-        // invalidated the window the next instruction would read).
-        let helper = helper_immediate(jit_deallocate as *const ());
-        let call = refreshed
-            .windows(helper.len())
-            .position(|window| window == helper.as_slice())
-            .expect("both lowerings call `jit_deallocate`");
-        assert!(
-            plain.len() > call && plain.len() < refreshed.len(),
-            "the refresh is emitted past the helper call: {} vs {} bytes",
-            plain.len(),
-            refreshed.len()
+                .windows(helper.len())
+                .any(|window| window == helper.as_slice()),
+            "the arm calls `jit_deallocate`"
         );
     }
 }
