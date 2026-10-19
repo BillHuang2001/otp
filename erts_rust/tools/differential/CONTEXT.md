@@ -57,13 +57,11 @@ Success ⇒ one line `ok <repr>`, exit `0`; failure ⇒ `exception <class> <reas
 **Invariant:** a capability gap (`unsupported`/`skipped`) is **never** a mismatch — it can only cause exit `3` (not allowlisted) or `0` (allowlisted). The `1`-vs-`3` split is read **solely** from the top-level `summary`/`ratchet`; the per-contract `by_contract` rollup (which repeats `mismatch` keys at a deeper indent) is deliberately ignored. The gate's unauthorized/stale id lists are restricted to genuine gaps, so a `mismatch` can never be recorded as "allowed". The binary's own codes are unchanged (`0/1/2`).
 
 ## Status
-- **Corpus:** 3281 cases covering all nine contracts; the recorded sweep is `total=3272 agree=3271
+- **Corpus:** 3322 cases covering all nine contracts; the recorded sweep is `total=3322 agree=3321
   mismatch=0 unsupported=1 skipped=0` with `ratchet: entries=1 allowed=1 unauthorized=0 stale=0` (a
-  12-way `differential run --out-file` sweep folded with `merge`, every worker exit `0`; the serial
+  16-way `differential run --out-file` sweep folded with `merge`, every worker exit `0`; the serial
   `gate.sh` route boots every CLI case, so the parallel sweep is the practical authoritative route).
-  The 9 `nif_state/…` cases postdate that sweep and were each verified `[AGREE]` individually with
-  `differential run <id>`; the committed `GAPS.md` header's `total=` therefore still reads `3272`
-  until the next generated refresh.  The single non-agreeing case is the allowlisted `wire/new_fun_ext_encode`. Do **not** read the total
+  The single non-agreeing case is the allowlisted `wire/new_fun_ext_encode`. Do **not** read the total
   from `../../out/report.json`: that tracked file is a stale suite artifact (`summary.total` 645) from
   an older corpus revision — the committed `GAPS.md` header and this line are the current figures, and
   `differential list` is authoritative for ids.
