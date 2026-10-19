@@ -81,11 +81,14 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `size` word, a refc window **and** an `ErlSubBits` match context take `end - start`
   (exactly `erts_bin_bits_size`), and a non-bitstring is `None` (→ the caller's `badarg`),
   never a substituted size. It exists because a BIF living in this crate cannot reach this
-  module's `pub(super)` readers, and it is re-exported once from `bitstrings/mod.rs` for the
-  two BIF floors that would serve `bit_size/1`: the in-crate harness floor
-  (`src/bench/counting.rs`) and the external test host (`tests/support/bifs.rs`, which would
-  also need a `pub` re-export — `families` is a private module). Neither has adopted it yet,
-  so nothing in the engine calls it and the re-export's `#[allow(unused_imports)]` stands.
+  module's `pub(super)` readers, and it is re-exported once from `bitstrings/mod.rs`
+  (`pub(crate) use raw::bit_size`, `#[allow(unused_imports)]`) for the BIF floor that serves
+  `bit_size/1`: the in-crate harness floor `src/bench/counting.rs`, which is what makes
+  `emqx_base62:decode/1` measurable (`instr_per_call` 531, `rooted_calls_per_call` 32).
+  The `#[allow(dead_code)]` on the function is load-bearing, not stale — its only caller is
+  `#[cfg(test)]`, so a plain `--lib` build would otherwise warn. The external test host
+  `tests/support/bifs.rs` still cannot reach it: integration tests see this crate from the
+  outside and `families` is a private module, so that floor would need a `pub` re-export.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
     `bs_match_string`/`bs_test_tail2` opcodes. `bs_get_integer2` commits its advance through
