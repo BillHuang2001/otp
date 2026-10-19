@@ -1528,6 +1528,9 @@ fn a_remote_reference_on_a_non_distributed_runtime_is_still_badarg() {
 fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias() {
     let mut rt = runtime();
     let owner = rt.self_pid();
+    // The fabricated reference's block lives on this heap, so it must outlive every read of the
+    // term (`from_eterm`/`compare` dereference the word).
+    let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
 
     // 1. A live alias minted through the **real BIF** (so the runtime's provenance registry is
     //    filled exactly as production fills it) from the process table's allocator.
@@ -1541,12 +1544,9 @@ fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias(
     // 2. The colliding bare reference, fabricated: `from_id` names the alias's id without
     //    drawing one (no mint could produce this pair any more — that is the point of the
     //    test), and `to_eterm` writes the very same frozen block a `make_ref/0` would.
-    let colliding_term = {
-        let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
-        MonitorRef::from_id(alias.id())
-            .to_eterm(&mut heap)
-            .expect("the four words fit")
-    };
+    let colliding_term = MonitorRef::from_id(alias.id())
+        .to_eterm(&mut heap)
+        .expect("the four words fit");
     // It is registered as a **bare** runtime-minted reference — the provenance `make_ref/0` and
     // the timer mints record — so the classifier sees exactly the shape it must refuse.
     rt.references.insert(colliding_term, None);
@@ -1897,12 +1897,11 @@ fn mints_from_the_runtime_and_the_process_table_never_share_an_id() {
     // (iv) The **only** way left to make an equal-id pair is to fabricate one: `from_id` draws
     // nothing and writes the same frozen block, so the fabricated reference *is* the alias word
     // for word. Provenance — not the payload — is what still keeps them apart.
-    let fabricated_term = {
-        let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
-        MonitorRef::from_id(alias.id())
-            .to_eterm(&mut heap)
-            .expect("the four words fit")
-    };
+    // On a heap that outlives every read of the term (a dropped heap would dangle the block).
+    let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
+    let fabricated_term = MonitorRef::from_id(alias.id())
+        .to_eterm(&mut heap)
+        .expect("the four words fit");
     assert!(
         beam_term::compare::eq(fabricated_term, alias_term, rt.atoms()),
         "a from_id-fabricated block with the alias's id is =:= to the alias"
