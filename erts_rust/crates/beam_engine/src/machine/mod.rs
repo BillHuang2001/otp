@@ -127,28 +127,53 @@ pub struct Machine {
     /// the slots that may hold a term and skip the rest of the 1024-word file, which is
     /// already `NIL` — a full refill of both files is otherwise the whole per-run floor.
     ///
-    /// **It is a conservative approximation, never a guarantee.** A writer that can
-    /// reach the register file without going through `set_x` cannot report what it
-    /// touched: a native JIT block stores straight into `machine.x` through the raw
-    /// pointer the generated code holds, and a host handed a raw `&mut` slice
-    /// ([`Machine::x_mut`]/[`Machine::with_roots`]) may write any slot. Each such writer
-    /// sets [`Machine::regs_escaped`], which forces the next `reset` to refill the whole
-    /// file. A stale register is a WRONG RESULT, so when in doubt the reset refills in
-    /// full.
+    /// **It is one of two disjoint dirty witnesses, never a guarantee on its own.** A
+    /// writer that cannot report a *count* of slots still reports the **extent** it may
+    /// have reached: [`Machine::x_dirty`]/[`Machine::fr_dirty`]. `reset` refills
+    /// `max(mark, dirty)` and clears both.
     pub(crate) x_mark: u32,
-    /// The FR-file twin of [`Machine::x_mark`]: raised by [`Machine::set_fr`], forced
-    /// full by [`Machine::regs_escaped`].
+    /// The FR-file twin of [`Machine::x_mark`]: raised by [`Machine::set_fr`], extended by
+    /// [`Machine::fr_dirty`].
     pub(crate) fr_mark: u32,
-    /// Whether a writer that cannot report the register slots it touched has run since
-    /// the last refill, so [`Machine::x_mark`]/[`Machine::fr_mark`] understate the dirty
-    /// region.
+    /// The **dirty extent** (exclusive) of the x-register file: one past the highest slot
+    /// a writer that cannot report the slots it touched may have stored into since the
+    /// last refill. `0` means clean.
     ///
-    /// Set by [`Machine::x_mut`]/[`Machine::fr_mut`]/[`Machine::with_roots`] (the caller
-    /// may write any slot of the slice it is handed) and by the native driver before it
-    /// folds a compiled block's result ([`Machine::mark_regs_escaped`]). [`Machine::reset`]
-    /// refills the whole register files when it is set and then clears it.
-    pub(crate) regs_escaped: bool,
-    /// The Erlang stack: the Y-slot words of every live frame, oldest first.
+    /// Exactly two kinds of writer need it, and both report a *proven* extent rather than
+    /// a blanket escape:
+    ///
+    /// * a host handed the register files as a raw `&mut` slice —
+    ///   [`Machine::x_mut`]/[`Machine::fr_mut`] (which hand out the whole file, so they
+    ///   note the whole file) and [`Machine::with_roots`], which hands the *writable root
+    ///   prefix* `x[..live_len]` and therefore notes exactly `live_len`. The extent is
+    ///   then sound **by construction**: the host physically cannot write a slot outside
+    ///   the slice it was handed.
+    /// * the native baseline driver, which folds every compiled block's own write extent
+    ///   (`Machine::note_native_x_writes`, derived at compile time from the block's
+    ///   register allocation) — see `../jit/baseline/`.
+    ///
+    /// The invariant the two witnesses establish, and the one that makes the whole
+    /// bounded refill sound: **every x slot `>= max(x_mark, x_dirty)` is `NIL`** (the
+    /// initial `resize` fills the file with `NIL`, [`Machine::reset`] re-fills every slot
+    /// either witness names, and every writer reports). Slots outside the region are
+    /// therefore indistinguishable from a refilled slot, so skipping them is exactly
+    /// equivalent to refilling them — and a stale register would be a WRONG RESULT, so
+    /// the two witnesses are the only thing `reset` trusts.
+    pub(crate) x_dirty: u32,
+    /// The FR-file twin of [`Machine::x_dirty`]: the live FR prefix a root hand-off is
+    /// handed (see [`Machine::with_roots`]) plus the whole file for
+    /// [`Machine::fr_mut`]/[`Machine::mark_native_fr_writes`].
+    ///
+    /// The generated native code never stores into the FR file (`rbx` is the `machine.x`
+    /// base and no emitter module emits an FR store — see `../jit/baseline/emit/`), so
+    /// the native path notes nothing here.
+    pub(crate) fr_dirty: u32,
+    /// The number of register words ([`Machine::reset`]'s `x_hi + fr_hi`) the last reset
+    /// refilled — the dirty region's size, i.e. what the run before it actually used.
+    ///
+    /// A deterministic diagnostic/test counter (see [`Machine::refilled_words`]): it is
+    /// written once per reset and read by nothing on an execution path.
+    pub(crate) refilled_words: u32,    /// The Erlang stack: the Y-slot words of every live frame, oldest first.
     pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
     pub(crate) frames: Vec<Frame>,
@@ -571,8 +596,9 @@ impl Machine {
             fr: Vec::new(),
             x_mark: 0,
             fr_mark: 0,
-            regs_escaped: false,
-            stack: Vec::new(),
+            x_dirty: 0,
+            fr_dirty: 0,
+            refilled_words: 0,            stack: Vec::new(),
             frames: Vec::new(),
             catch_frames: Vec::new(),
             pending_exception: None,
@@ -685,11 +711,19 @@ impl Machine {
         // any slot of either — a move that the `set_x`/`set_fr` high-water marks cannot
         // see. Mark the files escaped so the next `reset` refills them in full rather
         // than trusting the marks.
-        self.regs_escaped = true;
+        // The receiver is handed mutable slices of BOTH register files, but only the
+        // **prefix that can hold a term**: every slot at or beyond the run's used extent
+        // is `NIL` by the refill invariant, so it is not a root and cannot be relocated.
+        // `live` stays the caller's declared hint; the handed prefix is what the run has
+        // actually written, which is what keeps the next `reset` proportional to the run.
+        let x_live = self.used_x_extent() as usize;
+        let fr_live = self.used_fr_extent() as usize;
+        self.note_x_dirty(x_live as u32);
+        self.note_fr_dirty(fr_live as u32);
         let raise_args = self.raise_function_clause_args;
         let pending_args = self.pending_function_clause_args;
         if raise_args.is_none() && pending_args.is_none() {
-            let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
+            let roots = RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
             return f(roots);
         }
         // A raise is in flight and holds at least one heap-term latch: park them so the
@@ -703,7 +737,7 @@ impl Machine {
             self.stack.push(term);
         }
         let result = {
-            let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
+            let roots = RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
             f(roots)
         };
         let mut cursor = base;

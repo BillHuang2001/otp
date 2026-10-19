@@ -96,8 +96,19 @@ fn fill_nil(slots: &mut [Eterm]) {
     chunks.into_remainder().fill(Eterm::default());
 }
 
-impl Machine {
-    /// Read X register `n`, or `None` if it is outside the register file.
+/// One past the last slot of a register file that can hold a non-`NIL` word: the larger
+/// of the `set_x`/`set_fr` seam high-water mark and the writer-reported dirty extent,
+/// clamped to the file length.
+///
+/// This is the single rule both [`Machine::reset`]'s refill bound and
+/// [`Machine::with_roots`](crate::machine::Machine::with_roots)'s handed prefix use, so
+/// the two can never disagree on how much of a file is live.
+#[inline]
+fn used_extent(len: usize, mark: u32, dirty: u32) -> u32 {
+    mark.max(dirty).min(len as u32)
+}
+
+impl Machine {    /// Read X register `n`, or `None` if it is outside the register file.
     ///
     /// `#[inline]`-marked: this is the operand seam's innermost accessor, called
     /// several times per interpreted instruction, and the crate is compiled into
@@ -117,14 +128,55 @@ impl Machine {
     /// [`Machine::with_roots`](crate::machine::Machine::with_roots), because three
     /// separate `&mut self` accessor calls cannot coexist.
     ///
-    /// Handing out the mutable slice **escapes the register file**: the caller may
-    /// write any slot, which the [`Machine::set_x`] high-water mark cannot observe, so
-    /// this marks the files escaped and the next [`Machine::reset`] refills them in
-    /// full (see [`Machine::regs_escaped`]).
+    /// Handing out the mutable slice notes the file's **whole-file dirty extent**: the
+    /// caller may write any slot, which the [`Machine::set_x`] high-water mark cannot
+    /// observe, so the next [`Machine::reset`] refills the file in full (see
+    /// [`Machine::x_dirty`]). A caller that knows which slots it wrote should use a
+    /// narrower door ([`Machine::with_roots`](crate::machine::Machine::with_roots) hands
+    /// only the prefix that can hold a term).
     #[inline]
     pub fn x_mut(&mut self) -> &mut [Eterm] {
-        self.regs_escaped = true;
+        self.note_x_dirty(self.x.len() as u32);
         &mut self.x
+    }
+
+    /// One past the highest X-register slot that can hold a non-[`NIL`](beam_term::NIL)
+    /// word: the larger of the [`Machine::x_mark`] seam high-water mark and the
+    /// [`Machine::x_dirty`] writer-reported extent, clamped to the file length.
+    ///
+    /// This is the **writable root prefix** of the file — every slot at or beyond it is
+    /// `NIL` by the refill invariant, so it is not a root and cannot be relocated. It is
+    /// both what [`Machine::with_roots`](crate::machine::Machine::with_roots) hands a
+    /// host and what bounds the next [`Machine::reset`]'s refill, which is what makes the
+    /// reset proportional to what a run actually used.
+    #[inline]
+    pub(crate) fn used_x_extent(&self) -> u32 {
+        used_extent(self.x.len(), self.x_mark, self.x_dirty)
+    }
+
+    /// The FR-file twin of [`Machine::used_x_extent`].
+    #[inline]
+    pub(crate) fn used_fr_extent(&self) -> u32 {
+        used_extent(self.fr.len(), self.fr_mark, self.fr_dirty)
+    }
+
+    /// Extend the X file's dirty extent to at least the exclusive `extent` (clamped to
+    /// the file length); a smaller report never shrinks it.
+    #[inline]
+    pub(crate) fn note_x_dirty(&mut self, extent: u32) {
+        let extent = extent.min(self.x.len() as u32);
+        if extent > self.x_dirty {
+            self.x_dirty = extent;
+        }
+    }
+
+    /// The FR-file twin of [`Machine::note_x_dirty`].
+    #[inline]
+    pub(crate) fn note_fr_dirty(&mut self, extent: u32) {
+        let extent = extent.min(self.fr.len() as u32);
+        if extent > self.fr_dirty {
+            self.fr_dirty = extent;
+        }
     }
 
     /// Read float register `n`, or `None` if it is outside the FR file.
@@ -142,14 +194,14 @@ impl Machine {
     /// can hold a pointer into the process heap and must be a GC root; see
     /// [`Machine::x_mut`] for why the whole-set hand-off goes through
     /// [`Machine::with_roots`](crate::machine::Machine::with_roots) rather than three
-    /// separate accessor calls — and for why handing the slice out escapes the file
-    /// (and so forces the next [`Machine::reset`] to refill it in full).
+    /// separate accessor calls — and for why handing the slice out notes the file's
+    /// whole-file dirty extent (and so forces the next [`Machine::reset`] to refill it in
+    /// full).
     #[inline]
     pub fn fr_mut(&mut self) -> &mut [Eterm] {
-        self.regs_escaped = true;
+        self.note_fr_dirty(self.fr.len() as u32);
         &mut self.fr
     }
-
     /// The number of **live leading FR slots** — the exclusive high-water mark of
     /// the float-register file.
     ///
@@ -163,22 +215,32 @@ impl Machine {
     ///
     /// **Caveat — a slot-escaping writer may understate it.** The mark advances only
     /// through [`Machine::set_fr`]. A writer that can reach the FR file without going
-    /// through it — a native JIT block (which stores straight into `machine.fr`
-    /// through the raw pointer the generated code holds) or a host handed a raw
-    /// mutable slice ([`Machine::fr_mut`]/[`Machine::x_mut`]/
-    /// [`Machine::with_roots`](crate::machine::Machine::with_roots)) — sets the
-    /// crate-internal `regs_escaped` flag instead of raising the mark, so in that
-    /// window the mark may name fewer slots than are actually dirty. A caller that
-    /// needs the honest upper bound in that window must account for it itself (e.g.
-    /// conservatively treat the whole FR file as live, or track whether it took a raw
-    /// slice). A caller that never runs a native block and never takes a raw slice
-    /// sees a mark that is **exact** after the ordinary interpret seams, because
-    /// every FR write goes through [`Machine::set_fr`].
+    /// through it — a host handed a raw mutable slice ([`Machine::fr_mut`]/
+    /// [`Machine::x_mut`]/[`Machine::with_roots`](crate::machine::Machine::with_roots)) or
+    /// a writer that reports an extent ([`Machine::note_fr_dirty`]) — records the
+    /// [`Machine::fr_dirty`] extent instead of raising the mark, so in that window the
+    /// mark may name fewer slots than are actually dirty (the reset refill and the root
+    /// hand-off both use `max(mark, dirty)`, so nothing they do depends on the mark
+    /// alone). A caller that needs the honest upper bound in that window must read
+    /// [`Machine::used_fr_extent`] or conservatively treat the whole FR file as live. A
+    /// caller that never takes a raw slice sees a mark that is **exact** after the
+    /// ordinary interpret seams, because every FR write goes through [`Machine::set_fr`].
     #[inline]
     pub fn fr_mark(&self) -> u32 {
         (self.fr_mark as usize).min(MAX_FLOAT_REGISTER as usize) as u32
     }
 
+    /// The number of register words the last [`Machine::reset`] refilled: the x-file words
+    /// plus the FR-file words (`x_hi + fr_hi` of that refill).
+    ///
+    /// A deterministic counter of the reset's actual work, and the figure that shows the
+    /// dirty-region refill is proportional to what a run used rather than to the 2048
+    /// words of the two files. Diagnostic/test surface only — nothing in the engine reads
+    /// it.
+    #[inline]
+    pub fn refilled_words(&self) -> u32 {
+        self.refilled_words
+    }
     /// Write `value` into float register `n`.
     ///
     /// Mirrors [`Machine::set_x`]: returns [`crate::error::bad_register`] if `n` is
@@ -230,14 +292,14 @@ impl Machine {
     /// The native driver calls this as soon as a compiled block has executed: generated
     /// code stores straight into `machine.x` through the pointer it holds (and may touch
     /// the FR file), so the [`Machine::x_mark`]/[`Machine::fr_mark`] high-water marks no
-    /// longer bound the dirty region. [`Machine::x_mut`]/[`Machine::fr_mut`]/
-    /// [`Machine::with_roots`](crate::machine::Machine::with_roots) set the same flag for
-    /// a host handed a raw slice.
+    /// longer bound the dirty region. It is the wide form of
+    /// [`Machine::note_x_dirty`]/[`Machine::note_fr_dirty`]: a caller that knows the
+    /// extent it may have written reports it there instead and pays only that much.
     #[inline]
     pub(crate) fn mark_regs_escaped(&mut self) {
-        self.regs_escaped = true;
+        self.note_x_dirty(self.x.len() as u32);
+        self.note_fr_dirty(self.fr.len() as u32);
     }
-
     /// Reset to the initial state: a fresh (NIL-filled) register file and empty
     /// stack and frame stacks.
     ///
@@ -255,51 +317,47 @@ impl Machine {
     ///   are only resized when their length differs from the target (which happens
     ///   once, for the first reset after `Machine::with_max_register`, and never
     ///   again in steady state), so the register base stays put across runs;
-    /// * the refill is **bounded by the written high-water mark**:
-    ///   [`Machine::x_mark`]/[`Machine::fr_mark`] record the leading slots a register-
-    ///   write seam has actually stored into since the last refill, so a run that
-    ///   touched two x-registers and no FR only pays for those two words plus the FR
-    ///   file's zero. A writer that cannot report its slots (a native JIT block, a host
-    ///   handed a raw slice) sets [`Machine::regs_escaped`] instead, and this reset then
-    ///   refills both files in full — a stale register would be a WRONG RESULT, so the
-    ///   marks are never trusted past what the seams could prove.
+    /// * the refill is **bounded by the dirty region**: [`Machine::x_mark`]/
+    ///   [`Machine::fr_mark`] record the leading slots a register-write seam has actually
+    ///   stored into since the last refill, and [`Machine::x_dirty`]/[`Machine::fr_dirty`]
+    ///   record the extent a writer that cannot report its slots ([`Machine::x_mut`], a
+    ///   root hand-off, a native block) may have reached. The refill covers
+    ///   `max(mark, dirty)` of each file, so a run that touched three x-registers and no
+    ///   FR pays three words instead of 2048 — and the patch is *exactly* equivalent to a
+    ///   full one, because every slot outside the region is still `NIL` (the initial
+    ///   `resize` and every previous reset filled it) and every writer reports.
     #[inline]
     pub fn reset(&mut self) {
-        // The dirty region of each file: the tracked high-water mark, or the whole file
-        // when a writer that could not report its slots has run. Everything outside the
-        // region is still `NIL` from the previous refill (or the initial `resize`), so
-        // skipping it is exactly equivalent to refilling it.
-        let escaped = self.regs_escaped;
+        // The dirty region of each file: the larger of the tracked high-water mark and the
+        // reported writer extent. Everything outside the region is still `NIL` from the
+        // previous refill (or the initial `resize`), so skipping it is exactly equivalent
+        // to refilling it.
         let n = self.max_register as usize;
         if self.x.len() != n {
             // A fresh (or resized) file is `NIL`-filled by `resize` itself.
             self.x.clear();
             self.x.resize(n, Eterm::default());
             self.x_mark = 0;
+            self.x_dirty = 0;
         }
-        let x_hi = if escaped {
-            n
-        } else {
-            (self.x_mark as usize).min(n)
-        };
+        let x_hi = (used_extent(n, self.x_mark, self.x_dirty) as usize).min(n);
         fill_nil(&mut self.x[..x_hi]);
         self.x_mark = 0;
+        self.x_dirty = 0;
+        self.refilled_words = x_hi as u32;
 
         let fr_len = MAX_FLOAT_REGISTER as usize;
         if self.fr.len() != fr_len {
             self.fr.clear();
             self.fr.resize(fr_len, Eterm::default());
             self.fr_mark = 0;
+            self.fr_dirty = 0;
         }
-        let fr_hi = if escaped {
-            fr_len
-        } else {
-            (self.fr_mark as usize).min(fr_len)
-        };
+        let fr_hi = (used_extent(fr_len, self.fr_mark, self.fr_dirty) as usize).min(fr_len);
         fill_nil(&mut self.fr[..fr_hi]);
         self.fr_mark = 0;
-        self.regs_escaped = false;
-
+        self.fr_dirty = 0;
+        self.refilled_words += fr_hi as u32;
         self.stack.clear();
         self.frames.clear();
         self.catch_frames.clear();
