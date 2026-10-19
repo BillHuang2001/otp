@@ -192,6 +192,8 @@ Gaps whose owner is another crate, each with the exact API this crate adopts onc
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
 - `tests/alloc.rs` → the allocation-failure classification contract (`requested == words * size_of::<Eterm>()`, heap untouched, the predicate's accept/reject split)
 - `tests/counters.rs` → the deterministic counter harness: counting `#[global_allocator]` + graph census, per-shape words/objects/header overhead, allocations and bytes allocated, bytes touched, the copy-vs-enqueue split, the asserted byte-touch model, `report_deterministic_counters_per_shape`
+- `tests/traversals.rs` → the structural traversal counter: what a `send` **writes into the destination** versus what the source graph **contains** (the `{From, LiteralPayload}` send at 1 object / 3 words vs the same graph's 28-object / 73-word census), pinning that the two numbers answer different questions; `report_structural_traversals_per_shape`
+- `tests/identity.rs` → **term identity across the copy boundary**: a copied term is observationally identical to its source for every payload class, so `tests/traversals.rs`'s 1-object/3-word literal send is proven *shared*, not dropped (`copy.c:720,744,767`; `erl_message.c:722-723,771,797`)
 - `tests/perf.rs` → the dependency-free copy-cost measurement (ns/word, ns/object) + the single-pass-vs-sized preflight-share probe
 - `tests/send_perf.rs` → the dependency-free per-send measurement over the real `beam_message::send` path (clean vs dirty destination, five shapes)
 - `PERF.md` → the measured per-send and preflight-share figures (single-pass vs the two-traversal path) and the "what remains" boundary note
