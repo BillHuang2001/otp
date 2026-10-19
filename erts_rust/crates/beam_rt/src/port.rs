@@ -178,15 +178,15 @@ pub(crate) mod watch;
 use beam_alloc::Heap;
 use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
 use beam_bifs::PortHook;
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
-    Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
-    PortRegistry as IoPortRegistry, ReadMessage, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
-    StreamOptions, PORT_REDS_EXECUTE,
+    Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortCommandOutcome, PortExitReason,
+    PortNotification, PortRegistry as IoPortRegistry, PortTaskOutcome, ReadMessage, SpawnDriver,
+    SpawnOptions, SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
 };
-use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
+use beam_process::{PortId, PortMonitor, PortTable, ProcessId, ProcessTable};
 use beam_term::{
     atom_val, is_atom, is_small, make_atom, make_small, signed_value, try_make_small, AtomTable,
     Eterm, NIL,
@@ -345,24 +345,7 @@ pub enum PortName {
 }
 
 impl PortName {
-    /// Whether the port's bytes come from a C driver's **inline `output` callback** — only a
-    /// `dlopen`ed `{spawn_driver, Name}` port ([`PortName::SpawnDriver`]).
-    ///
-    /// A built-in driver port ([`PortName::SpawnDriverBuiltin`]) — and every `spawn`/`fd` port —
-    /// delivers through a poller-registered descriptor on the port-task round instead, so its
-    /// bytes are not harvested from the driver's input queue.
-    fn bytes_from_driver_output(self) -> bool {
-        match self {
-            PortName::SpawnDriver => true,
-            PortName::SpawnDriverBuiltin
-            | PortName::Spawn
-            | PortName::SpawnExecutable
-            | PortName::Fd => false,
-        }
-    }
-
-    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot
-    /// say about itself.
+    /// The [`StreamShape`] this `Name` form's reads carry — the producer fact a read cannot    /// say about itself.
     ///
     /// A **built-in** driver port's bytes come up through [`beam_io::DriverContext::input`], a
     /// flat byte queue that cannot say which `driver_output*` call wrote them, so they render
@@ -537,13 +520,11 @@ struct PortMeta {
     owner: ProcessId,
     /// Which `Name` form opened the port.
     ///
-    /// The two message producers route on it (see [`PortName::bytes_from_driver_output`], and
+    /// The two message producers route on it (see [`PortName::stream_shape`] and
     /// [`PortMeta::has_driver_control`] for the `port_control` gate's `Name`-form half): a
-    /// `dlopen`ed `{spawn_driver, Name}` port's bytes
-    /// come from the C driver's inline `output` callback (the port-task round reports the reads
-    /// [`driver::DriverPortAdapter`] hands up, header/body split intact), while every other port's
-    /// — including a **built-in** driver port's — come from a poller-registered descriptor through
-    /// the same round.
+    /// built-in driver port's bytes come up through [`beam_io::DriverContext::input`], a flat byte
+    /// queue that cannot say which `driver_output*` call wrote them, while a `dlopen`ed
+    /// `{spawn_driver, Name}` port's reads carry the C's header/body split.
     kind: PortName,
     /// Whether this port's driver declares a **`control` callback** — the C's
     /// `prt->drv_ptr->control != NULL` test (`../../erts/emulator/beam/io.c:4035`), captured from
@@ -611,6 +592,26 @@ struct PortMeta {
     /// "never busy, no `SOFT_BUSY`" case, i.e. `force` ⇒ `notsup`, matching the oracle's own answers
     /// for `{spawn, Cmd}` and `{fd, N}` ports.
     driver_busy: Option<driver::BusyFlag>,
+    /// The **OS child pid** a `{spawn_driver, Name}` port's C driver recorded through
+    /// `erl_drv_set_os_pid` — the C's `prt->os_pid` (`io.c:2971`), which
+    /// `port_info(Port, os_pid)` reads back (`erl_bif_info.c:3814-3817`).
+    ///
+    /// The C starts the field at `-1` (`io.c:386`) and the BIF renders a negative value as the atom
+    /// `undefined`, so **unset is `None`** ([`driver::OsPidFlag`]): a driver that never called the
+    /// hook answers `undefined`, exactly like the oracle
+    /// (`open_port({spawn_driver,"ram_file_drv"},[])`).
+    ///
+    /// It is a shared handle, not a value, because the driver records the pid from inside its
+    /// `start` callback — which runs **after** the port is registered — so the reader has to see a
+    /// later write. Seized from the host with [`driver::DriverPort::os_pid_flag`] **before**
+    /// [`driver::DriverPortAdapter::load`] consumes it (the boxed driver exposes no host), the same
+    /// way [`PortMeta::driver_busy`], [`PortMeta::driver_terms`] and
+    /// [`PortMeta::driver_control_flags`] are.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port, and a **built-in** driver
+    /// port, whose Rust driver declares no OS child of its own) — those answer from
+    /// [`PortMeta::os_pid`], the pid `beam_io` reports for the child it really forked.
+    driver_os_pid: Option<driver::OsPidFlag>,
     /// The monitor tree a `{spawn_driver, Name}` port's C driver holds on Erlang processes
     /// (`driver_monitor_process`) — the C's per-port monitor list.
     ///
@@ -1100,6 +1101,24 @@ pub struct PortRegistry {
     /// inherits an entry: it is consumed by the read it was recorded for, dropped when the port's
     /// `Closed` report is folded, and cleared when a new port registers under that number.
     failed_read_recipients: HashMap<u64, FailedReadRecipient>,
+    /// Every live port's incoming monitor set, read from the authoritative
+    /// [`beam_process::PortTable`] **immediately before** each port-task round — the reading a
+    /// **driver-failed** port's `'DOWN'` messages are built from (see
+    /// [`PortRegistry::fail_port`](super::PortRegistry)).
+    ///
+    /// The failure channel needs it because a round that reaps a driver-failed port mints that
+    /// port's [`PortNotification::Closed`] report in the very same call, and minting is what
+    /// retires its **number** ([`beam_io::PortRegistry::execute_port_tasks`] →
+    /// `take_closed_notifications` → [`PortTable::release`]) — which drops the number's incoming
+    /// monitors along with its owner and links. [`PortRegistry::drain_failures`] therefore runs
+    /// strictly *after* the port has left the table, so this
+    /// [`PortRegistry::capture_round_monitors`] reading is the last truthful statement of who was
+    /// watching it.
+    ///
+    /// Replaced (never accumulated) by every round, so an entry belongs to the round that is
+    /// about to run and is consumed by the failure that round reaps; a port that survives the
+    /// round is simply re-read next time.
+    pre_round_monitors: HashMap<u64, Vec<PortMonitor>>,
 }
 
 impl PortRegistry {
@@ -1130,6 +1149,7 @@ impl PortRegistry {
             pending_events: Vec::new(),
             pending_port_signals: exit::PendingPortSignals::default(),
             failed_read_recipients: HashMap::new(),
+            pre_round_monitors: HashMap::new(),
         })
     }
 
@@ -1193,6 +1213,66 @@ impl PortRegistry {
         }
     }
 
+    /// Reads every live port's incoming monitor set into
+    /// [`PortRegistry::pre_round_monitors`] — **before** the round that may reap one of them.
+    ///
+    /// This is the failure channel's only chance: [`beam_io::PortRegistry::execute_port_tasks`]
+    /// reaps a driver-failed port and then mints its close report in the same call, and minting
+    /// retires the port's number, which is what drops its monitors from the
+    /// [`PortTable`](beam_process::PortTable). The drain that renders the failure's `'DOWN'`
+    /// messages runs after the round, so it must find them here.
+    ///
+    /// Only a port that actually has watchers takes an entry, so a runtime whose ports are
+    /// unmonitored pays one hash probe per live port and allocates nothing. (A round already
+    /// collects and sorts the whole port-number list twice, so the probe is not the cost.)
+    fn capture_round_monitors(&mut self) {
+        // Field-level destructuring keeps the three borrows disjoint: `PortTable` is reached
+        // through `registry`, the port list from `meta`, and the snapshot written here.
+        let PortRegistry {
+            registry,
+            meta,
+            pre_round_monitors,
+            ..
+        } = self;
+        pre_round_monitors.clear();
+        for number in meta.keys() {
+            let monitors = registry.port_table().monitors(PortId::new(*number));
+            if !monitors.is_empty() {
+                pre_round_monitors.insert(*number, monitors.to_vec());
+            }
+        }
+    }
+
+    /// Runs one `beam_io` port-task round — the crate's single entry to
+    /// [`beam_io::PortRegistry::execute_port_tasks`].
+    ///
+    /// The round is where a driver's own `driver_failure*`/`driver_exit` is reaped *and* where
+    /// the reaped port's close report retires its number, so the monitor snapshot that teardown
+    /// needs is taken first (see [`PortRegistry::capture_round_monitors`]). Every other step is
+    /// `beam_io`'s, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As for [`beam_io::PortRegistry::execute_port_tasks`] — a driver error raised while a task
+    /// runs; the round's closes then stay queued for the next one.
+    fn run_port_tasks(&mut self, reds_budget: usize) -> Result<PortTaskOutcome> {
+        self.capture_round_monitors();
+        self.registry.execute_port_tasks(&mut self.poller, reds_budget)
+    }
+
+    /// Runs one `beam_io` readiness round — [`beam_io::PortRegistry::handle_events`], the round
+    /// that exists only to mint outstanding close reports.
+    ///
+    /// It reaps a driver-failed port exactly as [`PortRegistry::run_port_tasks`] does, so it
+    /// takes the same monitor snapshot first.
+    ///
+    /// # Errors
+    ///
+    /// As for [`beam_io::PortRegistry::handle_events`].
+    fn handle_port_events(&mut self, events: &[Event]) -> Result<PortTaskOutcome> {
+        self.capture_round_monitors();
+        self.registry.handle_events(&mut self.poller, events)
+    }
     /// Arms a **one-shot** read interest on the tty descriptor (fd 0) for `owner` — the
     /// `enif_select` half of `prim_tty:tty_select/2` (see [`tty`]).
     ///
@@ -1278,105 +1358,231 @@ impl PortRegistry {
         self.meta.contains_key(&id.number())
     }
 
-    /// Writes `bytes` to the port's stream — `erlang:port_command/2,3`.
+    /// Hands a command to the port the way `erlang:port_command/2,3` does, taking the command's
+    /// bytes from `make_data` **only once the port has accepted the command** — the C's own order.
     ///
-    /// The bytes are queued through [`beam_io::PortRegistry::port_command`] and the
-    /// `OUTPUT` task it scheduled is run immediately, so the stream has been handed the data
-    /// before this call returns (the BIF's `true` answer means exactly that). For a child port
-    /// that stream is the child's stdin; for a `{fd, N}` port it is the **adopted, duplex**
-    /// descriptor — writing is the oracle's own behaviour for a descriptor port, so the write
-    /// takes the same path rather than being a capability gap.
+    /// The C resolves the port and tests the driver's flag word **before** `erts_port_output` runs
+    /// (`erts_internal_port_command_3`, `erts/emulator/beam/erl_bif_port.c:190-198`), and
+    /// `erts_port_output` answers `ERTS_PORT_OP_BUSY` from the port's scheduler flags **before** it
+    /// converts `Data` (`io.c:1749-1754`, against the `erts_ioq_iodata_vec_len`/
+    /// `io_list_to_buf` conversion at `io.c:1790`/`:1866`). A `[nosuspend]` command on a busy port
+    /// therefore answers the atom `false` even when `Data` is **not iodata at all** — the command is
+    /// dropped, never `badarg`. A bytes-first seam cannot reproduce that (the caller converts first,
+    /// so the conversion failure wins), which is why this variant takes a producer and calls it
+    /// only on the accept path.
     ///
-    /// # The driver's reply is retained, not discarded
-    ///
-    /// That task round is the round a **built-in** driver answers from: `ram_file_drv`/`efile`
-    /// write their reply into [`beam_io::DriverContext::input`] during the `OUTPUT` task, and
-    /// the round then harvests it as a [`beam_io::PortNotification::Data`] — draining the port's
-    /// input queue, so no later round can see it. The outcome is therefore **folded into**
-    /// [`PortRegistry::pending_events`] (through the same
-    /// [`PortRegistry::fold_notifications`] the pump uses) rather than dropped, and the next
-    /// [`PortRegistry::pump`] reports it as the owner's `{Port, {data, Data}}`. Dropping it was
-    /// the defect: the reply never reached the owner and `port_info(Port, input)` stayed `0`.
+    /// The pre-conversion gate is [`PortRegistry::decide_before_data`], the C's two checks that
+    /// answer without looking at `Data`; a command that passes it is handed to
+    /// [`PortRegistry::command`], where [`beam_io`]'s decision table re-decides on the converted
+    /// bytes and the accepted command's round and byte accounting run. The two halves read the same
+    /// facts, so a command the gate accepts cannot then be refused as busy.
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never
-    /// opened) — the oracle's own reason for `port_command` on a dead port;
-    /// [`BeamError::Io`] when the write itself fails (a child that closed its stdin yields
-    /// `EPIPE`).
-    pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        let Some(meta) = self.meta.get_mut(&id.number()) else {
-            return Err(BeamError::BadArg);
-        };
-        // Every byte handed to a port counts as **output** for `erlang:statistics(io)`,
-        // whichever stream it goes to (the counters are bumped before the branch so a
-        // driver port and a child/`{fd,N}` port are counted alike). The port's **own**
-        // `port_info(Port, output)` total is bumped at the same instant, so the two agree by
-        // construction.
-        self.io_counters.note_output(bytes.len());
-        meta.output.set(meta.output.get().saturating_add(bytes.len() as u64));
-        // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
-        // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
-        // answers with through `driver_output*` are queued as this port's **reads**, which the next
-        // port-task round reports one message per call with the C's header/body split intact (see
-        // [`PortRegistry::fold_notifications`]). Harvesting them off the flat byte queue would
-        // flatten a `driver_output2` reply (`[h…|<<tail>>]` → `<<h…tail>>`), so it is deliberately
-        // left to the round.
-        if self
-            .meta
-            .get(&id.number())
-            .map(|meta| meta.kind.bytes_from_driver_output())
-            .unwrap_or(false)
-        {
-            let written = self.registry.output(&mut self.poller, id, bytes);
-            // The driver's `output` callback is where a socket driver stages its
-            // `{inet_reply, …}` (see [`completion`]), so the channel is drained before the
-            // outcome is reported — a staged reply is a message its owner is owed, not a
-            // reason to fail the command.
-            let completions = self.drain_io_completions(None);
-            self.pending_events.extend(completions);
-            // The same `output` callback is where a socket driver stages an `{active, …}`
-            // delivery, so that channel is drained beside the completions and held as pending
-            // work until a pump reports it (see [`ops::active_input`]).
-            let active = self.drain_active_inputs();
-            self.pending_events
-                .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
-            written?;
-            return Ok(());
+    /// As for [`PortRegistry::command`], plus whatever `make_data` returns (the caller's own iodata
+    /// conversion — `badarg` for a term that is not iodata).
+    pub fn command_with_data<F>(
+        &mut self,
+        id: PortId,
+        make_data: F,
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome>
+    where
+        F: FnOnce() -> Result<Vec<u8>>,
+    {
+        if let Some(outcome) = self.decide_before_data(id, options)? {
+            return Ok(outcome);
         }
-        // A `{packet, N}` port's stream is framed by the emulator: the length header is
-        // prepended to this payload here, **before** the bytes reach `beam_io`, exactly as the
-        // reference C's sys driver does in its `output`/`outputv` callbacks
-        // (`sys_drivers.c:1144-1160`, `:1062-1077`). The counters above were bumped with the
-        // **payload** length, which is what the oracle's own `port_info(Port, output)` reports
-        // for a framed port (measured: 3, not 7, for a 3-byte payload on `{packet,4}`).
-        let wire: Cow<'_, [u8]> = match self.meta.get(&id.number()).and_then(|meta| meta.packet.as_ref())
-        {
-            Some(framing) => Cow::Owned(framing.frame_output(bytes)?),
-            None => Cow::Borrowed(bytes),
+        let bytes = make_data()?;
+        self.command(id, &bytes, options)
+    }
+    /// The C's **pre-conversion** half of the `port_command` decision: the checks that answer
+    /// without ever looking at the data, in the C's order.
+    ///
+    /// * the port must be live — `sig_lookup_port`'s `badarg` (`erl_bif_port.c:190-193`), which
+    ///   [`beam_io::PortRegistry::is_busy`] reports as its own `badarg` for an unknown port;
+    /// * `[force]` is refused `error:notsup` unless the driver **entry** advertises
+    ///   `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`) — a fact about the entry, so it holds
+    ///   on an idle port too;
+    /// * otherwise a **busy** port is `ERTS_PORT_OP_BUSY` (`io.c:1749-1754`): nothing is queued,
+    ///   and the runtime answers `false` or suspends the caller.
+    ///
+    /// `Some(outcome)` is that answer; `None` means the command is accepted so far and its bytes
+    /// may be converted.
+    ///
+    /// Both facts are the ones the port layer's own decision reads — the state through
+    /// [`beam_io::Driver::is_busy`] (whom [`beam_io::PortRegistry::is_busy`] forwards to) and the
+    /// entry flag through [`PortRegistry::soft_busy`], the runtime's mirror of the
+    /// `ERL_DRV_FLAG_SOFT_BUSY` bit a loaded driver entry reported (the very handle
+    /// [`driver::DriverPortAdapter::flags`] answers from) — so the gate can never disagree with the
+    /// decision that follows it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), and
+    /// the `notsup` raise for `[force]` on a driver without `ERL_DRV_FLAG_SOFT_BUSY`.
+    fn decide_before_data(
+        &self,
+        id: PortId,
+        options: PortCommandOptions,
+    ) -> Result<Option<PortCommandOutcome>> {
+        let busy = self.registry.is_busy(id)?;
+        if options.is_force() {
+            if !self.soft_busy(id) {
+                return Err(notsup());
+            }
+            return Ok(None);
+        }
+        Ok(busy.then_some(PortCommandOutcome::Busy))
+    }
+    /// Hands `bytes` to the port the way `erlang:port_command/2,3` does, and reports what the
+    /// port's **busy state** and the command options made of it.
+    ///
+    /// This is [`PortRegistry::command_with_data`]'s **eager** form: the bytes are already
+    /// converted, so the C's order (busy before conversion) is not observable and a caller holding
+    /// a *term* must use `command_with_data` instead.
+    ///
+    /// The **decision** is [`beam_io`]'s — [`beam_io::PortRegistry::port_command_with`], whose
+    /// [`beam_io::Port::command`] is the crate's one implementation of the C's decision table
+    /// (`erts/emulator/beam/erl_bif_port.c:192-235`, `io.c:1731`, `:1763-1769`) — never re-derived
+    /// here. This method owns the two halves `beam_io` cannot: the **round** that makes an accepted
+    /// write really happen before the answer, and the byte accounting that must follow the accept.
+    ///
+    /// # The accepted command
+    ///
+    /// `Done` ⇒ the `OUTPUT` task the command scheduled is run **now**
+    /// ([`beam_io::PortRegistry::execute_port_tasks`]), so the stream has been handed the data
+    /// before this returns (the BIF's `true` answer means exactly that). For a child port that
+    /// stream is the child's stdin; for a `{fd, N}` port it is the **adopted, duplex** descriptor;
+    /// for a `{spawn_driver, Name}` port that task *is* the driver's own `output` callback
+    /// ([`beam_io::Driver::ready_output`]'s default calls `output`), which is what the C's
+    /// `port_command` on a loaded driver does.
+    ///
+    /// That round is also what a **built-in** driver answers from: `ram_file_drv`/`efile` write
+    /// their reply into [`beam_io::DriverContext::input`] during the `OUTPUT` task, and the round
+    /// harvests it as a [`beam_io::PortNotification::Data`] — draining the port's input queue, so
+    /// no later round can see it. The outcome is therefore **folded into**
+    /// [`PortRegistry::pending_events`] (through the same [`PortRegistry::fold_notifications`] the
+    /// pump uses) rather than dropped, and the next [`PortRegistry::pump`] reports it as the
+    /// owner's `{Port, {data, Data}}`. Dropping it was the defect: the reply never reached the
+    /// owner and `port_info(Port, input)` stayed `0`.
+    ///
+    /// # The byte accounting follows the accept
+    ///
+    /// `erlang:statistics(io)`'s output total and the port's own `port_info(Port, output)` figure
+    /// are bumped **only for a command that was accepted**: a command the driver entry refuses
+    /// (`notsup`) and a `Busy` one that was never queued both write nothing and so count nothing.
+    /// Both are bumped with the **payload** length — a `{packet, N}` port's emulator-side length
+    /// header is not part of what the oracle reports (measured: 3, not 7, for a 3-byte payload on
+    /// `{packet,4}`).
+    ///
+    /// A `{packet, N}` port's header is prepended **before** the command reaches `beam_io`,
+    /// exactly as the reference C's sys driver does in its own `output`/`outputv` callbacks
+    /// (`sys_drivers.c:1144-1160`, `:1062-1077`). Only the spawn/`{fd,N}` family is framed by the
+    /// emulator ([`PortName::frames_packets`]), and such a port can never report busy, so the
+    /// header is prepended before the decision without that being observable — the decision itself
+    /// stays `beam_io`'s alone.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened) —
+    /// the oracle's own reason for `port_command` on a dead port; the `notsup` raise for `[force]`
+    /// on a driver that does not advertise `ERL_DRV_FLAG_SOFT_BUSY`, **idle or busy**, decided
+    /// before any output is attempted; the framer's growth refusal for an oversized `{packet, N}`
+    /// payload; and whatever the write itself failed with (a child that closed its stdin yields
+    /// `EPIPE`).
+    pub fn command(
+        &mut self,
+        id: PortId,
+        bytes: &[u8],
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome> {
+        let wire: Cow<'_, [u8]> = match self.meta.get(&id.number()) {
+            Some(meta) if meta.kind.frames_packets() => match meta.packet.as_ref() {
+                Some(framing) => Cow::Owned(framing.frame_output(bytes)?),
+                None => Cow::Borrowed(bytes),
+            },
+            _ => Cow::Borrowed(bytes),
         };
-        self.registry
-            .port_command(&mut self.poller, id, &wire, PortCommandOptions::EMPTY)?;
-        // `port_command` only queues the bytes and schedules the task; run it now so the
-        // write really happened.
         let outcome = self
             .registry
-            .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            .port_command_with(&mut self.poller, id, &wire, options)?;
+        if outcome == PortCommandOutcome::Busy {
+            // Nothing was queued, so nothing is written and nothing is counted: the caller owns
+            // the bytes and the options and re-issues the command once the driver is idle.
+            return Ok(outcome);
+        }
+        // Accepted — only now do the bytes count as output. `erlang:statistics(io)`'s total and
+        // the port's own `port_info(Port, output)` figure are bumped at the same instant, so the
+        // two agree by construction.
+        self.io_counters.note_output(bytes.len());
+        if let Some(meta) = self.meta.get_mut(&id.number()) {
+            meta.output
+                .set(meta.output.get().saturating_add(bytes.len() as u64));
+        }
+        // The command is only queued and its task scheduled; run the round now so the write really
+        // happened (and so a driver port's `output` callback has answered) before the caller is
+        // told `true`. A driver that closes its own port from that very callback is reaped and
+        // retired by this round, which is why the round is entered through
+        // [`PortRegistry::run_port_tasks`] (it snapshots the monitors the teardown owes).
+        let round = self.run_port_tasks(PORT_REDS_EXECUTE);
+        let (notifications, refused) = match round {
+            Ok(outcome) => (outcome.notifications, None),
+            // A driver that refused the command may still owe its owner a reply, a completion or
+            // its `{'EXIT', …}`: the channels below are drained before the refusal is reported
+            // (the round's own `Closed` report stays queued for the next one).
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        // The `OUTPUT` task that carried this command is where a socket driver stages its
+        // `{inet_reply, …}` (see [`completion`]) and its `{active, …}` delivery (see
+        // [`ops::active_input`]), and where a driver that closes its **own** port latches the
+        // failure — so both channels are drained and held as pending work until a pump reports
+        // them.
+        //
+        // The drain comes **before** the round's notifications are folded, the order
+        // [`PortRegistry::pump`] uses and the only order that keeps a failing callback's own read:
+        // [`PortRegistry::drain_failures`] is what finishes the teardown
+        // ([`PortRegistry::fail_port`]) — removing the port's metadata and purging the events
+        // retained for it — so a fold that ran first would bind the read to metadata the teardown
+        // is about to discard and then lose the event to that purge. Folded after, the read is
+        // rendered from the recipient the teardown snapshotted ([`FailedReadRecipient`]), which is
+        // the snapshot the oracle's `{data,<<"hi">>}` **then** `{'EXIT',P,9}` row needs.
+        let completions = self.drain_io_completions(None);
         // The round harvested the replies the drivers just wrote (and every other live port's
         // buffered input along with them — a round drains them all), so its notifications are
         // **retained** here for the next pump: the queue they came from is already empty.
         let mut events = Vec::new();
-        self.fold_notifications(outcome.notifications, &mut events)?;
+        self.fold_notifications(notifications, &mut events)?;
         self.pending_events.extend(events);
-        // Same rule as the driver-`output` branch above: the `OUTPUT` task that carried this
-        // command is exactly where a socket driver stages `gen_udp:send`'s `{inet_reply, …}`.
-        let completions = self.drain_io_completions(None);
         self.pending_events.extend(completions);
-        // …and where it stages an `{active, …}` delivery too.
         let active = self.drain_active_inputs();
         self.pending_events
             .extend(active.into_iter().map(|packet| PortEvent::ActiveInput { packet }));
-        Ok(())
+        match refused {
+            Some(error) => Err(error),
+            None => Ok(PortCommandOutcome::Done),
+        }
+    }
+
+    /// Writes `bytes` to the port's stream — `erlang:port_command/2`, i.e. [`PortRegistry::command`]
+    /// with **no** options.
+    ///
+    /// A busy port is reported as the typed capability gap the runtime's `port_command` floor
+    /// raises for a plain command on one (this seam has no way to suspend the caller and re-issue
+    /// the command, which is what the C does); every other outcome is [`Ok`] — the bytes really
+    /// were handed to the stream, or the driver really did answer them.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::command`], plus the typed capability gap for a busy port.
+    pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
+        match self.command(id, bytes, PortCommandOptions::EMPTY)? {
+            PortCommandOutcome::Done => Ok(()),
+            PortCommandOutcome::Busy => Err(error::unsupported(
+                "port_command on a busy port: suspending the caller until the port is idle is not \
+                 implemented",
+            )),
+        }
     }
 
     /// Delivers a named port-control operation to the port's driver — the runtime side of
@@ -1873,9 +2079,7 @@ impl PortRegistry {
                     self.registry.schedule_events(&port_events);
                 }
             }
-            let outcome = self
-                .registry
-                .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            let outcome = self.run_port_tasks(PORT_REDS_EXECUTE)?;
             // The **completion channel** is drained on *every* round, immediately after the
             // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
             // (or from `output`/`control`), and the port keeps it until a drain takes it, so
@@ -2106,13 +2310,27 @@ impl PortRegistry {
     /// delivered to a stale owner ([`PortRegistry::close`] purges them outright, which is what
     /// keeps a reused port number from inheriting them).
     ///
+    /// A [`PortEvent::Data`] is the exception, and it is not a relaxation: its recipient was
+    /// **already** resolved where the read was folded, from a live port's metadata or — for the
+    /// read a failing driver callback wrote before it closed its own port — from the snapshot
+    /// [`PortRegistry::fail_port`] took ([`FailedReadRecipient`]). That port is gone *by
+    /// construction*, and the read is exactly what the owner is owed **ahead of** the `'EXIT'`
+    /// the same failure published (the oracle's `{P,{data,<<"hi">>}}` then `{'EXIT',P,9}` row),
+    /// so the liveness question here could only suppress it. There is no stale owner to reach: a
+    /// read with no recoverable recipient is dropped by the fold itself, `close`'s and
+    /// `fail_port`'s purges never leave another port's read behind, and a recycled number gets a
+    /// live port whose own metadata resolves its own reads.
+    ///
     /// Nothing is re-delivered: the bytes left [`beam_io`]'s input queue when they were harvested,
     /// so this is the **only** report they can still have.
     fn drain_pending_events(&mut self) -> Vec<PortEvent> {
         std::mem::take(&mut self.pending_events)
             .into_iter()
             .filter(|event| match event.port() {
-                Some(port) => self.meta.contains_key(&port.number()),
+                Some(port) => {
+                    self.meta.contains_key(&port.number())
+                        || matches!(event, PortEvent::Data { .. })
+                }
                 None => true,
             })
             .collect()
@@ -2469,9 +2687,17 @@ impl PortRegistry {
         let parallelism = item("false")?;
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
-            // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
-            // the oracle's own answer.
-            None => item("undefined")?,
+            // A **driver** port owns no child the emulator forked: its pid is whatever the driver
+            // recorded with `erl_drv_set_os_pid` (`io.c:2971`), and the C's `prt->os_pid` starts at
+            // `-1` (`io.c:386`), which the BIF renders as `undefined`
+            // (`erl_bif_info.c:3814-3817`) — the oracle's own answer for a port whose driver never
+            // called the hook.
+            None => match meta.driver_os_pid.as_ref().and_then(driver::OsPidFlag::get) {
+                Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
+                // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
+                // the oracle's own answer.
+                None => item("undefined")?,
+            },
         };
         Ok(vec![
             (item("name")?, name),
@@ -2706,6 +2932,55 @@ impl RuntimePorts {
         self.registry
             .try_borrow_mut()
             .map_err(|_| error::unsupported("the port table is already in use"))
+    }
+
+    /// Hands `bytes` to a port the way `erlang:port_command/2,3` does — the port-hook's own entry
+    /// to the crate's one decision table.
+    ///
+    /// This is the seam `crate::native::port`'s `port_command` floor calls: the **decision**
+    /// (`[force]` on a driver without `ERL_DRV_FLAG_SOFT_BUSY` ⇒ `notsup`, a busy port ⇒
+    /// [`PortCommandOutcome::Busy`] with nothing queued, otherwise the command is queued) is
+    /// [`beam_io`]'s, and the accepted command's round, notification folding and byte accounting
+    /// are [`PortRegistry::command`]'s — see there for both halves. Nothing about the table is
+    /// re-derived at this layer.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::command`]; a nested borrow of the registry is the typed capability
+    /// gap of [`RuntimePorts::registry_mut`], never a panic.
+    pub fn command(
+        &mut self,
+        port: PortId,
+        bytes: &[u8],
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome> {
+        self.registry_mut()?.command(port, bytes, options)
+    }
+    /// Hands a command to a port the way `erlang:port_command/2,3` does, converting the data
+    /// **only once the port has accepted the command** — [`PortRegistry::command_with_data`], the
+    /// C's own order (the busy state and the driver's flag word are decided before `Data` is
+    /// converted, `io.c:1749-1754` vs `:1790`).
+    ///
+    /// This is the seam `crate::native::port`'s `port_command` floor uses: it holds the **term**,
+    /// not bytes, so a `[nosuspend]` command on a busy port must be able to answer `false` without
+    /// ever converting it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::command_with_data`], plus whatever `make_data` returns; a nested
+    /// borrow of the registry is the typed capability gap of [`RuntimePorts::registry_mut`], never a
+    /// panic.
+    pub fn command_with_data<F>(
+        &mut self,
+        port: PortId,
+        make_data: F,
+        options: PortCommandOptions,
+    ) -> Result<PortCommandOutcome>
+    where
+        F: FnOnce() -> Result<Vec<u8>>,
+    {
+        self.registry_mut()?
+            .command_with_data(port, make_data, options)
     }
 
     /// `erts_internal:port_control(Port, Op, Data)` — deliver a port-control operation to the
@@ -3063,6 +3338,16 @@ impl PortHook for RuntimePorts {
             None => PortOptions::default(),
         };
         resolved.overlay(self.port_options(options)?);
+        // `[exit_status]` is `badarg` for any port whose name resolves to a registered driver —
+        // the C's `(driver != &spawn_driver && opts->exit_status)` (`io.c:623-626`), applied to
+        // **both** spawn name forms because the `{spawn, Cmd}` lookup runs first. The refusal is the
+        // whole truth, not a Milestone-1 shortcut: the only `{exit_status, N}` reporter is the
+        // emulator-internal `driver_report_exit` (`io.c:5554`), which `erl_driver.h` does not
+        // declare, so no Erlang-reachable driver can ever report one. Checked here, before any
+        // registry call, so a refused port consumes no id.
+        if resolved.exit_status && opens_a_driver_port(&spec) {
+            return Err(BeamError::BadArg);
+        }
 
         // `beam_io`'s driver constructor really starts the child (or adopts `{fd, N}`)
         // before anything is registered anywhere, so a failure here cannot leak an id; the
@@ -3127,6 +3412,9 @@ impl PortHook for RuntimePorts {
                     driver_atoms: None,
                     driver_control_flags: None,
                     driver_busy: None,
+                    // A built-in driver is this crate's Rust driver, not a loaded `ErlDrvEntry`:
+                    // it has no `erl_drv_set_os_pid` hook to record an OS child through.
+                    driver_os_pid: None,
                     driver_monitors: None,
                     input: Cell::new(0),
                     output: Cell::new(0),
@@ -3188,6 +3476,11 @@ impl PortHook for RuntimePorts {
             // bit, which `DriverPortAdapter::load` stamps onto this same handle once the library is
             // open — so the value is visible here without re-reading the entry.
             let driver_busy = host.busy_flag();
+            // And for the port's **OS child pid**: the driver records it from inside a callback
+            // through `erl_drv_set_os_pid` (`io.c:2971`), which `port_info(Port, os_pid)` reads
+            // back. Seized here for the same reason as the busy handle — the host is consumed by
+            // `load` below, and the write arrives *after* the port is registered.
+            let driver_os_pid = host.os_pid_flag();
             // And for the monitors the driver may install through `driver_monitor_process`: the
             // runtime sweeps this handle at the scheduler-pass boundary to mark a monitored process
             // that has died, and the port's own drive point fires the driver's `process_exit`.
@@ -3217,6 +3510,7 @@ impl PortHook for RuntimePorts {
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
                 driver_busy: Some(driver_busy),
+                driver_os_pid: Some(driver_os_pid),
                 driver_monitors: Some(driver_monitors),
                 input: Cell::new(0),
                 output: Cell::new(0),
@@ -3262,6 +3556,9 @@ impl PortHook for RuntimePorts {
             driver_atoms: None,
             driver_control_flags: None,
             driver_busy: None,
+            // A `spawn`/`fd` port has no C driver — its OS child pid is the one `beam_io` reports
+            // for the process it forked, carried in [`PortMeta::os_pid`].
+            driver_os_pid: None,
             driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),
@@ -3583,6 +3880,11 @@ impl Runtime {
         // same route — the same `table`, the same delivery seam, so the same receiver is woken
         // through `beam_process`'s wake list (see [`exit`]).
         delivered += self.deliver_port_signals(table)?;
+        // A driver that observed its **peer** closing owes its owner the oracle's own message
+        // (`{tcp_closed, Port}`, and the port's retirement when `exit_on_close` is set). It takes
+        // this same route — the same `table`, the same delivery seam — so a parked receiver is
+        // woken through `beam_process`'s wake list (see [`ops::peer_closed`]).
+        delivered += self.deliver_peer_closes(table)?;
         Ok(delivered)
     }
 }
@@ -3712,6 +4014,9 @@ impl RuntimeContext<'_> {
         // other recipient's stay queued for the scheduler route that owns a process table (see
         // [`exit`]).
         messages.extend(self.poll_port_signals()?);
+        // A peer close owed to the evaluator itself rides the same inline route (see
+        // [`ops::peer_closed`]); another process's report is left latched for the scheduler route.
+        messages.extend(self.poll_peer_closes()?);
         Ok(messages)
     }
 
@@ -4018,7 +4323,51 @@ fn driver_path_name(command: &str) -> &str {
     command.split(' ').next().unwrap_or(command)
 }
 
-/// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
+/// Whether `spec` names a port the C would open **through a driver** — the predicate behind the
+/// `[exit_status]` refusal (`erts/emulator/beam/io.c:595-628`).
+///
+/// The C resolves the name against its loaded-driver list for **both** spawn name forms:
+/// `{spawn, Cmd}` truncates the command at the first blank and searches for the token
+/// (`io.c:599-628`), and `{spawn_driver, Name}` searches for the name itself. A hit means the port
+/// is a *driver* port, for which `opts->exit_status` is `badarg` (`io.c:623-626`) — and an
+/// unresolved `{spawn_driver, Name}` is `badarg` a few lines later for the same input, so the answer
+/// does not depend on the lookup.
+///
+/// The membership gates are the emulator's own two: [`driver::is_static_driver`] (the `driver_tab.c`
+/// statics — `tcp_inet`, `udp_inet`, `ram_file_drv`) and [`driver::driver_is_loaded`] (a driver an
+/// `erl_ddll:load_driver/3` put on the loaded list). `fd`/`efile` are deliberately **not** members:
+/// OTP 21+ made them ordinary modules, so the oracle runs `{spawn,"fd"}` as a shell command and
+/// accepts `[exit_status]` for it (verified against erts-17.1).
+///
+/// The `{fd, N}` **name form** is a driver port, and a different driver from `spawn_driver`: it is
+/// the emulator's own `fd_driver` (`erts/emulator/sys/unix/sys_drivers.c:257`, registered at
+/// `io.c:86`), so the same test refuses `[exit_status]` for it — measured on erts-17.1,
+/// `open_port({fd,1},[exit_status])` raises `error:badarg`. It is refused here for the same reason
+/// the driver names are: no Erlang-reachable driver can report a status (see the `open_port` site).
+/// `{spawn_executable, Path}` skips the lookup entirely in the C
+/// (`spawn_type != ERTS_SPAWN_EXECUTABLE`), so it is never a driver port.
+fn opens_a_driver_port(spec: &NameSpec) -> bool {
+    match spec.kind {
+        PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
+        PortName::Spawn => {
+            let name = driver_path_name(&spec.command);
+            driver::is_static_driver(name) || driver::driver_is_loaded(name)
+        }
+        PortName::SpawnExecutable => false,
+        PortName::Fd => true,
+    }
+}
+
+/// The `error:notsup` raise a `[force]` command answers on a driver whose entry does not
+/// advertise `ERL_DRV_FLAG_SOFT_BUSY`
+/// (`erts/emulator/beam/erl_bif_port.c:195-198`).
+///
+/// [`PortRegistry::decide_before_data`] needs it because it answers that arm **before** the command
+/// reaches [`beam_io`], whose [`beam_io::Port::command`] raises the identical reason for the same
+/// rule; both spell the bare atom the oracle raises, never a message the harness could not compare.
+fn notsup() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("notsup")))
+}/// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
 /// and the driver name the loaded entry must declare.
 ///
 /// The C looks the name's prefix up to the first space up in its **loaded-driver list**
@@ -4167,6 +4516,18 @@ mod tests;
 /// oracle-expression builder do not grow the provider's unit suite.
 #[cfg(test)]
 mod ram_file_matrix_tests;
+/// The `[exit_status]` **name-form matrix** against the live oracle: which `open_port/2` `Name`
+/// forms accept the option and which are `badarg`, plus the "a refusal consumes no port number"
+/// property (see `src/port/exit_status_matrix_tests.rs`). A separate file so the matrix does not
+/// grow this one.
+#[cfg(test)]
+mod exit_status_matrix_tests;
+/// The `erlang:port_command/2,3` **row matrix** against the live oracle: the idle-port rows both
+/// runtimes can reach, and the busy-port arms this runtime can only reach through its own
+/// controllable driver fixture (see `src/port/command_matrix_tests.rs`). A separate file so the
+/// matrix does not grow this one.
+#[cfg(test)]
+mod command_matrix_tests;
 /// The A.4 **driver-monitor marking** suite: the runtime's pass-boundary sweep over every live
 /// port's C-driver monitor tree (see `src/port/monitor_tests.rs`). A separate file so the suite
 /// does not grow this one.

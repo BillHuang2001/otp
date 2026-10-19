@@ -147,12 +147,20 @@ impl PortRegistry {
         // the same reason, and the same instant.
         self.remember_failed_read(id);
         // The signals are read **before** the metadata goes: the link set and the incoming
-        // monitors are the only sources of the recipients.
+        // monitors are the only sources of the recipients. The monitors come from
+        // [`PortRegistry::failed_port_monitors`] rather than the port table directly: the round
+        // that reaped this port also minted its close report, and minting retires the number —
+        // dropping its monitor set with it (`PortTable::release`). The snapshot the round took
+        // beforehand is then the last truthful statement of who was watching.
+        let monitors = self.failed_port_monitors(id);
         let signals = self.port_exit_signals(
             id,
             signal_reason(&failure.reason),
             failure.signals_owner,
+            monitors,
         );
+        // The snapshot belonged to this failure; the number is gone, so nothing else can.
+        self.pre_round_monitors.remove(&id.number());
         self.meta.remove(&id.number());
         // A failed port is `undefined` for `whereis/1`, `badarg` for `port_get_data/1`, and a
         // recycled number starts clean (see `ops::PortExtras`).

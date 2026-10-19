@@ -53,16 +53,69 @@
 //! [`PortRegistry::port_control`](super::PortRegistry) once the driver has answered, so a rejected
 //! `setopts` can never be inherited: only a reply tagged `INET_REP_OK` is recorded.
 //!
-//! # Which records are replayed
+//! # Which records are replayed, element by element
 //!
 //! Replay is **not** "everything the listener was told": it is exactly the set the C's
-//! `tcp_inet_copy` copies into the accepted descriptor (`inet_drv.c:11810-11827`), mapped onto the
-//! option codes that set them — the packet type, the packet size, the header size, the mode, the
-//! `deliver` flag, `exit_on_close`, the buffer size, the two TCP watermarks, the send-timeout pair,
-//! the busy-message-queue pair and the three `tcp_add_flags` bits (`show_econnreset`,
-//! `read_ahead`, `linger_zero`). [`is_inherited_record`] is that table.
+//! `tcp_inet_copy` copies into the accepted descriptor (`inet_drv.c:11810-11846`), mapped onto the
+//! option codes that write those fields. [`is_inherited_record`] is that table. The full audit —
+//! every element of the C's copy list, the code that carries it, and how this replay reproduces it
+//! — is:
 //!
-//! Two families are deliberately **not** replayed, each for a reason the C itself gives:
+//! | the C's copy (`tcp_inet_copy`) | code replayed | how the replay reproduces it |
+//! |---|---|---|
+//! | `inet.mode` (`:11811`) | 24 | the record assigns the field |
+//! | `inet.exitf` (`:11812`) | 26 | assigns |
+//! | `inet.deliver` (`:11813`) | 25 | assigns |
+//! | `inet.htype` (`:11815`) | 23 | assigns |
+//! | `inet.psize` (`:11816`) | 32 | assigns |
+//! | `inet.stype`/`inet.sfamily` (`:11817-11818`) | — (cached tags, no option code) | see below |
+//! | `inet.hsz` (`:11819`) | 21 | assigns |
+//! | `inet.bufsz` (`:11820`) | 20 **and** 7 | two writers — see below |
+//! | `desc->high`/`desc->low` (`:11821-11822`) | 27/28 | assigns, cross-clamping in the C's own order |
+//! | `desc->send_timeout` (`:11823`) | 30 | assigns (stream-gated, and an accepted TCP socket is a stream) |
+//! | `desc->send_timeout_close` (`:11824`) | 35 | assigns |
+//! | `tcp_add_flags & SHOW_ECONNRESET` (`:11825-11827`) | 39 | assigns |
+//! | `tcp_add_flags & NO_READ_AHEAD` (`:11827`) | 49 | assigns (the negated `{read_ahead, …}`) |
+//! | `tcp_add_flags & LINGER_ZERO` (`:11825-11827`) | — | see below |
+//! | the parent's busy-msgq limits (`:11842-11846`) | 36/37 | assigns, cross-clamping in the store's own order |
+//!
+//! Three elements are **not** reproduced by a record, each for a reason that is a seam fact rather
+//! than a choice, and each with its evidence:
+//!
+//! * **`inet.stype`/`inet.sfamily`** are cached descriptor tags with no option code, so the accepted
+//!   port's are whatever
+//!   [`TcpInetDriver::from_socket`](beam_io::drivers::inet::TcpInetDriver) probed: its `stype` from
+//!   a `getsockopt(SO_TYPE)`, its `family` from a constant `AF_INET`
+//!   (`erts_rust/crates/beam_io/src/drivers/inet/mod.rs:840-841`). They **agree with the listener**
+//!   for every socket this floor serves, because `beam_io`'s `INET_REQ_GETTYPE` reply refuses
+//!   anything but `AF_INET` (`beam_io/src/drivers/inet/wire.rs:381-392`) and a `SOCK_STREAM` probe is
+//!   the listener's own `INET_TYPE_STREAM` — so an accepted port's tags are the listener's, which the
+//!   accept suite pins on both ports' `gettype` verb. The C also copies them
+//!   (`:11817-11818`), so this is agreement by construction rather than by copy.
+//! * **`inet.bufsz` has two writers.** `{buffer, N}` (`:7318-7330`) assigns it *and* sets
+//!   `INET_FLG_BUFFER_SET`, while `{recbuf, N}` (`:7350-7360`) raises it only while that flag is
+//!   clear. Because the mirror holds the listener's **arguments** and not the driver's derived state,
+//!   replaying code 20 alone would lose every `{recbuf, …}`-raised value — a listener opened with
+//!   `{recbuf, 65536}` and no `{buffer, …}` has `bufsz = 65536`, which `tcp_inet_copy` copies into the
+//!   accepted socket. So code **7** is replayed too, in the listener's own arrival order relative to
+//!   code 20, which reproduces the field exactly: the same write sequence from the same defaults
+//!   (`SocketOptions::default()`) reaches the same state, including the flag, because the flag's only
+//!   writer is the very `{buffer, N}` record the listener sent. Re-applying `SO_RCVBUF` is inert —
+//!   `accept(2)` already gave the new descriptor the listener's kernel buffer, so setting the same
+//!   value again is idempotent. **Residual:** the accepted store ends with
+//!   `INET_FLG_BUFFER_SET` set iff the listener's did, where the C's `tcp_inet_copy` never copies the
+//!   flag (`:11810-11831` omits `desc->flags`, and `inet_start` zeroed it, `:10967`) — so an accepted
+//!   socket inherits the flag from a listener that set `{buffer, …}`, and a later `{recbuf, N}` on it
+//!   will not raise `bufsz` where the oracle's still would. The wire has no "assign `bufsz` without
+//!   the flag" record, so closing this needs a `beam_io` seam (see the node report), not a replay.
+//! * **`TCP_ADDF_LINGER_ZERO`** is a driver flag, not a socket option: the C's `{linger, {true, 0}}`
+//!   arm sets it beside the kernel `SO_LINGER` so that a close sends `RST`. `beam_io` models the
+//!   kernel option only (`opt_sys.rs`'s `INET_OPT_LINGER` → `struct linger`) and has **no** flag
+//!   field, so neither this runtime's listener nor its accepted port carries one — the inheritance
+//!   is vacuous here rather than lost, and the accepted socket's observable `{linger, …}` agrees
+//!   because `accept(2)` inherits `SO_LINGER` and `prim_inet:accept_opts/3` re-applies it besides.
+//!
+//! Two further families are deliberately **not** replayed, each for a reason the C itself gives:
 //!
 //! * **`{active, …}`** — `tcp_inet_copy` does not copy `active`/`active_count` at all, and the
 //!   Erlang side re-applies it: `prim_inet:accept_opts/3`
@@ -73,9 +126,10 @@
 //!   accepted socket at 6 instead of the oracle's 3. So for `active` the Erlang `setopts` is
 //!   authoritative and the mirror only *records* it.
 //! * the **kernel-backed** options (`nodelay`, `keepalive`, `linger`, `reuseaddr`, `priority`,
-//!   `recvbuf`/`sendbuf`, …) — the C does not copy them to the new descriptor either. They do
-//!   not need replaying: `accept(2)` gives the new descriptor the listener's own `SO_*` state,
-//!   and `prim_inet:accept_opts/3` re-applies six of them besides.
+//!   `sendbuf`, …) — the C does not copy them to the new descriptor either. They do not need
+//!   replaying: `accept(2)` gives the new descriptor the listener's own `SO_*` state, and
+//!   `prim_inet:accept_opts/3` re-applies six of them besides. (`recbuf` is the one kernel-backed
+//!   code that *is* replayed, for the `bufsz` reason above — and only for that reason.)
 //!
 //! `{line_delim, …}` is not replayed for the same reason the C does not copy `desc->delimiter`:
 //! the accepted socket starts with the default delimiter.
@@ -135,6 +189,15 @@ const ACTIVE_COUNTER: usize = 2;
 // it, so the codes this module needs are restated here with the C they come from. They are
 // **hand-maintained wire constants** (`inet_drv.c:874-930`), not derived values.
 
+/// `INET_OPT_RCVBUF` (7) — `{recbuf, N}`, the kernel receive buffer (`inet_drv.c:881`).
+///
+/// Replayed **only** because the C's copied field `inet.bufsz` has two writers
+/// (`inet_drv.c:7318-7360`): `{buffer, N}` assigns it ([`INET_LOPT_BUFFER`]), and `{recbuf, N}` raises
+/// it while `INET_FLG_BUFFER_SET` is still clear (`if (ival > desc->inet.bufsz) desc->inet.bufsz =
+/// ival;`). [`SocketOptions::inherited_from`] copies the field's **value**
+/// (`erts_rust/crates/beam_io/src/drivers/inet/opt.rs:508`), which a replay of arguments can only
+/// reproduce by re-applying both writers in the listener's own order — see the module docs.
+const INET_OPT_RCVBUF: u8 = 7;
 /// `INET_LOPT_BUFFER` (20) — the driver's own staging buffer (`inet_drv.c:882`).
 const INET_LOPT_BUFFER: u8 = 20;
 /// `INET_LOPT_HEADER` (21) — the packet header size (`inet_drv.c:886`).
@@ -247,6 +310,55 @@ impl PortInetOptions {
     /// The recorded `setopts` records, in arrival order (the replay source).
     pub(crate) fn records(&self) -> &[Vec<u8>] {
         &self.records
+    }
+
+    /// The driver's current `{active, …}` mode value, if a record has been seen.
+    ///
+    /// [`INET_LOPT_ACTIVE`]'s operand **is** the C's `desc->inet.active`
+    /// (`inet_set_opts`'s arm, `erts/emulator/drivers/common/inet_drv.c:6968-7016`), whose
+    /// vocabulary is `INET_PASSIVE` 0 / `INET_ACTIVE` 1 / `INET_ONCE` 2 / `INET_MULTI` 3
+    /// (`inet_drv.c:786-789`). Recorded, never replayed (see the module docs): the Erlang side is
+    /// authoritative for `active`, so the mirror only observes it.
+    ///
+    /// `None` means **no `{active, …}` record has ever been accepted** — the port's driver is
+    /// still at the C's `inet_start` default, `INET_PASSIVE` (`inet_drv.c:10932`). The last record
+    /// wins, exactly as the driver's own field does.
+    ///
+    /// One caveat the caller must carry: a **spent** grant is invisible here. The C clears
+    /// `desc->active` back to `INET_PASSIVE` after an `{active, once}` delivery
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE`) or when an `{active, N}` counter reaches zero — a
+    /// transition that is the *driver's* state, which this mirror records only when a **new**
+    /// `setopts` arrives.
+    pub(crate) fn active_mode(&self) -> Option<i32> {
+        self.last_value(INET_LOPT_ACTIVE)
+    }
+
+    /// The driver's current `{exit_on_close, …}` flag, if a record has been seen — the C's
+    /// `desc->inet.exitf` ([`INET_LOPT_EXITONCLOSE`], `inet_drv.c:904`).
+    ///
+    /// `None` means no such record was accepted, i.e. the driver's own default, `true`
+    /// (`exitf = 1`, `inet_drv.c:10929`). Both `{exit_on_close, true}` and the `0`/`1` operand the
+    /// wire carries are covered: the record's value word is the flag itself.
+    pub(crate) fn exit_on_close(&self) -> Option<bool> {
+        self.last_value(INET_LOPT_EXITONCLOSE).map(|value| value != 0)
+    }
+
+    /// The value word of the **last** recorded record carrying `code`, if any.
+    ///
+    /// Every record this mirror stores is a whole `[opt, val_be32, …]` span ([`walk`]), so a
+    /// record's value word is always its bytes `1..RECORD` whatever its total length.
+    fn last_value(&self, code: u8) -> Option<i32> {
+        let mut value = None;
+        for record in &self.records {
+            if record.first() != Some(&code) {
+                continue;
+            }
+            let Some(word) = record.get(1..RECORD) else {
+                continue;
+            };
+            value = Some(i32::from_be_bytes([word[0], word[1], word[2], word[3]]));
+        }
+        value
     }
 }
 
@@ -416,7 +528,6 @@ pub(crate) fn setopts_succeeded(reply: &[u8]) -> bool {
 ///
 /// | code | option | the C field it is |
 /// |---|---|---|
-/// | 20 | `{buffer, N}` | `bufsz` (`:11820`) |
 /// | 21 | `{header, N}` | `hsz` (`:11819`) |
 /// | 23 | `{packet, N}` | `htype` (`:11815`) |
 /// | 24 | `{mode, …}` | `mode` (`:11811`) |
@@ -430,6 +541,10 @@ pub(crate) fn setopts_succeeded(reply: &[u8]) -> bool {
 /// | 39 | `{show_econnreset, …}` | `TCP_ADDF_SHOW_ECONNRESET` (`:11825`) |
 /// | 49 | `{read_ahead, …}` | `TCP_ADDF_NO_READ_AHEAD` (`:11827`) |
 ///
+/// …plus the two codes that write the copied `bufsz` (`:11820`): [`INET_LOPT_BUFFER`] (20), which
+/// assigns it, and [`INET_OPT_RCVBUF`] (7), which raises it while the flag is clear. Both are needed
+/// because the mirror holds the listener's *arguments*, not its derived state — see the module docs.
+///
 /// Everything else is **not** inherited, and the module docs say why for each family.
 pub(crate) fn is_inherited_record(record: &[u8]) -> bool {
     let Some(&code) = record.first() else {
@@ -437,7 +552,8 @@ pub(crate) fn is_inherited_record(record: &[u8]) -> bool {
     };
     matches!(
         code,
-        INET_LOPT_BUFFER
+        INET_OPT_RCVBUF
+            | INET_LOPT_BUFFER
             | INET_LOPT_HEADER
             | INET_LOPT_PACKET
             | INET_LOPT_MODE

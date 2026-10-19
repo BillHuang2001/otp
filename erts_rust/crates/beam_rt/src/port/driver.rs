@@ -574,7 +574,51 @@ impl BusyFlag {
     }
 }
 
-/// The port's **driver-failure latch** — where a driver that closes its own port records the
+/// The **OS child pid** of one driver port — the C's `prt->os_pid` (`erts/emulator/beam/erl_port.h`),
+/// as a driver records it with `erl_drv_set_os_pid` (`io.c:2971`) and `port_info(Port, os_pid)` reads
+/// it back (`erl_bif_info.c:3814-3817`).
+///
+/// The C starts it at `-1` (`io.c:386`) and the BIF renders `undefined` for a negative value, so
+/// **unset is modelled explicitly** ([`Option`]) rather than overloading `0`: a driver that really
+/// recorded pid `0` (not a legal pid, but a value the C would render as `0`) must be
+/// distinguishable from a port whose driver never called the hook.
+///
+/// Shared by [`Rc`] between the [`DriverPort`] host (which [`DriverHost::set_os_pid`] writes, from
+/// inside a driver callback) and the runtime's port metadata, which answers
+/// `port_info(Port, os_pid)` from it. Seized with [`DriverPort::os_pid_flag`] **before** the host is
+/// boxed into the port lifecycle (the boxed driver exposes no host), exactly like [`BusyFlag`] — and
+/// for the same reason it must be a handle rather than a value: the driver records the pid from
+/// inside its `start` callback, which runs *after* the port is registered, so the reader has to see
+/// later writes.
+///
+/// Unlike the driver-private state [`DriverPort::clear_driver_state`] drops at teardown, this stays
+/// readable for the port's whole life: the C's `prt->os_pid` is a field of the port struct, not of
+/// the driver's private state, and `port_info(Port, os_pid)` keeps answering after the driver stops
+/// writing.
+#[derive(Clone, Debug, Default)]
+pub struct OsPidFlag {
+    /// The recorded pid, or `None` while no driver has recorded one (the C's `-1`).
+    pid: Rc<Cell<Option<c_int>>>,
+}
+
+impl OsPidFlag {
+    /// A fresh, **unset** flag — the state of a port whose driver has not called
+    /// `erl_drv_set_os_pid` (the C's `os_pid == -1`, rendered `undefined`).
+    pub fn new() -> OsPidFlag {
+        OsPidFlag::default()
+    }
+
+    /// The recorded OS pid, or `None` while unset — what `port_info(Port, os_pid)` reports as
+    /// `undefined`.
+    pub fn get(&self) -> Option<c_int> {
+        self.pid.get()
+    }
+
+    /// Records `pid` — the write half of `erl_drv_set_os_pid`.
+    pub fn set(&self, pid: c_int) {
+        self.pid.set(Some(pid));
+    }
+}/// The port's **driver-failure latch** — where a driver that closes its own port records the
 /// request, and where the port lifecycle drains it into `beam_io`'s failure channel.
 ///
 /// The C's `driver_failure*` family and `driver_exit` (`io.c:7196-7278`) are **port-closing
@@ -854,6 +898,15 @@ pub struct DriverPort {
     /// [`DriverPortAdapter::load`] and drains it after every callback
     /// ([`DriverPortAdapter::settle`]) — the host itself cannot close a port (see [`FailureLatch`]).
     failures: FailureLatch,
+    /// The port's **OS child pid**, as its driver records it with `erl_drv_set_os_pid` — the C's
+    /// `prt->os_pid` (see [`OsPidFlag`]).
+    ///
+    /// Shared with the runtime's `PortMeta`, which answers `port_info(Port, os_pid)` from it (and
+    /// `undefined` while unset). Seized with [`DriverPort::os_pid_flag`] before the host is boxed
+    /// into the port lifecycle, exactly like [`DriverPort::busy_flag`] — and, unlike the
+    /// driver-private queue, **never cleared** by [`DriverPort::clear_driver_state`]: the pid is a
+    /// field of the port, not of the driver's private state, so `port_info` must keep answering.
+    os_pid: OsPidFlag,
 }
 
 impl DriverPort {
@@ -888,6 +941,9 @@ impl DriverPort {
             // No driver has closed this port: the latch is what `driver_failure*`/`driver_exit`
             // fill and what the port lifecycle drains after each callback (`FailureLatch`).
             failures: FailureLatch::new(),
+            // No driver has recorded an OS pid yet, so `port_info(Port, os_pid)` is `undefined` —
+            // the C's `prt->os_pid = -1` at port construction (`io.c:386`).
+            os_pid: OsPidFlag::new(),
         }
     }
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
@@ -1004,6 +1060,17 @@ impl DriverPort {
     /// callback; the runtime reads it back to answer `erlang:port_command/2,3`.
     pub fn busy_flag(&self) -> BusyFlag {
         self.busy.clone()
+    }
+    /// The port's **OS child pid** handle, shared with the runtime — the C's `prt->os_pid` behind
+    /// `erl_drv_set_os_pid` and `port_info(Port, os_pid)` (see [`OsPidFlag`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver exposes no host), exactly
+    /// like [`DriverPort::busy_flag`]. The driver records the pid from inside a callback — its
+    /// `start`, typically, which runs *after* the port is registered — so the reader holds the
+    /// handle rather than a value read once at `open_port/2`. An unset flag is the C's `-1` and
+    /// renders as `undefined`; it is never cleared by [`DriverPort::clear_driver_state`].
+    pub fn os_pid_flag(&self) -> OsPidFlag {
+        self.os_pid.clone()
     }
     /// The port's **driver-failure latch**, shared with the port lifecycle — the handle
     /// `driver_failure*`/`driver_exit` record their request on and the port drains into
@@ -1507,6 +1574,33 @@ impl DriverHost for DriverPort {
         0
     }
 
+    /// Records the port's **OS child pid** (`erl_drv_set_os_pid` — the C's
+    /// `port->os_pid = (SWord)pid`, `io.c:2971`), the value `port_info(Port, os_pid)` reports
+    /// (`erl_bif_info.c:3814-3817`).
+    ///
+    /// The C's answer is `void` and its only early return is the invalid-port one
+    /// (`io.c:2972-2974`), which here is a host no port lifecycle has claimed
+    /// ([`DriverPortAdapter::load`] is what claims one) — that host keeps the seam's `-1`, and a
+    /// claimed one answers `0`. Nothing else can fail: the handle is a shared [`Cell`], so the
+    /// write is total (a pid the runtime cannot render is `port_info`'s problem, not the
+    /// recorder's — the C stores the whole `ErlDrvSInt` the same way).
+    ///
+    /// The write lands on the [`OsPidFlag`] the runtime seized with [`DriverPort::os_pid_flag`],
+    /// which is why a pid recorded from inside `start` — after `open_port/2` already registered the
+    /// port — is still visible to a later `port_info`. It is deliberately **not** part of
+    /// [`DriverPort::clear_driver_state`]: the C's `prt->os_pid` outlives the driver's private
+    /// state, so a `port_info` after the driver stopped writing still answers.
+    fn set_os_pid(&mut self, pid: c_int) -> c_int {
+        match self.control.try_borrow() {
+            Ok(control) if control.attached => {}
+            // A host nobody claimed (and one whose latch is busy, which no callback can be) is the
+            // C's invalid-port case: refuse rather than record a pid no port could report.
+            _ => return -1,
+        }
+        self.os_pid.set(pid);
+        0
+    }
+
     /// Records the driver's request to close its own port — the single hook behind the C's whole
     /// `driver_failure*` family (`io.c:7196-7229`).
     ///
@@ -1984,8 +2078,12 @@ pub(crate) fn load_driver_at(
 ///   [`DriverPortAdapter::control`]; its only gap is a reply the driver answers from memory of its
 ///   own rather than from the buffer it was handed (a typed *unsupported*, see the module docs).
 /// * A queued term is delivered without a sending-port identity (the C stamps `from = prt`).
-/// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
-///   `{Port, {exit_status, …}}` message is ever synthesized for it.
+/// * `take_exit_status` is always `Ok(None)`, and that is the C's own scope rather than a gap of
+///   this adapter: `beam_io` has no exit-status source for a driver port (no child is reaped for
+///   one), and the C's only `{exit_status, N}` reporter is the emulator-internal
+///   `driver_report_exit` — declared in `erts/emulator/beam/global.h`, **not** in `erl_driver.h` —
+///   so no C driver can call it; the `exit_status` open option is itself refused for any non-`spawn`
+///   driver (`erl_bif_port.c:1100`).
 pub struct DriverPortAdapter {
     /// The loaded library **and** the host its callbacks run against (one `Box`, so the host never
     /// moves while an `ErlDrvPort` derived from its environment is in use).
@@ -2037,6 +2135,16 @@ pub struct DriverPortAdapter {
     /// a `DriverContext` it cannot name: the request has to outlive the callback and be handed up by
     /// the port lifecycle, which is the only party that can close a port.
     failures: FailureLatch,
+    /// The port's **busy state**, seized from the host at [`DriverPortAdapter::load`] (see
+    /// [`BusyFlag`]).
+    ///
+    /// Held for the whole port life because [`beam_io::Driver::is_busy`] — the accessor
+    /// `beam_io::Port::command`'s `ERTS_PORT_OP_BUSY` arm reads — and
+    /// [`beam_io::Driver::flags`] (the `ERL_DRV_FLAG_SOFT_BUSY` half `[force]` is decided on) must
+    /// answer **through the seam**, from the very handle the host's `set_busy_port` hook writes and
+    /// `load` stamps the entry's flag word onto. The driver has no other route to report the state:
+    /// the port layer consults the driver, never the runtime's metadata.
+    busy: BusyFlag,
 }
 
 /// One descriptor a driver selected, with the directions it armed.
@@ -2096,6 +2204,14 @@ impl DriverPortAdapter {
         // host (see [`DriverMonitors`]). The handle is shared by `Rc`, so taking it before or after
         // the host moves into the `Box` is the same tree.
         let monitors = host.monitors();
+        // The two per-port attribute handles the **seam** has to answer through (the boxed driver
+        // exposes no host): the busy state `set_busy_port` writes, whose other half `load` stamps
+        // just below from the entry's `ERL_DRV_FLAG_SOFT_BUSY`, and the OS pid `erl_drv_set_os_pid`
+        // records. Both are shared by `Rc`, so taking them here and writing through the host later
+        // is the same state (see [`BusyFlag`], [`OsPidFlag`]). The OS pid handle is **not** kept on
+        // this adapter: the runtime seizes its own clone with [`DriverPort::os_pid_flag`] before
+        // this call and answers `port_info(Port, os_pid)` from that same shared cell.
+        let busy = host.busy_flag();
         {
             let mut state = control.borrow_mut();
             state.attached = true;
@@ -2115,6 +2231,7 @@ impl DriverPortAdapter {
             control,
             terms,
             monitors,
+            busy,
             selected: Vec::new(),
         })
     }
@@ -2536,6 +2653,40 @@ impl beam_io::Driver for DriverPortAdapter {
         self.driver
             .as_ref()
             .is_some_and(|driver| driver.library().entry().control.is_some())
+    }
+
+    /// The loaded `ErlDrvEntry`'s capability flags, in `beam_io`'s vocabulary: its
+    /// `ERL_DRV_FLAG_SOFT_BUSY` bit (`beam_abi::driver::types`, `erl_driver.h`) ⇒
+    /// [`beam_io::DriverFlags::SOFT_BUSY`].
+    ///
+    /// The value is the one [`DriverPortAdapter::load`] stamped onto the host's shared
+    /// [`BusyFlag`] from `library.entry().driver_flags`, read back here through the handle seized
+    /// at that same load — never re-read from the library, and the **same bit** the C tests when it
+    /// decides `[force]` (`erl_bif_port.c:195-198`). Reporting it through the seam is what lets
+    /// `beam_io::Port::command` answer the C's `notsup` itself instead of every caller re-deriving
+    /// the entry's flag word; it mirrors `beam_io`'s own C-ABI adapter (`abi/port.rs`'s `flags`).
+    ///
+    /// A port whose driver was torn down keeps the last stamped value (the handle outlives the
+    /// library), so a closed port never gains a flag its driver did not declare.
+    fn flags(&self) -> beam_io::DriverFlags {
+        let flags = beam_io::DriverFlags::empty();
+        if self.busy.soft_busy() {
+            flags.union(beam_io::DriverFlags::SOFT_BUSY)
+        } else {
+            flags
+        }
+    }
+
+    /// The port's **busy state** as the driver last set it through `set_busy_port` — the C's
+    /// `ERTS_PTS_FLG_BUSY_PORT` (`io.c:5208-5264`).
+    ///
+    /// Forwarded from the very [`BusyFlag`] the host's [`DriverHost::set_busy_port`] hook writes, so
+    /// `beam_io::Port::is_busy` (and therefore `PortRegistry::is_busy` and
+    /// `Port::command`'s `ERTS_PORT_OP_BUSY` arm, `io.c:1763-1769`) sees a `dlopen`ed C driver's
+    /// state instead of the trait default `false`. `false` before the driver ever marks the port and
+    /// after it clears it.
+    fn is_busy(&self) -> bool {
+        self.busy.is_busy()
     }
 
     /// Runs the driver's `start` callback with this port's handle.
@@ -3001,6 +3152,15 @@ mod ddll_tests;
 /// separate file so the C fixture it compiles does not grow this one.
 #[cfg(test)]
 mod port_term_tests;
+
+/// The A.4 **port-attribute suite** for the two [`beam_abi::DriverHost`] hooks that record state a
+/// `port_info`/`port_command` question is answered from — `erl_drv_set_os_pid` (⇒
+/// `port_info(Port, os_pid)`) and `set_busy_port` (⇒ `beam_io::Driver::is_busy` and the
+/// `ERL_DRV_FLAG_SOFT_BUSY` half [`beam_io::Driver::flags`] reports) — plus the two
+/// [`beam_io::Driver`] overrides that carry them to `beam_io`'s command decision table. A separate
+/// file so the C fixture it compiles does not grow this one.
+#[cfg(test)]
+mod port_attributes_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

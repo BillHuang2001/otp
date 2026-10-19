@@ -63,6 +63,99 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   what happens on a host with an `erl` on `$PATH` — the resolved default is the system install's
   script (see above).
 
+## The `-eval` route's term storage and machine ownership (cross-cutting seam)
+Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eval` (spread across
+`runtime.rs`, `context/{pool,pump,calls}.rs` and `eval/mod.rs`, so recorded here).
+
+- **No `Machine` spans a `-eval` expression.** `Runtime::eval` (`runtime.rs:2981`) builds one
+  `RuntimeContext::new(&mut *runtime)` and hands it to `crate::eval::eval` (`eval/mod.rs:349`), whose
+  `Evaluator` holds only `ctx: &'a mut RuntimeContext<'b>` (`eval/mod.rs:460-463`) — the tree-walker
+  builds terms through `beam_engine::terms`/`beam_bifs`, never through an engine. The only
+  `Machine`s on this route are the **per-nested-call, short-lived** ones in
+  `context/pump.rs:270` (`run_export_blocking`) and `:340` (`run_label_blocking`), dropped at scope
+  exit after `Runtime::adopt_escaped_binaries(machine.refc_binaries())` (`pump.rs:282-283`,
+  `:349-350` → `runtime.rs:1618`). So there is no long-lived `Machine::refc_binaries` reservoir to
+  prune: the reservoir-equivalents are `Runtime` fields.
+- **`RuntimeContext::new` sets `mailbox_table: None`** (`context/runtime_context.rs:176-191`), so on
+  this route `ExecutionContext::alloc_words`/`alloc_words_rooted` (`context/execution.rs:498,509`)
+  bypass the process heap entirely and go to `Runtime::alloc_words` → `Runtime::arena`
+  (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
+  ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
+  arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
+- **Four storage regions, none ever freed.** `arena` (`:240`); the pooled BIF heap `bif_heaps:
+  Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap` `:1398,1406`, grown by
+  **region retirement** in `context/calls.rs:158 take_bif_frontier`); `eval_heap: Heap` (`:271`) plus
+  `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap` `:1511`); and `eval_off_heap:
+  beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
+- **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
+  byte-aligned binary ≤64 bytes to `terms::make_heap_binary` (arena) and everything else —
+  non-byte-aligned, or past `ERL_ONHEAP_BINARY_LIMIT` — to `beam_codec::term::make_bitstring` on
+  `eval_heap`. `binary:copy/2` likewise builds **on-heap** on the pooled BIF heap
+  (`beam_bifs/src/binary.rs:679-697`, refusing `system_limit` past the region's `available()*8`), and
+  the container result is then re-homed onto `eval_heap` (`context/pool.rs:105
+  move_result_into_runtime_store` ← `calls.rs:1175 rehome_container_result`, chosen because
+  `mailbox_table.is_none()`).
+- **Off-heap refc payloads on this route come only from a nested `Machine`** (`bs_init_writable`/
+  `bs_create_bin` → `beam_engine/src/machine/mod.rs:791/834 refc_binaries`), and their handles are
+  adopted into `eval_off_heap` before the machine drops. `beam_bifs` never builds one (no
+  `OffHeapBinaries` host is installed anywhere in production — the handoff is still open per
+  `beam_codec/CONTEXT.md`), and `stabilize_term` (`runtime.rs:1456`, the `-eval` single-pass form)
+  **flattens** an unresolvable payload on-heap.
+- **The runner's park prune cannot be reused here.**
+  `context/gc/bin_vheap.rs:352 reclaim` needs `&mut ProcessTable` + a `Process` (for
+  `collector().scanned_bounds()`) + `&mut Machine`; and its gate 6
+  (`context/gc_walk.rs:381 reaches_an_unscanned_word`) uses `Criterion::PayloadPrune`
+  (`gc_walk.rs:791-798`), which answers `hit = true` on the **first pointer-bearing word in
+  `WordRegion::Foreign`** — and every eval-route root (arena / `eval_heap` / retired regions) is
+  `Foreign` by construction (`context/gc.rs:370 word_region`, `WordRegion` at `:259`). So a prune
+  against the walker's roots always declines, and
+  `beam_gc::for_each_reachable_binary_payload` (`beam_gc/src/offheap.rs:107`, whose walk only enters
+  a from-space word) can never see them either.
+- **The only region-agnostic walker in this crate** is `RuntimeContext::graph_holds_reference`
+  (`context/calls.rs:1049`) — a `#![allow(unsafe_code)]` `Walklist` walk over
+  `beam_term::layout::for_each_child_slot` (`beam_term/src/layout.rs:303`) with the
+  `dereferenceable_pointer`/`is_term_word`/`is_literal` guards, no visited set and a
+  `WALK_VISIT_BUDGET`. It answers "does this graph hold a reference", not "which payloads does it
+  name", but it is the template for one that could.
+- **The walker's live-term holders** (a prune would have to be handed all of them): the `Env =
+  HashMap<String, Eterm>` (`eval/mod.rs:175`) threaded through every `expr` call (`:469`, sequence at
+  `:518-524 exprs`); `Evaluator::terms`' partially-built `Vec<Eterm>` and `list`'s `acc`
+  (`:527-552`) — i.e. **recursion frames**, so a mid-expression hook is unsound; `Flow::Raise { reason,
+  head }` (`:147-166`); the escaped closures' `Runtime::eval_closures: Vec<Rc<FunBody>>` with its own
+  `Env` (`:182-187`, pushed by `register_fun` `:1624`); and whatever `eval_off_heap`/`eval_heap`
+  themselves hold. `Runtime::as_action_process` (`runtime.rs:3059`) runs the body as a freshly spawned
+  child and `stabilize_term_with`s only the **final** result (step 5).
+- **`eval_off_heap` is NOT pid-less in practice: a scheduled `run`-route process grows it too.**
+  `RuntimeContext::run_export` (the `ExecutionContext::call_bif` external-module route) is
+  **blocking-aware for every caller**, so a `run`-route process calling e.g. `base64:encode/1` (an
+  external-module entry into `base64.beam`, whose `bs_create_bin` accumulator passes
+  `ERL_ONHEAP_BINARY_LIMIT` = 64 bytes) goes through `run_export_blocking`/`run_label_blocking` and
+  their `runtime.adopt_escaped_binaries(machine.refc_binaries())` — see
+  `adopt_escaped_binaries`'s own doc list of nested runs (`runtime.rs:1599-1613`). `pump_once` is the
+  *same* path (it is the `step` closure both pass). `runtime/CONTEXT.md`'s "not attributed to any
+  process" is about `process_info(P, binary)` attribution, **not** about who grows the table.
+- **`beam_message::OffHeapTable` traps for anyone pruning it.** There is **no per-entry removal** —
+  only `drain_binaries()` (all), so a prune is drain → filter → re-`push_binary`. `push_binary` never
+  dedups (two pushes of one payload = two entries) and `binary_by_data_ptr` resolves only the
+  **first** match; the `data_ptr` dedup lives in `adopt_escaped_binaries` (`runtime.rs:1618-1629`).
+  `len`/`is_empty`/`iter`/`overhead_bytes` are **MSO-only** — after `push_binary`, `is_empty()` is
+  still `true` — so a binary-side gate must read `binaries()`. A `GrowOutcome::Moved` realloc
+  invalidates every previously handed-out `data_ptr`; re-read it from the live handles.
+- **The raw-`Eterm` holders a prune must publish are already inventoried** (written for a *moving*
+  heap, but the same roster is the prune's must-publish list — relocation-rooting asks for pointer
+  updates, prune-rooting for read-reachability, so the requirement differs but the set does not):
+  `context/IMPLEMENTATION.md` §*What a MOVING engine heap would invalidate — the at-risk roster*
+  (`Runtime::persistent_terms`, `trace`'s `MatchSpec::Functions`, `seq_trace`'s `Token{label,from}`,
+  `eval_closures`' `FunBody.env`, `timers`' `TimerAction::Deliver`) and its *Safe* list
+  (`RunnerState.exits`/`results`, `references`/`Timers.refs` keys, ETS's own arena,
+  `RuntimeContext`, `dist`/`port`, `PortMeta`). Two refinements found by inspecting the writers:
+  `persistent_term:put/2`'s key+value and `TimerAction::Deliver.message` **are** stabilized
+  (`context/calls.rs:713-722`; `context/runtime_hooks.rs:1343` and `native.rs:807`) and
+  `trace_pattern` stabilizes its match-spec functions (`native/erts_internal/trace.rs:165-174`), so
+  none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
+  whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
+  the raw term **unstabilized**, and `eval_closures`' env can name one.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's own test region — everything from its first test-module declaration to EOF, whether that declaration opens an inline module or a sibling `#[path]` one).
 - `src/port.rs` 4 076 lines, 4 020 of production (unit suite lives in `port/tests.rs`, 3 824 lines, plus the sibling `port/{driver_output_shape,inet_matrix,ram_file_matrix,completion,control_capability,monitor,spawn_driver,packet_framing,stream_shape}_tests.rs` and `port/test_support.rs`).

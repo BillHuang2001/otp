@@ -279,6 +279,25 @@ impl SeqTrace {
     pub fn is_active(&self, pid: ProcessId) -> bool {
         self.token(pid).is_some()
     }
+    /// Appends every token **term** this state holds to `out` — the label and the `from` pid of
+    /// each process's token.
+    ///
+    /// A root-set census for the `-eval` route's escaped-payload prune
+    /// ([`crate::eval::reclaim`]): unlike a timer message or a `persistent_term` value, a token's
+    /// label and `from` are **not** stabilized when they are stored
+    /// ([`SeqTrace::set_label`]/[`SeqTrace::set_from`] record the caller's word as it is), so a
+    /// label naming an off-heap refc-binary payload keeps that payload live through this state
+    /// alone. The flags/serial/lastcnt fields are integers, so they cannot name anything and are
+    /// not reported.
+    pub(crate) fn gather_off_heap_roots(&self, out: &mut Vec<Eterm>) {
+        for state in self.processes.values() {
+            let Some(token) = state.token else {
+                continue;
+            };
+            out.push(token.label);
+            out.push(token.from);
+        }
+    }
 
     /// `pid`'s token, created with the C's defaults when it has none — the C's
     /// `new_seq_trace_token` (`erl_if_trace.c:3133-3154`).

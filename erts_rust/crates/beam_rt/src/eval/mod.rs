@@ -99,7 +99,7 @@ mod bits;
 mod bits_decode;
 mod bits_match;
 mod parse;
-
+pub(crate) mod reclaim;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -191,6 +191,19 @@ pub(crate) struct FunBody {
 /// A `fun m:f/A` is **not** one of these: it is the real
 /// [`FunKind::External`](beam_codec::FunKind::External) term (see
 /// [`Evaluator::fun_ref`]), so only the local closure needs a stored body.
+impl FunBody {
+    /// Appends the terms this closure captured to `out` — a root-set census for the
+    /// escaped-payload prune ([`reclaim`]).
+    ///
+    /// A capture environment holds the terms the closure was created over, and a closure stored
+    /// on the runtime ([`Runtime::eval_closures`](crate::runtime::Runtime)) outlives the
+    /// evaluator that built it, so nothing else names them: a captured off-heap refc binary would
+    /// have no root at all without this. The captured names are not reported (they are Rust
+    /// strings, not terms).
+    pub(crate) fn env_terms(&self, out: &mut Vec<Eterm>) {
+        out.extend(self.env.values().copied());
+    }
+}
 enum FunKind {
     /// `fun (Params) -> Body end` — a closure over `env`.
     Local {
@@ -358,9 +371,20 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
     // this very pid can arrive.
     ctx.with_relocation_exempt(|ctx| {
         let tree = parse::parse(expr)?;
-        let mut evaluator = Evaluator { ctx };
+        let mut evaluator = Evaluator {
+            ctx,
+            depth: 0,
+            prune: true,
+        };
         let mut env = Env::new();
-        let outcome = evaluator.expr(&tree, &mut env);
+        // The **one** prune point of this route: the driver evaluates the top-level statements
+        // itself (instead of delegating to [`Evaluator::exprs`]) so the escaped-payload prune can
+        // run *between* them, where the evaluator's live term set is exactly its environment plus
+        // the value of the statement just reduced. Inside [`Evaluator::expr_inner`] the same
+        // `exprs` call would be reached from a `case`/`try`/fun clause whose subject or partially
+        // built containers are live and unnamed, so pruning must not be keyed off a recursion
+        // depth alone — see [`Evaluator::prune_escaped`].
+        let outcome = evaluator.run_top_level(&tree, &mut env);
         finish(outcome, evaluator.ctx)
     })
 }
@@ -451,7 +475,11 @@ pub(crate) fn apply_eval_closure(
     let Some(body) = ctx.runtime.eval_closures.get(index).cloned() else {
         return Err(BeamError::BadArg);
     };
-    let mut evaluator = Evaluator { ctx };
+    let mut evaluator = Evaluator {
+        ctx,
+        depth: 0,
+        prune: false,
+    };
     let result = evaluator.apply_closure(&body, fun, args);
     finish(result, evaluator.ctx)
 }
@@ -460,13 +488,76 @@ pub(crate) fn apply_eval_closure(
 struct Evaluator<'a, 'b> {
     /// The host: the BIF registry, the shared atom table, the heap, the pid.
     ctx: &'a mut RuntimeContext<'b>,
+    /// How many `expr` frames are live right now.
+    ///
+    /// The escaped-payload prune ([`reclaim`]) is a **depth-0** operation: only at the top
+    /// level is the evaluator's live term set exactly its [`Env`] plus the value it is
+    /// reducing. Inside a nested expression the frames' partially built terms
+    /// ([`Evaluator::terms`]' `Vec<Eterm>`, [`Evaluator::list`]'s accumulator) are live and
+    /// unnamed, so a prune there could free a payload one of them still points at.
+    depth: usize,
+    /// Whether this evaluator may prune at all.
+    ///
+    /// Only the `-eval` **driver** ([`eval`]) enables it. [`apply_eval_closure`] builds a
+    /// fresh evaluator inside a running module's call, where the caller's terms are live
+    /// and unnameable from here, so a closure application never prunes.
+    prune: bool,
 }
 
 impl Evaluator<'_, '_> {
     // -- expressions ----------------------------------------------------------
 
-    /// Evaluates `expr` in `env`.
+    /// Evaluates `expr` in `env`, tracking the depth the escaped-payload prune depends on.
     fn expr(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {
+        self.depth += 1;
+        let result = self.expr_inner(expr, env);
+        self.depth -= 1;
+        result
+    }
+
+    /// Evaluates the whole `-eval` expression, pruning the escaped-payload store between its
+    /// top-level statements.
+    ///
+    /// A comma sequence parses to [`Expr::Block`], so the driver runs the statements itself; any
+    /// other expression is a single statement. Both halves call [`Evaluator::prune_escaped`] with
+    /// exactly the terms the evaluator still holds — its environment and the statement's value —
+    /// which is what makes the prune's root enumeration complete.
+    fn run_top_level(&mut self, tree: &Expr, env: &mut Env) -> EResult<Eterm> {
+        let Expr::Block(body) = tree else {
+            let value = self.expr(tree, env)?;
+            self.prune_escaped(env, value);
+            return Ok(value);
+        };
+        let mut last = NIL;
+        for expression in body {
+            last = self.expr(expression, env)?;
+            self.prune_escaped(env, last);
+        }
+        Ok(last)
+    }
+    /// Releases the off-heap refc-binary payloads the `-eval` route's escaped-payload store holds
+    /// that nothing reaches any more ([`reclaim::prune`]).
+    ///
+    /// Called **only** at a top-level statement boundary of the `-eval` driver
+    /// ([`Evaluator::run_top_level`], which is why the `depth == 0` guard holds by construction
+    /// and `prune` is only set by that driver). The live terms at that moment are the
+    /// environment's values and the value of the statement just reduced, and both are handed over
+    /// as the prune's `extra` roots; everything else that can name a payload is enumerated by
+    /// [`Runtime::gather_off_heap_roots`](crate::runtime::Runtime::gather_off_heap_roots).
+    ///
+    /// The trigger is `O(1)` — a handle-count comparison — so a statement that added nothing to
+    /// the store costs one `Vec::len` and nothing else runs.
+    fn prune_escaped(&mut self, env: &Env, value: Eterm) {
+        if !self.prune || self.depth != 0 {
+            return;
+        }
+        let mut extra: Vec<Eterm> = Vec::with_capacity(env.len() + 1);
+        extra.extend(env.values().copied());
+        extra.push(value);
+        let _ = reclaim::prune(self.ctx.runtime, &extra);
+    }
+    /// [`Evaluator::expr`] without the depth bookkeeping.
+    fn expr_inner(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {
         match expr {
             Expr::Int(value) => self.integer(*value),
             Expr::Float(value) => Ok(heap!(terms::make_float(self.ctx, *value))),

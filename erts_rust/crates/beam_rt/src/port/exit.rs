@@ -95,7 +95,7 @@ use std::rc::Rc;
 
 use beam_common::Result;
 use beam_engine::terms;
-use beam_process::{MonitorRef, PortId, ProcessId, ProcessTable};
+use beam_process::{MonitorRef, PortId, PortMonitor, ProcessId, ProcessTable};
 use beam_term::{make_atom, Eterm};
 
 use crate::context::RuntimeContext;
@@ -275,20 +275,69 @@ impl PortRegistry {
     /// answer depends on the recipient's `trap_exit` flag (see
     /// [`Runtime::deliver_port_signals`]) and on whether the recipient is still alive; neither
     /// is readable here (this registry holds no process table).
+    ///
+    /// # The one closer that owes the links nothing
+    ///
+    /// [`PortRegistry::retire_peer_closed`](super::PortRegistry) marks the port in
+    /// `PortExtras::no_owner_exit` before calling
+    /// [`PortRegistry::close`](super::PortRegistry), because the C's peer-close retirement is
+    /// `driver_exit(desc->inet.port, 0)` (`inet_drv.c:12835-12837`) — and `driver_exit` runs
+    /// `unlink_proc` **first** (`io.c:7244`), so a trapping linked owner gets no
+    /// `{'EXIT', S, normal}` while every monitor still gets its `{'DOWN', Ref, port, S, normal}`.
+    /// Suppressing here (rather than at delivery) keeps the whole signal set one snapshot, so the
+    /// two messages of one close can never disagree.
     pub(super) fn capture_port_exit(&mut self, id: PortId) {
-        let signals = self.port_exit_signals(id, PortSignalReason::Normal, true);
+        let signals_owner = !self.extras.owner_exit_suppressed(id.number());
+        // The port is still live here — `close` snapshots before `beam_io` is told anything — so
+        // the port table is the authoritative statement of who is watching it.
+        let monitors = self.port_table().monitors(id);
+        let signals =
+            self.port_exit_signals(id, PortSignalReason::Normal, signals_owner, monitors);
         if !signals.is_empty() {
             self.pending_port_signals.stash(id, signals);
         }
     }
 
+    /// The incoming monitor set a **driver-failed** port was watched by, read from whichever
+    /// source still holds it.
+    ///
+    /// The two answers are not interchangeable, which is why this is a question rather than a
+    /// field read:
+    ///
+    /// * [`beam_io`] has already **closed** the port (`reap_failures`) but not necessarily
+    ///   **reported** it, and its number — and therefore its monitor set — is released only when
+    ///   that report is minted (`PortTable::release`). While the table still holds the port it is
+    ///   the authority, and it is fresher than any snapshot (a monitor may have been installed
+    ///   after the last round began).
+    /// * Once the number is retired the table knows nothing about the port, so the reading
+    ///   [`PortRegistry::capture_round_monitors`] took immediately before the round that retired
+    ///   it is the last truthful statement — see [`PortRegistry::pre_round_monitors`](super::PortRegistry).
+    ///
+    /// A port that neither source knows owes no `'DOWN'`; an invented one would be worse than a
+    /// missing one.
+    pub(super) fn failed_port_monitors(&self, id: PortId) -> &[PortMonitor] {
+        if self.port_table().contains(id) {
+            self.port_table().monitors(id)
+        } else {
+            self.pre_round_monitors
+                .get(&id.number())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        }
+    }
     /// The `'EXIT'`/`'DOWN'` messages the close of `id` owes, with `reason` on every one of them,
-    /// read from the still-live metadata/link/monitor state.
+    /// read from the still-live metadata/link state plus the caller's `monitors` reading.
     ///
     /// `signals_owner` is the C's own distinction: the `driver_failure*` family delivers a
     /// port-exit signal to the connected process, while `driver_exit` runs `unlink_proc` first
     /// (`io.c:7244`), so **no** `'EXIT'` is owed — but every monitor still gets its `'DOWN'`, the
     /// C's one `erts_deliver_port_exit` path covering links and monitors alike.
+    ///
+    /// `monitors` is the port's incoming monitor set, and it is a **parameter** because the two
+    /// callers read it from different places: a runtime `close` still holds the port in the
+    /// [`PortTable`](beam_process::PortTable), while a driver-failed port has usually had its
+    /// number retired by the round that reaped it — see
+    /// [`PortRegistry::failed_port_monitors`].
     ///
     /// An empty answer means the port owes nothing (or no longer has metadata), never a
     /// fabricated message.
@@ -297,6 +346,7 @@ impl PortRegistry {
         id: PortId,
         reason: PortSignalReason,
         signals_owner: bool,
+        monitors: &[PortMonitor],
     ) -> Vec<PortSignal> {
         let Some(owner) = self.meta.get(&id.number()).map(|meta| meta.owner) else {
             return Vec::new();
@@ -320,7 +370,7 @@ impl PortRegistry {
         // The `'EXIT'` entries come first because that is the order the oracle delivers them
         // in: a process that is both linked and watching sees the exit before the `'DOWN'`
         // (pinned by `tests/port_exit.rs`).
-        for monitor in self.port_table().monitors(id) {
+        for monitor in monitors {
             signals.push(PortSignal {
                 port: id,
                 to: monitor.watcher,
@@ -330,7 +380,6 @@ impl PortRegistry {
         }
         signals
     }
-
     /// Publishes already-final signals straight into the deliverable queue — the failure
     /// channel's route (see [`PendingPortSignals::push_ready`]).
     pub(super) fn push_port_signals(&mut self, signals: Vec<PortSignal>) {
@@ -359,7 +408,7 @@ impl PortRegistry {
         if !self.pending_port_signals.has_unreported() {
             return Ok(());
         }
-        let outcome = self.registry.handle_events(&mut self.poller, &[])?;
+        let outcome = self.handle_port_events(&[])?;
         self.fold_notifications(outcome.notifications, events)?;
         if self.pending_port_signals.has_unreported() {
             return Err(error::unsupported(

@@ -319,6 +319,9 @@ impl PortRegistry {
             driver_atoms: None,
             driver_control_flags: None,
             driver_busy: None,
+            // A built-in inet driver has no `erl_drv_set_os_pid` hook: `port_info(Port, os_pid)`
+            // is this port's `undefined`.
+            driver_os_pid: None,
             driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),

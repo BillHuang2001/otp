@@ -1013,3 +1013,124 @@ fn a_binary_stream_port_delivers_the_oracles_header_lists() {
     );
 
 }
+
+// ---------------------------------------------------------------------------------------------
+// The **built-in** driver's row of the C's `port_command/2,3` decision table
+// ---------------------------------------------------------------------------------------------
+
+/// `ram_file_drv`'s reply to [`OPEN_ABC`]: the `NUMBER` reply code (`3`) plus a big-endian `i32`
+/// zero (the C's `numeric_reply(f, 0)` — the `open` result slot, "0 is not used").
+const OPEN_NUMBER_REPLY: [u8; 5] = [3, 0, 0, 0, 0];
+
+/// A **built-in** driver port is idle, takes a plain command (`true`, and the bytes really reach the
+/// driver) and refuses `[force]` with `error:notsup` — because a built-in driver has no
+/// `ErlDrvEntry` flag word and so can never carry `ERL_DRV_FLAG_SOFT_BUSY`.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1) for
+/// `P = open_port({spawn_driver,"ram_file_drv"},[])`:
+///
+/// | call | oracle |
+/// |---|---|
+/// | `port_command(P, <<1,0,0,0,3,97,98,99>>)` | `true` |
+/// | `port_command(P, <<1,0,0,0,3,97,98,99>>, [nosuspend])` | `true` |
+/// | `port_command(P, <<1,0,0,0,3,97,98,99>>, [force])` | `error:notsup` |
+/// | `port_command(P, <<1,0,0,0,3,97,98,99>>, [force,nosuspend])` | `error:notsup` |
+///
+/// The refusal is decided from the driver's **flag word, never from the busy state**
+/// (`erl_bif_port.c:195-198`, read *before* `erts_port_output`), which is exactly why an **idle**
+/// built-in port refuses it: a built-in driver is the C's "never busy, no `SOFT_BUSY`" case that
+/// [`beam_io::Driver::is_busy`]/[`beam_io::Driver::flags`]'s trait defaults describe. That is the
+/// one row of the table the sibling `driver/port_attributes_tests.rs` cannot state — its fixtures are
+/// `dlopen`ed drivers with a real entry to carry (or omit) the bit.
+///
+/// Driven on `beam_io`'s registry directly, because that is where the decision table lives:
+/// [`crate::PortRegistry`] exposes no `port_command_with` (the runtime's `port_command` floor
+/// re-derives the same arms in `crate::native::port`). The row is hermetic — no child, no oracle
+/// round trip, and no wait: a `ram_file` port owns no descriptor, so the poller is only a signature.
+#[test]
+fn a_builtin_driver_port_takes_a_plain_command_and_refuses_force() {
+    let mut poller = Poller::new().expect("a poll set");
+    let drivers = DriverRegistry::with_static_spawn_drivers();
+    let mut ports = IoPortRegistry::new();
+    let id = ports
+        .open_named(&mut poller, &drivers, "ram_file_drv")
+        .expect("the built-in ram_file_drv opens");
+    assert!(
+        !ports.is_busy(id).expect("a live port"),
+        "a built-in driver never marks its port busy (no `set_busy_port`)"
+    );
+
+    // `[force]`: the refusal, on the idle port. Nothing is queued, so nothing can be written.
+    let err = ports
+        .port_command_with(
+            &mut poller,
+            id,
+            OPEN_ABC,
+            PortCommandOptions::EMPTY.with_force(true),
+        )
+        .expect_err("a built-in driver has no SOFT_BUSY flag word, so `[force]` is notsup");
+    assert_eq!(
+        err.as_atom(),
+        Some("notsup"),
+        "the oracle raises `error:notsup` for `[force]` on a `{{spawn_driver,\"ram_file_drv\"}}` port"
+    );
+    let err = ports
+        .port_command_with(
+            &mut poller,
+            id,
+            OPEN_ABC,
+            PortCommandOptions::EMPTY
+                .with_force(true)
+                .with_nosuspend(true),
+        )
+        .expect_err("`nosuspend` does not soften the capability refusal");
+    assert_eq!(
+        err.as_atom(),
+        Some("notsup"),
+        "the oracle's same `error:notsup`"
+    );
+    let port = ports.get(id).expect("a live port");
+    assert_eq!(
+        (port.output_len(), port.input_len()),
+        (0, 0),
+        "a refused forced command queues no bytes and the driver answers nothing"
+    );
+
+    // The idle, non-forced rows: both are the oracle's `true`, and the command really reaches the
+    // driver — its five-byte `NUMBER 0` reply is what the round harvests.
+    assert_eq!(
+        ports
+            .port_command_with(&mut poller, id, OPEN_ABC, PortCommandOptions::EMPTY)
+            .expect("an idle port takes a plain command"),
+        beam_io::PortCommandOutcome::Done,
+        "the oracle answers `true` for a plain `port_command/2` on the idle port"
+    );
+    assert_eq!(
+        ports.get(id).expect("a live port").output_len(),
+        OPEN_ABC.len(),
+        "the whole command is queued for the write path"
+    );
+    let round = ports
+        .execute_port_tasks(&mut poller, 1024)
+        .expect("the output task runs");
+    assert_eq!(
+        round.notifications,
+        vec![PortNotification::Data {
+            port: id,
+            read: ReadMessage::body_only(OPEN_NUMBER_REPLY.to_vec()),
+        }],
+        "the command reached the driver: exactly one `{{data, …}}` notification carrying its reply"
+    );
+    assert_eq!(
+        ports
+            .port_command_with(
+                &mut poller,
+                id,
+                OPEN_ABC,
+                PortCommandOptions::EMPTY.with_nosuspend(true)
+            )
+            .expect("an idle port takes a `[nosuspend]` command too"),
+        beam_io::PortCommandOutcome::Done,
+        "the oracle answers `true` for `[nosuspend]` on an idle port (the option only matters when busy)"
+    );
+}

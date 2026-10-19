@@ -151,6 +151,8 @@ fn the_inherited_set_is_the_c_tcp_inet_copy_block() {
         INET_LOPT_MSGQ_LOWTRMRK,
         INET_LOPT_TCP_SHOW_ECONNRESET,
         INET_LOPT_TCP_READ_AHEAD,
+        // The second writer of the copied `bufsz` — see the test below.
+        INET_OPT_RCVBUF,
     ] {
         assert!(
             is_inherited_record(&rec(code, 1)),
@@ -166,6 +168,42 @@ fn the_inherited_set_is_the_c_tcp_inet_copy_block() {
         );
     }
     assert!(!is_inherited_record(&[]), "an empty record inherits nothing");
+}
+
+/// The C's `inet.bufsz` is copied as a **value**, and two codes write it, so the replay must carry
+/// both: `{buffer, N}` assigns it (`inet_drv.c:7318-7330`) and `{recbuf, N}` raises it while
+/// `INET_FLG_BUFFER_SET` is clear (`:7350-7360`).
+///
+/// Without code 7 a listener opened with `{recbuf, 65536}` and no `{buffer, …}` would leave its
+/// accepted socket at the 9216-byte default, where the oracle's reports the listener's 65536 —
+/// the divergence this table row exists to prevent, pinned end to end by the accept suite's
+/// `a_recbuf_raised_driver_buffer_is_inherited`.
+#[test]
+fn both_writers_of_the_copied_driver_buffer_are_replayed() {
+    assert!(is_inherited_record(&rec(INET_LOPT_BUFFER, 4096)));
+    assert!(is_inherited_record(&rec(INET_OPT_RCVBUF, 65_536)));
+    // Replay order is the listener's own arrival order, which is what makes the pair reproduce the
+    // C's field: the flag's only writer is the `{buffer, …}` record the listener itself sent.
+    let mut options = InetOptions::default();
+    let arg = [
+        rec(INET_OPT_RCVBUF, 65_536),
+        rec(INET_LOPT_BUFFER, 4096),
+    ]
+    .concat();
+    assert!(options.record(4, &arg));
+    let codes: Vec<u8> = options
+        .get(4)
+        .expect("port 4 has a mirror")
+        .records()
+        .iter()
+        .filter(|record| is_inherited_record(record))
+        .map(|record| record[0])
+        .collect();
+    assert_eq!(
+        codes,
+        vec![INET_OPT_RCVBUF, INET_LOPT_BUFFER],
+        "both writers survive the filter, in the listener's order"
+    );
 }
 
 // -- the success rule and the verb test ----------------------------------------------------
