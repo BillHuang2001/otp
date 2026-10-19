@@ -34,11 +34,11 @@
 //! Every byte of the wire already lives in the sibling `beam_dist` crate — the
 //! connector handshake (`beam_dist::driver::ConnectionDriver::client`), the
 //! control-message codec (`send_control`), the `epmd` `PORT2_REQ` lookup
-//! (`beam_dist::epmd::lookup_port`) and the inbound classifier
-//! (`ConnectionDriver::dispatch_inbound_checked`). What this module adds is the *driving
-//! state* the runtime owns: a socket per peer, a bounded non-blocking pump, a
-//! failure-recorded retirement policy and the [`DistSignalRouter`] implementation
-//! the process table's outbound signals are routed through.
+//! (`beam_dist::epmd::lookup_port_at`, aimed at [`crate::dist::epmd_addr`]) and the
+//! inbound classifier (`ConnectionDriver::dispatch_inbound_checked`). What this module
+//! adds is the *driving state* the runtime owns: a socket per peer, a bounded
+//! non-blocking pump, a failure-recorded retirement policy and the [`DistSignalRouter`]
+//! implementation the process table's outbound signals are routed through.
 //!
 //! # The handshake order (OTP's `handshake_we_started/1`)
 //!
@@ -434,7 +434,9 @@ impl DistClient {
     /// Dials `peer_name` (a `-name`/`-sname` value) and opens an outbound link.
     ///
     /// The peer's distribution listen port is resolved through `epmd`
-    /// ([`beam_dist::epmd::lookup_port`]); the socket is opened, and the connecting
+    /// ([`lookup_dist_port`]), on the `epmd` at [`crate::dist::epmd_addr`] — the same
+    /// address this node's `ALIVE2` registration uses, so a private `epmd`
+    /// (`$ERL_EPMD_PORT`) serves both; the socket is opened, and the connecting
     /// state machine is created. Nothing is sent yet — the first
     /// [`DistClient::pump`] writes the `Name` frame, and
     /// [`crate::Runtime::dist_connect`] drives it to completion.
@@ -446,7 +448,7 @@ impl DistClient {
     /// identity that was never installed ([`DistClient::set_identity`]).
     pub fn connect(&self, peer_name: &str, atoms: &mut AtomTable) -> Result<()> {
         let peer = NodeName::parse(peer_name);
-        let port = beam_dist::epmd::lookup_port(peer.epmd())?;
+        let port = lookup_dist_port(peer.epmd())?;
         let host = host_part(peer.full());
         // A peer on this host is reached over the loopback when its name does not
         // resolve (a `-sname` node's host part is the local hostname); a genuinely
@@ -1013,6 +1015,29 @@ fn host_part(full: &str) -> String {
     }
 }
 
+/// The distribution listen port of the peer registered as `epmd_name`, resolved on
+/// **the** `epmd` this node speaks to.
+///
+/// The address is [`crate::dist::epmd_addr`] — the runtime's single reading of
+/// `$ERL_EPMD_PORT` — so a node's `ALIVE2` registration
+/// ([`crate::dist::DistNode::register_once`]) and its outbound `PORT2_REQ` lookups
+/// always aim at the same daemon (OTP's `erl_epmd:get_epmd_port/0` semantics: a bare
+/// number is a loopback port, a `host:port` value verbatim, unset the well-known
+/// `127.0.0.1:4369`). An unregistered name stays the typed
+/// `Io(NotFound)` [`DistClient::connect`]'s contract promises.
+fn lookup_dist_port(epmd_name: &[u8]) -> Result<u16> {
+    lookup_dist_port_at(&crate::dist::epmd_addr(), epmd_name)
+}
+
+/// [`lookup_dist_port`] over an **explicit** `epmd` address — the testable core.
+///
+/// The address is a parameter because the process environment is global: a test
+/// points it at a fake `epmd` on an ephemeral loopback port instead of mutating
+/// `$ERL_EPMD_PORT` (this crate never `set_var`s in a test).
+fn lookup_dist_port_at(addr: &str, epmd_name: &[u8]) -> Result<u16> {
+    beam_dist::epmd::lookup_port_at(addr, epmd_name)
+}
+
 /// The [`DistSignalRouter`] implementation over a shared [`DistClientInner`].
 struct DistRouter {
     /// The shared client state installed on the runtime's process table.
@@ -1359,5 +1384,93 @@ mod tests {
             ),
             "an id past the bound is a typed refusal"
         );
+    }
+
+    /// The outbound `epmd` lookup speaks to the **configured** `epmd`, not the
+    /// well-known one: a fake `epmd` on an ephemeral loopback port answers the
+    /// `PORT2_REQ` (`'z'` + the peer name, 2-byte framed) with a hand-encoded
+    /// `PORT2_RESP` (`'w'`, result 0, port(2) node_type(1) protocol(1)
+    /// high_vsn(2) low_vsn(2) namelen(2) name extralen(2) extra — unframed, per
+    /// `epmd_srv.c:904-936`), and the lookup resolves exactly the port it advertised.
+    ///
+    /// The address is the parameter of [`lookup_dist_port_at`] (what
+    /// [`lookup_dist_port`] supplies [`crate::dist::epmd_addr`] for) because the
+    /// process environment is global: this test never mutates `$ERL_EPMD_PORT`.
+    #[test]
+    fn the_dist_port_lookup_asks_the_configured_epmd_address() {
+        /// The port the fake `epmd` claims the peer listens on — deliberately not
+        /// the well-known `4369`, nor a port the fake itself is bound to.
+        const ADVERTISED: u16 = 45_678;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake epmd");
+        let addr = listener.local_addr().expect("read the fake epmd's port");
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the lookup connected");
+            let mut header = [0u8; 2];
+            stream
+                .read_exact(&mut header)
+                .expect("the 2-byte frame length");
+            let len = usize::from(u16::from_be_bytes(header));
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).expect("the framed request");
+            assert_eq!(
+                body.first().copied(),
+                Some(b'z'),
+                "the request must be a PORT2_REQ ('z')"
+            );
+            assert_eq!(&body[1..], b"peer", "the request names the peer");
+            let mut reply = vec![b'w', 0];
+            reply.extend_from_slice(&ADVERTISED.to_be_bytes());
+            reply.push(77); // node_type: normal (`EPMD_NODE_NORMAL`)
+            reply.push(0); // protocol: tcp/ip (`EPMD_PROTO_TCP`)
+            reply.extend_from_slice(&7u16.to_be_bytes()); // high_vsn
+            reply.extend_from_slice(&6u16.to_be_bytes()); // low_vsn
+            reply.extend_from_slice(&4u16.to_be_bytes()); // namelen
+            reply.extend_from_slice(b"peer");
+            reply.extend_from_slice(&0u16.to_be_bytes()); // extralen
+            stream.write_all(&reply).expect("answer the PORT2_REQ");
+            stream.flush().expect("flush the PORT2_RESP");
+        });
+        let resolved = lookup_dist_port_at(&addr.to_string(), b"peer")
+            .expect("the configured epmd answers the lookup");
+        assert_eq!(
+            resolved, ADVERTISED,
+            "the lookup resolves the port the configured epmd advertised"
+        );
+        fake.join().expect("the fake epmd finished");
+    }
+
+    /// [`lookup_dist_port`] — the function [`DistClient::connect`] calls — resolves
+    /// against [`crate::dist::epmd_addr`] and keeps `connect`'s error contract: a name
+    /// nobody registers is a typed [`BeamError::Io`] (the `NotFound` of an answering
+    /// `epmd`, or a connection error when none is listening), never a fabricated port
+    /// and never a panic.
+    #[test]
+    fn an_unregistered_peer_is_a_typed_error_not_a_fabricated_port() {
+        // Two honest outcomes, both typed: an answering `epmd` that does not know the
+        // name (`Io(NotFound)`, what `connect`'s contract promises), or no `epmd`
+        // listening on the configured address (a connection error).
+        match lookup_dist_port(b"beam_rt_no_such_node_for_the_lookup") {
+            Ok(port) => panic!("a fabricated distribution port {port}"),
+            Err(BeamError::Io(err)) => match err.kind() {
+                // An `epmd` answered the `PORT2_REQ` and does not know the name.
+                ErrorKind::NotFound => assert!(
+                    err.to_string().contains("beam_rt_no_such_node_for_the_lookup"),
+                    "a not-registered answer names the node: {err}"
+                ),
+                // No `epmd` is listening on the configured address.
+                kind => assert!(
+                    matches!(
+                        kind,
+                        ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::TimedOut
+                            | ErrorKind::AddrNotAvailable
+                    ),
+                    "unexpected lookup failure: {kind} ({err})"
+                ),
+            },
+            Err(other) => panic!("expected a typed Io error, got {other:?}"),
+        }
     }
 }

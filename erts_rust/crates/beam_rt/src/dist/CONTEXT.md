@@ -52,6 +52,7 @@ The connecting half is the sibling `src/dist_client.rs` (not part of this node):
 - `DistConnection::close` shuts the socket down in both directions (`ENOTCONN` and the connection-lost errors are the post-condition, not failures), and it is the first thing the link-retirement helper `retire_at` does — on the pump's error arm and on its dead-link (`!is_live()`) arm alike — so a retired link is never left half-open.
 - `DistConnection::peer_visibility` reports how the peer's own flags classify it (`PeerVisibility::Normal`/`Hidden`, `dist_util.erl:publish_type/1`), which is **recorded, never refused**: both ends of an OTP connection may advertise themselves hidden (this runtime advertises `preferred_flags`, which omits `DFLAG_PUBLISHED`).
 - `epmd_addr` is the node's one `epmd` address: `$ERL_EPMD_PORT` (a bare `N` ⇒ `127.0.0.1:N`, a value containing `:` used verbatim) else `EPMD_DEFAULT_ADDR`, and it is what `DistNode::register_once`'s `ALIVE2_REQ` connects to.
+- The connecting half's outbound `PORT2_REQ` lookup resolves on that **same** address (`dist_client.rs::lookup_dist_port` → `beam_dist::epmd::lookup_port_at(&epmd_addr(), …)`), so a node's registration and its dialling always speak to the same `epmd`.
 
 ## Constraints
 - Errors are return-based (`beam_common::Result`); a link-level failure **retires that one link** and is recorded, never raised — it must never fail a scheduler pass.
