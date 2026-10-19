@@ -572,6 +572,7 @@ Every probe is compared against the **system `erl`** on the identical `.beam`s, 
 
 **The O(1) steady state is one snapshot and one `Vec` compare per site.** `Frontier::snapshot()` reads `resource_terms()` into a sorted word list (an empty registry allocates nothing); `prune_beyond` then defers when the total word count is unchanged, when nothing is fresh, or when the kill switch is off — so a site with no NIF resource traffic costs one registry read and no walk at all, which is what makes the per-lambda-application price acceptable.
 The nested epilogue goes further: when **neither** store is due (neither the refc payload store nor the resource table), it does not copy the root set either.
+The park arm's host-seed collection (`Runtime::gather_off_heap_roots`) sits behind gate 1 (`candidates.is_empty()`), so a runtime that never minted a resource pays nothing for it.
 
 **There is no region word scan for resources, and that is a decision, not an omission.** The refc prune gets a region half for free because a payload *pointer* is a value written beside its header, so a `HEADER_BIN_REF` pattern scan finds it without dereferencing anything.
 A resource's identity instead lives **inside** its 4-word `[hdr][node][serial][id]` block, and the mint block itself stands in a runtime region (the pooled BIF heap) — so a word-pattern scan would match every candidate every time and make the prune a permanent no-op.
