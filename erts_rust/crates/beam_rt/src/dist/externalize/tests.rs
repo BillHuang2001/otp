@@ -29,8 +29,8 @@ use beam_codec::term::{
     make_map, tuple_arity, tuple_element,
 };
 use beam_term::prelude::{
-    make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data, make_small,
-    Eterm, NIL,
+    is_list, make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
+    make_small, Eterm, NIL,
 };
 use beam_term::AtomTable;
 
@@ -299,14 +299,20 @@ fn find_external_pid(term: Eterm) -> Option<Eterm> {
             .find_map(|&elem| find_external_pid(elem));
     }
     let mut cell = term;
-    while let Ok(head) = beam_codec::term::cons_head(cell) {
+    while is_list(cell) {
+        let Ok(head) = beam_codec::term::cons_head(cell) else {
+            return None;
+        };
         if let Some(found) = find_external_pid(head) {
             return Some(found);
         }
-        cell = match beam_codec::term::cons_tail(cell) {
-            Ok(tail) => tail,
-            Err(_) => return None,
+        let Ok(tail) = beam_codec::term::cons_tail(cell) else {
+            return None;
         };
+        if !is_list(tail) {
+            return find_external_pid(tail);
+        }
+        cell = tail;
     }
-    find_external_pid(cell)
+    None
 }
