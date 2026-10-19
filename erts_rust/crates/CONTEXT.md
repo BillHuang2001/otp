@@ -392,10 +392,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   live catch frame, matching C's `handle_error` → `next_catch`). `beam_bifs` attaches the true reason term
   instead of collapsing to a bare `badarg`: `{badmap,M}`, `{badkey,K}`, `{case_clause,V}`,
   `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
-  `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). The one remaining
-  degradation is a tag atom that cannot be interned (no `AtomInterner` hook) ⇒ plain `badarg`.
-  `beam_rt::runner::exit_reason` recovers the live reason term from the slot and renders it as the
-  uncaught-exception reason.
+  `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). `beam_rt` installs
+  the `AtomInterner` hook on every BIF call, so a structured reason's tag atom is always nameable; only
+  a host that installs **no** interner degrades such a raise to the bare `badarg` (never a substituted
+  atom). A raise whose own reason atom is absent from every table is interned by
+  `RuntimeContext::name_raise_reason_atom` before the engine spells it, so it can no longer escape a
+  live `try…catch`. `beam_rt::runner::exit_reason` recovers the live reason term from the slot and
+  renders it as the uncaught-exception reason.
 - **Failed head-clause/guard terminates via `func_info`; a missing module/function is bare `undef`.**
   `beam_engine`'s `Instr::FuncInfo` (`src/interpreter.rs`) raises class `error` with the **bare atom
   `function_clause`** (resolved from the running module's atom table; a module whose table lacks the
