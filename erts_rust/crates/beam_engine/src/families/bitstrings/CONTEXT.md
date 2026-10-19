@@ -262,7 +262,7 @@ fields), so those shapes are covered only by this node's oracle-derived unit tes
   code (`<<1, X/binary, 2>>` emits a non-append `binary` segment with `{f,0}`). Verified
   oracle-identical for that shape — do not "fix" it into a silent continue.
 
-## `## Measured` — per-call cost of the two foreign bitstring workloads
+## Measured — per-call cost of the measured workloads
 All figures are the default (native baseline) tier on the shared host, pinned core, one process at
 a time, with the `/proc/loadavg` band recorded; only the **ratios** and the deterministic
 `*_per_call` counters are meaningful — an absolute moves with the host load (observed ±15 % between
