@@ -171,8 +171,8 @@ const REF_THING_WORDS: usize = prelude::INTERNAL_REF_WORDS;
 /// The header **arity** of the *other* internal-reference block shape this crate accepts: the C
 /// `ErtsORefThing`, `[make_header(2, REF_SUBTAG), num[0..3] | marker]`.
 ///
-/// `ERTS_REF_THING_SIZE` is **3** words (`erl_term.h:990`: `header` + the three packed `num[]` ids
-/// + the marker, 24 bytes on 64-bit little-endian) and the C header is
+/// `ERTS_REF_THING_SIZE` is **3** words — `header`, the three packed `num[]` ids and the marker,
+/// 24 bytes on 64-bit little-endian (`erl_term.h:990`) — and the C header is
 /// `ERTS_REF_THING_HEADER = _make_header(ERTS_REF_THING_SIZE-1, _TAG_HEADER_REF)` (`:998`), so its
 /// arity is `ERTS_REF_THING_SIZE - 1` = **2** payload words.
 ///
