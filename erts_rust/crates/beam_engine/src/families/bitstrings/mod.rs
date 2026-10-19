@@ -194,7 +194,7 @@ pub(super) fn goto_label(labels: &LabelMap, label: Label) -> Result<Step> {
 /// size a segment, and the C `BS_GET_FIELD_SIZE` macro fails the match there; this
 /// engine reports that case as a typed [`crate::error::unsupported`] rather than
 /// guessing.
-#[inline]
+#[inline(always)]
 pub(super) fn read_size(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
@@ -206,12 +206,28 @@ pub(super) fn read_size(
     // for that same value. Short-circuit it (and `Character`, its `h`-tagged twin)
     // rather than paying an out-of-line `make_integer_unrooted` call for every
     // segment; every other operand kind — a register holding a runtime `size(Expr)`,
-    // a literal — still goes through [`read_operand`].
+    // a literal — goes through [`read_size_slow`].
+    //
+    // Keeping the two literal arms in this always-inlined shell and the
+    // `read_operand` route out of line is what lets a caller fold the size decode
+    // into two discriminant tests instead of a call plus a `Result` returned through
+    // memory.
     match operand {
-        Operand::Integer(n) => return size_of_int(*n),
-        Operand::Character(c) => return size_of_int(i64::from(*c)),
-        _ => {}
+        Operand::Integer(n) => size_of_int(*n),
+        Operand::Character(c) => size_of_int(i64::from(*c)),
+        other => read_size_slow(machine, ctx, other),
     }
+}
+
+/// The non-literal size operands: a register/Y slot holding a runtime `size(Expr)`, or
+/// a literal-area term, resolved through [`read_operand`]; also the accept rule's
+/// failure (a negative, oversized or non-integer value).
+#[inline(never)]
+fn read_size_slow(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+) -> Result<usize> {
     let value = read_operand(machine, ctx, operand)?;
     if beam_term::is_small(value) {
         let n = beam_term::signed_value(value);
@@ -257,12 +273,25 @@ pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
 /// `Literal` holding a flag-atom list (`little`/`signed`/`native`; `big`/`unsigned`
 /// are the defaults and contribute nothing). The comparison is by `make_atom` on
 /// this module's atom table, so it needs no index arithmetic.
-#[inline]
+///
+/// The hot arm (`Nil`, every flagless segment the compiler emits) is kept in an
+/// `#[inline(always)]` shell whose only other work is a call to the out-of-line
+/// [`decode_flags_slow`], so the flags decode costs the caller one discriminant test
+/// instead of a call, a `Result` return through memory and a prologue.
+#[inline(always)]
 pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
+    // The overwhelmingly common segment carries no flags (`encode_arg` maps the
+    // empty list to `a,0`), so the hot arm is a plain zero.
     match operand {
-        // The overwhelmingly common segment carries no flags (`encode_arg` maps the
-        // empty list to `a,0`), so the hot arm is a plain zero.
         Operand::Nil => Ok(0),
+        other => decode_flags_slow(module, other),
+    }
+}
+
+/// The non-`Nil` flags operands: a flag-atom list literal, or the typed error.
+#[inline(never)]
+fn decode_flags_slow(module: &Module, operand: &Operand) -> Result<u32> {
+    match operand {
         Operand::Literal(index) => {
             let term = module
                 .literal(*index)
@@ -273,6 +302,7 @@ pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
             }
             Ok(flags)
         }
+        // `Nil` is the fast shell's own arm, so it cannot reach here.
         _ => Err(error::unsupported("bitstring: unsupported flags operand")),
     }
 }
