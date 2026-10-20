@@ -232,11 +232,31 @@ drivers publish their own state through them (see *Who overrides the seam* below
   and releases the number there. So a `close` + `open` before the next round cannot make the deferred
   `Closed` name a reused, live port. A consumer must act on a `Closed` in the round that delivered it —
   the number may be handed out again immediately afterwards.
-- **No `Driver::flush`; a close drops queued bytes.** `Port::close` / `PortRegistry::close`
-  (`port.rs`, `registry.rs`) run `stop` and queue the close without draining either queue, whereas the C
-  calls `flush` before `terminate_port` and parks a port with a non-empty `ioq` in
-  `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at the
-  call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
+- **No `Driver::flush`; a close drops queued bytes — a real divergence (oracle-measured).**
+  `Port::close` (`port.rs:1214`) sets `Closing`, calls `driver.stop` and sets `Closed`;
+  `PortRegistry::close` (`registry.rs:1058`) then removes the `Port` from the live map, so nothing can
+  ever drain `Port::output` (`Port::command` only queues + schedules an `OUTPUT` task, `port.rs:451`).
+  The C instead parks the port: `erts_deliver_port_exit` → "if (reason != am_kill) &&
+  !is_port_ioq_empty(prt) → ERTS_PORT_SFLG_CLOSING + flush_port(prt)"
+  (`../../../../erts/emulator/beam/io.c:3946-3956`), `flush_port` calls `drv->flush` then
+  `terminate_port` **only if the ioq emptied** (`io.c:3659-3700`), and every driver callback's epilogue
+  terminates it once drained (`erts_port_driver_callback_epilogue`, `erl_port.h:797-813`).
+  Per-driver C flush: `tcp_inet_flush` discards only when write readiness is NOT armed
+  (`discard_output = !(desc->inet.event_mask & FD_WRITE)`, `inet_drv.c:12708-12731`) so a queued
+  remainder is drained; `fd_flush` only latches `terminating = 1` (`sys/unix/sys_drivers.c:1029-1034`),
+  with the guarantee documented at `:901-908`; `ram_file_drv` has no flush but consumes output
+  synchronously.
+  Measured on OTP 29.1.1 / erts-17.1 (`erlang:port_info(P,queue_size)` immediately before
+  `erlang:port_close/1`): raw `tcp_inet` (`prim_inet:open/connect/send`, 64 KB `sndbuf`, peer not
+  reading) ⇒ queued 369 036, `port_close` `true`, peer then received **500000/500000**; `spawn`/`fd`
+  against `tee` ⇒ queued 454 656, `port_close` `true`, child got **500000/500000**. The close is
+  **asynchronous** w.r.t. the drain (it returns while bytes are still queued), synchronous only w.r.t.
+  the `flush` callback. Two C paths *do* drop bytes, and neither is a close: `am_kill`, and
+  `driver_failure_term`'s `prt->ioq.size = 0` work-around on input EOF (`io.c:7216-7223`) — which is
+  why a `spawn` port whose child closes stdout (`sh -c "cat > f"`) loses its queued stdin.
+  Mitigated at the call site only (`beam_rt` sends `notify_port_exit` before `registry.close`), and
+  invisible through `gen_tcp:close/1` because `prim_inet:close/1` first subscribes to `subs_empty_out_q`
+  and waits for the queue to empty (`erts/preloaded/src/prim_inet.erl:175-215`).
   The loaded-driver path has the same hole one level lower: `beam_abi::DriverLibrary::flush`
   (`../../beam_abi/src/driver/loader.rs:377`) exists, but `abi/port.rs`'s `DriverPort::stop` runs only
   the entry's `stop` callback, so a `.so` driver's `flush` entry is never invoked at a port close either.
