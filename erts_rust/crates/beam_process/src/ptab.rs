@@ -234,16 +234,53 @@ const SIGNAL_SCRATCH_WORDS: usize = 64;
 /// — relocation-exempt, or `Running` with a stale `regs` snapshot) **or** whose relocating
 /// collection the host's [`CollectionGate`] declines (`decline`) gets the heap-fragment model
 /// instead.
+///
+/// `src` describes the heap `reason` lives in and is the **one** home of the ownership rule: it is
+/// `Some(table)` only for a reason that is neither an immediate nor already on the recipient's own
+/// heap (a signaller's table, or a wire reason on the host's transient dispatch arena), and `None`
+/// otherwise. A **non-immediate** reason with a source table is materialised on the recipient's own
+/// heap first ([`copy_reason_onto`]); when that heap refuses (`AllocKind::Heap`/`Message`) the
+/// **whole** payload is built into a heap fragment from the **same** source table
+/// ([`enqueue_fragment_payload`], whose copy resolves the reason's graph through `src`), so the
+/// receiver is never collected or grown on demand in that case. An **immediate** is embedded
+/// verbatim and **never** triggers a copy or a collection — `node_down`'s fast path.
 fn build_signal_message<F>(
     recipient: &mut Process,
     from: Eterm,
     reason: Eterm,
+    src: Option<&OffHeapTable>,
     decline: bool,
     mut build: F,
 ) -> Result<()>
 where
     F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
 {
+    // Ownership transfer first: a reason in *another* heap becomes a term the recipient owns (or
+    // the payload moves into a fragment) before `build` may embed it. An immediate, or a reason
+    // already on the recipient's heap, goes straight through untouched.
+    let reason = match src {
+        Some(table) if !is_immediate(reason) => {
+            match copy_reason_onto(recipient, reason, Some(table), decline) {
+                Ok(copied) => copied,
+                // The heap cannot take the copy without moving under unpublished live terms (or
+                // cannot take it at all): build the payload — reason included — into a fragment,
+                // copying its graph from the very table the reason lives in.
+                Err(BeamError::Alloc(failure))
+                    if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                {
+                    return enqueue_fragment_payload(
+                        recipient,
+                        from,
+                        reason,
+                        Some(table),
+                        &mut build,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        _ => reason,
+    };
     match build(recipient.heap_mut(), reason) {
         Ok(term) => {
             recipient.mailbox_mut().enqueue(Message::new(term, from));
@@ -1439,7 +1476,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, target, reason, decline, |heap, reason| {
+        build_signal_message(recipient, target, reason, None, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_term(
                 heap,
@@ -1489,7 +1526,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, decline, |heap, reason| {
+        build_signal_message(recipient, from, reason, None, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
             build_down_message_term(
@@ -4062,13 +4099,10 @@ impl ProcessTable {
     /// `src` describes the heap `reason` lives in: `Some` for a reason decoded off the wire — which
     /// lives on the host's **transient** per-drain dispatch arena and may be recycled as soon as the
     /// call returns — and `None` for a reason that is already an immediate (`node_down`'s
-    /// `noconnection`) or already on the watcher's own heap. A non-immediate reason with a source
-    /// table is **materialised on the watcher's own heap** ([`copy_reason_onto`]) *before* the
-    /// message embeds it, so the queued `{'DOWN', …}` never points into memory the host is about to
-    /// reuse; if that heap refuses the copy (a declined collection, or a genuine ceiling) the whole
-    /// message is built into a [`HeapFragment`] instead ([`enqueue_fragment_payload`], whose copy
-    /// resolves the reason's graph through the same source table) — the receiver is never collected
-    /// or grown on demand when the gate covers it.
+    /// `noconnection`) or already on the watcher's own heap. It is forwarded to
+    /// [`build_signal_message`], which owns the whole rule (copy onto the watcher's own heap first,
+    /// else build the message into a heap fragment) — so the queued `{'DOWN', …}` never points into
+    /// memory the host is about to reuse.
     ///
     /// An unknown watcher is skipped (it died earlier in the same sweep).
     fn enqueue_remote_down_message(
@@ -4091,32 +4125,7 @@ impl ProcessTable {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_remote(heap, &atoms, None, reference_term, remote, reason)
         };
-        // `None`: the payload is already fragment-resident, so only the wake below is left.
-        let on_heap: Option<Eterm> = match src {
-            // An immediate carries no heap pointer, so it is position-independent already.
-            Some(table) if !is_immediate(reason) => {
-                match copy_reason_onto(recipient, reason, Some(table), decline) {
-                    Ok(copied) => Some(copied),
-                    Err(BeamError::Alloc(failure))
-                        if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
-                    {
-                        enqueue_fragment_payload(
-                            recipient,
-                            remote.node(),
-                            reason,
-                            Some(table),
-                            &mut build,
-                        )?;
-                        None
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => Some(reason),
-        };
-        if let Some(reason) = on_heap {
-            build_signal_message(recipient, remote.node(), reason, decline, &mut build)?;
-        }
+        build_signal_message(recipient, remote.node(), reason, src, decline, &mut build)?;
         let woke = recipient.wake();
         if woke {
             self.ready.push(watcher);
@@ -4132,9 +4141,9 @@ impl ProcessTable {
     /// heap-materialised external pid.
     ///
     /// `src` describes the heap `reason` lives in — see
-    /// [`ProcessTable::enqueue_remote_down_message`] for the full rule: `Some` for a reason decoded
-    /// off the wire (the host's transient dispatch arena), `None` for an immediate or a reason
-    /// already on the peer's own heap.
+    /// [`ProcessTable::enqueue_remote_down_message`] for the rule [`build_signal_message`] owns:
+    /// `Some` for a reason decoded off the wire (the host's transient dispatch arena), `None` for an
+    /// immediate or a reason already on the peer's own heap.
     ///
     /// An unknown peer is skipped (it died earlier in the same sweep).
     fn enqueue_remote_exit_message(
@@ -4154,32 +4163,7 @@ impl ProcessTable {
             let from = remote.to_eterm(heap)?;
             build_exit_message_term(heap, &atoms, from, reason)
         };
-        // `None`: the payload is already fragment-resident, so only the wake below is left.
-        let on_heap: Option<Eterm> = match src {
-            // An immediate carries no heap pointer, so it is position-independent already.
-            Some(table) if !is_immediate(reason) => {
-                match copy_reason_onto(recipient, reason, Some(table), decline) {
-                    Ok(copied) => Some(copied),
-                    Err(BeamError::Alloc(failure))
-                        if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
-                    {
-                        enqueue_fragment_payload(
-                            recipient,
-                            remote.node(),
-                            reason,
-                            Some(table),
-                            &mut build,
-                        )?;
-                        None
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            _ => Some(reason),
-        };
-        if let Some(reason) = on_heap {
-            build_signal_message(recipient, remote.node(), reason, decline, &mut build)?;
-        }
+        build_signal_message(recipient, remote.node(), reason, src, decline, &mut build)?;
         let woke = recipient.wake();
         if woke {
             self.ready.push(peer);
@@ -4354,7 +4338,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, decline, |heap, reason| {
+        build_signal_message(recipient, from, reason, None, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_port(heap, &atoms, tag, reference_term, port, reason)
         })?;
@@ -4378,7 +4362,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, decline, |heap, reason| {
+        build_signal_message(recipient, from, reason, None, decline, |heap, reason| {
             build_exit_message_term(heap, &atoms, from, reason)
         })?;
         let woke = recipient.wake();
