@@ -278,7 +278,12 @@ flatten(#{nodes := Nodes} = Model) ->
     %% chain whose first element the bitmap denies would be dead data.
     [abort("chain ~w starts at U+~.16B, which is_candidate/1 denies", [Chain, C])
      || {[C | _] = Chain, _Res} <- Chains, not candidate(Model, C)],
-    lists:sort(Chains).
+    %% Sorted by the **packed key**, not by the code-point list: `pack/1' puts
+    %% `s[0]' in the low bits, so sequence order and numeric order of the packed
+    %% form disagree (`[16#300, 16#1FFE]' packs to `16#1FFE0300', above the
+    %% `16#410301' that `[16#301, 16#41]' packs to). `translate/3' binary-searches
+    %% this table by packed key, so the packed order is the one that must hold.
+    lists:sort([{pack(Chars), Chars, Res} || {Chars, Res} <- Chains]).
 
 %% The C's `is_candidate/1' (`erts/emulator/beam/erl_unicode.c:1418`).
 candidate(_Model, Cp) when Cp < 768 ->
@@ -304,8 +309,16 @@ walk(Nodes, Rows, Prefix) ->
               end
       end, Rows).
 
+%% Accepts both chain shapes: the raw `{Chars, Res}' pairs `walk/3' produces (the
+%% validations in `flatten/1' run before the sort) and the `{Key, Chars, Res}'
+%% triples `flatten/1' hands out.
 max_len(Chains) ->
-    lists:max([length(Chars) || {Chars, _} <- Chains]).
+    lists:max([length(chars_of(Entry)) || Entry <- Chains]).
+
+chars_of({_Key, Chars, _Res}) ->
+    Chars;
+chars_of({Chars, _Res}) ->
+    Chars.
 
 %% 16 bits per code point, `s[0]' in the low bits, zero in every unused slot.
 pack(Chars) ->
@@ -317,10 +330,9 @@ pack(Chars) ->
 prefixes(Chains) ->
     lists:usort(
       lists:flatmap(
-        fun({Chars, _}) ->
+        fun({_Key, Chars, _}) ->
                 [pack(lists:sublist(Chars, N)) || N <- lists:seq(1, length(Chars) - 1)]
         end, Chains)).
-
 %% ---------------------------------------------------------------------------
 %% Emitting Rust
 %% ---------------------------------------------------------------------------
@@ -408,9 +420,8 @@ bitmap(Bitmap, Offset) ->
 chains(Chains) ->
     ["/// The composition chains, `(packed key, composed code point)`, sorted by key.\n"
      "pub(crate) const CHAINS: [(u64, u32); ", integer_to_list(length(Chains)), "] = [\n",
-     [io_lib:format("    (~s, ~w),~n", [hex(pack(Chars), 16), Res]) || {Chars, Res} <- Chains],
+     [io_lib:format("    (~s, ~w),~n", [hex(Key, 16), Res]) || {Key, _Chars, Res} <- Chains],
      "];\n\n"].
-
 prefix_table(Chains) ->
     Pre = prefixes(Chains),
     ["/// Every proper prefix of a chain, packed the same way, sorted.\n"

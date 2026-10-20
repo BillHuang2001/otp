@@ -28,9 +28,10 @@
 //! * no canonical *reordering* (marks are never sorted; `a + diaeresis + acute`
 //!   stays three code points, it does not become `a-umlaut + acute`),
 //! * no Hangul composition, and
-//! * no exclusion *table*: the C's committed table simply has no chain for an
-//!   excluded pair, so e.g. `U+0915 U+093C` does not compose — the exclusion is
-//!   honoured by omission, which is why the differential oracle agrees.
+//! * no Unicode composition-exclusion list: the C table is the raw spec
+//!   transcription, so an excluded pair the header happens to carry *does*
+//!   compose — `U+0915 U+093C` ⇒ `U+0958` (`[2392]`), which is the oracle's
+//!   answer too. This port reproduces the table, not the standard.
 //!
 //! Composition happens only where the committed header
 //! (`erts/emulator/beam/erl_unicode_normalize.h`, transcribed into
@@ -42,12 +43,12 @@
 //!
 //! The C validates the whole image first (`erts_analyze_utf8`, `:1177`) and only
 //! then walks the bytes by masking, so this port decodes with the crate's
-//! existing [`decode_one`] — the same classification: low surrogates and
-//! noncharacters are **accepted** and pass through, while a high surrogate, an
+//! existing [`decode_one`] — the same classification: noncharacters
+//! (`U+FDD0` ⇒ `[64976]`, `U+FFFF` ⇒ `[65535]`) are **accepted** and pass
+//! through, while a **surrogate of either kind** (`U+D800` *and* `U+DC00`), an
 //! overlong form, a stray continuation byte and a truncated trailing sequence
 //! are all `badarg`. A non-binary argument (and a non-byte-aligned bitstring) is
-//! `badarg` too (`erts_get_aligned_binary_bytes`).
-//!
+//! `badarg` too (`erts_get_aligned_binary_bytes`).//!
 //! # An oracle defect this must not reproduce in a test
 //!
 //! The oracle (OTP 29.1.1 / erts-17.1) **aborts the VM** (SIGABRT) when the
@@ -375,22 +376,31 @@ mod tests {
     }
 
     /// The same three code points in the other order do NOT compose — no
-    /// canonical reordering happens — so the oracle answers `[65, 1, 10]`.
+    /// canonical reordering happens. Oracle (OTP 29.1.1): `A + acute + ring` ⇒
+    /// `[193, 778]` (the first two compose, the ring is then a lone mark),
+    /// `a + diaeresis + acute` ⇒ `[97, 228, 769]` and `a + acute + diaeresis` ⇒
+    /// `[225, 776]` — the mark pair is rolled up and re-scanned from the base
+    /// outwards, which is why the base and only one mark compose.
     #[test]
     fn marks_are_never_reordered() {
-        assert_eq!(norm_of(&[65, 769, 778]), vec![65, 1, 10]);
-        assert_eq!(norm_of(&[97, 776, 769]), vec![97, 8, 1]);
-        assert_eq!(norm_of(&[97, 769, 776]), vec![97, 1, 8]);
+        assert_eq!(norm_of(&[65, 769, 778]), vec![193, 778]);
+        assert_eq!(norm_of(&[97, 776, 769]), vec![97, 228, 769]);
+        assert_eq!(norm_of(&[97, 769, 776]), vec![225, 776]);
     }
 
-    /// A pair with no chain in the committed table stays two code points. The
-    /// composition exclusions are honoured by omission (the C table has no row),
-    /// not by an exclusion test: `U+0915 U+093C` is the classic excluded pair.
+    /// A pair with no chain in the committed table stays two code points, and —
+    /// the other half of the same fact — a pair the Unicode standard *excludes*
+    /// composes anyway when the header carries the row: `U+0915 U+093C` ⇒
+    /// `U+0958` (`[2392]`), the oracle's own answer, because the C table has no
+    /// exclusion list. (`U+0F71 U+0F72` is also uncomposed, but a mark-initial
+    /// input aborts the oracle, so it must not appear in a differential case.)
     #[test]
     fn a_non_composing_pair_stays_apart() {
-        assert_eq!(norm_of(&[0x0915, 0x093C]), vec![0x0915, 0x093C]);
-        assert_eq!(norm_of(&[2328, 2364]), vec![2328, 2364]);
-        assert_eq!(norm_of(&[3953, 3954]), vec![3953, 3954]);
+        assert_eq!(norm_of(&[66, 769]), vec![66, 769]);
+        assert_eq!(norm_of(&[0x03B1, 0x0309]), vec![0x03B1, 0x0309]);
+        assert_eq!(norm_of(&[9000, 9060]), vec![9000, 9060]);
+        // ... but an excluded pair the header does carry composes.
+        assert_eq!(norm_of(&[0x0915, 0x093C]), vec![0x0958]);
     }
 
     /// Only the chain the table holds composes: `i + circumflex + acute` has no
@@ -424,17 +434,19 @@ mod tests {
         assert_eq!(norm_of(&[65, 0x1F600, 769]), vec![65, 0x1F600, 769]);
     }
 
-    /// Low surrogates and noncharacters decode and pass through; a high surrogate,
-    /// an overlong form, a stray continuation byte and a truncated tail are
-    /// `badarg`, exactly as `erts_analyze_utf8` classifies them.
+    /// Noncharacters decode and pass through; a surrogate of **either** kind, an
+    /// overlong form, a stray continuation byte and a truncated tail are
+    /// `badarg`, exactly as `erts_analyze_utf8` classifies them (oracle-verified:
+    /// `U+FDD0` ⇒ `[64976]`, `U+FFFF` ⇒ `[65535]`, and both `U+D800` and
+    /// `U+DC00` ⇒ `badarg`).
     #[test]
     fn the_decoder_classifies_exactly_like_analyze_utf8() {
-        // U+DC00 (low surrogate) and U+FDD0 / U+FFFF (noncharacters) are accepted.
-        assert_eq!(norm(b"\xED\xB0\x80").unwrap(), vec![0xDC00]);
+        // U+FDD0 / U+FFFF (noncharacters) are accepted.
         assert_eq!(norm("\u{FDD0}".as_bytes()).unwrap(), vec![0xFDD0]);
         assert_eq!(norm("\u{FFFF}".as_bytes()).unwrap(), vec![0xFFFF]);
-        // U+D800 (high surrogate).
+        // U+D800 (high surrogate) and U+DC00 (low surrogate) are not.
         assert!(matches!(norm(b"\xED\xA0\x80"), Err(BeamError::BadArg)));
+        assert!(matches!(norm(b"\xED\xB0\x80"), Err(BeamError::BadArg)));
         // Overlong: a two-byte form of 'A', and the three/four-byte forms.
         assert!(matches!(norm(b"\xC1\x81"), Err(BeamError::BadArg)));
         assert!(matches!(norm(b"\xE0\x80\x80"), Err(BeamError::BadArg)));
