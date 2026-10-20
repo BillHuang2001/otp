@@ -170,9 +170,10 @@ const REPS: usize = 5;
 /// The heap-size policy both strategies share.
 ///
 /// `min_heap_words` is pinned to the mature capacity so the mature generation is a fixed
-/// point of [`HeapPolicy::mature_after_fullsweep`] (neither `should_grow` nor `should_shrink`
-/// fires: the capacity never exceeds `4 * need_after`, and a shrink can never go below the
-/// same floor) and it floors the nursery's live-set targets at the nursery's own initial size,
+/// point of [`HeapPolicy::mature_after_fullsweep`]: neither bracket fires, because the grow
+/// bracket's target (`mature_target_words`) is floored at that same `min_heap_words` and so
+/// never exceeds the capacity, and `should_shrink`'s guard is `capacity > min_heap_words`. It
+/// floors the nursery's live-set targets at the nursery's own initial size,
 /// so the nursery is never resized either — the run therefore reaches a steady state after the
 /// first fullsweep and the capacities are an assertable constant.
 fn policy() -> HeapPolicy {
