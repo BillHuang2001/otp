@@ -433,6 +433,7 @@ impl PortRegistry {
         };
         mode.is_active()
     }
+
     /// `id`'s mirrored `{exit_on_close, …}` flag, defaulting to the C's `true`
     /// (`desc->inet.exitf = 1`, `inet_drv.c:10929`).
     ///

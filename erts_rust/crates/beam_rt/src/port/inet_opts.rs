@@ -264,6 +264,7 @@ impl PortInetOptions {
         self.active_mode()
             .map(|active| ActiveMode::from_parts(active, self.active_count))
     }
+
     /// The driver's current `{exit_on_close, …}` flag, if a record has been seen — the C's
     /// `desc->inet.exitf` ([`INET_LOPT_EXITONCLOSE`], `inet_drv.c:904`).
     ///

@@ -1743,7 +1743,8 @@ impl PortRegistry {
         // The round harvested the replies the drivers just wrote (and every other live port's
         // buffered input along with them — a round drains them all), so its notifications are
         // **retained** here for the next pump: the queue they came from is already empty.
-        let mut events = Vec::new();        self.fold_notifications(notifications, &mut events)?;
+        let mut events = Vec::new();
+        self.fold_notifications(notifications, &mut events)?;
         self.pending_events.extend(events);
         self.pending_events.extend(completions);
         let active = self.drain_active_inputs();
@@ -1845,7 +1846,8 @@ impl PortRegistry {
         // drain is unconditional, because a failing control call must not also lose the reply
         // it staged.
         self.drain_active_spends();
-        let completions = self.drain_io_completions(None);        self.pending_events.extend(completions);
+        let completions = self.drain_io_completions(None);
+        self.pending_events.extend(completions);
         // The same callback is where a socket driver stages an `{active, …}` delivery (a
         // `setopts` that reads inline does), so that channel is drained here too.
         let active = self.drain_active_inputs();
@@ -2165,7 +2167,8 @@ impl PortRegistry {
         // the same breath; a spend for this port lands on a mirror `extras.forget_port` has already
         // dropped, which is the intended no-op (a dead socket has no mode).
         self.drain_active_spends();
-        let completions = self.drain_io_completions(snapshot);        self.pending_events.extend(completions);
+        let completions = self.drain_io_completions(snapshot);
+        self.pending_events.extend(completions);
         // The teardown's round is a drive point for the `{active, …}` channel as well. A delivery
         // staged for **this** port has no metadata any more, so the drain drops it — the
         // completion channel's rule — while a delivery staged for another live port is held like
@@ -2261,7 +2264,8 @@ impl PortRegistry {
             // drain comes first — a spend harvested after the closes it precedes would apply to a
             // mirror the next round already replaced (see [`PortRegistry::drain_active_spends`]).
             self.drain_active_spends();
-            self.report_pending_closes(&mut events)?;            // That round is also a drive point for the completion channel (it is what mints a
+            self.report_pending_closes(&mut events)?;
+            // That round is also a drive point for the completion channel (it is what mints a
             // close report, and a close is where a driver answers its queued operations), so it
             // is drained here — otherwise a completion awaiting the last port's teardown would
             // be stranded for ever.
@@ -2363,7 +2367,8 @@ impl PortRegistry {
             // the mode the driver now holds is the one a later peer-close gate must read (see
             // [`PortRegistry::drain_active_spends`]).
             self.drain_active_spends();
-            // The **completion channel** is drained on *every* round, immediately after the            // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
+            // The **completion channel** is drained on *every* round, immediately after the
+            // tasks: a driver stages an `{inet_reply, …}`/`{inet_async, …}` from inside a task
             // (or from `output`/`control`), and the port keeps it until a drain takes it, so
             // deferring the drain until something else looked non-empty would starve a caller
             // blocked on that very message (see [`completion`]).
