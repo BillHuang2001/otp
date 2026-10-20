@@ -94,50 +94,37 @@
 //!   `DOP_MONITOR_P_EXIT`, `DOP_DEMONITOR_P`, `DOP_ALIAS_SEND` — routed by the sender's
 //!   `DistLinks` (one table over both halves) and honoured by the receiver.
 //! * **the inbound half**: the *peer* acting on a process **we** host — its `link/1` and
-//!   `exit/2` (`DOP_EXIT`, `DOP_EXIT2`) reaching our own victims, and our own local monitor
-//!   reading back the death of a non-trapping one. Sections 1-7 all have the relationship
-//!   initiated from the side that hosts it; sections 8-10 are the mirror, and the mirror is
-//!   a different code path (this runtime's *inbound* receipt primitives rather than its
-//!   outbound routing).
+//!   `exit/2` (`DOP_LINK` + the `links` item it produces, `DOP_EXIT`, `DOP_EXIT2`) and its
+//!   `erlang:monitor/2` (`DOP_MONITOR_P` + the inbound `DOP_MONITOR_P_EXIT`) reaching our own
+//!   victims, and our own local monitor reading back the death of a non-trapping one.
+//!   Sections 1-7 all have the relationship initiated from the side that hosts it; sections
+//!   8-12 are the mirror, and the mirror is a different code path (this runtime's *inbound*
+//!   receipt primitives rather than its outbound routing).
 //! * **identifier round trips**: a pid inside `{'EXIT', Pid, Reason}` and inside
 //!   `{'DOWN', Ref, process, Pid, Reason}` must be `=:=` the pid that was handed over
 //!   earlier, and a pid echoed through the peer must come back `=:=` `self()`.
 //!
-//! # A measured rust↔rust divergence: the peer's *outbound control* is queued, a message
-//! # is not
+//! # The ordering rule a control signal relies on: a message write drains the queue first
 //!
-//! Two of the four inbound families measured in this direction do **not** agree between
-//! two `beam_rt` nodes, so they are deliberately **not** pinned here (a divergence is
-//! reported, never pinned with a weakened assertion):
+//! Two inbound families are observable only if a control signal the peer creates is applied
+//! **before** the next message the peer sends on the same link: the `links` item an inbound
+//! `DOP_LINK` produces (the peer's `link/1` then a barrier), and the `monitored_by` item an
+//! inbound `DOP_MONITOR_P` produces (the peer's `monitor/2` then a `{monitoring, …}` notice,
+//! after which our victim dies). This runtime's `DistSignalRouter` can only *queue* a
+//! process-table control signal — it is flushed at the client's next `pump` — while a message
+//! to a remote destination is written at the call, so the write is where the ordering exists:
+//! `DistClient`'s three message sends (`send_reg_send`/`send_message_pid`/`send_alias`) drain
+//! the link's queued control signals (`flush_queued_controls`) before writing their own
+//! frame, exactly as ERTS writes a control synchronously when the signal is created under the
+//! link lock. The rule and its pinning test are `src/dist_client/CONTEXT.md`'s; both families
+//! are pinned below, in both directions (here and against a real `erl` peer in
+//! [`tests/dist_two_vm.rs`](../dist_two_vm.rs)).
 //!
-//! * the peer's inbound `DOP_LINK` **record** — `process_info(Victim, links)` reports
-//!   `LINKS_LINKED 0 []` then `LINKS_UNLINKED 1 [true]`, i.e. the item lags one barrier
-//!   step (an ERTS peer reports `1 [true]` then `0 []`);
-//! * the peer's `erlang:monitor/2` of one of **our** processes — the monitor never arms:
-//!   `MONITORED_BY 0 []` on our side and `PEER_DOWN_TIMEOUT` on the peer's (an ERTS peer
-//!   gets `MONITORED_BY 1 [true]` and the `DOWN`).
-//!
-//! One root cause covers both. A process-table control signal (`link`/`unlink`/`monitor`)
-//! leaves this runtime **queued** — `DistSignalRouter::route` →
-//! `DistClientInner::queue_signal`, flushed only at the client's next `pump`
-//! (`flush_pending`) — while a *message* to a remote destination
-//! (`DOP_REG_SEND`/`DOP_SEND`, `DistLinks::route_control`/`route_message`) is written to
-//! the socket at the call. A barrier (or a `{monitoring, …}` notice) sent right after the
-//! call therefore **overtakes** the not-yet-flushed control signal on the same link, so the
-//! peer's synchronous read of the recorded state sees it one step late. In the monitor case
-//! the `DOP_MONITOR_P` then lands after our victim has already died, and an inbound
-//! monitor for a non-live target is dropped (`LocalDeliverySink::resolve_live`), so no
-//! `DOP_MONITOR_P_EXIT` is ever emitted. ERTS writes the signal synchronously under the
-//! link lock, which is why a real `erl` peer has no such window.
-//!
-//! Every `dist_two_vm.rs` case over the same fixtures **passes**, so this is a
-//! rust↔rust-only ordering asymmetry, not a wire or a codec defect.
-//!
-//! The `demonitor` sub-arm of the monitor family is *not measurable* on a `beam_rt` peer for
-//! an unrelated reason: the fixture's `monitor_then_demonitor/1` renders the victim with
-//! `pid_text/1`, and `erlang:pid_to_list/1` of an external pid is an **uncatchable**
-//! capability gap (below), so the peer dies with exit 3 `beam_rt: unsupported: bif` before
-//! the relationship is armed. There is no `ask_victim_rust/2`-based demonitor actor yet.
+//! The monitor family's **demonitor** sub-arm is *not measurable* on a `beam_rt` peer: the
+//! fixture's `monitor_then_demonitor/1` renders the victim with `pid_text/1`, and
+//! `erlang:pid_to_list/1` of an external pid is an **uncatchable** capability gap (below), so
+//! the peer dies with exit 3 `beam_rt: unsupported: bif` before the relationship is armed.
+//! There is no `ask_victim_rust/2`-based demonitor actor yet.
 //!
 //! # Running it
 //!
@@ -197,6 +184,14 @@ const RR_PEER_LINK_DEATH_PLAIN_SPEC: &str = "two_vm:peer_link_death_plain/1";
 /// [`a_rust_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill`]: the
 /// peer's `erlang:exit/2` over the whole `{plain,kill} x {trapping,not}` matrix.
 const RR_PEER_EXIT2_SPEC: &str = "two_vm:peer_exit2/1";
+/// [`a_rust_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`]: the peer's
+/// `link/1`, a barrier, its `unlink/1` and a second barrier, against a victim we host — the
+/// responder reports that victim's `process_info(Victim, links)` item after each barrier.
+const RR_PEER_DRIVES_LINKS_SPEC: &str = "two_vm:peer_drives_links/1";
+/// [`a_rust_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason`]: the peer's
+/// `erlang:monitor/2` of a victim we host, our victim's death of `{boom,[1,2,3]}`, and the
+/// `{'DOWN', …}` the peer forwards back to us.
+const RR_PEER_MONITORS_SPEC: &str = "two_vm:peer_monitors/1";
 
 // ---------------------------------------------------------------------------------------
 // 1. The handshake, in both directions
@@ -614,18 +609,22 @@ fn our_pid_survives_a_round_trip_through_a_rust_peer() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 8-10. The inbound half: the **peer** acts on a process *we* host
+// 8-12. The inbound half: the **peer** acts on a process *we* host
 //
 //   Sections 1-7 all have our node (or the peer) acting on a process that lives on the
-//   *peer*. These three are the mirror — the peer's `link/1` and `exit/2` aimed at a victim
+//   *peer*. These five are the mirror — the peer's `link/1` and `exit/2` aimed at a victim
 //   our own node hosts, which is the direction ERTS calls the *inbound*
-//   `DOP_LINK`/`DOP_EXIT`/`DOP_EXIT2` (`dist.c:2224`, `:2760`, `:2824`).
-//   `tests/dist_two_vm.rs` pins the same three families against a real `erl` peer; here the
-//   peer is this runtime, so the wire has this runtime's encoder on **both** ends.
+//   `DOP_LINK`/`DOP_EXIT`/`DOP_EXIT2` (`dist.c:2224`, `:2760`, `:2824`), plus the two
+//   families whose *record* has to be visible before the peer's next message: the `links`
+//   item an inbound `DOP_LINK` installs (section 11) and the `monitored_by` item an inbound
+//   `DOP_MONITOR_P` installs (section 12). `tests/dist_two_vm.rs` pins the same five against
+//   a real `erl` peer; here the peer is this runtime, so the wire has this runtime's encoder
+//   on **both** ends.
 //
-//   Two families of the four measured in this direction are *not* here, because they do
-//   not yet agree between two `beam_rt` nodes (a **reported** finding, never a weakened
-//   assertion — see the module docs' `# A measured rust↔rust divergence` section).
+//   All four inbound families measured in each direction are therefore covered here. The
+//   ordering the two *record* families need is the write-path rule the module docs state: a
+//   message write drains the link's queued control signals first, so a control signal created
+//   earlier can never be overtaken by a later message on the same link.
 // ---------------------------------------------------------------------------------------
 
 /// **A `beam_rt` peer's death travels *inbound* and our trapping process traps its
@@ -805,5 +804,148 @@ fn a_rust_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_k
         "missing",
         "every label matched a receipt, so no row reported a missing outcome",
     );
+    pair.finish();
+}
+
+// ---------------------------------------------------------------------------------------
+// 11-12. The two inbound families whose **record** must be visible ahead of the peer's next
+//        message: the `links` item an inbound `DOP_LINK` installs, and the `monitored_by`
+//        item an inbound `DOP_MONITOR_P` installs
+//
+//   Both are the mirror of a `dist_two_vm.rs` case over the same responder/actor pair, and
+//   both read a *record* rather than an event, so they pin the write-path ordering rule the
+//   module docs state: the peer creates the control signal (its `link/1`, its `monitor/2`),
+//   then writes a message on the same link (a barrier, a `{monitoring, …}` notice), and our
+//   node must already have applied the control signal when that message is processed.
+// ---------------------------------------------------------------------------------------
+
+/// **A `beam_rt` peer's `link/1` shows up in the victim's `links` item, and its `unlink/1`
+/// clears it** — the inbound `DOP_LINK`/`DOP_UNLINK_ID` as *our own* process reports them,
+/// with the peer's barrier message never overtaking the control signal that precedes it.
+///
+/// The mirror of
+/// [`dist_two_vm.rs`'s `a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`](../dist_two_vm.rs),
+/// over the same responder (`two_vm:peer_drives_links/1`) and the same actor
+/// (`link_and_unlink/1`). The peer `link/1`s the victim, takes a barrier round trip, then
+/// `unlink/1`s it and takes a second one; the responder reports the victim's
+/// `process_info(Victim, links)` item after each ack. The victim is **never killed** — it
+/// answers a round-trip probe after the second barrier (`VICTIM_ALIVE`) — so the only thing
+/// that differs between the two reports is the peer's own link, and an emptied item cannot
+/// be explained by a dead process.
+///
+/// The claim is `LINKS_FRESH 0 []` (the empty baseline, taken before the peer did anything)
+/// → `LINKS_LINKED 1 [true]` → `LINKS_UNLINKED 0 []`. Every report is the item's **shape**,
+/// `length/1` plus one `is_pid/1` per element: the entry the peer arms is an *external* pid,
+/// which this runtime cannot render at all (`beam_bifs`'s `external_channel_gap`, an
+/// uncatchable capability gap), so printing one would kill this VM with exit 3.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_link_shows_up_in_the_links_item_and_clears_on_unlink() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_links_item",
+        RR_PEER_DRIVES_LINKS_SPEC,
+        "link_and_unlink",
+    ) else {
+        return;
+    };
+    // The pid whose item is reported: one of ours, so it renders as `<0.number.serial>`
+    // (a *local* pid — the peer is the one that sees it as remote).
+    let victim = pair.runtime_text("VICTIM ");
+    assert!(
+        victim.starts_with("<0."),
+        "the victim must be a local pid of ours, printed as `<0.number.serial>`, not `{victim}`\n{}",
+        pair.diagnostics()
+    );
+    // Before the peer acts: a freshly spawned child has no links at all.
+    pair.runtime_equals("LINKS_FRESH ", "LINKS_FRESH 0 []");
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The peer holds a pid term (a remote pid is unprintable there, so it proves the type).
+    pair.actor_equals("LINK_VICTIM_IS_PID ", "LINK_VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // The peer's `link/1` was applied **before** the barrier it wrote right after the call:
+    // exactly one entry, and it is a pid.
+    pair.runtime_equals("LINKS_LINKED ", "LINKS_LINKED 1 [true]");
+
+    pair.actor_equals("UNLINKED", "UNLINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // … and its `unlink/1` cleared it again, with the victim still running.
+    pair.runtime_equals("LINKS_UNLINKED ", "LINKS_UNLINKED 0 []");
+    pair.actor_equals("VICTIM_ALIVE", "VICTIM_ALIVE");
+
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW links_reported");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    // Every report read a real `{links, …}` item (a missing one prints `… NOITEM …`), and the
+    // session took exactly the two barrier round trips the protocol defines.
+    pair.assert_no_substring(
+        &pair.runtime,
+        "NOITEM",
+        "every `links` report was taken from a real `process_info/2` reply",
+    );
+    pair.assert_absent(
+        &pair.runtime,
+        &["LINKS_LATER", "PARENT_TIMEOUT"],
+        "the session took exactly the two barrier round trips the protocol defines",
+    );
+    pair.finish();
+}
+
+/// **A `beam_rt` peer's `erlang:monitor/2` of our process really arms, and its
+/// `{'DOWN', …}` carries the boxed reason back over the wire** — the inbound
+/// `DOP_MONITOR_P` record and the outbound `DOP_MONITOR_P_EXIT` between two `beam_rt` nodes.
+///
+/// The mirror of
+/// [`dist_two_vm.rs`'s `a_real_erl_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason`](../dist_two_vm.rs),
+/// over the same responder (`two_vm:peer_monitors/1`) and the same actor
+/// (`actor_monitor_down/1`). `MONITORED_BY 1 [true]` is what makes the case non-vacuous in
+/// the other direction: our node really recorded the peer's `DOP_MONITOR_P` against the
+/// victim — the item is a **shape** (its length plus one `is_pid/1` per element), because the
+/// watcher is an external pid this runtime cannot render — *before* the victim died, so the
+/// `{'DOWN', …}` below cannot be an accident of ordering.
+///
+/// The peer then forwards the whole tuple back, and every slot is asserted here: the size,
+/// the head, that the reference is a reference (the peer minted it, so it can be compared
+/// with nothing we hold), the kind, the object (`=:=` our own pid after its round trip
+/// through the peer) and the reason term itself.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_inbound_monitor",
+        RR_PEER_MONITORS_SPEC,
+        "actor_monitor_down",
+    ) else {
+        return;
+    };
+    // Our node recorded the peer's monitor of the victim before the victim died — read off
+    // the victim's own `monitored_by` item, as a shape.
+    pair.runtime_equals("MONITORED_BY ", "MONITORED_BY 1 [true]");
+    // The forwarded `{'DOWN', Ref, process, OurPid, Reason}`, slot by slot.
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_HEAD ", "DOWN_HEAD true");
+    pair.runtime_equals("DOWN_REF ", "DOWN_REF true");
+    pair.runtime_equals("DOWN_KIND ", "DOWN_KIND true");
+    pair.runtime_equals("DOWN_OBJ ", "DOWN_OBJ true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON {boom,[1,2,3]}");
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    // `erlang:monitor/2` answered a reference (the peer's own, which it binds in its clause).
+    pair.actor_equals("MONITORING ", "MONITORING true");
+    // The peer's own view of the reason it received (its observation, not the assertion).
+    pair.actor_equals("PEER_DOWN_REASON ", "PEER_DOWN_REASON {boom,[1,2,3]}");
+    pair.assert_absent(
+        &pair.runtime,
+        &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
+        "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
     pair.finish();
 }
