@@ -97,10 +97,11 @@
 %%
 %% An update_record instruction is disassembled as
 %%
-%%     {update_record,{atom,Hint},Size,Src,SrcFun,Dst,{list,Updates}}
+%%     {update_record,Hint,Size,Src,Dst,{list,Updates}}
 %%
-%% i.e. the hint is element(2, Instr) and is one of {atom,copy},
-%% {atom,inplace} or {atom,reuse}. Functions whose record updates are
+%% i.e. the instruction is a 6-element tuple, the hint is element(2, Instr)
+%% and is one of {atom,copy}, {atom,inplace} or {atom,reuse} (beam_disasm
+%% leaves the hint argument unresolved). Functions whose record updates are
 %% constant-folded away before the SSA passes contain no update_record
 %% instruction at all; that case is exercised (and documented) by the
 %% `literal_sources' probe functions.
