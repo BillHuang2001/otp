@@ -599,10 +599,11 @@ impl Driver for FdDriver {
     ///
     /// `stop` never touches the port's output queue, so a byte still queued when it runs is gone
     /// with the descriptors. That is correct because the port only calls it once the queue is
-    /// **empty**: the C's `terminate_port` — the sole caller of `drv->stop` — runs only when
-    /// `is_port_ioq_empty(p)` (`erts/emulator/beam/io.c:3697-3700`, `:3733-3752`), and a close with a
-    /// non-empty ioq parks the port in `ERTS_PORT_SFLG_CLOSING` instead (`io.c:896-900`,
-    /// `:3936-3942`). [`crate::Port::close`] keeps that split: the drain
+    /// **empty**: the C's `terminate_port` — the sole caller of `drv->stop` (`io.c:3752`) — is
+    /// reached only when
+    /// `is_port_ioq_empty(p)` (`erts/emulator/beam/io.c:3696-3699`), and a close with a
+    /// non-empty ioq parks the port in `ERTS_PORT_SFLG_CLOSING` instead (`io.c:3968-3971`,
+    /// `:3946-3954`). [`crate::Port::close`] keeps that split: the drain
     /// ([`crate::Port::drain_output_during_close`], the ordinary `OUTPUT` task) must empty the queue
     /// before [`crate::Port::finish_close`] reaches `stop`, and otherwise the port stays live in
     /// [`crate::PortState::Closing`] with its write readiness armed until
@@ -614,14 +615,15 @@ impl Driver for FdDriver {
     /// byte). The only path that reaches `stop` with a non-empty queue is the **forced** teardown
     /// after a `driver_failure*` ([`crate::PortRegistry`]'s `reap_failures` → `close_now`), which is
     /// the C's own `prt->ioq.size = 0` work-around for a driver that has just declared itself broken
-    /// (`io.c:7215-7219`).
+    /// (`io.c:7220`).
     ///
     /// # Why there is no [`Driver::flush`] override
     ///
     /// The C `fd` driver's `fd_flush` only latches a flag — it writes **nothing**
     /// (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`; the "we now flush before terminating"
     /// guarantee is documented at `:900-907`). The writing is done by its `ready_output`
-    /// (`sys_drivers.c:1448-1471`), which keeps running while the port is `CLOSING` and, once the
+    /// (`sys_drivers.c:1448-1493`, `writev` at `:1473`), which keeps running while the port is
+    /// `CLOSING` and, once the
     /// queue emptied with the latch set, ends the port with `driver_failure_atom(port, "normal")`
     /// (`:1468-1469`). That `terminating` latch is therefore just "when the queue empties,
     /// terminate" — which this port layer *is*: its `Closing` state plus the drain loop that runs

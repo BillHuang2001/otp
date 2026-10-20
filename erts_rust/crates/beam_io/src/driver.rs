@@ -109,7 +109,7 @@ impl DriverFlags {
 /// | `NULL` | set | `[]` | `io.c:4134` (`if (!resp_bufp) return NIL;`) |
 /// | `NULL` | clear | `[]` | `io.c:4134` |
 /// | buffer, 0 bytes | set | `<<>>` | `io.c:4136-4162` (a zero-bit bitstring) |
-/// | buffer, 0 bytes | clear | `[]` | `io.c:4163-4166` (`buf_to_intlist`) |
+/// | buffer, 0 bytes | clear | `[]` | `io.c:4170-4174` (`buf_to_intlist` at `:4171`) |
 ///
 /// Collapsing the two into one empty byte slice is exactly what loses the first row: the runtime
 /// then renders its `PORT_CONTROL_FLAG_BINARY` answer (`<<>>`) where the oracle answers `[]`. Hence
@@ -403,7 +403,7 @@ impl<'a> DriverContext<'a> {
     /// owner called. The inet driver uses it for the two families
     /// [`CompletionEvent`] models: the `{inet_reply, Port, Reply[, Tag]}` answer to a
     /// `port_command` (`inet_reply_am`/`inet_reply_error_am`/`inet_reply_finish`,
-    /// `erts/emulator/drivers/common/inet_drv.c:2606-2680`) and the
+    /// `erts/emulator/drivers/common/inet_drv.c:2617-2740`) and the
     /// `{inet_async, Port, Id, Result}` completion of a queued asynchronous operation
     /// (`send_async_ok`/`send_async_ok_port`/`send_async_error`, `:2493-2562`). See the
     /// [`crate::completion`] module docs for the channel's contract.
@@ -441,8 +441,8 @@ impl<'a> DriverContext<'a> {
     /// `{active, true}` / `{active, N}` / `{active, once}` socket sends its owner when input
     /// arrives:
     ///
-    /// * `tcp_message` (`erts/emulator/drivers/common/inet_drv.c:3979`) — `{tcp, S, Data}`;
-    /// * `packet_binary_message` (`:4110`) — the `{tcp, S, Data}` shape of a `{packet, N}` stream
+    /// * `tcp_message` (`erts/emulator/drivers/common/inet_drv.c:3987`) — `{tcp, S, Data}`;
+    /// * `packet_binary_message` (`:4106`) — the `{tcp, S, Data}` shape of a `{packet, N}` stream
     ///   port, where the framing header is `read.header` and the payload `read.body`;
     /// * `packet_passive_message` (`:4215`) — `{tcp_passive, S}` / `{udp_passive, S}` when an
     ///   `{active, N}` counter runs out ([`ActiveInputEvent::Passive`], which carries no atom:
@@ -685,8 +685,9 @@ pub trait Driver: core::any::Any {
     /// This is the accessor a runtime reads **once per port-task round** to deliver the oracle's
     /// peer-close message (`{tcp_closed, Port}`, `{udp_closed, Port}`, …): the C has no separate
     /// notification for it either — the driver learns of the close inside its own `ready_input`
-    /// and the emulator turns that into a message (`tcp_inet_input` → `tcp_recv_closed`,
-    /// `erts/emulator/drivers/common/inet_drv.c:13202`).
+    /// and the emulator turns that into a message (`tcp_inet_input` `:13461` →
+    /// `tcp_recv_closed`, `erts/emulator/drivers/common/inet_drv.c:12783`, which sends
+    /// `tcp_closed_message`, `:4058`).
     ///
     /// The answer is **latched and sticky**: once a driver has observed the close it keeps
     /// answering `true` for the rest of the port's life, because the runtime may drain the round
@@ -917,17 +918,18 @@ pub trait Driver: core::any::Any {
     /// (`erts/emulator/beam/io.c:3659-3700`, `flush_port`).
     ///
     /// The C calls it only when the entry's `flush` pointer is non-`NULL`
-    /// (`if (p->drv_ptr->flush != NULL)`, `io.c:3663`), from `flush_port`, which runs when a port
+    /// (`if (p->drv_ptr->flush != NULL)`, `io.c:3664`), from `flush_port`, which runs when a port
     /// being closed still has a non-empty ioq
-    /// (`erts_deliver_port_exit`, `io.c:3936-3942`); `flush_port` then terminates the port **only
-    /// if the ioq became empty** (`io.c:3697-3700`). So `flush` is where a driver says "these
+    /// (`erts_deliver_port_exit`, `io.c:3946-3954`, `flush_port(prt)` at `:3952`); `flush_port`
+    /// then terminates the port **only
+    /// if the ioq became empty** (`io.c:3696-3699`). So `flush` is where a driver says "these
     /// bytes are obsolete, drop them" (the C `tcp_inet` discards the queue only when write
     /// readiness is *not* armed, `inet_drv.c:12708-12731`), and where a driver that has nothing to
     /// say inherits this default.
     ///
     /// The default ([`Ok(())`], discarding nothing) is exactly the C's `flush == NULL` case: every
     /// built-in driver without a flush of its own, and `ram_file_drv`'s entry is literally
-    /// `flush = NULL` (`erts/emulator/drivers/common/ram_file_drv.c:116-126`). A driver that
+    /// `flush = NULL` (`erts/emulator/drivers/common/ram_file_drv.c:120`). A driver that
     /// consumes output synchronously in [`Driver::output`] (as `ram_file_drv` does) therefore
     /// never has a queue to discard here and needs no override.
     ///

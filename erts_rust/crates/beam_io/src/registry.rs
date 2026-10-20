@@ -194,7 +194,7 @@ impl PortRegistry {
             let _teardown = port.close(poller);
             // A failed `start` must not leave a port parked in `Closing` behind either: its number
             // is released here, so its `stop` has to run now (the C's `driver_failure_term` zeroes
-            // the ioq before closing, `erts/emulator/beam/io.c:7215-7219`).
+            // the ioq before closing, `erts/emulator/beam/io.c:7220`).
             if port.is_closing() {
                 let _forced = port.finish_close(poller);
             }
@@ -426,7 +426,8 @@ impl PortRegistry {
         self.reap_failures(poller)?;
 
         // A close that could not drain synchronously parks its port in `CLOSING` (the C's
-        // `ERTS_PORT_SFLG_CLOSING`, `erts/emulator/beam/io.c:896-900`); finish it here — after the
+        // `ERTS_PORT_SFLG_CLOSING`, `erts/emulator/beam/erl_port.h:326`; the Limbo state,
+        // `erts/emulator/beam/io.c:3968-3971`); finish it here — after the
         // failure sweep, before the closes are reported — so a port whose queue empties this round
         // is reported as `Closed` in this same round. An error from it leaves `self.closed`
         // untouched, so every close already queued stays queued for the next round.
@@ -1081,9 +1082,9 @@ impl PortRegistry {
     /// its driver's `stop` not run and its poller registrations still armed, so the rounds that
     /// follow finish the write
     /// ([`PortRegistry::finish_closing_ports`]) — exactly the C's `ERTS_PORT_SFLG_CLOSING`
-    /// "Limbo" state, where the port "receives in/out-put events so as soon as the port queue gets
-    /// empty `terminate_port()` is called" (`erts/emulator/beam/io.c:896-900`,
-    /// `erts_deliver_port_exit` `io.c:3936-3942`).
+    /// "Limbo" state (`io.c:3968-3971`), where the port "receives in/out-put events so as soon as
+    /// the port queue gets
+    /// empty `terminate_port()` is called" (`erts_deliver_port_exit`, `io.c:3946-3954`).
     ///
     /// [`PortRegistry::is_closing`] is the probe a caller uses to learn that a close parked; the
     /// port is reported as a [`PortNotification::Closed`] by the round that removes it, and only
@@ -1193,7 +1194,7 @@ impl PortRegistry {
     ///
     /// The deferred half of [`PortRegistry::close`], and the Rust analogue of
     /// `erts_port_driver_callback_epilogue`: the C terminates a `CLOSING` port whose ioq became
-    /// empty at a driver-callback epilogue (`erts/emulator/beam/erl_port.h:797-813`), so a close
+    /// empty at a driver-callback epilogue (`erts/emulator/beam/erl_port.h:798-812`), so a close
     /// that could not drain synchronously finishes on the rounds that follow. Each live closing
     /// port is re-drained under one [`DEFAULT_READINESS_RED_BUDGET`] (the same
     /// [`Port::drain_output_during_close`] the begin half uses, so the write-accounting check stays
@@ -1253,7 +1254,7 @@ impl PortRegistry {
     ///
     /// The path a driver-triggered close takes ([`PortRegistry::reap_failures`]): the C's
     /// `driver_failure_term` zeroes the ioq before handing the port to
-    /// `erts_deliver_port_exit` (`prt->ioq.size = 0`, `erts/emulator/beam/io.c:7215-7219`), so the
+    /// `erts_deliver_port_exit` (`prt->ioq.size = 0`, `erts/emulator/beam/io.c:7220`), so the
     /// failure path never parks in `CLOSING` the way a caller-initiated close may — the driver
     /// whose queue we would be draining has just declared itself broken.
     ///
@@ -1317,7 +1318,7 @@ impl PortRegistry {
     /// So the port is reaped here, at the end of every entry point that drove a driver, through
     /// [`PortRegistry::close_now`] — the flush-then-close shape's **forced** arm, because a failed
     /// driver must not park a port in `CLOSING` waiting for a queue it can no longer write (the C
-    /// zeroes the ioq on this path, `erts/emulator/beam/io.c:7215-7219`): the driver's `stop` runs,
+    /// zeroes the ioq on this path, `erts/emulator/beam/io.c:7220`): the driver's `stop` runs,
     /// the port leaves the live map, its staged completions are harvested, and its number is
     /// retired when the deferred [`PortNotification::Closed`] is minted — never here.
     ///
@@ -2129,7 +2130,7 @@ mod tests {
 
     /// `take_eof` is the crate's driver-end-of-file observation point, so a reported
     /// end-of-file releases the pending partial line for the next round's harvest — the C's
-    /// `driver_eof` → `flush_linebuf_messages` (`io.c:7211`).
+    /// `driver_eof` → `flush_linebuf_messages` (`io.c:3475`, called at `io.c:7211`).
     #[test]
     fn take_eof_flushes_the_pending_partial_line() {
         let mut poller = poller();

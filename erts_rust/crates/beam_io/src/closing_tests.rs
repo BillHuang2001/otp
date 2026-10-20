@@ -23,12 +23,12 @@
 //! delivers all of it (`erlang:port_command(P, Data)` then `erlang:port_close(P)` — measured, a
 //! `tee` child received 500 000/500 000 bytes while `port_close/1` returned `true` with 454 656
 //! bytes still queued, so the drain is asynchronous, not part of the close's return). The C's
-//! shape is `erts_deliver_port_exit` (`erts/emulator/beam/io.c:3936-3942`): a close with a
+//! shape is `erts_deliver_port_exit` (`erts/emulator/beam/io.c:3946-3954`): a close with a
 //! non-empty ioq sets `ERTS_PORT_SFLG_CLOSING` and calls `flush_port`, which runs the driver's
 //! `flush` (only when the entry has one) and terminates the port **only if the ioq became empty**
-//! (`io.c:3659-3700`); `terminate_port` is the sole caller of `drv->stop` (`io.c:3733-3752`), and
+//! (`io.c:3659-3700`); `terminate_port` is the sole caller of `drv->stop` (`io.c:3752`), and
 //! a CLOSING port is "in Limbo, waiting to pass on … as soon as the port queue gets empty"
-//! (`io.c:896-900`, deferred half `erl_port.h:797-813`).
+//! (`io.c:3968-3971`, deferred half `erl_port.h:798-812`).
 //!
 //! Every case here runs over a plain-Rust [`ClosingDriver`] — no socket, no `cc` fixture, no
 //! `erl`, no wall-clock sleeping — whose ordered call log, accepted bytes and drain policy are all
@@ -206,7 +206,7 @@ fn round(poller: &mut Poller, registry: &mut PortRegistry) -> Vec<PortId> {
 ///
 /// `flush_port` calls `drv->flush` and only then terminates a now-empty port
 /// (`erts/emulator/beam/io.c:3659-3700`), and `terminate_port` is the sole caller of `drv->stop`
-/// (`io.c:3733-3752`) — so a driver may rely on `flush` → (drain) → `stop`.
+/// (`io.c:3752`) — so a driver may rely on `flush` → (drain) → `stop`.
 #[test]
 fn a_close_flushes_before_it_drains_and_stops_last() {
     let mut poller = poller();
@@ -224,7 +224,7 @@ fn a_close_flushes_before_it_drains_and_stops_last() {
     assert!(
         !registry.contains(id),
         "an emptied queue terminates the port inside the close (the C's `terminate_port`, \
-         io.c:3733-3752) — it leaves the live map"
+         io.c:3752) — it leaves the live map"
     );
     assert_eq!(
         round(&mut poller, &mut registry),
@@ -236,8 +236,8 @@ fn a_close_flushes_before_it_drains_and_stops_last() {
 
 /// A driver that accepts everything synchronously closes **inside** the `close` call: the port is
 /// `Closed`, all bytes are written, `stop` ran — and the `Closed` notification still rides the
-/// next port-task round (minting it is what retires the number, `io.c:3877-3880`'s deferred
-/// report).
+/// next port-task round (minting it is what retires the number, `terminate_port`'s
+/// `kill_port`-then-`{closed,…}` order, `io.c:3782-3794`).
 #[test]
 fn a_fully_written_command_closes_inside_the_close_call() {
     let mut poller = poller();
@@ -268,8 +268,9 @@ fn a_fully_written_command_closes_inside_the_close_call() {
 /// **The park**: a slow driver cannot write the whole command synchronously, so the port stays
 /// live in [`crate::PortState::Closing`] — exactly the C's Limbo state, where the port "receives
 /// in/out-put events so as soon as the port queue gets empty `terminate_port()` is called"
-/// (`ertes/emulator/beam/io.c:896-900`) — refuses further commands (`io.c:1440` answers `badarg`
-/// for `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-355`), and is
+/// (`erts/emulator/beam/io.c:3968-3971`) — refuses further commands (`io.c:1440-1441` answers
+/// `badarg`
+/// for `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-354`), and is
 /// drained by the rounds that follow. Only when the queue empties does `stop` run and its `Closed`
 /// arrive — with every byte delivered, never truncated.
 #[test]
@@ -390,7 +391,7 @@ fn a_driver_that_never_drains_is_torn_down_after_the_stall_limit() {
 
 /// A `flush` that discards the queue closes the port **inside** the `close` call: nothing is
 /// written, the queue is empty afterwards and `stop` runs at once — the C's
-/// `if (… && is_port_ioq_empty(p)) terminate_port(p);` (`io.c:3697-3700`).
+/// `if (… && is_port_ioq_empty(p)) terminate_port(p);` (`io.c:3696-3699`).
 #[test]
 fn a_flush_that_discards_the_queue_closes_the_port_inside_the_close_call() {
     let mut poller = poller();
@@ -413,8 +414,9 @@ fn a_flush_that_discards_the_queue_closes_the_port_inside_the_close_call() {
 }
 
 /// A `Closed` retires the port's **number** only when it is reported, so a `close` + `open` before
-/// the reporting round cannot make the report name a reused, live port (`io.c:3877-3880`'s
-/// deferred report; [`crate::PortRegistry::close`] states the rule).
+/// the reporting round cannot make the report name a reused, live port (`io.c:3782-3794`: the C
+/// removes the port from the table (`kill_port`) before it delivers `{closed, Port}`, so the
+/// message never names a live number; [`crate::PortRegistry::close`] states the rule).
 #[test]
 fn a_close_and_open_before_the_reporting_round_cannot_shadow_the_reported_number() {
     let mut poller = poller();

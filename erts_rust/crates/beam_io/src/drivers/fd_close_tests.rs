@@ -24,10 +24,10 @@
 //! closes them. It never writes to the output queue, so a byte still queued when it runs would be
 //! lost — which is exactly why the port only calls it once that queue is **empty**:
 //!
-//! * the C's `terminate_port` — the sole caller of `drv->stop` — is reached only when
-//!   `is_port_ioq_empty(p)` (`erts/emulator/beam/io.c:3697-3700`, `:3733-3752`), and a close with a
+//! * the C's `terminate_port` — the sole caller of `drv->stop` (`io.c:3752`) — is reached only when
+//!   `is_port_ioq_empty(p)` (`erts/emulator/beam/io.c:3696-3699`), and a close with a
 //!   non-empty ioq parks the port in `ERTS_PORT_SFLG_CLOSING` instead
-//!   (`io.c:896-900`, `:3936-3942`);
+//!   (`io.c:3968-3971`, `:3946-3954`);
 //! * this crate's [`crate::Port::close`] mirrors that split: the driver's `stop` runs from
 //!   [`crate::Port::finish_close`], which a close reaches only when the drain emptied the queue —
 //!   otherwise the port stays live in [`crate::PortState::Closing`] and
@@ -43,7 +43,7 @@
 //!
 //! The C `fd` driver's `fd_flush` only latches a flag; it writes nothing
 //! (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`, the guarantee documented at `:900-907`). The
-//! writing is done by its `ready_output` (`sys_drivers.c:1448-1471`), which keeps running while the
+//! writing is done by its `ready_output` (`sys_drivers.c:1448-1493`), which keeps running while the
 //! port is `CLOSING` and calls `driver_failure_atom(port, "normal")` once the queue emptied and the
 //! latch is set — i.e. the C's `terminating` flag is just "when the queue empties, terminate".
 //! This port layer already *is* that loop ([`crate::Port::drain_output_during_close`] runs the
@@ -119,7 +119,7 @@ fn round(poller: &mut Poller, registry: &mut PortRegistry) -> Vec<PortId> {
 ///
 /// The C agrees: a close with a non-empty ioq goes to `ERTS_PORT_SFLG_CLOSING`, where the port
 /// "receives in/out-put events so as soon as the port queue gets empty `terminate_port()` is
-/// called" (`erts/emulator/beam/io.c:896-900`, `erts_deliver_port_exit` `io.c:3936-3942`).
+/// called" (`erts/emulator/beam/io.c:3968-3971`, `erts_deliver_port_exit` `io.c:3946-3954`).
 #[test]
 fn a_short_write_parks_the_close_before_stop_runs() {
     let (peer, fd) = write_end();
@@ -177,7 +177,7 @@ fn a_short_write_parks_the_close_before_stop_runs() {
         "`FdDriver::stop` closes the write fd, so an attached fd proves it has not run"
     );
 
-    // A command on a closing port is the C's `badarg` (io.c:3877), not a second queue.
+    // A command on a closing port is the C's `badarg` (io.c:1440-1441), not a second queue.
     assert!(matches!(
         registry.port_command_with(&mut poller, id, b"late", PortCommandOptions::EMPTY),
         Err(BeamError::BadArg)
@@ -285,7 +285,7 @@ fn the_parked_remainder_is_delivered_in_full_by_the_rounds() {
 ///
 /// This is the half an `fd` `flush` override must not touch: the C `fd` driver discards nothing at
 /// close (`fd_flush` only latches `terminating`, `sys_drivers.c:1029-1034`), and the bytes are
-/// written by its `ready_output` (`sys_drivers.c:1448-1471`). Here that loop is the port's drain,
+/// written by its `ready_output` (`sys_drivers.c:1448-1493`). Here that loop is the port's drain,
 /// so the command a caller queued (`port_command/2` queues and returns) is written before `stop`.
 #[test]
 fn a_command_queued_before_a_close_is_written_by_the_close() {

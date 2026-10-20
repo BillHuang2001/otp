@@ -71,8 +71,8 @@
 //! sitting in the pipe and report `128 + 9` instead of the child's own status. The reference
 //! never kills a child to close a port either: `fd_flush` only latches `terminating`
 //! (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`), `ready_output` keeps writing while the
-//! `ioq` is non-empty (`:1448-1471`), and `drv->stop` — reached only with an empty queue —
-//! closes the descriptors, which is the child's end of file (`:1039-1053`).
+//! `ioq` is non-empty (`:1448-1493`), and `drv->stop` — reached only with an empty queue —
+//! closes the descriptors, which is the child's end of file (`:1039-1055`).
 //!
 //! The bounded wait also keeps draining what the child writes to its own **stdout**
 //! ([`SpawnDriver::drain_stdout_for_exit`]): the port's read direction is deregistered by then, so
@@ -204,8 +204,8 @@ const READ_CHUNK: usize = 64 * 1024;
 ///
 /// This is the bound the C does not need. There, a close never kills the child: the port stays in
 /// `ERTS_PORT_SFLG_CLOSING` while its `ioq` is non-empty, `ready_output` keeps `writev`-ing
-/// (`erts/emulator/sys/unix/sys_drivers.c:1448-1471`), and `drv->stop` only closes the descriptors
-/// — which is the child's end of file — after the queue is empty (`:1039-1053`). The emulator's
+/// (`erts/emulator/sys/unix/sys_drivers.c:1448-1493`), and `drv->stop` only closes the descriptors
+/// — which is the child's end of file — after the queue is empty (`:1039-1055`). The emulator's
 /// teardown may therefore block for as long as the child needs, and the child is reaped by
 /// `erl_child_setup` afterwards. This floor cannot afford that: [`Driver::stop`] runs on the
 /// runtime's single-threaded port pump, which must never stall the reactor (a `wait(2)` on a child
@@ -1339,8 +1339,8 @@ impl Driver for SpawnDriver {
     /// The C's `flush` does **nothing but latch** `dd->terminating = 1`
     /// (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`); the writing is done by the
     /// `ready_output` calls that follow on the still-`ERTS_PORT_SFLG_CLOSING` port
-    /// (`:1448-1471`), and once the `ioq` is empty that callback reports
-    /// `driver_failure_atom(port,"normal")` (`:1467-1468`), which is what terminates the port and
+    /// (`:1448-1493`), and once the `ioq` is empty that callback reports
+    /// `driver_failure_atom(port,"normal")` (`:1468-1469`), which is what terminates the port and
     /// runs its `stop`. This floor's `stop` is **synchronous** — [`crate::Port::close`] has already
     /// drained the output queue into the kernel pipe by the time it calls it — so the latch's
     /// consumer is the teardown itself: a flushed port's `stop` gives the child end of file and

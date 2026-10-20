@@ -91,7 +91,7 @@ pub const DEFAULT_READINESS_RED_BUDGET: usize = PORT_REDS_EXECUTE;
 /// stops waiting for its output queue to empty (see [`Port::close`]).
 ///
 /// The C has no such bound: a CLOSING port is "in Limbo, waiting to pass on … as soon as the port
-/// queue gets empty `terminate_port()` is called" (`erts/emulator/beam/io.c:896-900`), so it waits
+/// queue gets empty `terminate_port()` is called" (`erts/emulator/beam/io.c:3968-3971`), so it waits
 /// for as long as the driver keeps the port alive. Waiting is right — the bytes are the caller's
 /// — but waiting **for ever** on a driver that cannot write a single byte would hold the port
 /// number, its descriptors and its poller registrations indefinitely, and the owner would never
@@ -242,10 +242,10 @@ impl Port {
     ///
     /// This is the C's `ERTS_PORT_SFLG_CLOSING`, "a state where the port is in Limbo, waiting to
     /// pass on … as soon as the port queue gets empty `terminate_port()` is called"
-    /// (`erts/emulator/beam/io.c:896-900`): the port is still live and still registered with the
+    /// (`erts/emulator/beam/io.c:3968-3971`): the port is still live and still registered with the
     /// poller (so write readiness can finish the write), its driver's `stop` has **not** run, and
-    /// a command handed to it is refused (`io.c:1440` answers `badarg` for
-    /// `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-355`).
+    /// a command handed to it is refused (`io.c:1440-1441` answers `badarg` for
+    /// `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-354`).
     ///
     /// "Waiting for the queue" is [`Port::output_len`] — the output queue is the one thing a
     /// parked port still owes, so it is the probe rather than a duplicate flag: `is_closing() &&
@@ -748,7 +748,8 @@ impl Port {
 
     /// Releases the pending partial line as `noeol` frame(s) for the next harvest.
     ///
-    /// This is the C's `flush_linebuf`/`flush_linebuf_messages` (`io.c:7221`), which the port
+    /// This is the C's `flush_linebuf`/`flush_linebuf_messages` (`io.c:3475`, called only from
+    /// `driver_eof`, `io.c:7211`), which the port
     /// runs from `driver_eof`: when a `{line, N}` port's input stream ends, the bytes held
     /// back because no `\n` had arrived yet are delivered **once** as a `noeol` frame
     /// (`{Port, {data, {noeol, Data}}}`) — the oracle's `printf 'a\nb'` ⇒ `{eol,"a"} {noeol,"b"}`.
@@ -842,7 +843,7 @@ impl Port {
     ///
     /// In raw mode ([`Port::line_mode`] is `None`) this is **one [`PortNotification::Data` per
     /// read message**: the C delivers one `{Port, {data, Data}}` per `driver_output*` call
-    /// (`deliver_read_message`, `io.c:3363-3442`), so two calls inside one callback are two
+    /// (`deliver_read_message`, `io.c:3363-3448`), so two calls inside one callback are two
     /// notifications and a header/body pair is exactly one — never two, never merged. Each
     /// message is drained out of the port, so a report happens **exactly once per byte**. An
     /// explicit empty read is still reported (the oracle's `{Port, {data, []}}`); the
@@ -1287,15 +1288,16 @@ impl Port {
     /// discard what it no longer needs ([`Driver::flush`]), the port then tries to write out
     /// whatever is still queued, and only an **empty** output queue ends the port.
     ///
-    /// This is `erts_deliver_port_exit` (`erts/emulator/beam/io.c:3936-3942`): on a close (any
+    /// This is `erts_deliver_port_exit` (`erts/emulator/beam/io.c:3946-3954`): on a close (any
     /// reason but `kill`) with a non-empty ioq the C clears `EXITING`, sets
-    /// `ERTS_PORT_SFLG_CLOSING` and calls `flush_port` instead of `terminate_port` — the port keeps
+    /// `ERTS_PORT_SFLG_CLOSING` and calls `flush_port` instead of `terminate_port` (`flush_port` at
+    /// `:3952`, the `else terminate_port` at `:3955`) — the port keeps
     /// living, keeps receiving in/out events, and "as soon as the port queue gets empty
-    /// `terminate_port()` is called" (`io.c:896-900`; the deferred half is
-    /// `erts_port_driver_callback_epilogue`, `erl_port.h:797-813`). `flush_port` calls the
+    /// `terminate_port()` is called" (`io.c:3968-3971`; the deferred half is
+    /// `erts_port_driver_callback_epilogue`, `erl_port.h:798-812`). `flush_port` calls the
     /// driver's `flush` **only if the entry has one** and terminates the port **only if the ioq is
     /// empty afterwards** (`io.c:3659-3700`); `terminate_port` is the sole caller of `drv->stop`
-    /// (`io.c:3733-3752`).
+    /// (`io.c:3752`).
     ///
     /// So this method is two halves:
     ///
@@ -1326,8 +1328,8 @@ impl Port {
     /// A repeated `close` on a port that is already [`PortState::Closing`] (or `Closed`) is a
     /// no-op `Ok(())`: no second [`Driver::flush`], no second [`Driver::stop`]. The C agrees — the
     /// exit path returns immediately when the port is already
-    /// `EXITING`/`CLOSING`/`DEAD` (`io.c:3878-3881`), and `driver_failure_term` terminates rather
-    /// than re-flushing a `CLOSING` port (`io.c:7207-7209`).
+    /// `EXITING`/`CLOSING`/`DEAD` (`io.c:3877-3880`), and `driver_failure_term` terminates rather
+    /// than re-flushing a `CLOSING` port (`io.c:7212-7214`).
     ///
     /// # Errors
     ///
@@ -1355,10 +1357,10 @@ impl Port {
     ///
     /// Separated so a registry can finish a port parked in [`PortState::Closing`] from a later
     /// round ([`PortRegistry::finish_closing_ports`](crate::PortRegistry)) with the same code that
-    /// finishes an immediately-drained close — the C's `terminate_port`, which is the sole caller
-    /// of `drv->stop` (`erts/emulator/beam/io.c:3733-3752`). Whatever is still in the output queue
-    /// is **dropped** here: the caller has decided the remainder is obsolete (the C's
-    /// `prt->ioq.size = 0` before a driver failure, `io.c:7215-7219`).
+    /// finishes an immediately-drained close — the C's `terminate_port` (`io.c:3704-3795`), which
+    /// is the sole caller of `drv->stop` (`erts/emulator/beam/io.c:3752`). Whatever is still in the
+    /// output queue is **dropped** here: the caller has decided the remainder is obsolete (the C's
+    /// `prt->ioq.size = 0` before a driver failure, `io.c:7220`).
     ///
     /// The port is marked [`PortState::Closed`] even when `stop` fails, so a teardown error can
     /// never leave it looking open.
@@ -1820,7 +1822,7 @@ mod tests {
     // The `driver_output2` header/body split (contract A.4)
     // -----------------------------------------------------------------------------------
     // The oracle pins one `{Port, {data, Data}}` message per driver `driver_output*` CALL
-    // (`deliver_read_message`, `../../../erts/emulator/beam/io.c:3363-3442`): a header/body
+    // (`deliver_read_message`, `../../../erts/emulator/beam/io.c:3363-3448`): a header/body
     // pair is one message, two calls are two, and a `NULL` body (no binary tail at all) is
     // distinguishable from a present-but-empty one. This crate's half is the split carried on
     // [`ReadMessage`]; building `[H1,H2,H3|<<Body>>]` out of it is the runtime's.

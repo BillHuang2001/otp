@@ -568,7 +568,7 @@ impl Driver for RamFileDriver {
     /// there is no queued-output rescue to do here, and none is needed. The entry has `flush = NULL`
     /// (`ram_file_drv.c:120`), so the C's `flush_port` calls nothing
     /// (`erts/emulator/beam/io.c:3659-3700`) and the port's own drain runs the command through
-    /// [`Driver::output`] before `terminate_port` reaches this `stop` (`io.c:3733-3752`) — which is
+    /// [`Driver::output`] before `terminate_port` reaches this `stop` (`io.c:3752`) — which is
     /// why [`Driver::flush`]'s default (discard nothing) is the faithful answer and there is
     /// deliberately no override here. See [`Driver::output`]'s rustdoc for the close path.
     fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
