@@ -62,6 +62,8 @@
 //! * [`gc`]/[`gc_walk`] — the heap-admission point and the unscanned-root valve.
 //! * [`position`] — the **in-machine** BIF door that answers `erlang:process_info/1,2`'s
 //!   execution-position items for the process that is executing the query.
+//! * [`records`] — the one code-server record-table lookup (shared with the
+//!   `records:get_definition/2` bridge) and the engine's foreign-record-definition seam.
 //! * [`bridges`]/[`export_gate`]/[`fun_identity`]/[`memory_hook`]/[`module_info`]/
 //!   [`node_hash`]/[`persistent_term`]/[`process_bridge`]/[`runtime_hooks`]/[`signal`]/
 //!   [`trace`]/[`alias`] — the host-seam bridges and the runtime-level facilities they wrap.
@@ -84,6 +86,7 @@ mod pool;
 mod position;
 mod process_bridge;
 mod pump;
+mod records;
 mod runtime_context;
 mod runtime_hooks;
 mod send;

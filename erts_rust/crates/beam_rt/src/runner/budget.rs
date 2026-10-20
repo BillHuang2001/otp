@@ -574,6 +574,21 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable {
         ExecutionContext::atoms(self.inner, module)
     }
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path: the compiler that
+    /// A.9 must run executes *scheduled*, and its `put_record` create forms name another
+    /// module's record id, so without this forward the engine would take the trait default
+    /// (`Ok(None)`) and the compiler would meet the typed
+    /// `… create: no record definition table for another module` instead of the definition.
+    /// It is **not priced**: it is a table lookup, not a call resolution.
+    fn foreign_record_definition(
+        &mut self,
+        owner: Atom,
+        name: Atom,
+    ) -> Result<Option<beam_loader::RecordDefinition>> {
+        ExecutionContext::foreign_record_definition(self.inner, owner, name)
+    }
 
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.

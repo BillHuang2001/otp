@@ -131,6 +131,22 @@ impl ExecutionContext for RuntimeContext<'_> {
     fn atoms<'m>(&'m self, _module: &'m Module) -> &'m AtomTable {
         self.runtime.atoms()
     }
+    /// The host's record table for a `put_record` **create** whose `Id` names **another**
+    /// module's record: the code server's retained [`Module`] for the owner serves it
+    /// (`Recs` chunk = the C's record table, `erl_record.c:173-178`).
+    ///
+    /// A missing owner is **loaded and the lookup retried** (the C's
+    /// `erl_create_native_record_jit`, `erl_record.c:412-565`), the `is_exported` flag is
+    /// returned **unfiltered** (the engine applies the C's gate and raises
+    /// `error:{badrecord, Id}`), and `Ok(None)` — the host cannot answer — keeps the
+    /// engine's typed `unsupported`. Detail: [`records`](super::records).
+    fn foreign_record_definition(
+        &mut self,
+        owner: Atom,
+        name: Atom,
+    ) -> Result<Option<beam_loader::RecordDefinition>> {
+        RuntimeContext::foreign_record_definition(self, owner, name)
+    }
     /// The host's own call into a callee, under the arm's frame discipline.
     fn call_bif(
         &mut self,
