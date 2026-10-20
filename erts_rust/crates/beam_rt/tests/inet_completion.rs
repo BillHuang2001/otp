@@ -31,17 +31,40 @@
 //! message *shapes*; this file pins the whole loop: a real `.beam` parked inside `prim_inet`'s
 //! own `receive`, freed by a driver completion that this runtime staged and delivered.
 //!
-//! # Why the blocking half must run on the `run` route
+//! # What this file pins: the *scheduled* route's completion delivery
 //!
 //! A socket operation blocks the calling Erlang process in a plain `receive`
-//! (`prim_inet:recv0/3`, `prim_inet:accept0/3`). Under `-eval` the evaluator is a tree-walker with
-//! no scheduler behind it, so a parked nested call folds into the typed capability gap
-//! (`unsupported: opcode: run: process blocked`, exit 3) — it can never be resumed by a driver
-//! completion. `beam_rt run <file.beam> <mod>:<fun>/<arity>` runs the module as a *scheduled*
-//! process instead, so the target parks, a later scheduler pass drains the completion channel,
-//! the message lands in its mailbox and `resume-on-send` re-enqueues it. Every blocking case below
-//! is therefore driven through the `run` action, the convention `tests/port_wake.rs` established
-//! for the `{Port, {data, …}}` half.
+//! (`prim_inet:recv0/3`, `prim_inet:accept0/3`). `beam_rt run <file.beam> <mod>:<fun>/<arity>`
+//! runs the module as a *scheduled* process instead, so the target parks in the run queue, a later
+//! scheduler pass drains the completion channel, the message lands in its mailbox and
+//! `resume-on-send` re-enqueues it — the convention `tests/port_wake.rs` established for the
+//! `{Port, {data, …}}` half.
+//! Every blocking case below is driven through the `run` action for that reason, and what it pins
+//! is the delivery loop itself — the completion's message shape, the resume it causes, and the
+//! accepted descriptor's adoption — not the wait.
+//!
+//! The **nested** route (the `-eval`/`-s`/`-run`/boot caller, which is not in the run queue at
+//! all) really waits for its `{inet_async, …}` completion now: `src/context/pump.rs::wait_for_port_event`
+//! (compiled code) and the `-eval` bare-receive port branch sit the receive out over the pass's
+//! blocking policy, bounded by `crate::port::PORT_EVENT_DEADLINE` and re-armed by any round that
+//! made progress.
+//! A round made progress on any of three signals — the pass executed a slice, the pass **delivered
+//! a port message** (`Runtime::port_events_delivered`), or no live port holds an asynchronous
+//! operation any more.
+//! The delivery signal is the one the other two cannot see, because a completion lands in the
+//! mailbox in a round that ran no slice and no run-queue entry; the third is only ever read as
+//! "someone could still answer me", never as "an answer is owed", since a listener's standing
+//! accept interest keeps that count non-zero by design.
+//! `tests/inet_nested.rs` is that route's suite; this one stays on `run`.
+//!
+//! # The `beam_io` residual behind the nested route
+//!
+//! A passive read on an **accepted** socket whose payload was buffered **before** the read op armed
+//! produces no port event at all, so it only ends at the peer's close and answers `{error,closed}`
+//! where the oracle answers `{ok, <<"hi">>}` — a `beam_io` accepted-socket arming defect
+//! (`TcpInetDriver::from_accepted`'s read-interest registration), pinned by the `#[ignore]`d case in
+//! `tests/inet_nested.rs`; the connect-side socket with the same pre-buffered payload is delivered.
+//! It is a typed mismatch after a silent stall, never a hang: both runtimes exit 0.
 //!
 //! # The three pinned paths
 //!
@@ -53,12 +76,11 @@
 //!
 //! # The peer is never Erlang
 //!
-//! `gen_tcp:accept/1,2` reaches `prim_inet:accept_opts/3`, whose `getopts` list (`delay_send`,
-//! `priority`, `linger`, `tos`, `recvtos`, `recvttl`) this runtime's `inet` driver does not
-//! resolve. Both fixtures therefore work at the `prim_inet` level — `async_accept/2`, `recv/3` and
-//! an explicit `erlang:port_command/2` with `prim_inet:send/3`'s own caller-tag prefix — and every
-//! *peer* is a std [`UdpSocket`]/[`TcpStream`] owned by the test, so no Erlang node is needed to
-//! drive this runtime's blocking path.
+//! Both fixtures work at the `prim_inet` level — `async_accept/2`, `recv/3` and an explicit
+//! `erlang:port_command/2` with `prim_inet:send/3`'s own caller-tag prefix — which is also what
+//! keeps the driver's operation ids and the `{inet_reply, …}` tag observable; every *peer* is a std
+//! [`UdpSocket`]/[`TcpStream`] owned by the test, so no Erlang node is needed to drive this
+//! runtime's blocking path.
 //!
 //! `gen_tcp:connect/2,3,4` is **not** blocked any more: `erlang:read_timer/1`, the hook its
 //! `prim_inet` polling loop needs, is implemented (`src/context/runtime_hooks.rs`), and a connect
@@ -109,9 +131,10 @@ const PARITY_FIXTURE: &str = include_str!("fixtures/inet_completion_parity.erl")
 /// The TCP accept/recv/send fixture (module `cpl_tcp`), generated rather than committed because
 /// it is only ever compiled by this suite.
 ///
-/// It stays at the `prim_inet` level (`gen_tcp:accept/1,2` is blocked — see the module docs) and
-/// prints, in order: the bound listening port, the listening **port id**, the accepted socket's
-/// **port id**, the `recv` answer, and the shape of the `{inet_reply, Sock, Status, Tag}` the
+/// It stays at the `prim_inet` level (so the driver's own operation ids and the
+/// `{inet_reply, …}` caller tag are observable) and prints, in order: the bound listening port,
+/// the listening **port id**, the accepted socket's **port id**, the `recv` answer, and the shape
+/// of the `{inet_reply, Sock, Status, Tag}` the
 /// command was answered with. `Tag` is compared against the reference the fixture itself minted,
 /// so the fourth element is the *decoded* `term_to_binary(Mref, [local])` image and not an
 /// invented term. Nothing is printed before the fact it reports is true, so the harness can read
