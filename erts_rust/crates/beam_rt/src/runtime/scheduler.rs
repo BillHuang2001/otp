@@ -604,6 +604,36 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// How many port messages this runtime has **delivered** since it started — the monotone
+    /// progress signal a nested port wait reads around its own round.
+    ///
+    /// A wait ([`crate::context::RuntimeContext`]'s blocking run and the `-eval` bare `receive`)
+    /// needs a third signal beside "the pass ran a slice" and "no live port still owes us an
+    /// asynchronous answer": the completion it parked on is delivered by the pass's **port half**
+    /// in a round that ran no slice, and a live *listener* keeps
+    /// [`Runtime::ports_awaiting_async`] true for ever (its accept interest is legitimately
+    /// still armed), so both of the old signals stay blind to it and the already-delivered
+    /// `{inet_async, …}` is never scanned. A change in this count between two reads means a
+    /// port round delivered something, i.e. the mailbox may now hold the answer.
+    ///
+    /// Read-only, and cheap (one `u64` read): it neither borrows the port table nor touches the
+    /// poller, so a wait may read it on every round.
+    pub(crate) fn port_events_delivered(&self) -> u64 {
+        self.port_events
+    }
+
+    /// Credits the `delivered` port messages one port round really landed to the monotone
+    /// progress count behind [`Runtime::port_events_delivered`].
+    ///
+    /// Called by [`Runtime::deliver_port_messages`] with its own delivered count — the number of
+    /// messages that reached a live mailbox, which is exactly the shape of progress a nested
+    /// wait cares about. Saturating, so an arbitrarily long run degrades to a clamped count
+    /// instead of wrapping into a smaller one (a wrap would read as "no delivery" and could
+    /// stall a wait).
+    pub(crate) fn note_port_events(&mut self, delivered: usize) {
+        self.port_events = self.port_events.saturating_add(delivered as u64);
+    }
+
     fn is_quiescent(&mut self) -> bool {
         if self.run_queue_len() != 0 {
             return false;
