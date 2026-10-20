@@ -360,17 +360,30 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   above `IMMIX_BREAK_EVEN_WORDS = 8 * BLOCK_WORDS = 2048` (assertion-backed), with an additive
   on-demand growth seam (`Collector::ensure_capacity`, `HeapPolicy::unbounded()`, `GcConfig::growable()`).
   `beam_dist`: all 30 `Dop` variants round-trip byte-exact (30 golden vectors cross-checked against the
-  oracle), with LIVE interop for the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, client-originated
-  `DOP_MONITOR_P` → `DOP_PAYLOAD_MONITOR_P_EXIT`, `DOP_EXIT2`, `DOP_UNLINK_ID`/`_ACK` and fragmentation
-  both ways; `epmd` `DUMP`/`KILL`/`STOP` are implemented (node-up/down are not v6 opcodes). `beam_rt`:
+  oracle), with LIVE interop for the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, the
+  `DOP_MONITOR_P` → `DOP_MONITOR_P_EXIT` pair, `DOP_EXIT2`, `DOP_UNLINK_ID`/`_ACK` and fragmentation
+  both ways, plus its **defaulted inbound decode-side identity** (`control::LocalIdentity`,
+  `decode_control_with_identity`, `Connection`/`ConnectionDriver::set_local_identity`): an inbound pid,
+  port or reference naming this node **and** matching its live creation decodes to the internal term,
+  so a pid a peer reflects back is `=:=` the local one; its internal-ref ↔ wire-words mapping is the
+  public `ref_wire::{ref_id_to_numbers, ref_numbers_to_id, representable_ref_numbers}` (the C's
+  `erts_set_ref_numbers` layout — the one authority, no crate mirrors it); `epmd` `DUMP`/`KILL`/`STOP`
+  are implemented (node-up/down are not v6 opcodes). `beam_rt`:
   boot/CLI/env, `system_info`/`process_info`, a native BIF floor, and its own observability modules
   (`src/trace.rs`/`src/seq_trace.rs`/`src/crash_dump.rs`/`src/perf_map.rs` — only `send` trace events are
   emitted and the perf map is empty because no code ranges cross the crate boundary yet); inbound
   distribution runs by default (`allow_inbound_delivery`, `true` unless turned off) and routes the
   `Send`/`RegSend`/`AliasSend`/plain-`AltactSigSend` families into the local signal path plus the
   link/exit/unlink/monitor/demonitor/monitor-down/group-leader families through `beam_process`'s
-  route-free receipt primitives, with the distributed-spawn family and `Delivery::Other(_)` still
-  typed `Unsupported`; `DEFAULT_HEAP_WORDS = 1<<24`, with
+  route-free receipt primitives (each emitting no outbound `DOP_*`); the channel's identity — its sysname
+  atom and creation — is the live node's (`NodeIdentity`/`beam_bifs::LocalNode` report
+  `Runtime::node_creation()`, so a locally minted pid/port/reference and the image a peer echoes back
+  agree), and it is installed on every decode drain rather than stored, because `beam_term::Atom` is a
+  table-local index and a clone mints a fresh instance (a stale atom is inert, never a wrong match);
+  typed A.5 gaps: the distributed-spawn family (`DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY`),
+  `Delivery::Other(_)`, the ack-owing `DOP_UNLINK_ID` half (`id != 0`), a remote **named** monitor
+  `{Name, Node}`, and `DOP_PAYLOAD_MONITOR_P_EXIT` (the plain 5-tuple is always emitted);
+  `DEFAULT_HEAP_WORDS = 1<<24`, with
   heap exhaustion translated to `error:system_limit`; the parked root set publishes only the live
   float-register prefix (`Machine::fr_mark()`), the pooled BIF heap is rewound to each call's own mark
   (`Heap::reset_to(mark)`), and `process_info(P, binary)` is served from the target's own
