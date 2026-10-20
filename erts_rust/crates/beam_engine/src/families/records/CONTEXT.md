@@ -162,8 +162,9 @@ expectation above is pinned from the C ground truth (`erts/emulator/beam/erl_rec
 
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
 
+
 ## Known divergence (open, verified against the C)
-- **`foreign_record_definition` cannot express "this module defines no such record".** `Ok(None)` means both "no record table at all" (typed `unsupported`) and "the module is resolved and has no such record", where C's create path ends in `error:{badrecord, Id}` even after its load retry (`erl_record.c:509-565` ⇒ `erl_create_native_record(…, indicate_unloaded=false)` ⇒ `:407-409`). A host wanting the oracle's reason can answer with a **non-exported** definition — its fields are never read on the `badrecord` arm (`create::resolve`),.
+- **`foreign_record_definition` cannot express "this module defines no such record".** `Ok(None)` means both "no record table at all" (typed `unsupported`) and "the module is resolved and has no such record", where C's create path ends in `error:{badrecord, Id}` even after its load retry (`erl_record.c:509-565` ⇒ `erl_create_native_record(…, indicate_unloaded=false)` ⇒ `:407-409`). A host wanting the oracle's reason can answer with a **non-exported** definition — its fields are never read on the `badrecord` arm (`create::resolve`), so that is a zero-engine-change route.
 
 ## Coverage notes
 - The `differential` gate's `records` group (46 cases: 35 `Eval` + 11 `Module`) pins every
