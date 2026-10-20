@@ -161,7 +161,7 @@ use std::sync::Arc;
 
 use beam_alloc::{GrowOutcome, ReservedHeap};
 use beam_common::Result;
-use beam_loader::{Label, Module};
+use beam_loader::{Label, Module, RecordDefinition};
 use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::machine::Machine;
@@ -1105,6 +1105,68 @@ pub trait ExecutionContext {
         Ok(false)
     }
 
+    /// Resolve a **record definition** that is not the running module's own — the
+    /// host record-table seam behind `put_record`'s **create** form.
+    ///
+    /// A native record's create form (`Src` is the literal `nil`,
+    /// `emu/ops.tab:1648`) must find the definition *before* it can build anything.
+    /// An **atom** `Id` names a record of the running module, whose definition is
+    /// right there in [`Module::record`] — no seam, no table. A **`{Module,Name}`**
+    /// `Id` naming **another module** is exactly what C answers from the code
+    /// server's record table (`erts_record_find_entry`, `erl_record.c:376`), and
+    /// that table belongs to the host: it is the code/data owner, and this crate
+    /// never loads modules.
+    ///
+    /// `owner`/`name` are the two atom **values** the `Id` tuple carries (already
+    /// resolved from the operand); the host is expected to look them up in its own
+    /// loaded-module record table.
+    ///
+    /// * `Ok(Some(def))` — the host resolved `{owner, name}`. **The `is_exported`
+    ///   flag is part of the answer, not a filter**: the host must return the
+    ///   definition it found *even when* `def.is_exported == false`, because C then
+    ///   raises `badrecord` with the `Id` term itself as the reason
+    ///   (`erl_record.c:401-409`) instead of creating the record. Returning `None`
+    ///   for a non-exported hit would silently turn that raise into the typed
+    ///   capability error below, so the engine asks for the definition **and** the
+    ///   flag and decides both branches itself.
+    /// * `Ok(None)` — the host cannot answer: it has no record table, or the
+    ///   defining module is not (and cannot be) loaded. The family then keeps its
+    ///   honest typed `error::unsupported("… create: no record definition table for
+    ///   another module")`. A definition is **never guessed**, so a host that does
+    ///   not implement this seam keeps today's behaviour byte-for-byte
+    ///   ([`MinimalContext`] and every mock/test host are unchanged).
+    ///
+    /// # Atom-namespace contract
+    ///
+    /// [`Atom`] is a **table-local index**. The returned definition's `name` and
+    /// every `fields[i].name` must therefore be nameable in the **running process's**
+    /// atom namespace — the namespace [`atoms`](ExecutionContext::atoms) answers
+    /// from (the runtime's ONE live table, or the running module's snapshot for a
+    /// host that does not override it). The family re-resolves every one of those
+    /// names through that live namespace before writing it into a term, and a name
+    /// the namespace cannot spell is a typed error: an index from a foreign table is
+    /// never written into a term, where it would silently name a *different* atom.
+    /// Default values are ordinary terms and are stored verbatim.
+    ///
+    /// # Deviation from C (recorded, never silent)
+    ///
+    /// C's create form has a `code:ensure_loaded/1` trap path
+    /// (`erl_create_native_record_jit`, `erl_record.c:412-507`, plus its
+    /// continuation `erl_finish_create_record_jit`, `:509-565`): a module that is not
+    /// loaded yet is loaded, and the create is retried. This runtime has no code
+    /// server on the execution path, so that "load, then retry" half is the host's
+    /// `Ok(None)` — the host answers only for modules it can already resolve.
+    ///
+    /// The default body returns `Ok(None)`, so this seam is **purely additive**:
+    /// every existing implementor compiles and behaves byte-identically.
+    fn foreign_record_definition(
+        &mut self,
+        owner: Atom,
+        name: Atom,
+    ) -> Result<Option<RecordDefinition>> {
+        let _ = (owner, name);
+        Ok(None)
+    }
     /// Resolve an interned atom id to its name, preferring the host's **live**
     /// atom namespace over the running module's load-time snapshot.
     ///
@@ -1532,6 +1594,14 @@ impl ContextHeap {
 /// [`set_mailbox`](MinimalContext::set_mailbox)) may be installed to serve the
 /// nine receive-seam methods; without one each stays the trait's typed
 /// `unsupported`.
+///
+/// **Record definitions**
+/// ([`with_foreign_record_definitions`](MinimalContext::with_foreign_record_definitions) /
+/// [`set_foreign_record_definitions`](MinimalContext::set_foreign_record_definitions))
+/// may be installed to serve
+/// [`foreign_record_definition`](ExecutionContext::foreign_record_definition) — the
+/// `put_record` create form's other-module record table; without them the seam is
+/// the trait's `Ok(None)` (`"no record table"`).
 pub struct MinimalContext {
     hook: BifHook,
     /// An optional **outcome-aware** BIF hook (the
@@ -1554,6 +1624,16 @@ pub struct MinimalContext {
     /// An optional local-call resolver (the
     /// [`ExecutionContext::resolve_local_call`] body).
     local_call_resolver: Option<LocalCallResolver>,
+    /// The host-supplied **record definitions** — the body of
+    /// [`ExecutionContext::foreign_record_definition`], keyed by their exact
+    /// `(owner, name)` atom values.
+    ///
+    /// Empty out of the box, so the seam is the trait default (`Ok(None)`,
+    /// byte-identical to the pre-seam engine). A test that needs to model a host
+    /// with a loaded-module record table installs entries through
+    /// [`with_foreign_record_definitions`](MinimalContext::with_foreign_record_definitions)
+    /// / [`set_foreign_record_definitions`](MinimalContext::set_foreign_record_definitions).
+    foreign_records: Vec<(Atom, Atom, RecordDefinition)>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
     /// An optional shared atom namespace (the body of
@@ -1597,6 +1677,7 @@ impl MinimalContext {
             external_resolver: None,
             local_fun_resolver: None,
             local_call_resolver: None,
+            foreign_records: Vec::new(),
             mailbox: None,
             shared_atoms: None,
             heap: ContextHeap::new(),
@@ -1695,6 +1776,36 @@ impl MinimalContext {
         self.local_call_resolver = Some(resolver);
     }
 
+    /// A context with the given **record definitions** and the default (rejecting)
+    /// BIF hook.
+    ///
+    /// Each entry is `(owner, name, definition)` and answers
+    /// [`ExecutionContext::foreign_record_definition`] for an **exact** `(owner,
+    /// name)` atom-value match, returning a [`clone`](Clone::clone) of the
+    /// definition — the shape `put_record`'s create form consults for a
+    /// `{Module,Name}` record id naming another module. The `is_exported` flag is
+    /// carried through as given: an entry whose definition is *not* exported is a
+    /// `badrecord` on the C's semantics, exactly like a real record table.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_foreign_record_definitions(
+        definitions: Vec<(Atom, Atom, RecordDefinition)>,
+    ) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.foreign_records = definitions;
+        ctx
+    }
+
+    /// Install (or replace) the record definitions
+    /// [`ExecutionContext::foreign_record_definition`] answers from. The default
+    /// (never installed) is the trait's `Ok(None)` — "this host has no record
+    /// table".
+    pub fn set_foreign_record_definitions(
+        &mut self,
+        definitions: Vec<(Atom, Atom, RecordDefinition)>,
+    ) {
+        self.foreign_records = definitions;
+    }
     /// Install (or replace) the mailbox.
     pub fn set_mailbox(&mut self, mailbox: Box<dyn Mailbox>) {
         self.mailbox = Some(mailbox);
@@ -1882,6 +1993,19 @@ impl ExecutionContext for MinimalContext {
         }
     }
 
+    /// Answer from the installed record definitions, or keep the trait default
+    /// (`Ok(None)`, "no record table") when none were installed.
+    fn foreign_record_definition(
+        &mut self,
+        owner: Atom,
+        name: Atom,
+    ) -> Result<Option<RecordDefinition>> {
+        Ok(self
+            .foreign_records
+            .iter()
+            .find(|(o, n, _)| *o == owner && *n == name)
+            .map(|(_, _, definition)| definition.clone()))
+    }
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
         self.mailbox_call("receive_next", |mailbox| mailbox.receive_next())
     }

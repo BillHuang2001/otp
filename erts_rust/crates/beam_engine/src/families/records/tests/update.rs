@@ -202,10 +202,14 @@ fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
 
 #[test]
 fn put_record_create_for_another_module_is_a_typed_error() {
-    // A `{Module,Name}` id whose module is not the running one needs the code
-    // server's record table (`erts_record_find_entry`) or a `code:ensure_loaded/1`
-    // trap (`erl_create_native_record_jit`) — a facility this runtime does not have,
-    // so it is reported rather than guessed.
+    // A `{Module,Name}` id whose module is not the running one needs a definition
+    // from *outside* this module's `Recs` snapshot. The engine asks the host through
+    // `ExecutionContext::foreign_record_definition`; this `MinimalContext` installs no
+    // record table, so the seam's default answers `Ok(None)` and the family reports
+    // the gap rather than guessing a definition (`tests/foreign_create.rs` covers the
+    // `Ok(Some(def))` branches). C's other half of this path — the
+    // `code:ensure_loaded/1` trap (`erl_create_native_record_jit`, `erl_record.c:412`)
+    // — has no counterpart here and is likewise the host's `Ok(None)`.
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (r, a, other) = (fx.atom("r"), fx.atom("a"), fx.atom("other"));
