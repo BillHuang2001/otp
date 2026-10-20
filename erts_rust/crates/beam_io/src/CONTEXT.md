@@ -244,14 +244,38 @@ of `drv->stop` (`io.c:3752`).
   **additive, defaulted** seam: the driver's one chance, *before* `stop`, to take bytes off
   `ctx.output()` and discard them, or (returning `Ok(())` without consuming anything) to say "keep
   them, try to write them". The default `Ok(())` discards nothing — the C's `flush == NULL` case
-  (`io.c:3664`), which is `ram_file_drv`'s literal entry (`ram_file_drv.c:120`) — so a driver
-  that consumes its output synchronously needs no override and every other built-in inherits it.
+  (`io.c:3664`) — so a driver that consumes its output synchronously needs no override.
   No byte count is verified (the C's `flush` returns `void`); consuming what is discarded *is* the
   accounting rule. Overriders: `drivers/spawn.rs`'s `SpawnDriver` latches the C's `fd_flush`
   `terminating` flag (`sys_drivers.c:1029-1034`) and its `stop` then gives the child end-of-file
   and waits for it instead of killing it; `abi::DriverPort` forwards the loaded C driver's own
   entry through `DriverPort::call` (all four sinks installed, an absent slot the C's silent
-  no-op) and deliberately does none of `stop`'s teardown work — a flush is not a teardown.
+  no-op) and deliberately does none of `stop`'s teardown work — a flush is not a teardown;
+  `drivers/inet/mod.rs`'s `TcpInetDriver` reproduces `tcp_inet_flush` (`inet_drv.c:12708`-`:12730`,
+  the entry's slot at `:1368`): it discards the queued output (`ctx.output().clear()`) exactly when
+  the port is not write-armed-and-tokenized or the socket carries `SocketOptions::linger_zero`
+  (`discard_output = !(desc->inet.event_mask & FD_WRITE) | TCP_ADDF_LINGER_ZERO`), and keeps the
+  bytes for the port layer's `Closing` drain otherwise — the `token.is_some()` term of that test
+  models `erl_inet_close` (`inet_drv.c:5101`-`:5117`) zeroing the C event mask, where this floor
+  deregisters instead.
+  Three built-ins deliberately do **not** override it, each the C's own `flush` slot: `udp_inet`
+  (a `NULL` slot, `inet_drv.c:1406`-`:1443`), `ram_file_drv` (a `NULL` slot,
+  `ram_file_drv.c:120`) and `fd`, whose `fd_flush` (`sys/unix/sys_drivers.c:1029`-`:1034`) only
+  latches `terminating` and never clears the ioq — so their queued output is always the port
+  layer's drain to write.
+- `drivers/inet/mod.rs` → the **`tcp_inet` stop/close split**: `TcpInetDriver::stop` calls
+  `release_socket`, **not** `desc_close`, because the C's `tcp_inet_stop` (`inet_drv.c:11895`-`:11924`)
+  never touches the ioq — the unconditional `tcp_clear_output` of `tcp_desc_close`
+  (`:11932`-`:11939`, `tcp_clear_input` then `tcp_clear_output` then `erl_inet_close`) belongs only
+  to the close **verb** (`INET_REQ_CLOSE`, `TcpInetDriver::verb_close` → `desc_close`). Queued
+  output is therefore the flush's business and the port layer's, never the stop's, pinned by
+  `drivers/inet/flush_tests.rs` (`the_teardown_never_clears_the_queue_but_the_close_verb_does`).
+- `drivers/inet/mod.rs` → the **read-path ordering rule** (owned by the inet node — see
+  `drivers/inet/CONTEXT.md`): a complete buffered unit wins over a pending peer close, so
+  `{Port,{data,…}}` is delivered before `{tcp_closed,…}`. The observation is kept in
+  `TcpInetDriver::deferred_close` and applied at the single latch site
+  `TcpInetDriver::latch_peer_close` once nothing complete is left to deliver
+  (`TcpInetDriver::latch_deferred`).
 - `port.rs` → `PortState::Closing` is a **real observable state** (`Port::is_closing()`/
   `is_closed()`/`state()`), not a transient: `Port::close` is two halves.
   **Begin** (always): `state = Closing`, record `closing_watermark`, `driver_flush` (the four
@@ -349,10 +373,10 @@ of `drv->stop` (`io.c:3752`).
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Per-module in-module counts (`-p beam_io --lib` = 1059 passed / 1 failed — 1060 tests; the one
-red test is `drivers::inet::close_tests::the_teardown_empties_the_queued_output_too`, an in-flight
-edit of `src/drivers/inet/` owned by another agent, so this figure is honest rather than green):**
-`drivers` **715** — of which `inet` **591** (per-suite breakdown in `drivers/inet/CONTEXT.md`),
+**Gate: `-p beam_io` = 1071 lib + 251 integration over 26 binaries + 3 doctests ⇒ 1325 passed, 0
+failed, 2 `#[ignore]`d, over 28 test binaries.**
+**Per-module in-module counts (`-p beam_io --lib` = 1071 passed):**
+`drivers` **726** — of which `inet` **602** (per-suite breakdown in `drivers/inet/CONTEXT.md`),
 `line_buffer` 24, `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `ram_file` 34
 (`ram_file_tests` 23 + `ram_file_split_tests` 6 + `ram_file_close_tests` 5), `fd` 17 (14 + the 3 in
 `fd_close_tests.rs`), `efile` 13, `binary_io` 9 — then
@@ -442,8 +466,8 @@ edit of `src/drivers/inet/` owned by another agent, so this figure is honest rat
   `false` once only that port is left), plus the live-port-only rule and that both probes are pure
   `&self` questions.
   The `abi::DriverPort` leg is unreachable from a source-module unit test (it needs a `cc`-built `.so`
-  behind a loader handle); its `false` answer is pinned by the driver C-ABI integration suites' kind of
-  fixture, not here.
+  behind a loader handle), and its `false` wait answer carries no test today: the C-ABI integration
+  suites pin the **drive** half only (`has_pending_async` in `tests/abi_async.rs`/`tests/abi_vector.rs`).
   The busy decision table is `port_command_tests.rs`'s (8 tests over a plain-Rust `BusyDriver` whose
   busy state, flag word and written bytes are all observable): idle ⇒ `Done` with the bytes really
   written and one `OUTPUT` task, busy + plain or `[nosuspend]` ⇒ `Busy` with **nothing** queued and no
@@ -506,12 +530,12 @@ edit of `src/drivers/inet/` owned by another agent, so this figure is honest rat
 - `port_command_tests.rs` → the busy-port decision table's suite (8 tests), a `#[path]` test module of `port.rs`: idle ⇒ `Done` + one `OUTPUT` task, busy + plain/`[nosuspend]` ⇒ `Busy` with nothing queued, `[force]` ⇒ `notsup` without `SOFT_BUSY` and `Done` with it, the state cleared ⇒ `Done` again, `BadArg` on a non-`Open` port, and the `is_busy`/`port_closed` probes
 - `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel: `Data`/`Passive`/`Error(InetReason)`), `ActiveMode` (`{active, Mode}` with `from_parts`/`is_active`/`remaining`) and `ActiveSpend` (`Once`/`Multi` — the grants a delivery spent to exhaustion), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
-- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`active_mode` (default `ActiveMode::False`) and `take_active_spends` (default an empty, allocation-free `Vec`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async` (the **drive** predicate: work a port round must drive, accept/job inclusive)/`awaits_callers_async_op` (the **wait** predicate beside it: an async op some caller is parked on, defaulting to `has_pending_async` so a driver that cannot tell the two apart never claims nobody waits; the socket drivers answer accept-inclusively, `abi::DriverPort` answers `false`)/`flush` (the close path's one chance to discard queued output **before** `stop`; the default discards nothing — the C's `flush == NULL` — and only `SpawnDriver` and `abi::DriverPort` override it)/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
+- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`active_mode` (default `ActiveMode::False`) and `take_active_spends` (default an empty, allocation-free `Vec`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async` (the **drive** predicate: work a port round must drive, accept/job inclusive)/`awaits_callers_async_op` (the **wait** predicate beside it: an async op some caller is parked on, defaulting to `has_pending_async` so a driver that cannot tell the two apart never claims nobody waits; the socket drivers answer accept-inclusively, `abi::DriverPort` answers `false`)/`flush` (the close path's one chance to discard queued output **before** `stop`; the default discards nothing — the C's `flush == NULL` — and only `SpawnDriver`, `drivers::TcpInetDriver` and `abi::DriverPort` override it)/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site, `EINTR` retried, an interior-NUL path ⇒ `BadArg`), `access` (`Result<bool>`, refusal ⇒ `false`, only a genuine syscall failure is `BeamError::Io`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>` — the **effective** ids `check_access` compares a `stat` against)
 - `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `tcp_inet`, `udp_inet`, `ram_file_drv`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
-- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port), `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers), `passive_recv_tests.rs` (9 — the passive `gen_tcp:recv` park), `accept_opts_family_tests.rs` (7 — `prim_inet:accept_opts/3`'s whole eleven-code list, incl. `FamilyOpts`) and `shutdown_contract_tests.rs` (10 — the `gen_tcp:shutdown/2` aftermath)
+- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port), `flush_tests.rs` (6 — the close-path flush: the unarmed-write discard, the `{linger,{true,0}}` flag, the teardown-vs-close-verb split, and `udp_inet`'s absent slot), `close_tests.rs` (5 — what a teardown keeps and what the close verb drops), `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers), `passive_recv_tests.rs` (9 — the passive `gen_tcp:recv` park), `accept_opts_family_tests.rs` (7 — `prim_inet:accept_opts/3`'s whole eleven-code list, incl. `FamilyOpts`) and `shutdown_contract_tests.rs` (12 — the `gen_tcp:shutdown/2` aftermath)
 - `drivers/spawn_teardown_tests.rs` → the `spawn` driver's **teardown ordering** suite (4 tests), a `#[path]` test module of `drivers/spawn.rs` (so `super` is `spawn`): `stop` gives the child end-of-file before anything is killed, closing the port delivers every queued byte of a payload larger than a pipe buffer, a child that never reads stdin does not hang the close, and that same row cross-checked against the system `erl` — every wait polls a condition under a 60 s hang guard (never a wall-clock budget), skipping **loudly** without `erl`
 - `abi/flush_tests.rs` → `abi::DriverPort`'s `flush` forwarding suite (5 tests), a `#[path]` test module of `abi/port.rs` over `cc`-built C fixtures (`flush_driver.c`, `flush_driver_no_flush.c`, `flush_driver_marker.c`): the loaded driver's `flush` runs exactly once and before its `stop`; an entry with no `flush` slot closes cleanly and still stops; the order is `flush` → the drain's `output` → `stop`; a loaded driver never parks a closing port (its `output`/`outputv` are `void`, so the queue always counts as written); and the marker build's `driver_output` from inside `flush` reaches the owner (gated on `host_symbols_exported`, since the lib unit-test binary lacks `-Wl,--export-dynamic`)
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
