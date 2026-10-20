@@ -8,7 +8,7 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 ## Status
 **Implemented.** Every module (list in §API Surface) carries real bodies, incl. `decode/local_node.rs`, `decode/options.rs`, and the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`).
 Test count at this HEAD: **519 tests across 36 targets** (lib unit + 34 `tests/` binaries + doc-test), 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`); the exact count moves as tests are added — re-run the command for the current figure.
-Differential gate: **`total=2925 agree=2924 mismatch=0 unsupported=1 skipped=0`**, exit **0** — the sole allowlisted gap is `wire/new_fun_ext_encode` (the unclosable `erl_eval` lambda; re-run `../tools/differential/gate.sh` for the live split).
+Differential gate: **`total=2925 agree=2924 mismatch=0 unsupported=1 skipped=0`**, exit **0** — the sole allowlisted gap is `wire/new_fun_ext_encode`, a `FunKind::Local` the encoder is given **no** identity for (the closure `beam_rt`'s `-eval` route synthesizes itself; §Fun identity, §Known Issues; re-run `../tools/differential/gate.sh` for the live split).
 ## API Surface (FROZEN — dependents route here)
 Signatures only; the wire rules and C ground truth live below. All fallible calls return `beam_common::Result<_>`; a violated precondition is `BadArg` (§Constraints). Re-exported at the crate root and via `beam_codec::prelude::*`.
 `src/lib.rs` — modules `tag`, `reader`, `writer`, `atom_cache`, `off_heap`, `compress`, `encode`, `decode`, `error`, `term`, `ref_wire`, `prelude`, plus `pub const VERSION_MAGIC: u8 = 131`; lints `#![deny(unsafe_code)]` with exactly one `#[allow(unsafe_code)] mod term;`.
