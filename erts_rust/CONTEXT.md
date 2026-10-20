@@ -190,7 +190,12 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
   entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); the
   match-spec compiler beyond the core spec forms; `put_record/6`'s create form for a **foreign**
-  module's record id (the running module's own records are supported); several
+  module's record id (the running module's own records are supported) — the fix seam is a new
+  *defaulted* `beam_engine::ExecutionContext` method handing back the owner module's
+  `Arc<Module>` (the loaded modules ARE retained: `CodeServer`'s `modules: HashMap<String,
+  Arc<Module>>`, all lowered against one shared atom table), since `beam_engine` cannot reach
+  `beam_rt`/`beam_bifs` from an instruction and every tier funnels through
+  `families::records::local_definition`; several
   structured-raise-reason degradations; the datagram/inet data path (`gen_udp:send/4`,
   `inet:getstat/1`, `gen_tcp:connect/3` and `listen/2`); depth of live distribution interop. Every one
   returns a typed error, never a wrong result.
