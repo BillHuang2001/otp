@@ -955,4 +955,86 @@ mod tests {
         // A live set above the cap leaves the clamp — not a fabricated larger target.
         assert_eq!(capped.young_after_fullsweep(233, 233, 5_000), 233);
     }
+
+    /// The C's initial-heap rule (`erl_process.c:12586-12592`): a new process's first heap is
+    /// its `min_heap_size`, and a policy with no minimum keeps its `initial_young_words` seed.
+    #[test]
+    fn initial_heap_words_is_the_minimum_when_one_is_set() {
+        // No floor: the seed is the rule (`HeapPolicy::default`'s 233 stands in for the C's
+        // `H_MIN_SIZE`), and a caller-set seed is honoured verbatim rather than re-rounded.
+        assert_eq!(HeapPolicy::default().initial_heap_words(), 233);
+        assert_eq!(
+            HeapPolicy {
+                initial_young_words: 1024,
+                ..HeapPolicy::default()
+            }
+            .initial_heap_words(),
+            1024
+        );
+
+        // A floor wins, in **both** directions: `+hms 4000` => 4185 (the oracle's fresh-process
+        // `heap_size`), and `+hms 100` => 142 -- *below* the unconfigured 233 seed, because the
+        // C's default `H_MIN_SIZE` is simply replaced by the switch.
+        assert_eq!(HeapPolicy::from_min_max(4185, 0).initial_heap_words(), 4185);
+        assert_eq!(HeapPolicy::from_min_max(142, 0).initial_heap_words(), 142);
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(0, 0, 65_535).initial_heap_words(),
+            233
+        );
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(1000, 0, 65_535).initial_heap_words(),
+            1598
+        );
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(8000, 0, 65_535).initial_heap_words(),
+            10958
+        );
+    }
+
+    /// [`HeapPolicy::spawn_policy`] floors a `spawn_opt` request against the **global**
+    /// policy's minimums (the C `H_MIN_SIZE`/`BIN_VH_MIN_SIZE`), which is the one authority --
+    /// so `+hms 4000` floors `{min_heap_size, 100}` at 4185, and `+hms 100` floors it at 142.
+    /// Everything else (`max_heap_size`, the initial space sizes) is inherited from the global.
+    #[test]
+    fn spawn_policy_floors_against_the_global_policy() {
+        let default_global = HeapPolicy {
+            min_heap_words: DEFAULT_MIN_HEAP_WORDS,
+            ..HeapPolicy::default()
+        };
+        // The unconfigured emulator: identical to `from_spawn_opts`.
+        assert_eq!(
+            default_global.spawn_policy(0, 0, Some(65_535)),
+            HeapPolicy::from_spawn_opts(0, 0, 65_535)
+        );
+
+        for (hms, floor) in [(100usize, 142usize), (1000, 1598), (4000, 4185), (8000, 10958)] {
+            let global = HeapPolicy {
+                min_heap_words: next_heap_size(hms, 0),
+                ..HeapPolicy::default()
+            };
+            assert_eq!(global.min_heap_words, floor, "+hms {hms}");
+            // A below-floor request is replaced by the global (never rounded past it) ...
+            assert_eq!(global.spawn_policy(100, 0, None).min_heap_words, floor);
+            // ... an above-floor request is rounded through the growth table ...
+            assert_eq!(
+                global.spawn_policy(20_000, 0, None).min_heap_words,
+                next_heap_size(20_000, 0)
+            );
+            // ... and the global's binary-vheap floor applies likewise.
+            assert_eq!(global.spawn_policy(0, 100, None).min_bin_vheap_words, 46_422);
+            // An absent `fullsweep_after` inherits the global's; every other field too (the
+            // C's `H_MAX_SIZE` included).
+            let inherited = global.spawn_policy(0, 0, None);
+            assert_eq!(inherited.fullsweep_after, global.fullsweep_after);
+            assert_eq!(inherited.initial_mature_words, global.initial_mature_words);
+            assert_eq!(inherited.need_reserve_words, global.need_reserve_words);
+            assert_eq!(inherited.max_heap_words, global.max_heap_words);
+            // The inherited maximum really is the global's.
+            let capped = HeapPolicy {
+                max_heap_words: 12_345,
+                ..global.clone()
+            };
+            assert_eq!(capped.spawn_policy(0, 0, None).max_heap_words, 12_345);
+        }
+    }
 }

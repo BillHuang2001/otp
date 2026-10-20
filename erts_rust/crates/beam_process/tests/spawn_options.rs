@@ -127,8 +127,15 @@ fn the_heap_policy_reaches_the_collector() {
     );
     assert_eq!(policy.fullsweep_after, 10);
 
-    // The initial spaces are sized from the same policy.
-    assert_eq!(collector.young().capacity_words(), policy.initial_young_words);
+    // The initial spaces are sized from the same policy: the young space at the C's
+    // initial-heap rule (`max(heap_need, min_heap_size)`, `erl_process.c:12586-12592`), which
+    // for a spawning process is the `min_heap_size` the option installed.
+    assert_eq!(collector.young().capacity_words(), policy.initial_heap_words());
+    assert_eq!(
+        collector.young().capacity_words(),
+        policy.min_heap_words,
+        "a fresh process's heap is exactly its min_heap_size"
+    );
     assert_eq!(
         collector.mature_capacity_words(),
         policy.initial_mature_words
