@@ -1005,6 +1005,43 @@ fn foreign_pid(fixture: &Fixture, heap: &mut Heap, number: u64) -> Eterm {
     )
 }
 
+/// The wire image of a **locally minted** monitor reference `id`: an external
+/// reference (`NEWER_REFERENCE_EXT`) on `node`/`creation` whose three identifier words
+/// are the C's canonical `erts_set_ref_numbers` pack (`erl_bif_unique.h:117-131`) —
+/// the 18-bit reference number in `num[0]`, its bits 18..31 in `num[1]`, the rest in
+/// `num[2]`:
+///
+/// ```text
+/// num[0] = id & 0x3FFFF        (REF_MASK)
+/// num[1] = id & 0xFFFC_0000    (ERTS_REF1_NUM_MASK)
+/// num[2] = id >> 32
+/// ```
+///
+/// This is byte-for-byte what the production encoder writes
+/// (`src/dist_client/signals.rs::monitor_ref_term`) and the exact inverse of the
+/// sink's unpack (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159-167`). A
+/// hand-packed id with any other layout round-trips to a **different** id, so the
+/// outgoing remote monitor it names is not found — use this helper for every
+/// locally minted reference; a **peer**-minted one on a foreign node is written
+/// verbatim instead.
+fn local_monitor_ref_image(heap: &mut Heap, node: Eterm, creation: u32, id: u64) -> Eterm {
+    /// `REF_MASK`, `erl_bif_unique.h:127`
+    const REF_MASK: u32 = (1 << 18) - 1;
+    /// `ERTS_REF1_NUM_MASK__`, `erl_bif_unique.h:112-113`
+    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
+    make_external_ref(
+        heap,
+        node,
+        &[
+            (id & u64::from(REF_MASK)) as u32,
+            (id & u64::from(REF1_NUM_MASK)) as u32,
+            (id >> 32) as u32,
+        ],
+        creation,
+    )
+    .expect("materialize a local monitor reference image")
+}
+
 /// Routes `delivery` through a `LocalDeliverySink` over `table` for the node named by
 /// `node` with [`NODE_CREATION`].
 fn route(table: &mut ProcessTable, node: Atom, delivery: &Delivery) -> DeliveryOutcome {
@@ -1699,18 +1736,8 @@ fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
 
     // The wire image of **our own** reference, exactly as `dist_client` packs it onto
     // the outgoing `DOP_MONITOR_P`: `{our_node, our_creation, numbers}` with the C's
-    // `erts_set_ref_numbers` split of the id (`erl_bif_unique.h:115-134`).
-    let echoed = make_external_ref(
-        &mut heap,
-        make_atom(node),
-        &[
-            (id & u64::from((1u32 << 18) - 1)) as u32,
-            (id & u64::from(0xFFFC_0000u32)) as u32,
-            (id >> 32) as u32,
-        ],
-        NODE_CREATION,
-    )
-    .expect("the echoed reference image");
+    // `erts_set_ref_numbers` split of the id (`erl_bif_unique.h:117-131`).
+    let echoed = local_monitor_ref_image(&mut heap, make_atom(node), NODE_CREATION, id);
     let reason = make_small(7);
     let down = Delivery::MonitorExit {
         watched,
@@ -1746,13 +1773,12 @@ fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
 
     // A reference this node never minted as a monitor matches no record: the C resolves
     // the DOWN through the watcher's monitor tree and **drops** a miss.
-    let stray = make_external_ref(
+    let stray = local_monitor_ref_image(
         &mut heap,
         make_atom(node),
-        &[0u32, 0u32, id.wrapping_add(1000) as u32],
         NODE_CREATION,
-    )
-    .expect("a reference with no matching record");
+        id.wrapping_add(1000),
+    );
     let unmatched = Delivery::MonitorExit {
         watched,
         watcher: pid.to_eterm(),
@@ -1959,13 +1985,7 @@ fn every_routed_inbound_family_routes_nothing_outbound() {
         .monitor_term(pid, peer, MonitorKind::Process)
         .expect("record the outgoing remote monitor");
     let id = monitor.id();
-    let echoed = make_external_ref(
-        &mut heap,
-        make_atom(node),
-        &[0u32, (id >> 32) as u32, id as u32],
-        NODE_CREATION,
-    )
-    .expect("the echoed reference image");
+    let echoed = local_monitor_ref_image(&mut heap, make_atom(node), NODE_CREATION, id);
 
     let log = Rc::new(RefCell::new(Vec::new()));
     fixture.table.set_dist_router(Box::new(RecordingRouter {
