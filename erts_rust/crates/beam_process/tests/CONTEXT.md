@@ -113,13 +113,59 @@ SMP pool:
 52. `node_down.rs` (4 tests) — `ProcessTable::node_down`'s **`noconnection` semantics and record purge**, through the public API: `a_trapping_link_partner_traps_the_node_down_exit` (a trapping peer survives with `{'EXIT', RemotePid, noconnection}` at the mailbox head — external pid in the body, node atom as the message `from`); `a_non_trapping_link_partner_dies_with_exactly_noconnection` (the observed death reason is the bare atom `noconnection`, never `killed` — the link family); `a_remote_monitor_down_is_delivered_and_wakes_a_waiting_watcher` (`{'DOWN', Ref, process, RemotePid, noconnection}` delivered **and** a `Waiting` watcher landing in `drain_woken`); `a_node_down_purges_only_the_lost_nodes_records_in_both_directions` (the lost node's incoming `remote_watchers` record gone while a record from **another** node survives, and the `remote_links`/`remote_monitors` records naming it gone while unrelated ones survive).
     **No `erl` oracle probe is possible**: that would need a live second node (a real `net_kernel` connection to break), so the C ground truth is cited instead (`dist.c:304-324`/`:341-345`/`:379-423`, `erl_proc_sig_queue.c:2553-2576`).
 
-## Constraints
-- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry completion signals, `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is the pool's converging idle wait (it also requires the in-flight count to be zero, so counters read after it are exact); a wedged pool fails with a clear timeout instead of hanging the suite.
-  Likewise every heap figure is derived from the public heap-policy API (`capacity_words`/`next_heap_size`) and every "did nothing" claim is read back off the receiver's own observables — no suite asserts a wall-clock threshold.
-- `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must last far above that bound — the anti-vacuity guard).
-- The `oracle_*` suites (`alias.rs`, `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`, and the `erl` cross-checks in `capability_inventory.rs`/`port_monitor_cleanup.rs`) go through the **shared driver** `common/mod.rs`, **skip loudly** when `erl` is absent, and must never spawn a child process that inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the probes are written child-free).
-- Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`; sandbox `$HOME` is read-only); cross-checks against the real system ERTS belong to the sibling `../../../tools/differential/` harness.
-  Current: **664 passed, 0 failed, 1 ignored** (215 in-module unit tests + 448 across the 52 `tests/*.rs` targets + 1 doctest; the ignore is `preemption.rs`'s non-yielding-runner hang).
+39. `signal_fragment_fallback.rs` (8 tests) — the **heap-fragment fallback of the signal-delivery
+    path** at **both** refusal sites for a receiver with **unpublished live roots** — a
+    **relocation-exempt** process, or a **`Running`** one (`Process::has_unpublished_roots`): the
+    **apply-time** message
+    build (`build_signal_message` / the queued `deliver_head_signal`, via `enqueue_fragment_signal`) and
+    the **enqueue-time** reason copy (`copy_reason_onto`, via `enqueue_down_signal`'s
+    `deliver_down_fragment` / `enqueue_exit_signal`'s `deliver_exit_fragment`). A refused payload is
+    built on a 64-word scratch arena and copied **whole** into a fresh `beam_message::HeapFragment` the
+    queued `Message` owns (the shared `enqueue_fragment_payload`, which copies through the **source**
+    process's off-heap table) rather than being lost — the C's model (`erl_proc_sig_queue.c` builds
+    every signal message into the message's own fragment). A **controlled experiment** on a 7-word
+    nursery drained to one word short of the four-word head build, each case first asserting that
+    refusal and that a refused request writes nothing: (1) an exempt watcher still receives its
+    `{'DOWN', Ref, process, Target, noproc}` — exactly once, FIFO behind the fixture's filler, the
+    five-tuple structurally equal to the expected one (`compare::eq`, so the boxed reference compares by
+    content), `fragments().is_some()` with `fragment.contains(payload)`, while
+    `minor_gcs()`/`young().base()`/`heap_used_words()` are **unchanged**; (2) the same for a trapping
+    receiver's `{'EXIT', Dying, normal}`; (3)/(4) the same **enqueue-time** route for a reason one word
+    larger than the receiver's **whole** nursery, so the reason copy itself is the refused request and
+    the signal is never queued (`pending_signals` stays 0, the nursery/mature observables are unchanged)
+    while the DOWN / the oversized trapping `{'EXIT', …}` is still delivered whole, fragment-resident,
+    with a **blocked** receiver woken by the delivery itself (`drain_woken()` = the receiver — the
+    queued form's wake happens in `deliver_head_signal`, which this route bypasses); (5) the
+    **non-exempt contrast** — the identical refusal takes the other arm: `minor_gcs()` up by exactly
+    one, the nursery grown and relocated (`base()` moved) onto the target the landed live-set rule
+    derives for the `FILLER_WORDS`-word young live set the round evacuated
+    (`HeapPolicy::young_after_collection`, pinned exactly; never below `nursery_floor_words()` and
+    always a curated growth-table size), the filler promoted to mature, the EXIT built on the **new**
+    nursery (`fragments()` is `None`,
+    `contains_term(payload)` young, not mature) — so the fallback did not replace the grow-and-retry
+    path. (6) the **message-delivery** half of the gate: `Process::deliver` to a **`Running`** (not
+    exempt) receiver surfaces the raw refusal and enqueues nothing, leaving
+    `minor_gcs()`/`young().base()`/`heap_used_words()`/mature usage untouched, and the host's fragment
+    fallback (`beam_message::send_fragmented` through `Process::heap_and_mailbox_mut`) still delivers
+    the message whole and fragment-resident (`compare::eq` against the source term) with the fixture's
+    filler keeping its FIFO place; (7) the **schedule-in** half, the realistic `Running` sequence — a
+    queued DOWN with the immediate `noproc` reason (so the enqueue-time copy allocates nothing and the
+    signal *is* queued, deferred because the receiver is the executing process, `pending_signals` = 1)
+    is refused at the **apply-time** build at `service_signals`, so the DOWN lands fragment-resident
+    (structurally equal to the expected five-tuple) with the nursery untouched and the queue drained;
+    (8) the **control** — the identical refusal on the identical receiver in `ProcessState::Waiting`
+    takes the collect-and-grow arm (one collection, the nursery grown and relocated onto the
+    live-set target, the filler promoted to mature, the DOWN built on the receiver's **new** nursery
+    with no fragment, and — unlike
+    the running case — the signal serviced **eagerly**, `drain_woken()` = the receiver) — pinning that
+    the gate is the *running* state, not a blanket refusal.
+    **Discriminating by construction: against the pre-fix commit `360a4c6536`, cases 1 and 2 FAIL
+    with the raw `Alloc(AllocFailure { requested: 32, kind: Heap })` out of `terminate` (signal lost)
+    while case 5 passes; before the enqueue-time route, cases 3 and 4 FAIL (the drop is logged and no
+    message arrives).** An exit signal to a **non-trapping** exempt receiver is *not* covered by the
+    fallback (it would have to terminate the receiver) and stays a surfaced refusal — entry 29.
+    Deterministic — sizes from the public heap-policy arithmetic, no sleeps / wall-clock bounds /
+    oracle.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`, `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`, `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `decline_gate_builders.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs`, `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs`, `off_heap_reachability.rs` → the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals (incl. the **family-aware** exit policy — a link-exit `kill` traps, an explicit `erlang:exit/2` `kill` does not), GC roots, PCB state, pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the `{'EXIT',…}`/`{'DOWN',…}` builders (enqueue-time reason copy + the heap-fragment fallback for a declined relocation — crate-owned unpublished roots or the host `CollectionGate`), the GC relocation exemption, the queued-message re-install, and the process-owned off-heap refc-binary list (conservative declared-dead sweep + **reachability-driven** sweep)

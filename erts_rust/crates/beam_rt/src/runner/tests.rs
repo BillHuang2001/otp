@@ -3099,14 +3099,54 @@ fn counter_table(
     }
     rows
 }
+
+/// The words one `heap_growth:run/1` iteration requests from the heap: the fixture's single
+/// `test_heap 1 401` (`tests/fixtures/heap_growth.erl`), i.e. this shape's **per-iteration
+/// footprint**. Every collection-cadence derivation below divides by it, so a fixture that
+/// changes the request moves the derivation instead of silently breaking a quoted relation.
+const HEAP_GROWTH_ITERATION_WORDS: usize = 401;
+
+/// How many iterations one **settled** nursery carries between two collections — the `K` of the
+/// `collections == 1 + N / K` relation both growth suites pin, derived from the run's own
+/// measured peak nursery capacity.
+///
+/// The capacity is a *measurement*, not a constant: `beam_gc`'s `HeapPolicy::young_after_collection`
+/// **keeps** any capacity inside `[young_minor_target_words(live), YOUNG_SHRINK_FACTOR]` x that
+/// live-set-derived target and lands on the target outside it, so
+/// what a run settles on is whatever the growth seam installed for this workload's tiny live set.
+/// What the cadence follows from is the arithmetic of that capacity: an iteration allocates
+/// [`HEAP_GROWTH_ITERATION_WORDS`] words and the words a collection keeps alive here (the loop
+/// index and its accumulator — a handful) are far below the `capacity mod footprint` slack, so
+/// exactly `floor(capacity / footprint)` iterations fit after a collection and the next one
+/// collects. At the measured **843**-word capacity that is `843 / 401 == 2`: two iterations
+/// allocate 802 of the 843 words and the third asks for more than is left.
+///
+/// Floored at one: a capacity below a single footprint still carries one iteration (the
+/// admission door collects, then that iteration fits).
+fn heap_growth_iterations_per_nursery(peak_young_capacity: usize) -> u64 {
+    (peak_young_capacity / HEAP_GROWTH_ITERATION_WORDS).max(1) as u64
+}
+
+/// The collections `heap_growth:run/1` takes over `n` iterations under
+/// [`heap_growth_iterations_per_nursery`]'s cadence: one collection per `iterations_per_nursery`
+/// iterations, plus the one the run takes before its first iteration (the nursery a fresh process
+/// starts with is the collector's floor, smaller than a single 401-word request). Measured at
+/// N = 1..10 as `1 + N / K` exactly, and at N = 5 000 / 10 000 / 25 000 / 50 000 / 100 000 as
+/// 2 501 / 5 001 / 12 501 / 25 001 / 50 001.
+fn heap_growth_expected_collections(n: i64, iterations_per_nursery: u64) -> u64 {
+    (n as u64) / iterations_per_nursery + 1
+}
+
 /// **The headline evidence: on a growth-shaped workload the per-call counters are FLAT in N.**
 ///
 /// `churn:run/1` is driven at three increasing iteration counts on a fresh runtime each time, so
 /// its counters are per-run. The `foreign` regression claims the per-call cost *grows* with N;
 /// if that were a real per-call work increase rather than a measurement artefact, then at least
 /// one of these deterministic counters — collections per call, or slices per call — would grow
-/// with N too. This test pins the truth for the churn shape: both stay flat, so on this shape
-/// the excess wall clock is **not** extra per-call GC/runner work.
+/// with N too. This test pins the truth for the churn shape: neither grows — both are flat,
+/// because the nursery settles on the live-set-derived capacity (1 220 words) and every call
+/// therefore performs the same allocation and collection work — so on this shape the excess wall
+/// clock is **not** extra per-call GC/runner work.
 #[test]
 fn the_churn_workloads_per_call_counters_are_flat_in_n() {
     let rows = counter_table(churn_fixture(), "churn", &[2_000, 10_000, 40_000]);
@@ -3120,8 +3160,8 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
     assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
 
     // The per-call ratios must be flat: the widest run's per-call counters may not exceed the
-    // narrowest's by more than a small slack (the nursery grows once at the start, which is a
-    // fixed cost amortized away by the wider run — so the ratio only ever *falls*).
+    // narrowest's by more than a small slack (the nursery settles on its live-set-derived
+    // capacity, so the per-call ratios are the same at every N).
     let collections_per_call_ratio =
         (r3.collections as f64 / (n3 + 1) as f64) / (r1.collections as f64 / (n1 + 1) as f64);
     assert!(
@@ -3149,54 +3189,60 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 }
 
 /// **The mechanism control: the engine-native growth shape is *collected*, not grown, at exactly
-/// one collection per iteration plus one per pre-emption — with flat per-call counters.**
+/// one collection per settled-nursery's worth of iterations — with flat per-call counters.**
 ///
 /// `heap_growth:run/1` repeats a single 401-word `test_heap` allocation — far above a fresh
-/// process's nursery (233 words) — so it *must* reach the engine's full heap-admission door
-/// (`RuntimeContext::ensure_heap_full` → `Context::collect_or_grow`) on **every** iteration,
-/// with **no** registered-BIF result copy-out involved. That makes it the control for the
-/// `churn` shape: `churn` drives the BIF-result copy path, `heap_growth` drives the pure
-/// engine-allocation path, and if the collection-debt / retired-nursery mechanism were the
-/// source of an N-dependent per-call cost, this shape is where it would show.
+/// process's nursery (233 words) — so it reaches the engine's full heap-admission door
+/// (`RuntimeContext::ensure_heap_full` → `Context::collect_or_grow`) on every iteration whose
+/// request the settled nursery cannot hold, with **no** registered-BIF result copy-out involved.
+/// That makes it the control for the `churn` shape: `churn` drives the BIF-result copy path,
+/// `heap_growth` drives the pure engine-allocation path, and if the collection-debt /
+/// retired-nursery mechanism were the source of an N-dependent per-call cost, this shape is where
+/// it would show.
 ///
 /// Its iteration counts are chosen so that **every** run spans several reduction slices (the
 /// only window a live process's collector is readable from outside the runner), unlike a small
 /// run that the native baseline tier completes inside a single slice.
 ///
-/// # The count is `collections == N + yields`, and it is *derived*
+/// # The count is `collections == 1 + N / K`, and it is *derived*
 ///
-/// Two independent doors, one collection each:
+/// `K` is how many iterations the shape's **settled** nursery carries between two collections,
+/// derived from the run's own measured peak young capacity rather than quoted
+/// ([`heap_growth_iterations_per_nursery`]): it measured **2** on every row, i.e.
+/// `collections == 1 + N / 2`.
 ///
-/// * **one per iteration — the heap-admission door.** The 401-word request cannot fit the current
-///   space, so `collect_or_grow` collects on *that* iteration; `beam_gc`'s two-step
-///   `adjust_after_fullsweep` rule then sizes the next space from the loop's tiny live set, so the
-///   *following* iteration again cannot fit and collects again. No iteration takes the
-///   no-relocation `grow_nursery` arm, which is why the boundary-sampled retired chain stays at a
-///   single space (`peak_young_spaces == 1`) and no boundary observes an un-settled debt
-///   (`debt_boundaries == 0`): the shape is collected, never grown.
-/// * **one per pre-emption — the reduction/yield-boundary door**
-///   ([`crate::context::gc::reds_door`], called from the runner's `Yield` arm). A slice spends
-///   `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 reds, which is exactly the door's
-///   `REDS_BOUNDARY_MIN_REDS` interval, and the loop's 401-word allocation per iteration fills the
-///   space well past the door's 7/8 occupancy watermark, so **every** pre-emption collects —
-///   once, never more, because the interval resets at each boundary.
+/// * **one collection per `K` iterations — the heap-admission door.** A 401-word request fits the
+///   settled nursery `K` times (`2 x 401 = 802` of its 843 words) and the next one cannot, so
+///   `collect_or_grow` collects on that iteration and `HeapPolicy::young_after_collection`
+///   **keeps** the same capacity (it never grows a nursery, so the settled figure comes from the
+///   growth seam and the fullsweep, not from the collection). That is also why the boundary-sampled
+///   retired chain stays at one space (`peak_young_spaces == 1`) and no boundary observes an
+///   un-settled debt (`debt_boundaries == 0`).
+/// * **the `+ 1`: one collection before the first iteration.** A fresh process starts on the
+///   collector's floor (233 words), smaller than a single 401-word request, and the set of
+///   collections is that one plus one at every `K`-th iteration — measured `1 + N / K` exactly
+///   from N = 1 to N = 10 (1, 2, 2, 3, 3, 4, 4, 5, 5, 6) as well as on the five rows below.
 ///
-/// Hence the relation this test pins, over each row's own counters:
-/// `collections == N + yields` — with no constant to calibrate. Measured (this host, debug build)
-/// at N = 5 000 / 10 000 / 25 000 / 50 000 / 100 000: `collections` = 5 001 / 10 002 / 25 006 /
-/// 50 012 / 100 024 against `yields` = 1 / 2 / 6 / 12 / 24.
+/// The **boundary door adds nothing to the count**: a slice prices exactly 800 iterations
+/// (`reductions == 5N + 5` against a 4 000-unit budget) and 800 is a multiple of `K`, so each
+/// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
+/// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
+/// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
+/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 1 and
+/// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress
 ///
-/// * a `beam_gc` sizing change that re-introduces a growth arm (a collection that leaves the next
-///   space too small to hold the request): the per-iteration collection would disappear, so the
-///   count would fall **below** `N` (and `peak_young_spaces` would rise above 1);
-/// * a change to [`REDS_BOUNDARY_MIN_REDS`](crate::context::gc::reds_door::REDS_BOUNDARY_MIN_REDS)
-///   or to the door's occupancy watermark, or a valve/latch change that made the door decline: the
-///   boundary collections would stop tracking `yields` one-for-one;
-/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`) that moves
-///   `yields` itself — the equation would still hold, but the measured readings quoted above
-///   would move.
+/// * a `beam_gc` sizing change that moved the settled capacity: `K` moves with it and the expected
+///   count moves too, so the relation re-derives rather than breaking silently — but a capacity
+///   that no longer carries two iterations is a behaviour change worth reading;
+/// * a growth arm re-appearing (an iteration taking the no-relocation `grow_nursery` arm instead of
+///   collecting): the retired chain would rise above one space and a boundary would observe
+///   collection debt;
+/// * a change to the fixture's `test_heap` request: `K` moves with the footprint;
+/// * a slice-granularity change (`RUN_STEP_SLICES`, `DEFAULT_REDUCTIONS_PER_SLICE`) that made a
+///   slice price a non-multiple of `K` iterations — a boundary collection would then land
+///   mid-cycle and add to the count.
 #[test]
 fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
     // Five N, spanning a slice boundary count from 2 to 26: the relation is checked on every row
@@ -3208,15 +3254,23 @@ fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
     let (n3, r3) = rows[3];
     let (_, last) = rows[4];
 
-    // The relation, exact, on every measured row: one collection per iteration (the admission
-    // door) plus one per pre-emption (the boundary door). Derived above, never calibrated.
+    // The relation, exact, on every measured row, and *derived*: `K` iterations per settled
+    // nursery (from that row's own peak capacity) plus the one collection before the first
+    // iteration. Never calibrated to a quoted count.
     for &(n, row) in &rows {
+        let iterations_per_nursery = heap_growth_iterations_per_nursery(row.peak_young_capacity);
+        assert_eq!(
+            iterations_per_nursery, 2,
+            "N={n}: a {}-word settled nursery must carry two {}-word iterations — that is what \
+             the run actually did (measured at every row): {row:?}",
+            row.peak_young_capacity, HEAP_GROWTH_ITERATION_WORDS
+        );
         assert_eq!(
             row.collections,
-            (n as u64) + (row.yields as u64),
-            "N={n}: expected N + yields = {} collections (one per iteration + one per \
-             pre-emption), got {}: {row:?}",
-            (n as u64) + (row.yields as u64),
+            heap_growth_expected_collections(n, iterations_per_nursery),
+            "N={n}: expected 1 + N/K = 1 + {n}/{iterations_per_nursery} = {} collections (one per \
+             {iterations_per_nursery} iterations plus the one before the first), got {}: {row:?}",
+            heap_growth_expected_collections(n, iterations_per_nursery),
             row.collections
         );
     }

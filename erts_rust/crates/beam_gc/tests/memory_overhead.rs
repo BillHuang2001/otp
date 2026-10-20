@@ -393,7 +393,7 @@ fn rss_and_word_accounting_plateau_across_cycles() {
     // mature space would show up as monotonic growth in both RSS and the word accounting.
     //
     // The nursery is pinned (`min_heap_words` == its initial size) because the bounded
-    // `HeapPolicy::young_after_collection` shrinks a nursery a fullsweep leaves empty: every
+    // `HeapPolicy::young_after_fullsweep` shrinks a nursery a fullsweep leaves empty: every
     // cycle allocates the same corpus, so a stable nursery is what makes the word accounting
     // directly comparable cycle to cycle.
     let policy = HeapPolicy {

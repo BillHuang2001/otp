@@ -78,8 +78,9 @@ fn policy(cadence: u32, young: usize, mature: usize) -> HeapPolicy {
 
 /// Like [`policy`], but with an explicit `min_heap_words` floor.
 ///
-/// The (C-faithful) post-collection resize (`HeapPolicy::young_after_collection`, mirroring
-/// `erl_gc.c:1493`) *shrinks* a nursery the round leaves mostly empty, so a test that must
+/// The (C-faithful) post-collection resize (`HeapPolicy::young_after_collection` after a minor,
+/// `HeapPolicy::young_after_fullsweep` after a fullsweep; mirroring `erl_gc.c:1493` and
+/// `erl_gc.c:2062-2098`) *shrinks* a nursery the round leaves mostly empty, so a test that must
 /// reserve a fresh, *larger* block in the nursery each round has to pin a minimum.
 fn policy_with_min(cadence: u32, young: usize, mature: usize, min_heap_words: usize) -> HeapPolicy {
     HeapPolicy {
@@ -347,9 +348,11 @@ fn hamt_maps_survive_every_collection_on_both_strategies() {
     const ROUNDS: usize = 4;
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         // The nursery is re-sized after every collection (the chain collapses to one space,
-        // then `HeapPolicy::young_after_collection` sizes it from the surviving words,
-        // mirroring C `erl_gc.c:1493`), which *shrinks* it when a round leaves it mostly
-        // empty. Each round below reserves a fresh, growing HAMT block in the nursery
+        // then the policy's live-set target sizes it from what the round measured — the words a
+        // minor promoted (`HeapPolicy::young_after_collection`, mirroring C `erl_gc.c:1493`) or
+        // the whole live set a fullsweep kept (`HeapPolicy::young_after_fullsweep`)), which
+        // *shrinks* it when a round leaves it mostly empty. Each round below reserves a fresh,
+        // growing HAMT block in the nursery
         // (`map_words_capacity(100) == 2118` words by the last round), so pin a
         // `min_heap_words`/`initial_young_words` floor at/above that; otherwise the resize
         // shrinks the nursery below the next round's reservation and the build fails (a

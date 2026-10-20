@@ -95,9 +95,20 @@ const GC_PAYLOAD_BEAM: &str = concat!(
 /// [`GC_PAYLOAD_BEAM`]'s payload element count (`gc_payload:payload_length/0`).
 const PAYLOAD_LENGTH: i64 = 64;
 
-/// The churn rounds acceptance 6 runs — enough for many collections at the 233-word default
-/// nursery, with `fullsweep_after(0)` making every one of them a fullsweep.
+/// The churn rounds acceptance 6 runs — enough for many collections at the live-set-sized
+/// nursery, with `fullsweep_after(0)` making every cadence collection a fullsweep.
 const PAYLOAD_ROUNDS: i64 = 200;
+
+/// How many collections under `fullsweep_after = 0` may be **not** fullsweeps: exactly the
+/// reduction/yield-boundary door's **successful** kind-pinned young-only minors
+/// (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`), the one collection site that is not a
+/// cadence collection and whose refused minors are the door's own escalating `collect()` — a
+/// fullsweep — in that same call. A minor's promotion needs mature room that only a fullsweep
+/// installs (`HeapPolicy::mature_after_fullsweep`), and the door fires at most once per
+/// pre-emption and only where a park has crossed its seven-eighths occupancy watermark; the
+/// derivation for the figure this workload reaches is at the assertion in
+/// [`a_live_payload_survives_a_fullsweep_on_the_immix_path`].
+const BOUNDARY_MINOR_COLLECTIONS: u64 = 1;
 
 /// The emulator's default initial mature-generation size in words — the `beam_gc` default
 /// [`HeapOptions::default`] carries, and a value far below the break-even.
@@ -446,8 +457,10 @@ fn the_config_implied_strategy_runs_a_fullsweep_workload() {
 ///
 /// Asserted: the process's own collector really is the mark-region one while it runs; the
 /// workload returned its payload; **every element of that payload is intact**; the run drove
-/// collections and fullsweeps (`gc_stats().collections > 0`, `major == collections`); and no
-/// collection failed, halted a process or tripped a valve.
+/// collections and fullsweeps (`gc_stats().collections > 0`, and every cadence collection among
+/// them a fullsweep — the yield-boundary door's young-only minor is the one collection that is
+/// not, see [`BOUNDARY_MINOR_COLLECTIONS`]); and no collection failed, halted a process or
+/// tripped a valve.
 ///
 /// The payload check is deliberately structural rather than `x(0) == N`: a collection that
 /// relocated the heap against an incomplete root set would leave the payload's X/Y register
@@ -514,11 +527,46 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
     // 4. The runtime's own counters agree, and nothing failed.
     let after = rt.gc_stats();
     let collections = after.collections - before.collections;
+    let fullsweeps = after.major - before.major;
     assert!(collections > 0, "the workload really collected; {after:?}");
-    assert_eq!(
-        after.major - before.major,
-        collections,
-        "fullsweep_after 0 makes every collection a fullsweep; {after:?}"
+    assert!(
+        fullsweeps <= collections,
+        "a fullsweep is one of the collections, never more; {after:?}"
+    );
+    // Every collection the **cadence** reaches is a fullsweep (`fullsweep_due(0)` holds for every
+    // `minor_gcs`, so the collector's `collect` picks `CollectionKind::Major`), and the one site
+    // that can produce anything else — the reduction/yield-boundary door — runs a **kind-pinned
+    // young-only minor** (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`) and escalates
+    // *that same call* to `collect()` when the minor refuses, so a refused minor is no collection
+    // of its own: the excess `collections - fullsweeps` counts exactly the boundary minors that
+    // **succeeded**.
+    // A boundary minor may keep, shrink, or **grow** the nursery:
+    // `HeapPolicy::young_after_collection` keeps a capacity inside
+    // `[target, YOUNG_SHRINK_FACTOR × target]`, installs that target above the band, and installs
+    // it below the band too — the target being
+    // `young_minor_target_words` of the words the round itself promoted, i.e. a capacity derived
+    // from that round's live set and never from the fill it reached or the capacity it collected,
+    // which is what makes the installed figure a fixed point rather than a ratchet.
+    // A minor sizes only its own nursery, never its destination: the whole promotion must fit the
+    // mature region's free room (`collect_minor`'s up-front `free_lines() < needed` check, then
+    // the contiguous-run refusal of the atomic promotion), and only a **fullsweep** re-sizes that
+    // region (`mature_after_fullsweep` → `mature_target_words` = `MATURE_TARGET_LIVE_MULTIPLE` ×
+    // `need_after_fullsweep`, the multiple being the number of nursery-sized promotions one region
+    // is sized for).
+    // A successful minor therefore spends room a fullsweep installed, and once that room is gone
+    // the door's next collection is the escalating fullsweep — the region has to be re-sized by a
+    // fullsweep before another minor can be promoted out of it.
+    // The door also runs at most once per pre-emption (`REDS_BOUNDARY_MIN_REDS` is one slice
+    // budget) and only where a park has crossed the seven-eighths occupancy watermark or carries a
+    // growth's collection debt, so it is not a site every collection round reaches: after the one
+    // boundary minor here the nursery is collapsed onto that minor's own live-set target, and the
+    // run's remaining pre-emptions all park below the watermark — so the whole non-fullsweep count
+    // is that one minor (42 collections, 41 of them fullsweeps).
+    assert!(
+        collections - fullsweeps <= BOUNDARY_MINOR_COLLECTIONS,
+        "every cadence collection under fullsweep_after 0 is a fullsweep, and the only other \
+         collection site is the yield-boundary door's kind-pinned young-only minor (at most \
+         {BOUNDARY_MINOR_COLLECTIONS} of them); {after:?}"
     );
     assert_eq!(after.errors, 0, "no collection failed; {after:?}");
     assert_eq!(after.halted, 0, "no process halted its collection; {after:?}");

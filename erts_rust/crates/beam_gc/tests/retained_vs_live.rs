@@ -593,7 +593,7 @@ fn run_loop(label: &str, config: &GcConfig, kind: MatureKind) {
 ///
 /// * a 8192-word nursery holds the live graph plus the garbage and neither grows nor shrinks —
 ///   it is **pinned** with `min_heap_words` because the bounded
-///   [`HeapPolicy::young_after_collection`] shrinks a nursery a fullsweep leaves empty, and
+///   [`HeapPolicy::young_after_fullsweep`] shrinks a nursery a fullsweep leaves empty, and
 ///   every cycle re-allocates the same corpus;
 /// * a 12288-word mature generation (48 whole mark-region blocks) is a fixed point for both
 ///   strategies — the copying space shrinks it to the curated fixed point above the live set

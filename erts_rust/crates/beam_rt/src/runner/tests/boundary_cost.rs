@@ -30,59 +30,83 @@
 //!
 //! # The measured table (every figure below is printed by the test's own `eprintln!`)
 //!
-//! | N | slices | yields | collections | major | door checks | door collections | young spaces | young capacity |
-//! |---|---|---|---|---|---|---|---|---|
-//! | 2 000 | 905 | 904 | 15 346 | 2 514 | 904 | 113 | 1 | 609 |
-//! | 4 000 | 1 810 | 1 809 | 30 691 | 4 514 | 1 809 | 230 | 1 | 609 |
-//! | 10 000 | 4 525 | 4 524 | 76 728 | 10 514 | 4 524 | 571 | 1 | 609 |
+//! | N | slices | yields | collections | major | door checks | door collections | young spaces | young capacity | young occupancy | mature capacity | mature used |
+//! |---|---|---|---|---|---|---|---|---|---|---|---|
+//! | 2 000 | 905 | 904 | 3 468 | 169 | 904 | 128 | 1 | 1 220 | 1 065 | 4 185 | 4 068 |
+//! | 4 000 | 1 810 | 1 809 | 6 939 | 337 | 1 809 | 258 | 1 | 1 220 | 1 065 | 4 185 | 4 068 |
+//! | 10 000 | 4 525 | 4 524 | 17 341 | 838 | 4 524 | 646 | 1 | 1 220 | 1 065 | 4 185 | 4 068 |
 //!
 //! Three repetitions of the whole table are byte-identical, so every figure here is a
-//! **deterministic counter**, never a timing. The two relations pinned are:
+//! **deterministic counter**, never a timing. The relations pinned are:
 //!
 //! * **one check per pre-emption** — the door is handed exactly one boundary per `Yield` park
 //!   (`door.checks == yields`), never one per instruction: 904 / 1 809 / 4 524 checks against
-//!   904 / 1 809 / 4 524 pre-emptions. That is **0.4518 / 0.4521 / 0.4524 checks per call**
-//!   (`N + 1` calls), i.e. a 4 000-reduction slice carries 2 001 / 905 = 2.2110, 4 001 / 1 810 =
-//!   2.2105 and 10 001 / 4 525 = 2.2102 calls, so the loop's own price is 4 000 / 2.2110 =
-//!   **1 809 reductions per call** (the churn counter table's independent `reductions` column
-//!   reads 3 619 770 over the very same 2 001 calls = 1 808.98);
-//! * **the seven-eighths watermark rations it to about one boundary in eight** —
-//!   `door.checks / 9 <= door.collections <= door.checks / 7`: the shape's own heap-admission
-//!   door settles its collection debt on every iteration, so the nursery is nearly exhausted
-//!   (seven eighths used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every ~eighth slice
-//!   end, and a boundary collection leaves the boundaries after it below the watermark. Measured
-//!   **113/904 = one in 8.00** (N = 2 000), **230/1 809 = one in 7.87** (N = 4 000) and
-//!   **571/4 524 = one in 7.92** (N = 10 000): the door fires on 0.0565 / 0.0575 / 0.0571 calls
-//!   of a shape that collects 7.6692 / 7.6708 / 7.6720 times per call — **0.74 %** of the run's
-//!   own collections. It is a *rate*, not an identity: 8.00 / 7.87 / 7.92 are not one another
-//!   and none of them is a law (the N = 2 000 row lands on 8.00 only because 113 × 8 = 904
-//!   exactly), which is why the assertion is the band and not `checks / 8`.
+//!   904 / 1 809 / 4 524 pre-emptions.
+//!   That is **0.4518 / 0.4521 / 0.4524 checks per call** (`N + 1` calls), i.e. a 4 000-reduction
+//!   slice carries 2 001 / 905 = 2.2110, 4 001 / 1 810 = 2.2105 and 10 001 / 4 525 = 2.2102
+//!   calls, so the loop's own price is 4 000 / 2.2110 = **1 809 reductions per call** (the run's
+//!   own `reductions` counter reads 3 619 770 / 7 239 547 / 18 098 860 over the very same
+//!   2 001 / 4 001 / 10 001 calls = 1 808.98 / 1 809.43 / 1 809.70);
+//! * **the seven-eighths watermark rations it to about one boundary in seven** —
+//!   `door.checks / 9 <= door.collections <= door.checks / 7`: the nursery is nearly exhausted
+//!   (seven eighths used, the C's `ERTS_VBUMP_ALLOC_REDS` moment) at only every ~seventh slice
+//!   end, and a boundary collection leaves the boundaries after it below the watermark.
+//!   Measured **128/904 = one in 7.06** (N = 2 000), **258/1 809 = one in 7.01** (N = 4 000) and
+//!   **646/4 524 = one in 7.00** (N = 10 000) — the band's lower edge, with 8 / 3 / 2 boundaries
+//!   of slack — which is why the assertion is the 7..9 band and never a nominal `checks / 8`.
+//!   The door collects on **0.0640 / 0.0645 / 0.0646 calls**, i.e. **3.69 / 3.72 / 3.73 %** of a
+//!   run that collects 1.7331 / 1.7343 / 1.7339 times per call: a **constant** share, not a
+//!   rising one — the nursery's own capacity is constant (next section), so the allocation each
+//!   slice performs fills it at the same rate at every N;
+//! * **the shape's own totals are linear in N, at a fixed per-call rate** — 3 468 / 6 939 /
+//!   17 341 collections and 169 / 337 / 838 majors over a 5× range is **1.7331 / 1.7343 / 1.7339
+//!   collections and 0.0845 / 0.0842 / 0.0838 majors per call** at every row.
+//!   They are still pinned as the exact measured table of [`MEASURED`], never as a formula.
 //!
-//! **What this module can no longer verify: the door-ON vs door-OFF A/B it used to quote.**
+//! # The nursery plateau, and the live figure the policy sizes it from
+//!
+//! `beam_gc`'s nursery policy is **live-set targeted**: a minor's live figure is its own copy
+//! volume (`GcStats::words_copied`), the capacity it installs is
+//! `HeapPolicy::young_minor_target_words(live) = next_words(live + need_reserve_words)` — floored
+//! by `HeapPolicy::nursery_floor_words()` — and `HeapPolicy::young_after_collection` keeps an
+//! existing capacity only inside `[target, YOUNG_SHRINK_FACTOR (8) x target]`, landing on the
+//! target otherwise.
+//! The shape's own live figure is read off its collector: the process's cumulative
+//! `GcStats::words_copied` over its cumulative collection count at the last boundary it was
+//! observable at, i.e. a **mean copy volume per collection** — 545 955 / 3 465 = **158 words**
+//! (N = 2 000), 1 092 465 / 6 936 = **158** (N = 4 000) and 2 727 682 / 17 339 = **158**
+//! (N = 10 000), constant as a constant live set must be.
+//! It mixes the minors' young-only copy volume with the fullsweeps' whole-heap one, so it can
+//! only **over**-state the young-only figure the minor rule consumes — the conservative direction
+//! for the band asserted below.
+//! That puts the minor target at `young_minor_target_words(158) = next_words(222) = 233` words
+//! and the keep-band at `[233, 8 x 233 = 1 864]`; the sampled **1 220-word** capacity sits inside
+//! it, which is exactly why the capacity is a **fixed point** of the rule and does not move with
+//! N (1 220 / 1 220 / 1 220): the plateau is a steady state of `young_after_collection`'s
+//! *keeping* branch, not a coincidence of these three rows.
+//! The sampled young **occupancy** peak (1 065 words) is the watermark moment the door fires on:
+//! it is just under `1 220 x 7/8 = 1 067.5`, and a boundary sample is a slice-end read taken
+//! either just below that trigger or just after a collection emptied the space.
+//! The mature generation is flat for the same structural reason (4 185 capacity / 4 068 used at
+//! every N): `HeapPolicy::mature_target_words` is `MATURE_TARGET_LIVE_MULTIPLE` (2) x its
+//! post-fullsweep need — a property of the live set, never of the mature occupancy or capacity —
+//! so it is a fixed point too, and the flatness rail is what guards that fixed point.
+//!
+//! **What this module cannot verify: the door-ON vs door-OFF A/B.**
 //! Establishing that the door's collections *substitute for* the heap-admission door's rather
 //! than adding to them needs a door-disabled build — a throwaway `#[cfg(test)]` early return
 //! inside `collect_at_reds_boundary` (`src/context/gc/reds_door.rs`) — which is an edit outside
-//! this measurement's scope. The figures that A/B produced (identical totals at 6.984032 /
-//! 6.996002 / 6.999200 collections and 1.497006 / 1.499250 / 1.499850 majors per call at
-//! N = 500 / 2 000 / 10 000, against a door-off two young spaces / 376 words) come from an
-//! earlier tree state and no longer describe this one — N = 2 000 measures 7.669165 /
-//! 1.256372 per call and a **609**-word young space — so the substitution claim is **unverified**
-//! here and is not restated as a fact. Three structural facts keep the totals off the closed form
-//! `collections == 7N - 1` / `major == 3N / 2`: the door pins a young-only
+//! this measurement's scope, so **no `Δ` is claimed here**.
+//! What the table *does* pin is the rationing itself (one firing in 7.00–7.06 boundaries, a
+//! constant 3.7 % share of the run's own collections), a collapsed retired-space chain (one young
+//! space of 1 220 words at every N) and the exact per-row totals of [`MEASURED`], which are off
+//! any closed form for three structural reasons: the door pins a young-only
 //! `Process::collect_kind(CollectionKind::Minor)` first and escalates to the unpinned
 //! `Process::collect` only when the promotion cannot fit the mature space (so a boundary firing
 //! does not force a fullsweep of its own), the native baseline tier charges its blocks per block
 //! (which sets the slice and pre-emption counts the per-call rates are expressed against), and
 //! the BIF-result copy-out's learned hint grows the nursery **before** each copy
-//! (`RuntimeContext::copy_out_hint` + `hint_grow_gate`, `src/context/calls.rs`) — a growth event
-//! retires a nursery space, so it adds one unit of collection debt per iteration and therefore
-//! sets how often this shape is collected at all. The historical `1/2`-watermark cost (**+0.048
-//! collections/call (+0.69 %)** and **+0.134 majors/call (+8.9 %)** against its door-off build) is
-//! from that same earlier tree state and is likewise not re-measured here. What the table above
-//! *does* pin is the rationing: ~one firing in 7.9 boundaries, 0.74 % of the shape's collections,
-//! a per-call collection rate flat to 0.04 % across a 5× range (7.6692 → 7.6720; the majors fall
-//! from 1.2564 to 1.0513 per call, since they are one per iteration plus a fixed 514) and a
-//! collapsed retired-space chain (one young space, 609 words at every N).
+//! (`RuntimeContext::copy_out_hint` + `hint_grow_gate`, `src/context/calls.rs`).
 //!
 //! Every iteration of this shape reaches the engine's heap-admission door (each churn builds
 //! three 256-element structures, one of them through the interpreted `build_list/2` recursion),
@@ -110,6 +134,16 @@ struct Run {
     counters: GrowthCounters,
     /// The boundary door's own tallies for the very same run.
     door: BoundaryDoorCounters,
+    /// The largest young-nursery **occupancy** (words) sampled at a slice boundary — the
+    /// seven-eighths watermark moment the door fires on, never the capacity it is measured
+    /// against.
+    peak_young_used: usize,
+    /// The process collector's cumulative copy volume (`GcStats::words_copied`) and its
+    /// cumulative collection count at the last boundary the process was observable at — the two
+    /// figures [`Run::live_words`] is the ratio of. (The run's own total is
+    /// `counters.collections`, which is runtime-wide and can exceed this last sample.)
+    copy_words: usize,
+    process_collections: u64,
 }
 
 impl Run {
@@ -117,6 +151,21 @@ impl Run {
     /// every per-call figure.
     fn calls(n: i64) -> f64 {
         (n as f64) + 1.0
+    }
+
+    /// The shape's own **live figure** (words): its collector's cumulative copy volume over its
+    /// cumulative collection count, rounded **up** — a mean copy volume per collection, which is
+    /// the quantity [`beam_gc::HeapPolicy::young_minor_target_words`] is fed.
+    ///
+    /// It mixes a minor's young-only copy volume with a fullsweep's whole-heap one, so it can
+    /// only over-state the young-only figure the minor rule consumes: rounding up therefore makes
+    /// a target derived from it too large, never too small.
+    fn live_words(&self) -> usize {
+        assert!(
+            self.process_collections > 0,
+            "a measured row must have collected at least once to report a live figure: {self:?}"
+        );
+        self.copy_words.div_ceil(self.process_collections as usize)
     }
 }
 
@@ -126,8 +175,9 @@ impl Run {
 /// [`super::run_growth_counted`] is the same harness with the entry function hard-coded to
 /// `run/1`; this one takes the function name (`slice:fib/1` has no `run/1`) and reads the
 /// boundary door's counters around the run, which is the whole point of the pin below. The
-/// nursery geometry is sampled at every slice boundary — the only window a live process's
-/// collector is readable from outside the runner.
+/// nursery geometry **and** the collector's cumulative copy volume are sampled at every slice
+/// boundary — the only window a live process's collector is readable from outside the runner (a
+/// terminated process is removed from the table).
 fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
     let before = rt.gc_stats();
     let reductions_before = rt.reductions_statistics(false).0;
@@ -140,6 +190,9 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
     let mut peak_young_capacity = 0usize;
     let mut peak_mature_capacity = 0usize;
     let mut peak_mature_used = 0usize;
+    let mut peak_young_used = 0usize;
+    let mut copy_words = 0usize;
+    let mut process_collections = 0u64;
     let mut debt_boundaries = 0usize;
     let deadline = std::time::Instant::now() + COUNTER_RUN_DEADLINE;
     while rt.process_result(pid).is_none() {
@@ -158,6 +211,10 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
             if process.collection_debt() {
                 debt_boundaries += 1;
             }
+            peak_young_used = peak_young_used.max(collector.young().used_words());
+            let stats = collector.stats();
+            copy_words = stats.words_copied;
+            process_collections = stats.minor_collections + stats.major_collections;
         }
     }
     let slices = super::super::run::run_slice_counters();
@@ -180,31 +237,43 @@ fn run_counted(rt: &mut Runtime, module: &str, function: &str, n: i64) -> Run {
             debt_boundaries,
         },
         door: boundary_door_counters(),
+        peak_young_used,
+        copy_words,
+        process_collections,
     }
 }
 
-/// The measured rows this module pins: `(N, collections, major)`.
-///
-/// These are the run's **exact** totals — the honest per-N form of what used to be quoted as a
-/// closed form (`collections == 7N - 1`, `major == 3N / 2`, which this tree does not satisfy:
-/// see the module docs for the structural facts that keep it off that form). Every figure the
-/// docs quote (slices, yields, the door's checks and collections, the nursery geometry) is
-/// printed by the test's own `eprintln!`, and three repetitions of the table are identical.
+/// The measured rows this module pins: `(N, collections, major)` — the run's **exact** totals,
+/// the per-N form of the ~1.734-collections / ~0.0840-majors per call the module docs derive (a
+/// fixed per-call rate, which is what a live-set-targeted nursery of constant capacity implies).
+/// Every figure the docs quote (slices, yields, the door's checks and collections, the nursery
+/// and mature geometry, the copy volume the live figure comes from) is printed by the test's own
+/// `eprintln!`, and three repetitions of the table are identical.
 ///
 /// **Re-derive this table** from that output after any change to the runner's reduction pricing,
-/// the door's gates/watermark, the collector's nursery sizing or the BIF-result copy-out's
-/// growth gate — the files consulted are `src/runner/budget.rs`, `src/context/gc/reds_door.rs`,
-/// `src/context/calls.rs` and the `beam_gc` collector's sizing.
+/// the door's gates/watermark, the collector's nursery **or mature** sizing policy, or the
+/// BIF-result copy-out's growth gate — the files consulted are `src/runner/budget.rs`,
+/// `src/context/gc/reds_door.rs`, `src/context/calls.rs` and `beam_gc`'s `policy.rs`.
 const MEASURED: [(i64, u64, u64); 3] = [
-    (2_000, 15_346, 2_514),
-    (4_000, 30_691, 4_514),
-    (10_000, 76_728, 10_514),
+    (2_000, 3_468, 169),
+    (4_000, 6_939, 337),
+    (10_000, 17_341, 838),
 ];
+
+/// The measured young-nursery **capacity** (words) every row settles on — a MEASURED CONSTANT,
+/// not a derived one, pinned exactly so a change to the nursery's geometry cannot pass unnoticed.
+///
+/// It is *not* a bare literal standing in for the rule: the plateau assertion beside it derives
+/// the capacity's own band from [`beam_gc::HeapPolicy`] for each row's reported live figure
+/// (`nursery_floor_words() <= capacity <= YOUNG_SHRINK_FACTOR x young_minor_target_words(live)`),
+/// which is what makes 1 220 a *fixed point* of `young_after_collection` rather than a number
+/// this file happens to have read once.
+const MEASURED_YOUNG_CAPACITY: usize = 1_220;
 
 /// **The boundary door is a per-pre-emption, watermarked site on the `gc_bound` churn shape —
 /// not a per-call cost.**
 ///
-/// Three derived relations, all structural facts of the runner and the collector (never
+/// Four relations, all structural facts of the runner, the collector and its heap policy (never
 /// timings), pinned at the three iteration counts of [`MEASURED`]:
 ///
 /// * **one boundary check per pre-emption** — `door.checks == yields`, exactly, at every row:
@@ -215,23 +284,28 @@ const MEASURED: [(i64, u64, u64); 3] = [
 ///   call**;
 /// * **the seven-eighths watermark rations it to between one boundary in seven and one in
 ///   nine** — `door.checks / 9 <= door.collections <= door.checks / 7`. It is a *rate*, not an
-///   identity: measured 113/904 = **one in 8.00**, 230/1 809 = **one in 7.87**, 571/4 524 =
-///   **one in 7.92**, so the door collects on **0.0565 / 0.0575 / 0.0571 calls** of a shape that
-///   collects 7.6692 / 7.6708 / 7.6720 times per call — **0.74 %** of the run's own collections;
+///   identity: measured 128/904 = **one in 7.06**, 258/1 809 = **one in 7.01**, 646/4 524 =
+///   **one in 7.00** — right at the band's lower edge, with 8 / 3 / 2 boundaries of slack — so
+///   the door collects on **0.0640 / 0.0645 / 0.0646 calls** of a shape that collects 1.7331 /
+///   1.7343 / 1.7339 times per call, i.e. **3.69 / 3.72 / 3.73 %** of the run's own collections;
 /// * **the shape's own totals are a measured table** ([`MEASURED`]), pinned exactly per row:
-///   15 346 / 2 514 at N = 2 000, 30 691 / 4 514 at N = 4 000 and 76 728 / 10 514 at N = 10 000,
-///   i.e. **7.6692 / 7.6708 / 7.6720 collections and 1.2564 / 1.1282 / 1.0513 majors per call**
-///   (7.6730 / 7.6728 / 7.6728 and 1.2570 / 1.1285 / 1.0514 per iteration). The collection rate
-///   is therefore flat per iteration (7.6728 across a 5× range) while the majors are **one per
-///   iteration plus a fixed 514** (2 514 = 2 000 + 514, 4 514 = 4 000 + 514, 10 514 =
-///   10 000 + 514 exactly), so their per-iteration rate falls toward 1 from above rather than
-///   converging on the closed form's 1.5. The structural facts that keep the totals off
-///   `7N - 1` / `3N / 2` are named in the module docs: the door pins a young-only
-///   `CollectionKind::Minor` collection and escalates only when the promotion cannot fit the
-///   mature space, the native baseline tier charges its blocks per block (which sets the
-///   slice/pre-emption counts), and the BIF-result copy-out's learned hint grows the nursery
-///   before each copy (one growth event = one retired space = one unit of collection debt per
-///   iteration).
+///   3 468 / 169 at N = 2 000, 6 939 / 337 at N = 4 000 and 17 341 / 838 at N = 10 000, i.e.
+///   **1.7331 / 1.7343 / 1.7339 collections and 0.0845 / 0.0842 / 0.0838 majors per call** —
+///   linear in N at a fixed per-call rate, because the nursery's capacity and the shape's live
+///   set are both constant (next bullet);
+/// * **the nursery is one space on one live-set-derived capacity, and that capacity is the
+///   policy rule's fixed point** — `peak_young_spaces == 1` at every row and the same
+///   [`MEASURED_YOUNG_CAPACITY`] (1 220 words) at every row, with the band *derived* from
+///   [`beam_gc::HeapPolicy`] for each row's own reported live figure ([`Run::live_words`]:
+///   cumulative `GcStats::words_copied` over cumulative collections, a mean copy volume per
+///   collection of **158** words at all three rows): `nursery_floor_words() = 90 <= capacity`
+///   and `young_minor_target_words(158) = next_words(222) = 233 <= capacity <=
+///   YOUNG_SHRINK_FACTOR x 233 = 1 864` (`young_after_collection` installs the target below the
+///   band and lands on it above the band, so a capacity inside the band is kept — which is what
+///   makes the plateau flat in N instead of a ratchet). The mature generation is pinned flat as
+///   well (4 185-word capacity at every row), the fixed point of `mature_target_words` —
+///   `MATURE_TARGET_LIVE_MULTIPLE` (2) x its post-fullsweep need, a property of the live set and
+///   never of the mature occupancy or capacity.
 ///
 /// What the door contributes to those totals **cannot** be measured on this tree (a door-ON/OFF
 /// A/B needs a door-disabled build — see the module docs), so nothing here claims a `Δ`; what is
@@ -248,7 +322,9 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
         assert_eq!(run.counters.fallbacks, 0, "churn never falls back to the arena: {run:?}");
         eprintln!(
             "boundary_cost churn N={n} slices={} yields={} collections={} major={} door_checks={} \
-             door_unpublished={} door_collections={} peak_young_spaces={} peak_young_capacity={}",
+             door_unpublished={} door_collections={} peak_young_spaces={} peak_young_capacity={} \
+             peak_young_used={} copy_words={} process_collections={} live_words={} \
+             peak_mature_capacity={} peak_mature_used={} reductions={}",
             run.counters.slices,
             run.counters.yields,
             run.counters.collections,
@@ -258,6 +334,13 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
             run.door.collections,
             run.counters.peak_young_spaces,
             run.counters.peak_young_capacity,
+            run.peak_young_used,
+            run.copy_words,
+            run.process_collections,
+            run.live_words(),
+            run.counters.peak_mature_capacity,
+            run.counters.peak_mature_used,
+            run.counters.reductions,
         );
         assert_eq!(
             (run.counters.collections, run.counters.major),
@@ -308,17 +391,69 @@ fn the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape() {
         );
     }
 
-    // 3. The nursery stays one space and keeps the collector's plateau capacity: the door's
-    //    collections keep the retired-space chain collapsed instead of letting it grow with N.
+    // 3. The nursery stays one space on **one** live-set-derived capacity — and that capacity is
+    //    the policy rule's fixed point, not a number this file happens to have read: flatness (the
+    //    plateau may not move with N), the measured constant it settles on, and the rule's own
+    //    band for each row's reported live figure (never below `nursery_floor_words()`, never
+    //    above `YOUNG_SHRINK_FACTOR` x that live figure's `young_minor_target_words` target).
+    let policy = beam_gc::HeapPolicy::default();
+    let (n0, r0) = rows[0];
     for (n, run) in &rows {
         assert_eq!(
             run.counters.peak_young_spaces, 1,
             "the door keeps the nursery chain collapsed: N={n} {run:?}"
         );
-        assert!(
-            run.counters.peak_young_capacity <= 610,
-            "the nursery capacity must not climb with N: N={n} peak={}",
+        assert_eq!(
+            run.counters.peak_young_capacity, r0.counters.peak_young_capacity,
+            "the nursery's settled capacity must not move with N: N={n} peak={} vs N={n0} \
+             peak={}",
+            run.counters.peak_young_capacity, r0.counters.peak_young_capacity
+        );
+        assert_eq!(
+            run.counters.peak_young_capacity, MEASURED_YOUNG_CAPACITY,
+            "the measured young-capacity plateau (re-derive it from the line above): N={n} \
+             peak={}",
             run.counters.peak_young_capacity
+        );
+        // The rule's band, from the shape's OWN reported live figure (a mean copy volume per
+        // collection — see `Run::live_words`): the capacity a collection installs below the band
+        // is the target itself, above the band the target too, and inside the band it is kept.
+        // A capacity that is a fixed point therefore has to sit inside it.
+        let live = run.live_words();
+        let target = policy.young_minor_target_words(live);
+        let floor = policy.nursery_floor_words();
+        assert!(
+            run.counters.peak_young_capacity >= floor,
+            "no capacity the nursery rule installs is below nursery_floor_words() = {floor}: \
+             N={n} peak={}",
+            run.counters.peak_young_capacity
+        );
+        assert!(
+            run.counters.peak_young_capacity >= target,
+            "a capacity below young_minor_target_words(live = {live}) = {target} is enlarged onto \
+             it at the next collection, so the plateau cannot sit under it: N={n} peak={}",
+            run.counters.peak_young_capacity
+        );
+        assert!(
+            run.counters.peak_young_capacity <= beam_gc::YOUNG_SHRINK_FACTOR * target,
+            "a kept nursery stays within YOUNG_SHRINK_FACTOR x young_minor_target_words(live = \
+             {live}) ({target} x {} = {}): N={n} peak={}",
+            beam_gc::YOUNG_SHRINK_FACTOR,
+            beam_gc::YOUNG_SHRINK_FACTOR * target,
+            run.counters.peak_young_capacity
+        );
+    }
+
+    // 4. The mature generation is flat too, and for the same structural reason: its own rule
+    //    sizes it from the live set a fullsweep measured (`mature_target_words`, whose multiple is
+    //    `MATURE_TARGET_LIVE_MULTIPLE`), never from its occupancy or its capacity — so a constant
+    //    live set makes the capacity a fixed point rather than a ratchet.
+    for (n, run) in &rows {
+        assert_eq!(
+            run.counters.peak_mature_capacity, r0.counters.peak_mature_capacity,
+            "the mature generation's settled capacity must not move with N: N={n} peak={} vs \
+             N={n0} peak={}",
+            run.counters.peak_mature_capacity, r0.counters.peak_mature_capacity
         );
     }
 }

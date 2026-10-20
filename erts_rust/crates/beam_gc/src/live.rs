@@ -26,8 +26,8 @@
 //! promotion the minors since the last fullsweep made, all of which is garbage by then — so
 //! an occupancy-fed "live" estimate asks
 //! [`HeapPolicy::mature_after_fullsweep`](crate::HeapPolicy::mature_after_fullsweep) for
-//! room for the *garbage* as well as the live set, its `should_grow` predicate fires on
-//! **every** fullsweep, and the mature generation creeps up one growth-table step per
+//! room for the *garbage* as well as the live set, its grow bracket (`capacity < target`)
+//! fires on **every** fullsweep, and the mature generation creeps up one growth-table step per
 //! fullsweep without bound — for a live set that never changes. The C reference instead
 //! sizes from the post-sweep live fill
 //! (`need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + stack_size + S_RESERVED`,

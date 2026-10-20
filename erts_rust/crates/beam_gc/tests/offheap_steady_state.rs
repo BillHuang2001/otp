@@ -259,9 +259,11 @@ fn corpora() -> Vec<(Corpus, fn(&mut GenImmixCollector) -> Vec<Eterm>)> {
             Corpus {
                 name: "one-line + multi-line tuples",
                 young: 4096,
-                // 512 words = 2 whole blocks = 32 lines: the policy keeps it (a 104-word live
-                // set needs 20 lines) and the promotion fits without escalating.
-                mature_in_place: Some(512),
+                // 768 words = 3 whole blocks = 48 lines: the policy's target for this live set is
+                // `next_words(2 * (live + young occupancy + reserve)) = next_words(2 * (48 + 156 +
+                // 64)) = 610` words, which 768 sits at-or-above inside the `[target, 4 * target)`
+                // keep band, and the 20-line promotion fits without escalating.
+                mature_in_place: Some(3 * 256),
                 mature_relocate: 4096,
                 words: 12 * 3 + 4 * 17,
                 lines: Some(12 + 4 * 2),
@@ -443,11 +445,12 @@ const ON_HEAP_LINES: usize = PAIRS * 2 + 1;
 /// half — a pinned ceiling, not the (weaker) "never more than the region's capacity" invariant.
 /// The region is reclaimed in place at each fullsweep and then promoted into until it has no
 /// free line left, so the count cycles between [`ON_HEAP_LINES`] and this bound rather than
-/// sitting at a constant; pinning the bound keeps "no leak" a real assertion. The constant
-/// region holds 272 lines and the cycle stops at 260 because the next round's 13-line promotion
-/// no longer fits the 12 free lines that leaves, which is what escalates the following round to
-/// a fullsweep.
-const IMMIX_RESIDENT_LINES_CEILING: usize = 260;
+/// sitting at a constant; pinning the bound keeps "no leak" a real assertion. The region holds
+/// 448 lines (the fullsweep policy's target for this live set, `next_words(2 * (live + young
+/// occupancy + reserve))` = 2586 words, rounded up to whole blocks) and the cycle stops at 429
+/// because the next round's 13-line promotion no longer fits the 19 free lines that leaves,
+/// which is what escalates the following round to a fullsweep.
+const IMMIX_RESIDENT_LINES_CEILING: usize = 429;
 /// The off-heap payload size per binary.
 const PAYLOAD_BYTES: usize = 64 * 1024;
 

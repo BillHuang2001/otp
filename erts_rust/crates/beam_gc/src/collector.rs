@@ -234,7 +234,9 @@ impl Collector {
     /// half-forwarded.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
-    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
+    /// [collapsed](crate::nursery::Nursery::collapse) back to one space, sized from the **young
+    /// live set** the round evacuated — its copy volume
+    /// ([`HeapPolicy::young_after_collection`]).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let needed = self.nursery().used_words();
         if self.mature.available_words() < needed {
@@ -248,12 +250,13 @@ impl Collector {
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.minor_collections += 1;
-        // The nursery is empty again: size it for the next round from what the collection
-        // *left in it* — for a minor that is exactly the words it promoted
-        // (`GcStats::words_copied`), i.e. the C's minor-time young-heap resize fed with the
-        // surviving usage (`erl_gc.c:1493`). That is a quantity the round measured exactly,
-        // and (unlike a fullsweep, which relocates everything) a minor really does leave a
-        // live young set behind, so it is the minor's own sizing input.
+        // The nursery is empty again: size it from the **young live set** this round evacuated —
+        // the words it copied (`HeapPolicy::young_after_collection`). A minor's copy volume *is*
+        // its young live set, and that is the only quantity the round measured; the mature
+        // space's occupancy is not it, because a minor never copies the mature generation (only
+        // a fullsweep does), so it carries the garbage the minors since the last fullsweep
+        // promoted and would inflate the target until the capacity tracked the run's total
+        // allocation instead of the live set.
         self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
@@ -269,10 +272,9 @@ impl Collector {
     /// the typed heap exhaustion is returned *before* a single word is copied rather than
     /// mid-copy.
     ///
-    /// The nursery is re-sized by the C's **two-step** rule
-    /// ([`HeapPolicy::young_after_fullsweep`]): its pre-copy occupancy first
-    /// (`erl_gc.c:1866`), then the exact post-copy live set
-    /// (`adjust_after_fullsweep`, `erl_gc.c:2062-2098`).
+    /// The nursery is then re-sized from the **exact live set** the fullsweep measured
+    /// ([`HeapPolicy::young_after_fullsweep`]), so it neither re-copies the live set every
+    /// round nor keeps the capacity a dead burst left behind.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse_after_fullsweep) back to one space.
@@ -288,8 +290,9 @@ impl Collector {
         // The live term is deliberately *not* the pre-collection occupancy: a
         // fullsweep-sized generational heap is *full* when the cadence fires (the live set
         // plus every promotion the minors since the last fullsweep made, all of it garbage
-        // by now), so feeding the policy the **mature** occupancy makes its `should_grow`
-        // fire on every fullsweep and the mature capacity creeps up one growth-table step
+        // by now), so feeding the policy the **mature** occupancy inflates `need_after` past
+        // the space's own capacity and its grow bracket (`capacity < target`) fires on every
+        // fullsweep, so the mature capacity creeps up one growth-table step
         // per fullsweep, without bound, for a live set that never changes (see
         // [`crate::live`]).
         //
@@ -297,8 +300,8 @@ impl Collector {
         // space has to be able to receive a whole nursery's worth of promotion after the
         // fullsweep, otherwise the very next collection cannot be a minor and every
         // collection escalates to a fullsweep — the generational cadence never runs. It is
-        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`]
-        // keeps bounded, so including it still converges.
+        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`] always
+        // installs onto a target derived from the live set, so including it still converges.
         let live = crate::live::live(&from, roots).words;
         let young_occupancy = self.nursery.used_words();
         // Grow, shrink or keep the current mature capacity
@@ -327,17 +330,13 @@ impl Collector {
         self.stats.major_collections += 1;
         // The fullsweep relocated *every* live word — the nursery's included — into the fresh
         // mature space, so the nursery's surviving occupancy is now zero and there is no live
-        // young set to size it from. It is therefore sized by the C's **two-step** rule
-        // ([`HeapPolicy::young_after_fullsweep`]): the **demand the round observed**
-        // (`young_occupancy`, sampled before the copy — the `major_collection` pre-copy sizing,
-        // `erl_gc.c:1866`) followed by the **post-copy live set** (`live`, this fullsweep's
-        // exact reachable word count — the `adjust_after_fullsweep` shrink,
-        // `erl_gc.c:2062-2098`). The second step is what stops a nursery the growth seam
-        // stepped up for a burst from staying that size forever once the burst is dead: step 1
-        // compares the capacity against the *occupancy*, which a fullsweep always finds full,
-        // so only the live set can reveal the over-provisioning.
+        // young set to size it from. It is sized from the **live set** instead
+        // ([`HeapPolicy::young_after_fullsweep`]): a fullsweep is the one collection that
+        // measures the whole heap exactly, so it is where the nursery learns how large it
+        // should be — and where a nursery the growth seam stepped up for a burst is given back
+        // once that burst is dead.
         self.nursery
-            .collapse_after_fullsweep(&self.policy, young_occupancy, live)?;
+            .collapse_after_fullsweep(&self.policy, live)?;
         Ok(stats)
     }
 

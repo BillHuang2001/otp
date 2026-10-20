@@ -34,9 +34,9 @@
 //! four facts that follow, all from deterministic counters (never wall clock — the host is shared
 //! and heavily loaded, so only counts and ratios are read).
 //!
-//! # What was measured (`scripts/cargo.sh test -p beam_rt`, this host — every figure below is
-//! reproduced byte-for-byte by the run that pins it, printed by [`report`]; counters, never
-//! timings)
+//! # What was measured (`scripts/cargo.sh test -p beam_rt`, this host — counters, never timings:
+//! every figure a pin reads is reproduced byte-for-byte by the run that pins it and printed by
+//! [`report`], and a figure no assertion reads is quoted as *measured*)
 //!
 //! `native_reds:heap/1` (`tests/fixtures/native_reds.erl`) is `reds_boundary`'s BIF-and-call-only
 //! loop — each iteration allocates only through registered BIFs
@@ -48,28 +48,36 @@
 //! | tier | N | slices | yields | waits | collections | major | peak_young_spaces | reductions | heap_size |
 //! |---|---|---|---|---|---|---|---|---|---|
 //! | native (default) | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 9 | 233 |
-//! | native | 10 | 1 | 0 | 0 | 0 | 0 | 0 | 59 | 28 309 |
-//! | native | 100 | 1 | 0 | 0 | 0 | 0 | 0 | 509 | 196 267 |
-//! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 514 454 |
-//! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 1 347 480 |
-//! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 1 347 480 |
+//! | native | 10 | 1 | 0 | 0 | 0 | 0 | 0 | 59 | 15 376 |
+//! | native | 100 | 1 | 0 | 0 | 0 | 0 | 0 | 509 | 315 829 |
+//! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 830 667 |
+//! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 2 030 224 |
+//! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 2 030 224 |
 //! | native | 799 | 2 | 1 | 0 | 1 | 1 | 1 | 4 004 | 233 |
 //! | native | 800 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 2 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 4 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 20 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 196 267 |
+//! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 188 558 |
 //! | interpreter | 2 000 | 10 | 9 | 0 | 9 | 1 | 1 | 36 018 | 233 |
 //!
+//! (A row's `heap_size` is the capacity the nursery held when the loop returned, so on the
+//! interpreter tier it is the row's own phase-dependent figure: pinned at N = 2 000 by the control
+//! at the end of the test, *measured* on the N = 798 row.)
+//!
 //! `heap_growth:run/1` (the allocating engine-native shape — one 401-word `test_heap` per
-//! iteration) on the same default native tier:
+//! iteration) on the same default native tier, at a **843-word** settled nursery (peak young
+//! capacity, every row):
 //!
 //! | N | slices | yields | waits | collections | major | peak_young_spaces | reductions |
 //! |---|---|---|---|---|---|---|---|
-//! | 2 000 | 3 | 2 | 0 | 2 002 | 1 | 1 | 10 005 |
-//! | 10 000 | 13 | 12 | 0 | 10 012 | 1 | 1 | 50 005 |
-//! | 20 000 | 26 | 25 | 0 | 20 025 | 1 | 1 | 100 005 |
-//! | 80 000 | 101 | 100 | 0 | 80 100 | 2 | 1 | 400 005 |
+//! | 2 000 | 3 | 2 | 0 | 1 001 | 1 | 1 | 10 005 |
+//! | 10 000 | 13 | 12 | 0 | 5 001 | 1 | 1 | 50 005 |
+//! | 20 000 | 26 | 25 | 0 | 10 001 | 1 | 1 | 100 005 |
+//! | 80 000 | 101 | 100 | 0 | 40 001 | 1 | 1 | 400 005 |
+//!
+//! so its collections are `1 + N/K` with `K == 2` — the iterations the settled nursery carries
+//! (see pin 3).
 //!
 //! # The four pins
 //!
@@ -99,10 +107,13 @@
 //!    budget left except the last, which simply runs out of work), and because the shape prices
 //!    **5 units per iteration** (`reductions == 5N + 5`) a slice holds at most **800** iterations
 //!    — measured as the exact band `800·(slices − 1) ≤ N ≤ 800·slices − 1` on every row, both
-//!    halves derived from those two laws rather than calibrated. Its collections are exactly
-//!    `N + yields`: one admission collection per iteration plus one boundary collection per
-//!    pre-emption (measured 2 002 / 10 012 / 20 025 / 80 100), so the pre-emption rate does not
-//!    grow with N (the per-call figures are flat over a 4x step).
+//!    halves derived from those two laws rather than calibrated. Its collections are `1 + N/K`,
+//!    with `K == 2` iterations carried by the run's own settled 843-word nursery (`K` derived
+//!    from the measured peak capacity and the fixture's 401-word footprint, see
+//!    `heap_growth_iterations_per_nursery`): one admission collection per `K` iterations plus the
+//!    one before the first, the boundary door's own firings landing on cycle boundaries because a
+//!    slice prices 800 iterations — a multiple of `K` (measured 1 001 / 5 001 / 10 001 / 40 001),
+//!    so the pre-emption rate does not grow with N (the per-call figures are flat over a 4x step).
 //! 4. **The honest residual: this shape's own work can never end a slice.** `native_reds` prices
 //!    its iterations through `spend` (a `spend` never refuses, and once the budget is gone it is a
 //!    silent no-op — it does not even count), so past the budget the loop keeps running
@@ -119,9 +130,9 @@
 //!    * a fixture of the same shape with **no** epilogue seam ends **zero** slices (measured
 //!      `slices=1, yields=0, reductions=4 000` at N = 8 000), which is what identifies the
 //!      epilogue as the refusing site rather than the loop;
-//!    * the single `Yield` *does* collect once (a major at the boundary), so — unlike before this
-//!      pin was re-derived — the shape's `heap_size` now sits on the collector's floor (233)
-//!      instead of tracking N. The memory half of the old residual has therefore closed; the
+//!    * the single `Yield` *does* collect once (a major at the boundary), so the shape's
+//!      `heap_size` sits on the collector's floor (233) instead of tracking N. The memory half of
+//!      the old residual has therefore closed; the
 //!      **charging** half has not: closing it needs a refusing charge the loop's own seams can
 //!      take, i.e. the `beam_engine` handoff that makes a call-seam refusal re-runnable (the
 //!      resume address must be the seam's own instruction — see `BudgetProbe::spend`'s docs).
@@ -131,9 +142,17 @@
 //! The interpreter control is the same fixture under [`JitMode::Interpreter`] (forced per thread
 //! through [`super::super::tier::force`], never through the process environment): it charges per
 //! instruction, so its total really does track the work — **36 018** units and 10 slices / 9
-//! yields / 9 `collections` at N = 2 000 against the native tier's flat 4 006 / 2 / 1 — and its
-//! `heap_size` sits on the same collector's floor. That is the residual's discriminator: the gap
-//! is a fact about the **tier**, not about the fixture.
+//! yields / 9 `collections` at N = 2 000 against the native tier's flat 4 006 / 2 / 1. That is
+//! the residual's discriminator: the gap is a fact about the **tier**, not about the fixture.
+//! Its `heap_size` is the nursery capacity the last slice's growth left in place, which the
+//! live-set-targeted minor rule
+//! ([`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words))
+//! bounds instead of letting it follow N: **233** — the policy's floor, i.e.
+//! `young_minor_target_words(0)`, the same figure every saturated native row reads — on the
+//! pinned row (N = 2 000), and a bounded larger capacity when the loop ends with a grown nursery
+//! still in place (measured 159 640 / 234 593 / 310 300 at N = 1 000 / 1 500 / 10 000 and
+//! **309 923** at N = 20 000 — *below* the N = 10 000 reading, so the reading is bounded, never a
+//! function of the work).
 use super::super::tier::{JitMode, clear, force};
 use super::{GrowthCounters, growth_runtime, run_growth_function};
 use beam_process::DEFAULT_REDUCTIONS_PER_SLICE;
@@ -171,10 +190,26 @@ const NATIVE_REDS_ENTRY_UNITS: u64 = 9;
 /// sum is — so the split is measured, not assumed.
 const NATIVE_REDS_EPILOGUE_UNITS: u64 = 6;
 
-/// The collector's floor under this runtime: the young-nursery capacity a collected process reads
-/// back as `process_info(self(), heap_size)` (measured 233 on every saturated `native_reds` row and
-/// on the interpreter control).
-const COLLECTOR_FLOOR: i64 = 233;
+/// The heap policy a process created **without** heap options gets — the emulator defaults this
+/// suite's runtimes are built with ([`HeapOptions::new`](crate::config::HeapOptions::new), the
+/// `heap` field of the [`RuntimeConfig::default`](crate::config::RuntimeConfig) that
+/// [`growth_runtime`] passes to `Runtime::with_defaults`), whose `min_heap_words` is the C
+/// `H_DEFAULT_SIZE`.
+fn emulator_default_policy() -> beam_gc::HeapPolicy {
+    crate::config::HeapOptions::default().policy().clone()
+}
+
+/// The collector's floor under this runtime: the young-nursery capacity a collected process with
+/// an **empty** live set settles on, i.e.
+/// [`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words)`(0)`
+/// — which is also its
+/// [`nursery_floor_words`](beam_gc::HeapPolicy::nursery_floor_words), so no capacity any
+/// collection installs can sit below it. It is `beam_gc::DEFAULT_MIN_HEAP_WORDS` (233) for the
+/// emulator-default policy, and every saturated `native_reds` row reads it back as
+/// `process_info(self(), heap_size)`.
+fn collector_floor_words() -> i64 {
+    emulator_default_policy().young_minor_target_words(0) as i64
+}
 
 /// The largest `NativeReds` iteration count whose **linear** total (`5N + 9`) still fits in one
 /// slice's budget: `floor((4 000 − 9) / 5) = 798`. At N = 799 the total is 4 004 and the run needs a
@@ -257,7 +292,9 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
         "this suite measures the default (native baseline) tier; unset BEAM_RT_TIER"
     );
     let budget = u64::from(DEFAULT_REDUCTIONS_PER_SLICE);
-
+    // The floor every collected row's own `heap_size` report sits on, derived from the policy the
+    // spawned processes are actually created with (never a calibrated literal).
+    let collector_floor = collector_floor_words();
     // ---- 1. the charge, on the native tier: an exact price per iteration -------------------
     // N = 0 alone pins the constant: the loop body never runs, so the whole total is the run's
     // own entry/epilogue seams.
@@ -299,7 +336,7 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
         assert!(
             row.value > 1_000,
             "N={n}: an uncollected run's heap_size must track N (the collector's floor is \
-             {COLLECTOR_FLOOR}), got {}: {row:?}",
+             {collector_floor}), got {}: {row:?}",
             row.value
         );
     }
@@ -384,9 +421,9 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
         // The one boundary collection collapses the run's whole retired chain, so — unlike the
         // pre-pin-4 shape — the heap now sits on the collector's floor instead of tracking N.
         assert_eq!(
-            row.value, COLLECTOR_FLOOR,
+            row.value, collector_floor,
             "N={n}: the single boundary collection must leave the collector's floor \
-             ({COLLECTOR_FLOOR}), got {}: {row:?}",
+             ({collector_floor}), got {}: {row:?}",
             row.value
         );
     }
@@ -474,13 +511,24 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
             n as f64 / row.slices as f64,
             per_slice as f64 * (row.slices as f64 - 1.0) / row.slices as f64
         );
-        // Its collections are exactly one admission collection per iteration plus one boundary
-        // collection per pre-emption.
+        // Its collections are one per `K` iterations of the settled nursery plus the one before
+        // the first iteration — `K` derived from this row's own measured peak nursery capacity
+        // (see `heap_growth_iterations_per_nursery`), never a calibrated count.
+        let iterations_per_nursery =
+            super::heap_growth_iterations_per_nursery(row.peak_young_capacity);
+        assert_eq!(
+            iterations_per_nursery, 2,
+            "N={n}: a {}-word settled nursery must carry two {}-word iterations (measured on \
+             every row): {row:?}",
+            row.peak_young_capacity,
+            super::HEAP_GROWTH_ITERATION_WORDS
+        );
         assert_eq!(
             row.collections,
-            n as u64 + row.yields as u64,
-            "N={n}: collections must be N + yields (one admission per iteration, one boundary per \
-             pre-emption): {row:?}"
+            super::heap_growth_expected_collections(n, iterations_per_nursery),
+            "N={n}: collections must be 1 + N/K = 1 + {n}/{iterations_per_nursery} = {} (one per \
+             {iterations_per_nursery} iterations plus the one before the first): {row:?}",
+            super::heap_growth_expected_collections(n, iterations_per_nursery)
         );
     }
     // ... and the pre-emptions and the collections both scale **linearly** with N: over a 4x
@@ -532,9 +580,11 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
         "every interpreter slice but the last must end in the `Yield` arm: {control:?}"
     );
     assert_eq!(
-        control.value, COLLECTOR_FLOOR,
-        "the collected shape's heap_size must sit on the collector's floor ({COLLECTOR_FLOOR}): \
-         {control:?}"
+        control.value, collector_floor,
+        "at N = 2 000 the control's own heap_size report must land on the collector's floor \
+         ({collector_floor} = young_minor_target_words(0)); the live-set-targeted minor rule is \
+         what makes this row — and every saturated native row — read the floor instead of a \
+         capacity that grows with N: {control:?}"
     );
     assert_eq!(
         control.reductions, 36_018,

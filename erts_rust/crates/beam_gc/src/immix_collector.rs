@@ -611,8 +611,14 @@ impl GenImmixCollector {
         // a minor's reclamation.
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
         self.minor_since_major += 1;
-        // What the minor left in the nursery is exactly what it promoted (see
-        // `HeapPolicy::young_after_collection`) — the live young set it measured.
+        // Size the nursery from the words this minor **promoted** — its young live set — which
+        // is exactly the figure the copying collector feeds the same seam
+        // (`HeapPolicy::young_after_collection`). Both strategies therefore size the nursery from
+        // one identical, exact quantity, which is what keeps their collapsed capacities in
+        // lockstep for the same live set. The mark-region mature occupancy is deliberately not
+        // used: it is line-granular (`used_lines() * LINE_WORDS`, up to `LINE_WORDS` too large for
+        // one small object) and it holds the garbage the minors since the last fullsweep
+        // promoted.
         self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(PromoteOutcome::Done(stats))
     }
@@ -640,9 +646,11 @@ impl GenImmixCollector {
         // next collection cannot be a minor and the cadence degenerates into a fullsweep
         // every time. It is still **never** the *mature* occupancy: that is garbage-inflated
         // (the graphs the minors promoted and the next round's roots replaced), so using it
-        // would make the policy's `should_grow` fire on every fullsweep and creep the region
+        // would inflate `need_after` past the region's capacity and its grow bracket
+        // (`capacity < target`) would fire on every fullsweep and creep the region
         // up without bound (see [`crate::live`]). The young occupancy is bounded by the
-        // nursery capacity, which `young_after_collection` keeps bounded.
+        // nursery capacity, which `young_after_collection` always installs onto a target
+        // derived from the live set.
         let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let young_occupancy = self.nursery.used_words();
@@ -692,14 +700,11 @@ impl GenImmixCollector {
                 stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
                 self.minor_since_major = 0;
                 // The fullsweep promoted the nursery's live words into the mature region, so
-                // there is no surviving young set to size the nursery from: it is sized by the
-                // C's **two-step** rule ([`HeapPolicy::young_after_fullsweep`]) — the demand this
-                // round observed (`used`, sampled before the promotion; `erl_gc.c:1866`) followed
-                // by the whole-heap post-copy live set (`live.words`; the
-                // `adjust_after_fullsweep` shrink, `erl_gc.c:2062-2098`), the copying
-                // collector's rule.
+                // there is no surviving young set to size the nursery from: it is sized from the
+                // whole-heap post-copy live set ([`HeapPolicy::young_after_fullsweep`]), exactly
+                // as the copying collector sizes it.
                 self.nursery
-                    .collapse_after_fullsweep(&self.policy, used, live.words)?;
+                    .collapse_after_fullsweep(&self.policy, live.words)?;
                 Ok(stats)
             }
             PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines, live.words),
@@ -852,13 +857,11 @@ impl GenImmixCollector {
         // No in-place reclaim ran, so there is nothing to report for it.
         self.last_immix = None;
         // The relocation copied every live word — the nursery's included — into the fresh
-        // mature region, so there is no surviving young set: the nursery is sized by the C's
-        // **two-step** rule ([`HeapPolicy::young_after_fullsweep`]) from the demand this round
-        // observed (`used`, sampled before the copy; `erl_gc.c:1866`) and the whole-heap
-        // post-copy live set (`live_words`; `erl_gc.c:2062-2098`), exactly as the in-place
-        // fullsweep and the copying collector size it.
+        // mature region, so there is no surviving young set: the nursery is sized from the
+        // whole-heap post-copy live set ([`HeapPolicy::young_after_fullsweep`]), exactly as the
+        // in-place fullsweep and the copying collector size it.
         self.nursery
-            .collapse_after_fullsweep(&self.policy, used, live_words)?;
+            .collapse_after_fullsweep(&self.policy, live_words)?;
         Ok(stats)
     }
 }

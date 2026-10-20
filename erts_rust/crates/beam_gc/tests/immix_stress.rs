@@ -181,16 +181,18 @@ const SMALL_LIVE: usize = 6;
 /// multi-block run has room), with a long fullsweep cadence so each test picks the collection
 /// it wants to drive.
 ///
-/// `min_heap_words` equals the mature capacity, which makes `mature_after_fullsweep` return
-/// the current capacity (`should_shrink` cannot fire, and the grow branch is floored back to
-/// the minimum), so an explicit `collect_major` reclaims the mature generation **in place**
-/// and `last_immix_stats()` is observable. It also stops the post-collection nursery resize
-/// from shrinking the nursery.
+/// The mature capacity is 11 whole blocks (2816 words), the policy's **in-place fixed point** for
+/// the fixtures' live set: the two runs plus the six cells are 782 words, so
+/// `mature_target_words(782, 0) = next_words(2 * (782 + 64)) = next_words(1692) = 2586` words —
+/// inside `[2586, 4 * 2586)`, so `mature_after_fullsweep` answers the 2816-word capacity it was
+/// given and an explicit `collect_major` reclaims the mature generation **in place**, which is
+/// what makes `last_immix_stats()` observable. `min_heap_words` equals the region's size, which
+/// also stops the post-collection nursery resize from shrinking the nursery.
 fn large_policy() -> HeapPolicy {
     HeapPolicy {
         initial_young_words: 4096,
-        initial_mature_words: 8 * BLOCK_WORDS,
-        min_heap_words: 8 * BLOCK_WORDS,
+        initial_mature_words: 11 * BLOCK_WORDS,
+        min_heap_words: 11 * BLOCK_WORDS,
         fullsweep_after: 65535,
         ..HeapPolicy::default()
     }
@@ -281,7 +283,7 @@ fn large_objects_promote_into_block_runs_and_a_major_pins_them() {
     let mut c = GenImmixCollector::from_policy(large_policy()).expect("collector");
     assert_eq!(
         c.mature().block_count(),
-        8,
+        11,
         "the mature region is whole blocks"
     );
 

@@ -66,20 +66,25 @@
 //! fastest of [`REPS`] runs and carry information only as a within-point ratio:
 //!
 //! * [`Shape::Line`] (no line waste) — at `1/4` and `1/2` block the mark-region path moves
-//!   exactly as much as the copying path (64 → 64, 128 → 128 words) at a 1.0× footprint and
-//!   ≈ 2× the pause, i.e. it is *never better* below one block; from one whole block up it
-//!   moves **0** words (the whole live set is pinned) while the copying path pays the whole
-//!   live set (256 words at one block, 16 384 at 64), at a 1.0× footprint.
+//!   exactly as much as the copying path (64 → 64, 128 → 128 words) at a 1.0× footprint, i.e.
+//!   it is *never better* below one block; from one whole block up it moves **0** words (the
+//!   whole live set is pinned) while the copying path pays the whole live set (256 words at one
+//!   block, 16 384 at 64), at a 1.0× footprint.
 //! * [`Shape::Small`] (5.3× line waste) — below one whole block it pins nothing and moves
 //!   **5.3× more** words (64 vs 12, 128 vs 24) in 5.3× the footprint, i.e. it is *strictly
 //!   dominated*; from one block up it pins the whole live set at a 0.19× footprint. Its
-//!   avoided-copy-words-per-extra-µs ratio climbs ≈55 → ≈63 at 1 → 2 blocks and ≈73 at 8
-//!   blocks, then settles at ≈80–85 out to 64 blocks — the plateau the constant's *value* is
-//!   read from.
+//!   avoided-copy-words-per-extra-µs ratio climbs ≈68 → ≈83 at 1 → 2 blocks and settles at
+//!   ≈94–99 from 8 blocks out to 64 — the plateau the constant's *value* is read from.
 //! * [`Shape::Multi`] (1.9× line waste, objects spanning two lines) — the same qualitative
 //!   picture with the rounding factor of two: below one block it moves 1.9× more words
 //!   (128 vs 68) in 1.9× the footprint; from one block up it moves 0 words at a 0.53×
-//!   footprint, with the ratio ≈198 → ≈263 at 1 → 2 blocks and ≈274–292 from 8 blocks up.
+//!   footprint, with the ratio ≈660 → ≈760 at 1 → 2 blocks and ≈1160–1330 from 4 blocks up.
+//!
+//! A size point's mature region is sized by the rule under test ([`policy`] →
+//! [`HeapPolicy::mature_target_words`]), so the copying path allocates a *fresh space of the
+//! policy's capacity* on every fullsweep while the mark-region path keeps its own region and
+//! only marks it. That is why the pause column is quoted only as a within-point ratio: it moves
+//! with the region's size, and no count in this file depends on it.
 //!
 //! # What is assertion-backed, and what is not
 //!
@@ -256,44 +261,60 @@ impl Law {
 /// The nursery is the policy's [`initial_heap_words`](HeapPolicy::initial_heap_words) — the C's
 /// spawn rule `max(heap_need, min_heap_size)` (`erl_process.c:12586-12592`) — so it *is* the
 /// `min_heap_words` floor below: the C cannot express a young heap under its own `min_heap_size`
-/// either (`next_heap_size` floors every size by it, `erl_gc.c:347-352`). The floor is the fixed
-/// point of the mature generation, and it is always big enough for the corpus this file writes
-/// (the line floor below is `2 × (live lines + reserve)`, and a line-floor word is a whole
-/// [`LINE_WORDS`]-word line for at most [`LINE_WORDS`] useful words).
+/// either (`next_heap_size` floors every size by it, `erl_gc.c:347-352`). The nursery is always
+/// big enough for the corpus this file writes (the line floor below is `2 × (live lines +
+/// reserve)`, and a line-floor word is a whole [`LINE_WORDS`]-word line for at most
+/// [`LINE_WORDS`] useful words).
 ///
-/// A fullsweep now sizes its fresh mature space from the **exact live word count** *plus the
+/// A fullsweep sizes its fresh mature space from the **exact live word count** *plus the
 /// nursery's occupancy* (the C `erl_gc.c:2072` `need_after = (HEAP_TOP(p) - HEAP_START(p)) +
-/// need + …`; see [`crate::Collector::collect_major`](beam_gc::Collector::collect_major)). The
-/// promotion fullsweep (phase 2) therefore sees the corpus **twice** — once as the live set and
-/// once as the nursery's fill — i.e. `need_after = 2 × live words + reserve`, and the measured
-/// fullsweep (phase 4, over a nursery of garbage) a little more than the live set.
+/// need + …`; see [`crate::Collector::collect_major`](beam_gc::Collector::collect_major)), and
+/// the capacity it installs is [`HeapPolicy::mature_target_words`] — that room times
+/// [`MATURE_TARGET_LIVE_MULTIPLE`](beam_gc::MATURE_TARGET_LIVE_MULTIPLE) (2) — a **live-set
+/// target**, the mature generation's mirror image of the nursery's. The promotion fullsweep
+/// (phase 2) therefore sees the corpus **twice** — once as the live set and once as the
+/// nursery's fill — i.e. `need_after = 2 × live words + reserve` there, while the measured
+/// fullsweep (phase 4) sees the live set plus a nursery of garbage. The promotion's is the
+/// **larger** of the two, so **sizing the region from the promotion's own inputs covers both**:
 ///
-/// The fixed point the region must sit at is one where neither [`HeapPolicy::should_grow`]
-/// (`3 × capacity < 4 × need_after`) nor [`HeapPolicy::should_shrink`] fires. Sizing it to
-/// `4/3 × need_after` (whole Immix blocks) and pinning `min_heap_words` to that same value does
-/// exactly that — the second half of `should_shrink` can never hold — so the region is *kept*,
-/// the promotion (or partial-block evacuation) regime is what is measured, and no fullsweep
-/// relocates the region merely to make room for the next promotion.
+/// ```text
+/// target = mature_target_words(live_words, live_words)
+///        = next_words(2 × (live + live + reserve), 0)      // the rule, with the young term
+/// ```
 ///
-/// The `4/3 × need_after` headroom alone is not enough for a small-object shape, though: a
-/// mark-region space charges a whole **line** per object, so the region must also cover the
-/// copy's real line need (`live lines`, one per object) — the `2 × (live lines + reserve)`
-/// floor the sweep's original sizing used. The capacity is the larger of the two, so the
-/// promotion fits the region *and* the policy keeps it.
+/// The fixed point the region must sit at is one where neither the grow branch
+/// (`capacity < target`) nor [`HeapPolicy::should_shrink`] fires. Sizing the region to (at
+/// least) the rule's target and pinning `min_heap_words` to that same value does exactly that:
+/// the rule's target is floored by `min_heap_words`, so it can never exceed the capacity (no
+/// grow), and the second half of `should_shrink` (`capacity > min_heap_words`) can never hold
+/// (no shrink). So the region is *kept*, the promotion (or partial-block evacuation) regime is
+/// what is measured, and no fullsweep relocates the region merely to make room for the next
+/// promotion.
+///
+/// The rule's target alone is not enough for a small-object shape, though: a mark-region space
+/// charges a whole **line** per object, so the region must also cover the copy's real line need
+/// (`live lines`, one per object) — the `2 × (live lines + reserve)` floor the sweep's original
+/// sizing used. The capacity is the larger of the two, so the promotion fits the region *and*
+/// the policy keeps it (rounding up only ever moves the capacity *further* above the target,
+/// which keeps the grow branch off).
 fn policy(shape: Shape, objects: usize) -> HeapPolicy {
     let need_reserve_words = 64;
+    // The exact live word count a fullsweep of this corpus measures, and — for the promotion
+    // fullsweep, which promotes the corpus out of a nursery that still holds all of it — the
+    // young occupancy it is handed alongside it.
     let live_words = objects * shape.words();
-    let live_line_words = objects * shape.lines() * LINE_WORDS;
-    // The promotion fullsweep's request: the live set twice (live + a whole nursery's worth of
-    // promotion) plus the reserve.
-    let need_after = 2 * live_words + need_reserve_words;
+    let young_occupancy = live_words;
+    // The rule under test, evaluated on a **bound-free** seed (`HeapPolicy::default` has
+    // `min_heap_words == 0`), so the figure is the rule's own and not the floor installed
+    // below. With the promotion's inputs it is
+    // `next_words(2 × (live_words + young_occupancy + 64), 0)`.
+    let target = HeapPolicy::default().mature_target_words(live_words, young_occupancy);
     // The line-granular floor: one line per object needs `live_line_words` words, plus the
     // reserve, doubled (the sweep's original over-provisioning for the line need).
+    let live_line_words = objects * shape.lines() * LINE_WORDS;
     let line_floor = 2 * (live_line_words + need_reserve_words);
-    // `4/3 × need_after`, so `3 × capacity >= 4 × need_after` (no grow).
-    let grow_floor = (4 * need_after).div_ceil(3);
     // Whole Immix blocks, so the region capacity agrees exactly with its `min_heap_words` floor.
-    let mature_words = line_floor.max(grow_floor).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
+    let mature_words = target.max(line_floor).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
     HeapPolicy {
         fullsweep_after: 65535,
         // The nursery the collector is born with is the floor below (see the doc above): this

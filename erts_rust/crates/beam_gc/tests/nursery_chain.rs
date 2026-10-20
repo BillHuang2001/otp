@@ -470,20 +470,21 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
 
     // The capacities plateau: the last 50 triples are **one single state**.
     //
-    // After the growth path has run, a round's *collection* collapses the chain and re-sizes
-    // the nursery from the capacity the chain held and the demand the round observed (the
-    // `STEADY_NEED`-word object plus the request that produced it, `young_after_collection`):
-    // the collapsed space already covers the request, so the next round's `grow_nursery` is a
+    // After the growth path has run, each round's collection collapses the chain and sizes the
+    // nursery from the **live set** the round measured. The converged rounds install the
+    // **whole-heap** target a fullsweep applies (`HeapPolicy::young_target_words`: one
+    // `STEADY_NEED`-word tuple, so `next_words(2 * 700 + 64) = 1598`); a minor would instead
+    // install `HeapPolicy::young_minor_target_words` of the words it promoted
+    // (`next_words(700 + 64) = 987`), so the 1598 the loop settles on is the fullsweep's target.
+    // Either target is a fixed point of the rule — the same live set yields the same capacity —
+    // so the collapsed space already covers the request, the next round's `grow_nursery` is a
     // no-op and no space is retired. The loop therefore sits on **one** fixed state instead of
-    // alternating between a grown and a collapsed nursery.
+    // alternating between a grown and a collapsed nursery, and the capacity is the live set's
+    // target, not the request's size.
     //
     // What matters is that the state is **bounded** — a fixed point over a fixed, finite set of
     // states, each capacity pinned — not which one it is. A creep would show as a second (or
     // drifting) state, which the exact-set assertion below rejects.
-    //
-    // The capacity is the curated size the chain's collapse settles on for a `STEADY_NEED`-word
-    // survival under this small-start policy; the mature generation is its own policy fixed
-    // point.
     const PERIOD: usize = 1;
     let tail = &recorded[ROUNDS - 50..];
     assert!(
@@ -492,11 +493,26 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     );
     let distinct: std::collections::BTreeSet<(usize, usize, usize)> =
         tail.iter().copied().collect();
+    // The nursery capacity is the live set's target (one `STEADY_NEED`-word tuple, no other
+    // survivor); the mature generation's capacity follows its own rule at that live set — the
+    // fullsweep's target, `next_words(2 * (live (700) + young occupancy (700) + reserve (64)))`
+    // = `next_words(2928)` = 4185 — and it must be a **fixed point** of that rule, or the loop
+    // would be creeping rather than converging (the assertion right below checks it).
+    let young = c.policy().young_target_words(STEADY_NEED);
+    let mature = 4185;
     let pinned: std::collections::BTreeSet<(usize, usize, usize)> =
-        [(1, 984, 1598)].into_iter().collect();
+        [(1, young, mature)].into_iter().collect();
     assert_eq!(
         distinct, pinned,
-        "the converged cycle must be exactly the pinned fixed point"
+        "the converged cycle must be exactly the pinned fixed point (nursery = \
+         young_target_words({STEADY_NEED}) = {young}, mature = {mature})"
+    );
+    assert_eq!(
+        c.policy()
+            .mature_after_fullsweep(mature, STEADY_NEED, STEADY_NEED),
+        mature,
+        "the mature generation ({mature} words) must be a fixed point of its own rule at the \
+         converged live set ({STEADY_NEED} live words plus one nursery's occupancy)"
     );
 
     // Nothing creeps without bound.

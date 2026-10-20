@@ -36,14 +36,28 @@
 //!    exactly as for a full nursery". It is deliberately **not** folded into
 //!    [`should_collect`](beam_gc::Collector::should_collect), which stays occupancy-only.
 //! 2. **Driving the debt keeps the chain and its retention bounded.** A grow + "debt ⇒ collect"
-//!    admission loop holds the chain at one retired space (never one per cycle), so the retained
-//!    capacity cannot scale with the iteration count and the mature generation converges.
+//!    admission loop keeps the chain at **at most one** retired space (never one per cycle), so
+//!    the retained capacity cannot scale with the iteration count and the mature generation
+//!    converges.
+//!
+//! The **capacity** side of the same bound is the heap-size policy's live-set rule, and this file
+//! pins that too. A collection settles the nursery on
+//! [`HeapPolicy::young_target_words`] of the live set it measured — `next_words(2 × live + 64)` —
+//! so a settled capacity is a function of the **live set** and never of the iteration count. A
+//! collection only gives memory back once the capacity exceeds `YOUNG_SHRINK_FACTOR` (8) × that
+//! target, so a settled capacity stays inside the hysteresis band `[.., 8 × target]` that
+//! [`HeapPolicy::young_after_collection`] / [`HeapPolicy::young_after_fullsweep`] document, and a
+//! [`grow_nursery`](beam_gc::Collector::grow_nursery) step installs at most one growth-table step
+//! **or** one doubling above the space it replaces. The peak therefore has to be expressible as a
+//! function of the live set (`8 × target`, plus one doubling) — never as a multiple of `ROUNDS`.
 //!
 //! Every corpus here is deterministic (no randomness) and is driven through **both** mature
 //! strategies (the copying collector and the mark-region promotion). Timings are never
 //! asserted.
 
-use beam_gc::prelude::{AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind};
+use beam_gc::prelude::{
+    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind, YOUNG_SHRINK_FACTOR,
+};
 use beam_term::prelude::{make_small, ptr_val, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +82,16 @@ fn tuple_in(space: &mut HeapSpace, elems: &[Eterm]) -> Eterm {
 /// mutator allocates in.
 fn retained_words(c: &AnyCollector) -> usize {
     c.heap_size_words() - c.young().capacity_words()
+}
+
+/// The upper edge of the heap-size policy's **hysteresis band** for a live set of `live_words`: the
+/// largest nursery capacity a collection may settle on without giving the memory back
+/// (`YOUNG_SHRINK_FACTOR` × [`HeapPolicy::young_target_words`]).
+///
+/// It is the quantity the nursery's capacity is *bounded by*, and every term of it is a workload
+/// property — the live set — so a capacity checked against it cannot scale with the run length.
+fn band_edge(policy: &HeapPolicy, live_words: usize) -> usize {
+    YOUNG_SHRINK_FACTOR * policy.young_target_words(live_words)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +259,10 @@ fn should_collect_reports_occupancy_only_and_ignores_the_debt() {
 /// space, so the door's **occupancy** half of the signal never fires on its own.
 const ADMISSION_HINT: usize = 16;
 
-/// The op's own result — a tuple **larger than the nursery a collection settles on** (the
-/// default policy leaves `next_words(need_reserve_words, 0)`, so the op's un-rooted allocation
-/// seam really has to grow the heap).
+/// The op's own result — a tuple the op builds **after** its admission point, so it arrives
+/// through the un-rooted result-allocation seam, which may only **grow** the nursery (it holds no
+/// root set, so it cannot collect). Each round replaces it as the published root, so what the
+/// previous round built is garbage by the time the next admission point runs.
 ///
 /// Deliberately chosen so the object's mark-region footprint is **exactly one whole block**: 256
 /// words is `BLOCK_WORDS` — 16 whole `LINE_WORDS` — so a copy destination of this size is always
@@ -255,15 +280,21 @@ const ROUNDS: usize = 400;
 const TAIL: usize = 20;
 
 /// What one loop round left the collector in: `(chain length, current young capacity, retained
-/// (retired) words, mature capacity)`.
-type State = (usize, usize, usize, usize);
+/// (retired) words, mature capacity, live words)`.
+///
+/// `live words` is the collector's whole-heap live-set figure — the mature generation's occupancy,
+/// which a minor promotes every live young word into, and therefore the quantity the nursery's
+/// target is derived from.
+type State = (usize, usize, usize, usize, usize);
 
 /// What one full run of the loop observed: the peak chain length, the peak *current* nursery
-/// capacity, the peak retained capacity, and the last [`TAIL`] states.
+/// capacity, the peak retained capacity, the largest live set the run measured, and the last
+/// [`TAIL`] states.
 struct Observed {
     peak_spaces: usize,
     peak_young: usize,
     peak_retained: usize,
+    max_live: usize,
     tail: Vec<State>,
 }
 
@@ -273,11 +304,21 @@ struct Observed {
 ///
 /// The admission hint is deliberately smaller than the nursery, so the **only** thing that can
 /// make the admission point collect is the reported collection debt.
+///
+/// Every round also checks the rule's two **capacity** invariants, so the bound the caller asserts
+/// afterwards is a summary of what the run actually did:
+///
+/// * a collection settles on a capacity inside the live set's band
+///   ([`band_edge`] — `young_after_collection` installs the target or keeps a capacity the band
+///   already covers, and `young_after_fullsweep` does the same against the exact live set), and
+/// * a growth installs at most **one growth-table step or one doubling** above the space it
+///   replaces (`Nursery::grow`'s third step), never a compounding of the two.
 fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observed {
     let mut roots = vec![make_small(0)];
     let mut peak_spaces = 0usize;
     let mut peak_young = 0usize;
     let mut peak_retained = 0usize;
+    let mut max_live = 0usize;
     let mut tail: Vec<State> = Vec::with_capacity(TAIL);
 
     for round in 0..ROUNDS {
@@ -296,10 +337,31 @@ fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observ
                      used={used} retained={retained} mature={mature})"
                 )
             });
+            // A collection sizes the nursery from the live set it measured, and only gives the
+            // memory back past the band's upper edge: settle inside the band or not at all.
+            let live = c.mature_used_words();
+            let settled = c.young().capacity_words();
+            let band = band_edge(c.heap_policy(), live);
+            assert!(
+                settled <= band,
+                "{kind:?} round {round}: a collection must settle inside the live set's band \
+                 (8 × young_target_words({live}) = {band}), got {settled}"
+            );
+            max_live = max_live.max(live);
         }
         // The op's own result: the un-rooted allocation seam, which may only grow.
         if c.young().available_words() < OP_WORDS {
-            c.grow_nursery(OP_WORDS).expect("the op's growth");
+            let before = c.young().capacity_words();
+            c.grow_nursery(OP_WORDS)
+                .unwrap_or_else(|e| panic!("{kind:?} round {round}: grow failed {e:?}"));
+            let after = c.young().capacity_words();
+            let one_step = c.heap_policy().next_words(OP_WORDS, 0).max(before);
+            let bound = c.heap_policy().next_words(2 * before, 0).max(one_step);
+            assert!(
+                after <= bound,
+                "{kind:?} round {round}: a growth is at most one growth-table step or one \
+                 doubling of the {before}-word space it replaces, got {after} > {bound}"
+            );
         }
         roots[0] = tuple_in(c.young_mut(), elems);
 
@@ -314,12 +376,14 @@ fn drive_loop(c: &mut AnyCollector, elems: &[Eterm], kind: MatureKind) -> Observ
             c.young().capacity_words(),
             retained_words(c),
             c.mature_capacity_words(),
+            c.mature_used_words(),
         ));
     }
     Observed {
         peak_spaces,
         peak_young,
         peak_retained,
+        max_live,
         tail,
     }
 }
@@ -347,6 +411,7 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             peak_spaces,
             peak_young,
             peak_retained,
+            max_live,
             tail,
         } = drive_loop(&mut c, &elems, kind);
         // The leak this pins: without the debt query the admission point's `should_collect(16)`
@@ -375,6 +440,34 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             "{kind:?}: the admission point collected over the run"
         );
 
+        // **The peak capacity is a function of the live set.** A collection settles the nursery on
+        // `young_target_words(live)` (or keeps a capacity the band already covers), and a growth
+        // adds at most one growth-table step or one doubling on top of that — so the run's
+        // high-water mark is bounded by one doubling above the band's edge for the largest live set
+        // the run measured:
+        //
+        //     peak_young <= next_words(2 × 8 × young_target_words(max_live))
+        //
+        // Every factor is a property of the workload (the live multiple 2, the band factor 8, the
+        // live set itself), and `drive_loop` checks both per-round invariants as it goes, so this
+        // is a summary of the rule — not a numeric guard. The live set here is *not* tiny: each
+        // round's 256-word tuple is promoted by the next minor and stays live until the following
+        // fullsweep, so `max_live` reaches 1792 words (Copying) / 2560 (Immix) and the target
+        // 4185 / 6772 — which is why a capacity scaled to the op's own object cannot be expected
+        // (and why an `n × OP_WORDS` guard was never the right shape for this bound).
+        assert!(
+            max_live > 0,
+            "{kind:?}: the run must have measured a live set"
+        );
+        let band_max = band_edge(c.heap_policy(), max_live);
+        let peak_bound = c.heap_policy().next_words(2 * band_max, 0);
+        assert!(
+            peak_young <= peak_bound,
+            "{kind:?}: the peak nursery is bounded by the live set — one doubling above \
+             8 × young_target_words({max_live}) = {band_max}, i.e. {peak_bound} — got {peak_young} \
+             over {ROUNDS} cycles"
+        );
+
         // A converged, bounded tail: the chain and both capacities sit on a small fixed set of
         // states instead of drifting, and nothing creeps with the iteration count.
         let distinct: std::collections::BTreeSet<State> = tail.iter().copied().collect();
@@ -382,45 +475,23 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
             distinct.len() <= 12,
             "{kind:?}: the tail must sit on a few bounded states, got {distinct:?}"
         );
-        // An absolute cap, independent of the state count: the nursery is a small multiple of
-        // the op's own object, nowhere near the iteration count (400 × 256 = 102400 words would
-        // be the linear leak this pins against).
-        //
-        // The multiple is the growth rule's, not a constant of the workload: `grow_nursery`
-        // takes the smallest curated size covering the request and, only when that would not
-        // enlarge the space, at least a doubling — so the ladder of *retained* capacities is a
-        // geometric one, a few growth-table steps above the size a collection settles on — and
-        // a collection's own `young_after_collection` shrink rule (`capacity > 4 × demand`)
-        // pulls it back down at the next admission. The bound below is therefore an
-        // order-of-magnitude guard, not a pinned geometry: it fails only for a capacity that
-        // scales with the iteration count.
-        //
-        // The high-water is one **doubling step** above the plateau: the settlement after a
-        // fullsweep keeps the capacity the round observed (so the next round's constant request
-        // finds a nearly-full space) and the doubling branch then installs `next_words(2 ×
-        // capacity)`, which the *following* minor's shrink rule collapses again — the tail
-        // below shows exactly that four-state cycle. So the guard is one ladder step above
-        // `16 × OP_WORDS`: still an order-of-magnitude constant independent of the run.
-        assert!(
-            peak_young <= 24 * OP_WORDS,
-            "{kind:?}: the nursery must stay a small multiple of the op's object, got {peak_young}"
-        );
-        // The peaks are *bounded*, but the run's global high-water marks need not be the
-        // plateau's: the growth ladder can install one larger space while the cadence is still
-        // settling, and the next collection's `young_after_collection` shrink brings it back
-        // down. What the converged cycle must show is that the chain stays one retired space,
-        // that no capacity scales with the iteration count, and that the retention never exceeds
+        // The peaks above are the run's global high-water marks, which need not be the plateau's.
+        // What the converged cycle must show is that the chain holds at most one retired space,
+        // that the capacity stays inside the live set's band, and that the retention never exceeds
         // a single nursery space.
         let tail_spaces = tail.iter().map(|s| s.0).max().expect("a tail");
         let tail_young = tail.iter().map(|s| s.1).max().expect("a tail");
         let tail_retained = tail.iter().map(|s| s.2).max().expect("a tail");
-        assert_eq!(
-            tail_spaces, 2,
-            "{kind:?}: the plateau holds exactly one retired space"
-        );
+        let tail_live = tail.iter().map(|s| s.4).max().expect("a tail");
         assert!(
-            tail_young <= 24 * OP_WORDS,
-            "{kind:?}: the plateau's nursery is a small multiple of the op's object, got {tail_young}"
+            tail_spaces <= 2,
+            "{kind:?}: the plateau holds at most one retired space, got {tail_spaces}"
+        );
+        let tail_band = band_edge(c.heap_policy(), tail_live);
+        assert!(
+            tail_young <= tail_band,
+            "{kind:?}: the plateau's nursery sits inside the live set's band (8 × \
+             young_target_words({tail_live}) = {tail_band}), got {tail_young}"
         );
         assert!(
             tail_retained <= tail_young,
@@ -449,17 +520,68 @@ fn a_grow_and_admit_loop_keeps_the_chain_and_its_retention_bounded_on_both_strat
 fn a_repeated_grow_and_collect_cycle_never_accumulates_spaces() {
     for kind in KINDS {
         let mut c = any_for(kind, HeapPolicy::default());
+        let mut max_spaces = 0usize;
+        let mut max_retained = 0usize;
+        let mut max_young = 0usize;
+        let mut grew = 0usize;
         for round in 0..ROUNDS {
             let live = tuple_in(c.young_mut(), &[make_small(round as i64)]);
-            // A request far larger than any nursery a collection settles on, so the growth is a
-            // real replacement (never a no-op) every round.
+            // A request 4096 words large. The rule's **target** for this corpus is far below that
+            // (one round's live set is a 2-word tuple plus whatever a fullsweep has not reclaimed
+            // yet, so `young_target_words` answers at most 610 and the band's top 4880), so a
+            // growth is a real replacement whenever the settled capacity does not already cover
+            // the request — and the rounds where it is a no-op are exactly the ones whose settled
+            // capacity does. Both arms are pinned below.
+            let before = c.young().capacity_words();
+            let room = c.young().available_words();
             c.grow_nursery(4096)
                 .unwrap_or_else(|e| panic!("{kind:?} round {round}: grow failed {e:?}"));
-            assert_eq!(
-                c.young_space_count(),
-                2,
-                "{kind:?} round {round}: a growth retains exactly one space"
+
+            // **The chain holds at most one retired space** (`src/nursery.rs`: a growth retires
+            // the space it supersedes and keeps it addressable, and nothing else is ever appended
+            // — `young_space_count() <= 2` for the whole life of the nursery). The retained
+            // capacity is then exactly the superseded space, so it can never ratchet: one space,
+            // never one per growth.
+            let spaces = c.young_space_count();
+            let young = c.young().capacity_words();
+            assert!(
+                spaces <= 2,
+                "{kind:?} round {round}: the chain holds at most one retired space, got {spaces}"
             );
+            if spaces == 2 {
+                grew += 1;
+                assert_eq!(
+                    retained_words(&c),
+                    before,
+                    "{kind:?} round {round}: a growth retains exactly the {before}-word space it \
+                     superseded"
+                );
+                assert!(
+                    young > before,
+                    "{kind:?} round {round}: the request did enlarge the heap ({young} <= {before})"
+                );
+            } else {
+                // No retired space: the current space already had the room, so the growth was the
+                // rule's no-op arm — nothing was replaced and nothing was retained.
+                assert!(
+                    room >= 4096,
+                    "{kind:?} round {round}: a no-op growth needs the room it asked for \
+                     ({room} < 4096)"
+                );
+                assert_eq!(
+                    young, before,
+                    "{kind:?} round {round}: a no-op growth keeps the space it had"
+                );
+                assert_eq!(
+                    retained_words(&c),
+                    0,
+                    "{kind:?} round {round}: a one-space chain retains nothing"
+                );
+            }
+            max_spaces = max_spaces.max(spaces);
+            max_retained = max_retained.max(retained_words(&c));
+            max_young = max_young.max(young);
+
             let mut roots = vec![live];
             c.collect(&mut roots).expect("collect");
             assert_eq!(
@@ -471,7 +593,37 @@ fn a_repeated_grow_and_collect_cycle_never_accumulates_spaces() {
                 !c.collection_debt(),
                 "{kind:?} round {round}: the debt is settled by the collection"
             );
+            assert_eq!(
+                retained_words(&c),
+                0,
+                "{kind:?} round {round}: the collection gives the retained capacity back"
+            );
+            // And the capacity it settles on is the live set's, inside the documented band.
+            let live_after = c.mature_used_words();
+            let band = band_edge(c.heap_policy(), live_after);
+            assert!(
+                c.young().capacity_words() <= band,
+                "{kind:?} round {round}: a collection settles inside the live set's band \
+                 (8 × young_target_words({live_after}) = {band}), got {}",
+                c.young().capacity_words()
+            );
         }
+        // **Nothing accumulates over the run**: the chain never exceeded two spaces, the retention
+        // never exceeded one nursery space, and the growth seam really was exercised — so the
+        // two-space guard is not vacuous.
+        assert!(
+            max_spaces <= 2,
+            "{kind:?}: the chain never exceeded one retired space, got {max_spaces}"
+        );
+        assert!(
+            max_retained <= max_young,
+            "{kind:?}: the retention never exceeded one nursery space \
+             ({max_retained} > {max_young})"
+        );
+        assert!(
+            grew > ROUNDS / 4,
+            "{kind:?}: the loop must really replace a space (grew {grew} of {ROUNDS} rounds)"
+        );
         // After the last collapse the chain is one space and carries no debt.
         assert_eq!(c.young_space_count(), 1, "{kind:?}: one space at the end");
         assert_eq!(retained_words(&c), 0, "{kind:?}: no retained capacity left");

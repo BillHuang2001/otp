@@ -101,8 +101,9 @@ const SENTINEL: i64 = 900;
 /// the collection *kinds* are driven purely by the fullsweep cadence.
 ///
 /// `min_heap_words` is pinned because the C-faithful post-collection resize
-/// (`HeapPolicy::young_after_collection`) shrinks a nursery a round leaves mostly empty; the
-/// round-0 corpus needs a large, stable nursery.
+/// (`HeapPolicy::young_after_collection` after a minor, `HeapPolicy::young_after_fullsweep`
+/// after a fullsweep) shrinks a nursery a round leaves mostly empty; the round-0 corpus needs a
+/// large, stable nursery.
 fn policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 3,

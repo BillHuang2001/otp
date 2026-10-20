@@ -442,10 +442,16 @@ const AXIS1_TAIL_LINES: usize = 6;
 /// multi-object distribution tiles it exactly.
 const AXIS1_LINES: usize = AXIS1_BLOCKS * LINES_PER_BLOCK + AXIS1_TAIL_LINES;
 
-/// The axis-1 mature capacity, in words: 16 whole blocks — deliberately **larger** than the live
-/// set, so it is an in-place fixed point (neither `should_grow` nor `should_shrink` fires) and
-/// the pinning/evacuation regime is what is measured, never a relocating fullsweep.
-const AXIS1_MATURE_WORDS: usize = 4096;
+/// The axis-1 mature capacity, in words: 27 whole blocks (6912) — deliberately **larger** than
+/// the live set, so it is an in-place fixed point (neither the grow nor the shrink bracket fires)
+/// and the pinning/evacuation regime is what is measured, never a relocating fullsweep.
+///
+/// The figure is the policy's own target for this live set, rounded up to whole blocks: the
+/// live set is `AXIS1_LINES * LINE_WORDS = 2144` words with an empty nursery, so
+/// `mature_target_words(2144, 0) = next_words(2 * (2144 + 64)) = next_words(4416) = 6772` words,
+/// and 27 blocks (6912) is the smallest whole-block capacity at or above it — inside
+/// `[6772, 4 * 6772)`, which is the keep band.
+const AXIS1_MATURE_WORDS: usize = 27 * BLOCK_WORDS;
 
 /// The object-size distributions the axis sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,11 +555,12 @@ impl Dist {
 /// The heap policy every axis-1 shape shares: a nursery that holds the whole corpus, the
 /// fullsweep cadence disabled, and the fixed [`AXIS1_MATURE_WORDS`] mature capacity.
 ///
-/// The fullsweep is now sized from the **exact live word count**, which for these small live
-/// sets is far below the line-rounded region size, so `should_shrink` would otherwise fire and
-/// relocate the region out from under the measurement. Pinning `min_heap_words` to the region
-/// keeps `capacity == min_heap_words`, so `should_shrink` can never fire and the region stays
-/// the fixed, in-place size the axis is defined over.
+/// The fullsweep is sized from the **exact live word count**, which for these small live sets is
+/// far below the line-rounded region size, so a capacity that is **not** on the rule's fixed
+/// point would be relocated out from under the measurement. [`AXIS1_MATURE_WORDS`] is that fixed
+/// point (the target, 6772 words, rounded up to 27 whole blocks) and `min_heap_words` pins the
+/// region's floor there, so `mature_after_fullsweep` answers the capacity it was given and the
+/// region stays the fixed, in-place size the axis is defined over.
 fn axis1_policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 65535,
@@ -791,9 +798,13 @@ fn object_size_distribution_axis() {
 const AXIS2_OBJECTS: usize = 40;
 
 /// The axis-2 configured mature capacities, in words: below one whole block (128), one block
-/// (256), two (512), four (1024), the break-even (2048), the sparsest generation the policy still
-/// **keeps** (`4 × (live line-words + reserve)` = 2816 = 11 whole blocks), sixteen (4096) and an
-/// oversized generation (8192) that the policy shrinks back.
+/// (256), two (512), four (1024), the break-even (2048), eleven whole blocks (2816), sixteen
+/// (4096) and an oversized generation (8192) that the policy shrinks back.
+///
+/// The live set is 640 words with an empty nursery, so the policy's target is
+/// `next_words(2 * (640 + 64)) = 1598` words: the four smallest capacities are below it and grow
+/// onto it, 2048/2816/4096 sit inside its `[target, 4 * target)` keep band, and 8192 is past
+/// `4 * 1598 = 6392`, which is the shrink bracket.
 const AXIS2_CAPACITIES: [usize; 8] = [128, 256, 512, 1024, 2048, 2816, 4096, 8192];
 
 /// The axis-2 live set.

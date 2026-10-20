@@ -30,16 +30,18 @@
 //!    (`gc_loop:loop/1`, whose `build/1` conses every iteration) is run as a real scheduled
 //!    process; the loop returns the right answer **and** the run's counters prove the collection
 //!    happened on that process's own nursery — nothing fell back to the arena, the nursery stayed
-//!    at the emulator's `min_heap_size` floor, the run performed at least the number of
-//!    collections that much allocation through a space that size forces (a derived floor, see
+//!    **one space** whose capacity is a curated growth-table entry inside the band its own live
+//!    set derives, the words the loop abandoned were **reclaimed** rather than left resident, the
+//!    run performed at least the number of collections that much allocation through a space that
+//!    size forces (a derived floor, see
 //!    [`the_collector_runs_for_an_allocating_scheduled_loop`]), the pid's own `minor_gcs` counter
 //!    grew, and no collection failed or disabled the runtime.
 //! 2. **Memory is bounded.** The same loop at a 10× larger `N` collects proportionally more
-//!    often, while the young heap's **capacity stays at the collector's floor and does not scale
-//!    with `N`** — the collector's guarantee. (The capacity is the figure a slice boundary can
-//!    observe; the occupancy is observed *after* the boundary collection has emptied the space,
-//!    which is why no assertion is built on it — see the note in
-//!    [`the_collector_runs_for_an_allocating_scheduled_loop`].)
+//!    often, and its young heap stays **inside the band its own live set derives** instead of
+//!    growing with the program's total allocation — the collector's guarantee. (The capacity is
+//!    the figure a slice boundary can observe; the occupancy is observed *after* the boundary
+//!    collection has emptied the space, which is why no assertion is built on it — see the note
+//!    in [`the_collector_runs_for_an_allocating_scheduled_loop`].)
 //! 3. **Float code collects safely — and is never pinned.** A module doing float
 //!    arithmetic across a heap boundary (`gc_floats:l1/1`) must produce **correct** float
 //!    results and **is** collected over: the engine reaches only the **full** heap-admission
@@ -142,6 +144,14 @@ struct LoopRun {
     peak_young_used: usize,
     /// The largest young-heap capacity observed at a slice boundary.
     peak_young_capacity: usize,
+    /// The largest number of young spaces (the current one plus any a growth retired) observed
+    /// at a slice boundary.
+    peak_young_spaces: usize,
+    /// The largest mature-generation capacity observed at a slice boundary.
+    peak_mature_capacity: usize,
+    /// Words the runtime's collections **reclaimed** during this run (freed rather than copied),
+    /// summed from each collection's own outcome.
+    reclaimed: u64,
     /// Collections the **runtime** ran during this run.
     collections: u64,
     /// Engine allocations that fell back to the pointer-stable arena during this run.
@@ -191,6 +201,8 @@ fn run_loop(rt: &mut Runtime, module: &str, function: &str, n: i64) -> LoopRun {
     let mut minor_gcs = 0u32;
     let mut peak_young_used = 0usize;
     let mut peak_young_capacity = 0usize;
+    let mut peak_young_spaces = 0usize;
+    let mut peak_mature_capacity = 0usize;
     let deadline = Instant::now() + LOOP_DEADLINE;
     while rt.process_result(pid).is_none() {
         assert!(
@@ -204,6 +216,9 @@ fn run_loop(rt: &mut Runtime, module: &str, function: &str, n: i64) -> LoopRun {
             peak_young_used = peak_young_used.max(process.heap_used_words());
             peak_young_capacity =
                 peak_young_capacity.max(process.collector().young().capacity_words());
+            peak_young_spaces = peak_young_spaces.max(process.collector().young_space_count());
+            peak_mature_capacity =
+                peak_mature_capacity.max(process.collector().mature_capacity_words());
         }
     }
 
@@ -219,6 +234,9 @@ fn run_loop(rt: &mut Runtime, module: &str, function: &str, n: i64) -> LoopRun {
         minor_gcs,
         peak_young_used,
         peak_young_capacity,
+        peak_young_spaces,
+        peak_mature_capacity,
+        reclaimed: after.reclaimed - before.reclaimed,
         collections: after.collections - before.collections,
         fallbacks: after.fallbacks - before.fallbacks,
     }
@@ -250,10 +268,39 @@ fn expected_float_loop(n: i64) -> f64 {
 /// `loop(N - 1) + 1` allocate nothing at all.
 const WORDS_PER_ELEMENT: u64 = 10;
 
-/// The nursery capacity a fresh process is created with: the emulator's `min_heap_size` in words,
-/// and the geometry every collection in this suite sizes back to
-/// ([`LoopRun::peak_young_capacity`] is asserted equal to it).
+/// The nursery capacity a fresh process is created with: the emulator's `min_heap_size` in words.
+///
+/// It is also the **floor** every policy size passes through
+/// ([`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words) applies `.max(min_heap_words)`), so
+/// no nursery in this suite is ever smaller. It is *not* where a nursery settles: the size a
+/// collection installs is the live-set target
+/// [`young_target_words`](beam_gc::HeapPolicy::young_target_words) of the whole-heap live set the
+/// run keeps, and a loop that holds a live `build/1` spine pushes that target up the growth table
+/// — to 46 422 words at `N = 2 000`.
 const EMULATOR_MIN_HEAP_WORDS: u64 = 233;
+
+/// The largest nursery capacity a run with this **mature-generation** figure can install,
+/// derived from the live-set band [`HeapPolicy::young_after_fullsweep`] guarantees.
+///
+/// A collection sizes the nursery from the live set it just measured, and a fullsweep puts every
+/// live word in the mature generation, so the whole-heap live set is at most the mature
+/// generation's capacity at the same boundary.
+/// [`young_after_fullsweep`](beam_gc::HeapPolicy::young_after_fullsweep) then installs either
+/// [`young_target_words(live)`](beam_gc::HeapPolicy::young_target_words) or — when the capacity is
+/// already inside its hysteresis band — the capacity it had, which the band bounds by
+/// [`YOUNG_SHRINK_FACTOR`](beam_gc::YOUNG_SHRINK_FACTOR) times the target. A minor targets
+/// [`young_minor_target_words(young_live)`](beam_gc::HeapPolicy::young_minor_target_words) — one
+/// times the words it promoted plus the reserve, so never more than the fullsweep rule's two times
+/// the whole live set — and a capacity its own band keeps is bounded by
+/// [`YOUNG_SHRINK_FACTOR`](beam_gc::YOUNG_SHRINK_FACTOR) times *that* target, so a minor cannot
+/// take a nursery past the same ceiling either. Hence no capacity the run observes exceeds
+/// `YOUNG_SHRINK_FACTOR · young_target_words(peak_mature_capacity)`: a bound on the **live set's**
+/// scale, which is what separates a collector-sized nursery from an accumulating one (the run
+/// allocates 20 010 000 words at `N = 2 000`).
+fn nursery_ceiling(mature_capacity_words: usize) -> usize {
+    beam_gc::YOUNG_SHRINK_FACTOR
+        * beam_gc::HeapPolicy::default().young_target_words(mature_capacity_words)
+}
 
 /// A **derived lower bound** on the collections one `gc_loop:loop/1` run must have performed — the
 /// relation that makes "the collector ran on this process's own young heap" an arithmetic fact
@@ -266,20 +313,24 @@ const EMULATOR_MIN_HEAP_WORDS: u64 = 233;
 ///   allocates at least `WORDS_PER_ELEMENT · N(N + 1) / 2` words on the process's own young heap —
 ///   20 010 000 words at `N = 2 000`.
 /// * **The throughput of one collection.** No allocation is served between two collections out of
-///   anything but the current young *space*, so between two of them at most one space's worth of
-///   words can be consumed. [`EMULATOR_MIN_HEAP_WORDS`] is that space (the test asserts the run's
-///   own `peak_young_capacity` equals it, so the nursery never grew), hence
-///   `collections >= allocation / 233`.
+///   anything but one young *space*, so between two of them at most one space's worth of words can
+///   be consumed — and no space the run installs is larger than `peak_capacity`, the largest
+///   capacity [`run_loop`] sampled at a slice boundary. Hence
+///   `collections >= allocation / peak_capacity`.
 ///
-/// At `N = 2 000` that is **85 879**; the run measures **87 043**. The 1 164 gap is the part of
-/// the last `test_heap` request of each cycle that the collection ending that cycle left unused
-/// (a cycle consumes 230 words on average, not a full 233): the floor is a bound, and the measured
-/// value sits just above it because every collection here is triggered by a request that no longer
-/// fits (`used + 10 > 233`), never by a full space. Both figures move together — a run that stopped
-/// collecting on its own heap (falling back to the arena, or growing the nursery without bound)
-/// breaks this relation long before any golden number would.
-fn collections_floor(n: i64) -> u64 {
-    WORDS_PER_ELEMENT * (n as u64) * (n as u64 + 1) / 2 / EMULATOR_MIN_HEAP_WORDS
+/// The denominator is the run's **own** measured space, not a constant: the nursery's post-
+/// collection capacity is the live-set target
+/// [`young_target_words`](beam_gc::HeapPolicy::young_target_words) of the whole-heap live set the
+/// last fullsweep kept, and `gc_loop`'s live set swings with its recursion depth (the `build/1`
+/// spines its frames still hold), so the run's space walks the growth table between the 233-word
+/// floor and the largest size that live set asks for — 46 422 words at `N = 2 000`
+/// (`next_words(2 · live + 64)` for a live set of roughly 14 300–23 200 words). At that figure the
+/// floor is **431**; the run measures **6 934**. The gap is what the arithmetic leaves out: a cycle
+/// is ended by the request that no longer fits, not by a full space. Both figures move together — a
+/// run that stopped collecting on its own heap (falling back to the arena, or growing the nursery
+/// without bound) breaks this relation long before any golden number would.
+fn collections_floor(n: i64, peak_capacity: usize) -> u64 {
+    WORDS_PER_ELEMENT * (n as u64) * (n as u64 + 1) / 2 / peak_capacity as u64
 }
 
 /// **Acceptance 1 — the collector really ran, on the process's own young heap.**
@@ -289,9 +340,12 @@ fn collections_floor(n: i64) -> u64 {
 ///
 /// * no allocation fell back to the pointer-stable arena ([`LoopRun::fallbacks`] == 0), so every
 ///   word the loop allocated was served from — and reclaimed by — a young space;
-/// * the nursery stayed at the emulator's `min_heap_size` floor
-///   ([`LoopRun::peak_young_capacity`] == [`EMULATOR_MIN_HEAP_WORDS`]), so the space really is the
-///   collector's geometry and not a growing chain;
+/// * the nursery is **one space** ([`LoopRun::peak_young_spaces`] == 1), and its capacity is a
+///   curated growth-table entry no smaller than the emulator's `min_heap_size` floor and no larger
+///   than the live-set band [`nursery_ceiling`] derives — the geometry of a collector-sized
+///   nursery, never a chain that accumulates;
+/// * the words the loop abandoned were **reclaimed**, not left resident
+///   ([`LoopRun::reclaimed`] covers all but what the terminal heap still held);
 /// * the run performed at least [`collections_floor`]'s derived count — the number that much
 ///   allocation through a space that size cannot avoid;
 /// * the pid's own `minor_gcs` counter moved ([`LoopRun::minor_gcs`] > 0), and nothing failed,
@@ -305,21 +359,25 @@ fn collections_floor(n: i64) -> u64 {
 /// seven-eighths occupancy collects, and `gc_loop:loop/1`'s live set at a pre-emption is a single
 /// small integer (the `build/1` spine is dead, only the accumulator survives), so the collection
 /// there frees the whole space and the boundary reads an occupancy of **0**. The fill lives
-/// strictly *inside* a slice — this loop fills and empties its nursery ~43 times per iteration —
+/// strictly *inside* a slice — this loop fills and empties its nursery many times per iteration —
 /// so no boundary can ever observe it, and the occupancy figure is not evidence of anything here.
 /// The assertions above are the ones that cannot go stale for that reason.
 ///
 /// `minor_gcs` is asserted only to be **positive**, never pinned: it is `minor_since_major`, which
 /// the collector resets on every fullsweep, so its exact value is an artifact of this run's
-/// fullsweep cadence (2 073 of the 87 043 collections at `N = 2 000` were majors) rather than a
+/// fullsweep cadence (320 of the 6 934 collections at `N = 2 000` are majors) rather than a
 /// measure of the loop's allocation. The cumulative runtime counter
 /// [`LoopRun::collections`] is the honest "the collector ran" total.
 #[test]
 fn the_collector_runs_for_an_allocating_scheduled_loop() {
     /// The loop count this acceptance case is measured at: large enough to fill the nursery
-    /// thousands of times over (2 000 iterations abandon 20 010 000 words through a 233-word
-    /// space), small enough to stay well inside [`LOOP_DEADLINE`].
+    /// thousands of times over (2 000 iterations abandon 20 010 000 words through a space of at
+    /// most 46 422), small enough to stay well inside [`LOOP_DEADLINE`].
     const N: i64 = 2_000;
+
+    /// The words the whole run abandons on its own young heap: `N` iterations, the `k`-th
+    /// abandoning `k · `[`WORDS_PER_ELEMENT`].
+    const ALLOCATED_WORDS: u64 = WORDS_PER_ELEMENT * (N as u64) * (N as u64 + 1) / 2;
 
     let Some(mut rt) = runtime_with(GC_LOOP_BEAM) else {
         return;
@@ -333,24 +391,52 @@ fn the_collector_runs_for_an_allocating_scheduled_loop() {
          heap — a fallback means the arena served it and no collection could ever reclaim it; \
          {run:?}"
     );
-    assert_eq!(
-        run.peak_young_capacity, EMULATOR_MIN_HEAP_WORDS as usize,
-        "the nursery must sit at the emulator's min_heap_size floor (the geometry \
-         collections_floor's derivation assumes, and the one a slice boundary can observe); \
+    assert!(
+        run.peak_young_spaces == 1,
+        "the nursery must stay a single space: a retired space in its chain would hold words no \
+         collection had evacuated yet (the live-set target is what keeps one space sufficient); \
          {run:?}"
+    );
+    assert!(
+        run.peak_young_capacity >= EMULATOR_MIN_HEAP_WORDS as usize,
+        "every nursery the policy installs is floored at the emulator's min_heap_size \
+         (HeapPolicy::next_words applies `.max(min_heap_words)`); {run:?}"
+    );
+    assert!(
+        beam_gc::heap_sizes().contains(&run.peak_young_capacity),
+        "the nursery's capacity must be a curated growth-table entry — the output of \
+         HeapPolicy::next_words — not a figure accumulated outside the policy; {run:?}"
+    );
+    assert!(
+        run.peak_young_capacity <= nursery_ceiling(run.peak_mature_capacity),
+        "the nursery must be sized by the LIVE SET (at most the mature generation's capacity here) \
+         and never by the program's total allocation: the band HeapPolicy::young_after_fullsweep \
+         guarantees is YOUNG_SHRINK_FACTOR * young_target_words(mature capacity), and {} x {} = \
+         {} — the run allocates {ALLOCATED_WORDS} words; {run:?}",
+        beam_gc::YOUNG_SHRINK_FACTOR,
+        beam_gc::HeapPolicy::default().young_target_words(run.peak_mature_capacity),
+        nursery_ceiling(run.peak_mature_capacity),
+    );
+    assert!(
+        run.reclaimed
+            >= ALLOCATED_WORDS
+                .saturating_sub((run.peak_young_capacity + run.peak_mature_capacity) as u64),
+        "the words the loop abandoned must be RECLAIMED rather than left resident: everything but \
+         the terminal heap (at most one young space plus the mature generation) has to be \
+         reported reclaimed, else the collector is copying the garbage forward; {run:?}"
     );
     assert!(
         run.peak_young_used <= run.peak_young_capacity,
         "the young occupancy can never exceed its capacity; {run:?}"
     );
     assert!(
-        run.collections >= collections_floor(N),
+        run.collections >= collections_floor(N, run.peak_young_capacity),
         "the run must have collected at least {floor} times — {N} iterations abandoning {words} \
          words each cannot pass through a {heap}-word space more cheaply (see \
          collections_floor); {run:?}",
-        floor = collections_floor(N),
+        floor = collections_floor(N, run.peak_young_capacity),
         words = WORDS_PER_ELEMENT,
-        heap = EMULATOR_MIN_HEAP_WORDS,
+        heap = run.peak_young_capacity,
     );
     assert!(
         run.minor_gcs > 0,
@@ -405,12 +491,13 @@ fn a_non_allocating_loop_is_never_collected_over() {
 /// stays inside this runtime's collector geometry rather than growing with the *program's*
 /// total allocation.
 ///
-/// This pins the observed behaviour honestly, including its limitation: `beam_gc`'s hedging
-/// growth table enlarges the nursery when a collection reclaims too little
-/// (`young_after_collection`), and this loop keeps a large part of its `build/1` spine live
-/// while it recurses, so the capacity does grow with `N` — sublinearly in the words
-/// allocated, but measurably. What must hold is that collections happen and that the nursery
-/// stays a *bounded* multiple of the small-N figure, not that it is constant.
+/// This pins the observed behaviour honestly, including its limitation: a collection sizes the
+/// nursery from the **live set** it kept (`young_after_fullsweep` →
+/// [`young_target_words`](beam_gc::HeapPolicy::young_target_words)), and this loop keeps a large
+/// part of its `build/1` spine live while it recurses, so the capacity does grow with `N` —
+/// sublinearly in the words allocated, but measurably (46 422 words at `N = 2 000`, 121 536 at
+/// `N = 5 000`). What must hold is that collections happen and that the nursery stays inside the
+/// live set's own band ([`nursery_ceiling`]) rather than tracking the program's total allocation.
 #[test]
 fn the_young_heap_stays_bounded_as_the_loop_count_grows() {
     let Some(mut rt) = runtime_with(GC_LOOP_BEAM) else {
@@ -434,14 +521,17 @@ fn the_young_heap_stays_bounded_as_the_loop_count_grows() {
         small.collections,
         large.collections
     );
-    // ...and, crucially, the larger run is *not* backed by an unbounded arena: the nursery is
-    // bounded by the collector's growth table, well under any figure that would imply the
-    // program's whole allocation history is resident.
+    // ...and, crucially, the larger run is *not* backed by an unbounded nursery: the capacity is
+    // the live-set band of the larger run's own mature generation, an order of magnitude below
+    // the words it allocates (125 025 000 at N = 5 000).
     assert!(
-        large.peak_young_capacity < 100_000_000,
-        "the nursery is bounded by the growth table, not by the program's total allocation; \
-         got {} words",
-        large.peak_young_capacity
+        large.peak_young_capacity <= nursery_ceiling(large.peak_mature_capacity),
+        "the nursery must be bounded by the live set, not by the program's total allocation; \
+         got {} words against a derived ceiling of {} ({} x young_target_words({}))",
+        large.peak_young_capacity,
+        nursery_ceiling(large.peak_mature_capacity),
+        beam_gc::YOUNG_SHRINK_FACTOR,
+        large.peak_mature_capacity,
     );
 }
 

@@ -318,9 +318,14 @@ fn a_deeply_nested_nursery_reference_follows_the_evacuation() {
 /// no spurious exhaustion.
 #[test]
 fn a_nursery_reference_to_a_pinned_mature_object_is_left_verbatim() {
-    // A two-block mature region (512 words); the fixture fills the first block entirely, so
-    // its marks cover every line and it classifies `AllMarked` — the full-block pin rule.
-    let mut c = collector(1024, 2 * BLOCK_WORDS);
+    // A four-block mature region (1024 words), sitting on the policy's **in-place** fixed point
+    // for this live set: the fullsweep measures 256 live words plus the 2-word nursery holder,
+    // so `mature_target_words(258, 2) = next_words(2 * (258 + 2 + 64)) = next_words(648) = 987`
+    // words — inside `[987, 4 * 987)`, so `mature_after_fullsweep` answers the 1024-word
+    // capacity it was given and the reclaim is in place. The fixture fills the first block
+    // entirely, so its marks cover every line and it classifies `AllMarked` — the full-block pin
+    // rule.
+    let mut c = collector(1024, 1024);
 
     let elems = full_block_elems(0);
     let big = c

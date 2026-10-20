@@ -27,17 +27,20 @@
 //! (`list_to_tuple(lists:seq(1, 400))`), so `erlc -S` emits **no** `test_heap`/`allocate_heap`
 //! anywhere in the module — the loop is `call_ext`/`call`/`gc_bif`/`is_eq_exact`/`move` only.
 //! `RuntimeContext::alloc_words` and the BIF-result copy-out
-//! (`RuntimeContext::move_result_into_process_heap`) can only **grow** the nursery, so before
-//! this door existed the process was never collected at all: `heap_size`
+//! (`RuntimeContext::move_result_into_process_heap`) can only **grow** the nursery, so with the
+//! door disabled the process is never collected at all: `heap_size`
 //! (`beam_gc`'s nursery-chain capacity, the `process_info(P, garbage_collection)`
-//! `heap_size` figure) climbed with the loop count — measured here at **3 074 841 / 29 485 327
+//! `heap_size` figure) climbs with the loop count — measured at **3 074 841 / 29 485 327
 //! / 264 963 824** words for N = 2 000 / 20 000 / 200 000 and **0** collections, i.e. ≈ 1 300
 //! words retained per iteration.
 //!
-//! With the door live, the same three runs read **6 / 60 / 600** collections, `minor_gcs`
-//! **5 / 59 / 599** and a **flat `heap_size` of 233 words** (the collector's `min_heap_words`
-//! floor) with a one-space nursery throughout — the live set really is a handful of words, so
-//! the capacity stops growing after the first boundary.
+//! With the door live, the same three runs read **9 / 89 / 899** collections, `minor_gcs`
+//! **8 / 88 / 898** and a **flat `heap_size` of 610 words** with a one-space nursery throughout —
+//! the live set the boundary window holds is the single in-flight 400-element tuple, so the
+//! capacity is the live-set-targeted minor rule's target for it
+//! ([`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words)) at
+//! every N, never a quantity that follows the loop count. The test below drives all three N, so
+//! the figures are reproducible from it.
 //!
 //! # Why the run is forced onto the **interpreter**
 //!
@@ -115,6 +118,32 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
     );
     peak
 }
+/// The words one `reds_boundary` iteration leaves live in the boundary window: the 400-element
+/// `list_to_tuple/1` result (one header word plus 400 element words) the pre-emption catches
+/// before the iteration abandons it.
+const BOUNDARY_LIVE_WORDS: usize = 401;
+
+/// The young-nursery capacity the live-set-targeted minor rule installs for
+/// [`BOUNDARY_LIVE_WORDS`] — `young_minor_target_words(live)` = `next_words(live +
+/// need_reserve_words)`, floored by `nursery_floor_words()` — under the emulator-default policy a
+/// plain `spawn` child is created with ([`HeapOptions::new`](crate::config::HeapOptions::new), the
+/// `heap` field of the [`RuntimeConfig`](crate::config::RuntimeConfig) [`growth_runtime`] builds
+/// its runtime from).
+///
+/// This is the plateau the two rows below must both read, so the pin is the rule rather than a
+/// measured integer: at 401 live words it is 610, and any live set the fixture's own allocation
+/// could leave maps onto the same growth-table entry.
+fn plateau_words() -> usize {
+    let policy = crate::config::HeapOptions::default().policy().clone();
+    let target = policy.young_minor_target_words(BOUNDARY_LIVE_WORDS);
+    assert!(
+        target >= policy.nursery_floor_words(),
+        "the minor target can never sit below the policy's floor: {target} < {}",
+        policy.nursery_floor_words()
+    );
+    target
+}
+
 /// **A loop that reaches no heap-admission point is collected at the yield boundary, and its
 /// `heap_size` stops climbing with N.**
 ///
@@ -132,23 +161,29 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
 ///   measured **17.8–18.0 reds per iteration**, i.e. ~200–225 iterations per 4 000-reduction
 ///   slice ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`]), against ~14 before that pricing.
 ///   The band below is that measured rate, not a calibrated constant.
-/// * **`minor_gcs` follows the same relation minus the one fullsweep** the policy's
-///   `fullsweep_after` forces during the run (`collections - 1` at every N measured, hence
-///   `(8, 88)` for the two rows below), which is what makes the `garbage_collection` item's
-///   counter move with real collections instead of sitting at the pre-fix `0`.
-/// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space
-///   ([`heap_size`] 610 words at every N measured, the collector's sizing of the live set the
-///   boundary window actually holds: with the loop priced more finely the door now fires with
-///   the in-flight 400-element list/tuple still live, where it used to fire after the iteration
-///   had abandoned it and settled on the 233-word floor). What the pin is *for* — flatness in N
-///   and a single retired space — is unchanged (before the door: 3 074 841 / 29 485 327 /
-///   264 963 824 words for N = 2 000 / 20 000 / 200 000).
+/// * **`minor_gcs` follows the same relation minus the one fullsweep** each run reaches
+///   (`collections - 1` at every N measured, hence `(8, 88, 898)` for the three rows below). That
+///   fullsweep is the door's own escalating `collect`, and its reason is the shape: the mature
+///   region a spawn policy starts at holds 233 words while the chain-wide nursery occupancy this
+///   shape accumulates before its first collection is orders of magnitude larger, so the earliest
+///   boundary minors refuse; the fullsweep sizes that region from the occupancy, far more than the
+///   young live set each later boundary promotes, so the cadence is minors to the end. The policy's
+///   `fullsweep_after` cadence (65 535) never fires at these N. This is what makes the
+///   `garbage_collection` item's counter move with real collections instead of sitting at the
+///   pre-fix `0`.
+/// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space of
+///   `young_minor_target_words(401)` words (610, [`plateau_words`]) at every N measured. The
+///   fixture's live set at a boundary is the single in-flight 400-element `list_to_tuple/1`
+///   result (401 words), and the minor rule installs one times that live set plus the reserve, so
+///   the capacity is a function of the iteration's footprint and never of the loop count. What
+///   the pin is *for* — flatness in N and a single retired space — is unchanged (with the door
+///   disabled: 3 074 841 / 29 485 327 / 264 963 824 words for N = 2 000 / 20 000 / 200 000).
 ///
 /// No collection may fail (`errors`, `halted`) and no run may park in a `receive`.
 #[test]
 fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus() {
     let _tier = InterpreterTier::new();
-    const COUNTS: [i64; 2] = [2_000, 20_000];
+    const COUNTS: [i64; 3] = [2_000, 20_000, 200_000];
     let mut rows = Vec::new();
     for n in COUNTS {
         let mut rt = growth_runtime(boundary_fixture());
@@ -163,29 +198,23 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
         );
         rows.push((n, row, peak));
     }
-    let [(n1, r1, heap1), (n2, r2, heap2)] = [rows[0], rows[1]];
-    // Every collection here is the boundary door's: the workload reaches no other site.
-    assert!(
-        r1.collections > 0 && r2.collections > 0,
-        "the door must fire at all (it is the only collection site this workload reaches): \
-         {r1:?} {r2:?}"
-    );
-    assert_eq!(
-        r1.yields as u64,
-        r1.collections,
-        "one boundary per pre-emption: {r1:?}"
-    );
-    assert_eq!(
-        r2.yields as u64,
-        r2.collections,
-        "one boundary per pre-emption: {r2:?}"
-    );
-    // The derived relation: a constant pre-emption rate per iteration (a slice holds a fixed
-    // number of iterations), so the boundary's count is linear in N with no per-call work
-    // increase. The rate is the loop's per-iteration reduction price over the slice's 4 000:
-    // measured 17.8 reds/iteration at N=20 000 (89 slices) and 18.0 at N=2 000 (9), against
-    // ~14 before the call/BIF seams were priced. Pinned as that measured band.
-    for (n, row) in [(n1, &r1), (n2, &r2)] {
+    let [(n1, r1, heap1), (n2, r2, heap2), (n3, r3, heap3)] = [rows[0], rows[1], rows[2]];
+    // Every collection here is the boundary door's: the workload reaches no other site. A slice of
+    // this loop holds a **fixed** number of iterations, so the count is a constant rate per
+    // iteration at every N (never a per-call work increase); the rate is the loop's per-iteration
+    // reduction price over the slice's 4 000 — measured 17.8–18.0 reds/iteration at all three N,
+    // against ~14 before the call/BIF seams were priced. Pinned as that measured band.
+    for (n, row) in [(n1, &r1), (n2, &r2), (n3, &r3)] {
+        assert!(
+            row.collections > 0,
+            "the door must fire at all at N={n} (it is the only collection site this workload \
+             reaches): {row:?}"
+        );
+        assert_eq!(
+            row.yields as u64,
+            row.collections,
+            "one boundary per pre-emption at N={n}: {row:?}"
+        );
         let reds_per_iteration = row.collections * 4_000 / n as u64;
         assert!(
             (17..=20).contains(&reds_per_iteration),
@@ -193,23 +222,33 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
              (17..=20 reds/iteration), got {reds_per_iteration}: {row:?}"
         );
     }
-    assert!(r2.collections > r1.collections, "more iterations ⇒ more collections: {r2:?}");
+    assert!(
+        r1.collections < r2.collections && r2.collections < r3.collections,
+        "more iterations ⇒ more collections: {r1:?} {r2:?} {r3:?}"
+    );
     // `minor_gcs` is the minors since the last fullsweep, so it is the collection count minus
-    // the one fullsweep the policy's `fullsweep_after` forces during each run.
+    // the one fullsweep each run reaches (the door's escalating `collect` while the mature region
+    // is still the 233-word one a spawn policy installs; the `fullsweep_after` cadence never fires
+    // at these N).
     let minor = |r: &super::GrowthCounters| r.collections - r.major;
     assert_eq!(
-        (minor(&r1), minor(&r2)),
-        (8, 88),
-        "the garbage_collection item's counter must move with the collections: {r1:?} {r2:?}"
+        (minor(&r1), minor(&r2), minor(&r3)),
+        (8, 88, 898),
+        "the garbage_collection item's counter must move with the collections: \
+         {r1:?} {r2:?} {r3:?}"
     );
-    // The point of the door: a flat `heap_size` instead of a linear climb with N (the pre-door
-    // figures are 3 074 841 and 29 485 327 words — ≈ 1 300 retained words per iteration). The
-    // converged capacity is 610 words at this cadence (see the doc comment), and it is the same
-    // at both N — flatness, not the absolute floor, is the property.
-    assert_eq!(heap1, 610, "the nursery must converge, not climb: N={n1}");
+    // The point of the door: a flat `heap_size` instead of a linear climb with N (the
+    // door-disabled figures are 3 074 841 / 29 485 327 / 264 963 824 words — ≈ 1 300 retained
+    // words per iteration). The converged capacity is the minor rule's target for the boundary
+    // window's live set (`young_minor_target_words(401)`, 610 words — see the doc comment), and it
+    // is the same at every N — flatness, not the absolute figure, is the property.
+    let plateau = plateau_words();
+    for (n, heap) in [(n1, heap1), (n2, heap2), (n3, heap3)] {
+        assert_eq!(heap, plateau, "the nursery must converge, not climb: N={n}");
+    }
     assert_eq!(
-        (heap2, r1.peak_young_spaces, r2.peak_young_spaces),
-        (610, 1, 1),
-        "heap_size must NOT climb with N, and the chain must stay one space: N={n2}"
+        (r1.peak_young_spaces, r2.peak_young_spaces, r3.peak_young_spaces),
+        (1, 1, 1),
+        "heap_size must NOT climb with N, and the chain must stay one space at every N"
     );
 }

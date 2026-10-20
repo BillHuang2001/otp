@@ -786,4 +786,86 @@ fn a_provably_empty_retired_space_is_reused_instead_of_reallocated() {
         control.current().capacity_words() > 610,
         "the fresh space is the doubling the sizing rule prescribes"
     );
-    }
+}
+
+/// The growth seam is bounded by the **live-set target the last collection derived**: a nursery
+/// that has collected installs a space no larger than `max(one_step, live_target)`, while still
+/// never installing a space smaller than the current one and never refusing a request that fits.
+/// A fresh nursery — no measured live set yet — keeps the plain curated rule, and a request that
+/// genuinely outgrows the live set still gets its own one-step size (the bound is not a ceiling).
+#[test]
+fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
+    let policy = HeapPolicy::default();
+
+    // A fresh nursery has no measured live set, so the plain rule applies: the one-step size.
+    let mut fresh = Nursery::new(default_allocator().clone(), 233).expect("nursery");
+    assert_eq!(fresh.live_target_words, None);
+    fill(fresh.current_mut());
+    fresh.grow(&policy, 610).expect("the one-step growth");
+    assert_eq!(fresh.current().capacity_words(), policy.next_words(610, 0));
+
+    // A collected nursery remembers the target its round derived ...
+    let live = 401;
+    let mut nursery = Nursery::new(default_allocator().clone(), 233).expect("nursery");
+    nursery.collapse(&policy, live).expect("the collapse");
+    let live_target = policy.young_minor_target_words(live);
+    assert_eq!(live_target, 610);
+    assert_eq!(nursery.live_target_words, Some(live_target));
+    assert_eq!(
+        nursery.current().capacity_words(),
+        live_target,
+        "the minor target is what the collection installed"
+    );
+
+    // ... and a constant request the space already covers would otherwise take the doubling
+    // (`next_words(2 * 610) = 1 598`): the bound caps the fresh space at
+    // `max(one_step, live_target)` — the current capacity itself — so no space above the live
+    // set's own scale is installed.
+    fill(nursery.current_mut());
+    let collected = nursery.current().capacity_words();
+    assert!(
+        nursery.current().available_words() < collected,
+        "the space is full again"
+    );
+    nursery.grow(&policy, collected).expect("the bounded growth");
+    let installed = nursery.current().capacity_words();
+    let one_step = policy.next_words(collected, 0).max(collected);
+    assert_eq!(one_step, collected, "the one-step size does not enlarge here");
+    assert_eq!(
+        installed,
+        one_step.max(live_target),
+        "the bound caps the doubling at `max(one_step, live_target)`"
+    );
+    assert!(
+        installed < policy.next_words(2 * collected, 0),
+        "the doubling the unbounded rule would take was suppressed"
+    );
+    assert!(
+        installed >= collected,
+        "a growth never installs a space smaller than the one it replaces"
+    );
+    assert!(
+        nursery.current().available_words() + nursery.current().used_words() >= collected,
+        "and the installed space really holds the request"
+    );
+
+    // A request that genuinely outgrows the live set still sizes its own space: `one_step`
+    // alone grants it (`next_words(5 000) = 6 772`), so the bound is not a ceiling.
+    let mut large = Nursery::new(default_allocator().clone(), 233).expect("nursery");
+    large.collapse(&policy, live).expect("the collapse");
+    fill(large.current_mut());
+    let need = 5_000;
+    large.grow(&policy, need).expect("the large request");
+    let one_step = policy.next_words(need, 0).max(live_target);
+    assert_eq!(one_step, policy.next_words(need, 0));
+    assert_eq!(
+        large.current().capacity_words(),
+        one_step,
+        "the large request gets its own one-step size"
+    );
+    assert!(large.current().capacity_words() >= need);
+    assert!(
+        large.live_target_words == Some(live_target),
+        "growing does not change the remembered live-set target"
+    );
+}

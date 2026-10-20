@@ -102,21 +102,19 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// * without it the door would collect on every pre-emption of a process whose nursery is nearly
 ///   empty (a mostly-parked or barely-allocating process), paying a Cheney traversal for nothing.
 ///
-/// **Measured (single-build interleaved A/B, `taskset -c 3`, 15 pairs, deterministic counters,
-/// `gc_bound` churn, default native-baseline tier).** The churn shape's own heap-admission door
-/// already settles its collection debt every iteration, so a boundary collection here is nearly
+/// **The watermark's rationing, as this tree measures it.** The churn shape's own heap-admission
+/// door already settles its collection debt every iteration, so a boundary collection here is nearly
 /// always a duplicate — and an expensive one, because `beam_gc::Collector::collect` escalates to a
-/// **major** whenever the mature generation is not larger than the nursery in use. At a `1/2`
-/// watermark the door fired on **47 of 95** boundaries (N = 500; 191 of 383 at N = 2 000) and cost
-/// **+0.0479 collections/call (+0.69 %)** and **+0.1337 majors/call (+8.9 %)** against a
-/// door-disabled build of the same tree. At `7/8` the same runs measure **exactly** the
-/// door-disabled counts — 6.984032 collections and 1.497006 majors per call at N = 500, 6.996002
-/// and 1.499250 at N = 2 000 — while the door's own 11 / 47 collections still keep the
-/// retired-space chain collapsed (one young space at the 233-word floor, against the door-off two
-/// spaces / 376 words). Closing the gate further buys nothing: the C-exact `used >= capacity`
-/// (`1/1`) measures the *same* counters and only trades 11 firings for 3, so the looser `7/8` is
-/// taken — see just below for why a hard `used == capacity` test is a liability rather than a
-/// virtue on a nursery that grows on demand.
+/// **major** whenever the mature generation is not larger than the nursery in use. The `7/8`
+/// watermark rations the door to one firing in seven to nine boundary checks: measured **128 of
+/// 904** checks at N = 2 000, **258 of 1 809** at N = 4 000 and **646 of 4 524** at N = 10 000 (one
+/// in 7.06 / 7.01 / 7.00, the band's lower edge), and a boundary collection leaves the boundaries
+/// after it below the watermark. Its share of that shape's own collections is the constant **3.69 /
+/// 3.72 / 3.73 %** at the same three rows, because the capacity it collapses onto does not follow N
+/// (`src/runner/tests/boundary_cost.rs`'s `MEASURED` table holds the counts, `src/runner/MEASURED.md`
+/// the measurement record).
+/// What the door *adds* to a run's totals is not measurable here: a door-ON/OFF delta needs a
+/// door-disabled build, so none is claimed.
 ///
 /// **Not `1/1`.** `Process::grow_nursery` extends the current space in place, so a space one word
 /// short of full refills immediately and satisfies an exact `used == capacity` test on consecutive
@@ -124,22 +122,19 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// leaves the growth seam its headroom and is measured indistinguishable from `1/1` in the
 /// counters.
 ///
-/// **The A/B figures above are that A/B's tree state.** The copy-out hint gate in
-/// [`crate::context::calls`] (`hint_grow_gate`) now grows the churn shape's nursery **before** its
-/// 257-word tuple copy-out instead of after a refusal, and the growth event (one retired space ⇒
-/// one collection debt) shifts that shape's schedule: the current tip measures **7.6730
-/// collections and 1.2570 majors per iteration** at N = 2 000 (15 346 / 2 514 over 2 001 calls,
-/// one young space of **609** words), the door firing on **113 of 904** boundaries — still inside
-/// the `1/9`…`1/7` band, so the door's own rationing is unchanged and the growth events, not the
-/// door, set the new cadence. Numbers and the sibling re-derivation it implies:
-/// [`IMPLEMENTATION.md`](../../IMPLEMENTATION.md#the-learned-copy-out-hint--copy_out_hint--hint_grow_gate-the-copy-bound-fix).
+/// **The shape's schedule is a live-set one.** The copy-out hint gate in
+/// [`crate::context::calls`] (`hint_grow_gate`) grows the churn shape's nursery **before** its
+/// 257-word tuple copy-out instead of after a refusal, so the growth event (one retired space ⇒
+/// one collection debt) sets that shape's cadence: at N = 2 000 it measures **3 468 collections and
+/// 169 majors** over 2 001 calls (1.7331 / 0.0845 per iteration) on one young space of **1 220**
+/// words and a mature region of **4 185** words — fixed points of `HeapPolicy`'s live-set rules,
+/// never quantities that follow N.
 ///
 /// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
 /// would then be collected only through the debt arm, and if its growth seam retired no space it
-/// would climb again. Not observed: the churn shape is bimodal in eighths (12 of 95 checks empty,
-/// 24 at ≥ 7/8, the rest spread over `[1/8, 7/8)` but always *after* a collection), the
-/// no-heap-admission shape reports a debt at every check, and the pre-empting-but-not-churning
-/// shapes (`etf_roundtrip`, `list_walk`, `ets_copy`) keep a flat 233/376-word nursery.
+/// would climb again. Neither measured shape does: the churn shape's checks are pinned above at one
+/// firing in seven to nine, and the no-heap-admission shape (`reds_boundary`) reports a debt at
+/// every check (`src/runner/tests/reds_door.rs`).
 const BOUNDARY_OCCUPANCY_NUM: usize = 7;
 /// The occupancy watermark's denominator (see [`BOUNDARY_OCCUPANCY_NUM`]).
 const BOUNDARY_OCCUPANCY_DEN: usize = 8;
@@ -173,10 +168,13 @@ const BOUNDARY_OCCUPANCY_DEN: usize = 8;
 /// `reds_since_check` is the reduction count the just-ended slice spent, accumulated into the
 /// pid's interval.
 ///
-/// The action is [`beam_process::Process::collect`] **unconditionally**, never the admission
-/// doors' `collect_or_grow`: [`beam_process::Process::ensure_capacity`]'s `nursery.grow` is a
-/// no-op when the current space already has room, so it never collapses the retired chain — and
-/// collapsing that chain is the whole point of this door.
+/// The action is a **kind-pinned young-only minor**,
+/// [`Process::collect_kind(CollectionKind::Minor)`](beam_process::Process::collect_kind), and only
+/// when that minor refuses the **escalating**
+/// [`Process::collect`](beam_process::Process::collect) — never the admission doors'
+/// `collect_or_grow`: [`beam_process::Process::ensure_capacity`]'s `nursery.grow` is a no-op when
+/// the current space already has room, so it never collapses the retired chain — and collapsing
+/// that chain is the whole point of this door.
 ///
 /// # Errors
 ///
@@ -291,28 +289,53 @@ pub(crate) fn collect_at_reds_boundary(
         return Ok(());
     }
     // The action is a **young-only** collection first, never `collect_or_grow` and never the
-    // escalating `Process::collect` in the common case: `Process::ensure_capacity`'s
-    // `nursery.grow` is a no-op when the current space already has room (so it would leave the
-    // retired chain exactly where it is — the mechanism of the climb this door exists to stop),
-    // and the unpinned `collect` escalates a would-not-fit minor to a **major**, which turns this
-    // door's rationed slice-boundary collection into a fullsweep.
-    // `Process::collect_kind(Minor)` evacuates the nursery only and reports the typed heap
-    // exhaustion **before copying a word** when the promotion cannot fit the mature space.
+    // escalating `Process::collect` while a minor can still run.
+    // `Process::ensure_capacity`'s `nursery.grow` is a no-op when the current space already has
+    // room, so it would leave the retired chain exactly where it is — the mechanism of the climb
+    // this door exists to stop.
+    // The unpinned `collect` picks the kind by policy (the fullsweep cadence, or a mature region
+    // too small for a whole nursery promotion), which would turn this door's rationed
+    // slice-boundary collection into a fullsweep of its own accord.
+    // `Process::collect_kind(CollectionKind::Minor)` instead pins the kind: this boundary's
+    // collection is one young-only evacuation whatever the cadence says, and a promotion that
+    // cannot fit is the typed heap exhaustion **before a word is copied**.
     //
     // # Why a refused minor escalates instead of halting
     //
-    // A pinned minor that cannot be promoted is the *normal* state of these shapes: the mature
-    // generation sits on the collector's 233-word floor while the nursery holds tens of thousands
-    // of live words, so `collect_kind(Minor)` refuses at **every** boundary. Halting on that
-    // refusal (`halt_process_gc`) would disable collection for the rest of the process's life —
-    // measured: `reds_boundary:run(2000)` read `collections=0 errors=1` and a nursery chain of
-    // 10 retired spaces / 1 727 361 words, i.e. exactly the unbounded climb this door exists to
-    // stop, only worse (every later boundary also refuses). The refusal is therefore met with the
-    // **escalating** `Process::collect`, which is what a minor reports it cannot do: it grows (and
-    // if needed fullsweeps) the mature generation, so the live set is still evacuated and the
-    // chain still collapses. `beam_gc::AnyCollector::collect_minor` — a young-only collection that
-    // grows the mature space instead of fullsweeping — is the seam that would remove the
-    // escalation (its owner is `beam_gc`).
+    // A boundary minor is **promotable** whenever the mature generation still has room for the
+    // nursery's whole occupancy, and a fullsweep is what installs that room:
+    // `HeapPolicy::mature_after_fullsweep` sizes the region at
+    // `HeapPolicy::mature_target_words` — `MATURE_TARGET_LIVE_MULTIPLE` (2) × the space one
+    // collection must leave behind (`live + young occupancy + need_reserve_words`) — so a **run**
+    // of nursery-sized promotions fits between two fullsweeps.
+    // A minor is refused by the **room left** in that region, which no minor can enlarge (only a
+    // fullsweep runs the sizing rule; a minor promotes into the region it finds).
+    // The copying collector admits a promotion only while `mature.available_words() >=
+    // nursery.used_words()` ([`beam_gc::Collector::collect_minor`]'s up-front check — the
+    // nursery's whole occupancy, never merely the live set it will keep), and the mark-region
+    // strategy ([`beam_gc::GenImmixCollector::collect_minor`]) refuses both on that comparison and
+    // when a region with enough free lines has no contiguous run for one object of the promotion.
+    // Halting on such a refusal (`halt_process_gc`) would disable collection for the rest of the
+    // process's life, and every later boundary would refuse in turn: nothing then re-sizes the
+    // mature region, so the nursery chain climbs exactly as it does with no door at all — the
+    // outcome this door exists to prevent.
+    // The refusal is therefore met with the **escalating** `Process::collect`, which is what a
+    // minor reports it cannot do: whichever mature strategy is selected, the would-not-fit minor
+    // becomes the major that same call runs (the copying collector through the very
+    // `available_words()` comparison that refused it, the mark-region one through that comparison
+    // or through the atomic promotion's `WouldNotFit`), so the whole live set is evacuated, the
+    // mature region is re-sized from it, and the following boundaries are minors again.
+    // Measured on the `reds_boundary` fixture (`crate::runner`'s `reds_door` suite): exactly **one**
+    // fullsweep and `collections - 1` minors per run at every N.
+    // That fullsweep is this door's own escalation, and its reason is the shape: the mature region
+    // a spawn policy starts at holds 233 words (`HeapPolicy::initial_mature_words`) while the
+    // chain-wide nursery occupancy this shape accumulates before its first collection is orders of
+    // magnitude larger, so the **first** boundary's minor cannot be promoted.
+    // The region that fullsweep installs is sized from that occupancy, far more than the young live
+    // set each later boundary promotes, so no later minor of these runs exhausts it.
+    // `beam_gc::AnyCollector::collect_minor` — a young-only collection that grows the mature space
+    // instead of fullsweeping — is the seam that would remove the escalation (its owner is
+    // `beam_gc`).
     let action = process
         .collect_kind(CollectionKind::Minor)
         .or_else(|_| process.collect());
