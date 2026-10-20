@@ -47,6 +47,7 @@ Verified: no production path mutates a `Module`'s `functions`/`funs`/`records`/`
   monotonically.
 - The address-keyed resolution memo (`memo`/`MemoEntry`) is a redundant micro-optimisation on top of the O(1) key; it is load-bearing only for a synthetic (zero-checksum) module, and its entry is honoured only while its `Weak<Module>` upgrades **and** the module's current snapshot still equals the memoized key's.
 - A synthetic zero-checksum module still pays one content hash per **un-memoized** lookup — the mandated fallback.
+- **`cached_module_blocks` self-disables on `RefCell` re-entrancy** (`try_borrow_mut().ok()?` → `None`), which silently makes the driver run that callee on its per-instruction interpreter step — a documented performance cliff, never a correctness one.
 
 ## Routing Table
 - `mod.rs` → `CodeCache`, the per-thread `CODE_CACHE`, the `run_baseline_cached*` / `cached_module_blocks` / `remember_module` free functions, and the `module_fingerprint` re-export.
