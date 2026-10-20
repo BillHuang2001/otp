@@ -247,6 +247,24 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   deterministic stdout proves neither side dropped an append. `n_rust` = 2 000 is **capped by `beam_rt`'s
   non-overridable 60 s `run` deadline** (see Constraints) at ≈3.2–4.9 ms/call, which is also why the interpreter
   tier cannot measure this case at the calibrated `N` and reports `failed(no-binary-append-run)`, not a number.
+### No user-supplied module / compiler flags — the sanctioned knobs are env-only
+- **There is no CLI or config route to hand the driver your own module, your own compile-option set, or your own
+  loop count.** The workloads are a fixed Rust registry (`src/workloads/mod.rs:119-135`, ids pinned by
+  `:196-216`), selected only by id (`--workloads`), and every compile site hardcodes
+  `erlc -o <dir> <src>` with no extra flags (`src/workloads/list_walk.rs:279-281`,
+  `src/workloads/slice.rs:334-350`). `N`/`LEN`/the case tables are compile-time constants.
+- **The only compiler knobs are the child environment** (inherited by every spawn): `$ERLC`
+  (a *file*, path-only — `src/workloads/slice.rs:288-300`) and `ERL_COMPILER_OPTIONS`, which
+  `compile:file/2` appends to its options (`lib/compiler/src/compile.erl:1213-1224`; the erlc path is
+  `compile:compile/3` → `file/2`, `compile.erl:3341-3347`). `ERL_FLAGS="-pa <ebin>"` is the documented way to put a
+  *different* `compile` module on the erlc/erl code path (`erts/doc/references/erl_cmd.md:1546`;
+  `erts/etc/common/erlc.c:836-843` forwards it, `lib/kernel/src/erl_compile_server.erl:140,184` runs the compiler
+  in that node). `erlc +Opt` is the equivalent command-line form (`lib/stdlib/src/erl_compile.erl:110-117`).
+- So a two-compiler A/B is: two `bench run --runtime sys --workloads <module-workload>` passes in two
+  environments, then `bench compare a.json b.json`, over several alternating pinned rounds (each report's marginal
+  cancels noise only *within* its own run). An *arbitrary* module needs either a new `Workload` impl or the crate
+  used as a library (`bench::marginal::{sample_pairs, resolve}`, `bench::proc::run` — `src/lib.rs:63,65`).
+
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
 ```jsonc
