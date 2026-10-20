@@ -722,6 +722,15 @@ pub struct TcpInetDriver {
     /// data. A switch **to** [`PacketType::Raw`] therefore delivers the whole retained buffer
     /// (plus everything after it) verbatim, so raw mode stays authoritative for queued bytes.
     pending_input: Vec<u8>,
+    /// A close the socket reported that has **not** been latched yet.
+    ///
+    /// [`TcpInetDriver::read_bytes`] never latches: it reports the observation and leaves the
+    /// decision to its caller. A queued receive (`try_complete_recv`) that read data **and** the
+    /// peer's end of file in one drain must hand the data over first — the C's `tcp_recv`
+    /// answers a complete unit before it ever reaches the `n == 0` arm (`inet_drv.c:13216`,
+    /// `:13206`), so `{error, closed}` is owed to the *next* receive. Every other caller latches
+    /// straight away, which is the C's ordering for a discovery no operation is parked on.
+    deferred_close: Option<CloseSource>,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
     /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
@@ -847,6 +856,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
+            deferred_close: None,
             family: 0,
             stype: 0,
             name_addr: None,
@@ -902,6 +912,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
+            deferred_close: None,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
             name_addr: None,
@@ -1042,6 +1053,7 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
+                self.deferred_close = None;
                 // ... and a fresh read side: nothing has been delivered on the new socket yet, so
                 // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
                 self.read_armed = true;
@@ -1122,6 +1134,7 @@ impl TcpInetDriver {
         // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
         // socket no longer belongs to this one.
         self.pending_input.clear();
+        self.deferred_close = None;
         // The read side is selected again: the new socket has delivered nothing yet.
         self.read_armed = true;
         self.state = if connected {
@@ -1147,6 +1160,7 @@ impl TcpInetDriver {
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
+        self.deferred_close = None;
         // ... and nothing has been delivered on it yet, so its read side is selected again.
         self.read_armed = true;
     }
@@ -1290,7 +1304,15 @@ impl TcpInetDriver {
         report: ReadReport,
     ) -> Result<usize> {
         let mut bytes = Vec::new();
-        let read = self.read_bytes(ctx, &mut bytes, report)?;
+        let close = self.read_bytes(&mut bytes, report)?;
+        let read = bytes.len();
+        if let Some(source) = close {
+            // The close this read discovered is answered by **this** caller, and the latch runs
+            // before the bytes are queued so that a `{packet, N}` frame read in the same call
+            // survives the teardown's `tcp_clear_input` (the C's discovery sites clear and only
+            // then deliver, `inet_drv.c:12824`-`:12829`).
+            self.latch_peer_close(ctx, source)?;
+        }
         if self.framed().is_some() {
             // `{packet, N}`: the bytes are not a message yet — hold them for the frame decoder.
             self.pending_input.extend_from_slice(&bytes);
@@ -1327,12 +1349,11 @@ impl TcpInetDriver {
     /// [`CloseSource::Read`] instead of being raised.
     fn read_bytes(
         &mut self,
-        ctx: &mut DriverContext<'_>,
         out: &mut Vec<u8>,
         report: ReadReport,
-    ) -> Result<usize> {
+    ) -> Result<Option<CloseSource>> {
         if !self.state.is_connected() || self.peer_close.seen {
-            return Ok(0);
+            return Ok(None);
         }
         let fd = self.connected_socket()?;
         let mut read = 0usize;
@@ -1356,13 +1377,12 @@ impl TcpInetDriver {
                 // `async_error_am_all(am_closed)` (`:12829`), which this floor's reactor must
                 // defer to the next `recv` (`report`).
                 self.read_eof = true;
-                self.latch_peer_close(ctx, CloseSource::Read { error: None, report })?;
-                return Ok(read);
+                return Ok(Some(CloseSource::Read { error: None, report }));
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(read),
+                Some(libc::EAGAIN) => return Ok(None),
                 // The C's `tcp_recv` classification (`inet_drv.c:13185`-`:13210`), in its order:
                 // `ECONNRESET` goes to `tcp_recv_error` — which reports `error_atom(err)` and
                 // arms nothing — **only** while `TCP_ADDF_SHOW_ECONNRESET` is set
@@ -1378,8 +1398,7 @@ impl TcpInetDriver {
                         Some(errno)
                     };
                     self.read_eof = true;
-                    self.latch_peer_close(ctx, CloseSource::Read { error, report })?;
-                    return Ok(read);
+                    return Ok(Some(CloseSource::Read { error, report }));
                 }
             }
         }
@@ -1450,6 +1469,22 @@ impl TcpInetDriver {
             self.close_descriptor();
         }
         released
+    }
+
+    /// Latches a close an earlier [`TcpInetDriver::read_bytes`] reported but no caller has
+    /// consumed yet, answering whether it ran.
+    ///
+    /// A queued receive that read its payload and the peer's end of file in one drain defers the
+    /// close ([`TcpInetDriver::deferred_close`]) so the payload reaches the operation first, and
+    /// runs this the moment nothing complete is left to deliver.
+    fn latch_deferred(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
+        match self.deferred_close.take() {
+            Some(source) => {
+                self.latch_peer_close(ctx, source)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Drains the port's output queue to the socket, returning the number of bytes written.
