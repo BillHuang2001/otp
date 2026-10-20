@@ -57,8 +57,7 @@
 //! DistSignal::Exit      -> {DOP_EXIT,        From(local), To(remote), Reason}        -> Dop::Exit,       &[from.to_eterm(),  target_term, reason]  dist.c:1747
 //! DistSignal::Exit2     -> {DOP_EXIT2,       From(local), To(remote), Reason}        -> Dop::Exit2,      &[from.to_eterm(),  target_term, reason]  dist.c:1800
 //! DistSignal::MonitorExit -> {DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}
-//!                                                                    -> Dop::MonitorP,   &[watched.to_eterm(), watcher.to_eterm(), ref_term, reason]  dist.c:1497
-//! ```
+//!                                                                    -> Dop::MonitorPExit (or Dop::PayloadMonitorPExit), &[…, reason]  dist.c:1497//! ```
 //!
 //! where `target_term` is the **target** [`RemotePid`] (the `To` of the link/unlink/exit
 //! family, the *watched* remote process/port of the monitor family) and `from`/`watcher` is

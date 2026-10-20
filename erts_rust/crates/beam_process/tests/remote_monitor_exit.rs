@@ -26,8 +26,8 @@
 //! `DOP_DEMONITOR_P`) is never echoed onto the wire, and a death resolves the incoming-watcher
 //! entry. This file pins the other end of that resolution — the signal the resolution
 //! **emits**, because it is what makes the peer's `{'DOWN', Ref, process, Watched, Reason}`
-//! arrive at all. Before this seam existed a record was simply dropped when its subject died, so
-//! a remote `erlang:monitor(process, RemotePid)` never got its DOWN.
+//! arrive at all: without it a record is simply dropped when its subject dies, and a remote
+//! `erlang:monitor(process, RemotePid)` never gets its DOWN.
 //!
 //! Ground truth (read-only): `erts_dsig_send_m_exit` (`erts/emulator/beam/dist.c:1497-1519`)
 //! builds `TUPLE5(DOP_MONITOR_P_EXIT, Watched, Watcher, Ref, Reason)` — the **watched party
