@@ -32,7 +32,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-
+use std::sync::Arc;
 use beam_bifs::{
     AtomInterner, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
     RecordFieldView, RecordSource, SendHook, TableRegistry,
@@ -45,6 +45,7 @@ use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
 use crate::error;
+use crate::nif::atoms::ForeignAtomHub;
 use crate::nif::{NifEntry, NifHostImpl};
 use crate::runtime::Runtime;
 
@@ -899,6 +900,25 @@ impl LocalNode for NodeIdentity {
 /// only allocation the interner ever makes, paid by exactly the calls that need a second
 /// writer. The handle is **not** shared across calls: each call gets a fresh one rooted at
 /// the table's current length.
+///
+/// # One atom-index allocator, like the C's one locked table
+///
+/// The `base + offset` prediction above is exact only because the call path is the *only* writer
+/// while the call runs. A NIF-created thread is outside any call and may create an atom at the same
+/// time ([`ForeignAtomHub`]), so a second predictor would hand out the index the first one already
+/// claimed. [`PendingInterner::adopt_hub`] therefore points the interner at the runtime's **shared
+/// atom-index hub** — the one allocator (`hub.reserve`) — instead of predicting:
+///
+/// * [`AtomInterner::intern`] answers `hub.reserve(name)` (an index in the live table's own space);
+/// * [`PendingInterner::is_empty`] answers `!hub.has_pending()` (one relaxed atomic load);
+/// * [`PendingInterner::commit`] answers `hub.sync(atoms)`, i.e. appends the reservation tail in
+///   reservation order — the same commit the un-hubbed path performs, through the one allocator.
+///
+/// A call whose interner has **not** adopted a hub (a runtime with no foreign thread) keeps exactly
+/// today's behaviour, and the two shapes agree index-for-index whenever no foreign reservation
+/// intervenes (pinned by `nif::atoms`'s tests). The hub rides in the *shared* cell, so a handle
+/// [`PendingInterner::share`]d before or after the adoption still sees it — the NIF host of a
+/// `load_nif/2` call shares the very list the BIF layer writes.
 pub(crate) struct PendingInterner {
     /// The base + recorded names, inline until [`PendingInterner::share`] is called.
     state: InternerState,
@@ -918,8 +938,12 @@ enum InternerState {
 struct PendingInternerInner {
     /// The shared table's length when the call began: the first new name's index.
     base: usize,
-    /// Names interned during this call, in order (deduplicated).
+    /// Names interned during this call, in order (deduplicated). Unused once a hub is adopted —
+    /// the hub's own reservation tail is the list then.
     names: Vec<String>,
+    /// The shared atom-index hub, once the runtime has one and this call adopted it
+    /// ([`PendingInterner::adopt_hub`]).
+    hub: Option<Arc<ForeignAtomHub>>,
 }
 
 impl PendingInterner {
@@ -931,8 +955,23 @@ impl PendingInterner {
             state: InternerState::Inline(RefCell::new(PendingInternerInner {
                 base,
                 names: Vec::new(),
+                hub: None,
             })),
         }
+    }
+
+    /// Hand this call's atom-index allocation to the runtime's **shared atom-index hub**
+    /// ([`ForeignAtomHub`]).
+    ///
+    /// From here on [`AtomInterner::intern`] reserves through the hub instead of predicting
+    /// `base + name-count`, and [`PendingInterner::commit`] commits the hub's reservation tail. That is
+    /// what makes a NIF-created thread's atom creation (which is outside any call) and this call's own
+    /// share **one** index space rather than two that can collide — see the type's docs.
+    ///
+    /// Cheap and idempotent (`Arc` clone), and it reaches every handle already [`share`](Self::share)d
+    /// from this one, because the hub lives in the shared cell.
+    pub(crate) fn adopt_hub(&mut self, hub: Arc<ForeignAtomHub>) {
+        self.with_inner(|inner| inner.hub = Some(hub));
     }
 
     /// A second handle over the **same** state, for a call with two new-atom writers.
@@ -967,7 +1006,7 @@ impl PendingInterner {
         }
     }
 
-    /// Whether any name was recorded during this call.
+    /// Whether there is anything for [`PendingInterner::commit`] to do.
     ///
     /// Load-bearing as a **guard**, not as a semantic: [`PendingInterner::commit`] with no
     /// recorded names is already a no-op, but the caller must not even *reach* the shared
@@ -978,18 +1017,31 @@ impl PendingInterner {
     /// `HashMap<Arc<str>, Atom>`, thousands of entries after boot) on **every**
     /// registered BIF call -- even one that interns nothing. Skipping the `atoms_mut()`
     /// borrow when nothing was recorded keeps the no-copy fast path.
+    ///
+    /// With the shared atom-index hub adopted the answer is `!hub.has_pending()` — one relaxed atomic
+    /// load, and the hub's reservation tail *is* this call's list of names to commit.
     pub(crate) fn is_empty(&self) -> bool {
-        self.with_inner(|inner| inner.names.is_empty())
+        self.with_inner(|inner| match &inner.hub {
+            Some(hub) => !hub.has_pending(),
+            None => inner.names.is_empty(),
+        })
     }
 
     /// Commits the recorded names into `atoms`, in intern order.
     ///
     /// Must be called once the BIF/host has returned and released its borrow of the table, so
     /// each name lands at exactly the index the interner predicted.
+    ///
+    /// With the shared atom-index hub adopted this is `hub.sync(atoms)`: the hub appends its own
+    /// reservation tail in reservation order, which is the same write through the one allocator (and
+    /// also absorbs any runtime-side append it has not seen yet — see [`ForeignAtomHub::sync`]).
     pub(crate) fn commit(&self, atoms: &mut AtomTable) {
-        self.with_inner(|inner| {
-            for name in inner.names.drain(..) {
-                atoms.intern(&name);
+        self.with_inner(|inner| match &inner.hub {
+            Some(hub) => hub.sync(atoms),
+            None => {
+                for name in inner.names.drain(..) {
+                    atoms.intern(&name);
+                }
             }
         });
     }
@@ -998,6 +1050,10 @@ impl PendingInterner {
 impl AtomInterner for PendingInterner {
     fn intern(&mut self, name: &str) -> Atom {
         self.with_inner(|inner| {
+            if let Some(hub) = &inner.hub {
+                // One allocator for every writer — the C's one locked atom table.
+                return Atom::from_raw(hub.reserve(name));
+            }
             if let Some(offset) = inner.names.iter().position(|pending| pending == name) {
                 // A duplicate within this call reuses the predicted index.
                 return Atom::from_raw((inner.base + offset) as u32);

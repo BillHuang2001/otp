@@ -50,6 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use beam_alloc::Heap;
@@ -78,6 +79,7 @@ use crate::format;
 use crate::hasher::{FastHashMap, FastHashSet};
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
+use crate::nif::atoms::ForeignAtomHub;
 use crate::nif::NifRegistry;
 use crate::nif_monitor::NifMonitorIndex;
 use crate::perf_map::PerfMap;
@@ -1459,6 +1461,46 @@ impl Runtime {
         self.code_server.atoms()
     }
 
+    /// Install the **shared atom-index hub** for off-call atom creation (contract A.3).
+    ///
+    /// # What it is for
+    ///
+    /// `enif_alloc_env` on a thread a NIF created (`enif_thread_create`) reaches a host through
+    /// `beam_abi`'s thread-env host factory, and that host's `enif_make_atom` must intern into this
+    /// runtime's **one live** atom table at a real index. A foreign thread is not inside a NIF call, so
+    /// it cannot use the per-call predicted-index interner. This installs the one allocator that thread
+    /// and the call path share ([`ForeignAtomHub`]): the hub mirrors the live table's index space,
+    /// hands out reservations from its tail, and the code server drains them into the table at the
+    /// entry of every mutating atom path.
+    ///
+    /// # Idempotence and re-installation
+    ///
+    /// Install once (a host that installs a NIF thread-env factory calls this first). A later call
+    /// builds a **fresh** hub from the table as it stands then — safe, because a hub carries no state
+    /// the table does not (the reservations of the superseded hub are drained into the table by
+    /// [`CodeServer::attach_foreign_atoms`], so nothing is lost) — and a caller that wants a stable
+    /// handle should hold the one [`Runtime::foreign_atoms`] answers rather than re-install.
+    ///
+    /// # Cost
+    ///
+    /// Building the mirror is `O(table)`: one owned name per live atom. That is why it is **not** done
+    /// in [`Runtime::new`] — a runtime whose host never runs a NIF thread (the whole differential gate,
+    /// every benchmark leg) pays nothing at all.
+    pub fn install_foreign_atom_hub(&mut self) {
+        let hub = ForeignAtomHub::new(self.code_server.atoms());
+        self.code_server.attach_foreign_atoms(hub);
+    }
+
+    /// The installed shared atom-index hub, if any — the cheap `Arc` clone a foreign thread (or a
+    /// per-call [`PendingInterner`](crate::context::PendingInterner)) adopts.
+    ///
+    /// The hub has exactly **one** owner, the [`CodeServer`]: it is the only place the live atom table
+    /// grows, so it is the only place a reservation can become real, and a second handle here could
+    /// drift out of step with it (a runtime accessor answering `None` while the code server drains a
+    /// hub, or the reverse). This asks the owner.
+    pub(crate) fn foreign_atoms(&self) -> Option<Arc<ForeignAtomHub>> {
+        self.code_server.foreign_atoms()
+    }
     /// Interns `name` in the shared atom table and returns it as an atom term.
     pub fn intern(&mut self, name: &str) -> Eterm {
         make_atom(self.code_server.atoms_mut().intern(name))
