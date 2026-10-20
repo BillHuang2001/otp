@@ -32,8 +32,10 @@
 //! env = enif_alloc_env(); … enif_send(NULL, &pid, env, term); enif_free_env(env);
 //! ```
 //!
-//! works verbatim from a thread the NIF itself created — with the atoms it builds landing in
-//! the ONE global atom table. This suite pins that end to end on this runtime.
+//! works verbatim from a thread the NIF itself created, and the atoms the thread builds reach
+//! the receiver as the very atoms it spells. This suite pins that end to end on this runtime
+//! (here they cross **by name** in the queued ETF image, which the runtime interns into its live
+//! table — a foreign thread's index is never a live index).
 //!
 //! # What each probe measures, and what is asserted
 //!

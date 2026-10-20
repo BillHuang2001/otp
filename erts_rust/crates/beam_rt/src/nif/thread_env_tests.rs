@@ -260,7 +260,9 @@ fn an_atom_a_factory_thread_creates_reaches_the_live_table_by_name_not_by_index(
         .expect("spawn recv:wait/0");
     assert_eq!(runtime.run_one_slice().expect("one slice"), 1);
 
-    let (private_index, image) = std::thread::spawn(move || {
+    // The worker answers only the **private** index it interned the name at: there is no live index
+    // to hand back, because the space it built the atom in is not the runtime's table.
+    let private_index = std::thread::spawn(move || {
         with_thread_env_host(|host| {
             // The message env `enif_alloc_env(void)` asks this seam for — step (2) of its
             // reachability order, the only one a thread outside a call can satisfy.

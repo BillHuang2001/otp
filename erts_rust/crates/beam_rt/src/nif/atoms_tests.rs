@@ -170,6 +170,9 @@ fn a_decoded_image_carries_a_name_into_the_live_table() {
     let mut live = AtomTable::new();
     live.seed(["a_live_atom_first"]);
     let node = live.intern(NODE);
+    // The live table's own next index — after the seed and this node's sysname, and unrelated to
+    // anything the private space handed out.
+    let next_live_index = Atom::from_raw(live.len() as u32);
     let mut heap = Heap::new(1024).expect("a decode heap");
     let decoded = beam_codec::decode_term_with_local_node(&image, &mut heap, &mut live, node, 7, None)
         .expect("the image decodes against the live table");
@@ -178,8 +181,7 @@ fn a_decoded_image_carries_a_name_into_the_live_table() {
         .lookup("thread_made_atom")
         .expect("the decoder interned the name into the live table");
     assert_eq!(
-        live_index,
-        Atom::from_raw(1),
+        live_index, next_live_index,
         "at the live table's own next index"
     );
     assert_ne!(
