@@ -237,6 +237,9 @@ drivers publish their own state through them (see *Who overrides the seam* below
   calls `flush` before `terminate_port` and parks a port with a non-empty `ioq` in
   `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at the
   call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
+  The loaded-driver path has the same hole one level lower: `beam_abi::DriverLibrary::flush`
+  (`../../beam_abi/src/driver/loader.rs:377`) exists, but `abi/port.rs`'s `DriverPort::stop` runs only
+  the entry's `stop` callback, so a `.so` driver's `flush` entry is never invoked at a port close either.
 - **The partial-line flush rides `take_eof`, so it needs the `eof` *stream option* in this crate.** The
   port's flush is triggered when `Driver::take_eof` reports `true`, but `drivers/spawn.rs`
   (`SpawnDriver::take_eof`) reports only when `StreamOptions.eof` was set — the driver latches the end of
