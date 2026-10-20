@@ -121,7 +121,9 @@ use beam_term::{AtomTable, Eterm};
 use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::connection::Handshake;
-use crate::control::{decode_control, encode_control_cached, ControlMessage};
+use crate::control::{
+    decode_control_with_identity, encode_control_cached, ControlMessage, LocalIdentity,
+};
 use crate::delivery::{Delivery, Dispatched, InboundSink, LinkIdentity};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
@@ -298,6 +300,10 @@ pub struct ConnectionDriver {
     inbound: VecDeque<Vec<u8>>,
     /// How many ticks this link has answered (a diagnostic).
     ticks_answered: u64,
+    /// This node's own identity for the inbound decode — `None` (the default) keeps
+    /// every decoded pid/port/reference in its faithful external form. See
+    /// [`LocalIdentity`].
+    local_identity: Option<LocalIdentity>,
 }
 
 impl ConnectionDriver {
@@ -495,6 +501,7 @@ impl ConnectionDriver {
             next_seq_id: 1,
             inbound: VecDeque::new(),
             ticks_answered: 0,
+            local_identity: None,
         }
     }
 
@@ -594,6 +601,43 @@ impl ConnectionDriver {
         !self.output.is_empty()
     }
 
+    /// Installs this node's own identity for the inbound decode
+    /// ([`LocalIdentity`]).
+    ///
+    /// With it installed, an inbound external pid/port/reference whose node **and**
+    /// creation are this node's decodes to the **internal** term (the C's
+    /// `dec_is_this_node`, `external.c:3123-3129`), so a pid a peer reflects back
+    /// is `=:=` this node's own pid and an inbound alias reference
+    /// (`DOP_ALIAS_SEND`'s `To`) becomes a reference the runtime can resolve. It
+    /// applies to [`next_message`](Self::next_message) and therefore to every
+    /// derive-off of it (`next_delivery`, `next_delivery_checked`,
+    /// `dispatch_inbound*`), for the control arguments **and** the trailing message
+    /// term.
+    ///
+    /// `node` must be the sysname atom interned in the **same** table the messages
+    /// are decoded into — see [`LocalIdentity::intern`]. A driver with no identity
+    /// installed (the default) decodes exactly as it did before this seam existed.
+    ///
+    /// The identity is *not* consulted by
+    /// [`Delivery::classify_validated`](crate::Delivery::classify_validated): that
+    /// per-link check compares **external** node atoms (the C's `dep`) and is
+    /// unchanged by this.
+    pub fn set_local_identity(&mut self, identity: LocalIdentity) {
+        self.local_identity = Some(identity);
+    }
+
+    /// The identity installed by [`set_local_identity`](Self::set_local_identity),
+    /// or `None` (the default).
+    pub fn local_identity(&self) -> Option<LocalIdentity> {
+        self.local_identity
+    }
+
+    /// Removes the installed identity, restoring the faithful-external-form decode
+    /// ([`set_local_identity`](Self::set_local_identity)'s default).
+    pub fn clear_local_identity(&mut self) {
+        self.local_identity = None;
+    }
+
     /// Decodes the next queued control message, or returns `None` when none is
     /// pending.
     ///
@@ -601,6 +645,10 @@ impl ConnectionDriver {
     /// cache here (see the module docs), so the payload's `ATOM_CACHE_REF`s resolve
     /// against `atoms`. `atoms` must be the same table across calls (the cached atom
     /// indices are table-local).
+    ///
+    /// Identifiers of **this** node become internal terms when an identity is
+    /// installed ([`set_local_identity`](Self::set_local_identity)); without one
+    /// (the default) every pid/port/reference keeps its faithful external form.
     pub fn next_message(
         &mut self,
         heap: &mut Heap,
@@ -613,7 +661,13 @@ impl ConnectionDriver {
         let (header, offset) = parse_header(&body, atoms)?;
         self.recv_cache.apply(&header)?;
         let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
-        let message = decode_control(payload, heap, atoms, Some(self.recv_cache.table()))?;
+        let message = decode_control_with_identity(
+            payload,
+            heap,
+            atoms,
+            Some(self.recv_cache.table()),
+            self.local_identity,
+        )?;
         Ok(Some(message))
     }
 

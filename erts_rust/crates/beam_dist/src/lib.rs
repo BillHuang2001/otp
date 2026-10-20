@@ -64,7 +64,8 @@ pub mod prelude;
 pub mod transport;
 
 pub use crate::control::{
-    carries_message, decode_control, encode_control, encode_control_cached, ControlMessage,
+    carries_message, decode_control, decode_control_with_identity, encode_control,
+    encode_control_cached, ControlMessage, LocalIdentity,
 };
 pub use crate::delivery::{
     Delivery, DeliveryOutcome, Dispatched, InboundSink, LinkIdentity, UnsupportedSink,
