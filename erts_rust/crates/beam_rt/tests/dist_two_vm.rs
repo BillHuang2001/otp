@@ -68,7 +68,8 @@
 //! | [`a_real_erl_peer_links_to_our_process_and_traps_our_exit`] | `link/1` + `trap_exit`, then dies our victim with `boom` | `EXIT_MATCH pid=true reason=boom`, and the `{'EXIT', Pid, boom}` whose pid **is** the pid we printed |
 //! | [`a_real_erl_peer_traps_our_exit_with_the_reason_term_it_asked_for`] | the same, with the **compound** reason `{shutdown,{custom,7}}` | the reason *value*, not merely the event |
 //! | [`a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered`] | `unlink/1` first (with a barrier proving *our* node processed it), then dies the victim | `NOEXIT`, and no `EXIT` line at all |
-//! | [`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`] | `link/1`, a barrier, then `unlink/1` and a second barrier — the victim never dies | the victim's `process_info(Victim, links)` is `1 [true]` (`length/1` + `is_pid/1`, never the pids) after the link and `0 []` after the unlink |//! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
+//! | [`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`] | `link/1`, a barrier, then `unlink/1` and a second barrier — the victim never dies | the victim's `process_info(Victim, links)` is `1 [true]` (`length/1` + `is_pid/1`, never the pids) after the link and `0 []` after the unlink |
+//! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
 //! | [`a_real_erl_peer_demonitors_before_our_death_so_no_down_arrives`] | `demonitor(Ref, [flush])` first | `NODOWN`, and no `DOWN` line at all |
 //! | [`our_pid_survives_a_round_trip_through_a_real_erl_peer`] | echoes a pid term back | our pid arrives intact (`IDENTITY true`, the same text) |
 //!
