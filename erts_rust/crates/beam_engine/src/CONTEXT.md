@@ -183,8 +183,10 @@ state each holds in a Rust local across the call:
   `FunSource::read` from `x(arity)` or the `call_fun2` operand) and the `args` copy
   (`families::funs::register_args`). `terms::fun_free` (`terms/fun.rs`) then re-reads the term's **raw
   heap storage** *after* the call, so a move in the seam would dangle both.
-- `ExecutionContext::apply_fun` (the `Ok(None)` fallback of the same `call_fun`) — the same
-  `fun`/`args`; protection here is the host's relocation exemption, not publication.
+- `ExecutionContext::apply_fun_outcome` (the `Ok(None)` fallback of the same `call_fun`, whose default
+  body calls `apply_fun`) — the same `fun`/`args`; protection here is the host's relocation exemption,
+  not publication. A `FunOutcome::Suspend` writes nothing, so the parked instruction's operands stay
+  readable from `x(arity)`/`x(0..arity)` for the resume's re-consultation.
 - `ExecutionContext::call_bif` (`interpreter/bif.rs`) — the marshalled arguments are **copies** living in
   the `EMPTY_ARGS` stack array (`exec_bif`/`call_bif_named`) or `Machine::args_scratch` (**taken out of
   the machine** for the whole `dispatch_wide` call and restored afterwards, so it is not even reachable

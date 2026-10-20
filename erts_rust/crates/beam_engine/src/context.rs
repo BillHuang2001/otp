@@ -81,6 +81,16 @@
 //! the frozen [`RootSet`] — so a suspended BIF's live operands are rooted by
 //! construction. It is the engine-side twin of ERTS's `ERTS_BIF_YIELD2/3`.
 //!
+//! ## The closure-apply suspend channel
+//!
+//! [`apply_fun`] has the same limitation for a host that **interprets** a closure
+//! itself (a tree-walking `-eval` evaluator), so [`FunOutcome`] and
+//! [`apply_fun_outcome`] are its twin: a [`FunOutcome::Suspend`] parks the machine on
+//! the `call_fun`/`call_fun2` instruction, and the resume **re-consults the door with
+//! the same `fun` and `args`**, so the host must *continue* the pending application
+//! rather than restart it. Both doors **default** to forwarding and wrapping the
+//! value, so a host that predates them is byte-identical.
+//!
 //! ## The mailbox / message-receive seam
 //!
 //! The `receive` opcode family ([`crate::families::receive`]) never looks at a
@@ -437,6 +447,76 @@ impl BifOutcome {
     }
 }
 
+/// The outcome of a **fun/closure application** that is allowed to **wait** — the
+/// closure-apply twin of [`BifOutcome`].
+///
+/// [`ExecutionContext::apply_fun`] can only answer a value or an error, which leaves a
+/// host that **interprets** the closure itself — `beam_rt`'s tree-walking `-eval`
+/// evaluator, for one — with no way to park its caller when the body has to wait (a
+/// `receive` with no message, a timer): it can only raise. This enum is that missing
+/// channel, and [`ExecutionContext::apply_fun_outcome`] is the door beside
+/// [`apply_fun`](ExecutionContext::apply_fun).
+///
+/// * [`FunOutcome::Return`] — the application completed; this is its value, exactly
+///   what [`ExecutionContext::apply_fun`] returns.
+/// * [`FunOutcome::Suspend`] — the application could not complete without waiting. The
+///   engine does **not** apply the instruction: it parks on it (the machine's own
+///   `(func, pc)`) and reports a suspend ([`crate::RunOutcome::Suspend`]). The host
+///   later resumes the process, and this method is **consulted again with the same
+///   `fun` and `args`** — see the contract on
+///   [`ExecutionContext::apply_fun_outcome`] for what that requires of the host.
+///
+/// # Rooting
+///
+/// The engine keeps **no** suspended-application state: it neither copies the
+/// arguments nor remembers the closure. Parking is the machine's `(func, pc)` plus its
+/// registers, its Erlang stack and its FR file — and resumption **re-executes the
+/// instruction**, which re-reads the fun (`x(arity)`, or the `call_fun2` operand) and
+/// the arguments (`x(0..arity)`) from that state. Those are exactly the frozen
+/// [`RootSet`], so a suspended application's live operands are rooted **by
+/// construction** and a moving collector may relocate them.
+///
+/// # Where a suspend is honoured
+///
+/// At the `Ok(None)` arm of the `call_fun`/`call_fun2` closure seam — the one engine
+/// call site of the apply fallback, whose operand reads are pure and whose single write
+/// (`x(0)` with the value) is success-only, so re-executing it applies nothing twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunOutcome {
+    /// The application completed; this is its value.
+    Return(Eterm),
+    /// The application could not complete without waiting; the instruction was **not**
+    /// applied and the host must continue it on resume (see the type docs).
+    Suspend,
+}
+
+impl FunOutcome {
+    /// Is this a [`FunOutcome::Suspend`]?
+    pub fn is_suspend(&self) -> bool {
+        matches!(self, FunOutcome::Suspend)
+    }
+
+    /// The returned value, or `None` for a suspend.
+    pub fn into_value(self) -> Option<Eterm> {
+        match self {
+            FunOutcome::Return(value) => Some(value),
+            FunOutcome::Suspend => None,
+        }
+    }
+
+    /// The returned value, or the typed suspend error `at` names.
+    ///
+    /// The bridge for a caller that cannot honour a suspend (see [`FunOutcome`]): it
+    /// must never be mistaken for a value, so it becomes a
+    /// [`crate::error::unsupported`] naming the site.
+    pub fn into_value_or_unsupported(self, at: &str) -> Result<Eterm> {
+        match self {
+            FunOutcome::Return(value) => Ok(value),
+            FunOutcome::Suspend => Err(crate::error::unsupported(at)),
+        }
+    }
+}
+
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
 pub trait ExecutionContext {
     /// Dispatch `module:function/arity` with `args`, returning the result term.
@@ -737,6 +817,44 @@ pub trait ExecutionContext {
         Err(crate::error::unsupported("apply_fun"))
     }
 
+    /// The **outcome-aware** closure-apply door: [`apply_fun`](ExecutionContext::apply_fun)
+    /// that is also allowed to answer [`FunOutcome::Suspend`].
+    ///
+    /// A host that **interprets** the closure itself and whose body can **wait** — a
+    /// tree-walking evaluator applying an `-eval` lambda that reaches a `receive` with
+    /// no message — overrides this door; the engine then folds a
+    /// [`FunOutcome::Suspend`] into [`Step::Suspend`](crate::Step) at the apply
+    /// fallback, parking the machine on the `call_fun`/`call_fun2` instruction and
+    /// reporting [`crate::RunOutcome::Suspend`] to a blocking-aware run entry. It is
+    /// the closure-apply twin of the BIF suspend channel
+    /// ([`call_bif_outcome`](ExecutionContext::call_bif_outcome) / [`BifOutcome`]).
+    ///
+    /// **Contract.**
+    /// * `Suspend` means the application did **not** complete and the
+    ///   `call_fun`/`call_fun2` instruction was **not** applied: no register, stack
+    ///   slot, frame or continuation was written.
+    /// * The engine parks the machine on that instruction and resumption
+    ///   **re-executes** it, re-consulting this method with the **same** `fun` and the
+    ///   **same** `args`. The host must therefore **CONTINUE** the pending
+    ///   application, never restart it — an evaluator body is not re-execution
+    ///   idempotent — and must not consume a one-shot resource on the suspending
+    ///   attempt. (Contrast [`BifOutcome`], where the re-issued dispatch re-runs the
+    ///   BIF from its operands.)
+    /// * A host that declines the in-machine closure seam does not necessarily reach
+    ///   this door: [`resolve_local_fun`](ExecutionContext::resolve_local_fun) is
+    ///   consulted **first**, and a resolved closure is entered in this machine.
+    /// * [`crate::RunOutcome::Suspend`] is only reachable from a blocking-aware run
+    ///   entry; a non-blocking one folds it into the typed [`crate::error::suspended`]
+    ///   error.
+    ///
+    /// The default body forwards to [`apply_fun`](ExecutionContext::apply_fun) and
+    /// wraps the answer in [`FunOutcome::Return`], so every existing implementor
+    /// compiles and behaves byte-identically (an unimplemented `apply_fun` still
+    /// answers the typed [`crate::error::unsupported`]).
+    fn apply_fun_outcome(&mut self, fun: Eterm, args: &[Eterm]) -> Result<FunOutcome> {
+        self.apply_fun(fun, args).map(FunOutcome::Return)
+    }
+
     /// `send`: deliver `message` to the pid/port term `to` (the `send` opcode).
     ///
     /// The default body is a typed [`crate::error::unsupported`] — a context with
@@ -919,10 +1037,16 @@ pub trait ExecutionContext {
     /// not repeat the combined-argument ordering).
     ///
     /// The default body returns `Ok(None)` — "I cannot run this closure in your
-    /// machine" — which keeps the value-returning
-    /// [`apply_fun`](ExecutionContext::apply_fun) fallback (fun kinds with no local
-    /// label: external `fun M:F/A` and the `-eval` evaluator's own closure), so
-    /// every existing host is unchanged.
+    /// machine" — which keeps the
+    /// [`apply_fun_outcome`](ExecutionContext::apply_fun_outcome) fallback (fun kinds
+    /// with no local label: external `fun M:F/A` and the `-eval` evaluator's own
+    /// closure), so every existing host is unchanged. That fallback is
+    /// **outcome-aware**: its default forwards to the value-returning
+    /// [`apply_fun`](ExecutionContext::apply_fun), and a host that overrides it may
+    /// answer [`FunOutcome::Suspend`] to park the machine on the `call_fun`/`call_fun2`
+    /// instruction ([`Step::Suspend`](crate::Step),
+    /// [`crate::RunOutcome::Suspend`]) instead of failing. Such a host must **continue**
+    /// the pending application when the instruction is re-executed, never restart it.
     ///
     /// [`apply_fun`]: ExecutionContext::apply_fun
     fn resolve_local_fun(
