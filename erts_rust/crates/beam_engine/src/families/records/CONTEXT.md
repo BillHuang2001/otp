@@ -132,6 +132,17 @@ expectation above is pinned from the C ground truth (`erts/emulator/beam/erl_rec
 `emu/instrs.tab`, `emu/ops.tab`, `emu/macros.tab`) — no oracle agreement is claimed.
 
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
+## Coverage notes
+- The `differential` gate's `records` group (46 cases: 35 `Eval` + 11 `Module`) pins every
+  `records:*` BIF and six of the eight opcodes (186–191; 192/193 are unreachable from the
+  installed OTP-29 `erlc`). Every case **creates** its record through `records:create/4`, so
+  `PutRecord`'s create form has no oracle-verified case: the local form is proven structurally
+  only (here + `tests/update.rs`), and the corpus module's `-record #rec{a, b}` has defaultless
+  fields, so a compile-time `#rec{a = 1}` there would be a `novalue` error — a positive case
+  needs a record whose fields all carry defaults.
+- Stale-comment trap: the module doc of `tools/differential/src/corpus/records.rs` ("The module
+  case") and `crates/beam_rt/tests/records.rs` still describe the create form as unimplemented.
+  The **local** create form IS implemented here; only a *foreign* `Id` is the gap.
 
 ## Handoff: a foreign `PutRecord` create id (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.

@@ -157,7 +157,7 @@ Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-c
 - A.5 → `wire.rs`, `wire_extra.rs` (443), `dist.rs` (5), `dist_extra.rs` (15)
 - A.6 → `flags.rs`, `flags_apply.rs`
 - A.1/A.6 → `eval_route.rs` (22)
-- A.7 → `bifs.rs`, `ets.rs`, `ets_access.rs`, `ets_spec.rs`, `maps.rs`, `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`, `re.rs` (141), `format_limit.rs` (21), `ddll.rs` (21), `decode_packet.rs` (43), `proc_signals.rs`, `proc_control.rs`, `records.rs`, `zlib.rs` (36)
+- A.7 → `bifs.rs`, `ets.rs`, `ets_access.rs`, `ets_spec.rs`, `maps.rs`, `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`, `re.rs` (141), `format_limit.rs` (21), `ddll.rs` (21), `decode_packet.rs` (43), `proc_signals.rs`, `proc_control.rs`, `records.rs` (46), `zlib.rs` (36)
 - A.7/A.8 → `bif_extra.rs` (33: the `process_info/1,2` item sets of a spawned and of the running process, the ten `fun_info/1` items of a compiled local fun, `module_info/1`, `is_builtin/3`, `check_old_code/1`; the position-item cases are module-run, the running-process ones `-eval`)
 - A.8 → `system_info.rs`
 - A.1/A.7 → `bits.rs` (37), `gc.rs` (38)

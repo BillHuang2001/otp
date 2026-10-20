@@ -132,12 +132,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3218 agree=3217 mismatch=0
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3322 agree=3321 mismatch=0
   unsupported=1 skipped=0`** → `gate.sh` exits 0. **No case disagrees.** The single recorded
   capability gap (`known-gaps.txt`, the ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, an
   `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). `gate.sh` is
   authoritative for the live per-contract split; it always passes `--strict` and defaults its
-  allowlist to `tools/differential/known-gaps.txt`.
+  allowlist to `tools/differential/known-gaps.txt`. `tools/differential/CONTEXT.md` is the source of
+  truth for the corpus size and the sweep recipe — do not duplicate the counts here.
   Caveat: the A.4 case `driver_extra/driver_pushqv_with_a_partial_skip_enqueues_the_tail` exposes an
   **oracle-side crash flake** (the system `erl` dies by signal on ~2 of 5 solo runs; the Rust side is
   correct) — an OTP 29.1.1 upstream defect, a corpus-harness issue, not a runtime divergence.
@@ -190,7 +191,12 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
   entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); the
   match-spec compiler beyond the core spec forms; `put_record/6`'s create form for a **foreign**
-  module's record id (the running module's own records are supported); several
+  module's record id (the running module's own records are supported) — the fix seam is a new
+  *defaulted* `beam_engine::ExecutionContext` method handing back the owner module's
+  `Arc<Module>` (the loaded modules ARE retained: `CodeServer`'s `modules: HashMap<String,
+  Arc<Module>>`, all lowered against one shared atom table), since `beam_engine` cannot reach
+  `beam_rt`/`beam_bifs` from an instruction and every tier funnels through
+  `families::records::local_definition`; several
   structured-raise-reason degradations; the datagram/inet data path (`gen_udp:send/4`,
   `inet:getstat/1`, `gen_tcp:connect/3` and `listen/2`); depth of live distribution interop. Every one
   returns a typed error, never a wrong result.

@@ -1,10 +1,11 @@
-# compiler/scripts — Compiler Smoke Test & Host-Side Test Rig
+# compiler/scripts — Compiler Smoke Test, Host-Side Test Rig & A.9 Self-Host Probe
 
 ## Intent
-Two *manual*, **test-only** developer tools. `scripts/` is not in `lib/compiler/Makefile`'s `SUB_DIRECTORIES`, so nothing here is built, installed, or run by CI:
+Three *manual*, **test-only** developer tools. `scripts/` is not in `lib/compiler/Makefile`'s `SUB_DIRECTORIES`, so nothing here is built, installed, or run by CI:
 
 - `smoke` — release-time end-to-end smoke test: prove the freshly built compiler can build large real-world Erlang projects (Elixir itself plus a set of Mix/hex dependencies) without crashing.
 - `host_env.sh` + `host_env_xform.py` — the **host-side test rig**: build and run the in-tree `lib/compiler` application on *this machine's* Erlang runtime, without building the OTP-30 emulator. Needed because `erl`/`erlc`/`escript` on PATH are usually an older release (here: OTP 29.1.1 / erts-17.1), which (a) cannot load this tree's OTP-30 beams (`bootstrap/lib/**`: *"This BEAM file was compiled for a later version of the runtime system ... Use of opcode 193; this emulator supports only up to 191"*) and (b) resolves `-import_record` against its own installed `compiler` application, so a plain `erlc` of this tree's sources produces a compiler that crashes in its own SSA/records with `{badrecord,...}`/`function_clause`. Building the OTP-30 emulator needs `autoconf`/`m4` and is out of scope (see `otp30_env.sh` for that route).
+- `a9_selfhost_probe.sh` (+ `A9_CASES.md`) — the **A.9 self-hosted-build probe**: measure, rung by rung, how far the Rust rewrite's `erts_rust/target/*/beam_rt` gets towards compiling this tree with the tree's *own* committed OTP-30 bootstrap compiler, and run the A.9 differential case family it defines. Read-only with respect to the repository; it never claims a self-hosted build that does not exist.
 
 ## API Surface
 
@@ -37,6 +38,17 @@ Copied verbatim into the scratch dir as `mix.exs`. `deps/0` selects the dependen
 ### `smoke-build/` — smoke-test scratch dir
 Created if missing, used as cwd for all `smoke` steps; holds the `elixir/` clone, generated `mix.exs`, `deps/`, `_build/`. Only `smoke-build/mix.lock` is tracked (see `.gitignore`).
 
+### `a9_selfhost_probe.sh` — the A.9 self-hosted-build probe
+`lib/compiler/scripts/a9_selfhost_probe.sh [ladder|cases|--help]`, runnable from any directory; reads the repository, writes only under `$TMPDIR/a9_selfhost` (`A9_DIR` overrides), never inside the repo.
+- `ladder` (default) — runs L1–L7 and prints **one line per rung**, `L<n> <name>: PASS|BLOCKED|FAIL — <evidence>`, then `a9_selfhost_probe: ladder: <p> PASS, <b> BLOCKED, <f> FAIL (<n> rungs, <t>)`. Exit 0 when every rung ran (a `BLOCKED` rung is a successful measurement of a rung that does not work), 1 on any `FAIL`, 2 on a harness error (no `beam_rt`, no oracle, missing source).
+- `cases` — runs the nine-case A.9 family of `A9_CASES.md` against oracle + `beam_rt` and prints `<id>: agree|unsupported|mismatch|skipped — <detail>` per case; exit 1 only if a `mismatch` appears (an `unsupported` is a recorded gap, a `skipped` a recorded non-verdict).
+- `BEAM_RT` overrides the runtime (default: `erts_rust/target/{release,debug}/beam_rt`, first that exists); `ERTS_ORACLE`/`ERLC` the oracle (default: PATH); `A9_COMPILER_MODULES` the L3 module set (default `sys_core_bsm beam_flatten`); `A9_L2_SRC` the L2 module (default `lib/compiler/src/cerl_clauses.erl`); `A9_VERBOSE=1` echoes each command's output.
+- Rung coverage: L1 `cli_eval` (`-eval '1+1'` → `2`); L2 `in_process_compile` (one real OTP module, byte-`cmp`ed against `erlc +deterministic`); L3 `compiler_chunk` (the same over the tree's **own** `lib/compiler/src` sources — "the Rust runtime compiling the compiler"); L4 `tree_own_compiler` (the tree's committed OTP-30 bootstrap compiler on the code path — the A.9 blocker); L5 `erlc_frontend` (the real `erlc` with `ERLC_EMULATOR=<beam_rt>`, with the front end's argv captured by a logging wrapper); L6 `emake_driver` (the `make` module with the correct `{emake,[{Src,Opts}]}` in-term form); L7 `make_command_line` (the `make/otp.mk.in` compile rule).
+- Every artifact comparison uses `deterministic`/`{deterministic,true}` on **both** sides (the `CInf`/`Line` chunks otherwise embed the source path and cwd), and a rung that produced nothing asserts the artifact's *absence* — it never reports PASS on a comparison of nothing.
+
+### `A9_CASES.md` — the A.9 differential case family
+The definition of the nine proposed cases (id, contract letter, oracle invocation, Rust invocation, golden assertion, verdict today) plus, for each blocked case, the exact typed error and its owner crate; also the paragraphs on what is *deliberately not* a case and on how to land the family in `erts_rust/tools/differential` (`src/corpus/selfhost.rs`, `known-gaps.txt`, `gate.sh`). Analytical/planning document — no code.
+
 ## How It Is Invoked
 
 ### Host-side rig (the common case)
@@ -57,9 +69,21 @@ lib/compiler/scripts/host_env.sh cleandir
 ### `smoke`
 Run the escript directly (`lib/compiler/scripts/smoke`); it takes no arguments and uses the current environment/`PATH`. Steps: create/enter `smoke-build/`, `git clone git@github.com:elixir-lang/elixir.git` (or `git pull --ff-only origin main` + `make clean` if the clone exists and HEAD moved), `make compile`, `make test_stdlib` in Elixir, install `local.hex`/`local.rebar` with the freshly built Elixir's `bin/` first on `PATH`, then per dependency set export `SMOKE_DEPS_SET`, delete `mix.lock`, `touch mix.exs`, `mix deps.clean --all`, `mix deps.get`, `mix deps.compile`. Only deps are fetched and compiled; Mix projects' own test suites are never run.
 
+### A.9 probe
+```sh
+# build the runtime once (from the repo root; the crate cache is shared):
+erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt
+lib/compiler/scripts/a9_selfhost_probe.sh ladder          # ~1 min, 7 rungs + summary
+lib/compiler/scripts/a9_selfhost_probe.sh cases           # ~50 s, 9 case verdict lines
+A9_VERBOSE=1 lib/compiler/scripts/a9_selfhost_probe.sh ladder   # echo every command
+```
+- An in-process compile of one module of this tree costs ~6–24 s under `beam_rt` (the oracle needs ~0.2 s), so keep `A9_COMPILER_MODULES`/`A9_L2_SRC` small; `beam_ssa_loop_cfg.erl` alone takes ~105 s and is deliberately **not** in either default set.
+- `erlc` resolves `ERLC_EMULATOR` against its own cwd, so the probe always exports an absolute `beam_rt` path.
+
 ## Dependencies
 - Host-side rig: `erlc`/`erl` of any older OTP on PATH, `perl` (for `beam_makeops`), `python3`, `sha1sum`; writes only to `/tmp/host_env_*`.
 - `smoke`: network access (GitHub over SSH — needs a GitHub SSH key — plus hex.pm), a working `git`, `make` and a C toolchain; `mix`/`elixir` are built from the clone, not preinstalled. To be meaningful, run with the just-built OTP (`$ERL_TOP/bin` first on `PATH`).
+- A.9 probe: a built `erts_rust/target/{release,debug}/beam_rt` (or `BEAM_RT`), the system `erl`/`erlc` as oracle, and the committed `bootstrap/lib/{kernel,stdlib,compiler}/ebin` for L4; `bash`, `awk`, `sed`, `cmp`, `date +%s%N`. No `configure`/`make` run, no network.
 
 ## Known Issues
 - **The host-side rig exercises the compiler's *logic*, not its record mechanism.** `host_env_xform.py` drops all record type annotations and flattens the module-namespaced/native records (`-record #Name`, `-import_record`, `-export_record`, `#_{anno=…}`, `#rec.field`) to classic tuples — in the scratch copy only. Any future source change that adds an unhandled wildcard/`is_record/1`/`import_record` site makes the transform exit non-zero (by design) until the rule table is extended. All modules are converted consistently, so the built compiler is self-consistent and its output runs on the host.
@@ -72,14 +96,21 @@ Run the escript directly (`lib/compiler/scripts/smoke`); it takes no arguments a
 - `smoke/1` deletes `mix.lock` before `mix deps.get`, so the committed `smoke-build/mix.lock` does not pin versions during a run — deps are re-resolved freshly (and the checked-in lock is overwritten in the working tree).
 - `smoke` step `clone_elixir/0` runs against Elixir `main`, so the smoke test picks up Elixir changes and can fail for reasons unrelated to the Erlang compiler.
 - The Elixir deps set (`main`) is pinned to old version requirements, so it can rot as hex packages are yanked/updated.
+- **The A.9 probe measures; it does not build the tree.** Its two blocked rungs are live capability gaps in `beam_rt`, not probe faults: L4 = the tree's own OTP-30 bootstrap compiler cannot compile *any* module (`compile:file/2` returns the string `'unsupported_opcode: put_record: create: no record definition table for another module'`, a create-form `put_record` naming a foreign `{Module,Name}` record — `crates/beam_engine/src/families/records/mod.rs::local_definition`), L5 = the real `erlc` front end dies on `beam_rt: unknown flag -S1` (compact `+S1`/`+sbtu`) and `init:get_plain_arguments()` is `[]` under this runtime. L7 is environment-only: `./configure` re-execs `$CONFIG_SHELL`, which is a missing `/nix/store/…-bash-5.3p9/bin/bash`, so `make/$(TARGET)/otp.mk` never exists. Measured ladder: 4 PASS / 3 BLOCKED / 0 FAIL.
+- The L4 observable is **module dependent**: `lib/compiler/src/beam_flatten.erl` yields the typed reason above, while `cerl_clauses.erl` makes the tree compiler print its own `Function: is_catchall/1` diagnostic and answer `error` (the same gap caught by `compile`'s per-function handler). A probe that pinned only the second shape would misclassify a gap as a mismatch.
+- The L4 corroboration is re-measured on every ladder run: all 59/59 host OTP-29 `compiler/ebin/*.beam` carry **0** `put_record` instructions (0 create-form), because pre-OTP-30 records are flattened to `put_tuple2` at compile time — the reason a 755/755 byte-identical in-process sweep never executed the record-table path. The tree's OTP-30 bootstrap beams do carry them (583 create-form in `v3_core.beam`, 113 in `beam_ssa_opt.beam`, measured once under `beam_rt`; a full re-count costs ~2 min and is not part of the probe).
+- `a9_selfhost_probe.sh cases` deliberately has **no** case for `-extra` plain arguments: the oracle prints `["a","b"]` where `beam_rt` prints `[]`, which is a `mismatch` (a differing observable, not a signalled gap) and is already recorded in `erts_rust/tools/differential/divergences.md`. The L5 rung reports the value instead, so the fact is reproduced without a red run.
 
 ## Notes for Agents
 - To test a change in `lib/compiler/src` on a machine without an OTP-30 runtime: `lib/compiler/scripts/host_env.sh build`, then drive the resulting compiler via `erl -noshell -pa $RIG_EBIN`(or `host_env.sh shell`). Re-run `build` after every source edit — it always re-transforms and recompiles from scratch, and it never touches the repository.
 - `smoke-mix.exs` is matched by the repo-root `.formatter.exs` (`**/*.exs`), so it must stay `mix format`-clean or the tree-wide format check fails.
-- Nothing in CI, `Makefile.in`, or `lib/compiler/Makefile` invokes `smoke` or `host_env.sh`; the `.github/scripts/otp-compliance.es` reference to `smoke-build` only excludes that directory from `.app.src` scanning.
+- To re-check A.9 after any `beam_rt` change: `lib/compiler/scripts/a9_selfhost_probe.sh ladder` (≈1 min). L4/L5 turning `PASS` is the signal to delete the two allowlist entries in `erts_rust/tools/differential/known-gaps.txt` and tighten the ratchet — the probe's `cases` mode already byte-compares an artifact whenever one is produced, so nothing else needs editing.
+- Nothing in CI, `Makefile.in`, or `lib/compiler/Makefile` invokes `smoke`, `host_env.sh` or `a9_selfhost_probe.sh`; the `.github/scripts/otp-compliance.es` reference to `smoke-build` only excludes that directory from `.app.src` scanning.
 - `HOWTO/INSTALL.md`'s "smoke test" (`erl -s ts install -s ts smoke_test batch`) is a different mechanism (test_server subset), not `smoke`.
 
 ## See Also
 - `../CONTEXT.md` — the `compiler` application (build, sources, Common Test suites, the opt-in Stage-2 passes).
 - `../test/` — the Common Test suites that are the normal regression coverage.
+- `A9_CASES.md` (this dir) — the A.9 differential case family: ids, invocations, goldens, expected verdicts, gap owners, and how to land it in `erts_rust/tools/differential`.
+- `../../../erts_rust/tools/differential/` — `known-gaps.txt` (the ratchet allowlist), `divergences.md` (unpinnable divergences), `gate.sh`; read-only from this node.
 - `../otp30_env.sh` (this dir) — the full-tree route that builds the OTP-30 emulator first (needs `autoconf`/`m4`).
