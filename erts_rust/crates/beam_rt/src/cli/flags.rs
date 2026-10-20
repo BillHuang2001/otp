@@ -138,12 +138,53 @@ pub(super) fn parse_kernel_poll(switch: &str, value: &str) -> Result<()> {
 /// The nine `+sbt` scheduler bind types (`erl_cpu_topology.c:628-647`).
 pub(super) const SCHEDULER_BIND_TYPES: [&str; 9] =
     ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"];
-/// The `+s` sub-options with a value (`erlexec.c:129-150` `pluss_val_switches`, plus
-/// `early_init`'s `+ssrct`, `erl_init.c:943-954`).
-const EMULATOR_S_SUB_OPTIONS: &[&str] = &[
-    "sbt", "sbwtdcpu", "sbwtdio", "sbwt", "scl", "sct", "secio", "sfwi", "stbt", "swct",
-    "swtdcpu", "swtdio", "swt", "sws", "sss", "sssdcpu", "sssdio", "spp", "sub", "srct",
+/// The `+s*` scheduler sub-parameters — the text **after** `+s` (`erl_init.c`'s
+/// `sub_param = argv[i]+2`) — with the flag that says whether the sub-parameter reads a
+/// value.
+///
+/// This is `erl_init.c:1922-2210`'s `has_prefix` chain, in its own order: the entries are
+/// **longest first** within each family, so a prefix match resolves `bwtdcpu` before `bwt`,
+/// `wtdcpu` before `wt`, `ssdcpu` before `ss` and `ecio`/`ss` never as something shorter.
+/// Every one of them but `srct` reads a value with `get_arg(sub_param + <length>,
+/// argv[i+1], &i)`, i.e. the value may be **attached** (`+sbwt1000`) or the next token
+/// (`+sbwt 1000`); `+ssrct` (skip reading the CPU topology, handled in `early_init`,
+/// `erl_init.c:943-954`, and a no-op in the late pass) reads none.
+pub(super) const SCHEDULER_SUB_OPTIONS: &[(&str, bool)] = &[
+    ("bwtdcpu", true),
+    ("bwtdio", true),
+    ("ssdcpu", true),
+    ("ssdio", true),
+    ("wtdcpu", true),
+    ("wtdio", true),
+    ("ecio", true),
+    ("tbt", true),
+    ("wct", true),
+    ("bwt", true),
+    ("fwi", true),
+    ("bt", true),
+    ("cl", true),
+    ("ct", true),
+    ("pp", true),
+    ("ub", true),
+    ("wt", true),
+    ("ws", true),
+    ("ss", true),
+    ("srct", false),
 ];
+
+/// The **value-taking** `+s*` scheduler switch `argument` names, if any — the sub-parameter
+/// whose spelling the token carries (`+sbwt1000` and `+sbwt 1000` are both `sbwt`).
+///
+/// The caller prefixes the answer with `"+s"` to get the canonical switch spelling it
+/// preserves and reports ([`crate::cli`]'s `PLUS_VALUE_SWITCHES` handles the word-order
+/// switches; this is the one family whose spelling is data rather than a table row).
+pub(super) fn scheduler_value_switch(argument: &str) -> Option<&'static str> {
+    let rest = argument.strip_prefix("+s")?;
+    SCHEDULER_SUB_OPTIONS
+        .iter()
+        .find(|(option, takes_value)| *takes_value && rest.starts_with(option))
+        .map(|(option, _takes_value)| *option)
+}
 
 /// Whether the emulator's own argument loop recognizes the flag spelling `name` — the
 /// recognition rule the oracle's `+X` fallthrough depends on.
@@ -209,10 +250,11 @@ pub(super) fn emulator_flag_recognized(name: &str) -> bool {
         'B' => matches!(rest, "" | "i" | "c" | "d"),
         // `-n` requires `ns`/`na`/`nd` (`erl_init.c:1846-1869`).
         'n' => ["s", "a", "d"].iter().any(|option| rest.starts_with(option)),
-        // The `-s` scheduler sub-options (`erl_init.c:1922`).
-        's' => EMULATOR_S_SUB_OPTIONS
+        // The `-s` scheduler sub-options: `rest` is the text after the `s`, which IS the
+        // sub-parameter (`erl_init.c:1922-2210`).
+        's' => SCHEDULER_SUB_OPTIONS
             .iter()
-            .any(|option| rest.starts_with(option)),
+            .any(|(option, _takes_value)| rest.starts_with(option)),
         // `-S`/`-SP`/`-SD{cpu,Pcpu,io}` (the early-init scheduler switches,
         // `erl_init.c:955-...`); the bare `+S` is consumed by the CLI's own arm.
         'S' => ["P", "Dcpu", "DPcpu", "Dio"].contains(&rest),
