@@ -192,6 +192,7 @@ The child `CONTEXT.md` files own the per-subsystem detail; this table only route
 - `MEASURED.md` -> measured performance + execution-coverage detail; `PERF.md` -> tier performance snapshots; `TEST_NOTES.md` -> the exhaustive test/fixture enumeration.
 
 ## See Also
-- `INSTRUCTION_SURFACE.md` -> the instruction surface + execution semantics, design decisions, full gaps and handoffs (this file keeps only summaries); `TEST_NOTES.md` -> the test/fixture enumeration; `MEASURED.md`/`PERF.md` -> the measured figures and the tier snapshots.
+- `MEASURED.md` -> the measured figures; `HANDOFF_eval_route_receive.md` -> the two `-eval`-route `receive` gaps: root cause with `file:line`, the ready-to-apply `beam_rt` patch for the late `receive … after T`, the two sound host routes for a spawned `-eval` closure that must block, and why neither is closable from this crate.
+- `INSTRUCTION_SURFACE.md` -> the instruction surface + execution semantics, design decisions, full gaps and handoffs (this file keeps only summaries); `TEST_NOTES.md` -> the test/fixture enumeration;`MEASURED.md`/`PERF.md` -> the measured figures and the tier snapshots.
 - `../CONTEXT.md` -> crate-layer contracts, the seam types, the Stage-1/Stage-5 DAG, the wave table; `../../CONTEXT.md` sec. 4 -> the engine IR seam and the root-set contract; `../../ERTS_RUST_REWRITE_DEEPDIVE.md` sec. E/F/G -> IR seam, interpreter/JIT trade-offs, tiering rationale.
 - `../beam_loader/CONTEXT.md` -> the IR types (`Module`/`Function`/`Instr`/`Operand`/`TestKind`/`HeapNeed`/`LiteralArea`); `../beam_term/CONTEXT.md` -> the engine's term API (`Eterm`, `make_small`/`make_atom`/`NIL`, `cmp`/`eq`/`cmp_arith`, `number::big_to_f64`, `map::write_map`).
