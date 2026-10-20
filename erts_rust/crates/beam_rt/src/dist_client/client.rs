@@ -596,6 +596,9 @@ impl DistClient {
         let to_name = make_atom(atoms.intern(name));
         let empty = make_atom(atoms.intern(""));
         let mut inner = self.borrow_mut()?;
+        // Drain the routed controls this send could otherwise overtake, **before** any
+        // term is materialised on `inner.scratch` (a flush that empties the queue resets it).
+        Self::flush_queued_controls(&mut inner, atoms)?;
         let local = inner.local_pid_term(from)?;
         let msg = inner.outbound_payload(msg, atoms)?;
         inner
@@ -619,6 +622,9 @@ impl DistClient {
     ) -> Result<()> {
         let remote = RemotePid::from_eterm(to)?;
         let mut inner = self.borrow_mut()?;
+        // See [`DistClient::flush_queued_controls`]: the flush must precede every term this
+        // send writes on `inner.scratch`, because an emptied queue resets that heap.
+        Self::flush_queued_controls(&mut inner, atoms)?;
         let local = inner.local_pid_term(from)?;
         let to_term = remote.to_eterm(&mut inner.scratch)?;
         let msg = inner.outbound_payload(msg, atoms)?;
@@ -650,9 +656,42 @@ impl DistClient {
         atoms: &mut AtomTable,
     ) -> Result<()> {
         let mut inner = self.borrow_mut()?;
+        // See [`DistClient::flush_queued_controls`]: a message never overtakes a control.
+        Self::flush_queued_controls(&mut inner, atoms)?;
         let local = inner.local_pid_term(from)?;
         let msg = inner.outbound_payload(msg, atoms)?;
         inner.links.route_alias(to, local, msg, atoms)
+    }
+
+    /// Writes every control signal the [`DistSignalRouter`] has already queued, **before**
+    /// this call's own frame reaches the wire.
+    ///
+    /// This is the outbound path's control/message ordering rule. ERTS writes a control
+    /// message synchronously when the signal is created, under the link lock
+    /// (`dist.c`'s `erts_dsig_send_*`), so a message written later can never overtake it.
+    /// This runtime's router cannot write (`route` runs inside the process table, with no
+    /// atom table in reach — see [`super::router`]), so it queues; the equivalent guarantee
+    /// is established here instead: no message may be written while a control signal that
+    /// was created *earlier* is still queued.
+    ///
+    /// Called by all three message sends ([`DistClient::send_reg_send`],
+    /// [`DistClient::send_message_pid`], [`DistClient::send_alias`]) with the inner state
+    /// they already borrow, and **before** they materialise any term on
+    /// [`DistClientInner::scratch`]: [`DistClientInner::flush_pending`] resets that heap when
+    /// the queue empties, so a term written first could be reset out from under the send.
+    /// The separate `payloads` arena is not touched by a flush, so
+    /// [`DistClientInner::outbound_payload`] may run either side of it.
+    ///
+    /// Allocation-free on the common path: an empty queue returns immediately
+    /// ([`DistClientInner::flush_pending`]'s first statement).
+    ///
+    /// # Errors
+    ///
+    /// As [`DistClientInner::flush_pending`]. A per-item routing failure is *recorded* in
+    /// [`DistClientInner::last_error`], never raised, so a peer's dead link cannot fail a
+    /// send to a different peer.
+    fn flush_queued_controls(inner: &mut DistClientInner, atoms: &mut AtomTable) -> Result<()> {
+        inner.flush_pending(atoms).map(|_| ())
     }
 
     /// Borrows the shared inner state, mapping a live borrow to a typed error (never a

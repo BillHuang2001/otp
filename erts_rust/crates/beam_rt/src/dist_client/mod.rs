@@ -86,9 +86,17 @@
 //! `Rc<RefCell<…>>` cell ([`DistClient`]), and `route` only *materialises*: the
 //! signal's terms are written onto a stable scratch heap ([`DistClientInner::scratch`])
 //! and appended to a small outbound queue. Encoding (which needs the live atom
-//! table) and the socket write happen in [`DistClient::pump`], the one place the
-//! runtime's atom table is live. The scratch heap is reset exactly when the queue
-//! empties, so no queued term can dangle.
+//! table) and the socket write happen in [`DistClient::pump`], the pass-driven flush
+//! point where the runtime's atom table is live. The scratch heap is reset exactly when
+//! the queue empties, so no queued term can dangle.
+//!
+//! **A message send drains that queue before writing its own frame**
+//! (`DistClient`'s `flush_queued_controls`) — the second entry to that same flush, and the
+//! outbound path's ordering rule: a message can never overtake a control signal created
+//! earlier on the same link. ERTS writes a control synchronously when the signal is created,
+//! under the link lock (`dist.c`'s `erts_dsig_send_*`), so this is the equivalent guarantee
+//! for a router that can only queue. The drain precedes every term a send materialises on the
+//! scratch heap, because an emptied queue resets it.
 //!
 //! # The `DOP_*` argument order of the routed signals
 //!

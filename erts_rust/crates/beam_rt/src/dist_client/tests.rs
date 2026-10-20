@@ -247,6 +247,93 @@ fn a_reg_send_reaches_the_peer_decoded() {
     }
 }
 
+/// **A message never overtakes a control signal created before it.**
+///
+/// The router only *queues* a routed signal ([`DistSignalRouter::route`] runs inside the
+/// process table and cannot reach an atom table, so it cannot encode), while a message send
+/// writes its frame inline. ERTS has no such window: a control message is written
+/// synchronously when the signal is created, under the link lock (`dist.c`'s
+/// `erts_dsig_send_*`), so a later message can never precede it on the same link. The
+/// equivalent guarantee here is that every message send first drains the queue
+/// ([`DistClient::flush_queued_controls`]) — so the peer must decode the control first, with
+/// **no** `pump` between the two.
+#[test]
+fn a_message_never_overtakes_a_queued_control() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 13);
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+
+    // A control created first, and deliberately not flushed by any `pump`.
+    let remote = remote_pid(&mut atoms, 7, 13);
+    {
+        let mut router = client.router();
+        router
+            .route(DistSignal::Link {
+                from: ProcessId::new(4, 0),
+                to: remote,
+            })
+            .expect("queue the link");
+    }
+    assert!(
+        client.has_pending_outbound(),
+        "the routed link is queued work until something writes it"
+    );
+
+    // A message written afterwards: the send must drain the queue before its own frame.
+    let mut msg_heap = TestHeap::new(64).expect("heap");
+    let hello = atom_term(atoms.intern("hello"));
+    let msg = msg_heap.tuple(&[hello, make_small(7)]).expect("build the message");
+    client
+        .send_reg_send(
+            "peer@localhost",
+            "echo",
+            ProcessId::new(4, 0),
+            msg,
+            &mut atoms,
+        )
+        .expect("send DOP_REG_SEND");
+    assert!(
+        !client.has_pending_outbound(),
+        "the send's drain wrote the queued control too — the queue is empty"
+    );
+
+    // Decode what the peer received, in order.
+    let mut received: Vec<Delivery> = Vec::new();
+    for _ in 0..50 {
+        let mut buf = [0u8; 8192];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => driver.feed(&buf[..n]),
+            Err(err) if is_would_block(&err) => {}
+            Err(err) => panic!("peer read: {err}"),
+        }
+        driver.step().expect("peer step");
+        let mut heap = TestHeap::new(1 << 12).expect("heap");
+        let mut sink = UnsupportedSink;
+        let dispatched = driver
+            .dispatch_inbound(&mut heap, &mut atoms, &mut sink)
+            .expect("classify");
+        received.extend(dispatched.into_iter().map(|record| record.delivery));
+        if received.len() >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        received.len(),
+        2,
+        "the peer must receive the control and the message, got {received:?}"
+    );
+    assert!(
+        matches!(received[0], Delivery::Link { .. }),
+        "the control created first must be written first, got {:?}",
+        received[0]
+    );
+    assert!(
+        matches!(received[1], Delivery::RegSend { .. }),
+        "the message follows the control, got {:?}",
+        received[1]
+    );
+}
+
 /// A routed `DistSignal::Exit` is materialised **synchronously**: dropping the
 /// signal's source heap right after `route` returns cannot affect what is later
 /// written to the wire.
