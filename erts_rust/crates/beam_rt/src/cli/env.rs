@@ -258,7 +258,6 @@ pub fn merge_argv(args: &[String], env: &dyn Env) -> Vec<String> {
 /// * a **bare** `-extra` (nothing after it) contributes no plain argument at all.
 ///
 /// The two halves are returned as `(flags, plain)`; both keep their stream order.
-#[allow(dead_code)] // wired into `cli::parse`/`parse_with_env` by the next wave.
 pub fn split_plain(args: &[String]) -> (Vec<String>, Vec<String>) {
     let mut flags = Vec::new();
     let mut plain = Vec::new();
@@ -322,7 +321,6 @@ fn looks_like_a_switch(token: &str) -> bool {
 ///
 /// — each entity splits at its **own** first `-extra`, and the command line's tail carries
 /// its later literal `-extra` as data.
-#[allow(dead_code)] // wired into `cli::parse`/`parse_with_env` by the next wave.
 pub fn merge_argv_with_plain(args: &[String], env: &dyn Env) -> (Vec<String>, Vec<String>) {
     let mut flags = Vec::new();
     let mut plain = Vec::new();

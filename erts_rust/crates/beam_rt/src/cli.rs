@@ -154,7 +154,9 @@ use crate::runtime::Runtime;
 mod env;
 pub(crate) mod flags;
 mod vars;
-pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
+pub use env::{
+    merge_argv, merge_argv_with_plain, otp_flags_var, split_plain, tokenize, Env, MapEnv, ProcessEnv,
+};
 pub use vars::{from_env, ErlEnv};
 
 /// The usage text, printed on a usage (exit 2) error.
@@ -195,7 +197,9 @@ Switches:
   -emu_flavor emu|jit|smp   emulator flavor
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
                             a +FLAG is an emulator flag and is not an init argument
-
+  -extra [ARG...]           every following argument is a plain argument
+                            (init:get_plain_arguments/0), never an init argument
+  -- [ARG...]               the following arguments are plain until the next switch
 Environment (merged into the command line, real erl's order):
   ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
 Environment (read by the emulator/launcher; never an init argument):
@@ -281,8 +285,14 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 ///
 /// Exactly the errors [`parse`] reports for the merged command line.
 pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
-    let merged = env::merge_argv(args, env);
+    // The merge keeps the environment's plain-argument tails apart from its flags, in merge
+    // order, because `-extra` acts per entity (`init.erl:127-139`). The **flag stream** is
+    // byte-identical to [`env::merge_argv`]'s output, so everything downstream — including
+    // [`vars::has_plus_q_switch`] — reads exactly what it read before; the plain tails only
+    // feed `init:get_plain_arguments/0`.
+    let (merged, plain) = env::merge_argv_with_plain(args, env);
     let mut config = parse(&merged)?;
+    config.plain_args = plain;
     let env_vars = vars::from_env(env);
     // `ERL_MAX_PORTS` acts exactly like a `+Q` the command line does not already carry
     // (the oracle: any `+Q` in the merged argv overrides the variable). The two tokens go
@@ -331,6 +341,13 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
+    // The invocation's own stream splits into its **flags** and its **plain arguments**
+    // (`-extra`/`--`, per entity — [`env::split_plain`]). Only the flags are switches: an
+    // `-extra` is consumed by `init` and is therefore never an init argument, which is why
+    // the flag loop walks the split rather than `args` itself. A marker-free invocation
+    // splits to `(args, [])`, so its parse is byte-identical to before.
+    let (flags, plain) = env::split_plain(args);
+    let flags = flags.as_slice();
     let mut builder = Builder {
         emulator: EmulatorConfig::default(),
         pa: Vec::new(),
@@ -348,8 +365,8 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         action: Action::Boot,
     };
     let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].as_str();
+    while index < flags.len() {
+        let argument = flags[index].as_str();
         match argument {
             "-version" | "--version" => {
                 builder.record(argument, Vec::new());
@@ -361,7 +378,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 1;
             }
             "-eval" => {
-                let expr = value_of(args, index, "-eval")?;
+                let expr = value_of(flags, index, "-eval")?;
                 // `-eval` is a **Start instruction**, not an init argument: the oracle
                 // consumes it in `init`'s `parse_boot_args/1`, so
                 // `init:get_argument(eval)` is the bare atom `error` (verified against
@@ -370,13 +387,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-pa" => {
-                let (values, next) = path_values(args, index, "-pa")?;
+                let (values, next) = path_values(flags, index, "-pa")?;
                 builder.record(argument, values.clone());
                 builder.pa.extend(values.into_iter().map(PathBuf::from));
                 index = next;
             }
             "-pz" => {
-                let (values, next) = path_values(args, index, "-pz")?;
+                let (values, next) = path_values(flags, index, "-pz")?;
                 builder.record(argument, values.clone());
                 builder.pz.extend(values.into_iter().map(PathBuf::from));
                 index = next;
@@ -388,7 +405,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // launcher would reject such a name and force `isdistributed = 0`, which is
                 // a runtime-core fidelity gap (`M1_GAPS.md`), so only the exit status is
                 // matched here.
-                let value = plus_value_of(args, index, argument)?;
+                let value = plus_value_of(flags, index, argument)?;
                 builder.record(argument, vec![value.clone()]);
                 if !is_switch(&value) {
                     builder.emulator.node_name = Some(value);
@@ -402,7 +419,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // `{ok,[["a","b"]]}`), and with anything but a single value it leaves the
                 // cookie unset (`erlang:get_cookie()` is `nocookie`) — verified against
                 // OTP 29.1.1 / erts-17.1.
-                let (values, next) = path_values(args, index, "-setcookie")?;
+                let (values, next) = path_values(flags, index, "-setcookie")?;
                 builder.record(argument, values.clone());
                 builder.emulator.cookie = match values.as_slice() {
                     [only] => Some(only.clone()),
@@ -416,15 +433,15 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // `error` — verified against OTP 29.1.1 / erts-17.1. The two values are
                 // taken blindly (the oracle consumes the following token even when it
                 // looks like a switch, e.g. `-noshell`).
-                index = parse_env_switch(args, index)?;
+                index = parse_env_switch(flags, index)?;
             }
             "-config" | "-boot" => {
-                let value = value_of(args, index, argument)?;
+                let value = value_of(flags, index, argument)?;
                 builder.record(argument, vec![value]);
                 index += 2;
             }
             "-emu_flavor" => {
-                let value = value_of(args, index, "-emu_flavor")?;
+                let value = value_of(flags, index, "-emu_flavor")?;
                 builder.record(argument, vec![value.clone()]);
                 let flavor = flags::parse_emu_flavor("-emu_flavor", &value)?;
                 builder.emulator.features =
@@ -440,18 +457,18 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // recognized-but-unmodeled spelling is accepted, and an unrecognized one is the
             // emulator's `unknown flag -X` (exit 1). No `+`-flag is ever an `init` argument.
             other if other.starts_with('+') => {
-                index = parse_plus_switch(args, index, &mut builder)?;
+                index = parse_plus_switch(flags, index, &mut builder)?;
             }
-            "-smp" => index = parse_smp_switch(args, index, &mut builder)?,
-            "-s" => index = builder.parse_apply(args, index, "-s")?,
-            "-run" => index = builder.parse_apply(args, index, "-run")?,
-            "run" => index = parse_run_file(args, index, &mut builder)?,
+            "-smp" => index = parse_smp_switch(flags, index, &mut builder)?,
+            "-s" => index = builder.parse_apply(flags, index, "-s")?,
+            "-run" => index = builder.parse_apply(flags, index, "-run")?,
+            "run" => index = parse_run_file(flags, index, &mut builder)?,
             // `-smpdisable` is the one-token spelling of the refused `-smp disable`.
             "-smpdisable" => return Err(error::smp_disable_not_supported()),
             // A `-`-switch the table above does not model is accepted and recorded exactly as
             // before (real `erl` never rejects one). A `+`-flag never reaches this arm: the
             // arm above resolves (or, for an unrecognized spelling, rejects) every one of them.
-            other if is_switch(other) => index = builder.record_unmodeled(args, index),
+            other if is_switch(other) => index = builder.record_unmodeled(flags, index),
             // A plain positional token: the oracle's launcher forwards it to `init` as an
             // ordinary argument, which is never a usage error (`erl junk -noshell ...` exits
             // 0). This runtime ignores it, matching that status.
@@ -478,6 +495,10 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         // The environment family is read only by `parse_with_env`; the pure `parse` sees
         // an empty one (it must never read the process environment).
         env: ErlEnv::default(),
+        // The plain arguments this invocation's OWN stream selected (`-extra`/`--`). They
+        // are never init arguments; `parse_with_env` replaces them with the merged form's
+        // tails when the `ERL_*FLAGS` entities contribute any of their own.
+        plain_args: plain,
     })
 }
 
@@ -3061,6 +3082,105 @@ mod tests {
         assert_eq!(
             config.init_args.get("noinput"),
             Some(vec![&[][..]])
+        );
+        // The `-extra` tail is a **plain argument**, never an init argument: the real `erlc`
+        // hands the source file that way, so `init:get_plain_arguments/0` reports
+        // `["Foo.erl"]` and `init:get_argument(extra)` is the bare atom `error`.
+        assert_eq!(config.plain_args, vec!["Foo.erl".to_string()]);
+        assert_eq!(config.init_args.get("extra"), None);
+    }
+
+    /// `-extra` claims the whole rest of its own entity, a later switch-looking token
+    /// included, and neither the marker nor a token in the tail becomes an init argument.
+    #[test]
+    fn an_extra_claims_the_rest_of_its_entity_as_plain_arguments() {
+        let config = parsed(&["-noshell", "-extra", "a", "b", "-o", "outdir"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(
+            config.plain_args,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "-o".to_string(),
+                "outdir".to_string()
+            ]
+        );
+        assert_eq!(config.init_args.get("extra"), None);
+        assert_eq!(
+            config.init_args.get("o"),
+            None,
+            "a switch-looking token in an -extra tail is data"
+        );
+        assert_eq!(
+            config.init_args.get("noshell"),
+            Some(vec![&[][..]]),
+            "the flags before the marker are unaffected"
+        );
+    }
+
+    /// `--` opens a plain run that the next switch-looking token ends, so a switch after it
+    /// is parsed as a flag again and only the tokens before it are plain.
+    #[test]
+    fn a_double_dash_run_ends_at_the_next_switch() {
+        let config = parsed(&["--", "a", "b"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(
+            config.plain_args,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(config.init_args.is_empty(), "`--` is not an init argument");
+
+        // `-- a -noshell b` ⇒ plain `["a"]`: `-noshell` resumes flag mode (and `b` is its
+        // neighbour, never a plain argument).
+        let config = parsed(&["--", "a", "-noshell", "b"]);
+        assert_eq!(config.plain_args, vec!["a".to_string()]);
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+    }
+
+    /// A marker-free invocation splits to `(args, [])`, so its parse is unchanged.
+    #[test]
+    fn an_invocation_without_a_marker_has_no_plain_arguments() {
+        let config = parsed(&["-noshell", "-eval", "2+3"]);
+        assert!(config.plain_args.is_empty());
+        assert_eq!(config.action, Action::Eval("2+3".to_string()));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+        assert!(parsed(&[]).plain_args.is_empty());
+    }
+
+    /// The merged route keeps the `ERL_*FLAGS` entities' plain tails, in merge order, and
+    /// leaves the flag stream byte-identical to [`env::merge_argv`]'s.
+    #[test]
+    fn the_environment_merge_carries_the_plain_tails() {
+        let env = MapEnv(std::collections::HashMap::from([
+            ("ERL_AFLAGS".to_string(), "-extra a".to_string()),
+            ("ERL_ZFLAGS".to_string(), "-extra d".to_string()),
+        ]));
+        let args: Vec<String> = ["-noshell", "-extra", "b", "-extra", "c"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = parse_with_env(&args, &env).expect("the merged command line parses");
+        assert_eq!(
+            config.plain_args,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "-extra".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "each entity splits at its own first -extra, in merge order"
+        );
+        assert_eq!(config.init_args.get("extra"), None);
+        assert_eq!(
+            config.init_args.get("noshell"),
+            Some(vec![&[][..]]),
+            "the command line's own switch survives the merge"
+        );
+        assert_eq!(
+            config.init_args.len(),
+            1,
+            "no plain tail, and no marker, is an init argument"
         );
     }
 
