@@ -185,21 +185,29 @@
 //!   claims its `(uniq, index)` — the `-eval` evaluator's template closures), where
 //!   even the C's `[]`-function arm has no `fe->module` to report: the typed gap.
 //!
-//! # Honest gaps (never a fabricated value)
+//! # The fun text: one implementation, two routes
 //!
-//! One thing stays out of reach and is the typed
-//! [`crate::error::unsupported_bif`] rather than a guess:
+//! `erlang:fun_to_list/1` and `io_lib`'s `~w`/`~p`/`~W`/`~P` fun leaf render the
+//! **same** text — the C `FUN_DEF` printer arm (`erl_printf_term.c:674-726`) is what
+//! `fun_to_list_1` splices (`bif.c:4494-4504`), so the two routes must never drift.
+//! The text's one home is [`fun_text_str`], reached through the single
+//! [`BifContext`]-taking adapter [`fun_text`] by both. Because every printer entry
+//! point (`crate::print::term_chunk`/`term_chunk_order`/`format_term` and the
+//! `pretty_*` family) already takes a `&mut BifContext`, the printer's recursive
+//! cluster threads it down to the leaf, so the `FunKind::Local` arm can ask the
+//! [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam for the
+//! `#Fun<Module.OldIndex.OldUniq>` triple the frozen descriptor does not carry.
 //!
-//! * **`fun_to_list/1` of a `FunKind::Local` (`make_fun3`) fun** — it needs
-//!   `#Fun<Module.OldIndex.OldUniq>` (`erl_printf_term.c:676-694`, oracle:
-//!   `"#Fun<fiprobe.0.124001487>"`), and all three fields *are* on the seam
-//!   ([`beam_codec::FunIdentity`]'s `module`/`old_index`/`old_uniq`). What blocks it is
-//!   the text's single home [`fun_text_str`]: it takes an `&AtomTable` and nothing
-//!   else, because `io_lib`'s `~w`/`~p` leaf ([`crate::print`]) reaches it from its
-//!   recursive renderer with no [`BifContext`] — so `fun_to_list/1` and the printer
-//!   cannot be closed *consistently* (the oracle renders the same text from both)
-//!   without threading an identity resolver through the printer chain and widening the
-//!   runtime's fun-identity gate to the printer's BIF keys (Handoffs).
+//! A fun-identity resolver is a *borrowed* `&mut dyn LocalFunIdentity`, not a `Copy`
+//! payload, so it cannot be stashed in a thread-local the way `src/ets/self_hook.rs`
+//! stashes a `ProcessId` — the crate is `#![deny(unsafe_code)]` and a `&mut dyn`
+//! cannot be threaded through a `thread_local!` without it. Threading the context is
+//! the only safe route.
+//!
+//! What stays the typed [`crate::error::unsupported_bif`] is a `Local` fun the seam
+//! cannot attribute at all (`Ok(None)` — the defining module is not loaded here, the
+//! `-eval` evaluator's template closures being the standing example): no text can be
+//! derived from `(uniq, index)` alone, so neither route fabricates one.
 //!
 //! # Produced atoms are interned on demand
 //!
@@ -776,9 +784,12 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `erlang:fun_to_list/1` (`bif.c:4494`).
 ///
-/// An external fun renders through the C `FUN_DEF` printer as
-/// `"fun Module:Function/Arity"` with the C's own atom quoting
-/// (`print_atom_name`, `erl_printf_term.c:235-330` — *not* `io_lib`'s
+/// `fun_to_list_1` is `term2list_dsprintf(p, fun)` over the C `FUN_DEF` printer arm,
+/// i.e. the text the `~w`/`~p` fun leaf splices — so this BIF and the printer share
+/// [`fun_text`], and can never render a fun differently.
+///
+/// An external fun renders `"fun Module:Function/Arity"` with the C's own atom
+/// quoting (`print_atom_name`, `erl_printf_term.c:235-330` — *not* `io_lib`'s
 /// `write_atom`: `make_fun(nonode@nohost, foo, 1)` ⇒ `"fun 'nonode@nohost':foo/1"`).
 /// `Arity` is the **true** arity (`ep->info.mfa.arity`, descriptor word 3 for an
 /// external fun) — so this reader differs from `fun_info/2`'s `arity` item and
@@ -787,26 +798,46 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// An `Imported` (`NEW_FUN_EXT`) fun takes the printer's **local-fun** arm
 /// (`erl_printf_term.c:676-694`): `"#Fun<Module.OldIndex.OldUniq>"`, with the raw
 /// module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
-/// `old_index`/`old_uniq` — all three carried by its descriptor.
+/// `old_index`/`old_uniq` — all three carried by its descriptor. A `Local`
+/// (`make_fun3`) fun renders the same text from the
+/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam.
 ///
-/// A non-fun is `badarg`; a `FunKind::Local` (`make_fun3`) fun is the typed
-/// capability gap: the `#Fun<Module.OldIndex.OldUniq>` triple *is* on the
-/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam, but this leaf
-/// ([`fun_text_str`]) reaches it with an `&AtomTable` and nothing else, so the
-/// identity is not reachable here (module docs, Handoffs).
-///
-/// The text itself is [`fun_text_str`]'s, which the printer shares.
+/// A non-fun is `badarg`; a `Local` fun no loaded module claims is the typed
+/// capability gap ([`fun_text`]).
 fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
         return Err(error::badarg());
     }
-    let text = fun_text_str(fun, ctx.atoms())?;
+    let text = fun_text(fun, ctx)?;
     text_list(ctx, &text)
 }
 
-/// The `%T` text of a fun term — `erlang:fun_to_list/1`'s rendering, the leaf both
-/// `io_lib:write1/4` (for `~w`/`~p`) and `io_lib_pretty` splice in.
+/// The `%T` fun text through the [`BifContext`] — the **one** adapter both
+/// `erlang:fun_to_list/1` ([`fun_to_list_1`]) and the `~w`/`~p`/`~W`/`~P` printer leaf
+/// ([`crate::print`]) call, so the two routes cannot drift.
+///
+/// The [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam is consulted
+/// **only** for a [`FunKind::Local`] fun — mirroring [`Item::needs_identity`], so an
+/// `External`/`Imported` fun never touches it (they carry their own module/function,
+/// and their rendering is therefore bit-identically independent of any host seam).
+///
+/// # Errors
+///
+/// As [`fun_text_str`], plus that seam's own error.
+pub(crate) fn fun_text(fun: Eterm, ctx: &mut BifContext<'_>) -> Result<String> {
+    let kind = beam_codec::term::fun_kind_term(fun)?;
+    if matches!(kind, FunKind::Local) {
+        // Resolved before the `&AtomTable` borrow is taken, so the seam's `&mut`
+        // borrow and the table borrow never overlap.
+        let identity = ctx.local_fun_identity(fun)?;
+        return fun_text_str(fun, ctx.atoms(), identity.as_ref());
+    }
+    fun_text_str(fun, ctx.atoms(), None)
+}
+
+/// The pure `%T` formatter of a fun term — `erlang:fun_to_list/1`'s rendering, the
+/// leaf both `io_lib:write1/4` (for `~w`/`~p`) and `io_lib_pretty` splice in.
 ///
 /// * [`FunKind::External`] (an `EXPORT_EXT`) — `"fun Module:Function/Arity"`, with
 ///   the C `print_atom_name` quoting ([`quoted_atom`]) and the **true** arity
@@ -814,17 +845,20 @@ fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///   external fun with true arity 256 renders `fun lists:reverse/256` while
 ///   `erlang:fun_info(F, arity)` reports `0` — the oracle-verified split.
 /// * [`FunKind::Imported`] (a `NEW_FUN_EXT`) — the printer's **local-fun** arm
-///   (`erl_printf_term.c:676-694`): `"#Fun<Module.OldIndex.OldUniq>"`, with the raw
+///   (`erl_printf_term.c:678-690`): `"#Fun<Module.OldIndex.OldUniq>"`, with the raw
 ///   module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
 ///   `old_index`/`old_uniq` — all three carried by its descriptor.
-/// * [`FunKind::Local`] (a `make_fun3` closure) — the typed [`error::unsupported_bif`]
-///   capability gap. The `#Fun<Module.OldIndex.OldUniq>` triple *is* on the
+/// * [`FunKind::Local`] (a `make_fun3` closure) — the same text, from the
+///   `identity` the caller resolved off the
 ///   [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam
-///   (`FunIdentity.module`/`old_index`/`old_uniq`), but this leaf's signature is
-///   `(&AtomTable)` — it is the `io_lib` `~w`/`~p` leaf as well
-///   ([`crate::print::render_chunk`]), whose recursive renderer carries no
-///   [`BifContext`] — so the seam is unreachable from here and closing only
-///   `erlang:fun_to_list/1` would split the two renderings the oracle keeps identical.
+///   (`FunIdentity.module`/`old_index`/`old_uniq`); the frozen descriptor carries only
+///   `(uniq, index)`, so with `identity == None` the answer is the typed
+///   [`error::unsupported_bif`] capability gap rather than a fabricated `#Fun<…>`.
+///
+/// The C emits exactly **three** fields — module, `old_index`, `old_uniq` — and
+/// never the `num_free` capture count (oracle-verified: `mk1(A) -> fun(Y) -> Y+A end`
+/// with one capture renders `#Fun<fp.1.9361005>`, and the fun's own
+/// `fun_info(F, env)` holds that capture).
 ///
 /// A non-fun is `badarg`.
 ///
@@ -833,8 +867,13 @@ fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// [`BeamError::BadArg`](beam_common::BeamError) for a non-fun,
 /// [`BeamError::TermNotFound`](beam_common::BeamError) when a fun's module/function
 /// atom index is not in `atoms`, and
-/// [`BeamError::UnsupportedBif`](beam_common::BeamError) for a `Local` fun.
-pub(crate) fn fun_text_str(fun: Eterm, atoms: &AtomTable) -> Result<String> {
+/// [`BeamError::UnsupportedBif`](beam_common::BeamError) for a `Local` fun with no
+/// resolved identity.
+pub(crate) fn fun_text_str(
+    fun: Eterm,
+    atoms: &AtomTable,
+    identity: Option<&beam_codec::FunIdentity>,
+) -> Result<String> {
     match beam_codec::term::fun_kind_term(fun)? {
         FunKind::External => {
             let module = atom_term_name(atoms, fun_module(fun)?)?;
@@ -858,7 +897,19 @@ pub(crate) fn fun_text_str(fun: Eterm, atoms: &AtomTable) -> Result<String> {
             let old_uniq = beam_codec::term::fun_old_uniq(fun)? as i32;
             Ok(format!("#Fun<{module}.{old_index}.{old_uniq}>"))
         }
-        FunKind::Local => Err(error::unsupported_bif()),
+        FunKind::Local => {
+            let Some(id) = identity else {
+                return Err(error::unsupported_bif());
+            };
+            // `PRINT_BUF(res, fn, arg, erts_atom_get_name(ap), ap->len)`
+            // (`erl_printf_term.c:683`) — the module atom's **raw** name, never
+            // `print_atom_name`-quoted. The two `int` fields are sign-extended like
+            // the `Imported` arm's.
+            let module = atom_term_name(atoms, id.module)?;
+            let old_index = id.old_index as i32;
+            let old_uniq = id.old_uniq as i32;
+            Ok(format!("#Fun<{module}.{old_index}.{old_uniq}>"))
+        }
     }
 }
 

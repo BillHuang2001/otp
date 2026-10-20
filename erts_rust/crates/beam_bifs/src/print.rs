@@ -157,17 +157,26 @@
 //! A **fun**'s leaf is `erlang:fun_to_list/1` (`lib/stdlib/src/io_lib.erl:914` for
 //! `~w`/`~p`, and `io_lib_pretty:print_length/7` at `:932-934` splices the same
 //! text), so an `EXPORT_EXT` fun renders `fun Module:Function/Arity` and a
-//! `NEW_FUN_EXT` fun renders `#Fun<Module.OldIndex.OldUniq>` — both byte-faithfully,
-//! via [`crate::fun_info::fun_text_str`], at any nesting depth. Only a runtime-made
-//! `Local` (`make_fun3`) fun stays the typed capability gap
-//! ([`BeamError::UnsupportedBif`](beam_common::BeamError), matching
-//! `erlang:fun_to_list/1`): its inlined descriptor is only `(uniq, index)`, so the
-//! module/name a `#Fun<…>` needs is not in the term and any rendering would be a
-//! *silently wrong* result.
+//! `NEW_FUN_EXT` **or** a runtime-made `make_fun3` (`Local`) fun renders
+//! `#Fun<Module.OldIndex.OldUniq>` — both byte-faithfully, via
+//! [`crate::fun_info::fun_text`], at any nesting depth.
+//!
+//! The local-fun triple is not in the frozen descriptor, so the leaf reaches the
+//! [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam — which is why the
+//! whole recursive cluster below (`render_chunk`, `render_list_chunk`,
+//! `render_tail_chunk`, `render_tuple_rest_chunk`, `render_map_chunk`,
+//! `render_map_body_chunk`, `map_pair_chunk`, `resolve_map_pairs`) takes the
+//! [`BifContext`] rather than a bare `&AtomTable`. A thread-local was rejected: the
+//! seam is a borrowed `&mut dyn LocalFunIdentity`, which cannot be stored in a
+//! `thread_local!` without `unsafe` (this crate is `#![deny(unsafe_code)]`), unlike
+//! the `Copy` `ProcessId` payload `src/ets/self_hook.rs` scopes that way. With no
+//! identity seam installed a `Local` fun stays the typed capability gap
+//! ([`BeamError::UnsupportedBif`](beam_common::BeamError)), matching
+//! `erlang:fun_to_list/1`.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{atom_val, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
@@ -227,13 +236,13 @@ pub(crate) enum MapOrder {
 pub(crate) fn resolve_map_pairs(
     term: Eterm,
     order: MapOrder,
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
 ) -> Result<Vec<(Eterm, Eterm)>> {
     match order {
         MapOrder::Storage => Ok(beam_term::map::map_pairs_storage_order(term)?),
-        MapOrder::Ordered => Ok(beam_term::map::map_pairs(term, atoms)?),
+        MapOrder::Ordered => Ok(beam_term::map::map_pairs(term, ctx.atoms())?),
         MapOrder::Reversed => {
-            let mut pairs = beam_term::map::map_pairs(term, atoms)?;
+            let mut pairs = beam_term::map::map_pairs(term, ctx.atoms())?;
             pairs.reverse();
             Ok(pairs)
         }
@@ -250,7 +259,7 @@ pub(crate) fn resolve_map_pairs(
             if !is_atom(order_term) {
                 return Err(badarg());
             }
-            let resolved = match atoms.name(atom_val(order_term)).ok_or_else(badarg)? {
+            let resolved = match ctx.atoms().name(atom_val(order_term)).ok_or_else(badarg)? {
                 "ordered" => MapOrder::Ordered,
                 "reversed" => MapOrder::Reversed,
                 // `maps:iterator(Map, undefined)` is `maps:iterator(Map, fun(A,B) ->
@@ -264,7 +273,7 @@ pub(crate) fn resolve_map_pairs(
                 "undefined" => MapOrder::Storage,
                 _ => return Err(badarg()),
             };
-            resolve_map_pairs(term, resolved, atoms)
+            resolve_map_pairs(term, resolved, ctx)
         }
     }
 }
@@ -478,7 +487,7 @@ pub(crate) fn term_chunk(
     printable: bool,
     depth: i64,
 ) -> Result<Chunk> {
-    render_chunk(ctx.atoms(), term, printable, depth, MapOrder::Storage)
+    render_chunk(ctx, term, printable, depth, MapOrder::Storage)
 }
 
 /// As [`term_chunk`], but with the map order a `~k`/`~K` modifier selected
@@ -494,7 +503,7 @@ pub(crate) fn term_chunk_order(
     depth: i64,
     order: MapOrder,
 ) -> Result<Chunk> {
-    render_chunk(ctx.atoms(), term, printable, depth, order)
+    render_chunk(ctx, term, printable, depth, order)
 }/// Collects `term` into its element vector iff it is a proper list.
 ///
 /// `NIL` yields `Some(vec![])`; a cons chain ending in anything but `NIL`, or a
@@ -535,8 +544,12 @@ fn char_printable(value: i64) -> bool {
 
 /// Renders `term` as one element chunk (`io_lib:write1/4` for `~w`, or
 /// `io_lib_pretty:write/1` for `~p`).
+///
+/// It takes the [`BifContext`] rather than a bare `&AtomTable` because the fun leaf
+/// can need the [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam (see the
+/// module docs); every other leaf reads only `ctx.atoms()`.
 fn render_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
     depth: i64,
@@ -563,7 +576,7 @@ fn render_chunk(
                 return Ok(Chunk::text(&quoted_string(&bytes)));
             }
         }
-        return render_list_chunk(atoms, term, printable, depth, order);
+        return render_list_chunk(ctx, term, printable, depth, order);
     }
     if is_tuple(term) {
         let arity = tuple_size(term);
@@ -575,13 +588,13 @@ fn render_chunk(
         }
         let mut body: Vec<Chunk> = Vec::with_capacity(arity);
         body.push(render_chunk(
-            atoms,
+            ctx,
             tuple_element(term, 0),
             printable,
             depth - 1,
             order,
         )?);
-        render_tuple_rest_chunk(atoms, term, 1, depth - 1, printable, order, &mut body)?;
+        render_tuple_rest_chunk(ctx, term, 1, depth - 1, printable, order, &mut body)?;
         return Ok(Chunk::List(vec![
             Chunk::Char('{'),
             Chunk::List(body),
@@ -589,7 +602,7 @@ fn render_chunk(
         ]));
     }
     if is_atom(term) {
-        let name = atoms.name(atom_val(term)).ok_or_else(badarg)?;
+        let name = ctx.atoms().name(atom_val(term)).ok_or_else(badarg)?;
         return Ok(Chunk::text(&format_atom(name)));
     }
     if is_float(term) {
@@ -602,7 +615,7 @@ fn render_chunk(
         return render_bitstring_chunk(term, printable, depth);
     }
     if is_map(term) {
-        return render_map_chunk(atoms, term, printable, depth, order);
+        return render_map_chunk(ctx, term, printable, depth, order);
     }
     if is_internal_pid(term) {
         // The `%T` text `erlang:pid_to_list/1` renders (the oracle's `write1/4`
@@ -630,13 +643,13 @@ fn render_chunk(
     // A **fun**'s leaf is `erlang:fun_to_list/1` (`io_lib:write1/4` → `fun_to_list`,
     // and `io_lib_pretty:print_length/7` splices the same `io_lib:write/1` text —
     // `lib/stdlib/src/io_lib_pretty.erl:932-934`), i.e. the text
-    // `crate::fun_info::fun_text_str` renders: `fun Module:Function/Arity` for an
-    // `EXPORT_EXT` fun, `#Fun<Module.OldIndex.OldUniq>` for a `NEW_FUN_EXT` fun.
-    // Only a runtime-made `Local` (`make_fun3`) fun stays a typed capability gap —
-    // its inlined descriptor carries no module/name, so a `#Fun<…>` here would be a
-    // *silently wrong* result (see the module docs).
+    // `crate::fun_info::fun_text` renders: `fun Module:Function/Arity` for an
+    // `EXPORT_EXT` fun, `#Fun<Module.OldIndex.OldUniq>` for a `NEW_FUN_EXT` fun and for
+    // a `make_fun3` (`Local`) fun whose identity the runtime's `LocalFunIdentity` seam
+    // resolves. With no identity for a `Local` fun the leaf is the typed capability
+    // gap, never a fabricated `#Fun<…>` (see the module docs).
     if is_function(term) {
-        return Ok(Chunk::text(&crate::fun_info::fun_text_str(term, atoms)?));
+        return Ok(Chunk::text(&crate::fun_info::fun_text(term, ctx)?));
     }
     Err(badarg())
 }
@@ -665,15 +678,15 @@ fn format_port(term: Eterm) -> Result<String> {
 }/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
 /// depth `0`/`1` and the `~p` printable-string rule (`io_lib:write1/4`).
 fn render_list_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
     depth: i64,
     order: MapOrder,
 ) -> Result<Chunk> {
     let mut body: Vec<Chunk> = Vec::new();
-    body.push(render_chunk(atoms, car(term), printable, depth - 1, order)?);
-    render_tail_chunk(atoms, cdr(term), printable, depth - 1, order, &mut body)?;
+    body.push(render_chunk(ctx, car(term), printable, depth - 1, order)?);
+    render_tail_chunk(ctx, cdr(term), printable, depth - 1, order, &mut body)?;
     Ok(Chunk::List(vec![
         Chunk::Char('['),
         Chunk::List(body),
@@ -690,7 +703,7 @@ fn render_list_chunk(
 /// overflowed it. The pushed chunks — the `,` before each element, the terminating
 /// `|`+tail, or the depth-limited `|...` — are exactly the recursive walk's.
 fn render_tail_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
     depth: i64,
@@ -710,11 +723,11 @@ fn render_tail_chunk(
         }
         if !is_list(term) {
             out.push(Chunk::Char('|'));
-            out.push(render_chunk(atoms, term, printable, depth - 1, order)?);
+            out.push(render_chunk(ctx, term, printable, depth - 1, order)?);
             return Ok(());
         }
         out.push(Chunk::Char(','));
-        out.push(render_chunk(atoms, car(term), printable, depth - 1, order)?);
+        out.push(render_chunk(ctx, car(term), printable, depth - 1, order)?);
         term = cdr(term);
         depth -= 1;
     }
@@ -726,7 +739,7 @@ fn render_tail_chunk(
 /// consumed per element, so a per-element recursion overflowed the native stack on a
 /// long tuple.
 fn render_tuple_rest_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     index: usize,
     depth: i64,
@@ -744,7 +757,7 @@ fn render_tuple_rest_chunk(
         }
         out.push(Chunk::Char(','));
         out.push(render_chunk(
-            atoms,
+            ctx,
             tuple_element(term, index),
             printable,
             depth - 1,
@@ -764,7 +777,7 @@ fn render_tuple_rest_chunk(
 /// order `order` selected. So no re-sort is needed and a >32-pair hash map renders
 /// like the oracle.
 fn render_map_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
     depth: i64,
@@ -773,14 +786,14 @@ fn render_map_chunk(
     if depth == 1 {
         return Ok(Chunk::text("#{}"));
     }
-    let pairs: Vec<(Eterm, Eterm)> = resolve_map_pairs(term, order, atoms)?;
+    let pairs: Vec<(Eterm, Eterm)> = resolve_map_pairs(term, order, ctx)?;
     if pairs.is_empty() {
         return Ok(Chunk::text("#{}"));
     }
     let inner = depth - 1;
     let mut body: Vec<Chunk> = Vec::new();
-    body.push(map_pair_chunk(atoms, pairs[0], printable, inner, order)?);
-    render_map_body_chunk(atoms, &pairs, 1, inner, inner, printable, order, &mut body)?;
+    body.push(map_pair_chunk(ctx, pairs[0], printable, inner, order)?);
+    render_map_body_chunk(ctx, &pairs, 1, inner, inner, printable, order, &mut body)?;
     Ok(Chunk::List(vec![
         Chunk::Char('#'),
         Chunk::Char('{'),
@@ -801,7 +814,7 @@ fn render_map_chunk(
 /// the recursive form (the depth-limited run emits its `,...` even when the pairs are
 /// exhausted).
 fn render_map_body_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     pairs: &[(Eterm, Eterm)],
     index: usize,
     depth: i64,
@@ -821,7 +834,7 @@ fn render_map_body_chunk(
             return Ok(());
         }
         out.push(Chunk::Char(','));
-        out.push(map_pair_chunk(atoms, pairs[index], printable, inner, order)?);
+        out.push(map_pair_chunk(ctx, pairs[index], printable, inner, order)?);
         index += 1;
         depth -= 1;
     }
@@ -830,16 +843,16 @@ fn render_map_body_chunk(
 /// Renders one map pair (`io_lib:write_map_assoc/4`): `[Key, " => ", Value]` —
 /// the four ` => ` characters are one sub-list element.
 fn map_pair_chunk(
-    atoms: &AtomTable,
+    ctx: &mut BifContext<'_>,
     pair: (Eterm, Eterm),
     printable: bool,
     depth: i64,
     order: MapOrder,
 ) -> Result<Chunk> {
     Ok(Chunk::List(vec![
-        render_chunk(atoms, pair.0, printable, depth, order)?,
+        render_chunk(ctx, pair.0, printable, depth, order)?,
         Chunk::text(" => "),
-        render_chunk(atoms, pair.1, printable, depth, order)?,
+        render_chunk(ctx, pair.1, printable, depth, order)?,
     ]))
 }
 /// `io_lib_format:chars/2` — a deeply nested `lists:duplicate/2`.
