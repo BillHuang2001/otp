@@ -100,7 +100,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 // ---------------------------------------------------------------------------
 
 /// The `Timeout(4), Length(4)` operand of `TCP_REQ_RECV` (`inet_drv.c:12293`).
-fn recv_operand(timeout_ms: i32, length: u32) -> Vec<u8> {
+pub(crate) fn recv_operand(timeout_ms: i32, length: u32) -> Vec<u8> {
     let mut arg = timeout_ms.to_be_bytes().to_vec();
     arg.extend_from_slice(&length.to_be_bytes());
     arg
@@ -137,7 +137,7 @@ fn set_option(port: &mut Rig, code: u8, value: i32) {
 /// peer private — and every send-path case here has to *read* what the driver wrote — so this
 /// suite builds its own pair and hands the peer to the test. The driver adopts a duplicate of the
 /// accepted socket (no `unsafe` needed to make a descriptor), exactly as the sibling suite does.
-fn linked() -> (Rig, TcpStream) {
+pub(crate) fn linked() -> (Rig, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let peer = TcpStream::connect(listener.local_addr().expect("an address"))
         .expect("the far end connects");
@@ -171,7 +171,7 @@ fn close_fd(fd: RawFd) {
 // ---------------------------------------------------------------------------
 
 /// The `(id, result)` pairs of every `{inet_async, …}` completion in `completions`.
-fn async_events(completions: &[PortCompletion]) -> Vec<(u16, InetAsyncResult)> {
+pub(super) fn async_events(completions: &[PortCompletion]) -> Vec<(u16, InetAsyncResult)> {
     completions
         .iter()
         .filter_map(|completion| match &completion.event {
@@ -187,7 +187,7 @@ fn async_events(completions: &[PortCompletion]) -> Vec<(u16, InetAsyncResult)> {
 /// A completion is produced by the *socket*, not by the control call, so a test that connects a
 /// peer or closes its end waits for the **condition** (bounded by [`HANG_GUARD`]) instead of
 /// sleeping for a fixed budget: the loop rounds, drains and re-rounds until the events appear.
-fn await_events(port: &mut Rig, want: usize) -> Vec<(u16, InetAsyncResult)> {
+pub(crate) fn await_events(port: &mut Rig, want: usize) -> Vec<(u16, InetAsyncResult)> {
     let guard = Instant::now() + HANG_GUARD;
     let mut events = Vec::new();
     while events.len() < want {

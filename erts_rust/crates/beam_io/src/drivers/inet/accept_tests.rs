@@ -401,7 +401,7 @@ const ACCEPT_WAIT: Duration = Duration::from_secs(10);
 /// run the tasks those events name — the loop `beam_rt` runs. Unlike [`Rig::round`] (which calls
 /// `execute_port_tasks` directly, i.e. the `drive_async` poll point) the completion here can only
 /// come from a real readiness event.
-fn poll_round(rig: &mut Rig) {
+pub(crate) fn poll_round(rig: &mut Rig) {
     let events = match rig.poller.poll(Some(Duration::from_millis(100))) {
         Ok(events) => events,
         Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,

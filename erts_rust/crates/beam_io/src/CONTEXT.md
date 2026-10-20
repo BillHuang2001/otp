@@ -265,8 +265,8 @@ drivers publish their own state through them (see *Who overrides the seam* below
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Per-module in-module counts (`-p beam_io --lib` = 989):** `drivers` **660** — of which `inet`
-**548** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
+**Per-module in-module counts (`-p beam_io --lib` = 1032):** `drivers` **703** — of which `inet`
+**591** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
 29 (`ram_file_tests` 23 + `ram_file_split_tests` 6), `fd` 14, `efile` 13, `binary_io` 9 — then
 `registry` 60 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
 `registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
@@ -389,7 +389,7 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site, `EINTR` retried, an interior-NUL path ⇒ `BadArg`), `access` (`Result<bool>`, refusal ⇒ `false`, only a genuine syscall failure is `BeamError::Io`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>` — the **effective** ids `check_access` compares a `stat` against)
 - `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `tcp_inet`, `udp_inet`, `ram_file_drv`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
-- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its two newest suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port) and `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers)
+- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port), `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers), `passive_recv_tests.rs` (9 — the passive `gen_tcp:recv` park), `accept_opts_family_tests.rs` (7 — `prim_inet:accept_opts/3`'s whole eleven-code list, incl. `FamilyOpts`) and `shutdown_contract_tests.rs` (10 — the `gen_tcp:shutdown/2` aftermath)
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
 - `io_device/` → the `{get_until,…}` io-device request layer — child node `io_device/` (files listed in `../CONTEXT.md`)
 

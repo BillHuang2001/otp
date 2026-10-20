@@ -688,10 +688,16 @@ pub struct TcpInetDriver {
     /// `TCP_ADDF_PENDING_SHUT_WR`/`TCP_ADDF_PENDING_SHUT_RDWR`, `inet_drv.c:12362`) — applied
     /// as soon as the queue drains.
     pending_shutdown: Option<u8>,
-    /// Whether a write `shutdown` has actually been applied to the socket — the C's
-    /// `TCP_ADDF_SHUTDOWN_WR_DONE` (`inet_drv.c:862`). It makes a later `EPIPE` stay `EPIPE`
-    /// instead of being rewritten to `ECONNRESET` (`tcp_send_error`, `:13717`), so a send after a
-    /// completed half-close still reports `closed`, never `econnreset`.
+    /// Whether the write half was shut in a way that must not be reported as the peer's reset — the
+    /// C's `TCP_ADDF_SHUTDOWN_WR_DONE` (`inet_drv.c:863`). Set in exactly the two places the C sets
+    /// it: a **failed** write-side `shutdown(2)` (`:12372`, before the error reply) and the
+    /// **deferred** drain `tcp_shutdown_async` (`:13973`, on success only) — never by a direct
+    /// successful `shutdown` (the C's `else return ctl_reply_ok(…)` at `:12377`-`:12378` latches
+    /// nothing). It keeps a later `EPIPE` an `EPIPE` instead of rewriting it to `ECONNRESET`
+    /// (`tcp_send_error`, `:13717`), which is the flag
+    /// `tcp_send_or_shutdown_error`'s `err == ECONNRESET && TCP_ADDF_SHOW_ECONNRESET` reads
+    /// (`:13615`): the deferred drain therefore answers `closed` unconditionally, while a direct
+    /// successful write shutdown answers `econnreset` under `{show_econnreset,true}`.
     shutdown_wr_done: bool,
     /// The lowercase errno name of a failed **asynchronous** `connect`, if one failed after
     /// the control call had already answered `ok` (there is no reply channel left by then).
@@ -1513,8 +1519,9 @@ impl TcpInetDriver {
                 // rather than surfaced as a bare I/O error.
                 Some(libc::ECONNRESET) | Some(libc::EPIPE) => {
                     // `tcp_send_error` (`inet_drv.c:13714`-`:13720`) rewrites `EPIPE` to
-                    // `ECONNRESET` unless a write shutdown already completed
-                    // (`TCP_ADDF_SHUTDOWN_WR_DONE`), and `tcp_send_or_shutdown_error` then reads
+                    // `ECONNRESET` unless `TCP_ADDF_SHUTDOWN_WR_DONE` is set — which only a
+                    // **failed** write shutdown (`:12372`) or an already-applied **deferred** one
+                    // (`:13973`) does — and `tcp_send_or_shutdown_error` then reads
                     // `err == ECONNRESET && (tcp_add_flags & TCP_ADDF_SHOW_ECONNRESET)`
                     // (`:13615`) to decide between the `econnreset` and the `closed` reply.
                     let errno = err.raw_os_error().unwrap_or(libc::ECONNRESET);
@@ -1926,6 +1933,15 @@ impl TcpInetDriver {
     /// the two write values: any other byte falls through to `shutdown(2)`, which answers the
     /// kernel's `EINVAL` as `[0]einval`.
     ///
+    /// `TCP_ADDF_SHUTDOWN_WR_DONE` is latched in exactly the two places the C latches it, both
+    /// **away** from the direct success arm: a **failed** `shutdown(2)` for a write-side `how`,
+    /// before the error reply (`inet_drv.c:12371`-`:12374`), and the **deferred** drain
+    /// `tcp_shutdown_async` (`:13973`). The direct success arm (`:12377`-`:12378`) sets nothing, so
+    /// a successful `shutdown(write)` leaves the later `EPIPE` to be rewritten to `ECONNRESET`
+    /// (`tcp_send_error`, `:13717`) — which `tcp_send_or_shutdown_error`'s
+    /// `err == ECONNRESET && TCP_ADDF_SHOW_ECONNRESET` (`:13615`) renders `econnreset` under
+    /// `{show_econnreset,true}` and `closed` (`am_closed`) otherwise.
+    ///
     /// # Errors
     ///
     /// Never for an operand the C's arm replies to: a wrong length is the `[0]einval` reply and a
@@ -1949,13 +1965,24 @@ impl TcpInetDriver {
             }
         }
         match shutdown_socket(fd, how) {
-            Ok(()) => {
-                if how == TCP_SHUT_WR || how == TCP_SHUT_RDWR {
+            // `else return ctl_reply_ok(rbuf, rsize);` (`inet_drv.c:12377`-`:12378`) — the C's
+            // success arm latches **nothing**, so `TCP_ADDF_SHUTDOWN_WR_DONE` stays clear and a
+            // later `EPIPE` from this deliberately shut write half is still rewritten to
+            // `ECONNRESET` (`tcp_send_error`, `:13717`), i.e. reported as the reset under
+            // `{show_econnreset,true}` (`tcp_send_or_shutdown_error`, `:13615`).
+            Ok(()) => Ok(ctl_ok()),
+            Err(err) => {
+                // `if (how != TCP_SHUT_RD) desc->tcp_add_flags |= TCP_ADDF_SHUTDOWN_WR_DONE;`
+                // runs **before** the error reply (`inet_drv.c:12371`-`:12374`), so a write-side
+                // shutdown the kernel refused still counts as "the write half is shut": the
+                // `EPIPE`→`ECONNRESET` rewrite in `tcp_send_error` is skipped afterwards
+                // (`:13717` tests exactly this flag), so a later `EPIPE` surfaces as `epipe`
+                // rather than `econnreset`.
+                if how != TCP_SHUT_RD {
                     self.shutdown_wr_done = true;
                 }
-                Ok(ctl_ok())
+                Ok(ctl_error(err))
             }
-            Err(err) => Ok(ctl_error(err)),
         }
     }
 
@@ -2580,6 +2607,9 @@ mod stat_tests;
 #[cfg(test)]
 #[path = "tcp_shutdown_tests.rs"]
 mod tcp_shutdown_tests;
+#[cfg(test)]
+#[path = "shutdown_contract_tests.rs"]
+mod shutdown_contract_tests;
 #[cfg(test)]
 mod tests;
 // The **write-side** framing pin: the `{packet, 1|2|4}` length header the C prepends in

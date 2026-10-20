@@ -55,7 +55,7 @@ const RECV_OCT: u8 = 9;
 const SEND_OCT: u8 = 10;
 
 /// One `INET_REQ_GETSTAT` call for the single op `code`, returned as its 32-bit value.
-fn stat32(port: &mut Rig, code: u8) -> u32 {
+pub(super) fn stat32(port: &mut Rig, code: u8) -> u32 {
     let reply = port.control(&op(11), &[code]);
     assert_eq!(
         reply.len(),
@@ -68,7 +68,7 @@ fn stat32(port: &mut Rig, code: u8) -> u32 {
 }
 
 /// One `INET_REQ_GETSTAT` call for the octet op `code`, returned as its 64-bit value.
-fn stat64(port: &mut Rig, code: u8) -> u64 {
+pub(super) fn stat64(port: &mut Rig, code: u8) -> u64 {
     let reply = port.control(&op(11), &[code]);
     assert_eq!(
         reply.len(),
@@ -103,13 +103,16 @@ fn zeroed_counter_block() -> Vec<u8> {
 ///
 /// The driver adopts a duplicate of the accepted socket (`try_clone().into_raw_fd()`, so it owns a
 /// descriptor this test knows and no `unsafe` is needed to make one).
-struct TcpPair {
-    port: Rig,
-    peer: TcpStream,
+///
+/// Both fields are `pub(super)` so the crate's other `getstat` suites (the send-counter half,
+/// [`super::stat_send_tests`]) drive the same pair instead of building a second one.
+pub(super) struct TcpPair {
+    pub(super) port: Rig,
+    pub(super) peer: TcpStream,
 }
 
 impl TcpPair {
-    fn new() -> TcpPair {
+    pub(super) fn new() -> TcpPair {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let peer = TcpStream::connect(listener.local_addr().expect("an address"))
             .expect("the far end connects");
@@ -130,7 +133,7 @@ impl TcpPair {
     /// A `recv` that finds nothing delivers nothing (and therefore counts nothing), so repeating it
     /// is safe: the counter still advances exactly once, when the bytes really arrive. The loop
     /// only bounds a genuinely broken driver — it is a condition wait, never a latency budget.
-    fn recv_until(&mut self, len: usize) {
+    pub(super) fn recv_until(&mut self, len: usize) {
         for _ in 0..500 {
             if self.port.input_len() >= len {
                 return;

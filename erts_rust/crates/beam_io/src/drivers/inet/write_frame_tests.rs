@@ -423,17 +423,13 @@ fn a_short_write_frames_once_and_delivers_every_byte() {
     expected.extend_from_slice(&payload);
     let expected_len = expected.len();
 
-    // The reader runs beside the driver: the socket only drains while the peer takes bytes off it.
-    let mut reader = wired.peer.try_clone().expect("a second descriptor");
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let mut got = vec![0u8; expected_len];
-        let read = reader.read_exact(&mut got);
-        let _ = tx.send((read, got));
-    });
-
     // The command and its first (partial) write: 16 MiB can never fit in the socket's send buffer
     // plus the peer's receive window, so a strict remainder is guaranteed to be queued.
+    //
+    // The draining reader is started **after** these assertions, never before: a reader running
+    // beside the command's own write can drain the socket between the driver's `send(2)` calls, so
+    // on a loaded host the whole command would be accepted and `queued == 0` — a flake in the
+    // instrument, not a divergence. A non-reading peer makes the remainder deterministic.
     wired.command(CALLER_REF_TAG, &payload);
     let queued = wired.output_len();
     assert!(
@@ -441,6 +437,14 @@ fn a_short_write_frames_once_and_delivers_every_byte() {
         "the kernel could not take the whole command; a strict remainder must be queued"
     );
     assert!(queued < expected_len, "a strict remainder of the command");
+
+    let mut reader = wired.peer.try_clone().expect("a second descriptor");
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut got = vec![0u8; expected_len];
+        let read = reader.read_exact(&mut got);
+        let _ = tx.send((read, got));
+    });
 
     let started = Instant::now();
     while wired.output_len() > 0 {
@@ -451,7 +455,8 @@ fn a_short_write_frames_once_and_delivers_every_byte() {
             "the write never drained ({} byte(s) still queued)",
             wired.output_len()
         );
-    }    let (read, got) = rx.recv_timeout(HANG_GUARD).expect("the peer received it all");
+    }
+    let (read, got) = rx.recv_timeout(HANG_GUARD).expect("the peer received it all");
     read.expect("the peer reads the whole command");
     handle.join().expect("the reader thread");
     assert_eq!(
