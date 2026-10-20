@@ -43,14 +43,21 @@
 //!
 //! A missing toolchain — or a probe that cannot answer — is a **loud skip**, never a
 //! silent pass.
+//!
+//! # The two-VM harness is [`dist`]
+//!
+//! Everything that starts **two live VMs at once** (this runtime plus a peer, sharing one
+//! private `epmd`) lives in the [`dist`] submodule — the harness, not a probe: see its
+//! module docs for the session/teardown invariants and for the two peer routes
+//! ([`dist::PeerKind`]).
+
+pub mod dist;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use beam_common::BeamError;
-
-/// Assert `error` is the oracle's plain `exception error: bad argument` — the bare reason
+use beam_common::BeamError;/// Assert `error` is the oracle's plain `exception error: bad argument` — the bare reason
 /// atom `badarg` — which is the rejection every BIF-level failure in these suites reports.
 ///
 /// [`BeamError::as_atom`] covers both the dedicated `BadArg` reason variant and a `Raise`

@@ -18,80 +18,122 @@
 //
 // %CopyrightEnd%
 
-//! **Two-VM distribution** (contract A.5, the inbound direction): a real system-ERTS
-//! node connects to this Rust ERTS runtime *and actually uses it*.
+//! **Two-VM distribution** (contract A.5): a real system-ERTS node and this Rust ERTS
+//! runtime, **live at once**, sharing one **private** `epmd`, with the traffic that
+//! crosses between them asserted on **both** sides.
 //!
 //! The other A.5 suites each pin one half of a link from a different angle —
 //! [`tests/dist.rs`](../dist.rs) the `'N'` handshake, [`tests/dist_client.rs`](../dist_client.rs)
 //! this runtime dialling out, [`tests/live_inbound.rs`](../live_inbound.rs) an inbound
 //! `DOP_REG_SEND` into a running local process, [`tests/live_signals.rs`](../live_signals.rs)
-//! the outbound signal families — all of them over the **default** `epmd` port, and all of
-//! them from *one* VM's point of view. This suite is the integration proof: **two VMs at
-//! once**, a real system `erl` and this runtime, sharing one **private** `epmd`, and the
-//! traffic that crosses between them is asserted on **both** sides.
+//! the outbound signal families — all of them over the **default** `epmd` port, and all
+//! of them from *one* VM's point of view. This suite is the integration proof: two VMs at
+//! once, and every observability claim is a line printed by **one VM about the other**.
 //!
-//! What each test asserts, end to end:
+//! The harness itself (the private `epmd`, the session-isolated children, the scratch
+//! directory, the skip policy) lives in [`tests/support/dist.rs`](../support/dist.rs) —
+//! one home for every two-VM suite, including the rust↔rust one that shares this file's
+//! fixture.
+//!
+//! # What this file asserts, end to end
+//!
+//! ## The `-eval` peer: the inbound families
 //!
 //! 1. the runtime boots as a `-sname` node, registers with the private `epmd`, and its
 //!    fixture prints a `READY <node>` line once its registered name exists;
-//! 2. the system `erl` peer resolves it **by name** — `net_adm:ping('rust…@host')` answers
-//!    **`pong`** (which is a real `gen:call` to the remote `net_kernel`, so the runtime has
-//!    to serve that endpoint, not merely accept a socket);
-//! 3. **one message each way**: the peer `DOP_REG_SEND`s `{greeting, PeerNode, 42}` to the
-//!    runtime's registered name `two_vm_peer` and the runtime `!`s
-//!    `{reply, RustNode, 43}` to the peer's registered name `oracle_peer`; **both** payloads
-//!    are printed by the receiving VM and compared, verbatim, to the exact expected term;
-//! 4. **`nodedown`** in both directions — the runtime's own `erlang:monitor_node(PeerNode,
-//!    true)` reports `{nodedown, PeerNode}` when the peer exits
-//!    ([`the_oracle_pings_the_rust_node_and_a_message_crosses_each_way`]), and the peer's
-//!    `erlang:monitor_node(RustNode, true)` reports `{nodedown, RustNode}` when the runtime
-//!    is killed ([`the_peer_watches_the_rust_node_go_down`]).
+//! 2. the system `erl` peer resolves it **by name** — `net_adm:ping('rust…@host')`
+//!    answers **`pong`** (which is a real `gen:call` to the remote `net_kernel`, so the
+//!    runtime has to serve that endpoint, not merely accept a socket);
+//! 3. **one message each way**: the peer `DOP_REG_SEND`s `{greeting, PeerNode, 42}` to
+//!    the runtime's registered name `two_vm_peer` and the runtime `!`s
+//!    `{reply, RustNode, 43}` to the peer's registered name `oracle_peer`; **both**
+//!    payloads are printed by the receiving VM and compared, verbatim, to the exact
+//!    expected term;
+//! 4. **`nodedown`** in both directions — the runtime's own
+//!    `erlang:monitor_node(PeerNode, true)` reports `{nodedown, PeerNode}` when the peer
+//!    exits ([`the_oracle_pings_the_rust_node_and_a_message_crosses_each_way`]), and the
+//!    peer's `erlang:monitor_node(RustNode, true)` reports `{nodedown, RustNode}` when
+//!    the runtime is killed ([`the_peer_watches_the_rust_node_go_down`]).
 //!
-//! # Running it
+//! ## The actor peer: the distributed **signal** families, peer-observed
 //!
-//! Both tests are `#[ignore]`d: they need a whole system Erlang toolchain (`erl`, `erlc`,
-//! `epmd`) plus `setsid` and `kill`, they take ~10 s each, and they really do spawn two
-//! VMs. The exact command:
+//! The `-eval` expression a `spawn_peer` call carries cannot run on a `beam_rt` peer, so
+//! the signal families use a **compiled** fixture instead — the *responder* / *actor*
+//! pair below. The peer runs `two_vm:<actor>/1`, the same Erlang source on a real `erl`
+//! **and** on `beam_rt` (`support::dist::PeerKind`), and what each family asserts is what
+//! the **peer** observed about **our** process:
 //!
-//! ```text
-//! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
-//!     -p beam_rt --test dist_two_vm -- --ignored --nocapture
-//! ```
+//! | test | the peer does | the peer must report |
+//! |---|---|---|
+//! | [`a_real_erl_peer_links_to_our_process_and_traps_our_exit`] | `link/1` + `trap_exit`, then dies our victim with `boom` | `EXIT_MATCH pid=true reason=boom`, and the `{'EXIT', Pid, boom}` whose pid **is** the pid we printed |
+//! | [`a_real_erl_peer_traps_our_exit_with_the_reason_term_it_asked_for`] | the same, with the **compound** reason `{shutdown,{custom,7}}` | the reason *value*, not merely the event |
+//! | [`a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered`] | `unlink/1` first (with a barrier proving *our* node processed it), then dies the victim | `NOEXIT`, and no `EXIT` line at all |
+//! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
+//! | [`a_real_erl_peer_demonitors_before_our_death_so_no_down_arrives`] | `demonitor(Ref, [flush])` first | `NODOWN`, and no `DOWN` line at all |
+//! | [`our_pid_survives_a_round_trip_through_a_real_erl_peer`] | echoes a pid term back | our pid arrives intact (`IDENTITY true`, the same text) |
 //!
-//! To run one of them: append `--exact <test-name>` after the `--`. `--nocapture` matters:
-//! every child's transcript is echoed on failure *and* on every loud skip.
+//! Every one of them is `#[ignore]`d: they need a whole system Erlang toolchain (`erl`,
+//! `erlc`, `epmd`) plus `setsid` and `kill`, and they really do spawn two VMs.
 //!
-//! # Isolation (why `setsid`, and why a *private* `epmd`)
+//! # The responder / actor protocol
 //!
-//! An Erlang VM signals its **process group** (`SIGUSR1` for the break handler, and
-//! `erl_child_setup` does the same on the way down), so a VM started as a plain child of the
-//! test process can hit the test binary — and any sibling test — with its own signals.
-//! Every child here (the private `epmd`, the `erl` peer, the `beam_rt` runtime) is therefore
-//! started as `setsid -w <program> …`: its own **session**, so its own process group, whose
-//! id is its own pid. Drop sends `TERM` to the whole group, waits a bounded grace, escalates
-//! to `KILL`, and reaps — so no `beam_rt`, `erl` or `epmd` is ever left behind.
-//! (`setsid` execs the program directly, so the child we hold *is* the program; the group id
-//! is read back from `/proc/<pid>/stat` and only trusted when it really is `<pid>` — see
-//! [`ChildVm::pgid`].)
+//! Our node runs the **responder** (`run <fixture.beam> two_vm:<responder>/1 "<peer
+//! node>"`); the peer runs the **actor** (`erl … -run two_vm <actor> "<our node>"`, or
+//! `beam_rt … run <fixture.beam> two_vm:<actor>/1 "<our node>"`). The message exchange is
+//! the same in every signal test, one numbered step per message:
 //!
-//! A private `epmd` on a private port (`ERL_EPMD_PORT=<port> epmd -daemon -port <port>`,
-//! with its cwd inside the test's own scratch dir) keeps the run out of any other node's way
-//! — the developer's own `epmd`, and any other test's — and lets the whole pair collide with
-//! nothing. A daemonized `epmd` detaches into its own session, so the group kill cannot
-//! reach it: [`PrivateEpmd::stop`] finds it by its own argv (`-port <our port>`) and signals
-//! that pid, then proves the port is closed.
+//! 1. **responder → `epmd`**: the runtime registers its node, then prints `READY <node>`,
+//!    `PEER <peer node>`, and (for the signal families) `VICTIM <pid>` — the *local* pid
+//!    the peer is about to act on. Its own `erlang:monitor(process, Victim)` makes it
+//!    report `VICTIM_DOWN <reason>` independently of the peer, which is what makes the
+//!    negative controls non-vacuous.
+//! 2. **actor → responder, `{hello, ActorPid}`** to the registered name `two_vm_peer`,
+//!    retried on a bounded schedule (a `DOP_REG_SEND` to a name that is not registered
+//!    *yet* is silently dropped — by the oracle too): a registration race, not a bug.
+//! 3. **responder → actor, `{victim, VictimPid}`** — every greeting is answered.
+//! 4. **actor, locally**: arms its own view of the relationship — `link/1` with
+//!    `process_flag(trap_exit, true)`, or `erlang:monitor/2` — and prints it
+//!    (`LINKED <pid>` / `REF <ref>`).
+//! 5. **actor → responder, `{barrier, ActorPid}`**; **responder → actor,
+//!    `{barrier_ack, ResponderPid}`**. Signals from one peer travel in order on its
+//!    link, so the ack proves *our* node has already applied step 4's `DOP_LINK` /
+//!    `DOP_MONITOR_P` / `DOP_UNLINK_ID` / `DOP_DEMONITOR_P` — without it the death below
+//!    could race the relationship and make a *pass* meaningless.
+//! 6. **actor → victim, `{die, Reason}`** — a plain `DOP_SEND` to a local pid of ours.
+//!    The victim is a **spawned child**, never the responder: the responder is the run
+//!    action's target, and if it exited the runtime would exit before the outbound
+//!    `DOP_EXIT` / `DOP_MONITOR_P_EXIT` it just routed could be flushed.
+//! 7. **our node → actor, `{'EXIT', Victim, Reason}` or `{'DOWN', Ref, process, Victim,
+//!    Reason}`** — the outbound signal family under test. The actor prints what it
+//!    matched and, where a pid is involved, the *identity* it matched (a `=:=` guard).
+//! 8. **actor → responder, `{saw, Verdict}`**; **responder → actor, `{bye, done}`**;
+//!    **actor → responder, `{thanks, ActorPid}`**. The responder prints `PEER_SAW
+//!    <verdict>`, then stays alive until the actor confirms — the ordering that keeps a
+//!    VM from exiting out from under the last message of the other.
 //!
-//! # Skip policy
+//! Three rules the fixture keeps so that the **same** source can run on a `beam_rt` peer:
 //!
-//! Every precondition is a **loud skip** (`support::skip_loudly`, or a `SKIP: …` line when
-//! the reason is a *runtime* one): a missing `erl`/`erlc`/`epmd`/`setsid`/`kill` (discovered
-//! by **filesystem only**, never by running the tool — see `tests/support/mod.rs`), a
-//! private `epmd` that does not come up, or a runtime that never prints its `ready` line
-//! inside the bound. A missing toolchain is never a silent pass, and a *missing committed
-//! fixture* cannot happen here: the fixture is compiled at test time with the system `erlc`
-//! into the scratch directory.
+//! * no pid *literal* (`<0.1.0>` is not parseable outside a shell) — pids cross only as
+//!   terms in messages;
+//! * no `timer:sleep` (portability across both runtimes): a wait is `receive … after T`;
+//! * no printing of a **remote** pid through `~p` (`erlang:pid_to_list/1` of an external
+//!   pid is a typed capability gap in this runtime — `beam_bifs`'s `external_channel_gap` —
+//!   so the fixture's `pid_text/1` falls back to a marker rather than fabricating a
+//!   channel number; the pid *identity* assertions never depend on the text).
 //!
-//! # Assumptions the implementation must satisfy
+//! # The pid text a peer can print, and why it is normalized
+//!
+//! `erlang:pid_to_list/1` renders `<node.number.serial>`, but for a pid that arrived from
+//! another node the first component is the receiving VM's **node-table index** — the
+//! oracle printed `<10304.35.2>` for our `<0.35.2>`, and the index differs per VM and per
+//! run. `node/1` names the node, and both facts come from the peer itself, so the
+//! fixture's `canonical_pid/2` substitutes the node name and yields the canonical
+//! `<twovmr…@host.35.2>` the *other* VM printed — a normalization of two observed facts,
+//! never an invention. The tests then derive that same string from our own printed pid
+//! (`Pair::external_pid_text`), so the peer's view of our pid is compared **term for
+//! term** with the pid we printed.
+//!
+//! # What the runtime side must hold up (each is exercised below)
 //!
 //! This file is the executable statement of what "two VMs" means; the runtime side has to
 //! hold up its end. Documented here so a failure is attributable, not mysterious:
@@ -102,75 +144,75 @@
 //!   registered name `net_kernel` is answered, which is what `net_adm:ping/1` returns
 //!   `pong` from.
 //! * **an accepted link can send**: `{Name, PeerNode} ! Msg` on a link *the peer opened*
-//!   reaches the peer's registered name (today the documented runtime send path is the
-//!   outbound/connector link).
+//!   reaches the peer's registered name.
+//! * **an accepted link can signal**: a `DOP_LINK`/`DOP_MONITOR_P` the peer sends is
+//!   recorded against our local process, a `DOP_UNLINK_ID`/`DOP_DEMONITOR_P` removes it
+//!   again, and when that process dies the runtime routes `DOP_EXIT`/`DOP_MONITOR_P_EXIT`
+//!   back over the **same** link, with the reason term intact and the peer's own reference
+//!   echoed.
 //! * **`erlang:monitor_node(Node, true)`** answers `true` for a connected node and delivers
 //!   `{nodedown, Node}` to the monitoring process when the link dies, in **both**
 //!   directions.
 //! * the fixture's `receive … after T` keeps the run's scheduler pump stepping (a bare
-//!   `receive` leaves the pump quiescent, which is why every wait here is deadline-bounded).
+//!   `receive` leaves the pump quiescent, which is why every wait in the fixture is
+//!   deadline-bounded: with an empty run queue, nothing to poll and no pending timer,
+//!   `Runtime::run_scheduled` stops with its honest `blocked` diagnostic).
+//!
+//! # Running it
+//!
+//! ```text
+//! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
+//!     -p beam_rt --test dist_two_vm -- --ignored --nocapture
+//! ```
+//!
+//! To run one of them: append `--exact <test-name>` after the `--`. `--nocapture` matters:
+//! every child's transcript is echoed on failure *and* on every loud skip. Each test is a
+//! two-VM session of a few seconds (the two negative controls spend 3 s in their own
+//! deliberately-expiring wait); `--test-threads=1` keeps a loaded host's timings honest.
+//! The whole eight-test file runs in ~18 s on an idle host.
 
-use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
-
-// The shared harness is compiled into every test target; this target only uses a subset of
+// The two-VM harness is compiled into every test target; this target only uses a subset of
 // it, so the unused helpers would otherwise warn here.
 #[allow(dead_code)]
 mod support;
 
-/// The **real** executable under test (the test target's build guarantees it is current).
-const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
-
-/// How long the private `epmd` may take to accept its first connection.
-const EPMD_START_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the runtime may take to print its `READY` line (it drives the whole boot script
-/// first, then loads and starts the fixture).
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long any single expected stdout line may take to appear once its predecessor has.
-///
-/// Deliberately **longer** than every deadline the peer's expressions carry (a 100 × 200 ms
-/// ping budget, a 20 s nodedown wait), so a peer that gives up prints its own `PINGFAIL` /
-/// `NODEDOWN_TIMEOUT` line into the transcript *before* this wait expires — a red test then
-/// names the peer's verdict instead of only "no line".
-const LINE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a VM may take to exit once the interaction has completed.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// The grace a `TERM`ed process group gets before it is `KILL`ed.
-const KILL_GRACE: Duration = Duration::from_secs(3);
-/// The poll interval for every bounded wait in this file.
-const POLL: Duration = Duration::from_millis(20);
-/// How long the killed `epmd` gets to release its port.
-const EPMD_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+use support::dist::{
+    ChildVm, Harness, PeerKind, BINARY, EXIT_TIMEOUT, KILL_GRACE, LINE_TIMEOUT, READY_TIMEOUT,
+    unique, unique_cookie,
+};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------------------
 // The fixture (compiled at test time with the system `erlc`; never committed)
 // ---------------------------------------------------------------------------------------
 
-/// The runtime-side fixture. `run/1` is the full exchange of
-/// [`the_oracle_pings_the_rust_node_and_a_message_crosses_each_way`]; `linger/0` is the
-/// passive side of [`the_peer_watches_the_rust_node_go_down`].
+/// The shared fixture: the original `run/1` + `linger/0` pair, and the responder/actor
+/// pair the signal families drive.
 ///
-/// Every wait is **deadline-bounded** (`after 30000` / `after 100`), and that is
+/// **Every wait is deadline-bounded** (`after 30000` / `after 250`), and that is
 /// load-bearing rather than defensive: a bare `receive` leaves the run action's scheduler
 /// pump with an empty run queue, nothing to poll and no pending timer, so
 /// `Runtime::run_scheduled` stops with its honest `blocked` diagnostic before the peer's
 /// message can arrive (`tests/dist.rs` and `tests/live_inbound.rs` pin the same rule).
 ///
 /// The peer's node atom arrives as a **charlist** (`list_to_atom/1`) rather than as a bare
-/// `run` argument, so the command line never depends on the atom charset.
+/// `run` argument, so the command line never depends on the atom charset. The actors'
+/// `arg/1` absorbs the two peer routes' argument shapes: `erl -run Mod Func "x"` calls
+/// `Mod:Func(["x"])` (a list of strings) while `beam_rt … run Mod:Func/1 "x"` hands the
+/// charlist itself.
 const FIXTURE_ERL: &str = r#"%% Generated by `beam_rt/tests/dist_two_vm.rs` (never committed).
 -module(two_vm).
--export([run/1, linger/0]).
+-export([run/1, linger/0,
+         arg/1,
+         peer_drives/1, identity/1,
+         link_and_trap/1, link_and_trap_compound/1, link_then_unlink/1,
+         monitor_victim/1, monitor_then_demonitor/1, echo_identity/1]).
 
-%% The whole two-VM exchange, from this runtime's side: register a name, take one message
-%% from the peer, answer it on the peer's registered name, then watch the peer go down.
+%% =====================================================================
+%% 1. The original two-VM exchange, from this runtime's side: register a
+%%    name, take one message from the peer, answer it on the peer's
+%%    registered name, then watch the peer go down.
+%% =====================================================================
 run(OracleName) ->
     Oracle = list_to_atom(OracleName),
     true = register(two_vm_peer, self()),
@@ -206,6 +248,308 @@ linger(0) ->
 linger(N) ->
     receive _ -> ok after 100 -> ok end,
     linger(N - 1).
+
+%% =====================================================================
+%% 2. The responder (this runtime) / actor (the peer) pair.
+%% =====================================================================
+
+%% `-run` wraps its argv in a list of strings, `run` passes the string.
+arg([S | _]) when is_list(S) -> S;
+arg(S) -> S.
+
+%% ---- the responder: the peer orchestrates our victim's death ----------
+peer_drives(PeerArg) ->
+    Peer = list_to_atom(arg(PeerArg)),
+    true = register(two_vm_peer, self()),
+    Victim = spawn(fun victim_loop/0),
+    MRef = erlang:monitor(process, Victim),
+    io:format("READY ~p~n", [node()]),
+    io:format("PEER ~p~n", [Peer]),
+    io:format("VICTIM ~p~n", [Victim]),
+    serve(Peer, Victim, MRef).
+
+serve(Peer, Victim, MRef) ->
+    receive
+        {hello, PeerPid} ->
+            PeerPid ! {victim, Victim},
+            serve(Peer, Victim, MRef);
+        {barrier, PeerPid} ->
+            PeerPid ! {barrier_ack, self()},
+            serve(Peer, Victim, MRef);
+        {'DOWN', MRef, process, Victim, Reason} ->
+            io:format("VICTIM_DOWN ~p~n", [Reason]),
+            serve(Peer, Victim, MRef);
+        {saw, What} ->
+            io:format("PEER_SAW ~p~n", [What]),
+            {oracle_peer, Peer} ! {bye, done},
+            await_thanks()
+    after 30000 ->
+        io:format("PARENT_TIMEOUT~n", []),
+        halt(4)
+    end.
+
+await_thanks() ->
+    receive
+        {thanks, _PeerPid} ->
+            io:format("HANDSHAKE_DONE~n", []),
+            done
+    after 5000 ->
+        io:format("BYE_TIMEOUT~n", []),
+        done
+    end.
+
+%% The process the peer kills: a `spawn`ed child, never the responder itself.
+victim_loop() ->
+    receive
+        {die, Reason} -> exit(Reason);
+        stop -> ok
+    after 30000 -> exit(victim_timeout)
+    end.
+
+%% ---- the responder: our pid's identity round trip -------------------
+identity(PeerArg) ->
+    Peer = list_to_atom(arg(PeerArg)),
+    true = register(two_vm_peer, self()),
+    io:format("READY ~p~n", [node()]),
+    io:format("PEER ~p~n", [Peer]),
+    io:format("SELF ~p~n", [self()]),
+    io:format("SELF_NODE ~p~n", [node(self())]),
+    wait_identity(Peer).
+
+wait_identity(Peer) ->
+    Me = self(),
+    receive
+        {hello, PeerPid} ->
+            PeerPid ! {identity, Me},
+            wait_identity(Peer);
+        {echo, Echoed} ->
+            io:format("IDENTITY ~p~n", [Echoed =:= Me]),
+            io:format("ECHO ~p~n", [Echoed]),
+            io:format("ECHO_NODE ~p~n", [node(Echoed)]),
+            {oracle_peer, Peer} ! {bye, done},
+            await_thanks()
+    after 30000 ->
+        io:format("PARENT_TIMEOUT~n", []),
+        halt(4)
+    end.
+
+%% ---- the actor: the peer -------------------------------------------
+%% `erlang:pid_to_list/1` renders `<node.number.serial>`, but for a pid that
+%% arrived from another node the first component is the *node-table index*
+%% (`<10304.35.2>`), which no other VM can predict. `node/1` names the node, and
+%% both facts come from the peer itself, so substituting the node name yields the
+%% canonical `<node.number.serial>` the other VM printed — nothing is invented.
+%% This runtime cannot name an *external* pid's channel at all, so it raises and
+%% the fallback marker stands in (the identity assertions are the clauses' `=:=`,
+%% never the text).
+pid_text(Pid) ->
+    try erlang:pid_to_list(Pid) of
+        Text -> canonical_pid(Text, Pid)
+    catch _:_ -> "remote-pid"
+    end.
+canonical_pid(Text, Pid) ->
+    case node(Pid) =:= node() of
+        true -> Text;
+        false -> replace_pid_node(Text, atom_to_list(node(Pid)))
+    end.
+replace_pid_node([$< | Rest], NodeName) ->
+    case lists:splitwith(fun(C) -> C =/= $. end, Rest) of
+        {_Index, Tail} -> [$<] ++ NodeName ++ Tail;
+        _ -> [$< | Rest]
+    end;
+replace_pid_node(Text, _NodeName) ->
+    Text.
+
+ref_text(Ref) ->
+    try erlang:ref_to_list(Ref) of
+        Text -> Text
+    catch _:_ -> "remote-ref"
+    end.
+
+ping(_Target, 0) ->
+    io:format("PINGFAIL~n", []),
+    halt(2);
+ping(Target, N) ->
+    case net_adm:ping(Target) of
+        pong ->
+            io:format("PONG ~p~n", [node()]);
+        _ ->
+            receive after 200 -> ok end,
+            ping(Target, N - 1)
+    end.
+
+greet_peer() ->
+    true = register(oracle_peer, self()),
+    ok.
+
+ask_victim(_Target, 0) ->
+    io:format("NOVICTIM~n", []),
+    halt(3);
+ask_victim(Target, N) ->
+    {two_vm_peer, Target} ! {hello, self()},
+    receive
+        {victim, Victim} ->
+            io:format("VICTIM_SEEN ~s~n", [pid_text(Victim)]),
+            Victim
+    after 250 ->
+        ask_victim(Target, N - 1)
+    end.
+
+ask_identity(_Target, 0) ->
+    io:format("NOIDENTITY~n", []),
+    halt(3);
+ask_identity(Target, N) ->
+    {two_vm_peer, Target} ! {hello, self()},
+    receive
+        {identity, Pid} -> Pid
+    after 250 ->
+        ask_identity(Target, N - 1)
+    end.
+
+%% A round trip through the responder: same-link signals are applied in
+%% order, so the ack proves our node has already recorded step 4.
+barrier(Target) ->
+    {two_vm_peer, Target} ! {barrier, self()},
+    receive
+        {barrier_ack, _} ->
+            io:format("BARRIER ok~n", [])
+    after 5000 ->
+        io:format("BARRIER_TIMEOUT~n", []),
+        halt(6)
+    end.
+
+await_exit(Victim, Ms) ->
+    receive
+        {'EXIT', V, Reason} when V =:= Victim ->
+            {ok, Reason};
+        {'EXIT', _Other, Reason} ->
+            io:format("EXIT_OTHER_REASON ~p~n", [Reason]),
+            await_exit(Victim, Ms)
+    after Ms ->
+        timeout
+    end.
+
+await_down(MRef, Victim, Ms) ->
+    receive
+        {'DOWN', MRef, process, V, Reason} ->
+            {ok, V =:= Victim, Reason};
+        {'DOWN', OtherRef, Kind, _Obj, Reason} ->
+            io:format("DOWN_OTHER ref=~s kind=~p reason=~p~n",
+                      [ref_text(OtherRef), Kind, Reason]),
+            await_down(MRef, Victim, Ms)
+    after Ms ->
+        timeout
+    end.
+
+finish(Target, What) ->
+    {two_vm_peer, Target} ! {saw, What},
+    receive
+        {bye, Done} ->
+            io:format("BYE ~p~n", [Done])
+    after 5000 ->
+        io:format("BYE_TIMEOUT~n", [])
+    end,
+    {two_vm_peer, Target} ! {thanks, self()},
+    io:format("ACTOR_DONE~n", []),
+    ok.
+
+finish_exit(Target, Victim) ->
+    case await_exit(Victim, 10000) of
+        {ok, Reason} ->
+            io:format("EXIT_MATCH pid=true reason=~p~n", [Reason]),
+            io:format("EXIT_TERM {'EXIT',~s,~p}~n", [pid_text(Victim), Reason]),
+            finish(Target, seen);
+        timeout ->
+            io:format("EXIT_TIMEOUT~n", []),
+            finish(Target, timeout)
+    end.
+
+trap_and_die(PeerArg, Reason) ->
+    Target = list_to_atom(arg(PeerArg)),
+    ping(Target, 100),
+    greet_peer(),
+    Victim = ask_victim(Target, 40),
+    true = process_flag(trap_exit, true),
+    true = link(Victim),
+    io:format("LINKED ~s~n", [pid_text(Victim)]),
+    barrier(Target),
+    Victim ! {die, Reason},
+    finish_exit(Target, Victim).
+
+link_and_trap(PeerArg) ->
+    trap_and_die(PeerArg, boom).
+
+link_and_trap_compound(PeerArg) ->
+    trap_and_die(PeerArg, {shutdown, {custom, 7}}).
+
+link_then_unlink(PeerArg) ->
+    Target = list_to_atom(arg(PeerArg)),
+    ping(Target, 100),
+    greet_peer(),
+    Victim = ask_victim(Target, 40),
+    true = process_flag(trap_exit, true),
+    true = link(Victim),
+    io:format("LINKED ~s~n", [pid_text(Victim)]),
+    true = unlink(Victim),
+    io:format("UNLINKED~n", []),
+    barrier(Target),
+    Victim ! {die, boom},
+    receive
+        {'EXIT', V, Reason} when V =:= Victim ->
+            io:format("UNEXPECTED_EXIT ~p~n", [Reason])
+    after 3000 ->
+        io:format("NOEXIT~n", [])
+    end,
+    finish(Target, no_exit).
+
+monitor_victim(PeerArg) ->
+    Target = list_to_atom(arg(PeerArg)),
+    ping(Target, 100),
+    greet_peer(),
+    Victim = ask_victim(Target, 40),
+    MRef = erlang:monitor(process, Victim),
+    io:format("REF ~s~n", [ref_text(MRef)]),
+    barrier(Target),
+    Victim ! {die, boom},
+    case await_down(MRef, Victim, 10000) of
+        {ok, Same, Reason} ->
+            io:format("DOWN_MATCH ref=bound pid=~p reason=~p~n", [Same, Reason]),
+            io:format("DOWN_TERM {'DOWN',~s,process,~s,~p}~n",
+                      [ref_text(MRef), pid_text(Victim), Reason]),
+            finish(Target, seen);
+        timeout ->
+            io:format("DOWN_TIMEOUT~n", []),
+            finish(Target, timeout)
+    end.
+
+monitor_then_demonitor(PeerArg) ->
+    Target = list_to_atom(arg(PeerArg)),
+    ping(Target, 100),
+    greet_peer(),
+    Victim = ask_victim(Target, 40),
+    MRef = erlang:monitor(process, Victim),
+    io:format("REF ~s~n", [ref_text(MRef)]),
+    true = erlang:demonitor(MRef, [flush]),
+    io:format("DEMONITORED~n", []),
+    barrier(Target),
+    Victim ! {die, boom},
+    receive
+        {'DOWN', R, process, _Obj, Reason} ->
+            io:format("UNEXPECTED_DOWN ~s ~p~n", [ref_text(R), Reason])
+    after 3000 ->
+        io:format("NODOWN~n", [])
+    end,
+    finish(Target, no_down).
+
+echo_identity(PeerArg) ->
+    Target = list_to_atom(arg(PeerArg)),
+    ping(Target, 100),
+    greet_peer(),
+    OurPid = ask_identity(Target, 40),
+    io:format("ECHOED_IN ~s~n", [pid_text(OurPid)]),
+    OurPid ! {echo, OurPid},
+    io:format("ECHO_SENT~n", []),
+    finish(Target, echoed).
 "#;
 
 /// The fixture's module name (it must be what the `run` spec names).
@@ -216,6 +560,13 @@ const EXCHANGE_SPEC: &str = "two_vm:run/1";
 
 /// The runtime's entry point for the passive nodedown case.
 const LINGER_SPEC: &str = "two_vm:linger/0";
+
+/// The responder for the peer-orchestrated signal families: spawns the victim and stays
+/// alive until the actor has finished observing.
+const PEER_DRIVES_SPEC: &str = "two_vm:peer_drives/1";
+
+/// The responder for the identity round trip.
+const IDENTITY_SPEC: &str = "two_vm:identity/1";
 
 // ---------------------------------------------------------------------------------------
 // The peer's expressions
@@ -277,7 +628,7 @@ end.
 "#;
 
 // ---------------------------------------------------------------------------------------
-// The two tests
+// The two original tests
 // ---------------------------------------------------------------------------------------
 
 /// **A real system-ERTS node connects to this runtime and uses it.** The peer resolves the
@@ -291,10 +642,10 @@ end.
 #[test]
 #[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
 fn the_oracle_pings_the_rust_node_and_a_message_crosses_each_way() {
-    let Some(harness) = Harness::new("exchange") else {
+    let Some(mut harness) = Harness::new("exchange", "dist_two_vm") else {
         return; // every precondition already reported its loud skip
     };
-    let Some(fixture) = harness.compile_fixture() else {
+    let Some(fixture) = harness.compile_fixture(FIXTURE_ERL, FIXTURE_MODULE) else {
         return;
     };
 
@@ -498,10 +849,10 @@ fn the_oracle_pings_the_rust_node_and_a_message_crosses_each_way() {
 #[test]
 #[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
 fn the_peer_watches_the_rust_node_go_down() {
-    let Some(harness) = Harness::new("nodedown") else {
+    let Some(mut harness) = Harness::new("nodedown", "dist_two_vm") else {
         return;
     };
-    let Some(fixture) = harness.compile_fixture() else {
+    let Some(fixture) = harness.compile_fixture(FIXTURE_ERL, FIXTURE_MODULE) else {
         return;
     };
 
@@ -601,776 +952,479 @@ fn the_peer_watches_the_rust_node_go_down() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Preconditions: toolchain discovery (filesystem only) + the private `epmd` + the fixture
+// The responder/actor session: one live pair per test
 // ---------------------------------------------------------------------------------------
 
-/// Everything one test needs before it can start a VM pair: the discovered tools, the
-/// test's own scratch directory, the derived host name and the private `epmd`.
+/// A live responder/actor pair: our runtime (the responder, started on the `run` route)
+/// and the peer (the actor, started through [`Harness::spawn_actor`]).
 ///
-/// Declared in drop order: the `epmd` daemon is stopped **before** the scratch directory
-/// (its cwd) is removed.
-struct Harness {
-    /// The system `erl` — the peer (resolved by [`support::resolve_oracle`]'s rules).
-    oracle: PathBuf,
-    /// The system `erlc` — compiles the fixture at test time.
-    erlc: PathBuf,
-    /// `setsid`, which puts every child in its own session (see the module docs).
-    setsid: PathBuf,
-    /// `kill`, which delivers the group `TERM`/`KILL` a `Child::kill` cannot.
-    kill: PathBuf,
-    /// The short hostname **both** nodes live under, derived exactly as `beam_rt`'s
-    /// `dist::local_hostname` derives it (`/proc/sys/kernel/hostname`, then `$HOSTNAME`,
-    /// then `localhost`) — never by shelling out to `hostname`.
-    host: String,
-    /// The private `epmd` this run registered with (dropped → stopped).
-    epmd_daemon: PrivateEpmd,
-    /// This test's own directory under `$TMPDIR` (the fixture's output directory, the
-    /// children's cwd, and the `-pa` the runtime is given).
-    scratch: Scratch,
+/// Declared in drop order — `runtime`, `actor`, **then** `harness` — so both VMs (whose
+/// cwd and `-pa` are the harness's scratch directory) are gone before the harness stops
+/// the private `epmd` and removes that directory (`support::dist`'s teardown invariants).
+struct Pair {
+    /// This runtime, running `two_vm:<responder>/1`.
+    runtime: ChildVm,
+    /// The peer, running `two_vm:<actor>/1`.
+    actor: ChildVm,
+    /// Our full `node@host` name.
+    rust_node: String,
+    /// The peer's full `node@host` name.
+    actor_node: String,
+    /// The toolchain, the private `epmd` and the scratch directory (dropped last).
+    ///
+    /// Never read: it is held purely for its `Drop` (stop `epmd`, remove the scratch
+    /// directory the two VMs above `cd`'d into), which is why the declaration order of this
+    /// struct is load-bearing.
+    #[allow(dead_code)]
+    harness: Harness,
 }
 
-impl Harness {
-    /// Discovers the toolchain, makes the scratch directory and starts the private `epmd`,
-    /// or `None` after a **loud skip** naming exactly what is missing.
-    fn new(label: &str) -> Option<Harness> {
-        let Some(oracle) = support::require_oracle("dist_two_vm") else {
+impl Pair {
+    /// Starts both VMs, gates on the responder's `READY`/`PEER` lines, and returns the
+    /// pair — or `None` after a **loud skip** when the runtime never became ready.
+    ///
+    /// `label` names the scratch directory, `spec` is the responder's
+    /// `two_vm:<function>/1` and `actor` the peer's function name.
+    fn start(label: &str, spec: &str, actor: &str) -> Option<Pair> {
+        let mut harness = Harness::new(label, "dist_two_vm")?;
+        let Some(fixture) = harness.compile_fixture(FIXTURE_ERL, FIXTURE_MODULE) else {
             return None;
         };
-        let erlc = tool("erlc")?;
-        let epmd_program = tool("epmd")?;
-        let setsid = tool("setsid")?;
-        let kill = tool("kill")?;
-        let scratch = Scratch::new(label)?;
-        let host = local_hostname();
-        let epmd_daemon = PrivateEpmd::start(&epmd_program, &setsid, &kill, scratch.path())?;
-        Some(Harness {
-            oracle,
-            erlc,
-            setsid,
-            kill,
-            host,
-            epmd_daemon,
-            scratch,
-        })
-    }
 
-    /// Compiles [`FIXTURE_ERL`] into `<scratch>/two_vm.beam` with the system `erlc`, or
-    /// `None` after a loud skip when the compiler fails.
-    fn compile_fixture(&self) -> Option<PathBuf> {
-        let source = self.scratch.path().join(format!("{FIXTURE_MODULE}.erl"));
-        if let Err(error) = std::fs::write(&source, FIXTURE_ERL) {
+        let rust_name = unique('r');
+        let actor_name = unique('o');
+        let cookie = unique_cookie();
+        let rust_node = format!("{rust_name}@{}", harness.host);
+        let actor_node = format!("{actor_name}@{}", harness.host);
+
+        // The runtime first: it must be up (and `READY`) before the actor's greeting can
+        // be delivered rather than dropped.
+        let runtime = harness
+            .spawn_runtime(&rust_name, &cookie, &fixture, spec, Some(&actor_node))
+            .unwrap_or_else(|error| panic!("cannot start {BINARY} under setsid: {error}"));
+        let Some(ready) = runtime.wait_for(|line| line.starts_with("READY "), READY_TIMEOUT) else {
             support::skip_loudly(
                 "dist_two_vm",
-                &format!("cannot write the fixture source {}: {error}", source.display()),
+                &format!(
+                    "the runtime printed no `READY` line within {READY_TIMEOUT:?}\n  command: {}\n  \
+                     stdout: {:?}\n  stderr: {}",
+                    runtime.command,
+                    runtime.transcript(),
+                    runtime.stderr_text()
+                ),
             );
             return None;
-        }
-        let output = Command::new(&self.erlc)
-            .arg("-o")
-            .arg(self.scratch.path())
-            .arg(&source)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                support::skip_loudly(
-                    "dist_two_vm",
-                    &format!(
-                        "`{}` exited with {}: {}",
-                        self.erlc.display(),
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                );
-                return None;
-            }
-            Err(error) => {
-                support::skip_loudly(
-                    "dist_two_vm",
-                    &format!("cannot run `{}`: {error}", self.erlc.display()),
-                );
-                return None;
-            }
-        }
-        let beam = self.scratch.path().join(format!("{FIXTURE_MODULE}.beam"));
-        if !beam.is_file() {
-            support::skip_loudly(
-                "dist_two_vm",
-                &format!("`erlc` produced no {}", beam.display()),
-            );
-            return None;
-        }
-        Some(beam)
+        };
+        assert_eq!(
+            ready.trim(),
+            format!("READY {rust_node}"),
+            "the runtime's fixture reported its own full node name\n  stderr: {}",
+            runtime.stderr_text()
+        );
+        harness.report_registration(&rust_name);
+
+        let pair = Pair {
+            runtime,
+            actor: harness
+                .spawn_actor(PeerKind::Oracle, &actor_name, &cookie, actor, &rust_node)
+                .unwrap_or_else(|error| {
+                    panic!("cannot start the system `erl` actor under setsid: {error}")
+                }),
+            rust_node,
+            actor_node,
+            harness,
+        };
+        // The responder echoes the peer's node back, which pins that the argument reached
+        // the fixture as the peer's own name.
+        pair.runtime_equals("PEER ", &format!("PEER {}", pair.actor_node));
+        Some(pair)
     }
 
-    /// The environment every child gets: the **private** `epmd` port, so neither VM can
-    /// touch (or be seen by) any other node on the machine.
-    fn child_env(&self) -> Vec<(&'static str, String)> {
-        vec![("ERL_EPMD_PORT", self.epmd_daemon.port.to_string())]
-    }
-
-    /// Reports — never asserts — whether the runtime's short name really appeared in *this*
-    /// run's private `epmd`, and whether the machine's default `epmd` knows it instead.
-    ///
-    /// This is the one precondition the peer's `pong` cannot distinguish from the others: a
-    /// runtime that ignores `ERL_EPMD_PORT` registers on 4369 and is invisible to the peer,
-    /// which looks exactly like "the runtime does not serve `net_kernel`". Both facts end up
-    /// in the failure message, so a red test is attributable rather than mysterious.
-    fn report_registration(&self, name: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Ok(port) = beam_dist::epmd::lookup_port_at(&self.epmd_daemon.addr, name.as_bytes())
-            {
-                eprintln!(
-                    "note: the private `epmd` on {} resolved {name} to listener port {port}",
-                    self.epmd_daemon.addr
-                );
-                return;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(POLL);
-        }
-        let elsewhere = beam_dist::epmd::lookup_port_at(
-            beam_dist::EPMD_DEFAULT_ADDR,
-            name.as_bytes(),
-        );
-        eprintln!(
-            "warning: {name} never appeared in the private `epmd` on {} within 15s — is \
-             ERL_EPMD_PORT honoured for the runtime's ALIVE2 registration? (default `epmd` on \
-             {} says {:?})",
-            self.epmd_daemon.addr,
-            beam_dist::EPMD_DEFAULT_ADDR,
-            elsewhere
-        );
-    }
-    /// Starts the runtime under test as a `-sname` node on the `run` route.
-    ///
-    /// `peer_node` (when given) is the peer's full `node@host` atom, passed to the fixture
-    /// as a **double-quoted** `run` argument — a char list, so no atom-charset question
-    /// reaches the command line.
-    fn spawn_runtime(
-        &self,
-        name: &str,
-        cookie: &str,
-        fixture: &Path,
-        spec: &str,
-        peer_node: Option<&str>,
-    ) -> std::io::Result<ChildVm> {
-        let mut args: Vec<String> = vec![
-            "-noshell".into(),
-            "-sname".into(),
-            name.to_string(),
-            "-setcookie".into(),
-            cookie.to_string(),
-            "-pa".into(),
-            self.scratch.path().display().to_string(),
-            "run".into(),
-            fixture.display().to_string(),
-            spec.to_string(),
-        ];
-        if let Some(peer) = peer_node {
-            args.push(format!("\"{peer}\""));
-        }
-        ChildVm::spawn(
-            "runtime",
-            &self.setsid,
-            &self.kill,
-            Path::new(BINARY),
-            &args,
-            &self.child_env(),
-            Some(self.scratch.path()),
+    /// Both VMs' commands, transcripts and stderr — the diagnostic every failure carries.
+    fn diagnostics(&self) -> String {
+        format!(
+            "  runtime command: {}\n  runtime stdout: {:#?}\n  runtime stderr: {}\n  \
+             actor command: {}\n  actor stdout: {:#?}\n  actor stderr: {}",
+            self.runtime.command,
+            self.runtime.transcript(),
+            self.runtime.stderr_text(),
+            self.actor.command,
+            self.actor.transcript(),
+            self.actor.stderr_text(),
         )
     }
 
-    /// Starts the system `erl` peer with `eval` as its `-eval` expression, `@TARGET@`
-    /// replaced by `target` (the runtime's full `node@host` atom).
-    fn spawn_peer(
-        &self,
-        name: &str,
-        cookie: &str,
-        eval: &str,
-        target: &str,
-    ) -> std::io::Result<ChildVm> {
-        let eval = eval.replace("@TARGET@", target);
-        let args: Vec<String> = vec![
-            "-sname".into(),
-            name.to_string(),
-            "-setcookie".into(),
-            cookie.to_string(),
-            "-noshell".into(),
-            "-eval".into(),
-            eval,
-        ];
-        ChildVm::spawn(
-            "peer",
-            &self.setsid,
-            &self.kill,
-            &self.oracle,
-            &args,
-            &self.child_env(),
-            Some(self.scratch.path()),
-        )
-    }
-}
-
-/// `name` on `$PATH` (**filesystem only** — the tool is never run to detect it), or a loud
-/// skip naming it.
-fn tool(name: &str) -> Option<PathBuf> {
-    match support::find_on_path(name) {
-        Some(path) => Some(path),
-        None => {
-            support::skip_loudly(
-                "dist_two_vm",
-                &format!("no `{name}` on $PATH (this suite drives a real two-VM pair)"),
-            );
-            None
-        }
-    }
-}
-
-/// The short hostname Erlang itself derives for a `-sname` node, derived the way
-/// [`beam_rt`]'s `dist::local_hostname` derives it: `/proc/sys/kernel/hostname`, then
-/// `$HOSTNAME`, then the literal `localhost`. Deliberately **not** `hostname(1)` — the
-/// harness never shells out to discover a fact the runtime reads from a file.
-fn local_hostname() -> String {
-    if let Ok(contents) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
-        let host = contents.trim();
-        if !host.is_empty() {
-            return host.to_string();
-        }
-    }
-    match std::env::var("HOSTNAME") {
-        Ok(host) if !host.is_empty() => host,
-        _ => "localhost".to_string(),
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// Unique names
-// ---------------------------------------------------------------------------------------
-
-/// A per-call counter, so the two tests (which cargo may run concurrently) never pick the
-/// same node names or cookie.
-static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-
-/// A process-unique, **lowercase-alphanumeric** node-name fragment: `-sname` lowercases and
-/// validates the name, and a leftover node from an earlier run must never collide.
-fn unique(tag: char) -> String {
-    format!(
-        "twovm{tag}{}{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
-/// A process-unique cookie (never the developer's `~/.erlang.cookie`: every node is given
-/// `-setcookie` explicitly).
-fn unique_cookie() -> String {
-    format!(
-        "ck{}{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
-// ---------------------------------------------------------------------------------------
-// The test's own scratch directory
-// ---------------------------------------------------------------------------------------
-
-/// A private directory under `$TMPDIR`, unique per call (label + pid + sequence), removed on
-/// drop.
-struct Scratch {
-    dir: PathBuf,
-}
-
-impl Scratch {
-    /// Creates `$TMPDIR/beam_rt_two_vm_<label>_<pid>_<n>`, or `None` after a loud skip.
-    fn new(label: &str) -> Option<Scratch> {
-        let dir = std::env::temp_dir().join(format!(
-            "beam_rt_two_vm_{label}_{}_{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::SeqCst)
-        ));
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => Some(Scratch { dir }),
-            Err(error) => {
-                support::skip_loudly(
-                    "dist_two_vm",
-                    &format!(
-                        "cannot create the scratch directory {}: {error}",
-                        dir.display()
-                    ),
-                );
-                None
-            }
-        }
+    /// The next runtime line starting with `prefix`.
+    fn runtime_line(&self, prefix: &str) -> String {
+        self.runtime
+            .wait_for(|line| line.starts_with(prefix), LINE_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the runtime never printed a `{prefix}…` line\n{}",
+                    self.diagnostics()
+                )
+            })
     }
 
-    /// The directory itself (the fixture's output directory and the children's cwd).
-    fn path(&self) -> &Path {
-        &self.dir
+    /// The next actor line starting with `prefix`.
+    fn actor_line(&self, prefix: &str) -> String {
+        self.actor
+            .wait_for(|line| line.starts_with(prefix), LINE_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the peer never printed a `{prefix}…` line\n{}",
+                    self.diagnostics()
+                )
+            })
     }
-}
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+    /// Asserts the next runtime line starting with `prefix` is exactly `expected`.
+    fn runtime_equals(&self, prefix: &str, expected: &str) {
+        let line = self.runtime_line(prefix);
+        assert_eq!(
+            line.trim(),
+            expected,
+            "the runtime's `{prefix}` line\n{}",
+            self.diagnostics()
+        );
     }
-}
 
-// ---------------------------------------------------------------------------------------
-// The private `epmd`
-// ---------------------------------------------------------------------------------------
+    /// Asserts the next actor line starting with `prefix` is exactly `expected`.
+    fn actor_equals(&self, prefix: &str, expected: &str) {
+        let line = self.actor_line(prefix);
+        assert_eq!(
+            line.trim(),
+            expected,
+            "the peer's `{prefix}` line\n{}",
+            self.diagnostics()
+        );
+    }
 
-/// A private `epmd` daemon on a private port, stopped on drop.
-///
-/// The port comes from an ephemeral bind that is released immediately, so it collides with
-/// no other test (nor with a developer's own `epmd` on 4369), and every child is handed
-/// `ERL_EPMD_PORT=<port>` so both VMs register with, and resolve through, *this* daemon.
-struct PrivateEpmd {
-    /// The port the daemon listens on.
-    port: u16,
-    /// `127.0.0.1:<port>` — the address every probe and lookup uses.
-    addr: String,
-    /// The resolved `kill`, used to reclaim the detached daemon.
-    kill: PathBuf,
-}
-
-impl PrivateEpmd {
-    /// Starts `epmd -daemon -port <free port>` under `setsid -w` with `ERL_EPMD_PORT` set
-    /// and its cwd inside `scratch`, then waits (bounded) for it to accept a connection.
-    ///
-    /// `None` after a loud skip when no free port is available, the daemon fails to start,
-    /// or it never accepts a connection.
-    fn start(epmd: &Path, setsid: &Path, kill: &Path, scratch: &Path) -> Option<PrivateEpmd> {
-        let Some(port) = free_port() else {
-            support::skip_loudly(
-                "dist_two_vm",
-                "no free loopback port for the private `epmd`",
-            );
-            return None;
-        };
-        let addr = format!("127.0.0.1:{port}");
-        let output = Command::new(setsid)
-            .arg("-w")
-            .arg(epmd)
-            .arg("-daemon")
-            .arg("-port")
-            .arg(port.to_string())
-            .env("ERL_EPMD_PORT", port.to_string())
-            .current_dir(scratch)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                support::skip_loudly(
-                    "dist_two_vm",
-                    &format!(
-                        "`{} -daemon -port {port}` exited with {}: {}",
-                        epmd.display(),
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                );
-                return None;
-            }
-            Err(error) => {
-                support::skip_loudly(
-                    "dist_two_vm",
-                    &format!("cannot run `{}`: {error}", epmd.display()),
-                );
-                return None;
-            }
-        }
-        let daemon = PrivateEpmd {
-            port,
-            addr,
-            kill: kill.to_path_buf(),
-        };
-        // `epmd -daemon` returns as soon as the daemon parent has forked, so readiness is
-        // "it accepts a connection" rather than "the command returned".
-        let deadline = Instant::now() + EPMD_START_TIMEOUT;
-        while Instant::now() < deadline {
-            if TcpStream::connect(&daemon.addr).is_ok() {
-                return Some(daemon);
-            }
-            thread::sleep(POLL);
-        }
-        support::skip_loudly(
-            "dist_two_vm",
-            &format!(
-                "the private `epmd` never accepted a connection on {} within {EPMD_START_TIMEOUT:?}",
-                daemon.addr
+    /// The rest of the next runtime line that starts with `prefix` (trimmed).
+    fn runtime_text(&self, prefix: &str) -> String {
+        let line = self.runtime_line(prefix);
+        match line.trim().strip_prefix(prefix) {
+            Some(rest) => rest.to_string(),
+            None => panic!(
+                "the runtime's `{prefix}` line was `{line}`\n{}",
+                self.diagnostics()
             ),
-        );
-        // A daemon that came up too late (or on a port we cannot reach) must still not be
-        // left running.
-        daemon.stop();
-        None
+        }
     }
-
-    /// Stops the daemon and proves its port is closed.
+    /// The rest of the next **peer** line that starts with `prefix` (trimmed).
     ///
-    /// A daemonized `epmd` detaches into its own session, so the group kill that reclaims
-    /// the VMs cannot reach it — and OTP's daemon refuses `KILL_REQ`/`STOP_REQ` from an
-    /// ordinary client (measured: `epmd -stop`/`-kill` answer `local epmd responded with
-    /// <>` unless it was started with `-relaxed_command_check`). So the daemon is found by
-    /// its **own argv** ([`epmd_pid_on_port`], which only our private `-port <port>` matches)
-    /// and signalled by pid.
-    fn stop(&self) {
-        // Best effort: have the daemon drop every registration first.
-        if let Ok(mut client) = beam_dist::epmd::connect(&self.addr) {
-            let _ = client.kill();
+    /// The peer mints facts of its own — a `REF`ERENCE it allocates, the pid *it* saw — and
+    /// the assertions then compare those very strings against what it prints later, so the
+    /// test never fabricates a value the peer did not report.
+    fn actor_text(&self, prefix: &str) -> String {
+        let line = self.actor_line(prefix);
+        match line.trim().strip_prefix(prefix) {
+            Some(rest) => rest.to_string(),
+            None => panic!(
+                "the peer's `{prefix}` line was `{line}`\n{}",
+                self.diagnostics()
+            ),
         }
-        let Some(pid) = epmd_pid_on_port(self.port) else {
-            if port_closed(&self.addr) {
-                return;
-            }
-            eprintln!(
-                "warning: `epmd` on {} accepts connections but no daemon with `-port {}` was \
-                 found in /proc to stop",
-                self.addr, self.port
-            );
-            return;
-        };
-        signal(&self.kill, &["-TERM", &pid.to_string()]);
-        if wait_for_port_closed(&self.addr, EPMD_STOP_TIMEOUT) {
-            return;
-        }
-        signal(&self.kill, &["-KILL", &pid.to_string()]);
-        if wait_for_port_closed(&self.addr, EPMD_STOP_TIMEOUT) {
-            return;
-        }
-        eprintln!(
-            "warning: the private `epmd` (pid {pid}) still holds {} after TERM and KILL",
-            self.addr
-        );
     }
-}
 
-impl Drop for PrivateEpmd {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// A free loopback port: bound as `:0`, read back, and released at once.
-fn free_port() -> Option<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
-    let port = listener.local_addr().ok()?.port();
-    drop(listener);
-    Some(port)
-}
-
-/// Whether nothing accepts connections on `addr` any more.
-fn port_closed(addr: &str) -> bool {
-    TcpStream::connect(addr).is_err()
-}
-
-/// Polls [`port_closed`] for up to `timeout`.
-fn wait_for_port_closed(addr: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if port_closed(addr) {
-            return true;
+    /// The peer's own rendering of a **local** pid this runtime printed.
+    ///
+    /// `erlang:pid_to_list/1` is `<node.number.serial>`: for a local pid the node part is
+    /// the channel number `0` (`<0.42.0>`), for the same pid seen from another node it is
+    /// that node's name (`<rustname@host.42.0>`). So the peer's text is ours with the `0`
+    /// replaced by the node name — **derived from the printed line**, never fabricated.
+    fn external_pid_text(&self, local_pid_text: &str, node: &str) -> String {
+        match local_pid_text.strip_prefix("<0.") {
+            Some(rest) => format!("<{node}.{rest}"),
+            None => panic!(
+                "the runtime printed a pid in an unexpected shape: {local_pid_text}\n{}",
+                self.diagnostics()
+            ),
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(POLL);
     }
-}
 
-/// The pid of the `epmd` daemon started with `-port <port>`, found by reading
-/// `/proc/<pid>/cmdline` — a plain filesystem scan, so only *this* run's private daemon (the
-/// only one whose argv carries the port) can match.
-fn epmd_pid_on_port(port: u16) -> Option<u32> {
-    let wanted = port.to_string();
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = raw
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+    /// Asserts `vm`'s transcript holds no line starting with any of `prefixes`.
+    fn assert_absent(&self, vm: &ChildVm, prefixes: &[&str], why: &str) {
+        let transcript = vm.transcript();
+        let found: Vec<&String> = transcript
+            .iter()
+            .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
             .collect();
-        let Some(program) = args.first() else {
-            continue;
-        };
-        let base = program.rsplit('/').next().unwrap_or(program);
-        if base != "epmd" {
-            continue;
-        }
-        if args
-            .windows(2)
-            .any(|pair| pair[0] == "-port" && pair[1] == wanted)
-        {
-            return Some(pid);
-        }
-    }
-    None
-}
-
-/// Runs `<kill> <args…>` with the **resolved** `kill` binary (never a shell builtin).
-fn signal(kill: &Path, args: &[&str]) {
-    let _ = Command::new(kill)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-// ---------------------------------------------------------------------------------------
-// A VM child in its own session
-// ---------------------------------------------------------------------------------------
-
-/// One VM (`beam_rt` or the system `erl`) running as `setsid -w <program> …`: its own
-/// session, hence its own process group, so its `SIGUSR1`/`SIGTERM` traffic can never reach
-/// the test binary or a sibling test.
-///
-/// The child's stdout is drained line by line into a channel (so a `READY`/`PONG`/`GOT` line
-/// can be awaited as it appears) *and* kept in a transcript for failure messages; stderr is
-/// collected the same way. Drop kills the **group** (`TERM`, a bounded grace, then `KILL`)
-/// and reaps, so nothing survives a failed assertion.
-struct ChildVm {
-    /// The exact command line, so a failure names what was run.
-    command: String,
-    /// The `setsid -w …` process — with `setsid`'s direct exec, the VM itself.
-    child: Child,
-    /// The process group to signal: this child's pid when `/proc/<pid>/stat` says it really
-    /// leads its own group (`setsid` execs directly, so it does), else `None`.
-    pgid: Option<u32>,
-    /// The resolved `kill` used for the group signals.
-    kill: PathBuf,
-    /// The child's stdout, one line at a time.
-    lines: Receiver<String>,
-    /// Every stdout line so far (failure diagnostics).
-    transcript: Arc<Mutex<Vec<String>>>,
-    /// Every stderr line so far (failure diagnostics).
-    stderr: Arc<Mutex<String>>,
-}
-
-impl ChildVm {
-    /// Spawns `setsid -w <program> <args…>` with `env` applied and `cwd` set, and starts the
-    /// two reader threads.
-    fn spawn(
-        label: &str,
-        setsid: &Path,
-        kill: &Path,
-        program: &Path,
-        args: &[String],
-        env: &[(&str, String)],
-        cwd: Option<&Path>,
-    ) -> std::io::Result<ChildVm> {
-        let mut command = Command::new(setsid);
-        command.arg("-w").arg(program);
-        command.args(args);
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let command_line = format!(
-            "setsid -w {} {}",
-            program.display(),
-            args.iter()
-                .map(|arg| if arg.contains(' ') || arg.contains('\n') {
-                    format!("{arg:?}")
-                } else {
-                    arg.clone()
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
+        assert!(
+            found.is_empty(),
+            "{why} — but the transcript holds {found:?}\n{}",
+            self.diagnostics()
         );
-        let mut child = command.spawn()?;
-        let pid = child.id();
-        // `setsid` calls `setsid(2)` and execs the program, so the child *is* the session and
-        // group leader; read the group back from /proc rather than assuming it (a `setsid`
-        // that forked would leave `pgid == pid` false, and then only the process itself is
-        // signalled — never an unrelated group).
-        let pgid = wait_for_group_leader(pid);
-        if pgid.is_none() {
-            eprintln!(
-                "warning: {label}: `setsid -w` did not leave pid {pid} as its own group leader; \
-                 the group signal will be skipped"
-            );
-        }
-        let stdout = child.stdout.take().expect("the child's stdout is piped");
-        let stderr_pipe = child.stderr.take().expect("the child's stderr is piped");
-
-        let transcript = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&transcript);
-        let (tx, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(mut buffer) = sink.lock() {
-                    buffer.push(line.clone());
-                }
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        thread::spawn(move || {
-            for line in BufReader::new(stderr_pipe).lines() {
-                let Ok(line) = line else { break };
-                match sink.lock() {
-                    Ok(mut buffer) => {
-                        buffer.push_str(&line);
-                        buffer.push('\n');
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(ChildVm {
-            command: command_line,
-            child,
-            pgid,
-            kill: kill.to_path_buf(),
-            lines,
-            transcript,
-            stderr,
-        })
     }
 
-    /// Waits (bounded) for a stdout line satisfying `pred`, discarding earlier lines.
-    ///
-    /// Returns `None` on the timeout, or when the child's stdout reached EOF first.
-    fn wait_for<F: Fn(&str) -> bool>(&self, pred: F, timeout: Duration) -> Option<String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            match self.lines.recv_timeout(remaining) {
-                Ok(line) if pred(&line) => return Some(line),
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return None,
-            }
-        }
-    }
-
-    /// Every stdout line so far (failure diagnostics).
-    fn transcript(&self) -> Vec<String> {
-        self.transcript
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_default()
-    }
-
-    /// The stderr collected so far (failure diagnostics).
-    fn stderr_text(&self) -> String {
-        self.stderr.lock().map(|text| text.clone()).unwrap_or_default()
-    }
-
-    /// Polls for the child's exit, bounded by `timeout`; the child is **reaped** when it has
-    /// exited.
-    fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) => {}
-                Err(_) => return None,
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(POLL);
-        }
-    }
-
-    /// Signals `signal` to this child's **process group** (a no-op when the group could not
-    /// be established; see [`ChildVm::pgid`]).
-    fn signal_group(&self, signal: &str) {
-        let Some(pgid) = self.pgid else { return };
-        let _ = Command::new(&self.kill)
-            .arg(signal)
-            .arg("--")
-            .arg(format!("-{pgid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    /// Terminates the whole group: `TERM`, a bounded grace, then `KILL`.
-    fn kill_group(&mut self) {
-        if self.wait_exit(Duration::ZERO).is_some() {
-            return;
-        }
-        self.signal_group("-TERM");
-        if self.wait_exit(KILL_GRACE).is_some() {
-            return;
-        }
-        self.signal_group("-KILL");
-        let _ = self.wait_exit(KILL_GRACE);
+    /// The closing assertions every session shares: the actor reported `ACTOR_DONE` and
+    /// halted 0, and the `run` action printed its `done` result and exited 0.
+    fn finish(mut self) {
+        let actor_done = self
+            .actor
+            .wait_for(|line| line.trim() == "ACTOR_DONE", LINE_TIMEOUT);
+        let actor_status = self.actor.wait_exit(EXIT_TIMEOUT);
+        let runtime_result = self
+            .runtime
+            .wait_for(|line| line.trim() == "done", LINE_TIMEOUT);
+        let runtime_status = self.runtime.wait_exit(EXIT_TIMEOUT);
+        let diagnostics = self.diagnostics();
+        assert!(
+            actor_done.is_some(),
+            "the peer never reported ACTOR_DONE\n{diagnostics}"
+        );
+        assert_eq!(
+            actor_status.and_then(|status| status.code()),
+            Some(0),
+            "the peer halted 0 after the session\n{diagnostics}"
+        );
+        assert!(
+            runtime_result.is_some(),
+            "the `run` action printed no `done` result\n{diagnostics}"
+        );
+        assert_eq!(
+            runtime_status.and_then(|status| status.code()),
+            Some(0),
+            "the `run` action exits 0 once the fixture returns\n{diagnostics}"
+        );
     }
 }
 
-impl Drop for ChildVm {
-    fn drop(&mut self) {
-        self.kill_group();
-        // Belt and braces: a child whose group could not be established is killed directly,
-        // and a child that already exited is reaped here.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+// ---------------------------------------------------------------------------------------
+// The distributed signal families, observed by the peer (contract A.5)
+// ---------------------------------------------------------------------------------------
 
-/// Polls `/proc/<pid>/stat` briefly for a process that really leads its own group, and
-/// answers that group id.
+/// **The peer links to our process and traps the exit our process dies with.**
 ///
-/// `setsid` execs the program it was given, so the child *is* the session leader and
-/// `pgrp == pid`; the poll exists only to let that change land after the spawn.
-fn wait_for_group_leader(pid: u32) -> Option<u32> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(pgid) = leader_pgid(pid) {
-            return Some(pgid);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
+/// The actor `link/1`s the victim *we* spawned (with `process_flag(trap_exit, true)`),
+/// waits for a barrier that proves our node recorded the `DOP_LINK`, then sends the victim
+/// `{die, boom}`. Our node must route a `DOP_EXIT` back over the **same** (peer-dialled)
+/// link, carrying the reason and our own pid, and the actor must receive
+/// `{'EXIT', Victim, boom}` with the very pid we printed.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_links_to_our_process_and_traps_our_exit() {
+    let Some(pair) = Pair::start("link", PEER_DRIVES_SPEC, "link_and_trap") else {
+        return; // every precondition already reported its loud skip
+    };
+    // The victim's pid, printed by **us** (a local pid, so `<0.number.serial>`).
+    let victim = pair.runtime_text("VICTIM ");
+    let victim_seen_from_peer = pair.external_pid_text(&victim, &pair.rust_node);
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The pid travelled to the peer as a term and renders as the peer's own view of it.
+    pair.actor_equals(
+        "VICTIM_SEEN ",
+        &format!("VICTIM_SEEN {victim_seen_from_peer}"),
+    );
+    pair.actor_equals("LINKED ", &format!("LINKED {victim_seen_from_peer}"));
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // The exit our node routed: the reason value, and the `{'EXIT', Pid, Reason}` whose
+    // pid is compared with `=:=` in the actor's own clause guard.
+    pair.actor_equals("EXIT_MATCH ", "EXIT_MATCH pid=true reason=boom");
+    pair.actor_equals(
+        "EXIT_TERM ",
+        &format!("EXIT_TERM {{'EXIT',{victim_seen_from_peer},boom}}"),
+    );
+    // Our own runtime saw the same victim die with the same reason (an independent,
+    // local witness that the peer's `NOEXIT`-style negative controls rest on).
+    pair.runtime_equals("VICTIM_DOWN ", "VICTIM_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
 }
 
-/// `pid`'s process group id when it leads that group, read from `/proc/<pid>/stat`
-/// (field 5, `pgrp`, after the parenthesised command that may itself contain spaces).
-fn leader_pgid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let close = stat.rfind(')')?;
-    let mut fields = stat[close + 1..].split_whitespace();
-    let _state = fields.next()?;
-    let _ppid = fields.next()?;
-    let pgrp: u32 = fields.next()?.parse().ok()?;
-    (pgrp == pid).then_some(pgrp)
+/// **The reason *term* survives, not merely the event**: the same link exit, with the
+/// victim dying of a compound reason (`{shutdown,{custom,7}}`) the actor chose.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_traps_our_exit_with_the_reason_term_it_asked_for() {
+    let Some(pair) = Pair::start("link_compound", PEER_DRIVES_SPEC, "link_and_trap_compound")
+    else {
+        return;
+    };
+    let victim = pair.runtime_text("VICTIM ");
+    let victim_seen_from_peer = pair.external_pid_text(&victim, &pair.rust_node);
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals(
+        "VICTIM_SEEN ",
+        &format!("VICTIM_SEEN {victim_seen_from_peer}"),
+    );
+    pair.actor_equals("LINKED ", &format!("LINKED {victim_seen_from_peer}"));
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    pair.actor_equals(
+        "EXIT_MATCH ",
+        "EXIT_MATCH pid=true reason={shutdown,{custom,7}}",
+    );
+    pair.actor_equals(
+        "EXIT_TERM ",
+        &format!("EXIT_TERM {{'EXIT',{victim_seen_from_peer},{{shutdown,{{custom,7}}}}}}"),
+    );
+    pair.runtime_equals("VICTIM_DOWN ", "VICTIM_DOWN {shutdown,{custom,7}}");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.finish();
+}
+
+/// **The negative control**: the actor `unlink/1`s the victim *before* it dies, so our
+/// node must deliver **no** exit signal at all.
+///
+/// The barrier is what makes this meaningful: same-link signals are applied in order, so
+/// the `{barrier_ack, …}` proves our node had already processed the `DOP_UNLINK_ID` when
+/// the victim died. The runtime's own `VICTIM_DOWN boom` proves the victim really did die
+/// during the actor's bounded wait — without it, "no exit arrived" would be vacuous.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered() {
+    let Some(pair) = Pair::start("unlink", PEER_DRIVES_SPEC, "link_then_unlink") else {
+        return;
+    };
+    let victim = pair.runtime_text("VICTIM ");
+    let victim_seen_from_peer = pair.external_pid_text(&victim, &pair.rust_node);
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals(
+        "VICTIM_SEEN ",
+        &format!("VICTIM_SEEN {victim_seen_from_peer}"),
+    );
+    pair.actor_equals("LINKED ", &format!("LINKED {victim_seen_from_peer}"));
+    pair.actor_equals("UNLINKED", "UNLINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // The bounded wait printed its verdict: nothing arrived.
+    pair.actor_equals("NOEXIT", "NOEXIT");
+    // The victim died — our own local monitor is the witness — and nothing was routed.
+    pair.runtime_equals("VICTIM_DOWN ", "VICTIM_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW no_exit");
+    pair.assert_absent(
+        &pair.actor,
+        &["EXIT_TERM", "EXIT_MATCH", "UNEXPECTED_EXIT", "EXIT_TIMEOUT"],
+        "the peer unlinked before the victim died, so no exit signal may reach it",
+    );
+    pair.actor_equals("BYE ", "BYE done");
+    pair.finish();
+}
+
+/// **The peer monitors our process and receives the peer-minted `DOWN`.**
+///
+/// The actor arms `erlang:monitor(process, Victim)`, prints the reference it minted, then
+/// dies the victim. Our node must route a `DOP_MONITOR_P_EXIT` that carries **that**
+/// reference (the actor's receive clause binds the same `Ref`, so any other reference
+/// falls through to its catch-all) together with our pid and the reason.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down() {
+    let Some(pair) = Pair::start("monitor", PEER_DRIVES_SPEC, "monitor_victim") else {
+        return;
+    };
+    let victim = pair.runtime_text("VICTIM ");
+    let victim_seen_from_peer = pair.external_pid_text(&victim, &pair.rust_node);
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals(
+        "VICTIM_SEEN ",
+        &format!("VICTIM_SEEN {victim_seen_from_peer}"),
+    );
+    // The reference the **peer** minted, printed by the peer.
+    let reference = pair.actor_text("REF ");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    pair.actor_equals("DOWN_MATCH ", "DOWN_MATCH ref=bound pid=true reason=boom");
+    // The whole `{'DOWN', …}` term: the reference and the pid are the very ones already
+    // printed above, and the reason is the one the actor chose.
+    pair.actor_equals(
+        "DOWN_TERM ",
+        &format!("DOWN_TERM {{'DOWN',{reference},process,{victim_seen_from_peer},boom}}"),
+    );
+    pair.runtime_equals("VICTIM_DOWN ", "VICTIM_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.assert_absent(
+        &pair.actor,
+        &["DOWN_OTHER", "DOWN_TIMEOUT", "UNEXPECTED_DOWN"],
+        "the peer's monitor matched its own reference",
+    );
+    pair.actor_equals("BYE ", "BYE done");
+    pair.finish();
+}
+
+/// **The other monitor control**: the actor `demonitor(Ref, [flush])`s *before* the
+/// victim dies, so no `DOWN` may arrive at all.
+///
+/// As in the unlink case the barrier carries the meaning: our node had already processed
+/// the `DOP_DEMONITOR_P` when the victim died, and the runtime's own `VICTIM_DOWN boom`
+/// shows that death really happened inside the actor's bounded wait.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peer_demonitors_before_our_death_so_no_down_arrives() {
+    let Some(pair) = Pair::start("demonitor", PEER_DRIVES_SPEC, "monitor_then_demonitor") else {
+        return;
+    };
+    let victim = pair.runtime_text("VICTIM ");
+    let victim_seen_from_peer = pair.external_pid_text(&victim, &pair.rust_node);
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals(
+        "VICTIM_SEEN ",
+        &format!("VICTIM_SEEN {victim_seen_from_peer}"),
+    );
+    // The reference the peer minted (and then dropped), printed by the peer itself.
+    let reference = pair.actor_text("REF ");
+    pair.actor_equals("DEMONITORED", "DEMONITORED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    pair.actor_equals("NODOWN", "NODOWN");
+    pair.runtime_equals("VICTIM_DOWN ", "VICTIM_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW no_down");
+    // The peer's reference occurs exactly once in its whole transcript: its own `REF` line.
+    // A `{'DOWN', …}` naming it would be a second occurrence, so this catches a DOWN printed
+    // in any shape at all, not only the shapes `assert_absent` lists.
+    let occurrences = pair
+        .actor
+        .transcript()
+        .iter()
+        .filter(|line| line.contains(&reference))
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "the peer's reference {reference} must appear only in its own `REF` line, never in a DOWN\n{}",
+        pair.diagnostics()
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["DOWN_TERM", "DOWN_MATCH", "UNEXPECTED_DOWN", "DOWN_TIMEOUT"],
+        "the peer demonstrated its monitor before the victim died, so no DOWN may arrive",
+    );
+    pair.actor_equals("BYE ", "BYE done");
+    pair.finish();
+}
+
+/// **Our pid survives the round trip**: the responder sends `self()` to the peer, the peer
+/// echoes the *same term* back, and the responder compares it with `=:=`.
+///
+/// `IDENTITY true` is the assertion; `SELF`/`ECHO`/`ECHO_NODE` and the peer's `ECHOED_IN`
+/// make a mismatch diagnosable (a pid that came back as a *different* term would print
+/// different text, and one that lost its internal form here would fail the comparison
+/// before it could be printed at all).
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn our_pid_survives_a_round_trip_through_a_real_erl_peer() {
+    let Some(pair) = Pair::start("identity", IDENTITY_SPEC, "echo_identity") else {
+        return;
+    };
+    let me = pair.runtime_text("SELF ");
+
+    pair.runtime_equals("SELF_NODE ", &format!("SELF_NODE {}", pair.rust_node));
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The pid term the peer received is the one we print, rendered from the peer's side.
+    pair.actor_equals(
+        "ECHOED_IN ",
+        &format!("ECHOED_IN {}", pair.external_pid_text(&me, &pair.rust_node)),
+    );
+    pair.actor_equals("ECHO_SENT", "ECHO_SENT");
+    // ..., and what came back is `=:=` our own pid, in our own rendering.
+    pair.runtime_equals("IDENTITY ", "IDENTITY true");
+    pair.runtime_equals("ECHO ", &format!("ECHO {me}"));
+    pair.runtime_equals("ECHO_NODE ", &format!("ECHO_NODE {}", pair.rust_node));
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
 }
