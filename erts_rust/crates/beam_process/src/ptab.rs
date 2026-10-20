@@ -519,7 +519,9 @@ pub struct ProcessTable {
     /// Per local process: the **incoming** remote monitors — remote processes watching it
     /// (`DOP_MONITOR_P`). The mirror of [`ProcessTable::remote_monitors`], kept in a side table
     /// rather than in the frozen [`MonitoredBy`](crate::monitor::MonitoredBy) record set (see
-    /// [`RemoteWatcher`]). An entry dies with the watched process
+    /// [`RemoteWatcher`]). An entry is resolved when it is demonitored
+    /// ([`ProcessTable::demonitor_from_remote`]) or when the watched process dies, whose
+    /// termination routes one [`DistSignal::MonitorExit`] per record
     /// ([`ProcessTable::terminate_into`]).
     remote_watchers: HashMap<ProcessId, Vec<RemoteWatcher>>,
     /// Per local process: its **group leader**, as a [`PidTarget`] so a leader on another node
@@ -2264,9 +2266,9 @@ impl ProcessTable {
     /// per-peer signals are generated the death has *already happened*. Every per-peer step is
     /// therefore **best-effort**: a failure to queue a local `{'EXIT', …}`/`{'DOWN', …}` (an
     /// unreachable receiver heap, or a relocation-exempt / host-gate-declined receiver refusing to
-    /// grow) or to route a
-    /// remote [`DistSignal::Exit`] is **logged** — never silently swallowed — and the cascade
-    /// **continues** to the remaining peers, so the process-death observer (step 5) and the port
+    /// grow) or to route a remote [`DistSignal::Exit`] / [`DistSignal::MonitorExit`] is
+    /// **logged** — never silently swallowed — and the cascade **continues** to the remaining
+    /// peers, so the process-death observer (step 5) and the port
     /// monitor cleanup (step 6) always run. Aborting mid-cascade instead would leave later peers
     /// unsignalled, the observer unrun (leaking the host resources it releases, e.g. ETS tables
     /// owned by the pid) and the port table holding dangling incoming `PortMonitor` entries.
@@ -2472,15 +2474,41 @@ impl ProcessTable {
         // Outgoing *remote* monitors die with the watcher: the remote node will simply
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
-        // The dying process's **incoming** remote watchers and its group-leader entry go with
-        // it: neither can outlive its subject, and both are keyed by the local pid (whose slot
-        // serial `take` has already bumped, so a stale entry could never be observed again).
+        // The dying process's **incoming** remote watchers are the mirror image: each of them is
+        // a remote process holding an `erlang:monitor(process, LocalPid)`, so every one must be
+        // told the process is gone — the C's `erts_dsig_send_m_exit`
+        // (`{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}`, `dist.c:1497`),
+        // which is what makes the peer's `{'DOWN', Ref, process, Pid, Reason}` arrive at all.
+        // One signal per recorded watcher (the table already de-duplicated by the whole
+        // reference identity, [`RemoteWatcherRef`]) and the reference goes back in the spelling
+        // it was recorded in: a peer that minted its own reference matches its DOWN set on
+        // *that* reference, which has no faithful `u64` image.
         //
-        // A **gap**, recorded in `../CONTEXT.md` Known Issues: a local process with remote
-        // watchers should tell each of them it is gone (`DOP_MONITOR_P_EXIT`), and the outgoing
-        // `DistSignal` enum has no variant for it — so the records are dropped without
-        // notifying them here.
-        self.remote_watchers.remove(&pid);
+        // This runs before `drop(process)` for the same reason the remote-link step above does:
+        // `reason` may live in the dying heap the router reads. Like that step it is
+        // **best-effort** (see the fn docs) — a signal for a node no live link reaches is the
+        // router's typed error, dropped-and-logged exactly as ERTS's `erts_dsig_drop` drops an
+        // undeliverable control signal, so the remaining watchers are still routed. The
+        // `remote_watchers` entry was drained, so no record is left behind.
+        for watcher in self.remote_watchers.remove(&pid).unwrap_or_default() {
+            if let Err(failure) = self.route(DistSignal::MonitorExit {
+                watched: pid,
+                watcher: watcher.watcher,
+                reference: watcher.reference,
+                reason,
+            }) {
+                beam_common::beam_error!(
+                    "beam_process: dropping remote monitor-exit signal {:?} -> {:?}: {:?}; \
+                     termination continues",
+                    pid,
+                    watcher.watcher,
+                    failure
+                );
+            }
+        }
+        // The dying process's group-leader entry goes with it too: it cannot outlive its
+        // subject, and it is keyed by the local pid (whose slot serial `take` has already
+        // bumped, so a stale entry could never be observed again).
         self.group_leaders.remove(&pid);
         // 5. Notify the process-death observer exactly once, now that the death has been
         //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
