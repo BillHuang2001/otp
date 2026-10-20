@@ -256,6 +256,18 @@ impl Collector {
         // mature garbage the minors since the last fullsweep promoted, which is why this rule
         // only ever keeps or shrinks: the growth decision belongs to the fullsweep, which
         // measures the live set exactly.
+        if std::env::var_os("BEAM_GC_TRACE").is_some() {
+            eprintln!(
+                "TRACE minor: capacity={} young_used={} young_live_copied={} mature_used={} \
+                 target(young_live)={} target(mature)={}",
+                self.nursery.capacity_words(),
+                needed,
+                stats.words_copied,
+                self.mature.used_words(),
+                self.policy.young_target_words(stats.words_copied),
+                self.policy.young_target_words(self.mature.used_words()),
+            );
+        }
         self.nursery
             .collapse(&self.policy, self.mature.used_words())?;
         Ok(stats)
