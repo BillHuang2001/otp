@@ -32,7 +32,7 @@
 //! **partially routed**; and the distributed-spawn family plus `Delivery::Other` are
 //! **not routed**, reported as the honest [`DeliveryOutcome::Unsupported`].
 
-use beam_codec::term::external_ref_parts;
+use beam_codec::{ref_numbers_to_id, term::external_ref_parts};
 use beam_common::{BeamError, Result};
 use beam_dist::{AltactSigFlags, Delivery, DeliveryOutcome, InboundSink};
 use beam_message::{CopyContext, OffHeapTable};
@@ -288,7 +288,8 @@ impl InboundSink for LocalDeliverySink<'_> {
             // `DOP_PAYLOAD_MONITOR_P_EXIT`, `dist.c:2700-2714`). This is the **inverse**
             // of a monitor *this* node initiated: the reference on the wire is the one
             // `dist_client` put into the outgoing `DOP_MONITOR_P` (an external reference
-            // on **our** node, `{our_node, our_creation, [0, id >> 32, id]}`), which the
+            // on **our** node, `{our_node, our_creation, canonical ids}` — the shared
+            // `beam_codec::ref_id_to_numbers` word order), which the
             // peer echoes back verbatim. `wire_monitor_ref_id` therefore recovers the
             // very `MonitorRef` the outgoing record was keyed by, so the recorded
             // `RemoteMonitor` is found and the DOWN matches its monitor exactly.
@@ -920,19 +921,23 @@ impl LocalDeliverySink<'_> {
 
     /// Recovers the `MonitorRef` **id** of a reference that came back off the wire and
     /// was minted by *this* runtime — the exact inverse of the pack
-    /// [`crate::dist_client`]'s `monitor_ref_term` puts on the wire.
+    /// [`crate::dist_client`]'s `monitor_ref_term` puts on the wire, both sides calling the
+    /// shared authority [`beam_codec::ref_id_to_numbers`] /
+    /// [`beam_codec::ref_numbers_to_id`].
     ///
     /// A monitor this node initiates on a remote process records a
     /// [`RemoteMonitor`](beam_process::RemoteMonitor) under a `MonitorRef` and routes a
-    /// `DOP_MONITOR_P` whose `Ref` element is `{our_node, our_creation, [0, id >> 32,
-    /// id]}` (three 32-bit words, most significant first, leading word zeroed). The peer
+    /// `DOP_MONITOR_P` whose `Ref` element is `{our_node, our_creation, canonical ids}` —
+    /// the three 32-bit numbers of [`beam_codec::ref_id_to_numbers`] (the C's
+    /// `erts_set_ref_numbers` word order, `ERTS_REF_NUMBERS` of them). The peer
     /// echoes that identical reference image in the `DOP_MONITOR_P_EXIT` it sends when the
     /// monitored process dies, and the control-message decoder materialises it as an
     /// **external** reference (`beam_dist::control::decode_control` installs no
     /// local-node identity, so the codec's local-node demotion never runs).
     ///
     /// This undoes that packing exactly, and only for a reference this node minted: the
-    /// node and creation must be **this** node's and the leading id word zero. Anything
+    /// node and creation must be **this** node's — a check on the node/creation pair, the
+    /// numbers themselves coming from the shared unpacker. Anything
     /// else — in particular a reference a **peer** minted, whose node is not ours — is
     /// `None`, never a guessed id: such an identity has no faithful `u64` image (see the
     /// `Monitor`/`Demonitor` arm).
@@ -964,20 +969,6 @@ fn receipt(result: Result<()>) -> Result<DeliveryOutcome> {
         Err(BeamError::TermNotFound) => Ok(DeliveryOutcome::NoSuchProcess),
         Err(err) => Err(err),
     }
-}
-
-/// Unpacks the wire numbers of a reference image into the 60-bit id the M1 internal
-/// reference stores (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159`) — the inverse of
-/// the pack `crate::dist_client`'s `monitor_ref_term` writes, both mirroring
-/// `beam_codec`'s crate-internal `ref_wire` (the authority for the mapping).
-///
-/// A short image is zero-padded, a longer one contributes its first three numbers, and
-/// `num[0]`/`num[1]` are masked exactly as the C masks them (`REF_MASK`/`REF1_NUM_MASK`).
-fn ref_numbers_to_id(numbers: &[u32]) -> u64 {
-    const REF_MASK: u32 = (1 << 18) - 1;
-    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
-    let at = |index: usize| u64::from(numbers.get(index).copied().unwrap_or(0));
-    (at(0) & u64::from(REF_MASK)) | (at(1) & u64::from(REF1_NUM_MASK)) | (at(2) << 32)
 }
 
 /// The remote pid an **external** pid thing names, or `None` for anything else.

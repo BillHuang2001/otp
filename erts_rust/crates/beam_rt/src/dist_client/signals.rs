@@ -25,7 +25,7 @@
 //! this file only writes a signal's terms onto the client's stable scratch heap.
 
 use beam_alloc::Heap;
-use beam_codec::term::make_external_ref;
+use beam_codec::{ref_id_to_numbers, term::make_external_ref};
 use beam_common::{BeamError, Result};
 use beam_process::{DistSignal, MonitorRef};
 use beam_term::prelude::{try_make_small, Eterm};
@@ -64,29 +64,19 @@ pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
 /// (`beam_dist/tests/live_interop.rs:1063`) sends exactly this external form to a real
 /// `erl` peer, which accepts it and echoes it back in `DOP_MONITOR_P_EXIT`.
 ///
-/// The three 32-bit identifier words carry the reference id, most significant first —
-/// the same word count OTP uses for a distribution reference (`ERTS_REF_NUMBERS`).
+/// The three 32-bit identifier words are the reference id's **canonical wire image**:
+/// [`beam_codec::ref_id_to_numbers`] (the shared `beam_codec::ref_wire` authority, the
+/// C's `erts_set_ref_numbers` pack, `ERTS_REF_NUMBERS` words). Using that one mapping —
+/// never a crate-local bit layout — is what makes our own reference come back as the
+/// *same* id once the inbound decode demotes it
+/// (`LocalDeliverySink::wire_monitor_ref_id`).
 pub(super) fn monitor_ref_term(
     heap: &mut Heap,
     reference: MonitorRef,
     node: Eterm,
     creation: u32,
 ) -> Result<Eterm> {
-    let id = reference.id();
-    // The C's `erts_set_ref_numbers` pack (`erl_bif_unique.h:115-134`): the 18-bit
-    // reference number in `num[0]`, its bits 18..31 in `num[1]`, the rest in `num[2]` —
-    // the *same* mapping `beam_codec`'s (crate-internal) `ref_wire::ref_id_to_numbers`
-    // uses for an internal reference's wire image, and therefore the mapping an inbound
-    // decode with this node's `LocalIdentity` unpacks back
-    // (`LocalDeliverySink::wire_monitor_ref_id`). Packing the id differently here would
-    // make our own reference come back as a *different* id once the decode demotes it.
-    const REF_MASK: u32 = (1 << 18) - 1;
-    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
-    let ids = [
-        (id & u64::from(REF_MASK)) as u32,
-        (id & u64::from(REF1_NUM_MASK)) as u32,
-        (id >> 32) as u32,
-    ];
+    let ids = ref_id_to_numbers(reference.id());
     make_external_ref(heap, node, &ids, creation)
 }
 
