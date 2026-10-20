@@ -320,6 +320,14 @@ pub enum Expr {
         name: Option<String>,
         /// The clauses.
         clauses: Vec<FunClause>,
+        /// The closure's **own source text**, sliced out of the `-eval` expression verbatim:
+        /// everything from its `fun` keyword through its matching `end`.
+        ///
+        /// It is what [`crate::eval::compile`] embeds in a synthetic module so the Erlang
+        /// compiler — not a hand-written printer — derives the closure's free variables, its
+        /// self-recursion name and its nested funs. `None` when the parser could not place the
+        /// token span (only a hand-built `Expr`, never [`crate::eval::parse`]'s output).
+        source: Option<String>,
     },
 
     /// `[Template || Quals]`

@@ -470,6 +470,36 @@ impl RuntimeContext<'_> {
                 args,
             );
         }
+        // A closure this evaluator built has the tree walker for a continuation, so a spawned
+        // child could neither block in a bare `receive` nor survive a call that parks. When the
+        // closure's own source text was recorded, `crate::eval::compile` turns it into a real
+        // module and the child becomes an ordinary `ProcessEntry::Export` — a real engine
+        // machine that parks and resumes like any other. Every failure declines and the
+        // tree-walking entry below is taken, so this is never a wrong value.
+        //
+        // The compile itself is driven on this context, which owns the process table and may
+        // pump the scheduler, so the compiler's own file/io round trips are the ordinary nested
+        // module call. The **in-slice** arm above deliberately does not attempt it: re-entering
+        // the scheduler from inside a running engine is forbidden, so a spawn made from loaded
+        // code keeps the tree-walking entry.
+        if let Some(compiled) = crate::eval::compile::entry_for(self, fun, &args) {
+            let call_args = compiled.arguments(&args);
+            // `entry_for` already checked the closure's arity against `args`; this is the
+            // cross-check that the generated `run/<captures + arity>` is the shape the argument
+            // list has, so the child can never start at an entry of another arity.
+            if call_args.len() as u32 == compiled.arity {
+                return Ok(self
+                    .runtime
+                    .spawn_process_with_policy(
+                        &compiled.module,
+                        crate::eval::compile::ENTRY_FUNCTION,
+                        call_args,
+                        policy,
+                        priority,
+                    )?
+                    .to_eterm());
+            }
+        }
         Ok(self
             .runtime
             .spawn_fun_process_with_policy(fun, args, policy, priority)?

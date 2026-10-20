@@ -98,10 +98,10 @@ mod ast;
 mod bits;
 mod bits_decode;
 mod bits_match;
+pub(crate) mod compile;
 mod parse;
 pub(crate) mod reclaim;
 pub(crate) mod scratch;
-
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -209,6 +209,14 @@ pub(crate) struct FunBody {
     kind: FunKind,
     /// The variables captured when the fun was created.
     env: Env,
+    /// The closure's **own source text** — everything from its `fun` keyword through its
+    /// matching `end`, sliced out of the `-eval` expression by the parser
+    /// ([`ast::Expr::Fun`]'s `source`).
+    ///
+    /// It exists for [`compile`]: a spawned closure is compiled into a synthetic module from
+    /// this text, so the Erlang compiler derives its free variables and nested funs. `None` for
+    /// a body the parser could not span — such a closure keeps the tree-walking route.
+    source: Option<String>,
 }
 
 /// The kind of fun this evaluator builds.
@@ -659,7 +667,11 @@ impl Evaluator<'_, '_> {
                 name,
                 arity,
             } => self.fun_ref(module.as_deref(), name, *arity),
-            Expr::Fun { name, clauses } => self.fun_literal(name.as_deref(), clauses, env),
+            Expr::Fun {
+                name,
+                clauses,
+                source,
+            } => self.fun_literal(name.as_deref(), clauses, source.as_deref(), env),
 
             Expr::ListComp(template, quals) => {
                 self.comprehension(CompTemplate::List(template), quals, env)
@@ -1854,6 +1866,7 @@ impl Evaluator<'_, '_> {
         &mut self,
         name: Option<&str>,
         clauses: &[ast::FunClause],
+        source: Option<&str>,
         env: &mut Env,
     ) -> EResult<Eterm> {
         let arity = clauses.first().map_or(0, |clause| clause.params.len()) as u32;
@@ -1863,6 +1876,7 @@ impl Evaluator<'_, '_> {
                 clauses: clauses.to_vec(),
             },
             env: env.clone(),
+            source: source.map(str::to_string),
         };
         self.register_fun(body, arity)
     }

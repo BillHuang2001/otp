@@ -67,6 +67,9 @@ const PUNCT: &[&str] = &[
     "!",
 ];
 
+/// A token's span in the source: `(start, end)` **character** offsets, `end` exclusive.
+type Span = (usize, usize);
+
 /// The scanning pass over the source text.
 struct Lexer<'a> {
     /// The original source (for diagnostics).
@@ -129,28 +132,40 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scans the whole input into a token vector.
-    fn tokenize(mut self) -> Result<Vec<Tok>> {
+    ///
+    /// The second half of the answer is each token's **character span** in `src` (`start` and
+    /// exclusive `end`, both indices into the source's `char` sequence) and is index-parallel
+    /// with the token vector. The spans are what lets a construct's source text be sliced back
+    /// out verbatim — the `fun … end` expression's own text is embedded in a synthetic module by
+    /// [`crate::eval::compile`].
+    fn tokenize(mut self) -> Result<(Vec<Tok>, Vec<Span>)> {
         let mut out = Vec::new();
+        let mut spans = Vec::new();
         loop {
             self.skip_trivia();
-            let Some(c) = self.peek() else { return Ok(out) };
-            if let Some(tok) = self.punct() {
-                out.push(tok);
+            let start = self.pos;
+            let Some(c) = self.peek() else {
+                return Ok((out, spans));
+            };
+            let tok = if let Some(tok) = self.punct() {
+                tok
             } else if c.is_ascii_digit() {
-                out.push(self.number()?);
+                self.number()?
             } else if c == '$' {
                 self.pos += 1;
                 let code = self.char_code()?;
-                out.push(Tok::Int(i128::from(code)));
+                Tok::Int(i128::from(code))
             } else if c == '"' {
-                out.push(Tok::Str(self.quoted('"')?));
+                Tok::Str(self.quoted('"')?)
             } else if c == '\'' {
-                out.push(Tok::QuotedAtom(self.quoted('\'')?));
+                Tok::QuotedAtom(self.quoted('\'')?)
             } else if c.is_alphabetic() || c == '_' {
-                out.push(self.word()?);
+                self.word()?
             } else {
                 return Err(self.err(&format!("unexpected character {c:?}")));
-            }
+            };
+            out.push(tok);
+            spans.push((start, self.pos));
         }
     }
 
@@ -398,6 +413,10 @@ struct Parser<'a> {
     src: &'a str,
     /// The tokens.
     toks: Vec<Tok>,
+    /// Each token's character span, index-parallel with [`Parser::toks`].
+    spans: Vec<Span>,
+    /// The source as characters, so a span indexes and slices cleanly.
+    chars: Vec<char>,
     /// The current token offset.
     pos: usize,
     /// Whether `/` must be read as a binary segment specifier, not division.
@@ -414,10 +433,13 @@ struct Parser<'a> {
 /// [`BeamError`](beam_common::BeamError) carrying a parse diagnostic for anything
 /// outside the expression grammar (a capability gap, exit 3 in the CLI).
 pub fn parse(src: &str) -> Result<Expr> {
-    let toks = Lexer::new(src).tokenize()?;
+    let (toks, spans) = Lexer::new(src).tokenize()?;
+    let chars: Vec<char> = src.chars().collect();
     let mut parser = Parser {
         src,
         toks,
+        spans,
+        chars,
         pos: 0,
         in_segment: false,
         no_remote: false,
@@ -1094,27 +1116,57 @@ impl<'a> Parser<'a> {
 
     /// `fun …`; `fun` was already consumed.
     fn parse_fun(&mut self) -> Result<Expr> {
+        // The `fun` keyword is the token just consumed, so its span marks the start of the
+        // closure's own source text (see [`Parser::fun_expr`]).
+        let fun_token = self.pos.checked_sub(1);
         match self.peek().cloned() {
             Some(Tok::Punct("(")) => {
                 self.pos += 1;
                 let clauses = self.parse_fun_clauses()?;
-                Ok(Expr::Fun {
-                    name: None,
-                    clauses,
-                })
+                Ok(self.fun_expr(None, clauses, fun_token))
             }
             Some(Tok::Var(name)) if self.is_punct_at(1, "(") => {
                 self.pos += 2;
                 let clauses = self.parse_fun_clauses()?;
-                Ok(Expr::Fun {
-                    name: Some(name),
-                    clauses,
-                })
+                Ok(self.fun_expr(Some(name), clauses, fun_token))
             }
-            Some(Tok::Atom(name)) => self.parse_fun_named(name, false),
-            Some(Tok::QuotedAtom(name)) => self.parse_fun_named(name, true),
+            Some(Tok::Atom(name)) => self.parse_fun_named(name, false, fun_token),
+            Some(Tok::QuotedAtom(name)) => self.parse_fun_named(name, true, fun_token),
             other => Err(self.err(&format!("malformed fun expression: {other:?}"))),
         }
+    }
+
+    /// The [`Expr::Fun`] for a clause list `parse_fun_clauses` just finished, carrying the
+    /// closure's **own source text**.
+    ///
+    /// The text runs from the `fun` keyword (`fun_token`'s span) through the `end` token the
+    /// clause list consumed and which is therefore the previous token. It is sliced out of the
+    /// original expression rather than printed from the tree, so the Erlang compiler that
+    /// [`crate::eval::compile`] hands it to derives the closure's free variables, self-recursion
+    /// name and nested funs from the *author's* text. A span that cannot be resolved leaves
+    /// `source` as `None`, and the closure keeps the tree-walking route.
+    fn fun_expr(
+        &self,
+        name: Option<String>,
+        clauses: Vec<FunClause>,
+        fun_token: Option<usize>,
+    ) -> Expr {
+        let source = fun_token
+            .zip(self.pos.checked_sub(1))
+            .and_then(|(first, last)| self.source_text(first, last));
+        Expr::Fun {
+            name,
+            clauses,
+            source,
+        }
+    }
+
+    /// The source text of the (inclusive) token range `first..=last`, or `None` when either
+    /// token index is out of bounds.
+    fn source_text(&self, first: usize, last: usize) -> Option<String> {
+        let start = self.spans.get(first)?.0;
+        let end = self.spans.get(last)?.1;
+        Some(self.chars.get(start..end)?.iter().collect())
     }
 
     /// The `fun Name/Arity` / `fun Module:Name/Arity` / named-`fun` continuation after
@@ -1123,7 +1175,7 @@ impl<'a> Parser<'a> {
     /// `quoted` marks a quoted-atom name (`fun 'foo'/0`, `fun 'erlang':'+'/2`). Erlang
     /// requires the *named*-fun form's name to be a **variable**, so a quoted atom
     /// followed by `(` (`fun 'foo'(X) -> X end`) is a syntax error.
-    fn parse_fun_named(&mut self, name: String, quoted: bool) -> Result<Expr> {
+    fn parse_fun_named(&mut self, name: String, quoted: bool, fun_token: Option<usize>) -> Result<Expr> {
         self.pos += 1;
         if self.eat_punct("/") {
             let arity = self.expect_int()?;
@@ -1147,10 +1199,7 @@ impl<'a> Parser<'a> {
         }
         if !quoted && self.eat_punct("(") {
             let clauses = self.parse_fun_clauses()?;
-            return Ok(Expr::Fun {
-                name: Some(name),
-                clauses,
-            });
+            return Ok(self.fun_expr(Some(name), clauses, fun_token));
         }
         Err(self.err("malformed fun expression"))
     }

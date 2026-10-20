@@ -74,6 +74,7 @@ use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NodeName, NONODE_NAME};
 use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
+use crate::eval::compile::CompiledClosure;
 use crate::eval::FunBody;
 use crate::format;
 use crate::hasher::{FastHashMap, FastHashSet};
@@ -772,6 +773,18 @@ pub struct Runtime {
     /// the body here; the store is append-only, so an index is stable for the runtime's
     /// lifetime.
     pub(crate) eval_closures: Vec<Rc<FunBody>>,
+    /// The **compiled** form of an `-eval` closure, keyed by that same closure index.
+    ///
+    /// A closure `erlang:spawn/1` starts cannot block: the tree walker's continuation is the
+    /// native Rust stack. [`crate::eval::compile`] therefore compiles such a closure's own
+    /// source text into a synthetic module (`beam_rt_eval_fun_<index>`) and the child becomes a
+    /// real `ProcessEntry::Export`, so the engine parks and resumes it like any other process.
+    ///
+    /// The value is the `Option` **including a decline**: a closure with no recorded source
+    /// text, or one the compiler rejects, must not be re-compiled on every spawn — a decline
+    /// simply keeps the tree-walking entry and its typed gap. The key is the closure's index in
+    /// [`Runtime::eval_closures`], which is append-only, so a hit is always this closure's.
+    pub(crate) eval_compiled: FastHashMap<u32, Option<CompiledClosure>>,
     /// The pending **timer deadlines** (`erlang:send_after/3`).
     ///
     /// A min-heap of absolute deadlines that only the scheduler loop advances: a pass fires
@@ -1355,6 +1368,7 @@ impl Runtime {
             monitor_nodes: FastHashMap::default(),
             node_monitors: FastHashMap::default(),
             eval_closures: Vec::new(),
+            eval_compiled: FastHashMap::default(),
             timers: Timers::new(),
             timer_wake_targets: TimerWakes::default(),
             run_wake_pid: None,
