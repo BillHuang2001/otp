@@ -57,18 +57,18 @@ use beam_gc::prelude::{
     MatureSource, IMMIX_BREAK_EVEN_WORDS, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
-use beam_term::prelude::{is_boxed, make_small, ptr_val, size_object, AtomTable, Eterm};
+use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
 // ---------------------------------------------------------------------------
 // The process-shaped workload
 // ---------------------------------------------------------------------------
 
-/// The nursery the workload allocates in, in words — and the policy's `min_heap_words`, so it is
-/// also the **initial heap** the collector is born with (the C's spawn rule
-/// `sz = heap_need < p->min_heap_size ? p->min_heap_size : …`, `erl_process.c:12586-12592`).
+/// The nursery the workload allocates in, in words — the policy's `min_heap_words` and
+/// `initial_young_words`, so it is also the **initial heap** the collector is born with (the C's
+/// spawn rule `sz = heap_need < p->min_heap_size ? p->min_heap_size : …`,
+/// `erl_process.c:12586-12592`), *and* the live set's own
+/// [`young_target_words`](HeapPolicy::young_target_words), so no collection ever re-sizes it.
 /// A curated growth-table size (the `+hms`-style floor must be a fixed point,
-/// `erl_process.c:12575`), big enough that its own occupancy keeps a fullsweep's `need_after`
-/// above `MATURE_WORDS / 4` (see [`workload_policy`]), and small enough that a *whole* nursery of
-/// live terms still fits the mature generation's lines.
+/// `erl_process.c:12575`). See [`RESERVE_WORDS`] for the fixed-point arithmetic.
 const NURSERY_WORDS: usize = 2586;
 /// The mature generation the workload promotes into, in words. A whole number of
 /// mark-region blocks (32 × 256), so the mark-region space's block rounding lands on exactly
@@ -93,31 +93,53 @@ const BURST: usize = 200;
 /// The word count `ensure_capacity` is asked for on the growth rounds.
 const GROW_REQUEST: usize = 48;
 /// The policy's collection reserve, in words — the C's `S_RESERVED` role in
-/// `need_after = … + reserve` (`erl_gc.c:2072`). Much larger than the 64-word default because the
-/// boundary collections see a partly filled nursery, and the reserve is what keeps their
-/// `need_after` above `MATURE_WORDS / 4` so the mature generation is never shrunk (see
-/// [`workload_policy`]).
-const RESERVE_WORDS: usize = 512;
+/// `need_after = … + reserve` (`erl_gc.c:2072`), which is *also* the constant the nursery's own
+/// target is derived from (`HeapPolicy::young_target_words` = `next_words(2 × live + reserve)`).
+///
+/// It is the one knob that makes both spaces **fixed points**, and the arithmetic is worth
+/// spelling out because both halves matter:
+///
+/// * **The nursery.** The workload's live set is the [`LIVE_TUPLES`] working set — 16 one-line
+///   tuples = 256 words — so its target is `next_words(2 × 256 + 2048) = next_words(2560) =
+///   2586` = [`NURSERY_WORDS`]. The nursery is born at that size and every sizing rule
+///   re-derives it: a fullsweep installs `young_target_words(live)` and `should_grow(2586,
+///   2586)` asks for it (it fires, but for the same number), a minor keeps it (its target from
+///   the mature occupancy is far larger than `2586 / 8`), and the explicit growth seam is a
+///   no-op because a collapsed nursery always has room for [`GROW_REQUEST`]. And because
+///   `2 × live + 2048 <= 2586` holds for **every** live set up to 269 words, that stays true
+///   even at the transient live sets the working-set replacement produces.
+/// * **The mature generation.** A fullsweep's `need_after` is `live + young occupancy +
+///   reserve`, i.e. at most `256 + 2586 + 2048 = 4890` words and at least `0 + 0 + 2048 = 2048`.
+///   Both are inside the *keep* band [`HeapPolicy::mature_after_fullsweep`] needs —
+///   `(MATURE_WORDS / 4, 3 × MATURE_WORDS / 4] = (2048, 6144]` (the lower edge is an inclusive
+///   "not shrinking" edge: `should_shrink` needs `capacity > 4 × need_after`) — so the mature
+///   generation is never grown and never shrunk either.
+///
+/// The mark-region space rounds its capacity to whole [`LINE_WORDS`]-blocks and [`MATURE_WORDS`]
+/// is a whole number of them, so both strategies keep exactly the geometry they were born with:
+/// identical admission answers, identical collection kinds, identical capacities.
+const RESERVE_WORDS: usize = 2048;
 
-/// A **fixed-geometry** policy: a nursery pinned at its own floor plus a large mature generation
-/// held at a fixed point, so neither strategy ever resizes a space and both see the same cadence.
+/// The size of the process's **working set**: how many one-line [`TUPLE_WORDS`]-word tuples it
+/// keeps reachable across a round. Constant by design — the nursery's capacity is a fixed point
+/// of the live set (`HeapPolicy::young_target_words`), so a working set that grew every round
+/// would (correctly) step the nursery up a growth-table entry per fullsweep, and any
+/// line-rounding gap between the two strategies would then amplify into different cadences.
+/// 16 × 16 = **256 words**, comfortably inside the 269-word ceiling that keeps the nursery at
+/// [`NURSERY_WORDS`] (see [`RESERVE_WORDS`]).
+const LIVE_TUPLES: usize = 16;
+
+/// A **fixed-geometry** policy: both spaces born at, and held at, a fixed point of the sizing
+/// rules, so neither strategy ever resizes a space and both see the same cadence.
 ///
 /// The nursery is the policy's **initial heap** — [`HeapPolicy::initial_heap_words`], i.e. the
 /// C's `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` at spawn
-/// (`erl_process.c:12586-12592`) — which is its `min_heap_words` floor, and its only growth path
-/// (a surviving set larger than itself) is unreachable here because a collection always fires
-/// before the nursery fills. The mature generation cannot be floored the same way: `min_heap_size`
-/// is a floor for the *young* heap too (`next_heap_size` raises every size to it,
-/// `erl_gc.c:347-352`), so a floor at the mature capacity would make the nursery that large as
-/// well. It is held by the live set instead: with `need_after = live + nursery occupancy +
-/// reserve`, [`HeapPolicy::should_shrink`] needs `capacity > 4 × need_after` and
-/// [`HeapPolicy::should_grow`] needs `3 × capacity < 4 × need_after`, so `need_after` must stay
-/// inside `(MATURE_WORDS / 4, 3 × MATURE_WORDS / 4]` = `(2048, 6144]` words. A burst collection
-/// sees `live + occupancy ≈ 2 × NURSERY_WORDS` plus the reserve; a boundary collection (the one
-/// `ensure_capacity` forces, and the final one) sees a partly filled nursery. The reserve is
-/// therefore [`RESERVE_WORDS`] — the role of the C's `S_RESERVED`, which `erl_gc.c:2072` folds
-/// into the same `need_after` — rather than the 64-word default, which puts both cases inside the
-/// band (≈2.5 K and ≈5.7 K words) with room on both sides.
+/// (`erl_process.c:12586-12592`) — and [`NURSERY_WORDS`] is simultaneously its `min_heap_words`
+/// floor, its initial size *and* the live set's target, so it starts and stays there. The mature
+/// generation cannot be floored the same way (`min_heap_size` floors the *young* heap too,
+/// `next_words` raises every size to it, `erl_gc.c:347-352`), so it is held by the *live set*
+/// instead: [`RESERVE_WORDS`] places every fullsweep's `need_after` inside the keep band around
+/// [`MATURE_WORDS`]. See those two constants for the arithmetic.
 fn workload_policy() -> HeapPolicy {
     HeapPolicy {
         min_heap_words: NURSERY_WORDS,
@@ -187,18 +209,6 @@ fn alloc_pair(
     );
 
     let kind = if asked_c {
-        let live_est: usize = roots_c.iter().map(|r| size_object(*r)).sum();
-        let occ = copying.young().used_words();
-        eprintln!(
-            "DEBUG pre-collect: asked {asked_c} young {} mature_cap {}/{} mature_used {}/{} occ \
-             {occ} live_est {live_est} need_after {}",
-            copying.young().capacity_words(),
-            copying.mature_capacity_words(),
-            immix.mature_capacity_words(),
-            copying.mature_used_words(),
-            immix.mature_used_words(),
-            live_est + occ + RESERVE_WORDS,
-        );
         let kc = copying
             .collect(roots_c)
             .expect("the collection fits the fixed geometry")
@@ -207,16 +217,6 @@ fn alloc_pair(
             .collect(roots_i)
             .expect("the collection fits the fixed geometry")
             .kind;
-        eprintln!(
-            "DEBUG post-collect: kinds {kc:?}/{ki:?} young_after {}/{} mature_after {}/{} used \
-             {}/{}",
-            copying.young().capacity_words(),
-            immix.young().capacity_words(),
-            copying.mature_capacity_words(),
-            immix.mature_capacity_words(),
-            copying.mature_used_words(),
-            immix.mature_used_words(),
-        );
         assert_eq!(kc, ki, "the two strategies must run the same collection");
         assert_eq!(
             copying.young().used_words(),
@@ -273,8 +273,9 @@ fn run_lockstep() -> Lockstep {
     let mut roots_c: Vec<Eterm> = Vec::new();
     let mut roots_i: Vec<Eterm> = Vec::new();
 
-    // The process's long-lived terms, written before the workload starts.
-    for i in 0..3i64 {
+    // The process's long-lived working set, written before the workload starts: [`LIVE_TUPLES`]
+    // one-line tuples it keeps reachable for the whole run and replaces once per round.
+    for i in 0..LIVE_TUPLES as i64 {
         let (tc, ti, a, kind) = alloc_pair(
             &mut copying,
             &mut roots_c,
@@ -295,9 +296,13 @@ fn run_lockstep() -> Lockstep {
     assert_roots_equal(&roots_c, &roots_i, &atoms, "after the long-lived terms");
 
     for round in 0..12i64 {
-        // The mutator writes a burst of terms. Each is pushed into the root set immediately,
-        // so a mid-burst collection relocates it instead of orphaning the word.
-        for i in 0..BURST as i64 {
+        // Replace the working set: the previous round's terms are dropped here and reclaimed by
+        // the next fullsweep, and the fresh ones are pushed into the root set immediately so a
+        // collection that fires while they are being written relocates them instead of
+        // orphaning the word.
+        roots_c.clear();
+        roots_i.clear();
+        for i in 0..LIVE_TUPLES as i64 {
             let (tc, ti, a, kind) = alloc_pair(
                 &mut copying,
                 &mut roots_c,
@@ -315,18 +320,28 @@ fn run_lockstep() -> Lockstep {
             roots_c.push(tc);
             roots_i.push(ti);
         }
+        assert_roots_equal(&roots_c, &roots_i, &atoms, "after the working set");
 
-        // Keep two of the burst's terms; the rest — and the previous round's kept pair —
-        // become garbage the next collections must reclaim.
-        let (kept_c, kept_i) = (
-            (roots_c[3], roots_c[3 + BURST - 1]),
-            (roots_i[3], roots_i[3 + BURST - 1]),
-        );
-        roots_c.truncate(3);
-        roots_i.truncate(3);
-        roots_c.extend([kept_c.0, kept_c.1]);
-        roots_i.extend([kept_i.0, kept_i.1]);
-
+        // The mutator then writes a burst of terms it keeps **none** of: they are the garbage
+        // the collections reclaim, and dropping the words keeps the live set at the working set
+        // (which is what makes the nursery's target a fixed point — see [`RESERVE_WORDS`]). A
+        // term is valid only until the next collection relocates it, so nothing reads them.
+        for i in 0..BURST as i64 {
+            let (_tc, _ti, a, kind) = alloc_pair(
+                &mut copying,
+                &mut roots_c,
+                &mut immix,
+                &mut roots_i,
+                &atoms,
+                round,
+                i,
+                i + round,
+            );
+            asked.push(a);
+            if let Some(k) = kind {
+                kinds.push(k);
+            }
+        }
         // Every third round the runtime grows the heap on demand, exactly as
         // `beam_process::Process::ensure_capacity` does.
         if round % 3 == 2 {
