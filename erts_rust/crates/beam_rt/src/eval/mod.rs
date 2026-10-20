@@ -3596,8 +3596,8 @@ mod tests {
     }
 
     /// Evaluates `expr` on a **booted** runtime and returns how long the evaluation itself
-    /// took (the boot is excluded — see [`wait_iterations`]), asserting that it produced the
-    /// small integer `1`.
+    /// took, together with the immediate value it produced (the boot is excluded — see
+    /// [`wait_iterations`]).
     ///
     /// [`PENDING_TIMER`] is prefixed to the expression, so the runtime's timer heap holds a
     /// live deadline **throughout** the measured receive. That is not a contrivance: a real
@@ -3605,7 +3605,10 @@ mod tests {
     /// condition under which a pump pass takes its timer-half sleep. Without it the timer
     /// heap can happen to be empty and a blocking pump has nothing to sleep on, which would
     /// make a timing assertion pass for the wrong reason.
-    fn timed_wait(expr: &str) -> Duration {
+    ///
+    /// The runtime is dropped on return, so only an **immediate** value may be handed back
+    /// (see [`run`]); a probe that needs to report a heap-allocated term renders it itself.
+    fn timed_eval(expr: &str) -> (Duration, Eterm) {
         let mut runtime = Runtime::with_defaults().expect("the default runtime");
         runtime.run_one_slice().expect("the runtime boots");
         let mut sink = beam_bifs::NullSink;
@@ -3614,9 +3617,36 @@ mod tests {
         let started = Instant::now();
         let value = eval(&mut ctx, &probe).unwrap_or_else(|error| panic!("{probe} failed: {error}"));
         let elapsed = started.elapsed();
-        assert!(is_small(value), "{probe} must answer the small integer `1`");
-        assert_eq!(signed_value(value), 1, "{probe}");
+        assert!(
+            is_immediate(value),
+            "{probe}: a heap-allocated result cannot outlive this helper's runtime"
+        );
+        (elapsed, value)
+    }
+
+    /// [`timed_eval`] for a probe whose own value must be the small integer `1`.
+    fn timed_wait(expr: &str) -> Duration {
+        let (elapsed, value) = timed_eval(expr);
+        assert!(is_small(value), "{expr} must answer the small integer `1`");
+        assert_eq!(signed_value(value), 1, "{expr}");
         elapsed
+    }
+
+    /// The **millisecond span a probe measured for itself** — an
+    /// `erlang:monotonic_time(millisecond)` delta it answered instead of a fixed value — as a
+    /// [`Duration`].
+    ///
+    /// Timing a *span inside* an expression is what lets a test exclude a one-off cost (such as
+    /// a closure's first compile) from the region under a tight bound, which a whole-expression
+    /// measurement cannot do.
+    fn span_ms(value: Eterm) -> Duration {
+        assert!(
+            is_small(value),
+            "a probe's own `erlang:monotonic_time/1` delta must be a small integer"
+        );
+        Duration::from_millis(
+            u64::try_from(signed_value(value)).expect("a monotonic delta is never negative"),
+        )
     }
 
     /// A far-future `erlang:send_after/3`: the far-out deadline every booted node has, kept
@@ -3635,6 +3665,21 @@ mod tests {
     /// below the ~150 ms a blocking pump added and far above the latency of a runnable
     /// thread, so the bound pins the deadline semantics without flaking.
     const AFTER_WINDOW_SLACK: Duration = Duration::from_millis(40);
+
+    /// Wall-clock ceiling for the **one-off** compile a spawned `-eval` closure pays on its
+    /// *first* spawn (`crate::eval::compile`: the closure's own source text is compiled
+    /// in-process into a synthetic module and loaded).
+    ///
+    /// This is a **loading** cost, not a pickup latency: measured 154 ms for the first closure
+    /// in a fresh runtime (loading the compiler's own modules dominates) and 159 ms on the CLI
+    /// route, with every further distinct closure at 41–42 ms and a *repeat* spawn of the same
+    /// closure at 0 ms (it is a `Runtime::eval_compiled` cache hit). 2 s is ~13× the measured
+    /// cold figure, so a loaded, shared host can stretch it without flaking the test, while a
+    /// compile that degraded by an order of magnitude — or a spawn path that started paying the
+    /// compile per *statement* — still trips it. It is deliberately **not** an
+    /// [after-window slack](AFTER_WINDOW_SLACK): charging a compile to a pickup bound would
+    /// measure the compiler instead of the receive loop.
+    const COLD_CLOSURE_COMPILE_BUDGET: Duration = Duration::from_millis(2000);
 
     /// An `after T` window is slept out to its **own deadline**, not to a pump call's
     /// schedule.
@@ -3682,11 +3727,20 @@ mod tests {
     /// A message that arrives **before** the deadline wins, and is picked up within one
     /// port-poll slice of arriving.
     ///
-    /// Two sources, because the loop reaches them through different waits: the runtime's
-    /// **timer heap** (`erlang:send_after/3`, fired by a scheduler pass) and a **spawned
-    /// child** (`erlang:spawn/1`, run by the run queue). Both used to be observed one whole
-    /// *blocking* pump after the fact (`{msg,151}` against the oracle's `{msg,101}`, and
-    /// `{msg,125}` against the oracle's `{msg,0}`).
+    /// Three sources, because the loop reaches them through different waits: the runtime's
+    /// **timer heap** (`erlang:send_after/3`, fired by a scheduler pass), a **compiled-MFA
+    /// child** (`erlang:spawn/3`, run by the run queue) and a **spawned `-eval` closure**
+    /// (whose first spawn compiles it into a synthetic module — `crate::eval::compile`). All
+    /// three used to be observed one whole *blocking* pump after the fact (`{msg,151}` against
+    /// the oracle's `{msg,101}`, and `{msg,125}` against the oracle's `{msg,0}`).
+    ///
+    /// Every child under the tight bound is one that carries **no one-off compile cost**, so
+    /// that the timed region measures pickup and nothing else: a compiled-MFA child has none at
+    /// all, and the closure is timed on its *second* spawn, by which point
+    /// [`Runtime::eval_compiled`] holds its module and the spawn is a cache hit. The closure's
+    /// first (cold) spawn pays the compiler once — a loading cost, not a latency — and is
+    /// pinned separately against
+    /// [the compile budget](COLD_CLOSURE_COMPILE_BUDGET) rather than against a pickup bound.
     #[test]
     fn a_message_that_beats_the_deadline_is_picked_up_promptly() {
         let elapsed = timed_wait(
@@ -3703,14 +3757,51 @@ mod tests {
              port-poll slice, but the receive answered after {elapsed:?}"
         );
 
+        // A compiled `Module:Function(Args)` child: spawning it is a plain export entry, with no
+        // compile, no cache probe and no tree walker — the whole window is the pickup.
         let elapsed = timed_wait(
-            "P = self(), spawn(fun() -> P ! late end), \
+            "P = self(), spawn(erlang, send, [P, late]), \
              receive late -> ok after 500 -> ok end, 1",
         );
         assert!(
             elapsed <= AFTER_WINDOW_SLACK,
-            "a spawned child's message must be picked up promptly, but the receive answered \
-             after {elapsed:?}"
+            "a compiled-MFA child's message must be picked up promptly, but the receive \
+             answered after {elapsed:?} (oracle: ~0 ms)"
+        );
+
+        // The cold span of a spawned `-eval` closure: the one-off compile, timed on the spawn
+        // that pays it. The window is far longer than the compile, so the bound below — not the
+        // `after` arm — is what reports a compile that has grown out of hand.
+        let (_, cold) = timed_eval(
+            "P = self(), F = fun() -> P ! late end, \
+             T0 = erlang:monotonic_time(millisecond), \
+             spawn(F), receive late -> ok after 5000 -> ok end, \
+             erlang:monotonic_time(millisecond) - T0",
+        );
+        let cold = span_ms(cold);
+        assert!(
+            cold <= COLD_CLOSURE_COMPILE_BUDGET,
+            "the first spawn of a `-eval` closure compiles it in process (measured 154 ms cold, \
+             41-42 ms per further distinct closure) and its message must still arrive well \
+             inside the window, but the spawn+delivery took {cold:?}"
+        );
+
+        // The same closure spawned a **second** time is a `Runtime::eval_compiled` cache hit, so
+        // this is the closure route's pickup latency — the property the cold span above must not
+        // be charged to. The timed region starts at that second spawn; the first one (and its
+        // compile) is outside it.
+        let (_, warm) = timed_eval(
+            "P = self(), F = fun() -> P ! late end, \
+             spawn(F), receive late -> ok after 5000 -> ok end, \
+             T0 = erlang:monotonic_time(millisecond), \
+             spawn(F), receive late -> ok after 5000 -> ok end, \
+             erlang:monotonic_time(millisecond) - T0",
+        );
+        let warm = span_ms(warm);
+        assert!(
+            warm <= AFTER_WINDOW_SLACK,
+            "a spawned `-eval` closure's message must be picked up promptly once its module is \
+             cached, but the second spawn's receive answered after {warm:?} (oracle: ~0 ms)"
         );
     }
 
