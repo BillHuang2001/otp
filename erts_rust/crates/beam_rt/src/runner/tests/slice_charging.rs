@@ -48,28 +48,32 @@
 //! | tier | N | slices | yields | waits | collections | major | peak_young_spaces | reductions | heap_size |
 //! |---|---|---|---|---|---|---|---|---|---|
 //! | native (default) | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 9 | 233 |
-//! | native | 10 | 1 | 0 | 0 | 0 | 0 | 0 | 59 | 28 309 |
-//! | native | 100 | 1 | 0 | 0 | 0 | 0 | 0 | 509 | 196 267 |
-//! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 514 454 |
-//! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 1 347 480 |
-//! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 1 347 480 |
+//! | native | 10 | 1 | 0 | 0 | 0 | 0 | 0 | 59 | 15 376 |
+//! | native | 100 | 1 | 0 | 0 | 0 | 0 | 0 | 509 | 315 829 |
+//! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 830 667 |
+//! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 2 030 224 |
+//! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 2 030 224 |
 //! | native | 799 | 2 | 1 | 0 | 1 | 1 | 1 | 4 004 | 233 |
 //! | native | 800 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 2 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 4 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
 //! | native | 20 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 196 267 |
-//! | interpreter | 2 000 | 10 | 9 | 0 | 9 | 1 | 1 | 36 018 | 233 |
+//! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 315 829 |
+//! | interpreter | 2 000 | 10 | 9 | 0 | 9 | 1 | 1 | 36 018 | 2 586 |
 //!
 //! `heap_growth:run/1` (the allocating engine-native shape — one 401-word `test_heap` per
-//! iteration) on the same default native tier:
+//! iteration) on the same default native tier, at a **843-word** settled nursery (peak young
+//! capacity, every row):
 //!
 //! | N | slices | yields | waits | collections | major | peak_young_spaces | reductions |
 //! |---|---|---|---|---|---|---|---|
-//! | 2 000 | 3 | 2 | 0 | 2 002 | 1 | 1 | 10 005 |
-//! | 10 000 | 13 | 12 | 0 | 10 012 | 1 | 1 | 50 005 |
-//! | 20 000 | 26 | 25 | 0 | 20 025 | 1 | 1 | 100 005 |
-//! | 80 000 | 101 | 100 | 0 | 80 100 | 2 | 1 | 400 005 |
+//! | 2 000 | 3 | 2 | 0 | 1 001 | 2 | 1 | 10 005 |
+//! | 10 000 | 13 | 12 | 0 | 5 001 | 2 | 1 | 50 005 |
+//! | 20 000 | 26 | 25 | 0 | 10 001 | 2 | 1 | 100 005 |
+//! | 80 000 | 101 | 100 | 0 | 40 001 | 2 | 1 | 400 005 |
+//!
+//! so its collections are `1 + N/K` with `K == 2` — the iterations the settled nursery carries
+//! (see pin 3).
 //!
 //! # The four pins
 //!
@@ -99,10 +103,13 @@
 //!    budget left except the last, which simply runs out of work), and because the shape prices
 //!    **5 units per iteration** (`reductions == 5N + 5`) a slice holds at most **800** iterations
 //!    — measured as the exact band `800·(slices − 1) ≤ N ≤ 800·slices − 1` on every row, both
-//!    halves derived from those two laws rather than calibrated. Its collections are exactly
-//!    `N + yields`: one admission collection per iteration plus one boundary collection per
-//!    pre-emption (measured 2 002 / 10 012 / 20 025 / 80 100), so the pre-emption rate does not
-//!    grow with N (the per-call figures are flat over a 4x step).
+//!    halves derived from those two laws rather than calibrated. Its collections are `1 + N/K`,
+//!    with `K == 2` iterations carried by the run's own settled 843-word nursery (`K` derived
+//!    from the measured peak capacity and the fixture's 401-word footprint, see
+//!    `heap_growth_iterations_per_nursery`): one admission collection per `K` iterations plus the
+//!    one before the first, the boundary door's own firings landing on cycle boundaries because a
+//!    slice prices 800 iterations — a multiple of `K` (measured 1 001 / 5 001 / 10 001 / 40 001),
+//!    so the pre-emption rate does not grow with N (the per-call figures are flat over a 4x step).
 //! 4. **The honest residual: this shape's own work can never end a slice.** `native_reds` prices
 //!    its iterations through `spend` (a `spend` never refuses, and once the budget is gone it is a
 //!    silent no-op — it does not even count), so past the budget the loop keeps running
@@ -119,9 +126,9 @@
 //!    * a fixture of the same shape with **no** epilogue seam ends **zero** slices (measured
 //!      `slices=1, yields=0, reductions=4 000` at N = 8 000), which is what identifies the
 //!      epilogue as the refusing site rather than the loop;
-//!    * the single `Yield` *does* collect once (a major at the boundary), so — unlike before this
-//!      pin was re-derived — the shape's `heap_size` now sits on the collector's floor (233)
-//!      instead of tracking N. The memory half of the old residual has therefore closed; the
+//!    * the single `Yield` *does* collect once (a major at the boundary), so the shape's
+//!      `heap_size` sits on the collector's floor (233) instead of tracking N. The memory half of
+//!      the old residual has therefore closed; the
 //!      **charging** half has not: closing it needs a refusing charge the loop's own seams can
 //!      take, i.e. the `beam_engine` handoff that makes a call-seam refusal re-runnable (the
 //!      resume address must be the seam's own instruction — see `BudgetProbe::spend`'s docs).
@@ -131,9 +138,13 @@
 //! The interpreter control is the same fixture under [`JitMode::Interpreter`] (forced per thread
 //! through [`super::super::tier::force`], never through the process environment): it charges per
 //! instruction, so its total really does track the work — **36 018** units and 10 slices / 9
-//! yields / 9 `collections` at N = 2 000 against the native tier's flat 4 006 / 2 / 1 — and its
-//! `heap_size` sits on the same collector's floor. That is the residual's discriminator: the gap
-//! is a fact about the **tier**, not about the fixture.
+//! yields / 9 `collections` at N = 2 000 against the native tier's flat 4 006 / 2 / 1. That is
+//! the residual's discriminator: the gap is a fact about the **tier**, not about the fixture.
+//! Its `heap_size` is the one figure of the control that does *not* sit on the collector's floor:
+//! the tier's 9 collections leave the nursery at **2 586** words and the reading climbs with N
+//! (**311 411** at 10 000, **503 876** at 20 000) instead of converging — the `beam_gc` nursery
+//! ratchet recorded under `CONTEXT.md` *Known Issues / Handoffs*, which is why the control's floor
+//! pin fails.
 use super::super::tier::{JitMode, clear, force};
 use super::{GrowthCounters, growth_runtime, run_growth_function};
 use beam_process::DEFAULT_REDUCTIONS_PER_SLICE;
@@ -172,8 +183,9 @@ const NATIVE_REDS_ENTRY_UNITS: u64 = 9;
 const NATIVE_REDS_EPILOGUE_UNITS: u64 = 6;
 
 /// The collector's floor under this runtime: the young-nursery capacity a collected process reads
-/// back as `process_info(self(), heap_size)` (measured 233 on every saturated `native_reds` row and
-/// on the interpreter control).
+/// back as `process_info(self(), heap_size)` (measured 233 on every saturated `native_reds` row).
+/// The interpreter control is the exception: its 9 collections leave **2 586** words and the figure
+/// climbs with N, the nursery ratchet recorded under `CONTEXT.md` *Known Issues / Handoffs*.
 const COLLECTOR_FLOOR: i64 = 233;
 
 /// The largest `NativeReds` iteration count whose **linear** total (`5N + 9`) still fits in one
@@ -474,13 +486,24 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
             n as f64 / row.slices as f64,
             per_slice as f64 * (row.slices as f64 - 1.0) / row.slices as f64
         );
-        // Its collections are exactly one admission collection per iteration plus one boundary
-        // collection per pre-emption.
+        // Its collections are one per `K` iterations of the settled nursery plus the one before
+        // the first iteration — `K` derived from this row's own measured peak nursery capacity
+        // (see `heap_growth_iterations_per_nursery`), never a calibrated count.
+        let iterations_per_nursery =
+            super::heap_growth_iterations_per_nursery(row.peak_young_capacity);
+        assert_eq!(
+            iterations_per_nursery, 2,
+            "N={n}: a {}-word settled nursery must carry two {}-word iterations (measured on \
+             every row): {row:?}",
+            row.peak_young_capacity,
+            super::HEAP_GROWTH_ITERATION_WORDS
+        );
         assert_eq!(
             row.collections,
-            n as u64 + row.yields as u64,
-            "N={n}: collections must be N + yields (one admission per iteration, one boundary per \
-             pre-emption): {row:?}"
+            super::heap_growth_expected_collections(n, iterations_per_nursery),
+            "N={n}: collections must be 1 + N/K = 1 + {n}/{iterations_per_nursery} = {} (one per \
+             {iterations_per_nursery} iterations plus the one before the first): {row:?}",
+            super::heap_growth_expected_collections(n, iterations_per_nursery)
         );
     }
     // ... and the pre-emptions and the collections both scale **linearly** with N: over a 4x
@@ -533,8 +556,9 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
     );
     assert_eq!(
         control.value, COLLECTOR_FLOOR,
-        "the collected shape's heap_size must sit on the collector's floor ({COLLECTOR_FLOOR}): \
-         {control:?}"
+        "the collected shape's heap_size must sit on the collector's floor ({COLLECTOR_FLOOR}) — a \
+         larger reading is the nursery ratchet recorded under CONTEXT.md *Known Issues / \
+         Handoffs*, not a plateau: {control:?}"
     );
     assert_eq!(
         control.reductions, 36_018,
