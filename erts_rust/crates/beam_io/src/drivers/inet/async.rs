@@ -925,3 +925,6 @@ impl TcpInetDriver {
 #[cfg(test)]
 #[path = "async_tests.rs"]
 mod async_tests;
+#[cfg(test)]
+#[path = "passive_recv_tests.rs"]
+mod passive_recv_tests;
