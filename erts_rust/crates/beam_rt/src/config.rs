@@ -529,6 +529,22 @@ pub struct RuntimeConfig {
     pub max_ports: Option<usize>,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
+    /// The **plain arguments** — the source of `init:get_plain_arguments/0` (contract A.6).
+    ///
+    /// These are the tokens `-extra` and `--` select, kept as strings in the order the
+    /// entities that carried them contribute them (`ERL_OTP<sysver>_FLAGS`, `ERL_AFLAGS`,
+    /// the command line, `ERL_FLAGS`, `ERL_ZFLAGS` — the merge order, with each entity
+    /// splitting at its **own** marker); [`crate::cli::env::merge_argv_with_plain`] is where
+    /// that split happens. The rule is `init`'s: everything after a `-extra`, and everything
+    /// after a `--` up to the next switch-looking token, is a plain argument
+    /// (`erts/preloaded/src/init.erl:81-139,1664-1740`).
+    ///
+    /// A plain argument is **not** an init argument: it never appears in
+    /// [`init_args`](Self::init_args), so `init:get_argument/1` cannot see it and
+    /// `init:get_arguments/0` lists no entry for it — verified against OTP 29.1.1, where
+    /// `-extra a b c` leaves `init:get_arguments/0` at
+    /// `[{root,…},{bindir,…},{progname,…},{home,…},{noshell,[]}]`.
+    pub plain_args: Vec<String>,
     /// The boot script this invocation drives, as the CLI **resolved** it: the explicit
     /// `-boot FILE` value when one was given, else `init`'s own default (the literal
     /// `start`) — for every action but `-version`, which boots nothing.
@@ -566,9 +582,9 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
     /// path (both the `-pa` head and the `-pz` tail), a [`DEFAULT_HEAP_WORDS`]-word heap,
-    /// the emulator's heap-size defaults, no init arguments, [`Action::Boot`], no
-    /// port-table request, no explicit online scheduler count, no resolved boot script and
-    /// no environment variables.
+    /// the emulator's heap-size defaults, no init arguments, no plain arguments,
+    /// [`Action::Boot`], no port-table request, no explicit online scheduler count, no
+    /// resolved boot script and no environment variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
@@ -579,6 +595,7 @@ impl Default for RuntimeConfig {
             heap: HeapOptions::default(),
             max_ports: None,
             init_args: InitArgs::default(),
+            plain_args: Vec::new(),
             resolved_boot_script: None,
             action: Boot,
             perf_map: PerfMapConfig::new(),
@@ -823,6 +840,9 @@ mod tests {
         assert_eq!(config.heap, HeapOptions::default());
         assert_eq!(config.max_ports, None);
         assert!(config.init_args.is_empty());
+        // No `-extra`/`--` marker in a bare invocation, so no plain argument either
+        // (`init:get_plain_arguments/0` is `[]`).
+        assert!(config.plain_args.is_empty());
         assert_eq!(config.action, Action::Boot);
         assert_eq!(config.env_vars(), &ErlEnv::default());
         assert!(!config.is_version());

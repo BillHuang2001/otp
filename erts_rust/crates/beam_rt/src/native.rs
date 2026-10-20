@@ -37,7 +37,7 @@
 //! | `erlang:process_flag(monitor_nodes \| {monitor_nodes, Opts}, Bool)` | the undocumented node-monitor flag `net_kernel:monitor_nodes/1,2` sets: the `beam_bifs` `ProcessHook` seam takes an **atom** flag, so the tuple/option-map form is served here from the runtime's own per-pid monitor-node store (contract A.5/A.9, `src/native/process.rs`) |
 //! | `erlang:hibernate/0` | an OTP-30 **instruction** (`emu/ops.tab:896-898` rewrites `call_ext erlang:hibernate/0` to `i_hibernate`), not a `bif.tab` BIF; this runtime's loader performs no such transform, so the call reaches the floor, which models "hibernate" as **continue** (the C's `erts_hibernate` only shrinks the heap and clears the ACTIVE flag; the caller's own following `receive` blocks) — `src/native/process.rs` |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
-//! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
+//! | `init:get_plain_arguments/0` | the plain-argument list `-extra`/`--` selected (`RuntimeConfig::plain_args`, split per merge entity by the CLI) |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args`, preceded by the emulator's own automatic flags (`root`/`bindir`/`progname`/`home`) |
 //! | `init:stop/0,1` | terminates the **node**: records the exit status (or raises the crash-dump slogan / `badarg`) and answers `ok` without interrupting the caller |
 //! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |

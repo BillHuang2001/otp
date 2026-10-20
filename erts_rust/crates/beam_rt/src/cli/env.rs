@@ -48,6 +48,16 @@
 //! [`tokenize`] reproduces `build_args_from_string(string, allow_comments = 0)` exactly
 //! (erlexec.c:1772-1930), which is what `build_args_from_env` calls for every variable.
 //! The full rule set is documented on the function.
+//!
+//! # Plain arguments
+//!
+//! A merged token stream also carries the **plain arguments** `init:get_plain_arguments/0`
+//! reports: `-extra` (everything after it, in that entity) and `--` (everything after it up
+//! to the next switch-looking token). [`split_plain`] does that split **per entity**, and
+//! [`merge_argv_with_plain`] is the merge that keeps the flags and the plain tails apart —
+//! `init`'s own rule, where an `-extra` "only effects the remaining command-line flags in
+//! the entity in which it is passed" and the tails concatenate in merge order
+//! (`erts/preloaded/src/init.erl:115-139,1664-1740`).
 
 use std::collections::HashMap;
 
@@ -201,6 +211,10 @@ pub fn tokenize(s: &str) -> Vec<String> {
 /// holding only whitespace expands to none). `args` (the command line, excluding
 /// `argv[0]`) keeps its order in the middle.
 ///
+/// This is the **flag stream only** — a thin delegation to
+/// [`merge_argv_with_plain`], which also returns the plain-argument tail `-extra`/`--`
+/// select. The two agree on every flag token.
+///
 /// ```
 /// use beam_rt::cli::{merge_argv, MapEnv};
 /// use std::collections::HashMap;
@@ -213,21 +227,125 @@ pub fn tokenize(s: &str) -> Vec<String> {
 /// assert_eq!(merge_argv(&args, &env), ["-a", "-cmd", "-f"]);
 /// ```
 pub fn merge_argv(args: &[String], env: &dyn Env) -> Vec<String> {
-    let mut merged = Vec::new();
+    merge_argv_with_plain(args, env).0
+}
+
+/// Splits one token stream into its **flags** and its **plain arguments**.
+///
+/// The stream is one **entity** — the command line, or one `ERL_*FLAGS` variable — because
+/// that is the unit `-extra` acts on: `init`'s own rule is that an `-extra` "only effects
+/// the remaining command-line flags in the entity in which it is passed"
+/// (`erts/preloaded/src/init.erl:127-139`). The rules, in full
+/// (`parse_boot_args/4` + `check/2`, `init.erl:1664-1740`):
+///
+/// * in flag mode, a token `-extra` is **consumed** and **every** following token of the
+///   stream is a plain argument — including a later literal `-extra`, which is then data
+///   and never a switch. Oracle: `erl -noshell -extra a b -extra c` ⇒
+///   `init:get_plain_arguments()` is `["a","b","-extra","c"]`, and an `-eval` placed after
+///   the `-extra` is never evaluated (it becomes a plain argument).
+/// * a token `--` is **consumed** and the tokens after it are plain **until the next token
+///   that looks like a switch** — one beginning with `-` or `+` — which stays in the flag
+///   stream and **resumes** flag mode. Oracle: `-- a b` ⇒ `["a","b"]`; `-- a -noshell b` ⇒
+///   `["a"]`, with `-noshell` and the value it takes (`b`) in the flag stream; and
+///   `-- a -extra b` ⇒ `["a","b"]` (the `-extra` is switch-looking, so it ends the `--` run
+///   and then claims the rest of the stream).
+/// * every **other** token, a bare positional one included, stays in the flag stream: this
+///   splitter never guesses a switch's arity, so deciding that `b` in `-noshell b` is
+///   `-noshell`'s value — and not a plain argument — is the parser's business, not this
+///   splitter's (`get_args/2`, `init.erl:1724-1737`).
+/// * a stream with **no** marker is entirely flags, in order, so an entity without `-extra`
+///   or `--` never changes anything.
+/// * a **bare** `-extra` (nothing after it) contributes no plain argument at all.
+///
+/// The two halves are returned as `(flags, plain)`; both keep their stream order.
+#[allow(dead_code)] // wired into `cli::parse`/`parse_with_env` by the next wave.
+pub fn split_plain(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut flags = Vec::new();
+    let mut plain = Vec::new();
+    let mut index = 0usize;
+    while let Some(token) = args.get(index) {
+        if token == "-extra" {
+            // `-extra` claims the whole rest of this entity, itself excluded.
+            plain.extend(args[index + 1..].iter().cloned());
+            break;
+        }
+        if token == "--" {
+            // `--` opens a plain run that the next switch-looking token ends.
+            index += 1;
+            while let Some(candidate) = args.get(index) {
+                if looks_like_a_switch(candidate) {
+                    break;
+                }
+                plain.push(candidate.clone());
+                index += 1;
+            }
+            continue;
+        }
+        flags.push(token.clone());
+        index += 1;
+    }
+    (flags, plain)
+}
+
+/// Whether `token` looks like an emulator switch — it begins with `-` or `+`.
+///
+/// That is exactly the test that ends a `--` plain run (`check/2`,
+/// `erts/preloaded/src/init.erl:1720-1722`: anything matching `<<"-",Flag/binary>>` is a
+/// flag, everything else is an argument; the `+` switches are the emulator's own `+A`/`+S`
+/// family, which this runtime's parser also accepts).
+fn looks_like_a_switch(token: &str) -> bool {
+    token.starts_with('-') || token.starts_with('+')
+}
+
+/// Merges the `ERL_*FLAGS` environment variables into `args`, keeping the **plain
+/// arguments** apart from the flags.
+///
+/// The five entities are split **independently** and concatenated in the merge order of
+/// [`merge_argv`] (`initial_argv_massage`, erlexec.c:2179-2203):
+///
+/// ```text
+/// [ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] args… [ERL_FLAGS] [ERL_ZFLAGS]
+/// ```
+///
+/// Each entity is [`tokenize`]d and then [`split_plain`]d, so its flags join the flag
+/// stream **in merge order** and its plain tail joins the plain list **in the same order** —
+/// `init`'s rule that "if multiple `-extra` flags are passed they are concatenated using the
+/// same order rules as `ERL_*FLAGS`" (`erts/preloaded/src/init.erl:127-139`). An entity with
+/// no marker is unaffected and an **unset** variable contributes nothing.
+///
+/// The documented example reproduces exactly (`init.erl:135-139`):
+///
+/// ```text
+/// ERL_AFLAGS="-extra a" ERL_ZFLAGS="-extra d" erl -extra b -extra c
+///   init:get_plain_arguments() → ["a","b","-extra","c","d"]
+/// ```
+///
+/// — each entity splits at its **own** first `-extra`, and the command line's tail carries
+/// its later literal `-extra` as data.
+#[allow(dead_code)] // wired into `cli::parse`/`parse_with_env` by the next wave.
+pub fn merge_argv_with_plain(args: &[String], env: &dyn Env) -> (Vec<String>, Vec<String>) {
+    let mut flags = Vec::new();
+    let mut plain = Vec::new();
+    // One entity at a time, in merge order: flags in merge order, plain tails likewise.
+    let mut absorb = |tokens: Vec<String>| {
+        let (entity_flags, entity_plain) = split_plain(&tokens);
+        flags.extend(entity_flags);
+        plain.extend(entity_plain);
+    };
     // Prepended before the command line, in order.
     for name in [otp_flags_var().as_str(), "ERL_AFLAGS"] {
         if let Some(value) = env.get(name) {
-            merged.extend(tokenize(&value));
+            absorb(tokenize(&value));
         }
     }
-    merged.extend(args.iter().cloned());
+    absorb(args.to_vec());
     // Appended after the command line, in order.
     for name in ["ERL_FLAGS", "ERL_ZFLAGS"] {
         if let Some(value) = env.get(name) {
-            merged.extend(tokenize(&value));
+            absorb(tokenize(&value));
         }
     }
-    merged
+    (flags, plain)
 }
 
 #[cfg(test)]
@@ -376,5 +494,123 @@ mod tests {
     fn the_otp_flags_variable_is_named_for_the_system_version() {
         assert_eq!(beam_common::otp_version().major, 30);
         assert_eq!(otp_flags_var(), "ERL_OTP30_FLAGS");
+    }
+
+    // -- plain arguments: `-extra` and `--` ----------------------------------
+
+    #[test]
+    fn a_stream_with_no_marker_is_entirely_flags() {
+        // The common case: nothing plain, every token a flag-stream token in order.
+        let (flags, plain) = split_plain(&tokens(&["-noshell", "-eval", "1"]));
+        assert_eq!(flags, tokens(&["-noshell", "-eval", "1"]));
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn extra_claims_the_whole_rest_of_the_stream() {
+        // Oracle: `erl -noshell -eval … -extra a b c` ⇒ `["a","b","c"]`.
+        let (flags, plain) = split_plain(&tokens(&["-noshell", "-extra", "a", "b", "c"]));
+        assert_eq!(flags, tokens(&["-noshell"]));
+        assert_eq!(plain, tokens(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn a_second_extra_is_data_once_the_stream_is_plain() {
+        // Oracle: `-extra a b -extra c` ⇒ `["a","b","-extra","c"]` — a later literal
+        // `-extra` inside an already-plain tail is carried as a plain argument.
+        let (flags, plain) = split_plain(&tokens(&["-noshell", "-extra", "a", "b", "-extra", "c"]));
+        assert_eq!(flags, tokens(&["-noshell"]));
+        assert_eq!(plain, tokens(&["a", "b", "-extra", "c"]));
+    }
+
+    #[test]
+    fn a_bare_extra_contributes_no_plain_argument() {
+        let (flags, plain) = split_plain(&tokens(&["-noshell", "-extra"]));
+        assert_eq!(flags, tokens(&["-noshell"]));
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn the_end_args_marker_opens_a_plain_run() {
+        // Oracle: `-- a b` ⇒ `["a","b"]`.
+        let (flags, plain) = split_plain(&tokens(&["--", "a", "b"]));
+        assert!(flags.is_empty());
+        assert_eq!(plain, tokens(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_switch_ends_the_end_args_run_and_resumes_flag_mode() {
+        // Oracle: `-- a -noshell b` ⇒ `["a"]`, with `-noshell` — and the value it takes,
+        // `b` — in the flag stream (this splitter never guesses a switch's arity).
+        let (flags, plain) = split_plain(&tokens(&["--", "a", "-noshell", "b"]));
+        assert_eq!(flags, tokens(&["-noshell", "b"]));
+        assert_eq!(plain, tokens(&["a"]));
+    }
+
+    #[test]
+    fn an_extra_after_the_end_args_run_claims_the_rest() {
+        // Oracle: `-- a -extra b` ⇒ `["a","b"]` — `-extra` is switch-looking, so it ends
+        // the `--` run and then claims everything after itself.
+        let (flags, plain) = split_plain(&tokens(&["--", "a", "-extra", "b"]));
+        assert!(flags.is_empty());
+        assert_eq!(plain, tokens(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_plus_switch_also_ends_the_end_args_run() {
+        // The emulator's own `+`-switches look like switches too (`+A 1` after `--`).
+        let (flags, plain) = split_plain(&tokens(&["--", "a", "+A", "1"]));
+        assert_eq!(flags, tokens(&["+A", "1"]));
+        assert_eq!(plain, tokens(&["a"]));
+    }
+
+    #[test]
+    fn merge_keeps_the_plain_tails_of_every_entity_in_merge_order() {
+        // The documented multi-entity example (`erts/preloaded/src/init.erl:135-139`):
+        // `ERL_AFLAGS="-extra a" ERL_ZFLAGS="-extra d" erl -extra b -extra c` ⇒
+        // `["a","b","-extra","c","d"]`, with an empty flag stream — each entity splits at
+        // its OWN first `-extra`, and the command line's tail carries its later literal
+        // `-extra` as data.
+        let env = MapEnv(HashMap::from([
+            ("ERL_AFLAGS".to_string(), "-extra a".to_string()),
+            ("ERL_ZFLAGS".to_string(), "-extra d".to_string()),
+        ]));
+        let args = tokens(&["-extra", "b", "-extra", "c"]);
+        let (flags, plain) = merge_argv_with_plain(&args, &env);
+        assert!(flags.is_empty(), "no flag survives: {flags:?}");
+        assert_eq!(plain, tokens(&["a", "b", "-extra", "c", "d"]));
+        // The flag-stream-only form of the same merge agrees.
+        assert_eq!(merge_argv(&args, &env), flags);
+    }
+
+    #[test]
+    fn an_entity_without_a_marker_is_unaffected_and_stays_in_order() {
+        // `ERL_AFLAGS` is prepended and `ERL_ZFLAGS` appended, neither carrying a marker, so
+        // the only plain arguments are the command line's own `--` run — and every flag
+        // keeps its merge position.
+        let env = MapEnv(HashMap::from([
+            ("ERL_AFLAGS".to_string(), "-af 1".to_string()),
+            ("ERL_FLAGS".to_string(), "-f".to_string()),
+            ("ERL_ZFLAGS".to_string(), "-z".to_string()),
+        ]));
+        let args = tokens(&["-cmd", "--", "a", "b"]);
+        let (flags, plain) = merge_argv_with_plain(&args, &env);
+        assert_eq!(flags, tokens(&["-af", "1", "-cmd", "-f", "-z"]));
+        assert_eq!(plain, tokens(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_plain_tail_in_two_entities_concatenates_in_merge_order() {
+        // A `--` run in `ERL_AFLAGS` and an `-extra` tail on the command line: the two
+        // tails concatenate in merge order (AFLAGS first), each entity having split at its
+        // own marker.
+        let env = MapEnv(HashMap::from([(
+            "ERL_AFLAGS".to_string(),
+            "-af -- early".to_string(),
+        )]));
+        let args = tokens(&["--", "mid", "-noshell", "-extra", "late"]);
+        let (flags, plain) = merge_argv_with_plain(&args, &env);
+        assert_eq!(flags, tokens(&["-af", "-noshell"]));
+        assert_eq!(plain, tokens(&["early", "mid", "late"]));
     }
 }
