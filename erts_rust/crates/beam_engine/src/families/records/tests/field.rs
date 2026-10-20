@@ -253,30 +253,171 @@ fn get_record_field_foreign_form_branches_to_fail_on_a_name_mismatch() {
 }
 
 #[test]
-fn get_record_field_with_no_fail_raises_function_clause() {
+fn get_record_field_local_form_with_no_fail_raises_badfield_naming_the_record_and_field() {
+    // `erl_get_local_record_field` sets `p->fvalue = TUPLE2(TUPLE2(defp->module,
+    // defp->name), field); p->freason = EXC_BADFIELD` when no key matches
+    // (`erl_record.c:814-821`), and `$FAIL_HEAD_OR_BODY($Fail)`
+    // (`emu/instrs.tab:1447`) then raises it: class `error`, reason
+    // `{badfield, {{Module,Name}, Field}}`.
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (rec, _a, _b, r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
-    fx.atom("function_clause");
+    let badfield = fx.atom("badfield");
+    fx.atom("error");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(
+    let result = run(
         fx.module(),
-        run(
-            fx.module(),
-            &LabelMap::new(),
-            &mut machine,
-            &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
-                fail: NO_FAIL,
-                src: Operand::X(0),
-                id: Operand::Atom(r),
-                field: Operand::Atom(z),
-                dst: Operand::X(1),
-            })),
-            &mut ctx,
-        ),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            id: Operand::Atom(r),
+            field: Operand::Atom(z),
+            dst: Operand::X(1),
+        })),
+        &mut ctx,
     );
-    assert_eq!(reason, "function_clause");
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_field_failure_reason(reason, badfield, fx.module().name, r, z);
+    assert_eq!(machine.x(1), Some(NIL), "the destination is untouched on a raise");
+}
+
+#[test]
+fn get_record_field_local_form_with_no_fail_raises_badrecord_carrying_the_source_term() {
+    // Every `badrecord` exit of `erl_get_local_record_field` (`erl_record.c:790-803`)
+    // is `p->fvalue = src; p->freason = EXC_BADRECORD` — the **source term itself**,
+    // not the `{Module,Name}` id (that payload shape belongs to the create form).
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (rec, a, _b, _r) = two_field_record(&mut fx, &mut ctx);
+    let other = fx.atom("other");
+    let badrecord = fx.atom("badrecord");
+    fx.atom("error");
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            // The record is named `r`; the atom `other` is a name mismatch.
+            id: Operand::Atom(other),
+            field: Operand::Atom(a),
+            dst: Operand::X(1),
+        })),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    let payload = assert_badrecord_reason(reason, badrecord, rec);
+    assert!(
+        predicates::is_record(payload),
+        "the payload is the source record term, not an id pair"
+    );
+    assert_eq!(machine.x(1), Some(NIL), "the destination is untouched on a raise");
+}
+
+#[test]
+fn get_record_field_with_no_fail_raises_badrecord_on_a_non_record_source() {
+    // `is_not_record(src)` enters the C helper's `badrecord:` label directly
+    // (`erl_record.c:791-793`), so the payload is the non-record term.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (a, r) = (fx.atom("a"), fx.atom("r"));
+    let badrecord = fx.atom("badrecord");
+    fx.atom("error");
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, make_small(5)).unwrap();
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            id: Operand::Atom(r),
+            field: Operand::Atom(a),
+            dst: Operand::X(1),
+        })),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_badrecord_reason(reason, badrecord, make_small(5));
+}
+
+#[test]
+fn get_record_field_foreign_form_with_no_fail_raises_badrecord_on_a_non_exported_record() {
+    // `if (defp->is_exported == am_false) goto badrecord;` — `p->fvalue = src;
+    // p->freason = EXC_BADRECORD` (`erl_record.c:856-858`).
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (other, r, a) = (fx.atom("other"), fx.atom("r"), fx.atom("a"));
+    let badrecord = fx.atom("badrecord");
+    fx.atom("error");
+    let rec = record(&mut ctx, other, r, false, &[(a, make_small(11))]);
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+    machine.set_x(3, id).unwrap();
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            id: Operand::X(3),
+            field: Operand::Atom(a),
+            dst: Operand::X(1),
+        })),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_badrecord_reason(reason, badrecord, rec);
+}
+
+#[test]
+fn get_record_field_foreign_form_with_no_fail_raises_badfield_naming_the_record_and_field() {
+    // `erl_get_record_field`'s absent-field exit (`erl_record.c:872-879`) is the same
+    // `{badfield, {{defp->module, defp->name}, field}}` reason as the local form.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (other, r, a) = (fx.atom("other"), fx.atom("r"), fx.atom("a"));
+    let z = fx.atom("z");
+    let badfield = fx.atom("badfield");
+    fx.atom("error");
+    let rec = record(&mut ctx, other, r, true, &[(a, make_small(11))]);
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+    machine.set_x(3, id).unwrap();
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+            fail: NO_FAIL,
+            src: Operand::X(0),
+            id: Operand::X(3),
+            field: Operand::Atom(z),
+            dst: Operand::X(1),
+        })),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_field_failure_reason(reason, badfield, other, r, z);
 }

@@ -55,9 +55,9 @@
 
 use std::collections::BTreeMap;
 
-use beam_common::{BeamError, ExceptionClass};
+use beam_common::ExceptionClass;
 use beam_loader::{Export, Function, Label, Module, Operand, RecordDefinition, RecordField, NO_FAIL};
-use beam_term::{make_atom, make_small, Atom, Eterm};
+use beam_term::{make_atom, make_small, Atom, AtomTable, Eterm};
 
 use super::*;
 use crate::jit::Tier;
@@ -105,57 +105,6 @@ fn create(id: Operand, fail: Label, updates: Vec<(Operand, Operand)>) -> Instr {
 fn intern_raise_atoms(fx: &mut Fixture, tag: &str) {
     fx.atom(tag);
     fx.atom("error");
-}
-
-/// Assert `reason` is exactly `{Tag, {{Owner, Name}, Field}}`
-/// (`erl_record.c:339-351`) for a definition owned by **`owner`**.
-fn assert_create_reason(
-    reason: Eterm,
-    tag: Atom,
-    owner: Atom,
-    name: Atom,
-    field: Atom,
-) -> Eterm {
-    assert_eq!(terms::tuple_arity(reason).expect("a tuple"), 2, "reason arity");
-    assert_eq!(
-        terms::tuple_element(reason, 0).expect("tag element"),
-        make_atom(tag),
-        "the reason tag"
-    );
-    let value = terms::tuple_element(reason, 1).expect("payload element");
-    assert_eq!(terms::tuple_arity(value).expect("a tuple"), 2, "field pair arity");
-    let pair = terms::tuple_element(value, 0).expect("record id element");
-    assert_eq!(terms::tuple_arity(pair).expect("a tuple"), 2, "id pair arity");
-    assert_eq!(
-        terms::tuple_element(pair, 0).expect("owner"),
-        make_atom(owner),
-        "the definition's module"
-    );
-    assert_eq!(
-        terms::tuple_element(pair, 1).expect("name"),
-        make_atom(name),
-        "the definition's name"
-    );
-    assert_eq!(
-        terms::tuple_element(value, 1).expect("field"),
-        make_atom(field),
-        "the error field"
-    );
-    value
-}
-
-/// The `(class, reason)` a run that must have raised recorded.
-fn raised_reason<T: std::fmt::Debug>(
-    machine: &Machine,
-    result: &beam_common::Result<T>,
-) -> (ExceptionClass, Eterm) {
-    assert!(
-        matches!(result, Err(BeamError::Raise(_))),
-        "expected a raise, got {result:?}"
-    );
-    machine
-        .pending_exception()
-        .expect("a recorded exception")
 }
 
 /// The definition term of the (native record) `instance`.
@@ -527,7 +476,7 @@ fn foreign_create_badfield_outranks_no_value() {
     );
     let (class, reason) = raised_reason(&machine, &result);
     assert_eq!(class, ExceptionClass::Error);
-    assert_create_reason(reason, badfield, other, r, z);
+    assert_field_failure_reason(reason, badfield, other, r, z);
 }
 
 #[test]
@@ -566,7 +515,7 @@ fn foreign_create_no_value_remembers_only_the_first_absent_field() {
     );
     let (class, reason) = raised_reason(&machine, &result);
     assert_eq!(class, ExceptionClass::Error);
-    assert_create_reason(reason, novalue, other, r, first);
+    assert_field_failure_reason(reason, novalue, other, r, first);
 }
 
 #[test]
@@ -620,12 +569,104 @@ fn foreign_create_distinguishes_a_some_zero_default_from_an_absent_one() {
     );
     let (class, reason) = raised_reason(&machine, &result);
     assert_eq!(class, ExceptionClass::Error);
-    assert_create_reason(reason, novalue, other, r, b);
+    assert_field_failure_reason(reason, novalue, other, r, b);
 }
 
 // ---------------------------------------------------------------------------
 // The atom-namespace rule
 // ---------------------------------------------------------------------------
+
+/// The error tag of a `NO_FAIL` record error is a **global** in C
+/// (`error_atom[EXC_BADFIELD]`/`[EXC_NOVALUE]`/`[EXC_BADRECORD]`,
+/// `beam_common.c:754-768`), so it exists in every universe — a module whose own
+/// load-time snapshot never mentions it still raises. The engine resolves the tag
+/// through the live atom namespace with the module snapshot as fallback
+/// (`crate::machine::namespace_atom`), so a shared namespace that CAN spell it is
+/// enough.
+///
+/// These two tests build exactly that: the fixture module interns **none** of
+/// `badfield`/`novalue`/`error`, and the context's `ExecutionContext::atoms` returns
+/// a shared table that does.
+fn shared_raise_namespace(tags: &[&str]) -> AtomTable {
+    let mut shared = AtomTable::default();
+    for name in tags {
+        shared.intern(name);
+    }
+    shared.intern("error");
+    shared
+}
+
+#[test]
+fn create_badfield_resolves_its_tag_from_the_live_namespace() {
+    // `erl_record.c:331-337`/`:339-351`: an unconsumed update entry is the
+    // `badfield` error, and `expand_error_value` wraps the
+    // `TUPLE2(TUPLE2(Module,Name),Field)` payload with `error_atom[EXC_BADFIELD]`.
+    // The running module cannot name `badfield`; the live namespace can.
+    let mut fx = Fixture::new();
+    let (other, r, b, z) = (fx.atom("other"), fx.atom("r"), fx.atom("b"), fx.atom("z"));
+    let shared = shared_raise_namespace(&["badfield"]);
+    let badfield = shared.lookup("badfield").expect("the shared `badfield` atom");
+    assert!(
+        fx.module().atom_table.lookup("badfield").is_none(),
+        "the module's own snapshot must not contain the tag"
+    );
+    let mut ctx = MinimalContext::with_shared_atoms(shared);
+    ctx.set_foreign_record_definitions(vec![(
+        other,
+        r,
+        definition(r, true, &[(b, Some(make_small(2)))]),
+    )]);
+
+    let id = id_pair(&mut ctx, other, r);
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(1, id).expect("X(1)");
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &create(
+            Operand::X(1),
+            NO_FAIL,
+            vec![(Operand::Atom(z), Operand::Integer(3))],
+        ),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, ExceptionClass::Error, "`badfield` is class `error`");
+    assert_field_failure_reason(reason, badfield, other, r, z);
+}
+
+#[test]
+fn create_novalue_resolves_its_tag_from_the_live_namespace() {
+    // The second delayed-field error: a field whose default is the absent sentinel
+    // (`erl_record.c:318-326`), rendered with `error_atom[EXC_NOVALUE]`.
+    let mut fx = Fixture::new();
+    let (other, r, b) = (fx.atom("other"), fx.atom("r"), fx.atom("b"));
+    let shared = shared_raise_namespace(&["novalue"]);
+    let novalue = shared.lookup("novalue").expect("the shared `novalue` atom");
+    assert!(
+        fx.module().atom_table.lookup("novalue").is_none(),
+        "the module's own snapshot must not contain the tag"
+    );
+    let mut ctx = MinimalContext::with_shared_atoms(shared);
+    ctx.set_foreign_record_definitions(vec![(other, r, definition(r, true, &[(b, None)]))]);
+
+    let id = id_pair(&mut ctx, other, r);
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(1, id).expect("X(1)");
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &create(Operand::X(1), NO_FAIL, Vec::new()),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, ExceptionClass::Error, "`novalue` is class `error`");
+    assert_field_failure_reason(reason, novalue, other, r, b);
+}
 
 #[test]
 fn foreign_create_rejects_a_definition_whose_names_the_caller_cannot_spell() {

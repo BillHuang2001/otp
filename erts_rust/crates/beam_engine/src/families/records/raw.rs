@@ -31,8 +31,8 @@
 //! re-derived here**: every function forwards to `beam_term::record`.
 //!
 //! Its second responsibility is the one term build that must be carved by hand —
-//! the create form's `{Tag, {{Module, Name}, Field}}` reason graph
-//! ([`write_create_failure_reason`]), whose three tuples have to share a **single**
+//! the record field failure reason `{Tag, {{Module, Name}, Field}}`
+//! ([`write_field_failure_reason`]), whose three tuples have to share a **single**
 //! rooted reservation (see that function). The carve writes terms through
 //! `beam_term`'s public constructors; it re-derives no layout.
 //!
@@ -205,7 +205,7 @@ pub(crate) fn write_record(
     definition_hash: Eterm,
 ) -> Result<Eterm> {
     // SAFETY: the caller (the family's `write_record_instance` /
-    // `write_local_record`) reserved `record_block_words(fields.len())`
+    // `write_created_record`) reserved `record_block_words(fields.len())`
     // exclusively-owned words at `hp` with a single rooted allocation
     // ([`crate::terms::reserve`]) and keeps them unmoved until the returned term is
     // written to its destination register; every key is an atom and duplicate keys
@@ -225,9 +225,9 @@ fn atom_of(term: Eterm) -> Result<Atom> {
     }
 }
 
-/// Lay out the create form's failure reason `{Tag, {{Module, Name}, Field}}` —
-/// the C's `TUPLE2(TUPLE2(Module, Name), Field)` (`erl_record.c:339-351`) — and
-/// return the tagged reason term.
+/// Lay out a record field failure reason `{Tag, {{Module, Name}, Field}}` — the C's
+/// `TUPLE2(TUPLE2(Module, Name), Field)` (`erl_record.c:339-351`) — and return the
+/// tagged reason term.
 ///
 /// The three 2-tuples are carved as **one contiguous 9-word block** reserved with
 /// a single rooted allocation, so the whole graph costs one (collecting)
@@ -241,8 +241,11 @@ fn atom_of(term: Eterm) -> Result<Atom> {
 /// ```
 ///
 /// Every element is an **immediate** (an atom or an `arityval` header), so no
-/// sub-term needs the heap and the reservation needs no spare tail.
-pub(crate) fn write_create_failure_reason(
+/// sub-term needs the heap and the reservation needs no spare tail. `Tag` is
+/// `badfield` for `put_record`'s update form, `update_record_id` and
+/// `get_record_field` (`erl_record.c:746-756`, `:814-821`, `:872-879`), and
+/// `badfield`/`novalue` for the create form's two delayed-field errors (`:331-351`).
+pub(crate) fn write_field_failure_reason(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     module: Atom,
