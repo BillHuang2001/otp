@@ -21,7 +21,8 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `line`/`noline`/`text`/`binary`/`getopts` control verbs — an unknown verb is `BadArg` — EOF
   de-registration, the `pub(crate)`
   read/write-slot seams `adopt_read_fd`/`release_read_fd`/`adopt_write_fd`/`release_write_fd`/
-  `has_*_fd`/`attached_fd`), `set_nonblocking`.
+  `has_*_fd`/`attached_fd`), `set_nonblocking`; **no `Driver::flush` override**, deliberately (see
+  *The close path, per driver*).
 - `efile.rs` → `EfileDriver` (`Driver::name() == "efile"`), `make_efile` (its `DriverFactory`),
   `FileDataMode`; the `open` flag grammar and `Access`
   translation reproduce the C's `efile_translate_modelist` + `get_flags`, and `open(2)` is retried on
@@ -35,8 +36,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   (the term-free `open_port/2` shape — an empty command/path or an empty argv ⇒ `BadArg`), the
   deferred `fork_exec_child`, `ChildProc`/`ForkedChild`; constructed via `with_stream_options`,
   **really spawning in the constructor** and reaping eagerly (`take_exit_status()`/`take_eof()` once
-  only). `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is
-  **never** closed.
+  only). `stop` deregisters/closes every descriptor **and gives the child end of file before anything
+  is killed** (see *The close path, per driver*), `Drop` does the same without the wait, and an
+  adopted `{fd,N}` is **never** closed.
 - `ram_file.rs` → `RamFileDriver` (`"ram_file_drv"`; a `Vec<u8>` "file", the C's **13 opcodes** and
   its `OK`/`NUMBER`/`DATA`/`ERROR` reply encodings), `make_ram_file`, `DRIVER_NAME` (aliased
   `RAM_FILE_DRIVER_NAME` at the crate root) and the `pub` `RAM_FILE_*` command/mode/whence/response
@@ -52,7 +54,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `ERROR <errno>` reply (`errno_atom`); only an unknown command word or a too-short argument is the
   typed `badarg`. The logical file is a `Vec<u8>` whose `len()` **is** the C's `end` (the C's
   separate allocation `size` field is unobservable and has no counterpart); a write past the end
-  zero-fills the gap (the C's `ram_file_expand`).
+  zero-fills the gap (the C's `ram_file_expand`). **No `Driver::flush` override** — the C entry is
+  `flush = NULL`, so the port's own `Closing` drain is what runs a queued command at close (see *The
+  close path, per driver*).
 - `inet/` → the `tcp_inet`/`udp_inet` socket drivers. [`Driver::control`](crate::Driver::control) takes
   the C's packed request payload in **two** wire forms: a **decimal** command is
   `erlang:port_control/3`'s integer `Op`, forwarded by the runtime as its decimal string and decoded
@@ -82,6 +86,22 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `erl_child_setup` text⇄binary machine, `Phase { Text, Binary }` (**default `Binary`** = raw
   passthrough), `PhaseChange`.
 - `mod.rs` → module wiring/re-exports only.
+
+## The close path, per driver (the mechanism is `../CONTEXT.md`'s — this is only each driver's half)
+`Driver::flush` is the **additive, defaulted** trait member the port layer's close path calls first, and it is the C's `drv->flush` (called from `flush_port`, `io.c:3659-3700`: the `flush != NULL` test at `:3664` and the call at `:3687`), which `erts_deliver_port_exit` reaches from its CLOSING arm (`io.c:3946-3954`, the `else` at `:3955` being `terminate_port`).
+It is a driver's one chance to **discard** queued output — never a second write loop.
+So the question a driver answers here is never "how do I write my queue at close?" (the port's `Closing` drain does that through the ordinary `OUTPUT` task → `ready_output` → `output` → `check_write_accounting`) but "may I throw any of it away?".
+`Driver::stop` is the C's `terminate_port` (`io.c:3704-3795`, whose sole `drv->stop` call is at `:3752`) and is reached only once that queue **emptied**; otherwise the port parks in [`crate::PortState::Closing`](crate::PortState) — the C's Limbo, `io.c:3968-3971` — its deferred half being `erts_port_driver_callback_epilogue` (`erts/emulator/beam/erl_port.h:798-812`, "CLOSING and the ioq is empty ⇒ terminate") and this crate's `PortRegistry::finish_closing_ports`, while the forced teardown after a `driver_failure*` (`io.c:7220`'s `prt->ioq.size = 0`) runs `stop` with the remainder dropped.
+A command on a `Closing` port is the C's `badarg` (`io.c:1440-1441`, `ERTS_PORT_SFLGS_INVALID_LOOKUP` includes `CLOSING`, `erl_port.h:351-353`).
+- `spawn.rs` — the **only `flush` overrider** here, and it only latches: the C's `fd_flush` sets `dd->terminating = 1` and writes nothing (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`; the "guarantee that things such as escripts … really have outputted all data before terminating" is documented at `:900-907`).
+  Its consumer is `SpawnDriver::stop`: after deregistering both directions it **closes the child's stdin first** (`close_stdin_for_eof`, the child's end of file — the effect the C `fd` driver reaches by closing the write descriptor in its own `stop`, `sys_drivers.c:1037-1052`), then, **only when the flush latched** `terminating`, lets the child exit on its own via `reap_after_stdin_eof` — non-blocking `try_wait` probes every `CHILD_EXIT_POLL_MS` (5 ms) under a `CHILD_EXIT_WAIT_MS` (250 ms) bound, each iteration also draining the child's stdout (`drain_stdout_for_exit`) so a `tee`-shaped child cannot block on a full stdout pipe with its stdin still unread — and kills + reaps (`reap_child`, the abrupt path) only on expiry or when nothing flushed.
+  An unflushed teardown therefore takes the abrupt kill path, and a child that outlives the bound is a **documented divergence** (the oracle would leave it running for `erl_child_setup` to reap).
+  The current teardown deliberately does **not** route the C's `driver_failure_atom(port,"normal")` epilogue (`:1468-1469`, the `ready_output` loop's exit once the queue emptied with the latch set): this floor's `stop` is synchronous — the port has already drained the queue before calling it — and a caller's `port_close/1` must not turn into an owner `{'EXIT',…}` message the oracle never sends.
+  `Drop` gives the child its end of file and then takes the abrupt path without the wait (no `DriverContext`, and an arbitrary thread must not stall for the bound); a duplex `{fd,N}` port has no separate stdin to close and no child to wait for, so only its registration/descriptor teardown applies.
+- `fd.rs` — **no `flush` override, deliberately**: the C's `fd_flush` latches only and never writes (`sys_drivers.c:1029-1034`), its `ready_output` keeps writing while the port is `CLOSING` (`:1448-1471`), and the port layer's `Closing` state plus its drain loop **is** that loop, so an override could only discard bytes the C keeps.
+  `FdDriver::stop` is consequently reached only once the queue emptied (or from the forced `close_now` after a `driver_failure*`), which is why it can close the descriptors without rescuing anything; its rustdoc records the reasoning so nobody re-investigates.
+- `ram_file.rs` — **no `flush` override**, because the C entry is literally `flush = NULL` (`erts/emulator/drivers/common/ram_file_drv.c:120`), so `flush_port` calls nothing and the port's own drain runs the queued command through the driver's `output` slot: a command queued by `erlang:port_command/2` and never driven by a round still **executes** at close, its reply staged as a completed read.
+  Because `output` consumes the whole payload the queue empties inside the drain, so this driver never parks — the parked half of the shape is unreachable from a `ram_file_drv` port.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only (`BadArg`/`Io`/`SystemLimit`, or `Raise` for the
@@ -213,7 +233,12 @@ children for `spawn`, loopback TCP/UDP + `erl`-oracle cross-checks for `inet`. B
 against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
 child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
 budget tuned for an idle host (see *Notes for Agents*).
-`ram_file.rs`'s suites (the sibling `ram_file_tests.rs`, 23 tests, plus the reply-split pin
+**Per-module in-module counts after the close-path split: `spawn` 27** (23 in `spawn.rs` + the 4 in `spawn_teardown_tests.rs`), **`fd` 17** (14 + the 3 in `fd_close_tests.rs`) and **`ram_file` 34** (23 in `ram_file_tests.rs` + 6 in `ram_file_split_tests.rs` + the 5 in `ram_file_close_tests.rs`) — 78 for the three together.
+Each driver's **close-path half is a sibling test module of its own source half** (`super` is the driver module) so the source file stays near its size target:
+- `spawn_teardown_tests.rs` (4) pins the **teardown ordering** over real children and a payload larger than a pipe buffer (512 KiB): `stop` gives the child end of file before anything is killed, a closed port's whole queued command really reaches the child, a child that never reads stdin does not hang the close (the bound, the documented divergence), and the same row cross-checked against the system `erl` (`erl` absent ⇒ skips **loudly**); every wait polls a condition under the 60 s hang guard.
+- `fd_close_tests.rs` (3) pins an `FdDriver` close over a real `UnixStream::pair`: a short write parks the close **before** `stop` (the parked port still owns its write fd), the parked remainder is delivered in full by the rounds, and `a_command_queued_before_a_close_is_written_by_the_close` pins the writing that "no `flush` override" must leave alone. Hermetic (no `cc`, no `erl`, no child).
+- `ram_file_close_tests.rs` (5) pins that a queued command **executes** in the close drain: the command's reply, a `write`'s `NUMBER` reply, a `DATA` reply keeping its header/body split, the port finishing inside the `close` call (nothing left to park — `is_closing` is the `badarg` for the gone port), and several commands queued without a round arriving as **one** payload. Hermetic.
+`ram_file.rs`'s other suites (the sibling `ram_file_tests.rs`, 23 tests, plus the reply-split pin
 `ram_file_split_tests.rs`, 6) need no OS resource: the reply
 encodings, the mode/whence bit tables, the zero-filled-gap/truncate semantics, the argument faults
 and the two transports' consume-what-you-report accounting are pure in-memory assertions driven
@@ -226,13 +251,20 @@ the other pins the high-level `ram_file:*` API shapes (`get_size`/`get_file`/`po
 The crate-level integration suites for this node are the sibling `../../tests/` ones: `inet.rs` (10), `udp_inet.rs` (6) and `ram_file.rs` (12).
 
 ## Routing Table
-- `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper)
+- `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper); **no `Driver::flush`**
+  (the port's `Closing` drain is the C's `ready_output` loop) — its close half is the sibling
+  `fd_close_tests.rs` (`#[cfg(test)] #[path = "fd_close_tests.rs"] mod close_tests;`, 3 tests)
 - `efile.rs` → `EfileDriver`/`make_efile`/`FileDataMode`, the `open` grammar + `Access`/`OpenFlags`
-- `spawn.rs` → `SpawnDriver`/`SpawnSpec`/`SpawnOptions`/`StreamOptions`/`build_command`
+- `spawn.rs` → `SpawnDriver`/`SpawnSpec`/`SpawnOptions`/`StreamOptions`/`build_command`,
+  `CHILD_EXIT_WAIT_MS`/`CHILD_EXIT_POLL_MS`; the **only `flush` overrider** here (it latches the C's
+  `fd_flush` `terminating`) feeding `stop`'s end-of-file-then-bounded-wait ordering — its teardown half
+  is the sibling `spawn_teardown_tests.rs` (`mod teardown_tests;`, 4 tests)
 - `ram_file.rs` → `RamFileDriver`/`make_ram_file`/`DRIVER_NAME` + the `RAM_FILE_*` command/mode/whence/response
-  constants (the in-memory command-driven file driver); its suites are the siblings `ram_file_tests.rs`
-  (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split pattern) and
-  `ram_file_split_tests.rs` (`mod split_tests;`, the `header`/`body` pin per reply shape)
+  constants (the in-memory command-driven file driver; **no `flush` override** — the C entry is
+  `flush = NULL`, so the close drain runs the command through `output`); its suites are the siblings
+  `ram_file_tests.rs` (`#[cfg(test)] #[path = "ram_file_tests.rs"] mod tests;`, the `inet/` split
+  pattern), `ram_file_split_tests.rs` (`mod split_tests;`, the `header`/`body` pin per reply shape) and
+  `ram_file_close_tests.rs` (`mod close_tests;`, 5 tests — a queued command executing in the close drain)
 - `line_buffer.rs` → `LineBuffer`; `binary_io.rs` → `Phase`/`PhaseChange`
 - `src/drivers/inet/` → the `tcp_inet` + `udp_inet` socket drivers; the option vocabulary
   (`opt.rs` — the five-byte/one-byte record walk over `Step`, the `SocketOptions` store, the
@@ -246,6 +278,7 @@ The crate-level integration suites for this node are the sibling `../../tests/` 
 - `../abi/` → the driver C-ABI host layer (sibling child node, not a built-in driver)
 
 ## See Also
-- `../CONTEXT.md` → the `beam_io` crate root: the frozen `Driver`/`DriverContext` seam, `PortRegistry`,
-  reducer constants, the per-driver API surface and the driver handoffs.
+- `../CONTEXT.md` → the `beam_io` crate root: the frozen `Driver`/`DriverContext` seam (incl. the
+  additive `Driver::flush`), `PortRegistry`, reducer constants, *The close path* (flush → drain → `stop`,
+  the park, `CLOSING_DRAIN_STALL_LIMIT`), the per-driver API surface and the driver handoffs.
 - `../../CONTEXT.md` → crate-layer contracts, the A.4 driver C-ABI contract.

@@ -43,7 +43,7 @@ use beam_process::PortId;
 use crate::driver::{Driver, DriverContext};
 use crate::poller::Poller;
 use crate::port::{
-    PortCommandOptions, PortCommandOutcome, PortState, CLOSING_DRAIN_STALL_LIMIT,
+    PortCommandOptions, PortCommandOutcome, CLOSING_DRAIN_STALL_LIMIT,
     DEFAULT_READINESS_RED_BUDGET as ROUND_BUDGET,
 };
 use crate::port_task::PortNotification;
@@ -266,7 +266,7 @@ fn a_fully_written_command_closes_inside_the_close_call() {
 }
 
 /// **The park**: a slow driver cannot write the whole command synchronously, so the port stays
-/// live in [`PortState::Closing`] — exactly the C's Limbo state, where the port "receives
+/// live in [`crate::PortState::Closing`] — exactly the C's Limbo state, where the port "receives
 /// in/out-put events so as soon as the port queue gets empty `terminate_port()` is called"
 /// (`ertes/emulator/beam/io.c:896-900`) — refuses further commands (`io.c:1440` answers `badarg`
 /// for `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-355`), and is
