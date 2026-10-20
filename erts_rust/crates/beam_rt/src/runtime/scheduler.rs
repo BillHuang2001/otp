@@ -1116,18 +1116,46 @@ impl Runtime {
     /// common case) or a node with nothing to do, so a pass never waits here — the node's
     /// sockets are non-blocking and only a peer that has already sent bytes is read.
     ///
+    /// # The creation sync point
+    ///
+    /// This is the **one** place the node's creation can change: `pump` runs
+    /// [`DistNode::register_once`], whose `ALIVE2` answer replaces the pre-registration
+    /// [`DEFAULT_CREATION`](crate::dist::DEFAULT_CREATION) with the incarnation `epmd`
+    /// assigned. The outbound half keeps its **own** copy of the creation
+    /// ([`DistClientInner::creation`](crate::dist_client)) for the pids/ports/references it
+    /// externalises, so it is re-installed here ([`Runtime::sync_dist_creation`]) —
+    /// **after** the pump, and unconditionally: a pump that registers and *then* fails an
+    /// `accept` must still leave the client on the new creation, or this node would advertise
+    /// one incarnation in its handshake and stamp another on its payloads.
+    ///
     /// # Errors
     ///
     /// Only the listener's own `accept` failures. A *link*'s failure is retired and
     /// recorded by the node itself ([`crate::dist::DistNode::last_link_error`]), never
     /// raised: a hostile or broken peer must not be able to fail a scheduler pass.
     pub(crate) fn pump_dist(&mut self) -> Result<usize> {
-        match self.dist.as_mut() {
+        let outcome = match self.dist.as_mut() {
             Some(node) => node.pump(),
-            None => Ok(0),
-        }
+            None => return Ok(0),
+        };
+        self.sync_dist_creation();
+        outcome
     }
 
+    /// Keeps the outbound distribution half's stored creation equal to the node's live one
+    /// ([`Runtime::node_creation`]) — the value the `'N'` handshake advertises and the value
+    /// every externalised payload this runtime sends must carry.
+    ///
+    /// Called from [`Runtime::pump_dist`] (the only place the creation can change:
+    /// [`crate::dist::DistNode::register_once`]) and cheap enough to call there
+    /// unconditionally: one field read, one compare, and on a settled node **no** write at
+    /// all ([`DistClient::set_creation`] returns immediately when the value already matches).
+    pub(crate) fn sync_dist_creation(&mut self) {
+        let creation = self.node_creation();
+        if let Some(client) = self.dist_client.as_ref() {
+            client.set_creation(creation);
+        }
+    }
     /// Gives every **established** accepted distribution link its peer's node atom term —
     /// the binding that makes the accepted half of the one node→link table
     /// ([`crate::dist::DistLinks`]) an **exact** node match.

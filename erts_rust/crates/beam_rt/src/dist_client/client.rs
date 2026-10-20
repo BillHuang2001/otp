@@ -178,9 +178,13 @@ impl DistClient {
     /// Installs this node's identity (the name/atom/creation an outbound handshake
     /// and every external pid this client builds must carry).
     ///
-    /// The runtime calls this immediately before [`DistClient::connect`], because the
-    /// node's creation is only known for certain **after** `epmd` answered its
-    /// `ALIVE2` registration (see [`crate::dist::DistNode::creation`]).
+    /// The runtime calls this while building itself
+    /// ([`Runtime::new`](crate::Runtime)) and again immediately before
+    /// [`DistClient::connect`], because the node's creation is only known for certain
+    /// **after** `epmd` answered its `ALIVE2` registration (see
+    /// [`crate::dist::DistNode::creation`]); the creation half is refreshed at that one
+    /// point by [`DistClient::set_creation`] (see
+    /// [`Runtime::sync_dist_creation`](crate::Runtime)).
     pub fn set_identity(&self, our_name: &str, our_node: Eterm, creation: u32, cookie: &[u8]) {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
             inner.our_name = our_name.as_bytes().to_vec();
@@ -190,9 +194,37 @@ impl DistClient {
         }
     }
 
-    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
-    /// default).
+    /// This node's creation **as this client has it** — the value every externalised
+    /// pid/port/reference and every outbound handshake this half builds carries.
     ///
+    /// It must equal [`Runtime::node_creation`](crate::Runtime) (the node's live
+    /// creation, which is what `term_to_binary/1` and the `'N'` handshake use), or this
+    /// runtime would advertise one incarnation and stamp another — see
+    /// [`Runtime::sync_dist_creation`](crate::Runtime), the point that keeps them equal.
+    ///
+    /// `None` while another borrow of the shared cell is in flight (a pump or a drain is
+    /// running and is rewriting the value): an unreadable answer, never a fabricated `0`.
+    /// `Some(0)` is the honest answer before [`DistClient::set_identity`] was called.
+    pub fn creation(&self) -> Option<u32> {
+        self.inner.try_borrow().ok().map(|inner| inner.creation)
+    }
+    /// Refreshes **only** the creation (the half `epmd` assigns), leaving the name, node
+    /// atom and cookie untouched.
+    ///
+    /// The creation is the one identity field that changes after the runtime is built
+    /// (`DistNode`'s `ALIVE2` registration), so this is the cheap re-install
+    /// [`Runtime::sync_dist_creation`](crate::Runtime) runs at the pump that finalises it —
+    /// no allocation, and a no-op (no borrow taken for a write) once the value already
+    /// matches, which is every pump after the first.
+    pub fn set_creation(&self, creation: u32) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            if inner.creation != creation {
+                inner.creation = creation;
+            }
+        }
+    }
+    /// Marks this node **hidden** (`-hidden`) — or, with `false`, published (the
+    /// default).    ///
     /// An outbound link then advertises [`crate::dist::advertised_flags`]'s set, which
     /// omits `DFLAG_PUBLISHED` for a hidden node, so a real peer records this runtime as
     /// [`beam_dist::PeerVisibility::Hidden`] and leaves it out of `nodes()` — the

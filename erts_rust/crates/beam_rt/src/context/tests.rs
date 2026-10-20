@@ -36,7 +36,51 @@ use crate::runtime::GcStatsSnapshot;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
 }
-
+/// A runtime that **is** a distributed node, built through the CLI parser exactly as a command
+/// line builds one: `-sname <name>` makes the runtime bind its distribution listener, which is
+/// all the identity needs (no `epmd` is contacted until the first scheduler pass's pump, so a
+/// hermetic test sees the pre-registration
+/// [`DEFAULT_CREATION`](crate::dist::DEFAULT_CREATION)).
+///
+/// The name carries the pid **and** a per-call counter, because the tests of one binary run
+/// concurrently in one process and two listeners may not share a node name.
+fn named_runtime(tag: &str) -> Runtime {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("beamrtid{tag}{}{serial}", std::process::id());
+    let args: Vec<String> = [
+        "-noshell",
+        "-sname",
+        &name,
+        "-setcookie",
+        "identity-cookie",
+        "-eval",
+        "ok.",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let config = crate::parse(&args).expect("the node switches parse");
+    Runtime::new(config).expect("the runtime starts (the listener binds)")
+}
+/// The bytes of a binary term, read back **through the registry** (`erlang:byte_size/1` +
+/// `binary:at/2`) — this crate is `#![deny(unsafe_code)]` and the term readers are not safe
+/// APIs here, so a test never reaches into a bitstring's storage itself.
+fn registry_bytes(ctx: &mut RuntimeContext<'_>, term: Eterm) -> Vec<u8> {
+    let size = signed_value(
+        ctx.call_bif("erlang", "byte_size", 1, &[term])
+            .expect("erlang:byte_size/1"),
+    );
+    assert!(size > 0, "an encoded image is never empty");
+    (0..size)
+        .map(|index| {
+            let byte = ctx
+                .call_bif("binary", "at", 2, &[term, make_small(index)])
+                .expect("binary:at/2");
+            signed_value(byte) as u8
+        })
+        .collect()
+}
 #[test]
 fn dispatches_a_registered_erlang_bif() {
     let mut rt = runtime();
@@ -2432,18 +2476,184 @@ fn the_local_node_identity_is_nonode_at_nohost_with_creation_zero() {
     // `term_to_binary/1` of an internal pid can emit `NEW_PID_EXT` (88).
     let rt = runtime();
     let expected = rt.atoms().lookup("nonode@nohost").expect("seeded at boot");
+    // An undistributed runtime (`RuntimeConfig::default()`) has no `DistNode` at all, so the
+    // live creation is the C's `erts_creation` of a node that never connected: `0`.
+    assert_eq!(rt.node_creation(), 0, "no `-name`/`-sname` → no creation");
     let mut identity = NodeIdentity {
         node: rt.atoms().lookup("nonode@nohost"),
+        creation: rt.node_creation(),
     };
     assert_eq!(identity.local_node(), Some((expected, 0)));
 
     // A table without the atom answers `None` — an unencodable id, never a
     // fabricated node.
-    let mut identity = NodeIdentity { node: None };
+    let mut identity = NodeIdentity { node: None, creation: 0 };
     assert_eq!(identity.local_node(), None);
 }
 
+/// A **distributed** runtime's identity carries the **live** `DistNode::creation()` — not the
+/// undistributed `0`, and not a value captured at `Runtime::new`.
+///
+/// The undistributed case stays exactly as the test above pins it
+/// (`nonode@nohost`/`0`): a runtime with no `-name`/`-sname` has no node, so it can have no
+/// creation, which is the C's own answer for a node that never connected anywhere.
 #[test]
+fn the_identity_of_a_distributed_runtime_carries_the_live_creation() {
+    let rt = named_runtime("live");
+    let node_creation = rt
+        .dist_node()
+        .expect("a `-sname` runtime is a node")
+        .creation();
+    assert_ne!(
+        node_creation, 0,
+        "a wired node's creation is never the undistributed `0`"
+    );
+    assert_eq!(
+        rt.node_creation(),
+        node_creation,
+        "`Runtime::node_creation` is the node's own live creation"
+    );
+    let node = rt.local_node();
+    let mut identity = NodeIdentity { node: Some(node), creation: rt.node_creation() };
+    assert_eq!(
+        identity.local_node(),
+        Some((node, node_creation)),
+        "the `LocalNode` seam answers the runtime's own node **and** its live creation"
+    );
+    // The atom is the full `name@host`, so the creation is not paired with `nonode@nohost`.
+    let name = rt
+        .atom_name_of(rt.local_node_term())
+        .expect("the node atom has a name")
+        .to_string();
+    assert!(name.starts_with("beamrtidlive"), "the node names itself, got {name:?}");
+}
+
+/// The image `term_to_binary/1` writes for an internal pid carries the **live** creation: it
+/// demotes back to the internal term when decoded with the identity this node advertises, and
+/// it does **not** when decoded with the undistributed creation `0` the seam used to report.
+///
+/// The second half is the negative control that makes the first meaningful: the demotion in
+/// `beam_codec` is identity-gated on node **and** creation (`dec_is_this_node`,
+/// `external.c:3123-3129`), so an image stamped `0` would look **remote** to a peer that knows
+/// this node at creation `1` — the defect this test pins.
+#[test]
+fn a_pid_image_carries_the_live_creation() {
+    let mut rt = named_runtime("image");
+    let creation = rt.node_creation();    assert_ne!(creation, 0, "a wired node mints with a real creation");
+    let name = rt
+        .atom_name_of(rt.local_node_term())
+        .expect("the node atom has a name")
+        .to_string();
+    let pid = rt.self_pid().to_eterm();
+    let (image, is_pid) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let image = ctx
+            .call_bif("erlang", "term_to_binary", 1, &[pid])
+            .expect("term_to_binary(self())");
+        let bytes = registry_bytes(&mut ctx, image);
+        // The wire tag proves this really is a `NEW_PID_EXT` (88) and not some other shape.
+        assert_eq!(bytes.first(), Some(&131), "an ETF image starts with VERSION_MAGIC");
+        assert_eq!(bytes.get(1), Some(&88), "an internal pid is a NEW_PID_EXT");
+        (
+            bytes,
+            ctx.call_bif("erlang", "is_pid", 1, &[pid]).expect("is_pid/1"),
+        )
+    };
+    assert_eq!(rt.atom_name_of(is_pid), Some("true"));
+
+    // Decoded with the identity this node advertises: the internal term comes back.
+    let mut heap = beam_alloc::Heap::new(256).expect("a decode heap");
+    let mut atoms = AtomTable::new();
+    let node_atom = atoms.intern(&name);
+    let demoted = beam_codec::decode_term_with_local_node(
+        &image,
+        &mut heap,
+        &mut atoms,
+        node_atom,
+        creation,
+        None,
+    )
+    .expect("the image decodes at the live creation");
+    assert_eq!(
+        demoted, pid,
+        "a pid minted here and decoded at this node's creation is the very same term"
+    );
+    assert!(
+        beam_term::prelude::is_internal_pid(demoted),
+        "an identifier naming this node at this creation decodes to the INTERNAL term"
+    );
+
+    // The negative control: at the undistributed creation `0` — the value the seam reported
+    // before this fix — the very same image stays an **external** pid.
+    let mut heap = beam_alloc::Heap::new(256).expect("a decode heap");
+    let mut atoms = AtomTable::new();
+    let node_atom = atoms.intern(&name);
+    let external = beam_codec::decode_term_with_local_node(
+        &image, &mut heap, &mut atoms, node_atom, 0, None,
+    )
+    .expect("the image still decodes at a foreign creation");
+    assert!(
+        !beam_term::prelude::is_internal_pid(external),
+        "a creation-0 identity must NOT demote this node's creation-{creation} pid"
+    );
+    assert_ne!(
+        external, pid,
+        "an image that does not name this incarnation is not this node's pid"
+    );
+}
+
+/// The creation is read **live**, per call: when `epmd` reissues it (the one production writer,
+/// driven here through the test seam), the very next `term_to_binary/1` stamps the new value and
+/// the previous one stops matching.
+///
+/// This is the test that rules out a snapshot: a value captured at `Runtime::new` would keep
+/// stamping the pre-registration creation for the rest of the run.
+#[test]
+fn a_reissued_creation_is_picked_up_by_the_next_call() {
+    let mut rt = named_runtime("reissue");
+    let name = rt
+        .atom_name_of(rt.local_node_term())
+        .expect("the node atom has a name")
+        .to_string();
+    let first = rt.node_creation();
+    let pid = rt.self_pid().to_eterm();
+    let snapshot = std::cell::Cell::new(None::<Vec<u8>>);
+    let encode = |rt: &mut Runtime, out: &std::cell::Cell<Option<Vec<u8>>>| {
+        let mut ctx = RuntimeContext::new(rt);
+        let image = ctx
+            .call_bif("erlang", "term_to_binary", 1, &[pid])
+            .expect("term_to_binary(self())");
+        out.set(Some(registry_bytes(&mut ctx, image)));
+    };
+    encode(&mut rt, &snapshot);
+    let before = snapshot.take().expect("the first image");
+    let decode_at = |bytes: &[u8], creation: u32| {
+        let mut heap = beam_alloc::Heap::new(256).expect("a decode heap");
+        let mut atoms = AtomTable::new();
+        let node_atom = atoms.intern(&name);
+        beam_codec::decode_term_with_local_node(bytes, &mut heap, &mut atoms, node_atom, creation, None)
+            .expect("the image decodes")
+    };
+    assert!(
+        beam_term::prelude::is_internal_pid(decode_at(&before, first)),
+        "the first image carries the creation in force when it was written"
+    );
+
+    // `epmd`'s ALIVE2 answer reissues the incarnation.
+    rt.set_node_creation_for_test(9);
+    assert_eq!(rt.node_creation(), 9, "the runtime reports the reissued creation");
+    encode(&mut rt, &snapshot);
+    let after = snapshot.take().expect("the second image");
+    assert_ne!(before, after, "the reissued creation changes the image's bytes");
+    assert!(
+        beam_term::prelude::is_internal_pid(decode_at(&after, 9)),
+        "the new image carries the reissued creation"
+    );
+    assert!(
+        !beam_term::prelude::is_internal_pid(decode_at(&after, first)),
+        "the new image no longer matches the creation it was written at"
+    );
+}#[test]
 fn term_to_binary_of_an_internal_pid_is_a_new_pid_ext() {
     // End to end through the real dispatch: the `LocalNode` hook installed by
     // `call_registered` turns the runtime's own pid into the oracle's `NEW_PID_EXT`
@@ -2537,9 +2747,8 @@ fn node_hash_is_stable_within_an_os_process() {
     let rt = runtime();
     assert_eq!(node_hash::node_hash(), first, "a second runtime reports the same hash");
     assert_eq!(
-        NodeIdentity { node: rt.atoms().lookup("nonode@nohost") }
-            .local_node_hash(),
-        Some(first),
+        NodeIdentity { node: rt.atoms().lookup("nonode@nohost"), creation: rt.node_creation() }
+            .local_node_hash(),        Some(first),
         "the LocalNode seam answers the same per-process hash"
     );
 }

@@ -190,6 +190,18 @@ impl DistNode {
         self.creation
     }
 
+    /// Test-only: sets the creation exactly as [`DistNode::register_once`] does when `epmd`
+    /// answers its `ALIVE2` registration.
+    ///
+    /// Registration is the **only** production writer of this field and it needs a live
+    /// `epmd` daemon, which a hermetic test has no way to provide — so the identity tests that
+    /// must observe the creation *changing* (and the `Runtime` sync point that keeps the
+    /// outbound half's copy equal to it) drive it through here. Same floor as the production
+    /// write (`creation.max(1)`: `0` is the undistributed value, never a node's).
+    #[cfg(test)]
+    pub(crate) fn set_creation_for_test(&mut self, creation: u32) {
+        self.creation = creation.max(1);
+    }
     /// Whether `epmd` accepted the registration.
     pub fn is_registered(&self) -> bool {
         self.registered
