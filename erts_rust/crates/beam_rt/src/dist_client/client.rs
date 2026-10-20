@@ -754,12 +754,33 @@ impl DistClientInner {
     /// node's ([`crate::dist::DistNode::dispatch_inbound`]).
     fn dispatch(&mut self, atoms: &mut AtomTable, sink: &mut dyn InboundSink) -> Result<usize> {
         self.dispatch_heap.reset();
+        // This node's **decode-side identity** (`beam_dist::control::LocalIdentity`), built
+        // in the table this drain decodes against: an inbound pid/port/reference naming us
+        // at our creation decodes to the internal term (the C's `dec_is_this_node`,
+        // `external.c:3123-3129`), for the control arguments and the trailing message alike.
+        //
+        // Rebuilt per drain, not stored: an `Atom` is a table-local index, so an identity
+        // interned into an earlier (possibly cloned) table could be silently inert. An
+        // empty `our_name` means no identity was ever installed — then nothing is installed
+        // here either, rather than naming the empty atom.
+        let identity = if self.our_name.is_empty() {
+            None
+        } else {
+            Some(beam_dist::control::LocalIdentity::intern(
+                atoms,
+                &self.our_name,
+                self.creation,
+            )?)
+        };
         let mut delivered = 0;
         let mut index = 0;
         while index < self.links.outbound.len() {
             if !self.links.outbound[index].is_established() {
                 index += 1;
                 continue;
+            }
+            if let Some(identity) = identity {
+                self.links.outbound[index].driver.set_local_identity(identity);
             }
             // The decode arena and the link are disjoint fields, so both are borrowed
             // for the duration of the decode only.

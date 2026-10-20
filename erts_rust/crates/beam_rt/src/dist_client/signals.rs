@@ -73,7 +73,20 @@ pub(super) fn monitor_ref_term(
     creation: u32,
 ) -> Result<Eterm> {
     let id = reference.id();
-    let ids = [0u32, (id >> 32) as u32, id as u32];
+    // The C's `erts_set_ref_numbers` pack (`erl_bif_unique.h:115-134`): the 18-bit
+    // reference number in `num[0]`, its bits 18..31 in `num[1]`, the rest in `num[2]` —
+    // the *same* mapping `beam_codec`'s (crate-internal) `ref_wire::ref_id_to_numbers`
+    // uses for an internal reference's wire image, and therefore the mapping an inbound
+    // decode with this node's `LocalIdentity` unpacks back
+    // (`LocalDeliverySink::wire_monitor_ref_id`). Packing the id differently here would
+    // make our own reference come back as a *different* id once the decode demotes it.
+    const REF_MASK: u32 = (1 << 18) - 1;
+    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
+    let ids = [
+        (id & u64::from(REF_MASK)) as u32,
+        (id & u64::from(REF1_NUM_MASK)) as u32,
+        (id >> 32) as u32,
+    ];
     make_external_ref(heap, node, &ids, creation)
 }
 

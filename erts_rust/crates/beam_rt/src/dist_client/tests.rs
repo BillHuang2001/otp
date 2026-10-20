@@ -656,8 +656,14 @@ fn a_locally_minted_monitor_exit_reference_uses_the_monitor_spelling() {
     let id = reference.id();
     assert_eq!(
         ids,
-        [0u32, (id >> 32) as u32, id as u32],
-        "the reference id in the monitor family's 3-id big-endian split"
+        [
+            (id & u64::from((1u32 << 18) - 1)) as u32,
+            (id & u64::from(0xFFFC_0000u32)) as u32,
+            (id >> 32) as u32,
+        ],
+        "the C's `erts_set_ref_numbers` pack (num[0] = the 18-bit number, num[1] = its \
+         bits 18..31, num[2] = the rest), so an inbound decode with this node's \
+         LocalIdentity restores exactly this id"
     );
 }
 

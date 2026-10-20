@@ -1227,6 +1227,18 @@ impl Runtime {
         // The sink is scoped so the fragment replay below can take `&mut self`.
         let (dispatched, fragment_pids) = {
             let mut sink = LocalDeliverySink::new(&mut self.processes, atom, creation);
+            // The **decode-side identity** (`beam_dist::control::LocalIdentity`): a
+            // pid/port/reference naming this node at this creation decodes to the internal
+            // term (the C's `dec_is_this_node`, `external.c:3123-3129`). Installed on the
+            // caller's driver for exactly this drain, in the table the decode uses. Unlike
+            // the per-link *validation*, this needs nothing from the driver's own handshake
+            // names — it is this runtime's own view of who it is.
+            let identity = beam_dist::control::LocalIdentity::intern(
+                self.code_server.atoms_mut(),
+                name.as_bytes(),
+                creation,
+            )?;
+            driver.set_local_identity(identity);
             let dispatched =
                 driver.dispatch_inbound(heap, self.code_server.atoms_mut(), &mut sink)?;
             (dispatched, sink.take_fragment_deliveries())
