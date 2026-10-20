@@ -54,7 +54,7 @@
 
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, GcConfig, GcStats, HeapInfo, HeapPolicy, MatureKind,
-    MatureSource, IMMIX_BREAK_EVEN_WORDS, LINE_WORDS,
+    MatureSource, BLOCK_WORDS, IMMIX_BREAK_EVEN_WORDS, LINE_WORDS, MATURE_TARGET_LIVE_MULTIPLE,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
@@ -70,11 +70,12 @@ use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
 /// A curated growth-table size (the `+hms`-style floor must be a fixed point,
 /// `erl_process.c:12575`). See [`RESERVE_WORDS`] for the fixed-point arithmetic.
 const NURSERY_WORDS: usize = 2586;
-/// The mature generation the workload promotes into, in words. A whole number of
-/// mark-region blocks (32 × 256), so the mark-region space's block rounding lands on exactly
-/// this capacity too and the two strategies see the same geometry. Kept at exactly this size by
-/// the live set the workload keeps alive (see [`workload_policy`]), not by a `min_heap_words`
-/// floor.
+/// The mature generation the workload is **born** with, in words — the policy's
+/// `initial_mature_words`. A whole number of mark-region blocks (32 × 256), so the mark-region
+/// space's block rounding lands on exactly this capacity too and both strategies *start* from
+/// the same geometry. It is not where they end: a fullsweep installs the live-set target
+/// [`HeapPolicy::mature_target_words`], which this workload's live set and nursery occupancy put
+/// at [`COPYING_MATURE_WORDS`] — see that constant for the arithmetic.
 const MATURE_WORDS: usize = 8192;
 /// The mutator's tuple: 15 elements + a header = **16 words = exactly one [`LINE_WORDS`] line**.
 ///
@@ -114,17 +115,56 @@ const GROW_REQUEST: usize = 48;
 ///   words (and `live + 2048 <= 2586` for every one up to 538), that stays true even at the
 ///   transient live sets the working-set replacement produces; `min_heap_words` floors both
 ///   targets at [`NURSERY_WORDS`] regardless.
-/// * **The mature generation.** A fullsweep's `need_after` is `live + young occupancy +
-///   reserve`, i.e. at most `256 + 2586 + 2048 = 4890` words and at least `0 + 0 + 2048 = 2048`.
-///   Both are inside the *keep* band [`HeapPolicy::mature_after_fullsweep`] needs —
-///   `(MATURE_WORDS / 4, 3 × MATURE_WORDS / 4] = (2048, 6144]` (the lower edge is an inclusive
-///   "not shrinking" edge: `should_shrink` needs `capacity > 4 × need_after`) — so the mature
-///   generation is never grown and never shrunk either.
+/// * **The mature generation.** A fullsweep installs the live-set target
+///   [`HeapPolicy::mature_target_words`] — `next_words(2 × (live + young occupancy + reserve))`
+///   — so the capacity this workload runs at is *derived from its live set* rather than held at
+///   the initial [`MATURE_WORDS`] (the figure is [`COPYING_MATURE_WORDS`]). The cadence fires a
+///   fullsweep at a **full** nursery (every collection is admitted at the heap-admission point,
+///   and the nursery collapses back onto [`NURSERY_WORDS`] after each one), so the target is
+///   re-derived as the same figure and the rule's `capacity < target` branch never fires: the
+///   capacity is a fixed point. The two fullsweeps `ensure_capacity` runs on an empty nursery
+///   derive the smaller growth-table entry for `256 + 0 + 2048` words instead, and the
+///   target-keyed rule keeps the larger capacity, because it only shrinks a space that exceeds
+///   four times its target (`HeapPolicy::should_shrink`).
 ///
-/// The mark-region space rounds its capacity to whole [`LINE_WORDS`]-blocks and [`MATURE_WORDS`]
-/// is a whole number of them, so both strategies keep exactly the geometry they were born with:
-/// identical admission answers, identical collection kinds, identical capacities.
+/// The mark-region space rounds its capacity up to whole [`BLOCK_WORDS`]-word blocks and the
+/// copying space does not, so once a fullsweep has sized the mature generation the strategies
+/// share one *target* but not one capacity ([`COPYING_MATURE_WORDS`] vs [`IMMIX_MATURE_WORDS`]).
+/// That block rounding is the one geometry difference the strategies are allowed; the
+/// admission answers, the collection kinds and the nursery geometry still agree exactly, which
+/// is what the lockstep run forces.
 const RESERVE_WORDS: usize = 2048;
+
+/// The words the workload keeps alive: its [`LIVE_TUPLES`] one-line working-set tuples, every
+/// one of them a root. 16 × 16 = **256 words**.
+const LIVE_WORDS: usize = LIVE_TUPLES * TUPLE_WORDS;
+
+/// The nursery's fill, in words, when a collection fires: the burst writes the working set and
+/// then whole [`TUPLE_WORDS`]-word tuples until [`AnyCollector::should_collect`] answers `true`,
+/// i.e. until fewer than one tuple's words are left (`NURSERY_WORDS - fill < TUPLE_WORDS`).
+/// `256 + 145 × 16 = 2576`, leaving 10 of the 2586 words free.
+const YOUNG_OCCUPANCY_WORDS: usize =
+    LIVE_WORDS + (NURSERY_WORDS - LIVE_WORDS) / TUPLE_WORDS * TUPLE_WORDS;
+
+/// The mature capacity the workload actually runs at — the rule's target at a fullsweep that
+/// sees the **full** nursery (which is where the cadence fires), i.e. the figure the first such
+/// fullsweep installs and every later one re-derives:
+///
+/// ```text
+/// need_after = live + young occupancy + reserve = 256 + 2576 + 2048 = 4880
+/// target     = next_words(MATURE_TARGET_LIVE_MULTIPLE × 4880, 0) = next_words(9760) = 10958
+/// ```
+///
+/// i.e. `workload_policy().mature_target_words(LIVE_WORDS, YOUNG_OCCUPANCY_WORDS)`; the copying
+/// space installs that figure verbatim, and the test re-derives it rather than trusting the
+/// literal.
+const COPYING_MATURE_WORDS: usize = 10958;
+
+/// The mark-region space's mature capacity: the same target rounded **up to whole blocks**
+/// ([`ImmixSpace::with_allocator`](beam_gc::ImmixSpace::with_allocator) sizes the space as
+/// `block_count(target) × BLOCK_WORDS`), so `ceil(10958 / 256) = 43` blocks = **11008 words**.
+const IMMIX_MATURE_WORDS: usize = COPYING_MATURE_WORDS.div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
+const _: () = assert!(IMMIX_MATURE_WORDS == 11008);
 
 /// The size of the process's **working set**: how many one-line [`TUPLE_WORDS`]-word tuples it
 /// keeps reachable across a round. Constant by design — the nursery's capacity is a fixed point
@@ -135,17 +175,18 @@ const RESERVE_WORDS: usize = 2048;
 /// [`NURSERY_WORDS`] (see [`RESERVE_WORDS`]).
 const LIVE_TUPLES: usize = 16;
 
-/// A **fixed-geometry** policy: both spaces born at, and held at, a fixed point of the sizing
-/// rules, so neither strategy ever resizes a space and both see the same cadence.
+/// A **fixed-geometry** policy: the nursery is born at, and held at, a fixed point of the sizing
+/// rules, and the mature generation is sized by the live set, so both strategies see the same
+/// cadence.
 ///
 /// The nursery is the policy's **initial heap** — [`HeapPolicy::initial_heap_words`], i.e. the
 /// C's `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` at spawn
 /// (`erl_process.c:12586-12592`) — and [`NURSERY_WORDS`] is simultaneously its `min_heap_words`
 /// floor, its initial size *and* the live set's target, so it starts and stays there. The mature
 /// generation cannot be floored the same way (`min_heap_size` floors the *young* heap too,
-/// `next_words` raises every size to it, `erl_gc.c:347-352`), so it is held by the *live set*
-/// instead: [`RESERVE_WORDS`] places every fullsweep's `need_after` inside the keep band around
-/// [`MATURE_WORDS`]. See those two constants for the arithmetic.
+/// `next_words` raises every size to it, `erl_gc.c:347-352`), so it is *sized* by the live set
+/// instead: the first fullsweep installs [`COPYING_MATURE_WORDS`] and every later one keeps it.
+/// See [`RESERVE_WORDS`] for the arithmetic.
 fn workload_policy() -> HeapPolicy {
     HeapPolicy {
         min_heap_words: NURSERY_WORDS,
@@ -462,15 +503,60 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     assert_eq!(copying.policy(), &workload_policy());
     assert_eq!(immix.policy(), copying.policy());
 
-    // The `garbage_collection` item agrees field for field: this workload's fixed geometry
-    // holds both mature generations at the same capacity, so even `total_heap_size` matches.
+    // Both fullsweeps reproduced the rule's target *is the capacity the run holds*: re-derive it
+    // from the workload's live set and nursery occupancy instead of trusting the pin
+    // (`next_words(2 × (256 + 2576 + 2048))` = `next_words(9760)` = 10958), then take each
+    // strategy's own rounding of it — the copying space installs the target verbatim, the
+    // mark-region space rounds it up to whole blocks (11008).
+    let rule_target = workload_policy().mature_target_words(LIVE_WORDS, YOUNG_OCCUPANCY_WORDS);
+    assert_eq!(
+        rule_target, COPYING_MATURE_WORDS,
+        "the rule's target for this workload's live set and nursery occupancy"
+    );
+    assert_eq!(
+        MATURE_TARGET_LIVE_MULTIPLE * (LIVE_WORDS + YOUNG_OCCUPANCY_WORDS + RESERVE_WORDS),
+        9760,
+        "the un-multiplied room the target is `next_words` of"
+    );
+
+    // The `garbage_collection` item agrees field for field **except** `total_heap_size`, which
+    // composes the mature capacity: the two strategies reach the same target but round it
+    // differently, so each side is pinned against its own derived figure. (Every other field is
+    // strategy-independent: the nursery geometry, the policy's knobs, the minor count.)
     let info_c: HeapInfo = copying.heap_info();
     let info_i: HeapInfo = immix.heap_info();
-    assert_eq!(info_i, info_c);
+    assert_eq!(info_i.minor_gcs, info_c.minor_gcs, "minor_gcs");
+    assert_eq!(info_i.fullsweep_after, info_c.fullsweep_after, "fullsweep_after");
+    assert_eq!(info_i.min_heap_size, info_c.min_heap_size, "min_heap_size");
+    assert_eq!(
+        info_i.min_bin_vheap_size, info_c.min_bin_vheap_size,
+        "min_bin_vheap_size"
+    );
+    assert_eq!(info_i.max_heap_size, info_c.max_heap_size, "max_heap_size");
+    assert_eq!(info_i.heap_size, info_c.heap_size, "heap_size");
     assert_eq!(info_c.heap_size, NURSERY_WORDS);
-    assert_eq!(info_c.total_heap_size, NURSERY_WORDS + MATURE_WORDS);
     assert_eq!(info_c.min_heap_size, NURSERY_WORDS);
     assert_eq!(info_c.minor_gcs, copying.minor_gcs());
+    // `total_heap_size` = nursery + the strategy's own mature capacity.
+    assert_eq!(
+        info_c.total_heap_size,
+        NURSERY_WORDS + COPYING_MATURE_WORDS,
+        "copying: nursery + `mature_target_words(live, occ)`"
+    );
+    assert_eq!(
+        info_i.total_heap_size,
+        NURSERY_WORDS + IMMIX_MATURE_WORDS,
+        "mark-region: nursery + `mature_target_words(live, occ)` rounded up to whole blocks"
+    );
+    // The block rounding is the whole of the difference — one mark-region block at most.
+    assert_eq!(
+        IMMIX_MATURE_WORDS,
+        COPYING_MATURE_WORDS.div_ceil(BLOCK_WORDS) * BLOCK_WORDS,
+        "the mark-region capacity is the copying capacity rounded up to whole blocks"
+    );
+    assert_eq!(IMMIX_MATURE_WORDS % BLOCK_WORDS, 0, "a whole number of blocks");
+    assert!(IMMIX_MATURE_WORDS >= COPYING_MATURE_WORDS);
+    assert!(IMMIX_MATURE_WORDS - COPYING_MATURE_WORDS < BLOCK_WORDS);
 
     // The collection *counts* agree; only the strategy's copy work may differ (the mark-region
     // path pins whole blocks instead of re-copying them).
@@ -485,9 +571,9 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     );
     assert!(stats_c.minor_collections > 0 && stats_c.major_collections > 0);
 
-    // Both mature generations are at the configured capacity, and both retained the live roots.
-    assert_eq!(copying.mature_capacity_words(), MATURE_WORDS);
-    assert_eq!(immix.mature_capacity_words(), MATURE_WORDS);
+    // Both mature generations are at their own derived capacity, and both retained the live roots.
+    assert_eq!(copying.mature_capacity_words(), COPYING_MATURE_WORDS);
+    assert_eq!(immix.mature_capacity_words(), IMMIX_MATURE_WORDS);
     assert!(
         copying.mature_used_words() > 0,
         "the live roots were promoted"
@@ -498,11 +584,11 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     );
     assert_eq!(
         copying.mature_used_words() + copying.mature_available_words(),
-        MATURE_WORDS
+        COPYING_MATURE_WORDS
     );
     assert_eq!(
         immix.mature_used_words() + immix.mature_available_words(),
-        MATURE_WORDS
+        IMMIX_MATURE_WORDS
     );
 }
 
