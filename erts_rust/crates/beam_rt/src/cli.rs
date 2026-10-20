@@ -671,7 +671,8 @@ impl Builder {
     /// `+hms 4000 +hmax 500` is accepted because the first `+hmax` it parses has no
     /// predecessor. Verified against OTP 29.1.1 (see [`max_heap_below_min_heap`]).
     fn rejects_max_heap(&mut self, max: usize) -> bool {
-        let rejected = self.prev_max_heap_words != 0 && self.prev_max_heap_words < self.raw_min_heap_words;
+        let rejected =
+            self.prev_max_heap_words != 0 && self.prev_max_heap_words < self.raw_min_heap_words;
         self.prev_max_heap_words = max;
         rejected
     }
