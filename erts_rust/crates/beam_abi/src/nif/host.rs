@@ -369,8 +369,16 @@ pub trait NifHost {
         None
     }
 
-    /// Schedule `fptr` to run as `fun_name`, possibly on a dirty scheduler (C `enif_schedule_nif`),
-    /// returning the term of the scheduled call; default: unsupported.
+    /// **Legacy hook that [`enif_schedule_nif`](crate::nif::enif::process::enif_schedule_nif) no
+    /// longer consults.** The continuation trampoline
+    /// ([`nif::enif::schedule`](crate::nif::enif::schedule)) runs the scheduled call itself, so this
+    /// hook is kept **for source compatibility only** (an implementor that still overrides it keeps
+    /// compiling) and its answer is ignored. It was never able to express the C's contract: it takes
+    /// no `argv`, so it could not run the continuation, and `enif_schedule_nif`'s own return is the
+    /// C's trap marker (`THE_NON_VALUE`) rather than the value the scheduled call will produce.
+    ///
+    /// Use [`NifHost::nif_yield_point`] for the one thing the runtime *is* asked to do during a
+    /// chain; default: unsupported.
     fn schedule_nif(
         &mut self,
         fun_name: &str,
@@ -382,6 +390,24 @@ pub trait NifHost {
         None
     }
 
+    /// A **yield point** for a scheduled NIF chain, called once per continuation trampoline
+    /// iteration (C: the emulator's own scheduler preemption between the trap re-runs of
+    /// `enif_schedule_nif`). `flags` is the dirty-job flag word of the continuation about to run
+    /// (`0` for a normal schedule).
+    ///
+    /// This exists because a self-rescheduling chain is otherwise unbounded work on one thread: the
+    /// oracle is fair — with `+S 1:1`, an unrelated process ran 3 000 033 `receive … after 0`
+    /// iterations while a 3 000 000-entry chain ran — so a host that wants the same fairness
+    /// preempts (and, in a real scheduler, reschedules) here. Default: a no-op, which keeps the
+    /// chain's old "the caller owns the thread until the chain ends" behaviour.
+    ///
+    /// The host already receives the chain's env, so a rescheduling host must be careful not to
+    /// re-enter the continuation it is yielding from; the loop in
+    /// [`nif::enif::schedule::run`](crate::nif::enif::schedule::run) continues only after this call
+    /// returns.
+    fn nif_yield_point(&mut self, flags: c_int) {
+        let _ = flags;
+    }
     /// Create a fresh, process-independent term environment (C `enif_alloc_env`) for the
     /// `enif_send`/`enif_make_copy` "message env" idiom; the host owns the returned env (which is
     /// what the C-facing opaque `*mut ErlNifEnv` designates). Default: unsupported.

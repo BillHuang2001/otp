@@ -643,13 +643,26 @@ pub unsafe extern "C" fn enif_thread_name(tid: ErlNifTid) -> *mut c_char {
     }
 }
 
-/// `int enif_thread_type(void);` — the type of the calling thread (see the module docs for why this
-/// runtime reports `ERL_NIF_THR_UNDEFINED`).
+/// `int enif_thread_type(void);` — the type of the calling thread.
+///
+/// **A dirty-flagged scheduled NIF reports its dirty scheduler.** A continuation entered by
+/// [`super::schedule`] with `ERL_NIF_DIRTY_JOB_CPU_BOUND` / `ERL_NIF_DIRTY_JOB_IO_BOUND` runs on the
+/// calling thread here (no dirty pool exists in this runtime), but for the duration of that
+/// continuation this entry point answers the C's `ERL_NIF_THR_DIRTY_CPU_SCHEDULER` (`2`) /
+/// `ERL_NIF_THR_DIRTY_IO_SCHEDULER` (`3`) — the value the oracle reports from a real dirty scheduler
+/// and the one the `a3_schedule` fixture probes. Outside a dirty-flagged continuation the answer is
+/// unchanged (see the module docs): a foreign thread and a thread created by
+/// [`enif_thread_create`] both answer `ERL_NIF_THR_UNDEFINED`.
 ///
 /// # Safety
 /// No preconditions: no pointers are taken and the function never panics.
 #[no_mangle]
 pub unsafe extern "C" fn enif_thread_type() -> c_int {
+    // The trampoline's marker wins: a dirty-flagged continuation is entered "from a dirty
+    // scheduler" in the C, so it must see that scheduler type here too.
+    if let Some(dirty) = super::schedule::current_dirty_thread_type() {
+        return dirty;
+    }
     let ty = sync::thread_type();
     if ty == sync::ERL_NIF_THR_OTHER {
         // `ERL_NIF_THR_OTHER` is this layer's own extension for "a thread it created" and is never

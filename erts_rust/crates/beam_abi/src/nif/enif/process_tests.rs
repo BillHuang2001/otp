@@ -246,17 +246,18 @@ fn zero_monitor() -> ErlNifMonitor {
     }
 }
 
-/// The NIF entry point `enif_schedule_nif` is handed (never called here).
+/// The continuation `enif_schedule_nif` is handed — a real NIF entry point that answers a small
+/// integer, so "the continuation ran" and "its value reached the caller" are both observable.
 ///
 /// # Safety
 ///
-/// Mirrors the C NIF entry-point ABI; the body only returns `NIL`.
+/// Mirrors the C NIF entry-point ABI; the body reads no pointer.
 unsafe extern "C" fn scheduled_nif(
     _env: *mut crate::nif::types::ErlNifEnv,
     _argc: c_int,
     _argv: *const ERL_NIF_TERM,
 ) -> ERL_NIF_TERM {
-    bare_badarg()
+    n(make_small(42))
 }
 
 #[test]
@@ -506,44 +507,105 @@ fn compare_monitors_is_a_memcmp_style_ordering() {
 }
 
 #[test]
-fn schedule_raises_badarg_without_host_support() {
-    let mut host = ProcHost::new(false);
-    let mut env = NifEnv::new(&mut host);
-    let name = c"reschedule";
-    // SAFETY: `env` is live, `name` is NUL-terminated and `scheduled_nif` is a valid entry
-    // point with no arguments.
-    let term = unsafe {
-        enif_schedule_nif(
-            env.as_ptr(),
-            name.as_ptr(),
-            0,
-            Some(scheduled_nif),
-            0,
-            core::ptr::null(),
-        )
-    };
-    let badarg = env.host().intern_atom("badarg").expect("interns");
-    assert_eq!(t(term), badarg, "no host support ⇒ badarg, never a fabricated success");
-    assert_eq!(env.pending_exception(), Some(badarg), "the refusal is raised");
-    // SAFETY: `env` is live.
-    unsafe { enif_clear_env(env.as_ptr()) };
-    // The C `enif_clear_env` frees temporary objects but never clears `exception_thrown`
-    // (`erl_nif.c:700-723`), so the refusal is still pending afterwards.
-    assert_eq!(
-        env.pending_exception(),
-        Some(badarg),
-        "enif_clear_env must not clear the exception"
-    );
-    assert!(host.scheduled.is_empty(), "nothing was scheduled");
+fn schedule_runs_the_continuation_and_never_consults_the_legacy_hook() {
+    // The `schedule_nif` hook is a legacy seam the entry point no longer consults (the trampoline
+    // runs the scheduled call itself), so both a host that "supports" it and one that declines must
+    // behave identically — and identically to the oracle, which re-runs the trap and lets the
+    // continuation's value become the call's result (`erl_nif.c:3512-3558`).
+    for hook_supported in [false, true] {
+        let mut host = ProcHost::new(hook_supported);
+        let mut env = NifEnv::new(&mut host);
+        let name = c"reschedule";
+        // SAFETY: `env` is live, `name` is NUL-terminated and `scheduled_nif` is a valid entry
+        // point with no arguments.
+        let term = unsafe {
+            enif_schedule_nif(
+                env.as_ptr(),
+                name.as_ptr(),
+                0,
+                Some(scheduled_nif),
+                0,
+                core::ptr::null(),
+            )
+        };
+        assert_eq!(
+            t(term),
+            make_small(42),
+            "hook_supported={hook_supported}: the continuation's value is the call's result"
+        );
+        assert_eq!(
+            env.pending_exception(),
+            None,
+            "hook_supported={hook_supported}: a value-producing schedule raises nothing"
+        );
+        let name_atom = env.host().intern_atom("reschedule").expect("interns");
+        assert_eq!(
+            env.host().atom_name(name_atom).as_deref(),
+            Some("reschedule"),
+            "fun_name is interned (and never resolved)"
+        );
+        assert!(
+            host.scheduled.is_empty(),
+            "hook_supported={hook_supported}: the legacy schedule_nif hook must not be consulted"
+        );
+        // SAFETY: `env` is live.
+        unsafe { enif_clear_env(env.as_ptr()) };
+        assert_eq!(
+            env.pending_exception(),
+            None,
+            "`enif_clear_env` leaves the (empty) exception slot alone"
+        );
+    }
 }
-
 #[test]
-fn schedule_returns_the_hosts_term_and_enforces_the_c_rules() {
+fn schedule_enforces_the_cs_rules_before_it_runs_anything() {
     let mut host = ProcHost::new(true);
     let mut env = NifEnv::new(&mut host);
     let name = c"reschedule";
-    // SAFETY: `env` is live, `name` is NUL-terminated and `scheduled_nif` is a valid entry
-    // point with two arguments.
+    let argv = [n(make_small(2)), n(make_small(3))];
+    // The rules the C enforces before anything is scheduled (`erl_nif.c:3569,3584-3598,3571`), plus
+    // this crate's own two: a null `argv` with a non-zero count and a null `env`. Every one of them
+    // is the `badarg` raise, exactly as the C's `enif_make_badarg` answers.
+    let badarg = env.host().intern_atom("badarg").expect("interns");
+    // SAFETY: each probe is either valid or refused before it is read.
+    unsafe {
+        type Cont = crate::nif::enif::schedule::NifContinuation;
+        let probes: [(*const c_char, c_int, Option<Cont>, c_int, *const ERL_NIF_TERM); 7] = [
+            (name.as_ptr(), 0, Some(scheduled_nif), MAX_ARG + 1, argv.as_ptr()),
+            (name.as_ptr(), 0, Some(scheduled_nif), -1, argv.as_ptr()),
+            (name.as_ptr(), 4, Some(scheduled_nif), 2, argv.as_ptr()),
+            (core::ptr::null(), 0, Some(scheduled_nif), 2, argv.as_ptr()),
+            (
+                b"\xff\0".as_ptr().cast::<c_char>(),
+                0,
+                Some(scheduled_nif),
+                2,
+                argv.as_ptr(),
+            ),
+            (name.as_ptr(), 0, None, 2, argv.as_ptr()),
+            (name.as_ptr(), 0, Some(scheduled_nif), 2, core::ptr::null()),
+        ];
+        for (fun_name, flags, fptr, argc, argv) in probes {
+            let term = enif_schedule_nif(env.as_ptr(), fun_name, flags, fptr, argc, argv);
+            assert_eq!(
+                t(term),
+                badarg,
+                "flags={flags} argc={argc} must be refused"
+            );
+            assert_eq!(
+                env.pending_exception(),
+                Some(badarg),
+                "flags={flags} argc={argc}: the refusal is raised"
+            );
+            env.clear();
+        }
+    }
+    assert!(
+        host.scheduled.is_empty(),
+        "no refusal consulted the legacy hook (and none ran a continuation)"
+    );
+    // The one legal call: the continuation runs and its value comes back.
+    // SAFETY: `env` is live, `name` is NUL-terminated, `argv` is readable for 2 terms.
     let term = unsafe {
         enif_schedule_nif(
             env.as_ptr(),
@@ -551,54 +613,12 @@ fn schedule_returns_the_hosts_term_and_enforces_the_c_rules() {
             ERL_DIRTY_JOB_CPU_BOUND,
             Some(scheduled_nif),
             2,
-            core::ptr::null(),
+            argv.as_ptr(),
         )
     };
-    let scheduled = env.host().intern_atom("scheduled").expect("interns");
-    assert_eq!(t(term), scheduled);
-    assert_eq!(
-        host.scheduled,
-        vec![("reschedule".to_string(), ERL_DIRTY_JOB_CPU_BOUND, 2)]
-    );
-
-    // The rules the C enforces before any host is consulted (`erl_nif.c:3569,3597,3571`).
-    let badarg = env.host().intern_atom("badarg").expect("interns");
-    // SAFETY: `env` is live and `name`/`scheduled_nif` are valid for every call.
-    unsafe {
-        let probes = [
-            (name.as_ptr(), 0, MAX_ARG + 1),
-            (name.as_ptr(), 4, 0),
-            (name.as_ptr(), 0, -1),
-            (core::ptr::null(), 0, 0),
-        ];
-        for (fun_name, flags, argc) in probes {
-            let term = enif_schedule_nif(
-                env.as_ptr(),
-                fun_name,
-                flags,
-                Some(scheduled_nif),
-                argc,
-                core::ptr::null(),
-            );
-            assert_eq!(t(term), badarg, "flags={flags} argc={argc} must be refused");
-        }
-        let null_fptr = enif_schedule_nif(
-            env.as_ptr(),
-            name.as_ptr(),
-            0,
-            None,
-            0,
-            core::ptr::null(),
-        );
-        assert_eq!(t(null_fptr), badarg);
-    }
-    assert_eq!(
-        host.scheduled.len(),
-        1,
-        "only the one legal call reached the host"
-    );
+    assert_eq!(t(term), make_small(42), "the legal call runs the continuation");
+    assert!(host.scheduled.is_empty(), "still no legacy hook call");
 }
-
 // ---------------------------------------------------------------------------------------------
 // The three-way monitor seam — `NifHost::monitor_process_result`
 // ---------------------------------------------------------------------------------------------
