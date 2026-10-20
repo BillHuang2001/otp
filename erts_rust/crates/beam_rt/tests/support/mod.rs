@@ -50,6 +50,17 @@ use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
 
+/// The shared **two-VM** harness (a private `epmd`, a per-test scratch directory and
+/// session-isolated VM children) used by the suites that drive a real node pair —
+/// [`tests/dist_two_vm.rs`](../dist_two_vm.rs) and
+/// [`tests/dist_payload_matrix.rs`](../dist_payload_matrix.rs).
+///
+/// Included here so both suites share one copy: an isolation rule (`setsid` for every
+/// child, a private `epmd` on an ephemeral port) is exactly the kind of thing that rots
+/// when it is copied.
+#[allow(dead_code)]
+pub mod two_vm;
+
 /// Assert `error` is the oracle's plain `exception error: bad argument` — the bare reason
 /// atom `badarg` — which is the rejection every BIF-level failure in these suites reports.
 ///
