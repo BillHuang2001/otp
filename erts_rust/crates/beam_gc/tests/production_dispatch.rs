@@ -57,7 +57,7 @@ use beam_gc::prelude::{
     MatureSource, IMMIX_BREAK_EVEN_WORDS, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
-use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
+use beam_term::prelude::{is_boxed, make_small, ptr_val, size_object, AtomTable, Eterm};
 // ---------------------------------------------------------------------------
 // The process-shaped workload
 // ---------------------------------------------------------------------------
@@ -187,6 +187,18 @@ fn alloc_pair(
     );
 
     let kind = if asked_c {
+        let live_est: usize = roots_c.iter().map(|r| size_object(*r)).sum();
+        let occ = copying.young().used_words();
+        eprintln!(
+            "DEBUG pre-collect: asked {asked_c} young {} mature_cap {}/{} mature_used {}/{} occ \
+             {occ} live_est {live_est} need_after {}",
+            copying.young().capacity_words(),
+            copying.mature_capacity_words(),
+            immix.mature_capacity_words(),
+            copying.mature_used_words(),
+            immix.mature_used_words(),
+            live_est + occ + RESERVE_WORDS,
+        );
         let kc = copying
             .collect(roots_c)
             .expect("the collection fits the fixed geometry")
@@ -195,6 +207,16 @@ fn alloc_pair(
             .collect(roots_i)
             .expect("the collection fits the fixed geometry")
             .kind;
+        eprintln!(
+            "DEBUG post-collect: kinds {kc:?}/{ki:?} young_after {}/{} mature_after {}/{} used \
+             {}/{}",
+            copying.young().capacity_words(),
+            immix.young().capacity_words(),
+            copying.mature_capacity_words(),
+            immix.mature_capacity_words(),
+            copying.mature_used_words(),
+            immix.mature_used_words(),
+        );
         assert_eq!(kc, ki, "the two strategies must run the same collection");
         assert_eq!(
             copying.young().used_words(),

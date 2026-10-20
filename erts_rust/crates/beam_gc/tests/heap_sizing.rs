@@ -29,8 +29,10 @@
 //!    `fullsweep_after: 0` case, on both mature-generation strategies;
 //! 3. the post-collection **growth/shrink** sizing on the copying collector
 //!    (`adjust_after_fullsweep`, `erl_gc.c:2061-2098` and the minor-time nursery resize,
-//!    `erl_gc.c:1493`): a nursery under pressure grows, a grossly oversized space shrinks,
-//!    and `min_heap_words`/`max_heap_words` floor/cap the result;
+//!    `erl_gc.c:1493`): the nursery sizes itself from the **live set**
+//!    (`HeapPolicy::young_target_words`) at a fullsweep or an explicit `ensure_capacity`
+//!    request, a minor only keeps or shrinks it, a grossly oversized space shrinks, and
+//!    `min_heap_words`/`max_heap_words` floor/cap the result;
 //! 4. a **relocating** Immix fullsweep (the shrink half of the policy on the mark-region
 //!    mature generation) preserving a young→mature reference across the resize;
 //! 5. [`HeapInfo`] — the `garbage_collection`-shaped observables derived from a live
@@ -233,6 +235,12 @@ fn fullsweep_after_zero_makes_every_collection_a_fullsweep() {
 
 #[test]
 fn a_tiny_nursery_grows_under_allocation_pressure() {
+    // Growth is decided where the live set is measured **exactly** — a fullsweep
+    // (`HeapPolicy::young_after_fullsweep`) or an explicit request
+    // (`Collector::ensure_capacity`). A *minor* only keeps or shrinks
+    // (`HeapPolicy::young_after_collection`), so the birth-sized nursery survives the first
+    // minor and then steps up the growth table the moment the mutator asks for more room than
+    // it has. Both halves are allocation pressure; only the second changes the capacity.
     let policy = HeapPolicy {
         initial_young_words: 12,
         ..HeapPolicy::default()
@@ -246,12 +254,59 @@ fn a_tiny_nursery_grows_under_allocation_pressure() {
         let mut roots = vec![t];
         let collection = c.collect(&mut roots).expect("collect");
         assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
+        assert_eq!(
+            c.young().capacity_words(),
+            12,
+            "{kind:?}: a minor keeps the nursery it has, it never grows it"
+        );
+        assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
 
-        // A nursery far too small for the next round steps up the growth table.
+        // A nursery far too small for the next round of allocation is what steps the growth
+        // table: `ensure_capacity` collects, then installs the curated size covering the
+        // request (`next_words(64) = 90`).
+        let collection = c.ensure_capacity(64, &mut roots).expect("grow");
+        assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
         assert!(
             c.young().capacity_words() > 12,
             "{kind:?}: the nursery must grow under pressure, got {}",
             c.young().capacity_words()
+        );
+        assert_eq!(
+            c.young().capacity_words(),
+            90,
+            "{kind:?}: it grows to the curated size that covers the request, not further"
+        );
+        assert!(c.young().available_words() >= 64, "{kind:?}");
+        assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
+    }
+}
+
+#[test]
+fn a_tiny_nursery_of_a_fullsweeping_process_grows_to_the_live_set_target() {
+    // The same pressure, decided by the exact measurement instead of by request: a process
+    // that fullsweeps every collection re-sizes its nursery from the live set it just kept.
+    let policy = HeapPolicy {
+        initial_young_words: 12,
+        fullsweep_after: 0,
+        ..HeapPolicy::default()
+    };
+    for kind in [MatureKind::Copying, MatureKind::Immix] {
+        let mut c = any(kind, policy.clone());
+        assert_eq!(c.young().capacity_words(), 12, "{kind:?}");
+        let t = build_tuple(&mut c, &[make_small(1), make_small(2)]);
+        let mut roots = vec![t];
+        let collection = c.collect(&mut roots).expect("collect");
+        assert_eq!(collection.kind, CollectionKind::Major, "{kind:?}");
+        // Three live words (`{1,2}` plus its header) -> `young_target_words(3) = 90`.
+        assert_eq!(
+            c.young().capacity_words(),
+            policy.young_target_words(3),
+            "{kind:?}"
+        );
+        assert_eq!(
+            c.young().capacity_words(),
+            90,
+            "{kind:?}: the nursery grew to the live set's target"
         );
         assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
     }
