@@ -330,6 +330,7 @@ pub mod proc;
 pub mod process;
 pub mod resources;
 pub mod select;
+pub mod stop;
 pub mod threads;
 pub mod time;
 pub mod variadic;
@@ -342,7 +343,7 @@ pub use self::{exception::*, get::*, make::*, map::*, mem::*, pred::*, proc::*};
 // is then reachable as `nif::enif::enif_*` without touching this file.
 #[allow(unused_imports)]
 pub use self::{
-    envs::*, ioq::*, mapiter::*, process::*, resources::*, select::*, threads::*, time::*,
+    envs::*, ioq::*, mapiter::*, process::*, resources::*, select::*, stop::*, threads::*, time::*,
     variadic::*,
 };
 
