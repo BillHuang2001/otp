@@ -74,7 +74,28 @@ pub const YOUNG_TARGET_LIVE_MULTIPLE: usize = 2;
 ///   returns to the live set's scale once the burst is dead (`tests/nursery_bounded.rs`), and
 ///   so that the growth rule can never feed itself.
 pub const YOUNG_SHRINK_FACTOR: usize = 8;
-
+/// How much of the **room a fullsweep must leave behind** the mature generation sizes itself
+/// to ([`HeapPolicy::mature_target_words`]).
+///
+/// The mature generation is the destination of every minor, so the quantity it is sized from is
+/// the room one fullsweep has to guarantee: the exact live set it kept, plus one whole nursery's
+/// worth of promotion (the C `adjust_after_fullsweep`'s `need_after`,
+/// `erl_gc.c:2072`), plus the reserve. [`Collector::collect`](crate::Collector::collect) only
+/// allows a minor while the mature space has that much room left
+/// (`mature.available_words() >= nursery.used_words()`), so a mature space of exactly
+/// `need_after` admits **one** promotion and the next collection is a fullsweep again.
+///
+/// This is [`YOUNG_TARGET_LIVE_MULTIPLE`]'s counterpart on the other generation: the nursery
+/// holds `2` live sets so the mutator can allocate a whole nursery before the live set is copied
+/// again, and the mature generation holds `2` `need_after` budgets so **a run of minors** — not
+/// a single one — fits between fullsweeps. The trade is identical and it is the same one: the
+/// multiple divides the fullsweeps (each of which copies the whole live set) by `2`, at a memory
+/// cost of `2` times the room a fullsweep's result needs.
+///
+/// The figure is a property of the **live set the fullsweep measured**, never of the mature
+/// space's own capacity or occupancy, which is what makes the resulting capacity a fixed point
+/// rather than a ratchet (`tests/mature_capacity_convergence.rs`).
+pub const MATURE_TARGET_LIVE_MULTIPLE: usize = 2;
 /// The oracle's default `min_bin_vheap_size`: `erts_next_heap_size(32768, 0)`.
 ///
 /// Computed through the growth table rather than hard-coded, so the value can never
@@ -371,38 +392,96 @@ impl HeapPolicy {
         heap_words > 4 * need_words && heap_words > self.min_heap_words
     }
 
+    /// The room a fullsweep must leave behind (in words), given the `live_words` it kept and the
+    /// `young_occupancy_words` still to be promoted — the C's `need_after`
+    /// (`erl_gc.c:2072`).
+    ///
+    /// It is the **un-multiplied** quantity: enough for the live set, one whole nursery's worth
+    /// of promotion and the reserve. [`Collector::collect`](crate::Collector::collect) admits a
+    /// minor only while the mature space has at least one nursery's occupancy available, so this
+    /// is the smallest mature capacity a generational cadence runs at all.
+    pub fn need_after_fullsweep(&self, live_words: usize, young_occupancy_words: usize) -> usize {
+        live_words
+            .saturating_add(young_occupancy_words)
+            .saturating_add(self.need_reserve_words)
+    }
+
+    /// The mature-space size (in words) one fullsweep aims at, given the **exact live set** it
+    /// measured and the young heap's occupancy still to be promoted: the curated size covering
+    /// [`MATURE_TARGET_LIVE_MULTIPLE`] x [`need_after_fullsweep`](Self::need_after_fullsweep).
+    ///
+    /// This is [`young_target_words`](Self::young_target_words)'s counterpart on the mature
+    /// generation, and it has the same two load-bearing properties:
+    ///
+    /// * **It is a workload property.** Its input is the live set a fullsweep measured, so
+    ///   re-deriving it at the same live set yields the same capacity — a fixed point, not a
+    ///   ratchet. A target derived from the mature space's occupancy or capacity is not: a
+    ///   generational heap is *full* when the cadence fires, so such a rule steps the growth
+    ///   table once per fullsweep without bound (`tests/mature_capacity_convergence.rs` is that
+    ///   regression's gate).
+    /// * **It converts the fullsweep count.** One `need_after` admits exactly one minor
+    ///   promotion before the mature space is too full to take another, so the multiple is
+    ///   literally the number of promotions one mature space is sized for; the copy work a
+    ///   fullsweep pays (the whole live set) is divided by it.
+    ///
+    /// Floored by [`min_heap_words`](Self::min_heap_words) and clamped by
+    /// [`max_heap_words`](Self::max_heap_words) through [`next_words`](Self::next_words), so a
+    /// `+hms`/`spawn_opt` minimum still sizes every mature space a policy produces and a capped
+    /// policy's target is the cap itself.
+    pub fn mature_target_words(&self, live_words: usize, young_occupancy_words: usize) -> usize {
+        self.next_words(
+            self.need_after_fullsweep(live_words, young_occupancy_words)
+                .saturating_mul(MATURE_TARGET_LIVE_MULTIPLE),
+            0,
+        )
+    }
+
     /// The mature-space size (in words) to use after a fullsweep that kept `live_words`
     /// alive and still needs `need_words` — the C `adjust_after_fullsweep` decision
     /// (`erl_gc.c:2061-2098`) reduced to one target size.
     ///
-    /// `need_after = live_words + need_words + need_reserve_words` is the room the
-    /// collection must leave behind (`erl_gc.c:2072`). The current `capacity_words` is
+    /// The **target** is [`mature_target_words`](Self::mature_target_words):
+    /// [`MATURE_TARGET_LIVE_MULTIPLE`] x
+    /// [`need_after_fullsweep`](Self::need_after_fullsweep), where the un-multiplied
+    /// `need_after = live_words + need_words + need_reserve_words` is the room the collection
+    /// must leave behind (`erl_gc.c:2072`). One `need_after` admits exactly one minor
+    /// promotion, so the multiple is what lets a **run** of minors fit between fullsweeps (see
+    /// [`MATURE_TARGET_LIVE_MULTIPLE`]). The current `capacity_words` is
     ///
-    /// * **grown** to `next_words(need_after, 0)` when [`should_grow`](Self::should_grow)
-    ///   holds — a fullsweep always leaves enough room for its own result (`erl_gc.c:2073-2077`);
-    /// * **shrunk** to `next_words(2 * need_after, 0)` when
-    ///   [`should_shrink`](Self::should_shrink) holds — the C's `wanted = 2 * need_after`
-    ///   (`erl_gc.c:2087`);
-    /// * otherwise **kept** as it is.
+    /// * **grown** onto the target when it is **below** it — the space is too small for its own
+    ///   result, and a generational heap too small for one promotion could not run a single
+    ///   minor;
+    /// * **shrunk** back onto the target when [`should_shrink`](Self::should_shrink) holds — the
+    ///   live set fell four times below what the space is sized for, so the memory goes back;
+    /// * otherwise **kept** as it is, which makes the target a fixed point.
+    ///
+    /// Both brackets are keyed on the **target**, not on the un-multiplied `need_after`, and the
+    /// grow side is the strict `capacity < target` rather than [`should_grow`](Self::should_grow):
+    /// `should_grow`'s "less than a quarter of headroom left" arm fires for a capacity that is
+    /// one growth-table step **above** the target, which would make a branch named *grow* shrink
+    /// a space and — for the mark-region mature generation — turn an in-place reclaim into a
+    /// relocation. Keying both brackets on the target and keeping them disjoint makes each
+    /// branch install the target in the direction its comparison established: a "grow" only
+    /// ever enlarges and a "shrink" only ever makes the space smaller.
+    ///
+    /// The rule reads the **live set** (through `need_after`) and never the mature space's own
+    /// occupancy, so it cannot ratchet.
     ///
     /// [`min_heap_words`](Self::min_heap_words) floors and
-    /// [`max_heap_words`](Self::max_heap_words) clamps every result (through
-    /// [`next_words`](Self::next_words)); the shrink branch additionally never returns
-    /// more than the current capacity, so a "shrink" can only ever make the heap smaller.
+    /// [`max_heap_words`](Self::max_heap_words) clamps every result through
+    /// [`next_words`](Self::next_words) — including the target itself, so a clamped policy has
+    /// the clamped target as its fixed point.
     pub fn mature_after_fullsweep(
         &self,
         capacity_words: usize,
         live_words: usize,
         need_words: usize,
     ) -> usize {
-        let need_after = live_words
-            .saturating_add(need_words)
-            .saturating_add(self.need_reserve_words);
-        if self.should_grow(capacity_words, need_after) {
-            self.next_words(need_after, 0)
-        } else if self.should_shrink(capacity_words, need_after) {
-            self.next_words(need_after.saturating_mul(2), 0)
-                .min(capacity_words)
+        let target = self.mature_target_words(live_words, need_words);
+        if capacity_words < target {
+            target
+        } else if self.should_shrink(capacity_words, target) {
+            target.min(capacity_words)
         } else {
             capacity_words
         }
@@ -899,16 +978,28 @@ mod tests {
     fn mature_after_fullsweep_grows_shrinks_and_keeps() {
         let policy = HeapPolicy::default();
 
-        // Grown: a mature space too small for the live set gets the curated size that
-        // covers `live + reserve`. `mature_after_fullsweep(12, 13, 0)` asks for 77 words.
-        assert_eq!(policy.mature_after_fullsweep(12, 13, 0), 90);
-        assert_eq!(policy.mature_after_fullsweep(0, 0, 0), 90);
+        // Grown: a mature space below its target is installed onto it. The target is
+        // `MATURE_TARGET_LIVE_MULTIPLE * need_after` through the growth table, so
+        // `mature_after_fullsweep(12, 13, 0)` asks for `2 * (13 + 64) = 154` -> 233, and an
+        // empty live set asks for `2 * 64 = 128` -> 142.
+        assert_eq!(policy.mature_after_fullsweep(12, 13, 0), 233);
+        assert_eq!(policy.mature_after_fullsweep(0, 0, 0), 142);
+        assert_eq!(
+            policy.mature_after_fullsweep(12, 13, 0),
+            policy.mature_target_words(13, 0),
+            "the grown result *is* the target"
+        );
 
-        // Kept: 233 words with a 100-word live set needs 164 — neither grow nor shrink.
-        assert_eq!(policy.mature_after_fullsweep(233, 100, 0), 233);
+        // Kept: 610 words with a 100-word live set has a 376-word target — inside
+        // `[target, 4 * target)`, so neither bracket fires.
+        assert_eq!(policy.mature_target_words(100, 0), 376);
+        assert_eq!(policy.mature_after_fullsweep(610, 100, 0), 610);
+        // 233 words, on the other hand, is *below* the 376-word target and is grown onto it.
+        assert_eq!(policy.mature_after_fullsweep(233, 100, 0), 376);
 
-        // Shrunk: 1000 words keeping 0 needs 64, so `should_shrink` fires and the target is
-        // the curated size of `2 * 64 = 128`, i.e. 142 — never more than the old capacity.
+        // Shrunk: 1000 words keeping 0 has a 142-word target, more than four times below the
+        // capacity, so `should_shrink` fires and the capacity becomes the target — never more
+        // than the old capacity.
         assert_eq!(policy.mature_after_fullsweep(1000, 0, 0), 142);
         assert_eq!(policy.mature_after_fullsweep(1000, 5, 0), 142);
         assert_eq!(policy.mature_after_fullsweep(1000, 10, 0), 233);
@@ -933,13 +1024,16 @@ mod tests {
             ..HeapPolicy::default()
         };
         assert_eq!(floored.mature_after_fullsweep(12, 13, 0), 4_096);
-        // 8192 words keeping 100 needs 164: the shrink target (curated 328) is floored to
-        // 4096, which is still smaller than 8192.
-        assert_eq!(floored.mature_after_fullsweep(8_192, 100, 0), 4_096);
+        // 8 192 words keeping 100 has a 376-word target floored to the 4 096-word minimum — but
+        // 8 192 is only twice that floor, inside the four-times shrink bracket, so it is kept.
+        assert_eq!(floored.mature_after_fullsweep(8_192, 100, 0), 8_192);
+        // Four times the floored target is where the shrink fires: 32 768 > 4 * 4 096.
+        assert_eq!(floored.mature_after_fullsweep(32_768, 100, 0), 4_096);
         // A capacity already at the floor is never "shrunk" further.
         assert_eq!(floored.mature_after_fullsweep(4_096, 100, 0), 4_096);
 
-        // A maximum clamps a would-be grow: 12 words needing 464 would go to 610, capped to 512.
+        // A maximum clamps a would-be grow: 12 words needing 464 would go to 987
+        // (`2 * 464`), capped to 512.
         let capped = HeapPolicy {
             max_heap_words: 512,
             ..HeapPolicy::default()
@@ -950,8 +1044,15 @@ mod tests {
         let default = HeapPolicy::default();
         assert_eq!(
             default.mature_after_fullsweep(12, 100, 100),
-            default.next_words(100 + 100 + default.need_reserve_words, 0)
+            default.next_words(
+                MATURE_TARGET_LIVE_MULTIPLE * (100 + 100 + default.need_reserve_words),
+                0
+            )
         );
+        // The clamped policy's fixed point is the clamped target: a second fullsweep at the same
+        // live set keeps what the first one installed.
+        assert_eq!(capped.mature_after_fullsweep(512, 400, 0), 512);
+        assert_eq!(floored.mature_after_fullsweep(4_096, 13, 0), 4_096);
     }
 
     /// The **minor** rule: the capacity is compared with the **young live set's** target
