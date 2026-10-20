@@ -37,7 +37,8 @@ use std::collections::BTreeMap;
 use beam_common::BeamError;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{
-    Function, Instr, Label, MapWriteArgs, Module, Operand, PutRecordArgs, TestKind, NO_FAIL,
+    Function, Instr, Label, MapWriteArgs, Module, Operand, PutRecordArgs, RecordDefinition,
+    RecordField, TestKind, NO_FAIL,
 };
 use beam_term::{make_small, Atom, Eterm};
 
@@ -427,6 +428,65 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
             "put_record/create-foreign-module",
             run_gap(&module, entry, &[]),
             "put_record: create: no record definition table for another module",
+        );
+
+        // …and the seam that closes that path: a host that owns a record table
+        // answers `ExecutionContext::foreign_record_definition` and the create
+        // **succeeds**. Only a host with *no* record table — the `MinimalContext`
+        // above, `Ok(None)` — still gets the typed error; a definition is never
+        // guessed. (No installed toolchain emits the native-record family, so this
+        // is forward-compat: pinned from `erl_create_native_record`,
+        // `erl_record.c:356-410`, not from an oracle.)
+        let mut f = GapFixture::new();
+        let foreign = f.atom("other");
+        let rec = f.atom("rec");
+        let value = f.atom("value");
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Move {
+                src: Operand::Atom(foreign),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Atom(rec),
+                dst: Operand::X(1),
+            },
+            Instr::PutTuple2 {
+                dst: Operand::X(0),
+                elements: vec![Operand::X(0), Operand::X(1)],
+            },
+            Instr::PutRecord(Box::new(PutRecordArgs {
+                fail: NO_FAIL,
+                id: Operand::X(0),
+                src: Operand::Nil,
+                dst: Operand::X(2),
+                live: 0,
+                updates: vec![(Operand::Atom(value), Operand::Integer(7))],
+            })),
+            Instr::Return,
+        ];
+        let entry = f.add_function("f", 0, code);
+        let module = f.finish();
+        let mut ctx = MinimalContext::with_foreign_record_definitions(vec![(
+            foreign,
+            rec,
+            RecordDefinition {
+                name: rec,
+                is_exported: true,
+                fields: vec![RecordField {
+                    name: value,
+                    default: Some(make_small(0)),
+                }],
+            },
+        )]);
+        let created = run_gap_with(&module, entry, &[], &mut ctx)
+            .expect("a host that owns the record table creates the record");
+        // A native record is a tuple of `1 + #fields` (`beam_term::record_block_words`):
+        // the definition block plus one value per declared field.
+        assert_eq!(
+            terms::tuple_arity(created).expect("a native record is a tuple"),
+            2,
+            "the created record has its definition block plus its one field"
         );
     }
     {
