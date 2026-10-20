@@ -35,7 +35,8 @@
          rem_to_band/1, div_rem_pow2/1, huge_mul_declines/1,
          arith_licm_ssa/1, arith_licm_declines/1, no_shift_hoist/1,
          arith_licm_probe/1, arith_licm_equivalence/1,
-         arith_licm_kill_switches/1, default_output_identical/1]).
+         arith_licm_kill_switches/1, default_output_identical/1,
+         real_loop_speedup/1, licm_recv_loop/1]).
 suite() -> [{ct_hooks,[ts_install_cth]}, {timetrap,{minutes,5}}].
 all() -> [strength_reduction, induction_variable_canonicalisation,
           strength_reduction_declines, strength_reduction_equivalence,
@@ -46,7 +47,8 @@ all() -> [strength_reduction, induction_variable_canonicalisation,
           rem_to_band, div_rem_pow2, huge_mul_declines,
           arith_licm_ssa, arith_licm_declines, no_shift_hoist,
           arith_licm_probe, arith_licm_equivalence,
-          arith_licm_kill_switches, default_output_identical].
+          arith_licm_kill_switches, default_output_identical,
+          real_loop_speedup, licm_recv_loop].
 init_per_suite(Config) -> Config.
 end_per_suite(_Config) -> ok.
 
@@ -752,7 +754,13 @@ no_shift_hoist(Config) ->
 %%=========================================================================
 %% The same, end to end on a real module: a `receive' loop whose arithmetic
 %% is computed from a loop-invariant argument that a guard OUTSIDE the loop
-%% proved an integer.
+%% proved an integer. A `receive' retry loop is the ONLY CFG cycle the pass
+%% ever sees (a self-recursive function is a tail call, not a cycle, and no
+%% pass turns one into the other), so these probes -- not the counted loops of
+%% `real_loop_speedup/1' -- are the workloads the arithmetic LICM was written
+%% for. `licm_recv_loop/1' further down drives the same shape end to end:
+%% reach, instruction shape, equivalence and allocation asserted, timing
+%% reported.
 %%=========================================================================
 
 arith_licm_probe(Config) ->
@@ -1404,6 +1412,639 @@ bsl_limit(Lo, Hi) ->
         N when is_integer(N) -> bsl_limit(Mid, Hi);
         _ -> bsl_limit(Lo, Mid)
     end.
+
+%%=========================================================================
+%% The runtime-speed question, on a REAL loop: does the rewritten loop actually
+%% execute faster? `speed_probe_src/1' is an LCG-style counter loop whose hot
+%% path is dominated by exactly the three rewrites the pass performs --
+%% `S * 1024' -> `S bsl 10', `S rem 65536' -> `S band 65535' and
+%% `S1 div 256' / `S1 rem 256' -> `S1 bsr 8' / `S1 band 255'.
+%%
+%% What is asserted here is REACH and EQUIVALENCE, not speed. The timings are
+%% reported, never asserted in a direction, because on this runtime there is
+%% nothing for the rewrite to win: the JIT already strength-reduces `div'/`rem'
+%% by a power-of-two immediate into a shift/mask under the same clamped-range
+%% condition the pass requires (`erts/emulator/beam/jit/x86/instr_arith.cpp')
+%% and turns `X * 2^n' into a left shift as well. The only timing assertion is
+%% the loose non-flakiness guard the equivalence suite uses.
+%%=========================================================================
+
+real_loop_speedup(Config) ->
+    %% Two copies of the same loop under different `-module' names:
+    %% `code:load_binary/3' keys loaded code by module name, so both builds have
+    %% to be distinct modules to coexist in this VM.
+    {OffMod, OffBin} =
+        speed_build(Config, speed_probe_off, speed_probe_src(speed_probe_off),
+                    []),
+    {OnMod, OnBin} =
+        speed_build(Config, speed_probe_on, speed_probe_src(speed_probe_on),
+                    [loop_opt, loop_arith_licm]),
+
+    %% Reach: the pass must have rewritten this loop. The synthetic tests above
+    %% pin the shape of each rewrite; this is the end-to-end proof that the
+    %% whole pipeline reaches a loop shaped like a real program's.
+    OffCode = code_chunk(OffBin, OffMod),
+    OnCode = code_chunk(OnBin, OnMod),
+    case OffCode =:= OnCode of
+        true -> ct:fail({loop_pass_did_not_reach, OffMod});
+        false -> ok
+    end,
+
+    %% Equivalence: the rewrite may be faster, it may not compute anything else.
+    %% The loop runs 2,000,000 iterations, so any divergence in the arithmetic
+    %% accumulates into the returned integer.
+    OffVal = OffMod:run(),
+    OnVal = OnMod:run(),
+    case OffVal =:= OnVal of
+        true -> ok;
+        false -> ct:fail({result_mismatch, {off, OffVal}, {on, OnVal}})
+    end,
+
+    %% Measurement: one discarded warm-up round (code loading, JIT state), then
+    %% an odd number of rounds alternating which build is timed first, so a
+    %% drift in the machine's load hits both builds alike.
+    _ = speed_time(OffMod),
+    _ = speed_time(OnMod),
+    Rounds = 9,
+    {OffUs, OnUs} = speed_samples(OffMod, OnMod, Rounds),
+    {OffMed, OffSpread} = speed_stats(OffUs),
+    {OnMed, OnSpread} = speed_stats(OnUs),
+
+    ct:pal("~n=== loop_opt runtime speed (speed_probe_off vs speed_probe_on) ==="),
+    ct:pal("method: ~w interleaved rounds, one discarded warm-up round, "
+           "alternating which build is timed first", [Rounds]),
+    ct:pal("reach: the generated `Code' chunk changed; both builds return ~p",
+           [OffVal]),
+    ct:pal("~-10s ~11s ~11s ~7s ~9s ~9s",
+           ["kernel", "OFF med", "ON med", "ratio", "OFF sprd", "ON sprd"]),
+    ct:pal("~-10s ~9.3f ms ~9.3f ms ~7.3f ~8.1f% ~8.1f%",
+           ["loop/0", OffMed / 1000, OnMed / 1000, OffMed / OnMed,
+            100 * OffSpread, 100 * OnSpread]),
+    ct:pal("ratio = OFF median / ON median, > 1 means the build with the loop "
+           "passes was FASTER in this run"),
+    ct:pal("CAVEAT: this table describes THIS run only. The host is shared and "
+           "loaded, so absolute times are not reproducible and the ratio has to "
+           "be read against the reported spread; the ratio commonly lands at or "
+           "marginally below 1 here, i.e. no gain, which is a property of this "
+           "machine and not of the pass. No direction is asserted: the JIT "
+           "already strength-reduces `div'/`rem' by a power-of-two immediate "
+           "into a shift/mask under the same clamped-range condition the pass "
+           "requires, and turns `X * 2^n' into a left shift too, so on this "
+           "runtime there is nothing left for the rewrite to win."),
+
+    %% The only timing assertion there is: no catastrophic regression. A
+    %% tighter bound -- or a direction -- would just be a coin toss at this
+    %% noise level.
+    case OnMed =< OffMed * 2 of
+        true ->
+            ok;
+        false ->
+            ct:fail({loop_opt_slower, {off, OffMed}, {on, OnMed}})
+    end.
+
+%% The probe of `real_loop_speedup': a tail-recursive counter loop of the shape
+%% a real program's inner loop has. `Mod' is a parameter because the two builds
+%% have to be loaded as distinct modules.
+-spec speed_probe_src(atom()) -> iolist().
+speed_probe_src(Mod) ->
+    io_lib:format(
+      "-module(~s).\n"
+      "-export([run/0]).\n"
+      "run() -> loop(2000000, 12345, 0).\n"
+      "loop(0, _, A) ->\n"
+      "    A;\n"
+      "loop(N, S, A) ->\n"
+      "    S1 = (S * 1024 + 12345) rem 65536,\n"
+      "    A1 = A + (S1 div 256) + (S1 rem 256),\n"
+      "    loop(N - 1, S1, A1).\n", [Mod]).
+
+%% Compile `Src' under `Name' with `Opts', load it and return the module and its
+%% BEAM binary, the `Code' chunk of which the reach check reads.
+-spec speed_build(list(), atom(), iolist(), [atom()]) -> {module(), binary()}.
+speed_build(Config, Name, Src, Opts) ->
+    {Mod, Bin} = compile_bin(Config, Name, Src, Opts),
+    {module, Mod} = code:load_binary(Mod, src_filename(Config, Name), Bin),
+    {Mod, Bin}.
+
+%% One timed run of the probe, in microseconds.
+-spec speed_time(module()) -> non_neg_integer().
+speed_time(Mod) ->
+    {Us, _Val} = timer:tc(Mod, run, []),
+    Us.
+
+%% `Rounds' paired samples of the two builds. The round number decides which
+%% build is timed first, so the two are interleaved rather than batched.
+-spec speed_samples(module(), module(), pos_integer()) ->
+          {[non_neg_integer()], [non_neg_integer()]}.
+speed_samples(OffMod, OnMod, Rounds) ->
+    lists:foldl(
+      fun(R, {Offs, Ons}) ->
+              case R rem 2 of
+                  1 ->
+                      OffUs = speed_time(OffMod),
+                      OnUs = speed_time(OnMod),
+                      {[OffUs | Offs], [OnUs | Ons]};
+                  0 ->
+                      OnUs = speed_time(OnMod),
+                      OffUs = speed_time(OffMod),
+                      {[OffUs | Offs], [OnUs | Ons]}
+              end
+      end, {[], []}, lists:seq(1, Rounds)).
+
+%% The timing statistics of one build's samples, in microseconds: the MEDIAN is
+%% the reported value and the second element is the interquartile range over it,
+%% a robust relative spread.
+-spec speed_stats([non_neg_integer()]) -> {non_neg_integer(), float()}.
+speed_stats(Us) ->
+    Sorted = lists:sort(Us),
+    N = length(Sorted),
+    Med = lists:nth((N + 1) div 2, Sorted),
+    Q1 = lists:nth((N + 3) div 4, Sorted),
+    Q3 = lists:nth((3 * N + 3) div 4, Sorted),
+    {Med, case Med > 0 of
+              true -> (Q3 - Q1) / Med;
+              false -> 0.0
+          end}.
+
+%% The `Code' chunk of a BEAM binary, extracted by hand from the FOR1 container:
+%% this host's `beam_lib:chunks/2' cannot read this tree's beams, and the
+%% generated code is the only thing the reach check wants. EA IFF 85 layout:
+%% "FOR1" | 32-bit big-endian total size | form type ("BEAM", itself NOT a sized
+%% chunk) | chunks of 4-byte id | 32-bit size | payload | 0..3 bytes of padding.
+%%
+%% Comparing whole `.beam' files instead would be WRONG here: `CInf' and `Dbgi'
+%% embed the option list, so two builds of the same source always differ there.
+-spec code_chunk(binary(), atom()) -> binary().
+code_chunk(Bin, Mod) ->
+    case lists:keyfind(<<"Code">>, 1, beam_chunks(Bin)) of
+        {<<"Code">>, Payload} -> Payload;
+        false -> ct:fail({no_code_chunk, Mod})
+    end.
+
+-spec beam_chunks(binary()) -> [{binary(), binary()}].
+beam_chunks(<<"FOR1", _Total:32, _Form:4/binary, Rest/binary>>) ->
+    beam_chunks(Rest, []);
+beam_chunks(Bin) ->
+    ct:fail({not_a_beam_file, byte_size(Bin)}).
+
+-spec beam_chunks(binary(), [{binary(), binary()}]) -> [{binary(), binary()}].
+beam_chunks(<<>>, Acc) ->
+    lists:reverse(Acc);
+beam_chunks(<<Id:4/binary, Size:32, Rest0/binary>>, Acc) ->
+    case Rest0 of
+        <<Payload:Size/binary, Rest1/binary>> ->
+            Pad = (4 - (Size rem 4)) rem 4,
+            case Rest1 of
+                <<_:Pad/binary, Rest2/binary>> ->
+                    beam_chunks(Rest2, [{Id, Payload} | Acc]);
+                _Tail ->
+                    %% last chunk written without its alignment padding
+                    lists:reverse([{Id, Payload} | Acc])
+            end;
+        _Short ->
+            lists:reverse(Acc)
+    end;
+beam_chunks(_Trailing, Acc) ->
+    %% fewer than 8 bytes left: end-of-file alignment padding
+    lists:reverse(Acc).
+
+%%=========================================================================
+%% The arithmetic LICM on the only loop shape this runtime produces.
+%%
+%% `real_loop_speedup/1' above exercises the STRENGTH-REDUCTION half of the
+%% pass, which runs on any function. The LICM half needs a CFG cycle, and the
+%% only cycles the pipeline builds come from `receive' lowering: a
+%% tail-recursive function is a tail `call', not a cycle, and no pass turns one
+%% into the other. So this case builds the one workload
+%% `beam_ssa_loop_arith' can ever act on -- a `receive' retry loop whose
+%% per-message arithmetic is computed from loop-invariant values -- and asserts
+%% the hoist, the equivalence and the allocation, then REPORTS the timing.
+%%
+%% The probe (`licm_probe_src/1'): `prep/0' fills the mailbox of the calling
+%% process with a `{cfg,K,J,M}' message followed by `ITERS' `{msg,Byte}'
+%% messages, and `run/0' consumes the configuration and then exactly `ITERS'
+%% messages through the `receive' loop, with an accumulator that depends on
+%% every message. `plain/0' folds the same message values WITHOUT a `receive'
+%% and is the independent reference for the loop's value.
+%%
+%% The `{cfg,...}' message is what makes `K'/`J'/`M' dynamic: as literals they
+%% would be constant-folded into the loop and there would be no arithmetic left
+%% to hoist. Their integrality is proven by the loop clause's own guard, which
+%% the code generator evaluates OUTSIDE the receive cycle, so the type
+%% annotations at `K * 3', `J + 7' and `M * M' are loop-invariant and the three
+%% operations are hoistable. A guard INSIDE the cycle would make the annotation
+%% loop-dependent, and the pass would (correctly) decline to hoist.
+%%=========================================================================
+
+licm_recv_loop(Config) ->
+    %% Two builds of the same probe under distinct module names (`code' keys
+    %% loaded code by module name, so both have to coexist in this VM), plus a
+    %% third build that runs `loop_opt' alone, to attribute the delta.
+    {OffMod, OffBin} =
+        speed_build(Config, licm_probe_off, licm_probe_src(licm_probe_off), []),
+    {OnMod, OnBin} =
+        speed_build(Config, licm_probe_on, licm_probe_src(licm_probe_on),
+                    [loop_opt, loop_arith_licm]),
+    {_, LpBin} = compile_bin(Config, licm_probe_lp,
+                             licm_probe_src(licm_probe_lp), [loop_opt]),
+
+    %% Reach: the pass must have changed the generated code.
+    OffCode = code_chunk(OffBin, OffMod),
+    OnCode = code_chunk(OnBin, OnMod),
+    case OffCode =:= OnCode of
+        true -> ct:fail({loop_pass_did_not_reach, OnMod});
+        false -> ok
+    end,
+
+    %% Attribution: on this probe `loop_opt' alone changes NOTHING (there is no
+    %% power-of-two arithmetic for the strength reducer), so the whole delta
+    %% belongs to the `loop_arith_licm' sub-pass.
+    case code_chunk(LpBin, licm_probe_lp) =:= OffCode of
+        true -> ok;
+        false -> ct:fail(loop_opt_alone_changed_the_probe)
+    end,
+
+    %% Shape: the change is confined to the function that owns the receive
+    %% loop; every other function of the module compiles instruction-for-
+    %% instruction identically.
+    OffFns = licm_code(Config, licm_probe_off, OffBin),
+    OnFns = licm_code(Config, licm_probe_on, OnBin),
+    case licm_diff(OffFns, OnFns) of
+        [{loop, 5}] -> ok;
+        Other -> ct:fail({licm_changed_other_functions, Other})
+    end,
+
+    %% Shape: in that function the arithmetic that runs before the first
+    %% receive opcode (the loop preheader) went from nothing to the three
+    %% loop-invariant operations, and the per-message path lost exactly those
+    %% operations -- the same operations, moved, none added or removed.
+    {OffPre, OffPost} = licm_recv_arith(OffFns),
+    {OnPre, OnPost} = licm_recv_arith(OnFns),
+    OffPreA = licm_arith(OffPre),
+    OffPostA = licm_arith(OffPost),
+    OnPreA = licm_arith(OnPre),
+    OnPostA = licm_arith(OnPost),
+    case OffPreA of
+        [] -> ok;
+        Hoisted -> ct:fail({hoisted_without_the_flag, Hoisted})
+    end,
+    case length(OnPreA) >= 3 andalso
+        lists:member({gc_bif, '*'}, OnPreA) andalso
+        lists:member({gc_bif, '+'}, OnPreA) of
+        true -> ok;
+        false -> ct:fail({arith_licm_did_not_hoist, OnPreA})
+    end,
+    case lists:sort(OffPreA ++ OffPostA) =:= lists:sort(OnPreA ++ OnPostA) of
+        true -> ok;
+        false -> ct:fail({arith_set_changed, OffPreA ++ OffPostA,
+                          OnPreA ++ OnPostA})
+    end,
+    case length(OnPostA) < length(OffPostA) of
+        true -> ok;
+        false -> ct:fail({per_message_arith_not_reduced, OffPostA, OnPostA})
+    end,
+
+    %% Equivalence: the hoist may be faster, it may not compute anything else.
+    %% Both builds must also agree with the `plain/0' fold of the same message
+    %% values, which no loop pass touches.
+    OffVal = licm_run(OffMod),
+    OnVal = licm_run(OnMod),
+    OffPlain = licm_plain(OffMod),
+    OnPlain = licm_plain(OnMod),
+    case {OffVal =:= OnVal, OffVal =:= OffPlain, OnVal =:= OnPlain} of
+        {true, true, true} ->
+            %% Every run above consumed exactly the messages `prep/0' queued, so
+            %% the mailbox is empty again -- assert it rather than trust it.
+            case process_info(self(), message_queue_len) of
+                {message_queue_len, 0} -> ok;
+                {message_queue_len, N} -> ct:fail({messages_left_queued, N})
+            end;
+        _ ->
+            ct:fail({result_mismatch, {off, OffVal}, {on, OnVal},
+                     {plain, OffPlain, OnPlain}})
+    end,
+
+    %% Allocation: hoisting arithmetic changes CPU work, not allocation. The
+    %% asserted number is the GC counter DELTA of the CONSUMING loop in a fresh
+    %% process. The process's running total is not comparable between the two
+    %% builds: a freshly spawned process inherits its parent's counters (it does
+    %% not start at zero) and the total also counts the GCs of `prep/0''s
+    %% mailbox fill, neither of which is a property of the generated code -- two
+    %% runs of the SAME build differ by several GCs. So the total, the reclaimed
+    %% words and the heap size are only reported.
+    {OffRunGCs, OffWords, OffHeap0, OffHeap1, OffFreshVal, OffTotalGCs} =
+        licm_alloc(OffMod),
+    {OnRunGCs, OnWords, OnHeap0, OnHeap1, _OnFreshVal, OnTotalGCs} =
+        licm_alloc(OnMod),
+    case {OffRunGCs =:= OnRunGCs, OffFreshVal =:= OffVal} of
+        {true, true} ->
+            ok;
+        _ ->
+            ct:fail({allocation_changed, {off, OffRunGCs}, {on, OnRunGCs},
+                     {off_fresh, OffFreshVal}, {off, OffVal}})
+    end,
+
+    %% Measurement: one discarded warm-up round per build, then an odd number of
+    %% rounds alternating which build is timed first, so a drift in the
+    %% machine's load hits both builds alike. Each sample is preceded by
+    %% `prep/0', so a sample is the cost of consuming the messages.
+    _ = licm_time(OffMod),
+    _ = licm_time(OnMod),
+    Rounds = 7,
+    {OffUs, OnUs} = licm_samples(OffMod, OnMod, Rounds),
+    {OffMed, OffSpread} = speed_stats(OffUs),
+    {OnMed, OnSpread} = speed_stats(OnUs),
+
+    ct:pal("~n=== loop_arith_licm on a real receive loop "
+           "(licm_probe_off vs licm_probe_on) ==="),
+    ct:pal("method: ~w interleaved rounds, one discarded warm-up round, "
+           "alternating which build is timed first; `prep/0' (the mailbox fill) "
+           "runs before every sample and is NOT timed", [Rounds]),
+    ct:pal("reach: the `Code' chunk changed, and `loop_opt' alone leaves it "
+           "identical, so the delta is the arithmetic LICM"),
+    ct:pal("shape: in `loop/5' the arithmetic before the first receive opcode "
+           "went from ~w to ~w operations, the per-message path from ~w to ~w "
+           "(same operations, moved; no operation added or removed)",
+           [length(OffPreA), length(OnPreA),
+            length(OffPostA), length(OnPostA)]),
+    ct:pal("value: ~p -- identical in both builds and in both `plain/0' folds",
+           [OffVal]),
+    ct:pal("allocation: GCs caused by the measured (warm) run OFF ~w / ON ~w "
+           "(the assertion); heap_size OFF ~w -> ~w / ON ~w -> ~w "
+           "(words allocated by the run); process total GC counter "
+           "(inherited + warm-ups + fill) OFF ~w / ON ~w, words reclaimed "
+           "OFF ~w / ON ~w",
+           [OffRunGCs, OnRunGCs, OffHeap0, OffHeap1, OnHeap0, OnHeap1,
+            OffTotalGCs, OnTotalGCs, OffWords, OnWords]),
+    ct:pal("~-10s ~11s ~11s ~7s ~9s ~9s",
+           ["kernel", "OFF med", "ON med", "ratio", "OFF sprd", "ON sprd"]),
+    ct:pal("~-10s ~9.3f ms ~9.3f ms ~7.3f ~8.1f% ~8.1f%",
+           ["recv_loop", OffMed / 1000, OnMed / 1000, OffMed / OnMed,
+            100 * OffSpread, 100 * OnSpread]),
+    ct:pal("ratio = OFF median / ON median, > 1 means the LICM build was "
+           "FASTER in this run"),
+    ct:pal("CAVEAT: this table describes THIS run only. The host is shared and "
+           "loaded, so absolute times are not reproducible and the ratio has to "
+           "be read against the reported spread. The hoist is deterministic "
+           "(reach, shape and allocation are asserted above); the timing "
+           "direction is not, and there is a structural reason for that: the "
+           "pass moves the loop-invariant arithmetic into the receive loop's "
+           "preheader, but an Erlang `receive' loop is re-entered by a TAIL CALL "
+           "once per message, so the hoisted code runs once per message anyway. "
+           "The ON build also keeps the hoisted values in extra stack slots "
+           "(`allocate,8' vs `allocate,5'), so the ratio commonly lands at or "
+           "just below 1. No direction is asserted."),
+
+    %% The only timing assertion there is: no catastrophic regression.
+    case OnMed =< OffMed * 2 of
+        true ->
+            ok;
+        false ->
+            ct:fail({loop_opt_slower, {off, OffMed}, {on, OnMed}})
+    end.
+
+%% The probe of `licm_recv_loop/1', parameterized by module name because the
+%% builds have to be loaded as distinct modules. The iteration count is a
+%% literal in the generated source, so `prep/0' fills exactly as many messages
+%% as `run/0' consumes; 400,000 keeps one (untimed-fill) run in the 10-50 ms
+%% range on the development host.
+-spec licm_probe_src(atom()) -> iolist().
+licm_probe_src(Mod) ->
+    io_lib:format(
+      "-module(~s).\n"
+      "-export([prep/0, run/0, plain/0]).\n"
+      "prep() ->\n"
+      "    self() ! {cfg, 3, 1000, 7},\n"
+      "    fill(400000).\n"
+      "fill(0) -> ok;\n"
+      "fill(N) -> self() ! {msg, N band 255}, fill(N - 1).\n"
+      "run() ->\n"
+      "    {K, J, M} = cfg(),\n"
+      "    loop(400000, K, J, M, 0).\n"
+      "plain() ->\n"
+      "    {K, J, M} = cfg(),\n"
+      "    fold(400000, K, J, M, 0).\n"
+      "fold(0, _K, _J, _M, Acc) -> Acc;\n"
+      "fold(N, K, J, M, Acc) ->\n"
+      "    fold(N - 1, K, J, M, Acc + (N band 255) + K * 3 + J + 7 + M * M).\n"
+      "cfg() ->\n"
+      "    receive {cfg, K, J, M} -> {K, J, M}\n"
+      "    after 0 -> {3, 1000, 7}\n"
+      "    end.\n"
+      "loop(0, _K, _J, _M, Acc) -> Acc;\n"
+      "loop(N, K, J, M, Acc)\n"
+      "  when is_integer(K), is_integer(J), is_integer(M), K > 0 ->\n"
+      "    receive\n"
+      "        {msg, X} ->\n"
+      "            A = K * 3,\n"
+      "            B = J + 7,\n"
+      "            C = M * M,\n"
+      "            loop(N - 1, K, J, M, Acc + X + A + B + C)\n"
+      "    end;\n"
+      "loop(_, _K, _J, _M, Acc) -> Acc.\n", [Mod]).
+
+%% `run/0' of the probe with its mailbox filled, in the calling process.
+-spec licm_run(module()) -> integer().
+licm_run(Mod) ->
+    Mod:prep(),
+    Mod:run().
+
+%% `plain/0' (the reference fold) with its mailbox filled. The fold does not
+%% touch the mailbox, so `prep/0''s messages are still queued when it returns:
+%% drain them here. Leftover messages would be scanned by every selective
+%% `receive' the REST of the test run performs (including the watchdog timers of
+%% `ssa_opt_budget_SUITE', which turn a `receive ... after 0' into a full
+%% mailbox scan and thereby change which side of the race wins), so the testcase
+%% must leave the mailbox empty.
+-spec licm_plain(module()) -> integer().
+licm_plain(Mod) ->
+    Mod:prep(),
+    Val = Mod:plain(),
+    flush(),
+    Val.
+
+%% One timed run of the probe with a freshly filled mailbox: the fill is outside
+%% the timed region, so a sample is the cost of consuming the messages.
+-spec licm_time(module()) -> non_neg_integer().
+licm_time(Mod) ->
+    Mod:prep(),
+    speed_time(Mod).
+
+%% `speed_samples/3' for a probe that fills its own mailbox: the same
+%% interleaving, but every sample is preceded by `prep/0'.
+-spec licm_samples(module(), module(), pos_integer()) ->
+          {[non_neg_integer()], [non_neg_integer()]}.
+licm_samples(OffMod, OnMod, Rounds) ->
+    lists:foldl(
+      fun(R, {Offs, Ons}) ->
+              case R rem 2 of
+                  1 ->
+                      OffUs = licm_time(OffMod),
+                      OnUs = licm_time(OnMod),
+                      {[OffUs | Offs], [OnUs | Ons]};
+                  0 ->
+                      OnUs = licm_time(OnMod),
+                      OffUs = licm_time(OffMod),
+                      {[OffUs | Offs], [OnUs | Ons]}
+              end
+      end, {[], []}, lists:seq(1, Rounds)).
+
+%% Run the probe in a fresh process and return the allocation figures of one
+%% measured run:
+%% `{GCs caused by that run, the process's total words reclaimed, its heap_size
+%%   before and after the run, the value the loop returned, the process's total
+%%   GC count}'.
+%%
+%% The first element is the asserted one: the consuming loop must cause the same
+%% number of GCs in both builds. It is measured after TWO warm-up runs, because a
+%% COLD run is not comparable -- the `loop_arith_licm' build keeps the hoisted
+%% values live across the `receive' in a bigger stack frame (`allocate,8' vs
+%% `allocate,5'), and that one-off stack growth costs a GC or two in a freshly
+%% spawned process (measured 0 in the OFF build, 2 in the ON one) without saying
+%% anything about the loop. After the warm-up both builds are in the same heap
+%% and stack state, and the measured run reports the same figures in both.
+%%
+%% The process's running total carries the counters a spawned process inherits
+%% from its parent on top of the GCs of the two warm-ups and of `prep/0''s
+%% mailbox fill, so it is reported but never compared.
+-spec licm_alloc(module()) ->
+          {non_neg_integer(), non_neg_integer(), non_neg_integer(),
+           non_neg_integer(), integer(), non_neg_integer()}.
+licm_alloc(Mod) ->
+    {Pid, MRef} =
+        spawn_monitor(
+          fun() ->
+                  Mod:prep(), _ = Mod:run(),
+                  Mod:prep(), _ = Mod:run(),
+                  {Before, _, _} = erlang:statistics(garbage_collection),
+                  {heap_size, Heap0} = process_info(self(), heap_size),
+                  Mod:prep(),
+                  Val = Mod:run(),
+                  {After, Words, _} = erlang:statistics(garbage_collection),
+                  {heap_size, Heap1} = process_info(self(), heap_size),
+                  exit({probe, {After - Before, Words, Heap0, Heap1, Val, After}})
+          end),
+    receive
+        {'DOWN', MRef, process, Pid, {probe, Res}} ->
+            Res;
+        {'DOWN', MRef, process, Pid, Other} ->
+            ct:fail({probe_died, Mod, Other})
+    end.
+
+%% The `{Name,Arity,Instructions}' triples of a disassembled code chunk,
+%% canonicalized so that two builds of the same source under DIFFERENT module
+%% names compare equal: the `line' instructions are dropped (they carry the
+%% source FILE NAME) and every occurrence of the module's own name is replaced
+%% (the disassembly embeds it in `func_info' and in every local-call target).
+-spec licm_functions([tuple()], atom()) -> [{atom(), arity(), list()}].
+licm_functions(Code, Mod) ->
+    [{N, A, [licm_rename(Mod, probe_mod, I)
+             || I <- Is, licm_op(I) =/= line]}
+     || {function, N, A, _, Is} <- Code].
+
+%% Every occurrence of the atom `From' in `Term' replaced by `To'.
+-spec licm_rename(atom(), atom(), term()) -> term().
+licm_rename(From, To, T) when is_tuple(T) ->
+    list_to_tuple([licm_rename(From, To, E) || E <- tuple_to_list(T)]);
+licm_rename(From, To, L) when is_list(L) ->
+    [licm_rename(From, To, E) || E <- L];
+licm_rename(From, To, From) ->
+    To;
+licm_rename(_From, _To, Other) ->
+    Other.
+
+%% The `{Name,Arity}' of every function whose instructions differ between the
+%% two builds of the same source.
+-spec licm_diff([{atom(), arity(), list()}], [{atom(), arity(), list()}]) ->
+          [{atom(), arity()}].
+licm_diff([], []) ->
+    [];
+licm_diff([{N, A, OffIs} | Offs], [{N, A, OnIs} | Ons]) ->
+    case OffIs =:= OnIs of
+        true -> licm_diff(Offs, Ons);
+        false -> [{N, A} | licm_diff(Offs, Ons)]
+    end;
+licm_diff(OffFns, OnFns) ->
+    ct:fail({function_set_changed, length(OffFns), length(OnFns)}).
+
+%% The disassembled functions of an already compiled probe: `Bin' is written
+%% under the name its source was compiled with, so `beam_disasm' can read it
+%% without compiling the source a second time.
+-spec licm_code(list(), atom(), binary()) -> [{atom(), arity(), list()}].
+licm_code(Config, Name, Bin) ->
+    Beam = beam_filename(Config, Name),
+    ok = file:write_file(Beam, Bin),
+    case beam_disasm:file(Beam) of
+        {beam_file, _M, _Es, _As, _CI, Code} ->
+            licm_functions(Code, Name);
+        Other ->
+            ct:fail({disasm_failed, Name, Other})
+    end.
+
+%% The arithmetic of the receive-loop-owning function, split at its receive
+%% opcode into what runs before the loop header (the preheader) and what runs
+%% inside the loop. The probe has exactly one function with both a `receive' and
+%% arithmetic; `cfg/0' has a `receive' but computes nothing in it.
+-spec licm_recv_arith([{atom(), arity(), list()}]) -> {list(), list()}.
+licm_recv_arith(Fns) ->
+    Splits =
+        lists:filtermap(
+          fun({_N, _A, Is}) ->
+                  case licm_split(Is) of
+                      none ->
+                          false;
+                      {Pre, Post} ->
+                          case licm_arith(Pre) ++ licm_arith(Post) of
+                              [] -> false;
+                              _ -> {true, {Pre, Post}}
+                          end
+                  end
+          end, Fns),
+    case Splits of
+        [Split] -> Split;
+        [] -> ct:fail(no_receive_loop_with_arithmetic);
+        _ -> ct:fail({ambiguous_receive_loop, length(Splits)})
+    end.
+
+%% Split an instruction list at its first receive opcode:
+%% `{Before, From the receive opcode on}', or `none' if there is none.
+-spec licm_split(list()) -> {list(), list()} | none.
+licm_split([I | Is]) ->
+    case licm_op(I) of
+        loop_rec -> {[], [I | Is]};
+        peek_message -> {[], [I | Is]};
+        _ ->
+            case licm_split(Is) of
+                {Pre, Post} -> {[I | Pre], Post};
+                none -> none
+            end
+    end;
+licm_split([]) ->
+    none.
+
+%% The opcode of a BEAM instruction, except that an arithmetic BIF reports its
+%% operation so that `*'/`+'/`div' can be told apart.
+-spec licm_op(tuple() | atom()) -> atom() | {bif | gc_bif, atom()}.
+licm_op(I) when is_tuple(I) ->
+    case element(1, I) of
+        gc_bif -> {gc_bif, element(2, I)};
+        bif -> {bif, element(2, I)};
+        Op -> Op
+    end;
+licm_op(I) ->
+    I.
+
+%% The arithmetic BIFs of an instruction list, in code order.
+-spec licm_arith(list()) -> [{bif | gc_bif, atom()}].
+licm_arith(Is) ->
+    lists:filtermap(
+      fun(I) ->
+              case licm_op(I) of
+                  {bif, Op} -> {true, {bif, Op}};
+                  {gc_bif, Op} -> {true, {gc_bif, Op}};
+                  _ -> false
+              end
+      end, Is).
 
 %%=========================================================================
 %% Compiling, disassembling and running a probe under a set of options.
