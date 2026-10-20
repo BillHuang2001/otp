@@ -93,9 +93,51 @@
 //! * **`DOP_REG_SEND`/`DOP_SEND` both ways**, `DOP_LINK` + `DOP_EXIT`, `DOP_MONITOR_P` +
 //!   `DOP_MONITOR_P_EXIT`, `DOP_DEMONITOR_P`, `DOP_ALIAS_SEND` — routed by the sender's
 //!   `DistLinks` (one table over both halves) and honoured by the receiver.
+//! * **the inbound half**: the *peer* acting on a process **we** host — its `link/1` and
+//!   `exit/2` (`DOP_EXIT`, `DOP_EXIT2`) reaching our own victims, and our own local monitor
+//!   reading back the death of a non-trapping one. Sections 1-7 all have the relationship
+//!   initiated from the side that hosts it; sections 8-10 are the mirror, and the mirror is
+//!   a different code path (this runtime's *inbound* receipt primitives rather than its
+//!   outbound routing).
 //! * **identifier round trips**: a pid inside `{'EXIT', Pid, Reason}` and inside
 //!   `{'DOWN', Ref, process, Pid, Reason}` must be `=:=` the pid that was handed over
 //!   earlier, and a pid echoed through the peer must come back `=:=` `self()`.
+//!
+//! # A measured rust↔rust divergence: the peer's *outbound control* is queued, a message
+//! # is not
+//!
+//! Two of the four inbound families measured in this direction do **not** agree between
+//! two `beam_rt` nodes, so they are deliberately **not** pinned here (a divergence is
+//! reported, never pinned with a weakened assertion):
+//!
+//! * the peer's inbound `DOP_LINK` **record** — `process_info(Victim, links)` reports
+//!   `LINKS_LINKED 0 []` then `LINKS_UNLINKED 1 [true]`, i.e. the item lags one barrier
+//!   step (an ERTS peer reports `1 [true]` then `0 []`);
+//! * the peer's `erlang:monitor/2` of one of **our** processes — the monitor never arms:
+//!   `MONITORED_BY 0 []` on our side and `PEER_DOWN_TIMEOUT` on the peer's (an ERTS peer
+//!   gets `MONITORED_BY 1 [true]` and the `DOWN`).
+//!
+//! One root cause covers both. A process-table control signal (`link`/`unlink`/`monitor`)
+//! leaves this runtime **queued** — `DistSignalRouter::route` →
+//! `DistClientInner::queue_signal`, flushed only at the client's next `pump`
+//! (`flush_pending`) — while a *message* to a remote destination
+//! (`DOP_REG_SEND`/`DOP_SEND`, `DistLinks::route_control`/`route_message`) is written to
+//! the socket at the call. A barrier (or a `{monitoring, …}` notice) sent right after the
+//! call therefore **overtakes** the not-yet-flushed control signal on the same link, so the
+//! peer's synchronous read of the recorded state sees it one step late. In the monitor case
+//! the `DOP_MONITOR_P` then lands after our victim has already died, and an inbound
+//! monitor for a non-live target is dropped (`LocalDeliverySink::resolve_live`), so no
+//! `DOP_MONITOR_P_EXIT` is ever emitted. ERTS writes the signal synchronously under the
+//! link lock, which is why a real `erl` peer has no such window.
+//!
+//! Every `dist_two_vm.rs` case over the same fixtures **passes**, so this is a
+//! rust↔rust-only ordering asymmetry, not a wire or a codec defect.
+//!
+//! The `demonitor` sub-arm of the monitor family is *not measurable* on a `beam_rt` peer for
+//! an unrelated reason: the fixture's `monitor_then_demonitor/1` renders the victim with
+//! `pid_text/1`, and `erlang:pid_to_list/1` of an external pid is an **uncatchable**
+//! capability gap (below), so the peer dies with exit 3 `beam_rt: unsupported: bif` before
+//! the relationship is armed. There is no `ask_victim_rust/2`-based demonitor actor yet.
 //!
 //! # Running it
 //!
@@ -146,6 +188,15 @@ const RV_EXIT_KILL_SPEC: &str = "two_vm:rv_exit_kill/1";
 const RR_OUR_ALIAS_SPEC: &str = "two_vm:rr_our_alias/1";
 /// [`our_pid_survives_a_round_trip_through_a_rust_peer`]: our `self()` out and back.
 const IDENTITY_SPEC: &str = "two_vm:identity/1";
+/// [`a_rust_peers_death_travels_inbound_and_our_trapping_process_traps_its_compound_reason`]:
+/// the **peer** links to a victim *we* host and then dies of a compound reason.
+const RR_PEER_LINK_DEATH_SPEC: &str = "two_vm:peer_link_death/1";
+/// [`a_rust_peers_death_travels_inbound_and_kills_our_non_trapping_process_with_its_reason`]:
+/// the same relationship with `trap_exit` **off**, read back through our own local monitor.
+const RR_PEER_LINK_DEATH_PLAIN_SPEC: &str = "two_vm:peer_link_death_plain/1";
+/// [`a_rust_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill`]: the
+/// peer's `erlang:exit/2` over the whole `{plain,kill} x {trapping,not}` matrix.
+const RR_PEER_EXIT2_SPEC: &str = "two_vm:peer_exit2/1";
 
 // ---------------------------------------------------------------------------------------
 // 1. The handshake, in both directions
@@ -558,6 +609,201 @@ fn our_pid_survives_a_round_trip_through_a_rust_peer() {
         &pair.runtime,
         &["PARENT_TIMEOUT", "NOIDENTITY"],
         "the pid came back and matched before the bound",
+    );
+    pair.finish();
+}
+
+// ---------------------------------------------------------------------------------------
+// 8-10. The inbound half: the **peer** acts on a process *we* host
+//
+//   Sections 1-7 all have our node (or the peer) acting on a process that lives on the
+//   *peer*. These three are the mirror — the peer's `link/1` and `exit/2` aimed at a victim
+//   our own node hosts, which is the direction ERTS calls the *inbound*
+//   `DOP_LINK`/`DOP_EXIT`/`DOP_EXIT2` (`dist.c:2224`, `:2760`, `:2824`).
+//   `tests/dist_two_vm.rs` pins the same three families against a real `erl` peer; here the
+//   peer is this runtime, so the wire has this runtime's encoder on **both** ends.
+//
+//   Two families of the four measured in this direction are *not* here, because they do
+//   not yet agree between two `beam_rt` nodes (a **reported** finding, never a weakened
+//   assertion — see the module docs' `# A measured rust↔rust divergence` section).
+// ---------------------------------------------------------------------------------------
+
+/// **A `beam_rt` peer's death travels *inbound* and our trapping process traps its
+/// compound reason** — the receive side of `DOP_EXIT` (`dist.c:2760`).
+///
+/// The peer links to a victim our responder spawned, waits for a barrier that proves our
+/// node applied the `DOP_LINK` (the ack is a same-link round trip), and then dies of
+/// `{boom,[1,2,3]}`. Our victim traps exits, so the signal must reach it as
+/// `{'EXIT', PeerPid, {boom,[1,2,3]}}`.
+///
+/// Three identity claims, all term-level:
+///
+/// * `EXIT_PID true` — the trapped message's sender is `=:=` the pid the peer reported
+///   separately from the one the wire carried inside the exit: two arrivals of one external
+///   pid must decode to one `Eterm` word.
+/// * `EXIT_REASON {boom,[1,2,3]}` — the *reason term itself*, not a shape that resembles
+///   it: a bare atom would pass for any atom, so the compound value is what is asserted.
+/// * `LINKER_DOWN {boom,[1,2,3]}` — the peer's own witness that its arm really died of the
+///   reason it chose, so our trapped term cannot be explained by an arm that never died.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_death_travels_inbound_and_our_trapping_process_traps_its_compound_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_peer_link_death",
+        RR_PEER_LINK_DEATH_SPEC,
+        "actor_link_death_boxed",
+    ) else {
+        return;
+    };
+    // The peer's connector → our acceptor (its first act), and the pid it received: our
+    // victim is an *external* pid there, so it proves the type rather than rendering it.
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    // Our own view of the peer's arm: a pid (never text — the peer's pid is external here).
+    pair.runtime_equals("LINKER_IS_PID ", "LINKER_IS_PID true");
+    // `LINKED` is the peer's own `{'EXIT'}` arm reporting the link call's success...
+    pair.actor_equals("LINKED", "LINKED");
+    // ...and our node routed the exit the peer's death produced: the sender's identity
+    // first, then the reason term.
+    pair.runtime_equals("EXIT_PID ", "EXIT_PID true");
+    pair.runtime_equals("EXIT_REASON ", "EXIT_REASON {boom,[1,2,3]}");
+    // The peer's witness of its own death, with the very same reason term.
+    pair.actor_equals("LINKER_DOWN ", "LINKER_DOWN {boom,[1,2,3]}");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.assert_absent(
+        &pair.runtime,
+        &["EXIT_TIMEOUT", "EXIT_OTHER_PID", "NOLINKER"],
+        "the trapped exit matched the linked pid inside the bound",
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["NOLINK", "LINKER_TIMEOUT", "PINGFAIL", "NOVISITOR"],
+        "the peer armed its link and reported its own death",
+    );
+    pair.finish();
+}
+
+/// **The same inbound link death with `trap_exit` off**: the signal *terminates* our
+/// process, and the reason it terminates with is the peer's own — never `noproc` (a link
+/// the receiver never recorded) and never `killed` (the untrappable-exit reason, which a
+/// link exit does not use).
+///
+/// The victim is a `spawn`ed child (the responder must outlive it to report) and its death
+/// is read back through the responder's **own local monitor**, so `DOWN_REASON boom` is our
+/// own observation of our own process — not the peer's claim about it. The peer's
+/// `LINKER_DOWN boom` is the independent half: its arm really did die of `boom`.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_death_travels_inbound_and_kills_our_non_trapping_process_with_its_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_peer_link_death_plain",
+        RR_PEER_LINK_DEATH_PLAIN_SPEC,
+        "actor_link_death_atom",
+    ) else {
+        return;
+    };
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.runtime_equals("LINKER_IS_PID ", "LINKER_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    // Our own local monitor's DOWN: the clause bound the reference we minted and the pid we
+    // spawned (a `DOWN` naming anything else falls through to `DOWN_OTHER`).
+    pair.runtime_equals("DOWN_PID ", "DOWN_PID true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON boom");
+    pair.actor_equals("LINKER_DOWN ", "LINKER_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT", "DOWN_OTHER", "NOLINKER"],
+        "the victim's death reached our own monitor with the peer's reason",
+    );
+    pair.assert_absent(
+        &pair.actor,
+        &["NOLINK", "LINKER_TIMEOUT", "PINGFAIL", "NOVISITOR"],
+        "the peer armed its link and reported its own death",
+    );
+    pair.finish();
+}
+
+/// **A `beam_rt` peer's `erlang:exit/2` calls travel inbound and split the whole matrix by
+/// trapping and `kill`** — the inbound `DOP_EXIT2` (`dist.c:2824`), which is *not* the link
+/// exit: it is the signal `exit/2` produces, so it must apply the same untrappable-`kill`
+/// rewrite ERTS applies locally.
+///
+/// Four victims our responder spawned — two non-trapping, two trapping — and the peer calls
+/// `exit(Victim, boom)` and `exit(Victim, kill)` against one of each. The four rows the
+/// responder must print are the C's exit policy, one per cell of the matrix:
+///
+/// ```text
+/// EXIT2 plain_boom down boom                  % non-trapping, plain reason: dies of it
+/// EXIT2 plain_kill down killed                % non-trapping, kill: the rewrite to `killed`
+/// EXIT2 trap_boom trapped boom from_peer=true % trapping, plain reason: the message
+/// EXIT2 trap_kill down killed                 % trapping, kill: still dies, still `killed`
+/// ```
+///
+/// `from_peer=true` is the trapped message's sender `=:=` the pid the peer's greeting
+/// carried, so the trapped signal is demonstrably the peer's. `TRAP_BOOM_ALIVE true` is the
+/// survivor answering a round-trip probe — a trapped process is *alive*, not merely
+/// un-reaped — and the peer's own `EXIT2 <label> true` lines are `exit/2`'s return value,
+/// which is `true` for a live target on both runtimes.
+#[test]
+#[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
+fn a_rust_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill() {
+    let Some(pair) = Pair::start(
+        PeerKind::Rust,
+        BANNER,
+        "rr_peer_exit2",
+        RR_PEER_EXIT2_SPEC,
+        "actor_exit2_matrix",
+    ) else {
+        return;
+    };
+    // Four references we minted, one per victim — the monitor behind each row below.
+    pair.runtime_equals(
+        "MONITORS_ARE_REFS ",
+        "MONITORS_ARE_REFS [true,true,true,true]",
+    );
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The four victim pids arrived at the peer as pids (it cannot render one).
+    pair.actor_equals(
+        "VICTIMS_ARE_PIDS ",
+        "VICTIMS_ARE_PIDS [true,true,true,true]",
+    );
+    // `exit/2`'s own return value, one per call, in the order the peer makes them.
+    pair.actor_equals("EXIT2 plain_boom ", "EXIT2 plain_boom true");
+    pair.actor_equals("EXIT2 plain_kill ", "EXIT2 plain_kill true");
+    pair.actor_equals("EXIT2 trap_boom ", "EXIT2 trap_boom true");
+    pair.actor_equals("EXIT2 trap_kill ", "EXIT2 trap_kill true");
+    // Our side's four outcomes. The collector accepts the receipts in any order (they come
+    // from five different senders) and prints them always in this one.
+    pair.runtime_equals("EXIT2 plain_boom ", "EXIT2 plain_boom down boom");
+    pair.runtime_equals("EXIT2 plain_kill ", "EXIT2 plain_kill down killed");
+    pair.runtime_equals(
+        "EXIT2 trap_boom ",
+        "EXIT2 trap_boom trapped boom from_peer=true",
+    );
+    pair.runtime_equals("EXIT2 trap_kill ", "EXIT2 trap_kill down killed");
+    pair.runtime_equals("TRAP_BOOM_ALIVE ", "TRAP_BOOM_ALIVE true");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.assert_absent(
+        &pair.runtime,
+        &["EXIT2_TIMEOUT"],
+        "every one of the four exit signals produced a receipt inside the bound",
+    );
+    pair.assert_no_substring(
+        &pair.runtime,
+        "missing",
+        "every label matched a receipt, so no row reported a missing outcome",
     );
     pair.finish();
 }
