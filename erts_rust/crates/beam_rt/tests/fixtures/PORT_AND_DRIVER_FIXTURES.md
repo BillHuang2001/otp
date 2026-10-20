@@ -7,8 +7,8 @@ The general skip rule — a missing toolchain is a loud `SKIP`, a missing commit
 | fixture | subject |
 |---|---|
 | `event_driver.c` / `event_driver.erl` | the driver `driver_select` + `driver_set_timer` + output-family modes |
-| `reg.c` / `reg_recv.erl` | the port-less driver registry hooks |
-| `env_nif.c` / `env_nif.erl` / `env_caller.erl` | `enif_alloc_env`/`enif_free_env` over a real NIF |
+| `reg.c` / `reg_recv.erl` | the port-less driver registry hooks (**inline in `tests/driver.rs`**, not files here) |
+| `env_nif.c` / `env_nif.erl` / `env_caller.erl` | `enif_alloc_env`/`enif_free_env` over a real NIF (**inline in `tests/nif.rs`**, not files here) |
 | `busy_driver.c` | the `port_command/2,3` busy/suspend/`[force]` table over a real busy driver |
 | `port_failure_driver.c` + `port_failure.erl` | the `driver_failure*`/`driver_exit` port-closing family |
 
@@ -76,7 +76,7 @@ erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "event"),
 so `ready_input`'s byte is `<<"R">>`, `timeout`'s is `<<"T">>`, and the runtime's own answer is
 asserted against exactly that pair.
 
-## Registry-hook fixtures (`reg.c` / `reg_recv.erl`, never committed — compiled at test time)
+## Registry-hook fixture (inline in `tests/driver.rs`, compiled at test time)
 
 `tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle` compiles a second
 driver fixture at test time (contract A.4):
@@ -93,11 +93,11 @@ Neither is committed: the C is compiled with `$CC` (or `cc`) against the host `e
 Erlang with the system `erlc`, both at test time, and both are skipped **loudly** (the test returns)
 when a tool is missing.
 
-Oracle values (the same `.so`, verified against the real system `erl`):
+Oracle values (the same `.so`, verified against the real system `erl`; `reg.c` is the `REG_DRIVER_C` string in `tests/driver.rs`, written out to a scratch dir before this build):
 
 ```sh
 INC=$(erl -noshell -eval 'io:format("~s",[code:lib_dir(erts,include)])' -s init stop)
-cc -shared -fPIC -I"$INC" -o "$TMPDIR/reg.so" reg.c
+cc -shared -fPIC -I"$INC" -o "$TMPDIR/reg.so" "$TMPDIR/reg.c"
 erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "reg"),
     P = open_port({spawn_driver, "reg"}, [binary]),
     true = port_command(P, <<"go">>),
@@ -113,7 +113,7 @@ erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "reg"),
 | `remove_driver_entry` (again) | `0` | the entry is already gone (no such entry) |
 | `remove_driver_entry` (the port's own entry) | `-1` | dynamically loaded, refused (`io.c:7709-7713`) |
 
-## `enif_alloc_env` fixtures (`env_nif.c` / `env_nif.erl` / `env_caller.erl`, never committed)
+## `enif_alloc_env` fixture (inline in `tests/nif.rs`)
 
 `tests/nif.rs::enif_alloc_env_returns_a_live_env` compiles a NIF fixture at test time (contract A.3)
 that is **separate** from the shared `beam_abi` fixture `test_nif.c` (which this crate may not edit),
@@ -125,8 +125,7 @@ because the shared fixture does not exercise the `alloc_env`/`free_env` host hoo
   `env_caller.erl` (`go/1`) reaches `alloc_env_ok/0` through an **external** call (a local call inside
   the NIF's own module would never reach the runtime's dispatch).
 
-Neither is committed; both are compiled at test time and skipped **loudly** when `cc`/`erlc`/the
-header is missing. Oracle (the same artifacts under the real system `erl`):
+Neither is a file in this directory; the C, the stub module and the caller are `include_str!`-embedded in `tests/nif.rs`, written to a scratch dir, and compiled there at test time, skipped **loudly** when `cc`/`erlc`/the header is missing. Oracle (the same artifacts under the real system `erl`):
 
 ```sh
 erl -noshell -pa "$TMPDIR" -eval 'io:format("~w~n",[env_caller:go(os:getenv("TMPDIR") ++ "/env_nif")]), halt(0).'

@@ -17,7 +17,7 @@ The per-doc sections add only their suite's own specifics (which tools, the 30 s
 
 ## Committed `.beam` images
 
-All 26 committed images, by name (byte sizes are the committed files' own):
+All 27 committed images, by name (byte sizes are the committed files' own):
 
 | image | bytes | described under |
 |---|---|---|
@@ -30,6 +30,7 @@ All 26 committed images, by name (byte sizes are the committed files' own):
 | `recv_after.beam` | 824 | `## Committed oracle fixtures` |
 | `dist_echo.beam` | 632 | `## Committed oracle fixtures` |
 | `port_exit.beam` | 2 512 | `## Committed oracle fixtures` |
+| `port_suspend.beam` | 1 048 | `## Committed oracle fixtures` |
 | `bifent.beam` | 720 | `## Committed oracle fixtures` |
 | `tmr.beam` | 660 | `## Committed oracle fixtures` |
 | `pingpong.beam` | 1 004 | `## Committed oracle fixtures` |
@@ -224,8 +225,10 @@ cp port_failure.erl "$SCRATCH/gen/"
 cp "$SCRATCH/gen/port_failure.beam" port_failure.beam    # 2 656 bytes
 git add -f port_failure.beam
 ```
-Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
-absolute checkout path is embedded in any committed `.beam`.
+Every fixture in this section is built with `+deterministic` in a `$TMPDIR` scratch dir, which strips the embedded source path.
+Two committed images are **not** path-free — `strings reds_boundary.beam port_suspend.beam | rg '/home/'` reports a worktree path in each:
+`reds_boundary.beam` and `port_suspend.beam` were compiled without `+deterministic`.
+Neither suite compares its image bytes, so nothing is flaky; recompiling either one with the deterministic recipe above removes the leak.
 
 The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
 **force-added**: `git add -f sched.beam`.
@@ -461,7 +464,7 @@ Each rebuilt `.beam` must be **force-added** (`git add -f gc_loop.beam`), like t
 
 `recv_after`'s exports pin the finite-`after` shapes: `after20/0`/`after2000/0` compile to a
 `wait_timeout` carrying the literal `{integer,T}` followed by `timeout` (the shape
-`src/runner/reason.rs::parked_receive_timeout` recovers the deadline from), `afterzero/0` folds the
+`Machine::wait_deadline` recovers the deadline from), `afterzero/0` folds the
 `after 0` away so an empty mailbox falls straight to `timeout`, `self_send/0` matches the
 queued message and never arms a deadline, and `wait_forever/0` (`after infinity`) is a bare
 `wait`. Only the two literal-timeout exports are read here; a **variable** `after T` compiles
@@ -469,11 +472,30 @@ to the same `wait_timeout` with a Y-register operand, which the runner cannot re
 `CONTEXT.md`'s Known Issues). The fixture is driven by the receive-deadline tests in
 `src/runtime.rs` (the scheduler path) and `src/runner/` (the parked-timeout bookkeeping).
 
-`marked/0`-style exports that would drive the `recv_marker_*` prologue are deliberately
-**not** in either fixture: the prologue is emitted for a receive that matches on a
-reference created before the send, which needs `erlang:make_ref/0` — a `beam_bifs` BIF
-that Milestone 1 does not register. The marker seam is covered directly instead (the
-unit tests in `src/mailbox.rs` and `src/context.rs`).
+`rescan:marked/0` drives the `recv_marker_*` prologue (a receive matching on a reference created before the send), and `junk_then_ref/0` and `two_receives/0` pin the anchor and the rescan positions.
+
+## Every other fixture file in this directory
+
+The files below are consumed by the named suite; `ERL_SOURCE_FIXTURES.md` and `PORT_AND_DRIVER_FIXTURES.md` describe the ones whose detail is load-bearing, and this table is the index for the rest (all compiled at test time unless noted).
+
+| file | suite | what it is |
+|---|---|---|
+| `action_identity.erl` | `../action_identity.rs` | `ident/0` prints the `-s`/`-run` action process's own identity (registered name, `whereis(init)`, liveness, node) on one line |
+| `funrecv.erl` / `funrecvw.erl` | `../fun_entry_receive.rs` | the fun-bodied process entry: a `make_fun3` closure entered at its own lambda label, with the blocking `receive` inline and one `call_ext` away |
+| `inet_completion_parity.erl` / `inet_completion_udp.erl` | `../inet_completion.rs` | the passive-completion parity pair (`cpl_parity:go/0`, `cpl_udp:recv/0`) over real loopback sockets |
+| `maxheap.erl` (compiled image committed as `maxheap.beam`) | `../max_heap_enforce.rs` | the `max_heap_size` kill/survive matrix |
+| `preempt.erl` (compiled image committed as `preempt.beam`) | `../preempt.rs` | the allocation and spin loops the reduction pre-emption budget is measured on |
+| `pi_binary.erl` | `../process_info_binary.rs` | `process_info(self(), binary)` over a self-built payload, a held payload and a held list |
+| `plstart.erl` / `plwait.erl` | `../proc_lib_start.rs` | the `proc_lib:start_link` shapes and the `plwait` receive that waits on the ack/`'DOWN'` pair |
+| `port_watch.erl` | `../port_monitor_cleanup.rs` | `watch/1` monitors a port and parks; `kill/1` removes the watcher |
+| `sched_compile_driver.erl` / `sched_compile_input.erl` | `../compile_file.rs` | the scheduled-route `compile:file/2` driver and its one-function input |
+| `sigself.erl` | `../signal_self_delivery.rs` | a process signalling itself out of its own slice (`killed/0`, `natural/0`, `ran_before_kill/0`) |
+| `spawnmon.erl` | `../spawn_monitor.rs` | `spawn_monitor/1` incl. the local-node, bad-arg and remote shapes |
+| `spawnslice.erl` | `../spawn_from_slice.rs` | a bare and a nested spawn issued from inside a running slice |
+| `nif_monitor.c` / `nif_monitor.erl` / `nif_monitor_caller.erl` | `../nif_monitor.rs` | the `enif_monitor_process`/`enif_demonitor_process` NIF, its stub module and the external caller |
+| `nif_resource_gc.c` | `../nif_resource_gc.rs`, `../nif_resource_nested.rs` | the resource-type destructor fixture the reachability prune is measured against |
+| `reg.c` / `reg_recv.erl` | `../driver.rs` | **inline in `tests/driver.rs`** (`REG_DRIVER_C` and the `reg_recv` source), not files in this directory |
+| `env_nif.c` / `env_nif.erl` / `env_caller.erl` | `../nif.rs` | **inline in `tests/nif.rs`** (`ENV_NIF_ERL`/`ENV_CALLER_ERL` and the C), not files in this directory |
 
 ## See Also
 
