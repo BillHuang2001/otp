@@ -854,16 +854,52 @@ is the live set's target, both branches of the same rule. The figure a minor doe
 mature space's occupancy — crept 4 411 → 8 822 over that same window, and its 2× whole-heap target
 10 958 → 17 731: a capacity that follows the run's total promotion rather than its live set.
 
-Pre-change figures for the same pins, measured on the pre-change tree: `reds_door` read **2 586**
-at N = 2 000 instead of 610, and `slice_charging`'s interpreter control read **2 586** instead of
-233. They are quoted as measurements of that tree, not as a narrative about the code.
+**The churn shape's own counters** (`tests/churn_attribution.rs`, 4 000 ops + 500 warm-up): 0.201
+collections/op (0.167 minor + 0.034 major), 271.1 words copied/op, 103.40 objects copied/op, 806.0
+words reclaimed/op, 0.0007 growth events/op, peak nursery spaces 1, peak nursery capacity 4 185 words
+(occupancy 3 541), peak mature capacity 10 958 (occupancy 8 118) → peak resident occupancy 11 659 words
+against a peak resident capacity of 15 143, fullsweep live set 546 / 1 353. The table above is that run.
 
-**The churn shape is unchanged by the rule** — `tests/churn_attribution.rs`, 4 000 ops + 500
-warm-up: 0.200 collections/op (0.133 minor + 0.067 major), 270.8 words copied/op, 103.28 objects
-copied/op, 806.0 words reclaimed/op, 0.0007 growth events/op, peak nursery spaces 1, peak nursery
-capacity 4 185 words (occupancy 3 523), peak mature capacity 6 772 (occupancy 4 059) → peak
-resident occupancy 7 582 words against a peak resident capacity of 10 957, fullsweep live set
-546 / 1 353. The table above is that run.
+### The flatness-vs-amortisation trade
+
+A minor's target is **one** times the young live set, so the nursery holds `target / per-iteration
+allocation` iterations of the mutator's own allocation and the capacity stays **flat in N** at a
+constant live set.
+A larger minor multiple would amortise the copy work further; it is excluded because the amortisation
+would price memory on a *young-only* under-estimate of the live set and would move the converged young
+capacity off the figure the dependents pin.
+The measured case for that choice, all four probes on this tree:
+
+**1. The dependent runtime's constant-live-set flatness probe.** The owner is `beam_rt`: a probe that
+rebuilds a 400-element tuple every iteration and samples `process_info(self(), heap_size)` at **every**
+iteration, run as a release build of the runtime at four N values spanning 2 000 … 200 000 (a 100×
+range). Over those samples the **min** `heap_size` is **987** and the **max** **830 667** on the native
+baseline-JIT tier, and **2 586** / **134 530** with `BEAM_RT_TIER=interpreter`; the post-loop reading
+is **610** = `young_minor_target_words(401)` on **both** tiers. Both ends are flat in N — the min is
+the capacity the policy installs, the max is the **chain-summed** capacity mid-burst (`Nursery::grow`
+retires spaces without moving terms), so the max is a burst-cycle fixed point rather than a leak. A
+single sample is not a measurement: one arbitrary iteration of the same run reports anything from
+**2 586** to **830 667** (a 321× spread across sample points), because a sample lands mid-burst on the
+garbage the iteration has just allocated. The canonical table and the probe are `beam_rt`'s.
+
+**2. The same trade in the crate's own counters** — the `gc_bound/churn` attribution above: **0.201**
+collections/op = **0.167** minor + **0.034** major, **271.1** words copied/op (0.336× the 806 words the
+shape allocates per op), **103.40** objects copied/op, peak nursery **4 185** capacity / 3 541
+occupancy, peak mature **10 958** / 8 118, peak resident **15 143** words, fullsweep live set min/peak
+546 / 1 353, end state nursery 4 185 / 0 and mature 10 958 / 4 059.
+
+**3. The dependent runtime fixture that reads the same ratio at a much larger allocation per
+iteration** — `beam_rt`'s `boundary_cost` (release, read-only from here), whose N = 2 000 row reads
+`collections=3468 major=169 door_checks=904 door_collections=128 peak_young_spaces=1
+peak_young_capacity=1220 peak_mature_capacity=4185 peak_mature_used=4068`. That is **1.73 collections
+per iteration** for a **1 220**-word nursery carrying **1.5** iterations of allocation (1 220 / 806),
+and its boundary door fires **one collection per 7.06 checks** (`904 / 128`, inside the 7..9 watermark
+band its owner pins) at `904 / 2 001 = 0.452` checks per call.
+
+**4. The suite those probes live in** is `beam_rt`'s: 1 805 passed / 1 failed / 4 ignored, the single
+failure being that fixture's own stale `MEASURED` table, which its owner re-derives. The two `beam_gc`
+pins inside it both pass — `reds_door` (converged `heap_size` **610** at N = 2 000 and 20 000) and
+`slice_charging` (interpreter control **233**).
 
 ### The CLI flatness probe and the burst residual
 
