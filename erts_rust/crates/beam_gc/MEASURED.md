@@ -30,9 +30,12 @@ Sections:
 * [Per-op attribution of the `gc_bound/churn` shape](#per-op-attribution-of-the-gc_boundchurn-shape-the-collectors-own-counters)
   — what the churn shape pays per operation.
 * [The nursery follows the live set — the live-set nursery target](#the-nursery-follows-the-live-set--the-live-set-nursery-target)
-  — one target derived from the whole-heap live set, the counters it moves and the A/B; with
-  [the rejected nursery-sizing variants](#the-rejected-nursery-sizing-variants) and
-  [the cadence against the oracle](#the-cadence-against-the-oracle-counts).
+  — one target per collection kind, the counters it moves and the A/B; with
+  [the acceptance measurements](#the-acceptance-measurements-a-collections-capacity-is-the-live-set)
+  (the `beam_rt` pins), [the CLI flatness probe and the burst
+  residual](#the-cli-flatness-probe-and-the-burst-residual), [the rejected nursery-sizing
+  variants](#the-rejected-nursery-sizing-variants) and [the cadence against the
+  oracle](#the-cadence-against-the-oracle-counts).
 * [The off-heap binary roster](#the-off-heap-binary-roster-reachability-reclaim-and-the-binary-virtual-heap-trigger)
   — the reachability sweep flat in N, and the pre-wiring runtime probe that shows what the missing
   trigger costs (one retained 64 KiB payload per call).
@@ -647,16 +650,16 @@ runner::tests::the_churn_workloads_per_call_counters_are_flat_in_n -- --nocaptur
 |---|---|---|
 | environment | `beam_gc` unit-shaped driver, `HeapPolicy::default()` | real runtime, scheduled slice |
 | words allocated | 806 (asserted from the shape) | ≈1 830 (3 × 256 cons + copy-out + tuple) |
-| collections | **0.201** (0.133 minor / 0.067 major) | 0.061 (2 459 collections, 18 of them fullsweeps) |
-| words copied | **271.0** (0.34 × the allocated volume) | — |
-| words reclaimed (junk) | 806.5 (≈ all of it) | — |
-| objects copied | 103.38 | — |
-| words copied / collection | 1 350.7 | — |
+| collections | **0.200** (0.133 minor / 0.067 major) | 0.061 (2 459 collections, 18 of them fullsweeps) |
+| words copied | **270.8** (0.34 × the allocated volume) | — |
+| words reclaimed (junk) | 806.0 (≈ all of it) | — |
+| objects copied | 103.28 | — |
+| words copied / collection | 1 350.8 | — |
 | growth events (space installs) | 0.0007 | — |
 | debt admissions | 0.0000 | 0 (no boundary holds a retired space) |
-| peak nursery capacity (occupancy) | 4 185 (3 489 words) | 99 003 |
+| peak nursery capacity (occupancy) | 4 185 (3 523 words) | 99 003 |
 | peak mature capacity / occupancy | 6 772 / 4 059 words | 121 536 / 85 542 words |
-| fullsweep live set (min…peak) | 464 … 1 353 words | — |
+| fullsweep live set (min…peak) | 546 … 1 353 words | — |
 
 **Reading the split.** Because the nursery is sized from the live set, the copy volume now sits **below**
 the mutator's allocation volume — 271 copied words per 806 allocated, i.e. **0.34×** — as the
@@ -669,7 +672,7 @@ op pays per collection, so the two are no longer multiplied by two collections p
 minor to a fullsweep whenever `mature.available_words() < nursery.used_words()` — the test is against the
 nursery's whole **occupancy**, not the live young set a minor would actually copy. The instrument records the
 escalation's inputs: the mature had as little as **1** free word when an escalation fired, against a nursery
-occupancy of up to **4 035**, so every escalation is a genuine "the mature is full of promoted
+occupancy of up to **4 069**, so every escalation is a genuine "the mature is full of promoted
 garbage", not a conservative-test artifact. `fullsweep_after` (65 535) never fires: all 0.067
 majors/op are **capacity**-forced, and the fresh mature space is sized by
 `mature_after_fullsweep(capacity, live, young_occupancy)`, which on this shape takes the grow branch or
@@ -693,61 +696,81 @@ per-call marginal, not as an N-independent constant.
 Source: `tests/churn_attribution.rs` (deterministic counters, load-invariant) plus the paired
 `beam_rt` A/B below.
 
-**The mechanism.** The nursery's post-collection capacity is ONE target,
-`HeapPolicy::young_target_words(live) = next_words(YOUNG_TARGET_LIVE_MULTIPLE * live +
-need_reserve_words, 0)`, i.e. `next_words(2 * live + 64)` — a function of the **whole-heap live set**,
-never of the nursery's own capacity or of its pre-collection fill. A fullsweep is the one collection
-that measures the live set exactly, so it is where the capacity is installed
-(`Nursery::collapse_after_fullsweep` → `young_after_fullsweep(capacity, live)`: grow to the target,
-shrink back to it once the live set has fallen `YOUNG_SHRINK_FACTOR` (8) times below it, else keep); a
-minor may only **keep or shrink** against the same target (`Nursery::collapse` →
-`young_after_collection(capacity, live)`), because its cheap live figure is the mature space's
-occupancy, an *over*-estimate, and growing from an over-estimate would close a loop through the
-nursery. Two ratios fix the constants: a copying nursery amortizes the live set's evacuation over the
-words the mutator allocates into it, so `live / nursery` is the collector's copy work per allocated
-word and `YOUNG_TARGET_LIVE_MULTIPLE = 2` halves it; and the band from `YOUNG_SHRINK_FACTOR = 8` is
-wider than the ~3× a live set swings inside one operation, so the capacity is a fixed point rather
-than an oscillation.
+**The mechanism.** The nursery's post-collection capacity is ONE live-set target per collection
+kind, never a function of the nursery's own capacity or of its pre-collection fill.
+
+* A **fullsweep** measures the **whole-heap** live set exactly (it copies every live word), so it
+  sizes the nursery from `young_target_words(live) = next_words(YOUNG_TARGET_LIVE_MULTIPLE * live +
+  need_reserve_words, 0)`, i.e. `next_words(2 * live + 64)`, through `Nursery::collapse_after_fullsweep`
+  → `young_after_fullsweep(capacity, live)`: grow to the target, shrink back to it once the live set
+  has fallen `YOUNG_SHRINK_FACTOR` (8) times below it, else keep.
+* A **minor** measures only the **young** live set — the words it evacuated, `GcStats::words_copied`
+  (`GenImmixCollector::run_minor` feeds the promoted words, the same exact quantity) — and sizes the
+  nursery from `young_minor_target_words(live) = next_words(live + need_reserve_words, 0)`, i.e.
+  `next_words(live + 64)`, through `Nursery::collapse` → `young_after_collection(capacity, live)`: a
+  three-way choice that **installs the target** when the capacity is above `YOUNG_SHRINK_FACTOR` × the
+  target (the live set fell far below what the nursery is sized for: give the memory back) or below it
+  (enlarge onto the target), and otherwise **keeps** the capacity. A minor therefore both grows and
+  shrinks, always onto a capacity derived from the live set.
+  The mature space's occupancy is **never** a minor's live figure: a minor does not copy the mature
+  generation (only a fullsweep does), so that space carries every garbage object the minors since the
+  last fullsweep promoted, and a target derived from it tracks the run's *total promotion* instead of
+  its live set.
+
+Two ratios fix the constants: a copying nursery amortizes the live set's evacuation over the words
+the mutator allocates into it, so `live / nursery` is the collector's copy work per allocated word and
+the fullsweep's `YOUNG_TARGET_LIVE_MULTIPLE = 2` halves it (the minor's figure is young-only, an
+under-estimate of the heap's whole live set, so it takes one times the live set — the smallest curated
+capacity at which the round's own survival does not itself force the next collection); and the band
+from `YOUNG_SHRINK_FACTOR = 8` is wider than the ~3× a live set swings inside one operation, so the
+capacity is a fixed point rather than an oscillation. Both targets run through the monotone
+`next_words`, so neither can land below `nursery_floor_words() = next_words(need_reserve_words, 0)`
+(**90** words for the default policy, **233** = `DEFAULT_MIN_HEAP_WORDS` for a spawn policy — the
+figure `beam_rt`'s `COLLECTOR_FLOOR` pin reads), and `young_minor_target_words(0)` *is* that floor.
 The C reaches the same decision in two steps — `major_collection` sizes the receiving young heap from
 the pre-copy occupancy (`erl_gc.c:1866`), then `adjust_after_fullsweep` re-sizes from the post-copy
 live set (`erl_gc.c:2062-2098`) — because a C young heap is only *part* of the process heap. Here the
 nursery is its own space, so its occupancy is bounded by its own capacity
 (`used_words() <= capacity_words()`) and can never signal demand beyond the live set: the pre-copy
 step collapses into the live-set decision.
-| per operation (4 000 ops + 500 warm-up) | capacity-keyed rule (`5ddf6e72e4`) | live-set target (`49a8df25ad`) |
+
+| per operation (4 000 ops + 500 warm-up) | capacity-keyed rule (`5ddf6e72e4`) | live-set target (current) |
 |---|---|---|
 | words allocated (shape) | 806 | 806 |
-| collections | 1.500 (1.000 minor / 0.500 major) | **0.201** (0.133 / 0.067) |
-| words copied | 1 283.5 | **271.0** |
-| words reclaimed (junk) | 806.6 | 806.5 |
-| objects copied | 425.01 | **103.38** |
-| words copied / collection | 855.4 | 1 350.7 |
+| collections | 1.500 (1.000 minor / 0.500 major) | **0.200** (0.133 / 0.067) |
+| words copied | 1 283.5 | **270.8** |
+| words reclaimed (junk) | 806.6 | 806.0 |
+| objects copied | 425.01 | **103.28** |
+| words copied / collection | 855.4 | 1 350.8 |
 | growth events (space installs) | 0.0004 | 0.0007 |
 | peak nursery spaces | 1 | 1 |
-| peak nursery capacity / occupancy | 609 / 461 | **4 185** / 3 489 |
+| peak nursery capacity / occupancy | 609 / 461 | **4 185** / 3 523 |
 | peak mature capacity / occupancy | 2 586 / 1 960 | **6 772** / 4 059 |
-| fullsweep live set (min…peak) | 464 … 1 353 | 464 … 1 353 |
-| peak resident (nursery + mature) | 3 195 | **10 957** |
-| escalation: mature room min vs nursery occupancy max | 1 vs 550 | 1 vs 4 035 |
+| fullsweep live set (min…peak) | 464 … 1 353 | 546 … 1 353 |
+| peak resident capacity (nursery + mature) | 3 195 | **10 957** |
+| peak resident occupancy (nursery + mature) | 2 421 | **7 582** |
+| escalation: mature room min vs nursery occupancy max | 1 vs 550 | 1 vs 4 069 |
 
 **7.5× fewer collections for 4.7× less copy work and 4.1× fewer objects copied, paid for in resident
-words** (the two peaks sum to 3 195 → 10 957, i.e. 3.4×). That is the trade the `live / nursery` ratio
-predicts: a nursery of `k` × the live set divides the copy work by `k` and costs `k` × the live set in
-resident words, and the churn's live set (464 … 1 353 words) is what both figures follow.
+words** (the two capacities sum to 3 195 → 10 957, i.e. 3.4×). That is the trade the `live / nursery`
+ratio predicts: a nursery of `k` × the live set divides the copy work by `k` and costs `k` × the live
+set in resident words, and the churn's live set (546 … 1 353 words) is what both figures follow.
 
-**Boundedness (asserted, not hoped).** Every branch of `young_after_fullsweep` returns either the current
-capacity or `young_target_words(live)`, which depends **only on the live set** — so re-deriving it at the
-same live set reproduces it: `young_after_fullsweep(target, live) == target` for every `live`,
-exhaustively over the growth table and over min/max-clamped policies (`src/policy.rs`'s in-module suite).
-The nursery therefore never exceeds `YOUNG_SHRINK_FACTOR` × its target, a burst that outlived its data is
-corrected at the next fullsweep, and a nursery grown for one request comes back down: a burst nursery of
-2 819 words returns to 233 once its live set is 60 words, `young_after_fullsweep(100_000, 0)` is 90 words,
-and a grossly oversized nursery collapses to 90 on **both** strategies (`tests/heap_sizing.rs`).
-`tests/nursery_chain.rs`'s grow-then-collect loop converges to **exactly one** state —
-`(1 space, 1 598, 1 598)`, the live set's own target and a fixed point of the mature rule — instead of
-alternating between a grown and a collapsed nursery. The three branches (shrink to the target, grow to it,
-keep inside the band), the churn geometry, the fixed point, `a_minor_never_grows_the_nursery` and the two
-constants are pinned one test each by `tests/post_fullsweep_nursery.rs`.
+**Boundedness (asserted, not hoped).** Every branch of either sizing rule returns either the current
+capacity or a target that depends **only on the live set** — so re-deriving it at the same live set
+reproduces it: `young_after_fullsweep(target, live) == target` and
+`young_after_collection(young_minor_target_words(live), live) == young_minor_target_words(live)` for
+every `live`, exhaustively over the growth table and over min/max-clamped policies (`src/policy.rs`'s
+in-module suite). The nursery therefore never exceeds `YOUNG_SHRINK_FACTOR` × its target, a burst that
+outlived its data is corrected at the next fullsweep, and a nursery grown for one request comes back
+down: a burst nursery of 2 819 words returns to 233 once its live set is 60 words,
+`young_after_fullsweep(100_000, 0)` is 90 words, and a grossly oversized nursery collapses to 90 on
+**both** strategies (`tests/heap_sizing.rs`). `tests/nursery_chain.rs`'s grow-then-collect loop
+converges to **exactly one** state — `(1 space, 1 598, 1 598)`, the live set's own target and a fixed
+point of the mature rule — instead of alternating between a grown and a collapsed nursery. The three
+branches (shrink to the target, grow to it, keep inside the band), the churn geometry, the fixed point,
+`a_minor_may_grow_only_onto_the_live_set_target` and the two constants are pinned one test each by
+`tests/post_fullsweep_nursery.rs`.
 
 **A/B of the two runtimes on the same shape.** Release `beam_rt`,
 `bench run --quick --runtime rust --workloads gc_bound`, pinned to one core, five alternating paired
@@ -775,16 +798,89 @@ and 233 / 512), `tests/retained_vs_live.rs` (8 192 / 12 288 / 20 480) and the Im
 2 304, mature 6 772, RSS plateau ratio **1.000×** — a plateau, not a leak). Only the churn shape was
 A/B'd end to end; the others are unchanged counter-for-counter in the crate's own suites.
 
+### The acceptance measurements: a collection's capacity is the live set
+
+Three independent probes, all on this tree. The fixtures are `beam_rt`'s
+(`tests/fixtures/{reds_boundary,native_reds}.beam`): a BIF-only loop that builds and abandons a
+400-element tuple per iteration, so its live set is either ≈ 0 words or the 401 words of the one
+in-flight tuple and does not grow with N. Every figure is a count or a capacity — no timing.
+
+**1. The boundary-door pin (`beam_rt`'s `reds_door`, interpreter tier, collected at the
+reduction/yield boundary between slices).** `heap_size` is **610 words at both N = 2 000 and
+N = 20 000**, with `peak_young_spaces = 1` and **9 / 89** collections (one per pre-emption) —
+flat in N, and the same capacity at both ends of a 10× range. 610 = `young_minor_target_words(401)`
+= `next_words(401 + 64)`, the target of the live set the boundary window actually holds.
+
+**2. The interpreter control of the slice-charging pin (`beam_rt`'s `slice_charging`).** At
+N = 2 000 it reports `heap_size = 233` — the process's `min_heap_words`, i.e.
+`young_minor_target_words(0)` = `nursery_floor_words()` for a spawn policy. Every
+boundary-sampled row reads **233 for every N** measured — 799, 800, 2 000, 4 000 and 20 000
+(`value=233` on each, one boundary collection each).
+
+**3. A per-minor trace over `reds_boundary:run/1`** (a temporary per-minor diagnostic; the figures
+are the collector's own per-collection counters). Every boundary minor evacuates
+`young_live_copied = 401` (once in four — the iteration's in-flight tuple is the live set) or `0`,
+which gives `minor_target = 610` / `233` against `floor = 233`: the capacity a collection installs
+is the live set's target, both branches of the same rule. The figure a minor does *not* read — the
+mature space's occupancy — crept 4 411 → 8 822 over that same window, and its 2× whole-heap target
+10 958 → 17 731: a capacity that follows the run's total promotion rather than its live set.
+
+Pre-change figures for the same pins, measured on the pre-change tree: `reds_door` read **2 586**
+at N = 2 000 instead of 610, and `slice_charging`'s interpreter control read **2 586** instead of
+233. They are quoted as measurements of that tree, not as a narrative about the code.
+
+**The churn shape is unchanged by the rule** — `tests/churn_attribution.rs`, 4 000 ops + 500
+warm-up: 0.200 collections/op (0.133 minor + 0.067 major), 270.8 words copied/op, 103.28 objects
+copied/op, 806.0 words reclaimed/op, 0.0007 growth events/op, peak nursery spaces 1, peak nursery
+capacity 4 185 words (occupancy 3 523), peak mature capacity 6 772 (occupancy 4 059) → peak
+resident occupancy 7 582 words against a peak resident capacity of 10 957, fullsweep live set
+546 / 1 353. The table above is that run.
+
+### The CLI flatness probe and the burst residual
+
+`erts_rust/target/debug/beam_rt run erts_rust/crates/beam_rt/tests/fixtures/native_reds.beam
+native_reds:heap/1 <N>` — the process's own final `process_info(self(), heap_size)` reading, on the
+default (native baseline-JIT) tier and with `BEAM_RT_TIER=interpreter`. "before" is the same probe on
+the pre-change tree.
+
+| N | native, after | native, before | interpreter, after | interpreter, before |
+|---|---|---|---|---|
+| 2 000 | 233 | 233 | 233 | 2 586 |
+| 20 000 | 233 | 233 | 309 923 | 503 876 |
+| 100 000 | 233 | 233 | 297 368 | 300 453 |
+| 200 000 | 233 | 233 | 280 628 | 300 453 |
+
+**The native tier** runs the whole loop inside one slice, so it reaches no collection at all and
+stays on the floor — 233 words, flat in N.
+
+**The interpreter tier** is pre-empted (~89 slices at N = 20 000), so between two boundary
+collections it allocates the whole slice's worth of garbage — ~266 000 words at N = 20 000 — with no
+collection possible in between. The capacity **at a collection** is the live-set figure (233 / 610,
+measured above and flat at every N); the process's own *final* reading is a **mid-burst** sample of
+a nursery chain whose length tracks the burst's allocation count, so it is level in N but not
+identical across N. It is the slice's allocation demand, not a nursery-policy quantity, and the next
+collection collapses the chain back onto the live-set target.
+
+**The residual trade-off, stated plainly.** The growth seam's installed size is now capped by the
+remembered live target (`Nursery::grow`'s `min(target, max(one_step, live_target))`), so a burst
+whose in-slice demand exceeds that target installs a **chain of target-sized spaces** (the summed
+capacity ≈ the demand) instead of climbing the growth table geometrically. The retained **words** are
+the burst's own allocation (capacity ≈ occupancy + one space); the cost is the **space count**
+(~500 spaces of 610 words at N = 20 000) and a final reading that depends on where in the burst it
+falls. A collection collapses the chain to one space, so nothing is retained across collection
+cycles.
+
 ### The rejected nursery-sizing variants
 
 Three other ways to size the nursery were measured and rejected. Each fails a property the live-set
 target has, and each stays a **live regression gate** in `tests/` rather than a historical note.
 * **Capacity-keyed (the C shape).** Size from the pre-copy fill, then shrink by `2 * need_after` after
-  the copy. Its growth branch requires `demand > capacity`, and both inputs it can see are ≈ the
-  capacity — a minor's promoted words are ≈ 0 under immediate promotion, and a fullsweep's pre-copy fill
-  is ≈ the capacity — so the branch is unreachable and the nursery can only be enlarged by an explicit
-  request. Measured: it settles at a 609-word nursery against a 464–1 353-word live set, i.e. a copy
-  volume of 1.58 × the allocated volume (the `5ddf6e72e4` column above).
+  the copy. Its growth branch requires `demand > capacity`, and the inputs it can see are ≈ the
+  capacity or below it — a minor's promoted words are its young live set, which a nursery sized at that
+  live set's own target already holds, and a fullsweep's pre-copy fill is ≈ the capacity — so the
+  branch does not fire and the nursery can only be enlarged by an explicit request. Measured: it
+  settles at a 609-word nursery against a 464–1 353-word live set, i.e. a copy volume of 1.58 × the
+  allocated volume (the `5ddf6e72e4` column above).
 * **Keyed on the nursery's own fill or on its capacity.** The fill is ≈ the capacity at every collection,
   so `next_words` steps the growth table up on *every* collection and the capacity ratchets: a 200-round
   loop grows the nursery ~20 % per round with no bound, and RSS scales with the workload (the unbounded
@@ -849,10 +945,11 @@ collection (a foreign BIF container in a root declines the unscanned-root valve,
 so the baselines here are integers — and the ≈`N/3` slope recorded under "The `run` path collects at its
 own heap admissions" is that artifact: it **does not reproduce at HEAD**.
 **Load-bearing.** The two halves are pinned separately in `tests/post_fullsweep_nursery.rs`: the
-growth/shrink/keep branches at a fixed live set, and `a_minor_never_grows_the_nursery` for the
-keep-or-shrink half (a minor that grew from the mature occupancy would close the loop the fullsweep
-decision exists to avoid). A target derived from the capacity or the fill instead is that rule's
-regression, pinned by `tests/nursery_bounded.rs`.
+fullsweep's growth/shrink/keep branches against `young_target_words(live)` at a fixed live set, and
+`a_minor_may_grow_only_onto_the_live_set_target` for the minor half — a minor installs
+`young_minor_target_words(live)` (its own young live set), so it grows as well as shrinks, and never
+onto a capacity derived from the mature occupancy. A target derived from the capacity or the fill
+instead is that rule's regression, pinned by `tests/nursery_bounded.rs`.
 ## The off-heap binary roster: reachability reclaim and the binary-virtual-heap trigger
 
 Sources: `tests/offheap_retention.rs` (the in-crate ladder and the without-sweep contrast — all

@@ -257,18 +257,6 @@ impl Collector {
         // a fullsweep does), so it carries the garbage the minors since the last fullsweep
         // promoted and would inflate the target until the capacity tracked the run's total
         // allocation instead of the live set.
-        if std::env::var_os("BEAM_GC_TRACE").is_some() {
-            eprintln!(
-                "TRACE minor: capacity={} young_used={} young_live_copied={} minor_target={} \
-                 floor={} mature_used={}",
-                self.nursery.capacity_words(),
-                needed,
-                stats.words_copied,
-                self.policy.young_minor_target_words(stats.words_copied),
-                self.policy.nursery_floor_words(),
-                self.mature.used_words(),
-            );
-        }
         self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
