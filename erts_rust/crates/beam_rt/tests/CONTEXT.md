@@ -216,7 +216,7 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `process_info(P, binary)`'s three shape differences (per-distinct-payload counting, a released payload while the child stays parked, a copy-engine payload that nothing registers).
 * `enif_thread_type()` answers `ERL_NIF_THR_UNDEFINED` on the calling thread, a non-dirty continuation and the `stop` thread where the oracle answers the scheduler thread; `enif_schedule_nif`'s raw return word is not reproduced.
 * The `-eval` route's spawn residuals: an in-engine `spawn` keeps the tree-walking entry, a closure the compile declines keeps its typed gaps, and `receive … after infinity` parks.
-* `+hmax` does not bound the grown nursery **chain**.
+* `+hmax`'s nursery-chain ceiling holds inside `beam_gc::Nursery::grow`, but the two `beam_rt` growth seams serve a refused growth from the arena instead of raising `system_limit` (`HANDOFF.md`, `M1_GAPS_GC.md` *Heap switches*).
 * The `send`/inline-`!` route cannot park on a busy port (only `port_command` suspends); the busy wait is bounded by `port::busy_wait::BUSY_PORT_DEADLINE`.
 * No self-hosted build: the runtime compiles every `lib/*/src/*.erl` source in process but does not compile or run itself.
 
