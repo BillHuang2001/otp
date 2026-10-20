@@ -33,15 +33,20 @@
 //! unsignalled, the observer unrun (leaking the host resources it releases — the ETS tables owned
 //! by the pid are the motivating case) and the port table holding a dead watcher's monitor.
 //!
-//! Two failures are forced, each hitting a different step:
+//! Three failures are forced, each hitting a different step:
 //!
-//! 1. [`a_failing_dist_router_does_not_abort_the_cascade`] — the **remote** step (4): a
-//!    [`DistSignalRouter`] whose transport always fails. The router is attempted once per remote
-//!    link partner, the local watcher still gets its `{'DOWN', …}`, the observer still fires and
-//!    the dead watcher's port monitor is still cleaned.
+//! 1. [`a_failing_dist_router_does_not_abort_the_cascade`] — the **remote link** part of step
+//!    (4): a [`DistSignalRouter`] whose transport always fails. The router is attempted once per
+//!    remote link partner, the local watcher still gets its `{'DOWN', …}`, the observer still
+//!    fires and the dead watcher's port monitor is still cleaned.
 //! 2. [`an_unreachable_peer_heap_does_not_abort_the_cascade`] — the **local link** step (1): a
 //!    relocation-exempt peer whose bounded nursery cannot hold the exit reason. The *next* link
 //!    partner is still signalled, the observer still fires and the port monitor is still cleaned.
+//! 3. [`a_failing_dist_router_does_not_abort_the_remote_watcher_step`] — the **remote watcher**
+//!    part of step (4): the same never-succeeding transport, this time in front of two incoming
+//!    remote watchers on *different* nodes. Every watcher's `DOP_MONITOR_P_EXIT`
+//!    ([`DistSignal::MonitorExit`]) is still attempted, in record order, and the observer and the
+//!    port-monitor cleanup still run.
 //!
 //! Determinism: no sleep, no wall-clock bound and no oracle. The oversized reason is derived from
 //! the public heap-policy arithmetic (the peer's own bounded nursery capacity + 1 word), so the
@@ -54,8 +59,8 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_process::prelude::*;
 use beam_term::prelude::{
-    external_pid_size_words, make_atom, make_small, size_object, write_external_pid, AtomTable,
-    Eterm,
+    external_pid_size_words, external_ref_size_words, make_atom, make_small, size_object,
+    write_external_pid, write_external_ref, AtomTable, Eterm,
 };
 
 /// A distribution seam whose transport **always** fails, recording every attempt.
@@ -89,10 +94,16 @@ impl ProcessExitObserver for Recorder {
     }
 }
 
-/// A table, a port table, and the remote sysname atom.
+/// A table, a port table, the atom table the [`SignalAtoms`] were interned from, and the remote
+/// sysname atom.
+///
+/// The atom table is kept (rather than dropped after interning `node`) so a test can intern a
+/// **second** sysname — the two-node case the incoming-remote-watcher step needs, since a
+/// watcher's node is part of its identity.
 struct Fixture {
     table: ProcessTable,
     ports: PortTable,
+    names: AtomTable,
     node: Eterm,
 }
 
@@ -104,6 +115,7 @@ impl Fixture {
         Fixture {
             table: ProcessTable::new(atoms),
             ports: PortTable::new(),
+            names,
             node,
         }
     }
@@ -117,6 +129,12 @@ impl Fixture {
         self.ports
             .alloc_owned(owner)
             .expect("room in the port-number space")
+    }
+
+    /// The term for a sysname, interned in the fixture's atom table (so two calls with the same
+    /// `name` are the *same* node and two different names are two different nodes).
+    fn node_named(&mut self, name: &str) -> Eterm {
+        make_atom(self.names.intern(name))
     }
 
     /// Installs a recording observer, returning the shared death log.
@@ -140,6 +158,22 @@ fn remote_pid(heap: &mut Heap, node: Eterm, number: u32, serial: u32, creation: 
     // SAFETY: `p` addresses the four words just handed out and `write_external_pid` writes all of
     // them before the pointer escapes; `node` is a live atom term.
     unsafe { write_external_pid(p, node, number, serial, creation) }
+}
+
+/// Builds an external reference term on `heap` (the frozen
+/// `[header, node, creation, data.ui32]` thing) — the peer-minted `Ref` an inbound
+/// `DOP_MONITOR_P` arrives with, and therefore the reference its `DOP_MONITOR_P_EXIT` must
+/// carry back.
+fn remote_ref(heap: &mut Heap, node: Eterm, ids: &[u32], creation: u32) -> Eterm {
+    // SAFETY: `heap` hands out `external_ref_size_words(ids.len())` exclusively-owned, writable
+    // words (and `ids.len() <= MAX_REF_IDS` at every call site here).
+    let p = unsafe {
+        heap.alloc_words(external_ref_size_words(ids.len()))
+            .expect("the heap has room")
+    };
+    // SAFETY: `p` addresses those words and `write_external_ref` writes all of them before the
+    // pointer escapes; `node` is a live atom term.
+    unsafe { write_external_ref(p, node, ids, creation) }
 }
 
 /// The number of messages in `pid`'s mailbox.
@@ -360,4 +394,110 @@ fn an_unreachable_peer_heap_does_not_abort_the_cascade() -> Result<()> {
         "the dead watcher's incoming port monitor was still removed"
     );
     Ok(())
+}
+
+/// A down distribution seam must not abort the **incoming-remote-watcher** half of the remote
+/// step either: a process with two watchers on two different peer nodes must attempt *every*
+/// watcher's `DOP_MONITOR_P_EXIT` (in record order) even though the transport fails for each,
+/// and the steps after the remote step — the death observer and the port-monitor cleanup — must
+/// still run.
+#[test]
+fn a_failing_dist_router_does_not_abort_the_remote_watcher_step() {
+    let mut fx = Fixture::new();
+    let mut heap = Heap::new(64).expect("test heap");
+    let attempts = Rc::new(RefCell::new(Vec::new()));
+    fx.table.set_dist_router(Box::new(FailingRouter {
+        attempts: Rc::clone(&attempts),
+    }));
+
+    let dying = fx.spawn();
+    let owner = fx.spawn();
+    let node_a = fx.node;
+    let node_b = fx.node_named("other@host");
+    assert_ne!(node_a, node_b, "two distinct peer nodes");
+
+    // Two incoming monitors, the shape a peer's `erlang:monitor(process, LocalPid)` leaves
+    // behind: `{DOP_MONITOR_P, Remote(watcher), Local(watched), Ref}`, each with the peer's own
+    // minted reference and each on its own node.
+    let watcher_a = RemotePid::from_eterm(remote_pid(&mut heap, node_a, 11, 22, 33))
+        .expect("an external pid");
+    let watcher_b = RemotePid::from_eterm(remote_pid(&mut heap, node_b, 44, 55, 66))
+        .expect("an external pid");
+    let ref_a = RemoteRef::from_eterm(remote_ref(&mut heap, node_a, &[1, 2, 3], 0xAAAA))
+        .expect("a peer-minted reference");
+    let ref_b = RemoteRef::from_eterm(remote_ref(&mut heap, node_b, &[4, 5, 6], 0xBBBB))
+        .expect("a peer-minted reference");
+    fx.table
+        .monitor_from_remote_ref(dying, watcher_a, ref_a, MonitorKind::Process)
+        .expect("the dying process is live");
+    fx.table
+        .monitor_from_remote_ref(dying, watcher_b, ref_b, MonitorKind::Process)
+        .expect("the dying process is live");
+    assert_eq!(
+        attempts.borrow().len(),
+        0,
+        "an inbound DOP_MONITOR_P is never echoed, so recording routed nothing"
+    );
+
+    // Step 6: an incoming port monitor, so the cleanup after the failing step is observable.
+    let port = fx.port(owner);
+    fx.table
+        .monitor_port(dying, port, &mut fx.ports)
+        .expect("the dying process is live and the port is allocated");
+    // Step 5: the process-death observer.
+    let deaths = fx.record();
+
+    let reason = make_small(13);
+    fx.table
+        .terminate_with_ports(&mut fx.ports, dying, reason)
+        .expect("a down distribution seam must not abort the death");
+
+    // The death happened, and the observer still fired exactly once — a step *after* the failing
+    // remote step.
+    assert!(!fx.table.contains(dying), "the process died");
+    assert_eq!(
+        deaths.borrow().as_slice(),
+        &[dying],
+        "the death observer ran despite the routing failures"
+    );
+    assert!(
+        fx.table.remote_watchers(dying).is_empty(),
+        "the records were drained, so nothing is left to resolve later"
+    );
+
+    // Every recorded watcher was attempted exactly once, in record order: the cascade kept going
+    // after the first transport failure.
+    let attempts = attempts.borrow();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "one DOP_MONITOR_P_EXIT attempt per recorded watcher, got {attempts:?}"
+    );
+    assert_eq!(
+        attempts[0],
+        DistSignal::MonitorExit {
+            watched: dying,
+            watcher: watcher_a,
+            reference: RemoteWatcherRef::Remote(ref_a),
+            reason,
+        },
+        "the watched party comes first on the wire (`dist.c:1497-1519`)"
+    );
+    assert_eq!(
+        attempts[1],
+        DistSignal::MonitorExit {
+            watched: dying,
+            watcher: watcher_b,
+            reference: RemoteWatcherRef::Remote(ref_b),
+            reason,
+        },
+        "the second watcher was still routed after the first failed"
+    );
+    drop(attempts);
+
+    // Step 6 ran.
+    assert!(
+        fx.ports.monitors(port).is_empty(),
+        "the dead watcher's incoming port monitor was still removed"
+    );
 }

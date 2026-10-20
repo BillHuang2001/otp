@@ -10,16 +10,22 @@ map for the source subtree and the notes the child nodes inherit.
 
 ## API Surface (routes — see `../CONTEXT.md` for the full frozen surface)
 - Root re-exports (`lib.rs`): the `Encoder`/`Decoder` entry points, `decode_term`,
-  `Tag` constants, `VERSION_MAGIC`, the `error` surface, the `term` fun accessors.
-  `prelude.rs` mirrors them for `use beam_codec::prelude::*;`.
-- **M1 internal-reference seam (this node).** `ref_wire.rs` (crate-internal) maps a
-  60-bit internal-reference `id` ↔ the 3 wire numbers of a `REFERENCE_EXT` /
+  `Tag` constants, `VERSION_MAGIC`, the `error` surface, the `term` fun accessors, and
+  the reference wire mapping. `prelude.rs` mirrors them for `use beam_codec::prelude::*;`.
+- **Reference wire mapping (this node, public API).** `ref_wire.rs` maps a 60-bit
+  internal-reference `id` ↔ the 3 wire numbers of a `REFERENCE_EXT` /
   `NEW_REFERENCE_EXT` / `NEWER_REFERENCE_EXT` image (`ref_id_to_numbers` /
-  `ref_numbers_to_id`, `representable_ref_id` — the "fits the internal id slot" gate the
-  local-node demotion consults — plus `REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`); `term::ref`
-  (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
+  `ref_numbers_to_id` — the C's `erts_set_ref_numbers` pack, `num[0]` = bits 0..17,
+  `num[1]` = bits 18..31, `num[2]` = bits 32..63, emitted in that wire order),
+  `representable_ref_id` (the "fits the internal id slot" decode gate the local-node
+  demotion consults), the checked packer `representable_ref_numbers` (the same id-slot
+  bound as a typed `BeamError::SystemLimit` refusal) and `REF_MASK`/`REF1_NUM_MASK`/
+  `REF_NUMBERS`. All of it is re-exported at the crate root and in `prelude`; a
+  dependent crate writing or reading a wire reference uses it rather than mirroring the
+  bit layout (a different pack makes the same reference come back as a different id).
+  `term::ref` (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
   `beam_term::boxed`'s frozen M1 block. The single place either mapping is written —
-  both children must route through it, never re-derive it.
+  both children and every dependant crate must route through it, never re-derive it.
 
 ## Constraints
 - Inherited from [`../CONTEXT.md`](../CONTEXT.md) §Constraints (errors only through
@@ -84,7 +90,7 @@ map for the source subtree and the notes the child nodes inherit.
 
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
-- `ref_wire.rs` → internal-reference `id` ↔ wire-number mapping (`REF_MASK`/`REF1_NUM_MASK`, pack/unpack)
+- `ref_wire.rs` → the **public** internal-reference `id` ↔ wire-number mapping (`REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`, pack/unpack, the `representable_ref_id` decode gate and the `representable_ref_numbers` checked packer); its unit suite pins the C goldens, the word boundaries and the typed refusal
 - `tag.rs` → wire-frozen tag constants + the `Tag` enum
 - `reader.rs`/`writer.rs` → bounds-checked BE cursor / growable sink (safe Rust)
 - `atom_cache.rs` → `AtomCache` + the `AtomCacheWriter` hook trait

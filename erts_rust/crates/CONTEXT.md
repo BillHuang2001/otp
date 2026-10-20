@@ -255,17 +255,17 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary); `tests/` (the allocator integration suite)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
 - `beam_deflate/` → zlib 1.3.2 in safe Rust (bytes only, `beam_common` its sole dependency): `deflate/` (window + hash chains, the five match functions, Huffman construction, the flush driver), `inflate/` (bit reader, `inftrees`/`inffast`, header/trailer state machine, dictionary protocol), `checksum.rs` (`crc32`/`adler32` + `combine`); the one shared encoder behind both `beam_codec`'s ETF `COMPRESSED` and `beam_bifs`'s `zlib` BIFs
-- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`, the `COMPRESSED` wrapper over `beam_deflate`
-- `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
+- `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`, the `COMPRESSED` wrapper over `beam_deflate`, the public `ref_wire` reference-id ↔ wire-words mapping (the C's `erts_set_ref_numbers`), and the decode-side local-node demotion (`Decoder::with_local_node`: a pid/port/ref naming this node decodes internal)
+- `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`, and the defaulted inbound decode-side identity (`control::LocalIdentity` + `decode_control_with_identity`, `Connection`/`ConnectionDriver::set_local_identity`)
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome; companion docs `TEST_NOTES.md` (measurement discipline) and `HANDOFF_bs_init_writable.md`
 - `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
-- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`); sub-nodes `src/smp/` and `tests/`
+- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`), and the remote (`DistSignalRouter`/`DistSignal`, seven variants incl. the death-time `MonitorExit`) + inbound route-free receipt halves of the distribution signal family; sub-nodes `src/smp/` and `tests/`
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the fifteen host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/`PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/`ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`); sub-nodes `src/zlib/` (the six one-shots + the 19 stream NIF keys over `beam_deflate`), and the `serves_local_call` predicate `beam_rt` consults for a module's own unexported `*_nif` stubs
 - `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag): `set` defaults to a CHAMP interior, `ordered_set` to a K-ary B+-tree, `bag`/`duplicate_bag` to a chained bucket index; `ETS_SURFACE.md` (the ETS API-surface reference)
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
-- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider; sub-nodes `src/boot/`, `src/cli/`, `src/info/`, `src/native/`, `src/port/`
+- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), the `PortHook` provider, the distribution halves (`src/dist/` accepting, `src/dist_client/` connecting, one `DistLinks` table over both) and their two-live-VM suites (`tests/dist_two_vm{,_rust,_wire}.rs` + the `tests/support/{dist,pair,fixture}.rs` harness); sub-nodes `src/boot/`, `src/cli/`, `src/info/`, `src/native/`, `src/port/`
 - `../tools/differential/` → differential-test harness vs real ERTS (sibling — read-only, escalate writes to `..`)
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
@@ -360,17 +360,30 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   above `IMMIX_BREAK_EVEN_WORDS = 8 * BLOCK_WORDS = 2048` (assertion-backed), with an additive
   on-demand growth seam (`Collector::ensure_capacity`, `HeapPolicy::unbounded()`, `GcConfig::growable()`).
   `beam_dist`: all 30 `Dop` variants round-trip byte-exact (30 golden vectors cross-checked against the
-  oracle), with LIVE interop for the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, client-originated
-  `DOP_MONITOR_P` → `DOP_PAYLOAD_MONITOR_P_EXIT`, `DOP_EXIT2`, `DOP_UNLINK_ID`/`_ACK` and fragmentation
-  both ways; `epmd` `DUMP`/`KILL`/`STOP` are implemented (node-up/down are not v6 opcodes). `beam_rt`:
+  oracle), with LIVE interop for the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, the
+  `DOP_MONITOR_P` → `DOP_MONITOR_P_EXIT` pair, `DOP_EXIT2`, `DOP_UNLINK_ID`/`_ACK` and fragmentation
+  both ways, plus its **defaulted inbound decode-side identity** (`control::LocalIdentity`,
+  `decode_control_with_identity`, `Connection`/`ConnectionDriver::set_local_identity`): an inbound pid,
+  port or reference naming this node **and** matching its live creation decodes to the internal term,
+  so a pid a peer reflects back is `=:=` the local one; its internal-ref ↔ wire-words mapping is the
+  public `ref_wire::{ref_id_to_numbers, ref_numbers_to_id, representable_ref_numbers}` (the C's
+  `erts_set_ref_numbers` layout — the one authority, no crate mirrors it); `epmd` `DUMP`/`KILL`/`STOP`
+  are implemented (node-up/down are not v6 opcodes). `beam_rt`:
   boot/CLI/env, `system_info`/`process_info`, a native BIF floor, and its own observability modules
   (`src/trace.rs`/`src/seq_trace.rs`/`src/crash_dump.rs`/`src/perf_map.rs` — only `send` trace events are
   emitted and the perf map is empty because no code ranges cross the crate boundary yet); inbound
   distribution runs by default (`allow_inbound_delivery`, `true` unless turned off) and routes the
   `Send`/`RegSend`/`AliasSend`/plain-`AltactSigSend` families into the local signal path plus the
   link/exit/unlink/monitor/demonitor/monitor-down/group-leader families through `beam_process`'s
-  route-free receipt primitives, with the distributed-spawn family and `Delivery::Other(_)` still
-  typed `Unsupported`; `DEFAULT_HEAP_WORDS = 1<<24`, with
+  route-free receipt primitives (each emitting no outbound `DOP_*`); the channel's identity — its sysname
+  atom and creation — is the live node's (`NodeIdentity`/`beam_bifs::LocalNode` report
+  `Runtime::node_creation()`, so a locally minted pid/port/reference and the image a peer echoes back
+  agree), and it is installed on every decode drain rather than stored, because `beam_term::Atom` is a
+  table-local index and a clone mints a fresh instance (a stale atom is inert, never a wrong match);
+  typed A.5 gaps: the distributed-spawn family (`DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY`),
+  `Delivery::Other(_)`, the ack-owing `DOP_UNLINK_ID` half (`id != 0`), a remote **named** monitor
+  `{Name, Node}`, and `DOP_PAYLOAD_MONITOR_P_EXIT` (the plain 5-tuple is always emitted);
+  `DEFAULT_HEAP_WORDS = 1<<24`, with
   heap exhaustion translated to `error:system_limit`; the parked root set publishes only the live
   float-register prefix (`Machine::fr_mark()`), the pooled BIF heap is rewound to each call's own mark
   (`Heap::reset_to(mark)`), and `process_info(P, binary)` is served from the target's own
@@ -379,6 +392,28 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   call actually interns a name; the `term_to_binary` fun-identity bridge reuses the code server's
   generation-cached module snapshot); dispatch/throughput figures and their measurement caveats live
   in `../tools/bench/RESULTS.md`.
+- **Distribution signals (contract A.5) are live in both directions, with two-live-VM evidence.**
+  Outbound, `beam_process`'s link/unlink/monitor/exit/terminal entry points route real control through
+  the `DistSignalRouter` installed on the process table: `DOP_LINK`, `DOP_UNLINK_ID`, `DOP_EXIT`
+  (death-time link exit), `DOP_EXIT2` (`erlang:exit/2` on a remote pid — previously a silent no-op),
+  `DOP_MONITOR_P`, `DOP_DEMONITOR_P` and `DOP_MONITOR_P_EXIT` (a dying watched process telling each
+  remote watcher, `TUPLE5(DOP_MONITOR_P_EXIT, Watched, Watcher, Ref, Reason)` — watched first, the C's
+  `dist.c:1497-1522`; the reference is written back in the spelling the record carries and packed by the
+  shared `beam_codec::ref_id_to_numbers`). Inbound, every family reaches the local process through the
+  route-free receipt primitives, so an inbound delivery emits no outbound `DOP_*`. The identity defect is
+  fixed at its root — the decode, not a proxy check: `beam_dist`'s `LocalIdentity` is installed per drain
+  on all three decode paths, so an inbound pid/port/reference for this node is the internal term and
+  `Pid =:= self()` holds for a peer that reflects a pid back. Evidence:
+  `crates/beam_rt/tests/dist_two_vm.rs` (rust ↔ real `erl`, 15 cases: link/unlink, monitor/demonitor with
+  the peer-minted ref bound, `exit/2` kill vs `normal`, aliases both ways, identity round trip),
+  `tests/dist_two_rust.rs` (two `beam_rt` VMs, 7 cases), `tests/dist_two_vm_wire.rs` (a hermetic
+  byte-level case pinning opcode 21 and the watched-first argument order plus the negotiated `DFLAG`
+  set). All are `#[ignore]`d (two VMs each, ~52 s in total): run them with
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test dist_two_vm
+  --test dist_two_rust --test dist_two_vm_wire -- --ignored --test-threads=1`. A `beam_rt` node cannot
+  render a remote identifier (`pid_to_list/1`, `~p` of an external pid/ref is a typed gap), so the
+  rust↔rust legs assert term identity rather than text; every fixture keeps a wake source armed (a bare
+  `receive` makes `run_scheduled` report its honest `blocked`, exit 3).
 - **The off-heap refc-binary reclamation loop is closed end to end** (trigger + reachability sweep +
   a host seam), across four crates: `beam_gc` owns the algorithm and the accounting model
   (`BinVheap`, `for_each_reachable_binary_payload`, `HeapFootprint`), `beam_engine` exposes the

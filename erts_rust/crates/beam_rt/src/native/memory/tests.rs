@@ -33,7 +33,9 @@ use beam_common::BeamError;
 use beam_engine::terms;
 use beam_engine::ExecutionContext;
 use beam_gc::HeapObservable;
-use beam_process::{ProcessId, ProcessTable, SignalAtoms};
+use beam_process::{
+    MonitorKind, PidTarget, ProcessId, ProcessTable, RemotePid, RemoteRef, SignalAtoms,
+};
 use beam_term::{atom_val, is_atom, make_small, signed_value, AtomTable, Eterm, NIL};
 
 use crate::context::RuntimeContext;
@@ -1278,4 +1280,137 @@ fn the_oracle_reports_the_empty_list_for_a_process_with_no_off_heap_binary() {
         return;
     };
     assert_eq!(line, "[]", "an idle process holds no off-heap binary: {line}");
+}
+
+// -- `monitored_by`: the local/remote rendering split ----------------------
+
+/// Installs a **local** monitor on `victim` through the real `erlang:monitor/2` route, so the
+/// caller (the runtime's root process) becomes one of the victim's incoming
+/// [`MonitoredBy`](beam_process::MonitoredBy) records — the very store the `monitored_by` item
+/// reads (`Process::monitored_by`). Returns the monitor reference the BIF answers.
+fn arm_local_monitor(runtime: &mut crate::Runtime, victim: Eterm) -> Eterm {
+    let process = atom(runtime, "process");
+    call(runtime, "erlang", "monitor", &[process, victim]).expect("erlang:monitor/2")
+}
+
+/// `victim`'s `monitored_by` value as a **bare pid list** — the oracle's own shape
+/// (`{monitored_by,[<0.84.0>]}`, verified against OTP 29.1.1 / erts-17.1). The `{Item, Value}`
+/// wrapper belongs to [`pair`], one level up, so a value that came back wrapped would fail here.
+fn watchers_of(runtime: &mut crate::Runtime, victim: Eterm) -> Vec<Eterm> {
+    let (key, value) = pair(info(runtime, victim, "monitored_by").expect("monitored_by"));
+    assert_eq!(runtime.atom_name_of(key), Some("monitored_by"));
+    terms::list_elements(value).expect("a bare pid list, not a wrapped item")
+}
+
+/// The `monitored_by` item renders its two watcher families **through two different code
+/// paths** ([`RuntimeContext::monitored_by_value`]): a **local** watcher is an internal pid
+/// immediate and the plain `terms::make_list` fast path suffices, while a **wire-origin
+/// (remote)** watcher must be materialized as the four-word *external* pid block
+/// [`RemotePid::to_eterm`] writes on a scratch `beam_alloc::Heap`, and the finished list then
+/// copied out through `rehome_container_result`.
+///
+/// Both halves are pinned here at the **builder** level, hermetically (no `erl`/`erlc`/`epmd`,
+/// no peer VM, no socket): the two opt-in two-VM suites
+/// (`tests/dist_two_rust.rs`, `tests/dist_two_vm.rs`) cover the same split only end to end, so a
+/// regression in it would otherwise be invisible in the default suite.
+///
+/// The remote watcher is installed through the **real inbound entry point** an arriving
+/// `DOP_MONITOR_P` reaches — [`ProcessTable::monitor_from_remote_ref`] with a peer-minted
+/// external reference, the wire shape `dist.c:2341` carries. Every identity field is asserted
+/// **separately** (node, number, serial, creation, all four mutually distinct), which is what
+/// makes a swapped-field `to_eterm`/`from_eterm` regression fail instead of passing on
+/// "it is an external pid".
+#[test]
+fn the_monitored_by_item_renders_a_local_and_a_wire_origin_watcher_apart() {
+    let mut runtime = runtime();
+    let victim = runtime.processes.spawn_default().expect("a victim process");
+    let victim_pid = victim.to_eterm();
+    let root = root_pid(&mut runtime);
+    assert_ne!(victim_pid, root, "the victim is a child, never the caller");
+
+    // (1) LOCAL ONLY — the fast path: one internal pid immediate, nothing on a scratch heap.
+    let _reference = arm_local_monitor(&mut runtime, victim_pid);
+    let local_only = watchers_of(&mut runtime, victim_pid);
+    assert_eq!(
+        local_only.len(),
+        1,
+        "the root process is the victim's only watcher: {local_only:?}"
+    );
+    assert!(
+        ProcessId::is_process(local_only[0]),
+        "a local watcher is an internal pid immediate"
+    );
+    assert_eq!(local_only[0], root, "and it is the pid that armed it");
+    assert_eq!(
+        PidTarget::from_eterm(local_only[0]).expect("a pid"),
+        PidTarget::Local(ProcessId::from_eterm(root).expect("an internal pid")),
+        "the local entry classifies as a local target"
+    );
+
+    // (2) The inbound `DOP_MONITOR_P`: another node's process watches the same victim. The node
+    // is **not** this runtime's local node (a `Runtime::with_defaults()` runtime is not
+    // distributed), so the entry cannot be mistaken for a local pid.
+    let peer_node = atom(&mut runtime, "peer@host.example");
+    let (number, serial, creation) = (7u32, 3u32, 0x1234_5678u32);
+    let mut peer_heap = beam_alloc::Heap::new(64).expect("a scratch heap for the peer's terms");
+    let peer_pid_term =
+        beam_codec::term::make_external_pid(&mut peer_heap, peer_node, number, serial, creation)
+            .expect("the peer's external pid");
+    let watcher = RemotePid::from_eterm(peer_pid_term).expect("a remote watcher");
+    let peer_ref_term =
+        beam_codec::term::make_external_ref(&mut peer_heap, peer_node, &[7, 11], creation)
+            .expect("the peer's monitor reference");
+    let peer_ref = RemoteRef::from_eterm(peer_ref_term).expect("a peer-minted wire reference");
+    runtime
+        .processes
+        .monitor_from_remote_ref(victim, watcher, peer_ref, MonitorKind::Process)
+        .expect("record the inbound DOP_MONITOR_P");
+
+    // (3) BOTH FAMILIES — the two-step path, in the documented local-then-remote order. (The
+    // oracle orders this item by monitor creation, which this runtime cannot observe: it keeps
+    // the two families in two stores. So this pins *this runtime's own documented choice*, not
+    // an oracle-observable order — the same caveat the `monitors` item carries.)
+    let both = watchers_of(&mut runtime, victim_pid);
+    assert_eq!(
+        both.len(),
+        2,
+        "the bare pid list holds one entry per watcher: {both:?}"
+    );
+    assert_eq!(both[0], root, "local watchers come first");
+    assert!(
+        ProcessId::is_process(both[0]),
+        "the local watcher keeps its internal pid immediate"
+    );
+
+    let remote_entry = both[1];
+    assert!(
+        !ProcessId::is_process(remote_entry),
+        "the remote watcher is NOT an internal pid immediate"
+    );
+    let decoded =
+        RemotePid::from_eterm(remote_entry).expect("the remote entry is an external pid block");
+    assert_eq!(decoded.node(), peer_node, "the peer's node atom survives");
+    assert_eq!(decoded.number(), number, "the peer's pid number survives");
+    assert_eq!(decoded.serial(), serial, "the peer's pid serial survives");
+    assert_eq!(decoded.creation(), creation, "the peer's creation survives");
+    assert!(
+        matches!(
+            PidTarget::from_eterm(remote_entry).expect("a pid"),
+            PidTarget::Remote(_)
+        ),
+        "the remote entry classifies as a remote target"
+    );
+
+    // (4) THE TWO PATHS AGREE: an inbound `DOP_DEMONITOR_P` takes the victim back to the
+    // local-only case, and the answer is *exactly* the fast path's value again — so the
+    // two-step copy-out never leaves a mangled local half behind.
+    runtime
+        .processes
+        .demonitor_from_remote_ref(victim, peer_ref)
+        .expect("record the inbound DOP_DEMONITOR_P");
+    assert_eq!(
+        watchers_of(&mut runtime, victim_pid),
+        local_only,
+        "the fast path and the two-step path agree on the local-only case"
+    );
 }

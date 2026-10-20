@@ -104,19 +104,32 @@
 //! DistSignal::Demonitor -> {DOP_DEMONITOR_P,Watcher(local), Watched(remote), Ref}  dist.c:1566
 //! DistSignal::Exit      -> {DOP_EXIT,       From(local), To(remote), Reason} dist.c:1456 & 1747
 //! DistSignal::Exit2     -> {DOP_EXIT2,      From(local), To(remote), Reason} dist.c:1800
+//! DistSignal::MonitorExit -> {DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}
+//!                                                                             dist.c:1516
 //! ```
 //!
-//! **Correction to a sibling's inline gloss.** `beam_process::remote`'s module
-//! table glosses the monitor family as `&[to_term, watcher.to_eterm(), ref_term]`
-//! and the unlink as `&[from, to]`; both differ from the C — the monitor family's
-//! first element is the **watcher** (the sender's local pid, `dist.c:1543-1545`:
-//! `TUPLE4(DOP_MONITOR_P, watcher, watched, ref)`), and `DOP_UNLINK_ID` carries a
-//! leading **id** (`dist.c:1472`). This module follows `dist.c` (and the
-//! `live_interop` evidence), because a real peer must never be mis-served. The
-//! unlink id is minted here (a monotonic non-zero small integer): a real receiver
-//! deletes the link by `from` and uses the id only for its acknowledgement
-//! handshake (`erl_proc_sig_queue.c:6695-6726`), so any non-zero id is accepted and
-//! effective.
+//! `MonitorExit` is the **one** variant whose tuple is *watched*-first — the reverse of the
+//! monitor family's `{watcher, watched, ref}` — because it is the mirror of an inbound
+//! `DOP_MONITOR_P` (`erts_dsig_send_m_exit`, `dist.c:1499-1522`); it is also the one variant
+//! routed to the node of the element that is **not** its subject (`signals.rs`'s `signal_node`).
+//! Its `Ref` is written in the spelling the watcher table recorded
+//! ([`beam_process::RemoteWatcherRef`]): a peer-minted external reference goes back verbatim
+//! (`{its node, its creation, its ids}`), a locally minted one through the monitor family's own
+//! `{this node, this creation, ids}` builder.
+//!
+//! **The plain 5-tuple form is emitted unconditionally** — the `DFLAG_EXIT_PAYLOAD` preference
+//! for `DOP_PAYLOAD_MONITOR_P_EXIT` with the reason as the message body (`dist.c:1511-1519`) is
+//! *not* reproduced here. Two reasons: [`crate::dist::advertised_flags`] describes what this
+//! runtime **understands inbound** (it does handle `DOP_PAYLOAD_MONITOR_P_EXIT`, see
+//! `crate::dist::inbound`'s `remote_monitor_down`), not what it emits; and the plain form is
+//! legal on **every** peer that supports `DFLAG_DIST_MONITOR` — a mandatory-set flag
+//! (`dist.c:1504-1508` only skips the send when even that is missing) — so no per-link gate is
+//! needed and the 4-tuple form buys nothing measurable on this path.
+//!
+//! The unlink id is minted here (a monotonic non-zero small integer, `client.rs`'s
+//! `next_unlink_id`): a real receiver deletes the link by `from` and uses the id only for its
+//! acknowledgement handshake (`erl_proc_sig_queue.c:6695-6726`), so any non-zero id is accepted
+//! and effective.
 //!
 //! # Honest limits
 //!

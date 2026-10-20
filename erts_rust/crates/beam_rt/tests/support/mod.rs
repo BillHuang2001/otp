@@ -43,6 +43,23 @@
 //!
 //! A missing toolchain — or a probe that cannot answer — is a **loud skip**, never a
 //! silent pass.
+//!
+//! # The two-VM harness is [`dist`], and its two companions
+//!
+//! Everything that starts **two live VMs at once** (this runtime plus a peer, sharing one
+//! private `epmd`) lives in the [`dist`] submodule — the harness, not a probe: see its
+//! module docs for the session/teardown invariants and for the two peer routes
+//! ([`dist::PeerKind`]).
+//!
+//! [`dist::Harness`] is driven by two suites, and each of them starts a *session*: the
+//! responder/actor [`pair::Pair`] (both VMs live at once, every claim a line one VM printed
+//! about the other) running the shared Erlang [`fixture`] module. Both are peer-kind
+//! agnostic — the same source and the same session drive the system `erl` peer
+//! (`tests/dist_two_vm.rs`) and a second `beam_rt` peer (`tests/dist_two_rust.rs`).
+
+pub mod dist;
+pub mod fixture;
+pub mod pair;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -78,6 +95,7 @@ pub fn assert_badarg(error: BeamError) {
         "expected error:badarg, got {error:?}"
     );
 }
+
 /// The longest a single external probe may run before it is killed. Every probe here is a
 /// `-noshell` program that must terminate on its own; the bound exists so that a probe
 /// which nevertheless blocks (the exact failure mode documented above) can never hang the

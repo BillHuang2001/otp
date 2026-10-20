@@ -105,8 +105,14 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
     `an_incoming_watcher_record_is_dropped_by_death_and_by_demonitor` pins the `RemoteWatcher`
     incoming-record table resolving through **both** the watched process's death and a
     `DOP_DEMONITOR_P` receipt, each destroying nothing that is not its own record (a sibling's
-    identical reference surviving) and never resurrecting one. Every case asserts the recording
-    router's log stays empty.
+    identical reference surviving) and never resurrecting one. Every **receipt** case asserts the
+    recording router's log stays empty (the C's non-echoing receipt arms, `dist.c:2258`);
+    `demonitor_from_remote`/`demonitor_from_remote_ref` never route. The **death** is not a receipt
+    and does emit, so the two death cases assert the opposite: resolving a record by the watched
+    process's death routes exactly **one** `DistSignal::MonitorExit` per record — the whole value
+    asserted (`watched` = the dying local pid, `watcher` = the recorded `RemotePid`,
+    `reference` = `RemoteWatcherRef::Local(..)` in the spelling the record held, `reason` = the term
+    the death was handed) — the outbound mirror pinned in full by `remote_monitor_exit.rs`.
 SMP pool:
 17. `smp.rs` (11 tests) — the SMP pool: N-on-M-scheduler progress (M ∈ {1,4}, 200 pids each, each
     process running `YIELDS + 1` runner invocations and **one** recorded slice); work stealing (a
@@ -265,19 +271,28 @@ SMP pool:
     `demonitor(Ref, [flush])` removing a queued DOWN for a **pid** target. Every oracle expression is
     synchronized on a message (no sleeps); variable names are kept distinct per receive in the `-eval`
     text so no earlier binding is silently re-used as a pattern.
-33. `terminate_best_effort.rs` (2 tests) — the **best-effort termination cascade** of
+33. `terminate_best_effort.rs` (3 tests) — the **best-effort termination cascade** of
     `ProcessTable::terminate`/`terminate_with_ports`: a dying process is reclaimed *first*, so a
     per-peer signalling failure is dropped-and-logged (ERTS's `erts_dsig_drop`) and the cascade
-    continues, letting the process-death observer and the port-monitor cleanup always run. Two
+    continues, letting the process-death observer and the port-monitor cleanup always run. Three
     failures are forced, each hitting a different step: a `DistSignalRouter` whose transport always
-    fails (`Err(BeamError::Io(NotConnected))`) despite which the routing is **attempted once per
-    remote link partner** — asserting the second partner was still routed after the first failed —
-    and a relocation-exempt link peer whose bounded nursery refuses the exit-reason copy (raw
-    `Alloc`), after which the *next* link partner is still signalled. In both cases `terminate`
-    returns `Ok`, the observer fired **exactly once**, the local watcher still got its
-    `{'DOWN', …}`, and the dead watcher's incoming `PortMonitor` is gone. **Discriminating by
-    construction: both tests FAIL (a typed `Io` / `Alloc` out of `terminate`, observer unrun, port
-    monitor still listed) the moment the per-peer `?`-propagation is restored.** Deterministic —
+    fails (`Err(BeamError::Io(NotConnected))`) in front of two **remote link partners** — the
+    routing is **attempted once per partner**, asserting the second partner was still routed after
+    the first failed; a relocation-exempt link peer whose bounded nursery refuses the exit-reason
+    copy (raw
+    `Alloc`), after which the *next* link partner is still signalled; and
+    `a_failing_dist_router_does_not_abort_the_remote_watcher_step` — the same never-succeeding
+    transport in front of **two incoming remote watchers on two different peer nodes** (the
+    `Fixture` now keeps its `AtomTable` so a second sysname can be interned, and a `remote_ref`
+    helper builds the peer-minted references), pinning that step (4)'s watcher drain attempts
+    **every** watcher exactly once and **in record order** — `attempts[0]`/`attempts[1]` are the
+    whole `DistSignal::MonitorExit { watched, watcher, reference: RemoteWatcherRef::Remote(..),
+    reason }` values, watched-party-first as `dist.c:1497-1519` requires. In all three cases
+    `terminate`/`terminate_with_ports` returns `Ok`, the observer fired **exactly once**, the local
+    watcher still got its `{'DOWN', …}`, and the dead watcher's incoming `PortMonitor` is gone.
+    **Discriminating by construction: every test FAILS (a typed `Io` / `Alloc` out of `terminate`,
+    a single recorded attempt instead of two, the observer unrun, the port monitor still listed)
+    the moment the per-peer `?`-propagation is restored.** Deterministic —
     the refusal size is the exempt peer's own bounded nursery capacity + 1 word, no sleeps /
     wall-clock bounds / oracle.
 34. `message_relocation.rs` (4 tests) — the collection's **queued-message re-install**: a collection
@@ -610,6 +625,36 @@ SMP pool:
     observable from `erl -noshell -eval` without a second node and a full `DOP_SPAWN_REQUEST` peer,
     so the C derivation (`dist.c` line ranges, `src/reserve.rs`'s module docs) is the documented
     basis.
+50. `remote_monitor_exit.rs` (7 tests) — the **outbound** half of the same families:
+    `DistSignal::MonitorExit`, the `DOP_MONITOR_P_EXIT` a watched local process's death routes to
+    every recorded `RemoteWatcher` (the C's `erts_dsig_send_m_exit`,
+    `TUPLE5(DOP_MONITOR_P_EXIT, Watched, Watcher, Ref, Reason)`, `dist.c:1497-1519` —
+    **watched-first**, the reverse of the monitor family's `{DOP_MONITOR_P, watcher, watched,
+    ref}`). `remote_inbound.rs` pins the record; this file pins what resolving it *emits*, because
+    that signal is what makes a peer's `erlang:monitor(process, RemotePid)` get its
+    `{'DOWN', Ref, process, Watched, Reason}` at all (before the seam existed the record was
+    silently dropped). Every case destructures through one `monitor_exit` helper that **panics on
+    any other `DistSignal` variant**, so each also proves nothing else went on the wire. The seven:
+    (1) `a_death_routes_one_monitor_exit_for_a_peer_minted_record` — a record installed through
+    `monitor_from_remote_ref` with a heap-built peer `RemoteRef`: after `terminate(dying, reason)`
+    exactly one signal, whose `watched` is the dying local pid, `watcher` the recorded `RemotePid`,
+    `reference` **verbatim** (`RemoteWatcherRef::Remote(RemoteRef::from_eterm(peer_ref_term))`) and
+    `reason` the very word the death was handed plus structurally equal to it (a heap-built
+    2-tuple, not a `make_small`, so "carried" is provable); (2)
+    `watchers_on_two_different_nodes_each_get_their_own_signal` — two sysnames, one signal each in
+    **record order**, each naming its own node/watcher/reference, no de-duplication; (3)
+    `a_locally_minted_record_routes_its_monitor_ref_intact` — the `monitor_from_remote`
+    (`MonitorRef`) spelling routes `RemoteWatcherRef::Local(..)` unchanged; (4)
+    `only_the_dying_processes_own_watchers_are_routed` — three watched pids, each death routes
+    exactly its own watcher and a still-live pid keeps its record and routes nothing; (5)
+    `a_structured_reason_is_carried_faithfully` — a nested heap-built `{bad, {1, 2}}` reason (and
+    provably not `normal`) arrives structurally intact; (6) `without_a_router_a_death_is_record_only`
+    — no `DistSignalRouter` installed: `terminate` still returns `Ok`, the process is gone, the
+    record table is drained, nothing is fabricated (no mailbox message, no woken receiver) and the
+    table keeps working; (7) `one_signal_per_recorded_watcher_exactly` — three records on one
+    process (two peer-minted + one local spelling) give exactly three signals, pairwise distinct in
+    both destination and reference, each in the spelling it was recorded in. Deterministic — fixed
+    terms on the test's own heaps, no sleeps / wall-clock bounds / oracle.
 
 ## Constraints- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -628,8 +673,8 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **646 passed, 0 failed, 1 ignored** (215
-  in-module unit tests + 430 across the 49 integration test targets under `tests/` — one per top-level
+  `../../../tools/differential/` harness, not here. Current: **654 passed, 0 failed, 1 ignored** (215
+  in-module unit tests + 438 across the 50 integration test targets under `tests/` — one per top-level
   `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
   of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
   failure mode in `preemption.rs`).
@@ -679,9 +724,9 @@ SMP pool:
   route for a `Running` receiver)
 - `reserve_remote.rs` → the distributed-spawn reservation seam (`reserve_remote`/`spawn_reserved`/
   `cancel_reservation`, the no-leak rollback pins)
-- `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
-  an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
-  run)
+- `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` in
+  front of remote link partners *and* of incoming remote watchers, or an unreachable peer heap, must
+  not abort the death; the observer and the port-monitor cleanup still run)
 - `reference_ids.rs` → the **shared reference-id-space pin**: `RefAllocator` is a zero-sized handle
   onto `beam_common::next_ref_id`, so a draw *is* the shared counter's next id, two handles never
   repeat an id, and a monitor/alias reference can never collide with a bare `make_ref/0`-shaped
@@ -693,5 +738,11 @@ SMP pool:
   when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `remote_inbound.rs` → the inbound (receipt) half of the same families: the route-free `ProcessTable`
-  entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
+  entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`
+- `remote_monitor_exit.rs` → the **outbound** mirror of `remote_inbound.rs`: the
+  `DistSignal::MonitorExit` (`DOP_MONITOR_P_EXIT`, watched-first, `dist.c:1497-1519`) a watched local
+  process's death routes per recorded `RemoteWatcher` — the reference in the spelling the record
+  holds, the death's own reason term carried, one signal per record, in record order, with the
+  record-only behaviour of a runtime that installs no router
+- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)

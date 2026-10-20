@@ -299,16 +299,19 @@ impl<'a> RuntimeContext<'a> {
         let uses_runtime_hooks = hooks.runtime_hooks;
         // The local-node identity: **this runtime's own node** — the configured
         // `node@host` atom when `-name`/`-sname` made it a distributed node, else the fixed
-        // `nonode@nohost` ([`Runtime::local_node`] is the single source of truth for both).
-        // It is read from the runtime *before* the shared atom table is borrowed by the
-        // context, and it is always `Some` for a live runtime: the atom was interned into
-        // that very table at construction, so the hook can never answer "unknown" for a node
-        // this runtime *is*. Both fields are `Copy`, so this hook needs no runtime borrow at
-        // all and every arm below can install it (see [`NodeIdentity`]).
+        // `nonode@nohost` ([`Runtime::local_node`] is the single source of truth for both),
+        // paired with the node's **live** creation ([`Runtime::node_creation`]: the
+        // distributed node's `DistNode::creation` as `epmd` assigned it, `0` when this
+        // runtime is not a node). Both are `Copy` and both are read here, per call, **live**
+        // — never snapshotted, because the creation is finalised by the `ALIVE2` answer
+        // during the first scheduler pass (`DistNode::register_once`), long after boot, and
+        // a stale value would stamp a pid image with an incarnation this node is not. The
+        // immutable reborrows that read them end with the reads, so every arm below still
+        // has `&mut Runtime` for its bridge (see [`NodeIdentity`]).
         let mut local_node = NodeIdentity {
             node: Some(self.runtime.local_node()),
-        };
-        // The caller's module name is **not** cloned here: only the NIF-loading, `send` and
+            creation: self.runtime.node_creation(),
+        };        // The caller's module name is **not** cloned here: only the NIF-loading, `send` and
         // fun-caller arms consume it, and a registered BIF call may not pay an owned `String`
         // for them. The borrow below serves the one pre-destructure consumer (the fun-identity
         // snapshot); the destructure then moves the field out as `caller_module` for the arms.
@@ -1238,7 +1241,7 @@ impl<'a> RuntimeContext<'a> {
     ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
     ///   [`super::pool`]), a destination reached only for a call whose pool may be rewound: on that
     ///   route the copy exists to license the rewind, and the store it lands in is never reset.
-    fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
+    pub(crate) fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)
         } else {

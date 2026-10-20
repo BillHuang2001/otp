@@ -116,7 +116,9 @@ use beam_term::{AtomTable, Eterm};
 
 use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
-use crate::control::{decode_control, encode_control_cached, ControlMessage};
+use crate::control::{
+    decode_control_with_identity, encode_control_cached, ControlMessage, LocalIdentity,
+};
 use crate::delivery::{Delivery, Dispatched, InboundSink, LinkIdentity};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
@@ -790,6 +792,10 @@ pub struct Connection<T: Transport> {
     pending: Option<Vec<u8>>,
     /// How many ticks this link has answered (a diagnostic).
     ticks_answered: u64,
+    /// This node's own identity for the inbound decode — `None` (the default) keeps
+    /// every decoded pid/port/reference in its faithful external form. See
+    /// [`LocalIdentity`].
+    local_identity: Option<LocalIdentity>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -896,6 +902,7 @@ impl<T: Transport> Connection<T> {
             next_seq_id: 1,
             pending,
             ticks_answered: 0,
+            local_identity: None,
         }
     }
 
@@ -938,6 +945,42 @@ impl<T: Transport> Connection<T> {
     /// see [`Handshake::peer_visibility`]).
     pub fn peer_visibility(&self) -> PeerVisibility {
         self.handshake.peer_visibility
+    }
+
+    /// Installs this node's own identity for the inbound decode
+    /// ([`LocalIdentity`]).
+    ///
+    /// With it installed, an inbound external pid/port/reference whose node **and**
+    /// creation are this node's decodes to the **internal** term (the C's
+    /// `dec_is_this_node`, `external.c:3123-3129`), so a pid a peer reflects back
+    /// is `=:=` this node's own pid and an inbound alias reference
+    /// (`DOP_ALIAS_SEND`'s `To`) becomes a reference the runtime can resolve. It
+    /// applies to [`recv`](Self::recv) and therefore to every derive-off of it
+    /// (`recv_delivery`, `recv_delivery_checked`, `dispatch_inbound*`), for the
+    /// control arguments **and** the trailing message term.
+    ///
+    /// `node` must be the sysname atom interned in the **same** table the messages
+    /// are decoded into — see [`LocalIdentity::intern`]. A link with no identity
+    /// installed (the default) decodes exactly as it did before this seam existed.
+    ///
+    /// The identity is *not* consulted by
+    /// [`Delivery::classify_validated`](crate::Delivery::classify_validated): that
+    /// per-link check compares **external** node atoms (the C's `dep`) and is
+    /// unchanged by this.
+    pub fn set_local_identity(&mut self, identity: LocalIdentity) {
+        self.local_identity = Some(identity);
+    }
+
+    /// The identity installed by [`set_local_identity`](Self::set_local_identity),
+    /// or `None` (the default).
+    pub fn local_identity(&self) -> Option<LocalIdentity> {
+        self.local_identity
+    }
+
+    /// Removes the installed identity, restoring the faithful-external-form decode
+    /// ([`set_local_identity`](Self::set_local_identity)'s default).
+    pub fn clear_local_identity(&mut self) {
+        self.local_identity = None;
     }
 
     /// The full handshake outcome.
@@ -1059,6 +1102,10 @@ impl<T: Transport> Connection<T> {
     /// to the receive atom cache before the control body is decoded, so payload
     /// `ATOM_CACHE_REF`s resolve.
     ///
+    /// Identifiers of **this** node become internal terms when an identity is
+    /// installed ([`set_local_identity`](Self::set_local_identity)); without one
+    /// (the default) every pid/port/reference keeps its faithful external form.
+    ///
     /// The returned [`ControlMessage::terms`] holds the control arguments and, for
     /// a `send` opcode, the trailing message term (see the module docs).
     pub fn recv(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<ControlMessage> {
@@ -1066,7 +1113,13 @@ impl<T: Transport> Connection<T> {
         let (header, offset) = parse_header(&body, atoms)?;
         self.recv_cache.apply(&header)?;
         let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
-        decode_control(payload, heap, atoms, Some(self.recv_cache.table()))
+        decode_control_with_identity(
+            payload,
+            heap,
+            atoms,
+            Some(self.recv_cache.table()),
+            self.local_identity,
+        )
     }
 
     /// Receives one control message and **classifies** it for local delivery.

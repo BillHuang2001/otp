@@ -32,7 +32,7 @@
 //! **partially routed**; and the distributed-spawn family plus `Delivery::Other` are
 //! **not routed**, reported as the honest [`DeliveryOutcome::Unsupported`].
 
-use beam_codec::term::external_ref_parts;
+use beam_codec::{ref_numbers_to_id, term::external_ref_parts};
 use beam_common::{BeamError, Result};
 use beam_dist::{AltactSigFlags, Delivery, DeliveryOutcome, InboundSink};
 use beam_message::{CopyContext, OffHeapTable};
@@ -98,8 +98,10 @@ use beam_term::prelude::{
 /// **Not routed** — the distributed-spawn family and [`Delivery::Other`] are reported as
 /// [`DeliveryOutcome::Unsupported`], with the still-missing sibling API named at each
 /// match arm. (The `DOP_MONITOR_P_EXIT`-on-local-death echo a recorded
-/// [`RemoteWatcher`](beam_process::RemoteWatcher) would owe its peer is a separate
-/// **outbound** concern, still unimplemented and out of this sink's scope.)
+/// [`RemoteWatcher`](beam_process::RemoteWatcher) owes its peer is the **outbound** half,
+/// not this sink's: `ProcessTable::terminate_into` routes a
+/// [`DistSignal::MonitorExit`](beam_process::DistSignal) per watched record and
+/// `crate::dist_client`'s `encode_signal` writes it.)
 ///
 /// Every unrouted arm is *structural*, not incidental: routing one through the nearest
 /// *locally-initiated* `beam_process` entry point (`link_term`/`monitor_term`/`…`) would
@@ -295,7 +297,8 @@ impl InboundSink for LocalDeliverySink<'_> {
             // `DOP_PAYLOAD_MONITOR_P_EXIT`, `dist.c:2700-2714`). This is the **inverse**
             // of a monitor *this* node initiated: the reference on the wire is the one
             // `dist_client` put into the outgoing `DOP_MONITOR_P` (an external reference
-            // on **our** node, `{our_node, our_creation, [0, id >> 32, id]}`), which the
+            // on **our** node, `{our_node, our_creation, canonical ids}` — the shared
+            // `beam_codec::ref_id_to_numbers` word order), which the
             // peer echoes back verbatim. `wire_monitor_ref_id` therefore recovers the
             // very `MonitorRef` the outgoing record was keyed by, so the recorded
             // `RemoteMonitor` is found and the DOWN matches its monitor exactly.
@@ -464,12 +467,12 @@ impl LocalDeliverySink<'_> {
             // Not an internal reference thing: outside the opcode's contract
             // (`dist.c:2577`), so neither a delivery nor a drop is claimed for it.
             //
-            // A wire-borne reference currently arrives in the **external** form — the
-            // control-message decoder installs no local-node identity
-            // (`beam_dist::control::decode_control`), so the codec's local-node
-            // demotion never runs — and an external reference is not a readable alias
-            // key here. That is a `beam_dist` handoff, recorded rather than worked
-            // around: see the module's escalation notes.
+            // A **wire** alias reference reaches here in the internal form: the drain
+            // installs this node's `beam_dist::control::LocalIdentity`, so a reference
+            // naming this node at this creation is demoted by the decode (the C's
+            // `dec_is_this_node`, `external.c:3123-3129`) and its id is a readable alias
+            // key. A drain with no identity installed leaves it external — the typed
+            // `Unsupported` rather than a guess.
             return Ok(DeliveryOutcome::Unsupported);
         };
         let Some(owner) = self.table.resolve_alias(reference) else {
@@ -536,23 +539,23 @@ impl LocalDeliverySink<'_> {
 
     /// Classifies an addressed pid term as a process of this node.
     ///
-    /// An **internal** pid immediate is a local process by construction. The
-    /// distribution decoder materialises a pid as an **external** pid thing
-    /// (`beam_codec`), so a destination on this node arrives as an external pid
-    /// whose node atom and creation match ours — and only then is it looked up (by
-    /// number *and* serial, never number alone).
+    /// An **internal** pid immediate is a local process by construction, and that is the only
+    /// shape a decoded destination arrives in: the drain installs this node's
+    /// [`LocalIdentity`](beam_dist::control::LocalIdentity) on the link, so the decode itself
+    /// demotes a wire pid naming this node at **this** creation to the internal term (the C's
+    /// `dec_is_this_node`, `external.c:3123-3129`). Anything still external is therefore
+    /// **not** this node's — a foreign node, or a stale incarnation of this one — and the
+    /// lookup is by number *and* serial, never number alone.
     fn resolve(&self, term: Eterm) -> Target {
         match PidTarget::from_eterm(term) {
             Ok(PidTarget::Local(pid)) => Target::Local(pid),
-            Ok(PidTarget::Remote(remote))
-                if remote.node() == self.local_node
-                    && remote.creation() == self.local_creation =>
-            {
-                Target::Local(ProcessId::new(
-                    u64::from(remote.number()),
-                    u64::from(remote.serial()),
-                ))
-            }
+            // Anything still external is **not** this node's: the demotion of a wire pid
+            // naming this node at this creation is the **decode's** rule, not the sink's.
+            // `beam_dist`'s `LocalIdentity` (`decode_control_with_identity`) is installed on
+            // every link this runtime drains, so a pid addressed to this node arrives here
+            // already internal (the C's `dec_is_this_node`, `external.c:3123-3129`) — a
+            // foreign node or a stale incarnation of this one stays a remote pid and is
+            // never resolved by its slot number alone.
             Ok(PidTarget::Remote(_)) => Target::Foreign,
             Err(_) => Target::NotAPid,
         }
@@ -934,32 +937,42 @@ impl LocalDeliverySink<'_> {
 
     /// Recovers the `MonitorRef` **id** of a reference that came back off the wire and
     /// was minted by *this* runtime — the exact inverse of the pack
-    /// [`crate::dist_client`]'s `monitor_ref_term` puts on the wire.
+    /// [`crate::dist_client`]'s `monitor_ref_term` puts on the wire, both sides calling the
+    /// shared authority [`beam_codec::ref_id_to_numbers`] /
+    /// [`beam_codec::ref_numbers_to_id`].
     ///
     /// A monitor this node initiates on a remote process records a
     /// [`RemoteMonitor`](beam_process::RemoteMonitor) under a `MonitorRef` and routes a
-    /// `DOP_MONITOR_P` whose `Ref` element is `{our_node, our_creation, [0, id >> 32,
-    /// id]}` (three 32-bit words, most significant first, leading word zeroed). The peer
+    /// `DOP_MONITOR_P` whose `Ref` element is `{our_node, our_creation, canonical ids}` —
+    /// the three 32-bit numbers of [`beam_codec::ref_id_to_numbers`] (the C's
+    /// `erts_set_ref_numbers` word order, `ERTS_REF_NUMBERS` of them). The peer
     /// echoes that identical reference image in the `DOP_MONITOR_P_EXIT` it sends when the
     /// monitored process dies, and the control-message decoder materialises it as an
     /// **external** reference (`beam_dist::control::decode_control` installs no
     /// local-node identity, so the codec's local-node demotion never runs).
     ///
     /// This undoes that packing exactly, and only for a reference this node minted: the
-    /// node and creation must be **this** node's and the leading id word zero. Anything
+    /// node and creation must be **this** node's — a check on the node/creation pair, the
+    /// numbers themselves coming from the shared unpacker. Anything
     /// else — in particular a reference a **peer** minted, whose node is not ours — is
     /// `None`, never a guessed id: such an identity has no faithful `u64` image (see the
     /// `Monitor`/`Demonitor` arm).
     fn wire_monitor_ref_id(&self, term: Eterm) -> Option<u64> {
+        // The normal shape: the drain installed this node's `LocalIdentity`, so our own
+        // reference came back **internal** and its id word *is* the monitor id (the pack
+        // `monitor_ref_term` writes is canonical, so the demotion restores it exactly).
+        if let Ok(reference) = MonitorRef::from_eterm(term) {
+            return Some(reference.id());
+        }
+        // Otherwise the reference stayed external — a drain with no identity installed, or
+        // an id the internal slot cannot hold. Unpack the external image with the inverse
+        // of that same pack (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159`), and only
+        // for a reference this node minted: the node and creation must be **ours**.
         let (node, ids, creation) = external_ref_parts(term).ok()?;
         if node != self.local_node || creation != self.local_creation {
             return None;
         }
-        let (high, low) = match ids {
-            [0, high, low] => (*high, *low),
-            _ => return None,
-        };
-        Some((u64::from(high) << 32) | u64::from(low))
+        Some(ref_numbers_to_id(ids))
     }
 }
 

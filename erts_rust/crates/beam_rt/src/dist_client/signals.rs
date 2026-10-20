@@ -25,12 +25,18 @@
 //! this file only writes a signal's terms onto the client's stable scratch heap.
 
 use beam_alloc::Heap;
-use beam_codec::term::make_external_ref;
+use beam_codec::{ref_id_to_numbers, term::make_external_ref};
 use beam_common::{BeamError, Result};
 use beam_process::{DistSignal, MonitorRef};
 use beam_term::prelude::{try_make_small, Eterm};
 
 /// The node a routed signal addresses.
+///
+/// Every variant but [`DistSignal::MonitorExit`] names its peer in the `to`/`target` element,
+/// which **is** the node the control must be written to. `MonitorExit` is the exception: its
+/// wire tuple is *watched*-first (`TUPLE5(DOP_MONITOR_P_EXIT, watched, watcher, ref, reason)`,
+/// `dist.c:1516`) and the watched pid is this node's **own** process, so the element naming the
+/// destination is the **watcher's** node — routing by the watched pid would address this node.
 pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
     match signal {
         DistSignal::Link { to, .. }
@@ -38,10 +44,16 @@ pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
         | DistSignal::Exit { to, .. }
         | DistSignal::Exit2 { to, .. } => to.node(),
         DistSignal::Monitor { target, .. } | DistSignal::Demonitor { target, .. } => target.node(),
+        // The reverse of the monitor family's order: the peer that must receive the
+        // `{'DOWN', …}` is the **watcher** (`beam_process::DistSignal::MonitorExit`).
+        DistSignal::MonitorExit { watcher, .. } => watcher.node(),
     }
 }
 
-/// The `{DOP_DEMONITOR_P, …, Ref}`/`{DOP_MONITOR_P, …, Ref}` reference element.
+/// The `{DOP_DEMONITOR_P, …, Ref}`/`{DOP_MONITOR_P, …, Ref}` reference element, and the
+/// **locally minted** reference of a `{DOP_MONITOR_P_EXIT, …, Ref, …}`
+/// ([`beam_process::RemoteWatcherRef::Local`] — a peer-minted one is written back verbatim
+/// instead, see `client.rs`'s `encode_signal`).
 ///
 /// The reference **must** go on the wire as an **external** reference
 /// (`NEWER_REFERENCE_EXT`, `{node, creation, ids}`), never as the in-heap internal ref
@@ -52,16 +64,19 @@ pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
 /// (`beam_dist/tests/live_interop.rs:1063`) sends exactly this external form to a real
 /// `erl` peer, which accepts it and echoes it back in `DOP_MONITOR_P_EXIT`.
 ///
-/// The three 32-bit identifier words carry the reference id, most significant first —
-/// the same word count OTP uses for a distribution reference (`ERTS_REF_NUMBERS`).
+/// The three 32-bit identifier words are the reference id's **canonical wire image**:
+/// [`beam_codec::ref_id_to_numbers`] (the shared `beam_codec::ref_wire` authority, the
+/// C's `erts_set_ref_numbers` pack, `ERTS_REF_NUMBERS` words). Using that one mapping —
+/// never a crate-local bit layout — is what makes our own reference come back as the
+/// *same* id once the inbound decode demotes it
+/// (`LocalDeliverySink::wire_monitor_ref_id`).
 pub(super) fn monitor_ref_term(
     heap: &mut Heap,
     reference: MonitorRef,
     node: Eterm,
     creation: u32,
 ) -> Result<Eterm> {
-    let id = reference.id();
-    let ids = [0u32, (id >> 32) as u32, id as u32];
+    let ids = ref_id_to_numbers(reference.id());
     make_external_ref(heap, node, &ids, creation)
 }
 

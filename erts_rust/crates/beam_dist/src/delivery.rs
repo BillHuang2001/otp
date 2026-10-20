@@ -97,7 +97,9 @@
 //! a `dist.c`-level same-node delivery short-circuit wrapper around an ETF body,
 //! not a `DOP_*` opcode.
 
-use beam_codec::term::{external_pid_parts, external_ref_parts, tuple_arity, tuple_element};
+use beam_codec::term::{
+    external_pid_parts, external_ref_parts, internal_ref_id, tuple_arity, tuple_element,
+};
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{is_atom, is_internal_pid, is_small, make_atom, signed_value};
 use beam_term::{AtomTable, Eterm};
@@ -865,17 +867,23 @@ impl Delivery {
             // `{DOP_SPAWN_REPLY[_TT], Ref, To, Flags, From[, Token]}`:
             // `dist.c:3070-3095`. The parent (`to`) is a local pid or an external pid
             // of *this* node, the reference is this node's own reference re-arriving
-            // as an external ref (the C accepts an internal ref too, `dist.c:3079`,
-            // which a decoded wire message cannot carry), and the result is the new
-            // remote pid or an error atom. The `Flags` word is already validated by
-            // `classify` (`spawn_flags`, `dist.c:3088-3093`).
+            // either as an **internal** ref or as an external ref of this node (an old
+            // incarnation), and the result is the new remote pid or an error atom. The
+            // `Flags` word is already validated by `classify` (`spawn_flags`,
+            // `dist.c:3088-3093`).
             Delivery::SpawnReply { reference, to, result, .. } => {
                 let to_ok = is_internal_pid(*to)
                     || external_pid_node(*to) == Some(link.local_node);
                 if !to_ok {
                     return Err(BeamError::BadArg);
                 }
-                if external_ref_node(*reference) != Some(link.local_node) {
+                // `dist.c:3079-3086`: `is_internal_ref(ref)` continues, an external ref
+                // whose `external_ref_dist_entry` is `erts_this_dist_entry` breaks
+                // (an old incarnation of this node), anything else is
+                // `invalid_message`.
+                let reference_ok = is_internal_ref(*reference)
+                    || external_ref_node(*reference) == Some(link.local_node);
+                if !reference_ok {
                     return Err(BeamError::BadArg);
                 }
                 if !(is_external_pid(*result) || is_atom(*result)) {
@@ -992,20 +1000,57 @@ fn external_pid_node(x: Eterm) -> Option<Eterm> {
     external_pid_parts(x).ok().map(|(node, _, _, _)| node)
 }
 
-/// `is_ref(x)`: an external reference.
+/// `is_ref(x)` — the C's reference test, spanning **internal and external**
+/// references (`erts/emulator/beam/erl_term.h`'s `is_ref`, i.e. what
+/// `is_not_ref` negates).
 ///
-/// A **decoded wire** reference is always external (an internal reference is a
-/// same-node term the decoder only produces for a local-node demotion, and the C's
-/// `is_ref` — which spans internal and external refs — has no safe equivalent
-/// here: `is_internal_ref` is not exposed as a safe predicate). This predicate
-/// therefore reports exactly the references a remote control message can carry.
+/// This is the predicate the C's control-message validators use:
+/// `DOP_ALIAS_SEND`'s `if (is_not_ref(to))` (`dist.c:2584`),
+/// `DOP_ALTACT_SIG_SEND`'s `if (is_not_ref(to) || (flags & …_FLG_NAME))`
+/// (`dist.c:2663`), `DOP_MONITOR_P`'s `if (is_not_ref(ref))` (`dist.c:2361`),
+/// `DOP_DEMONITOR_P`'s (`dist.c:2427`) and `DOP_[PAYLOAD_]MONITOR_P_EXIT`'s
+/// (`dist.c:2723`). A remote peer's own reference arrives as an *external* ref,
+/// while **this** node's reference arrives as an external ref of this node that an
+/// identity-installed decode demotes to the **internal** form
+/// ([`beam_codec::Decoder::with_local_node`], installed by
+/// [`crate::control::decode_control_with_identity`]) — so both arms are real for a
+/// wire message, and an external-only test would reject the alias and monitor forms
+/// the C accepts.
+///
+/// The internal arm is **inert without an installed
+/// [`LocalIdentity`](crate::control::LocalIdentity)**: no wire
+/// image can carry an internal reference (it is a same-node heap term with no
+/// external encoding), so an identity-less decode stays external and this predicate
+/// answers exactly as an external-only one would.
+///
+/// The two opcodes with a *different* reference rule keep it: `DOP_SPAWN_REPLY`
+/// accepts an internal ref **or** an external ref of this node
+/// (`dist.c:3079-3086`, tested inline as `is_internal_ref || external_ref_node`),
+/// and `DOP_SPAWN_REQUEST` requires an **external** ref
+/// (`is_not_external_ref(ref)`, `dist.c:2933`, which uses `external_ref_parts`
+/// directly).
 fn is_ref(x: Eterm) -> bool {
-    external_ref_parts(x).is_ok()
+    is_internal_ref(x) || external_ref_parts(x).is_ok()
 }
 
 /// The node-name term of an external reference, or `None` for anything else.
 fn external_ref_node(x: Eterm) -> Option<Eterm> {
     external_ref_parts(x).ok().map(|(node, _, _)| node)
+}
+
+/// `is_internal_ref(x)` — an on-heap (local) reference thing.
+///
+/// `beam_term::boxed::is_internal_ref` is the frozen predicate, but it is an
+/// `unsafe` header read and this crate is `#![deny(unsafe_code)]`.
+/// [`beam_codec::term::internal_ref_id`] is the **safe accessor over that same
+/// predicate**: it validates the term is boxed, that the header carries
+/// `REF_SUBTAG` and that the block has the M1 internal-reference arity *before*
+/// reading the id word, so `Ok` here is exactly `is_internal_ref` for every
+/// reference this runtime builds (a reference produced by
+/// [`beam_codec::term::make_internal_ref`] / the runtime's own `make_ref`
+/// producers). A non-reference is `Err`, never a wrong answer.
+fn is_internal_ref(x: Eterm) -> bool {
+    internal_ref_id(x).is_ok()
 }
 
 /// A non-zero, non-negative **small** integer — the C's `term_to_Uint64(…) &&

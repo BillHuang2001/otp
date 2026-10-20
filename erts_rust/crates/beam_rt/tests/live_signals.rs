@@ -85,6 +85,24 @@
 //! (and its wire encoding) independently of the BIF's classification, so a regression is
 //! attributed to one half or the other.
 //!
+//! # The monitor family
+//!
+//! The two `monitor` tests close the mirror image of the link pair: a real `erl` peer
+//! **watches one of this runtime's processes** and reports the `{'DOWN', Ref, process, Pid,
+//! Reason}` its own OTP node received. The runtime hands the peer the pid (a `DOP_SEND`
+//! payload carrying an *internal* pid, which the outbound externaliser re-materialises as
+//! this node's external pid), the peer answers with `erlang:monitor(process, Pid)`
+//! (`{DOP_MONITOR_P, Watcher, Watched, Ref}`, `dist.c:1524-1528`), the inbound sink records the
+//! watcher under the **peer-minted** reference (`LocalDeliverySink::monitor`), and the
+//! process is then killed with a real `erlang:exit/2` reason. Its death routes
+//! `{DOP_MONITOR_P_EXIT, Watched, Watcher, Ref, Reason}` — *watched first*, the C's
+//! `erts_dsig_send_m_exit` (`dist.c:1497-1522`) — which is what makes the peer's `'DOWN'`
+//! arrive at all. `demonitor` is the negative control: the peer cancels the monitor
+//! (`demonitor(Ref, [flush])`) before the kill and must then report that **no** `'DOWN'`
+//! arrived. Both tests assert on the peer's own output, and both check on this side that the
+//! watcher record really existed (and was really cancelled) — so neither can pass while the
+//! runtime ignores the whole family.
+//!
 //! Every test is a **loud skip** (`SKIP: …` + early `return`, never a panic and never a
 //! silent pass) when no usable `erl`/`epmd` is available, the peers are killed and reaped
 //! on drop, and their node names/cookie are process-unique so a run can never collide
@@ -103,7 +121,7 @@ use std::time::{Duration, Instant};
 use beam_alloc::Heap;
 use beam_bifs::NullSink;
 use beam_engine::ExecutionContext;
-use beam_process::{DistSignal, RemotePid};
+use beam_process::{DistSignal, ProcessId, RemotePid};
 use beam_rt::{Runtime, RuntimeConfig, RuntimeContext};
 
 // The shared harness is compiled into every test target; this target only uses a
@@ -126,6 +144,33 @@ const CONTROL_PEER_TIMEOUT_MS: u64 = 4_000;
 const SUBJECT_WAIT: Duration = Duration::from_secs(25);
 /// The same bound for the negative control (longer than its peer-side `after`).
 const CONTROL_WAIT: Duration = Duration::from_secs(12);
+/// How long the monitor peer's `after` bound on receiving the pid it must watch: a safety
+/// bound, because the runtime sends it immediately after the handshake.
+const MONITOR_READY_TIMEOUT_MS: u64 = 20_000;
+/// The subject monitor peer's `after` bound on waiting for the `'DOWN'`. The kill happens as
+/// soon as the peer's monitor is recorded, so this is a safety bound, not a wait.
+const MONITOR_DOWN_TIMEOUT_MS: u64 = 15_000;
+/// The **pause the demonitor peer takes between `monitor/2` and `demonitor/2`**, so this
+/// suite can observe the recorded watcher (the non-vacuity check that the monitor really
+/// reached the runtime) before the cancellation removes it.
+const DEMONITOR_PAUSE_MS: u64 = 1_500;
+/// The demonitor peer's `after` bound on waiting for a `'DOWN'` that must never arrive.
+/// Comfortably longer than the suite needs to kill the process after the cancellation.
+const DEMONITOR_DOWN_TIMEOUT_MS: u64 = 5_000;
+/// How long the suite drives passes while the peer reports its monitor outcome.
+const MONITOR_WAIT: Duration = Duration::from_secs(25);
+/// The same bound for the demonitor positive/negative observations (longer than that peer's
+/// `after`).
+const DEMONITOR_WAIT: Duration = Duration::from_secs(20);
+/// How long the runtime is given to record (or drop) an inbound monitor record — a bound on
+/// the round trip of one control message, not a wait.
+const MONITOR_SETUP_WAIT: Duration = Duration::from_secs(10);
+
+/// The committed `mailbox.beam` fixture (recipe in `tests/fixtures/README.md`):
+/// `mailbox:wait/0` parks in a `receive` and stays alive, which is the process the monitor
+/// peers watch and this suite kills. It is loaded **by path** (never through a `-pa` on the
+/// fixtures directory, which holds a `lists.beam` that would shadow stdlib's).
+const MAILBOX_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mailbox.beam");
 
 /// A process-unique tag, so a run's node names/cookie never collide with a concurrent
 /// test's (or a leftover node from an earlier run).
@@ -198,7 +243,8 @@ struct Peer {
 
 impl Peer {
     /// Spawns `erl -sname <node> -setcookie <cookie> -kernel inet_dist_listen_min <port>
-    /// inet_dist_listen_max <port> -noshell -eval <EXPR>`.
+    /// inet_dist_listen_max <port> -noshell -eval <EXPR>` where `EXPR` is the **link**
+    /// family's program ([`peer_eval`]).
     fn start(
         oracle: &Path,
         node: &str,
@@ -207,6 +253,20 @@ impl Peer {
         exit_timeout_ms: u64,
     ) -> std::io::Result<Peer> {
         let eval = peer_eval(exit_timeout_ms);
+        Peer::start_with_eval(oracle, node, cookie, port, &eval)
+    }
+
+    /// [`Peer::start`] with a caller-supplied `-eval` program: the **monitor** family's peer
+    /// script ([`monitor_peer_eval`]) differs from the link family's only in what it does
+    /// with the pid this runtime hands it, so the spawn/readiness/teardown plumbing (pinned
+    /// listener port, piped stdout, kill-and-reap on drop) is shared verbatim.
+    fn start_with_eval(
+        oracle: &Path,
+        node: &str,
+        cookie: &str,
+        port: u16,
+        eval: &str,
+    ) -> std::io::Result<Peer> {
         let mut child = Command::new(oracle)
             .arg("-sname")
             .arg(node)
@@ -217,7 +277,7 @@ impl Peer {
             .arg(port.to_string())
             .arg("inet_dist_listen_max")
             .arg(port.to_string())
-            .args(["-noshell", "-eval", &eval])
+            .args(["-noshell", "-eval", eval])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -653,5 +713,464 @@ fn without_the_link_the_exit_is_not_delivered() {
         line.starts_with("NOLINKEXIT"),
         "with no DOP_LINK routed, the peer's exit-trapping process must not receive an exit \
          (got {line:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The monitor family (A.5): a real peer watches one of *this* runtime's processes
+// ---------------------------------------------------------------------------------------
+
+/// The monitor family's peer `-eval`: trap exits, publish `term_to_binary(self())` as hex,
+/// then wait for the pid this runtime hands it, `erlang:monitor(process, Pid)` it, and
+/// report what the peer's own OTP node did with that monitor.
+///
+/// `demonitor_first` is the **negative control**'s shape: the peer pauses (so this suite can
+/// observe the recorded watcher), cancels the monitor with `demonitor(Ref, [flush])` and
+/// prints the cancellation's answer before waiting for a `'DOWN'` that must never arrive.
+/// Both programs terminate on their own: the inner `after` bounds the DOWN wait, the outer
+/// one the pid wait.
+fn monitor_peer_eval(demonitor_first: bool, down_timeout_ms: u64) -> String {
+    let cancel = if demonitor_first {
+        format!(
+            "timer:sleep({DEMONITOR_PAUSE_MS}), \
+             Demonitored = erlang:demonitor(Ref, [flush]), \
+             io:format(\"DEMONITORED ~p~n\", [Demonitored]), "
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "process_flag(trap_exit, true), \
+         io:format(\"PEERPID ~s~n\", \
+                   [binary_to_list(binary:encode_hex(term_to_binary(self())))]), \
+         receive \
+             P when is_pid(P) -> \
+                 Ref = erlang:monitor(process, P), \
+                 io:format(\"MONITORED ~p ~p ~p~n\", [P, node(P), Ref]), \
+                 {cancel}\
+                 receive \
+                     {{'DOWN', DR, DKind, DPid, DReason}} -> \
+                         io:format(\"DOWN ~p ~p ~p ~p~n\", [DR, DKind, DPid, DReason]) \
+                 after {down_timeout_ms} -> io:format(\"NODOWN ~p~n\", [Ref]) end \
+         after {MONITOR_READY_TIMEOUT_MS} -> io:format(\"NOPID~n\") end."
+    )
+}
+
+/// The whitespace fields of one peer line, without its leading tag — the shape both peers
+/// print (`MONITORED <pid> <node> <ref>`, `DOWN <ref> <kind> <pid> <reason>`).
+///
+/// `~p` renders a pid **on another node** as `<NodeId.Number.Serial>` (probed against the
+/// oracle: OTP 29 prints the node's internal id, not its `name@host` atom), so the peer
+/// prints `node(P)` beside it — that is the field that says which node the pid lives on.
+fn fields(line: &str) -> Vec<&str> {
+    line.split_whitespace().skip(1).collect()
+}
+
+/// Drives scheduler passes (and the distribution driver inside them) until the runtime
+/// holds exactly `want` recorded **incoming remote watchers** for `target`, answering the
+/// last count it saw.
+///
+/// This is the non-vacuity half of both monitor tests: a peer's own `MONITORED` line only
+/// says the peer minted a reference, while this says the `DOP_MONITOR_P` really arrived and
+/// was recorded against the pid the peer is watching (so a later `'DOWN'` can only be the
+/// runtime's answer).
+fn wait_for_watchers(rt: &mut Runtime, target: ProcessId, want: usize, timeout: Duration) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = rt.processes().remote_watchers(target).len();
+        if count == want || Instant::now() >= deadline {
+            return count;
+        }
+        rt.run_one_slice().expect("a scheduler pass");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// One open monitor session: a real `erl` peer holding an `erlang:monitor/2` (or a cancelled
+/// one) on one of this runtime's processes, and the runtime holding that process.
+struct MonitorSession {
+    peer: Peer,
+    rt: Runtime,
+    /// The peer's node name (for the "still connected" assertions).
+    peer_node: String,
+    /// This node's **full** `name@host` form — what the peer's `node(P)` answers for the pid
+    /// it was handed (the `-sname` the runtime was started with is only the first half).
+    our_node: String,
+    /// The local process the peer watches: `mailbox:wait/0`, parked in its `receive` so it
+    /// stays alive until the suite kills it.
+    target: ProcessId,
+    /// The peer's own `MONITORED <pid> <node> <ref>` line — the pid it watches, the node
+    /// that pid lives on, and the reference the **peer** minted, which the `'DOWN'` must
+    /// carry back.
+    monitored: String,
+}
+
+impl MonitorSession {
+    /// Starts the peer, publishes/connects this node, spawns the watched process and hands
+    /// the peer its pid; returns once both sides agree a monitor exists.
+    ///
+    /// The pid reaches the peer as a **`DOP_SEND` payload carrying an internal pid**: the
+    /// outbound externaliser (`src/dist/externalize.rs`) re-materialises it as this node's
+    /// external pid, which is what `erlang:monitor(process, Pid)` on the peer's node needs.
+    fn open(oracle: &Path, demonitor_first: bool) -> MonitorSession {
+        let session = SESSION.fetch_add(1, Ordering::Relaxed);
+        let peer_node = format!("{}{}", unique("mp"), session);
+        let our_node = format!("{}{}", unique("mc"), session);
+        let cookie = unique("mk");
+        let port = free_port();
+        let down_timeout_ms = if demonitor_first {
+            DEMONITOR_DOWN_TIMEOUT_MS
+        } else {
+            MONITOR_DOWN_TIMEOUT_MS
+        };
+        let eval = monitor_peer_eval(demonitor_first, down_timeout_ms);
+
+        let peer = Peer::start_with_eval(oracle, &peer_node, &cookie, port, &eval)
+            .expect("the real `erl` peer starts");
+        let ready = peer
+            .wait_for(|line| line.starts_with("PEERPID "), READY_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the real `erl` peer never published its pid\n  command: {}\n  stdout: {}\n  \
+                     stderr: {}",
+                    peer.command,
+                    peer.transcript_text(),
+                    peer.stderr_text()
+                )
+            });
+        let hex = ready
+            .strip_prefix("PEERPID ")
+            .expect("the pid line's prefix")
+            .trim()
+            .to_string();
+
+        // The peer registers with `epmd` asynchronously during its own start-up, so wait for
+        // the registration before dialling it (the pinned port is what `epmd` must answer).
+        let deadline = Instant::now() + EPMD_TIMEOUT;
+        let mut resolved = None;
+        while Instant::now() < deadline {
+            match beam_dist::epmd::lookup_port(peer_node.as_bytes()) {
+                Ok(found) => {
+                    resolved = Some(found);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        let Some(found) = resolved else {
+            panic!(
+                "the peer never appeared in `epmd` within {EPMD_TIMEOUT:?}\n  command: {}\n  \
+                 stderr: {}",
+                peer.command,
+                peer.stderr_text()
+            );
+        };
+        assert_eq!(found, port, "epmd resolved the peer's pinned listen port");
+
+        let mut rt = node_runtime(&our_node, &cookie);
+        // The peer's `node(P)` is the full `name@host` form of the node a pid lives on.
+        let our_node = rt.node_name().map(str::to_string).unwrap_or(our_node);
+        // One pass publishes *this* node to `epmd` too (and finalises its creation).
+        rt.run_one_slice().expect("a scheduler pass");
+        rt.dist_connect(&peer_node)
+            .unwrap_or_else(|err| panic!("dist_connect('{peer_node}') failed: {err:?}"));
+        assert!(
+            rt.dist_is_connected(&peer_node),
+            "the outbound link completed its handshake"
+        );
+        let remote = decode_remote_pid(&mut rt, &hex);
+
+        // The process the peer watches: a real `.beam` parked in its `receive`, so it stays
+        // alive (and observable) until this suite kills it with a real reason.
+        rt.load_module(MAILBOX_BEAM).expect("mailbox.beam loads");
+        let target = rt
+            .spawn_process("mailbox", "wait", vec![])
+            .expect("spawn mailbox:wait/0");
+        rt.run_one_slice().expect("the pass parks the receiver");
+
+        // Hand the peer the pid. The payload is an **internal** pid term, so this also
+        // exercises the outbound externaliser's local-identifier rewrite.
+        let mut pid_heap = Heap::new(256).expect("a peer-pid heap");
+        let peer_term = remote
+            .to_eterm(&mut pid_heap)
+            .expect("the peer's pid as an external pid term");
+        let from = rt.self_pid();
+        rt.dist_send_message_pid(peer_term, from, target.to_eterm())
+            .expect("send the watched pid to the peer");
+        rt.run_one_slice().expect("a scheduler pass");
+
+        let monitored = peer
+            .wait_for(|line| line.starts_with("MONITORED "), READY_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the peer never monitored the pid it was sent\n  command: {}\n  stdout: {}\n  \
+                     stderr: {}",
+                    peer.command,
+                    peer.transcript_text(),
+                    peer.stderr_text()
+                )
+            });
+
+        let mut open = MonitorSession {
+            peer,
+            rt,
+            peer_node,
+            our_node,
+            target,
+            monitored,
+        };
+        // The peer's monitor arrives as a `DOP_MONITOR_P` control; wait until this runtime
+        // has recorded the incoming watcher, so a later `'DOWN'` can only be its answer.
+        let watchers = wait_for_watchers(&mut open.rt, target, 1, MONITOR_SETUP_WAIT);
+        assert_eq!(
+            watchers,
+            1,
+            "this runtime must record the peer's DOP_MONITOR_P as one incoming watcher of the \
+             watched process before the kill (got {watchers})\n  peer command: {}\n  stdout: {}",
+            open.peer.command,
+            open.peer.transcript_text()
+        );
+        open
+    }
+
+    /// Kills the watched process with a real `erlang:exit/2` reason — the front door a
+    /// program uses to end a process, which terminates it (it does not trap exits) and
+    /// routes one `DOP_MONITOR_P_EXIT` per recorded watcher.
+    fn kill_target(&mut self, reason: beam_term::Eterm) {
+        let target = self.target.to_eterm();
+        let answer = {
+            let mut sink = NullSink;
+            let mut ctx = RuntimeContext::with_output(&mut self.rt, &mut sink);
+            ctx.call_bif("erlang", "exit", 2, &[target, reason])
+                .expect("erlang:exit/2 on the watched process")
+        };
+        assert_eq!(
+            self.rt.atom_name_of(answer),
+            Some("true"),
+            "erlang:exit/2 answers the atom `true`"
+        );
+        assert!(
+            !self.rt.processes().contains(self.target),
+            "the watched process is gone after the exit signal"
+        );
+        assert!(
+            self.rt.processes().remote_watchers(self.target).is_empty(),
+            "the dying process's incoming watcher records are resolved by its termination"
+        );
+    }
+
+    /// Drives scheduler passes (which is what flushes and decodes distribution traffic)
+    /// while polling the peer's stdout for a line satisfying `pred`, bounded by `timeout`.
+    fn drive_until<F: Fn(&str) -> bool>(&mut self, pred: F, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.rt.run_one_slice().expect("a scheduler pass");
+            if let Some(line) = self.peer.wait_for(&pred, Duration::from_millis(50)) {
+                return Some(line);
+            }
+        }
+        None
+    }
+}
+
+/// **The peer's monitor of one of our processes, end to end (contract A.5).**
+///
+/// A real `erl` peer calls `erlang:monitor(process, Pid)` on a pid this runtime hands it,
+/// prints the pid and the reference **it** minted, and this runtime then kills that process
+/// with a real reason. The peer must print the `'DOWN'` its own OTP node received, and that
+/// line has to carry (a) the arrival itself, (b) the real reason, and (c) the **peer's own**
+/// reference — which is only possible if the reference round-tripped faithfully through
+/// `DOP_MONITOR_P` → this runtime's remote-watcher record → `DOP_MONITOR_P_EXIT`
+/// (`erts_dsig_send_m_exit`, `dist.c:1497-1522`, *watched first*).
+#[test]
+fn a_peer_monitor_of_our_process_receives_down_with_the_peer_minted_ref() {
+    let Some(oracle) = oracle() else {
+        return; // `require_oracle` already reported the loud skip
+    };
+    if epmd_unreachable() {
+        eprintln!(
+            "SKIP: the peer must register with `epmd` (and this runtime resolves it there), \
+             and no daemon answers on {}",
+            beam_dist::EPMD_DEFAULT_ADDR
+        );
+        return;
+    }
+
+    let mut session = MonitorSession::open(&oracle, false);
+    // The peer's own view: the pid it watches (and the node that pid lives on) and the
+    // reference it minted for the monitor.
+    let monitored = fields(&session.monitored);
+    assert_eq!(
+        monitored.len(),
+        3,
+        "the peer printed `MONITORED <pid> <node> <ref>` (got {:?})",
+        session.monitored
+    );
+    let (watched_pid, monitored_ref) = (monitored[0].to_string(), monitored[2].to_string());
+    assert_eq!(
+        monitored[1], session.our_node,
+        "the pid the peer monitors lives on *this* node (got {:?})",
+        monitored[1]
+    );
+    assert!(
+        monitored_ref.starts_with("#Ref<"),
+        "the peer printed the reference `erlang:monitor/2` answered (got {monitored_ref:?})"
+    );
+
+    let reason = session.rt.intern("router_boom");
+    session.kill_target(reason);
+
+    let line = session
+        .drive_until(
+            |line| line.starts_with("DOWN ") || line.starts_with("NODOWN"),
+            MONITOR_WAIT,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the peer never reported a monitor outcome after the watched process died\n  \
+                 command: {}\n  stdout: {}\n  stderr: {}",
+                session.peer.command,
+                session.peer.transcript_text(),
+                session.peer.stderr_text()
+            )
+        });
+    // (a) the `'DOWN'` arrived at all.
+    assert!(
+        line.starts_with("DOWN "),
+        "the peer must receive the `'DOWN'` its own monitor earned (got {line:?}, peer \
+         command: {})",
+        session.peer.command
+    );
+    let down = fields(&line);
+    assert_eq!(
+        down.len(),
+        4,
+        "the peer printed `DOWN <ref> <kind> <pid> <reason>` (got {line:?})"
+    );
+    // (c) the reference is the one the **peer** minted — the round-trip proof.
+    assert_eq!(
+        down[0], monitored_ref,
+        "the `'DOWN'` carries the reference the peer minted for this monitor (got {:?} for \
+         {monitored_ref:?})",
+        down[0]
+    );
+    assert_eq!(down[1], "process", "the monitor was a process monitor");
+    assert_eq!(
+        down[2], watched_pid,
+        "the `'DOWN'` names the pid the peer was watching (got {:?} for {watched_pid:?})",
+        down[2]
+    );
+    // (b) the real reason, not a placeholder and not `noproc`/`normal`.
+    assert_eq!(
+        down[3], "router_boom",
+        "the `'DOWN'` carries the reason this runtime killed the process with (got {:?})",
+        down[3]
+    );
+    assert!(
+        session.rt.dist_is_connected(&session.peer_node),
+        "the outbound link is still established after the monitor exit"
+    );
+
+    eprintln!(
+        "monitor: peer observed {line:?} for {}\n  peer command: {}",
+        session.monitored, session.peer.command
+    );
+}
+
+/// **Demonitor suppresses the `'DOWN'` (the monitor family's negative control).**
+///
+/// The same session, but the peer cancels its monitor (`demonitor(Ref, [flush])`) before the
+/// watched process dies: the `DOP_DEMONITOR_P` must remove exactly that record on this side
+/// (checked, so the test cannot pass while the runtime ignores the family), and the peer must
+/// then report that **no** `'DOWN'` arrived — asserted on the peer's own output, not merely by
+/// a timeout that would also pass if the peer had never monitored at all.
+#[test]
+fn a_peer_demonitor_suppresses_the_down() {
+    let Some(oracle) = oracle() else {
+        return; // `require_oracle` already reported the loud skip
+    };
+    if epmd_unreachable() {
+        eprintln!(
+            "SKIP: the peer must register with `epmd` (and this runtime resolves it there), \
+             and no daemon answers on {}",
+            beam_dist::EPMD_DEFAULT_ADDR
+        );
+        return;
+    }
+
+    let mut session = MonitorSession::open(&oracle, true);
+    assert_eq!(
+        fields(&session.monitored).len(),
+        3,
+        "the peer installed a monitor before cancelling it (got {})",
+        session.monitored
+    );
+    let demonitored = session
+        .peer
+        .wait_for(|line| line.starts_with("DEMONITORED "), READY_TIMEOUT)
+        .unwrap_or_else(|| {
+            panic!(
+                "the peer never reported its `demonitor/2` answer\n  command: {}\n  stdout: {}\n  \
+                 stderr: {}",
+                session.peer.command,
+                session.peer.transcript_text(),
+                session.peer.stderr_text()
+            )
+        });
+    assert_eq!(
+        fields(&demonitored),
+        vec!["true"],
+        "the peer's `erlang:demonitor(Ref, [flush])` answers `true` (got {demonitored:?})"
+    );
+    // The cancellation really reached this runtime: the recorded watcher is gone, so the
+    // process's death cannot be attributed to a monitor that is still live.
+    let left = wait_for_watchers(&mut session.rt, session.target, 0, MONITOR_SETUP_WAIT);
+    assert_eq!(
+        left,
+        0,
+        "the peer's DOP_DEMONITOR_P must cancel exactly the recorded watcher (got {left} left)\n  \
+         peer command: {}\n  stdout: {}",
+        session.peer.command,
+        session.peer.transcript_text()
+    );
+
+    let reason = session.rt.intern("late_boom");
+    session.kill_target(reason);
+
+    let line = session
+        .drive_until(
+            |line| line.starts_with("DOWN ") || line.starts_with("NODOWN"),
+            DEMONITOR_WAIT,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the peer never reported its demonitor outcome\n  command: {}\n  stdout: {}\n  \
+                 stderr: {}",
+                session.peer.command,
+                session.peer.transcript_text(),
+                session.peer.stderr_text()
+            )
+        });
+    assert!(
+        line.starts_with("NODOWN"),
+        "a demonitored peer must not receive a `'DOWN'` for the watched process's death (got \
+         {line:?}, peer command: {})",
+        session.peer.command
+    );
+    // The absence, explicitly, over everything the peer printed: not one line announces a
+    // received `'DOWN'`.
+    let transcript = session.peer.transcript_text();
+    assert!(
+        !transcript.lines().any(|line| line.starts_with("DOWN ")),
+        "no `'DOWN'` line may appear in the demonitored peer's own output, got:\n{transcript}"
+    );
+    assert!(
+        session.rt.dist_is_connected(&session.peer_node),
+        "the outbound link is still established after the demonitor"
+    );
+
+    eprintln!(
+        "demonitor: peer observed {line:?} for {}\n  peer command: {}",
+        session.monitored, session.peer.command
     );
 }

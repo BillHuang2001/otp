@@ -762,13 +762,38 @@ impl RecordSource for RecordBridge<'_> {
 /// matching the oracle).
 ///
 /// Keeping the identity live is what makes the two directions agree on a **named** node: the
-/// atom `term_to_binary` writes for an internal pid is the very atom a decoded `NEW_PID_EXT`
-/// is compared against, so a `-sname`/`-name` runtime no longer stamps its pids with
-/// `nonode@nohost`.
+/// atom **and the creation** `term_to_binary` writes for an internal pid are the very ones a
+/// decoded `NEW_PID_EXT` is compared against, so a `-sname`/`-name` runtime no longer stamps
+/// its pids with `nonode@nohost`/creation `0`.
 ///
-/// The atom is `Copy` (resolved once, before the context borrows the shared table), so the
-/// hook needs **no** runtime borrow and can be installed in every
-/// [`RuntimeContext::call_registered`] arm.
+/// Both fields are `Copy` and both are read **live** from the runtime when the hook is built —
+/// one atom plus one `u32`, no borrow held past the constructor. The creation is
+/// [`Runtime::node_creation`]: the distributed node's live
+/// [`DistNode::creation`](crate::dist::DistNode::creation) (the value the `'N'` handshake
+/// advertises and the value `epmd` assigns at registration) while this runtime **is** a node,
+/// and `0` otherwise — the C's `erts_creation` of a node that never connected anywhere
+/// (`erts/emulator/beam/erl_node_container_utils.c`).
+///
+/// # Why the creation is read live rather than snapshotted
+///
+/// A snapshot would go **stale**: [`DistNode::creation`](crate::dist::DistNode::creation)
+/// starts at [`DEFAULT_CREATION`](crate::dist::DEFAULT_CREATION) and is replaced by the
+/// `ALIVE2` answer inside `DistNode::register_once` during this runtime's **first** scheduler
+/// pass, i.e. after `Runtime::new` and long after boot. Nothing hands the hook a chance to
+/// refresh itself in between, and a stale creation is a *wrong* identity — a pid image naming
+/// an incarnation this node is not.
+///
+/// None is needed: the creation is a plain field of the runtime's `dist` node, and the
+/// runtime's `dist`/`dist_client` are **never moved out** of the `Runtime`. The scheduler pass
+/// moves only `processes` ([`Runtime::take_processes`]), `scheduler` and `runner_state`
+/// (`src/runtime/scheduler.rs`'s `scheduler_pass`), so the `&mut Runtime` a
+/// [`RuntimeContext`](super::RuntimeContext) holds always has its node in place and an
+/// immutable reborrow is available at the construction site.
+///
+/// The one *stored* copy of the creation elsewhere is
+/// [`DistClientInner::creation`](crate::dist_client) — the value the outbound externaliser
+/// stamps on a payload — and it is kept in sync at the same point the live value changes
+/// ([`Runtime::sync_dist_creation`]).
 ///
 /// The `[local]` direction is the seam's second half: `local_node_hash` answers a real
 /// per-OS-process Bob-Jenkins hash over this host's name, pid and clock (see
@@ -778,20 +803,23 @@ pub(super) struct NodeIdentity {
     /// The runtime's node-name atom, taken from [`Runtime::local_node`] at the start of the
     /// call; always `Some` for a live runtime (the atom is interned at construction).
     pub(super) node: Option<Atom>,
+    /// The node's **live** creation, taken from [`Runtime::node_creation`] at the start of the
+    /// call: the distributed node's [`DistNode::creation`](crate::dist::DistNode::creation)
+    /// while this runtime is a node, `0` for the undistributed `nonode@nohost` (see the struct
+    /// docs — it is read live, never snapshotted).
+    pub(super) creation: u32,
 }
 
 impl LocalNode for NodeIdentity {
     fn local_node(&mut self) -> Option<(Atom, u32)> {
-        // Creation `0`: the value of an undistributed node (the C's `erts_creation` of a
-        // node that never connected anywhere). A `-sname`/`-name` node's `epmd`-assigned
-        // creation is not carried here — this seam's struct holds only the node atom, and
-        // its shape is pinned by the colocated unit test — so the name is live while the
-        // creation stays the undistributed default. The encoder reads this hook, so
-        // `term_to_binary/1` of an internal pid stamps exactly this identity; the decoder
-        // reads it too — `beam_bifs`'s `binary_to_term/1` (`binconv::decode_term_bif`)
-        // installs it on its `beam_codec` decoder, so a decoded local identifier is demoted
-        // back to the internal id and `binary_to_term(term_to_binary(self())) =:= self()`.
-        self.node.map(|node| (node, 0))
+        // The creation is the runtime's **live** one (see the struct docs): the encoder reads
+        // this hook, so `term_to_binary/1` of an internal pid stamps exactly the identity the
+        // `'N'` handshake advertises and `epmd` assigned; the decoder reads it too —
+        // `beam_bifs`'s `binary_to_term/1` (`binconv::decode_term_bif`) installs it on its
+        // `beam_codec` decoder, so a decoded local identifier is demoted back to the internal
+        // id and `binary_to_term(term_to_binary(self())) =:= self()` holds at the creation a
+        // peer would see. `0` stays the undistributed answer.
+        self.node.map(|node| (node, self.creation))
     }
 
     /// The node's `LOCAL_EXT` (`121`) hash, which makes `term_to_binary(Term, [local])` a real
@@ -803,6 +831,21 @@ impl LocalNode for NodeIdentity {
     /// process therefore report the same hash (a `[local]` image built by one decodes in the
     /// other), while the oracle's own hash differs per run; a differential case must therefore
     /// **mask** the four hash bytes and compare the rest of the image.
+    ///
+    /// # Why the hash does not mix the creation (or the node name)
+    ///
+    /// This is the C's own construction, not an omission: `erts_late_init_external`
+    /// (`../../erts/emulator/beam/external.c:136-199`) hashes `time-offset(8) || hostname ||
+    /// pid-string` seeded with the low 32 bits of the monotonic clock, and never touches
+    /// `erts_this_node->sysname` or `erts_creation`. So the hash is **per VM start**, not per
+    /// node identity, and it needs no reconciliation with the creation reported by
+    /// [`NodeIdentity::local_node`]: a `[local]` image carries the node field as `NIL_EXT` with
+    /// creation `0` (`ERTS_DIST_EXT_INTERNAL_NC`, `external.c:2978`) and identifies the node
+    /// through these four bytes alone, which is why the decoder treats `NIL_EXT` as the local
+    /// node **unconditionally** (`beam_codec`'s `is_internal_node_marker`) rather than
+    /// comparing a creation. Oracle-confirmed shape: two `erl` runs of the same
+    /// `term_to_binary({ok,17},[local])` differ in exactly these four bytes, whatever
+    /// `-sname`/`-name` they were given, and each decodes only its own.
     fn local_node_hash(&mut self) -> Option<u32> {
         Some(super::node_hash::node_hash())
     }

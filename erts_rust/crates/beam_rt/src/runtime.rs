@@ -3822,8 +3822,44 @@ impl Runtime {
         make_atom(self.local_node)
     }
 
-    /// Whether this runtime is a **live** distributed node: bound and registered with `epmd`,
-    /// so a remote node can reach it.
+    /// This runtime's **live** node creation — the second half of its node identity.
+    ///
+    /// The value is the C's `erts_creation` (`../../erts/emulator/beam/erl_node_container_utils.c`):
+    /// a distributed node's incarnation, as `epmd` assigned it in its `ALIVE2` answer
+    /// ([`DistNode::creation`], which starts at
+    /// [`DEFAULT_CREATION`](crate::dist::DEFAULT_CREATION) and is finalised during the first
+    /// scheduler pass's [`DistNode::pump`]), and `0` for a runtime with no `-name`/`-sname` —
+    /// a node that never connected anywhere.
+    ///
+    /// It is **the** single source of truth for the creation this runtime mints identifiers
+    /// with, and it is read live (never snapshotted):
+    ///
+    /// * the `beam_bifs::LocalNode` seam ([`crate::context::bridges`]'s `NodeIdentity`) reads
+    ///   it per BIF call, so `term_to_binary/1` of an internal pid/port stamps the same
+    ///   creation the `'N'` handshake advertises and `binary_to_term/1` demotes a wire
+    ///   identifier back to the internal term at that creation;
+    /// * the outbound distribution half's stored copy
+    ///   ([`DistClientInner::creation`](crate::dist_client)) is refreshed from it by
+    ///   [`Runtime::sync_dist_creation`] at the one point it can change.
+    pub fn node_creation(&self) -> u32 {
+        self.dist.as_ref().map_or(0, DistNode::creation)
+    }
+
+    /// Test-only: reissues the node's creation exactly as `epmd`'s `ALIVE2` answer does
+    /// (`DistNode::register_once`), the one production writer, which needs a live `epmd`.
+    ///
+    /// This is what lets a hermetic test observe the identity **changing** — the property that
+    /// makes a snapshot the wrong design. Pinned by `src/context/tests.rs`'s
+    /// `a_reissued_creation_is_picked_up_by_the_next_call` (the `LocalNode` seam) and
+    /// `src/runtime/scheduler/tests.rs`'s creation-sync test (the outbound half's stored copy).
+    #[cfg(test)]
+    pub(crate) fn set_node_creation_for_test(&mut self, creation: u32) {
+        if let Some(node) = self.dist.as_mut() {
+            node.set_creation_for_test(creation);
+        }
+    }
+
+    /// Whether this runtime is a **live** distributed node: bound and registered with `epmd`,    /// so a remote node can reach it.
     ///
     /// `false` for a runtime with no `-name`/`-sname`, and for a node `epmd` refused or has not
     /// yet registered (a registration failure is recorded, never raised — see

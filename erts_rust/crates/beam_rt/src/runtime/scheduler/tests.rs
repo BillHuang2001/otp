@@ -1336,3 +1336,54 @@ fn the_run_route_still_sleeps_to_a_parked_receive_timeout() {
         started.elapsed()
     );
 }
+
+// -- the node identity's creation, and the one point it can change ---------------------
+/// The outbound distribution half's stored creation
+/// ([`DistClientInner::creation`](crate::dist_client)) is kept equal to the node's **live**
+/// one ([`Runtime::node_creation`]) — the invariant that makes this runtime advertise one
+/// incarnation in its `'N'` handshake and stamp the same one on every payload it externalises.
+///
+/// The only production writer of the node's creation is `epmd`'s `ALIVE2` answer inside
+/// `DistNode::register_once`, which runs during [`Runtime::pump_dist`] — so that pump is the
+/// sync point, and the reissue is driven here through the test seam (a hermetic test runs no
+/// `epmd` daemon). Without the sync the client would keep the pre-registration creation for
+/// the rest of the run while the node — and the `LocalNode` seam — had moved on.
+#[test]
+fn the_outbound_half_creation_follows_the_nodes_live_creation() {
+    let mut config = crate::config::RuntimeConfig::default();
+    config.emulator.node_name = Some("unitcreation".to_string());
+    config.init_args.record("setcookie", vec!["cook".to_string()]);
+    let mut rt = Runtime::new(config).expect("a node runtime");
+    let before = rt.node_creation();
+    assert_ne!(before, 0, "a wired node's creation is never the undistributed `0`");
+    assert_eq!(
+        rt.dist_client().expect("a node has a client").creation(),
+        Some(before),
+        "`Runtime::new` installs the node's creation on the outbound half"
+    );
+    // A non-node has no client creation to agree on: the runtime reports `0` and installs
+    // nothing (the `dist_client` is `None`), so the two can never drift apart.
+    assert_eq!(
+        runtime().node_creation(),
+        0,
+        "an undistributed runtime reports the undistributed creation"
+    );
+
+    // `epmd` reissues the incarnation; the next pump (the production sync point) carries it
+    // across to the outbound half.
+    rt.set_node_creation_for_test(7);
+    assert_eq!(rt.node_creation(), 7);
+    assert_eq!(
+        rt.dist_client().expect("a node has a client").creation(),
+        Some(before),
+        "the client's copy only moves at the pump, never on its own"
+    );
+    rt.pump_dist().expect("a distribution pump");
+    let live = rt.node_creation();
+    assert_eq!(
+        rt.dist_client().expect("a node has a client").creation(),
+        Some(live),
+        "the pump syncs the outbound half onto the node's live creation — whether the \
+         reissue came from the test seam or from a live `epmd`'s `ALIVE2` answer"
+    );
+}

@@ -50,8 +50,13 @@
 //!   the first through `erts_port_exit` and the second through the very same signal send as a
 //!   pid (a reference matches no process), and neither can fail. A reference is *not* a
 //!   process, so nothing is signalled;
-//! * a **pid on another node** answers `true` without a delivery (the signal is contract
-//!   A.5's, and an unconnected node is `ERTS_DSIG_PREP_NOT_CONNECTED`);
+//! * a **pid on another node** is contract A.5's: the signal is routed as a `DOP_EXIT2`
+//!   control signal through
+//!   [`ProcessTable::send_exit_term`](beam_process::ProcessTable::send_exit_term), and the
+//!   answer is still `true`. With **no** distribution seam installed (a runtime that is not a
+//!   node) the table is record-only and the signal is simply dropped, again answering `true`;
+//!   with one installed but **no established link** to the peer's node the router's typed
+//!   `no_link_error` propagates instead of a fabricated `true` (see [`Self::exit_remote`]);
 //! * **everything else** — an atom (registered or not), an integer, a float, a tuple, a
 //!   binary — is `badarg`. The C has no atom/name case at all: `exit(RegisteredName, Reason)`
 //!   is `badarg` even when the name is registered (verified against OTP 29/erts-17.1).
@@ -90,8 +95,10 @@ impl RuntimeContext<'_> {
     ///
     /// `Target` is a pid (local or remote), a port or a reference; every other term — an
     /// atom included, registered or not — is the oracle's `badarg`. A signal that has nowhere
-    /// to go (a port, a reference, an unknown pid, a pid on another node) is not an error:
-    /// the answer is `true`.
+    /// to go (a port, a reference, an unknown local pid) is not an error: the answer is
+    /// `true`. A **remote** pid's signal leaves the node
+    /// ([`Self::exit_remote`]); a transport failure on the way out is the typed error, never a
+    /// swallowed `true`.
     pub(in crate::native) fn exit_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let target = *args.first().ok_or(BeamError::BadArg)?;
         let reason = *args.get(1).ok_or(BeamError::BadArg)?;
@@ -133,10 +140,7 @@ impl RuntimeContext<'_> {
     fn exit_target(&mut self, target: Eterm, reason: Eterm) -> Result<Eterm> {
         match PidTarget::from_eterm(target) {
             Ok(PidTarget::Local(pid)) => return self.exit_local(pid, reason),
-            // A pid on another node: the signal belongs to contract A.5's live
-            // distribution link, which this runtime does not have. Nothing local is
-            // affected either way, and the oracle answers `true`.
-            Ok(PidTarget::Remote(_remote)) => return self.atom("true"),
+            Ok(PidTarget::Remote(_)) => return self.exit_remote(target, reason),
             Err(_) => {}
         }
         // A port or a reference: the signal has nowhere to go (a reference matches no
@@ -161,6 +165,41 @@ impl RuntimeContext<'_> {
         if self.process_table_mut().contains(target) {
             self.process_table_mut().send_exit(caller, target, reason)?;
         }
+        self.atom("true")
+    }
+
+    /// `exit(Target, Reason)` for a **remote** pid target: the A.5 `DOP_EXIT2` control signal.
+    ///
+    /// `target` is an external pid, so the signal has to leave the node. `beam_process` owns
+    /// that routing: [`ProcessTable::send_exit_term`](beam_process::ProcessTable::send_exit_term)
+    /// maps an external pid onto
+    /// [`DistSignal::Exit2`](beam_process::remote::DistSignal::Exit2) (`{DOP_EXIT2, From, To,
+    /// Reason}` — a plain exit signal, *not* the link exit `DOP_EXIT`), which the installed
+    /// [`DistSignalRouter`](beam_process::remote::DistSignalRouter) serialises onto the
+    /// established link. That is the C's own arm: `is_external_pid(id)` →
+    /// `erts_dsig_send_exit2(&ctx, c_p->common.id, id, reason, prio)` → `true`
+    /// (`bif.c:1804-1838`). The BIF's answer stays the oracle's `true`.
+    ///
+    /// **No link is dialled here.** `DistClientInner::queue_signal` answers a typed
+    /// `no_link_error` when no link names the peer's node, and that error propagates as-is:
+    /// establishing a connection can block, and an exit signal must never wait.
+    /// `Runtime::dist_ensure_link` (the `erlang:send/2` path) is where a dial belongs.
+    ///
+    /// # Errors
+    ///
+    /// The router's transport failure — no established link to the peer's node, an I/O error —
+    /// and nothing else. It is never folded into the `true` the oracle answers on its own
+    /// `ERTS_DSIG_PREP_NOT_CONNECTED` path: swallowing it would make a remote `exit/2` look
+    /// delivered when nothing was sent. The precedent is `erlang:monitor/2`'s remote arm
+    /// ([`Self::monitor_process`], `src/native/process/monitor.rs`), which propagates
+    /// `monitor_term_with_options`'s router error the same way.
+    fn exit_remote(&mut self, target: Eterm, reason: Eterm) -> Result<Eterm> {
+        let caller = self.pid();
+        // The same `from`/`reason` the local arm hands to `send_exit`, through the one
+        // `beam_process` entry point that takes an arbitrary pid term (and so re-uses the
+        // classification this arm already made).
+        self.process_table_mut()
+            .send_exit_term(caller, target, reason)?;
         self.atom("true")
     }
 
@@ -222,10 +261,14 @@ mod tests {
     //! pinned here (the end-to-end flows live in `tests/exit.rs`).
 
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use beam_bifs::NullSink;
+    use beam_process::remote::{DistSignal, DistSignalRouter};
     use beam_term::{make_small, NIL};
 
-    use crate::native::test_support::{atom, call, runtime};
+    use crate::native::test_support::{atom, call, remote_pid, runtime};
 
     /// A tuple built on the process heap by the runtime's own term constructors.
     fn make_tuple(runtime: &mut crate::Runtime, elements: &[Eterm]) -> Eterm {
@@ -255,6 +298,116 @@ mod tests {
             ),
             other => panic!("expected an exit-class raise, got {other:?}"),
         }
+    }
+
+    /// A [`DistSignalRouter`] that records every routed signal, or fails with `fail`'s text.
+    struct Recorder {
+        log: Rc<RefCell<Vec<DistSignal>>>,
+        fail: Option<&'static str>,
+    }
+
+    impl DistSignalRouter for Recorder {
+        fn route(&mut self, signal: DistSignal) -> beam_common::Result<()> {
+            match self.fail {
+                Some(text) => Err(crate::error::message(text)),
+                None => {
+                    self.log.borrow_mut().push(signal);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Installs a [`Recorder`] as the runtime's distribution seam, returning its log.
+    ///
+    /// `fail` makes every route answer that typed error instead — the shape
+    /// `DistClientInner::queue_signal`'s `no_link_error` takes.
+    fn install_router(
+        runtime: &mut crate::Runtime,
+        fail: Option<&'static str>,
+    ) -> Rc<RefCell<Vec<DistSignal>>> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        context
+            .process_table_mut()
+            .set_dist_router(Box::new(Recorder {
+                log: Rc::clone(&log),
+                fail,
+            }));
+        log
+    }
+
+    /// **A remote pid's `exit/2` really sends the A.5 `DOP_EXIT2` signal.**
+    ///
+    /// The signal is `beam_process`'s `DistSignal::Exit2` — the *explicit* exit opcode, not the
+    /// link exit `DOP_EXIT` — carrying the caller as `from`, the remote pid as `to` and the
+    /// BIF's own reason; the answer stays the oracle's `true` (the C's `is_external_pid` arm,
+    /// `bif.c:1804-1838`). A runtime with **no** seam installed is record-only and answers
+    /// `true` as well, which is the non-distributed shape that must not regress.
+    #[test]
+    fn a_remote_exit_routes_a_dop_exit2_signal_and_answers_true() {
+        let mut runtime = runtime();
+        let caller = runtime.self_pid();
+        let bye = atom(&mut runtime, "bye");
+        // The term's words live on `_remote_heap`, so the heap must outlive every use below.
+        let (_remote_heap, remote) = remote_pid(&mut runtime, "elsewhere@host");
+        let target = beam_process::RemotePid::from_eterm(remote).expect("an external pid");
+
+        // No seam (a runtime that is not a distributed node): the table is record-only.
+        assert!(!runtime.processes().has_dist_router(), "no seam by default");
+        let answer = call(&mut runtime, "erlang", "exit", &[remote, bye])
+            .expect("a remote exit with nowhere to route still answers true");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+
+        // With the seam installed the signal is routed, and only then.
+        let log = install_router(&mut runtime, None);
+        let answer = call(&mut runtime, "erlang", "exit", &[remote, bye]).expect("exit/2");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("true"),
+            "the answer is `true`"
+        );
+        assert_eq!(
+            log.borrow().as_slice(),
+            &[DistSignal::Exit2 {
+                from: caller,
+                to: target,
+                reason: bye,
+            }],
+            "erlang:exit/2 towards a remote pid routes DOP_EXIT2, not the link exit DOP_EXIT"
+        );
+
+        // `exit/3` shares the arm (the option list does not change the signal).
+        let priority = atom(&mut runtime, "priority");
+        let options = make_list(&mut runtime, &[priority]);
+        let answer = call(&mut runtime, "erlang", "exit", &[remote, bye, options]).expect("exit/3");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("true"),
+            "exit/3 answers `true` too"
+        );
+        assert_eq!(log.borrow().len(), 2, "exit/3 routed its own second signal");
+    }
+
+    /// **A router failure out of a remote `exit/2` is the typed error, never a `true`.**
+    ///
+    /// The transport is the only thing that can fail here, and a swallowed failure would make
+    /// an undelivered exit look delivered. The typed error is exactly the one
+    /// `DistClientInner::queue_signal` answers when no link names the peer's node — this BIF
+    /// deliberately does **not** dial (`Runtime::dist_ensure_link` is the send path's job).
+    #[test]
+    fn a_remote_exit_with_no_link_propagates_the_router_error() {
+        const NO_LINK: &str = "distribution: no established connection to node elsewhere@host";
+        let mut runtime = runtime();
+        let bye = atom(&mut runtime, "bye");
+        let (_remote_heap, remote) = remote_pid(&mut runtime, "elsewhere@host");
+        let log = install_router(&mut runtime, Some(NO_LINK));
+
+        let (class, name) = raise_of(call(&mut runtime, "erlang", "exit", &[remote, bye]));
+        assert_eq!(class, ExceptionClass::Error, "a transport failure is an error");
+        assert_eq!(name.as_deref(), Some(NO_LINK), "the router's own reason survives");
+        assert!(log.borrow().is_empty(), "nothing was recorded for a failed route");
     }
 
     #[test]

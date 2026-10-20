@@ -53,7 +53,7 @@ lookup + the full request set), a blocking `Connection` API, and a **non-blockin
 loopback to the differential harness as eleven byte-comparable report kinds (`ping`/`nodes`/`term` plus
 `nodeid`/`handshake`/`badcookie`/`frag`/`alias`/`monitor`/`regsend_missing`/`utf8`).
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
-beam_dist` is green (**412 tests, 0 failed**) and the workspace builds warning-free; the crate is
+beam_dist` is green (**444 tests, 0 failed**) and the workspace builds warning-free; the crate is
 safe Rust (`#![deny(unsafe_code)]`).
 
 **All 30 `Dop` opcodes round-trip exhaustively.** `tests/dop_roundtrip.rs` drives every variant through
@@ -294,7 +294,21 @@ distribution header carries it).
   the header ref order.
 - `decode_control(body, &mut Heap, &mut AtomTable, Option<&AtomCache>) -> Result<ControlMessage>`.
   Unknown opcode / wrong arity / malformed tuple ⇒ `BeamError::BadArg`. Term encoding is **only**
-  `beam_codec`.
+  `beam_codec`. It is `decode_control_with_identity(…, None)` — the identity-less form, in which
+  every pid/port/reference keeps its faithful **external** form.
+- `decode_control_with_identity(body, &mut Heap, &mut AtomTable, Option<&AtomCache>,
+  Option<LocalIdentity>) -> Result<ControlMessage>` — the identity-aware decode funnel: with an
+  identity installed, an external pid/port/reference whose node **and** creation are this node's
+  decodes to the **internal** term (the C's `dec_is_this_node`, `external.c:3123-3129`), in the
+  control arguments **and** in the trailing message term (one `Decoder` covers both). It is the only
+  place the crate installs `beam_codec::Decoder::with_local_node`, so the demotion — and the C's
+  identity-gated D2/D6 bounds it engages — is installed once.
+- `struct LocalIdentity { node: Atom, creation: u32 }` (`Clone, Copy, Debug, PartialEq, Eq`) +
+  `LocalIdentity::new(node, creation)` and `LocalIdentity::intern(&mut AtomTable, sysname, creation)
+  -> Result<LocalIdentity>` (non-UTF-8 ⇒ `BadArg`, like `LinkIdentity::intern`). `node` is this
+  node's **full wire name** (`name@host`, `ErlNode.sysname`, `erl_node_tables.h:220`) interned in the
+  **same** `AtomTable` the body is decoded against; a foreign-table atom is inert (no demotion, never
+  a wrong match).
 
 ### `src/epmd.rs` — `epmd` port-mapper + admin client (safe)
 2-byte-BE-framed **requests** (`ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES_REQ`,
@@ -357,6 +371,13 @@ Decisions).
   `std::io::ErrorKind::UnexpectedEof`, while a truncated/malformed frame stays `BadArg` (the
   handshake reads keep the plain `read_packet`/`BadArg` behaviour). The `TcpTransport` `Read` impl
   overrides `read_exact_or_eof` to make that distinction over a real socket.
+- The **local-identity seam** (defaulted, `None`): `set_local_identity(LocalIdentity)` /
+  `local_identity() -> Option<LocalIdentity>` / `clear_local_identity()`. It is stored next to the
+  receive atom cache (initialised `None` in the single construction funnel, `from_handshake`) and
+  handed to `decode_control_with_identity` by `recv`, so `recv_delivery`, `recv_delivery_checked` and
+  `dispatch_inbound*` inherit it without a signature change. With it installed, an inbound
+  external pid/port/reference of this node decodes to the **internal** term; without it (the default)
+  every identifier keeps its faithful external form, byte-for-byte as before the seam existed.
 
 ### `src/delivery.rs` — inbound `DOP_*` delivery classification + the `InboundSink` seam (safe)
 Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it to the local recipient.
@@ -382,6 +403,15 @@ Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it 
   &LinkIdentity) -> Result<Delivery>` — `classify` **plus** the C's per-opcode `invalid_message`
   shape/`dep` anti-spoof checks (`dist.c`), so a forged or malformed message is `Err(BeamError::BadArg)`
   instead of mis-delivered. Opt-in: `classify` is unchanged.
+- The validator's **reference** checks follow the C's *per-opcode* predicate, never one blanket rule:
+  the generic guard (`delivery.rs`'s `is_ref`) spans **internal and external** references — the C's
+  `is_not_ref` — for `AliasSend.to` (`dist.c:2584`), `AltactSigSend.to` when `ALIAS` is set
+  (`dist.c:2663`), `Monitor.reference` (`dist.c:2361`), `Demonitor.reference` (`dist.c:2427`) and
+  `MonitorExit`/`PayloadMonitorExit.reference` (`dist.c:2723`); `SpawnReply.reference` accepts an
+  **internal** ref *or* an external ref of this node (`dist.c:3079-3086`, an old incarnation); and
+  `SpawnRequest.reference` requires an **external** ref (`is_not_external_ref`,
+  `dist.c:2933`). The internal arm is reachable only with a `LocalIdentity` installed, since no wire
+  image can carry an internal reference (see Design Decisions).
 - The two entry points each have an unchecked and a checked form:
   `ConnectionDriver::next_delivery`/`dispatch_inbound` and `Connection::recv_delivery`/
   `dispatch_inbound` (the semantic view) vs `ConnectionDriver::next_delivery_checked`/
@@ -403,7 +433,13 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   nothing more can be done.
 - `take_output() -> Vec<u8>` / `has_output()` — bytes the runtime must write to the socket.
 - `next_message(&mut Heap, &mut AtomTable) -> Result<Option<ControlMessage>>` — decodes the next queued
-  payload (applying the receive atom cache).
+  payload (applying the receive atom cache), through the same identity-aware decode funnel the
+  blocking `Connection::recv` uses.
+- `set_local_identity(LocalIdentity)` / `local_identity() -> Option<LocalIdentity>` /
+  `clear_local_identity()` — the per-driver half of the local-identity seam (defaulted `None` in the
+  shared constructor). `next_message` and every derive-off (`next_delivery`, `next_delivery_checked`,
+  `dispatch_inbound*`) honour it, so an inbound external pid/port/reference of this node decodes to the
+  **internal** term; without it every identifier keeps its faithful external form.
 - `send_control(dop, terms, atoms)` / `send_message(from, to, msg, atoms)` / `send_tick()` — encode +
   envelope into the output buffer.
 - `state()` / `negotiated()` / `client_flags()` / `server_flags()` / `peer_name()` / `peer_creation()` /
@@ -502,7 +538,19 @@ than two).
     cross-checked against the system `erl` oracle (`term_to_binary/1`, `VERSION_MAGIC` stripped).
   - `tests/delivery.rs` — `Delivery::classify` over every opcode (arg-order pins; the
     `SpawnRequest`/`SpawnReply`/`AltactSigSend` flag decoding incl. the out-of-range `BadArg` negative;
-    `DOP_UNLINK` ⇒ `Other`).
+    `DOP_UNLINK` ⇒ `Other`), plus the **validator's reference guards built from heap terms** (the only
+    way to hand it an internal reference): `DOP_SPAWN_REPLY` accepts an internal ref **or** an external
+    ref of this node and rejects a third node's; the widened `is_ref` arms (`DOP_ALIAS_SEND.to`,
+    `DOP_ALTACT_SIG_SEND.to` with `ALIAS`, `DOP_MONITOR_P`/`DOP_DEMONITOR_P.reference` and both
+    `DOP_[PAYLOAD_]MONITOR_P_EXIT.reference` forms) accept an internal reference *and* the classified
+    `Delivery` carries that very term; and the strict arms stay strict (`ALIAS | NAME`, a non-reference
+    `to`/`ref`, `DOP_SPAWN_REQUEST`'s external-only ref).
+  - `tests/monitor_exit_vectors.rs` — **hand-written golden vectors** for the monitor control messages
+    (independent of the encoder, so a codec change cannot silently redefine them): the plain
+    `DOP_MONITOR_P_EXIT` 5-tuple with `watched` **first** and `watcher` second (opcode 21), the
+    `DOP_PAYLOAD_MONITOR_P_EXIT` 4-tuple (opcode 28) plus its trailing reason, the side-by-side
+    reverse-order `DOP_MONITOR_P` (the two are deliberately mirrored, matching `dist.c:2341` vs
+    `dist.c:2700`), the arity rules as `BadArg`, and the `classify_validated` view of each vector.
   - `tests/validated_delivery.rs` — the **checked** per-link receive/dispatch entry points
     (`Connection::recv_delivery_checked`/`dispatch_inbound_checked`,
     `ConnectionDriver::next_delivery_checked`/`dispatch_inbound_checked`) over a real wire, with
@@ -510,6 +558,24 @@ than two).
     `DOP_MONITOR_P` with a real peer-pid watcher validates and a small-int watcher ⇒ `Err`; and the
     unchanged unchecked `recv_delivery`/`next_delivery` still accepts the same bytes (the driver is fed
     the **byte-identical** frame twice, so the accept/reject pair differs in no byte).
+  - `tests/local_identity.rs` — the inbound **decode-side local-identity** seam hermetically (19 tests,
+    no sockets needed for the decode legs): `{DOP_LINK, <this-node pid>, <this-node pid>}` decodes to
+    **internal** pids on both `PID_EXT` and `NEW_PID_EXT` (wire order `number` then `serial`), a foreign
+    node atom or a foreign creation stays external, the installed identity engages the C's local
+    pid/port bounds, every send-family payload (`DOP_SEND`/`_SENDER`/`DOP_REG_SEND`/`DOP_ALIAS_SEND`)
+    demotes its pid, a this-node reference demotes (`beam_codec::internal_ref_id(..).is_ok()`) while a
+    foreign one or an id outside the 60-bit internal slot stays external, this-node ports demote on all
+    three wire tags, `Delivery::classify` carries the demoted `AliasSend` reference, and the
+    **identity-less legs re-assert every form stays external** (the additivity proof for `beam_rt`).
+    The seam's **acceptance criterion** is pinned two-step, decode → `classify` →
+    `classify_validated` with a `LinkIdentity::intern`'d link over the same atom table: an inbound
+    `DOP_ALIAS_SEND` addressed to a wire reference of this node and an inbound `DOP_MONITOR_P_EXIT`
+    whose `ref` is this node's own both decode **internal** and then pass the validated view
+    (`AliasSend.to` / `MonitorExit.reference` carried as that very internal term) — with the
+    identity-less counterparts left external and still accepted through the external arm.
+    Two end-to-end legs drive a real `Connection` (`TcpListener`/`TcpTransport` pair) and a byte-fed
+    `ConnectionDriver` through `set_local_identity` → `recv`/`next_message`, and back to external after
+    `clear_local_identity`.
   - `tests/fragment.rs` — byte-exact `'E'`/`'F'` prefixes, split/reassemble round-trips, negatives.
   - `tests/atom_cache.rs` — segment addressing, `New`/`Cached` classification, header apply, ref
     resolution through `beam_codec`, and `encode_control_cached` driven by a real `OutboundAtomCache`
@@ -702,6 +768,39 @@ than two).
   listen on the well-known address.
 - **`NamesResp::encode` is lossy** (per-node ports are not retained) — decoding (the client direction)
   is exact.
+- **The local node identity is an *installed*, defaulted value — never a change to the term codec or to
+  a decode signature.** The C decoder is not purely wire-driven: `dec_is_this_node`
+  (`external.c:3123-3129`) asks *"is this identifier's node the node I am running on?"* and, if so,
+  `dec_pid`/`dec_port`/`ref_ext_common` build the **internal** term instead of the external thing. That
+  rule needs node identity, which the value layer does not own, so it is supplied per link:
+  `LocalIdentity { node, creation }` carried to `beam_codec::Decoder::with_local_node` by
+  `decode_control_with_identity` — one funnel, with `decode_control` = the same call with `None`. The
+  reasons for this shape:
+  * **Additivity is the contract with `beam_rt`.** With nothing installed, every decoded
+    pid/port/reference keeps its faithful external form and every existing byte of behaviour is
+    unchanged, so a runtime that has not adopted the seam observes exactly what it did before (pinned by
+    `tests/local_identity.rs`'s identity-less legs). That is why the identity lives on `Connection` /
+    `ConnectionDriver` as an `Option` field rather than becoming a required `recv`/`next_message`
+    parameter — no signature changes, and `recv_delivery`/`dispatch_inbound*` inherit it for free.
+  * **The atom must come from the decode-time `AtomTable`.** An atom is a table-local index; the
+    comparison is a raw word `==` against atoms interned *by the same decode*. A foreign-table atom is
+    therefore **inert** (no demotion, never a wrong match), which is why `LocalIdentity::intern` takes
+    the table and the full wire name (`name@host`, `ErlNode.sysname`) rather than a string compared at
+    decode time.
+  * **The demotion brings the C's identity-gated bounds with it** — a local pid number/serial or port id
+    past the internal immediate's range, and a local `NEWER_REFERENCE_EXT` first number at or past
+    `MAX_REFERENCE`, are `BadArg` (`external.c:3175-3179`, `:4718-4721`, `:4804-4813`); a local
+    reference whose packed id does not fit the 60-bit slot keeps the faithful external form. All of that
+    is `beam_codec`'s, engaged by the one `with_local_node` call.
+  * **No new error variant and no crate-local error type.** Everything stays `BeamError::BadArg`
+    (wire/identity violations) or a faithful external term; the seam adds no failure mode of its own.
+  * **Identity is decode-side only.** `Delivery::classify_validated`'s per-link checks compare
+    **external** node atoms (the C's `dep`) and are deliberately untouched: installing an identity
+    changes what a decoded term *is*, never which `dep` comparison runs. The one place the two interact
+    is the reference *form*: the validator's `is_ref` spans internal and external references like the
+    C's `is_not_ref`, so the internal term the demotion produces is accepted by the same guard that
+    accepts a peer's external reference — and with no identity installed the arm is inert (no wire image
+    can carry an internal reference).
 
 ## Known Issues / Remaining Gaps
 - **The crate classifies inbound deliveries but performs no side effects.** `Connection::recv` /
@@ -848,6 +947,15 @@ than two).
   the differential harness drives as an external command; not part of the library API
 - `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
   → seams
+- `tests/local_identity.rs` → the inbound **decode-side local-identity** seam
+  (`LocalIdentity`/`decode_control_with_identity` + `Connection`/`ConnectionDriver::set_local_identity`):
+  this-node pids/ports/refs demote to internal terms on every wire tag and in every send-family payload,
+  foreign node/creation/unrepresentable-id forms stay external, the C's local bounds engage, the demoted
+  reference then passes `classify` **and** `classify_validated` (`DOP_ALIAS_SEND`/`DOP_MONITOR_P_EXIT`),
+  and the identity-less legs prove additivity — no `erl`/`epmd`
+- `tests/monitor_exit_vectors.rs` → hand-written golden vectors for the monitor control messages
+  (`DOP_MONITOR_P_EXIT`'s `watched`-first 5-tuple, `DOP_PAYLOAD_MONITOR_P_EXIT` + its trailing reason,
+  the reverse-order `DOP_MONITOR_P`, the arity rules, and each vector's `classify_validated` view)
 - `tests/validated_delivery.rs` → the **checked** per-link receive/dispatch layer over a real wire
   (blocking `Connection` loopback + a `ConnectionDriver` byte shuttle): a peer `DOP_LINK` validates, a
   third-node `from` is `Err(BadArg)`, a `DOP_MONITOR_P` with a small-int watcher is `Err`, and the

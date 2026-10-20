@@ -27,7 +27,10 @@
 //! [`crate::transport::Read`] and [`crate::transport::Write`] are deliberately
 //! **not** glob-exported — they would shadow `std::io::{Read, Write}`.
 
-pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
+pub use crate::control::{
+    decode_control, decode_control_with_identity, encode_control, encode_control_cached,
+    ControlMessage, LocalIdentity,
+};
 pub use crate::delivery::{
     Delivery, DeliveryOutcome, Dispatched, InboundSink, LinkIdentity, UnsupportedSink,
 };

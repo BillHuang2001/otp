@@ -552,6 +552,15 @@ impl Runtime {
     /// a **client** that holds any link, handshaking or established
     /// ([`DistClient::has_links`](crate::dist_client::DistClient::has_links)).
     ///
+    /// The **outbound** half is also asked what it concretely owes
+    /// ([`DistClient::has_pending_outbound`](crate::dist_client::DistClient::has_pending_outbound)):
+    /// a routed signal sitting in the client's outbound queue and bytes a link's driver has not
+    /// written yet. A queued signal is work even though `queue_signal` gated it on
+    /// `may_reach_node`, because the link can be retired **between** queueing and the flush — the
+    /// item is then dropped at the flush (its typed reason recorded in
+    /// [`DistClient::last_error`](crate::dist_client::DistClient::last_error)), so the flush has to
+    /// run at least once before a stall may be declared.
+    ///
     /// The consequence is that a `run`-route process parked on a bare `receive` with a live
     /// link keeps pumping — it is resumed the moment the peer's message survives the link —
     /// and only a link that is genuinely gone lets the pass declare the honest
@@ -599,15 +608,17 @@ impl Runtime {
             return false;
         }
         // Distribution (A.5): a live link is work the pass must keep pumping, because an
-        // inbound `DOP_*` can wake a parked process. Both tests are `Option`/link checks, so
-        // a runtime that is not a node — and a node holding no link — is unchanged.
+        // inbound `DOP_*` can wake a parked process — and so is a queued signal or a driver's
+        // unwritten output, which the very next flush owes the wire. Both tests are
+        // `Option`/link checks, so a runtime that is not a node — and a node holding no link
+        // and nothing queued — is unchanged.
         if self.dist.as_ref().is_some_and(|node| !node.is_idle()) {
             return false;
         }
         !self
             .dist_client
             .as_ref()
-            .is_some_and(|client| client.has_links())
+            .is_some_and(|client| client.has_links() || client.has_pending_outbound())
     }
 
     /// Records that a **heap-fragment** delivery woke `pid` (see
@@ -1139,18 +1150,46 @@ impl Runtime {
     /// common case) or a node with nothing to do, so a pass never waits here — the node's
     /// sockets are non-blocking and only a peer that has already sent bytes is read.
     ///
+    /// # The creation sync point
+    ///
+    /// This is the **one** place the node's creation can change: `pump` runs
+    /// [`DistNode::register_once`], whose `ALIVE2` answer replaces the pre-registration
+    /// [`DEFAULT_CREATION`](crate::dist::DEFAULT_CREATION) with the incarnation `epmd`
+    /// assigned. The outbound half keeps its **own** copy of the creation
+    /// ([`DistClientInner::creation`](crate::dist_client)) for the pids/ports/references it
+    /// externalises, so it is re-installed here ([`Runtime::sync_dist_creation`]) —
+    /// **after** the pump, and unconditionally: a pump that registers and *then* fails an
+    /// `accept` must still leave the client on the new creation, or this node would advertise
+    /// one incarnation in its handshake and stamp another on its payloads.
+    ///
     /// # Errors
     ///
     /// Only the listener's own `accept` failures. A *link*'s failure is retired and
     /// recorded by the node itself ([`crate::dist::DistNode::last_link_error`]), never
     /// raised: a hostile or broken peer must not be able to fail a scheduler pass.
     pub(crate) fn pump_dist(&mut self) -> Result<usize> {
-        match self.dist.as_mut() {
+        let outcome = match self.dist.as_mut() {
             Some(node) => node.pump(),
-            None => Ok(0),
-        }
+            None => return Ok(0),
+        };
+        self.sync_dist_creation();
+        outcome
     }
 
+    /// Keeps the outbound distribution half's stored creation equal to the node's live one
+    /// ([`Runtime::node_creation`]) — the value the `'N'` handshake advertises and the value
+    /// every externalised payload this runtime sends must carry.
+    ///
+    /// Called from [`Runtime::pump_dist`] (the only place the creation can change:
+    /// [`crate::dist::DistNode::register_once`]) and cheap enough to call there
+    /// unconditionally: one field read, one compare, and on a settled node **no** write at
+    /// all ([`DistClient::set_creation`] returns immediately when the value already matches).
+    pub(crate) fn sync_dist_creation(&mut self) {
+        let creation = self.node_creation();
+        if let Some(client) = self.dist_client.as_ref() {
+            client.set_creation(creation);
+        }
+    }
     /// Gives every **established** accepted distribution link its peer's node atom term —
     /// the binding that makes the accepted half of the one node→link table
     /// ([`crate::dist::DistLinks`]) an **exact** node match.
@@ -1250,6 +1289,18 @@ impl Runtime {
         // The sink is scoped so the fragment replay below can take `&mut self`.
         let (dispatched, fragment_pids) = {
             let mut sink = LocalDeliverySink::new(&mut self.processes, atom, creation);
+            // The **decode-side identity** (`beam_dist::control::LocalIdentity`): a
+            // pid/port/reference naming this node at this creation decodes to the internal
+            // term (the C's `dec_is_this_node`, `external.c:3123-3129`). Installed on the
+            // caller's driver for exactly this drain, in the table the decode uses. Unlike
+            // the per-link *validation*, this needs nothing from the driver's own handshake
+            // names — it is this runtime's own view of who it is.
+            let identity = beam_dist::control::LocalIdentity::intern(
+                self.code_server.atoms_mut(),
+                name.as_bytes(),
+                creation,
+            )?;
+            driver.set_local_identity(identity);
             let dispatched =
                 driver.dispatch_inbound(heap, self.code_server.atoms_mut(), &mut sink)?;
             (dispatched, sink.take_fragment_deliveries())
@@ -1364,11 +1415,11 @@ impl Runtime {
     /// with the same gates and the same sink, so both directions route through exactly one
     /// implementation.
     ///
-    /// A no-op unless [`Runtime::allow_inbound_delivery`] turned the capability on (off by
-    /// default, so the differential corpus stays byte-identical) **and** this runtime has a
-    /// client — so a runtime with no node, no outbound link or the capability off pays one bool
-    /// test per pass and never allocates the decode arena. Never raises in practice: a
-    /// link-level failure retires just that link and records why.
+    /// A no-op unless inbound delivery is on (**on** by default —
+    /// [`Runtime::allow_inbound_delivery`] is the A/B lever that turns it off) **and** this
+    /// runtime has a client — so a runtime with no node, no outbound link or the capability
+    /// off pays one bool test per pass and never allocates the decode arena. Never raises in
+    /// practice: a link-level failure retires just that link and records why.
     ///
     /// # Errors
     ///

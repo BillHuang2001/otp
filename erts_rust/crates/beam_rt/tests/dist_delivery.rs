@@ -337,25 +337,23 @@ fn a_pid_on_another_node_is_no_such_process_and_never_mis_delivered() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_alias_send_to_a_wire_borne_reference_is_unsupported_not_a_wrong_delivery() {
+fn a_wire_alias_reference_is_demoted_to_an_internal_reference() {
     let mut rt = node_runtime("alias");
     let (mut client, mut server) = establish();
     let mut heap = Heap::new(HEAP_WORDS).expect("heap");
 
     // `DOP_ALIAS_SEND`'s `To` must be a **reference** (`dist.c:2577`
-    // `is_not_ref(to)` ⇒ `invalid_message`), so a well-formed wire message carries a
-    // reference thing. A wire reference is always the **external**
-    // (`NEWER_REFERENCE_EXT`) form: the control-message decoder installs no local-node
-    // identity, so the codec's local-node demotion never runs and the sink sees an
-    // external reference — never a readable local alias key.
+    // `is_not_ref(to)` ⇒ `invalid_message`). A real peer puts this node's reference on the
+    // wire in the external (`NEWER_REFERENCE_EXT`) form, and the drain installs this
+    // runtime's `beam_dist::control::LocalIdentity`, so the decode demotes it to the
+    // **internal** reference thing (the C's `dec_is_this_node`, `external.c:3123-3129`).
     //
-    // The sink therefore reports the typed **`Unsupported`** for this wire half (the
-    // recorded `beam_dist` handoff in `src/dist.rs`: the external form is not an alias
-    // key here), and emphatically *not* a delivery to whichever process the raw id
-    // happens to name. The C's silent-drop half of the rule
-    // (`erl_proc_sig_queue.c:6036-6046`: *"Not an alias … drop message"*) is pinned
-    // where it IS reachable — for a **local** reference — by the sink-level case
-    // `an_unowned_reference_is_dropped_and_a_non_ref_target_is_unsupported`.
+    // The sink no longer answers `Unsupported` for the wire half: with an internal
+    // reference it reaches the alias table, and a reference that is not a live alias is the
+    // C's silent drop (`erl_proc_sig_queue.c:6036-6046`). The *delivering* case — a live
+    // alias whose owner's mailbox really receives the message, and an `ALIAS_ONCE` alias
+    // consumed by it — is pinned at the sink level by
+    // `an_alias_send_reaches_the_owner_and_consumes_a_reply_alias`.
     let name = rt
         .dist_node()
         .expect("a configured node")
@@ -380,11 +378,17 @@ fn an_alias_send_to_a_wire_borne_reference_is_unsupported_not_a_wrong_delivery()
         .dispatch_inbound(&mut heap, &mut server)
         .expect("dispatch");
     assert_eq!(dispatched.len(), 1);
+    let Delivery::AliasSend { to, .. } = &dispatched[0].delivery else {
+        panic!("expected a DOP_ALIAS_SEND, got {:?}", dispatched[0].delivery);
+    };
+    assert!(
+        beam_process::MonitorRef::from_eterm(*to).is_ok(),
+        "the wire reference must have been demoted to the internal reference thing"
+    );
     assert_eq!(
         dispatched[0].outcome,
-        DeliveryOutcome::Unsupported,
-        "a wire reference is the external form, which is not an alias key: \
-         the honest outcome is `Unsupported`, never a delivery or a wrong drop: {:?}",
+        DeliveryOutcome::Dropped,
+        "an internal reference that is not a live alias is the C's silent drop: {:?}",
         dispatched[0].delivery
     );
     assert_eq!(only_message(&rt, rt.self_pid()), None);
@@ -1001,6 +1005,43 @@ fn foreign_pid(fixture: &Fixture, heap: &mut Heap, number: u64) -> Eterm {
     )
 }
 
+/// The wire image of a **locally minted** monitor reference `id`: an external
+/// reference (`NEWER_REFERENCE_EXT`) on `node`/`creation` whose three identifier words
+/// are the C's canonical `erts_set_ref_numbers` pack (`erl_bif_unique.h:117-131`) —
+/// the 18-bit reference number in `num[0]`, its bits 18..31 in `num[1]`, the rest in
+/// `num[2]`:
+///
+/// ```text
+/// num[0] = id & 0x3FFFF        (REF_MASK)
+/// num[1] = id & 0xFFFC_0000    (ERTS_REF1_NUM_MASK)
+/// num[2] = id >> 32
+/// ```
+///
+/// This is byte-for-byte what the production encoder writes
+/// (`src/dist_client/signals.rs::monitor_ref_term`) and the exact inverse of the
+/// sink's unpack (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159-167`). A
+/// hand-packed id with any other layout round-trips to a **different** id, so the
+/// outgoing remote monitor it names is not found — use this helper for every
+/// locally minted reference; a **peer**-minted one on a foreign node is written
+/// verbatim instead.
+fn local_monitor_ref_image(heap: &mut Heap, node: Eterm, creation: u32, id: u64) -> Eterm {
+    /// `REF_MASK`, `erl_bif_unique.h:127`
+    const REF_MASK: u32 = (1 << 18) - 1;
+    /// `ERTS_REF1_NUM_MASK__`, `erl_bif_unique.h:112-113`
+    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
+    make_external_ref(
+        heap,
+        node,
+        &[
+            (id & u64::from(REF_MASK)) as u32,
+            (id & u64::from(REF1_NUM_MASK)) as u32,
+            (id >> 32) as u32,
+        ],
+        creation,
+    )
+    .expect("materialize a local monitor reference image")
+}
+
 /// Routes `delivery` through a `LocalDeliverySink` over `table` for the node named by
 /// `node` with [`NODE_CREATION`].
 fn route(table: &mut ProcessTable, node: Atom, delivery: &Delivery) -> DeliveryOutcome {
@@ -1045,10 +1086,13 @@ fn an_internal_pid_send_target_is_routed_to_its_mailbox() {
     assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
 }
 
-/// An **external** pid whose node atom and creation are *this* node's names a local
-/// process — looked up by number **and** serial.
+/// An **external** pid naming this node is [`DeliveryOutcome::NoSuchProcess`] at the sink:
+/// the demotion of a wire pid for *this* node is the **decode's** rule (the drain installs
+/// `beam_dist`'s `LocalIdentity`), so a pid that reaches the sink still external is not this
+/// node's — pinned end to end by
+/// `an_inbound_pid_naming_this_node_decodes_to_the_internal_term`.
 #[test]
-fn an_external_pid_on_this_node_is_routed_to_its_mailbox() {
+fn an_external_pid_on_this_node_is_never_demoted_by_the_sink() {
     let mut fixture = Fixture::new();
     let node = fixture.local_node;
     let pid = fixture.pid;
@@ -1065,9 +1109,10 @@ fn an_external_pid_on_this_node_is_routed_to_its_mailbox() {
     };
     assert_eq!(
         route(&mut fixture.table, node, &delivery),
-        DeliveryOutcome::Delivered
+        DeliveryOutcome::NoSuchProcess,
+        "the sink classifies; the decode demotes"
     );
-    assert_eq!(mailbox(&fixture.table, pid), vec![(message, from)]);
+    assert!(mailbox(&fixture.table, pid).is_empty());
 }
 
 /// A pid on **another node**, or a stale incarnation of this one, is never resolved
@@ -1690,14 +1735,9 @@ fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
     let id = monitor.id();
 
     // The wire image of **our own** reference, exactly as `dist_client` packs it onto
-    // the outgoing `DOP_MONITOR_P`: `{our_node, our_creation, [0, id >> 32, id]}`.
-    let echoed = make_external_ref(
-        &mut heap,
-        make_atom(node),
-        &[0u32, (id >> 32) as u32, id as u32],
-        NODE_CREATION,
-    )
-    .expect("the echoed reference image");
+    // the outgoing `DOP_MONITOR_P`: `{our_node, our_creation, numbers}` with the C's
+    // `erts_set_ref_numbers` split of the id (`erl_bif_unique.h:117-131`).
+    let echoed = local_monitor_ref_image(&mut heap, make_atom(node), NODE_CREATION, id);
     let reason = make_small(7);
     let down = Delivery::MonitorExit {
         watched,
@@ -1733,13 +1773,12 @@ fn a_monitor_down_for_our_own_outgoing_reference_fires_or_is_dropped() {
 
     // A reference this node never minted as a monitor matches no record: the C resolves
     // the DOWN through the watcher's monitor tree and **drops** a miss.
-    let stray = make_external_ref(
+    let stray = local_monitor_ref_image(
         &mut heap,
         make_atom(node),
-        &[0u32, 0u32, id.wrapping_add(1000) as u32],
         NODE_CREATION,
-    )
-    .expect("a reference with no matching record");
+        id.wrapping_add(1000),
+    );
     let unmatched = Delivery::MonitorExit {
         watched,
         watcher: pid.to_eterm(),
@@ -1946,13 +1985,7 @@ fn every_routed_inbound_family_routes_nothing_outbound() {
         .monitor_term(pid, peer, MonitorKind::Process)
         .expect("record the outgoing remote monitor");
     let id = monitor.id();
-    let echoed = make_external_ref(
-        &mut heap,
-        make_atom(node),
-        &[0u32, (id >> 32) as u32, id as u32],
-        NODE_CREATION,
-    )
-    .expect("the echoed reference image");
+    let echoed = local_monitor_ref_image(&mut heap, make_atom(node), NODE_CREATION, id);
 
     let log = Rc::new(RefCell::new(Vec::new()));
     fixture.table.set_dist_router(Box::new(RecordingRouter {

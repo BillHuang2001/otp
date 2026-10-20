@@ -89,7 +89,7 @@ use beam_codec::{
 };
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{is_small, make_small, signed_value};
-use beam_term::{AtomTable, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::flags::{Dop, DOP_ALTACT_SIG_FLG_TOKEN};
 
@@ -254,6 +254,94 @@ pub fn encode_control_cached(
     Ok(body)
 }
 
+/// The **local node identity** the inbound decoder compares an incoming
+/// identifier's node/creation against — the C's `erts_this_node`
+/// (`sysname` + `creation`).
+///
+/// `sysname` here is the node's **full wire name** (`name@host`), i.e.
+/// `ErlNode.sysname` — *"name@host atom for efficiency"* (`erl_node_tables.h:220`) —
+/// not a bare short name: that is the atom a pid/port/reference node field carries
+/// on the wire, and the atom the C compares against in `dec_is_this_node`.
+///
+/// A decoded external pid/port/reference whose node is *this* node must become the
+/// **internal** term, so `Pid =:= self()` holds for a pid a peer reflects back and an
+/// inbound alias reference (`DOP_ALIAS_SEND`'s `To`) becomes a reference the runtime
+/// can resolve:
+///
+/// ```c
+/// /* erts/emulator/beam/external.c:3123-3129 */
+/// static ERTS_INLINE int dec_is_this_node(Eterm sysname, Uint32 creation)
+/// {
+///     return (sysname == INTERNAL_LOCAL_SYSNAME
+///             || (sysname == erts_this_node->sysname &&
+///                 creation == erts_this_node->creation));
+/// }
+/// ```
+///
+/// (`dec_pid` `external.c:3175-3182`, `dec_port` `:4718-4721`, `ref_ext_common`
+/// `:4821-4862`, and `dist.c:2701-2740` for the alias/payload families.) The
+/// demotion itself — and the C's identity-gated bounds it engages — lives in
+/// [`beam_codec`]'s [`Decoder::with_local_node`]; this type is the value the crate's
+/// decode entry points hand to it.
+///
+/// ## `node` must come from the table the message is decoded against
+///
+/// An atom is a **table-local index**, not a name: [`LocalIdentity::node`] is the
+/// node-name atom as interned in the same [`AtomTable`] the control message is
+/// decoded with. A mismatch is **inert** — no wire identifier ever compares equal,
+/// so no demotion happens and nothing is decoded *wrongly* (every identifier keeps
+/// the faithful external form). It never produces a false match either: the
+/// comparison is a raw word `==` against atoms interned by the same decode, so a
+/// foreign table's index can only coincide by accident, and such a coincidence
+/// requires that very atom to have been interned into this table at that index —
+/// which is the same atom.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LocalIdentity {
+    /// This node's node-name atom (`name@host`, `erts_this_node->sysname`) as an
+    /// atom of the decode-time [`AtomTable`].
+    pub node: Atom,
+    /// This node's `creation` (`erts_this_node->creation`). Both must match for a
+    /// wire identifier to be treated as local.
+    pub creation: u32,
+}
+
+impl LocalIdentity {
+    /// Builds the identity from an already-interned `sysname` atom.
+    ///
+    /// `node` **must** be an atom of the [`AtomTable`] the control message will be
+    /// decoded against (see the type docs).
+    pub fn new(node: Atom, creation: u32) -> LocalIdentity {
+        LocalIdentity { node, creation }
+    }
+
+    /// Interns `sysname` into `atoms` and builds the identity.
+    ///
+    /// `sysname` is this node's full wire name (`name@host`, `ErlNode.sysname`) —
+    /// the name the distribution protocol puts in a pid/port/reference node field.
+    /// `atoms` **must** be the table the control message is decoded against: an
+    /// atom compares by its table-local value, so an identity built against a
+    /// different table could never match (and would silently demote nothing).
+    ///
+    /// The distribution protocol carries node names as UTF-8: a name that is not
+    /// valid UTF-8 is [`BeamError::BadArg`], never a lossy substitution (the same
+    /// rule [`LinkIdentity::intern`](crate::delivery::LinkIdentity::intern) applies).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] if `sysname` is not valid UTF-8.
+    pub fn intern(
+        atoms: &mut AtomTable,
+        sysname: &[u8],
+        creation: u32,
+    ) -> Result<LocalIdentity> {
+        let name = core::str::from_utf8(sysname).map_err(|_| BeamError::BadArg)?;
+        Ok(LocalIdentity {
+            node: atoms.intern(name),
+            creation,
+        })
+    }
+}
+
 /// Decodes a control message from its on-wire tuple form: the ETF tuple
 /// `{DOP_*, …}` plus, for an opcode that [`carries_message`], the trailing term.
 ///
@@ -270,11 +358,51 @@ pub fn encode_control_cached(
 /// accepts any count `>=` it. A malformed message (wrong tuple tag, short,
 /// zero arity, non-small opcode, unknown opcode, wrong arity, trailing bytes) is
 /// [`BeamError::BadArg`]; the decoder never panics.
+///
+/// This is [`decode_control_with_identity`] with **no** local node identity
+/// installed: every pid/port/reference decodes to its faithful external form,
+/// exactly as before that seam existed. A caller that owns node identity (the
+/// runtime, [`Connection`](crate::Connection),
+/// [`ConnectionDriver`](crate::ConnectionDriver)) uses the identity-aware form.
 pub fn decode_control(
     body: &[u8],
     heap: &mut Heap,
     atoms: &mut AtomTable,
     cache: Option<&AtomCache>,
+) -> Result<ControlMessage> {
+    decode_control_with_identity(body, heap, atoms, cache, None)
+}
+
+/// Decodes a control message, treating identifiers of **this** node as local: every
+/// external pid/port/reference in the control arguments **and** in the trailing
+/// message whose node and creation match `identity` decodes to the **internal**
+/// term (`dec_is_this_node`, `external.c:3123-3129`; the demotion itself is
+/// `dec_pid` `:3175-3182`, `dec_port` `:4721` and `ref_ext_common` `:4821-4862`).
+///
+/// Everything else is exactly [`decode_control`]: the same arity rules, the same
+/// flattened [`ControlMessage`] shape, the same `BadArg` on malformed input. The
+/// install is `identity`-gated, so `None` is byte-for-byte the identity-less
+/// behaviour (the additivity guarantee the runtime relies on).
+///
+/// Two consequences come with the demotion, both the C's own:
+///
+/// * the identity engages `beam_codec`'s **identity-gated bounds** — a *local* pid
+///   whose number or serial, or a *local* port whose id, exceeds the internal
+///   immediate's range is [`BeamError::BadArg`] (`external.c:3175-3179`,
+///   `:4718-4721`), and a *local* `NEWER_REFERENCE_EXT` with a first number at or
+///   past `MAX_REFERENCE` is [`BeamError::BadArg`] (`external.c:4804-4813`);
+/// * a local **reference** whose packed id does not fit the internal form's 60-bit
+///   slot keeps the faithful **external** form (`beam_codec::ref_wire`) — a
+///   documented fallback, never a truncated id and never an error.
+///
+/// A local pid/port whose node matches but whose **creation** differs stays
+/// external too: the C compares `sysname` *and* `creation`.
+pub fn decode_control_with_identity(
+    body: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+    cache: Option<&AtomCache>,
+    identity: Option<LocalIdentity>,
 ) -> Result<ControlMessage> {
     // The control tuple header: `SMALL_TUPLE_EXT` + an 8-bit arity, or
     // `LARGE_TUPLE_EXT` + a 32-bit big-endian arity (`external.h`).
@@ -304,6 +432,11 @@ pub fn decode_control(
     let mut decoder = Decoder::new_body(stream);
     if let Some(cache) = cache {
         decoder = decoder.with_atom_cache(cache);
+    }
+    // The single decoder covers the control arguments *and* the trailing message,
+    // so a message payload's pids/ports/refs are demoted by the same rule.
+    if let Some(identity) = identity {
+        decoder = decoder.with_local_node(identity.node, identity.creation);
     }
     let opcode = decoder.decode(heap, atoms)?;
     if !is_small(opcode) {
