@@ -53,7 +53,25 @@ full gap list in `../../../INSTRUCTION_SURFACE.md`.
   **The running module's own create form IS implemented** (`create_native_record` from the
   module's own `Recs` definition), as is every *update* form (the source instance carries its
   own definition). Closable only by a host record-definition source — **OWNER:
-  `beam_rt`/`beam_bifs`** (`beam_bifs`' `RecordSource` seam), not this node.
+  `beam_rt`/`beam_bifs`**, not this node. Scoping facts for that fix:
+  - **Every tier reaches this one body**, so a fix here is tier-complete: the interpreter's
+    catch-all (`interpreter/dispatch.rs:677`) and the native baseline tier (`jit/baseline/emit/block.rs:910-925`
+    → `jit_family`) both land in `families::dispatch` (`families/mod.rs:160`), and the Cranelift tier
+    (which inlines no record variant) deopts to `jit_step_one`. No tier has a private `put_record` path.
+  - **`ExecutionContext` has no record method**, and `beam_bifs`' `RecordSource` is a `BifContext` seam
+    (serving `records:get_definition/2` only) that no instruction can reach, so the fix needs a **new
+    defaulted** `ExecutionContext` method (`Ok(None)` default keeps every host byte-identical).
+  - **A foreign definition's atoms are indices in the *foreign* table** (`beam_loader::Module::records`
+    is per-module), so `module`/`name`/every field key must be name-resolved and re-resolved into the
+    running module's/shared namespace before `raw::write_record`, while
+    `compute_record_definition_hash`'s `&module.atom_table` (mod.rs:929-932) is only the atom-name →
+    `hvalue` source the hash mixes (`beam_term::hashing::make_hash2`).
+  - **C's foreign path is not `badfield`/`novalue`.** `erl_create_native_record` (`erl_record.c:355-410`)
+    requires `defp->is_exported == am_true`; an unloaded module TRAPs to `code:ensure_loaded/1`
+    (`erl_record.c:600-640`) and `finish_create_record` retries; a miss or a non-exported definition sets
+    `freason = EXC_BADRECORD` with `fvalue = Id` and takes `$FAIL_HEAD_OR_BODY`
+    (`emu/instrs.tab:1373-1395`), i.e. `error:{badrecord,{Module,Name}}` on the `NO_FAIL` path — a reason
+    graph this family does not build today (`create_failure` covers only badfield/novalue).
 
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; `raw.rs` is this node's only non-test exemption, and every
