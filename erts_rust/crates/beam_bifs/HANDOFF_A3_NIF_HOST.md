@@ -297,7 +297,9 @@ identity can differ, never the operand.
   `erlc` the `.erl`, run it under the live system `erl`, and assert the recorded OTP 29.1.1 /
   erts-17.1 transcript; each skips loudly without the toolchain.
 - `tests/nif_a3_abi_assertions.rs` — **3 in-process ABI assertions** (no `dlopen`, no oracle), each
-  pinning one section's verdict matrix at the `beam_abi` C-ABI boundary:
+  pinning one section's verdict matrix at the `beam_abi` C-ABI boundary. One test binary over three
+  `#[path]` modules, one per section (`tests/nif_a3_abi_assertions/{schedule,thread_env,select_stop}.rs`),
+  so each stays inside the ~1000-line file rule:
   - `enif_schedule_nif_runs_its_continuation_to_completion` (§1) — the continuation runs and its value
     is the call's value, a nested schedule answers the C's `THE_NON_VALUE`, a long chain stays
     constant-stack, a raise ends it with the reason left on the env, dirty flags pick the reported
@@ -334,7 +336,9 @@ that the drivers need `cc` + `erl_nif.h`; skip loudly when absent, as the existi
 
 ## §6 Test placement
 The two test files **stay in this crate**: they are cross-crate assertions at the `beam_abi` ABI
-boundary, and the fixtures they rest on are this node's ground-truth artifacts. Any further
-`beam_abi`-internal tests are that node's call. The `beam_rt`-level end-to-end cases belong in
-`crates/beam_rt/tests/` (the runtime's own NIF tests already own the load/call harness), and the corpus
-cases per §5.
+boundary, and the fixtures they rest on are this node's ground-truth artifacts. `nif_a3_oracle_replay.rs`
+owns the compile-and-run oracle replays; `nif_a3_abi_assertions.rs` is the in-process binary and its
+three per-section modules are the assertions, split only to respect the file-size rule (a single file
+would run ~1500 lines). Any further `beam_abi`-internal tests are that node's call. The `beam_rt`-level
+end-to-end cases belong in `crates/beam_rt/tests/` (the runtime's own NIF tests already own the
+load/call harness), and the corpus cases per §5.
