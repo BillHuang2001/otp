@@ -70,7 +70,7 @@
 //! | `status` | `running`/`runnable`/`waiting`/`suspended`/`exiting` (or the transient `garbage_collecting`) from [`Process::status`](beam_process::Process::status) |
 //! | `message_queue_len` | the mailbox length |
 //! | `messages` | the queued payload terms, FIFO |
-//! | `links` | the linked pids |
+//! | `links` | the linked pid terms — the **local** links first, then the ones an inbound `DOP_LINK` recorded (rendered as external pids); see [`RuntimeContext::links_value`] |
 //! | `monitors` | `[{process, Pid} \| {port, Port}]` — the outgoing process monitors followed by the outgoing port monitors (see [`Snapshot::monitors`]) |
 //! | `monitored_by` | the watching pids |
 //! | `dictionary` | the `{Key, Value}` pairs, insertion order |
@@ -468,8 +468,24 @@ struct Snapshot {
     message_queue_len: usize,
     /// The queued payloads, FIFO.
     messages: Vec<Eterm>,
-    /// The linked pids.
+    /// The **local** linked pids, as internal pid immediates
+    /// ([`Process::links`](beam_process::Process::links)).
     links: Vec<Eterm>,
+    /// The linked pids that live on **another** node, in the C's own record shape.
+    ///
+    /// This is the process table's inbound/local remote-link half
+    /// ([`ProcessTable::remote_links`](beam_process::ProcessTable::remote_links), a
+    /// `&[RemotePid]`): a link an inbound `DOP_LINK` installed, kept as a decomposed
+    /// [`RemotePid`]. A `RemotePid` is **all-immediate** (the sysname **atom** term plus the
+    /// number/serial/creation words), so it retains no foreign heap pointer and can be held
+    /// across the process-table borrow.
+    ///
+    /// The `links` item must render each of them as an **external pid**, exactly as ERTS does:
+    /// the C keeps local and dist links in **one** link tree and `collect_one_link`
+    /// (`erl_bif_info.c:575-593`) collects every link type except an `unlinking` one — including
+    /// `ERTS_LNK_TYPE_DIST_PROC`, whose `other.item` is the external pid — so
+    /// `process_info(Pid, links)` of a process a peer linked is `[<external pid>]`, never `[]`.
+    remote_links: Vec<RemotePid>,
     /// The outgoing monitors: the process monitors (`Process::monitors`) followed by the
     /// port monitors (`Process::port_monitors`), each as `(is_a_process_monitor, target)`
     /// where a port monitor's target is the port id term.
@@ -938,7 +954,7 @@ impl RuntimeContext<'_> {
             "status" => self.atom(snapshot.status)?,
             "message_queue_len" => make_small(snapshot.message_queue_len as i64),
             "messages" => terms::make_list(self, &snapshot.messages)?,
-            "links" => terms::make_list(self, &snapshot.links)?,
+            "links" => self.links_value(snapshot)?,
             "monitors" => self.monitors_value(snapshot)?,
             "monitored_by" => self.monitored_by_value(snapshot)?,
             "dictionary" => self.dictionary_value(snapshot)?,
@@ -1061,6 +1077,75 @@ impl RuntimeContext<'_> {
         }
         for watcher in snapshot.monitored_by.iter().rev() {
             list = scratch.cons(*watcher, list)?;
+        }
+        match self.rehome_container_result(list) {
+            Some(copied) => Ok(copied),
+            // Unreachable in practice: a refusal means the copier rejected a graph this runtime
+            // just built, or a destination that could not be grown. The scratch words are freed
+            // as this function returns, so handing the term back unchanged would be a dangling
+            // term — the typed limit is the honest answer.
+            None => Err(BeamError::SystemLimit),
+        }
+    }
+    /// The `links` value: a **bare list** of the linked pid/port terms — the oracle's own shape
+    /// (`{links,[<0.84.0>]}`, the C's `erl_bif_info.c:3689-3707` conses each collected link onto
+    /// the result as a bare term, no tuples) — **local** links first, then remote ones.
+    ///
+    /// # One set in the C, two stores here
+    ///
+    /// ERTS keeps every link — local process, local port, remote process, remote port — in the
+    /// single link tree `ERTS_P_LINKS(prt)` (`erl_monitor_link.c`), and `collect_one_link`
+    /// (`erl_bif_info.c:575-593`) walks **all** of them, skipping only a link whose `unlinking`
+    /// flag is set. The `dist` halves are `ERTS_LNK_TYPE_DIST_PROC`/`ERTS_LNK_TYPE_DIST_PORT`,
+    /// whose `other.item` is the **external** pid/port. So a process a peer linked must report
+    /// that peer: `process_info(Pid, links)` on the oracle names the external pid, and
+    /// `[is_pid(X) || X <- L]` over it is `[true]` (measured against OTP 29.1.1 / erts-17.1:
+    /// one entry while the peer's link stands, `[]` after its `unlink`).
+    ///
+    /// This runtime keeps the two halves in two stores — the local half in
+    /// [`Process::links`](beam_process::Process::links), the inbound remote half in
+    /// [`ProcessTable::remote_links`](beam_process::ProcessTable::remote_links) as decomposed
+    /// [`RemotePid`]s — so the item is their concatenation, rendered by two code paths:
+    ///
+    /// * a **local** link is an internal pid immediate, buildable straight on the reply heap;
+    /// * a **remote** link must be rendered as an *external* pid, which is the four-word
+    ///   `ExternalThing` block of `beam_term::thing::write_external_pid` (the C's
+    ///   `make_external_pid`, `erl_term.h:1137-1172`) — writable only by
+    ///   `beam_codec`/`beam_process`, because this crate is `#![deny(unsafe_code)]`. So the
+    ///   remote entries are materialized on a **scratch** `beam_alloc::Heap` through
+    ///   [`RemotePid::to_eterm`] and the finished list is copied wholesale onto the region that
+    ///   outlives this call ([`RuntimeContext::rehome_container_result`]) — exactly the two-step
+    ///   [`RuntimeContext::monitored_by_value`] uses, and the only shape that leaves no dangling
+    ///   term behind when the scratch heap is released as this call returns.
+    ///
+    /// # Ordering
+    ///
+    /// Local links first (in `Process::links`' insertion order), then the remote ones (in
+    /// `remote_links`' recording order). **The oracle does not pin this item's order**: the C
+    /// emits the link-tree traversal's **reverse** (it conses each collected item onto the head)
+    /// and `*_rbt_foreach`'s order is documented **undefined**
+    /// (`erts/emulator/beam/erl_rbtree.h:164-169`), even though the tree's keys do compare by
+    /// `ml_cmp_keys` (`erl_monitor_link.c:91-105`: internal pid < internal port < external pid <
+    /// external port). A caller must therefore treat this item as a set, which is what
+    /// `lists:member/2` does — the same caveat the `monitors`/`monitored_by` items carry.
+    fn links_value(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
+        if snapshot.remote_links.is_empty() {
+            // The common case: immediates only, so no foreign-heap block is involved.
+            return terms::make_list(self, &snapshot.links);
+        }
+        // One `ExternalThing` (4 words) per remote link plus one cons cell per entry.
+        let entries = snapshot.links.len() + snapshot.remote_links.len();
+        let words = 4 * snapshot.remote_links.len() + 2 * entries + 8;
+        let mut scratch = beam_alloc::Heap::new(words)?;
+        let mut list = NIL;
+        // Remote links first **in reverse**, so they end up *last* in the finished list; the
+        // local terms are then consed on top of them, which puts the local links first.
+        for peer in snapshot.remote_links.iter().rev() {
+            let pid = peer.to_eterm(&mut scratch)?;
+            list = scratch.cons(pid, list)?;
+        }
+        for linked in snapshot.links.iter().rev() {
+            list = scratch.cons(*linked, list)?;
         }
         match self.rehome_container_result(list) {
             Some(copied) => Ok(copied),
@@ -1260,6 +1345,11 @@ impl RuntimeContext<'_> {
             message_queue_len: process.mailbox().len(),
             messages: process.mailbox().iter().map(|m| m.payload()).collect(),
             links: process.links().iter().map(ProcessId::to_eterm).collect(),
+            // The **remote** links: an inbound `DOP_LINK`'s peer, kept in the process table's
+            // `remote_links` side table as a decomposed [`RemotePid`] (a link tree record's
+            // `other` slot may be an external pid, which a [`ProcessId`] cannot spell). Read
+            // here, rendered by [`RuntimeContext::links_value`] — the `monitored_by` precedent.
+            remote_links: table.remote_links(pid).to_vec(),
             monitors,
             monitored_by: process
                 .monitored_by()

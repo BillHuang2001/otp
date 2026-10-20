@@ -1414,3 +1414,138 @@ fn the_monitored_by_item_renders_a_local_and_a_wire_origin_watcher_apart() {
         "the fast path and the two-step path agree on the local-only case"
     );
 }
+
+// -- `links`: the local + inbound-remote union (contract A.5) --------------
+
+/// `victim`'s `links` value as a **bare list of pid terms** — the oracle's own shape: the C's
+/// `am_links` arm conses each collected link onto the result as a bare term, never as a tuple
+/// (`erl_bif_info.c:3689-3707`). The `{Item, Value}` wrapper belongs to [`pair`], one level up,
+/// so a value that came back wrapped would fail here.
+fn links_of(runtime: &mut crate::Runtime, victim: Eterm) -> Vec<Eterm> {
+    let (key, value) = pair(info(runtime, victim, "links").expect("links"));
+    assert_eq!(runtime.atom_name_of(key), Some("links"));
+    terms::list_elements(value).expect("a bare pid list, not a wrapped item")
+}
+
+/// The `links` item is the **union** of the two halves this runtime keeps in two stores, mirroring
+/// the C's single link tree: the local links
+/// ([`Process::links`](beam_process::Process::links)) and the ones an inbound `DOP_LINK` recorded
+/// ([`ProcessTable::remote_links`](beam_process::ProcessTable::remote_links)). The C collects
+/// **every** link type — `collect_one_link` (`erl_bif_info.c:575-593`) skips only an `unlinking`
+/// link — including `ERTS_LNK_TYPE_DIST_PROC`, whose `other.item` is the external pid, so a
+/// process a peer linked must name that peer instead of answering `[]`.
+///
+/// Both halves are pinned here at the **builder** level, hermetically (no `erl`/`erlc`/`epmd`, no
+/// peer VM, no socket), through [`RuntimeContext::links_value`]: the fast path (immediates only)
+/// and the two-step path (a scratch `beam_alloc::Heap` for the external-pid block, then
+/// `rehome_container_result`). The remote link is installed through the **real inbound entry
+/// point** an arriving `DOP_LINK` reaches — [`ProcessTable::record_remote_link`] — and removed
+/// through the real `erlang:unlink/1` target
+/// ([`ProcessTable::unlink_term`](beam_process::ProcessTable::unlink_term)).
+///
+/// Only the **shape** is asserted: a foreign pid cannot be printed by this runtime
+/// (`beam_bifs`'s printer answers the typed gap for an external pid), and the oracle's
+/// `<Channel.Creation.Serial>` text is not pinnable across VMs. Every identity field is checked
+/// **separately** through [`RemotePid`], which is what makes a swapped-field
+/// `to_eterm`/`from_eterm` regression fail instead of passing on "it is an external pid".
+#[test]
+fn the_links_item_unions_a_local_link_with_an_inbound_distribution_link() {
+    let mut runtime = runtime();
+    let victim = runtime.processes.spawn_default().expect("a victim process");
+    let victim_pid = victim.to_eterm();
+    let root = root_pid(&mut runtime);
+    assert_ne!(victim_pid, root, "the victim is a child, never the caller");
+
+    // (1) NO LINKS — the empty list, and the remote half is what makes that non-trivial: nothing
+    // is recorded for the victim on either side yet.
+    assert_eq!(
+        links_of(&mut runtime, victim_pid),
+        Vec::new(),
+        "a process nothing linked answers the empty list"
+    );
+
+    // (2) LOCAL ONLY — the fast path: one internal pid immediate, nothing on a scratch heap.
+    let local_peer = runtime
+        .processes
+        .spawn_default()
+        .expect("a local peer process");
+    runtime
+        .processes
+        .link(victim, local_peer)
+        .expect("record a local link");
+    let local_only = links_of(&mut runtime, victim_pid);
+    assert_eq!(
+        local_only.len(),
+        1,
+        "the local link is the victim's only link: {local_only:?}"
+    );
+    assert!(
+        ProcessId::is_process(local_only[0]),
+        "a local link is an internal pid immediate"
+    );
+    assert_eq!(local_only[0], local_peer.to_eterm(), "and it is the linked pid");
+
+    // (3) The inbound `DOP_LINK`: another node's process links the victim. The node is **not**
+    // this runtime's local node (a `Runtime::with_defaults()` runtime is not distributed), so the
+    // entry cannot be mistaken for a local pid.
+    let peer_node = atom(&mut runtime, "peer@host.example");
+    let (number, serial, creation) = (11u32, 5u32, 0x0BAD_F00Du32);
+    let mut peer_heap = beam_alloc::Heap::new(64).expect("a scratch heap for the peer's terms");
+    let peer_pid_term =
+        beam_codec::term::make_external_pid(&mut peer_heap, peer_node, number, serial, creation)
+            .expect("the peer's external pid");
+    let peer = RemotePid::from_eterm(peer_pid_term).expect("a remote peer");
+    runtime
+        .processes
+        .record_remote_link(victim, peer)
+        .expect("record the inbound DOP_LINK");
+
+    // (4) BOTH HALVES — the two-step path, in the documented local-then-remote order. (The oracle
+    // does not pin this item's order: the C emits the link-tree traversal's reverse and
+    // `*_rbt_foreach`'s order is documented undefined, `erl_rbtree.h:164-169`. So this pins *this
+    // runtime's own documented choice* — a caller must treat the item as a set, which is what
+    // `lists:member/2` does — the same caveat the `monitors`/`monitored_by` items carry.)
+    let both = links_of(&mut runtime, victim_pid);
+    assert_eq!(
+        both.len(),
+        2,
+        "one entry per link, the local one plus the wire-origin one: {both:?}"
+    );
+    assert_eq!(both[0], local_peer.to_eterm(), "local links come first");
+    assert!(
+        ProcessId::is_process(both[0]),
+        "the local link keeps its internal pid immediate"
+    );
+
+    let remote_entry = both[1];
+    assert!(
+        !ProcessId::is_process(remote_entry),
+        "the remote link is NOT an internal pid immediate"
+    );
+    let decoded =
+        RemotePid::from_eterm(remote_entry).expect("the remote entry is an external pid block");
+    assert_eq!(decoded.node(), peer_node, "the peer's node atom survives");
+    assert_eq!(decoded.number(), number, "the peer's pid number survives");
+    assert_eq!(decoded.serial(), serial, "the peer's pid serial survives");
+    assert_eq!(decoded.creation(), creation, "the peer's creation survives");
+    assert!(
+        matches!(
+            PidTarget::from_eterm(remote_entry).expect("a pid"),
+            PidTarget::Remote(_)
+        ),
+        "the remote entry classifies as a remote target"
+    );
+
+    // (5) THE TWO PATHS AGREE: the peer's `unlink` removes its recorded link, taking the victim
+    // back to the local-only case — and the answer is *exactly* the fast path's value again, so
+    // the two-step copy-out never leaves a mangled local half behind.
+    runtime
+        .processes
+        .unlink_term(victim, peer_pid_term)
+        .expect("record the peer's unlink");
+    assert_eq!(
+        links_of(&mut runtime, victim_pid),
+        local_only,
+        "the fast path and the two-step path agree on the local-only case"
+    );
+}
