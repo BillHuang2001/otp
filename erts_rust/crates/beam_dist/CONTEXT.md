@@ -851,6 +851,46 @@ than two).
   there**: `LocalDeliverySink` is a single sink built once per scheduler pass and shared across every
   established link, so it cannot supply the per-link peer identity the C's `dep` check needs — adoption
   requires a per-link sink (or threading the link's peer into `InboundSink::deliver`).
+- **`InboundSink` has no reply channel — the C's per-opcode replies are not emitted.**
+  `InboundSink::deliver(&mut self, &Delivery) -> Result<DeliveryOutcome>` (`src/delivery.rs:1151`) returns
+  only an outcome; a sink owns no connection/driver/output queue (the `DeliveryOutcome` doc even says the
+  runtime "should answer the peer", `src/delivery.rs:1110-1112`). Three C replies therefore cannot be
+  produced today: `DOP_EXIT` with reason `noproc` for an inbound `DOP_LINK` whose `to` is dead
+  (`dist.c:2268-2272`), `DOP_MONITOR_P_EXIT` with `noproc` for a dead `DOP_MONITOR_P` target
+  (`dist.c:2406-2410`), and the owed `DOP_UNLINK_ID_ACK` (`erl_proc_sig_queue.c:2752-2792`; `beam_rt`
+  reports `Unsupported`, `beam_rt/src/dist/inbound.rs:753`). Smallest additive seam: a defaulted
+  `fn reply(&mut self, &Delivery, DeliveryOutcome) -> Option<Reply>` plus `pub struct Reply { dop: Dop,
+  terms: Vec<Eterm> }`, written by the caller's `dispatch_inbound*` through the existing `send_control`
+  (one place keeps the outbound atom cache + fragmentation); `deliver`'s signature and `UnsupportedSink`
+  stay unchanged. A reply naming one of THIS node's pids also needs the identity fix below.
+- **The outbound control encode installs no local-node identity, so a control argument or message holding
+  an internal pid/port/reference is a typed `unsupported` — never a wrong image.** `encode_control_cached`
+  builds `Encoder::new_body(atoms)` and only adds the atom cache (`src/control.rs:241-244`); `LocalIdentity`
+  is decode-side only (`src/control.rs:439`; `Connection`/`ConnectionDriver` store it for
+  `recv`/`next_message`, `connection.rs:798`, `driver.rs:306`). `beam_codec`'s encoder needs
+  `Encoder::with_local_node` to write an internal id (`internal_id_node()`,
+  `beam_codec/src/encode/mod.rs:451-457`) and otherwise answers `unsupported` (`:595`), while a PEER's
+  external pid/ref needs no identity at all (`external_ref_parts` probe `:560` → `encode_ref` `:998`,
+  which echoes the ref's own node/creation/ids — so a peer-minted monitor ref CAN be written back
+  verbatim). Consequence: outbound `DOP_LINK`/`DOP_EXIT*`/`DOP_EXIT2*`/`DOP_MONITOR_P_EXIT`/
+  `DOP_UNLINK_ID(_ACK)`/`DOP_GROUP_LEADER`/`DOP_SEND_SENDER`/`DOP_REG_SEND`/`DOP_SPAWN_REPLY` encode only
+  when the caller pre-spells this node's ids as external terms — which is what
+  `beam_rt/src/dist_client/{client,signals}.rs` does (`local()`, `monitor_ref_term`) plus the
+  payload-only externalize round trip (`beam_rt/src/dist/externalize.rs`). An identity-taking encode
+  (an extra `Option<LocalIdentity>` parameter or a `*_with_identity` variant) is the clean fix.
+- **`Delivery` terms are the caller's heap words, never copied — a sink must be done with them before the
+  drain heap is reset.** Every field is a raw `Eterm` decoded into the `&mut Heap` the caller passes to
+  `recv`/`next_message` (`src/delivery.rs:110-115`; `connection.rs:1116-1122`, `driver.rs:664-670`), and
+  `reason`/`payload`/`message`/`args` can be boxed (tuple, binary, …). This crate owns no arena and resets
+  nothing, so a sink that STORES a field past `heap.reset()` keeps a stale pointer (immediates survive).
+  That obligation is implicit in the code and must be honoured by copying onto the receiver's heap.
+- **Two `classify_validated` divergences from the C, both honest refusals.** (a) The C's monitor `Ref`
+  guard is `is_not_ref` (`dist.c:2361`), so an *internal* ref is accepted and the C echoes it back naming
+  THIS node; `Delivery::Monitor.reference` keeps it internal, but `beam_process`'s
+  `RemoteRef::from_eterm` requires `is_external_ref` (`beam_process/src/remote.rs:243`), so that shape
+  ends `Unsupported` downstream instead of accepted. (b) `DOP_LINK`'s `to` is not validated
+  (`src/delivery.rs:720-728`), so the C's "an external `to` of a THIRD node is `invalid_message`"
+  (`dist.c:2240-2243`) is not reproduced; the dead/old-incarnation case is the sink's business instead.
 - **Tick *scheduling* is `net_kernel`'s job.** The `net_ticktime` timeout and the resulting
   `{nodedown,Node}` decision belong to `net_kernel` (Erlang, `lib/kernel/src/net_kernel.erl`), not
   this crate's; this crate only answers an inbound tick.
