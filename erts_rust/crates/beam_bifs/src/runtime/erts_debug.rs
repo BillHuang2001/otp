@@ -22,18 +22,21 @@
 //! internal debugging tools).
 //!
 //! Every key below is a declared `bif.tab` entry. Most of them are **host-independent
-//! constants or pure term operations**, and those are implemented here **for real**
-//! (see `REAL_BIFS`): `unaligned_bitstring/2` (a bitstring-to-bitstring
-//! transformation), `map_info/1` (a walk of a HAMT map's node interiors), the
-//! `lcnt`/`interpreter_size`/`disassemble` constants, the `get_internal_state` /
-//! `set_internal_state` gate, `size_shared/1` and `copy_shared/2` (term walks), and
-//! the two `notsup` protocol stubs of the trace/literal-area collectors.
+//! constants, pure term operations or self-contained decode/table work**, and those are
+//! implemented here **for real** (see `REAL_BIFS`): `dist_ext_to_term/2` (the
+//! distribution decode, over the shared `beam_codec` decoder with an `AtomCache`),
+//! `instructions/0` (this tree's generated `beam_makeops` roster),
+//! `unaligned_bitstring/2` (a bitstring-to-bitstring transformation), `map_info/1` (a
+//! walk of a HAMT map's node interiors), the `lcnt`/`interpreter_size`/`disassemble`
+//! constants, the `get_internal_state` / `set_internal_state` gate, `size_shared/1` and
+//! `copy_shared/2` (term walks), and the two `notsup` protocol stubs of the
+//! trace/literal-area collectors.
 //!
-//! The rest require the *running* runtime (VM introspection, the distribution codec,
-//! lock-counter bookkeeping, the dirty-scheduler probes). Each of those is registered
-//! through the single [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so with no
-//! hook installed a call answers the typed `unsupported_bif` capability gap — never
-//! `undef`, never a fabricated value.
+//! The rest require the *running* runtime (VM introspection of dirty schedulers and
+//! breakpoints). Each of those is registered through the single
+//! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so with no hook installed a call
+//! answers the typed `unsupported_bif` capability gap — never `undef`, never a
+//! fabricated value.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -60,7 +63,9 @@ use crate::registry::BifRegistry;
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("erts_debug", "copy_shared", 2),
     ("erts_debug", "disassemble", 1),
+    ("erts_debug", "dist_ext_to_term", 2),
     ("erts_debug", "get_internal_state", 1),
+    ("erts_debug", "instructions", 0),
     ("erts_debug", "interpreter_size", 0),
     ("erts_debug", "lcnt_clear", 0),
     ("erts_debug", "lcnt_collect", 0),
@@ -80,19 +85,22 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty, 3);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_cpu, 2);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_io, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", dist_ext_to_term, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", instructions, 0);
 
-    // The host-independent keys, implemented below. `map_info/1` summarises a HAMT
-    // map's node interior; `unaligned_bitstring/2` is a bitstring-to-bitstring
-    // transformation; the `lcnt`/`interpreter_size`/`disassemble` keys are the
-    // constants a build without those facilities answers; the internal-state pair is
-    // the `available_internal_state` gate; `size_shared`/`copy_shared` are term walks;
-    // and the two collector keys are `notsup` stubs (their machinery does not exist in
-    // this runtime at all — see the module docs on each).
+    // The host-independent keys, implemented below. `dist_ext_to_term/2` is the
+    // distribution decode over the shared `beam_codec` decoder and
+    // `instructions/0` renders this tree's generated `beam_makeops` roster;
+    // `map_info/1` summarises a HAMT map's node interior; `unaligned_bitstring/2`
+    // is a bitstring-to-bitstring transformation; the
+    // `lcnt`/`interpreter_size`/`disassemble` keys are the constants a build
+    // without those facilities answers; the internal-state pair is the
+    // `available_internal_state` gate; `size_shared`/`copy_shared` are term walks;
+    // and the two collector keys are `notsup` stubs (their machinery does not
+    // exist in this runtime at all — see the module docs on each).
     reg.register("erts_debug", "copy_shared", 2, copy_shared_2);
     reg.register("erts_debug", "disassemble", 1, disassemble_1);
+    reg.register("erts_debug", "dist_ext_to_term", 2, dist_ext_to_term_2);
     reg.register("erts_debug", "get_internal_state", 1, get_internal_state_1);
+    reg.register("erts_debug", "instructions", 0, instructions_0);
     reg.register("erts_debug", "interpreter_size", 0, interpreter_size_0);
     reg.register("erts_debug", "lcnt_clear", 0, lcnt_clear_0);
     reg.register("erts_debug", "lcnt_collect", 0, lcnt_collect_0);
@@ -724,6 +732,106 @@ fn walk_hashmap(map: Eterm) -> Result<HashMapInfo> {
     Ok(info)
 }
 
+/// `ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (`../../erts/emulator/beam/external.h:120`):
+/// the atom-cache slot count `dist_ext_to_term/2` fills from its first argument.
+///
+/// It is 255 — one fewer than the 256 a one-byte index can address — so the C's
+/// `if (arity > ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES) goto badarg`
+/// (`external.c:1362-1363`) refuses a 256-element tuple. Every index the BIF
+/// accepts is therefore `< 255` and its `u8` slot cast is exact.
+const MAX_INTERNAL_ATOM_CACHE_ENTRIES: usize = 255;
+
+/// `erts_debug:instructions/0` — the instruction-dispatch table's names.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_debug.c:376-393`
+/// (`erts_debug_instructions_0`), which builds
+/// `[opc[i].name || i <- 0..num_instructions-1]`: **every** row of the
+/// `beam_makeops`-generated `opc[]` table, in dispatch order, each name a charlist
+/// of its bytes.
+///
+/// Those names carry `beam_makeops`' operand-type suffixes
+/// (`allocate_heap_tIt`, `append_cons_Is`, …), so they are **not** `genop.tab`'s
+/// opcode names and cannot be derived from the loader's roster. The table is
+/// therefore generated data: [`super::instructions::INSTRUCTIONS`], emitted by the
+/// committed `gen_instructions.escript` from this tree's own generator (see that
+/// file's header for the why and the how).
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1): **245** entries, the first four
+/// `["aligned_label_Lt", "allocate_tt", "allocate_heap_tIt", "append_cons_Is"]`
+/// and the last `"wait_unlocked_f"`. This tree is OTP 30 and its `ops.tab` reworked
+/// the native-record family, so its table holds **248**; the difference is a
+/// release skew, not a divergence, and is pinned as an explicit exception set by
+/// `the_generated_roster_matches_a_live_oracle_modulo_the_release_skew` below.
+///
+/// # Errors
+///
+/// Propagates a heap-allocation failure.
+fn instructions_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let mut names = Vec::with_capacity(super::instructions::INSTRUCTIONS.len());
+    for name in super::instructions::INSTRUCTIONS {
+        names.push(ctx.charlist(name)?);
+    }
+    ctx.list(&names)
+}
+
+/// `erts_debug:dist_ext_to_term/2` — decode an external-term image the way the
+/// **distribution** receiver does, with a caller-supplied atom cache.
+///
+/// Ground truth: `../../erts/emulator/beam/external.c:1340-1405`
+/// (`erts_debug_dist_ext_to_term_2`) → `erts_decode_dist_ext` (`:1273-1311`).
+/// The argument order of the C's guards is reproduced exactly, because every
+/// failure is `badarg` and only the *first* failing guard is observable:
+///
+/// 1. `is_not_tuple(arg1)` ⇒ `badarg` (`:1358-1359`);
+/// 2. `arity > ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (255) ⇒ `badarg`
+///    (`:1362-1363`);
+/// 3. a non-atom element ⇒ `badarg` (`:1366-1370`) — the tuple fills atom-cache
+///    slots `0..arity-1` in order;
+/// 4. `is_not_bitstring(arg2)` or a non-byte-aligned or **empty** bitstring ⇒
+///    `badarg` (`:1372-1380`);
+/// 5. a first byte that is not `VERSION_MAGIC` (131) ⇒ `badarg` (`:1290-1295`);
+/// 6. a truncated or unrecognized image ⇒ `badarg` (`:1296-1298`).
+///
+/// Trailing bytes after the term are ignored (the C decodes one term and returns
+/// it), and an `ATOM_CACHE_REF` (`82`) whose slot the caller did not fill is the
+/// C's `attab` bound failure ⇒ `badarg`. The term is materialized on the context
+/// heap by the shared `beam_codec` decoder — the same one `binary_to_term` uses,
+/// installed with `beam_codec::AtomCache` — never a second decoder.
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1); the matrix is pinned by
+/// `dist_ext_to_term_matches_the_oracle_matrix` below.
+///
+/// # Errors
+///
+/// Always [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a rejected
+/// argument or image; otherwise propagates a heap-allocation failure.
+fn dist_ext_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let slots = args[0];
+    if !access::is_tuple(slots) {
+        return Err(badarg());
+    }
+    let arity = access::tuple_size(slots);
+    if arity > MAX_INTERNAL_ATOM_CACHE_ENTRIES {
+        return Err(badarg());
+    }
+    let mut cache = beam_codec::AtomCache::new();
+    for index in 0..arity {
+        let atom = access::tuple_element(slots, index);
+        if !access::is_atom(atom) {
+            return Err(badarg());
+        }
+        // `index < arity <= 255`, so the one-byte on-wire slot index is exact.
+        cache.set(index as u8, atom_val(atom));
+    }
+    // A non-bitstring and a non-byte-aligned bitstring are both `badarg` here;
+    // the empty image is the C's `size == 0` guard.
+    let data = crate::bits::bytes(args[1])?;
+    if data.is_empty() {
+        return Err(badarg());
+    }
+    crate::binconv::decode_dist_ext_image(ctx, &data, &cache)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,16 +912,18 @@ mod tests {
         }
     }
 
-    /// The types this module owns are exactly [`REAL_BIFS`], and every one of them is
+    /// A module's real BIF surface is exactly [`REAL_BIFS`], and every one of them is
     /// actually registered by [`register`].
     #[test]
-    fn real_bifs_is_the_fourteen_real_keys_and_is_registered() {
+    fn real_bifs_is_the_sixteen_real_keys_and_is_registered() {
         assert_eq!(
             REAL_BIFS,
             &[
                 ("erts_debug", "copy_shared", 2),
                 ("erts_debug", "disassemble", 1),
+                ("erts_debug", "dist_ext_to_term", 2),
                 ("erts_debug", "get_internal_state", 1),
+                ("erts_debug", "instructions", 0),
                 ("erts_debug", "interpreter_size", 0),
                 ("erts_debug", "lcnt_clear", 0),
                 ("erts_debug", "lcnt_collect", 0),
@@ -843,7 +953,7 @@ mod tests {
                 "{module}:{function}/{arity} is a real BIF but still sits in the seam roster"
             );
         }
-        // 14 real keys + the 6 remaining `runtime_bif!` seam keys.
+        // 16 real keys + the 4 remaining `runtime_bif!` seam keys.
         assert_eq!(reg.len(), 20, "the erts_debug/collector key count");
     }    /// Every valid call returns the source's own bits at the source's own bit size —
     /// the C's sub-bit view starts at the very `offset` the bits were copied to, so
@@ -1291,9 +1401,10 @@ mod tests {
     }
 
     /// The keys that stay **seam-backed** answer the typed capability gap — never a
-    /// fabricated value, never `undef`.
+    /// fabricated value, never `undef` — and the two keys this module implements for real
+    /// are registered, listed in [`REAL_BIFS`] and gone from the seam roster.
     #[test]
-    fn the_remaining_seam_keys_answer_the_typed_gap() {
+    fn the_four_remaining_seam_keys_forward_to_the_hook() {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         for &(module, function, arity) in &[
@@ -1301,8 +1412,6 @@ mod tests {
             ("erts_debug", "dirty", 3),
             ("erts_debug", "dirty_cpu", 2),
             ("erts_debug", "dirty_io", 2),
-            ("erts_debug", "dist_ext_to_term", 2),
-            ("erts_debug", "instructions", 0),
         ] {
             assert!(
                 reg.contains(module, function, arity),
@@ -1319,8 +1428,605 @@ mod tests {
                 "{module}:{function}/{arity}"
             );
         }
+
+        // The two host-independent keys this module serves itself: registered, listed in
+        // `REAL_BIFS`, and **not** in the `RuntimeHooks` roster (a real implementation
+        // behind the seam bridge would be dead code — `beam_rt`'s native floor answers
+        // before the registry).
+        for &(function, arity) in &[("dist_ext_to_term", 2), ("instructions", 0)] {
+            assert!(
+                reg.contains("erts_debug", function, arity),
+                "erts_debug:{function}/{arity} must be registered"
+            );
+            assert!(
+                REAL_BIFS.contains(&("erts_debug", function, arity)),
+                "erts_debug:{function}/{arity} must be listed in REAL_BIFS"
+            );
+            assert!(
+                !crate::hook_sets::needs_runtime_hooks("erts_debug", function, arity),
+                "erts_debug:{function}/{arity} is a real BIF but still sits in the seam roster"
+            );
+        }
     }
+
     // -----------------------------------------------------------------------
+    // dist_ext_to_term/2
+    //
+    // The whole oracle probe these expectations were taken from (OTP 29.1.1 /
+    // erts-17.1, `erl` on `PATH`):
+    //
+    // ```text
+    // erl -noshell -eval '
+    //   R = (try erts_debug:dist_ext_to_term(Slots, Image) catch C:E -> {C,E} end),
+    //   io:format("~p~n",[R]), halt(0).'
+    // ```
+    //
+    // ```text
+    // ({},                  <<131,97,5>>)      => 5
+    // ({a},                 <<131,97,5>>)      => 5
+    // ({a},                 <<131,97,5,99>>)   => 5      (the trailing byte is ignored)
+    // ({a},                 <<131,82,0>>)      => a      (`ATOM_CACHE_REF` slot 0)
+    // ({},                  <<131,82,0>>)      => {error,badarg}
+    // ({a},                 <<131,82,1>>)      => {error,badarg}
+    // (256-atom tuple,      <<131,97,5>>)      => {error,badarg}
+    // ({a,b},               <<131,97,5>>)      => 5
+    // ({1},                 <<131,97,5>>)      => {error,badarg}
+    // ({a},                 <<>>)              => {error,badarg}
+    // ({a},                 foo)               => {error,badarg}
+    // ({a},                 <<131>>)           => {error,badarg}
+    // ({a},                 <<131,97,5:7>>)    => {error,badarg}
+    // (-1,                  <<131,97,5>>)      => {error,badarg}
+    // ({a},                 <<97,5>>)          => {error,badarg}
+    // ({a}, term_to_binary(binary:copy(<<"abcdefghij">>,100), [compressed]))
+    //                                          => {error,badarg}
+    // ```
+    //
+    // The last row is the interesting one: a **genuine** `[131,80,…]` image is rejected
+    // as well, because the C's distribution decode (`external.c:1273-1311`) never
+    // accepts the `COMPRESSED` wrapper — it is a `term_to_binary`-only form.
+
+    /// The atom-cache tuple of one `dist_ext_to_term/2` probe row.
+    #[derive(Clone, Copy)]
+    enum Slots {
+        /// `{a, b, …}` — one atom per cache slot, in slot order.
+        Atoms(&'static [&'static str]),
+        /// `{1}` — a non-atom element, rejected before the image is looked at.
+        NonAtom,
+        /// `-1` — not a tuple at all.
+        NotTuple,
+        /// `list_to_tuple(lists:duplicate(256, a))` — past the 255-slot bound.
+        TooManyAtoms,
+    }
+
+    /// The image argument of one `dist_ext_to_term/2` probe row.
+    #[derive(Clone, Copy)]
+    enum Image {
+        /// The byte-aligned bitstring `<<bytes>>`.
+        Bytes(&'static [u8]),
+        /// `<<bytes:bits>>` — a bitstring that is **not** byte aligned.
+        Bits(&'static [u8], usize),
+        /// A genuine `term_to_binary(…, [compressed])` image: `times` repetitions of
+        /// `repeat`, encoded through the shared `beam_codec` encoder at level 6.
+        Compressed {
+            repeat: &'static [u8],
+            times: usize,
+        },
+        /// The atom `foo`: not a bitstring.
+        NotBitstring,
+    }
+
+    /// One row of the `dist_ext_to_term/2` matrix of the module doc's probe.
+    struct DistRow {
+        /// The oracle-transcript label this row is reported under (no spaces: it is a
+        /// field of the live oracle's one-line-per-row output).
+        label: &'static str,
+        slots: Slots,
+        image: Image,
+        /// The oracle's value for a successful decode; `None` where it raises `badarg`.
+        value: Option<&'static str>,
+    }
+
+    /// The matrix, in the order of the module doc's transcript.
+    const DIST_ROWS: &[DistRow] = &[
+        DistRow {
+            label: "empty_cache_small_int",
+            slots: Slots::Atoms(&[]),
+            image: Image::Bytes(&[131, 97, 5]),
+            value: Some("5"),
+        },
+        DistRow {
+            label: "slot_zero_unused",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[131, 97, 5]),
+            value: Some("5"),
+        },
+        DistRow {
+            label: "trailing_byte_ignored",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[131, 97, 5, 99]),
+            value: Some("5"),
+        },
+        DistRow {
+            label: "atom_cache_ref_slot_zero",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[131, 82, 0]),
+            value: Some("a"),
+        },
+        DistRow {
+            label: "atom_cache_ref_unset_slot",
+            slots: Slots::Atoms(&[]),
+            image: Image::Bytes(&[131, 82, 0]),
+            value: None,
+        },
+        DistRow {
+            label: "atom_cache_ref_unset_slot_one",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[131, 82, 1]),
+            value: None,
+        },
+        DistRow {
+            label: "cache_tuple_past_255_slots",
+            slots: Slots::TooManyAtoms,
+            image: Image::Bytes(&[131, 97, 5]),
+            value: None,
+        },
+        DistRow {
+            label: "two_cache_slots",
+            slots: Slots::Atoms(&["a", "b"]),
+            image: Image::Bytes(&[131, 97, 5]),
+            value: Some("5"),
+        },
+        DistRow {
+            label: "non_atom_cache_element",
+            slots: Slots::NonAtom,
+            image: Image::Bytes(&[131, 97, 5]),
+            value: None,
+        },
+        DistRow {
+            label: "empty_image",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[]),
+            value: None,
+        },
+        DistRow {
+            label: "image_not_a_bitstring",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::NotBitstring,
+            value: None,
+        },
+        DistRow {
+            label: "version_byte_only",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[131]),
+            value: None,
+        },
+        DistRow {
+            label: "image_not_byte_aligned",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bits(&[131, 97, 5], 23),
+            value: None,
+        },
+        DistRow {
+            label: "cache_not_a_tuple",
+            slots: Slots::NotTuple,
+            image: Image::Bytes(&[131, 97, 5]),
+            value: None,
+        },
+        DistRow {
+            label: "missing_version_magic",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Bytes(&[97, 5]),
+            value: None,
+        },
+        DistRow {
+            label: "compressed_wrapper",
+            slots: Slots::Atoms(&["a"]),
+            image: Image::Compressed {
+                repeat: b"abcdefghij",
+                times: 100,
+            },
+            value: None,
+        },
+    ];
+
+    /// The two arguments of one probe row, materialized on a fresh heap.
+    ///
+    /// The atom terms come from a fresh [`probe_atoms`] table — the same deterministic
+    /// seed [`observe_args`] builds its context over, so the cache slots name the same
+    /// atoms the context will. The returned heap keeps the argument terms alive and must
+    /// therefore outlive the call.
+    fn dist_args(row: &DistRow) -> (Heap, Vec<Eterm>) {
+        let mut heap = Heap::new(1 << 13).expect("test heap");
+        let atoms = probe_atoms();
+        let atom = |name: &str| make_atom(atoms.lookup(name).expect("a seeded atom"));
+        let slots = match row.slots {
+            Slots::Atoms(names) => {
+                let elems: Vec<Eterm> = names.iter().map(|name| atom(name)).collect();
+                heap.tuple(&elems).expect("the cache tuple fits")
+            }
+            Slots::NonAtom => heap.tuple(&[make_small(1)]).expect("the tuple fits"),
+            Slots::NotTuple => make_small(-1),
+            Slots::TooManyAtoms => {
+                let elems = vec![atom("a"); 256];
+                heap.tuple(&elems).expect("the 256-element tuple fits")
+            }
+        };
+        let image = match row.image {
+            Image::Bytes(bytes) => {
+                access::make_heap_bitstring(&mut heap, bytes, bytes.len() * 8)
+                    .expect("the image fits")
+            }
+            Image::Bits(bytes, bits) => {
+                access::make_heap_bitstring(&mut heap, bytes, bits).expect("the image fits")
+            }
+            Image::NotBitstring => atom("foo"),
+            Image::Compressed { repeat, times } => {
+                let payload = repeat.repeat(times);
+                let term = access::make_heap_bitstring(&mut heap, &payload, payload.len() * 8)
+                    .expect("the payload fits");
+                let image = beam_codec::encode_term_compressed(term, &atoms, 6)
+                    .expect("the compressed image encodes");
+                assert_eq!(
+                    (image[0], image[1]),
+                    (beam_codec::VERSION_MAGIC, beam_codec::COMPRESSED_EXT),
+                    "{}: the row must carry a genuine COMPRESSED image",
+                    row.label
+                );
+                access::make_heap_bitstring(&mut heap, &image, image.len() * 8)
+                    .expect("the image fits")
+            }
+        };
+        (heap, vec![slots, image])
+    }
+
+    /// [`observe_args`]'s label for one probe row.
+    fn dist_observe(row: &DistRow) -> String {
+        let (_heap, args) = dist_args(row);
+        observe_args("erts_debug", "dist_ext_to_term", 2, &args)
+    }
+
+    /// The label [`observe_args`] must answer for one probe row: an integer value renders
+    /// `int(N)`, an atom value `atom(Name)`, a rejected call `badarg`.
+    fn dist_expected(row: &DistRow) -> String {
+        match row.value {
+            None => "badarg".to_string(),
+            Some(value) => match value.parse::<i64>() {
+                Ok(number) => format!("int({number})"),
+                Err(_) => format!("atom({value})"),
+            },
+        }
+    }
+
+    /// The `dist_ext_to_term/2` matrix of the oracle transcript in the module doc:
+    /// every row's outcome is pinned, and every failure is the plain `badarg` the C's
+    /// guard order produces.
+    #[test]
+    fn dist_ext_to_term_matches_the_oracle_matrix() {
+        for row in DIST_ROWS {
+            assert_eq!(dist_observe(row), dist_expected(row), "{}", row.label);
+        }
+    }
+
+    /// The Erlang source of a row's cache argument.
+    fn erl_slots(row: &DistRow) -> String {
+        match row.slots {
+            Slots::Atoms(names) => format!("{{{}}}", names.join(",")),
+            Slots::NonAtom => "{1}".to_string(),
+            Slots::NotTuple => "-1".to_string(),
+            Slots::TooManyAtoms => "list_to_tuple(lists:duplicate(256,a))".to_string(),
+        }
+    }
+
+    /// The Erlang source of an image **term**: `foo` for the not-a-bitstring row, else a
+    /// bitstring literal spelling exactly the bytes (and the trailing partial byte) that
+    /// were handed to this crate's BIF.
+    fn erl_image(term: Eterm) -> String {
+        if access::is_atom(term) {
+            return "foo".to_string();
+        }
+        let bits = access::bitstring_bit_size(term).expect("a bitstring");
+        let bytes = access::bitstring_bits(term).expect("a bitstring");
+        let whole = bits / 8;
+        let partial = bits % 8;
+        let mut parts: Vec<String> = bytes[..whole].iter().map(u8::to_string).collect();
+        if partial != 0 {
+            parts.push(format!("{}:{partial}", bytes[whole]));
+        }
+        format!("<<{}>>", parts.join(","))
+    }
+
+    /// The same matrix, cross-checked against a **live** `erl` in one startup: one line
+    /// per row, `<label> <ok Value | badarg>`, compared with this crate's outcome and
+    /// with the pinned value of every successful row.
+    ///
+    /// Skips **loudly** when no `erl` is on `PATH`; the pinned golden above is what CI
+    /// without an oracle still checks.
+    #[test]
+    fn the_dist_ext_matrix_agrees_with_a_live_oracle() {
+        if crate::runtime::ddll::test_support::which_erl().is_none() {
+            eprintln!(
+                "SKIP: no `erl` on PATH — the dist_ext_to_term matrix was not \
+                 cross-checked against a live oracle"
+            );
+            return;
+        }
+        // One `-eval` statement, one startup, one line per row.
+        let mut script = String::from(
+            "P = fun(L, F) -> R = (try F() of V -> lists:flatten(io_lib:format(\"ok ~p\", [V])) \
+             catch error:badarg -> \"badarg\"; C:Rsn -> lists:flatten(io_lib:format(\
+             \"other ~p:~p\", [C, Rsn])) end), io:format(\"~s ~s~n\", [L, R]) end, ",
+        );
+        let mut labels = Vec::new();
+        for row in DIST_ROWS {
+            let (_heap, args) = dist_args(row);
+            script.push_str(&format!(
+                "P(\"{}\", fun() -> erts_debug:dist_ext_to_term({}, {}) end), ",
+                row.label,
+                erl_slots(row),
+                erl_image(args[1])
+            ));
+            labels.push(row.label);
+        }
+        script.push_str("halt(0).");
+
+        let output = std::process::Command::new("erl")
+            .args(["-noshell", "-eval", &script])
+            .output();
+        let stdout = match output {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => {
+                eprintln!(
+                    "SKIP: the live oracle failed ({}); stderr: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            Err(err) => {
+                eprintln!("SKIP: could not run `erl` ({err})");
+                return;
+            }
+        };
+
+        let lines: Vec<&str> = stdout.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            labels.len(),
+            "the oracle printed {} lines for {} rows: {stdout}",
+            lines.len(),
+            labels.len()
+        );
+        for (row, line) in DIST_ROWS.iter().zip(&lines) {
+            let (label, answer) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("{line:?} is not `<label> <answer>`"));
+            assert_eq!(label, row.label, "the oracle's row order");
+            let expected = match row.value {
+                None => "badarg".to_string(),
+                Some(value) => format!("ok {value}"),
+            };
+            assert_eq!(*answer, expected, "{}", row.label);
+            assert_eq!(dist_observe(row), dist_expected(row), "{}", row.label);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // instructions/0
+    //
+    // `erts_debug:instructions()` is the `beam_makeops`-generated `opc[]` name table,
+    // in dispatch order, each name a charlist of its bytes. This tree (OTP 30) holds
+    // **248** rows; the live OTP 29.1.1 oracle holds **245**, because OTP 30's
+    // `erts/emulator/beam/jit/x86/ops.tab:1328-1371` reworked the native-record family.
+    // The skew is pinned as an explicit exception set below, never smoothed over.
+
+    /// The instruction names this tree emits that the OTP 29.1.1 oracle does **not**: the
+    /// three opcodes OTP 30's native-record rework added.
+    ///
+    /// This set must shrink to **empty** once the differential oracle is an OTP 30
+    /// runtime — a leftover entry then fails loudly (see
+    /// [`the_version_skew_exception_set_is_exactly_the_documented_one`]).
+    const RELEASE_SKEW_ADDED: [&str; 3] = [
+        "i_get_local_record_elements_qxI",
+        "i_get_local_record_elements_qyI",
+        "i_update_local_native_record_aqsdtI",
+    ];
+
+    /// The four names whose spelling differs, as `(this tree, the OTP 29.1.1 oracle)`.
+    /// Both spellings are real instructions; only the operand letters the native-record
+    /// rework touched moved (`j` → `f` for a *failed*-typed source operand, `j…` → `…` for
+    /// the no-longer-distinct argument registers).
+    const RELEASE_SKEW_RENAMED: [(&str, &str); 4] = [
+        ("i_create_native_record_jcdtI", "i_create_native_record_cdtI"),
+        ("i_get_record_elements_jxI", "i_get_record_elements_fxI"),
+        ("i_get_record_elements_jyI", "i_get_record_elements_fyI"),
+        ("i_update_native_record_jsdtI", "i_update_native_record_sdtI"),
+    ];
+
+    /// `use` of the generated table, so the assertions below read as prose.
+    use crate::runtime::instructions::INSTRUCTIONS;
+
+    /// [`INSTRUCTIONS`] is this tree's dispatch roster: 248 unique, non-empty ASCII names,
+    /// the same first and last rows the oracle reports (the ends are release-stable).
+    #[test]
+    fn the_instruction_roster_is_the_generated_table() {
+        assert_eq!(INSTRUCTIONS.len(), 248, "the generated opc[] row count");
+        let unique: std::collections::BTreeSet<&str> = INSTRUCTIONS.iter().copied().collect();
+        assert_eq!(unique.len(), INSTRUCTIONS.len(), "a duplicated row");
+        for (index, name) in INSTRUCTIONS.iter().enumerate() {
+            assert!(!name.is_empty(), "row {index} is empty");
+            assert!(name.is_ascii(), "row {index} ({name}) is not ASCII");
+        }
+        assert_eq!(
+            INSTRUCTIONS[..4],
+            [
+                "aligned_label_Lt",
+                "allocate_tt",
+                "allocate_heap_tIt",
+                "append_cons_Is"
+            ],
+            "the first four rows"
+        );
+        assert_eq!(
+            INSTRUCTIONS[INSTRUCTIONS.len() - 4..],
+            [
+                "wait_locked_f",
+                "wait_timeout_locked_sf",
+                "wait_timeout_unlocked_sf",
+                "wait_unlocked_f"
+            ],
+            "the last four rows"
+        );
+    }
+
+    /// The bytes of the charlist `term` (each element a small integer byte).
+    fn charlist_bytes(term: Eterm) -> Vec<u8> {
+        list_of(term)
+            .into_iter()
+            .map(|element| {
+                assert!(access::is_small(element), "a charlist element must be a small");
+                signed_value(element) as u8
+            })
+            .collect()
+    }
+
+    /// `instructions/0` renders **every** row of the generated roster as its own charlist,
+    /// in dispatch order — never a truncated, reordered or fabricated list.
+    #[test]
+    fn instructions_0_renders_every_row_as_a_charlist() {
+        let mut reg = BifRegistry::new();
+        super::register(&mut reg);
+        let mut heap = Heap::new(1 << 16).expect("test heap");
+        let atoms = probe_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let out = reg
+            .call("erts_debug", "instructions", 0, &mut ctx, &[])
+            .expect("instructions/0 runs");
+
+        let rows = list_of(out);
+        assert_eq!(rows.len(), INSTRUCTIONS.len(), "one charlist per row");
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                charlist_bytes(*row),
+                INSTRUCTIONS[index].as_bytes(),
+                "row {index}"
+            );
+        }
+        // The two ends, spelled out as bytes (the ends are release-stable).
+        assert_eq!(charlist_bytes(rows[0]), b"aligned_label_Lt");
+        assert_eq!(
+            charlist_bytes(rows[INSTRUCTIONS.len() - 1]),
+            b"wait_unlocked_f"
+        );
+    }
+
+    /// The release-skew exception set of the two tables above is exactly the documented one
+    /// and nothing else: every dropped name and every in-tree spelling is really in
+    /// [`INSTRUCTIONS`], and no oracle spelling is.
+    ///
+    /// **Why this exists:** this tree is OTP 30 and the differential oracle is OTP 29.1.1,
+    /// so the two `opc[]` tables differ by the native-record rework in
+    /// `erts/emulator/beam/jit/x86/ops.tab:1328-1371` (it gained the `j` operand plus the
+    /// `i_get_local_record_elements`/`i_update_local_native_record` opcodes). The set is a
+    /// *skew*, not a divergence: it must shrink to **empty** when the oracle becomes OTP
+    /// 30, and failing loudly here is the intent — a stale entry would let a real
+    /// divergence hide behind a "known exception".
+    #[test]
+    fn the_version_skew_exception_set_is_exactly_the_documented_one() {
+        assert_eq!(RELEASE_SKEW_ADDED.len(), 3, "the documented dropped names");
+        assert_eq!(RELEASE_SKEW_RENAMED.len(), 4, "the documented renames");
+        let roster: std::collections::BTreeSet<&str> = INSTRUCTIONS.iter().copied().collect();
+        for name in RELEASE_SKEW_ADDED {
+            assert!(roster.contains(name), "{name} is not in the generated roster");
+        }
+        for (ours, oracle) in RELEASE_SKEW_RENAMED {
+            assert!(roster.contains(ours), "{ours} is not in the generated roster");
+            assert!(
+                !roster.contains(oracle),
+                "{oracle} is the oracle's spelling and must not be in this tree's roster"
+            );
+        }
+    }
+
+    /// The generated roster equals a **live** OTP 29.1.1 oracle's roster element for
+    /// element, in order, once the documented release skew is applied.
+    ///
+    /// Skips **loudly** when no `erl` is on `PATH`. A differing row reports its index and
+    /// both spellings, so a real divergence cannot hide behind the skew set.
+    #[test]
+    fn the_generated_roster_matches_a_live_oracle_modulo_the_release_skew() {
+        if crate::runtime::ddll::test_support::which_erl().is_none() {
+            eprintln!(
+                "SKIP: no `erl` on PATH — the instructions/0 roster was not cross-checked \
+                 against a live oracle"
+            );
+            return;
+        }
+        let mut erl = std::process::Command::new("erl");
+        erl.args([
+            "-noshell",
+            "-eval",
+            "L = erts_debug:instructions(), io:format(\"~p~n\", [length(L)]), \
+             lists:foreach(fun(S) -> io:format(\"~s~n\", [S]) end, L), halt(0).",
+        ]);
+        let stdout = match erl.output() {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            Ok(out) => {
+                eprintln!(
+                    "SKIP: the live oracle failed ({}); stderr: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            Err(err) => {
+                eprintln!("SKIP: could not run `erl` ({err})");
+                return;
+            }
+        };
+        let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+        let count: usize = lines
+            .next()
+            .expect("the oracle printed the roster length")
+            .trim()
+            .parse()
+            .expect("the oracle's length line is a number");
+        let oracle: Vec<&str> = lines.collect();
+        assert_eq!(oracle.len(), count, "the oracle's own count line");
+        assert_eq!(count, 245, "the OTP 29.1.1 opc[] row count");
+
+        let ours = our_roster_for_the_oracle();
+        assert_eq!(
+            ours.len(),
+            oracle.len(),
+            "{} rows here against {} on the oracle (245 = 248 − {} added, {} renamed)",
+            ours.len(),
+            oracle.len(),
+            RELEASE_SKEW_ADDED.len(),
+            RELEASE_SKEW_RENAMED.len()
+        );
+        for (index, (ours, theirs)) in ours.iter().zip(&oracle).enumerate() {
+            assert_eq!(
+                ours, theirs,
+                "row {index}: this tree says {ours:?}, the oracle says {theirs:?}"
+            );
+        }
+    }
+
+    /// [`INSTRUCTIONS`] with the documented release skew applied — the roster a live OTP
+    /// 29.1.1 oracle must agree with.
+    fn our_roster_for_the_oracle() -> Vec<String> {
+        INSTRUCTIONS
+            .iter()
+            .filter(|name| !RELEASE_SKEW_ADDED.contains(name))
+            .map(|name| {
+                let renamed = RELEASE_SKEW_RENAMED
+                    .iter()
+                    .find(|(ours, _)| ours == name)
+                    .map(|(_, oracle)| *oracle);
+                renamed.unwrap_or(name).to_string()
+            })
+            .collect()
+    }    // -----------------------------------------------------------------------
     // map_info/1
     //
     // The whole oracle probe these expectations were taken from (OTP 29.1.1 /
