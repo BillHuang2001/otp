@@ -219,15 +219,17 @@ Six cases per variant, each a fresh port (start-up message drained, then the sta
 | busy | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true`, command delivered |
 | busy | none | either | caller **suspends** until the port is idle, then `true`, command delivered |
 
-The last row is the one **documented divergence**: this runtime's BIF seam has no
-"suspend the caller and re-run me" shape (`src/native/port.rs`), so a bare `port_command` on a busy
-port raises the typed capability gap (exit 3) rather than fabricating a `true`.
+The last row is the real suspend: `port_command` on a busy port parks through `beam_engine`'s
+**BIF suspend channel** (`BifOutcome::Suspend`, the C's `erts_suspend` + `ERTS_BIF_YIELD3`), the
+scheduler runs the port round that lets the driver clear its busy bit, and the parked instruction is
+re-executed — the re-issued command answers `true` with the command delivered, at most once per write.
+`tests/port_busy.rs` pins it two ways: `busy_pc/1` on the CLI `run` route with the helper clearing
+the bit 100 ms in, and `busy_plain_resumed/1` on the `-eval` route (which owns a scheduler pass and
+waits in place) → `{ok,cleared,echoed}` on both this runtime and the oracle.
 
 > **Never run the busy + no-options case on the oracle without something to clear the busy bit.** It
-> blocks for ever (the C's `erts_suspend` + `ERTS_BIF_YIELD3`). `tests/port_busy.rs` asserts the
-> runtime's typed gap on that call, and evidences the oracle's suspend **only** through
-> `busy_plain_resumed/1`, whose helper clears the bit 200 ms in and yields the oracle's
-> `{ok,cleared,echoed}`.
+> blocks for ever there. On this runtime the wait is bounded by `port::busy_wait::BUSY_PORT_DEADLINE`
+> (5 s), which raises the typed `DEADLINE_REASON` rather than hanging the executable.
 
 ### Skip-loudly rule
 
