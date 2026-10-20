@@ -102,6 +102,7 @@
 //! `driver_*` / `erl_drv_*` declarations must still compile) because the driver C ABI is not
 //! observable through the black-box CLI at all.
 
+mod bif_extra;
 mod bifs;
 mod binmatch;
 mod bits;
@@ -122,6 +123,7 @@ mod etf;
 mod ets;
 mod ets_access;
 mod ets_spec;
+mod eval_route;
 mod flags;
 mod flags_apply;
 mod format_limit;
@@ -134,6 +136,7 @@ mod mexec;
 mod mexec_extra;
 mod modules;
 mod nif;
+mod nif_a3;
 mod nif_abi;
 mod nif_abi_extra;
 mod nif_res;
@@ -648,6 +651,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(etf::group());
     cases.extend(terms::group());
     cases.extend(semantics::group());
+    cases.extend(eval_route::group());
     cases.extend(errors::group());
     cases.extend(nif::group());
     cases.extend(nif_so::group());
@@ -656,6 +660,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(nif_res::group());
     cases.extend(nif_abi::group());
     cases.extend(nif_abi_extra::group());
+    cases.extend(nif_a3::group());
     cases.extend(records::group());
     cases.extend(driver::group());
     cases.extend(driver_c::group());
@@ -669,6 +674,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(dist_extra::group());
     cases.extend(ddll::group());
     cases.extend(decode_packet::group());
+    cases.extend(bif_extra::group());
     cases.extend(bifs::group());
     cases.extend(maps::group());
     cases.extend(phash::group());
