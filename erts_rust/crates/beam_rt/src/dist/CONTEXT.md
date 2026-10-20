@@ -69,8 +69,9 @@ The connecting half is the sibling `src/dist_client/` (not part of this node): i
 - Accepted sockets are **blocking with a `DIST_READ_SLICE` (25 ms) read timeout**; only the *listener* is non-blocking.
   Neither the listener nor a link is registered with `beam_io`'s poller — the only driver is `scheduler_pass`'s `pump_dist`, so a route that runs no scheduler pass never accepts anything.
 - The listener is bound in `Runtime::new` but published to `epmd` (`ALIVE2_REQ`) **on the first pump**, so a runtime that runs no scheduler pass is never resolvable.
-- `Runtime::is_quiescent` (`src/runtime/scheduler.rs`) has **no dist term**: `run_scheduled` reports `blocked` (exit 3) on the first round with `ran == 0 && delivered == 0`, even with a pending inbound connection or a link mid-handshake.
-  A node therefore serves distribution only while some *other* wake source (a timer deadline, a runnable process, a port) keeps the pump stepping — which is why both live dist suites drive a keep-alive fixture's `receive … after 25`.
+- `Runtime::is_quiescent` (`src/runtime/scheduler.rs:590-622`) **has** two dist terms: a node that is not idle (`DistNode::is_idle`, i.e. the one link table holds *some* link — either half, even mid-handshake), and on the client half `DistClient::has_links()` **or** `DistClient::has_pending_outbound()` (a queued signal, or bytes a driver has not yet written).
+  What it still does **not** count is a connection *knocking* on the listener: with no link in the table and nothing queued the node is idle, so `run_scheduled` reports `blocked` (exit 3) on the first round with `ran == 0 && delivered == 0` even while a peer is mid-connect.
+  A node therefore serves distribution only while some wake source — a held link, a queued control, a timer deadline, a runnable process, a port — keeps the pump stepping, which is why both live dist suites drive a keep-alive fixture's `receive … after 25`.
 - `DistConnection::pump` flushes `take_output()` on **both** outcomes, so a refusal status the driver framed (`not_allowed` on a mandatory-flag failure, an accept-decision refusal) still reaches the peer's socket although `step` reports it as `Err`; only a write failure suppresses it, and it retires the link.
 - `DistConnection::close` shuts the socket down in both directions (`ENOTCONN` and the connection-lost errors are the post-condition, not failures), and it is the first thing the link-retirement helper `retire_at` does — on the pump's error arm and on its dead-link (`!is_live()`) arm alike — so a retired link is never left half-open.
 - `DistConnection::peer_visibility` reports how the peer's own flags classify it (`PeerVisibility::Normal`/`Hidden`, `dist_util.erl:publish_type/1`), which is **recorded, never refused**: both ends of an OTP connection may advertise themselves hidden (this runtime's own visibility is `advertised_flags`: published unless `-hidden`).
@@ -90,7 +91,7 @@ The connecting half is the sibling `src/dist_client/` (not part of this node): i
 ## Missing sibling APIs (the still-`Unsupported` families)
 - **The distributed-spawn family** (`SpawnRequest`/`SpawnReply`) needs a `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY` sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` keys into.
 - **`Delivery::Other(_)`** is the link driver's (the C kills the connection outright, `dist.c:2277-2282`).
-- **`beam_dist` still needs two things**: a reply channel on `InboundSink` (`beam_dist/src/delivery.rs:1099` exposes only `deliver`, so the `DOP_EXIT`/`DOP_MONITOR_P_EXIT` `noproc` replies and the `DOP_UNLINK_ID_ACK` cannot be emitted at all — the drain counts only `Delivered`); and this node's own sysname plus creation in `encode_control_cached` (`beam_dist/src/control.rs:214` builds `Encoder::new(atoms)` with no local identity), which is what this crate's `dist/externalize.rs` works around.
+- **`beam_dist` still needs two things**: a reply channel on `InboundSink` (`beam_dist/src/delivery.rs:1144` exposes only `deliver` at `:1151`, so the `DOP_EXIT`/`DOP_MONITOR_P_EXIT` `noproc` replies and the `DOP_UNLINK_ID_ACK` cannot be emitted at all — the drain counts only `Delivered`); and this node's own sysname plus creation in `encode_control_cached` (`beam_dist/src/control.rs:214` builds an `Encoder` from `atoms` alone, with no local identity), which is what this crate's `dist/externalize.rs` works around.
 - The sink carries no **peer** sysname, so a plain `DOP_SEND*` stores the wire sender pid as the mailbox `from` rather than the C's peer node atom — a typed divergence recorded in `dist/inbound.rs` (*the peer's node name … this seam does not carry*), not a blocker: every message and receipt family routes.
 - **Routing an inbound creation family through the nearest public `beam_process` entry point would be WRONG today**: those entry points are the *local-initiated outbound* half and route a `DOP_*` through the installed `DistSignalRouter`, whose auto-echo the C's inbound receipt arms never send (`dist.c:2258` `break; /* Done */`).
 - `beam_process`'s route-free receipt primitives (all present, none echoing a `DOP_*`): `record_remote_link`, `apply_remote_exit_signal`, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote_ref`/`demonitor_from_remote_ref` (the peer-minted wire-reference spellings; the `MonitorRef` ones stay for an internal ref), `remote_monitor_down`, `set_group_leader_from_remote` — the per-family routing table is [`../runtime/CONTEXT.md`](../runtime/CONTEXT.md)'s.
@@ -129,29 +130,46 @@ Remaining A.5 gaps, each typed — never a wrong value:
   `../dist_client/CONTEXT.md`). Emitted unconditionally in the plain form — no `DFLAG_EXIT_PAYLOAD`
   preference — and the routing key is the **watcher's** node. The reverse direction (our record
   receiving the peer's `DOP_MONITOR_P_EXIT`) works too.
-* **`erlang:exit(RemotePid, Reason)` emits no bytes**: the runtime-native floor's `exit_target`
-  (`../native/process/exit.rs:139`) answers `true` for `PidTarget::Remote` without routing. The
-  entry point that would fix it already exists and is unused by the floor:
-  `ProcessTable::send_exit_term` (`../../beam_process/src/ptab.rs:3442`).
-* **An inbound `DOP_ALIAS_SEND` is effectively always `Unsupported`** on the real wire path (an
-  external wire reference cannot resolve through `MonitorRef::from_eterm`, `inbound.rs:456-464`),
-  not the routed arm the table above describes; the outbound `DOP_ALIAS_SEND` (which carries
-  `net_adm:ping/1`'s alias reply) is live.
+* **`erlang:exit(RemotePid, Reason)` sends a real `DOP_EXIT2`**: the floor's `exit_target` routes
+  `PidTarget::Remote` through `exit_remote` (`../native/process/exit.rs:196-202` →
+  `ProcessTable::send_exit_term`) and answers `true`, and the route's failure propagates as the
+  typed error rather than being swallowed. It deliberately does **not** dial a link (a handshake
+  can block; `Runtime::dist_ensure_link` is the *send* path's step), so with no established link
+  the BIF answers the typed `no_link_error` where the oracle answers `true`.
+* **An inbound `DOP_ALIAS_SEND` is served**: every drain installs this node's
+  `beam_dist::control::LocalIdentity`, so the wire reference demotes to an internal
+  `make_internal_ref` and resolves through the runtime's alias store
+  (`inbound.rs::deliver_to_alias`, `:448-479`); a reference that is not a live alias is the C's
+  silent drop (`erl_proc_sig_queue.c:6036-6046`). The outbound `DOP_ALIAS_SEND` (which carries
+  `net_adm:ping/1`'s alias reply) is live too. Residual: a wire reference whose packed id exceeds
+  `MAX_SMALL` is not representable internally and stays external — the typed `Unsupported`.
 * `DFLAG_EXIT_PAYLOAD` **is** advertised (`dist/node.rs:572-574` via `DFLAG_DIST_DEFAULT`,
   `../../beam_dist/src/flags.rs:239`), so the payload opcodes are accepted inbound, but this
   runtime never emits one.
 * `erlang:monitor_node/3` (the `Info`-carrying form) is a typed `unsupported`.
 * `erlang:monitor(process, {Name, Node})` naming **another** node is a typed `unsupported` (`src/native/process/monitor.rs::named_node_target` resolves names on this node only), so a remote **name** monitor has no `DOWN`; a remote **pid** monitor works in both directions.
 * No Erlang-level distribution subtree runs on a `-sname`/`-name` node: the native floor answers `erl_distribution:start_link/0,1` with `ignore`, so `kernel_sup` skips `net_sup`. Measured on a `-sname` node `whereis(net_kernel)` is a live pid (this crate's service) while `whereis(net_sup)`/`whereis(auth)` are `undefined` here vs pids on the oracle; `whereis(kernel_sup)`/`whereis(application_controller)`/`whereis(logger)` are pids on both, `whereis(timer_server)` is `undefined` on both, and `node()`/`is_alive()` agree. Mechanism: `src/native/CONTEXT.md` *The Erlang-level distribution supervisor*.
-* `node/0` and the node atom pid image do reflect the live `-name`/`-sname` node, but `NodeIdentity` reports creation `0` (*Placeholders*, [`../../M1_GAPS.md`](../../M1_GAPS.md)), so a decoded local id is external (see the `beam_codec`/`beam_bifs` handoff).
+* `node/0` and the node atom pid image do reflect the live `-name`/`-sname` node, and `NodeIdentity` reports the **live** creation (`Runtime::node_creation()`, the single source: `DistNode::creation()` while distributed, `0` for `nonode@nohost`), so a decoded local id demotes to an internal term.
 * A `~w`/`~p` of a term holding a **foreign** pid is `beam_codec`'s typed `unsupported_external_term` (`beam_codec/src/error.rs:43`), so a peer's pid cannot be printed.
 * A payload whose local identifier hides in a leaf `holds_local_id` does not descend — a >32-pair hash map, a fun environment, a native record's fields — keeps that same honest refusal rather than risking a wrong term.
 
-**Observation gaps in the inbound path** (both are facts about the wiring, not missing opcode arms):
+**Observation gap in the inbound path** (a fact about the wiring, not a missing opcode arm):
 * Both production drains count **only** `DeliveryOutcome::Delivered` and discard the rest — `dist/node.rs`'s `dispatch_inbound` and `dist_client/client.rs`'s `dispatch` (`filter(|r| r.outcome == DeliveryOutcome::Delivered).count()`), so an `Unsupported`/`Dropped`/`NoSuchProcess` outcome is invisible in production (no log, no `last_error`, no counter).
   Only the explicit seam `Runtime::dispatch_inbound` returns the per-message `Vec<Dispatched>` records that carry the outcome.
-* A `RemotePid` naming **this** node is demoted to a local `ProcessId` in exactly one place — `dist/inbound.rs`'s `resolve` (node **and** creation, number **and** serial).
-  The outbound paths do not demote it: `context/send.rs`'s `classify_send_destination` tests `RemotePid::from_eterm` before any node comparison, and the native monitor's `monitor_target` maps every external pid to `MonitorTarget::Remote`, so such a pid reaches the routing entry as a wire destination and answers `no_link_error` instead of delivering locally.
+* There is exactly **one** demotion rule and it lives in the **decode**, not in the sink: every
+  drain installs this node's `beam_dist::control::LocalIdentity` (the C's `dec_is_this_node`,
+  `external.c:3123-3129`), so a wire pid/reference naming this node at this creation arrives
+  already internal. `dist/inbound.rs`'s `resolve` only **classifies** (internal pid ⇒ `Local`,
+  still-external ⇒ `Foreign`, else `NotAPid`); it demotes nothing.
+  The identity is rebuilt **per drain, per round**, because `beam_term::Atom` is a table-local
+  index and `AtomTable::clone` assigns a fresh instance — an identity interned into another table
+  is silently *inert* (no demotion, never a wrong match), while interning an already-present name
+  costs one hash lookup.
+  The outbound paths do not demote: `context/send.rs`'s `classify_send_destination` tests
+  `RemotePid::from_eterm` before any node comparison, and the native monitor's `monitor_target`
+  maps every external pid to `MonitorTarget::Remote`, so a hand-constructed external pid naming
+  **this** node routes a `DOP_EXIT2`/`DOP_SEND` where the C would handle it locally, and answers
+  `no_link_error` instead of delivering.
 ## See Also
 - `../dist_client/` → the connecting half (outbound client handshake, the queued `DistSignalRouter` and its `flush_pending`).
 - `../CONTEXT.md` → the crate façade and the A.5 status; `../runtime/CONTEXT.md` → the per-pass distribution drive.
