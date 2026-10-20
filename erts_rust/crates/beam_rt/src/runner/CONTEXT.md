@@ -130,7 +130,7 @@ characterisation and figures are in `PERF.md`).
   deadline recovery lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding sits here.
 * [`perf`] — the `+JPperf` code-map feed (contract A.8).
-* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, the `Suspend` BIF-park arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so an untested build is byte-identical to before.
+* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, the `Suspend` BIF-park arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so a build without tests carries none of them.
 
 ## The `BEAM_RT_TIER` modes (`mode_from_value` is the single definition)
 | value | mode | meaning |
@@ -166,8 +166,8 @@ the process-wide `BEAM_RT_TIER` default ([`env_default`]).
 ## The tier is sound for any module
 [`select_entry_tier`] picks `BaselineJit` from the mode alone: there is **no module the baseline tier
 cannot run**, so there is no per-module predicate to consult. A `Step::Enter` — a step that continues
-in *another* module's code — was historically the one shape a native tier could not take (a compiled
-block's code, label map and literal area are all bound to a single module), and the engine's driver now
+in *another* module's code — is the one shape a compiled block cannot take on its own (a compiled
+block's code, label map and literal area are all bound to a single module), so the engine's driver
 handles it: a `Step::Enter` (emitted by a compiled `call_ext`/`return`, or by the interpreter's own
 step) switches the machine context (`Machine::switch_context`), rebinds the module / label map /
 literal area and continues in the **callee's** compiled blocks — including the first sight of a
@@ -226,7 +226,7 @@ The cadence is the **pre-emption** cadence: every slice this arm ends prunes, so
 The per-fixture envelope (one surviving payload, no growth in N) is measured on [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs)'s direct-recursion shape — figures in [`MEASURED.md`](MEASURED.md) *The off-heap prune's per-fixture envelope*.
 **A fun-loop body is covered by the OTHER prune, not this one.** `lists:foldl/3`/`lists:foreach/2` is entered as a *nested* external call, and each application of the lambda is served by `RuntimeContext::apply_fun` → `run_label_blocking`'s own short-lived `Machine` (`context/pump.rs`); when that machine drops its reservoir is handed to the runtime's **escaped-payload store** (`Runtime::eval_off_heap`), never to the process's `Machine::refc_binaries` — so this arm cannot bound it, and the nested-run epilogue does: `RuntimeContext::adopt_nested_payloads` publishes the finished machine's own root set and prunes that store against it (`Runtime::prune_off_heap`, `O(1)`-gated), releasing only the handles the run itself adopted.
 Figures at both payload sizes, and the linear pre-prune counterpart: [`MEASURED.md`](MEASURED.md) *The off-heap prune's per-fixture envelope* — flat in N, with the process's own reservoir at `0` handles throughout and its `erlang:statistics(reductions)` delta `0` (it neither pre-empts nor parks).
-The `-eval` route's escaped store **is** pruned now, at the evaluator's depth-0 statement boundaries (`src/eval/reclaim.rs`), so that route is bounded.
+The `-eval` route's escaped store is pruned at the evaluator's depth-0 statement boundaries (`src/eval/reclaim.rs`), so that route is bounded.
 What is measured, and where the figures live: `erlang:memory(binary)` (`binary_alloc`'s live bytes) and the process's RSS across a build-a-binary loop, against the oracle's — the measured envelope and its caveats are [`../../CONTEXT.md`](../../CONTEXT.md) *Known Issues / Intentional M1 gaps*'s off-heap bullet, whose suite is [`../../tests/off_heap_reclaim.rs`](../../tests/off_heap_reclaim.rs) (the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md) carries the loop workloads' RSS).
 The end-to-end effect on a real workload — `emqx_base62:encode/1` on the unmodified EMQX module, against the oracle and against the same module before the reclamation — is [`MEASURED.md`](MEASURED.md) *The off-heap reclamation end to end*.
 
@@ -277,7 +277,7 @@ Headline rust/sys ratios on this runtime's default baseline-JIT tier against OTP
 | `emqx_base62:encode/1`, end to end | **27.4×**, with `erlang:memory(binary)` and `VmHWM` flat in N |
 
 - **The growth shapes are flat in N, on deterministic counters.** `churn` reads 7.6728–7.6730 collections per iteration and one major per iteration plus a fixed 514 (`reductions`/call 1 808.98–1 809.84) at N = 2 000 / 10 000 / 40 000; `heap_growth` satisfies `collections == N + yields` exactly; both hold one young space at every N.
-- **The boundary door is free on the shape that used to pay**: it fires 0.74 % of `churn`'s own collections (one in ~8 boundary checks) at one collapsed 609-word young space, and the ON-vs-OFF paired difference is exactly 0 on every shape whose `door checks/call` is 0 or ≤1 per run.
+- **The boundary door is free on an allocation-shaped loop**: it fires 0.74 % of `churn`'s own collections (one in ~8 boundary checks) at one collapsed 609-word young space, and the ON-vs-OFF paired difference is exactly 0 on every shape whose `door checks/call` is 0 or ≤1 per run.
 - **The `run` route never sleeps while it has work**: 0 `clock_nanosleep` on a 200 000-round two-process ping-pong, and still ≥1 for a parked `receive … after T`.
 - **The native tier's slice charge is exact**: `reductions == 5N + 9` with a **4 006** ceiling, and a **refusing** seam — not the pricing one — is what ends a slice.
 Everything behind those lines — the per-workload tables and their loop counts, the per-iteration collection/major rates and nursery geometry, the door's ON-vs-OFF A/B and its explicitly un-reverified figures, the `foreign` literal-area-tagging mechanism, the slice budget's full charge table, the off-heap prune's per-fixture envelope and the `emqx_base62:encode/1` end-to-end record — is [`MEASURED.md`](MEASURED.md).
@@ -365,7 +365,7 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
 
 ## Known Issues / Handoffs
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like on an allocation-shaped loop.** Such a runtime runs **zero** collections (the admission declines and the nursery grows instead) where this one collects several times per call, so the difference is the memory management each performs and the heap the other retains, not dispatch or tier.
-  The figures behind that, and the dated 1.25×–1.60× band the allocation-shaped `foreign` rows once read, are [`MEASURED.md`](MEASURED.md) *Not like-for-like*.
+  The figures behind that are [`MEASURED.md`](MEASURED.md) *Not like-for-like*.
 * **A natively executed compiled block is charged at a deopt, a heap-admission point and each **priced**
   BIF/call seam — but only a *refusing* seam can end its slice.** The per-instruction charge belongs to
   the interpreter's loop, so what a native block's budget drains is [`budget`]'s `spend`
@@ -374,7 +374,7 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   **Residual**: a **non-allocating BIF-and-call-only loop still ends no slice of its own** on the native
   tier — `spend` never refuses and is a silent no-op once the budget is gone, so the *single* `Yield`
   such a row reads is the run's **epilogue** seam and the boundary collection door stays unreachable for
-  the loop. Only the memory half of that residual has closed: that one `Yield` does collect, so
+  the loop. The memory half of that residual is served: that one `Yield` does collect, so
   `heap_size` sits on the collector's floor (233) instead of tracking N.
   The exact charge (`reductions == 5N + 9` with its **4 006** ceiling), the allocating shape's
   slices/yields/collections table, the no-epilogue zero-slice row and the interpreter-tier control are
