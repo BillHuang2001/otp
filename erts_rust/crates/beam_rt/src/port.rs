@@ -4917,6 +4917,12 @@ mod exit_status_matrix_tests;
 /// matrix does not grow this one.
 #[cfg(test)]
 mod command_matrix_tests;
+/// The **busy-port park → pump → resume** probe: a compiled process inside a scheduler slice that
+/// is suspended on `erlang:port_command/2`, resumed once the port goes idle, and the driver's
+/// write counter proving the suspending attempt consumed nothing (see
+/// `src/port/busy_suspend_tests.rs`). A separate file so it does not grow this one.
+#[cfg(test)]
+mod busy_suspend_tests;
 /// The A.4 **driver-monitor marking** suite: the runtime's pass-boundary sweep over every live
 /// port's C-driver monitor tree (see `src/port/monitor_tests.rs`). A separate file so the suite
 /// does not grow this one.

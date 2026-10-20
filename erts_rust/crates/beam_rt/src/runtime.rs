@@ -59,8 +59,8 @@ use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_gc::HeapPolicy;
 use beam_loader::Module;
 use beam_process::{
-    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, RemotePid, Scheduler,
-    SignalAtoms,
+    MonitorRef, PortId, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, RemotePid,
+    Scheduler, SignalAtoms,
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
@@ -423,6 +423,29 @@ pub struct Runtime {
     /// (a port operation re-entered from inside a port operation) is reported as a typed
     /// capability gap rather than panicking.
     pub(crate) ports: Rc<RefCell<PortRegistry>>,
+    /// The **busy-port wait clock**: when each `(caller pid, port)` wait for a busy port
+    /// started, so a wait that spans **several scheduler slices** still expires at a fixed wall
+    /// time instead of restarting its deadline on every re-issue.
+    ///
+    /// A plain `erlang:port_command/2,3` on a busy port parks its process (the C's `erts_suspend`
+    /// + `ERTS_BIF_YIELD3` re-run, see [`crate::port::busy_wait`]) and the BIF is re-issued on
+    /// resume. The self-resuming `-eval` route instead pumps the scheduler in place; the deadline
+    /// it enforces is [`crate::port::busy_wait::BUSY_PORT_DEADLINE`] from the **first** attempt,
+    /// and a per-slice [`RuntimeContext`](crate::context::RuntimeContext) cannot remember that —
+    /// it is dropped at the end of every slice (`crate::runner`) — so the start lives here, on
+    /// the one object that outlives them all.
+    ///
+    /// The entry is inserted on the first attempt that observes the port busy and **removed by
+    /// every terminal verdict** of the wait (idle-then-written, port gone, deadline expired), so
+    /// the map holds only waits that are still in flight: it cannot grow, and a stale start can
+    /// never shorten a later unrelated wait. An entry whose process has left the process table is
+    /// pruned when the map is next inserted into (see
+    /// [`Runtime::note_busy_port_wait`]/[`Runtime::clear_busy_port_wait`]).
+    ///
+    /// Keyed by the pair and only ever `insert`/`remove`d — never iterated on the hot path — so it
+    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`], like
+    /// [`Runtime::mailboxes`].
+    pub(crate) busy_port_waits: FastHashMap<(ProcessId, PortId), std::time::Instant>,
     /// The live NIF libraries behind `erlang:load_nif/2` (contract A.3).
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` for the same reason as
@@ -1269,6 +1292,7 @@ impl Runtime {
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
+            busy_port_waits: FastHashMap::default(),
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
             nif_monitors,
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
@@ -1588,6 +1612,42 @@ impl Runtime {
         self.timer_resumes.remove(&pid)
     }
 
+    /// Notes that `pid` has begun waiting for the busy port `port`, and answers the **wait
+    /// start** to measure the deadline from.
+    ///
+    /// A wait that already has an entry keeps it: that is the whole point of the map (see
+    /// [`Runtime::busy_port_waits`]) — a caller parked across several scheduler slices and
+    /// re-issued on each resume must still expire at the *first* attempt's deadline rather than
+    /// restart it. A first attempt inserts [`Instant::now`](std::time::Instant::now).
+    ///
+    /// Entries belonging to a pid the process table no longer holds are pruned here, which is
+    /// what bounds the map: a wait whose process died between park and resume never reaches its
+    /// own terminal verdict, and this is the only cheap place to notice. Ids are never reused by
+    /// this runtime, so a stale entry can never be mistaken for a live one either way.
+    pub(crate) fn note_busy_port_wait(
+        &mut self,
+        pid: ProcessId,
+        port: PortId,
+    ) -> std::time::Instant {
+        if let Some(start) = self.busy_port_waits.get(&(pid, port)) {
+            return *start;
+        }
+        if self.busy_port_waits.len() > 8 {
+            let processes = &self.processes;
+            self.busy_port_waits
+                .retain(|(waiter, _), _| processes.contains(*waiter));
+        }
+        let start = std::time::Instant::now();
+        self.busy_port_waits.insert((pid, port), start);
+        start
+    }
+
+    /// Drops the busy-port wait entry for `(pid, port)` — called from **every terminal verdict**
+    /// of the wait (written, port gone, deadline expired), so the map only ever holds waits that
+    /// are still in flight and a stale start cannot shorten a later unrelated wait.
+    pub(crate) fn clear_busy_port_wait(&mut self, pid: ProcessId, port: PortId) {
+        self.busy_port_waits.remove(&(pid, port));
+    }
     /// The open **whole-file-descriptor** table (contract A.7): the host files
     /// `prim_file:open/2` handed a descriptor for and `prim_file:close/1` has not yet
     /// removed.

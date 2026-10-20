@@ -76,6 +76,13 @@ pub(crate) struct ControlVerb {
     /// (`io.c:4134`, the empty list for every flag word), `Buffer` a driver that answers from a
     /// real buffer (the shape every [`ControlVerb::replying`]/[`ControlVerb::setting`] reply has).
     pub(crate) reply_shape: beam_io::ControlReplyShape,
+    /// Whether serving this verb **clears the port's busy bit** — the C fixture
+    /// `tests/fixtures/busy_driver.c`'s `$N` verb, which calls `set_busy_port(port, 0)` from inside
+    /// its `control` callback (`io.c:5261-5262`, the `erts_port_resume_procs` side of the clear).
+    /// A real driver is the only thing that can clear the bit a `set_busy_port(port, 1)` set, so a
+    /// test that wants a busy port to go idle *from Erlang code* (`port_control(P, $N, <<>>)`) needs
+    /// this side effect on the verb (see [`ControlVerb::clearing`]).
+    pub(crate) clears_busy: bool,
 }
 
 impl ControlVerb {
@@ -86,6 +93,7 @@ impl ControlVerb {
             reply: reply.to_vec(),
             set_flags: None,
             reply_shape: beam_io::ControlReplyShape::Buffer,
+            clears_busy: false,
         }
     }
 
@@ -97,6 +105,22 @@ impl ControlVerb {
             reply: reply.to_vec(),
             set_flags: Some(flags),
             reply_shape: beam_io::ControlReplyShape::Buffer,
+            clears_busy: false,
+        }
+    }
+
+    /// A verb that answers **no bytes** and clears the port's busy bit — the C fixture
+    /// `tests/fixtures/busy_driver.c`'s `$N` (`'N'`, 78) verb, which is `set_busy_port(port, 0)`
+    /// behind a `0` reply (`io.c:5261-5262`). This is what lets Erlang code
+    /// (`erlang:port_control(P, $N, <<>>)`) make a busy port go idle, which is exactly the
+    /// mechanism the C's suspended caller waits for.
+    pub(crate) fn clearing(command: u32) -> ControlVerb {
+        ControlVerb {
+            command,
+            reply: Vec::new(),
+            set_flags: None,
+            reply_shape: beam_io::ControlReplyShape::Buffer,
+            clears_busy: true,
         }
     }
 
@@ -111,6 +135,7 @@ impl ControlVerb {
             reply: Vec::new(),
             set_flags: None,
             reply_shape: beam_io::ControlReplyShape::Null,
+            clears_busy: false,
         }
     }
 }
@@ -211,6 +236,15 @@ impl Driver for ControlDriver {
                 if let Some(bits) = entry.set_flags {
                     self.flags.set(bits);
                 }
+                // The C's `$N`: a driver clears the port's own busy bit from inside its `control`
+                // callback (`set_busy_port(port, 0)`, `io.c:5261-5262`). The handle is the same
+                // one the port's metadata reads (`PortMeta::driver_busy`), so the clear is visible
+                // to `PortRegistry::is_busy` — and therefore to the next command attempt.
+                if entry.clears_busy {
+                    if let Some(busy) = &self.busy {
+                        busy.set_busy(false);
+                    }
+                }
                 // The reply buffer this verb answers with — the fact the bytes cannot carry
                 // (a `NULL` reply and an empty buffer are both zero bytes, but the C renders the
                 // former as `[]` whatever the port's binary flag says, `io.c:4134`).
@@ -274,11 +308,33 @@ pub(crate) fn register_busy_port(
     busy: bool,
     soft_busy: bool,
 ) -> (PortId, BusyFlag, Rc<Cell<usize>>) {
+    register_busy_control_port(runtime, name, Vec::new(), busy, soft_busy)
+}
+
+/// [`register_busy_port`] **plus** the `control` verbs the driver recognises, so a test can make
+/// the port go idle from **Erlang code** — `erlang:port_control(Port, $N, <<>>)` against a
+/// [`ControlVerb::clearing`] verb — the way `tests/fixtures/busy_driver.c`'s `$N` does.
+///
+/// That is what a parked `port_command` caller waits for (`crate::port::busy_wait`): the bit is
+/// cleared by *someone else* while the caller is suspended, so a test that drives the park →
+/// pump → resume loop needs a clear it can reach from another process (or from a
+/// `timer:apply_after/4`) rather than by touching the [`BusyFlag`] handle from Rust.
+///
+/// # Panics
+///
+/// As for [`register_control_port`].
+pub(crate) fn register_busy_control_port(
+    runtime: &mut Runtime,
+    name: &'static str,
+    verbs: Vec<ControlVerb>,
+    busy: bool,
+    soft_busy: bool,
+) -> (PortId, BusyFlag, Rc<Cell<usize>>) {
     let flag = BusyFlag::new();
     flag.set_busy(busy);
     flag.set_soft_busy(soft_busy);
     let (id, _control_flags, writes) =
-        register_driver_port(runtime, name, Vec::new(), None, Some(flag.clone()));
+        register_driver_port(runtime, name, verbs, None, Some(flag.clone()));
     (id, flag, writes)
 }
 

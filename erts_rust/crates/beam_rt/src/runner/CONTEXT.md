@@ -130,7 +130,7 @@ characterisation and figures are in `PERF.md`).
   deadline recovery lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding sits here.
 * [`perf`] — the `+JPperf` code-map feed (contract A.8).
-* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so an untested build is byte-identical to before.
+* [`run`]'s `#[cfg(test)]` slice/park accounting — `RUN_SLICE_COUNTERS` (a per-thread `Cell<RunSliceCounters>`), read through `run_slice_counters()` and zeroed by `reset_run_slice_counters()`: `note_slice_entered()` counts one `RuntimeRunner::run` call (one reduction slice) and `note_slice_parked(preempted)` counts one slice that handed the machine back (the `Yield` pre-emption arm, the `Suspend` BIF-park arm, or the `receive` `Wait` arm). The increments are `#[cfg(test)]`-only, so an untested build is byte-identical to before.
 
 ## The `BEAM_RT_TIER` modes (`mode_from_value` is the single definition)
 | value | mode | meaning |

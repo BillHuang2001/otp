@@ -51,9 +51,15 @@ All 26 committed images, by name (byte sizes are the committed files' own):
 ## Committed oracle fixtures
 
 `mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
-`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam` and
-`pingpong.beam` are committed oracle fixtures: real `.beam` images produced by the **system
-Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam`,
+`port_suspend.beam` and `pingpong.beam` are committed oracle fixtures: real `.beam` images produced
+by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+* `port_suspend.beam` (`port_suspend.erl`, compiled with the plain system `erlc`) is the **busy-port
+  BIF-suspend** image for `src/port/busy_suspend_tests.rs`: `park/1` opens a busy driver port and
+  calls `port_command/2` on it (the shape that parks), and `park_with_clearing_helper/1` additionally
+  spawns a helper that blocks in `receive after 50` and then calls `port_control(Port, $N, <<>>)`
+  (the fixture's `set_busy_port(port, 0)`), so one `run_scheduled` proves park → pump → resume and
+  that the driver was written to **exactly once**.
 * `pingpong.beam` is the **two-process ping-pong** image for the `run` route's sleep
   accounting (`tests/run_route_sleep.rs`): `go/1` spawns one fun-bodied worker and runs `N`
   synchronous round trips (`Worker ! {self(), N}` / a bound-variable `receive {_, N}`, with

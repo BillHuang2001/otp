@@ -444,6 +444,7 @@ impl<'a> RuntimeContext<'a> {
                 current_module: caller_module,
                 engines,
                 gc_armed: _,
+                suspend_requested: _,
                 dispatch_memo: _,
                 lent_tables,
                 copy_out_hint: _,

@@ -111,3 +111,8 @@ mod tests;
 
 pub(crate) use entry::{registered_name, ProcessEntry, RunnerState, UnrunnableProcess};
 pub(crate) use run::RuntimeRunner;
+/// The `#[cfg(test)]` slice/park/suspend accounting, re-exported for the suites outside this
+/// module that pin a structural park (a BIF suspend is not observable any other way — see
+/// `crate::port::busy_suspend_tests`).
+#[cfg(test)]
+pub(crate) use run::{reset_run_slice_counters, run_slice_counters};

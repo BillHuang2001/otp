@@ -170,7 +170,7 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::{ExecutionContext, Machine};
+use beam_engine::{BifOutcome, ExecutionContext, Machine};
 use beam_loader::{Label, Module};
 use beam_term::{Atom, AtomTable, Eterm};
 
@@ -383,6 +383,60 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         self.probe.spend();
         Ok(value)
     }
+
+    /// The **outcome-aware** BIF door, priced exactly like [`call_bif`](ExecutionContext::call_bif).
+    ///
+    /// **Load-bearing** for the suspend channel on the scheduled path: the slice's machine runs
+    /// on *this* wrapper, so without the forward the engine would take the trait default
+    /// (`call_bif(...).map(BifOutcome::Return)`) and never observe a
+    /// [`BifOutcome::Suspend`] — the one caller that can produce one
+    /// ([`RuntimeContext::port_command`](crate::context::RuntimeContext) on a busy port) would
+    /// have its discarded value returned as the BIF's answer instead of parking the process.
+    ///
+    /// Priced **only on [`BifOutcome::Return`]**: a suspend is not a completed BIF, and its
+    /// re-execution prices the call when it actually returns — charging here too would make one
+    /// busy-port wait cost two reductions. An `Err` is not priced, exactly as
+    /// [`call_bif`](ExecutionContext::call_bif) does not price one.
+    fn call_bif_outcome(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        let outcome = ExecutionContext::call_bif_outcome(self.inner, module, function, arity, args)?;
+        self.spend_if_returned(outcome);
+        Ok(outcome)
+    }
+
+    /// The **in-machine outcome-aware** BIF door — the one the slice's machine actually reaches
+    /// ([`wants_bif_in_machine`](ExecutionContext::wants_bif_in_machine) is `true`), so this is
+    /// where a parked `erlang:port_command/2,3` meets the budget.
+    ///
+    /// Forwarded and priced exactly like the pair above: a **spend** on
+    /// [`BifOutcome::Return`], nothing on a suspend or an `Err`.
+    fn call_bif_in_machine_outcome(
+        &mut self,
+        machine: &Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        let outcome = ExecutionContext::call_bif_in_machine_outcome(
+            self.inner,
+            machine,
+            entry_module,
+            module,
+            function,
+            arity,
+            args,
+        )?;
+        self.spend_if_returned(outcome);
+        Ok(outcome)
+    }
+
     /// **Price one reduction per `call_ext*` resolution**, then forward the resolution.
     ///
     /// This is one of the two pricing seams that make a **native** baseline-JIT block's budget
@@ -688,5 +742,18 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     /// the slice's own context decides matching and delivers the `{trace, …}` message.
     fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
         ExecutionContext::trace_event(self.inner, event)
+    }
+}
+
+impl BudgetContext<'_, '_> {
+    /// Price one reduction for an outcome-aware BIF dispatch **only when the BIF completed**.
+    ///
+    /// A [`BifOutcome::Suspend`] is not a completed call: the engine parks the machine without
+    /// applying the instruction, and the resumed BIF prices itself through the same seam when it
+    /// finally returns. Charging a suspend would make one busy-port wait cost two reductions.
+    fn spend_if_returned(&mut self, outcome: BifOutcome) {
+        if outcome.into_value().is_some() {
+            self.probe.spend();
+        }
     }
 }

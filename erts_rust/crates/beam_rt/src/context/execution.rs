@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::ExecutionContext;
+use beam_engine::{BifOutcome, ExecutionContext};
 use beam_loader::{Label, Module};
 use beam_process::PendingSignal;
 use beam_term::{Atom, AtomTable, Eterm};
@@ -174,6 +174,36 @@ impl ExecutionContext for RuntimeContext<'_> {
         Ok(result)
     }
 
+    /// The **outcome-aware** BIF door: [`Self::call_bif`] plus the
+    /// [`suspend_requested`](RuntimeContext::suspend_requested) latch.
+    ///
+    /// A BIF served here can **wait** — `erlang:port_command/2,3` on a busy port whose caller
+    /// may not pump the scheduler is the one such arm
+    /// ([`crate::port::busy_wait::PortWrite::Parked`]) — and the seam's only shapes used to be a
+    /// value and an error, so that caller had to raise a capability gap. It now records a
+    /// **request** on this context ([`RuntimeContext::request_suspend`]) and answers a value the
+    /// engine will discard; this door turns the taken request into
+    /// [`BifOutcome::Suspend`](beam_engine::BifOutcome), and the engine parks the machine on the
+    /// instruction ([`Step::Suspend`](beam_engine::Step)) so the process is re-run there when the
+    /// port goes idle — the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run (`erl_bif_port.c:220-231`).
+    ///
+    /// # Ordering
+    ///
+    /// The value-returning route runs **first** and an `Err` is propagated **unchanged**: a raise
+    /// must never be converted into a suspend (it would silently drop the reason and re-run the
+    /// failing call for ever). The latch is then [`take`](std::mem::take)n unconditionally on the
+    /// `Ok` path, so a bit left behind by some future arm can never leak into the *next*
+    /// dispatch and suspend an unrelated call.
+    fn call_bif_outcome(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        let value = self.call_bif(module, function, arity, args)?;
+        Ok(self.take_bif_outcome(value))
+    }
     /// The engine's **cross-module call seam**
     /// ([`ExecutionContext::resolve_external_call`]): run a `call_ext*` callee's export **in
     /// the running machine** instead of recursing through [`Self::call_bif`].
@@ -840,6 +870,36 @@ impl ExecutionContext for RuntimeContext<'_> {
         self.dispatch_in_machine(machine, entry_module, module, function, arity, args)
     }
 
+    /// The **in-machine outcome-aware** BIF door — `RuntimeContext`'s one load-bearing override
+    /// of the suspend channel.
+    ///
+    /// [`Self::wants_bif_in_machine`] is a constant `true`, so the engine takes **only** this
+    /// door on the scheduled path and this is where a request actually becomes a park. The body
+    /// is [`Self::call_bif_in_machine`] plus
+    /// [`take_bif_outcome`](RuntimeContext::take_bif_outcome), i.e. exactly the
+    /// [`call_bif_outcome`](ExecutionContext::call_bif_outcome) discipline: the dispatch runs
+    /// first, an `Err` is propagated unchanged, and the latch is taken on the `Ok` path only.
+    ///
+    /// # The two wrappers this depends on
+    ///
+    /// The scheduled path's engine context is the slice's `BudgetContext` (in
+    /// [`crate::runner`]), not this context, so that wrapper must forward **both** outcome
+    /// doors — without it the engine would fall back to the trait default
+    /// (`forward(...).map(BifOutcome::Return)`) and a suspended BIF would silently return its
+    /// discarded value as a result.
+    fn call_bif_in_machine_outcome(
+        &mut self,
+        machine: &beam_engine::Machine,
+        entry_module: &Module,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<BifOutcome> {
+        let value =
+            self.call_bif_in_machine(machine, entry_module, module, function, arity, args)?;
+        Ok(self.take_bif_outcome(value))
+    }
     /// Whether the running process requests the `call`/`return_from`/`return_to` execution
     /// trace family (contract A.8).
     ///
@@ -896,5 +956,22 @@ impl RuntimeContext<'_> {
             ));
         }
         served
+    }
+
+    /// Folds the [`suspend_requested`](RuntimeContext::suspend_requested) latch and a BIF's
+    /// value into the engine's [`BifOutcome`] — the shared tail of both outcome doors
+    /// ([`ExecutionContext::call_bif_outcome`] and
+    /// [`ExecutionContext::call_bif_in_machine_outcome`]).
+    ///
+    /// The latch is **always** [`take`](std::mem::take)n, on both verdicts, so it is consumed by
+    /// exactly the dispatch that set it: a bit can never survive into the next dispatch and
+    /// suspend an unrelated call. When it was set the value is dropped unread — the engine never
+    /// applies a suspended instruction, so the discarded answer (the atom `true` from
+    /// [`RuntimeContext::port_command`](crate::context::RuntimeContext)) is unobservable.
+    pub(super) fn take_bif_outcome(&mut self, value: Eterm) -> BifOutcome {
+        if std::mem::take(&mut self.suspend_requested) {
+            return BifOutcome::Suspend;
+        }
+        BifOutcome::Return(value)
     }
 }

@@ -26,8 +26,8 @@
 //! things: it **suspends** the calling process (`erts_suspend`, `erl_bif_port.c:220-231` for
 //! `port_command`, `bif.c:2578-2582` for `send`) and resumes it when the driver clears the bit
 //! (`erts_port_resume_procs`), whereupon the BIF is **re-run** and — the port now being idle —
-//! really writes the command. This module is that wait, for a runtime whose BIF seam has no
-//! engine-side suspend.
+//! really writes the command. This module is that wait: it pumps the scheduler in place when the
+//! caller owns a pass, and asks the engine to park the caller when it does not.
 //!
 //! # Where the wait can run at all
 //!
@@ -51,11 +51,41 @@
 //! either makes progress or waits — never a busy-spin.
 //!
 //! A context that may **not** pump ([`RuntimeContext::may_pump_scheduler`] is `false`: a compiled
-//! process running inside a scheduler slice, `crate::runner`) cannot re-enter the scheduler, and
-//! this runtime has no engine-side BIF-suspend channel through which the process could park and be
-//! re-run. That caller therefore gets [`IdleWait::CannotPump`] immediately and answers the typed
-//! capability gap — a documented residual (see `M1_GAPS.md` §*Ports, drivers and the send family
-//! (A.4)*), never a fabricated `true`.
+//! process running inside a scheduler slice, `crate::runner`) cannot re-enter the scheduler, so it
+//! cannot wait in place. It does not have to: the BIF seam now carries an **outcome-aware door**
+//! ([`ExecutionContext::call_bif_in_machine_outcome`](beam_engine::ExecutionContext)), so such a
+//! caller reports [`IdleWait::Park`] — "suspend me and re-run the instruction" — which
+//! [`crate::context`] turns into a [`BifOutcome::Suspend`](beam_engine::BifOutcome) and the engine
+//! folds into a park on the instruction. That is the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run
+//! (`erl_bif_port.c:220-231`), and the resumed process re-issues the command through this same
+//! function, this time with an idle port.
+//!
+//! # Re-execution safety (the engine's stated host obligation)
+//!
+//! A suspend means "the instruction was not applied and will be re-executed with the same
+//! operands", so the suspending attempt must consume **nothing**:
+//!
+//! * **Nothing is written.** The busy test precedes any queueing: the C's `ERTS_PORT_OP_BUSY` path
+//!   queues nothing and returns before `erts_port_output` touches the driver (`io.c:1763-1769`),
+//!   and this module only ever reports [`PortWrite::Parked`] from the `Busy` arm — the same
+//!   outcome the retry arm treats as "no bytes" (`busy_wait_tests` pins it: the driver's write
+//!   counter stays `0`).
+//! * **The payload is not consumed.** The iodata conversion sits behind an `Fn`, so it is simply
+//!   not called on the busy test — exactly the C's order (`io.c:1749-1754` before `:1790`).
+//! * **The deadline survives.** The 5 s bound is measured from a wait **start** remembered on
+//!   [`Runtime`] and keyed by `(caller pid, port)`
+//!   ([`Runtime::note_busy_port_wait`]/[`Runtime::clear_busy_port_wait`]), not from a
+//!   `Instant::now()` on the per-slice context — which is dropped at the end of every slice
+//!   (`crate::runner`). A caller parked and resumed repeatedly therefore still expires at the
+//!   *first* attempt's deadline instead of restarting it; every terminal verdict (written, gone,
+//!   expired) removes the entry, so the map holds only in-flight waits. The bound applies to the
+//!   **park** route too: a port no driver ever clears becomes the typed deadline gap after
+//!   [`BUSY_PORT_DEADLINE`] rather than re-issuing the BIF for ever.
+//!
+//! A **nested** run started from inside a BIF (a `run_export_blocking` on a `for_process*`
+//! context) is a different matter: a blocking entry folds a suspend into the typed
+//! [`beam_engine::error::suspended`], so such a caller still gets a typed gap, never a wrong
+//! answer.
 //!
 //! [`RuntimeContext::may_pump_scheduler`]: crate::context::RuntimeContext
 
@@ -93,11 +123,19 @@ pub(crate) const DEADLINE_REASON: &str =
     "port_command on a busy port: the port was still busy after the 5 s wait, so the caller was \
      not resumed (the C suspends it for ever)";
 
-/// The capability-gap reason for a caller that owns no scheduler pass.
+/// The capability-gap reason for a caller that owns no scheduler pass **and** has no outcome-aware
+/// BIF door to park through.
+///
+/// Since the BIF suspend channel landed this is **not** reachable from
+/// `erlang:port_command/2,3` (that arm now parks: [`IdleWait::Park`]). It still names the two arms
+/// that have no door: the shared **`send`-to-port** route
+/// ([`send_message_to_port`], reached from the inline `Instr::Send`/`!` instruction as well as from
+/// `erlang:send/2,3`, which cannot consume a latch the inline instruction set) and
+/// [`crate::port::PortRegistry::write_command`], which has no `Runtime` to pump with at all.
 pub(crate) const NO_PUMP_REASON: &str =
-    "port_command on a busy port: this caller runs inside a scheduler slice and cannot re-enter \
-     the scheduler to wait for the port (the runtime has no engine-side BIF-suspend channel that \
-     would park it and re-run the BIF)";
+    "port command on a busy port: this caller runs inside a scheduler slice and has no \
+     outcome-aware BIF door to park through, so it cannot re-enter the scheduler to wait for the \
+     port";
 
 /// The capability-gap reason for a port that reported busy **again** immediately after the wait
 /// observed it idle.
@@ -120,6 +158,17 @@ pub(crate) enum PortWrite {
     /// written — the C's `ERTS_PORT_OP_BUSY` under `ERTS_PORT_SIG_FLG_NOSUSPEND`, which
     /// `port_command/3` renders as the atom `false` and `send/3` as the atom `nosuspend`.
     Suspended,
+    /// The port was busy and the caller **may not pump** the scheduler, so it must be suspended
+    /// and the instruction re-run once the port goes idle — the C's `erts_suspend` +
+    /// `ERTS_BIF_YIELD*` re-run (`erl_bif_port.c:220-231`, `io.c:5265`).
+    ///
+    /// Nothing was queued, written or converted (see the module docs' re-execution-safety
+    /// section), and the wait's start is recorded on the [`Runtime`] so the deadline survives the
+    /// re-issue. The BIF arm folds this into
+    /// [`RuntimeContext::request_suspend`](crate::context::RuntimeContext), which the outcome door
+    /// turns into [`BifOutcome::Suspend`](beam_engine::BifOutcome). The `send` arm has no such
+    /// door (see [`NO_PUMP_REASON`]) and raises there instead.
+    Parked,
 }
 
 /// What the **send** route's port arm produced — [`PortWrite`] plus the one verdict only a `send`
@@ -171,8 +220,14 @@ pub(crate) enum IdleWait {
     Gone,
     /// The deadline expired with the port still busy.
     Deadline,
-    /// The caller may not re-enter the scheduler, so it cannot wait at all.
-    CannotPump,
+    /// The caller may not re-enter the scheduler, so it cannot wait in place: it must be
+    /// suspended and the instruction re-issued on resume (the C's `erts_suspend` +
+    /// `ERTS_BIF_YIELD*` re-run).
+    ///
+    /// A park is reached only while the wait is **inside** its deadline: the same
+    /// [`BUSY_PORT_DEADLINE`] bounds this route, so a port that never goes idle expires into
+    /// [`IdleWait::Deadline`] (the C's wait is unbounded) instead of re-executing the BIF for ever.
+    Park,
 }
 
 /// Issues one port command, applying the C's suspend-and-retry loop exactly as
@@ -205,18 +260,36 @@ where
     F: Fn() -> Result<Vec<u8>>,
 {
     match attempt(runtime, owner, id, &make_data, options)? {
-        PortCommandOutcome::Done => Ok(PortWrite::Written),
+        PortCommandOutcome::Done => {
+            // A completed write ends the wait, if this caller had one in flight.
+            runtime.clear_busy_port_wait(owner, id);
+            Ok(PortWrite::Written)
+        }
         PortCommandOutcome::Busy if options.is_nosuspend() => Ok(PortWrite::Suspended),
         PortCommandOutcome::Busy => {
-            match wait_until_idle(runtime, may_pump, id)? {
+            match wait_until_idle(runtime, may_pump, owner, id)? {
                 IdleWait::Idle => {}
-                IdleWait::Gone => return Err(BeamError::BadArg),
-                IdleWait::Deadline => return Err(error::unsupported(DEADLINE_REASON)),
-                IdleWait::CannotPump => return Err(error::unsupported(NO_PUMP_REASON)),
+                IdleWait::Gone => {
+                    runtime.clear_busy_port_wait(owner, id);
+                    return Err(BeamError::BadArg);
+                }
+                IdleWait::Deadline => {
+                    runtime.clear_busy_port_wait(owner, id);
+                    return Err(error::unsupported(DEADLINE_REASON));
+                }
+                // The caller cannot pump, so it must be parked and re-run: nothing was written
+                // and nothing converted (see the module docs' re-execution-safety section).
+                IdleWait::Park => return Ok(PortWrite::Parked),
             }
             match attempt(runtime, owner, id, &make_data, options)? {
-                PortCommandOutcome::Done => Ok(PortWrite::Written),
-                PortCommandOutcome::Busy => Err(error::unsupported(BUSY_AGAIN_REASON)),
+                PortCommandOutcome::Done => {
+                    runtime.clear_busy_port_wait(owner, id);
+                    Ok(PortWrite::Written)
+                }
+                PortCommandOutcome::Busy => {
+                    runtime.clear_busy_port_wait(owner, id);
+                    Err(error::unsupported(BUSY_AGAIN_REASON))
+                }
             }
         }
     }
@@ -258,9 +331,11 @@ where
 pub(crate) fn wait_until_idle(
     runtime: &mut Runtime,
     may_pump: bool,
+    owner: ProcessId,
     id: PortId,
 ) -> Result<IdleWait> {
-    wait_until_idle_by(runtime, may_pump, id, Instant::now() + BUSY_PORT_DEADLINE)
+    let start = runtime.note_busy_port_wait(owner, id);
+    wait_until_idle_by(runtime, may_pump, owner, id, start + BUSY_PORT_DEADLINE)
 }
 
 /// [`wait_until_idle`] against an explicit deadline — the form the unit tests use, so a deadline
@@ -272,9 +347,13 @@ pub(crate) fn wait_until_idle(
 fn wait_until_idle_by(
     runtime: &mut Runtime,
     may_pump: bool,
+    owner: ProcessId,
     id: PortId,
     deadline: Instant,
 ) -> Result<IdleWait> {
+    // Record the wait start before the first state read, so the deadline a *re-issued* wait
+    // measures from is the first attempt's (`Runtime::note_busy_port_wait` is idempotent).
+    let _ = runtime.note_busy_port_wait(owner, id);
     loop {
         match port_state(runtime, id)? {
             // The port is gone: `port_command` is `badarg` and `send/2` is the silent success.
@@ -282,13 +361,20 @@ fn wait_until_idle_by(
             Some(false) => return Ok(IdleWait::Idle),
             Some(true) => {}
         }
-        // A caller inside a scheduler slice may not re-enter the scheduler, and there is no
-        // engine-side BIF suspend to park it: report the blocker rather than spin or lie.
-        if !may_pump {
-            return Ok(IdleWait::CannotPump);
-        }
+        // The deadline is tested **before** the park verdict, so it bounds both routes. The C is
+        // unbounded here (a suspended process waits until the driver clears the bit, however long
+        // that takes), and a parked caller is re-run once per slice — so without this a port no
+        // driver ever clears would re-execute the BIF for ever instead of failing after
+        // [`BUSY_PORT_DEADLINE`]. The wait start is the **first** attempt's
+        // ([`Runtime::note_busy_port_wait`] is idempotent), so a caller parked and resumed
+        // repeatedly still expires at that first deadline.
         if Instant::now() >= deadline {
             return Ok(IdleWait::Deadline);
+        }
+        // A caller inside a scheduler slice may not re-enter the scheduler: it must be parked
+        // and the instruction re-issued on resume (see the module docs).
+        if !may_pump {
+            return Ok(IdleWait::Park);
         }
         runtime.pump_scheduler(BUSY_PORT_PUMP_SLICES)?;
     }
@@ -356,6 +442,11 @@ pub(crate) fn send_message_to_port(
             let options = PortCommandOptions::EMPTY.with_nosuspend(nosuspend);
             let written = issue(runtime, may_pump, owner, id, || data_bytes(data), options);
             match written {
+                // This route has **no outcome-aware BIF door** to park through: it is also the
+                // inline `Instr::Send`/`!` instruction, which cannot consume a suspend latch
+                // (see `RuntimeContext::suspend_requested`), so a busy port in a slice stays the
+                // typed capability gap instead of parking.
+                Ok(PortWrite::Parked) => Err(error::unsupported(NO_PUMP_REASON)),
                 // `DONE`, and the `nosuspend` arm: the caller folds the verdict into its answer.
                 Ok(write) => Ok(PortSend::Write(write)),
                 // The C's silent success for a port that is not there and for whatever the port
