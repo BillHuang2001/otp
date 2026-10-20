@@ -84,10 +84,11 @@
 //! delivers (see [`PendingNifSend`]).
 //! `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's rule since OTP 20).
 //!
-//! # Hooks still at the trait default — and exactly why
+//! # The remaining hooks — and exactly why
 //!
-//! The rest of [`NifHost`] is **not** unimplemented by oversight: each hook needs runtime state this
-//! host cannot reach, so it keeps [`beam_abi`]'s typed default rather than inventing an answer. Every
+//! The rest of [`NifHost`] is **not** unimplemented by oversight: a hook that answers with
+//! [`beam_abi`]'s typed default needs runtime state this host cannot reach, so it keeps that default
+//! rather than inventing an answer (the ones below that are live say what they really do). Every
 //! seam that would close one lives outside this file (crate `CONTEXT.md` handoffs); the `enif_*`
 //! C-variadic functions (`make_tuple`/`make_list`/`set_option`/the `*printf` family,
 //! rust-lang/rust#44930) cannot exist in stable Rust at all.
@@ -111,12 +112,18 @@
 //!   `{select, ResourceTerm, Ref, EventAtom}` to a pid. The hook is live:
 //!   [`crate::nif_select`] decodes the mask and drives the port layer's select store, and the
 //!   notification's resource term is minted at delivery by
-//!   [`resource_term_for`] (see `src/port/CONTEXT.md`); the resource type's `stop` callback has no
-//!   seam here, so a `STOP` keeps the C's fast-track answer.
-//! * **`schedule_nif`** (`:3560-3604`) — re-enters the NIF through the emulator's scheduling
-//!   trampoline or moves it to a dirty scheduler. This runtime has neither
-//!   (`dirty_scheduler_support = 0`) and its call stack is the engine's. Default `badarg` — the C's
-//!   own answer for a bad flag.
+//!   [`resource_term_for`] (see `src/port/CONTEXT.md`). The `STOP` half's **callback** is not a host
+//!   hook: this host answers only the code, and `beam_abi`'s `enif_select`
+//!   (`nif::enif::select::service_stop_verdict`) reads that code back and runs the resource type's
+//!   `stop` synchronously with `is_direct_call = true` for a `STOP_CALLED` answer — which is every
+//!   STOP this runtime ever produces, because the select store de-registers immediately and never
+//!   defers (see [`crate::nif_select`]).
+//! * **`schedule_nif`** (`:3560-3604`) — a **legacy hook `beam_abi` never consults**: the
+//!   continuation trampoline (`beam_abi::nif::enif::schedule`) runs the scheduled call itself, so
+//!   this host implements nothing for it. The one thing a chain *is* asked for is
+//!   [`NifHost::nif_yield_point`] once per trampoline iteration, and [`NifHostImpl`] overrides it
+//!   with an explicit, documented no-op — a **fairness** gap (a self-rescheduling chain keeps this
+//!   thread until it ends, where the oracle preempts it), never a wrong result.
 //! * **`dynamic_resource_call`** (`:3297-3323`) — resolves a resource term minted by **another** NIF
 //!   module and calls that type's `dyncall`; `beam_abi`'s registry (a thread-local) resolves only the
 //!   terms *it* minted, so this needs a per-library `{module, name}`-keyed resource-type registry.
@@ -1331,6 +1338,37 @@ impl NifHost for NifHostImpl<'_> {
             .select(event, mode, obj, pid, self_pid, reference)
     }
 
+    /// A **no-op, deliberately and by argument** — the honest answer for this runtime's one
+    /// participation in an `enif_schedule_nif` chain.
+    ///
+    /// `beam_abi`'s continuation trampoline (`beam_abi::nif::enif::schedule`) runs the scheduled
+    /// calls itself and asks the host for nothing but this yield point, once per iteration. Nothing
+    /// here can act on it, for three reasons that are facts about this runtime rather than hopes:
+    ///
+    /// * **A chain runs inside one BIF call, on the engine's thread.** The whole schedule is entered
+    ///   from `call_ext` dispatch and has to hand a term back to the instruction that made the call,
+    ///   so there is no point inside the chain at which this runtime may re-enter its own scheduler.
+    ///   That is the same constraint [`crate::context::nif_send::deliver`] encodes: its nested send
+    ///   context sets `may_pump_scheduler = false` because re-entering the scheduler from under a NIF
+    ///   "would run a second process from within the first one's slice".
+    /// * **No reduction or timeslice primitive is reachable from a host.**
+    ///   [`NifHost::consume_timeslice`] is itself a documented default here — the calling process's
+    ///   reduction budget belongs to the slice's `BudgetProbe`, which the runner charges and turns
+    ///   into a yield — so a second, uncoordinated charge of the same quantum is exactly what this
+    ///   runtime does not do. A yield point has nothing to charge and nothing to ask.
+    /// * **A dirty-flagged continuation runs on the calling thread.** This runtime's emulator
+    ///   information block reports `dirty_scheduler_support: 0`
+    ///   ([`NifHost::system_info`]), so there is no dirty pool to hand a continuation to.
+    ///
+    /// **The gap this leaves is fairness, never correctness**: a self-rescheduling chain keeps this
+    /// thread until it ends, where the oracle preempts it (with `+S 1:1`, an unrelated process ran
+    /// 3 000 033 `receive … after 0` iterations while a 3 000 000-entry chain ran). Faking a yield
+    /// would be worse than the gap: the chain's env and `argv` point into the C call frames it is
+    /// running in, so there is nothing a "resume later" could re-enter.
+    fn nif_yield_point(&mut self, flags: core::ffi::c_int) {
+        let _ = flags;
+    }
+
     /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.
     ///
     /// One monotonic counter per property combination, so a value under `[positive, monotonic]` is
@@ -1360,11 +1398,11 @@ impl NifHost for NifHostImpl<'_> {
     /// (`io.c`'s `driver_system_info`); `async_threads` is `0` because this runtime has no async
     /// pool. `scheduler_threads` is the runtime's **real** normal-scheduler count, the value the
     /// host was built with (from [`crate::info::schedulers_count`] — `+S N` or the machine's
-    /// parallelism). `dirty_scheduler_support` is `0`: this runtime has **no** dirty schedulers and
-    /// its `enif_schedule_nif` hook is unsupported, so reporting them as available would be a
-    /// capability lie the C only avoids because OTP always builds them in. The four ABI-version
-    /// fields are `beam_abi`'s compile-time constants (the C hard-codes them in `driver_system_info`
-    /// too), and `enif_system_info` overwrites them anyway.
+    /// parallelism). `dirty_scheduler_support` is `0`: this runtime has **no** dirty schedulers — a
+    /// dirty-flagged `enif_schedule_nif` continuation runs on the calling thread — so reporting them
+    /// as available would be a capability lie the C only avoids because OTP always builds them in. The
+    /// four ABI-version fields are `beam_abi`'s compile-time constants (the C hard-codes them in
+    /// `driver_system_info` too), and `enif_system_info` overwrites them anyway.
     fn system_info(&mut self) -> Option<ErlDrvSysInfo> {
         Some(ErlDrvSysInfo {
             driver_major_version: beam_abi::ERL_DRV_EXTENDED_MAJOR_VERSION,

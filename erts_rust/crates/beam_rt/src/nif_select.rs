@@ -65,10 +65,26 @@
 //! `ERL_DRV_READ | ERL_DRV_WRITE | ERL_DRV_USE` (`:1274-1276`) and runs its "off" path, which ORs
 //! those bits (`:1470-1482`) and then adds `ERL_NIF_SELECT_STOP_CALLED` (`:1497-1510`). A stop on a
 //! descriptor that was never armed is `ERL_NIF_SELECT_STOP_CALLED` alone — the C's own fast track
-//! (`call_stop = CALL_STOP; ret = ERL_NIF_SELECT_STOP_CALLED;`, `:1276-1280`). **Residual:** the
-//! resource type's `stop` callback has no seam on this side — it is the resource registry's
-//! (`beam_abi`), reached from the `enif_*` entry point rather than from a host hook — so no `stop`
-//! callback is invoked and `ERL_NIF_SELECT_STOP_SCHEDULED` (`:1500`) is never answered.
+//! (`call_stop = CALL_STOP; ret = ERL_NIF_SELECT_STOP_CALLED;`, `:1276-1280`).
+//!
+//! # The stop callback itself runs in `beam_abi`, and every STOP here is `STOP_CALLED`
+//!
+//! This module answers the **code** only. The resource type's `stop` callback is the ABI layer's:
+//! `beam_abi`'s `enif_select` (`nif::enif::select::service_stop_verdict`) reads the verdict back off
+//! that code and, for a `STOP_CALLED`, runs the callback **synchronously** with
+//! `is_direct_call = true` — the C's scheduler-side call (`erl_check_io.c:1531`).
+//!
+//! `ERL_NIF_SELECT_STOP_SCHEDULED` — the verdict that parks the callback for a later drain — is
+//! **unreachable from this runtime**, and that is a fact about the store, not a hook left
+//! unimplemented: [`PortRegistry::stop_nif_select`] de-registers the descriptor immediately
+//! ([`SelectWatch::stop`](crate::port::select::SelectWatch::stop) takes the registration out of every
+//! index and hands its poller key to `Poller::deregister`), so no stop is ever deferred and nothing is
+//! ever parked. The C's `STOP_SCHEDULED` arm exists for the select/poll **fallback** driver, whose
+//! `wake_poller` defers the stop to the poller thread
+//! (`erts/emulator/sys/common/erl_check_io.c:1485-1517`, `erl_poll.c:761-877`); this runtime polls
+//! through one `beam_io::Poller` and owns no such fallback. `beam_abi`'s pending-stop table
+//! (`beam_abi::nif::enif::stop::run_pending_stops`) therefore has nothing to run here, and this
+//! runtime **adds no drain call** — a poll-loop call to it would be a no-op pretending to be a hook.
 
 use core::ffi::{c_int, c_void};
 use std::cell::RefMut;
@@ -124,7 +140,8 @@ pub(crate) fn select(
 
     // `STOP` (`:1272-1290`): delete the descriptor's registration and answer the C's
     // "stop callback called". It wins over every other bit, as in the C (`mode` is rewritten to
-    // `READ | WRITE | USE` there and the mask is never decoded).
+    // `READ | WRITE | USE` there and the mask is never decoded). The callback the answer names is
+    // `beam_abi`'s to run, synchronously, once this code is returned (module docs).
     if mode.intersects(ErlNifSelectFlags::STOP) {
         let stopped = {
             let mut registry = borrow_ports(services)?;
