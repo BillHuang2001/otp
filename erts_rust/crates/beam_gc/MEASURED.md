@@ -312,7 +312,8 @@ is never realized. Folding the young occupancy in makes the mature region able t
 promotion, so minors actually run and dominate the cadence (**147 vs 73**).
 
 **Bounded, not creeping.** Both capacities are a single constant across the 200 measured rounds. The
-young occupancy is capped by the nursery capacity, which `young_after_collection` itself keeps bounded,
+young occupancy is capped by the nursery capacity, which the live-set nursery target keeps bounded
+(`[4/3 × target, YOUNG_SHRINK_FACTOR × target]` around `young_target_words(live)`),
 so the grow branch's target `next_words(need_after, 0)` is a fixed point (376 for the Copying default,
 1024 for the Immix policy above) — memory does **not** grow per collection. Using the **mature**
 occupancy instead would be garbage-inflated and creep without bound; that is why only the young
