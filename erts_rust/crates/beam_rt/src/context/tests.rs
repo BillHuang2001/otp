@@ -3497,8 +3497,9 @@ fn bif_tab_or_skip(banner: &str) -> Option<&'static BifTab> {
 }
 
 /// A stdlib **fast path** (`lists:map/2`) is NOT a builtin: with `lists` unloaded the answer
-/// must be `false`. This is the regression test for the wrong-value bug (the registry holds
-/// 640 keys, 79 of them stdlib fast paths, so `BifRegistry::contains` alone answered `true`).
+/// must be `false`. This is the regression test for the wrong-value bug — the registry holds
+/// stdlib fast paths beside the declared `bif.tab` keys (`beam_bifs/tests/roster_audit.rs` pins
+/// the split), so `BifRegistry::contains` alone answered `true`.
 #[test]
 fn function_exported_does_not_report_a_stdlib_fast_path_as_exported() {
     let mut rt = runtime();
