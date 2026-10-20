@@ -37,10 +37,10 @@
 //! |---|---|---|
 //! | declared (`bif.tab`) | 556 | `bif 476 + ubif 73 + hbif 7` |
 //! | registry | 667 | 556 declared + 111 stdlib fast paths |
-//! | seam union | 217 | the 14 tables, deduped (`221 raw − 4 shared`) |
-//! | declared seam-backed | 187 | union members the table declares |
-//! | declared in-crate | 369 | `556 − 187`, no table lists them |
-//! | undeclared seam members | 30 | the union members registered as stdlib fast paths |
+//! | seam union | 219 | the 14 tables, deduped (`223 raw − 4 shared`) |
+//! | declared seam-backed | 186 | union members the table declares |
+//! | declared in-crate | 370 | `556 − 186`, no table lists them |
+//! | undeclared seam members | 33 | the union members registered as stdlib fast paths |
 //!
 //! "Adopted" is *not* the same as "registered": a union member returns the typed
 //! `unsupported_bif` until its host hook is installed. This audit pins only the
@@ -113,10 +113,10 @@ const FAST_PATHS: usize = 111;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.
-const SEAM_UNION: usize = 217;
-const DECLARED_SEAM_BACKED: usize = 187;
-const DECLARED_IN_CRATE: usize = 369;
-const UNDECLARED_SEAM_MEMBERS: usize = 30;
+const SEAM_UNION: usize = 219;
+const DECLARED_SEAM_BACKED: usize = 186;
+const DECLARED_IN_CRATE: usize = 370;
+const UNDECLARED_SEAM_MEMBERS: usize = 33;
 /// The keys two tables share — the four external-term encoders, which read the
 /// fun-identity **and** the local-node seams.
 const SHARED_UNION_KEYS: usize = 4;
@@ -127,7 +127,7 @@ const SHARED_UNION_KEYS: usize = 4;
 /// [`TABLES`] order; the total column sums to [`SEAM_UNION`] + [`SHARED_UNION_KEYS`].
 const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("MEMORY_HOOK_BIFS", 2, 0),
-    ("LOCAL_FUN_IDENTITY_BIFS", 4, 4),
+    ("LOCAL_FUN_IDENTITY_BIFS", 9, 6),
     ("DICT_HOOK_BIFS", 7, 7),
     ("PROCESS_HOOK_BIFS", 11, 11),
     ("PORT_HOOK_BIFS", 8, 4),
@@ -139,7 +139,7 @@ const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("PERSISTENT_TERM_BIFS", 7, 7),
     ("FUN_CALLER_BIFS", 24, 0),
     ("LOCAL_NODE_BIFS", 6, 2),
-    ("RUNTIME_HOOKS_BIFS", 143, 143),
+    ("RUNTIME_HOOKS_BIFS", 140, 140),
 ];
 
 /// The declared entries per module, recomputed from the parsed table and pinned in
@@ -391,15 +391,18 @@ fn the_undeclared_seam_members_are_stdlib_fast_paths() {
             key.2
         );
     }
-    // Exactly the three wholly-undeclared tables contribute: the memory pair, the port
+    // Exactly the four partly-undeclared tables contribute: the memory pair, the port
     // operations (of which the table declares only the four `erts_internal:` spellings,
-    // not the four `erlang:` ones) and the fun-taking surface. Each table's rows are
+    // not the four `erlang:` ones), the fun-taking surface, and the fun **renderers**
+    // (`erlang:display/1` and `erlang:fun_to_list/1` are declared BIFs, while the three
+    // `io`/`io_lib` printer keys are stdlib fast paths). Each table's rows are
     // filtered through the parsed table, so a *declared* row simply is not an undeclared
     // member — the expected set stays a construction, never a hand-written list.
     let expected: BTreeSet<(String, String, u32)> = [
         ("MEMORY_HOOK_BIFS", MEMORY_HOOK_BIFS),
         ("PORT_HOOK_BIFS", PORT_HOOK_BIFS),
         ("FUN_CALLER_BIFS", FUN_CALLER_BIFS),
+        ("LOCAL_FUN_IDENTITY_BIFS", LOCAL_FUN_IDENTITY_BIFS),
     ]
     .iter()
     .flat_map(|(_, table)| {

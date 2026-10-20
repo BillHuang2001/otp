@@ -788,7 +788,7 @@ fn build_map(
     t: i64,
     order: MapOrder,
 ) -> Result<Node> {
-    let pairs: Rc<[(Eterm, Eterm)]> = resolve_map_pairs(term, order, ctx.atoms())?.into();
+    let pairs: Rc<[(Eterm, Eterm)]> = resolve_map_pairs(term, order, ctx)?.into();
     let seq = map1(ctx, &pairs, printable, 0, d, d - 1, tsub(t, 3), order)?;
     let (len, dots) = list_length(&seq, 3, 0);
     Ok(Node {

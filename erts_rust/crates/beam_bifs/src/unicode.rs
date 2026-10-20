@@ -114,6 +114,7 @@ use crate::error::badarg;
 use crate::registry::BifRegistry;
 
 pub(crate) mod grapheme;
+pub(crate) mod normalize;
 mod wide;
 
 // ---------------------------------------------------------------------------
@@ -216,7 +217,7 @@ struct Leftover {
 
 /// The outcome of trying to decode one UTF-8 sequence (`cbv/2` plus the
 /// `<<U/utf8>>` pattern's validation).
-enum Decode {
+pub(crate) enum Decode {
     /// A code point and the number of bytes it occupied.
     Ok(u32, usize),
     /// Not a valid sequence (bad continuation, overlong, surrogate, out of range,
@@ -232,7 +233,7 @@ enum Decode {
 /// `0xE0` needs a second byte `>= 0xA0`, a `0xED` second byte `>= 0xA0` would be a
 /// surrogate, `0xF0` needs a second byte `>= 0x90`, and the 4-byte form must stay
 /// at or below `U+10FFFF`.
-fn decode_one(bytes: &[u8]) -> Decode {
+pub(crate) fn decode_one(bytes: &[u8]) -> Decode {
     let b0 = bytes[0];
     if b0 & 0x80 == 0 {
         return Decode::Ok(u32::from(b0), 1);

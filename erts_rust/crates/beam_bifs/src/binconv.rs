@@ -230,8 +230,8 @@ use std::cell::RefCell;
 
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
-    decode_term_with_options_and_gate_used, decode_term_with_options_used, DecodeOptions, Encoder,
-    MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
+    decode_term_with_options_and_gate_used, decode_term_with_options_used, AtomCache, DecodeOptions,
+    Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
 };
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm, NIL};
@@ -1785,13 +1785,7 @@ fn decode_term_bif(
             // A failed decode leaves the scratch possibly ahead of the shared table (the
             // next call's `prefix_matches` rebuilds it); nothing is committed.
             let fresh: Vec<String> = if decoded.is_ok() {
-                (known..scratch.len())
-                    .filter_map(|index| {
-                        scratch
-                            .name(Atom::from_raw(index as u32))
-                            .map(str::to_string)
-                    })
-                    .collect()
+                names_since(scratch, known)
             } else {
                 Vec::new()
             };
@@ -1817,6 +1811,83 @@ fn decode_term_bif(
         Ok(term)
     }
 }
+
+/// The names the decode scratch holds at `known..` — exactly the atom names the
+/// decoder appended, in index order, i.e. the ones that must be committed to the
+/// shared table at those very indices.
+fn names_since(scratch: &AtomTable, known: usize) -> Vec<String> {
+    (known..scratch.len())
+        .filter_map(|index| {
+            scratch
+                .name(Atom::from_raw(index as u32))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Decodes a **distribution** external-term image into the context's heap,
+/// resolving `ATOM_CACHE_REF` (`82`) through `cache`.
+///
+/// This is the decode behind `erts_debug:dist_ext_to_term/2` — the C's
+/// `erts_decode_dist_ext` (`../../erts/emulator/beam/external.c:1273-1311`), reached
+/// from `erts_debug_dist_ext_to_term_2` (`:1340-1405`). It is the same
+/// [`beam_codec::Decoder`] every other decode in this crate uses, installed with the
+/// codec's [`AtomCache`](beam_codec::AtomCache) — there is no second decoder. The
+/// semantics that differ from `binary_to_term/1` are the C's:
+///
+/// * `data` must begin with `VERSION_MAGIC` (131) — [`Decoder::new`] consumes and
+///   requires it, exactly the C's `if (*ep != VERSION_MAGIC) goto error`;
+/// * **trailing bytes are ignored** (the C decodes one term and returns it), so this
+///   entry point deliberately does not call [`Decoder::finish`];
+/// * an `ATOM_CACHE_REF` whose slot the caller left unset is `BeamError::BadArg`
+///   (the codec's own bound check, the C's `attab` lookup).
+///
+/// The decode runs against the per-thread [`DECODE_SCRATCH`] exactly like
+/// [`decode_term_bif`], and the names it appends are then committed to the shared
+/// table through [`BifContext::intern_atom`] — so a wire atom **name** is interned
+/// (which is also what the C's flag-free distribution decode does: the sender only
+/// caches names, so a non-cached name travels in full and is put) and the returned
+/// term's atom indices name real atoms in the caller's table.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a missing/mismatched
+/// version byte, a malformed/truncated image and an unset atom-cache slot, plus the
+/// codec's own typed errors where it has a finer one. A `COMPRESSED` (`80`) wrapper
+/// is also `BadArg` — and that is what the oracle answers for such an image: the
+/// C's `erts_decode_dist_ext_size` sizing pass (`external.c:1193-1250` →
+/// `decoded_size`) has no `COMPRESSED` arm, so the BIF refuses the image before a
+/// heap factory exists.
+pub(crate) fn decode_dist_ext_image(
+    ctx: &mut BifContext<'_>,
+    data: &[u8],
+    cache: &AtomCache,
+) -> Result<Eterm> {
+    let (decoded, fresh) = {
+        let (shared, heap) = ctx.atom_and_heap();
+        with_decode_scratch(shared, |scratch| {
+            let known = scratch.len();
+            let decoded = match Decoder::new(data) {
+                Ok(decoder) => decoder.with_atom_cache(cache).decode(heap, scratch),
+                Err(error) => Err(error),
+            };
+            // A failed decode may leave the scratch ahead of the shared table (the
+            // next call's `prefix_matches` rebuilds it); nothing is committed.
+            let fresh: Vec<String> = if decoded.is_ok() {
+                names_since(scratch, known)
+            } else {
+                Vec::new()
+            };
+            (decoded, fresh)
+        })
+    };
+    let term = decoded?;
+    for name in &fresh {
+        ctx.intern_atom(name)?;
+    }
+    Ok(term)
+}
+
 /// Registers the `erlang` binary/atom conversion and term (de)serialization BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "list_to_binary", 1, list_to_binary_1);

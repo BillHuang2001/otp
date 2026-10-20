@@ -35,7 +35,7 @@
 //! | seam | table | keys |
 //! |---|---|---|
 //! | [`MemoryHook`] | [`MEMORY_HOOK_BIFS`] | 2 |
-//! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 4 |
+//! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 9 |
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 8 |
@@ -47,7 +47,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 143 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 140 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -102,7 +102,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 143-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 140-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -136,19 +136,36 @@ pub const MEMORY_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "memory", 1),
 ];
 
-/// The registered BIFs that read the [`LocalFunIdentity`] seam — the only callers
-/// reaching `binconv::encode_body`, which installs a local fun's `NEW_FUN_EXT`
-/// identity on the external-term encoder.
+/// The registered BIFs that read the [`LocalFunIdentity`] seam — the only place a
+/// `make_fun3` (`Local`) fun's `#Fun<Module.OldIndex.OldUniq>` triple comes from,
+/// since the frozen descriptor carries only `(uniq, index)`.
 ///
-/// `erlang:term_to_binary/1,2` reach it through `encode_image`/`encode_body`;
-/// `erlang:external_size/1,2` reach it through `plain_image_of`, which shares the
-/// same `encode_body`. Sorted by `(module, function, arity)`; see
-/// [`needs_local_fun_identity`].
+/// Two families reach it:
+///
+/// * the **encoders** — `erlang:term_to_binary/1,2` through `encode_image`/
+///   `encode_body`, and `erlang:external_size/1,2` through `plain_image_of`, which
+///   shares the same `encode_body` (`binconv::encode_body` installs the identity on
+///   the external-term encoder);
+/// * the **renderers** — `erlang:fun_to_list/1` and the printer leaf behind
+///   `io:format/2`, `io_lib:format/2,3` and `erlang:display/1`, all through
+///   `fun_info::fun_text` (the C's `FUN_DEF` arm, one text for both routes).
+///
+/// `io:format/1` is deliberately **absent**: it is `io:format(Format, [])`, so it has
+/// no argument term and no directive can ever render — listing it would be a
+/// too-wide gate. `io_lib:printable_list/1` is absent for the same reason (it classifies
+/// a term, it never renders one).
+///
+/// Sorted by `(module, function, arity)`; see [`needs_local_fun_identity`].
 pub const LOCAL_FUN_IDENTITY_BIFS: &[(&str, &str, u32)] = &[
+    ("erlang", "display", 1),
     ("erlang", "external_size", 1),
     ("erlang", "external_size", 2),
+    ("erlang", "fun_to_list", 1),
     ("erlang", "term_to_binary", 1),
     ("erlang", "term_to_binary", 2),
+    ("io", "format", 2),
+    ("io_lib", "format", 2),
+    ("io_lib", "format", 3),
 ];
 
 /// The registered BIFs that read the [`DictHook`] seam — the whole process-dictionary
@@ -364,10 +381,11 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// The union of the five `runtime_bif!` family modules: `runtime/erlang.rs` (76),
 /// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (20),
 /// `runtime/debugger.rs` (13) and `runtime/other.rs` (28) = **193** registered keys,
-/// of which **143** forward to the seam — the fifty keys with real implementations
-/// (`erlang:is_builtin/3`, `erlang:term_to_iovec/1,2`, the twelve `erts_debug` /
-/// `erts_trace_cleaner` / `erts_literal_area_collector` constants and term walks
-/// (`copy_shared/2`, `disassemble/1`, `get_internal_state/1`, `interpreter_size/0`,
+/// of which **140** forward to the seam — the fifty-three keys with real implementations
+/// (`erlang:is_builtin/3`, `erlang:term_to_iovec/1,2`, the fourteen `erts_debug` /
+/// `erts_trace_cleaner` / `erts_literal_area_collector` constants, term walks and the
+/// two self-contained decoders (`copy_shared/2`, `disassemble/1`,
+/// `dist_ext_to_term/2`, `get_internal_state/1`, `instructions/0`, `interpreter_size/0`,
 /// `lcnt_clear/0`, `lcnt_collect/0`, `lcnt_control/1,2`, `map_info/1`,
 /// `set_internal_state/2`, `size_shared/1`, `unaligned_bitstring/2`,
 /// `erts_trace_cleaner:send_trace_clean_signal/1`,
@@ -479,8 +497,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_debug", "dirty", 3),
     ("erts_debug", "dirty_cpu", 2),
     ("erts_debug", "dirty_io", 2),
-    ("erts_debug", "dist_ext_to_term", 2),
-    ("erts_debug", "instructions", 0),
     ("erts_internal", "abort_pending_connection", 2),
     ("erts_internal", "beamfile_chunk", 2),
     ("erts_internal", "beamfile_module_md5", 1),
@@ -536,7 +552,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("ets", "internal_request_all", 0),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
-    ("prim_file", "internal_normalize_utf8", 1),
 ];
 
 /// Whether `(module, function, arity)` is one of the [`MEMORY_HOOK_BIFS`].
@@ -810,17 +825,27 @@ mod tests {
     }
 
     #[test]
-    fn local_fun_identity_bifs_are_exactly_the_encoders() {
+    fn local_fun_identity_bifs_are_the_encoders_and_the_fun_renderers() {
         // `encode_body` (binconv.rs) reads `ctx.local_fun_identity()`; it is reached
         // by `term_to_binary/1,2` (via `encode_image`) and by `external_size/1,2`
-        // (via `plain_image_of`). Sorted by `(module, function, arity)`.
+        // (via `plain_image_of`). `fun_info::fun_text` reads it for the printed
+        // `#Fun<…>` triple — reached by `erlang:fun_to_list/1` and by the printer leaf
+        // behind `io:format/2`, `io_lib:format/2,3` and `erlang:display/1`.
+        // `io:format/1` takes no argument term (`io:format(Format, [])`), so it can
+        // never render a fun and is deliberately absent. Sorted by
+        // `(module, function, arity)`.
         assert_eq!(
             LOCAL_FUN_IDENTITY_BIFS,
             &[
+                ("erlang", "display", 1),
                 ("erlang", "external_size", 1),
                 ("erlang", "external_size", 2),
+                ("erlang", "fun_to_list", 1),
                 ("erlang", "term_to_binary", 1),
                 ("erlang", "term_to_binary", 2),
+                ("io", "format", 2),
+                ("io_lib", "format", 2),
+                ("io_lib", "format", 3),
             ]
         );
     }
@@ -1089,7 +1114,12 @@ mod tests {
             (
                 "LOCAL_FUN_IDENTITY_BIFS",
                 LOCAL_FUN_IDENTITY_BIFS,
-                &[crate::binconv::register, crate::term_conv::register],
+                &[
+                    crate::binconv::register,
+                    crate::term_conv::register,
+                    crate::fun_info::register,
+                    crate::io::register,
+                ],
             ),
             (
                 "PORT_HOOK_BIFS",
@@ -1203,7 +1233,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 143);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 140);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1274,8 +1304,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 221,
-            "the documented seam surface is 221 keys across the 14 tables; a table \
+            aggregate, 223,
+            "the documented seam surface is 223 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
@@ -1346,6 +1376,15 @@ mod tests {
                     ("erlang", "binary_to_term", 1), // the decode direction is not an encoder
                     ("lists", "term_to_binary", 1),  // wrong module
                     ("erlang", "-", 2),              // an unrelated operator BIF
+                    // `io:format/1` is `io:format(Format, [])`: no argument term, so
+                    // no directive can reach the fun leaf (see the table's docs).
+                    ("io", "format", 1),
+                    // A different `io_lib` key: `printable_list/1` classifies a term,
+                    // it never renders one.
+                    ("io_lib", "printable_list", 1),
+                    ("erlang", "display", 0),        // wrong arity
+                    ("erlang", "display_string", 2), // writes a string verbatim
+                    ("erlang", "fun_to_list", 2),    // wrong arity
                 ],
             ),
             (

@@ -24,23 +24,29 @@
 //! machinery this crate does not own: the interpreter-level debugger tools
 //! (`erl_debugger`), the code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
 //! (`internal_request_all/0`), the
-//! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
-//! normalizer, `os` signal handling, `net_kernel` distribution flag and
-//! `error_logger` category map. Each is registered through the single
+//! tracing-state cleanup and literal-area copy protocols, `os` signal handling, the
+//! `net_kernel` distribution flag and the `error_logger` category map. Each is
+//! registered through the single
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers the typed
 //! `unsupported_bif` capability gap until the runtime installs a hook -- never
-//! `undef`, never a fabricated value. Two groups are the exception: the 8 `re` keys are
-//! served by the real in-crate engine (`crate::re`) and the whole 6-key `erl_ddll`
+//! `undef`, never a fabricated value. Three groups are the exception: the 8 `re` keys are
+//! served by the real in-crate engine (`crate::re`), the whole 6-key `erl_ddll`
 //! surface by the loaded-driver registry + `beam_abi`'s driver loader
-//! ([`crate::runtime::ddll`]), not the seam.
+//! ([`crate::runtime::ddll`]), and `prim_file:internal_normalize_utf8/1` by the
+//! in-crate NFC normalizer (`crate::unicode::normalize`) -- not the seam.
 
+use crate::context::BifContext;
 use crate::registry::BifRegistry;
+use beam_common::Result;
+use beam_term::Eterm;
 
 /// The `(module, function, arity)` keys this module registers **for real** (not
 /// through the `RuntimeHooks` seam): the 8 [`crate::re`] engine keys registered by
-/// `crate::re::register` plus the 6 `erl_ddll` keys registered by
+/// `crate::re::register`, the 6 `erl_ddll` keys registered by
 /// [`crate::runtime::ddll::live::register`], [`crate::runtime::ddll::info::register`] and
-/// [`crate::runtime::ddll::monitor::register`].
+/// [`crate::runtime::ddll::monitor::register`], and
+/// `prim_file:internal_normalize_utf8/1`, registered right here over
+/// [`crate::unicode::normalize`].
 ///
 /// (`erl_ddll:format_error_int/1` is the seventh real `erl_ddll` key, registered by
 /// `crate::runtime::ddll::register` in the containing family, not here.)
@@ -51,6 +57,7 @@ pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("erl_ddll", "monitor", 2),
     ("erl_ddll", "try_load", 3),
     ("erl_ddll", "try_unload", 2),
+    ("prim_file", "internal_normalize_utf8", 1),
     ("re", "compile", 1),
     ("re", "compile", 2),
     ("re", "import", 1),
@@ -60,6 +67,37 @@ pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("re", "run", 3),
     ("re", "version", 0),
 ];
+
+/// `prim_file:internal_normalize_utf8/1` -- `prim_file_internal_normalize_utf8_1`
+/// (`../../erts/emulator/beam/erl_unicode.c:2826`) over
+/// `do_utf8_to_list_normalize` (`:1569`), i.e. the in-crate port in
+/// [`crate::unicode::normalize`].
+///
+/// The C wrapper's two gates are both reproduced:
+///
+/// * `erts_get_aligned_binary_bytes` (`erl_bits.h:596-650`) -- **only a
+///   byte-aligned bitstring** has an aligned byte image, so a list, an atom, an
+///   integer and a non-byte-aligned bitstring (`<<1:3>>`) all answer the same
+///   `badarg` the C falls through to (oracle-verified: a list and `97` are
+///   `badarg` on OTP 29.1.1, not a charlist reshape);
+/// * `erts_analyze_utf8` (`:1177`) -- a byte-aligned image that is not valid
+///   UTF-8 (a stray continuation byte, an overlong form, a surrogate of either
+///   kind, a truncated tail) is `badarg`.
+///
+/// The value is a plain list of code points on `ctx.heap()`:
+/// `internal_normalize_utf8(<<65,204,129>>)` ⇒ `[193]`, `<<97>>` ⇒ `[97]`,
+/// `<<>>` ⇒ `[]`. Never a fabricated list: both failure classes are `badarg`.
+fn internal_normalize_utf8_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // Exactly the C's `erts_get_aligned_binary_bytes`: `bits::bytes` is this
+    // crate's byte-aligned-bitstring accessor and is `badarg` for everything else.
+    let bytes = crate::bits::bytes(args[0])?;
+    let points = crate::unicode::normalize::normalize_utf8(&bytes)?;
+    let mut elems = Vec::with_capacity(points.len());
+    for point in points {
+        elems.push(ctx.int(i64::from(point))?);
+    }
+    ctx.list(&elems)
+}
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
@@ -100,9 +138,15 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // `send_copy_request/3` is a real `notsup` stub in `src/runtime/erts_debug.rs`.
     crate::runtime::runtime_bif!(reg, "erts_literal_area_collector", release_area_switch, 0);
 
-    // `prim_file` -- the filename normalizer (needs the C NFC tables).
-    crate::runtime::runtime_bif!(reg, "prim_file", internal_normalize_utf8, 1);
-
+    // `prim_file` -- the filename normalizer. The NFC composition tables the C
+    // header carries are transcribed into `crate::unicode::normalize` (generated
+    // by `src/unicode/normalize/gen_normalize.escript`), so the key is real.
+    reg.register(
+        "prim_file",
+        "internal_normalize_utf8",
+        1,
+        internal_normalize_utf8_1,
+    );
     // `os` -- Unix signal handling.
     crate::runtime::runtime_bif!(reg, "os", set_signal, 2);
 
@@ -112,9 +156,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // `error_logger` -- the legacy warning-category map.
     crate::runtime::runtime_bif!(reg, "error_logger", warning_map, 0);
 
-    // The 14 keys this family owns for real (see `REAL_BIFS`) are registered by `crate::re::register`
-    // and the three `crate::runtime::ddll` submodule `register`s above; assert they really landed so
-    // the roster cannot drift from what was registered.
+    // The 15 keys this family owns for real (see `REAL_BIFS`) are registered by
+    // `crate::re::register`, the three `crate::runtime::ddll` submodule `register`s above
+    // and this module's own `prim_file` registration; assert they really landed so the
+    // roster cannot drift from what was registered.
     debug_assert!(
         REAL_BIFS
             .iter()
@@ -244,14 +289,21 @@ mod tests {
     }
 
     /// The keys this family serves for real are exactly [`super::REAL_BIFS`]: the 8 `re` engine keys
-    /// ([`crate::re::REAL_BIFS`]) plus the 6 `erl_ddll` keys
+    /// ([`crate::re::REAL_BIFS`]), the 6 `erl_ddll` keys
     /// ([`crate::runtime::ddll::live::REAL_BIFS`] ∪ [`crate::runtime::ddll::info::REAL_BIFS`] ∪
-    /// [`crate::runtime::ddll::monitor::REAL_BIFS`]). Ties the source rosters to this file's
-    /// combined literal so any of them drifting is caught here.
+    /// [`crate::runtime::ddll::monitor::REAL_BIFS`]) and
+    /// `prim_file:internal_normalize_utf8/1`, registered here over
+    /// [`crate::unicode::normalize`]. Ties the source rosters to this file's combined
+    /// literal so any of them drifting is caught here.
     #[test]
-    fn the_real_roster_is_the_re_and_ddll_keys() {
+    fn the_real_roster_is_the_re_ddll_and_prim_file_keys() {
         let real = super::REAL_BIFS;
-        assert_eq!(real.len(), 14);
+        assert_eq!(real.len(), 15);
+        assert!(real.contains(&("prim_file", "internal_normalize_utf8", 1)));
+        assert!(
+            !crate::hook_sets::needs_runtime_hooks("prim_file", "internal_normalize_utf8", 1),
+            "the normalizer is real now, so it must not be a RuntimeHooks seam key"
+        );
         for key in crate::re::REAL_BIFS {
             assert!(real.contains(key), "missing re key {key:?}");
         }

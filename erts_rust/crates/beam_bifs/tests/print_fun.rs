@@ -37,10 +37,13 @@
 //! arity, while a **local** fun (our `FunKind::Imported` from `NEW_FUN_EXT` *and*
 //! our `FunKind::Local` from `make_fun3`) renders `#Fun<Module.OldIndex.OldUniq>`.
 //! The tree inlines the C's out-of-line `ErlFunEntry` into the term descriptor, so
-//! an `Imported` fun carries all three fields but a `Local` (`make_fun3`) fun —
-//! descriptor `[uniq:u64][index:u32]` — carries none: that one stays the typed
-//! capability gap, exactly like `erlang:fun_to_list/1` (`UnsupportedBif`), because
-//! a fabricated `#Fun<…>` would be a *silently wrong* result.
+//! an `Imported` fun carries all three fields while a `Local` (`make_fun3`) fun —
+//! descriptor `[uniq:u64][index:u32]` — carries none of them: its triple comes from
+//! the [`LocalFunIdentity`] seam, the same one `erlang:fun_to_list/1` reads, so the
+//! printer and the BIF can never disagree. Only a `Local` fun the seam cannot
+//! attribute (`Ok(None)` — the `-eval` `erl_eval` template closure) stays the typed
+//! `unsupported_bif` capability gap, because a fabricated `#Fun<…>` would be a
+//! *silently wrong* result.
 //!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] (plus
 //! [`BytesSink`] for the `io:format/2` output) and the declared dependency crates
@@ -51,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
+use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink, LocalFunIdentity};
 use beam_codec::term::{
     cons_head, cons_tail, make_flatmap, make_fun_external, make_fun_imported, FunPid,
 };
@@ -60,10 +63,24 @@ use beam_process::ProcessId;
 use beam_term::{atom_val, is_nil, is_small, signed_value, AtomTable, Eterm};
 
 /// The atoms the fixtures seed: the two external funs' modules/names, the map key,
-/// the quoted-atom module, and `ok` (the `io:format/2` return value's atom).
+/// the quoted-atom module, `ok` (the `io:format/2` return value's atom) and the two
+/// modules the local-fun identity stubs name.
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["lists", "reverse", "erlang", "abs", "a", "foo", "nonode@nohost", "ok"]);
+    atoms.seed([
+        "lists",
+        "reverse",
+        "erlang",
+        "abs",
+        "a",
+        "foo",
+        "nonode@nohost",
+        "ok",
+        // The two `LocalFunIdentity` stub modules: a name `print_atom_name` prints
+        // **bare**, and one it would `'…'`-quote.
+        "printed",
+        "weird mod",
+    ]);
     atoms
 }
 
@@ -358,18 +375,21 @@ fn depth_limited_directives_render_the_same_fun_text() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) The remaining gap: a `make_fun3` (`FunKind::Local`) fun
+// (d) A `make_fun3` (`FunKind::Local`) fun with NO identity seam
 // ---------------------------------------------------------------------------
 
-/// A `FunKind::Local` (`make_fun3`) fun is the typed capability gap — **not** a
-/// fabricated `#Fun<…>`.
+/// A `FunKind::Local` (`make_fun3`) fun with **no** [`LocalFunIdentity`] seam
+/// installed is the typed capability gap — **not** a fabricated `#Fun<…>`.
 ///
-/// Its inlined descriptor is only `[header, uniq, index]`, so the module/name a
-/// `#Fun<M.OldIndex.OldUniq>` needs is not in the term; `erlang:fun_to_list/1` is
-/// the same gap (pinned by `print.rs`'s in-module test), so the printer must stay
-/// consistent with it rather than print a wrong `#Fun<…>`.
+/// Its inlined descriptor is only `[header, uniq, index]`, so the module the
+/// `#Fun<M.OldIndex.OldUniq>` triple needs is not in the term; the triple normally
+/// arrives through the seam (see [`local_fun_renders_the_seam_identity_on_all_three_routes`]),
+/// and a runtime with none installed — or one that answers `Ok(None)`, e.g. for an
+/// `-eval` `erl_eval` template closure — cannot attribute it. The printer's leaf and
+/// `erlang:fun_to_list/1` are the *same* text, so both must report the same gap
+/// rather than print a wrong `#Fun<…>`.
 #[test]
-fn a_local_fun_is_the_typed_capability_gap() {
+fn a_local_fun_without_a_seam_is_the_typed_capability_gap() {
     let reg = default_registry();
     let mut heap = Heap::new(1 << 20).expect("test heap");
     let atoms = seeded_atoms();
@@ -406,6 +426,245 @@ fn a_local_fun_is_the_typed_capability_gap() {
         Err(BeamError::Raise(ref r)) if r.reason.as_atom() == Some("unsupported_bif")
     ));
 
+    drop(words);
+}
+
+// ---------------------------------------------------------------------------
+// (e) A `make_fun3` (`FunKind::Local`) fun WITH the identity seam installed
+// ---------------------------------------------------------------------------
+
+/// A `LocalFunIdentity` stub — what a runtime supplies for a loaded module's
+/// `make_fun3` closure. `None` models a fun no loaded module can attribute, the
+/// `-eval`/`erl_eval` template closure.
+struct StubIdentity(Option<beam_codec::FunIdentity>);
+
+impl LocalFunIdentity for StubIdentity {
+    fn local_fun_identity(&mut self, _term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+        Ok(self.0)
+    }
+}
+
+/// The [`beam_codec::FunIdentity`] a loader would report for `module`'s lambda:
+/// the module atom plus the two legacy `int` fields the `#Fun<…>` text renders (the
+/// MD5/creator are not part of the text and stay zeroed).
+fn identity(atoms: &AtomTable, module: &str, old_index: u32, old_uniq: u32) -> beam_codec::FunIdentity {
+    beam_codec::FunIdentity::new(
+        atoms.lookup(module).expect("seeded module"),
+        [0u8; 16],
+        old_index,
+        old_uniq,
+        FunPid {
+            node: atoms.lookup("nonode@nohost").expect("seeded node"),
+            number: 1,
+            serial: 0,
+            creation: 0,
+        },
+    )
+}
+
+/// A `FunKind::Local` block with an explicit descriptor (`[header, uniq, index]`, the
+/// frozen `make_fun3` layout, arity 1 and no captures). Deliberately *different* from
+/// the values a test's identity carries, so a render that read the descriptor instead
+/// of the seam cannot pass. Held in a `Box` the caller keeps alive.
+fn local_fun_with(uniq: u64, index: u32) -> Box<[Eterm]> {
+    vec![
+        Eterm::from_raw(beam_term::FUN_SUBTAG | (1usize << 8)),
+        Eterm::from_raw(uniq as usize),
+        Eterm::from_raw(index as usize),
+    ]
+    .into_boxed_slice()
+}
+
+/// Renders `fun` through **all three** routes — `io_lib:format("~w")`,
+/// `io_lib:format("~p")` and `erlang:fun_to_list/1` — and requires each to be
+/// `expect`. The three agree because the oracle defines all three as the one
+/// `FUN_DEF` printer text (`bif.c:4494-4504`); this file exists to keep them from
+/// drifting.
+fn assert_three_routes_agree(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    expect: &str,
+) {
+    for directive in ["~w", "~p"] {
+        let got = io_lib_text(ctx, reg, directive, &[fun])
+            .unwrap_or_else(|e| panic!("io_lib:format(\"{directive}\", [Fun]) => {e:?}"));
+        assert_eq!(got, expect, "io_lib:format(\"{directive}\", [Fun])");
+    }
+    let via_bif = reg
+        .call("erlang", "fun_to_list", 1, ctx, &[fun])
+        .unwrap_or_else(|e| panic!("erlang:fun_to_list/1 => {e:?}"));
+    assert_eq!(
+        flatten_chars(via_bif),
+        expect,
+        "erlang:fun_to_list/1 disagrees with the printer's `~w`/`~p` leaf",
+    );
+}
+
+/// A `make_fun3` fun whose identity seam is installed renders the seam's
+/// `#Fun<Module.OldIndex.OldUniq>` on all three routes, and the text comes from the
+/// seam — **not** from the frozen descriptor.
+///
+/// Ground truth: the `FUN_DEF` local arm, `erts/emulator/beam/erl_printf_term.c:678-690`
+/// (`"#Fun<"` + raw module name + `'.'` + signed `old_index` + `'.'` + signed
+/// `old_uniq` + `'>'`), which is what `erlang:fun_to_list/1` splices
+/// (`bif.c:4494-4504`, `term2list_dsprintf`). Live oracle (OTP 29.1.1 / erts-17.1), a
+/// `fiprobe:mk/1` closure with one capture: `erlang:fun_to_list(F)` ⇒
+/// `#Fun<probe9.0.N>`, `io_lib:format("~w",[F])` and `~p` the same single line — one
+/// capture adds no fourth field.
+#[test]
+fn local_fun_renders_the_seam_identity_on_all_three_routes() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut stub = StubIdentity(Some(identity(&atoms, "printed", 3, 1234)));
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_local_fun_identity(&mut stub);
+
+    // The descriptor says `(uniq 1234, index 7)`; the seam says `(old_index 3,
+    // old_uniq 1234)`. Only the seam's triple may appear.
+    let words = local_fun_with(1234, 7);
+    let fun = beam_term::make_boxed(words.as_ptr());
+    assert_three_routes_agree(&reg, &mut ctx, fun, "#Fun<printed.3.1234>");
+
+    // An `EXPORT_EXT` fun never consults the seam: its own module/function/arity stay
+    // the text even while an identity is installed.
+    let external = external_fun(&mut ctx, REVERSE);
+    assert_three_routes_agree(&reg, &mut ctx, external, "fun lists:reverse/1");
+
+    drop(words);
+}
+
+/// A local fun nested inside a list, a tuple and a map renders the same text at any
+/// depth — the leaf is reached through the recursive printer cluster, which carries
+/// the [`BifContext`] (and therefore the seam) rather than a bare `&AtomTable`.
+///
+/// Live oracle (OTP 29.1.1 / erts-17.1) on a 0-capture `fp:mk()` closure `F`:
+/// `io_lib:format("~w",[[F,F]])` ⇒ `[#Fun<fp.0.N>,#Fun<fp.0.N>]` — one line, never
+/// re-flowed — and `io_lib:format("~p",[{a,F}])` ⇒ `{a,#Fun<fp.0.N>}`.
+#[test]
+fn a_nested_local_fun_renders_the_seam_identity_at_depth() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut stub = StubIdentity(Some(identity(&atoms, "printed", 3, 1234)));
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_local_fun_identity(&mut stub);
+
+    let words = local_fun_with(1234, 7);
+    let fun = beam_term::make_boxed(words.as_ptr());
+
+    // A 2-element list of the *same* fun twice.
+    let pair = list(&mut ctx, &[fun, fun]);
+    for directive in ["~w", "~p"] {
+        let got = io_lib_text(&mut ctx, &reg, directive, &[pair]).expect("a nested local fun");
+        assert_eq!(
+            got, "[#Fun<printed.3.1234>,#Fun<printed.3.1234>]",
+            "`{directive}` of `[F,F]`",
+        );
+    }
+
+    // A tuple, where the fun is the *second* element (the tail path differs).
+    let key = atom(&mut ctx, "a");
+    let tuple = ctx.tuple(&[key, fun]).expect("a 2-tuple fits");
+    for directive in ["~w", "~p"] {
+        let got = io_lib_text(&mut ctx, &reg, directive, &[tuple]).expect("a local fun in a tuple");
+        assert_eq!(got, "{a,#Fun<printed.3.1234>}", "`{directive}` of `{{a,F}}`");
+    }
+
+    // A map value.
+    let map = make_flatmap(ctx.heap(), &[(key, fun)]).expect("the map fits");
+    for directive in ["~w", "~p"] {
+        let got = io_lib_text(&mut ctx, &reg, directive, &[map]).expect("a local fun in a map");
+        assert_eq!(got, "#{a => #Fun<printed.3.1234>}", "`{directive}` of `#{{a => F}}`");
+    }
+
+    drop(words);
+}
+
+/// The local arm prints the module atom's **raw** name, never the
+/// `print_atom_name`-quoted form the external arm uses: `PRINT_BUF(... erts_atom_get_name(ap),
+/// ap->len)` at `erts/emulator/beam/erl_printf_term.c:683`.
+///
+/// Live oracle (OTP 29.1.1 / erts-17.1), a hand-built `NEW_FUN_EXT` whose module atom
+/// is `'weird mod'`, `old_index` 3 and `old_uniq` 0xFFFFFFFF (the same C arm as a
+/// `make_fun3` closure): `erlang:fun_to_list(F)` ⇒ `#Fun<weird mod.3.-1>` and
+/// `io_lib:format("~w",[F])` ⇒ `#Fun<weird mod.3.-1>` — no quotes around the space.
+#[test]
+fn a_local_fun_module_name_is_never_quoted() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut stub = StubIdentity(Some(identity(&atoms, "weird mod", 3, u32::MAX)));
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_local_fun_identity(&mut stub);
+
+    let words = local_fun_with(0, 0);
+    let fun = beam_term::make_boxed(words.as_ptr());
+    assert_three_routes_agree(&reg, &mut ctx, fun, "#Fun<weird mod.3.-1>");
+    drop(words);
+}
+
+/// `old_index`/`old_uniq` are C `int` fields (`ErlFunEntry`, `erl_fun.h:31-59`) printed
+/// through `PRINT_SWORD(..., 'd', ...)` (`erl_printf_term.c:685-689`), so a value above
+/// `2^31 - 1` renders **negative**.
+///
+/// Live oracle (OTP 29.1.1 / erts-17.1) on a hand-built fun whose `old_index` is
+/// 0x80000000 and `old_uniq` 0x7FFFFFFF: `erlang:fun_info(F, index)` ⇒
+/// `{index,-2147483648}`, `{uniq,2147483647}`, and `erlang:fun_to_list(F)` ⇒
+/// `#Fun<printed.-2147483648.2147483647>` (`io_lib` `~w`/`~p` identical).
+#[test]
+fn local_fun_index_and_uniq_are_sign_extended_int_fields() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut stub = StubIdentity(Some(identity(&atoms, "printed", 0x8000_0000, 0x7FFF_FFFF)));
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_local_fun_identity(&mut stub);
+
+    let words = local_fun_with(0, 0);
+    let fun = beam_term::make_boxed(words.as_ptr());
+    assert_three_routes_agree(
+        &reg,
+        &mut ctx,
+        fun,
+        "#Fun<printed.-2147483648.2147483647>",
+    );
+    drop(words);
+}
+
+/// A seam that answers `Ok(None)` — a fun no loaded module attributes, e.g. the
+/// `-eval` `erl_eval` template closure the oracle *can* attribute (`#Fun<erl_eval.N.M>`,
+/// because `erl_eval` is the module that built it) — stays the typed
+/// `unsupported_bif` on **both** routes here, never a fabricated `#Fun<…>`.
+#[test]
+fn a_local_fun_the_seam_cannot_attribute_is_the_typed_gap_on_both_routes() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut stub = StubIdentity(None);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_local_fun_identity(&mut stub);
+
+    let words = local_fun_with(1234, 7);
+    let fun = beam_term::make_boxed(words.as_ptr());
+    for directive in ["~w", "~p"] {
+        let got = io_lib_text(&mut ctx, &reg, directive, &[fun]);
+        assert!(
+            matches!(
+                got,
+                Err(BeamError::Raise(ref r)) if r.reason.as_atom() == Some("unsupported_bif")
+            ),
+            "`{directive}` of an unattributable Local fun must stay the typed gap, got {got:?}",
+        );
+    }
+    assert!(
+        matches!(
+            reg.call("erlang", "fun_to_list", 1, &mut ctx, &[fun]),
+            Err(BeamError::Raise(ref r)) if r.reason.as_atom() == Some("unsupported_bif")
+        ),
+        "erlang:fun_to_list/1 must report the same typed gap as the printer",
+    );
     drop(words);
 }
 

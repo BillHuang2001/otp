@@ -588,12 +588,13 @@ fn internal_native2name_and_is_translatable() {
         assert!(call(&reg, &mut ctx, "prim_file", "internal_native2name", 1, &[bad]).is_err());
     }
 
-    // `prim_file:internal_normalize_utf8/1` is deliberately unregistered.
+    // `prim_file:internal_normalize_utf8/1` is **not** this module's key (it lives
+    // in `src/runtime/other.rs` over `src/unicode/normalize/`), but it is real, so
+    // it answers from the full registry: `<<"abc">>` ⇒ `[97,98,99]`.
     let plain = binary_term(&reg, &mut ctx, b"abc");
-    assert!(
-        call(&reg, &mut ctx, "prim_file", "internal_normalize_utf8", 1, &[plain]).is_err(),
-        "internal_normalize_utf8/1 must stay unregistered (no faithful NFC normalizer)"
-    );
+    let normalized = call(&reg, &mut ctx, "prim_file", "internal_normalize_utf8", 1, &[plain])
+        .expect("internal_normalize_utf8/1 is a real BIF");
+    assert_string(&reg, &mut ctx, normalized, "abc");
     // `os:set_signal/2` is deliberately unregistered.
     let sigterm = ctx.atom("abc").expect("seeded");
     assert!(call(&reg, &mut ctx, "os", "set_signal", 2, &[sigterm, sigterm]).is_err());

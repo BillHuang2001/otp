@@ -251,11 +251,7 @@ fn code_message(code: i32) -> &'static str {
 ///
 /// Propagates a heap-allocation failure.
 fn charlist(ctx: &mut BifContext<'_>, message: &str) -> Result<Eterm> {
-    let mut elems = Vec::with_capacity(message.len());
-    for byte in message.bytes() {
-        elems.push(ctx.int(i64::from(byte))?);
-    }
-    ctx.list(&elems)
+    ctx.charlist(message)
 }
 
 /// Registers the real `erl_ddll:format_error_int/1` implementation.
