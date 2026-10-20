@@ -1264,10 +1264,16 @@ fn poll_peer_closes_returns_the_message_addressed_to_this_process() {
         1,
         "the evaluator owns the socket, so the report is its own"
     );
+    let (sender, message) = messages[0];
     assert_eq!(
-        rendered(&mut session.rt, messages[0]),
+        rendered(&mut session.rt, sender),
+        port_text,
+        "the sender is the port itself, as on the mailbox route"
+    );
+    assert_eq!(
+        rendered(&mut session.rt, message),
         format!("{{tcp_closed,{port_text}}}"),
-        "the `-eval` route returns the same 2-tuple the mailbox route delivers"
+        "the `-eval` route builds the same 2-tuple the mailbox route delivers"
     );
     assert!(
         !session.rt.ports.borrow().is_live(session.port),

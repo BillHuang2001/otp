@@ -88,7 +88,7 @@
 //! |---|---|---|
 //! | read | [`PortRegistry::drain_peer_closes`] / [`PortRegistry::drain_peer_closes_for`] | per port round |
 //! | deliver | [`Runtime::deliver_peer_closes`] | the scheduler `run` route (a mailbox write) |
-//! | deliver | [`RuntimeContext::poll_peer_closes`] | the `-eval` `receive` route (returned inline) |
+//! | deliver | [`RuntimeContext::poll_peer_closes`] | the `-eval` `receive` route (built for its own process, then delivered to its mailbox) |
 //! | retire | [`PortRegistry::retire_peer_closed`] | the C's `driver_exit`, called by both deliver halves |
 //!
 //! ## The retirement is `driver_exit`, not `port_close/1`
@@ -542,8 +542,9 @@ impl Runtime {
 }
 
 impl RuntimeContext<'_> {
-    /// The messages the peer-close channel owes **this context's own process**, for the `-eval`
-    /// `receive` to match inline.
+    /// The messages the peer-close channel owes **this context's own process**, each paired with
+    /// its sender — the port, the C's `erts_queue_message(…, prt->common.id, …)` — for the
+    /// `-eval` route to deliver into that process's mailbox.
     ///
     /// The `-eval` route can only observe its own mailbox, so it takes exactly the reports
     /// addressed to itself ([`PortRegistry::drain_peer_closes_for`]) and **leaves every other
@@ -562,7 +563,7 @@ impl RuntimeContext<'_> {
     ///
     /// A nested borrow of the port registry (a typed capability gap), the message builder's
     /// allocation failure and the retirement's teardown errors.
-    pub(crate) fn poll_peer_closes(&mut self) -> Result<Vec<Eterm>> {
+    pub(crate) fn poll_peer_closes(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
         let pid = self.pid();
         let cell = Rc::clone(&self.runtime.ports);
         let reports = {
@@ -573,7 +574,8 @@ impl RuntimeContext<'_> {
         };
         let mut messages = Vec::with_capacity(reports.len());
         for report in reports {
-            messages.push(self.peer_close_message(&report)?);
+            let message = self.peer_close_message(&report)?;
+            messages.push((report.port.to_eterm(), message));
             if report.exit_on_close {
                 self.runtime.retire_peer_closed_port(report.port)?;
             }

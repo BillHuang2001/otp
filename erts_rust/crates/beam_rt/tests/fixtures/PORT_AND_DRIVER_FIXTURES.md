@@ -376,10 +376,10 @@ gets a `'DOWN'`.
 ### What the suite pins, and on which route
 
 Both delivery routes are covered, because they are separate code paths over one policy — the
-**`-eval` route** returns the messages to the evaluator's own `receive`
-(`RuntimeContext::poll_port_messages`) and the **scheduler `run` route** puts them in the recipient's
-mailbox (`Runtime::deliver_port_signals`), so a receiver parked in a compiled `receive` is woken by
-them. Each row is one probe pair: the same expression prints under the oracle and under `beam_rt`,
+**`-eval` route** takes the messages for the evaluator's own process and delivers them into its
+mailbox (`RuntimeContext::poll_port_messages_into_mailbox`) and the **scheduler `run` route** puts
+them in the recipient's mailbox (`Runtime::deliver_port_signals`), so a receiver parked in a
+compiled `receive` is woken by them. Each row is one probe pair: the same expression prints under the oracle and under `beam_rt`,
 and the two stdouts must be equal. The `run` route passes the directory as a double-quoted `run`
 argument (a charlist), the driver name as a bare atom and the row as an integer
 (`beam_rt run port_failure.beam port_failure:<function>/3 "<dir>" port_failure_driver <row>`).

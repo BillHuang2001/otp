@@ -86,9 +86,9 @@
 //! there is no recipient and the notification is dropped, exactly as the C drops it.
 //!
 //! One honest asymmetry: the `-eval` evaluator path
-//! ([`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext)) can only observe
-//! *its own* mailbox, so it does not return a notification addressed to some other process —
-//! the scheduler path delivers it instead (see `src/port.rs`).
+//! ([`RuntimeContext::poll_port_messages_into_mailbox`](crate::context::RuntimeContext)) can
+//! only observe *its own* mailbox, so it does not deliver a notification addressed to some
+//! other process — the scheduler path delivers it instead (see `src/port.rs`).
 //!
 //! # Errors
 //!

@@ -170,7 +170,7 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   between them is the **non-blocking** `Runtime::pump_scheduler_now` (`TimerWait::ImminentWithin(0)`);
   the deadline is tested **before** the pump, so the wait ends on the **caller's** deadline rather
   than on a pump call's schedule: `pump_scheduler_now(RECEIVE_PUMP_SLICES)`,
-  `poll_port_messages(remaining.min(PORT_POLL_SLICE))` and
+  `poll_port_messages_into_mailbox(remaining.min(PORT_POLL_SLICE))` and
   `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
   `Evaluator::receive`), so `pump_dist` → `DistNode::pump` →
   `accept_one` is re-entered every slice, instead of charging the whole window to

@@ -63,8 +63,8 @@
 //!    deliverable queue — which is the one point at which the port really has left the
 //!    runtime. The queue is then drained by whichever route owns a process table:
 //!    [`Runtime::deliver_port_signals`] (the scheduler `run` route, into the recipient's
-//!    mailbox) or [`RuntimeContext::poll_port_signals`] (the `-eval` `receive` route, whose
-//!    messages are matched inline).
+//!    mailbox) or [`RuntimeContext::poll_port_signals`] (the `-eval` `receive` route, which
+//!    builds the same messages for its own process and delivers them into its mailbox too).
 //!
 //! The snapshot is per **recipient**, so a route that can only observe its own mailbox takes
 //! its own entries and leaves the rest queued for the route that can deliver them.
@@ -488,20 +488,21 @@ impl Runtime {
 }
 
 impl RuntimeContext<'_> {
-    /// The messages a closing port owes **this context's own process**, for the `-eval`
-    /// `receive` to match inline.
+    /// The messages a closing port owes **this context's own process**, each paired with its
+    /// sender — the port, the C's `erts_queue_message(…, prt->common.id, …)` — for the `-eval`
+    /// route to deliver into that process's mailbox.
     ///
     /// The `-eval` route can only observe its own mailbox, so it takes exactly its own
     /// entries ([`PortRegistry::take_port_signals_for`]) and leaves every other recipient's
     /// queued for the scheduler route. The policy is
-    /// [`Runtime::deliver_port_signals`]'s; the only difference is where the message ends up
-    /// (returned to the caller instead of enqueued).
+    /// [`Runtime::deliver_port_signals`]'s; the difference is only the recipient set (this
+    /// context's own process instead of every entry a process table holds).
     ///
     /// # Errors
     ///
     /// A nested borrow of the port registry (a typed capability gap) and the message
     /// builders' allocation failure.
-    pub(crate) fn poll_port_signals(&mut self) -> Result<Vec<Eterm>> {
+    pub(crate) fn poll_port_signals(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
         let pid = self.pid();
         let signals = {
             let cell = Rc::clone(&self.runtime.ports);
@@ -549,7 +550,8 @@ impl RuntimeContext<'_> {
                     continue;
                 }
                 PortSignalKind::Exit => {
-                    messages.push(self.port_closed_message(signal.port, &signal.reason)?)
+                    let message = self.port_closed_message(signal.port, &signal.reason)?;
+                    messages.push((signal.port.to_eterm(), message));
                 }
                 PortSignalKind::Down(reference) => {
                     // The port's death resolves the watcher's outgoing half (see
@@ -559,11 +561,9 @@ impl RuntimeContext<'_> {
                             .port_monitors_mut()
                             .retain(|watch| watch.reference != reference);
                     }
-                    messages.push(self.port_down_message(
-                        signal.port,
-                        reference,
-                        &signal.reason,
-                    )?);
+                    let message =
+                        self.port_down_message(signal.port, reference, &signal.reason)?;
+                    messages.push((signal.port.to_eterm(), message));
                 }
             }
         }

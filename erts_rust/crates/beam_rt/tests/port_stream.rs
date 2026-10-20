@@ -27,8 +27,9 @@
 //! through the `~w` printer.
 //!
 //! The receive runs the evaluator's `after` branch against
-//! [`RuntimeContext::poll_port_messages`](beam_rt::RuntimeContext), which polls the child's
-//! stdout through a `beam_io::Poller` and builds the message on the runtime's arena. The
+//! `RuntimeContext::poll_port_messages_into_mailbox`, which polls the child's stdout through a
+//! `beam_io::Poller`, builds the message on the runtime's arena and **delivers it into the
+//! evaluating process's mailbox** — where the `receive`'s own selective scan finds it. The
 //! terms therefore stay valid after `eval` returns (the runtime's arena is never reset).
 use beam_engine::terms;
 use beam_rt::Runtime;

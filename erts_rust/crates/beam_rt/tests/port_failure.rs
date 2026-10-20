@@ -68,10 +68,10 @@
 //! # The two routes
 //!
 //! Both delivery routes are pinned because they are separate code paths over one policy: the
-//! **`-eval` route** returns the messages to the evaluator's own `receive`
-//! (`RuntimeContext::poll_port_messages`), and the **scheduler `run` route** puts them in the
-//! recipient's mailbox and wakes a receiver parked in a compiled `receive`
-//! (`Runtime::deliver_port_messages` → [`Runtime::deliver_port_signals`]).
+//! **`-eval` route** takes the messages for the evaluator's own process and delivers them into
+//! its mailbox (`RuntimeContext::poll_port_messages_into_mailbox`), and the **scheduler `run`
+//! route** puts them in the recipient's mailbox (whoever it is) and wakes a receiver parked in a
+//! compiled `receive` (`Runtime::deliver_port_messages` → [`Runtime::deliver_port_signals`]).
 //!
 //! [`Runtime::deliver_port_signals`]: beam_rt::Runtime
 //!

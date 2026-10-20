@@ -1519,8 +1519,8 @@ impl Evaluator<'_, '_> {
     ///   most one slice, then rescans. Nothing in an iteration but those two bounded waits may
     ///   block, and the deadline is tested **before** the pump, so the window is what ends the
     ///   wait: `after 1`/`25`/`50`/`100`/`300`/`1000` land on their own deadline like the
-    ///   oracle's, with the residual that a message arriving on the **port** stream or in the
-    ///   **timer heap** is picked up by the next iteration (bound: one [`PORT_POLL_SLICE`]).
+    ///   oracle's, with the residual that a message arriving in the **timer heap** is picked up
+    ///   by the next iteration (bound: one [`PORT_POLL_SLICE`]).
     ///   Re-entering a **non-blocking** [`Runtime::pump_scheduler_now`] every slice is also
     ///   what keeps a **distribution** connection alive on this route (contract A.5): a peer's
     ///   `'N'` handshake is only *accepted* by the scheduler pass's distribution pump, so a
@@ -1530,6 +1530,16 @@ impl Evaluator<'_, '_> {
     ///   arrives in a slice (delivered by that very pump, or by the port poller) is picked up
     ///   by the rescan before the timeout is considered, so a message still wins over the
     ///   deadline.
+    ///
+    ///   **A port message goes to the mailbox**, through the runtime's one delivery path
+    ///   ([`RuntimeContext::poll_port_messages_into_mailbox`]) — never to a clause matcher of
+    ///   this loop's own. That is where the BEAM puts it (`{Port, {data, …}}` is an ordinary
+    ///   message from the port), and it is what makes this `receive` selective: a message no
+    ///   clause matches stays queued for a **later** `receive`, and the messages drained in the
+    ///   same port round as a matching one stay queued instead of being discarded with the
+    ///   match. A delivery therefore sends the loop straight back to the mailbox scan (no poll
+    ///   and no wait), which is where the clause matching lives.
+    ///
     /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
     ///   arrived` rather than hanging. There *is* a host-timer mechanism
@@ -1584,18 +1594,26 @@ impl Evaluator<'_, '_> {
                     #[cfg(test)]
                     RECEIVE_WAIT_ITERATIONS.with(|count| count.set(count.get() + 1));
                     // The port poller owns the *other* message source (see the module docs of
-                    // `crate::context`): its messages are produced, matched and discarded, not
-                    // enqueued, so a non-matching one is not left behind. With a live port it
-                    // waits one slice (or the rest of the window, if that is shorter); with
-                    // none it returns at once.
-                    let messages = match self.ctx.poll_port_messages(slice) {
-                        Ok(messages) => messages,
+                    // `crate::context`). What it produces is **delivered into this process's
+                    // mailbox**, exactly as the scheduler pass's port half delivers a port
+                    // message to its owner — never matched here and dropped. That is the BEAM's
+                    // rule: a port data message is a message in the mailbox, and a `receive` is
+                    // **selective**, so a message no clause matches is left queued for a later
+                    // `receive`, and the messages drained along with a matching one stay queued
+                    // instead of being swallowed by the match. With a live port the poll waits
+                    // one slice (or the rest of the window, if that is shorter); with none it
+                    // returns at once.
+                    let delivered = match self.ctx.poll_port_messages_into_mailbox(slice) {
+                        Ok(delivered) => delivered,
                         Err(err) => return Err(Flow::Fatal(err)),
                     };
-                    for message in messages {
-                        if let Some(result) = self.match_clauses(&receive.clauses, message, env)? {
-                            return Ok(result);
-                        }
+                    // A delivery changed the mailbox, so go round once more and let the loop
+                    // head's **mailbox scan** match it (that scan is the clause matcher, and it
+                    // removes only the message it takes). Without this round the newly queued
+                    // message would wait behind the timer wait below, which is up to one
+                    // [`PORT_POLL_SLICE`] — the pickup residual the docs name.
+                    if delivered > 0 {
+                        continue;
                     }
                     // The **third** source is the runtime's own timer heap, and only a
                     // scheduler pass fires it: `timer:apply_after/4` (a `timer_server` arming

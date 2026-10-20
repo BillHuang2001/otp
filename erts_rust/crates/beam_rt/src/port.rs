@@ -64,9 +64,11 @@
 //!   pass) delivers every event into the **owning process's mailbox** with
 //!   `beam_process`'s own deliver path, so a process blocked in a compiled `receive` is
 //!   woken by the existing resume-on-send machinery;
-//! * the **`-eval` `receive … after T`** path ([`RuntimeContext::poll_port_messages`])
-//!   returns the built messages inline, because `-eval` runs outside a scheduler slice and
-//!   matches them against the clause patterns itself.
+//! * the **`-eval` `receive … after T`** path ([`RuntimeContext::poll_port_messages_into_mailbox`])
+//!   delivers them into the evaluating process's **mailbox** too, through the same delivery
+//!   path — `-eval` runs outside a scheduler slice, so it is the port *poll* it drives itself
+//!   and not the delivery rule that differs. A message no clause matches therefore stays
+//!   queued for a later `receive`, exactly as it does on the scheduler route.
 //!
 //! # What is real, and what is not (yet)
 //!
@@ -799,7 +801,8 @@ struct FailedReadRecipient {
 /// This is [`PortRegistry::pump`]'s report, and the seam between the port poller and the
 /// two things that turn it into an Erlang term: the scheduler path
 /// ([`Runtime::deliver_port_messages`], which delivers it to `owner`'s mailbox) and the
-/// `-eval` `receive` path ([`RuntimeContext::poll_port_messages`], which builds it inline).
+/// `-eval` `receive` path ([`RuntimeContext::poll_port_messages_into_mailbox`], which builds
+/// it and delivers it into the evaluating process's mailbox).
 #[derive(Debug)]
 enum PortEvent {
     /// One driver read, owed to the owner as `{Port, {data, Data}}`: `Data` is shaped by `stream`
@@ -4306,27 +4309,66 @@ fn select_notification_handle(
 }
 
 impl RuntimeContext<'_> {
-    /// Reads any pending port-stream output as `{Port, {data, Data}}` messages.
+    /// The `-eval` `receive … after T` path's port half: drains a port round and **delivers**
+    /// every message it produced for this process into this process's **mailbox**.
     ///
-    /// This is the `-eval` `receive … after T` path's port half: it waits up to `timeout`
-    /// (in [`PORT_POLL_SLICE`] slices — see [`PortRegistry::pump`]) for the live ports to
-    /// produce something and builds the messages **on the runtime's pointer-stable arena**,
-    /// so the caller can match them against its `receive` clauses. The `data` atom is
-    /// interned in the runtime's **one shared** table, so the message is nameable by the
-    /// printer and comparable by the evaluator's own clauses.
+    /// That is where a port message belongs (the C's `erts_queue_message(…, prt->common.id, …)`
+    /// arms of `io.c`), and it is what makes the evaluator's `receive` *selective*: the message
+    /// is queued before any clause is tried, so a message no clause matches stays queued for a
+    /// later `receive` and a message that matched one does not swallow the ones drained with it.
+    /// Delivery goes through the runtime's one delivery path
+    /// ([`RuntimeContext::deliver_message`]), so an oversized payload takes the heap-fragment
+    /// fallback and a parked receiver is woken exactly as on the scheduler route.
     ///
-    /// `Ok(vec![])` means nothing arrived within `timeout`; nothing is polled at all when no
-    /// port is live (a receive with no port never sleeps here).
+    /// The wait is bounded by `timeout` (in [`PORT_POLL_SLICE`] slices — see
+    /// [`PortRegistry::pump`]); nothing is polled at all when no port is live. The returned
+    /// count is what was **delivered**, so a caller can rescan the mailbox exactly when it
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// The poller's/driver's failures; a nested borrow of the port table is a typed
+    /// capability gap rather than a panic; the message builders' allocation failure when a
+    /// term does not fit; and the delivery's own failures
+    /// ([`RuntimeContext::deliver_message`] — no mailbox for this pid, or `error:system_limit`
+    /// for a payload the receiver's heap and a fragment both refuse).
+    pub(crate) fn poll_port_messages_into_mailbox(&mut self, timeout: Duration) -> Result<usize> {
+        let pid = self.pid();
+        let messages = self.drain_port_messages(timeout)?;
+        let mut delivered = 0;
+        for (from, message) in messages {
+            self.deliver_message(pid, from, message)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Drains a port round into `(sender, message)` pairs, addressed to this process.
+    ///
+    /// The sender is the one the producing event carries — the **port** for everything a port
+    /// produces (`{Port, {data, …}}`, `{Port, {exit_status, _}}`, `{tcp_closed, Port}`,
+    /// `{'EXIT', Port, _}`, `{'DOWN', _, port, Port, _}`, a driver-emitted term), and the
+    /// `system` atom for the `enif_select`/`prim_tty` notification and the handled-signal
+    /// 2-tuple — exactly the senders [`Runtime::deliver_port_messages`] enqueues with.
+    ///
+    /// Every message is built **on the runtime's pointer-stable arena**, so it stays valid for
+    /// the runtime's lifetime (a delivery copies it into the receiver's own heap). The `data`
+    /// atom is interned in the runtime's **one shared** table, so the message is nameable by
+    /// the printer and matchable by the evaluator's own clauses.
+    ///
+    /// Nothing is returned for another process's event: this route can only observe its own
+    /// mailbox, so such an event keeps its scheduler-route destination (see each arm). An empty
+    /// vector means nothing arrived within `timeout`.
     ///
     /// The scheduler path uses [`Runtime::deliver_port_messages`] instead, because there the
-    /// messages belong in a process's mailbox rather than in the caller's hands.
+    /// recipients come from a process table it holds.
     ///
     /// # Errors
     ///
     /// The poller's/driver's failures; a nested borrow of the port table is a typed
     /// capability gap rather than a panic; the message builders' allocation failure when a
     /// term does not fit.
-    pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
+    pub(crate) fn drain_port_messages(&mut self, timeout: Duration) -> Result<Vec<(Eterm, Eterm)>> {
         // The shared port state is cloned out so the *messages* — which need `&mut self` —
         // are never built while the registry is borrowed (the same snapshot rule
         // `native.rs` follows).
@@ -4348,13 +4390,18 @@ impl RuntimeContext<'_> {
         let mut messages = Vec::with_capacity(events.len());
         for event in events {
             match event {
+                // A port-produced message's sender is the **port**, the C's
+                // `erts_queue_message(…, prt->common.id, …)` (`io.c:3443`/`:3627`/`:5570`).
                 PortEvent::Data {
                     port,
                     read,
                     stream,
                     shape,
                     ..
-                } => messages.push(self.port_data_message_shaped(port, &read, stream, shape)?),
+                } => {
+                    let message = self.port_data_message_shaped(port, &read, stream, shape)?;
+                    messages.push((port.to_eterm(), message));
+                }
                 // The `line` option's framed shape (see [`PortEvent::Line`]); the evaluator is
                 // the port's owner on this path, so the message is its own.
                 PortEvent::Line {
@@ -4364,9 +4411,13 @@ impl RuntimeContext<'_> {
                     eol,
                     stream,
                     ..
-                } => messages.push(self.port_line_message(port, &header, &bytes, eol, stream)?),
+                } => {
+                    let message = self.port_line_message(port, &header, &bytes, eol, stream)?;
+                    messages.push((port.to_eterm(), message));
+                }
                 PortEvent::Exited { port, status, .. } => {
-                    messages.push(self.port_exit_message(port, status)?)
+                    let message = self.port_exit_message(port, status)?;
+                    messages.push((port.to_eterm(), message));
                 }
                 // A driver-emitted term is the message itself, never a `{Port, Term}` wrapper
                 // (`io.c:6174`). The evaluator can only observe its **own** process's mailbox, so
@@ -4374,11 +4425,14 @@ impl RuntimeContext<'_> {
                 // scheduler path ([`Runtime::deliver_port_messages`]) delivers it into that
                 // process's mailbox instead — rather than being matched as if it were the
                 // evaluator's own.
-                PortEvent::Term { to, term, owner, .. } => {
+                PortEvent::Term {
+                    port, to, term, owner, ..
+                } => {
                     if to.unwrap_or(owner) != self.pid() {
                         continue;
                     }
-                    messages.push(self.stabilize_driver_term(term)?);
+                    let message = self.stabilize_driver_term(term)?;
+                    messages.push((port.to_eterm(), message));
                 }
                 // A handled signal is addressed to the `erl_signal_server` process, and the
                 // evaluator is not it: a `RuntimeContext` can only observe its **own** mailbox, so
@@ -4393,7 +4447,8 @@ impl RuntimeContext<'_> {
                     if packet.owner != self.pid() {
                         continue;
                     }
-                    messages.push(self.completion_message(&packet)?);
+                    let message = self.completion_message(&packet)?;
+                    messages.push((packet.port.to_eterm(), message));
                 }
                 // An `{active, …}` input delivery. Same rule as the completion arm above: the
                 // evaluator observes only its **own** mailbox, so one addressed to another
@@ -4416,7 +4471,8 @@ impl RuntimeContext<'_> {
                         kind: packet.kind,
                         event: packet.event.clone(),
                     };
-                    messages.push(self.active_input_message(&resolved)?);
+                    let message = self.active_input_message(&resolved)?;
+                    messages.push((packet.port.to_eterm(), message));
                 }
                 PortEvent::Signal { .. } => continue,
                 // A ready select registration. Same rule as the completion arm above: the evaluator
@@ -4443,22 +4499,38 @@ impl RuntimeContext<'_> {
                         // nothing is delivered rather than a notification naming the wrong term.
                         continue;
                     };
-                    let (_from, message) = self.select_message(&payload, event, handle)?;
-                    messages.push(message);
+                    let pair = self.select_message(&payload, event, handle)?;
+                    messages.push(pair);
                 }
             }
         }
         // A port close owes `'EXIT'`/`'DOWN'` messages to its links and monitors; the ones
-        // addressed to the evaluator itself are returned for its `receive` to match, and every
-        // other recipient's stay queued for the scheduler route that owns a process table (see
-        // [`exit`]).
+        // addressed to the evaluator itself are returned here (with the port as their sender,
+        // like every other port-produced message), and every other recipient's stay queued for
+        // the scheduler route that owns a process table (see [`exit`]).
         messages.extend(self.poll_port_signals()?);
-        // A peer close owed to the evaluator itself rides the same inline route (see
+        // A peer close owed to the evaluator itself rides the same route (see
         // [`ops::peer_closed`]); another process's report is left latched for the scheduler route.
         messages.extend(self.poll_peer_closes()?);
         Ok(messages)
     }
 
+    /// The **test-only** view of [`Self::drain_port_messages`]: the messages without their
+    /// senders.
+    ///
+    /// The port suite asserts the *term* the `-eval` route produces (the `{Port, {data, …}}`
+    /// shape, the framed `{eol|noeol, _}` payload, the driver's own reply) on contexts whose
+    /// port owner is a synthetic pid no process table holds, so it cannot deliver — and does not
+    /// want to. The production route delivers instead
+    /// ([`Self::poll_port_messages_into_mailbox`]); nothing outside a unit test may use this.
+    #[cfg(test)]
+    pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
+        Ok(self
+            .drain_port_messages(timeout)?
+            .into_iter()
+            .map(|(_from, message)| message)
+            .collect())
+    }
     /// Copies a driver-emitted term onto the runtime's pointer-stable arena.
     ///
     /// A term a C driver emitted (`erl_drv_output_term`/`erl_drv_send_term`) is decoded on the
