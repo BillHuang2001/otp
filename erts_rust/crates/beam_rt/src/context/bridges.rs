@@ -32,7 +32,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-
 use beam_bifs::{
     AtomInterner, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
     RecordFieldView, RecordSource, SendHook, TableRegistry,
@@ -899,6 +898,17 @@ impl LocalNode for NodeIdentity {
 /// only allocation the interner ever makes, paid by exactly the calls that need a second
 /// writer. The handle is **not** shared across calls: each call gets a fresh one rooted at
 /// the table's current length.
+///
+/// # Why a predicted index is exact here
+///
+/// The prediction needs the live table to be the **only** thing that grows while a call runs, and it
+/// is: a self-rescheduling NIF chain, a `load_nif/2` callback and every registered BIF run inside this
+/// one single-threaded call, so nothing else appends. A NIF-created thread
+/// (`enif_thread_create`) that creates an atom is deliberately **not** a second writer of this table
+/// — it draws indices from its own private space ([`crate::nif::atoms::ForeignAtomHub`]) and hands a
+/// name to the runtime only through a decoded ETF image, which is interned by the ordinary append
+/// path at whatever index the table has then. So the two never claim the same slot, and no
+/// reconciliation is needed.
 pub(crate) struct PendingInterner {
     /// The base + recorded names, inline until [`PendingInterner::share`] is called.
     state: InternerState,
@@ -934,7 +944,6 @@ impl PendingInterner {
             })),
         }
     }
-
     /// A second handle over the **same** state, for a call with two new-atom writers.
     ///
     /// The handle is `self` made shared: an inline state is promoted into a fresh shared cell
@@ -967,7 +976,7 @@ impl PendingInterner {
         }
     }
 
-    /// Whether any name was recorded during this call.
+    /// Whether there is anything for [`PendingInterner::commit`] to do.
     ///
     /// Load-bearing as a **guard**, not as a semantic: [`PendingInterner::commit`] with no
     /// recorded names is already a no-op, but the caller must not even *reach* the shared
