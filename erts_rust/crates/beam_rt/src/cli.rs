@@ -322,6 +322,11 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         pz: Vec::new(),
         online_schedulers: None,
         heap: HeapOptions::new(),
+        // The C's `H_MIN_SIZE = H_DEFAULT_SIZE` / `H_MAX_SIZE = H_DEFAULT_MAX_SIZE`
+        // (`erl_init.c:812-814`): the `+hmax` ordering rule is armed from the first token, and
+        // no `+hmax` has been seen yet.
+        raw_min_heap_words: beam_gc::DEFAULT_MIN_HEAP_WORDS,
+        prev_max_heap_words: 0,
         max_ports: None,
         init_args: InitArgs::new(),
         perf_map: PerfMapConfig::new(),
@@ -508,7 +513,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "+hms" => {
                 let value = plus_value_of(args, index, "+hms")?;
-                builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
+                let raw = parse_heap_words("+hms", &value)?;
+                // The **raw** value is what the `+hmax` ordering rule compares against
+                // (`erl_init.c:1564` sets `H_MIN_SIZE` unrounded; the growth-table rounding
+                // runs after the whole command line, `:283`), so it is recorded before the
+                // options round it.
+                builder.raw_min_heap_words = raw;
+                builder.heap.set_min_heap_words(raw);
                 index += 2;
             }
             "+hmbs" => {
@@ -520,9 +531,21 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "+hmax" => {
                 let value = plus_value_of(args, index, "+hmax")?;
-                builder
-                    .heap
-                    .set_max_heap_words(parse_max_heap_size(&value)?);
+                let max = parse_max_heap_size(&value)?;
+                // The C's **order-dependent** parse-time rule (`erl_init.c:1634-1639`): when a
+                // `+hmax` is parsed and a **previous** one set a nonzero `H_MAX_SIZE` that is
+                // now below the current `H_MIN_SIZE` (raw, as parsed at `erl_init.c:1564` — the
+                // growth-table rounding at `:283` runs after the whole command line), the
+                // invocation is rejected. It compares the *previous* value, so
+                // `+hmax 500 +hms 4000` is accepted (and the boot process is then killed at
+                // runtime) while `+hmax 500 +hms 1000 +hmax 200` is a usage error.
+                if builder.rejects_max_heap(max) {
+                    return Err(error::max_heap_below_min_heap(
+                        &value,
+                        builder.raw_min_heap_words(),
+                    ));
+                }
+                builder.heap.set_max_heap_words(max);
                 index += 2;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
@@ -605,6 +628,16 @@ struct Builder {
     online_schedulers: Option<u32>,
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) being assembled.
     heap: HeapOptions,
+    /// The **raw** `+hms` value as parsed — the C `H_MIN_SIZE` *before* the growth-table
+    /// rounding (`erl_init.c:1564` sets it unrounded; `:283` rounds it after the whole command
+    /// line). It is the `min` half of the order-dependent `+hmax` rule
+    /// (`erl_init.c:1634-1639`) and starts at the emulator's `H_DEFAULT_SIZE`
+    /// (`erl_init.c:812`), so the rule fires even when no `+hms` was given.
+    raw_min_heap_words: usize,
+    /// The **previously** parsed `+hmax` value — the C `H_MAX_SIZE` at the moment the next
+    /// `+hmax` is parsed (`0` = none yet, the C's `H_DEFAULT_MAX_SIZE`, which disables the
+    /// rule). See [`Builder::rejects_max_heap`].
+    prev_max_heap_words: usize,
     /// The requested port-table size (`+Q N`; `None` for the default table or `legacy`).
     max_ports: Option<usize>,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
@@ -617,6 +650,33 @@ struct Builder {
 }
 
 impl Builder {
+    /// The raw `+hms` value the `+hmax` ordering rule compares against (the C `H_MIN_SIZE`
+    /// before the growth-table rounding) — the `min` the rejection message names.
+    fn raw_min_heap_words(&self) -> usize {
+        self.raw_min_heap_words
+    }
+
+    /// Records `max` as the just-parsed `+hmax` value, answering whether the C's
+    /// **order-dependent** rule rejects the invocation (`erl_init.c:1634-1639`):
+    ///
+    /// ```c
+    /// if (H_MAX_SIZE < H_MIN_SIZE && H_MAX_SIZE) { … erts_usage(); }
+    /// H_MAX_SIZE = hMaxSize;
+    /// ```
+    ///
+    /// Only a **previous** nonzero `+hmax` that is already below the current (raw) `+hms`
+    /// triggers it, so the check is about the ordering of the switches, never about the pair
+    /// that ends up installed: `+hmax 500 +hms 4000` is accepted (the C then kills the boot
+    /// process at the limit), `+hmax 500 +hms 1000 +hmax 200` is a usage error, and
+    /// `+hms 4000 +hmax 500` is accepted because the first `+hmax` it parses has no
+    /// predecessor. Verified against OTP 29.1.1 (see [`max_heap_below_min_heap`]).
+    fn rejects_max_heap(&mut self, max: usize) -> bool {
+        let rejected =
+            self.prev_max_heap_words != 0 && self.prev_max_heap_words < self.raw_min_heap_words;
+        self.prev_max_heap_words = max;
+        rejected
+    }
+
     /// The `-pa` directories, in command-line order — the **head** of the code path.
     ///
     /// The `-pz` directories are the separate tail ([`Builder::pz_paths`]): the oracle's
@@ -821,10 +881,10 @@ fn parse_heap_words(switch: &str, value: &str) -> Result<usize> {
 /// Verified against the oracle: `+hmax 0` is accepted (unlimited), `+hmax -1` and
 /// `+hmax 1000000000000000000000` are rejected, and — because the C parses with
 /// `ErtsStrToSint` and tests only the numeric result — `+hmax abc` is its `0` and
-/// `+hmax 12abc` its `12`, which the `atoi` reader here reproduces. The C's
-/// parse-time "max must not be below the *current* min" check (`erl_init.c:1634-1639`) is
-/// **not** modelled: it is order-dependent (`+hmax 500 +hms 1000 +hmax 200` fails,
-/// `+hms 2000 +hmax 1000` does not) and only rejects an invocation.
+/// `+hmax 12abc` its `12`, which the `atoi` reader here reproduces. The C's **separate**
+/// parse-time "the *previous* max must not be below the current min" check
+/// (`erl_init.c:1634-1639`) is a different rule and lives in the CLI's `+hmax` arm
+/// ([`Builder::rejects_max_heap`]).
 fn parse_max_heap_size(value: &str) -> Result<usize> {
     let words = flags::atoi(value);
     if (0..=MAX_SMALL).contains(&words) {
@@ -2106,6 +2166,93 @@ mod tests {
         ] {
             let error = parse_args(args).expect_err("a malformed max-heap switch is refused");
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// **The `+hmax`/`+hms` ordering rule** (`erl_init.c:1634-1639`) — the three spellings the
+    /// oracle's emulator **rejects at parse time**.
+    ///
+    /// ```c
+    /// if (H_MAX_SIZE < H_MIN_SIZE && H_MAX_SIZE) { … erts_usage(); }
+    /// H_MAX_SIZE = hMaxSize;
+    /// ```
+    ///
+    /// The comparison is against the **previous** `+hmax` and the **raw** (unrounded) current
+    /// `+hms`, and `H_MIN_SIZE` starts at `H_DEFAULT_SIZE` (233) so the rule is armed even with
+    /// no `+hms` at all. Verified against OTP 29.1.1 / erts-17.1 — every row exits **1** with
+    /// this exact first stderr line (`\r\n`-terminated there, one line here):
+    ///
+    /// ```text
+    /// erl +hmax 500 +hms 1000 +hmax 200 -noshell -eval 'halt(0).'
+    ///   → max heap size (200) is not allowed to be smaller than min heap size (1000)
+    /// erl +hmax 200 +hmax 500 …   → max heap size (500) is not allowed to be smaller than
+    ///                               min heap size (233)
+    /// erl +hmax 200 +hmax 300 …   → max heap size (300) is not allowed to be smaller than
+    ///                               min heap size (233)
+    /// ```
+    ///
+    /// The third row is the one that shows the rule is **not** about the pair that ends up
+    /// installed (`300 > 200`, so `+hmax 500 +hmax 300` is accepted): it is about the previous
+    /// value when the next `+hmax` is parsed.
+    #[test]
+    fn the_max_heap_order_rule_rejects_these_spellings() {
+        // (argv, the offending +hmax value, the min heap size the message names)
+        let rows: [(&[&str], &str, usize); 3] = [
+            (&["+hmax", "500", "+hms", "1000", "+hmax", "200"], "200", 1000),
+            (&["+hmax", "200", "+hmax", "500"], "500", 233),
+            (&["+hmax", "200", "+hmax", "300"], "300", 233),
+        ];
+        for (args, max, min) in rows {
+            let error = parse_args(args).expect_err("the +hmax ordering rule rejects this");
+            let expected = format!(
+                "max heap size ({max}) is not allowed to be smaller than min heap size ({min})"
+            );
+            assert_eq!(
+                error::flag_rejected_diagnostic(&error),
+                Some(expected.as_str()),
+                "{args:?} names the value it refused and the min it compared against"
+            );
+            // The emulator's own rejection, never a capability gap: `run` prints the one line
+            // and exits 1 (the flag-rejection kind), not the CLI's usage status.
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The **accepted** side of the same rule — the four spellings the oracle boots with (and
+    /// only *then*, at runtime, meets the far smaller `+hmax`).
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1: each of these parses, starts the emulator and
+    /// dies a **runtime** death instead (`System process <0.0.0> terminated: killed` for the
+    /// first three, a `maximum heap size reached` logger block for the lone `+hmax 200`), which
+    /// is why the assertion here is on the parsed policy rather than on an exit status: a
+    /// successful parse is exactly what the CLI under test can be asked about.
+    ///
+    /// The distinction matters because the C compares only the **previous** value, so the
+    /// ordering is what decides, not the surviving pair:
+    ///
+    /// ```text
+    /// erl +hms 4000 +hmax 500 …    accepted (the first +hmax has no predecessor)
+    /// erl +hmax 500 +hms 4000 …    accepted (the rule ran while H_MIN_SIZE was still 233)
+    /// erl +hmax 500 +hmax 200 …    accepted (500 is not below 233)
+    /// erl +hmax 200 …              accepted (no predecessor at all)
+    /// ```
+    #[test]
+    fn the_max_heap_order_rule_accepts_these_spellings() {
+        // (argv, the installed max_heap_words, the installed min_heap_words — the +hms value
+        // rounded through the growth table, or H_DEFAULT_SIZE when no +hms was given)
+        let rows: [(&[&str], usize, usize); 4] = [
+            (&["+hms", "4000", "+hmax", "500"], 500, 4185),
+            (&["+hmax", "500", "+hms", "4000"], 500, 4185),
+            (&["+hmax", "500", "+hmax", "200"], 200, 233),
+            (&["+hmax", "200"], 200, 233),
+        ];
+        for (args, max, min) in rows {
+            let policy = parsed(args).heap_options().policy().clone();
+            assert_eq!(policy.max_heap_words, max, "{args:?}: the last +hmax wins");
+            assert_eq!(
+                policy.min_heap_words, min,
+                "{args:?}: the +hms value, rounded through the growth table"
+            );
         }
     }
 

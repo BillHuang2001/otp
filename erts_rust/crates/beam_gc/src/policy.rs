@@ -121,7 +121,11 @@ pub struct HeapPolicy {
     /// Smallest binary virtual heap the policy sizes to, in term words — the C
     /// `min_vheap_size` / `BIN_VH_MIN_SIZE`, whose default the oracle reports as 46422.
     pub min_bin_vheap_words: usize,
-    /// Initial size of the young (nursery) space, in term words.
+    /// Seed for the size of the young (nursery) space, in term words — the role of the C's
+    /// `heap_need` at spawn. The **first** young space a collector installs is
+    /// [`initial_heap_words`](Self::initial_heap_words), i.e. this value floored by
+    /// [`min_heap_words`](Self::min_heap_words), so `+hms`/`spawn_opt`'s `min_heap_size`
+    /// really sizes a new process's heap.
     pub initial_young_words: usize,
     /// Initial size of the mature space, in term words.
     pub initial_mature_words: usize,
@@ -177,32 +181,118 @@ impl HeapPolicy {
         }
     }
 
-    /// A policy for a process started with the `spawn_opt` heap options
-    /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after`, applying the C's
-    /// rounding rules (`erl_process.c:12321-12360`).
+    /// The size, in words, of the **first** young (nursery) space a process is born with —
+    /// the C's initial-heap rule at spawn:
     ///
-    /// `min_heap_words` below the C `H_MIN_SIZE` (`DEFAULT_MIN_HEAP_WORDS`, 233) is
-    /// replaced by that minimum rather than rounded up past it; otherwise it is rounded
-    /// through `erts_next_heap_size(x, 0)`, so the stored minimum is a fixed point of the
-    /// growth table — the C's
-    /// `ASSERT(p->min_heap_size == erts_next_heap_size(p->min_heap_size, 0))`
-    /// (`erl_process.c:12575`). `min_bin_vheap_words` follows the identical rule against
-    /// the C default `BIN_VH_MIN_SIZE`. `fullsweep_after` is stored verbatim (the C only
-    /// rejects a negative value).
+    /// ```c
+    /// sz = heap_need < p->min_heap_size ? p->min_heap_size : erts_next_heap_size(heap_need, 0);
+    /// p->heap_sz = sz;                          /* erl_process.c:12586-12592 */
+    /// ```
+    ///
+    /// A cheap spawn's `heap_need` is below the minimum, so the answer is the policy's
+    /// [`min_heap_words`](Self::min_heap_words) whenever one is set — the emulator's `+hms`
+    /// switch or a `spawn_opt` `{min_heap_size, N}` option — and
+    /// [`initial_young_words`](Self::initial_young_words) otherwise. That value *is* the
+    /// default minimum: `HeapPolicy::default` carries no floor, so its `initial_young_words`
+    /// (`DEFAULT_MIN_HEAP_WORDS`, 233) is the seed that stands in for the C's `H_MIN_SIZE`.
+    /// This is what makes `erlang:process_info(P, heap_size)` on a freshly spawned process
+    /// exactly its `min_heap_size` (`HEAP_SIZE(p) == p->heap_sz`, `erl_process.h:1017`,
+    /// `erl_bif_info.c:936`) — including `+hms 100`, whose 142-word heap is *below* the
+    /// unconfigured 233.
+    ///
+    /// The seed is not rounded through the growth table: a caller that set
+    /// `initial_young_words` named a size rather than a request (the `spawn_opt` path rounds
+    /// its own requests in [`Self::spawn_policy`]).
+    ///
+    /// # Deviation from the C
+    ///
+    /// This runtime does not model the C's `heap_need = arg_size + S_RESERVED (+ the group
+    /// leader's NC_HEAP_SIZE)` at spawn: the child's arguments are copied onto its heap
+    /// afterwards and the space grows on demand, so the first heap is `min_heap_size` rather
+    /// than `max(heap_need, min_heap_size)`. A spawn whose argument graph exceeds the minimum
+    /// therefore starts smaller than the oracle's and reaches a comparable size through a
+    /// collection instead of starting there.
+    pub fn initial_heap_words(&self) -> usize {
+        if self.min_heap_words != 0 {
+            self.min_heap_words
+        } else {
+            self.initial_young_words
+        }
+    }
+
+    /// The policy a **new process** gets from the `spawn_opt` heap options
+    /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after`, with `self` as the
+    /// emulator's global policy — the C's `hmin` / `bin_vhmin` / `erts_max_gen_gcs` floor
+    /// source (`erl_process.c:12242-12248`, `12321-12360`).
+    ///
+    /// Per option, the C's rule (`erl_process.c:12321-12332`) is:
+    ///
+    /// * an option value below the **global** minimum is replaced by that global minimum
+    ///   (not rounded past it) — so `+hms 4000` floors a `{min_heap_size, 100}` request at
+    ///   4185;
+    /// * anything else is rounded through `erts_next_heap_size(x, 0)`, so the stored minimum
+    ///   is a fixed point of the growth table — the C's
+    ///   `ASSERT(p->min_heap_size == erts_next_heap_size(p->min_heap_size, 0))`
+    ///   (`erl_process.c:12575`);
+    /// * an absent option (and `fullsweep_after` in every case) falls back to the global
+    ///   policy's own value.
+    ///
+    /// `min_bin_vheap_words` follows the identical rule against the global
+    /// `min_bin_vheap_words` (the C `BIN_VH_MIN_SIZE`). Every other field — the initial
+    /// space sizes, `need_reserve_words` and `max_heap_words` (the C `H_MAX_SIZE`, which a
+    /// `spawn_opt` child inherits unless its own `{max_heap_size, …}` overrides it) — is
+    /// inherited from `self`.
+    ///
+    /// A global field of `0` means *unset* (both minimums are `0` only in
+    /// [`HeapPolicy::default`], which is a growth-policy default rather than an emulator
+    /// configuration), so the emulator's unconfigured defaults
+    /// ([`DEFAULT_MIN_HEAP_WORDS`] / [`default_min_bin_vheap_words`]) are the floor then.
+    /// That is why [`Self::from_spawn_opts`] — the spawn rule over an *unconfigured*
+    /// emulator — is exactly `HeapPolicy::default().spawn_policy(…)`.
+    pub fn spawn_policy(
+        &self,
+        min_heap_words: usize,
+        min_bin_vheap_words: usize,
+        fullsweep_after: Option<u32>,
+    ) -> HeapPolicy {
+        let heap_floor = if self.min_heap_words == 0 {
+            DEFAULT_MIN_HEAP_WORDS
+        } else {
+            self.min_heap_words
+        };
+        let vheap_floor = if self.min_bin_vheap_words == 0 {
+            default_min_bin_vheap_words()
+        } else {
+            self.min_bin_vheap_words
+        };
+        HeapPolicy {
+            min_heap_words: round_spawn_min(min_heap_words, heap_floor),
+            min_bin_vheap_words: round_spawn_min(min_bin_vheap_words, vheap_floor),
+            fullsweep_after: fullsweep_after.unwrap_or(self.fullsweep_after),
+            ..self.clone()
+        }
+    }
+
+    /// A policy for a process started with the `spawn_opt` heap options
+    /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after` against the
+    /// **unconfigured** emulator — the C defaults `H_MIN_SIZE` (`DEFAULT_MIN_HEAP_WORDS`,
+    /// 233) and `BIN_VH_MIN_SIZE` as the floors.
+    ///
+    /// This is [`HeapPolicy::default().spawn_policy`]: an emulator whose `+hms`/`+hmbs`
+    /// switches were not given floors the request at exactly the same values. A host that
+    /// *does* parse those switches passes its own policy instead (that is `beam_rt`'s
+    /// `Runtime::default_spawn_policy`), so the floor has exactly one authority and the
+    /// `+hms` value cannot drift from the `spawn_opt` floor.
     pub fn from_spawn_opts(
         min_heap_words: usize,
         min_bin_vheap_words: usize,
         fullsweep_after: u32,
     ) -> HeapPolicy {
-        HeapPolicy {
-            min_heap_words: round_spawn_min(min_heap_words, DEFAULT_MIN_HEAP_WORDS),
-            min_bin_vheap_words: round_spawn_min(
-                min_bin_vheap_words,
-                default_min_bin_vheap_words(),
-            ),
-            fullsweep_after,
-            ..HeapPolicy::default()
-        }
+        HeapPolicy::default().spawn_policy(
+            min_heap_words,
+            min_bin_vheap_words,
+            Some(fullsweep_after),
+        )
     }
 
     /// Whether the fullsweep cadence is due after `minor_gcs` minor collections — the C
@@ -864,5 +954,87 @@ mod tests {
         assert!(capped.young_after_fullsweep(100_000, 100_000, 10) < 100_000);
         // A live set above the cap leaves the clamp — not a fabricated larger target.
         assert_eq!(capped.young_after_fullsweep(233, 233, 5_000), 233);
+    }
+
+    /// The C's initial-heap rule (`erl_process.c:12586-12592`): a new process's first heap is
+    /// its `min_heap_size`, and a policy with no minimum keeps its `initial_young_words` seed.
+    #[test]
+    fn initial_heap_words_is_the_minimum_when_one_is_set() {
+        // No floor: the seed is the rule (`HeapPolicy::default`'s 233 stands in for the C's
+        // `H_MIN_SIZE`), and a caller-set seed is honoured verbatim rather than re-rounded.
+        assert_eq!(HeapPolicy::default().initial_heap_words(), 233);
+        assert_eq!(
+            HeapPolicy {
+                initial_young_words: 1024,
+                ..HeapPolicy::default()
+            }
+            .initial_heap_words(),
+            1024
+        );
+
+        // A floor wins, in **both** directions: `+hms 4000` => 4185 (the oracle's fresh-process
+        // `heap_size`), and `+hms 100` => 142 -- *below* the unconfigured 233 seed, because the
+        // C's default `H_MIN_SIZE` is simply replaced by the switch.
+        assert_eq!(HeapPolicy::from_min_max(4185, 0).initial_heap_words(), 4185);
+        assert_eq!(HeapPolicy::from_min_max(142, 0).initial_heap_words(), 142);
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(0, 0, 65_535).initial_heap_words(),
+            233
+        );
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(1000, 0, 65_535).initial_heap_words(),
+            1598
+        );
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(8000, 0, 65_535).initial_heap_words(),
+            10958
+        );
+    }
+
+    /// [`HeapPolicy::spawn_policy`] floors a `spawn_opt` request against the **global**
+    /// policy's minimums (the C `H_MIN_SIZE`/`BIN_VH_MIN_SIZE`), which is the one authority --
+    /// so `+hms 4000` floors `{min_heap_size, 100}` at 4185, and `+hms 100` floors it at 142.
+    /// Everything else (`max_heap_size`, the initial space sizes) is inherited from the global.
+    #[test]
+    fn spawn_policy_floors_against_the_global_policy() {
+        let default_global = HeapPolicy {
+            min_heap_words: DEFAULT_MIN_HEAP_WORDS,
+            ..HeapPolicy::default()
+        };
+        // The unconfigured emulator: identical to `from_spawn_opts`.
+        assert_eq!(
+            default_global.spawn_policy(0, 0, Some(65_535)),
+            HeapPolicy::from_spawn_opts(0, 0, 65_535)
+        );
+
+        for (hms, floor) in [(100usize, 142usize), (1000, 1598), (4000, 4185), (8000, 10958)] {
+            let global = HeapPolicy {
+                min_heap_words: next_heap_size(hms, 0),
+                ..HeapPolicy::default()
+            };
+            assert_eq!(global.min_heap_words, floor, "+hms {hms}");
+            // A below-floor request is replaced by the global (never rounded past it) ...
+            assert_eq!(global.spawn_policy(100, 0, None).min_heap_words, floor);
+            // ... an above-floor request is rounded through the growth table ...
+            assert_eq!(
+                global.spawn_policy(20_000, 0, None).min_heap_words,
+                next_heap_size(20_000, 0)
+            );
+            // ... and the global's binary-vheap floor applies likewise.
+            assert_eq!(global.spawn_policy(0, 100, None).min_bin_vheap_words, 46_422);
+            // An absent `fullsweep_after` inherits the global's; every other field too (the
+            // C's `H_MAX_SIZE` included).
+            let inherited = global.spawn_policy(0, 0, None);
+            assert_eq!(inherited.fullsweep_after, global.fullsweep_after);
+            assert_eq!(inherited.initial_mature_words, global.initial_mature_words);
+            assert_eq!(inherited.need_reserve_words, global.need_reserve_words);
+            assert_eq!(inherited.max_heap_words, global.max_heap_words);
+            // The inherited maximum really is the global's.
+            let capped = HeapPolicy {
+                max_heap_words: 12_345,
+                ..global.clone()
+            };
+            assert_eq!(capped.spawn_policy(0, 0, None).max_heap_words, 12_345);
+        }
     }
 }

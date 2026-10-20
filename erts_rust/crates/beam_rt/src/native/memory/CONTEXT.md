@@ -44,9 +44,12 @@ Residuals: the door's `initial_call` is the process's **entry MFA** where the or
 ### Honest typed `unsupported` items
 Valid oracle names whose gap reason names the missing accessor/hook: `backtrace` (no raw/binary stack-dump accessor), `magic_ref` (the NIF resource API is unbound), `parent`/`label` (no such PCB field), `priority_messages` (no such `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no per-generation block sizes).
 
+### The heap-size items are oracle figures, not this runtime's own
+`heap_size` is the nursery's capacity, which is the process's own `min_heap_size` (`HeapPolicy::initial_heap_words`), so the default is the oracle's 233, `+hms 4000` answers 4185 and a `spawn_opt` `{min_heap_size,N}` is floored by the emulator's `+hms` and reported.
+`total_heap_size` composes the C's figure — `heap_size` plus the old generation's capacity **only once a collection has created it** (`erl_bif_info.c:1023-1030`), so a fresh process reports `total_heap_size == heap_size`, exactly as the oracle does.
+Both are pinned against the live oracle by `../../../tests/min_heap_size.rs`.
 ### Documented divergences (correct-but-different-by-construction)
 `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 when no execution position is readable.
-`heap_size` is the oracle's 233 (the nursery) while `total_heap_size` is the real **466** (a pre-allocated 233-word mature generation).
 `memory`, `reductions`, `group_leader` (`Runtime::group_leader_of`'s real pid — the root pid by default, set by `erlang:group_leader/2`, inherited on spawn), `binary`'s `Ptr`/`Refc`, `error_handler` (the atom) and `suspending` (`[]`) are this runtime's own values.
 `status` is `running` for the caller (single-threaded), else the process's `ProcessState`.
 `message_queue_data` is `on_heap` (the queue is heap-resident), with an **explicit** `process_flag(message_queue_data, off_heap)` accepted-and-ignored.

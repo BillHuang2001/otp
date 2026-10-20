@@ -481,6 +481,14 @@ impl HeapObservable for AnyCollector {
         }
     }
 
+    /// The selected strategy's old generation, as the C reports it: `0` until a collection has
+    /// populated it, its capacity afterwards — forwarded to whichever strategy is selected.
+    fn old_heap_size_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.old_heap_size_words(),
+            AnyCollector::Immix(c) => c.old_heap_size_words(),
+        }
+    }
     /// The words handed out across **every** nursery space — forwarded to whichever strategy is
     /// selected, so the answer is strategy-agnostic (both share the young nursery chain).
     fn heap_used_words(&self) -> usize {

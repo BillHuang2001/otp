@@ -253,6 +253,14 @@ impl Law {
 /// fixed point** of [`HeapPolicy::mature_after_fullsweep`], so both fullsweeps this file runs
 /// (the promotion and the measured one) reclaim in place rather than relocating.
 ///
+/// The nursery is the policy's [`initial_heap_words`](HeapPolicy::initial_heap_words) — the C's
+/// spawn rule `max(heap_need, min_heap_size)` (`erl_process.c:12586-12592`) — so it *is* the
+/// `min_heap_words` floor below: the C cannot express a young heap under its own `min_heap_size`
+/// either (`next_heap_size` floors every size by it, `erl_gc.c:347-352`). The floor is the fixed
+/// point of the mature generation, and it is always big enough for the corpus this file writes
+/// (the line floor below is `2 × (live lines + reserve)`, and a line-floor word is a whole
+/// [`LINE_WORDS`]-word line for at most [`LINE_WORDS`] useful words).
+///
 /// A fullsweep now sizes its fresh mature space from the **exact live word count** *plus the
 /// nursery's occupancy* (the C `erl_gc.c:2072` `need_after = (HEAP_TOP(p) - HEAP_START(p)) +
 /// need + …`; see [`crate::Collector::collect_major`](beam_gc::Collector::collect_major)). The
@@ -288,7 +296,9 @@ fn policy(shape: Shape, objects: usize) -> HeapPolicy {
     let mature_words = line_floor.max(grow_floor).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
     HeapPolicy {
         fullsweep_after: 65535,
-        initial_young_words: live_line_words + 4096,
+        // The nursery the collector is born with is the floor below (see the doc above): this
+        // policy states no separate heap need, so the two agree.
+        initial_young_words: mature_words,
         initial_mature_words: mature_words,
         min_heap_words: mature_words,
         need_reserve_words,
@@ -370,9 +380,23 @@ fn run_once(shape: Shape, objects: usize, kind: MatureKind) -> Run {
         }
     }
     assert_eq!(roots.len(), objects, "the corpus holds {objects} objects");
+    // The nursery is the policy's **initial heap** — the C's spawn rule
+    // `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` (`erl_process.c:12586-12592`),
+    // which for this policy is its `min_heap_words` floor (the mature capacity, pinned to be the
+    // in-place fixed point). It must hold the whole corpus the promotion phase writes plus the
+    // policy's own reserve, so the promotion is one in-place move of the corpus and the measured
+    // fullsweep sees a nursery of garbage only.
+    assert_eq!(
+        c.young().capacity_words(),
+        c.policy().initial_heap_words(),
+        "the nursery is the policy's initial heap"
+    );
     assert!(
-        c.young().available_words() >= 4096,
-        "the nursery was sized to hold the whole corpus"
+        c.young().available_words() >= c.policy().need_reserve_words,
+        "the nursery was sized to hold the whole corpus: {} words left of {} after {objects} \
+         object(s)",
+        c.young().available_words(),
+        c.young().capacity_words()
     );
 
     // ---- phase 2: promote (an unmeasured fullsweep) -------------------------------------

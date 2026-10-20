@@ -54,7 +54,7 @@
 
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, GcConfig, GcStats, HeapInfo, HeapPolicy, MatureKind,
-    MatureSource, IMMIX_BREAK_EVEN_WORDS,
+    MatureSource, IMMIX_BREAK_EVEN_WORDS, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
@@ -62,32 +62,68 @@ use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
 // The process-shaped workload
 // ---------------------------------------------------------------------------
 
-/// The nursery the workload allocates in, in words.
-const NURSERY_WORDS: usize = 256;
+/// The nursery the workload allocates in, in words — and the policy's `min_heap_words`, so it is
+/// also the **initial heap** the collector is born with (the C's spawn rule
+/// `sz = heap_need < p->min_heap_size ? p->min_heap_size : …`, `erl_process.c:12586-12592`).
+/// A curated growth-table size (the `+hms`-style floor must be a fixed point,
+/// `erl_process.c:12575`), big enough that its own occupancy keeps a fullsweep's `need_after`
+/// above `MATURE_WORDS / 4` (see [`workload_policy`]), and small enough that a *whole* nursery of
+/// live terms still fits the mature generation's lines.
+const NURSERY_WORDS: usize = 2586;
 /// The mature generation the workload promotes into, in words. A whole number of
 /// mark-region blocks (32 × 256), so the mark-region space's block rounding lands on exactly
-/// this capacity too and the two strategies see the same geometry.
+/// this capacity too and the two strategies see the same geometry. Kept at exactly this size by
+/// the live set the workload keeps alive (see [`workload_policy`]), not by a `min_heap_words`
+/// floor.
 const MATURE_WORDS: usize = 8192;
-/// How many tuples the mutator writes per round (3 words each — far more than the nursery
-/// holds, so collections fire mid-burst).
-const BURST: usize = 120;
+/// The mutator's tuple: 15 elements + a header = **16 words = exactly one [`LINE_WORDS`] line**.
+///
+/// The line-exact shape is what makes the two strategies comparable word for word: the mark-region
+/// mature space charges a whole line per object, so a line-exact tuple occupies the same 16 words
+/// under both, and `used` / `available` / the admission answers agree exactly (a 3-word tuple would
+/// cost 16 words there but 3 on the copying path, and the two runs would stop asking the same
+/// questions).
+const TUPLE_ARITY: usize = 15;
+/// The tuple's exact size in words (`arity + 1`) — the words one burst term costs.
+const TUPLE_WORDS: usize = TUPLE_ARITY + 1;
+const _: () = assert!(TUPLE_WORDS == LINE_WORDS);
+/// How many tuples the mutator writes per round — more than the [`NURSERY_WORDS`]-sized nursery
+/// holds (`NURSERY_WORDS / TUPLE_WORDS` = 161), so collections fire mid-burst.
+const BURST: usize = 200;
 /// The word count `ensure_capacity` is asked for on the growth rounds.
 const GROW_REQUEST: usize = 48;
+/// The policy's collection reserve, in words — the C's `S_RESERVED` role in
+/// `need_after = … + reserve` (`erl_gc.c:2072`). Much larger than the 64-word default because the
+/// boundary collections see a partly filled nursery, and the reserve is what keeps their
+/// `need_after` above `MATURE_WORDS / 4` so the mature generation is never shrunk (see
+/// [`workload_policy`]).
+const RESERVE_WORDS: usize = 512;
 
-/// A **fixed-geometry** policy: a small, pinned nursery plus a large, pinned mature
-/// generation, so neither strategy ever resizes a space and both see the same cadence.
+/// A **fixed-geometry** policy: a nursery pinned at its own floor plus a large mature generation
+/// held at a fixed point, so neither strategy ever resizes a space and both see the same cadence.
 ///
-/// `min_heap_words` equals the mature capacity, which is what pins it: `should_shrink` can
-/// only fire *above* that floor, so the mature generation is never shrunk — and the
-/// mark-region space's block-rounded capacity therefore never lands on a different size than
-/// the copying space's. The nursery is pinned the same way, and its only growth path (a
-/// surviving set larger than itself) is unreachable here because a collection always fires
-/// before the nursery fills.
+/// The nursery is the policy's **initial heap** — [`HeapPolicy::initial_heap_words`], i.e. the
+/// C's `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` at spawn
+/// (`erl_process.c:12586-12592`) — which is its `min_heap_words` floor, and its only growth path
+/// (a surviving set larger than itself) is unreachable here because a collection always fires
+/// before the nursery fills. The mature generation cannot be floored the same way: `min_heap_size`
+/// is a floor for the *young* heap too (`next_heap_size` raises every size to it,
+/// `erl_gc.c:347-352`), so a floor at the mature capacity would make the nursery that large as
+/// well. It is held by the live set instead: with `need_after = live + nursery occupancy +
+/// reserve`, [`HeapPolicy::should_shrink`] needs `capacity > 4 × need_after` and
+/// [`HeapPolicy::should_grow`] needs `3 × capacity < 4 × need_after`, so `need_after` must stay
+/// inside `(MATURE_WORDS / 4, 3 × MATURE_WORDS / 4]` = `(2048, 6144]` words. A burst collection
+/// sees `live + occupancy ≈ 2 × NURSERY_WORDS` plus the reserve; a boundary collection (the one
+/// `ensure_capacity` forces, and the final one) sees a partly filled nursery. The reserve is
+/// therefore [`RESERVE_WORDS`] — the role of the C's `S_RESERVED`, which `erl_gc.c:2072` folds
+/// into the same `need_after` — rather than the 64-word default, which puts both cases inside the
+/// band (≈2.5 K and ≈5.7 K words) with room on both sides.
 fn workload_policy() -> HeapPolicy {
     HeapPolicy {
-        min_heap_words: MATURE_WORDS,
+        min_heap_words: NURSERY_WORDS,
         initial_young_words: NURSERY_WORDS,
         initial_mature_words: MATURE_WORDS,
+        need_reserve_words: RESERVE_WORDS,
         fullsweep_after: 2,
         ..HeapPolicy::default()
     }
@@ -103,6 +139,18 @@ struct Lockstep {
     asked: Vec<bool>,
 }
 
+/// The 15 elements of one burst tuple: the three the caller supplies plus twelve derived from
+/// `d`, so every tuple differs while both runs build the identical shape.
+fn burst_tuple(a: i64, b: i64, d: i64) -> [Eterm; TUPLE_ARITY] {
+    let mut elems = [make_small(0); TUPLE_ARITY];
+    elems[0] = make_small(a);
+    elems[1] = make_small(b);
+    for (k, e) in elems.iter_mut().enumerate().skip(2) {
+        *e = make_small(d + k as i64);
+    }
+    elems
+}
+
 /// Asserts the two runs' root sets are structurally equal.
 fn assert_roots_equal(a: &[Eterm], b: &[Eterm], atoms: &AtomTable, what: &str) {
     assert_eq!(a.len(), b.len(), "{what}: root count");
@@ -114,10 +162,10 @@ fn assert_roots_equal(a: &[Eterm], b: &[Eterm], atoms: &AtomTable, what: &str) {
     }
 }
 
-/// Writes the same 3-word tuple into both runs' nurseries, **after** running the heap-admission
-/// point `beam_process::Process` runs: ask [`AnyCollector::should_collect`], collect when it
-/// says so, then write the term. Every step goes through the strategy seam — no concrete
-/// collector is named — and every step asserts the two runs agreed.
+/// Writes the same [`TUPLE_WORDS`]-word tuple into both runs' nurseries, **after** running the
+/// heap-admission point `beam_process::Process` runs: ask [`AnyCollector::should_collect`],
+/// collect when it says so, then write the term. Every step goes through the strategy seam — no
+/// concrete collector is named — and every step asserts the two runs agreed.
 ///
 /// A term is valid only until the next collection relocates it, which is why the caller pushes
 /// both words into their run's root set at once.
@@ -131,8 +179,8 @@ fn alloc_pair(
     b: i64,
     d: i64,
 ) -> (Eterm, Eterm, bool, Option<CollectionKind>) {
-    let asked_c = copying.should_collect(3);
-    let asked_i = immix.should_collect(3);
+    let asked_c = copying.should_collect(TUPLE_WORDS);
+    let asked_i = immix.should_collect(TUPLE_WORDS);
     assert_eq!(
         asked_c, asked_i,
         "the two strategies must agree on every admission query"
@@ -167,13 +215,13 @@ fn alloc_pair(
     let tc = copying
         .young_mut()
         .heap_mut()
-        .tuple(&[make_small(a), make_small(b), make_small(d)])
-        .expect("the nursery `should_collect` just cleared holds a 3-word tuple");
+        .tuple(&burst_tuple(a, b, d))
+        .expect("the nursery `should_collect` just cleared holds one line-exact tuple");
     let ti = immix
         .young_mut()
         .heap_mut()
-        .tuple(&[make_small(a), make_small(b), make_small(d)])
-        .expect("the nursery `should_collect` just cleared holds a 3-word tuple");
+        .tuple(&burst_tuple(a, b, d))
+        .expect("the nursery `should_collect` just cleared holds one line-exact tuple");
     (tc, ti, asked_c, kind)
 }
 
@@ -378,7 +426,7 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     assert_eq!(info_i, info_c);
     assert_eq!(info_c.heap_size, NURSERY_WORDS);
     assert_eq!(info_c.total_heap_size, NURSERY_WORDS + MATURE_WORDS);
-    assert_eq!(info_c.min_heap_size, MATURE_WORDS);
+    assert_eq!(info_c.min_heap_size, NURSERY_WORDS);
     assert_eq!(info_c.minor_gcs, copying.minor_gcs());
 
     // The collection *counts* agree; only the strategy's copy work may differ (the mark-region

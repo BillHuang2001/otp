@@ -198,14 +198,18 @@
 //! a collection total; the monotone totals are `Runtime::gc_stats().collections`.
 //! Nothing here is hardcoded from the oracle.
 //!
+//! The two heap-size items are **oracle figures**, not this runtime's own bookkeeping:
+//! `heap_size` is the nursery the policy installs (`beam_gc::HeapPolicy::initial_heap_words`,
+//! i.e. the process's own `min_heap_size`), and `total_heap_size` adds the old generation's
+//! capacity only once a collection has created it (`erl_bif_info.c:1023-1030`), so a fresh
+//! process reports both as its `min_heap_size` — 233 by default, 4185 under `+hms 4000`, a
+//! `spawn_opt` `{min_heap_size, N}` floored by the emulator's `+hms` — exactly as the oracle
+//! does (`tests/min_heap_size.rs`). The collector's real summed capacity stays available
+//! through `total_heap_size_words` for the `erlang:memory` accounting and the `max_heap_size`
+//! door.
+//!
 //! # Documented divergences (correct-but-different-by-construction)
 //!
-//! * `heap_size` / `total_heap_size`: the oracle reports `233` for both on a fresh idle
-//!   process. This runtime reports its **real** capacities, so an idle process reports `233`
-//!   for `heap_size` (the young space is `initial_young_words` = 233 words) but `466` for
-//!   `total_heap_size`, because the collector pre-allocates a 233-word mature generation
-//!   where the oracle's old heap is still empty. Reporting the real figure is deliberate:
-//!   the number is a property of *this* runtime's heap, and inventing `233` would be a lie.
 //! * `memory`: this runtime's own byte total (`(total_heap_size + stack_size) * 8` plus the
 //!   off-heap overhead), which is smaller than the oracle's because this heap is smaller.
 //! * `status`: this runtime is single-threaded, so the process making the call is `running`
@@ -1276,7 +1280,15 @@ impl RuntimeContext<'_> {
             priority: process.priority().name(),
             group_leader: self.runtime.group_leader_of(pid).to_eterm(),
             heap_size: process.collector().heap_size_words(),
-            total_heap_size: process.collector().total_heap_size_words(),
+            // The C's `total_heap_size` = `HEAP_SIZE(p) + (old_hend - old_heap)`
+            // (`erl_bif_info.c:1023-1030`): the old generation counts **only while it exists**,
+            // and a collection is what creates it (`erl_gc.c:1470-1478`). So a freshly spawned
+            // process reports `total_heap_size == heap_size` here, exactly as the oracle does,
+            // even though this collector already owns an (empty) mature space — the real
+            // capacity sum stays available through `total_heap_size_words` for the
+            // `erlang:memory` accounting and the `max_heap_size` door.
+            total_heap_size: process.collector().heap_size_words()
+                + process.collector().old_heap_size_words(),
             stack_size: process.registers().stack().len(),
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),

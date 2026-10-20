@@ -446,6 +446,28 @@ pub(crate) fn missing_value(switch: &str) -> BeamError {
     message(format!("switch {switch} requires a value"))
 }
 
+/// The C's **order-dependent** `+hmax` versus `+hms` parse-time refusal
+/// (`erl_init.c:1634-1639`):
+///
+/// ```c
+/// if (H_MAX_SIZE < H_MIN_SIZE && H_MAX_SIZE) {
+///     erts_fprintf(stderr, "max heap size (%s) is not allowed to be smaller than "
+///                          "min heap size (%d)\n", arg, H_MIN_SIZE);
+///     erts_usage();
+/// }
+/// ```
+///
+/// It is the **emulator's** own rejection, so like [`bad_switch_value`] it is a
+/// [`flag_rejected`] raise: [`crate::cli::run`] prints one line and exits **1**, never the
+/// CLI's usage status. The oracle reproduces the same first line (probed on OTP 29.1.1:
+/// `erl +hmax 500 +hms 1000 +hmax 200 …` exits 1 with
+/// `max heap size (200) is not allowed to be smaller than min heap size (1000)`).
+pub(crate) fn max_heap_below_min_heap(max: &str, min: usize) -> BeamError {
+    flag_rejected(format!(
+        "max heap size ({max}) is not allowed to be smaller than min heap size ({min})"
+    ))
+}
+
 /// A **`+`-switch with no operand**, i.e. at the end of argv or followed by the
 /// terminator `--`.
 ///

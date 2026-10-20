@@ -131,21 +131,25 @@ struct SpawnOptions {
 }
 
 impl SpawnOptions {
-    /// The heap policy the parsed options select for the child.
+    /// The heap policy the parsed options select for the child, over `base` — the emulator's
+    /// **global** heap policy (the C `H_MIN_SIZE` / `BIN_VH_MIN_SIZE` / `erts_max_gen_gcs` /
+    /// `H_MAX_SIZE` a process with no `spawn_opt` heap option is born with,
+    /// `erl_process.c:12242-12248`, `12562-12572`).
     ///
-    /// [`HeapPolicy::from_spawn_opts`] applies the C's rounding rules to the three rounding
-    /// options — a request below the minimum is replaced by it, anything else is rounded
-    /// through the growth table so the stored value is a fixed point of it
-    /// (`erl_process.c:12321-12360`) — and the process-default `fullsweep_after` when the
-    /// option was absent (the C stores the global `erts_max_gen_gcs`). `max_heap_size` is
-    /// applied on top; `0` is the `HeapPolicy` encoding of the C's `H_MAX_SIZE` ("no upper
-    /// bound").
-    fn policy(&self) -> HeapPolicy {
-        let mut policy = HeapPolicy::from_spawn_opts(
+    /// [`HeapPolicy::spawn_policy`] applies the C's rounding rules to the three rounding
+    /// options — a request below the **global** minimum is replaced by it, anything else is
+    /// rounded through the growth table so the stored value is a fixed point of it
+    /// (`erl_process.c:12321-12360`) — and falls back to the global `fullsweep_after` when the
+    /// option was absent (the C stores the global `erts_max_gen_gcs`). Everything else,
+    /// `max_heap_size` included, is inherited from `base`, which is the C's
+    /// `p->max_heap_size = sop->max_heap_size ? sop->max_heap_size : H_MAX_SIZE`; an explicit
+    /// `{max_heap_size, …}` option overrides it below. `0` is the `HeapPolicy` encoding of the
+    /// C's "no upper bound".
+    fn policy(&self, base: &HeapPolicy) -> HeapPolicy {
+        let mut policy = base.spawn_policy(
             self.min_heap_words.unwrap_or(0),
             self.min_bin_vheap_words.unwrap_or(0),
-            self.fullsweep_after
-                .unwrap_or_else(|| HeapPolicy::default().fullsweep_after),
+            self.fullsweep_after,
         );
         if let Some(max) = self.max_heap_words {
             policy.max_heap_words = max;
@@ -327,7 +331,7 @@ impl RuntimeContext<'_> {
         let child = self.spawn_fun_child_with_policy(
             fun,
             Vec::new(),
-            options.policy(),
+            options.policy(&self.runtime.default_spawn_policy()),
             options.priority,
         )?;
         self.apply_spawn_options(child, &options)
@@ -341,7 +345,7 @@ impl RuntimeContext<'_> {
             &module,
             &function,
             Vec::new(),
-            options.policy(),
+            options.policy(&self.runtime.default_spawn_policy()),
             options.priority,
         )?;
         self.apply_spawn_options(child, &options)
@@ -356,7 +360,7 @@ impl RuntimeContext<'_> {
             &module,
             &function,
             call_args,
-            options.policy(),
+            options.policy(&self.runtime.default_spawn_policy()),
             options.priority,
         )?;
         self.apply_spawn_options(child, &options)
@@ -643,14 +647,22 @@ impl RuntimeContext<'_> {
         // ```
         //
         // `max_heap_size == 0` is the C's "no upper bound", so it is always accepted, and
-        // `sop->min_heap_size` there is the **rounded** value — `H_MIN_SIZE` (233) when the
-        // option was absent or below it, else `erts_next_heap_size(x, 0)` — which is exactly
-        // what [`SpawnOptions::policy`]'s `HeapPolicy::from_spawn_opts` computes, so this
-        // comparison cannot drift from the growth table. Oracle (OTP 29.1.1): `{min_heap_size,
-        // 100}, {max_heap_size, 233}` spawns, 232 is `badarg`; `{min_heap_size, 1000},
-        // {max_heap_size, 1597}` is `badarg`, 1598 spawns.
+        // `sop->min_heap_size` there is the **globally floored** value — the emulator's
+        // `H_MIN_SIZE` when the option was absent or below it, else
+        // `erts_next_heap_size(x, 0)` — which is exactly
+        // [`SpawnOptions::policy`]'s `HeapPolicy::spawn_policy` over the emulator's own policy,
+        // so this comparison cannot drift from the growth table **or** from `+hms`. That is
+        // what makes `spawn_opt(fun, [{max_heap_size, 500}])` a `badarg` under `+hms 4000`
+        // (floor 4185 > 500) while it spawns under the default (floor 233).
+        //
+        // Oracle (OTP 29.1.1): `{min_heap_size, 100}, {max_heap_size, 233}` spawns, 232 is
+        // `badarg`; `{min_heap_size, 1000}, {max_heap_size, 1597}` is `badarg`, 1598 spawns.
         if let Some(max) = parsed.max_heap {
-            if max.violates_floor(parsed.policy().min_heap_words) {
+            if max.violates_floor(
+                parsed
+                    .policy(&self.runtime.default_spawn_policy())
+                    .min_heap_words,
+            ) {
                 return Err(BeamError::BadArg);
             }
         }
