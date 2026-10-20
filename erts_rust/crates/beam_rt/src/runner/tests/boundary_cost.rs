@@ -90,10 +90,9 @@
 //! The mature generation is flat for the same structural reason (4 185 capacity / 4 068 used at
 //! every N): `HeapPolicy::mature_target_words` is `MATURE_TARGET_LIVE_MULTIPLE` (2) x its
 //! post-fullsweep need — a property of the live set, never of the mature occupancy or capacity —
-//! so it is a fixed point too, and the ratchet that rule replaced is what the flatness rail
-//! guards.
+//! so it is a fixed point too, and the flatness rail is what guards that fixed point.
 //!
-//! **What this module cannot verify: the door-ON vs door-OFF A/B it once quoted.**
+//! **What this module cannot verify: the door-ON vs door-OFF A/B.**
 //! Establishing that the door's collections *substitute for* the heap-admission door's rather
 //! than adding to them needs a door-disabled build — a throwaway `#[cfg(test)]` early return
 //! inside `collect_at_reds_boundary` (`src/context/gc/reds_door.rs`) — which is an edit outside
