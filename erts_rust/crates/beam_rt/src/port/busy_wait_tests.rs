@@ -42,6 +42,7 @@
 //! | busy | — | — | `Gone` (unknown id) | `error:badarg` | 0 |
 //! | busy | `true`/`false` | none, `[nosuspend]` | `Park` | the caller is parked and re-run | 0 |
 //! | busy | `true` | none, expired deadline | `Deadline` | the `DEADLINE_REASON` gap | 0 |
+//! | busy | `false` | none, expired deadline | `Deadline` | the same gap (the bound covers the park route) | 0 |
 //! | cleared | either | none | `Idle` | `Written` | 1 (the bytes) |
 //! | busy | either | `[nosuspend]` | — | `Suspended` (no conversion) | 0 |
 //! | either | either | `[force]` without `SOFT_BUSY` | — | `error:notsup` | 0 |
@@ -233,6 +234,29 @@ fn an_expired_deadline_is_the_typed_gap() {
         "the expired wait is the module's own reason"
     );
     assert!(!ran.get(), "no attempt was ever accepted, so nothing was converted");
+    assert_eq!(writes.get(), 0, "nothing reached the driver's `output`");
+}
+
+/// The deadline bounds the **park** route too: a caller that may not pump and whose wait has
+/// already expired is `Deadline`, never a `Park` that would re-execute the BIF for ever.
+///
+/// The C suspends such a caller for as long as the driver keeps the port busy; this runtime
+/// bounds that (see [`BUSY_PORT_DEADLINE`](super::BUSY_PORT_DEADLINE)) and the bound must hold on
+/// **both** routes, so a port no driver ever clears cannot spin the scheduler.
+///
+/// The deadline is driven through the private deadline form with a deadline already in the past
+/// (no wait at all), so the row costs nothing.
+#[test]
+fn a_park_route_wait_past_its_deadline_is_the_typed_gap() {
+    let mut runtime = native_runtime();
+    let (port, _flag, writes) = register_busy_port(&mut runtime, "bw_park_deadline", true, false);
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        wait_until_idle_by(&mut runtime, false, OWNER, port, past)
+            .expect("the port table is readable"),
+        IdleWait::Deadline,
+        "a caller that may not pump still expires at its deadline"
+    );
     assert_eq!(writes.get(), 0, "nothing reached the driver's `output`");
 }
 

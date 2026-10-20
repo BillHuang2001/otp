@@ -64,12 +64,18 @@ pub(crate) struct RunSliceCounters {
     pub(crate) yields: usize,
     /// Slices that ended at the `receive` `Wait` arm.
     pub(crate) waits: usize,
+    /// Slices that ended at the **BIF-suspend** arm (`BifOutcome::Suspend`, the engine's
+    /// `RunOutcome::Suspend`) — a strict subset of `yields`, because a suspend re-enqueues the
+    /// process exactly like a pre-emption but **without applying the instruction**, so the next
+    /// slice re-executes it. This is the deterministic evidence a park → pump → resume test needs
+    /// (a wall-clock wait cannot distinguish "suspended and resumed" from "never had to wait").
+    pub(crate) suspends: usize,
 }
 
 #[cfg(test)]
 thread_local! {
     pub(crate) static RUN_SLICE_COUNTERS: std::cell::Cell<RunSliceCounters> =
-        const { std::cell::Cell::new(RunSliceCounters { slices: 0, yields: 0, waits: 0 }) };
+        const { std::cell::Cell::new(RunSliceCounters { slices: 0, yields: 0, waits: 0, suspends: 0 }) };
 }
 
 /// This thread's slice/park counters since the last [`reset_run_slice_counters`].
@@ -105,6 +111,19 @@ fn note_slice_parked(preempted: bool) {
         } else {
             value.waits += 1;
         }
+        counter.set(value);
+    });
+}
+
+/// Records one slice that ended at the **BIF-suspend** arm: a `Yield` (re-enqueued like a
+/// pre-emption) **and** a suspend, which is what makes "the instruction was not applied and will
+/// be re-executed" structurally observable to a test.
+#[cfg(test)]
+fn note_slice_suspended() {
+    RUN_SLICE_COUNTERS.with(|counter| {
+        let mut value = counter.get();
+        value.yields += 1;
+        value.suspends += 1;
         counter.set(value);
     });
 }
@@ -1448,7 +1467,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
                 #[cfg(test)]
-                note_slice_parked(true);
+                note_slice_suspended();
                 Ok(RunOutcome::Yield)
             }
             Err(error) => {

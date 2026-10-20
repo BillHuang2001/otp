@@ -78,7 +78,9 @@
 //!   `Instant::now()` on the per-slice context — which is dropped at the end of every slice
 //!   (`crate::runner`). A caller parked and resumed repeatedly therefore still expires at the
 //!   *first* attempt's deadline instead of restarting it; every terminal verdict (written, gone,
-//!   expired) removes the entry, so the map holds only in-flight waits.
+//!   expired) removes the entry, so the map holds only in-flight waits. The bound applies to the
+//!   **park** route too: a port no driver ever clears becomes the typed deadline gap after
+//!   [`BUSY_PORT_DEADLINE`] rather than re-issuing the BIF for ever.
 //!
 //! A **nested** run started from inside a BIF (a `run_export_blocking` on a `for_process*`
 //! context) is a different matter: a blocking entry folds a suspend into the typed
@@ -221,6 +223,10 @@ pub(crate) enum IdleWait {
     /// The caller may not re-enter the scheduler, so it cannot wait in place: it must be
     /// suspended and the instruction re-issued on resume (the C's `erts_suspend` +
     /// `ERTS_BIF_YIELD*` re-run).
+    ///
+    /// A park is reached only while the wait is **inside** its deadline: the same
+    /// [`BUSY_PORT_DEADLINE`] bounds this route, so a port that never goes idle expires into
+    /// [`IdleWait::Deadline`] (the C's wait is unbounded) instead of re-executing the BIF for ever.
     Park,
 }
 
@@ -355,13 +361,20 @@ fn wait_until_idle_by(
             Some(false) => return Ok(IdleWait::Idle),
             Some(true) => {}
         }
+        // The deadline is tested **before** the park verdict, so it bounds both routes. The C is
+        // unbounded here (a suspended process waits until the driver clears the bit, however long
+        // that takes), and a parked caller is re-run once per slice — so without this a port no
+        // driver ever clears would re-execute the BIF for ever instead of failing after
+        // [`BUSY_PORT_DEADLINE`]. The wait start is the **first** attempt's
+        // ([`Runtime::note_busy_port_wait`] is idempotent), so a caller parked and resumed
+        // repeatedly still expires at that first deadline.
+        if Instant::now() >= deadline {
+            return Ok(IdleWait::Deadline);
+        }
         // A caller inside a scheduler slice may not re-enter the scheduler: it must be parked
         // and the instruction re-issued on resume (see the module docs).
         if !may_pump {
             return Ok(IdleWait::Park);
-        }
-        if Instant::now() >= deadline {
-            return Ok(IdleWait::Deadline);
         }
         runtime.pump_scheduler(BUSY_PORT_PUMP_SLICES)?;
     }
