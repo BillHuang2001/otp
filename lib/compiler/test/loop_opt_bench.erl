@@ -60,6 +60,44 @@
 %%     a fresh `erl -noshell' process per variant, alternating rounds, median of
 %%     the in-VM elapsed time (a second, cold-code noise model).
 %%
+%% A second group of kernels -- the `recv_*' family -- measures the two LICM
+%% halves instead of the strength reductions.
+%% The only CFG cycle that exists when the SSA optimiser runs is a `receive'
+%% RETRY loop (a tail-recursive function stays a tail call), so a `receive' loop
+%% is the only shape on which either LICM can fire at all in real code:
+%%   * the base `loop_opt' LICM hoists pure non-raising tag tests (?SAFE_BIFS)
+%%     and constructors (?SAFE_OPS) out of the NATURAL loop body, which for a
+%%     receive is the match-retry cycle only;
+%%   * `loop_arith_licm' hoists arithmetic out of the wider region the loop
+%%     header dominates, which additionally covers the post-match body.
+%% Their mailbox must be full BEFORE the timed region, so each of these kernels
+%% exports prep/0, which sends itself exactly the ?ITERS messages that run/0
+%% consumes and leaves the mailbox empty afterwards.
+%% The mailbox is per-process, so the fill cannot be hoisted out of the timed
+%% region by the caller either: the harness calls prep/0 before every single
+%% invocation of run/0 -- the discarded warm-up, each timed round, the
+%% allocation process (before its GC snapshot) and the whole-program VM -- and
+%% times only run/0.
+%% These kernels are written so that the only arithmetic left in the receive
+%% region is the one the kernel targets: the loop counter is decremented BEFORE
+%% the `receive' (N1 = N - 1).
+%% A decrement inside the message body is itself loop-invariant with respect to
+%% the retry cycle, so `loop_arith_licm' would hoist it out of every one of these
+%% kernels, target and control alike, and the measurement would attribute that
+%% hoist to the kernel's own subject.
+%% The loop-invariant operands are read once through the process dictionary (set
+%% by prep/0) and narrowed by an `is_integer' guard on the entry point: literal
+%% arguments are constant-folded and leave nothing to hoist, and the guard is
+%% what proves the integrality `loop_arith_licm' requires before it may move a
+%% possibly-raising operation.
+%% `recv_tuple_invariant' is the documented NEGATIVE result (a control kernel):
+%% a `put_tuple' of loop-invariant elements built in the POST-MATCH body is not
+%% hoisted, because that body lies outside the natural loop body of the retry
+%% cycle -- only `loop_arith_licm' looks that far, and it does not hoist
+%% constructors.
+%% Since both builds of it are compiled to the same `Code' chunk, whatever ratio
+%% the timing table shows for it is noise on identical code and is not an effect
+%% of the pass.%%
 %% Run it through test/measure_loop_opt_speed.sh; do not invoke it directly.
 %% It needs (a) the host Erlang, (b) the rig compiler as the FIRST `compile' on
 %% the code path -- it hard-fails when code:which(compile) is not the rig, and
@@ -92,8 +130,28 @@
 -define(ITERS_MUL2, 32000000).
 -define(ITERS_BITPACK, 12000000).
 
+%% The receive kernels spend far more per iteration than the arithmetic ones
+%% (a `loop_rec'/`remove_message' pair, and for the control a tuple build), so
+%% they need far fewer iterations for a sample of the same order: 1,000,000
+%% puts the three LICM targets at ~45 ms per sample on the reference host,
+%% against the tens of milliseconds of the kernels above.
+-define(ITERS_RECV, 1000000).
+
+%% The constructor CONTROL allocates one tuple per message, so at the count
+%% above its samples are dominated by GC pacing rather than by the loop: two
+%% identically compiled builds of it differ by 25% in the median, and single
+%% samples spread over 60..165 ms.  At 200,000 its heap stays small enough that
+%% the medians of identical builds agree to a few percent, and the sample is
+%% still ~13 ms.  Its timing is not evidence in either direction anyway -- its
+%% whole point is that its `Code' chunk is identical -- so the count is chosen
+%% to keep the report readable, not to favour anything.
+-define(ITERS_RECV_CTOR, 200000).
+
 %% Chunk id of the generated code in a BEAM file.
 -define(CODE_CHUNK, <<"Code">>).
+
+%% Width of the `kernel' column of every report table.
+-define(NAME_WIDTH, 16).
 
 %% Instruction names (as reported by beam_disasm) that the loop pass removes:
 %% the expensive integer arithmetic.  The disassembler reports every BIF as
@@ -210,8 +268,8 @@ scratch_dir() ->
 %% Every kernel is a standalone module exporting run/0, so both builds are
 %% timed through the same entry point.  Each one is dominated by ONE family of
 %% rewrites the loop pass owns, on the hot path, so a win -- or the absence of
-%% one -- is attributable.
-%%
+%% one -- is attributable.  A receive kernel additionally exports prep/0, the
+%% mailbox fill that has to happen outside the timed region.%%
 %% `expect_reach' is the harness' hard assertion: false is only legal for a
 %% deliberate control kernel, and it is reported as a documented null result.
 -spec kernels() -> [kernel()].
@@ -365,7 +423,149 @@ kernels() ->
                          "loop(N, I, Acc) ->\n"
                          "    B = I band 16#FF,\n"
                          "    W = (B bsl 8) bor (B bsr 2),\n"
-                         "    loop(N - 1, I + 1, Acc bxor W).\n")}].
+                         "    loop(N - 1, I + 1, Acc bxor W).\n")},
+
+     %% --- the LICM group: a `receive' loop, the only CFG cycle there is ------
+
+     #{name => recv_arith_invariant,
+       note => "receive loop: K * 3, J + 7, M * M on invariant integers",
+       expect_reach => true,
+       whole_program => false,
+       src => kernel_src(?ITERS_RECV,
+                         "-export([run/0, prep/0]).\n"
+                         "\n"
+                         "run() ->\n"
+                         "    {K, J, M} = case erlang:get(bench_params) of\n"
+                         "                    undefined -> {3, 1000, 7};\n"
+                         "                    Ps -> Ps\n"
+                         "                end,\n"
+                         "    entry(?ITERS, K, J, M).\n"
+                         "\n"
+                         "prep() ->\n"
+                         "    put(bench_params, {3, 1000, 7}),\n"
+                         "    fill(?ITERS).\n"
+                         "\n"
+                         "entry(N, K, J, M)\n"
+                         "  when is_integer(K), is_integer(J), is_integer(M),"
+                         " K > 0 ->\n"
+                         "    loop(N, K, J, M, 0).\n"
+                         "\n"
+                         "fill(0) ->\n"
+                         "    ok;\n"
+                         "fill(N) ->\n"
+                         "    self() ! {msg, N band 255},\n"
+                         "    fill(N - 1).\n"
+                         "\n"
+                         "loop(0, _, _, _, Acc) ->\n"
+                         "    Acc;\n"
+                         "loop(N, K, J, M, Acc) ->\n"
+                         "    N1 = N - 1,\n"
+                         "    receive\n"
+                         "        {msg, X} ->\n"
+                         "            A = K * 3,\n"
+                         "            B = J + 7,\n"
+                         "            C = M * M,\n"
+                         "            loop(N1, K, J, M, Acc + X + A + B + C)\n"
+                         "    end.\n")},
+
+     #{name => recv_guard_arith,
+       note => "receive guard `K * 2 > J' (K=2000, J=1000, so it matches)",
+       expect_reach => true,
+       whole_program => false,
+       src => kernel_src(?ITERS_RECV,
+                         "-export([run/0, prep/0]).\n"
+                         "\n"
+                         "run() ->\n"
+                         "    {K, J} = case erlang:get(bench_guard) of\n"
+                         "                 undefined -> {2000, 1000};\n"
+                         "                 Ps -> Ps\n"
+                         "             end,\n"
+                         "    entry(?ITERS, K, J).\n"
+                         "\n"
+                         "prep() ->\n"
+                         "    put(bench_guard, {2000, 1000}),\n"
+                         "    fill(?ITERS).\n"
+                         "\n"
+                         "entry(N, K, J) when is_integer(K), is_integer(J), K > 0 ->\n"
+                         "    loop(N, K, J, 0).\n"
+                         "\n"
+                         "fill(0) ->\n"
+                         "    ok;\n"
+                         "fill(N) ->\n"
+                         "    self() ! {msg, N band 255},\n"
+                         "    fill(N - 1).\n"
+                         "\n"
+                         "loop(0, _, _, Acc) ->\n"
+                         "    Acc;\n"
+                         "loop(N, K, J, Acc) ->\n"
+                         "    N1 = N - 1,\n"
+                         "    receive\n"
+                         "        {msg, X} when K * 2 > J ->\n"
+                         "            loop(N1, K, J, Acc + X)\n"
+                         "    end.\n")},
+
+     #{name => recv_tag_invariant,
+       note => "receive guard `is_atom(Tag)' on a loop-invariant Tag",
+       expect_reach => true,
+       whole_program => false,
+       src => kernel_src(?ITERS_RECV,
+                         "-export([run/0, prep/0]).\n"
+                         "\n"
+                         "run() ->\n"
+                         "    Tag = case erlang:get(bench_tag) of\n"
+                         "              undefined -> tag;\n"
+                         "              T -> T\n"
+                         "          end,\n"
+                         "    loop(?ITERS, Tag, 0).\n"
+                         "\n"
+                         "prep() ->\n"
+                         "    put(bench_tag, tag),\n"
+                         "    fill(?ITERS).\n"
+                         "\n"
+                         "fill(0) ->\n"
+                         "    ok;\n"
+                         "fill(N) ->\n"
+                         "    self() ! {msg, N band 255},\n"
+                         "    fill(N - 1).\n"
+                         "\n"
+                         "loop(0, _, Acc) ->\n"
+                         "    Acc;\n"
+                         "loop(N, Tag, Acc) ->\n"
+                         "    N1 = N - 1,\n"
+                         "    receive\n"
+                         "        {msg, X} when is_atom(Tag) ->\n"
+                         "            loop(N1, Tag, Acc + X)\n"
+                         "    end.\n")},
+
+     #{name => recv_tuple_invariant,
+       note => "per-message {Tag,State,X}: put_tuple hoist cannot reach"
+               " the body: CONTROL",
+       expect_reach => false,
+       whole_program => false,
+       src => kernel_src(?ITERS_RECV_CTOR,
+                         "-export([run/0, prep/0]).\n"
+                         "\n"
+                         "run() ->\n"
+                         "    loop(?ITERS, tag, state, 0).\n"
+                         "\n"
+                         "prep() ->\n"
+                         "    fill(?ITERS).\n"
+                         "\n"
+                         "fill(0) ->\n"
+                         "    ok;\n"
+                         "fill(N) ->\n"
+                         "    self() ! {msg, N band 255},\n"
+                         "    fill(N - 1).\n"
+                         "\n"
+                         "loop(0, _, _, Acc) ->\n"
+                         "    Acc;\n"
+                         "loop(N, Tag, State, Acc) ->\n"
+                         "    N1 = N - 1,\n"
+                         "    receive\n"
+                         "        {msg, X} ->\n"
+                         "            R = {Tag, State, X},\n"
+                         "            loop(N1, Tag, State, Acc + element(3, R))\n"
+                         "    end.\n")}].
 
 %% A kernel module: `-module(~s)' is filled in per variant, and ?ITERS is
 %% defined here so the tuning lives in one place.
@@ -439,10 +639,33 @@ variant_opts(manual) -> [].
 
 %% The kernel result, used as the behavioural-equivalence check across variants:
 %% the pass is allowed to make the loop faster, never to change what it computes.
+%% A receive kernel must have its mailbox filled first, or run/0 would block.
 -spec run_once(atom()) -> term().
 run_once(Mod) ->
+    prep(Mod),
     Mod:run().
 
+%% Fill the mailbox of the CALLING process for a receive kernel.
+%% prep/0 sends itself exactly the messages its run/0 consumes, so the fill has
+%% to happen in the process that runs the kernel and before the timed region --
+%% that is why every caller of run/0 calls this first instead of filling once.
+%% A kernel without prep/0 (every arithmetic kernel, and any `manual' variant)
+%% needs nothing.
+-spec prep(atom()) -> ok.
+prep(Mod) ->
+    case erlang:function_exported(Mod, prep, 0) of
+        true -> Mod:prep();
+        false -> ok
+    end.
+
+%% The same, for the `-eval' string of a fresh VM: an empty prefix when the
+%% module has no mailbox to fill.
+-spec prep_call(atom()) -> string().
+prep_call(Mod) ->
+    case erlang:function_exported(Mod, prep, 0) of
+        true -> atom_to_list(Mod) ++ ":prep(),";
+        false -> ""
+    end.
 -spec load(atom(), string(), binary()) -> ok.
 load(Mod, BeamDir, Bin) ->
     File = filename:join(BeamDir, atom_to_list(Mod) ++ ".beam"),
@@ -503,14 +726,18 @@ report_reach(Built) ->
     lists:foreach(
       fun(#{name := Name, note := Note,
             code := #{off := O, on := N}, ops := #{off := Off, on := On}}) ->
-              io:format(" ~-16s ~-9s ~s~n",
-                        [Name, changed(O, N), shape(Off, On)]),
-              io:format(" ~-16s ~s~n", ["", Note])
+              io:format(" ~s ~-9s ~s~n",
+                        [pad(Name, ?NAME_WIDTH), changed(O, N), shape(Off, On)]),
+              io:format(" ~s ~s~n", [pad("", ?NAME_WIDTH), Note])
       end, Built),
     io:format(" ------------------------------------------------------------"
               "-------------------~n"
               " `Code' = the generated code chunk, OFF vs ON (the whole .beam file"
-              " always~n differs: CInf/Dbgi embed the option list).~n", []).
+              " always~n differs: CInf/Dbgi embed the option list).~n"
+              " The `recv_*' kernels are LICM kernels: their win is a MOVED"
+              " instruction (the~n same bif, hoisted out of the receive retry"
+              " cycle), so the div/rem/bsl/bsr~n counters do not move for them --"
+              " the `Code' column is what shows the reach.~n", []).
 
 -spec changed(binary(), binary()) -> string().
 changed(O, N) when O =:= N -> "no";
@@ -574,6 +801,8 @@ round(Rep, Built, Acc0) ->
               lists:foldl(
                 fun(Variant, A) ->
                         Mod = maps:get(Variant, Mods),
+                        %% Untimed: the mailbox fill is not part of the loop.
+                        prep(Mod),
                         {Us, _} = timer:tc(Mod, run, []),
                         add_sample(Name, Variant, Us, A)
                 end, Acc, Order)
@@ -589,6 +818,7 @@ variants(#{mods := Mods}) ->
 -spec sample(build()) -> ok.
 sample(#{mods := Mods}) ->
     lists:foreach(fun({_, Mod}) ->
+                          prep(Mod),
                           _ = Mod:run(),
                           ok
                   end, lists:sort(maps:to_list(Mods))),
@@ -617,6 +847,10 @@ alloc(Fun, Mod) ->
     Parent = self(),
     Ref = make_ref(),
     spawn(fun() ->
+                  %% The mailbox fill runs in THIS process and before the
+                  %% snapshot, so neither the fill nor its heap growth is
+                  %% attributed to the loop.
+                  prep(Mod),
                   {GC0, W0, _} = erlang:statistics(garbage_collection),
                   _ = Mod:Fun(),
                   {GC1, W1, _} = erlang:statistics(garbage_collection),
@@ -659,6 +893,7 @@ wp_sample(Mods, Variant) ->
     Mod = maps:get(Variant, Mods),
     Eval = lists:flatten(
              ["T0 = erlang:monotonic_time(microsecond),"
+              " ", prep_call(Mod),
               " _ = ", atom_to_list(Mod), ":run(),"
               " T1 = erlang:monotonic_time(microsecond),"
               " io:format(\"~w~n\", [T1 - T0]),"
@@ -699,8 +934,9 @@ report_whole_program(Rows) ->
               MedOff = median(Off),
               MedOn = median(On),
               Spread = spread(Off) + spread(On),
-              io:format(" ~-16s ~10w ~10w ~8.3f ~9.1f%~n",
-                        [Name, MedOff, MedOn, MedOff / MedOn, 100 * Spread])
+              io:format(" ~s ~10w ~10w ~8.3f ~9.1f%~n",
+                        [pad(Name, ?NAME_WIDTH), MedOff, MedOn,
+                         MedOff / MedOn, 100 * Spread])
       end, Rows),
     io:format(" cold-code runs in a fresh VM: dominated by VM start-up and code"
               " loading,~n so the ratio is only indicative; the in-VM table"
@@ -728,9 +964,9 @@ report(Built, Timings, Alloc) ->
               MedOff = median(Off),
               MedOn = median(On),
               Spread = spread(Off) + spread(On),
-              io:format(" ~-16s ~8.3f ~8.3f ~7.3f ~6.1f% ~8s ~8s ~5s  ~s~n",
-                        [Name, MedOff / 1000, MedOn / 1000, MedOff / MedOn,
-                         100 * Spread, manual_ms(Samples),
+              io:format(" ~s ~8.3f ~8.3f ~7.3f ~6.1f% ~8s ~8s ~5s  ~s~n",
+                        [pad(Name, ?NAME_WIDTH), MedOff / 1000, MedOn / 1000,
+                         MedOff / MedOn, 100 * Spread, manual_ms(Samples),
                          manual_ratio(Samples), changed_of(B),
                          alloc_of_kernel(B, Alloc)])
       end, Built),
@@ -752,7 +988,11 @@ report(Built, Timings, Alloc) ->
               " gc/alloc = GCs/words_reclaimed/final_heap_words of one isolated"
               " run, per variant~n"
               "            (equal counts are the expected result: the strength"
-              " reductions change~n            CPU work, not allocation)~n", []).
+              " reductions change~n            CPU work, not allocation)~n"
+              "            For the `recv_*' kernels the mailbox fill and drain"
+              " dominate both~n            columns -- a received message becomes"
+              " garbage every iteration -- so they~n            are expected to"
+              " differ there and are not evidence either way~n", []).
 
 %% The manual column only exists for kernels with a hand-written form.
 manual_ms(#{manual := Manual}) ->
@@ -841,6 +1081,18 @@ median(Times) ->
         1 -> lists:nth((length(Sorted) + 1) div 2, Sorted);
         0 -> (lists:nth(length(Sorted) div 2, Sorted)
               + lists:nth(length(Sorted) div 2 + 1, Sorted)) / 2
+    end.
+
+%% `kernel' column: pad to ?NAME_WIDTH by hand instead of using a `~-16s'
+%% field, because an io field width TRUNCATES a longer string and the receive
+%% kernels' names are longer than that.
+-spec pad(atom() | string(), non_neg_integer()) -> string().
+pad(Name, Width) when is_atom(Name) ->
+    pad(atom_to_list(Name), Width);
+pad(Str, Width) ->
+    case length(Str) of
+        Len when Len >= Width -> Str;
+        Len -> Str ++ lists:duplicate(Width - Len, $\s)
     end.
 
 %% Interquartile range over the median: a scale-free measure of the run's own
