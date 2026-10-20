@@ -17,46 +17,30 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! The A.3 (NIF) host-surface ledger: **oracle replay** for the three committed
-//! fixtures plus **in-process witnesses** of the three gaps they expose.
+//! The **oracle replay** for the three committed A.3 (NIF C ABI) fixtures:
+//! `tests/fixtures/a3_{schedule,thread_env,resource_stop}.{c,erl}`.
 //!
-//! # Why this file exists
+//! Each fixture is a real C NIF plus its Erlang driver, and each was measured against the live
+//! system OTP (29.1.1 / erts-17.1). This file keeps them alive — a fixture nobody executes rots —
+//! by compiling each one exactly as it was measured (`cc -fPIC -shared -O2 -Wall -Wextra` against
+//! the host `erl_nif.h`, then `erlc` on the driver), running it under the live oracle, and asserting
+//! the recorded transcript. The raw transcripts are quoted above each assertion (and in the
+//! fixtures' own headers); they are the ground truth any Rust implementation must reproduce.
 //!
-//! `tests/fixtures/a3_{schedule,thread_env,resource_stop}.{c,erl}` are the measurement
-//! artifacts behind `beam_abi`'s NIF host seams: real C NIFs, compiled with the host `cc`
-//! against the host `erl_nif.h` and run under the live system OTP. This file keeps them
-//! alive — a fixture nobody executes rots — and does it in the two ways they are useful:
+//! The **specification** those transcripts implement — the C line references and the resolved
+//! implementation shape per gap — is `../HANDOFF_A3_NIF_HOST.md` §1/§2/§3, a real, readable file in
+//! this crate's root.
 //!
-//! * **Part A, oracle replay.** Compile each fixture exactly as it was measured, run it
-//!   under the live oracle, and assert the transcript that was recorded against OTP 29.1.1
-//!   / erts-17.1. This is the ground truth any Rust implementation must reproduce; the raw
-//!   transcripts are quoted above each assertion (see also the fixtures' own headers).
-//! * **Part B, gap witnesses.** `beam_abi`'s `#[no_mangle]` `enif_*` entry points are plain
-//!   Rust functions, so the three *documented* A.3 substitutions can be pinned in-process —
-//!   no `dlopen`, no `.so`, no oracle. Each witness asserts **today's honest state** and
-//!   carries an assertion message naming what closes it, so it is a ledger entry: when the
-//!   implementation lands, the witness fails and must be flipped.
-//!
-//! # The three gaps (and where they are documented)
-//!
-//! 1. `enif_schedule_nif` — `beam_abi` forwards to the host hook and answers `badarg` when
-//!    the hook declines; there is no continuation trampoline, so the continuation never runs.
-//! 2. `enif_alloc_env` — `beam_abi` reaches the *live NIF call's* host through a
-//!    thread-local stack, so off that path it answers `NULL` (`enif_send` with a `NULL` env
-//!    is the C's `0`).
-//! 3. a resource type's `stop` callback — `enif_select(..., ERL_NIF_SELECT_STOP, ...)`
-//!    hands the request to the host's poller hook and never invokes the callback itself.
-//!
-//! The handoff note those messages name is `HANDOFF_A3_NIF_HOST.md`; it is **not in this
-//! tree yet** (the sections are referenced by the task record), so the messages name it as
-//! the specification rather than as a readable file.
+//! The **in-process ABI assertions** for the same three paths live beside this file in
+//! `nif_a3_abi_assertions.rs`: `beam_abi`'s `#[no_mangle]` `enif_*` entry points are plain Rust
+//! functions, so the contract measured here on the oracle is asserted there with no `dlopen`, no
+//! `.so` and no oracle. This file owns the ground-truth artifacts; that one owns the Rust contract.
 //!
 //! # Skip-vs-fail policy
 //!
-//! Part A needs `cc`, `erlc`, `erl` and a reachable `erl_nif.h`. If any is missing the test
-//! prints a loud `SKIP:` banner naming the reason and returns — **never** a silent pass. With
-//! the toolchain present every assertion is hard. Each `#[test]` skips independently, and
-//! Part B needs no toolchain at all.
+//! These tests need `cc`, `erlc`, `erl` and a reachable `erl_nif.h`. If any is missing the test
+//! prints a loud `SKIP:` banner naming the reason and returns — **never** a silent pass. With the
+//! toolchain present every assertion is hard, and each `#[test]` skips independently.
 //!
 //! # A probe this file never calls
 //!
@@ -69,13 +53,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use beam_abi::common::ERL_NIF_SELECT_STOP_CALLED;
-use beam_abi::nif::types::{ErlNifEnv, ErlNifPid, ErlNifResourceFlags, ErlNifResourceTypeInit};
-use beam_abi::{nif_from_eterm, NifEnv, NifHost};
-use libc::{c_int, c_void};
+use libc::c_int;
 
 // =============================================================================================
-// Part A — the oracle replay machinery (local to this file on purpose: `tests/common/` is
+// The oracle replay machinery (local to this file on purpose: `tests/common/` is
 // shared with every other suite in this tree, and this helper set is fixture-specific)
 // =============================================================================================
 /// The header the include-directory search keys on.
@@ -205,7 +186,7 @@ fn standard_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Everything Part A needs, or `None` after printing why.
+/// Everything the replay needs, or `None` after printing why.
 struct Toolchain {
     erl: PathBuf,
     erlc: PathBuf,
@@ -381,7 +362,7 @@ fn build_fixture(toolchain: &Toolchain, stem: &str) -> PathBuf {
 }
 
 // =============================================================================================
-// Part A.1 — `a3_schedule`: the `enif_schedule_nif` SUCCESS path
+// Replay 1 — `a3_schedule`: the `enif_schedule_nif` SUCCESS path
 // =============================================================================================
 /// Replays the measured oracle transcript of `tests/fixtures/a3_schedule.{c,erl}`.
 ///
@@ -463,7 +444,7 @@ io:format("done~n",[]).
 }
 
 // =============================================================================================
-// Part A.2 — `a3_thread_env`: the `enif_alloc_env` / `enif_send` message-env idiom
+// Replay 2 — `a3_thread_env`: the `enif_alloc_env` / `enif_send` message-env idiom
 // =============================================================================================
 /// Replays the measured oracle transcript of `tests/fixtures/a3_thread_env.{c,erl}`.
 ///
@@ -525,7 +506,7 @@ fn the_a3_thread_env_fixture_replays_the_measured_oracle_transcript() {
 }
 
 // =============================================================================================
-// Part A.3 — `a3_resource_stop`: the resource `stop` callback and the STOP verdicts
+// Replay 3 — `a3_resource_stop`: the resource `stop` callback and the STOP verdicts
 // =============================================================================================
 /// Replays the measured oracle verdicts of `tests/fixtures/a3_resource_stop.{c,erl}`.
 ///
@@ -702,285 +683,4 @@ io:format("done~n",[]).
         observed.len()
     );
     println!("a3_resource_stop oracle verdicts replayed (ReadOnPending = {observed:?})");
-}
-
-// =============================================================================================
-// Part B — in-process gap witnesses (no `dlopen`, no `.so`, no oracle)
-// =============================================================================================
-/// A minimal [`NifHost`] for the witness tests: a heap, an atom table, and a `select` hook that
-/// answers the caller's scripted code for `ERL_NIF_SELECT_STOP`.
-///
-/// This mirrors the in-module host of `beam_abi/src/nif/enif/select.rs`: the `NifEnv` holds the
-/// only `&mut` borrow of the host, so what a test needs to read back afterwards lives in
-/// `static`s (the [`STOP_CALLS`] counter) or in the `Rc<RefCell<…>>` log below.
-struct WitnessHost {
-    heap: beam_alloc::Heap,
-    atoms: beam_term::atom::AtomTable,
-    /// What the `select` hook answers (`None` = the trait default, "unsupported").
-    select_code: Option<c_int>,
-    /// Every `select` mode this host was given, in call order.
-    modes: std::rc::Rc<std::cell::RefCell<Vec<c_int>>>,
-}
-
-impl WitnessHost {
-    fn new(select_code: Option<c_int>) -> (WitnessHost, std::rc::Rc<std::cell::RefCell<Vec<c_int>>>) {
-        let modes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let host = WitnessHost {
-            heap: beam_alloc::Heap::new(4096).expect("a test heap is allocatable"),
-            atoms: beam_term::atom::AtomTable::new(),
-            select_code,
-            modes: std::rc::Rc::clone(&modes),
-        };
-        (host, modes)
-    }
-}
-
-impl NifHost for WitnessHost {
-    fn heap(&mut self) -> &mut beam_alloc::Heap {
-        &mut self.heap
-    }
-    fn intern_atom(&mut self, name: &str) -> Option<beam_term::Eterm> {
-        Some(beam_term::make_atom(self.atoms.intern(name)))
-    }
-    fn atom_name(&mut self, atom: beam_term::Eterm) -> Option<String> {
-        if !beam_term::is_atom(atom) {
-            return None;
-        }
-        self.atoms.name(beam_term::atom_val(atom)).map(str::to_string)
-    }
-    fn select(
-        &mut self,
-        _event: beam_abi::nif::types::ErlNifEvent,
-        mode: beam_abi::ErlNifSelectFlags,
-        _obj: *mut c_void,
-        _pid: Option<beam_term::Eterm>,
-        _reference: beam_term::Eterm,
-    ) -> Option<c_int> {
-        self.modes.borrow_mut().push(mode.bits());
-        self.select_code
-    }
-}
-
-/// How many times the witness resource type's `stop` callback ran.
-static STOP_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// The witness resource type's `stop` callback: the C's
-/// `void (*stop)(ErlNifEnv*, void* obj, ErlNifEvent event, int is_direct_call)`.
-///
-/// # Safety
-///
-/// `_env` must be null or a live env, `_obj` null or a live resource payload — the C contract
-/// of the callback. The body only bumps a counter and reads no pointer.
-unsafe extern "C" fn witness_stop_cb(
-    _env: *mut ErlNifEnv,
-    _obj: *mut c_void,
-    _event: beam_abi::nif::types::ErlNifEvent,
-    _is_direct_call: c_int,
-) {
-    STOP_CALLS.fetch_add(1, Ordering::SeqCst);
-}
-
-/// How many times the witness continuation ran.
-static CONTINUATION_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// The witness continuation `enif_schedule_nif` is handed: the C's
-/// `ERL_NIF_TERM (*)(ErlNifEnv*, int, const ERL_NIF_TERM[])`.
-///
-/// # Safety
-///
-/// `env` must be a live env and `_argv` null or readable for `_argc` terms — the C contract of a
-/// NIF entry point. The body builds one small integer on `env`.
-unsafe extern "C" fn witness_continuation(
-    env: *mut ErlNifEnv,
-    _argc: c_int,
-    _argv: *const beam_abi::ERL_NIF_TERM,
-) -> beam_abi::ERL_NIF_TERM {
-    CONTINUATION_CALLS.fetch_add(1, Ordering::SeqCst);
-    // SAFETY: `env` is live (the contract above), so the small integer lands on a live heap.
-    unsafe { beam_abi::nif::enif::make::enif_make_int(env, 7) }
-}
-
-/// **Gap witness 1** — `enif_schedule_nif`'s success path has no continuation trampoline.
-///
-/// The oracle (`erl_nif.c:3561-3604`) validates its arguments, saves the original call's
-/// `argv`/pc/mfa and returns `THE_NON_VALUE` (`0`), then runs the continuation and lets *its*
-/// value become the call's result (`execute_nif`, `:3512-3558`). `beam_abi` instead delegates to
-/// `NifHost::schedule_nif` and, when the hook declines (the trait default, which is what a host
-/// without a scheduler installs here), answers `enif_make_badarg` — the reason lands in the env's
-/// exception slot — and the continuation is never entered.
-#[test]
-fn gap_witness_enif_schedule_nif_answers_badarg_and_never_runs_the_continuation() {
-    CONTINUATION_CALLS.store(0, Ordering::SeqCst);
-    let (mut host, _modes) = WitnessHost::new(None);
-    let mut env = NifEnv::new(&mut host);
-    // `fun_name` is only interned by the C; the NUL-terminated literal is the ABI's `const char*`.
-    let fun_name = b"cont\0".as_ptr().cast::<libc::c_char>();
-    // SAFETY: `env.as_ptr()` is a live env, `fun_name` is NUL-terminated, `fptr` is a real
-    // `unsafe extern "C" fn`, `argc` is 0 and `argv` is null with a zero count.
-    let returned = unsafe {
-        beam_abi::nif::enif::process::enif_schedule_nif(
-            env.as_ptr(),
-            fun_name,
-            0,
-            Some(witness_continuation),
-            0,
-            core::ptr::null(),
-        )
-    };
-    assert_eq!(
-        CONTINUATION_CALLS.load(Ordering::SeqCst),
-        0,
-        "gap witness — needs the beam_abi continuation trampoline (see HANDOFF_A3_NIF_HOST.md §1); \
-         the oracle runs the continuation and lets its value become the call's result."
-    );
-    // Today the answer is `enif_make_badarg`: the `badarg` atom, recorded as the pending exception.
-    let reason = nif_from_eterm(
-        env.pending_exception()
-            .expect("the refusal is the C's `enif_make_badarg`, which records a pending exception"),
-    );
-    assert_eq!(
-        returned, reason,
-        "gap witness — needs the beam_abi continuation trampoline (see HANDOFF_A3_NIF_HOST.md §1); \
-         the oracle answers the non-value (0) and runs the continuation."
-    );
-    let name = env
-        .host()
-        .atom_name(beam_abi::eterm_from_nif(returned))
-        .expect("the refusal term is an atom the host can name");
-    assert_eq!(
-        name, "badarg",
-        "gap witness — needs the beam_abi continuation trampoline (see HANDOFF_A3_NIF_HOST.md §1); \
-         the oracle answers the non-value (0) and runs the continuation."
-    );
-}
-
-/// **Gap witness 2** — `enif_alloc_env` is `NULL` off the NIF-call path.
-///
-/// The oracle's `enif_alloc_env(void)` allocates a standalone message env with its own heap and
-/// the ONE global atom table (`erl_nif.c:669-680`, `setup_nif_env` `:636-666`), so the
-/// `enif_alloc_env` → `enif_make_*` → `enif_send` → `enif_free_env` idiom works from **any**
-/// thread. `beam_abi` reaches a host only through the thread-local stack of *live NIF-call* envs
-/// (`NifEnv::new` publishes, `Drop` withdraws), so outside a call it answers `NULL` — and
-/// `enif_send` with a `NULL` `env` is the C's `0` (nothing was sent). Both are asserted here with
-/// no env alive on this thread at all.
-#[test]
-fn gap_witness_enif_alloc_env_is_null_off_the_nif_call_path() {
-    // SAFETY: no env is live on this thread (this test never creates one before this point), which
-    // is exactly the documented precondition; outside a NIF call the answer is `NULL`.
-    let env = unsafe { beam_abi::nif::enif::envs::enif_alloc_env() };
-    assert!(
-        env.is_null(),
-        "gap witness — needs a host-independent message env (see HANDOFF_A3_NIF_HOST.md §2); \
-         the oracle answers a non-NULL env on any thread."
-    );
-    // The `enif_send(NULL, &pid, msg_env, msg)` form: a NULL call env cannot name a sender, so the
-    // C's only two outcomes make this `0` (not sent) — and a NULL `msg_env` is the same refusal.
-    let pid = ErlNifPid {
-        pid: nif_from_eterm(beam_term::NIL),
-    };
-    // SAFETY: `env` is null (the C's documented "no calling env" form for `enif_send`), `&pid` is a
-    // readable `ErlNifPid`, `msg_env` is null and `msg` is an immediate term word.
-    let sent = unsafe {
-        beam_abi::nif::enif::process::enif_send(
-            core::ptr::null_mut(),
-            &pid,
-            core::ptr::null_mut(),
-            nif_from_eterm(beam_term::NIL),
-        )
-    };
-    assert_eq!(
-        sent,
-        0,
-        "gap witness — needs a host-independent message env (see HANDOFF_A3_NIF_HOST.md §2); \
-         the oracle answers 1 here for a live receiver."
-    );
-    assert!(
-        env.is_null(),
-        "the message env must not have materialised in between"
-    );
-}
-
-/// **Gap witness 3** — a resource type's `stop` callback is never invoked.
-///
-/// `enif_select(…, ERL_NIF_SELECT_STOP, obj, …)` on an fd with no event state is the C's fast
-/// track: it calls the type's `stop` callback **inline** with `is_direct_call = 1` and answers
-/// `ERL_NIF_SELECT_STOP_CALLED` (`erl_check_io.c:1278-1285`, `:1528-1535`; the callback runs in a
-/// nooproc message env, `erl_nif.c:3032-3040`). `beam_abi` hands the whole request — callback
-/// included — to `NifHost::select` and documents that substitution in `src/nif/enif/select.rs`,
-/// so the code comes back but the callback never runs.
-///
-/// The descriptor is a plain non-negative int: the host here is a stub that answers a scripted
-/// code and never touches the fd, so no real descriptor is needed (and none is leaked).
-#[test]
-fn gap_witness_a_resource_stop_callback_is_never_invoked() {
-    STOP_CALLS.store(0, Ordering::SeqCst);
-    let (mut host, modes) = WitnessHost::new(Some(ERL_NIF_SELECT_STOP_CALLED));
-    let mut env = NifEnv::new(&mut host);
-    // A resource type WITH a `stop` callback — `members = 3` is the fixture's own convention
-    // (`dtor`, `stop`, `down` initialised; `erl_nif.c:2747-2756`).
-    let init = ErlNifResourceTypeInit {
-        dtor: None,
-        stop: Some(witness_stop_cb),
-        down: None,
-        members: 3,
-        dyncall: None,
-    };
-    let name = b"beam_bifs_a3_gap_witness_stop\0"
-        .as_ptr()
-        .cast::<libc::c_char>();
-    let flags = ErlNifResourceFlags::from_bits(
-        ErlNifResourceFlags::CREATE.bits() | ErlNifResourceFlags::TAKEOVER.bits(),
-    );
-    // SAFETY: `env.as_ptr()` is live, `name` is NUL-terminated, `&init` is a live
-    // `ErlNifResourceTypeInit` and `tried` is null.
-    let ty = unsafe {
-        beam_abi::nif::enif::resources::enif_init_resource_type(
-            env.as_ptr(),
-            name,
-            &init,
-            flags,
-            core::ptr::null_mut(),
-        )
-    };
-    assert!(!ty.is_null(), "the witness resource type opens");
-    // SAFETY: `ty` is the live type just opened; the payload is one word.
-    let obj = unsafe {
-        beam_abi::nif::enif::resources::enif_alloc_resource(ty, core::mem::size_of::<c_int>())
-    };
-    assert!(!obj.is_null(), "the witness resource object allocates");
-    // A reference for the notification: the value is irrelevant to the STOP arm.
-    // SAFETY: `env.as_ptr()` is live, so the ref is built on a live heap.
-    let reference = unsafe { beam_abi::nif::enif::make::enif_make_ref(env.as_ptr()) };
-    // SAFETY: `env.as_ptr()` is live, `7` is a non-negative `ErlNifEvent` the stub host ignores,
-    // `obj` is a live resource payload and `pid` is null (the calling process).
-    let code = unsafe {
-        beam_abi::nif::enif::select::enif_select(
-            env.as_ptr(),
-            7,
-            beam_abi::ErlNifSelectFlags::STOP,
-            obj,
-            core::ptr::null(),
-            reference,
-        )
-    };
-    assert_eq!(
-        code, ERL_NIF_SELECT_STOP_CALLED,
-        "the STOP request's code is the host hook's answer"
-    );
-    assert!(
-        modes.borrow().iter().any(|bits| {
-            bits & beam_abi::ErlNifSelectFlags::STOP.bits() != 0
-        }),
-        "the host really was asked to select on STOP"
-    );
-    assert_eq!(
-        STOP_CALLS.load(Ordering::SeqCst),
-        0,
-        "gap witness — beam_abi never invokes a resource type's `stop` callback \
-         (see HANDOFF_A3_NIF_HOST.md §3); the oracle calls it inline with \
-         `is_direct_call = 1` for an fd with no event state and answers STOP_CALLED."
-    );
-    // SAFETY: `obj` holds the allocator's reference, dropped exactly once here (the type has no
-    // destructor, so nothing else runs).
-    unsafe { beam_abi::nif::enif::resources::enif_release_resource(obj) };
 }
