@@ -475,7 +475,12 @@ fn an_alias_created_on_one_rust_node_delivers_from_the_other() {
     pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
     // The peer cannot render a reference it received, so it proves the type instead.
     pair.actor_equals("ALIAS_IS_REF ", "ALIAS_IS_REF true");
-    pair.actor_equals("ALIAS_SENT ", "ALIAS_SENT true");
+    // The send's own return value: a send to an alias reference is a real send, and `!`
+    // answers the message term (`erlang:send/2`), naming the peer's own node.
+    pair.actor_equals(
+        "ALIAS_SENT ",
+        &format!("ALIAS_SENT {{payload,{},4242}}", pair.actor_node),
+    );
     // The payload, verbatim, out of our own mailbox — and its sender is the peer's pid.
     pair.runtime_equals("PAYLOAD_N ", "PAYLOAD_N 4242");
     pair.runtime_equals("PAYLOAD_FROM_PEER ", "PAYLOAD_FROM_PEER true");
