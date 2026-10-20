@@ -646,7 +646,8 @@ impl GenImmixCollector {
         // next collection cannot be a minor and the cadence degenerates into a fullsweep
         // every time. It is still **never** the *mature* occupancy: that is garbage-inflated
         // (the graphs the minors promoted and the next round's roots replaced), so using it
-        // would make the policy's `should_grow` fire on every fullsweep and creep the region
+        // would inflate `need_after` past the region's capacity and its grow bracket
+        // (`capacity < target`) would fire on every fullsweep and creep the region
         // up without bound (see [`crate::live`]). The young occupancy is bounded by the
         // nursery capacity, which `young_after_collection` always installs onto a target
         // derived from the live set.

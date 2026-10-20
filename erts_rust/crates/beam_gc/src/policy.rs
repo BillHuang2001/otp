@@ -57,6 +57,33 @@ const VH_DEFAULT_SIZE_WORDS: usize = 32768;
 /// accumulator is live that the next round replaces), and the band from
 /// [`YOUNG_SHRINK_FACTOR`] must be wider than that swing or the capacity oscillates between
 /// collections — see `MEASURED.md`, "The nursery follows the live set".
+///
+/// # Where this multiple is *not* applied — the flatness-vs-amortisation trade
+///
+/// The nursery's **post-minor** rule deliberately uses **one** times the young live set
+/// ([`HeapPolicy::young_minor_target_words`]) instead of this multiple, and the two rules are
+/// chosen together:
+///
+/// * a multiple is an **amortisation** trade — a nursery holding `k` live sets lets the mutator
+///   allocate `k` live sets between collections, so the collector copies the live set `1/k` as
+///   often — and it is the fullsweep that applies one here, because a fullsweep is the one
+///   collection that measures the **whole-heap** live set exactly;
+/// * a minor's figure is the **young-only** live set, an under-estimate of that whole, so a
+///   multiple of it would be a multiple of an under-estimate. One times the figure makes the
+///   nursery hold `target / per-iteration allocation` iterations of the mutator's own
+///   allocation, so the capacity stays **flat in N** at a constant live set: on the dependent
+///   `beam_rt` `boundary_cost` churn fixture the nursery settles at **1 220** words against an
+///   806-word iteration (1.5 iterations), and the fixture measures **1.73 collections per
+///   iteration** over its 2 001 calls (its heap-admission and boundary doors together) — the
+///   canonical table and the protocol are `beam_rt`'s.
+/// * a larger minor multiple would amortise further and is **excluded**: it moves the converged
+///   young capacity off the live set's own curated size, which is exactly the figure the
+///   dependents pin (`beam_rt`'s `reds_door` reads the converged `heap_size` **610** =
+///   `young_minor_target_words(401)` at both N = 2 000 and N = 20 000, its `slice_charging`
+///   control **233** = `young_minor_target_words(0)`), and it would spend memory on an
+///   under-estimate. The 2× memory-for-amortisation trade therefore lives on the **mature** side
+///   ([`MATURE_TARGET_LIVE_MULTIPLE`], where the same 2× buys a *run* of minors between
+///   fullsweeps) and only one live-set multiple **2** is applied per generation.
 pub const YOUNG_TARGET_LIVE_MULTIPLE: usize = 2;
 
 /// The factor by which a nursery must exceed its live-set-derived target
@@ -565,6 +592,22 @@ impl HeapPolicy {
     /// capacity that already sits at or above the target. The floor is therefore a real lower
     /// bound on every capacity the policy's collection rule installs, not an emergent `max()`.
     ///
+    /// # The guarantee, as a derivation
+    ///
+    /// Both targets are this figure's own lookup applied to a non-negative augmentation of
+    /// [`need_reserve_words`], so `young_minor_target_words(live_words) >=
+    /// nursery_floor_words()` and `young_target_words(live_words) >= nursery_floor_words()` hold
+    /// for **every** `live_words` — `next_words` is monotone in its argument and both call it on
+    /// `live_words + need_reserve_words` (`=> need_reserve_words`) and
+    /// `2 * live_words + need_reserve_words` respectively — and both collapse to it exactly at
+    /// `live_words == 0`.
+    /// Because each collapse seam **installs** its target whenever the capacity is below it, no
+    /// collection can leave a nursery below this figure either: the floor is a lower bound on the
+    /// result of a collection, not only on a derivation.
+    /// That is the invariant a dependent re-attempting a refused allocation can assert against
+    /// (the `beam_process` collect-and-retry behind `Process::ensure_capacity` /
+    /// `Process::deliver`), rather than a number every caller has to check.
+    ///
     /// Concrete figures: [`HeapPolicy::default`] (no `min_heap_words`) answers **90** words;
     /// a spawn policy ([`HeapPolicy::from_spawn_opts`] / [`HeapPolicy::default`]
     /// [`.spawn_policy`](Self::spawn_policy), whose minimum is [`DEFAULT_MIN_HEAP_WORDS`])
@@ -607,7 +650,11 @@ impl HeapPolicy {
     ///
     /// Floored by [`min_heap_words`](Self::min_heap_words) and clamped by
     /// [`max_heap_words`](Self::max_heap_words) through [`next_words`](Self::next_words), so a
-    /// `+hms`/`spawn_opt` minimum still sizes every nursery a policy produces.
+    /// `+hms`/`spawn_opt` minimum still sizes every nursery a policy produces. Like
+    /// [`young_minor_target_words`](Self::young_minor_target_words) it is never below
+    /// [`nursery_floor_words`](Self::nursery_floor_words) for any `live_words` — its argument
+    /// `2 * live_words + need_reserve_words` is at least the reserve, and `next_words` is
+    /// monotone — and an empty live set makes it *exactly* the floor.
     pub fn young_target_words(&self, live_words: usize) -> usize {
         self.next_words(
             live_words
@@ -1272,8 +1319,109 @@ mod tests {
         assert_eq!(tiny_cap.nursery_floor_words(), 51);
         assert!(tiny_cap.nursery_floor_words() < tiny_cap.need_reserve_words);
     }
-    /// The nursery follows the **live set**: a fullsweep sizes it to
-    /// `young_target_words(live)`, keeps it inside the band, and is a fixed point — the
+    /// The **minimum/reserve-capacity guarantee** over the whole growth table and over
+    /// min/max-clamped policies: both targets stay at or above `nursery_floor_words()`, and so
+    /// does every capacity either collapse seam installs.
+    ///
+    /// This is a correctness property rather than a number pin — it is the invariant a dependent
+    /// re-attempting a refused allocation asserts against (`beam_process`'s collect-and-retry) —
+    /// so it is checked at every growth-table entry and both of its neighbours, under the
+    /// unconfigured default, a spawn policy, a `+hms` floor, a ceiling that does not bind the
+    /// floor, and a ceiling *below* the reserve (the one shape allowed to answer a floor under
+    /// `need_reserve_words`, the caller's own explicit choice).
+    #[test]
+    fn the_nursery_floor_bounds_every_target_and_every_collection() {
+        let policies = [
+            HeapPolicy::default(),
+            HeapPolicy::from_spawn_opts(0, 0, 65_535),
+            HeapPolicy::from_min_max(4_185, 0),
+            HeapPolicy {
+                min_heap_words: 500,
+                ..HeapPolicy::default()
+            },
+            HeapPolicy {
+                max_heap_words: 300,
+                ..HeapPolicy::default()
+            },
+            HeapPolicy {
+                max_heap_words: 51,
+                ..HeapPolicy::default()
+            },
+        ];
+
+        // Every growth-table entry and both of its neighbours: a target derived from a live set
+        // one word off an entry is the case a hand-picked sample list cannot cover.
+        let mut lives: Vec<usize> = vec![0, 1];
+        let mut capacities: Vec<usize> = vec![0];
+        for &size in heap_sizes() {
+            lives.push(size.saturating_sub(1));
+            lives.push(size);
+            lives.push(size.saturating_add(1));
+            capacities.push(size);
+        }
+        lives.sort_unstable();
+        lives.dedup();
+
+        for policy in &policies {
+            let floor = policy.nursery_floor_words();
+            // The floor is the reserve's own curated size, so an unbounded policy is never below
+            // the reserve it exists to cover; only a caller's `+hmax` can push it underneath.
+            if policy.max_heap_words == 0 {
+                assert!(
+                    floor >= policy.need_reserve_words,
+                    "{policy:?}: the floor {floor} is below the reserve {}",
+                    policy.need_reserve_words
+                );
+            }
+            // Both targets reduce to the floor at an empty live set — it *is* the degenerate
+            // case of each rule, not a separate quantity.
+            assert_eq!(policy.young_minor_target_words(0), floor, "{policy:?}");
+            assert_eq!(policy.young_target_words(0), floor, "{policy:?}");
+
+            let (mut previous_minor, mut previous_young) = (0usize, 0usize);
+            for &live in &lives {
+                let minor = policy.young_minor_target_words(live);
+                let young = policy.young_target_words(live);
+                // The guarantee itself.
+                assert!(
+                    minor >= floor,
+                    "{policy:?}: young_minor_target_words({live}) = {minor} < floor {floor}"
+                );
+                assert!(
+                    young >= floor,
+                    "{policy:?}: young_target_words({live}) = {young} < floor {floor}"
+                );
+                // Both are monotone in the live set and the fullsweep's 2x rule never lands
+                // below the minor's 1x rule for the same live set.
+                assert!(
+                    minor >= previous_minor && young >= previous_young,
+                    "{policy:?}: the targets are not monotone at live {live}"
+                );
+                assert!(
+                    young >= minor,
+                    "{policy:?}: young_target_words({live}) = {young} < {minor}"
+                );
+                (previous_minor, previous_young) = (minor, young);
+
+                // And no collection leaves the nursery below the floor, from any capacity on the
+                // table: the grow branch installs the target, which is itself at or above it.
+                for &capacity in &capacities {
+                    assert!(
+                        policy.young_after_collection(capacity, live) >= floor,
+                        "{policy:?}: a minor at capacity {capacity} / live {live} left the \
+                         nursery below the floor {floor}"
+                    );
+                    assert!(
+                        policy.young_after_fullsweep(capacity, live) >= floor,
+                        "{policy:?}: a fullsweep at capacity {capacity} / live {live} left the \
+                         nursery below the floor {floor}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The nursery follows the **live set**: a fullsweep sizes it to    /// `young_target_words(live)`, keeps it inside the band, and is a fixed point — the
     /// property a fill- or capacity-derived rule cannot have.
     #[test]
     fn young_after_fullsweep_tracks_the_live_set_and_is_a_fixed_point() {

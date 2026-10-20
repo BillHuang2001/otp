@@ -290,8 +290,9 @@ impl Collector {
         // The live term is deliberately *not* the pre-collection occupancy: a
         // fullsweep-sized generational heap is *full* when the cadence fires (the live set
         // plus every promotion the minors since the last fullsweep made, all of it garbage
-        // by now), so feeding the policy the **mature** occupancy makes its `should_grow`
-        // fire on every fullsweep and the mature capacity creeps up one growth-table step
+        // by now), so feeding the policy the **mature** occupancy inflates `need_after` past
+        // the space's own capacity and its grow bracket (`capacity < target`) fires on every
+        // fullsweep, so the mature capacity creeps up one growth-table step
         // per fullsweep, without bound, for a live set that never changes (see
         // [`crate::live`]).
         //
