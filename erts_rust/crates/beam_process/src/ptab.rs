@@ -2267,7 +2267,8 @@ impl ProcessTable {
     /// therefore **best-effort**: a failure to queue a local `{'EXIT', …}`/`{'DOWN', …}` (an
     /// unreachable receiver heap, or a relocation-exempt / host-gate-declined receiver refusing to
     /// grow) or to route a remote [`DistSignal::Exit`] / [`DistSignal::MonitorExit`] is
-    /// **logged** — never silently swallowed — and the cascade    /// **continues** to the remaining peers, so the process-death observer (step 5) and the port
+    /// **logged** — never silently swallowed — and the cascade **continues** to the remaining
+    /// peers, so the process-death observer (step 5) and the port
     /// monitor cleanup (step 6) always run. Aborting mid-cascade instead would leave later peers
     /// unsignalled, the observer unrun (leaking the host resources it releases, e.g. ETS tables
     /// owned by the pid) and the port table holding dangling incoming `PortMonitor` entries.
@@ -2474,7 +2475,7 @@ impl ProcessTable {
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
         // The dying process's **incoming** remote watchers are the mirror image: each of them is
-        // a remote process holding a `erlang:monitor(process, LocalPid)`, so every one must be
+        // a remote process holding an `erlang:monitor(process, LocalPid)`, so every one must be
         // told the process is gone — the C's `erts_dsig_send_m_exit`
         // (`{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}`, `dist.c:1497`),
         // which is what makes the peer's `{'DOWN', Ref, process, Pid, Reason}` arrive at all.
@@ -2508,7 +2509,8 @@ impl ProcessTable {
         // The dying process's group-leader entry goes with it too: it cannot outlive its
         // subject, and it is keyed by the local pid (whose slot serial `take` has already
         // bumped, so a stale entry could never be observed again).
-        self.group_leaders.remove(&pid);        // 5. Notify the process-death observer exactly once, now that the death has been
+        self.group_leaders.remove(&pid);
+        // 5. Notify the process-death observer exactly once, now that the death has been
         //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
         //    payload is only valid up to the drop below. The observer is isolated (a panic is
         //    caught and logged, never propagated — see `ProcessExitObserver`).
