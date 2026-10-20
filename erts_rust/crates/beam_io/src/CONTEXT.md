@@ -131,14 +131,17 @@ exhaustive):
 - `port.rs` → the `completions: Vec<PortCompletion>` stage + `Port::take_completions()` (drains once).
   The sink is installed at **every** driver interaction point — `open`(`start`), `output`,
   `ready_input`, `ready_output`, `control`, `timeout`, `drive_async`, `notify_exit`(`port_exit`) and
-  `close`(`stop`); the `timeout` one matters most, because `Port::run_task`'s `Timeout` arm discards
-  `Driver::timeout`'s `Result`, so a timer-driven `{error,timeout}` reply exists only as a completion.
+  close (`flush` **and** `stop`, see *The close path* below); the `timeout` one matters most, because
+  `Port::run_task`'s `Timeout` arm discards `Driver::timeout`'s `Result`, so a timer-driven
+  `{error,timeout}` reply exists only as a completion.
 - `registry.rs` → `PortRegistry::take_completions()` drains every live port in **port-number order**
   (each port's own completions in delivery order), then the completions harvested from ports closed
-  since the last drain. `close` **harvests** the closing port's staged completions into a
-  registry-owned queue before dropping the `Port`, so a teardown's `async_error_am_all` replies (and
-  any staged before it) still reach the owner exactly once; the port **number** keeps its existing
-  rule — retired only by the `Closed` report, never by a completion.
+  since the last drain. When a port **leaves the live map** (`remove_finished_port`, not necessarily
+  the `close` call itself — a parked closing port stays live and keeps reporting, see *The close
+  path*) its staged completions are **harvested** into a registry-owned queue, so a teardown's
+  `async_error_am_all` replies (and any staged before it) still reach the owner exactly once; the
+  port **number** keeps its existing rule — retired only by the `Closed` report, never by a
+  completion.
 Contract: **drain after every round** (line-frames style), a control op's return value is never a
 completion, and each completion is reported exactly once.
 
@@ -328,8 +331,8 @@ of `drv->stop` (`io.c:3702-3752`).
   **output**: a close does write out (or, at the stall bound, drop) the port's queued output, while
   the **input** line buffer is untouched and undelivered input is dropped with the port.
 - **A completion names a number that can be reused once its `Closed` report is minted.** The
-  harvest copies a closing port's completions *out* (the port itself is dropped), and the port
-  number is still retired only by the `Closed` report — so a caller **must** drain
+  harvest copies a port's completions *out* when the port leaves the live map (a parked closing port
+  is still live and keeps reporting), and the port number is still retired only by the `Closed` report — so a caller **must** drain
   `PortRegistry::take_completions` in the round it ran. A drain deferred past a later
   `PortRegistry::open` that reused the number would report a stale completion under a live port's
   id (the `Closed` report's own rule is unchanged and documented on `PortRegistry::close`).
