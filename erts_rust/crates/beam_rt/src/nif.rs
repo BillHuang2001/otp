@@ -167,6 +167,10 @@ use crate::context::PendingInterner;
 /// The **shared atom-index hub**: the one allocator of atom indices once a NIF-created thread (which
 /// is not inside a call) can create atoms — see its own docs for the invariant and the residual.
 pub(crate) mod atoms;
+/// The **process-independent host for NIF-created threads**: the [`NifHost`](beam_abi::NifHost) a
+/// thread a NIF created builds message envs and sends on, plus the factory `beam_abi`'s
+/// `enif_alloc_env` seam asks for one — see its own docs for the substitution and the typed gaps.
+pub(crate) mod thread_env;
 /// One loaded NIF library plus the host it was loaded against.
 ///
 /// The field order is load-bearing: `lib` is declared **first** so it is dropped first, and
