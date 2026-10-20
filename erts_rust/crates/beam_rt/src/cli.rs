@@ -337,7 +337,9 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// **missing operand of a `+`-switch** or of `-name`/`-sname`
 /// ([`error::missing_switch_operand`]) and the **refused `-smp disable`**
 /// ([`error::smp_disable_not_supported`]). A **plain positional argument** is accepted and
-/// ignored, never a usage error. A malformed
+/// ignored, never a usage error, and the two markers `-extra`/`--` hand their tails to
+/// [`RuntimeConfig::plain_args`] (the source of `init:get_plain_arguments/0`) instead of
+/// recording them as init arguments. A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
