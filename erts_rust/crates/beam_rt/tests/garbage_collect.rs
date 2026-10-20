@@ -193,21 +193,14 @@ const PROGRAMS: [(&str, &str, &str); 4] = [
 // ---------------------------------------------------------------------------------------
 
 // The `{async, ReqId}` completion for a **live, blocked** target is pinned on the
-// **scheduled-process** route (the `..._on_the_scheduled_route` test below), because the
-// `-eval` route cannot express its premise. A `spawn`ed `-eval` closure is run
-// **synchronously to completion** by the evaluator (`src/eval/mod.rs`, `apply_eval_closure`),
-// and it is applied on the slice's own context (`may_pump_scheduler` is false there), so its
-// `receive … after T` arms never park: a `spawn`ed `-eval` child runs `ok`, returns and
-// terminates before the parent's next statement. (The `-eval` action's **own** `receive …
-// after T` does wait — a mailbox rescan, a bounded scheduler pump, one port-poller pass and
-// `Runtime::wait_for_timer` on the timer heap — but that is the top-level evaluator, not a
-// spawned closure.) The target is then genuinely dead at the
-// `erlang:garbage_collect(P, …)` call, and this runtime answers the
-// oracle's own dead-target `false` — the C's `liveness_notify_sys_task_executed`
-// (`erts/emulator/beam/erl_process.c:11488-11490`), the same `false` as `EXPR_ASYNC_DEAD`. The
-// live-target (`true`) and dead-target (`false`) halves of the completion are therefore pinned
-// here by `EXPR_ASYNC_SELF` / `EXPR_ASYNC_DEAD`, and the live-**blocked**-target half by the
-// scheduled fixture entry `gc_req:ask_async/0`.
+// **scheduled-process** route (the `..._on_the_scheduled_route` test below), because that is
+// where the target's own collection is observable. A `spawn`ed `-eval` closure is real code
+// (`src/eval/compile.rs`: it is compiled into a synthetic module and runs as an
+// `ProcessEntry::Export`), so it genuinely parks in a bare `receive` and the `-eval` route *can*
+// express the premise — but it can only observe the completion message, not that a collection
+// happened. The live-target (`true`) and dead-target (`false`) halves of the completion are
+// pinned here by `EXPR_ASYNC_SELF` / `EXPR_ASYNC_DEAD`, and the live-**blocked**-target half by
+// the scheduled fixture entry `gc_req:ask_async/0`.
 
 /// The requester is the **target** (`self()`): the completion is delivered into the requesting
 /// process's own mailbox, so it can receive it after the call returns.
