@@ -141,7 +141,9 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
 
   It also carries the one inherent helper `host_serves(module, function, arity)` (floor ∪ NIF-loaded module ∪ registered `beam_bifs` key) — the **single** source of truth for "the host serves this MFA", which `resolve_external_call` refuses on first and the runner's export-entry arm asks directly (`../runner/CONTEXT.md`), because that seam's `Ok(None)` is overloaded.
 
-  `resolve_local_call` is **not** `host_serves`: its whole body is `native::prim_tty::serves_local_call(module, function, arity)` — a `&'static` two-table test (`module == prim_tty::LIBRARY` + `prim_tty::NIF_KEYS.contains`), so it reads no runtime state, allocates nothing, does no hash lookup and cannot change after construction (`NifRegistry::insert` is reached only by `load_nif/2`, and a `prim_tty` load answers `ok` **without** inserting — `bridges.rs`). `host_serves`'s NIF arm is module-granular (`NifRegistry::is_loaded`, not `lookup`), so a mid-run `load_nif/2` **does** flip it for every key of that module — the one runtime-mutable input either seam has.
+  `resolve_local_call` is **not** `host_serves`: it answers `crate::native::prim_tty::serves_local_call(module, function, arity)` else `beam_bifs::serves_local_call(module, function, arity)` (`execution.rs`).
+  That is two fixed `(name, arity)` key sets — prim_tty's 20 `NIF_KEYS` stubs and `beam_bifs`' 19 `zlib` stream stubs — each beginning with a **module-name equality** check, so the seam reads no runtime state, allocates nothing and does no hash lookup.
+  `host_serves`'s NIF arm is module-granular (`NifRegistry::is_loaded`, not `lookup`), so a mid-run `load_nif/2` **does** flip it for every key of that module — the one runtime-mutable input either seam has.
 
 * `bridges.rs` → the nine bridges (incl. `FunBridge`'s `call_fun_with_tables` override + its private `nested`), `NodeIdentity` (with its real `local_node_hash`), `local_fun_identity`/`module_md5`; `SendBridge` is a thin delegator to the shared classifier.
 

@@ -25,8 +25,6 @@ The key reservation runs from `TTY_KEY_TOP = u64::MAX - 2` down to `TTY_KEY_FLOO
 ## Test Strategy
 - Releasing only after the mint is what makes an object a NIF has already released still deliver its readiness; the end-to-end pins are `../../tests/nif_select.rs`'s `enif_select_interest_reference_keeps_a_released_object_alive_until_readiness` (the released object delivers), `enif_select_stop_releases_the_interests_reference_exactly_once` and `enif_select_interest_of_a_dead_owner_is_pruned_and_released` (the reference is given back once, at a stop and at a dead owner's prune), with `select/tests.rs` pinning the same half at the unit level.
 - `select/tests.rs` (15 cases) pins the store with no poller callback: the key reservation, the once-only readiness report, a foreign key ignored, the widening re-arm, `stop`/`cancel`, the dead-owner prune, the C event order with the bare-hang-up fallback, and the hold's no-object/refused-object/refused-re-registration/first-delivery edges.
-## Known Issues
-- One residual, a **lost notification** rather than a wrong result: the resource type's `stop` callback has no seam on this side, so a `STOP` keeps the C's fast-track `ERL_NIF_SELECT_STOP_CALLED` answer and `ERL_NIF_SELECT_STOP_SCHEDULED` is never reported.
 ## Routing Table
 - `select.rs` → `SelectWatch`/`SelectRegistration`, `arm`/`stop`/`cancel`/`take_ready`/`prune_dead`, `SelectPayload`/`SelectEvent`/`SelectDelivery`/`events_of`, `SelectHold`, `TTY_IFD`/`TTY_KEY_TOP`/`TTY_KEY_FLOOR`.
 - `tests.rs` → the store's unit suite (`crate::port::select::tests`).

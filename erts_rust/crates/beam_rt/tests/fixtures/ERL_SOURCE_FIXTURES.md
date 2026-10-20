@@ -1,7 +1,8 @@
 # `beam_rt` test fixtures — the `.erl` fixtures compiled at test time
 
 The fixtures in this doc are **sources only**: no `.beam` is committed for them, and each suite `include_str!`-embeds (or copies) the source into a per-case scratch directory and compiles it there with the system `erlc`.
-A fixture compiled into a scratch directory holding **only** that module is also a safe single `-pa` for the oracle, which is why the suites never name this directory as a whole (`tests/fixtures/` holds a `lists.beam` that would shadow stdlib).
+A fixture compiled into a scratch directory holding **only** that module is a safe single `-pa` for the oracle, which is why every suite here compiles into such a directory and never names `tests/fixtures/` as a whole (that directory holds many modules with colliding names and committed images).
+The sources whose detail is not load-bearing are indexed by [`README.md`](README.md)'s `## Every other fixture file in this directory`, which names the suite that consumes each one.
 The general skip rule — a missing toolchain is a loud `SKIP`, a missing committed fixture **fails** — is [`README.md`](README.md)'s `## Skip-loudly rule`; each section below adds only its own suite's specifics.
 
 ## The scheduled-route `epp` pair (`epp_forms.erl` / `epp_input.erl`, compiled at test time)
@@ -36,8 +37,7 @@ socket in `{active, true | once | N}` really delivers `{tcp, S, Data}` / `{udp, 
 and `{tcp_passive, S}` / `{udp_passive, S}` to its owner's mailbox, and a compiled `receive` gets
 it. The single committed source `inet_active.erl` (module `inet_active`, exports `t1/0 … t7/0`) is
 `include_str!`-embedded and compiled by the suite into a **per-case scratch directory** with the
-system `erlc`, and only that directory is ever named on a `-pa` (`tests/fixtures/` holds a
-`lists.beam` that would shadow stdlib).
+system `erlc`, and only that directory is ever named on a `-pa`.
 
 ### The transport is the driver itself — exactly what `prim_inet` does
 Every case opens its socket with `erlang:open_port({spawn_driver, "tcp_inet" | "udp_inet"},
@@ -160,7 +160,7 @@ same pid, because the published slot is runtime-wide rather than per-`RuntimeCon
 
 ## `zlib` fixtures (compiled at test time, never committed as `.beam`)
 
-The five `zlib_*` sources below are the `zlib` images for the four `zlib` suites.
+The six `zlib_*` sources below are the `zlib` images for the four `zlib` suites.
 All are source only, all are compiled by the system `erlc` at test time into a per-fixture scratch directory holding only that module, and all are skipped **loudly** when `erlc` is missing.
 
 ### `zlib_stream_levels_fixture.erl` — compiled at test time, never committed as a `.beam`

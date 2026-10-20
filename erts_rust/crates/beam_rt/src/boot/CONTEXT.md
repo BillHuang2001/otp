@@ -117,7 +117,7 @@ resets it to `(Mode == embedded)` (`init.erl:1337-1338`) via `bootscript.rs::boo
 code server's on-demand lookup, never an error (`init.erl:1339-1348`). `{preLoaded, […]}` precedes
 the marker and stays unconditional.
 The committed `bootstrap/bin/start.boot` names **202** `primLoad` modules (batches 29/86/87), so this
-runtime now loads the **29** of the pre-marker batch and defers the 173 post-marker names, matching
+runtime loads the **29** of the pre-marker batch and defers the 173 post-marker names, matching
 real `init`'s loaded-module set (`length(code:all_loaded())` = 97 here vs 109 under the installed
 oracle; the membership of `auth`, `dets_v9`, `array`, `base64`, `calendar` is unloaded under both).
 Loading a module still interns that module's **entire `Atoms` chunk** into the runtime's single
@@ -146,7 +146,7 @@ registered but the directive has not resumed). A directive that has **already** 
 (`heart`'s `start/0` returns after it `spawn`s a process it does **not** link) is skipped, not an error;
 `unlink(a, a)` for a self-registering directive is the process table's documented no-op.
 
-## Where the real `start.boot` gets now
+## How far the real `start.boot` runs
 Executing the real script (`bootstrap/bin/start.boot`, 22 instructions) with the CLI-equivalent
 configuration **runs all 22 directives to completion**, ending at the final `{progress,started}`
 (0-based directive index 21 of 22); the CLI exits **0** on every action but `-version` (each drives the
@@ -262,7 +262,7 @@ so `gen_server:loop_hibernate/4` (`lib/stdlib/src/gen_server.erl:2338`) does not
   reaches directive 20 and the final `{progress,started}`. Pinned by
   `../tests/boot.rs::the_boot_chains_kernel_processes_survive_their_directive_processes`, which asserts
   `whereis(application_controller)` is a live pid after the last directive. The detail is in
-  [`../M1_GAPS.md`](../M1_GAPS.md) *A.7/A.9 boot*.
+  [`../M1_GAPS.md`](../../M1_GAPS.md) *A.7/A.9 boot*.
 
 ### Kernel start performs a real native hostname lookup and leaves one live-but-idle port
 Directive **18** (`{apply,{application,start_boot,[{application,kernel,Props},permanent]}}`) starts the
@@ -305,7 +305,7 @@ which
   The `-eval` action itself adds no pass (`erlang:halt` returns the halt through the native floor, no
   trailing pump).
   Both sides of the comparison and the reproduction recipe are in
-  [`../PERF.md`](../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
+  [`../PERF.md`](../../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
 
 ### The completion-asserting tests (all pass)
 The three `cargo test --lib boot::` tests (`the_real_start_boot_executes_every_directive_to_progress_started`,
@@ -328,7 +328,7 @@ the process's authoritative root set on resume (`../runner/run.rs::publish_parke
 `resume_from_process_roots`). Without that pair a
 collection driven while the process was parked — `Process::deliver`'s exit cascade is **not** gated
 by `Runtime::gc_process_enabled` — would relocate the heap against a partial root set and leave a
-stale word in `x`, which is what argv length used to perturb.
+stale word in `x`.
 **The escape-store stabilization is honest.** `../runtime/gc.rs::try_stabilize_escaped` copies a
 runtime-level store's term onto the pointer-stable arena, propagates a **genuine** copy failure as
 the emulator's `error:system_limit` (never storing an un-copied term) and trips the `disable_gc`
@@ -337,9 +337,9 @@ because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
 1. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` runs to completion and agrees with the oracle.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
-   Both A.9 `selfhost/*` corpus cases — `selfhost/in_process_compile_file_no_spawn_deterministic` and `selfhost/scheduled_process_compile_file_deterministic` — **agree** with the oracle on both execution tiers; the durable invariant behind them is the registered-BIF copy-out of [`../DESIGN_DECISIONS.md`](../DESIGN_DECISIONS.md) (`../context/calls.rs`), never a term left on the recyclable pooled BIF heap.
+   Both A.9 `selfhost/*` corpus cases — `selfhost/in_process_compile_file_no_spawn_deterministic` and `selfhost/scheduled_process_compile_file_deterministic` — **agree** with the oracle on both execution tiers; the durable invariant behind them is the registered-BIF copy-out of [`../DESIGN_DECISIONS.md`](../../DESIGN_DECISIONS.md) (`../context/calls.rs`), never a term left on the recyclable pooled BIF heap.
    A signal-driven collection of a woken monitor watcher (`beam_process`'s process-termination cascade, `crates/beam_process/src/ptab.rs` → `enqueue_down_signal` → `copy_reason_onto` → `grow_receiver_for_signal`) is declined by the host `CollectionGate` every `ptab.rs` signal site consults, and the runner's park-window relocation exemption covers the rest of that window: the parked machine's live `Machine::pending_exception` reason remains a real GC root across it (`../runner/run.rs::publish_parked_roots`, read back on resume by `RuntimeContext::resync_parked_roots`).
-   [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
+   [`../M1_GAPS.md`](../../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
 2. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**
    `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), and the service answers with the tag paired to the request, so `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` complete and agree with the oracle from the pumped `-eval` route (`../tests/io_scan.rs`) and from a **scheduled** `run` process (`../tests/scheduled_io_device.rs`), and `io:get_line/2` runs through the same `{get_line,…}` arm (the colocated `file_server/get_line/tests.rs`).
    The residual io-device divergence is a `{get_chars,…}` on a `{encoding,unicode}` **stream** counting BYTES where the oracle counts CHARACTERS, documented in `../native/file_server/CONTEXT.md`.
@@ -372,9 +372,8 @@ The `erl` shell-out is kept because no filesystem probe can see *every* installa
 from neither the shim nor this executable, and a wrapper `erl` may live outside the release it starts.
 Asking `erl` is authoritative, and a path is never fabricated: if neither probe produces a stdlib the
 resolution fails with the typed `cannot locate the system code path: …` error (exit 1). Consequence: a
-normal installation pays **no** `erl` start-up (measured on this host: a bare `-eval` invocation now
-takes ≈0.34 s wall, since it drives the default boot script on every action, where the resident `erl`
-shell-out alone costs ≈0.5 s and is still avoided).
+normal installation pays **no** `erl` start-up (a bare `-eval` invocation takes ≈0.34 s wall, since it
+drives the default boot script on every action, where the resident `erl` shell-out alone costs ≈0.5 s).
 **The resolved root is the consumed SYSTEM install, not this runtime's own tree.** `native_roots`
 seeds candidate roots with the `erl` on `$PATH` first (canonicalized, never executed), then
 `current_exe()` ancestors, `$ERL_TOP` and the standard prefixes; `bootstrap/` is never a code-path
@@ -422,7 +421,8 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   *inside* a `RuntimeContext` blocking pump instead — `RunOutcome::Wait` handled by
   `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — is bounded by that pump's
   own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
-  rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
+  rather than a spin) and by a pump round that cannot advance (`Ok(None)` ⇒ the typed
+  `beam_engine::blocked()` gap); the nested cap is documented in
   `../context/CONTEXT.md`.
 - `bootscript.rs` is ~2022 lines (production lines 1–801, the rest its oracle test module) — the
   crate's documented long-file precedent; `drive.rs` is ~426 lines. Both are `#![deny(unsafe_code)]`;
@@ -483,7 +483,7 @@ script and reports its header (the consumed OTP-29 install's `{"Erlang/OTP","29"
   (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
   `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
   and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).
-  The **imminent-only wait policy** the drives now use is pinned in `../runtime/scheduler/tests.rs`:
+  The **imminent-only wait policy** the drives use is pinned in `../runtime/scheduler/tests.rs`:
   `the_imminent_only_wait_policy_sleeps_for_an_imminent_deadline_only` (the `TimerWait::ImminentWithin`
   unit: no deadline → `None`; an hour out → `None`; 20 ms out → the remaining time, clamped to the
   window; one wait per pass), `a_boot_drive_step_does_not_sleep_on_a_far_future_deadline` (a
@@ -535,10 +535,8 @@ The request/reply surface, the errno mapping, the io-device and the remaining ga
 Unlike `file_server_2` there is **no** name conflict with the boot script: `init` starts the loader (it is in the script's `{preLoaded, …}` list, not a `{kernelProcess, …}` child), so nothing in `bootstrap/bin/start.boot` registers the name.
 The `-version` action is the only route with no runtime at all, so it has no name registry to answer from.
 
-## Notes for Agents — the `-mode`-is-embedded predicate is written twice
-The `-mode`-is-embedded rule (`code.erl`'s `start_get_mode/0`: the **first** `-mode` occurrence must be the single string `"embedded"`) is expressed in **two** places this round — `bootscript.rs::boot_wants_embedded_mode` (the `{kernel_load_completed}` reset of `prim_load`) and the private `native/code.rs::wants_embedded_mode`.
-The duplication was unavoidable while `../native/code.rs` was owned by another agent, and the two **must stay in step**: `bootscript.rs::the_post_marker_batches_load_in_embedded_mode` pins the boot half, `native/code.rs::code_get_mode_follows_the_first_mode_argument` the code half.
-**The fix is one `Runtime` accessor** (a single `Runtime::wants_embedded_mode()` the two call sites share), which removes the drift risk outright.
+## Notes for Agents — the `-mode`-is-embedded predicate
+The `-mode`-is-embedded rule (`code.erl`'s `start_get_mode/0`: the **first** `-mode` occurrence must be the single string `"embedded"`) is expressed in **two** places — `bootscript.rs::boot_wants_embedded_mode` (the `{kernel_load_completed}` reset of `prim_load`) and the private `native/code.rs::wants_embedded_mode` — and the two **must stay in step**: `bootscript.rs::the_post_marker_batches_load_in_embedded_mode` pins the boot half, `native/code.rs::code_get_mode_follows_the_first_mode_argument` the code half.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
@@ -556,4 +554,4 @@ The duplication was unavoidable while `../native/code.rs` was owned by another a
 Whole-process startup is **≈0.34 s wall / ≈0.33 s CPU** (release, `-eval 'halt(0).'`) and **CPU-bound**: the boot drive issues **0** `clock_nanosleep` calls, because a blocking port poll requires a port that owes a reply and only the drive's `TimerWait::ImminentWithin` policy takes that gate.
 The boot path issues **927 filesystem stats**, but only **2** on `os.beam`, since `Runtime::find_module_file` answers an already-loaded module from `CodeServer::loaded_path`.
 A normal installation therefore pays **no** `erl` start-up (the resident `erl` shell-out alone costs ≈0.5 s and is avoided).
-Figures and their measurement pins: [`../PERF.md`](../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
+Figures and their measurement pins: [`../PERF.md`](../../PERF.md) *The boot path's one live-but-idle port, and the poll budget*.
