@@ -46,7 +46,7 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `-config F` | config file, recorded as the init argument `config`; an **unreadable** one fails the boot with the oracle's byte-exact `Could not start kernel pid (application_controller) …` stderr (CRLF, the resolved `<F>.config` named) and exit 1, really writing the crash dump |
 | `-boot F` | boot script: recorded as the init argument `boot` **and** the script the runtime drives (the explicit value, else this runtime's own release's `bootstrap/bin/start.boot`) through the A.7 boot-script executor **before** the action's own start instruction (every action but `-version`) |
 | `-emu_flavor emu\|jit\|smp` | emulator flavor → `emulator.flavor` + `FeatureFlags` |
-| `+A N` | async-thread pool size, preserved verbatim |
+| `-extra [token…]` | **ends the switch surface**: every remaining token is a **plain argument** (`RuntimeConfig::plain_args`, verbatim and in order) and nothing after it is an init argument or a Start instruction — the C `init`'s `start_extra_arg` (`erts/preloaded/src/init.erl:1674`). `-extra` itself is neither (the oracle's `init:get_argument(extra)` is `error`). This is the surface the real `erlc` front end uses (`-s erl_compile compile_cmdline -extra +deterministic -o <D> <src>`) || `+A N` | async-thread pool size, preserved verbatim |
 | `+P N` | max process count (`legacy`, or `1024..=134217727`) → `emulator.max_processes` |
 | `+Q N` | max port count (`legacy`, or `1024..=134217727`), preserved verbatim |
 | `+K true\|false` | kernel-poll switch, preserved verbatim |
