@@ -193,7 +193,7 @@ check_compiler() ->
             end
     end.
 
--spec scratch_dir() -> string().
+-spec scratch_dir() -> string().   %% the dir holding the kernel .beam files
 scratch_dir() ->
     case os:getenv("SCRATCH") of
         false -> die("SCRATCH is not set; run test/measure_loop_opt_speed.sh");
@@ -665,10 +665,13 @@ wp_sample(Mods, Variant) ->
               " halt(0, [{flush,true}])."]),
     Cmd = io_lib:format("~s -noshell -pa ~s -eval '~s' 2>/dev/null",
                         [os:getenv("HOST_ERL", "erl"),
-                         filename:join(scratch_dir(), "beam"),
+                         scratch_dir(),
                          Eval]),
-    case string:trim(os:cmd(lists:flatten(Cmd))) of
-        "" -> die("whole-program run of " ++ atom_to_list(Mod) ++ " failed");
+    Full = lists:flatten(Cmd),
+    case string:trim(os:cmd(Full)) of
+        "" ->
+            die("whole-program run of " ++ atom_to_list(Mod)
+                ++ " produced no output; command was: " ++ Full);
         Out ->
             try list_to_integer(lists:last(string:split(Out, "\n", all))) of
                 N when is_integer(N), N > 0 -> N;
