@@ -87,6 +87,17 @@ instructions are hand-built `Instr`s driven straight through `exec` (no loader i
 
 Each case asserts the success path, the fail-branch `Step::Goto`, or the `NO_FAIL` raise.
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
+## Coverage notes
+- The `differential` gate's `records` group (46 cases: 35 `Eval` + 11 `Module`) pins every
+  `records:*` BIF and six of the eight opcodes (186–191; 192/193 are unreachable from the
+  installed OTP-29 `erlc`). Every case **creates** its record through `records:create/4`, so
+  `PutRecord`'s create form has no oracle-verified case: the local form is proven structurally
+  only (here + `tests/update.rs`), and the corpus module's `-record #rec{a, b}` has defaultless
+  fields, so a compile-time `#rec{a = 1}` there would be a `novalue` error — a positive case
+  needs a record whose fields all carry defaults.
+- Stale-comment trap: the module doc of `tools/differential/src/corpus/records.rs` ("The module
+  case") and `crates/beam_rt/tests/records.rs` still describe the create form as unimplemented.
+  The **local** create form IS implemented here; only a *foreign* `Id` is the gap.
 
 ## See Also
 - `../CONTEXT.md` → the family seam, variant ownership, the `NO_FAIL` route and the handoff list.
