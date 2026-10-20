@@ -139,9 +139,16 @@ const MEASURED: usize = 7_800;
 /// Rounds in the whole loop.
 const ROUNDS: usize = WARMUP + MEASURED;
 
-/// The nursery capacity both strategies start with (pinned: `min_heap_words` is the mature
-/// size, so the bounded [`HeapPolicy::young_after_collection`] rule can never shrink it).
-const NURSERY_WORDS: usize = 16_384;
+/// The nursery capacity both strategies are born with, in words — the policy's initial-heap
+/// rule, [`HeapPolicy::initial_heap_words`], i.e. the C's
+/// `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` at spawn (`erl_process.c:12586-12592`).
+/// [`policy`] pins `min_heap_words` to the mature capacity to hold the *mature* generation at a
+/// fixed point, and that floor is above the corpus-sized seed, so a process starts with a
+/// [`MATURE_WORDS`]-sized nursery: the C cannot express a young heap below its own
+/// `min_heap_size` either (`next_heap_size` floors every size by it, `erl_gc.c:347-352`).
+/// Because the floor is the capacity, the bounded [`HeapPolicy::young_after_collection`] rule
+/// can never shrink it — hence it is an assertable steady state.
+const NURSERY_WORDS: usize = MATURE_WORDS;
 /// The mature generation's capacity in words — 128 whole Immix blocks (2048 lines), enough
 /// for the long-lived set plus the dead batches a fullsweep cycle accumulates. Also pinned as
 /// `min_heap_words`, so it is a fixed point of `mature_after_fullsweep` for **both**
