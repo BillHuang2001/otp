@@ -57,25 +57,43 @@
 //! * A **failed** `shutdown(2)` still latches `TCP_ADDF_SHUTDOWN_WR_DONE` for a write-side `how`
 //!   (`:12370`-`:12374`, the latch runs *before* the error reply), which is why the flag is a
 //!   "a write shutdown was attempted" mark rather than "it worked".
+//! * `tcp_inet_commandv` (`:12695`) routes a command queued on a socket with a *deferred*
+//!   shutdown ([`TcpInetDriver::pending_shutdown`](super::TcpInetDriver), the C's
+//!   `TCP_ADDF_PENDING_SHUT_WR`/`_RDWR`, `:12356`-`:12368`) straight to
+//!   `tcp_shutdown_error(desc, EPIPE)`, which always answers `closed`: the `EPIPE` it hands over is
+//!   never a peer reset, so `{show_econnreset, …}` cannot change that reply.
 //!
 //! # Measured on OTP 29.1.1 / erts-17.1
 //!
-//! The 25-row table at the bottom of this file is byte-compared against the system `escript`. One
-//! row of the `gen_tcp` contract does **not** agree with that oracle and is deliberately not
-//! compared: with `{show_econnreset,true}` set, the OTP 29.1.1 oracle answers `{error,econnreset}`
-//! for the first write after a *successful* write shutdown, where this tree's C
-//! (`inet_drv.c:13715`-`:13718`: `err == EPIPE && !(tcp_add_flags & TCP_ADDF_SHUTDOWN_WR_DONE)`)
-//! keeps `EPIPE` — and so answers `closed`. The guard's whole point is that a *deliberate*
-//! `shutdown(write)` must not be reported as the peer's reset, so this floor follows the tree's C
-//! and the divergence is recorded here rather than papered over.
+//! The 24-row table at the bottom of this file is byte-compared against the system `escript`. Two
+//! facts of the contract are documented rather than compared, because neither is expressible as a
+//! row:
+//!
+//! * **A recorded divergence — `{show_econnreset,true}` after a successful `shutdown(write)`.**
+//!   The oracle answers `{error,econnreset}` for the first write after a *successful* write
+//!   shutdown (deterministic across four legs; `strace` shows the kernel's `writev = -1 EPIPE`),
+//!   where this tree's C (`inet_drv.c:13715`-`:13718`:
+//!   `err == EPIPE && !(tcp_add_flags & TCP_ADDF_SHUTDOWN_WR_DONE)`) keeps the `EPIPE` — and so
+//!   answers `closed`. The guard's whole point is that a *deliberate* `shutdown(write)` must not be
+//!   reported as the peer's reset, so this floor follows the tree's C. The row lives in
+//!   [`a_deliberate_write_shutdown_is_never_reported_as_a_reset`], which asserts **this floor's**
+//!   `closed` and deliberately never compares the oracle's `econnreset`.
+//! * **The `TCP_ADDF_SHUTDOWN_WR_DONE` latch is not directly observable from Erlang on Linux.** A
+//!   `send(2)` after `SHUT_WR` returns `EPIPE` on both the first and the second call, and
+//!   `shutdown(s, 3)` fails `EINVAL` without shutting anything, so no call reaches the "a *later*
+//!   `EPIPE` that must stay `closed`" path the flag exists for (`:13717`, latched at `:13973`). The
+//!   flag is defensive only; it is pinned **indirectly**, through the `shutdown(write)` row's
+//!   `{error,closed}` reply in
+//!   [`a_write_shutdown_refuses_the_next_send_and_then_reports_enotconn`], and never by a row that
+//!   claims to observe the latch itself.
 
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use super::async_tests::{await_events, linked, recv_operand};
+use super::op_queue::async_tests::{await_events, linked, recv_operand};
 use super::opcode_tests::{connection, escript_stdout, op, listening_port, Rig};
 use super::opt::INET_INFINITY;
-use super::wire::{ctl_ok, ctl_xerror, INET_REP_OK};
+use super::wire::{ctl_ok, INET_REP_OK};
 use super::{TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR};
 use crate::completion::InetAsyncResult;
 
@@ -113,7 +131,9 @@ const READ_GUARD: Duration = Duration::from_secs(30);
 fn render_result(reply: &[u8]) -> String {
     match reply.split_first() {
         Some((&INET_REP_OK, rest)) if rest.is_empty() => "ok".to_owned(),
-        Some((&INET_REP_OK, rest)) => render_bytes(reply, rest),
+        // `ctl_cmd` answers `{ok, Tail}` when the reply carries a payload, and `~w` of a byte tail
+        // is the integer list this renders.
+        Some((&INET_REP_OK, rest)) => render_bytes(rest),
         Some((&super::wire::INET_REP_ERROR, name)) => {
             format!("{{error,{}}}", String::from_utf8_lossy(name))
         }
@@ -122,8 +142,10 @@ fn render_result(reply: &[u8]) -> String {
     }
 }
 
-/// `~w` of a raw reply list, e.g. `[1,0,0,0,5]` — the `GETSTATUS` rows' shape.
-fn render_bytes(reply: &[u8], _rest: &[u8]) -> String {
+/// `~w` of a raw reply list, e.g. `[1,0,0,0,5]` — the `GETSTATUS` rows' shape, and the spelling the
+/// listener group's last row uses for a `[0] ++ Name` reply (`[0,101,110,…]`, the raw bytes rather
+/// than the `{error,Name}` form [`render_result`] builds from the same reply).
+fn render_bytes(reply: &[u8]) -> String {
     let inner = reply
         .iter()
         .map(u8::to_string)
@@ -167,13 +189,22 @@ fn status(port: &mut Rig) -> Vec<u8> {
     reply
 }
 
-/// Arms a passive receive and waits for its completion, returning the delivered bytes.
+/// Arms a passive receive and waits for its completion, returning the delivered bytes — asserted to
+/// be exactly the `want` the peer wrote, so a short or duplicated read cannot pass silently.
 fn receive(port: &mut Rig, want: usize) -> Vec<u8> {
     let armed = port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0));
     assert_eq!(armed[0], INET_REP_OK, "the arming reply is `[1] ++ id`");
     let events = await_events(port, 1);
     match &events[0].1 {
-        InetAsyncResult::Data(read) => read.flattened(),
+        InetAsyncResult::Data(read) => {
+            let delivered = read.flattened();
+            assert_eq!(
+                delivered.len(),
+                want,
+                "the receive delivered {delivered:?} instead of the {want} bytes the peer wrote"
+            );
+            delivered
+        }
         other => panic!("the receive produced {other:?} instead of data"),
     }
 }
@@ -226,8 +257,8 @@ fn a_read_shutdown_leaves_sending_intact() {
 // Row 2 — a write shutdown ends the connection on the first later write
 // ---------------------------------------------------------------------------
 
-/// **`shutdown(write)` is `ok` and repeatable; the first later write is `closed` and every write
-/// after it is `enotconn`.**
+/// **`shutdown(write)` is `ok` and repeatable; the first later write is `{error,closed}` and every
+/// write after it is `{error,enotconn}`.**
 ///
 /// The kernel answers that write with `EPIPE`; `tcp_send_error` (`inet_drv.c:13717`) keeps it an
 /// `EPIPE` because `TCP_ADDF_SHUTDOWN_WR_DONE` is set (`:13723`), and
@@ -244,16 +275,18 @@ fn a_write_shutdown_refuses_the_next_send_and_then_reports_enotconn() {
     assert_eq!(
         render_result(&shutdown(&mut conn.port, TCP_SHUT_WR)),
         "ok",
-        "a repeated write shutdown is `[1]`, not `enotconn`: the descriptor is still connected"
+        "a repeated write shutdown is `[1]`, not `{{error,enotconn}}`: the descriptor is still \
+         connected"
     );
     assert_eq!(
         render_result(&send(&mut conn.port, b"bb")),
-        "closed",
-        "the write after a write shutdown answers the C's `inet_reply_error_am(am_closed)`"
+        "{error,closed}",
+        "the write after a write shutdown answers the C's `inet_reply_error_am(am_closed)`, which \
+         `prim_inet:ctl_cmd` renders `{{error,closed}}`"
     );
     assert_eq!(
         render_result(&send(&mut conn.port, b"cc")),
-        "enotconn",
+        "{error,enotconn}",
         "the first failure ended the connection (`tcp_desc_close`), so the next write is `enotconn`"
     );
     assert_eq!(
@@ -268,7 +301,7 @@ fn a_write_shutdown_refuses_the_next_send_and_then_reports_enotconn() {
 // ---------------------------------------------------------------------------
 
 /// **`shutdown(read_write)` is `ok` and repeatable; both a send and a receive afterwards are
-/// `closed`.**
+/// `{error,closed}`.**
 ///
 /// Both directions really are gone, so the write fails immediately (`EPIPE`) and the receive is
 /// answered from the armed receive one-shot that failure latches
@@ -287,7 +320,11 @@ fn a_read_write_shutdown_closes_both_directions() {
         "ok",
         "and repeating it is still `[1]`"
     );
-    assert_eq!(render_result(&send(&mut conn.port, b"ff")), "closed");
+    assert_eq!(
+        render_result(&send(&mut conn.port, b"ff")),
+        "{error,closed}",
+        "the write after a `SHUT_RDWR` answers `closed`, not `{{error,enotconn}}`"
+    );
     assert_eq!(
         render_result(&conn.port.control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0))),
         "{error,closed}",
@@ -382,10 +419,11 @@ fn the_how_byte_mapping_is_the_prim_inet_one() {
 ///
 /// The same arm latches `TCP_ADDF_SHUTDOWN_WR_DONE` **before** the error reply
 /// (`inet_drv.c:12370`-`:12374`), so the flag means "a write shutdown was attempted" rather than
-/// "it worked". That half is observable only once a later write actually gets `EPIPE` — where the
-/// flag is what keeps `tcp_send_error` (`:13717`) from rewriting it to `ECONNRESET` — so it is
-/// pinned by [`a_write_shutdown_refuses_the_next_send_and_then_reports_enotconn`]'s `closed` reply
-/// instead of being faked here.
+/// "it worked". That latch is **not** directly observable from Erlang on Linux — a `send(2)` after
+/// `SHUT_WR` answers `EPIPE` on every call and `shutdown(s, 3)` refuses without shutting anything —
+/// so it is pinned indirectly, by
+/// [`a_write_shutdown_refuses_the_next_send_and_then_reports_enotconn`]'s `closed` reply, instead of
+/// being faked here.
 #[test]
 fn a_failed_write_shutdown_leaves_the_connection_usable() {
     let (mut port, mut peer) = linked();
@@ -408,17 +446,47 @@ fn a_failed_write_shutdown_leaves_the_connection_usable() {
 /// **The `{show_econnreset,true}` leg of the same contract** — the one row that does not agree with
 /// the OTP 29.1.1 oracle (see the module doc): this floor keeps `tcp_send_error`'s `EPIPE` when
 /// `TCP_ADDF_SHUTDOWN_WR_DONE` is set (`inet_drv.c:13715`-`:13718`), so a *deliberate* write
-/// shutdown is still reported as `closed` and never as the peer's reset. The option itself is
-/// accepted and read back, which is what the assertion after it pins.
+/// shutdown is still reported as `closed` and never as the peer's reset.
+///
+/// The option itself really is set — `INET_REQ_SETOPTS` accepts the five-byte
+/// `[INET_LOPT_TCP_SHOW_ECONNRESET, 1,0,0,0]` record (`inet_drv.c:6908`) — so the row below is the
+/// option in force, not an unset default: the kernel answers the write with `EPIPE`
+/// (`strace`: `writev = -1 EPIPE`), `shutdown_wr_done` is set by the successful `shutdown(write)`,
+/// and `tcp_send_error`'s rewrite to `ECONNRESET` is therefore skipped, leaving
+/// `tcp_send_or_shutdown_error`'s `err == ECONNRESET && SHOW_ECONNRESET` test (`:13615`) false and
+/// the reply `closed`.
+///
+/// **Recorded divergence (not asserted here, by design):** on OTP 29.1.1 the same three steps
+/// answer `{error,econnreset}` — deterministic across four legs — so the oracle's row is *not*
+/// this floor's and must not be compared. This floor follows the tree's C.
 #[test]
 fn a_deliberate_write_shutdown_is_never_reported_as_a_reset() {
     let mut conn = connection();
     assert_eq!(
         conn.port
-            .control(&op(1), &[]) // placeholder replaced below
-            .len(),
-        0,
-        "unreachable",
+            .control(&op(INET_REQ_SETOPTS), &show_econnreset_record(true)),
+        ctl_ok(),
+        "`{{show_econnreset,true}}` is accepted — it only changes how a *peer* reset is reported"
+    );
+    assert_eq!(
+        render_result(&shutdown(&mut conn.port, TCP_SHUT_WR)),
+        "ok",
+        "the write shutdown itself succeeds"
+    );
+    assert_eq!(
+        render_result(&send(&mut conn.port, b"dd")),
+        "{error,closed}",
+        "the deliberate shutdown leaves the later `EPIPE` as `closed`, never `{{error,econnreset}}`"
+    );
+    assert_eq!(
+        render_result(&send(&mut conn.port, b"ee")),
+        "{error,enotconn}",
+        "the first failure still ended the descriptor, exactly as the reset-free row does"
+    );
+    assert_eq!(
+        status(&mut conn.port),
+        [INET_REP_OK, 0, 0, 0, INET_STATE_CLOSED as u8],
+        "and `tcp_desc_close` left `INET_STATE_CLOSED`"
     );
 }
 
@@ -471,7 +539,7 @@ main(_) ->
     J(erlang:port_control(A3,ST,<<>>)),
     {A4,B4} = Pair(),
     J(gen_tcp:shutdown(A4,write)),
-    J(gen_tcp:send(B4,<<"hello">>)),
+    ok = gen_tcp:send(B4,<<"hello">>),
     J(Rcv(A4,5,2000)),
     J(erlang:port_control(A4,ST,<<>>)),
     {ok,L5} = gen_tcp:listen(0,[binary,{active,false},{ip,{127,0,0,1}}]),
@@ -489,7 +557,7 @@ main(_) ->
 
 /// **The whole `gen_tcp:shutdown/2` contract, row for row against the system `erl`.**
 ///
-/// Twenty-five rows, driven identically on both sides: the connected state, the read shutdown and
+/// Twenty-four rows, driven identically on both sides: the connected state, the read shutdown and
 /// its repeat, the send that still works and the bytes the peer receives, the unchanged state, the
 /// write shutdown and its repeat, the `closed` then `enotconn` ladder, the closed state, the
 /// read_write shutdown with both later operations refused, the write shutdown whose read side still
@@ -503,7 +571,7 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
 
     // ---- rows 1-6: a read shutdown leaves sending intact --------------------
     let (mut one, mut peer_one) = linked();
-    rust.push(render_bytes(&status(&mut one), &[]));
+    rust.push(render_bytes(&status(&mut one)));
     rust.push(render_result(&shutdown(&mut one, TCP_SHUT_RD)));
     rust.push(render_result(&shutdown(&mut one, TCP_SHUT_RD)));
     rust.push(render_result(&send(&mut one, b"aa")));
@@ -511,7 +579,7 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
     peer_one.set_read_timeout(Some(READ_GUARD)).expect("a guard");
     peer_one.read_exact(&mut received).expect("the peer reads");
     rust.push(render_data(&received));
-    rust.push(render_bytes(&status(&mut one), &[]));
+    rust.push(render_bytes(&status(&mut one)));
 
     // ---- rows 7-11: a write shutdown, then the send ladder -------------------
     let mut two = connection();
@@ -519,7 +587,7 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
     rust.push(render_result(&shutdown(&mut two.port, TCP_SHUT_WR)));
     rust.push(render_result(&send(&mut two.port, b"bb")));
     rust.push(render_result(&send(&mut two.port, b"cc")));
-    rust.push(render_bytes(&status(&mut two.port), &[]));
+    rust.push(render_bytes(&status(&mut two.port)));
 
     // ---- rows 12-16: a read_write shutdown closes both directions -----------
     let mut three = connection();
@@ -530,23 +598,25 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
         &op(TCP_REQ_RECV),
         &recv_operand(INET_INFINITY, 0),
     )));
-    rust.push(render_bytes(&status(&mut three.port), &[]));
+    rust.push(render_bytes(&status(&mut three.port)));
 
-    // ---- rows 17-20: the read side survives a write shutdown ----------------
+    // ---- rows 17-19: the read side survives a write shutdown ----------------
+    // The peer's own `gen_tcp:send` is a *setup* step on the oracle side (asserted `ok` there), not
+    // a row: it observes the peer, not the port under test.
     let (mut four, mut peer_four) = linked();
     rust.push(render_result(&shutdown(&mut four, TCP_SHUT_WR)));
     peer_four.write_all(b"hello").expect("the peer writes");
     peer_four.flush().expect("the peer flushes");
     rust.push(render_data(&receive(&mut four, 5)));
-    rust.push(render_bytes(&status(&mut four), &[]));
+    rust.push(render_bytes(&status(&mut four)));
 
-    // ---- rows 21-25: a listener answers enotconn for every how --------------
+    // ---- rows 20-24: a listener answers enotconn for every how --------------
     let (mut five, _port) = listening_port();
     for how in [TCP_SHUT_RD, TCP_SHUT_WR, TCP_SHUT_RDWR] {
         rust.push(render_result(&shutdown(&mut five, how)));
     }
-    rust.push(render_bytes(&status(&mut five), &[]));
-    rust.push(render_bytes(&shutdown(&mut five, TCP_SHUT_RD), &[]));
+    rust.push(render_bytes(&status(&mut five)));
+    rust.push(render_bytes(&shutdown(&mut five, TCP_SHUT_RD)));
 
     // The rows the C's arms and the OTP 29.1.1 measurement give (the `~w` spellings the probe
     // prints).
@@ -576,15 +646,15 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
         "[1,0,0,0,9]".to_owned(),              // still listening
         "[0,101,110,111,116,99,111,110,110]".to_owned(), // `[0]"enotconn"`, the raw reply
     ];
-    // `rust` carries one row fewer for the listener group: the raw `[0]enotconn` row above is the
-    // same reply `render_result` spells `{error,enotconn}`, so both spellings are asserted from the
-    // one call. Splice it in where the probe emits it.
-    let last = rust.pop().expect("the raw listener reply row");
-    assert_eq!(last, render_bytes(&[0, 101, 110, 111, 116, 99, 111, 110, 110], &[]));
-    rust.push("{error,enotconn}".to_owned()); // row 24: the raw reply, rendered as a result
-    rust.push(last); // row 25: …and as the raw list
-
+    // Both sides push the same 24 rows in the same order, so this is a straight comparison: the
+    // listener group's last row is the *raw* `[0] ++ Name` reply (`[0,101,110,…]`) and the three
+    // before it are the same reply rendered the way `prim_inet` spells it (`{error,enotconn}`).
     assert_eq!(rust, expected, "this floor's `gen_tcp:shutdown/2` rows");
+    assert_eq!(
+        rust.len(),
+        24,
+        "the compared table is the 24 rows the probe prints"
+    );
 
     let Some(dump) = escript_stdout("shutdown_contract", ORACLE_PROBE, &[]) else {
         eprintln!("SKIP: no `escript` on PATH — skipping the shutdown-contract oracle cross-check");
@@ -611,7 +681,6 @@ fn the_shutdown_contract_agrees_with_the_erl_oracle() {
 
 /// The option record that turns `{show_econnreset, …}` on — kept beside the divergence note so the
 /// next reader can reproduce the disagreement rather than rediscover it.
-#[allow(dead_code)]
 fn show_econnreset_record(on: bool) -> [u8; 5] {
     let [a, b, c, d] = (on as i32).to_be_bytes();
     [SHOW_ECONNRESET, a, b, c, d]

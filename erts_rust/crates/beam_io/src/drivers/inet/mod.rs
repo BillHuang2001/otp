@@ -2592,6 +2592,9 @@ mod stat_tests;
 #[path = "tcp_shutdown_tests.rs"]
 mod tcp_shutdown_tests;
 #[cfg(test)]
+#[path = "shutdown_contract_tests.rs"]
+mod shutdown_contract_tests;
+#[cfg(test)]
 mod tests;
 // The **write-side** framing pin: the `{packet, 1|2|4}` length header the C prepends in
 // `tcp_sendv`/`tcp_send` (`inet_drv.c:13744`-`:13769`, `:13861`-`:13885`) on the
