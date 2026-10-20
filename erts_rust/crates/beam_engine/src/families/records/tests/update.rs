@@ -24,9 +24,13 @@
 //! Both lower to `i_update_native_record` (`emu/ops.tab:1653`/`:1689`): the
 //! instance is rebuilt with the listed fields replaced, every update value is
 //! read before `dst` is written, and the `Id`/`Hint` operands are discarded. The
-//! create form of `put_record` (`Src = nil`) resolves the definition out of the
-//! running module's own `Recs` table; an id naming **another** module's record (or
-//! a name the module does not define) stays a documented typed `unsupported`.
+//! create form of `put_record` (`Src = nil`) resolves a bare-**atom** `Id` out of the
+//! running module's own `Recs` table (the local opcode, `emu/instrs.tab:1358` — no
+//! export requirement) and a **`{Module,Name}`** `Id` through the host's record table
+//! via `ExecutionContext::foreign_record_definition` (`erl_record.c:356-410`, which
+//! requires `is_exported`, `:401`). A name the running module does not define is a
+//! typed `unsupported`; so is a `{Module,Name}` naming a module the host cannot
+//! answer for (the seam's `Ok(None)`) — the only remaining `unsupported` case there.
 //!
 //! The create form's semantics get the full structural coverage (defaults,
 //! overrides, `badfield`/`novalue`) in the integration suite `tests/records.rs`,
