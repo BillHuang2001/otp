@@ -3111,7 +3111,8 @@ const HEAP_GROWTH_ITERATION_WORDS: usize = 401;
 /// measured peak nursery capacity.
 ///
 /// The capacity is a *measurement*, not a constant: `beam_gc`'s `HeapPolicy::young_after_collection`
-/// **keeps** any capacity inside `[4/3, YOUNG_SHRINK_FACTOR]` x `young_target_words(live)`, so
+/// **keeps** any capacity inside `[young_minor_target_words(live), YOUNG_SHRINK_FACTOR]` x that
+/// live-set-derived target and lands on the target outside it, so
 /// what a run settles on is whatever the growth seam installed for this workload's tiny live set.
 /// What the cadence follows from is the arithmetic of that capacity: an iteration allocates
 /// [`HEAP_GROWTH_ITERATION_WORDS`] words and the words a collection keeps alive here (the loop
@@ -3227,7 +3228,7 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 /// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
 /// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
 /// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
-/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 2 and
+/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 1 and
 /// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress
