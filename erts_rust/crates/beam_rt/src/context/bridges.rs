@@ -706,9 +706,11 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
 /// `Recs` chunk at load time — `erts_record_put`, `erl_record.c:173-178`). The definitions
 /// live in the [`Module`]'s [`RecordDefinition`](beam_loader::RecordDefinition) list, whose
 /// record/field names are atoms of the **module's own** atom table — not of this call's
-/// `BifContext` table. This bridge therefore resolves the module by name in the code server
-/// and **name-resolves** each definition through that table, so the BIF never has to know
-/// the loader's layout (see `beam_bifs::RecordSource`).
+/// `BifContext` table. This bridge therefore resolves the module and its record through the
+/// code server's shared lookup ([`super::records::loaded_record`] — one function, so the two
+/// record-table consumers cannot drift) and **name-resolves** each definition through the
+/// module's table, so the BIF never has to know the loader's layout (see
+/// `beam_bifs::RecordSource`).
 ///
 /// A module that is not loaded, or that defines no such record, answers `Ok(None)` — the
 /// BIF then raises the oracle's plain `badarg` (`records_get_definition_2`,
@@ -730,12 +732,10 @@ impl RecordSource for RecordBridge<'_> {
         module: &str,
         name: &str,
     ) -> Result<Option<RecordDefinitionView>> {
-        let Some(module) = self.code_server.module(module) else {
-            // Not loaded (or not a module name at all): no definition exists, which the
-            // BIF reports as the oracle's `badarg`.
-            return Ok(None);
-        };
-        let Some(record) = module.record_by_name(name) else {
+        let Some((module, record)) = super::records::loaded_record(self.code_server, module, name)
+        else {
+            // Not loaded (or not a module name at all) / no such record: no definition
+            // exists, which the BIF reports as the oracle's `badarg`.
             return Ok(None);
         };
         let mut fields = Vec::with_capacity(record.fields.len());
