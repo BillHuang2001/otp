@@ -114,7 +114,8 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// (`src/runner/tests/boundary_cost.rs`'s `MEASURED` table holds the counts, `src/runner/MEASURED.md`
 /// the measurement record).
 /// What the door *adds* to a run's totals is not measurable here: a door-ON/OFF delta needs a
-/// door-disabled build, so none is claimed.///
+/// door-disabled build, so none is claimed.
+///
 /// **Not `1/1`.** `Process::grow_nursery` extends the current space in place, so a space one word
 /// short of full refills immediately and satisfies an exact `used == capacity` test on consecutive
 /// boundaries; chained that way the door would amplify majors instead of rationing them. `7/8`
@@ -127,12 +128,14 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// one collection debt) sets that shape's cadence: at N = 2 000 it measures **3 468 collections and
 /// 169 majors** over 2 001 calls (1.7331 / 0.0845 per iteration) on one young space of **1 220**
 /// words and a mature region of **4 185** words — fixed points of `HeapPolicy`'s live-set rules,
-/// never quantities that follow N.///
+/// never quantities that follow N.
+///
 /// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
 /// would then be collected only through the debt arm, and if its growth seam retired no space it
 /// would climb again. Neither measured shape does: the churn shape's checks are pinned above at one
 /// firing in seven to nine, and the no-heap-admission shape (`reds_boundary`) reports a debt at
-/// every check (`src/runner/tests/reds_door.rs`).const BOUNDARY_OCCUPANCY_NUM: usize = 7;
+/// every check (`src/runner/tests/reds_door.rs`).
+const BOUNDARY_OCCUPANCY_NUM: usize = 7;
 /// The occupancy watermark's denominator (see [`BOUNDARY_OCCUPANCY_NUM`]).
 const BOUNDARY_OCCUPANCY_DEN: usize = 8;
 
