@@ -108,7 +108,7 @@ Every other `ets` contract — the `select_replace/2` static key-preservation ch
 ## Routing Table
 - `../CONTEXT.md` -> the crate root: roster census + pins, the frozen `BifRegistry`/`BifContext` API surface, cross-crate constraints, typed capability gaps, handoffs
 - `ets/` (**`./ets/CONTEXT.md`**) -> the `ets:*` bridge, the match-spec engine seams and every `ets` typed gap
-- `runtime/` (**`./runtime/CONTEXT.md`**) -> the 209 runtime-coupled keys — `erlang` 76, `erts_internal` 56, `erts_debug` 20, `debugger` 13, `other` 28 (`memory`/`atomics`/`ddll` alongside), of which 52 are served for real and **141** forward to `RuntimeHooks` (the `RUNTIME_HOOKS_BIFS` roster)
+- `runtime/` (**`./runtime/CONTEXT.md`**) -> the 209 runtime-coupled keys — `erlang` 76, `erts_internal` 56, `erts_debug` 20, `debugger` 13, `other` 28 (`memory`/`atomics`/`ddll` alongside), of which 53 are served for real and **140** forward to `RuntimeHooks` (the `RUNTIME_HOOKS_BIFS` roster)
 - `re/` (**`./re/CONTEXT.md`**) -> the self-contained `re:*` engine
 - `packet/` (**`./packet/CONTEXT.md`**) -> the `decode_packet/3` families
 - `unicode/` (**`./unicode/CONTEXT.md`**, sub-node `grapheme/`) -> the unicode conversions + grapheme port
@@ -116,5 +116,5 @@ Every other `ets` contract — the `select_replace/2` static key-preservation ch
 - `../tests/` -> the integration/pin suites named in `../CONTEXT.md`'s Test Strategy
 
 ## See Also
-- `../CONTEXT.md` -> the roster census (556 declared = 371 unconditional in-crate + 185 seam-backed; the seam union is the 14 `hook_sets.rs` tables = 219 raw / 215 deduped / 30 undeclared, of which 141 are `RuntimeHooks` forwarders and `PORT_HOOK_BIFS` 8 — 4 declared).
+- `../CONTEXT.md` -> the roster census (556 declared = 372 unconditional in-crate + 184 seam-backed; the seam union is the 14 `hook_sets.rs` tables = 218 raw / 214 deduped / 30 undeclared, of which 140 are `RuntimeHooks` forwarders and `PORT_HOOK_BIFS` 8 — 4 declared).
 - `../hook_sets.rs` -> the one home of every seam-consumer key set (+ the `needs_*` predicates a host gates through).
