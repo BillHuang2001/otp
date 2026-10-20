@@ -248,13 +248,16 @@ impl Collector {
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.minor_collections += 1;
-        // The nursery is empty again: size it for the next round from what the collection
-        // *left in it* — for a minor that is exactly the words it promoted
-        // (`GcStats::words_copied`), i.e. the C's minor-time young-heap resize fed with the
-        // surviving usage (`erl_gc.c:1493`). That is a quantity the round measured exactly,
-        // and (unlike a fullsweep, which relocates everything) a minor really does leave a
-        // live young set behind, so it is the minor's own sizing input.
-        self.nursery.collapse(&self.policy, stats.words_copied)?;
+        // The nursery is empty again: size it from the **whole-heap live set** the collection
+        // kept (`HeapPolicy::young_after_collection`). A minor promotes every live young word
+        // into the mature space, so the mature space's occupancy *is* the whole-heap live set
+        // the round measured — the quantity the nursery amortizes its copies against, and the
+        // one quantity that does not follow the nursery's own capacity. It over-estimates by the
+        // mature garbage the minors since the last fullsweep promoted, which is why this rule
+        // only ever keeps or shrinks: the growth decision belongs to the fullsweep, which
+        // measures the live set exactly.
+        self.nursery
+            .collapse(&self.policy, self.mature.used_words())?;
         Ok(stats)
     }
 

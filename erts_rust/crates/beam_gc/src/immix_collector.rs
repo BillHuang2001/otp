@@ -611,9 +611,11 @@ impl GenImmixCollector {
         // a minor's reclamation.
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
         self.minor_since_major += 1;
-        // What the minor left in the nursery is exactly what it promoted (see
-        // `HeapPolicy::young_after_collection`) — the live young set it measured.
-        self.nursery.collapse(&self.policy, stats.words_copied)?;
+        // Size the nursery from the **whole-heap live set** the promotion left in the mature
+        // region — the same input the copying collector's minor feeds
+        // (`HeapPolicy::young_after_collection`; a minor keeps or shrinks, the fullsweep grows).
+        self.nursery
+            .collapse(&self.policy, self.mature.used_words())?;
         Ok(PromoteOutcome::Done(stats))
     }
     /// Reclaims the mature generation in place, then promotes the nursery into it.
