@@ -655,7 +655,38 @@ SMP pool:
     process (two peer-minted + one local spelling) give exactly three signals, pairwise distinct in
     both destination and reference, each in the spelling it was recorded in. Deterministic — fixed
     terms on the test's own heaps, no sleeps / wall-clock bounds / oracle.
-
+51. `remote_reason_copy.rs` (4 tests) — the **wire reason is materialised on the recipient** by the
+    two inbound receipt builders (`src/ptab.rs`'s `enqueue_remote_exit_message` /
+    `enqueue_remote_down_message`, both `src: Option<&OffHeapTable>`). Method: each test builds a
+    **boxed** reason (`{boom,[1,2,3]}` / `{shutdown,...}` / `{clobber,...}`) on a **separate**
+    `beam_alloc::Heap` simulating the host's per-drain dispatch arena, calls the public receipt entry
+    point (`apply_remote_exit_signal` / `remote_monitor_down`), then **resets and rewrites the arena**
+    with a longer tuple before asserting — so every assertion reads only the recipient's heap. Cases:
+    (1) `a_trapping_link_exit_copies_the_wire_reason_onto_the_receivers_heap` — the queued
+    `{'EXIT', From, Reason}`'s `Reason` word is **not** the arena word (pointer non-aliasing) and walks
+    as a 2-tuple / atom head / 3-element small-int list after the arena is gone; (2)
+    `a_remote_monitor_down_copies_the_wire_reason_onto_the_watchers_heap` — the same for the
+    `{'DOWN', Ref, process, RemotePid, Reason}` of a recorded outgoing remote monitor; (3)
+    `an_exempt_receiver_gets_the_boxed_wire_reason_in_the_messages_heap_fragment` — a
+    `set_relocation_exempt(true)` recipient takes the fragment route (the message's `Fragments` holds
+    the reason, the nursery is untouched) and never collects; (4)
+    `a_gate_declined_watcher_gets_the_boxed_wire_reason_in_the_messages_heap_fragment` — the host
+    `CollectionGate` decline path, same evidence. Deterministic, no sleeps, no `erl` oracle (the
+    oracle cannot observe a Rust-side heap word).
+52. `node_down.rs` (4 tests) — `ProcessTable::node_down`'s **`noconnection` semantics and record
+    purge**, through the public API. (1) `a_trapping_link_partner_traps_the_node_down_exit` — a
+    trapping peer survives with `{'EXIT', RemotePid, noconnection}` at the mailbox head (external pid
+    in the body, node atom as the message `from`); (2)
+    `a_non_trapping_link_partner_dies_with_exactly_noconnection` — the observed death reason is the
+    bare atom `noconnection`, never `killed` (the link family); (3)
+    `a_remote_monitor_down_is_delivered_and_wakes_a_waiting_watcher` — `{'DOWN', Ref, process,
+    RemotePid, noconnection}` is delivered **and** a `Waiting` watcher lands in `drain_woken`; (4)
+    `a_node_down_purges_only_the_lost_nodes_records_in_both_directions` — the lost node's incoming
+    `remote_watchers` record is gone while a record from **another** node survives, and the
+    `remote_links`/`remote_monitors` records naming the lost node are gone while unrelated ones
+    survive. **No `erl` oracle probe is possible** for any of these: they need a second live node (a
+    real `net_kernel` connection to break), so the C ground truth is cited instead
+    (`dist.c:304-324`/`:341-345`/`:379-423`, `erl_proc_sig_queue.c:2553-2576`).
 ## Constraints- **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
   `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is
@@ -673,8 +704,8 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **654 passed, 0 failed, 1 ignored** (215
-  in-module unit tests + 438 across the 50 integration test targets under `tests/` — one per top-level
+  `../../../tools/differential/` harness, not here. Current: **662 passed, 0 failed, 1 ignored** (215
+  in-module unit tests + 446 across the 52 integration test targets under `tests/` — one per top-level
   `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
   of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
   failure mode in `preemption.rs`).
@@ -740,6 +771,12 @@ SMP pool:
 - `remote_inbound.rs` → the inbound (receipt) half of the same families: the route-free `ProcessTable`
   entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`
 - `remote_monitor_exit.rs` → the **outbound** mirror of `remote_inbound.rs`: the
+- `remote_reason_copy.rs` → the **wire-reason copy** of the two inbound receipt builders: a boxed
+  reason built on a simulated decoder arena, embedded, then the arena recycled — asserted on the
+  recipient's heap (or the message's `Fragments`), for the trap, the monitor-DOWN and both
+  heap-fragment routes.
+- `node_down.rs` → `node_down`'s `noconnection` semantics (trapped, fatal, monitor-DOWN + wake) and
+  its three-direction record purge. No `erl` oracle probe is possible (needs a second live node).
   `DistSignal::MonitorExit` (`DOP_MONITOR_P_EXIT`, watched-first, `dist.c:1497-1519`) a watched local
   process's death routes per recorded `RemoteWatcher` — the reference in the spelling the record
   holds, the death's own reason term carried, one signal per record, in record order, with the

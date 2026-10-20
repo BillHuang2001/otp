@@ -60,6 +60,12 @@
 //! (external-pid) or **port** signal does not: it would carry no `trap_exit` policy decision
 //! to defer, so `node_down`/`port_closed` materialise it straight into the mailbox.
 //!
+//! A **wire**-sourced reason (an inbound `DOP_EXIT`/`DOP_EXIT2`/`DOP_MONITOR_P_EXIT` reason, which
+//! the host decoded onto a transient arena it recycles) is never embedded verbatim: the two remote
+//! builders copy it onto the recipient's own heap — or, when that heap refuses, into the message's
+//! [`HeapFragment`] — from an **empty** source off-heap table (a wire payload carries no off-heap
+//! handles), so the queued `{'EXIT', …}`/`{'DOWN', …}` never points into recycled memory.
+//!
 //! Every signal-builder path handles a full receiver heap exactly as
 //! [`Process::deliver`](crate::process::Process::deliver) does: an **ordinary** receiver's nursery
 //! is collected and grown **on demand** to cover the refused request (through
@@ -3577,6 +3583,12 @@ impl ProcessTable {
     /// decision to defer). The message's **`from`** is the remote **node atom** (an immediate,
     /// as the C stores it) while the external pid stays in the message *body*.
     ///
+    /// `reason` is a term a host decoded off the wire, i.e. one that lives on its **transient**
+    /// dispatch arena: the builder **copies it onto `to`'s own heap** (or into the message's heap
+    /// fragment, when that heap refuses) before embedding it, from an **empty** source off-heap
+    /// table — a wire payload carries no off-heap handles, which is the assumption `beam_rt`'s own
+    /// inbound message path makes. An **immediate** reason is embedded verbatim.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when `to` is not a live local process; propagates the
@@ -3606,7 +3618,12 @@ impl ProcessTable {
         }
         match exit_policy(reason, trapping, family, &self.atoms) {
             ExitPolicy::Ignore => Ok(()),
-            ExitPolicy::Trap => self.enqueue_remote_exit_message(to, from, reason),
+            ExitPolicy::Trap => {
+                // The wire reason's heap: an empty off-heap table (see the method docs). One per
+                // call — a `&mut` table is never shared across a recipient sweep.
+                let wire = OffHeapTable::new();
+                self.enqueue_remote_exit_message(to, from, reason, Some(&wire))
+            }
             ExitPolicy::Terminate(peer_reason) => self.terminate(to, peer_reason),
         }
     }
@@ -3860,6 +3877,11 @@ impl ProcessTable {
     /// the watcher's monitor tree by reference and drops the signal when the lookup misses
     /// (`erl_proc_sig_queue.c:6355-6396`).
     ///
+    /// `reason` came off the wire (the host's transient dispatch arena), so the builder copies it
+    /// onto the watcher's own heap — or into the message's heap fragment — before embedding it,
+    /// from an **empty** source off-heap table; an immediate is embedded verbatim (see
+    /// [`ProcessTable::apply_remote_exit_signal`]).
+    ///
     /// The wire's `watched` may be a registered **name** (`dist.c:2722` accepts an external pid
     /// *or* an atom); resolving it is `beam_rt`'s job and the outgoing record it must match holds
     /// a [`RemotePid`], so this takes the resolved `RemotePid`. A name-targeted DOWN (the C's
@@ -3884,7 +3906,9 @@ impl ProcessTable {
             // No outgoing record for that reference: the C drops the DOWN (see the method docs).
             return Ok(());
         }
-        self.enqueue_remote_down_message(watcher, reference, watched, reason)
+        // The wire reason's heap: an empty off-heap table (see the method docs).
+        let wire = OffHeapTable::new();
+        self.enqueue_remote_down_message(watcher, reference, watched, reason, Some(&wire))
     }
 
     /// Applies an incoming `DOP_GROUP_LEADER` — `{DOP_GROUP_LEADER, From(leader),
@@ -3946,11 +3970,22 @@ impl ProcessTable {
     ///    ([`ExitFamily::Linked`], the C's `ERTS_SIG_Q_OP_EXIT_LINKED`): `Ignore` does
     ///    nothing, `Trap` queues `{'EXIT', RemotePid, Reason}`, anything else terminates the
     ///    peer (with the usual cascading propagation);
-    /// 3. every record mentioning `node` is purged.
+    /// 3. every record mentioning `node` is purged — the outgoing links (`remote_links`), the
+    ///    outgoing monitors (`remote_monitors`) **and the incoming watcher records**
+    ///    (`remote_watchers`): a monitor a process on the dead node holds on a local process can
+    ///    never be resolved (its `DOP_MONITOR_P_EXIT` cannot arrive) nor demonitored (its
+    ///    `DOP_DEMONITOR_P` cannot arrive either), so keeping the record would leak it forever and
+    ///    a re-connect must not resurrect it. Dropping is the only sound action — a DOWN goes to
+    ///    the watcher, and that watcher's node is gone. The records of **other** nodes are
+    ///    untouched. This mirrors the C's connection-down cleanup, which walks the dead node's own
+    ///    `ErtsMonLnkDist` tables with `foreach_delete` iterators and deletes every entry in both
+    ///    directions (`dist.c:379-423`, `ERTS_CML_CLEANUP_STATE_LINKS`/`_MONITORS`/
+    ///    `_ONAME_MONITORS`).
     ///
-    /// `reason` is the node-down reason (an immediate such as `noconnection`) and is embedded
-    /// verbatim — there is no source heap to copy it from, so the caller must pass a term that
-    /// does not live in a heap that may be recycled underneath this call.
+    /// `reason` is the node-down reason (an immediate such as `noconnection`, the C's
+    /// `am_noconnection`, `erl_proc_sig_queue.c:2571-2573`) and is embedded verbatim — both
+    /// builders are called with no source heap, so the caller must pass a term that does not live
+    /// in a heap that may be recycled underneath this call.
     ///
     /// # Errors
     ///
@@ -3969,7 +4004,7 @@ impl ProcessTable {
             })
             .collect();
         for (watcher, monitor) in down {
-            self.enqueue_remote_down_message(watcher, monitor.reference, monitor.remote, reason)?;
+            self.enqueue_remote_down_message(watcher, monitor.reference, monitor.remote, reason, None)?;
         }
 
         // 2. Links: snapshot the (peer, remote) pairs linked to `node`.
@@ -3991,12 +4026,14 @@ impl ProcessTable {
             let trapping = process.is_trapping_exit();
             match exit_policy(reason, trapping, ExitFamily::Linked, &self.atoms) {
                 ExitPolicy::Ignore => {}
-                ExitPolicy::Trap => self.enqueue_remote_exit_message(peer, remote, reason)?,
+                ExitPolicy::Trap => self.enqueue_remote_exit_message(peer, remote, reason, None)?,
                 ExitPolicy::Terminate(peer_reason) => self.terminate(peer, peer_reason)?,
             }
         }
 
-        // 3. Purge every record mentioning `node`: the relationships are gone with it.
+        // 3. Purge every record mentioning `node`: the relationships are gone with it. Both
+        // directions go — the records *to* the dead node (already fired above) and the records
+        // *from* it, which nothing can ever resolve or cancel.
         for partners in self.remote_links.values_mut() {
             partners.retain(|remote| remote.node() != node);
         }
@@ -4006,6 +4043,11 @@ impl ProcessTable {
         }
         self.remote_monitors
             .retain(|_, monitors| !monitors.is_empty());
+        for watchers in self.remote_watchers.values_mut() {
+            watchers.retain(|watcher| watcher.watcher.node() != node);
+        }
+        self.remote_watchers
+            .retain(|_, watchers| !watchers.is_empty());
         Ok(())
     }
 
@@ -4017,6 +4059,17 @@ impl ProcessTable {
     /// (`erl_proc_sig_queue.c:4984`/`:5014`); the external-pid target stays in the message
     /// **body**. `from` is not a GC root, so it may never hold the heap-materialised external pid.
     ///
+    /// `src` describes the heap `reason` lives in: `Some` for a reason decoded off the wire — which
+    /// lives on the host's **transient** per-drain dispatch arena and may be recycled as soon as the
+    /// call returns — and `None` for a reason that is already an immediate (`node_down`'s
+    /// `noconnection`) or already on the watcher's own heap. A non-immediate reason with a source
+    /// table is **materialised on the watcher's own heap** ([`copy_reason_onto`]) *before* the
+    /// message embeds it, so the queued `{'DOWN', …}` never points into memory the host is about to
+    /// reuse; if that heap refuses the copy (a declined collection, or a genuine ceiling) the whole
+    /// message is built into a [`HeapFragment`] instead ([`enqueue_fragment_payload`], whose copy
+    /// resolves the reason's graph through the same source table) — the receiver is never collected
+    /// or grown on demand when the gate covers it.
+    ///
     /// An unknown watcher is skipped (it died earlier in the same sweep).
     fn enqueue_remote_down_message(
         &mut self,
@@ -4024,19 +4077,46 @@ impl ProcessTable {
         reference: MonitorRef,
         remote: RemotePid,
         reason: Eterm,
+        src: Option<&OffHeapTable>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let decline = self.declines_signal_collection(watcher);
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, remote.node(), reason, decline, |heap, reason| {
+        // One closure for **both** routes (the on-heap build and the fragment build). A remote
+        // monitor carries no user tag (see `monitor_term_with_tag`), so the DOWN keeps the default
+        // `'DOWN'` head atom; the closure materialises the remote pid into the message *body*.
+        let mut build = |heap: &mut Heap, reason: Eterm| -> Result<Eterm> {
             let reference_term = reference.to_eterm(heap)?;
-            // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
-            // DOWN keeps the default `'DOWN'` head atom; the closure materialises the remote
-            // pid into the message *body*.
             build_down_message_remote(heap, &atoms, None, reference_term, remote, reason)
-        })?;
+        };
+        // `None`: the payload is already fragment-resident, so only the wake below is left.
+        let on_heap: Option<Eterm> = match src {
+            // An immediate carries no heap pointer, so it is position-independent already.
+            Some(table) if !is_immediate(reason) => {
+                match copy_reason_onto(recipient, reason, Some(table), decline) {
+                    Ok(copied) => Some(copied),
+                    Err(BeamError::Alloc(failure))
+                        if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                    {
+                        enqueue_fragment_payload(
+                            recipient,
+                            remote.node(),
+                            reason,
+                            Some(table),
+                            &mut build,
+                        )?;
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => Some(reason),
+        };
+        if let Some(reason) = on_heap {
+            build_signal_message(recipient, remote.node(), reason, decline, &mut build)?;
+        }
         let woke = recipient.wake();
         if woke {
             self.ready.push(watcher);
@@ -4051,22 +4131,55 @@ impl ProcessTable {
     /// stays in the message **body**. `from` is not a GC root, so it may never hold the
     /// heap-materialised external pid.
     ///
+    /// `src` describes the heap `reason` lives in — see
+    /// [`ProcessTable::enqueue_remote_down_message`] for the full rule: `Some` for a reason decoded
+    /// off the wire (the host's transient dispatch arena), `None` for an immediate or a reason
+    /// already on the peer's own heap.
+    ///
     /// An unknown peer is skipped (it died earlier in the same sweep).
     fn enqueue_remote_exit_message(
         &mut self,
         peer: ProcessId,
         remote: RemotePid,
         reason: Eterm,
+        src: Option<&OffHeapTable>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let decline = self.declines_signal_collection(peer);
         let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
             return Ok(());
         };
-        build_signal_message(recipient, remote.node(), reason, decline, |heap, reason| {
+        // One closure for **both** routes (the on-heap build and the fragment build).
+        let mut build = |heap: &mut Heap, reason: Eterm| -> Result<Eterm> {
             let from = remote.to_eterm(heap)?;
             build_exit_message_term(heap, &atoms, from, reason)
-        })?;
+        };
+        // `None`: the payload is already fragment-resident, so only the wake below is left.
+        let on_heap: Option<Eterm> = match src {
+            // An immediate carries no heap pointer, so it is position-independent already.
+            Some(table) if !is_immediate(reason) => {
+                match copy_reason_onto(recipient, reason, Some(table), decline) {
+                    Ok(copied) => Some(copied),
+                    Err(BeamError::Alloc(failure))
+                        if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                    {
+                        enqueue_fragment_payload(
+                            recipient,
+                            remote.node(),
+                            reason,
+                            Some(table),
+                            &mut build,
+                        )?;
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => Some(reason),
+        };
+        if let Some(reason) = on_heap {
+            build_signal_message(recipient, remote.node(), reason, decline, &mut build)?;
+        }
         let woke = recipient.wake();
         if woke {
             self.ready.push(peer);
