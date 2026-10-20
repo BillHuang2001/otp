@@ -48,6 +48,9 @@
 //! * [`elements`] — `get_record_elements` / `get_record_elements_id`,
 //! * [`update`] — `put_record` (its update path and the create form's typed
 //!   unsupported id cases) and `update_record_id`,
+//! * [`foreign_create`] — the create form over the
+//!   [`foreign_record_definition`](crate::context::ExecutionContext::foreign_record_definition)
+//!   seam (a definition that is not the running module's own),
 //! * [`access`] — `is_record_accessible`,
 //! * [`field`] — `get_record_field`,
 //! * [`rooted`] — the two build paths driven under the mock **moving** collector
@@ -67,6 +70,7 @@ use crate::context::MinimalContext;
 mod access;
 mod elements;
 mod field;
+mod foreign_create;
 mod native;
 mod rooted;
 mod update;

@@ -788,6 +788,28 @@ fn name_str<'a>(module: &'a Module, name: Atom) -> &'a str {
     module.atom_name(name).expect("the atom is interned")
 }
 
+/// Build the two create-form entries over the own record `mixed` and the pair to pass
+/// the pair entry as its `Id`: (the atom-`Id` entry, the pair-`Id` entry, the
+/// `{Module,Name}` id term). Both entries write into `X(0)` with `b = 7` (the pair
+/// record reads its `Id` from `X(0)` and so also writes there — the destination is
+/// read before it is written).
+fn both_id_shapes(module: &mut Module, ctx: &mut MinimalContext) -> (Label, Label, Eterm) {
+    let mixed = module.atom_table.intern("mixed");
+    let b = module.atom_table.intern("b");
+    let updates = vec![(Operand::Atom(b), Operand::Integer(7))];
+    let atom_entry = append_create(
+        module,
+        Operand::Atom(mixed),
+        Operand::X(0),
+        updates.clone(),
+        None,
+    );
+    let pair_entry = append_create(module, Operand::X(0), Operand::X(0), updates, None);
+    let pair = terms::make_tuple(ctx, &[make_atom(module.name), make_atom(mixed)])
+        .expect("build the {Module,Name} id");
+    (atom_entry, pair_entry, pair)
+}
+
 /// The `(class, reason)` of a run that must have raised.
 fn raised(machine: &Machine, result: &Result<Eterm, BeamError>) -> (ExceptionClass, Eterm) {
     assert!(
@@ -797,14 +819,33 @@ fn raised(machine: &Machine, result: &Result<Eterm, BeamError>) -> (ExceptionCla
     machine.pending_exception().expect("a recorded exception")
 }
 
-/// Intern the atoms a create-form `badfield`/`novalue` raise needs to be *named*.
+/// Intern the atoms a create-form `badfield`/`novalue`/**`badrecord`** raise needs to
+/// be *named*.
 ///
 /// The fixture's atom table has none of them, so a module that does not intern them
 /// can only report the typed `unsupported` (asserted below) — the same convention
-/// the maps family's `{badmap,_}`/`{badkey,_}` reasons follow.
+/// the maps family's `{badmap,_}`/`{badkey,_}` reasons follow. `badrecord` is the
+/// generic `{Module,Name}` create form's tag (`erl_record.c:407-409`); `error` is the
+/// class atom the failure path sets.
 fn intern_raise_atoms(module: &mut Module) {
-    for name in ["badfield", "novalue", "error"] {
+    for name in ["badfield", "novalue", "badrecord", "error"] {
         module.atom_table.intern(name);
+    }
+}
+
+/// Set the `is_exported` flag of the module's own record `name`
+/// (`beam_loader::Module::records` is public, so the loader's decoded `Recs` table can
+/// be edited in place — no new fixture `.beam` is needed).
+///
+/// The generic `{Module,Name}` create form gates on this flag
+/// (`defp->is_exported == am_true`, `erl_record.c:401`) while the atom-`Id` local form
+/// ignores it (`:254-354`), so a test can pin both halves of the contrast over the
+/// same inputs.
+fn set_exported(module: &mut Module, name: &str, exported: bool) {
+    let atom = module.atom_table.intern(name);
+    match module.records.iter_mut().find(|record| record.name == atom) {
+        Some(definition) => definition.is_exported = exported,
+        None => panic!("the fixture defines the record {name:?}"),
     }
 }
 
@@ -976,40 +1017,84 @@ fn create_branches_to_a_live_fail_label_and_leaves_dst_untouched() {
 }
 
 #[test]
-fn create_accepts_both_the_atom_and_the_module_name_pair_id() {
-    // The two id shapes the C resolves (`i_create_local_native_record` for the atom
-    // form and the generic `i_create_native_record` when the module is the running
-    // one) must build the *same* record. The pair rides in X(0), which the create
-    // form reads (the id) before it writes it (the destination).
+fn create_accepts_both_id_shapes_for_an_exported_own_record() {
+    // With the own record **exported**, both `Id` shapes C resolves build the *same*
+    // record: the atom form is the local `i_create_local_native_record`
+    // (`emu/instrs.tab:1358`, `erl_record.c:254-354`, no export requirement), the
+    // `{Module,Name}` form the generic `i_create_native_record` (`:1373`, `:356-410`),
+    // whose one extra gate `defp->is_exported == am_true` (`:401`) an exported definition
+    // passes. `records_fixture` defines `mixed` without `-export_record`, so the flag is
+    // flipped through the loader's public `Recs` table: this test and its non-exported
+    // twin below then contrast over the *same* inputs.
+    //
+    // No `erlc`/`erl` oracle exists (the installed toolchain never emits the native-record
+    // family — `erl_features:configurable()` = `[compr_assign,maybe_expr]`, so a `-record`
+    // update lowers to `update_record`; see `src/families/records/tests/foreign_create.rs`
+    // and `tests/gaps.rs`): every expectation is pinned from the C.
     let mut module = load(RECORDS_FIXTURE_BEAM);
-    intern_raise_atoms(&mut module);
+    set_exported(&mut module, "mixed", true);
     let mixed = module.atom_table.intern("mixed");
     let b = module.atom_table.intern("b");
-
-    let updates = vec![(Operand::Atom(b), Operand::Integer(7))];
-    let atom_entry = append_create(
-        &mut module,
-        Operand::Atom(mixed),
-        Operand::X(0),
-        updates.clone(),
-        None,
-    );
-    let pair_entry = append_create(&mut module, Operand::X(0), Operand::X(0), updates, None);
-
     let mut ctx = MinimalContext::new();
-    let (from_atom, _) = run_create(&module, atom_entry, &[], &mut ctx);
-    let from_atom = from_atom.expect("the atom id builds the record");
+    let (atom_entry, pair_entry, pair) = both_id_shapes(&mut module, &mut ctx);
 
-    let pair = terms::make_tuple(&mut ctx, &[make_atom(module.name), make_atom(mixed)])
-        .expect("build the {Module,Name} id");
+    let (from_atom, _) = run_create(&module, atom_entry, &[], &mut ctx);
+    let from_atom = from_atom.expect("the atom id builds the exported record");
     let (from_pair, _) = run_create(&module, pair_entry, &[pair], &mut ctx);
-    let from_pair = from_pair.expect("the {Module,Name} pair builds the record");
+    let from_pair = from_pair.expect("the {Module,Name} pair builds the exported record");
 
     assert_same_record(&module, from_atom, from_pair, mixed);
     // A fresh instance each time (the same inputs, a different allocation).
     assert_ne!(from_atom, from_pair);
     assert_defaults(&module, from_pair, "mixed", &[b]);
     assert_field(&module, from_pair, b, make_small(7));
+}
+
+#[test]
+fn create_rejects_a_non_exported_own_record_on_the_module_name_pair_form() {
+    // The same own record, this time **not** exported — the two id shapes now diverge,
+    // exactly as in C: the atom `Id` is the local opcode (`emu/instrs.tab:1358` →
+    // `erl_create_local_native_record`, `erl_record.c:254-354`), which reads the
+    // definition straight out of the running module's own `Recs` with **no** export
+    // requirement, so it still creates; the `{Module,Name}` `Id` is the generic
+    // `i_create_native_record` (`:1373` → `erl_create_native_record`, `:356-410`), which
+    // gates on `defp->is_exported == am_true` (`:401`) **even when `Module` is the
+    // running module** and so raises `error:{badrecord, Id}` (`:407-409` +
+    // `expand_error_value`, `beam_common.c:761-767`). No `erlc`/`erl` oracle exists for
+    // the native-record family on the installed toolchain, so this is pinned from the C.
+    let mut module = load(RECORDS_FIXTURE_BEAM);
+    set_exported(&mut module, "mixed", false);
+    // `badrecord` is resolved from the running module's own atom table by the reason
+    // builder (`create_badrecord`), so the fixture must intern it.
+    intern_raise_atoms(&mut module);
+    let b = module.atom_table.intern("b");
+    let badrecord = module.atom_table.intern("badrecord");
+    let mut ctx = MinimalContext::new();
+    let (atom_entry, pair_entry, pair) = both_id_shapes(&mut module, &mut ctx);
+
+    let (from_atom, _) = run_create(&module, atom_entry, &[], &mut ctx);
+    let from_atom = from_atom.expect("the atom id builds a non-exported own record");
+    assert_defaults(&module, from_atom, "mixed", &[b]);
+    assert_field(&module, from_atom, b, make_small(7));
+
+    let (failed, machine) = run_create(&module, pair_entry, &[pair], &mut ctx);
+    let (class, reason) = raised(&machine, &failed);
+    assert_eq!(class, ExceptionClass::Error, "`badrecord` is class `error`");
+    assert_eq!(terms::tuple_arity(reason).expect("a tuple"), 2, "reason arity");
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("tag"),
+        make_atom(badrecord),
+        "the reason tag is `badrecord`"
+    );
+    // The payload is the `Id` term **itself** (`p->fvalue = id`, `erl_record.c:407`) —
+    // never the `{Tag, {{Module,Name}, Field}}` shape a `badfield`/`novalue` failure
+    // builds (`:339-351`), which is what a regression to the create-failure builder
+    // would produce.
+    assert_eq!(
+        terms::tuple_element(reason, 1).expect("payload"),
+        pair,
+        "the reason's payload is the `{{Module,Name}}` Id term itself"
+    );
 }
 
 #[test]

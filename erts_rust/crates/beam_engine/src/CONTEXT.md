@@ -98,13 +98,18 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `context.rs` → the `ExecutionContext` / `Mailbox` seams (`call_bif` + the defaulted in-machine twin
   `call_bif_in_machine` behind the `wants_bif_in_machine` probe; the resolver seams
-  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`; and `atoms`, the live atom
+  `resolve_external_call`/`resolve_local_fun`/`resolve_local_call`/`atom_name`; the record-table seam
+  `foreign_record_definition` — `put_record`'s create form for another module's `{Module,Name}` id, where
+  `Ok(Some(def))` = the host resolved it (`is_exported` is part of the answer) and `Ok(None)` = the
+  family's typed `unsupported`; and `atoms`, the live atom
   namespace used by comparison AND by the raise path's `machine::catch::namespace_atom`), `RootSet`, `MinimalContext` (incl. its
   `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
   front and **grown in place** as terms are built, so an allocation costs its payload only; on
   reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
   handed-out pointer stays valid and **unmoved** — `relocate` is deliberately never used. It does **not**
-  override `alloc_words_rooted`, so it stays the test/embedding heap, not a collector.)
+  override `alloc_words_rooted`, so it stays the test/embedding heap, not a collector; its
+  `with_foreign_record_definitions`/`set_foreign_record_definitions` are the record-table hook behind
+  `foreign_record_definition`, empty by default.)
   (`CONTEXT.md` beside it: none — see `../CONTEXT.md`)
 - `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
   root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
