@@ -749,31 +749,31 @@ fn max_heap_size_is_the_oracle_flag_map() {
 fn heap_size_and_total_heap_size_are_the_processes_real_capacities() {
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
-    let (heap_size, total_heap_size) = {
+    let (heap_size, old_heap_size) = {
         let process = runtime
             .processes()
             .get(runtime.self_pid())
             .expect("the root process is live");
         (
             process.collector().heap_size_words(),
-            process.collector().total_heap_size_words(),
+            process.collector().old_heap_size_words(),
         )
     };
     assert_eq!(
         signed_value(pair(info(&mut runtime, pid, "heap_size").expect("heap_size")).1),
         heap_size as i64
     );
+    // `total_heap_size` is the **C-shaped** sum `heap_size + old_heap_size`
+    // (`erts/emulator/beam/erl_bif_info.c:1023-1030`), not the collector's summed capacity:
+    // the oracle's old heap is created by a collection (`erl_gc.c:1470-1478`), so a fresh
+    // process reports `total_heap_size == heap_size` (measured on the oracle: 233 / 233).
     assert_eq!(
         signed_value(pair(info(&mut runtime, pid, "total_heap_size").expect("total_heap_size")).1),
-        total_heap_size as i64
+        heap_size as i64 + old_heap_size as i64
     );
-    // `Process::new` uses `HeapPolicy::default()`: a 233-word nursery, so `heap_size` agrees
-    // with the oracle's 233, while the pre-allocated 233-word mature space makes
-    // `total_heap_size` 466 — see this module's documented divergence.
     assert_eq!(heap_size, 233);
-    assert_eq!(total_heap_size, 466);
+    assert_eq!(old_heap_size, 0, "no collection has created an old heap yet");
 }
-
 /// Runs `erl` and returns `process_info/1`'s item names in order, or `None` when the system
 /// `erl` is unavailable (the test then skips **loudly**).
 ///

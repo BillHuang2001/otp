@@ -2126,6 +2126,93 @@ mod tests {
         }
     }
 
+    /// **The `+hmax`/`+hms` ordering rule** (`erl_init.c:1634-1639`) — the three spellings the
+    /// oracle's emulator **rejects at parse time**.
+    ///
+    /// ```c
+    /// if (H_MAX_SIZE < H_MIN_SIZE && H_MAX_SIZE) { … erts_usage(); }
+    /// H_MAX_SIZE = hMaxSize;
+    /// ```
+    ///
+    /// The comparison is against the **previous** `+hmax` and the **raw** (unrounded) current
+    /// `+hms`, and `H_MIN_SIZE` starts at `H_DEFAULT_SIZE` (233) so the rule is armed even with
+    /// no `+hms` at all. Verified against OTP 29.1.1 / erts-17.1 — every row exits **1** with
+    /// this exact first stderr line (`\r\n`-terminated there, one line here):
+    ///
+    /// ```text
+    /// erl +hmax 500 +hms 1000 +hmax 200 -noshell -eval 'halt(0).'
+    ///   → max heap size (200) is not allowed to be smaller than min heap size (1000)
+    /// erl +hmax 200 +hmax 500 …   → max heap size (500) is not allowed to be smaller than
+    ///                               min heap size (233)
+    /// erl +hmax 200 +hmax 300 …   → max heap size (300) is not allowed to be smaller than
+    ///                               min heap size (233)
+    /// ```
+    ///
+    /// The third row is the one that shows the rule is **not** about the pair that ends up
+    /// installed (`300 > 200`, so `+hmax 500 +hmax 300` is accepted): it is about the previous
+    /// value when the next `+hmax` is parsed.
+    #[test]
+    fn the_max_heap_order_rule_rejects_these_spellings() {
+        // (argv, the offending +hmax value, the min heap size the message names)
+        let rows: [(&[&str], &str, usize); 3] = [
+            (&["+hmax", "500", "+hms", "1000", "+hmax", "200"], "200", 1000),
+            (&["+hmax", "200", "+hmax", "500"], "500", 233),
+            (&["+hmax", "200", "+hmax", "300"], "300", 233),
+        ];
+        for (args, max, min) in rows {
+            let error = parse_args(args).expect_err("the +hmax ordering rule rejects this");
+            let expected = format!(
+                "max heap size ({max}) is not allowed to be smaller than min heap size ({min})"
+            );
+            assert_eq!(
+                error::flag_rejected_diagnostic(&error),
+                Some(expected.as_str()),
+                "{args:?} names the value it refused and the min it compared against"
+            );
+            // The emulator's own rejection, never a capability gap: `run` prints the one line
+            // and exits 1 (the flag-rejection kind), not the CLI's usage status.
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The **accepted** side of the same rule — the four spellings the oracle boots with (and
+    /// only *then*, at runtime, meets the far smaller `+hmax`).
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1: each of these parses, starts the emulator and
+    /// dies a **runtime** death instead (`System process <0.0.0> terminated: killed` for the
+    /// first three, a `maximum heap size reached` logger block for the lone `+hmax 200`), which
+    /// is why the assertion here is on the parsed policy rather than on an exit status: a
+    /// successful parse is exactly what the CLI under test can be asked about.
+    ///
+    /// The distinction matters because the C compares only the **previous** value, so the
+    /// ordering is what decides, not the surviving pair:
+    ///
+    /// ```text
+    /// erl +hms 4000 +hmax 500 …    accepted (the first +hmax has no predecessor)
+    /// erl +hmax 500 +hms 4000 …    accepted (the rule ran while H_MIN_SIZE was still 233)
+    /// erl +hmax 500 +hmax 200 …    accepted (500 is not below 233)
+    /// erl +hmax 200 …              accepted (no predecessor at all)
+    /// ```
+    #[test]
+    fn the_max_heap_order_rule_accepts_these_spellings() {
+        // (argv, the installed max_heap_words, the installed min_heap_words — the +hms value
+        // rounded through the growth table, or H_DEFAULT_SIZE when no +hms was given)
+        let rows: [(&[&str], usize, usize); 4] = [
+            (&["+hms", "4000", "+hmax", "500"], 500, 4185),
+            (&["+hmax", "500", "+hms", "4000"], 500, 4185),
+            (&["+hmax", "500", "+hmax", "200"], 200, 233),
+            (&["+hmax", "200"], 200, 233),
+        ];
+        for (args, max, min) in rows {
+            let policy = parsed(args).heap_options().policy().clone();
+            assert_eq!(policy.max_heap_words, max, "{args:?}: the last +hmax wins");
+            assert_eq!(
+                policy.min_heap_words, min,
+                "{args:?}: the +hms value, rounded through the growth table"
+            );
+        }
+    }
+
     /// Unmodeled flags keep their behaviour when a modelled heap switch sits next to
     /// them: a *recognized* `+`-flag is accepted (and, for `+A`, preserved verbatim) but is
     /// not an init argument, and parsing continues onto the next switch.
