@@ -66,7 +66,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::super::accept_tests::poll_round;
-use super::super::async_tests::{async_events, await_events, linked, recv_operand};
+use super::async_tests::{async_events, await_events, linked, recv_operand};
 use super::super::opcode_tests::{escript_stdout, op, Rig};
 use super::super::opt::INET_INFINITY;
 use super::super::wire::{ctl_xerror, INET_REP_ERROR, INET_REP_OK};
@@ -494,6 +494,7 @@ fn render_arm(reply: &[u8]) -> String {
         }
         Some((&INET_REP_ERROR, name)) => format!("{{error,{}}}", String::from_utf8_lossy(name)),
         None => panic!("a control reply is never empty: {reply:?}"),
+        Some((tag, _)) => panic!("`{tag}` is not a result tag: {reply:?}"),
     }
 }
 
@@ -506,7 +507,7 @@ fn render(id: u16, result: &InetAsyncResult) -> String {
         // a `{mode, binary}` read would render as `<<"…">>` and is the runtime's rendering to
         // choose (`inet_async_data`, `inet_drv.c:3162`-`:3190`).
         InetAsyncResult::Data(read) => {
-            let flat = render_reply(&read.flattened());
+            let flat = render_reply(&read.flattened()[..]);
             format!("{{ok,{flat}}}")
         }
         InetAsyncResult::Error(reason) => format!("{{error,{}}}", reason.atom_name()),
@@ -597,7 +598,7 @@ fn the_passive_park_sequence_agrees_with_the_erl_oracle() {
     let (mut port, mut peer) = linked();
     let mut rust: Vec<String> = Vec::new();
 
-    rust.push(render_reply(&port.control(&op(INET_REQ_GETSTATUS), &[])));
+    rust.push(render_reply(&port.control(&op(INET_REQ_GETSTATUS), &[])[..]));
     assert_eq!(state_code(&mut port), INET_STATE_CONNECTED as u8);
 
     let base = arm_receive(&mut port, INET_INFINITY);
@@ -609,7 +610,7 @@ fn the_passive_park_sequence_agrees_with_the_erl_oracle() {
         },
     );
     rust.push(match port.try_control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)) {
-        Ok(reply) => render_arm(&reply),
+        Ok(reply) => render_arm(&reply[..]),
         Err(err) => panic!("a refused enqueue is a reply, not a raise: {err:?}"),
     });
 
@@ -655,10 +656,10 @@ fn the_passive_park_sequence_agrees_with_the_erl_oracle() {
         },
     );
     rust.push(match port.try_control(&op(TCP_REQ_RECV), &recv_operand(INET_INFINITY, 0)) {
-        Ok(reply) => render_arm(&reply),
+        Ok(reply) => render_arm(&reply[..]),
         Err(err) => panic!("a later receive is a reply, not a raise: {err:?}"),
     });
-    rust.push(render_reply(&port.control(&op(INET_REQ_GETSTATUS), &[])));
+    rust.push(render_reply(&port.control(&op(INET_REQ_GETSTATUS), &[])[..]));
 
     // The ids the rows must carry: the first receive is 0, the refused enqueue takes 1, and the
     // three later operations are 2, 3 and 4 — on **both** sides, because the oracle's dump is
