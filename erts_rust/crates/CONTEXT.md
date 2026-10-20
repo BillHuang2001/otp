@@ -516,7 +516,28 @@ the caller reserves the words and passes `hp: *mut Eterm`):
     path), and delivers the C's `{select, ResourceTerm, Reference, EventAtom}`
     (`ready_input`/`ready_output`/`ready_error`; `CUSTOM_MSG` delivers the caller's term verbatim); STOP
     and CANCEL answer the C's `STOP_CALLED`/`*_CANCELLED` bits and an unservable request stays a typed
-    refusal. Residual: `ERL_NIF_SELECT_STOP_SCHEDULED` (no resource-`stop` seam yet).
+    refusal. `enif_select`'s STOP arm then runs the resource type's own `stop` callback
+    (`beam_abi::nif::enif::call_resource_stop`): a `STOP_CALLED` verdict calls it synchronously with
+    `is_direct_call = true` (the caller keeps its reference), a `STOP_SCHEDULED` verdict parks the
+    `(obj, event)` pair for `run_pending_stops()` with `is_direct_call = false` and one kept
+    `enif_keep_resource` reference released at the drain (a second STOP steals rather than double-arms),
+    and every other verdict calls nothing; a type opened **without** a `stop` answers the host's code and
+    runs nothing (the oracle SIGSEGVs on that shape). `beam_rt`'s select store de-registers immediately,
+    so every STOP it observes is `STOP_CALLED` — the only verdict Linux/epoll can produce for an
+    epoll-able fd.
+  * `enif_schedule_nif` runs its continuation: `beam_abi/src/nif/enif/schedule.rs` holds an explicit
+    `Outcome { Value, Reschedule, Raised }` and an iterative, constant-Rust-stack trampoline (a nested
+    schedule records the continuation and answers the C's `THE_NON_VALUE`; the outermost call folds the
+    emulator's trap re-run into its own result), with `argv` passed through uncopied, `fun_name`
+    interned-only, `NifHost::nif_yield_point` called once per iteration, a dirty flag reported through
+    `enif_thread_type` (2/3), and a continuation's raise left as the env's pending exception. The C's raw
+    `THE_NON_VALUE` word is deliberately not reproduced: a probe exposing it sees the value.
+  * `enif_alloc_env` reaches a host in three steps — the current NIF call's host, else a host opened by
+    the process-global `ThreadEnvHostFactory` (`install_thread_env_factory`, cached per thread), else
+    `NULL` — and `enif_send` resolves its host from `env` else from `msg_env`, so the
+    `enif_send(NULL, &pid, msg_env, msg)` idiom works from a NIF-created thread. `NULL` stays the answer
+    when no host is reachable: a crate-owned env with a private atom table would hand a NIF a wrong atom
+    index.
   * A resource exposed only as a term is reclaimed when the term dies: the runner's park arm prunes
     through `beam_abi::nif::enif::release_resource_terms` with a complete-root predicate that matches a
     word **or** a reference identity (a copied term therefore counts as reachable), running the
