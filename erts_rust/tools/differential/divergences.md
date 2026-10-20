@@ -233,11 +233,15 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   registers far fewer names.
 
 ## A.8 — introspection (owner: `beam_rt` / `beam_bifs`)
-- `erlang:process_info(P, Item)` for a **spawned** `P` and the **five** position items `catchlevel`,
-  `initial_call`, `current_function`, `current_location` and `current_stacktrace` are answered by the
-  oracle but raise `beam_rt: unsupported: process_info: <item>` (exit 3) in the rust runtime — for
-  **every** spawned process (a `spawn(?MODULE,loop,[])` child behaves like a fun-bodied one). For
-  `self()` four of the five now agree (`catchlevel`, `initial_call`, `current_function` and
+- `erlang:process_info(P, Item)` of a process spawned from **`-eval`** and the **five** position items
+  `catchlevel`, `initial_call`, `current_function`, `current_location` and `current_stacktrace` raise
+  `beam_rt: unsupported: process_info: <item>` (exit 3) in the rust runtime — a fun-bodied child and
+  a `spawn(?MODULE,loop,[])` one alike, because a process the runtime never scheduled an engine for
+  has no resolved target. All five **do** agree for a process spawned from compiled code and are
+  pinned there (`bif_extra/process_info_spawned_position_items`,
+  `bif_extra/process_info_spawned_current_location`,
+  `bif_extra/process_info_spawned_current_stacktrace`). For
+  `self()` four of the five agree (`catchlevel`, `initial_call`, `current_function` and
   `current_location`, the last byte-identical) and only `current_stacktrace` raises. An honest
   capability gap, not a mismatch.
 - The same spawned-process family's **values** must never be pinned: `stack_size` (oracle `9`, rust
@@ -333,17 +337,32 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   `inet_control/line_framed_read` and `inet_control/packet4_framed_read_buffers_across_segments`
   (framing inherited from `gen_tcp:listen/2`, a truncated prefix withholding a message, and two
   coalesced frames delivered as two messages all agree) — and `{packet, line}` on a sender is pinned
-  by `inet_write/line_mode_send_adds_no_prefix`. The write-side header rows are not in the corpus
-  yet (`inet_write`'s `no_case_pins_a_measured_divergence` guard still rejects `{packet, 1|2|4}`);
-  the one write-side shape that *stays* unpinnable is the passive read below. Owner: `beam_rt` /
+  by `inet_write/line_mode_send_adds_no_prefix`. The write-side header rows are
+  `inet_write/block_framed_send_prefixes_the_header` (a fresh connection per mode, `{packet, 4}` /
+  `{packet, 2}` / `{packet, 1}` observed on the raw peer),
+  `inet_write/packet4_send_via_setopts_writes_the_prefix`,
+  `inet_write/framed_sender_and_framed_receiver` and
+  `inet_write/packet4_send_prefixes_a_large_payload`, and the half-close and the write accounting
+  are `inet_write/shutdown_write_then_send_closes_the_writer` and
+  `inet_write/send_counters_advance_with_the_writes`. The write-side shapes that *stay* unpinnable
+  are the second send after a half-close (next entry) and the passive read below. Owner: `beam_rt` /
   `beam_io`.
+- **A half-close's *first* send is pinnable and its *second* is a capability gap.** After
+  `gen_tcp:shutdown(Cl, write)` a `gen_tcp:send/2` answers `{error,closed}` on **both** sides, which
+  is what `inet_write/shutdown_write_then_send_closes_the_writer` pins — but a **second** send makes
+  `beam_rt` exit `3` with `beam_rt: unsupported: opcode: run: process blocked (no message
+  available)` where the oracle answers `{error,enotconn}` (measured 3/3 serial; the driver marks the
+  socket fully closed after the first failed write). A typed capability gap, not a divergence, so
+  the pinned row performs exactly **one** send after the shutdown. Owner: `beam_rt` / `beam_io`.
 - **A passive `gen_tcp:recv/2,3` whose data arrives while the recv is armed agrees**, and that is
-  the shape a row may pin. Only the **data-already-queued** shape is unpinnable, and it fails three
-  different ways: exit `3` `opcode: run: process blocked (no message available)` on the module-run
-  route; exit `3` `port event: … within the 5 s bound` on the `-eval` route when the caller's
-  timeout exceeds 5 s (or is `infinity`); and, on the `-eval` route with a caller timeout of 5000 ms
-  or less, a plain wrong `{error,timeout}` — a real value divergence, not a capability gap. Owner:
-  `beam_rt` / `beam_io`.
+  the shape a row may pin. A read with **nothing to read** answers `{error,timeout}` on both sides
+  when its caller bound is 5000 ms or less, and is pinned
+  (`inet_control/passive_recv_on_an_empty_socket_times_out`). Only the **data-already-queued** shape
+  is unpinnable, and it fails three different ways: exit `3` `opcode: run: process blocked (no
+  message available)` on the module-run route; exit `3` `port event: … within the 5 s bound` on the
+  `-eval` route when the caller's timeout exceeds 5 s (or is `infinity`); and, on the `-eval` route
+  with a caller timeout of 5000 ms or less, a plain wrong `{error,timeout}` — a real value
+  divergence, not a capability gap. Owner: `beam_rt` / `beam_io`.
 - **The `inet:getstat/1` *send*-side counters are pinnable** — after two completed 3-byte writes both
   sides answer `{ok,[{send_cnt,2},{send_oct,6}]}` (`{ok,[{send_cnt,0},{send_oct,0}]}` before them) —
   but the **recv**-side counters are racy **on the oracle** (`{2,6}` on one run, `{0,0}` on two
