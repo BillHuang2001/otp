@@ -808,9 +808,9 @@ than two).
   `Delivery::classify` turns it into the full semantic `Delivery` — but nothing in this crate acts on
   it (no link / monitor / spawn / exit bookkeeping). Routing is the caller's job via the `InboundSink`
   seam (`Connection::recv_delivery`/`dispatch_inbound`, `ConnectionDriver::next_delivery`/
-  `dispatch_inbound`), whose **production impl over `beam_process`/`Mailbox` is still owed by
-  `beam_rt`** (the defaulted impl is `UnsupportedSink`, which never mis-delivers). Typed *outbound*
-  helpers exist for `Send(_Sender)`/`RegSend`/`Link`/`Exit`/`MonitorP`/`DemonitorP`; every other opcode
+  `dispatch_inbound`), whose production impl is `beam_rt`'s `LocalDeliverySink`
+  (`beam_rt/src/dist/inbound.rs`; the defaulted impl is `UnsupportedSink`, which never mis-delivers).
+  Typed *outbound* helpers exist for `Send(_Sender)`/`RegSend`/`Link`/`Exit`/`MonitorP`/`DemonitorP`; every other opcode
   is sent through the generic `send_control`.
 - **Spawn/altact/payload-exit are classified, not executed.** The `Delivery` variants
   (`SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit`/`PayloadExit2`/`PayloadMonitorExit`) and
