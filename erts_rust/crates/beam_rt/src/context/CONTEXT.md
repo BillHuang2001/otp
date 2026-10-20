@@ -8,7 +8,7 @@ Mechanics-level companion: [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — every pe
 
 ## API Surface
 ### `context/` — the concrete `ExecutionContext` (the glue)
-`RuntimeContext<'a>` carries the runtime borrow, the optional `output` sink (`SharedSink`, a cloneable `Rc<RefCell<..>>`; stdout when `None`), `mailbox_pid`/`mailbox_table`, `may_pump_scheduler`, `current_module`, `engines`, `gc_armed`, `dispatch_memo` and `lent_tables`.
+`RuntimeContext<'a>` carries the runtime borrow, the optional `output` sink (`SharedSink`, a cloneable `Rc<RefCell<..>>`; stdout when `None`), `mailbox_pid`/`mailbox_table`, `may_pump_scheduler`, `current_module`, `engines`, `suspend_requested`, `gc_armed`, `dispatch_memo` and `lent_tables`.
 Its methods: `new`, `with_output`, `heap_available()`, `for_process` (runs **as** the given pid — the scheduler seam), `pid()`, `eval_heap()`, `enter_module`, `run_export`, `resync_parked_roots` (the resume half of the runner's parked-machine root hand-off).
 `lent_tables` is set only by `FunBridge::nested`; `new`/`with_output`/`for_process` set it `None`.
 `impl ExecutionContext`: `call_bif` serves, **in order**, `try_call_nif` (a loaded NIF wins — the BEAM's dispatch order) → `try_native` (the native floor) → [`dispatch`](#the-dispatch-memo--dispatchhooks) (the memoized registry implementation + hook roster, so the prologue runs once per key per context) → `call_registered` (the `beam_bifs` registry — reached only when the memoized registration flag is set) → for the `erlang` namespace, `is_known_unimplemented_bif` ? `unsupported:` : bare `error::undef` → else load the module file and `run_export` (`calls.rs`'s `call_bif_routed`).

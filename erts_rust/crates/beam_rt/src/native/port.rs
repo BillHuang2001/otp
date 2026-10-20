@@ -243,33 +243,35 @@ impl RuntimeContext<'_> {
     ///
     /// A plain command on a busy port is the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run: the
     /// caller blocks until the port is idle and the BIF runs again, whereupon the bytes are written
-    /// and the answer is `true`. This runtime's BIF seam (`ExecutionContext::call_bif`) has no
-    /// "block the caller and re-run me" shape — its only shapes are a value and an error — so the
-    /// wait is taken **here**, on the routes that own a scheduler pass:
-    /// [`crate::port::busy_wait::issue`] runs bounded port rounds (the same
-    /// [`Runtime::pump_scheduler`](crate::Runtime::pump_scheduler) step the port pump uses) until
-    /// the port reports idle and then re-issues the command through the same seam. The busy bit is
-    /// cleared by the driver's own callback inside a port round — or by another process's
-    /// `port_control/3`, which the pass's run-queue round serves — so a round is exactly what the
-    /// C's scheduler would do.
+    /// and the answer is `true`. Both routes reach it through [`crate::port::busy_wait::issue`]:
+    ///
+    /// * a caller that owns the scheduler pass (`-eval`) **waits in place** — bounded port rounds
+    ///   (the [`Runtime::pump_scheduler`](crate::Runtime::pump_scheduler) step the port pump uses)
+    ///   until the port reports idle, then the command is re-issued;
+    /// * a caller inside a scheduler slice (`crate::runner`) **parks**: `issue` reports
+    ///   [`PortWrite::Parked`](crate::port::busy_wait::PortWrite), this function records the
+    ///   request ([`RuntimeContext::request_suspend`]), and the outcome-aware BIF door turns it
+    ///   into [`BifOutcome::Suspend`](beam_engine::BifOutcome) — the engine does **not** apply the
+    ///   instruction, the runner re-enqueues the process (`RunOutcome::Yield`), and the next round
+    ///   re-executes the BIF, which now finds the port idle and really writes. That is the C's
+    ///   suspend-and-re-run, and the `true` returned here on that path is never observed.
+    ///
+    /// The busy bit is cleared by the driver's own callback inside a port round — or by another
+    /// process's `port_control/3`, which the pass's run-queue round serves — so a round is exactly
+    /// what the C's scheduler would do.
     ///
     /// The wait is bounded ([`BUSY_PORT_DEADLINE`](crate::port::busy_wait::BUSY_PORT_DEADLINE),
-    /// 5 s) where the C is unbounded, because a single-threaded runtime that owns its own pass
-    /// would otherwise hang the whole executable; expiry is a typed capability gap naming the
-    /// deadline, never a fabricated `true`. A caller that may **not** pump
-    /// ([`RuntimeContext::may_pump_scheduler`] is `false`: a compiled process inside a scheduler
-    /// slice) answers the typed capability gap
-    /// [`NO_PUMP_REASON`](crate::port::busy_wait::NO_PUMP_REASON) —
-    /// `M1_GAPS.md` §*Ports, drivers and the send family (A.4)*. Every other arm — `false`,
-    /// `notsup`, `badarg` — matches the oracle.
+    /// 5 s) where the C is unbounded, because a single-threaded runtime would otherwise hang; the
+    /// bound covers **both** routes, so expiry is a typed capability gap naming the deadline,
+    /// never a fabricated `true` and never a spin. Every other arm — `false`, `notsup`, `badarg` —
+    /// matches the oracle.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a malformed
     /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force` on a port
     /// whose driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`; a typed capability gap for a busy
-    /// port that never went idle within the deadline or for a caller that may not pump;
-    /// [`BeamError::Io`] when the write fails.
+    /// port that never went idle within the deadline; [`BeamError::Io`] when the write fails.
     fn port_command(&mut self, args: &[Eterm], with_options: bool) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let data = *args.get(1).ok_or(BeamError::BadArg)?;
