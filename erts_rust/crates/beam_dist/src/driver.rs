@@ -104,6 +104,29 @@
 //! `"alive"` peer and a `"named:"` name collision each surface the same typed `Io`
 //! error (and `io::ErrorKind`) [`crate::connection`] would return.
 //!
+//! # A frame-level decode failure is fatal, and the frame is retained
+//!
+//! A queued message body whose distribution header or control tuple cannot be
+//! decoded is a **connection-fatal** condition, exactly as it is in ERTS: both
+//! `invalid_message:` and `decode_error:` in `erts/emulator/beam/dist.c` fall
+//! through to `data_error:`, which calls `erts_kill_dist_connection`. There is no
+//! retry and no resync — a frame is not separable from the stream state, because
+//! its header has already advanced the distribution atom cache.
+//!
+//! [`ConnectionDriver::next_message`] therefore decodes **before** it commits: the
+//! frame stays at the head of the inbound queue until it has fully decoded. On a
+//! failure the link moves to [`DriverState::Failed`], the caller's heap is rewound
+//! to the mark taken before the attempt (so no dead words are left behind), the
+//! typed error is returned, and the frame is **retained** — every later
+//! `next_message` (and every derive-off of it) re-attempts the same decode and
+//! reports the same typed error, never `Ok(None)` and never the following frame.
+//! The retained bytes are readable through [`ConnectionDriver::failed_frame`].
+//!
+//! A *classification* failure is different: [`Delivery::classify`] /
+//! [`Delivery::classify_validated`] run on an already-decoded message and
+//! deliberately do **not** change the link state (see
+//! [`ConnectionDriver::dispatch_inbound`]).
+//!
 //! Conversely, a driver playing the **accepting** role that must refuse a peer
 //! (a `Name` whose flags fail the mandatory check) writes the `"not_allowed"`
 //! status into its output **before** returning the error: the framed bytes are
@@ -298,6 +321,10 @@ pub struct ConnectionDriver {
 
     /// Complete (defragmented) inbound message bodies awaiting decode.
     inbound: VecDeque<Vec<u8>>,
+    /// Whether the frame at the head of [`inbound`](Self::inbound) failed to decode
+    /// (a diagnostic for [`failed_frame`](Self::failed_frame); the frame itself is
+    /// never copied).
+    decode_failed: bool,
     /// How many ticks this link has answered (a diagnostic).
     ticks_answered: u64,
     /// This node's own identity for the inbound decode — `None` (the default) keeps
@@ -500,6 +527,7 @@ impl ConnectionDriver {
             outbound: OutboundAtomCache::new(),
             next_seq_id: 1,
             inbound: VecDeque::new(),
+            decode_failed: false,
             ticks_answered: 0,
             local_identity: None,
         }
@@ -649,26 +677,73 @@ impl ConnectionDriver {
     /// Identifiers of **this** node become internal terms when an identity is
     /// installed ([`set_local_identity`](Self::set_local_identity)); without one
     /// (the default) every pid/port/reference keeps its faithful external form.
+    ///
+    /// # Decode-then-commit
+    ///
+    /// The frame is popped only **after** it has fully decoded. A failure (a
+    /// malformed or truncated header, a payload slice that does not exist, or a
+    /// control tuple the codec rejects) is **fatal for the link** — the C's
+    /// `invalid_message:`/`decode_error:` both fall through to `data_error:` and
+    /// kill the connection (`dist.c`) — so, in this order:
+    ///
+    /// 1. `heap` is rewound to the mark taken before the attempt, leaving no dead
+    ///    words behind;
+    /// 2. the link moves to [`DriverState::Failed`] ([`step`](Self::step) then
+    ///    reports [`StepOutcome::Failed`] and `send_control` refuses);
+    /// 3. the typed error is returned;
+    /// 4. the frame is **retained** at the head of the queue, so a later call
+    ///    re-attempts the same decode and reports the same typed error — never
+    ///    `Ok(None)`, never the next frame. `recv_cache.apply` is idempotent for a
+    ///    re-applied header (it clears the per-message table before re-setting the
+    ///    same persistent slots), so the re-report is deterministic.
+    ///    [`failed_frame`](Self::failed_frame) exposes those retained bytes.
     pub fn next_message(
         &mut self,
         heap: &mut Heap,
         atoms: &mut AtomTable,
     ) -> Result<Option<ControlMessage>> {
-        let body = match self.inbound.pop_front() {
+        let body = match self.inbound.front() {
             Some(body) => body,
             None => return Ok(None),
         };
-        let (header, offset) = parse_header(&body, atoms)?;
-        self.recv_cache.apply(&header)?;
-        let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
-        let message = decode_control_with_identity(
-            payload,
-            heap,
-            atoms,
-            Some(self.recv_cache.table()),
-            self.local_identity,
-        )?;
-        Ok(Some(message))
+        let mark = heap.used();
+        match decode_frame(body, &mut self.recv_cache, self.local_identity, heap, atoms) {
+            Ok(message) => {
+                self.inbound.pop_front();
+                self.decode_failed = false;
+                Ok(Some(message))
+            }
+            Err(err) => {
+                // The mark was read from this very heap and decoding only ever
+                // advances `used`, so the rewind is always in range and `reset_to`
+                // cannot fail (it refuses only a mark beyond the current offset) —
+                // there is no recoverable failure for the caller to see, see the
+                // crate `heap` docs.
+                let _ = heap.reset_to(mark);
+                self.state = DriverState::Failed;
+                self.decode_failed = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// The retained undecodable frame, or `None`.
+    ///
+    /// `Some(frame)` only after a **decode** failure in
+    /// [`next_message`](Self::next_message): a frame-level decode error is fatal
+    /// for the link, and that frame is left at the head of the inbound queue rather
+    /// than consumed, so this is a **peek** at those very bytes — no second copy of
+    /// the frame is kept. Every later decode attempt re-reports the same error until
+    /// the driver is dropped.
+    ///
+    /// `None` otherwise, including after a failure that is not a decode failure
+    /// (a handshake error, or a garbage packet rejected by
+    /// [`step`](Self::step)'s structural check).
+    pub fn failed_frame(&self) -> Option<&[u8]> {
+        if !self.decode_failed {
+            return None;
+        }
+        self.inbound.front().map(|body| body.as_slice())
     }
 
     /// Decodes **and classifies** the next queued inbound control message, or
@@ -676,6 +751,11 @@ impl ConnectionDriver {
     ///
     /// This is [`next_message`](Self::next_message) followed by
     /// [`Delivery::classify`] — the semantic view a runtime routes.
+    ///
+    /// A **decode** failure inherits [`next_message`](Self::next_message)'s
+    /// connection-fatal policy (state [`DriverState::Failed`], frame retained and
+    /// re-reported). A **classification** failure on an already-decoded message does
+    /// not alter the link state.
     pub fn next_delivery(
         &mut self,
         heap: &mut Heap,
@@ -700,6 +780,11 @@ impl ConnectionDriver {
     /// message was decoded against, so the node comparison is a raw term `==`.
     /// [`next_delivery`](Self::next_delivery) is the unchanged, unchecked
     /// counterpart.
+    ///
+    /// A **decode** failure is connection-fatal exactly as in
+    /// [`next_message`](Self::next_message) (state [`DriverState::Failed`], the frame
+    /// retained and re-reported); a **validation** failure on an already-decoded
+    /// message does not alter the link state.
     pub fn next_delivery_checked(
         &mut self,
         heap: &mut Heap,
@@ -721,10 +806,16 @@ impl ConnectionDriver {
     ///
     /// This is the inbound delivery seam: the caller (e.g. `beam_rt`) supplies an
     /// [`InboundSink`] over its process table/mailbox. Draining all queued messages
-    /// matches the driver's own `step` loop. A classification failure (a
+    /// matches the driver's own `step` loop. A **classification** failure (a
     /// message-carrying opcode with no trailing message) is returned as `Err` and
     /// does **not** alter the link state; messages already dispatched stay
     /// dispatched.
+    ///
+    /// A **decode** failure is the different, connection-fatal case described on
+    /// [`next_message`](Self::next_message): the link moves to [`DriverState::Failed`]
+    /// and the undecodable frame stays queued (readable through
+    /// [`failed_frame`](Self::failed_frame)), so it is re-reported rather than
+    /// skipped. Messages already dispatched stay dispatched.
     pub fn dispatch_inbound(
         &mut self,
         heap: &mut Heap,
@@ -747,6 +838,10 @@ impl ConnectionDriver {
     /// drains through [`next_delivery_checked`](Self::next_delivery_checked), so a
     /// message that fails the C's `invalid_message` validation is returned as `Err`
     /// and never reaches `sink`; messages already dispatched stay dispatched.
+    ///
+    /// A **decode** failure is connection-fatal ([`next_message`](Self::next_message))
+    /// and retains the undecodable frame; a **validation** failure does not alter the
+    /// link state.
     pub fn dispatch_inbound_checked(
         &mut self,
         heap: &mut Heap,
@@ -1189,6 +1284,26 @@ fn parse_header(body: &[u8], atoms: &mut AtomTable) -> Result<(DistHeader, usize
         }
         _ => Err(BeamError::BadArg),
     }
+}
+
+/// Decodes one queued message body into its control message.
+///
+/// The whole per-frame decode — header parse, receive-atom-cache apply, payload
+/// slice, control-tuple decode — so [`ConnectionDriver::next_message`] has a single
+/// fallible step whose failure it can handle without having committed the frame.
+/// A free function (not a method) so the caller can hold an immutable borrow of its
+/// own inbound queue and a mutable borrow of its atom caches at the same time.
+fn decode_frame(
+    body: &[u8],
+    recv_cache: &mut ReceiveAtomCache,
+    local_identity: Option<LocalIdentity>,
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+) -> Result<ControlMessage> {
+    let (header, offset) = parse_header(body, atoms)?;
+    recv_cache.apply(&header)?;
+    let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
+    decode_control_with_identity(payload, heap, atoms, Some(recv_cache.table()), local_identity)
 }
 
 /// A [`Write`] sink that appends to a `Vec<u8>` (the driver's output buffer).
