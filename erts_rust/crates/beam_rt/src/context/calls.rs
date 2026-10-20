@@ -1241,7 +1241,7 @@ impl<'a> RuntimeContext<'a> {
     ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
     ///   [`super::pool`]), a destination reached only for a call whose pool may be rewound: on that
     ///   route the copy exists to license the rewind, and the store it lands in is never reset.
-    fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
+    pub(crate) fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)
         } else {

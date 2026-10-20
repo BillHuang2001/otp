@@ -446,13 +446,13 @@ fn our_remote_exit_kill_kills_a_process_on_a_rust_peer() {
 ///
 /// Our responder mints the alias with `erlang:alias/1`, prints the reference it holds (a
 /// local reference: ours to render) and hands the **term** to the peer over the wire; the
-/// peer sends `{payload, Node, 4242}` to it. The payload must arrive verbatim in *our*
+/// peer sends `{payload, self(), 4242}` to it. The payload must arrive verbatim in *our*
 /// mailbox, resolved from the alias reference to its owner — `PAYLOAD_N 4242` — and its
 /// sender must be the very pid we handed the alias to (`PAYLOAD_FROM_PEER true`, a `=:=`
 /// over a pid that crossed the wire twice: out in a greeting, back inside the payload).
 ///
-/// The peer asserts the send's own return value (`ALIAS_SENT true`): sending to a reference
-/// is a real send, not a `badarg`.
+/// The peer asserts the send's own return value (`ALIAS_SENT {payload,<its own pid>,4242}`):
+/// sending to a reference is a real send, not a `badarg`, and `!` answers the message term.
 #[test]
 #[ignore = "two VMs: two beam_rt nodes plus erlc/epmd/setsid/kill; run with --ignored --nocapture"]
 fn an_alias_created_on_one_rust_node_delivers_from_the_other() {
@@ -472,14 +472,19 @@ fn an_alias_created_on_one_rust_node_delivers_from_the_other() {
         "our alias is a local reference, so we can render it: {reference}\n{}",
         pair.diagnostics()
     );
+    // The peer's own `self()`, printed by the VM that owns it (a local pid there, so it
+    // renders as `<0.Number.Serial>`) — the `ALIAS_SENT` expectation below is *derived* from
+    // this string, never fabricated.
+    let actor_pid = pair.actor_text("SELF ");
     pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
     // The peer cannot render a reference it received, so it proves the type instead.
     pair.actor_equals("ALIAS_IS_REF ", "ALIAS_IS_REF true");
     // The send's own return value: a send to an alias reference is a real send, and `!`
-    // answers the message term (`erlang:send/2`), naming the peer's own node.
+    // answers the message term (`erlang:send/2`) — with the **peer's own pid** in the
+    // sender slot, the very pid the responder then `=:=`-compares against (`PAYLOAD_FROM_PEER`).
     pair.actor_equals(
         "ALIAS_SENT ",
-        &format!("ALIAS_SENT {{payload,{},4242}}", pair.actor_node),
+        &format!("ALIAS_SENT {{payload,{actor_pid},4242}}"),
     );
     // The payload, verbatim, out of our own mailbox — and its sender is the peer's pid.
     pair.runtime_equals("PAYLOAD_N ", "PAYLOAD_N 4242");

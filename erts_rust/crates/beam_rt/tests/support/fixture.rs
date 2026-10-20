@@ -953,7 +953,13 @@ actor_link_and_trap(PeerArg) ->
 %% ---- 4.3 an alias created here, used from the peer -------------------
 
 %% `rv_our_alias/1` prints the payload's sender with `~p`; this variant
-%% reports the payload by value and its sender by identity.
+%% reports the payload by value and its sender by **identity**. The payload
+%% therefore carries the actor's own pid (`self()`), never its node atom: the
+%% responder compares that slot with `From =:= PeerPid`, so a payload holding a
+%% node name could only ever answer `false`. The pid is printed once, up front,
+%% by the VM that owns it -- it is a local pid there, so it renders as
+%% `<0.Number.Serial>` and the test derives the `ALIAS_SENT` line from this
+%% very string instead of fabricating one.
 rr_our_alias(PeerArg) ->
     Peer = rv_start(PeerArg),
     Alias = erlang:alias([]),
@@ -972,13 +978,17 @@ rr_our_alias(PeerArg) ->
 
 actor_rr_our_alias(PeerArg) ->
     Target = list_to_atom(arg(PeerArg)),
+    io:format("SELF ~p~n", [self()]),
     ping(Target, 100),
     greet_peer(),
     Alias = ask_alias(Target, 60),
     %% `ref_text/1` cannot name an external reference either, so the peer
     %% proves only that what it received *is* a reference.
     io:format("ALIAS_IS_REF ~p~n", [is_reference(Alias)]),
-    Sent = (Alias ! {payload, node(), 4242}),
+    %% The payload's sender slot is the peer's own pid, so the alias owner can
+    %% assert `From =:= PeerPid` across two inbound deliveries (a `DOP_REG_SEND`
+    %% greeting and this `DOP_ALIAS_SEND` payload).
+    Sent = (Alias ! {payload, self(), 4242}),
     io:format("ALIAS_SENT ~p~n", [Sent]),
     finish(Target, alias_sent).
 

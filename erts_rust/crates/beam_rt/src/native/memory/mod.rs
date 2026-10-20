@@ -233,7 +233,7 @@
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::{HeapInfo, HeapObservable};
-use beam_process::{MonitorKind, ProcessId};
+use beam_process::{MonitorKind, ProcessId, RemotePid};
 use beam_term::{make_small, Atom, Eterm, NIL};
 
 use super::RuntimeContext;
@@ -470,8 +470,24 @@ struct Snapshot {
     /// port monitors (`Process::port_monitors`), each as `(is_a_process_monitor, target)`
     /// where a port monitor's target is the port id term.
     monitors: Vec<(bool, Eterm)>,
-    /// The watching pids.
+    /// The watching pids that live on **this** node, as internal pid immediates.
+    ///
+    /// [`Process::monitored_by`](beam_process::Process::monitored_by) holds exactly the watchers
+    /// that are local processes; a watcher on another node lives in the process table's
+    /// `remote_watchers` side table instead (see [`Snapshot::remote_watchers`]).
     monitored_by: Vec<Eterm>,
+    /// The watching pids that live on **another** node, in the C's own record shape.
+    ///
+    /// A monitor an inbound `DOP_MONITOR_P` installed keeps the peer's pid decomposed as a
+    /// [`RemotePid`] (all-immediate: the sysname **atom** term plus the number/serial/creation),
+    /// so nothing here points into another heap. The `monitored_by` item must render each of
+    /// them as an **external pid**, exactly as ERTS does — the C's monitor record points at the
+    /// watcher's `Eterm`, which for a distributed monitor is the external pid
+    /// (`erl_proc_sig_queue.c`, `monitor_from_remote`), so an oracle peer's
+    /// `lists:member(OurPid, process_info(Victim, monitored_by))` is `true`
+    /// (`tests/dist_two_vm.rs::our_monitor_of_a_erl_peer_process_receives_the_down` proves the
+    /// oracle's own side of that with a remote watcher).
+    remote_watchers: Vec<RemotePid>,
     /// The process dictionary pairs, insertion order.
     dictionary: Vec<(Eterm, Eterm)>,
     /// The `trap_exit` flag.
@@ -920,7 +936,7 @@ impl RuntimeContext<'_> {
             "messages" => terms::make_list(self, &snapshot.messages)?,
             "links" => terms::make_list(self, &snapshot.links)?,
             "monitors" => self.monitors_value(snapshot)?,
-            "monitored_by" => terms::make_list(self, &snapshot.monitored_by)?,
+            "monitored_by" => self.monitored_by_value(snapshot)?,
             "dictionary" => self.dictionary_value(snapshot)?,
             "trap_exit" => {
                 let atom = bool_atom(snapshot.trap_exit);
@@ -1006,6 +1022,51 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &entries)
     }
 
+    /// The `monitored_by` value: a **bare pid list** of the watching processes (verified against
+    /// OTP 29.1.1 / erts-17.1: `{monitored_by,[<0.84.0>]}`), local watchers first.
+    ///
+    /// A **local** watcher is an internal pid immediate, so the whole list could be built on the
+    /// reply heap like every other item — but a **remote** watcher must be rendered as an
+    /// *external* pid, and an external pid is the four-word `ExternalThing` block of
+    /// `beam_term::thing::write_external_pid` (the C's `make_external_pid`,
+    /// `erl_term.h:1137-1172`), which only `beam_codec`/`beam_process` may write: this crate is
+    /// `#![deny(unsafe_code)]`. So the remote entries are materialized on a **scratch**
+    /// `beam_alloc::Heap` through [`RemotePid::to_eterm`] and the finished list is then copied
+    /// wholesale onto the region that outlives this call
+    /// ([`RuntimeContext::rehome_container_result`]: the running process's scanned young heap,
+    /// else the never-reset `-eval` store) — the same two-step the scratch `system_info` value
+    /// uses, and the only shape that leaves no dangling term behind when the scratch heap is
+    /// released at the end of this call.
+    ///
+    /// The list is built local-watchers-then-remote: the oracle orders the item by monitor
+    /// creation, which this runtime cannot observe (it keeps the two families in two stores) —
+    /// the same documented ordering caveat as the `monitors` item.
+    fn monitored_by_value(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
+        if snapshot.remote_watchers.is_empty() {
+            // The common case: immediates only, so no foreign-heap block is involved.
+            return terms::make_list(self, &snapshot.monitored_by);
+        }
+        // One `ExternalThing` (4 words) per remote watcher plus one cons cell per entry.
+        let entries = snapshot.monitored_by.len() + snapshot.remote_watchers.len();
+        let words = 4 * snapshot.remote_watchers.len() + 2 * entries + 8;
+        let mut scratch = beam_alloc::Heap::new(words)?;
+        let mut list = NIL;
+        for watcher in snapshot.remote_watchers.iter().rev() {
+            let pid = watcher.to_eterm(&mut scratch)?;
+            list = scratch.cons(pid, list)?;
+        }
+        for watcher in snapshot.monitored_by.iter().rev() {
+            list = scratch.cons(*watcher, list)?;
+        }
+        match self.rehome_container_result(list) {
+            Some(copied) => Ok(copied),
+            // Unreachable in practice: a refusal means the copier rejected a graph this runtime
+            // just built, or a destination that could not be grown. The scratch words are freed
+            // as this function returns, so handing the term back unchanged would be a dangling
+            // term — the typed limit is the honest answer.
+            None => Err(BeamError::SystemLimit),
+        }
+    }
     /// The `dictionary` value: the stored `{Key, Value}` pairs, insertion order.
     fn dictionary_value(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
         let mut entries = Vec::with_capacity(snapshot.dictionary.len());
@@ -1200,6 +1261,15 @@ impl RuntimeContext<'_> {
                 .monitored_by()
                 .iter()
                 .map(|m| m.watcher.to_eterm())
+                .collect(),
+            // The **remote** watchers: an inbound `DOP_MONITOR_P`'s `watcher`, kept in the
+            // process table's side table as a decomposed [`RemotePid`] because a
+            // `MonitoredBy` record's `watcher` slot is a [`ProcessId`] (a *local* process).
+            // Read here, rendered by [`RuntimeContext::monitored_by_value`].
+            remote_watchers: table
+                .remote_watchers(pid)
+                .iter()
+                .map(|watch| watch.watcher)
                 .collect(),
             dictionary: process.dict().entries().collect(),
             trap_exit: process.is_trapping_exit(),
