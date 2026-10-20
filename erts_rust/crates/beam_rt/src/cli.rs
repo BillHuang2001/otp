@@ -72,8 +72,9 @@
 //! is recorded and ignored. An **unrecognized `+`-flag** is different: the launcher
 //! rewrites it to `-X` for the emulator, which prints `unknown flag -X` and exits **1**
 //! (a *recognized* spelling such as `+Weird` stays accepted). A **plain positional
-//! argument** is accepted and ignored, never a usage error (the launcher forwards it to
-//! `init`, which accepts it).
+//! argument** is never a usage error: the launcher forwards it to `init`, which collects it
+//! into the **plain-argument** list, and `-extra` hands it everything that follows (see
+//! [`parse`] and [`RuntimeConfig::plain_args`]).
 //!
 //! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
 //! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
@@ -311,10 +312,22 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// launcher's own rejections — an **unrecognized `+`-flag** ([`error::unknown_flag`]), a
 /// **missing operand of a `+`-switch** or of `-name`/`-sname`
 /// ([`error::missing_switch_operand`]) and the **refused `-smp disable`**
-/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is accepted and
-/// ignored, never a usage error. A malformed
+/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is never a usage
+/// error: it is collected into [`RuntimeConfig::plain_args`], and `-extra` collects
+/// everything after it there too (see below). A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
+///
+/// # The plain-argument surface (`-extra`, contract A.6)
+///
+/// [`RuntimeConfig::plain_args`] reproduces the C `init`'s `Args` accumulator
+/// (`erts/preloaded/src/init.erl:1669-1710`): a stray **positional** token is an `arg`, and
+/// `-extra` is `start_extra_arg` — it appends **every** remaining token, verbatim and in
+/// order, and stops parsing, so nothing after it is an init argument or a Start instruction
+/// (`-extra` itself is neither). Oracle-verified (OTP 29.1.1 / erts-17.1):
+/// `erl -noshell -eval '…' -extra +deterministic -o /tmp/x /tmp/s.erl` answers
+/// `["+deterministic","-o","/tmp/x","/tmp/s.erl"]`, `erl stray -noshell -eval '…' -extra a b`
+/// answers `["stray","a","b"]`, and `init:get_argument(extra)` is the bare atom `error`.
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
     let mut builder = Builder {
         emulator: EmulatorConfig::default(),
@@ -329,6 +342,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         prev_max_heap_words: 0,
         max_ports: None,
         init_args: InitArgs::new(),
+        plain_args: Vec::new(),
         perf_map: PerfMapConfig::new(),
         action: Action::Boot,
     };
@@ -407,6 +421,21 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 let value = value_of(args, index, argument)?;
                 builder.record(argument, vec![value]);
                 index += 2;
+            }
+            // `-extra` **ends** the switch surface. The C `init` treats it as
+            // `start_extra_arg` (`erts/preloaded/src/init.erl:1674-1675`), which answers
+            // `lists:reverse(As, Bs)` — the stray positional arguments collected so far plus
+            // **every** remaining token, verbatim and in order — as the plain-argument list,
+            // and stops parsing: nothing after `-extra` is an init argument or a Start
+            // instruction, and `-extra` itself is neither (the oracle's
+            // `init:get_argument(extra)` is the bare atom `error`). Verified against OTP
+            // 29.1.1 / erts-17.1:
+            // `erl -noshell -eval '…' -extra a b` ⇒ `init:get_plain_arguments()` is
+            // `["a","b"]`, `init:get_argument(extra)` is `error`, and a `-eval` written after
+            // the `-extra` never runs (it is a plain argument).
+            "-extra" => {
+                builder.plain_args.extend(args[index + 1..].iter().cloned());
+                index = args.len();
             }
             "-emu_flavor" => {
                 let value = value_of(args, index, "-emu_flavor")?;
@@ -587,10 +616,23 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 }
                 index = builder.record_unmodeled(args, index);
             }
-            // A plain positional token: the oracle's launcher forwards it to `init` as an
-            // ordinary argument, which is never a usage error (`erl junk -noshell ...` exits
-            // 0). This runtime ignores it, matching that status.
-            _ => index += 1,
+            // A plain positional token: the oracle's launcher forwards it to `init`, which
+            // collects it as an `arg` into the plain-argument list
+            // (`erts/preloaded/src/init.erl:1704-1705`: `parse_boot_args(Bs, Ss, Fs, [B|As])`),
+            // so `erl stray -noshell …` answers `init:get_plain_arguments()` = `["stray"]`
+            // (verified against OTP 29.1.1 / erts-17.1). It is never a usage error and never
+            // an init argument.
+            //
+            // Residual: the oracle's flags are **greedy** — a positional token directly after
+            // a valueless flag is that flag's *value* (`init.erl:1735-1747`'s `get_args`), so
+            // `erl -noinput stray` is `init:get_argument(noinput)` = `{ok,[["stray"]]}` with an
+            // empty plain-argument list, where this parser records `noinput` with no values
+            // and `stray` as a plain argument. That flag/value grammar is the `-`-switch
+            // surface's own concern (`M1_GAPS.md`), not the plain-argument collector's.
+            _ => {
+                builder.plain_args.push(argument.to_string());
+                index += 1;
+            }
         }
     }
     let code_paths = builder.code_paths();
@@ -604,6 +646,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: builder.heap,
         max_ports: builder.max_ports,
         init_args: builder.init_args,
+        plain_args: builder.plain_args,
         perf_map: builder.perf_map,
         // The CLI resolves the script it drives in `drive`, once the whole command line
         // (and therefore the action) is known — `-version` is the one action that boots
@@ -642,6 +685,10 @@ struct Builder {
     max_ports: Option<usize>,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
     init_args: InitArgs,
+    /// The **plain arguments** collected so far, in command-line order: a stray positional
+    /// token (the C `init`'s `arg`), then everything after `-extra` (its
+    /// `start_extra_arg` clause) — the `init:get_plain_arguments/0` source.
+    plain_args: Vec<String>,
     /// The perf-map / JIT-dump surface (`+JPperf`/`+JPperfdirectory`) being assembled
     /// (contract A.8).
     perf_map: PerfMapConfig,
@@ -2557,6 +2604,65 @@ mod tests {
         assert_eq!(parsed(&["junk"]).action, Action::Boot);
     }
 
+    /// The **plain-argument** surface (contract A.6): the C `init`'s `Args` accumulator — a
+    /// stray positional `arg`, plus **everything** after `-extra`, verbatim and in order —
+    /// is [`RuntimeConfig::plain_args`], the source of `init:get_plain_arguments/0`.
+    ///
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1): `erl -noshell -eval '…' -extra a b` ⇒
+    /// `["a","b"]` with `init:get_argument(extra)` = the bare atom `error`; `erl stray
+    /// -noshell -eval '…' -extra a b` ⇒ `["stray","a","b"]`; a `-eval` written **after** the
+    /// `-extra` never runs (it is a plain argument).
+    #[test]
+    fn extra_and_stray_positionals_are_the_plain_arguments() {
+        // The exact tail the real `erlc` front end appends, which
+        // `erl_compile:compile_cmdline/0` (`lib/stdlib/src/erl_compile.erl:53-56`) reads
+        // through `init:get_plain_arguments/0`.
+        let config = parsed(&[
+            "-noshell",
+            "-s",
+            "erl_compile",
+            "compile_cmdline",
+            "-extra",
+            "+deterministic",
+            "-o",
+            "/tmp/x",
+            "/tmp/s.erl",
+        ]);
+        assert_eq!(
+            config.plain_args,
+            vec!["+deterministic", "-o", "/tmp/x", "/tmp/s.erl"]
+        );
+        // `-extra` is **not** an init argument, and the Start instruction before it still
+        // took effect.
+        assert_eq!(config.init_args.get("extra"), None);
+        assert_eq!(
+            config.action,
+            Action::Apply {
+                module: "erl_compile".to_string(),
+                function: "compile_cmdline".to_string(),
+                args: Vec::new(),
+            }
+        );
+
+        // Nothing after `-extra` is a switch or a Start instruction any more: the `-eval`
+        // below is a plain argument and never replaces the action.
+        let config = parsed(&["-noshell", "-extra", "-eval", "halt(0)."]);
+        assert_eq!(config.plain_args, vec!["-eval", "halt(0)."]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(config.init_args.get("eval"), None);
+
+        // A stray positional token is the C's `arg`: it comes first, ahead of the `-extra`
+        // tail (`lists:reverse(As, Bs)`), and is never an init argument.
+        let config = parsed(&["stray", "-noshell", "-extra", "a", "b"]);
+        assert_eq!(config.plain_args, vec!["stray", "a", "b"]);
+        assert_eq!(config.init_args.get("stray"), None);
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+
+        // Which is why a command line with neither answers the empty list, exactly as the
+        // oracle answers for the argv of an `-eval`/`-s`/`-run` invocation.
+        assert!(parsed(&["-noshell"]).plain_args.is_empty());
+        assert!(RuntimeConfig::default().plain_args.is_empty());
+    }
     /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
     /// each is an **init argument**, exactly as the oracle
     /// (`erl -setcookie abc -noshell -eval 'io:format("~w~n",[init:get_argument(setcookie)]), halt().'`

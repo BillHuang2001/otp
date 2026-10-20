@@ -172,18 +172,25 @@ impl RuntimeContext<'_> {
             });
         self.atom(if relaxed { "relaxed" } else { "strict" })
     }
-    /// `init:get_plain_arguments/0`: the arguments the emulator did not model, each as a
-    /// string (contract A.6).
+    /// `init:get_plain_arguments/0`: the command-line tokens `init` did not consume as a
+    /// flag or a Start instruction, each as a string, in order (contract A.6).
     ///
-    /// This runtime has no `-extra` handling and the CLI rejects a stray positional
-    /// argument outright (exit 2, see [`crate::cli::parse`]), so no plain argument can
-    /// ever have been given: the result is always `[]` — which is exactly what the
-    /// oracle reports for the corpus argv `["-noshell", …, "-eval", …]` (verified
-    /// against OTP 29/erts-17.1).
+    /// The list is [`RuntimeConfig::plain_args`](crate::config::RuntimeConfig::plain_args),
+    /// which the CLI fills from the two sources the C `init` accumulates into its `Args`
+    /// field (`erts/preloaded/src/init.erl:1669-1710`): a stray **positional** token (an
+    /// `arg`) and — when the command line carries `-extra` — **every** token after it,
+    /// verbatim (`start_extra_arg`, `lists:reverse(As, Bs)`). It is `[]` for a command line
+    /// with neither, which is what the oracle answers for the argv of every `-eval`/`-s`/
+    /// `-run` invocation, and exactly what the real `erlc` front end relies on: it invokes
+    /// the emulator as `… -s erl_compile compile_cmdline -extra +deterministic -o <D> <src>`
+    /// and `erl_compile:compile_cmdline/0` (`lib/stdlib/src/erl_compile.erl:53-56`) reads the
+    /// file list straight out of this call. Verified against OTP 29.1.1 / erts-17.1:
+    /// `erl -noshell -eval '…' -extra a b` ⇒ `["a","b"]`, and `-extra` is not itself an init
+    /// argument (`init:get_argument(extra)` is the bare atom `error`).
     pub(super) fn get_plain_arguments(&mut self) -> Result<Eterm> {
-        Ok(beam_term::NIL)
+        let plain: Vec<String> = self.runtime.plain_args().to_vec();
+        self.string_list(&plain)
     }
-
     /// `init:get_arguments/0`: the whole command line as `{Flag, [Value…]}` pairs
     /// (contract A.6).
     ///
@@ -597,15 +604,34 @@ mod tests {
     }
 
     #[test]
-    fn get_plain_arguments_is_always_empty() {
-        // The CLI models no plain arguments (a stray positional argument is a usage
-        // error), so `init:get_plain_arguments/0` is the empty list, as the oracle's is.
+    fn get_plain_arguments_reports_the_configured_plain_args() {
+        // `RuntimeConfig::plain_args` is the `init:get_plain_arguments/0` source (the C
+        // `init`'s `Args` field): a config that carries plain arguments answers them as
+        // strings, in order, and the default config answers `[]`.
+        let mut config = crate::config::RuntimeConfig::default();
+        config.plain_args = vec![
+            "+deterministic".to_string(),
+            "-o".to_string(),
+            "/tmp/x".to_string(),
+        ];
+        let mut configured = Runtime::new(config).expect("a runtime with plain args");
+        let plain = call(&mut configured, "init", "get_plain_arguments", &[]).expect("plain args");
+        let strings: Vec<String> = terms::list_elements(plain)
+            .expect("a list")
+            .iter()
+            .map(|argument| string_of(*argument))
+            .collect();
+        assert_eq!(strings, vec!["+deterministic", "-o", "/tmp/x"]);
+
+        // A host-built runtime (no plain arguments) answers the empty list — the oracle's
+        // `init:get_plain_arguments()` for a command line with neither a stray positional nor
+        // `-extra` (verified against OTP 29.1.1 / erts-17.1).
         let mut runtime = runtime();
+        assert!(runtime.plain_args().is_empty());
         let plain = call(&mut runtime, "init", "get_plain_arguments", &[]).expect("plain args");
         assert_eq!(plain, beam_term::NIL);
         assert!(terms::list_elements(plain).expect("a list").is_empty());
     }
-
     /// The emulator's own **automatic** flags, in the order `init:get_arguments/0` lists
     /// them (`init.erl:363-388`).
     const AUTOMATIC_FLAGS: [&str; 4] = ["root", "bindir", "progname", "home"];

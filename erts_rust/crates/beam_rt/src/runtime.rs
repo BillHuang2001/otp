@@ -1498,6 +1498,15 @@ impl Runtime {
         &self.config.init_args
     }
 
+    /// The **plain arguments** — the tokens `init` did not consume as a flag or a Start
+    /// instruction (the source of `init:get_plain_arguments/0`, contract A.6).
+    ///
+    /// Empty unless the command line carried a stray positional argument or `-extra` (see
+    /// [`RuntimeConfig::plain_args`]); a runtime a host built
+    /// ([`Runtime::with_defaults`]) always answers an empty list.
+    pub fn plain_args(&self) -> &[String] {
+        &self.config.plain_args
+    }
     /// The preloaded-module registry skeleton (contract A.7).
     pub fn preloaded(&self) -> &PreloadedModules {
         &self.preloaded
