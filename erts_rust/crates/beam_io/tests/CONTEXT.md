@@ -88,8 +88,9 @@ suites and helper entry points; this node adds the **fixture-level** knowledge a
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (never a
 bare `cargo`, never `cd` — use the wrapper, the sandbox `$HOME` is read-only). 26 suites, **251
-passing / 0 failing**; the whole `-p beam_io` run is **1243** (989 lib + 251 integration + 3
-doctests, 2 doctests `ignore`d). Per file:
+passing / 0 failing**; the whole `-p beam_io` run is **1325 passed / 0 failed / 2 ignored** over **28
+test binaries** (1 lib + 26 integration + 1 doctest binary), i.e. **1071** lib tests + 251
+integration tests + 3 doctests, with 2 more doctests `#[ignore]`d (5 doctests in all). Per file:
 
 | Suite | Tests | Suite | Tests |
 |---|---|---|---|
@@ -120,8 +121,10 @@ pin, incl. its `[0]einval` operand guard); `{active,once}` delivering one datagr
 no `Passive`; `{active,2}` delivering two datagrams then exactly one `Passive` and nothing more;
 passive→`{active,true}` delivering the already-buffered datagram (the re-arm's synthesized edge);
 `{active,true}` TCP delivering the peer's bytes with an **empty** header; `{packet,2}` TCP
-delivering the **stripped** body; two armed datagram ports reported in **port-number order** by one
-destructive drain; and the channel staying empty for a passive port and after a close. Waits are
+delivering the **stripped** body; an `ActiveInputEvent::Error` (a peer reset under
+`{show_econnreset,true}`) drained **before** the close report of the same round; two armed datagram
+ports reported in **port-number order** by one destructive drain; and the channel staying empty for a
+passive port and after a close. Waits are
 conditions (one bounded poll slice per round under a 10 s hang guard), never wall-clock budgets, and
 assertions are on content/sets, never on round counts.
 Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channel** end-to-end
@@ -136,6 +139,8 @@ Two suites pin the **`{inet_async, …}` / `{inet_reply, …}` completion channe
   (the oracle's reason; its message *count* is a probe property and stays unasserted). Rows that are
   structural-only (no oracle column): `a_receive_hands_out_an_id_and_the_completion_never_rides_the_reply`,
   `a_receive_completes_at_the_rounds_async_drive_point`,
+  `a_command_answers_its_caller_tag_verbatim` (the `prim_inet` caller tag reaching the completion
+  byte-for-byte),
   `an_accept_completion_hands_over_a_descriptor_the_runtime_can_adopt` (the descriptor hand-off;
   `INET_REQ_FDOPEN` adoption is a crate-local route to the same state the C reaches internally) and
   `port_notifications_stay_exactly_two_variants` (the compile-time two-arm match).
@@ -193,6 +198,10 @@ rot.
   each step owes (the accept's `{inet_async, _, _, {ok, Port2}}` first, then the command's
   `{inet_reply, _, ok, Ref}`), and on `port_close` skip the ownership `{'EXIT', Port, normal}` that
   may precede the pending operation's `{inet_async, _, _, {error, closed}}`.
+- **The read path's ordering rule — a complete buffered unit wins over a pending peer close — is
+  pinned at the `src/drivers/inet/write_then_close_tests.rs` level, not here**; these suites see only
+  its consequence (the `{ok, Data}` a queued receive answers ahead of the `{error, closed}` the
+  *following* operations are owed), so a change to that ordering belongs in that unit suite.
 ## Routing Table
 - `abi_driver.rs` → the end-to-end C-driver path (incl. the driver-queue family round-trip, the
   `outputv`-over-`output` preference, the empty-queue write-readiness case, the `NULL`-`*rbuf`
@@ -217,7 +226,10 @@ rot.
   oracle table)
 - `driver_table.rs`, `driver_registry_slots.rs` → the process-global driver registry
 - `poller.rs`, `port.rs`, `port_task.rs`, `driver_seams.rs` → the reactor, the port, port-task
-  scheduling, the driver-declared timer/port-exit seams
+  scheduling, the driver-declared timer/port-exit seams. A driver-seam suite's port may be **parked
+  rather than finished** after `close` — the lying-write row closes a port whose queue still holds the
+  bytes the driver falsely counted as written — and `PortRegistry::is_closing(id)` is how a suite
+  observes that (a parked port is still a live port with its number allocated, not a leak).
 - `inet_async.rs` → the `tcp_inet` **asynchronous-op queue + completion channel** through
   `PortRegistry` (numeric opcodes, the single receive slot, the caller tag, the accept hand-off and
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
@@ -225,11 +237,14 @@ rot.
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
 - `spawn.rs`'s `a_stalled_write_stays_queued_and_arms_write_readiness` is the integration-level pin of
   the C's **deferred port close** (`io.c:3946-3956` + `flush_port` `io.c:3659-3700`): a `sleep` child
-  never reads its stdin, so `PortRegistry::close` **parks** the port in `PortState::Closing` with its
-  output queue intact and both poller registrations still armed, `stop` not run and no `Closed`
-  reported; a command on it is `badarg` and a second `close` is idempotent. The fully-drained closes
-  in `port.rs`/`port_task.rs`/`efile.rs` still deregister inside the call — that is the same contract's
-  synchronous arm, not a discarded queue.
+  never reads its stdin, so the write stalls with the unwritable remainder still queued and write
+  readiness armed, and `PortRegistry::close` **parks** the port in `PortState::Closing` with that
+  remainder retained (`output_len() > 0`), an `OUTPUT` task pending, both poller registrations still
+  armed, its number still allocated, `stop` not run and no `Closed` reported; a command on it is
+  `badarg` and queues nothing, a second `close` is idempotent (nothing written, nothing torn down),
+  and a following round that makes no progress leaves it parked and owes the owner no `Closed`. The
+  fully-drained closes in `port.rs`/`port_task.rs`/`efile.rs` still deregister inside the call — that
+  is the same contract's synchronous arm, not a discarded queue.
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
   (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
   (`udp_inet`) and the packed opcode/`control` command grammar (`ram_file_drv`), each with an
