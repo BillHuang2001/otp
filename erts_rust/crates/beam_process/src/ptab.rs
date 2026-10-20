@@ -62,9 +62,11 @@
 //!
 //! A **wire**-sourced reason (an inbound `DOP_EXIT`/`DOP_EXIT2`/`DOP_MONITOR_P_EXIT` reason, which
 //! the host decoded onto a transient arena it recycles) is never embedded verbatim: the two remote
-//! builders copy it onto the recipient's own heap — or, when that heap refuses, into the message's
-//! [`HeapFragment`] — from an **empty** source off-heap table (a wire payload carries no off-heap
-//! handles), so the queued `{'EXIT', …}`/`{'DOWN', …}` never points into recycled memory.
+//! builders build the payload around it on a **scratch** arena and then copy the whole graph onto
+//! the recipient's own heap — or, when that heap refuses, into the message's [`HeapFragment`] —
+//! from an **empty** source off-heap table (a wire payload carries no off-heap handles), so the
+//! queued `{'EXIT', …}`/`{'DOWN', …}` never points into recycled memory, and no recipient-heap word
+//! is carried across the copy's own collection.
 //!
 //! Every signal-builder path handles a full receiver heap exactly as
 //! [`Process::deliver`](crate::process::Process::deliver) does: an **ordinary** receiver's nursery
@@ -238,12 +240,18 @@ const SIGNAL_SCRATCH_WORDS: usize = 64;
 /// `src` describes the heap `reason` lives in and is the **one** home of the ownership rule: it is
 /// `Some(table)` only for a reason that is neither an immediate nor already on the recipient's own
 /// heap (a signaller's table, or a wire reason on the host's transient dispatch arena), and `None`
-/// otherwise. A **non-immediate** reason with a source table is materialised on the recipient's own
-/// heap first ([`copy_reason_onto`]); when that heap refuses (`AllocKind::Heap`/`Message`) the
-/// **whole** payload is built into a heap fragment from the **same** source table
-/// ([`enqueue_fragment_payload`], whose copy resolves the reason's graph through `src`), so the
-/// receiver is never collected or grown on demand in that case. An **immediate** is embedded
-/// verbatim and **never** triggers a copy or a collection — `node_down`'s fast path.
+/// otherwise. Such a reason is **never** copied and then reused across a collection: the payload is
+/// built around it on a **scratch** [`Heap`] — whose words cannot move with the recipient's heap,
+/// so the source of the transfer stays put — and the **whole** payload graph is then moved onto the
+/// recipient's own heap in one rooted-by-construction step ([`copy_reason_onto`], whose
+/// collect-grow-retry reads only from that scratch arena and the caller's table). The enqueue
+/// follows immediately, with nothing in between that could collect, so no recipient-heap word
+/// outlives its own relocation. When the recipient's heap refuses the payload
+/// (`AllocKind::Heap`/`Message`) the **whole** payload is built into a heap fragment instead
+/// ([`enqueue_fragment_payload`]), so the receiver is never collected or grown on demand in that
+/// case. An **immediate** is embedded verbatim and **never** triggers a copy or a collection —
+/// `node_down`'s fast path — and a reason already owned by the recipient (its own heap, `None`)
+/// goes straight to `build` on that heap.
 fn build_signal_message<F>(
     recipient: &mut Process,
     from: Eterm,
@@ -255,32 +263,35 @@ fn build_signal_message<F>(
 where
     F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
 {
-    // Ownership transfer first: a reason in *another* heap becomes a term the recipient owns (or
-    // the payload moves into a fragment) before `build` may embed it. An immediate, or a reason
-    // already on the recipient's heap, goes straight through untouched.
-    let reason = match src {
-        Some(table) if !is_immediate(reason) => {
-            match copy_reason_onto(recipient, reason, Some(table), decline) {
-                Ok(copied) => copied,
-                // The heap cannot take the copy without moving under unpublished live terms (or
-                // cannot take it at all): build the payload — reason included — into a fragment,
-                // copying its graph from the very table the reason lives in.
-                Err(BeamError::Alloc(failure))
-                    if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
-                {
-                    return enqueue_fragment_payload(
-                        recipient,
-                        from,
-                        reason,
-                        Some(table),
-                        &mut build,
-                    );
-                }
-                Err(error) => return Err(error),
+    // Ownership transfer for a reason in *another* heap, in one step: build the payload on a
+    // scratch arena (the reason itself still lives in the caller's stable heap for the duration of
+    // the call), then copy the whole graph onto the recipient's own heap. `copy_reason_onto` may
+    // collect and grow the recipient first, which is sound here precisely because nothing this
+    // transfer embeds lives in the recipient's heap until that copy has returned.
+    if let (Some(table), false) = (src, is_immediate(reason)) {
+        let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
+        let payload = build(&mut scratch, reason)?;
+        return match copy_reason_onto(recipient, payload, Some(table), decline) {
+            // Nothing runs between the copy and the enqueue, so the copied word is live when the
+            // message takes it — no second build around an unrooted word.
+            Ok(owned) => {
+                recipient.mailbox_mut().enqueue(Message::new(owned, from));
+                Ok(())
             }
-        }
-        _ => reason,
-    };
+            // The heap cannot take the payload without moving under unpublished live terms (or
+            // cannot take it at all): build it — reason included — into a fragment, copying its
+            // graph from the very table the reason lives in.
+            Err(BeamError::Alloc(failure))
+                if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+            {
+                enqueue_fragment_payload(recipient, from, reason, Some(table), &mut build)
+            }
+            Err(error) => Err(error),
+        };
+    }
+    // An immediate reason, or one already on the recipient's own heap (the queued-signal path's
+    // apply-time build): embedded verbatim on that heap. `reason` is an immediate or lives outside
+    // the recipient's young heap here, so reusing the word across the retry's collect is sound.
     match build(recipient.heap_mut(), reason) {
         Ok(term) => {
             recipient.mailbox_mut().enqueue(Message::new(term, from));

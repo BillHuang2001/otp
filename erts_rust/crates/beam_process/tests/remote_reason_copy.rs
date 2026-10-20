@@ -54,7 +54,10 @@
 //!    moved;
 //! 4. [`a_gate_declined_watcher_gets_the_boxed_wire_reason_in_the_messages_heap_fragment`] — the
 //!    DOWN half of the same decline, through the host's `CollectionGate`.
-//!
+//! 5. [`a_reason_copied_onto_a_tight_nursery_survives_the_payload_builds_collection`] — a receiver
+//!    whose nursery takes the reason copy but **not** the payload built around it: the refused
+//!    build collects and grows the nursery before retrying, and the retried build must embed the
+//!    reason at its **relocated** address, never the pre-collection word.//!
 //! Determinism: no sleep, no wall-clock bound, no oracle. The "was it copied" question is answered
 //! by an address comparison and a structural walk performed **after** the arena is gone; the
 //! "did nothing move" claim by the receiver's own nursery observables.
@@ -66,10 +69,10 @@ use beam_common::Result;
 use beam_gc::HeapPolicy;
 use beam_message::Message;
 use beam_process::prelude::*;
-use beam_term::list::{car, cdr};
+use beam_term::list::{car, cdr, ptr_val};
 use beam_term::prelude::{
-    external_pid_size_words, is_list, is_small, make_atom, make_small, signed_value, tuple_element,
-    tuple_size, write_external_pid, AtomTable, Eterm, NIL,
+    external_pid_size_words, is_list, is_small, make_atom, make_small, signed_value, size_object,
+    tuple_element, tuple_size, write_external_pid, AtomTable, Eterm, NIL,
 };
 
 /// The words the fragment cases' reason occupies: far more than the tiny nursery below, so the
@@ -79,7 +82,12 @@ const OVERSIZED_INT_COUNT: i64 = 10;
 /// The receiver's nursery in words for the fragment cases — smaller than one boxed reason, so the
 /// copy is refused by capacity (never by timing).
 const SMALL_NURSERY_WORDS: usize = 16;
-
+/// The receiver's nursery in words for the tight-nursery case: large enough for the **reason copy**
+/// and too small for the payload built around it, so the copy succeeds and the build is refused.
+const TIGHT_NURSERY_WORDS: usize = 38;
+/// The reason's list length in the tight-nursery case, chosen (and asserted) so the reason alone
+/// fills all but a few words of the nursery.
+const TIGHT_REASON_LIST: i64 = 16;
 /// A table, the atom table its [`SignalAtoms`] were interned from, and the sysname atom term
 /// standing in for the remote node.
 fn fixture() -> (ProcessTable, AtomTable, Eterm) {
@@ -413,5 +421,184 @@ fn a_gate_declined_watcher_gets_the_boxed_wire_reason_in_the_messages_heap_fragm
     };
     assert_ne!(copied.raw(), reason_word, "the fragment holds a COPY of the reason");
     assert_boxed_reason(copied, named(&names, "shutdown"), 1, OVERSIZED_INT_COUNT);
+    Ok(())
+}
+// --- the retry must not embed a collected-away reason ------------------------
+#[test]
+fn a_reason_copied_onto_a_tight_nursery_survives_the_payload_builds_collection() -> Result<()> {
+    let (mut table, names, node) = fixture();
+    let mut wire = wire_pid_heap();
+    let receiver = table.spawn(HeapPolicy {
+        initial_young_words: TIGHT_NURSERY_WORDS,
+        ..HeapPolicy::default()
+    })?;
+    table.get_mut(receiver).expect("receiver").set_trap_exit(true);
+    let capacity = table
+        .get(receiver)
+        .expect("the receiver is live")
+        .collector()
+        .young()
+        .capacity_words();
+    assert_eq!(
+        capacity, TIGHT_NURSERY_WORDS,
+        "the tight nursery really is the size this case is built on"
+    );
+    let mut arena = arena();
+    let reason = boxed_reason(&mut arena, named(&names, "boom"), 1, TIGHT_REASON_LIST);
+    let reason_word = reason.raw();
+    let reason_words = size_object(reason);
+    // The geometry the hazard needs, asserted rather than assumed: the reason copy fits (so it
+    // lands on the receiver's own heap) while the payload's **first** wrapper allocation — the
+    // `From` external pid — does not, so the build is refused and the receiver's nursery is
+    // collected before the retry.
+    assert!(
+        reason_words <= capacity,
+        "the reason copy fits the tight nursery ({reason_words} of {capacity} words)"
+    );
+    assert!(
+        reason_words + external_pid_size_words() > capacity,
+        "the copy leaves fewer words free than the wrapper's own `From` needs \
+         ({reason_words} + {} > {capacity})",
+        external_pid_size_words()
+    );
+    let ext = remote_pid(&mut wire, node, 61, 62, 63);
+    let remote = RemotePid::from_eterm(ext)?;
+    table.record_remote_link(receiver, remote)?;
+    let minor_before = table
+        .get(receiver)
+        .expect("the receiver is live")
+        .collector()
+        .minor_gcs();
+    let base_before = table
+        .get(receiver)
+        .expect("the receiver is live")
+        .collector()
+        .young()
+        .base();
+    table.apply_remote_exit_signal(receiver, remote, reason, false)?;
+    // Anti-vacuity: the refused build really did collect the receiver's nursery before retrying,
+    // so the retry below runs against a relocated heap — the window this case exists for.
+    let process = table.get(receiver).expect("the receiver survived");
+    assert_eq!(
+        process.collector().minor_gcs(),
+        minor_before + 1,
+        "the refused payload build collected the receiver's nursery exactly once before retrying"
+    );
+    assert_ne!(
+        process.collector().young().base(),
+        base_before,
+        "the retry runs against a nursery that is not the one the reason was copied into"
+    );
+    recycle(&mut arena, &names);
+    drop(arena);
+    let message = sole_message(&table, receiver);
+    assert_eq!(message.from(), node, "the `from` slot stays the node atom");
+    let payload = message.payload();
+    // SAFETY: `payload` is the live `{'EXIT', RemotePid, Reason}` tuple on the receiver's heap.
+    let copied = unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), named(&names, "EXIT"));
+        assert_eq!(RemotePid::from_eterm(tuple_element(payload, 1))?, remote);
+        tuple_element(payload, 2)
+    };
+    assert_ne!(
+        copied.raw(),
+        reason_word,
+        "the queued reason is a COPY — never the arena word the host is about to recycle"
+    );
+    // The retried build must embed the reason where it now **lives**. A word carried across the
+    // collection addresses the nursery space that collection replaced, so it is in neither the
+    // receiver's current young space nor its mature space: checked before anything dereferences
+    // the word.
+    let reason_ptr = ptr_val(copied);
+    assert!(
+        process.collector().young_contains(reason_ptr)
+            || process.collector().mature_contains(reason_ptr),
+        "the queued reason ({:#x}) must live in the receiver's heap (young base {:?}), not in the \
+         nursery space the rejected build's collection replaced (base {base_before:?})",
+        copied.raw(),
+        process.collector().young().base()
+    );
+    assert_boxed_reason(copied, named(&names, "boom"), 1, TIGHT_REASON_LIST);
+    Ok(())
+}
+#[test]
+fn a_down_reason_copied_onto_a_tight_nursery_survives_the_payload_builds_collection() -> Result<()> {
+    let (mut table, names, node) = fixture();
+    let mut wire = wire_pid_heap();
+    let watcher = table.spawn(HeapPolicy {
+        initial_young_words: TIGHT_NURSERY_WORDS,
+        ..HeapPolicy::default()
+    })?;
+    let ext = remote_pid(&mut wire, node, 71, 72, 73);
+    let remote = RemotePid::from_eterm(ext)?;
+    let reference = table.monitor_term(watcher, ext, MonitorKind::Process)?;
+    let mut arena = arena();
+    let reason = boxed_reason(&mut arena, named(&names, "shutdown"), 1, TIGHT_REASON_LIST);
+    let reason_word = reason.raw();
+    let reason_words = size_object(reason);
+    let capacity = table
+        .get(watcher)
+        .expect("the watcher is live")
+        .collector()
+        .young()
+        .capacity_words();
+    // The same asserted geometry as the exit case: the reason copy fits, its wrapper does not.
+    assert!(
+        reason_words <= capacity && reason_words + external_pid_size_words() > capacity,
+        "the DOWN's own target cannot fit beside a {reason_words}-word reason in {capacity} words"
+    );
+    let minor_before = table
+        .get(watcher)
+        .expect("the watcher is live")
+        .collector()
+        .minor_gcs();
+    let base_before = table
+        .get(watcher)
+        .expect("the watcher is live")
+        .collector()
+        .young()
+        .base();
+    table.remote_monitor_down(watcher, remote, reference, reason)?;
+    let process = table.get(watcher).expect("the watcher survived");
+    assert_eq!(
+        process.collector().minor_gcs(),
+        minor_before + 1,
+        "the refused DOWN build collected the watcher's nursery exactly once before retrying"
+    );
+    assert_ne!(
+        process.collector().young().base(),
+        base_before,
+        "the retry runs against a nursery that is not the one the reason was copied into"
+    );
+    recycle(&mut arena, &names);
+    drop(arena);
+    let message = sole_message(&table, watcher);
+    assert_eq!(message.from(), node, "the DOWN `from` slot stays the node atom");
+    let payload = message.payload();
+    // SAFETY: `payload` is the live `{'DOWN', Ref, process, RemotePid, Reason}` tuple on the
+    // watcher's heap.
+    let copied = unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), named(&names, "DOWN"));
+        assert_eq!(tuple_element(payload, 2), named(&names, "process"));
+        assert_eq!(RemotePid::from_eterm(tuple_element(payload, 3))?, remote);
+        tuple_element(payload, 4)
+    };
+    assert_ne!(
+        copied.raw(),
+        reason_word,
+        "the queued DOWN reason is a COPY — never the arena word the host is about to recycle"
+    );
+    let reason_ptr = ptr_val(copied);
+    assert!(
+        process.collector().young_contains(reason_ptr)
+            || process.collector().mature_contains(reason_ptr),
+        "the queued DOWN reason ({:#x}) must live in the watcher's heap (young base {:?}), not in \
+         the nursery space the rejected build's collection replaced (base {base_before:?})",
+        copied.raw(),
+        process.collector().young().base()
+    );
+    assert_boxed_reason(copied, named(&names, "shutdown"), 1, TIGHT_REASON_LIST);
     Ok(())
 }
