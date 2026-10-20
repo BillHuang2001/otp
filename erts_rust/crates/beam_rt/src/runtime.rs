@@ -1528,9 +1528,9 @@ impl Runtime {
     /// fills that slot is entirely up to the host, because only the host knows where the atoms a
     /// foreign thread creates must land and how a thread-safe send becomes a mailbox delivery. This
     /// method is that decision for `beam_rt`: the factory it installs is
-    /// [`ThreadEnvFactory`](crate::nif::thread_env::ThreadEnvFactory), whose hosts intern through
+    /// `ThreadEnvFactory` (in `crate::nif::thread_env`), whose hosts intern through
     /// this runtime's one atom-index hub and whose `enif_send` queues a complete ETF image for
-    /// [`Runtime::drain_nif_thread_sends`].
+    /// `Runtime::drain_nif_thread_sends`.
     ///
     /// A runtime that never installs it keeps the **honest old answer**: a NIF-created thread gets
     /// the C's `NULL` message env, never a fake host — a crate-private `AtomTable` would hand a NIF
@@ -1563,7 +1563,7 @@ impl Runtime {
     /// stores nothing, so a poisoned install can never be turned into a success here. Installation
     /// is **last-install-wins** and process-global: a second call replaces (and drops) the previous
     /// factory and hands this runtime a **fresh** queue, which is why the crate's own test suites
-    /// serialise installs with [`lock_nif_thread_env`].
+    /// serialise installs with `crate::runtime::lock_nif_thread_env`.
     pub fn install_nif_thread_env(&mut self) -> bool {
         if self.foreign_atoms().is_none() {
             self.install_foreign_atom_hub();
@@ -1602,7 +1602,7 @@ impl Runtime {
     ///
     /// The order is load-bearing: [`beam_abi::nif::clear_thread_env_factory`] runs **first**, so no
     /// host can be opened (or stay cached) for the factory that is about to lose its queue, and only
-    /// then is the runtime's [`ForeignSends`] handle dropped, so a factory that somehow outlived the
+    /// then is the runtime's `ForeignSends` handle dropped, so a factory that somehow outlived the
     /// clear cannot queue into a buffer nobody drains any more.
     ///
     /// A message already queued but not yet drained is **dropped** here: its `enif_send` had
