@@ -2154,9 +2154,9 @@ mod tests {
             assert_eq!(show(ctx, imported, false), "#Fun<lists.3.1234>");
             assert_eq!(show(ctx, imported, true), "#Fun<lists.3.1234>");
 
-            // A `Local` (`make_fun3`) fun stays the typed capability gap — the
-            // documented structural gap: this `[header, uniq, index]` descriptor has
-            // no module/name for `fun_to_list/1` to render.
+            // With no identity seam installed, a `Local` (`make_fun3`) fun is the
+            // typed capability gap: its `[header, uniq, index]` descriptor carries no
+            // module, so a `#Fun<…>` here would be fabricated.
             let words: Box<[Eterm]> = vec![
                 Eterm::from_raw(beam_term::FUN_SUBTAG | (2usize << 8)),
                 Eterm::from_raw(0), // uniq
