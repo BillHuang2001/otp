@@ -4,7 +4,9 @@ Genuine, verified differences between the Rust runtime (`beam_rt`) and the syste
 oracle that the expanded corpus found. None is a capability gap the runtime signals honestly
 (an `unsupported` raise / exit 3), so a case pinning one would be a `mismatch` — the gate's
 one hard failure. Each is therefore **deliberately not pinned** as a corpus case; the owning
-crate below must close the gap, after which a case can be added to the corpus.
+crate below must close the gap, after which a case can be added to the corpus. Where an entry's
+neighbouring half *does* agree, that half is named too, so the boundary of the unpinned shape is
+exact.
 
 (The honest capability gaps a *case* pins — the runtime signals them via its documented
 `beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above. A few
@@ -54,34 +56,13 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
 - `enif_free_iovec` is a **probe hazard**: the only safe shape needs the *internal*
   `ERL_NIF_IOVEC_FLAGS_PREALLOC` (absent from the public `erl_nif.h`), and the freeing form of an
   env-attached vector is UB on the oracle — deliberately not pinned.
-- A resource type's **`stop` callback is never invoked** by the Rust runtime, while the oracle calls
-  it once per `enif_select(…, ERL_NIF_SELECT_STOP, …)` (`erl_check_io.c:1530`) — armed or not.
-  Measured trace (arm a READ interest on a pipe read end, then `STOP` twice, reading the callback's
-  own counter between the steps): oracle `{0,0,17,1,1,2}`, rust `{0,0,17,0,1,0}` — the *codes*
-  agree (`17` = `STOP_CALLED|READ_CANCELLED`, then `1` = `STOP_CALLED`), only the callback count
-  differs, and `ERL_NIF_SELECT_STOP_SCHEDULED` is unobservable for the same reason. Owner:
-  `beam_abi` / the `beam_rt` select hook (`crates/beam_rt/src/nif_select.rs`).
-- **`enif_schedule_nif`'s success path** — the documented "yield" seam. Measured with a real NIF
-  that re-schedules itself (`enif_schedule_nif(env, "sched_resumed", 0, sched_resumed, 0, NULL)`
-  from the first entry, the resumed entry returning the call counter): the oracle resumes the call
-  on the same scheduler and the module receives the resumed entry's value (`2`), and it does the
-  same for `ERL_NIF_DIRTY_JOB_CPU_BOUND` (`2`, so dirty dispatch works there too). The Rust runtime
-  leaves `NifHost::schedule_nif` at its `None` default, so the C raises `badarg`
-  (`crates/beam_abi/src/nif/enif/process.rs`) and the module observes `error:badarg` — i.e. the
-  same root cause as the already-recorded `dirty_scheduler_support = 0`. The **refusal** half
-  (`argc > 255`, a flags bit outside the dirty-job pair) agrees and is pinned
-  (`nif_abi/schedule_nif_rejects_*`); only the success path is unpinnable. Owner: `beam_rt`
-  (`NifHost::schedule_nif`, `crates/beam_rt/src/nif.rs`) / `beam_abi`.
-- **`enif_send` from a NIF-created thread** — the documented thread-safe form (`env == NULL` plus a
-  message env built with `enif_alloc_env`). Measured by spawning a thread that allocates a message
-  env and sends `{from_nif_thread, 11}` to pid passed in from the caller: the oracle delivers it
-  (`enif_send` answers `1`, the term reaches the mailbox), while the Rust runtime answers
-  `enif_alloc_env() == NULL` on a thread that is **not** inside a NIF call (the per-call host is
-  published thread-locally by `NifEnv`, `crates/beam_abi/src/nif/enif/envs.rs`), so this idiom
-  cannot be used at all and nothing is delivered (the receiver's bounded `receive` reports
-  `timeout`). The two in-call forms (`msg_env == NULL` and a message env on the calling thread)
-  are live and pinned (`nif_rt/send_null_env_*`, `nif_rt/send_message_env_*`). Owner: `beam_abi`
-  (`nif/enif/envs.rs`) / the runtime's host publication on non-scheduler threads.
+- `enif_schedule_nif`'s **raw return word** and a resource **`dtor`'s timing** stay unpinned: the
+  oracle answers `THE_NON_VALUE` (`0`, `erl_nif.c:399`) where the Rust trampoline answers the
+  continuation's own term word, and ERTS runs a destructor as **aux work**, so a report printed
+  immediately after the release still sees `0` on both sides. Only the resumed entry's **value** is
+  pinned (`nif_a3/schedule_nif_*`, `nif_a3/dirty_schedule_nif_*`) and only the dtor's eventual
+  **count** and payload (`nif_a3/resource_dtor_*`, through a bounded poll). Owner: `beam_abi` /
+  `beam_rt`.
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - `driver_async_port_key(port)` answers the port's opaque `ErlDrvData`/pointer word in the oracle while
   the Rust runtime's `DriverPort` keeps the `DriverHost` trait default (`0`,
@@ -252,23 +233,34 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   registers far fewer names.
 
 ## A.8 — introspection (owner: `beam_rt` / `beam_bifs`)
-- `erlang:process_info(self(), registered_name)` answers the bare empty list `[]` in the oracle for
-  an unregistered process where the rust runtime answers `{registered_name,init}` (its `-eval` root
-  process is registered as `init`). Only the **spawned**-process forms (bare `[]`,
-  `{trap_exit,false}`, `links` length 0) are pinned. Owner: `beam_rt`.
-- `erlang:process_info(P, Item)` for a **spawned** `P` and the position items `catchlevel`,
-  `initial_call`, `current_function` and `current_stacktrace` are answered by the oracle but raise
-  `beam_rt: unsupported: process_info: <item>` (exit 3) in the rust runtime, whose native floor
-  serves them only for `self()` — an honest capability gap, not a mismatch.
+- `erlang:process_info(P, Item)` of a process spawned from **`-eval`** and the **five** position items
+  `catchlevel`, `initial_call`, `current_function`, `current_location` and `current_stacktrace` raise
+  `beam_rt: unsupported: process_info: <item>` (exit 3) in the rust runtime — a fun-bodied child and
+  a `spawn(?MODULE,loop,[])` one alike, because a process the runtime never scheduled an engine for
+  has no resolved target. All five **do** agree for a process spawned from compiled code and are
+  pinned there (`bif_extra/process_info_spawned_position_items`,
+  `bif_extra/process_info_spawned_current_location`,
+  `bif_extra/process_info_spawned_current_stacktrace`). For
+  `self()` four of the five agree (`catchlevel`, `initial_call`, `current_function` and
+  `current_location`, the last byte-identical) and only `current_stacktrace` raises. An honest
+  capability gap, not a mismatch.
+- The same spawned-process family's **values** must never be pinned: `stack_size` (oracle `9`, rust
+  `0`), `reductions` (oracle `4006`, rust `0`), `memory` (oracle `2632`, rust `1864`) and
+  `group_leader` (a different pid-space value) all differ, so only their *type* is pinnable. A
+  capability-gap raise is **fatal even inside `try … catch C:R`** (the script still dies exit `3`),
+  so each of these shapes has to be measured in its own invocation — which is why a ledger row, not
+  a case, is the right home for them. Owner: `beam_rt`.
 - `erlang:system_monitor/0` (oracle `undefined`) and `erlang:system_monitor/1` (oracle
   `error:badarg`) raise `erlang:system_monitor/N is a known BIF that is not implemented` (exit 3) in
   the rust runtime — honest capability gaps, not mismatches.
 - `erlang:system_info(check_io)` (oracle a poll-set list) and `erlang:system_info(loaded)` (oracle
   `true`) are exit-3 capability gaps in the rust runtime, as are `build_type` (oracle `opt`) and
   `tolerant_timeofday` (oracle `false`).
-- `erlang:fun_info/1` of a **local** fun (and its `module`/`name`/`index`/`uniq`/`new_index`/
-  `new_uniq`/`pid` items) is exit-3 (`beam_rt: unsupported: bif`) — the closable gap with its recipe
-  in `CASE_DRAFTS.md` §8; the `arity`/`type`/`env` items agree.
+- `erlang:fun_info/1` of a **compiled local closure** agrees on all ten items, byte for byte
+  (`bif_extra/fun_info_local_*`). An **`erl_eval`-created** lambda is a different surface:
+  `module`/`name`/`index`/`uniq`/`new_uniq`/`pid` are exit-3 (`beam_rt: unsupported: bif`) while
+  `env` answers `{env,[]}` and `new_index` answers `{new_index,0}` — plain wrong *values*, not gaps,
+  so they must never be pinned (`arity` and `type` do agree). Owner: `beam_bifs` / `beam_rt`.
 
 ## A.1 — terms, records, exceptions (owner: `beam_engine`, `beam_bifs` / `beam_rt`)
 - Calling a non-fun (`5(1)`) raises `{badfun,5}` in the oracle vs `badarg` in the rust runtime.
@@ -307,15 +299,22 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   line to stdout (measured agreeing on roughly one run in six), so the shape stays unpinned. A
   missing `{spawn,Cmd}` shell diagnostic differs only in `argv[0]` (`sh:` vs `/bin/sh:`); the exit
   status `127` agrees.
-- The **`{line,N}` half now agrees and is pinned**: the runtime reproduces the oracle's line framing
+- The **`{line,N}` payload half agrees and is pinned**: the runtime reproduces the oracle's line framing
   exactly — the `{eol, Line}` / `{noeol, Line}` frames, the split at exactly N bytes with no EOL, the
   512-byte default `line` boundary and the EOF no-EOL flush (the CR payload included)
   (`driver/line_option_matrix`, `driver/line_frames_exact_n_noeol_split`,
   `driver/line_full_line_noeol_flush`, `driver/line_default_512_boundary`,
   `driver/line_frame_term_bytes`, `driver/line_eof_noeol_flush_precedes_exit_status`,
   `driver/line_eof_noeol_flush_then_exit_status_payloads` — the two `…flush…` ids name the consuming
-  sequence of a selective receive, **not** a mailbox order: with a non-selective receive both
-  runtimes deliver `[{exit_status,0},{data,…}]`).
+  sequence of a selective receive, **not** a mailbox order). The **order** does not generalise: with
+  `printf abcdefgh` under `{line,3}` the oracle delivers `abc`, `def`, `exit_status`, `gh` while
+  `beam_rt` delivers `exit_status` first, so only an order-free payload set may be pinned for
+  `{line,3}`. Owner: `beam_rt` / `beam_io`.
+- The **`-eval` root process traps exits in the oracle and does not in `beam_rt`**
+  (`process_info(self(), trap_exit)` answers `{trap_exit,true}` vs `{trap_exit,false}`, 3/3; a
+  spawned child answers `{trap_exit,false}` on both), which is why the oracle's trailing
+  `{'EXIT',Port,normal}` is absent here: any port/`exit_status` observable that leans on the root
+  trapping exits is unpinnable. Owner: `beam_rt` (`-eval` root).
 - Two further line/EOF-ordering findings are unpinned because they are plain observables (a case
   pinning one would be a `mismatch`):
   - the **`eof`** option: `printf abc` under `[binary,line,eof,exit_status]` ⇒ oracle
@@ -323,54 +322,51 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
     `{Port, eof}` (the receive times out — no `eof` is delivered);
   - the **`spawn_executable`** path: a child that closes both fds before sleeping
     (`{spawn_executable,"/bin/sh"}` + `{args,["-c","printf abc; exec 1>&- 2>&-; sleep 1"]}`,
-    `[binary,line,exit_status]`) ⇒ oracle `[{exit_status,0},{data,{noeol,<<"abc">>}}]` vs Rust
-    `[{data,{noeol,<<"abc">>}},{exit_status,0}]` (the flush leads). **It is a race, not a fixed
-    order**: the oracle came back exit-first 5/5 and the runtime flipped once in 5, so a case may pin
-    only the order-free pair, never the sequence. The same command under `{spawn, …}` agrees, so it
-    is confined to `spawn_executable`.
+    `[binary,line,exit_status]`) delivers the same two messages in an order that is a **race, not a
+    fixed order** — the runtime now comes back exit-first like the oracle in **8 of 10** runs (it
+    used to flush first) — so a case may pin only the order-free pair, never the sequence. The same
+    command under `{spawn, …}` agrees, so it is confined to `spawn_executable`.
 
-- **The framed TCP *read* now agrees in all three block modes; the framed *write* does not.** A
-  block framing mode on the **sending** socket writes no length header on `beam_rt`: with
-  `{packet, 4}` on the connected client (`gen_tcp:connect/3`'s option list or an `inet:setopts/2`
-  after it), `gen_tcp:send(Cl, <<"hello">>)` reaches a raw peer as
-  `<<0,0,0,5,104,101,108,108,111>>` under the oracle and as `<<104,101,108,108,111>>` under
-  `beam_rt`; `{packet, 2}` is `<<0,5,…>>` vs the bare payload and `{packet, 1}` is `<<5,…>>` vs
-  the bare payload. A framed sender talking to a framed receiver is therefore the same shape seen
-  from the other end — measured `ok {ok,{data,<<104,101,108,108,111>>}}` on the oracle against
-  `ok {ok,timeout}` on `beam_rt` for the `{packet, 4}` both-ends probe. `{packet, line}` on a
-  sender agrees (line mode adds no prefix), and so does UDP output framing (`gen_udp:send` of
-  `<<"hi">>` under `{packet, 4}` arrives unframed on both sides), so the gap is confined to the
-  TCP **stream** writer. The read side is exact and **is** pinned —
-  `inet_control/packet4_framed_read`, `inet_control/packet2_framed_read`,
+- **The framed TCP *read* and *write* both agree.** A block framing mode on the **sending** socket
+  prefixes the header exactly as the oracle does — `{packet, 4}` ⇒
+  `<<0,0,0,5,104,101,108,108,111>>`, `{packet, 2}` ⇒ `<<0,5,…>>`, `{packet, 1}` ⇒ `<<5,…>>` and
+  `{packet, line}` the bare payload — whether the mode is set in `gen_tcp:connect/3`'s option list
+  *or* with `inet:setopts/2` after the connect, and a framed sender talking to a framed receiver
+  delivers `{data,<<"hello">>}` on both sides. The read side is exact in all three block modes and
+  is pinned — `inet_control/packet4_framed_read`, `inet_control/packet2_framed_read`,
   `inet_control/line_framed_read` and `inet_control/packet4_framed_read_buffers_across_segments`
   (framing inherited from `gen_tcp:listen/2`, a truncated prefix withholding a message, and two
-  coalesced frames delivered as two messages all agree). Owner: `beam_rt` / `beam_io`.
-
-  **Re-measured while landing the write-path group** (`inet_write.rs`), with the peer's bytes
-  observed on its `{active, true}` message queue (a passive `gen_tcp:recv/3` is the exit-`3`
-  capability gap below, so it cannot carry the measurement). All three reproductions of the gap still
-  hold at this commit: `{packet, 2}` in `gen_tcp:connect/3`'s option list ⇒ oracle
-  `ok {ok,{data,<<0,5,104,101,108,108,111>>}}` vs `beam_rt` `ok {ok,{data,<<104,101,108,108,111>>}}`;
-  `{packet, 4}` via `inet:setopts/2` after the connect ⇒ oracle
-  `ok {ok,ok,{data,<<0,0,0,5,104,101,108,108,111>>}}` vs `beam_rt`
-  `ok {ok,ok,{data,<<104,101,108,108,111>>}}`; a `{packet, 4}` sender against a `{packet, 4}`
-  receiver ⇒ oracle `ok {ok,{data,<<104,101,108,108,111>>}}` vs `beam_rt` `ok {ok,timeout}`.
-  `{packet, line}` on a sender agrees and **is** pinned by
-  `inet_write/line_mode_send_adds_no_prefix`. The framed-write cases (a raw-peer `{packet, 4}` /
-  `{packet, 2}` header image, plus a large payload needing `<<0,0,0,N>>`) land the moment the write
-  side prefixes the header; the recipe is in `src/corpus/inet_write.rs`'s module docs and its
-  `no_case_pins_a_measured_divergence` guard is what keeps them out until then.
-- **The stream writer's *other* write-side shapes**: `gen_tcp:send/2` after
-  `gen_tcp:shutdown(Cl, write)` and every **passive** read (`gen_tcp:recv/2,3`, even with the bytes
-  already queued by a completed send) are the same `process blocked` exit-`3` capability gap the
-  `inet_control` module docs record (`beam_rt: unsupported: opcode: run: process blocked (no message
-  available)`; the oracle answers `ok {ok,{error,closed},{error,enotconn}}` for the two sends and
-  `{ok, <<"hi">>}` for the read). Owner: `beam_rt` / `beam_io`.
-- **`inet:getstat/1` never advances its send-side counters (`beam_rt`).** For a connected socket the
-  item agrees before any write (`{ok,[{send_cnt,0},{send_oct,0}]}` on both), but after two completed
-  writes of 3 bytes each the oracle answers `{ok,[{send_cnt,2},{send_oct,6}]}` while `beam_rt` still
-  answers `{ok,[{send_cnt,0},{send_oct,0}]}` — the driver accounting is not updated on the write path.
-  A plain observable, so `inet_write`'s guard test rejects `inet:getstat(`. Owner: `beam_io`.
+  coalesced frames delivered as two messages all agree) — and `{packet, line}` on a sender is pinned
+  by `inet_write/line_mode_send_adds_no_prefix`. The write-side header rows are
+  `inet_write/block_framed_send_prefixes_the_header` (a fresh connection per mode, `{packet, 4}` /
+  `{packet, 2}` / `{packet, 1}` observed on the raw peer),
+  `inet_write/packet4_send_via_setopts_writes_the_prefix`,
+  `inet_write/framed_sender_and_framed_receiver` and
+  `inet_write/packet4_send_prefixes_a_large_payload`, and the half-close and the write accounting
+  are `inet_write/shutdown_write_then_send_closes_the_writer` and
+  `inet_write/send_counters_advance_with_the_writes`. The write-side shapes that *stay* unpinnable
+  are the second send after a half-close (next entry) and the passive read below. Owner: `beam_rt` /
+  `beam_io`.
+- **A half-close's *first* send is pinnable and its *second* is a capability gap.** After
+  `gen_tcp:shutdown(Cl, write)` a `gen_tcp:send/2` answers `{error,closed}` on **both** sides, which
+  is what `inet_write/shutdown_write_then_send_closes_the_writer` pins — but a **second** send makes
+  `beam_rt` exit `3` with `beam_rt: unsupported: opcode: run: process blocked (no message
+  available)` where the oracle answers `{error,enotconn}` (measured 3/3 serial; the driver marks the
+  socket fully closed after the first failed write). A typed capability gap, not a divergence, so
+  the pinned row performs exactly **one** send after the shutdown. Owner: `beam_rt` / `beam_io`.
+- **A passive `gen_tcp:recv/2,3` whose data arrives while the recv is armed agrees**, and that is
+  the shape a row may pin. A read with **nothing to read** answers `{error,timeout}` on both sides
+  when its caller bound is 5000 ms or less, and is pinned
+  (`inet_control/passive_recv_on_an_empty_socket_times_out`). Only the **data-already-queued** shape
+  is unpinnable, and it fails three different ways: exit `3` `opcode: run: process blocked (no
+  message available)` on the module-run route; exit `3` `port event: … within the 5 s bound` on the
+  `-eval` route when the caller's timeout exceeds 5 s (or is `infinity`); and, on the `-eval` route
+  with a caller timeout of 5000 ms or less, a plain wrong `{error,timeout}` — a real value
+  divergence, not a capability gap. Owner: `beam_rt` / `beam_io`.
+- **The `inet:getstat/1` *send*-side counters are pinnable** — after two completed 3-byte writes both
+  sides answer `{ok,[{send_cnt,2},{send_oct,6}]}` (`{ok,[{send_cnt,0},{send_oct,0}]}` before them) —
+  but the **recv**-side counters are racy **on the oracle** (`{2,6}` on one run, `{0,0}` on two
+  before the receives drain), so only a post-receive value may ever be pinned. Owner: `beam_io`.
 - **A bare-integer payload is written by the oracle and dropped by `beam_rt`.** `gen_tcp:send(Cl, 42)`
   answers `ok` on both sides, but the oracle puts the single byte `42` on the wire where the runtime
   writes nothing (measured: the peer receives `<<42,0,255,1,128>>` after a `42`, `<<0,255,1,128>>`
@@ -733,4 +729,10 @@ Measured with the system `erl` (OTP 29.1.1 / erts-17.1) against `beam_rt` (relea
 - **`erlang:disconnect_node/1`** is `beam_rt: unsupported: erlang:disconnect_node/1 is a known BIF that is not implemented` (exit 3); **`erlang:spawn_request/5`** likewise (`unsupported`), so an `erpc:call/4` over a plain self-pair is unpinnable.
 - **Cookie-refusal latency:** a refused handshake costs ~5 s per attempt on rust (its connect timeout) vs instantly on the oracle, so `dist_extra/cookie_mismatch` uses three bounded attempts.
 - **`group_leader(RemotePid, self())`** could not be measured — the oracle's `-eval` wrapper silently refuses to evaluate it (no stdout, exit 1); not a proven divergence. `erlang:monitor_node(MissingNode, true)` answers `true` on both, too weak to pin.
-- **A `-eval` trap met while measuring** (owner `beam_rt`, `-eval` evaluator): `Pid ! Msg` **after** a blocking call (`timer:sleep/1` or a bounded `receive`) fails the whole script with `beam_rt: term not found` (exit `1`), while `erlang:send(Pid, Msg)` works in the same position and `!` works before any blocking call. Every `dist_extra` script therefore uses `erlang:send/2`.
+- **A `-eval` script's process halts the VM the instant the top-level expression ends** (owner
+  `beam_rt`, `-eval` route), so a message with no trailing blocking call or `halt()` never runs its
+  recipient: a `spawn` whose child prints `child got hello`, then `P ! hello` as the last
+  expression, prints `child got hello` on the oracle and **nothing** on `beam_rt`, exit `0` on both
+  (3/3). Every script in `dist_extra` therefore ends with a bounded wait or an explicit `halt()`.
+  `Pid ! Msg` itself agrees in every position — before a `timer:sleep/1`, after it, after a bounded
+  `receive … after`, and after a monitor's `'DOWN'` — and so does `erlang:send/2`.
