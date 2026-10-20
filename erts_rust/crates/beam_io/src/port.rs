@@ -60,7 +60,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_process::PortId;
 
 use crate::completion::PortCompletion;
@@ -86,6 +86,27 @@ pub use crate::registry::PortRegistry;
 /// poller events can run at most [`crate::port_task::PORT_REDS_EXECUTE`] reductions' worth of
 /// port tasks; anything left over stays queued for the next round.
 pub const DEFAULT_READINESS_RED_BUDGET: usize = PORT_REDS_EXECUTE;
+
+/// How many consecutive **no-progress** drain rounds a [`PortState::Closing`] port gets before it
+/// stops waiting for its output queue to empty (see [`Port::close`]).
+///
+/// The C has no such bound: a CLOSING port is "in Limbo, waiting to pass on … as soon as the port
+/// queue gets empty `terminate_port()` is called" (`erts/emulator/beam/io.c:896-900`), so it waits
+/// for as long as the driver keeps the port alive. Waiting is right — the bytes are the caller's
+/// — but waiting **for ever** on a driver that cannot write a single byte would hold the port
+/// number, its descriptors and its poller registrations indefinitely, and the owner would never
+/// be told the port closed. So the port tolerates a bounded stall instead: sixteen consecutive
+/// rounds in which the output queue did not shrink **at all** — each round being a whole
+/// `ERTS_PORT_REDS_EXECUTE` budget of write attempts (`PORT_REDS_EXECUTE`, 1000 reductions ≈ 25
+/// `OUTPUT` tasks) — and then gives up, drops the remainder and reports the close.
+///
+/// A drain that is merely **slow** is never cut off: any round that writes at least one byte
+/// resets the count, so a 500 KB write to a peer that reads 1 KB per round keeps the port alive
+/// for as long as it is making progress. Only a driver that reports no progress at all — a full
+/// socket nobody drains, a busy driver, a driver whose reported byte count never consumes
+/// anything — reaches the limit, which is exactly the case where waiting longer cannot help.
+pub const CLOSING_DRAIN_STALL_LIMIT: usize = 16;
+
 /// The lifecycle state of a port.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PortState {
@@ -165,6 +186,22 @@ pub struct Port {
     /// either, because it is inbound data rather than the answer to the owner's call. A port
     /// whose driver never enables active mode stages nothing here.
     active_inputs: VecDeque<ActiveInput>,
+    /// Consecutive [`PortState::Closing`] drain rounds that made **no** progress (the output queue
+    /// did not shrink), counted by [`Port::note_closing_drain`] and bounded by
+    /// [`CLOSING_DRAIN_STALL_LIMIT`]; reset to `0` as soon as a round writes anything, and unused
+    /// by a port that never parks in `Closing`.
+    closing_stalls: usize,
+    /// The smallest output-queue length seen since this port entered [`PortState::Closing`] — the
+    /// watermark [`Port::note_closing_drain`] compares against.
+    ///
+    /// A closing port's queue can shrink from **two** writers: the port-task round's own
+    /// `OUTPUT` task and the closing-port drain ([`Port::drain_output_during_close`], run by
+    /// [`PortRegistry::close`](crate::PortRegistry) and once per round by
+    /// [`PortRegistry::finish_closing_ports`](crate::PortRegistry)). A caller-supplied
+    /// "did *my* call progress" boolean therefore misses the round's write and would count a stall
+    /// on a socket that is draining perfectly well, truncating it at the bound; the watermark
+    /// makes the measurement independent of who wrote the bytes.
+    closing_watermark: usize,
 }
 impl Port {
     /// Builds a port in the [`PortState::Opening`] state around `driver`.
@@ -187,6 +224,8 @@ impl Port {
             completions: Vec::new(),
             failure: None,
             active_inputs: VecDeque::new(),
+            closing_stalls: 0,
+            closing_watermark: usize::MAX,
         }
     }    /// This port's id.
     pub fn id(&self) -> PortId {
@@ -196,6 +235,30 @@ impl Port {
     /// This port's lifecycle state.
     pub fn state(&self) -> PortState {
         self.state
+    }
+
+    /// Whether this port is in the [`PortState::Closing`] state — **parked** after a close that
+    /// could not drain its output queue synchronously.
+    ///
+    /// This is the C's `ERTS_PORT_SFLG_CLOSING`, "a state where the port is in Limbo, waiting to
+    /// pass on … as soon as the port queue gets empty `terminate_port()` is called"
+    /// (`erts/emulator/beam/io.c:896-900`): the port is still live and still registered with the
+    /// poller (so write readiness can finish the write), its driver's `stop` has **not** run, and
+    /// a command handed to it is refused (`io.c:1440` answers `badarg` for
+    /// `ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`, `erl_port.h:351-355`).
+    ///
+    /// "Waiting for the queue" is [`Port::output_len`] — the output queue is the one thing a
+    /// parked port still owes, so it is the probe rather than a duplicate flag: `is_closing() &&
+    /// output_len() == 0` is the state a round finishes the port from
+    /// ([`PortRegistry::finish_closing_ports`](crate::PortRegistry)).
+    pub fn is_closing(&self) -> bool {
+        self.state == PortState::Closing
+    }
+
+    /// Whether this port has been fully closed: the driver's `stop` has run and the port can only
+    /// be torn out of its registry.
+    pub fn is_closed(&self) -> bool {
+        self.state == PortState::Closed
     }
 
     /// The registered name of the port's driver.
@@ -1220,13 +1283,86 @@ impl Port {
         driver.port_exit(&mut ctx, reason)
     }
 
-    /// Stops the driver and marks the port [`PortState::Closed`].
+    /// Closes the port with the C's **flush-then-close** shape: the driver gets its one chance to
+    /// discard what it no longer needs ([`Driver::flush`]), the port then tries to write out
+    /// whatever is still queued, and only an **empty** output queue ends the port.
+    ///
+    /// This is `erts_deliver_port_exit` (`erts/emulator/beam/io.c:3936-3942`): on a close (any
+    /// reason but `kill`) with a non-empty ioq the C clears `EXITING`, sets
+    /// `ERTS_PORT_SFLG_CLOSING` and calls `flush_port` instead of `terminate_port` — the port keeps
+    /// living, keeps receiving in/out events, and "as soon as the port queue gets empty
+    /// `terminate_port()` is called" (`io.c:896-900`; the deferred half is
+    /// `erts_port_driver_callback_epilogue`, `erl_port.h:797-813`). `flush_port` calls the
+    /// driver's `flush` **only if the entry has one** and terminates the port **only if the ioq is
+    /// empty afterwards** (`io.c:3659-3700`); `terminate_port` is the sole caller of `drv->stop`
+    /// (`io.c:3733-3752`).
+    ///
+    /// So this method is two halves:
+    ///
+    /// * **Begin** — always: `state = Closing`, [`Driver::flush`] (all four delivery sinks
+    ///   installed, exactly like [`Port::notify_exit`]), then a synchronous drain of the port's
+    ///   `OUTPUT` task(s) under one [`DEFAULT_READINESS_RED_BUDGET`], through the ordinary
+    ///   [`Port::run_task`]/[`Port::ready_output`] path so the write-accounting check is in the
+    ///   path. A pending `INPUT`/`TIMEOUT` task is dropped first: a closing port has no owner left
+    ///   to notify.
+    /// * **Finish** — only when the output queue is empty afterwards: `driver.stop`, then
+    ///   `state = Closed` (a `stop` failure still leaves the port `Closed`, so it can never look
+    ///   open again).
+    ///
+    /// A queue that is **not** empty leaves the port **parked** in [`PortState::Closing`] with an
+    /// `OUTPUT` task pending (so the reactor's write readiness, or a later round's
+    /// [`PortRegistry::finish_closing_ports`](crate::PortRegistry), keeps draining it). `stop` does
+    /// **not** run, the port stays in its registry, and this method returns the flush/drain result
+    /// (`Ok(())` for a clean park). The bytes are then delivered by the rounds that follow — the
+    /// whole point: `erlang:port_command(P, Data)` followed immediately by `erlang:port_close(P)`
+    /// delivers `Data` on the oracle (measured: a `tee` child received 500 000/500 000 bytes while
+    /// `port_close/1` returned `true` with 454 656 bytes still queued — the drain is asynchronous,
+    /// not part of the close's return).
+    ///
+    /// A port that never drains is not waited on for ever: see [`CLOSING_DRAIN_STALL_LIMIT`].
+    ///
+    /// # Idempotence
+    ///
+    /// A repeated `close` on a port that is already [`PortState::Closing`] (or `Closed`) is a
+    /// no-op `Ok(())`: no second [`Driver::flush`], no second [`Driver::stop`]. The C agrees — the
+    /// exit path returns immediately when the port is already
+    /// `EXITING`/`CLOSING`/`DEAD` (`io.c:3878-3881`), and `driver_failure_term` terminates rather
+    /// than re-flushing a `CLOSING` port (`io.c:7207-7209`).
     ///
     /// # Errors
     ///
-    /// Returns whatever the driver's `stop` returns.
+    /// Returns the driver's [`Driver::flush`] error, a drain error, or the driver's `stop` error —
+    /// the **first** one seen, since all three still run so the port is never left half-closed.
     pub fn close(&mut self, poller: &mut Poller) -> Result<()> {
+        if self.is_closing() || self.is_closed() {
+            return Ok(());
+        }
         self.state = PortState::Closing;
+        self.closing_watermark = self.output.len();
+        let mut first_error = self.driver_flush(poller).err();
+        if let Err(err) = self.drain_output_during_close(poller) {
+            first_error.get_or_insert(err);
+        }
+        if self.output.is_empty() {
+            if let Err(err) = self.finish_close(poller) {
+                first_error.get_or_insert(err);
+            }
+        }
+        error_outcome(first_error)
+    }
+
+    /// The **finish half** of [`Port::close`]: `driver.stop`, then [`PortState::Closed`].
+    ///
+    /// Separated so a registry can finish a port parked in [`PortState::Closing`] from a later
+    /// round ([`PortRegistry::finish_closing_ports`](crate::PortRegistry)) with the same code that
+    /// finishes an immediately-drained close — the C's `terminate_port`, which is the sole caller
+    /// of `drv->stop` (`erts/emulator/beam/io.c:3733-3752`). Whatever is still in the output queue
+    /// is **dropped** here: the caller has decided the remainder is obsolete (the C's
+    /// `prt->ioq.size = 0` before a driver failure, `io.c:7215-7219`).
+    ///
+    /// The port is marked [`PortState::Closed`] even when `stop` fails, so a teardown error can
+    /// never leave it looking open.
+    pub(crate) fn finish_close(&mut self, poller: &mut Poller) -> Result<()> {
         let result = {
             let id = self.id;
             let Port {
@@ -1247,10 +1383,113 @@ impl Port {
                 .with_failure(failure);
             driver.stop(&mut ctx)
         };
-        // The port is closed either way; a teardown failure must not leave it looking
-        // open.
         self.state = PortState::Closed;
         result
+    }
+
+    /// Records one [`PortState::Closing`] drain round and answers whether the port should now
+    /// **give up** waiting for its output queue to empty.
+    ///
+    /// Progress is measured against the port's own [`Port::closing_watermark`], not against a
+    /// caller-supplied byte count: the queue shrinks from the port-task round's `OUTPUT` task as
+    /// well as from [`Port::drain_output_during_close`], and a boolean describing only one of the
+    /// two would count a stall on a socket that is in fact draining. Any shrinkage resets the
+    /// consecutive-stall count to zero, so a slow-but-moving drain (a peer reading 1 KB per round
+    /// out of a 500 KB queue) is never cut off; a round with no progress at all increments it, and
+    /// the port gives up once [`CLOSING_DRAIN_STALL_LIMIT`] such rounds have happened in a row —
+    /// after which the registry tears it down anyway and reports the close, dropping the remainder
+    /// rather than holding the port number, its descriptors and its poller registrations for ever.
+    ///
+    /// Driven by [`PortRegistry::finish_closing_ports`](crate::PortRegistry) once per round for
+    /// every live closing port.
+    pub(crate) fn note_closing_drain(&mut self) -> bool {
+        let remaining = self.output.len();
+        if remaining < self.closing_watermark {
+            self.closing_watermark = remaining;
+            self.closing_stalls = 0;
+            return false;
+        }
+        self.closing_stalls += 1;
+        self.closing_stalls >= CLOSING_DRAIN_STALL_LIMIT
+    }
+
+    /// Calls the driver's [`Driver::flush`] with all four delivery sinks installed.
+    ///
+    /// The sinks matter: a flush may hand a final completion or `{active,…}` delivery up (the C's
+    /// `tcp_inet_flush` runs driver bookkeeping), and dropping those silently would lose a message
+    /// the owner is waiting for. The port's `TIMEOUT` task is **not** re-armed — the C's `flush`
+    /// has no timer contract, and the port is on its way out anyway.
+    fn driver_flush(&mut self, poller: &mut Poller) -> Result<()> {
+        let id = self.id;
+        let Port {
+            driver,
+            input,
+            output,
+            arms,
+            pending_reads,
+            completions,
+            failure,
+            active_inputs,
+            ..
+        } = self;
+        let mut ctx = DriverContext::new(id, poller, input, output, arms)
+            .with_reads(pending_reads)
+            .with_completions(completions)
+            .with_active(active_inputs)
+            .with_failure(failure);
+        driver.flush(&mut ctx)
+    }
+
+    /// Drains the queued output of a closing port: drops its `INPUT`/`TIMEOUT` tasks and runs its
+    /// `OUTPUT` task(s) under one [`DEFAULT_READINESS_RED_BUDGET`].
+    ///
+    /// Every attempt goes through [`Port::run_task`] → [`Port::ready_output`], so the driver's
+    /// reported byte count is verified by the same [`Port::check_write_accounting`] the round uses
+    /// (one write path, never a second). The loop stops as soon as the output queue is empty (the
+    /// C's `terminate_port` condition), as soon as an attempt makes **no** progress (re-driving a
+    /// full socket would just be the same `EAGAIN` again — the poller or the next round decides
+    /// when to retry), or when the budget runs out. A queue that is still non-empty afterwards
+    /// keeps an `OUTPUT` task pending, so write readiness has something to run.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's `ready_output` returns; the queue and the pending task are
+    /// left as they were, so a later round re-drives the write.
+    pub(crate) fn drain_output_during_close(&mut self, poller: &mut Poller) -> Result<()> {
+        self.tasks.remove(PortTaskKind::Input);
+        self.tasks.remove(PortTaskKind::Timeout);
+        let mut budget = DEFAULT_READINESS_RED_BUDGET;
+        while budget > 0 && !self.output.is_empty() {
+            // A short write leaves the remainder queued but consumes the task (the reactor's write
+            // readiness is what re-arms it in the ordinary path); a closing port cannot wait for
+            // that, so it re-arms the task itself. `PortTaskQueue` keeps one task per kind, so this
+            // is idempotent and cannot build a backlog.
+            self.schedule_task(PortTaskKind::Output);
+            let Some(task) = self.pop_ready_task(Instant::now()) else {
+                break;
+            };
+            let before = self.output.len();
+            let reds = self.run_task(poller, &task)?;
+            budget = budget.saturating_sub(reds.max(1));
+            if self.output.len() >= before {
+                // No progress: this write cannot move (EAGAIN, a busy driver, a refused command).
+                break;
+            }
+        }
+        if !self.output.is_empty() {
+            // The port stays drainable: write readiness schedules this task again, and the
+            // registry's closing-port finisher re-drives it once per round.
+            self.schedule_task(PortTaskKind::Output);
+        }
+        Ok(())
+    }
+}
+
+/// Folds a driver's `Option<BeamError>` first-failure slot into a [`Result`].
+fn error_outcome(first_error: Option<BeamError>) -> Result<()> {
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 

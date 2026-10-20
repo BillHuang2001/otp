@@ -192,6 +192,12 @@ impl PortRegistry {
             // teardown so a registration it made before failing is released, then hand its
             // number back so the id space does not leak.
             let _teardown = port.close(poller);
+            // A failed `start` must not leave a port parked in `Closing` behind either: its number
+            // is released here, so its `stop` has to run now (the C's `driver_failure_term` zeroes
+            // the ioq before closing, `erts/emulator/beam/io.c:7215-7219`).
+            if port.is_closing() {
+                let _forced = port.finish_close(poller);
+            }
             self.ids.release(id);
             return Err(err);
         }
@@ -303,6 +309,10 @@ impl PortRegistry {
         self.schedule_events(events);
         let (ran, reds_used) = self.run_scheduled_tasks(poller, DEFAULT_READINESS_RED_BUDGET)?;
         self.reap_failures(poller)?;
+        // A close that could not drain synchronously parks its port in `CLOSING`; finish it here,
+        // before the closes are reported, so a port that empties its queue this round is reported
+        // as `Closed` in this same round (see `finish_closing_ports`).
+        self.finish_closing_ports(poller)?;
         let mut notifications = self.take_reaped_notifications();
         notifications.extend(self.take_closed_notifications());
         Ok(PortTaskOutcome {
@@ -414,6 +424,13 @@ impl PortRegistry {
         // while the round is still the only thing touching the registry, and a port reaped here
         // must appear in this round's `Closed` reports like any other close.
         self.reap_failures(poller)?;
+
+        // A close that could not drain synchronously parks its port in `CLOSING` (the C's
+        // `ERTS_PORT_SFLG_CLOSING`, `erts/emulator/beam/io.c:896-900`); finish it here — after the
+        // failure sweep, before the closes are reported — so a port whose queue empties this round
+        // is reported as `Closed` in this same round. An error from it leaves `self.closed`
+        // untouched, so every close already queued stays queued for the next round.
+        self.finish_closing_ports(poller)?;
 
         // Collect the closes only now that the round's fallible steps are behind us: an early
         // return above leaves them queued for the next round instead of dropping them, because
@@ -1054,7 +1071,23 @@ impl PortRegistry {
         keys
     }
 
-    /// Stops and removes the port with id `id`, queueing its number for retirement.
+    /// Stops and removes the port with id `id`, queueing its number for retirement — or **parks**
+    /// it in [`crate::port::PortState::Closing`] when its output cannot all be written synchronously.
+    ///
+    /// This is the registry surface of [`Port::close`], whose flush-then-close shape it keeps: the
+    /// driver's [`Driver::flush`] runs, the queued output is drained under one
+    /// [`DEFAULT_READINESS_RED_BUDGET`], and only an **empty** output queue removes the port. A
+    /// port that still has bytes to write stays **live** in the map with an `OUTPUT` task pending,
+    /// its driver's `stop` not run and its poller registrations still armed, so the rounds that
+    /// follow finish the write
+    /// ([`PortRegistry::finish_closing_ports`]) — exactly the C's `ERTS_PORT_SFLG_CLOSING`
+    /// "Limbo" state, where the port "receives in/out-put events so as soon as the port queue gets
+    /// empty `terminate_port()` is called" (`erts/emulator/beam/io.c:896-900`,
+    /// `erts_deliver_port_exit` `io.c:3936-3942`).
+    ///
+    /// [`PortRegistry::is_closing`] is the probe a caller uses to learn that a close parked; the
+    /// port is reported as a [`PortNotification::Closed`] by the round that removes it, and only
+    /// then is its number retired — so "closed" and "reported closed" stay one event.
     ///
     /// The close is reported as a [`PortNotification::Closed`] by the next round — either
     /// [`PortRegistry::execute_port_tasks`] or [`PortRegistry::handle_events`] — and the port
@@ -1064,6 +1097,12 @@ impl PortRegistry {
     /// here would let a `close` + `open` pair make the deferred report name a *different, live*
     /// port. A caller that closes a port and never runs another round therefore keeps the number
     /// allocated — the round is what retires it.
+    ///
+    /// # Idempotence
+    ///
+    /// Closing an already-parked ([`crate::port::PortState::Closing`]) port is a no-op `Ok(())` that harvests
+    /// nothing and queues nothing: no second [`Driver::flush`], no second [`Driver::stop`], and no
+    /// second `Closed` report. The same holds for a port already finished but not yet reported.
     ///
     /// # Completions survive the close
     ///
@@ -1079,14 +1118,60 @@ impl PortRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
-    /// `stop` returns. The port is removed and its close queued either way, so a teardown
-    /// failure neither leaves the port looking live nor leaks its number.
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's `flush`,
+    /// a write in the drain, or `stop` returns. A port that finished is removed and its close
+    /// queued either way, so a teardown failure neither leaves the port looking live nor leaks its
+    /// number; a port that parked stays live with its queue intact, so a failed write is retried
+    /// rather than lost.
     pub fn close(&mut self, poller: &mut Poller, id: PortId) -> Result<()> {
-        let Some(mut port) = self.ports.remove(&id.number()) else {
-            return Err(error::badarg());
+        let (result, finished) = {
+            let Some(port) = self.ports.get_mut(&id.number()) else {
+                return Err(error::badarg());
+            };
+            if port.is_closing() || port.is_closed() {
+                return Ok(());
+            }
+            let result = port.close(poller);
+            (result, port.is_closed())
         };
-        let result = port.close(poller);
+        if finished {
+            self.remove_finished_port(id);
+        }
+        result
+    }
+
+    /// Whether port `id` is **parked** in [`crate::port::PortState::Closing`] — closed by a caller but still
+    /// draining output — the accessor a runtime uses to learn that a
+    /// [`PortRegistry::close`] did not finish synchronously.
+    ///
+    /// A parked port is still a live port: [`PortRegistry::contains`] says `true`, its number is
+    /// still allocated, and it keeps receiving write readiness until
+    /// [`PortRegistry::finish_closing_ports`] drains it (or [`crate::CLOSING_DRAIN_STALL_LIMIT`] gives up
+    /// on it) and its [`PortNotification::Closed`] is reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, like every other registry seam.
+    pub fn is_closing(&self, id: PortId) -> Result<bool> {
+        match self.ports.get(&id.number()) {
+            Some(port) => Ok(port.is_closing()),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Removes a **finished** port, harvests what its teardown staged and queues its number for
+    /// retirement — the one removal sequence both [`PortRegistry::close`] and
+    /// [`PortRegistry::finish_closing_ports`] use, so the two cannot drift.
+    ///
+    /// The staged side channels are copied out here because the `Port` itself is dropped: the
+    /// driver's teardown replies (`{error, closed}` for every queued async operation), the
+    /// `{active,…}` deliveries and the grants they spent must still reach the owner exactly once.
+    /// The number keeps its rule: it is released by
+    /// [`PortRegistry::take_closed_notifications`], not here.
+    fn remove_finished_port(&mut self, id: PortId) {
+        let Some(mut port) = self.ports.remove(&id.number()) else {
+            return;
+        };
         // Harvest whatever the driver staged before and during its teardown: the port is gone,
         // so these can only be reported from here.
         self.closed_completions
@@ -1100,9 +1185,102 @@ impl PortRegistry {
         self.closed_active_spends
             .extend(spent.into_iter().map(|spend| (id, spend)));
         // The port is gone from the registry either way, so its close is queued (and its number
-        // retired by the reporting round) even if the driver's teardown reports a failure.
+        // retired by the reporting round) even if the driver's teardown reported a failure.
         self.closed.push(id);
-        result
+    }
+
+    /// Finishes every port **parked** in [`crate::port::PortState::Closing`], in port-number order.
+    ///
+    /// The deferred half of [`PortRegistry::close`], and the Rust analogue of
+    /// `erts_port_driver_callback_epilogue`: the C terminates a `CLOSING` port whose ioq became
+    /// empty at a driver-callback epilogue (`erts/emulator/beam/erl_port.h:797-813`), so a close
+    /// that could not drain synchronously finishes on the rounds that follow. Each live closing
+    /// port is re-drained under one [`DEFAULT_READINESS_RED_BUDGET`] (the same
+    /// [`Port::drain_output_during_close`] the begin half uses, so the write-accounting check stays
+    /// in the path) and then either
+    ///
+    /// * **finished** — its queue is empty, or it made no progress for
+    ///   [`crate::CLOSING_DRAIN_STALL_LIMIT`] consecutive rounds
+    ///   ([`Port::note_closing_drain`]) and the remainder is dropped — which runs the driver's
+    ///   `stop`, removes the port and queues its `Closed` exactly like a synchronous close, or
+    /// * **left parked** for the next round.
+    ///
+    /// A round that made **some** progress resets the stall count, so a slow drain is never cut
+    /// off; a dead one cannot hold the port number, its descriptors and its poller registrations
+    /// for ever.
+    ///
+    /// The first error is reported **after** every port has been visited, so one failing drain does
+    /// not stop the others; the closes queued by the ports that did finish stay in
+    /// [`PortRegistry::closed`], and the caller's early return leaves them queued for the next
+    /// round rather than dropping them (the rule [`PortRegistry::execute_port_tasks`] states).
+    fn finish_closing_ports(&mut self, poller: &mut Poller) -> Result<()> {
+        let mut first_error = None;
+        // Snapshot the keys first: `finish_close` and the removal need `&mut self`, and the port
+        // map is mutated while it is iterated.
+        for key in self.sorted_keys() {
+            let id = PortId::new(key);
+            let finished = {
+                let Some(port) = self.ports.get_mut(&key) else {
+                    continue;
+                };
+                if !port.is_closing() {
+                    continue;
+                }
+                if let Err(err) = port.drain_output_during_close(poller) {
+                    first_error.get_or_insert(err);
+                }
+                let give_up = port.note_closing_drain();
+                if port.output_len() == 0 || give_up {
+                    if let Err(err) = port.finish_close(poller) {
+                        first_error.get_or_insert(err);
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if finished {
+                self.remove_finished_port(id);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Tears a port down **at once**, dropping whatever output is still queued.
+    ///
+    /// The path a driver-triggered close takes ([`PortRegistry::reap_failures`]): the C's
+    /// `driver_failure_term` zeroes the ioq before handing the port to
+    /// `erts_deliver_port_exit` (`prt->ioq.size = 0`, `erts/emulator/beam/io.c:7215-7219`), so the
+    /// failure path never parks in `CLOSING` the way a caller-initiated close may — the driver
+    /// whose queue we would be draining has just declared itself broken.
+    ///
+    /// A port that is already `Closing`/`Closed` is a no-op `Ok(())`.
+    fn close_now(&mut self, poller: &mut Poller, id: PortId) -> Result<()> {
+        let (first_error, finished) = {
+            let Some(port) = self.ports.get_mut(&id.number()) else {
+                return Err(error::badarg());
+            };
+            if port.is_closing() || port.is_closed() {
+                return Ok(());
+            }
+            let mut first_error = port.close(poller).err();
+            if port.is_closing() {
+                if let Err(err) = port.finish_close(poller) {
+                    first_error.get_or_insert(err);
+                }
+            }
+            (first_error, port.is_closed())
+        };
+        if finished {
+            self.remove_finished_port(id);
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Drains the closes pending since the last round into [`PortNotification::Closed`] values,
@@ -1137,9 +1315,11 @@ impl PortRegistry {
     /// `driver_exit`, see [`crate::port_failure`]), and by the time the callback returns the port
     /// must be closed — but not from inside the callback, which is still running on the driver.
     /// So the port is reaped here, at the end of every entry point that drove a driver, through
-    /// the **ordinary** [`PortRegistry::close`] path: the driver's `stop` runs, the port leaves
-    /// the live map, its staged completions are harvested, and its number is retired when the
-    /// deferred [`PortNotification::Closed`] is minted — never here.
+    /// [`PortRegistry::close_now`] — the flush-then-close shape's **forced** arm, because a failed
+    /// driver must not park a port in `CLOSING` waiting for a queue it can no longer write (the C
+    /// zeroes the ioq on this path, `erts/emulator/beam/io.c:7215-7219`): the driver's `stop` runs,
+    /// the port leaves the live map, its staged completions are harvested, and its number is
+    /// retired when the deferred [`PortNotification::Closed`] is minted — never here.
     ///
     /// Whatever a dying port had already staged for its owner is harvested first
     /// ([`PortRegistry::take_reaped_notifications`]), so the bytes a failing callback delivered
@@ -1169,7 +1349,7 @@ impl PortRegistry {
                 None => Vec::new(),
             };
             self.reaped_notifications.extend(staged);
-            if let Err(err) = self.close(poller, id) {
+            if let Err(err) = self.close_now(poller, id) {
                 first_error.get_or_insert(err);
             }
         }
@@ -2525,3 +2705,12 @@ mod active_mode_tests;
 #[cfg(test)]
 #[path = "awaits_callers_tests.rs"]
 mod awaits_callers_tests;
+/// The **flush-then-close** shape — [`Driver::flush`], [`crate::port::PortState::Closing`] as a real
+/// observable state, the begin/finish halves of [`Port::close`], the round-side
+/// [`PortRegistry::finish_closing_ports`] and the bounded-stall tear-down
+/// ([`crate::CLOSING_DRAIN_STALL_LIMIT`]) — lives in its own sibling for the same reason as
+/// `reply_tests`: the suite runs over a plain-Rust fake driver, so it needs no socket, no `cc`, no
+/// `erl` and no wall-clock wait.
+#[cfg(test)]
+#[path = "closing_tests.rs"]
+mod closing_tests;

@@ -912,6 +912,53 @@ pub trait Driver: core::any::Any {
         Ok(())
     }
 
+    /// The driver's **one chance, before [`Driver::stop`]**, to decide whether the output still
+    /// queued for it can be discarded — the C's `drv_ptr->flush`
+    /// (`erts/emulator/beam/io.c:3659-3700`, `flush_port`).
+    ///
+    /// The C calls it only when the entry's `flush` pointer is non-`NULL`
+    /// (`if (p->drv_ptr->flush != NULL)`, `io.c:3663`), from `flush_port`, which runs when a port
+    /// being closed still has a non-empty ioq
+    /// (`erts_deliver_port_exit`, `io.c:3936-3942`); `flush_port` then terminates the port **only
+    /// if the ioq became empty** (`io.c:3697-3700`). So `flush` is where a driver says "these
+    /// bytes are obsolete, drop them" (the C `tcp_inet` discards the queue only when write
+    /// readiness is *not* armed, `inet_drv.c:12708-12731`), and where a driver that has nothing to
+    /// say inherits this default.
+    ///
+    /// The default ([`Ok(())`], discarding nothing) is exactly the C's `flush == NULL` case: every
+    /// built-in driver without a flush of its own, and `ram_file_drv`'s entry is literally
+    /// `flush = NULL` (`erts/emulator/drivers/common/ram_file_drv.c:116-126`). A driver that
+    /// consumes output synchronously in [`Driver::output`] (as `ram_file_drv` does) therefore
+    /// never has a queue to discard here and needs no override.
+    ///
+    /// # Contract
+    ///
+    /// * Called **once**, from [`crate::Port::close`], after the port entered
+    ///   [`PortState::Closing`](crate::PortState::Closing) and **before** the queued output is
+    ///   drained — so whatever this leaves in [`DriverContext::output`] is what the drain tries to
+    ///   write, and an empty queue here closes the port without touching the device at all.
+    /// * A discarding flush takes the bytes off the queue itself
+    ///   ([`ctx.output().consume(n)`](crate::queue::ByteQueue::consume)); returning `Ok(())`
+    ///   without consuming them means "keep them, try to write them". The port verifies neither
+    ///   count — the C's `flush` returns `void` and reports no byte count either — so consuming
+    ///   what is discarded is the whole accounting rule.
+    /// * [`Driver::stop`] follows only once the queue **is** empty (or the port gives up on it, see
+    ///   [`crate::CLOSING_DRAIN_STALL_LIMIT`]), so a driver may rely on `flush` preceding `stop`.
+    ///
+    /// The overriders: [`crate::drivers::TcpInetDriver`] and [`crate::drivers::UdpInetDriver`] live
+    /// in `src/drivers/inet/`, and [`crate::abi::DriverPort`] forwards to the loaded C driver's own
+    /// `flush` entry (calling nothing when the entry has none, which is the C's `NULL` test).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when the driver's flush fails. The port is torn down
+    /// regardless (a flush failure is not a reason to leave it half-closed), and the error is what
+    /// [`crate::Port::close`] reports.
+    fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        let _ = ctx;
+        Ok(())
+    }
+
     /// Shuts the driver down, releasing its OS resources.
     ///
     /// # Errors
