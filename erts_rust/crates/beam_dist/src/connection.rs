@@ -105,7 +105,20 @@
 //! `AlreadyExists` for `"named:…"` and `InvalidData` for an unknown status. A
 //! refused **acceptor** also writes the `"not_allowed"` status to the peer first
 //! (see [`accept_server`]), so neither side can hang.
-
+//!
+//! **Receive-side failure policy.** A frame that cannot be decoded is fatal for the
+//! link, exactly as in the C, where `invalid_message`/`decode_error` fall to
+//! `data_error` and call `erts_kill_dist_connection` (`dist.c:3167-3188`): there is
+//! no resynchronisation, because the frame is not separable from the stream state
+//! (its distribution header has already advanced this connection's atom cache).
+//! [`Connection::recv`] therefore retains the failed frame
+//! ([`Connection::failed_frame`]) and poisons the link — later calls re-report the
+//! same typed error without reading another byte ([`Connection::is_failed`]) — which
+//! [`Connection::recv_delivery`], [`Connection::recv_delivery_checked`] and both
+//! `dispatch_inbound*` forms inherit. A **classification** failure *after* a
+//! successful decode (a wrongly shaped `DOP_*` tuple, or one whose control terms do
+//! not fit its arity) is deliberately not fatal: it returns the typed error and the
+//! link stays usable.
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::time::Duration;
 
@@ -790,6 +803,10 @@ pub struct Connection<T: Transport> {
     next_seq_id: u64,
     /// A packet body read ahead of the protocol (the handshake's `buffered` frame).
     pending: Option<Vec<u8>>,
+    /// The frame whose decode failed: a link in this state is **poisoned** (every
+    /// later [`Connection::recv`] re-reports this frame's error without reading
+    /// another byte). `None` while the link is healthy.
+    failed_frame: Option<Vec<u8>>,
     /// How many ticks this link has answered (a diagnostic).
     ticks_answered: u64,
     /// This node's own identity for the inbound decode — `None` (the default) keeps
@@ -901,6 +918,7 @@ impl<T: Transport> Connection<T> {
             outbound: OutboundAtomCache::new(),
             next_seq_id: 1,
             pending,
+            failed_frame: None,
             ticks_answered: 0,
             local_identity: None,
         }
@@ -1108,9 +1126,85 @@ impl<T: Transport> Connection<T> {
     ///
     /// The returned [`ControlMessage::terms`] holds the control arguments and, for
     /// a `send` opcode, the trailing message term (see the module docs).
+    ///
+    /// # A frame that cannot be decoded is fatal for the link
+    ///
+    /// The C makes a distribution message that fails to decode
+    /// **connection-fatal**: `invalid_message`/`decode_error` both fall to
+    /// `data_error`, which calls `erts_kill_dist_connection` (`dist.c:3167-3188`)
+    /// and never resynchronises — the frame cannot be separated from the stream
+    /// state it corrupted (the distribution atom cache has already advanced by its
+    /// header). This method reproduces that policy: a failure of the header parse,
+    /// the atom-cache apply, the payload slice or the control-body decode returns
+    /// the same typed error as before ([`BeamError::BadArg`], or
+    /// [`BeamError::SystemLimit`] where the codec already produced it) **and
+    /// poisons the link** — the frame is retained ([`failed_frame`](Self::failed_frame))
+    /// and every later `recv` re-reports that frame's error without reading another
+    /// byte from the transport
+    /// ([`is_failed`](Self::is_failed)). The caller's heap is rewound to the mark it
+    /// had on entry, so a failed decode leaves no dead words.
+    ///
+    /// The frame is retained (rather than an error value) so the diagnosis is
+    /// reproducible and no `Clone` requirement is imposed on [`BeamError`]; it is
+    /// bounded by [`MAX_ESTABLISHED_PACKET_BODY`].
+    ///
+    /// A **classification** failure ([`recv_delivery`](Self::recv_delivery) /
+    /// [`recv_delivery_checked`](Self::recv_delivery_checked) after a successful
+    /// decode) is *not* fatal — see those methods.
     pub fn recv(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<ControlMessage> {
-        let body = self.read_message_body()?;
-        let (header, offset) = parse_header(&body, atoms)?;
+        // A poisoned link never touches the transport again: the retained frame is
+        // re-decoded, so both the error and the diagnosis are reproducible.
+        let body = match self.failed_frame.take() {
+            Some(frame) => frame,
+            None => self.read_message_body()?,
+        };
+        // Words handed out before this call belong to the caller; a failed decode
+        // must not leave its partially materialized terms behind.
+        let mark = heap.used();
+        match self.decode_frame(&body, heap, atoms) {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                // `mark` came from `heap.used()`, so `mark <= heap.used()` holds by
+                // construction and the rewind cannot refuse
+                // (`Heap::reset_to` only rejects moving *forward*).
+                let _ = heap.reset_to(mark);
+                self.failed_frame = Some(body);
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a frame this peer sent failed to decode, making the link unusable
+    /// (see [`recv`](Self::recv)'s fatal-decode policy).
+    ///
+    /// The non-blocking counterpart is
+    /// [`ConnectionDriver::state`](crate::driver::ConnectionDriver::state) reporting
+    /// [`DriverState::Failed`](crate::driver::DriverState::Failed).
+    pub fn is_failed(&self) -> bool {
+        self.failed_frame.is_some()
+    }
+
+    /// The frame whose decode failed, retained for diagnosis, or `None` on a healthy
+    /// link.
+    ///
+    /// These are the exact body bytes (nothing is stripped), bounded by
+    /// [`MAX_ESTABLISHED_PACKET_BODY`]; they stay available across every later
+    /// [`recv`](Self::recv) on the failed link and are never consumed.
+    pub fn failed_frame(&self) -> Option<&[u8]> {
+        self.failed_frame.as_deref()
+    }
+
+    /// Parses one already-read frame body and decodes its control message.
+    ///
+    /// The frame-level half of [`recv`](Self::recv); a failure here is a decode
+    /// failure of a frame the peer believes it delivered, which poisons the link.
+    fn decode_frame(
+        &mut self,
+        body: &[u8],
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+    ) -> Result<ControlMessage> {
+        let (header, offset) = parse_header(body, atoms)?;
         self.recv_cache.apply(&header)?;
         let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
         decode_control_with_identity(
@@ -1127,6 +1221,13 @@ impl<T: Transport> Connection<T> {
     /// This is [`recv`](Self::recv) followed by [`Delivery::classify`] — the
     /// semantic view a runtime routes (the blocking counterpart of
     /// [`crate::driver::ConnectionDriver::next_delivery`]).
+    ///
+    /// The two failure policies are distinct: a **decode** failure poisons the link
+    /// ([`recv`](Self::recv)), while a **classification** failure — a `DOP_*` tuple
+    /// that decoded fine but carries the wrong shape or arity — returns the typed
+    /// error and leaves the link usable, so the next message is read normally. That
+    /// is a deliberate difference from the C, whose `invalid_message` tears the
+    /// connection down.
     pub fn recv_delivery(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Delivery> {
         let message = self.recv(heap, atoms)?;
         Delivery::classify(&message)
@@ -1146,6 +1247,9 @@ impl<T: Transport> Connection<T> {
     ///
     /// [`recv_delivery`](Self::recv_delivery) is the unchanged, unchecked
     /// counterpart (the semantic view with no validation).
+    ///
+    /// Failure policy is [`recv_delivery`](Self::recv_delivery)'s: a decode failure
+    /// poisons the link, a validation/classification failure does not.
     pub fn recv_delivery_checked(
         &mut self,
         heap: &mut Heap,
@@ -1162,7 +1266,10 @@ impl<T: Transport> Connection<T> {
     /// [`crate::driver::ConnectionDriver::dispatch_inbound`]).
     ///
     /// A classification failure (a message-carrying opcode with no trailing
-    /// message) is returned as `Err` and the link state is unaffected.
+    /// message, or an opcode whose control terms do not fit its arity) is returned
+    /// as `Err` and the link state is unaffected, so the next frame is read
+    /// normally; only a **decode** failure of the frame itself poisons the link
+    /// (see [`recv`](Self::recv)).
     pub fn dispatch_inbound(
         &mut self,
         heap: &mut Heap,
@@ -1181,7 +1288,8 @@ impl<T: Transport> Connection<T> {
     /// The checked counterpart of [`dispatch_inbound`](Self::dispatch_inbound): it
     /// goes through [`recv_delivery_checked`](Self::recv_delivery_checked), so a
     /// message that fails the C's `invalid_message` validation is returned as
-    /// `Err` and never reaches `sink`.
+    /// `Err` and never reaches `sink`. As there, only a frame-level **decode**
+    /// failure poisons the link — the link stays usable after a validation refusal.
     pub fn dispatch_inbound_checked(
         &mut self,
         heap: &mut Heap,

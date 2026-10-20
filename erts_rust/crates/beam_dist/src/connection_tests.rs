@@ -758,3 +758,143 @@ fn recv_rejects_a_non_tuple_control_message() {
     let mut atoms = AtomTable::new();
     assert!(matches!(conn.recv(&mut heap, &mut atoms), Err(BeamError::BadArg)));
 }
+
+// -----------------------------------------------------------------------
+// A frame-level decode failure is fatal for the link (`dist.c:3167-3188`:
+// `invalid_message`/`decode_error` -> `data_error` ->
+// `erts_kill_dist_connection`).
+// -----------------------------------------------------------------------
+
+/// The valid `131, 'D', 0` header followed by a `{DOP_LINK, 1.5, 2.5, 3.5}`
+/// control tuple: a well-formed ETF image whose arity is wrong for `DOP_LINK`
+/// (two control arguments, not three), so the decode fails **after** the three
+/// floating-point arguments have been materialized on the caller's heap.
+fn wrong_arity_body_with_heap_terms() -> Vec<u8> {
+    let mut body = vec![
+        beam_codec::VERSION_MAGIC,
+        DIST_HEADER,
+        0,
+        SMALL_TUPLE_EXT,
+        4,
+        beam_codec::SMALL_INTEGER_EXT,
+        Dop::Link.as_u8(),
+    ];
+    for value in [1.5f64, 2.5, 3.5] {
+        body.push(beam_codec::NEW_FLOAT_EXT);
+        body.extend_from_slice(&value.to_bits().to_be_bytes());
+    }
+    body
+}
+
+#[test]
+fn a_frame_that_fails_to_decode_poisons_the_link() {
+    let atoms = AtomTable::new();
+    let bad = wrong_arity_body_with_heap_terms();
+    let good = packet_body(Dop::Link, &[make_small(5), make_small(6)], &atoms);
+
+    // A perfectly valid frame sits behind the bad one: a link that skipped the
+    // failure would deliver it on the next `recv`.
+    let mut input = framed(&bad, ESTABLISHED_FRAMING);
+    let good_frame = framed(&good, ESTABLISHED_FRAMING);
+    input.extend_from_slice(&good_frame);
+
+    let mut conn = connection(input);
+    let mut heap = Heap::new(1024).unwrap();
+    let mut rx_atoms = AtomTable::new();
+    assert!(!conn.is_failed(), "a fresh link is not failed");
+    assert_eq!(conn.failed_frame(), None);
+
+    // (a) The decode failure is the same typed error as before, the link is marked
+    // failed and the exact body that was fed is retained for diagnosis.
+    let mark = heap.used();
+    assert!(matches!(conn.recv(&mut heap, &mut rx_atoms), Err(BeamError::BadArg)));
+    assert!(conn.is_failed());
+    assert_eq!(conn.failed_frame(), Some(bad.as_slice()));
+    assert_eq!(heap.used(), mark, "a failed decode must leave no dead words");
+
+    // (b) A second `recv` re-reports the same error and does **not** consume the
+    // valid frame buffered behind the bad one — the silent skip this poisons.
+    assert!(matches!(conn.recv(&mut heap, &mut rx_atoms), Err(BeamError::BadArg)));
+    assert!(conn.is_failed());
+    assert_eq!(heap.used(), mark);
+
+    // (c) The retained frame is stable: the same bytes, never consumed, across every
+    // derive-off of `recv`.
+    assert_eq!(conn.failed_frame(), Some(bad.as_slice()));
+    assert!(matches!(
+        conn.recv_delivery(&mut heap, &mut rx_atoms),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(conn.failed_frame(), Some(bad.as_slice()));
+    assert_eq!(heap.used(), mark);
+
+    // The valid frame is still unread in the transport.
+    assert_eq!(
+        conn.into_inner().input_remaining(),
+        good_frame.len(),
+        "the valid frame must stay unread"
+    );
+}
+
+#[test]
+fn a_failed_decode_returns_the_callers_heap_words() {
+    let bad = wrong_arity_body_with_heap_terms();
+
+    // Control leg: the very same tuple shape with a `DOP_EXIT` opcode (three
+    // control arguments) decodes fine and *does* advance the heap, so the rollback
+    // assertion below measures something real rather than a decode that never wrote
+    // a word.
+    let mut viable = bad.clone();
+    viable[6] = Dop::Exit.as_u8();
+    let mut conn = connection(framed(&viable, ESTABLISHED_FRAMING));
+    let mut heap = Heap::new(1024).unwrap();
+    let mut atoms = AtomTable::new();
+    let mark = heap.used();
+    let message = conn.recv(&mut heap, &mut atoms).expect("a `DOP_EXIT` with three args decodes");
+    assert_eq!(message.dop, Dop::Exit);
+    assert!(heap.used() > mark, "decoding floats materializes heap words");
+
+    // The failing leg: the same work, then an arity refusal — every word it handed
+    // out is given back.
+    let mut conn = connection(framed(&bad, ESTABLISHED_FRAMING));
+    let mut heap = Heap::new(1024).unwrap();
+    let mut atoms = AtomTable::new();
+    let mark = heap.used();
+    assert!(matches!(conn.recv(&mut heap, &mut atoms), Err(BeamError::BadArg)));
+    assert_eq!(heap.used(), mark, "a failed decode must leave no dead words");
+}
+
+#[test]
+fn a_classification_failure_does_not_poison_the_link() {
+    // A control-only `DOP_SEND` (the `{DOP, From, To}` form with no trailing
+    // message) decodes fine but cannot be classified — a *classification* failure,
+    // which stays non-fatal: the next frame is read and delivered normally.
+    let atoms = AtomTable::new();
+    let mut input = framed(
+        &packet_body(Dop::SendSender, &[make_small(1), make_small(2)], &atoms),
+        ESTABLISHED_FRAMING,
+    );
+    input.extend(framed(
+        &packet_body(Dop::Link, &[make_small(7), make_small(8)], &atoms),
+        ESTABLISHED_FRAMING,
+    ));
+
+    let mut conn = connection(input);
+    let mut heap = Heap::new(1024).unwrap();
+    let mut rx_atoms = AtomTable::new();
+    assert!(matches!(
+        conn.recv_delivery(&mut heap, &mut rx_atoms),
+        Err(BeamError::BadArg)
+    ));
+    assert!(!conn.is_failed(), "a classification failure must not poison the link");
+    assert_eq!(conn.failed_frame(), None);
+
+    match conn.recv_delivery(&mut heap, &mut rx_atoms).expect("the next frame is read") {
+        Delivery::Link { from, to } => {
+            assert_eq!(from, make_small(7));
+            assert_eq!(to, make_small(8));
+        }
+        other => panic!("expected the following DOP_LINK, got {other:?}"),
+    }
+    assert!(!conn.is_failed());
+}

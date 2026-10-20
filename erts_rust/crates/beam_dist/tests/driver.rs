@@ -791,3 +791,166 @@ fn a_refusing_server_driver_never_emits_a_challenge() {
     assert_eq!(server.state(), DriverState::Failed);
     assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
 }
+
+// ---------------------------------------------------------------------------
+// (h) A frame-level DECODE failure is fatal for the link and the frame is
+//     retained, never silently skipped.
+//
+// ERTS treats a control message that cannot be decoded as connection-fatal: both
+// `invalid_message:` and `decode_error:` fall through to `data_error:`, which calls
+// `erts_kill_dist_connection` (`erts/emulator/beam/dist.c`). There is no resync —
+// the frame's header has already advanced the distribution atom cache — so the
+// driven state machine must report the same typed error again rather than advance
+// to the next frame.
+// ---------------------------------------------------------------------------
+
+/// Wraps an established-phase message body in the 4-byte packet framing.
+fn frame_established(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// The ill-formed established-phase body the decode-failure tests feed.
+///
+/// The distribution header is well formed and carries no atom-cache refs (the exact
+/// 3 bytes `131, 68, 0`), so `step`'s structural `validate_header_prefix` accepts the
+/// packet and `next_message`'s header parse yields offset 3 — the failure is in the
+/// control tuple, not in the framing. The tuple announces arity 3 (the opcode plus
+/// `DOP_SEND`'s two control arguments), supplies a one-element tuple as the first
+/// argument — so decoding **writes a boxed term into the caller's heap** before it
+/// fails — and then runs out of bytes for the second argument.
+fn ill_formed_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[beam_codec::VERSION_MAGIC, DIST_HEADER, 0]);
+    // `SMALL_TUPLE_EXT`, arity 3, then the opcode as `SMALL_INTEGER_EXT`.
+    body.extend_from_slice(&[104, 3, 97, Dop::Send.as_u8()]);
+    // The first control argument: `SMALL_TUPLE_EXT` arity 1 around the small int 5.
+    body.extend_from_slice(&[104, 1, 97, 5]);
+    // The second control argument is missing: the tuple is truncated.
+    body
+}
+
+#[test]
+fn a_decode_failure_is_fatal_and_retains_the_frame() {
+    let (_client, mut server) = establish(Mode::Whole);
+    let body = ill_formed_body();
+
+    server.feed(&frame_established(&body));
+    assert_eq!(
+        server.step().expect("the packet is queued"),
+        StepOutcome::Progress,
+        "a well-formed length prefix and header are queued, not rejected"
+    );
+    assert_eq!(server.state(), DriverState::Established);
+    assert_eq!(server.failed_frame(), None, "nothing has failed to decode yet");
+
+    // The failing payload really does write to the heap before it fails (the boxed
+    // `{5}` control argument), so the rewind assertion below is not vacuous.
+    let mut probe_heap = Heap::new(4096).expect("probe heap");
+    let mut probe_atoms = AtomTable::new();
+    let probe =
+        beam_dist::control::decode_control(&body[3..], &mut probe_heap, &mut probe_atoms, None);
+    assert!(matches!(probe, Err(BeamError::BadArg)), "the control tuple is undecodable");
+    assert!(probe_heap.used() >= 2, "the failed decode handed out {}", probe_heap.used());
+
+    let mut heap = Heap::new(4096).expect("server heap");
+    let mut atoms = AtomTable::new();
+    let mark = heap.used();
+    let err = server
+        .next_message(&mut heap, &mut atoms)
+        .expect_err("a truncated control tuple must fail the decode");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(heap.used(), mark, "a failed decode hands the caller's heap back unchanged");
+    assert_eq!(server.state(), DriverState::Failed, "a decode failure is fatal for the link");
+    assert_eq!(server.failed_frame(), Some(&body[..]), "the frame is retained, not consumed");
+
+    // The failed link stays failed and reports it rather than resuming.
+    assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
+    assert_eq!(server.state(), DriverState::Failed);
+}
+
+#[test]
+fn a_retained_frame_is_re_reported_and_never_consumed() {
+    let (_client, mut server) = establish(Mode::Whole);
+    let body = ill_formed_body();
+
+    server.feed(&frame_established(&body));
+    server.step().expect("the packet is queued");
+
+    let mut heap = Heap::new(4096).expect("server heap");
+    let mut atoms = AtomTable::new();
+    let first = server
+        .next_message(&mut heap, &mut atoms)
+        .expect_err("the first attempt fails the decode");
+    assert!(matches!(first, BeamError::BadArg), "got {first:?}");
+    let mark = heap.used();
+    assert_eq!(server.failed_frame(), Some(&body[..]));
+
+    // Every later attempt re-decodes the *same* retained frame and reports the same
+    // typed error — never `Ok(None)` and never a following frame.
+    for attempt in 0..2 {
+        let again = server
+            .next_message(&mut heap, &mut atoms)
+            .expect_err("a retained frame is never skipped");
+        assert!(matches!(again, BeamError::BadArg), "attempt {attempt}: got {again:?}");
+        assert_eq!(
+            format!("{again:?}"),
+            format!("{first:?}"),
+            "attempt {attempt} reports the same error as the first"
+        );
+        assert_eq!(heap.used(), mark, "attempt {attempt} also rewinds the heap");
+        assert_eq!(server.failed_frame(), Some(&body[..]), "attempt {attempt} keeps the frame");
+        assert_eq!(server.state(), DriverState::Failed);
+    }
+
+    // The derive-offs inherit the same policy rather than papering over it.
+    let via_delivery = server
+        .next_delivery(&mut heap, &mut atoms)
+        .expect_err("the retained frame fails the delivery drain too");
+    assert!(matches!(via_delivery, BeamError::BadArg), "got {via_delivery:?}");
+    assert_eq!(server.failed_frame(), Some(&body[..]));
+}
+
+#[test]
+fn a_valid_frame_ahead_of_an_undecodable_one_is_still_delivered() {
+    let (mut client, mut server) = establish(Mode::Whole);
+
+    // A real `DOP_SEND` message, produced by the peer's own encoder.
+    let atoms = AtomTable::new();
+    client
+        .send_control(Dop::Send, &[make_small(1), make_small(2), make_small(3)], &atoms)
+        .expect("the client encodes a valid message");
+    let good = client.take_output();
+    let bad = frame_established(&ill_formed_body());
+
+    // Both packets are queued by one `step`: A is well formed, B is not.
+    server.feed(&good);
+    server.feed(&bad);
+    assert_eq!(server.step().expect("both packets are queued"), StepOutcome::Progress);
+    assert_eq!(server.state(), DriverState::Established);
+
+    let mut server_atoms = AtomTable::new();
+    let mut heap = Heap::new(4096).expect("server heap");
+    let msg = server
+        .next_message(&mut heap, &mut server_atoms)
+        .expect("A decodes")
+        .expect("A is pending");
+    assert_eq!(msg.dop, Dop::Send);
+    assert_eq!(msg.terms, vec![make_small(1), make_small(2), make_small(3)]);
+    assert_eq!(server.state(), DriverState::Established, "a successful decode keeps the link");
+    assert_eq!(server.failed_frame(), None, "A decoded, so nothing is retained yet");
+
+    let err = server
+        .next_message(&mut heap, &mut server_atoms)
+        .expect_err("B fails the decode");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(
+        server.failed_frame(),
+        Some(&ill_formed_body()[..]),
+        "B — not the already-delivered A — is the retained frame"
+    );
+    assert_eq!(server.state(), DriverState::Failed);
+    assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
+}
