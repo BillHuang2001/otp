@@ -146,12 +146,18 @@
 //! * **`group_leader(RemotePid, self())`** could not be measured: the oracle's `-eval` wrapper
 //!   would not evaluate it (a silent exit `1`), so there is no oracle observation to pin.
 //!
-//! # A `-eval` trap found while measuring: `Pid ! Msg` after a blocking call
+//! # The `-eval` route's own boundary: a script ends when its last expression does
 //!
-//! On the Rust runtime `Doomed ! go` **after** a `timer:sleep/1` or a bounded `receive` fails
-//! the whole script with `beam_rt: term not found` (exit `1`), while `erlang:send(Doomed, go)`
-//! works everywhere; before any blocking call both work. Every script in this group therefore
-//! uses `erlang:send/2` and never the `!` operator.
+//! `Pid ! Msg` agrees with `erlang:send(Pid, Msg)` in **every** position — before a
+//! `timer:sleep/1`, after it, after a bounded `receive … after`, and after a monitor's `'DOWN'` —
+//! so this group keeps the qualified `erlang:send/2` spelling purely as a convention, not to dodge
+//! a defect.
+//!
+//! What the route does impose is its own deadline: a `-eval` script's process **halts the VM the
+//! instant the top-level expression ends**, so a message with no trailing blocking call never runs
+//! its recipient on the Rust runtime (recorded in `divergences.md` §A.5). Every script here
+//! therefore ends with a bounded wait or an explicit `halt()` — which is also what makes the peer
+//! leg's reply observable.
 //!
 //! # Cost
 //!
