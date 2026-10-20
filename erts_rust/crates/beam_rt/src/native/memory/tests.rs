@@ -1536,6 +1536,36 @@ fn the_links_item_unions_a_local_link_with_an_inbound_distribution_link() {
         "the remote entry classifies as a remote target"
     );
 
+    // (4b) `process_info/1` picks the item up **automatically**: it walks `PI_1_KEYS` through the
+    // very same `raw_value` arm, so the fixed value is what that reply carries too — no separate
+    // change is needed for it.
+    let one = call(&mut runtime, "erlang", "process_info", &[victim_pid]).expect("process_info/1");
+    let (_, from_one) = entries_of(one)
+        .into_iter()
+        .find(|(key, _)| runtime.atom_name_of(*key) == Some("links"))
+        .expect("process_info/1 emits the links item");
+    let from_one = terms::list_elements(from_one).expect("a bare pid list");
+    assert_eq!(
+        from_one.len(),
+        both.len(),
+        "process_info/1's links item is the same local-then-remote union"
+    );
+    assert_eq!(
+        from_one[0], both[0],
+        "the local link is the same pid immediate in both routes"
+    );
+    // The remote entry is a **copy** of the external-pid block, so it lives at a different heap
+    // address and is compared part by part, never word by word.
+    let from_one_remote = RemotePid::from_eterm(from_one[1]).expect("an external pid block");
+    assert_eq!(from_one_remote.node(), decoded.node(), "same peer node");
+    assert_eq!(from_one_remote.number(), decoded.number(), "same peer number");
+    assert_eq!(from_one_remote.serial(), decoded.serial(), "same peer serial");
+    assert_eq!(
+        from_one_remote.creation(),
+        decoded.creation(),
+        "same peer creation"
+    );
+
     // (5) THE TWO PATHS AGREE: the peer's `unlink` removes its recorded link, taking the victim
     // back to the local-only case — and the answer is *exactly* the fast path's value again, so
     // the two-step copy-out never leaves a mangled local half behind.
