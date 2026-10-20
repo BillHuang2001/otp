@@ -1,9 +1,15 @@
 # `beam_rt` test fixtures
 
 `mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
-`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam` and
-`pingpong.beam` are committed oracle fixtures: real `.beam` images produced by the **system
-Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+`function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam`,
+`port_suspend.beam` and `pingpong.beam` are committed oracle fixtures: real `.beam` images produced
+by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+* `port_suspend.beam` (`port_suspend.erl`, compiled with the plain system `erlc`) is the **busy-port
+  BIF-suspend** image for `src/port/busy_suspend_tests.rs`: `park/1` opens a busy driver port and
+  calls `port_command/2` on it (the shape that parks), and `park_with_clearing_helper/1` additionally
+  spawns a helper that blocks in `receive after 50` and then calls `port_control(Port, $N, <<>>)`
+  (the fixture's `set_busy_port(port, 0)`), so one `run_scheduled` proves park → pump → resume and
+  that the driver was written to **exactly once**.
 * `pingpong.beam` is the **two-process ping-pong** image for the `run` route's sleep
   accounting (`tests/run_route_sleep.rs`): `go/1` spawns one fun-bodied worker and runs `N`
   synchronous round trips (`Worker ! {self(), N}` / a bound-variable `receive {_, N}`, with
@@ -768,15 +774,19 @@ Six cases per variant, each a fresh port (start-up message drained, then the sta
 | busy | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true`, command delivered |
 | busy | none | either | caller **suspends** until the port is idle, then `true`, command delivered |
 
-The last row is the one **documented divergence**: this runtime's BIF seam has no
-"suspend the caller and re-run me" shape (`src/native/port.rs`), so a bare `port_command` on a busy
-port raises the typed capability gap (exit 3) rather than fabricating a `true`.
+The last row is the runtime's **BIF-suspend arm**: a scheduled process that issues a bare
+`port_command` on a busy port parks through `beam_engine`'s BIF suspend channel (the C's
+`erts_suspend` + `ERTS_BIF_YIELD3` re-run), the scheduler pass pumps the port/timer halves, and the
+re-issued command answers `true` with the command delivered. `tests/port_busy.rs` pins it two ways:
+`busy_plain_resumed/1` on the `-eval` route (which owns a scheduler pass and waits in place, the
+helper clearing the bit 200 ms in → `{ok,cleared,echoed}`) and `busy_pc/1` through the CLI `run`
+action (a **scheduled slice**, the helper clearing the bit 100 ms in → `{true,<<120>>}`, identical to
+the oracle). The residual is the `send`/inline-`!` route, which shares this wait but has no BIF door
+to park on and still raises the typed gap, and the wait's 5 s bound (the C is unbounded).
 
 > **Never run the busy + no-options case on the oracle without something to clear the busy bit.** It
-> blocks for ever (the C's `erts_suspend` + `ERTS_BIF_YIELD3`). `tests/port_busy.rs` asserts the
-> runtime's typed gap on that call, and evidences the oracle's suspend **only** through
-> `busy_plain_resumed/1`, whose helper clears the bit 200 ms in and yields the oracle's
-> `{ok,cleared,echoed}`.
+> blocks for ever. On this runtime the same call is bounded: a port no driver ever clears is the
+> typed deadline gap (`busy_wait::DEADLINE_REASON`) rather than a hung executable.
 
 ### Skip-loudly rule
 
