@@ -223,6 +223,13 @@ rot.
   its `INET_REQ_FDOPEN` adoption, the `{error, closed}` teardown); three `erl`-oracle cases
 - `efile.rs`, `spawn.rs`, `inet.rs` → the built-in drivers on real files, real children, loopback TCP
   (`spawn.rs` also cross-checks the port-level `[line]`/`[binary,{line,N}]` framing against the oracle)
+- `spawn.rs`'s `a_stalled_write_stays_queued_and_arms_write_readiness` is the integration-level pin of
+  the C's **deferred port close** (`io.c:3946-3956` + `flush_port` `io.c:3659-3700`): a `sleep` child
+  never reads its stdin, so `PortRegistry::close` **parks** the port in `PortState::Closing` with its
+  output queue intact and both poller registrations still armed, `stop` not run and no `Closed`
+  reported; a command on it is `badarg` and a second `close` is idempotent. The fully-drained closes
+  in `port.rs`/`port_task.rs`/`efile.rs` still deregister inside the call — that is the same contract's
+  synchronous arm, not a discarded queue.
 - `udp_inet.rs`, `ram_file.rs` → the other two built-ins through the real port layer
   (`DriverRegistry::with_builtins` + `PortRegistry` + `Poller`): a loopback UDP datagram round trip
   (`udp_inet`) and the packed opcode/`control` command grammar (`ram_file_drv`), each with an
