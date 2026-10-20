@@ -111,6 +111,7 @@ fn listener_options() -> SocketOptions {
         send_timeout_close: 1,
         show_econnreset: true,  // TCP_ADDF_SHOW_ECONNRESET
         read_ahead: false,      // TCP_ADDF_NO_READ_AHEAD
+        linger_zero: true,      // TCP_ADDF_LINGER_ZERO
         msgq_high: 1000,        // {high_msgq_watermark, 1000}
         msgq_low: 500,          // {low_msgq_watermark, 500}
         // --- the fields the C does NOT copy, deliberately pushed off their defaults ----------
@@ -200,7 +201,8 @@ fn timeout_options_are_inherited() {
     assert_ne!(child.send_timeout_close, copy.send_timeout_close);
 }
 
-/// The `SHOW_ECONNRESET`/`NO_READ_AHEAD` flag group (the only two `tcp_add_flags` bits the C keeps).
+/// The `SHOW_ECONNRESET`/`NO_READ_AHEAD`/`LINGER_ZERO` flag group (the only three `tcp_add_flags`
+/// bits the C keeps).
 #[test]
 fn flag_options_are_inherited() {
     let parent = listener_options();
@@ -214,8 +216,13 @@ fn flag_options_are_inherited() {
         !copy.read_ahead,
         "tcp_add_flags & TCP_ADDF_NO_READ_AHEAD (`:11822`)"
     );
+    assert!(
+        copy.linger_zero,
+        "tcp_add_flags & TCP_ADDF_LINGER_ZERO (`:11829`-`:11831`)"
+    );
     assert_ne!(child.show_econnreset, copy.show_econnreset);
     assert_ne!(child.read_ahead, copy.read_ahead);
+    assert_ne!(child.linger_zero, copy.linger_zero);
 }
 
 /// The busy-msgq limits, which the C reads off the parent port and writes to the child
@@ -297,6 +304,7 @@ fn the_copy_is_exactly_the_c_mapping() {
         send_timeout_close: parent.send_timeout_close,
         show_econnreset: parent.show_econnreset,
         read_ahead: parent.read_ahead,
+        linger_zero: parent.linger_zero,
         msgq_high: parent.msgq_high,
         msgq_low: parent.msgq_low,
         // not inherited — the child's own

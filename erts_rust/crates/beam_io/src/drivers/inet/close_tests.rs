@@ -40,8 +40,8 @@ use super::wire::{ctl_ok, ctl_xerror};
 use super::{InetState, TcpInetDriver, INET_AF_INET, INET_TYPE_STREAM};
 use crate::poller::Poller;
 use crate::port::PortCommandOptions;
+use crate::port_task::PortNotification;
 use crate::registry::PortRegistry;
-use beam_process::PortId;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
@@ -257,13 +257,15 @@ fn a_teardown_keeps_the_queued_output_that_write_readiness_can_still_send() {
     assert!(queued > 0, "the peer never reads, so a remainder is queued");
     assert!(
         ports
-            .get(id)
+            .get_mut(id)
             .expect("the port is live")
             .take_active_spends()
             .is_empty(),
         "a plain write spends no {{active,_}} grant"
     );
-    ports.close(id).expect("the close runs (and answers its `true`)");
+    ports
+        .close(&mut poller, id)
+        .expect("the close runs (and answers its `true`)");
     // The queue is kept: `tcp_inet_flush` saw write readiness armed (the stalled
     // `write_pending` left `Interest::BOTH`), so it did not `tcp_clear_output`.
     assert!(
@@ -283,7 +285,7 @@ fn a_teardown_keeps_the_queued_output_that_write_readiness_can_still_send() {
     assert!(!port.is_closed(), "`stop` has not run yet");
     // A second `close` is the C's idempotent re-entry (`io.c` returns at once for a CLOSING port).
     ports
-        .close(id)
+        .close(&mut poller, id)
         .expect("a second close is an idempotent Ok(())");
     // Only once the remainder is written (or the stall bound drops it) does the port leave the
     // live map and report `Closed`; the peer here never reads, so that is the bound.
@@ -292,7 +294,11 @@ fn a_teardown_keeps_the_queued_output_that_write_readiness_can_still_send() {
         let round = ports
             .execute_port_tasks(&mut poller, crate::port::DEFAULT_READINESS_RED_BUDGET)
             .expect("a port-task round");
-        if round.notifications.iter().any(|n| n.port == id) {
+        if round
+            .notifications
+            .iter()
+            .any(|n| matches!(n, PortNotification::Closed { port } if *port == id))
+        {
             closed = true;
             break;
         }

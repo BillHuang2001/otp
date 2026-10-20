@@ -1343,18 +1343,21 @@ impl TcpInetDriver {
     /// Reads the socket to `EAGAIN` into `out`, appending every byte the kernel hands over.
     ///
     /// A no-op unless the socket is connected and the peer's close has not already been observed.
-    /// Returns the number of bytes read. The edge-triggered poller means a caller must drain to
-    /// `EAGAIN` per readiness callback, which this loop does.
+    /// The edge-triggered poller means a caller must drain to `EAGAIN` per readiness callback,
+    /// which this loop does.
     ///
-    /// `report` is threaded into the [`CloseSource::Read`] this read latches if it is the one that
-    /// finds the peer gone — see [`ReadReport`].
+    /// Answers the peer-close **observation** when this drain is the one that made it, and latches
+    /// nothing itself: it only records [`TcpInetDriver::read_eof`] and hands the [`CloseSource`]
+    /// back, so the caller decides when the close is applied (the C's discovery sites clear and
+    /// only then deliver, `inet_drv.c:12824`-`:12829`) — see [`TcpInetDriver::read_available`]'s
+    /// latch and [`TcpInetDriver::deferred_close`] for the payload-first ordering. `report` is
+    /// threaded into the returned [`CloseSource::Read`] — see [`ReadReport`].
     ///
     /// # Errors
     ///
-    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor) and
-    /// whatever the close latch reports (a failed poller de-registration, or a refused
-    /// active-input delivery). A **read** failure is not one of them: it is classified through
-    /// [`CloseSource::Read`] instead of being raised.
+    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor). A
+    /// **read** failure is not one of them: it is classified through [`CloseSource::Read`] instead
+    /// of being raised.
     fn read_bytes(
         &mut self,
         out: &mut Vec<u8>,
@@ -1364,7 +1367,6 @@ impl TcpInetDriver {
             return Ok(None);
         }
         let fd = self.connected_socket()?;
-        let mut read = 0usize;
         let mut buf = [0u8; READ_CHUNK];
         loop {
             // SAFETY: `fd` is an open, non-blocking socket owned by this driver and `buf` is
@@ -1374,7 +1376,6 @@ impl TcpInetDriver {
             if n > 0 {
                 let n = n as usize;
                 out.extend_from_slice(&buf[..n]);
-                read += n;
                 // Edge-triggered readiness: keep reading until the socket is empty.
                 continue;
             }
@@ -2702,6 +2703,11 @@ mod close_tests;
 mod error_delivery_tests;
 #[cfg(test)]
 mod fdopen_errno_tests;
+// `tcp_inet`'s `flush` override — the C's `tcp_inet_flush` (`inet_drv.c:12708`-`:12731`), whose
+// `discard_output` decides whether a close may keep the queued output or has to drop it.
+#[cfg(test)]
+#[path = "flush_tests.rs"]
+mod flush_tests;
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
@@ -2743,6 +2749,12 @@ mod tests;
 #[cfg(test)]
 #[path = "write_frame_tests.rs"]
 mod write_frame_tests;
+// The **read-path ordering** pin: a complete buffered unit wins over a pending close — the C's
+// `tcp_recv` delivers what the drain collected (`inet_drv.c:13216`-`:13217`/`:13229`-`:13230`)
+// before a later call's `n == 0` may reach `tcp_recv_closed` (`:13206`-`:13208`).
+#[cfg(test)]
+#[path = "write_then_close_tests.rs"]
+mod write_then_close_tests;
 /// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
 /// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
 /// halves state the format in one place.
