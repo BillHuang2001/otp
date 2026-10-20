@@ -58,7 +58,7 @@
 //! kill_at_bound_monitor    {down,true,true,killed}     1 report, Kill: true
 //! log_and_continue         {survived,completed}        13 reports, Kill: false
 //! log_and_continue_silent  {survived,completed}        0 reports
-//! capacity_not_occupancy   {survived,{100,true}}       4 reports, Total Heap Size > 700
+//! capacity_not_occupancy   {survived,{100,true}}       1 report, Total Heap Size > 700
 //! floor                    [badarg,accepted,accepted,accepted,accepted,badarg,badarg,badarg]
 //! spawn_opt_log            {survived,true,completed}   13 reports
 //! spawn_opt_kill           {died,true,true,killed}     1 report
@@ -502,7 +502,7 @@ fn the_floor_is_the_processes_own_min_heap_size() {
 // ---------------------------------------------------------------------------------------
 
 /// The bound is checked against the **capacity a collection installs**, never against the live
-/// words: the victim holds a 100-element list (under 100 words of live data) for its whole life and
+/// words: the victim holds a 100-element list (a couple of hundred words of live data) for its whole life and
 /// still breaches `#{size => 700}`.
 ///
 /// Measured: both runtimes print `{survived,{100,true}}`; the report's `Total Heap Size` is this

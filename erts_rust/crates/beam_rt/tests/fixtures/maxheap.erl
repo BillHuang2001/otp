@@ -40,7 +40,7 @@
 %% * `reports_per_collection/0` — the measurement behind "one report per over-limit
 %%   collection": the victim reports the **runtime's own** collection-counter delta
 %%   around its work, so the suite can compare it with the number of reports.
-%% * `capacity_not_occupancy/0` — a victim that never holds more than ~500 words of live
+%% * `capacity_not_occupancy/0` — a victim that never holds more than ~200 words of live
 %%   data (the 100-element list it keeps) still breaches `#{size => 700}`, because a
 %%   fullsweep installs `mature_target_words` = `2 x (live + young occupancy + reserve)`
 %%   words: the check is on the collected **capacity**, never on occupancy.
