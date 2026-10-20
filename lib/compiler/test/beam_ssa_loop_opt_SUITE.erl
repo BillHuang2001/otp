@@ -1734,7 +1734,7 @@ licm_recv_loop(Config) ->
     %% words and the heap size are only reported.
     {OffRunGCs, OffWords, OffHeap0, OffHeap1, OffFreshVal, OffTotalGCs} =
         licm_alloc(OffMod),
-    {OnRunGCs, OnWords, OnHeap0, OnHeap1, OnFreshVal, OnTotalGCs} =
+    {OnRunGCs, OnWords, OnHeap0, OnHeap1, _OnFreshVal, OnTotalGCs} =
         licm_alloc(OnMod),
     case {OffRunGCs =:= OnRunGCs, OffFreshVal =:= OffVal} of
         {true, true} ->
