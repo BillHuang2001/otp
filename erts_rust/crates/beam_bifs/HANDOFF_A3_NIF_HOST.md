@@ -198,13 +198,21 @@ idiom). Ownership is unchanged by the seam: the env belongs to the host that all
 3. `enif_send`: resolve the host from `env` when it is a live env, **else from `msg_env`** (the
    `enif_send(NULL, &pid, msg_env, msg)` idiom). Nothing else changes: null `to_pid` ⇒ `0`,
    unsupported hook ⇒ `0`.
-4. **Host half (`beam_rt`, still owed):** a factory whose `intern_atom`/`atom_name` reach the
-   runtime's **live** `AtomTable` (the `AtomInterner` seam — the measured atom round-trip proves a
-   snapshot is not enough, `enif_make_atom` can *create* an atom) and whose `send` hook injects into
-   the process table thread-safely (a `Send + Sync` channel drained by the scheduler, mirroring
-   `beam_abi::driver::async_pool::AsyncPool`), so a send **wakes** a parked receiver. Until
-   `beam_rt` installs one, `enif_alloc_env()` off the call path answers `NULL` — an honest refusal,
-   never a wrong term.
+4. **Host half (`beam_rt`, implemented):** `../beam_rt/src/nif/thread_env.rs` installs a
+   `ThreadEnvHostFactory` (a per-thread `ForeignHost`) from `cli::run` and clears it on the one graceful
+   exit; `Runtime::drain_nif_thread_sends` runs at `context/calls.rs::try_call_nif` (after the call's
+   services drop) and in `runtime/scheduler.rs::scheduler_pass`, decoding each queued image against the
+   live atom table and then delivering + resume-on-send through the runtime's own seam, so a send
+   **wakes** a parked receiver. Its atom space is **private and append-only**, and a term crosses the
+   boundary as an ETF image decoded against the live `AtomTable`: atoms travel by **name**, because
+   reserving indices inside the live space (which re-anchors when the live table grows around an
+   outstanding handle) can end up naming a different atom. Consequences, stated as substitutions: the
+   send is queued at `enif_send` (the C's `1`) and delivered at the next drain, where the C delivers
+   inside the call; `atom_table` is `None` on such a host, so the env-less
+   `enif_compare`/`enif_is_identical`/`enif_hash` order a nested atom by raw index; and
+   `enif_make_existing_atom` answers within the private space only. `enif_alloc_env()` off the call path
+   answers `NULL` only when no factory is installed — a crate-owned env would hand a NIF a *wrong atom
+   index*, an honest refusal rather than a wrong term.
 
 ---
 
@@ -317,10 +325,13 @@ identity can differ, never the operand.
 
 **Still owed, and where:**
 
-- (a) **`../beam_rt`** — the runtime host halves: the §2 item 4 factory host over the live `AtomTable`
-  plus a thread-safe send that wakes a parked receiver, and the `beam_rt`-level end-to-end cases.
-- (b) **`../tools/differential`** (sibling node) — the corpus cases of §5.
-- (c) Nothing in `beam_abi`'s ABI surface is outstanding for these three paths.
+- (a) **`../tools/differential`** (sibling node) — the corpus cases of §5. The `beam_rt` runtime host
+  halves landed in `../beam_rt/src/nif/thread_env.rs` (`ThreadEnvHostFactory`, install/clear in
+  `cli::run`, `drain_nif_thread_sends` at the two drain sites; private append-only atom space with a
+  by-name ETF handoff — §2 item 4) and are pinned end-to-end by that crate's
+  `tests/nif_a3_{thread_env,schedule,resource_stop}.rs`: 25 of 35 observations agree with the live
+  oracle, the rest are the documented `enif_thread_type`-on-a-driver-thread and raw-word substitutions.
+- (b) Nothing in `beam_abi`'s ABI surface is outstanding for these three paths.
 
 ## §5 Differential-corpus cases owed (`tools/differential`, sibling node)
 - `nif_a3/schedule_normal_continuation_value`, `nif_a3/schedule_chain_of_100000` (constant stack),
