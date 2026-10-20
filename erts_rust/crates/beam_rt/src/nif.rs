@@ -42,6 +42,15 @@
 //! two apart is what lets the unload host be long-lived while the call host is cheap and
 //! correctly rooted at the current atom-table length.
 //!
+//! # A third host: the one a NIF-created thread runs on
+//!
+//! [`thread_env`] is neither of the above: a thread a NIF created (`enif_thread_create`) is inside no
+//! call and outlives the `load` callback, so `beam_abi`'s thread-env seam opens a [`thread_env::ForeignHost`]
+//! for it through the factory [`Runtime::install_nif_thread_env`](crate::runtime::Runtime::install_nif_thread_env)
+//! installs, and [`Runtime::drain_nif_thread_sends`](crate::runtime::Runtime::drain_nif_thread_sends)
+//! delivers what its `enif_send` queued. That module's own docs carry the one atom-index space, the
+//! queued-ETF-image substitution and the typed gaps; nothing about it changes either host here.
+//!
 //! # Deferred atom interning
 //!
 //! A NIF interns atoms through [`NifHost::intern_atom`] (an `enif_make_atom`), which must add
