@@ -72,7 +72,8 @@
 //!   sign-extended) and fun_to_list => "#Fun<weird mod.3.-1>" (the local-fun arm of
 //!   the `FUN_DEF` printer uses the RAW module name, no quoting)
 //!   name => its `ErlFunEntry`-derived `'-mk1/0-fun-0-'` needs the loaded module's
-//!   fun table, so it (and fun_info_mfa/1) stay an honest typed gap here.
+//!   fun table (the `LocalFunIdentity` seam), so it stays an honest typed gap here;
+//!   fun_info_mfa/1 answers `{Module, [], Arity}` — the C's `mfa == NULL` arm.
 //! ```
 //!
 //! A `make_fun3` (`FunKind::Local`) fun's identity items need the
@@ -675,15 +676,17 @@ fn fun_info_mfa_1_matches_the_oracle() {
         "fun_info_mfa/1 of a local fun",
     );
 
-    // An `Imported` (`NEW_FUN_EXT`) fun resolves its *function* element through the
-    // loaded module's fun table (`erts_get_fun_mfa`), which the descriptor does not
-    // carry — the same honest typed gap (the oracle would answer
-    // `{fiprobe,'-mk1/0-fun-0-',1}` for a loaded module).
+    // An `Imported` (`NEW_FUN_EXT`) fun names its module on the wire, so the module
+    // and the **header** arity are always answerable; the *function* is the loaded
+    // module's fun table (`erts_get_fun_mfa`), which only the `LocalFunIdentity` seam
+    // supplies. The C's `mfa == NULL` arm answers `[]` there — an answer, not a gap.
+    // Oracle: a `NEW_FUN_EXT` image naming a module the reader cannot load ⇒
+    // `{fiprobe,[],1}`, against `{fiprobe,'-mk1/0-fun-0-',1}` once it can.
     let imported = imported_fun(&mut ctx, 1, "fiprobe", &MK1_UNIQ, 1, 1, 75998142, &[]);
-    assert_unsupported_bif(
-        call(&reg, &mut ctx, "fun_info_mfa", &[imported]),
-        "fun_info_mfa/1 of an imported fun",
-    );
+    let mfa = call(&reg, &mut ctx, "fun_info_mfa", &[imported]).expect("imported mfa");
+    assert_eq!(atom_name(&atoms, elem(&reg, &mut ctx, mfa, 1)), "fiprobe");
+    assert_eq!(elem(&reg, &mut ctx, mfa, 2), NIL, "the C's `[]` function");
+    assert_eq!(signed_value(elem(&reg, &mut ctx, mfa, 3)), 1);
 }
 
 // ---------------------------------------------------------------------------
