@@ -746,11 +746,11 @@ fn a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered() {
 ///
 /// The actor `link/1`s the victim, takes a barrier round trip (same-link signals are applied
 /// in order, so the ack proves our node has already applied the `DOP_LINK`), then `unlink/1`s
-/// it and takes a second one. The victim is **never killed**, so the only thing that changes
-/// between the two reports is the peer's own link — and the third report (after the second
-/// barrier) shows it stays empty.
+/// it and takes a second one. The victim is **never killed** — it answers a round-trip probe
+/// after the second barrier (`VICTIM_ALIVE`) — so the only thing that differs between the two
+/// reports is the peer's own link, and an emptied item cannot be explained by a dead process.
 ///
-/// Both reports are the item's **shape**, `length/1` plus one `is_pid/1` per element: an
+/// Every report is the item's **shape**, `length/1` plus one `is_pid/1` per element: an
 /// external pid has no printable text in this runtime (`beam_bifs`'s `external_channel_gap`,
 /// the typed capability gap) and its channel is a per-VM node-table index, so the pids
 /// themselves are unprintable on both sides. The whole claim is `LINKS_LINKED 1 [true]` →
