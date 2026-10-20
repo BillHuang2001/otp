@@ -12,7 +12,7 @@ Everything routes through `beam_process`'s tables; the per-family oracle contrac
 `monitor/2,3`, `demonitor/1,2`, `alias/0,1` and `unalias/1` route through `beam_process`'s tables, with the per-family oracle contracts in `monitor.rs`'s rustdoc.
 A bare `make_ref/0`/timer reference removes nothing, a structural non-reference is the `badarg`, and `[flush]`/`[info]` answer the real "was a monitor removed" boolean.
 `erlang:monitor(process, {Name, Node})` naming **another** node is a typed `unsupported` (`monitor.rs::named_node_target` resolves names on this node only), so a remote **name** monitor has no `DOWN`; a remote **pid** monitor works in both directions.
-A reference on this node is not a local alias (the runtime keeps no local alias table), so an alias-directed send to a non-live reference takes the send path's own typed error.
+An alias-directed send resolves through `ProcessTable::resolve_alias`, so a reference that is not a **live** alias takes the send path's own typed error.
 
 ### `exit/2,3` — `exit.rs`
 `exit/3` takes only the bare `priority` atom.
@@ -58,7 +58,7 @@ A request is recorded **only** for a **scheduled slice** (a `-eval` or single-pa
 A request for a process that terminates first is pruned at the pass boundary (`../../runtime/scheduler.rs::prune_gc_requests`).
 The argument contracts (`erl_process.c:11309-11324`): a **live local pid** ⇒ `true` plus a request for *that* pid, a well-formed internal pid the table does not hold ⇒ `false`, anything else — including an **external**/wire pid, which this runtime can never honour ⇒ `badarg`.
 `/2`'s options are the 2-tuples `{async,_}`/`{type,_}` (a later overriding an earlier; default `major`; anything else `badarg`), the `{type,_}` value validated **before** any liveness decision (`garbage_collect(DeadPid, [{type, foo}])` is `badarg`, never `false`), and `{async, ReqId}` answering `async` for a live and a dead target alike.
-**The async form's follow-up `{garbage_collect, ReqId, GCResult}` message is the one part this runtime cannot reproduce** — the oracle's request is a cross-process system task (`erts_internal:request_system_task/3`) with no system-task protocol here — so the return value is the oracle's exactly and the notification is never sent, never faked (`../../../tests/garbage_collect.rs`).
+**The async form's follow-up `{garbage_collect, ReqId, GCResult}` is delivered** — `Runtime::request_gc_async` records the request and `../../runtime/gc.rs::deliver_gc_completions` emits the message into the requester's mailbox at a scheduler-pass boundary, its result the oracle's liveness answer (`../../../tests/garbage_collect.rs`).
 
 ### Not served — process / scheduler control
 `process_display/2` needs a process **stack dump** (no engine accessor).
