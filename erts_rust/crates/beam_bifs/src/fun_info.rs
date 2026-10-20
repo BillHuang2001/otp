@@ -139,6 +139,7 @@
 //! fun_info(F, pid)       => FunIdentity.creator       (funp->creator)
 //! fun_info(F, name)      => FunIdentity.function      (mfa->function, the FunT entry's function atom)
 //! fun_info(F, new_index) => the term's own index word  (fe->index)
+//! fun_info_mfa(F)        => module/function as above, arity from the header
 //! ```
 //!
 //! `new_index` is the one identity item that needs **no** seam: the term's
@@ -159,18 +160,46 @@
 //! `fun_info/1` walk must not pay for it once per key. `/1` and `/2` resolve it at
 //! the same point of the same [`item_value`] path, so the two still cannot disagree.
 //!
+//! # `fun_info_mfa/1` — the three arms
+//!
+//! `erl_bif_info.c:4020-4056` builds `{Module, Function, Arity}` from a fun's
+//! resolved MFA, and `Arity` is `make_small(fun_arity(funp))` in **every** arm — the
+//! header's 8-bit **call** arity, i.e. the lambda's true code arity (a compiled
+//! `mk(X) -> fun(Y, Z) -> X+Y+Z end.` reports `2` for a one-capture closure), not the
+//! `num_free` capture count and not the external fun's descriptor-word-3 arity (see
+//! the arity split below).
+//!
+//! * **`FunKind::External`** — `ep->info.mfa`'s module and function, both in the term.
+//! * **`FunKind::Imported`** (`NEW_FUN_EXT`) — the wire image names the module, so the
+//!   module is always answerable; the function is the loaded module's `FunT` entry
+//!   (`erts_get_fun_mfa`), supplied by the [`LocalFunIdentity`](crate::context::LocalFunIdentity)
+//!   seam's [`function`](beam_codec::FunIdentity::function). When that entry cannot be
+//!   resolved — the defining module is on no code path — C takes its `mfa == NULL`
+//!   arm and answers `[]` for the function, which is an *answer*, not a gap:
+//!   oracle-verified `{fiprobe,[],2}` for a `NEW_FUN_EXT` image read back by a VM that
+//!   cannot load `fiprobe`, against `{fiprobe,'-mk/1-fun-0-',2}` once it can.
+//! * **`FunKind::Local`** (`make_fun3`) — the term inlines no module atom, so the
+//!   module comes from the same seam (`FunIdentity.module`), and the function from
+//!   `FunIdentity.function`. Oracle-verified `{fiprobe,'-mk/1-fun-0-',2}`. The one
+//!   residual is a `Local` fun the seam cannot attribute at all (no loaded module
+//!   claims its `(uniq, index)` — the `-eval` evaluator's template closures), where
+//!   even the C's `[]`-function arm has no `fe->module` to report: the typed gap.
+//!
 //! # Honest gaps (never a fabricated value)
 //!
-//! Two things stay out of reach and are the typed
+//! One thing stays out of reach and is the typed
 //! [`crate::error::unsupported_bif`] rather than a guess:
 //!
-//! * **`fun_info_mfa/1` of a `FunKind::Local`/`FunKind::Imported` fun** — it needs
-//!   the resolved MFA *and* the lambda's **true code arity**, which no seam supplies
-//!   (the seam's [`beam_codec::FunIdentity`] carries the lambda `function` atom but
-//!   not the arity the MFA needs).
 //! * **`fun_to_list/1` of a `FunKind::Local` (`make_fun3`) fun** — it needs
-//!   `#Fun<Module.OldIndex.OldUniq>` (`erl_printf_term.c:680-694`), i.e. the
-//!   resolved MFA a `Local` term cannot supply.
+//!   `#Fun<Module.OldIndex.OldUniq>` (`erl_printf_term.c:676-694`, oracle:
+//!   `"#Fun<fiprobe.0.124001487>"`), and all three fields *are* on the seam
+//!   ([`beam_codec::FunIdentity`]'s `module`/`old_index`/`old_uniq`). What blocks it is
+//!   the text's single home [`fun_text_str`]: it takes an `&AtomTable` and nothing
+//!   else, because `io_lib`'s `~w`/`~p` leaf ([`crate::print`]) reaches it from its
+//!   recursive renderer with no [`BifContext`] — so `fun_to_list/1` and the printer
+//!   cannot be closed *consistently* (the oracle renders the same text from both)
+//!   without threading an identity resolver through the printer chain and widening the
+//!   runtime's fun-identity gate to the printer's BIF keys (Handoffs).
 //!
 //! # Produced atoms are interned on demand
 //!
@@ -185,7 +214,8 @@
 //! process instead of answering `{type,external}` — oracle:
 //! `erlang:fun_info(fun lists:reverse/1, type)` ⇒ `{type,external}`.
 //!
-//! # The arity split (`fun_to_list/1` vs `fun_info/2`)//!
+//! # The arity split (`fun_to_list/1` vs `fun_info/2`)
+//!
 //! An `EXPORT_EXT` (external) fun stores its arity twice: the header's 8-bit
 //! field and, in this runtime, descriptor word 3 — the inlined `Export`'s
 //! `info.mfa.arity` ([`beam_term::fun::fun_true_arity`]). The C reads the two
@@ -659,30 +689,85 @@ fn item_of(ctx: &BifContext<'_>, what: Eterm) -> Item {
 // erlang:fun_info_mfa/1
 // ---------------------------------------------------------------------------
 
-/// `erlang:fun_info_mfa/1` (`erl_bif_info.c:4020`).
+/// `erlang:fun_info_mfa/1` (`erl_bif_info.c:4020-4056`).
 ///
-/// `{Module, Function, Arity}` for an external fun; a non-fun is `badarg`. A
-/// local/imported fun needs the resolved MFA's *function* atom **and** the lambda's
-/// true code arity — the loaded module's fun table (`erts_get_fun_mfa`) — neither of
-/// which the inlined descriptor nor the `LocalFunIdentity` seam carries, so both
-/// remain the documented typed gap.
+/// `{Module, Function, Arity}`; a non-fun is `badarg`. The C's three arms:
+///
+/// * **external** (`EXPORT_EXT`) — `ep->info.mfa`'s module and function.
+/// * **local/imported** (`make_fun3`, `NEW_FUN_EXT`) — `erts_get_fun_mfa(fe, …)`'s
+///   module and function; the C keeps the *module* even when that MFA cannot be
+///   resolved, and then reports the function as `[]` (`erl_bif_info.c:4038-4049`).
+/// * `arity` is `make_small(fun_arity(funp))` in **all three** arms — the header's
+///   8-bit **call** arity (`fun_arity(funp)`, `erl_fun.h:92-94`), i.e. the lambda's
+///   true code arity, *not* its `num_free` capture count and *not*
+///   [`crate::access::fun_true_arity`]'s descriptor word 3. For a `make_fun3`
+///   closure the engine writes it as `descriptor.arity - descriptor.num_free`
+///   (`beam_engine`'s `make_fun3`), which is what
+///   [`beam_codec::term::fun_arity_term`] reads back.
 fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     if !access::is_function(fun) {
         return Err(error::badarg());
     }
-    if beam_codec::term::fun_kind_term(fun)? != FunKind::External {
-        return Err(error::unsupported_bif());
-    }
-    let module = atom_term_name(ctx.atoms(), fun_module(fun)?)?;
-    let function = atom_term_name(ctx.atoms(), fun_function(fun)?)?;
-    let module = ctx.atom(&module)?;
-    let function = ctx.atom(&function)?;
+    let kind = beam_codec::term::fun_kind_term(fun)?;
     // As for `fun_info/2`'s `arity`: the header's 8-bit field, not the true arity
-    // (`erl_bif_info.c:4049-4052` reads `fun_arity`), so true arity 256 ⇒
-    // `{lists,reverse,0}` (oracle-verified).
+    // (`erl_bif_info.c:4049-4052` reads `fun_arity`), so an external fun with true
+    // arity 256 ⇒ `{lists,reverse,0}` (oracle-verified).
     let arity = ctx.int(beam_codec::term::fun_arity_term(fun)? as i64)?;
-    ctx.tuple(&[module, function, arity])
+    match kind {
+        FunKind::External => {
+            let module = atom_term_name(ctx.atoms(), fun_module(fun)?)?;
+            let function = atom_term_name(ctx.atoms(), fun_function(fun)?)?;
+            let module = ctx.atom(&module)?;
+            let function = ctx.atom(&function)?;
+            ctx.tuple(&[module, function, arity])
+        }
+        // A decoded `NEW_FUN_EXT` names its module on the wire, so the MFA's module is
+        // always answerable. Its *function* is the loaded module's `FunT` entry
+        // (`erts_get_fun_mfa`) — the [`LocalFunIdentity`](crate::context::LocalFunIdentity)
+        // seam's [`function`](beam_codec::FunIdentity::function) — and the C's `mfa ==
+        // NULL` arm answers `[]` there, which is **not** a capability gap: oracle, a
+        // `NEW_FUN_EXT` image naming a module that is on no code path of the reader
+        // (`erlang:fun_info_mfa(binary_to_term(Image))`) ⇒ `{fiprobe,[],2}`, while
+        // `erlang:fun_info_mfa(F)` of a *loaded* module's fun ⇒
+        // `{fiprobe,'-mk/1-fun-0-',2}`.
+        FunKind::Imported => {
+            let module = atom_term_name(ctx.atoms(), fun_module(fun)?)?;
+            let module = ctx.atom(&module)?;
+            let function = match ctx.local_fun_identity(fun)? {
+                Some(identity) => match identity.function {
+                    Some(atom) => {
+                        let name = atom_term_name(ctx.atoms(), atom)?;
+                        ctx.atom(&name)?
+                    }
+                    None => NIL,
+                },
+                None => NIL,
+            };
+            ctx.tuple(&[module, function, arity])
+        }
+        // A `make_fun3` closure inlines no module atom, so the C's `fe->module`
+        // fallback needs the seam. With an identity **and** its lambda name the answer
+        // is the oracle's `{Module,Function,Arity}`; without them the defining module is
+        // genuinely unknown here (the `-eval` evaluator's template closures match no
+        // loaded module's `FunT`), so this is the typed capability gap rather than a
+        // fabricated module — the one residual, identical to `fun_info/2`'s `module`.
+        FunKind::Local => {
+            let Some(identity) = ctx.local_fun_identity(fun)? else {
+                return Err(error::unsupported_bif());
+            };
+            let Some(function_atom) = identity.function else {
+                // The seam resolved a *loaded* defining module but not its lambda name;
+                // the C always has `mfa->function` there, so `[]` would be a wrong value.
+                return Err(error::unsupported_bif());
+            };
+            let module = atom_term_name(ctx.atoms(), identity.module)?;
+            let function = atom_term_name(ctx.atoms(), function_atom)?;
+            let module = ctx.atom(&module)?;
+            let function = ctx.atom(&function)?;
+            ctx.tuple(&[module, function, arity])
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,9 +789,11 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
 /// `old_index`/`old_uniq` — all three carried by its descriptor.
 ///
-/// A non-fun is `badarg`; a `FunKind::Local` (`make_fun3`) fun would need the same
-/// triple from an `ErlFunEntry` its opaque descriptor does not have — the
-/// documented typed gap.
+/// A non-fun is `badarg`; a `FunKind::Local` (`make_fun3`) fun is the typed
+/// capability gap: the `#Fun<Module.OldIndex.OldUniq>` triple *is* on the
+/// [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam, but this leaf
+/// ([`fun_text_str`]) reaches it with an `&AtomTable` and nothing else, so the
+/// identity is not reachable here (module docs, Handoffs).
 ///
 /// The text itself is [`fun_text_str`]'s, which the printer shares.
 fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
@@ -731,9 +818,13 @@ fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///   module atom name (no `print_atom_name` quoting) and the stubbed entry's signed
 ///   `old_index`/`old_uniq` — all three carried by its descriptor.
 /// * [`FunKind::Local`] (a `make_fun3` closure) — the typed [`error::unsupported_bif`]
-///   capability gap: its inlined descriptor is only `(uniq, index)`, so none of the
-///   three fields exists in the term and a fabricated `#Fun<…>` would be a silently
-///   wrong result.
+///   capability gap. The `#Fun<Module.OldIndex.OldUniq>` triple *is* on the
+///   [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam
+///   (`FunIdentity.module`/`old_index`/`old_uniq`), but this leaf's signature is
+///   `(&AtomTable)` — it is the `io_lib` `~w`/`~p` leaf as well
+///   ([`crate::print::render_chunk`]), whose recursive renderer carries no
+///   [`BifContext`] — so the seam is unreachable from here and closing only
+///   `erlang:fun_to_list/1` would split the two renderings the oracle keeps identical.
 ///
 /// A non-fun is `badarg`.
 ///
