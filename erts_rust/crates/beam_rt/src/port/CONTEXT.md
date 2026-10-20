@@ -3,7 +3,8 @@
 The runtime side of contract A.4.
 `port.rs` is the **port provider**: `open_port/2`'s `Name`/`Options` decoding, the `PortRegistry`, the port-task round, the `{Port,{data,..}}` pump behind `beam_io`.
 Each child owns one post-`open_port/2` fact over the one `PortExtras` side table: `ops.rs` the table-entry operations, `exit.rs` the `'EXIT'`/`'DOWN'` a close owes, `failure.rs` the driver's own close request, `info_extras.rs` the derived `port_info/2` items.
-Four are driver→owner channels: `completion.rs` (`{inet_reply,…}`/`{inet_async,…}`, what makes `prim_inet:send/4` return), `active_input.rs` (`{tcp,…}`/`{udp,…}`/`{tcp_passive,…}`), `peer_closed.rs` (`{tcp_closed,S}`), `inet_opts.rs` (the per-port `mode`/`active`/`exit_on_close` mirror).
+Four are driver→owner channels: `completion.rs` (`{inet_reply,…}`/`{inet_async,…}`, what makes `prim_inet:send/4` return), `active_input.rs` (`{tcp,…}`/`{udp,…}`/`{tcp_passive,…}`), `peer_closed.rs` (`{tcp_closed,S}`), `inet_opts.rs` (the per-port `mode`/`active`/`exit_on_close` mirror, whose `{active,…}` half is kept in
+step with the driver's own spend path by `PortRegistry::drain_active_spends`).
 Those runtime halves and the closing-port signals are files of this node; the mechanics of every one of them are in [`driver/CONTEXT.md`](driver/CONTEXT.md), which owns the driver side that stages them.
 `driver.rs` is this runtime's **own** driver C-ABI host for `{spawn_driver,Name}` ports over `beam_abi`'s frozen `DriverHost` seam (`driver/`); `watch.rs` delivers `os:set_signal/2` and `select.rs` the `prim_tty:tty_select/2` interest, the special case of its `enif_select` store (`select/`).
 **Separate** from `beam_io`'s own host layer (`beam_io::abi`), so end-to-end `.so`-driver traffic goes through this tree.
@@ -34,12 +35,19 @@ Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/completion.rs` — the d
 ### `port/inet_opts.rs` — the per-port inet option mirror (A.4)
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/inet_opts.rs` — the per-port inet option mirror (A.4)*.
 `prim_inet:open/6` opens every inet port with `[binary]` alone and applies every other option through `setopts/2`, so this node mirrors the driver's `{mode,…}`/`{active,…}`/`{exit_on_close,…}` out of each accepted `port_control/3` argument; `PortRegistry::data_mode(id, fallback)` is the one consuming accessor the delivery renderers read.
+`PortRegistry::drain_active_spends` (`inet_opts.rs:455`) is the spend channel's drain: it takes
+`beam_io::PortRegistry::take_active_spends` (destructive — every spend consumed exactly once) and applies each
+to the mirror (`InetOptions::spend_active` ⇒ `active = INET_PASSIVE`, `active_count = 0`), and it runs **before**
+`collect_peer_closes`'s gate at every drive point, so the peer-close gate never reads a mode a same-round spend
+already invalidated; `PortInetOptions::active_state` is the mirror's `ActiveMode` reader, the fallback half of
+that gate behind `beam_io::PortRegistry::active_mode`.
 ### `port/active_input.rs` — the `{active, …}` input channel (A.4)
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/active_input.rs` — the `{active, …}` input channel (A.4)*.
 An `{active, true|once|N}` socket parks no input in the port's byte queue, so the driver sends the owner `{tcp,S,Data}`/`{udp,S,IP,Port,Data}`/`{tcp_passive,S}`/`{udp_passive,S}`; the staged `PortEvent::ActiveInput` rides `pending_events`, so `has_nothing_to_poll` sees it.
 ### `port/peer_closed.rs` — the peer-close channel (`{tcp_closed, Port}`)
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/peer_closed.rs` — the peer-close channel (`{tcp_closed, Port}`)*.
 `beam_io::PortRegistry::port_closed(id)` is a latched, sticky observation that a connected socket's peer has closed; `PeerCloseKind::Tcp` is the only kind (the C has no `udp_closed`), and retirement is the C's `driver_exit`, not `port_close/1`.
+The gate's `{active,…}` half is the **live** driver state, not the last `setopts`: `inet_active` reads `beam_io::PortRegistry::active_mode` first, so a socket whose `{active,once}`/`{active,N}` grant a delivery spent is passive there and its close is silent — the C's passive arm (`inet_drv.c:12819-12832`, the grant cleared at the spend by `INET_CHECK_ACTIVE_TO_PASSIVE`, `:1552-1560`) — while the observation keeps its latch, so a later active `setopts` re-fires it once (`inet_set_opts`'s sticky arm, `:6968-7016`). Both spent-grant twins are pinned against the oracle in `peer_closed_tests.rs`, including the `{tcp_passive,S}` that only the `{active,N}` arm sends (`:1556-1558`).
 ### `port/exit.rs` — a closing port's `'EXIT'`/`'DOWN'`
 Detail: [`driver/CONTEXT.md`](driver/CONTEXT.md) *`port/exit.rs` — a closing port's `'EXIT'`/`'DOWN'`*.
 A close owes a **trapping** link its `{'EXIT',Port,Reason}` and every watcher its `{'DOWN',Ref,port,Port,Reason}`, `'EXIT'` before `'DOWN'`; the reason rides the signal, so one close's two signals can never disagree.
@@ -134,7 +142,7 @@ The largest wall-clock cost this layer can impose on a CLI start-up is **not wor
 - `tests.rs` 72 — every `Name` form + option (`{fd,N}` over a socket pair), an empty name → `BadArg` consuming no port number, the built-in-driver open and its unknown-name counterpart, the `port_info` vocabulary, `pump`'s once-only `{exit_status,…}`, the `next_deadline` clamp, the driver-emitted-term queue path, signal delivery, the atom-commit round.
 - **`driver/*_tests.rs`'s suites and `driver.rs`'s own units** — counts, fixtures, the skip rule — [`driver/CONTEXT.md`](driver/CONTEXT.md).
 - `failure_tests.rs` 4; `failure_e2e_tests.rs` 10 (the real-C-`.so` road `port_command → output → the failure latch → settle → signal_failure → drain_failures → push_ready`, one row per oracle opcode 1–8, each asserting the published `PortSignal` list **whole**).
-- `completion_tests.rs` 11; `peer_closed_tests.rs` 12; `active_input_tests.rs` 16 with `active_input_e2e_tests.rs` 9 (8 over real loopback); `inet_opts_tests.rs` with `accept_inherit_tests.rs` (the inheritance agreement — real loopback traffic, `src/port/completion.rs`'s `#[path]` module); `ram_file_matrix_tests.rs` 6 (one row per wire opcode with both `port_info/2` counters, whole-session.
+- `completion_tests.rs` 11; `peer_closed_tests.rs` 16 (the mirror/latch units, the real-traffic routes, the two spent-grant twins, and the two `erl` oracle cross-checks of those twins); `active_input_tests.rs` 16 with `active_input_e2e_tests.rs` 9 (8 over real loopback); `inet_opts_tests.rs` with `accept_inherit_tests.rs` (the inheritance agreement — real loopback traffic, `src/port/completion.rs`'s `#[path]` module); `ram_file_matrix_tests.rs` 6 (one row per wire opcode with both `port_info/2` counters, whole-session.
 - `inet_matrix_tests.rs` 12 (the numeric `erlang:port_control/3` opcode matrix, `N + 16#03f1a300`, one identical port state per family, every reply compared whole across **nine families**, `Rule::ErrorReply`/`Rule::Prefix` keeping host-dependent tables stable, `residual_sessions()` keeping **two** rows: `INET_REQ_OPEN` of a non-`AF_INET` family ⇒ `[0]eafnosupport`, and `INET_REQ_FDOPEN`(13) on a port already holding a socket, ours `[0]einval` vs the oracle's `[1]` with the C leaking it, `inet_drv.c:5251`).
 - `stream_shape_tests.rs` 7; `packet_framing_tests.rs` 8 (`{packet,N}` at three layers — framer/reassembler, the write path over a `cat > FILE` child, the read path over a `sh` child — plus the dropped partial packet and a driver port keeping its option).
 - `exit.rs`/`ops.rs`/`info_extras.rs` units cover `PendingPortSignals`' two stages, the extras tables and the derivations.

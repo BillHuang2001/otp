@@ -20,42 +20,52 @@
 
 //! The peer-close channel's suites.
 //!
-//! Four of the six cases are pure: the `{active, …}`/`{exit_on_close, …}` mirror reads, the
-//! once-only latch with its recycle rule, and the driver-kind gate. Two drive **real loopback
-//! traffic** through a real `{spawn_driver, "tcp_inet"}` / `{spawn_driver, "udp_inet"}` port opened
-//! by the runtime's own `open_port/2` hook, close the peer, and read the latch back through
-//! [`PortRegistry::drain_peer_closes`] — the two halves of the invariant that matter most
-//! (invariant 1: once, and only on an active socket; invariant 6: never for a datagram port).
+//! Some cases are pure: the `{active, …}`/`{exit_on_close, …}` mirror reads, the once-only latch
+//! with its recycle rule, and the driver-kind gate. The rest drive **real loopback traffic**
+//! through a real `{spawn_driver, "tcp_inet"}` / `{spawn_driver, "udp_inet"}` port opened by the
+//! runtime's own `open_port/2` hook, put bytes and/or a close through it, and read the latch back
+//! through [`PortRegistry::drain_peer_closes`] — the two halves of the invariant that matter most
+//! (invariant 1: once, and only on a socket that is active **now**; invariant 6: never for a
+//! datagram port).
 //!
 //! # Loud skips, never a silent pass
 //!
 //! A sandbox that refuses `socket(2)`/`bind(2)` cannot host a real-traffic case: [`skip_no_loopback`]
-//! prints a banner and the case returns. No case depends on another having run.
+//! prints a banner and the case returns. A missing `erl` skips only the oracle cross-check, with
+//! [`skip_oracle_check`]'s banner. No case depends on another having run.
 //!
 //! # The oracle these cases reproduce (OTP 29.1.1 / erts-17.1, measured)
 //!
 //! * `tcp_recv_closed` (`erts/emulator/drivers/common/inet_drv.c:12783-12845`): an **active**
 //!   socket sends one `{tcp_closed, S}` (2-tuple) and dies when `exit_on_close` (the default);
 //!   a **passive** one sends nothing (`:12819-12832`).
+//! * `INET_CHECK_ACTIVE_TO_PASSIVE` (`:1552-1560`): the `{active, …}` grant is cleared **at the
+//!   spend**, so a socket whose `{active, once}` grant is gone — and one whose `{active, N}`
+//!   counter reached zero — is passive for that test, and its close is silent exactly like a
+//!   never-armed socket's. `packet_passive_message` fires only for the `INET_MULTI` arm, never for
+//!   `INET_ONCE`.
 //! * `tcp_closed_message`'s `TCP_ADDF_CLOSE_SENT` guard (`:4064-4071`): at most once per
 //!   descriptor, however often the driver observes the EOF.
 //! * `inet_set_opts`'s `INET_LOPT_ACTIVE` arm (`:6968-7016`): a passive descriptor already closed
 //!   sends the message **at that moment** when an active mode is armed — the sticky re-fire.
 //! * `rg 'udp_closed' erts/` has **zero** hits: a `udp_inet` port has no such message.
 
+use std::io::Write;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use beam_bifs::PortHook;
 use beam_engine::terms;
+use beam_io::{ActiveInputEvent, ActiveMode};
 use beam_process::{PortId, ProcessId, ProcessTable, SignalAtoms};
 use beam_term::{AtomTable, Eterm};
 
 use super::{PeerCloseKind, PeerCloseReport};
 use crate::config::RuntimeConfig;
+use crate::port::ops::active_input::ActiveInputPacket;
 use crate::port::ops::inet_opts::{is_setopts_control, setopts_succeeded};
-use crate::port::tests::{fixture, Fixture};
-use crate::port::{RuntimeContext, RuntimePorts};
+use crate::port::tests::{erl_eval, fixture, skip_oracle_check, Fixture};
+use crate::port::{PortEvent, RuntimeContext, RuntimePorts};
 use crate::Runtime;
 
 // -----------------------------------------------------------------------------------------------
@@ -67,6 +77,10 @@ use crate::Runtime;
 const INET_CONTROL_MAGIC: u64 = 0x03f1_a300;
 /// `INET_REQ_SETOPTS` (7) — the request `prim_inet:setopts/2` sends for a record list.
 const INET_REQ_SETOPTS: u64 = 7;
+/// `TCP_REQ_RECV` (42) — the passive read `prim_inet:recv/3` sends (`inet_drv.c:12265-12325`),
+/// whose enqueue is the C's `sock_select(INETP(desc), (FD_READ|FD_CLOSE), 1)` (`:12315`): the one
+/// thing that arms a socket's read side out of a spent `{active, …}` grant's window.
+const TCP_REQ_RECV: u64 = 42;
 /// `INET_REQ_OPEN`'s socket family tag: `INET_AF_INET` (1).
 const INET_AF_INET: u8 = 1;
 /// `SOCK_STREAM` (1) — the `INET_REQ_OPEN` operand of a `tcp_inet` socket.
@@ -83,9 +97,10 @@ const INET_LOPT_EXITONCLOSE: u8 = 26;
 const INET_ACTIVE: i32 = 1;
 /// `INET_ONCE` (2) — `{active, once}`.
 const INET_ONCE: i32 = 2;
+/// `INET_MULTI` (3) — `{active, N}`, whose record carries a trailing counter (`inet_drv.c:786-789`).
+const INET_MULTI: i32 = 3;
 /// `INET_PASSIVE` (0) — `{active, false}`, the driver's default.
-const INET_PASSIVE: i32 = 0;
-/// How long a case waits for a report it **expects**: a fan-out bound, never a sleep.
+const INET_PASSIVE: i32 = 0;/// How long a case waits for a report it **expects**: a fan-out bound, never a sleep.
 const DELIVERY_BOUND: Duration = Duration::from_secs(5);
 /// How long a case polls to prove nothing is reported — six `PORT_POLL_SLICE` rounds, each of
 /// which blocks on a real `epoll_wait`, so a report that exists has every chance to arrive.
@@ -100,6 +115,14 @@ fn record(code: u8, value: i32) -> Vec<u8> {
     bytes
 }
 
+/// One `{active, N}` record: `[INET_LOPT_ACTIVE, INET_MULTI, counter_be16]` — the C's trailing
+/// 2-byte big-endian counter, which `inet_set_opts` accumulates into `desc->inet.active_count`
+/// (`inet_drv.c:6975-6987`).
+fn multi_record(code: u8, value: i32, count: i16) -> Vec<u8> {
+    let mut bytes = record(code, value);
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes
+}
 /// The `setopts` control op **as `prim_inet` sends it**: the decimal `c_uint` of
 /// `INET_REQ_SETOPTS + ERTS_INET_DRV_CONTROL_MAGIC_NUMBER`.
 fn setopts_op() -> String {
@@ -345,6 +368,24 @@ impl Session {
         reply
     }
 
+    /// One **passive read** of whatever the socket holds — the C's `TCP_REQ_RECV`(42), the request
+    /// `prim_inet:recv/3` sends (`inet_drv.c:12265-12325`), answering the driver's enqueue reply
+    /// (`[1] ++ Id`, or the `[0] ++ "einval"` shape when the live mode is not passive).
+    ///
+    /// This is the only way to make a socket whose `{active, …}` grant is spent read at all: the
+    /// delivery that empties the grant deselects its read side
+    /// (`sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0)`, `:13106`-`:13114`), and the enqueue's
+    /// own `sock_select(…, 1)` (`:12315`) is what arms it again. The bytes stay unread: the
+    /// completion rides the port's async channel, which these cases do not consume — the
+    /// *observation* is the point.
+    fn passive_recv(&mut self) -> Vec<u8> {
+        let op = (INET_CONTROL_MAGIC + TCP_REQ_RECV).to_string();
+        let mut arg = Vec::with_capacity(8);
+        arg.extend_from_slice(&0u32.to_be_bytes()); // Timeout(4) — no timer for this read
+        arg.extend_from_slice(&0u32.to_be_bytes()); // Length(4) — "whatever is there"
+        self.control(&op, &arg)
+    }
+
     /// How many of the port's three inet latches are set — the hook-detection witness
     /// [`Session::setopts`] reads across the control call.
     ///
@@ -397,6 +438,58 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The **live** `{active, …}` state the driver holds — `beam_io::PortRegistry::active_mode`,
+    /// i.e. the C's `desc->inet.active` (+ `active_count`) *after* every granted delivery spent its
+    /// grant (`INET_CHECK_ACTIVE_TO_PASSIVE`, `inet_drv.c:1552-1560`). This is the exact store
+    /// [`PortRegistry::inet_active`](super::PortRegistry) reads for the peer-close gate, so a case
+    /// that asserts on it proves the deliver-before-close sequence really spent the grant instead of
+    /// silently exercising the never-armed socket.
+    fn active_mode(&self) -> ActiveMode {
+        let port = self.port;
+        self.rt
+            .ports
+            .borrow()
+            .registry
+            .active_mode(port)
+            .unwrap_or_else(|error| panic!("the driver's {{active,…}} state for {port:?}: {error}"))
+    }
+
+    /// One port round plus every `{active, …}` delivery it staged, in the driver's order — the
+    /// `{tcp, S, Data}` of a granted read always precedes the `{tcp_passive, S}` that read spent
+    /// (`INET_CHECK_ACTIVE_TO_PASSIVE` runs after `tcp_message`, `inet_drv.c:1552-1560`).
+    ///
+    /// Unlike [`Session::round`] this does **not** touch the peer-close channel, so pumping for a
+    /// delivery never consumes a report another assertion is about to read.
+    fn active_round(&mut self) -> Vec<ActiveInputPacket> {
+        let events = {
+            let mut registry = self.rt.ports.borrow_mut();
+            registry
+                .pump(PUMP_SLICE)
+                .unwrap_or_else(|error| panic!("the port round: {error}"))
+        };
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                PortEvent::ActiveInput { packet } => Some(packet),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pumps until `want` deliveries are staged or `bound` expires, answering **everything** staged
+    /// (a delivery that spends an `{active, N}` counter stages its data message *and* the passive
+    /// message in the same round). `want = 1` over a quiet socket is therefore the "nothing was
+    /// delivered" probe.
+    fn deliveries(&mut self, bound: Duration, want: usize) -> Vec<ActiveInputPacket> {
+        let deadline = Instant::now() + bound;
+        let mut packets = Vec::new();
+        loop {
+            packets.extend(self.active_round());
+            if packets.len() >= want || Instant::now() >= deadline {
+                return packets;
+            }
+        }
+    }
     /// Pumps until the channel reports something or `bound` expires.
     fn collect(&mut self, bound: Duration) -> Vec<PeerCloseReport> {
         let deadline = Instant::now() + bound;
@@ -446,6 +539,21 @@ impl Session {
             .to_string()
     }
 
+    /// `packet`'s message — `{tcp, S, Data}` / `{tcp_passive, S}` — rendered by the registered `~w`
+    /// printer, the text the oracle's own `io:format("~w",[Message])` prints.
+    fn render_active(&mut self, packet: &ActiveInputPacket) -> String {
+        let term = {
+            let mut context = RuntimeContext::new(&mut self.rt);
+            context
+                .active_input_message(packet)
+                .unwrap_or_else(|error| panic!("an active-input message for {packet:?}: {error}"))
+        };
+        self.rt
+            .format_term_w(term, None)
+            .unwrap_or_else(|error| panic!("the `~w` printer refused a built term: {error}"))
+            .trim_end_matches('\n')
+            .to_string()
+    }
     /// One **observe-and-deliver** step of the scheduler route: a port round (which is what makes
     /// the driver see the peer's EOF at all) followed by the delivery half under test, with `table`
     /// standing in for the process table a scheduler pass moves out of the runtime.
@@ -612,6 +720,323 @@ fn a_passive_tcp_socket_reports_nothing_until_an_active_mode_is_armed() {
     );
 }
 
+/// An **exhausted** `{active, N}` counter puts the socket back in the passive arm, so its peer's
+/// close is silent — and the sticky re-fire is what owes the message once an active mode is armed
+/// again.
+///
+/// The C's accounting: `INET_CHECK_ACTIVE_TO_PASSIVE`
+/// (`erts/emulator/drivers/common/inet_drv.c:1552-1560`) spends one grant per delivered packet and,
+/// on the delivery that drives an `INET_MULTI` counter to zero, flips `desc->inet.active` to
+/// `INET_PASSIVE` **and** sends one `packet_passive_message`; an `INET_ONCE` grant is spent
+/// silently, with no message at all. `tcp_recv_closed` then reads `if (!desc->inet.active)` and
+/// takes its passive arm (`:12819-12832` — "passive mode do not terminate port !", no message)
+/// instead of the active one (`:12833-12842`), and `inet_set_opts`'s `INET_LOPT_ACTIVE` arm
+/// (`:6968-7016`, the sticky re-fire at `:7001-7015`) sends the `{tcp_closed, S}` the moment an
+/// active mode is armed on the already-closed descriptor.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1) for this sequence — `{active,2}`, two bytes one
+/// at a time, close, one passive `gen_tcp:recv/3`, re-arm `{active,true}` (the port number is the
+/// oracle's own):
+///
+/// ```text
+/// one={tcp,#Port<0.5>,<<97>>}
+/// two={tcp,#Port<0.5>,<<98>>}
+/// passive={tcp_passive,#Port<0.5>}
+/// silent=timeout
+/// recv={error,closed}
+/// recv_after=timeout
+/// closed={tcp_closed,#Port<0.5>}
+/// ```
+///
+/// The `recv` line is the observation this case pins: the spend deselected the read side
+/// (`:13106`-`:13114`), so the close is only noticed once something reads — and a passive read
+/// answers `closed` (`:12826`) while sending **no** message. A gate reading the last accepted
+/// `setopts` instead of the live state would fabricate the `{tcp_closed, S}` right there.
+///
+/// and for the `{active,1}` form of the same sequence (`data` / `passive` / `silent` / `closed`):
+///
+/// ```text
+/// data={tcp,#Port<0.5>,<<120>>}
+/// passive={tcp_passive,#Port<0.5>}
+/// silent=timeout
+/// closed={tcp_closed,#Port<0.5>}
+/// ```
+#[test]
+fn an_exhausted_active_n_counter_reports_nothing_until_an_active_mode_is_rearmed() {
+    let Some((mut session, mut peer)) = Session::connected_tcp("peer close: spent counter") else {
+        return;
+    };
+    // Two grants: the first delivery spends one (leaving 1), the second drives the counter to zero.
+    assert_eq!(
+        session.setopts(&multi_record(INET_LOPT_ACTIVE, INET_MULTI, 2)),
+        vec![1],
+        "the driver accepts `{{active,2}}`"
+    );
+    assert_eq!(
+        session.active_mode(),
+        ActiveMode::Multi { remaining: 2 },
+        "two grants armed, none spent yet (the C's `active_count`, `inet_drv.c:6975-6987`)"
+    );
+
+    assert!(
+        peer.write_all(b"a").is_ok(),
+        "the peer writes the first granted byte"
+    );
+    let first = session.deliveries(DELIVERY_BOUND, 1);
+    assert_eq!(
+        first.len(),
+        1,
+        "one granted read is one message, got {first:?}"
+    );
+    let port_text = session.port_text();
+    assert_eq!(
+        session.render_active(&first[0]),
+        format!("{{tcp,{port_text},<<97>>}}"),
+        "`tcp_message`'s `{{tcp, S, Data}}` (`inet_drv.c:3979`), the binary the `[binary]` port \
+         renders — `~w` prints a binary's bytes in decimal, as the oracle does"
+    );
+    assert_eq!(
+        session.active_mode(),
+        ActiveMode::Multi { remaining: 1 },
+        "the delivery spent exactly one grant (`:1556`), so the counter is 1 and the mode is still active"
+    );
+
+    assert!(
+        peer.write_all(b"b").is_ok(),
+        "the peer writes the second granted byte"
+    );
+    let rest = session.deliveries(DELIVERY_BOUND, 2);
+    assert_eq!(
+        rest.len(),
+        2,
+        "the delivery that spends the last grant stages its data message and the passive message \
+         together (`:1556-1559`), got {rest:?}"
+    );
+    assert!(
+        matches!(rest[0].event, ActiveInputEvent::Data(_)),
+        "the data message comes first, got {:?}",
+        rest[0].event
+    );
+    assert_eq!(
+        session.render_active(&rest[0]),
+        format!("{{tcp,{port_text},<<98>>}}"),
+        "the second granted byte is its own message"
+    );
+    assert_eq!(
+        rest[1].event,
+        ActiveInputEvent::Passive,
+        "the `INET_MULTI` arm's zero is the only place `packet_passive_message` fires (`:1558`)"
+    );
+    assert_eq!(
+        session.render_active(&rest[1]),
+        format!("{{tcp_passive,{port_text}}}"),
+        "the oracle's `{{tcp_passive, S}}` for the exhausted counter"
+    );
+    assert_eq!(
+        session.active_mode(),
+        ActiveMode::False,
+        "the zeroed counter cleared the mode (`:1557`), which is the state `tcp_recv_closed` tests"
+    );
+
+    // The C's passive arm: no message and no port death (`:12819-12832`).
+    drop(peer);
+    let quiet = session.quiet();
+    assert!(
+        quiet.is_empty(),
+        "an exhausted `{{active,N}}` grant leaves the socket passive, so the close reports nothing \
+         (`inet_drv.c:12819-12832`), got {quiet:?}"
+    );
+    // The witness the empty channel needs: the driver **did** observe the EOF while the socket was
+    // passive (`tcp_inet_input` reads on the readiness event whatever the mode,
+    // `inet_drv.c:13598-13600`, and `tcp_recv_closed` only then reads `desc->inet.active`). Without
+    // this the silence above would also hold for a close nobody had seen yet, i.e. for a gate that
+    // never ran — `session.active_mode()` already proves the store the gate reads is passive.
+    //
+    // The passive window alone does **not** observe it: the delivery that emptied the counter
+    // deselected the socket's read side (`sock_select(INETP(desc), (FD_READ|FD_CLOSE), 0)`,
+    // `:13106`-`:13114`), so the EOF stays in the kernel until something arms the read again. A
+    // passive read is what does — the C's `TCP_REQ_RECV`(42) enqueue (`sock_select(…, 1)`,
+    // `:12315`), whose read answers `0` and runs `tcp_recv_closed` with `desc->inet.active == 0`.
+    assert!(
+        !session.peer_close_observed(),
+        "a spent grant leaves the socket deselected (`:13106`-`:13114`), so the silent window reads \
+         nothing and cannot have observed the peer's EOF yet"
+    );
+    let queued = session.passive_recv();
+    assert_eq!(
+        queued.first().copied(),
+        Some(1),
+        "the passive read is queued (`[1] ++ Id`, `:12308`): the driver's own `desc->inet.active` is \
+         passive, which is the `:12290` guard, got {queued:?}"
+    );
+    let after_read = session.quiet();
+    assert!(
+        after_read.is_empty(),
+        "the close is observed with the socket passive, so the C takes the silent arm \
+         (`inet_drv.c:12819-12832`) and answers the *read* with `closed` (`:12826`) instead, got \
+         {after_read:?}"
+    );
+    assert!(
+        session.peer_close_observed(),
+        "the passive read is what latched the peer's EOF — this is the close the gate must suppress"
+    );
+    assert!(
+        session.rt.ports.borrow().is_live(session.port),
+        "the passive arm does not terminate the port (`:12820-12821` \"passive mode do not \
+         terminate port !\")"
+    );
+
+    // The sticky re-fire: an active mode on the already-closed descriptor makes the message due.
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ACTIVE)),
+        vec![1],
+        "the driver accepts `{{active,true}}` on a closed descriptor"
+    );
+    let reports = session.collect(DELIVERY_BOUND);
+    assert_eq!(
+        reports.len(),
+        1,
+        "the re-fire is exactly one report (`:7001-7015` + `TCP_ADDF_CLOSE_SENT`), got {reports:?}"
+    );
+    assert_eq!(reports[0].port, session.port, "the report names its own port");
+    assert_eq!(
+        session.render(&reports[0]),
+        format!("{{tcp_closed,{port_text}}}"),
+        "the oracle prints `{{tcp_closed,#Port<0.N>}}` — a 2-tuple, never a 3"
+    );
+    let again = session.round();
+    assert!(
+        again.is_empty(),
+        "the re-fire is once-only too, got {again:?}"
+    );
+}
+
+/// The `{active, once}` twin: the single granted read spends the mode **silently** — no
+/// `{tcp_passive, S}`, which the C sends only for `INET_MULTI` — so the close that follows is
+/// silent, and a re-arm is what owes the one `{tcp_closed, S}`.
+///
+/// `INET_CHECK_ACTIVE_TO_PASSIVE` (`erts/emulator/drivers/common/inet_drv.c:1552-1560`) spends an
+/// `INET_ONCE` grant by flipping the mode with **no** message (`:1554-1555`); the exhausted socket
+/// is therefore passive at `tcp_recv_closed` and takes the silent arm (`:12819-12832`); the sticky
+/// re-fire at `:7001-7015` sends the message when an active mode is armed afterwards.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1) for this sequence — `{active,once}`, one byte,
+/// close, one passive `gen_tcp:recv/3`, re-arm `{active,true}`:
+///
+/// ```text
+/// data={tcp,#Port<0.5>,<<120>>}
+/// passive=timeout
+/// silent=timeout
+/// recv={error,closed}
+/// recv_after=timeout
+/// closed={tcp_closed,#Port<0.5>}
+/// ```
+///
+/// `recv_after=timeout` with a `recv={error,closed}` above it is the same observation as the
+/// `{active,N}` twin's: the passive read is what discovers the EOF, the passive arm answers the
+/// *read* and sends nothing, and only the re-arm owes the `{tcp_closed, S}`.
+#[test]
+fn a_spent_active_once_socket_reports_nothing_until_an_active_mode_is_rearmed() {
+    let Some((mut session, mut peer)) = Session::connected_tcp("peer close: spent once") else {
+        return;
+    };
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ONCE)),
+        vec![1],
+        "the driver accepts `{{active,once}}`"
+    );
+    assert!(
+        peer.write_all(b"x").is_ok(),
+        "the peer writes the single granted byte"
+    );
+    let delivered = session.deliveries(DELIVERY_BOUND, 1);
+    assert_eq!(
+        delivered.len(),
+        1,
+        "one grant is one message, got {delivered:?}"
+    );
+    let port_text = session.port_text();
+    assert_eq!(
+        session.render_active(&delivered[0]),
+        format!("{{tcp,{port_text},<<120>>}}"),
+        "`tcp_message`'s `{{tcp, S, Data}}`"
+    );
+    assert_eq!(
+        session.active_mode(),
+        ActiveMode::False,
+        "the read spent the grant (`:1554-1555`), so the driver is passive with no counter left"
+    );
+    let extra = session.deliveries(QUIET_WINDOW, 1);
+    assert!(
+        extra.is_empty(),
+        "`INET_ONCE` never sends `{{tcp_passive, S}}` — only the `INET_MULTI` arm does (`:1556-1558`) \
+         — got {extra:?}"
+    );
+
+    // Passive now: the peer's close is the C's silent passive arm (`:12819-12832`).
+    drop(peer);
+    let quiet = session.quiet();
+    assert!(
+        quiet.is_empty(),
+        "a spent `{{active,once}}` socket reports nothing at the close (`inet_drv.c:12819-12832`), \
+         got {quiet:?}"
+    );
+    // As in the `{{active,N}}` twin: the silence is only evidence if the close was **observed** while
+    // the socket was passive — the read happens on readiness whatever the mode
+    // (`inet_drv.c:13598-13600`), and `session.active_mode()` already proved the grant is gone. The
+    // spend deselected the read side (`:13106`-`:13114`), so the passive window observes nothing and
+    // the `TCP_REQ_RECV`(42) enqueue's own `sock_select(…, 1)` (`:12315`) is what arms it again.
+    assert!(
+        !session.peer_close_observed(),
+        "the spent grant deselected the socket's read side (`:13106`-`:13114`), so the silent window \
+         cannot have observed the peer's EOF yet"
+    );
+    let queued = session.passive_recv();
+    assert_eq!(
+        queued.first().copied(),
+        Some(1),
+        "the passive read is queued (`[1] ++ Id`, `:12308`), got {queued:?}"
+    );
+    let after_read = session.quiet();
+    assert!(
+        after_read.is_empty(),
+        "a close observed while passive is the silent arm (`inet_drv.c:12819-12832`) — the read \
+         takes the `closed` answer (`:12826`) and no `{{tcp_closed, S}}` exists, got {after_read:?}"
+    );
+    assert!(
+        session.peer_close_observed(),
+        "the passive read is what latched the peer's EOF — a close nobody has seen yet would make \
+         the empty channel meaningless"
+    );
+    assert!(
+        session.rt.ports.borrow().is_live(session.port),
+        "the passive arm does not terminate the port (`:12820-12821` \"passive mode do not \
+         terminate port !\")"
+    );
+
+    assert_eq!(
+        session.setopts(&record(INET_LOPT_ACTIVE, INET_ACTIVE)),
+        vec![1],
+        "the driver accepts `{{active,true}}` on a closed descriptor"
+    );
+    let reports = session.collect(DELIVERY_BOUND);
+    assert_eq!(
+        reports.len(),
+        1,
+        "the sticky re-fire is exactly one report (`:7001-7015`), got {reports:?}"
+    );
+    assert_eq!(reports[0].port, session.port, "the report names its own port");
+    assert_eq!(
+        session.render(&reports[0]),
+        format!("{{tcp_closed,{port_text}}}"),
+        "the oracle prints `{{tcp_closed,#Port<0.N>}}`"
+    );
+    let again = session.round();
+    assert!(
+        again.is_empty(),
+        "the re-fire is once-only too, got {again:?}"
+    );
+}
 /// A `udp_inet` port never reports a peer close: `inet_drv` has no `{udp_closed, _}` message.
 #[test]
 fn a_udp_inet_port_never_reports_a_peer_close() {
@@ -959,5 +1384,131 @@ fn the_exit_on_close_false_socket_survives_the_peer_close_message() {
             .expect("a second delivery pass"),
         0,
         "the once-only latch is keyed on *reported*, so a live port reports nothing more"
+    );
+}
+
+// -----------------------------------------------------------------------------------------------
+// The oracle cross-checks: the same arm/spend/close/re-arm sequence on a real `erl`
+// -----------------------------------------------------------------------------------------------
+
+/// The `{active,2}` sequence the spent-counter case drives, as one `gen_tcp` program (a real
+/// listen/accept plus a client, so the peer's close is a real EOF): arm two grants, spend both one
+/// byte at a time, close the peer, make one passive read (the `TCP_REQ_RECV` the case sends as a
+/// control op), re-arm `{active,true}`.
+const TWO_GRANT_PROBE: &str = "begin \
+     {ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true}]), \
+     {ok,P} = inet:port(L), \
+     {ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false}]), \
+     {ok,S} = gen_tcp:accept(L), \
+     ok = inet:setopts(S,[{active,2}]), \
+     ok = gen_tcp:send(C,<<\"a\">>), \
+     One = receive X1 -> X1 after 2000 -> timeout end, \
+     ok = gen_tcp:send(C,<<\"b\">>), \
+     Two = receive X2 -> X2 after 2000 -> timeout end, \
+     Passive = receive X3 -> X3 after 2000 -> timeout end, \
+     gen_tcp:close(C), \
+     Silent = receive X4 -> X4 after 1000 -> timeout end, \
+     Recv = gen_tcp:recv(S,0,500), \
+     RecvAfter = receive X6 -> X6 after 500 -> timeout end, \
+     ok = inet:setopts(S,[{active,true}]), \
+     Closed = receive X5 -> X5 after 2000 -> timeout end, \
+     io:format(\"one=~w~ntwo=~w~npassive=~w~nsilent=~w~nrecv=~w~nrecv_after=~w~nclosed=~w~n\", \
+     [One,Two,Passive,Silent,Recv,RecvAfter,Closed]), \
+     gen_tcp:close(S), gen_tcp:close(L) end";
+
+/// The `{active,once}` sequence the spent-once case drives: one granted read (which owes **no**
+/// `{tcp_passive, S}`), the peer's close, one passive read, then the re-arm.
+const ONE_GRANT_PROBE: &str = "begin \
+     {ok,L} = gen_tcp:listen(0,[binary,{active,false},{reuseaddr,true}]), \
+     {ok,P} = inet:port(L), \
+     {ok,C} = gen_tcp:connect({127,0,0,1},P,[binary,{active,false}]), \
+     {ok,S} = gen_tcp:accept(L), \
+     ok = inet:setopts(S,[{active,once}]), \
+     ok = gen_tcp:send(C,<<\"x\">>), \
+     Data = receive X1 -> X1 after 2000 -> timeout end, \
+     Passive = receive X2 -> X2 after 2000 -> timeout end, \
+     gen_tcp:close(C), \
+     Silent = receive X3 -> X3 after 1000 -> timeout end, \
+     Recv = gen_tcp:recv(S,0,500), \
+     RecvAfter = receive X5 -> X5 after 500 -> timeout end, \
+     ok = inet:setopts(S,[{active,true}]), \
+     Closed = receive X4 -> X4 after 2000 -> timeout end, \
+     io:format(\"data=~w~npassive=~w~nsilent=~w~nrecv=~w~nrecv_after=~w~nclosed=~w~n\", \
+     [Data,Passive,Silent,Recv,RecvAfter,Closed]), \
+     gen_tcp:close(S), gen_tcp:close(L) end";
+
+/// `text` with every port term masked to `#Port<P>` — the oracle's port number is its own and
+/// differs per run, so a pinned literal names the message **shape** (the rule
+/// `active_input_e2e_tests.rs::mask_ports` follows).
+fn mask_ports(text: &str) -> String {
+    const OPEN: &str = "#Port<";
+    let mut masked = String::with_capacity(text.len());
+    for (index, part) in text.split(OPEN).enumerate() {
+        if index == 0 {
+            masked.push_str(part);
+            continue;
+        }
+        match part.find('>') {
+            Some(close) => {
+                masked.push_str("#Port<P>");
+                masked.push_str(&part[close + 1..]);
+            }
+            None => {
+                masked.push_str(OPEN);
+                masked.push_str(part);
+            }
+        }
+    }
+    masked
+}
+
+/// Runs one probe and answers its **masked** stdout, or `None` when no usable `erl` is on `PATH`
+/// (the caller then prints [`skip_oracle_check`]'s banner).
+fn masked_oracle(expr: &str) -> Option<String> {
+    Some(mask_ports(&erl_eval(expr)?))
+}
+
+/// The `{active,2}` close sequence, cross-checked against a real `erl`: the two granted reads are
+/// two messages, the exhaust sends one `{tcp_passive, S}`, the close afterwards is **silent**
+/// (`tcp_recv_closed`'s passive arm, `inet_drv.c:12819-12832`) — a passive read is what observes it
+/// and answers `{error,closed}` without answering a message — and re-arming `{active,true}` is what
+/// produces the single `{tcp_closed, S}` (`inet_set_opts`'s sticky re-fire, `:7001-7015`).
+#[test]
+fn the_oracle_agrees_that_an_exhausted_active_n_grant_silences_the_close() {
+    let Some(printed) = masked_oracle(TWO_GRANT_PROBE) else {
+        skip_oracle_check("the spent `{active,N}` close");
+        return;
+    };
+    assert_eq!(
+        printed,
+        "one={tcp,#Port<P>,<<97>>}\n\
+         two={tcp,#Port<P>,<<98>>}\n\
+         passive={tcp_passive,#Port<P>}\n\
+         silent=timeout\n\
+         recv={error,closed}\n\
+         recv_after=timeout\n\
+         closed={tcp_closed,#Port<P>}",
+        "the oracle's own answer for the `{{active,2}}` spend/close/recv/re-arm sequence"
+    );
+}
+
+/// The `{active,once}` twin, cross-checked against the same oracle: one granted read, **no**
+/// `{tcp_passive, S}` (the C sends it only for `INET_MULTI`, `inet_drv.c:1556-1558`), a silent
+/// close whose EOF the passive read is what discovers, and the one report the re-arm owes.
+#[test]
+fn the_oracle_agrees_that_a_spent_active_once_grant_silences_the_close() {
+    let Some(printed) = masked_oracle(ONE_GRANT_PROBE) else {
+        skip_oracle_check("the spent `{active,once}` close");
+        return;
+    };
+    assert_eq!(
+        printed,
+        "data={tcp,#Port<P>,<<120>>}\n\
+         passive=timeout\n\
+         silent=timeout\n\
+         recv={error,closed}\n\
+         recv_after=timeout\n\
+         closed={tcp_closed,#Port<P>}",
+        "the oracle's own answer for the `{{active,once}}` spend/close/recv/re-arm sequence"
     );
 }
