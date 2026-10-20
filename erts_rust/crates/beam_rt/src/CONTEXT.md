@@ -166,21 +166,25 @@ Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, sa
   (a real refusal) — that is the discriminator against the timeout form below.
 - **The `-eval` `receive … after T` route pumps the scheduler every port-poll slice, so a peer is
   accepted however late it dials.** Both per-iteration waits of the `after` arm are bounded by
-  `PORT_POLL_SLICE` (25 ms, the port poller's own budget, reused rather than duplicated) and the wait ends
-  only once the **caller's** deadline has elapsed: `poll_port_messages(remaining.min(PORT_POLL_SLICE))`
-  and `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
-  `Evaluator::receive`), so `Runtime::pump_scheduler` — and with it `pump_dist` → `DistNode::pump` →
-  `accept_one` — is re-entered every slice, instead of charging the whole window to
+  `PORT_POLL_SLICE` (25 ms, the port poller's own budget, reused rather than duplicated) and the pump
+  between them is the **non-blocking** `Runtime::pump_scheduler_now` (`TimerWait::ImminentWithin(0)`);
+  the deadline is tested **before** the pump, so the wait ends on the **caller's** deadline rather
+  than on a pump call's schedule: `pump_scheduler_now(RECEIVE_PUMP_SLICES)`,
+  `poll_port_messages(remaining.min(PORT_POLL_SLICE))` and
+  `wait_for_timer(min(deadline, now + PORT_POLL_SLICE), …)` (`eval/mod.rs`, the `after` arm of
+  `Evaluator::receive`), so `pump_dist` → `DistNode::pump` →
+  `accept_one` is re-entered every slice, instead of charging the whole window to
   `PortRegistry::pump(timeout)` (which loops in `PORT_POLL_SLICE` `epoll_wait` slices for as long as any
   port is live — the booted kernel's `inet_gethost` child never closes, `port.rs:1802` — and would leave a
   peer's connection unaccepted in the listen backlog until `net_setuptime`). Measured
   `beam_rt -sname rustnode -setcookie c123 -noshell -eval 'receive after 25000 -> ok end.'` +
   `erl -sname peerpos … net_adm:ping(rustnode@billmini)` ⇒ **`pong` in 0.38 s**. The observable timing of
-  the arm is exact (the window still ends it; a message that arrives in a slice still wins over the
-  timeout, and a pending timer inside a slice is still slept to), pinned structurally by the colocated
-  `eval::tests::{a_long_after_window_is_waited_out_in_port_poll_slices,
-  a_sub_slice_after_window_never_loops}` over a test-only per-thread iteration counter.
-- **`DistNode::is_idle` (`dist/node.rs:273` → `links.rs:200`) means "no live LINK".** The listener and a pending
+  the arm is the oracle's — `after 1/25/50/100/300/1000` all land on their own deadline, a message that
+  arrives in a slice wins over the timeout, and a pending timer inside a slice is still slept to —
+  pinned by the colocated `eval::tests::{a_long_after_window_is_waited_out_in_port_poll_slices,
+  a_sub_slice_after_window_never_loops}` over a test-only per-thread iteration counter and by
+  `eval::tests::{an_after_window_fires_on_its_own_deadline,
+  a_message_that_beats_the_deadline_is_picked_up_promptly}` over the wall clock.- **`DistNode::is_idle` (`dist/node.rs:273` → `links.rs:200`) means "no live LINK".** The listener and a pending
   accept are not counted as work, so a distributed node with nothing to run is `is_quiescent`
   (`scheduler.rs:581`). The `run` route only survives an idle `receive` because the live `inet_gethost`
   port keeps `has_nothing_to_poll()` false; without it a long-lived server node would exit

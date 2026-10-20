@@ -1490,10 +1490,11 @@ impl Evaluator<'_, '_> {
     /// That is what makes `spawn(fun() -> Self ! hello end), receive M -> M after 1000 -> …`
     /// work end to end.
     ///
-    /// * **with `after T`** — the mailbox is scanned, then the scheduler pumped, then the
-    ///   remaining time is spent on the two *other* message sources: the port poller (the
-    ///   shape `open_port({spawn, …}, …)` output arrives through) and the runtime's own
-    ///   **timer heap** ([`Runtime::wait_for_timer`], the shape `erlang:send_after/3` and
+    /// * **with `after T`** — the mailbox is scanned, the deadline tested, then the scheduler
+    ///   pumped **without blocking**, then the remaining time is spent on the two *other*
+    ///   message sources: the port poller (the shape `open_port({spawn, …}, …)` output
+    ///   arrives through) and the runtime's own **timer heap**
+    ///   ([`Runtime::wait_for_timer`], the shape `erlang:send_after/3` and
     ///   `timer:apply_after/4` messages arrive through). The `after` body runs once the
     ///   deadline passes with no match. The whole wait is bounded by that one deadline — a
     ///   window with no pending deadline is slept out, so `receive _ -> ok after 300 -> ok
@@ -1503,16 +1504,20 @@ impl Evaluator<'_, '_> {
     ///
     ///   Both waits are **sliced** ([`PORT_POLL_SLICE`], the port poller's own budget, which
     ///   this loop reuses rather than inventing a second granularity): one iteration waits at
-    ///   most one slice, then rescans. The window, not the slice, is what ends the wait, so
-    ///   the observable timing is unchanged — but a long `after T` now re-enters
-    ///   [`Runtime::pump_scheduler`] every slice. That is what keeps a **distribution**
-    ///   connection alive on this route (contract A.5): a peer's `'N'` handshake is only
-    ///   *accepted* by the scheduler pass's distribution pump, so a wait that handed the whole
-    ///   window to the port poller — which blocks on any live port, and the boot's own
-    ///   `inet_gethost` helper child never closes — left the peer's connection queued in the
-    ///   listen backlog until `net_setuptime` gave up. A message that arrives in a slice
-    ///   (delivered by that very pump, or by the port poller) is picked up by the rescan
-    ///   before the timeout is considered, so a message still wins over the deadline.
+    ///   most one slice, then rescans. Nothing in an iteration but those two bounded waits may
+    ///   block, and the deadline is tested **before** the pump, so the window is what ends the
+    ///   wait: `after 1`/`25`/`50`/`100`/`300`/`1000` land on their own deadline like the
+    ///   oracle's, with the residual that a message arriving on the **port** stream or in the
+    ///   **timer heap** is picked up by the next iteration (bound: one [`PORT_POLL_SLICE`]).
+    ///   Re-entering a **non-blocking** [`Runtime::pump_scheduler_now`] every slice is also
+    ///   what keeps a **distribution** connection alive on this route (contract A.5): a peer's
+    ///   `'N'` handshake is only *accepted* by the scheduler pass's distribution pump, so a
+    ///   wait that handed the whole window to the port poller — which blocks on any live port,
+    ///   and the boot's own `inet_gethost` helper child never closes — left the peer's
+    ///   connection queued in the listen backlog until `net_setuptime` gave up. A message that
+    ///   arrives in a slice (delivered by that very pump, or by the port poller) is picked up
+    ///   by the rescan before the timeout is considered, so a message still wins over the
+    ///   deadline.
     /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
     ///   runnable and then reports the typed capability gap `receive: no matching message
     ///   arrived` rather than hanging. There *is* a host-timer mechanism
@@ -1530,18 +1535,27 @@ impl Evaluator<'_, '_> {
                         let mut clause_env = bound;
                         return self.exprs(&receive.clauses[index].body, &mut clause_env);
                     }
+                    // The **deadline test comes first, above the pump**: a closed window pays no
+                    // pump, no poll and no sleep — it runs its `after` body now. The scan above
+                    // ran first, so a message that arrived at the boundary still wins over the
+                    // deadline (the oracle's `send_after(100, self(), late)` under `after 300`
+                    // answers `{msg,101}`, never `timeout`).
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     // A runnable process (a `spawn`ed child, say) may deliver the message we
                     // are waiting for: pump it and rescan. `0` slices means nothing was
-                    // runnable, so the mailbox cannot have changed.
+                    // runnable, so the mailbox cannot have changed. The pump is the
+                    // **non-blocking** [`Runtime::pump_scheduler_now`] — the blocking
+                    // [`Runtime::pump_scheduler`] sleeps up to `min(nearest deadline, 100 ms)`
+                    // in its timer half plus one `PORT_POLL_SLICE` in its port half on every
+                    // empty round, none of it a function of *this* receive's window, which is
+                    // what made every `after T` below ~150 ms fire ~150 ms late.
                     if self.ctx.may_pump_scheduler() {
-                        let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
+                        let ran = heap!(self.ctx.runtime.pump_scheduler_now(RECEIVE_PUMP_SLICES));
                         if ran > 0 {
                             continue;
                         }
-                    }
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
                     }
                     // **One slice of the window, never all of it** (see the method docs): the
                     // waits below are the only places this loop blocks, and blocking for the
@@ -1549,6 +1563,7 @@ impl Evaluator<'_, '_> {
                     // pump that `accept`s a peer's connection. A context that may *not* pump
                     // (the evaluator running inside a scheduler slice) keeps the old
                     // whole-window wait: its `after` body is due when the window ends.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
                     let slice = if self.ctx.may_pump_scheduler() {
                         remaining.min(PORT_POLL_SLICE)
                     } else {
@@ -1584,19 +1599,20 @@ impl Evaluator<'_, '_> {
                     if !self.ctx.may_pump_scheduler() {
                         break;
                     }
-                    // Again one slice, so the loop above's [`Runtime::pump_scheduler`] — the
-                    // distribution pump, the timer heap and the run queue — is re-entered
-                    // every slice while the window is open. A pending deadline *inside* the
-                    // slice is still slept to exactly (`Runtime::wait_for_timer` takes the
-                    // earlier of the two instants), so a short timer fires at its deadline
-                    // rather than up to a slice late.
+                    // Again one slice, so the loop head's [`Runtime::pump_scheduler_now`] — the
+                    // distribution pump, the timer heap and the run queue — is re-entered every
+                    // slice while the window is open. A pending deadline *inside* the slice is
+                    // still slept to exactly (`Runtime::wait_for_timer` takes the earlier of the
+                    // two instants and bounds its own pass by the same window), so a short timer
+                    // fires at its deadline rather than up to a slice late.
+                    //
+                    // There is deliberately no `break` after this wait: the loop goes round once
+                    // more and **rescans the mailbox** first, so a message the wait itself just
+                    // delivered runs its clause instead of being handed to the `after` body. The
+                    // loop head's deadline test then ends the wait, so the extra round costs no
+                    // pump, no poll and no sleep.
                     let wake = deadline.min(Instant::now() + PORT_POLL_SLICE);
                     heap!(self.ctx.runtime.wait_for_timer(wake, RECEIVE_PUMP_SLICES));
-                    // Nothing became due in that slice; the wait ends when the **window** (not
-                    // the slice) has elapsed, and only then does the `after` body run.
-                    if Instant::now() >= deadline {
-                        break;
-                    }
                 }
                 let mut body_env = env.clone();
                 self.exprs(body, &mut body_env)
@@ -3565,6 +3581,125 @@ mod tests {
         receive_wait_iterations()
     }
 
+    /// Evaluates `expr` on a **booted** runtime and returns how long the evaluation itself
+    /// took (the boot is excluded — see [`wait_iterations`]), asserting that it produced the
+    /// small integer `1`.
+    ///
+    /// [`PENDING_TIMER`] is prefixed to the expression, so the runtime's timer heap holds a
+    /// live deadline **throughout** the measured receive. That is not a contrivance: a real
+    /// booted node always has one (the kernel's `timer_server` tick), and it is precisely the
+    /// condition under which a pump pass takes its timer-half sleep. Without it the timer
+    /// heap can happen to be empty and a blocking pump has nothing to sleep on, which would
+    /// make a timing assertion pass for the wrong reason.
+    fn timed_wait(expr: &str) -> Duration {
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        runtime.run_one_slice().expect("the runtime boots");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let probe = format!("{PENDING_TIMER}{expr}");
+        let started = Instant::now();
+        let value = eval(&mut ctx, &probe).unwrap_or_else(|error| panic!("{probe} failed: {error}"));
+        let elapsed = started.elapsed();
+        assert!(is_small(value), "{probe} must answer the small integer `1`");
+        assert_eq!(signed_value(value), 1, "{probe}");
+        elapsed
+    }
+
+    /// A far-future `erlang:send_after/3`: the far-out deadline every booted node has, kept
+    /// armed so the receive under measurement is never the only thing on the timer heap.
+    ///
+    /// Two seconds is longer than any window these tests use, so the deadline itself never
+    /// fires; its only effect is that a pass which *would* sleep on a timer deadline has one
+    /// to sleep on.
+    const PENDING_TIMER: &str = "erlang:send_after(2000, self(), housekeeping), ";
+
+    /// How much wall clock an `after T` window may overshoot its own deadline by.
+    ///
+    /// Every wait on the route is exact (`std::thread::sleep` to the deadline, or to the
+    /// next pending runtime deadline if that is earlier), so what is left is host scheduling
+    /// latency — a loaded, shared host can only make it *longer*, never shorter. 40 ms is far
+    /// below the ~150 ms a blocking pump added and far above the latency of a runnable
+    /// thread, so the bound pins the deadline semantics without flaking.
+    const AFTER_WINDOW_SLACK: Duration = Duration::from_millis(40);
+
+    /// An `after T` window is slept out to its **own deadline**, not to a pump call's
+    /// schedule.
+    ///
+    /// The wall clock is the only honest witness here: what this pins is purely temporal (a
+    /// flat ~150 ms floor on the CLI route for every `after 1 … after 100`, ~50 ms of
+    /// overshoot on `after 300`) and changes no term and no exit code. The expected numbers
+    /// are the oracle's (`erl`, OTP 29.1.1: `after 200` → 201, `after 25` → 26). One
+    /// [slack](AFTER_WINDOW_SLACK) is allowed on top of the window and nothing below it: a
+    /// sleep never returns early.
+    #[test]
+    fn an_after_window_fires_on_its_own_deadline() {
+        // A window longer than one `PORT_POLL_SLICE`: the loop's own waits own the timing.
+        let elapsed = timed_wait("receive _ -> ok after 200 -> ok end, 1");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "an `after 200` window must be waited out, not cut short: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(200) + AFTER_WINDOW_SLACK,
+            "an `after 200` window must end at its own deadline, but it took {elapsed:?} (a \
+             blocking pump adds its own sleep on top of the window)"
+        );
+
+        // A window *inside* one poll slice: a blocking pump spends its sleep inside the
+        // window and then re-checks the deadline a whole pump call late, which is why every
+        // short `after` used to cost the same fixed ~100 ms in-process / ~150 ms on the CLI.
+        let elapsed = timed_wait("receive _ -> ok after 25 -> ok end, 1");
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "an `after 25` window must be waited out: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(25) + AFTER_WINDOW_SLACK,
+            "an `after 25` window took {elapsed:?} — a window inside one poll slice must not \
+             cost a pump call"
+        );
+        let elapsed = timed_wait("receive _ -> ok after 1 -> ok end, 1");
+        assert!(
+            elapsed <= Duration::from_millis(1) + AFTER_WINDOW_SLACK,
+            "an `after 1` window took {elapsed:?} — a sub-slice window must return at once"
+        );
+    }
+
+    /// A message that arrives **before** the deadline wins, and is picked up within one
+    /// port-poll slice of arriving.
+    ///
+    /// Two sources, because the loop reaches them through different waits: the runtime's
+    /// **timer heap** (`erlang:send_after/3`, fired by a scheduler pass) and a **spawned
+    /// child** (`erlang:spawn/1`, run by the run queue). Both used to be observed one whole
+    /// *blocking* pump after the fact (`{msg,151}` against the oracle's `{msg,101}`, and
+    /// `{msg,125}` against the oracle's `{msg,0}`).
+    #[test]
+    fn a_message_that_beats_the_deadline_is_picked_up_promptly() {
+        let elapsed = timed_wait(
+            "erlang:send_after(100, self(), late), \
+             receive late -> ok after 500 -> ok end, 1",
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "`send_after(100, …)` cannot be observed before its own deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(100) + AFTER_WINDOW_SLACK,
+            "a message `erlang:send_after/3` delivered at 100 ms must be picked up within one \
+             port-poll slice, but the receive answered after {elapsed:?}"
+        );
+
+        let elapsed = timed_wait(
+            "P = self(), spawn(fun() -> P ! late end), \
+             receive late -> ok after 500 -> ok end, 1",
+        );
+        assert!(
+            elapsed <= AFTER_WINDOW_SLACK,
+            "a spawned child's message must be picked up promptly, but the receive answered \
+             after {elapsed:?}"
+        );
+    }
+
     /// A `receive … after T` window longer than one port-poll slice is waited out in
     /// **slices**, re-entering the scheduler each time — never handed to the port poller whole.
     ///
@@ -3576,16 +3711,17 @@ mod tests {
     /// exactly the discipline `crate::runtime`'s pass-sleep counters follow.
     #[test]
     fn a_long_after_window_is_waited_out_in_port_poll_slices() {
-        // 100 ms is four slices (measured: 4). The lower bound is the slicing itself; the upper
-        // bound guards the other failure — a slice that degenerated to a spin. Neither bound can
-        // flake on a loaded host, which can only make each slice *longer* (fewer iterations).
+        // 100 ms is four slices (measured: 4). The lower bound is the slicing itself — the
+        // loop's own wait is `remaining.min(PORT_POLL_SLICE)` — and the upper bound guards the
+        // other failure, a slice that degenerated to a spin. Neither bound can flake on a
+        // loaded host, which can only make each slice *longer* (fewer iterations).
         let iterations = wait_iterations("receive _ -> ok after 100 -> ok end, 1");
         assert!(
             iterations >= 2,
             "a 100 ms `after` window (PORT_POLL_SLICE = {PORT_POLL_SLICE:?}) must be waited out \
              in slices, re-entering the scheduler each time, but it took {iterations} wait \
-             iteration(s) — a single one means the whole window went to the port poller again, \
-             which is the distribution starvation contract A.5 measures"
+             iteration(s) — a single one means the whole window went to one wait, which is the \
+             distribution starvation contract A.5 measures"
         );
         assert!(
             iterations <= 100,
@@ -3596,12 +3732,13 @@ mod tests {
 
     /// A window **shorter** than one slice is not stretched into a slice loop.
     ///
-    /// The bound is `<= 1` rather than `== 1` on purpose: each iteration *starts* with a
-    /// scheduler pump, and a pump whose run queue is empty already blocks up to one
-    /// [`PORT_POLL_SLICE`] in its own port poll (a live-but-idle port, which the booted kernel's
-    /// helper child is), so a sub-slice window can legitimately be consumed by that pump before
-    /// the loop ever reaches its own wait. What must not happen — and is what this pins — is a
-    /// **slice loop** around a shorter window.
+    /// The bound is `<= 1` rather than `== 1` on purpose, and it is derived from the loop
+    /// rather than from a wall clock: for a window inside one slice `slice = remaining` (the
+    /// whole window) and `Runtime::wait_for_timer` sleeps it out in one go, so the *only* way
+    /// to take a second counted iteration is an earlier pending runtime deadline inside the
+    /// window — itself correctly bounded, because that wait sleeps to
+    /// `min(next deadline, the slice)` and then to the window end. A **slice loop** around a
+    /// shorter window (the failure this pins) would need many.
     #[test]
     fn a_sub_slice_after_window_never_loops() {
         // `PORT_POLL_SLICE` is 25 ms, so a 5 ms window fits inside one slice.
@@ -3612,6 +3749,7 @@ mod tests {
              most one wait, but it took {iterations}"
         );
     }
+
     #[test]
     fn malformed_expressions_are_capability_gaps() {
         for expr in ["1 +", "(", "case"] {

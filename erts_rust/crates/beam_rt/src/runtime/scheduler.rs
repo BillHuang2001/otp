@@ -245,6 +245,43 @@ impl Runtime {
         Ok(ran + delivered as u64)
     }
 
+    /// Runs a **bounded, non-blocking** scheduler pass from inside the running code — the
+    /// `-eval` `receive … after T` pump.
+    ///
+    /// It does exactly [`Runtime::pump_scheduler`]'s work (the run queue, the port
+    /// deliveries, the distribution pumps and the due timers — all of them non-blocking by
+    /// construction) and returns the same `ran + delivered` figure, but under
+    /// [`TimerWait::ImminentWithin`] with a **zero** window. Two sleeps live inside
+    /// [`Runtime::pump_scheduler`] and neither is a function of the caller's own window: its
+    /// timer half sleeps `min(nearest deadline, TIMER_PUMP_SLICE)` whenever *any* deadline is
+    /// pending (a booted kernel always keeps housekeeping deadlines, so an empty run queue
+    /// pays the full 100 ms for a deadline that has nothing to do with this `receive`), and
+    /// its port half blocks one `PORT_POLL_SLICE` on every zero-slice round. A caller whose
+    /// loop re-checks its mailbox and its deadline only *between* whole pump calls therefore
+    /// overshoots an `after T` window by up to one pump call — the `-eval` route's flat
+    /// ~150 ms floor on every `after 1 … after 100`.
+    ///
+    /// Hence this entry: the zero window can never sleep (a due deadline still fires — the
+    /// pass fires timers before it consults [`Runtime::timer_wait`] — and a deadline exactly
+    /// at the zero window is slept for exactly `0`), and `TimerWait::ImminentWithin` also
+    /// zeroes the port half whenever no port owes a reply. Both halves that *do* have to
+    /// block stay where they belong, with the caller: the evaluator's own port poll
+    /// ([`RuntimeContext::poll_port_messages`]) and its own bounded
+    /// [`Runtime::wait_for_timer`]. It cannot spin either — [`TimerWait::allows`] permits one
+    /// sleep per pass and this policy's window is zero.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::pump_scheduler`].
+    pub(crate) fn pump_scheduler_now(&mut self, max_slices: u64) -> Result<u64> {
+        let (ran, delivered) = self.scheduler_pass(
+            Some(max_slices),
+            true,
+            TimerWait::ImminentWithin(Duration::ZERO),
+        )?;
+        Ok(ran + delivered as u64)
+    }
+
     /// Runs a **bounded, boot-drive** scheduler step: [`Runtime::pump_scheduler`] with an
     /// **imminent-only** sleep policy ([`TimerWait::ImminentWithin`]).
     ///
@@ -308,10 +345,14 @@ impl Runtime {
     /// A pending deadline **beyond** `until` never extends the wait past the window, so a
     /// long housekeeping timer cannot make an `after T` overshoot its own timeout.
     ///
-    /// It neither spins nor hangs: there is exactly one sleep, bounded by `until`, followed
-    /// by one **bounded** pass, so the call cannot outlive the caller's deadline. That is the
-    /// shape [`crate::context::RuntimeContext::pump_once`] already uses for the compiled
-    /// route's finite `receive … after T`.
+    /// Nothing here can outlive the caller's deadline: the sleep is bounded by `until`, and
+    /// the single bounded pass that follows runs under
+    /// [`TimerWait::ImminentWithin`] with the **remaining** window, so the only timer it may
+    /// ever sleep on is one that is due before `until` (and then exactly that long). It
+    /// neither spins nor hangs — the pass is bounded by `max_slices`, and its port half
+    /// blocks at most one `PORT_POLL_SLICE`. That is the shape
+    /// [`crate::context::RuntimeContext::pump_once`] already uses for the compiled route's
+    /// finite `receive … after T`.
     ///
     /// # Errors
     ///
@@ -329,8 +370,13 @@ impl Runtime {
             std::thread::sleep(target.saturating_duration_since(now));
         }
         // One bounded pass: a deadline that has now elapsed fires (and delivers) in it, a
-        // deadline that has not stays pending for the caller's next window.
-        Ok(self.pump_scheduler_boot(max_slices)? > 0)
+        // deadline that has not stays pending for the caller's next window. The pass's own
+        // sleep policy is the **remaining** window rather than the boot drives' fixed
+        // slice, so whatever it waits for is due before the caller's deadline.
+        let window = until.saturating_duration_since(Instant::now());
+        let (ran, delivered) =
+            self.scheduler_pass(Some(max_slices), true, TimerWait::ImminentWithin(window))?;
+        Ok(ran + delivered as u64 > 0)
     }
 
     /// Runs **one** scheduler slice (one process, once), returning how many slices ran
