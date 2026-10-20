@@ -81,18 +81,6 @@
 //!
 //! # Measured and deliberately NOT pinned
 //!
-//! * **`enif_schedule_nif`'s success path** — the yield seam. Measured with a NIF that re-schedules
-//!   itself onto the same (or a dirty) scheduler: the oracle resumes the call and the module
-//!   receives the resumed call's value (`2` for both the plain `flags = 0` form and
-//!   `ERL_NIF_DIRTY_JOB_CPU_BOUND`), while the Rust runtime leaves `NifHost::schedule_nif` at its
-//!   default and the C therefore raises `badarg` (the module observes `{raised, error, badarg}`).
-//!   A case pinning it would be a mismatch; it is recorded in `divergences.md` §A.3. Owner:
-//!   `beam_rt` (the `NifHost::schedule_nif` hook) / `beam_abi`.
-//! * **`enif_send` from a NIF-created thread**, the documented thread-safe form (`env == NULL` plus
-//!   a message env): the oracle delivers (`enif_send` ⇒ `1`, the message arrives), the Rust runtime
-//!   answers `enif_alloc_env() == NULL` on a thread that is not inside a NIF call (so there is no
-//!   message env to send from and nothing is delivered). Recorded in `divergences.md` §A.3. Owner:
-//!   `beam_abi` (`nif/enif/envs.rs`) / the runtime's per-call host publication.
 //! * **A sub-binary window of an *off-heap* parent.** Measured by retaining `enif_alloc_binary`'s
 //!   data pointer, making the binary term, windowing it and then writing through the retained
 //!   pointer: both runtimes answer alike (the window does not observe the later write). It is still
@@ -103,7 +91,9 @@
 //! * **`enif_thread_type()` of the *calling* thread** is the already-recorded divergence (oracle
 //!   `1` = normal scheduler, Rust runtime `0`), so this group asserts the **created** thread's kind
 //!   (`ERL_NIF_THR_UNDEFINED`, `0`, on both) and never the caller's value.
-//! * **Already pinned elsewhere, not duplicated here**: `enif_send`'s both forms and its dead-pid /
+//! * **Already pinned elsewhere, not duplicated here**: `enif_schedule_nif`'s rescheduling
+//!   trampoline (plain and dirty) and the `env == NULL` message-env send from a NIF-created thread
+//!   ([`super::nif_a3`]), `enif_send`'s both forms and its dead-pid /
 //!   self answers ([`super::nif_so`]'s `nif_rt` block), `enif_inspect_iolist_as_binary` over nested
 //!   iodata ([`super::nif_so`] `nif_rt/iolist_deep_flatten_bytes`, [`super::nif_abi_extra`]'s byte
 //!   rules), `enif_tsd_*` per-thread independence and `enif_cond_*` / `enif_rwlock_*`
@@ -200,8 +190,9 @@ sd_code(_) -> 9.
 /// cross-process-send families plus the binary write-through/window/realloc family.
 ///
 /// Every `enif_*` referenced here is a symbol the `beam_rt` release binary exports (verified with
-/// `nm -D`), and nothing C-variadic is used. `enif_schedule_nif` is deliberately **absent**: its
-/// success path is a recorded divergence (`divergences.md` §A.3).
+/// `nm -D`), and nothing C-variadic is used. `enif_schedule_nif` is deliberately **absent** here:
+/// the rescheduling trampoline has its own group ([`super::nif_a3`]), and this library stays on the
+/// threading surface.
 const NIF_THREAD_C: &str = r#"/* A real NIF exercising the THREADING / BLOCKING / CROSS-PROCESS half of the NIF C ABI:
    enif_thread_create / enif_thread_join / enif_thread_self / enif_equal_tids / enif_thread_type /
    enif_thread_name, the enif_mutex_lock / enif_mutex_trylock hand-off a case can observe, the
@@ -763,20 +754,29 @@ mod tests {
     }
 
     #[test]
-    fn the_divergent_scheduling_seam_is_not_pinned() {
-        // `enif_schedule_nif`'s success path is a recorded divergence (`divergences.md` §A.3): the
-        // oracle resumes the call, the Rust runtime raises badarg. A library referencing it would
-        // pin a mismatch, so its absence is asserted — a future replacement of that hook may land a
-        // case here, and must delete this guard at the same time.
-        assert!(
-            !NIF_THREAD_C.contains("enif_schedule_nif"),
-            "the schedule_nif yield seam is a recorded divergence and must not be pinned"
+    fn the_callers_thread_type_is_not_pinned() {
+        // `enif_thread_type()` of the *calling* thread is a recorded divergence (`divergences.md`
+        // §A.3: the oracle runs a NIF on a scheduler thread, `1`, the Rust runtime on its own
+        // thread, `0`). This group therefore observes the **created** thread's kind only, which is
+        // `ERL_NIF_THR_UNDEFINED` on both — so the one and only `enif_thread_type()` call must sit
+        // in a worker entry point, never in a NIF that a case reads a value from.
+        assert_eq!(
+            NIF_THREAD_C.matches("enif_thread_type(").count(),
+            1,
+            "the fixture must ask for a thread type exactly once (in the created thread)"
         );
-        // Same for the `env == NULL` + message-env send from a NIF-created thread: the oracle
-        // delivers, the Rust runtime answers `enif_alloc_env() == NULL` off the NIF call path.
+        for line in NIF_THREAD_C
+            .lines()
+            .filter(|line| line.contains("enif_thread_type"))
+        {
+            assert!(
+                !line.contains("static ERL_NIF_TERM"),
+                "a NIF entry point must not report the caller's thread type: {line:?}"
+            );
+        }
         assert!(
-            !NIF_THREAD_C.contains("enif_send(NULL"),
-            "enif_send from a created thread is a recorded divergence and must not be pinned"
+            NIF_THREAD_C.contains("kind_type = (int) enif_thread_type();"),
+            "the single thread-type observation must be the created thread's own kind"
         );
     }
 
