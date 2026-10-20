@@ -99,12 +99,15 @@ const PAYLOAD_LENGTH: i64 = 64;
 /// nursery, with `fullsweep_after(0)` making every cadence collection a fullsweep.
 const PAYLOAD_ROUNDS: i64 = 200;
 
-/// How many collections under `fullsweep_after = 0` may be **not** fullsweeps: the ones the
-/// reduction/yield-boundary door runs as a kind-pinned, young-only minor
-/// (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`), which is not a cadence collection at
-/// all — a boundary that shrinks the nursery leaves the next admission unable to promote and
-/// escalates to a fullsweep immediately after, so at most one sits between two cadence
-/// collections.
+/// How many collections under `fullsweep_after = 0` may be **not** fullsweeps: exactly the
+/// reduction/yield-boundary door's **successful** kind-pinned young-only minors
+/// (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`), the one collection site that is not a
+/// cadence collection and whose refused minors are the door's own escalating `collect()` — a
+/// fullsweep — in that same call. A minor's promotion needs mature room that only a fullsweep
+/// installs (`HeapPolicy::mature_after_fullsweep`), and the door fires at most once per
+/// pre-emption and only where a park has crossed its seven-eighths occupancy watermark; the
+/// derivation for the figure this workload reaches is at the assertion in
+/// [`a_live_payload_survives_a_fullsweep_on_the_immix_path`].
 const BOUNDARY_MINOR_COLLECTIONS: u64 = 1;
 
 /// The emulator's default initial mature-generation size in words — the `beam_gc` default
@@ -531,13 +534,34 @@ fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
         "a fullsweep is one of the collections, never more; {after:?}"
     );
     // Every collection the **cadence** reaches is a fullsweep (`fullsweep_due(0)` holds for every
-    // `minor_gcs`), but the reduction/yield-boundary door is not part of that cadence: it runs a
-    // **kind-pinned young-only minor** (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`),
-    // which may keep or shrink the nursery but never grow it
-    // (`HeapPolicy::young_after_collection`). A boundary that shrinks the nursery leaves the next
-    // admission unable to promote, so that admission escalates to `collect()` — a fullsweep — and
-    // the pair is one non-cadence minor plus one cadence fullsweep. At most one such boundary
-    // minor can therefore sit between two cadence collections.
+    // `minor_gcs`, so the collector's `collect` picks `CollectionKind::Major`), and the one site
+    // that can produce anything else — the reduction/yield-boundary door — runs a **kind-pinned
+    // young-only minor** (`src/context/gc/reds_door.rs`, `collect_kind(Minor)`) and escalates
+    // *that same call* to `collect()` when the minor refuses, so a refused minor is no collection
+    // of its own: the excess `collections - fullsweeps` counts exactly the boundary minors that
+    // **succeeded**.
+    // A boundary minor may keep, shrink, or **grow** the nursery:
+    // `HeapPolicy::young_after_collection` keeps a capacity inside
+    // `[target, YOUNG_SHRINK_FACTOR × target]`, installs that target above the band, and installs
+    // it below the band too — the target being
+    // `young_minor_target_words` of the words the round itself promoted, i.e. a capacity derived
+    // from that round's live set and never from the fill it reached or the capacity it collected,
+    // which is what makes the installed figure a fixed point rather than a ratchet.
+    // A minor sizes only its own nursery, never its destination: the whole promotion must fit the
+    // mature region's free room (`collect_minor`'s up-front `free_lines() < needed` check, then
+    // the contiguous-run refusal of the atomic promotion), and only a **fullsweep** re-sizes that
+    // region (`mature_after_fullsweep` → `mature_target_words` = `MATURE_TARGET_LIVE_MULTIPLE` ×
+    // `need_after_fullsweep`, the multiple being the number of nursery-sized promotions one region
+    // is sized for).
+    // A successful minor therefore spends room a fullsweep installed, and once that room is gone
+    // the door's next collection is the escalating fullsweep — the region has to be re-sized by a
+    // fullsweep before another minor can be promoted out of it.
+    // The door also runs at most once per pre-emption (`REDS_BOUNDARY_MIN_REDS` is one slice
+    // budget) and only where a park has crossed the seven-eighths occupancy watermark or carries a
+    // growth's collection debt, so it is not a site every collection round reaches: after the one
+    // boundary minor here the nursery is collapsed onto that minor's own live-set target, and the
+    // run's remaining pre-emptions all park below the watermark — so the whole non-fullsweep count
+    // is that one minor (42 collections, 41 of them fullsweeps).
     assert!(
         collections - fullsweeps <= BOUNDARY_MINOR_COLLECTIONS,
         "every cadence collection under fullsweep_after 0 is a fullsweep, and the only other \

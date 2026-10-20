@@ -282,16 +282,21 @@ const EMULATOR_MIN_HEAP_WORDS: u64 = 233;
 /// The largest nursery capacity a run with this **mature-generation** figure can install,
 /// derived from the live-set band [`HeapPolicy::young_after_fullsweep`] guarantees.
 ///
-/// A collection sizes the nursery from the whole-heap live set it just kept, and a fullsweep puts
-/// every live word in the mature generation, so that live set is at most the mature generation's
-/// capacity at the same boundary. [`young_after_fullsweep`](beam_gc::HeapPolicy::young_after_fullsweep)
-/// then installs either [`young_target_words(live)`](beam_gc::HeapPolicy::young_target_words) or —
-/// when the capacity is already inside its hysteresis band — the capacity it had, which the band
-/// bounds by [`YOUNG_SHRINK_FACTOR`](beam_gc::YOUNG_SHRINK_FACTOR) times the target. A minor only
-/// keeps or shrinks, so it can never take a nursery past this band. Hence no capacity the run
-/// observes exceeds `YOUNG_SHRINK_FACTOR · young_target_words(peak_mature_capacity)`: a bound on
-/// the **live set's** scale, which is what separates a collector-sized nursery from an
-/// accumulating one (the run allocates 20 010 000 words at `N = 2 000`).
+/// A collection sizes the nursery from the live set it just measured, and a fullsweep puts every
+/// live word in the mature generation, so the whole-heap live set is at most the mature
+/// generation's capacity at the same boundary.
+/// [`young_after_fullsweep`](beam_gc::HeapPolicy::young_after_fullsweep) then installs either
+/// [`young_target_words(live)`](beam_gc::HeapPolicy::young_target_words) or — when the capacity is
+/// already inside its hysteresis band — the capacity it had, which the band bounds by
+/// [`YOUNG_SHRINK_FACTOR`](beam_gc::YOUNG_SHRINK_FACTOR) times the target. A minor targets
+/// [`young_minor_target_words(young_live)`](beam_gc::HeapPolicy::young_minor_target_words) — one
+/// times the words it promoted plus the reserve, so never more than the fullsweep rule's two times
+/// the whole live set — and a capacity its own band keeps is bounded by
+/// [`YOUNG_SHRINK_FACTOR`](beam_gc::YOUNG_SHRINK_FACTOR) times *that* target, so a minor cannot
+/// take a nursery past the same ceiling either. Hence no capacity the run observes exceeds
+/// `YOUNG_SHRINK_FACTOR · young_target_words(peak_mature_capacity)`: a bound on the **live set's**
+/// scale, which is what separates a collector-sized nursery from an accumulating one (the run
+/// allocates 20 010 000 words at `N = 2 000`).
 fn nursery_ceiling(mature_capacity_words: usize) -> usize {
     beam_gc::YOUNG_SHRINK_FACTOR
         * beam_gc::HeapPolicy::default().young_target_words(mature_capacity_words)
