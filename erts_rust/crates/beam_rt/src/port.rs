@@ -1396,7 +1396,16 @@ impl PortRegistry {
     /// runs; the round's closes then stay queued for the next one.
     fn run_port_tasks(&mut self, reds_budget: usize) -> Result<PortTaskOutcome> {
         self.capture_round_monitors();
-        self.registry.execute_port_tasks(&mut self.poller, reds_budget)
+        let outcome = self.registry.execute_port_tasks(&mut self.poller, reds_budget)?;
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "port tasks: ran={} reds={} notif={}",
+                outcome.ran,
+                outcome.reds_used,
+                outcome.notifications.len()
+            ));
+        }
+        Ok(outcome)
     }
 
     /// Runs one `beam_io` readiness round — [`beam_io::PortRegistry::handle_events`], the round
@@ -4032,6 +4041,12 @@ impl Runtime {
             registry.prune_dead_select(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "deliver_port_messages: timeout={timeout:?} events={}",
+                events.len()
+            ));
+        }
         // A driver callback cannot mint an atom (the live table is borrowed for the whole
         // callback), so a *new* name one interned was handed a predicted index for **this**
         // boundary to land. Committing before any message is built means the terms a driver

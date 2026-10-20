@@ -661,7 +661,15 @@ impl<'a> RuntimeContext<'a> {
         pc: u32,
     ) -> Result<Option<RunOutcome>> {
         let deadline = Instant::now() + crate::port::PORT_EVENT_DEADLINE;
+        let mut rounds = 0u32;
         loop {
+            rounds += 1;
+            if crate::debug_trace::enabled() && rounds <= 8 {
+                crate::debug_trace::trace(format_args!(
+                    "wait_for_port_event round {rounds}: awaiting_async={}",
+                    self.runtime.ports_awaiting_async()
+                ));
+            }
             // A round that delivered the completion, or one after which **no** live port holds
             // an asynchronous operation any more, means the answer is in the mailbox: resume so
             // the engine re-scans it. `ran` alone is not the signal — the pass's `ran` counts

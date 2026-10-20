@@ -231,10 +231,26 @@ impl PortRegistry {
     /// It is a live-port question, so a port the registry no longer holds contributes nothing
     /// (a close drains its pending operations and reports them before the descriptor goes away).
     pub fn awaits_async_completion(&self) -> bool {
+        if crate::debug_trace::enabled() {
+            let mut keys: Vec<u64> = self.meta.keys().copied().collect();
+            keys.sort_unstable();
+            crate::debug_trace::trace(format_args!("awaits_async: meta={keys:?}"));
+        }
         self.meta
             .keys()
-            .filter_map(|number| self.registry.get(PortId::new(*number)))
-            .any(|held| held.driver().has_pending_async())
+            .filter_map(|number| self.registry.get(PortId::new(*number)).map(|held| (*number, held)))
+            .any(|(number, held)| {
+                let pending = held.driver().has_pending_async();
+                if pending && crate::debug_trace::enabled() {
+                    let listening = held
+                        .driver_as::<beam_io::drivers::inet::TcpInetDriver>()
+                        .map(|tcp| tcp.state().is_listening());
+                    crate::debug_trace::trace(format_args!(
+                        "awaits_async: port {number} pending (tcp listening={listening:?})"
+                    ));
+                }
+                pending
+            })
     }
 
     /// The `locking` item's value atom: `port_level` when the port has its own lock,
