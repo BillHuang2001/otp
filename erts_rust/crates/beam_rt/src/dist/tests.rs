@@ -313,15 +313,13 @@ fn a_hidden_and_a_published_peer_both_establish_and_are_recorded() {
     assert_eq!(client.peer_creation(), 1);
 }
 
-/// The capability flags the **accepting** half actually put on the wire, as the
-/// connecting peer reads them: a real [`DistNode`] and a peer driver run the `'N'`
-/// handshake against each other over a loopback socket, and the peer's record of the
-/// acceptor's `Challenge` flags (`ConnectionDriver::server_flags`) is returned.
+/// A peer that dials `node`'s listener and completes the `'N'` handshake: the socket it speaks
+/// over and the driver holding its side of the protocol, both still live.
 ///
-/// This is the wire truth rather than the constructor's input: it is what a system
-/// `erl` classifies with `publish_type/1` when it decides whether to list this node in
-/// `nodes()`.
-fn acceptor_flags_as_the_peer_read_them(node: &mut DistNode) -> DistFlags {
+/// The node accepts and drives the link exactly as it does in production, so the returned
+/// pair can go on to make the peer **disappear** (drop the socket) and observe what the node
+/// records — see [`an_accepted_link_that_dies_records_its_peer_as_lost`].
+fn dial_and_establish(node: &mut DistNode) -> (TcpStream, ConnectionDriver) {
     let mut client = TcpStream::connect(("127.0.0.1", node.port()))
         .expect("connect the node's listener");
     client.set_nodelay(true).expect("TCP_NODELAY");
@@ -359,21 +357,124 @@ fn acceptor_flags_as_the_peer_read_them(node: &mut DistNode) -> DistFlags {
             client.write_all(&bytes).expect("the peer's write");
             client.flush().expect("the peer's flush");
         }
-        if matches!(peer.state(), DriverState::Established) {
-            assert_eq!(
-                node.links().borrow().first().map(|link| link.state()),
-                Some(DriverState::Established),
-                "both ends completed the `'N'` handshake"
-            );
-            assert_eq!(
-                node.links().borrow().first().and_then(|link| link.peer_visibility()),
-                Some(PeerVisibility::Normal),
-                "the peer published ITSELF; our own flags are the separate question"
-            );
-            return peer.server_flags();
+        if matches!(peer.state(), DriverState::Established)
+            && node
+                .links()
+                .borrow()
+                .first()
+                .is_some_and(DistConnection::is_established)
+        {
+            return (client, peer);
         }
     }
     panic!("the loopback 'N' handshake never completed");
+}
+
+/// The capability flags the **accepting** half actually put on the wire, as the
+/// connecting peer reads them: a real [`DistNode`] and a peer driver run the `'N'`
+/// handshake against each other over a loopback socket, and the peer's record of the
+/// acceptor's `Challenge` flags (`ConnectionDriver::server_flags`) is returned.
+///
+/// This is the wire truth rather than the constructor's input: it is what a system
+/// `erl` classifies with `publish_type/1` when it decides whether to list this node in
+/// `nodes()`.
+fn acceptor_flags_as_the_peer_read_them(node: &mut DistNode) -> DistFlags {
+    let (_client, peer) = dial_and_establish(node);
+    assert_eq!(
+        node.links()
+            .borrow()
+            .first()
+            .and_then(|link| link.peer_visibility()),
+        Some(PeerVisibility::Normal),
+        "the peer published ITSELF; our own flags are the separate question"
+    );
+    peer.server_flags()
+}
+
+/// **A lost accepted link records its peer.** [`DistNode::pump`] retires a link whose peer
+/// hung up and the retirement records that peer's `node@host` name in the runtime's shared
+/// [`LostPeers`](super::links::LostPeers) recorder — the record
+/// [`crate::Runtime::service_lost_dist_peers`] turns into OTP's `noconnection` semantics.
+///
+/// The question the retirement asks is **`was_established`**, never the live state: the pump
+/// that discovers the peer's EOF is what moves the driver to `Closed`, so a retirement that
+/// asked `is_established()` would see `false` for exactly the link whose loss must be
+/// recorded — and a real `erl` peer's `init:stop()` would deliver nothing at all.
+#[test]
+fn an_accepted_link_that_dies_records_its_peer_as_lost() {
+    use super::links::{new_lost_peers, take_lost_peers};
+    let name = unique_node("lostpeer");
+    let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+    let lost: super::links::LostPeers = new_lost_peers();
+    node.use_lost_peers(std::rc::Rc::clone(&lost));
+    let (client, peer) = dial_and_establish(&mut node);
+    assert!(
+        node.links()
+            .borrow()
+            .first()
+            .is_some_and(DistConnection::was_established),
+        "the link completed its 'N' handshake"
+    );
+    assert!(take_lost_peers(&lost).is_empty(), "nothing was lost yet");
+
+    // The peer's whole node goes away: its socket closes, exactly as a dying `erl`'s does.
+    drop(client);
+    drop(peer);
+    for _ in 0..200 {
+        node.pump().expect("the accepted link's pump");
+        if node.links().borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        node.links().borrow().is_empty(),
+        "the dead link is retired rather than left half-open"
+    );
+    assert_eq!(
+        take_lost_peers(&lost),
+        vec!["peer@host.example".to_string()],
+        "a link that had established is a peer whose node went down — the record the \
+         peer-loss drain turns into `noconnection`"
+    );
+}
+
+/// The complementary case: an accepted link retired **before** its `'N'` handshake completed
+/// records **no** peer loss — no process can hold a relationship with a peer that never
+/// became a node, and the reason stays the diagnostic
+/// [`DistNode::last_link_error`] reports.
+#[test]
+fn an_accepted_link_that_never_handshook_records_no_lost_peer() {
+    use super::links::{new_lost_peers, take_lost_peers};
+    let name = unique_node("silentpeer");
+    let mut node = DistNode::start(&name, COOKIE.to_vec()).expect("the listener binds");
+    let lost: super::links::LostPeers = new_lost_peers();
+    node.use_lost_peers(std::rc::Rc::clone(&lost));
+    let client = TcpStream::connect(("127.0.0.1", node.port()))
+        .expect("connect the node's listener");
+    node.pump().expect("the accept");
+    assert_eq!(node.links().borrow().len(), 1, "the link was accepted");
+    assert!(
+        !node.links().borrow()[0].was_established(),
+        "the peer never sent an `'N'` frame"
+    );
+    drop(client);
+    for _ in 0..200 {
+        node.pump().expect("the accepted link's pump");
+        if node.links().borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(node.links().borrow().is_empty(), "the link is retired");
+    assert!(
+        node.last_link_error().is_some(),
+        "the retirement stays observable as a diagnostic"
+    );
+    assert!(
+        take_lost_peers(&lost).is_empty(),
+        "a link that never handshook was never a node down, so nothing is recorded"
+    );
 }
 
 /// **Contract A.5 — this node's visibility.** A published node ORs

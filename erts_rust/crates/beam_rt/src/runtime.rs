@@ -71,7 +71,8 @@ use crate::codeserver::CodeServer;
 use crate::config::{strategy_env_default, ArgTerm, InitArgs, MaxHeapSetting, RuntimeConfig};
 use crate::context::gc_walk::{ForeignLatch, RuntimeCollectionGate};
 use crate::context::{PersistentTermStore, RuntimeContext};
-use crate::dist::{resolve_cookie, DistNode, NodeName, NONODE_NAME};
+use crate::dist::links::{new_lost_peers, no_lost_peers, take_lost_peers, LostPeers};
+use crate::dist::{resolve_cookie, DistLinks, DistNode, NodeName, NONODE_NAME};
 use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
 use crate::eval::compile::CompiledClosure;
@@ -96,6 +97,8 @@ pub(crate) mod executing;
 #[cfg(test)]
 mod dist_connect_tests;
 mod ets_owner;
+#[cfg(test)]
+mod lost_peer_tests;
 mod gc;
 mod scheduler;
 mod timer_wakes;
@@ -858,6 +861,21 @@ pub struct Runtime {
     /// either). When present, the link is built and pumped by the scheduler pass, next to
     /// [`Runtime::pump_dist`], and the client's router is installed on the process table.
     dist_client: Option<DistClient>,
+    /// The **peer-loss recorder** shared with **both** distribution halves (see
+    /// [`LostPeers`]): the `node@host` names of peers whose link a pump retired because it
+    /// died.
+    ///
+    /// The retirement sites ([`crate::dist::DistNode`]'s pump/decoder and
+    /// [`crate::dist_client::DistClient`]'s pump/decoder) record here and nothing more: they
+    /// run inside a pump, which holds no process table (a scheduler pass *moves* the table out
+    /// of the runtime). [`Runtime::service_lost_dist_peers`] is the drain, and it is what makes
+    /// OTP's `noconnection` semantics actually fire on the process table — a remote monitor's
+    /// `{'DOWN', Ref, process, Peer, noconnection}`, a remote link's
+    /// `{'EXIT', Peer, noconnection}` or termination.
+    ///
+    /// Empty for a runtime that never lost a peer, which is every hermetic (non-distributed)
+    /// run: the pass's step is then one borrow and one `is_empty`.
+    lost_dist_peers: LostPeers,
     /// The distribution **cookie** the handshake digests use, resolved once at construction
     /// from `-setcookie`, else `$HOME/.erlang.cookie`, else the documented default (see
     /// [`crate::dist::resolve_cookie`]).
@@ -1221,10 +1239,17 @@ impl Runtime {
         // Both distribution halves are told, because visibility is the node's, not the
         // dialler's.
         let hidden = config.init_args.get("hidden").is_some();
+        // The one **peer-loss recorder** both distribution halves write to (see
+        // [`LostPeers`]): created here, before either half exists, and installed into each as
+        // it is built — so a link retired by the accepting half's pump and one retired by the
+        // connecting half's land in the same place, and
+        // [`Runtime::service_lost_dist_peers`] drains them together.
+        let lost_dist_peers = new_lost_peers();
         let dist = match config.emulator.node_name.as_deref() {
             Some(name) => {
                 let mut node = DistNode::start(name, cookie.clone())?;
                 node.set_hidden(hidden);
+                node.use_lost_peers(Rc::clone(&lost_dist_peers));
                 Some(node)
             }
             None => None,
@@ -1270,6 +1295,9 @@ impl Runtime {
             Some(node) => {
                 let client = DistClient::new(cookie.clone())?;
                 client.set_hidden(hidden);
+                // The same peer-loss recorder the listening half just took, so a link either
+                // half retires is applied to the process table by the same pass step.
+                client.use_lost_peers(Rc::clone(&lost_dist_peers));
                 // The advertised name is the full `node@host` form (a `-sname` node is not
                 // advertised bare), which `node_name()` already returns; the creation is the
                 // value known so far (the `epmd`-assigned one is only final after the node's
@@ -1377,6 +1405,7 @@ impl Runtime {
             pending_spawns: Vec::new(),
             dist,
             dist_client,
+            lost_dist_peers,
             cookie,
             local_node,
             inbound_delivery: true,
@@ -3108,6 +3137,110 @@ impl Runtime {
         Ok(delivered)
     }
 
+    /// Applies OTP's `noconnection` semantics for every peer whose distribution link was
+    /// **retired as dead**, returning how many peers fired (contract A.5).
+    ///
+    /// The retirement sites ([`crate::dist::DistNode`]'s pump and decoder,
+    /// [`crate::dist_client::DistClient`]'s pump and decoder) run inside a pump, which holds no
+    /// process table — a scheduler pass *moves* the table out of the runtime — so all they do
+    /// is record the dead peer's `node@host` name in the shared recorder
+    /// ([`LostPeers`]). This is the drain: each recorded peer becomes one
+    /// [`ProcessTable::node_down`](beam_process::ProcessTable::node_down), which is exactly the
+    /// oracle's behaviour when a connection is lost — every outgoing **remote monitor** of a
+    /// process on that node gets `{'DOWN', Ref, process, PeerPid, noconnection}`, every
+    /// **remote link** goes through the exit policy (a trapping process gets
+    /// `{'EXIT', PeerPid, noconnection}`, a non-trapping one terminates with `noconnection`),
+    /// and the relationships naming that node are purged.
+    ///
+    /// # Who counts as gone
+    ///
+    /// A peer is gone only when **no** link of **either** half names it any more
+    /// ([`DistLinks::link_names`] — any handshake state, not only established links). That one
+    /// rule is what keeps a **re-connect** a non-event: a re-dial replaces an established
+    /// outbound link with a still-handshaking one, so the retirement records the loss while the
+    /// replacement keeps the name listed.
+    ///
+    /// The node atom comes from the shared table's **existing-atom** lookup, so an accepted
+    /// peer whose name never became an atom is a *decline*, never a fabricated atom. The
+    /// `noconnection` reason atom is interned into that same table here — the established
+    /// mid-pass pattern ([`Runtime::bind_dist_peers`]'s callers intern `nodeup`/`nodedown` the
+    /// same way) — and it is what makes the reason nameable to the exit policy and legible to
+    /// the receiving process.
+    ///
+    /// Complementary to, not a replacement for, [`Runtime::service_node_monitors`]:
+    /// `erlang:monitor_node/2` subscribers get their plain `{nodedown, Node}` from *that* step
+    /// on the same round (it diffs the established-node set), while the **process
+    /// relationships** — remote monitors and remote links — are discharged here. The two
+    /// deliver different message families, exactly as the oracle splits them, so one lost
+    /// connection legitimately reports both.
+    ///
+    /// # Cost
+    ///
+    /// One `try_borrow` and one `is_empty` when nothing was lost — which is every runtime that
+    /// never had a peer die, and every non-distributed run. No allocation, no atom-table touch.
+    ///
+    /// # Errors
+    ///
+    /// [`ProcessTable::node_down`](beam_process::ProcessTable::node_down)'s own allocation
+    /// failure (`error:system_limit`); nothing is swallowed.
+    pub(crate) fn service_lost_dist_peers(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        // The common case — no peer was lost — is one borrow and one emptiness test.
+        if no_lost_peers(&self.lost_dist_peers) {
+            return Ok(0);
+        }
+        // The "still linked" names are read **before** the recorder is drained: a half whose
+        // cell cannot be borrowed (a pump in flight) must not turn a live peer into a dead one,
+        // so the whole drain is deferred to the next pass and nothing is applied.
+        let Some(linked) = self.dist_link_names() else {
+            return Ok(0);
+        };
+        let lost = take_lost_peers(&self.lost_dist_peers);
+        if crate::debug_trace::dist_enabled() {
+            crate::debug_trace::dist(format_args!(
+                "drain: lost={lost:?} linked={linked:?}"
+            ));
+        }
+        let mut fired = 0;
+        for name in lost {
+            if linked.iter().any(|live| *live == name) {
+                // The peer came back (or the link was replaced by a fresh handshake): no loss.
+                continue;
+            }
+            // Existing atoms only: a name the shared table cannot name is a decline.
+            let Some(atom) = self.code_server.atoms_mut().lookup(&name) else {
+                crate::debug_trace::dist(format_args!("drain: {name} not in the atom table"));
+                continue;
+            };
+            let node = make_atom(atom);
+            let reason = make_atom(self.code_server.atoms_mut().intern("noconnection"));
+            crate::debug_trace::dist(format_args!("drain: node_down {name} noconnection"));
+            table.node_down(node, reason)?;
+            fired += 1;
+        }
+        Ok(fired)
+    }
+
+    /// The `node@host` names of **every** link either distribution half holds, whatever its
+    /// handshake state — [`Runtime::service_lost_dist_peers`]'s "still linked" view.
+    ///
+    /// The connecting half's table already spans both halves (it owns the one [`DistLinks`]
+    /// over the accepted cell the listening node shared with it); the node's own table is
+    /// unioned in defensively, so a runtime whose client was never installed still reports the
+    /// links it accepted.
+    ///
+    /// `None` when a half's cell cannot be borrowed — an unreadable answer, never a fabricated
+    /// "no links", so the caller defers instead of declaring peers dead.
+    fn dist_link_names(&self) -> Option<Vec<String>> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(client) = self.dist_client.as_ref() {
+            names.extend(client.link_names()?);
+        }
+        if let Some(node) = self.dist.as_ref() {
+            names.extend(DistLinks::new(node.links()).link_names());
+        }
+        Some(names)
+    }
+
     /// Builds one node-monitor notification `{nodeup, Node}` (`up`) or `{nodedown, Node}`, the
     /// plain **2-tuple** `erlang:monitor_node/2` carries (the `Info`-carrying 3-tuple belongs to
     /// the `process_flag(monitor_nodes, …)` family).
@@ -3128,7 +3261,8 @@ impl Runtime {
             )
         };
         terms::make_tuple(&mut ctx, &[tag, node])
-    }    /// Gives a freshly spawned `child` the group leader its `parent` has
+    }
+    /// Gives a freshly spawned `child` the group leader its `parent` has
     /// (`erl_process.c:12654-12663`).
     ///
     /// A child with no explicit `spawn_opt` leader inherits its parent's, so an explicit
@@ -4056,6 +4190,18 @@ impl Runtime {
                 "distribution: this runtime has no distribution client",
             ));
         };
+        // **Connecting is idempotent**: a peer this runtime already has an established link to
+        // — one it dialled, or one the peer opened — is connected, so nothing is dialled.
+        // That is what OTP does (`net_kernel:connect_node/1` answers `true` for a node already
+        // in `nodes()` without a socket round trip, and `erts_get_dist_entry` reuses an
+        // existing entry), and it is load-bearing rather than an optimisation: a second `'N'`
+        // handshake to a peer that already has a connection from this node is a
+        // simultaneous-connection collision, which the peer resolves by killing one of the two
+        // links — so `net_adm:ping/1` against a peer that dialled *us* would report `pang` and
+        // tear down the live link.
+        if client.is_connected_any_half(peer) {
+            return Ok(());
+        }
         client.set_identity(&name, make_atom(local_node), creation, &cookie);
         client.connect(peer, self.code_server.atoms_mut())?;
         let deadline = std::time::Instant::now() + DIST_CONNECT_TIMEOUT;

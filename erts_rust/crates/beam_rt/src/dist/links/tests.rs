@@ -799,3 +799,141 @@ fn the_client_reports_a_links_identity_through_the_shared_table() {
         "a runtime with no link at all has no identity to report"
     );
 }
+/// An outbound link that is **still handshaking**: the peer accepts the connection and then
+/// never answers the `'N'` frame. The returned listener/socket must stay alive — a closed peer
+/// would retire the link instead of leaving it mid-handshake.
+fn dial_handshaking(
+    client: &DistClient,
+    peer: &str,
+    atoms: &mut AtomTable,
+) -> (std::net::TcpListener, TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("read the port");
+    client
+        .connect_addr(peer, addr, atoms)
+        .expect("dial the loopback peer");
+    let (stream, _) = listener.accept().expect("the client connected");
+    stream
+        .set_read_timeout(Some(DIST_READ_SLICE))
+        .expect("the link's read slice");
+    (listener, stream)
+}
+
+/// An outbound link that **completed** its `'N'` handshake, against a loopback listener this
+/// helper owns.
+fn establish_outbound(
+    client: &DistClient,
+    peer: &str,
+    atoms: &mut AtomTable,
+) -> (ConnectionDriver, TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("read the port");
+    client
+        .connect_addr(peer, addr, atoms)
+        .expect("dial the loopback peer");
+    let (mut stream, _) = listener.accept().expect("the client connected");
+    stream
+        .set_read_timeout(Some(DIST_READ_SLICE))
+        .expect("the link's read slice");
+    let mut driver = ConnectionDriver::server(peer.as_bytes(), COOKIE, 1);
+    for _ in 0..200 {
+        client.pump(atoms).expect("the client pump");
+        read_into(&mut driver, &mut stream);
+        step_peer(&mut driver, &mut stream);
+        if matches!(driver.state(), DriverState::Established) && client.is_connected(peer) {
+            return (driver, stream);
+        }
+    }
+    panic!("the loopback handshake never completed");
+}
+
+/// A third peer, reachable only by dialling (the outbound half's two states).
+const SILENT_PEER: &str = "silent@host.example";
+/// A fourth peer, dialled **and** established.
+const LIVE_PEER: &str = "live@host.example";
+
+/// [`DistLinks::link_names`] is the **still-linked** view the peer-loss step reads
+/// ([`crate::Runtime::service_lost_dist_peers`]): every link **either** half holds, whatever its
+/// handshake state — where [`DistLinks::established_names`] answers only who can carry a
+/// `DOP_*` right now. The two differ exactly where a re-connect lives: a replacement link that
+/// is still handshaking **names** its peer while being unable to reach it, so the loss that
+/// retired its predecessor must not fire.
+///
+/// The accepted half contributes a name only once its `'N'` handshake *named* the peer
+/// ([`DistConnection::peer_name`] is `None` before then), so a link still handshaking on that
+/// half is present in the cell and absent from both lists — a recorded fact, not an accident:
+/// there is no name yet to compare against.
+#[test]
+fn link_names_lists_both_halves_in_both_handshake_states() {
+    // (a) the accepted half: one established link and one still handshaking.
+    let (mut connection, _peer, _stream) = establishing_accepted();
+    let mut atoms = AtomTable::new();
+    bind_peer(&mut connection, &mut atoms);
+    let (server_stream, _client_stream) = socket_pair();
+    let peer_addr = server_stream.peer_addr().expect("the peer's address");
+    let handshaking = DistConnection::from_parts(
+        ConnectionDriver::server(ACCEPTOR_NAME.as_bytes(), COOKIE, 1),
+        server_stream,
+        peer_addr,
+    );
+    assert_eq!(
+        handshaking.state(),
+        DriverState::Handshaking,
+        "the second accepted link never handshook"
+    );
+    assert_eq!(
+        handshaking.peer_name(),
+        None,
+        "an accepted link is unnamed until its 'N' handshake delivered the peer's name"
+    );
+    let accepted = Rc::new(RefCell::new(vec![connection, handshaking]));
+
+    // The table's own view of the accepted half, with no client in sight.
+    let links = DistLinks::new(Rc::clone(&accepted));
+    assert_eq!(
+        links.link_names(),
+        vec![PEER_NAME.to_string()],
+        "the established accepted link is listed and the unnamed one is not"
+    );
+    assert_eq!(
+        links.established_names(),
+        vec![PEER_NAME.to_string()],
+        "and for that half the two views agree, because only established links are named"
+    );
+
+    // (b) both halves: the shared accepted cell plus the connecting half's two states.
+    let client = DistClient::new(COOKIE.to_vec()).expect("client");
+    let our = make_atom(atoms.intern(ACCEPTOR_NAME));
+    client.set_identity(ACCEPTOR_NAME, our, 1, COOKIE);
+    client
+        .share_links_with(Rc::clone(&accepted))
+        .expect("install the node's accepted links");
+    let (_silent_listener, _silent_stream) = dial_handshaking(&client, SILENT_PEER, &mut atoms);
+    let (_live_driver, _live_stream) = establish_outbound(&client, LIVE_PEER, &mut atoms);
+
+    let names = client.link_names().expect("the client cell is readable");
+    assert_eq!(
+        names,
+        vec![
+            SILENT_PEER.to_string(),
+            LIVE_PEER.to_string(),
+            PEER_NAME.to_string(),
+        ],
+        "outbound first (dial order), then the accepted half — the handshaking one included"
+    );
+
+    // The distinction the peer-loss guard depends on: the still-handshaking link names its
+    // peer, but no `DOP_*` would reach it.
+    assert!(
+        !client.is_connected_any_half(SILENT_PEER),
+        "a link still handshaking cannot carry a control"
+    );
+    assert!(
+        client.is_connected_any_half(LIVE_PEER),
+        "the established outbound link can"
+    );
+    assert!(
+        client.is_connected_any_half(PEER_NAME),
+        "and so can the established accepted one"
+    );
+}

@@ -68,6 +68,7 @@
 //! | [`a_real_erl_peer_links_to_our_process_and_traps_our_exit`] | `link/1` + `trap_exit`, then dies our victim with `boom` | `EXIT_MATCH pid=true reason=boom`, and the `{'EXIT', Pid, boom}` whose pid **is** the pid we printed |
 //! | [`a_real_erl_peer_traps_our_exit_with_the_reason_term_it_asked_for`] | the same, with the **compound** reason `{shutdown,{custom,7}}` | the reason *value*, not merely the event |
 //! | [`a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered`] | `unlink/1` first (with a barrier proving *our* node processed it), then dies the victim | `NOEXIT`, and no `EXIT` line at all |
+//! | [`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`] | `link/1`, a barrier, then `unlink/1` and a second barrier — the victim never dies | the victim's `process_info(Victim, links)` is `1 [true]` (`length/1` + `is_pid/1`, never the pids) after the link and `0 []` after the unlink |
 //! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
 //! | [`a_real_erl_peer_demonitors_before_our_death_so_no_down_arrives`] | `demonitor(Ref, [flush])` first | `NODOWN`, and no `DOWN` line at all |
 //! | [`our_pid_survives_a_round_trip_through_a_real_erl_peer`] | echoes a pid term back | our pid arrives intact (`IDENTITY true`, the same text) |
@@ -75,7 +76,46 @@
 //! Every one of them is `#[ignore]`d: they need a whole system Erlang toolchain (`erl`,
 //! `erlc`, `epmd`) plus `setsid` and `kill`, and they really do spawn two VMs.
 //!
-//! # The responder / actor protocol
+//! ## The actor peer: the distributed **signal** families, us-observed
+//!
+//! The mirror image of the table above — here the **peer** arms the relationship (`DOP_LINK`,
+//! `DOP_MONITOR_P`, `DOP_EXIT2` all travel *inbound*) and the assertion is what **our** process
+//! received, which is where the wire decode, the link/monitor book-keeping and the reason-term
+//! copy live:
+//!
+//! | test | the peer does | our side must report |
+//! |---|---|---|
+//! | [`a_real_erl_peers_death_travels_inbound_and_our_trapping_process_traps_its_compound_reason`] | `link/1`s a pid we host from a spawned arm, then dies of `{boom,[1,2,3]}` | `EXIT_REASON {boom,[1,2,3]}` — the term itself — and `EXIT_PID true` (the trapped sender is the very pid the peer reported) |
+//! | [`a_real_erl_peers_death_travels_inbound_and_kills_our_non_trapping_process_with_its_reason`] | the same with the atom `boom`, against a victim that does **not** trap | `DOWN_REASON boom` — never `noproc`, never `killed` |
+//! | [`a_real_erl_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason`] | `erlang:monitor(process, Victim)` on our pid, then *we* die of `{boom,[1,2,3]}` | `MONITORED_BY 1 [true]` (the peer's monitor really is recorded), and every slot of the `{'DOWN', …}` the peer forwards back: size 5, head, a reference, `process`, our own pid, `{boom,[1,2,3]}` |
+//! | [`a_real_erl_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill`] | `erlang:exit(Pid, boom\|kill)` against four of our processes | all four rows: `down boom`, `down killed`, `trapped boom from_peer=true` (and the survivor still alive), `down killed` |
+//!
+//! Their values are the ones a real OTP 29.1.1 `erl` prints with **both** sides an `erl`; a
+//! `beam_rt` peer cannot render a remote identifier, so those tables' claims are terms
+//! (`=:=`, `element/2`, `is_reference/1`) rather than text — the same reason the rust↔rust
+//! section asserts identity instead of `<node.number.serial>`.
+//!
+//! ## The peer's whole *node* going away
+//!
+//! One step further out than a process death: the peer runs `init:stop()`, so the **node** is
+//! lost and OTP resolves every relationship it held with that node with the reason
+//! `noconnection` (`beam_rt`'s `Runtime::service_lost_dist_peers` interns the atom and calls
+//! `ProcessTable::node_down` at the scheduler pass after both inbound drains):
+//!
+//! | test | the peer does | our side must report |
+//! |---|---|---|
+//! | [`a_real_erl_peers_node_death_sends_our_monitor_a_down_with_noconnection`] | confirms the `DOP_MONITOR_P` on its own side, then `init:stop()` | `{'DOWN', Ref, process, PeerPid, noconnection}` whose `Ref` is the one `monitor/2` returned and whose tag is `process` (`DOWN_SIZE 5`, `DOWN_HEAD`/`DOWN_REF`/`DOWN_PID true`, `DOWN_KIND process`, `DOWN_REASON noconnection`) |
+//! | [`a_real_erl_peers_node_death_sends_our_trapping_link_an_exit_with_noconnection`] | the same over a `link/1`, into a **trapping** process | `{'EXIT', PeerPid, noconnection}` — `EXIT_SIZE 3`, `EXIT_PID true`, `EXIT_REASON noconnection` — and the process lives on to print it |
+//! | [`a_real_erl_peers_node_death_kills_our_non_trapping_link_with_noconnection`] | the same into a **non-trapping** link holder (a spawned child, read back through our own local monitor) | termination with `noconnection` — `DOWN_SIZE 5`, `DOWN_KIND process`, `DOWN_PID true`, `DOWN_REASON noconnection`, never `noproc`, never `killed` |
+//! | [`reconnecting_to_a_real_erl_peer_is_not_a_node_down`] | stays **alive** while we re-dial it (`net_adm:ping/1`) | **nothing** in a 3 s window (`WINDOW clear`, no `UNEXPECTED_EXIT`/`UNEXPECTED_DOWN`), and both relationships still stand (`STILL_LINKED true`, `STILL_MONITORED true`, `ALIVE true`) |
+//!
+//! Two things differ from every other family. The peer's node is what ends, so there is no
+//! `ACTOR_DONE`/`{bye, …}` handshake to close the session with — the test's closing assertions
+//! are the peer's own clean exit and the `run` action's `done`. And the peer confirms the
+//! relationship **on its own side** (`PEER_ARM_SEEN`, read from its `links`/`monitored_by`
+//! items) before it stops, so a receipt cannot be explained by a `DOP_LINK`/`DOP_MONITOR_P`
+//! that never crossed the wire.
+//!//! # The responder / actor protocol
 //!
 //! Our node runs the **responder** (`run <fixture.beam> two_vm:<responder>/1 "<peer
 //! node>"`); the peer runs the **actor** (`erl … -run two_vm <actor> "<our node>"`, or
@@ -149,11 +189,32 @@
 //!   recorded against our local process, a `DOP_UNLINK_ID`/`DOP_DEMONITOR_P` removes it
 //!   again, and when that process dies the runtime routes `DOP_EXIT`/`DOP_MONITOR_P_EXIT`
 //!   back over the **same** link, with the reason term intact and the peer's own reference
-//!   echoed.
+//!   echoed. The recorded link is also **observable from our side**, in the linked process's
+//!   `process_info(Pid, links)` item — the union of its local links and the remote peers
+//!   ([`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`]).
+//! * **an accepted link can be *signalled* by the peer**: the peer's own `link/1` death, its
+//!   `erlang:monitor/2` of one of our processes and its `erlang:exit/2` all arrive as inbound
+//!   signals — `DOP_EXIT`, `DOP_MONITOR_P`, `DOP_EXIT2` — so the recorded relationship has to
+//!   be *applied* on our side (with the wire reason copied onto the recipient's heap, and the
+//!   untrappable/`kill` rule honoured) and never merely stored
+//!   ([`a_real_erl_peers_death_travels_inbound_and_our_trapping_process_traps_its_compound_reason`],
+//!   [`a_real_erl_peers_death_travels_inbound_and_kills_our_non_trapping_process_with_its_reason`],
+//!   [`a_real_erl_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason`],
+//!   [`a_real_erl_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill`]).
 //! * **`erlang:monitor_node(Node, true)`** answers `true` for a connected node and delivers
 //!   `{nodedown, Node}` to the monitoring process when the link dies, in **both**
 //!   directions.
-//! * the fixture's `receive … after T` keeps the run's scheduler pump stepping (a bare
+//! * **a lost peer node resolves every relationship with `noconnection`**: when a link is
+//!   retired because it *died*, the runtime records the node and the next scheduler pass
+//!   interns `noconnection` and fires OTP's node-down semantics against the process table —
+//!   `{'DOWN', Ref, process, PeerPid, noconnection}` for a monitor, `{'EXIT', PeerPid,
+//!   noconnection}` for a trapping link and termination with that reason for a non-trapping
+//!   one — while a node that is still reachable (`dist_link_names()`) is skipped, so a
+//!   re-connect is not a node down
+//!   ([`a_real_erl_peers_node_death_sends_our_monitor_a_down_with_noconnection`],
+//!   [`a_real_erl_peers_node_death_sends_our_trapping_link_an_exit_with_noconnection`],
+//!   [`a_real_erl_peers_node_death_kills_our_non_trapping_link_with_noconnection`],
+//!   [`reconnecting_to_a_real_erl_peer_is_not_a_node_down`]).//! * the fixture's `receive … after T` keeps the run's scheduler pump stepping (a bare
 //!   `receive` leaves the pump quiescent, which is why every wait in the fixture is
 //!   deadline-bounded: with an empty run queue, nothing to poll and no pending timer,
 //!   `Runtime::run_scheduled` stops with its honest `blocked` diagnostic).
@@ -167,10 +228,10 @@
 //!
 //! To run one of them: append `--exact <test-name>` after the `--`. `--nocapture` matters:
 //! every child's transcript is echoed on failure *and* on every loud skip. Each test is a
-//! two-VM session of a few seconds (the two negative controls spend 3 s in their own
+//! two-VM session of a few seconds (the negative controls spend 3 s in their own
 //! deliberately-expiring wait); `--test-threads=1` keeps a loaded host's timings honest.
-//! The whole eight-test file runs in ~18 s on an idle host.
-
+//! The whole twenty-four-test file runs in ~55-80 s on a shared host (≈2-3 s per two-VM
+//! session, because both VMs boot per case), and every case boots two real VMs.
 // The two-VM harness is compiled into every test target; this target only uses a subset of
 // it, so the unused helpers would otherwise warn here.
 #[allow(dead_code)]
@@ -207,6 +268,9 @@ const LINGER_SPEC: &str = "two_vm:linger/0";
 /// alive until the actor has finished observing.
 const PEER_DRIVES_SPEC: &str = "two_vm:peer_drives/1";
 
+/// The responder for the `links`-item case: the same victim protocol, but every barrier it
+/// answers is followed by a report of the victim's `process_info(Victim, links)` **shape**.
+const PEER_DRIVES_LINKS_SPEC: &str = "two_vm:peer_drives_links/1";
 /// The responder for the identity round trip.
 const IDENTITY_SPEC: &str = "two_vm:identity/1";
 
@@ -220,6 +284,28 @@ const RV_EXIT_KILL_SPEC: &str = "two_vm:rv_exit_kill/1";
 const RV_EXIT_NORMAL_SPEC: &str = "two_vm:rv_exit_normal/1";
 const RV_OUR_ALIAS_SPEC: &str = "two_vm:rv_our_alias/1";
 const RV_THEIR_ALIAS_SPEC: &str = "two_vm:rv_their_alias/1";
+
+/// The responders of the **inbound-signal** family (the peer arms the relationship and dies or
+/// exits on our process): an inbound link death with a boxed reason, the same with an atom reason
+/// against a non-trapping process, an inbound monitor whose `DOWN` comes back to us, and the
+/// inbound `DOP_EXIT2` matrix (`boom`/`kill` × trapping/non-trapping).
+const PEER_LINK_DEATH_SPEC: &str = "two_vm:peer_link_death/1";
+const PEER_LINK_DEATH_PLAIN_SPEC: &str = "two_vm:peer_link_death_plain/1";
+const PEER_MONITORS_SPEC: &str = "two_vm:peer_monitors/1";
+const PEER_EXIT2_SPEC: &str = "two_vm:peer_exit2/1";
+
+/// The responders of the **peer-node-loss** family (the peer's whole *node* goes away while a
+/// relationship with one of its processes stands): a monitor, a trapping link, a non-trapping
+/// link, and the re-connect negative control.
+const NODE_LOSS_MONITOR_SPEC: &str = "two_vm:node_loss_monitor/1";
+const NODE_LOSS_LINK_TRAPPED_SPEC: &str = "two_vm:node_loss_link_trapped/1";
+const NODE_LOSS_LINK_PLAIN_SPEC: &str = "two_vm:node_loss_link_plain/1";
+const NODE_LOSS_RECONNECT_SPEC: &str = "two_vm:node_loss_reconnect/1";
+
+/// The peers of the peer-node-loss family: the process the relationship is armed on and that
+/// then stops its node, and (for the negative control) one that stays alive and serves probes.
+const NODE_LOSS_TARGET_ACTOR: &str = "actor_node_loss_target";
+const NODE_LOSS_SURVIVOR_ACTOR: &str = "actor_node_loss_survivor";
 
 // ---------------------------------------------------------------------------------------
 // The peer's expressions
@@ -728,6 +814,84 @@ fn a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered() {
     pair.finish();
 }
 
+/// **A real `erl` peer's `link/1` shows up in our `process_info(Victim, links)` item, and
+/// its `unlink/1` clears it again.**
+///
+/// The observable the C runtime offers for an inbound `DOP_LINK` is the target process's
+/// `links` item: ERTS keeps every link — local process/port and remote process/port — in one
+/// link tree, so a peer-linked process names the peer's **external pid** there. This runtime
+/// holds the local half and the inbound remote half in two stores, so this is the case that
+/// proves the item is their union end to end (the hermetic unit test in
+/// `src/native/memory/tests.rs` only proves the rendering).
+///
+/// The actor `link/1`s the victim, takes a barrier round trip (same-link signals are applied
+/// in order, so the ack proves our node has already applied the `DOP_LINK`), then `unlink/1`s
+/// it and takes a second one. The victim is **never killed** — it answers a round-trip probe
+/// after the second barrier (`VICTIM_ALIVE`) — so the only thing that differs between the two
+/// reports is the peer's own link, and an emptied item cannot be explained by a dead process.
+///
+/// Every report is the item's **shape**, `length/1` plus one `is_pid/1` per element: an
+/// external pid has no printable text in this runtime (`beam_bifs`'s `external_channel_gap`,
+/// the typed capability gap) and its channel is a per-VM node-table index, so the pids
+/// themselves are unprintable on both sides. The whole claim is `LINKS_LINKED 1 [true]` →
+/// `LINKS_UNLINKED 0 []`, from the empty baseline `LINKS_FRESH 0 []` taken before the peer
+/// did anything.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "links_item",
+        PEER_DRIVES_LINKS_SPEC,
+        "link_and_unlink",
+    ) else {
+        return;
+    };
+    // The pid whose item is reported: one of ours, so it renders as `<0.number.serial>`
+    // (a *local* pid — the peer is the one that sees it as remote).
+    let victim = pair.runtime_text("VICTIM ");
+    assert!(
+        victim.starts_with("<0."),
+        "the victim must be a local pid of ours, printed as `<0.number.serial>`, not `{victim}`\n{}",
+        pair.diagnostics()
+    );
+    // Before the peer acts: a freshly spawned child has no links at all.
+    pair.runtime_equals("LINKS_FRESH ", "LINKS_FRESH 0 []");
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The peer holds a pid term (it prints no text for it, so the behaviour stays runnable on
+    // either peer kind).
+    pair.actor_equals("LINK_VICTIM_IS_PID ", "LINK_VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // The peer's `link/1` arrived: exactly one entry, and it is a pid.
+    pair.runtime_equals("LINKS_LINKED ", "LINKS_LINKED 1 [true]");
+
+    pair.actor_equals("UNLINKED", "UNLINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // … and its `unlink/1` cleared it again, with the victim still running.
+    pair.runtime_equals("LINKS_UNLINKED ", "LINKS_UNLINKED 0 []");
+    pair.actor_equals("VICTIM_ALIVE", "VICTIM_ALIVE");
+
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW links_reported");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    // Every report read a real `{links, …}` item (a missing one prints `… NOITEM …`), and the
+    // session took exactly the two barrier round trips the protocol defines.
+    pair.assert_no_substring(
+        &pair.runtime,
+        "NOITEM",
+        "every `links` report was taken from a real `process_info/2` reply",
+    );
+    pair.assert_absent(
+        &pair.runtime,
+        &["LINKS_LATER", "PARENT_TIMEOUT"],
+        "the session took exactly the two barrier round trips the protocol defines",
+    );
+    pair.finish();
+}
+
 /// **The peer monitors our process and receives the peer-minted `DOWN`.**
 ///
 /// The actor arms `erlang:monitor(process, Victim)`, prints the reference it minted, then
@@ -1166,4 +1330,401 @@ fn we_send_to_a_real_erl_peers_alias_and_it_lands_in_the_peers_mailbox() {
     pair.actor_equals("BYE ", "BYE done");
     pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
     pair.finish();
+}
+
+// ---------------------------------------------------------------------------------------
+// The inbound signal families, observed by us (contract A.5)
+// ---------------------------------------------------------------------------------------
+
+/// **The peer links to our process and dies of a boxed reason; our trapping process must trap
+/// that very term.**
+///
+/// The mirror image of [`a_real_erl_peer_links_to_our_process_and_traps_our_exit`]: here the
+/// peer arms the link (`link/1` on a pid *we* host) and the peer's process dies, so the
+/// `DOP_EXIT` arrives **inbound** and our node has to record the link, remove it, notify the
+/// trapping target and copy the wire reason onto the recipient's heap. The reason is
+/// `{boom,[1,2,3]}` — a compound term, so a mismatched copy shows up as a different line rather
+/// than a shape that still looks plausible.
+///
+/// Two identities are asserted besides the term: `EXIT_PID` compares the trapped message's
+/// sender pid with the pid the peer reported separately (one external pid, two arrivals, one
+/// term), and the peer's own `LINKER_DOWN` proves its arm really died of the reason it chose —
+/// so `EXIT_REASON` cannot be satisfied by a link that never went down.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_death_travels_inbound_and_our_trapping_process_traps_its_compound_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_link_boxed",
+        PEER_LINK_DEATH_SPEC,
+        "actor_link_death_boxed",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("LINKER_IS_PID ", "LINKER_IS_PID true");
+    pair.runtime_equals("EXIT_PID ", "EXIT_PID true");
+    // The reason term itself, out of our own mailbox.
+    pair.runtime_equals("EXIT_REASON ", "EXIT_REASON {boom,[1,2,3]}");
+    pair.assert_absent(
+        &pair.runtime,
+        &["EXIT_TIMEOUT", "EXIT_OTHER_PID"],
+        "the inbound link death was trapped by its own victim",
+    );
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("LINKER_DOWN ", "LINKER_DOWN {boom,[1,2,3]}");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// **The same inbound link death against a NON-trapping process: it dies of the peer's own
+/// reason.** The victim must terminate with `boom` — never `noproc` (a link the receiving node
+/// never recorded, which is what an unordered or dropped `DOP_LINK` would produce) and never
+/// `killed` (the untrappable-`exit/2` reason, which a link exit does not use, not even for the
+/// reason `kill`).
+///
+/// The exit reason is read back through the responder's own local monitor of the victim, so the
+/// claim is our side's observation of our own process, not the peer's.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_death_travels_inbound_and_kills_our_non_trapping_process_with_its_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_link_atom",
+        PEER_LINK_DEATH_PLAIN_SPEC,
+        "actor_link_death_atom",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("LINKER_IS_PID ", "LINKER_IS_PID true");
+    pair.runtime_equals("DOWN_PID ", "DOWN_PID true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON boom");
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_TIMEOUT", "DOWN_OTHER", "EXIT_TIMEOUT"],
+        "the inbound link death terminated the victim with the peer's reason",
+    );
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("LINKER_DOWN ", "LINKER_DOWN boom");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// **The peer monitors our process and its `{'DOWN', …}` carries the boxed reason back over the
+/// wire** — and the whole tuple is asserted on **our** side, because the peer forwards it to us
+/// instead of only printing it.
+///
+/// `MONITORED_BY 1 [true]` is what makes the case non-vacuous in the other direction: our node
+/// really recorded the peer's `DOP_MONITOR_P` against the victim (the item is reported as a
+/// shape — its length plus one `is_pid/1` per element — because the watcher is an external pid
+/// this runtime cannot render). Then every slot of the forwarded tuple: size, head, that the
+/// reference is a reference (the peer minted it, so it can be compared with nothing we hold),
+/// the object `=:=` our own pid after its round trip through the peer, and the reason term.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_monitor_of_our_process_gets_a_down_carrying_the_boxed_reason() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_monitor",
+        PEER_MONITORS_SPEC,
+        "actor_monitor_down",
+    ) else {
+        return;
+    };
+    pair.runtime_equals("MONITORED_BY ", "MONITORED_BY 1 [true]");
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_HEAD ", "DOWN_HEAD true");
+    pair.runtime_equals("DOWN_REF ", "DOWN_REF true");
+    pair.runtime_equals("DOWN_KIND ", "DOWN_KIND true");
+    pair.runtime_equals("DOWN_OBJ ", "DOWN_OBJ true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON {boom,[1,2,3]}");
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("VICTIM_IS_PID ", "VICTIM_IS_PID true");
+    pair.actor_equals("MONITORING ", "MONITORING true");
+    // The peer's own view of the reason it received (its observation, not the assertion).
+    pair.actor_equals("PEER_DOWN_REASON ", "PEER_DOWN_REASON {boom,[1,2,3]}");
+    pair.assert_absent(
+        &pair.runtime,
+        &["SAW_DOWN_TIMEOUT", "NOMONITOR"],
+        "the peer's monitor fired and its DOWN reached us",
+    );
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+/// **The inbound `DOP_EXIT2` matrix**: the peer runs `erlang:exit(OurPid, Reason)` against four
+/// of our processes — `boom` and `kill`, each against a trapping and a non-trapping one.
+///
+/// All four rows are asserted, because the pair of rules they pin is easy to get half right:
+///
+/// | receiver | `boom` | `kill` |
+/// |---|---|---|
+/// | non-trapping (`plain_*`) | dies of `boom` | dies of `killed` |
+/// | trapping (`trap_*`) | traps `{'EXIT', PeerPid, boom}` and stays alive | dies of `killed` |
+///
+/// So `kill` is untrappable in **both** directions and `boom` is *trapped* by the trapping
+/// receiver and passed through unchanged to the non-trapping one. `from_peer=true` is the trapped
+/// message's sender compared with the peer's own pid; `TRAP_BOOM_ALIVE` is a round-trip probe of
+/// the survivor, so "trapped" means the process lived on rather than merely that a message
+/// arrived; and the peer's own `EXIT2 …` lines are the four `exit/2` answers.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_exit_calls_travel_inbound_and_split_the_matrix_by_trapping_and_kill() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "inbound_exit2",
+        PEER_EXIT2_SPEC,
+        "actor_exit2_matrix",
+    ) else {
+        return;
+    };
+    pair.runtime_equals(
+        "MONITORS_ARE_REFS ",
+        "MONITORS_ARE_REFS [true,true,true,true]",
+    );
+    pair.runtime_equals("EXIT2 plain_boom ", "EXIT2 plain_boom down boom");
+    pair.runtime_equals("EXIT2 plain_kill ", "EXIT2 plain_kill down killed");
+    pair.runtime_equals(
+        "EXIT2 trap_boom ",
+        "EXIT2 trap_boom trapped boom from_peer=true",
+    );
+    pair.runtime_equals("EXIT2 trap_kill ", "EXIT2 trap_kill down killed");
+    pair.runtime_equals("TRAP_BOOM_ALIVE ", "TRAP_BOOM_ALIVE true");
+    pair.assert_absent(
+        &pair.runtime,
+        &[
+            "EXIT2_TIMEOUT",
+            "EXIT2 trap_boom missing",
+            "EXIT2 trap_kill missing",
+        ],
+        "all four inbound exit signals were applied to their own target",
+    );
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals(
+        "VICTIMS_ARE_PIDS ",
+        "VICTIMS_ARE_PIDS [true,true,true,true]",
+    );
+    // The four `erlang:exit/2` answers, all `true` for a live remote pid.
+    pair.actor_equals("EXIT2 plain_boom ", "EXIT2 plain_boom true");
+    pair.actor_equals("EXIT2 plain_kill ", "EXIT2 plain_kill true");
+    pair.actor_equals("EXIT2 trap_boom ", "EXIT2 trap_boom true");
+    pair.actor_equals("EXIT2 trap_kill ", "EXIT2 trap_kill true");
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW seen");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    pair.finish();
+}
+
+// ---------------------------------------------------------------------------------------
+// The peer-**node**-loss family (contract A.5): the peer's whole node goes away
+// ---------------------------------------------------------------------------------------
+
+/// Closes a **peer-node-loss** session: the `run` action printed its `done` result, both VMs
+/// are gone and both exited 0.
+///
+/// This is [`Pair::finish`] minus the handshake, and the difference is the family: `finish`
+/// waits for the peer's `ACTOR_DONE` and its `{bye, …}` round trip, but here the peer's whole
+/// **node** is what ended (three cases) or was told to stop (the re-connect control), so it
+/// reports nothing after its last line and the responder is the only side left to observe the
+/// loss. What still has to hold — and is asserted here — is that the peer really terminated by
+/// itself (an `init:stop/0` shutdown, exit 0) rather than being reaped by the harness, and that
+/// the responder finished normally.
+fn close_node_loss_session(mut pair: Pair) {
+    let runtime_result = pair
+        .runtime
+        .wait_for(|line| line.trim() == "done", LINE_TIMEOUT);
+    let runtime_status = pair.runtime.wait_exit(EXIT_TIMEOUT);
+    let peer_status = pair.actor.wait_exit(EXIT_TIMEOUT);
+    let diagnostics = pair.diagnostics();
+    assert!(
+        runtime_result.is_some(),
+        "the `run` action printed no `done` result\n{diagnostics}"
+    );
+    assert_eq!(
+        runtime_status.and_then(|status| status.code()),
+        Some(0),
+        "the `run` action exits 0 once the fixture returns\n{diagnostics}"
+    );
+    assert_eq!(
+        peer_status.and_then(|status| status.code()),
+        Some(0),
+        "the peer shut its own node down cleanly (exit 0), so the harness has nothing to \
+         reap\n{diagnostics}"
+    );
+}
+
+/// **A real `erl` peer's node death delivers `{'DOWN', Ref, process, PeerPid, noconnection}`
+/// to our monitor.**
+///
+/// Our responder monitors a process *on the peer*; the peer confirms on **its own** side that
+/// the inbound `DOP_MONITOR_P` really was recorded (`PEER_ARM_SEEN true`) and only then stops
+/// its node (`init:stop()`). ERTS resolves every relationship it holds with a node it lost
+/// with the reason `noconnection` (`beam_rt`'s `Runtime::service_lost_dist_peers` →
+/// `ProcessTable::node_down`), so the monitor's message is that 5-tuple — and the receive
+/// clause binds the **very** reference `erlang:monitor/2` returned *and* requires the tag
+/// `process`, so a different reference or another `'DOWN'` shape cannot pass.
+///
+/// The loss is only observable once our runtime's scheduler pass drains it, so the test waits
+/// on the printed line rather than on a sleep; a `beam_rt` node cannot render a remote pid, so
+/// the watched pid and the reference are asserted by identity (`DOWN_PID`/`DOWN_REF`) and
+/// never as text.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_node_death_sends_our_monitor_a_down_with_noconnection() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "node_loss_monitor",
+        NODE_LOSS_MONITOR_SPEC,
+        NODE_LOSS_TARGET_ACTOR,
+    ) else {
+        return; // every precondition already reported its loud skip
+    };
+    // The peer's own evidence: it ponged, it saw the monitor applied (`monitored_by`), and it
+    // is going to stop its node.
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("PEER_ARMED ", "PEER_ARMED monitor");
+    pair.actor_equals("PEER_ARM_SEEN ", "PEER_ARM_SEEN true");
+    pair.actor_equals("STOPPING", "STOPPING");
+    // Our side: a real reference from `monitor/2`, and a `{'DOWN', …}` that the fixture's
+    // clause matched against that reference and the `process` tag.
+    pair.runtime_equals("MONITOR_IS_REF ", "MONITOR_IS_REF true");
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_HEAD ", "DOWN_HEAD true");
+    pair.runtime_equals("DOWN_REF ", "DOWN_REF true");
+    pair.runtime_equals("DOWN_KIND ", "DOWN_KIND process");
+    pair.runtime_equals("DOWN_PID ", "DOWN_PID true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON noconnection");
+    pair.assert_absent(
+        &pair.runtime,
+        &["DOWN_OTHER", "DOWN_TIMEOUT"],
+        "the DOWN matched the monitor's own reference, the `process` tag and the watched pid",
+    );
+    close_node_loss_session(pair);
+}
+
+/// **A trapping link to a peer process receives `{'EXIT', PeerPid, noconnection}` when the
+/// peer's node goes away.**
+///
+/// The same session as the monitor case over a `link/1`: our process traps exits, so the node
+/// loss must arrive as the message `{'EXIT', PeerPid, noconnection}` — the reason *atom*
+/// `noconnection` (not `noproc`, not `killed`), with the sender pid identical to the one the
+/// greeting carried — and the process must stay alive to report it.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_node_death_sends_our_trapping_link_an_exit_with_noconnection() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "node_loss_link_trapped",
+        NODE_LOSS_LINK_TRAPPED_SPEC,
+        NODE_LOSS_TARGET_ACTOR,
+    ) else {
+        return;
+    };
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("PEER_ARMED ", "PEER_ARMED link");
+    pair.actor_equals("PEER_ARM_SEEN ", "PEER_ARM_SEEN true");
+    pair.actor_equals("STOPPING", "STOPPING");
+    pair.runtime_equals("EXIT_SIZE ", "EXIT_SIZE 3");
+    pair.runtime_equals("EXIT_PID ", "EXIT_PID true");
+    pair.runtime_equals("EXIT_REASON ", "EXIT_REASON noconnection");
+    pair.assert_absent(
+        &pair.runtime,
+        &["EXIT_TIMEOUT"],
+        "the trapping process trapped the node loss as an `{'EXIT', _, noconnection}`",
+    );
+    close_node_loss_session(pair);
+}
+
+/// **A non-trapping link to a peer process dies of `noconnection` when the peer's node goes
+/// away.**
+///
+/// The complementary rule to the trapped case: the same loss against a link holder that does
+/// **not** trap exits terminates it, and the reason it dies of is `noconnection` — never
+/// `noproc` (a relationship the node never recorded) and never `killed` (the untrappable
+/// `exit/2` reason). The victim is a spawned child (the responder itself must outlive it to
+/// report) and its death is read back through the responder's own local monitor, so the claim
+/// is our own observation of our own process.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_node_death_kills_our_non_trapping_link_with_noconnection() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "node_loss_link_plain",
+        NODE_LOSS_LINK_PLAIN_SPEC,
+        NODE_LOSS_TARGET_ACTOR,
+    ) else {
+        return;
+    };
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("PEER_ARMED ", "PEER_ARMED link");
+    pair.actor_equals("PEER_ARM_SEEN ", "PEER_ARM_SEEN true");
+    pair.actor_equals("STOPPING", "STOPPING");
+    pair.runtime_equals("DOWN_SIZE ", "DOWN_SIZE 5");
+    pair.runtime_equals("DOWN_KIND ", "DOWN_KIND process");
+    pair.runtime_equals("DOWN_PID ", "DOWN_PID true");
+    pair.runtime_equals("DOWN_REASON ", "DOWN_REASON noconnection");
+    pair.assert_absent(
+        &pair.runtime,
+        &["NO_LINK_ARMED", "DOWN_TIMEOUT"],
+        "our own monitor read the link holder's death back as `noconnection`",
+    );
+    close_node_loss_session(pair);
+}
+
+/// **A re-connect to a peer is not a node down** — the negative control for the three cases
+/// above.
+///
+/// Both relationships (a `link/1` and a `monitor/2`) are armed on a peer process that stays
+/// alive, our runtime then dials the node it is already connected to (`net_adm:ping/1` — the
+/// replacement link), and a 3 s window long enough for a node-down receipt to land inside it
+/// follows: nothing may arrive. "Nothing arrived" is then shown to be a *live* peer rather
+/// than a dead test — the link is still in our `links` item, `demonitor/2` still finds the
+/// monitor (`true` only for a monitor that is still recorded), and the peer answers a round
+/// trip. Any receipt prints `UNEXPECTED_EXIT`/`UNEXPECTED_DOWN`, which the negative assertion
+/// turns into a failure.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn reconnecting_to_a_real_erl_peer_is_not_a_node_down() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "node_loss_reconnect",
+        NODE_LOSS_RECONNECT_SPEC,
+        NODE_LOSS_SURVIVOR_ACTOR,
+    ) else {
+        return;
+    };
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    pair.actor_equals("PEER_ARMED ", "PEER_ARMED both");
+    pair.actor_equals("PEER_ARM_SEEN ", "PEER_ARM_SEEN true");
+    pair.actor_equals("PEER_SERVING", "PEER_SERVING");
+    // The re-connect answered, and the window it opened stayed empty.
+    pair.runtime_equals("REDIAL ", "REDIAL pong");
+    pair.runtime_equals("WINDOW ", "WINDOW clear");
+    // The positive half: both relationships survive the re-connect and the peer is alive.
+    pair.runtime_equals("STILL_LINKED ", "STILL_LINKED true");
+    pair.runtime_equals("STILL_MONITORED ", "STILL_MONITORED true");
+    pair.runtime_equals("ALIVE ", "ALIVE true");
+    pair.assert_absent(
+        &pair.runtime,
+        &["UNEXPECTED_EXIT", "UNEXPECTED_DOWN", "NO_PEER_ARM"],
+        "the peer's link was replaced, not lost, so no noconnection receipt may appear",
+    );
+    close_node_loss_session(pair);
 }

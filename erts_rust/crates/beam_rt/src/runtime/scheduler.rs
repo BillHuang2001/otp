@@ -1225,6 +1225,26 @@ impl Runtime {
                     continue;
                 }
             }
+            // The **peer-loss half** of contract A.5: a link either half retired because the
+            // peer died was recorded (`DistNode`'s/`DistClient`'s pump and decoder — they run
+            // inside a pump and hold no process table), and this is where OTP's `noconnection`
+            // semantics are applied to the table: a remote monitor's
+            // `{'DOWN', Ref, process, Peer, noconnection}`, a remote link's
+            // `{'EXIT', Peer, noconnection}` (trapping) or termination (non-trapping). It sits
+            // **after both inbound drains** so a link that died in this very round has already
+            // recorded its loss, and **before the timer half** so the messages it queues go out
+            // in this round. A peer still named by any link of either half (a re-connect, an
+            // accepted replacement) is not lost, so a `node_down` never fires for it. `Ok(0)`
+            // with no allocation when nothing was lost — every non-distributed run.
+            match self.service_lost_dist_peers(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
             // The timer half: deliver every `erlang:send_after/3` message whose deadline has
             // passed (which may wake a blocked receiver, exactly like a port message) and
             // resume every process whose finite `receive … after T` deadline fired.

@@ -55,6 +55,14 @@ pub struct DistConnection {
     /// never binds is simply not matched by the accepted half's lookup (see
     /// [`crate::dist::links`]).
     node: Option<Eterm>,
+    /// Whether this link **ever** completed its `'N'` handshake.
+    ///
+    /// A latch, not a state: [`beam_dist::driver::DriverState`] leaves `Established` *before*
+    /// the retirement site asks (a peer's EOF moves it to `Closed`, a protocol error to
+    /// `Failed`), so a retirement that asked the live state would call every dead link
+    /// "never handshook" — and a peer loss would never be recorded. See
+    /// [`DistConnection::was_established`].
+    was_established: bool,
     /// Bytes read from the peer so far.
     bytes_in: u64,
     /// Bytes written to the peer so far.
@@ -76,6 +84,7 @@ impl DistConnection {
             stream,
             peer_addr,
             node: None,
+            was_established: false,
             bytes_in: 0,
             bytes_out: 0,
         })
@@ -100,6 +109,7 @@ impl DistConnection {
             stream,
             peer_addr,
             node: None,
+            was_established: false,
             bytes_in: 0,
             bytes_out: 0,
         }
@@ -113,6 +123,19 @@ impl DistConnection {
     /// Whether the handshake has completed (the link is usable).
     pub fn is_established(&self) -> bool {
         matches!(self.driver.state(), DriverState::Established)
+    }
+
+    /// Whether the handshake **ever** completed — the question a retirement must ask.
+    ///
+    /// [`DistConnection::is_established`] is the *live* state, and by the time a link is
+    /// retired it is always gone: the pump that discovered the death is what moved the driver
+    /// out of `Established` (`Closed` on the peer's EOF, `Failed` on a protocol error). A
+    /// retirement that asked the live state would therefore classify **every** dead link as
+    /// one that never handshook, record no peer loss, and silently drop OTP's `noconnection`
+    /// semantics — while a link that really never handshook stays `false` here, which is the
+    /// distinction the recorder needs.
+    pub fn was_established(&self) -> bool {
+        self.was_established
     }
 
     /// Whether the link can still make progress (handshaking or established).
@@ -323,6 +346,16 @@ impl DistConnection {
         // A step that reports an error may still have framed a refusal into the
         // output buffer, so the outcome is held rather than propagated with `?`.
         let stepped = self.driver.step();
+        // The establishment latch is set **here**, before the driver can leave `Established`
+        // again: the retirement sites read it (see [`DistConnection::was_established`]). One
+        // `step` can establish *and* consume the whole inbound buffer, so an outcome that
+        // reports the establishment (`Established`) or progress on an established link
+        // (`Progress`) counts even when a same-call EOF already moved the state on.
+        self.was_established |= self.is_established()
+            || matches!(
+                stepped.as_ref(),
+                Ok(beam_dist::StepOutcome::Established | beam_dist::StepOutcome::Progress)
+            );
         if let Ok(outcome) = &stepped {
             match outcome {
                 beam_dist::StepOutcome::Progress

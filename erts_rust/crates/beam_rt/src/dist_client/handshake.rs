@@ -52,6 +52,9 @@ pub(crate) struct ClientLink {
     pub(super) driver: ConnectionDriver,
     /// The socket the driver's bytes travel over.
     pub(super) stream: TcpStream,
+    /// Whether this link **ever** completed its `'N'` handshake — the latch
+    /// [`ClientLink::was_established`] reads, set by [`ClientLink::pump`].
+    pub(super) was_established: bool,
     /// Bytes read from the peer so far.
     pub(super) bytes_in: u64,
     /// Bytes written to the peer so far.
@@ -62,6 +65,18 @@ impl ClientLink {
     /// Whether the handshake completed and the link carries `DOP_*`.
     pub(crate) fn is_established(&self) -> bool {
         matches!(self.driver.state(), DriverState::Established)
+    }
+
+    /// Whether the handshake **ever** completed — the question a retirement must ask.
+    ///
+    /// [`ClientLink::is_established`] is the *live* state, and the pump that discovers a dead
+    /// link is what moves the driver out of `Established` (`Closed` on the peer's EOF,
+    /// `Failed` on a protocol error) — so asking it at retirement time would call every lost
+    /// peer "never handshook" and record no node down at all
+    /// ([`crate::Runtime::service_lost_dist_peers`]). A link that really never handshook
+    /// stays `false`, which is the distinction the recorder needs.
+    pub(crate) fn was_established(&self) -> bool {
+        self.was_established
     }
 
     /// The **peer's** validated capability flags, once the handshake completed
@@ -160,7 +175,12 @@ impl ClientLink {
                     events += 1;
                     break;
                 }
-                Ok(_) => events += 1,
+                Ok(outcome) => {
+                    if matches!(outcome, StepOutcome::Established | StepOutcome::Progress) {
+                        self.was_established = true;
+                    }
+                    events += 1;
+                }
                 Err(err) => {
                     // A refusing/misbehaving peer may have buffered a status frame
                     // before the failure — drain it (the driver's contract) and then
@@ -170,6 +190,10 @@ impl ClientLink {
                 }
             }
         }
+        // The establishment latch, read again after the loop: a link that established in an
+        // earlier step and dies now (a peer's EOF, a protocol error) stays `true`, which is
+        // what the retirement site asks. See [`ClientLink::was_established`].
+        self.was_established |= self.is_established();
         self.flush_output()?;
         Ok(events)
     }

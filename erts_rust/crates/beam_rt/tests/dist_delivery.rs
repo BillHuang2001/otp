@@ -888,15 +888,20 @@ fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
         "retire the link that carried a DOP_LINK from a third node",
         |rt| rt.dist_node().expect("a configured node").is_idle(),
     );
-    assert_eq!(
-        mailbox_len(&rt, pid),
-        1,
-        "nothing queued behind the spoofed control message may be delivered"
+    // The retired link had **established**, so its death is a node down: every relationship
+    // with the peer's node is resolved with `noconnection` on the next scheduler pass
+    // (`Runtime::service_lost_dist_peers`). The link's partner — the pid this test addressed
+    // — does not trap exits, so that `{'EXIT', PeerPid, noconnection}` terminates it, and
+    // the message queued behind the forged control is never delivered.
+    assert!(
+        !rt.processes().contains(pid),
+        "the established link's retirement is a node down, so the non-trapping link partner \
+         is terminated with `noconnection`"
     );
     assert_eq!(
-        only_message(&rt, pid),
-        Some(accepted),
-        "the mailbox still holds only the message the accepted link delivered"
+        mailbox_len(&rt, pid),
+        0,
+        "nothing queued behind the spoofed control message may be delivered"
     );
     let error = rt
         .dist_node()
