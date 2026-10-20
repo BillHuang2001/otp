@@ -15,7 +15,7 @@ Two *manual*, **test-only** developer tools. `scripts/` is not in `lib/compiler/
 - **No host-OTP version gate.** The script only checks that `erlc` exists (`host_env.sh:51,65`), prints `erlc -version` (`:70`) and derives `COMPILER_VSN` from `lib/compiler/vsn.mk` (`:86-88`) — it never compares host versions, and `lib/compiler/test/run_stage2_suites.sh` does not either. The OTP-29-class host assumed by the docstrings (`host_env.sh:26-29`, `host_env_xform.py:24-25`) is a convention, not a check.
 - `shell [Args...]` — `exec erl -pa $RIG_EBIN Args...`, i.e. the rig compiler first on the code path (`code:which(compile)` then reports `$RIG_EBIN/compile.beam`, version from `vsn.mk`).
 - `cleandir` — `rm -rf $HOST_ENV_DIR`.
-- Requires: host `erlc`, `perl`, `python3`, `sha1sum`. Never modifies repository sources.
+- Requires: host `erlc` (`host_env.sh:51,65`), `erl` (the step-4 self-check, `:100` — not pre-checked), `perl` (`:67`, for `beam_makeops`), `python3` (`:66`), `sha1sum` (`:55`, only when `HOST_ENV_DIR` is unset — under `set -e` a missing `sha1sum` aborts the script). No erlc version constraint (see the no-version-gate bullet above). Never modifies repository sources. Only the *sources* are needed: `lib/compiler/src/{*.erl,*.hrl,genop.tab,core_parse.yrl}`, `erts/emulator/utils/beam_makeops` (a perl script), `lib/stdlib/include`, `lib/compiler/vsn.mk` — no `configure`/`make`, no in-tree emulator, no built kernel/stdlib.
 
 ### `host_env_xform.py SRC_DIR OUT_DIR` — the source transform
 Rewrites a scratch copy of `lib/compiler/src` (`*.erl` + `*.hrl`) so the *older host erlc* can compile it. Four rewrites; anything it does not recognize makes it **exit non-zero with a message** rather than emit a silently wrong tree:
