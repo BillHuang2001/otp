@@ -45,7 +45,8 @@ use beam_common::{BeamError, Result};
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::flags::{
     AltactSigFlags, DistSpawnFlags, Dop, DIST_SPAWN_FLAG_LINK, DIST_SPAWN_FLAG_MONITOR,
-    DOP_ALTACT_SIG_FLG_NAME, DOP_ALTACT_SIG_FLG_PRIO, DOP_ALTACT_SIG_FLG_TOKEN,
+    DOP_ALTACT_SIG_FLG_ALIAS, DOP_ALTACT_SIG_FLG_NAME, DOP_ALTACT_SIG_FLG_PRIO,
+    DOP_ALTACT_SIG_FLG_TOKEN,
 };
 use beam_dist::{
     ControlMessage, Delivery, DeliveryOutcome, Dispatched, InboundSink, LinkIdentity,
@@ -794,7 +795,8 @@ fn spawn_request_still_rejects_an_internal_reference() {
     let function = make_atom(atoms.intern("send"));
     let mfa = heap.tuple(&[module, function, make_small(2)]).expect("the MFA tuple");
     let opts = make_small(0);
-    let args = make_small(0);    let message = ControlMessage {
+    let args = make_small(0);
+    let message = ControlMessage {
         dop: Dop::SpawnRequest,
         terms: vec![reference, from, group_leader, mfa, opts, args],
     };
@@ -803,4 +805,191 @@ fn spawn_request_still_rejects_an_internal_reference() {
         matches!(Delivery::classify_validated(&message, &link), Err(BeamError::BadArg)),
         "a spawn request must carry an external reference (`dist.c:2936-2937`)",
     );
+}
+
+// ---------------------------------------------------------------------------
+// (k) The generic reference guard spans internal **and** external references.
+//
+// The C's `is_not_ref` (`erl_term.h`'s `is_ref`) admits either form, so every
+// `is_not_ref` arm accepts a **local** reference:
+// `DOP_ALIAS_SEND.to` (`dist.c:2584`), `DOP_ALTACT_SIG_SEND.to` with `ALIAS` set
+// (`dist.c:2663`), `DOP_MONITOR_P.reference` (`dist.c:2361`),
+// `DOP_DEMONITOR_P.reference` (`dist.c:2427`) and
+// `DOP_[PAYLOAD_]MONITOR_P_EXIT.reference` (`dist.c:2723`).
+//
+// A wire image can only carry an **external** reference, so — exactly like the
+// `DOP_SPAWN_REPLY` section above — these control messages are built from **heap
+// terms**: the internal form is what an identity-installed decode produces for a
+// wire reference naming this node, and these tests pin the validator's answer to
+// it. Each case is otherwise well-formed, so the reference form is the only thing
+// that could fail.
+// ---------------------------------------------------------------------------
+
+/// An on-heap reference of **this** node, asserted to be *only* the internal form.
+fn local_ref(heap: &mut Heap, id: u64) -> Eterm {
+    let reference = make_internal_ref(heap, id).expect("an internal reference");
+    assert!(internal_ref_id(reference).is_ok(), "the term is an internal reference");
+    assert!(external_ref_parts(reference).is_err(), "…and not an external one");
+    reference
+}
+
+#[test]
+fn alias_sends_accept_an_internal_reference() {
+    let mut heap = Heap::new(1 << 16).expect("heap");
+    let mut atoms = AtomTable::new();
+    let link = link_identity(&mut atoms);
+
+    let from = peer_pid(&mut heap, &mut atoms);
+    let to = local_ref(&mut heap, 7);
+    let payload = make_small(1);
+
+    // `{DOP_ALIAS_SEND, From, To} -- Message`: `is_not_ref(to)` (`dist.c:2584`).
+    let message = ControlMessage { dop: Dop::AliasSend, terms: vec![from, to, payload] };
+    assert_eq!(
+        Delivery::classify_validated(&message, &link)
+            .expect("the C accepts an internal alias reference (`dist.c:2584`)"),
+        Delivery::AliasSend { from, to, message: payload, token: None },
+        "the internal reference itself is carried, never substituted",
+    );
+
+    // `{DOP_ALTACT_SIG_SEND, Flags, SenderPid, To} -- Signal` with `ALIAS` set:
+    // `is_not_ref(to) || (flags & …_FLG_NAME)` (`dist.c:2663`).
+    let flags = make_small(i64::from(DOP_ALTACT_SIG_FLG_ALIAS));
+    let message =
+        ControlMessage { dop: Dop::AltactSigSend, terms: vec![flags, from, to, payload] };
+    assert_eq!(
+        Delivery::classify_validated(&message, &link)
+            .expect("the C accepts an internal alias reference (`dist.c:2663`)"),
+        Delivery::AltactSigSend {
+            flags: AltactSigFlags::ALIAS,
+            from,
+            to,
+            token: None,
+            message: payload,
+        },
+        "the internal reference itself is carried, never substituted",
+    );
+}
+
+#[test]
+fn the_monitor_family_accepts_an_internal_reference() {
+    let mut heap = Heap::new(1 << 16).expect("heap");
+    let mut atoms = AtomTable::new();
+    let link = link_identity(&mut atoms);
+
+    let reference = local_ref(&mut heap, 11);
+    let watched = make_internal_pid(make_pid_data(0, 9));
+    let remote = peer_pid(&mut heap, &mut atoms);
+    let reason = make_small(3);
+
+    // Every case is well-formed apart from the reference form under test: `remote`
+    // is a pid of the peer node (a valid watcher / watched), `watched` a local pid
+    // and `reason` any term.
+    let cases = [
+        (
+            ControlMessage { dop: Dop::MonitorP, terms: vec![remote, watched, reference] },
+            Delivery::Monitor { watcher: remote, watched, reference },
+            "DOP_MONITOR_P (`dist.c:2361`)",
+        ),
+        (
+            ControlMessage { dop: Dop::DemonitorP, terms: vec![remote, watched, reference] },
+            Delivery::Demonitor { watcher: remote, watched, reference },
+            "DOP_DEMONITOR_P (`dist.c:2427`)",
+        ),
+        (
+            ControlMessage {
+                dop: Dop::MonitorPExit,
+                terms: vec![remote, watched, reference, reason],
+            },
+            Delivery::MonitorExit { watched: remote, watcher: watched, reference, reason },
+            "DOP_MONITOR_P_EXIT (`dist.c:2723`)",
+        ),
+        (
+            ControlMessage {
+                dop: Dop::PayloadMonitorPExit,
+                terms: vec![remote, watched, reference, reason],
+            },
+            Delivery::PayloadMonitorExit {
+                watched: remote,
+                watcher: watched,
+                reference,
+                payload: reason,
+            },
+            "DOP_PAYLOAD_MONITOR_P_EXIT (`dist.c:2723`)",
+        ),
+    ];
+
+    for (message, expected, what) in cases {
+        assert_eq!(
+            Delivery::classify_validated(&message, &link)
+                .unwrap_or_else(|err| panic!("{what}: an internal reference is accepted: {err:?}")),
+            expected,
+            "{what}: the internal reference itself is carried, never substituted",
+        );
+    }
+}
+
+/// The arms the C keeps **strict** stay strict.
+#[test]
+fn the_strict_reference_arms_still_reject() {
+    let mut heap = Heap::new(1 << 16).expect("heap");
+    let mut atoms = AtomTable::new();
+    let link = link_identity(&mut atoms);
+
+    let from = peer_pid(&mut heap, &mut atoms);
+    let reference = local_ref(&mut heap, 7);
+    let payload = make_small(1);
+
+    // `ALIAS | NAME` is a contradiction the C rejects outright, even for a perfectly
+    // valid internal reference (`is_not_ref(to) || (flags & …_FLG_NAME)`,
+    // `dist.c:2663`).
+    let flags = make_small(i64::from(DOP_ALTACT_SIG_FLG_ALIAS | DOP_ALTACT_SIG_FLG_NAME));
+    let contradictory =
+        ControlMessage { dop: Dop::AltactSigSend, terms: vec![flags, from, reference, payload] };
+    assert!(
+        matches!(Delivery::classify_validated(&contradictory, &link), Err(BeamError::BadArg)),
+        "`ALIAS | NAME` is rejected for an internal reference too (`dist.c:2663`)",
+    );
+
+    // A non-reference where the C requires `is_ref` is `invalid_message` — the
+    // widened predicate must not have made the guards accept anything.
+    let not_a_ref = make_small(9);
+    let cases = [
+        (
+            ControlMessage { dop: Dop::AliasSend, terms: vec![from, not_a_ref, payload] },
+            "DOP_ALIAS_SEND `to` (`dist.c:2584`)",
+        ),
+        (
+            ControlMessage {
+                dop: Dop::AltactSigSend,
+                terms: vec![
+                    make_small(i64::from(DOP_ALTACT_SIG_FLG_ALIAS)),
+                    from,
+                    not_a_ref,
+                    payload,
+                ],
+            },
+            "DOP_ALTACT_SIG_SEND `to` (`dist.c:2663`)",
+        ),
+        (
+            ControlMessage {
+                dop: Dop::MonitorP,
+                terms: vec![from, make_internal_pid(make_pid_data(0, 9)), not_a_ref],
+            },
+            "DOP_MONITOR_P `ref` (`dist.c:2361`)",
+        ),
+        (
+            ControlMessage {
+                dop: Dop::MonitorPExit,
+                terms: vec![from, make_internal_pid(make_pid_data(0, 9)), not_a_ref, payload],
+            },
+            "DOP_MONITOR_P_EXIT `ref` (`dist.c:2723`)",
+        ),
+    ];
+    for (message, what) in cases {
+        assert!(
+            matches!(Delivery::classify_validated(&message, &link), Err(BeamError::BadArg)),
+            "{what}: a non-reference must still be rejected",
+        );
+    }
 }

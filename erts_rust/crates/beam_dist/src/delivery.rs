@@ -1000,15 +1000,37 @@ fn external_pid_node(x: Eterm) -> Option<Eterm> {
     external_pid_parts(x).ok().map(|(node, _, _, _)| node)
 }
 
-/// `is_ref(x)`: an external reference.
+/// `is_ref(x)` — the C's reference test, spanning **internal and external**
+/// references (`erts/emulator/beam/erl_term.h`'s `is_ref`, i.e. what
+/// `is_not_ref` negates).
 ///
-/// A **decoded wire** reference is almost always external (an internal reference is
-/// a same-node term that only a *local-node demotion* in the decoder produces), so
-/// this predicate reports what a remote control message can carry. It is narrower
-/// than the C's `is_ref`, which spans internal and external references: the arms
-/// that need the wider test say so explicitly via [`is_internal_ref`].
+/// This is the predicate the C's control-message validators use:
+/// `DOP_ALIAS_SEND`'s `if (is_not_ref(to))` (`dist.c:2584`),
+/// `DOP_ALTACT_SIG_SEND`'s `if (is_not_ref(to) || (flags & …_FLG_NAME))`
+/// (`dist.c:2663`), `DOP_MONITOR_P`'s `if (is_not_ref(ref))` (`dist.c:2361`),
+/// `DOP_DEMONITOR_P`'s (`dist.c:2427`) and `DOP_[PAYLOAD_]MONITOR_P_EXIT`'s
+/// (`dist.c:2723`). A remote peer's own reference arrives as an *external* ref,
+/// while **this** node's reference arrives as an external ref of this node that an
+/// identity-installed decode demotes to the **internal** form
+/// ([`beam_codec::Decoder::with_local_node`], installed by
+/// [`crate::control::decode_control_with_identity`]) — so both arms are real for a
+/// wire message, and an external-only test would reject the alias and monitor forms
+/// the C accepts.
+///
+/// The internal arm is **inert without an installed
+/// [`LocalIdentity`](crate::control::LocalIdentity)**: no wire
+/// image can carry an internal reference (it is a same-node heap term with no
+/// external encoding), so an identity-less decode stays external and this predicate
+/// answers exactly as an external-only one would.
+///
+/// The two opcodes with a *different* reference rule keep it: `DOP_SPAWN_REPLY`
+/// accepts an internal ref **or** an external ref of this node
+/// (`dist.c:3079-3086`, tested inline as `is_internal_ref || external_ref_node`),
+/// and `DOP_SPAWN_REQUEST` requires an **external** ref
+/// (`is_not_external_ref(ref)`, `dist.c:2933`, which uses `external_ref_parts`
+/// directly).
 fn is_ref(x: Eterm) -> bool {
-    external_ref_parts(x).is_ok()
+    is_internal_ref(x) || external_ref_parts(x).is_ok()
 }
 
 /// The node-name term of an external reference, or `None` for anything else.

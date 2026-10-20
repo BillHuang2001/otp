@@ -54,8 +54,8 @@ use beam_common::BeamError;
 use beam_dist::control::{decode_control, decode_control_with_identity};
 use beam_dist::flags::Dop;
 use beam_dist::{
-    Connection, ConnectionDriver, ControlMessage, Delivery, DriverState, LocalIdentity,
-    TcpListener, TcpTransport,
+    Connection, ConnectionDriver, ControlMessage, Delivery, DriverState, LinkIdentity,
+    LocalIdentity, TcpListener, TcpTransport,
 };
 use beam_term::prelude::{
     internal_port_data, is_internal_pid, is_internal_port, make_internal_pid, make_pid_data,
@@ -830,4 +830,134 @@ fn the_driver_next_message_demotes_a_this_node_pid() {
         .expect("next_message")
         .expect("one queued message");
     assert!(is_external_pid(message.terms[1]));
+}
+
+// ---------------------------------------------------------------------------
+// (10) The **validated** (per-link) view of a demoted reference.
+//
+// This is the acceptance criterion of the decode-side identity seam: an inbound
+// reference naming this node must (a) decode to the **internal** reference and
+// (b) then pass `Delivery::classify` *and* `Delivery::classify_validated`, whose
+// reference guards are the C's `is_not_ref` — which spans internal and external
+// references (`dist.c:2584` for `DOP_ALIAS_SEND`, `dist.c:2723` for
+// `DOP_[PAYLOAD_]MONITOR_P_EXIT`). The delivered reference is the *demoted* term
+// itself, never a substituted one.
+// ---------------------------------------------------------------------------
+
+/// The per-link identity for the fixture's own atom table: the peer is
+/// [`OTHER_NODE`], this node is [`LOCAL_NODE`] (the table the decode used).
+fn link_identity(fixture: &mut Fixture) -> LinkIdentity {
+    LinkIdentity::intern(&mut fixture.atoms, OTHER_NODE.as_bytes(), LOCAL_NODE.as_bytes())
+        .expect("intern the link identity")
+}
+
+/// `{DOP_ALIAS_SEND, peer, <this-node reference>} -- {reply,7}` — an inbound alias
+/// whose alias reference is this node's own. `ids` is the wire reference's number
+/// triple.
+fn alias_send_body(ids: &[u32]) -> Vec<u8> {
+    control_body(
+        Dop::AliasSend,
+        &[
+            new_pid_ext(OTHER_NODE, 1, 0, OTHER_CREATION),
+            newer_ref_ext(LOCAL_NODE, LOCAL_CREATION, ids),
+        ],
+        Some(reply_tuple(vec![SMALL_INTEGER_EXT, 7])),
+    )
+}
+
+/// `{DOP_MONITOR_P_EXIT, peer, <this-node pid>, <this-node reference>, 3}` — a
+/// monitor down signal whose reference is this node's own.
+fn monitor_p_exit_body(ids: &[u32]) -> Vec<u8> {
+    control_body(
+        Dop::MonitorPExit,
+        &[
+            new_pid_ext(OTHER_NODE, 1, 0, OTHER_CREATION),
+            new_pid_ext(LOCAL_NODE, 9, 1, LOCAL_CREATION),
+            newer_ref_ext(LOCAL_NODE, LOCAL_CREATION, ids),
+            vec![SMALL_INTEGER_EXT, 3],
+        ],
+        None,
+    )
+}
+
+#[test]
+fn an_inbound_alias_send_to_this_node_validates_as_an_internal_reference() {
+    let ids = [11u32, 0, 0];
+    let mut fixture = Fixture::new();
+    let identity = fixture.identity();
+    let message = fixture.decode(&alias_send_body(&ids), Some(identity));
+    let link = link_identity(&mut fixture);
+
+    let to = message.terms[1];
+    assert_eq!(internal_ref_id(to).expect("the demoted internal reference"), 11);
+
+    // The semantic view carries the internal reference...
+    match Delivery::classify(&message).expect("classify") {
+        Delivery::AliasSend { to: classified, .. } => assert_eq!(classified, to),
+        other => panic!("expected an alias send, got {other:?}"),
+    }
+    // ...and the validated view accepts it instead of rejecting a wire form the C
+    // accepts (`is_not_ref(to)`, `dist.c:2584`).
+    match Delivery::classify_validated(&message, &link)
+        .expect("an internal alias reference passes the validated view (`dist.c:2584`)")
+    {
+        Delivery::AliasSend { to: validated, .. } => {
+            assert_eq!(internal_ref_id(validated).expect("still the internal reference"), 11);
+            assert_eq!(validated, to, "the demoted term itself is delivered");
+        }
+        other => panic!("expected an alias send, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_inbound_monitor_p_exit_of_this_nodes_reference_validates_as_internal() {
+    let ids = [11u32, 0, 0];
+    let mut fixture = Fixture::new();
+    let identity = fixture.identity();
+    let message = fixture.decode(&monitor_p_exit_body(&ids), Some(identity));
+    let link = link_identity(&mut fixture);
+
+    let reference = message.terms[2];
+    assert_eq!(internal_ref_id(reference).expect("the demoted internal reference"), 11);
+    assert!(is_internal_pid(message.terms[1]), "the local watcher is an internal pid");
+
+    // `is_not_ref(ref)` (`dist.c:2723`) admits the internal form, so the monitor
+    // down signal this node's own reference belongs to is not `invalid_message`.
+    match Delivery::classify_validated(&message, &link)
+        .expect("an internal monitor reference passes the validated view (`dist.c:2723`)")
+    {
+        Delivery::MonitorExit { reference: validated, .. } => {
+            assert_eq!(internal_ref_id(validated).expect("still the internal reference"), 11);
+            assert_eq!(validated, reference, "the demoted term itself is delivered");
+        }
+        other => panic!("expected a monitor exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn without_an_identity_the_widened_reference_arms_accept_the_external_form() {
+    // Additivity: with no identity installed the same bytes keep the faithful
+    // **external** reference (no internal reference is fabricated) and the validated
+    // view accepts it through the external arm — the widening changes nothing here.
+    let ids = [11u32, 0, 0];
+    let mut fixture = Fixture::new();
+    let link = link_identity(&mut fixture);
+
+    let message = fixture.decode_plain(&alias_send_body(&ids));
+    let to = message.terms[1];
+    assert!(is_external_ref(to), "no identity ⇒ the faithful external form");
+    assert!(internal_ref_id(to).is_err(), "no internal reference is fabricated");
+    match Delivery::classify_validated(&message, &link).expect("the external arm is unchanged") {
+        Delivery::AliasSend { to: validated, .. } => assert_eq!(validated, to),
+        other => panic!("expected an alias send, got {other:?}"),
+    }
+
+    let message = fixture.decode_plain(&monitor_p_exit_body(&ids));
+    let reference = message.terms[2];
+    assert!(is_external_ref(reference), "no identity ⇒ the faithful external form");
+    assert!(internal_ref_id(reference).is_err());
+    match Delivery::classify_validated(&message, &link).expect("the external arm is unchanged") {
+        Delivery::MonitorExit { reference: validated, .. } => assert_eq!(validated, reference),
+        other => panic!("expected a monitor exit, got {other:?}"),
+    }
 }
