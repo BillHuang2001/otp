@@ -651,6 +651,10 @@ in-process compiler route.
   (c) A monitor of a **remote** pid answers `NotAlive` (no cross-node NIF monitor), and a copied
   `enif_make_resource_binary` term does not resolve through `enif_get_resource` (that binary is on-heap
   here, not the C's copy-shared magic binary).
+  (d) `nif_yield_point` is an honest no-op in `beam_rt` — the runtime cannot re-enter its scheduler from
+  under a NIF and no reduction primitive is host-reachable — so a self-rescheduling chain keeps its
+  thread until it ends (fairness, never correctness). `dirty_scheduler_support` stays `0`, so a
+  dirty-flagged continuation runs on the calling thread while `enif_thread_type` still reports 2/3.
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
   (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer. Off-heap refc
   liveness is the process's: `beam_process` sweeps its owned payloads by reachability at the end of a
