@@ -3111,7 +3111,8 @@ const HEAP_GROWTH_ITERATION_WORDS: usize = 401;
 /// measured peak nursery capacity.
 ///
 /// The capacity is a *measurement*, not a constant: `beam_gc`'s `HeapPolicy::young_after_collection`
-/// **keeps** any capacity inside `[4/3, YOUNG_SHRINK_FACTOR]` x `young_target_words(live)`, so
+/// **keeps** any capacity inside `[young_minor_target_words(live), YOUNG_SHRINK_FACTOR]` x that
+/// live-set-derived target and lands on the target outside it, so
 /// what a run settles on is whatever the growth seam installed for this workload's tiny live set.
 /// What the cadence follows from is the arithmetic of that capacity: an iteration allocates
 /// [`HEAP_GROWTH_ITERATION_WORDS`] words and the words a collection keeps alive here (the loop
@@ -3142,10 +3143,10 @@ fn heap_growth_expected_collections(n: i64, iterations_per_nursery: u64) -> u64 
 /// its counters are per-run. The `foreign` regression claims the per-call cost *grows* with N;
 /// if that were a real per-call work increase rather than a measurement artefact, then at least
 /// one of these deterministic counters — collections per call, or slices per call — would grow
-/// with N too. This test pins the truth for the churn shape: neither grows — both are flat or
-/// falling, because the nursery settles once and the widening run then amortizes the mature
-/// generation growing between fullsweeps — so on this shape the excess wall clock is **not**
-/// extra per-call GC/runner work.
+/// with N too. This test pins the truth for the churn shape: neither grows — both are flat,
+/// because the nursery settles on the live-set-derived capacity (1 220 words) and every call
+/// therefore performs the same allocation and collection work — so on this shape the excess wall
+/// clock is **not** extra per-call GC/runner work.
 #[test]
 fn the_churn_workloads_per_call_counters_are_flat_in_n() {
     let rows = counter_table(churn_fixture(), "churn", &[2_000, 10_000, 40_000]);
@@ -3159,8 +3160,8 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
     assert!(r3.collections > r1.collections, "more iterations ⇒ more collections: {r3:?}");
 
     // The per-call ratios must be flat: the widest run's per-call counters may not exceed the
-    // narrowest's by more than a small slack (the nursery grows once at the start, which is a
-    // fixed cost amortized away by the wider run — so the ratio only ever *falls*).
+    // narrowest's by more than a small slack (the nursery settles on its live-set-derived
+    // capacity, so the per-call ratios are the same at every N).
     let collections_per_call_ratio =
         (r3.collections as f64 / (n3 + 1) as f64) / (r1.collections as f64 / (n1 + 1) as f64);
     assert!(
@@ -3227,7 +3228,7 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 /// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
 /// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
 /// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
-/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 2 and
+/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 1 and
 /// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress
