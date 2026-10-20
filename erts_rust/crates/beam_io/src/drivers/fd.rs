@@ -62,6 +62,11 @@
 //! (`ERTS_PORT_SFLG_LINEBUF_IO`) affects how a port *delivers* input to its owner, not how
 //! it accepts output, so [`Driver::output`] stays a raw byte-stream drain.
 //!
+//! A **closing** port keeps draining through that same callback, so [`Driver::stop`] never has
+//! to rescue queued output (it cannot — it closes the descriptors). See [`Driver::stop`]'s
+//! rustdoc for why that is the C's ordering, and why this driver therefore needs no
+//! [`Driver::flush`] override.
+//!
 //! # Control handshake
 //!
 //! [`Driver::control`] accepts a UTF-8 command string plus raw argument bytes:
@@ -505,6 +510,12 @@ impl Driver for FdDriver {
         Ok(())
     }
 
+    /// Drains the port's output queue to the write fd — the C's `fd` driver `output` slot, and the
+    /// callback a port's `OUTPUT` task reaches through the default [`Driver::ready_output`].
+    ///
+    /// A short write (`EAGAIN`) leaves the remainder queued and arms write readiness, so the write
+    /// is resumed by the next round; a *closing* port keeps driving this same callback, which is
+    /// why this driver needs no [`Driver::flush`] override — see [`Driver::stop`]'s note.
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         self.write_pending(ctx)
     }
@@ -581,6 +592,43 @@ impl Driver for FdDriver {
         }
     }
 
+    /// Releases anything the text phase is holding, deregisters both directions and closes the
+    /// descriptors — **no output is written here, and none can be lost**.
+    ///
+    /// # The queued output is not this driver's to rescue
+    ///
+    /// `stop` never touches the port's output queue, so a byte still queued when it runs is gone
+    /// with the descriptors. That is correct because the port only calls it once the queue is
+    /// **empty**: the C's `terminate_port` — the sole caller of `drv->stop` — runs only when
+    /// `is_port_ioq_empty(p)` (`erts/emulator/beam/io.c:3697-3700`, `:3733-3752`), and a close with a
+    /// non-empty ioq parks the port in `ERTS_PORT_SFLG_CLOSING` instead (`io.c:896-900`,
+    /// `:3936-3942`). [`crate::Port::close`] keeps that split: the drain
+    /// ([`crate::Port::drain_output_during_close`], the ordinary `OUTPUT` task) must empty the queue
+    /// before [`crate::Port::finish_close`] reaches `stop`, and otherwise the port stays live in
+    /// [`crate::PortState::Closing`] with its write readiness armed until
+    /// [`crate::PortRegistry::finish_closing_ports`] drains it. So a short write (`EAGAIN` on a full
+    /// pipe or socket) parks the close **before** `stop`, never after — pinned over a real socket
+    /// pair by `fd_close_tests` (`a_short_write_parks_the_close_before_stop_runs`: the parked port
+    /// still owns its write fd, which is exactly what `stop` would have taken;
+    /// `the_parked_remainder_is_delivered_in_full_by_the_rounds`: every byte arrives, byte for
+    /// byte). The only path that reaches `stop` with a non-empty queue is the **forced** teardown
+    /// after a `driver_failure*` ([`crate::PortRegistry`]'s `reap_failures` → `close_now`), which is
+    /// the C's own `prt->ioq.size = 0` work-around for a driver that has just declared itself broken
+    /// (`io.c:7215-7219`).
+    ///
+    /// # Why there is no [`Driver::flush`] override
+    ///
+    /// The C `fd` driver's `fd_flush` only latches a flag — it writes **nothing**
+    /// (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`; the "we now flush before terminating"
+    /// guarantee is documented at `:900-907`). The writing is done by its `ready_output`
+    /// (`sys_drivers.c:1448-1471`), which keeps running while the port is `CLOSING` and, once the
+    /// queue emptied with the latch set, ends the port with `driver_failure_atom(port, "normal")`
+    /// (`:1468-1469`). That `terminating` latch is therefore just "when the queue empties,
+    /// terminate" — which this port layer *is*: its `Closing` state plus the drain loop that runs
+    /// [`Driver::output`] until the queue is empty, then [`Driver::stop`]. An override could only
+    /// discard bytes the C keeps, so the default (discard nothing) is the faithful answer and the
+    /// writing it must leave alone is pinned by
+    /// `fd_close_tests::a_command_queued_before_a_close_is_written_by_the_close`.
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // Release anything still held by text-phase framing before the fds go away.
         self.flush_input(ctx);
@@ -1191,3 +1239,7 @@ mod tests {
         registry.close(&mut poller, id).expect("closes");
     }
 }
+
+#[cfg(test)]
+#[path = "fd_close_tests.rs"]
+mod close_tests;
