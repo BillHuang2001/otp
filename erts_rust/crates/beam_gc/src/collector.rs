@@ -272,10 +272,9 @@ impl Collector {
     /// the typed heap exhaustion is returned *before* a single word is copied rather than
     /// mid-copy.
     ///
-    /// The nursery is re-sized by the C's **two-step** rule
-    /// ([`HeapPolicy::young_after_fullsweep`]): its pre-copy occupancy first
-    /// (`erl_gc.c:1866`), then the exact post-copy live set
-    /// (`adjust_after_fullsweep`, `erl_gc.c:2062-2098`).
+    /// The nursery is then re-sized from the **exact live set** the fullsweep measured
+    /// ([`HeapPolicy::young_after_fullsweep`]), so it neither re-copies the live set every
+    /// round nor keeps the capacity a dead burst left behind.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse_after_fullsweep) back to one space.
@@ -330,17 +329,13 @@ impl Collector {
         self.stats.major_collections += 1;
         // The fullsweep relocated *every* live word — the nursery's included — into the fresh
         // mature space, so the nursery's surviving occupancy is now zero and there is no live
-        // young set to size it from. It is therefore sized by the C's **two-step** rule
-        // ([`HeapPolicy::young_after_fullsweep`]): the **demand the round observed**
-        // (`young_occupancy`, sampled before the copy — the `major_collection` pre-copy sizing,
-        // `erl_gc.c:1866`) followed by the **post-copy live set** (`live`, this fullsweep's
-        // exact reachable word count — the `adjust_after_fullsweep` shrink,
-        // `erl_gc.c:2062-2098`). The second step is what stops a nursery the growth seam
-        // stepped up for a burst from staying that size forever once the burst is dead: step 1
-        // compares the capacity against the *occupancy*, which a fullsweep always finds full,
-        // so only the live set can reveal the over-provisioning.
+        // young set to size it from. It is sized from the **live set** instead
+        // ([`HeapPolicy::young_after_fullsweep`]): a fullsweep is the one collection that
+        // measures the whole heap exactly, so it is where the nursery learns how large it
+        // should be — and where a nursery the growth seam stepped up for a burst is given back
+        // once that burst is dead.
         self.nursery
-            .collapse_after_fullsweep(&self.policy, young_occupancy, live)?;
+            .collapse_after_fullsweep(&self.policy, live)?;
         Ok(stats)
     }
 

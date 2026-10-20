@@ -423,45 +423,37 @@ impl Nursery {
     /// second, post-copy sizing rule to a fullsweep (`erl_gc.c:2062-2098`) that a minor never
     /// reaches.
     ///
-    /// # The sizing input is bounded by the collected capacity, so this can never creep
+    /// # A minor keeps or shrinks; it never grows
     ///
-    /// `demand_words` is at most `capacity_words()` (the chain's own occupancy cannot exceed
-    /// the chain's capacity), and every branch of [`HeapPolicy::young_after_collection`] that
-    /// could enlarge the target beyond `collected_capacity` needs `demand_words >
-    /// collected_capacity`, which that bound forbids. So **`collapse` never grows the
-    /// nursery**: the post-collection capacity is at most the pre-collection capacity, and a
-    /// collection that finds the nursery mostly empty shrinks it towards the demand. The only
-    /// thing that enlarges a nursery is the explicit, request-driven
-    /// [`grow`](Nursery::grow) seam — so a fixed demand converges to a constant capacity
-    /// instead of climbing one growth-table step per collection.
-    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, demand_words: usize) -> Result<()> {
+    /// [`HeapPolicy::young_after_collection`] has no growth branch, so **`collapse` never
+    /// grows the nursery**: the post-collection capacity is at most the pre-collection
+    /// capacity, and a collection that finds the nursery grossly over-sized for the live set
+    /// gives the memory back. Growth is decided where the live set is measured exactly — a
+    /// [fullsweep](Nursery::collapse_after_fullsweep) — or by the explicit, request-driven
+    /// [`grow`](Nursery::grow) seam; a fixed live set therefore converges to a constant
+    /// capacity instead of climbing one growth-table step per collection.
+    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_collection(collected_capacity, demand_words);
+        let target = policy.young_after_collection(collected_capacity, live_words);
         self.install_collapsed(target)
     }
 
-    /// Collapses the chain after a **fullsweep**, applying the C's **two-step** nursery sizing
-    /// ([`HeapPolicy::young_after_fullsweep`]): the pre-copy occupancy sizing
-    /// (`erl_gc.c:1866`) followed by the post-copy live-set shrink (`erl_gc.c:2062-2098`).
+    /// Collapses the chain after a **fullsweep**, sizing the nursery from the **whole-heap live
+    /// set** the round kept ([`HeapPolicy::young_after_fullsweep`]).
     ///
-    /// `observed_words` is the occupancy the round sampled **before** the copy and
-    /// `live_words` the **whole-heap** post-copy live word count (young *and* mature), which is
-    /// the input the second step needs: a fullsweep leaves no live young set of its own, so its
-    /// own surviving set cannot size the nursery, and a nursery-only count would collapse it to
-    /// the reserve floor every round (`MEASURED.md`).
-    ///
-    /// Both inputs only ever *shrink* the target relative to the collected capacity, so this
-    /// keeps [`collapse`](Nursery::collapse)'s guarantee that a collection never enlarges a
-    /// nursery.
+    /// `live_words` must be the whole-heap post-copy live word count (young *and* mature): a
+    /// fullsweep leaves no live young set of its own, so a nursery-only count would collapse the
+    /// nursery to the reserve floor every round. A fullsweep therefore **may enlarge** the
+    /// nursery — it is the one collection that measures the live set exactly, so it is where the
+    /// growth decision belongs — and it shrinks a nursery the live set has outgrown back
+    /// towards the target.
     pub(crate) fn collapse_after_fullsweep(
         &mut self,
         policy: &HeapPolicy,
-        observed_words: usize,
         live_words: usize,
     ) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target =
-            policy.young_after_fullsweep(collected_capacity, observed_words, live_words);
+        let target = policy.young_after_fullsweep(collected_capacity, live_words);
         self.install_collapsed(target)
     }
 
