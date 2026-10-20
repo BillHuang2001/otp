@@ -84,7 +84,6 @@ use beam_term::AtomTable;
 
 use crate::context::PendingInterner;
 use crate::error;
-
 /// The release-layout code-path derivation (the oracle's `<lib>` bundle scan): a thin child
 /// module so this file stays the code server's public surface — see [`path`].
 mod path;

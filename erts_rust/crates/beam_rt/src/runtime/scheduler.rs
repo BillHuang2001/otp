@@ -1082,6 +1082,30 @@ impl Runtime {
                     continue;
                 }
             }
+            // The **NIF-created-thread half** (contract A.3): deliver what a NIF's own worker
+            // thread (`enif_thread_create`) queued through `enif_send` while **no** NIF call was in
+            // flight. It belongs to the port step right above rather than a step of its own, for the
+            // same reason that step exists: this is an **external producer** the runtime does not
+            // drive — a thread, like the OS child behind a port — so the runtime must ask it for
+            // work once per round instead of being told.
+            //
+            // A drained message is decoded onto a scratch heap against the live atom table, with
+            // this node's identity installed, and delivered through the runtime's own send seam
+            // (`Runtime::drain_nif_thread_sends`); a delivery wakes a receiver parked in a compiled
+            // `receive` through the table's wake list, so the pass goes round again to run it — the
+            // same resume-on-send path a port or timer message takes.
+            //
+            // Cost: **nothing** for a runtime with no factory installed (one `Option` test — every
+            // differential case, every benchmark leg), and one uncontended lock acquisition for one
+            // that has one (the queue's emptiness is not readable without it; see the drain's docs).
+            // Not a `continue`: a delivery is counted and the pass simply goes round again, so the
+            // step composes with the distribution half below instead of short-circuiting it.
+            let foreign_sends = self.drain_nif_thread_sends(Some(&mut table));
+            if foreign_sends > 0 {
+                delivered += foreign_sends;
+                scheduler.resume_woken(&mut table);
+                continue;
+            }
             // The distribution half: accept a pending inbound connection and drive every
             // live link's handshake one step (contract A.5, Phase 1). Non-blocking, so a
             // runtime with no node (or a node with no traffic) pays nothing; a link that

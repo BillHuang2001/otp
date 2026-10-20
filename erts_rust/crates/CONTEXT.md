@@ -253,7 +253,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary); `tests/` (the allocator integration suite)
-- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
+- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), `nif/host.rs` (`NifHost`/`NifEnv`), and the three additional seams: `nif/enif/schedule.rs` (`enif_schedule_nif`'s `Outcome` + iterative constant-stack continuation trampoline, `NifHost::nif_yield_point`), `nif/thread_env.rs` (`ThreadEnvHostFactory` / `install_thread_env_factory` — the off-call-path `enif_alloc_env`), and `nif/enif/{resources_stop.rs,stop.rs}` (`call_resource_stop` / the pending-stop table behind `enif_select`'s STOP verdicts)
 - `beam_deflate/` → zlib 1.3.2 in safe Rust (bytes only, `beam_common` its sole dependency): `deflate/` (window + hash chains, the five match functions, Huffman construction, the flush driver), `inflate/` (bit reader, `inftrees`/`inffast`, header/trailer state machine, dictionary protocol), `checksum.rs` (`crc32`/`adler32` + `combine`); the one shared encoder behind both `beam_codec`'s ETF `COMPRESSED` and `beam_bifs`'s `zlib` BIFs
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`, the `COMPRESSED` wrapper over `beam_deflate`, the public `ref_wire` reference-id ↔ wire-words mapping (the C's `erts_set_ref_numbers`), and the decode-side local-node demotion (`Decoder::with_local_node`: a pid/port/ref naming this node decodes internal)
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`, and the defaulted inbound decode-side identity (`control::LocalIdentity` + `decode_control_with_identity`, `Connection`/`ConnectionDriver::set_local_identity`)
@@ -516,7 +516,28 @@ the caller reserves the words and passes `hp: *mut Eterm`):
     path), and delivers the C's `{select, ResourceTerm, Reference, EventAtom}`
     (`ready_input`/`ready_output`/`ready_error`; `CUSTOM_MSG` delivers the caller's term verbatim); STOP
     and CANCEL answer the C's `STOP_CALLED`/`*_CANCELLED` bits and an unservable request stays a typed
-    refusal. Residual: `ERL_NIF_SELECT_STOP_SCHEDULED` (no resource-`stop` seam yet).
+    refusal. `enif_select`'s STOP arm then runs the resource type's own `stop` callback
+    (`beam_abi::nif::enif::call_resource_stop`): a `STOP_CALLED` verdict calls it synchronously with
+    `is_direct_call = true` (the caller keeps its reference), a `STOP_SCHEDULED` verdict parks the
+    `(obj, event)` pair for `run_pending_stops()` with `is_direct_call = false` and one kept
+    `enif_keep_resource` reference released at the drain (a second STOP steals rather than double-arms),
+    and every other verdict calls nothing; a type opened **without** a `stop` answers the host's code and
+    runs nothing (the oracle SIGSEGVs on that shape). `beam_rt`'s select store de-registers immediately,
+    so every STOP it observes is `STOP_CALLED` — the only verdict Linux/epoll can produce for an
+    epoll-able fd.
+  * `enif_schedule_nif` runs its continuation: `beam_abi/src/nif/enif/schedule.rs` holds an explicit
+    `Outcome { Value, Reschedule, Raised }` and an iterative, constant-Rust-stack trampoline (a nested
+    schedule records the continuation and answers the C's `THE_NON_VALUE`; the outermost call folds the
+    emulator's trap re-run into its own result), with `argv` passed through uncopied, `fun_name`
+    interned-only, `NifHost::nif_yield_point` called once per iteration, a dirty flag reported through
+    `enif_thread_type` (2/3), and a continuation's raise left as the env's pending exception. The C's raw
+    `THE_NON_VALUE` word is deliberately not reproduced: a probe exposing it sees the value.
+  * `enif_alloc_env` reaches a host in three steps — the current NIF call's host, else a host opened by
+    the process-global `ThreadEnvHostFactory` (`install_thread_env_factory`, cached per thread), else
+    `NULL` — and `enif_send` resolves its host from `env` else from `msg_env`, so the
+    `enif_send(NULL, &pid, msg_env, msg)` idiom works from a NIF-created thread. `NULL` stays the answer
+    when no host is reachable: a crate-owned env with a private atom table would hand a NIF a wrong atom
+    index.
   * A resource exposed only as a term is reclaimed when the term dies: the runner's park arm prunes
     through `beam_abi::nif::enif::release_resource_terms` with a complete-root predicate that matches a
     word **or** a reference identity (a copied term therefore counts as reachable), running the
@@ -614,14 +635,26 @@ in-process compiler route.
   floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
   `tcp_sendfile` reproduce their refusals only.
 - **A.3 residuals, each a typed refusal or a deferred answer rather than a wrong result.**
-  (a) `ERL_NIF_SELECT_STOP_SCHEDULED` is never answered — the resource type's `stop` callback has no
-  host seam, so a STOP keeps the C's fast-track `STOP_CALLED` answer.
+  (a) A NIF-created thread (off the call path) reaches a host only through `beam_rt`'s installed
+  `ThreadEnvHostFactory`. That host's atom space is a **private append-only name space**, and a term
+  crosses the boundary as an ETF image decoded against the live `AtomTable` (atoms travel by name, so a
+  foreign index can never name a live atom): `enif_make_existing_atom` answers within the private space
+  only, `atom_table` is `None` (so env-less `enif_compare`/`enif_is_identical`/`enif_hash` order a nested
+  atom by raw index), and `select`/monitors/liveness/`whereis_pid`/`make_ref`/`system_info`/
+  `term_to_binary`/`binary_to_term`/`port_command` are unsupported there; a **remote** pid destination
+  answers `false` (no `beam_dist` route on the host), and a message holding a local `make_fun3` closure
+  cannot be encoded. Its send is queued at `enif_send` (the C's `1`) and decoded, delivered and woken at
+  the runtime's next drain, where the C delivers inside the call.
   (b) The load/unload host runs with `services = None`: only the callback-scoped `enif_send` window
   answers there, and `upgrade` is not modelled at all (a second `load_nif/2` is the oracle's `reload`
   refusal), while a `dtor`-time send has no live receiver set and no drain point.
   (c) A monitor of a **remote** pid answers `NotAlive` (no cross-node NIF monitor), and a copied
   `enif_make_resource_binary` term does not resolve through `enif_get_resource` (that binary is on-heap
   here, not the C's copy-shared magic binary).
+  (d) `nif_yield_point` is an honest no-op in `beam_rt` — the runtime cannot re-enter its scheduler from
+  under a NIF and no reduction primitive is host-reachable — so a self-rescheduling chain keeps its
+  thread until it ends (fairness, never correctness). `dirty_scheduler_support` stays `0`, so a
+  dirty-flagged continuation runs on the calling thread while `enif_thread_type` still reports 2/3.
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
   (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer. Off-heap refc
   liveness is the process's: `beam_process` sweeps its owned payloads by reachability at the end of a

@@ -237,10 +237,10 @@ static ERL_NIF_TERM do_work(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 /* reschedule/1 -> the term `enif_schedule_nif(env, "do_work", ERL_NIF_DIRTY_JOB_CPU_BOUND,
  * do_work, 1, argv)` produces: the runtime runs `do_work/1` (on a dirty CPU scheduler when one is
  * available) with this call's own argument vector and its result becomes the result of
- * `reschedule/1`, i.e. `{dirty, Arg}` on the oracle. The seam of this crate hands the host
- * `(fun_name, flags, fptr, argc)`; with no host support it raises `badarg` (`erl_nif.c:3569-3598`
- * are the two argument rules it reproduces: `argc > MAX_ARG` and a `flags` bit outside the two
- * dirty-job bits). */
+ * `reschedule/1`, i.e. `{dirty, Arg}` on the oracle — and here too, because the ABI's own
+ * trampoline runs the continuation. The argument rules reproduced before it runs anything are
+ * `erl_nif.c:3569-3603`'s: `argc > MAX_ARG`, a negative `argc`, a `flags` bit outside the two
+ * dirty-job bits, a null `fun_name` and a null `fptr`, each answered with `enif_make_badarg`. */
 static ERL_NIF_TERM reschedule(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     if (argc != 1)
         return enif_make_badarg(env);

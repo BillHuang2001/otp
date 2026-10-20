@@ -98,20 +98,65 @@
 //! * **`ERL_NIF_SELECT_ERROR` is passed to the hook** rather than answered `INT_MIN | NOTSUP`: the C
 //!   only refuses the error bit when the platform has no error-capable poller (`:1300-1307`), which
 //!   is a property of the runtime's poller, not of this layer.
-//! * **`ERL_NIF_SELECT_STOP` does not call the resource's `stop` callback here.** The C's fast track
-//!   for an unknown fd calls `stop` directly and answers `ERL_NIF_SELECT_STOP_CALLED`
-//!   (`:1283`); the resource registry and its callbacks belong to the `resources` family and the
-//!   runtime, so the request — including the case where the hook itself calls `stop` — is the hook's
-//!   to service.
+//!
+//! # The STOP verdicts — what happens after the host answers
+//!
+//! The host owns the poller and therefore picks the verdict; this crate services the two STOP
+//! verdicts on the object the request named (`resources_stop.rs` runs the callback, [`stop`] parks a
+//! deferred one):
+//!
+//! | the host's answer | what this crate does |
+//! |---|---|
+//! | `code & ERL_NIF_SELECT_STOP_CALLED` | runs the type's `stop` **synchronously**, `is_direct_call = true` (`erl_check_io.c:1531`) |
+//! | `code & ERL_NIF_SELECT_STOP_SCHEDULED` | parks a pending stop for `(obj, e)` (one `enif_keep_resource` reference, `:1509`); [`run_pending_stops`] runs the callback later with `is_direct_call = false` (`:2241`) |
+//! | a plain `0`, a `*_CANCELLED` bit, any negative refusal | nothing — no callback, no reference |
+//!
+//! The code itself is always answered **unchanged**: the verdict is the host's, this crate only acts
+//! on it.
+//!
+//! ## Reference accounting, per verdict
+//!
+//! The C's `enif_select` takes one `enif_keep_resource` reference per armed interest (`:1446`) and
+//! gives it back when the interest is dropped (`:1533`, `:1834`, `:2242`). In this crate those keeps
+//! belong to the **host** — it is what registered the interest — so the accounting here is:
+//!
+//! * `STOP_CALLED` ⇒ this crate takes and releases nothing. The C has two flavours behind that one
+//!   bit: the unknown-fd fast track's `CALL_STOP` (`:1283`), where the **caller still owns** the
+//!   reference it passed in, and `CALL_STOP_AND_RELEASE` (`:1502`), where **the runtime has already
+//!   released** the select's own reference by the time `enif_select` returns. Either way the host's
+//!   answer stands and nothing local changes the count.
+//! * `STOP_SCHEDULED` ⇒ **the drain releases it**: parking takes one keep (`:1509`) and
+//!   [`run_pending_stops`] gives it back after the callback ran (`:2242`).
+//! * every other answer ⇒ nothing is kept, nothing is released, no callback runs.
+//!
+//! ## A resource type without a `stop` callback
+//!
+//! The host's code is answered unchanged and **no callback runs**. The C only `ASSERT`s the
+//! callback's presence (`:1279`), and that `ASSERT` is compiled out in a release build, so the
+//! oracle's `erts_resource_stop` (`erl_nif.c:3032-3041`) calls a NULL function pointer and takes the
+//! VM down (measured: SIGSEGV, 3/3 runs). Skipping the call is this crate's deliberate typed
+//! decision instead of a crash; [`resource_type_has_stop`] is the query.
+//!
+//! ## `STOP_SCHEDULED` is unreachable for an epoll-able fd on Linux
+//!
+//! `wake_poller` — the only thing that defers a stop — is set by the select/poll **fallback** driver
+//! (`erl_poll.c:761-877`), so a pipe's or socket's STOP is always synchronous on an epoll host
+//! (measured: a pipe answers `STOP_CALLED` / `STOP_CALLED|READ_CANCELLED`, while `/dev/null`, a
+//! regular file and a directory answer `STOP_SCHEDULED|READ_CANCELLED`). A host whose select store
+//! de-registers immediately therefore always answers `STOP_CALLED`; the deferred arm is for a host
+//! that really defers, and what is pinned here is the **dispatch** of that answer.
 
 use libc::{c_int, c_void};
 
 use crate::common::{
     ErlNifSelectFlags, ERL_NIF_SELECT_CANCEL, ERL_NIF_SELECT_CUSTOM_MSG, ERL_NIF_SELECT_ERROR,
-    ERL_NIF_SELECT_INVALID_EVENT, ERL_NIF_SELECT_READ, ERL_NIF_SELECT_STOP, ERL_NIF_SELECT_WRITE,
+    ERL_NIF_SELECT_INVALID_EVENT, ERL_NIF_SELECT_READ, ERL_NIF_SELECT_STOP,
+    ERL_NIF_SELECT_STOP_CALLED, ERL_NIF_SELECT_STOP_SCHEDULED, ERL_NIF_SELECT_WRITE,
 };
 use crate::nif::types::{ErlNifEnv, ErlNifEvent, ErlNifPid};
 
+use super::resources::{call_resource_stop, resource_type_has_stop};
+use super::stop::record_pending_stop;
 use super::*;
 
 /// The answer for a request this crate cannot service (no env, no host, or no hook support). Negative,
@@ -216,8 +261,35 @@ unsafe fn select(
         Some(t(unsafe { (*pid).pid }))
     };
     match nif_env.host().select(e, flags, obj, recipient, t(term)) {
-        Some(code) => code,
+        Some(code) => {
+            // The verdict is the host's; servicing the STOP half of it is this crate's (module docs,
+            // "The STOP verdicts"). The code itself is returned unchanged.
+            service_stop_verdict(code, obj, e);
+            code
+        }
         None => SELECT_UNSUPPORTED,
+    }
+}
+
+/// Service the STOP half of a host's `enif_select` answer (module docs, "The STOP verdicts").
+///
+/// A negative answer is one of the C's `INT_MIN | bit` refusals and is never a STOP verdict, so it is
+/// rejected before the bits are inspected. `STOP_CALLED` is tested **before** `STOP_SCHEDULED`: the
+/// two are mutually exclusive in the C (the fast track / `!wake_poller` arm answers `CALLED`, the
+/// `wake_poller` arm answers `SCHEDULED`), and the synchronous answer must win if a host ever set
+/// both.
+fn service_stop_verdict(code: c_int, obj: *mut c_void, event: ErlNifEvent) {
+    if code < 0 {
+        return;
+    }
+    if code & ERL_NIF_SELECT_STOP_CALLED != 0 {
+        if resource_type_has_stop(obj) {
+            // SAFETY-neutral: this helper takes a raw handle and never dereferences one it does not
+            // recognise; the calling NIF holds an outstanding reference on it (its own contract).
+            call_resource_stop(obj, event, true);
+        }
+    } else if code & ERL_NIF_SELECT_STOP_SCHEDULED != 0 && resource_type_has_stop(obj) {
+        record_pending_stop(obj, event);
     }
 }
 

@@ -42,7 +42,7 @@
 //! | `enif_demonitor_process` | `0` identified **and removed** (`:4051`), `1` could not be identified (`:4043-4044`) |
 //! | `enif_compare_monitors` | `memcmp`-style `<0`/`0`/`>0` over the monitor payload (`:4054-4059`) |
 //! | `enif_make_monitor_term` | an ordinary internal reference holding the monitor's payload (`:4013-4017`) |
-//! | `enif_schedule_nif` | the term the scheduled call will produce; `badarg` for `argc > MAX_ARG` (`:3569`) or a bad `flags` (`:3597`) |
+//! | `enif_schedule_nif` | the value the scheduled call's chain produces (`super::schedule` runs it); the C's `THE_NON_VALUE` on a nested schedule; `badarg` for `argc > MAX_ARG` (`:3569`), a bad `flags` (`:3597`), a null `fun_name`/`fptr`/`argv`-with-args, or a null env |
 //!
 //! # The monitor payload is the internal-reference block
 //!
@@ -100,26 +100,34 @@
 //!   invalid id is `0` too (`!!erts_proc_lookup(...)`, `:2330`), so "unknown" and "dead" coincide; a
 //!   fabricated `1` ("alive") is never produced. A `NULL` pid/port pointer answers `0` (the C
 //!   faults).
-//! * **`NULL` `to_pid`/`to_port` answer `0`** (the C dereferences them), and a **`NULL` `env`
-//!   answers `0`** for `enif_send`/`enif_port_command` (this seam reaches the runtime only through
-//!   the env's host) — `enif_port_command`'s C counterpart aborts the emulator (`:1108-1109`).
+//! * **`NULL` `to_pid`/`to_port` answer `0`** (the C dereferences them). For `enif_send` a **`NULL`
+//!   `env` is not fatal**: the host is then resolved from `msg_env` (the C's
+//!   `enif_send(NULL, &pid, msg_env, msg)` form, measured `{0,1,1}` even on a scheduler thread), and
+//!   only two unusable envs answer `0`. `enif_port_command` has no such second source — a `NULL` `env`
+//!   answers `0` (its C counterpart aborts the emulator, `:1108-1109`).
 //! * **`enif_send` passes `from = None`.** `enif_send` always sends *from the calling process* —
 //!   the C derives `from` from the caller's env (`from = c_p ? c_p->common.id : am_undefined`,
 //!   `:996`) and cannot send on another process's behalf — which is exactly what
-//!   `NifHost::send`'s `None` means. The host resolves the concrete sender itself. `msg_env` (the
-//!   message's own environment in the C) is accepted for signature fidelity and unused: the hook
-//!   performs the term movement itself.
-//! * **`enif_schedule_nif` refuses what it cannot honour.** `argc > 255` (`MAX_ARG`,
-//!   `erl_vm.h:48`) and a `flags` with any bit outside `ERL_NIF_DIRTY_JOB_CPU_BOUND |
-//!   ERL_NIF_DIRTY_JOB_IO_BOUND` raise `badarg`, exactly as the C does; a `NULL` `fun_name` and a
-//!   `NULL` function pointer also raise `badarg` (the C would fault in `strlen`/call through the
-//!   null pointer), and a negative `argc` cannot be expressed to the hook (which counts with a
-//!   `usize`). With no host support it raises `badarg` — it never pretends to have scheduled
-//!   anything.
-//! * **`enif_schedule_nif` does not carry `argv` across the seam.** `NifHost::schedule_nif` takes
-//!   `(fun_name, flags, fptr, argc)`; the C idiom re-schedules the *current* call's own argument
-//!   vector, which the host's NIF-call frame already holds. The name is handed over as `&str`
-//!   (interning it, and any atom-table limit, is the host's concern).
+//!   `NifHost::send`'s `None` means. The host resolves the concrete sender itself, and a send made
+//!   with no calling process (an `enif_thread_create`d worker, an `env == NULL` send) has the C's
+//!   `undefined` sender — never a fabricated pid.
+//!   `msg_env` (the message's own environment in the C) is **used**: it is the host source when `env`
+//!   is null, and the message terms live on it. The C *transfers* that env's heap into the outgoing
+//!   message (`erts_create_message_from_nif_env`, `:812-841`); this seam hands the host the term, so a
+//!   host whose heap is not the receiver's **copies** it across the `copy_struct` boundary — same
+//!   observable (the message arrives intact), different allocation behaviour.
+//! * **`enif_schedule_nif` runs the continuation it is asked to schedule.** The C returns the trap
+//!   marker `THE_NON_VALUE` (`0`) and lets the emulator re-run the trap, so the continuation's value
+//!   becomes the call's result later (`erl_nif.c:3561-3604`, `:3512-3558`). This layer folds that
+//!   re-run into the *outermost* call: [`super::schedule`] validates nothing itself, but
+//!   `enif_schedule_nif` refuses `argc > 255` (`MAX_ARG`, `erl_vm.h:48`), a negative `argc`, a
+//!   `flags` with any bit outside `ERL_NIF_DIRTY_JOB_CPU_BOUND | ERL_NIF_DIRTY_JOB_IO_BOUND`, a
+//!   `NULL`/non-UTF-8 `fun_name`, a `NULL` function pointer, a `NULL` `argv` with `argc > 0` and a
+//!   `NULL` env — every one of them `badarg`, as the C raises — and otherwise runs the continuation
+//!   chain to completion, returning its value. A **nested** schedule (a continuation scheduling the
+//!   next one) answers the C's `0` exactly. See [`super::schedule`] for the measured oracle
+//!   transcript, the constant-stack trampoline, the yield-point seam and the dirty-thread-type
+//!   marker. `NifHost::schedule_nif` is a **legacy hook this entry point no longer consults**.
 //! * **`enif_make_monitor_term`/`enif_demonitor_process` need a usable `env`** (they rebuild the
 //!   reference on its heap); with a `NULL` env they report the crate's "cannot" answer (`badarg`
 //!   term / `1`) instead of faulting.
@@ -137,7 +145,7 @@ use crate::nif::host::NifMonitorResult;
 use crate::nif::types::{ErlNifMonitor, ErlNifPid, ErlNifPort};
 
 /// `MAX_ARG` (`erl_vm.h:48`) — the largest argument count `enif_schedule_nif` accepts.
-const MAX_ARG: c_int = 255;
+pub(crate) const MAX_ARG: c_int = 255;
 
 /// The C's "the resource type carries no `down` callback" code (`erl_nif.c:3968-3972`).
 const MONITOR_NO_DOWN_CALLBACK: c_int = -1;
@@ -387,6 +395,36 @@ unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -
 /// Returns `1` when the message was sent and `0` when it was not (dead receiver, no host support, or
 /// an unusable `env`/`to_pid`) — the C's only two outcomes.
 ///
+/// # Which host delivers
+///
+/// The host is resolved from `env` when it is a live env, **else from `msg_env`**. That second source
+/// is the documented `enif_send(NULL, &pid, msg_env, msg)` idiom, which the oracle accepts
+/// unconditionally (measured `{0,1,1}` for `env == NULL` *on a scheduler thread*, and `1` for the same
+/// call from an `enif_thread_create`d worker) because the C needs no calling process at all: the
+/// message env carries its own heap and the VM-global atom table. Here, a `msg_env` produced by
+/// [`NifHost::alloc_env`](crate::nif::host::NifHost::alloc_env) is a real env with a real host
+/// behind it, so reaching the host through *it* is exactly what the C does.
+///
+/// # What the seam guarantees, and what it does not
+///
+/// * **Delivery is synchronous inside this call** and the host must **wake a parked receiver**: the
+///   C puts the message in the target's mailbox before `enif_send` returns
+///   (`erts_queue_message`, `erl_nif.c:1093`), and a receiver blocked in `receive` is resumed by it —
+///   a deferred/batched flush would be a different (wrong) observable.
+/// * **The C transfers the message env's heap; this seam may copy.** `erts_create_message_from_nif_env`
+///   splices the env's fragment chain and off-heap list into the `ErtsMessage` and nulls the env's
+///   (`erl_nif.c:812-841`, used at `:960`), so a C `msg_env` send is zero-copy and the term cannot be
+///   reused afterwards. [`NifHost::send`](crate::nif::host::NifHost::send) is handed the **term** and
+///   the sender, so a host whose heap is not the receiver's (the runtime's is) *copies* it across the
+///   `copy_struct` boundary; the observable — the message arrives intact — is the same, the
+///   allocation behaviour is not, and reusing the term after the send stays a caller error either way.
+/// * **The sender identity with no calling process is `undefined`, never a fabricated pid.** The C
+///   derives it from the caller's env (`from = c_p ? c_p->common.id : am_undefined`, `erl_nif.c:996`),
+///   which is why `None` is passed here — "the calling process" — and a call that has no calling
+///   process (a NIF-created thread, an `env == NULL` send) therefore has no sender. The host must
+///   report the C's `undefined`; minting a pid for it would be a wrong term in the receiver's
+///   `process_info(_, messages)`.
+///
 /// # Safety
 ///
 /// `env`/`msg_env` must be null or live envs; `to_pid` must be null or point at a readable
@@ -395,7 +433,7 @@ unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -
 pub unsafe extern "C" fn enif_send(
     env: *mut crate::nif::types::ErlNifEnv,
     to_pid: *const ErlNifPid,
-    _msg_env: *mut crate::nif::types::ErlNifEnv,
+    msg_env: *mut crate::nif::types::ErlNifEnv,
     msg: ERL_NIF_TERM,
 ) -> c_int {
     if to_pid.is_null() {
@@ -404,10 +442,17 @@ pub unsafe extern "C" fn enif_send(
     }
     // SAFETY: `to_pid` is non-null and readable (caller contract).
     let receiver = t(unsafe { (*to_pid).pid });
-    let Some(e) = (unsafe { env_mut(env) }) else {
+    // One `env_mut` result at a time: `msg_env` is only consulted when `env` is not a live env (the
+    // `enif_send(NULL, &pid, msg_env, msg)` form), so no second `&mut NifEnv` is ever live here.
+    let resolved = match unsafe { env_mut(env) } {
+        Some(e) => Some(e),
+        // SAFETY: `msg_env` must be null or a live env (caller contract); a null one answers `None`.
+        None => unsafe { env_mut(msg_env) },
+    };
+    let Some(e) = resolved else {
         return 0;
     };
-    // `None`: the sender is the calling process (see the module docs).
+    // `None`: the sender is the calling process — `undefined` when this thread has none (see above).
     match e.host().send(receiver, None, t(msg)) {
         Some(sent) => sent as c_int,
         None => 0,
@@ -808,10 +853,36 @@ pub unsafe extern "C" fn enif_make_monitor_term(
 
 /// `ERL_NIF_TERM enif_schedule_nif(ErlNifEnv*, const char*, int, ERL_NIF_TERM (*)(ErlNifEnv*,int,const ERL_NIF_TERM[]), int, const ERL_NIF_TERM[]);`
 ///
-/// Delegates to `NifHost::schedule_nif` (the runtime's reschedule onto a regular or dirty scheduler)
-/// and returns the term the scheduled call will produce. Raises `badarg` for `argc > MAX_ARG`, a
-/// `flags` bit outside the two dirty-job bits, a null `fun_name`, a null function pointer, a
-/// negative `argc`, or no host support — it never pretends to have scheduled anything.
+/// Validates the call exactly as the C does and then hands it to the continuation trampoline
+/// ([`super::schedule::run`]), which runs the scheduled call — and any chain it reschedules — to
+/// completion and returns the chain's value. The `fun_name` argument is interned and otherwise
+/// ignored: the C never resolves it against the module's function table, so a name that exists
+/// nowhere still works (measured: `sched_ghost_name(99)` → `{ghost,99}`).
+///
+/// # Refusals (all of them `badarg`)
+///
+/// In the C's order (`erl_nif.c:3569-3603`), plus two this crate must decide itself:
+///
+/// 1. `argc > MAX_ARG` (255, `erl_vm.h:48`) — checked **first**, before `fun_name` is even read;
+/// 2. a negative `argc`, which the C's `int` accepts but a NIF-entry argument count cannot mean;
+/// 3. a `flags` bit outside `ERL_NIF_DIRTY_JOB_CPU_BOUND | ERL_NIF_DIRTY_JOB_IO_BOUND`;
+/// 4. a null or non-UTF-8 `fun_name` (the C would `strlen`/intern raw bytes);
+/// 5. a null function pointer (the C would call through it);
+/// 6. a null `argv` with `argc > 0` (the C would read through it; `argc == 0` with a null `argv` is
+///    legal);
+/// 7. a null `env` — there is no host, so nothing can run.
+///
+/// A refusal is exactly what the C raises through `enif_make_badarg` (`erl_nif.c:3571-3601`): the
+/// `badarg` atom, recorded as the env's pending exception so the host turns it into `error:badarg`.
+/// Every refusal is therefore the same wire observable (`error:badarg`), which is why the C's
+/// ordering is only observable through *which* side effects did not happen (nothing interned, nothing
+/// run) — `schedule_tests.rs` pins both.
+///
+/// # The nested case
+///
+/// A continuation that schedules the next one gets [`schedule::non_value_term`] back — the C's
+/// `THE_NON_VALUE` (`erl_nif.c:399`) — while the outermost call still yields the chain's final value.
+/// See [`super::schedule`] for the full account, including that one substitution.
 ///
 /// # Safety
 ///
@@ -830,11 +901,12 @@ pub unsafe extern "C" fn enif_schedule_nif(
         ) -> ERL_NIF_TERM,
     >,
     argc: c_int,
-    _argv: *const ERL_NIF_TERM,
+    argv: *const ERL_NIF_TERM,
 ) -> ERL_NIF_TERM {
-    // C: `if (argc > MAX_ARG) return enif_make_badarg(env);` (`erl_nif.c:3569`). A negative `argc`
-    // cannot be expressed to the hook (which counts with a `usize`) and is refused too.
-    if argc > MAX_ARG || argc < 0 {
+    // C: `if (argc > MAX_ARG) return enif_make_badarg(env);` (`erl_nif.c:3569`) — checked before
+    // `fun_name`/`flags`, so a call that trips it interns nothing. A negative `argc` cannot be
+    // expressed to a NIF entry point and is refused too.
+    if !(0..=MAX_ARG).contains(&argc) {
         // SAFETY: delegated to `enif_make_badarg`, which tolerates a null env.
         return unsafe { enif_make_badarg(env) };
     }
@@ -850,7 +922,7 @@ pub unsafe extern "C" fn enif_schedule_nif(
         return unsafe { enif_make_badarg(env) };
     };
     let Ok(name) = core::str::from_utf8(name) else {
-        // The hook names the NIF with a `&str`; the C interns raw bytes.
+        // The C interns raw bytes; the host seam names atoms with a `&str`.
         // SAFETY: as above.
         return unsafe { enif_make_badarg(env) };
     };
@@ -859,17 +931,29 @@ pub unsafe extern "C" fn enif_schedule_nif(
         // SAFETY: as above.
         return unsafe { enif_make_badarg(env) };
     };
-    let scheduled = match unsafe { env_mut(env) } {
-        Some(e) => e.host().schedule_nif(name, flags, fptr, argc as usize),
-        None => None,
-    };
-    match scheduled {
-        Some(term) => n(term),
-        // SAFETY: as above — no host, so nothing was scheduled.
-        None => unsafe { enif_make_badarg(env) },
+    if argv.is_null() && argc > 0 {
+        // The C copies `argv` into the x-register array (`erl_nfunc_sched.c:126-130`), i.e. it reads
+        // through the null pointer. `argc == 0` with a null `argv` is the normal "no arguments" case.
+        // SAFETY: as above.
+        return unsafe { enif_make_badarg(env) };
     }
+    // The C interns `fun_name` here (`:3571-3573`) and stores it as the trampoline's mfa function
+    // (`erl_nfunc_sched.c:131-134`); it is never resolved, so nothing depends on the answer — only
+    // the interning itself is part of the contract. A null env (no host) is this entry point's last
+    // refusal: there is nothing to intern with and nowhere to run.
+    match unsafe { env_mut(env) } {
+        Some(e) => {
+            let _ = e.host().intern_atom(name);
+        }
+        // SAFETY: as above — no host, so nothing was scheduled.
+        None => return unsafe { enif_make_badarg(env) },
+    }
+    // SAFETY: every argument was validated above — the env is live (just dereferenced), `argv` is
+    // readable for `argc` (the caller's contract, and non-null unless `argc == 0`) and `fptr` is a
+    // real entry point. The trampoline borrows the env afresh per use, so no borrow of it is held
+    // into the continuation call.
+    unsafe { super::schedule::run(env, flags, fptr, argc, argv) }
 }
-
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod tests;

@@ -1248,10 +1248,22 @@ pub fn run(args: Vec<String>) -> i32 {
         // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
         // `ok` to a caller that keeps running, so the status is applied here — after the
         // whole expression has finished — instead of raising (the `halt/1` path below).
-        Ok(()) => source
-            .as_ref()
-            .and_then(|rt| rt.halt_status())
-            .unwrap_or(EXIT_OK),
+        Ok(()) => match source.as_mut() {
+            Some(runtime) => {
+                // The **one** graceful teardown of the NIF thread-env host factory, and the reason
+                // it lives here: the factory slot is process-global and last-install-wins, so it
+                // must not outlive the one long-lived runtime a real invocation builds — and there
+                // is deliberately no `Drop` impl for it, because this crate's own suite builds many
+                // runtimes in one process and each `Drop` would uninstall the others'. This arm is
+                // the only exit a real invocation takes on which the runtime is still alive and the
+                // process keeps running: every abnormal exit writes a crash dump (which reads the
+                // runtime's node state through [`write_crash_dump`], so it must not be torn down
+                // first) or ends in `abort`, and neither leaves anything to reclaim.
+                runtime.clear_nif_thread_env();
+                runtime.halt_status().unwrap_or(EXIT_OK)
+            }
+            None => EXIT_OK,
+        },
         Err(error) => {
             if let Some(status) = error::halt_status(&error) {
                 // The program asked to terminate with this status: no diagnostic, no dump.
@@ -1390,7 +1402,7 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             Ok(())
         }
         Action::Boot => {
-            let mut runtime = Runtime::new(config)?;
+            let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |_| Ok(()))
                 // The boot chain's failure is often a **structured** raise reason (the applied
                 // directive's own term), which `BeamError`'s `Display` can only render as the
@@ -1402,7 +1414,7 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             result
         }
         Action::Eval(expr) => {
-            let mut runtime = Runtime::new(config)?;
+            let mut runtime = build_runtime(config)?;
             // Real `erl -eval '2+3'` prints nothing and exits 0: the expression is
             // evaluated for its effect only (`halt`, a start script, …).
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
@@ -1416,7 +1428,7 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             function,
             args,
         } => {
-            let mut runtime = Runtime::new(config)?;
+            let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
                 let mut terms = Vec::with_capacity(args.len());
                 for name in &args {
@@ -1432,7 +1444,7 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             function,
             args,
         } => {
-            let mut runtime = Runtime::new(config)?;
+            let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
                 let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
                 let terms = runtime.materialize_args(&parsed)?;
@@ -1448,7 +1460,7 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             arity,
             args,
         } => {
-            let mut runtime = Runtime::new(config)?;
+            let mut runtime = build_runtime(config)?;
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
                 run_file(runtime, &file, &module, &function, arity, &args)
             });
@@ -1456,6 +1468,37 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             result
         }
     }
+}
+
+/// Builds the runtime a CLI action runs on, and installs the runtime's **NIF thread-env host
+/// factory** on it — the one route that produces a long-lived runtime a NIF's own thread can use
+/// (contract A.3).
+///
+/// # Why this is here and not in [`Runtime::new`]
+///
+/// [`Runtime::install_nif_thread_env`] fills a **process-global** slot in `beam_abi`
+/// (last-install-wins), while this crate's own test suite builds many runtimes in a single process:
+/// an install inside `Runtime::new` would have every one of them clobber the others', so a test that
+/// set up the seam would silently lose it to the next runtime the suite built. A *real* invocation
+/// builds exactly **one** long-lived runtime, which is precisely the shape the global slot is for,
+/// and this is that point: after the runtime exists and before the action (or the boot script it
+/// drives) runs, so a boot directive or the action itself may already create a NIF thread.
+///
+/// # A declined install is not a failed run
+///
+/// [`Runtime::install_nif_thread_env`] answers `false` only for a **poisoned** ABI factory lock (a
+/// holder panicked). That leaves the honest old behaviour in place — a NIF-created thread gets the
+/// C's `NULL` message env — so the run continues and the decline is recorded on the debug-trace
+/// channel rather than aborting a program that never asked for a foreign thread. The boolean is
+/// never discarded silently.
+fn build_runtime(config: RuntimeConfig) -> Result<Runtime> {
+    let mut runtime = Runtime::new(config)?;
+    if !runtime.install_nif_thread_env() && crate::debug_trace::enabled() {
+        crate::debug_trace::trace(format_args!(
+            "the NIF thread-env factory was not installed; a NIF-created thread gets a NULL env"
+        ));
+    }
+    Ok(runtime)
 }
 
 /// The literal boot script `init` falls back to when the command line names none

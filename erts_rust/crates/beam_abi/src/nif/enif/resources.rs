@@ -117,9 +117,14 @@
 //!    not find it (measured). This crate has no `load` session boundary (the loader owns it), so a
 //!    created type is visible immediately. Only `*tried` is pinned by the compatibility claim and it
 //!    is unaffected: the create branch reports `CREATE` either way.
-//! 6. **The `ERL_NIF_SELECT_STOP` (`stop`) callback is stored but never invoked** (it is driven by
-//!    `beam_io`, which is not wired to this crate). The `down` callback **is** invoked: the registry
-//!    carries the C's per-object monitor tree as one table keyed by the stored reference block
+//! 6. **Both remaining callbacks are invoked, and the `enif_select` STOP verdicts drive the `stop`
+//!    one.** [`call_resource_stop`] reproduces the C's `erts_resource_stop` (`erl_nif.c:3032-3041`) on
+//!    a nooproc env built from the type's host — synchronously for `ERL_NIF_SELECT_STOP_CALLED`
+//!    (`erl_check_io.c:1531`, `is_direct_call = 1`) and from the drain
+//!    [`run_pending_stops`](super::stop::run_pending_stops) for `ERL_NIF_SELECT_STOP_SCHEDULED`
+//!    (`:2241`, `is_direct_call = 0`); [`resource_type_has_stop`] is the "was the type opened with
+//!    one?" query the dispatch gates on. The `down` callback is invoked too: the registry carries the
+//!    C's per-object monitor tree as one table keyed by the stored reference block
 //!    ([`Registry::monitors`], owned by [`monitors`]), [`deliver_resource_down_id`] reproduces
 //!    `erts_fire_nif_monitor` (`erl_nif.c:3058-3115`) and [`Registry::forget_object`] cancels a dying
 //!    object's monitors silently (the C's `dtor_demonitor`, `:2940-2948`). The registry also exposes
@@ -320,8 +325,9 @@ struct ResourceType {
     name: String,
     /// `ErlNifResourceDtor*` — run when the last reference is released.
     dtor: Option<ErlNifResourceDtor>,
-    /// `ErlNifResourceStop*` — stored, never invoked (needs `enif_select`; see the module docs).
-    #[allow(dead_code)]
+    /// `ErlNifResourceStop*` — run by [`call_resource_stop`] for an `enif_select` STOP verdict
+    /// (`erl_check_io.c:1531` directly, `:2241` from the deferred drain), and observable through
+    /// [`resource_type_has_stop`].
     stop: Option<ErlNifResourceStop>,
     /// `ErlNifResourceDown*` — run by [`deliver_resource_down_id`] when a monitor armed on a resource
     /// of this type fires (`erts_fire_nif_monitor`, `erl_nif.c:3107-3108`), and observable through
@@ -1447,6 +1453,17 @@ pub use self::term::resource_term;
 mod keep;
 
 pub use self::keep::{keep_resource, unkeep_resource};
+
+// ---------------------------------------------------------------------------------------------
+// The `stop`-callback invocation seam — the C's `erts_resource_stop`
+// ---------------------------------------------------------------------------------------------
+// Running a type's `stop` (and answering whether it has one) needs a nooproc env built from the
+// type's own host; it lives in its own file (this one is at the ~1000-line target) and is re-exported
+// here, so `nif::enif::resources::{call_resource_stop, resource_type_has_stop}` is the public path.
+#[path = "resources_stop.rs"]
+mod stop_cb;
+
+pub use self::stop_cb::{call_resource_stop, resource_type_has_stop};
 
 #[cfg(test)]
 #[path = "resources_tests.rs"]
