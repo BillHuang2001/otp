@@ -324,7 +324,14 @@ const CENSUS: &[Row] = &[
         "pure term introspection over the frozen fun interior (`src/fun_info.rs`); never a seam key"
     ),
     // -- Class B: seam-blocked ----------------------------------------------
-    seam!("code", "coverage_support", 0, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
+    // The five `LocalFunIdentity` *renderers*: with no identity seam a local fun has
+    // no `#Fun<Module.OldIndex.OldUniq>` text to print, so the renderer answers the
+    // typed gap (an `External`/`Imported` fun never reaches the seam and renders).
+    seam!("erlang", "fun_to_list", 1, "LocalFunIdentity seam (`hook_sets::LOCAL_FUN_IDENTITY_BIFS`): the fun text is `erl_printf_term.c`'s `FUN_DEF` arm, which needs the defining module, `old_index` and `old_uniq` — on the seam for a `make_fun3` fun"),
+    seam!("erlang", "display", 1, "LocalFunIdentity seam (`hook_sets::LOCAL_FUN_IDENTITY_BIFS`): `display/1` is the same `FUN_DEF` text on the output sink"),
+    seam!("io", "format", 2, "LocalFunIdentity seam (`hook_sets::LOCAL_FUN_IDENTITY_BIFS`): `~w`/`~p` render a fun through the one shared `fun_text` leaf"),
+    seam!("io_lib", "format", 2, "LocalFunIdentity seam (`hook_sets::LOCAL_FUN_IDENTITY_BIFS`): `~w`/`~p` render a fun through the one shared `fun_text` leaf"),
+    seam!("io_lib", "format", 3, "LocalFunIdentity seam (`hook_sets::LOCAL_FUN_IDENTITY_BIFS`): `~w`/`~p` render a fun through the one shared `fun_text` leaf"),    seam!("code", "coverage_support", 0, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("code", "get_coverage", 2, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("code", "get_coverage_mode", 0, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
     seam!("code", "get_coverage_mode", 1, "RuntimeHooks seam (`hook_sets::RUNTIME_HOOKS_BIFS`): the answer is live VM state only the runtime holds"),
@@ -937,6 +944,27 @@ fn external_fun(ctx: &mut BifContext<'_>, arity: usize) -> Eterm {
     make_fun_external(ctx.heap(), arity, module, function).expect("an external fun fits")
 }
 
+/// A `FunKind::Local` (`make_fun3`) fun: the header word plus the
+/// `[uniq, index]` descriptor, with no module/name anywhere in the term.
+///
+/// The block is **leaked** deliberately: it must stay readable for the whole call,
+/// and a census row's argument vector cannot own the storage it points at.
+fn local_fun() -> Eterm {
+    let words: &'static mut [Eterm] = Box::leak(
+        vec![
+            Eterm::from_raw(beam_term::FUN_SUBTAG | (2usize << 8)),
+            Eterm::from_raw(0), // uniq
+            Eterm::from_raw(0), // index
+        ]
+        .into_boxed_slice(),
+    );
+    beam_term::make_boxed(words.as_ptr())
+}
+/// The character list `bytes` on the calling heap.
+fn byte_list(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Eterm {
+    let elems: Vec<Eterm> = bytes.iter().map(|&b| ctx.int(i64::from(b)).expect("fits")).collect();
+    ctx.list(&elems).expect("a short list fits")
+}
 /// The list `[1, 2]` on the calling heap.
 fn list12(ctx: &mut BifContext<'_>) -> Eterm {
     let one = ctx.int(1).expect("fits");
@@ -1076,6 +1104,16 @@ fn args_for(
             // `<<65,204,129>>` — `a` followed by U+0301, which composes to `å`.
             let image = make_binary(ctx.heap(), &[65, 204, 129]).expect("fits");
             vec![image]
+        }
+        // -- `LocalFunIdentity` renderers: only a *local* fun reaches the seam ---
+        ("erlang", "display", 1) | ("erlang", "fun_to_list", 1) => vec![local_fun()],
+        ("io", "format", 2) | ("io_lib", "format", 2) => {
+            let format = byte_list(ctx, b"~w");
+            vec![format, ctx.list(&[local_fun()]).expect("fits")]
+        }
+        ("io_lib", "format", 3) => {
+            let format = byte_list(ctx, b"~w");
+            vec![format, ctx.list(&[local_fun()]).expect("fits"), NIL]
         }
         _ => small_ints(ctx, arity),
     }
@@ -1274,14 +1312,26 @@ fn the_class_b_rows_are_the_seam_union_minus_the_documented_defaults() {
         extra.is_empty(),
         "class-B rows that no gap-defaulting seam table lists: {extra:?}"
     );
-    // The overlap is exactly the four `LOCAL_FUN_IDENTITY_BIFS` keys, which are also
-    // `LOCAL_NODE_BIFS` members: their uninstalled default is `Ok(None)`, so they are
-    // class-D rows and the subtraction above is what keeps the equation exact.
+    // The overlap is exactly the four `LOCAL_FUN_IDENTITY_BIFS` **encoders**, whose
+    // uninstalled default is `Ok(None)`, so they are class-D rows; the table's five
+    // renderers default to the typed gap instead and are ordinary class-B rows.
     let overlap: BTreeSet<Key> = universe.intersection(&defaults).copied().collect();
+    let encoders: BTreeSet<Key> = [
+        ("erlang", "term_to_binary", 1),
+        ("erlang", "term_to_binary", 2),
+        ("erlang", "external_size", 1),
+        ("erlang", "external_size", 2),
+    ]
+    .into_iter()
+    .collect();
     let local_fun_identity: BTreeSet<Key> = LOCAL_FUN_IDENTITY_BIFS.iter().copied().collect();
     assert_eq!(
-        overlap, local_fun_identity,
-        "the class-D rows that a class-B table lists must be exactly `LOCAL_FUN_IDENTITY_BIFS`"
+        overlap, encoders,
+        "the class-D rows that a class-B table lists must be exactly the four `LOCAL_FUN_IDENTITY_BIFS` encoders"
+    );
+    assert!(
+        overlap.is_subset(&local_fun_identity),
+        "every overlapping class-D row must be a `LOCAL_FUN_IDENTITY_BIFS` member"
     );
     // ... and every class-D row *does* read some seam: none of them is a stray.
     for &key in &defaults {
@@ -1326,14 +1376,14 @@ fn class_a_and_class_c_are_disjoint_from_the_seam_union() {
 /// | class | rows | meaning |
 /// |---|---|---|
 /// | A | 4 | closed in-crate |
-/// | B | 206 | `210` seam-table keys − the `4` `LOCAL_FUN_IDENTITY_BIFS` defaults |
+/// | B | 211 | `215` seam-table keys − the `4` `LOCAL_FUN_IDENTITY_BIFS` defaults |
 /// | C | 23 | `erl_debugger` 13 + `erts_debug` 8 + the 2 collector RPCs |
 /// | D | 8 | `LOCAL_NODE_BIFS` 6 + `RECORD_SOURCE_BIFS` 1 + `EXPORT_GATE_BIFS` 1 |
 #[test]
 fn the_class_counts_are_pinned() {
     let counts = [
         (Class::A, 4usize),
-        (Class::B, 206),
+        (Class::B, 211),
         (Class::C, 23),
         (Class::D, 8),
     ];
