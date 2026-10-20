@@ -60,7 +60,7 @@
 //!   policy* is a runtime decision, so the row asserts the twin rule and the
 //!   `schedulers_online =< schedulers` invariant, never the oracle's figure.
 //! * `+sbwt1000` — the oracle **rejects a numeric busy-wait threshold** in *both* spellings
-//!   (`bad scheduler busy wait threshold: 1000` + the `beam.smp` usage block, exit 1) while
+//!   (exit 1, its diagnostic on the controlling terminal) while
 //!   this runtime accepts it verbatim; that is a *value-validation* difference, not a
 //!   spelling one, so the row asserts the twin rule and the same-config property on this
 //!   runtime only. The same switch with a symbolic value (`+sbwtlong`/`+sbwt long`) is
