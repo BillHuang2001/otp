@@ -97,6 +97,8 @@ pub(crate) mod executing;
 #[cfg(test)]
 mod dist_connect_tests;
 mod ets_owner;
+#[cfg(test)]
+mod lost_peer_tests;
 mod gc;
 mod scheduler;
 mod timer_wakes;

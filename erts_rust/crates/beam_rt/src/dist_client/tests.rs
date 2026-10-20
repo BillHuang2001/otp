@@ -800,3 +800,47 @@ fn a_queued_monitor_exit_is_pending_until_the_flush_and_decodes_watched_first() 
         other => panic!("expected a DOP_MONITOR_P_EXIT, got {other:?}"),
     }
 }
+
+/// A link retired **before** it completed its `'N'` handshake records **no** lost peer: no
+/// process can hold a relationship with a peer that never became a node, so a failed dial is
+/// the diagnostic in [`DistClient::last_error`] and never a `noconnection` the scheduler pass
+/// would apply (`crate::dist::links::LostPeers`).
+///
+/// The peer in this fixture accepts the connection and hangs up without answering the `'N'`
+/// frame — the shape a re-dial to a peer that has just gone away leaves behind.
+#[test]
+fn a_retirement_that_never_handshook_records_no_lost_peer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("read the port");
+    let mut atoms = Table::new();
+    let our = atom_term(atoms.intern("client@localhost"));
+    let client = DistClient::new(b"cook".to_vec()).expect("client");
+    client.set_identity("client@localhost", our, 1, b"cook");
+    let lost = crate::dist::links::new_lost_peers();
+    client.use_lost_peers(std::rc::Rc::clone(&lost));
+    client
+        .connect_addr("peer@localhost", addr, &mut atoms)
+        .expect("dial the loopback peer");
+    let (stream, _) = listener.accept().expect("the client connected");
+    drop(stream);
+
+    for _ in 0..50 {
+        client.pump(&mut atoms).expect("the client pump");
+        if !client.has_links() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !client.has_links(),
+        "the link is retired rather than left half-open"
+    );
+    assert!(
+        client.last_error().is_some(),
+        "the retirement stays observable as a diagnostic"
+    );
+    assert!(
+        lost.borrow().is_empty(),
+        "a link that never handshook was never a node down, so nothing is recorded"
+    );
+}
