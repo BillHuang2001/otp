@@ -234,7 +234,13 @@ impl TcpInetDriver {
                     // An active-mode discovery is reported to the owner (`{tcp_closed, S}` /
                     // `{tcp_error, S, Reason}`, `inet_drv.c:12841`/`:12871`), not owed to a
                     // receive, so it arms no receive one-shot.
-                    let read = self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
+                    let read = {
+                        let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
+                        if let Some(source) = close {
+                            self.latch_peer_close(ctx, source)?;
+                        }
+                        bytes.len()
+                    };
                     if read == 0 {
                         // `EAGAIN`, or a peer close the read latched: the socket is drained and
                         // the retained bytes are not a whole frame yet.
@@ -258,7 +264,10 @@ impl TcpInetDriver {
         let mut bytes = core::mem::take(&mut self.pending_input);
         // Same rule as [`TcpInetDriver::deliver_framed`]: an active-mode close is reported to the
         // owner, so it owes no receive reply.
-        self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
+        let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
+        if let Some(source) = close {
+            self.latch_peer_close(ctx, source)?;
+        }
         if bytes.is_empty() {
             return Ok(());
         }
