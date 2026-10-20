@@ -35,7 +35,7 @@ use beam_term::prelude::Eterm;
 use crate::bounds::ScannedBounds;
 use crate::copy::Copier;
 use crate::error::heap_exhausted;
-use crate::heap_info::HeapObservable;
+use crate::heap_info::{old_heap_size, HeapObservable};
 use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
 use crate::reachable::ReachableObject;
@@ -80,8 +80,13 @@ impl Collector {
     }
 
     /// Creates a collector with the given `policy`, backed by `alloc`.
+    ///
+    /// The young space is created at [`HeapPolicy::initial_heap_words`] — the C's initial-heap
+    /// rule, `max(heap_need, min_heap_size)` — so an emulator `+hms` or a `spawn_opt`
+    /// `{min_heap_size, N}` sizes a new process's first heap, and
+    /// `erlang:process_info(P, heap_size)` reports it.
     pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<Collector> {
-        let nursery = Nursery::new(alloc.clone(), policy.initial_young_words)?;
+        let nursery = Nursery::new(alloc.clone(), policy.initial_heap_words())?;
         let mature = HeapSpace::with_allocator(alloc, policy.initial_mature_words)?;
         Ok(Collector {
             policy,
@@ -528,6 +533,15 @@ impl HeapObservable for Collector {
         self.nursery.capacity_words() + self.mature.capacity_words()
     }
 
+    /// The mature generation's capacity **once a collection has populated it**, in words —
+    /// the C's `old_hend - old_heap`, which exists only after the old generation has been
+    /// created by a collection (`erl_gc.c:1470-1478`).
+    fn old_heap_size_words(&self) -> usize {
+        old_heap_size(
+            self.stats.minor_collections + self.stats.major_collections,
+            self.mature.capacity_words(),
+        )
+    }
     /// The words handed out across **every** nursery space — the allocatable current one and
     /// each space a [`grow_nursery`](Self::grow_nursery) retired — so a chained nursery reports
     /// its whole occupancy rather than only the space new terms go into.

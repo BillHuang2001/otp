@@ -217,8 +217,12 @@ impl GenImmixCollector {
     }
 
     /// Creates an Immix-backed collector with `policy`, backed by `alloc`.
+    ///
+    /// The young space is created at [`HeapPolicy::initial_heap_words`] — the C's initial-heap
+    /// rule, `max(heap_need, min_heap_size)` — exactly as the copying collector does, so the
+    /// mature-generation strategy never changes the heap size a process is born with.
     pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<GenImmixCollector> {
-        let nursery = Nursery::new(alloc.clone(), policy.initial_young_words)?;
+        let nursery = Nursery::new(alloc.clone(), policy.initial_heap_words())?;
         let mature = ImmixSpace::with_allocator(alloc, policy.initial_mature_words)?;
         Ok(GenImmixCollector {
             policy,
@@ -877,6 +881,15 @@ impl HeapObservable for GenImmixCollector {
         self.nursery.capacity_words() + self.mature.capacity_words()
     }
 
+    /// The mark-region mature generation's capacity **once a collection has populated it**, in
+    /// words — the C's `old_hend - old_heap`, which exists only after a collection
+    /// (`erl_gc.c:1470-1478`).
+    fn old_heap_size_words(&self) -> usize {
+        crate::heap_info::old_heap_size(
+            self.stats.minor_collections + self.stats.major_collections,
+            self.mature.capacity_words(),
+        )
+    }
     /// The words handed out across **every** nursery space — the allocatable current one and
     /// each space a [`grow_nursery`](Self::grow_nursery) retired — so a chained nursery reports
     /// its whole occupancy rather than only the space new terms go into.

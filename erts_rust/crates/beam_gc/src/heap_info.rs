@@ -39,14 +39,37 @@
 //!
 //! * `heap_size` = the nursery's **capacity** in words — the "heap" in the C sense, i.e.
 //!   how many words the process may currently allocate before the next collection;
-//! * `total_heap_size` = `heap_size` **plus the mature generation's capacity** — the C's
-//!   `heap_sz + old heap`, since the mature space is this scheme's old generation.
+//! * `total_heap_size` = `heap_size` **plus the old generation, while it exists** — the C's
+//!   `heap_sz + old heap`. The mature space *is* this scheme's old generation, but the C's
+//!   old heap is created by a collection, so [`HeapObservable::old_heap_size_words`] answers
+//!   `0` for a process that has never been collected and the mature capacity afterwards.
+//!   [`HeapObservable::total_heap_size_words`] (the real capacity sum) is the **accounting**
+//!   figure — what [`HeapFootprint::of`](crate::HeapFootprint::of) and the `max_heap_size`
+//!   door read — and is deliberately a different number for a fresh process.
 //!
 //! Words, not bytes: the oracle's numbers are word counts too.
 //!
 //! This module is safe Rust and inspects no term interior.
 
 use crate::policy::HeapPolicy;
+
+/// The old generation's reported size, in words: **`0` until a collection has populated it**,
+/// the mature generation's capacity afterwards.
+///
+/// This is the C's `old_hend && old_heap ? old_hend - old_heap : 0`
+/// (`erts/emulator/beam/erl_bif_info.c:1023-1030`): the old heap is *created by a
+/// collection* (`erl_gc.c:1470-1478`), so a freshly spawned process reports
+/// `total_heap_size == heap_size` even though this runtime's collector already owns an
+/// (empty, pre-allocated) mature space. `collections` is the collector's accumulated
+/// minor + major count ([`GcStats`](crate::stats::GcStats)), which is the "a collection has
+/// run" fact the C reads off the heap pointers.
+pub(crate) fn old_heap_size(collections: u64, mature_capacity_words: usize) -> usize {
+    if collections == 0 {
+        0
+    } else {
+        mature_capacity_words
+    }
+}
 
 /// The `garbage_collection` observables of one live collector — the values a
 /// `process_info(Pid, garbage_collection)` reply and the heap-size fields of
@@ -73,7 +96,12 @@ pub struct HeapInfo {
     pub max_heap_size: usize,
     /// The nursery's capacity in words — the process's current usable heap.
     pub heap_size: usize,
-    /// `heap_size` plus the mature generation's capacity, in words.
+    /// The collector's summed capacity — `heap_size` plus the mature generation's capacity, in
+    /// words ([`HeapObservable::total_heap_size_words`]).
+    ///
+    /// This is the **accounting** figure. The oracle's observable `total_heap_size` is the
+    /// C-shaped `heap_size + old_heap_size_words()` (the old generation counts only once a
+    /// collection has created it), which `beam_rt`'s `process_info` snapshot composes.
     pub total_heap_size: usize,
 }
 
@@ -98,7 +126,23 @@ pub trait HeapObservable {
     /// The current usable heap in words (see [`HeapInfo::heap_size`]).
     fn heap_size_words(&self) -> usize;
     /// The total heap in words (see [`HeapInfo::total_heap_size`]).
+    ///
+    /// **This is the collector's real summed capacity**, nursery plus mature generation, and it
+    /// deliberately keeps that meaning: [`HeapFootprint::of`](crate::HeapFootprint::of) (the
+    /// `erlang:memory` accounting) and the `max_heap_size` admission door both read it, and
+    /// neither may see a generation the collector has already allocated disappear from the
+    /// figure. The C-shaped, *observable* `total_heap_size` is
+    /// `heap_size_words() + old_heap_size_words()` — use that for a `process_info` reply.
     fn total_heap_size_words(&self) -> usize;
+    /// The old generation's size in words **as the C reports it**: `0` until a collection has
+    /// populated the mature generation, its capacity afterwards — the C
+    /// `old_hend && old_heap ? old_hend - old_heap : 0`
+    /// (`erts/emulator/beam/erl_bif_info.c:1023-1030`).
+    ///
+    /// `heap_size_words() + old_heap_size_words()` is the observable `total_heap_size`, which is
+    /// why a freshly spawned process reports the same figure for both items: the oracle's old
+    /// heap is created by a collection (`erl_gc.c:1470-1478`), not at spawn.
+    fn old_heap_size_words(&self) -> usize;
     /// The **chain-summed** nursery occupancy in words: the words handed out across every
     /// nursery space, the allocatable current one **and** every space a
     /// [`grow_nursery`](crate::Collector::grow_nursery) retired.

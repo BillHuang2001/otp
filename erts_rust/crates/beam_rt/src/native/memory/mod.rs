@@ -1276,7 +1276,15 @@ impl RuntimeContext<'_> {
             priority: process.priority().name(),
             group_leader: self.runtime.group_leader_of(pid).to_eterm(),
             heap_size: process.collector().heap_size_words(),
-            total_heap_size: process.collector().total_heap_size_words(),
+            // The C's `total_heap_size` = `HEAP_SIZE(p) + (old_hend - old_heap)`
+            // (`erl_bif_info.c:1023-1030`): the old generation counts **only while it exists**,
+            // and a collection is what creates it (`erl_gc.c:1470-1478`). So a freshly spawned
+            // process reports `total_heap_size == heap_size` here, exactly as the oracle does,
+            // even though this collector already owns an (empty) mature space — the real
+            // capacity sum stays available through `total_heap_size_words` for the
+            // `erlang:memory` accounting and the `max_heap_size` door.
+            total_heap_size: process.collector().heap_size_words()
+                + process.collector().old_heap_size_words(),
             stack_size: process.registers().stack().len(),
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),
