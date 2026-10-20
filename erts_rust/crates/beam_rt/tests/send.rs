@@ -592,7 +592,9 @@ fn an_eval_bang_to_a_dead_pid_agrees_with_the_live_oracle() {
         stdout.trim(),
         "the two runtimes must agree on a `!` to a dead pid"
     );
-}/// A destination the oracle rejects with `badarg` raises `badarg` from compiled code too.
+}
+
+/// A destination the oracle rejects with `badarg` raises `badarg` from compiled code too.
 ///
 /// Oracle: `try sp:bif_send(42, x) catch C:E -> {C,E} end` ⇒ `{error,badarg}`.
 #[test]
