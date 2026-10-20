@@ -39,6 +39,9 @@ pub(crate) mod debugger;
 pub(crate) mod erlang;
 pub(crate) mod erts_debug;
 pub(crate) mod erts_internal;
+/// The `beam_makeops`-generated `opc[]` roster behind `erts_debug:instructions/0`
+/// (generated data — see that file's header and `gen_instructions.escript`).
+mod instructions;
 mod memory;
 pub(crate) mod other;
 

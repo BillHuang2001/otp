@@ -1863,6 +1863,21 @@ impl<'a> BifContext<'a> {
         }
         Ok(acc)
     }
+
+    /// The charlist `[b0, b1, …]` of `text`'s **bytes** on the context heap — the
+    /// C's `erts_bld_string_n` (`erl_bif_io.c`) / `buf_to_intlist` shape: one small
+    /// integer per byte, so a non-ASCII character becomes its UTF-8 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's allocation failure.
+    pub fn charlist(&mut self, text: &str) -> Result<Eterm> {
+        let mut elems = Vec::with_capacity(text.len());
+        for byte in text.bytes() {
+            elems.push(self.int(i64::from(byte))?);
+        }
+        self.list(&elems)
+    }
 }
 
 #[cfg(test)]

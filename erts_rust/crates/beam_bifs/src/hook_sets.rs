@@ -47,7 +47,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 143 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 141 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -479,8 +479,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_debug", "dirty", 3),
     ("erts_debug", "dirty_cpu", 2),
     ("erts_debug", "dirty_io", 2),
-    ("erts_debug", "dist_ext_to_term", 2),
-    ("erts_debug", "instructions", 0),
     ("erts_internal", "abort_pending_connection", 2),
     ("erts_internal", "beamfile_chunk", 2),
     ("erts_internal", "beamfile_module_md5", 1),
@@ -1203,7 +1201,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 143);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 141);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the

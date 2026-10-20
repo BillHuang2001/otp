@@ -22,18 +22,21 @@
 //! internal debugging tools).
 //!
 //! Every key below is a declared `bif.tab` entry. Most of them are **host-independent
-//! constants or pure term operations**, and those are implemented here **for real**
-//! (see `REAL_BIFS`): `unaligned_bitstring/2` (a bitstring-to-bitstring
-//! transformation), `map_info/1` (a walk of a HAMT map's node interiors), the
-//! `lcnt`/`interpreter_size`/`disassemble` constants, the `get_internal_state` /
-//! `set_internal_state` gate, `size_shared/1` and `copy_shared/2` (term walks), and
-//! the two `notsup` protocol stubs of the trace/literal-area collectors.
+//! constants, pure term operations or self-contained decode/table work**, and those are
+//! implemented here **for real** (see `REAL_BIFS`): `dist_ext_to_term/2` (the
+//! distribution decode, over the shared `beam_codec` decoder with an `AtomCache`),
+//! `instructions/0` (this tree's generated `beam_makeops` roster),
+//! `unaligned_bitstring/2` (a bitstring-to-bitstring transformation), `map_info/1` (a
+//! walk of a HAMT map's node interiors), the `lcnt`/`interpreter_size`/`disassemble`
+//! constants, the `get_internal_state` / `set_internal_state` gate, `size_shared/1` and
+//! `copy_shared/2` (term walks), and the two `notsup` protocol stubs of the
+//! trace/literal-area collectors.
 //!
-//! The rest require the *running* runtime (VM introspection, the distribution codec,
-//! lock-counter bookkeeping, the dirty-scheduler probes). Each of those is registered
-//! through the single [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so with no
-//! hook installed a call answers the typed `unsupported_bif` capability gap — never
-//! `undef`, never a fabricated value.
+//! The rest require the *running* runtime (VM introspection of dirty schedulers and
+//! breakpoints). Each of those is registered through the single
+//! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so with no hook installed a call
+//! answers the typed `unsupported_bif` capability gap — never `undef`, never a
+//! fabricated value.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -60,7 +63,9 @@ use crate::registry::BifRegistry;
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("erts_debug", "copy_shared", 2),
     ("erts_debug", "disassemble", 1),
+    ("erts_debug", "dist_ext_to_term", 2),
     ("erts_debug", "get_internal_state", 1),
+    ("erts_debug", "instructions", 0),
     ("erts_debug", "interpreter_size", 0),
     ("erts_debug", "lcnt_clear", 0),
     ("erts_debug", "lcnt_collect", 0),
@@ -80,19 +85,22 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty, 3);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_cpu, 2);
     crate::runtime::runtime_bif!(reg, "erts_debug", dirty_io, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", dist_ext_to_term, 2);
-    crate::runtime::runtime_bif!(reg, "erts_debug", instructions, 0);
 
-    // The host-independent keys, implemented below. `map_info/1` summarises a HAMT
-    // map's node interior; `unaligned_bitstring/2` is a bitstring-to-bitstring
-    // transformation; the `lcnt`/`interpreter_size`/`disassemble` keys are the
-    // constants a build without those facilities answers; the internal-state pair is
-    // the `available_internal_state` gate; `size_shared`/`copy_shared` are term walks;
-    // and the two collector keys are `notsup` stubs (their machinery does not exist in
-    // this runtime at all — see the module docs on each).
+    // The host-independent keys, implemented below. `dist_ext_to_term/2` is the
+    // distribution decode over the shared `beam_codec` decoder and
+    // `instructions/0` renders this tree's generated `beam_makeops` roster;
+    // `map_info/1` summarises a HAMT map's node interior; `unaligned_bitstring/2`
+    // is a bitstring-to-bitstring transformation; the
+    // `lcnt`/`interpreter_size`/`disassemble` keys are the constants a build
+    // without those facilities answers; the internal-state pair is the
+    // `available_internal_state` gate; `size_shared`/`copy_shared` are term walks;
+    // and the two collector keys are `notsup` stubs (their machinery does not
+    // exist in this runtime at all — see the module docs on each).
     reg.register("erts_debug", "copy_shared", 2, copy_shared_2);
     reg.register("erts_debug", "disassemble", 1, disassemble_1);
+    reg.register("erts_debug", "dist_ext_to_term", 2, dist_ext_to_term_2);
     reg.register("erts_debug", "get_internal_state", 1, get_internal_state_1);
+    reg.register("erts_debug", "instructions", 0, instructions_0);
     reg.register("erts_debug", "interpreter_size", 0, interpreter_size_0);
     reg.register("erts_debug", "lcnt_clear", 0, lcnt_clear_0);
     reg.register("erts_debug", "lcnt_collect", 0, lcnt_collect_0);
@@ -722,6 +730,106 @@ fn walk_hashmap(map: Eterm) -> Result<HashMapInfo> {
         }
     }
     Ok(info)
+}
+
+/// `ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (`../../erts/emulator/beam/external.h:120`):
+/// the atom-cache slot count `dist_ext_to_term/2` fills from its first argument.
+///
+/// It is 255 — one fewer than the 256 a one-byte index can address — so the C's
+/// `if (arity > ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES) goto badarg`
+/// (`external.c:1362-1363`) refuses a 256-element tuple. Every index the BIF
+/// accepts is therefore `< 255` and its `u8` slot cast is exact.
+const MAX_INTERNAL_ATOM_CACHE_ENTRIES: usize = 255;
+
+/// `erts_debug:instructions/0` — the instruction-dispatch table's names.
+///
+/// Ground truth: `../../erts/emulator/beam/beam_debug.c:376-393`
+/// (`erts_debug_instructions_0`), which builds
+/// `[opc[i].name || i <- 0..num_instructions-1]`: **every** row of the
+/// `beam_makeops`-generated `opc[]` table, in dispatch order, each name a charlist
+/// of its bytes.
+///
+/// Those names carry `beam_makeops`' operand-type suffixes
+/// (`allocate_heap_tIt`, `append_cons_Is`, …), so they are **not** `genop.tab`'s
+/// opcode names and cannot be derived from the loader's roster. The table is
+/// therefore generated data: [`super::instructions::INSTRUCTIONS`], emitted by the
+/// committed `gen_instructions.escript` from this tree's own generator (see that
+/// file's header for the why and the how).
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1): **245** entries, the first four
+/// `["aligned_label_Lt", "allocate_tt", "allocate_heap_tIt", "append_cons_Is"]`
+/// and the last `"wait_unlocked_f"`. This tree is OTP 30 and its `ops.tab` reworked
+/// the native-record family, so its table holds **248**; the difference is a
+/// release skew, not a divergence, and is pinned as an explicit exception set by
+/// `the_generated_roster_matches_a_live_oracle_modulo_the_release_skew` below.
+///
+/// # Errors
+///
+/// Propagates a heap-allocation failure.
+fn instructions_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let mut names = Vec::with_capacity(super::instructions::INSTRUCTIONS.len());
+    for name in super::instructions::INSTRUCTIONS {
+        names.push(ctx.charlist(name)?);
+    }
+    ctx.list(&names)
+}
+
+/// `erts_debug:dist_ext_to_term/2` — decode an external-term image the way the
+/// **distribution** receiver does, with a caller-supplied atom cache.
+///
+/// Ground truth: `../../erts/emulator/beam/external.c:1340-1405`
+/// (`erts_debug_dist_ext_to_term_2`) → `erts_decode_dist_ext` (`:1273-1311`).
+/// The argument order of the C's guards is reproduced exactly, because every
+/// failure is `badarg` and only the *first* failing guard is observable:
+///
+/// 1. `is_not_tuple(arg1)` ⇒ `badarg` (`:1358-1359`);
+/// 2. `arity > ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (255) ⇒ `badarg`
+///    (`:1362-1363`);
+/// 3. a non-atom element ⇒ `badarg` (`:1366-1370`) — the tuple fills atom-cache
+///    slots `0..arity-1` in order;
+/// 4. `is_not_bitstring(arg2)` or a non-byte-aligned or **empty** bitstring ⇒
+///    `badarg` (`:1372-1380`);
+/// 5. a first byte that is not `VERSION_MAGIC` (131) ⇒ `badarg` (`:1290-1295`);
+/// 6. a truncated or unrecognized image ⇒ `badarg` (`:1296-1298`).
+///
+/// Trailing bytes after the term are ignored (the C decodes one term and returns
+/// it), and an `ATOM_CACHE_REF` (`82`) whose slot the caller did not fill is the
+/// C's `attab` bound failure ⇒ `badarg`. The term is materialized on the context
+/// heap by the shared `beam_codec` decoder — the same one `binary_to_term` uses,
+/// installed with `beam_codec::AtomCache` — never a second decoder.
+///
+/// Oracle-verified (OTP 29.1.1 / erts-17.1); the matrix is pinned by
+/// `dist_ext_to_term_matches_the_oracle_matrix` below.
+///
+/// # Errors
+///
+/// Always [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a rejected
+/// argument or image; otherwise propagates a heap-allocation failure.
+fn dist_ext_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let slots = args[0];
+    if !access::is_tuple(slots) {
+        return Err(badarg());
+    }
+    let arity = access::tuple_size(slots);
+    if arity > MAX_INTERNAL_ATOM_CACHE_ENTRIES {
+        return Err(badarg());
+    }
+    let mut cache = beam_codec::AtomCache::new();
+    for index in 0..arity {
+        let atom = access::tuple_element(slots, index);
+        if !access::is_atom(atom) {
+            return Err(badarg());
+        }
+        // `index < arity <= 255`, so the one-byte on-wire slot index is exact.
+        cache.set(index as u8, atom_val(atom));
+    }
+    // A non-bitstring and a non-byte-aligned bitstring are both `badarg` here;
+    // the empty image is the C's `size == 0` guard.
+    let data = crate::bits::bytes(args[1])?;
+    if data.is_empty() {
+        return Err(badarg());
+    }
+    crate::binconv::decode_dist_ext_image(ctx, &data, &cache)
 }
 
 #[cfg(test)]
