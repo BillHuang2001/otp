@@ -238,6 +238,9 @@ exactly the runtime glue the external driver measures and this table cannot. The
 that the runtime regression is a **runtime-glue** effect, not an engine-tier lowering effect on this
 compiled shape.
 
+## Known Issues
+- **The harness is eager-only**: it drives `JitBackend::compile`, so it pins the **eager** whole-module artifact and does **not** measure the **lazy** per-entry path `CodeCache::compiled_handle` gives the runtime. Per-process/startup figures live in `../../../MEASURED.md` (`Measured (baseline-JIT cold start …)`) and the lazy path's correctness in `tests/jit_cache.rs`/`tests/jit_real_module.rs`.
+
 ## Routing Table
 - `support.rs` → the shared scaffolding (see API Surface); `workloads.rs` → the four deopted workloads
   (`build/0`, `map/2`, `select/1`, `walk/2`), the partially-inlined `sum/1`, the cross-module `cross/2`

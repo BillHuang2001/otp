@@ -121,7 +121,10 @@ accessors are claimed from either variant and the three pure accessors from `Bif
   `unsupported` (writing shared module constants would corrupt them), so the emitted guard rejects
   that bit too, branching to the helper. The store writes the word `8*(1+offset)` past the header —
   the exact word `get_tuple_element` reads — straight through scratch (no write barrier, no
-  cached-register clobber).
+  cached-register clobber). Pinned by
+  `tests/jit.rs::tuple_writes_match_the_interpreter_on_real_tuples`,
+  `::the_tuple_write_is_inlined_and_caches_its_registers`, and the two rejected-target tests
+  (`a_non_tuple_tuple_write_target_…`, `a_literal_area_tuple_write_target_…`).
 - **arith** (`arith.rs::fast_arith`): only `erlang` `+`/`-`/`*` at arity 2, `args.len() == 2`; the
   destination is an in-bound x-register (`FastDest::X`) **or an addressable Y slot** (`FastDest::Y`),
   and every operand is loadable — an in-bound x-register, an **addressable Y slot** (`FastSource::YSlot`)
