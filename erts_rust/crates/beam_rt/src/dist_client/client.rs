@@ -368,6 +368,7 @@ impl DistClient {
             name: peer.full().to_string(),
             driver,
             stream,
+            was_established: false,
             bytes_in: 0,
             bytes_out: 0,
         });
@@ -722,7 +723,15 @@ impl DistClientInner {
     fn retire(&mut self, index: usize, err: BeamError) {
         let link = self.links.outbound.remove(index);
         let name = link.name.clone();
-        let established = link.is_established();
+        // `was_established`, not `is_established`: the pump that found the link dead is what
+        // moved its driver out of `Established` (see [`ClientLink::was_established`]), so the
+        // live state would report every lost peer as one that never handshook.
+        let established = link.was_established();
+        if crate::debug_trace::dist_enabled() {
+            crate::debug_trace::dist(format_args!(
+                "client.retire[{index}] name={name} established={established} err={err}"
+            ));
+        }
         self.last_error = Some(format!("{name}: {err}"));
         if established {
             note_lost_peer(&self.lost, &name);

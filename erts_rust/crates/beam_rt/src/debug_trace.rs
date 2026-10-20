@@ -49,3 +49,21 @@ pub(crate) fn trace(args: fmt::Arguments<'_>) {
         eprintln!("[rt-trace] {args}");
     }
 }
+
+/// Whether the **distribution diagnostic** trace is on (`BEAM_RT_DEBUG_DIST` present).
+///
+/// A channel of its own rather than a second use of [`enabled`]: a live two-VM run's boot
+/// trace is thousands of lines, and what a peer-loss investigation needs is the handful the
+/// link halves and the peer-loss drain emit. Resolved once per OS process, like `enabled`.
+pub(crate) fn dist_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BEAM_RT_DEBUG_DIST").is_some())
+}
+
+/// Writes one distribution diagnostic line to stderr when [`dist_enabled`]; a no-op
+/// otherwise. A diagnostic only — no behaviour depends on it.
+pub(crate) fn dist(args: fmt::Arguments<'_>) {
+    if dist_enabled() {
+        eprintln!("[rt-dist] {args}");
+    }
+}

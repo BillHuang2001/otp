@@ -334,7 +334,17 @@ impl DistNode {
         }
         let mut index = 0;
         while index < connections.len() {
+            let before = connections[index].state();
             let outcome = connections[index].pump();
+            if crate::debug_trace::dist_enabled() {
+                crate::debug_trace::dist(format_args!(
+                    "node.pump link[{index}] {before:?} -> {:?} established={} live={} outcome={:?}",
+                    connections[index].state(),
+                    connections[index].is_established(),
+                    connections[index].is_live(),
+                    outcome.as_ref().map(|_| ()).map_err(|e| format!("{e}"))
+                ));
+            }
             match outcome {
                 Ok(progress) => events += progress,
                 Err(err) => {
@@ -574,12 +584,24 @@ fn retire_at(
 ) {
     // Read the peer **before** the removal: the retired link is the only witness to which
     // node went away.
-    let lost_peer = if connections[index].is_established() {
+    //
+    // The question is `was_established`, **not** `is_established`: the pump that found the
+    // link dead is the very call that moved its driver out of `Established` (a peer's EOF →
+    // `Closed`, a protocol error → `Failed`), so the live state answers "never handshook" for
+    // every dying link and the peer loss is never recorded.
+    let established = connections[index].was_established();
+    let lost_peer = if established {
         connections[index].peer_name()
     } else {
         None
     };
-    let mut connection = connections.remove(index);
+    if crate::debug_trace::dist_enabled() {
+        crate::debug_trace::dist(format_args!(
+            "node.retire[{index}] peer={:?} state={:?} established={established} err={err}",
+            connections[index].peer_name(),
+            connections[index].state()
+        ));
+    }    let mut connection = connections.remove(index);
     let closed = connection.close();
     let reason = match connection.peer_name() {
         Some(peer) => format!("{peer}: {err}"),
@@ -590,6 +612,7 @@ fn retire_at(
         Err(close_err) => format!("{reason} (close: {close_err})"),
     });
     if let Some(peer) = lost_peer {
+        crate::debug_trace::dist(format_args!("node.retire: note_lost_peer {peer}"));
         note_lost_peer(lost, &peer);
     }
 }

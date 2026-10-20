@@ -844,3 +844,42 @@ fn a_retirement_that_never_handshook_records_no_lost_peer() {
         "a link that never handshook was never a node down, so nothing is recorded"
     );
 }
+
+/// **A lost outbound link records its peer.** A link that completed its `'N'` handshake and
+/// then loses the peer (the socket closes) is a node that went down, so its `node@host` name
+/// lands in the runtime's shared [`LostPeers`](crate::dist::links::LostPeers) recorder — the
+/// record [`crate::Runtime::service_lost_dist_peers`] turns into OTP's `noconnection`
+/// semantics.
+///
+/// The question the retirement asks is **`was_established`**, never the live state: the pump
+/// that discovers the peer's EOF is what moves the driver to `Closed`, so a retirement that
+/// asked `is_established()` would answer `false` for every dying link and no `noconnection`
+/// would ever fire for a real `erl` peer's `init:stop()`.
+#[test]
+fn a_retirement_that_had_established_records_its_peer_as_lost() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 7);
+    let lost = crate::dist::links::new_lost_peers();
+    client.use_lost_peers(std::rc::Rc::clone(&lost));
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+    assert!(client.is_connected("peer@localhost"), "the handshake completed");
+    assert!(lost.borrow().is_empty(), "nothing was lost while the peer was alive");
+
+    // The peer's node goes away: its socket closes, exactly as a dying `erl`'s does.
+    drop(stream);
+    for _ in 0..200 {
+        client.pump(&mut atoms).expect("the client pump");
+        if !client.has_links() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !client.has_links(),
+        "the dead link is retired rather than left half-open"
+    );
+    assert_eq!(
+        *lost.borrow(),
+        vec!["peer@localhost".to_string()],
+        "a link that had established is a peer whose node went down"
+    );
+}

@@ -3195,6 +3195,11 @@ impl Runtime {
             return Ok(0);
         };
         let lost = take_lost_peers(&self.lost_dist_peers);
+        if crate::debug_trace::dist_enabled() {
+            crate::debug_trace::dist(format_args!(
+                "drain: lost={lost:?} linked={linked:?}"
+            ));
+        }
         let mut fired = 0;
         for name in lost {
             if linked.iter().any(|live| *live == name) {
@@ -3203,10 +3208,12 @@ impl Runtime {
             }
             // Existing atoms only: a name the shared table cannot name is a decline.
             let Some(atom) = self.code_server.atoms_mut().lookup(&name) else {
+                crate::debug_trace::dist(format_args!("drain: {name} not in the atom table"));
                 continue;
             };
             let node = make_atom(atom);
             let reason = make_atom(self.code_server.atoms_mut().intern("noconnection"));
+            crate::debug_trace::dist(format_args!("drain: node_down {name} noconnection"));
             table.node_down(node, reason)?;
             fired += 1;
         }
@@ -4183,6 +4190,18 @@ impl Runtime {
                 "distribution: this runtime has no distribution client",
             ));
         };
+        // **Connecting is idempotent**: a peer this runtime already has an established link to
+        // — one it dialled, or one the peer opened — is connected, so nothing is dialled.
+        // That is what OTP does (`net_kernel:connect_node/1` answers `true` for a node already
+        // in `nodes()` without a socket round trip, and `erts_get_dist_entry` reuses an
+        // existing entry), and it is load-bearing rather than an optimisation: a second `'N'`
+        // handshake to a peer that already has a connection from this node is a
+        // simultaneous-connection collision, which the peer resolves by killing one of the two
+        // links — so `net_adm:ping/1` against a peer that dialled *us* would report `pang` and
+        // tear down the live link.
+        if client.is_connected_any_half(peer) {
+            return Ok(());
+        }
         client.set_identity(&name, make_atom(local_node), creation, &cookie);
         client.connect(peer, self.code_server.atoms_mut())?;
         let deadline = std::time::Instant::now() + DIST_CONNECT_TIMEOUT;
