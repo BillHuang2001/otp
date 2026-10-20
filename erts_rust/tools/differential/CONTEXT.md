@@ -143,7 +143,7 @@ Corpus groups (`src/corpus/*`): the **per-group inventory is the `differential-c
 - A.4 built-in drivers → `udp.rs` (32), `ram_file.rs` (21), `inet_control.rs` (15), `inet_write.rs` (11)
 - A.5 → `wire.rs`, `wire_extra.rs` (443), `dist.rs` (5), `dist_extra.rs` (15)
 - A.6 → `flags.rs`, `flags_apply.rs`
-- A.7 → `bifs.rs`, `ets.rs`, `ets_access.rs`, `ets_spec.rs`, `maps.rs`, `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`, `re.rs` (141), `format_limit.rs` (21), `ddll.rs` (21), `decode_packet.rs` (43), `proc_signals.rs`, `proc_control.rs`, `records.rs`, `zlib.rs` (36)
+- A.7 → `bifs.rs`, `ets.rs`, `ets_access.rs`, `ets_spec.rs`, `maps.rs`, `phash.rs`, `binmatch.rs`, `math_bifs.rs`, `printing.rs`, `re.rs` (141), `format_limit.rs` (21), `ddll.rs` (21), `decode_packet.rs` (43), `proc_signals.rs`, `proc_control.rs`, `records.rs` (46), `zlib.rs` (36)
 - A.8 → `system_info.rs`
 - A.1/A.7 → `bits.rs` (37), `gc.rs` (38)
 - A.9 → `boot.rs`, `boot_prereq.rs` (72), `boot_extra.rs` (275), `selfhost.rs` (26), `selfhost_chain.rs` (7)
