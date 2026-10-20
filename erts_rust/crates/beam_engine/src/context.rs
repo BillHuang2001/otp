@@ -853,7 +853,9 @@ pub trait ExecutionContext {
     /// answers the typed [`crate::error::unsupported`]).
     fn apply_fun_outcome(&mut self, fun: Eterm, args: &[Eterm]) -> Result<FunOutcome> {
         self.apply_fun(fun, args).map(FunOutcome::Return)
-    }    /// `send`: deliver `message` to the pid/port term `to` (the `send` opcode).
+    }
+
+    /// `send`: deliver `message` to the pid/port term `to` (the `send` opcode).
     ///
     /// The default body is a typed [`crate::error::unsupported`] — a context with
     /// no mailbox cannot send. On `Ok` the `send` opcode stores the **message
