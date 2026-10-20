@@ -845,12 +845,14 @@ than two).
   monitor/demonitor/group-leader and both monitor-`DOWN` forms), each emitting no outbound `DOP_*`.
   Still owed downstream: the **reply** half of the signal contract (see the reply-channel entry below),
   the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol, and a `DFLAG_PUBLISHED`/visibility advertisement
-  at startup (no `publish_flag` caller). The per-link **checked** path this crate exposes
-  (`Connection::recv_delivery_checked`/`dispatch_inbound_checked`, `ConnectionDriver::next_delivery_checked`/
-  `dispatch_inbound_checked`, over `LinkIdentity` + `Delivery::classify_validated`) is **not yet adopted
-  there**: `LocalDeliverySink` is a single sink built once per scheduler pass and shared across every
-  established link, so it cannot supply the per-link peer identity the C's `dep` check needs — adoption
-  requires a per-link sink (or threading the link's peer into `InboundSink::deliver`).
+  at startup (no `publish_flag` caller). The per-link **checked** path is ADOPTED in both production
+  drives — `Delivery::classify_validated` over `LinkIdentity` runs inside the per-link forwarder
+  (`beam_rt/src/dist/connection.rs:365-372` → `ConnectionDriver::dispatch_inbound_checked`,
+  `beam_rt/src/dist_client/client.rs:826`), so a delivery is validated against *that* link's
+  `peer_name()`/`our_name()`; the check deliberately cannot live in the sink, which is one
+  `LocalDeliverySink` built per scheduler pass and shared by every link (no peer to compare a `From`
+  against). A validation `Err` retires just that link (the C's `invalid_message` connection kill);
+  `Connection::dispatch_inbound` (unchecked) remains the embedding/test seam.
 - **`InboundSink` has no reply channel — the C's per-opcode replies are not emitted.**
   `InboundSink::deliver(&mut self, &Delivery) -> Result<DeliveryOutcome>` (`src/delivery.rs:1151`) returns
   only an outcome; a sink owns no connection/driver/output queue (the `DeliveryOutcome` doc even says the
