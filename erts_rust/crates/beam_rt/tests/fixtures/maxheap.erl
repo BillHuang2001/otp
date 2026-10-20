@@ -40,8 +40,10 @@
 %% * `reports_per_collection/0` — the measurement behind "one report per over-limit
 %%   collection": the victim reports the **runtime's own** collection-counter delta
 %%   around its work, so the suite can compare it with the number of reports.
-%% * `capacity_not_occupancy/0` — a victim that never holds more than ~60 words of live
-%%   data still breaches `#{size => 700}`: the check is on the collected **capacity**.
+%% * `capacity_not_occupancy/0` — a victim that never holds more than ~500 words of live
+%%   data (the 100-element list it keeps) still breaches `#{size => 700}`, because a
+%%   fullsweep installs `mature_target_words` = `2 x (live + young occupancy + reserve)`
+%%   words: the check is on the collected **capacity**, never on occupancy.
 %% * `floor/0` — the `size` floor matrix (`224`…`235` around the default
 %%   `min_heap_size` 233, plus `0`, a negative, a float, a map without `size`).
 %% * `spawn_opt_*/0` — `spawn_opt`'s `{max_heap_size, Map}` really carries the flags.
@@ -200,6 +202,11 @@ capacity_not_occupancy() ->
 small(Parent) ->
     _ = process_flag(max_heap_size, #{size => 700, kill => false, error_logger => true}),
     Live = grow(100, []),
+    %% Churn: build and abandon a second list, so the victim reaches a collection (and its
+    %% prospective post-collection capacity) with only `Live` resident. Without it the victim
+    %% grows its nursery inline through the growth seam, never collects, and so never reaches
+    %% a capacity check at all.
+    _ = grow(60, []),
     Parent ! {done, self(), {length(Live), is_list(Live)}},
     ok.
 
