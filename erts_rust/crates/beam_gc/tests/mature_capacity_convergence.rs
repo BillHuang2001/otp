@@ -44,10 +44,11 @@
 //! promoted becomes garbage the moment the next round's root set replaces it, so by the time the
 //! cadence fires the mature space is full of dead words. Sizing the fresh space from that
 //! occupancy therefore asks the policy for room for the *garbage* as well as the live set, and
-//! `HeapPolicy::mature_after_fullsweep`'s `should_grow` fires on every single fullsweep — the
-//! capacity creeps up one growth-table step per fullsweep, without bound, for a live set that
-//! never changes. The fullsweep must instead be sized from the **exact live word count** of the
-//! graph it evacuates (the C `adjust_after_fullsweep`'s `HEAP_TOP(p) - HEAP_START(p)`).
+//! `HeapPolicy::mature_after_fullsweep`'s grow bracket (`capacity < target`) fires on every single
+//! fullsweep once the target is derived from that occupancy — it exceeds the capacity at every
+//! round — so the capacity creeps up one growth-table step per fullsweep, without bound, for a
+//! live set that never changes. The fullsweep must instead be sized from the **exact live word
+//! count** of the graph it evacuates (the C `adjust_after_fullsweep`'s `HEAP_TOP(p) - HEAP_START(p)`).
 //!
 //! Every corpus here is deterministic (no randomness) and every **assertion** is a deterministic
 //! count — capacities and occupancies. **No timing is ever asserted** and none is measured; the

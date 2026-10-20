@@ -60,9 +60,10 @@
 //! plus the reserve (the C `adjust_after_fullsweep`'s
 //! `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …`, `erl_gc.c:2072`) — and **never** from
 //! the *mature* generation's (garbage-inflated) pre-collection occupancy. Sizing from the mature
-//! occupancy makes [`HeapPolicy::should_grow`] fire on every fullsweep and creeps the capacity up
-//! one growth-table step per fullsweep, without bound, for a live set that never changes. The
-//! young occupancy is a different quantity: it is bounded by the nursery capacity, which
+//! occupancy makes the `capacity < target` grow bracket fire on every fullsweep (the target a
+//! mature-occupancy-keyed rule derives exceeds the capacity at every round), so it creeps the
+//! capacity up one growth-table step per fullsweep, without bound, for a live set that never
+//! changes. The young occupancy is a different quantity: it is bounded by the nursery capacity, which
 //! [`HeapPolicy::young_after_collection`] keeps bounded, so the capacity converges under the very
 //! cadence a plain process runs — the strongest form of the regression assertion. The same
 //! property, isolated from the nursery, is pinned by `tests/mature_capacity_convergence.rs`.
