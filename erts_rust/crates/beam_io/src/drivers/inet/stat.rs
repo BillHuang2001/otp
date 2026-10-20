@@ -308,4 +308,53 @@ mod tests {
         assert_eq!(stat.send_avg, 0.0);
         assert_eq!(stat.send_max, 0);
     }
+
+    /// The oracle-measured zero-length sequence `5, 0, 10, 0, 0`, which pins the C's
+    /// **floating-point** average update against an integer-truncating one.
+    ///
+    /// Measured on OTP 29.1.1 / erts-17.1 (a raw `{packet,0}` `tcp_inet` socket, the rendered
+    /// `send_cnt`/`send_max`/`send_avg`/`send_pend`/`send_oct` block per step):
+    /// `[0,0,0,0,0]` → `[1,5,5,0,5]` → `[2,5,2,0,5]` → `[3,10,5,0,15]` → `[4,10,3,0,15]`
+    /// → `[5,10,3,0,15]`.
+    ///
+    /// By hand from `inet_output_count` (`inet_drv.c:11560`-`:11582`, `avg` captured **before**
+    /// the update, `len` promoted to `double` by the usual arithmetic conversions):
+    /// * `len = 5`,  `n = 1` ⇒ `avg = 0 + (5 - 0)/1 = 5`;
+    /// * `len = 0`,  `n = 2` ⇒ `avg = 5 + (0 - 5)/2 = 2.5`;
+    /// * `len = 10`, `n = 3` ⇒ `avg = 2.5 + (10 - 2.5)/3 = 5`;
+    /// * `len = 0`,  `n = 4` ⇒ `avg = 5 + (0 - 5)/4 = 3.75`;
+    /// * `len = 0`,  `n = 5` ⇒ `avg = 3.75 + (0 - 3.75)/5 = 3`.
+    ///
+    /// The rendered `2` at step 2 is the discriminator: an integer-truncating update would carry
+    /// `5 + (0 - 5)/2` with C's toward-zero integer division, i.e. `5 - 2 = 3`, and the oracle
+    /// answers `2`. A zero-length call still advances `send_cnt` and leaves `send_oct` and
+    /// `send_max` untouched.
+    #[test]
+    fn the_oracle_zero_length_sequence_keeps_the_average_floating_point() {
+        let mut stat = InetStat::default();
+        let mut rendered = Vec::new();
+        let mut octets = Vec::new();
+        let mut peaks = Vec::new();
+        for len in [5usize, 0, 10, 0, 0] {
+            stat.output(len);
+            // `inet_fill_stat` renders the average through a 32-bit truncation
+            // (`(unsigned long) desc->send_avg`, `inet_drv.c:10732`-`:10792`).
+            rendered.push(stat.send_avg as u32);
+            octets.push(stat.send_oct);
+            peaks.push(stat.send_max);
+        }
+        assert_eq!(rendered, vec![5, 2, 5, 3, 3], "the oracle's rendered send_avg column");
+        assert_eq!(octets, vec![5, 5, 15, 15, 15], "a zero-length send adds no octets");
+        assert_eq!(peaks, vec![5, 5, 10, 10, 10], "nor moves the peak");
+        assert_eq!(stat.send_cnt, 5, "every call counts, zero-length ones included");
+        assert_eq!(stat.send_avg, 3.0, "the double never truncates internally");
+    }
 }
+
+#[cfg(test)]
+#[path = "stat_send_tests.rs"]
+mod send_tests;
+
+#[cfg(test)]
+#[path = "stat_send_udp_tests.rs"]
+mod send_udp_tests;
