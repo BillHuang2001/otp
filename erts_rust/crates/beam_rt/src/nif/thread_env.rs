@@ -18,7 +18,6 @@
 //
 // %CopyrightEnd%
 
-#![allow(dead_code)] // wired by the runtime startup in a follow-up task; see the module docs
 
 //! The **process-independent host for NIF-created threads** — the [`NifHost`] behind
 //! `enif_alloc_env`/`enif_make_atom`/`enif_send` on a thread a NIF created (contract **A.3**).
@@ -159,9 +158,11 @@ const THREAD_ENV_HEAP_WORDS: usize = 1 << 20;
 
 /// One `enif_send` a NIF-created thread issued.
 ///
-/// Queued by [`ForeignHost::send`] and drained by the runtime at its next pump (the follow-up
-/// wiring), which decodes `image` onto the receiver's heap against the runtime's **live** atom table
-/// and enqueues it in the target's mailbox, waking a parked receiver.
+/// Queued by [`ForeignHost::send`] and drained by
+/// [`Runtime::drain_nif_thread_sends`](crate::runtime::Runtime::drain_nif_thread_sends) at the
+/// runtime's next pump — a NIF call's return (`try_call_nif`) or the scheduler pass family's port
+/// step — which decodes `image` onto a scratch heap against the runtime's **live** atom table and
+/// enqueues the result in the target's mailbox, waking a parked receiver.
 pub(crate) struct ForeignSend {
     /// The receiver, resolved from the `ErlNifPid` the caller passed: an **internal local** pid.
     pub(crate) target: ProcessId,

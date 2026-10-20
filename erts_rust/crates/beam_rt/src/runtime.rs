@@ -80,6 +80,7 @@ use crate::hasher::{FastHashMap, FastHashSet};
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::atoms::ForeignAtomHub;
+use crate::nif::thread_env::{ForeignSends, ThreadEnvFactory};
 use crate::nif::NifRegistry;
 use crate::nif_monitor::NifMonitorIndex;
 use crate::perf_map::PerfMap;
@@ -469,6 +470,18 @@ pub struct Runtime {
     /// observer can always take it from inside the finalizer — the same argument as
     /// [`Runtime::ets_owners`].
     pub(crate) nif_monitors: Rc<RefCell<NifMonitorIndex>>,
+    /// The queue the **NIF-created-thread hosts** push `enif_send`s onto, when this runtime has
+    /// installed `beam_abi`'s process-global thread-env factory
+    /// ([`Runtime::install_nif_thread_env`]); `None` on every runtime that has not, which is the
+    /// state of every differential case, every benchmark leg and every test that does not opt in.
+    ///
+    /// It is the runtime's handle to the same `Arc<Mutex<…>>` the installed
+    /// [`ThreadEnvFactory`](crate::nif::thread_env::ThreadEnvFactory) clones into every host it
+    /// opens: the producers are the NIF's own threads, the consumer is
+    /// [`Runtime::drain_nif_thread_sends`]. `None` is what makes that drain observationally inert
+    /// (one `Option` test, no lock), and [`Runtime::clear_nif_thread_env`] drops it so a stale
+    /// factory cannot queue into a buffer nobody drains any more.
+    nif_thread_sends: Option<ForeignSends>,
     /// The node-global **persistent-term** store behind the seven `persistent_term:*`
     /// BIFs.
     ///
@@ -1297,6 +1310,7 @@ impl Runtime {
             busy_port_waits: FastHashMap::default(),
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
             nif_monitors,
+            nif_thread_sends: None,
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             executing: None,
@@ -1501,6 +1515,322 @@ impl Runtime {
     pub(crate) fn foreign_atoms(&self) -> Option<Arc<ForeignAtomHub>> {
         self.code_server.foreign_atoms()
     }
+
+    /// Install `beam_abi`'s **process-global thread-env host factory** for this runtime, so a
+    /// thread a NIF created (`enif_thread_create`) can obtain a real [`NifHost`] — and therefore a
+    /// real message env, a creatable atom and a deliverable `enif_send` — instead of the C's
+    /// `NULL` env (contract **A.3**).
+    ///
+    /// # This is a host decision, not an ABI one
+    ///
+    /// `beam_abi` owns the slot and the reachability order (`enif_alloc_env` looks for the calling
+    /// thread's call host, then the factory-opened thread host, then `NULL`); whether a *runtime*
+    /// fills that slot is entirely up to the host, because only the host knows where the atoms a
+    /// foreign thread creates must land and how a thread-safe send becomes a mailbox delivery. This
+    /// method is that decision for `beam_rt`: the factory it installs is
+    /// [`ThreadEnvFactory`](crate::nif::thread_env::ThreadEnvFactory), whose hosts intern through
+    /// this runtime's one atom-index hub and whose `enif_send` queues a complete ETF image for
+    /// [`Runtime::drain_nif_thread_sends`].
+    ///
+    /// A runtime that never installs it keeps the **honest old answer**: a NIF-created thread gets
+    /// the C's `NULL` message env, never a fake host — a crate-private `AtomTable` would hand a NIF
+    /// an atom index this runtime does not hold, which is a *wrong term*, and a fabricated delivery
+    /// would be a lie about a message that never arrived.
+    ///
+    /// # The atom index space is installed first
+    ///
+    /// A factory's hosts **create** atoms (`enif_make_atom`), so they must draw from the one live
+    /// index space. [`Runtime::install_foreign_atom_hub`] is therefore called first when no hub is
+    /// attached, and the very hub it attached is the one handed to the factory — installing a
+    /// factory over a private index space is exactly the wrong-term failure this method exists to
+    /// avoid, so a hub that cannot be reached makes the install **decline** (`false`) rather than
+    /// proceed.
+    ///
+    /// # The node identity the images carry
+    ///
+    /// The factory's hosts encode an `enif_send` message as a complete ETF image with this node's
+    /// identity installed, so an internal pid/port/reference inside it has a wire image. The name
+    /// is [`Runtime::local_node`]'s — the atom this runtime interned at construction, spelled here
+    /// through the shared table (the configured `node@host` when `-name`/`-sname` made it a node,
+    /// else [`NONODE_NAME`] as the fallback for an atom the table cannot spell) — and the creation
+    /// is [`Runtime::node_creation`], which is `u32` already: the codec's own width, so no
+    /// narrowing is applied.
+    ///
+    /// # Answers, idempotence and the process-global slot
+    ///
+    /// `true` when the factory was installed. `false` only when the ABI's factory lock is
+    /// **poisoned** (a holder panicked) — the seam then keeps whatever it had, and this method
+    /// stores nothing, so a poisoned install can never be turned into a success here. Installation
+    /// is **last-install-wins** and process-global: a second call replaces (and drops) the previous
+    /// factory and hands this runtime a **fresh** queue, which is why the crate's own test suites
+    /// serialise installs with [`lock_nif_thread_env`].
+    pub fn install_nif_thread_env(&mut self) -> bool {
+        if self.foreign_atoms().is_none() {
+            self.install_foreign_atom_hub();
+        }
+        let Some(hub) = self.foreign_atoms() else {
+            // Unreachable (`install_foreign_atom_hub` always attaches one), and deliberately not
+            // an assert: a factory over a private index space would hand a NIF a wrong atom index.
+            return false;
+        };
+        // The node identity, read from the runtime's one source of truth (see the docs above).
+        let node = match self.atoms().name(self.local_node()) {
+            Some(name) => name.to_string(),
+            None => NONODE_NAME.to_string(),
+        };
+        let creation = self.node_creation();
+        let factory = ThreadEnvFactory::new(
+            hub,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            node,
+            creation,
+        );
+        // The runtime's drain handle comes from the factory itself, so the queue a foreign thread
+        // pushes onto and the one [`Runtime::drain_nif_thread_sends`] reads can never be two
+        // different `Vec`s (cloning a handle built separately would be correct too, but this cannot
+        // drift by construction).
+        let sends: ForeignSends = factory.sends();
+        let installed = beam_abi::nif::install_thread_env_factory(Box::new(factory));
+        if installed {
+            self.nif_thread_sends = Some(sends);
+        }
+        installed
+    }
+
+    /// Uninstall the thread-env host factory and drop this runtime's handle to its send queue —
+    /// the explicit teardown of [`Runtime::install_nif_thread_env`].
+    ///
+    /// The order is load-bearing: [`beam_abi::nif::clear_thread_env_factory`] runs **first**, so no
+    /// host can be opened (or stay cached) for the factory that is about to lose its queue, and only
+    /// then is the runtime's [`ForeignSends`] handle dropped, so a factory that somehow outlived the
+    /// clear cannot queue into a buffer nobody drains any more.
+    ///
+    /// A message already queued but not yet drained is **dropped** here: its `enif_send` had
+    /// already answered the C's `1`, and this is a host teardown, not a delivery point. The
+    /// alternative — delivering from a method that owns no process table — would have to choose,
+    /// silently, which table a blocking pass is using.
+    ///
+    /// # This is never called from `Drop`
+    ///
+    /// The factory is **process-global** and last-install-wins, while the crate's own suite builds
+    /// many runtimes in one process: a `Drop` that cleared the slot would have each of them uninstall
+    /// the others' factory as it went out of scope. Teardown therefore stays an explicit host
+    /// decision, made by the one long-lived runtime a real invocation builds (see
+    /// [`crate::cli`]).
+    pub fn clear_nif_thread_env(&mut self) {
+        beam_abi::nif::clear_thread_env_factory();
+        self.nif_thread_sends = None;
+    }
+
+    /// The **crate-visible serialisation lock** for [`Runtime::install_nif_thread_env`] /
+    /// [`Runtime::clear_nif_thread_env`] in the test suites.
+    ///
+    /// The factory slot behind those two methods is **process-global** (`beam_abi`'s
+    /// `Mutex<Option<Box<dyn ThreadEnvHostFactory>>>`, last-install-wins), while the crate's own
+    /// suite builds many runtimes in **one** process — and the default cargo test harness runs them
+    /// on several threads. Two installs that overlap therefore clobber each other: the last one wins
+    /// the global slot, and the earlier runtime keeps draining a queue nothing writes to any more
+    /// (or, worse, a `clear` between them leaves the other's hosts with no factory). A suite that
+    /// exercises the seam must hold this lock for the whole install → exercise → clear window:
+    ///
+    /// ```ignore
+    /// let _serial = crate::runtime::lock_nif_thread_env();
+    /// let mut runtime = runtime();
+    /// assert!(runtime.install_nif_thread_env());
+    /// // … spawn the NIF thread, drain, assert …
+    /// runtime.clear_nif_thread_env();
+    /// ```
+    ///
+    /// The guard is **poison-recovering**: a suite that panicked while holding it would otherwise
+    /// turn every later test in the same process into a second panic, which would hide the real
+    /// failure. Recovering keeps the *serialisation* guarantee (the lock is still exclusive) while
+    /// letting each test report its own outcome.
+    ///
+    /// Nothing in this crate calls it yet: it is the published handle for the suites that own the
+    /// seam's end-to-end cases (a NIF that creates a thread which sends), so it is allowed to be
+    /// unused until one does — the alternative, a private lock per suite, would give two suites
+    /// two locks and no serialisation at all.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn lock_nif_thread_env() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Delivers every `enif_send` the **NIF-created threads** queued since the last drain, answering
+    /// how many messages actually reached a mailbox.
+    ///
+    /// # The ordering substitution this closes
+    ///
+    /// The C delivers **synchronously inside `enif_send`**: a thread with no calling process has
+    /// `c_p == NULL`, so the sender is `am_undefined` and the message is in the receiver's mailbox
+    /// before `enif_send` returns (`erts/emulator/beam/erl_nif.c:1006`, `:876-877`). That is not
+    /// reachable here: the receiver's heap, mailbox and process table belong to the runtime's thread,
+    /// and the host runs on a thread that owns none of them
+    /// ([`crate::nif::thread_env`]'s module docs carry the full argument).
+    ///
+    /// The substitution is therefore explicit: the message is **queued at `enif_send` time** (which
+    /// is when the hook answers the C's `1`), and it lands in the receiver's mailbox — and wakes a
+    /// receiver parked in `receive` through the runtime's own resume-on-send wake list — at this
+    /// drain. "In the mailbox by the time `enif_send` returned" is **not** reproduced; "accepted at
+    /// that moment, delivered at the runtime's next pump" is.
+    ///
+    /// # The two call sites
+    ///
+    /// * [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext::try_call_nif) — a NIF call
+    ///   is where a NIF would have joined its worker thread, so what that thread queued is delivered
+    ///   before the calling process resumes;
+    /// * the scheduler pass family's port step ([`crate::runtime::scheduler`]) — so a message queued
+    ///   while no NIF call is in flight still lands.
+    ///
+    /// # What each message costs and what "skipped" means
+    ///
+    /// The image is a **complete ETF image** (leading `131`), so it is decoded onto a fresh scratch
+    /// [`Heap`] against the **live** atom table — [`CodeServer::atoms_mut`], which also commits the
+    /// hub's outstanding reservations, so an atom a foreign thread created is in the table before a
+    /// message naming it is read — with the local-node identity installed
+    /// ([`beam_codec::Decoder::with_local_node`] at [`Runtime::local_node`]/[`Runtime::node_creation`]),
+    /// i.e. the exact inverse of what `ForeignHost::encode_image` wrote: a local-node
+    /// `NEW_PID_EXT`/`V4_PORT_EXT`/reference in the image demotes back to the internal id. The
+    /// decoded term is then handed to the runtime's own send seam, the same one
+    /// [`NifBridge::load_nif`](crate::context::bridges::NifBridge) uses for a `load` callback's
+    /// sends.
+    ///
+    /// An item that cannot be delivered is **skipped and counted, never fabricated**: a scratch heap
+    /// that cannot be allocated, an image the codec refuses (a tag it will not decode, a malformed
+    /// shape) and a delivery the send seam rejects (the target is no longer a live process) each
+    /// leave that one message undelivered — the return value counts only the messages that really
+    /// landed, and the skip is reported on the debug-trace channel rather than lost. Nothing panics
+    /// and no placeholder term is ever delivered.
+    ///
+    /// `from: None` is the C's `am_undefined` sender (a message env has no calling process), **not**
+    /// the receiving process: the delivery carries that atom as the envelope sender, exactly as
+    /// `from = c_p ? c_p->common.id : am_undefined` writes it.
+    ///
+    /// # Cost with nothing installed
+    ///
+    /// The common case — no factory ever installed — is one `Option::is_none` on a field: no lock is
+    /// taken, no allocation is made and nothing is observable (the differential corpus, every
+    /// benchmark leg and every test that does not opt in stay byte-identical).
+    ///
+    /// With a factory installed the drain takes **one** uncontended `Mutex::lock` per call. The queue
+    /// is `Arc<Mutex<Vec<ForeignSend>>>`, whose emptiness is not readable without the lock, so an
+    /// empty queue still costs that one acquisition (a CAS plus an acquire fence on the uncontended
+    /// path — tens of nanoseconds) and nothing else: no allocation, no decode, no traversal. That is
+    /// why the two call sites are a NIF call (never per instruction) and one scheduler pump step.
+    pub(crate) fn drain_nif_thread_sends(
+        &mut self,
+        mut mailbox: Option<&mut ProcessTable>,
+    ) -> usize {
+        let Some(sends) = self.nif_thread_sends.clone() else {
+            // No factory installed: the fast path, and the state every ordinary run is in.
+            return 0;
+        };
+        // One lock acquisition, released **before** any delivery: a delivering thread must never
+        // hold the queue a NIF thread is pushing onto.
+        let queued = {
+            let mut queue = match sends.lock() {
+                Ok(queue) => queue,
+                // A poisoned queue is recovered rather than propagated (the `ForeignAtomHub`'s own
+                // discipline): the data behind the lock is a plain `Vec`, so a panic under the lock
+                // cannot leave a shape a recovery would misread. Nothing panics here.
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if queue.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *queue)
+        };
+        let mut delivered = 0usize;
+        let mut skipped = 0usize;
+        for send in queued {
+            match self.deliver_foreign_send(mailbox.as_deref_mut(), send) {
+                true => delivered += 1,
+                false => skipped += 1,
+            }
+        }
+        if skipped > 0 && crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "nif thread sends: {delivered} delivered, {skipped} skipped"
+            ));
+        }
+        delivered
+    }
+
+    /// Delivers one drained [`ForeignSend`](crate::nif::thread_env::ForeignSend) through the
+    /// runtime's own send seam — the per-message body of [`Runtime::drain_nif_thread_sends`], whose
+    /// docs carry the ordering substitution, the identity and the skip rules.
+    ///
+    /// `true` when the message reached a mailbox.
+    fn deliver_foreign_send(
+        &mut self,
+        mailbox: Option<&mut ProcessTable>,
+        send: crate::nif::thread_env::ForeignSend,
+    ) -> bool {
+        let crate::nif::thread_env::ForeignSend {
+            target,
+            from,
+            image,
+        } = send;
+        // A fresh scratch arena per message: the delivery copies the decoded term onto the
+        // receiver's own heap, so nothing this heap holds outlives the iteration.
+        let Ok(mut heap) = Heap::new(self.bif_heap_words) else {
+            // No arena, no decode: this one message is undeliverable, and the next has its own
+            // chance (nothing here fails the caller).
+            return false;
+        };
+        let node = self.local_node();
+        let creation = self.node_creation();
+        // The decode runs against the runtime's **live** atom table (which also commits the hub's
+        // outstanding reservations first — see the drain's docs); the identity installed is the one
+        // the encoder wrote, so a local-node identifier in the image demotes to the internal id.
+        let Ok(msg) = beam_codec::decode_term_with_local_node(
+            &image,
+            &mut heap,
+            self.code_server.atoms_mut(),
+            node,
+            creation,
+            None,
+        ) else {
+            return false;
+        };
+        let to = target.to_eterm();
+        match from {
+            // The ordinary `enif_send(from_pid, …)` shape: the runtime's own send seam, exactly as
+            // a `load` callback's queued send is delivered (`NifBridge::load_nif`).
+            Some(from) => crate::context::nif_send::deliver(self, mailbox, from, to, msg),
+            // A message env's send: no calling process, so the C's sender is `am_undefined`. The
+            // destination is already a resolved internal local pid (the host refuses anything else),
+            // so the delivery is the runtime's own `deliver_message` with that envelope sender — and
+            // deliberately **not** the target, which no sender substitution would be truthful about.
+            None => {
+                let undefined = self.intern("undefined");
+                // The context is only the carrier of the runtime's delivery seam here: no code
+                // runs, so nothing it could pump (and `may_pump_scheduler` is irrelevant —
+                // `deliver_message` never advances the scheduler). The pid it nominally runs as is
+                // the runtime's own root, read **before** the reborrow; `deliver_message` reads it
+                // only to mark that process relocation-exempt for the call, which is inert.
+                let root = self.self_pid;
+                let mut ctx = match mailbox {
+                    Some(table) => RuntimeContext::for_process(self, table, root),
+                    None => RuntimeContext::new(self),
+                };
+                match ctx.deliver_message(target, undefined, msg) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        if crate::debug_trace::enabled() {
+                            crate::debug_trace::trace(format_args!(
+                                "nif thread send: delivery failed ({error:?})"
+                            ));
+                        }
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     /// Interns `name` in the shared atom table and returns it as an atom term.
     pub fn intern(&mut self, name: &str) -> Eterm {
         make_atom(self.code_server.atoms_mut().intern(name))

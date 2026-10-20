@@ -1543,6 +1543,27 @@ impl<'a> RuntimeContext<'a> {
         if !interner.is_empty() {
             self.runtime.code_server.intern_pending(&interner);
         }
+        // The **foreign-thread send drain** (contract A.3): a NIF call is the place a NIF would
+        // have joined a worker thread it created (`enif_thread_create`), so anything that thread
+        // queued through `enif_send` while this call ran is in the receiver's mailbox — and a
+        // receiver parked in `receive` is woken — **before the calling process resumes**. That is
+        // what makes a NIF's own thread observable at all (the `probe_thread_send_to/1` shape: the
+        // receiver is parked, the NIF's thread sends, this drain delivers and wakes it).
+        //
+        // The seam delivers through the runtime's own send path and needs `&mut Runtime` plus the
+        // process table, so it runs *here*: `services` is already dropped (its borrow of both is
+        // released), the interner is committed (so an atom the NIF created — or one the drained
+        // image names — is already in the shared table), and no other borrow is outstanding. The
+        // table is the pass's own when the call runs inside a scheduler slice, else the runtime's
+        // (the same resolution `RuntimeNifServices` made).
+        let drained = self
+            .runtime
+            .drain_nif_thread_sends(self.mailbox_table.as_deref_mut());
+        if drained > 0 && crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "nif call {module}:{function}/{arity} drained {drained} foreign-thread send(s)"
+            ));
+        }
         match outcome {
             // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
             // turns into `Raised`). The ABI's `THE_NON_VALUE` (a bare header word) is not one: the
