@@ -406,4 +406,4 @@ copy-out/rewind rules (`the_copy_out_always_hands_the_copier_an_empty_destinatio
 - [`PERF.md`](PERF.md) → the current cross-runtime figures and the execution-tier effect.
 - [`PERF_HISTORY.md`](PERF_HISTORY.md) → the dated `BEFORE`/`AFTER` cross-runtime snapshots and their `nb*` registered-BIF columns.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_call`/`perf_bif`/`perf_copy_out` harnesses and the dispatch-cost narrative.
-- [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts; `src/context/IMPLEMENTATION.md` documents the dispatch memo this file prices.
+- [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts; `src/context/calls/CONTEXT.md` documents the dispatch path this file prices and `src/context/pool/CONTEXT.md` the copy-out.

@@ -131,7 +131,7 @@ This snapshot's `baseline`/`slice` figures are its own preloaded-only-slice meas
 | `gc_bound` | `churn` | `ns_per_op` (ns) | **29.90** | 29.904–30.194 | 55.18 | 4 283.39 |
 
 **Reading.** The per-unit interpreter cost is far higher under Rust (**13.9×–145.5×** across the startup-cancelled marginals), and `slice` peak RSS is the one like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB** → rust **2.60× lower**.
-A loop workload's rust peak RSS is **not** comparable across runtimes — each shape's growth is its own ([`src/runner/CONTEXT.md`](src/runner/CONTEXT.md) *Measured*).
+A loop workload's rust peak RSS is **not** comparable across runtimes — each shape's growth is its own ([`src/runner/MEASURED.md`](src/runner/MEASURED.md) *Growth-shaped loops*).
 The `foreign` per-call gap (**41×–64×**) sits in `AFTER`'s band (**37×–55×**), this default tiering the *whole* process.
 
 ### `rust` default vs `BEAM_RT_TIER=interpreter` — the tier effect (min of 3)
@@ -220,6 +220,8 @@ Dated A/B: [`PERF_HISTORY.md`](PERF_HISTORY.md) *The copy-out's learned size hin
 - [`PERF_DISPATCH.md`](PERF_DISPATCH.md) → the per-call `DISPATCH-CUT` / `COPY-OUT-CUT` analyses, i.e. the `examples/perf_call.rs` figures with their reproduction recipes.
 - [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md) → the bench driver's authoritative environment record, per-target tables, methodology and honesty audit (this file links to it and does not reproduce it). Its `m6` bands are a **different, far more heavily loaded** pass and are not the `CURRENT` baseline.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_bif` harness, the dispatch-cost narrative and the execution-trace seam.
+- [`src/runner/MEASURED.md`](src/runner/MEASURED.md) → the per-workload measurement record behind the runner's `Measured` index (growth-shaped loops, the copy-out hint's A/B, the slice budget's charge, the emqx off-heap end-to-end).
+- [`src/context/calls/CONTEXT.md`](src/context/calls/CONTEXT.md) · [`src/context/pool/CONTEXT.md`](src/context/pool/CONTEXT.md) → the dispatch path and the BIF-result copy-out this file prices.
 - [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts and current state.
 
 ## The `ets` table-alias witness (the copy-out halved)
