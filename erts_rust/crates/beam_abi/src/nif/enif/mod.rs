@@ -57,6 +57,9 @@
 //! | [`envs`] | `enif_alloc_env` / `enif_free_env` / `enif_make_copy` / `enif_priv_data` |
 //! | [`variadic`] | the seven C-variadic slots (C shim behind `cfg(beam_abi_variadic_shim)`) |
 //!
+//! Two files own **no** `enif_*` slot and so fill nothing in: [`schedule`] (the `enif_schedule_nif`
+//! continuation trampoline that [`process`] drives) and [`stop`] (the pending-stop table and drain
+//! that [`select`]'s STOP arm drives).//!
 //! # The slots still `None`
 //!
 //! Only the seven **C-variadic** slots (`enif_make_tuple`, `enif_make_list`, `enif_set_option`,
@@ -66,11 +69,11 @@
 //! `#[no_mangle]` helpers. `build.rs` sets the cfg only when it could compile the shim; **without a C
 //! compiler those seven slots stay `None`**.
 //!
-//! `enif_alloc_env` — the last non-variadic slot to be filled — is populated by [`envs`]. It takes no
-//! argument, so it reaches the host of the NIF call the calling thread is inside through the
-//! thread-local stack `super::host::NifEnv` publishes (and its `Drop` withdraws), and answers `NULL`
-//! — never a wrong term — when no env is live or the host has no `alloc_env` support.
-//!
+//! `enif_alloc_env` takes no argument, so it reaches a host in three steps ([`envs`] documents them):
+//! the host of the NIF call the calling thread is inside (through the thread-local stack
+//! `super::host::NifEnv` publishes and its `Drop` withdraws), else the host a
+//! [`super::thread_env::ThreadEnvHostFactory`] opened for this thread, else `NULL` — never a
+//! crate-owned env, which would hand a NIF a wrong atom index.//!
 //! # Honest limitations (never a wrong result)
 //!
 //! * **Integers** are handled for small ints and for bignums up to one 64-bit limb; anything wider
@@ -85,14 +88,16 @@
 //! * **Map operations** use an empty `AtomTable` for the same reason; they are exact whenever the
 //!   key terms are not atoms (the overwhelmingly common NIF case, where the key is a term the NIF
 //!   was handed).
-//! * **No scheduler threads.** [`enif_thread_type`] never reports a scheduler type: a foreign thread
-//!   and a thread created by [`enif_thread_create`] both answer `ERL_NIF_THR_UNDEFINED` (this layer's
-//!   internal `ERL_NIF_THR_OTHER` marker for "a thread it created" is mapped to `ERL_NIF_THR_UNDEFINED`,
-//!   which is also the C's answer for such a thread — `erl_nif.c:3606-3625` knows only scheduler
-//!   threads). [`enif_thread_name`] returns the thread's debug name, or the static string `"unknown"`
-//!   for a thread created with a NULL name (the C's `no_name`); it answers `NULL` only for a null,
-//!   foreign or already-joined tid.
-//! * [`enif_make_binary`] builds an **on-heap** binary (off-heap refcounted binaries are a
+//! * **No scheduler threads.** [`enif_thread_type`] reports a scheduler type only for the duration of
+//!   a **dirty-flagged `enif_schedule_nif` continuation** ([`schedule`]'s thread-local marker): that
+//!   continuation runs on the calling thread (there is no dirty pool here), so `ERL_NIF_THR_DIRTY_CPU_SCHEDULER`
+//!   / `..._IO` are the C's *answer* while the thread identity stays the caller's. Everywhere else a
+//!   foreign thread and a thread created by [`enif_thread_create`] both answer `ERL_NIF_THR_UNDEFINED`
+//!   (this layer's internal `ERL_NIF_THR_OTHER` marker for "a thread it created" is mapped to
+//!   `ERL_NIF_THR_UNDEFINED`, which is also the C's answer for such a thread —
+//!   `erl_nif.c:3606-3625` knows only scheduler threads). [`enif_thread_name`] returns the thread's
+//!   debug name, or the static string `"unknown"` for a thread created with a NULL name (the C's
+//!   `no_name`); it answers `NULL` only for a null, foreign or already-joined tid.//! * [`enif_make_binary`] builds an **on-heap** binary (off-heap refcounted binaries are a
 //!   `beam_alloc` concern not yet exposed here); [`enif_inspect_binary`] refuses a *bit*-offset base
 //!   instead of fabricating an unaligned pointer.
 
