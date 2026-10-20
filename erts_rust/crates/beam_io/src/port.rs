@@ -1090,6 +1090,20 @@ impl Port {
     pub fn has_pending_async(&self) -> bool {
         self.driver.has_pending_async()
     }
+    /// Whether an asynchronous operation some **caller is parked on** is still outstanding — the
+    /// **wait-side** twin of [`Port::has_pending_async`] (see
+    /// [`Driver::awaits_callers_async_op`]).
+    ///
+    /// [`Port::has_pending_async`] answers "this port has work a round must drive"; this one
+    /// answers "an answer is still owed to a waiting process", which is what a caller-blocking wait
+    /// must consult before giving up on a reply that only a later port round can deliver. A driver
+    /// that cannot tell the two apart defaults to the same answer, so neither probe can hide work.
+    ///
+    /// Like [`Port::has_pending_async`] it never touches the driver context, so it is safe to call
+    /// while iterating the registry.
+    pub fn awaits_callers_async_op(&self) -> bool {
+        self.driver.awaits_callers_async_op()
+    }
 
     /// Drives the driver's asynchronous completions, returning how many were processed.
     ///

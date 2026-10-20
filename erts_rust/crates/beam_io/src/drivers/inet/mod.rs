@@ -2451,6 +2451,17 @@ impl Driver for TcpInetDriver {
     fn has_pending_async(&self) -> bool {
         self.queued_ops().has_pending()
     }
+    /// The **wait-side** twin of [`Driver::has_pending_async`]: an answer a later port round still
+    /// owes a parked caller.
+    ///
+    /// Identical to the drive answer here, and **accept-inclusive by construction**: a queued
+    /// `accept` carries a real caller's `{inet_async, Port, Id, Result}` (`prim_inet:accept0/3`
+    /// parks in a bare `receive` waiting for it — see `opcode.rs`'s `INET_REQ_ACCEPT`), and a
+    /// listener with no queued accept is deregistered by `disarm_accepts`, so there is no standing
+    /// readiness interest without a caller behind it.
+    fn awaits_callers_async_op(&self) -> bool {
+        self.queued_ops().has_pending()
+    }
 
     /// The latched peer close ([`TcpInetDriver::peer_closed`]) — the accessor the runtime reads
     /// once per round to deliver the oracle's `{tcp_closed, Port}`.

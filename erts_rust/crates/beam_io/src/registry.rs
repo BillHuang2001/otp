@@ -678,6 +678,33 @@ impl PortRegistry {
         };
         self.after_driver_call(poller, result)
     }
+    /// Whether **any** live port has an asynchronous operation some caller is parked on, i.e. an
+    /// answer a later port round still owes a waiting process (see
+    /// [`Driver::awaits_callers_async_op`] and [`Port::awaits_callers_async_op`]).
+    ///
+    /// This is the predicate a caller-blocking wait uses to decide "an answer is still owed", as
+    /// opposed to [`Driver::has_pending_async`]'s "there is work to drive": a listener with a
+    /// queued `accept` (a real caller parked on `{inet_async, Port, Id, Result}`) keeps the wait
+    /// alive, while a loaded C driver's in-flight `driver_async` job — whose completion goes to
+    /// the driver's own `ready_async`/`async_free`, not to a parked process — does not.
+    ///
+    /// The drive gate in [`PortRegistry::execute_port_tasks`] stays on
+    /// [`crate::Port::has_pending_async`]: a port with work to drive but no waiter must still be
+    /// driven. Like every other probe here it never touches a driver context, so it is safe to
+    /// call while iterating the registry; keys are snapshotted first for the same reason the
+    /// round's probe snapshots them.
+    pub fn awaits_callers_async_op(&self) -> bool {
+        for key in self.sorted_keys() {
+            if self
+                .ports
+                .get(&key)
+                .is_some_and(crate::port::Port::awaits_callers_async_op)
+            {
+                return true;
+            }
+        }
+        false
+    }
 
     /// Takes the reaped exit status of the OS child behind port `id`, once.
     ///
@@ -2491,3 +2518,10 @@ mod downcast_tests;
 #[cfg(test)]
 #[path = "active_mode_tests.rs"]
 mod active_mode_tests;
+/// The **wait-side async predicate** — [`Driver::awaits_callers_async_op`] beside the drive-side
+/// [`Driver::has_pending_async`], its port passthrough and the registry-wide probe over it — lives
+/// in its own sibling for the same reason as `reply_tests`: the suite runs over plain-Rust fake
+/// drivers, so it needs no socket, no `cc` and no `erl`.
+#[cfg(test)]
+#[path = "awaits_callers_tests.rs"]
+mod awaits_callers_tests;

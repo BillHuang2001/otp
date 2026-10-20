@@ -817,6 +817,34 @@ pub trait Driver: core::any::Any {
     fn has_pending_async(&self) -> bool {
         false
     }
+    /// Whether an asynchronous operation some **caller is parked on** is still outstanding, i.e. a
+    /// reply only a later port round can deliver to a waiting process.
+    ///
+    /// This is the **wait-side twin** of [`Driver::has_pending_async`], and the two answer
+    /// different questions:
+    ///
+    /// * [`Driver::has_pending_async`] is the **drive** predicate — "asynchronous work this port
+    ///   round must drive". It is deliberately broad: a listener's queued `accept` counts, and so
+    ///   does a loaded driver's in-flight `driver_async` job, because both need a round to make
+    ///   progress.
+    /// * `awaits_callers_async_op` is the **wait** predicate — "somebody is parked waiting for an
+    ///   answer". A caller-blocking wait (a `receive … after` on `{inet_async, Port, Id, Result}`,
+    ///   a `gen_tcp:recv/2`) must not give up while this answers `true`, because the reply will
+    ///   arrive from a later port round rather than from anything the waiter can do itself.
+    ///
+    /// The default is the identity (`self.has_pending_async()`): a driver that cannot tell the two
+    /// apart must not silently claim "nobody is waiting", since that would let such a wait give up
+    /// early and lose the reply. A driver that *can* tell them apart overrides it — the socket
+    /// drivers answer it accept-inclusively (a queued accept carries a real caller's
+    /// `{inet_async, Port, Id, Result}`) while a loaded C driver answers `false` (a `driver_async`
+    /// job's completion goes to the driver's own `ready_async`/`async_free`, never to a parked
+    /// Erlang process).
+    ///
+    /// The drive gate in [`crate::PortRegistry::execute_port_tasks`] stays on
+    /// [`Driver::has_pending_async`]: a port with work to drive but no waiter must still be driven.
+    fn awaits_callers_async_op(&self) -> bool {
+        self.has_pending_async()
+    }
 
     /// Takes the reaped exit status of the OS child this port owns, **once**.
     ///

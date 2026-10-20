@@ -1441,6 +1441,18 @@ impl Driver for UdpInetDriver {
     fn has_pending_async(&self) -> bool {
         self.async_ops.has_pending()
     }
+    /// The **wait-side** twin of [`Driver::has_pending_async`]: an answer a later port round still
+    /// owes a parked caller.
+    ///
+    /// Identical to the drive answer here and **accept-inclusive by construction** (the datagram
+    /// driver shares the stream driver's `AsyncQueue`): a queued `accept` carries a real caller's
+    /// `{inet_async, Port, Id, Result}` (`prim_inet:accept0/3` parks in a bare `receive`), while a
+    /// listener with no queued accept has its readiness interest dropped by
+    /// `disarm_accepts`, so nothing stands armed without a caller behind it. The queued receive
+    /// slot (`PACKET_REQ_RECV`/`TCP_REQ_RECV`) is a caller parked on the same reply shape.
+    fn awaits_callers_async_op(&self) -> bool {
+        self.async_ops.has_pending()
+    }
 
     /// The port's `{active, …}` state — the C's `desc->inet.active`
     /// (`INET_PASSIVE`/`INET_ACTIVE`/`INET_ONCE`/`INET_MULTI`) plus the running `active_count`

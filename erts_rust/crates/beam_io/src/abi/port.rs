@@ -848,6 +848,17 @@ impl Driver for DriverPort {
     fn has_pending_async(&self) -> bool {
         self.abi.has_pending_async()
     }
+    /// **No** caller is ever parked on a loaded driver's `driver_async` job, so this is `false`.
+    ///
+    /// The drive half stays [`DriverPort::has_pending_async`] = [`AbiHost::has_pending_async`],
+    /// which reports `jobs.in_flight() > 0` so the port round still drives the pool. But a
+    /// `driver_async` job's completion goes to the **driver's own** `ready_async` callback (or its
+    /// `async_free`), never to a parked Erlang process — the C's `erts_async_*` machinery has no
+    /// recipient term at all. So an in-flight job is "work to drive", not "an answer owed to a
+    /// waiter", and a caller-blocking wait must not be kept alive by one.
+    fn awaits_callers_async_op(&self) -> bool {
+        false
+    }
 
     /// The `driver_set_timer` deadline, as the port's next `TIMEOUT`.
     fn next_timeout(&self) -> Option<Instant> {
