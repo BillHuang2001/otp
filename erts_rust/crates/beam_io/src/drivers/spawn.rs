@@ -54,10 +54,30 @@
 //! to [`crate::PortRegistry::open`]; a failed spawn is a constructor error that registers
 //! nothing and carries the **errno-derived atom** the oracle raises (`error:enoent`,
 //! `error:eacces`, … — see `error::spawn_failure`). [`Driver::start`] only
-//! registers the already-created descriptors with the poller. [`Driver::stop`] and the
-//! `Drop` impl both kill and reap the child (a child that already exited is reaped through
-//! `try_wait` and needs no kill), deregister every fd they registered and close the fds
-//! they own. Nothing else may close those fds.
+//! registers the already-created descriptors with the poller. [`Driver::stop`] deregisters
+//! every fd it registered, **closes the child's stdin first** so the child gets its end of
+//! file, lets the child exit on its own (bounded — see [`CHILD_EXIT_WAIT_MS`]) and only then
+//! kills it, then closes the fds it owns; the `Drop` impl does the same without the wait.
+//! Nothing else may close those fds.
+//!
+//! # The teardown ordering: end of file **before** the reap
+//!
+//! `erlang:port_command(P, Data)` immediately followed by `erlang:port_close(P)` must still
+//! deliver **every** byte of `Data` to the child. The two halves of that guarantee are split:
+//! [`crate::Port::close`] flushes and drains the port's output queue into the kernel pipe
+//! (the C's `ERTS_PORT_SFLG_CLOSING` drain), and this driver's half is the ordering inside
+//! [`Driver::stop`]. Closing the child's stdin is what gives the child end of file, and the
+//! child is reaped only once it exited by itself; reaping first would discard every byte still
+//! sitting in the pipe and report `128 + 9` instead of the child's own status. The reference
+//! never kills a child to close a port either: `fd_flush` only latches `terminating`
+//! (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`), `ready_output` keeps writing while the
+//! `ioq` is non-empty (`:1448-1493`), and `drv->stop` — reached only with an empty queue —
+//! closes the descriptors, which is the child's end of file (`:1039-1055`).
+//!
+//! The bounded wait also keeps draining what the child writes to its own **stdout**
+//! ([`SpawnDriver::drain_stdout_for_exit`]): the port's read direction is deregistered by then, so
+//! a child that echoes its input back (a `tee`) would otherwise block on a full stdout pipe with
+//! its stdin still unread, and the wait would expire into the fallback kill.
 //!
 //! The reference splits a failed spawn in two, and so does this driver. `spawn_start` checks
 //! `access(Path, X_OK)` **in the emulator** (`sys_drivers.c:521`): a path that check cannot
@@ -167,6 +187,7 @@ use std::os::unix::io::{IntoRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use beam_common::{BeamError, Result};
 
@@ -177,6 +198,36 @@ use crate::poller::{Interest, Token};
 
 /// The read buffer size of a single [`Driver::ready_input`] syscall.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// The longest [`SpawnDriver::stop`] waits for the child to exit **on its own**, in milliseconds,
+/// once its stdin has been closed and it therefore has its end of file.
+///
+/// This is the bound the C does not need. There, a close never kills the child: the port stays in
+/// `ERTS_PORT_SFLG_CLOSING` while its `ioq` is non-empty, `ready_output` keeps `writev`-ing
+/// (`erts/emulator/sys/unix/sys_drivers.c:1448-1493`), and `drv->stop` only closes the descriptors
+/// — which is the child's end of file — after the queue is empty (`:1039-1055`). The emulator's
+/// teardown may therefore block for as long as the child needs, and the child is reaped by
+/// `erl_child_setup` afterwards. This floor cannot afford that: [`Driver::stop`] runs on the
+/// runtime's single-threaded port pump, which must never stall the reactor (a `wait(2)` on a child
+/// that keeps running would park *every* port). So the wait is **bounded** and the child is killed
+/// only when the bound expires.
+///
+/// A few hundred milliseconds is the right order here because the wait is not a pipe drain: by the
+/// time `stop` runs the port has already written every queued byte into the kernel pipe
+/// ([`crate::Port::close`] drains its `OUTPUT` task before it calls the driver), so all the child
+/// has to do is read what a pipe buffer holds — at most 64 KiB by default, and usually far less
+/// because the drain already fed it — and see end of file. The bound is an order of magnitude more
+/// than that needs, even on a loaded host, and is only reached by a child that never reads its
+/// stdin at all (a `sleep`): for that child the fallback kill keeps the close bounded, which is a
+/// documented divergence — the oracle would leave it running.
+///
+/// A child that writes to its own stdout does *not* eat into the bound: the wait drains that stream
+/// itself (see [`SpawnDriver::drain_stdout_for_exit`]), so a `tee`-shaped child never blocks on a
+/// full stdout pipe while it finishes reading.
+const CHILD_EXIT_WAIT_MS: u64 = 250;
+
+/// The sleep between two non-blocking `try_wait` probes of [`CHILD_EXIT_WAIT_MS`], in milliseconds.
+const CHILD_EXIT_POLL_MS: u64 = 5;
 
 /// The two `open_port/2` options that shape a spawned child's **streams** rather than its
 /// process description (see the module docs), kept out of [`SpawnOptions`] so that struct stays
@@ -669,6 +720,12 @@ pub struct SpawnDriver {
     /// Whether the driver owns (and must close) the descriptors. False for an adopted
     /// `{fd, N}` descriptor, which belongs to the Erlang side.
     own_fds: bool,
+    /// Whether the port asked for a flush before tearing the driver down — the C's
+    /// `terminating` latch, set by `fd_flush` (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`).
+    /// It is what tells [`Driver::stop`] that the port drained its output queue first, so the
+    /// synchronous teardown may give the child end of file and let it finish instead of killing it
+    /// (see [`CHILD_EXIT_WAIT_MS`]).
+    terminating: bool,
     /// Whether one adopted `{fd, N}` descriptor serves **both** directions (so it is
     /// registered once with [`Interest::BOTH`] and its read registration *is* its write
     /// registration). Always false for a child port, whose read and write streams are two
@@ -746,6 +803,8 @@ impl SpawnDriver {
                 eof_reported: false,
                 // The descriptor belongs to the Erlang side: deregistered, never closed.
                 own_fds: false,
+                // Nothing has flushed this port yet; see `terminating`.
+                terminating: false,
                 duplex: true,
                 os_pid: None,
             });
@@ -818,6 +877,7 @@ impl SpawnDriver {
             eof_notify: stream_options.eof,
             eof_reported: false,
             own_fds: true,
+            terminating: false,
             duplex: false,
             os_pid: Some(os_pid),
         })
@@ -1048,6 +1108,144 @@ impl SpawnDriver {
         }
     }
 
+    /// Gives the child its **end of file**: closes the child's stdin, the write end of the port's
+    /// output pipe, so a child that has read everything the port drained sees `read(2) == 0` and
+    /// can finish and exit on its own.
+    ///
+    /// This is the C's `stop` releasing `dd->ofd`
+    /// (`erts/emulator/sys/unix/sys_drivers.c:1046-1052`), moved **ahead** of the reap: it must
+    /// run before anything is killed, or every byte still in the pipe is lost and the child
+    /// reports `128 + 9` instead of its own status.
+    ///
+    /// The two cases the descriptor ownership rules leave:
+    ///
+    /// * **an owned descriptor** ([`SpawnDriver::own_fds`], every child port) — closed here, and
+    ///   `take()`n so the later [`SpawnDriver::close_fds`] cannot close it twice;
+    /// * **an adopted `{fd, N}` descriptor** — **never** closed (it belongs to the Erlang side) and,
+    ///   being the [`SpawnDriver::duplex`] case, it is the *same* descriptor that carries the read
+    ///   direction, so there is no separate stdin to close for end of file at all: closing it would
+    ///   both violate the ownership rule and cut off the reads the port may still be collecting. A
+    ///   `{fd, N}` port has no child either, so there is nobody to give end of file to.
+    fn close_stdin_for_eof(&mut self) {
+        if self.duplex {
+            return;
+        }
+        let Some(fd) = self.stdin_fd.take() else {
+            return;
+        };
+        if self.own_fds {
+            close_fd(fd);
+        }
+        // A non-duplex port the driver does not own cannot be constructed (`{fd, N}` is the only
+        // adopted form and it is always duplex), so the descriptor taken above is always an owned
+        // one; the guard keeps the ownership rule explicit rather than implied.
+    }
+
+    /// Lets the child exit **on its own** after [`SpawnDriver::close_stdin_for_eof`], killing and
+    /// reaping it only when [`CHILD_EXIT_WAIT_MS`] expires.
+    ///
+    /// The probes are non-blocking (`ChildProc::try_wait`, i.e. `waitpid(2, WNOHANG)`), never a
+    /// blocking `wait(2)`: this runs on the runtime's single-threaded port pump, so a child that
+    /// keeps running must not park the reactor for as long as it lives — see
+    /// [`CHILD_EXIT_WAIT_MS`] for the C's contrasting, deliberately blocking teardown.
+    ///
+    /// Each iteration also **drains the child's stdout** (non-blocking, into the port's input queue)
+    /// through [`SpawnDriver::drain_stdout_for_exit`]. That is not an afterthought: a child that
+    /// echoes what it reads (the measured row's `tee`) writes its own output back to the port, and
+    /// the teardown has already deregistered that read direction, so nothing else will ever consume
+    /// it. Once a pipe buffer of it is unread the child blocks in `write(2)` — with its stdin still
+    /// unread — and the graceful wait could never finish, so the fallback kill would truncate what
+    /// the child had already been given. Draining here keeps the child's progress independent of
+    /// the port pump's readiness loop, which is what makes the measured `port_command` +
+    /// `port_close` row reproducible under load.
+    ///
+    /// A child that has exited stays in `self.child` with its status **cached** by the probe, so
+    /// [`Driver::take_exit_status`] still reports it after the teardown — the child's own code, not
+    /// the `128 + 9` of a kill. A later [`SpawnDriver::reap_child`] (a `Drop` after a `stop`, or a
+    /// second teardown) sees the cached status and kills nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::Io`] when a probe, the fallback kill or the fallback wait fails, or
+    /// when draining the child's stdout fails — in which case the child is still reaped (never
+    /// leaked) before the error is returned.
+    fn reap_after_stdin_eof(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(CHILD_EXIT_WAIT_MS);
+        loop {
+            if let Err(err) = self.drain_stdout_for_exit(ctx) {
+                // A child this driver can no longer read from cannot be relied on to finish, and a
+                // teardown must not leak it: take the abrupt path, then report why.
+                let _reap = self.reap_child();
+                return Err(err);
+            }
+            let exited = match self.child.as_mut() {
+                Some(child) => child.try_wait().map_err(error::io)?.is_some(),
+                None => return Ok(()),
+            };
+            if exited {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // The child is not consuming its stdin: the bound is what keeps the single-threaded
+                // port pump responsive, so give up and take the abrupt path — today's kill-and-reap,
+                // and a divergence the oracle does not have (it would leave the child running and
+                // let `erl_child_setup` reap it later).
+                return self.reap_child();
+            }
+            std::thread::sleep(Duration::from_millis(CHILD_EXIT_POLL_MS));
+        }
+    }
+
+    /// Reads whatever the child has written to its stdout into the port's input queue, without
+    /// blocking, and latches end of file when it has none left.
+    ///
+    /// The teardown's twin of [`Driver::ready_input`], with the two differences that make it usable
+    /// there: it does not touch the poller (the read registration was already taken by
+    /// [`Driver::stop`], and a descriptor cannot be deregistered twice) and, having no reactor to
+    /// come back to it, it is the *caller's* loop that re-invokes it. The bytes still reach the
+    /// port — [`crate::Port::close`] harvests what the driver staged during the teardown — so a
+    /// child's last words are not lost, exactly as the C delivers them before it finishes the
+    /// close.
+    ///
+    /// A `{fd, N}` port is skipped: its single descriptor carries both directions and belongs to
+    /// the Erlang side, so reading it here would steal bytes from its owner (and such a port has no
+    /// child to wait for anyway, see [`SpawnDriver::close_stdin_for_eof`]).
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::Io`] for a read failure other than `EINTR`/`EAGAIN`.
+    fn drain_stdout_for_exit(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        if self.read_eof || self.duplex {
+            return Ok(());
+        }
+        let Some(fd) = self.stdout_fd else {
+            return Ok(());
+        };
+        let mut buf = [0u8; READ_CHUNK];
+        loop {
+            // SAFETY: `fd` is an open, non-blocking descriptor owned by this driver (the child's
+            // stdout) and `buf` is a writable array of `READ_CHUNK` bytes, so `read(2)` writes at
+            // most `READ_CHUNK` bytes into it.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), READ_CHUNK) };
+            if n > 0 {
+                ctx.input().push(&buf[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                // The child closed its stream. Latch it so `take_eof` can still report it; the
+                // descriptor itself is released by the teardown's `close_fds`.
+                self.read_eof = true;
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return Ok(()),
+                _ => return Err(error::io(err)),
+            }
+        }
+    }
+
     /// Kills and reaps the child, if one is still held.
     ///
     /// A child that already exited is reaped by `try_wait` and needs no kill, so the one
@@ -1136,6 +1334,32 @@ impl Driver for SpawnDriver {
         }
     }
 
+    /// Latches the C's `fd_flush` state: the port is closing and wants what it queued delivered.
+    ///
+    /// The C's `flush` does **nothing but latch** `dd->terminating = 1`
+    /// (`erts/emulator/sys/unix/sys_drivers.c:1029-1034`); the writing is done by the
+    /// `ready_output` calls that follow on the still-`ERTS_PORT_SFLG_CLOSING` port
+    /// (`:1448-1493`), and once the `ioq` is empty that callback reports
+    /// `driver_failure_atom(port,"normal")` (`:1468-1469`), which is what terminates the port and
+    /// runs its `stop`. This floor's `stop` is **synchronous** — [`crate::Port::close`] has already
+    /// drained the output queue into the kernel pipe by the time it calls it — so the latch's
+    /// consumer is the teardown itself: a flushed port's `stop` gives the child end of file and
+    /// waits (bounded, [`CHILD_EXIT_WAIT_MS`]) for it to finish, where an unflushed one takes the
+    /// abrupt kill path. That is the only difference the flag makes.
+    ///
+    /// This floor deliberately does **not** route `driver_failure_atom(port,"normal")`: the port's
+    /// teardown is synchronous and finishes through [`crate::Port::finish_close`] (which marks the
+    /// port `Closed` itself), so the driver-failure channel
+    /// ([`DriverContext::signal_failure`](crate::DriverContext::signal_failure) →
+    /// `PortRegistry::reap_failures`) has the wrong shape here — a port closed by its caller must
+    /// not report the `{'EXIT', Port, normal}` that channel turns into an owner message, and the
+    /// oracle sends none on a plain `port_close/1`. Do not "fix" it into that path.
+    fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        let _ = ctx;
+        self.terminating = true;
+        Ok(())
+    }
+
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let in_result = match (self.in_token.take(), self.stdout_fd) {
             (Some(token), Some(fd)) => ctx.deregister(fd, token),
@@ -1145,10 +1369,20 @@ impl Driver for SpawnDriver {
             (Some(token), Some(fd)) => ctx.deregister(fd, token),
             _ => Ok(()),
         };
-        // The child is killed and reaped first, so nothing it produces can reach the queues
-        // after the port is gone; then the descriptors are released (taken here, so `Drop`
-        // will not touch them again).
-        let child_result = self.reap_child();
+        // End of file **first**, before anything can be killed: closing the child's stdin lets it
+        // read what the port drained into the pipe and then exit on its own, so nothing it was
+        // sent is lost (`sys_drivers.c:1046-1052`; the pipe still holds the bytes after the write
+        // end is closed, so closing early loses nothing).
+        self.close_stdin_for_eof();
+        // Then let it finish — but only when the port flushed first, i.e. when it really did drain
+        // its output queue before tearing the driver down. An unflushed teardown takes the abrupt
+        // path it always took, and the bound inside the graceful one keeps the port pump
+        // responsive for a child that never reads its stdin.
+        let child_result = if self.terminating {
+            self.reap_after_stdin_eof(ctx)
+        } else {
+            self.reap_child()
+        };
         self.close_fds();
         in_result.and(out_result).and(child_result)
     }
@@ -1166,9 +1400,16 @@ impl Drop for SpawnDriver {
     fn drop(&mut self) {
         // `stop` already released the child and the descriptors on the normal teardown path;
         // this covers a driver dropped without ever being stopped (a `start` that failed
-        // inside `PortRegistry::open`, for instance), so neither a running child nor a
-        // descriptor leaks. A `Drop` cannot report anything to a caller, so both outcomes are
-        // discarded — the same rule `FdDriver` follows for its descriptor closes.
+        // inside `PortRegistry::open`, or a port dropped without a close), so neither a running
+        // child nor a descriptor leaks. A `Drop` cannot report anything to a caller, so both
+        // outcomes are discarded — the same rule `FdDriver` follows for its descriptor closes.
+        //
+        // The child still gets its end of file first, which is what lets a child blocked on its
+        // stdin finish; but the reap that follows is the abrupt one: a `Drop` runs on an arbitrary
+        // thread with no `DriverContext` (so it cannot deregister anything either) and must not
+        // stall it for [`CHILD_EXIT_WAIT_MS`]. The graceful, bounded wait belongs to
+        // `Driver::stop`, the only path a real close takes.
+        self.close_stdin_for_eof();
         let _reap = self.reap_child();
         self.close_fds();
     }
@@ -1976,3 +2217,12 @@ mod tests {
         }
     }
 }
+
+/// The driver's **teardown-order** suite: a close must deliver every queued byte to the child.
+///
+/// A sibling `#[path]` module (like `ram_file_tests.rs`) because this file is already the driver
+/// source half; the tests are still the driver's own in-module suite, so they reach `super`'s
+/// private surface and drive the real `stop`/`flush` the port calls.
+#[cfg(test)]
+#[path = "spawn_teardown_tests.rs"]
+mod teardown_tests;

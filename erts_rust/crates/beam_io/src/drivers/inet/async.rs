@@ -452,19 +452,34 @@ impl TcpInetDriver {
             if self.peer_close.seen {
                 break;
             }
+            if self.deferred_close.is_some() {
+                // Nothing complete is buffered, so a close the read already reported can never be
+                // answered with data: latch it and let the tail report it.
+                self.latch_deferred(ctx)?;
+                break;
+            }
             // Not enough buffered bytes: read what the socket has and try once more.
             let before = self.pending_input.len();
             let mut bytes = Vec::new();
             // The queued operation is the party that consumes a discovery this read makes: it is
             // answered right below from the `peer_close` latch (`async_error_am_all(am_closed)`,
             // `inet_drv.c:12829`), so the receive ladder stays unarmed.
-            self.read_bytes(ctx, &mut bytes, ReadReport::Answered)?;
+            let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
             self.pending_input.extend_from_slice(&bytes);
-            if self.pending_input.len() == before {
-                // `EAGAIN`: no progress, so the operation waits for the next readiness edge.
-                break;
+            if let Some(source) = close {
+                // The bytes this read collected belong to the parked operation, so a complete unit
+                // is delivered **first**: the C's `tcp_recv` answers a complete unit and only
+                // reaches its `n == 0` arm on a later call (`inet_drv.c:13216`, `:13206`), which
+                // owes `{error, closed}` to the next receive rather than to this one.
+                self.deferred_close.get_or_insert(source);
             }
-        }
+            if self.pending_input.len() == before {
+                // `EAGAIN`, or a read that saw only the peer's end of file: a deferred close can
+                // no longer be answered with data, so latch it and let the tail report it
+                // (`async_error_am_all(am_closed)`, `inet_drv.c:12829`).
+                self.latch_deferred(ctx)?;
+                break;
+            }        }
         if self.async_ops.recv().is_some() && self.peer_close.seen {
             // The peer went away with the operation pending: the C answers the pending operation
             // from the discovery site — `tcp_recv_closed` with `async_error_am(am_closed)`

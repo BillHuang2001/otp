@@ -464,6 +464,25 @@ impl Driver for RamFileDriver {
     /// The whole queued payload is consumed — the driver reports exactly its length, as the
     /// consume-what-you-report contract (see [`Driver::output`]) requires — and the reply reaches
     /// the port owner as `{Port, {data, Reply}}` on the next port-task round.
+    ///
+    /// # This is the only place a command runs, so a close reaches it too
+    ///
+    /// The C's entry has no `flush` (`ram_file_driver_entry`'s `NULL, /* flush */`,
+    /// `erts/emulator/drivers/common/ram_file_drv.c:120`), so `flush_port` has nothing to call
+    /// (`erts/emulator/beam/io.c:3659-3700`) and the command is run by this `output` slot. Here the
+    /// port's [`crate::Port::close`] drains its `OUTPUT` task through the ordinary
+    /// [`crate::Port::ready_output`] → `Driver::ready_output` default → this method, so a command
+    /// queued by `erlang:port_command/2` and never driven by a round still **executes** at close,
+    /// with its reply staged as a completed read (pinned by `ram_file_close_tests`). Nothing is
+    /// discarded on the way: [`Driver::flush`]'s default consumes nothing, which is exactly the
+    /// C's `flush == NULL`.
+    ///
+    /// Because this consumes **everything** it is given, the queue is empty after that drain and
+    /// the port finishes inside the close call — it never parks in
+    /// [`crate::PortState::Closing`]. Note also that the queue has **no per-command boundary**: two
+    /// commands queued before any round arrive as one payload (a `write`'s operand length is
+    /// delimited only by the `port_command` call), so a caller issuing this command-driven protocol
+    /// drives a round between commands.
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let queued = ctx.output().front();
         if queued.is_empty() {
@@ -544,6 +563,14 @@ impl Driver for RamFileDriver {
     }
 
     /// Releases the buffer, returning the driver to its inert state.
+    ///
+    /// The C's `rfile_stop` releases the buffer and nothing else (`ram_file_drv.c:169`-`:175`):
+    /// there is no queued-output rescue to do here, and none is needed. The entry has `flush = NULL`
+    /// (`ram_file_drv.c:120`), so the C's `flush_port` calls nothing
+    /// (`erts/emulator/beam/io.c:3659-3700`) and the port's own drain runs the command through
+    /// [`Driver::output`] before `terminate_port` reaches this `stop` (`io.c:3752`) — which is
+    /// why [`Driver::flush`]'s default (discard nothing) is the faithful answer and there is
+    /// deliberately no override here. See [`Driver::output`]'s rustdoc for the close path.
     fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
         self.reset();
         Ok(())
@@ -621,3 +648,6 @@ mod tests;
 #[cfg(test)]
 #[path = "ram_file_split_tests.rs"]
 mod split_tests;
+#[cfg(test)]
+#[path = "ram_file_close_tests.rs"]
+mod close_tests;

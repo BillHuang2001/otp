@@ -252,12 +252,19 @@ pub(super) fn set(
         // Non-Windows: `continue` — accepted and ignored (`inet_drv.c:7208`-`:7219`).
         INET_OPT_EXCLUSIVEADDRUSE => Step::Done(RECORD),
         // `struct linger`: `l_onoff` is the record's value, `l_linger` the next four bytes
-        // (`:7363`-`:7388`); a payload shorter than that is the C's `return -1`.
+        // (`:7363`-`:7388`); a payload shorter than that is the C's `return -1`. A TCP descriptor
+        // also latches the C's `TCP_ADDF_LINGER_ZERO` here — **before** the `setsockopt`, so a
+        // failing syscall (which `linger` does not propagate, `propagate = 0`) still records it —
+        // because that flag is what makes a close discard the queued output
+        // (`tcp_inet_flush`, `:12714`-`:12716`).
         INET_OPT_LINGER => {
             let Some(tail) = rest.get(RECORD..RECORD + 4) else {
                 return Some(Ok(Step::Refused));
             };
             let linger = i32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
+            if scope.is_tcp_protocol() {
+                options.linger_zero = value != 0 && linger == 0;
+            }
             let step = apply(fd, code, |fd| sys::set_socket_linger(fd, value, linger));
             match step {
                 Step::Done(_) => Step::Done(RECORD + 4),

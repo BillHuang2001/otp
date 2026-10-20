@@ -620,8 +620,83 @@ fn a_stalled_write_stays_queued_and_arms_write_readiness() {
         "nothing was dropped by the failed write"
     );
 
+    // A stalled write parks the port instead of dropping the remainder: `erts_deliver_port_exit`
+    // sets `ERTS_PORT_SFLG_CLOSING` and calls `flush_port` **without** terminating
+    // (`erts/emulator/beam/io.c:3946-3956`), and `flush_port` terminates only once the ioq has
+    // emptied (`io.c:3659-3700`; `terminate_port` — the sole caller of `drv->stop`, `io.c:3752` —
+    // is what runs it). The parked port is the C's "Limbo" (`io.c:3968-3971`): it keeps receiving
+    // in/out events so the drain can finish (`erl_port.h:797-813`).
+    let queued = registry.get(id).expect("live").output_len();
+    let registrations = poller.len();
     registry.close(&mut poller, id).expect("the port closes");
-    assert!(poller.is_empty(), "the descriptors are deregistered");
+    assert!(
+        registry.is_closing(id).expect("a parked port is still a live port"),
+        "`sleep` never reads, so the close parks the port in `Closing`"
+    );
+    assert!(registry.contains(id), "a parked port keeps its number");
+    assert!(
+        !registry.get(id).expect("live").is_closed(),
+        "a parked port is not closed: `stop` has not run"
+    );
+    let remaining = registry.get(id).expect("live").output_len();
+    assert!(
+        remaining > 0 && remaining <= queued,
+        "the unwritable remainder stays queued ({remaining} of {queued} bytes) instead of \
+         being discarded"
+    );
+    assert!(
+        registry
+            .get(id)
+            .expect("live")
+            .has_pending_task(PortTaskKind::Output),
+        "an OUTPUT task stays pending so the drain has something to run"
+    );
+    assert_eq!(
+        poller.len(),
+        registrations,
+        "the parked port keeps both registrations — write readiness must survive for the drain, \
+         and the descriptors are deregistered by `stop`, which has not run"
+    );
+    // A command on a CLOSING port is the C's `badarg` (`io.c:3877-3880`, the
+    // `ERTS_PORT_SFLGS_INVALID_LOOKUP` set), not a silent enqueue nobody would ever write.
+    assert!(matches!(
+        registry.port_command_with(&mut poller, id, b"late", PortCommandOptions::EMPTY),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        remaining,
+        "the refused command queued nothing"
+    );
+
+    // A second close is idempotent: no second flush, no second `stop`, no second report.
+    registry.close(&mut poller, id).expect("a second close is idempotent");
+    assert!(
+        registry.is_closing(id).expect("live"),
+        "the repeated close leaves the park alone"
+    );
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        remaining,
+        "the repeated close writes nothing"
+    );
+    assert_eq!(poller.len(), registrations, "and tears nothing down");
+
+    // The rounds that follow keep the port parked (no progress is possible) and owe the owner
+    // **no** `Closed`: the close is reported by the round that terminates the port, never while
+    // its ioq still holds bytes (`io.c:3659-3700`).
+    let round = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the round runs");
+    assert!(
+        round.notifications.is_empty(),
+        "a parked port owes no `Closed` while output is still queued: {:?}",
+        round.notifications
+    );
+    assert!(
+        registry.is_closing(id).expect("live"),
+        "one no-progress round is far below CLOSING_DRAIN_STALL_LIMIT, so the port is still parked"
+    );
 }
 
 #[test]

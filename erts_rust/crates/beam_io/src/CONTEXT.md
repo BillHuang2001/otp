@@ -4,9 +4,9 @@
 Source root of `beam_io` (the I/O subsystem of the Rust ERTS rewrite) plus the three sub-nodes that
 carry the bulk of the code. The parent `../CONTEXT.md` carries the crate's frozen API surface,
 constraints, design decisions and cross-crate handoffs — read it first. This file adds the
-**port-level channel mechanism** (line framing, the write path and the busy decision, the completion
-and `{active,…}` channels), the per-module in-module test counts and the oracle-pinned shape tables,
-and the durable gotchas; the parent routes here for that detail.
+**port-level mechanism** (line framing, the write path and the busy decision, the completion and
+`{active,…}` channels, the flush-then-close path), the per-module in-module test counts and the
+oracle-pinned shape tables, and the durable gotchas; the parent routes here for that detail.
 
 ## API Surface
 Module wiring + root re-exports + `prelude`: `src/lib.rs`. Every module below is re-exported at the
@@ -63,7 +63,7 @@ out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_li
   order — the accessor style of `take_eof`/`take_closed_notifications`); `execute_port_tasks`
   harvests every pending read of every port and its `notifications` carry only
   `PortNotification`s, so one round can yield several `Data` (one per `driver_output*` call,
-  `io.c:3363-3442`) and a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the
+  `io.c:3363-3448`) and a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the
   line channel).
 
 ### A driver's write path — the reply round trip, the busy decision and a refused command
@@ -106,7 +106,7 @@ command was refused" and render the oracle's `badarg`.
 A socket driver owes its owner **messages** that cannot be a return value: the
 `{inet_reply, Port, Reply[, Tag]}` answer to `erlang:port_command/2` (the reply to a blocked
 `gen_tcp:send/2` — `inet_reply_am`/`inet_reply_error_am`/`inet_reply_finish`,
-`../../../erts/emulator/drivers/common/inet_drv.c:2606-2680`) and the
+`../../../erts/emulator/drivers/common/inet_drv.c:2617-2740`) and the
 `{inet_async, Port, Id, Result}` completion of a queued asynchronous operation
 (`send_async_ok`/`send_async_ok_port`/`send_async_error`, `:2493-2562`; teardown flushes every
 queued op with `{error,closed}` via `async_error_am_all`, `:2597-2608`). This is a **third side
@@ -131,22 +131,25 @@ exhaustive):
 - `port.rs` → the `completions: Vec<PortCompletion>` stage + `Port::take_completions()` (drains once).
   The sink is installed at **every** driver interaction point — `open`(`start`), `output`,
   `ready_input`, `ready_output`, `control`, `timeout`, `drive_async`, `notify_exit`(`port_exit`) and
-  `close`(`stop`); the `timeout` one matters most, because `Port::run_task`'s `Timeout` arm discards
-  `Driver::timeout`'s `Result`, so a timer-driven `{error,timeout}` reply exists only as a completion.
+  close (`flush` **and** `stop`, see *The close path* below); the `timeout` one matters most, because
+  `Port::run_task`'s `Timeout` arm discards `Driver::timeout`'s `Result`, so a timer-driven
+  `{error,timeout}` reply exists only as a completion.
 - `registry.rs` → `PortRegistry::take_completions()` drains every live port in **port-number order**
   (each port's own completions in delivery order), then the completions harvested from ports closed
-  since the last drain. `close` **harvests** the closing port's staged completions into a
-  registry-owned queue before dropping the `Port`, so a teardown's `async_error_am_all` replies (and
-  any staged before it) still reach the owner exactly once; the port **number** keeps its existing
-  rule — retired only by the `Closed` report, never by a completion.
+  since the last drain. When a port **leaves the live map** (`remove_finished_port`, not necessarily
+  the `close` call itself — a parked closing port stays live and keeps reporting, see *The close
+  path*) its staged completions are **harvested** into a registry-owned queue, so a teardown's
+  `async_error_am_all` replies (and any staged before it) still reach the owner exactly once; the
+  port **number** keeps its existing rule — retired only by the `Closed` report, never by a
+  completion.
 Contract: **drain after every round** (line-frames style), a control op's return value is never a
 completion, and each completion is reported exactly once.
 
 ### The driver→owner `{active, …}` input channel (`port_task.rs`'s `ActiveInput`)
 An `{active, true|N|once}` socket owes its owner **incoming-message** notifications that are
 neither `{Port, {data, …}}` (the passive read path) nor the answer to a call (a completion): the
-`{tcp, S, Data}` of `tcp_message` (`inet_drv.c:3979`), its `{packet,N}` shape
-`packet_binary_message` (`:4110`), `{tcp_passive, S}`/`{udp_passive, S}` from
+`{tcp, S, Data}` of `tcp_message` (`inet_drv.c:3987`), its `{packet,N}` shape
+`packet_binary_message` (`:4106`), `{tcp_passive, S}`/`{udp_passive, S}` from
 `packet_passive_message` (`:4215`), and the `{tcp_error, S, Reason}`/`{udp_error, S, Reason}` of
 `tcp_error_message` (`:4079`)/`packet_error_message` (`:4245`). Built exactly like the two precedents (separate struct, separate
 drain — `PortNotification` keeps its two variants and `CompletionEvent` gains no variant):
@@ -225,32 +228,137 @@ drivers publish their own state through them (see *Who overrides the seam* below
   the honest answer for a driver with no active mode. The driver-level pins are
   `drivers/inet/active_seam_tests.rs` (9) and the child node's `src/drivers/inet/CONTEXT.md`.
 
+### The close path — flush, drain, then `stop` (the C's `ERTS_PORT_SFLG_CLOSING`)
+A close does not drop queued output: `Port::close` has the C's **flush-then-close** shape, so
+`erlang:port_command(P, Data)` followed immediately by `erlang:port_close(P)` still delivers `Data`
+(measured on the oracle: a `tee` child received 500 000/500 000 bytes while `port_close/1` returned
+`true` with 454 656 bytes still queued — the drain is asynchronous, **not** part of the close's
+return). The C: `erts_deliver_port_exit` clears `EXITING`, sets `ERTS_PORT_SFLG_CLOSING` and calls
+`flush_port` instead of `terminate_port` when the ioq is non-empty and the reason is not `kill`
+(`io.c:3946-3953`, `flush_port(prt)` at `:3952`); `flush_port` calls the driver's `flush` **only if
+the entry has one** (`io.c:3664` the slot test, `:3687` the call) and
+terminates **only if the ioq became empty** (`io.c:3696-3699`); `terminate_port` (`io.c:3704-3795`)
+is the sole caller
+of `drv->stop` (`io.c:3752`).
+- `driver.rs` → `Driver::flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()>`, the
+  **additive, defaulted** seam: the driver's one chance, *before* `stop`, to take bytes off
+  `ctx.output()` and discard them, or (returning `Ok(())` without consuming anything) to say "keep
+  them, try to write them". The default `Ok(())` discards nothing — the C's `flush == NULL` case
+  (`io.c:3664`) — so a driver that consumes its output synchronously needs no override.
+  No byte count is verified (the C's `flush` returns `void`); consuming what is discarded *is* the
+  accounting rule. Overriders: `drivers/spawn.rs`'s `SpawnDriver` latches the C's `fd_flush`
+  `terminating` flag (`sys_drivers.c:1029-1034`) and its `stop` then gives the child end-of-file
+  and waits for it instead of killing it; `abi::DriverPort` forwards the loaded C driver's own
+  entry through `DriverPort::call` (all four sinks installed, an absent slot the C's silent
+  no-op) and deliberately does none of `stop`'s teardown work — a flush is not a teardown;
+  `drivers/inet/mod.rs`'s `TcpInetDriver` reproduces `tcp_inet_flush` (`inet_drv.c:12708`-`:12730`,
+  the entry's slot at `:1368`): it discards the queued output (`ctx.output().clear()`) exactly when
+  the port is not write-armed-and-tokenized or the socket carries `SocketOptions::linger_zero`
+  (`discard_output = !(desc->inet.event_mask & FD_WRITE) | TCP_ADDF_LINGER_ZERO`), and keeps the
+  bytes for the port layer's `Closing` drain otherwise — the `token.is_some()` term of that test
+  models `erl_inet_close` (`inet_drv.c:5101`-`:5117`) zeroing the C event mask, where this floor
+  deregisters instead.
+  Three built-ins deliberately do **not** override it, each the C's own `flush` slot: `udp_inet`
+  (a `NULL` slot, `inet_drv.c:1406`-`:1443`), `ram_file_drv` (a `NULL` slot,
+  `ram_file_drv.c:120`) and `fd`, whose `fd_flush` (`sys/unix/sys_drivers.c:1029`-`:1034`) only
+  latches `terminating` and never clears the ioq — so their queued output is always the port
+  layer's drain to write.
+- `drivers/inet/mod.rs` → the **`tcp_inet` stop/close split**: `TcpInetDriver::stop` calls
+  `release_socket`, **not** `desc_close`, because the C's `tcp_inet_stop` (`inet_drv.c:11895`-`:11924`)
+  never touches the ioq — the unconditional `tcp_clear_output` of `tcp_desc_close`
+  (`:11932`-`:11939`, `tcp_clear_input` then `tcp_clear_output` then `erl_inet_close`) belongs only
+  to the close **verb** (`INET_REQ_CLOSE`, `TcpInetDriver::verb_close` → `desc_close`). Queued
+  output is therefore the flush's business and the port layer's, never the stop's, pinned by
+  `drivers/inet/flush_tests.rs` (`the_teardown_never_clears_the_queue_but_the_close_verb_does`).
+- `drivers/inet/mod.rs` → the **read-path ordering rule** (owned by the inet node — see
+  `drivers/inet/CONTEXT.md`): a complete buffered unit wins over a pending peer close, so
+  `{Port,{data,…}}` is delivered before `{tcp_closed,…}`. The observation is kept in
+  `TcpInetDriver::deferred_close` and applied at the single latch site
+  `TcpInetDriver::latch_peer_close` once nothing complete is left to deliver
+  (`TcpInetDriver::latch_deferred`).
+- `port.rs` → `PortState::Closing` is a **real observable state** (`Port::is_closing()`/
+  `is_closed()`/`state()`), not a transient: `Port::close` is two halves.
+  **Begin** (always): `state = Closing`, record `closing_watermark`, `driver_flush` (the four
+  delivery sinks — reads, completions, `{active,…}`, failure — installed exactly as `notify_exit`
+  installs them, because a `tcp_inet_flush`-shaped callback may hand a final completion up), then
+  `drain_output_during_close`: it drops the pending `INPUT`/`TIMEOUT` tasks (a closing port has no
+  owner left to notify) and runs the `OUTPUT` task(s) under one `DEFAULT_READINESS_RED_BUDGET`
+  through the ordinary `run_task` → `ready_output` → `check_write_accounting` path, so there is
+  exactly **one** write loop and a short write is re-armed rather than lost.
+  **Finish** (`finish_close`, only once the queue **is** empty): `driver.stop` (same four sinks),
+  then `state = Closed` — even when `stop` fails, so a teardown error can never leave the port
+  looking open; whatever is still queued is dropped there (the caller has decided the remainder is
+  obsolete). A close whose drain empties the queue **inside** the call finishes synchronously; a
+  `flush` that discards the queue closes the port without touching the device at all.
+  A **refused** write (`Err` from `output`/`ready_output`) does not fail the close: the drain stops
+  and the port parks, and the refusal surfaces where it already did, from the round that re-drives
+  the queued `OUTPUT` task.
+- `port.rs` → the **parked** case: a queue still non-empty afterwards leaves the port in
+  `PortState::Closing` with an `OUTPUT` task pending, `stop` **not** run, its poller registrations
+  still armed and its number still allocated — the C's Limbo, "a state where the port is in Limbo,
+  waiting to pass on. All links are removed, and the port receives in/out-put events so as soon as
+  the port queue gets empty `terminate_port()` is called" (`io.c:3968-3971`; the deferred half is
+  `erts_port_driver_callback_epilogue`, `erl_port.h:798-812`). Write readiness, or a later round,
+  re-drives it. `PortRegistry::is_closing` reports it (`BadArg` for an unknown id, like every other
+  registry seam); `Port`/`PortRegistry::close` answer `Ok(())`; a second `close` is an idempotent
+  `Ok(())` — no second `flush`, no second `stop`, no second `Closed` (the C returns immediately on
+  an `EXITING`/`CLOSING`/`DEAD` port); `Port::command` answers `BadArg` (the
+  `ERTS_PORT_SFLGS_INVALID_LOOKUP` set includes `CLOSING`, `erl_port.h:351-354`; `io.c:1440-1441`
+  answers `badarg`), so a late `port_command/2` is the oracle's `badarg`.
+- `registry.rs` → the round-side finisher `finish_closing_ports`, called by **both**
+  `execute_port_tasks` and `handle_events` **after `reap_failures` and before the closes are
+  drained**: every live closing port is re-drained (the same `drain_output_during_close`, the same
+  budget) and then either finished — queue empty, or the stall bound reached, through the same
+  `remove_finished_port`/`finish_close` the synchronous path uses — or left parked for the next
+  round. A port finished **this** round therefore reports its `Closed` this round. Every port is
+  visited before the first error is returned, and an error leaves `self.closed` untouched, so the
+  closes already queued stay queued for the next round.
+- **`CLOSING_DRAIN_STALL_LIMIT` (`16`) is this crate's own valve, not the C's.** The C waits in
+  Limbo for as long as the driver keeps the port alive; a port that can never write a byte would
+  then hold its number, its descriptors and its poller registrations for ever **and** never tell the
+  owner it closed. Progress is measured against `Port::closing_watermark` (the queue shrinks from
+  the round's `OUTPUT` task as well as from the drain, so either route counts), so **any** shrinkage
+  resets the count — a 500 KB write to a peer reading 1 KB per round is never cut off — and only
+  `CLOSING_DRAIN_STALL_LIMIT` consecutive no-progress rounds (`Port::note_closing_drain`) make it
+  give up: the remainder is dropped, `stop` runs and the close is reported exactly once.
+- The **forced** close: a driver that latched a `driver_failure*`/`driver_exit` must not park
+  (`PortRegistry::reap_failures` → `close_now`), because the driver whose queue would be drained has
+  just declared itself broken — the C zeroes the ioq on that path (`prt->ioq.size = 0`,
+  `io.c:7220`), so `close_now` runs `Port::close` and then `finish_close` regardless of the queue.
+  `PortRegistry::open` does the same for a driver whose `start` failed.
+- **Invariants.** A `Closed` is never minted while `output_len() > 0` (only the finish half or the
+  stall bound mints it); the port number retires with that report, never with the park. What the
+  port still owed when it leaves the live map is dropped — its undelivered **input** and its staged
+  line frames (the C's `stopq` in `terminate_port`, `io.c:3768`) — while the three owner side
+  channels (completions, `{active,…}` deliveries, spent grants) are harvested into the registry
+  first and reported exactly once.
+
 ## Known Issues (durable gotchas — not fixed by changing this file)
-- **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
-  queues the id in `self.closed` and keeps it **allocated** in `ids`; the reporting round
-  (`execute_port_tasks` and `handle_events`, both via `take_closed_notifications`) mints the `Closed`
-  and releases the number there. So a `close` + `open` before the next round cannot make the deferred
-  `Closed` name a reused, live port. A consumer must act on a `Closed` in the round that delivered it —
-  the number may be handed out again immediately afterwards.
-- **No `Driver::flush`; a close drops queued bytes.** `Port::close` / `PortRegistry::close`
-  (`port.rs`, `registry.rs`) run `stop` and queue the close without draining either queue, whereas the C
-  calls `flush` before `terminate_port` and parks a port with a non-empty `ioq` in
-  `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at the
-  call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
-- **The partial-line flush rides `take_eof`, so it needs the `eof` *stream option* in this crate.** The
-  port's flush is triggered when `Driver::take_eof` reports `true`, but `drivers/spawn.rs`
-  (`SpawnDriver::take_eof`) reports only when `StreamOptions.eof` was set — the driver latches the end of
-  file either way. The oracle flushes at `driver_eof` regardless of the option, so a `[line]` port opened
-  without `eof` would hold its final partial line here. Closing that needs a driver-side input-EOF
-  accessor independent of the notification option (an additive `Driver` seam), and the runtime's
-  adoption of `set_line_mode`/`flush_linebuf` on the `open_port` path.
-- **A close never flushes the line buffer** (`io.c:7211` runs the flush from `driver_eof` only), and the
-  partial line is neither reported nor discarded by it — it is still held afterwards, so an explicit
-  `flush_linebuf` still releases it. Pinned by
-  `port::tests::closing_a_line_port_never_flushes_the_pending_partial_line`.
+- **A `PortNotification::Closed` names a number that is retired *with the report*.** A port that
+  leaves the live map — a synchronous close, or the round that finishes a parked one — is queued in
+  `self.closed` by `remove_finished_port`, and its number stays **allocated** in `ids` until the
+  reporting round (`execute_port_tasks` and `handle_events`, both via `take_closed_notifications`)
+  mints the `Closed` and releases the number there. So a `close` + `open` before the next round
+  cannot make the deferred `Closed` name a reused, live port. A consumer must act on a `Closed` in
+  the round that delivered it — the number may be handed out again immediately afterwards.
+- **The partial-line `input` flush (`Port::flush_linebuf`) rides `take_eof`, so it needs the `eof`
+  *stream option* in this crate.** It is triggered when `Driver::take_eof` reports `true`, but
+  `drivers/spawn.rs` (`SpawnDriver::take_eof`) reports only when `StreamOptions.eof` was set — the
+  driver latches the end of file either way. The oracle flushes at `driver_eof` regardless of the
+  option, so a `[line]` port opened without `eof` would hold its final partial line here. Closing
+  that needs a driver-side input-EOF accessor independent of the notification option (an additive
+  `Driver` seam), and the runtime's adoption of `set_line_mode`/`flush_linebuf` on the `open_port`
+  path. (`Driver::flush` and the close path's output drain are a different, unrelated flush — see
+  *The close path* above.)
+- **A close never flushes the line buffer** (`io.c:7210-7211` runs the flush from `driver_eof` only),
+  and the partial line is neither reported nor discarded by it — it is still held afterwards, so an
+  explicit `flush_linebuf` still releases it. Pinned by
+  `port::tests::closing_a_line_port_never_flushes_the_pending_partial_line`. This says nothing about
+  **output**: a close does write out (or, at the stall bound, drop) the port's queued output, while
+  the **input** line buffer is untouched and undelivered input is dropped with the port.
 - **A completion names a number that can be reused once its `Closed` report is minted.** The
-  harvest copies a closing port's completions *out* (the port itself is dropped), and the port
-  number is still retired only by the `Closed` report — so a caller **must** drain
+  harvest copies a port's completions *out* when the port leaves the live map (a parked closing port
+  is still live and keeps reporting), and the port number is still retired only by the `Closed` report — so a caller **must** drain
   `PortRegistry::take_completions` in the round it ran. A drain deferred past a later
   `PortRegistry::open` that reused the number would report a stale completion under a live port's
   id (the `Closed` report's own rule is unchanged and documented on `PortRegistry::close`).
@@ -265,12 +373,17 @@ drivers publish their own state through them (see *Who overrides the seam* below
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Per-module in-module counts (`-p beam_io --lib` = 1032):** `drivers` **703** — of which `inet`
-**591** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
-29 (`ram_file_tests` 23 + `ram_file_split_tests` 6), `fd` 14, `efile` 13, `binary_io` 9 — then
-`registry` 60 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
-`registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
-`host_output_tests.rs`, `port` 8, `table` 7, `job` 3), `port` 36 (12 + the 12 in
+**Gate: `-p beam_io` = 1071 lib + 251 integration over 26 binaries + 3 doctests ⇒ 1325 passed, 0
+failed, 2 `#[ignore]`d, over 28 test binaries.**
+**Per-module in-module counts (`-p beam_io --lib` = 1071 passed):**
+`drivers` **726** — of which `inet` **602** (per-suite breakdown in `drivers/inet/CONTEXT.md`),
+`line_buffer` 24, `spawn` 27 (23 + the 4 in `spawn_teardown_tests.rs`), `ram_file` 34
+(`ram_file_tests` 23 + `ram_file_split_tests` 6 + `ram_file_close_tests` 5), `fd` 17 (14 + the 3 in
+`fd_close_tests.rs`), `efile` 13, `binary_io` 9 — then
+`registry` 71 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
+`registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs` + the 4 in `awaits_callers_tests.rs`
++ the 7 in `closing_tests.rs`), `io_device` 41, `abi` 46 (`host` 23 = 18 + the 5 in
+`host_output_tests.rs`, `port` 13 = 8 + the 5 in `flush_tests.rs`, `table` 7, `job` 3), `port` 36 (12 + the 12 in
 `active_input_tests.rs` + the 8 in `port_command_tests.rs` + the 4 in `port_control_reply_tests.rs`),
 `port_task` 22, `signal` 20, `poller` 17, `driver` 13, `timer` 12, `ddll` 11, `completion` 11,
 `fs_access` 10, `queue` 8, `error` 8, `port_failure` 7, `cpu_time` 6, `close_fd` 6.
@@ -288,8 +401,9 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - **Line framing** is pinned at three levels. `drivers/line_buffer.rs` unit-tests the marker per frame
   (`eol` only for a newline terminator; the limit split and the CR_AFTER split are `noeol`), the
   `{eol, []}` blank line, that every flushed frame is `noeol`, and `flush_into_ready`'s arrival order.
-  `port.rs` unit-tests the port-level rule that a **close never flushes** (the held partial survives the
-  close and an explicit flush still releases it — impossible had the close reported it) and that the
+  `port.rs` unit-tests the port-level rule that a **close never flushes the input line buffer** (the
+  held partial survives the close and an explicit flush still releases it — impossible had the close
+  reported it) and that the
   `take_eof` flush releases a blank-line frame. `registry.rs` unit-tests the round-level shapes over a
   real pipe port (three `eol` lines, the blank line, the `{line,4}` split, one read ⇒ 150 frames, raw
   mode off by default, a line-mode port reporting **nothing** on `PortNotification`, `BadArg` for an
@@ -324,6 +438,36 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   drivers, one spend per exhausted `{active,once}`/`{active,N}` grant, the remaining counter readable
   through `PortRegistry::active_mode`, `{active,true}` never spending, the `setopts`-to-zero path
   spending nothing, and the registry route over a factory-built `"tcp_inet"` port.
+- **The close path** is pinned hermetically in `closing_tests.rs` (7 tests, no socket, no `cc`, no
+  `erl`, no sleeping), a `#[path]` sibling of `registry.rs` over a plain-Rust `ClosingDriver` whose
+  ordered call log (`flush`/`output`/`stop`), accepted bytes and drain policy are all observable:
+  `flush` before the drain and `stop` last; a fully written command closing **inside** the `close`
+  call; a one-byte-per-call driver parking the port (`is_closing`, still `contains`, the remainder
+  queued, an `OUTPUT` task pending, `stop` not run, a late command `BadArg`, a second `close` a
+  no-op, then progressive rounds to a `Closed` with every byte delivered, and no `Closed` while
+  `output_len() > 0`); the `CLOSING_DRAIN_STALL_LIMIT` give-up (exactly one `Closed`, remainder
+  dropped); a discarding `flush` closing inside the call with nothing written; a `close` + `open`
+  before the reporting round never shadowing the reported number; and exactly-once `Closed` across a
+  fast (synchronous) and a slow (parked) port, plus the unknown-id `BadArg` on `close`/`is_closing`.
+  The driver-level halves are `drivers/spawn_teardown_tests.rs` (4: `stop` gives the child its EOF
+  before anything is killed, a closed port's whole queued command really reaches the child, a child
+  that never reads stdin does not hang the close, plus the same row cross-checked against the system
+  `erl`) and `abi/flush_tests.rs` (5 over `cc`-built fixtures: the loaded `flush` runs once before
+  `stop`, a `NULL` slot closes cleanly and still stops, `flush` → the drain's `output` → `stop` in
+  that order, a loaded driver never parks a closing port, and a marker build whose `driver_output`
+  from inside the callback reaches the owner).
+- **The wait-side async predicate** is pinned hermetically in `awaits_callers_tests.rs` (4 tests, no
+  socket, no `cc`, no `erl`), a `#[path]` sibling of `registry.rs`, over two plain-Rust fake drivers:
+  one that overrides **only** `has_pending_async` (the default `awaits_callers_async_op` follows it
+  through both the port and the registry-wide probe, so an undecidable driver never claims nobody
+  waits), and one that overrides **both** — read back through `Port::has_pending_async`/
+  `Port::awaits_callers_async_op` and `PortRegistry::awaits_callers_async_op` over two live ports
+  (listener-shaped: both `true`; loaded-driver-shaped: drive-only, and the registry-wide probe answers
+  `false` once only that port is left), plus the live-port-only rule and that both probes are pure
+  `&self` questions.
+  The `abi::DriverPort` leg is unreachable from a source-module unit test (it needs a `cc`-built `.so`
+  behind a loader handle), and its `false` wait answer carries no test today: the C-ABI integration
+  suites pin the **drive** half only (`has_pending_async` in `tests/abi_async.rs`/`tests/abi_vector.rs`).
   The busy decision table is `port_command_tests.rs`'s (8 tests over a plain-Rust `BusyDriver` whose
   busy state, flag word and written bytes are all observable): idle ⇒ `Done` with the bytes really
   written and one `OUTPUT` task, busy + plain or `[nosuspend]` ⇒ `Busy` with **nothing** queued and no
@@ -367,11 +511,13 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest` (`READABLE`/`WRITABLE`/`BOTH`/`ERROR`), `Ready`, `Event`, `Waker`; `poller_tests.rs` → its `#[path]` suite
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`/`PortCommandOutcome`, `Port::command`/`is_busy`/`port_closed`/`active_mode`/`take_active_spends`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`; suite `port_command_tests.rs`, plus `port_control_reply_tests.rs`
-- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_command_with`/`is_busy`/`port_closed`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest, `active_mode`, `take_active_spends` + the `closed_active_spends` harvest); suites `registry_reply_tests.rs`/`registry_busy_tests.rs`/`registry_downcast_tests.rs`/`active_mode_tests.rs`
+- `port.rs` → `Port`, `PortState` (**`Closing` is a real state**, not a transient: see *The close path*), `PortControl`, `PortCommandOptions`/`PortCommandOutcome`, `Port::command`/`is_closing`/`is_closed`/`is_busy`/`port_closed`/`active_mode`/`take_active_spends`/`has_pending_async`/`awaits_callers_async_op` (the drive / wait async twins), `Port::close` + the finish half `finish_close` + `driver_flush`/`drain_output_during_close`/`note_closing_drain`, `CLOSING_DRAIN_STALL_LIMIT`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the completed-read queue (`pending_reads`, `close_input_frame`), the completion stage (`completions` + `take_completions`), the `{active,…}` stage (`active_inputs` + `take_active_inputs`), and the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`; suites `port_command_tests.rs`, plus `port_control_reply_tests.rs` (the close-path suites live on the registry side — `closing_tests.rs`)
+- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `close` (parking or finishing) + `is_closing` + the round-side finisher `finish_closing_ports`, the shared removal/harvest helper `remove_finished_port`, the **forced** `close_now` a driver failure takes, `port_command`/`port_command_with`/`is_busy`/`port_closed`/`port_control`, the exit/eof/async seams, the registry-wide `awaits_callers_async_op` probe, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`, `take_completions` + the `closed_completions` harvest, `take_active_inputs` + the `closed_active` harvest, `active_mode`, `take_active_spends` + the `closed_active_spends` harvest); suites `registry_reply_tests.rs`/`registry_busy_tests.rs`/`registry_downcast_tests.rs`/`active_mode_tests.rs`/`awaits_callers_tests.rs`/`closing_tests.rs`
 - `completion.rs` → the driver→owner completion side channel: `CompletionEvent` (`InetReply { caller_ref: Option<Vec<u8>>, reply }` / `InetAsync { id, result }`), `InetReply` (`Ok`/`Error(InetReason)`), `InetAsyncResult` (`Ok`/`Data`/`Port`/`Error`), `InetReason` (`Closed`/`Timeout`/`Errno` + `from_errno`/`atom_name`) and the port-stamped `PortCompletion { port, event }`
 - `active_input_tests.rs` → the `{active,…}` channel's structural suite (12 tests), a `#[path]` test module of `port.rs`
-- `active_mode_tests.rs` → the driver-agnostic `{active,…}` state seam's suite (10 tests), a `#[path]` test module of `registry.rs`: the `ActiveMode::from_parts` mapping and its predicates, the two trait **defaults** over a driver that overrides nothing, an overriding fake driver read back through `PortRegistry::active_mode` (+ the unknown-id `BadArg`), and `take_active_spends`'s exactly-once / spending-order / port-number-order rules plus its **closed half** (a spend staged before a `close`, and one staged from `stop`)
+- `active_mode_tests.rs` → the driver-agnostic `{active,…}` state seam's suite (9 tests), a `#[path]` test module of `registry.rs`: the `ActiveMode::from_parts` mapping and its predicates, the two trait **defaults** over a driver that overrides nothing, an overriding fake driver read back through `PortRegistry::active_mode` (+ the unknown-id `BadArg`), and `take_active_spends`'s exactly-once / spending-order / port-number-order rules plus its **closed half** (a spend staged before a `close`, and one staged from `stop`)
+- `closing_tests.rs` → the **flush-then-close** suite (7 tests), a `#[path]` test module of `registry.rs` over a plain-Rust `ClosingDriver` whose ordered call log (`flush`/`output`/`stop`), accepted bytes and drain policy are observable — what each test pins is in `## Test Strategy` above
+- `awaits_callers_tests.rs` → the **wait-side** async predicate's suite (4 tests), a `#[path]` test module of `registry.rs`: the trait default following `has_pending_async` over a driver that overrides only the drive half, a driver that overrides **both** read back through `Port::has_pending_async`/`Port::awaits_callers_async_op` and the registry-wide probe over two ports (a listener-shaped one where both are `true`, a loaded-driver-shaped one that is drive-only), the live-port-only rule, and that both probes are pure `&self` questions
 - `completion_tests.rs` → the channel's structural suite (11 tests), a `#[path]` test module of `completion.rs`: all nine interaction points, the timer-only route, both round drivers, port-number ordering, the close harvest, exactly-once, and the no-sink `unsupported`
 - `driver_output2.rs` (`../tests/`) → the split-read pin over a real `PortRegistry`/`Poller`: one `Data` per call, header/body exact, `Some(vec![])` vs `None`, `input_len` = `hlen+len`, no re-report on a second round
 - `registry_reply_tests.rs` → the write-path pin: the reply round trip (`port_command` ⇒ one `Data`) and the refused-command propagation (`Err(BadArg)` out of `execute_port_tasks`), a `#[path]` test module of `registry.rs`
@@ -384,21 +530,38 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
 - `port_command_tests.rs` → the busy-port decision table's suite (8 tests), a `#[path]` test module of `port.rs`: idle ⇒ `Done` + one `OUTPUT` task, busy + plain/`[nosuspend]` ⇒ `Busy` with nothing queued, `[force]` ⇒ `notsup` without `SOFT_BUSY` and `Done` with it, the state cleared ⇒ `Done` again, `BadArg` on a non-`Open` port, and the `is_busy`/`port_closed` probes
 - `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `ReadMessage` (`{header, body}` — the `driver_output2` split), `PortNotification` (`Data { port, read }` + `Closed`), `LineNotification` (the separate `{line,N}` channel, with its per-frame `header`), `ActiveInput`/`ActiveInputEvent` (the separate `{active,…}` channel: `Data`/`Passive`/`Error(InetReason)`), `ActiveMode` (`{active, Mode}` with `from_parts`/`is_active`/`remaining`) and `ActiveSpend` (`Once`/`Multi` — the grants a delivery spent to exhaustion), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
-- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`active_mode` (default `ActiveMode::False`) and `take_active_spends` (default an empty, allocation-free `Vec`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async`/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
+- `driver.rs` → `Driver` (its frozen method set: required `name`/`start`/`output`/`ready_input`/`stop`; defaulted `flags`/`ready_output`/`control`/`has_control` (default `true`; `false` iff the C counterpart has no `control` — `RamFileDriver` and a NULL-`control` `DriverPort`)/`is_busy`/`port_closed` (both defaulting `false`; the first is the `set_busy_port` state `Port::command` decides on, the second a latched peer/OS close)/`active_mode` (default `ActiveMode::False`) and `take_active_spends` (default an empty, allocation-free `Vec`)/`timeout`/`next_timeout`/`port_exit`/`drive_async`/`has_pending_async` (the **drive** predicate: work a port round must drive, accept/job inclusive)/`awaits_callers_async_op` (the **wait** predicate beside it: an async op some caller is parked on, defaulting to `has_pending_async` so a driver that cannot tell the two apart never claims nobody waits; the socket drivers answer accept-inclusively, `abi::DriverPort` answers `false`)/`flush` (the close path's one chance to discard queued output **before** `stop`; the default discards nothing — the C's `flush == NULL` — and only `SpawnDriver`, `drivers::TcpInetDriver` and `abi::DriverPort` override it)/`take_exit_status`/`take_eof`), `DriverContext` (incl. the four sinks: `with_reads` + `deliver_read(header, body)`, `with_completions` + `deliver_completion(event)`, `with_active` + `deliver_active_input(event)`, `with_failure` + `signal_failure(failure)` — the first three stamp `ctx.port()` itself, and each answers a typed `unsupported` with no sink), `DriverFlags`, `DriverRegistry` (+ `STATIC_SPAWN_DRIVERS`/`is_static_spawn_driver`/`create_static_spawn`/`with_static_spawn_drivers` — the `driver_tab` seam), `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site, `EINTR` retried, an interior-NUL path ⇒ `BadArg`), `access` (`Result<bool>`, refusal ⇒ `false`, only a genuine syscall failure is `BeamError::Io`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>` — the **effective** ids `check_access` compares a `stat` against)
 - `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `tcp_inet`, `udp_inet`, `ram_file_drv`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
-- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port), `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers), `passive_recv_tests.rs` (9 — the passive `gen_tcp:recv` park), `accept_opts_family_tests.rs` (7 — `prim_inet:accept_opts/3`'s whole eleven-code list, incl. `FamilyOpts`) and `shutdown_contract_tests.rs` (10 — the `gen_tcp:shutdown/2` aftermath)
+- `drivers/inet/` → the `tcp_inet`/`udp_inet` socket drivers (option/syscall/stat layer, the async-op queue, the `{active,…}` deliveries, the opcode bridge, `{packet,N}` framing) — child node `drivers/inet/CONTEXT.md`; its suite halves are `write_frame_tests.rs` (12 — the `{packet,1|2|4}` header on both write routes, `send_oct`, the short write and the refusals, over a real loopback port), `flush_tests.rs` (6 — the close-path flush: the unarmed-write discard, the `{linger,{true,0}}` flag, the teardown-vs-close-verb split, and `udp_inet`'s absent slot), `close_tests.rs` (5 — what a teardown keeps and what the close verb drops), `active_seam_tests.rs` (9 — `Driver::active_mode`/`take_active_spends` over the real drivers), `passive_recv_tests.rs` (9 — the passive `gen_tcp:recv` park), `accept_opts_family_tests.rs` (7 — `prim_inet:accept_opts/3`'s whole eleven-code list, incl. `FamilyOpts`) and `shutdown_contract_tests.rs` (12 — the `gen_tcp:shutdown/2` aftermath)
+- `drivers/spawn_teardown_tests.rs` → the `spawn` driver's **teardown ordering** suite (4 tests), a `#[path]` test module of `drivers/spawn.rs` (so `super` is `spawn`): `stop` gives the child end-of-file before anything is killed, closing the port delivers every queued byte of a payload larger than a pipe buffer, a child that never reads stdin does not hang the close, and that same row cross-checked against the system `erl` — every wait polls a condition under a 60 s hang guard (never a wall-clock budget), skipping **loudly** without `erl`
+- `abi/flush_tests.rs` → `abi::DriverPort`'s `flush` forwarding suite (5 tests), a `#[path]` test module of `abi/port.rs` over `cc`-built C fixtures (`flush_driver.c`, `flush_driver_no_flush.c`, `flush_driver_marker.c`): the loaded driver's `flush` runs exactly once and before its `stop`; an entry with no `flush` slot closes cleanly and still stops; the order is `flush` → the drain's `output` → `stop`; a loaded driver never parks a closing port (its `output`/`outputv` are `void`, so the queue always counts as written); and the marker build's `driver_output` from inside `flush` reaches the owner (gated on `host_symbols_exported`, since the lib unit-test binary lacks `-Wl,--export-dynamic`)
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
 - `io_device/` → the `{get_until,…}` io-device request layer — child node `io_device/` (files listed in `../CONTEXT.md`)
+
+## Handoffs (beam_rt — what a runtime now observes on a close)
+- **A close can return before the port is gone.** `PortRegistry::close` answers `Ok(())` with the port **parked** in `PortState::Closing` when its queued output could not all be written synchronously: the driver's `flush` has run, `stop` has **not**, the port is still in the live map (`contains` and `is_closing` both `true`), its poller registrations are still armed, and every further command is the oracle's `badarg`.
+- **`Closed` arrives from a later round, and the number retires with that report.** A runtime must keep running rounds (`execute_port_tasks`/`handle_events`) after such a close: the round that empties the queue — or the one that hits `CLOSING_DRAIN_STALL_LIMIT` and drops the remainder — reports the `PortNotification::Closed`, and only then is the number released. A runtime that stops running rounds after a parked close therefore holds the number, its descriptors and its poller registrations; the same applies to a parked port the runtime never re-drives.
+- **`erlang:port_close/1`'s `true` still covers the buffered bytes**, so rendering `true` on a parked close is correct rather than an early answer; the bytes are delivered by the rounds that follow (the oracle row this was measured against: a `tee` child received 500 000/500 000 bytes while `port_close/1` returned `true` with 454 656 bytes still queued).
+- **The drained output goes to the device, so it owes the owner no extra message** — but whatever a `flush`, a `stop` or a drained `ready_output` stages on the side channels still reaches the runtime through the existing drains: completions, `{active,…}` deliveries and spent grants are harvested into the registry queues when the port leaves the live map, and a parked port keeps reporting through them until it does.
+- **What is *not* reported:** the input and line frames a port still owed when it leaves the live map are dropped with it (the C's `stopq` in `terminate_port`), so input staged by the close-time drain of a port that finishes **inside** the `close` call is dropped too. A parked port is still live, so its input is harvested normally — which is why a runtime must drain `take_input_notifications`/`take_line_notifications` in the round it runs.
 
 ## See Also
 - `../CONTEXT.md` → the authoritative crate doc (frozen API surface, constraints, test strategy, handoffs).
 - `../../../erts/emulator/beam/{io.c,erl_port_task.c,erl_port_task.h,erl_bif_port.c}` and
   `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth
-  (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7211` the
+  (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7210-7211` the
   `driver_eof` flush; `erl_bif_port.c:862-869,986` the `line`/`{line,N}` option decoding).
+- The close path's C ground truth: `io.c:3946-3953` (`erts_deliver_port_exit`'s CLOSING arm),
+  `:3659-3700` (`flush_port`), `:3704-3795` (`terminate_port`, whose sole `drv->stop` call is
+  `:3752`),
+  `:3968-3971` (the Limbo comment), `:7220` (the forced `prt->ioq.size = 0` on a driver failure),
+  `:3768` (`stopq`), `erl_port.h:798-812` (`erts_port_driver_callback_epilogue`), `:351-354`
+  (`ERTS_PORT_SFLGS_INVALID_LOOKUP`, which includes `CLOSING`), plus
+  `../../../erts/emulator/sys/unix/sys_drivers.c:1029-1034` (`fd_flush`'s latch) and
+  `drivers/common/ram_file_drv.c:120` (`flush = NULL`).
 
 ## Oracle-pinned shapes still owed by the port layer (measured with the system `erl`)
 
@@ -435,5 +598,5 @@ Driver failures, measured the same way after `driver_failure*`/`driver_exit` fro
 | `driver_failure_atom(p,"enospc")` | `{'EXIT',P,enospc}` | `undefined` | `badarg` |
 | `driver_failure(p,42)` | `{'EXIT',P,42}` | `undefined` | `badarg` |
 | `driver_failure_eof(p)` | `{'EXIT',P,normal}` | `undefined` | `badarg` |
-| `driver_exit(p,0)` / `driver_exit(p,ENOSPC)` | **nothing** (the C unlinks first, `io.c:7244`) | `undefined` | `badarg` |
+| `driver_exit(p,0)` / `driver_exit(p,ENOSPC)` | **nothing** (the C unlinks first, `io.c:7244-7245`) | `undefined` | `badarg` |
 | `driver_output` then `driver_failure_posix` | `{data,…}` **then** `{'EXIT',P,einval}` | `undefined` | `badarg` |

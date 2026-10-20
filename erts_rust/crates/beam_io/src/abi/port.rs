@@ -38,7 +38,8 @@
 //! | [`Driver::control`] | `control` | absent slot ⇒ `badarg` (`io.c:4035`) |
 //! | [`Driver::control_reply_shape`] | — | the `*rbuf == NULL` test of the last `control` call (`io.c:4134`); the shape no `cres` can carry |
 //! | [`Driver::port_exit`] | `process_exit`, falling back to `emergency_close` | the C has no port-exit callback |
-//! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op |
+//! | [`Driver::flush`] | `flush` | absent slot ⇒ the C's silent no-op (`io.c:3664`); runs **before** `stop` |
+//! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op; the sole caller of the entry's `stop` (`terminate_port`, `io.c:3703-3704`, the call at `:3752`) |
 //! | [`Driver::next_timeout`] | the `driver_set_timer` deadline | see [`crate::AbiHost`] |
 //! | [`DriverPort::poll_async`] | `ready_async` / `async_free` | drained from the `driver_async` job set |
 //! | — | `stop_select` | the `ERL_DRV_USE` release callback; runs outside the `Driver` trait, on deselect and at teardown |
@@ -70,9 +71,9 @@
 //! driver code publish it:
 //!
 //! * [`DriverPort::call`] — around **every** callback it routes (`start`/`output`/`ready_input`/
-//!   `ready_output`/`control`/`timeout`/`port_exit`/`stop`), including the `ready_async` branch of
-//!   [`DriverPort::poll_async`], and around the `stop_select` callbacks `DriverPort` fires on a
-//!   released `ERL_DRV_USE` selection; and
+//!   `ready_output`/`control`/`timeout`/`port_exit`/`flush`/`stop`), including the `ready_async`
+//!   branch of [`DriverPort::poll_async`], and around the `stop_select` callbacks `DriverPort` fires
+//!   on a released `ERL_DRV_USE` selection; and
 //! * the `async_free` branch of [`DriverPort::poll_async`], which bypasses `call` (the C's
 //!   `async_free` is `void (*)(void*)`, with no port and no `ready_async`).
 //!
@@ -848,6 +849,17 @@ impl Driver for DriverPort {
     fn has_pending_async(&self) -> bool {
         self.abi.has_pending_async()
     }
+    /// **No** caller is ever parked on a loaded driver's `driver_async` job, so this is `false`.
+    ///
+    /// The drive half stays [`DriverPort::has_pending_async`] = [`AbiHost::has_pending_async`],
+    /// which reports `jobs.in_flight() > 0` so the port round still drives the pool. But a
+    /// `driver_async` job's completion goes to the **driver's own** `ready_async` callback (or its
+    /// `async_free`), never to a parked Erlang process — the C's `erts_async_*` machinery has no
+    /// recipient term at all. So an in-flight job is "work to drive", not "an answer owed to a
+    /// waiter", and a caller-blocking wait must not be kept alive by one.
+    fn awaits_callers_async_op(&self) -> bool {
+        false
+    }
 
     /// The `driver_set_timer` deadline, as the port's next `TIMEOUT`.
     fn next_timeout(&self) -> Option<Instant> {
@@ -894,6 +906,71 @@ impl Driver for DriverPort {
     fn take_exit_status(&mut self) -> Result<Option<i32>> {
         Ok(None)
     }
+    /// `flush`: give the loaded driver its one chance, **before** `stop`, to discard the output it
+    /// still has queued — the C's `drv_ptr->flush` from `flush_port`
+    /// (`erts/emulator/beam/io.c:3659-3700`).
+    ///
+    /// # The C's `flush`/`stop` split
+    ///
+    /// The two callbacks belong to different halves of a port's death and the C never conflates
+    /// them:
+    ///
+    /// * `flush` is called only when the entry **has** one — `if (p->drv_ptr->flush != NULL)`
+    ///   (`io.c:3664`, with the callback at `:3687`) — and only for a port being closed whose ioq is
+    ///   still non-empty (`erts_deliver_port_exit`'s CLOSING arm, `io.c:3946-3953`). It exists so the
+    ///   driver can say "these bytes are obsolete, drop them" (the C `tcp_inet` discards its queue
+    ///   only when write readiness is *not* armed, `inet_drv.c:12708-12731`).
+    /// * `stop` is called once, by `terminate_port` (`io.c:3703-3704`, the `drv->stop` call at
+    ///   `:3752`) — the sole caller of the entry's `stop` slot. [`DriverPort::stop`] therefore stays
+    ///   exactly as it is; this method adds a callback *in front of* it, it does not move anything
+    ///   out of it.
+    ///
+    /// # An absent `flush` slot is the C's silent no-op, not an error
+    ///
+    /// An entry with no `flush` is a driver with nothing to discard, and the C runs no code for it
+    /// (`io.c:3664`). [`DriverLibrary::flush`] reports that as `Err(DriverCallError::absent)` so a
+    /// caller *can* tell the two apart; here the error is swallowed, which is both the C's behaviour
+    /// and [`Driver::flush`]'s own default — a `.so` that never declared a `flush` closes exactly as
+    /// a Rust driver that never overrode it.
+    ///
+    /// # What the callback can still do
+    ///
+    /// It runs through [`DriverPort::call`] like every other slot, so the port's four sinks are
+    /// installed: a `driver_output*`/`driver_failure*` made from inside `flush` reaches the owner
+    /// exactly as it would from `output`/`timeout`, and bytes the driver takes off the port's output
+    /// queue with `driver_deq` are really gone from it (`flush` reports no byte count, so the port
+    /// verifies none — see [`Driver::flush`]'s contract).
+    ///
+    /// # The deferred half (why this does not terminate the port)
+    ///
+    /// `flush_port` terminates the port itself **only if the ioq became empty** (`io.c:3696-3699`);
+    /// otherwise the port stays `ERTS_PORT_SFLG_CLOSING` (the "Limbo" state, `io.c:896-900`) and the
+    /// driver-callback epilogue terminates it once the queue drains
+    /// (`erts_port_driver_callback_epilogue`, `erts/emulator/beam/erl_port.h:797-813`). That deferral
+    /// is modelled **above** this layer, not here: [`crate::Port::close`] drains the output queue
+    /// synchronously after this callback and only then runs `stop`
+    /// ([`crate::Port::close`] → [`crate::Port::drain_output_during_close`]);
+    /// [`crate::PortRegistry`] keeps a port whose queue did not empty in
+    /// [`PortState::Closing`](crate::PortState::Closing) and finishes it from a later round
+    /// (`finish_closing_ports`). This method's whole job is the callback.
+    ///
+    /// # Why this needs none of `stop`'s teardown care
+    ///
+    /// [`DriverPort::stop`] also withdraws the poller registrations a driver left selected and fires
+    /// the `stop_select`s it owes, and [`Drop`] releases undelivered `driver_async` completions —
+    /// because teardown is when those obligations end. `flush` is **not** a teardown: the port is
+    /// still live, its descriptors are still the driver's, and the write it is being asked about may
+    /// well go ahead (a flush that consumes nothing means "keep the bytes, try to write them"). A
+    /// deregistration here would make the port's own drain fail and a `stop_select` here would tell
+    /// the driver to close a handle the C still wants it to serve. So this forwards the one callback
+    /// and nothing else.
+    fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        self.call(ctx, |port, _handle| {
+            // `Err(absent("flush"))` is the C's `flush == NULL` no-op (`io.c:3664`), not a failure.
+            let _ = port.lib.flush(port.data);
+        });
+        Ok(())
+    }
 
     /// `stop`: release the driver's resources.
     ///
@@ -936,6 +1013,12 @@ impl Drop for DriverPort {
     }
 }
 
+/// The `flush`-forwarding suite, a sibling `#[path]` child of this module (like `host`'s two): it
+/// `dlopen`s the real C fixtures under `src/abi/fixtures/`, so it stays out of this file and off
+/// the ~1000-line budget (see `flush_tests.rs`).
+#[cfg(test)]
+#[path = "flush_tests.rs"]
+mod flush_tests;
 #[cfg(test)]
 mod tests {
     use super::{driver_flags, is_start_failure, load_failure, make_loaded, DriverPort};

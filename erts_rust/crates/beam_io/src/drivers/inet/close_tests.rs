@@ -39,8 +39,9 @@ use super::opcode_tests::{connection, erl_stdout, op, Rig, CONTROL_MAGIC};
 use super::wire::{ctl_ok, ctl_xerror};
 use super::{InetState, TcpInetDriver, INET_AF_INET, INET_TYPE_STREAM};
 use crate::poller::Poller;
-use crate::port::{Port, PortCommandOptions};
-use beam_process::PortId;
+use crate::port::PortCommandOptions;
+use crate::port_task::PortNotification;
+use crate::registry::PortRegistry;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
@@ -214,15 +215,22 @@ fn the_close_verb_empties_the_queued_output() {
         "GETFD(14) on the now socket-less port"
     );
 }
-/// The C reaches the same end state on the **teardown** path, where the queue is emptied by
-/// `tcp_inet_flush`'s `tcp_clear_output` (`inet_drv.c:12708`-`:12731`, `:12728`) before the port
-/// is freed — so nothing queued outlives `Driver::stop` either.
+/// **A teardown does not discard what can still be written.** The C's `tcp_inet_flush`
+/// (`inet_drv.c:12708`-`:12731`) keeps the queue unless write readiness is unarmed
+/// (`discard_output = !(desc->inet.event_mask & FD_WRITE)`) or `{linger,{true,0}}` is set, and
+/// `flush_port` (`erts/emulator/beam/io.c:3659`-`:3700`) only reaches `terminate_port` (`:3704`)
+/// once `is_port_ioq_empty(p)` (`:3697`) — otherwise the port sits in the C's Limbo
+/// (`ERTS_PORT_SFLG_CLOSING`, `:3946`-`:3956`) until the queue drains.
 ///
-/// The `Port` is driven directly here (not through the registry) because the registry drops the
-/// port, and with it the queue, at a `close`: only the bare [`Port`] can show that the driver's
-/// teardown empties the queue rather than leaving it for the drop.
+/// So a 16 MiB write to a peer that never reads leaves the port **parked in
+/// [`PortState::Closing`]** after `close`, with the unwritable remainder still queued and `stop`
+/// not yet run; only the stall bound (`CLOSING_DRAIN_STALL_LIMIT`) or a drain that completes ends
+/// it, and it is that later round which reports `Closed`.
+///
+/// Measured on the oracle (OTP 29.1.1 / erts-17.1): `port_close/1` returns `true` with 369 036
+/// bytes still queued and the peer later receives 500 000/500 000.
 #[test]
-fn the_teardown_empties_the_queued_output_too() {
+fn a_teardown_keeps_the_queued_output_that_write_readiness_can_still_send() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let _peer = TcpStream::connect(listener.local_addr().expect("an address"))
         .expect("the far end connects");
@@ -235,18 +243,71 @@ fn the_teardown_empties_the_queued_output_too() {
     let driver = TcpInetDriver::from_socket(fd).expect("the driver adopts the socket");
     assert_eq!(driver.state(), InetState::Connected);
     let mut poller = Poller::new().expect("a poll set");
-    let mut port = Port::new(PortId::new(1), Box::new(driver));
-    port.open(&mut poller).expect("start registers the socket");
-    port.output(&mut poller, &tagged_command(16 * 1024 * 1024))
+    let mut ports = PortRegistry::new();
+    let id = ports
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+    ports
+        .output(&mut poller, id, &tagged_command(16 * 1024 * 1024))
         .expect("the write");
-    let queued = port.output_len();
+    let queued = ports
+        .get(id)
+        .expect("the port is live")
+        .output_len();
     assert!(queued > 0, "the peer never reads, so a remainder is queued");
-    port.close(&mut poller).expect("the teardown runs");
+    assert!(
+        ports
+            .get_mut(id)
+            .expect("the port is live")
+            .take_active_spends()
+            .is_empty(),
+        "a plain write spends no {{active,_}} grant"
+    );
+    ports
+        .close(&mut poller, id)
+        .expect("the close runs (and answers its `true`)");
+    // The queue is kept: `tcp_inet_flush` saw write readiness armed (the stalled
+    // `write_pending` left `Interest::BOTH`), so it did not `tcp_clear_output`.
+    assert!(
+        ports.contains(id),
+        "a parked closing port stays in the live map — the C's Limbo"
+    );
+    assert!(
+        ports.is_closing(id).expect("the port is live"),
+        "the port is parked in PortState::Closing, not closed"
+    );
+    let port = ports.get(id).expect("the port is live");
     assert_eq!(
         port.output_len(),
-        0,
-        "the {queued} bytes that can never be written go with the teardown"
+        queued,
+        "the {queued} bytes write readiness can still send are retained, not discarded"
     );
+    assert!(!port.is_closed(), "`stop` has not run yet");
+    // A second `close` is the C's idempotent re-entry (`io.c` returns at once for a CLOSING port).
+    ports
+        .close(&mut poller, id)
+        .expect("a second close is an idempotent Ok(())");
+    // Only once the remainder is written (or the stall bound drops it) does the port leave the
+    // live map and report `Closed`; the peer here never reads, so that is the bound.
+    let mut closed = false;
+    for _ in 0..(crate::port::CLOSING_DRAIN_STALL_LIMIT + 4) {
+        let round = ports
+            .execute_port_tasks(&mut poller, crate::port::DEFAULT_READINESS_RED_BUDGET)
+            .expect("a port-task round");
+        if round
+            .notifications
+            .iter()
+            .any(|n| matches!(n, PortNotification::Closed { port } if *port == id))
+        {
+            closed = true;
+            break;
+        }
+    }
+    assert!(
+        closed,
+        "the stall bound ends the parked close and reports Closed exactly once"
+    );
+    assert!(!ports.contains(id), "the number retires with that report");
 }
 // -----------------------------------------------------------------------
 // tcp_clear_input on a prebound close

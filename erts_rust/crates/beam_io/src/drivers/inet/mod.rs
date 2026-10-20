@@ -722,6 +722,15 @@ pub struct TcpInetDriver {
     /// data. A switch **to** [`PacketType::Raw`] therefore delivers the whole retained buffer
     /// (plus everything after it) verbatim, so raw mode stays authoritative for queued bytes.
     pending_input: Vec<u8>,
+    /// A close the socket reported that has **not** been latched yet.
+    ///
+    /// [`TcpInetDriver::read_bytes`] never latches: it reports the observation and leaves the
+    /// decision to its caller. A queued receive (`try_complete_recv`) that read data **and** the
+    /// peer's end of file in one drain must hand the data over first — the C's `tcp_recv`
+    /// answers a complete unit before it ever reaches the `n == 0` arm (`inet_drv.c:13216`,
+    /// `:13206`), so `{error, closed}` is owed to the *next* receive. Every other caller latches
+    /// straight away, which is the C's ordering for a discovery no operation is parked on.
+    deferred_close: Option<CloseSource>,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
     /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
@@ -847,6 +856,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
+            deferred_close: None,
             family: 0,
             stype: 0,
             name_addr: None,
@@ -902,6 +912,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
+            deferred_close: None,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
             name_addr: None,
@@ -1042,6 +1053,7 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
+                self.deferred_close = None;
                 // ... and a fresh read side: nothing has been delivered on the new socket yet, so
                 // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
                 self.read_armed = true;
@@ -1122,6 +1134,7 @@ impl TcpInetDriver {
         // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
         // socket no longer belongs to this one.
         self.pending_input.clear();
+        self.deferred_close = None;
         // The read side is selected again: the new socket has delivered nothing yet.
         self.read_armed = true;
         self.state = if connected {
@@ -1147,6 +1160,7 @@ impl TcpInetDriver {
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
+        self.deferred_close = None;
         // ... and nothing has been delivered on it yet, so its read side is selected again.
         self.read_armed = true;
     }
@@ -1235,8 +1249,13 @@ impl TcpInetDriver {
         result
     }
 
-    /// The C's `tcp_desc_close` (`inet_drv.c:11932`-`:11939`), the body behind both
-    /// `INET_REQ_CLOSE` (`:12258`-`:12266`) and the driver teardown.
+    /// The C's `tcp_desc_close` (`inet_drv.c:11932`-`:11939`) — the body of the **`INET_REQ_CLOSE`
+    /// verb** (`:12258`-`:12266`) and of every peer-close teardown the C routes through it
+    /// (`:12264`, `:12511`, `:12521`, `:12572`, `:12825`, `:12873`, `:13653`, `:13670`). It is
+    /// deliberately **not** the driver teardown: `tcp_inet_stop` (`:11893`-`:11924`) runs
+    /// `tcp_close_check` + `tcp_clear_input` + `inet_stop` and never touches the `ioq` — the queue
+    /// is the flush's and the port layer's business there (see [`TcpInetDriver::flush`] and
+    /// [`Driver::stop`]'s body).
     ///
     /// ```c
     /// static void tcp_desc_close(tcp_descriptor* desc)
@@ -1257,6 +1276,9 @@ impl TcpInetDriver {
     ///
     /// [`TcpInetDriver::close_socket`] cannot do this (it takes no [`DriverContext`], and `Drop`
     /// has no port to clear), so the queue half lives here, on the `ctx`-carrying close path.
+    ///
+    /// The **port** teardown deliberately does not come through here — see
+    /// [`Driver::stop`]'s body, which is the C's `tcp_inet_stop` and keeps its hands off the `ioq`.
     ///
     /// # Errors
     ///
@@ -1290,7 +1312,15 @@ impl TcpInetDriver {
         report: ReadReport,
     ) -> Result<usize> {
         let mut bytes = Vec::new();
-        let read = self.read_bytes(ctx, &mut bytes, report)?;
+        let close = self.read_bytes(&mut bytes, report)?;
+        let read = bytes.len();
+        if let Some(source) = close {
+            // The close this read discovered is answered by **this** caller, and the latch runs
+            // before the bytes are queued so that a `{packet, N}` frame read in the same call
+            // survives the teardown's `tcp_clear_input` (the C's discovery sites clear and only
+            // then deliver, `inet_drv.c:12824`-`:12829`).
+            self.latch_peer_close(ctx, source)?;
+        }
         if self.framed().is_some() {
             // `{packet, N}`: the bytes are not a message yet — hold them for the frame decoder.
             self.pending_input.extend_from_slice(&bytes);
@@ -1313,29 +1343,30 @@ impl TcpInetDriver {
     /// Reads the socket to `EAGAIN` into `out`, appending every byte the kernel hands over.
     ///
     /// A no-op unless the socket is connected and the peer's close has not already been observed.
-    /// Returns the number of bytes read. The edge-triggered poller means a caller must drain to
-    /// `EAGAIN` per readiness callback, which this loop does.
+    /// The edge-triggered poller means a caller must drain to `EAGAIN` per readiness callback,
+    /// which this loop does.
     ///
-    /// `report` is threaded into the [`CloseSource::Read`] this read latches if it is the one that
-    /// finds the peer gone — see [`ReadReport`].
+    /// Answers the peer-close **observation** when this drain is the one that made it, and latches
+    /// nothing itself: it only records [`TcpInetDriver::read_eof`] and hands the [`CloseSource`]
+    /// back, so the caller decides when the close is applied (the C's discovery sites clear and
+    /// only then deliver, `inet_drv.c:12824`-`:12829`) — see [`TcpInetDriver::read_available`]'s
+    /// latch and [`TcpInetDriver::deferred_close`] for the payload-first ordering. `report` is
+    /// threaded into the returned [`CloseSource::Read`] — see [`ReadReport`].
     ///
     /// # Errors
     ///
-    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor) and
-    /// whatever the close latch reports (a failed poller de-registration, or a refused
-    /// active-input delivery). A **read** failure is not one of them: it is classified through
-    /// [`CloseSource::Read`] instead of being raised.
+    /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor). A
+    /// **read** failure is not one of them: it is classified through [`CloseSource::Read`] instead
+    /// of being raised.
     fn read_bytes(
         &mut self,
-        ctx: &mut DriverContext<'_>,
         out: &mut Vec<u8>,
         report: ReadReport,
-    ) -> Result<usize> {
+    ) -> Result<Option<CloseSource>> {
         if !self.state.is_connected() || self.peer_close.seen {
-            return Ok(0);
+            return Ok(None);
         }
         let fd = self.connected_socket()?;
-        let mut read = 0usize;
         let mut buf = [0u8; READ_CHUNK];
         loop {
             // SAFETY: `fd` is an open, non-blocking socket owned by this driver and `buf` is
@@ -1345,7 +1376,6 @@ impl TcpInetDriver {
             if n > 0 {
                 let n = n as usize;
                 out.extend_from_slice(&buf[..n]);
-                read += n;
                 // Edge-triggered readiness: keep reading until the socket is empty.
                 continue;
             }
@@ -1356,13 +1386,12 @@ impl TcpInetDriver {
                 // `async_error_am_all(am_closed)` (`:12829`), which this floor's reactor must
                 // defer to the next `recv` (`report`).
                 self.read_eof = true;
-                self.latch_peer_close(ctx, CloseSource::Read { error: None, report })?;
-                return Ok(read);
+                return Ok(Some(CloseSource::Read { error: None, report }));
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(read),
+                Some(libc::EAGAIN) => return Ok(None),
                 // The C's `tcp_recv` classification (`inet_drv.c:13185`-`:13210`), in its order:
                 // `ECONNRESET` goes to `tcp_recv_error` — which reports `error_atom(err)` and
                 // arms nothing — **only** while `TCP_ADDF_SHOW_ECONNRESET` is set
@@ -1378,8 +1407,7 @@ impl TcpInetDriver {
                         Some(errno)
                     };
                     self.read_eof = true;
-                    self.latch_peer_close(ctx, CloseSource::Read { error, report })?;
-                    return Ok(read);
+                    return Ok(Some(CloseSource::Read { error, report }));
                 }
             }
         }
@@ -1450,6 +1478,22 @@ impl TcpInetDriver {
             self.close_descriptor();
         }
         released
+    }
+
+    /// Latches a close an earlier [`TcpInetDriver::read_bytes`] reported but no caller has
+    /// consumed yet, answering whether it ran.
+    ///
+    /// A queued receive that read its payload and the peer's end of file in one drain defers the
+    /// close ([`TcpInetDriver::deferred_close`]) so the payload reaches the operation first, and
+    /// runs this the moment nothing complete is left to deliver.
+    fn latch_deferred(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
+        match self.deferred_close.take() {
+            Some(source) => {
+                self.latch_peer_close(ctx, source)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Drains the port's output queue to the socket, returning the number of bytes written.
@@ -2451,6 +2495,17 @@ impl Driver for TcpInetDriver {
     fn has_pending_async(&self) -> bool {
         self.queued_ops().has_pending()
     }
+    /// The **wait-side** twin of [`Driver::has_pending_async`]: an answer a later port round still
+    /// owes a parked caller.
+    ///
+    /// Identical to the drive answer here, and **accept-inclusive by construction**: a queued
+    /// `accept` carries a real caller's `{inet_async, Port, Id, Result}` (`prim_inet:accept0/3`
+    /// parks in a bare `receive` waiting for it — see `opcode.rs`'s `INET_REQ_ACCEPT`), and a
+    /// listener with no queued accept is deregistered by `disarm_accepts`, so there is no standing
+    /// readiness interest without a caller behind it.
+    fn awaits_callers_async_op(&self) -> bool {
+        self.queued_ops().has_pending()
+    }
 
     /// The latched peer close ([`TcpInetDriver::peer_closed`]) — the accessor the runtime reads
     /// once per round to deliver the oracle's `{tcp_closed, Port}`.
@@ -2516,18 +2571,88 @@ impl Driver for TcpInetDriver {
         }
     }
 
+    /// The C's `tcp_inet_flush` (`inet_drv.c:12708`-`:12731`) — the driver entry's `flush` slot
+    /// (`:1368`), which the emulator calls from `flush_port` (`erts/emulator/beam/io.c:3659`-`:3700`,
+    /// the `drv_ptr->flush != NULL` test at `:3664` and the call at `:3687`) while a closing port
+    /// still holds an `ioq`, **before** `tcp_inet_stop` can run:
+    ///
+    /// ```c
+    /// static void tcp_inet_flush(ErlDrvData e)
+    /// {
+    ///     tcp_descriptor* desc = (tcp_descriptor*)e;
+    ///     int discard_output;
+    ///     /* Discard send queue to avoid hanging port (OTP-7615) */
+    ///     discard_output = !(desc->inet.event_mask & FD_WRITE);
+    ///     discard_output |= desc->tcp_add_flags & TCP_ADDF_LINGER_ZERO;
+    ///     ...
+    ///     if (discard_output) {
+    ///         tcp_clear_output(desc);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// So the queue is dropped in exactly two situations, and **kept otherwise** — kept, that is,
+    /// for the port layer to write out during its `Closing` drain
+    /// ([`crate::Port::close`] → [`crate::PortState::Closing`]):
+    ///
+    /// * **write readiness is not armed for this socket.** `event_mask & FD_WRITE` is what the C
+    ///   sets while a write can still make progress: `sock_select(…, FD_WRITE, 1)` after a short
+    ///   write re-armed the buffer (`tcp_send`'s `INET_ECONN_BLOCK` arm) and for a connect in
+    ///   flight. This floor's counterpart is its single registration's `Interest` mask — the
+    ///   `Interest::WRITABLE`/`Interest::BOTH` that
+    ///   [`TcpInetDriver::write_pending`] arms when a remainder is queued
+    ///   (`self.interest.is_writable()`) — **and** the registration itself: the C's
+    ///   `erl_inet_close` (`:5101`-`:5117`) zeroes the mask in both of its arms
+    ///   (`desc_close`'s `desc->event_mask = 0;`, `:5073`, and the prebound arm's
+    ///   `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0);`
+    ///   then `desc->event_mask = 0;`, `:5108`-`:5109`), which is this driver's
+    ///   [`TcpInetDriver::deregister`] taking the token away, so a closed or peer-closed
+    ///   descriptor is "not armed" even though the last `Interest` snapshot still says otherwise.
+    /// * **`{linger, {true, 0}}` is in effect** — [`SocketOptions::linger_zero`], the C's
+    ///   `TCP_ADDF_LINGER_ZERO` (`:864`, set by `inet_set_opts`'s `INET_OPT_LINGER` arm,
+    ///   `:7382`-`:7386`). A zero-linger close aborts with an `RST`, so queued bytes have nowhere
+    ///   to go.
+    ///
+    /// The C's `tcp_clear_output` also calls `send_empty_out_q_msgs` (`:11724`, the
+    /// `INET_REQ_SUBSCRIBE` notification half) — that channel has no counterpart here yet, so the
+    /// discard is the whole effect.
+    ///
+    /// `sendfile`'s `HAVE_SENDFILE` arm (`:12717`-`:12723`) forces the discard; this floor
+    /// refuses `TCP_REQ_SENDFILE`(45) outright, so there is no sendfile state to abort.
+    ///
+    /// # Errors
+    ///
+    /// Never: the C entry returns `void`, and a discard cannot fail. The [`Result`] is the frozen
+    /// seam's shape.
+    fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        // `discard_output = !(desc->inet.event_mask & FD_WRITE) | TCP_ADDF_LINGER_ZERO`.
+        let write_armed = self.token.is_some() && self.interest.is_writable();
+        if !write_armed || self.options.linger_zero {
+            // `tcp_clear_output`: `driver_deq(ix, driver_sizeq(ix))` (`:11718`-`:11724`).
+            ctx.output().clear();
+        }
+        Ok(())
+    }
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // Every queued operation is answered with `{error, closed}` **before** the descriptor goes
         // away — the C's `async_error_am_all(am_closed)` (`inet_drv.c:2597`-`:2608`) — and the
         // release outcome is kept: neither half is dropped on the other's failure.
         //
-        // The teardown runs the same `tcp_desc_close` body as the `close` verb, so the port's
-        // output queue is emptied here too. The C spreads that over two functions —
-        // `tcp_inet_stop` clears the input buffer (`:11904`) and `tcp_inet_flush` discards the
-        // `ioq` (`inet_drv.c:12708`-`:12731`, `tcp_clear_output` at `:12728`) before the port is
-        // freed — so the end state is the same: no queued byte outlives the teardown.
+        // The teardown is the C's `tcp_inet_stop` (`:11895`-`:11924`) — `tcp_close_check`, then
+        // `tcp_clear_input`, then `inet_stop` (`:10847`, `erl_inet_close` + free) — and it
+        // **never touches the port's `ioq`**: the queued output is the flush's business
+        // ([`TcpInetDriver::flush`], which drops it only when write readiness is unarmed or
+        // `{linger, {true, 0}}` is set) and the port layer's `Closing` drain's, which is why the
+        // queue reaching here is normally empty already. On a **forced** close (the driver-failure
+        // path, `io.c:7220`'s `prt->ioq.size = 0`, and this crate's
+        // `PortRegistry`'s `close_now`) the remainder is dropped by the teardown's own `stopq`
+        // (`io.c:3768`) — i.e. with the port — and never written.
+        //
+        // So this is [`TcpInetDriver::release_socket`], not [`TcpInetDriver::desc_close`]: the
+        // close **verb** is the only caller of the C's `tcp_desc_close` body here (see
+        // [`TcpInetDriver::verb_close`]).
         let drained = drain_closed(&mut self.async_ops, ctx);
-        let released = self.desc_close(ctx);
+        let released = self.release_socket(ctx);
         drained?;
         released
     }
@@ -2578,6 +2703,11 @@ mod close_tests;
 mod error_delivery_tests;
 #[cfg(test)]
 mod fdopen_errno_tests;
+// `tcp_inet`'s `flush` override — the C's `tcp_inet_flush` (`inet_drv.c:12708`-`:12731`), whose
+// `discard_output` decides whether a close may keep the queued output or has to drop it.
+#[cfg(test)]
+#[path = "flush_tests.rs"]
+mod flush_tests;
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
@@ -2619,6 +2749,12 @@ mod tests;
 #[cfg(test)]
 #[path = "write_frame_tests.rs"]
 mod write_frame_tests;
+// The **read-path ordering** pin: a complete buffered unit wins over a pending close — the C's
+// `tcp_recv` delivers what the drain collected (`inet_drv.c:13216`-`:13217`/`:13229`-`:13230`)
+// before a later call's `n == 0` may reach `tcp_recv_closed` (`:13206`-`:13208`).
+#[cfg(test)]
+#[path = "write_then_close_tests.rs"]
+mod write_then_close_tests;
 /// The **length-framed** wire format the `erl`-oracle dumps use (a 4-byte big-endian byte count
 /// per reply) — the Rust half of the framing the suites' oracle expressions write, so the two
 /// halves state the format in one place.
