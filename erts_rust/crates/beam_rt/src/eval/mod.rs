@@ -1571,8 +1571,8 @@ impl Evaluator<'_, '_> {
                     // **non-blocking** [`Runtime::pump_scheduler_now`] — the blocking
                     // [`Runtime::pump_scheduler`] sleeps up to `min(nearest deadline, 100 ms)`
                     // in its timer half plus one `PORT_POLL_SLICE` in its port half on every
-                    // empty round, none of it a function of *this* receive's window, which is
-                    // what made every `after T` below ~150 ms fire ~150 ms late.
+                    // empty round, none of it a function of *this* receive's window, so this
+                    // loop never pays a sleep its own deadline did not ask for.
                     if self.ctx.may_pump_scheduler() {
                         let ran = heap!(self.ctx.runtime.pump_scheduler_now(RECEIVE_PUMP_SLICES));
                         if ran > 0 {
@@ -3680,8 +3680,8 @@ mod tests {
     /// Every wait on the route is exact (`std::thread::sleep` to the deadline, or to the
     /// next pending runtime deadline if that is earlier), so what is left is host scheduling
     /// latency — a loaded, shared host can only make it *longer*, never shorter. 40 ms is far
-    /// below the ~150 ms a blocking pump added and far above the latency of a runnable
-    /// thread, so the bound pins the deadline semantics without flaking.
+    /// below the shortest pump call the loop could otherwise block for and far above the
+    /// latency of a runnable thread, so the bound pins the deadline semantics without flaking.
     const AFTER_WINDOW_SLACK: Duration = Duration::from_millis(40);
 
     /// Wall-clock ceiling for the **one-off** compile a spawned `-eval` closure pays on its
@@ -3703,8 +3703,8 @@ mod tests {
     /// schedule.
     ///
     /// The wall clock is the only honest witness here: what this pins is purely temporal (a
-    /// flat ~150 ms floor on the CLI route for every `after 1 … after 100`, ~50 ms of
-    /// overshoot on `after 300`) and changes no term and no exit code. The expected numbers
+    /// window inside one poll slice costs no pump call, a longer one ends at its own deadline)
+    /// and changes no term and no exit code. The expected numbers
     /// are the oracle's (`erl`, OTP 29.1.1: `after 200` → 201, `after 25` → 26). One
     /// [slack](AFTER_WINDOW_SLACK) is allowed on top of the window and nothing below it: a
     /// sleep never returns early.
@@ -3722,9 +3722,8 @@ mod tests {
              blocking pump adds its own sleep on top of the window)"
         );
 
-        // A window *inside* one poll slice: a blocking pump spends its sleep inside the
-        // window and then re-checks the deadline a whole pump call late, which is why every
-        // short `after` used to cost the same fixed ~100 ms in-process / ~150 ms on the CLI.
+        // A window *inside* one poll slice: the loop re-checks its deadline between its own
+        // bounded waits, so a short window costs its own duration and nothing more.
         let elapsed = timed_wait("receive _ -> ok after 25 -> ok end, 1");
         assert!(
             elapsed >= Duration::from_millis(25),

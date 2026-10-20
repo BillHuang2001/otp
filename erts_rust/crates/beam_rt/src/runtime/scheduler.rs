@@ -257,9 +257,9 @@ impl Runtime {
     /// pending (a booted kernel always keeps housekeeping deadlines, so an empty run queue
     /// pays the full 100 ms for a deadline that has nothing to do with this `receive`), and
     /// its port half blocks one `PORT_POLL_SLICE` on every zero-slice round. A caller whose
-    /// loop re-checks its mailbox and its deadline only *between* whole pump calls therefore
-    /// overshoots an `after T` window by up to one pump call — the `-eval` route's flat
-    /// ~150 ms floor on every `after 1 … after 100`.
+    /// loop re-checks its mailbox and its deadline only *between* whole pump calls would
+    /// overshoot an `after T` window by up to one pump call, so such a caller uses this entry
+    /// and owns its own bounded waits.
     ///
     /// Hence this entry: the zero window can never sleep (a due deadline still fires — the
     /// pass fires timers before it consults [`Runtime::timer_wait`] — and a deadline exactly
