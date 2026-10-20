@@ -26,10 +26,13 @@
 //!
 //! 1. **Sustained allocation grows the mature generation; the nursery follows the live set.** A
 //!    live set that keeps climbing forces the *mature* generation past its initial size, while
-//!    the nursery's capacity climbs with it in **live-set target** steps
-//!    ([`HeapPolicy::young_target_words`]) — never one growth-table step per collection, which is
-//!    the runaway `HeapPolicy::young_after_collection` exists to prevent. Every live term stays
-//!    structurally intact after every collection (`beam_term::compare::eq`).
+//!    the nursery's capacity follows it in **live-set target** steps — a fullsweep installs the
+//!    **whole** live set's target ([`HeapPolicy::young_target_words`]) and a minor installs the
+//!    **young** live set's target from the words it promoted
+//!    ([`HeapPolicy::young_minor_target_words`]), never one growth-table step per collection,
+//!    which is the runaway `HeapPolicy::young_after_collection` /
+//!    `HeapPolicy::young_after_fullsweep` exist to prevent. Every live term stays structurally
+//!    intact after every collection (`beam_term::compare::eq`).
 //! 2. **A collection never leaves a half-forwarded from-space.** A policy whose
 //!    `max_heap_words` cannot fit the live set makes `collect` / `collect_major` /
 //!    `collect_minor` return a **typed** heap-exhaustion error *before* a single word is
@@ -48,6 +51,7 @@
 use beam_common::BeamError;
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, Collector, GcConfig, HeapObservable, HeapPolicy, MatureKind,
+    YOUNG_SHRINK_FACTOR,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{make_small, AtomTable, Eterm};
@@ -89,9 +93,11 @@ fn assert_pairs_intact(roots: &[Eterm], expected: &[(i64, i64)]) {
 #[test]
 fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_the_live_set() {
     // Start tiny; the *live set* climbs every round, so the mature generation must grow past
-    // its initial size to keep it alive. The nursery follows that live set at every fullsweep
-    // (`HeapPolicy::young_target_words`), so it climbs with it in *target* steps — never one
-    // growth-table step per collection, which is the creep the rule exists to prevent.
+    // its initial size to keep it alive. The nursery follows that live set at every collection —
+    // a fullsweep through the whole live set's target (`HeapPolicy::young_target_words`), a minor
+    // through the young live set it evacuated (`HeapPolicy::young_minor_target_words`) — so it
+    // moves in *live-set target* steps, never one growth-table step per collection, which is the
+    // creep the rule exists to prevent.
     let initial_young = 51;
     let initial_mature = 51;
     let policy = HeapPolicy {
@@ -108,12 +114,14 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
     let mut expected: Vec<(i64, i64)> = Vec::new();
     let mut young_caps: Vec<usize> = Vec::new();
     let mut targets: Vec<usize> = Vec::new();
+    let mut kinds: Vec<CollectionKind> = Vec::new();
+    let mut lives: Vec<usize> = Vec::new();
 
     // A **constant** per-round batch, so the allocation itself always fits the (birth-sized)
     // nursery; it is the *accumulated* live set that grows, round after round.
     const BATCH: i64 = 8;
     /// The final rounds whose capacity must be one single value (the live-set plateau).
-    const TAIL: usize = 5;
+    const TAIL: usize = 4;
     for round in 0..30i64 {
         for j in 0..BATCH {
             let a = round * 1000 + j;
@@ -134,24 +142,59 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
         // After *every* collection the whole live set is structurally intact.
         assert_pairs_intact(&roots, &expected);
 
-        // Every root is a 3-word `{a, 2a}` tuple, so the round's whole-heap live set is exact and
-        // the nursery's target is derivable: `next_words(2 * live + need_reserve_words)`.
+        // Every root is a 3-word `{a, 2a}` tuple, so the round's live set is exact — and so is
+        // the capacity the collector may install, derived from the rule of the kind that ran:
+        // a **minor** sizes the nursery from the young live set it evacuated (its copy volume,
+        // `stats.words_copied`) through `young_minor_target_words`, a **fullsweep** from the
+        // whole live set it measured through `young_target_words`.
         let live = 3 * roots.len();
-        let target = policy.young_target_words(live);
+        let promoted = collection.stats.words_copied;
+        let target = match collection.kind {
+            CollectionKind::Minor => policy.young_minor_target_words(promoted),
+            CollectionKind::Major => {
+                assert_eq!(
+                    promoted, live,
+                    "round {round}: a fullsweep copies exactly the whole live set"
+                );
+                policy.young_target_words(promoted)
+            }
+        };
         let cap = collector.young().capacity_words();
         let previous = young_caps.last().copied().unwrap_or(initial_young);
         assert!(
             cap == previous || cap == target,
-            "round {round}: the nursery capacity {cap} is neither the previous capacity {previous} \
-             nor young_target_words({live}) = {target}"
+            "round {round}: the {:?} nursery capacity {cap} is neither the previous capacity \
+             {previous} nor the live set's target {target} (whole live set {live}, promoted \
+             {promoted})",
+            collection.kind
         );
+        // The floor is a real lower bound on every capacity the rule installs ...
         assert!(
-            cap >= previous,
-            "round {round}: a climbing live set must never shrink the nursery ({previous} -> \
-             {cap})"
+            cap >= policy.nursery_floor_words(),
+            "round {round}: {cap} words is below the policy's {} -word nursery floor",
+            policy.nursery_floor_words()
+        );
+        // ... and a kept capacity is inside the hysteresis band around its target.
+        assert!(
+            cap <= YOUNG_SHRINK_FACTOR * target,
+            "round {round}: {cap} words is past the {}x band around its {target}-word target",
+            YOUNG_SHRINK_FACTOR
+        );
+        // The rule is a fixed point at the live set it measured, so a live set that stopped
+        // moving could never climb a growth-table step per collection.
+        let reapplied = match collection.kind {
+            CollectionKind::Minor => policy.young_after_collection(cap, promoted),
+            CollectionKind::Major => policy.young_after_fullsweep(cap, promoted),
+        };
+        assert_eq!(
+            reapplied, cap,
+            "round {round}: re-applying the rule at {cap} words / {promoted} live words answered \
+             {reapplied}, so {cap} is not a fixed point"
         );
         young_caps.push(cap);
         targets.push(target);
+        kinds.push(collection.kind);
+        lives.push(live);
     }
 
     // The mature generation really did grow: the live set (240 tuples = 720 words) far
@@ -166,11 +209,40 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
         "the live set now occupies the grown mature generation"
     );
 
-    // The nursery **follows the live set**: it climbed off its birth size in target steps and
-    // then settled on one constant — the tail is a single capacity, and that capacity is the
-    // live set's target. It never stepped up once per collection with the climbing live set (a
-    // 20 %-per-collection creep would be 51 * 1.2^30 ≈ 12 000 words by now).
+    // Every fullsweep in the run installed exactly the **whole** live set's target: that is the
+    // collection that measures the live set exactly, so it is where the nursery learns the
+    // workload's scale.
+    for (round, kind) in kinds.iter().enumerate() {
+        if *kind == CollectionKind::Major {
+            assert_eq!(
+                young_caps[round],
+                policy.young_target_words(lives[round]),
+                "round {round}: a fullsweep over {}-word live set settles on its target",
+                lives[round]
+            );
+        }
+    }
+    assert!(
+        *young_caps.iter().max().expect("non-empty")
+            <= lives
+                .iter()
+                .map(|live| policy.young_target_words(*live))
+                .max()
+                .expect("non-empty"),
+        "the nursery never exceeds the largest live set's target, got {young_caps:?} vs \
+         {lives:?}"
+    );
+
+    // The last `TAIL` rounds are minors over the same constant batch, so they promote the same
+    // young live set every time and settle on its one target: the nursery **plateaus** there
+    // rather than stepping up once per collection (a 20 %-per-collection creep off 51 words would
+    // be 51 * 1.2^30 ≈ 12 000 words by now).
     let tail = &young_caps[young_caps.len() - TAIL..];
+    let tail_kinds = &kinds[kinds.len() - TAIL..];
+    assert!(
+        tail_kinds.iter().all(|k| *k == CollectionKind::Minor),
+        "the trailing run must be minors over the constant batch, got {tail_kinds:?}"
+    );
     assert!(
         tail.iter().all(|cap| *cap == tail[0]),
         "the nursery capacity must plateau over the last {TAIL} rounds, got {young_caps:?}"
@@ -178,12 +250,8 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
     assert_eq!(
         tail[0],
         *targets.last().expect("non-empty"),
-        "the plateau is the live set's target (live {} words)",
-        3 * roots.len()
-    );
-    assert!(
-        *young_caps.iter().max().expect("non-empty") <= *targets.iter().max().expect("non-empty"),
-        "the nursery never exceeds the live set's target, got {young_caps:?} vs {targets:?}"
+        "the plateau is the young live set's target ({} words promoted per round)",
+        BATCH * 3
     );
     // Every step the capacity took landed on a target, and it took more than one: the growth is
     // real, and each step is a live-set step rather than an arbitrary growth-table step.
@@ -199,7 +267,7 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
     for step in &steps {
         assert!(
             targets.contains(step),
-            "every capacity the nursery stepped up to must be a live-set target: {step} not in \
+            "every capacity the nursery stepped to must be a live-set target: {step} not in \
              {targets:?}"
         );
     }

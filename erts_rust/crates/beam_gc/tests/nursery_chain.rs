@@ -471,12 +471,16 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     // The capacities plateau: the last 50 triples are **one single state**.
     //
     // After the growth path has run, each round's collection collapses the chain and sizes the
-    // nursery from the **live set** the round kept (`HeapPolicy::young_target_words`: one
-    // `STEADY_NEED`-word tuple, so `next_words(2 * 700 + 64) = 1598`). That is a fixed point of
-    // the rule — the same live set yields the same capacity — so the collapsed space already
-    // covers the request, the next round's `grow_nursery` is a no-op and no space is retired.
-    // The loop therefore sits on **one** fixed state instead of alternating between a grown and
-    // a collapsed nursery, and the capacity is the live set's target, not the request's size.
+    // nursery from the **live set** the round measured. The converged rounds install the
+    // **whole-heap** target a fullsweep applies (`HeapPolicy::young_target_words`: one
+    // `STEADY_NEED`-word tuple, so `next_words(2 * 700 + 64) = 1598`); a minor would instead
+    // install `HeapPolicy::young_minor_target_words` of the words it promoted
+    // (`next_words(700 + 64) = 987`), so the 1598 the loop settles on is the fullsweep's target.
+    // Either target is a fixed point of the rule — the same live set yields the same capacity —
+    // so the collapsed space already covers the request, the next round's `grow_nursery` is a
+    // no-op and no space is retired. The loop therefore sits on **one** fixed state instead of
+    // alternating between a grown and a collapsed nursery, and the capacity is the live set's
+    // target, not the request's size.
     //
     // What matters is that the state is **bounded** — a fixed point over a fixed, finite set of
     // states, each capacity pinned — not which one it is. A creep would show as a second (or

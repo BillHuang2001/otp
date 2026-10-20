@@ -22,11 +22,14 @@
 //!
 //! A process's **nursery** (the young semi-space) is a *bounded* buffer: it is the space the
 //! mutator churns through between collections, **not** a place for the live set (that is the
-//! mature generation's job). Its size is therefore one **live-set target**,
-//! `HeapPolicy::young_target_words(live)` = `next_words(2 * live + reserve)`, installed where
-//! the live set is measured *exactly* — at a fullsweep
-//! (`HeapPolicy::young_after_fullsweep`) or an explicit request (`ensure_capacity`). A **minor**
-//! only keeps or shrinks the nursery (`HeapPolicy::young_after_collection`), never grows it.
+//! mature generation's job). Its size is therefore one **live-set target**, installed by the
+//! collection that measured the live set it sizes from: a **fullsweep** installs the *whole*
+//! live set's target ([`HeapPolicy::young_target_words`] = `next_words(2 * live + reserve)`,
+//! it measures the live set exactly), and a **minor** installs the *young* live set's target
+//! from the words it evacuated — its copy volume, `GcStats::words_copied`
+//! ([`HeapPolicy::young_after_collection`] over [`HeapPolicy::young_minor_target_words`] =
+//! `next_words(live + reserve)`). A minor may therefore **grow** the nursery, but only onto a
+//! capacity derived from the live set, never from the capacity it had or the fill it reached.
 //!
 //! The failure this file guards against is a nursery that grows one step per collection: a
 //! nursery is only collected when it is **full**, so a "grow when full" rule grows it ~20 %
@@ -35,14 +38,18 @@
 //! `foreign` benchmark's RSS growing with `N`). Sizing the nursery from its *pre-collection*
 //! fill is the same bug by another route: that count is ≈ the capacity, so the rule grows on
 //! every collection. Deriving it from the live set instead is idempotent — the same live set
-//! yields the same capacity — so the nursery converges with the live set and stops.
+//! yields the same capacity — so the nursery converges with the live set and stops; the
+//! assertions below therefore hold every capacity to *a live-set target or the capacity it
+//! already had*, never to a third value.
 //!
 //! Every case below is driven through **both** mature strategies
 //! ([`AnyCollector::Copying`] and [`AnyCollector::Immix`]) unless the case is about the
 //! nursery alone. Every corpus is deterministic (no randomness) and every assertion is on a
 //! deterministic count — **no timing is ever asserted**.
 
-use beam_gc::prelude::{AnyCollector, GcConfig, HeapPolicy, MatureKind};
+use beam_gc::prelude::{
+    AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind, YOUNG_SHRINK_FACTOR,
+};
 use beam_term::prelude::{make_small, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -189,11 +196,12 @@ fn the_nursery_and_total_heap_plateau_under_a_growing_working_load() {
 // ---------------------------------------------------------------------------
 
 /// Each round fills the whole nursery with **live** data and keeps it, so the live set climbs
-/// past the nursery and the nursery is re-sized — but only ever to the live set's one target
-/// ([`HeapPolicy::young_target_words`]), which a fullsweep measures exactly. Under a "grow when
-/// full" rule this is exactly the corpus that ramps the nursery up without bound: it would step
-/// the growth table once per round; here every step lands on that round's target, so the
-/// capacity is a function of the live set and converges with it.
+/// past the nursery and the nursery is re-sized — but only ever onto a live-set target: the
+/// **young** live set's target (`HeapPolicy::young_minor_target_words`) after a minor, the
+/// **whole** live set's target ([`HeapPolicy::young_target_words`]) after a fullsweep. Under a
+/// "grow when full" rule this is exactly the corpus that ramps the nursery up without bound: it
+/// would step the growth table once per round; here every step lands on that round's target, so
+/// the capacity is a function of the live set and converges with it.
 #[test]
 fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
     /// Tuples per round: 77 * 3 = 231 words, i.e. 231 of the 233-word birth nursery — full.
@@ -228,19 +236,50 @@ fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
                 );
             }
 
-            c.collect(&mut roots).expect("collect");
+            let collection = c.collect(&mut roots).expect("collect");
             assert_eq!(c.young().used_words(), 0, "{kind:?}");
 
             // Every root is a 3-word `{a, 2a}` tuple, so the round's live set is exact and the
-            // capacity the collector may install is derivable: one live-set target.
+            // capacity the collector may install is derivable: one live-set target, of the
+            // quantity the kind that ran measured.
             let live = roots.len() * 3;
-            let target = policy.young_target_words(live);
+            let promoted = collection.stats.words_copied;
+            let target = match collection.kind {
+                CollectionKind::Minor => policy.young_minor_target_words(promoted),
+                CollectionKind::Major => policy.young_target_words(promoted),
+            };
             let cap = c.young().capacity_words();
             let previous = young_caps.last().copied().unwrap_or(NURSERY);
             assert!(
                 cap == previous || cap == target,
-                "{kind:?} round {round}: the nursery capacity {cap} is neither the previous \
-                 capacity {previous} nor young_target_words({live}) = {target}"
+                "{kind:?} round {round}: the {:?} nursery capacity {cap} is neither the previous \
+                 capacity {previous} nor the live set's target {target} (whole live set {live}, \
+                 promoted {promoted})",
+                collection.kind
+            );
+            // The floor is a real lower bound on every installed capacity, and the band bounds
+            // how far a kept one may sit above its target.
+            assert!(
+                cap >= policy.nursery_floor_words(),
+                "{kind:?} round {round}: {cap} words is below the policy's {} -word floor",
+                policy.nursery_floor_words()
+            );
+            assert!(
+                cap <= YOUNG_SHRINK_FACTOR * target,
+                "{kind:?} round {round}: {cap} words is past the {}x band around its \
+                 {target}-word target",
+                YOUNG_SHRINK_FACTOR
+            );
+            // The rule is a fixed point at the live set it measured: a collection can never be
+            // the start of a per-collection ratchet.
+            let reapplied = match collection.kind {
+                CollectionKind::Minor => policy.young_after_collection(cap, promoted),
+                CollectionKind::Major => policy.young_after_fullsweep(cap, promoted),
+            };
+            assert_eq!(
+                reapplied, cap,
+                "{kind:?} round {round}: re-applying the rule at {cap} words / {promoted} live \
+                 words answered {reapplied}, so {cap} is not a fixed point"
             );
             young_caps.push(cap);
             targets.push(target);
@@ -253,31 +292,42 @@ fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
             "{kind:?}: the live set ({live_words} words) must far exceed the nursery"
         );
 
-        // ... the nursery followed it to exactly its final target, and never ran ahead of one.
+        // ... the nursery followed it to the final round's target — the capacity the rule
+        // answers for the live set that round measured ...
         assert_eq!(
             *young_caps.last().expect("non-empty"),
             *targets.last().expect("non-empty"),
             "{kind:?}: the nursery settles on the live set's target, got {young_caps:?}"
         );
-        assert!(
-            young_caps
-                .iter()
-                .zip(&targets)
-                .all(|(cap, target)| cap <= target),
-            "{kind:?}: the nursery must never exceed the live set's target, got {young_caps:?} \
-             vs {targets:?}"
-        );
-
+        // ... and it never ran ahead of the whole live set's scale: every capacity the nursery
+        // ever took is a live-set target of some round (or the birth size).
+        let mut distinct = young_caps.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        for cap in &distinct {
+            assert!(
+                *cap == NURSERY || targets.contains(cap),
+                "{kind:?}: the nursery took {cap} words, which is neither the birth size \
+                 ({NURSERY}) nor any round's live-set target — it came from something other than \
+                 the live set ({young_caps:?}, targets {targets:?})"
+            );
+        }
         // The capacity climbed, but only in live-set steps: a "grow when full" rule would step it
-        // ~20 % on *every* one of the 30 rounds (30 distinct capacities), and the target itself
-        // changes on most rounds (so the target is not what bounds the count — the rule is).
-        let distinct = {
-            let mut seen = young_caps.clone();
-            seen.dedup();
-            seen
-        };
+        // ~20 % on *every* one of the 30 rounds (30 distinct capacities). The bound is the number
+        // of *targets* the live set itself produced, plus the birth size — a property of the
+        // workload, never of the round count.
+        let mut distinct_targets = targets.clone();
+        distinct_targets.sort_unstable();
+        distinct_targets.dedup();
         assert!(
-            distinct.len() <= 6,
+            distinct.len() <= distinct_targets.len() + 1,
+            "{kind:?}: the nursery took {} distinct capacities ({distinct:?}) but the live set \
+             only ever had {} distinct targets ({distinct_targets:?}) — a per-collection creep",
+            distinct.len(),
+            distinct_targets.len()
+        );
+        assert!(
+            distinct.len() * 2 < ROUNDS as usize,
             "{kind:?}: the nursery must grow in live-set steps, not once per round, got \
              {young_caps:?}"
         );

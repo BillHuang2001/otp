@@ -93,21 +93,27 @@ const BURST: usize = 200;
 /// The word count `ensure_capacity` is asked for on the growth rounds.
 const GROW_REQUEST: usize = 48;
 /// The policy's collection reserve, in words — the C's `S_RESERVED` role in
-/// `need_after = … + reserve` (`erl_gc.c:2072`), which is *also* the constant the nursery's own
-/// target is derived from (`HeapPolicy::young_target_words` = `next_words(2 × live + reserve)`).
+/// `need_after = … + reserve` (`erl_gc.c:2072`), which is *also* the constant both of the
+/// nursery's live-set targets are derived from: the **whole-heap** one a fullsweep installs
+/// (`HeapPolicy::young_target_words` = `next_words(2 × live + reserve)`) and the **young** one a
+/// minor installs from the words it promoted (`HeapPolicy::young_minor_target_words` =
+/// `next_words(live + reserve)`).
 ///
 /// It is the one knob that makes both spaces **fixed points**, and the arithmetic is worth
 /// spelling out because both halves matter:
 ///
 /// * **The nursery.** The workload's live set is the [`LIVE_TUPLES`] working set — 16 one-line
-///   tuples = 256 words — so its target is `next_words(2 × 256 + 2048) = next_words(2560) =
-///   2586` = [`NURSERY_WORDS`]. The nursery is born at that size and every sizing rule
-///   re-derives it: a fullsweep installs `young_target_words(live)` and `should_grow(2586,
-///   2586)` asks for it (it fires, but for the same number), a minor keeps it (its target from
-///   the mature occupancy is far larger than `2586 / 8`), and the explicit growth seam is a
-///   no-op because a collapsed nursery always has room for [`GROW_REQUEST`]. And because
-///   `2 × live + 2048 <= 2586` holds for **every** live set up to 269 words, that stays true
-///   even at the transient live sets the working-set replacement produces.
+///   tuples = 256 words — so its whole-heap target is `next_words(2 × 256 + 2048) =
+///   next_words(2560) = 2586` = [`NURSERY_WORDS`], and its young-live-set target is
+///   `next_words(256 + 2048) = next_words(2304) = 2586` as well. The nursery is born at that size
+///   and every sizing rule re-derives it: a fullsweep installs `young_target_words(live)` and
+///   `should_grow(2586, 2586)` asks for it (it fires, but for the same number), a minor installs
+///   `young_minor_target_words(promoted)` — the same number, so it keeps the capacity — and the
+///   explicit growth seam is a no-op because a collapsed nursery always has room for
+///   [`GROW_REQUEST`]. And because `2 × live + 2048 <= 2586` holds for every live set up to 269
+///   words (and `live + 2048 <= 2586` for every one up to 538), that stays true even at the
+///   transient live sets the working-set replacement produces; `min_heap_words` floors both
+///   targets at [`NURSERY_WORDS`] regardless.
 /// * **The mature generation.** A fullsweep's `need_after` is `live + young occupancy +
 ///   reserve`, i.e. at most `256 + 2586 + 2048 = 4890` words and at least `0 + 0 + 2048 = 2048`.
 ///   Both are inside the *keep* band [`HeapPolicy::mature_after_fullsweep`] needs —

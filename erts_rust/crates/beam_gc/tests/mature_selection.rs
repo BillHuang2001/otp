@@ -59,7 +59,7 @@ fn policy(mature_words: usize) -> HeapPolicy {
 /// minors and majors so both collectors are exercised on both collection kinds.
 ///
 /// The nursery is **pinned** (`min_heap_words`) because the bounded
-/// [`HeapPolicy::young_after_collection`] shrinks a nursery a fullsweep leaves empty: the
+/// [`HeapPolicy::young_after_fullsweep`] shrinks a nursery a fullsweep leaves empty: the
 /// corpus needs one large, *stable* nursery across every round.
 fn crossing_policy() -> HeapPolicy {
     let objects = IMMIX_BREAK_EVEN_BLOCKS * LINES_PER_BLOCK;

@@ -146,8 +146,13 @@ const ROUNDS: usize = WARMUP + MEASURED;
 /// fixed point, and that floor is above the corpus-sized seed, so a process starts with a
 /// [`MATURE_WORDS`]-sized nursery: the C cannot express a young heap below its own
 /// `min_heap_size` either (`next_heap_size` floors every size by it, `erl_gc.c:347-352`).
-/// Because the floor is the capacity, the bounded [`HeapPolicy::young_after_collection`] rule
-/// can never shrink it — hence it is an assertable steady state.
+/// Because `min_heap_words` **is** the capacity, `next_words` floors both live-set targets at
+/// it — a minor's `young_minor_target_words(promoted)` and a fullsweep's
+/// `young_target_words(live)`, whichever the round runs — so the nursery sits exactly on its
+/// own target: `HeapPolicy::young_after_collection` keeps it (neither the below-target growth
+/// branch nor the `YOUNG_SHRINK_FACTOR` shrink branch fires), and it is an assertable steady
+/// state. Without that floor a minor would size the nursery from the young live set it
+/// promoted, which for this corpus is a fraction of the capacity.
 const NURSERY_WORDS: usize = MATURE_WORDS;
 /// The mature generation's capacity in words — 128 whole Immix blocks (2048 lines), enough
 /// for the long-lived set plus the dead batches a fullsweep cycle accumulates. Also pinned as
@@ -167,8 +172,9 @@ const REPS: usize = 5;
 /// `min_heap_words` is pinned to the mature capacity so the mature generation is a fixed
 /// point of [`HeapPolicy::mature_after_fullsweep`] (neither `should_grow` nor `should_shrink`
 /// fires: the capacity never exceeds `4 * need_after`, and a shrink can never go below the
-/// same floor) and the nursery is never resized — the run therefore reaches a steady state
-/// after the first fullsweep and the capacities are an assertable constant.
+/// same floor) and it floors the nursery's live-set targets at the nursery's own initial size,
+/// so the nursery is never resized either — the run therefore reaches a steady state after the
+/// first fullsweep and the capacities are an assertable constant.
 fn policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: FULLSWEEP_AFTER,

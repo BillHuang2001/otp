@@ -62,7 +62,9 @@ const REGION_WORDS: usize = 2048;
 
 /// The nursery the cycles allocate in, and its floor: big enough for one round's fresh
 /// objects however far a collection shrinks it (a fullsweep's collapse sizes the nursery
-/// through `young_after_collection`, whose only floor is `min_heap_words`).
+/// through [`HeapPolicy::young_after_fullsweep`], a minor's through
+/// [`HeapPolicy::young_after_collection`] over the words it promoted; neither can land below
+/// [`HeapPolicy::nursery_floor_words`], and `min_heap_words` floors every target).
 const NURSERY_WORDS: usize = 1024;
 
 /// A 100-word tuple: a header plus 99 elements, i.e. exactly **7** Immix lines.
