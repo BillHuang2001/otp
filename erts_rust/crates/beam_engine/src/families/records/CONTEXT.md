@@ -133,6 +133,10 @@ expectation above is pinned from the C ground truth (`erts/emulator/beam/erl_rec
 
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
 
+## Handoff: a foreign `PutRecord` create id (from `INSTRUCTION_SURFACE.md`)
+Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
+4. **A *foreign* `PutRecord` create id -- closed by a defaulted engine seam, residual only at the host.** `PutRecord`'s create form for the running module's own records is built in-crate, and an `Id` naming **another** module's record is served by `ExecutionContext::foreign_record_definition(owner, name)` (default `Ok(None)`): `Ok(Some(def))` is the host's record table answering `erl_record.c::erts_record_find_entry`, the engine builds the instance only when the definition is exported (a non-exported one is the C's `error:{badrecord, Id}` raise, `erl_record.c:401-409`), and the `{Module, Name}` form enforces that even when `Module` is the running module. The residual is a host that answers `Ok(None)` -- no record table, or a defining module it cannot load -- which keeps the typed `error::unsupported("put_record: create: no record definition table for another module")`; the engine has no `code:ensure_loaded/1` trap (`erl_create_native_record_jit`, `erl_record.c:412-507` + `erl_finish_create_record_jit`), so the load-then-retry half is the host's, and a created instance stores no definition pointer (the M1 substitution). Pinned in `src/families/records/tests/` and `tests/gaps.rs`.
+
 ## See Also
 - `../CONTEXT.md` → the family seam, variant ownership, the `NO_FAIL` route and the handoff list.
 - `../../../terms/` → `reserve`/`Slack` and the rooted builders the bodies call.

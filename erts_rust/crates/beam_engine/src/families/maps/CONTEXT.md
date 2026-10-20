@@ -162,6 +162,10 @@ Verified against the system `erlc` (OTP 29) disassembly:
 - The same by-name/typed-gap pattern is used by the exceptions family
   (`../exceptions/raise.rs:52-86`), so a change to this contract is a two-site change.
 
+## Map `is_eq_exact`: the O(k log k) / two-`Vec` cost (from `../../CONTEXT.md`)
+Moved verbatim from the crate `CONTEXT.md` (which keeps the contract and a pointer).
+- **A map `is_eq_exact` costs O(k log k) and two heap `Vec`s per comparison.** `eval_test`'s `IsEqExact` is a plain `cmp(a, b, ctx.atoms(module))` (`src/interpreter/test.rs:69-72`) with no map fast path, and `beam_term::compare::cmp_maps` collects and re-sorts both maps' pairs (`beam_term/src/compare.rs:323-338` -> `map.rs:482-489` -> `collect_pairs`, which allocates a `Vec<(Eterm,Eterm)>` per map).
+
 ## See Also
 - `../CONTEXT.md` → the family seam, the router sentinel, the full gap list.
 - `../../../../beam_bifs/src/error.rs:130-156` → the BIF-side counterpart
