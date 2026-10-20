@@ -21,9 +21,10 @@
 //! The conventional glob-import surface for downstream crates.
 //!
 //! `use beam_codec::prelude::*;` brings the codec seam (the reader/writer, the
-//! atom cache, the encoder/decoder and the tag constants) into scope. The
-//! term-layer helpers in [`crate::term`] are deliberately **not** re-exported:
-//! they are an internal stop-gap, not part of the cross-crate contract.
+//! atom cache, the encoder/decoder, the tag constants and the reference wire
+//! mapping) into scope. The term-layer helpers in [`crate::term`] are deliberately
+//! **not** re-exported: they are an internal stop-gap, not part of the cross-crate
+//! contract.
 
 pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
 pub use crate::compress::{compress, decompress};
@@ -44,6 +45,10 @@ pub use crate::error::{
 };
 pub use crate::off_heap::OffHeapBinaries;
 pub use crate::reader::Reader;
+pub use crate::ref_wire::{
+    ref_id_to_numbers, ref_numbers_to_id, representable_ref_id, representable_ref_numbers,
+    REF1_NUM_MASK, REF_MASK, REF_NUMBERS,
+};
 pub use crate::tag::*;
 pub use crate::term::{
     fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,

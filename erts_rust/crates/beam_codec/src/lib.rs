@@ -43,6 +43,13 @@
 //! carrying `#[allow(unsafe_code)]` under the crate-wide `#![deny(unsafe_code)]`.
 //!
 //! Downstream code can `use beam_codec::prelude::*;`.
+//!
+//! The internal-reference id ↔ wire-number mapping lives in [`ref_wire`] and is
+//! **public**: a crate that writes or reads a reference image calls it
+//! ([`ref_id_to_numbers`] / [`ref_numbers_to_id`], the C's `erts_set_ref_numbers`
+//! layout) instead of mirroring the bit layout, so a reference always comes back as
+//! the same id on the other side (crate-layer `CONTEXT.md`,
+//! Prevent-Duplication).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -54,7 +61,7 @@ pub mod encode;
 pub mod error;
 pub mod off_heap;
 pub mod reader;
-pub(crate) mod ref_wire;
+pub mod ref_wire;
 pub mod tag;
 #[allow(unsafe_code)]
 pub mod term;
@@ -80,6 +87,10 @@ pub use crate::error::{
     UNSUPPORTED_REASON,
 };
 pub use crate::reader::Reader;
+pub use crate::ref_wire::{
+    ref_id_to_numbers, ref_numbers_to_id, representable_ref_id, representable_ref_numbers,
+    REF1_NUM_MASK, REF_MASK, REF_NUMBERS,
+};
 pub use crate::tag::*;
 pub use crate::term::{
     fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,
