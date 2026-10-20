@@ -615,10 +615,15 @@ impl Runtime {
     ///
     /// Called by the sender
     /// ([`RuntimeContext::send_fragmented_message`](crate::context::RuntimeContext)) after
-    /// it has enqueued the payload and woken the receiver: this is the fragment path's
-    /// substitute for `ProcessTable`'s wake list, which it bypasses. The pid is enqueued by
-    /// the next [`Runtime::scheduler_pass`]; recording one for a pid that re-blocks or dies
-    /// first is harmless (the sweep skips it).
+    /// it has enqueued the payload and woken the receiver, and by the inbound distribution
+    /// drain **only for a fragment delivery whose
+    /// [`Process::wake`](beam_process::Process::wake) answered `true`**: this is the
+    /// fragment path's substitute for `ProcessTable`'s wake list, which it bypasses, and
+    /// that list is a *should be scheduled* list — a receiver that was already `Runnable`
+    /// was not woken by the delivery, whatever else it is. Recording one for a pid that
+    /// re-blocks or dies first is harmless (the sweep skips it), and so is recording one
+    /// for a pid the running pass holds no engine for (the sweep refuses it and records a
+    /// typed [diagnostic](crate::runner::UnrunnableProcess) instead of failing the pass).
     pub(crate) fn note_fragment_wake(&mut self, pid: ProcessId) {
         self.fragment_wakes.push(pid);
     }
@@ -630,9 +635,22 @@ impl Runtime {
     /// (`Scheduler::resume_woken`), with the same rule: a pid is enqueued only when it is
     /// still a **live `Runnable`** process that is **not already queued** — it may have
     /// terminated or re-blocked since the wake — and it resumes at its own priority.
+    ///
+    /// Unlike a wake the table recorded itself, this sweep can be handed the pid of a
+    /// process that has **no engine entry point**: the note is written by a delivery outside
+    /// the runner, and the runtime's own long-lived services (`init`, the `erl_prim_loader`
+    /// stand-in, the `file_server_2` service, the registered `net_kernel` service) and the
+    /// `-eval`/`-s`/`-run` action child are spawned, inserted and **never enqueued** — while
+    /// being *born* `Runnable`, so "`Runnable` and not in a run queue" does not exclude
+    /// them. Such a pid is **not** enqueued: the pass's `state` holds no engine for it
+    /// ([`RunnerState::contains`]), so enqueuing it would hand the runner a pid it cannot
+    /// run. It is recorded as the same typed diagnostic the runner writes
+    /// ([`crate::runner::UnrunnableProcess`]) and skipped — never a failed pass, and never a
+    /// silent skip.
     fn absorb_fragment_wakes(
         &mut self,
         table: &mut ProcessTable,
+        state: &mut RunnerState,
         scheduler: &mut Scheduler,
     ) -> usize {
         let wakes = std::mem::take(&mut self.fragment_wakes);
@@ -642,6 +660,18 @@ impl Runtime {
                 continue;
             };
             if process.state() != ProcessState::Runnable || process.flags().in_run_queue() {
+                continue;
+            }
+            if !state.contains(pid) {
+                // A pid this pass cannot run: record why, and leave it exactly as it was
+                // (`Runnable`, out of the run queue) — the truthful state of a
+                // spawned-never-enqueued process. A pid is diagnosed once, so an
+                // already-recorded one skips the name lookup below.
+                if state.unrunnable(pid).is_none() {
+                    let name = crate::runner::registered_name(table, self.code_server.atoms(), pid);
+                    let diagnostic = crate::runner::UnrunnableProcess::of(pid, process, name);
+                    state.record_unrunnable(diagnostic);
+                }
                 continue;
             }
             let priority = process.priority();
@@ -762,12 +792,16 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// * a typed diagnostic when an enqueued pid has no registered engine;
     /// * the process table's errors while terminating a process or delivering a message
     ///   between processes (including a timer's message that does not fit the receiver's
     ///   heap);
     /// * the port poller's/driver's failures; a nested borrow of the port table is a typed
     ///   capability gap rather than a panic.
+    ///
+    /// An enqueued pid with **no registered engine is not an error**: the runner records a
+    /// typed [`crate::runner::UnrunnableProcess`] diagnostic, restores the pid's state and
+    /// answers `Wait`, so one unindexed run-queue entry can never take the pass — and the
+    /// node — down (see [`RuntimeRunner::run`](crate::runner::RuntimeRunner)).
     fn scheduler_pass(
         &mut self,
         max_slices: Option<u64>,
@@ -792,7 +826,7 @@ impl Runtime {
         }
         // A heap-fragment delivery is absorbed at the same points as the table's own wake
         // list, so a wake it produced *outside* a slice is enqueued before the first one.
-        self.absorb_fragment_wakes(&mut table, &mut scheduler);
+        self.absorb_fragment_wakes(&mut table, &mut state, &mut scheduler);
         let mut ran: u64 = 0;
         let mut delivered: usize = 0;
         let mut waits: u32 = 0;
@@ -951,7 +985,7 @@ impl Runtime {
             // A heap-fragment delivery made *inside* the slices just run woke its receiver;
             // `run_slice` absorbs the table's own wake list, and this is the fragment
             // counterpart, so the receiver this pass just woke still runs in this pass.
-            let woke = self.absorb_fragment_wakes(&mut table, &mut scheduler);
+            let woke = self.absorb_fragment_wakes(&mut table, &mut state, &mut scheduler);
             // The **driver-monitor marking** half of the A.4 monitor family: a C driver that called
             // `driver_monitor_process` watches an Erlang process, and this runtime is the only party
             // that holds the live process table, so the surveillance is discharged here — every
@@ -1222,12 +1256,16 @@ impl Runtime {
         };
         // The two fragment notes for a message that had to go into a heap fragment, exactly
         // the pair the local send path applies (`crate::context`'s
-        // `send_fragmented_message`): the descent gate, because the payload lives in a region
-        // the receiver's collector does not scan, and the wake the fragment path cannot
-        // record on the table's own wake list.
-        for pid in fragment_pids {
+        // `send_fragmented_message`): the descent gate for **every** fragment delivery,
+        // because the payload lives in a region the receiver's collector does not scan, and
+        // the wake note **only for a delivery that really moved the receiver** — the wake
+        // list is a *should be scheduled* list, and a receiver that was already `Runnable`
+        // (a runtime-owned service that is born so and never runs) must not be put on it.
+        for (pid, woken) in fragment_pids {
             self.note_foreign_reachable(pid);
-            self.note_fragment_wake(pid);
+            if woken {
+                self.note_fragment_wake(pid);
+            }
         }
         Ok(dispatched)
     }
@@ -1282,9 +1320,13 @@ impl Runtime {
             let delivered = node.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)?;
             (delivered, sink.take_fragment_deliveries())
         };
-        for pid in fragment_pids {
+        // As in `dispatch_inbound`: the descent gate for every fragment delivery, the wake
+        // note only for a receiver the delivery really woke.
+        for (pid, woken) in fragment_pids {
             self.note_foreign_reachable(pid);
-            self.note_fragment_wake(pid);
+            if woken {
+                self.note_fragment_wake(pid);
+            }
         }
         Ok(delivered)
     }
@@ -1359,9 +1401,13 @@ impl Runtime {
             let delivered = client.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)?;
             (delivered, sink.take_fragment_deliveries())
         };
-        for pid in fragment_pids {
+        // As in `dispatch_inbound`: the descent gate for every fragment delivery, the wake
+        // note only for a receiver the delivery really woke.
+        for (pid, woken) in fragment_pids {
             self.note_foreign_reachable(pid);
-            self.note_fragment_wake(pid);
+            if woken {
+                self.note_fragment_wake(pid);
+            }
         }
         Ok(delivered)
     }

@@ -59,7 +59,10 @@ use super::signals::{monitor_ref_term, signal_node, unlink_id_term};
 const SCRATCH_WORDS: usize = 1 << 12;
 
 /// The words of the arena one inbound control message is decoded on (reset per drain).
-const DISPATCH_HEAP_WORDS: usize = 1 << 16;
+///
+/// Shared with the accepting half — one capacity for both, so a message the runtime
+/// *sends* is never decodable only on one side (see [`crate::dist`]'s constant).
+const DISPATCH_HEAP_WORDS: usize = crate::dist::DIST_DISPATCH_HEAP_WORDS;
 
 /// A control message the [`DistSignalRouter`] queued for delivery.
 ///

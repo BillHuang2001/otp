@@ -62,23 +62,112 @@ fn table() -> ProcessTable {
     ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()))
 }
 
+/// A pid the scheduler hands to the runner with **no engine entry point** is *diagnosed*,
+/// never fatal: one unindexed run-queue entry must not take a whole pass — and the node —
+/// down.
+///
+/// The runner owns both halves of the refusal, because nobody else touches the process in
+/// this window: the typed record ([`UnrunnableProcess`]) and the state restore. The
+/// scheduler's `slice_begin` has already taken the pid off the run queue and marked it
+/// [`ProcessState::Running`], and `slice_end`'s `Wait` arm changes nothing, so leaving it
+/// alone would leave the pid `Running` forever — a lie that also flips
+/// [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots).
 #[test]
-fn a_pid_without_an_engine_is_a_typed_error() {
+fn a_pid_without_an_engine_is_diagnosed_and_left_runnable() {
     let mut rt = runtime();
     let mut state = RunnerState::default();
     let mut table = table();
     let pid = table.spawn_default().expect("a fresh process");
+    // What the scheduler's `slice_begin` does before the runner ever sees the pid.
+    {
+        let process = table.get_mut(pid).expect("a fresh process stays in the table");
+        process.set_state(ProcessState::Running);
+        process.flags_mut().set_in_run_queue(false);
+    }
 
     let mut runner = RuntimeRunner::new(&mut rt, &mut state);
-    let error = runner
+    let outcome = runner
         .run(pid, &mut table, 1)
-        .expect_err("no engine ⇒ a typed error");
+        .expect("an engine-less pid is not an error");
     assert_eq!(
-        error.to_string(),
-        crate::error::unknown_process_entry(pid).to_string()
+        outcome,
+        ProcOutcome::Wait,
+        "it left the run queue and nothing will run it — the honest outcome"
     );
+    drop(runner);
+
+    let diagnostic = state.unrunnable(pid).expect("the pid is diagnosed");
+    assert_eq!(diagnostic.pid, pid);
+    assert_eq!(
+        diagnostic.state,
+        ProcessState::Running,
+        "the record says what the pass actually observed, before any restore"
+    );
+    assert!(!diagnostic.in_run_queue, "`slice_begin` took it off the queue");
+    assert_eq!(
+        diagnostic.registered_name, None,
+        "a bare `spawn_default` process is unregistered"
+    );
+    let text = diagnostic.to_string();
+    assert!(text.contains("has no engine entry point"), "{text}");
+    assert!(text.contains(&format!("{pid:?}")), "the message names the pid: {text}");
+
+    let restored = table.get(pid).expect("it stays in the table");
+    assert_eq!(
+        restored.state(),
+        ProcessState::Runnable,
+        "the `Running` lie `slice_begin` wrote is undone"
+    );
+    assert!(!restored.flags().in_run_queue(), "nothing enqueued it");
+
+    // A pid is diagnosed **once**: a second refusal keeps the first observation rather than
+    // burying it under a later one.
+    let now_waiting = table.get_mut(pid).expect("it stays in the table");
+    now_waiting.set_state(ProcessState::Waiting);
+    let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+    assert_eq!(
+        runner.run(pid, &mut table, 1).expect("still not an error"),
+        ProcOutcome::Wait
+    );
+    drop(runner);
+    assert_eq!(
+        state.unrunnable(pid).expect("still recorded").state,
+        ProcessState::Running,
+        "the first record is kept verbatim"
+    );
+    assert_eq!(
+        table.get(pid).expect("it stays").state(),
+        ProcessState::Runnable,
+        "every refusal restores a truthful state"
+    );
+    // The consuming half hands the record over and clears it.
+    let taken = state.take_unrunnable(pid).expect("the record");
+    assert_eq!(taken.pid, pid);
+    assert!(state.unrunnable(pid).is_none(), "taking consumes it");
 }
 
+#[test]
+fn a_pid_that_left_the_process_table_is_refused_without_a_record() {
+    // The runner is handed a pid the table no longer holds (terminated between the enqueue
+    // and the slice): there is nothing to describe and nothing to restore, and the outcome is
+    // still the non-fatal `Wait`.
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = ProcessId::new(4242, 0);
+    assert!(table.get(pid).is_none(), "the fixture pid is not live");
+
+    let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+    assert_eq!(
+        runner.run(pid, &mut table, 1).expect("not an error"),
+        ProcOutcome::Wait
+    );
+    drop(runner);
+    assert!(
+        state.unrunnable(pid).is_none(),
+        "a pid with no PCB cannot be described"
+    );
+}
 #[test]
 fn the_standard_error_atoms_become_atom_reasons() {
     let mut rt = runtime();

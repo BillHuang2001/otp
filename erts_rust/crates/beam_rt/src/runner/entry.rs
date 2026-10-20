@@ -26,15 +26,15 @@
 //! holds the machine that runs it, and [`RunnerState`] is the whole table plus the
 //! outcomes every process recorded.
 
+use std::fmt;
 use std::sync::Arc;
 
 use beam_common::BeamError;
 use beam_engine::context::RootSet;
 use beam_engine::{Machine, Tier};
 use beam_loader::Module;
-use beam_process::ProcessId;
-use beam_term::{Atom, Eterm};
-
+use beam_process::{Priority, Process, ProcessId, ProcessState, ProcessTable};
+use beam_term::{Atom, AtomTable, Eterm};
 use crate::context::LocalFunTarget;
 use crate::hasher::FastHashMap;
 use crate::timers::TimerHandle;
@@ -235,6 +235,96 @@ pub(super) struct ProcessEngine {
     pub(super) off_heap: Option<crate::context::gc::OffHeapReclaimer>,
 }
 
+/// A pid the runtime tried to **schedule** but holds no engine entry point for.
+///
+/// [`RunnerState::engines`] is the only place an execution entry point lives, so a pid
+/// without one can never run. Two sites can hand such a pid to the scheduler:
+///
+/// * the runner's own slice entry
+///   ([`RuntimeRunner::run`](super::RuntimeRunner)), for a pid the run queue really
+///   contained;
+/// * [`Runtime::absorb_fragment_wakes`](crate::runtime::Runtime::absorb_fragment_wakes),
+///   the heap-fragment wake sweep, whose subject is a *note* rather than a run-queue entry.
+///
+/// The runtime's own long-lived services (`init`/[`Runtime::self_pid`], the
+/// `erl_prim_loader` stand-in, the `file_server_2` service, the registered `net_kernel`
+/// service) and the `-eval`/`-s`/`-run` action child are exactly such pids: they are spawned,
+/// inserted and **never enqueued**, and they are *born* [`ProcessState::Runnable`] — so
+/// "`Runnable` and not in a run queue" is **not** a valid "should be scheduled" test for
+/// them. Neither site may treat one as a runnable process: the runner refuses it (and
+/// restores a truthful state) and the sweep refuses to enqueue it, each recording **one**
+/// of these records and emitting **one** diagnostic line.
+///
+/// [`Runtime::self_pid`]: crate::runtime::Runtime::self_pid
+///
+/// The record is **observability**, never a behaviour switch: it is written once per pid
+/// (see [`RunnerState::record_unrunnable`]) and nothing reads it to make a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnrunnableProcess {
+    /// The pid that was refused.
+    pub(crate) pid: ProcessId,
+    /// The process's scheduler state **as observed when it was refused**.
+    ///
+    /// From the run-queue site this is [`ProcessState::Running`]: the scheduler's
+    /// `slice_begin` has already taken the pid off the queue and marked it executing by the
+    /// time the runner sees it. From the fragment-wake sweep it is the state the note was
+    /// judged by (normally [`ProcessState::Runnable`]). Both are recorded **before** any
+    /// restore, so the record says what the pass actually saw.
+    pub(crate) state: ProcessState,
+    /// Whether the process was in a run queue at the moment it was refused.
+    pub(crate) in_run_queue: bool,
+    /// The process's scheduling priority.
+    pub(crate) priority: Priority,
+    /// The name the process is registered under, when it is registered — the one thing that
+    /// makes such a record immediately actionable (`init`, `net_kernel`, …).
+    pub(crate) registered_name: Option<String>,
+}
+
+impl UnrunnableProcess {
+    /// Diagnoses `pid` from its live PCB `process`, plus the registered name the caller
+    /// looked up (the process table holds names, not the PCBs).
+    pub(crate) fn of(pid: ProcessId, process: &Process, registered_name: Option<String>) -> Self {
+        UnrunnableProcess {
+            pid,
+            state: process.state(),
+            in_run_queue: process.flags().in_run_queue(),
+            priority: process.priority(),
+            registered_name,
+        }
+    }
+}
+
+impl fmt::Display for UnrunnableProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "scheduler: process {:?} has no engine entry point (state {:?}, in_run_queue {}, \
+             priority {:?}",
+            self.pid, self.state, self.in_run_queue, self.priority
+        )?;
+        if let Some(name) = &self.registered_name {
+            write!(f, ", registered as {name}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// The name `pid` is registered under, as its atom text — `None` when it is unregistered
+/// (or no longer live, [`ProcessTable::name_of`]'s rule) or when the shared atom table
+/// cannot name the registration atom.
+///
+/// Both sites that diagnose an engine-less pid take the name from here, so a record always
+/// names a registered service the same way.
+pub(crate) fn registered_name(
+    table: &ProcessTable,
+    atoms: &AtomTable,
+    pid: ProcessId,
+) -> Option<String> {
+    table
+        .name_of(pid)
+        .and_then(|name| atoms.name(name))
+        .map(str::to_string)
+}
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
 ///
 /// [`Runtime`](crate::runtime::Runtime) owns one; a scheduler pass *moves it out* so the
@@ -270,6 +360,17 @@ pub(crate) struct RunnerState {
     /// the process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is
     /// `unsafe` in edition 2024) and the CLI is measured by setting the variable.
     pub(super) jit_mode: Option<super::tier::JitMode>,
+    /// The pids the runtime tried to schedule but has **no engine entry point** for, keyed
+    /// by pid and recorded **once** each (see [`UnrunnableProcess`]).
+    ///
+    /// It lives here — not on the [`Runtime`](crate::runtime::Runtime) — because a
+    /// scheduler pass *moves this struct out* of the runtime and puts it back when the pass
+    /// ends, so a record written by the runner (which holds it) and one written by the
+    /// fragment-wake sweep are the same set, and both survive across passes.
+    ///
+    /// A [`FastHashMap`] for the same reason as the outcome maps below: it is only ever
+    /// probed by pid, never iterated for an observable order.
+    pub(super) unrunnable: FastHashMap<ProcessId, UnrunnableProcess>,
 }
 impl RunnerState {
     /// The execution-tier mode in force: the explicitly set one, else the `BEAM_RT_TIER`
@@ -529,6 +630,44 @@ impl RunnerState {
     /// docs). Taking consumes it: the first caller gets it, later ones get `None`.
     pub(crate) fn take_error(&mut self, pid: ProcessId) -> Option<BeamError> {
         self.errors.remove(&pid)
+    }
+
+    /// Records `diagnostic` as the typed record of a pid the runtime tried to schedule and
+    /// holds no engine for, answering whether it was **newly** recorded.
+    ///
+    /// A pid is diagnosed **once**: the first record is kept verbatim (an existing entry is
+    /// never overwritten), so a pid that keeps being noted across passes cannot grow the map
+    /// or bury the original observation. The one diagnostic line is emitted here, on the
+    /// newly-diagnosed edge, through the runtime's env-gated debug channel
+    /// ([`crate::debug_trace`]) — a normal run is silent, and the differential gate compares
+    /// process output, so nothing is written to stderr unless `BEAM_RT_BOOT_TRACE` is set.
+    pub(crate) fn record_unrunnable(&mut self, diagnostic: UnrunnableProcess) -> bool {
+        let pid = diagnostic.pid;
+        if self.unrunnable.contains_key(&pid) {
+            return false;
+        }
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!("{diagnostic}"));
+        }
+        self.unrunnable.insert(pid, diagnostic);
+        true
+    }
+
+    /// The typed record of `pid` having been refused for want of an engine, when one was
+    /// recorded.
+    pub(crate) fn unrunnable(&self, pid: ProcessId) -> Option<&UnrunnableProcess> {
+        self.unrunnable.get(&pid)
+    }
+
+    /// Takes the typed record of `pid` having been refused for want of an engine.
+    ///
+    /// A diagnostic is not a per-pass work item — nothing in the runtime consumes one, and
+    /// [`RunnerState::record_unrunnable`] keeps the first record for the process's lifetime
+    /// — so the consuming half is compiled only for the crate's own tests
+    /// (`crate::runner::tests`), which assert the record and then clear it.
+    #[cfg(test)]
+    pub(crate) fn take_unrunnable(&mut self, pid: ProcessId) -> Option<UnrunnableProcess> {
+        self.unrunnable.remove(&pid)
     }
 }
 

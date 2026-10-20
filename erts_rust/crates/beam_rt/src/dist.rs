@@ -143,16 +143,40 @@ pub const DIST_READ_SLICE: Duration = Duration::from_millis(25);
 /// drained, but a flood is bounded per pass).
 const MAX_ACCEPTS_PER_PUMP: usize = 8;
 
-/// The scratch heap used to decode an inbound control message (words).
+/// The capacity, in term words, of the arena an inbound control message is decoded on
+/// — shared by **both** distribution halves (the accepting [`DistNode`] and the
+/// connecting [`crate::dist_client::DistClient`]), which each own one.
 ///
 /// One decoded message at a time is materialised here; the delivery immediately
-/// **copies** it into the receiver's own heap, so the arena is reset between
-/// drains. It is sized to hold a full non-fragmented distribution message
-/// ([`beam_dist::DIST_FRAGMENT_SIZE`]); a larger reassembled fragmented message
-/// that does not fit retires the link with a recorded reason, exactly as any
-/// other undecodable message does (see [`DistNode::last_link_error`]) — a bounded,
-/// honest Milestone-1 limit, never a wrong delivery.
-const DIST_DISPATCH_HEAP_WORDS: usize = 1 << 16;
+/// copies it into the receiver's own heap (or into a heap fragment), so the arena is
+/// reset between drains.
+///
+/// # Why it is sized from the *reassembly* limit, not from a frame
+///
+/// A payload larger than [`beam_dist::DIST_FRAGMENT_SIZE`] (64 KiB) arrives as
+/// `'E'`/`'F'` fragment frames that [`beam_dist`] **reassembles into one control body**
+/// before it is handed over, so a multi-megabyte message is decoded in a single burst
+/// and the arena — not the frame size — is what bounds it. Sizing it from one frame
+/// silently dropped every message above ~512 KiB: the decode failed with
+/// `AllocKind::Heap`, and because `ConnectionDriver::next_message` pops the frame
+/// *before* decoding, the message was already gone, so the link retired and the
+/// payload was lost.
+///
+/// The arena is therefore sized for the distribution layer's own reassembly limit
+/// ([`beam_dist::fragment::DEFAULT_MAX_FRAGMENTED_MESSAGE`]) at two term words per eight payload
+/// bytes: the binary minimum is one word per eight bytes
+/// ([`beam_term::bitstring::heap_bits_size_words`]), and the second word covers the
+/// term/framing overhead plus a denser wire encoding (a list of cached atoms spends
+/// one wire byte per cons cell). A message whose *decoded term* is larger than this
+/// (a pathological denser-than-two-words-per-eight-bytes payload) still exhausts the
+/// arena, and then its link retires with the reason recorded in
+/// [`DistNode::last_link_error`] — an honest, recorded limit, never a wrong delivery.
+///
+/// The reserve is **address space, not resident memory**: the block is one dedicated
+/// `mmap`-backed carrier and its pages fault in lazily, so a runtime that never
+/// receives a large message never touches them.
+pub(crate) const DIST_DISPATCH_HEAP_WORDS: usize =
+    beam_dist::fragment::DEFAULT_MAX_FRAGMENTED_MESSAGE / 8 * 2;
 
 /// Resolves the cookie the handshake digests use: `-setcookie` from the command
 /// line, else `$HOME/.erlang.cookie`, else the documented Milestone-1 default.

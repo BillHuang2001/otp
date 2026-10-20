@@ -129,13 +129,21 @@ pub struct LocalDeliverySink<'a> {
     local_node: Eterm,
     /// This node's creation (the incarnation the pid must belong to).
     local_creation: u32,
-    /// The receivers whose message had to be placed in a heap fragment — the caller
-    /// replays the runtime's two fragment notes
-    /// ([`note_foreign_reachable`](crate::runtime::Runtime::note_foreign_reachable) and
-    /// [`note_fragment_wake`](crate::runtime::Runtime::note_fragment_wake)) after the
-    /// drain; a payload in a fragment lives in a region the receiver's collector does not
-    /// scan, so handing it to running code is what opens the descent latch.
-    fragment_deliveries: Vec<ProcessId>,
+    /// The receivers whose message had to be placed in a heap fragment, each with
+    /// **whether that delivery moved it** — `true` when
+    /// [`Process::wake`](beam_process::Process::wake) turned a `Waiting`/`Suspended`
+    /// receiver `Runnable`, `false` when it was already runnable (or could not be woken).
+    ///
+    /// The caller replays the runtime's two fragment notes after the drain, and the flag is
+    /// exactly what splits them:
+    /// [`note_foreign_reachable`](crate::runtime::Runtime::note_foreign_reachable) for
+    /// **every** pair (a payload in a fragment lives in a region the receiver's collector
+    /// does not scan, so handing it to running code is what opens the descent latch) and
+    /// [`note_fragment_wake`](crate::runtime::Runtime::note_fragment_wake) **only for a
+    /// pair whose wake really happened** — the wake list is a *should be scheduled* list,
+    /// and a part of the run time that is born `Runnable` (the runtime's own never-enqueued
+    /// services, the `-eval` action child) must never be put on it.
+    fragment_deliveries: Vec<(ProcessId, bool)>,
 }
 
 impl<'a> LocalDeliverySink<'a> {
@@ -150,18 +158,19 @@ impl<'a> LocalDeliverySink<'a> {
         }
     }
 
-    /// Takes the pids of the receivers this drain had to deliver to through a **heap
-    /// fragment** (see [`Self::enqueue_fragmented`]), in delivery order.
+    /// Takes the receivers this drain had to deliver to through a **heap fragment** (see
+    /// [`Self::enqueue_fragmented`]), in delivery order, each with **whether the delivery
+    /// woke it** — `true` only for a receiver whose state really moved to `Runnable`.
     ///
-    /// The caller replays the runtime's two fragment notes for each of them after the
-    /// drain — exactly the pair
+    /// The caller replays the runtime's two fragment notes for each pair after the drain —
+    /// the reachability note for **every** pair, the wake note only for the `true` ones —
+    /// which is exactly the pair
     /// [`RuntimeContext::send_fragmented_message`](crate::context) applies on the local
-    /// send path. Taking the list clears it, so a sink reused across links records each
-    /// fragment delivery once.
-    pub(crate) fn take_fragment_deliveries(&mut self) -> Vec<ProcessId> {
+    /// send path (it guards its own note with `if woken`). Taking the list clears it, so a
+    /// sink reused across links records each fragment delivery once.
+    pub(crate) fn take_fragment_deliveries(&mut self) -> Vec<(ProcessId, bool)> {
         std::mem::take(&mut self.fragment_deliveries)
-    }
-}
+    }}
 
 impl InboundSink for LocalDeliverySink<'_> {
     fn deliver(&mut self, delivery: &Delivery) -> Result<DeliveryOutcome> {
@@ -616,12 +625,19 @@ impl LocalDeliverySink<'_> {
     /// so reaching this method from exactly that failure costs the refusal, not a partial
     /// write.
     ///
-    /// The pid is recorded in [`Self::fragment_deliveries`] whether or not the wake moved
-    /// the receiver: the payload sits in a region the receiver's collector does not scan, so
-    /// the caller must replay the runtime's two fragment notes for it after the drain (the
-    /// wake note is harmless for a receiver that was already runnable — the runtime's wake
-    /// sweep skips a pid that is not a live `Runnable` process).
-    ///
+    /// The pid is recorded in [`Self::fragment_deliveries`] **whether or not** the wake
+    /// moved the receiver — a fragment that landed is a delivery — together with the wake
+    /// result itself. The distinction is load-bearing, not cosmetic: the payload sits in a
+    /// region the receiver's collector does not scan, so the caller must replay the
+    /// runtime's **reachability** note for it after the drain, but the **wake** note is a
+    /// *should be scheduled* list, and a receiver that was already `Runnable` was not woken
+    /// by this delivery at all. Recording it as woken would hand
+    /// [`Runtime::note_fragment_wake`](crate::runtime::Runtime::note_fragment_wake) the pid
+    /// of a process nothing is waiting to run — including the runtime's own
+    /// **never-enqueued services** (`init`, the `-eval`/`-s`/`-run` action child,
+    /// `erl_prim_loader`, the `file_server_2` service), which are *born* `Runnable` and
+    /// hold no engine entry point (see
+    /// [`Runtime::absorb_fragment_wakes`](crate::runtime::Runtime::absorb_fragment_wakes)).    ///
     /// # Errors
     ///
     /// Only a genuine table/protocol failure: a well-formed delivery never returns `Err`
@@ -655,8 +671,8 @@ impl LocalDeliverySink<'_> {
         let (heap, mailbox) = process.heap_and_mailbox_mut();
         match beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0) {
             Ok(()) => {
-                let _woken = process.wake();
-                fragment_deliveries.push(pid);
+                let woken = process.wake();
+                fragment_deliveries.push((pid, woken));
                 Ok(DeliveryOutcome::Delivered)
             }
             // Even the fragment could not be allocated: the one remaining honest drop on the
