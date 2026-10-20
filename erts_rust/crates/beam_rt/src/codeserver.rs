@@ -84,8 +84,6 @@ use beam_term::AtomTable;
 
 use crate::context::PendingInterner;
 use crate::error;
-use crate::nif::atoms::ForeignAtomHub;
-
 /// The release-layout code-path derivation (the oracle's `<lib>` bundle scan): a thin child
 /// module so this file stays the code server's public surface — see [`path`].
 mod path;
@@ -180,16 +178,6 @@ pub struct CodeServer {
     /// `-pa`/`-pz` directories. It therefore stays the consumed installation's `<lib>` even
     /// when a user directory is shaped like one.
     system_lib_root: Option<PathBuf>,
-    /// The **shared atom-index hub**, once the runtime has installed one
-    /// ([`crate::Runtime::install_foreign_atom_hub`]) — the single allocator of atom indices for
-    /// threads that are not inside a NIF call (contract A.3).
-    ///
-    /// This server is the only place the live table grows, so it is also the only place a
-    /// reservation made by such a thread can become real: [`CodeServer::atoms_mut`] and
-    /// [`CodeServer::intern_pending`] **drain it before their own append** (see
-    /// [`CodeServer::drain_foreign_atoms`]), which is what keeps the two index claims — the hub's
-    /// reservation tail and the runtime's next `intern` — from ever naming the same slot.
-    foreign_atoms: Option<Arc<ForeignAtomHub>>,
 }
 
 impl CodeServer {
@@ -212,7 +200,6 @@ impl CodeServer {
             tail_paths: Vec::new(),
             default_paths: Vec::new(),
             system_lib_root: None,
-            foreign_atoms: None,
         }
     }
 
@@ -394,88 +381,16 @@ impl CodeServer {
         &self.atoms
     }
 
-    /// Install the **shared atom-index hub** for this server's live table
-    /// ([`ForeignAtomHub`], contract A.3).
-    ///
-    /// `hub` must have been built from this server's current table
-    /// ([`ForeignAtomHub::new`]`(self.atoms())`), which is what makes its mirror this table's index
-    /// space. From then on every mutating atom path here drains the hub first — see
-    /// [`CodeServer::drain_foreign_atoms`] — so a foreign thread's reserved index and the runtime's
-    /// own next `intern` can never be the same slot.
-    ///
-    /// A server that is handed a second hub replaces the first: the hub is only ever the *one*
-    /// allocator, and a mirror built from the same table stays correct across the replacement (both
-    /// mirrors name the same indices; the superseded one simply stops being drained).
-    pub(crate) fn attach_foreign_atoms(&mut self, hub: Arc<ForeignAtomHub>) {
-        // Drain the outgoing hub (if any) before it stops being consulted: its reservations are
-        // already-paid-for indices that must still reach the live table, and after this line nothing
-        // would ever sync them.
-        self.drain_foreign_atoms();
-        self.foreign_atoms = Some(hub);
-    }
-
-    /// The installed shared atom-index hub, for a caller that must hand it to a foreign thread (the
-    /// NIF thread-env host factory) or adopt it on a per-call interner.
-    pub(crate) fn foreign_atoms(&self) -> Option<Arc<ForeignAtomHub>> {
-        self.foreign_atoms.clone()
-    }
-
-    /// **Drain the hub's reservation tail into the live table**, before this server appends anything.
-    ///
-    /// # The invariant
-    ///
-    /// Once a hub is installed ([`CodeServer::attach_foreign_atoms`]) it is the single allocator of
-    /// atom indices: a thread outside a NIF call reserves an index from it, and the runtime appends
-    /// through [`CodeServer::atoms_mut`]/[`CodeServer::intern_pending`]. Every such append is preceded
-    /// by this drain, so the runtime's next `intern` always lands *after* every standing reservation —
-    /// the two can never claim the same slot.
-    ///
-    /// The gate is [`ForeignAtomHub::needs_sync`] — two relaxed atomic loads — so a runtime with no
-    /// foreign thread pays nothing beyond them, and a runtime with **no** hub pays one `Option` test.
-    ///
-    /// # The honest residual
-    ///
-    /// An append made while a caller holds the raw `&mut AtomTable` this server handed out (a long
-    /// interning loop inside one borrow) is invisible to the hub until the next drain. If a foreign
-    /// thread reserved an index in that window, its index is stale; the next
-    /// [`ForeignAtomHub::sync`] detects that (the live table is longer than the mirror's committed
-    /// prefix) and **re-anchors** the reservation, so the name still reaches the table exactly once, at
-    /// a real index. Nothing observable is wrong from that — the foreign path converts a term to an
-    /// ETF image **by atom name** before it leaves the thread, and an in-worker `atom_name` reads the
-    /// hub — but the *index* a foreign thread observed before the re-anchor may afterwards name a
-    /// different atom.
-    fn drain_foreign_atoms(&mut self) {
-        let Some(hub) = self.foreign_atoms.as_ref() else {
-            return;
-        };
-        if !hub.needs_sync(self.atoms.len()) {
-            return;
-        }
-        // The `Arc` clone (one atomic bump, and only on the path that really syncs) is what lets the
-        // borrow of `self.foreign_atoms` end before the table is borrowed mutably.
-        let hub = Arc::clone(hub);
-        let table = match Rc::get_mut(&mut self.atoms) {
-            Some(table) => table,
-            None => Rc::make_mut(&mut self.atoms),
-        };
-        hub.sync(table);
-    }
-
     /// The one shared atom table, mutably — the runtime seeds and interns through it.
     ///
     /// Copy-on-write: while another holder still has a handle (a BIF in flight), the
     /// write clones the table rather than aliasing it (the clone preserves every index).
-    ///
-    /// The shared atom-index hub, when one is installed, is **drained at entry**
-    /// ([`CodeServer::drain_foreign_atoms`]): a foreign thread's reserved index is committed here,
-    /// before the caller's own `intern` can take the slot it points at.
     ///
     /// A **per-call commit** of newly interned names goes through
     /// [`CodeServer::intern_pending`] instead: it is the same append-only write, but it takes
     /// the `Rc::get_mut` fast path so an interning call appends in place whenever this server
     /// is the table's only owner (see its docs).
     pub fn atoms_mut(&mut self) -> &mut AtomTable {
-        self.drain_foreign_atoms();
         Rc::make_mut(&mut self.atoms)
     }
 
@@ -518,14 +433,7 @@ impl CodeServer {
     /// An empty interner short-circuits: a call that interned nothing must not borrow the
     /// table at all (the callers guard on [`PendingInterner::is_empty`] for the same reason,
     /// and every non-interning call would otherwise pay the fallback clone).
-    ///
-    /// The shared atom-index hub is drained **before** the emptiness test and before the append
-    /// ([`CodeServer::drain_foreign_atoms`]): a reservation is exactly as much a claim on the table's
-    /// next index as a registered BIF's new name, so both must be settled in one order. A
-    /// hub-adopted interner's own reservations *are* that drain — [`PendingInterner::commit`] with a
-    /// hub commits through it — so the two paths cannot append the same name twice.
     pub(crate) fn intern_pending(&mut self, interner: &PendingInterner) {
-        self.drain_foreign_atoms();
         if interner.is_empty() {
             return;
         }

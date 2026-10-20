@@ -30,8 +30,8 @@
 //!
 //! | test | the property |
 //! |---|---|
-//! | [`the_factory_host_hands_out_the_hubs_own_atom_indices`] | the `enif_make_atom` hook answers exactly the index [`ForeignAtomHub::reserve`] reserved, `enif_get_atom`/`enif_make_existing_atom` read that same space, a name the base table already holds is **not** duplicated and an unknown one is never fabricated |
-//! | [`an_atom_a_factory_thread_creates_reaches_the_live_table_at_its_own_index`] | a real `std::thread` gets a message env from the installed factory, interns a **new** atom, and the **live** table spells it at that index after the code server's own drain — so the index is the runtime's, not a crate-private one |
+//! | [`the_factory_host_hands_out_the_private_spaces_atom_indices`] | the `enif_make_atom` hook answers exactly the index [`ForeignAtomHub::reserve`] reserved **in the private space**, `enif_get_atom`/`enif_make_existing_atom` read that same space, a name the space already holds is **not** duplicated and an unknown one is never fabricated |
+//! | [`an_atom_a_factory_thread_creates_reaches_the_live_table_by_name_not_by_index`] | a real `std::thread` gets a message env from the installed factory, interns a **new** atom (private index), and the name reaches the **live** table only when the decoded image carries it — at the live table's own index, never the private one |
 //! | [`a_send_queues_an_image_that_decodes_to_the_exact_message`] | `enif_send` answers the C's `1`, the queue holds one [`ForeignSend`] with the expected target and **no** sender, and its image (`131`-led) decodes to a term structurally equal to the message |
 //! | [`a_drained_foreign_send_wakes_a_parked_receiver`] | the scheduler pass that drains delivers into the mailbox of a receiver parked in a compiled `receive` **and wakes it** — its computed result is the message |
 //! | [`a_send_to_a_term_that_names_no_process_answers_false`] | the C's `0` for a destination naming no pid, with nothing queued (a pid term for a process nobody owns is the drain's liveness question, below) |
@@ -58,7 +58,7 @@
 //!   `enif_alloc_env` takes before it would answer `NULL`.
 //! * A **local (`make_fun3`) closure** cannot be built here (`beam_term::fun::write_fun_local` is
 //!   `unsafe`), so the "the codec refuses this message" leg uses the other documented refusal: an
-//!   atom the hub's mirror cannot name.
+//!   atom the private space cannot name.
 //!
 //! Everything else is real. In particular the drain's **skip** arm is driven through the runtime's
 //! own queue: `Runtime::nif_thread_sends` is a `#[cfg(test)]` read accessor for the very `Arc` the
@@ -129,12 +129,16 @@ fn queue() -> ForeignSends {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-/// A hub mirroring `names`, a factory over it (this test's own, never installed) and the host that
-/// factory opens — the same shape `beam_abi` gives a NIF-created thread.
+/// A **private** atom space seeded with `names`, a factory over it (this test's own, never installed)
+/// and the host that factory opens — the same shape `beam_abi` gives a NIF-created thread.
+///
+/// Seeding goes through [`ForeignAtomHub::reserve`], so the space's indices are its own: there is no
+/// live table here, and no live index is involved.
 fn factory_host(names: &[&str]) -> (Arc<ForeignAtomHub>, ForeignSends, Box<dyn NifHost>) {
-    let mut table = AtomTable::new();
-    table.seed(names.iter().copied());
-    let hub = ForeignAtomHub::new(&table);
+    let hub = ForeignAtomHub::new();
+    for name in names {
+        hub.reserve(name);
+    }
     let sends = queue();
     let factory = ThreadEnvFactory::new(
         Arc::clone(&hub),
@@ -175,25 +179,24 @@ fn decode(image: &[u8], atoms: &mut AtomTable) -> Option<(Heap, Eterm)> {
 // ---------------------------------------------------------------------------------------------
 
 /// The `enif_make_atom`/`enif_get_atom`/`enif_make_existing_atom` hooks all answer out of the
-/// **hub's** one index space: a created atom takes exactly the index
-/// [`ForeignAtomHub::reserve`] reserved for it, its name round-trips, a name the base table already
-/// holds keeps the base table's index (so it is not duplicated), and a name nobody interned answers
-/// `None` rather than a fabricated index.
+/// **factory's private** atom space: a created atom takes exactly the index
+/// [`ForeignAtomHub::reserve`] reserved for it, its name round-trips, a name the space already holds
+/// keeps its index (so it is never duplicated), and a name nobody created answers `None` rather than a
+/// fabricated index.
 #[test]
-fn the_factory_host_hands_out_the_hubs_own_atom_indices() {
-    let mut table = AtomTable::new();
-    table.seed(["alpha", "beta"]);
-    let hub = ForeignAtomHub::new(&table);
+fn the_factory_host_hands_out_the_private_spaces_atom_indices() {
+    let hub = ForeignAtomHub::new();
+    hub.reserve("alpha");
+    hub.reserve("beta");
     let factory =
         ThreadEnvFactory::new(Arc::clone(&hub), queue(), LOCAL_NODE.to_string(), CREATION);
     let mut host = factory.open().expect("the factory opens a host");
 
-    // A pre-existing name is read, never duplicated: `enif_make_existing_atom` and `enif_make_atom`
-    // both answer the base table's own index and the mirror does not grow.
+    // A name the space already holds is read, never duplicated.
     assert_eq!(
         host.existing_atom("alpha").map(|atom| atom_val(atom).raw()),
         Some(0),
-        "a name the base table holds resolves through the hub's mirror"
+        "a name the space holds resolves through it"
     );
     assert_eq!(
         host.intern_atom("alpha").map(|atom| atom_val(atom).raw()),
@@ -201,23 +204,19 @@ fn the_factory_host_hands_out_the_hubs_own_atom_indices() {
         "interning a known name keeps its index"
     );
     assert_eq!(
-        hub.table_len(),
-        2,
-        "neither lookup appended a name to the one index space"
+        hub.reserve("beta"),
+        1,
+        "neither lookup appended a name to the space"
     );
 
-    // A NEW name takes exactly the index the hub reserved for it — the reservation is made first
-    // and compared, which is the property that makes the atom a *real* live index.
+    // A NEW name takes exactly the index `reserve` gives it — a **private** index.
     let reserved = hub.reserve("novel_name");
-    assert_eq!(
-        reserved, 2,
-        "a new name takes the live table's own next index"
-    );
+    assert_eq!(reserved, 2, "the space's own next index");
     let created = host.intern_atom("novel_name").expect("the host interns");
     assert_eq!(
         atom_val(created).raw(),
         reserved,
-        "the atom a foreign thread builds carries the reserved index"
+        "the atom a foreign thread builds carries the private index"
     );
     assert_eq!(
         host.atom_name(created).as_deref(),
@@ -225,47 +224,43 @@ fn the_factory_host_hands_out_the_hubs_own_atom_indices() {
         "the text round-trips through the same space"
     );
 
-    // `enif_make_existing_atom` never fabricates an index — in the host or in the hub …
+    // `enif_make_existing_atom` never fabricates an index — in the host or in the space …
     assert_eq!(host.existing_atom("never_seen"), None);
     assert_eq!(hub.lookup("never_seen"), None);
     assert_eq!(
         host.atom_name(created).as_deref(),
         Some("novel_name"),
-        "a refused lookup left the mirror untouched"
+        "a refused lookup left the space untouched"
     );
-    // … until something really interns it.
+    // … until something really creates it.
     let seen = host.intern_atom("never_seen").expect("the host interns");
     assert_eq!(host.existing_atom("never_seen"), Some(seen));
     assert_eq!(host.atom_name(seen).as_deref(), Some("never_seen"));
 }
 
 // ---------------------------------------------------------------------------------------------
-// 2. A factory-thread atom lands in the LIVE table, at its own index
+// 2. A factory-thread atom reaches the LIVE table **by name**, never at its private index
 // ---------------------------------------------------------------------------------------------
 
-/// The point of the hub: a **new** atom a NIF-created thread creates is not a crate-private index.
-/// The thread gets a message env from the installed factory, interns a name that exists nowhere
-/// else, and the runtime's live `AtomTable` then spells that name at exactly that index — through
-/// the code server's own drain (the path the crate uses), not a hand-rolled sync.
+/// The handoff is **by name**: a NIF-created thread creates an atom in the factory's private space,
+/// and that name reaches the runtime's live `AtomTable` only when a decoded image carries it — never
+/// because the private index is a live index. The private index is therefore *not* the live one.
 #[test]
-fn an_atom_a_factory_thread_creates_reaches_the_live_table_at_its_own_index() {
+fn an_atom_a_factory_thread_creates_reaches_the_live_table_by_name_not_by_index() {
     let _env = EnvGuard::acquire();
     let mut runtime = Runtime::with_defaults().expect("the default runtime");
     assert!(
         runtime.install_nif_thread_env(),
-        "the factory installs (and attaches the one atom-index hub first)"
+        "the factory installs (over its own private atom space)"
     );
     let base_len = runtime.atoms().len();
-    let hub = runtime
-        .foreign_atoms()
-        .expect("installing a factory installs the hub it draws from");
-    assert_eq!(
-        hub.table_len(),
-        base_len,
-        "a fresh hub mirrors the whole table"
-    );
+    runtime.load_module(RECV_BEAM).expect("recv.beam loads");
+    let receiver = runtime
+        .spawn_process("recv", "wait", vec![])
+        .expect("spawn recv:wait/0");
+    assert_eq!(runtime.run_one_slice().expect("one slice"), 1);
 
-    let worker = std::thread::spawn(|| {
+    let (private_index, image) = std::thread::spawn(move || {
         with_thread_env_host(|host| {
             // The message env `enif_alloc_env(void)` asks this seam for — step (2) of its
             // reachability order, the only one a thread outside a call can satisfy.
@@ -274,46 +269,60 @@ fn an_atom_a_factory_thread_creates_reaches_the_live_table_at_its_own_index() {
                 !env.is_null(),
                 "the factory host serves an env off the call path"
             );
-            // `enif_make_atom(msg_env, "thread_made_atom")`: the hook that must reach the LIVE
-            // index space.
+            // `enif_make_atom(msg_env, "thread_made_atom")`: a name that exists nowhere else.
             let atom = host
                 .intern_atom("thread_made_atom")
                 .expect("the host interns");
+            let index = atom_val(atom).raw();
+            // The one crossing: an `enif_send`, whose image spells every atom by NAME.
+            assert_eq!(
+                host.send(receiver.to_eterm(), None, atom),
+                Some(true),
+                "the send is accepted (the C's `1`) and queues an image"
+            );
             assert!(
                 host.free_env(env),
                 "the env came from this host, so it is handed back to it"
             );
-            atom_val(atom).raw()
+            index
         })
         .expect("a factory is installed, so a host is reachable")
     })
     .join()
     .expect("the worker thread does not panic");
 
+    // The private index is small and says nothing about the live table: the atom is not there yet.
     assert!(
-        worker as usize >= base_len,
-        "a created atom takes a NEW index ({worker} < the table's {base_len})"
-    );
-    // The code server is the one place the live table grows, and every mutating entry commits the
-    // hub's reservations before its own append.
-    runtime.code_server_atoms_mut();
-    assert_eq!(
-        runtime.atoms().name(Atom::from_raw(worker)),
-        Some("thread_made_atom"),
-        "the live table spells the atom the foreign thread created, at its index"
+        private_index < 8,
+        "the private space is its own — {private_index} is not a live index"
     );
     assert_eq!(
         runtime.atoms().lookup("thread_made_atom"),
-        Some(Atom::from_raw(worker)),
-        "and the name resolves back to that same index"
+        None,
+        "nothing has carried the name into the live table yet"
     );
-    assert!(
-        !hub.has_pending(),
-        "the drain committed every outstanding reservation"
-    );
-}
 
-// ---------------------------------------------------------------------------------------------
+    // The drain decodes the image against the live table, which interns the name — and the delivery
+    // lands, so the message really carried that atom across the thread boundary.
+    assert_eq!(
+        runtime.drain_nif_thread_sends(None),
+        1,
+        "the image decodes and delivers"
+    );
+    let live_index = runtime
+        .atoms()
+        .lookup("thread_made_atom")
+        .expect("the decoder interned the name into the live table");
+    assert!(
+        live_index.raw() as usize >= base_len,
+        "it landed at the live table's own new index ({live_index:?} < {base_len})"
+    );
+    assert_ne!(
+        live_index,
+        Atom::from_raw(private_index),
+        "and that is NOT the private index the foreign thread used"
+    );
+}// ---------------------------------------------------------------------------------------------
 // 3. `enif_send` queues a complete ETF image of the exact message
 // ---------------------------------------------------------------------------------------------
 
@@ -367,7 +376,7 @@ fn a_send_queues_an_image_that_decodes_to_the_exact_message() {
     );
     assert!(
         hub.lookup(LOCAL_NODE).is_some(),
-        "the encoder reserved this node's sysname in the one index space"
+        "the encoder reserved this node's sysname in the private space"
     );
 }
 
@@ -513,11 +522,11 @@ fn a_send_to_a_term_that_names_no_process_answers_false() {
 
 /// A message the codec refuses is the typed `None` (the ABI's `0`), never an image with an invented
 /// identity: nothing is queued. The documented refusal reachable from this crate is an atom the
-/// hub's mirror cannot name (`beam_term::fun::write_fun_local`'s local closure is `unsafe`).
+/// private space cannot name (`beam_term::fun::write_fun_local`'s local closure is `unsafe`).
 #[test]
 fn an_unencodable_message_answers_none() {
     let (hub, sends, mut host) = factory_host(&["base_atom"]);
-    let ghost = make_atom(Atom::from_raw(hub.table_len() as u32 + 1_000));
+    let ghost = make_atom(Atom::from_raw(hub.scratch_table().len() as u32 + 1_000));
     assert_eq!(
         hub.name_of(atom_val(ghost).raw()),
         None,
@@ -723,9 +732,5 @@ fn a_runtime_that_never_installed_answers_zero_from_the_drain() {
         runtime.drain_nif_thread_sends(None),
         0,
         "the fast path answers 0 without taking a lock"
-    );
-    assert!(
-        runtime.foreign_atoms().is_none(),
-        "and no atom-index hub was built for it either"
     );
 }

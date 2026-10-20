@@ -173,8 +173,9 @@ use libc::c_char;
 
 use crate::context::PendingInterner;
 
-/// The **shared atom-index hub**: the one allocator of atom indices once a NIF-created thread (which
-/// is not inside a call) can create atoms — see its own docs for the invariant and the residual.
+/// The **private atom space** of the NIF-created threads: the name→index space a thread that is not
+/// inside a call builds its atoms against, handed to the runtime only **by name** (an encoded ETF
+/// image) — see its own docs.
 pub(crate) mod atoms;
 /// The **process-independent host for NIF-created threads**: the [`NifHost`](beam_abi::NifHost) a
 /// thread a NIF created builds message envs and sends on, plus the factory `beam_abi`'s
@@ -778,13 +779,7 @@ pub(crate) fn resource_term_for(
     obj: *mut core::ffi::c_void,
 ) -> Option<Eterm> {
     let atoms = runtime.code_server.atoms_handle();
-    let mut interner = PendingInterner::new(atoms.len());
-    // The shared atom-index hub, when the runtime has installed one: the mint then reserves through
-    // it instead of predicting `base + offset`, so it can never claim an index a NIF-created thread
-    // has reserved (see [`atoms`]).
-    if let Some(hub) = runtime.foreign_atoms() {
-        interner.adopt_hub(hub);
-    }
+    let interner = PendingInterner::new(atoms.len());
     let heap = Heap::new(runtime.bif_heap_words).ok()?;
     let schedulers = crate::info::schedulers_count(runtime) as i32;
     let mut host = NifHostImpl::new(heap, atoms, interner, owner.to_eterm(), schedulers, None);
@@ -1111,16 +1106,16 @@ impl NifHost for NifHostImpl<'_> {
     ///
     /// A failed decode commits nothing: the novel names are recorded only on the `Ok` path.
     ///
-    /// # The index space must not have moved under the decode
+    /// # The prediction is checked, not assumed
     ///
     /// The decoded term carries the index the **scratch image** assigned each novel name
     /// (`shared.len() + k`), and this hook asks the interner to record that same name so the commit
-    /// lands it exactly there. With the shared atom-index hub installed ([`atoms`]) that prediction is
-    /// no longer trivially exact: a NIF-created thread may reserve the very index between the scratch
-    /// being taken and the record below. The check after each record call turns that (rare) case into
-    /// an honest `None` — the C's `0`, "cannot decode here" — instead of a term whose atom resolves to
-    /// a **different** name. It can also only fire for the first novel name of a decode, because the
-    /// loop stops as soon as the index space has moved.
+    /// lands it exactly there. Nothing else appends to the live table while a call runs (a
+    /// NIF-created thread's atoms live in their own private space — [`atoms`] — and reach the table
+    /// only as names inside a decoded image), so the prediction is exact by construction; the check
+    /// after each record call is the guard that keeps it an honest `None` — the C's `0`, "cannot
+    /// decode here" — rather than a term whose atom resolves to a **different** name if that ever
+    /// stopped holding.
     fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
         // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
         let heap = &mut self.heap;
@@ -1157,9 +1152,8 @@ impl NifHost for NifHostImpl<'_> {
     /// name the image introduces is taken from the per-thread scratch image of the shared table and
     /// recorded on the shared [`PendingInterner`] by `intern` (not `intern_atom` — the base was fixed
     /// at host construction) on the `Ok` path only, so a failed decode commits nothing. As in
-    /// [`NifHost::binary_to_term`], a novel name whose index the interner does not record at the very
-    /// index the scratch assigned it — the shared atom-index hub moving under the decode — is the
-    /// typed `None`, never a term carrying a different atom.
+    /// [`NifHost::binary_to_term`], a novel name the interner does not record at the very index the
+    /// scratch assigned it is the typed `None`, never a term carrying a different atom.
     fn binary_to_term_used(&mut self, bytes: &[u8]) -> Option<(Eterm, usize)> {
         // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
         let heap = &mut self.heap;

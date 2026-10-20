@@ -263,13 +263,6 @@ impl<'a> RuntimeContext<'a> {
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
-        // One atom-index allocator: when the runtime has installed the shared
-        // [`ForeignAtomHub`](crate::nif::atoms::ForeignAtomHub), this call reserves through it
-        // instead of predicting `base + offset`, so a NIF-created thread creating an atom at the same
-        // time can never be handed the index this call also claims.
-        if let Some(hub) = self.runtime.foreign_atoms() {
-            pending.adopt_hub(hub);
-        }
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
@@ -1060,9 +1053,6 @@ impl<'a> RuntimeContext<'a> {
         // The commit route every interning call takes: predict the index, then append in
         // intern order, so the name lands exactly where `pending` already pointed.
         let mut pending = PendingInterner::new(self.runtime.code_server.atoms().len());
-        if let Some(hub) = self.runtime.foreign_atoms() {
-            pending.adopt_hub(hub);
-        }
         pending.intern(name);
         self.runtime.code_server.intern_pending(&pending);
     }
@@ -1481,12 +1471,6 @@ impl<'a> RuntimeContext<'a> {
         }
         let atoms = self.runtime.code_server.atoms_handle();
         let mut interner = PendingInterner::new(atoms.len());
-        // The shared atom-index hub, when installed: a NIF that creates an atom reserves its index
-        // through the one allocator rather than predicting it (see
-        // [`crate::nif::atoms::ForeignAtomHub`]).
-        if let Some(hub) = self.runtime.foreign_atoms() {
-            interner.adopt_hub(hub);
-        }
         // A NIF result is never copied off the pool (see the method docs), so this route grows the
         // frontier but never rewinds it: [`Self::take_bif_frontier`] is what keeps a long table-less
         // run from marching one region to its capacity.
@@ -1509,7 +1493,8 @@ impl<'a> RuntimeContext<'a> {
             // `call_registered` hands its `FunIdentityBridge`.
             caller: self.current_module.as_deref(),
         };
-        let mut host = NifHostImpl::new(            heap,
+        let mut host = NifHostImpl::new(
+            heap,
             Rc::clone(&atoms),
             interner.share(),
             self_pid,

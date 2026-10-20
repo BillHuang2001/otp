@@ -37,16 +37,33 @@
 //! `enif_get_atom`, and `enif_send(NULL, &pid, msg_env, msg)` answers `1` and delivers — waking a
 //! receiver parked in `receive`.
 //!
-//! # The atom index space is the hub's, never a private table
+//! # The atom index space is private to the foreign threads; the handoff is **by name**
 //!
-//! `enif_make_atom` can **create** an atom, and a created atom must carry a real index in the
-//! runtime's one live `AtomTable`: a private table would hand a NIF a **wrong term**, which is
-//! forbidden ([`atoms`](super::atoms)' module docs carry the full argument). Every name therefore
-//! goes through the crate's one index allocator, [`ForeignAtomHub`]: [`ForeignHost::intern_atom`]
-//! **reserves** an index (the code server commits reservations at its next table touch) and
-//! [`ForeignHost::atom_name`]/[`ForeignHost::existing_atom`] read the hub's mirror of the same
-//! space.
+//! `enif_make_atom` can **create** an atom, and a NIF-created thread is not inside a NIF call, so it
+//! cannot use the call path's predicted-index interner. What it uses instead is
+//! [`ForeignAtomHub`] — a **private** name→index space, owned by the factory and shared by every host
+//! it opens ([`atoms`](super::atoms)' module docs carry the full argument). [`ForeignHost::intern_atom`]
+//! reserves an index there, and [`ForeignHost::atom_name`]/[`ForeignHost::existing_atom`] read that
+//! same space, so a thread can create an atom and read it back without ever touching the runtime's
+//! live table.
 //!
+//! A private index is **never** a live index. Nothing built on such a thread reaches the runtime as a
+//! term: the one crossing is [`NifHost::send`], which encodes the message as a complete ETF image **by
+//! atom name** against the hub's scratch table, and the runtime decodes that image against its own
+//! live table, interning the names itself. So an atom a foreign thread creates enters the live table
+//! exactly when a decoded image carries it — and only then. Reserving indices in the live table's own
+//! index space (the earlier design) was unsound: the reservation was a claim on an index the
+//! runtime's own appenders could reach first, and the reconciliation that followed re-anchored an
+//! index a term already carried, so a live `Atom` could end up naming a *different* atom than the one
+//! it was built for.
+//!
+//! The boundary that follows: a term built on a foreign host belongs to that host (its atoms carry
+//! private indices, so `beam_term`'s index equality would compare them against live atoms wrongly).
+//! It may be read back there and sent from there — which is what [`NifHost::send`] does — and must
+//! never be handed to the runtime's own term machinery. The mix that could smuggle one in is
+//! `enif_send` issued from a **call-path** env carrying a term built on a **foreign** host: the call
+//! host encodes against the live table, where a private index names no live atom, so that encode is
+//! the typed refusal (never a substituted atom).//!
 //! # The one deliberate substitution: a queued ETF image, not a synchronous delivery
 //!
 //! The C's `enif_send` from a thread with no calling process delivers **synchronously inside the
@@ -69,16 +86,15 @@
 //! *runtime's* heaps and against the runtime's one atom table.
 //!
 //! A term built on a NIF-created thread is not: it lives on that thread's own heap and carries atom
-//! **indices** from the hub's (predictive) mirror of the live index space. Handing those words to
-//! the runtime verbatim would hand it a foreign heap (already unsound — the heap may be freed while
-//! the runtime reads it) and, worse, an atom index whose name the live table may not yet have
-//! committed. An **External Term Format image** is the one representation that crosses that boundary
-//! by *name*: it is encoded against the hub's scratch table (a dense `AtomTable` whose `0..n` names
-//! are exactly the hub's), and the runtime decodes it into its own heap against its own live table
-//! (installing the same local-node identity, so a message carrying one of this node's pids/ports/
-//! references still decodes to the internal id). The copy is the cost of crossing the thread
-//! boundary safely, and it is why [`ForeignHost::send`] needs the message to be *encodable*.
-//!
+//! **indices** from the hub's *private* space. Handing those words to the runtime verbatim would hand
+//! it a foreign heap (already unsound — the heap may be freed while the runtime reads it) and, worse,
+//! an atom index that names nothing in the runtime's live table. An **External Term Format image** is
+//! the one representation that crosses that boundary by *name*: it is encoded against the hub's
+//! scratch table (a dense `AtomTable` whose `0..n` names are exactly the hub's), and the runtime
+//! decodes it into its own heap against its own live table (installing the same local-node identity,
+//! so a message carrying one of this node's pids/ports/references still decodes to the internal id).
+//! The copy is the cost of crossing the thread boundary safely, and it is why [`ForeignHost::send`]
+//! needs the message to be *encodable*.//!
 //! # Ownership, lifetime and threading
 //!
 //! * [`ThreadEnvFactory`] is `Send + Sync + 'static` (the ABI seam's requirement — it lives in a
@@ -113,10 +129,10 @@
 //!   calling process, which is what `None` means on a call host.
 //! * **`atom_table` stays at the trait default `None`.** The env-less `enif_compare`/
 //!   `enif_is_identical`/`enif_hash` therefore order a *nested* atom by its **raw index** instead of
-//!   by name on this thread (`beam_term::compare`'s documented fallback). The hub's mirror could
-//!   serve a name, but it is a *predicted* view (`AtomTable` is not behind a lock here) and this
-//!   host must not hand `beam_term` a table the runtime may be appending to.
-//! * **`select`, monitors, liveness, `whereis_pid`, `make_ref`, `unique_integer`, `system_info`,
+//!   by name on this thread (`beam_term::compare`'s documented fallback). The hub could serve a name
+//!   through its scratch table, but that table is a *snapshot* of a space other threads of this
+//!   factory may be appending to, and this host must not hand `beam_term` a view that a concurrent
+//!   reservation could move past.//! * **`select`, monitors, liveness, `whereis_pid`, `make_ref`, `unique_integer`, `system_info`,
 //!   `term_to_binary`/`binary_to_term`, `port_command`, `priv_data`,
 //!   `dynamic_resource_call`/`consume_timeslice`/`nif_schedule`** keep their trait defaults: every
 //!   one of them needs the runtime's process table, poller, reference space or code server, which
@@ -132,8 +148,10 @@
 //!   identity lives in the loaded module, which this host cannot reach), so the send is the typed
 //!   `None` — the ABI's `0` — rather than an image with an invented identity. The same holds for any
 //!   other tag the codec refuses.
-//! * **An atom the hub's mirror does not know** (one the runtime interned without a subsequent hub
-//!   sync) is unnameable, so an image containing it is the typed `None` rather than a wrong name.
+//! * **An atom the private space does not know** — one no foreign thread ever created, and which no
+//!   image carried into this space — is unnameable, so an image containing it is the typed `None`
+//!   rather than a wrong name. (A term built with such an atom cannot arise on this host: every atom
+//!   here was created through [`ForeignAtomHub::reserve`].)
 
 use core::ffi::c_int;
 use std::sync::{Arc, Mutex};
@@ -171,9 +189,9 @@ pub(crate) struct ForeignSend {
     /// case for a NIF-created thread.
     pub(crate) from: Option<ProcessId>,
     /// The message as a **complete** External Term Format image: the leading `VERSION_MAGIC` (`131`)
-    /// included, as `erlang:term_to_binary/1` writes it, encoded against the hub's index space with
-    /// this node's local identity installed (so an internal pid/port/reference inside it has a wire
-    /// image).
+    /// included, as `erlang:term_to_binary/1` writes it, encoded against the hub's private atom space
+    /// (so every atom is written by **name**) with this node's local identity installed (so an
+    /// internal pid/port/reference inside it has a wire image).
     pub(crate) image: Vec<u8>,
 }
 
@@ -190,8 +208,9 @@ pub(crate) type ForeignSends = Arc<Mutex<Vec<ForeignSend>>>;
 /// there is one of these per thread that touches the seam. See the module docs for the ownership
 /// rules, the substitution and the typed gaps.
 pub(crate) struct ForeignHost {
-    /// The one atom-index allocator: every name this host creates or reads goes through it, so the
-    /// indices it hands a NIF are real live indices (see [`ForeignAtomHub`]).
+    /// The foreign threads' one **private** atom space: every name this host creates or reads goes
+    /// through it, so the indices it hands a NIF are this space's own — never the live table's (see
+    /// [`ForeignAtomHub`]).
     hub: Arc<ForeignAtomHub>,
     /// The queue an `enif_send` pushes onto — drained by the runtime, not by this thread.
     sends: ForeignSends,
@@ -216,9 +235,10 @@ impl ForeignHost {
     /// Two steps, in this order:
     ///
     /// 1. **Reserve the node name first.** [`ForeignAtomHub::scratch_table`] is a cached image
-    ///    stamped by the hub's length, so a reservation made *after* the image was taken would not be
-    ///    in it and the encoder could not render the sysname atom. Reserving is idempotent (an
-    ///    existing name keeps its index) and lands in the one index space.
+    ///    stamped by the space's length, so a reservation made *after* the image was taken would not
+    ///    be in it and the encoder could not render the sysname atom. Reserving is idempotent (an
+    ///    existing name keeps its index) and lands in the private space, which is where the encoder
+    ///    reads names from.
     /// 2. **Encode** with [`Encoder::new`] (which writes `VERSION_MAGIC`, i.e. exactly
     ///    `term_to_binary/1`'s shape) and the local-node identity installed, so an internal
     ///    pid/port/reference is encodable and decodes back to the same internal id.
@@ -241,20 +261,22 @@ impl NifHost for ForeignHost {
         &mut self.heap
     }
 
-    /// Intern `name`: **reserve** its index in the one live index space.
+    /// Intern `name`: its index in the foreign threads' **private** atom space.
     ///
-    /// Never `None`: a reservation always answers an index (an existing name keeps its own). The
-    /// name becomes visible to the rest of the runtime when the code server next commits the hub's
-    /// reservations ([`ForeignAtomHub::sync`], called at `atoms_mut`/`intern_pending` entry), and it is
-    /// nameable here immediately ([`NifHost::atom_name`]).
+    /// Never `None`: a reservation always answers an index (an existing name keeps its own). The name
+    /// is nameable here immediately ([`NifHost::atom_name`]) and — because it is a *private* index, not
+    /// a live one — it becomes visible to the rest of the runtime only through a decoded ETF image
+    /// carrying that name, which the runtime's own append path interns.
     fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
         Some(make_atom(Atom::from_raw(self.hub.reserve(name))))
     }
 
-    /// The text of `atom`, or `None` for a non-atom term or an index the hub does not know.
+    /// The text of `atom`, or `None` for a non-atom term or an index this private space does not
+    /// know.
     ///
-    /// The hub's mirror covers the committed prefix **and** the reservation tail, which is what lets
-    /// a thread read back its own just-created atom without touching (or locking) the live table.
+    /// The space holds every name a thread of this factory created, which is what lets a thread read
+    /// back its own just-created atom (and one an earlier thread created) without touching — or
+    /// locking — the runtime's live table.
     fn atom_name(&mut self, atom: Eterm) -> Option<String> {
         if !is_atom(atom) {
             return None;
@@ -264,8 +286,10 @@ impl NifHost for ForeignHost {
 
     /// The atom `name`, **without** creating it (C `enif_make_existing_atom`).
     ///
-    /// `None` for a name neither the hub's mirror nor a standing reservation holds — never a
-    /// fabricated index.
+    /// `None` for a name this private space does not hold — never a fabricated index. (A private
+    /// space knows only what its own threads created, where the C reads the one global table, so this
+    /// can under-answer for an atom the runtime interned elsewhere; `beam_abi`'s per-env atom record
+    /// covers a name interned earlier in the same env.)
     fn existing_atom(&mut self, name: &str) -> Option<Eterm> {
         self.hub
             .lookup(name)
@@ -409,7 +433,7 @@ impl NifHost for ForeignHost {
 ///
 /// The **node name** is kept here (as a shared `Arc<str>`) rather than resolved to an `Atom` once:
 /// an atom index is only meaningful against the table that handed it out, and a foreign thread
-/// encodes against the hub's mirror, so the name is resolved through the hub at encode time.
+/// encodes against the hub's private space, so the name is resolved through the hub at encode time.
 pub(crate) struct ThreadEnvFactory {
     /// The one atom-index allocator, shared with every host this factory opens.
     hub: Arc<ForeignAtomHub>,
@@ -424,10 +448,10 @@ pub(crate) struct ThreadEnvFactory {
 impl ThreadEnvFactory {
     /// Build the factory the runtime installs.
     ///
-    /// `hub` is the runtime's one atom-index hub ([`ForeignAtomHub::new`] over the live table),
-    /// `sends` the queue the runtime drains at its next pump, and `node`/`creation` this node's
-    /// identity as [`beam_codec::Encoder::with_local_node`] wants it — the name here, the creation
-    /// verbatim.
+    /// `hub` is the foreign threads' **private** atom space ([`ForeignAtomHub::new`] — empty, and
+    /// holding no reference to the live table), `sends` the queue the runtime drains at its next pump,
+    /// and `node`/`creation` this node's identity as [`beam_codec::Encoder::with_local_node`] wants it
+    /// — the name here, the creation verbatim.
     pub(crate) fn new(
         hub: Arc<ForeignAtomHub>,
         sends: ForeignSends,

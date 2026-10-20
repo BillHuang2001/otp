@@ -1475,47 +1475,6 @@ impl Runtime {
         self.code_server.atoms()
     }
 
-    /// Install the **shared atom-index hub** for off-call atom creation (contract A.3).
-    ///
-    /// # What it is for
-    ///
-    /// `enif_alloc_env` on a thread a NIF created (`enif_thread_create`) reaches a host through
-    /// `beam_abi`'s thread-env host factory, and that host's `enif_make_atom` must intern into this
-    /// runtime's **one live** atom table at a real index. A foreign thread is not inside a NIF call, so
-    /// it cannot use the per-call predicted-index interner. This installs the one allocator that thread
-    /// and the call path share ([`ForeignAtomHub`]): the hub mirrors the live table's index space,
-    /// hands out reservations from its tail, and the code server drains them into the table at the
-    /// entry of every mutating atom path.
-    ///
-    /// # Idempotence and re-installation
-    ///
-    /// Install once (a host that installs a NIF thread-env factory calls this first). A later call
-    /// builds a **fresh** hub from the table as it stands then — safe, because a hub carries no state
-    /// the table does not (the reservations of the superseded hub are drained into the table by
-    /// [`CodeServer::attach_foreign_atoms`], so nothing is lost) — and a caller that wants a stable
-    /// handle should hold the one [`Runtime::foreign_atoms`] answers rather than re-install.
-    ///
-    /// # Cost
-    ///
-    /// Building the mirror is `O(table)`: one owned name per live atom. That is why it is **not** done
-    /// in [`Runtime::new`] — a runtime whose host never runs a NIF thread (the whole differential gate,
-    /// every benchmark leg) pays nothing at all.
-    pub fn install_foreign_atom_hub(&mut self) {
-        let hub = ForeignAtomHub::new(self.code_server.atoms());
-        self.code_server.attach_foreign_atoms(hub);
-    }
-
-    /// The installed shared atom-index hub, if any — the cheap `Arc` clone a foreign thread (or a
-    /// per-call [`PendingInterner`](crate::context::PendingInterner)) adopts.
-    ///
-    /// The hub has exactly **one** owner, the [`CodeServer`]: it is the only place the live atom table
-    /// grows, so it is the only place a reservation can become real, and a second handle here could
-    /// drift out of step with it (a runtime accessor answering `None` while the code server drains a
-    /// hub, or the reverse). This asks the owner.
-    pub(crate) fn foreign_atoms(&self) -> Option<Arc<ForeignAtomHub>> {
-        self.code_server.foreign_atoms()
-    }
-
     /// Install `beam_abi`'s **process-global thread-env host factory** for this runtime, so a
     /// thread a NIF created (`enif_thread_create`) can obtain a real [`NifHost`] — and therefore a
     /// real message env, a creatable atom and a deliverable `enif_send` — instead of the C's
@@ -1528,8 +1487,8 @@ impl Runtime {
     /// fills that slot is entirely up to the host, because only the host knows where the atoms a
     /// foreign thread creates must land and how a thread-safe send becomes a mailbox delivery. This
     /// method is that decision for `beam_rt`: the factory it installs is
-    /// `ThreadEnvFactory` (in `crate::nif::thread_env`), whose hosts intern through
-    /// this runtime's one atom-index hub and whose `enif_send` queues a complete ETF image for
+    /// `ThreadEnvFactory` (in `crate::nif::thread_env`), whose hosts intern into a **private** atom
+    /// space of their own and whose `enif_send` queues a complete ETF image for
     /// `Runtime::drain_nif_thread_sends`.
     ///
     /// A runtime that never installs it keeps the **honest old answer**: a NIF-created thread gets
@@ -1537,14 +1496,21 @@ impl Runtime {
     /// an atom index this runtime does not hold, which is a *wrong term*, and a fabricated delivery
     /// would be a lie about a message that never arrived.
     ///
-    /// # The atom index space is installed first
+    /// # The atom space is the foreign threads' own
     ///
-    /// A factory's hosts **create** atoms (`enif_make_atom`), so they must draw from the one live
-    /// index space. [`Runtime::install_foreign_atom_hub`] is therefore called first when no hub is
-    /// attached, and the very hub it attached is the one handed to the factory — installing a
-    /// factory over a private index space is exactly the wrong-term failure this method exists to
-    /// avoid, so a hub that cannot be reached makes the install **decline** (`false`) rather than
-    /// proceed.
+    /// A factory's hosts **create** atoms (`enif_make_atom`), so they need somewhere to allocate
+    /// indices. That somewhere is a [`ForeignAtomHub`] built here — a **private** name→index space
+    /// with no reference to the live table at all. Reserving indices in the live table's own index
+    /// space (the earlier design) was unsound: a reservation was a claim on an index the runtime's own
+    /// appenders could reach first, and reconciling the two re-anchored an index a term already
+    /// carried, so a live `Atom` could end up naming a *different* atom than the one it was built for.
+    /// A private space cannot corrupt the live table because it never touches it.
+    ///
+    /// The handoff is **by name**: every term that leaves such a host is an ETF image encoded by atom
+    /// name ([`ForeignHost::encode_image`](crate::nif::thread_env::ForeignHost)), and
+    /// [`Runtime::drain_nif_thread_sends`] decodes it against the live table, which interns the names
+    /// itself. An atom a foreign thread created is therefore in the live table exactly when a decoded
+    /// image carried it there, and a foreign index is never a live index.
     ///
     /// # The node identity the images carry
     ///
@@ -1565,14 +1531,11 @@ impl Runtime {
     /// factory and hands this runtime a **fresh** queue, which is why the crate's own test suites
     /// serialise installs with `crate::runtime::lock_nif_thread_env`.
     pub fn install_nif_thread_env(&mut self) -> bool {
-        if self.foreign_atoms().is_none() {
-            self.install_foreign_atom_hub();
-        }
-        let Some(hub) = self.foreign_atoms() else {
-            // Unreachable (`install_foreign_atom_hub` always attaches one), and deliberately not
-            // an assert: a factory over a private index space would hand a NIF a wrong atom index.
-            return false;
-        };
+        // The foreign threads' own atom space — private, empty, and never the live table's (see the
+        // docs above). A fresh one per install: the factory is last-install-wins, so the superseded
+        // factory's space goes with it, and a name it had created reaches this runtime's live table
+        // only through an image already decoded.
+        let hub = ForeignAtomHub::new();
         // The node identity, read from the runtime's one source of truth (see the docs above).
         let node = match self.atoms().name(self.local_node()) {
             Some(name) => name.to_string(),
@@ -1702,9 +1665,10 @@ impl Runtime {
     /// # What each message costs and what "skipped" means
     ///
     /// The image is a **complete ETF image** (leading `131`), so it is decoded onto a fresh scratch
-    /// [`Heap`] against the **live** atom table — [`CodeServer::atoms_mut`], which also commits the
-    /// hub's outstanding reservations, so an atom a foreign thread created is in the table before a
-    /// message naming it is read — with the local-node identity installed
+    /// [`Heap`] against the **live** atom table — [`CodeServer::atoms_mut`], which interns every atom
+    /// name the image spells, so an atom a foreign thread created is in the table before a message
+    /// naming it is read (the handoff from that thread's private space is **by name**, never by
+    /// index) — with the local-node identity installed
     /// ([`beam_codec::Decoder::with_local_node`] at [`Runtime::local_node`]/[`Runtime::node_creation`]),
     /// i.e. the exact inverse of what `ForeignHost::encode_image` wrote: a local-node
     /// `NEW_PID_EXT`/`V4_PORT_EXT`/reference in the image demotes back to the internal id. The
@@ -1797,9 +1761,10 @@ impl Runtime {
         };
         let node = self.local_node();
         let creation = self.node_creation();
-        // The decode runs against the runtime's **live** atom table (which also commits the hub's
-        // outstanding reservations first — see the drain's docs); the identity installed is the one
-        // the encoder wrote, so a local-node identifier in the image demotes to the internal id.
+        // The decode runs against the runtime's **live** atom table (which interns every name the
+        // image spells — the foreign host's handoff is by name, see the drain's docs); the identity
+        // installed is the one the encoder wrote, so a local-node identifier demotes to the internal
+        // id.
         let Ok(msg) = beam_codec::decode_term_with_local_node(
             &image,
             &mut heap,
