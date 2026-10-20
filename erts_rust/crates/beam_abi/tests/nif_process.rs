@@ -38,7 +38,8 @@
 //! The twelve functions are driven through [`NifHost`]. `common::TestHost` only implements
 //! heap/atoms, so this file defines its own [`ProcHost`]: in-memory pid/port/registered-name tables,
 //! a `sent`/`port_cmds` log, monitor bookkeeping that hands out real **internal references** (the
-//! 3-word block the C stores in an `ErlNifMonitor`), and a `schedule_nif` that records the request.
+//! 3-word block the C stores in an `ErlNifMonitor`), and a `schedule_nif` override whose (empty)
+//! log proves the legacy hook is never consulted: `enif_schedule_nif` runs its continuation itself.
 //! It is the same shape as the unit tests' `ProcHost` in `src/nif/enif/process_tests.rs`, lifted to
 //! the integration level so the C ABI — not the Rust API — is what gets exercised.
 //!
@@ -93,7 +94,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use beam_abi::common::ERL_DIRTY_JOB_CPU_BOUND;
 use beam_abi::nif::enif::enif_api_table;
 use beam_abi::nif::loader::{load, NifCallError, NifLoadError};
 use beam_abi::{NifEnv, NifHost};
@@ -710,21 +710,22 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     assert_eq!(tuple_elements(wrong_kind), Some(vec![make_small(0), undefined]));
 
     // --- enif_schedule_nif (through `reschedule/1` + the real `do_work/1` entry point) ------------
-    // ORACLE: `reschedule(7) -> {dirty,7}` — the scheduled call really ran with the caller's argv.
-    // Here the host is the runtime: it records the request and supplies the term.
-    let scheduled = host.atom("scheduled");
-    assert_eq!(
-        lib.call(&mut env, "reschedule", 1, &[make_small(7)])
-            .expect("reschedule/1"),
-        scheduled
-    );
-    assert_eq!(
-        host.scheduled,
-        vec![("do_work".to_string(), ERL_DIRTY_JOB_CPU_BOUND, 1)],
-        "the name, the dirty-job flag and the argument count reach the host"
-    );
-    // ORACLE: `do_work(7) -> {dirty,7}`.
+    // ORACLE: `reschedule(7) -> {dirty,7}` — the scheduled call really ran with the caller's argv,
+    // so the trampoline ran the continuation in-crate. `ProcHost` overrides the legacy
+    // `NifHost::schedule_nif` hook, so the empty log proves the hook is no longer consulted.
     let dirty = host.atom("dirty");
+    assert_eq!(
+        tuple_elements(
+            lib.call(&mut env, "reschedule", 1, &[make_small(7)])
+                .expect("reschedule/1")
+        ),
+        Some(vec![dirty, make_small(7)])
+    );
+    assert!(
+        host.scheduled.is_empty(),
+        "the legacy `NifHost::schedule_nif` hook is never consulted"
+    );
+    // ORACLE: `do_work(7) -> {dirty,7}` — the continuation is an ordinary exported NIF too.
     assert_eq!(
         tuple_elements(lib.call(&mut env, "do_work", 1, &[make_small(7)]).expect("do_work/1")),
         Some(vec![dirty, make_small(7)])
