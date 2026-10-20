@@ -234,7 +234,9 @@ impl Collector {
     /// half-forwarded.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
-    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
+    /// [collapsed](crate::nursery::Nursery::collapse) back to one space, sized from the **young
+    /// live set** the round evacuated — its copy volume
+    /// ([`HeapPolicy::young_after_collection`]).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let needed = self.nursery().used_words();
         if self.mature.available_words() < needed {
@@ -248,28 +250,26 @@ impl Collector {
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.minor_collections += 1;
-        // The nursery is empty again: size it from the **whole-heap live set** the collection
-        // kept (`HeapPolicy::young_after_collection`). A minor promotes every live young word
-        // into the mature space, so the mature space's occupancy *is* the whole-heap live set
-        // the round measured — the quantity the nursery amortizes its copies against, and the
-        // one quantity that does not follow the nursery's own capacity. It over-estimates by the
-        // mature garbage the minors since the last fullsweep promoted, which is why this rule
-        // only ever keeps or shrinks: the growth decision belongs to the fullsweep, which
-        // measures the live set exactly.
+        // The nursery is empty again: size it from the **young live set** this round evacuated —
+        // the words it copied (`HeapPolicy::young_after_collection`). A minor's copy volume *is*
+        // its young live set, and that is the only quantity the round measured; the mature
+        // space's occupancy is not it, because a minor never copies the mature generation (only
+        // a fullsweep does), so it carries the garbage the minors since the last fullsweep
+        // promoted and would inflate the target until the capacity tracked the run's total
+        // allocation instead of the live set.
         if std::env::var_os("BEAM_GC_TRACE").is_some() {
             eprintln!(
-                "TRACE minor: capacity={} young_used={} young_live_copied={} mature_used={} \
-                 target(young_live)={} target(mature)={}",
+                "TRACE minor: capacity={} young_used={} young_live_copied={} minor_target={} \
+                 floor={} mature_used={}",
                 self.nursery.capacity_words(),
                 needed,
                 stats.words_copied,
+                self.policy.young_minor_target_words(stats.words_copied),
+                self.policy.nursery_floor_words(),
                 self.mature.used_words(),
-                self.policy.young_target_words(stats.words_copied),
-                self.policy.young_target_words(self.mature.used_words()),
             );
         }
-        self.nursery
-            .collapse(&self.policy, self.mature.used_words())?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
 
@@ -311,8 +311,8 @@ impl Collector {
         // space has to be able to receive a whole nursery's worth of promotion after the
         // fullsweep, otherwise the very next collection cannot be a minor and every
         // collection escalates to a fullsweep — the generational cadence never runs. It is
-        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`]
-        // keeps bounded, so including it still converges.
+        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`] always
+        // installs onto a target derived from the live set, so including it still converges.
         let live = crate::live::live(&from, roots).words;
         let young_occupancy = self.nursery.used_words();
         // Grow, shrink or keep the current mature capacity

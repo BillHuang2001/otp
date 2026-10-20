@@ -108,7 +108,7 @@ use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
 use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
 use crate::nursery::Nursery;
-use crate::policy::{HeapPolicy, YOUNG_SHRINK_FACTOR};
+use crate::policy::HeapPolicy;
 use crate::reachable::ReachableObject;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
@@ -611,25 +611,15 @@ impl GenImmixCollector {
         // a minor's reclamation.
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
         self.minor_since_major += 1;
-        // Size the nursery from the **whole-heap live set** the promotion left in the mature
-        // region — the same input the copying collector's minor feeds
-        // (`HeapPolicy::young_after_collection`; a minor keeps or shrinks, the fullsweep grows).
-        //
-        // The mark-region space's occupancy is **line-granular** (`used_lines() * LINE_WORDS`),
-        // so it is an upper bound on the live words: exact for objects that fill their lines, up
-        // to `LINE_WORDS` times too large for one small object. An over-estimate is the safe
-        // direction for a *keep-or-shrink* rule (it can only postpone a shrink), so the cheap
-        // figure is used as it is; when the shrink gate does fire, the live set is re-measured
-        // exactly so the collector gives back the same capacity the copying collector would
-        // rather than the line-rounded one.
-        let upper = self.mature.used_words();
-        let target = self.policy.young_target_words(upper);
-        let live = if self.nursery.capacity_words() > YOUNG_SHRINK_FACTOR.saturating_mul(target) {
-            crate::live::live_full(&self.nursery, &self.mature, roots).words
-        } else {
-            upper
-        };
-        self.nursery.collapse(&self.policy, live)?;
+        // Size the nursery from the words this minor **promoted** — its young live set — which
+        // is exactly the figure the copying collector feeds the same seam
+        // (`HeapPolicy::young_after_collection`). Both strategies therefore size the nursery from
+        // one identical, exact quantity, which is what keeps their collapsed capacities in
+        // lockstep for the same live set. The mark-region mature occupancy is deliberately not
+        // used: it is line-granular (`used_lines() * LINE_WORDS`, up to `LINE_WORDS` too large for
+        // one small object) and it holds the garbage the minors since the last fullsweep
+        // promoted.
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(PromoteOutcome::Done(stats))
     }
     /// Reclaims the mature generation in place, then promotes the nursery into it.
@@ -658,7 +648,8 @@ impl GenImmixCollector {
         // (the graphs the minors promoted and the next round's roots replaced), so using it
         // would make the policy's `should_grow` fire on every fullsweep and creep the region
         // up without bound (see [`crate::live`]). The young occupancy is bounded by the
-        // nursery capacity, which `young_after_collection` keeps bounded.
+        // nursery capacity, which `young_after_collection` always installs onto a target
+        // derived from the live set.
         let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let young_occupancy = self.nursery.used_words();

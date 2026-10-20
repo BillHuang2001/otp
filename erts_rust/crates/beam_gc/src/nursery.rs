@@ -45,8 +45,13 @@
 //!   whenever that already enlarges the space, and only falls back to at least a **doubling**
 //!   when the one-step target would install a space no larger than the one it replaces, so a
 //!   growth loop that keeps enlarging an equally-full space climbs the growth table
-//!   geometrically: the chain is `O(log(heap))` long instead of gaining one ≈same-size space
-//!   per call.
+//!   geometrically instead of gaining one ≈same-size space per call. Once the nursery has
+//!   **collected**, it also remembers the live-set target that collection derived and caps every
+//!   fresh space at `max(one_step, live_target)` (`live_target_words`), so the growth seam cannot
+//!   install a capacity the next collection would have to give back. A fresh nursery — no
+//!   measured live set yet — still climbs the growth table. Either way the retained chain is
+//!   `O(requirement)`, its summed capacity bounded by the requests that built it, and the next
+//!   collection drops it.
 //! * **The chain's *summed* capacity obeys the ceiling.** [`capacity_words`](Nursery::capacity_words)
 //!   is what `HeapPolicy::max_heap_words` bounds — a fresh space may only claim the budget the
 //!   chain has left, so `capacity_words() <= max_heap_words` after every successful growth. A
@@ -144,6 +149,18 @@ pub(crate) struct Nursery {
     /// `min(bases) .. max(limits)`, so [`bounds`](Nursery::bounds) answers precisely the union's
     /// bounding interval — no accumulated slack from earlier, since-dropped spaces.
     extent: ScannedBounds,
+    /// The nursery capacity the policy derived for the live set the **last collection** of this
+    /// chain measured: the young live set's target after a minor
+    /// ([`HeapPolicy::young_minor_target_words`]) or the whole live set's after a fullsweep
+    /// ([`HeapPolicy::young_target_words`]).
+    ///
+    /// `None` until the first collection: a fresh nursery has no measured live set, so its
+    /// growths keep the plain curated rule. The growth seam has no live set of its own —
+    /// [`grow`](Nursery::grow) only knows a request — so without this bound it could install a
+    /// space the very next collection gives back; the remembered target caps every fresh space at
+    /// `max(one_step, live_target)`, which bounds the installed capacity by the same rule the
+    /// collection applies while still granting a genuinely large request its own `one_step` size.
+    live_target_words: Option<usize>,
 }
 
 impl Nursery {
@@ -157,6 +174,7 @@ impl Nursery {
             retired: Vec::new(),
             retired_regions: BTreeMap::new(),
             extent,
+            live_target_words: None,
         })
     }
 
@@ -277,9 +295,14 @@ impl Nursery {
     ///    Only when the one-step target would install a space **no larger than the one it
     ///    replaces** does the rule take at least a **doubling**
     ///    (`policy.next_words(2 * capacity, 0)`), so a growth loop that keeps enlarging an
-    ///    equally-full space climbs the growth table geometrically and the chain of retired
-    ///    spaces stays `O(log(heap))` long, instead of gaining one ≈same-size space — and one
-    ///    whole retained capacity — per call. Every size is bounded by
+    ///    equally-full space climbs the growth table geometrically, instead of gaining one
+    ///    ≈same-size space — and one whole retained capacity — per call. A nursery that has
+    ///    **collected** then caps the result at `max(one_step, live_target)` (its remembered
+    ///    live-set target, `live_target_words`): the growth seam has no live set of its own, so it
+    ///    must not install a space the next collection would have to give back. The bound can
+    ///    neither refuse a request that fits (`one_step >= need_words`) nor install a space
+    ///    smaller than the current one, and it still grants a genuinely large request its own
+    ///    `one_step` size. Every size is bounded by
     ///    [`min_heap_words`](HeapPolicy::min_heap_words) through
     ///    [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
     /// 4. **Refuse.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
@@ -322,7 +345,7 @@ impl Nursery {
         // The plain next-size rule, floored by the capacity it must not undercut.
         let one_step = policy.next_words(need_words, 0).max(capacity);
         // Only a request that would hand back a space no larger than the one it replaces
-        // needs the doubling: it is what bounds the chain logarithmically.
+        // needs the doubling.
         let mut target = if one_step > capacity {
             one_step
         } else {
@@ -330,6 +353,13 @@ impl Nursery {
                 .next_words(capacity.saturating_mul(2), 0)
                 .max(one_step)
         };
+        // A nursery that has collected knows the live set's target, so its growths are bounded by
+        // it: the seam has no live set of its own, and a space larger than that target is one the
+        // next collection would immediately give back. `one_step` (>= the request, >= the current
+        // capacity) keeps the bound from ever refusing a fitting request or shrinking the space.
+        if let Some(live_target) = self.live_target_words {
+            target = target.min(one_step.max(live_target));
+        }
         if target < need_words {
             return Err(heap_exhausted(need_words));
         }
@@ -414,28 +444,29 @@ impl Nursery {
     /// It drops the retired spaces (and their containment index) and re-sizes the single
     /// remaining current space from the heap-size policy
     /// ([`HeapPolicy::young_after_collection`]) over the capacity the chain held when it was
-    /// collected, where `demand_words` is what the round measured: for a minor the words it
-    /// **promoted** (which is what it left alive in the young generation). The space is only
-    /// replaced when the target differs; otherwise its bump pointer is merely rewound.
+    /// collected, where `live_words` is what the round measured: the words it **promoted**
+    /// (which is what it left alive in the young generation). The space is only replaced when
+    /// the target differs; otherwise its bump pointer is merely rewound.
     ///
     /// A **fullsweep** passes the post-copy live set as well and therefore calls
     /// [`collapse_after_fullsweep`](Nursery::collapse_after_fullsweep) — the C applies a
     /// second, post-copy sizing rule to a fullsweep (`erl_gc.c:2062-2098`) that a minor never
     /// reaches.
     ///
-    /// # A minor keeps or shrinks; it never grows
+    /// # The minor seam
     ///
-    /// [`HeapPolicy::young_after_collection`] has no growth branch, so **`collapse` never
-    /// grows the nursery**: the post-collection capacity is at most the pre-collection
-    /// capacity, and a collection that finds the nursery grossly over-sized for the live set
-    /// gives the memory back. Growth is decided where the live set is measured exactly — a
-    /// [fullsweep](Nursery::collapse_after_fullsweep) — or by the explicit, request-driven
-    /// [`grow`](Nursery::grow) seam; a fixed live set therefore converges to a constant
-    /// capacity instead of climbing one growth-table step per collection.
+    /// [`HeapPolicy::young_after_collection`] installs the live set's target whenever the capacity
+    /// is below it or far above it, so `collapse` both grows a nursery that was too small for
+    /// what the round promoted and shrinks one a dead burst over-sized. Both branches land on a
+    /// capacity derived from the **live set**, so a fixed live set converges to a constant
+    /// capacity instead of climbing one growth-table step per collection. The target is
+    /// remembered ([`live_target_words`](Nursery::live_target_words)) so the growth seam
+    /// ([`grow`](Nursery::grow)) is bounded by it too.
     pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
         let collected_capacity = self.capacity_words();
         let target = policy.young_after_collection(collected_capacity, live_words);
-        self.install_collapsed(target)
+        let live_target = policy.young_minor_target_words(live_words);
+        self.install_collapsed(target, live_target)
     }
 
     /// Collapses the chain after a **fullsweep**, sizing the nursery from the **whole-heap live
@@ -446,7 +477,8 @@ impl Nursery {
     /// nursery to the reserve floor every round. A fullsweep therefore **may enlarge** the
     /// nursery — it is the one collection that measures the live set exactly, so it is where the
     /// growth decision belongs — and it shrinks a nursery the live set has outgrown back
-    /// towards the target.
+    /// towards the target. That whole-heap target is also what the growth seam is bounded by
+    /// afterwards ([`live_target_words`](Nursery::live_target_words)).
     pub(crate) fn collapse_after_fullsweep(
         &mut self,
         policy: &HeapPolicy,
@@ -454,12 +486,14 @@ impl Nursery {
     ) -> Result<()> {
         let collected_capacity = self.capacity_words();
         let target = policy.young_after_fullsweep(collected_capacity, live_words);
-        self.install_collapsed(target)
+        let live_target = policy.young_target_words(live_words);
+        self.install_collapsed(target, live_target)
     }
 
     /// The shared body of the two collapse seams: install (or rewind to) a single space of
-    /// `target` words, drop the retired chain, and re-seed the aggregate extent.
-    fn install_collapsed(&mut self, target: usize) -> Result<()> {
+    /// `target` words, drop the retired chain, re-seed the aggregate extent and remember the
+    /// `live_target` this round derived for the growth seam.
+    fn install_collapsed(&mut self, target: usize, live_target: usize) -> Result<()> {
         self.retired.clear();
         self.retired_regions.clear();
         if self.current.capacity_words() == target {
@@ -468,6 +502,7 @@ impl Nursery {
             let alloc = self.current.allocator().clone();
             self.current = HeapSpace::with_allocator(alloc, target)?;
         }
+        self.live_target_words = Some(live_target);
         // Down to exactly one space, so the aggregate is re-seeded from it rather than widened:
         // the retired spaces' extents are gone and a stale widening would keep rejecting
         // addresses far outside the collapsed chain's neighbourhood. The epoch advances — the
