@@ -79,9 +79,12 @@
 //! in this machine ([`Step::Enter`], with the free variables placed at
 //! `x(arity..)`), so a `receive` inside the closure suspends the *calling* process;
 //! on the seam's `Ok(None)` default the closure is applied through the
-//! value-returning
-//! [`ExecutionContext::apply_fun`](crate::context::ExecutionContext::apply_fun)
-//! (default: a typed `unsupported`) as before. `apply`/`apply_last` name a
+//! outcome-aware
+//! [`ExecutionContext::apply_fun_outcome`](crate::context::ExecutionContext::apply_fun_outcome)
+//! (default: forward to the value-returning `apply_fun`, a typed `unsupported` when
+//! the host serves neither), whose [`FunOutcome::Suspend`](crate::FunOutcome) parks
+//! the machine on the `call_fun`/`call_fun2` instruction for a closure application
+//! that has to wait. `apply`/`apply_last` name a
 //! `module:function` directly and are resolved through the cross-module-call seam
 //! [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)
 //! — on a hit the callee runs in this machine ([`Step::Enter`]); on the
@@ -120,7 +123,7 @@ use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Module, Operand};
 use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
 
-use crate::context::{BifOutcome, ExecutionContext, RootSet};
+use crate::context::{BifOutcome, ExecutionContext, FunOutcome, RootSet};
 use crate::error;
 use crate::families::exceptions::callee;
 use crate::machine::{namespace_atom, Continuation, Machine};
@@ -498,9 +501,13 @@ fn raise_badarity(
 /// A `receive` inside the closure then suspends *this* process (an ordinary
 /// [`crate::RunOutcome::Wait`]), and a raise inside it flows into the caller's live
 /// `try`/`catch` frames rather than escaping as a typed error. When the host
-/// declines (`Ok(None)` — the seam's default) the value-returning
-/// [`ExecutionContext::apply_fun`] is the fallback, byte-identical to a host without
-/// the seam.
+/// declines (`Ok(None)` — the seam's default) the outcome-aware
+/// [`ExecutionContext::apply_fun_outcome`] is the fallback; its default forwards to
+/// the value-returning [`ExecutionContext::apply_fun`], so a host without the
+/// channel is byte-identical, while a host that **interprets** the closure itself may
+/// answer [`FunOutcome::Suspend`] and have the machine park on this instruction
+/// (nothing is applied — the resume re-consults the door with the same `fun` and
+/// `args`, so the host must *continue* the pending application, never restart it).
 ///
 /// Every error — the seam's own and the fallback's — is routed through the
 /// catch-aware funnel [`Machine::raise_bif_error`], so a routable raise (a
@@ -567,13 +574,29 @@ fn call_fun(
                 pc: target_pc,
             }))
         }
-        // The host cannot run this closure in-machine: the value-returning
-        // fallback, unchanged for a host without the seam.
-        Ok(None) => match ctx.apply_fun(fun, &args) {
-            Ok(result) => {
+        // The host cannot run this closure in-machine: the outcome-aware apply
+        // fallback (whose default forwards to the value-returning `apply_fun`, so a
+        // host without the seam is unchanged). This site IS re-execution-idempotent:
+        // everything above only *reads* `fun` and the arguments (`register_args`), and
+        // the one write — `set_x(0, result)` — is success-only, so a suspend applies
+        // nothing (no register, no stack slot, no frame, no continuation) and the
+        // resume's re-consultation re-reads the same `x(arity)` fun and `x(0..arity)`
+        // arguments from the machine's own root set. That is why the suspend becomes a
+        // park here, exactly as at the two class-A BIF sites
+        // (`interpreter/dispatch.rs::call_ext_dispatch` and `jit_local_call`'s
+        // served-callee arm). `apply_target`'s BIF dispatch is deliberately the
+        // opposite — class B, a typed error — because `apply/3` has already rewritten
+        // `x(0..arity)` by the time it dispatches.
+        Ok(None) => match ctx.apply_fun_outcome(fun, &args) {
+            Ok(FunOutcome::Return(result)) => {
                 machine.set_x(0, result)?;
                 Ok(Some(Step::Next))
             }
+            // The application could not complete without waiting: the instruction was
+            // not applied, so the machine parks on it and the host's resume
+            // re-consults the seam (which must CONTINUE the pending application, not
+            // restart it — an evaluator body is not re-execution idempotent).
+            Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
             // A raise inside the applied closure must route through the
             // catch-aware funnel, not escape the caller's `try`/`catch`.
             Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
