@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::{BifOutcome, ExecutionContext};
 use beam_loader::{Label, Module};
@@ -609,9 +609,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `{Name, Node}` pair naming **this** node (the C's local `whereis` arm), or a genuinely
     /// remote destination (transmitted by the distribution client); anything else is
     /// [`BeamError::BadArg`]. The message is copied into the recipient's heap and
-    /// enqueued by [`ProcessTable::deliver`] (an unknown pid is the table's typed
-    /// `TermNotFound`). The sender is this context's pid, so `self() ! M` reaches the very
-    /// mailbox the following `receive` scans.
+    /// enqueued by [`ProcessTable::deliver`]; a pid that no process backs is the oracle's
+    /// **silent success**, not an error — see the dead-destination section of
+    /// [`Self::send_message_with_off_heap`], which owns that policy for every send route.
+    /// The sender is this context's pid, so `self() ! M` reaches the very mailbox the
+    /// following `receive` scans.
     ///
     /// This is the **no-off-heap** form: it delegates to
     /// [`Self::send_message_with_off_heap`] with an empty handle slice, so the trace events
@@ -652,6 +654,28 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// payload ([`Self::trace_send_events`]). A third event follows when the **receiver** is
     /// `['receive']`-traced: `{trace, Receiver, 'receive', Msg}`, emitted here (never from the
     /// internal delivery bypass, which would recurse) by [`Self::trace_receive_events`].
+    ///
+    /// # A destination nobody backs is the oracle's **success**
+    ///
+    /// `Pid ! Msg` where `Pid` names no live process succeeds silently: the C's `do_send`
+    /// (`bif.c:2470-2480`) looks the pid up, reports *success* without delivering when
+    /// `erts_proc_lookup` finds nothing, and the operator expression evaluates to `Msg`. So the
+    /// one failure this method **folds** is [`BeamError::TermNotFound`], and the fold is the
+    /// oracle's semantics rather than a swallowed error: on this path a not-found can only mean
+    /// "the destination pid is not live" — the *sender* is never looked up, and every other
+    /// failure on the path has a disjoint cause ([`ProcessTable::deliver`] itself reports only
+    /// the destination miss, `beam_process`'s table lookup, and the heap-fragment fallback
+    /// behind it only a copy/allocation failure, [`Self::send_fragmented_message`]). Every other
+    /// error is propagated unchanged, so no crate-local error scope is widened.
+    ///
+    /// The `send` **trace event** still fires, because the C emits it *before* the destination
+    /// lookup (`bif.c:2470-2471`) and reports success at `:2479-2480` — hence the fold's early
+    /// return through [`Self::trace_send_events`]. The `receive` event deliberately does **not**
+    /// fire: it is an **enqueue-time** event (`erl_proc_sig_queue.c:8626-8630`), and a dropped
+    /// message is never enqueued, so [`Self::trace_receive_events`] is skipped. Nor can a fold
+    /// consume an alias: `reference` is `None` on every pid/name `Local` arm of
+    /// [`classify_send_destination`](super::send::classify_send_destination), so the
+    /// alias-consume arm below is unreachable for a dead destination.
     fn send_message_with_off_heap(
         &mut self,
         to: Eterm,
@@ -679,9 +703,16 @@ impl ExecutionContext for RuntimeContext<'_> {
         // `None` (no handle in any family, i.e. a plain on-heap message) keeps the documented
         // empty-source fast path.
         let source = self.send_source(Some(self.mailbox_pid), src_binaries);
-        match &source {
-            Some(source) => self.deliver_message_with_off_heap(target, from, message, source)?,
-            None => self.deliver_message(target, from, message)?,
+        // The delivery's one folded failure is a destination nobody backs: the C reports
+        // success without delivering there (see the dead-destination section above).
+        let delivered = match &source {
+            Some(source) => self.deliver_message_with_off_heap(target, from, message, source),
+            None => self.deliver_message(target, from, message),
+        };
+        match delivered {
+            Ok(()) => {}
+            Err(BeamError::TermNotFound) => return self.trace_send_events(to, message),
+            Err(error) => return Err(error),
         }
         // An **alias** destination is consumed by the message that went through it (see
         // `resolve_send_target`): the delivery is done, so the `reply_demonitor` rule can

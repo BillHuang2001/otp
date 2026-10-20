@@ -53,6 +53,11 @@
 //! exactly as the corresponding compiled send does; the message is copied into the receiver's heap
 //! by `beam_message`'s copier and the receiver is woken through the runtime's resume-on-send wake
 //! list (the pass's `run_ready` absorbs it at the end of the slice the NIF is running in).
+//!
+//! One answer deliberately does **not** match the compiled send: a local pid nobody backs. The
+//! operator reports that as a success without delivering (`bif.c:2478-2480`), while the C's
+//! `enif_send` answers `0` for a receiver `erts_proc_lookup` cannot find (`erl_nif.c:876-881`).
+//! The ABI's `0` is therefore decided in [`deliver_through`], before the seam.
 
 use beam_engine::ExecutionContext;
 use beam_process::{ProcessId, ProcessTable};
@@ -71,15 +76,18 @@ use crate::runtime::Runtime;
 ///
 /// # What each answer means
 ///
-/// * `true` — [`RuntimeContext::send_message`] returned `Ok`, i.e. the message is in the receiver's
-///   mailbox (a NIF is never handed a "maybe").
-/// * `false` — the not-queued answer, which the C reports for exactly one reason on the normal
-///   scheduler path: `erts_proc_lookup(receiver)` found no process (`:876-877`). Here the same
-///   answer also covers a destination the send seam rejects (`badarg` for a term that names no
-///   process — a non-pid, a port), a remote destination this node cannot reach (the C's
-///   `enif_send` has no distribution arm, so `0` is the oracle's answer there too), and a failed
-///   copy (the C aborts the emulator; a runtime whose error strategy is return-based reports "not
-///   delivered" instead, and says so on the debug-trace channel rather than swallowing it).
+/// * `true` — the message is queued in the receiver's mailbox (a NIF is never handed a "maybe").
+/// * `false` — the C's not-queued answer. Its one reason on the normal scheduler path is the
+///   C's own: `erts_proc_lookup(receiver)` found no process (`erl_nif.c:876-881`). This module
+///   therefore decides that case **before** the send seam (see [`deliver_through`]): the seam
+///   deliberately reports a dead pid as `!`'s silent success (`bif.c:2478-2480`, see
+///   [`RuntimeContext::send_message_with_off_heap`]), and the NIF ABI must not inherit an
+///   answer that only the operator's semantics makes right. The same `false` also covers a
+///   destination the send seam rejects (`badarg` for a term that names no process — a non-pid, a
+///   port), a remote destination this node cannot reach (the C's `enif_send` has no
+///   distribution arm, so `0` is the oracle's answer there too), and a failed copy (the C aborts
+///   the emulator; a runtime whose error strategy is return-based reports "not delivered"
+///   instead, and says so on the debug-trace channel rather than swallowing it).
 pub(crate) fn deliver(
     runtime: &mut Runtime,
     mailbox: Option<&mut ProcessTable>,
@@ -101,7 +109,20 @@ pub(crate) fn deliver(
 }
 
 /// Runs the delivery on `ctx` and folds its outcome into the C's `1`/`0`.
+///
+/// The C's `erts_proc_lookup(receiver)` gate (`erl_nif.c:876-881`) is applied **here**, ahead
+/// of the seam and only to an **internal pid** term: [`RuntimeContext::send_message`] treats a
+/// destination nobody backs as `!`'s silent success (`bif.c:2478-2480`), which is right for the
+/// operator and wrong for the NIF ABI. Every other destination keeps its own routing — a plain
+/// atom name (the C's `erts_whereis_name_to_id` arm, whose failure is the oracle's `badarg`), a
+/// live alias reference (delivered to its owner) and a remote pid (which the seam transmits or
+/// refuses) all reach the seam unchanged.
 fn deliver_through(mut ctx: RuntimeContext<'_>, to: Eterm, msg: Eterm) -> bool {
+    if let Ok(pid) = ProcessId::from_eterm(to) {
+        if !ctx.process_table().contains(pid) {
+            return false;
+        }
+    }
     match ctx.send_message(to, msg) {
         Ok(()) => true,
         Err(error) => {

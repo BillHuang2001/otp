@@ -33,10 +33,29 @@
 //!
 //! The `Dest ! Msg` **operator** does not reach the BIF at all: the compiler emits the `send`
 //! instruction, which `beam_engine` serves through its `send_message` seam directly (that is
-//! what `tests/mailbox.rs` and `tests/scheduler.rs` pin). What is pinned *here* is the BIF
-//! call, which is what `erlang:send(Pid, Msg)` compiles to (`call_ext erlang:send/2`) and what
-//! a dynamically applied `erlang:'!'/2` dispatches.
+//! what `tests/mailbox.rs` and `tests/scheduler.rs` pin). The BIF call is what
+//! `erlang:send(Pid, Msg)` compiles to (`call_ext erlang:send/2`) and what a dynamically
+//! applied `erlang:'!'/2` dispatches.
 //!
+//! Two routes are therefore pinned here, because a **dropped** message has to behave the same
+//! on both: the compiled `erlang:send/2` call and the operator's `send` instruction. The oracle
+//! drops a message for a pid with no process and reports success on both
+//! (`erts/emulator/beam/bif.c:2470-2480`: the lookup misses and the send reports success
+//! without delivering), so `DeadPid ! Msg` evaluates to `Msg` and never raises — from compiled
+//! code (`a_compiled_bang_to_a_dead_or_unknown_pid_succeeds_silently`), from `-eval`
+//! (`an_eval_bang_to_a_dead_pid_agrees_with_the_live_oracle`) and leaving no residue in the
+//! sender (`a_bang_to_a_dead_pid_leaves_the_sender_alive_with_an_empty_mailbox`).
+//!
+//! Both routes end at the runtime's send seam
+//! ([`RuntimeContext::send_message`](beam_rt::RuntimeContext)), which folds the destination miss
+//! into that success. A compiled `erlang:send/2` whose destination is a pid (or a reference)
+//! additionally takes `beam_engine`'s own `erlang:send/2` fast path
+//! (`../beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_send`), which delivers through
+//! the seam and folds the same miss itself — so that half is a check that the two agree, while
+//! the `send` **instruction** is the route that pins the seam's fold. `SendBridge` (the
+//! `beam_bifs::SendHook` provider) is reached by a `send` the fast path declines — a registered
+//! name, a port, a `{Name, Node}` pair — and by a `-eval`/`apply` `erlang:send/2`, and it folds
+//! nothing of its own, so the policy has one definition.//!
 //! # Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`)
 //!
 //! ```none
@@ -63,6 +82,9 @@
 //! $ erl -noshell -pa <dir> -eval 'D = spawn(sp, done, []), timer:sleep(50),
 //!                                  io:format("~p ~p~n",[sp:bif_send(D, x), is_process_alive(D)])'
 //! x false
+//! $ erl -noshell -pa <dir> -eval 'D = spawn(sp, done, []), timer:sleep(50),
+//!                                  io:format("~p ~p~n",[sp:bang(D, x), is_process_alive(D)])'
+//! x false
 //! ```
 //!
 //! Destination 8 is **accepted by the oracle** but is a Milestone-1 capability gap in this
@@ -72,6 +94,11 @@
 //! `erlang:send(Port, Data)` answers the message term (writing only for the `{Pid,{command,Data}}`
 //! and `{Pid,close}` shapes) — the oracle rows live in `tests/port_busy.rs`. The rest of the
 //! fixture cases above cover the remaining destinations.
+// The shared harness is compiled in whole, but this suite uses only its toolchain discovery
+// and oracle probe (the dead-destination `!` case), so the unused remainder is expected here.
+#[allow(dead_code)]
+mod support;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -85,17 +112,24 @@ const RECV_BEAM: &str = concat!(
     "/../beam_engine/tests/fixtures/recv.beam"
 );
 
-/// The fixture source: the `erlang:send/2` **BIF** call, compiled (never committed).
+/// The fixture source: the `erlang:send/2` **BIF** call and the `Dest ! Msg` **operator**,
+/// compiled (never committed).
 ///
-/// `bif_send/2` is the point of the fixture: the compiler lowers `erlang:send(Dest, Msg)` to
-/// `call_ext erlang:send/2`, so running it in compiled code exercises
-/// [`RuntimeContext::call_registered`](beam_rt::RuntimeContext)'s send arm and the hook behind
-/// it. (`erlang:'!'(Dest, Msg)`, by contrast, is lowered to the `send` **instruction** and
-/// never reaches the BIF — which is why the `!`-BIF case below is driven through
-/// `erlang:apply/3` instead.)
+/// `bif_send/2` is the point of the fixture for the BIF half: the compiler lowers
+/// `erlang:send(Dest, Msg)` to `call_ext erlang:send/2`, so running it in compiled code exercises
+/// the engine's `erlang:send/2` fast path
+/// (`../beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_send`), which delivers through
+/// [`RuntimeContext::send_message`](beam_rt::RuntimeContext) for a pid/reference destination and
+/// folds the same dead-destination miss the seam does. (`erlang:'!'(Dest, Msg)`, by contrast, is
+/// lowered to the `send` **instruction** and never reaches the BIF — which is why the `!`-BIF
+/// case below is driven through `erlang:apply/3` instead.)///
+/// `bang/2` is the point of the fixture for the **operator** half, and it is the one that
+/// matters for a dropped message: `Dest ! Msg` is the `send` instruction, dispatched through
+/// `ExecutionContext::send_message_with_off_heap`, a **different** seam from the BIF's
+/// `SendHook` — so the dead-destination rule has to be pinned on it separately.
 const FIXTURE_ERL: &str = r#"%% Generated by `beam_rt/tests/send.rs` (never committed).
 -module(sp).
--export([self_send/0, bif_send/2, done/0]).
+-export([self_send/0, bif_send/2, bang/2, bang_then_wait/2, done/0]).
 
 %% `erlang:send/2` to this process's own mailbox, taken straight back out of the receive.
 self_send() ->
@@ -105,6 +139,20 @@ self_send() ->
 %% The BIF form of a cross-process send, returning the message term (the oracle's value).
 bif_send(Dest, Msg) ->
     erlang:send(Dest, Msg).
+
+%% The **operator** form of a cross-process send. The compiler lowers `Dest ! Msg` to the
+%% `send` **instruction**, so this never reaches the `erlang:send/2` BIF: it is the fixture
+%% that exercises the runtime's `ExecutionContext::send_message` seam.
+bang(Dest, Msg) ->
+    Dest ! Msg.
+
+%% The same `send` instruction, then a blocking `receive`: the process stays in the table
+%% (parked) instead of terminating, so a test can ask whether a **dropped** message left
+%% anything behind in the sender's own mailbox (it must not — the message is not
+%% re-delivered to the sender).
+bang_then_wait(Dest, Msg) ->
+    _ = (Dest ! Msg),
+    receive X -> X end.
 
 %% A process that terminates immediately — the "dead pid" the oracle drops a message for.
 done() ->
@@ -400,6 +448,161 @@ fn a_compiled_bif_send_to_a_dead_or_unknown_pid_succeeds_silently() {
         );
     }
     fixture.cleanup();
+}
+
+/// The `Dest ! Msg` **operator** (the `send` instruction) to a pid **no process exists for**
+/// also succeeds silently, evaluating to the message.
+///
+/// This is a *different seam* from the BIF case above: `!` compiles to the `send`
+/// instruction, which `ExecutionContext::send_message_with_off_heap` serves, so the
+/// destination-miss rule has to hold there too. The C looks the pid up and reports success
+/// when the lookup finds nothing (`bif.c:2470-2480`) — `erts_send_message` returns a failure
+/// only for a *bad argument*, and a pid with no process is not one — which is why the oracle
+/// answers `x` for a dead pid and never raises.
+///
+/// Oracle (system `erl`, the same fixture):
+/// `D = spawn(sp, done, []), timer:sleep(50), sp:bang(D, x)` ⇒ `x`.
+#[test]
+fn a_compiled_bang_to_a_dead_or_unknown_pid_succeeds_silently() {
+    let Some(fixture) = build_fixture("bang") else {
+        return;
+    };
+    let beam = fixture.beam.to_string_lossy().into_owned();
+    let mut rt = runtime_with(&beam);
+
+    // A process that runs to completion: once it is gone from the table its pid is dead.
+    let doomed = rt
+        .spawn_process("sp", "done", vec![])
+        .expect("spawn sp:done/0");
+    rt.run_scheduler().expect("the pass drains the queue");
+    assert!(
+        rt.processes().get(doomed).is_none(),
+        "the process terminated, so its pid is dead"
+    );
+
+    for (label, target) in [
+        ("a terminated pid", doomed.to_eterm()),
+        (
+            "a never-allocated pid",
+            beam_process::ProcessId::new(999_999, 0).to_eterm(),
+        ),
+    ] {
+        let sender = rt
+            .spawn_process("sp", "bang", vec![target, make_small(7)])
+            .expect("spawn sp:bang/2");
+        rt.run_scheduler().expect("the pass drains the queue");
+
+        let exit_reason = rt
+            .process_exit(sender)
+            .map(|reason| rt.atom_name_of(reason).unwrap_or("<unnamed atom>").to_string());
+
+        assert_eq!(
+            rt.process_result(sender).map(signed_value),
+            Some(7),
+            "`{label} ! 7` evaluates to the message, as the oracle does \
+             (the sender exited with {exit_reason:?})"
+        );
+        assert!(
+            rt.process_exit(sender).is_none(),
+            "`{label} ! 7` must not raise (beam_rt: term not found is not the C's answer)"
+        );
+    }
+    fixture.cleanup();
+}
+
+/// A message dropped for a dead pid leaves **no residue** in the sender: the sender is still
+/// alive afterwards and its own mailbox is empty.
+///
+/// The sender parks in a `receive` after the send, so it is still in the table when the pass
+/// drains — the state a returning sender cannot show (a normal return terminates the process
+/// and removes it, which is what the case above relies on). An implementation that
+/// *bounced* the undeliverable message back, or that resolved the miss by delivering it to
+/// the caller, would park here with a non-empty mailbox and fail.
+#[test]
+fn a_bang_to_a_dead_pid_leaves_the_sender_alive_with_an_empty_mailbox() {
+    let Some(fixture) = build_fixture("bang_alive") else {
+        return;
+    };
+    let beam = fixture.beam.to_string_lossy().into_owned();
+    let mut rt = runtime_with(&beam);
+
+    let doomed = rt
+        .spawn_process("sp", "done", vec![])
+        .expect("spawn sp:done/0");
+    rt.run_scheduler().expect("the pass drains the queue");
+    assert!(
+        rt.processes().get(doomed).is_none(),
+        "the process terminated, so its pid is dead"
+    );
+
+    for (label, target) in [
+        ("a terminated pid", doomed.to_eterm()),
+        (
+            "a never-allocated pid",
+            beam_process::ProcessId::new(999_999, 0).to_eterm(),
+        ),
+    ] {
+        let sender = rt
+            .spawn_process("sp", "bang_then_wait", vec![target, make_small(7)])
+            .expect("spawn sp:bang_then_wait/2");
+        rt.run_scheduler().expect("the pass drains the queue");
+
+        let exit_reason = rt
+            .process_exit(sender)
+            .map(|reason| rt.atom_name_of(reason).unwrap_or("<unnamed atom>").to_string());
+
+        let parked = rt.processes().get(sender).unwrap_or_else(|| {
+            panic!(
+                "sending to {label} must not kill the sender: it is parked in `receive` \
+                 (the sender exited with {exit_reason:?})"
+            )
+        });
+        assert!(
+            parked.mailbox().is_empty(),
+            "a message dropped for {label} must not leave residue in the sender's mailbox"
+        );
+        assert!(
+            rt.process_result(sender).is_none(),
+            "the sender is parked, so it has not returned a value"
+        );
+        assert!(
+            rt.process_exit(sender).is_none(),
+            "sending to {label} must not raise"
+        );
+    }
+    fixture.cleanup();
+}
+
+/// The **`-eval`** route's `!` operator drops a dead destination silently too, and the whole
+/// probe agrees with the live oracle byte for byte.
+///
+/// The `-eval` route reaches the same `send_message_with_off_heap` seam through the
+/// evaluator's `!` operator, so it is a third front door onto the rule. The `catch` wrapper
+/// is what makes a divergence visible as `R={'EXIT',…}` / `R=<reason>` instead of a killed
+/// probe, so a runtime that raises for a dead pid fails on the printed line rather than on a
+/// missing one.
+///
+/// The spawned process is given a real chance to die (`timer:sleep(50)`, which both runtimes
+/// honour) before it is used as a destination.
+#[test]
+fn an_eval_bang_to_a_dead_pid_agrees_with_the_live_oracle() {
+    let Some(oracle) = support::require_oracle("send") else {
+        return;
+    };
+    let program = "P = spawn(fun() -> ok end), timer:sleep(50), \
+                   R = (catch (P ! hi)), io:format(\"R=~p~n\",[R]).";
+
+    let (stdout, stderr) = eval(program);
+    assert_eq!(stdout, "R=hi\n", "`DeadPid ! hi` evaluates to the message");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+
+    let theirs = support::oracle_eval(&oracle, None, program)
+        .unwrap_or_else(|| panic!("the live oracle could not answer `{program}`"));
+    assert_eq!(
+        theirs,
+        stdout.trim(),
+        "the two runtimes must agree on a `!` to a dead pid"
+    );
 }
 
 /// A destination the oracle rejects with `badarg` raises `badarg` from compiled code too.

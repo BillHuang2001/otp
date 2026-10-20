@@ -290,10 +290,10 @@ impl DictHook for DictBridge<'_> {
 ///
 /// * An **internal pid** — whether or not a process currently exists for it. The C looks the
 ///   pid up and reports *success* without delivering when `erts_proc_lookup_raw` finds nothing
-///   (`bif.c:2478-2480`), so a send to a dead or never-created pid **succeeds silently**.
-///   [`send_message`](ExecutionContext::send_message) reports that case as
-///   [`BeamError::TermNotFound`], which this bridge folds back into the oracle's success —
-///   that is the oracle's semantics, not a swallowed failure.
+///   (`bif.c:2478-2480`), so a send to a dead or never-created pid **succeeds silently**. That
+///   semantics is defined **once**, at the send seam itself
+///   ([`RuntimeContext::send_message_with_off_heap`](super::RuntimeContext::send_message_with_off_heap)),
+///   so this bridge propagates the seam's answer unchanged.
 /// * A **registered name** (an atom) — resolved through [`ProcessTable::whereis`], the same
 ///   "name → id" resolution the C does with `erts_whereis_name_to_id` (`bif.c:2507`), and the
 ///   message is delivered to the registered process. A name that is *not* registered is the
@@ -400,12 +400,9 @@ impl SendHook for SendBridge<'_> {
                         // A delivery applies no fun and reads no `TableRegistry`.
                         lent_tables: None,
                     };
-                    match ctx.send_message(target.to_eterm(), term) {
-                        // No process for the pid: the C drops the message and reports success
-                        // (`bif.c:2478-2480`); the table's typed not-found is that same case.
-                        Err(BeamError::TermNotFound) => Ok(()),
-                        delivered => delivered,
-                    }
+                    // A dead destination is the seam's own success (`bif.c:2478-2480`); this
+                    // bridge adds no fold of its own, so the policy has one definition.
+                    ctx.send_message(target.to_eterm(), term)
                 };
                 // Only a **successful** delivery consumes the alias.
                 delivered?;

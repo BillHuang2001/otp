@@ -876,15 +876,48 @@ fn send_message_resolves_the_target_and_rejects_a_non_pid() {
     assert_eq!(mailbox.peek().expect("the delivered message").payload(), make_small(7));
 }
 
+/// A `Pid ! Msg` whose pid no process backs is the oracle's **silent success**: the C looks the pid
+/// up, reports success without delivering and the operator evaluates to the message
+/// (`bif.c:2478-2480`). So the send seam — the one path every send route funnels through — answers
+/// `Ok(())` and enqueues nothing anywhere.
+///
+/// The **table** keeps its own typed not-found: the fold is the seam's policy, not a weakened
+/// lookup, which the second half pins through the delivery the seam calls.
 #[test]
-fn send_message_to_an_unknown_pid_is_the_tables_typed_error() {
+fn send_message_to_an_unknown_pid_succeeds_and_delivers_nothing() {
     let mut rt = runtime();
+    let ghost_pid = ProcessId::new(9999, 7);
+    let ghost = ghost_pid.to_eterm();
     let mut ctx = RuntimeContext::new(&mut rt);
-    // A pid whose (number, serial) names no live process: the table's typed not-found.
-    let ghost = ProcessId::new(9999, 7).to_eterm();
+    // A pid whose (number, serial) names no live process: the oracle's `hi`, silently dropped.
+    ctx.send_message(ghost, make_small(1))
+        .expect("a dead destination is the oracle's silent success");
+
+    // Nothing is enqueued — not to the sender, not to any other process in the table.
+    assert!(
+        !ctx.runtime.processes.contains(ghost_pid),
+        "the ghost pid still names no process"
+    );
+    for pid in ctx.runtime.processes.pids() {
+        let mailbox = ctx
+            .runtime
+            .processes
+            .get(pid)
+            .expect("a pid from the table's own iterator")
+            .mailbox();
+        assert_eq!(
+            mailbox.len(),
+            0,
+            "a dropped message is enqueued nowhere ({pid:?})"
+        );
+    }
+
+    // The lower-level delivery the seam calls still reports the table's typed not-found: the fold
+    // lives at the seam, above an unchanged table.
+    let from = ctx.mailbox_pid.to_eterm();
     let error = ctx
-        .send_message(ghost, make_small(1))
-        .expect_err("no such process");
+        .deliver_message(ghost_pid, from, make_small(2))
+        .expect_err("the delivery itself still reports the miss");
     assert!(
         matches!(error, BeamError::TermNotFound),
         "expected the table's typed not-found error, got {error:?}"
