@@ -1479,8 +1479,26 @@ impl Driver for UdpInetDriver {
         self.drive_async_ops(ctx)
     }
 
+    /// The C's `packet_inet_stop` (`:14533`-`:14549`): every pending operation is answered
+    /// `{error, closed}` **before** the descriptor goes away, so the owner is never left waiting.
+    /// The completions are harvested by the registry's close path.
+    ///
+    /// # No `flush` override — deliberately
+    ///
+    /// The `udp_inet` driver entry has **no `flush` slot**: its `struct erl_drv_entry` puts `NULL`
+    /// where `tcp_inet` puts `tcp_inet_flush` (`inet_drv.c:1406`-`:1443`, the third `NULL` after
+    /// `packet_inet_timeout` — `outputv`, `ready_async`, **`flush`**, `call`, `event`; the
+    /// `tcp_inet` entry at `:1368` fills that same position with `tcp_inet_flush`). So
+    /// `flush_port`'s `p->drv_ptr->flush != NULL` test (`erts/emulator/beam/io.c:3664`) calls
+    /// nothing, and this driver inherits [`Driver::flush`]'s default — which discards nothing —
+    /// exactly as the C does. A datagram port's queued commands are therefore written by the port
+    /// layer's `Closing` drain, never thrown away at a close.
+    ///
+    /// That asymmetry is the C's, not an oversight here: `packet_inet_ctl`'s `INET_REQ_CLOSE`
+    /// (`:14701`) never discards the queue either (unlike `tcp_close_check` + `tcp_desc_close`),
+    /// because a datagram write cannot block on a peer's window the way a stream write can.
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        // The C's `packet_inet_stop` (`:14548`): every pending operation is answered
+        // The C's `packet_inet_stop` (`:14533`-`:14549`): every pending operation is answered
         // `{error, closed}` **before** the descriptor goes away, so the owner is never left
         // waiting. The completions are harvested by the registry's close path.
         let drained = self.drain_pending_closed(ctx);

@@ -398,6 +398,17 @@ pub(super) struct SocketOptions {
     pub(super) line_delim: u8,
     /// `{read_packets, …}` (code [`INET_LOPT_UDP_READ_PACKETS`]) — datagram-gated.
     pub(super) read_packets: i32,
+    /// The C's `TCP_ADDF_LINGER_ZERO` (`inet_drv.c:864`) — `{linger, {true, 0}}` is in effect, so
+    /// a close must **discard** the driver's queued output instead of trying to write it (a
+    /// zero-linger close aborts the connection with an `RST`, which is what makes
+    /// `tcp_send`/`tcp_sendv` give up immediately, `:13788`-`:13799`/`:13899`-`:13904`).
+    ///
+    /// Set by the `{linger, …}` record of a `setopts` walk on a **TCP** descriptor
+    /// (`inet_set_opts`'s `if (li_val.l_onoff && li_val.l_linger == 0)` arm, `:7382`-`:7386`) and
+    /// read by [`super::TcpInetDriver::flush`] (the C's `tcp_inet_flush`, `:12708`-`:12731`). It is
+    /// stored even when the `setsockopt(SO_LINGER)` itself fails, because the C sets the flag
+    /// during the record decode, before the syscall.
+    pub(super) linger_zero: bool,
 }
 
 impl Default for SocketOptions {
@@ -426,6 +437,7 @@ impl Default for SocketOptions {
             send_timeout_close: 0,
             line_delim: DEFAULT_LINE_DELIM,
             read_packets: INET_PACKET_POLL,
+            linger_zero: false,
         }
     }
 }
@@ -458,6 +470,7 @@ impl SocketOptions {
     /// | `desc->send_timeout_close` | [`SocketOptions::send_timeout_close`] | [`INET_LOPT_TCP_SEND_TIMEOUT_CLOSE`] (35) | `:11827` |
     /// | `tcp_add_flags & TCP_ADDF_SHOW_ECONNRESET` | [`SocketOptions::show_econnreset`] | [`INET_LOPT_TCP_SHOW_ECONNRESET`] (39) | `:11829`-`:11831` |
     /// | `tcp_add_flags & TCP_ADDF_NO_READ_AHEAD` | [`SocketOptions::read_ahead`] (negated) | [`INET_LOPT_TCP_READ_AHEAD`] (49) | `:11829`-`:11831` |
+    /// | `tcp_add_flags & TCP_ADDF_LINGER_ZERO` | [`SocketOptions::linger_zero`] | — (never reported) | `:11829`-`:11831` |
     /// | the parent's busy-msgq limits (`erl_drv_busy_msgq_limits`) | [`SocketOptions::msgq_high`] | [`INET_LOPT_MSGQ_HIWTRMRK`] (36) | `:11842` |
     /// | the parent's busy-msgq limits (`erl_drv_busy_msgq_limits`) | [`SocketOptions::msgq_low`] | [`INET_LOPT_MSGQ_LOWTRMRK`] (37) | `:11844` |
     ///
@@ -519,6 +532,10 @@ impl SocketOptions {
             // `tcp_add_flags & TCP_ADDF_NO_READ_AHEAD` (`:11829`-`:11831`), kept as the negated
             // `{read_ahead, …}` boolean.
             read_ahead: parent.read_ahead,
+            // `tcp_add_flags & TCP_ADDF_LINGER_ZERO` (`:11829`-`:11831`) — a listener created with
+            // `{linger, {true, 0}}` hands the flag to its accepted sockets (measured on OTP 29.1.1:
+            // closing an accepted socket whose bytes cannot be written completes at once).
+            linger_zero: parent.linger_zero,
             // The parent's busy-msgq limits, read out of the parent port and written verbatim to
             // the child (`:11842`/`:11844`).
             msgq_high: parent.msgq_high,

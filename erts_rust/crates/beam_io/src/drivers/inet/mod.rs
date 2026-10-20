@@ -1235,8 +1235,13 @@ impl TcpInetDriver {
         result
     }
 
-    /// The C's `tcp_desc_close` (`inet_drv.c:11932`-`:11939`), the body behind both
-    /// `INET_REQ_CLOSE` (`:12258`-`:12266`) and the driver teardown.
+    /// The C's `tcp_desc_close` (`inet_drv.c:11932`-`:11939`) — the body of the **`INET_REQ_CLOSE`
+    /// verb** (`:12258`-`:12266`) and of every peer-close teardown the C routes through it
+    /// (`:12264`, `:12511`, `:12521`, `:12572`, `:12825`, `:12873`, `:13653`, `:13670`). It is
+    /// deliberately **not** the driver teardown: `tcp_inet_stop` (`:11893`-`:11924`) runs
+    /// `tcp_close_check` + `tcp_clear_input` + `inet_stop` and never touches the `ioq` — the queue
+    /// is the flush's and the port layer's business there (see [`TcpInetDriver::flush`] and
+    /// [`Driver::stop`]'s body).
     ///
     /// ```c
     /// static void tcp_desc_close(tcp_descriptor* desc)
@@ -1257,6 +1262,9 @@ impl TcpInetDriver {
     ///
     /// [`TcpInetDriver::close_socket`] cannot do this (it takes no [`DriverContext`], and `Drop`
     /// has no port to clear), so the queue half lives here, on the `ctx`-carrying close path.
+    ///
+    /// The **port** teardown deliberately does not come through here — see
+    /// [`Driver::stop`]'s body, which is the C's `tcp_inet_stop` and keeps its hands off the `ioq`.
     ///
     /// # Errors
     ///
@@ -2527,18 +2535,88 @@ impl Driver for TcpInetDriver {
         }
     }
 
+    /// The C's `tcp_inet_flush` (`inet_drv.c:12708`-`:12731`) — the driver entry's `flush` slot
+    /// (`:1368`), which the emulator calls from `flush_port` (`erts/emulator/beam/io.c:3659`-`:3700`,
+    /// the `drv_ptr->flush != NULL` test at `:3664` and the call at `:3687`) while a closing port
+    /// still holds an `ioq`, **before** `tcp_inet_stop` can run:
+    ///
+    /// ```c
+    /// static void tcp_inet_flush(ErlDrvData e)
+    /// {
+    ///     tcp_descriptor* desc = (tcp_descriptor*)e;
+    ///     int discard_output;
+    ///     /* Discard send queue to avoid hanging port (OTP-7615) */
+    ///     discard_output = !(desc->inet.event_mask & FD_WRITE);
+    ///     discard_output |= desc->tcp_add_flags & TCP_ADDF_LINGER_ZERO;
+    ///     ...
+    ///     if (discard_output) {
+    ///         tcp_clear_output(desc);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// So the queue is dropped in exactly two situations, and **kept otherwise** — kept, that is,
+    /// for the port layer to write out during its `Closing` drain
+    /// ([`crate::Port::close`] → [`crate::PortState::Closing`]):
+    ///
+    /// * **write readiness is not armed for this socket.** `event_mask & FD_WRITE` is what the C
+    ///   sets while a write can still make progress: `sock_select(…, FD_WRITE, 1)` after a short
+    ///   write re-armed the buffer (`tcp_send`'s `INET_ECONN_BLOCK` arm) and for a connect in
+    ///   flight. This floor's counterpart is its single registration's `Interest` mask — the
+    ///   `Interest::WRITABLE`/`Interest::BOTH` that
+    ///   [`TcpInetDriver::write_pending`] arms when a remainder is queued
+    ///   (`self.interest.is_writable()`) — **and** the registration itself: the C's
+    ///   `erl_inet_close` (`:5101`-`:5117`) zeroes the mask in both of its arms
+    ///   (`desc_close`'s `desc->event_mask = 0;`, `:5073`, and the prebound arm's
+    ///   `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0);`
+    ///   then `desc->event_mask = 0;`, `:5108`-`:5109`), which is this driver's
+    ///   [`TcpInetDriver::deregister`] taking the token away, so a closed or peer-closed
+    ///   descriptor is "not armed" even though the last `Interest` snapshot still says otherwise.
+    /// * **`{linger, {true, 0}}` is in effect** — [`SocketOptions::linger_zero`], the C's
+    ///   `TCP_ADDF_LINGER_ZERO` (`:864`, set by `inet_set_opts`'s `INET_OPT_LINGER` arm,
+    ///   `:7382`-`:7386`). A zero-linger close aborts with an `RST`, so queued bytes have nowhere
+    ///   to go.
+    ///
+    /// The C's `tcp_clear_output` also calls `send_empty_out_q_msgs` (`:11724`, the
+    /// `INET_REQ_SUBSCRIBE` notification half) — that channel has no counterpart here yet, so the
+    /// discard is the whole effect.
+    ///
+    /// `sendfile`'s `HAVE_SENDFILE` arm (`:12717`-`:12723`) forces the discard; this floor
+    /// refuses `TCP_REQ_SENDFILE`(45) outright, so there is no sendfile state to abort.
+    ///
+    /// # Errors
+    ///
+    /// Never: the C entry returns `void`, and a discard cannot fail. The [`Result`] is the frozen
+    /// seam's shape.
+    fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        // `discard_output = !(desc->inet.event_mask & FD_WRITE) | TCP_ADDF_LINGER_ZERO`.
+        let write_armed = self.token.is_some() && self.interest.is_writable();
+        if !write_armed || self.options.linger_zero {
+            // `tcp_clear_output`: `driver_deq(ix, driver_sizeq(ix))` (`:11718`-`:11724`).
+            ctx.output().clear();
+        }
+        Ok(())
+    }
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // Every queued operation is answered with `{error, closed}` **before** the descriptor goes
         // away — the C's `async_error_am_all(am_closed)` (`inet_drv.c:2597`-`:2608`) — and the
         // release outcome is kept: neither half is dropped on the other's failure.
         //
-        // The teardown runs the same `tcp_desc_close` body as the `close` verb, so the port's
-        // output queue is emptied here too. The C spreads that over two functions —
-        // `tcp_inet_stop` clears the input buffer (`:11904`) and `tcp_inet_flush` discards the
-        // `ioq` (`inet_drv.c:12708`-`:12731`, `tcp_clear_output` at `:12728`) before the port is
-        // freed — so the end state is the same: no queued byte outlives the teardown.
+        // The teardown is the C's `tcp_inet_stop` (`:11895`-`:11924`) — `tcp_close_check`, then
+        // `tcp_clear_input`, then `inet_stop` (`:10847`, `erl_inet_close` + free) — and it
+        // **never touches the port's `ioq`**: the queued output is the flush's business
+        // ([`TcpInetDriver::flush`], which drops it only when write readiness is unarmed or
+        // `{linger, {true, 0}}` is set) and the port layer's `Closing` drain's, which is why the
+        // queue reaching here is normally empty already. On a **forced** close (the driver-failure
+        // path, `io.c:7212`'s `prt->ioq.size = 0`, and this crate's
+        // `PortRegistry`'s `close_now`) the remainder is dropped by the teardown's own `stopq`
+        // (`io.c:3768`) — i.e. with the port — and never written.
+        //
+        // So this is [`TcpInetDriver::release_socket`], not [`TcpInetDriver::desc_close`]: the
+        // close **verb** is the only caller of the C's `tcp_desc_close` body here (see
+        // [`TcpInetDriver::verb_close`]).
         let drained = drain_closed(&mut self.async_ops, ctx);
-        let released = self.desc_close(ctx);
+        let released = self.release_socket(ctx);
         drained?;
         released
     }
