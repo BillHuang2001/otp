@@ -34,10 +34,12 @@
 //! / 264 963 824** words for N = 2 000 / 20 000 / 200 000 and **0** collections, i.e. ≈ 1 300
 //! words retained per iteration.
 //!
-//! With the door live, the same three runs read **6 / 60 / 600** collections, `minor_gcs`
-//! **5 / 59 / 599** and a **flat `heap_size` of 233 words** (the collector's `min_heap_words`
-//! floor) with a one-space nursery throughout — the live set really is a handful of words, so
-//! the capacity stops growing after the first boundary.
+//! With the door live, the same three runs read **9 / 89 / 899** collections, `minor_gcs`
+//! **8 / 88 / 898** and a **flat `heap_size` of 610 words** with a one-space nursery throughout —
+//! the live set the boundary window holds is the single in-flight 400-element tuple, so the
+//! capacity is the live-set-targeted minor rule's target for it
+//! ([`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words)) at
+//! every N, never a quantity that follows the loop count.
 //!
 //! # Why the run is forced onto the **interpreter**
 //!
@@ -115,6 +117,32 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
     );
     peak
 }
+/// The words one `reds_boundary` iteration leaves live in the boundary window: the 400-element
+/// `list_to_tuple/1` result (one header word plus 400 element words) the pre-emption catches
+/// before the iteration abandons it.
+const BOUNDARY_LIVE_WORDS: usize = 401;
+
+/// The young-nursery capacity the live-set-targeted minor rule installs for
+/// [`BOUNDARY_LIVE_WORDS`] — `young_minor_target_words(live)` = `next_words(live +
+/// need_reserve_words)`, floored by `nursery_floor_words()` — under the emulator-default policy a
+/// plain `spawn` child is created with ([`HeapOptions::new`](crate::config::HeapOptions::new), the
+/// `heap` field of the [`RuntimeConfig`](crate::config::RuntimeConfig) [`growth_runtime`] builds
+/// its runtime from).
+///
+/// This is the plateau the two rows below must both read, so the pin is the rule rather than a
+/// measured integer: at 401 live words it is 610, and any live set the fixture's own allocation
+/// could leave maps onto the same growth-table entry.
+fn plateau_words() -> usize {
+    let policy = crate::config::HeapOptions::default().policy().clone();
+    let target = policy.young_minor_target_words(BOUNDARY_LIVE_WORDS);
+    assert!(
+        target >= policy.nursery_floor_words(),
+        "the minor target can never sit below the policy's floor: {target} < {}",
+        policy.nursery_floor_words()
+    );
+    target
+}
+
 /// **A loop that reaches no heap-admission point is collected at the yield boundary, and its
 /// `heap_size` stops climbing with N.**
 ///
@@ -136,13 +164,13 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
 ///   `fullsweep_after` forces during the run (`collections - 1` at every N measured, hence
 ///   `(8, 88)` for the two rows below), which is what makes the `garbage_collection` item's
 ///   counter move with real collections instead of sitting at the pre-fix `0`.
-/// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space
-///   ([`heap_size`] 610 words at every N measured, the collector's sizing of the live set the
-///   boundary window actually holds: with the loop priced more finely the door now fires with
-///   the in-flight 400-element list/tuple still live, where it used to fire after the iteration
-///   had abandoned it and settled on the 233-word floor). What the pin is *for* — flatness in N
-///   and a single retired space — is unchanged (before the door: 3 074 841 / 29 485 327 /
-///   264 963 824 words for N = 2 000 / 20 000 / 200 000).
+/// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space of
+///   `young_minor_target_words(401)` words (610, [`plateau_words`]) at every N measured. The
+///   fixture's live set at a boundary is the single in-flight 400-element `list_to_tuple/1`
+///   result (401 words), and the minor rule installs one times that live set plus the reserve, so
+///   the capacity is a function of the iteration's footprint and never of the loop count. What
+///   the pin is *for* — flatness in N and a single retired space — is unchanged (before the door:
+///   3 074 841 / 29 485 327 / 264 963 824 words for N = 2 000 / 20 000 / 200 000).
 ///
 /// No collection may fail (`errors`, `halted`) and no run may park in a `receive`.
 #[test]
@@ -204,12 +232,14 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
     );
     // The point of the door: a flat `heap_size` instead of a linear climb with N (the pre-door
     // figures are 3 074 841 and 29 485 327 words — ≈ 1 300 retained words per iteration). The
-    // converged capacity is 610 words at this cadence (see the doc comment), and it is the same
-    // at both N — flatness, not the absolute floor, is the property.
-    assert_eq!(heap1, 610, "the nursery must converge, not climb: N={n1}");
+    // converged capacity is the minor rule's target for the boundary window's live set
+    // (`young_minor_target_words(401)`, 610 words — see the doc comment), and it is the same at
+    // both N — flatness, not the absolute figure, is the property.
+    let plateau = plateau_words();
+    assert_eq!(heap1, plateau, "the nursery must converge, not climb: N={n1}");
     assert_eq!(
         (heap2, r1.peak_young_spaces, r2.peak_young_spaces),
-        (610, 1, 1),
+        (plateau, 1, 1),
         "heap_size must NOT climb with N, and the chain must stay one space: N={n2}"
     );
 }
