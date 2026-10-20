@@ -37,15 +37,25 @@
 //! `erlang:send(Pid, Msg)` compiles to (`call_ext erlang:send/2`) and what a dynamically
 //! applied `erlang:'!'/2` dispatches.
 //!
-//! Two seams are therefore pinned here, because a **dropped** message has to behave the same
-//! on both: the BIF's `SendHook` and the operator's `send_message`. The oracle drops a message
-//! for a pid with no process and reports success on both routes
+//! Two routes are therefore pinned here, because a **dropped** message has to behave the same
+//! on both: the compiled `erlang:send/2` call and the operator's `send` instruction. The oracle
+//! drops a message for a pid with no process and reports success on both
 //! (`erts/emulator/beam/bif.c:2470-2480`: the lookup misses and the send reports success
 //! without delivering), so `DeadPid ! Msg` evaluates to `Msg` and never raises — from compiled
 //! code (`a_compiled_bang_to_a_dead_or_unknown_pid_succeeds_silently`), from `-eval`
 //! (`an_eval_bang_to_a_dead_pid_agrees_with_the_live_oracle`) and leaving no residue in the
 //! sender (`a_bang_to_a_dead_pid_leaves_the_sender_alive_with_an_empty_mailbox`).
 //!
+//! Both routes end at the runtime's send seam
+//! ([`RuntimeContext::send_message`](beam_rt::RuntimeContext)), which folds the destination miss
+//! into that success. A compiled `erlang:send/2` whose destination is a pid (or a reference)
+//! additionally takes `beam_engine`'s own `erlang:send/2` fast path
+//! (`../beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_send`), which delivers through
+//! the seam and folds the same miss itself — so that half is a check that the two agree, while
+//! the `send` **instruction** is the route that pins the seam's fold. `SendBridge` (the
+//! `beam_bifs::SendHook` provider) is reached by a `send` the fast path declines — a registered
+//! name, a port, a `{Name, Node}` pair — and by a `-eval`/`apply` `erlang:send/2`, and it folds
+//! nothing of its own, so the policy has one definition.//!
 //! # Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`)
 //!
 //! ```none
@@ -106,12 +116,13 @@ const RECV_BEAM: &str = concat!(
 /// compiled (never committed).
 ///
 /// `bif_send/2` is the point of the fixture for the BIF half: the compiler lowers
-/// `erlang:send(Dest, Msg)` to `call_ext erlang:send/2`, so running it in compiled code
-/// exercises [`RuntimeContext::call_registered`](beam_rt::RuntimeContext)'s send arm and the
-/// hook behind it. (`erlang:'!'(Dest, Msg)`, by contrast, is lowered to the `send`
-/// **instruction** and never reaches the BIF — which is why the `!`-BIF case below is driven
-/// through `erlang:apply/3` instead.)
-///
+/// `erlang:send(Dest, Msg)` to `call_ext erlang:send/2`, so running it in compiled code exercises
+/// the engine's `erlang:send/2` fast path
+/// (`../beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_send`), which delivers through
+/// [`RuntimeContext::send_message`](beam_rt::RuntimeContext) for a pid/reference destination and
+/// folds the same dead-destination miss the seam does. (`erlang:'!'(Dest, Msg)`, by contrast, is
+/// lowered to the `send` **instruction** and never reaches the BIF — which is why the `!`-BIF
+/// case below is driven through `erlang:apply/3` instead.)///
 /// `bang/2` is the point of the fixture for the **operator** half, and it is the one that
 /// matters for a dropped message: `Dest ! Msg` is the `send` instruction, dispatched through
 /// `ExecutionContext::send_message_with_off_heap`, a **different** seam from the BIF's
