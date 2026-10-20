@@ -83,6 +83,7 @@ MODULES= \
 	z_SUITE \
 	zlc_SUITE \
 	stage2_bench \
+	loop_opt_bench \
 	stage2_suite_driver \
 	test_lib \
         erl_md5

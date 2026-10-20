@@ -35,7 +35,8 @@
          rem_to_band/1, div_rem_pow2/1, huge_mul_declines/1,
          arith_licm_ssa/1, arith_licm_declines/1, no_shift_hoist/1,
          arith_licm_probe/1, arith_licm_equivalence/1,
-         arith_licm_kill_switches/1, default_output_identical/1]).
+         arith_licm_kill_switches/1, default_output_identical/1,
+         real_loop_speedup/1]).
 suite() -> [{ct_hooks,[ts_install_cth]}, {timetrap,{minutes,5}}].
 all() -> [strength_reduction, induction_variable_canonicalisation,
           strength_reduction_declines, strength_reduction_equivalence,
@@ -46,7 +47,8 @@ all() -> [strength_reduction, induction_variable_canonicalisation,
           rem_to_band, div_rem_pow2, huge_mul_declines,
           arith_licm_ssa, arith_licm_declines, no_shift_hoist,
           arith_licm_probe, arith_licm_equivalence,
-          arith_licm_kill_switches, default_output_identical].
+          arith_licm_kill_switches, default_output_identical,
+          real_loop_speedup].
 init_per_suite(Config) -> Config.
 end_per_suite(_Config) -> ok.
 
@@ -1404,6 +1406,201 @@ bsl_limit(Lo, Hi) ->
         N when is_integer(N) -> bsl_limit(Mid, Hi);
         _ -> bsl_limit(Lo, Mid)
     end.
+
+%%=========================================================================
+%% The runtime-speed question, on a REAL loop: does the rewritten loop actually
+%% execute faster? `speed_probe_src/1' is an LCG-style counter loop whose hot
+%% path is dominated by exactly the three rewrites the pass performs --
+%% `S * 1024' -> `S bsl 10', `S rem 65536' -> `S band 65535' and
+%% `S1 div 256' / `S1 rem 256' -> `S1 bsr 8' / `S1 band 255'.
+%%
+%% What is asserted here is REACH and EQUIVALENCE, not speed. The timings are
+%% reported, never asserted in a direction, because on this runtime there is
+%% nothing for the rewrite to win: the JIT already strength-reduces `div'/`rem'
+%% by a power-of-two immediate into a shift/mask under the same clamped-range
+%% condition the pass requires (`erts/emulator/beam/jit/x86/instr_arith.cpp')
+%% and turns `X * 2^n' into a left shift as well. The only timing assertion is
+%% the loose non-flakiness guard the equivalence suite uses.
+%%=========================================================================
+
+real_loop_speedup(Config) ->
+    %% Two copies of the same loop under different `-module' names:
+    %% `code:load_binary/3' keys loaded code by module name, so both builds have
+    %% to be distinct modules to coexist in this VM.
+    {OffMod, OffBin} =
+        speed_build(Config, speed_probe_off, speed_probe_src(speed_probe_off),
+                    []),
+    {OnMod, OnBin} =
+        speed_build(Config, speed_probe_on, speed_probe_src(speed_probe_on),
+                    [loop_opt, loop_arith_licm]),
+
+    %% Reach: the pass must have rewritten this loop. The synthetic tests above
+    %% pin the shape of each rewrite; this is the end-to-end proof that the
+    %% whole pipeline reaches a loop shaped like a real program's.
+    OffCode = code_chunk(OffBin, OffMod),
+    OnCode = code_chunk(OnBin, OnMod),
+    case OffCode =:= OnCode of
+        true -> ct:fail({loop_pass_did_not_reach, OffMod});
+        false -> ok
+    end,
+
+    %% Equivalence: the rewrite may be faster, it may not compute anything else.
+    %% The loop runs 2,000,000 iterations, so any divergence in the arithmetic
+    %% accumulates into the returned integer.
+    OffVal = OffMod:run(),
+    OnVal = OnMod:run(),
+    case OffVal =:= OnVal of
+        true -> ok;
+        false -> ct:fail({result_mismatch, {off, OffVal}, {on, OnVal}})
+    end,
+
+    %% Measurement: one discarded warm-up round (code loading, JIT state), then
+    %% an odd number of rounds alternating which build is timed first, so a
+    %% drift in the machine's load hits both builds alike.
+    _ = speed_time(OffMod),
+    _ = speed_time(OnMod),
+    Rounds = 9,
+    {OffUs, OnUs} = speed_samples(OffMod, OnMod, Rounds),
+    {OffMed, OffSpread} = speed_stats(OffUs),
+    {OnMed, OnSpread} = speed_stats(OnUs),
+
+    ct:pal("~n=== loop_opt runtime speed (speed_probe_off vs speed_probe_on) ==="),
+    ct:pal("method: ~w interleaved rounds, one discarded warm-up round, "
+           "alternating which build is timed first", [Rounds]),
+    ct:pal("reach: the generated `Code' chunk changed; both builds return ~p",
+           [OffVal]),
+    ct:pal("~-10s ~11s ~11s ~7s ~9s ~9s",
+           ["kernel", "OFF med", "ON med", "ratio", "OFF sprd", "ON sprd"]),
+    ct:pal("~-10s ~9.3f ms ~9.3f ms ~7.3f ~8.1f% ~8.1f%",
+           ["loop/0", OffMed / 1000, OnMed / 1000, OffMed / OnMed,
+            100 * OffSpread, 100 * OnSpread]),
+    ct:pal("ratio = OFF median / ON median, > 1 means the build with the loop "
+           "passes was FASTER in this run"),
+    ct:pal("CAVEAT: this table describes THIS run only. The host is shared and "
+           "loaded, so absolute times are not reproducible and the ratio has to "
+           "be read against the reported spread; the ratio commonly lands at or "
+           "marginally below 1 here, i.e. no gain, which is a property of this "
+           "machine and not of the pass. No direction is asserted: the JIT "
+           "already strength-reduces `div'/`rem' by a power-of-two immediate "
+           "into a shift/mask under the same clamped-range condition the pass "
+           "requires, and turns `X * 2^n' into a left shift too, so on this "
+           "runtime there is nothing left for the rewrite to win."),
+
+    %% The only timing assertion there is: no catastrophic regression. A
+    %% tighter bound -- or a direction -- would just be a coin toss at this
+    %% noise level.
+    case OnMed =< OffMed * 2 of
+        true ->
+            ok;
+        false ->
+            ct:fail({loop_opt_slower, {off, OffMed}, {on, OnMed}})
+    end.
+
+%% The probe of `real_loop_speedup': a tail-recursive counter loop of the shape
+%% a real program's inner loop has. `Mod' is a parameter because the two builds
+%% have to be loaded as distinct modules.
+-spec speed_probe_src(atom()) -> iolist().
+speed_probe_src(Mod) ->
+    io_lib:format(
+      "-module(~s).\n"
+      "-export([run/0]).\n"
+      "run() -> loop(2000000, 12345, 0).\n"
+      "loop(0, _, A) ->\n"
+      "    A;\n"
+      "loop(N, S, A) ->\n"
+      "    S1 = (S * 1024 + 12345) rem 65536,\n"
+      "    A1 = A + (S1 div 256) + (S1 rem 256),\n"
+      "    loop(N - 1, S1, A1).\n", [Mod]).
+
+%% Compile `Src' under `Name' with `Opts', load it and return the module and its
+%% BEAM binary, the `Code' chunk of which the reach check reads.
+-spec speed_build(list(), atom(), iolist(), [atom()]) -> {module(), binary()}.
+speed_build(Config, Name, Src, Opts) ->
+    {Mod, Bin} = compile_bin(Config, Name, Src, Opts),
+    {module, Mod} = code:load_binary(Mod, src_filename(Config, Name), Bin),
+    {Mod, Bin}.
+
+%% One timed run of the probe, in microseconds.
+-spec speed_time(module()) -> non_neg_integer().
+speed_time(Mod) ->
+    {Us, _Val} = timer:tc(Mod, run, []),
+    Us.
+
+%% `Rounds' paired samples of the two builds. The round number decides which
+%% build is timed first, so the two are interleaved rather than batched.
+-spec speed_samples(module(), module(), pos_integer()) ->
+          {[non_neg_integer()], [non_neg_integer()]}.
+speed_samples(OffMod, OnMod, Rounds) ->
+    lists:foldl(
+      fun(R, {Offs, Ons}) ->
+              case R rem 2 of
+                  1 ->
+                      OffUs = speed_time(OffMod),
+                      OnUs = speed_time(OnMod),
+                      {[OffUs | Offs], [OnUs | Ons]};
+                  0 ->
+                      OnUs = speed_time(OnMod),
+                      OffUs = speed_time(OffMod),
+                      {[OffUs | Offs], [OnUs | Ons]}
+              end
+      end, {[], []}, lists:seq(1, Rounds)).
+
+%% The timing statistics of one build's samples, in microseconds: the MEDIAN is
+%% the reported value and the second element is the interquartile range over it,
+%% a robust relative spread.
+-spec speed_stats([non_neg_integer()]) -> {non_neg_integer(), float()}.
+speed_stats(Us) ->
+    Sorted = lists:sort(Us),
+    N = length(Sorted),
+    Med = lists:nth((N + 1) div 2, Sorted),
+    Q1 = lists:nth((N + 3) div 4, Sorted),
+    Q3 = lists:nth((3 * N + 3) div 4, Sorted),
+    {Med, case Med > 0 of
+              true -> (Q3 - Q1) / Med;
+              false -> 0.0
+          end}.
+
+%% The `Code' chunk of a BEAM binary, extracted by hand from the FOR1 container:
+%% this host's `beam_lib:chunks/2' cannot read this tree's beams, and the
+%% generated code is the only thing the reach check wants. EA IFF 85 layout:
+%% "FOR1" | 32-bit big-endian total size | form type ("BEAM", itself NOT a sized
+%% chunk) | chunks of 4-byte id | 32-bit size | payload | 0..3 bytes of padding.
+%%
+%% Comparing whole `.beam' files instead would be WRONG here: `CInf' and `Dbgi'
+%% embed the option list, so two builds of the same source always differ there.
+-spec code_chunk(binary(), atom()) -> binary().
+code_chunk(Bin, Mod) ->
+    case lists:keyfind(<<"Code">>, 1, beam_chunks(Bin)) of
+        {<<"Code">>, Payload} -> Payload;
+        false -> ct:fail({no_code_chunk, Mod})
+    end.
+
+-spec beam_chunks(binary()) -> [{binary(), binary()}].
+beam_chunks(<<"FOR1", _Total:32, _Form:4/binary, Rest/binary>>) ->
+    beam_chunks(Rest, []);
+beam_chunks(Bin) ->
+    ct:fail({not_a_beam_file, byte_size(Bin)}).
+
+-spec beam_chunks(binary(), [{binary(), binary()}]) -> [{binary(), binary()}].
+beam_chunks(<<>>, Acc) ->
+    lists:reverse(Acc);
+beam_chunks(<<Id:4/binary, Size:32, Rest0/binary>>, Acc) ->
+    case Rest0 of
+        <<Payload:Size/binary, Rest1/binary>> ->
+            Pad = (4 - (Size rem 4)) rem 4,
+            case Rest1 of
+                <<_:Pad/binary, Rest2/binary>> ->
+                    beam_chunks(Rest2, [{Id, Payload} | Acc]);
+                _Tail ->
+                    %% last chunk written without its alignment padding
+                    lists:reverse([{Id, Payload} | Acc])
+            end;
+        _Short ->
+            lists:reverse(Acc)
+    end;
+beam_chunks(_Trailing, Acc) ->
+    %% fewer than 8 bytes left: end-of-file alignment padding
+    lists:reverse(Acc).
 
 %%=========================================================================
 %% Compiling, disassembling and running a probe under a set of options.
