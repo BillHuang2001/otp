@@ -113,6 +113,7 @@ Every C enum-with-values type (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMa
 
 ## Handoffs (pointers — the detail is in `src/driver/CONTEXT.md`)
 - **`beam_rt` / `beam_io` own the remaining `DriverHost`/`NifHost` hosts**: `DriverHost::port_term` (the `ERL_DRV_PORT` term-data operand) and `DriverHost::failure`/`port_exit` (the port-closing family) are unimplemented there, so a loaded C driver written the C way delivers nothing on that operand and its `driver_failure_*` closes no port — the `beam_abi` halves are complete and oracle-pinned.
+- **`beam_rt` must install a `ThreadEnvHostFactory`** (its `NifHostImpl` opened per thread, with `intern_atom`/`atom_name` on the **live** `AtomTable` — the measured atom round-trip proves a snapshot is not enough, `enif_make_atom` can *create* an atom — and a `send` hook that injects thread-safely). Until it does, `enif_alloc_env()` off the NIF-call path stays `NULL`; the `beam_abi` half is complete and pinned by `src/nif/thread_env_tests.rs`.
 - **A tools-owned ledger needs correcting**: `erts_rust/tools/differential/{src/corpus/driver_c.rs, GAPS.md, divergences.md}` still lists a closed `erl_errno_id` divergence and calls the port-closing reason "not a VM-stable observable". Reported here; the tools owner edits it.
 
 ## Routing Table
