@@ -834,17 +834,18 @@ than two).
   would once a caller supplies such a policy. The seam also cannot *continue* on a non-`ok` status:
   `named` (dynamic node names) and `ok_simultaneous` are continuations with no `AcceptDecision`
   representation (and this crate has no dynamic-name support).
-- **Consumed by `beam_rt` for the ACCEPTING half only.** `beam_rt/src/dist.rs` (`DistNode`, driven from
-  `runtime/scheduler.rs::pump_dist`) derives the node name from `-name`/`-sname` (`NodeName`), registers
-  with `epmd` (`ALIVE2_REQ`), binds a listener and completes the `'N'` handshake as **server** via this
-  crate's `ConnectionDriver`, then routes the inbound **send family** into local mailboxes through the
-  `InboundSink` impl (`LocalDeliverySink`, `beam_rt/src/runtime/scheduler.rs`) — **gated by
-  `Runtime::allow_inbound_delivery`, which is default-OFF** (so a node handshakes and decodes inbound
-  traffic but routes nothing into a mailbox until a caller enables it; `beam_rt/src/runtime.rs`). What is still missing:
-  the **connector half** and the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol; every non-send delivery
-  is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
-  startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the
-  whole of the current distribution support. The per-link **checked** path this crate now exposes
+- **Consumed by `beam_rt` for BOTH halves, and inbound routing is ON by default.** `beam_rt/src/dist/`
+  accepts (`DistNode`, driven from `runtime/scheduler.rs::pump_dist`) and `beam_rt/src/dist_client/`
+  connects; both complete the `'N'` handshake through this crate's `ConnectionDriver`/`Connection`, and
+  inbound traffic reaches `LocalDeliverySink` (`beam_rt/src/dist/inbound.rs`) — the runtime side of this
+  crate's `InboundSink` seam, constructed per scheduler pass over the live process table
+  (`runtime/scheduler.rs`). It is gated by `Runtime::inbound_delivery` (**default ON**;
+  `Runtime::allow_inbound_delivery` turns it off, `beam_rt/src/runtime.rs:4334`). Routed today: the send
+  family into local mailboxes **plus** the route-free receipt families (`Link`/`Exit`/`Exit2`/unlink/
+  monitor/demonitor/group-leader and both monitor-`DOWN` forms), each emitting no outbound `DOP_*`.
+  Still owed downstream: the **reply** half of the signal contract (see the reply-channel entry below),
+  the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol, and a `DFLAG_PUBLISHED`/visibility advertisement
+  at startup (no `publish_flag` caller). The per-link **checked** path this crate exposes
   (`Connection::recv_delivery_checked`/`dispatch_inbound_checked`, `ConnectionDriver::next_delivery_checked`/
   `dispatch_inbound_checked`, over `LinkIdentity` + `Delivery::classify_validated`) is **not yet adopted
   there**: `LocalDeliverySink` is a single sink built once per scheduler pass and shared across every
