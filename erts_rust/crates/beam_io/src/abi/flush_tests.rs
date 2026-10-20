@@ -41,7 +41,7 @@
 //!   loading binary's **dynamic** symbol table — which the library's own unit-test binary does not
 //!   have — so it runs from the marker build `flush_driver_marker.c` and probes first; see
 //!   [`host_symbols_exported`];
-//! * an entry with **no** `flush` slot is the C's silent no-op (`io.c:3666`): the close is `Ok`, no
+//! * an entry with **no** `flush` slot is the C's silent no-op (`io.c:3664`): the close is `Ok`, no
 //!   error escapes from the loader's `absent("flush")`, and the driver's `stop` still runs;
 //! * the close-time order is `flush` → the port's own write drain (which reaches the driver's
 //!   `output`) → `stop`;
@@ -353,7 +353,7 @@ fn the_loaded_drivers_flush_runs_once_before_its_stop() {
 /// An entry that leaves `flush` `NULL` closes cleanly: no error escapes from the loader's
 /// `absent("flush")`, and the driver's `stop` still runs.
 ///
-/// The C's rule is `if (p->drv_ptr->flush != NULL)` (`io.c:3663`) — a driver with nothing to
+/// The C's rule is `if (p->drv_ptr->flush != NULL)` (`io.c:3664`) — a driver with nothing to
 /// discard simply has no callback, which is exactly [`Driver::flush`]'s own default. The variant
 /// fixture (`flush_driver_no_flush.c`) is that entry shape.
 #[test]

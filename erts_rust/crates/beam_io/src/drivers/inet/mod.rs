@@ -2644,7 +2644,7 @@ impl Driver for TcpInetDriver {
         // ([`TcpInetDriver::flush`], which drops it only when write readiness is unarmed or
         // `{linger, {true, 0}}` is set) and the port layer's `Closing` drain's, which is why the
         // queue reaching here is normally empty already. On a **forced** close (the driver-failure
-        // path, `io.c:7212`'s `prt->ioq.size = 0`, and this crate's
+        // path, `io.c:7220`'s `prt->ioq.size = 0`, and this crate's
         // `PortRegistry`'s `close_now`) the remainder is dropped by the teardown's own `stopq`
         // (`io.c:3768`) — i.e. with the port — and never written.
         //

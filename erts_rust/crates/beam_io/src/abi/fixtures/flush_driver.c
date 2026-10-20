@@ -9,9 +9,11 @@
  *
  * The C splits a port's death in two: `flush` (`flush_port`,
  * `erts/emulator/beam/io.c:3659-3700`) gives the driver one chance to discard the output still
- * queued for it, and `stop` (`terminate_port`, `io.c:3733-3752`) releases the driver afterwards.
+ * queued for it, and `stop` (`terminate_port`, `io.c:3703-3704`, whose `drv->stop` call is
+ * `:3752`) releases the driver afterwards.
  * `flush` is only called when the entry's pointer is non-`NULL`
- * (`if (p->drv_ptr->flush != NULL)`, `io.c:3663`), so both halves of that rule need a fixture:
+ * (`if (p->drv_ptr->flush != NULL)`, `io.c:3664`; the call itself is `:3687`), so both halves of
+ * that rule need a fixture:
  *
  *   * this file's base entry declares `flush`, so a host can prove the callback ran (its log line)
  *     and in which order relative to the port's own write drain and to `stop`;
@@ -155,7 +157,8 @@ static void flush_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     (void) len;
 #endif
 }
-/* `stop`: the C's `terminate_port` callback (`io.c:3733-3752`), the **only** caller of this slot.
+/* `stop`: the C's `terminate_port` callback (`io.c:3703-3704`, called at `:3752`), the **only**
+ * caller of this slot.
  * Logging it is how a host proves `flush` ran first. No `free` here on purpose: a host may still
  * read the port's teardown state after this returns, and the state lives as long as the test
  * process. */
