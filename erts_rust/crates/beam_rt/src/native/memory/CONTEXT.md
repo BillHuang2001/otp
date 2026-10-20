@@ -46,7 +46,8 @@ Valid oracle names whose gap reason names the missing accessor/hook: `backtrace`
 
 ### Documented divergences (correct-but-different-by-construction)
 `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 when no execution position is readable.
-`heap_size` is the oracle's 233 (the nursery) while `total_heap_size` is the real **466** (a pre-allocated 233-word mature generation).
+`heap_size` is the nursery's capacity, which is the process's own `min_heap_size` (`HeapPolicy::initial_heap_words`), so the default is the oracle's 233 and `+hms 4000` answers 4185.
+`total_heap_size` composes the C's figure — `heap_size` plus the old generation's capacity **only once a collection has created it** (`erl_bif_info.c:1023-1030`), so a fresh process reports `total_heap_size == heap_size` exactly as the oracle does.
 `memory`, `reductions`, `group_leader` (`Runtime::group_leader_of`'s real pid — the root pid by default, set by `erlang:group_leader/2`, inherited on spawn), `binary`'s `Ptr`/`Refc`, `error_handler` (the atom) and `suspending` (`[]`) are this runtime's own values.
 `status` is `running` for the caller (single-threaded), else the process's `ProcessState`.
 `message_queue_data` is `on_heap` (the queue is heap-resident), with an **explicit** `process_flag(message_queue_data, off_heap)` accepted-and-ignored.
