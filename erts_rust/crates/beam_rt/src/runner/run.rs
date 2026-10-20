@@ -40,7 +40,7 @@ use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
 use super::budget::{BudgetContext, BudgetProbe};
-use super::entry::{ProcessEngine, ProcessEntry, RunnerState};
+use super::entry::{ProcessEngine, ProcessEntry, RunnerState, UnrunnableProcess};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, killed, normal};
 use super::tier::select_entry_tier;
@@ -260,6 +260,60 @@ impl<'a> RuntimeRunner<'a> {
     pub(crate) fn new(runtime: &'a mut Runtime, state: &'a mut RunnerState) -> RuntimeRunner<'a> {
         RuntimeRunner { runtime, state }
     }
+
+    /// Refuses a pid the pass handed to [`ProcessRunner::run`] but which holds **no engine
+    /// entry point** — the honest, non-fatal shape of "the scheduler was told to run
+    /// something this runtime cannot run".
+    ///
+    /// Recording the diagnostic and restoring a truthful state are both the runner's job
+    /// here, because nobody else touches the process in this window:
+    ///
+    /// * the runner's own **typed diagnostic** ([`UnrunnableProcess`]) — the pid, the
+    ///   state/flags the pass observed, its priority and its registered name — recorded once
+    ///   per pid and emitted once through [`crate::debug_trace`] (env-gated, silent by
+    ///   default);
+    /// * the **state restore**: `beam_process`'s `slice_begin` already cleared
+    ///   `in_run_queue` and set [`ProcessState::Running`], and `slice_end`'s
+    ///   `Wait`/`Suspend` arms change nothing, so left alone the pid would stay `Running`
+    ///   for the rest of its life — a lie that also flips
+    ///   [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots)
+    ///   (a `Running` process is treated as having roots outside the root set, which
+    ///   declines its collection). It is restored to [`ProcessState::Runnable`], which is
+    ///   what a spawned-but-never-run process really is, and it stays out of the run queue
+    ///   (nothing put it there — the wake sweep refuses such a pid, see
+    ///   [`Runtime::absorb_fragment_wakes`](crate::runtime::Runtime::absorb_fragment_wakes)).
+    ///
+    /// The outcome is [`RunOutcome::Wait`]: the process is off the run queue and nothing
+    /// will run it, which is exactly what `Wait` means to the scheduler (its `Wait` arm
+    /// neither requeues nor terminates). It is **not** an `Err` — an unindexed run-queue
+    /// entry is a defect in the caller, and it must never take a whole scheduler pass, and
+    /// therefore the node, down with it.
+    ///
+    /// A pid that is no longer in the process table has nothing to restore and nothing to
+    /// describe, so no record is made for it (and the `Wait` outcome is unchanged).
+    fn refuse_engine_less(&mut self, pid: ProcessId, table: &mut ProcessTable) -> RunOutcome {
+        // A pid is diagnosed **once**: an already-recorded pid skips the name lookup below
+        // (the name lives on the table and is not cheap to read), and
+        // [`RunnerState::record_unrunnable`] would keep the first record anyway.
+        if self.state.unrunnable(pid).is_none() {
+            // The registered name is read off the table first (names live there, not on the
+            // PCB), so the PCB borrow below is the only one held while the record is built.
+            let registered_name = super::entry::registered_name(
+                table,
+                self.runtime.code_server().atoms(),
+                pid,
+            );
+            if let Some(process) = table.get(pid) {
+                let diagnostic = UnrunnableProcess::of(pid, process, registered_name);
+                self.state.record_unrunnable(diagnostic);
+            }
+        }
+        if let Some(process) = table.get_mut(pid) {
+            process.set_state(ProcessState::Runnable);
+        }
+        RunOutcome::Wait
+    }
+
     /// Runs the **reduction/yield-boundary** collection point over a just-parked machine — the
     /// slice-end door of [`crate::context::gc::collect_at_reds_boundary`].
     ///
@@ -716,11 +770,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
     ///
     /// # Errors
     ///
-    /// * a typed diagnostic when `pid` has no registered engine (a pid the runtime did
-    ///   not spawn cannot be run);
     /// * the process table's errors while a `send` delivered into a woken mailbox.
     ///
-    /// A *raise inside the process* is **not** an error here: it becomes
+    /// A `pid` with **no registered engine** is *not* an error: it is recorded as a typed
+    /// diagnostic ([`UnrunnableProcess`]) and answered [`RunOutcome::Wait`] (see
+    /// [`RuntimeRunner::refuse_engine_less`]), so one unindexed run-queue entry can never
+    /// take a scheduler pass — and the node — down.
+    ///
+    /// A *raise inside the process* is **not** an error here either: it becomes
     /// [`RunOutcome::Exit`] carrying the raised reason, exactly as the BEAM terminates a
     /// process with the reason it raised.
     fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<RunOutcome> {
@@ -733,9 +790,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // `&mut` value while its own container is still reachable. It goes back in below
         // unless the process finished.
         let Some(mut engine) = self.state.engines.remove(&pid) else {
-            return Err(crate::error::unknown_process_entry(pid));
+            // A pid with no engine entry point cannot be run — and taking the whole pass
+            // down for it would be far worse than the mistake: `slice_begin` has already
+            // taken the pid off the run queue and marked it `Running`, and `slice_end`'s
+            // `Wait`/`Suspend` arms touch neither, so this is the only place a truthful
+            // state can be restored. Record the typed diagnostic (once per pid) and answer
+            // the honest outcome: the process left the run queue and nothing will run it.
+            return Ok(self.refuse_engine_less(pid, table));
         };
-
         // Settle a parked receive's deadline **before** the context borrows the runtime:
         // a deadline that fired resumes the process at the timed-out path, while a
         // message-wake cancels the deadline so the receive cannot also fire its timeout.

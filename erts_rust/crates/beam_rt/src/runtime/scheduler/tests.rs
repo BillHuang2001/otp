@@ -192,8 +192,121 @@ fn send_after(rt: &mut Runtime, millis: i64, target: Eterm, message: Eterm) -> E
         .expect("send_after/3")
 }
 
-/// A receiver blocks **before** the timer fires, and the timer's message is what wakes
-/// it: the run queue is empty and the mailbox is empty when the deadline is scheduled,
+// -- the fragment-wake note, and a pid the pass cannot run -----------------
+
+/// A **fragment-wake note** for a pid the pass holds no engine for must not be enqueued,
+/// must not abort the pass, and must not disturb the work the pass really has.
+///
+/// This is the root-cause shape of the inbound-`DOP_SEND` failure: a payload that outgrew
+/// the receiver's default nursery is carried in a heap fragment, and the delivery's wake
+/// note used to be recorded **whether or not the delivery moved the receiver**
+/// (`src/dist/inbound.rs`). A receiver that was *born* `Runnable` and never enqueued — the
+/// runtime's own `init` root (which is exactly what the `-eval`/`-s`/`-run` action child is)
+/// and the `erl_prim_loader`/`file_server_2` services — is such a pid: "`Runnable` and not
+/// in a run queue" is **not** a valid "should be scheduled" test for it. Enqueued, it reached
+/// the runner with no engine, which used to kill the node with
+/// `scheduler: process … has no engine entry point`.
+///
+/// Now the sweep refuses it and records the typed diagnostic
+/// ([`crate::runner::UnrunnableProcess`]), and the pass carries on.
+#[test]
+fn a_fragment_note_for_an_engine_less_pid_does_not_take_the_pass_down() {
+    let mut rt = runtime();
+    rt.load_module(SLICE_BEAM).expect("load slice.beam");
+    let worker = rt
+        .spawn_process("slice", "fib", vec![make_small(10)])
+        .expect("spawn slice:fib/1");
+
+    // The runtime's own root process: spawned, inserted, **never enqueued**, born
+    // `Runnable`, and holding no engine — and registered as `init`, which is what makes the
+    // diagnostic actionable.
+    let engine_less = rt.self_pid();
+    let before = rt.processes().get(engine_less).expect("the root process");
+    assert_eq!(before.state(), ProcessState::Runnable, "born runnable");
+    assert!(!before.flags().in_run_queue(), "and never enqueued");
+    assert!(!rt.runner_state().contains(engine_less), "it holds no engine");
+    rt.note_fragment_wake(engine_less);
+
+    // One pass: the worker finishes, the engine-less pid is refused, nothing is fatal.
+    let ran = rt.run_scheduler().expect("an engine-less wake does not abort the pass");
+    assert!(ran >= 1, "the pass really ran work");
+    assert_eq!(
+        signed_value(rt.process_result(worker).expect("the worker returned")),
+        fib(10),
+        "the legitimate process ran to completion in the same pass"
+    );
+
+    let diagnostic = rt
+        .runner_state()
+        .unrunnable(engine_less)
+        .expect("the engine-less pid is diagnosed");
+    assert_eq!(diagnostic.pid, engine_less);
+    assert_eq!(diagnostic.state, ProcessState::Runnable);
+    assert!(!diagnostic.in_run_queue);
+    assert_eq!(
+        diagnostic.registered_name.as_deref(),
+        Some("init"),
+        "the record names the registered service"
+    );
+
+    let after = rt.processes().get(engine_less).expect("the root survives the pass");
+    assert_eq!(after.state(), ProcessState::Runnable, "left truthful, never `Running`");
+    assert!(!after.flags().in_run_queue(), "the sweep refused to enqueue it");
+    assert!(!rt.runner_state().contains(engine_less), "still no engine");
+}
+
+/// The **`woken == true` leg** of the same note: the note is the wake's *substitute for the
+/// process table's own wake list*, so it is only ever paired with a wake that really moved
+/// the receiver — a note on its own must not put a parked receiver on the run queue.
+///
+/// The `(ProcessId, bool)` record `src/dist/inbound.rs` keeps per fragment delivery pairs
+/// the descent gate (every delivery) with the wake note (only a delivery that moved the
+/// receiver): [`Process::wake`](beam_process::Process::wake) has already flipped the
+/// receiver to `Runnable` by the time the note is taken, so the sweep's
+/// "live `Runnable` and not already queued" test is what admits it. A receiver that is still
+/// `Waiting` — the note without the wake — stays parked, and the message that really wakes it
+/// still resumes it.
+#[test]
+fn a_fragment_note_alone_does_not_enqueue_a_parked_receiver() {
+    let mut rt = runtime();
+    rt.load_module(RECV_BEAM).expect("load recv.beam");
+    let receiver = rt
+        .spawn_process("recv", "wait", vec![])
+        .expect("spawn recv:wait/0");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+    assert_eq!(
+        rt.processes().get(receiver).expect("it stays").state(),
+        ProcessState::Waiting,
+        "parked on an empty mailbox"
+    );
+    assert_eq!(rt.run_queue_len(), 0, "nothing is runnable");
+
+    // A note with no wake behind it: the receiver is still `Waiting`, so the sweep does not
+    // enqueue it, and it is not diagnosed either (it holds an engine).
+    rt.note_fragment_wake(receiver);
+    assert_eq!(
+        rt.run_slices(1).expect("one bounded step"),
+        0,
+        "an un-woken receiver is not put on the run queue"
+    );
+    assert_eq!(
+        rt.processes().get(receiver).expect("it stays").state(),
+        ProcessState::Waiting
+    );
+    assert!(
+        rt.runner_state().unrunnable(receiver).is_none(),
+        "an engine-holding pid is never diagnosed"
+    );
+
+    // The real delivery wakes it (`Process::wake` sets `Runnable`), and it completes.
+    send_after(&mut rt, 5, receiver.to_eterm(), make_small(42));
+    assert!(rt.run_scheduler().expect("the pass waits for the deadline") >= 1);
+    assert_eq!(
+        signed_value(rt.process_result(receiver).expect("the receiver returned")),
+        42
+    );
+}
+/// A receiver blocks **before** the timer fires, and the timer's message is what wakes/// it: the run queue is empty and the mailbox is empty when the deadline is scheduled,
 /// so only the timer half of the scheduler pass can resume it.
 ///
 /// Oracle: `R = spawn(recv, wait, []), erlang:send_after(5, R, 42)` ⇒ `R` returns `42`.

@@ -109,5 +109,5 @@ mod tier;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use entry::{ProcessEntry, RunnerState};
+pub(crate) use entry::{registered_name, ProcessEntry, RunnerState, UnrunnableProcess};
 pub(crate) use run::RuntimeRunner;

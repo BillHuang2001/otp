@@ -29,7 +29,7 @@
 use super::*;
 
 use beam_alloc::Heap;
-use beam_process::SignalAtoms;
+use beam_process::{ProcessState, SignalAtoms};
 use beam_term::prelude::{eq, make_small, AtomTable, NIL};
 
 /// This test node's name; it is the sink's `local_node` atom.
@@ -117,7 +117,14 @@ fn payload(scratch: &mut Heap) -> Eterm {
 
 /// A receiver that must not be relocated (its roots are unpublished, so `Process::deliver`
 /// returns the copier's raw refusal) still gets the message — through a **heap fragment**,
-/// and the pid is recorded so the caller can replay the runtime's two fragment notes.
+/// and the pair `(pid, woken)` is recorded so the caller can replay the runtime's two
+/// fragment notes (the reachability note for the pid, the wake note only when the delivery
+/// really woke it).
+///
+/// The fixture's receiver is **`Runnable`** (a fresh process) and stays so: `Process::wake`
+/// moves only a `Waiting`/`Suspended` receiver, so this delivery does not wake it and the
+/// recorded flag is `false`. That is precisely the shape that used to be replayed as a
+/// wake — and so enqueued a process nothing should run.
 #[test]
 fn a_receiver_that_refuses_the_heap_copy_gets_the_message_in_a_heap_fragment() {
     let mut fixture = Fixture::new();
@@ -134,7 +141,7 @@ fn a_receiver_that_refuses_the_heap_copy_gets_the_message_in_a_heap_fragment() {
     let message = payload(&mut scratch);
     let delivery = send(pid.to_eterm(), message);
 
-    let (outcome, fragment_pids) = {
+    let (outcome, fragments) = {
         let mut sink = LocalDeliverySink::new(&mut fixture.table, node, NODE_CREATION);
         let outcome = sink
             .deliver(&delivery)
@@ -148,9 +155,21 @@ fn a_receiver_that_refuses_the_heap_copy_gets_the_message_in_a_heap_fragment() {
         "the fragment fallback delivers the message instead of dropping it"
     );
     assert_eq!(
-        fragment_pids,
-        vec![pid],
-        "exactly one fragment delivery is recorded, for the addressed receiver"
+        fragments,
+        vec![(pid, false)],
+        "exactly one fragment delivery is recorded, for the addressed receiver, and it did \
+         NOT wake it: the receiver was already `Runnable` (`Process::wake` moves only a \
+         `Waiting`/`Suspended` one), so replaying a wake note for it would enqueue a process \
+         nothing is waiting to run"
+    );
+    assert_eq!(
+        fixture
+            .table
+            .get(pid)
+            .expect("the receiver is live")
+            .state(),
+        ProcessState::Runnable,
+        "the delivery left the receiver's state exactly as it found it"
     );
     let mailbox = fixture.mailbox(pid);
     assert_eq!(
@@ -212,7 +231,7 @@ fn an_unknown_pid_is_still_no_such_process() {
     let message = payload(&mut scratch);
     let delivery = send(ghost.to_eterm(), message);
 
-    let (outcome, fragment_pids) = {
+    let (outcome, fragments) = {
         let mut sink = LocalDeliverySink::new(&mut fixture.table, node, NODE_CREATION);
         let outcome = sink
             .deliver(&delivery)
@@ -222,7 +241,62 @@ fn an_unknown_pid_is_still_no_such_process() {
 
     assert_eq!(outcome, DeliveryOutcome::NoSuchProcess);
     assert!(
-        fragment_pids.is_empty(),
+        fragments.is_empty(),
         "a pid with no process records no fragment delivery"
+    );
+}
+
+/// A fragment delivery to a receiver that really **was** parked records `woken == true` —
+/// the leg that must still reach the runtime's wake list, and so still be enqueued.
+///
+/// The receiver is put in the state a blocked `receive` leaves it in (`Waiting`) and stays
+/// relocation-exempt (so the heap copy is refused and the fragment route is taken). The
+/// delivery's own `Process::wake` is what moves it back to `Runnable`, which is exactly what
+/// the recorded flag has to report — the delivery is the reason it can run again.
+#[test]
+fn a_fragment_delivery_that_wakes_a_parked_receiver_records_the_wake() {
+    let mut fixture = Fixture::new();
+    let pid = fixture.pid;
+    let node = fixture.local_node;
+    fixture
+        .table
+        .set_relocation_exempt(pid, true)
+        .expect("mark the receiver relocation-exempt");
+    {
+        let receiver = fixture.table.get_mut(pid).expect("the receiver is live");
+        receiver.set_state(ProcessState::Waiting);
+    }
+    let mut scratch = Heap::new(4096).expect("a scratch arena for the payload");
+    let message = payload(&mut scratch);
+    let delivery = send(pid.to_eterm(), message);
+
+    let (outcome, fragments) = {
+        let mut sink = LocalDeliverySink::new(&mut fixture.table, node, NODE_CREATION);
+        let outcome = sink
+            .deliver(&delivery)
+            .expect("a receiver-heap refusal is not an internal error");
+        (outcome, sink.take_fragment_deliveries())
+    };
+
+    assert_eq!(outcome, DeliveryOutcome::Delivered);
+    assert_eq!(
+        fragments,
+        vec![(pid, true)],
+        "the parked receiver really was woken, so the wake note must be replayed for it"
+    );
+    assert_eq!(
+        fixture
+            .table
+            .get(pid)
+            .expect("the receiver is live")
+            .state(),
+        ProcessState::Runnable,
+        "a woken receiver is runnable again"
+    );
+    let mailbox = fixture.mailbox(pid);
+    assert_eq!(
+        mailbox.len(),
+        1,
+        "and the fragment-resident message is in its mailbox: {mailbox:?}"
     );
 }
