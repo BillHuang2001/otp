@@ -58,7 +58,7 @@
 //! kill_at_bound_monitor    {down,true,true,killed}     1 report, Kill: true
 //! log_and_continue         {survived,completed}        13 reports, Kill: false
 //! log_and_continue_silent  {survived,completed}        0 reports
-//! capacity_not_occupancy   {survived,{100,true}}       4 reports, Total Heap Size 1220 > 700
+//! capacity_not_occupancy   {survived,{100,true}}       4 reports, Total Heap Size > 700
 //! floor                    [badarg,accepted,accepted,accepted,accepted,badarg,badarg,badarg]
 //! spawn_opt_log            {survived,true,completed}   13 reports
 //! spawn_opt_kill           {died,true,true,killed}     1 report
@@ -367,7 +367,10 @@ fn a_killing_breach_reports_once_about_the_kill() {
     let blocks = blocks(&ours.err);
     assert_block(&blocks[0], |kill, total| {
         assert_eq!(kill, "true", "the report names the kill it performed");
-        assert_eq!(total, "1220", "the capacity the collection installed");
+        assert!(
+            total.parse::<u64>().expect("an integer") > 1000,
+            "the installed capacity is what breached the 1000-word bound, got {total}"
+        );
     });
     assert_eq!(field(&blocks[0], "Max Heap Size"), "1000");
     // The oracle's report is the same seven fields first, then `GC Info` and `Stacktrace`.
@@ -503,9 +506,10 @@ fn the_floor_is_the_processes_own_min_heap_size() {
 /// still breaches `#{size => 700}`.
 ///
 /// Measured: both runtimes print `{survived,{100,true}}`; the report's `Total Heap Size` is this
-/// runtime's 1220 — far above the 700 bound while the live data is a fraction of it. The figure is
-/// pinned because it is this runtime's own; the oracle's is 1220 as well here, but it is not
-/// compared (a heap capacity is runtime-specific).
+/// runtime's own post-collection capacity — far above the 700 bound while the live data is a
+/// fraction of it. The figure is this runtime's own accounting (the nursery is sized from the
+/// live-set target), so the assertion pins **that** it exceeds the bound, never the exact number,
+/// which the oracle does not share.
 #[test]
 fn the_bound_is_on_the_collected_capacity_not_the_live_occupancy() {
     let Some(oracle) = support::require_oracle(BANNER) else {

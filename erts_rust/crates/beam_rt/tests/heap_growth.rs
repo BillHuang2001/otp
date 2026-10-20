@@ -160,39 +160,40 @@ fn run_growth(rt: &mut Runtime, n: i64) -> GrowthRun {
 /// The collection count one measured run of `heap_growth:run/1` must report — **derived**, as
 /// an equation over the row's own counters:
 ///
-/// > `collections == N + (slices - 1)`
+/// > `collections == N / K + 1`, where `K = peak_young_capacity / SPRAWL_WORDS`
 ///
-/// The two terms are the two collection doors this shape reaches, and each fires exactly once
-/// per unit of its own counter:
+/// `K` is **how many of the loop's own requests the nursery holds**: the loop allocates exactly
+/// one `SPRAWL_WORDS`-word block per iteration and frees it again, so a nursery of `C` words
+/// serves `⌊C / SPRAWL_WORDS⌋` iterations before the next admission point has to collect. `C` is
+/// the run's own `peak_young_capacity` — the **post-collection** nursery chain a slice boundary
+/// observes, i.e. the capacity `beam_gc`'s `HeapPolicy::young_after_collection` settled on for
+/// this workload's live set (the live-set target, `next_words(2 * live + need_reserve_words)`),
+/// never the transient space a growth installs for one request (that growth is retired by the
+/// very next admission collection, which is why `fallbacks == 0` is the proof it happened at
+/// all). The `+ 1` is the settling collection that installs the target in the first place.
 ///
-/// 1. **One heap-admission collection per iteration.** Every iteration issues one
-///    `test_heap 401 1`, i.e. a 401-word request the fresh 233-word nursery can never hold.
-///    `context::gc::collect_or_grow` grows the nursery to cover it
-///    (`Process::ensure_capacity`), which **retires** the space it grew out of and leaves the
-///    collector's `collection_debt` set — so the next iteration's admission point must collect,
-///    and the collection sizes the nursery back down from the (empty) live set. Grow → collect
-///    alternates once per iteration, hence `N`, and the growth is *transient*: the nursery a
-///    slice boundary observes is the post-collection size, never the grown one.
-/// 2. **One boundary collection per pre-emption.** The loop burns its whole reduction budget
-///    each slice, so every non-final slice ends at the runner's `Yield` arm, which calls
-///    `context::gc::collect_at_reds_boundary`. That door collects when the nursery is occupied
-///    past its watermark **or** carries the collection debt — and this shape always carries the
-///    debt — so it collects exactly once per pre-emption, and a run of `slices` slices has
-///    `slices - 1` pre-emptions.
+/// Measured on this host (debug, `beam_rt`'s default tier): `peak_young_capacity = 843` for every
+/// run long enough to be sampled, so `K = 2` and `N = 5 000` → `collections = 2 501`,
+/// `N = 20 000` → `10 001`, `N = 1 000` → `501`. It is an identity over the row's own figures, not
+/// a calibration: the same relation holds for `N` from 50 to 20 000 (`N = 50` → `26`,
+/// `N = 500` → `251`), and the sibling `src/runner/tests.rs` growth table derives its own
+/// `collections == N + yields` from the reduction budget the same way.
 ///
-/// Measured on this host (debug, `beam_rt`'s default tier): `N = 5 000` → `collections = 5 001`,
-/// `slices = 2`; `N = 20 000` → `20 004`, `slices = 5`; `N = 50` → `50`, `slices = 1`. It is an
-/// identity, not a calibration: `src/runner/tests.rs`'s growth table pins the same relation as
-/// `collections == N + yields`.
-///
-/// What would make it regress: a `beam_gc` sizing change that stops retiring a grown space (so
-/// the debt is never set and an iteration can pass without collecting), or that lets the debt
-/// survive a collection; a change to the boundary door's `REDS_BOUNDARY_MIN_REDS` /
-/// occupancy watermark or to the runner's `DEFAULT_REDUCTIONS_PER_SLICE` (`RUN_STEP_SLICES`),
-/// which would move `slices` without moving the first term.
+/// What would make it regress: a `beam_gc` sizing change that stops the nursery from settling on
+/// its live-set target (so the admission door collects per request instead of per `K` requests —
+/// the pre-change rule, where a minor collection shrank the nursery to the 64-word reserve floor
+/// and every request had to grow it again), a growth that stops retiring the space it grew out of
+/// (so the debt is never set), or a change to the boundary door's `REDS_BOUNDARY_MIN_REDS` /
+/// occupancy watermark or to the runner's `DEFAULT_REDUCTIONS_PER_SLICE`, which would move
+/// `slices` (and therefore the pre-emption count) without moving this relation.
 fn expected_collections(n: i64, run: &GrowthRun) -> u64 {
     assert!(run.slices >= 1, "a run took at least one slice; {run:?}");
-    n as u64 + (run.slices - 1)
+    assert!(
+        run.peak_young_capacity >= SPRAWL_WORDS,
+        "a sampled run's settled nursery must hold at least one of the loop's requests; {run:?}"
+    );
+    let per_collection = run.peak_young_capacity / SPRAWL_WORDS;
+    n as u64 / per_collection as u64 + 1
 }
 
 /// Asserts the three "nothing failed" counters of a run are clean.
