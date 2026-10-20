@@ -87,6 +87,12 @@
 %%   written with file:write_file/2 before halting, and
 %%   `erlang:halt(Status,[{flush,true}])' is used.
 %%
+%%   On stdout every emitted line is *preceded* by a newline (never followed by
+%%   one), so it starts at column 0 even when a suite's own `ct:pal/2' output
+%%   did not end with a newline: `grep -c '^PASS'` therefore counts one line per
+%%   passing testcase.  The report file keeps the plain one-line-per-entry shape
+%%   (see `emit/2').
+%%
 %%   Status is 1 if any testcase failed, else 0.  `WARN' marks a testcase that
 %%   returned neither `ok' nor a `{comment,_}'/`{skip,_}'/`{error,_}' tuple
 %%   (Common Test would treat that as an error, but the return value is a
@@ -455,10 +461,19 @@ describe({exception, Class, Reason, Stack}) ->
 describe(Detail) ->
     fmt(Detail).
 
+%% Every emitted line is PRECEDED by a newline and followed by none, so it
+%% always starts at column 0: the suites print through `ct:pal/2', which lands
+%% straight on this driver's stdout (see "DELIBERATE LIMITATIONS"), and some of
+%% that output does not end with a newline.  Written as `[[L, "\n"]]' a line
+%% would then be glued onto the tail of the suite's output -- a `PASS' line
+%% that `grep -c '^PASS'' does not count.  A leading newline terminates the
+%% stray output and still keeps consecutive lines one per line.  The
+%% accumulated report entries keep the `[L, "\n"]' shape, so the report file is
+%% unaffected; stdout stays line-terminated because `write_report/2' starts its
+%% own message with `~n' (and `final_summary/1' emits a `""' line first).
 emit(#st{lines = Lines} = St, New) ->
-    Io = [[L, "\n"] || L <- New],
-    io:put_chars(Io),
-    St#st{lines = lists:reverse(Io) ++ Lines}.
+    io:put_chars([["\n", L] || L <- New]),
+    St#st{lines = lists:reverse([[L, "\n"] || L <- New]) ++ Lines}.
 
 bump(#st{pass = P} = St, pass) -> St#st{pass = P + 1};
 bump(#st{fail = F} = St, fail) -> St#st{fail = F + 1};
