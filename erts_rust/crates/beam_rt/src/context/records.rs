@@ -252,7 +252,8 @@ mod tests {
         (rt, use_module)
     }
 
-    /// The name of an atom term in the runtime's live shared table.    fn atom_name(rt: &Runtime, term: beam_term::Eterm) -> Option<String> {
+    /// The name of an atom term in the runtime's live shared table.
+    fn atom_name(rt: &Runtime, term: beam_term::Eterm) -> Option<String> {
         rt.atoms().name(atom_val(term)).map(str::to_owned)
     }
 
@@ -321,7 +322,10 @@ mod tests {
             panic!("a non-exported foreign record must raise, got {error:?}");
         };
         assert_eq!(raise.class, beam_common::ExceptionClass::Error);
-        assert_eq!(raise.reason.as_atom(), Some("badrecord"));
+        // A compound reason is term-independent here: `ExitReason::Structured`, with the
+        // live term in the raise's `live_reason` slot (the engine's uncaught funnel,
+        // `Machine::throw_with_trace`). The `badrecord` atom is the reason tuple's tag.
+        assert_eq!(raise.reason, beam_common::ExitReason::Structured);
         let reason = crate::error::live_reason_term(error)
             .expect("a `{badrecord, Id}` raise carries its live reason term");
         assert_eq!(terms::tuple_arity(reason).expect("the reason is a tuple"), 2);
@@ -410,11 +414,14 @@ mod tests {
         let (mut rt, _use_module) = runtime_with_fixtures(true);
         let owner = atom_val(rt.intern("nr_use"));
         let local = atom_val(rt.intern("local"));
-        let mut ctx = RuntimeContext::new(&mut rt);
-        let definition = ctx
-            .foreign_record_definition(owner, local)
-            .expect("the hook reports, never errors")
-            .expect("`nr_use`'s own non-exported `local` must be answered");
+        // The answer is an owned clone, so the context borrow ends here and the atom
+        // names below read the live table again.
+        let definition = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.foreign_record_definition(owner, local)
+                .expect("the hook reports, never errors")
+                .expect("`nr_use`'s own non-exported `local` must be answered")
+        };
         assert!(
             !definition.is_exported,
             "the export flag is returned unfiltered — the engine decides the badrecord branch"
@@ -446,11 +453,13 @@ mod tests {
         // An owner no module on any code path names.
         let unknown_owner = atom_val(rt.intern("no_such_owner_mod"));
         let anything = atom_val(rt.intern("anything"));
-        let mut ctx = RuntimeContext::new(&mut rt);
-        assert!(
+        let missing = {
+            let mut ctx = RuntimeContext::new(&mut rt);
             ctx.foreign_record_definition(unknown_owner, anything)
                 .expect("the hook reports, never errors")
-                .is_none(),
+        };
+        assert!(
+            missing.is_none(),
             "an owner that is on no code path is the host's honest `Ok(None)`"
         );
 
@@ -458,10 +467,12 @@ mod tests {
         // expresses as a non-exported empty answer (the engine raises `badrecord`).
         let loaded_owner = atom_val(rt.intern(PLACEHOLDER_OWNER));
         let absent = atom_val(rt.intern("no_such_record"));
-        let definition = ctx
-            .foreign_record_definition(loaded_owner, absent)
-            .expect("the hook reports, never errors")
-            .expect("a loaded owner with no such record answers the table miss");
+        let definition = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.foreign_record_definition(loaded_owner, absent)
+                .expect("the hook reports, never errors")
+                .expect("a loaded owner with no such record answers the table miss")
+        };
         assert!(!definition.is_exported);
         assert!(definition.fields.is_empty());
         assert_eq!(definition.name, absent);
@@ -493,11 +504,12 @@ mod tests {
         );
         let owner = atom_val(rt.intern("beam_types"));
         let name = atom_val(rt.intern("t_atom"));
-        let mut ctx = RuntimeContext::new(&mut rt);
-        let definition = ctx
-            .foreign_record_definition(owner, name)
-            .expect("the hook reports, never errors")
-            .expect("the seam must load the owner and retry the lookup");
+        let definition = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.foreign_record_definition(owner, name)
+                .expect("the hook reports, never errors")
+                .expect("the seam must load the owner and retry the lookup")
+        };
         assert!(
             definition.is_exported,
             "`beam_types` exports `t_atom` via -export_record/1"
@@ -513,7 +525,6 @@ mod tests {
             .map(|field| rt.atoms().name(field.name))
             .collect();
         assert_eq!(fields, vec![Some("elements")]);
-        drop(ctx);
         assert!(
             rt.code_server.is_loaded("beam_types"),
             "the seam's load half really loaded the owner"

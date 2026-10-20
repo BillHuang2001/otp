@@ -340,8 +340,74 @@ fn the_slice_wrapper_forwards_the_local_call_seam() {
     );
 }
 
-/// A scheduled export runs to completion through the runner's **tier-aware** first-entry
-/// path: its value is recorded and it exits `normal` (the selected tier is documented there).
+/// **The slice wrapper is transparent for the foreign-record-definition seam.**
+///
+/// `BudgetContext` is the `ExecutionContext` a scheduled slice's machine runs on, so a
+/// `put_record` **create** whose `Id` names **another** module's record asks *it* for the
+/// definition (`beam_engine::ExecutionContext::foreign_record_definition`), never the wrapped
+/// `RuntimeContext`. Without the forward the trait's default `Ok(None)` applies — "this host has
+/// no record table" — and the family answers its typed
+/// `… create: no record definition table for another module` instead of building the record.
+///
+/// The seam is driven through the wrapper and cross-checked against the bare inner context, so
+/// this pins the **forward** (the same definition, verbatim) rather than a constant: dropping
+/// the forward flips the answer to `None` and fails the assertion. It is deliberately **not
+/// priced** — a table lookup is not a call resolution — so the probe must stay at `0`.
+#[test]
+fn the_slice_wrapper_forwards_the_foreign_record_definition_seam() {
+    let mut rt = runtime();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+
+    // The committed native-record fixture pair's owner image: `nr_def` defines and exports
+    // `#rec{a, b}`, and the using module's `{Module,Name}` literal carries the placeholder
+    // owner `recdef` — registered here under exactly that name.
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../beam_loader/tests/fixtures/nr_def.beam"
+    ))
+    .expect("the committed nr_def fixture reads");
+    let module = rt.code_server.load_bytes(&bytes).expect("nr_def decodes");
+    rt.code_server.insert_loaded(
+        "recdef",
+        module,
+        crate::codeserver::RecordedName::Str("recdef.beam".to_string()),
+    );
+
+    let owner = beam_term::atom_val(rt.intern("recdef"));
+    let name = beam_term::atom_val(rt.intern("rec"));
+
+    // The bare context's own answer — the ground truth the wrapper must reproduce.
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    let inner = beam_engine::ExecutionContext::foreign_record_definition(&mut ctx, owner, name)
+        .expect("the seam answers")
+        .expect("the loaded owner's exported `rec` is answered");
+    assert!(inner.is_exported, "`-export_record([rec])` is in the definition");
+    assert_eq!(inner.name, name);
+    assert_eq!(inner.fields.len(), 2, "`#rec{{a, b}}` declares two fields");
+
+    // The same request through the slice wrapper: the identical definition, at no cost.
+    let mut probe = BudgetProbe::new(1_000);
+    let mut budget_ctx = BudgetContext {
+        inner: &mut ctx,
+        probe: &mut probe,
+    };
+    let forwarded =
+        beam_engine::ExecutionContext::foreign_record_definition(&mut budget_ctx, owner, name)
+            .expect("the seam answers")
+            .expect("the wrapper must forward, not fall back to the `Ok(None)` default");
+    assert_eq!(
+        forwarded, inner,
+        "the wrapper must forward the definition verbatim"
+    );
+    assert_eq!(
+        probe.used(),
+        0,
+        "the seam is a table lookup, not a call resolution — it charges no reduction"
+    );
+}
+
+/// A scheduled export runs to completion through the runner's **tier-aware** first-entry/// path: its value is recorded and it exits `normal` (the selected tier is documented there).
 #[test]
 fn a_scheduled_export_runs_through_the_tier_aware_entry() {
     let mut rt = runtime();
