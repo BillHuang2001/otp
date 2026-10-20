@@ -235,9 +235,9 @@ A close does not drop queued output: `Port::close` has the C's **flush-then-clos
 `true` with 454 656 bytes still queued — the drain is asynchronous, **not** part of the close's
 return). The C: `erts_deliver_port_exit` clears `EXITING`, sets `ERTS_PORT_SFLG_CLOSING` and calls
 `flush_port` instead of `terminate_port` when the ioq is non-empty and the reason is not `kill`
-(`io.c:3946-3954`, `flush_port(prt)` at `:3952`); `flush_port` calls the driver's `flush` **only if
-the entry has one** and
-terminates **only if the ioq became empty** (`io.c:3659-3700`); `terminate_port` (`io.c:3704-3795`)
+(`io.c:3946-3953`, `flush_port(prt)` at `:3952`); `flush_port` calls the driver's `flush` **only if
+the entry has one** (`io.c:3664` the slot test, `:3687` the call) and
+terminates **only if the ioq became empty** (`io.c:3696-3699`); `terminate_port` (`io.c:3704-3795`)
 is the sole caller
 of `drv->stop` (`io.c:3752`).
 - `driver.rs` → `Driver::flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()>`, the
@@ -554,7 +554,7 @@ failed, 2 `#[ignore]`d, over 28 test binaries.**
   `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth
   (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7210-7211` the
   `driver_eof` flush; `erl_bif_port.c:862-869,986` the `line`/`{line,N}` option decoding).
-- The close path's C ground truth: `io.c:3946-3954` (`erts_deliver_port_exit`'s CLOSING arm),
+- The close path's C ground truth: `io.c:3946-3953` (`erts_deliver_port_exit`'s CLOSING arm),
   `:3659-3700` (`flush_port`), `:3704-3795` (`terminate_port`, whose sole `drv->stop` call is
   `:3752`),
   `:3968-3971` (the Limbo comment), `:7220` (the forced `prt->ioq.size = 0` on a driver failure),
