@@ -98,8 +98,10 @@ use beam_term::prelude::{
 /// **Not routed** — the distributed-spawn family and [`Delivery::Other`] are reported as
 /// [`DeliveryOutcome::Unsupported`], with the still-missing sibling API named at each
 /// match arm. (The `DOP_MONITOR_P_EXIT`-on-local-death echo a recorded
-/// [`RemoteWatcher`](beam_process::RemoteWatcher) would owe its peer is a separate
-/// **outbound** concern, still unimplemented and out of this sink's scope.)
+/// [`RemoteWatcher`](beam_process::RemoteWatcher) owes its peer is the **outbound** half,
+/// not this sink's: `ProcessTable::terminate_into` routes a
+/// [`DistSignal::MonitorExit`](beam_process::DistSignal) per watched record and
+/// `crate::dist_client`'s `encode_signal` writes it.)
 ///
 /// Every unrouted arm is *structural*, not incidental: routing one through the nearest
 /// *locally-initiated* `beam_process` entry point (`link_term`/`monitor_term`/`…`) would
@@ -527,11 +529,13 @@ impl LocalDeliverySink<'_> {
 
     /// Classifies an addressed pid term as a process of this node.
     ///
-    /// An **internal** pid immediate is a local process by construction. The
-    /// distribution decoder materialises a pid as an **external** pid thing
-    /// (`beam_codec`), so a destination on this node arrives as an external pid
-    /// whose node atom and creation match ours — and only then is it looked up (by
-    /// number *and* serial, never number alone).
+    /// An **internal** pid immediate is a local process by construction, and that is the only
+    /// shape a decoded destination arrives in: the drain installs this node's
+    /// [`LocalIdentity`](beam_dist::control::LocalIdentity) on the link, so the decode itself
+    /// demotes a wire pid naming this node at **this** creation to the internal term (the C's
+    /// `dec_is_this_node`, `external.c:3123-3129`). Anything still external is therefore
+    /// **not** this node's — a foreign node, or a stale incarnation of this one — and the
+    /// lookup is by number *and* serial, never number alone.
     fn resolve(&self, term: Eterm) -> Target {
         match PidTarget::from_eterm(term) {
             Ok(PidTarget::Local(pid)) => Target::Local(pid),

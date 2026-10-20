@@ -1373,11 +1373,11 @@ impl Runtime {
     /// with the same gates and the same sink, so both directions route through exactly one
     /// implementation.
     ///
-    /// A no-op unless [`Runtime::allow_inbound_delivery`] turned the capability on (off by
-    /// default, so the differential corpus stays byte-identical) **and** this runtime has a
-    /// client — so a runtime with no node, no outbound link or the capability off pays one bool
-    /// test per pass and never allocates the decode arena. Never raises in practice: a
-    /// link-level failure retires just that link and records why.
+    /// A no-op unless inbound delivery is on (**on** by default —
+    /// [`Runtime::allow_inbound_delivery`] is the A/B lever that turns it off) **and** this
+    /// runtime has a client — so a runtime with no node, no outbound link or the capability
+    /// off pays one bool test per pass and never allocates the decode arena. Never raises in
+    /// practice: a link-level failure retires just that link and records why.
     ///
     /// # Errors
     ///

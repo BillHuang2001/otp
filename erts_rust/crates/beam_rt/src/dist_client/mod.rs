@@ -124,18 +124,12 @@
 //! `crate::dist::inbound`'s `remote_monitor_down`), not what it emits; and the plain form is
 //! legal on **every** peer that supports `DFLAG_DIST_MONITOR` — a mandatory-set flag
 //! (`dist.c:1504-1508` only skips the send when even that is missing) — so no per-link gate is
-//! needed and the 4-tuple form buys nothing measurable on this path.//!
-//! **Correction to a sibling's inline gloss.** `beam_process::remote`'s module
-//! table glosses the monitor family as `&[to_term, watcher.to_eterm(), ref_term]`
-//! and the unlink as `&[from, to]`; both differ from the C — the monitor family's
-//! first element is the **watcher** (the sender's local pid, `dist.c:1543-1545`:
-//! `TUPLE4(DOP_MONITOR_P, watcher, watched, ref)`), and `DOP_UNLINK_ID` carries a
-//! leading **id** (`dist.c:1472`). This module follows `dist.c` (and the
-//! `live_interop` evidence), because a real peer must never be mis-served. The
-//! unlink id is minted here (a monotonic non-zero small integer): a real receiver
-//! deletes the link by `from` and uses the id only for its acknowledgement
-//! handshake (`erl_proc_sig_queue.c:6695-6726`), so any non-zero id is accepted and
-//! effective.
+//! needed and the 4-tuple form buys nothing measurable on this path.
+//!
+//! The unlink id is minted here (a monotonic non-zero small integer, `client.rs`'s
+//! `next_unlink_id`): a real receiver deletes the link by `from` and uses the id only for its
+//! acknowledgement handshake (`erl_proc_sig_queue.c:6695-6726`), so any non-zero id is accepted
+//! and effective.
 //!
 //! # Honest limits
 //!
