@@ -232,6 +232,49 @@ const PORT_HEAP_WORDS: usize = 4_096;
 /// driver declares an earlier deadline (see [`beam_io::Driver::next_timeout`]), so a
 /// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
+
+/// How long a **nested** run waits for a live port to answer an asynchronous operation.
+///
+/// A passive `gen_tcp:recv/2,3`, a `gen_tcp:accept/1,2` and a `gen_udp:recv/2,3` all end in a
+/// plain `receive` of the socket driver's own `{inet_async, Port, Id, Result}`
+/// (`prim_inet.erl`'s `recv0/3`/`accept0/3`), which only a later port round can produce — so a
+/// caller that is *not* a scheduled process (the nested `-eval`/`-s`/`-run`/boot route) has to
+/// sit the wait out itself ([`crate::context::RuntimeContext::pump_once`]). The C has no bound
+/// there (a suspended process waits for the driver, however long that takes); a single-threaded
+/// runtime that owns its own pass cannot hang the whole executable, so the wait is bounded and
+/// an expired deadline is the typed capability gap [`PORT_EVENT_DEADLINE_REASON`].
+///
+/// This is the read's analogue of `port::busy_wait::BUSY_PORT_DEADLINE` — the same five
+/// seconds, the same "far longer than any real driver takes, far shorter than a user would
+/// tolerate" reasoning — and it bounds **one round of no progress**: every delivered event or
+/// executed slice restarts it, so a workload whose answers keep arriving is never cut short,
+/// while a port that never answers reports the diagnostic instead of looping (the outer
+/// `BLOCKING_PUMP_DEADLINE` still caps a peer that stays busy forever).
+pub(crate) const PORT_EVENT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Re-arms [`PORT_EVENT_DEADLINE`]'s no-progress window at **now** — the restart rule every nested
+/// port wait applies to a round that made progress.
+///
+/// The bound measures *consecutive* rounds without progress, so a round that delivered a port
+/// message or executed a slice moves the window forward: a workload whose completions keep arriving
+/// is then measured from its last progress, never from the instant its wait began (which is what
+/// computing the deadline once, at entry, would mean). A round that made **no** progress never
+/// restarts it, so a port that never answers still reports [`PORT_EVENT_DEADLINE_REASON`] instead
+/// of looping for ever.
+///
+/// Both nested waits apply this one rule — [`crate::context::RuntimeContext`]'s blocking port wait
+/// (a passive `gen_tcp:recv`/`accept` under the `-eval`/`-s`/`-run`/boot route) and the `-eval`
+/// bare `receive`'s port branch — so the windows cannot drift apart. The window is taken by `&mut`
+/// because the progress path resumes the machine and returns: the write *states* the rule at the
+/// point progress was established.
+pub(crate) fn restart_port_event_window(window: &mut Instant) {
+    *window = Instant::now() + PORT_EVENT_DEADLINE;
+}
+/// The capability-gap reason for a nested wait whose [`PORT_EVENT_DEADLINE`] expired with the
+/// port still holding its operation.
+pub(crate) const PORT_EVENT_DEADLINE_REASON: &str =
+    "port event: no live port delivered the {inet_async, …} completion the caller waits for \
+     within the 5 s bound (the C waits for ever)";
 /// How long one poll round may block while the async-job pool has work in flight.
 ///
 /// The pool's completions arrive on **worker** threads, which the poller knows nothing about, so a
@@ -1371,7 +1414,16 @@ impl PortRegistry {
     /// runs; the round's closes then stay queued for the next one.
     fn run_port_tasks(&mut self, reds_budget: usize) -> Result<PortTaskOutcome> {
         self.capture_round_monitors();
-        self.registry.execute_port_tasks(&mut self.poller, reds_budget)
+        let outcome = self.registry.execute_port_tasks(&mut self.poller, reds_budget)?;
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "port tasks: ran={} reds={} notif={}",
+                outcome.ran,
+                outcome.reds_used,
+                outcome.notifications.len()
+            ));
+        }
+        Ok(outcome)
     }
 
     /// Runs one `beam_io` readiness round — [`beam_io::PortRegistry::handle_events`], the round
@@ -4007,6 +4059,12 @@ impl Runtime {
             registry.prune_dead_select(|pid| table.contains(pid))?;
             registry.pump(timeout)?
         };
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "deliver_port_messages: timeout={timeout:?} events={}",
+                events.len()
+            ));
+        }
         // A driver callback cannot mint an atom (the live table is borrowed for the whole
         // callback), so a *new* name one interned was handed a predicted index for **this**
         // boundary to land. Committing before any message is built means the terms a driver
@@ -4201,9 +4259,15 @@ impl Runtime {
         // this same route — the same `table`, the same delivery seam — so a parked receiver is
         // woken through `beam_process`'s wake list (see [`ops::peer_closed`]).
         delivered += self.deliver_peer_closes(table)?;
+        // The **progress signal** a nested port wait reads around its own round (see
+        // [`Runtime::port_events_delivered`]): only a message really landed in a mailbox here, so
+        // a round that produced nothing is not mistaken for progress. Bumped at this one site —
+        // the round's own count, including the port's `'EXIT'`/`'DOWN'` and peer-close channels —
+        // because a nested machine is not in the run queue and the pass's `ran` count cannot see a
+        // delivery that happened in a round which executed no slice.
+        self.note_port_events(delivered);
         Ok(delivered)
-    }
-}
+    }}
 
 /// The second element of a [`select::SelectPayload::Plain`] notification: the registration's own
 /// handle term, or — when the registration carries a NIF **resource object** — the term minted

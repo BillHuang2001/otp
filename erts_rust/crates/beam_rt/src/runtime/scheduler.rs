@@ -587,6 +587,53 @@ impl Runtime {
             .unwrap_or(true)
     }
 
+    /// Whether some live port's driver still holds **one of its own asynchronous operations** —
+    /// a passive socket read, an `accept`, a datagram read — and therefore owes this runtime a
+    /// `{inet_async, …}` message only a later port round can produce.
+    ///
+    /// See [`PortRegistry::awaits_async_completion`](crate::port::PortRegistry::awaits_async_completion)
+    /// for why this is not [`Runtime::awaits_port_reply`]: nothing was written, so the byte
+    /// counters say nothing, and only the driver's queued-operation probe knows.
+    ///
+    /// A port table that cannot be borrowed answers `false`: the pass in progress owns it, so
+    /// the caller's own round re-borrows it and reports its answer (or its typed gap) itself.
+    pub(crate) fn ports_awaiting_async(&self) -> bool {
+        self.ports
+            .try_borrow()
+            .map(|registry| registry.awaits_async_completion())
+            .unwrap_or(false)
+    }
+
+    /// How many port messages this runtime has **delivered** since it started — the monotone
+    /// progress signal a nested port wait reads around its own round.
+    ///
+    /// A wait ([`crate::context::RuntimeContext`]'s blocking run and the `-eval` bare `receive`)
+    /// needs a third signal beside "the pass ran a slice" and "no live port still owes us an
+    /// asynchronous answer": the completion it parked on is delivered by the pass's **port half**
+    /// in a round that ran no slice, and a live *listener* keeps
+    /// [`Runtime::ports_awaiting_async`] true for ever (its accept interest is legitimately
+    /// still armed), so both of the old signals stay blind to it and the already-delivered
+    /// `{inet_async, …}` is never scanned. A change in this count between two reads means a
+    /// port round delivered something, i.e. the mailbox may now hold the answer.
+    ///
+    /// Read-only, and cheap (one `u64` read): it neither borrows the port table nor touches the
+    /// poller, so a wait may read it on every round.
+    pub(crate) fn port_events_delivered(&self) -> u64 {
+        self.port_events
+    }
+
+    /// Credits the `delivered` port messages one port round really landed to the monotone
+    /// progress count behind [`Runtime::port_events_delivered`].
+    ///
+    /// Called by [`Runtime::deliver_port_messages`] with its own delivered count — the number of
+    /// messages that reached a live mailbox, which is exactly the shape of progress a nested
+    /// wait cares about. Saturating, so an arbitrarily long run degrades to a clamped count
+    /// instead of wrapping into a smaller one (a wrap would read as "no delivery" and could
+    /// stall a wait).
+    pub(crate) fn note_port_events(&mut self, delivered: usize) {
+        self.port_events = self.port_events.saturating_add(delivered as u64);
+    }
+
     fn is_quiescent(&mut self) -> bool {
         if self.run_queue_len() != 0 {
             return false;
@@ -901,9 +948,19 @@ impl Runtime {
             // steps would burn a whole [`PORT_POLL_SLICE`]. The gate is scoped to the boot
             // drive's own [`TimerWait::ImminentWithin`] policy: the `run` and `-eval` routes
             // keep the unconditional blocking poll their workloads rely on.
+            //
+            // The gate has a **second** exception, and it is the socket half of the same
+            // question: a driver holding one of its own asynchronous operations
+            // ([`Runtime::ports_awaiting_async`] — a passive `gen_tcp:recv`, an `accept`, a
+            // datagram read) has written nothing and answered nothing, so the byte counters
+            // say "idle" while the port is in fact owed an answer that only a later round can
+            // produce. Blocking on such a port is exactly what the wait is for — it is how a
+            // nested `receive` on that operation reaches its completion without spinning.
             let progressed = round_slices > 0;
             let port_timeout = if progressed
-                || (matches!(wait, TimerWait::ImminentWithin(_)) && !self.awaits_port_reply())
+                || (matches!(wait, TimerWait::ImminentWithin(_))
+                    && !self.awaits_port_reply()
+                    && !self.ports_awaiting_async())
             {
                 Duration::ZERO
             } else {

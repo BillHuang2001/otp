@@ -528,7 +528,28 @@ pub struct Runtime {
     context_switches: u64,
     /// The anchor of the previous `erlang:statistics(context_switches)` read.
     context_switches_anchor: Cell<u64>,
-    /// The shared **I/O byte counters** behind `erlang:statistics(io)`.
+    /// How many **port messages this runtime has delivered** since it started — the monotone
+    /// progress signal a nested port wait reads ([`Runtime::port_events_delivered`]).
+    ///
+    /// A nested wait cannot decide "the answer may now be in the mailbox" from the pass's own
+    /// `ran` count alone. A driver's `{inet_async, …}` completion is delivered by the pass's
+    /// **port half** ([`Runtime::deliver_port_messages`]), in a round that executed **no** slice:
+    /// a nested machine is not in the run queue, and no port task is ready until the socket
+    /// answers. Nor does [`Runtime::ports_awaiting_async`] fall once the answer has landed — a
+    /// listener keeps its own accept interest armed for ever (which is correct: the wait must
+    /// still be entered for an `accept`). Both signals are therefore blind to the delivery in the
+    /// very round it happens, and the wait burns its whole
+    /// [`crate::port::PORT_EVENT_DEADLINE`] while the answer sits unscanned. Counting the
+    /// deliveries themselves is what closes that gap.
+    ///
+    /// Bumped **only** where a message really lands in a mailbox (a port signal or a peer close
+    /// included; a round that delivered nothing is not progress), so the count is a faithful
+    /// "something reached a mailbox" signal rather than a poll counter.
+    ///
+    /// It is a **read-only** signal: reading it arms, latches and consumes nothing — no second
+    /// `TCP_REQ_RECV` (the driver's `ealready`), no async-operation id burn — so a wait that
+    /// re-executes is safe.
+    port_events: u64,    /// The shared **I/O byte counters** behind `erlang:statistics(io)`.
     ///
     /// A clone of the [`PortRegistry`]'s own handle ([`crate::port::IoCounters`]), bumped
     /// where port bytes really move, so the `statistics(io)` arm reads them without borrowing
@@ -1304,7 +1325,7 @@ impl Runtime {
             exact_reductions_anchor: Cell::new(0),
             context_switches: 0,
             context_switches_anchor: Cell::new(0),
-            io_counters,
+            port_events: 0,            io_counters,
             cpu_clock: RefCell::new(beam_io::cpu_time::RuntimeClock::new()),
             booted: false,
             booting: false,            halt: None,

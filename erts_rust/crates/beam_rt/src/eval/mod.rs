@@ -1615,6 +1615,41 @@ impl Evaluator<'_, '_> {
                         "receive (no after clause) inside a spawned process",
                     )));
                 }
+                // A live port whose driver still holds **its own** asynchronous operation — a
+                // passive `gen_tcp:recv/2,3`, an `accept`, a datagram read — owes this receive a
+                // `{inet_async, …}` that only a later port round can produce, and it produces it
+                // when the *socket* is ready, arbitrarily later than this round. That is the one
+                // bare-receive wait with a real answer behind it, so it is sat out here rather
+                // than reported as the typed gap; [`PORT_EVENT_DEADLINE`] bounds it.
+                if self.ctx.runtime.ports_awaiting_async() {
+                    // The same three progress signals the compiled route's
+                    // [`RuntimeContext::wait_for_port_event`](crate::context::RuntimeContext) reads,
+                    // and for the same reason: the driver's `{inet_async, …}` completion is
+                    // delivered by the pass's **port half** in a round that runs no slice, so
+                    // `pump_scheduler`'s slice count alone is blind to it, and a live *listener*
+                    // keeps `ports_awaiting_async` true for ever (its accept interest is
+                    // legitimately armed). Reading the runtime's delivered-port-message count
+                    // around the round is what notices the delivery. Nothing is armed, latched or
+                    // consumed by it.
+                    let mut deadline = Instant::now() + crate::port::PORT_EVENT_DEADLINE;
+                    loop {
+                        let events_before = self.ctx.runtime.port_events_delivered();
+                        let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
+                        let delivered = self.ctx.runtime.port_events_delivered() != events_before;
+                        if ran > 0 || delivered || !self.ctx.runtime.ports_awaiting_async() {
+                            // Progress restarts the no-progress window the bound measures, so a
+                            // workload whose completions keep arriving is never cut short.
+                            crate::port::restart_port_event_window(&mut deadline);
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(Flow::Fatal(error::unsupported(
+                                crate::port::PORT_EVENT_DEADLINE_REASON,
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
                 if ran == 0 {
                     return Err(Flow::Fatal(error::unsupported(

@@ -216,6 +216,43 @@ impl PortRegistry {
             .any(|meta| meta.output.get() > meta.input.get())
     }
 
+    /// Whether some live port's driver still holds **one of its own asynchronous operations** —
+    /// the socket half of "this wait can still be answered".
+    ///
+    /// [`PortRegistry::awaits_port_reply`] covers the ports that owe a *reply to bytes this
+    /// runtime wrote* (a child echoing its request). This is the other family, and the one a
+    /// **passive** socket read belongs to: `prim_inet`'s `recv0/3`/`accept0/3` issue a control
+    /// op, get an id back, and then `receive` a `{inet_async, Port, Id, Result}` that only a
+    /// later port round can produce ([`beam_io`]'s async-operation queue,
+    /// `drivers/inet/async.rs`). Nothing was written, so `awaits_port_reply` is `false`; only
+    /// [`beam_io::Driver::has_pending_async`] — the drivers' own queued-operation probe — knows
+    /// the port is still owed an answer.
+    ///
+    /// It is a live-port question, so a port the registry no longer holds contributes nothing
+    /// (a close drains its pending operations and reports them before the descriptor goes away).
+    pub fn awaits_async_completion(&self) -> bool {
+        if crate::debug_trace::enabled() {
+            let mut keys: Vec<u64> = self.meta.keys().copied().collect();
+            keys.sort_unstable();
+            crate::debug_trace::trace(format_args!("awaits_async: meta={keys:?}"));
+        }
+        self.meta
+            .keys()
+            .filter_map(|number| self.registry.get(PortId::new(*number)).map(|held| (*number, held)))
+            .any(|(number, held)| {
+                let pending = held.driver().has_pending_async();
+                if pending && crate::debug_trace::enabled() {
+                    let listening = held
+                        .driver_as::<beam_io::drivers::inet::TcpInetDriver>()
+                        .map(|tcp| tcp.state().is_listening());
+                    crate::debug_trace::trace(format_args!(
+                        "awaits_async: port {number} pending (tcp listening={listening:?})"
+                    ));
+                }
+                pending
+            })
+    }
+
     /// The `locking` item's value atom: `port_level` when the port has its own lock,
     /// `driver_level` when all ports of its driver share one. See the module docs.
     pub(super) fn info_locking(&self, port: PortId) -> &'static str {
