@@ -36,10 +36,10 @@
 //!    than a few MiB to the process's `VmHWM`. The pre-fix commit grew roughly **linearly**
 //!    (the same workload's documented pre-fix curve, `tools/bench/RESULTS.md` §6.7, is
 //!    29 MiB → 227 MiB for a 20× `N` step, i.e. ~+190 MiB for this suite's 10× step): at the
-//!    fix's HEAD the churn payload itself is flat — the 10× step adds **~0.1 MiB**. (The
-//!    absolute `VmHWM`, ≈381 MiB on this host, is the runtime's *fixed boot cost*: every
-//!    action now drives the boot script and eagerly loads its modules, so the *bound* is the
-//!    growth across `N`, not the absolute figure.)
+//!    fix's HEAD the churn payload itself is flat — the 10× step adds **~1 MiB**. (The absolute
+//!    `VmHWM`, ≈120 MiB on this host, is the runtime's *fixed boot cost*: every action now
+//!    drives the boot script and eagerly loads its modules, so the *bound* is the growth across
+//!    `N`, not the absolute figure.)
 //! 2. [`the_churn_loop_really_collects`] — the *deterministic* half, with no RSS at all:
 //!    driven through [`Runtime::run_scheduled`], the loop's value is exactly `N` **and**
 //!    [`Runtime::gc_stats`] reports non-zero collections. Before the fix the valve declined
