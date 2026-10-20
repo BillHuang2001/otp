@@ -68,7 +68,7 @@
 //! | [`a_real_erl_peer_links_to_our_process_and_traps_our_exit`] | `link/1` + `trap_exit`, then dies our victim with `boom` | `EXIT_MATCH pid=true reason=boom`, and the `{'EXIT', Pid, boom}` whose pid **is** the pid we printed |
 //! | [`a_real_erl_peer_traps_our_exit_with_the_reason_term_it_asked_for`] | the same, with the **compound** reason `{shutdown,{custom,7}}` | the reason *value*, not merely the event |
 //! | [`a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered`] | `unlink/1` first (with a barrier proving *our* node processed it), then dies the victim | `NOEXIT`, and no `EXIT` line at all |
-//! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
+//! | [`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`] | `link/1`, a barrier, then `unlink/1` and a second barrier — the victim never dies | the victim's `process_info(Victim, links)` is `1 [true]` (`length/1` + `is_pid/1`, never the pids) after the link and `0 []` after the unlink |//! | [`a_real_erl_peer_monitors_our_process_and_gets_the_peer_minted_down`] | `erlang:monitor(process, Victim)`, then dies it | `{'DOWN', Ref, process, Victim, boom}` in a clause that **binds the same `Ref`** |
 //! | [`a_real_erl_peer_demonitors_before_our_death_so_no_down_arrives`] | `demonitor(Ref, [flush])` first | `NODOWN`, and no `DOWN` line at all |
 //! | [`our_pid_survives_a_round_trip_through_a_real_erl_peer`] | echoes a pid term back | our pid arrives intact (`IDENTITY true`, the same text) |
 //!
@@ -149,7 +149,9 @@
 //!   recorded against our local process, a `DOP_UNLINK_ID`/`DOP_DEMONITOR_P` removes it
 //!   again, and when that process dies the runtime routes `DOP_EXIT`/`DOP_MONITOR_P_EXIT`
 //!   back over the **same** link, with the reason term intact and the peer's own reference
-//!   echoed.
+//!   echoed. The recorded link is also **observable from our side**, in the linked process's
+//!   `process_info(Pid, links)` item — the union of its local links and the remote peers
+//!   ([`a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink`]).
 //! * **`erlang:monitor_node(Node, true)`** answers `true` for a connected node and delivers
 //!   `{nodedown, Node}` to the monitoring process when the link dies, in **both**
 //!   directions.
@@ -169,7 +171,8 @@
 //! every child's transcript is echoed on failure *and* on every loud skip. Each test is a
 //! two-VM session of a few seconds (the two negative controls spend 3 s in their own
 //! deliberately-expiring wait); `--test-threads=1` keeps a loaded host's timings honest.
-//! The whole eight-test file runs in ~18 s on an idle host.
+//! The whole sixteen-test file runs in ~46 s on a loaded host (≈2.4 s per two-VM session),
+//! and every case boots two real VMs.
 
 // The two-VM harness is compiled into every test target; this target only uses a subset of
 // it, so the unused helpers would otherwise warn here.
@@ -207,6 +210,9 @@ const LINGER_SPEC: &str = "two_vm:linger/0";
 /// alive until the actor has finished observing.
 const PEER_DRIVES_SPEC: &str = "two_vm:peer_drives/1";
 
+/// The responder for the `links`-item case: the same victim protocol, but every barrier it
+/// answers is followed by a report of the victim's `process_info(Victim, links)` **shape**.
+const PEER_DRIVES_LINKS_SPEC: &str = "two_vm:peer_drives_links/1";
 /// The responder for the identity round trip.
 const IDENTITY_SPEC: &str = "two_vm:identity/1";
 
@@ -725,6 +731,84 @@ fn a_real_erl_peer_unlinks_first_so_our_exit_is_not_delivered() {
         "the peer unlinked before the victim died, so no exit signal may reach it",
     );
     pair.actor_equals("BYE ", "BYE done");
+    pair.finish();
+}
+
+/// **A real `erl` peer's `link/1` shows up in our `process_info(Victim, links)` item, and
+/// its `unlink/1` clears it again.**
+///
+/// The observable the C runtime offers for an inbound `DOP_LINK` is the target process's
+/// `links` item: ERTS keeps every link — local process/port and remote process/port — in one
+/// link tree, so a peer-linked process names the peer's **external pid** there. This runtime
+/// holds the local half and the inbound remote half in two stores, so this is the case that
+/// proves the item is their union end to end (the hermetic unit test in
+/// `src/native/memory/tests.rs` only proves the rendering).
+///
+/// The actor `link/1`s the victim, takes a barrier round trip (same-link signals are applied
+/// in order, so the ack proves our node has already applied the `DOP_LINK`), then `unlink/1`s
+/// it and takes a second one. The victim is **never killed**, so the only thing that changes
+/// between the two reports is the peer's own link — and the third report (after the second
+/// barrier) shows it stays empty.
+///
+/// Both reports are the item's **shape**, `length/1` plus one `is_pid/1` per element: an
+/// external pid has no printable text in this runtime (`beam_bifs`'s `external_channel_gap`,
+/// the typed capability gap) and its channel is a per-VM node-table index, so the pids
+/// themselves are unprintable on both sides. The whole claim is `LINKS_LINKED 1 [true]` →
+/// `LINKS_UNLINKED 0 []`, from the empty baseline `LINKS_FRESH 0 []` taken before the peer
+/// did anything.
+#[test]
+#[ignore = "two VMs: a system erl/erlc/epmd peer plus setsid/kill; run with --ignored --nocapture"]
+fn a_real_erl_peers_link_shows_up_in_the_links_item_and_clears_on_unlink() {
+    let Some(pair) = Pair::start(
+        PeerKind::Oracle,
+        BANNER,
+        "links_item",
+        PEER_DRIVES_LINKS_SPEC,
+        "link_and_unlink",
+    ) else {
+        return;
+    };
+    // The pid whose item is reported: one of ours, so it renders as `<0.number.serial>`
+    // (a *local* pid — the peer is the one that sees it as remote).
+    let victim = pair.runtime_text("VICTIM ");
+    assert!(
+        victim.starts_with("<0."),
+        "the victim must be a local pid of ours, printed as `<0.number.serial>`, not `{victim}`\n{}",
+        pair.diagnostics()
+    );
+    // Before the peer acts: a freshly spawned child has no links at all.
+    pair.runtime_equals("LINKS_FRESH ", "LINKS_FRESH 0 []");
+
+    pair.actor_equals("PONG ", &format!("PONG {}", pair.actor_node));
+    // The peer holds a pid term (it prints no text for it, so the behaviour stays runnable on
+    // either peer kind).
+    pair.actor_equals("LINK_VICTIM_IS_PID ", "LINK_VICTIM_IS_PID true");
+    pair.actor_equals("LINKED", "LINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // The peer's `link/1` arrived: exactly one entry, and it is a pid.
+    pair.runtime_equals("LINKS_LINKED ", "LINKS_LINKED 1 [true]");
+
+    pair.actor_equals("UNLINKED", "UNLINKED");
+    pair.actor_equals("BARRIER ", "BARRIER ok");
+    // … and its `unlink/1` cleared it again, with the victim still running.
+    pair.runtime_equals("LINKS_UNLINKED ", "LINKS_UNLINKED 0 []");
+    pair.actor_equals("VICTIM_ALIVE", "VICTIM_ALIVE");
+
+    pair.runtime_equals("PEER_SAW ", "PEER_SAW links_reported");
+    pair.actor_equals("BYE ", "BYE done");
+    pair.runtime_equals("HANDSHAKE_DONE", "HANDSHAKE_DONE");
+    // Every report read a real `{links, …}` item (a missing one prints `… NOITEM …`), and the
+    // session took exactly the two barrier round trips the protocol defines.
+    pair.assert_no_substring(
+        &pair.runtime,
+        "NOITEM",
+        "every `links` report was taken from a real `process_info/2` reply",
+    );
+    pair.assert_absent(
+        &pair.runtime,
+        &["LINKS_LATER", "PARENT_TIMEOUT"],
+        "the session took exactly the two barrier round trips the protocol defines",
+    );
     pair.finish();
 }
 
