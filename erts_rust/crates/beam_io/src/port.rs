@@ -1469,7 +1469,14 @@ impl Port {
                 break;
             };
             let before = self.output.len();
-            let reds = self.run_task(poller, &task)?;
+            // A refused write (`Err` from the driver's `output`/`ready_output`) is **not** fatal to
+            // the close: nothing was written, so the drain simply stops and the port parks. The
+            // refusal then surfaces where it already does — at the round that re-drives the queued
+            // `OUTPUT` task (`PortRegistry::execute_port_tasks` → `Err`) — instead of turning the
+            // teardown itself into an error the caller can do nothing about.
+            let Ok(reds) = self.run_task(poller, &task) else {
+                break;
+            };
             budget = budget.saturating_sub(reds.max(1));
             if self.output.len() >= before {
                 // No progress: this write cannot move (EAGAIN, a busy driver, a refused command).

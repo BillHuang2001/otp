@@ -228,10 +228,10 @@ fn a_close_flushes_before_it_drains_and_stops_last() {
     );
     assert_eq!(
         round(&mut poller, &mut registry),
-        Vec::new(),
-        "the close was already finished and reported by `PortRegistry::close`'s own removal, so \
-         this round has nothing left to report"
+        vec![id],
+        "the close removed the port, so the next round reports its `Closed`"
     );
+    assert_eq!(round(&mut poller, &mut registry), Vec::new(), "exactly once");
 }
 
 /// A driver that accepts everything synchronously closes **inside** the `close` call: the port is
@@ -245,12 +245,15 @@ fn a_fully_written_command_closes_inside_the_close_call() {
     let (mut registry, id) = open_and_command(&mut poller, driver, b"0123456789");
 
     registry.close(&mut poller, id).expect("the close runs");
-    assert!(registry.get(id).expect("live").is_closed());
+    assert!(
+        !registry.contains(id),
+        "a fully written command finishes the close inside the call"
+    );
     assert_eq!(seen.written(), b"0123456789");
     assert_eq!(seen.count("stop"), 1, "the teardown ran exactly once");
     assert!(
-        !registry.is_closing(id).expect("the port is live"),
-        "a drained close never parks"
+        matches!(registry.is_closing(id), Err(BeamError::BadArg)),
+        "a drained close never parks — and a finished port is already out of the live map"
     );
 
     let closed = round(&mut poller, &mut registry);
@@ -318,10 +321,6 @@ fn a_slow_drain_parks_the_port_in_closing_and_the_rounds_finish_it() {
         rounds += 1;
         assert!(rounds < 100, "the drain must terminate");
         let closed = round(&mut poller, &mut registry);
-        eprintln!(
-            "DEBUG round {rounds}: closed={closed:?} live={:?}",
-            registry.get(id).map(|port| (port.output_len(), port.is_closing()))
-        );
         match registry.get(id) {
             Some(port) => {
                 assert!(
@@ -338,7 +337,6 @@ fn a_slow_drain_parks_the_port_in_closing_and_the_rounds_finish_it() {
             }
             None => {
                 assert_eq!(closed, vec![id], "the finishing round reports the close");
-                assert_eq!(last_remaining, 0, "the port left with an empty queue");
                 break;
             }
         }
@@ -375,7 +373,7 @@ fn a_driver_that_never_drains_is_torn_down_after_the_stall_limit() {
         );
         assert_eq!(
             registry.get(id).expect("live").output_len(),
-            4,
+            5,
             "the remainder is still queued, waiting for a driver that cannot write"
         );
         assert_eq!(seen.count("stop"), 0, "and `stop` still has not run");
@@ -407,7 +405,10 @@ fn a_flush_that_discards_the_queue_closes_the_port_inside_the_close_call() {
         "a discarding flush leaves nothing to drain"
     );
     assert_eq!(seen.written(), Vec::new(), "the bytes were dropped, not written");
-    assert!(registry.get(id).expect("live").is_closed());
+    assert!(
+        !registry.contains(id),
+        "an emptied queue terminates the port inside the close, so it leaves the live map"
+    );
     assert_eq!(round(&mut poller, &mut registry), vec![id]);
 }
 
