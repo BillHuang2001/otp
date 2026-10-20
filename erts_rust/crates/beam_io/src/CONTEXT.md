@@ -265,8 +265,8 @@ drivers publish their own state through them (see *Who overrides the seam* below
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
 integration-test node, and the crate-level policy (real fds, loud skips, oracle cross-checks) is in
 `../CONTEXT.md`.
-**Per-module in-module counts (`-p beam_io --lib` = 1015):** `drivers` **686** — of which `inet`
-**574** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
+**Per-module in-module counts (`-p beam_io --lib` = 1032):** `drivers` **703** — of which `inet`
+**591** (per-suite breakdown in `drivers/inet/CONTEXT.md`), `line_buffer` 24, `spawn` 23, `ram_file`
 29 (`ram_file_tests` 23 + `ram_file_split_tests` 6), `fd` 14, `efile` 13, `binary_io` 9 — then
 `registry` 60 (36 + the 4 in `registry_reply_tests.rs` + the 4 in `registry_busy_tests.rs` + the 7 in
 `registry_downcast_tests.rs` + the 9 in `active_mode_tests.rs`), `io_device` 41, `abi` 41 (`host` 23 = 18 + the 5 in
