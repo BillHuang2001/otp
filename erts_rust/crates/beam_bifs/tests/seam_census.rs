@@ -41,7 +41,7 @@
 //!   `erlang:fun_info_mfa/1` (which was never a seam key). Each is asserted
 //!   **registered**, **not** a member of any exported `hook_sets` table (every
 //!   `needs_*` predicate is `false`), and to produce a **non-gap** value.
-//! * **B — seam-blocked (206 rows).** Keys that read one of the eleven seams whose
+//! * **B — seam-blocked (211 rows).** Keys that read one of the eleven seams whose
 //!   uninstalled default is the typed gap, so they answer `error:unsupported_bif`
 //!   today. Membership is **derived**, never restated: the union of the exported
 //!   `hook_sets` tables that gate a roster key, deduped, minus the documented

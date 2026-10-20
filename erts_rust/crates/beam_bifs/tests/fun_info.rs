@@ -763,6 +763,78 @@ fn fun_to_list_1_quotes_atoms_like_the_c_printer() {
     }
 }
 
+/// A `LocalFunIdentity` stub answering `identity` for every term (what `beam_rt`
+/// supplies for a loaded module's `make_fun3` closure), or `None` for a fun no loaded
+/// module can attribute.
+struct StubIdentity(Option<beam_codec::FunIdentity>);
+
+impl beam_bifs::LocalFunIdentity for StubIdentity {
+    fn local_fun_identity(
+        &mut self,
+        _term: Eterm,
+    ) -> Result<Option<beam_codec::FunIdentity>> {
+        Ok(self.0)
+    }
+}
+
+/// The golden `fun_to_list/1` of a `make_fun3` fun once the identity seam answers, and
+/// the typed gap when it answers `Ok(None)`, plus `badarg` for a non-fun.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1, a compiled `fiprobe` probe): `fiprobe:mk1()` with
+/// `mk1() -> fun(X) -> X + 1 end` is `#Fun<fiprobe.1.75998142>` — the printed triple is
+/// `fun_info(F, module)`/`index`/`uniq`, and `term_to_binary`/`binary_to_term` round
+/// trips it unchanged (`fun_info(I, type)` ⇒ `{type,local}`).
+#[test]
+fn fun_to_list_1_renders_a_local_fun_through_the_seam() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+
+    // With the seam installed the local fun renders the oracle's triple, taken here
+    // from the `fiprobe:mk1()` probe above.
+    let mut stub = StubIdentity(Some(beam_codec::FunIdentity::new(
+        atoms.lookup("fiprobe").expect("seeded module"),
+        MK1_UNIQ,
+        1,
+        75998142,
+        FunPid {
+            node: atoms.lookup("nonode@nohost").expect("seeded node"),
+            number: 1,
+            serial: 0,
+            creation: 0,
+        },
+    )));
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut stub);
+    // The descriptor carries `[uniq, index]` only — the module/old_index/old_uniq the
+    // text shows come from the seam.
+    let (_storage, local) = local_fun(1, 85002344, 1, &[]);
+    let text = call(&reg, &mut ctx, "fun_to_list", &[local]).expect("fun_to_list");
+    assert_eq!(
+        list_to_string(&reg, &mut ctx, text),
+        "#Fun<fiprobe.1.75998142>"
+    );
+
+    // With the seam answering `Ok(None)` — the `-eval` `erl_eval` template closure is
+    // the oracle's own example — the answer is the typed capability gap, never a
+    // fabricated `#Fun<…>`.
+    let mut none = StubIdentity(None);
+    let mut ctx = make_ctx(&mut heap, &atoms).with_local_fun_identity(&mut none);
+    assert_unsupported_bif(
+        call(&reg, &mut ctx, "fun_to_list", &[local]),
+        "fun_to_list/1 of a Local fun the seam cannot attribute",
+    );
+
+    // A non-fun stays `badarg` on both routes.
+    for non_fun in [make_small(42), NIL] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "fun_to_list", &[non_fun]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+/// The same `badarg`/typed-gap split with **no** hook installed at all — the crate's
+/// default `BifContext`, where the seam answers `Ok(None)`.
 #[test]
 fn fun_to_list_1_gaps_a_local_fun_and_badargs_a_non_fun() {
     let reg = default_registry();
@@ -771,8 +843,8 @@ fn fun_to_list_1_gaps_a_local_fun_and_badargs_a_non_fun() {
     let mut ctx = make_ctx(&mut heap, &atoms);
 
     // The oracle renders a local fun as `#Fun<Module.OldIndex.OldUniq>` (e.g.
-    // "#Fun<fiprobe.1.85002344>") — a triple the inlined descriptor cannot
-    // supply, so this is the documented typed gap rather than a wrong string.
+    // "#Fun<fiprobe.1.85002344>") — a triple the inlined descriptor cannot supply, so
+    // with no seam this is the documented typed gap rather than a wrong string.
     let (_storage, local) = local_fun(1, 85002344, 1, &[]);
     assert_unsupported_bif(
         call(&reg, &mut ctx, "fun_to_list", &[local]),
