@@ -269,8 +269,7 @@ The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + ari
 - `src/driver.rs` → the non-blocking `ConnectionDriver` (`feed`/`step`/`take_output`/`next_message`/`next_delivery(_checked)`/`dispatch_inbound(_checked)`/`send_control`/`peer_visibility`/`failed_frame`), `DriverState`/`StepOutcome`, the `server_with_decision` constructor
 - `src/epmd.rs` → the request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set + `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport`, the real TCP client (`connect`, `lookup_at`/`lookup_port_at`, the `EPMD_DEFAULT_ADDR`-pinned wrappers)
 - `src/bin/dist_probe.rs` → the hermetic two-node loopback CLI (11 report kinds) the differential harness drives as an external command
-- `tests/{atom_cache,auth,connection,constants,control,delivery,dist_probe_cli,dop_roundtrip,driver,epmd,fragment,framing,handshake,hermetic_epmd,local_identity,monitor_exit_vectors,two_node_loopback,two_node_session,validated_delivery}.rs` → the integration suites summarized under Test Strategy
-- `tests/live_{interop,accept,accept_blocking,driver}.rs` + `tests/common/mod.rs` → the real-`erl` suites and their shared spawn harness
+- `tests/*.rs` → the integration suites summarized under Test Strategy; `tests/live_{interop,accept,accept_blocking,driver}.rs` are the real-`erl` ones, over the shared spawn harness in `tests/common/mod.rs`
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 2; consumes `beam_codec`).
