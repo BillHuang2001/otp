@@ -1578,8 +1578,11 @@ impl Runtime {
     /// The factory is **process-global** and last-install-wins, while the crate's own suite builds
     /// many runtimes in one process: a `Drop` that cleared the slot would have each of them uninstall
     /// the others' factory as it went out of scope. Teardown therefore stays an explicit host
-    /// decision, made by the one long-lived runtime a real invocation builds (see
-    /// [`crate::cli`]).
+    /// decision, made by the one long-lived runtime a real invocation builds: [`crate::cli::run`]'s
+    /// success arm, the only exit of a real invocation on which the runtime is still alive (an
+    /// abnormal exit writes a crash dump, which reads the runtime it would tear down, or ends in
+    /// `abort`). Every other caller — the crate's own suites included — installs and clears around a
+    /// window it owns instead, serialised by the test-only `lock_nif_thread_env`.
     pub fn clear_nif_thread_env(&mut self) {
         beam_abi::nif::clear_thread_env_factory();
         self.nif_thread_sends = None;

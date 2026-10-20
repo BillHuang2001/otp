@@ -63,7 +63,8 @@
 //! never be handed to the runtime's own term machinery. The mix that could smuggle one in is
 //! `enif_send` issued from a **call-path** env carrying a term built on a **foreign** host: the call
 //! host encodes against the live table, where a private index names no live atom, so that encode is
-//! the typed refusal (never a substituted atom).//!
+//! the typed refusal (never a substituted atom).
+//!
 //! # The one deliberate substitution: a queued ETF image, not a synchronous delivery
 //!
 //! The C's `enif_send` from a thread with no calling process delivers **synchronously inside the
@@ -94,7 +95,8 @@
 //! decodes it into its own heap against its own live table (installing the same local-node identity,
 //! so a message carrying one of this node's pids/ports/references still decodes to the internal id).
 //! The copy is the cost of crossing the thread boundary safely, and it is why [`ForeignHost::send`]
-//! needs the message to be *encodable*.//!
+//! needs the message to be *encodable*.
+//!
 //! # Ownership, lifetime and threading
 //!
 //! * [`ThreadEnvFactory`] is `Send + Sync + 'static` (the ABI seam's requirement — it lives in a
@@ -132,7 +134,8 @@
 //!   by name on this thread (`beam_term::compare`'s documented fallback). The hub could serve a name
 //!   through its scratch table, but that table is a *snapshot* of a space other threads of this
 //!   factory may be appending to, and this host must not hand `beam_term` a view that a concurrent
-//!   reservation could move past.//! * **`select`, monitors, liveness, `whereis_pid`, `make_ref`, `unique_integer`, `system_info`,
+//!   reservation could move past.
+//! * **`select`, monitors, liveness, `whereis_pid`, `make_ref`, `unique_integer`, `system_info`,
 //!   `term_to_binary`/`binary_to_term`, `port_command`, `priv_data`,
 //!   `dynamic_resource_call`/`consume_timeslice`/`nif_schedule`** keep their trait defaults: every
 //!   one of them needs the runtime's process table, poller, reference space or code server, which
