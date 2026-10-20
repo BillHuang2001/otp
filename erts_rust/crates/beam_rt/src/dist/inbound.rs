@@ -455,12 +455,12 @@ impl LocalDeliverySink<'_> {
             // Not an internal reference thing: outside the opcode's contract
             // (`dist.c:2577`), so neither a delivery nor a drop is claimed for it.
             //
-            // A wire-borne reference currently arrives in the **external** form — the
-            // control-message decoder installs no local-node identity
-            // (`beam_dist::control::decode_control`), so the codec's local-node
-            // demotion never runs — and an external reference is not a readable alias
-            // key here. That is a `beam_dist` handoff, recorded rather than worked
-            // around: see the module's escalation notes.
+            // A **wire** alias reference reaches here in the internal form: the drain
+            // installs this node's `beam_dist::control::LocalIdentity`, so a reference
+            // naming this node at this creation is demoted by the decode (the C's
+            // `dec_is_this_node`, `external.c:3123-3129`) and its id is a readable alias
+            // key. A drain with no identity installed leaves it external — the typed
+            // `Unsupported` rather than a guess.
             return Ok(DeliveryOutcome::Unsupported);
         };
         let Some(owner) = self.table.resolve_alias(reference) else {
@@ -535,15 +535,13 @@ impl LocalDeliverySink<'_> {
     fn resolve(&self, term: Eterm) -> Target {
         match PidTarget::from_eterm(term) {
             Ok(PidTarget::Local(pid)) => Target::Local(pid),
-            Ok(PidTarget::Remote(remote))
-                if remote.node() == self.local_node
-                    && remote.creation() == self.local_creation =>
-            {
-                Target::Local(ProcessId::new(
-                    u64::from(remote.number()),
-                    u64::from(remote.serial()),
-                ))
-            }
+            // Anything still external is **not** this node's: the demotion of a wire pid
+            // naming this node at this creation is the **decode's** rule, not the sink's.
+            // `beam_dist`'s `LocalIdentity` (`decode_control_with_identity`) is installed on
+            // every link this runtime drains, so a pid addressed to this node arrives here
+            // already internal (the C's `dec_is_this_node`, `external.c:3123-3129`) — a
+            // foreign node or a stale incarnation of this one stays a remote pid and is
+            // never resolved by its slot number alone.
             Ok(PidTarget::Remote(_)) => Target::Foreign,
             Err(_) => Target::NotAPid,
         }
@@ -935,15 +933,21 @@ impl LocalDeliverySink<'_> {
     /// `None`, never a guessed id: such an identity has no faithful `u64` image (see the
     /// `Monitor`/`Demonitor` arm).
     fn wire_monitor_ref_id(&self, term: Eterm) -> Option<u64> {
+        // The normal shape: the drain installed this node's `LocalIdentity`, so our own
+        // reference came back **internal** and its id word *is* the monitor id (the pack
+        // `monitor_ref_term` writes is canonical, so the demotion restores it exactly).
+        if let Ok(reference) = MonitorRef::from_eterm(term) {
+            return Some(reference.id());
+        }
+        // Otherwise the reference stayed external — a drain with no identity installed, or
+        // an id the internal slot cannot hold. Unpack the external image with the inverse
+        // of that same pack (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159`), and only
+        // for a reference this node minted: the node and creation must be **ours**.
         let (node, ids, creation) = external_ref_parts(term).ok()?;
         if node != self.local_node || creation != self.local_creation {
             return None;
         }
-        let (high, low) = match ids {
-            [0, high, low] => (*high, *low),
-            _ => return None,
-        };
-        Some((u64::from(high) << 32) | u64::from(low))
+        Some(ref_numbers_to_id(ids))
     }
 }
 
@@ -956,6 +960,20 @@ fn receipt(result: Result<()>) -> Result<DeliveryOutcome> {
         Err(BeamError::TermNotFound) => Ok(DeliveryOutcome::NoSuchProcess),
         Err(err) => Err(err),
     }
+}
+
+/// Unpacks the wire numbers of a reference image into the 60-bit id the M1 internal
+/// reference stores (`erts_get_ref_numbers_value`, `erl_bif_unique.h:159`) — the inverse of
+/// the pack `crate::dist_client`'s `monitor_ref_term` writes, both mirroring
+/// `beam_codec`'s crate-internal `ref_wire` (the authority for the mapping).
+///
+/// A short image is zero-padded, a longer one contributes its first three numbers, and
+/// `num[0]`/`num[1]` are masked exactly as the C masks them (`REF_MASK`/`REF1_NUM_MASK`).
+fn ref_numbers_to_id(numbers: &[u32]) -> u64 {
+    const REF_MASK: u32 = (1 << 18) - 1;
+    const REF1_NUM_MASK: u32 = 0xFFFC_0000;
+    let at = |index: usize| u64::from(numbers.get(index).copied().unwrap_or(0));
+    (at(0) & u64::from(REF_MASK)) | (at(1) & u64::from(REF1_NUM_MASK)) | (at(2) << 32)
 }
 
 /// The remote pid an **external** pid thing names, or `None` for anything else.

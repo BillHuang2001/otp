@@ -379,6 +379,23 @@ impl DistNode {
         // A fresh arena per drain: nothing decoded here outlives it (the delivery
         // copies out), so the previous drain's arena is reclaimed wholesale.
         self.dispatch_heap.reset();
+        // The decode-side identity: a pid/port/reference naming **this** node at **this**
+        // creation decodes to the internal term (`beam_dist::control::LocalIdentity` — the
+        // C's `dec_is_this_node`, `external.c:3123-3129`, applied to the control arguments
+        // *and* the trailing message). It is the ONE place the demotion happens; the sink
+        // only classifies (`LocalDeliverySink::resolve`).
+        //
+        // Refreshed per drain rather than installed once per link: an `Atom` is a
+        // **table-local index** (`beam_term::atom`), and a copy-on-write table clone can
+        // give the same name a different index, which would leave a stored identity
+        // silently inert (it can never mis-match — `LocalIdentity`'s own docs — but it
+        // would demote nothing). Interning a name already present is one hash lookup, and
+        // the atom table passed here is the very one the decode uses.
+        let identity = beam_dist::control::LocalIdentity::intern(
+            atoms,
+            self.name.advertised(),
+            self.creation,
+        )?;
         let mut delivered = 0;
         let cell = self.links();
         let mut connections = cell
@@ -393,6 +410,7 @@ impl DistNode {
             // The decode arena (`self.dispatch_heap`) and the link
             // (`connections[index]`) are separate objects, so both are borrowed
             // for the duration of the decode only.
+            connections[index].set_local_identity(identity);
             let outcome = {
                 let heap = &mut self.dispatch_heap;
                 connections[index].dispatch_inbound(heap, atoms, sink)

@@ -149,6 +149,28 @@ impl DistConnection {
     pub(crate) fn bind_node(&mut self, atom: Eterm) {
         self.node = Some(atom);
     }
+    /// Installs this runtime's **decode-side identity** on the link's driver
+    /// ([`beam_dist::control::LocalIdentity`]).
+    ///
+    /// With it installed, an inbound pid/port/reference whose node **and** creation are
+    /// this node's decodes to the **internal** term (the C's `dec_is_this_node`,
+    /// `external.c:3123-3129`), which is what lets the sink route a reflected pid and an
+    /// inbound alias reference. Refreshed by every drain
+    /// ([`DistNode::dispatch_inbound`](crate::dist::DistNode::dispatch_inbound)), because
+    /// the atom it carries is table-local.
+    pub(crate) fn set_local_identity(&mut self, identity: beam_dist::control::LocalIdentity) {
+        self.driver.set_local_identity(identity);
+    }
+
+    /// The identity installed by [`DistConnection::set_local_identity`], or `None`
+    /// (the default) — the observable proof a drain really installed one. The colocated
+    /// suites read it; production code installs and never asks, which is why it carries the
+    /// `dead_code` allowance.
+    #[allow(dead_code)]
+    pub(crate) fn local_identity(&self) -> Option<beam_dist::control::LocalIdentity> {
+        self.driver.local_identity()
+    }
+
     /// The peer's node creation, once the handshake advertised it.
     pub fn peer_creation(&self) -> u32 {
         self.driver.peer_creation()
