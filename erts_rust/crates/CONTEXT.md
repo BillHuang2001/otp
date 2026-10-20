@@ -635,8 +635,16 @@ in-process compiler route.
   floor's `stop`/`Drop` closes everything it owns), `ignorefd` (needs readiness suppression) and
   `tcp_sendfile` reproduce their refusals only.
 - **A.3 residuals, each a typed refusal or a deferred answer rather than a wrong result.**
-  (a) `ERL_NIF_SELECT_STOP_SCHEDULED` is never answered — the resource type's `stop` callback has no
-  host seam, so a STOP keeps the C's fast-track `STOP_CALLED` answer.
+  (a) A NIF-created thread (off the call path) reaches a host only through `beam_rt`'s installed
+  `ThreadEnvHostFactory`. That host's atom space is a **private append-only name space**, and a term
+  crosses the boundary as an ETF image decoded against the live `AtomTable` (atoms travel by name, so a
+  foreign index can never name a live atom): `enif_make_existing_atom` answers within the private space
+  only, `atom_table` is `None` (so env-less `enif_compare`/`enif_is_identical`/`enif_hash` order a nested
+  atom by raw index), and `select`/monitors/liveness/`whereis_pid`/`make_ref`/`system_info`/
+  `term_to_binary`/`binary_to_term`/`port_command` are unsupported there; a **remote** pid destination
+  answers `false` (no `beam_dist` route on the host), and a message holding a local `make_fun3` closure
+  cannot be encoded. Its send is queued at `enif_send` (the C's `1`) and decoded, delivered and woken at
+  the runtime's next drain, where the C delivers inside the call.
   (b) The load/unload host runs with `services = None`: only the callback-scoped `enif_send` window
   answers there, and `upgrade` is not modelled at all (a second `load_nif/2` is the oracle's `reload`
   refusal), while a `dtor`-time send has no live receiver set and no drain point.
