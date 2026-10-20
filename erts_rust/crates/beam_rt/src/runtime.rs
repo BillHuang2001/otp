@@ -1622,6 +1622,21 @@ impl Runtime {
         self.nif_thread_sends = None;
     }
 
+    /// The queue this runtime's installed thread-env factory pushes `enif_send`s onto, or `None`
+    /// when no factory is installed — the **test** read side of the seam.
+    ///
+    /// The suite that owns the seam's end-to-end cases (`src/nif/thread_env_tests.rs`) needs the
+    /// very `Arc` the installed hosts write to: to see a send queue up before the drain runs, to
+    /// feed the drain a raw (undecodable, or dead-target) [`ForeignSend`] and so pin its skip arm,
+    /// and to prove [`Runtime::clear_nif_thread_env`] took the *handle* rather than the messages.
+    /// A production caller has no reason to reach the queue — the hosts are its writers and
+    /// [`Runtime::drain_nif_thread_sends`] its only reader — so this stays `#[cfg(test)]`.
+    ///
+    /// [`ForeignSend`]: crate::nif::thread_env::ForeignSend
+    #[cfg(test)]
+    pub(crate) fn nif_thread_sends(&self) -> Option<&ForeignSends> {
+        self.nif_thread_sends.as_ref()
+    }
     /// The **crate-visible serialisation lock** for [`Runtime::install_nif_thread_env`] /
     /// [`Runtime::clear_nif_thread_env`] in the test suites.
     ///
@@ -1646,10 +1661,10 @@ impl Runtime {
     /// failure. Recovering keeps the *serialisation* guarantee (the lock is still exclusive) while
     /// letting each test report its own outcome.
     ///
-    /// Nothing in this crate calls it yet: it is the published handle for the suites that own the
-    /// seam's end-to-end cases (a NIF that creates a thread which sends), so it is allowed to be
-    /// unused until one does — the alternative, a private lock per suite, would give two suites
-    /// two locks and no serialisation at all.
+    /// The suite that owns the seam's end-to-end cases is `src/nif/thread_env_tests.rs` (the
+    /// factory host, its atom hub and the drain, driven with no C toolchain and no oracle): it holds
+    /// this lock across every install → exercise → clear window, which is why the lock lives here
+    /// rather than privately in that file — a second suite exercising the seam must share this one.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn lock_nif_thread_env() -> std::sync::MutexGuard<'static, ()> {

@@ -479,3 +479,7 @@ const _: fn() = || {
     assert_send_sync::<ForeignSend>();
     assert_send_sync::<Arc<ForeignAtomHub>>();
 };
+
+#[cfg(test)]
+#[path = "thread_env_tests.rs"]
+mod tests;
