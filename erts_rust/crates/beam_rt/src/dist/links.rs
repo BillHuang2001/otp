@@ -278,6 +278,30 @@ impl DistLinks {
         names
     }
 
+    /// The `node@host` names of **every** link either half holds, whatever its handshake
+    /// state — outbound first, then accepted.
+    ///
+    /// [`DistLinks::established_names`] answers "who can carry a `DOP_*` right now"; this
+    /// answers "which peers is this runtime still connected to or still trying to connect
+    /// to", which is what makes a **re-connect** a non-event for peer-loss handling
+    /// ([`crate::Runtime::service_lost_dist_peers`]). A re-dial replaces an established
+    /// outbound link with one that is still handshaking
+    /// ([`crate::dist_client::DistClient`]'s `connect_addr`), so the old link's retirement
+    /// records a lost peer while the replacement — not yet established — is the only link the
+    /// table holds: the name is still listed here, and the loss must therefore not fire a
+    /// `noconnection`.
+    ///
+    /// A cell that cannot be borrowed contributes no accepted name (the union rule's own
+    /// discipline, [`DistLinks::established_names`]): a borrow in flight is work, never a
+    /// claim about the peer.
+    pub(crate) fn link_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.outbound.iter().map(|link| link.name.clone()).collect();
+        if let Ok(accepted) = self.accepted.try_borrow() {
+            names.extend(accepted.iter().filter_map(|connection| connection.peer_name()));
+        }
+        names
+    }
+
     /// A human-readable label for `node`, **without** an atom table: the `node@host` name
     /// an outbound link keys it by, else a rendering of the raw term.
     ///
@@ -502,6 +526,72 @@ impl DistConnectionSnapshot {
     /// [`PeerVisibility::Hidden`] — or `None` before the handshake completes.
     pub fn peer_visibility(&self) -> Option<PeerVisibility> {
         self.peer_visibility
+    }
+}
+
+/// The **shared peer-loss recorder**: the `node@host` names of peers whose distribution link
+/// was retired as **dead**, waiting for the scheduler pass to apply OTP's `noconnection`
+/// semantics ([`crate::Runtime::service_lost_dist_peers`]).
+///
+/// One cell is owned by the [`Runtime`](crate::Runtime) and handed to **both** distribution
+/// halves ([`crate::dist::DistNode::use_lost_peers`] and
+/// [`crate::dist_client::DistClient::use_lost_peers`]), because either half may be the one
+/// that observes a peer disappear: the accepting half pumps the links a peer dialled in, the
+/// connecting half the links this runtime dialled.
+///
+/// The retirement sites **record**, they do not apply: they run inside a pump, which does not
+/// hold the process table (a scheduler pass *moves* it out of the runtime). The pass drains
+/// this recorder and calls [`beam_process::ProcessTable::node_down`], which is what makes a
+/// remote monitor's `{'DOWN', Ref, process, Peer, noconnection}` and a remote link's
+/// `{'EXIT', Peer, noconnection}` (trapping) or termination (non-trapping) fire — the
+/// `noconnection` reason the C's `net_kernel` produces when a connection is lost.
+///
+/// A **graceful** shutdown never records ([`crate::dist::DistNode`]'s drop,
+/// [`crate::dist_client::DistClient`]'s `close`): losing a link because this runtime is going
+/// away is not the peer going down.
+pub(crate) type LostPeers = Rc<RefCell<Vec<String>>>;
+
+/// A fresh, empty peer-loss recorder.
+pub(crate) fn new_lost_peers() -> LostPeers {
+    Rc::new(RefCell::new(Vec::new()))
+}
+
+/// Whether no peer loss is pending — the scheduler step's allocation-free early test.
+///
+/// A recorder that cannot be borrowed has a record (or a drain) in flight, which is work in
+/// progress: reported as "nothing pending" so the pass keeps its hands off it.
+pub(crate) fn no_lost_peers(lost: &LostPeers) -> bool {
+    match lost.try_borrow() {
+        Ok(lost) => lost.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// Records `name` as a peer whose link was **retired as dead**.
+///
+/// Called by both halves' retirement sites *after* asking whether the retired link had
+/// completed its `'N'` handshake — a link that never handshook was never a node down, so it
+/// is never recorded (nothing on the process table can name such a peer anyway).
+///
+/// A recorder that cannot be borrowed means a drain is running; the retirement sites cannot
+/// run inside one (a drain happens in the scheduler pass, between the pumps), and a `RefCell`
+/// panic on runtime data is not an option, so a re-entrant borrow records nothing.
+pub(crate) fn note_lost_peer(lost: &LostPeers, name: &str) {
+    if let Ok(mut lost) = lost.try_borrow_mut() {
+        lost.push(name.to_string());
+    }
+}
+
+/// Takes every recorded lost peer out of `lost`, leaving it empty — the drain's half of
+/// [`note_lost_peer`].
+///
+/// Allocation-free (the vector is moved out, the recorder is left with an empty one) and an
+/// unreadable recorder (a record in flight) yields nothing, so those names stay recorded for
+/// the next pass instead of being lost.
+pub(crate) fn take_lost_peers(lost: &LostPeers) -> Vec<String> {
+    match lost.try_borrow_mut() {
+        Ok(mut lost) => std::mem::take(&mut *lost),
+        Err(_) => Vec::new(),
     }
 }
 

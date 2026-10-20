@@ -51,6 +51,7 @@ use beam_term::AtomTable;
 use crate::error;
 
 use super::connection::{is_would_block, DistConnection};
+use super::links::{new_lost_peers, note_lost_peer, LostPeers};
 use super::{
     DistConnectionSnapshot, DistLinks, DIST_DISPATCH_HEAP_WORDS, DIST_LISTEN_ADDR,
 };
@@ -85,6 +86,12 @@ pub struct DistNode {
     registration_attempted: bool,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_link_error: Option<String>,
+    /// Where the **peer-loss recorder** lives (shared with the connecting half — see
+    /// [`LostPeers`]). A link this node retires because it died records its peer's
+    /// `node@host` name there, and the scheduler pass turns each recorded name into OTP's
+    /// `noconnection` semantics ([`crate::Runtime::service_lost_dist_peers`]). Empty and
+    /// unused until [`DistNode::use_lost_peers`] installs the runtime's cell.
+    lost: LostPeers,
     /// Whether this node is **hidden** (`-hidden`): its handshake then omits
     /// `DFLAG_PUBLISHED`, so a peer lists it only in
     /// `nodes(hidden)`/`nodes(connected)` (see [`advertised_flags`]). Set through
@@ -127,6 +134,7 @@ impl DistNode {
             registration_error: None,
             registration_attempted: false,
             last_link_error: None,
+            lost: new_lost_peers(),
             hidden: false,
             dispatch_heap: Heap::new(DIST_DISPATCH_HEAP_WORDS)?,
         })
@@ -152,6 +160,16 @@ impl DistNode {
     /// Whether this node advertises itself as **hidden** ([`DistNode::set_hidden`]).
     pub fn is_hidden(&self) -> bool {
         self.hidden
+    }
+
+    /// Installs the runtime's **peer-loss recorder** (see [`LostPeers`]) — the cell a retired
+    /// link's peer is recorded in, and the one the scheduler pass drains.
+    ///
+    /// [`DistNode::start`] keeps its signature for the hermetic suites, so the slot begins as
+    /// this node's own empty cell; the runtime installs its **shared** one here, at
+    /// construction, so this half and the connecting half record into the same place.
+    pub(crate) fn use_lost_peers(&mut self, lost: LostPeers) {
+        self.lost = lost;
     }
 
     /// The capability flags this node advertises in its handshake
@@ -322,7 +340,13 @@ impl DistNode {
                 Err(err) => {
                     // The link is broken (a protocol error, a dead socket). Retire
                     // it and keep the reason observable — the runtime carries on.
-                    retire_at(&mut connections, &mut self.last_link_error, index, err);
+                    retire_at(
+                        &mut connections,
+                        &mut self.last_link_error,
+                        &self.lost,
+                        index,
+                        err,
+                    );
                     continue;
                 }
             }
@@ -333,7 +357,13 @@ impl DistNode {
                 // it — which shuts its socket down first, so the peer sees the
                 // closure instead of a half-open socket — and carry on.
                 let err = BeamError::BadArg;
-                retire_at(&mut connections, &mut self.last_link_error, index, err);
+                retire_at(
+                    &mut connections,
+                    &mut self.last_link_error,
+                    &self.lost,
+                    index,
+                    err,
+                );
             }
         }
         Ok(events)
@@ -428,7 +458,13 @@ impl DistNode {
                 }
                 // A decode/classification failure retires just this link (recorded,
                 // never raised) — the scheduler pass carries on.
-                Err(err) => retire_at(&mut connections, &mut self.last_link_error, index, err),
+                Err(err) => retire_at(
+                    &mut connections,
+                    &mut self.last_link_error,
+                    &self.lost,
+                    index,
+                    err,
+                ),
             }
         }
         Ok(delivered)
@@ -519,15 +555,30 @@ impl DistNode {
 /// socket's) failure; a `shutdown(2)` failure is appended rather than swallowed, since the
 /// link is gone either way.
 ///
+/// A link that had **completed its handshake** is a node that went down, so its peer's
+/// `node@host` name is recorded in the runtime's peer-loss recorder (`lost`) — that record is
+/// what makes OTP's `noconnection` semantics fire at the next scheduler pass
+/// ([`crate::Runtime::service_lost_dist_peers`]). A link that never handshook is **not** a
+/// node down: no process can hold a relationship with it, and recording it would only be a
+/// later decline.
+///
 /// A free function rather than a method because the table is a borrowed `Rc<RefCell<…>>`
 /// while the pump drains it (see [`crate::dist::links`]) — the borrow is already held, so the
-/// caller passes the slice and the `last_link_error` slot instead of `&mut DistNode`.
+/// caller passes the slice and the `last_link_error`/`lost` slots instead of `&mut DistNode`.
 fn retire_at(
     connections: &mut Vec<DistConnection>,
     last_link_error: &mut Option<String>,
+    lost: &LostPeers,
     index: usize,
     err: BeamError,
 ) {
+    // Read the peer **before** the removal: the retired link is the only witness to which
+    // node went away.
+    let lost_peer = if connections[index].is_established() {
+        connections[index].peer_name()
+    } else {
+        None
+    };
     let mut connection = connections.remove(index);
     let closed = connection.close();
     let reason = match connection.peer_name() {
@@ -538,6 +589,9 @@ fn retire_at(
         Ok(()) => reason,
         Err(close_err) => format!("{reason} (close: {close_err})"),
     });
+    if let Some(peer) = lost_peer {
+        note_lost_peer(lost, &peer);
+    }
 }
 /// The creation a node advertises before `epmd` has assigned one.
 const DEFAULT_CREATION: u32 = 1;

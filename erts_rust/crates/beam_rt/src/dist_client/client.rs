@@ -42,7 +42,7 @@ use beam_term::prelude::{make_atom, make_small, Eterm};
 use beam_term::AtomTable;
 
 use crate::dist::externalize::PayloadArena;
-use crate::dist::links::no_link_error;
+use crate::dist::links::{new_lost_peers, no_link_error, note_lost_peer, LostPeers};
 use crate::dist::{advertised_flags, DistConnection, DistLinks, NodeName, DIST_READ_SLICE};
 use crate::error;
 
@@ -108,6 +108,12 @@ pub(crate) struct DistClientInner {
     payloads: PayloadArena,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_error: Option<String>,
+    /// Where the **peer-loss recorder** lives (shared with the accepting half — see
+    /// [`LostPeers`]). An outbound link retired because it died records its peer's `node@host`
+    /// name there, and the scheduler pass turns each recorded name into OTP's `noconnection`
+    /// semantics ([`crate::Runtime::service_lost_dist_peers`]). Empty and unused until
+    /// [`DistClient::use_lost_peers`] installs the runtime's cell.
+    lost: LostPeers,
     /// Whether this node is **hidden** (`-hidden`): a link this client dials then
     /// advertises no `DFLAG_PUBLISHED`, exactly as the accepted half does
     /// ([`crate::dist::advertised_flags`]). Visibility belongs to the node, not to who
@@ -152,6 +158,7 @@ impl DistClient {
                 dispatch_heap: Heap::new(DISPATCH_HEAP_WORDS)?,
                 payloads: PayloadArena::new()?,
                 last_error: None,
+                lost: new_lost_peers(),
                 hidden: false,
                 next_unlink_id: 1,
             })),
@@ -249,6 +256,31 @@ impl DistClient {
         self.inner.try_borrow().map(|inner| inner.hidden).unwrap_or(false)
     }
 
+    /// Installs the runtime's **peer-loss recorder** (see [`LostPeers`]) — the cell a retired
+    /// outbound link's peer is recorded in, and the one the scheduler pass drains.
+    ///
+    /// [`DistClient::new`] gives the client its own empty cell so the hermetic suites keep
+    /// working; the runtime installs the **shared** one here, at construction, so this half
+    /// and the accepting half record into the same place.
+    pub(crate) fn use_lost_peers(&self, lost: LostPeers) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.lost = lost;
+        }
+    }
+
+    /// The `node@host` names of **every** link either half holds, whatever its handshake state
+    /// ([`DistLinks::link_names`] — the peers this runtime is connected to *or still trying to
+    /// connect to*).
+    ///
+    /// The scheduler pass's peer-loss step asks this before it applies a recorded loss, so a
+    /// **re-connect** — which replaces an established link with a still-handshaking one — is
+    /// not mistaken for a node that went away.
+    ///
+    /// `None` when the client cell is borrowed (a pump or a drain in flight): an unreadable
+    /// answer, never a fabricated "no links", so the caller defers instead of firing.
+    pub(crate) fn link_names(&self) -> Option<Vec<String>> {
+        self.inner.try_borrow().ok().map(|inner| inner.links.link_names())
+    }
     /// The `DistSignalRouter` sharing this client's links and outbound queue.
     ///
     /// Installed on the runtime's process table ([`beam_process::ProcessTable::set_dist_router`])
@@ -681,9 +713,20 @@ impl DistClientInner {
     }
 
     /// Removes the outbound link at `index` and records why.
+    ///
+    /// A link that had **completed its handshake** is a node that went down, so its peer's
+    /// `node@host` name is recorded in the runtime's peer-loss recorder — that record is what
+    /// makes OTP's `noconnection` semantics fire at the next scheduler pass
+    /// ([`crate::Runtime::service_lost_dist_peers`]). A link that never handshook is **not** a
+    /// node down: no process can hold a relationship with it.
     fn retire(&mut self, index: usize, err: BeamError) {
         let link = self.links.outbound.remove(index);
-        self.last_error = Some(format!("{}: {err}", link.name));
+        let name = link.name.clone();
+        let established = link.is_established();
+        self.last_error = Some(format!("{name}: {err}"));
+        if established {
+            note_lost_peer(&self.lost, &name);
+        }
     }
 
     /// The **wire form** of an outbound message payload: `msg` itself when it carries no
