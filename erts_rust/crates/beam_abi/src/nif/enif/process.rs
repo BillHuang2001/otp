@@ -100,15 +100,22 @@
 //!   invalid id is `0` too (`!!erts_proc_lookup(...)`, `:2330`), so "unknown" and "dead" coincide; a
 //!   fabricated `1` ("alive") is never produced. A `NULL` pid/port pointer answers `0` (the C
 //!   faults).
-//! * **`NULL` `to_pid`/`to_port` answer `0`** (the C dereferences them), and a **`NULL` `env`
-//!   answers `0`** for `enif_send`/`enif_port_command` (this seam reaches the runtime only through
-//!   the env's host) — `enif_port_command`'s C counterpart aborts the emulator (`:1108-1109`).
+//! * **`NULL` `to_pid`/`to_port` answer `0`** (the C dereferences them). For `enif_send` a **`NULL`
+//!   `env` is not fatal**: the host is then resolved from `msg_env` (the C's
+//!   `enif_send(NULL, &pid, msg_env, msg)` form, measured `{0,1,1}` even on a scheduler thread), and
+//!   only two unusable envs answer `0`. `enif_port_command` has no such second source — a `NULL` `env`
+//!   answers `0` (its C counterpart aborts the emulator, `:1108-1109`).
 //! * **`enif_send` passes `from = None`.** `enif_send` always sends *from the calling process* —
 //!   the C derives `from` from the caller's env (`from = c_p ? c_p->common.id : am_undefined`,
 //!   `:996`) and cannot send on another process's behalf — which is exactly what
-//!   `NifHost::send`'s `None` means. The host resolves the concrete sender itself. `msg_env` (the
-//!   message's own environment in the C) is accepted for signature fidelity and unused: the hook
-//!   performs the term movement itself.
+//!   `NifHost::send`'s `None` means. The host resolves the concrete sender itself, and a send made
+//!   with no calling process (an `enif_thread_create`d worker, an `env == NULL` send) has the C's
+//!   `undefined` sender — never a fabricated pid.
+//!   `msg_env` (the message's own environment in the C) is **used**: it is the host source when `env`
+//!   is null, and the message terms live on it. The C *transfers* that env's heap into the outgoing
+//!   message (`erts_create_message_from_nif_env`, `:812-841`); this seam hands the host the term, so a
+//!   host whose heap is not the receiver's **copies** it across the `copy_struct` boundary — same
+//!   observable (the message arrives intact), different allocation behaviour.
 //! * **`enif_schedule_nif` runs the continuation it is asked to schedule.** The C returns the trap
 //!   marker `THE_NON_VALUE` (`0`) and lets the emulator re-run the trap, so the continuation's value
 //!   becomes the call's result later (`erl_nif.c:3561-3604`, `:3512-3558`). This layer folds that
@@ -388,6 +395,36 @@ unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -
 /// Returns `1` when the message was sent and `0` when it was not (dead receiver, no host support, or
 /// an unusable `env`/`to_pid`) — the C's only two outcomes.
 ///
+/// # Which host delivers
+///
+/// The host is resolved from `env` when it is a live env, **else from `msg_env`**. That second source
+/// is the documented `enif_send(NULL, &pid, msg_env, msg)` idiom, which the oracle accepts
+/// unconditionally (measured `{0,1,1}` for `env == NULL` *on a scheduler thread*, and `1` for the same
+/// call from an `enif_thread_create`d worker) because the C needs no calling process at all: the
+/// message env carries its own heap and the VM-global atom table. Here, a `msg_env` produced by
+/// [`NifHost::alloc_env`](crate::nif::host::NifHost::alloc_env) is a real env with a real host
+/// behind it, so reaching the host through *it* is exactly what the C does.
+///
+/// # What the seam guarantees, and what it does not
+///
+/// * **Delivery is synchronous inside this call** and the host must **wake a parked receiver**: the
+///   C puts the message in the target's mailbox before `enif_send` returns
+///   (`erts_queue_message`, `erl_nif.c:1093`), and a receiver blocked in `receive` is resumed by it —
+///   a deferred/batched flush would be a different (wrong) observable.
+/// * **The C transfers the message env's heap; this seam may copy.** `erts_create_message_from_nif_env`
+///   splices the env's fragment chain and off-heap list into the `ErtsMessage` and nulls the env's
+///   (`erl_nif.c:812-841`, used at `:960`), so a C `msg_env` send is zero-copy and the term cannot be
+///   reused afterwards. [`NifHost::send`](crate::nif::host::NifHost::send) is handed the **term** and
+///   the sender, so a host whose heap is not the receiver's (the runtime's is) *copies* it across the
+///   `copy_struct` boundary; the observable — the message arrives intact — is the same, the
+///   allocation behaviour is not, and reusing the term after the send stays a caller error either way.
+/// * **The sender identity with no calling process is `undefined`, never a fabricated pid.** The C
+///   derives it from the caller's env (`from = c_p ? c_p->common.id : am_undefined`, `erl_nif.c:996`),
+///   which is why `None` is passed here — "the calling process" — and a call that has no calling
+///   process (a NIF-created thread, an `env == NULL` send) therefore has no sender. The host must
+///   report the C's `undefined`; minting a pid for it would be a wrong term in the receiver's
+///   `process_info(_, messages)`.
+///
 /// # Safety
 ///
 /// `env`/`msg_env` must be null or live envs; `to_pid` must be null or point at a readable
@@ -396,7 +433,7 @@ unsafe fn ref_term_from_block(env: &mut NifEnv, block: &[u8; REF_THING_BYTES]) -
 pub unsafe extern "C" fn enif_send(
     env: *mut crate::nif::types::ErlNifEnv,
     to_pid: *const ErlNifPid,
-    _msg_env: *mut crate::nif::types::ErlNifEnv,
+    msg_env: *mut crate::nif::types::ErlNifEnv,
     msg: ERL_NIF_TERM,
 ) -> c_int {
     if to_pid.is_null() {
@@ -405,10 +442,17 @@ pub unsafe extern "C" fn enif_send(
     }
     // SAFETY: `to_pid` is non-null and readable (caller contract).
     let receiver = t(unsafe { (*to_pid).pid });
-    let Some(e) = (unsafe { env_mut(env) }) else {
+    // One `env_mut` result at a time: `msg_env` is only consulted when `env` is not a live env (the
+    // `enif_send(NULL, &pid, msg_env, msg)` form), so no second `&mut NifEnv` is ever live here.
+    let resolved = match unsafe { env_mut(env) } {
+        Some(e) => Some(e),
+        // SAFETY: `msg_env` must be null or a live env (caller contract); a null one answers `None`.
+        None => unsafe { env_mut(msg_env) },
+    };
+    let Some(e) = resolved else {
         return 0;
     };
-    // `None`: the sender is the calling process (see the module docs).
+    // `None`: the sender is the calling process — `undefined` when this thread has none (see above).
     match e.host().send(receiver, None, t(msg)) {
         Some(sent) => sent as c_int,
         None => 0,

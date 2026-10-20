@@ -33,10 +33,18 @@
 //!   [`enif::enif_api_table`] they are published through.
 //! - [`loader`] — the dynamic NIF loader: `dlopen`/`dlsym`, the `ErlNifEntry` load-time contract,
 //!   and a callable [`loader::NifLibrary`].
+//! - [`thread_env`] — the process-global [`thread_env::ThreadEnvHostFactory`] seam: the host a thread
+//!   that is **not** inside a NIF call (a NIF-created `enif_thread_create` worker) obtains so that
+//!   `enif_alloc_env` can hand out a real message env and `enif_send` can deliver from it.
 
 pub mod api;
 pub mod enif;
 pub mod host;
 pub mod loader;
 pub mod term;
+pub mod thread_env;
 pub mod types;
+
+pub use self::thread_env::{
+    clear_thread_env_factory, install_thread_env_factory, with_thread_env_host, ThreadEnvHostFactory,
+};
