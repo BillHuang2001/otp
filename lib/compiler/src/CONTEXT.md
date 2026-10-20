@@ -141,6 +141,15 @@ Module pass `ssa_opt_bc_size` (`beam_ssa_opt.erl:317-321`). Computes the exact s
 - Operands from `beam_arg/2` (`:2962`): `#b_var{}`→register, `#b_literal{}`→`{atom,V}|{float,V}|{integer,V}|nil|{literal,V}`; labels via `use_block_label/2` (`:2987`) / `bif_fail/1` (`:1564`) / `ensure_label/2` (`:1578`); `typed_args/3` (`:2945`) wraps in `#tr{}`.
 - `bs_*` is its own mini-instruction set: `bs_translate/1` (`:2829`) collects match ops into one `{bs_match,...,{commands,[...]}}` (`ensure_at_least`/`ensure_exactly`/`binary`/`integer`/`skip`/`get_tail`/`'=:='`) via `bs_translate_instr/1` (`:2909`).
 
+## Native records (OTP-30 `{Module,Name}` record ids)
+- A record is **owned by the module that defines it** (`-record` in that `.erl`); header-defined families are *imported* by their consumers, not re-owned:
+  `#c_*{}` (26 records: `c_alias … c_var`) → owner **`v3_core`**, imported by `core_parse.hrl` (`-import_record(v3_core, …)`, included by `cerl`, `cerl_trees`, `core_lib`, `core_lint`, `core_pp`, `core_scan`, `sys_core_*`, `beam_core_to_ssa`, `v3_core` itself defines them);
+  `#t_*{}` (14: `t_atom … t_union`) → owner **`beam_types`**, `beam_types.hrl:24-29` imports them under `-if(?MODULE =/= beam_types)`;
+  `#b_*{}` (11: `b_module … b_local`) → owner **`beam_ssa`**, `beam_ssa.hrl:22-27` (same `-if` guard);
+  `#opt_st{}`/`#func_info{}` → owner **`beam_ssa_opt`**, imported directly by `beam_ssa_type`, `beam_ssa_alias`, `beam_ssa_bc_size`, `beam_ssa_destructive_update`, `beam_ssa_fus`, `beam_ssa_fbip`, `beam_ssa_loop_opt`, `beam_ssa_opt_budget` (they only match/destructure these; the constructors live in `beam_ssa_opt`).
+- `beam_ssa_pre_codegen:fix_native_record` / `fix_native_record_id/2` (`:242-301`) choose the emitted `Id` operand: a bare **atom** when the value is created in this module *and* every updated field is known present (`#t_record{local_creation=true}` + `type`), otherwise the **`{Module,Name}` literal**. Hence `#c_var{}` written inside `cerl` compiles to `put_record Fail {literal,{v3_core,c_var}} nil …`, not an atom id.
+- A create-form `put_record` whose `Id` names *another* module is resolved at run time from the code server's record table (the owner module's `Recs` chunk, installed at load), not from the running module — see `../../erts/emulator/beam/CONTEXT.md` §"Native records (OTP-30)". In the primary bootstrap beam set 26 of 61 modules carry such create sites (~1.9k instructions, owners `v3_core`/`beam_types`/`beam_ssa`), so any runtime that only understands the local (atom) form cannot run the tree's own compiler.
+
 ## Generated files — never hand-edit
 - `beam_opcodes.erl` / `beam_opcodes.hrl` — generated into `$(EGEN)` by `erts/emulator/utils/beam_makeops` (Perl) from `genop.tab`; marker file `OPCODES-GENERATED` (git-ignored).
 - `core_parse.erl` — yecc output from `core_parse.yrl` (git-ignored).
