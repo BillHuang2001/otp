@@ -57,10 +57,14 @@
 //!   routes cannot silently swap behaviour.
 //! * [`maps_and_ets_fun_keys_also_suspend_a_scheduled_process`] covers the class beyond `lists`:
 //!   `maps:map/2` and `ets:foldl/3` with a blocking fun, oracle-compared.
-//! * [`a_nested_apply_that_bypasses_the_seam_is_still_the_typed_gap`] is the **negative**
-//!   control: the same workload applied through `erlang:apply/3` (which reaches the registry
-//!   directly, never the cross-module seam) is the documented residual — a typed capability gap,
-//!   never a fabricated value.
+//! * [`a_nested_apply_with_an_immediate_child_accepts_the_oracle_value_or_the_gap`] applies the
+//!   same workload through `erlang:apply/3` on a fixture whose child sends immediately, so it keeps
+//!   both tolerances (the oracle's value or the typed capability gap) — never a fabricated value.
+//! * [`every_apply_shape_answers_the_oracle_when_the_child_needs_a_later_slice`] is the
+//!   **deterministic** measurement of the same question: a two-hop spawn chain means the message
+//!   cannot exist while the fun is applied, and every apply shape (`erlang:apply/3`, both
+//!   `erlang:apply/2` forms, a direct call) then answers the oracle's own term — the fun
+//!   application is entered in-machine whatever applied it.
 //!
 //! A missing `erlc`/`erl` is a **loud** skip ([`skip_loudly`]), never a silent pass. Every
 //! fixture is compiled from this file's own source into a self-removing scratch directory.
@@ -95,7 +99,9 @@ const FIXTURE_SRC: &str = r#"
          map_pure/0, map_io/0, map_file/0, map_recv/0,
          feach_pure/0, feach_io/0, feach_file/0, feach_recv/0,
          fold_pure/0, fold_io/0, fold_file/0, fold_recv/0,
-         maps_recv/0, ets_recv/0, bypassing_apply/0]).
+         maps_recv/0, ets_recv/0, bypassing_apply/0,
+         chained_apply_mfa/0, chained_apply_externalfun/0, chained_direct/0,
+         chained_apply2_externalfun/0, chained_apply2_closure/0]).
 
 path() -> "@@FILE@@".
 
@@ -282,6 +288,57 @@ bypassing_apply() ->
     F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
     {M, Fun, Args} = {lists, flatmap, [F, [1]]},
     erlang:apply(M, Fun, Args).
+
+%% ---- the deterministic probes: the child can only answer from a LATER scheduler slice ----
+
+%% A child chain that needs scheduler slices of its OWN before it can send. The parent's slice
+%% spawns `child`, which only spawns `grandchild`, and only the grandchild delivers. Neither of
+%% those can run inside the parent's own slice (a slice ends when its process parks), so the fun's
+%% `receive` can only be satisfied after at least two later slices of other processes -- nothing
+%% already in the mailbox can satisfy it.
+%%
+%% A timer is deliberately NOT the barrier: a `receive after T` in a CHILD is a deadline that
+%% cannot wake the parent, and the `run` route only waits for the process it was asked for
+%% (`Runtime::set_run_wake_pid` -> `is_quiescent`/`timer_wait`), so such a child would stall the
+%% pass for a reason that has nothing to do with how the fun is applied.
+chain_child(Self) ->
+    _ = spawn(fun() -> _ = spawn(fun() -> Self ! {mx_value, 42} end) end),
+    Self.
+
+chained_apply_mfa() ->
+    reset(),
+    Self = chain_child(self()),
+    F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
+    {M, Fun, Args} = {lists, flatmap, [F, [1]]},
+    {erlang:apply(M, Fun, Args), seen()}.
+
+chained_apply_externalfun() ->
+    reset(),
+    Self = chain_child(self()),
+    F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
+    Apply = fun lists:flatmap/2,
+    {Apply(F, [1]), seen()}.
+
+%% `erlang:apply/2` -- the arity the engine does not special-case -- with the fun-applying key as
+%% an external fun, and with the closure itself as the target.
+chained_apply2_externalfun() ->
+    reset(),
+    Self = chain_child(self()),
+    F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
+    Apply = fun lists:flatmap/2,
+    {erlang:apply(Apply, [F, [1]]), seen()}.
+
+chained_apply2_closure() ->
+    reset(),
+    Self = chain_child(self()),
+    F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
+    {erlang:apply(F, [1]), seen()}.
+
+chained_direct() ->
+    reset(),
+    Self = chain_child(self()),
+    F = fun(X) -> receive {mx_value, V} -> note({recv, X, V}), [X + V] end end,
+    {lists:flatmap(F, [1]), seen()}.
 "#;
 
 /// The file the file-reading cells read; two bytes, so `byte_size/1` is a small unambiguous 2.
@@ -390,16 +447,28 @@ fn oracle_lines(oracle: &Path, fixture: &Fixture, function: &str) -> Vec<String>
 /// whose context is `RuntimeContext::for_process` with `may_pump_scheduler() == false` — and
 /// renders the returned term with the same `~w` control the oracle probe prints.
 fn run_scheduled_cell(fixture: &Fixture, rt: &mut Runtime, function: &str) -> String {
+    run_scheduled_outcome(fixture, rt, function).unwrap_or_else(|e| {
+        panic!(
+            "{FIXTURE_MODULE}:{function}/0 must run as a scheduled process (the fun \
+             application suspends it and the scheduler resumes it), got: {e}"
+        )
+    })
+}
+
+/// [`run_scheduled_cell`] without the "must return" assumption: the `~w` render of the value, or
+/// the run's own error text — what a measurement of a shape that may legitimately report the
+/// typed capability gap needs (the tolerance the negative control's doc explains).
+fn run_scheduled_outcome(
+    fixture: &Fixture,
+    rt: &mut Runtime,
+    function: &str,
+) -> Result<String, String> {
     let term = rt
         .run_scheduled(fixture.beam(), function, 0, &[])
-        .unwrap_or_else(|e| {
-            panic!(
-                "{FIXTURE_MODULE}:{function}/0 must run as a scheduled process (the fun \
-                 application suspends it and the scheduler resumes it), got: {e}"
-            )
-        });
+        .map_err(|e| e.to_string())?;
     rt.format_term_w(term, None)
-        .unwrap_or_else(|e| panic!("the `~w` render of {FIXTURE_MODULE}:{function}/0 failed: {e}"))
+        .map(|rendered| rendered.trim().to_string())
+        .map_err(|e| format!("the `~w` render of {FIXTURE_MODULE}:{function}/0 failed: {e}"))
 }
 
 /// Runs one cell through the **`-eval`** route: a [`RuntimeContext::with_output`] over the
@@ -568,21 +637,26 @@ fn maps_and_ets_fun_keys_also_suspend_a_scheduled_process() {
     }
 }
 
-/// **The documented residual is still a typed gap, never a fabricated value.**
+/// **The `erlang:apply/3` shape of the workload, on a fixture whose child sends immediately.**
 ///
 /// The same workload as the `lists:flatmap/2 × receive` cell, but applied through
-/// `erlang:apply/3`: that reaches the registry's implementation **directly** — it never consults
-/// [`RuntimeContext::resolve_external_call`](crate::context::RuntimeContext::resolve_external_call),
-/// so the seam cannot displace it. The host's nested run then cannot re-enter the scheduler from
-/// inside a slice, and the `receive` in the fun folds into the typed
-/// [`beam_engine::blocked`] capability gap (`unsupported_opcode: run: process blocked (no message
-/// available)`, the runtime's exit-3 class) instead of the value the oracle answers.
+/// `erlang:apply/3` — a `call_ext` the loader lowers to the `i_apply` instruction family, whose
+/// [`beam_engine`] `apply_target` resolves the callee through
+/// [`RuntimeContext::resolve_external_call`](crate::context::RuntimeContext::resolve_external_call)
+/// **first**, i.e. through the same seam a direct call takes, so the key's own Erlang code runs in
+/// the caller's machine and the fun's `receive` suspends the *process*.
 ///
-/// The oracle half is asserted too: the fixture is correct, so this is a routing residual and not
-/// a broken workload. When the residual is closed, this case must be flipped deliberately — the
-/// assertion below names it so a silent change cannot slip through.
+/// The **outcome of this particular fixture is still not a reliable measurement**, because its
+/// child (`bypassing_apply/0`) sends immediately: whether the message is in the mailbox by the time
+/// the apply runs is a race the fixture does not resolve. The deterministic measurement is
+/// [`every_apply_shape_answers_the_oracle_when_the_child_needs_a_later_slice`], which replaces that
+/// child with a two-hop spawn chain and gets the oracle's `{[43],[{recv,1,42}]}` for every apply
+/// shape. So this case keeps both tolerances on purpose — the oracle's value, or the typed
+/// [`beam_engine::blocked`] capability gap (`unsupported_opcode: run: process blocked (no message
+/// available)`, the runtime's exit-3 class) — and it must stay non-flaky either way; it never
+/// accepts a fabricated value, a hang or a different error class.
 #[test]
-fn a_nested_apply_that_bypasses_the_seam_is_still_the_typed_gap() {
+fn a_nested_apply_with_an_immediate_child_accepts_the_oracle_value_or_the_gap() {
     let Some((erlc, oracle)) = toolchain() else {
         return;
     };
@@ -601,22 +675,18 @@ fn a_nested_apply_that_bypasses_the_seam_is_still_the_typed_gap() {
     let expected = expected.last().expect("the oracle printed a value line");
     match rt.run_scheduled(fixture.beam(), "bypassing_apply", 0, &[]) {
         Err(error) => {
-            // The documented residual: the host's nested run cannot re-enter the scheduler from
-            // inside a slice, so the fun's `receive` folds into the typed capability gap.
+            // The tolerance for a lost race: nothing was in the mailbox when the fun's `receive`
+            // ran, so the suspended application folds into the typed capability gap.
             assert_eq!(
                 error.to_string(),
                 beam_engine::blocked().to_string(),
-                "the residual must stay the typed capability gap (never a wrong result and never \
-                 a different class), got: {error}"
+                "the only acceptable error here is the typed capability gap (never a wrong result \
+                 and never a different class), got: {error}"
             );
         }
         Ok(term) => {
-            // **Measured, not assumed:** on this checkout the `/3` shape already answers the
-            // oracle's own value, because the nested run applies the closure through
-            // `ExecutionContext::apply_fun` → `resolve_local_fun`, which enters the closure body
-            // in the caller's machine (only a fun with no in-machine entry stays a gap). The
-            // assertion is therefore the oracle's, so a regression to a fabricated value or to
-            // silence is still a failure.
+            // The applied fun was entered in-machine and a later slice resumed the process, so the
+            // answer is the oracle's — never a fabricated value and never silence.
             let rendered = rt
                 .format_term_w(term, None)
                 .unwrap_or_else(|e| panic!("the `~w` render of `bypassing_apply/0` failed: {e}"));
@@ -627,5 +697,77 @@ fn a_nested_apply_that_bypasses_the_seam_is_still_the_typed_gap() {
                  own term"
             );
         }
+    }
+}
+/// **Every apply shape answers the oracle when the child needs a later slice.**
+///
+/// The negative control above spawns a child that sends immediately, so whether the fun's
+/// `receive` finds the message is a race between the parent's slice and the child's first slice —
+/// which is why that test accepts both the oracle's value and the typed gap. This test removes the
+/// race: the parent's slice spawns `chain_child/1`, which only spawns a grandchild, and only the
+/// grandchild delivers (`chained_*` in [`FIXTURE_SRC`]). Neither spawn target can run inside the
+/// parent's own slice — a slice ends when its process parks — so the message can never be in the
+/// mailbox while the parent is applying the fun, and the workload can only answer if at least
+/// **two later slices of other processes** run while the application is in flight. That is exactly
+/// the property a residual about "the nested run cannot re-enter the scheduler from inside a
+/// slice" would have to fail to provide — and it does not: every shape below answers the oracle's
+/// own `{[43],[{recv,1,42}]}`.
+///
+/// A timer is deliberately **not** the barrier: a `receive after T` in a *child* is a deadline that
+/// cannot wake the parent, and the `run` route waits only for the process it was asked for
+/// ([`Runtime::run_scheduled`]'s wake-pid gate, `Runtime::is_quiescent`/`timer_wait`), so such a
+/// child stalls the pass for a reason that has nothing to do with how the fun is applied.
+///
+/// Five shapes, one workload (`lists:flatmap/2` over a fun that `receive`s):
+///
+/// * **(a)** `erlang:apply(lists, flatmap, [F, [1]])` — the compiled `call_ext erlang:apply/3`,
+///   which the loader lowers to the `i_apply` instruction family and [`beam_engine`]'s
+///   `apply_target` resolves through `ExecutionContext::resolve_external_call` **first**, i.e.
+///   through the same seam a direct call takes;
+/// * **(b1)** `Apply(F, [1])` with `Apply = fun lists:flatmap/2` — a `call_fun`, resolved through
+///   `ExecutionContext::resolve_local_fun`
+///   ([`super::super::apply::external_fun_target`]);
+/// * **(b2)** `erlang:apply(Apply, [F, [1]])` — the same external fun through `erlang:apply/2`,
+///   which the loader lowers to the fun-application instruction (`i_apply_fun`), so it takes the
+///   `call_fun` route too;
+/// * **(b3)** `erlang:apply(F, [1])` with `F` the blocking closure itself — the purest form of the
+///   value-returning arm, and the same `call_fun` route;
+/// * **(c)** the positive control — a direct `lists:flatmap(F, [1])` call.
+///
+/// So no `<M,F,A>` apply shape and no fun-application route keeps the typed `blocked()` gap: the
+/// fun application is entered **in-machine**, whatever applied it. Only a fun (or a callee) with
+/// **no in-machine entry** can still gap — the `-eval` evaluator's closure
+/// ([`crate::eval::EVAL_FUN_UNIQ`]), a served local stub key, and an external fun whose module or
+/// export cannot be loaded; the seam's declines are pinned by
+/// `super::super::tests::resolve_local_fun_declines_the_fun_kinds_it_cannot_claim`.
+#[test]
+fn every_apply_shape_answers_the_oracle_when_the_child_needs_a_later_slice() {
+    let Some((erlc, oracle)) = toolchain() else {
+        return;
+    };
+    let fixture = fixture(&erlc);
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+
+    for (shape, function) in [
+        ("(a)   erlang:apply(lists, flatmap, [F, L])", "chained_apply_mfa"),
+        ("(b1)  Apply(F, [L]) with Apply = fun lists:flatmap/2", "chained_apply_externalfun"),
+        ("(b2)  erlang:apply(fun lists:flatmap/2, [F, L])", "chained_apply2_externalfun"),
+        ("(b3)  erlang:apply(F, [L]) with F the blocking closure", "chained_apply2_closure"),
+        ("(c)   direct lists:flatmap(F, L) [positive control]", "chained_direct"),
+    ] {
+        let expected = oracle_lines(&oracle, &fixture, function);
+        let expected = expected.last().expect("the oracle printed a value line");
+        let rendered = run_scheduled_outcome(&fixture, &mut rt, function).unwrap_or_else(|e| {
+            panic!(
+                "{shape} (`{function}`/0) is an in-machine fun application, so two later \
+                 scheduler slices must resume the process and it must answer the oracle's own \
+                 term; it reported {e}"
+            )
+        });
+        eprintln!("{shape} -> {rendered}");
+        assert_eq!(
+            rendered, *expected,
+            "{shape} (`{function}`/0) inside a slice must answer the oracle's own term"
+        );
     }
 }
