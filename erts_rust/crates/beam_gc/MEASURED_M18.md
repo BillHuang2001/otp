@@ -284,11 +284,37 @@ only the mechanical path normalisations — never edit a metric value.**
 | `beam_process` | `-p beam_process --no-fail-fast` | **654 passed / 0 failed / 1 ignored** (52 targets) |
 | `beam_rt` | `-p beam_rt --lib` | **1 806 passed / 0 failed / 4 ignored** |
 | `beam_rt` | `-p beam_rt --tests` (152 integration targets + 2 unit binaries) | **825 passed / 0 failed / 41 ignored** |
-| workspace | `build --workspace --all-targets` | **warning-free** |
+| workspace | `build --workspace --all-targets` | **warning-free** (0 warning lines, 53 crates compiled) |
 
-The ignores are all pre-existing opt-in suites (two-VM distribution, `selfhost_*`, `ref_id_space`,
-`nif_resource_gc`, the documented non-yielding-runner `preemption` hang, two `offheap` doctests).
+Every row above was **re-verified at `a448493292`** (the commit that lands this record), from a clean tree,
+with the sums taken over every target's own `test result:` line — not from a summary:
+
+- `beam_gc` **377 / 0 / 2** over **51** targets (1 lib + 49 integration + 1 doctest); the two ignores are
+  the ```` ```ignore ```` illustrative fences in `src/offheap.rs:102` and `:153`, present since that file's
+  creation and not compilable standalone.
+- `beam_process` **654 / 0 / 1** over **52** targets (1 lib + 50 integration + 1 doctest); the ignore is
+  `tests/preemption.rs:752` `a_runner_that_never_returns_would_hang_the_scheduler`, opt-in because it hangs
+  by design under the documented no-pre-emption gap. Zero "skip" lines: the oracle tests really drove
+  `erl`/`erlc` (OTP 29).
+- `beam_rt` **1 806 / 0 / 4** (`--lib`) and **825 / 0 / 41** over exactly **152** integration targets
+  (`--tests`), so **2 631 / 0 / 45** for the crate.
+- workspace `build --workspace --all-targets`: **0 warning lines** from a real **53-crate** compile (203 s,
+  nothing cached) — not a no-op rebuild.
+
+Two invocation facts that the counts depend on, both pre-existing and outside this session's change:
+- **`-p beam_rt --tests` needs the crate's examples built.** A bare `--tests` does not build them, and
+  `tests/perf_call.rs:97` then fails **2 tests loudly on purpose** rather than passing without having driven
+  the harness (822 + 2, not 825). Build `-p beam_rt --examples` first (or run `--all-targets`, or a plain
+  `cargo test -p beam_rt`).
+- `tests/live_remote_families.rs`'s `free_port()` (`:163`) binds `127.0.0.1:0`, reads the port and drops the
+  listener, so the four concurrently-running tests can race a peer `erl` out of the port it picked. On a
+  loaded host it was observed once in nine runs (`the peer never connected to our node`,
+  `register/listen error: eaddrinuse`), it did not recur in eight consecutive re-runs (solo and full-file),
+  and it is orchestration, never a runtime divergence. **Handoff** — the retry belongs in that harness.
+
 No test was deleted, `#[ignore]`d or weakened, and no library behaviour was changed to make a test pass.
+The pre-existing opt-in ignores are the two-VM distribution suites (32 cases), `selfhost_*`, `ref_id_space`,
+`nif_resource_gc`, `nif_resource_nested`, `inet_nested`, and the lib measurement/sweep harnesses.
 
 ## See Also
 - `MEASURED.md` → the `beam_gc` change's own structural counters and the policy rule.
