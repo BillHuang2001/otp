@@ -535,7 +535,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("ets", "internal_request_all", 0),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
-    ("prim_file", "internal_normalize_utf8", 1),
 ];
 
 /// Whether `(module, function, arity)` is one of the [`MEMORY_HOOK_BIFS`].
@@ -1273,8 +1272,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 219,
-            "the documented seam surface is 219 keys across the 14 tables; a table \
+            aggregate, 218,
+            "the documented seam surface is 218 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
