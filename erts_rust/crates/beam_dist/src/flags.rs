@@ -745,7 +745,8 @@ impl AltactSigFlags {
 // Handshake / version tags (ei_connect_int.h, ei_connect.c).
 // ---------------------------------------------------------------------------
 
-/// `NAME_TAG` (and `CHALLENGE_TAG`): the `'N'`/`'n'` connect-name tag.
+/// `NAME_TAG`: the `'N'` connect-name tag (the legacy pre-OTP-23 `'n'` name is
+/// spoken by neither this crate nor [`crate::connection`]).
 pub const NAME_TAG: u8 = b'N';
 /// `CHALLENGE_TAG`: the `'N'` challenge tag (same byte as [`NAME_TAG`]).
 pub const CHALLENGE_TAG: u8 = b'N';

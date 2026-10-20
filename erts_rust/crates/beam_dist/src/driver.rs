@@ -56,7 +56,7 @@
 //!     while let Some(msg) = driver.next_message(&mut heap, &mut atoms)? {
 //!         /* handle the DOP_* message */
 //!     }
-//!     match driver.state() { DriverState::Closed | DriverState::Failed => drop(driver, ), _ => {} }
+//!     match driver.state() { DriverState::Closed | DriverState::Failed => drop(driver), _ => {} }
 //! }
 //! ```
 //!
