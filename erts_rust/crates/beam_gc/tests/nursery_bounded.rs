@@ -102,9 +102,18 @@ fn the_nursery_and_total_heap_plateau_under_a_growing_working_load() {
     /// Live tuples re-built every round (a bounded, non-growing live set): 20 * 3 = 60 words.
     const LIVE_TUPLES: usize = 20;
     /// Garbage tuples at the last round: the per-round *churn* grows with the round number.
-    /// Live + garbage must stay inside the nursery, so the round's allocation (60 + 150 =
-    /// 210 words) fits the 233-word nursery with room to spare.
-    const MAX_GARBAGE_TUPLES: usize = 50;
+    /// Live + garbage must stay inside the nursery, so the round's allocation (60 + 120 =
+    /// 180 words) fits the 233-word nursery with room to spare.
+    ///
+    /// The ceiling is also what keeps the **total** heap a plateau once the load saturates: a
+    /// fullsweep sizes the mature generation from
+    /// [`HeapPolicy::mature_target_words`](beam_gc::HeapPolicy::mature_target_words), i.e.
+    /// `next_words(2 * (live (60) + young occupancy (60 + 3 * garbage) + reserve (64)))` =
+    /// `next_words(368 + 6 * garbage)`, which sits at 610 words for `2 <= garbage <= 40` — so a
+    /// garbage ceiling of 40 keeps every saturated round on the one mature target. A larger
+    /// ceiling would step the growth table again inside the run and the total heap would move
+    /// with the *working load*, which is exactly what this case must not do.
+    const MAX_GARBAGE_TUPLES: usize = 40;
     /// Rounds to run. Long enough that a per-collection creep would be astronomical
     /// (`233 * 1.2^200` is ~10^17 words) and that the measured half is a true steady state.
     const ROUNDS: usize = 200;

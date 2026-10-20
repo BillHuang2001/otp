@@ -53,9 +53,11 @@
 //! fullsweep cadence (`fullsweep_after = 65535`). Neither test overrides a sizing knob.
 //!
 //! Test 1 deliberately runs that **default cadence** rather than forcing a fullsweep per round:
-//! the fullsweep sizes its fresh mature space from the **exact reachable live word count**
-//! (`collect_major` → `crate::live`) **plus the young heap's occupancy** — a whole nursery's
-//! worth of promotion, so the next collections can be minors (the C `adjust_after_fullsweep`'s
+//! the fullsweep sizes its fresh mature space from
+//! [`HeapPolicy::mature_target_words`] — `MATURE_TARGET_LIVE_MULTIPLE` (2) times the room it
+//! must leave behind, which is the **exact reachable live word count** (`collect_major` →
+//! `crate::live`) **plus the young heap's occupancy** — a whole nursery's worth of promotion —
+//! plus the reserve (the C `adjust_after_fullsweep`'s
 //! `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …`, `erl_gc.c:2072`) — and **never** from
 //! the *mature* generation's (garbage-inflated) pre-collection occupancy. Sizing from the mature
 //! occupancy makes [`HeapPolicy::should_grow`] fire on every fullsweep and creeps the capacity up
@@ -193,39 +195,64 @@ struct Steady {
 }
 
 /// The converged **constant** steady state for the **copying** strategy. The fullsweep sizes the
-/// fresh mature space from the exact reachable live word count (60 words) **plus the young heap's
-/// occupancy** (210 words) plus the reserve: `mature_after_fullsweep(233, 60, 210)` requests
-/// `next_words(334) = 376` words, so the default 233-word mature capacity moves one growth-table
-/// step to 376 (`376 >= 334` and `3 * 376 >= 4 * 334`, so it is then a fixed point). The nursery
-/// stays at the default 233 and the total heap is `233 + 376 = 609`. The mature *occupancy* is
-/// not constant — see [`COPYING_OCCUPANCY_CYCLE`].
+/// fresh mature space from its target ([`HeapPolicy::mature_target_words`]) — `2` × the room it
+/// must leave behind, `live (60) + young occupancy (210) + reserve (64) = 334` — so
+/// `next_words(2 * 334) = next_words(668) = 987` words. The default 233-word mature capacity is
+/// grown onto that target, and it is then a fixed point (`987 >= 987` and
+/// `4 * 987 > 987`, so neither bracket fires). The nursery stays at the default 233 and the total
+/// heap is `233 + 987 = 1220`. The mature *occupancy* is not constant — see
+/// [`COPYING_OCCUPANCY_CYCLE`].
 const COPYING_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
-    mature_capacity: 376,
-    total_heap_size: 233 + 376,
+    mature_capacity: 987,
+    total_heap_size: 233 + 987,
 };
 
 /// The **copying** mature occupancy's converged cycle: one live set per minor since the last
-/// fullsweep (`60 -> 120 -> 180 -> 60`). A minor promotes the nursery's live words onto the top
-/// of the mature space without reclaiming it; once the mature space can no longer receive the
-/// nursery's occupancy the escalation test fires a fullsweep, which evacuates young *and* mature
-/// into a fresh space holding exactly the 60-word live set — so the occupancy starts over at 60
-/// rather than growing without bound.
-const COPYING_OCCUPANCY_CYCLE: [usize; 3] = [LIVE_WORDS, 2 * LIVE_WORDS, 3 * LIVE_WORDS];
+/// fullsweep (`60 -> 120 -> ... -> 780 -> 60`). A minor promotes the nursery's live words onto the
+/// top of the mature space without reclaiming it, and [`AnyCollector::collect`] admits a minor
+/// only while the mature space has a whole nursery's occupancy (`210` words) available — so the
+/// 987-word space takes minors while `987 - used >= 210`, i.e. up to `used = 780`, and the
+/// escalation test then fires a fullsweep, which evacuates young *and* mature into a fresh space
+/// holding exactly the 60-word live set, so the occupancy starts over at 60 rather than growing
+/// without bound. Thirteen live sets per fullsweep.
+const COPYING_OCCUPANCY_CYCLE: [usize; 13] = [
+    LIVE_WORDS,
+    2 * LIVE_WORDS,
+    3 * LIVE_WORDS,
+    4 * LIVE_WORDS,
+    5 * LIVE_WORDS,
+    6 * LIVE_WORDS,
+    7 * LIVE_WORDS,
+    8 * LIVE_WORDS,
+    9 * LIVE_WORDS,
+    10 * LIVE_WORDS,
+    11 * LIVE_WORDS,
+    12 * LIVE_WORDS,
+    13 * LIVE_WORDS,
+];
 
-/// The converged **constant** steady state for the **mark-region** strategy. The exact-live
-/// sizing asks the policy for `next_words(60 + 210 + need_reserve(64)) = next_words(334) = 376`
-/// words; the line-granular region rounds that request up to two whole 256-word blocks (512), and
-/// the 20 live tuples occupy 20 lines = 320 resident words. The nursery stays at the default 233.
+/// The converged **constant** steady state for the **mark-region** strategy. The target is the
+/// same 987 words the copying space asks for (see [`COPYING_STEADY`]); the line-granular region
+/// rounds that request up to four whole 256-word blocks (1024), and the 20 live tuples occupy 20
+/// lines = 320 resident words. The nursery stays at the default 233.
 const IMMIX_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
-    mature_capacity: 512,
-    total_heap_size: 233 + 512,
+    mature_capacity: 1024,
+    total_heap_size: 233 + 1024,
 };
 
-/// The **mark-region** occupancy is constant: the region is reclaimed **in place** at every
-/// fullsweep and then holds exactly the live set — 20 one-line tuples = 20 lines = 320 words.
-const IMMIX_OCCUPANCY_CYCLE: [usize; 1] = [LIVE_TUPLES as usize * 16];
+/// The **mark-region** occupancy cycles over three live-set steps: every fullsweep reclaims the
+/// region **in place** (its target, 987 words, rounds up to the 1024-word region the space
+/// already has, so `mature_after_fullsweep` returns the capacity it was given) and leaves exactly
+/// the live set — 20 one-line tuples = 20 lines = 320 words. Each minor then promotes another 20
+/// lines (640, 960) until the 64-line region has only 4 free lines, too few for the next 20-line
+/// promotion, which escalates to the next fullsweep.
+const IMMIX_OCCUPANCY_CYCLE: [usize; 3] = [
+    LIVE_TUPLES as usize * 16,
+    2 * LIVE_TUPLES as usize * 16,
+    3 * LIVE_TUPLES as usize * 16,
+];
 
 /// The pinned constant expectation for a strategy.
 fn expected(kind: MatureKind) -> Steady {
@@ -335,23 +362,22 @@ fn the_quiescent_heap_converges_to_a_constant() {
         // the convergence honest: it is the sizing of the real fullsweep, not a run that never
         // reached one.
         //
-        // For the **copying** strategy that is exactly the 60 -> 120 -> 180 occupancy cycle: two
-        // minors per fullsweep. The **mark-region** region is line-granular and its `collect`
-        // escalates to a fullsweep unless the region's *free lines* cover the promotion's line
-        // need: 20 one-line tuples need 20 lines, while the 512-word (32-line) region holds the
-        // 20-line live set and leaves only 12 free lines — so at the default policy every
-        // collection is a fullsweep (reclaimed in place, which is why its occupancy is constant).
-        // The mark-region *minor* cadence is pinned by `tests/generational_cadence.rs`, whose
-        // bounded live set does leave the region room to promote.
+        // For the **copying** strategy that is exactly the 60 -> ... -> 780 occupancy cycle:
+        // twelve minors per fullsweep. The **mark-region** region is line-granular and its
+        // `collect` escalates to a fullsweep unless the region's *free lines* cover the
+        // promotion's line need: 20 one-line tuples need 20 lines, while the 1024-word (64-line)
+        // region holds the 20-line live set and leaves 44 free lines — enough to admit a
+        // promotion, so the region *does* run minors too (each one reclaims in place at the
+        // following fullsweep, which is why its occupancy is constant). The mark-region *minor*
+        // cadence is pinned by `tests/generational_cadence.rs`, whose bounded live set does leave
+        // the region room to promote.
         assert!(
             kinds.contains(&CollectionKind::Major),
             "{kind:?}: the default cadence must escalate to a fullsweep"
         );
-        assert_eq!(
+        assert!(
             kinds.contains(&CollectionKind::Minor),
-            kind == MatureKind::Copying,
-            "{kind:?}: the default cadence must run minors (copying only: this live set leaves \
-             the mark-region region too few free lines to admit a promotion)"
+            "{kind:?}: the default cadence must run minors between the fullsweeps"
         );
 
         // ---- the converged constant: min == max for all four observables ----
@@ -564,15 +590,13 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
             "{kind:?}: the live set ({live_words} words) must far exceed the default nursery"
         );
 
-        // ... and the largest nursery the run installed is the **final** live set's whole-heap
+        // ... and the largest nursery the run installed is that round's **whole live set's**
         // target: the fullsweep scale, which is what the live set's growth drags the nursery to.
+        // The mature generation is sized for a run of promotions, so the run's whole-live-set
+        // scale enters the nursery at its **largest fullsweep**, not necessarily at the final
+        // round: the rounds after that fullsweep are minors, each of which sizes the nursery to
+        // the young live set it evacuated (one batch).
         let (_, young_max) = min_max(&young_caps);
-        assert_eq!(
-            young_max,
-            policy.young_target_words(live_words),
-            "{kind:?}: the largest capacity the nursery took must be the final live set's target, \
-             got {young_caps:?}"
-        );
         let biggest = young_caps
             .iter()
             .position(|cap| *cap == young_max)
@@ -581,6 +605,25 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
             kinds[biggest],
             CollectionKind::Major,
             "{kind:?}: the whole live set's scale enters through a fullsweep, at round {biggest}"
+        );
+        assert_eq!(
+            young_max,
+            policy.young_target_words(lives[biggest]),
+            "{kind:?}: the largest capacity the nursery took must be that fullsweep's whole live \
+             set target ({} words at round {biggest}), got {young_caps:?}",
+            lives[biggest]
+        );
+        let largest_fullsweep = lives
+            .iter()
+            .zip(&kinds)
+            .filter(|(_, kind)| **kind == CollectionKind::Major)
+            .map(|(live, _)| *live)
+            .max()
+            .expect("the run reaches at least one fullsweep");
+        assert_eq!(
+            lives[biggest], largest_fullsweep,
+            "{kind:?}: the capacity maximum is installed by the run's largest fullsweep, got one \
+             at {live_words} words live against the largest {largest_fullsweep}"
         );
         // The last round leaves it at its own kind's target.
         assert_eq!(
@@ -651,8 +694,8 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
         eprintln!(
             "{kind:?}: {GROWTH_ROUNDS} rounds of growth, live set 231 -> {live_words} words \
              ({:.0}x the default {DEFAULT_NURSERY}-word nursery): nursery capacity {young_caps:?} \
-             ({} distinct values, ending at the live set's {young_max}-word target), mature \
-             capacity {mature_min} -> {mature_max} words",
+             ({} distinct values, peaking at the {young_max}-word target of the round-{biggest} \
+             fullsweep), mature capacity {mature_min} -> {mature_max} words",
             live_words as f64 / DEFAULT_NURSERY as f64,
             distinct.len()
         );

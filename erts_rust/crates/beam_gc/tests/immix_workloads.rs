@@ -162,18 +162,22 @@ const GARBAGE_C: usize = 1500;
 /// disabled so every collection is one this file explicitly asked for — the measurement must
 /// not depend on which collection a policy happened to pick.
 ///
-/// The fullsweep now sizes the fresh region from the **exact live word count**, so
-/// workload 3's 64-block region (larger than its ~1536-word live set) would otherwise be shrunk
-/// and relocated out from under the measurement. `min_heap_words` is pinned to the same
-/// 64 blocks, so `capacity == min_heap_words` and `should_shrink` can never fire: the region
-/// keeps all 32 live blocks **and** room for the promotion the workload is about.
+/// The fullsweep sizes the fresh region from the policy's mature target, so the region is pinned
+/// on that target: workloads 2 and 3 keep a ~1 824-word live set with a whole nursery's
+/// occupancy behind it, so `mature_target_words(live, occupancy)` =
+/// `next_words(2 * (live + occupancy + reserve)) = next_words(2 * (1824 + 5498 + 64)) = 17731`
+/// words. 72 whole blocks (18432) is the smallest whole-block region at or above it — inside
+/// `[17731, 4 * 17731)`, the keep band — and `min_heap_words` pins the floor there, so
+/// `mature_after_fullsweep` answers the capacity it was given: the region keeps all 32 live
+/// blocks **and** room for the promotion the workload is about, and the reclaim stays in place.
 fn policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: 8192,
-        // 64 Immix blocks: enough for workload 3's 32 live blocks *and* its promotion.
-        initial_mature_words: 16384,
-        min_heap_words: 16384,
+        // 72 Immix blocks: the in-place fixed point for workload 3's 32 live blocks plus its
+        // promotion.
+        initial_mature_words: 72 * 256,
+        min_heap_words: 72 * 256,
         ..HeapPolicy::default()
     }
 }

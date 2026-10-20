@@ -447,11 +447,28 @@ fn a_multi_block_object_survives_alongside_small_objects_and_garbage() {
 fn two_multi_block_objects_of_different_run_sizes_share_the_run_allocator() {
     assert_eq!(run_blocks(LARGE_WORDS), 2);
     assert_eq!(run_blocks(WIDE_WORDS), 3);
+    // The steady live set the test's fullsweep measures: the small cons, the two multi-block
+    // runs and the three fresh cons cells.
+    let live_words = 2 + LARGE_WORDS + WIDE_WORDS + 3 * 2;
+    // Start the region **on** the policy's target for that live set, so the fullsweep below is
+    // the in-place case (`mature_after_fullsweep` answers the capacity it was given):
+    // `mature_target_words(live, 0) = next_words(2 * (live + reserve))`, block-rounded up by the
+    // space itself, which keeps it inside `[target, 4 * target)`.
+    let target = HeapPolicy::default().mature_target_words(live_words, 0);
     let policy = HeapPolicy {
-        initial_mature_words: 8 * BLOCK_WORDS,
+        initial_mature_words: target,
         ..large_policy()
     };
     let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+    assert_eq!(
+        c.policy().mature_after_fullsweep(
+            c.mature().capacity_words(),
+            live_words,
+            0
+        ),
+        c.mature().capacity_words(),
+        "the fixture starts at an in-place fixed point of the mature rule"
+    );
 
     // A small object first, then a two-block run and a three-block run, so the run search
     // has to skip blocks that hold free *lines* but are not wholly free. `roots` order is

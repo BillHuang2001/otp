@@ -338,22 +338,24 @@ fn a_promote_reclaim_cycle_reaches_a_bounded_steady_state() {
         |c| c.mature().used_lines(),
     );
 
-    // Bounded and deterministic: the region converges to the four-block size the fullsweep
-    // policy asks for (once below the packed 8-block region, the policy keeps it), and the
-    // peak occupancy is the packed 2048-word region's own 112 lines — never more.
+    // Bounded and deterministic: the region is **kept** at its packed 8-block starting size,
+    // because the fullsweep policy's target for this live set (two 100-word tuples with the
+    // round's occupancy behind them, `next_words(2 * (200 + 200 + 64)) = 987` words) sits below
+    // it and it is inside the `[target, 4 * target)` keep band, and the peak occupancy is the
+    // packed region's own 112 lines — never more.
     assert_eq!(
-        state.capacity_words, 1024,
-        "the region converged to 1024 words (four blocks)"
+        state.capacity_words, 2048,
+        "the region is kept at its eight-block starting size"
     );
     assert_eq!(
         state.peak_used_lines, 112,
         "the peak occupancy is the packed 2048-word region's 8 x 14 lines"
     );
     assert_eq!(
-        state.majors, 14,
+        state.majors, 7,
         "the fragmented rounds escalated to fullsweeps"
     );
-    assert_eq!(c.stats().minor_collections, 50, "the rest stayed minors");
+    assert_eq!(c.stats().minor_collections, 57, "the rest stayed minors");
     println!(
         "steady state: capacity={} peak_used_lines={} majors={} minors={}",
         state.capacity_words,
@@ -385,8 +387,9 @@ fn larger_objects_reach_the_same_bounded_steady_state() {
         |c| c.mature().capacity_words(),
         |c| c.mature().used_lines(),
     );
-    // Deterministic and bounded: the policy keeps the 8-block region (its occupancy stays
-    // below the shrink threshold) and the peak is the packed region's own 8 x 9 lines.
+    // Deterministic and bounded: the policy keeps the 8-block region (the fullsweep's target for
+    // this live set is well below it, inside the target's keep band) and the peak is the packed
+    // region's own 8 x 9 lines.
     assert_eq!(
         state.capacity_words, 2048,
         "the region is kept at its starting size"
@@ -449,7 +452,7 @@ fn the_strategy_seam_reaches_the_same_steady_state() {
         // The seam reaches the very same steady state as the concrete collector: the region
         // sizes and the peak occupancies are identical on both routes.
         let expected = match elems {
-            ELEMS => (1024usize, 112usize),
+            ELEMS => (2048usize, 112usize),
             BIG_ELEMS => (2048, 72),
             other => panic!("unexpected corpus {other}"),
         };

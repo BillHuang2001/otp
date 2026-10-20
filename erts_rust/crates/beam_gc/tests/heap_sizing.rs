@@ -421,15 +421,21 @@ fn the_minimum_floors_and_the_maximum_clamps_a_real_resize() {
 
 #[test]
 fn a_relocating_fullsweep_resizes_the_immix_region_and_keeps_a_young_to_mature_reference() {
+    // Start the region at four blocks (1024 words). The fullsweep below measures a 6-word live
+    // set with a 2-word nursery occupancy, so the policy's target is
+    // `next_words(2 * (6 + 2 + 64)) = next_words(144) = 233` words — more than four times below
+    // the 1024-word region, which is exactly the shrink bracket of
+    // [`HeapPolicy::mature_after_fullsweep`]: the fullsweep relocates into a fresh region rather
+    // than reclaiming the old one in place.
     let policy = HeapPolicy {
-        initial_mature_words: 610,
+        initial_mature_words: 1024,
         ..HeapPolicy::default()
     };
     let mut c = any(MatureKind::Immix, policy);
     assert_eq!(
         mature_capacity(&c),
-        768,
-        "610 words rounds up to three 256-word blocks"
+        1024,
+        "1024 words is four whole 256-word blocks"
     );
 
     // Round 1: promote an inner tuple into the mature region with a minor.

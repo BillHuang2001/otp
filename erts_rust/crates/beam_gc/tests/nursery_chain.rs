@@ -494,11 +494,12 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
     let distinct: std::collections::BTreeSet<(usize, usize, usize)> =
         tail.iter().copied().collect();
     // The nursery capacity is the live set's target (one `STEADY_NEED`-word tuple, no other
-    // survivor); the mature generation's capacity is a literal here because the nursery rule
-    // does not size it — but it must be a **fixed point** of its own rule at this live set, or
-    // the loop would be creeping rather than converging (the assertion right below checks it).
+    // survivor); the mature generation's capacity follows its own rule at that live set — the
+    // fullsweep's target, `next_words(2 * (live (700) + young occupancy (700) + reserve (64)))`
+    // = `next_words(2928)` = 4185 — and it must be a **fixed point** of that rule, or the loop
+    // would be creeping rather than converging (the assertion right below checks it).
     let young = c.policy().young_target_words(STEADY_NEED);
-    let mature = 1598;
+    let mature = 4185;
     let pinned: std::collections::BTreeSet<(usize, usize, usize)> =
         [(1, young, mature)].into_iter().collect();
     assert_eq!(
@@ -506,12 +507,12 @@ fn a_grow_then_collect_loop_reaches_a_bounded_steady_state() {
         "the converged cycle must be exactly the pinned fixed point (nursery = \
          young_target_words({STEADY_NEED}) = {young}, mature = {mature})"
     );
-    let need_after = STEADY_NEED + c.policy().need_reserve_words;
-    assert!(
-        !c.policy().should_grow(mature, need_after)
-            && !c.policy().should_shrink(mature, need_after),
+    assert_eq!(
+        c.policy()
+            .mature_after_fullsweep(mature, STEADY_NEED, STEADY_NEED),
+        mature,
         "the mature generation ({mature} words) must be a fixed point of its own rule at the \
-         converged live set ({need_after} words needed)"
+         converged live set ({STEADY_NEED} live words plus one nursery's occupancy)"
     );
 
     // Nothing creeps without bound.
