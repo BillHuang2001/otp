@@ -38,8 +38,8 @@
 //! | [`Driver::control`] | `control` | absent slot ⇒ `badarg` (`io.c:4035`) |
 //! | [`Driver::control_reply_shape`] | — | the `*rbuf == NULL` test of the last `control` call (`io.c:4134`); the shape no `cres` can carry |
 //! | [`Driver::port_exit`] | `process_exit`, falling back to `emergency_close` | the C has no port-exit callback |
-//! | [`Driver::flush`] | `flush` | absent slot ⇒ the C's silent no-op (`io.c:3666`); runs **before** `stop` |
-//! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op; the sole caller of the entry's `stop` (`terminate_port`, `io.c:3733-3752`) |
+//! | [`Driver::flush`] | `flush` | absent slot ⇒ the C's silent no-op (`io.c:3664`); runs **before** `stop` |
+//! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op; the sole caller of the entry's `stop` (`terminate_port`, `io.c:3703-3704`, the call at `:3752`) |
 //! | [`Driver::next_timeout`] | the `driver_set_timer` deadline | see [`crate::AbiHost`] |
 //! | [`DriverPort::poll_async`] | `ready_async` / `async_free` | drained from the `driver_async` job set |
 //! | — | `stop_select` | the `ERL_DRV_USE` release callback; runs outside the `Driver` trait, on deselect and at teardown |
@@ -916,18 +916,19 @@ impl Driver for DriverPort {
     /// them:
     ///
     /// * `flush` is called only when the entry **has** one — `if (p->drv_ptr->flush != NULL)`
-    ///   (`io.c:3663`, with the callback at `:3666`) — and only for a port being closed whose ioq is
-    ///   still non-empty (`erts_deliver_port_exit`, `io.c:3936-3942`). It exists so the driver can
-    ///   say "these bytes are obsolete, drop them" (the C `tcp_inet` discards its queue only when
-    ///   write readiness is *not* armed, `inet_drv.c:12708-12731`).
-    /// * `stop` is called once, by `terminate_port` (`io.c:3733-3752`) — the sole caller of the
-    ///   entry's `stop` slot. [`DriverPort::stop`] therefore stays exactly as it is; this method
-    ///   adds a callback *in front of* it, it does not move anything out of it.
+    ///   (`io.c:3664`, with the callback at `:3687`) — and only for a port being closed whose ioq is
+    ///   still non-empty (`erts_deliver_port_exit`'s CLOSING arm, `io.c:3946-3953`). It exists so the
+    ///   driver can say "these bytes are obsolete, drop them" (the C `tcp_inet` discards its queue
+    ///   only when write readiness is *not* armed, `inet_drv.c:12708-12731`).
+    /// * `stop` is called once, by `terminate_port` (`io.c:3703-3704`, the `drv->stop` call at
+    ///   `:3752`) — the sole caller of the entry's `stop` slot. [`DriverPort::stop`] therefore stays
+    ///   exactly as it is; this method adds a callback *in front of* it, it does not move anything
+    ///   out of it.
     ///
     /// # An absent `flush` slot is the C's silent no-op, not an error
     ///
     /// An entry with no `flush` is a driver with nothing to discard, and the C runs no code for it
-    /// (`io.c:3666`). [`DriverLibrary::flush`] reports that as `Err(DriverCallError::absent)` so a
+    /// (`io.c:3664`). [`DriverLibrary::flush`] reports that as `Err(DriverCallError::absent)` so a
     /// caller *can* tell the two apart; here the error is swallowed, which is both the C's behaviour
     /// and [`Driver::flush`]'s own default — a `.so` that never declared a `flush` closes exactly as
     /// a Rust driver that never overrode it.
@@ -942,7 +943,7 @@ impl Driver for DriverPort {
     ///
     /// # The deferred half (why this does not terminate the port)
     ///
-    /// `flush_port` terminates the port itself **only if the ioq became empty** (`io.c:3697-3700`);
+    /// `flush_port` terminates the port itself **only if the ioq became empty** (`io.c:3696-3699`);
     /// otherwise the port stays `ERTS_PORT_SFLG_CLOSING` (the "Limbo" state, `io.c:896-900`) and the
     /// driver-callback epilogue terminates it once the queue drains
     /// (`erts_port_driver_callback_epilogue`, `erts/emulator/beam/erl_port.h:797-813`). That deferral
@@ -965,7 +966,7 @@ impl Driver for DriverPort {
     /// and nothing else.
     fn flush(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.call(ctx, |port, _handle| {
-            // `Err(absent("flush"))` is the C's `flush == NULL` no-op (`io.c:3666`), not a failure.
+            // `Err(absent("flush"))` is the C's `flush == NULL` no-op (`io.c:3664`), not a failure.
             let _ = port.lib.flush(port.data);
         });
         Ok(())
