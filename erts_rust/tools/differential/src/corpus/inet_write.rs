@@ -74,12 +74,39 @@
 //!   the client, so the writer is not tied to the `connect`/`accept` side.
 //! * **`line_mode_send_adds_no_prefix`** — `{packet, line}` on the **sending** socket adds
 //!   nothing: `<<"hi\n">>` arrives as those three bytes (the EOL included) and `<<"nonl">>`
-//!   arrives as those four, with `inet:getopts/2` echoing the mode. `line` is the one block
-//!   framing mode whose write side agrees (next section).
+//!   arrives as those four, with `inet:getopts/2` echoing the mode. `line` is the one framing
+//!   mode with no length prefix; the block modes `1`/`2`/`4` prefix one (see
+//!   `block_framed_send_prefixes_the_header`).
 //! * **`datagram_write_path`** — the datagram writer: `gen_udp:send/4` of an iolist
 //!   (`[<<"ab">>, <<"cd">>]`) is one datagram carrying the 4-byte concatenation, a send of
 //!   `<<>>` is a *deliverable zero-length datagram* (the peer's receive answers
 //!   `{data, <<>>}`, not a timeout), and an 8192-byte datagram arrives byte-identical.
+//! * **`shutdown_write_then_send_closes_the_writer`** — the half-close: after a completed
+//!   `<<"hi">>`, `gen_tcp:shutdown(Cl, write)` answers `ok`, the peer still receives that
+//!   `<<"hi">>` and then its `{tcp_closed, A}` teardown, a later `gen_tcp:send/2` is
+//!   `{error, closed}`, and the repeated `shutdown(write)` plus the following `shutdown(read)`
+//!   are `{error, enotconn}`. (`closed` on the send, never `enotconn`: that is the
+//!   send-on-a-*listener* answer.)
+//! * **`send_counters_advance_with_the_writes`** — `inet:getstat/1`'s **send-side** counters:
+//!   `{send_cnt, 0}`/`{send_oct, 0}` before any write, and `{send_cnt, 2}`/`{send_oct, 6}` after
+//!   two completed 3-byte writes the peer drained in full, so the driver accounting follows the
+//!   bytes really handed to the socket. The *recv*-side counters are deliberately not pinned
+//!   (next section).
+//! * **`block_framed_send_prefixes_the_header`** — a block framing mode on a **sender** prefixes
+//!   the frame length: over a **fresh connection per mode**, `<<"hello">>` is written as
+//!   `<<0,0,0,5,"hello">>` under `{packet, 4}`, `<<0,5,"hello">>` under `{packet, 2}` and
+//!   `<<5,"hello">>` under `{packet, 1}`, observed on the raw peer's `{active, true}` queue with
+//!   `inet:getopts/2` echoing the mode.
+//! * **`packet4_send_via_setopts_writes_the_prefix`** — the same four-byte prefix when the mode
+//!   is applied by `inet:setopts(Cl, [{packet, 4}])` *after* `gen_tcp:connect/3`, so the writer
+//!   reads the framing from the socket's live option store rather than from the connect option
+//!   list.
+//! * **`framed_sender_and_framed_receiver`** — the prefix round trips between two framed ends:
+//!   with `{packet, 4}` on both the receiver's parser consumes the header and hands up exactly
+//!   `<<"hello">>`.
+//! * **`packet4_send_prefixes_a_large_payload`** — the header's multi-byte arithmetic: a
+//!   300-byte payload is written behind `<<0,0,1,44>>` (a 304-byte frame), so the prefix is the
+//!   payload length, not a fixed constant.
 //!
 //! Ids are `inet_write/<snake_case_name>`; the contract is A.4 ([`Contract::DriverAbi`]) plus
 //! A.7 ([`Contract::OtpApps`]) where the observation is the `gen_tcp`/`gen_udp`/`inet` module
@@ -109,46 +136,26 @@
 //! Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) by
 //! running the *same* expression under both runtimes:
 //!
-//! * **a block-framed stream *write* prepends no length header (`beam_rt`).** This is the one
-//!   shape this group would otherwise pin, and it does **not** agree at this commit — measured
-//!   on the raw peer socket of a `{active, true}` receiver:
-//!   - `{packet, 2}` in `gen_tcp:connect/3`'s option list, `gen_tcp:send(Cl, <<"hello">>)`:
-//!     oracle `{ok,{data,<<0,5,104,101,108,108,111>>}}` vs `beam_rt`
-//!     `{ok,{data,<<104,101,108,108,111>>}}`;
-//!   - `{packet, 4}` via `inet:setopts(Cl, [{packet, 4}])` after the connect: oracle
-//!     `{ok,ok,{data,<<0,0,0,5,104,101,108,108,111>>}}` vs `beam_rt`
-//!     `{ok,ok,{data,<<104,101,108,108,111>>}}`;
-//!   - a `{packet, 4}` sender talking to a `{packet, 4}` receiver: oracle
-//!     `{ok,{data,<<104,101,108,108,111>>}}` vs `beam_rt` `{ok,timeout}` (the framed reader
-//!     withholds a frame it never got a prefix for);
-//!   - `{packet, 1}` misses it the same way, and `{packet, line}` **agrees** (line mode writes
-//!     no prefix — that is the `line_mode_send_adds_no_prefix` row).
-//!
-//!   A missing prefix is a plain observable, so a case would commit a `mismatch`; the guard test
-//!   [`no_case_pins_a_measured_divergence`] rejects `{packet, 1|2|4}` outright, and the
-//!   measurement is recorded in `divergences.md` §A.4. **The framed-write rows land the moment
-//!   the write-side fix does** — they are two `{packet, 4}` / `{packet, 2}` rows that send
-//!   `<<"hello">>` to a raw peer and pin the received image (`<<0,0,0,5,104,101,108,108,111>>` /
-//!   `<<0,5,104,101,108,108,111>>`), plus a large payload whose 4-byte header needs the
-//!   `<<0,0,0,N>>` form; the only edit needed is the golden and this section. Owner: `beam_io` /
-//!   `beam_rt`.
-//! * **a passive read has nothing to read from (`beam_rt`).** Every *passive* read —
-//!   `gen_tcp:recv(A, 0, 2000)` with the bytes already queued by a completed `send`, and
-//!   `gen_tcp:recv(A, 2, 1000)` — makes the Rust runtime exit `3` with
-//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` where the
-//!   oracle answers `{ok, <<"hi">>}`. That is a typed capability gap, not a divergence, so every
-//!   row of this group receives on the *active* path (`{active, true}` + a bounded `receive`)
-//!   instead. Owner: `beam_rt` / `beam_io`.
-//! * **`gen_tcp:send/2` after `gen_tcp:shutdown(Cl, write)` blocks (`beam_rt`).** The oracle
-//!   answers `{ok,{error,closed},{error,enotconn}}` for the two sends after the shutdown; the
-//!   Rust runtime takes the same `process blocked` exit `3` path, so the write-after-`shutdown`
-//!   half is not pinnable. `gen_tcp:shutdown/2`'s own answers are pinned elsewhere
-//!   ([`super::inet_control`]'s `tcp_bare_refusals`). Owner: `beam_rt` / `beam_io`.
-//! * **the send-side counters stay zero (`beam_rt`).** `inet:getstat(Cl, [send_cnt, send_oct])`
-//!   answers `{ok,[{send_cnt,0},{send_oct,0}]}` before the writes on both sides, but after two
-//!   completed writes the oracle answers `{ok,[{send_cnt,2},{send_oct,6}]}` while `beam_rt`
-//!   still answers `{ok,[{send_cnt,0},{send_oct,0}]}`: the driver accounting is not updated.
-//!   Recorded in `divergences.md` §A.4 and rejected by the guard test. Owner: `beam_io`.
+//! * **a *second* `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, write)` blocks (`beam_rt`).** The
+//!   **first** send after the shutdown agrees — `{error, closed}` on both sides, which is what
+//!   `shutdown_write_then_send_closes_the_writer` pins — but a second one makes the Rust runtime
+//!   exit `3` with `beam_rt: unsupported: opcode: run: process blocked (no message available)`
+//!   where the oracle answers `{error, enotconn}` (the driver marks the socket fully closed
+//!   after the first failed write). That is a typed capability gap, not a divergence, so the
+//!   pinned half-close row performs exactly **one** send after the shutdown. Owner: `beam_rt` /
+//!   `beam_io`.
+//! * **a passive read whose data was queued *before* the call (`beam_rt`).** Only a passive read
+//!   armed **before** the bytes arrive is pinnable, and that shape is the read half's
+//!   ([`super::inet_control`]'s `passive_recv_*` rows). A `gen_tcp:recv/2,3` whose bytes were
+//!   already queued is the `process blocked` exit-3 gap on the module-run route, a different
+//!   `port event` bound on the `-eval` route, and — for a caller timeout ≤ 5 s on `-eval` — a
+//!   plain, wrong `{error, timeout}`, i.e. a real divergence. Every row of **this** group
+//!   therefore receives on the *active* path (`{active, true}` + a bounded `receive`). Owner:
+//!   `beam_rt` / `beam_io`.
+//! * **the *recv*-side `inet:getstat/1` counters are racy on the oracle.** `{recv_cnt, _}` /
+//!   `{recv_oct, _}` legitimately answer `{0,0}` or the drained figure depending on when the
+//!   driver's accounting lands, so no row pins them; the **send**-side counters are exact and
+//!   are pinned by `send_counters_advance_with_the_writes`, once the writes have completed.
 //! * **a bare-integer payload is written by the oracle and dropped by `beam_rt`.**
 //!   `gen_tcp:send(Cl, 42)` answers `ok` on both sides, but the oracle puts the single byte `42`
 //!   on the wire (the peer receives `<<42,0,255,1,128>>` for the sequence below) where `beam_rt`
@@ -476,9 +483,184 @@ pub(crate) fn group() -> Vec<Case> {
              {S1, G1, S2, G2, S3, G3} end",
             "ok {ok,{data,<<97,98,99,100>>},ok,{data,<<>>},ok,{size,8192,true}}",
         ),
+        // --- the half-close: what the writer answers after shutdown(write) ---------------------
+        case(
+            "inet_write/shutdown_write_then_send_closes_the_writer",
+            "gen_tcp:shutdown(Cl,write) after a completed <<\"hi\">> answers ok, the peer still \
+             receives that <<\"hi\">> and then its {tcp_closed,A} teardown, a later \
+             gen_tcp:send/2 is {error,closed} (never enotconn) and the repeated shutdown(write) \
+             plus the following shutdown(read) are {error,enotconn}",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= 2 -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Sent = gen_tcp:send(Cl, <<\"hi\">>), \
+             Shut = gen_tcp:shutdown(Cl, write), \
+             S1 = gen_tcp:send(Cl, <<\"x\">>), \
+             Shut2 = gen_tcp:shutdown(Cl, write), \
+             ShutR = gen_tcp:shutdown(Cl, read), \
+             Got = Drain(<<>>), \
+             Cls = receive {tcp_closed, A} -> closed after 2000 -> timeout2 end, \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Sent, Shut, S1, Shut2, ShutR, Got, Cls} end",
+            "ok {ok,ok,{error,closed},{error,enotconn},{error,enotconn},<<104,105>>,closed}",
+        ),
+        // --- the send-side driver accounting ----------------------------------------------------
+        case(
+            "inet_write/send_counters_advance_with_the_writes",
+            "inet:getstat/1's send-side counters: {send_cnt,0}/{send_oct,0} before any write and \
+             {send_cnt,2}/{send_oct,6} after two completed 3-byte writes the peer drained in \
+             full, so the driver accounting follows the bytes really handed to the socket (the \
+             recv-side counters are racy on the oracle and are not pinned)",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= 6 -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Before = inet:getstat(Cl, [send_cnt, send_oct]), \
+             S1 = gen_tcp:send(Cl, <<\"abc\">>), \
+             S2 = gen_tcp:send(Cl, <<\"abc\">>), \
+             Got = Drain(<<>>), \
+             After = inet:getstat(Cl, [send_cnt, send_oct]), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Before, S1, S2, Got, After} end",
+            "ok {{ok,[{send_cnt,0},{send_oct,0}]},ok,ok,<<97,98,99,97,98,99>>,\
+             {ok,[{send_cnt,2},{send_oct,6}]}}",
+        ),
+        // --- a block framing mode on a sender prefixes the length header -----------------------
+        case(
+            "inet_write/block_framed_send_prefixes_the_header",
+            "a block framing mode on the sending socket prefixes the frame length: over a fresh \
+             connection per mode <<\"hello\">> is written as <<0,0,0,5,\"hello\">> under \
+             {packet,4}, <<0,5,\"hello\">> under {packet,2} and <<5,\"hello\">> under {packet,1}, \
+             observed on the raw peer's {active,true} queue with inet:getopts/2 echoing the mode",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin Frame = fun(Pk) -> \
+                 {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, {active, false}]), \
+                 {ok, Port} = inet:port(L), \
+                 {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                            [binary, {active, false}, {packet, Pk}]), \
+                 {ok, A} = gen_tcp:accept(L), \
+                 ok = inet:setopts(A, [{active, true}]), \
+                 Want = 5 + Pk, \
+                 Drain = fun Loop(Acc) when byte_size(Acc) >= Want -> Acc; \
+                             Loop(Acc) -> receive {tcp, A, Db} -> \
+                                              Loop(<<Acc/binary, Db/binary>>) \
+                                          after 2000 -> Acc end end, \
+                 Get = inet:getopts(Cl, [packet]), \
+                 Sent = gen_tcp:send(Cl, <<\"hello\">>), \
+                 Got = Drain(<<>>), \
+                 gen_tcp:close(Cl), \
+                 gen_tcp:close(A), \
+                 gen_tcp:close(L), \
+                 {Get, Sent, Got} \
+             end, \
+             [Frame(Pk) || Pk <- [1, 2, 4]] end",
+            "ok [{{ok,[{packet,1}]},ok,<<5,104,101,108,108,111>>},\
+             {{ok,[{packet,2}]},ok,<<0,5,104,101,108,108,111>>},\
+             {{ok,[{packet,4}]},ok,<<0,0,0,5,104,101,108,108,111>>}]",
+        ),
+        // --- the same framing applied to the live socket by setopts ---------------------------
+        case(
+            "inet_write/packet4_send_via_setopts_writes_the_prefix",
+            "with {packet,4} applied by inet:setopts(Cl,[{packet,4}]) after gen_tcp:connect/3 the \
+             sender still prefixes the four-byte length header, so the framing is read from the \
+             live option store rather than from the connect option list",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Set = inet:setopts(Cl, [{packet, 4}]), \
+             Get = inet:getopts(Cl, [packet]), \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= 9 -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Sent = gen_tcp:send(Cl, <<\"hello\">>), \
+             Got = Drain(<<>>), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Set, Get, Sent, Got} end",
+            "ok {ok,{ok,[{packet,4}]},ok,<<0,0,0,5,104,101,108,108,111>>}",
+        ),
+        // --- the prefix round trips between two framed ends ------------------------------------
+        case(
+            "inet_write/framed_sender_and_framed_receiver",
+            "with {packet,4} on both ends the header a framed sender writes is consumed by the \
+             framed receiver's parser, which hands up exactly <<\"hello\">> (both option stores \
+             echo the mode)",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}, {packet, 4}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{packet, 4}, {active, true}]), \
+             GetS = inet:getopts(Cl, [packet]), \
+             GetR = inet:getopts(A, [packet]), \
+             Sent = gen_tcp:send(Cl, <<\"hello\">>), \
+             Got = receive {tcp, A, Db} -> {data, Db} after 2000 -> timeout end, \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {GetS, GetR, Sent, Got} end",
+            "ok {{ok,[{packet,4}]},{ok,[{packet,4}]},ok,{data,<<104,101,108,108,111>>}}",
+        ),
+        // --- the header's multi-byte arithmetic -----------------------------------------------
+        case(
+            "inet_write/packet4_send_prefixes_a_large_payload",
+            "the four-byte {packet,4} header is the payload length: a 300-byte payload is written \
+             behind <<0,0,1,44>> (a 304-byte frame the peer drains in full), so the prefix is \
+             computed, not a fixed constant",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}, {packet, 4}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Payload = binary:copy(<<\"x\">>, 300), \
+             Want = byte_size(Payload) + 4, \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= Want -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Sent = gen_tcp:send(Cl, Payload), \
+             Got = Drain(<<>>), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Sent, byte_size(Got), binary:part(Got, 0, 4), binary:part(Got, 4, 2)} end",
+            "ok {ok,304,<<0,0,1,44>>,<<120,120>>}",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     use super::{group, Contract};
@@ -489,7 +671,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_write_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 11, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 17, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -555,31 +737,26 @@ mod tests {
     /// The shapes that were **measured** to diverge (or to be a typed capability gap) stay out of
     /// the group. Pinning any of them would commit a `mismatch` or an `unsupported`.
     ///
-    /// * a block framing mode (`{packet, 1|2|4}`) on a sender writes no length header on
-    ///   `beam_rt` — the measurement is in the module docs and `divergences.md` §A.4. `line` is
-    ///   the one framing mode that agrees and is what `line_mode_send_adds_no_prefix` pins.
-    /// * a **passive** read (`gen_tcp:recv/2,3`) is the `process blocked` exit-3 gap on `beam_rt`,
-    ///   so every row receives on the `{active, true}` path.
-    /// * `gen_tcp:shutdown/2`'s write half is the same gap (the send after it blocks), and the
-    ///   shutdown answers themselves are pinned by `inet_control`.
-    /// * `inet:getstat/1`'s send-side counters are never updated on `beam_rt`
-    ///   (`{send_cnt,2},{send_oct,6}` against `{0,0}`).
+    /// * a **passive** read (`gen_tcp:recv/2,3`) belongs to the read half: every row here writes
+    ///   through `gen_tcp`/`gen_udp` and reads on the `{active, true}` path. The one pinnable
+    ///   passive read is the one armed *before* the bytes arrive (pinned by
+    ///   [`super::inet_control`]'s `passive_recv_*` rows); the queued-before-the-call form is the
+    ///   `process blocked` exit-3 gap, and this group would only ever write it by accident.
     /// * the raw port-command bridge, `prim_inet`'s own verbs and `os:cmd/1` are out of scope for
     ///   the whole gen_tcp/gen_udp layer (they are pinned by the `udp/`, `driver/` and
     ///   `ram_file/` groups; `os:cmd/1` would need an external sender and a host-dependent
     ///   golden).
+    ///
+    /// The shapes that used to be listed here have **closed** and are pinned by this group:
+    /// `gen_tcp:shutdown/2` after a completed write (`shutdown_write_then_send_closes_the_writer`,
+    /// one send after it — a *second* one is still a capability gap, see the module docs), the
+    /// block framing modes on a **sender** (`{packet, 1|2|4}` prefixes the length header) and
+    /// `inet:getstat/1`'s send-side counters.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
             let expr = case.expr().expect("eval case");
-            for forbidden in [
-                "gen_tcp:recv(",
-                "gen_tcp:shutdown(",
-                "inet:getstat(",
-                "port_command",
-                "prim_inet",
-                "os:cmd",
-            ] {
+            for forbidden in ["gen_tcp:recv(", "port_command", "prim_inet", "os:cmd"] {
                 assert!(
                     !expr.contains(forbidden),
                     "case {} uses `{forbidden}`, a measured divergence or capability gap \
@@ -587,27 +764,8 @@ mod tests {
                     case.id
                 );
             }
-            // A block framing mode on a **sender**: the oracle prefixes the length header, the
-            // runtime writes the payload raw. Written compactly as well as spaced, so a future
-            // edit cannot slip one past the guard.
-            for framed in [
-                "{packet, 1}",
-                "{packet, 2}",
-                "{packet, 4}",
-                "{packet,1}",
-                "{packet,2}",
-                "{packet,4}",
-            ] {
-                assert!(
-                    !expr.contains(framed),
-                    "case {} frames a sender (`{framed}`), which writes no length header \
-                     (see the module docs)",
-                    case.id
-                );
-            }
         }
     }
-
     /// `gen_tcp:send/2` of a **bare integer** is the one iodata shape that diverges: the oracle
     /// puts the integer's byte on the wire, `beam_rt` writes nothing (both answer `ok`). Guard
     /// every send call's second argument against it — an integer *inside* an iolist is a byte and

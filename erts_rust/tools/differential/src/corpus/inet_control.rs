@@ -89,6 +89,17 @@
 //! * **`udp_passive_recv_returns_the_payload`** — the passive half of the same path:
 //!   `gen_udp:recv/3` hands back `{ok, {Ip, FromPort, Data}}` (again with the sender port reduced
 //!   to `is_integer/1`).
+//! * **`passive_recv_of_data_that_arrives_while_armed`** — the stream **passive read** in the one
+//!   shape that is pinnable: a spawned sender waits a bounded `receive after 500` and only then
+//!   `gen_tcp:send`s `<<"hi">>`, so `gen_tcp:recv(A, 2, 2000)` is *armed* before the bytes exist
+//!   and answers `{ok, <<"hi">>}` (a fixed length reads exactly that many bytes).
+//! * **`passive_recv_length_zero_returns_the_armed_arrival`** — the same armed read with length
+//!   `0`, which hands back whatever arrived (`{ok, <<"hello">>}`), followed by a second 2-byte
+//!   read on the now-empty socket, which arms and answers `{error, timeout}` — so a zero-length
+//!   read neither over- nor under-reads.
+//! * **`passive_recv_on_an_empty_socket_times_out`** — the degenerate end of the same lattice:
+//!   with nothing queued and nothing sent, `gen_tcp:recv(A, 2, 300)` answers `{error, timeout}`
+//!   on both runtimes (the driver arms, the caller's bound elapses, the socket stays open).
 //!
 //! Ids are `inet_control/<snake_case_name>`; the contract is A.4 ([`Contract::DriverAbi`]) plus
 //! A.7 ([`Contract::OtpApps`]) wherever the observation is the `gen_udp`/`gen_tcp`/`inet`
@@ -102,41 +113,51 @@
 //! `is_integer/1` + `P > 0`, or used once as an argument (the `eaddrinuse`, closed-socket and
 //! data-path rows) where only the resulting `posix()` reason or payload is observed. Every socket
 //! and port is closed before the row answers, so no row leaks a descriptor into the next one.
-//! The delivery rows wait with a bounded `receive … after N -> timeout end` (1000 ms, or 300 ms
-//! for the truncated-frame probe) whose **oracle** answer is the golden, and the bytes they
-//! deliver are already queued in the kernel by a *previous, completed* `send`, so neither depends
-//! on host load — and a lost datagram, a dropped connection or an unparsed frame would show up as
-//! the `timeout` answer, i.e. as a visible mismatch, never as a silent pass.
+//! The delivery rows wait with a bounded `receive … after N -> timeout end` (1000 ms for the
+//! teardown rows, 2000 ms where a payload is accumulated, or 300 ms for the truncated-frame and
+//! empty-socket probes) whose **oracle** answer is the golden, and the bytes they deliver are
+//! already queued in the kernel by a *previous, completed* `send`, so neither depends on host
+//! load — and a lost datagram, a dropped connection or an unparsed frame would show up as the
+//! `timeout` answer, i.e. as a visible mismatch, never as a silent pass.
+//!
+//! The `passive_recv_*` rows are the one place a row must delay a sender instead: they are
+//! precisely the shape where the bytes have to arrive **while the read is armed**, so a spawned
+//! sender waits on a *bounded* `receive after 500 -> ok end` (never a `timer:sleep` and never an
+//! unbounded wait) before it sends. The bound is ~10× the arming latency (the parent's next call
+//! is the `recv` itself), and both margins are visible: a sender that fired too early would show
+//! up as the `{error, timeout}` answer (a visible mismatch, not a hang) and a read that ran too
+//! long would time out at its own 2000 ms bound.
 //!
 //! The framed **read** rows send their bytes from a socket left in `{packet, 0}`, with the length
-//! prefix written out literally (`<<0,0,0,5,"hello">>`). That is deliberate: the read-side parser
-//! is what they pin, and the *write*-side framing — a block framing mode on the sending socket —
-//! is a measured divergence (next section).
+//! prefix written out literally (`<<0,0,0,5,"hello">>`), so the *read*-side parser is what they
+//! pin independently of the writer's framing (which prefixes the header too, and is pinned by
+//! [`super::inet_write`]).
 //!
 //! # Measured shapes that are deliberately NOT cases (handoffs, never `mismatch`-pinned)
 //!
 //! Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) by
 //! running the *same* expression under both runtimes:
 //!
-//! * **a framed stream *write* prepends no length header (`beam_rt`).** With a block framing mode
-//!   on the **sending** socket — `{packet, 4}` through `gen_tcp:connect/3`'s option list *or* an
-//!   `inet:setopts/2` after the connect — `gen_tcp:send(Cl, <<"hello">>)` reaches a raw peer as
-//!   `<<0,0,0,5,104,101,108,108,111>>` under the oracle and as `<<104,101,108,108,111>>` under
-//!   `beam_rt`: the header is never written. `{packet, 2}` (`<<0,5,…>>` vs `…`) and `{packet, 1}`
-//!   (`<<5,…>>` vs `…`) are missing it the same way, so a framed sender talking to a framed
-//!   receiver simply times out on the Rust side (measured: oracle
-//!   `{ok,{data,<<104,101,108,108,111>>}}`, `beam_rt` `{ok,timeout}`). The **read** side is exact
-//!   in all three modes — that is what the four `*_framed_read` rows pin — and `{packet, line}` on
-//!   a sender agrees too (line mode adds no prefix). Owner: `beam_io` / `beam_rt` (the write-side
-//!   framing). Reported, never pinned: a missing prefix is a plain observable, so a case would
-//!   commit a `mismatch`.
-//! * **the blocking reads are a typed capability gap (`beam_rt`).** `gen_tcp:recv(A, 2, 1000)`
-//!   (with or without queued bytes), `gen_tcp:accept(L, 200)` and `gen_udp:recv(S, 0, 300)`
-//!   (with no datagram queued) each make the Rust runtime exit `3` with
-//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` where the oracle
-//!   answers `{ok, …}` / `{error, timeout}`. That is `unsupported`, not a divergence, but it is
-//!   not an *agreement* either, so no row pins a read with nothing queued. Owners: `beam_rt` /
-//!   `beam_io`.
+//! * **a passive read whose data was queued *before* the call (`beam_rt`).** This is the trap the
+//!   `passive_recv_*` rows are shaped to avoid: with the bytes already queued, the module-run
+//!   route exits `3` with `beam_rt: unsupported: opcode: run: process blocked (no message
+//!   available)`, the `-eval` route exits `3` with a *different* reason (`port event: … within
+//!   the 5 s bound`) when the caller's timeout is above 5000 ms or `infinity`, and — for a caller
+//!   timeout ≤ 5000 ms — it answers a plain, wrong `{error, timeout}`, which is a **real
+//!   divergence**. So every passive-read row either arms the read before the data arrives or
+//!   expects `{error, timeout}` on an empty socket, and the guard test
+//!   [`no_case_pins_a_measured_divergence`] enforces exactly that. Owner: `beam_rt` / `beam_io`.
+//! * **`gen_tcp:accept/2` and `gen_udp:recv/3` with nothing pending (`beam_rt`).** A *bounded*
+//!   wait with nothing to collect is served on both sides — `gen_tcp:accept(L, 200)` and
+//!   `gen_udp:recv(S, 0, 300)` each answer `{error, timeout}` — but neither is pinned here: the
+//!   orderings that make them interesting (a connection or datagram that arrives while the wait
+//!   is armed) are the same arming race the `passive_recv_*` rows pin for the stream read, and a
+//!   second copy of it would add runtime without adding a contract. Owner: `beam_rt` / `beam_io`.
+//! * **a port `exit_status`/`{'EXIT', Port, _}` observable.** The `-eval` **root** process traps
+//!   exits on the oracle (`process_info(self(), trap_exit)` is `{trap_exit, true}`) and does not
+//!   on `beam_rt` (`{trap_exit, false}`), so any observable that rides the root's exit-signal
+//!   handling is unpinnable; every row here stays on a bounded `receive … after N` and never
+//!   asserts an `{'EXIT', Port, _}`. Owner: `beam_rt`.
 //! * **`erlang:port_command/2` on a socket-less driver port** now agrees and is pinned by the
 //!   [`super::udp`] group (`udp/port_command_on_a_socket_less_port_kills_it`,
 //!   `udp/port_command_with_a_caller_ref_prefix_keeps_the_port`).
@@ -511,9 +532,72 @@ pub(crate) fn group() -> Vec<Case> {
              Rc end",
             "ok {ok,{{127,0,0,1},true,<<104,105>>}}",
         ),
+        // --- the stream passive read: armed before the bytes exist ----------------------------
+        case(
+            "inet_control/passive_recv_of_data_that_arrives_while_armed",
+            "the pinnable passive-read shape: a spawned sender waits a bounded receive after 500 \
+             and only then sends <<\"hi\">>, so gen_tcp:recv(A,2,2000) is armed before the bytes \
+             arrive and answers {ok,<<\"hi\">>}",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             spawn(fun() -> receive after 500 -> ok end, \
+                           gen_tcp:send(Cl, <<\"hi\">>) end), \
+             Rc = gen_tcp:recv(A, 2, 2000), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             Rc end",
+            "ok {ok,<<104,105>>}",
+        ),
+        // --- a zero-length passive read takes whatever arrived --------------------------------
+        case(
+            "inet_control/passive_recv_length_zero_returns_the_armed_arrival",
+            "a zero-length passive read armed before the sender fires hands back exactly the \
+             arrival ({ok,<<\"hello\">>}), and the following 2-byte read on the drained socket \
+             arms and answers {error,timeout}",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             spawn(fun() -> receive after 500 -> ok end, \
+                           ok = gen_tcp:send(Cl, <<\"hello\">>) end), \
+             Rc0 = gen_tcp:recv(A, 0, 2000), \
+             Rc2 = gen_tcp:recv(A, 2, 2000), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Rc0, Rc2} end",
+            "ok {{ok,<<104,101,108,108,111>>},{error,timeout}}",
+        ),
+        // --- a passive read with nothing to collect times out ---------------------------------
+        case(
+            "inet_control/passive_recv_on_an_empty_socket_times_out",
+            "with nothing queued and nothing sent, gen_tcp:recv(A,2,300) arms, lets the caller's \
+             bound elapse and answers {error,timeout}; the socket stays open and closeable",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             Rc = gen_tcp:recv(A, 2, 300), \
+             Cls = gen_tcp:close(A), \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(L), \
+             {Rc, Cls} end",
+            "ok {{error,timeout},ok}",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     use super::{group, Contract};
@@ -525,7 +609,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_control_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 15, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 18, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -569,19 +653,22 @@ mod tests {
         );
     }
 
-    /// The shapes that were **measured** to diverge stay out of the group: a block framing mode
-    /// on the **sending** socket (no length header is written by `beam_rt`), the blocking reads
-    /// that have nothing queued (a typed `unsupported` capability gap), and `prim_inet`'s own
-    /// verbs (not the layer this group drives). Pinning any of them would commit a `mismatch`.
+    /// The shapes that were **measured** to diverge stay out of the group: a passive read whose
+    /// bytes were already queued when the call was made (a plain, wrong `{error, timeout}` for a
+    /// caller timeout ≤ 5 s, an exit-3 `port event`/`process blocked` gap otherwise), and the
+    /// layers this group does not drive (`prim_inet`'s own verbs, the raw port-command bridge,
+    /// `os:cmd/1`). Pinning any of them would commit a `mismatch` (or an `unsupported`).
     /// See the module docs for the exact pairs of observations.
     ///
     /// The option/address surface of both drivers (including `inet:getstat/1`,
     /// `gen_tcp:connect/3`, `gen_tcp:listen/2` and the `{mode, list|binary}` store) is served,
-    /// and so now are `gen_tcp:send/2` (`{error, enotconn}` on a listener, `ok` on a connection),
+    /// and so now are `gen_tcp:send/2` (`{error, enotconn}` on a listener, `ok` on a connection,
+    /// and — since the write side gained its framing — a length-prefixed frame under a block
+    /// framing mode, so a `{packet, N}` in a `gen_tcp:connect/3` option list is free to appear),
     /// the data path of both drivers (raw active-mode delivery, the peer-close teardown and the
-    /// passive/active datagram read) and the **framed read** in all three block modes
+    /// passive/active datagram read), the **framed read** in all three block modes
     /// (`{packet, 4}` / `{packet, 2}` / `line`, including inheritance from `gen_tcp:listen/2` and
-    /// buffering across segments), so those verbs are free to appear in a row.
+    /// buffering across segments), and the **armed** passive stream read (`passive_recv_*`).
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {
@@ -603,26 +690,28 @@ mod tests {
                     case.id
                 );
             }
-            // A block framing mode on the **sending** socket: the oracle prefixes a length header
-            // on every `gen_tcp:send/2` (`{packet, 4}` turns `<<"hello">>` into
-            // `<<0,0,0,5,"hello">>`), `beam_rt` writes the payload raw — a plain observable, so a
-            // case pinning it would be a `mismatch`. Every sender in this group is the socket
-            // `gen_tcp:connect/3` produced, so the guard scans that call's option list. A framing
-            // mode on a **receiving** socket is fine and is exactly what the `*_framed_read` rows
-            // pin (see the module docs and `divergences.md` §A.4).
-            for (at, _) in expr.match_indices("gen_tcp:connect(") {
+            // A passive read is only pinnable when it is **armed before the bytes arrive**: with
+            // the data already queued, the same call answers a plain, wrong `{error, timeout}`
+            // (caller bound ≤ 5 s) or one of the two exit-3 capability reasons. Two readings are
+            // safe without the arming idiom, and only those two: a `recv` on the *listening*
+            // socket (a `{error, enotconn}` refusal that never arms), and a `recv` in a row that
+            // writes nothing at all (so nothing can have been queued). Everything else must delay
+            // its sender with a bounded `receive after N -> ok end` inside a `spawn`, which is
+            // what the `passive_recv_*` rows do.
+            let armed_sender = expr.contains("spawn(fun() -> receive after ");
+            let writes_nothing = !expr.contains("gen_tcp:send(") && !expr.contains("gen_udp:send(");
+            for (at, _) in expr.match_indices("gen_tcp:recv(") {
                 let call = &expr[at..];
-                let opts = call.split(')').next().unwrap_or(call);
+                let listener_refusal = call.starts_with("gen_tcp:recv(L,");
                 assert!(
-                    !opts.contains("{packet, "),
-                    "case {} frames the output of its connected socket (`{opts}`), a measured \
-                     divergence (see the module docs)",
+                    armed_sender || writes_nothing || listener_refusal,
+                    "case {} calls a passive read without arming it before the bytes arrive \
+                     (`{call}`), the queued-before-the-call shape that is a measured divergence \
+                     (see the module docs)",
                     case.id
                 );
-            }
-        }
-    }
-    /// The probe wrapper binds `V`, `C`, `R` and `X`, so an expression that binds one of those
+            }        }
+    }    /// The probe wrapper binds `V`, `C`, `R` and `X`, so an expression that binds one of those
     /// names makes the **oracle** fail to compile the wrapped expression — a guaranteed, silent
     /// false mismatch. Guard the group against a future edit reintroducing one.
     #[test]
@@ -647,9 +736,11 @@ mod tests {
     /// unbounded wait) would make the group's runtime depend on the host's load. A **bounded**
     /// `receive … after N -> timeout end` is allowed — its *oracle* answer is the golden, and a
     /// delivery that never happened shows up as a `timeout` answer, i.e. as a visible mismatch.
+    /// The `passive_recv_*` rows' spawned sender is the same rule: it delays itself with a
+    /// bounded `receive after 500 -> ok end`, never a `timer:sleep`, so its bound is visible in
+    /// the source and in the golden's own timing.
     #[test]
-    fn no_case_waits_on_a_message() {
-        for case in group() {
+    fn no_case_waits_on_a_message() {        for case in group() {
             let expr = case.expr().expect("eval case");
             assert!(
                 !expr.contains("timer:sleep"),
