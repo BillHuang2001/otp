@@ -13,8 +13,10 @@ Three A.3 (NIF C ABI) capability gaps remain in `../beam_abi`, each a typed refu
 `crates/beam_rt` (`src/nif.rs`, `src/nif_select.rs`), i.e. sibling nodes the authoring agent has no
 write authority over. What this node *can* own — and does — is the ground truth: three **real C NIF
 fixtures**, each compiled with `cc` and **run against the live oracle** (OTP 29.1.1 / erts-17.1), plus
-`tests/nif_a3_host_gaps.rs`, which replays the measured oracle transcript and witnesses each gap
-in-process. The measurements below are recorded facts from those runs, not predictions: several of
+`tests/nif_a3_oracle_replay.rs` (which replays the measured oracle transcript) and
+`tests/nif_a3_abi_assertions.rs` (which asserts the same three contracts in-process). All three gaps are
+now **closed** in `beam_abi`; the two suites are the regression gate. The measurements below are
+recorded facts from those runs, not predictions: several of
 them contradict the obvious port of the C, so read them before writing code.
 
 Fixtures (reuse them; do not rewrite them):
@@ -212,16 +214,28 @@ the test.
 
 ## §4 What this node already provides
 - The three fixtures + `.erl` drivers, `cc -Wall -Wextra` clean, oracle-measured (tables above).
-- `tests/nif_a3_host_gaps.rs` — 6 tests: 3 replay the measured oracle transcripts (compile → `erlc` →
-  `erl`, skip loudly without the toolchain), 3 witness the current gaps **in-process** through
-  `beam_abi`'s public `enif_*` entry points (no `dlopen`): the `enif_schedule_nif` continuation never
-  runs and `badarg` comes back; `enif_alloc_env()` is `NULL` with no live env and
-  `enif_send(null, …)` is `0`; a resource `stop` callback is never called even though the host answers
-  `STOP_CALLED`. **Flip those three witnesses into the oracle-faithful assertions when the gaps close**
-  — they are the regression gate in the meantime.
-- A measured-transcript record inside that test's doc comments (stable fields only; the deferred-stop
-  latency/`CallsAtReturn` slots vary with host load, and READ-on-pending-stop is a genuine race the
-  test resolves with a bounded retry).
+- `tests/nif_a3_oracle_replay.rs` — 3 tests, one per fixture: compile → `erlc` → `erl`, asserting the
+  measured oracle transcript (skip loudly without the toolchain, never a silent pass).
+- `tests/nif_a3_abi_assertions.rs` — 3 tests, one per gap path, asserting the **closed** contract
+  in-process through `beam_abi`'s public `enif_*` entry points (no `dlopen`, no `.so`, no oracle, no
+  toolchain): the continuation trampoline (`enif_schedule_nif` runs the continuation exactly once with
+  the caller's own uncopied `argv` and answers its value; a nested schedule answers `THE_NON_VALUE`
+  while the outermost call yields the chain's final value; one `nif_yield_point` per trampoline
+  iteration; a raise ends the chain; dirty flags show through `enif_thread_type`; `argc > 255` and a
+  bad flags bit are `badarg` and run nothing); `enif_alloc_env` off the call path (`NULL` / no host /
+  `enif_send` `0` with no factory; with one, a real env, an atom round trip, an
+  `enif_send(NULL, &pid, msg_env, msg)` with the C's `undefined` sender, and a free that lands back on
+  the allocating host); the `enif_select` STOP verdict matrix (`1` and `17` synchronous and direct;
+  `18` deferred, run exactly once by `run_pending_stops()` with `is_direct_call = 0` and a second drain
+  running nothing; `16`, `0` and a negative code running nothing), with the reference accounting
+  checked per case (the parked stop's keep is taken and the drain gives it back).
+- One documented difference the schedule assertions encode: for a raise the trampoline answers the
+  **pending reason term** — the very word `enif_raise_exception` returned — not the C's raw `0`, because
+  the emulator's trap re-run is folded into the outermost call (`beam_abi`'s `nif::enif::schedule`
+  module documents that substitution); a nested schedule still answers `0`.
+- A measured-transcript record inside the replay test's doc comments (stable fields only; the
+  deferred-stop latency/`CallsAtReturn` slots vary with host load, and READ-on-pending-stop is a genuine
+  race the test resolves with a bounded retry).
 
 ## §5 Differential-corpus cases owed (`tools/differential`, sibling node)
 - `nif_a3/schedule_normal_continuation_value`, `nif_a3/schedule_chain_of_100000` (constant stack),
@@ -235,8 +249,13 @@ Each is expressible through a single CLI process (no distribution needed): the `
 print one line per probe, so a case can compare that line verbatim. Note the gate's `--strict` mode and
 that the drivers need `cc` + `erl_nif.h`; skip loudly when absent, as the existing NIF cases do.
 
-## §6 Test placement once implemented
-Move the three in-process witnesses into `crates/beam_abi/tests/` (they belong to the ABI) and keep the
-fixtures + oracle replay here (they are this node's ground-truth artifacts). Add the `beam_rt`-level
+## §6 Test placement (decided)
+The three assertions stayed in `beam_bifs/tests/nif_a3_abi_assertions.rs` (plus its
+`tests/nif_a3_abi_assertions/{schedule,thread_env,select_stop}.rs` modules) rather than moving to
+`crates/beam_abi/tests/`: they exercise the frozen ABI only through its public `enif_*` entry points,
+they need no fixture and no toolchain, and keeping them beside the oracle replay keeps the ground truth
+and the contract in one node (and the file split keeps each file inside the workspace's ~1000-line
+rule). The fixtures + oracle replay stay here (this node's ground-truth artifacts). Add the
+`beam_rt`-level
 end-to-end cases to `crates/beam_rt/tests/` (the runtime's own NIF tests already own the load/call
 harness), and the corpus cases per §5.
