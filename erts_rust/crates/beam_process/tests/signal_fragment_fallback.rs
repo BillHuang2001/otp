@@ -93,13 +93,13 @@
 //!
 //! Determinism: no sleep, no wall-clock bound and no oracle. Every size is derived from the
 //! public heap-policy arithmetic — [`HeapPolicy::initial_young_words`] (the nursery), the
-//! four-word `{'EXIT', …}` head, [`HeapPolicy::need_reserve_words`] and [`next_heap_size`] (the
-//! growth the collection's resize computes) — so the refusal is exact and the relocation is
-//! forced by capacity, never by timing.
+//! four-word `{'EXIT', …}` head, [`HeapPolicy::need_reserve_words`] and
+//! [`HeapPolicy::young_after_collection`] (the live-set target a collection's resize installs) —
+//! so the refusal is exact and the relocation is forced by capacity, never by timing.
 
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{next_heap_size, HeapPolicy};
+use beam_gc::{heap_sizes, HeapPolicy};
 use beam_message::{send_fragmented, CopyContext, Message, OffHeapTable};
 use beam_process::prelude::*;
 use beam_term::compare;
@@ -118,12 +118,13 @@ const HEAD_WORDS: usize = 4;
 /// writes nothing (a request that does not fit is rejected before any word is handed out).
 const FREE_WORDS: usize = HEAD_WORDS - 1;
 
-/// The receiver's nursery in words. Deliberately smaller than the policy's 64-word reserve
-/// ([`HeapPolicy::need_reserve_words`]), which is what makes case 3's relocation observable: the
-/// collection empties the nursery, and the resize that follows replaces a nursery the round left
-/// mostly empty with the smallest curated size covering the reserve — so the capacity grows and
-/// the base pointer moves. (A nursery the reserve already fits is simply kept, which is why the
-/// default 233-word nursery could not have shown the growth.)
+/// The receiver's nursery in words. Deliberately **below the live-set target** a collection
+/// installs ([`HeapPolicy::young_after_collection`]: the round's young live set is only the
+/// [`FILLER_WORDS`]-word filler, so the target is the smallest curated size covering
+/// [`HeapPolicy::need_reserve_words`] — [`HeapPolicy::nursery_floor_words`], 90 words for this
+/// policy), which is what makes case 3's relocation observable: the resize replaces the nursery,
+/// so the capacity grows and the base pointer moves. (A nursery already inside the rule's keep band
+/// is merely rewound, which is why the default 233-word nursery could not have shown the growth.)
 const NURSERY_WORDS: usize = HEAD_WORDS + FREE_WORDS;
 
 /// The filler message's size in words: `1` header plus two immediate elements — exactly the
@@ -663,8 +664,9 @@ fn an_exempt_receiver_gets_an_oversized_link_exit_through_a_fragment() -> Result
 ///
 /// This is what pins that the fragment fallback did not replace the grow-and-retry path: the
 /// collection promotes the queued filler into the mature generation (a relocation), the resize
-/// replaces the emptied nursery with the smallest curated size covering the policy's reserve
-/// (a growth, so the base pointer moves), and the `{'EXIT', …}` is built on that fresh nursery.
+/// installs the young live set's target (`HeapPolicy::young_after_collection` over the
+/// [`FILLER_WORDS`]-word live set it evacuated, a growth from a [`NURSERY_WORDS`]-word nursery, so
+/// the base pointer moves), and the `{'EXIT', …}` is built on that fresh nursery.
 #[test]
 fn a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragment() -> Result<()> {
     let (mut table, names, atoms) = table_with_names();
@@ -693,12 +695,12 @@ fn a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragmen
         .collector()
         .young()
         .capacity_words();
-    let reserve = table
+    let policy = table
         .get(receiver)
         .expect("the receiver is live")
         .collector()
         .policy()
-        .need_reserve_words;
+        .clone();
 
     table.terminate(dying, reason)?;
     assert!(table.contains(receiver), "the trapping receiver survived");
@@ -717,14 +719,32 @@ fn a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragmen
         .collector()
         .young()
         .capacity_words();
+    // The resize is the **live-set** rule, not a reserve floor: a collection installs
+    // `young_after_collection(collected capacity, young live set)` over the chain it started from,
+    // and the young live set this round evacuated is exactly the filler the promotion moved
+    // ([`FILLER_WORDS`]) — so the installed capacity is `next_words(FILLER_WORDS +
+    // need_reserve_words, 0)`. A [`NURSERY_WORDS`]-word nursery sits below that target, so the
+    // rule grows it onto it.
+    let expected_capacity = policy.young_after_collection(capacity_before, FILLER_WORDS);
+    assert_eq!(
+        capacity_after, expected_capacity,
+        "the collection installed the young live set's target: {capacity_before} -> {capacity_after} \
+         words, expected {expected_capacity}"
+    );
     assert!(
         capacity_after > capacity_before,
         "the nursery was grown on demand: {capacity_before} -> {capacity_after} words"
     );
-    assert_eq!(
-        capacity_after,
-        next_heap_size(reserve, 0),
-        "the growth targets the smallest curated size covering the policy's reserve"
+    // The invariant a dependent re-attempting a refused allocation asserts against: the collection
+    // cannot leave the nursery below the policy's floor, so the retried four-word build has room.
+    assert!(
+        capacity_after >= policy.nursery_floor_words(),
+        "no collection leaves a nursery below the policy floor: {capacity_after} >= {} words",
+        policy.nursery_floor_words()
+    );
+    assert!(
+        heap_sizes().contains(&capacity_after),
+        "the installed capacity is a curated growth-table size: {capacity_after} words"
     );
     assert_ne!(
         base_after, base_before,

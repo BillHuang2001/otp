@@ -61,7 +61,7 @@
 
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{next_heap_size, HeapPolicy};
+use beam_gc::{heap_sizes, HeapPolicy};
 use beam_message::{Message, OffHeapTable};
 use beam_process::prelude::*;
 use beam_term::compare;
@@ -80,10 +80,13 @@ const HEAD_WORDS: usize = 4;
 /// nothing.
 const FREE_WORDS: usize = HEAD_WORDS - 1;
 
-/// The receiver's nursery in words. Deliberately smaller than the policy's 64-word reserve
-/// ([`HeapPolicy::need_reserve_words`]), which is what makes the *control* case's collection
-/// observable: the emptied nursery is replaced by the smallest curated size covering the reserve,
-/// so it grows and the base pointer moves.
+/// The receiver's nursery in words. Deliberately **below the live-set target** the collection will
+/// install — [`HeapPolicy::young_after_collection`] sizes a nursery from the young live set the
+/// round evacuated, and here that live set is only the [`FILLER_WORDS`]-word filler, so the target
+/// is the smallest curated size covering [`HeapPolicy::need_reserve_words`] (90 words for this
+/// policy, i.e. its [`HeapPolicy::nursery_floor_words`]). Being below it is what makes the
+/// *control* case's collection observable: the resize replaces the nursery, so the capacity grows
+/// and the base pointer moves.
 const NURSERY_WORDS: usize = HEAD_WORDS + FREE_WORDS;
 
 /// The filler message's size in words: `1` header plus two immediate elements — exactly the words
@@ -629,12 +632,12 @@ fn without_the_gate_the_same_signals_collect_and_grow() -> Result<()> {
         .collector()
         .young()
         .capacity_words();
-    let reserve = table
+    let policy = table
         .get(receiver)
         .expect("the receiver is live")
         .collector()
         .policy()
-        .need_reserve_words;
+        .clone();
 
     table.terminate(dying, reason)?;
     assert!(table.contains(receiver), "the trapping receiver survived");
@@ -653,14 +656,32 @@ fn without_the_gate_the_same_signals_collect_and_grow() -> Result<()> {
         .collector()
         .young()
         .capacity_words();
+    // The resize is the **live-set** rule, not a reserve floor: a collection installs
+    // `young_after_collection(collected capacity, young live set)` over the chain it started from,
+    // and the young live set this round evacuated is exactly the filler the promotion moved
+    // ([`FILLER_WORDS`]) — so the installed capacity is `next_words(FILLER_WORDS +
+    // need_reserve_words, 0)`. A [`NURSERY_WORDS`]-word nursery sits below that target, so the
+    // rule grows it onto it.
+    let expected_capacity = policy.young_after_collection(capacity_before, FILLER_WORDS);
+    assert_eq!(
+        capacity_after, expected_capacity,
+        "the collection installed the young live set's target: {capacity_before} -> {capacity_after} \
+         words, expected {expected_capacity}"
+    );
     assert!(
         capacity_after > capacity_before,
         "the nursery was grown on demand: {capacity_before} -> {capacity_after} words"
     );
-    assert_eq!(
-        capacity_after,
-        next_heap_size(reserve, 0),
-        "the growth targets the smallest curated size covering the policy's reserve"
+    // The invariant a dependent re-attempting a refused allocation asserts against: the collection
+    // cannot leave the nursery below the policy's floor, so the retried four-word build has room.
+    assert!(
+        capacity_after >= policy.nursery_floor_words(),
+        "no collection leaves a nursery below the policy floor: {capacity_after} >= {} words",
+        policy.nursery_floor_words()
+    );
+    assert!(
+        heap_sizes().contains(&capacity_after),
+        "the installed capacity is a curated growth-table size: {capacity_after} words"
     );
     assert_ne!(
         base_after, base_before,

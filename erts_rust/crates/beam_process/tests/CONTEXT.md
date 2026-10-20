@@ -405,8 +405,11 @@ SMP pool:
     with a **blocked** receiver woken by the delivery itself (`drain_woken()` = the receiver — the
     queued form's wake happens in `deliver_head_signal`, which this route bypasses); (5) the
     **non-exempt contrast** — the identical refusal takes the other arm: `minor_gcs()` up by exactly
-    one, the nursery grown to `next_heap_size(reserve, 0)` and relocated (`base()` moved), the filler
-    promoted to mature, the EXIT built on the **new** nursery (`fragments()` is `None`,
+    one, the nursery grown and relocated (`base()` moved) onto the target the landed live-set rule
+    derives for the `FILLER_WORDS`-word young live set the round evacuated
+    (`HeapPolicy::young_after_collection`, pinned exactly; never below `nursery_floor_words()` and
+    always a curated growth-table size), the filler promoted to mature, the EXIT built on the **new**
+    nursery (`fragments()` is `None`,
     `contains_term(payload)` young, not mature) — so the fallback did not replace the grow-and-retry
     path. (6) the **message-delivery** half of the gate: `Process::deliver` to a **`Running`** (not
     exempt) receiver surfaces the raw refusal and enqueues nothing, leaving
@@ -419,8 +422,9 @@ SMP pool:
     is refused at the **apply-time** build at `service_signals`, so the DOWN lands fragment-resident
     (structurally equal to the expected five-tuple) with the nursery untouched and the queue drained;
     (8) the **control** — the identical refusal on the identical receiver in `ProcessState::Waiting`
-    takes the collect-and-grow arm (one collection, the nursery grown and relocated, the filler
-    promoted to mature, the DOWN built on the receiver's **new** nursery with no fragment, and — unlike
+    takes the collect-and-grow arm (one collection, the nursery grown and relocated onto the
+    live-set target, the filler promoted to mature, the DOWN built on the receiver's **new** nursery
+    with no fragment, and — unlike
     the running case — the signal serviced **eagerly**, `drain_woken()` = the receiver) — pinning that
     the gate is the *running* state, not a blanket refusal.
     **Discriminating by construction: against the pre-fix commit `360a4c6536`, cases 1 and 2 FAIL
