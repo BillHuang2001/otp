@@ -95,6 +95,7 @@ This recipe drives the pass suites (`ssa_opt_budget_SUITE`, `beam_ssa_loop_opt_S
 - It builds the rig via `../scripts/host_env.sh build` unless `RIG_EBIN` is preset.
 - The report carries a `host adaptation:` header line and a per-suite `NOTE` wherever the flattening applied, so a host result is never mistaken for a real OTP-30 run (it exercises the pass *logic*, not native records).
 - The transform is strict and only the compiled files are handed to it: requesting `compile_SUITE` (arity-1 `is_record/1`) or `native_record_SUITE` (`#_{...}`, arity-1 `is_record/1`) aborts with the offending construct named — those constructs cannot exist on a host without native records.
+- Invocation is a plain `erl -noshell -pa $RIG_EBIN -pa $SCRATCH/ebin -run stage2_suite_driver main <report> SUITE…` started from the repository root (`run_stage2_suites.sh:228-235`) — no `ct_run`, no in-tree OTP build: only a released host OTP plus the rig ebin (built by `../scripts/host_env.sh build`, or preset via `RIG_EBIN`) and `python3` for the flattening. The host `erlc` compiles the suites with `+clint +clint0 +ssalint +nowarn_missing_spec_documented` and retries without the lint flags if the host rejects them (`:203-223`). No host OTP version is hardcoded; the driver only WARNS when `code:which(compile)` is not under `$STAGE2_RIG_EBIN` (`stage2_suite_driver.erl:170-193`), so check that header line in the report.
 - Last full run (host OTP 29.1.1, rig compiler 10.0.6): **87 pass, 0 fail** (`loop_opt` 22, `fus` 20, `fbip` 12, `budget` 20, `diff` 4, `equiv` 9).
 
 ## Known Issues
