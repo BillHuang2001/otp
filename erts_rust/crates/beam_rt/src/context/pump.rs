@@ -558,8 +558,17 @@ impl<'a> RuntimeContext<'a> {
             _ => None,
         };
         let Some((delay_ms, resume)) = finite else {
-            // No deadline: one pump, and a pump that changed nothing ends the drive with the
-            // typed gap (the mailbox cannot have changed).
+            // No deadline. A live port whose driver still holds one of its own asynchronous
+            // operations (a passive `gen_tcp:recv/2,3`, an `accept`, a datagram read) owes this
+            // receive a `{inet_async, …}` that only a port round can produce, and it produces it
+            // when the *socket* is ready — arbitrarily later than this round. Waiting it out here
+            // is what makes the three shapes answer on the nested route instead of folding into
+            // the typed gap; [`PORT_EVENT_DEADLINE`] bounds the wait.
+            if self.runtime.ports_awaiting_async() {
+                return self.wait_for_port_event(machine, module, func, pc);
+            }
+            // No port owes anything: one pump, and a pump that changed nothing ends the drive
+            // with the typed gap (the mailbox cannot have changed).
             let ran = self.runtime.pump_scheduler_boot(RUN_EXPORT_PUMP_SLICES)?;
             if ran == 0 {
                 return Ok(None);
@@ -601,6 +610,70 @@ impl<'a> RuntimeContext<'a> {
                     .saturating_duration_since(now)
                     .min(DEADLINE_PUMP_SLEEP),
             );
+        }
+    }
+
+    /// Sits out a nested `receive` that a **live port's own asynchronous operation** will answer
+    /// — the socket half of [`RuntimeContext::pump_once`].
+    ///
+    /// A passive `gen_tcp:recv/2,3`, a `gen_tcp:accept/1,2` and a `gen_udp:recv/2,3` are not
+    /// synchronous requests: `prim_inet`'s `recv0/3`/`accept0/3` issue a control op, get an
+    /// operation **id** back, and then `receive` the driver's `{inet_async, Port, Id, Result}`
+    /// (`beam_io`'s async-operation queue completes it from `ready_input`). Nothing is runnable
+    /// meanwhile — the answer arrives when the *socket* is ready — so the ordinary
+    /// "a pump that ran nothing cannot have changed the mailbox" rule
+    /// ([`Runtime::pump_scheduler_boot`](crate::runtime::Runtime::pump_scheduler_boot) answering
+    /// `0`) does not apply, and this is the loop that replaces it: keep driving the machine until
+    /// the port round delivers the completion, bounded by [`PORT_EVENT_DEADLINE`].
+    ///
+    /// # Why it does not spin
+    ///
+    /// Each round is [`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler) — the
+    /// pass's blocking policy — and a round that ran nothing **blocks in the port poller** for up
+    /// to [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE) precisely because a driver holds a
+    /// queued operation (the pass's own `port_timeout` gate, `src/runtime/scheduler.rs`). A round
+    /// that did run something made progress and is counted below. So one iteration either
+    /// delivers, executes or waits; it never busy-spins, and the deadline is re-checked between
+    /// rounds.
+    ///
+    /// # Re-execution safety (the engine's stated host obligation)
+    ///
+    /// Nothing is armed, latched or consumed here: the operation was queued **once** by the
+    /// machine's own execution of the control call, and a resume only re-scans the mailbox at
+    /// the reported `(func, pc)` — so a machine that re-parks at the same receive leaves the
+    /// driver's operation, and its id, exactly as they were. Re-entering this loop after such a
+    /// re-park therefore waits on the *same* operation rather than issuing a second one (a second
+    /// `TCP_REQ_RECV` would be the driver's `ealready`, and the id counter would have advanced).
+    ///
+    /// # The bound
+    ///
+    /// [`PORT_EVENT_DEADLINE`] bounds one round of **no** progress. Every delivered event or
+    /// executed slice restarts it, so a workload whose completions keep arriving is never cut
+    /// short; a port that never answers reports the typed
+    /// [`PORT_EVENT_DEADLINE_REASON`] diagnostic instead of hanging the single-threaded runtime
+    /// (the C suspends the process unboundedly). The outer
+    /// [`BLOCKING_PUMP_DEADLINE`] still caps a peer that stays runnable for ever.
+    fn wait_for_port_event(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        func: u32,
+        pc: u32,
+    ) -> Result<Option<RunOutcome>> {
+        let deadline = Instant::now() + crate::port::PORT_EVENT_DEADLINE;
+        loop {
+            // A round that delivered the completion, or one after which **no** live port holds
+            // an asynchronous operation any more, means the answer is in the mailbox: resume so
+            // the engine re-scans it. `ran` alone is not the signal — the pass's `ran` counts
+            // executed slices, and a delivery can happen in a round that ran none.
+            if self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)? > 0
+                || !self.runtime.ports_awaiting_async()
+            {
+                return Ok(Some(machine.resume_outcome(module, func, pc, self)?));
+            }
+            if Instant::now() >= deadline {
+                return Err(error::unsupported(crate::port::PORT_EVENT_DEADLINE_REASON));
+            }
         }
     }
 }

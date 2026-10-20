@@ -1615,6 +1615,28 @@ impl Evaluator<'_, '_> {
                         "receive (no after clause) inside a spawned process",
                     )));
                 }
+                // A live port whose driver still holds **its own** asynchronous operation — a
+                // passive `gen_tcp:recv/2,3`, an `accept`, a datagram read — owes this receive a
+                // `{inet_async, …}` that only a later port round can produce, and it produces it
+                // when the *socket* is ready, arbitrarily later than this round. That is the one
+                // bare-receive wait with a real answer behind it, so it is sat out here rather
+                // than reported as the typed gap; [`PORT_EVENT_DEADLINE`] bounds it.
+                if self.ctx.runtime.ports_awaiting_async() {
+                    let deadline = Instant::now() + crate::port::PORT_EVENT_DEADLINE;
+                    loop {
+                        if heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES)) > 0
+                            || !self.ctx.runtime.ports_awaiting_async()
+                        {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(Flow::Fatal(error::unsupported(
+                                crate::port::PORT_EVENT_DEADLINE_REASON,
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
                 if ran == 0 {
                     return Err(Flow::Fatal(error::unsupported(

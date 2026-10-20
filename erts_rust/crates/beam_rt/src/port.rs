@@ -232,6 +232,31 @@ const PORT_HEAP_WORDS: usize = 4_096;
 /// driver declares an earlier deadline (see [`beam_io::Driver::next_timeout`]), so a
 /// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
+
+/// How long a **nested** run waits for a live port to answer an asynchronous operation.
+///
+/// A passive `gen_tcp:recv/2,3`, a `gen_tcp:accept/1,2` and a `gen_udp:recv/2,3` all end in a
+/// plain `receive` of the socket driver's own `{inet_async, Port, Id, Result}`
+/// (`prim_inet.erl`'s `recv0/3`/`accept0/3`), which only a later port round can produce — so a
+/// caller that is *not* a scheduled process (the nested `-eval`/`-s`/`-run`/boot route) has to
+/// sit the wait out itself ([`crate::context::RuntimeContext::pump_once`]). The C has no bound
+/// there (a suspended process waits for the driver, however long that takes); a single-threaded
+/// runtime that owns its own pass cannot hang the whole executable, so the wait is bounded and
+/// an expired deadline is the typed capability gap [`PORT_EVENT_DEADLINE_REASON`].
+///
+/// This is the read's analogue of `port::busy_wait::BUSY_PORT_DEADLINE` — the same five
+/// seconds, the same "far longer than any real driver takes, far shorter than a user would
+/// tolerate" reasoning — and it bounds **one round of no progress**: every delivered event or
+/// executed slice restarts it, so a workload whose answers keep arriving is never cut short,
+/// while a port that never answers reports the diagnostic instead of looping (the outer
+/// `BLOCKING_PUMP_DEADLINE` still caps a peer that stays busy forever).
+pub(crate) const PORT_EVENT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The capability-gap reason for a nested wait whose [`PORT_EVENT_DEADLINE`] expired with the
+/// port still holding its operation.
+pub(crate) const PORT_EVENT_DEADLINE_REASON: &str =
+    "port event: no live port delivered the {inet_async, …} completion the caller waits for \
+     within the 5 s bound (the C waits for ever)";
 /// How long one poll round may block while the async-job pool has work in flight.
 ///
 /// The pool's completions arrive on **worker** threads, which the poller knows nothing about, so a
