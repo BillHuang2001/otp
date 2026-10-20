@@ -400,20 +400,46 @@ const FIRST_FILL_ITERATION: u64 = 8;
 /// growth policy changes: print the table (every test that drives [`COUNTS`] prints it) and take
 /// the largest surplus over a long ladder.
 const SURPLUS_BOUND: u64 = 1;
-/// The smallest number of minor collections one fullsweep was measured to cost in the
-/// `vp:hold/1` shape (`collections / major`, floored): the mature generation absorbs roughly
-/// `32`–`37` promotions of the 4-word accumulator before it can no longer take one.
+/// The smallest number of minor collections one fullsweep must be able to cost in the
+/// `vp:hold/1` shape — the **pessimistic** end of the mature generation's own admission rule.
 ///
-/// This is a **measured band**, not a derived figure: the promotion cadence depends on the
-/// collector's grow-or-sweep decision, and the ratio moves inside the band with `N` (measured
-/// `35.0` at `N = 5 000`, `36.6` from `N = 20 000` on, and `32.7`–`36.4` across a 201-row
-/// consecutive sweep at `N = 5 000 … 5 200`). What the tests pin with it: the fullsweep count is
-/// `collections / 36.6` in the large, never the `collections / 513` the integer-accumulator
-/// control reads — i.e. the held BIF result really is a live, promoted heap object.
-const MINORS_PER_MAJOR: u64 = 32;
-/// The largest number of minor collections one fullsweep was measured to cost in the
-/// `vp:hold/1` shape — see [`MINORS_PER_MAJOR`].
-const MAX_MINORS_PER_MAJOR: u64 = 37;
+/// # The derivation (from `beam_gc`'s policy, not from a fit)
+///
+/// A minor is admitted only while the mature space can take a whole nursery's worth of
+/// promotion — `collector::collect` chooses a fullsweep when
+/// `mature.available_words() < nursery.used_words()` — so the promotable budget of an installed
+/// mature region is `mature_capacity − nursery_words`.
+///
+/// * `nursery_words` = **221** (`vp:hold`'s measured fill occupancy; the space itself is the
+///   233-word [`EMULATOR_MIN_HEAP_WORDS`] floor).
+/// * `mature_capacity` = `HeapPolicy::mature_target_words(live, young_occupancy)` =
+///   `next_words(MATURE_TARGET_LIVE_MULTIPLE × (live + young_occ + need_reserve_words))` with
+///   `MATURE_TARGET_LIVE_MULTIPLE = 2`, `need_reserve_words = 64`, and the fullsweep's own
+///   measurement in this shape `live = 4`, `young_occ = 221` ⇒ `next_words(2 × 289 = 578)`
+///   = **610** words (the growth table's step above 376).
+/// * `budget` = `610 − 221` = **389** words.
+///
+/// Divided by the promotion a minor makes, the budget gives the two ends of the band:
+/// **`389 / 17` = 22** (every minor copying the abandoned `junk/1` as well as the held tuple —
+/// [`WORDS_PER_ITERATION`]) and **`389 / 4` = 97** ([`STATS_TUPLE_WORDS`] alone, the steady-state
+/// promotion: the tuple is 4 words and `junk/1` is already dead at the admission point).
+///
+/// # Measured
+///
+/// The steady intervals between fullsweeps are **exactly 90** minors each (a per-collection trace
+/// of `N = 5 000`: intervals of 4, 90, 90, 90, 90 — the first is short because the victim's first
+/// mature region is the 233-word floor, whose budget is `233 − 221` = 12 words), i.e. inside the
+/// derived band and 2.4× the pre-live-set-rule ratio (36.6), which is what
+/// `MATURE_TARGET_LIVE_MULTIPLE = 2` buys. Whole-run `collections / major` is 77 at `N = 5 000`
+/// (the short start-up interval is amortised) and 90.5 from `N = 20 000` on. What the tests pin
+/// with it: the fullsweep count is tens of minors, never the `collections / 513` the
+/// integer-accumulator control reads — i.e. the held BIF result really is a live, promoted heap
+/// object.
+const MINORS_PER_MAJOR: u64 = 22;
+/// The largest number of minor collections one fullsweep may cost in the `vp:hold/1` shape — the
+/// **optimistic** end of the same budget (`389 / 4 = 97`; see [`MINORS_PER_MAJOR`] for the full
+/// derivation and the measured 90).
+const MAX_MINORS_PER_MAJOR: u64 = 97;
 /// The collection count one measured run of either shape must report at `N`, before the
 /// pre-emption surcharge — the **fill law**, `(N + FILL_OFFSET) / ITERATIONS_PER_COLLECTION` (see
 /// [`FILL_OFFSET`] and [`ITERATIONS_PER_COLLECTION`]), the exact number of nursery fills, and
@@ -442,24 +468,26 @@ const MAX_MINORS_PER_MAJOR: u64 = 37;
 ///
 /// | N | slices | collections | law | surplus | major |
 /// |---|---|---|---|---|---|
-/// | 5 000 | 9 | 385 | 384 | 1 | 11 |
-/// | 7 000 | 13 | 538 | 538 | 0 | 15 |
-/// | 10 000 | 18 | 769 | 769 | 0 | 21 |
-/// | 20 000 | 35 | 1 538 | 1 538 | 0 | 42 |
-/// | 30 000 | 53 | 2 308 | 2 308 | 0 | 63 |
-/// | 50 000 | 88 | 3 846 | 3 846 | 0 | 105 |
-/// | 100 000 | 175 | 7 692 | 7 692 | 0 | 210 |
-/// | 150 000 | 263 | 11 538 | 11 538 | 0 | 315 |
-/// | 200 000 | 350 | 15 385 | 15 384 | 1 | 420 |
+/// | 5 000 | 9 | 385 | 384 | 1 | 5 |
+/// | 7 000 | 13 | 538 | 538 | 0 | 6 |
+/// | 10 000 | 18 | 769 | 769 | 0 | 9 |
+/// | 20 000 | 35 | 1 538 | 1 538 | 0 | 17 |
+/// | 30 000 | 53 | 2 308 | 2 308 | 0 | 26 |
+/// | 50 000 | 88 | 3 846 | 3 846 | 0 | 43 |
+/// | 100 000 | 175 | 7 692 | 7 692 | 0 | 85 |
+/// | 150 000 | 263 | 11 538 | 11 538 | 0 | 127 |
+/// | 200 000 | 350 | 15 385 | 15 384 | 1 | 170 |
 ///
 /// `vp:control/1` reports the **same** collections at every row (385 / 538 / 769 / 1 538 / 2 308 /
-/// 3 846 / 7 692 / 11 538 / 15 385) with `major` = 1 / 1 / 2 / 3 / 5 / 8 / 15 / 22 / 30 — the only
+/// 3 846 / 7 692 / 11 538 / 15 385) with `major` = 1 / 1 / 1 / 2 / 2 / 3 / 6 / 9 / 12 — the only
 /// counter that differs between the two shapes.
 ///
 /// Three more figures from the same measurement, so the bound can be read at its extremes: `N =
-/// 300 000` (525 slices) reports `23 077` collections against a law of `23 077` and `630`
-/// fullsweeps, `N = 500 000` reports `38 461` against `38 461`, and `N = 1 000 000` (1 749 slices)
-/// reports `76 923` against `76 923` with `2 098` fullsweeps.
+/// 300 000` (525 slices) reports `23 077` collections against a law of `23 077` and `254`
+/// fullsweeps, `N = 500 000` (875 slices) reports `38 461` against `38 461` with `423`, and
+/// `N = 1 000 000` (1 749 slices) reports `76 923` against `76 923` with `846` fullsweeps — the
+/// same ~90 minors per fullsweep as the ladder, which is what [`MAX_MINORS_PER_MAJOR`]'s
+/// derivation (`389 / 4 = 97`) bounds.
 fn collections_law(n: i64) -> u64 {
     (n as u64 + FILL_OFFSET) / ITERATIONS_PER_COLLECTION
 }
@@ -637,8 +665,9 @@ fn the_fill_law_holds_and_its_phase_is_the_entry_frame() {
 /// changed the collector's behaviour.
 ///
 /// `major` is the one counter that **must** differ: `hold`'s 4-word accumulator survives every
-/// minor collection and is promoted, so its mature generation fills after ~37 minors, while
-/// `control` retains an immediate and sweeps after ~513. That is the positive evidence that the
+/// minor collection and is promoted, so its mature generation fills after ~90 minors (the
+/// measured steady interval; see [`MINORS_PER_MAJOR`]), while `control` retains an immediate and
+/// sweeps after ~1 280 (`15 385 / 12` at `N = 200 000`). That is the positive evidence that the
 /// statistics tuple is a live heap object — and the band the assertions below pin is
 /// [`MINORS_PER_MAJOR`] … [`MAX_MINORS_PER_MAJOR`].
 #[test]
