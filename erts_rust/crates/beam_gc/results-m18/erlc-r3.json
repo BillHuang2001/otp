@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792504423832,
+  "profile": "full",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "erlc_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "erlc throughput over bounded OTP stdlib + Elixir compiler corpus slices",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 9845.791953
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 60.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 6.0939739826330666
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 4723.134535239758
+        }
+      ],
+      "peak_memory_bytes": 134725632,
+      "notes": [
+        "corpus: 60 files (46503 LOC) attempted from stdlib+elixir; 60 produced .beam (46503 LOC)"
+      ]
+    }
+  ]
+}

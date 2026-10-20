@@ -1,0 +1,74 @@
+load-pre r1-rust: 9.09 3.81 5.10 33/1033 5
+load-post r1-rust: 25.57 10.37 7.26 9/1034 1135
+load-pre r1-sys: 25.57 10.37 7.26 40/1133 5
+load-post r1-sys: 40.14 17.62 9.99 12/1207 8617
+load-pre r2-sys: 36.65 17.62 10.07 25/1162 7
+load-post r2-sys: 28.72 18.38 10.75 28/1012 8619
+load-pre r2-rust: 28.72 18.38 10.75 24/1013 8622
+load-post r2-rust: 21.32 19.13 11.83 15/1004 9752
+load-pre r3-rust: 21.22 19.15 11.87 8/1033 5
+load-post r3-rust: 29.51 21.65 13.51 81/1328 1135
+load-pre r3-sys: 29.51 21.65 13.51 82/1329 1138
+load-post r3-sys: 92.28 42.67 21.52 131/1469 9750
+load-pre ext-full: 11.92 19.24 29.81 2/914 5
+load-post ext-full: 19.42 19.45 28.50 17/996 10882
+load-pre erlc r1: 18.75 19.30 28.35 18/992 5
+load-post erlc r1: 18.49 19.22 28.23 16/1006 202
+load-pre erlc r2: 18.49 19.22 28.23 16/1006 205
+load-post erlc r2: 18.10 19.12 28.10 19/999 402
+load-pre erlc r3: 18.10 19.12 28.10 22/999 405
+load-post erlc r3: 17.85 19.03 27.97 15/985 602
+load-pre r4-rust(post): 17.53 18.90 27.79 21/1022 5
+load-post r4-rust(post): 33.29 22.43 28.36 2/984 1135
+load-pre r4-sys: 33.29 22.43 28.36 1/984 1138
+load-post r4-sys: 28.08 23.01 28.23 14/1046 9750
+load-pre r5-sys: 25.91 22.65 28.08 29/1074 5
+load-post r5-sys: 28.35 24.51 28.47 2/923 8617
+load-pre r5-rust(post): 28.35 24.51 28.47 1/923 8620
+load-post r5-rust(post): 13.62 20.86 26.96 18/1052 9750
+load-pre ab-pre-r1: 15.21 20.65 26.73 1/913 5
+load-post ab-pre-r1: 11.01 19.22 26.09 2/850 265
+load-pre ab-post-r1: 11.01 19.22 26.09 2/850 268
+load-post ab-post-r1: 9.90 18.57 25.77 3/956 528
+load-pre ab-post-r2: 9.90 18.57 25.77 18/956 531
+load-post ab-post-r2: 8.30 17.64 25.31 3/846 791
+load-pre ab-pre-r2: 8.30 17.64 25.31 3/847 794
+load-post ab-pre-r2: 6.51 16.63 24.81 1/834 1054
+load-pre ab-pre-r3: 6.51 16.63 24.81 1/834 1057
+load-post ab-pre-r3: 5.39 15.54 24.23 17/968 1317
+load-pre ab-post-r3: 5.39 15.54 24.23 17/969 1320
+load-post ab-post-r3: 12.51 16.47 24.35 1/885 1580
+load-pre r6-rust: 9.97 15.71 23.97 4/893 5
+load-post r6-rust: 18.82 17.30 23.97 16/1053 1135
+load-pre r6-sys: 18.82 17.30 23.97 18/1053 1138
+load-post r6-sys: 21.26 19.11 24.26 1/896 9750
+load-pre r7-sys: 21.26 19.11 24.26 1/896 9753
+load-post r7-sys: 20.99 19.26 24.03 19/1154 18365
+load-pre r7-rust: 20.99 19.26 24.03 39/1154 18368
+load-post r7-rust: 11.04 16.58 22.80 43/1337 19498
+load-pre ab2-pre-r1: 3.93 5.23 3.84 1/856 243
+load-post ab2-pre-r1: 2.93 4.89 3.76 1/862 503
+load-pre ab2-post-r1: 2.93 4.89 3.76 1/862 506
+load-post ab2-post-r1: 2.38 4.64 3.70 2/852 766
+load-pre ab2-post-r2: 2.38 4.64 3.70 1/852 769
+load-post ab2-post-r2: 2.07 4.46 3.66 2/853 1029
+load-pre ab2-pre-r2: 2.07 4.46 3.66 1/853 1032
+load-post ab2-pre-r2: 1.71 4.18 3.59 2/860 1292
+load-pre ab2-pre-r3: 1.71 4.18 3.59 1/860 1295
+load-post ab2-pre-r3: 1.46 3.93 3.52 2/859 1555
+load-pre ab2-post-r3: 1.46 3.93 3.52 1/859 1558
+load-post ab2-post-r3: 1.33 3.73 3.46 1/851 1818
+load-pre ext-full-quiet: 1.33 3.73 3.46 1/851 5
+load-post ext-full-quiet: 3.84 3.87 3.54 2/850 10882
+load-pre r8: 3.53 3.80 3.52 1/845 5
+load-post r8: 1.96 3.31 3.36 1/833 1135
+load-pre r8: 1.96 3.31 3.36 1/833 1138
+load-post r8: 2.21 3.18 3.32 1/836 9750
+load-pre r9: 2.21 3.18 3.32 1/836 9753
+load-post r9: 2.63 3.20 3.32 1/828 18365
+load-pre r9: 2.63 3.20 3.32 1/828 18368
+load-post r9: 1.70 2.84 3.19 1/828 19498
+load-pre r10: 1.70 2.84 3.19 1/828 19501
+load-post r10: 1.29 2.52 3.06 1/811 20631
+load-pre r10: 1.29 2.52 3.06 1/811 20634
+load-post r10: 2.27 2.62 3.06 1/808 29246

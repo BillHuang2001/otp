@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1792526033863,
+  "profile": "full",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "erlc_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "erlc throughput over bounded OTP stdlib + Elixir compiler corpus slices",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 6208.797224
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 60.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 9.663707451754266
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 7489.856460482144
+        }
+      ],
+      "peak_memory_bytes": 133890048,
+      "notes": [
+        "corpus: 60 files (46503 LOC) attempted from stdlib+elixir; 60 produced .beam (46503 LOC)"
+      ]
+    },
+    {
+      "workload": "elixir_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "installed system Elixir compiler (elixirc) throughput over the checkout's stdlib corpus",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 47650.044066
+        },
+        {
+          "name": "files_attempted",
+          "unit": "files",
+          "value": 105.0
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 223.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 4.679953699331801
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 2349.7145111748237
+        },
+        {
+          "name": "compiler_startup_ms",
+          "unit": "ms",
+          "value": 310.96086299999996
+        }
+      ],
+      "peak_memory_bytes": 212754432,
+      "notes": [
+        "batch compile failed; per-file fallback (version skew)",
+        "compiler: Elixir 1.20.4 (compiled with Erlang/OTP 29)",
+        "corpus = the checkout's unbuilt, read-only .ex sources staged into $TMPDIR; compiler = the installed system elixirc, so a version skew with the checkout is expected",
+        "97/105 compiled; 223 .beam produced",
+        "223 .beam file(s) produced from 105 source file(s) (an Elixir source may define several modules)"
+      ]
+    },
+    {
+      "workload": "cowboy",
+      "runtime": "sys",
+      "category": "io",
+      "description": "Cowboy hello_world HTTP server driven by the in-process HTTP/1.1 load generator",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "build_ms",
+          "unit": "ms",
+          "value": 44317.086338
+        },
+        {
+          "name": "requests",
+          "unit": "count",
+          "value": 916405.0
+        },
+        {
+          "name": "errors",
+          "unit": "count",
+          "value": 0.0
+        },
+        {
+          "name": "requests_per_sec",
+          "unit": "req/s",
+          "value": 183201.03432404646
+        },
+        {
+          "name": "latency_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 20000,
+            "min": 0.030088,
+            "max": 2.949946,
+            "mean": 0.09152146105000004,
+            "p50": 0.083401,
+            "p90": 0.11691960000000007,
+            "p99": 0.24051481999999988
+          }
+        }
+      ],
+      "peak_memory_bytes": 154017792,
+      "notes": []
+    }
+  ]
+}
