@@ -30,14 +30,16 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 
 use beam_alloc::Heap as TestHeap;
-use beam_codec::term::make_external_pid;
+use beam_codec::term::{external_pid_parts, external_ref_parts, make_external_pid, make_external_ref};
 use beam_common::BeamError;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::flags::DFLAG_PUBLISHED;
 use beam_dist::{
-    preferred_flags, publish_flag, Delivery, DistFlags, StepOutcome, UnsupportedSink,
+    preferred_flags, publish_flag, Delivery, DistFlags, Dop, StepOutcome, UnsupportedSink,
 };
-use beam_process::{DistSignal, MonitorKind, ProcessId, RefAllocator, RemotePid};
+use beam_process::{
+    DistSignal, MonitorKind, ProcessId, RefAllocator, RemotePid, RemoteRef, RemoteWatcherRef,
+};
 use beam_term::prelude::{make_atom as atom_term, make_small, AtomTable as Table};
 use beam_term::AtomTable;
 
@@ -45,7 +47,7 @@ use crate::dist::DIST_READ_SLICE;
 
 use super::handshake::is_would_block;
 use super::lookup::{lookup_dist_port, lookup_dist_port_at};
-use super::signals::unlink_id_term;
+use super::signals::{signal_node, unlink_id_term};
 
 /// A toolchain-free loopback pair: the client dials a local listener that speaks
 /// the **server** side of the handshake. Returns the client and the peer's driver
@@ -524,5 +526,271 @@ fn an_unregistered_peer_is_a_typed_error_not_a_fabricated_port() {
             ),
         },
         Err(other) => panic!("expected a typed Io error, got {other:?}"),
+    }
+}
+
+/// An external reference for `peer@localhost`, **decomposed** the way the watcher table
+/// records one a peer minted in its `DOP_MONITOR_P` (`RemoteWatcherRef::Remote`).
+fn remote_ref(atoms: &mut AtomTable, creation: u32, ids: &[u32]) -> RemoteRef {
+    let mut heap = TestHeap::new(32).expect("heap");
+    let node = atom_term(atoms.intern("peer@localhost"));
+    let term = make_external_ref(&mut heap, node, ids, creation).expect("external reference");
+    RemoteRef::from_eterm(term).expect("a remote reference")
+}
+
+/// **Contract A.5 — `DOP_MONITOR_P_EXIT`'s argument order and reference spelling.** The wire
+/// tuple is `{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}` — *watched
+/// first*, the reverse of `DOP_MONITOR_P`'s `{watcher, watched, ref}`
+/// (`erts_dsig_send_m_exit`, `erts/emulator/beam/dist.c:1516`) — and a reference the **peer**
+/// minted goes back **verbatim**: its own node, its own creation, its own id words. The
+/// watched pid therefore carries *this* node, the watcher the peer's, and the reason has been
+/// copied onto the scratch heap (its source heap is dropped before any assertion).
+#[test]
+fn a_monitor_exit_names_the_watched_first_and_returns_the_peer_reference_verbatim() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 6);
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+
+    let our_node = atom_term(atoms.intern("client@localhost"));
+    let peer_node = atom_term(atoms.intern("peer@localhost"));
+    let watcher = remote_pid(&mut atoms, 7, 9);
+    let watched = ProcessId::new(3, 1);
+    let peer_ids = [0u32, 0xaaaa_bbbb, 0xcccc_dddd];
+    let peer_ref = remote_ref(&mut atoms, 9, &peer_ids);
+    // The reason lives on a heap that is dropped the moment the encode returns: the scratch
+    // heap must hold the copy (`copy_struct_simple`), exactly as for `DOP_EXIT`.
+    let mut reason_heap = TestHeap::new(64).expect("heap");
+    let reason = {
+        let boom = atom_term(atoms.intern("boom"));
+        reason_heap
+            .tuple(&[boom, make_small(17)])
+            .expect("build the reason")
+    };
+    let (dop, args) = {
+        let mut inner = client.inner.borrow_mut();
+        inner
+            .encode_signal(DistSignal::MonitorExit {
+                watched,
+                watcher,
+                reference: RemoteWatcherRef::Remote(peer_ref),
+                reason,
+            })
+            .expect("encode DOP_MONITOR_P_EXIT")
+    };
+    drop(reason_heap);
+
+    assert_eq!(dop, Dop::MonitorPExit, "the plain 5-tuple form is emitted");
+    assert_eq!(
+        args.len(),
+        4,
+        "watched, watcher, reference, reason — and nothing else"
+    );
+
+    // Element 0: the **watched** process, i.e. this node's own pid as an external pid.
+    let (node, number, _serial, creation) =
+        external_pid_parts(args[0]).expect("the watched element is an external pid");
+    assert_eq!(node, our_node, "the watched pid carries this node");
+    assert_eq!(creation, 6, "…and this node's creation");
+    assert_eq!(
+        u64::from(number),
+        watched.number(),
+        "…and the watched process's own number"
+    );
+
+    // Element 1: the watcher, verbatim as the table recorded it.
+    let (node, number, _serial, creation) =
+        external_pid_parts(args[1]).expect("the watcher element is an external pid");
+    assert_eq!(node, peer_node, "the watcher pid carries the peer's node");
+    assert_eq!(creation, 9, "…and the peer's creation");
+    assert_eq!(number, watcher.number(), "…and the watcher's own number");
+
+    // Element 2: the peer-minted reference, byte-for-byte its own `{node, creation, ids}` —
+    // never this node, never this node's creation.
+    let (node, ids, creation) =
+        external_ref_parts(args[2]).expect("the reference element is an external reference");
+    assert_eq!(node, peer_node, "the reference keeps the peer's node");
+    assert_eq!(creation, 9, "the reference keeps the peer's creation");
+    assert_eq!(ids, peer_ids, "and the peer's own id words");
+
+    // Element 3: the reason, on the stable scratch heap.
+    let mut expected_heap = TestHeap::new(64).expect("heap");
+    let boom = atom_term(atoms.intern("boom"));
+    let expected = expected_heap
+        .tuple(&[boom, make_small(17)])
+        .expect("expected reason");
+    assert!(
+        beam_term::compare::eq(args[3], expected, &atoms),
+        "the copied reason is not {{boom,17}}"
+    );
+}
+
+/// The other reference spelling: a reference **this** node minted goes out through the
+/// monitor family's own `{node, creation, ids}` builder ([`monitor_ref_term`]), so the peer's
+/// `{'DOWN', …}` matches the monitor it installed with that reference.
+#[test]
+fn a_locally_minted_monitor_exit_reference_uses_the_monitor_spelling() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 8);
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+
+    let our_node = atom_term(atoms.intern("client@localhost"));
+    let watcher = remote_pid(&mut atoms, 4, 8);
+    let reference = RefAllocator::new().next();
+    let reason = atom_term(atoms.intern("killed"));
+    let (dop, args) = {
+        let mut inner = client.inner.borrow_mut();
+        inner
+            .encode_signal(DistSignal::MonitorExit {
+                watched: ProcessId::new(5, 0),
+                watcher,
+                reference: RemoteWatcherRef::Local(reference),
+                reason,
+            })
+            .expect("encode DOP_MONITOR_P_EXIT")
+    };
+
+    assert_eq!(dop, Dop::MonitorPExit);
+    assert_eq!(args.len(), 4);
+    let (node, ids, creation) =
+        external_ref_parts(args[2]).expect("the reference element is an external reference");
+    assert_eq!(node, our_node, "a locally minted reference is this node's");
+    assert_eq!(creation, 8, "…with this node's creation");
+    let id = reference.id();
+    assert_eq!(
+        ids,
+        [0u32, (id >> 32) as u32, id as u32],
+        "the reference id in the monitor family's 3-id big-endian split"
+    );
+}
+
+/// [`signal_node`] for **every** [`DistSignal`] variant — the routing key each variant's wire
+/// tuple addresses. `MonitorExit` is the one that is *not* named by its `to`/`target` element:
+/// its tuple leads with the locally **watched** pid, so the control is written to the
+/// **watcher's** node.
+#[test]
+fn every_routed_signal_addresses_the_peer_that_must_receive_it() {
+    let mut atoms = Table::new();
+    let peer_node = atom_term(atoms.intern("peer@localhost"));
+    let peer = remote_pid(&mut atoms, 1, 2);
+    let reference = RefAllocator::new().next();
+    let from = ProcessId::new(3, 0);
+    let reason = make_small(0);
+    let v = [
+        ("link", DistSignal::Link { from, to: peer }),
+        ("unlink", DistSignal::Unlink { from, to: peer }),
+        ("exit", DistSignal::Exit { from, to: peer, reason }),
+        ("exit2", DistSignal::Exit2 { from, to: peer, reason }),
+        (
+            "monitor",
+            DistSignal::Monitor {
+                watcher: from,
+                target: peer,
+                reference,
+                kind: MonitorKind::Process,
+            },
+        ),
+        (
+            "demonitor",
+            DistSignal::Demonitor {
+                watcher: from,
+                target: peer,
+                reference,
+            },
+        ),
+        (
+            "monitor-exit",
+            DistSignal::MonitorExit {
+                watched: from,
+                watcher: peer,
+                reference: RemoteWatcherRef::Local(reference),
+                reason,
+            },
+        ),
+    ];
+    for (label, signal) in v {
+        assert_eq!(
+            signal_node(&signal),
+            peer_node,
+            "{label} must address the peer's node"
+        );
+    }
+}
+
+/// A routed `MonitorExit` is queued work until the flush, then it is on the wire — and the
+/// peer decodes it as the C's `DOP_MONITOR_P_EXIT` tuple, **watched first**. This is the
+/// quiescence account's evidence: the queue is non-empty (so
+/// [`DistClient::has_pending_outbound`] is `true`, so a pass may not declare a stall) between
+/// `route` and `pump`, and empty (with the link's driver output drained) after it.
+#[test]
+fn a_queued_monitor_exit_is_pending_until_the_flush_and_decodes_watched_first() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 11);
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+    assert!(
+        !client.has_pending_outbound(),
+        "an established, pumped link with nothing queued owes the wire nothing"
+    );
+
+    let our_node = atom_term(atoms.intern("client@localhost"));
+    let peer_node = atom_term(atoms.intern("peer@localhost"));
+    let watcher = remote_pid(&mut atoms, 6, 11);
+    let watched = ProcessId::new(2, 0);
+    let peer_ref = remote_ref(&mut atoms, 11, &[0, 1, 2]);
+    let reason = atom_term(atoms.intern("noproc"));
+    {
+        let mut router = client.router();
+        router
+            .route(DistSignal::MonitorExit {
+                watched,
+                watcher,
+                reference: RemoteWatcherRef::Remote(peer_ref),
+                reason,
+            })
+            .expect("queue the monitor exit");
+    }
+    assert!(
+        client.has_pending_outbound(),
+        "a queued signal is work the following flush still owes"
+    );
+
+    client
+        .pump(&mut atoms)
+        .expect("flush the queued monitor exit");
+    assert!(
+        !client.has_pending_outbound(),
+        "the flush emptied the queue and wrote the link's output"
+    );
+
+    let mut buf = [0u8; 8192];
+    let n = stream.read(&mut buf).expect("peer read");
+    driver.feed(&buf[..n]);
+    driver.step().expect("peer step");
+    let mut heap = TestHeap::new(1 << 12).expect("heap");
+    let mut sink = UnsupportedSink;
+    let dispatched = driver
+        .dispatch_inbound(&mut heap, &mut atoms, &mut sink)
+        .expect("classify");
+    match dispatched.first().map(|r| r.delivery.clone()) {
+        Some(Delivery::MonitorExit {
+            watched: w,
+            watcher: wt,
+            reference,
+            ..
+        }) => {
+            let (node, number, _serial, _creation) =
+                external_pid_parts(w).expect("the decoded watched element is an external pid");
+            assert_eq!(node, our_node, "the first element is this node's own pid");
+            assert_eq!(
+                u64::from(number),
+                watched.number(),
+                "…the process that died"
+            );
+            let (node, number, _serial, _creation) =
+                external_pid_parts(wt).expect("the decoded watcher element is an external pid");
+            assert_eq!(node, peer_node, "the second element is the peer's pid");
+            assert_eq!(number, watcher.number(), "…the watcher");
+            let (node, ids, creation) =
+                external_ref_parts(reference).expect("the decoded reference is external");
+            assert_eq!((node, creation), (peer_node, 11), "the peer's own reference identity");
+            assert_eq!(ids, [0u32, 1, 2], "…with its own id words");
+        }
+        other => panic!("expected a DOP_MONITOR_P_EXIT, got {other:?}"),
     }
 }

@@ -31,6 +31,12 @@ use beam_process::{DistSignal, MonitorRef};
 use beam_term::prelude::{try_make_small, Eterm};
 
 /// The node a routed signal addresses.
+///
+/// Every variant but [`DistSignal::MonitorExit`] names its peer in the `to`/`target` element,
+/// which **is** the node the control must be written to. `MonitorExit` is the exception: its
+/// wire tuple is *watched*-first (`TUPLE5(DOP_MONITOR_P_EXIT, watched, watcher, ref, reason)`,
+/// `dist.c:1516`) and the watched pid is this node's **own** process, so the element naming the
+/// destination is the **watcher's** node — routing by the watched pid would address this node.
 pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
     match signal {
         DistSignal::Link { to, .. }
@@ -38,10 +44,16 @@ pub(super) fn signal_node(signal: &DistSignal) -> Eterm {
         | DistSignal::Exit { to, .. }
         | DistSignal::Exit2 { to, .. } => to.node(),
         DistSignal::Monitor { target, .. } | DistSignal::Demonitor { target, .. } => target.node(),
+        // The reverse of the monitor family's order: the peer that must receive the
+        // `{'DOWN', …}` is the **watcher** (`beam_process::DistSignal::MonitorExit`).
+        DistSignal::MonitorExit { watcher, .. } => watcher.node(),
     }
 }
 
-/// The `{DOP_DEMONITOR_P, …, Ref}`/`{DOP_MONITOR_P, …, Ref}` reference element.
+/// The `{DOP_DEMONITOR_P, …, Ref}`/`{DOP_MONITOR_P, …, Ref}` reference element, and the
+/// **locally minted** reference of a `{DOP_MONITOR_P_EXIT, …, Ref, …}`
+/// ([`beam_process::RemoteWatcherRef::Local`] — a peer-minted one is written back verbatim
+/// instead, see `client.rs`'s `encode_signal`).
 ///
 /// The reference **must** go on the wire as an **external** reference
 /// (`NEWER_REFERENCE_EXT`, `{node, creation, ids}`), never as the in-heap internal ref

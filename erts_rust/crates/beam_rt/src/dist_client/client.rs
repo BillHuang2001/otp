@@ -33,11 +33,11 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
 
 use beam_alloc::Heap;
-use beam_codec::term::make_external_pid;
+use beam_codec::term::{make_external_pid, make_external_ref};
 use beam_common::{BeamError, Result};
 use beam_dist::driver::ConnectionDriver;
 use beam_dist::{Dop, InboundSink};
-use beam_process::{DistSignal, DistSignalRouter, ProcessId, RemotePid};
+use beam_process::{DistSignal, DistSignalRouter, ProcessId, RemotePid, RemoteWatcherRef};
 use beam_term::prelude::{make_atom, make_small, Eterm};
 use beam_term::AtomTable;
 
@@ -474,6 +474,32 @@ impl DistClient {
         !self.has_links()
     }
 
+    /// Whether this client still owes the wire **work it has already accepted** — a routed
+    /// signal sitting in the outbound queue, or bytes a link's driver has not yet written.
+    ///
+    /// The scheduler pass's *narrow* companion of [`DistClient::has_links`]: a link is pending
+    /// work in principle (an inbound `DOP_*` can wake a parked process), while this asks
+    /// whether something concrete is **mid-flight** and must be pumped at least once more.
+    ///
+    /// A queued signal is work even though [`DistClientInner::queue_signal`] gated it on
+    /// [`DistLinks::may_reach_node`]: the link can be **retired** between queueing and the
+    /// flush (the peer dies, the socket errors), and such an item is then dropped at the flush
+    /// with the typed reason recorded in [`DistClient::last_error`] — which still requires the
+    /// flush to run, so the pass may not declare a stall before it. The buffered-output half
+    /// covers the same window on the wire side: a control written by a send path that did not
+    /// get to flush (the driver buffers, the socket write fails) stays pending here.
+    ///
+    /// O(link count), allocation-free (two slice scans plus one `try_borrow`), and **declines
+    /// to `true`** when a cell cannot be borrowed: a borrowed cell means distribution work is
+    /// in flight, so the caller must keep pumping rather than substantiate a stall it cannot
+    /// justify — the same discipline [`DistClient::has_links`] keeps.
+    pub fn has_pending_outbound(&self) -> bool {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.has_pending_outbound(),
+            Err(_) => true,
+        }
+    }
+
     /// Why the most recently retired link was dropped, if any.
     pub fn last_error(&self) -> Option<String> {
         match self.inner.try_borrow() {
@@ -571,6 +597,30 @@ impl DistClient {
 }
 
 impl DistClientInner {
+    /// Whether this client holds outbound work the next flush owes ([`DistClient::has_pending_outbound`]).
+    ///
+    /// Both halves are asked, because a routed control may travel on either one
+    /// ([`DistLinks::route_control`]): the outbound links live in this cell, the accepted one
+    /// behind the shared `Rc<RefCell<…>>` the node pumps.
+    fn has_pending_outbound(&self) -> bool {
+        if !self.pending.is_empty() {
+            return true;
+        }
+        if self
+            .links
+            .outbound
+            .iter()
+            .any(|link| link.driver.has_output())
+        {
+            return true;
+        }
+        match self.links.accepted.try_borrow() {
+            Ok(accepted) => accepted.iter().any(|link| link.has_pending_output()),
+            // A borrowed accepted cell is a pump (or a route) in progress: pending work.
+            Err(_) => true,
+        }
+    }
+
     /// Steps every **outbound** link, retiring the ones that died, and returns the event count.
     ///
     /// Only the outbound half is stepped here: the accepted links are the listening node's
@@ -759,6 +809,18 @@ impl DistClientInner {
 
     /// Writes the signal's control arguments onto the scratch heap and returns the
     /// opcode plus the arguments (see the module docs for the `DOP_*` order).
+    ///
+    /// # `DOP_MONITOR_P_EXIT` is emitted in the plain 5-tuple form
+    ///
+    /// The C prefers `DOP_PAYLOAD_MONITOR_P_EXIT` — 4 arguments with the reason as the
+    /// trailing message body — when the **peer link** advertised `DFLAG_EXIT_PAYLOAD`
+    /// (`dist.c:1511-1519`). That choice is deliberately not reproduced: the flags this
+    /// runtime advertises ([`crate::dist::advertised_flags`]) describe what it *understands
+    /// inbound*, not what it emits, and the plain `TUPLE5` form is legal on every peer that
+    /// supports `DFLAG_DIST_MONITOR` (a **mandatory-set** flag — the C only skips the send
+    /// when even that is absent, `dist.c:1504-1508`). So the plain form needs no per-link
+    /// gate, cannot pick a shape a peer misreads, and the 4-tuple form buys nothing
+    /// measurable here.
     pub(super) fn encode_signal(&mut self, signal: DistSignal) -> Result<(Dop, Vec<Eterm>)> {
         let our_node = self.our_node;
         let creation = self.creation;
@@ -829,6 +891,42 @@ impl DistClientInner {
                     beam_message::copy_struct_simple(reason, heap)?,
                 ],
             )),
+            // `{DOP_MONITOR_P_EXIT, Watched(local), Watcher(remote), Ref, Reason}` — the
+            // C's `erts_dsig_send_m_exit` (`dist.c:1516`). **Watched first**, the reverse of
+            // `DOP_MONITOR_P`'s `{watcher, watched, ref}`, because the tuple mirrors the
+            // inbound `DOP_MONITOR_P` this node is answering.
+            DistSignal::MonitorExit {
+                watched,
+                watcher,
+                reference,
+                reason,
+            } => {
+                let watched_term = local(heap, watched)?;
+                let watcher_term = watcher.to_eterm(heap)?;
+                let reference_term = match reference {
+                    // The peer minted this reference, so it goes back **verbatim** — its own
+                    // node, its own creation and its own id words. Substituting this node (or
+                    // this node's creation) would name a reference the peer does not have, and
+                    // its `{'DOWN', Ref, …}` would then match nothing.
+                    RemoteWatcherRef::Remote(remote) => {
+                        make_external_ref(heap, remote.node(), remote.ids(), remote.creation())?
+                    }
+                    // This node minted it, so it is spelled exactly as the monitor family
+                    // spells one, through the same builder (`{node, creation, ids}`).
+                    RemoteWatcherRef::Local(local_ref) => {
+                        monitor_ref_term(heap, local_ref, our_node, creation)?
+                    }
+                };
+                Ok((
+                    Dop::MonitorPExit,
+                    vec![
+                        watched_term,
+                        watcher_term,
+                        reference_term,
+                        beam_message::copy_struct_simple(reason, heap)?,
+                    ],
+                ))
+            }
         }
     }
 }

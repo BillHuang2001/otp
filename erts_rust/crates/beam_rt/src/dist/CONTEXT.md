@@ -122,11 +122,13 @@ Remaining A.5 gaps, each typed — never a wrong value:
 * The distributed-spawn family — `DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY` (`SpawnRequest`/`SpawnReply`) and `Delivery::Other(_)` — stays `Unsupported`, so `rpc:call/4,5` (which is `erpc`: a remote spawn plus a monitor) and `spawn(Node, M, F, A)` are capability gaps; the missing seam is a `beam_process` remote reservation API ([`../../HANDOFF.md`](../../HANDOFF.md)).
 * The ack-owing `UnlinkId` half (`id != 0`) stays `Unsupported`; `id == 0` is `Delivered`.
   `DFLAG_UNLINK_ID` is in `DFLAG_DIST_MANDATORY_26`, so a real OTP peer negotiates it.
-* **No outbound `DOP_MONITOR_P_EXIT` is ever emitted.** `beam_process::DistSignal` has no
-  monitor-down variant, so a local process with incoming remote watchers is dropped silently at
-  `../../beam_process/src/ptab.rs:2483` — a peer's `erlang:monitor(process, RemotePid)` on one of
-  our processes never receives its `'DOWN'`, while the reverse direction (our record receiving the
-  peer's `DOP_MONITOR_P_EXIT`) works.
+* **An outbound `DOP_MONITOR_P_EXIT` is emitted** for a local process with incoming remote watchers:
+  `ProcessTable::terminate_into` routes one `DistSignal::MonitorExit` per drained `RemoteWatcher`
+  (`../../beam_process/src/ptab.rs:2494`) and `dist_client`'s `encode_signal` writes the C's
+  *watched-first* `TUPLE5` with the reference in the spelling the table recorded (`dist.c:1516`;
+  `../dist_client/CONTEXT.md`). Emitted unconditionally in the plain form — no `DFLAG_EXIT_PAYLOAD`
+  preference — and the routing key is the **watcher's** node. The reverse direction (our record
+  receiving the peer's `DOP_MONITOR_P_EXIT`) works too.
 * **`erlang:exit(RemotePid, Reason)` emits no bytes**: the runtime-native floor's `exit_target`
   (`../native/process/exit.rs:139`) answers `true` for `PidTarget::Remote` without routing. The
   entry point that would fix it already exists and is unused by the floor:

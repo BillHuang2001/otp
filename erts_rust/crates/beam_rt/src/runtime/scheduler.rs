@@ -552,6 +552,15 @@ impl Runtime {
     /// a **client** that holds any link, handshaking or established
     /// ([`DistClient::has_links`](crate::dist_client::DistClient::has_links)).
     ///
+    /// The **outbound** half is also asked what it concretely owes
+    /// ([`DistClient::has_pending_outbound`](crate::dist_client::DistClient::has_pending_outbound)):
+    /// a routed signal sitting in the client's outbound queue and bytes a link's driver has not
+    /// written yet. A queued signal is work even though `queue_signal` gated it on
+    /// `may_reach_node`, because the link can be retired **between** queueing and the flush — the
+    /// item is then dropped at the flush (its typed reason recorded in
+    /// [`DistClient::last_error`](crate::dist_client::DistClient::last_error)), so the flush has to
+    /// run at least once before a stall may be declared.
+    ///
     /// The consequence is that a `run`-route process parked on a bare `receive` with a live
     /// link keeps pumping — it is resumed the moment the peer's message survives the link —
     /// and only a link that is genuinely gone lets the pass declare the honest
@@ -599,15 +608,17 @@ impl Runtime {
             return false;
         }
         // Distribution (A.5): a live link is work the pass must keep pumping, because an
-        // inbound `DOP_*` can wake a parked process. Both tests are `Option`/link checks, so
-        // a runtime that is not a node — and a node holding no link — is unchanged.
+        // inbound `DOP_*` can wake a parked process — and so is a queued signal or a driver's
+        // unwritten output, which the very next flush owes the wire. Both tests are
+        // `Option`/link checks, so a runtime that is not a node — and a node holding no link
+        // and nothing queued — is unchanged.
         if self.dist.as_ref().is_some_and(|node| !node.is_idle()) {
             return false;
         }
         !self
             .dist_client
             .as_ref()
-            .is_some_and(|client| client.has_links())
+            .is_some_and(|client| client.has_links() || client.has_pending_outbound())
     }
 
     /// Records that a **heap-fragment** delivery woke `pid` (see
