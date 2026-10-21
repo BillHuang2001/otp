@@ -3380,3 +3380,80 @@ fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
         "the middle N must not blow up either: {mid:.6}/call"
     );
 }
+
+/// The debt-gated seam decline keeps the retired-nursery **chain** bounded across a long
+/// fun-applying workload: ten times the iterations must not buy the process more retained
+/// spaces.
+///
+/// # What this forbids, and why that is the right bound
+///
+/// `lists:foldl/3` (like every `lists`/`maps` key `beam_bifs::needs_fun_caller` names) is a
+/// **host-served** fast path, so the engine reaches it through
+/// `RuntimeContext::resolve_external_call`. With that seam always declining, the key ran
+/// synchronously as a `beam_bifs` BIF and applied the caller's fun through
+/// [`crate::context::bridges`]'s `FunBridge::nested` → `apply_fun` → `pump::run_label_blocking`
+/// — a **second machine** whose context is `gc_armed == false` and whose process is marked
+/// relocation-exempt for the whole application. Nothing can collect while such a run is live:
+/// the nested machine's admission points are unarmed, and the armed doors refuse an exempt
+/// process. That nested run's registered-BIF copy-outs meanwhile keep growing the process's
+/// young heap through the **no-collect** `Process::grow_nursery` seam, and `beam_gc`'s
+/// `Nursery::grow` *retires* the space it replaces instead of freeing it — a chain of retired
+/// spaces that no collection ever collapses (the shape that made one in-process
+/// `compile:file/2` report 20 retired spaces and 3.0 GB of chain-summed capacity).
+///
+/// The bound asserted here is therefore that **the chain's length must not be a function of the
+/// work done**: `10 × N` iterations must retire no more spaces than `N` (one space of slack for
+/// where a slice boundary happens to fall). That is precisely the "non-collecting growth whose
+/// refusal nothing ever revisits" mechanism above — should it return, the larger run necessarily
+/// retires more spaces, because only a collection can collapse the chain and the exempt nested
+/// run forbids one. The workload is real work either way: the row's `value` grows with `N` and
+/// its `slices` grow with it, so a fixture that quietly stopped applying its fun would fail the
+/// last two assertions instead of passing the bound vacuously.
+#[test]
+#[ignore = "the fun-applying fold costs >300 s at N=2000 under the test profile; run it \
+            explicitly with a fresh `runner::tests::a_long_fun_applying` filter (it asserts the \
+            retired-nursery chain's length, not a smoke value)"]
+fn a_long_fun_applying_workload_does_not_chain_retired_nurseries() {
+    let source = "\
+-module(nestfold).
+-export([run/1]).
+run(N) ->
+    lists:foldl(fun(X, Acc) -> Acc + length(integer_to_binary(X * 3)) end, 0, lists:seq(1, N)).
+";
+    let Some(dir) = compile_modules("nestfold_chain", &[("nestfold", source)]) else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the nursery-chain bound test is skipped");
+        return;
+    };
+    let beam = dir.join("nestfold.beam");
+    let beam = beam.to_str().expect("the scratch path is utf-8");
+    let small = run_growth_counted(&mut growth_runtime(beam), "nestfold", 200);
+    let big = run_growth_counted(&mut growth_runtime(beam), "nestfold", 2_000);
+    assert!(
+        big.value > small.value && big.slices > small.slices,
+        "the workload must really run: N=200 -> value {} / {} slices, N=2000 -> value {} / {} \
+         slices",
+        small.value,
+        small.slices,
+        big.value,
+        big.slices,
+    );
+    assert!(
+        big.collections >= 1,
+        "the ten-times-larger run must have collected at least once (N=200: {} collections, \
+         N=2000: {})",
+        small.collections,
+        big.collections,
+    );
+    assert!(
+        big.peak_young_spaces <= small.peak_young_spaces + 1,
+        "the retired-nursery chain must not grow with the work: N=200 peaked at {} space(s) \
+         ({} words) and N=2000 at {} space(s) ({} words), with {} of the sampled slice \
+         boundaries still owing a collection at N=2000 -- a chain that lengthens with N is the \
+         non-collecting `Process::grow_nursery` growth whose refusal nothing revisits",
+        small.peak_young_spaces,
+        small.peak_young_capacity,
+        big.peak_young_spaces,
+        big.peak_young_capacity,
+        big.debt_boundaries,
+    );
+}
