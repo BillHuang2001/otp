@@ -177,7 +177,7 @@ fn run_growth(rt: &mut Runtime, n: i64) -> GrowthRun {
 /// `N = 20 000` → `10 001`, `N = 1 000` → `501`. It is an identity over the row's own figures, not
 /// a calibration: the same relation holds for `N` from 50 to 20 000 (`N = 50` → `26`,
 /// `N = 500` → `251`), and the sibling `src/runner/tests.rs` growth table derives its own
-/// `collections == N + yields` from the reduction budget the same way.
+/// `collections == 1 + N / K` (`K == 2`) from its own settled capacity the same way.
 ///
 /// What would make it regress: a `beam_gc` sizing change that stops the nursery from settling on
 /// its live-set target (so the admission door collects per request instead of per `K` requests —

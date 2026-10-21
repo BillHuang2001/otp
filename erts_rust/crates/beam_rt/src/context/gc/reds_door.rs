@@ -105,12 +105,13 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// **The watermark's rationing, as this tree measures it.** The churn shape's own heap-admission
 /// door already settles its collection debt every iteration, so a boundary collection here is nearly
 /// always a duplicate — and an expensive one, because `beam_gc::Collector::collect` escalates to a
-/// **major** whenever the mature generation is not larger than the nursery in use. The `7/8`
-/// watermark rations the door to one firing in seven to nine boundary checks: measured **128 of
-/// 904** checks at N = 2 000, **258 of 1 809** at N = 4 000 and **646 of 4 524** at N = 10 000 (one
-/// in 7.06 / 7.01 / 7.00, the band's lower edge), and a boundary collection leaves the boundaries
-/// after it below the watermark. Its share of that shape's own collections is the constant **3.69 /
-/// 3.72 / 3.73 %** at the same three rows, because the capacity it collapses onto does not follow N
+/// **major** unless the round's own live promotion fits the mature space
+/// (`Collector::minor_promotion_fits`). The `7/8` watermark rations the door to one firing in eight
+/// to nine boundary checks: measured **105 of
+/// 904** checks at N = 2 000, **210 of 1 809** at N = 4 000 and **532 of 4 524** at N = 10 000 (one
+/// in 8.61 / 8.61 / 8.50, inside the band), and a boundary collection leaves the boundaries
+/// after it below the watermark. Its share of that shape's own collections is the constant **2.221 /
+/// 2.215 / 2.239 %** at the same three rows, because the capacity it collapses onto does not follow N
 /// (`src/runner/tests/boundary_cost.rs`'s `MEASURED` table holds the counts, `src/runner/MEASURED.md`
 /// the measurement record).
 /// What the door *adds* to a run's totals is not measurable here: a door-ON/OFF delta needs a
@@ -125,9 +126,9 @@ pub(crate) const REDS_BOUNDARY_MIN_REDS: u32 = 4_000;
 /// **The shape's schedule is a live-set one.** The copy-out hint gate in
 /// [`crate::context::calls`] (`hint_grow_gate`) grows the churn shape's nursery **before** its
 /// 257-word tuple copy-out instead of after a refusal, so the growth event (one retired space ⇒
-/// one collection debt) sets that shape's cadence: at N = 2 000 it measures **3 468 collections and
-/// 169 majors** over 2 001 calls (1.7331 / 0.0845 per iteration) on one young space of **1 220**
-/// words and a mature region of **4 185** words — fixed points of `HeapPolicy`'s live-set rules,
+/// one collection debt) sets that shape's cadence: at N = 2 000 it measures **4 728 collections and
+/// 325 majors** over 2 001 calls (2.3628 / 0.1624 per call) on one young space of **2 585**
+/// words and a mature region of **6 772** words — fixed points of `HeapPolicy`'s live-set rules,
 /// never quantities that follow N.
 ///
 /// **What would regress it:** a shape whose slice-boundary occupancy sits in `[1/2, 7/8)` — it
