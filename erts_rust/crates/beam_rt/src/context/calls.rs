@@ -1193,6 +1193,7 @@ impl<'a> RuntimeContext<'a> {
     fn graph_holds_reference(term: Eterm) -> bool {
         #[cfg(test)]
         notes::note_walk_call();
+        perf_counters::bump(|c| &mut c.walk_calls);
         let mut work = Walklist::new();
         let mut budget = WALK_VISIT_BUDGET;
         work.push(term);
@@ -1219,6 +1220,7 @@ impl<'a> RuntimeContext<'a> {
             loop {
                 #[cfg(test)]
                 notes::note_walk_visit();
+                perf_counters::bump(|c| &mut c.walk_visits);
                 // The budget is the only bound the walk has (see *The walk*): a forged cycle would
                 // otherwise spin here forever. It is charged **per dereferenced object**, exactly
                 // as the generic step charged it, so exhaustion answers the same `true`.
