@@ -213,6 +213,17 @@ impl Machine {
         self.raise_supplied_trace.take()
     }
 
+    /// Whether the raise currently in flight **supplied** its trace — either as
+    /// explicit symbolic frames or as a raw trace object — **without** consuming the
+    /// latch.
+    ///
+    /// The cooked-trace opcode needs this to decide whether to consult the supplied
+    /// state at all: a supplied raise carries no derived snapshot, so the usual
+    /// "empty snapshot ⇒ `NIL`" shortcut would drop the supplied trace.
+    pub(crate) fn has_raise_supplied_trace(&self) -> bool {
+        self.raise_supplied_trace.is_some() || self.raise_supplied_raw_trace
+    }
+
     /// Push a catch frame (the `try`/`catch` handler target).
     ///
     /// The frame's module context is stamped from the context executing right now
@@ -411,6 +422,11 @@ impl Machine {
         // a non-empty trace), and this raise — whoever raised it — owns the live
         // state from here on, so a raise that arrived with no such frames clears it.
         self.raise_supplied_trace = self.pending_supplied_trace.take();
+        // The **raw**-trace flavour of the same protocol: `raw_raise` supplied the
+        // trace object itself (C's `c_p->ftrace`, with `EXF_SAVETRACE` cleared), so
+        // this raise must not rebuild the snapshot — the snapshot of the raise being
+        // re-raised IS the supplied trace.
+        self.raise_supplied_raw_trace = std::mem::take(&mut self.pending_supplied_raw_trace);
         self.pending_exception = Some((class, reason));
         // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
         // handler's `build_stacktrace` (and the uncaught funnel) must be able to name
@@ -419,11 +435,13 @@ impl Machine {
         // live callers come from the call-frame stack, innermost first. This is the
         // engine's replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
         self.raise_snapshot.clear();
-        if let Some((func, pc)) = self.current_code() {
-            self.raise_snapshot.push((self.current_context(), func, pc));
-        }
-        for (func, pc, context) in self.resumption_contexts() {
-            self.raise_snapshot.push((context, func, pc));
+        if self.raise_supplied_trace.is_none() && !self.raise_supplied_raw_trace {
+            if let Some((func, pc)) = self.current_code() {
+                self.raise_snapshot.push((self.current_context(), func, pc));
+            }
+            for (func, pc, context) in self.resumption_contexts() {
+                self.raise_snapshot.push((context, func, pc));
+            }
         }
         let frame = match self.catch_frames.last() {
             Some(frame) => *frame,
@@ -443,6 +461,12 @@ impl Machine {
         // *uncaught* raise above never reaches this point.
         let class_atom = self.class_atom(class)?;
         self.unwind_to_frame(frame.frame_index)?;
+        // The landing frame is no longer suspended in the call that raised: the handler
+        // runs in it. Leaving its continuation-pointer slot set would make the raise
+        // site look like its own caller to every later derivation from this frame (C's
+        // `next_catch` drops the frames above the catch frame, and its `RETURN()` clears
+        // a consumed slot — `emu/macros.tab:241-247`).
+        self.set_continuation(Continuation::Halt)?;
         self.land_exception(class_atom, reason, trace)?;
         // The handler's `(func, pc)` are indices into the *landing context's*
         // module, which is not necessarily the module the raise happened in (a raise
@@ -518,10 +542,21 @@ impl Machine {
             BeamError::Raise(raise)
                 if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
             {
-                // Consume the failed-clause argument list: it belongs to the raising
-                // frame, which is the frame this funnel names first.
-                let failed_clause_args = self.take_raise_function_clause_args();
-                let frames = self.raise_stacktrace(entry_module, func, pc, failed_clause_args);
+                // A raise that arrived carrying **explicit symbolic frames** renders
+                // those (an empty supplied trace stays empty); a raise that supplied a
+                // **raw** trace renders the preserved snapshot — the trace of the raise
+                // it re-raises — instead of deriving one from this site.
+                if let Some(supplied) = self.take_raise_supplied_trace() {
+                    return BeamError::Raise(raise.with_stacktrace(supplied));
+                }
+                let frames = if std::mem::take(&mut self.raise_supplied_raw_trace) {
+                    self.snapshot_stacktrace(entry_module)
+                } else {
+                    // Consume the failed-clause argument list: it belongs to the raising
+                    // frame, which is the frame this funnel names first.
+                    let failed_clause_args = self.take_raise_function_clause_args();
+                    self.raise_stacktrace(entry_module, func, pc, failed_clause_args)
+                };
                 if frames.is_empty() {
                     BeamError::Raise(raise)
                 } else {
@@ -607,6 +642,23 @@ impl Machine {
             };
             if let Some(module) = self.frame_module(entry_module, context) {
                 push_stack_frame(&mut trace, &module, func, pc, None);
+            }
+        }
+        trace
+    }
+
+    /// The [`StackTrace`] of the machine's **raise snapshot** ([`Machine::raise_snapshot`])
+    /// — the pre-unwind frame chain, resolved against each frame's own module.
+    ///
+    /// This is what a raise that supplied a **raw** trace object renders: the engine's
+    /// raw `StackTrace` equivalent is the snapshot, so the re-raised exception's frames
+    /// are the ones the original raise captured, verbatim, with no re-raise-site frame
+    /// added (`build_stacktrace`'s `is_raised_exc` arm, `../../erts/emulator/beam/beam_common.c:1219-1223`).
+    fn snapshot_stacktrace(&self, entry_module: Option<&Module>) -> StackTrace {
+        let mut trace = StackTrace::new();
+        for (context, func, pc) in self.raise_snapshot() {
+            if let Some(module) = self.frame_module(entry_module, *context) {
+                push_stack_frame(&mut trace, &module, *func, *pc, None);
             }
         }
         trace

@@ -416,7 +416,9 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // fresh run begins with neither armed, so a raise in the new run can never
         // render the frames an earlier run's raise arrived carrying.
         self.pending_supplied_trace = None;
+        self.pending_supplied_raw_trace = false;
         self.raise_supplied_trace = None;
+        self.raise_supplied_raw_trace = false;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).

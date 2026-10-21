@@ -170,6 +170,10 @@ pub(crate) fn symbolic_stacktrace(
     if let Some(supplied) = machine.take_raise_supplied_trace() {
         return carve_supplied_frames(machine, entry_module, ctx, &supplied);
     }
+    // A raise that supplied a **raw** trace renders the preserved snapshot: the
+    // engine's raw-trace equivalent, exactly as `build_stacktrace` returns a supplied
+    // (raised) exception's trace verbatim (`beam_common.c:1219-1223`). Consumed once.
+    let _raw_supplied = std::mem::take(&mut machine.raise_supplied_raw_trace);
     // The **raise-time** frame chain: the raising frame first, then every caller
     // innermost-first, exactly as it was captured *before* the raise unwound the
     // call frames. Copy it out of the machine so the `shapes` below borrow only

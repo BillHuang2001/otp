@@ -324,6 +324,11 @@ pub(crate) fn exec(
             // `get_trace_from_exc(NIL) == NULL` answer; a non-NIL raw is cooked as
             // before.
             let has_snapshot = !machine.raise_snapshot().is_empty();
+            // A raise that **supplied** its trace has no derived snapshot by
+            // construction (the rebuild is skipped), so the supplied frames must still
+            // reach `symbolic_stacktrace` — the one place that consumes them — even
+            // when the raw trace is `NIL` and the snapshot is empty.
+            let supplied = machine.raise_supplied_raw_trace || machine.has_raise_supplied_trace();
             // An `undef` raised by an unresolvable `call_ext*`/`apply` target carries
             // a synthesized **callee head item** as its raw trace (see
             // [`callee`]): C's innermost `build_stacktrace` item, the callee named
@@ -332,7 +337,7 @@ pub(crate) fn exec(
             // must be re-read through, never a pre-computed term that could have
             // moved) to the trace builder.
             let head = machine.take_raise_head_item();
-            let cooked = if is_nil(raw) && !has_snapshot && !head {
+            let cooked = if is_nil(raw) && !has_snapshot && !head && !supplied {
                 NIL
             } else {
                 symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(0), head)?
@@ -357,6 +362,10 @@ pub(crate) fn exec(
                     // it in `x(3)` (C stores the class in the `StackTrace` struct
                     // *and* in `c_p->freason`, `beam_common.c:1151-1175`).
                     install_class_atom(machine, module, ctx, class)?;
+                    // C's `raw_raise` stores the supplied trace in `c_p->ftrace` and
+                    // clears `EXF_SAVETRACE` (`beam_common.c:1148-1179`), so nothing is
+                    // derived at this site: the raise keeps the trace it arrived with.
+                    machine.pending_supplied_raw_trace = true;
                     machine.throw_with_trace(class, value, trace).map(Some)
                 }
                 None => {

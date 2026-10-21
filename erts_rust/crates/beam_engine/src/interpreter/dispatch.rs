@@ -693,7 +693,7 @@ impl Machine {
         func: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
-        match self.continuation()? {
+        match self.take_continuation()? {
             Continuation::Halt => Ok(Step::Done),
             Continuation::Address {
                 func: caller,

@@ -370,6 +370,20 @@ pub struct Machine {
     /// — a raise with no live catch frame — cannot leave stale frames for a later,
     /// unrelated cooked trace to inherit.
     pub(crate) pending_supplied_trace: Option<StackTrace>,
+    /// A **one-shot latch**: the raise about to land supplies its trace as a **raw**
+    /// trace object ([`Instr::RawRaise`](beam_loader::Instr)'s `x(2)` operand, C's
+    /// `c_p->ftrace`).
+    ///
+    /// C's `raw_raise` stores the supplied trace in `c_p->ftrace` and clears
+    /// `EXF_SAVETRACE` (`../../erts/emulator/beam/beam_common.c:1148-1179`), so
+    /// `save_stacktrace` does **not** run (its guard is `freason & EXF_SAVETRACE`,
+    /// `:505-507`) and no re-raise-site frame is ever prepended:
+    /// `build_stacktrace` returns the stored trace verbatim (`:1219-1223`).
+    ///
+    /// The engine keeps no raw `StackTrace` object — its equivalent is
+    /// [`Machine::raise_snapshot`] — so "a raw trace was supplied" means exactly
+    /// *keep the snapshot of the raise being re-raised and derive nothing*.
+    pub(crate) pending_supplied_raw_trace: bool,
     /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
     /// explicit frames the raise currently in flight arrived carrying.
     ///
@@ -383,6 +397,11 @@ pub struct Machine {
     /// machine-held heap term, so they need no rooting across the cooked trace's
     /// reservation.
     pub(crate) raise_supplied_trace: Option<StackTrace>,
+    /// The **live raise** state behind [`Machine::pending_supplied_raw_trace`]: this
+    /// raise supplies its trace as a raw trace object, so
+    /// [`Machine::throw_with_trace`] leaves [`Machine::raise_snapshot`] untouched (the
+    /// preserved snapshot is the trace) and every cooking renders it.
+    pub(crate) raise_supplied_raw_trace: bool,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -665,7 +684,9 @@ impl Machine {
             pending_function_clause_args: None,
             raise_function_clause_args: None,
             pending_supplied_trace: None,
+            pending_supplied_raw_trace: false,
             raise_supplied_trace: None,
+            raise_supplied_raw_trace: false,
             refc_binaries: Vec::new(),
             writable_payloads: Vec::new(),
             args_scratch: Vec::new(),

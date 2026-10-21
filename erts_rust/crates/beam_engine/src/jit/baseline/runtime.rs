@@ -1818,7 +1818,7 @@ pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        machine.continuation()
+        machine.take_continuation()
     };
     match continuation {
         Ok(continuation) => return_word(runtime, continuation),
@@ -1861,7 +1861,7 @@ pub(crate) extern "C" fn jit_deallocate_return(
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        machine.pop_frame_checked(deallocate).and_then(|()| machine.continuation())
+        machine.pop_frame_checked(deallocate).and_then(|()| machine.take_continuation())
     };
     match outcome {
         Ok(continuation) => return_word(runtime, continuation),
