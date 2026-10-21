@@ -219,3 +219,30 @@ That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), th
 of the in-process `compile:file/2` route (A.9).
 The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
+
+## Where a nested run's memory lives (what is per-call vs process-lifetime)
+Four regions, none of which is per-`RuntimeContext`: a context is a borrow-only struct over
+`&'a mut Runtime` (`runtime_context.rs:198-287`), so it owns no heap at all and dropping it frees only
+its inline `dispatch_memo` slots and the boxes a miss put in them.
+* **The term arena is the runtime's, for the process's whole life.** A table-less context
+  (`RuntimeContext::new`/`with_output`, and therefore `FunBridge::nested`'s inherited
+  `mailbox_table: None`) routes every `alloc_words`/`heap_available` to `Runtime::arena`
+  (`gc.rs:1457-1469`, `gc.rs:1502-1541` → `runtime.rs:2180`), i.e. one `MinimalContext`
+  (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>` that **only ever
+  grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes the frontier; freed
+  only when the `Runtime` drops. `beam_engine/src/context.rs:1395-1577` owns the algorithm.
+* **A scheduled process's nested run allocates from its own young heap instead** (`gc.rs:1509-1539`,
+  `gc_process_enabled`), whose `Process::grow_nursery` retires the space it replaces — the *capacity*
+  ratchet, never live data (`beam_gc`'s `Nursery::grow`/`install`).
+* **The pooled `Machine` is the only retained per-run object, and its footprint never shrinks**: 16 KiB
+  of register files at construction (`MAX_REGISTER`/`MAX_FLOAT_REGISTER` = 1024 words each) plus every
+  `Vec`'s high-water capacity; `Machine::reset` clears/truncates and keeps capacity, keeps the label
+  cache, and rejects (never shrinks) `refc_binaries`. The pool bounds residency, not size:
+  `MAX_POOLED_MACHINES = 32` idle machines over ≤ 96 callee slots (`machine_pool.rs:126-149`).
+* **`runtime.eval_heap` is the table-less route's other store**: fixed capacity, grown by *region
+  replacement* with the old region pushed onto `eval_heap_retired` (`runtime.rs:2286-2295`), and its
+  per-statement window can only rewind while unpinned — a nested run that wrote on it pins the window
+  (`eval/scratch.rs:298-304`), so a compile-shaped run keeps everything it wrote.
+The consequences for a long in-process `compile:file/2`, the per-call cost census and the pool's
+reuse counters (`BEAM_RT_PERF_COUNTERS=1`) are `../runtime/CONTEXT.md`'s and
+`../PERF.md`'s; the engine-side capacity facts are `beam_engine/src/machine/CONTEXT.md`'s.
