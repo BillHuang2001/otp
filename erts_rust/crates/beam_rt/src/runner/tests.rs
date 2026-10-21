@@ -3409,16 +3409,63 @@ fn the_heap_growth_workloads_per_call_counters_are_flat_in_n() {
 /// run forbids one. The workload is real work either way: the row's `value` grows with `N` and
 /// its `slices` grow with it, so a fixture that quietly stopped applying its fun would fail the
 /// last two assertions instead of passing the bound vacuously.
+///
+/// # The workload, the N pair, and why the bound is not vacuous at this size
+///
+/// `nestfold:run/1` folds a fun over `lists:seq(1, N)` that builds one `integer_to_binary/1`
+/// per iteration and measures it with `byte_size/1` — a registered-BIF copy-out per iteration
+/// (the growth input the mechanism above needs), applied through the nested
+/// `FunBridge` run (the relocation-exempt window it happens in). The measured pair is
+/// `N = 2 000` vs `N = 20 000`, **not** the original `200` vs `2 000`: at `N = 200` the whole
+/// fold is 1 007 reduction units, so it finishes inside the run's **first** slice and no slice
+/// boundary exists to sample the chain at (`peak_young_spaces` reads `0`, i.e. *unobserved*);
+/// both members of the pair below end **several** slices, so the peak is a real maximum over
+/// the run.
+///
+/// The pair still exercises the mechanism, on measured counters rather than on size:
+///
+/// * the growth seam is driven **many** times in both rows — the sampled `peak_young_capacity`
+///   rises `17 964` → `196 883` words across the pair (`11 ×` on `10 ×` the work), i.e. the
+///   process's nursery is repeatedly grown by the nested copy-outs;
+/// * each row takes exactly **one** collection (a fullsweep, `collections = 1`, `major = 1`), and
+///   that single collapse is what keeps the retained chain at **one** space in both rows
+///   (`peak_young_spaces = 1`, no boundary left owing a debt) — so the gate is exercised *and*
+///   succeeding, not bypassed by an idle workload;
+/// * with the gate declining (the always-exempt nested run, nothing armed inside it), none of
+///   those many growths is ever collapsed, so the chain's length tracks the number of growths —
+///   which rises with `N`. The pre-gate shape measured 20 retired spaces / 3.0 GB of chain-summed
+///   capacity for one in-process `compile:file/2`. The `+ 1` therefore absorbs only where a slice
+///   boundary falls, never a second growth regime.
+///
+/// Measured cost of the whole test in the test profile (`optimized + debuginfo`): **~0.3 s** end
+/// to end — `finished in 0.25–0.45 s` over repeated solo runs, of which ~0.2 s is the harness's
+/// one `erlc` spawn and ~0.02 s each the two runtime boots, the two measured runs themselves
+/// being ~6 ms (`N = 2 000`) and ~22 ms (`N = 20 000`). It therefore runs in the default gate.
+/// The reason it was `#[ignore]`d as ">300 s at N = 2000" was its **fixture**, not the
+/// fold: `length/1` takes a list, so the original body
+/// `Acc + length(integer_to_binary(X * 3))` raised `badarg` on the first iteration (the oracle
+/// raises it too), and a raising process never resolves `Runtime::process_result` (a raise is
+/// recorded by `Runtime::process_exit`) — so the sampling loop spun on empty slices (measured:
+/// 50 million slices in 20 s, the process already gone from the table) until its 300 s
+/// `COUNTER_RUN_DEADLINE`. `byte_size/1` is the length measure a binary has.
+///
+/// The rows, printable with `--nocapture`:
+///
+/// ```text
+/// nestfold_chain small N=2000  : slices=3  reductions=10007   collections=1 major=1 peak_spaces=1 peak_cap=17964   debt_bounds=0 value=7631
+/// nestfold_chain big   N=20000 : slices=26 reductions=100007  collections=1 major=1 peak_spaces=1 peak_cap=196883  debt_bounds=0 value=96298
+/// ```
 #[test]
-#[ignore = "the fun-applying fold costs >300 s at N=2000 under the test profile; run it \
-            explicitly with a fresh `runner::tests::a_long_fun_applying` filter (it asserts the \
-            retired-nursery chain's length, not a smoke value)"]
 fn a_long_fun_applying_workload_does_not_chain_retired_nurseries() {
+    // `SMALL_N` must end more than one slice (otherwise its chain peak is unobserved, not
+    // measured) and both rows must reach their first collection; see the doc comment above.
+    const SMALL_N: i64 = 2_000;
+    const BIG_N: i64 = 20_000;
     let source = "\
 -module(nestfold).
 -export([run/1]).
 run(N) ->
-    lists:foldl(fun(X, Acc) -> Acc + length(integer_to_binary(X * 3)) end, 0, lists:seq(1, N)).
+    lists:foldl(fun(X, Acc) -> Acc + byte_size(integer_to_binary(X * 3)) end, 0, lists:seq(1, N)).
 ";
     let Some(dir) = compile_modules("nestfold_chain", &[("nestfold", source)]) else {
         eprintln!("SKIP: no system `erlc` on PATH -- the nursery-chain bound test is skipped");
@@ -3426,12 +3473,28 @@ run(N) ->
     };
     let beam = dir.join("nestfold.beam");
     let beam = beam.to_str().expect("the scratch path is utf-8");
-    let small = run_growth_counted(&mut growth_runtime(beam), "nestfold", 200);
-    let big = run_growth_counted(&mut growth_runtime(beam), "nestfold", 2_000);
+    let small = run_growth_counted(&mut growth_runtime(beam), "nestfold", SMALL_N);
+    let big = run_growth_counted(&mut growth_runtime(beam), "nestfold", BIG_N);
+    for (tag, n, row) in [("small", SMALL_N, small), ("big", BIG_N, big)] {
+        eprintln!(
+            "nestfold_chain {tag} N={n} : slices={} reductions={} collections={} major={} \
+             peak_spaces={} peak_cap={} mature_cap={} mature_used={} debt_bounds={} value={}",
+            row.slices,
+            row.reductions,
+            row.collections,
+            row.major,
+            row.peak_young_spaces,
+            row.peak_young_capacity,
+            row.peak_mature_capacity,
+            row.peak_mature_used,
+            row.debt_boundaries,
+            row.value,
+        );
+    }
     assert!(
         big.value > small.value && big.slices > small.slices,
-        "the workload must really run: N=200 -> value {} / {} slices, N=2000 -> value {} / {} \
-         slices",
+        "the workload must really run: N={SMALL_N} -> value {} / {} slices, N={BIG_N} -> value \
+         {} / {} slices",
         small.value,
         small.slices,
         big.value,
@@ -3439,17 +3502,17 @@ run(N) ->
     );
     assert!(
         big.collections >= 1,
-        "the ten-times-larger run must have collected at least once (N=200: {} collections, \
-         N=2000: {})",
+        "the ten-times-larger run must have collected at least once (N={SMALL_N}: {} \
+         collections, N={BIG_N}: {})",
         small.collections,
         big.collections,
     );
     assert!(
         big.peak_young_spaces <= small.peak_young_spaces + 1,
-        "the retired-nursery chain must not grow with the work: N=200 peaked at {} space(s) \
-         ({} words) and N=2000 at {} space(s) ({} words), with {} of the sampled slice \
-         boundaries still owing a collection at N=2000 -- a chain that lengthens with N is the \
-         non-collecting `Process::grow_nursery` growth whose refusal nothing revisits",
+        "the retired-nursery chain must not grow with the work: N={SMALL_N} peaked at {} \
+         space(s) ({} words) and N={BIG_N} at {} space(s) ({} words), with {} of the sampled \
+         slice boundaries still owing a collection at N={BIG_N} -- a chain that lengthens with N \
+         is the non-collecting `Process::grow_nursery` growth whose refusal nothing revisits",
         small.peak_young_spaces,
         small.peak_young_capacity,
         big.peak_young_spaces,
