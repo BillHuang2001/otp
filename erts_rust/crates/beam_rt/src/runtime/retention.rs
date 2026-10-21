@@ -443,30 +443,45 @@ mod tests {
         );
     }
 
-    /// **The store's doubling chain is clamped, and a refusal retires nothing.**
+    /// **The store's doubling chain is clamped by its one absolute ceiling, and a refusal retires
+    /// nothing.**
     ///
     /// [`Runtime::grow_eval_heap`] doubles by region retirement, so an unclamped chain retains
-    /// twice its final region. A configured `+hmax` is the ceiling; `needed` is a floor only up to
-    /// it, and a request beyond it is the **typed** allocation failure a failed `Heap::new` reports
-    /// (never a truncated copy), leaving the store exactly as it was — same region, same retired
-    /// list.
+    /// twice its final region. [`MAX_EVAL_HEAP_WORDS`] is that chain's only clamp: `needed` is a
+    /// floor only up to it, and a request beyond it is the **typed** allocation failure a failed
+    /// `Heap::new` reports (never a truncated copy), leaving the store exactly as it was — same
+    /// region, same retired list.
+    ///
+    /// A configured `+hmax` is deliberately **not** the ceiling (asserted first): it is a
+    /// *process-heap* limit, and a store that could not outgrow one pooled region would fail the
+    /// exact workload it exists for (`context/pool/tests.rs` pins that end to end). The ceiling
+    /// itself is exercised arithmetically — asking for one word past it is refused before any
+    /// region is allocated, so no 256 MiB region is ever created here.
     #[test]
     fn growing_the_eval_store_past_its_ceiling_is_a_typed_failure_that_retires_nothing() {
         const ROUND_WORDS: usize = 2_048;
-        const CEILING: usize = 8_192;
+        const CONFIGURED_HMAX: usize = 8_192;
         let mut rt = Runtime::new(
             crate::config::RuntimeConfig::new()
                 .with_heap_words(ROUND_WORDS)
-                .with_heap_options(crate::config::HeapOptions::new().with_max_heap_words(CEILING)),
+                .with_heap_options(
+                    crate::config::HeapOptions::new().with_max_heap_words(CONFIGURED_HMAX),
+                ),
         )
-        .expect("a runtime whose `+hmax` is the store's ceiling");
+        .expect("a runtime whose `+hmax` sizes its pooled BIF heap");
+        assert_eq!(
+            rt.eval_heap_ceiling(),
+            crate::runtime::MAX_EVAL_HEAP_WORDS,
+            "`+hmax` ({CONFIGURED_HMAX} words) must not narrow the store's ceiling"
+        );
         rt.grow_eval_heap(ROUND_WORDS * 2)
             .expect("a doubling inside the ceiling");
         let grown = rt.retention_stats();
         assert_eq!(grown.eval_heap_words, (ROUND_WORDS * 2) as u64);
         assert_eq!(grown.eval_heap_retired_regions, 1);
+        // One word past the absolute ceiling: the clamp cannot serve it.
         let refused = rt
-            .grow_eval_heap(CEILING + 1)
+            .grow_eval_heap(crate::runtime::MAX_EVAL_HEAP_WORDS + 1)
             .expect_err("a request past the ceiling cannot be served");
         let exhausted = crate::error::enforce_term_heap_limit(refused);
         assert!(

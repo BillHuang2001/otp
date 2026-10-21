@@ -151,15 +151,18 @@ const NESTED_BIF_HEAP_SEED_WORDS: usize = 131_072;
 const NESTED_SEED_HEADROOM: usize = 2;
 
 /// The absolute ceiling, in words, of the `-eval`/single-pass store
-/// ([`Runtime::grow_eval_heap`]) when no `+hmax` is configured.
+/// ([`Runtime::grow_eval_heap`]) — its **only** ceiling.
 ///
 /// The store doubles by **region replacement**, and a replaced region is never freed, so an
 /// unclamped doubling chain is a per-doubling leak whose total is twice the final region. This
-/// ceiling (`1 << 25` words = 256 MiB, twice the default region) bounds that chain; a `+hmax`
-/// takes precedence when one is configured. Reaching it is a **typed** exhaustion (the same
-/// `BeamError::Alloc` a failed [`beam_alloc::Heap::new`] reports, which
-/// [`crate::error::enforce_term_heap_limit`] renders as `error:system_limit`) — never a silently
-/// truncated copy: the store's one caller
+/// ceiling (`1 << 25` words = 256 MiB) is the runaway guard on that chain and nothing else: a
+/// `+hmax` (`max_heap_size`) is a **process-heap** limit and deliberately does **not** narrow the
+/// store — the store is a runtime-level region no process owns, and the workloads the store
+/// exists for (a long `-eval`/single-pass run whose *copied* results exceed one pooled region) are
+/// bounded by their own live set, not by any process's heap cap. Reaching the ceiling is a
+/// **typed** exhaustion (the same `BeamError::Alloc` a failed [`beam_alloc::Heap::new`] reports,
+/// which [`crate::error::enforce_term_heap_limit`] renders as `error:system_limit`) — never a
+/// silently truncated copy: the store's one caller
 /// ([`crate::context::RuntimeContext::move_result_into_runtime_store`]) then leaves the result on
 /// the pooled BIF heap instead, exactly as for any other refused copy-out.
 const MAX_EVAL_HEAP_WORDS: usize = 1 << 25;
@@ -2455,17 +2458,22 @@ impl Runtime {
     ///
     /// # The ceiling
     ///
-    /// The doubling is **clamped**: the replacement may not exceed the ceiling
-    /// [`Runtime::eval_heap_ceiling`] names — a configured `+hmax`, otherwise
-    /// [`MAX_EVAL_HEAP_WORDS`] — because every replacement also *retires* its predecessor, so an
-    /// unclamped chain retains twice its final region for the runtime's life. `needed` is a floor
-    /// up to that ceiling: a request the ceiling cannot satisfy is a **typed** exhaustion
+    /// The doubling is **clamped**: the replacement may not exceed the one ceiling
+    /// [`Runtime::eval_heap_ceiling`] names — [`MAX_EVAL_HEAP_WORDS`] — because every replacement
+    /// also *retires* its predecessor, so an unclamped chain retains twice its final region for
+    /// the runtime's life. `needed` is a floor up to that ceiling: a request the ceiling cannot
+    /// satisfy is a **typed** exhaustion
     /// (`BeamError::Alloc` of [`AllocKind::Heap`](beam_common::AllocKind), exactly what a failed
     /// [`beam_alloc::Heap::new`] reports, which [`crate::error::enforce_term_heap_limit`] renders as
     /// the documented `error:system_limit`) and **retires nothing** — never a silently truncated
     /// copy. The store's own caller
     /// ([`crate::context::RuntimeContext::move_result_into_runtime_store`]) treats the error as a
     /// refused copy-out and leaves the result on the pooled BIF heap, so the words stay readable.
+    ///
+    /// A configured `+hmax` (`max_heap_size`) is **not** part of the clamp: it limits a
+    /// *process's* heap, and the store is a runtime-level region no process owns. Coupling them
+    /// made a store that could not absorb a run whose copied results pass one pooled region —
+    /// the exact workload the store exists for.
     ///
     /// # Errors
     ///
@@ -2493,19 +2501,17 @@ impl Runtime {
         Ok(())
     }
 
-    /// The largest capacity [`Runtime::grow_eval_heap`] may install: a configured `+hmax`
-    /// ([`crate::config::RuntimeConfig::heap_options`]'s
-    /// [`policy`](crate::config::HeapOptions::policy) `max_heap_words`; `0` is "none configured"),
-    /// else [`MAX_EVAL_HEAP_WORDS`], and never below the region the store already has — a store that
-    /// was configured larger than the ceiling keeps its region (it is never shrunk).
+    /// The largest capacity [`Runtime::grow_eval_heap`] may install: the absolute runaway guard
+    /// [`MAX_EVAL_HEAP_WORDS`], and never below the region the store already has — a store that
+    /// was configured larger than it keeps its region (it is never shrunk).
+    ///
+    /// The **full capacity** the store was created with ([`crate::Runtime::new`]'s
+    /// `heap_words`, which *is* `+hmax`-floored) is therefore not a ceiling here: the clamp only
+    /// ever bounds the *doubling chain*, so a configured store starts at its own size and may grow
+    /// from there. Neither is `+hmax` one — it is a process-heap limit
+    /// (see [`MAX_EVAL_HEAP_WORDS`]).
     fn eval_heap_ceiling(&self) -> usize {
-        let configured = self.config.heap_options().policy().max_heap_words;
-        let ceiling = if configured == 0 {
-            MAX_EVAL_HEAP_WORDS
-        } else {
-            configured
-        };
-        ceiling.max(self.eval_heap.capacity())
+        MAX_EVAL_HEAP_WORDS.max(self.eval_heap.capacity())
     }
 
     /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an

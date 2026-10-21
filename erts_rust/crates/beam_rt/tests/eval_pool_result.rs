@@ -63,7 +63,10 @@ const CONTAINER_RETAINED: &str = "L = lists:seq(1,30), A = lists:last(L), \
      Tuples = [list_to_tuple(lists:seq(1,10)) || _ <- lists:seq(1,500)], \
      io:format(\"~w~n\",[{hd(L), A, length(Tuples)}]).";
 
-/// The heap cap case 2 runs under: `+hmax N` sizes the pooled BIF heap **and** the store.
+/// The heap cap case 2 runs under: `+hmax N` sizes the **pooled BIF heap**. It is a *process-heap*
+/// limit (`max_heap_size`) and deliberately does not bound the runtime's `-eval` store, which is a
+/// runtime-level region no process owns (see `Runtime::eval_heap_ceiling`); the window below is
+/// therefore the pool's, and the rewind is what keeps the run inside it.
 ///
 /// The window is measured, not guessed. Walking the cap down on this runtime (OTP 30 /
 /// erts-17.1 tree, `-eval` of [`MANY_CONTAINER_CALLS`], the runtime built from this tree):
