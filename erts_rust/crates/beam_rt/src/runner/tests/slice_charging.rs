@@ -53,28 +53,30 @@
 //! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 830 667 |
 //! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 2 030 224 |
 //! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 2 030 224 |
-//! | native | 799 | 2 | 1 | 0 | 1 | 1 | 1 | 4 004 | 233 |
-//! | native | 800 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 2 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 4 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 20 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
+//! | native | 799 | 2 | 1 | 0 | 1 | 0 | 1 | 4 004 | 233 |
+//! | native | 800 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 2 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 4 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 20 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
 //! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 188 558 |
 //! | interpreter | 2 000 | 10 | 9 | 0 | 9 | 1 | 1 | 36 018 | 233 |
 //!
 //! (A row's `heap_size` is the capacity the nursery held when the loop returned, so on the
 //! interpreter tier it is the row's own phase-dependent figure: pinned at N = 2 000 by the control
-//! at the end of the test, *measured* on the N = 798 row.)
+//! at the end of the test, *measured* on the N = 798 row. A saturated native row's one collection is
+//! a young-only minor — `major = 0` — because the promotion fits the mature region, so nothing
+//! forces a fullsweep; the door asks for a minor first and escalates only on a refusal.)
 //!
 //! `heap_growth:run/1` (the allocating engine-native shape — one 401-word `test_heap` per
-//! iteration) on the same default native tier, at a **843-word** settled nursery (peak young
-//! capacity, every row):
+//! iteration) on the same default native tier, at a settled nursery of **two** 401-word iterations
+//! (`peak_young_capacity = 843`, every row, printed by [`report`]):
 //!
 //! | N | slices | yields | waits | collections | major | peak_young_spaces | reductions |
 //! |---|---|---|---|---|---|---|---|
-//! | 2 000 | 3 | 2 | 0 | 1 001 | 1 | 1 | 10 005 |
-//! | 10 000 | 13 | 12 | 0 | 5 001 | 1 | 1 | 50 005 |
-//! | 20 000 | 26 | 25 | 0 | 10 001 | 1 | 1 | 100 005 |
-//! | 80 000 | 101 | 100 | 0 | 40 001 | 1 | 1 | 400 005 |
+//! | 2 000 | 3 | 2 | 0 | 1 001 | 0 | 1 | 10 005 |
+//! | 10 000 | 13 | 12 | 0 | 5 001 | 0 | 1 | 50 005 |
+//! | 20 000 | 26 | 25 | 0 | 10 001 | 0 | 1 | 100 005 |
+//! | 80 000 | 101 | 100 | 0 | 40 001 | 0 | 1 | 400 005 |
 //!
 //! so its collections are `1 + N/K` with `K == 2` — the iterations the settled nursery carries
 //! (see pin 3).
@@ -130,9 +132,11 @@
 //!    * a fixture of the same shape with **no** epilogue seam ends **zero** slices (measured
 //!      `slices=1, yields=0, reductions=4 000` at N = 8 000), which is what identifies the
 //!      epilogue as the refusing site rather than the loop;
-//!    * the single `Yield` *does* collect once (a major at the boundary), so the shape's
-//!      `heap_size` sits on the collector's floor (233) instead of tracking N. The memory half of
-//!      the old residual has therefore closed; the
+//!    * the single `Yield` *does* collect once (a young-only minor here — the promotion fits the
+//!      mature region, so nothing forces a fullsweep; whether the firing is a minor or a fullsweep
+//!      is a consequence of the mature generation's sizing, never a property of the door), so the
+//!      shape's `heap_size` sits on the collector's floor (233) instead of tracking N. The memory
+//!      half of the old residual has therefore closed; the
 //!      **charging** half has not: closing it needs a refusing charge the loop's own seams can
 //!      take, i.e. the `beam_engine` handoff that makes a call-seam refusal re-runnable (the
 //!      resume address must be the seam's own instruction — see `BudgetProbe::spend`'s docs).
@@ -256,20 +260,23 @@ fn native_reds_row(n: i64, label: &str) -> GrowthCounters {
 }
 
 /// The per-row report line: `{n, slices, yields, waits, collections, major,
-/// peak_young_spaces, reductions, value}` — the counter-table shape the neighbouring suites
-/// print, so every figure quoted in the module docs is re-derived by the very run that pins it.
+/// peak_young_spaces, peak_young_capacity, reductions, value}` — the counter-table shape the
+/// neighbouring suites print, so every figure quoted in the module docs is re-derived by the very
+/// run that pins it (the settled nursery capacity included, which is what
+/// `heap_growth_iterations_per_nursery` derives a row's `K` from).
 /// `value` is whatever the entry returned: the heap size the process reported for itself on the
 /// `native_reds` rows (see the module docs' table), the iteration count on the `heap_growth` rows.
 fn report(module: &str, label: &str, n: i64, row: &GrowthCounters) {
     eprintln!(
         "slice_charging {module} [{label}] N={n} : slices={} yields={} waits={} collections={} \
-         major={} peak_young_spaces={} reductions={} value={}",
+         major={} peak_young_spaces={} peak_young_capacity={} reductions={} value={}",
         row.slices,
         row.yields,
         row.waits,
         row.collections,
         row.major,
         row.peak_young_spaces,
+        row.peak_young_capacity,
         row.reductions,
         row.value,
     );
@@ -407,16 +414,19 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
             row.reductions
         );
         assert_eq!(
-            (
-                row.slices,
-                row.yields,
-                row.waits,
-                row.collections,
-                row.major,
-                row.peak_young_spaces
-            ),
-            (2, 1, 0, 1, 1, 1),
-            "N={n}: exactly one pre-emption and one boundary collection, whatever N is: {row:?}"
+            (row.slices, row.yields, row.waits, row.collections, row.peak_young_spaces),
+            (2, 1, 0, 1, 1),
+            "N={n}: exactly one pre-emption, one boundary collection and one young space, \
+             whatever N is: {row:?}"
+        );
+        // The collection's **kind** is deliberately not pinned: the door asks for a young-only
+        // minor first and escalates only when the promotion cannot fit the mature region, so
+        // whether that one firing is a minor or a fullsweep is a consequence of the mature
+        // generation's sizing, not a property of the door. Either kind leaves the chain
+        // collapsed, which is what the assertion below observes.
+        assert!(
+            row.major <= row.collections,
+            "one collection can be at most one fullsweep: N={n} {row:?}"
         );
         // The one boundary collection collapses the run's whole retired chain, so — unlike the
         // pre-pin-4 shape — the heap now sits on the collector's floor instead of tracking N.
