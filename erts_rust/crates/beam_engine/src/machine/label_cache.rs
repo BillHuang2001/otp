@@ -158,6 +158,7 @@ const NO_DIGEST: [u8; 16] = [0u8; 16];
 /// runs. A `#[cfg(test)]` constructor ([`LabelMaps::with_capacity`]) narrows it so the
 /// eviction policy is pinnable with a handful of modules.
 pub(crate) const LABEL_MAP_CAPACITY: usize = 32;
+
 /// The identity of one cached label map (see the module docs for why these three
 /// fields are the honest key and why none of them needs a hash).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
