@@ -18,22 +18,24 @@
 //
 // %CopyrightEnd%
 
-//! **Retention accounting**: one snapshot of the runtime's four never-freed storage regions.
+//! **Retention accounting**: one snapshot of the runtime's four storage regions.
 //!
-//! `beam_rt` holds four regions that are allocated but never released for the runtime's
-//! lifetime, and until this module existed not one of them was observable from outside:
+//! `beam_rt` holds four regions whose capacity outlives the call that needed it, and until this
+//! module existed not one of them was observable from outside:
 //!
 //! 1. the **arena** — [`Runtime::arena`], the engine's `MinimalContext` whose `ContextHeap` keeps
 //!    a `Vec<ReservedHeap>` that only ever grows (`beam_engine/src/context.rs`); on the
 //!    `-eval`/table-less route every term and every nested `Machine`'s heap/stack is allocated
-//!    there, through [`Runtime::alloc_words`];
-//! 2. the **pooled BIF heap** — [`Runtime::bif_heaps`], where a growing call *retires* its region
-//!    back into the pool (`crate::context::calls`'s `take_bif_frontier`) instead of reusing it,
-//!    so the pool accumulates regions for the runtime's life;
+//!    there, through [`Runtime::alloc_words`] — the one region with no size policy at all;
+//! 2. the **pooled BIF heap** — [`Runtime::bif_heaps`], a stack of regions that is **depth-sized**
+//!    (`bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` for a nested one) and
+//!    reused across calls, where a growing call *retires* its region back into the pool
+//!    (`crate::context::calls`'s `take_bif_frontier`, which grows geometrically from the region's
+//!    own capacity);
 //! 3. the **`-eval` term store** — [`Runtime::eval_heap`] plus the regions
 //!    [`Runtime::grow_eval_heap`] replaced into [`Runtime::eval_heap_retired`] (the growth doubles
-//!    the capacity and never frees the old region, because a `beam_alloc::Heap` never moves a
-//!    term);
+//!    the capacity, clamped at `MAX_EVAL_HEAP_WORDS` = 256 MiB, and never frees the old region,
+//!    because a `beam_alloc::Heap` never moves a term);
 //! 4. the **escaped off-heap payload store** — [`Runtime::eval_off_heap`], the off-heap table that
 //!    *owns* the payload references every copy onto the store depends on.
 //!
