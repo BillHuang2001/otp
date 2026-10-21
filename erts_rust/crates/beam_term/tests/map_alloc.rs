@@ -37,8 +37,8 @@
 //!    still takes the collecting fallback path and must allocate.
 //! 2. **`write_map` of a 32-pair input allocates exactly one buffer.** The input arity
 //!    alone fixes the layout (dedup can only shrink a <= 32-pair input), so the flat
-//!    branch dedups and sorts **one** `Vec` instead of hash-deduping into one `Vec` and
-//!    collecting a second — and it never calls `erts_map_hash`.
+//!    branch copies the pairs into **one** `Vec`, sorts it and collapses the adjacent
+//!    duplicate runs in place — never hashing a key, never collecting a second buffer.
 //! 3. **No observable change.** The `write_map` output is compared **word for word**
 //!    against `thing::write_flatmap` fed the explicitly deduplicated, sorted pair list,
 //!    and both `write_map` and the reference report the same
@@ -333,7 +333,7 @@ fn a_thirty_two_pair_write_map_allocates_one_buffer() {
 
     eprintln!(
         "map_alloc: write_map(32 pairs) allocations={allocs} bytes={bytes} \
-         (expect the single dedup/sort buffer; the hash-dedup path used two)"
+         (expect the single sort/collapse buffer)"
     );
 
     assert_same_flatmap_block(map, reference, N);
@@ -349,7 +349,7 @@ fn a_thirty_two_pair_write_map_allocates_one_buffer() {
 
     assert_eq!(
         allocs, 1,
-        "the flat branch must allocate exactly the single dedup/sort buffer"
+        "the flat branch must allocate exactly the single sort/collapse buffer"
     );
 }
 

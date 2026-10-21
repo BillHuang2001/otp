@@ -22,8 +22,9 @@
 //! against a **frozen copy of the pre-change builder**, over a corpus shaped like the
 //! maps a compiler builds.
 //!
-//! The point of the exercise is the duplicate-key collapse, which the current
-//! implementation does with a per-insertion linear `eq` scan — O(n²) on both branches.
+//! The point of the exercise is the duplicate-key collapse: the retired builder scans its
+//! buffer on every insertion (O(n²) on both branches), the live one sorts once and
+//! collapses adjacent `eq`-equal runs in one pass.
 //! Both sides here write into the **same pre-allocated buffer** and consume the **same
 //! pre-built `pairs: Vec<(Eterm, Eterm)>`**, so what is timed is the builder itself:
 //! no output allocation, no input construction, no BEAM heap.
@@ -48,7 +49,7 @@
 //! * `maps`          — maps timed in this bucket (per side);
 //! * `live ns/map`   — [`beam_term::map::write_map`];
 //! * `retired ns/map`— the pre-change quadratic builder (the local [`retired`] copy);
-//! * `live/retired`  — ≈ 1.0 while both are the same algorithm; < 1.0 once the fix lands;
+//! * `live/retired`  — < 1.0 where the sort-and-collapse builder is faster;
 //! * `retired/live`  — the same ratio inverted, i.e. the speed-up of the fix.
 
 use std::hint::black_box;
