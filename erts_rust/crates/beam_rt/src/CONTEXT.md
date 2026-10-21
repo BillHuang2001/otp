@@ -191,7 +191,7 @@ region and therefore `AllocType::Standard`, which `context/memory_hook.rs:169-17
 - **`Runtime::eval_off_heap`** (`runtime.rs:352`) owns off-heap payload references; its payload **bytes**
   are visible as `binary`, but the table has no per-entry removal (only `drain_binaries`), so a prune is
   drain → filter → re-push, is budget-gated (`eval/reclaim.rs:186`, 46 422 words) and is **scoped to one
-  nested run's own adoptions** (`evall/reclaim.rs:350`, `Runtime::prune_off_heap`, `runtime.rs:2437`) —
+  nested run's own adoptions** (`eval/reclaim.rs:350`, `Runtime::prune_off_heap`, `runtime.rs:2437`) —
   everything else in it is retained for the runtime's life (`adopt_escaped_binaries`, `:2399-2410`).
 - **Equally uncounted, outside these fields:** the code server's `Arc<Module>` cache (retained for the
   runtime's life, `codeserver.rs:124`; the `code` key reports only the `.beam` **file** sizes,
