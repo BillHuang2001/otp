@@ -84,6 +84,7 @@
 //! | `BEAM_RT_BREADTH_MAX_BYTES=<n>` | skip sources whose file is **larger** than `n` bytes, before the shard/limit filters (the skipped count is always reported) |
 //! | `BEAM_RT_BREADTH_SCHEDULED=1` | drive the **scheduled** (spawn-a-compiler-process) route; `0`/unset is the in-process route; any other value panics |
 //! | `BEAM_RT_BREADTH_PA=a:b:c` | put these directories first on the runtime's code path (one `-pa` group, in the given order): this is how a sweep is run with **the tree's own compiler** (`bootstrap/lib/compiler/ebin:bootstrap/lib/kernel/ebin:bootstrap/lib/stdlib/ebin`) instead of the system one |
+//! | `BEAM_RT_BREADTH_DEADLINE_S=<n>` | the per-child bound (default 900 s): a compile that outlives it is killed and reaped and counted as `timed out (per-source bound)` |
 //! | `BEAM_RT_BREADTH_COMPARE=bytes\|artifact` | the verdict: `bytes` (default) asserts whole-file byte identity against the oracle; `artifact` asks only that an artifact was produced (the tree's OTP-30 compiler legitimately stamps `opcode_max` 183 where OTP 29 stamps 181, so its output can never be byte-identical) and still reports the byte relation, unasserted |
 //!
 //! The corpus is sorted by application then module, so a shard (or a `LIMIT`) is a stable,
@@ -151,6 +152,29 @@ const BANNER: &str = "selfhost breadth";
 /// per-source deadline the corpus measurement quotes: generous for the slowest real source, short
 /// enough that a wedged runtime is reported rather than slept on.
 const SOURCE_DEADLINE: Duration = Duration::from_secs(900);
+
+/// `BEAM_RT_BREADTH_DEADLINE_S=<n>`: the per-child bound, defaulting to [`SOURCE_DEADLINE`].
+///
+/// A sweep whose corpus is *throughput*-limited (a slow compiler, or a runtime that is orders of
+/// magnitude slower than the oracle) needs a bound it chose rather than one it inherited: a
+/// source that outlives it is reported as `timed out (per-source bound)` — a measurement, never a
+/// silent omission — so a shorter bound buys breadth at the cost of an explicit timeout count.
+fn source_deadline() -> Duration {
+    source_deadline_from(std::env::var("BEAM_RT_BREADTH_DEADLINE_S").ok().as_deref())
+}
+
+/// The switch's parsing, split out so the unit tests can pin it without a process-wide environment.
+fn source_deadline_from(value: Option<&str>) -> Duration {
+    match value.map(str::trim) {
+        None | Some("") => SOURCE_DEADLINE,
+        Some(text) => match text.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
+            _ => panic!(
+                "BEAM_RT_BREADTH_DEADLINE_S must be a positive number of seconds, got `{text}`"
+            ),
+        },
+    }
+}
 
 /// How often a running child's exit is polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -697,6 +721,7 @@ fn compile_with_erlc(
     corpus: &Corpus,
     outdir: &Path,
     route: Route,
+    deadline: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut arguments: Vec<&str> = vec!["-o", path_arg(outdir)];
     if route.compiles_in_calling_process() {
@@ -710,7 +735,7 @@ fn compile_with_erlc(
     }
     arguments.push(path_arg(&source.path));
 
-    let probe = run_bounded(erlc, &arguments, SOURCE_DEADLINE)?;
+    let probe = run_bounded(erlc, &arguments, deadline)?;
     if probe.code != Some(0) {
         return Err(reason_of(&probe));
     }
@@ -731,6 +756,7 @@ fn compile_on_route(
     outdir: &Path,
     route: Route,
     pa: &[PathBuf],
+    deadline: Duration,
 ) -> Result<Vec<u8>, String> {
     let expression = compile_expr(source, corpus, outdir, route);
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
@@ -741,7 +767,7 @@ fn compile_on_route(
     argv.push("-noshell".into());
     argv.push("-eval".into());
     argv.push(expression.into());
-    let probe = run_bounded_os(Path::new(BINARY), &argv, SOURCE_DEADLINE)?;
+    let probe = run_bounded_os(Path::new(BINARY), &argv, deadline)?;
     if probe.code != Some(0) {
         return Err(reason_of(&probe));
     }    let artifact = source.artifact(outdir);
@@ -912,6 +938,7 @@ fn sweep_body() {
     let route = route_selection();
     let route_name = route.name();
     let compare = compare_selection();
+    let deadline = source_deadline();
     let compare_name = compare.name();
     let pa = pa_selection();
     let Some(oracle) = support::require_oracle(BANNER) else {
@@ -950,7 +977,7 @@ fn sweep_body() {
         corpus.include_dirs.len(),
         oracle.display(),
         erlc.display(),
-        SOURCE_DEADLINE.as_secs(),
+        deadline.as_secs(),
     );
     for dir in &pa {
         eprintln!("  code path first: {}", dir.display());
@@ -996,7 +1023,7 @@ fn sweep_body() {
         // ---- the oracle's own verdict: the baseline, compiled with this route's option list ----
         let oracle_out = scratch.outdir(source, "oracle");
         let oracle_started = Instant::now();
-        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out, route) {
+        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out, route, deadline) {
             Ok(bytes) => bytes,
             Err(reason) => {
                 eprintln!(
@@ -1013,7 +1040,7 @@ fn sweep_body() {
         // ---- the runtime's verdict, on the selected route, in a runtime of its own ----
         let rust_out = scratch.outdir(source, "rust");
         let route_started = Instant::now();
-        let mine = compile_on_route(source, &corpus, &rust_out, route, &pa);        let route_elapsed = route_started.elapsed();
+        let mine = compile_on_route(source, &corpus, &rust_out, route, &pa, deadline);        let route_elapsed = route_started.elapsed();
         route_wall += route_elapsed;
 
         let mine = match mine {
@@ -1261,6 +1288,17 @@ mod tests {
         for bogus in ["artifacts", "byte", "none", "1"] {
             let panicked = std::panic::catch_unwind(|| compare_from(Some(bogus))).is_err();
             assert!(panicked, "`{bogus}` must panic, not weaken the contract");
+        }
+    }
+
+    #[test]
+    fn the_per_source_deadline_defaults_and_parses() {
+        assert_eq!(source_deadline_from(None), SOURCE_DEADLINE);
+        assert_eq!(source_deadline_from(Some("")), SOURCE_DEADLINE);
+        assert_eq!(source_deadline_from(Some("300")), Duration::from_secs(300));
+        for bogus in ["0", "-1", "abc", "1.5"] {
+            let panicked = std::panic::catch_unwind(|| source_deadline_from(Some(bogus))).is_err();
+            assert!(panicked, "`{bogus}` must panic, not silently bound a run");
         }
     }
 
