@@ -40,7 +40,17 @@ use super::runtime_context::RuntimeContext;
 /// The memo is **direct-mapped**: [`dispatch_slot`] picks the slot, so a collision simply
 /// overwrites and the next call for the evicted key recomputes. A miss can therefore cost a
 /// call (the prologue it rebuilds), never change its answer.
-pub(super) const DISPATCH_MEMO_SLOTS: usize = 8;
+///
+/// The count was **8**, and what that cost is why it grew. A real `compile:file/2` of
+/// `lib/stdlib/src/string.erl` — contract A.9's in-process compile — reaches only **241
+/// distinct keys**, yet paid **1 442 796** memo misses over 4 675 283 `call_bif` entries
+/// (30.86 % of calls), **1 099 752** of them slot *collisions* rather than first uses
+/// (`BEAM_RT_PERF_COUNTERS=1`). Eight slots hold at most eight of 241 keys at a time, so the
+/// hot set evicts itself continuously and each of those misses re-runs the whole prologue (a
+/// registry lookup plus the eleven `needs_*` `binary_search`es). 128 slots is one
+/// power-of-two step that holds a real workload's hot set whole; a collision still only costs
+/// work, never a different answer.
+pub(super) const DISPATCH_MEMO_SLOTS: usize = 128;
 
 /// The slot `(module, function, arity)` is memoized in.
 ///
@@ -49,9 +59,10 @@ pub(super) const DISPATCH_MEMO_SLOTS: usize = 8;
 /// memo lookup it indexes. Hashing the **lengths** alone is not enough: any two same-length keys
 /// collide **by construction** (the initial `module.len()`/`function.len()` mix), so the natural
 /// loop `ets:insert/2` · `ets:lookup/2` — which then costs the whole miss prologue (a registry
-/// lookup, the eleven `needs_*` `binary_search`es and two `String` allocations) on **every**
-/// iteration — is a permanent miss. A collision only ever costs work (a miss recomputes; it can
-/// never change an answer), so spreading same-length keys is behaviour-preserving.
+/// lookup, the eleven `needs_*` `binary_search`es and — on a slot that is still empty — two
+/// `String` allocations) on **every** iteration — is a permanent miss. A collision only ever
+/// costs work (a miss recomputes; it can never change an answer), so spreading same-length keys
+/// is behaviour-preserving.
 pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
     // The 64-bit FNV-1a offset basis and prime.
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -67,12 +78,15 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
     }
     hash = (hash ^ u64::from(arity)).wrapping_mul(PRIME);
     // A fixed avalanche multiplier applied after the fold, then the **high** bits (the ones the
-    // multiply mixes into). `MIX` is a chosen constant, not a derivation: the memo has only
-    // `DISPATCH_MEMO_SLOTS` slots, so with more hot keys than slots *some* pair must share one,
-    // and this is the choice that keeps the crate's measured hot key set — `lists:reverse/1`,
-    // `erlang:length/1`, the `ets:insert/2` · `ets:lookup/2` pair and the `erlang` arithmetic
-    // rows — on distinct slots (the `perf_call` harness rows report them). A collision costs a
-    // recomputed prologue and never a different answer.
+    // multiply mixes into), masked to `DISPATCH_MEMO_SLOTS`. `MIX` is a chosen constant, not a
+    // derivation: the fold leaves the arity in the low bits and mixes the high ones only weakly,
+    // while a direct-mapped memo reads exactly those high bits.
+    //
+    // What it achieves is *measured*, not asserted: `BEAM_RT_PERF_COUNTERS=1` reports this
+    // memo's hit/miss/collision split for a whole run, which is how both the slot count and this
+    // multiplier were chosen. What that split is over the 241 distinct keys a `compile:file/2` of
+    // `string.erl` reaches is [`DISPATCH_MEMO_SLOTS`]'s doc. A collision costs a recomputed
+    // prologue and never a different answer.
     const MIX: u64 = 0xa5d2_b6a8_e9c1_9f9f;
     (hash.wrapping_mul(MIX) >> (64 - DISPATCH_MEMO_SLOTS.trailing_zeros() as u64)) as usize
 }
@@ -199,7 +213,20 @@ pub(super) struct DispatchAnswer {
 /// [`Runtime::registry`]: crate::Runtime
 pub(super) struct DispatchMemo {
     /// The memoized keys, `None` for a slot that has not been used yet.
-    pub(super) slots: [Option<DispatchEntry>; DISPATCH_MEMO_SLOTS],
+    ///
+    /// Each entry is **boxed**, and that is load-bearing rather than stylistic: a
+    /// [`RuntimeContext`] is built **by value** at every nested run (`FunBridge::nested`, the
+    /// blocking `run_export_blocking`/`run_label_blocking`), and those runs nest — the A.9
+    /// in-process compile reaches roughly a hundred Rust frames deep. With the entries inline the
+    /// table is `128 × 80` = 10 KiB **per frame**, so `size_of::<RuntimeContext>()` went from
+    /// 744 bytes to 10 344 and a real `compile:file/2` of `string.erl` overflowed the 2 MiB test
+    /// stack. Boxed, one slot costs a pointer (the table is 1 KiB, so the context stays within
+    /// ~400 bytes of its old size) and a slot is only ever allocated when it is **filled** —
+    /// where the two `String`s it holds were allocated anyway.
+    ///
+    /// A `Box` does not weaken the retag: [`DispatchEntry::retag`] reaches through it to the same
+    /// two buffers, which is what keeps a warm slot's miss allocation-free.
+    pub(super) slots: [Option<Box<DispatchEntry>>; DISPATCH_MEMO_SLOTS],
 }
 
 impl Default for DispatchMemo {
@@ -220,6 +247,29 @@ pub(super) struct DispatchEntry {
     pub(super) arity: u32,
     /// The memoized answer.
     pub(super) answer: DispatchAnswer,
+}
+
+impl DispatchEntry {
+    /// Re-points this entry at `(module, function, arity)` and its `answer`, **reusing** both of
+    /// its `String` buffers.
+    ///
+    /// This is the direct-mapped overwrite's cheap half: the miss prologue has already been paid
+    /// (the registry lookup and the hook roster), and re-tagging costs two `clear` + `push_str`
+    /// pairs, which reallocate **only** when the new name does not fit the retained capacity —
+    /// never for the steady state this exists for, where a slot keeps being claimed by keys of
+    /// similar length. A fresh `to_string()` pair on every collision was the other half of the
+    /// cost of the measured 1 099 752 colliding misses.
+    ///
+    /// It cannot make a hit's answer wrong: [`RuntimeContext::dispatch`]'s hit test compares this
+    /// key field for field, so an entry is only ever *read* through the key it names.
+    fn retag(&mut self, module: &str, function: &str, arity: u32, answer: DispatchAnswer) {
+        self.module.clear();
+        self.module.push_str(module);
+        self.function.clear();
+        self.function.push_str(function);
+        self.arity = arity;
+        self.answer = answer;
+    }
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -250,12 +300,21 @@ impl<'a> RuntimeContext<'a> {
             bif: self.runtime.registry.lookup(module, function, arity),
             hooks: DispatchHooks::of(module, function, arity),
         };
-        self.dispatch_memo.slots[slot] = Some(DispatchEntry {
-            module: module.to_string(),
-            function: function.to_string(),
-            arity,
-            answer,
-        });
+        // A warm slot is **overwritten in place** ([`DispatchEntry::retag`]) instead of being
+        // replaced, so a steady-state miss — a key whose slot another key already claimed —
+        // allocates nothing: the entry's two `String` buffers are refilled where they are. Only a
+        // slot that is still `None` (a context's first use of it) allocates.
+        match &mut self.dispatch_memo.slots[slot] {
+            Some(entry) => entry.retag(module, function, arity, answer),
+            None => {
+                self.dispatch_memo.slots[slot] = Some(Box::new(DispatchEntry {
+                    module: module.to_string(),
+                    function: function.to_string(),
+                    arity,
+                    answer,
+                }));
+            }
+        }
         answer
     }
 
@@ -532,3 +591,200 @@ impl<'a> RuntimeContext<'a> {
         module == "erlang" && matches!((function, arity), ("fun_info", 1) | ("fun_info", 2))
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The memo's slot reuse: a collision costs work, never an answer, and never an allocation
+// ---------------------------------------------------------------------------------------
+
+/// The two properties the direct-mapped overwrite must keep, pinned on a **real** collision.
+///
+/// A collision is the memo's steady state (a real workload reaches a few hundred keys into
+/// [`DISPATCH_MEMO_SLOTS`] slots), so both halves of it are asserted here: the answer may never
+/// come from the *other* key, and the entry must be re-tagged in place
+/// ([`DispatchEntry::retag`]) so a warm slot's miss allocates nothing.
+///
+/// The pair is found by brute force over [`dispatch_slot`], i.e. it is a collision of the
+/// compiled hash rather than a hand-picked one, and it is ordered so the **longer** key fills the
+/// slot first — which is what lets the second dispatch reuse both buffers (a `String` refilled
+/// with something longer than its capacity reallocates, and that is not what this case pins).
+#[cfg(test)]
+mod memo_reuse_tests {
+    use super::*;
+    use crate::config::RuntimeConfig;
+    use crate::runtime::Runtime;
+
+    /// A dispatch answer as a comparable value: `(is-registered, BIF address, hook roster)`.
+    /// The [`BifFn`] is compared by **address**, so two lookups of one key agree.
+    type AnswerShape = (bool, Option<usize>, DispatchHooks);
+
+    /// A memo key.
+    type Key = (&'static str, &'static str, u32);
+
+    /// The candidate keys the colliding pair is searched over: registered `erlang`/`lists`/`ets`/
+    /// `maps`/`records`/`persistent_term`/`binary` names plus names no registry owns, over several
+    /// arities. Fixed and deterministic, so the search's answer is stable.
+    const CANDIDATES: &[Key] = &[
+        ("erlang", "+", 2),
+        ("erlang", "-", 2),
+        ("erlang", "length", 1),
+        ("erlang", "put", 2),
+        ("erlang", "get", 1),
+        ("lists", "reverse", 1),
+        ("lists", "map", 2),
+        ("lists", "member", 2),
+        ("lists", "sort", 1),
+        ("lists", "nope", 1),
+        ("ets", "new", 2),
+        ("ets", "insert", 2),
+        ("ets", "lookup", 2),
+        ("ets", "delete", 2),
+        ("ets", "nope", 2),
+        ("records", "get_definition", 2),
+        ("persistent_term", "get", 1),
+        ("maps", "get", 2),
+        ("maps", "put", 3),
+        ("maps", "nope", 2),
+        ("binary", "copy", 2),
+        ("nosuchmod", "nope", 3),
+        ("erlang", "nope", 0),
+        ("erlang", "nope", 1),
+        ("erlang", "nope", 2),
+    ];
+
+    /// A runtime with the default configuration — the construction every dispatch suite in this
+    /// crate uses.
+    fn runtime() -> Runtime {
+        Runtime::new(RuntimeConfig::default()).expect("the default runtime")
+    }
+
+    /// That answer as a comparable value.
+    fn shape(answer: DispatchAnswer) -> AnswerShape {
+        (
+            answer.bif.is_some(),
+            answer.bif.map(|bif| bif as usize),
+            answer.hooks,
+        )
+    }
+
+    /// The answer the **uncached** prologue produces for `key`: the registry implementation plus
+    /// one fresh evaluation of every `uses_*` predicate — exactly what `dispatch` memoizes.
+    fn uncached(rt: &Runtime, key: Key) -> AnswerShape {
+        shape(DispatchAnswer {
+            bif: rt.registry.lookup(key.0, key.1, key.2),
+            hooks: DispatchHooks::of(key.0, key.1, key.2),
+        })
+    }
+
+    /// Two distinct keys in one slot whose answers differ, the **longer** key first.
+    fn colliding_pair(rt: &Runtime) -> (Key, Key) {
+        for (index, a) in CANDIDATES.iter().enumerate() {
+            for b in &CANDIDATES[index + 1..] {
+                if dispatch_slot(a.0, a.1, a.2) != dispatch_slot(b.0, b.1, b.2) {
+                    continue;
+                }
+                if uncached(rt, *a) == uncached(rt, *b) {
+                    // A pair with one answer could not detect a hit returning the other key's.
+                    continue;
+                }
+                let (a, b) = (*a, *b);
+                return if a.0.len() + a.1.len() >= b.0.len() + b.1.len() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+            }
+        }
+        panic!("the candidate set must contain a colliding pair with different answers");
+    }
+
+    #[test]
+    fn a_colliding_pair_answers_its_own_key_in_alternation() {
+        let mut rt = runtime();
+        let (first, second) = colliding_pair(&rt);
+        let slot = dispatch_slot(first.0, first.1, first.2);
+        assert_eq!(
+            slot,
+            dispatch_slot(second.0, second.1, second.2),
+            "the pair must share a memo slot"
+        );
+        let (want_first, want_second) = (uncached(&rt, first), uncached(&rt, second));
+        assert_ne!(
+            want_first, want_second,
+            "the pair must carry different answers, or the case is vacuous"
+        );
+        let mut ctx = RuntimeContext::new(&mut rt);
+        // Alternating dispatches make every call after the first one a miss on a slot that still
+        // holds the other key, so a hit test weaker than the whole key (the slot alone, the
+        // module alone, the arity alone) answers the other key's implementation here.
+        for round in 0..4 {
+            assert_eq!(
+                shape(ctx.dispatch(first.0, first.1, first.2)),
+                want_first,
+                "round {round}: {}:{}/{} answered the colliding key's shape",
+                first.0,
+                first.1,
+                first.2
+            );
+            assert_eq!(
+                ctx.dispatch_memo.slots[slot]
+                    .as_ref()
+                    .map(|entry| (entry.module.as_str(), entry.function.as_str(), entry.arity)),
+                Some((first.0, first.1, first.2)),
+                "round {round}: the slot names the key it answers"
+            );
+            assert_eq!(
+                shape(ctx.dispatch(second.0, second.1, second.2)),
+                want_second,
+                "round {round}: {}:{}/{} answered the colliding key's shape",
+                second.0,
+                second.1,
+                second.2
+            );
+            assert_eq!(
+                ctx.dispatch_memo.slots[slot]
+                    .as_ref()
+                    .map(|entry| (entry.module.as_str(), entry.function.as_str(), entry.arity)),
+                Some((second.0, second.1, second.2)),
+                "round {round}: the slot names the key it answers"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_slot_is_retagged_without_reallocating() {
+        let mut rt = runtime();
+        let (first, second) = colliding_pair(&rt);
+        let slot = dispatch_slot(first.0, first.1, first.2);
+        let mut ctx = RuntimeContext::new(&mut rt);
+        // An empty slot allocates its two buffers once (at most once per slot per context).
+        ctx.dispatch(first.0, first.1, first.2);
+        let (module_ptr, function_ptr) = {
+            let entry = ctx.dispatch_memo.slots[slot]
+                .as_ref()
+                .expect("the cold miss filled the slot");
+            assert_eq!(
+                (entry.module.as_str(), entry.function.as_str(), entry.arity),
+                (first.0, first.1, first.2),
+                "the filled slot names the key it answers"
+            );
+            (entry.module.as_ptr(), entry.function.as_ptr())
+        };
+        // The colliding key overwrites the entry **in place**: same buffers, new key. The kernel
+        // of the check is the pointer identity — a fresh `to_string()` pair would move both.
+        ctx.dispatch(second.0, second.1, second.2);
+        let entry = ctx.dispatch_memo.slots[slot]
+            .as_ref()
+            .expect("the collision re-tagged the slot");
+        assert_eq!(
+            (entry.module.as_str(), entry.function.as_str(), entry.arity),
+            (second.0, second.1, second.2),
+            "the overwritten slot names the new key"
+        );
+        assert_eq!(
+            (entry.module.as_ptr(), entry.function.as_ptr()),
+            (module_ptr, function_ptr),
+            "the warm slot reused its two `String` buffers, so the miss allocated nothing"
+        );
+    }
+}
+

@@ -775,9 +775,13 @@ fn a_dispatch_memo_slot_collision_cannot_change_an_answer() {
         }
     }
     // A concrete, stable instance of the situation, so the guard below can never pass
-    // vacuously: `erlang:send/2` is registered and needs the delivery hook, while a name no
-    // registry owns shares its slot carrying a completely different answer.
-    assert_eq!(dispatch_slot("erlang", "send", 2), dispatch_slot("nosuchmod", "nope", 3));
+    // vacuously: `records:get_definition/2` is registered and needs the record-source hook while
+    // `lists:reverse/1` is registered and needs no hook at all — two different answers sharing
+    // one slot.
+    assert_eq!(
+        dispatch_slot("records", "get_definition", 2),
+        dispatch_slot("lists", "reverse", 1)
+    );
     assert!(
         !colliding.is_empty(),
         "the probe set must contain a slot collision between two different answers"
@@ -805,25 +809,39 @@ fn a_dispatch_memo_slot_collision_cannot_change_an_answer() {
 fn the_dispatch_memo_stays_correct_under_slot_churn() {
     let mut rt = runtime();
     let mut ctx = RuntimeContext::new(&mut rt);
-    let expected: Vec<AnswerShape> = DISPATCH_PROBE_KEYS
-        .iter()
-        .map(|&key| shape(uncached_dispatch(ctx.runtime, key)))
-        .collect();
     // The probe set is deliberately larger than the memo, so one pass over it evicts and
-    // recomputes continuously and three passes make every hit/miss interleaving occur.
+    // recomputes continuously and three passes make every hit/miss interleaving occur. It is the
+    // probe keys plus one `erlang:+/arity` row per arity (only `+/2` is registered), which both
+    // widens the set past `DISPATCH_MEMO_SLOTS` and keeps a stale answer *detectable*: every
+    // `+/arity` sibling shares two of its three key fields with the registered row, so a hit
+    // decided by anything weaker than the whole key would answer a registered implementation for
+    // an unregistered arity.
+    let mut keys: Vec<(&str, String, u32)> = DISPATCH_PROBE_KEYS
+        .iter()
+        .map(|&(module, function, arity)| (module, function.to_string(), arity))
+        .collect();
+    for arity in 0..=(DISPATCH_MEMO_SLOTS as u32) {
+        if arity != 2 {
+            keys.push(("erlang", "+".to_string(), arity));
+        }
+    }
     assert!(
-        DISPATCH_PROBE_KEYS.len() > DISPATCH_MEMO_SLOTS,
+        keys.len() > DISPATCH_MEMO_SLOTS,
         "the probe set must not fit the memo, or no churn happens"
     );
+    let expected: Vec<AnswerShape> = keys
+        .iter()
+        .map(|(module, function, arity)| {
+            shape(uncached_dispatch(ctx.runtime, (module, function, *arity)))
+        })
+        .collect();
     for pass in 0..3 {
-        for (key, want) in DISPATCH_PROBE_KEYS.iter().zip(&expected) {
-            let got = ctx.dispatch(key.0, key.1, key.2);
+        for ((module, function, arity), want) in keys.iter().zip(&expected) {
+            let got = ctx.dispatch(module, function, *arity);
             assert_eq!(
                 shape((got.bif, got.hooks)),
                 *want,
-                "pass {pass}: {}/{} answer changed under slot churn",
-                key.0,
-                key.1
+                "pass {pass}: {module}:{function}/{arity} answer changed under slot churn"
             );
         }
     }

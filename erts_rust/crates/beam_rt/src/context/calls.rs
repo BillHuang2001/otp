@@ -1105,6 +1105,35 @@ impl<'a> RuntimeContext<'a> {
             && !beam_term::literal::is_literal(term)
     }
 
+    /// The cheap tag pre-check a word must pass before the reference walk spends anything on it —
+    /// either to **visit** it or to push it as a child candidate.
+    ///
+    /// A word that fails it can never lead to a reference, and it is exactly the walk's admission
+    /// test (its old inline form), factored out because the cons spin below asks it per **child**
+    /// word *before* pushing: a rejected child then costs the test alone instead of a push plus a
+    /// pop plus the same test.
+    ///
+    /// Each conjunct rejects a class of word that must never be dereferenced:
+    ///
+    /// * [`beam_term::literal::is_literal`] — a frozen code constant lives in the literal area and
+    ///   can name nothing on this heap. (It is *also* true for a small integer, whose low four bits
+    ///   are all set, so the immediates that dominate a cons spine are rejected on the first test.)
+    /// * [`beam_term::tag::is_term_word`] — a word whose primary tag is `HEADER` is **not a term at
+    ///   all**, yet the frozen `is_boxed`/`is_list` bit tricks are true for it, and its "pointer"
+    ///   can be `NULL` (`THE_NON_VALUE`) or a plausible-looking non-address.
+    /// * the container tricks themselves ([`beam_term::boxed::is_boxed`] /
+    ///   [`beam_term::prelude::is_list`]) — an atom, a pid, a port and `NIL` are neither a boxed
+    ///   term nor a cons cell.
+    ///
+    /// `is_term_word && is_boxed` is [`beam_term::boxed::is_boxed_term`], so this is the same
+    /// predicate the walk applied inline before, with the same three guards in the same meaning.
+    #[inline]
+    fn walk_may_lead_further(word: Eterm) -> bool {
+        !beam_term::literal::is_literal(word)
+            && beam_term::tag::is_term_word(word)
+            && (beam_term::boxed::is_boxed(word) || beam_term::prelude::is_list(word))
+    }
+
     /// Whether anything in the graph rooted at `term` is a **reference** term — the one shape that
     /// must never be moved off the pooled heap.
     ///
@@ -1137,6 +1166,16 @@ impl<'a> RuntimeContext<'a> {
     /// documents at its call site), never a wrong move. A *shared* subgraph is re-walked once per
     /// parent, which costs a bounded constant factor and no allocation.
     ///
+    /// A **cons spine** is the one shape that does not pay the worklist at all. It is the walk's
+    /// common input — a `lists:reverse/1` result, a `lists:foldl/3` accumulator, an iolist — and
+    /// its cells have their two children at the fixed offsets `0` and `1`. So a cell is read
+    /// directly, only a child that could lead further is pushed
+    /// ([`Self::walk_may_lead_further`]), and a CDR that is itself a readable cons cell becomes the
+    /// next iteration of the same loop instead of a worklist round trip: one loop iteration per
+    /// cell instead of a push, a pop and a full admission test per cell. Everything the generic
+    /// step enforces still holds on the spine — the same guards, one budget charge per
+    /// dereferenced object, one visit per object.
+    ///
     /// Literals are skipped: a frozen code constant lives in the literal area and can name nothing
     /// on this heap. So is every word that is **not a readable term** (see *Safety*).
     ///
@@ -1157,66 +1196,91 @@ impl<'a> RuntimeContext<'a> {
         let mut work = Walklist::new();
         let mut budget = WALK_VISIT_BUDGET;
         work.push(term);
-        while let Some(item) = work.pop() {
-            // Three words can reach the worklist without being a readable container, and each is
-            // skipped here so nothing below ever dereferences it.
-            //
-            // * A literal is a frozen code constant, which lives in the literal area and can name
-            //   nothing on this heap.
-            // * An immediate is neither boxed nor a cons.
-            // * A word whose primary tag is `HEADER` is **not a term at all**
-            //   ([`beam_term::tag::is_term_word`]): the frozen `is_boxed`/`is_list` bit tricks are
-            //   also true for it, and `boxed_val`/`ptr_val` of one is `NULL` — the C ABI's
-            //   `THE_NON_VALUE` (`make_header(0, 0)`) is exactly such a word, and it is a shape a
-            //   registered BIF may legitimately return.
-            if beam_term::literal::is_literal(item)
-                || !beam_term::tag::is_term_word(item)
-                || !(beam_term::boxed::is_boxed_term(item) || beam_term::prelude::is_list(item))
-            {
+        while let Some(popped) = work.pop() {
+            // Three kinds of word can reach the worklist without being a readable container, and
+            // each is skipped here so nothing below ever dereferences it: a literal (a frozen code
+            // constant, which names nothing on this heap), an immediate, and a `HEADER`-tagged
+            // word, which is not a term at all ([`Self::walk_may_lead_further`]).
+            if !Self::walk_may_lead_further(popped) {
                 continue;
             }
-            // The address `item`'s pointer bits name, or `None` when no live term can be there —
+            // The address `popped`'s pointer bits name, or `None` when no live term can be there —
             // the same guard the unscanned-root valve applies
             // ([`super::gc::dereferenceable_pointer`]), so the two walks cannot disagree about
             // which words are readable.
-            let Some(address) = super::gc::dereferenceable_pointer(item) else {
+            let Some(address) = super::gc::dereferenceable_pointer(popped) else {
                 continue;
             };
-            let address = address as *const Eterm;
-            #[cfg(test)]
-            notes::note_walk_visit();
-            // The budget is the only bound the walk has (see *The walk*): a forged cycle would
-            // otherwise spin here forever.
-            if budget == 0 {
-                return true;
-            }
-            budget -= 1;
-            if beam_term::prelude::is_list(item) {
+            // Walk the **cons spine** `popped` starts in place (see *The walk*): `item`/`cell` are
+            // the current cell, and the loop advances to the CDR while it is itself a readable cons
+            // cell, so only a spine's non-cons children ever reach the worklist.
+            let mut item = popped;
+            let mut address = address;
+            loop {
+                #[cfg(test)]
+                notes::note_walk_visit();
+                // The budget is the only bound the walk has (see *The walk*): a forged cycle would
+                // otherwise spin here forever. It is charged **per dereferenced object**, exactly
+                // as the generic step charged it, so exhaustion answers the same `true`.
+                if budget == 0 {
+                    return true;
+                }
+                budget -= 1;
+                if !beam_term::prelude::is_list(item) {
+                    let address = address as *const Eterm;
+                    // SAFETY: `item` passed [`Self::walk_may_lead_further`] and is not a cons, so it
+                    // is a boxed **term** word ([`beam_term::boxed::is_boxed_term`]) whose object
+                    // pointer is non-null and aligned; the word at that address is its live header.
+                    unsafe {
+                        let header = *address;
+                        if beam_term::boxed::is_ref_thing_header(header)
+                            || beam_term::boxed::is_external_ref_header(header)
+                        {
+                            return true;
+                        }
+                        // SAFETY: `address` heads the live object `header` names, so
+                        // `for_each_child_slot` visits exactly that shape's term-reference slots —
+                        // offsets relative to the header word, every one in bounds and live. A child
+                        // that cannot lead further is not queued, so every worklist item is a
+                        // candidate for a visit rather than something to be re-rejected.
+                        beam_term::layout::for_each_child_slot(header, address, |offset| {
+                            let child = *address.add(offset);
+                            if Self::walk_may_lead_further(child) {
+                                work.push(child);
+                            }
+                        });
+                    }
+                    break;
+                }
+                let cell = address as *const Eterm;
                 // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
                 // non-null and aligned, so the two words at that address are its live `car` and
                 // `cdr`.
-                unsafe {
-                    work.push(*address);
-                    work.push(*address.add(1));
+                let (car, cdr) = unsafe { (*cell, *cell.add(1)) };
+                // The CAR is a candidate only when it could lead further: a spine of immediates —
+                // the accumulator this walk is called for — pushes nothing at all.
+                if Self::walk_may_lead_further(car) {
+                    work.push(car);
                 }
-                continue;
-            }
-            // SAFETY: `item` is a boxed **term** word ([`beam_term::boxed::is_boxed_term`]) whose
-            // object pointer is non-null and aligned, so the word at that address is its live
-            // header.
-            unsafe {
-                let header = *address;
-                if beam_term::boxed::is_ref_thing_header(header)
-                    || beam_term::boxed::is_external_ref_header(header)
-                {
-                    return true;
+                // The CDR: stay on the spine when it is itself a readable cons cell, and otherwise
+                // queue it only when it could lead further — an improper tail (a boxed object) is a
+                // real candidate, an immediate or a literal is not.
+                if Self::walk_may_lead_further(cdr) {
+                    if beam_term::prelude::is_list(cdr) {
+                        match super::gc::dereferenceable_pointer(cdr) {
+                            Some(next) => {
+                                item = cdr;
+                                address = next;
+                                continue;
+                            }
+                            // A `LIST` word whose cell pointer is `NULL` or mis-aligned is skipped,
+                            // which is exactly what the admission step above would do with it.
+                            None => break,
+                        }
+                    }
+                    work.push(cdr);
                 }
-                // SAFETY: `address` heads the live object `header` names, so `for_each_child_slot`
-                // visits exactly that shape's term-reference slots — offsets relative to the
-                // header word, every one in bounds and live.
-                beam_term::layout::for_each_child_slot(header, address, |offset| {
-                    work.push(*address.add(offset));
-                });
+                break;
             }
         }
         false
@@ -2192,3 +2256,175 @@ mod tests;
 #[cfg(test)]
 #[path = "calls/alias_tests.rs"]
 mod alias_tests;
+
+// ---------------------------------------------------------------------------------------
+// The reference walk's CONS SPINE — the shape it is called for most
+// ---------------------------------------------------------------------------------------
+
+/// The walk's cons-spine fast path, on the shapes a registered BIF really returns.
+///
+/// A spine of cons cells (a `lists:reverse/1` result, a `lists:foldl/3` accumulator, an iolist)
+/// is the walk's common input: 5 000 cells of immediates is one measured container result's
+/// shape, scaled up. Three properties are pinned here, all of them **answers**, plus the visit
+/// accounting the walk's other suite pins at 27 objects for the `etf_roundtrip` payload:
+///
+/// * a long spine of immediates holds **no** reference, terminates, and pays exactly one visit
+///   (one budget charge) per cons cell;
+/// * an **improper** tail — a CDR that is not a cons cell — is still visited, and a reference
+///   reachable through it is still found;
+/// * a reference in a spine's **CAR** is found too (the CAR is pushed only when it could lead
+///   further, which is what the cheap pre-check is for).
+///
+/// The terms are built with the public `beam_alloc`/`beam_term` writers, the way the walk's
+/// `src/context/tests.rs` suite builds them; the reference block is the frozen M1 internal
+/// reference (`[make_header(3, REF_SUBTAG), 0, 0, id]`, exactly what
+/// [`beam_term::boxed::write_internal_ref`] writes) written through the safe initialised-prefix
+/// view, because this crate is `#![deny(unsafe_code)]`.
+#[cfg(test)]
+mod cons_spine_tests {
+    use super::*;
+    use beam_term::make_small;
+    use beam_term::prelude::make_header;
+
+    /// The spine length: long enough that the worklist design shows, short enough to stay a unit
+    /// test (it is 5 000 cons cells = 10 000 heap words).
+    const SPINE_CELLS: i64 = 5_000;
+
+    /// The frozen M1 internal-reference block for `id`, through the safe initialised-prefix view
+    /// of the heap — the same construction `src/context/tests.rs` uses, so both suites walk the
+    /// identical term.
+    fn internal_reference(heap: &mut beam_alloc::Heap, id: i64) -> Eterm {
+        let words = beam_term::prelude::INTERNAL_REF_WORDS;
+        heap.tuple(&vec![beam_term::prelude::NIL; words - 1])
+            .expect("the reference's words fit");
+        let base = {
+            let block = heap.used_words_mut();
+            assert_eq!(
+                block.len(),
+                words,
+                "the reference block is the whole used prefix"
+            );
+            block[0] = make_header(words - 1, beam_term::prelude::REF_SUBTAG);
+            block[1] = make_small(0); // node: the local node
+            block[2] = make_small(0); // serial: one id space in M1
+            block[3] = make_small(id); // id
+            block.as_mut_ptr()
+        };
+        beam_term::prelude::make_boxed(base)
+    }
+
+    /// A spine of `cells` cons cells over immediates, ending in the tail `tail`.
+    fn spine(heap: &mut beam_alloc::Heap, cells: i64, tail: Eterm) -> Eterm {
+        let mut list = tail;
+        for index in (0..cells).rev() {
+            list = heap
+                .cons(make_small(index), list)
+                .expect("the spine's next cell fits");
+        }
+        list
+    }
+
+    #[test]
+    fn a_long_spine_of_immediates_holds_no_reference_and_visits_each_cell_once() {
+        let mut heap = beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let list = spine(&mut heap, SPINE_CELLS, beam_term::prelude::NIL);
+        notes::reset();
+        assert!(
+            !RuntimeContext::graph_holds_reference(list),
+            "a spine of small integers holds no reference"
+        );
+        assert_eq!(
+            notes::walk_snapshot(),
+            notes::WalkCounts {
+                calls: 1,
+                // One visit (one budget charge) per **dereferenced object**: the spine has
+                // exactly `SPINE_CELLS` cons cells, and `NIL` is an immediate that is never
+                // pushed, let alone visited.
+                visits: SPINE_CELLS as usize,
+                hash_inserts: 0,
+                spills: 0,
+            },
+            "the spine is walked one cell at a time, hash-free and without spilling"
+        );
+    }
+
+    #[test]
+    fn an_improper_tail_terminates_and_is_still_visited() {
+        let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+        // `[1, 2 | {3, 4}]`: the CDR of the last cell is a tuple, not a cons cell.
+        let tuple = heap
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the improper tail");
+        let list = spine(&mut heap, 2, tuple);
+        notes::reset();
+        assert!(
+            !RuntimeContext::graph_holds_reference(list),
+            "an improper tail of immediates holds no reference"
+        );
+        assert_eq!(
+            notes::walk_snapshot().visits,
+            3,
+            "two cons cells plus the tuple: the tail is a candidate and is visited"
+        );
+    }
+
+    #[test]
+    fn a_reference_reachable_through_a_spines_tail_is_found() {
+        let mut heap = beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let reference = internal_reference(&mut heap, 11);
+        let list = spine(&mut heap, SPINE_CELLS, reference);
+        assert!(
+            RuntimeContext::graph_holds_reference(list),
+            "the reference at the end of the spine is found"
+        );
+        // The improper shape the same spine takes when the tail is a container holding the
+        // reference: `[… | {ref, 0}]`.
+        let mut boxed_tail_heap =
+            beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let reference = internal_reference(&mut boxed_tail_heap, 12);
+        let tuple = boxed_tail_heap
+            .tuple(&[reference, make_small(0)])
+            .expect("the improper tail over the reference");
+        let improper = spine(&mut boxed_tail_heap, SPINE_CELLS, tuple);
+        assert!(
+            RuntimeContext::graph_holds_reference(improper),
+            "a reference one container down an improper tail is found"
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_spines_car_is_found() {
+        let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+        let reference = internal_reference(&mut heap, 13);
+        // `[[ref, 0], 1, 2]`: the reference sits two levels down a CAR, so it is only reachable
+        // through the worklist the spine queues its non-immediate CARs on.
+        let inner = heap
+            .cons(reference, beam_term::prelude::NIL)
+            .expect("the inner cons over the reference");
+        let list = spine(&mut heap, 3, beam_term::prelude::NIL);
+        let with_car = heap
+            .cons(inner, list)
+            .expect("the spine's head over the inner cons");
+        assert!(
+            RuntimeContext::graph_holds_reference(with_car),
+            "a reference in a spine's CAR is found"
+        );
+        // A `LIST` word whose cell pointer is `NULL` is skipped rather than dereferenced, in the
+        // CDR position the spine advances along and in the CAR position it queues.
+        let null_list = Eterm::from_raw(1);
+        let null_cdr = heap
+            .cons(make_small(1), null_list)
+            .expect("a cons over a NULL-cell list word");
+        assert!(
+            !RuntimeContext::graph_holds_reference(null_cdr),
+            "a list word with a NULL cell pointer is skipped in the CDR position"
+        );
+        let null_car = heap
+            .cons(null_list, beam_term::prelude::NIL)
+            .expect("a cons whose car is a NULL-cell list word");
+        assert!(
+            !RuntimeContext::graph_holds_reference(null_car),
+            "a list word with a NULL cell pointer is skipped in the CAR position"
+        );
+    }
+}
