@@ -895,6 +895,54 @@ fn apply_plus_value(builder: &mut Builder, switch: &str, value: &str) -> Result<
             builder.perf_map.set_directory(value.to_string());
             builder.preserve("+JPperfdirectory", value);
         }
+        // The rest of the `+s*` scheduler sub-parameter family (`erl_init.c:1922-2210`), each
+        // with the value grammar the C gives it. The validation never changes the effect
+        // (none of these is modelled): the pair is preserved verbatim either way.
+        //
+        // `+scl`/`+spp`/`+sub` — the three scheduler booleans (`:1988-2001`, `:2043-2053`,
+        // `:2064-2082`): exactly `true`/`false`.
+        "+scl" | "+spp" | "+sub" => {
+            flags::parse_scheduler_boolean(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+sws`/`+swt`/`+swct` — the three named scheduler tuning families (`:2084-2121`):
+        // the wakeup strategy, the wakeup threshold and the wake-cleanup threshold, each a
+        // closed symbolic set.
+        "+sws" => {
+            flags::parse_wakeup_strategy(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        "+swt" => {
+            flags::parse_wakeup_threshold(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        "+swct" => {
+            flags::parse_wake_cleanup_threshold(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+stbt` — the same nine bind types as `+sbt` (`:2055-2062` calls the same
+        // `erts_init_scheduler_bind_type_string`), so the one table is reused; only an
+        // `invalid type` result is fatal there (`not supported`/`no cpu topology` pass).
+        "+stbt" => {
+            flags::parse_sbt("+stbt", value)?;
+            builder.preserve("+stbt", value);
+        }
+        // `+sss`/`+sssdcpu`/`+sssdio` — the suggested thread stack sizes (`:2163-2204`):
+        // `atoi` then `20..=8192` kilo words.
+        "+sss" | "+sssdcpu" | "+sssdio" => {
+            flags::parse_sched_thread_stack_size(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+sfwi N` — the forced-wakeup interval (`:2206-2216`): `strtol` + `errno`, and a
+        // negative result is refused (`+sfwi -1` exits 1, `+sfwi x` exits 0).
+        "+sfwi" => {
+            flags::parse_forced_wakeup_interval(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+secio V` — **no validation at all**, and deliberately so: the C reads the value
+        // with `get_arg` only to discard it ("ignore argument, eager check io no longer used",
+        // `:2037-2041`), so `+secio bogus` exits 0 in the oracle.
+        "+secio" => builder.preserve(switch, value),
         // `+SP`/`+SDPcpu` — the scheduler **percentage** switches (`early_init`,
         // `:955-1022`): the `+S`-shaped `sscanf` cascade whose only test is negativity, with no
         // upper bound (`+SP 50`, `+SP 100:100` and `+SP :3` are fine; `+SP -1` is not).
@@ -3485,6 +3533,17 @@ mod tests {
             ("+SDcpu", "64", "1025"),
             ("+SDPcpu", "50:25", "-1"),
             ("+SDio", "64", "0"),
+            ("+scl", "true", "bogus"),
+            ("+spp", "false", "1"),
+            ("+sub", "true", "black"),
+            ("+sws", "legacy", "turbo"),
+            ("+swt", "very_high", "turbo"),
+            ("+swct", "very_lazy", "100"),
+            ("+stbt", "tnnps", "bogus"),
+            ("+sss", "20", "19"),
+            ("+sssdcpu", "8192", "8193"),
+            ("+sssdio", "64", "0"),
+            ("+sfwi", "100", "-1"),
         ];
         for &(switch, accepted, refused) in rows {
             let separated = [switch, accepted];
@@ -3508,6 +3567,12 @@ mod tests {
                     "{args:?}"
                 );
                 assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            }
+        }
+        // `+secio`'s value is read and **discarded** by the C, so it accepts anything.
+        for value in ["bogus", "true", "0"] {
+            for args in [vec!["+secio", value], vec![&*format!("+secio{value}")]] {
+                assert!(parse_args(&args).is_ok(), "{args:?}");
             }
         }
         // `+SDcpu`'s non-positive halves are offsets from the default, not refusals

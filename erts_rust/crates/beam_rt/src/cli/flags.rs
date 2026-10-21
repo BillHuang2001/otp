@@ -454,6 +454,99 @@ pub(super) fn parse_busy_wait_threshold(switch: &str, value: &str) -> Result<()>
     }
 }
 
+/// `+scl` / `+spp` / `+sub <bool>` — the three scheduler **boolean** sub-parameters
+/// (`erl_init.c:1988-2001` for `+scl`, `:2043-2053` for `+spp`, `:2064-2082` for `+sub`): each
+/// one `sys_strcmp`s the value against the two literals, so the accepted set is closed and
+/// exact — `+scl bogus`, `+scl TRUE` and `+scl 1` are all refused (verified: exit 1).
+pub(super) fn parse_scheduler_boolean(switch: &str, value: &str) -> Result<()> {
+    if matches!(value, "true" | "false") {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// The two `+sws` wakeup strategies (`erts_sched_set_wakeup_other_type`,
+/// `erts/emulator/beam/erl_process.c:5835-5849`).
+pub(super) const SCHEDULER_WAKEUP_STRATEGIES: [&str; 2] = ["default", "legacy"];
+
+/// `+sws <strategy>` — the scheduler wakeup strategy (`erl_init.c:2110-2121`): exactly
+/// [`SCHEDULER_WAKEUP_STRATEGIES`], anything else is `EINVAL` + usage (exit 1).
+pub(super) fn parse_wakeup_strategy(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKEUP_STRATEGIES.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// The five `+swt` wakeup thresholds (`erts_sched_set_wakeup_other_threshold`,
+/// `erts/emulator/beam/erl_process.c:5813-5833`) — the `very_low..very_high` family, **not**
+/// the `very_long..none` spin-count names `+sbwt` takes.
+pub(super) const SCHEDULER_WAKEUP_THRESHOLDS: [&str; 5] =
+    ["very_high", "high", "medium", "low", "very_low"];
+
+/// `+swt <threshold>` — the scheduler wakeup threshold (`erl_init.c:2098-2108`): symbolic only,
+/// so a number (`+swt 100`) and a spin-count name (`+swt very_long`) are both refused.
+pub(super) fn parse_wakeup_threshold(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKEUP_THRESHOLDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// The five `+swct` wake-cleanup thresholds (`erts_sched_set_wake_cleanup_threshold`,
+/// `erts/emulator/beam/erl_process.c:5891-5907`).
+pub(super) const SCHEDULER_WAKE_CLEANUP_THRESHOLDS: [&str; 5] =
+    ["very_lazy", "lazy", "medium", "eager", "very_eager"];
+
+/// `+swct <threshold>` — the thread-progress wake-cleanup threshold (`erl_init.c:2084-2096`):
+/// symbolic only, exactly [`SCHEDULER_WAKE_CLEANUP_THRESHOLDS`].
+pub(super) fn parse_wake_cleanup_threshold(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKE_CLEANUP_THRESHOLDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// `ERTS_SCHED_THREAD_MIN_STACK_SIZE` (`erts/emulator/beam/erl_process.h:118`) — in kilo words.
+pub(super) const SCHEDULER_MIN_STACK_SIZE: i64 = 20;
+/// `ERTS_SCHED_THREAD_MAX_STACK_SIZE` (`erts/emulator/beam/erl_process.h:119`) — in kilo words.
+pub(super) const SCHEDULER_MAX_STACK_SIZE: i64 = 8_192;
+
+/// `+sss` / `+sssdcpu` / `+sssdio <kilo words>` — the suggested scheduler-thread stack sizes
+/// (`erl_init.c:2163-2204`): the value is `atoi`ed (so a trailing suffix is ignored and junk is
+/// `0`) and must land in `[ERTS_SCHED_THREAD_MIN_STACK_SIZE,
+/// ERTS_SCHED_THREAD_MAX_STACK_SIZE]`, i.e. `20..=8192`.
+///
+/// The C stores the `atoi` result in an `int`, so the reader is narrowed to 32 bits exactly as
+/// [`parse_ets_tables`]'s is.
+pub(super) fn parse_sched_thread_stack_size(switch: &str, value: &str) -> Result<()> {
+    let size = i64::from(atoi(value) as i32);
+    if (SCHEDULER_MIN_STACK_SIZE..=SCHEDULER_MAX_STACK_SIZE).contains(&size) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// `+sfwi <interval>` — the run-queue-supervision forced-wakeup interval
+/// (`erl_init.c:2206-2216`): `strtol(arg, NULL, 10)` with the `errno`/negative test.
+///
+/// `strtol` leaves `errno` alone when it converts **nothing**, so a non-numeric value is the
+/// C's `0` and is accepted (`+sfwi x` exits 0); a negative value (`+sfwi -1`) and an
+/// out-of-range one (`errno == ERANGE`) are refused.
+pub(super) fn parse_forced_wakeup_interval(switch: &str, value: &str) -> Result<()> {
+    match strtol10(value) {
+        Some(interval) if interval >= 0 => Ok(()),
+        // No conversion at all: `strtol` answers `0` with `errno` untouched.
+        None if scan_int(value).is_none() => Ok(()),
+        _ => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
 /// `+SP <percent>[:<percent>]` and `+SDPcpu <percent>[:<percent>]` — the normal- and dirty-CPU
 /// scheduler **percentages** (`erl_init.c:955-1022` for `+SP`, `:1000-1022` for `+SDPcpu`):
 /// the same `sscanf("%d:%d")` → `sscanf(":%d")` cascade as `+S`, but the only test is
