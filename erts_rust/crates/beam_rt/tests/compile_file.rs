@@ -45,6 +45,11 @@
 //!   `compile:file/2`, that the artifact exists, that it is **byte-for-byte** identical to an
 //!   oracle run with the **identical** option list, and that its `Code` chunk matches
 //!   `erlc +deterministic` (through `beam_lib:chunks/2`).
+//! * `a_clause_head_with_256_variable_bitstring_segments_compiles_in_process` is the
+//!   **deep-nesting regression**: a generated module whose clause head carries 256 variable 8-bit
+//!   segments nests `beam_core_to_ssa`'s match-tree recursion ≈ 1 000 fun applications deep, which
+//!   used to overflow the driver's default thread stack and abort the runtime. It asserts the
+//!   compile completes, that the binary is non-empty, and that the answer is the oracle's.
 //!
 //! A real divergence fails the suite. A missing toolchain (`erl`/`erlc`) is a **loud** skip
 //! (`support::require_oracle` / `support::skip_loudly`), never a silent pass.
@@ -822,6 +827,117 @@ fn a_real_stdlib_module_artifact_is_byte_identical_to_the_oracles() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Test 6: the deep-nesting regression — a long bitstring clause head
+// ---------------------------------------------------------------------------------------
+
+/// How many **variable** 8-bit segments the generated clause head carries.
+///
+/// 256 is *over* the threshold that used to abort the runtime; 224 is *under* it. The compile
+/// builds `beam_core_to_ssa`'s match tree with one Erlang-level fun application per decision-tree
+/// level (`match/4` via `lists:foldr/3`, `match_con/5` and `do_match_value/5` via
+/// `lists:mapfoldl/3`), and every one of those is a **nested engine run on the calling thread**
+/// (`src/context/bridges.rs::FunBridge::nested` → `src/context/execution.rs::apply_fun` →
+/// `src/context/pump.rs::run_label_blocking`) costing ≈ 8.4 KB of OS thread stack. At 256
+/// segments the nesting is ≈ 996 levels — exactly Rust's default 8 MiB main-thread stack — so the
+/// compile ended in `fatal runtime error: stack overflow, aborting` (SIGABRT, exit 134) instead of
+/// a `.beam`. The driver now runs on the explicitly sized stack `src/main.rs` documents
+/// (`MAIN_STACK_BYTES`), which is what makes this test pass.
+///
+/// This is a **regression test for that bound**, not for the threshold arithmetic: it asserts the
+/// observable result of a compile that the runtime could not complete at all before.
+const DEEP_HEAD_SEGMENTS: usize = 256;
+
+/// The generated source: `deep_bits:f/1` whose first clause head is one bitstring pattern of
+/// [`DEEP_HEAD_SEGMENTS`] variable 8-bit segments, plus a catch-all so the module is total.
+///
+/// It is written into the test's own scratch directory, never committed as a fixture — the
+/// segment count is the parameter under test.
+fn deep_head_source() -> String {
+    let segments: Vec<String> = (0..DEEP_HEAD_SEGMENTS)
+        .map(|index| format!("V{index}:8"))
+        .collect();
+    format!(
+        "-module(deep_bits).\n-export([f/1]).\n\nf(<<{}>>) -> ok;\nf(_) -> no.\n",
+        segments.join(",")
+    )
+}
+
+/// `compile:file(Src, [binary, deterministic, no_docs, no_spawn_compiler_process])` over the
+/// generated module, reporting the *observable* result — `{ok, Module, Size}` — rather than the
+/// whole binary (the suite's differential is the module name and the size, and the oracle's
+/// `RET` line is compared verbatim below).
+fn deep_head_probe(src: &Path) -> String {
+    format!(
+        "Rc = compile:file({}, [binary, deterministic, no_docs, no_spawn_compiler_process]),\n\
+         io:format(\"RET ~p~n\", [case Rc of {{ok,M,B}} -> {{ok,M,byte_size(B)}}; O -> O end]),\n\
+         halt(0).",
+        literal(src)
+    )
+}
+
+/// **The deep-nesting regression.** Compiling a module whose clause head carries 256 variable
+/// 8-bit bitstring segments drives `beam_core_to_ssa`'s match-tree recursion ≈ 1 000 nested
+/// fun-application levels deep. Before the driver was given its own sized stack that compile
+/// aborted the whole runtime with `fatal runtime error: stack overflow, aborting` (SIGABRT,
+/// exit 134) — so this test would have caught it: it asserts the compile **completes**, that the
+/// answer is `{ok, deep_bits, _}` with a non-empty binary, and (with a live oracle) that the
+/// oracle's own answer to the identical probe is the same.
+///
+/// Cost on this host: ≈ 1.7 s of `beam_rt` (debug runtime) plus ≈ 0.3 s of the oracle — well
+/// inside [`support::PROBE_TIMEOUT`].
+#[test]
+fn a_clause_head_with_256_variable_bitstring_segments_compiles_in_process() {
+    let dir = TempDir::new("deep_head");
+    let src = dir.0.join("deep_bits.erl");
+    fs::write(&src, deep_head_source()).expect("write the generated deep-head module");
+
+    let expr = deep_head_probe(&src);
+    let ours = beam_rt_eval(&expr);
+    assert_eq!(
+        ours.code, 0,
+        "the deep-head compile must complete (a stack overflow aborts the process with 134): \
+         exit {} — {}",
+        ours.code, ours.err
+    );
+    let line = ours.out.lines().next().unwrap_or_default().to_string();
+    let bytes = line
+        .strip_prefix("RET {ok,deep_bits,")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .and_then(|size| size.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "the deep-head compile must answer `RET {{ok,deep_bits,<size>}}`, got {line:?} \
+                 (stderr {:?})",
+                ours.err
+            )
+        });
+    assert!(
+        bytes > 0,
+        "the deep-head compile must produce a non-empty binary, got {bytes} bytes"
+    );
+    eprintln!(
+        "deep-head compile ({DEEP_HEAD_SEGMENTS} variable 8-bit segments): {line} \
+         ({} bytes)",
+        bytes
+    );
+
+    let Some(oracle) = support::require_oracle("compile_file") else {
+        return;
+    };
+    let theirs = oracle_eval(&oracle, &expr);
+    assert_eq!(
+        theirs.code, 0,
+        "the oracle must compile the same generated module: exit {} — {}",
+        theirs.code, theirs.err
+    );
+    assert_eq!(
+        line, theirs.out,
+        "the deep-head compile must agree with the oracle's (identical option list)"
+    );
+    eprintln!("deep-head compile agrees with the oracle");
+}
+
+// ---------------------------------------------------------------------------------------
 // Current state
 // ---------------------------------------------------------------------------------------
 //
@@ -837,3 +953,9 @@ fn a_real_stdlib_module_artifact_is_byte_identical_to_the_oracles() {
 // `epp:parse_file/3` read path, which answers exactly the oracle's `{FormCount, Tags}`) and
 // `a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle` (the E0 compile) pin it
 // on both execution tiers.
+//
+// The deep-nesting regression (`a_clause_head_with_256_variable_bitstring_segments_compiles_in_process`)
+// is the *bound* on the nested-run seam: the match-tree recursion of a long bitstring clause head
+// nests ≈ 1 000 fun applications and used to overflow the driver's default 8 MiB thread stack; the
+// driver now runs on the sized stack `src/main.rs` documents. The seam is still unbounded — raising
+// the bound only moves the abort point past every legitimate workload in the installed corpus.
