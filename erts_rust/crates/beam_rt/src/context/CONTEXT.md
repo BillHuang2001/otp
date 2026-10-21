@@ -346,9 +346,9 @@ That peak's attribution:
   the flag's RSS effect exists only once the eval store would have filled.
 - **The `[rt-mem] exit` census alone is misleading.** For cerl_clauses it reads
   `arena_words = 5 133 195` (~39 MB) and `bif_words = 20 185 088` (161 MB of *reservation*, with
-  `bif_peak_used_words = 12 953`), and it can name neither mechanism above: the glibc heap is outside
-  `beam_alloc` entirely, and the eval store's figures are capacity over `AllocType::Standard` regions,
-  which the `MemoryHook` excludes from `erlang:memory(emulator)`.
+  `bif_peak_used_words = 12 953`), and neither resident mechanism above is attributable from it: the
+  glibc heap is outside `beam_alloc` entirely, and the eval store is reported as **capacity**
+  (`eval_heap_words` + `eval_heap_retired_regions`), not as touched pages.
 
 ### Reclaim: what is sound without a collection, and what is not
 Ranked by the measured peak, and all of it **`beam_rt`-owned** (`Runtime::bif_heaps`, `bif_heap_words`,
