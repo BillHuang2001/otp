@@ -316,7 +316,11 @@ is), and a freed segment keeps whatever pages its previous owner dirtied while i
   `core`/`state` submodules), `mbc`, `mseg`, `heap`, `binary` (incl. its `growth` submodule). Every `unsafe fn` has a `# Safety`
   section and every `unsafe` block a `// SAFETY:` rationale. `size_class`, `registry`, `stats`,
   `strategy`, `policy`, `refcount`, `error` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
-- **Carriers come from the OS via `mseg` (mmap)**, are page-aligned, and `munmap`'d on free/drop.
+- **Carriers come from the OS via `mseg` (mmap) and are page-aligned.** Release policy: a *slab* carrier is
+  never released (drained carriers are retained for the allocator's lifetime, a documented M1 policy); a
+  dedicated (large) carrier is released on the block's free and a fully-free multi-block carrier on its last
+  free — both into the mseg reuse cache (up to `max_cache_size` = 10 segments, FIFO eviction), so the mapping
+  survives until the cache evicts it and only then `munmap`s.
 - **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — nothing
   else. Adding a dependency edge requires reporting to `../`.
 - **`Heap` is fixed-capacity by contract** — never reallocate (workspace §2).
