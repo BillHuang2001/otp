@@ -249,6 +249,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
   both survive it. The two off-heap rosters are released only by a host call to
   `Machine::retain_refc_binaries`.
+  **Nothing is ever released or shrunk**: the register/FR files are `fill_nil`-refilled only over their *used
+  extent* (never `truncate`d, never reallocated once the length matches), `stack`/`frames`/`catch_frames`/
+  `raise_snapshot`/`args_scratch`/`refc_binaries`/`writable_payloads`/`label_maps.entries` all use
+  `clear`/`truncate`/`pop`, which **keep capacity**, and no `shrink_to_fit`/`shrink_to`/`reserve_exact` exists
+  anywhere in the crate — so a machine's resident footprint is the high-water mark of the heaviest run it has
+  ever executed and only dropping the machine frees it. `Machine::new` itself (`mod.rs`) allocates both
+  1024-word register files (8 KiB each) before the first run.
 
 ## A frame's continuation slot is consumed by whoever follows it
 `Machine::take_continuation` (`frames.rs`) is the **one** read-and-clear: it reads the current frame's
