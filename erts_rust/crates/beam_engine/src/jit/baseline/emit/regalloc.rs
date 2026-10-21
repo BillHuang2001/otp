@@ -144,6 +144,15 @@ use super::{Allocation, CACHE_REGISTERS};
 /// The slots are returned in the registers' **first-appearance** order, so the
 /// physical (`rbp`/`r12`–`r15`) assignment is deterministic and stays stable across an
 /// allocator change; only the *selection* is interval-weighted.
+///
+/// This is the **build-on-demand twin** of [`allocate_registers_with_labels`]: it builds
+/// the module-wide label map itself and then delegates. It has **no production caller** —
+/// the emitter threads the map its compilation entry (`compile_module`/`compile_function`)
+/// already built into [`allocate_registers_with_labels`], so one whole-module build serves
+/// every block, every continuation sub-block and every function of a compilation. This
+/// entry survives for the in-crate unit suites (`emit/spill_tests.rs`,
+/// `emit/liveness_tests.rs` and the `baseline` test modules), which hand it a bare block.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn allocate_registers(
     module: &Module,
     code: &[Instr],
@@ -151,14 +160,16 @@ pub(crate) fn allocate_registers(
     end: usize,
 ) -> Allocation {
     // The `test` shape needs the module-wide label map to know whether a fail label
-    // resolves; build it here (the driver builds the same map once per run, so this
-    // costs no more than an existing per-run step).
+    // resolves, so build it here for a caller that has none.
     let labels = interpreter::build_label_map(module);
     allocate_registers_with_labels(module, &labels, code, start, end)
 }
 
-/// [`allocate_registers`] against an already-built module-wide label map.
-fn allocate_registers_with_labels(
+/// [`allocate_registers`] against an already-built module-wide label map —
+/// **the production entry**: every emitter call site has the map its compilation entry
+/// already built, so the module's label and import tables are built once per compilation
+/// rather than once per block / continuation sub-block.
+pub(crate) fn allocate_registers_with_labels(
     module: &Module,
     labels: &LabelMap,
     code: &[Instr],

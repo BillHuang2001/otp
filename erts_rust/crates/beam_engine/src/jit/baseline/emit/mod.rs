@@ -20,7 +20,9 @@
 
 //! The baseline JIT's emitter: typed IR → x86-64 basic blocks.
 //!
-//! The register allocator ([`allocate_registers`]) and the per-instruction
+//! The register allocator ([`allocate_registers_with_labels`], fed the module-wide label map
+//! the compilation entry already built; [`allocate_registers`] is its build-on-demand twin
+//! for the in-crate unit tests) and the per-instruction
 //! lowering ([`emit_block`]) — the inline `move`/`swap`/`jump`/metadata set, the
 //! word-level `test` and exact-value `select_val` subsets, the
 //! deopt-and-continue sequence ([`emit_step_and_continue`]) that covers every
@@ -45,8 +47,8 @@
 //! spill writes — so a block that
 //! touches more registers than the cache budget still runs natively instead of
 //! deopting. The residents are the registers with the **longest live intervals**,
-//! chosen by [`allocate_registers`] from the native touches of the block's inlinable
-//! instructions, so the registers that stay live across the most instruction
+//! chosen by [`allocate_registers_with_labels`] from the native touches of the block's
+//! inlinable instructions, so the registers that stay live across the most instruction
 //! boundaries are the ones kept in machine registers; the direct `machine.x`
 //! accesses are the fill/spill for the rest. That is safe precisely because the cache
 //! membership is fixed for the whole block ([`Allocation`]): an x-register is either
@@ -172,6 +174,11 @@ pub(crate) use r#move::{move_shape, MoveShape};
 pub(crate) use regalloc::cacheable_touches;
 #[cfg(test)]
 pub(crate) use regalloc::is_inlined;
+// The register allocator: `allocate_registers_with_labels` is the production entry (every
+// emitter call site threads in the module-wide map its compilation entry already built),
+// `allocate_registers` its build-on-demand twin for the in-crate unit tests.
+pub(crate) use regalloc::allocate_registers_with_labels;
+#[cfg(test)]
 pub(crate) use regalloc::allocate_registers;
 
 // The compilation entry points live in the `compile` submodule; re-export them here
