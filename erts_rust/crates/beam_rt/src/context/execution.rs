@@ -43,7 +43,7 @@ use beam_loader::{Label, Module};
 use beam_process::PendingSignal;
 use beam_term::{Atom, AtomTable, Eterm};
 
-use super::apply::{callee_observes_its_call_site, LocalFunTarget};
+use super::apply::{callee_admission, LocalFunTarget};
 use super::gc;
 use super::runtime_context::RuntimeContext;
 use super::send::SendDestination;
@@ -258,7 +258,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
     ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose
     ///   **own code for the resolved function** reads the call site it runs at
-    ///   ([`callee_observes_its_call_site`]) → `Ok(None)`,
+    ///   ([`callee_admission`]) → `Ok(None)`,
     ///   whether it was already cached or loaded on demand by this very call — the guard is
     ///   applied to both paths, so the answer never depends on *when* the module was cached
     ///   (the seam is idempotent, see the note at the guard). A **built-in NIF library**
@@ -378,7 +378,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         };
         // An in-machine callee runs under the **caller's** recorded `current_module` (see the
         // NIF exclusion above), so a callee whose own code *reads* that call site
-        // ([`callee_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
+        // ([`callee_admission`]) keeps the synchronous [`Self::call_bif`] path,
         // which enters it through `run_export` and sets the identity correctly. The guard is
         // **module-wide** for `erlang:load_nif/2` (a local call inside the module can reach it,
         // and a local `call` never re-consults this seam) and **per-function** for the two
@@ -437,9 +437,16 @@ impl ExecutionContext for RuntimeContext<'_> {
         // nothing else: a non-built-in module importing `erlang:load_nif/2` keeps the
         // module-wide refusal, since its `load_nif` really does register a library under the
         // module identity.
-        if !crate::native::prim_tty::is_builtin_library(module)
-            && callee_observes_its_call_site(&callee, function_atom, arity)
-        {
+        // The two **pure** halves of that guard chain — the call-site verdict and the export
+        // entry label — are memoized on the callee image's identity
+        // ([`callee_admission`], `ir_cache.rs`), because both are functions of one module's
+        // immutable `ImpT`/`Code`/`ExpT` and the seam runs on **every** cross-module entry
+        // (millions of times in one `compile:file/2`). Everything above stays per-call: the
+        // `host_serves` refusal (its NIF arm flips on a mid-run `erlang:load_nif/2`), the
+        // callee's name lookup and the `prim_tty` exemption below are never memoized — see the
+        // `ir_cache` module docs for why caching the seam's *overall* answer would be wrong.
+        let admission = callee_admission(&callee, function_atom, arity);
+        if !crate::native::prim_tty::is_builtin_library(module) && admission.observes_call_site {
             if crate::debug_trace::enabled() {
                 crate::debug_trace::trace(format_args!(
                     "seam decline [{trace_pid:?}] {module}:{function}/{arity}: observes its call site"
@@ -449,7 +456,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         }
         // Hand back the export entry label the synchronous `run_export` would enter. An export
         // the callee does not have is the synchronous path's `undef`.
-        match callee.export(function_atom, arity) {
+        match admission.label {
             Some(label) => Ok(Some((callee, label))),
             None => {
                 if crate::debug_trace::enabled() {
