@@ -789,10 +789,10 @@ fn a_provably_empty_retired_space_is_reused_instead_of_reallocated() {
 }
 
 /// The growth seam is bounded by the **live-set target the last collection derived**: a nursery
-/// that has collected installs a space no larger than `max(one_step, live_target)`, while still
-/// never installing a space smaller than the current one and never refusing a request that fits.
-/// A fresh nursery — no measured live set yet — keeps the plain curated rule, and a request that
-/// genuinely outgrows the live set still gets its own one-step size (the bound is not a ceiling).
+/// that has collected never installs a space on the doubling's scale, while still never installing
+/// a space the size of the one it replaces and never refusing a request that fits. A fresh nursery
+/// — no measured live set yet — keeps the plain curated rule, and a request that genuinely outgrows
+/// the live set still gets its own one-step size (the bound is not a ceiling).
 #[test]
 fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     let policy = HeapPolicy::default();
@@ -818,9 +818,13 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     );
 
     // ... and a constant request the space already covers would otherwise take the doubling
-    // (`next_words(2 * 610) = 1 598`): the bound caps the fresh space at
-    // `max(one_step, live_target)` — the current capacity itself — so no space above the live
-    // set's own scale is installed.
+    // (`next_words(2 * 610) = 1 598`): the bound narrows the fresh space to
+    // `max(one_step, live_target)` — here the current capacity itself — so nothing on the
+    // doubling's scale is installed. The bound only narrows, though: a growth must still make
+    // **strict progress** (`next_words_above`, the C's "never the same size when *growing*" rule,
+    // `erl_gc.c:310-338`), and since the bound lands exactly on the current capacity the
+    // one-table-step-above size is what gets installed — never a same-size space, which would
+    // append a whole capacity to the chain while granting no room.
     fill(nursery.current_mut());
     let collected = nursery.current().capacity_words();
     assert!(
@@ -831,18 +835,28 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     let installed = nursery.current().capacity_words();
     let one_step = policy.next_words(collected, 0).max(collected);
     assert_eq!(one_step, collected, "the one-step size does not enlarge here");
+    let bounded = one_step.max(live_target);
+    assert_eq!(
+        bounded, collected,
+        "the live-set bound lands on the current capacity, so it can only narrow"
+    );
     assert_eq!(
         installed,
-        one_step.max(live_target),
-        "the bound caps the doubling at `max(one_step, live_target)`"
+        policy.next_words_above(collected),
+        "strict progress outranks the bound's landing point: one growth-table step above the \
+         space that was replaced"
+    );
+    assert!(
+        installed > bounded,
+        "the installed space is larger than the bound's landing point"
     );
     assert!(
         installed < policy.next_words(2 * collected, 0),
         "the doubling the unbounded rule would take was suppressed"
     );
     assert!(
-        installed >= collected,
-        "a growth never installs a space smaller than the one it replaces"
+        installed > collected,
+        "a growth never installs a space the size of (or smaller than) the one it replaces"
     );
     assert!(
         nursery.current().available_words() + nursery.current().used_words() >= collected,
