@@ -260,9 +260,12 @@ pub struct Machine {
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
     pub(crate) context: u32,
-    /// The **label-map cache**: one already-built module-wide label index (plus the
-    /// import table derived from it), for the module this machine most recently
-    /// entered.
+    /// The **label-map cache**: a bounded LRU (`label_cache::LABEL_MAP_CAPACITY`, 32
+    /// entries) of already-built module-wide label indexes (plus the import table derived
+    /// from each), so a re-entered module does not rebuild its own — including the modules
+    /// a run enters as in-machine cross-module callees, which are resolved through
+    /// [`Machine::label_map_arc`] from the module-context registry and re-registered on
+    /// every run because [`Machine::reset`] clears that registry.
     ///
     /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value —
     /// a traversal of every function's label table plus a resolution of the whole
@@ -274,8 +277,9 @@ pub struct Machine {
     /// **Content-keyed, not run-keyed**, so [`Machine::reset`] deliberately does
     /// **not** clear it: a machine that runs one module repeatedly builds its map once.
     /// The key is the module's load-time digest plus its atom-table snapshot plus its
-    /// address — see `label_cache.rs` for why that triple is sound on the bare
-    /// `&Module` route and why a synthetic (all-zero-checksum) module is never cached.
+    /// address — see `label_cache.rs` for why that triple proves image identity, why the
+    /// bare `&Module` route can never stale-hit a recycled address, and why a synthetic
+    /// (all-zero-checksum) module is never cached.
     pub(crate) label_maps: LabelMaps,
     /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
     /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).

@@ -273,7 +273,8 @@ impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
 // It makes the build count observable: a run of a **synthetic** module (no content
 // identity, so `crate::machine::label_cache` never caches it) builds exactly once per
 // entry, and a real `.beam` module builds once on its first entry through a machine and
-// not at all on later ones. Compiled only under `cfg(test)`, so it is
+// not at all on later entries while it stays resident in that machine's LRU. Compiled
+// only under `cfg(test)`, so it is
 // absent from production builds and from the `tests/` integration suites (which
 // link the non-test library) and cannot perturb their timing.
 #[cfg(test)]
@@ -330,7 +331,9 @@ pub(crate) fn build_label_map(module: &Module) -> LabelMap {
     // | `tailcall.beam` | 27 | 193 ns |
     //
     // A build happens once per machine per module, never once per run: `Machine::label_map`
-    // serves it from the one-entry cache in `crate::machine::label_cache` (a synthetic
+    // serves it from the bounded LRU in `crate::machine::label_cache` (`LABEL_MAP_CAPACITY`
+    // entries keyed on the digest + atom snapshot + address, so a nested run alternating an
+    // entry module and its in-machine callees keeps every one of them resident; a synthetic
     // all-zero-checksum image has no content identity and is rebuilt on every entry).
     //
     // The entries come out in **label-id order** within each function: a `BTreeMap`

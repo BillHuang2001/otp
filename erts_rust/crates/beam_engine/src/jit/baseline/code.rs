@@ -558,7 +558,7 @@ impl CompiledModule {
     /// Every x-register any compiled block holds in a machine register (sorted
     /// ascending, deduped across blocks).
     ///
-    /// The allocator ranks by live-interval length ([`allocate_registers`](super::emit)), so this is
+    /// The allocator ranks by live-interval length ([`allocate_registers_with_labels`](super::emit)), so this is
     /// the set of the registers with the longest live intervals rather than the
     /// first-appearing ones; a register **not** in it is addressed directly in
     /// `machine.x`.

@@ -43,7 +43,7 @@ use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, DEFAULT_CAPACITY};
 
 use super::super::code::{CompiledFunction, CompiledModule, Summary};
-use super::{allocate_registers, emit_block, touch};
+use super::{allocate_registers_with_labels, emit_block, touch};
 
 /// Lower every `Function`'s every `Block` of `module` into **one** native artifact.
 ///
@@ -339,7 +339,7 @@ fn emit_sub_blocks(
         if start >= end {
             continue;
         }
-        let allocation = allocate_registers(module, code, start, end);
+        let allocation = allocate_registers_with_labels(module, labels, code, start, end);
         for (x, _) in &allocation.slots {
             touch(&mut summary.highest_cached_register, *x);
             if !summary.cached_registers.contains(x) {
@@ -447,7 +447,7 @@ fn emit_shared_sub_blocks(
         // describe `[start, end)` — the containing block's allocation is indexed from
         // `block.start` and is wrong for it. The touches go to `discard`, so the
         // whole-module summary (built from the IR blocks' own allocations) is unchanged.
-        let allocation = allocate_registers(module, code, start, end);
+        let allocation = allocate_registers_with_labels(module, labels, code, start, end);
         let mut discard: Option<u32> = None;
         let offset = buffer.len();
         emit_block(
@@ -501,7 +501,7 @@ fn emit_function(
             // step handles that address exactly as before.
             continue;
         }
-        let allocation = allocate_registers(module, code, start, end);
+        let allocation = allocate_registers_with_labels(module, labels, code, start, end);
         for (x, _) in &allocation.slots {
             touch(&mut summary.highest_cached_register, *x);
             if !summary.cached_registers.contains(x) {
@@ -778,6 +778,117 @@ mod tests {
             .len()
     }
 
+    /// Append a second, **import-free** function `g/0` to `module`: `Label(3)` ·
+    /// `Label(4)` · `x(0) := 7` · `return`, with its `Block`s, its module-global label
+    /// table and its `Export` filled in.
+    ///
+    /// Its label ids are distinct from `f/0`'s because a label id is module-global, and
+    /// it references no import, so `module.imports` needs no adjustment.
+    fn with_second_function(mut module: Module) -> Module {
+        let code = vec![
+            Instr::Label(Label(3)),
+            Instr::Label(Label(4)),
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        let code_len = code.len();
+        let blocks = vec![
+            Block {
+                label: Label(3),
+                start: 0,
+                end: 1,
+            },
+            Block {
+                label: Label(4),
+                start: 1,
+                end: code_len,
+            },
+        ];
+        let labels = BTreeMap::from([(Label(3), 0), (Label(4), 1)]);
+        let name_atom = module.atom_table.intern("g");
+        module.functions.push(Function {
+            func_label: Label(3),
+            entry_label: Label(4),
+            module: module.name,
+            name: name_atom,
+            arity: 0,
+            code,
+            blocks,
+            labels,
+        });
+        module.exports.push(Export {
+            function: name_atom,
+            arity: 0,
+            label: Label(4),
+        });
+        module
+    }
+
+    /// The module-wide label map is a **pipeline input**, not a per-block product: one
+    /// compilation builds it exactly once, however many functions, IR blocks and
+    /// continuation sub-blocks it lowers.
+    ///
+    /// Pinned by **count only, never timing**, through the `cfg(test)` tally
+    /// `crate::interpreter::label_map_builds`. Before the threading it was one whole-module
+    /// build per block *and* per continuation sub-block — on
+    /// `lib/stdlib/src/ordsets.erl`, 2 033 redundant builds out of 7 333 — so the pin is
+    /// only non-vacuous if the fixture really holds **more than one** continuation address
+    /// inside one block and more than one function; both are asserted here (hence the
+    /// two-call floor: a single frame-preserving call leaves exactly one continuation
+    /// address and therefore no sub-block to lower).
+    #[test]
+    fn compiling_a_module_builds_its_label_map_once_however_many_functions_and_sub_blocks_it_has() {
+        for rounds in [2usize, 4, 16] {
+            let module = with_second_function(call_dense_module(rounds));
+            assert!(
+                module.functions.len() > 1,
+                "the fixture must cover more than one function, else the per-function \
+                 emit pass is not exercised"
+            );
+            let continuations = module.functions[0]
+                .code
+                .iter()
+                .filter(|instr| stores_continuation(instr))
+                .count();
+            assert!(
+                continuations == rounds && continuations > 1,
+                "{rounds} frame-preserving calls must leave one continuation address each \
+                 and more than one of them ({continuations} found), else no continuation \
+                 sub-block is emitted and the pin is vacuous"
+            );
+
+            interpreter::reset_label_map_builds();
+            compile_module(&module).expect("the two-function module compiles");
+            assert_eq!(
+                interpreter::label_map_builds(),
+                1,
+                "{rounds} calls / {} functions: exactly one whole-module label-map build \
+                 per compilation — a per-block or per-sub-block rebuild would give one per \
+                 block plus one per continuation address",
+                module.functions.len(),
+            );
+        }
+    }
+
+    /// `compile_function` takes its module-wide label map **from the caller**, so lowering
+    /// one function with a supplied map builds none at all: the per-block and per-sub-block
+    /// allocations thread it instead of rebuilding it.
+    #[test]
+    fn compiling_a_function_with_a_supplied_label_map_builds_none() {
+        let module = with_second_function(call_dense_module(4));
+        let labels = interpreter::build_label_map(&module);
+        interpreter::reset_label_map_builds();
+        compile_function(&module, &labels, 0).expect("the call-dense function compiles");
+        assert_eq!(
+            interpreter::label_map_builds(),
+            0,
+            "compile_function's caller owns the module-wide label map; every block and \
+             continuation sub-block allocation must reuse it",
+        );
+    }
     /// The continuation sub-blocks must lower **disjoint** ranges, so the emitted code
     /// grows **linearly** with the number of frame-preserving calls, not quadratically.
     ///
