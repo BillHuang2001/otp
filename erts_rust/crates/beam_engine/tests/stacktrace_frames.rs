@@ -56,15 +56,47 @@
 //! (never a fabricated host frame). The oracle is re-derived live from the system
 //! `erl` and each test **skips loudly** when no runnable `erl` is on `PATH` (a green
 //! run without `erl` proves nothing about corpus parity).
+//!
+//! # The second family of rows: a consumed continuation slot is cleared
+//!
+//! A frame's continuation-pointer slot means exactly one thing — *this frame is
+//! suspended inside a call and resumes at that address when the call returns* — so
+//! whoever follows the address clears it in the same step (C's `RETURN()` does
+//! `SET_I(cp_val(*E)); *E = NIL`, `erts/emulator/beam/emu/macros.tab:241-247`), and a
+//! raise that **lands** in a frame's catch handler clears it too (the handler runs in
+//! that frame). A frame that already returned from its call, or that a raise landed
+//! in, must therefore never be named a second time. Those rows pin, per shape, the
+//! cooked trace (or the raise's own frames, or `process_info/2`'s
+//! `current_stacktrace`):
+//!
+//! | entry | Erlang | pinned frames |
+//! |---|---|---|
+//! | `withcall/0` | `parent(ok)`, then `try 1 / 0 catch _C:_R:S -> S end` | `[withcall/0 @16]` |
+//! | `inhandler/0` | `try g(0) catch _:_ -> 1 / 0 end` | `[inhandler/0 @19]` |
+//! | `park/0` | `parent(ok)`, then `receive _ -> ok end` | `[park/0 @21]` (`current_stacktrace`) |
+//! | `folded/0` | `try 1 / 0 catch C:R:S -> erlang:raise(C,R,S) end` (folded to `raw_raise`) | `[folded/0 @24]` |
+//! | `refold/0` | `try g(0) catch C:R:S -> erlang:raise(C,R,S) end` | `[g/1 @17, refold/0 @26]` |
+//!
+//! `folded/0`/`refold/0` pin the supplied-vs-derived trace rule: `sys_core_fold`
+//! rewrites `catch C:R:S -> erlang:raise(C,R,S)` into the `raw_raise` instruction
+//! (so the `erlang:raise/3` BIF never runs), and C's `raw_raise` keeps the trace the
+//! re-raised exception already carried (`beam_common.c:1148-1179`), so no
+//! re-raise-site frame is ever added — `refold/0` is the row whose frame *identity*
+//! moves when a trace is derived at the re-raise site instead.
+//!
+//! Every row above runs on **both** execution tiers — the interpreter and the native
+//! x86-64 baseline tier (whose `return`/`deallocate_return` bodies are the
+//! interpreter's JIT twins) — and the two must derive byte-identical frames before
+//! either is compared with the oracle.
 
 use std::process::Command;
 
-use beam_engine::terms;
+use beam_common::Raise;
+use beam_engine::{terms, Machine, RunOutcome, Tier};
 use beam_term::{atom_val, is_atom, is_nil, is_small, signed_value, Eterm};
 
 mod support;
 use support::ModuleHost;
-
 // ---------------------------------------------------------------------------
 // The committed fixture (produced by the system `erlc +deterministic`)
 // ---------------------------------------------------------------------------
@@ -78,6 +110,10 @@ const FRAMES_BEAM: &str = concat!(
     "/tests/fixtures/stacktrace_frames.beam"
 );
 
+/// The two execution tiers every row must agree on: the direct-threaded
+/// interpreter and the native x86-64 baseline tier (whose `return` /
+/// `deallocate_return` bodies are the JIT twins of the interpreter's).
+const TIERS: [Tier; 2] = [Tier::Interpreter, Tier::BaselineJit];
 /// The fixture's source file name — the `{file,Name}` element of every frame's
 /// location (a list of code points, exactly the oracle's shape).
 const FRAMES_SOURCE: &str = "stacktrace_frames.erl";
@@ -195,18 +231,99 @@ fn frame_fields(host: &ModuleHost, item: Eterm) -> Frame {
     (module, function, arity, file, signed_value(line_term))
 }
 
-/// Runs `MODULE:function/0` and returns the frames of its cooked `S`.
-fn cooked_frames(host: &mut ModuleHost, function: &str) -> Vec<Frame> {
-    let s = host
-        .call(MODULE, function, &[])
-        .unwrap_or_else(|err| panic!("{MODULE}:{function}/0 must return its caught S, got {err:?}"));
-    terms::list_elements(s)
-        .unwrap_or_else(|err| panic!("{function}/0's caught S must be a proper list: {err:?}"))
+/// Reads a cooked stacktrace term into [`Frame`]s (innermost first).
+fn read_frames(host: &ModuleHost, trace: Eterm) -> Vec<Frame> {
+    terms::list_elements(trace)
+        .unwrap_or_else(|err| panic!("a cooked stacktrace must be a proper list: {err:?}"))
         .iter()
         .map(|&item| frame_fields(host, item))
         .collect()
 }
 
+/// Runs `MODULE:function/0` and returns the frames of its cooked `S`.
+fn cooked_frames(host: &mut ModuleHost, function: &str) -> Vec<Frame> {
+    let s = host
+        .call(MODULE, function, &[])
+        .unwrap_or_else(|err| panic!("{MODULE}:{function}/0 must return its caught S, got {err:?}"));
+    read_frames(host, s)
+}
+
+// ---------------------------------------------------------------------------
+// Running a row on an explicit tier (the tier-parity half of every row)
+// ---------------------------------------------------------------------------
+
+/// Runs `MODULE:function/0` on a fresh machine through `tier`, returning that
+/// machine (so a parked row can read its state) and the run's outcome.
+///
+/// The machine is handed back rather than retained by the host: a row's cooked `S`
+/// holds atoms, small integers and character lists only — no off-heap
+/// reference-counted binary — so its terms stay valid while the machine is alive,
+/// which it is for the whole of the caller's read.
+fn run_on_tier(
+    host: &mut ModuleHost,
+    function: &str,
+    tier: Tier,
+) -> (Machine, beam_common::Result<RunOutcome>) {
+    let module = host.load(MODULE).expect("the fixture loads");
+    let function_atom = module
+        .atom_table
+        .lookup(function)
+        .unwrap_or_else(|| panic!("{function} is interned in {MODULE}"));
+    let mut machine = Machine::new();
+    let outcome = machine.run_export_outcome_with_tier(&module, function_atom, 0, &[], host, tier);
+    (machine, outcome)
+}
+
+/// The cooked `S` frames `MODULE:function/0` returns on `tier`.
+fn cooked_frames_on_tier(host: &mut ModuleHost, function: &str, tier: Tier) -> Vec<Frame> {
+    let (machine, outcome) = run_on_tier(host, function, tier);
+    let outcome = outcome.unwrap_or_else(|err| panic!("{MODULE}:{function}/0 on {tier:?}: {err:?}"));
+    let RunOutcome::Returned(value) = outcome else {
+        panic!("{function}/0 must return its caught S on {tier:?}, got {outcome:?}");
+    };
+    let frames = read_frames(host, value);
+    drop(machine);
+    frames
+}
+
+/// The frames of the uncaught raise `MODULE:function/0` propagates on `tier`.
+fn raise_frames_on_tier(host: &mut ModuleHost, function: &str, tier: Tier) -> Vec<Frame> {
+    let (machine, outcome) = run_on_tier(host, function, tier);
+    let err = match outcome {
+        Ok(outcome) => panic!("{MODULE}:{function}/0 must propagate its raise on {tier:?}, got {outcome:?}"),
+        Err(err) => err,
+    };
+    drop(machine);
+    let raise = err
+        .into_raise()
+        .unwrap_or_else(|| panic!("{function}/0 must raise, not fail its capability"));
+    raise_frames(&raise)
+}
+
+/// The `(module, function, arity, file, line)` view of a raise's symbolic frames.
+fn raise_frames(raise: &Raise) -> Vec<Frame> {
+    raise
+        .stacktrace
+        .frames
+        .iter()
+        .map(|frame| match &frame.location {
+            Some(location) => (
+                frame.module.as_str().to_string(),
+                frame.function.as_str().to_string(),
+                i64::from(frame.arity),
+                location.file.as_str().to_string(),
+                i64::from(location.line),
+            ),
+            None => (
+                frame.module.as_str().to_string(),
+                frame.function.as_str().to_string(),
+                i64::from(frame.arity),
+                String::new(),
+                0,
+            ),
+        })
+        .collect()
+}
 /// Asserts `frames` contains no repeated frame — the exact defect the report
 /// described (a duplicated top frame). The **whole** `(module, function, arity,
 /// file, line)` tuple is compared, so a repeat with a drifted location is caught
@@ -238,6 +355,37 @@ fn render_frames(frames: &[Frame]) -> String {
 // The oracle (real ERTS), skipped loudly without `erl`
 // ---------------------------------------------------------------------------
 
+/// Runs `expression` under the system `erl` with the fixture directory appended and
+/// returns the fixture module's own frames from the stacktrace it evaluates to,
+/// rendered in [`render_frames`]'s flat form.
+///
+/// `expression` must evaluate to a **stacktrace list** (the cooked `S` of a
+/// `try … catch _C:_R:S`, or a `process_info(P, current_stacktrace)` value); the
+/// trailing host frames (`erl_eval`/`init`) are selected away, exactly as in
+/// [`oracle_frames`]. `None` when no runnable `erl` is on `PATH`.
+fn oracle_select(expression: &str) -> Option<String> {
+    let eval = format!(
+        "Pick = fun(L) -> [X || {{{MODULE},_,_,_}} = X <- L] end, \
+         Show = fun(L) -> lists:flatten(lists:join(\";\", \
+         [io_lib:format(\"~s|~s|~w|~s|~w\", [M, atom_to_list(FN), A, \
+         proplists:get_value(file, Loc), proplists:get_value(line, Loc)]) \
+         || {{M,FN,A,Loc}} <- L])) end, \
+         io:format(\"~s\", [Show(Pick({expression}))]), halt()."
+    );
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let output = Command::new("erl")
+        .args(["-noshell", "-pz", fixtures, "-eval", &eval])
+        .output()
+        .ok()?;
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{eval}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// The `stacktrace_frames`-module frames the system `erl` cooks for `function/0`,
 /// rendered in [`render_frames`]'s flat form; `None` when no runnable `erl` is on
 /// `PATH` (the caller skips loudly).
@@ -256,26 +404,49 @@ fn render_frames(frames: &[Frame]) -> String {
 /// "no oracle" — it panics with the captured stderr, so a broken oracle can never
 /// masquerade as a silent skip (the same policy as `tests/trace.rs::oracle_eval`).
 fn oracle_frames(function: &str) -> Option<String> {
-    let eval = format!(
-        "Pick = fun(L) -> [X || {{{MODULE},_,_,_}} = X <- L] end, \
-         Show = fun(L) -> lists:flatten(lists:join(\";\", \
-         [io_lib:format(\"~s|~s|~w|~s|~w\", [M, atom_to_list(FN), A, \
-         proplists:get_value(file, Loc), proplists:get_value(line, Loc)]) \
-         || {{M,FN,A,Loc}} <- L])) end, \
-         io:format(\"~s\", [Show(Pick({MODULE}:{function}()))]), halt()."
-    );
-    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let output = Command::new("erl")
-        .args(["-noshell", "-pz", fixtures, "-eval", &eval])
-        .output()
-        .ok()?;
-    assert!(
-        output.status.success(),
-        "the system `erl` exited {} for `{eval}`\n  stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    oracle_select(&format!("{MODULE}:{function}()"))
+}
+
+/// [`oracle_frames`] for a function whose raise is **uncaught**: the frames of the
+/// stacktrace `try MODULE:function() catch _C:_R:S -> S end` binds.
+fn oracle_raise_frames(function: &str) -> Option<String> {
+    oracle_select(&format!(
+        "try {MODULE}:{function}() catch _C:_R:S -> S end"
+    ))
+}
+
+/// [`oracle_frames`] for `process_info(P, current_stacktrace)` on a process parked
+/// inside `function/0` (the oracle's own `park/0` blocks in `receive`).
+fn oracle_parked_frames(function: &str) -> Option<String> {
+    oracle_select(&format!(
+        "begin P = spawn(fun() -> {MODULE}:{function}() end), timer:sleep(100), \
+         {{current_stacktrace, S}} = erlang:process_info(P, current_stacktrace), \
+         exit(P, kill), S end"
+    ))
+}
+
+/// Cross-checks `engine_frames` against a live-oracle rendering of the same
+/// stacktrace and **skips loudly** when `erl` is absent. Equality of the whole
+/// rendered list pins the frame **count** as well as every field: a duplicated (or
+/// dropped) frame makes the lists differ in length as well as content.
+fn assert_frames_eq_oracle(
+    test_name: &str,
+    oracle: Option<String>,
+    engine_frames: &[Frame],
+    what: &str,
+) {
+    match oracle {
+        Some(oracle) => assert_eq!(
+            render_frames(engine_frames),
+            oracle,
+            "{test_name}: the engine's frames for {what} must equal the oracle's leading \
+             `{MODULE}` frames"
+        ),
+        None => eprintln!(
+            "SKIP stacktrace_frames::{test_name} oracle half: no `erl` oracle on PATH \
+             — the engine-only assertions above still ran"
+        ),
+    }
 }
 
 /// Cross-checks the engine's frames for `function/0` against the live oracle and
@@ -285,20 +456,113 @@ fn oracle_frames(function: &str) -> Option<String> {
 /// **count**: a duplicated (or dropped) frame would make the lists differ in length
 /// as well as content.
 fn assert_matches_oracle(test_name: &str, function: &str, engine_frames: &[Frame]) {
-    match oracle_frames(function) {
-        Some(oracle) => assert_eq!(
-            render_frames(engine_frames),
-            oracle,
-            "{test_name}: the engine's cooked S for {MODULE}:{function}/0 must equal \
-             the oracle's leading `{MODULE}` frames"
-        ),
-        None => eprintln!(
-            "SKIP stacktrace_frames::{test_name} oracle half: no `erl` oracle on PATH \
-             — the engine-only assertions above still ran"
-        ),
-    }
+    assert_frames_eq_oracle(
+        test_name,
+        oracle_frames(function),
+        engine_frames,
+        &format!("{MODULE}:{function}/0"),
+    );
 }
 
+/// Pins one **cooked** row: `function/0`'s caught `S` must be `expected` on **both**
+/// tiers (a tier is only ever compared against the same pinned frame list, which
+/// makes the two tiers agree byte-for-byte), no frame may repeat, and the result is
+/// cross-checked against the live oracle.
+fn assert_cooked_row(function: &str, expected: &[Frame]) {
+    let mut host = frames_host();
+    let mut per_tier: Vec<(Tier, Vec<Frame>)> = Vec::new();
+    for tier in TIERS {
+        per_tier.push((tier, cooked_frames_on_tier(&mut host, function, tier)));
+    }
+    for (tier, frames) in &per_tier {
+        assert_eq!(
+            frames, expected,
+            "{MODULE}:{function}/0's cooked S on {tier:?} must be {expected:?}, got {frames:?}"
+        );
+        assert_no_duplicate_frames(frames, &format!("{MODULE}:{function}/0 on {tier:?}"));
+    }
+    assert_eq!(
+        per_tier[0].1, per_tier[1].1,
+        "the interpreter and the native baseline tier must derive byte-identical \
+         frames for {MODULE}:{function}/0"
+    );
+    assert_frames_eq_oracle(
+        function,
+        oracle_frames(function),
+        &per_tier[0].1,
+        &format!("{MODULE}:{function}/0"),
+    );
+}
+
+/// Pins one **uncaught-raise** row: the raise `function/0` propagates must carry
+/// exactly `expected` on **both** tiers, and the result is cross-checked against the
+/// live oracle.
+fn assert_raise_row(function: &str, expected: &[Frame]) {
+    let mut host = frames_host();
+    let mut per_tier: Vec<(Tier, Vec<Frame>)> = Vec::new();
+    for tier in TIERS {
+        per_tier.push((tier, raise_frames_on_tier(&mut host, function, tier)));
+    }
+    for (tier, frames) in &per_tier {
+        assert_eq!(
+            frames, expected,
+            "{MODULE}:{function}/0's raise on {tier:?} must carry {expected:?}, got {frames:?}"
+        );
+        assert_no_duplicate_frames(frames, &format!("{MODULE}:{function}/0 on {tier:?}"));
+    }
+    assert_eq!(
+        per_tier[0].1, per_tier[1].1,
+        "the interpreter and the native baseline tier must derive byte-identical \
+         frames for the raise out of {MODULE}:{function}/0"
+    );
+    assert_frames_eq_oracle(
+        function,
+        oracle_raise_frames(function),
+        &per_tier[0].1,
+        &format!("the raise out of {MODULE}:{function}/0"),
+    );
+}
+
+/// Pins one **parked** row: after `function/0` parks in a `receive`, the machine's
+/// `process_info(P, current_stacktrace)` value must name exactly `expected` on
+/// **both** tiers, and the result is cross-checked against the live oracle.
+fn assert_parked_row(function: &str, expected: &[Frame]) {
+    let mut host = frames_host();
+    let module = host.load(MODULE).expect("the fixture loads");
+    let mut per_tier: Vec<(Tier, Vec<Frame>)> = Vec::new();
+    for tier in TIERS {
+        let (machine, outcome) = run_on_tier(&mut host, function, tier);
+        let outcome =
+            outcome.unwrap_or_else(|err| panic!("{MODULE}:{function}/0 on {tier:?}: {err:?}"));
+        assert!(
+            matches!(outcome, RunOutcome::Wait { .. }),
+            "{function}/0 must park in `receive` on {tier:?}, got {outcome:?}"
+        );
+        let trace = machine
+            .current_stacktrace(&module, &mut host)
+            .unwrap_or_else(|err| panic!("current_stacktrace on {tier:?}: {err:?}"));
+        per_tier.push((tier, read_frames(&host, trace)));
+    }
+    for (tier, frames) in &per_tier {
+        assert_eq!(
+            frames, expected,
+            "{MODULE}:{function}/0's current_stacktrace on {tier:?} must be \
+             {expected:?}, got {frames:?}"
+        );
+        assert_no_duplicate_frames(frames, &format!("{MODULE}:{function}/0 on {tier:?}"));
+    }
+    assert_eq!(
+        per_tier[0].1, per_tier[1].1,
+        "the interpreter and the native baseline tier must report byte-identical \
+         frames for a machine parked in {MODULE}:{function}/0"
+    );
+    assert_frames_eq_oracle(
+        function,
+        oracle_parked_frames(function),
+        &per_tier[0].1,
+        &format!("a machine parked in {MODULE}:{function}/0"),
+    );
+}
 // ---------------------------------------------------------------------------
 // t0 — `try f() catch _C:_R:S -> S end`; `f/0` raises directly
 // ---------------------------------------------------------------------------
@@ -396,4 +660,60 @@ fn every_shape_cooks_frames_that_are_pairwise_distinct_and_match_the_oracle() {
         );
         assert_no_duplicate_frames(&frames, &format!("{function}/0"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// A frame's continuation-pointer slot: it means "suspended in a call", and every
+// consumer that follows the address clears it in the same step (C's
+// `RETURN()` does `SET_I(cp_val(*E)); *E = NIL`,
+// `erts/emulator/beam/emu/macros.tab:241-247`). A frame that already RETURNED
+// from its call — or that a raise LANDED in — is therefore never named again.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn withcall_names_the_returned_from_caller_once_at_the_raising_fdiv() {
+    // `withcall/0` calls `parent(ok)` (which returns), then the try body raises.
+    // The caller frame is named ONCE, at the raising `fdiv` (line 16): the call
+    // that already returned left no address behind, so no second `withcall/0` item
+    // appears at the returned-from call site.
+    assert_cooked_row("withcall", &[frame("withcall", 0, 16)]);
+}
+
+#[test]
+fn inhandler_names_the_frame_once_after_the_raise_landed_in_it() {
+    // `inhandler/0`'s try body makes a **non-tail** `g(0)` call, whose `fdiv`
+    // raises; the raise lands in `inhandler/0`'s own catch handler, which then
+    // raises again. The landing consumes the frame's slot (the handler runs *in*
+    // that frame), so the second raise names `inhandler/0` ONCE — a stale slot
+    // would name it a second time at the call that raised.
+    assert_raise_row("inhandler", &[frame("inhandler", 0, 19)]);
+}
+
+#[test]
+fn park_reports_one_frame_in_process_info_current_stacktrace() {
+    // `park/0` calls `parent(ok)` (which returns) and then blocks in `receive`.
+    // `process_info(P, current_stacktrace)` derives through the same chain, so the
+    // parked frame is named ONCE (line 21, the `wait`) — the returned-from call is
+    // not a live caller.
+    assert_parked_row("park", &[frame("park", 0, 21)]);
+}
+
+#[test]
+fn folded_keeps_the_original_raise_chain_without_a_re_raise_site_frame() {
+    // `folded/0` is `try 1 / 0 catch C:R:S -> erlang:raise(C, R, S) end`, which
+    // `sys_core_fold` rewrites into the `raw_raise` instruction. C's `raw_raise`
+    // stores the supplied trace and clears `EXF_SAVETRACE`, so `build_stacktrace`
+    // returns the raise's own chain verbatim: exactly ONE `folded/0` frame, at the
+    // original raise (line 24), with no re-raise-site frame added.
+    assert_raise_row("folded", &[frame("folded", 0, 24)]);
+}
+
+#[test]
+fn refold_keeps_the_two_frame_chain_of_the_raise_it_re_raises() {
+    // `refold/0` re-raises out of a try whose body made a **non-tail** `g(0)` call,
+    // so the exception it re-raises carries a two-frame chain: `g/1` (the raising
+    // `fdiv`, line 17) then `refold/0` (line 26, the make-or-break question: the
+    // caller of the raise, *not* the `raw_raise` site). Deriving the trace at the
+    // re-raise site instead would substitute `refold/0` for `g/1` and name it twice.
+    assert_raise_row("refold", &[frame("g", 1, 17), frame("refold", 0, 26)]);
 }
