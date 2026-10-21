@@ -219,8 +219,10 @@ allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: 
 (`raise_function_clause_args`/`pending_function_clause_args`) are **parked into the published root set**
 by `Machine::with_roots` for the duration of every hand-off and re-seated from their slots afterwards (a
 `with_roots` fast path hands over an unmodified `RootSet` when neither is armed), so a collecting host
-relocates them with no host-side change; the supplied-trace latches are `Vec<StackFrame>` metadata and
-need no rooting. `Machine::pending_exception` (`machine/catch.rs`) is the remaining engine-held live
+relocates them with no host-side change; the supplied-trace latches — `pending_supplied_trace`/
+`raise_supplied_trace` (`Option<StackTrace>`) and the raw-trace pair `pending_supplied_raw_trace`/
+`raise_supplied_raw_trace` (`bool`) — are metadata and need no rooting. `Machine::pending_exception`
+(`machine/catch.rs`) is the remaining engine-held live
 reason `Eterm`: it is rooted **host-side**, in the park window, by `beam_rt`'s `Registers::extra_roots`
 publication (read back through the write accessor `Machine::pending_exception_mut`), not by `with_roots`.
 The complete set of `Eterm`-typed `Machine` fields is `x`/`fr`/`stack` (the `RootSet`), `pending_exception`, `class_atoms: [Eterm; 3]`
