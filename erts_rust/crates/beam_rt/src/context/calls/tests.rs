@@ -1410,3 +1410,268 @@ fn eval_route_pool_costs() {
         report(label, &rows);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The reference walk's `move_container` gate — the walk runs only where it is observable
+// ---------------------------------------------------------------------------------------
+//
+// `RuntimeContext::call_registered`'s tail walks the result graph for a reference **only** when
+// `move_container` is true (a process route, or a table-less call no escaping arm can have leaked
+// a heap word from). When `move_container == false` the walk's answer is unobservable: its
+// `reference` arm would only set `rewind = false`, which the gate already implies, and the copy
+// arm — the walk's second consumer — is gated on the same flag. The suite below pins both sides of
+// that gate plus the exactness of the hoisted visit counter.
+
+thread_local! {
+    /// The term the fixture BIF built on the pooled heap, so a test can assert the result came back
+    /// **word-identical** (a copy would be a different address — and for a reference inside it, a
+    /// different term).
+    static FIXTURE_BUILT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// A registered BIF that allocates on the pooled heap and returns `{Ref}` — a container holding an
+/// **internal reference**, the one shape the copy-out's reference walk exists for.
+fn reference_holding_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let reference = internal_reference(ctx.heap(), 4242);
+    let container = ctx.heap().tuple(&[reference])?;
+    FIXTURE_BUILT.with(|c| c.set(container.raw()));
+    Ok(container)
+}
+
+/// A registered BIF whose result is the **accumulator shape**: a cons spine of immediates ending in
+/// an internal reference (what a `lists:foldl/3` accumulator looks like to the walk — the measured
+/// 236.5 M + 76.1 M of the 408.5 M visits a `lib/stdlib/src/string.erl` compile used to pay).
+fn accumulator_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let reference = internal_reference(ctx.heap(), 777);
+    let mut list = reference;
+    for index in (0..ACCUMULATOR_CELLS).rev() {
+        list = ctx.heap().cons(make_small(index), list)?;
+    }
+    FIXTURE_BUILT.with(|c| c.set(list.raw()));
+    Ok(list)
+}
+
+/// The accumulator's spine length (long enough that a whole-AST walk would be visible, short enough
+/// to stay a unit test).
+const ACCUMULATOR_CELLS: i64 = 64;
+
+/// A fun term built on the caller's `heap`, used purely as a **reentrancy witness**: the dispatch
+/// prologue's `reentrancy_capable` asks only whether some argument is a fun, which is what makes a
+/// real `lists:foldl/3` call reentrant. The raw atom indices are placeholders because nothing here
+/// applies the fun.
+///
+/// The heap is passed in rather than built here on purpose: [`beam_engine::terms::is_fun`] reads
+/// the term's header word, so the fun must still have a live region when the call runs (a heap
+/// dropped at this function's exit would leave the header read pointing at recycled memory and the
+/// call would look *non*-reentrant).
+fn reentrancy_witness(heap: &mut beam_alloc::Heap) -> Eterm {
+    beam_codec::term::make_fun_external(
+        heap,
+        1,
+        beam_term::Atom::from_raw(1),
+        beam_term::Atom::from_raw(2),
+    )
+    .expect("the external fun builds")
+}
+
+/// The runtime a table-less fixture call runs against, with the two fixture BIFs registered.
+fn fixture_runtime() -> crate::runtime::Runtime {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    {
+        let registry = Rc::get_mut(&mut rt.registry)
+            .expect("the runtime holds the only handle to its registry");
+        let _ = registry.register(
+            "copy_out_fixture",
+            "reference_holding",
+            2,
+            reference_holding_result,
+        );
+        let _ = registry.register("copy_out_fixture", "accumulator", 2, accumulator_result);
+    }
+    rt
+}
+
+/// **A table-less reentrant call never walks its result.**
+///
+/// `RuntimeContext::new` (the `-eval`/`-s`/`-run` route and the in-process `compile:file/2` route of
+/// contract A.9) has `mailbox_table == None`, and a **reentrant** call — any call carrying a fun
+/// argument, i.e. every `lists:foldl/3`/`lists:map/2`/`maps:map/2` accumulator — is one conjunct of
+/// `!safe_to_rewind`, so `move_container` is false and the walk is unobservable. Three things are
+/// pinned: the walk is **not invoked** (its call counter does not move), the result is handed back
+/// **word-identical** to what the BIF built on the pool (a copy would be a different address, and a
+/// copied reference is a different term), and the pool is **not rewound** (its words are live).
+#[test]
+fn a_table_less_reentrant_call_never_walks_its_result() {
+    let mut rt = fixture_runtime();
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
+    FIXTURE_BUILT.with(|c| c.set(0));
+    let built = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        notes::reset();
+        let result = ctx
+            .call_bif("copy_out_fixture", "reference_holding", 2, &[fun, make_small(0)])
+            .expect("the fixture BIF returns");
+        assert_eq!(
+            notes::walk_snapshot().calls,
+            0,
+            "a table-less reentrant call must not walk its result: the answer is unobservable"
+        );
+        assert_eq!(
+            notes::walk_snapshot().visits,
+            0,
+            "the walk's whole visit count stays at zero for the gated path"
+        );
+        assert!(
+            rt_note(&notes::snapshot()),
+            "the copy-out must not even be attempted on this route"
+        );
+        result.raw()
+    };
+    assert_eq!(
+        built,
+        FIXTURE_BUILT.with(core::cell::Cell::get),
+        "the result is word-identical to the term the BIF built — nothing was copied"
+    );
+    assert_eq!(
+        rt.bif_heaps.last().expect("the pool keeps its region").used() > 0,
+        true,
+        "the pool must NOT be rewound: the result still points into those words"
+    );
+}
+
+/// The no-copy-out half of the assertion above, spelled out (`snapshot()`'s three-tuple is
+/// `(copy_attempts, grow_retries, empty_destination_attempts)`).
+fn rt_note(snapshot: &(usize, usize, usize)) -> bool {
+    *snapshot == (0, 0, 0)
+}
+
+/// **The same result on a process route still walks, still finds the reference, and still declines
+/// the move.**
+///
+/// `RuntimeContext::for_process` supplies a `mailbox_table`, so `move_container` is true whatever
+/// `safe_to_rewind` answers: this is the case the gate must leave **exactly** as it was. The walk
+/// runs, answers "holds a reference", and the result is returned word-identical (not copied onto
+/// the process heap) with the pool un-rewound — a copied reference would stop being the term it
+/// names.
+#[test]
+fn a_process_route_still_walks_its_result_and_still_declines_the_move() {
+    let mut rt = fixture_runtime();
+    let (mut table, pid) = process_table(&mut rt);
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
+    FIXTURE_BUILT.with(|c| c.set(0));
+    let built = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        notes::reset();
+        let result = ctx
+            .call_bif("copy_out_fixture", "reference_holding", 2, &[fun, make_small(0)])
+            .expect("the fixture BIF returns");
+        assert_eq!(
+            notes::walk_snapshot().calls,
+            1,
+            "a process route moves its container result, so the walk's answer is observable — it runs"
+        );
+        assert_eq!(
+            notes::walk_snapshot().visits,
+            2,
+            "the `{{Ref}}` container is two dereferenced objects: the tuple, then the reference block"
+        );
+        result.raw()
+    };
+    assert_eq!(
+        built,
+        FIXTURE_BUILT.with(core::cell::Cell::get),
+        "a reference-holding result is NOT copied — the walk's answer kept the term where it was"
+    );
+    assert!(
+        rt.bif_heaps.last().expect("the pool keeps its region").used() > 0,
+        "and the pool is not rewound, exactly as before the gate"
+    );
+}
+
+/// **The accumulator shape through the gate: a table-less reentrant call whose result is a long
+/// cons spine ending in a reference.**
+///
+/// The shape pinned here is a spine of 64 immediate cons cells with an internal reference in the
+/// tail — what `lists:foldl/3` hands back to `call_registered` when the fold's accumulator is the
+/// intermediate compiler AST (measured: `lists:foldl/3` 236.5 M + `lists:map/2` 76.1 M of
+/// `string.erl`'s 408.5 M walk visits). The real bridge is not driven because the walk's gate reads
+/// only `reentrancy_capable(args)` — "some argument is a fun" — which the fixture supplies; an
+/// applied fun would additionally need a compiled, resolvable closure, and the property under test
+/// does not depend on what the fun does. The call still returns the fold's value, cell for cell.
+#[test]
+fn a_table_less_reentrant_accumulator_is_returned_unwalked() {
+    let mut rt = fixture_runtime();
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
+    FIXTURE_BUILT.with(|c| c.set(0));
+    let built = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        notes::reset();
+        let result = ctx
+            .call_bif("copy_out_fixture", "accumulator", 2, &[fun, make_small(0)])
+            .expect("the fixture BIF returns");
+        assert_eq!(
+            notes::walk_snapshot(),
+            notes::WalkCounts {
+                calls: 0,
+                visits: 0,
+                hash_inserts: 0,
+                spills: 0,
+            },
+            "a 64-cell accumulator is handed back without a single visit on this route"
+        );
+        result.raw()
+    };
+    assert_eq!(
+        built,
+        FIXTURE_BUILT.with(core::cell::Cell::get),
+        "the accumulator comes back as the fold left it"
+    );
+    assert_eq!(
+        rt.bif_heaps.last().expect("the pool keeps its region").used() > 0,
+        true,
+        "and its spine stays live on the pool (no rewind)"
+    );
+}
+
+/// **The hoisted visit counter is exact on every exit.**
+///
+/// The walk accumulates its visits in a local `u64` and folds them in once, at its single exit
+/// (two early answers `break 'walk` into it). This pins that the folded total equals the per-visit
+/// counter for both shapes — the ordinary terminal exit (a spine of immediates, 8 cells) and the
+/// reference-header early exit (`{Ref}`, 2 objects) — so the hoist cannot silently under-count.
+#[test]
+fn the_folded_visit_total_matches_the_per_visit_counter_on_every_exit() {
+    let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+    let mut list = beam_term::prelude::NIL;
+    for index in (0..8i64).rev() {
+        list = heap.cons(make_small(index), list).expect("a cell fits");
+    }
+    notes::reset();
+    assert!(!RuntimeContext::graph_holds_reference(list));
+    let visits = notes::walk_snapshot().visits;
+    assert_eq!(visits, 8, "one visit per cons cell, and `NIL` is never pushed");
+    assert_eq!(
+        notes::walk_fold_snapshot(),
+        (1, visits),
+        "the terminal exit folds the local counter exactly once"
+    );
+
+    // The reference-header exit needs a **fresh** heap: `internal_reference` asserts the block is
+    // the heap's whole used prefix (it writes the header over `used_words_mut`).
+    let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+    let reference = internal_reference(&mut heap, 7);
+    let tuple = heap.tuple(&[reference]).expect("the tuple fits");
+    notes::reset();
+    assert!(RuntimeContext::graph_holds_reference(tuple));
+    let visits = notes::walk_snapshot().visits;
+    assert_eq!(visits, 2, "the tuple and the reference block it holds");
+    assert_eq!(
+        notes::walk_fold_snapshot(),
+        (1, visits),
+        "the reference-header early exit folds the local counter exactly once too"
+    );
+}
