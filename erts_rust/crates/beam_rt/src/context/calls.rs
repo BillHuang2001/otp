@@ -77,6 +77,8 @@ use super::bridges::{DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridg
 use super::dispatch::DispatchHooks;
 use super::export_gate::ExportGateBridge;
 use super::fun_identity::FunIdentityBridge;
+pub(super) mod perf_counters;
+
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
 use super::persistent_term::PersistentTermBridge;
@@ -173,6 +175,7 @@ impl<'a> RuntimeContext<'a> {
         }
         // Retire the exhausted region — never freed, never moved, so the words another caller owns
         // in it stay valid — and continue the run in a fresh, larger frontier.
+        perf_counters::bump(|c| &mut c.pool_grown);
         self.runtime.put_bif_heap(heap);
         Heap::new(grown)
     }
@@ -257,6 +260,9 @@ impl<'a> RuntimeContext<'a> {
         // another owner still holds. `mark == 0` (a heap taken clean) makes that the plain
         // `reset()` it used to be. See [`Self::call_registered`]'s copy-out rule.
         let mark = heap.used();
+        if mark != 0 {
+            perf_counters::bump(|c| &mut c.pool_dirty);
+        }
         // `self_pid` is the pid this context runs as: `erlang:self/0` reports it, and a
         // `receive` in a fun a BIF applies resolves its mailbox against it.
         let self_pid = self.mailbox_pid;
@@ -365,6 +371,9 @@ impl<'a> RuntimeContext<'a> {
         // [`Self::reentrancy_capable`]). Hoisted out of the dispatch block below because the
         // result-rewind gate needs it too.
         let reentrant = Self::reentrancy_capable(args);
+        if reentrant {
+            perf_counters::bump(|c| &mut c.reentrant);
+        }
         // Whether this call must **hold the shared `TableRegistry` cell** for its whole
         // duration. This is deliberately a *separate* predicate from `reentrant` (which keeps
         // its own meaning for the `safe_to_rewind` gate below): a reentrant call no longer
@@ -469,11 +478,17 @@ impl<'a> RuntimeContext<'a> {
             //
             // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must degrade to
             // "no ETS", never panic.
+            if lent_tables.is_some() {
+                perf_counters::bump(|c| &mut c.tables_lent);
+            }
             let mut held_tables = if lent_tables.is_none() && install_tables {
                 tables_handle.try_borrow_mut().ok()
             } else {
                 None
             };
+            if held_tables.is_some() {
+                perf_counters::bump(|c| &mut c.tables_held);
+            }
             // `held_tables` must outlive `tables` (it owns the cell borrow the latter reborrows).
             let mut tables: Option<&mut TableRegistry> = match lent_tables.as_deref_mut() {
                 Some(lent) => Some(lent),
@@ -485,6 +500,7 @@ impl<'a> RuntimeContext<'a> {
             // answers from the runtime's own port table (see `crate::port`).
             let mut ports = RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
             if uses_dict {
+                perf_counters::bump(|c| &mut c.arm_dict);
                 // The running process's directory: resolve the table the same way the
                 // mailbox/`self` seam does — the caller-supplied table (a scheduler pass)
                 // when there is one, else the runtime's own process table (a `-eval`
@@ -518,6 +534,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_process_hook {
+                perf_counters::bump(|c| &mut c.arm_process_hook);
                 // The eleven process/name/global-state BIFs: the bridge borrows the process
                 // table (the caller-supplied pass table when there is one, else the
                 // runtime's own) *and* the runtime (for the `process_info` arena), exactly
@@ -550,6 +567,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_nif_loader {
+                perf_counters::bump(|c| &mut c.arm_nif_loader);
                 // `erlang:load_nif/2`: the NIF bridge needs `&mut Runtime` (to store the loaded
                 // library in the runtime's NIF registry), so it is the only runtime borrow in
                 // this arm — mutually exclusive with the dict/fun-caller arms. Its host shares
@@ -585,6 +603,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_record_source {
+                perf_counters::bump(|c| &mut c.arm_record_source);
                 // `records:get_definition/2` answers from the *loaded module's* `Recs` chunk,
                 // which lives in the code server's module map — a `&CodeServer` borrow, so it
                 // is its own mutually exclusive arm (see [`RecordBridge`]). The BIF applies no
@@ -612,6 +631,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_export_gate {
+                perf_counters::bump(|c| &mut c.arm_export_gate);
                 // `erlang:binary_to_term/2`: the `[safe]` decode's `EXPORT_EXT` check asks "is
                 // this `M:F/A` exported by code loaded *now*?", which only the runtime knows —
                 // the loaded-module cache plus the registered BIFs (see [`ExportGateBridge`]).
@@ -641,6 +661,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_send_hook {
+                perf_counters::bump(|c| &mut c.arm_send_hook);
                 // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
                 // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
                 // path, so nothing about delivery is re-implemented), making it mutually
@@ -675,6 +696,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_module_info {
+                perf_counters::bump(|c| &mut c.arm_module_info);
                 // `erlang:get_module_info/1,2`: answers from the loaded module's IR — a
                 // `&CodeServer` borrow, its own mutually exclusive arm. It applies no fun
                 // argument.
@@ -701,6 +723,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_persistent_term {
+                perf_counters::bump(|c| &mut c.arm_persistent_term);
                 // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
                 // node-global store, plus a clone of the shared atom-table handle so the
                 // store can compare keys/values **structurally** (`beam_term::eq`) — two
@@ -751,6 +774,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_runtime_hooks {
+                perf_counters::bump(|c| &mut c.arm_runtime_hooks);
                 // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
                 // reference space (`&mut Runtime`) plus the caller's process table
                 // (`&mut ProcessTable`) — the same pair the dict arm resolves, so it is its
@@ -783,6 +807,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else {
+                perf_counters::bump(|c| &mut c.arm_fun_caller);
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
                 // inherits the caller's module name so a nested call still knows its call site.
@@ -897,6 +922,9 @@ impl<'a> RuntimeContext<'a> {
         // `system_limit` the tail's own `enforce_term_heap_limit` maps an allocation refusal to. The
         // pool is left un-rewound, the same residual a failed move already has.
         let aliased = alias.get();
+        if result.as_ref().is_ok_and(|term| Self::result_is_foreign_container(*term)) {
+            perf_counters::bump(|c| &mut c.foreign_result);
+        }
         // The witness's own tally: a test that asserts "no copy ran for this immediate" is only
         // meaningful once the cell is known to have been **set** by the `ets` helper (a witness
         // that was never installed would skip the copy for the trivial reason that `aliased` is
@@ -921,6 +949,7 @@ impl<'a> RuntimeContext<'a> {
                 notes::note_alias_copy_pool(mark, heap.used());
                 match self.rehome_container_result(term) {
                     Some(copied) => {
+                        perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
                     }
@@ -932,6 +961,7 @@ impl<'a> RuntimeContext<'a> {
                     }
                 }
             } else if Self::graph_holds_reference(term) {
+                perf_counters::bump(|c| &mut c.ref_held);
                 // A reference's identity **is** its address (see the comment above): the copy
                 // would be a different term, so the result stays where it is and the pool is
                 // not rewound.
@@ -940,6 +970,7 @@ impl<'a> RuntimeContext<'a> {
                 // The copy first and, only once it succeeded, the rewind: a refused copy leaves
                 // both the result and the pool exactly as they were.
                 if let Some(copied) = self.rehome_container_result(term) {
+                    perf_counters::bump(|c| &mut c.rehomed);
                     result = Ok(copied);
                     rewind = safe_to_rewind;
                 }
@@ -967,6 +998,7 @@ impl<'a> RuntimeContext<'a> {
         drop(atoms);
         drop(memory);
         if !pending.is_empty() {
+            perf_counters::bump(|c| &mut c.intern_commit);
             self.runtime.code_server.intern_pending(&pending);
         }
         // Rewind to this call's mark and give the heap back to the pool. Every word this call
@@ -986,6 +1018,9 @@ impl<'a> RuntimeContext<'a> {
         // leaves the heap untouched (its own contract), so the honest answer is to surface it —
         // that is a `BeamError::BadArg` out of the same `Result` this call already returns, never
         // a recycled live word and never a silently mis-sized pool.
+        if rewind {
+            perf_counters::bump(|c| &mut c.rewound);
+        }
         let rewound = if rewind { heap.reset_to(mark) } else { Ok(()) };
         self.runtime.put_bif_heap(heap);
         rewound?;
@@ -1581,10 +1616,17 @@ impl RuntimeContext<'_> {
     ) -> Result<Eterm> {
         // A loaded NIF library wins over every other route: a NIF replaces the Erlang stub of
         // the same `{module, function, arity}`. On a miss this is a no-op (`Ok(None)`).
+        perf_counters::bump(|c| &mut c.call_bif);
+        perf_counters::note_key(module, function, arity);
+        if !self.runtime.nifs.borrow().is_empty() {
+            perf_counters::bump(|c| &mut c.nif_probe);
+        }
         if let Some(term) = self.try_call_nif(module, function, arity, args)? {
+            perf_counters::bump(|c| &mut c.nif_hit);
             return Ok(term);
         }
         if let Some(result) = self.try_native(module, function, arity, args) {
+            perf_counters::bump(|c| &mut c.native_hit);
             // The floor builds its terms on the same pooled BIF heap, so an exhaustion
             // there is the same documented limit (see `error::enforce_term_heap_limit`).
             return result.map_err(error::enforce_term_heap_limit);
@@ -1594,6 +1636,7 @@ impl RuntimeContext<'_> {
         // `BifRegistry::lookup`, which stays the single source of truth — and the resolved
         // `BifFn` is what `call_registered` invokes (no second registry lookup).
         if let Some(bif) = dispatch.bif {
+            perf_counters::bump(|c| &mut c.registered);
             // A table-creating `ets:new/2` is observed here so the runtime's owner index can
             // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
             // a `named_table` is reachable through the registry's *public* surface, so only it
@@ -1638,6 +1681,7 @@ impl RuntimeContext<'_> {
         // time a module has to be resolved, so an external call reaches the real stdlib
         // without an explicit `-pa`. A miss here is not fatal: `CodeServer::load` below
         // reports it, naming every directory searched.
+        perf_counters::bump(|c| &mut c.external);
         let _ = self.runtime.find_module_file(module);
         let loaded = match self.runtime.code_server.load(module) {
             Ok(loaded) => loaded,

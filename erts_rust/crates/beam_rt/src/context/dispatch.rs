@@ -32,6 +32,7 @@ use beam_bifs::BifFn;
 use beam_engine::terms;
 use beam_term::Eterm;
 
+use super::calls::perf_counters;
 use super::runtime_context::RuntimeContext;
 
 /// The number of `(module, function, arity)` keys a context's dispatch memo holds.
@@ -236,8 +237,14 @@ impl<'a> RuntimeContext<'a> {
         let slot = dispatch_slot(module, function, arity);
         if let Some(entry) = &self.dispatch_memo.slots[slot] {
             if entry.arity == arity && entry.module == module && entry.function == function {
+                perf_counters::bump(|c| &mut c.dispatch_hit);
                 return entry.answer;
             }
+        }
+        perf_counters::bump(|c| &mut c.dispatch_miss);
+        match &self.dispatch_memo.slots[slot] {
+            None => perf_counters::bump(|c| &mut c.dispatch_cold),
+            Some(_) => perf_counters::bump(|c| &mut c.dispatch_evict),
         }
         let answer = DispatchAnswer {
             bif: self.runtime.registry.lookup(module, function, arity),
