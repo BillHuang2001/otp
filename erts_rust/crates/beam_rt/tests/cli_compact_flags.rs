@@ -50,21 +50,31 @@
 //!   marker-free baseline), and (iii) the two spellings produce the **same** driven
 //!   observable — the `system_info` values the oracle answers, or, for the rows with no
 //!   `system_info` observable, only the parser equality;
-//! * the **refusals** are unchanged in both spellings: exit 1, one stderr line, no `USAGE`;
+//! * the **refusals** are unchanged in both spellings: exit 1, one stderr line, no `USAGE` —
+//!   and every row's exit status is cross-checked against the oracle's under the same argv;
 //! * no `+` switch is ever an `init` argument (`init:get_arguments/0` is unchanged by them).
 //!
-//! # Two rows where the two runtimes cannot legitimately agree
+//! # The one row where the two runtimes cannot legitimately agree
 //!
-//! * `+SP50` — the oracle answers `schedulers` 8 (50 % of this host's 16 logical CPUs) and
-//!   this runtime answers its own default (14, the physical count): the *scheduler-count
-//!   policy* is a runtime decision, so the row asserts the twin rule and the
-//!   `schedulers_online =< schedulers` invariant, never the oracle's figure.
-//! * `+sbwt1000` — the oracle **rejects a numeric busy-wait threshold** in *both* spellings
-//!   (exit 1, its diagnostic on the controlling terminal) while
-//!   this runtime accepts it verbatim; that is a *value-validation* difference, not a
-//!   spelling one, so the row asserts the twin rule and the same-config property on this
-//!   runtime only. The same switch with a symbolic value (`+sbwtlong`/`+sbwt long`) is
-//!   accepted by both runtimes and carries the oracle cross-check instead.
+//! * `+SP50` — the *value validation* is aligned (both runtimes accept `50` in both
+//!   spellings); what legitimately differs is the *scheduler-count policy*: the oracle
+//!   answers `schedulers` 8 (50 % of this host's 16 logical CPUs) while this runtime answers
+//!   its own default (14, the physical count). The row therefore asserts the twin rule and
+//!   the `schedulers_online =< schedulers` invariant, never the oracle's figure.
+//!
+//! (The `+hmaxk` twin drives no figure of its own, so its oracle half is not consulted either:
+//! that row pins the parser equality and both spellings' exit-0/clean-stderr acceptance on this
+//! runtime.)
+//!
+//! A numeric busy-wait threshold is **not** a divergence: `+sbwt1000` and `+sbwt 1000` are
+//! refused by *both* runtimes in *both* spellings (a refusal row below), and the symbolic set
+//! (`+sbwtlong`/`+sbwt long`, `+sbwtmedium`/`+sbwt medium`) is accepted by both and carries
+//! the oracle cross-check.
+//!
+//! The numeric `+` switches follow the C's digit-prefix readers (`atoi`/`strtol`/`sscanf`)
+//! per switch, so the trailing garbage in `+S1bogus`/`+S1x`/`+P65536bogus`/`+Q1024x`/
+//! `+t1048576x` is ignored by this runtime exactly as the oracle ignores it — pinned as an
+//! *agreement* by its own test.
 //!
 //! # Harness
 //!
@@ -105,6 +115,9 @@ const PROCESS_LIMIT_PROBE: &str =
 
 /// `erlang:system_info(port_limit)` — the figure `+Q` drives.
 const PORT_LIMIT_PROBE: &str = "io:format(\"~p~n\",[erlang:system_info(port_limit)]),halt(0).";
+
+/// `erlang:system_info(atom_limit)` — the figure `+t` drives.
+const ATOM_LIMIT_PROBE: &str = "io:format(\"~p~n\",[erlang:system_info(atom_limit)]),halt(0).";
 
 /// `garbage_collection`'s `min_heap_size` — the figure `+hms` drives.
 const MIN_HEAP_PROBE: &str = "io:format(\"~p~n\",[proplists:get_value(min_heap_size,\
@@ -245,8 +258,8 @@ struct Twin {
     probe: Option<&'static str>,
     /// The line both spellings must print on this runtime, where pinning one is meaningful.
     golden: Option<&'static str>,
-    /// Whether the oracle must print the same line. `false` for the two rows documented in
-    /// the module docs as policy/validation differences.
+    /// Whether the oracle half is asserted at all. `false` for the `+SP` row (whose figure is
+    /// this runtime's own scheduler-count policy — see the module docs) and for `+hmaxk`.
     oracle_agrees: bool,
     /// Whether the compact spelling must move the parsed configuration off the marker-free
     /// baseline. `false` for the two rows whose value **is** the emulator default (`+hms233`
@@ -332,18 +345,18 @@ const TWINS: &[Twin] = &[
         moves_config: false,
     },
     Twin {
-        description: "`+sbwt1000` is `+sbwt 1000` (a numeric busy-wait threshold)",
-        attached: &["+sbwt1000"],
-        separated: &["+sbwt", "1000"],
-        probe: None,
-        golden: None,
-        oracle_agrees: false,
-        moves_config: true,
-    },
-    Twin {
         description: "`+sbwtlong` is `+sbwt long` (a symbolic busy-wait threshold)",
         attached: &["+sbwtlong"],
         separated: &["+sbwt", "long"],
+        probe: None,
+        golden: None,
+        oracle_agrees: true,
+        moves_config: true,
+    },
+    Twin {
+        description: "`+sbwtmedium` is `+sbwt medium` (a second symbolic busy-wait threshold)",
+        attached: &["+sbwtmedium"],
+        separated: &["+sbwt", "medium"],
         probe: None,
         golden: None,
         oracle_agrees: true,
@@ -519,58 +532,56 @@ struct Refusal {
     args: &'static [&'static str],
     /// The **exact**, untrimmed stderr — one line, `USAGE`-free.
     stderr: &'static str,
-    /// Whether the oracle refuses the same invocation too. `false` where this runtime is
-    /// **stricter** than the oracle (see the trailing-garbage row).
-    oracle_refuses: bool,
 }
 
 /// The refusals the emulator's own reader must keep producing. The texts are the binary's
 /// (read out of `src/cli.rs`/`src/error.rs` and confirmed against the built binary):
 /// the launcher's `unknown flag -X`, the launcher's `Missing argument(s) for '+S'.`, and the
-/// emulator's one-line `bad value "…" for switch +Q` (this runtime deliberately does not
-/// reproduce `beam.smp`'s multi-kilobyte usage block, so the wording differs from the
-/// oracle's `bad number of ports bogus` — the exit status does not).
+/// emulator's one-line `bad value "…" for switch +X` (this runtime deliberately does not
+/// reproduce `beam.smp`'s multi-kilobyte usage block, so the wording differs while the exit
+/// status does not).
 ///
-/// The last row is the one **strictness** difference: the oracle's `+S`/`+P`/`+Q` readers are
-/// digit-prefix readers, so `erl +S1bogus` is accepted (exit 0, one scheduler) while this
-/// runtime rejects the same token — documented here so the divergence is visible rather than
-/// assumed away; the oracle half of that row is therefore not asserted.
+/// Every row's **exit status** is cross-checked against the oracle's under the same argv,
+/// including the two `+sbwt` rows: a numeric busy-wait threshold is refused by both runtimes
+/// in both spellings (the C's symbolic set is `very_long|long|medium|short|very_short|none`),
+/// and the oracle's own `+sbwt` diagnostic goes to the controlling terminal in this sandbox,
+/// so only its exit code is capturable.
 const REFUSALS: &[Refusal] = &[
     Refusal {
         description: "an unrecognized `+Xyz` is the launcher's `unknown flag -X`",
         args: &["+Xyz", "-noshell", "-eval", "halt(0)."],
         stderr: "beam_rt: unknown flag -Xyz\n",
-        oracle_refuses: true,
     },
     Refusal {
         description: "`+S` with no value (attached or separated) is the launcher's diagnostic",
         args: &["+S"],
         stderr: "beam_rt: Missing argument(s) for '+S'.\n",
-        oracle_refuses: true,
     },
     Refusal {
         description: "`+Q bogus` keeps the separated form's bad-value diagnostic",
         args: &["+Q", "bogus", "-noshell", "-eval", "halt(0)."],
         stderr: "beam_rt: bad value \"bogus\" for switch +Q\n",
-        oracle_refuses: true,
     },
     Refusal {
         description: "`+Qbogus` reports the same diagnostic with the value parsed attached",
         args: &["+Qbogus", "-noshell", "-eval", "halt(0)."],
         stderr: "beam_rt: bad value \"bogus\" for switch +Q\n",
-        oracle_refuses: true,
     },
     Refusal {
-        description: "`+S1bogus` reports the attached value verbatim (stricter than the oracle)",
-        args: &["+S1bogus", "-noshell", "-eval", "halt(0)."],
-        stderr: "beam_rt: bad value \"1bogus\" for switch +S\n",
-        oracle_refuses: false,
+        description: "`+sbwt1000` refuses a numeric busy-wait threshold (the attached spelling)",
+        args: &["+sbwt1000", "-noshell", "-eval", "halt(0)."],
+        stderr: "beam_rt: bad value \"1000\" for switch +sbwt\n",
+    },
+    Refusal {
+        description: "`+sbwt 1000` refuses the same numeric value in the separated spelling",
+        args: &["+sbwt", "1000", "-noshell", "-eval", "halt(0)."],
+        stderr: "beam_rt: bad value \"1000\" for switch +sbwt\n",
     },
 ];
 
-/// Every refusal: exit **1**, exactly one stderr line, and **no** `USAGE` block — and, where
-/// the oracle refuses too, the same exit status under the same argv (its wording is not the
-/// shared contract, which is why only the status is cross-checked).
+/// Every refusal: exit **1**, exactly one stderr line, and **no** `USAGE` block — and the same
+/// exit status from the oracle under the same argv (its wording is not the shared contract,
+/// which is why only the status is cross-checked).
 #[test]
 fn the_refusals_are_unchanged_in_both_spellings() {
     let oracle = support::require_oracle("cli_compact_flags");
@@ -614,14 +625,6 @@ fn the_refusals_are_unchanged_in_both_spellings() {
             ));
         }
         // The oracle refuses the same invocation (exit 1) — the shared half of a refusal.
-        if !refusal.oracle_refuses {
-            println!(
-                "note cli_compact_flags: the oracle half of {:?} is not asserted — this \
-                 runtime is stricter than the digit-prefix readers (see REFUSALS)",
-                refusal.description
-            );
-            continue;
-        }
         if let Some(oracle) = oracle.as_deref() {
             match support::run_bounded_with_env(oracle, refusal.args, &env) {
                 Some(theirs) if theirs.status.code() == Some(1) => {}
@@ -635,6 +638,116 @@ fn the_refusals_are_unchanged_in_both_spellings() {
                     refusal.description
                 )),
             }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------
+// (c2) the digit-prefix tolerance — the numeric `+` switches agree with the oracle
+// ---------------------------------------------------------------------------------------
+
+/// One digit-prefix row: an attached `+` switch whose numeric value carries trailing garbage,
+/// the `system_info` probe it drives, and the figure both runtimes answer for it.
+struct DigitPrefix {
+    /// What the row pins (used in the assertion messages).
+    description: &'static str,
+    /// The argv: an attached numeric `+` switch followed by trailing garbage.
+    args: &'static [&'static str],
+    /// The driven observable.
+    probe: &'static str,
+    /// The figure the C's digit-prefix readers (`atoi`/`strtol`/`sscanf`) answer — the value
+    /// stops at the first non-digit, so the garbage is ignored rather than refused.
+    golden: &'static str,
+}
+
+/// The numeric `+` switches read their value the way the C does — a digit prefix, not the whole
+/// token. Both runtimes accept every row below and answer the prefix.
+const DIGIT_PREFIX: &[DigitPrefix] = &[
+    DigitPrefix {
+        description: "`+S1bogus` takes the `1` and ignores `bogus` (the `atoi` prefix)",
+        args: &["+S1bogus"],
+        probe: SCHEDULERS_PROBE,
+        golden: "1",
+    },
+    DigitPrefix {
+        description: "`+S1x` takes the `1` and ignores `x`",
+        args: &["+S1x"],
+        probe: SCHEDULERS_PROBE,
+        golden: "1",
+    },
+    DigitPrefix {
+        description: "`+P65536bogus` takes the `65536` and ignores `bogus`",
+        args: &["+P65536bogus"],
+        probe: PROCESS_LIMIT_PROBE,
+        golden: "65536",
+    },
+    DigitPrefix {
+        description: "`+Q1024x` takes the `1024` and ignores `x`",
+        args: &["+Q1024x"],
+        probe: PORT_LIMIT_PROBE,
+        golden: "1024",
+    },
+    DigitPrefix {
+        description: "`+t1048576x` takes the `1048576` and ignores `x`",
+        args: &["+t1048576x"],
+        probe: ATOM_LIMIT_PROBE,
+        golden: "1048576",
+    },
+];
+
+/// Every row: exit **0** with **empty** stderr and the digit-prefix figure on this runtime —
+/// and the *same* line from the live oracle under the same argv, so the figure is a live
+/// cross-check rather than a pinned guess. A missing `erl` skips only the oracle half, loudly.
+#[test]
+fn the_numeric_switches_take_the_c_digit_prefix_like_the_oracle() {
+    let oracle = support::require_oracle("cli_compact_flags");
+    let mut failures: Vec<String> = Vec::new();
+    for row in DIGIT_PREFIX {
+        let ours = run(beam_rt(), row.args, row.probe);
+        if ours.code != 0 {
+            failures.push(format!(
+                "{}: exit {:?} (stderr {:?})",
+                row.description, ours.code, ours.err
+            ));
+            continue;
+        }
+        if !ours.err.is_empty() {
+            failures.push(format!("{}: stderr {:?}", row.description, ours.err));
+        }
+        if ours.out != row.golden {
+            failures.push(format!(
+                "{}: answered {:?} != the pinned {:?}",
+                row.description, ours.out, row.golden
+            ));
+        }
+
+        let Some(oracle) = oracle.as_deref() else {
+            continue;
+        };
+        let theirs = run(
+            oracle.to_str().expect("the oracle path is UTF-8"),
+            row.args,
+            row.probe,
+        );
+        if theirs.code != 0 {
+            failures.push(format!(
+                "{}: the oracle exited {:?} (stderr {:?})",
+                row.description, theirs.code, theirs.err
+            ));
+            continue;
+        }
+        if !theirs.err.is_empty() {
+            failures.push(format!(
+                "{}: the oracle's stderr {:?}",
+                row.description, theirs.err
+            ));
+        }
+        if theirs.out != ours.out {
+            failures.push(format!(
+                "{}: beam_rt {:?} != oracle {:?}",
+                row.description, ours.out, theirs.out
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
