@@ -278,6 +278,10 @@ RSS, which is why down-sizing `heap_words` is the lever and a reservation-trunca
   owned by the region — which is what exhausts regions on a compile.
   A retired region is kept rather than freed because **another caller still owns words in it**
   (`calls.rs:177-179`), so its capacity is unreclaimable, not merely unreclaimed.
+  Measured: this pool **is** the dominant store, and its size is `max nesting depth × heap_words`
+  (`take_bif_heap`'s `None => Heap::new(self.bif_heap_words)`, `runtime.rs:2167`, is the per-level
+  allocation; the two other `heap_words`-sized sites — the NIF load host `bridges.rs:641` and the
+  foreign-send scratch `runtime.rs:1833` — are not on a compile's path).
 - **`Runtime::arena`** — `heap_available`/`alloc_words` on a table-less context answer the arena
   (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` (`runtime.rs:2180-2182`) → one
   `MinimalContext` (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>`
