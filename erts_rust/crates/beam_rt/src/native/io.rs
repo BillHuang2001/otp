@@ -26,17 +26,31 @@
 //! Every one of them is an `io.erl` wrapper over `o_request/2` (`io.erl:160-207`), which
 //! resolves the request's **device** and posts `{io_request, self(), Mref, Request}` to it,
 //! blocking in a `receive` for `{io_reply, Mref, Reply}`. The default device is
-//! `group_leader()` (`io.erl:196-200`, `default_output/0`), and this runtime's group leader
-//! for its own root process is **itself**, so `execute_request/3`'s first clause
-//! (`io.erl:1653`) answers `{ErrorTag, calling_self}` and the wrapper raises
-//! `error:calling_self` (`conv_reason/1`, `io.erl:798`) — every `io:fwrite/2` in the
-//! installed **compiler**'s error-reporting `catch` handlers
-//! (`lib/compiler/src/beam_ssa_bool.erl:140-152`, `beam_ssa_type.erl:225-233`) therefore
-//! *replaces* the compiler's real diagnostic with `calling_self`.
+//! `group_leader()` (`io.erl:1710`, `default_output/0`), which here is the runtime's root
+//! process for every action process (and the root itself for the root); no io server runs
+//! there, so that round trip never completes. Serving the keys in this floor removes
+//! `io.erl` from the path for them, so no request ever needs a round trip: the device
+//! question is answered by [`RuntimeContext::io_device`] and the bytes go straight to the
+//! selected stream.
 //!
-//! Serving the keys here removes `io.erl` from the path for them, so the request never
-//! leaves the runtime and the device question is answered by [`RuntimeContext::io_device`]
-//! instead of by a message round trip this runtime cannot complete against itself.
+//! The **omitted** default device is therefore a deliberate substitution — the caller's
+//! output stream (stdout) — and it is load-bearing: every `io:fwrite/2` in the installed
+//! **compiler**'s error-reporting `catch` handlers
+//! (`lib/compiler/src/beam_ssa_bool.erl:140-152`, `beam_ssa_type.erl:225-233`) reports
+//! through it, and that substitution is what lets the compiler's real diagnostic print
+//! instead of being replaced by an io-device failure. An **explicit** device is never
+//! substituted: it is classified exactly as `o_request/2` + `request/3` classify it and
+//! raises whatever the oracle raises.
+//!
+//! # The arity truth: `io:format/3` is `(Device, Format, Args)`
+//!
+//! OTP has no options-taking `io:format/3` (`io.erl:1350`,
+//! `format(Io, Format, Args) -> o_request(format, [Io, Format, Args])`), so
+//! `io:format("~p~n", [[1,2]], [])` passes the *format string* as the **device** and raises
+//! `error:function_clause` — the oracle's own answer, reproduced by [`Self::io_stream`]'s
+//! [`Device::NoClause`] arm. The options-taking form of that name is `io_lib:format/3`,
+//! whose `{chars_limit, _}` and friends are real `io_lib` code (**not** this floor) and are
+//! byte-identical to the oracle's.
 //!
 //! # The device model
 //!
@@ -49,11 +63,16 @@
 //! | `standard_io` | `request/3`'s `standard_io` clause rewrites it to `group_leader()` | stdout |
 //! | `user` | the registered terminal device | stdout |
 //! | `standard_error` | the registered stderr device | stderr |
-//! | the caller's **own** group-leader pid | that device (the terminal) | stdout |
+//! | the caller **itself** (`self()`) | `execute_request/3`'s first clause → `{ErrorTag, calling_self}` → `error:calling_self` | `error:calling_self` |
+//! | the caller's **group leader** pid (a **distinct** process) | that device (the terminal) | stdout |
 //! | the registered `standard_error` pid | that device | stderr |
-//! | another **registered** device pid | the `{io_request, …}` round trip | the typed `unsupported` (a BIF cannot block) |
+//! | another **live** device pid | the `{io_request, …}` round trip | the typed `unsupported` (a BIF cannot block) |
 //! | an **unregistered** atom | `{ErrorTag, arguments}` → `error:badarg` | `error:badarg` |
 //! | not an atom and not a pid | no `o_request/2` clause matches → `error:function_clause` | `error:function_clause` |
+//!
+//! The self test is `execute_request/3`'s **first** clause, so it comes first here too and
+//! wins over every other reading — an atom registered to the caller, and a group leader that
+//! *is* the caller, are both `calling_self`.
 //!
 //! A non-stdout device that this runtime *can* serve is never silently redirected to
 //! stdout, and a device it cannot reach is a typed `unsupported` rather than a fabricated
@@ -107,6 +126,10 @@ enum Stream {
 enum Device {
     /// The device selects this stream.
     Stream(Stream),
+    /// The device **is the calling process itself**, which `execute_request/3`'s first
+    /// clause answers `{ErrorTag, calling_self}` (`io.erl:1665`) — surfaced as
+    /// `error:calling_self` (`conv_reason/1`, `io.erl:784`).
+    CallingSelf,
     /// The argument is an atom naming **no registered process**: `request/3`'s
     /// `whereis(Name) =:= undefined` clause answers `{ErrorTag, arguments}`, which
     /// `o_request/2` turns into `error:badarg` (`conv_reason/1`, `io.erl:782`).
@@ -234,23 +257,26 @@ impl RuntimeContext<'_> {
     /// The stream a request's **effective device** selects, or the raise the oracle
     /// produces for a device this runtime cannot serve.
     ///
-    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`, which
-    /// this runtime's own single output stream stands in for (the group leader of a process
-    /// this runtime starts is itself, which is exactly the `calling_self` case this floor
-    /// exists to answer).
+    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`
+    /// (`io.erl:1710`), which this runtime's single output stream stands in for — the
+    /// substituted default that keeps the installed compiler's `io:fwrite/2` diagnostics
+    /// printing (see the module docs). The **explicit** device is resolved by
+    /// [`Self::io_device`], so it is never substituted.
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for an atom naming no registered process, the bare
-    /// `function_clause` for a non-atom/non-pid argument, and the typed `unsupported` for a
-    /// live device that needs the `{io_request, …}` round trip — each the oracle's own
-    /// answer, never a silent redirect to stdout.
+    /// The `error:calling_self` of an explicit `self()` device, [`BeamError::BadArg`] for an
+    /// atom naming no registered process, the bare `function_clause` for a non-atom/non-pid
+    /// argument, and the typed `unsupported` for a live device that needs the
+    /// `{io_request, …}` round trip — each the oracle's own answer, never a silent redirect
+    /// to stdout.
     fn io_stream(&self, device: Option<Eterm>) -> Result<Stream> {
         let Some(device) = device else {
             return Ok(Stream::Output);
         };
         match self.io_device(device) {
             Device::Stream(stream) => Ok(stream),
+            Device::CallingSelf => Err(prim::calling_self()),
             Device::UnknownAtom => Err(BeamError::BadArg),
             Device::NoClause => Err(prim::function_clause()),
             Device::Unreachable => Err(error::unsupported(UNREACHABLE_DEVICE)),
@@ -285,13 +311,20 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// The stream a **live** device pid selects.
+    /// The class a **live** device pid selects.
     ///
-    /// The caller's own **group leader** is the default device — the terminal this runtime
-    /// writes to — and the registered `standard_error` device is the process's standard
-    /// error. Every other live device would need the `{io_request, …}`/`{io_reply, …}` round
-    /// trip, which a BIF cannot perform ([`Device::Unreachable`]).
+    /// The caller **itself** is `execute_request/3`'s **first** clause (`io.erl:1665`), so
+    /// that test runs before every other reading — a registered name that resolves to the
+    /// caller and a group leader that happens to be the caller are both that clause. The
+    /// caller's own **group leader** (a distinct process here) is the default device — the
+    /// terminal this runtime writes to — and the registered `standard_error` device is the
+    /// process's standard error. Every other live device would need the
+    /// `{io_request, …}`/`{io_reply, …}` round trip, which a BIF cannot perform
+    /// ([`Device::Unreachable`]).
     fn io_pid_device(&self, pid: ProcessId) -> Device {
+        if pid == self.pid() {
+            return Device::CallingSelf;
+        }
         if pid == self.runtime.group_leader_of(self.pid()) {
             return Device::Stream(Stream::Output);
         }
@@ -356,6 +389,21 @@ mod tests {
         terms::make_list(&mut context, &[]).expect("the empty list")
     }
 
+    /// The `[[1,2]]` argument list `~p` renders in the arity probes.
+    fn one_two(runtime: &mut Runtime) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        let inner = terms::make_list(&mut context, &[make_small(1), make_small(2)])
+            .expect("a two-element list");
+        terms::make_list(&mut context, &[inner]).expect("a one-element list")
+    }
+
+    /// The pid this context runs as, as a term.
+    fn own_pid(runtime: &mut Runtime) -> ProcessId {
+        let mut sink = beam_bifs::NullSink;
+        let context = RuntimeContext::with_output(runtime, &mut sink);
+        context.pid()
+    }
     /// `io:nl/0` writes exactly one newline and answers `ok`; `io:nl/1` does the same for
     /// every device this runtime serves.
     #[test]
@@ -549,5 +597,124 @@ mod tests {
         let text = chars(&mut runtime, "hi");
         let error = call(&mut runtime, "io", "write", &[device, text]).expect_err("write/2");
         assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+
+    /// `io:format/3` is `(Device, Format, Args)`, and OTP has **no** options-taking
+    /// `io:format/3` (`io.erl:1350`): an `io:format(Format, Args, Options)`-shaped call passes
+    /// the *format string* as the **device**, so it is the bare `function_clause` — on the
+    /// oracle exactly as here, never `badarg` and never a silent `ok`. The device forms that
+    /// really name a stream render `~p` and answer `ok`.
+    #[test]
+    fn format_3_is_device_format_args() {
+        // `io:format("~p~n", [[1,2]], [])`: the format string lands in the device slot, and
+        // `[]` lands in the argument slot, so `o_request/2` has no clause to pick.
+        let mut runtime = runtime();
+        let format = chars(&mut runtime, "~p~n");
+        let data = one_two(&mut runtime);
+        let empty = no_args(&mut runtime);
+        let (result, out) = call_capturing(&mut runtime, "format", &[format, data, empty]);
+        let error = result.expect_err("format(\"~p~n\", [[1,2]], [])");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+        assert_eq!(out, "", "a raised request writes nothing to the output stream");
+
+        for name in ["standard_io", "user"] {
+            let mut served = crate::native::test_support::runtime();
+            let device = atom(&mut served, name);
+            let format = chars(&mut served, "~p~n");
+            let data = one_two(&mut served);
+            let (result, out) = call_capturing(&mut served, "format", &[device, format, data]);
+            assert_eq!(
+                served.atom_name_of(result.expect("format/3")),
+                Some("ok"),
+                "format({name}, ...)"
+            );
+            assert_eq!(out, "[1,2]\n", "format({name}, ...)");
+        }
+
+        // `group_leader()` is the caller's group leader — a **distinct** process here — and a
+        // device this runtime answers on the output stream. (The unit-test caller *is* the
+        // runtime's root, whose default leader is itself, so it gets a leader of its own.)
+        let mut leader = crate::native::test_support::runtime();
+        let root = own_pid(&mut leader);
+        let group_leader = ProcessId::new(root.number() + 1000, root.serial());
+        leader.set_group_leader(root, group_leader);
+        let device = group_leader.to_eterm();
+        let format = chars(&mut leader, "~p~n");
+        let data = one_two(&mut leader);
+        let (result, out) = call_capturing(&mut leader, "format", &[device, format, data]);
+        assert_eq!(
+            leader.atom_name_of(result.expect("format(group_leader(), ...)")),
+            Some("ok")
+        );
+        assert_eq!(out, "[1,2]\n", "format(group_leader(), ...)");
+    }
+
+    /// An **explicit `self()` device** is `execute_request/3`'s first clause
+    /// (`io.erl:1665`) — `error:calling_self` on the oracle, and here too, for every
+    /// device-taking entry point. Nothing reaches the output stream, because the request is
+    /// refused before the payload is read.
+    #[test]
+    fn explicit_self_device_raises_calling_self() {
+        let mut runtime = runtime();
+        let me = own_pid(&mut runtime);
+        let me_term = me.to_eterm();
+        let format = chars(&mut runtime, "~p~n");
+        let data = no_args(&mut runtime);
+        let text = chars(&mut runtime, "hi");
+        let hi = atom(&mut runtime, "hi");
+
+        for (what, function, args) in [
+            ("io:format/3", "format", vec![me_term, format, data]),
+            ("io:fwrite/3", "fwrite", vec![me_term, format, data]),
+            ("io:put_chars/2", "put_chars", vec![me_term, text]),
+            ("io:nl/1", "nl", vec![me_term]),
+            ("io:write/2", "write", vec![me_term, hi]),
+        ] {
+            let (result, out) = call_capturing(&mut runtime, function, &args);
+            let error = result.expect_err(what);
+            assert_eq!(error.as_atom(), Some("calling_self"), "{what}: {error}");
+            assert_eq!(out, "", "{what}: nothing may reach the output stream");
+        }
+
+        // The `whereis` path reaches the same clause: an atom registered to the caller **is**
+        // the caller, so it is `calling_self` too — not the output stream.
+        runtime
+            .register_boot_process("the_calling_process", me)
+            .expect("register the caller's name");
+        let named = atom(&mut runtime, "the_calling_process");
+        let (result, out) = call_capturing(&mut runtime, "nl", &[named]);
+        let error = result.expect_err("io:nl(<name of self>)");
+        assert_eq!(error.as_atom(), Some("calling_self"), "{error}");
+        assert_eq!(out, "");
+    }
+
+    /// A live device pid that is **neither** the caller nor its group leader stays the typed
+    /// capability gap (a BIF cannot block on the `{io_request, …}`/`{io_reply, …}` round
+    /// trip), for every device-taking entry point — never a silent redirect to stdout.
+    #[test]
+    fn another_live_device_pid_is_the_typed_gap() {
+        let mut runtime = runtime();
+        let own = own_pid(&mut runtime);
+        let other = ProcessId::new(own.number() + 1000, own.serial()).to_eterm();
+        let format = chars(&mut runtime, "~p~n");
+        let data = no_args(&mut runtime);
+        let text = chars(&mut runtime, "hi");
+        let hi = atom(&mut runtime, "hi");
+
+        for (what, function, args) in [
+            ("io:format/3", "format", vec![other, format, data]),
+            ("io:fwrite/3", "fwrite", vec![other, format, data]),
+            ("io:put_chars/2", "put_chars", vec![other, text]),
+            ("io:nl/1", "nl", vec![other]),
+            ("io:write/2", "write", vec![other, hi]),
+        ] {
+            let (result, out) = call_capturing(&mut runtime, function, &args);
+            let error = result.expect_err(what);
+            let reason = crate::error::unsupported_reason(&error).unwrap_or_else(|| {
+                panic!("{what}: a live non-stdio device must be the typed capability gap: {error}")
+            });
+            assert!(reason.contains("io-device"), "{what}: {reason}");
+            assert_eq!(out, "", "{what}: a capability gap writes nothing");
+        }
     }
 }

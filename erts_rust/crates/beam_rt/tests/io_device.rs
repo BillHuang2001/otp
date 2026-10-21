@@ -27,12 +27,16 @@
 //! Each one is an `io.erl` wrapper over `o_request/2` (`lib/stdlib/src/io.erl:160-207`),
 //! which resolves the request's **device** and posts `{io_request, self(), Mref, Request}` to
 //! it, blocking in a `receive` for `{io_reply, Mref, Reply}`. The default device is
-//! `group_leader()`, and this runtime's own root process is its own group leader, so
-//! `execute_request/3` answers `{error, calling_self}` and the wrapper raises
-//! `error:calling_self` — which *replaces* the diagnostic of every installed compiler
-//! `catch` handler that reports through `io:fwrite/2`. The floor serves the keys directly
-//! (`src/native/io.rs`), so the request never leaves the runtime and the device question is
-//! answered natively; the rendering still goes through the **registered** `io_lib:format/2`.
+//! `group_leader()`, which here is a process that runs no io server, so that round trip never
+//! completes — and an **explicit `self()`** device is `execute_request/3`'s first clause, the
+//! oracle's `error:calling_self`. The floor serves the keys directly (`src/native/io.rs`), so
+//! the request never leaves the runtime and the device question is answered natively; the
+//! rendering still goes through the **registered** `io_lib:format/2`.
+//!
+//! `io:format/3` is `(Device, Format, Args)` — OTP has **no** options-taking `io:format/3`
+//! (`io.erl:1350`), so `io:format("~p~n", [[1,2]], [])` passes the format string as the
+//! device and is the bare `function_clause` on both runtimes. The `{chars_limit, _}` options
+//! belong to `io_lib:format/3`, which is real `io_lib` code and is cross-checked separately.
 //!
 //! # What is compared
 //!
@@ -252,8 +256,9 @@ fn io_nl_0_writes_exactly_one_newline() {
 }
 
 /// `io:nl/1`'s device argument is honoured for every device this runtime serves: the
-/// `standard_io` rewrite, the `user` terminal name, and the caller's **own** group-leader
-/// pid (the `calling_self` case the floor exists to answer) all select the output stream.
+/// `standard_io` rewrite, the `user` terminal name, and the caller's **group-leader pid** (a
+/// distinct process here — the caller's *own* pid is `error:calling_self` instead, see
+/// [`an_explicit_self_device_is_the_oracles_calling_self`]) all select the output stream.
 #[test]
 fn io_nl_1_honours_the_device() {
     for (device, expr) in [
@@ -543,4 +548,141 @@ fn io_format_1_and_2_are_unchanged_by_the_floor() {
         "io:format(\"gf2 ~p~n\",[7]), halt(0).",
         b"gf2 7\n",
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// The arity truth: `io:format/3` is `(Device, Format, Args)`
+// ---------------------------------------------------------------------------------------
+
+/// `io:format/3` is `(Device, Format, Args)` and OTP has **no** options-taking
+/// `io:format/3` (`io.erl:1350`), so the `io:format(Format, Args, Options)`-shaped call
+/// passes the format string as the **device** and raises the bare `function_clause` — on the
+/// oracle exactly as here.
+///
+/// This is pinned on purpose: reading the third argument as an options list would turn a
+/// genuine oracle agreement into a divergence. The options-taking form is `io_lib:format/3`
+/// (real `io_lib` code, never this floor), which answers `[[91,"...",93]]` for
+/// `io_lib:format("~p",[[1,2]],[{chars_limit,3}])` on both runtimes.
+#[test]
+fn the_empty_options_shaped_format_3_is_the_arity_truth() {
+    pinned_stdout(
+        "io:format(\"~p~n\", [[1,2]], []) caught",
+        "R = try io:format(\"~p~n\",[[1,2]],[]) catch error:E -> E end, \
+         io:format(\"~p~n\",[R]), halt(0).",
+        b"function_clause\n",
+    );
+    // Uncaught: both runtimes exit 1 and print nothing on stdout.
+    let run = differential(
+        "io:format(\"~p~n\", [[1,2]], []) uncaught",
+        "io:format(\"~p~n\",[[1,2]],[]), halt(0).",
+    );
+    assert_eq!(run.code, 1, "a runtime error is CLI exit 1");
+    assert!(
+        run.out.is_empty(),
+        "an uncaught function_clause prints nothing to stdout — got {:?}",
+        run.out_str()
+    );
+
+    // The device-form siblings really render: the `{Device, Format, Args}` reading is the
+    // oracle's, so no `function_clause` and no silent `ok` without the bytes.
+    pinned_stdout(
+        "io:format(standard_io, \"~p~n\", [[1,2]])",
+        "io:format(standard_io,\"~p~n\",[[1,2]]), halt(0).",
+        b"[1,2]\n",
+    );
+    pinned_stdout(
+        "io:format(user, ...)",
+        "io:format(user,\"~p~n\",[[1,2]]), halt(0).",
+        b"[1,2]\n",
+    );
+    pinned_stdout(
+        "io:format(group_leader(), ...)",
+        "io:format(group_leader(),\"~p~n\",[[1,2]]), halt(0).",
+        b"[1,2]\n",
+    );
+    // `io_lib:format/3` is the options-taking API, and it is byte-identical to the oracle's.
+    pinned_stdout(
+        "io_lib:format(\"~p\",[[1,2]],[{chars_limit,3}])",
+        "io:format(\"~p~n\",[io_lib:format(\"~p\",[[1,2]],[{chars_limit,3}])]), halt(0).",
+        b"[[91,\"...\",93]]\n",
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The explicit `self()` device: `error:calling_self` (oracle-equal)
+// ---------------------------------------------------------------------------------------
+
+/// An **explicit `self()`** device is `execute_request/3`'s first clause (`io.erl:1665`), so
+/// the oracle raises `error:calling_self` (`conv_reason/1`, `io.erl:784`) — and so does this
+/// floor, on **every** device-taking entry point. The payload is never written, and the
+/// reason is never a bare `function_clause` or an `ok`.
+#[test]
+fn an_explicit_self_device_is_the_oracles_calling_self() {
+    for (what, call) in [
+        ("io:format/3", "io:format(self(), \"x~n\", [])"),
+        ("io:fwrite/3", "io:fwrite(self(), \"x~n\", [])"),
+        ("io:put_chars/2", "io:put_chars(self(), \"x\")"),
+        ("io:nl/1", "io:nl(self())"),
+        ("io:write/2", "io:write(self(), hi)"),
+    ] {
+        pinned_stdout(
+            what,
+            &format!("R = try {call} catch error:E -> E end, io:format(\"~p~n\",[R]), halt(0)."),
+            b"calling_self\n",
+        );
+    }
+    // Uncaught: both runtimes exit 1 with nothing on stdout — the exit-status parity, not
+    // just the caught reason.
+    let run = differential("io:nl(self()) uncaught", "io:nl(self()), halt(0).");
+    assert_eq!(run.code, 1, "a runtime error is CLI exit 1");
+    assert!(
+        run.out.is_empty(),
+        "an uncaught calling_self prints nothing to stdout — got {:?}",
+        run.out_str()
+    );
+}
+
+/// The whole device matrix, cross-checked against the live oracle: the caught reason and the
+/// printed text (the payload plus the `~p` rendering of the reason) must be the oracle's own.
+///
+/// `standard_error` sends its payload to **fd 2**, so its arm lives in
+/// [`the_standard_error_device_keeps_its_payload_on_fd_2`] where the stderr bytes are
+/// compared too.
+#[test]
+fn the_device_matrix_answers_like_the_oracle() {
+    for (device, expected) in [
+        // Not an atom and not a pid: no `o_request/2` clause matches.
+        ("[]", "function_clause\n"),
+        ("1", "function_clause\n"),
+        // The streams this runtime serves.
+        ("standard_io", "x\nok\n"),
+        ("user", "x\nok\n"),
+        ("group_leader()", "x\nok\n"),
+        // The caller itself: `execute_request/3`'s first clause.
+        ("self()", "calling_self\n"),
+        // An atom naming no registered process.
+        ("no_such_io_device", "badarg\n"),
+    ] {
+        let expr = format!(
+            "R = try io:format({device}, \"x~n\", []) catch error:E -> E end, \
+             io:format(\"~p~n\",[R]), halt(0)."
+        );
+        pinned_stdout(
+            &format!("io:format({device}, ...)"),
+            &expr,
+            expected.as_bytes(),
+        );
+    }
+}
+
+/// `standard_error` selects **fd 2** for its payload while the caught reason (`ok`) still
+/// reaches stdout, and both streams match the oracle byte for byte.
+#[test]
+fn the_standard_error_device_keeps_its_payload_on_fd_2() {
+    let expr = "R = try io:format(standard_error, \"x~n\", []) catch error:E -> E end, \
+                io:format(\"~p~n\",[R]), halt(0).";
+    let run = differential_with_stderr("io:format(standard_error, ...)", expr);
+    assert_ok("io:format(standard_error, ...)", &run);
+    assert_eq!(run.out, b"ok\n", "the caught reason is `ok`");
+    assert_eq!(run.err, b"x\n", "the payload lands on stderr");
 }
