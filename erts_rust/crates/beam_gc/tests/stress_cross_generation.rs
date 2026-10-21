@@ -748,6 +748,28 @@ fn observe(kind: MatureKind) -> Observation {
     let mut snapshots: Vec<String> = Vec::new();
     let mut sentinel = NIL;
 
+    // The **initial fullsweep**, pinned on both strategies before round 0 allocates anything.
+    //
+    // The copying collector's first collection is mandated to be a fullsweep — a fresh process
+    // has no old generation (`old_heap_size_words() == 0` is the C's `OLD_HEAP(p) == NULL`,
+    // `erl_gc.c:1486-1488`), so `Collector::collect` selects `CollectionKind::Major` while that
+    // holds — while `GenImmixCollector::collect` has no such guard, so its first `collect` would
+    // be a minor and the two strategies' sequences would diverge at collection 0.
+    // `collect_kind` neither chooses nor escalates, and a fullsweep resets the fullsweep-cadence
+    // counter, so both runs then count minors from 0 and the `fullsweep_after = 3` cadence
+    // produces the identical sequence (see
+    // `rich_corpus_survives_cross_generation_collections_under_both_strategies`). It runs on the
+    // empty nursery, which [`policy`] pins as a fixed point of the sizing rules
+    // (`min_heap_words` floors both targets), so no capacity moves.
+    let warm = c
+        .collect_kind(CollectionKind::Major, &mut roots)
+        .expect("the initial fullsweep");
+    assert_eq!(
+        warm.kind,
+        CollectionKind::Major,
+        "{kind:?}: `collect_kind` runs exactly the kind it is given"
+    );
+
     for round in 0..ROUNDS {
         if round == 0 {
             let r0 = build_round0(c.young_mut().heap_mut(), &ctx);
@@ -898,7 +920,10 @@ fn rich_corpus_survives_cross_generation_collections_under_both_strategies() {
     let copying = observe(MatureKind::Copying);
     let immix = observe(MatureKind::Immix);
 
-    // Six minors and two forced fullsweeps, driven purely by the cadence.
+    // Six minors and two forced fullsweeps, driven purely by the cadence. Derived from
+    // `fullsweep_after = 3`: a fullsweep resets `minor_since_major`, and both runs take the
+    // pinned initial fullsweep first (see `observe`), so collection `i` is a major iff
+    // `i % (fullsweep_after + 1) == fullsweep_after`, i.e. every fourth round starting at 3.
     let expected: Vec<CollectionKind> = (0..ROUNDS)
         .map(|r| {
             if r % 4 == 3 {

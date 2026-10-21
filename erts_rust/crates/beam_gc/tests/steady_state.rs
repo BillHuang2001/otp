@@ -210,14 +210,20 @@ const COPYING_STEADY: Steady = Steady {
 };
 
 /// The **copying** mature occupancy's converged cycle: one live set per minor since the last
-/// fullsweep (`60 -> 120 -> ... -> 780 -> 60`). A minor promotes the nursery's live words onto the
+/// fullsweep (`60 -> 120 -> ... -> 960 -> 60`). A minor promotes the nursery's live words onto the
 /// top of the mature space without reclaiming it, and [`AnyCollector::collect`] admits a minor
-/// only while the mature space has a whole nursery's occupancy (`210` words) available — so the
-/// 987-word space takes minors while `987 - used >= 210`, i.e. up to `used = 780`, and the
+/// only while the mature space's room covers the nursery's **live promotion** — the
+/// `minor_promotion_fits` / C `erl_gc.c:1486-1488` room test, which is the 60-word live set here —
+/// so the 987-word space takes minors while `987 - used >= 60`, i.e. up to `used = 960`, and the
 /// escalation test then fires a fullsweep, which evacuates young *and* mature into a fresh space
 /// holding exactly the 60-word live set, so the occupancy starts over at 60 rather than growing
-/// without bound. Thirteen live sets per fullsweep.
-const COPYING_OCCUPANCY_CYCLE: [usize; 13] = [
+/// without bound. `987 / 60 = 16` live sets per fullsweep, fifteen promotions.
+///
+/// The step count is derived from that rule below (`COPYING_STEADY.mature_capacity / LIVE_WORDS`)
+/// rather than counted off the list, so the two constants cannot drift apart.
+const COPYING_OCCUPANCY_STEPS: usize = 16;
+const _: () = assert!(COPYING_OCCUPANCY_STEPS == COPYING_STEADY.mature_capacity / LIVE_WORDS);
+const COPYING_OCCUPANCY_CYCLE: [usize; COPYING_OCCUPANCY_STEPS] = [
     LIVE_WORDS,
     2 * LIVE_WORDS,
     3 * LIVE_WORDS,
@@ -231,6 +237,9 @@ const COPYING_OCCUPANCY_CYCLE: [usize; 13] = [
     11 * LIVE_WORDS,
     12 * LIVE_WORDS,
     13 * LIVE_WORDS,
+    14 * LIVE_WORDS,
+    15 * LIVE_WORDS,
+    16 * LIVE_WORDS,
 ];
 
 /// The converged **constant** steady state for the **mark-region** strategy. The target is the
@@ -363,8 +372,10 @@ fn the_quiescent_heap_converges_to_a_constant() {
         // the convergence honest: it is the sizing of the real fullsweep, not a run that never
         // reached one.
         //
-        // For the **copying** strategy that is exactly the 60 -> ... -> 780 occupancy cycle:
-        // twelve minors per fullsweep. The **mark-region** region is line-granular and its
+        // For the **copying** strategy that is exactly the 60 -> ... -> 960 occupancy cycle:
+        // fifteen minors per fullsweep (the 987-word space keeps room for one 60-word live
+        // promotion until it holds 960 words, so sixteen occupancy values precede the reset).
+        // The **mark-region** region is line-granular and its
         // `collect` escalates to a fullsweep unless the region's *free lines* cover the
         // promotion's line need: 20 one-line tuples need 20 lines, while the 1024-word (64-line)
         // region holds the 20-line live set and leaves 44 free lines — enough to admit a
