@@ -70,7 +70,8 @@ use crate::error::unsupported_bif;
 
 use super::{
     char_printable, dup_chars, latin1_printable_char, printable_string, proper_list, quoted_string,
-    record::RecordParts, resolve_map_pairs, term_chunk_order, Chunk, MapOrder, UNLIMITED_DEPTH,
+    record::{self, RecordParts}, resolve_map_pairs, term_chunk_order, Chunk, MapOrder,
+    UNLIMITED_DEPTH,
 };
 
 mod cind;
@@ -633,6 +634,22 @@ fn build(
         }
         return build_binary(ctx, term, printable, d, t, order);
     }
+    if is_record(term) {
+        if d == 1 {
+            // `print_length_native_record(Rec, 1, _T, …)`: the *flat* depth-1 text
+            // (`RecStr = io_lib:write(Rec, 1, Enc, Ord, -1)`, i.e. `#m:r{...}`), a
+            // chars **leaf** with `Dots = 3` and the record-level re-run closure.
+            let parts = record::record_parts(ctx, term)?;
+            let chunk = record::flat_record_chunk(ctx, &parts, false, 1, order)?;
+            return Ok(Node {
+                len: chunk.flat_len() as i64,
+                dots: 3,
+                tpl: Tpl::Text(chunk),
+                more: More::Build { term, d: 1 },
+            });
+        }
+        return build_record(ctx, term, printable, d, t, order);
+    }
     // `print_length/7`'s catch-all: `io_lib:write/1`, never truncated.
     Ok(Node::text(term_chunk_order(
         ctx,
@@ -994,6 +1011,113 @@ fn write_binary_body(bytes: &[u8], d: i64, t: i64) -> (Vec<Chunk>, bool) {
     }
     (body, false)
 }
+/// `io_lib_pretty:print_length_native_record/7` (the `D =:= 1` clause is
+/// [`build`]'s): the `#Module:Name` prefix ([`RecordParts::name`]), the field
+/// sequence generated at `D - 1`, and the whole thing's flat length and dots
+/// (`list_length(Pairs, NameL + 2, 0)` — the `+2` is the braces).
+///
+/// # Errors
+///
+/// As [`record::record_parts`] (a malformed record is `badarg`, never a fabricated
+/// rendering), plus whatever a field's value builder reports.
+fn build_record(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    d: i64,
+    t: i64,
+    order: MapOrder,
+) -> Result<Node> {
+    let parts: Rc<RecordParts> = Rc::new(record::record_parts(ctx, term)?);
+    let fields = record_fields_from(
+        ctx,
+        &parts,
+        0,
+        d - 1,
+        tsub(t, parts.name_len + 2),
+        printable,
+        order,
+    )?;
+    let (len, dots) = list_length(&fields, parts.name_len + 2, 0);
+    // As for a list, the record-level re-run closure is attached **only** when the
+    // rendering was truncated.
+    let more = if dots > 0 {
+        More::Build { term, d }
+    } else {
+        More::None
+    };
+    Ok(Node {
+        tpl: Tpl::Record { parts, fields },
+        len,
+        dots,
+        more,
+    })
+}
+/// `io_lib_pretty:print_length_native_record_fields/8` — the record's fields from
+/// index `i`, one per depth level.
+///
+/// **Iterative**, like [`list1`]/[`tuple1`]/[`map1`] (a record of any length is
+/// walked on one stack frame; see the module docs on totality). The chars-budget
+/// accounting is the **mirror** of the list rule: the oracle's
+/// `T1 = case Fs == [] of true -> tsub(T,1); false -> T end` charges the comma to
+/// the **last** field, where [`list1`] charges it to every field *but* the last.
+///
+/// # Errors
+///
+/// As [`build`].
+fn record_fields_from(
+    ctx: &mut BifContext<'_>,
+    parts: &Rc<RecordParts>,
+    mut i: usize,
+    mut d: i64,
+    mut t: i64,
+    printable: bool,
+    order: MapOrder,
+) -> Result<Seq> {
+    let n = parts.fields.len();
+    let mut elems: Vec<Node> = Vec::new();
+    while i < n {
+        // The `[]` clause precedes the dots clause, so an empty field list is a
+        // proper end at any depth/budget (it never reaches this loop).
+        if d == 1 || t == 0 {
+            return Ok(Seq {
+                elems,
+                tail: SeqTail::Dots(More::Field1 {
+                    parts: parts.clone(),
+                    i,
+                    d,
+                }),
+            });
+        }
+        let field = &parts.fields[i];
+        let t1 = if i + 1 == n { tsub(t, 1) } else { t };
+        let value = build(
+            ctx,
+            field.value,
+            printable,
+            d - 1,
+            tsub(t1, field.key_len),
+            order,
+        )?;
+        t = tsub(t1, field.key_len + value.len);
+        d -= 1;
+        elems.push(Node {
+            len: field.key_len + value.len,
+            dots: value.dots,
+            tpl: Tpl::Field {
+                name: Chunk::text(&field.key_text),
+                name_len: field.key_len,
+                value: Box::new(value),
+            },
+            more: More::None,
+        });
+        i += 1;
+    }
+    Ok(Seq {
+        elems,
+        tail: SeqTail::None,
+    })
+}
 /// `io_lib_pretty:write/1` — the single-line (flat) rendering of a template.
 fn write(node: &Node) -> Chunk {
     match &node.tpl {
@@ -1006,6 +1130,12 @@ fn write(node: &Node) -> Chunk {
             Chunk::Char('>'),
         ]),
         Tpl::Pair(_, _) => write_pair(node),
+        // `write({{record, [{Name,_} | L]}, _, _, _}) -> [Name, ${, write_fields(L), $}]`.
+        Tpl::Record { parts, fields } => write_record_node(parts, fields),
+        // A field is reached through `write_fields/1`, never through `write/1`; the
+        // oracle's catch-all would hand back the `{field,…}` template itself, which
+        // is not chars, so this arm renders the field's own `[Name, " = ", Value]`.
+        Tpl::Field { .. } => write_field(node),
         Tpl::Container(kind, seq) => match kind {
             Kind::List => Chunk::List(vec![
                 Chunk::Char('['),
@@ -1071,6 +1201,54 @@ fn write_pair(node: &Node) -> Chunk {
         _ => write(node),
     }
 }
+/// `io_lib_pretty:write/2`'s record clause — `[Name, ${, write_fields(L), $}]`.
+fn write_record_node(parts: &RecordParts, fields: &Seq) -> Chunk {
+    let mut items = parts.name.clone().into_items();
+    items.push(Chunk::Char('{'));
+    items.push(write_fields(fields));
+    items.push(Chunk::Char('}'));
+    Chunk::List(items)
+}
+/// `io_lib_pretty:write_fields/1` + `write_fields_tail/1` — a record's fields
+/// joined by `,`, with a `{dots,…}` sequence as the **nested** leaf `",..."` (the
+/// oracle's `write_fields_tail({dots,_,_,_}) -> ",..."`), the same shape
+/// [`pp_pairs_tail`] uses for a map's elided tail. The whole-sequence clause
+/// `write_fields({dots,…}) -> "..."` is likewise one nested leaf.
+fn write_fields(seq: &Seq) -> Chunk {
+    if seq.elems.is_empty() && matches!(seq.tail, SeqTail::Dots(_)) {
+        return Chunk::text("...");
+    }
+    let mut items: Vec<Chunk> =
+        Vec::with_capacity(seq.elems.len().saturating_mul(2).saturating_add(2));
+    for (i, f) in seq.elems.iter().enumerate() {
+        if i > 0 {
+            items.push(Chunk::Char(','));
+        }
+        items.push(write_field(f));
+    }
+    match &seq.tail {
+        SeqTail::None => {}
+        SeqTail::Dots(_) => items.push(Chunk::text(",...")),
+        // A record's field sequence is always properly terminated, so this arm is
+        // unreachable; it is written out for totality and mirrors [`write_seq`].
+        SeqTail::Improper(t) => {
+            if !seq.elems.is_empty() {
+                items.push(Chunk::Char(','));
+            }
+            items.extend(write(t).into_items());
+        }
+    }
+    Chunk::List(items)
+}
+/// `io_lib_pretty:write_field/1` — `[Name, " = " | write(F)]`.
+fn write_field(node: &Node) -> Chunk {
+    match &node.tpl {
+        Tpl::Field { name, value, .. } => {
+            Chunk::List(vec![name.clone(), Chunk::text(" = "), write(value)])
+        }
+        _ => write(node),
+    }
+}
 /// `io_lib_pretty`'s `?ATM/1` — a template that renders as a plain char list. A
 /// `{bin, S}` template is **not** atomic, so a binary element is repacked by
 /// `pp_binary/7` on its own line rather than written inline.
@@ -1081,6 +1259,16 @@ fn atomic(node: &Node) -> bool {
 fn atomic_pair(node: &Node) -> bool {
     match &node.tpl {
         Tpl::Pair(k, v) => atomic(k) && atomic(v),
+        _ => false,
+    }
+}
+/// `io_lib_pretty`'s `?ATM_FLD/1` — the **value** of a record field is atomic
+/// (`?ATM(element(4, element(1, Field)))`), i.e. the field's value template is a
+/// chars leaf. A field with a plain leaf value is packed on the current line;
+/// anything else forces a newline.
+fn atomic_field(node: &Node) -> bool {
+    match &node.tpl {
+        Tpl::Field { value, .. } => atomic(value),
         _ => false,
     }
 }
@@ -1116,6 +1304,30 @@ fn pp(node: &Node, col: i64, ll: i64, m: i64, t_ind: i64, ind: &Chunk, ld: i64, 
                 Chunk::Char('}'),
             ]),
         },
+        // `pp({{record, [{Name,NLen} | L]}, …}) ->
+        //      [Name, ${, pp_record(L, NLen, Col, Ll, M, TInd, Ind, LD, W + NLen+1), $}]`
+        // — `Col` is passed through **unchanged** (the prefix is not counted
+        // against the column the field indent is measured from).
+        Tpl::Record { parts, fields } => Chunk::List(vec![
+            parts.name.clone(),
+            Chunk::Char('{'),
+            pp_record(
+                fields,
+                parts.name_len,
+                col,
+                ll,
+                m,
+                t_ind,
+                ind,
+                ld,
+                w + parts.name_len + 1,
+            ),
+            Chunk::Char('}'),
+        ]),
+        // `pp/8` has no field clause: a field is reached only through [`pp_field`]
+        // (and `cind_field/7`), never from [`pp`]. Rendering it flat is the same text
+        // [`pp_field`] produces for a field that fits.
+        Tpl::Field { .. } => write_field(node),
     }
 }
 /// `[Head… | Tail]` — the oracle *conses* a recursive `pp` result onto the elements
@@ -1448,6 +1660,183 @@ fn pp_pair(
         ll,
     )
 }
+/// `io_lib_pretty:pp_record/10` — a record's field sequence: the first field after
+/// the [`rec_indent`] break, the rest through [`pp_fields_tail`].
+///
+/// `name_len` is the `#Module:Name` width, so `Nind = NameL + 1` is the column the
+/// continuation lines want (the `{` plus the name). `col0` is the column the record
+/// itself starts at.
+#[allow(clippy::too_many_arguments)]
+fn pp_record(
+    fields: &Seq,
+    name_len: i64,
+    col0: i64,
+    ll: i64,
+    m: i64,
+    t_ind: i64,
+    ind0: &Chunk,
+    ld: i64,
+    w0: i64,
+) -> Chunk {
+    let (first, rest) = match fields.elems.split_first() {
+        Some(split) => split,
+        None => match &fields.tail {
+            // `pp_record({dots,…}, …) -> "..."`.
+            SeqTail::Dots(_) => return Chunk::text("..."),
+            // `pp_record([], …) -> ""`.
+            _ => return Chunk::List(Vec::new()),
+        },
+    };
+    let n_ind = name_len + 1;
+    let (col, ind, s, w) = rec_indent(n_ind, t_ind, col0, ind0, w0);
+    let (fs, fw) = pp_field(
+        first,
+        col,
+        ll,
+        m,
+        t_ind,
+        &ind,
+        last_depth(!rest.is_empty(), ld),
+        w,
+    );
+    let rest_chunk = pp_fields_tail(
+        rest,
+        &fields.tail,
+        col,
+        col + fw,
+        ll,
+        m,
+        t_ind,
+        &ind,
+        ld,
+        w + fw,
+    );
+    // `[S, FS | pp_fields_tail(…)]` — `S` is the oracle's `""` when it did not break.
+    let mut head: Vec<Chunk> = Vec::with_capacity(2);
+    head.extend(s);
+    head.push(fs);
+    cons(head, rest_chunk)
+}
+/// `io_lib_pretty:pp_fields_tail/9` — everything after a record's first field.
+/// **Iterative**, like [`pp_tail`]/[`pp_pairs_tail`] (one frame per record).
+#[allow(clippy::too_many_arguments)]
+fn pp_fields_tail(
+    fields: &[Node],
+    tail: &SeqTail,
+    col0: i64,
+    mut col: i64,
+    ll: i64,
+    m: i64,
+    t_ind: i64,
+    ind: &Chunk,
+    ld: i64,
+    mut w: i64,
+) -> Chunk {
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut rest = fields;
+    loop {
+        match rest.split_first() {
+            None => {
+                // `pp_fields_tail({dots,…}, …) -> ",..."` — one nested leaf, like
+                // [`pp_pairs_tail`].
+                if matches!(tail, SeqTail::Dots(_)) {
+                    out.push(Chunk::text(",..."));
+                }
+                return Chunk::List(out);
+            }
+            Some((f, more)) => {
+                let ld1 = last_depth(!more.is_empty(), ld);
+                let e_len = 1 + f.len;
+                let flat = if ld1 == 0 {
+                    e_len + 1 < ll - col && w + e_len + 1 <= m && atomic_field(f)
+                } else {
+                    e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic_field(f)
+                };
+                if flat {
+                    out.push(Chunk::Char(','));
+                    out.push(write_field(f));
+                    col += e_len;
+                    w += e_len;
+                } else {
+                    let (fs, fw) = pp_field(f, col0, ll, m, t_ind, ind, ld1, 0);
+                    out.push(Chunk::Char(','));
+                    out.push(Chunk::Char('\n'));
+                    out.push(ind.clone());
+                    out.push(fs);
+                    col = col0 + fw;
+                    w = fw;
+                }
+                rest = more;
+            }
+        }
+    }
+}
+/// `io_lib_pretty:pp_field/9` — one record field and the width it occupied.
+///
+/// The flat clause answers `Len` for a leaf **value** (`?ATM_FLD`) and `Ll` (force a
+/// newline) for anything else; the broken clause always forces the newline and picks
+/// its separator from whether [`rec_indent`] broke the line
+/// (`Sep = case S of [$\n | _] -> " ="; _ -> " = " end`).
+#[allow(clippy::too_many_arguments)]
+fn pp_field(
+    f: &Node,
+    col: i64,
+    ll: i64,
+    m: i64,
+    t_ind: i64,
+    ind: &Chunk,
+    ld: i64,
+    w: i64,
+) -> (Chunk, i64) {
+    if f.len < ll - col - ld && f.len + w + ld <= m {
+        let we = if atomic_field(f) { f.len } else { ll };
+        return (write_field(f), we);
+    }
+    let (name, name_len, value) = match &f.tpl {
+        Tpl::Field {
+            name,
+            name_len,
+            value,
+        } => (name, *name_len, value.as_ref()),
+        _ => return (write_field(f), ll),
+    };
+    let (col1, ind1, s, w1) = rec_indent(name_len, t_ind, col, ind, w + name_len);
+    // `Sep` is `" ="` exactly when `S` starts with the newline, i.e. when
+    // [`rec_indent`] broke the field onto its own line.
+    let sep = if s.is_some() { " =" } else { " = " };
+    let mut head = vec![name.clone(), Chunk::text(sep)];
+    head.extend(s);
+    // `[Name, Sep, S | pp(F, …)]`.
+    (cons(head, pp(value, col1, ll, m, t_ind, &ind1, ld, w1)), ll)
+}
+/// `io_lib_pretty:rec_indent/5` — the column, continuation indent and separator
+/// prefix of a record field.
+///
+/// A field indents by the tagged-tuple indent `TInd` when the caller found one that
+/// is narrower than `RInd` (and then the field starts on a **new line**, `S =
+/// [$\n | Ind]`, with `W` reset to `0`); otherwise by `RInd` itself and the field
+/// stays on the current line (`S = ""`, which is the `None`).
+fn rec_indent(
+    r_ind: i64,
+    t_ind: i64,
+    col0: i64,
+    ind0: &Chunk,
+    w0: i64,
+) -> (i64, Chunk, Option<Chunk>, i64) {
+    let nl = t_ind > 0 && r_ind > t_ind;
+    let d_col = if nl { t_ind } else { r_ind };
+    let col = col0 + d_col;
+    let ind = indent_chunk(d_col.max(0) as usize, ind0);
+    let s = if nl {
+        let mut items = vec![Chunk::Char('\n')];
+        items.extend(ind.clone().into_items());
+        Some(Chunk::List(items))
+    } else {
+        None
+    };
+    let w = if nl { 0 } else { w0 };
+    (col, ind, s, w)
+}
 /// `io_lib_pretty:pp_binary/7` — the `[LT, LT, S, GT, GT]` clause, with
 /// `N = max(8, min(Ll - Col, M - 4 - W) - LD)` and the continuation indent, the
 /// body repacked by [`pp_binary_body`].
@@ -1639,11 +2028,46 @@ fn expand(
                 more: More::None,
             })
         }
-        (_, More::Build { term, d }) => build(ctx, *term, printable, d + dd, t, order),
-        // A sequence-level dots closure is only reached through [`expand_seq`].
-        (_, More::List1 { .. } | More::Tuple1 { .. } | More::Map1 { .. }) | (_, More::None) => {
-            Err(unsupported_bif())
+        // `expand({{record, [{Name,NameL} | L]}, _Len, _, no_more}, T, Dd)` — the
+        // field sequence expands with `NameL + 2` already spent on the prefix.
+        (Tpl::Record { parts, fields }, More::None) => {
+            let seq = expand_seq(ctx, fields, t, dd, printable, order, parts.name_len + 2)?;
+            let (len, dots) = list_length(&seq, parts.name_len + 2, 0);
+            Ok(Node {
+                tpl: Tpl::Record {
+                    parts: parts.clone(),
+                    fields: seq,
+                },
+                len,
+                dots,
+                more: More::None,
+            })
         }
+        // `expand({{field, Name, NameL, Field}, _Len, _, no_more}, T, Dd)`.
+        (Tpl::Field { name, name_len, value }, More::None) => {
+            let v = expand(ctx, value, tsub(t, *name_len), dd, printable, order)?;
+            Ok(Node {
+                len: name_len + v.len,
+                dots: v.dots,
+                tpl: Tpl::Field {
+                    name: name.clone(),
+                    name_len: *name_len,
+                    value: Box::new(v),
+                },
+                more: More::None,
+            })
+        }
+        (_, More::Build { term, d }) => build(ctx, *term, printable, d + dd, t, order),
+        // A sequence-level dots closure is only reached through [`expand_seq`], which
+        // dispatches it to [`expand_dots`] (the field one included).
+        (
+            _,
+            More::List1 { .. }
+            | More::Tuple1 { .. }
+            | More::Map1 { .. }
+            | More::Field1 { .. },
+        )
+        | (_, More::None) => Err(unsupported_bif()),
     }
 }
 /// `io_lib_pretty:expand_list/4` — expand each element of a sequence `Dd` levels
@@ -1702,7 +2126,8 @@ fn expand_seq(
 /// # Errors
 ///
 /// The typed [`unsupported_bif`] if the closure is not a sequence generator (it
-/// always is: only [`list1`]/[`tuple1`]/[`map1`] build a `SeqTail::Dots`).
+/// always is: only [`list1`]/[`tuple1`]/[`map1`]/[`record_fields_from`] build a
+/// `SeqTail::Dots`).
 fn expand_dots(
     ctx: &mut BifContext<'_>,
     more: &More,
@@ -1716,6 +2141,9 @@ fn expand_dots(
         More::Tuple1 { term, i, d } => tuple1(ctx, *term, printable, *i, d + dd, t, order),
         More::Map1 { pairs, i, d, d0 } => {
             map1(ctx, pairs, printable, *i, d + dd, *d0, t, order)
+        }
+        More::Field1 { parts, i, d } => {
+            record_fields_from(ctx, parts, *i, d + dd, t, printable, order)
         }
         More::None | More::Build { .. } => Err(unsupported_bif()),
     }

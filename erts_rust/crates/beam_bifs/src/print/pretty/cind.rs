@@ -29,7 +29,9 @@ use beam_common::Result;
 
 use crate::error::badarg;
 
-use super::{atomic, atomic_pair, last_depth, map_value_indent, Kind, Node, Seq, SeqTail, Tpl};
+use super::{
+    atomic, atomic_field, atomic_pair, last_depth, map_value_indent, Kind, Node, Seq, SeqTail, Tpl,
+};
 
 /// `io_lib_pretty:cind/7` — the indentation a tagged tuple's continuation lines
 /// want, or `Err` on the oracle's `throw(no_good)`.
@@ -50,6 +52,14 @@ fn cind(node: &Node, col: i64, ll: i64, m: i64, ind: i64, ld: i64, w: i64) -> Re
             Kind::Tuple(false) => cind_list(seq, col + 1, ll, m, ind, ld, w + 1),
             Kind::Map => cind_map(seq, col + 2, ll, m, ind, ld, w + 2),
         },
+        // `cind({{record, [{_Name,NLen} | L]}, _Len, _, _}, Col, Ll, M, Ind, LD, W) ->
+        //      cind_record(L, NLen, Col, Ll, M, Ind, LD, W + NLen + 1)`.
+        Tpl::Record { parts, fields } => {
+            cind_record(fields, parts.name_len, col, ll, m, ind, ld, w + parts.name_len + 1)
+        }
+        // A field is reached through [`cind_field`], never from `cind/7`; the
+        // oracle's catch-all `cind({S,_Len,_,_}, _, _, _, Ind, _, _) -> Ind` answers.
+        Tpl::Field { .. } => Ok(ind),
     }
 }
 /// `io_lib_pretty:cind_tag_tuple/7`.
@@ -144,6 +154,128 @@ fn cind_pair(
     let value_ind = map_value_indent(ind);
     cind(v, col0 + value_ind, ll, m, ind, ld, 0)?;
     Ok(ll)
+}
+/// `io_lib_pretty:cind_record/8` — the indentation a record's field sequence wants.
+///
+/// The oracle's `[]` and `{dots,…}` clauses are its catch-all
+/// `cind_record(_, _Nlen, _Col, _Ll, _M, Ind, _LD, _W) -> Ind`, so an empty or
+/// elided field sequence answers the caller's `Ind` instead of failing.
+///
+/// # Errors
+///
+/// As [`cind_rec`]/[`cind_field`] (the oracle's `no_good`).
+#[allow(clippy::too_many_arguments)]
+fn cind_record(
+    fields: &Seq,
+    name_len: i64,
+    col0: i64,
+    ll: i64,
+    m: i64,
+    ind: i64,
+    ld: i64,
+    w0: i64,
+) -> Result<i64> {
+    let (first, rest) = match fields.elems.split_first() {
+        Some(split) => split,
+        None => return Ok(ind),
+    };
+    let n_ind = name_len + 1;
+    let (col, w) = cind_rec(n_ind, col0, ll, m, ind, w0)?;
+    let fw = cind_field(
+        first,
+        col,
+        ll,
+        m,
+        ind,
+        last_depth(!rest.is_empty(), ld),
+        w,
+    )?;
+    cind_fields_tail(rest, col, col + fw, ll, m, ind, ld, w + fw)
+}
+/// `io_lib_pretty:cind_fields_tail/8`.
+///
+/// `col0` is the record's continuation column (the one [`cind_rec`] produced) and
+/// `col` the running one. The broken arm continues at `Col + FW`
+/// (`cind_fields_tail(Fs, Col0, Col + FW, …)`) — the oracle's own asymmetry with its
+/// map twin [`cind_pairs_tail`], which continues at `Col0 + PW`; reproduced as
+/// written.
+#[allow(clippy::too_many_arguments)]
+fn cind_fields_tail(
+    fields: &[Node],
+    col0: i64,
+    col: i64,
+    ll: i64,
+    m: i64,
+    ind: i64,
+    ld: i64,
+    w: i64,
+) -> Result<i64> {
+    match fields.split_first() {
+        None => Ok(ind),
+        Some((f, rest)) => {
+            let ld1 = last_depth(!rest.is_empty(), ld);
+            let e_len = 1 + f.len;
+            let flat = if ld1 == 0 {
+                e_len + 1 < ll - col && w + e_len + 1 <= m && atomic_field(f)
+            } else {
+                e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic_field(f)
+            };
+            if flat {
+                cind_fields_tail(rest, col0, col + e_len, ll, m, ind, ld, w + e_len)
+            } else {
+                let fw = cind_field(f, col0, ll, m, ind, ld1, 0)?;
+                cind_fields_tail(rest, col0, col + fw, ll, m, ind, ld, fw)
+            }
+        }
+    }
+}
+/// `io_lib_pretty:cind_field/7` — a record field's width (`Len` for a leaf value,
+/// `Ll` — force a newline — otherwise), or the oracle's `no_good`.
+///
+/// # Errors
+///
+/// As [`cind_rec`]/[`cind`].
+fn cind_field(
+    f: &Node,
+    col: i64,
+    ll: i64,
+    m: i64,
+    ind: i64,
+    ld: i64,
+    w: i64,
+) -> Result<i64> {
+    if f.len < ll - col - ld && f.len + w + ld <= m {
+        return Ok(if atomic_field(f) { f.len } else { ll });
+    }
+    let (name_len, value) = match &f.tpl {
+        Tpl::Field {
+            name_len, value, ..
+        } => (*name_len, value.as_ref()),
+        _ => return Ok(ll),
+    };
+    let (col1, w1) = cind_rec(name_len, col, ll, m, ind, w + name_len)?;
+    cind(value, col1, ll, m, ind, ld, w1)?;
+    Ok(ll)
+}
+/// `io_lib_pretty:cind_rec/6` — a record field's continuation column and width
+/// base, or the oracle's `throw(no_good)` when the column leaves no room (neither
+/// `M + Col =< Ll` nor `Col =< Ll div 2`).
+///
+/// It is [`rec_indent`](super::rec_indent)'s rule without the separator chunk: the
+/// same `Nl`/`DCol`, and `W` reset to `0` exactly when the line breaks.
+///
+/// # Errors
+///
+/// `error:badarg` (the oracle's `no_good`).
+fn cind_rec(r_ind: i64, col0: i64, ll: i64, m: i64, ind: i64, w0: i64) -> Result<(i64, i64)> {
+    let nl = ind > 0 && r_ind > ind;
+    let d_col = if nl { ind } else { r_ind };
+    let col = col0 + d_col;
+    if m + col <= ll || col <= ll / 2 {
+        Ok((col, if nl { 0 } else { w0 }))
+    } else {
+        Err(badarg())
+    }
 }
 /// `io_lib_pretty:cind_list/7`.
 fn cind_list(seq: &Seq, col0: i64, ll: i64, m: i64, ind: i64, ld: i64, w: i64) -> Result<i64> {
