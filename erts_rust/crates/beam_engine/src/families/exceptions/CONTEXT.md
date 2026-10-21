@@ -44,7 +44,7 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   reservation (`2*argc + 5` words) through `terms::reserve_slack` + the `Sink`, reading the
   callee's **real** arguments from `x(0..argc)` *after* it (reserve → read → write). It is
   built only for a bare `undef`, only with a live catch frame, and only when the arguments
-  are readable — otherwise `Ok(None)` and today's unmodified raise. `Location` is the empty
+  are readable — otherwise `Ok(None)` and the unmodified raise. `Location` is the empty
   list (the callee does not exist, so there is no source position).
 - `stacktrace.rs`: `symbolic_stacktrace(machine, module, ctx, head_operand, head)` — cooks
   the machine's raise-time snapshot into the symbolic `[{M,F,A,Location}]` list from
