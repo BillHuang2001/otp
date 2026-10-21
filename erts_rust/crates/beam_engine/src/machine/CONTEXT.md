@@ -197,6 +197,17 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
   both survive it. The two off-heap rosters are released only by a host call to
   `Machine::retain_refc_binaries`.
+- **A frame's `Continuation` slot means "suspended in a call" — and a returned call does not clear it.**
+  `resumption_contexts`/`resumption_addresses`, `raise_stacktrace` and `Machine::current_stacktrace` all read
+  every non-`Halt` slot as a **live** caller, which holds only while each returned call resets the slot it
+  consumed. `return_step` (`src/interpreter/dispatch.rs`) and `jit_return`/`jit_deallocate_return`/`return_word`
+  (`src/jit/baseline/runtime.rs`) read `Machine::continuation()` and leave the value in place, so after `A`
+  calls `B` and `B` returns, `A`'s slot still names `A` and the next raise reports `A` as its own caller — a
+  duplicated head item on **every** derived trace, not only re-raises (reproduced: a `try`/`catch` in a
+  function that made one returned call yields `[{m,f,0,[line]},{m,f,0,[line]}]` where the oracle yields
+  one item). C has no residue here because the CP word lives on the stack and `return` pops past it, so
+  clearing the slot where it is consumed is the fix that restores the invariant by construction.
+  Symptom and reproduction: `../families/exceptions/CONTEXT.md` §Known Issues.
 
 ## The cross-module call seam (`resolve_external_call`) and `Machine::drive` (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
