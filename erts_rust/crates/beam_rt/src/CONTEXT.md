@@ -84,7 +84,8 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   (`:271`) plus `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap` `:1511`); and
   `eval_off_heap: beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
   `Runtime::retention_stats() -> RetentionStats` (`runtime/retention.rs`) reads all four — arena
-  demand words/calls, `bif_regions`/`bif_words`, `eval_heap_words`/`eval_heap_retired_regions`/
+  demand words/calls, `bif_regions`/`bif_words`/`bif_peak_used_words`/`bif_max_capacity_words`/
+  `bif_heaps_taken`/`bif_nested_heap_words`/`bif_nested_peak_words`, `eval_heap_words`/`eval_heap_retired_regions`/
   `eval_heap_retired_words`, `eval_off_heap_handles` (MSO slots only — `OffHeapTable::len` excludes
   the table's refc binaries) — and `BEAM_RT_MEM_TRACE` prints it as one `[rt-mem] boot …` line after
   the boot and one `[rt-mem] exit …` line on the way out of `cli::run` (silent unless set).

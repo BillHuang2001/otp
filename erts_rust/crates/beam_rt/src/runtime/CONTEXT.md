@@ -5,7 +5,7 @@
 `../runtime/scheduler.rs` (+ `scheduler/tests.rs`) is the **scheduler-pass family**: it drives processes, ports, timers and distribution in bounded steps (the distribution half is **four** steps — the server pump/inbound and the connector's pump/inbound).
 `../runner/` (a sibling directory) is the `beam_process::ProcessRunner` each scheduled process runs through; it is documented here because it is the scheduler's own instrument.
 `gc.rs` holds the runtime-level GC state, accounting and safety valves, and `ets_owner.rs` the `ProcessExitObserver` host with the two owner-death drains.
-`retention.rs` is the **retention accounting**: `RetentionStats` (one snapshot of the four never-freed storage regions — arena demand counters, the pooled BIF heap's regions/words, the `-eval` store's current and retired capacity, the escaped off-heap store's handle count) and its `Runtime::retention_stats()` accessor, plus the one-line `Display` form `BEAM_RT_MEM_TRACE` prints.
+`retention.rs` is the **retention accounting**: `RetentionStats` (one snapshot of the four never-freed storage regions — arena demand counters, the pooled BIF heap's regions/words/capacity/peak-use plus its nested-call loan count and seed, the `-eval` store's current and retired capacity, the escaped off-heap store's handle count) and its `Runtime::retention_stats()` accessor, plus the one-line `Display` form `BEAM_RT_MEM_TRACE` prints.
 
 ## API Surface
 ### `runtime.rs` — the façade
