@@ -119,6 +119,22 @@ thread_local! {
     static POOL: RefCell<Vec<Pooled>> = const { RefCell::new(Vec::new()) };
 }
 
+// How many nested runs have had to build a **fresh** machine because the pool held none for
+// their callee — the counter behind the reuse pins (test builds only; a production build has
+// no counter and no extra work at all, [`fresh_machine`] is then a plain [`Machine::new`]).
+#[cfg(test)]
+thread_local! {
+    static FRESH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A freshly built machine, counted in a test build so a pin can prove the pool answered a
+/// request instead of the allocator.
+fn fresh_machine() -> Machine {
+    #[cfg(test)]
+    FRESH_BUILDS.with(|count| count.set(count.get() + 1));
+    Machine::new()
+}
+
 /// A machine to run one nested run of `module` on: the pooled one that last ran that very
 /// module, or a fresh machine when the pool holds none for it.
 ///
@@ -133,7 +149,7 @@ pub(super) fn acquire(module: &Module) -> Machine {
             .rposition(|pooled| pooled.last_module == key)?;
         Some(pool.remove(position).machine)
     });
-    recycled.unwrap_or_else(Machine::new)
+    recycled.unwrap_or_else(fresh_machine)
 }
 
 /// Recycle the machine a finished nested run of `module` used: reset it, then push it onto the
@@ -184,9 +200,35 @@ pub(super) fn pooled_modules() -> Vec<usize> {
     POOL.with(|pool| pool.borrow().iter().map(|p| p.last_module).collect())
 }
 
-/// Empties the pool, so a pin starts from a known state (the pool is thread-local and a test
-/// thread is reused across the cases of one suite).
+/// How many machines in the pool own an off-heap handle — a non-empty `refc_binaries`
+/// reservoir or a live writable-append registration.
+///
+/// [`release`]'s `debug_assert!`s already fail loudly on the release that carries such a
+/// handle, so this is the same invariant stated *after* the fact: a pin can assert the pool is
+/// clean without depending on the assertion firing.
+#[cfg(test)]
+pub(super) fn pooled_reservoir_owners() -> usize {
+    POOL.with(|pool| {
+        pool.borrow()
+            .iter()
+            .filter(|pooled| {
+                !pooled.machine.refc_binaries().is_empty()
+                    || pooled.machine.writable_payload_count() != 0
+            })
+            .count()
+    })
+}
+
+/// How many fresh machines the pool had to build on this thread since the last [`clear`].
+#[cfg(test)]
+pub(super) fn fresh_builds() -> usize {
+    FRESH_BUILDS.with(std::cell::Cell::get)
+}
+
+/// Empties the pool and resets the fresh-build counter, so a pin starts from a known state (the
+/// pool is thread-local and a test thread is reused across the cases of one suite).
 #[cfg(test)]
 pub(super) fn clear() {
     POOL.with(|pool| pool.borrow_mut().clear());
+    FRESH_BUILDS.with(|count| count.set(0));
 }
