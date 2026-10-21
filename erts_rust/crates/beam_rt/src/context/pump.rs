@@ -20,12 +20,17 @@
 
 //! The nested-run pump: running a module export as a **scheduled process**.
 //!
-//! [`RuntimeContext::run_export`] drives one export on a fresh [`Machine`], and its blocking
+//! [`RuntimeContext::run_export`] drives one export on a pooled [`Machine`], and its blocking
 //! twins ([`RuntimeContext::run_export_blocking`] / [`RuntimeContext::run_label_blocking`])
 //! pump the scheduler while a cross-module callee is suspended in a `receive`, so the callee
 //! **suspends and resumes** instead of folding into the typed [`beam_engine::blocked`] gap.
 //! [`pump_until_returned`] is the shared bounded loop and [`BLOCKING_PUMP_DEADLINE`] its
 //! wall-clock safety cap.
+//!
+//! The machine each run executes on comes from [`super::machine_pool`], which recycles a
+//! finished run's machine instead of building a fresh one, so the engine's whole-module label
+//! map (and the register-file allocations) survive across cross-module calls into the same
+//! callee.
 
 use std::time::{Duration, Instant};
 
@@ -263,7 +268,7 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        // The fresh `Machine` below holds its `x`/stack outside the process root set a
+        // The `Machine` below holds its `x`/stack outside the process root set a
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
@@ -277,19 +282,19 @@ impl<'a> RuntimeContext<'a> {
             // store latches the window (see `crate::eval::scratch` and
             // `Runtime::pin_window_if_store_written`).
             let store_used_before = this.runtime.eval_heap.used();
-            let mut machine = Machine::new();
+            let mut machine = super::machine_pool::acquire(module);
             let result = match machine.run_export_outcome(module, function, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
                     this.pump_once(&mut machine, module, func, pc)
                 }),
                 Err(err) => Err(err),
             };
-            // The machine is dropped when this scope ends, releasing every off-heap payload
-            // handle it built — but the returned term (and any term the callee stored where
-            // this run cannot see it) may still point at one. Adopt them into the runtime's
-            // escaped-payload store **before** that drop, and release the ones this run built
-            // that nothing names any more (see [`RuntimeContext::adopt_nested_payloads`]).
-            this.adopt_nested_payloads(machine, &result, &frontier);
+            // The returned term (and any term the callee stored where this run cannot see it) may
+            // still point at an off-heap payload this run built, so those handles are adopted into
+            // the runtime's escaped-payload store and the machine's reservoir is drained **before**
+            // the machine is recycled (see [`RuntimeContext::adopt_nested_payloads`]).
+            this.adopt_nested_payloads(&mut machine, &result, &frontier);
+            super::machine_pool::release(machine, module);
             let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
@@ -342,7 +347,7 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        // The closure's fresh `Machine` holds its `x`/stack outside the process root set a
+        // The closure's `Machine` holds its `x`/stack outside the process root set a
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
@@ -352,17 +357,18 @@ impl<'a> RuntimeContext<'a> {
             // As [`Self::run_export_blocking`]: the `-eval` statement window's latch for this run,
             // because the closure's `Machine` holds its roots outside the window's descent.
             let store_used_before = this.runtime.eval_heap.used();
-            let mut machine = Machine::new();
+            let mut machine = super::machine_pool::acquire(module);
             let result = match machine.run_label_outcome(module, label, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
                     this.pump_once(&mut machine, module, func, pc)
                 }),
                 Err(err) => Err(err),
             };
-            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
-            // before the machine holding them is dropped, and release the ones this run built
-            // that nothing names any more.
-            this.adopt_nested_payloads(machine, &result, &frontier);
+            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles and
+            // drain the machine's reservoir before it is recycled, then release the ones this run
+            // built that nothing names any more.
+            this.adopt_nested_payloads(&mut machine, &result, &frontier);
+            super::machine_pool::release(machine, module);
             let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
@@ -371,10 +377,11 @@ impl<'a> RuntimeContext<'a> {
     /// The nested run's epilogue: adopt every off-heap payload handle the just-finished
     /// `machine` built, then release the ones **this run itself** built that no live term names —
     /// for both stores this runtime owns, the escaped refc-payload store and the ABI's NIF
-    /// **resource-term** registry.
+    /// **resource-term** registry — and finally drain the machine's own reservoir so it can be
+    /// recycled.
     ///
     /// Adoption is unconditional: the returned term (and every term the callee stored where
-    /// this run cannot see it) may name a payload whose only owner is about to be dropped, so
+    /// this run cannot see it) may name a payload whose only owner is the machine, so
     /// [`Runtime::adopt_escaped_binaries`](crate::runtime::Runtime) hands ownership to the
     /// runtime on **every** path — errors and deferred prunes included.
     ///
@@ -394,15 +401,18 @@ impl<'a> RuntimeContext<'a> {
     /// ordinary call that built nothing off-heap pays two compares and no copy of the machine's
     /// register file.
     ///
-    /// # Why the machine is dropped between the two steps
+    /// # Why the machine is drained before the prune
     ///
     /// The refc prune retains any payload whose `RefCount > 1` (another owner exists outside its
-    /// enumeration). While this machine lives **it** is such an owner for every payload it
-    /// built, so a prune run before the drop would retain exactly the payloads this run is
-    /// asking about. The adoption above has already cloned each handle into the store, so
-    /// dropping the machine here frees nothing. (A NIF resource *term* holds no such per-machine
-    /// reference — a copy of it shares the term binding — so the resource prune is unaffected by
-    /// the drop either way; it runs here so both prunes read one code path.)
+    /// enumeration). While this machine holds a handle it **is** such an owner for every payload
+    /// it built, so a prune run before the drain would retain exactly the payloads this run is
+    /// asking about. The adoption above has already cloned each handle into the store, so the
+    /// drain here frees nothing that a live term names — it only gives up this machine's claims,
+    /// which is what lets the caller recycle the machine
+    /// ([`machine_pool::release`](super::machine_pool)) instead of dropping it. (A NIF resource
+    /// *term* holds no such per-machine reference — a copy of it shares the term binding — so the
+    /// resource prune is unaffected by the drain either way; it runs here so both prunes read one
+    /// code path.)
     ///
     /// # Why only this run's own payloads and resource terms may be released
     ///
@@ -418,10 +428,12 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A raise's reason term is not part of the frozen root set — it escapes in
     /// [`beam_common::Raise`]'s live-reason slot — so a failed run takes the plain adopt path
-    /// and leaves both stores alone (a bounded leak).
+    /// and leaves both stores alone (a bounded leak). The reservoir is still drained, because the
+    /// adoption has taken over every handle (the machine may not keep owning one across a
+    /// recycle).
     fn adopt_nested_payloads(
         &mut self,
-        mut machine: Machine,
+        machine: &mut Machine,
         result: &Result<Eterm>,
         frontier: &crate::eval::reclaim::Frontier,
     ) {
@@ -432,7 +444,7 @@ impl<'a> RuntimeContext<'a> {
                 let refc_due = self.runtime.off_heap_prune_pending();
                 let resources_due = crate::eval::reclaim::resources_pending(self.runtime, frontier);
                 if refc_due || resources_due {
-                    let roots = self.publish_nested_roots(&mut machine, *term);
+                    let roots = self.publish_nested_roots(machine, *term);
                     (Some(roots), refc_due, resources_due)
                 } else {
                     (None, false, false)
@@ -450,8 +462,9 @@ impl<'a> RuntimeContext<'a> {
                 .collect(),
             None => Vec::new(),
         };
-        // The machine must not outlive this point as a payload owner (see above).
-        drop(machine);
+        // The machine must not own a payload past this point: the store holds every handle now,
+        // and the machine is about to be recycled (see above).
+        machine.retain_refc_binaries(|_| false);
         let Some(roots) = roots else {
             return;
         };

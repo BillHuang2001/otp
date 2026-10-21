@@ -79,6 +79,7 @@ mod fun_identity;
 pub(crate) mod gc;
 pub(crate) mod gc_walk;
 mod memory_hook;
+mod machine_pool;
 mod module_info;
 mod node_hash;
 mod persistent_term;
