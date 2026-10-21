@@ -220,16 +220,63 @@ impl Collector {
         available >= self.nursery.used_words() || available >= self.young_promotion_words(roots)
     }
 
+    /// Whether the old generation **exists** yet — the Rust mirror of the C's
+    /// `OLD_HEAP(p) != NULL`, i.e. "there is somewhere for a minor to promote into".
+    ///
+    /// The C creates the old heap **inside a collection**, never at spawn
+    /// (`erl_gc.c:1470-1478`, the "Create new, empty old_heap" block of `minor_collection`;
+    /// `major_collection` discards and re-creates it). A process's first collection therefore
+    /// always finds `OLD_HEAP(p) == NULL`: `minor_collection`'s "is there an old heap *and* is it
+    /// large enough?" test is
+    ///
+    /// ```c
+    /// if (OLD_HEAP(p) &&
+    ///     ((mature_size <= OLD_HEND(p) - OLD_HTOP(p)) && …))
+    /// ```
+    ///
+    /// (`erl_gc.c:1486-1488`), so with no old heap the minor cannot take its copy branch: it
+    /// falls through to the "Not enough room for a minor collection. Must force a major
+    /// collection." `return -1` (`erl_gc.c:1574-1577`), which `garbage_collect` turns into its
+    /// `do_major_collection` branch (`erl_gc.c:839-849`). The **first** collection of every
+    /// process is that fullsweep.
+    ///
+    /// This crate's old-generation fact is [`HeapObservable::old_heap_size_words`] — the C's
+    /// `p->old_heap ? old_hend - old_heap : 0` (`erts/emulator/beam/erl_bif_info.c:1023-1030`),
+    /// which answers `0` exactly while no collection has created the generation. It is a
+    /// *derived, observable* fact here rather than the raw pointer the C reads, but it is the
+    /// same fact: the mature space is pre-allocated empty by
+    /// [`Collector::with_allocator`](Collector::with_allocator), and only a collection makes it
+    /// the old generation.
+    ///
+    /// It also covers the second, independent ground, capacity: a mature space of
+    /// `capacity_words() == 0` cannot receive a single promoted word, so no minor that has
+    /// anything to promote can succeed into it — and such a minor would not create the
+    /// generation either, leaving the collector permanently on the wrong side of the C's test.
+    /// The `old_heap_size_words()` spelling answers `0` for both readings (never collected, or
+    /// an empty-capacity old generation), so it is the one this guard relies on.
+    ///
+    /// What the guard must not be replaced by is [`minor_promotion_fits`] alone: that predicate
+    /// answers `available >= used_words`, which is **vacuously true** for an empty nursery
+    /// (`0 >= 0`) — and the first collection of a fresh process is precisely the run that has to
+    /// create the old generation, whether or not it has anything to promote yet.
+    fn has_old_generation(&self) -> bool {
+        self.old_heap_size_words() != 0
+    }
+
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     ///
     /// A major is chosen when the fullsweep cadence is due
     /// ([`HeapPolicy::fullsweep_due`], the C `GEN_GCS(p) >= MAX_GEN_GCS(p)`,
-    /// `erl_gc.c:694,831`) **or** when the mature space cannot receive the nursery's live
-    /// promotion ([`minor_promotion_fits`] — the C `erl_gc.c:1486-1488` room test that turns a
-    /// minor into a fullsweep). Otherwise a minor runs.
+    /// `erl_gc.c:694,831`), **or** when there is no old generation yet
+    /// ([`has_old_generation`] — the C `OLD_HEAP(p)` test at `erl_gc.c:1486-1488` whose failure
+    /// sends the first collection to `do_major_collection`, `erl_gc.c:1574-1577`, `:839-849`),
+    /// **or** when the mature space cannot receive the nursery's live promotion
+    /// ([`minor_promotion_fits`] — the same `erl_gc.c:1486-1488` room test). Otherwise a minor
+    /// runs.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)
+            || !self.has_old_generation()
             || !self.minor_promotion_fits(roots)
         {
             CollectionKind::Major
