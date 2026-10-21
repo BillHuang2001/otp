@@ -235,11 +235,11 @@ Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interprete
 `ensure_heap` doors, and a per-BIF/per-call `spend` on the native tier), one slice's prologue/epilogue
 does this host work (each is amortized over the whole 4000-reduction budget, so it is per-`run`, never
 per-iteration):
-* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:383`/`817`), the
-  FR prefix read `Machine::fr_mark()` (`run.rs:677`), the tier lookup (`run.rs:430-438`),
-  `note_reductions` (`run.rs:602`), `serve_gc_request` (early-returns without a pending request),
-  and — on the `Yield` arm only — `current_code()` (`run.rs:778`) and
-  `reset_reductions`/`bump_reductions` (`run.rs:791-792`).
+* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:821` /
+  `:1329`, `:1463`, `:1540`), the FR prefix read `Machine::fr_mark()` (`run.rs:1219`), the tier
+  lookup (`run.rs:873-881`), `note_reductions` (`run.rs:1144`), `serve_gc_request`
+  (early-returns without a pending request), and — on the `Yield` arm only — `current_code()`
+  (`run.rs:1263`) and `reset_reductions`/`bump_reductions` (`run.rs:1276-1277`).
 * **One allocation per slice:** `RuntimeContext::enter_module` (`run.rs:475` →
   `../context/runtime_context.rs:501-508`) builds a fresh `String` of the module name on **every**
   slice (a `RuntimeContext` itself is a stack value: `for_process_with_engines`, no heap alloc).
