@@ -399,6 +399,54 @@ impl HeapPolicy {
         }
     }
 
+    /// The smallest size (in words) **strictly greater** than `size` — the "one step further
+    /// than the space it replaces" size a growth installs.
+    ///
+    /// This is the C's `erts_next_heap_size(size, 1)` (`erl_gc.c:310-338`, used at
+    /// `:1886-1888`): the growth path takes the table entry *after* the current size, which is
+    /// the "never the same size when **growing**" rule. [`next_words`](Self::next_words) with
+    /// `offset == 1` answers that entry, and this accessor completes it into a total function:
+    /// past the growth table's top (or under a [`min_heap_words`](Self::min_heap_words) floor
+    /// above every entry) the table cannot name a larger size, so the answer is `size + 1`. It is
+    /// therefore **always** strictly greater than `size`, which is the property the no-relocation
+    /// growth seam needs: a growth must never install a space no larger than the one it retires.
+    ///
+    /// A clamp by [`max_heap_words`](Self::max_heap_words) can still place the answer below
+    /// `size`, which is the caller's explicit ceiling, not a sizing rule.
+    pub fn next_words_above(&self, size: usize) -> usize {
+        let stepped = self.next_words(size, 1);
+        if stepped > size {
+            stepped
+        } else {
+            size.saturating_add(1)
+        }
+    }
+
+    /// The most capacity (in words) a **nursery chain** may hold for a live-set base of
+    /// `base_words` — the cap [`Nursery::grow`](crate::Nursery) applies to a chain that already
+    /// retains a space.
+    ///
+    /// It is [`YOUNG_SHRINK_FACTOR`] (`8`) times the base, i.e. the *same* multiple
+    /// [`young_after_collection`](Self::young_after_collection) and
+    /// [`young_after_fullsweep`](Self::young_after_fullsweep) treat as the acceptable in-place
+    /// hysteresis band around a live-set target (`target <= capacity <= 8 * target` is "keep").
+    /// Deriving it from that band rather than inventing a number is deliberate: a growth may
+    /// strand no more capacity than a **collection** would have kept in place, so a nursery that
+    /// has measured its live set can never hold more than the band's upper edge.
+    ///
+    /// The base is the caller's: the live-set target the last collection derived
+    /// ([`young_minor_target_words`](Self::young_minor_target_words) /
+    /// [`young_target_words`](Self::young_target_words)) when one has been measured, and the
+    /// request-derived space size when the nursery has never collected. In the second case the
+    /// caller floors the cap by that space's own size, so a **single** genuinely large allocation
+    /// is always grantable — the C's `delay_garbage_collection` (`erl_gc.c:500-599`), which hands
+    /// out one bounded fragment sized to the actual need.
+    ///
+    /// The floor is [`nursery_floor_words`](Self::nursery_floor_words), so a policy whose reserve
+    /// (or a `+hms` minimum) is larger than the base still has a usable cap.
+    pub fn chain_cap_words(&self, base_words: usize) -> usize {
+        YOUNG_SHRINK_FACTOR.saturating_mul(base_words.max(self.nursery_floor_words()))
+    }
     /// The heap size to use after a fullsweep, from the `live_words` a collection kept
     /// and the `need_words` the mutator still requires.
     ///

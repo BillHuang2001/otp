@@ -41,17 +41,18 @@
 //!   [`collapse`](Nursery::collapse) — the whole-collector half a host builds
 //!   [`ScannedBounds`](crate::ScannedBounds) from, so its unscanned-root valve can reject an
 //!   address outside the chain with one comparison instead of the indexed test.
-//! * **The chain is bounded.** [`grow`](Nursery::grow) takes the plain one-step next size
-//!   whenever that already enlarges the space, and only falls back to at least a **doubling**
-//!   when the one-step target would install a space no larger than the one it replaces, so a
-//!   growth loop that keeps enlarging an equally-full space climbs the growth table
-//!   geometrically instead of gaining one ≈same-size space per call. Once the nursery has
-//!   **collected**, it also remembers the live-set target that collection derived and caps every
-//!   fresh space at `max(one_step, live_target)` (`live_target_words`), so the growth seam cannot
-//!   install a capacity the next collection would have to give back. A fresh nursery — no
-//!   measured live set yet — still climbs the growth table. Either way the retained chain is
-//!   `O(requirement)`, its summed capacity bounded by the requests that built it, and the next
-//!   collection drops it.
+//! * **The chain is bounded.** A growth always installs a space **strictly larger** than the one
+//!   it retires ([`HeapPolicy::next_words_above`], the C's "never the same size when *growing*"
+//!   rule `erl_gc.c:310-338`), so a growth event can never stack an equally sized space onto the
+//!   chain — one whole retained capacity that grants no room. Once the nursery has **collected**
+//!   it also remembers the live-set target that collection derived and narrows every fresh space
+//!   from above at `max(one_step, live_target)` (`live_target_words`), so the growth seam cannot
+//!   install a capacity the next collection would have to give back. And a chain that already
+//!   **retains** a space may only grow while its summed capacity stays inside the live set's keep
+//!   band ([`HeapPolicy::chain_cap_words`], `YOUNG_SHRINK_FACTOR` times the live target) — the C's
+//!   one-young-block-plus-one-bounded-fragment shape (`delay_garbage_collection`,
+//!   `erl_gc.c:500-599`) — so `capacity_words()` is bounded by the **live set** and is *flat in
+//!   the number of growth events* rather than one capacity per event.
 //! * **The chain's *summed* capacity obeys the ceiling.** [`capacity_words`](Nursery::capacity_words)
 //!   is what `HeapPolicy::max_heap_words` bounds — a fresh space may only claim the budget the
 //!   chain has left, so `capacity_words() <= max_heap_words` after every successful growth. A
@@ -60,7 +61,9 @@
 //! * **A provably empty retired space is re-adopted, not replaced.** A space a growth retired
 //!   without ever handing out a word can serve a later request itself: the swap allocates
 //!   nothing and consumes none of the chain's capacity budget, which is the second reason the
-//!   chain cannot be driven past the ceiling by a loop of small requests.
+//!   chain cannot be driven past the ceiling by a loop of small requests. The empty spaces are
+//!   **indexed by capacity** ([`empty_retired`](Nursery::empty_retired)), so selecting one is
+//!   `O(log #spaces)` and no growth event scans the chain.
 //!
 //! Every superseded space is **retained until a collection evacuates it**, never freed by the
 //! growth itself: it may hold live words (they were handed to the mutator) and only a
@@ -82,7 +85,7 @@
 //! This module is safe Rust — it only manipulates [`HeapSpace`] values; `unsafe` stays
 //! confined to the word-level modules of the crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use beam_alloc::AllocRef;
 use beam_common::Result;
@@ -92,7 +95,6 @@ use crate::bounds::ScannedBounds;
 use crate::error::heap_exhausted;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
-
 /// The reserved extent `[base, limit)` of `space`, as a generation-`0` [`ScannedBounds`].
 ///
 /// The **reserved** extent, deliberately, not the live fill `[base, top)`: `top` moves on every
@@ -129,7 +131,25 @@ pub(crate) struct Nursery {
     /// therefore distinct bases); a same-`base` insert could only come from a zero-capacity
     /// space — an empty live region for which both entries answer `false` identically.
     retired_regions: BTreeMap<usize, usize>,
-    /// The covering interval of **every** space's reserved extent (`[base, limit)`), maintained
+    /// The subset of `retired` that never handed the mutator a word — the spaces
+    /// [`grow`](Nursery::grow) may **re-adopt** instead of allocating — keyed by
+    /// `(capacity_words, retirement serial, base address)`.
+    ///
+    /// Ordered by capacity first, so the smallest adequate empty space is one `range` probe from
+    /// the request size; the serial breaks ties towards the **oldest** space, and the base names
+    /// the space inside `retired`. This is what keeps a growth from scanning the chain: a growth
+    /// event that has to allocate (or refuse) touches no entry at all.
+    ///
+    /// *Why it cannot go stale:* a retired space's occupancy is **frozen** — nothing allocates in
+    /// a retired space — so a space that was empty when it was retired is empty for as long as it
+    /// is retired, and one that held words never becomes empty. Membership is therefore decided
+    /// once, at retirement ([`install`](Nursery::install)), removed when the space is re-adopted
+    /// ([`readopt_retired`](Nursery::readopt_retired)) and cleared with the chain
+    /// ([`install_collapsed`](Nursery::install_collapsed)).
+    empty_retired: BTreeSet<(usize, u64, usize)>,
+    /// Monotone retirement counter — the "oldest among equals" tiebreak of
+    /// [`empty_retired`](Nursery::empty_retired).
+    retired_serial: u64,    /// The covering interval of **every** space's reserved extent (`[base, limit)`), maintained
     /// incrementally — the chain-wide [`ScannedBounds`] the whole-collector aggregate is built
     /// from, so a host's fast-reject filter costs `O(1)` per address instead of the indexed
     /// per-space test.
@@ -173,10 +193,11 @@ impl Nursery {
             current,
             retired: Vec::new(),
             retired_regions: BTreeMap::new(),
+            empty_retired: BTreeSet::new(),
+            retired_serial: 0,
             extent,
             live_target_words: None,
-        })
-    }
+        })    }
 
     /// The space the mutator allocates in.
     pub(crate) fn current(&self) -> &HeapSpace {
@@ -292,22 +313,32 @@ impl Nursery {
     /// 3. **Allocate a fresh space.** Its size is the **one-step** size the policy allows —
     ///    `policy.next_words(need_words, 0)` floored by the current capacity — whenever that
     ///    already enlarges the space (a genuinely larger request: the plain next-size rule).
-    ///    Only when the one-step target would install a space **no larger than the one it
-    ///    replaces** does the rule take at least a **doubling**
-    ///    (`policy.next_words(2 * capacity, 0)`), so a growth loop that keeps enlarging an
-    ///    equally-full space climbs the growth table geometrically, instead of gaining one
-    ///    ≈same-size space — and one whole retained capacity — per call. A nursery that has
-    ///    **collected** then caps the result at `max(one_step, live_target)` (its remembered
-    ///    live-set target, `live_target_words`): the growth seam has no live set of its own, so it
-    ///    must not install a space the next collection would have to give back. The bound can
-    ///    neither refuse a request that fits (`one_step >= need_words`) nor install a space
-    ///    smaller than the current one, and it still grants a genuinely large request its own
-    ///    `one_step` size. Every size is bounded by
+    ///    Otherwise the candidate is at least a **doubling** (`policy.next_words(2 * capacity,
+    ///    0)`). A nursery that has **collected** then narrows the candidate from **above** at
+    ///    `max(one_step, live_target)` (its remembered live-set target, `live_target_words`): the
+    ///    growth seam has no live set of its own, so it must not install a space the next
+    ///    collection would have to give back. Finally the size is raised to
+    ///    [`HeapPolicy::next_words_above`] of the current capacity — the "never the same size when
+    ///    *growing*" rule (`erl_gc.c:310-338`) — so a growth **always** installs a space strictly
+    ///    larger than the one it retires. That last step is what the live-set bound may never
+    ///    defeat: the bound narrows the choice, it cannot shrink the space below the current one
+    ///    and it cannot install a same-size space, so the chain can never stack equally sized
+    ///    spaces (each event would otherwise gain a whole capacity while granting no room).
+    ///    The bound also cannot refuse a request that fits (`one_step >= need_words`), and it still
+    ///    grants a genuinely large request its own `one_step` size. Every size is bounded by
     ///    [`min_heap_words`](HeapPolicy::min_heap_words) through
     ///    [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
-    /// 4. **Refuse.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
-    ///    that cannot reach the request yields the typed
-    ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched —
+    /// 4. **Refuse at the chain cap.** Once the chain already **retains** a space, a growth that
+    ///    would take the summed capacity past
+    ///    [`HeapPolicy::chain_cap_words`] yields the typed
+    ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) — before anything is allocated or
+    ///    retired. The cap is the same `YOUNG_SHRINK_FACTOR` (8) multiple the heap-size policy
+    ///    treats as the acceptable keep band around a live-set target, so a growth can strand no
+    ///    more capacity than a collection would have kept in place.
+    /// 5. **Refuse at the ceiling.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or
+    ///    growth-table) ceiling that cannot reach the request — or that can reach it only by
+    ///    installing a space no larger than the current one — yields the typed
+    ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched:
     ///    the current space is not replaced and nothing is retired.
     ///
     /// # The ceiling bounds the chain's SUMMED capacity
@@ -319,17 +350,47 @@ impl Nursery {
     /// append one ceiling-sized space per call. After every successful growth
     /// `capacity_words() <= max_heap_words` whenever the ceiling is non-zero. A ceiling that *can*
     /// cover the request but forbids a larger step installs the largest space it allows, which is
-    /// the only size left to it. `max_heap_words == 0` is "no upper bound", the crate's encoding
+    /// the only size left to it — and when that is no larger than the space it would replace the
+    /// growth is refused rather than installing a same-size space (a growth always makes room).
+    /// `max_heap_words == 0` is "no upper bound", the crate's encoding
     /// for unbounded growth, and leaves the size of step 3 alone.
     ///
-    /// Both refusals are decided **before** any space is allocated or retired, so a refused
-    /// growth leaves the nursery byte-for-byte as it was (same current base, same chain length,
-    /// same summed capacity) and a caller may retry it after collecting.
+    /// # The chain cap bounds the RETAINED capacity
+    ///
+    /// A growth never moves a term, so every space it supersedes stays addressable and stays
+    /// charged to [`capacity_words`](Nursery::capacity_words) until a collection collapses the
+    /// chain. The C never has more than **one young block plus one bounded fragment**
+    /// (`delay_garbage_collection`, `erl_gc.c:500-599`: one fragment sized to the actual need,
+    /// accounted separately, with `heap_sz` unchanged and `F_FORCE_GC` set so the next collection
+    /// folds it away). Step 4 is that bound, in capacity terms:
+    ///
+    /// * a chain holding **nothing** retained always grants the request — that is the C's one
+    ///   fragment, and refusing it would make a legitimate large allocation impossible;
+    /// * a chain that **does** retain something may only grow while the summed capacity stays
+    ///   within [`HeapPolicy::chain_cap_words`]`(live_target_or_fresh_size)` — so after the
+    ///   fragment, a further growth has to collect first, exactly as the C's `F_FORCE_GC` asks.
+    ///
+    /// The consequence is the property the seam was missing: `capacity_words()` is bounded by the
+    /// **live set** (times the keep band, plus the one space the first growth had to install) and
+    /// is **flat in the number of growth events** instead of one whole capacity per event.
+    ///
+    /// # What a refusal means
+    ///
+    /// Every refusal is decided **before** any space is allocated or retired, so a refused growth
+    /// leaves the nursery byte-for-byte as it was: the same current space (same base, same bump
+    /// pointer), the same chain length, the same summed capacity — and therefore the same
+    /// [`retains_old_spaces`](Nursery::retains_old_spaces) answer, so the
+    /// [`collection_debt`](crate::Collector::collection_debt) the host polls stays `true` and the
+    /// caller is expected to **collect** (`Collector::collect`/`ensure_capacity` collapse the
+    /// chain, after which the request fits again). A refusal is never a wrong answer, and the
+    /// runtime host absorbs it: the allocation it was making simply stays in its own pool.
     ///
     /// A superseded space is never *freed* here, whatever its occupancy: a space that handed the
     /// mutator words may hold live terms and only a [collection](Nursery::collapse) proves them
-    /// dead, so the runtime never frees a retired space outside `collapse`. A space that never
-    /// handed out a word is not freed either — it is [re-adopted](Nursery::readopt_retired)
+    /// dead, so the runtime never frees a retired space outside `collapse` — even when its words
+    /// are provably garbage, the host may hold machine roots that are unpublished at this point
+    /// (which is also why a collection is not legal here). A space that never handed out a word is
+    /// not freed either — it is [re-adopted](Nursery::readopt_retired)
     /// instead, which keeps `space_count` and the containment index meaningful.
     pub(crate) fn grow(&mut self, policy: &HeapPolicy, need_words: usize) -> Result<()> {
         if self.current.available_words() >= need_words {
@@ -337,8 +398,8 @@ impl Nursery {
         }
         // A retired space nothing was ever allocated in can serve this request itself: it
         // strands no live word, allocates nothing and consumes none of the capacity budget.
-        if let Some(index) = self.empty_retired_for(need_words) {
-            self.readopt_retired(index);
+        if let Some(key) = self.empty_retired_for(need_words) {
+            self.readopt_retired(key);
             return Ok(());
         }
         let capacity = self.current.capacity_words();
@@ -360,18 +421,38 @@ impl Nursery {
         if let Some(live_target) = self.live_target_words {
             target = target.min(one_step.max(live_target));
         }
+        // A growth must make room: never install a space the size of the one it retires. This is
+        // the C's `erts_next_heap_size(size, 1)` (the "never the same size when growing" rule), and
+        // it is applied **after** the live-set bound so that bound can only narrow the choice — it
+        // can no longer discard the progress (which is what used to make every post-collection
+        // growth stack one whole same-size space onto the chain).
+        target = target.max(policy.next_words_above(capacity));
         if target < need_words {
             return Err(heap_exhausted(need_words));
         }
         // The ceiling bounds the chain's **summed** capacity, so the fresh space may only claim
         // the budget the chain has left. Refuse — before allocating or retiring anything —
-        // when that budget cannot reach the request.
+        // when that budget cannot reach the request, or when it would leave the fresh space no
+        // larger than the one it replaces.
         if policy.max_heap_words != 0 {
             let budget = policy.max_heap_words.saturating_sub(self.capacity_words());
             if budget < need_words {
                 return Err(heap_exhausted(need_words));
             }
             target = target.min(budget);
+            if target <= capacity {
+                return Err(heap_exhausted(need_words));
+            }
+        }
+        // The chain cap: the capacity this growth would leave **retained** must stay within the
+        // keep band's upper edge. A chain holding nothing retained always passes (the C's one
+        // bounded fragment); the cap is floored by `target` so a single large request is still
+        // granted its own space.
+        let cap = policy
+            .chain_cap_words(self.live_target_words.unwrap_or(target))
+            .max(target);
+        if self.retains_old_spaces() && self.capacity_words().saturating_add(target) > cap {
+            return Err(heap_exhausted(need_words));
         }
         let fresh = HeapSpace::with_allocator(self.current.allocator().clone(), target)?;
         // The chain gained the freshly installed space; the retired one was already covered (it
@@ -383,26 +464,27 @@ impl Nursery {
         Ok(())
     }
 
-    /// The index of the **smallest** retired space that never handed the mutator a word
+    /// The **smallest** retired space that never handed the mutator a word
     /// (`used_words() == 0`) and is still large enough for a `need_words` allocation — the space
-    /// [`grow`](Nursery::grow) can re-adopt instead of allocating a fresh one.
+    /// [`grow`](Nursery::grow) can re-adopt instead of allocating a fresh one — as the
+    /// [`empty_retired`](Nursery::empty_retired) key that names it.
     ///
-    /// The smallest adequate space wins, and [`min_by_key`](Iterator::min_by_key) keeps the first
-    /// minimum, so among equal capacities the **oldest** space is chosen: the selection is
-    /// deterministic, and it leaves the largest retired spaces available for a later, larger
-    /// request. `None` when no retired space is both empty and large enough — the only case in
-    /// which a growth has to allocate.
-    fn empty_retired_for(&self, need_words: usize) -> Option<usize> {
-        self.retired
-            .iter()
-            .enumerate()
-            .filter(|(_, space)| space.used_words() == 0 && space.capacity_words() >= need_words)
-            .min_by_key(|(_, space)| space.capacity_words())
-            .map(|(index, _)| index)
+    /// The smallest adequate space wins, and the set's ordering (capacity, then retirement serial)
+    /// keeps the oldest among equals: the selection is deterministic, and it leaves the largest
+    /// retired spaces available for a later, larger request. `None` when no retired space is both
+    /// empty and large enough — the only case in which a growth has to allocate.
+    ///
+    /// **`O(log #spaces)`**, and it touches no entry on any other growth path: the chain is
+    /// indexed by capacity at retirement rather than scanned per growth, so a growth loop is never
+    /// quadratic in the number of retired spaces.
+    fn empty_retired_for(&self, need_words: usize) -> Option<(usize, u64, usize)> {
+        self.empty_retired
+            .range((need_words, 0, 0)..)
+            .next()
+            .copied()
     }
-
-    /// Re-adopts the retired space at `index` as the current space, retiring the old current in
-    /// its place — the step [`grow`](Nursery::grow) takes instead of allocating when a retired
+    /// Re-adopts the retired space named by `key` as the current space, retiring the old current
+    /// in its place — the step [`grow`](Nursery::grow) takes instead of allocating when a retired
     /// space is provably empty.
     ///
     /// Nothing is stranded (the re-adopted space never handed the mutator a word), nothing is
@@ -411,7 +493,19 @@ impl Nursery {
     /// designated current — so the aggregate covering cannot move and is left alone; only the
     /// geometry epoch advances, because the partition (and with it the role of every address:
     /// which space's `top` may still move) changed.
-    fn readopt_retired(&mut self, index: usize) {
+    ///
+    /// The space is located by its base address (the stable identity the
+    /// [`empty_retired`](Nursery::empty_retired) key carries), so the index needs no renumbering
+    /// when one entry leaves the `retired` vector; this path is the only one that scans it, and
+    /// it is at most one scan per productive re-adoption, never per growth event.
+    fn readopt_retired(&mut self, key: (usize, u64, usize)) {
+        let base = key.2;
+        let index = self
+            .retired
+            .iter()
+            .position(|space| space.base() as usize == base)
+            .expect("the empty-retired index names a retired space");
+        self.empty_retired.remove(&key);
         let space = self.retired.remove(index);
         self.retired_regions.remove(&(space.base() as usize));
         self.install(space);
@@ -421,15 +515,24 @@ impl Nursery {
     }
 
     /// Installs `space` as the current space and retires the one it replaces, keeping the
-    /// containment index ([`retired_regions`](Nursery::retired_regions)) and the `retired` chain
-    /// in step. The allocator is untouched, and nothing is freed.
+    /// containment index ([`retired_regions`](Nursery::retired_regions)), the `retired` chain and
+    /// the empty-space index ([`empty_retired`](Nursery::empty_retired)) in step. The allocator is
+    /// untouched, and nothing is freed.
+    ///
+    /// This is the one place a space's emptiness is decided, and the decision is final: a retired
+    /// space's occupancy is frozen (nothing allocates in it), so the entry the index gains here is
+    /// exact for as long as the space is retired.
     fn install(&mut self, space: HeapSpace) {
         let old = core::mem::replace(&mut self.current, space);
-        self.retired_regions
-            .insert(old.base() as usize, old.top() as usize);
+        let base = old.base() as usize;
+        self.retired_regions.insert(base, old.top() as usize);
+        if old.used_words() == 0 {
+            let key = (old.capacity_words(), self.retired_serial, base);
+            self.retired_serial = self.retired_serial.saturating_add(1);
+            self.empty_retired.insert(key);
+        }
         self.retired.push(old);
     }
-
     /// Widens the cached aggregate extent to cover the space [`install`](Nursery::install) just
     /// made current, and advances the geometry epoch by one.
     fn widen_extent(&mut self) {
@@ -496,6 +599,7 @@ impl Nursery {
     fn install_collapsed(&mut self, target: usize, live_target: usize) -> Result<()> {
         self.retired.clear();
         self.retired_regions.clear();
+        self.empty_retired.clear();
         if self.current.capacity_words() == target {
             self.current.reset();
         } else {
