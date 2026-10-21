@@ -86,7 +86,7 @@ C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace`
 (`erts/emulator/beam/beam_common.c:1148-1179`), `save_stacktrace`'s `EXF_SAVETRACE` guard (`:505-507`) and
 `build_stacktrace`'s verbatim return (`:1219-1223`).
 - **Explicit symbolic frames** — `erlang:raise/3` whose third argument is a non-empty trace list, modelled
-  as [`beam_common::Raise::stacktrace`]. `Machine::raise_error` (`../../src/interpreter/bif.rs`) arms the
+  as [`beam_common::Raise::stacktrace`]. `Machine::raise_error` (`../../interpreter/bif.rs`) arms the
   one-shot `pending_supplied_trace` latch, `Machine::throw_with_trace` promotes it to the live
   `raise_supplied_trace`, and `stacktrace::symbolic_stacktrace` — the one consumer — renders THOSE frames
   instead of the `raise_snapshot` heuristic (the uncaught path renders them through
@@ -101,21 +101,21 @@ C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace`
   `raise_supplied_raw_trace` and then **skips** the snapshot rebuild — so the snapshot of the raise being
   re-raised IS the supplied trace — and `symbolic_stacktrace` / `Machine::snapshot_stacktrace` /
   `Machine::with_uncaught_frames` render that preserved chain.
-All four latches are cleared by `Machine::reset` (with the rest of the raise latches,
-`src/machine/registers.rs`).
+Both pairs are cleared by `Machine::reset`, together with the callee-head and failed-clause-argument pairs
+(`../../machine/registers.rs`).
 A raise that supplied neither flavour gets the derived trace: `throw_with_trace` rebuilds `raise_snapshot`
 (the **pre-unwind** `(context, func, pc)` chain, the raising frame first then every live caller
 innermost-first) and the cooking renders it.
 The carve itself (`carve_supplied_frames`) is **also public**: the crate root exposes
 `beam_engine::encode_supplied_stacktrace` (free function) and its `Machine` twin
-(`src/supplied_stacktrace.rs`), both thin wrappers over this one carve, so a host that
+(`../../supplied_stacktrace.rs`), both thin wrappers over this one carve, so a host that
 runs no compiled handler — `beam_rt`'s `-eval` tree-walking route — renders the same
 frames through the same code.
 The out-of-crate half of the explicit-frames flavour — `beam_bifs`'s `erlang:raise/3` decoding its third
 argument into `Raise::stacktrace` — belongs to `beam_bifs`; this family consumes the frames the `Raise`
 already carries.
 
-## The landing order in `Machine::raise_error` (`src/interpreter/bif.rs`)
+## The landing order in `Machine::raise_error` (`../../interpreter/bif.rs`)
 A raise carrying a **live reason term** (a compound reason) goes through `throw_with_trace` **before** the
 `catch_frame_depth() == 0` test, so it lands the same way whether or not a handler is live: caught, the term
 lands in `x(1)`; uncaught, `throw_with_trace`'s no-catch-frame arm returns a frameless `Raise` that keeps the
@@ -159,7 +159,7 @@ compiled handler) and is relocated in place by every collection.
 **A supplied EMPTY trace is indistinguishable from "no trace supplied".**
 `beam_common::Raise` carries no supplied-trace flag, so `erlang:raise(error, boom, [])` reaches the engine as
 the same value as a raise that carried no trace: `Machine::raise_error`'s arming condition is
-`!raise.stacktrace.is_empty()` (`src/interpreter/bif.rs`), which a supplied `[]` cannot satisfy, and the
+`!raise.stacktrace.is_empty()` (`../../interpreter/bif.rs`), which a supplied `[]` cannot satisfy, and the
 cooked `S` is the derived `raise_snapshot` chain where the oracle keeps `[]`.
 C's discriminator is `is_raised_exc` (`erts/emulator/beam/beam_common.c:1119-1126`); `raise_3` stores `NIL`
 behind the negative "already cooked" header, so the empty list survives as a *supplied* trace.
