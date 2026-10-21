@@ -300,10 +300,46 @@ RSS, which is why down-sizing `heap_words` is the lever and a reservation-trunca
   (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32; 16 KiB of register files per machine,
   `Vec` high-water capacity retained by `Machine::reset`, never shrunk) and the wall-clock
   `BLOCKING_PUMP_DEADLINE` (900 s). Neither holds a heap.
-**`Process::grow_nursery` is unreachable on this route.** `move_result_into_process_heap` returns at
-its first guard — `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`) — before
-`hint_grow_gate` (`:1494`) and before the growth block (`:1554-1568`), so only the **scheduled**
-(`for_process`) route ever grows a process nursery.
+**`Process::grow_nursery` is unreachable on the table-less route.** `move_result_into_process_heap`
+returns at its first guard — `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`) — before
+`hint_grow_gate` (`:1494`) and before the growth block (`:1554-1568`).
+On the **scheduled** route it is reachable in code but not reached in practice for a compile (previous
+section's measurement: 843 words, `minor_gcs = 0`), because the compile's work happens in nested runs
+whose context carries `mailbox_table: None`.
+
+### Reclaim: what is sound without a collection, and what is not
+Ranked by the measured peak, and all of it **`beam_rt`-owned** (`Runtime::bif_heaps`, `bif_heap_words`,
+`take_bif_heap`/`put_bif_heap`/`take_bif_frontier`, `grow_eval_heap`) — no `beam_engine` API is needed
+for the dominant store.
+1. **SOUND — size the per-level region by need, not by `heap_words`.** Seed `bif_heaps`/`take_bif_heap`
+   from a small initial (e.g. 1 MiB) and let `take_bif_frontier`'s demand-driven growth do the rest. No
+   reachability question at all: a region that was never allocated is never a dangling pointer. This is
+   exactly what `+hmax` proves is possible (3.81 GB → 104 MB, same `{ok,…}` result); the difference from
+   `+hmax` is that the *growth ceiling* must stay uncapped, or a level needing more than the cap fails as
+   `system_limit` (measured: `inet_parse` at `+hmax 1000000` answers `error`).
+2. **SOUND — bound the pool's stored *count* and free the surplus, gated on the copy-out predicate.**
+   Dropping a region at `put_bif_heap` is sound **only** when the nested run's result was copied out
+   (`move_container`/`safe_to_rewind`, `calls.rs:417`/`:934`); with `move_container == false` the returned
+   term still lives on that region and the parent's registers point into it, which is precisely why the
+   pool does not free. A cap must therefore be applied to regions strictly older than the current depth
+   *and* after a copy-out — never blanket.
+3. **SOUND, minor — `eval_heap`'s retired chain** only shrinks by the same "did the store get pinned"
+   test; `pin_window_if_store_written` pins it on the first store-writing nested run, so a compile pins it
+   immediately (`resets == 0`). Banked value: 1–2 regions.
+4. **UNSOUND — `eval_heap`/arena `reset_to` at a `-eval` statement boundary for a compile.** A compile is
+   *one* statement, and the evaluator's environment holds live values built on the arena, so a
+   statement-boundary reset inside it would either do nothing (no boundary) or drop live values. The
+   existing `eval/mod.rs:417-423` reset is correctly gated on `depth != 0` for this reason.
+5. **UNSOUND without a collection — truncating the arena's older `ReservedHeap` regions.** A later region
+   can hold terms whose cons cells live in an earlier one; proving otherwise is a reachability scan
+   (`beam_gc`'s `copy_struct`), i.e. a GC. `beam_engine` exposes **no** stats or reclaim at all
+   (`ContextHeap`/`MinimalContext` have no `stats`/`reclaim`/`truncate`): an arena fix would need
+   `ContextHeap::stats(&self) -> ContextHeapStats { regions, reserved_words, committed_words, used_words,
+   peak_words }` + `ContextHeap::reclaim(&mut self, keep_regions: usize) -> usize`, surfaced as
+   `MinimalContext::heap_stats`/`reclaim_heap`, invoked from `src/context/pump.rs` after
+   `adopt_nested_payloads` + `machine_pool::release` in `run_export_blocking`/`run_label_blocking`
+   (`:264-301`/`:343-375`) and only once the caller's result has been stabilised off the arena.
+   Its measured contribution is bounded by the `+hmax` residual: **≤ ~104 MB of the 3.81 GB peak (~3 %)**.
 The consequences for a long in-process `compile:file/2`, the per-call cost census and the pool's
 reuse counters (`BEAM_RT_PERF_COUNTERS=1`) are `../runtime/CONTEXT.md`'s and
 `../PERF.md`'s; the engine-side capacity facts are `beam_engine/src/machine/CONTEXT.md`'s.
