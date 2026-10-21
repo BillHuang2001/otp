@@ -195,6 +195,21 @@ pub(crate) fn bump(pick: impl FnOnce(&mut Counters) -> &mut u64) {
     });
 }
 
+/// Adds a whole walk's visit count at once, when the counters are on.
+///
+/// [`RuntimeContext::graph_holds_reference`] counts its visits in a local `u64` and calls this
+/// **once per walk**: a `bump` per visited object would put an `enabled()` load and a
+/// thread-local `borrow_mut` in the innermost loop, which is a real share of the loop body on the
+/// 10^8 objects a large in-process compile visits.
+///
+/// [`RuntimeContext::graph_holds_reference`]: super::RuntimeContext::graph_holds_reference
+pub(crate) fn add_visits(visits: u64) {
+    if !enabled() || visits == 0 {
+        return;
+    }
+    COUNTERS.with(|counters| counters.borrow_mut().walk_visits += visits);
+}
+
 /// Records one call for `(module, function, arity)`, when the counters are on.
 pub(crate) fn note_key(module: &str, function: &str, arity: u32) {
     if !enabled() {

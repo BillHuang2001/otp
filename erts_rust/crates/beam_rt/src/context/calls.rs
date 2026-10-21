@@ -960,11 +960,35 @@ impl<'a> RuntimeContext<'a> {
                         result = Err(BeamError::SystemLimit);
                     }
                 }
-            } else if Self::graph_holds_reference(term) {
+            } else if move_container && Self::graph_holds_reference(term) {
                 perf_counters::bump(|c| &mut c.ref_held);
                 // A reference's identity **is** its address (see the comment above): the copy
                 // would be a different term, so the result stays where it is and the pool is
                 // not rewound.
+                //
+                // # Why the walk is gated on `move_container` — it is unobservable otherwise
+                //
+                // The walk's answer has exactly two consumers: this arm, which only sets
+                // `rewind = false`, and the `move_container` arm below, which copies the result
+                // **and then** sets `rewind = safe_to_rewind`. When `move_container == false` —
+                // that is, `mailbox_table.is_none() && !safe_to_rewind` — the copy arm cannot run
+                // either (it is gated on the same `move_container`), and `rewind` is already
+                // `false`: `move_container == false` implies `!safe_to_rewind`, and `rewind` is
+                // only ever assigned `safe_to_rewind`. So both possible answers of the walk
+                // produce the **same** `result` and the same `rewind` — the walk is unobservable
+                // in that state, and skipping it changes nothing but its own diagnostic counters.
+                // (`result` is never modified by the walk, so no term moves either way.)
+                //
+                // Where this bites hardest is the table-less route's **reentrant** call — a
+                // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
+                // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries and
+                // the in-process `compile:file/2` route of contract A.9): `!reentrant` is one
+                // conjunct of `safe_to_rewind`, so such a call has `move_container == false` and
+                // never walks its result. That is exactly the **accumulator** shape — a container
+                // the applied fun returned, i.e. a whole intermediate compiler AST — so the
+                // per-call walk of the entire accumulator disappears where it was quadratic
+                // (measured on `lib/stdlib/src/string.erl`: `lists:foldl/3` + `lists:map/2` + a
+                // share of `lists:foldr/3` were 236.5 M + 76.1 M of 408.5 M walk visits).
                 rewind = false;
             } else if move_container {
                 // The copy first and, only once it succeeded, the rewind: a refused copy leaves
@@ -1194,10 +1218,19 @@ impl<'a> RuntimeContext<'a> {
         #[cfg(test)]
         notes::note_walk_call();
         perf_counters::bump(|c| &mut c.walk_calls);
+        // The visit count is accumulated **locally** and folded in exactly once, at the walk's
+        // single exit ([`perf_counters::add_visits`]): a `bump` per visited object would put an
+        // `enabled()` load and a thread-local `borrow_mut` in the innermost loop, and a large
+        // in-process compile visits 10^8 objects. Two answers leave the loop early — an exhausted
+        // budget and a reference header — so the loop is `break 'walk`-ed rather than `return`ed
+        // and `found` carries the answer out; that keeps the fold single-sited by construction,
+        // so no future exit can silently under-count.
+        let mut visits: u64 = 0;
+        let mut found = false;
         let mut work = Walklist::new();
         let mut budget = WALK_VISIT_BUDGET;
         work.push(term);
-        while let Some(popped) = work.pop() {
+        'walk: while let Some(popped) = work.pop() {
             // Three kinds of word can reach the worklist without being a readable container, and
             // each is skipped here so nothing below ever dereferences it: a literal (a frozen code
             // constant, which names nothing on this heap), an immediate, and a `HEADER`-tagged
@@ -1220,12 +1253,13 @@ impl<'a> RuntimeContext<'a> {
             loop {
                 #[cfg(test)]
                 notes::note_walk_visit();
-                perf_counters::bump(|c| &mut c.walk_visits);
+                visits += 1;
                 // The budget is the only bound the walk has (see *The walk*): a forged cycle would
                 // otherwise spin here forever. It is charged **per dereferenced object**, exactly
                 // as the generic step charged it, so exhaustion answers the same `true`.
                 if budget == 0 {
-                    return true;
+                    found = true;
+                    break 'walk;
                 }
                 budget -= 1;
                 if !beam_term::prelude::is_list(item) {
@@ -1238,7 +1272,8 @@ impl<'a> RuntimeContext<'a> {
                         if beam_term::boxed::is_ref_thing_header(header)
                             || beam_term::boxed::is_external_ref_header(header)
                         {
-                            return true;
+                            found = true;
+                            break 'walk;
                         }
                         // SAFETY: `address` heads the live object `header` names, so
                         // `for_each_child_slot` visits exactly that shape's term-reference slots —
@@ -1285,7 +1320,10 @@ impl<'a> RuntimeContext<'a> {
                 break;
             }
         }
-        false
+        perf_counters::add_visits(visits);
+        #[cfg(test)]
+        notes::note_walk_visit_fold(visits as usize);
+        found
     }
 
     /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
