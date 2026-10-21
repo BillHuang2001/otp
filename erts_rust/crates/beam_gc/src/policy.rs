@@ -399,6 +399,29 @@ impl HeapPolicy {
         }
     }
 
+    /// The smallest size (in words) **strictly greater** than `size` — the "one step further
+    /// than the space it replaces" size a growth installs.
+    ///
+    /// This is the C's `erts_next_heap_size(size, 1)` (`erl_gc.c:310-338`, used at
+    /// `:1886-1888`): the growth path takes the table entry *after* the current size, which is
+    /// the "never the same size when **growing**" rule. [`next_words`](Self::next_words) with
+    /// `offset == 1` answers that entry, and this accessor completes it into a total function:
+    /// past the growth table's top (or under a [`min_heap_words`](Self::min_heap_words) floor
+    /// above every entry) the table cannot name a larger size, so the answer is `size + 1`. It is
+    /// therefore **always** strictly greater than `size`, which is the property the no-relocation
+    /// growth seam needs: a growth must never install a space no larger than the one it retires.
+    ///
+    /// A clamp by [`max_heap_words`](Self::max_heap_words) can still place the answer below
+    /// `size`, which is the caller's explicit ceiling, not a sizing rule.
+    pub fn next_words_above(&self, size: usize) -> usize {
+        let stepped = self.next_words(size, 1);
+        if stepped > size {
+            stepped
+        } else {
+            size.saturating_add(1)
+        }
+    }
+
     /// The heap size to use after a fullsweep, from the `live_words` a collection kept
     /// and the `need_words` the mutator still requires.
     ///

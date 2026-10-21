@@ -648,12 +648,29 @@ impl GenImmixCollector {
         // (the graphs the minors promoted and the next round's roots replaced), so using it
         // would inflate `need_after` past the region's capacity and its grow bracket
         // (`capacity < target`) would fire on every fullsweep and creep the region
-        // up without bound (see [`crate::live`]). The young occupancy is bounded by the
-        // nursery capacity, which `young_after_collection` always installs onto a target
-        // derived from the live set.
+        // up without bound (see [`crate::live`]).
+        //
+        // The young occupancy is clamped to the capacity the nursery will **actually** have
+        // after this round's collapse — `young_after_fullsweep(capacity, live)`, the same
+        // `Nursery::collapse_after_fullsweep` applies below — which restores the C's premise for
+        // the same term: `HEAP_TOP(p) - HEAP_START(p)` is one young block's usage, bounded by
+        // that block's `HEAP_SIZE`, and the C sizes the young block from the live set at every
+        // collection (`erl_gc.c:1875-1888`, `:2061-2098`). That capacity is a function of the
+        // live set alone, upper-bounded by `YOUNG_SHRINK_FACTOR` (8) times
+        // `HeapPolicy::young_target_words(live)` (past which the collapse installs the target
+        // itself). `Nursery::used_words()` is the chain-summed occupancy of every nursery space,
+        // so unclamped it also counts every dead word the mutator (or a host's unrooted BIF
+        // copy-out, which bumps the process heap and never rewinds) accumulated since the last
+        // collection — unbounded, and folded into `need_after` it is baked into the region's
+        // size, which the next fullsweep measures again: a capacity feedback. See the identical
+        // clamp, and its derivation, in [`crate::Collector::collect_major`] and the regression
+        // gate `tests/mature_capacity_feedback.rs`.
         let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
-        let young_occupancy = self.nursery.used_words();
+        let young_capacity_after = self
+            .policy
+            .young_after_fullsweep(self.nursery.capacity_words(), live.words);
+        let young_occupancy = self.nursery.used_words().min(young_capacity_after);
         let target = self
             .policy
             .mature_after_fullsweep(capacity, live.words, young_occupancy);

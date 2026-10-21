@@ -145,8 +145,9 @@ impl Collector {
     /// This reads the **current** (allocatable) space only — a [growth](Self::grow_nursery)
     /// retires the space it replaced and nothing is ever allocated in a retired one, so the
     /// current space is the correct one for an allocation-admission signal. A *collection*
-    /// must instead cover the whole chain, which is why [`collect`](Self::collect) compares
-    /// the mature's room against the chain-wide [`Nursery::used_words`].
+    /// must instead cover the whole chain and size itself from the live set it keeps, which is
+    /// why [`collect`](Self::collect) decides minor vs major on the mature space's room against
+    /// the **live** young word count ([`minor_promotion_fits`](Self::minor_promotion_fits)).
     ///
     /// The chain's [collection debt](Self::collection_debt) is deliberately **not** folded in —
     /// see that method for the opt-in seam a host consults alongside this one.
@@ -173,11 +174,90 @@ impl Collector {
     pub fn collection_debt(&self) -> bool {
         self.nursery.retains_old_spaces()
     }
+    /// The words a **minor** of the current nursery will copy into the mature space: the exact
+    /// live graph of the nursery chain, counted read-only (no forwarding marker is written, so
+    /// the count may run immediately before the copy — [`crate::live`]).
+    ///
+    /// This is the quantity the C's minor decision stands for, and the one
+    /// [`GcStats::words_copied`] an evacuation of the same from-set and roots reports exactly;
+    /// it is therefore both the escalation test's input ([`collect`](Self::collect)) and the
+    /// minor's own room requirement ([`collect_minor`](Self::collect_minor)).
+    fn young_promotion_words(&self, roots: &[Eterm]) -> usize {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from);
+        crate::live::live(&from, roots).words
+    }
+
+    /// Whether the mature space can receive the nursery's promotion — the C's
+    /// `mature_size <= OLD_HEND(p) - OLD_HTOP(p)` test (`erts/emulator/beam/erl_gc.c:1486-1488`;
+    /// when it fails, `minor_collection` returns `-1` and `garbage_collect` runs a major,
+    /// `:1573-1576`, `:839-849`).
+    ///
+    /// The input is the **live** young word count, never the nursery's fill. The fill
+    /// ([`Nursery::used_words`], chain-summed) also counts every word the mutator has already
+    /// abandoned since the last collection, and in this runtime that is an allocation-history
+    /// figure rather than a live-set one: a host's registered-BIF copy-out bump-allocates into
+    /// the process heap and never rewinds, so a nursery can carry thousands of dead words. The
+    /// C never compares that figure against the old heap's room because its young usage is
+    /// `HEAP_TOP(p) - HEAP_START(p)`, bounded by `HEAP_SIZE(p)` by construction (`erl_gc.c:696`,
+    /// `:1439`), and `HEAP_SIZE` is re-derived from the live set at every collection
+    /// (`erl_gc.c:1995`/`:2061-2098` for a fullsweep, `:1512-1554` for a minor). Here the
+    /// live-set-bounded quantity is the live count itself, which is exactly what the C's
+    /// `mature_size` stands for: the data a minor has to move. Comparing the room against the
+    /// fill instead made every collection escalate to a fullsweep as soon as one dead burst
+    /// exceeded the mature space's room — permanently, because the fullsweep's own sizing is a
+    /// function of the **live set** ([`Self::collect_major`]), so no fullsweep can ever buy
+    /// room for a dead figure.
+    ///
+    /// The two bounds agree by construction: a fullsweep sizes the mature space from the live
+    /// set plus the young occupancy it clamps to the nursery capacity that collapse installs
+    /// (`HeapPolicy::mature_after_fullsweep`), so the room a fullsweep leaves is always at
+    /// least a live young set's worth — the collection after it is a minor.
+    fn minor_promotion_fits(&self, roots: &[Eterm]) -> bool {
+        self.mature.available_words() >= self.minor_room_words(roots)
+    }
+
+    /// The room a minor needs, in mature words — **the one decision input** of both the kind
+    /// choice ([`minor_promotion_fits`](Self::minor_promotion_fits),
+    /// [`collect`](Self::collect)) and the minor's own pre-copy refusal
+    /// ([`collect_minor`](Self::collect_minor)), so the two can never disagree: a `collect` that
+    /// chose a minor can never then be refused by it.
+    ///
+    /// It is the **exact live promotion** ([`young_promotion_words`](Self::young_promotion_words))
+    /// — the number of words `Copier::run` writes into the mature space — and it is a true upper
+    /// bound on that copy because the count and the copy share their primitives: both size an
+    /// object through [`copy::move_size`](crate::copy::move_size), both enumerate its reference
+    /// words through `beam_term`'s canonical child-slot walk,
+    /// [`copy::for_each_ref`](crate::copy::for_each_ref), and both visit each reachable object
+    /// exactly once (the counter by an address bitmap, the copier by its forwarding marker) — so
+    /// funs, refc binaries and their sub-binaries, flat and HAMT maps, list chunking and cycles
+    /// are counted with the same word counts they are copied with
+    /// (`tests/minor_room_upper_bound.rs` pins the equality from the outside: a mature space of
+    /// exactly the copy volume admits the minor, one word less refuses it).
+    ///
+    /// The fill is consulted **first** as a cheap short-circuit: it is an upper bound on the live
+    /// count, so when it already fits the answer is the same and the walk is skipped.
+    fn minor_room_words(&self, roots: &[Eterm]) -> usize {
+        let fill = self.nursery.used_words();
+        if self.mature.available_words() >= fill {
+            fill
+        } else {
+            self.young_promotion_words(roots)
+        }
+    }
+
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
+    ///
+    /// A major is chosen when the fullsweep cadence is due
+    /// ([`HeapPolicy::fullsweep_due`], the C `GEN_GCS(p) >= MAX_GEN_GCS(p)`,
+    /// `erl_gc.c:694,831`), **or** when the mature space cannot receive the nursery's live
+    /// promotion ([`minor_promotion_fits`] — the C `erl_gc.c:1486-1488` room test, whose failure
+    /// sends the collection to `do_major_collection`, `erl_gc.c:1574-1577`, `:839-849`).
+    /// Otherwise a minor runs.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)
-            || self.mature.available_words() < self.nursery.used_words()
+            || !self.minor_promotion_fits(roots)
         {
             CollectionKind::Major
         } else {
@@ -194,8 +274,9 @@ impl Collector {
     /// [`collect`](Self::collect).
     ///
     /// [`collect`](Self::collect) *chooses* the kind (the fullsweep cadence, or a mature space
-    /// too small for a whole nursery promotion) and **escalates** a would-not-fit minor to a
-    /// major. This entry point never chooses and never escalates:
+    /// too small for the nursery's **live** promotion —
+    /// [`minor_promotion_fits`](Self::minor_promotion_fits)) and **escalates** a would-not-fit
+    /// minor to a major. This entry point never chooses and never escalates:
     /// [`CollectionKind::Minor`] runs [`collect_minor`](Self::collect_minor) and
     /// [`CollectionKind::Major`] runs [`collect_major`](Self::collect_major), so on success the
     /// returned [`Collection::kind`] is the requested `kind`.
@@ -225,26 +306,46 @@ impl Collector {
         Ok(Collection { kind, stats })
     }
 
+
+
     /// Runs a minor collection: evacuate the nursery's live terms into the mature space.
     ///
-    /// The destination must fit the whole nursery up front (immediate promotion, no
-    /// partial-copy rollback). [`collect`](Self::collect) escalates to a major when it would
-    /// not; a **direct** call instead reports the typed heap exhaustion *before* a single
-    /// word is copied, so a too-small mature space can never leave the nursery
-    /// half-forwarded.
+    /// The destination must fit the promotion up front (immediate promotion, no partial-copy
+    /// rollback). [`collect`](Self::collect) escalates to a major when it would not; a
+    /// **direct** call instead reports the typed heap exhaustion *before* a single word is
+    /// copied, so a too-small mature space can never leave the nursery half-forwarded.
+    ///
+    /// The room requirement is [`minor_room_words`](Self::minor_room_words) — the very input
+    /// [`collect`](Self::collect)'s kind choice reads, so a minor that `collect` selected can
+    /// never be refused here — and it is the **live** young word count, the exact number of words
+    /// this call writes into the mature space (see
+    /// [`minor_promotion_fits`](Self::minor_promotion_fits)). The nursery's chain-summed fill is
+    /// an upper bound on it and is consulted first, so the read-only walk that counts the live
+    /// graph runs only when that cheap bound does not already fit. A fill-keyed test would refuse
+    /// a promotion the live set fits into whenever the mutator had abandoned more words than the
+    /// mature space has room for — permanently, because nothing ever buys room for a dead figure.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space, sized from the **young
     /// live set** the round evacuated — its copy volume
     /// ([`HeapPolicy::young_after_collection`]).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let needed = self.nursery().used_words();
-        if self.mature.available_words() < needed {
-            return Err(heap_exhausted(needed));
-        }
         let mut from = FromSet::new();
         self.nursery.add_to_from_set(&mut from);
+        let need = self.minor_room_words(roots);
+        if self.mature.available_words() < need {
+            return Err(heap_exhausted(need));
+        }
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
+        // The room requirement is an upper bound on this copy by construction (the count and the
+        // copy share their sizing and child-slot primitives); the equality pin lives in
+        // `tests/minor_room_upper_bound.rs`.
+        debug_assert!(
+            stats.words_copied <= need,
+            "the minor's room requirement ({need} words) is a true upper bound on its copy \
+             ({} words)",
+            stats.words_copied
+        );
         self.minor_since_major += 1;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
@@ -265,12 +366,13 @@ impl Collector {
     ///
     /// The fresh space is sized up front so the copy always fits and the two from-spaces are
     /// never left half-forwarded: the policy is asked for room for the **exact live set** the
-    /// fullsweep evacuates plus the **young heap's occupancy** (a whole nursery's worth of
-    /// promotion, the C `need_after`, `erl_gc.c:2072`) plus its reserve, so the next
-    /// collections can be minors again. Should
-    /// [`max_heap_words`](HeapPolicy::max_heap_words) clamp that size below the live set,
-    /// the typed heap exhaustion is returned *before* a single word is copied rather than
-    /// mid-copy.
+    /// fullsweep evacuates plus the **young heap's occupancy**, clamped to the capacity that
+    /// nursery is about to have (a whole nursery's worth of promotion, the C `need_after`,
+    /// `erl_gc.c:2061-2098`; the C's `size_before` term is one young block's usage inside that
+    /// block's `HEAP_SIZE`, `erl_gc.c:1875-1888`) plus its reserve, so the next collections can
+    /// be minors again. Should [`max_heap_words`](HeapPolicy::max_heap_words) clamp that size
+    /// below the live set, the typed heap exhaustion is returned *before* a single word is
+    /// copied rather than mid-copy.
     ///
     /// The nursery is then re-sized from the **exact live set** the fullsweep measured
     /// ([`HeapPolicy::young_after_fullsweep`]), so it neither re-copies the live set every
@@ -299,11 +401,37 @@ impl Collector {
         // The young occupancy is a different quantity and *is* included: the fresh mature
         // space has to be able to receive a whole nursery's worth of promotion after the
         // fullsweep, otherwise the very next collection cannot be a minor and every
-        // collection escalates to a fullsweep — the generational cadence never runs. It is
-        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`] always
-        // installs onto a target derived from the live set, so including it still converges.
+        // collection escalates to a fullsweep — the generational cadence never runs. But it is
+        // included **as the C includes it**, clamped to the capacity that nursery will
+        // actually have: the C's `need_after` term is `HEAP_TOP(p) - HEAP_START(p)`, the usage
+        // of a *single* young block, so it can never exceed that block's `HEAP_SIZE` — and the C
+        // re-sizes the young block from the live set at every collection (a fullsweep frees the
+        // old heap, `erl_gc.c:1875-1888`, and `adjust_after_fullsweep` sizes the next one from
+        // the post-copy live set, `erl_gc.c:2061-2098`), so `used <= HEAP_SIZE` is a
+        // live-set-derived bound. The bound restored here is exactly the capacity
+        // [`crate::nursery::Nursery::collapse_after_fullsweep`] installs immediately below:
+        // [`HeapPolicy::young_after_fullsweep`] of the capacity the nursery chain has now and the
+        // live set this fullsweep measured. That is a pure function of the live set, upper-bounded
+        // by `YOUNG_SHRINK_FACTOR` (8) times `HeapPolicy::young_target_words(live)` — past that
+        // the collapse installs the target itself — so it is bounded, and it is the room the next
+        // minor really has.
+        //
+        // The clamp is what keeps the fresh mature space a function of the **live set**.
+        // `Nursery::used_words` is the chain-summed occupancy of every nursery space, so it
+        // also counts every dead word the mutator (or a host's unrooted BIF copy-out, which
+        // bumps the process heap and never rewinds) accumulated since the last collection.
+        // That figure is genuinely unbounded — a runaway process fills the nursery with
+        // millions of dead words — and folded into `need_after` it is baked into the next mature
+        // space: the following fullsweep then measures a larger live set and grows again — the
+        // mature-capacity feedback (see `tests/mature_capacity_feedback.rs`). Clamping leaves the
+        // term's purpose (a whole nursery's worth of promotion room, and therefore a *run* of
+        // minors between fullsweeps) intact while making it independent of the allocation
+        // history.
         let live = crate::live::live(&from, roots).words;
-        let young_occupancy = self.nursery.used_words();
+        let young_capacity_after = self
+            .policy
+            .young_after_fullsweep(self.nursery.capacity_words(), live);
+        let young_occupancy = self.nursery.used_words().min(young_capacity_after);
         // Grow, shrink or keep the current mature capacity
         // (`HeapPolicy::mature_after_fullsweep`, the C `adjust_after_fullsweep`).
         let size =

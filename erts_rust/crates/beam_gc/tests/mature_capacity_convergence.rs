@@ -94,9 +94,13 @@ const MEASURED: usize = 200;
 /// The stable live set in words (the graph the converged heap must cope with).
 const LIVE_WORDS: usize = LIVE_TUPLES as usize * TUPLE_WORDS;
 
-/// One round's total allocation — the **nursery occupancy** a collection samples, and the room
-/// the escalation test (`mature.available_words() < nursery.used_words()`) compares the mature
-/// space's headroom against.
+/// One round's total allocation — the **nursery occupancy** a collection samples and the figure
+/// the mature sizing rule folds into `need_after` (`live + young occupancy + reserve`).
+///
+/// It is *not* the escalation test's input: a minor is admitted while the mature space's room
+/// covers the nursery's **live** promotion ([`Collector::collect`](beam_gc::Collector::collect)'s
+/// `minor_promotion_fits`, the C `erl_gc.c:1486-1488` room test), which is [`LIVE_WORDS`] here —
+/// see [`occupancy_steps`] for why that distinction sets the cycle's length.
 const ROUND_WORDS: usize = (LIVE_TUPLES as usize + GARBAGE_TUPLES as usize) * TUPLE_WORDS;
 
 /// [`HeapPolicy::default`]'s `need_reserve_words`; the test asserts the live policy agrees.
@@ -108,17 +112,17 @@ const STRATEGIES: [MatureKind; 2] = [MatureKind::Copying, MatureKind::Immix];
 /// fullsweep. A copying minor promotes the nursery's live words onto the top of the mature
 /// space without reclaiming it, so the occupancy steps one live set per minor until
 /// [`Collector::collect`](beam_gc::Collector::collect)'s escalation test — the mature space's
-/// remaining room below the nursery's own occupancy — fires a fullsweep, which evacuates young
-/// *and* mature into a fresh space holding exactly the 60-word live set and starts the cycle
-/// over at 60.
+/// remaining room below the nursery's **live promotion** (the C's `mature_size` room test,
+/// `erl_gc.c:1486-1488`) — fires a fullsweep, which evacuates young *and* mature into a fresh
+/// space holding exactly the 60-word live set and starts the cycle over at 60.
 ///
 /// The cycle's **length** is the amortisation [`MATURE_TARGET_LIVE_MULTIPLE`] buys, and it is
-/// derived rather than listed: the converged capacity is
+/// derived rather than listed (see [`occupancy_steps`]): the converged capacity is
 /// `mature_target_words(LIVE_WORDS, ROUND_WORDS)` = `next_words(2 * (60 + 210 + 64))` = 987
-/// words, the occupancy takes the values `live, 2 * live, …` and a minor is admitted while
-/// `capacity - used >= round`, so the last value in the cycle is
-/// `(capacity - round) / live + 1 = 777 / 60 + 1 = 13` live sets (780 words, leaving 207 words
-/// of room — below the round's 210). Thirteen occupancy values, twelve promotions.
+/// words, the post-collection occupancy takes the values `live, 2 * live, …`, and a minor is
+/// admitted while `capacity - used >= live`, so the largest value in the cycle is
+/// `capacity / live = 987 / 60 = 16` live sets (960 words, leaving 27 words — below the 60-word
+/// live promotion). Sixteen occupancy values, fifteen promotions.
 const COPYING_OCCUPANCY_STEPS: usize = occupancy_steps(mature_target(), LIVE_WORDS);
 /// The cycle as the `COPYING_OCCUPANCY_STEPS` successive multiples of the live set.
 const COPYING_OCCUPANCY_CYCLE: [usize; COPYING_OCCUPANCY_STEPS] = {
@@ -132,13 +136,32 @@ const COPYING_OCCUPANCY_CYCLE: [usize; COPYING_OCCUPANCY_STEPS] = {
 };
 
 /// The number of distinct occupancy values in a converged cycle, derived from the rule rather
-/// than measured: the occupancy starts at one `live` and grows one `live` per minor while the
-/// mature space's remaining room (`capacity - used`) is at least `ROUND_WORDS` — the nursery's
-/// own occupancy, which [`Collector::collect`](beam_gc::Collector::collect)'s escalation test
-/// compares against. The cycles are therefore `live, 2 * live, …` up to and including the first
-/// value that leaves less than a round of room.
+/// than measured.
+///
+/// The occupancy starts at one `live` (what the fullsweep left) and grows one `live` per minor,
+/// and a minor is admitted while the mature space's room covers the nursery's **live promotion**
+/// — [`Collector::collect`](beam_gc::Collector::collect)'s `minor_promotion_fits`, whose second
+/// arm is `available >= young_promotion_words`, i.e. `capacity - used >= live`. The cycle is
+/// therefore `live, 2 * live, …` up to the largest multiple of `live` that still fits,
+/// `capacity / live` — the first value past it would need `capacity - used < live` and the
+/// collection escalates to a fullsweep, which resets the occupancy to `live`.
+///
+/// Note the input is the **live** set, not the round's allocation: a fill-keyed test
+/// (`capacity - used >= round`) would stop the cycle `round / live` values early, which is what
+/// this test used to pin before the escalation predicate was changed to read the live promotion
+/// (`src/collector.rs::minor_promotion_fits`).
 const fn occupancy_steps(capacity: usize, live: usize) -> usize {
-    capacity.saturating_sub(ROUND_WORDS) / live + 1
+    if live == 0 {
+        // Degenerate input: a live set of no words never fills the space, so the cycle is the
+        // single post-fullsweep value. (Guards the division; the corpora here are non-empty.)
+        return 1;
+    }
+    let steps = capacity / live;
+    if steps == 0 {
+        1
+    } else {
+        steps
+    }
 }
 
 /// The converged mature capacity this corpus' fullsweep asks for —
@@ -197,8 +220,9 @@ const fn immix_region_words() -> usize {
 
 /// The **mark-region** mature occupancy's converged cycle, derived by the same rule: the region
 /// is reclaimed **in place** at every fullsweep and then holds exactly the live set (320 words),
-/// and it admits another promotion while `1024 - used >= 210` — so it cycles over
-/// `320, 640, 960` (three values, two promotions) instead of growing without bound.
+/// and it admits another promotion while the region's free **lines** cover the promotion's —
+/// `1024 - used >= 320` — so it cycles over `320, 640, 960` (three values, two promotions)
+/// instead of growing without bound.
 const IMMIX_OCCUPANCY_STEPS: usize = occupancy_steps(immix_region_words(), IMMIX_LIVE_WORDS);
 /// The cycle as the `IMMIX_OCCUPANCY_STEPS` successive multiples of the live set.
 const IMMIX_OCCUPANCY_CYCLE: [usize; IMMIX_OCCUPANCY_STEPS] = {
@@ -425,8 +449,9 @@ struct Fullsweep {
     /// The exact live set the fullsweep evacuated (`crate::live`), read from the fresh space's
     /// occupancy — the figure the sizing rule is given.
     live: usize,
-    /// The nursery's occupancy at the collection, which the rule folds into `need_after` — and
-    /// which the escalation test compares the mature space's room against.
+    /// The nursery's occupancy at the collection, which the rule folds into `need_after`. (The
+    /// escalation test does **not** read it — that compares the mature space's room against the
+    /// nursery's **live** promotion, `minor_promotion_fits`; see [`occupancy_steps`].)
     young_occupancy: usize,
     /// The mature capacity installed.
     capacity_after: usize,
