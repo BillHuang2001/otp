@@ -72,16 +72,60 @@
 //! is clean. Each strategy is run **twice on the same runtime** and the two runs must report
 //! **identical** load-invariant counts — the load-invariance assertion (the host is heavily
 //! loaded, so wall-clock is meaningless and is printed, never asserted). Across the two
-//! strategies: the two cadences must agree to within a few percent (both run the same allocation
-//! pattern through the same live-set nursery rule fed the same quantity — the words the minor
-//! promoted — and diverge only through the minor/major *mix*, a fullsweep sizing the nursery from
-//! the whole-heap live set where a minor sizes it from the young one), the mark-region run must
+//! strategies: the two runs must **account for the same young words** — the product
+//! `collections × mean nursery capacity`, which is what the run's own heap doors admitted (see
+//! [the cadence is an accounting identity](#the-cadence-is-an-accounting-identity-not-a-tolerance)),
+//! the mark-region run must
 //! reach strictly more fullsweeps (its would-not-fit escalation), and its mature occupancy and
 //! reported process memory must be strictly larger (the line-granular price). The **copy-work
 //! direction is deliberately not asserted** — its sign is regime-dependent *and* the two runs'
 //! per-collection volume is not comparable, because a collection copies the live set through a
 //! nursery each strategy sizes from its own collection mix (see
 //! [the measured verdict](#the-measured-verdict)); it is printed instead.
+//!
+//! # The cadence is an accounting identity, not a tolerance
+//!
+//! The two collection **counts** are deliberately not compared to each other. A percentage band
+//! on them is a number fitted to the data, and it moves whenever a `beam_gc` sizing change shifts
+//! one run by a single collection — which is exactly what happened when the minor/major decision
+//! stopped using the dead-inclusive nursery fill: the copying run moved 587 → 588 collections and
+//! a 5 % band, fitted with no headroom, tipped over. What the mechanism actually fixes is a
+//! **product**. Every collection is triggered by a heap-admission door refusing the next request
+//! because the *current* young space has no room left (`src/context/gc.rs::ensure_heap_full`'s
+//! `should_collect(heap_need)` → `beam_gc`'s `collect`), so the words one collection accounts for
+//! are its capacity minus the words the failing request could not fit. Summed over a run:
+//!
+//! ```text
+//! allocated young words  =  Σ_collections (capacity − free_at_admission)
+//!                        =  collections × mean_capacity − Σ free_at_admission
+//! ```
+//!
+//! The left-hand side is **strategy-independent**: the fixture allocates exactly the same terms in
+//! the same order under either mature strategy (nothing it does consults the collector), and the
+//! mature generation's own capacity is not part of the young allocation at all. The right-hand side
+//! is what each run's samples measure: the mean capacity is taken over the per-slice samples, and a
+//! slice is one fixed reduction budget, so in this allocation-dominated workload every sample
+//! stands for the same number of allocated words — the weight a `Σ over collections` needs. (The
+//! *current* space is sampled, never `heap_size_words()`'s chain sum: a growth retires a space no
+//! collection drains.)
+//!
+//! Two derived residuals are the only terms that can make the two products differ, and both are
+//! bounded rather than fitted:
+//!
+//! * `Σ free_at_admission` — each collection's interval is short by the request that did not fit.
+//!   The fixture's rounds allocate one `churn/1` step at a time (a 3-tuple, a 3-element list and a
+//!   cons = 12 words), so the residual is `< collections × 12` ≈ **0.4 %** of the ~1.85 M words a
+//!   run accounts for;
+//! * the per-slice sampling of the mean — one sample per `collections / samples` ≈ 6-collection
+//!   slice, and the capacity moves in grown steps of at most `peak − settled` = 1 599 words, so a
+//!   mis-attributed sample moves the mean by `1 599 / 97` ≈ 16 words, i.e. `collections × 16` on
+//!   the product ≈ **0.5 %**.
+//!
+//! The asserted tolerance is **1 %** — the sum of those two terms, five times *tighter* than the
+//! 5 % band on the raw counts it replaces, on a quantity that is not fitted to the data. What
+//! still fails: a run whose doors admitted the same words under a smaller nursery (collecting
+//! without the allocation to justify it), a run that stopped collecting, and either residual
+//! growing (a larger per-request overshoot, or a coarser sampling of a wider capacity span).
 //!
 //! # The measured verdict
 //!
@@ -93,18 +137,28 @@
 //!
 //! | metric | Copying (2047) | Immix (2048) | Immix ÷ Copying |
 //! |---|---|---|---|
-//! | runtime `gc_stats().collections` | 587 | 558 | 0.951× |
+//! | runtime `gc_stats().collections` | 588 | 558 | 0.949× |
 //! | runtime `gc_stats().major` | 196 | 291 | 1.485× |
-//! | process `GcStats::words_copied` | 377 530 | 201 540 | 0.534× |
-//! | process `GcStats::objects_copied` | 153 518 | 80 681 | 0.526× |
-//! | process `GcStats::words_reclaimed` | 1 269 960 | 2 353 776 | 1.853× (unit caveat below) |
-//! | process `GcStats::minor_collections` | 390 | 266 | 0.682× |
+//! | process `GcStats::words_copied` | 376 610 | 201 540 | 0.535× |
+//! | process `GcStats::objects_copied` | 153 150 | 80 681 | 0.527× |
+//! | process `GcStats::words_reclaimed` | 1 270 560 | 2 353 776 | 1.853× (unit caveat below) |
+//! | process `GcStats::minor_collections` | 391 | 266 | 0.680× |
 //! | process `GcStats::major_collections` | 195 | 289 | 1.482× |
-//! | `collector().mature_used_words()` | 1 668 | 7 808 | **4.681×** |
+//! | `collector().mature_used_words()` | 1 748 | 7 808 | **4.467×** |
 //! | `collector().minor_gcs()` (last sample) | 1 | 0 | — (see below) |
+//! | mean sampled nursery capacity | 3 148 | 3 303 | 1.049× |
+//! | settled (last sampled) nursery capacity | 2 586 | 2 586 | 1.000× |
+//! | peak nursery capacity | 4 185 | 4 185 | 1.000× |
+//! | `collections × mean nursery` (young words admitted) | 1 851 024 | 1 843 074 | **0.996×** |
 //! | `erlang:memory(processes)` | 175 864 B | 176 288 B | 1.002× |
 //! | `erlang:memory(processes_used)` | 34 944 B | 92 624 B | 2.651× |
 //! | wall clock (printed, never asserted) | 30–48 ms | 38–43 ms | not reproducible |
+//!
+//! The nursery rows are the identity's own inputs. Both runs install the **same two capacities**
+//! (2 586 and 4 185 — consecutive steps of the curated growth table) because they share the sizing
+//! rules; they differ in how much time they spend in each, and that is what makes one run collect
+//! 30 times fewer while admitting the same allocation: 3 303 vs 3 148 words per collection. The
+//! products land **0.43 %** apart, inside the 1 % bound derived above.
 //!
 //! `minor_gcs` is a **last-sample** figure and is part of the determinism comparison only: it is
 //! `minor_since_major`, which a fullsweep resets, so where the last observed slice falls in the
@@ -113,11 +167,11 @@
 //! the informative figures.
 //!
 //! **The footprint price is the strict, load-invariant result.** The mark-region run pays
-//! **4.68× the mature occupancy** and **2.65× the reported used process bytes** for the identical
-//! workload, and reaches a fullsweep far more often (291 of 558 collections against 196 of 587): a
+//! **4.47× the mature occupancy** and **2.65× the reported used process bytes** for the identical
+//! workload, and reaches a fullsweep far more often (291 of 558 collections against 196 of 588): a
 //! mark-region minor whose promotion would not fit the mature space's free lines escalates to a
 //! major (`immix_collector.rs::collect`'s `tight` arm), so the same cadence is split into more
-//! fullsweeps and fewer minors (289/266 against 195/390). `erlang:memory(processes)` as a whole is
+//! fullsweeps and fewer minors (289/266 against 195/391). `erlang:memory(processes)` as a whole is
 //! only **1.002×** larger (176 288 B against 175 864 B), which the assertion pins as strictly
 //! larger, and the line-granular cost lands in the **used** half of it (2.65×).
 //!
@@ -130,9 +184,10 @@
 //! targets the young live set once over (`young_minor_target_words`) while a fullsweep targets the
 //! whole-heap live set twice over (`young_target_words`), and a mark-region fullsweep reclaims the
 //! mature generation in place and promotes only the nursery, where a copying fullsweep relocates
-//! the whole heap. On this workload the mark-region run copies 0.534× the words. The copy axis is
-//! therefore reported and never asserted, which is also why the two *cadences* are only required
-//! to agree to within a few percent rather than exactly.
+//! the whole heap. On this workload the mark-region run copies 0.535× the words. The copy axis is
+//! therefore reported and never asserted — it is a function of the nursery each run's mix installs,
+//! which is why the two runs are compared through the allocation product above rather than through
+//! their raw collection counts.
 //!
 //! `MEASURED.md`'s headline — on a long, allocation-driven run of 8 000 rounds with a
 //! **2 560-word long-lived set of line-sized (16-word) objects** in a **pinned 128-block space**
@@ -147,7 +202,7 @@
 //! 16-word line holds one small object at 2.7–4× its payload — inside a space that merely
 //! *starts* at the rule's break-even (2 048 words = 8 blocks) and is then grown by the policy,
 //! never pinned at a fixed point; the line-granular occupancy therefore keeps the free-line
-//! pressure high (4.68× the copying space's occupancy) and the would-not-fit escalation keeps
+//! pressure high (4.47× the copying space's occupancy) and the would-not-fit escalation keeps
 //! firing (291 fullsweeps against 196). This is `MEASURED.md`'s own description of the loss
 //! regime — the small-object shape ("below one whole block Immix is never fewer and is strictly
 //! more for the small-object shape"; line rounding charges a 3-word tuple a whole 16-word line =
@@ -169,8 +224,8 @@
 //! (`MEASURED.md`'s own caveat) — the 1.85× is mostly that unit, not 1.85× more garbage.
 //! (b) The process's own `GcStats` is a **floor**: the scheduler removes a terminated process at
 //! once, so the terminal slice's collections are not observable from the table. The runtime's own
-//! `gc_stats()` delta is the authoritative schedule and the shortfall is **2 of 587** collections
-//! for Copying (585 observable process collections) and **3 of 558** for Immix (555), i.e. under
+//! `gc_stats()` delta is the authoritative schedule and the shortfall is **2 of 588** collections
+//! for Copying (586 observable process collections) and **3 of 558** for Immix (555), i.e. under
 //! one percent — each run loses only the collections of the slice in which its process
 //! terminated, so the comparison is like for like.
 
@@ -235,7 +290,26 @@ struct Measured {
     mature_used_words: usize,
     /// The process's `minor_gcs` (minors since the last fullsweep) at the last sample.
     minor_gcs: u32,
-    /// Collections the **runtime** ran during the run (its `gc_stats()` delta).
+    /// The **allocation-weighted mean** capacity, in words, of the young space the run's own
+    /// collections drained: the arithmetic mean of the per-slice `young().capacity_words()`
+    /// samples. A slice is one fixed reduction budget, so in this allocation-dominated workload
+    /// every sample stands for the same number of allocated words — the weighting the accounting
+    /// identity `collections × mean capacity = allocated words` needs (see
+    /// [the file docs](#the-cadence-is-an-accounting-identity-not-a-tolerance)).
+    ///
+    /// Deliberately the *current* space, never `heap_size_words()`'s chain sum: a
+    /// [`Process::grow_nursery`] retires a space no collection ever drains, so a chain sum would
+    /// count capacity that no collection accounts for. (On this workload the two agree at every
+    /// sample — the chain is always collapsed.)
+    nursery_words: usize,
+    /// The **last** sampled nursery capacity, in words — where the run came to rest.
+    settled_nursery_words: usize,
+    /// The largest current-space nursery capacity observed at any slice boundary — the figure a
+    /// fullsweep's `young_target_words(live)` (twice the whole-heap live set) installs and a
+    /// minor's `young_minor_target_words(live)` (once the young live set) does not.
+    peak_nursery_words: usize,
+    /// How many slice boundaries the mean above was taken over.
+    nursery_samples: u64,    /// Collections the **runtime** ran during the run (its `gc_stats()` delta).
     collections: u64,
     /// Fullsweeps among them.
     major: u64,
@@ -256,6 +330,10 @@ impl PartialEq for Measured {
             stats,
             mature_used_words,
             minor_gcs,
+            nursery_words,
+            settled_nursery_words,
+            peak_nursery_words,
+            nursery_samples,
             collections,
             major,
             peak_processes_bytes,
@@ -268,6 +346,10 @@ impl PartialEq for Measured {
             && stats == other.stats
             && mature_used_words == other.mature_used_words
             && minor_gcs == other.minor_gcs
+            && nursery_words == other.nursery_words
+            && settled_nursery_words == other.settled_nursery_words
+            && peak_nursery_words == other.peak_nursery_words
+            && nursery_samples == other.nursery_samples
             && collections == other.collections
             && major == other.major
             && peak_processes_bytes == other.peak_processes_bytes
@@ -298,8 +380,8 @@ fn memory_key(rt: &mut Runtime, key: beam_term::Eterm) -> i64 {
 /// `gc_stats()` delta ([`Measured::collections`]/[`Measured::major`]) counts every collection the
 /// runtime's doors ran and is the authoritative schedule, and the difference between the two is
 /// exactly the collections that terminal slice performed. Both strategies lose the same kind of
-/// tail, so the comparison is like for like (measured: 585 observable process collections
-/// against 587 runtime ones for Copying, 555 against 558 for Immix — a tail of 2 and 3, under
+/// tail, so the comparison is like for like (measured: 586 observable process collections
+/// against 588 runtime ones for Copying, 555 against 558 for Immix — a tail of 2 and 3, under
 /// 1 %). `erlang:memory(processes)`/`(processes_used)` are sampled every slice and the
 /// peak is reported, so the figures include the workload process itself.
 fn run_measured(rt: &mut Runtime, rounds: i64) -> Measured {
@@ -315,6 +397,10 @@ fn run_measured(rt: &mut Runtime, rounds: i64) -> Measured {
     let mut stats = GcStats::default();
     let mut mature_used_words = 0usize;
     let mut minor_gcs = 0u32;
+    let mut settled_nursery_words = 0usize;
+    let mut peak_nursery_words = 0usize;
+    let mut nursery_capacity_sum = 0u64;
+    let mut nursery_samples = 0u64;
     let mut peak_processes_bytes = i64::MIN;
     let mut peak_processes_used_bytes = i64::MIN;
     let deadline = started + RUN_DEADLINE;
@@ -331,6 +417,10 @@ fn run_measured(rt: &mut Runtime, rounds: i64) -> Measured {
             stats = collector.stats();
             mature_used_words = collector.mature_used_words();
             minor_gcs = collector.minor_gcs();
+            settled_nursery_words = collector.young().capacity_words();
+            peak_nursery_words = peak_nursery_words.max(settled_nursery_words);
+            nursery_capacity_sum += settled_nursery_words as u64;
+            nursery_samples += 1;
         }
         let processes = memory_key(rt, processes_key);
         let processes_used = memory_key(rt, used_key);
@@ -346,12 +436,20 @@ fn run_measured(rt: &mut Runtime, rounds: i64) -> Measured {
         .expect("the workload returned its payload");
     support::check_gc_payload(payload, PAYLOAD_LENGTH);
 
+    assert!(
+        nursery_samples > 0,
+        "the process was sampled at least once while it lived"
+    );
     let after = rt.gc_stats();
     Measured {
         kind: kind.expect("the process was observed while it lived"),
         stats,
         mature_used_words,
         minor_gcs,
+        nursery_words: (nursery_capacity_sum / nursery_samples) as usize,
+        settled_nursery_words,
+        peak_nursery_words,
+        nursery_samples,
         collections: after.collections - before.collections,
         major: after.major - before.major,
         peak_processes_bytes,
@@ -385,7 +483,8 @@ fn print_row(label: &str, m: &Measured) {
         "{label:<8} kind={:<8} collections={:<4} major={:<3} words_copied={:<7} \
          words_reclaimed={:<7} objects_copied={:<6} minor_collections={:<4} \
          major_collections={:<3} mature_used_words={:<5} minor_gcs={:<2} \
-         memory(processes)={:<6} memory(processes_used)={:<5} payload_len={}",
+         memory(processes)={:<6} memory(processes_used)={:<5} mean_nursery={:<5} \
+         settled_nursery={:<5} peak_nursery={:<5} samples={:<3} payload_len={}",
         format!("{:?}", m.kind),
         m.collections,
         m.major,
@@ -398,7 +497,20 @@ fn print_row(label: &str, m: &Measured) {
         m.minor_gcs,
         m.peak_processes_bytes,
         m.peak_processes_used_bytes,
+        m.nursery_words,
+        m.settled_nursery_words,
+        m.peak_nursery_words,
+        m.nursery_samples,
         m.payload_length,
+    );
+    // The accounting identity this file asserts, printed per run so the two rows can be read
+    // against each other: `collections × mean nursery capacity` is the young words the run's own
+    // heap doors admitted (up to the free words each failing request left behind).
+    println!(
+        "         → collections × mean_nursery = {} × {} = {} young words",
+        m.collections,
+        m.nursery_words,
+        u128::from(m.collections) * m.nursery_words as u128,
     );
     // Timing is context only: the host is heavily loaded, so wall-clock is not a result.
     eprintln!(
@@ -420,6 +532,18 @@ fn assert_measured(m: &Measured, expected: MatureKind) {
     assert!(
         m.peak_processes_bytes > 0 && m.peak_processes_used_bytes > 0,
         "the runtime's memory accounting is live; {m:?}"
+    );
+    assert!(
+        m.nursery_samples > 0 && m.nursery_words > 0 && m.settled_nursery_words > 0,
+        "the process's nursery was observable while it lived; {m:?}"
+    );
+    // The nursery really cycles: a fullsweep installs `young_target_words(live)` — twice the
+    // whole-heap live set — while a minor installs `young_minor_target_words(live)` — once the
+    // young live set — so a run that reaches a fullsweep (the assertion above) must at some point
+    // hold a capacity larger than the one it came to rest on.
+    assert!(
+        m.peak_nursery_words > m.settled_nursery_words,
+        "the fullsweep target must exceed the minor target this run settled on ({m:?})"
     );
 }
 
@@ -498,29 +622,51 @@ fn the_runtime_shaped_workload_under_both_strategies() {
     // **quantity**: a minor's exact promoted word count, `GcStats::words_copied`
     // (`collector.rs::collect_minor`'s copier and `immix_collector.rs::run_minor`'s atomic
     // promotion both count object words, never lines).
-    // Their collection **cadences** differ, and the cause is the minor/major *mix*, because
-    // the two rules behind the mix are not the same rule: a minor sizes the nursery from the young
-    // live set once over (`young_minor_target_words`), a fullsweep from the whole-heap live set
-    // twice over (`young_target_words`), so a run that reaches more fullsweeps settles on a larger
-    // nursery and collects less often.
-    // The mark-region run is the one whose mix is shifted: its escalation (the next comment)
-    // turns minors into fullsweeps — 289 fullsweeps against 266 minors, where the copying run's
-    // 195 fullsweeps against 390 minors are exactly the configured
-    // two-minors-then-a-fullsweep cadence.
-    // The mature generation reaches the nursery's sizing only through that escalation decision, so
-    // no other strategy-specific figure enters the comparison.
-    // A divergence past that step would instead mean one strategy had stopped collecting, which is
-    // what this bound guards.
-    let cadence_lo = copying.collections.min(immix.collections);
-    let cadence_hi = copying.collections.max(immix.collections);
+    // Their collection **counts** differ, and the cause is the minor/major *mix*, because the two
+    // rules behind the mix are not the same rule: a minor sizes the nursery from the young live
+    // set once over (`young_minor_target_words`), a fullsweep from the whole-heap live set twice
+    // over (`young_target_words`), so a run that reaches more fullsweeps settles on a larger
+    // nursery and collects less often. The mature generation reaches the nursery's sizing only
+    // through that escalation decision.
+    //
+    // So the two counts are *not* compared to each other: a percentage band on them was a number
+    // fitted to the data, and it moves whenever a `beam_gc` sizing change shifts one run by a
+    // single collection. What the mechanism fixes is the **product** — the words the run's own
+    // heap doors admitted:
+    //
+    //     allocated young words = Σ_collections (capacity − free_at_admission)
+    //                           = collections × mean capacity − Σ free_at_admission
+    //
+    // (`src/context/gc.rs::ensure_heap_full` collects when `should_collect(heap_need)` — the
+    // current young space no longer holds the next request — so one collection accounts for one
+    // nursery capacity less the words the failing request could not fit; the mean capacity is the
+    // per-slice sample mean, and a slice is one fixed reduction budget, so in this
+    // allocation-dominated workload every sample stands for the same number of allocated words).
+    // The left-hand side is strategy-independent: the fixture allocates exactly the same terms in
+    // the same order under either mature strategy. The two residuals that can make the two
+    // products differ are both derived, and both are summed into the tolerance below — see
+    // [the file docs](#the-cadence-is-an-accounting-identity-not-a-tolerance): the
+    // Σ free_at_admission term (`< collections × 12 words`, the fixture's own `churn/1` step
+    // size) ≈ 0.4 %, and the per-slice sampling of the mean (`(peak − settled) / samples` ≈ 16
+    // words per sample, so `collections × 16`) ≈ 0.5 %.
+    let copying_allocation = u128::from(copying.collections) * copying.nursery_words as u128;
+    let immix_allocation = u128::from(immix.collections) * immix.nursery_words as u128;
+    let allocation_lo = copying_allocation.min(immix_allocation);
+    let allocation_hi = copying_allocation.max(immix_allocation);
     assert!(
-        cadence_lo * 100 >= cadence_hi * 95,
-        "the two strategies must reach the same collection cadence to within 5 %: both run the \
-         same allocation pattern through the same live-set nursery rule fed the same promoted-word \
-         quantity, and only the minor/major mix each strategy's escalation produces differs \
-         (Copying {} vs Immix {})",
+        allocation_lo * 100 >= allocation_hi * 99,
+        "the two strategies must account for the same young words to within 1 %: both run the \
+         same allocation pattern through the same live-set nursery rule, so \
+         `collections × mean nursery capacity` — the words the run's heap doors admitted, up to \
+         the free words each failing request left — has to match, and only the minor/major mix \
+         (which sizes the nursery, not the allocation) may differ (Copying {} × {} = {}, Immix \
+         {} × {} = {})",
         copying.collections,
-        immix.collections
+        copying.nursery_words,
+        copying_allocation,
+        immix.collections,
+        immix.nursery_words,
+        immix_allocation
     );
     // The minor/major **split** is *not* strategy-independent: a mark-region minor whose
     // promotion would not fit the mature space's free lines escalates to a major
