@@ -895,13 +895,41 @@ fn apply_plus_value(builder: &mut Builder, switch: &str, value: &str) -> Result<
             builder.perf_map.set_directory(value.to_string());
             builder.preserve("+JPperfdirectory", value);
         }
-        // The scheduler *size* switches (`+SP`, `+SDcpu`, `+SDPcpu`, `+SDio`) and the `+s*`
-        // sub-parameters other than `+sbt` are recognized and value-consuming but not
-        // modelled: this runtime runs one normal scheduler pool and no CPU topology, so the
-        // value is preserved verbatim (nothing is lost) and nothing else happens. Their own
-        // value grammars are deliberately not validated — see
-        // [`flags::emulator_flag_recognized`], which takes the same stand for every other
-        // unmodeled emulator switch.
+        // `+SP`/`+SDPcpu` — the scheduler **percentage** switches (`early_init`,
+        // `:955-1022`): the `+S`-shaped `sscanf` cascade whose only test is negativity, with no
+        // upper bound (`+SP 50`, `+SP 100:100` and `+SP :3` are fine; `+SP -1` is not).
+        "+SP" | "+SDPcpu" => {
+            flags::parse_scheduler_percent(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+SDcpu` — the dirty-CPU scheduler count: the `+S` cascade *and* `chk_S` bounds
+        // (`1..=1024`, online `1..=total`), so a non-positive half is an offset from the
+        // default and `+SDcpu -1` is accepted.
+        "+SDcpu" => {
+            let default_schedulers = crate::info::logical_processors();
+            flags::parse_dirty_cpu_schedulers(
+                switch,
+                value,
+                default_schedulers,
+                default_schedulers,
+            )?;
+            builder.preserve(switch, value);
+        }
+        // `+SDio` — the dirty-I/O scheduler count: `atoi` then `1..=1024` (`+SDio 0` and
+        // `+SDio 1025` are refused, `+SDio abc` `atoi`s to `0` and is refused too).
+        "+SDio" => {
+            flags::parse_dirty_io_schedulers(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // The remaining `+s*` sub-parameter is `+sct`, whose value is **not** a scalar but the
+        // full CPU-topology token language (`erts/emulator/beam/erts_cpu_topology.c:1076-1300`:
+        // `cpus`/`cpu`/`node`/`core`/`thread`/`processor` nodes, `id=…`/`logical=…`,
+        // `/`-separated lists, `;`-separated declarations). Its grammar is deliberately **not**
+        // modelled here, so `+sct` stays accepted-and-preserved rather than half-validated.
+        //
+        // `+swtdcpu`/`+swtdio` (the per-scheduler-type wakeup thresholds,
+        // `erts_sched_set_wakeup_other_threshold`) are likewise preserved unvalidated: this
+        // runtime models no scheduler pool for them to configure.
         _ => builder.preserve(switch, value),
     }
     Ok(())
@@ -2992,8 +3020,8 @@ mod tests {
             (&["+sssdio64"][..], &["+sssdio", "64"][..], "+sssdio", "64"),
             (&["+sfwi100"][..], &["+sfwi", "100"][..], "+sfwi", "100"),
             (&["+stbtu"][..], &["+stbt", "u"][..], "+stbt", "u"),
-            (&["+swct100"][..], &["+swct", "100"][..], "+swct", "100"),
-            (&["+subblack"][..], &["+sub", "black"][..], "+sub", "black"),
+            (&["+swcteager"][..], &["+swct", "eager"][..], "+swct", "eager"),
+            (&["+subtrue"][..], &["+sub", "true"][..], "+sub", "true"),
         ] {
             assert_attached_equals_separated(attached, separated);
             let config = parsed(attached);
@@ -3014,8 +3042,8 @@ mod tests {
             vec!["+sbwtdcpu".to_string(), "medium".to_string()]
         );
         assert_eq!(
-            parsed(&["+sssdcpu7"]).emulator.extra_emulator_flags,
-            vec!["+sssdcpu".to_string(), "7".to_string()]
+            parsed(&["+sssdcpu64"]).emulator.extra_emulator_flags,
+            vec!["+sssdcpu".to_string(), "64".to_string()]
         );
         // `+srct`/`+ssrct` read no value at all (`early_init` only sets a flag).
         let config = parsed(&["+ssrct"]);
@@ -3425,6 +3453,80 @@ mod tests {
                 assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
                 let attached = format!("{switch}{value}");
                 assert!(parse_args(&[attached.as_str()]).is_err(), "{attached}");
+            }
+        }
+    }
+
+    /// The `+s*` scheduler sub-parameters and the four scheduler-**size** switches are
+    /// **validated**, not merely consumed: each one's own value grammar
+    /// (`erl_init.c:955-1180` for `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio`, `:1922-2210` for the `+s`
+    /// family) refuses a bad value with the emulator's `bad …` + usage, i.e. exit **1** — never
+    /// a capability gap — and accepts a good one in both spellings alike.
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1 (attached and separated alike):
+    /// `+SP 50`/`+SP 100:100`/`+SP :3`/`+SP -5`-free forms exit 0 while `+SPabc` exits 1;
+    /// `+SDcpu 64` exits 0 while `+SDcpu1025` exits 1 (but `+SDcpu-1` is an offset and exits 0);
+    /// `+SDPcpu 50:25` exits 0 while `+SDPcpu-1` exits 1;
+    /// `+SDio 64` exits 0 while `+SDio0`/`+SDio1025` exit 1;
+    /// `+scltrue`/`+spptrue`/`+subtrue` exit 0 while `+sclbogus`/`+sppx`/`+subx` exit 1;
+    /// `+swsdefault`/`+swslegacy` exit 0 while `+swsx` exits 1;
+    /// `+swtvery_high` exits 0 while `+swtturbo` exits 1;
+    /// `+swctvery_lazy`/`+swctvery_eager` exit 0 while `+swctfoo` exits 1;
+    /// `+stbt u` exits 0 while `+stbtx` exits 1;
+    /// `+sss 64`/`+sssdcpu 64`/`+sssdio 64` exit 0 while `+sss19`/`+sss8193` exit 1;
+    /// `+sfwi 100`/`+sfwi x` exit 0 while `+sfwi-1` exits 1;
+    /// `+secio bogus` exits 0 (the C ignores the value: `erl_init.c:2037-2041`).
+    #[test]
+    fn the_scheduler_sub_parameter_grammars_match_the_c() {
+        // (switch, a value the oracle accepts, a value it refuses) — never the same pair, and
+        // never a switch this runtime models an effect for (`+sbt` has its own test above).
+        let rows: &[(&str, &str, &str)] = &[
+            ("+SP", "50:100", "abc"),
+            ("+SDcpu", "64", "1025"),
+            ("+SDPcpu", "50:25", "-1"),
+            ("+SDio", "64", "0"),
+        ];
+        for &(switch, accepted, refused) in rows {
+            let separated = [switch, accepted];
+            let attached = [format!("{switch}{accepted}")];
+            let attached: Vec<&str> = attached.iter().map(String::as_str).collect();
+            assert_eq!(
+                parsed(&separated),
+                parsed(&attached),
+                "{switch} {accepted} vs {switch}{accepted}"
+            );
+            assert_eq!(
+                parsed(&separated).emulator.extra_emulator_flags,
+                vec![switch.to_string(), accepted.to_string()],
+                "{switch} {accepted} keeps its (switch, value) pair"
+            );
+            for args in [vec![switch, refused], vec![&*format!("{switch}{refused}")]] {
+                let error = parse_args(&args).expect_err("a bad scheduler value is refused");
+                assert_eq!(
+                    error::flag_rejected_diagnostic(&error),
+                    Some(format!("bad value {refused:?} for switch {switch}").as_str()),
+                    "{args:?}"
+                );
+                assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            }
+        }
+        // `+SDcpu`'s non-positive halves are offsets from the default, not refusals
+        // (`erl_init.c:1046-1052`), so `-1` is accepted while `4:5` (online > total) is not.
+        for accepted in ["-1", "1", "1024", "4:2", ":2", "0:0"] {
+            for args in [vec!["+SDcpu", accepted], vec![&*format!("+SDcpu{accepted}")]] {
+                assert!(parse_args(&args).is_ok(), "{args:?}");
+            }
+        }
+        for refused in ["4:5", "1025", ":", "1:2:3"] {
+            for args in [vec!["+SDcpu", refused], vec![&*format!("+SDcpu{refused}")]] {
+                assert!(parse_args(&args).is_err(), "{args:?}");
+            }
+        }
+        // `+SP`/`+SDPcpu` have **no** upper bound and no total/online relation.
+        for accepted in ["0", "100", "100:100", ":3", "9999"] {
+            for switch in ["+SP", "+SDPcpu"] {
+                let args = [switch, accepted];
+                assert!(parse_args(&args).is_ok(), "{args:?}");
             }
         }
     }

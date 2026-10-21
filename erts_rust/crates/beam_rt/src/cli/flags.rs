@@ -454,6 +454,58 @@ pub(super) fn parse_busy_wait_threshold(switch: &str, value: &str) -> Result<()>
     }
 }
 
+/// `+SP <percent>[:<percent>]` and `+SDPcpu <percent>[:<percent>]` — the normal- and dirty-CPU
+/// scheduler **percentages** (`erl_init.c:955-1022` for `+SP`, `:1000-1022` for `+SDPcpu`):
+/// the same `sscanf("%d:%d")` → `sscanf(":%d")` cascade as `+S`, but the only test is
+/// `tot < 0 || onln < 0` — there is **no** upper bound and no total/online relation.
+///
+/// Verified against OTP 29.1.1 / erts-17.1: `+SP50`, `+SP100:100`, `+SP:3`, `+SP0` exit 0;
+/// `+SPabc`, `+SP-1`, `+SP5:-1` exit 1.
+pub(super) fn parse_scheduler_percent(switch: &str, value: &str) -> Result<()> {
+    let negative = match scan_count_pair(value) {
+        Some((total, online)) => {
+            total.is_some_and(|percent| percent < 0) || online.is_some_and(|percent| percent < 0)
+        }
+        None => true,
+    };
+    if negative {
+        return Err(error::bad_switch_value(switch, value));
+    }
+    Ok(())
+}
+
+/// `+SDcpu <n>[:<n>]` — the dirty-CPU scheduler count (`erl_init.c:1023-1089`): the `+S`
+/// cascade and `chk_S` bounds, with `ERTS_MAX_NO_OF_DIRTY_CPU_SCHEDULERS` = the same `1024`.
+///
+/// A non-positive half is an **offset from the default** (`+SDcpu -1` is `no_schedulers - 1`
+/// and is accepted), which is why the rule is [`resolve_scheduler_counts`] rather than a
+/// negativity test.
+pub(super) fn parse_dirty_cpu_schedulers(
+    switch: &str,
+    value: &str,
+    default_total: i64,
+    default_online: i64,
+) -> Result<()> {
+    let pair = scan_count_pair(value)
+        .and_then(|pair| resolve_scheduler_counts(pair, default_total, default_online));
+    match pair {
+        Some(_) => Ok(()),
+        None => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
+/// `+SDio <n>` — the dirty-I/O scheduler count (`erl_init.c:1090-1100`): a bare `atoi` bounded
+/// to `[1, ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS]` (the same `1024`). The C stores it in an
+/// `int`, hence the 32-bit narrowing (`+SDio 4294967297` `atoi`s to `1` and is accepted).
+pub(super) fn parse_dirty_io_schedulers(switch: &str, value: &str) -> Result<()> {
+    let count = i64::from(atoi(value) as i32);
+    if (1..=ERTS_MAX_NO_OF_SCHEDULERS).contains(&count) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
 /// `MIN_ATOM_TABLE_SIZE` (`erts/emulator/beam/atom.h:33`).
 ///
 /// `pub(crate)` because the `+t` effect (`crate::info::limits`) reads a preserved value
