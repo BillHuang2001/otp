@@ -8735,3 +8735,246 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
     );
 }
 
+
+// ---------------------------------------------------------------------------------------
+// The nested-run machine pool (`super::machine_pool`)
+// ---------------------------------------------------------------------------------------
+//
+// Every nested run (`run_export_blocking`/`run_label_blocking` — the `call_bif` external-module
+// route and every fun the `FunBridge` applies) takes its `Machine` from the thread-local pool
+// instead of building one, and the pool only pays off if two properties hold: it really hands
+// the *same* machine back for a callee it has already served, and a machine that ran something
+// else first carries no state into the next run. The four cases below pin both, plus the
+// reservoir invariant that makes recycling sound at all.
+
+/// The pool's affinity key for a callee image: the `&Module` address
+/// [`machine_pool::acquire`](super::machine_pool) keys on, computed here from the code
+/// server's own handle so a pin can name the exact entry it expects to find.
+fn pool_key(handle: &Module) -> usize {
+    handle as *const Module as usize
+}
+
+/// **A repeated nested run reuses the pooled machine instead of building a fresh one.**
+///
+/// `gc_ints:loop/2` is a callee with no cross-module call of its own, so one
+/// [`RuntimeContext::run_export`] is exactly one `acquire`/`release` pair. The first run finds
+/// an empty pool and therefore builds a machine ([`super::machine_pool::fresh_builds`] == 1);
+/// every later run of the **same** callee pops that machine and pushes it back, so the fresh
+/// count stays at 1 while the pool still holds exactly one entry. A pool that pushed without
+/// ever hitting (or that dropped the entry on release) would show either a grown `pooled_len`
+/// or a grown fresh count here.
+#[test]
+fn a_repeated_nested_run_reuses_the_pooled_machine() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    let image = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    machine_pool::clear();
+    let first = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.run_export(&image, "loop", 2, &[make_small(4), make_small(0)])
+            .expect("gc_ints:loop(4, 0)")
+    };
+    assert_eq!(signed_value(first), 10, "4+3+2+1");
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        1,
+        "the pool started empty, so the first run had to build its machine"
+    );
+    assert_eq!(
+        machine_pool::pooled_len(),
+        1,
+        "the finished run's machine went back into the pool"
+    );
+    assert_eq!(
+        machine_pool::pooled_modules(),
+        vec![pool_key(&image)],
+        "the pooled entry is tagged with the callee image it just ran, which is what makes the \
+         next call into the same callee a hit"
+    );
+    let second = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.run_export(&image, "loop", 2, &[make_small(4), make_small(0)])
+            .expect("gc_ints:loop(4, 0), again")
+    };
+    assert_eq!(second, first, "the recycled machine answers exactly the same term");
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        1,
+        "the second run popped the pooled machine instead of building one"
+    );
+    assert_eq!(
+        machine_pool::pooled_len(),
+        1,
+        "…and pushed it back, so the pool did not grow"
+    );
+}
+
+/// **The pool is what makes the `FunBridge` route cheap, and it works from a freshly built
+/// nested context.** [`FunBridge::nested`](super::bridges) builds a brand-new
+/// [`RuntimeContext`] for **every applied fun** (`lists:map/2`'s three elements are three
+/// nested contexts), so a pool field on a context would start empty every time; the
+/// thread-local stack is reachable from each of them.
+///
+/// The fun is an **external** fun (`fun gc_ints:l1/1`, an `EXPORT_EXT` term), which is applied
+/// through the ordinary dynamic-call route — one `run_export` into `gc_ints` per element, i.e.
+/// one `acquire`/`release` pair each, on a callee the pool has already served.
+#[test]
+fn the_pool_serves_the_fun_bridge_s_nested_contexts() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    let image = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    machine_pool::clear();
+    let mapped = rt
+        .eval("lists:map(fun gc_ints:l1/1, [4, 3, 2])")
+        .expect("lists:map/2 applies the fixture's export");
+    assert_eq!(
+        rt.format_term(mapped, None)
+            .expect("~p renders the mapped list")
+            .trim_end(),
+        "[10,6,3]",
+        "gc_ints:l1/1 is 4+3+2+1, 3+2+1, 2+1"
+    );
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        1,
+        "three applications of one callee reach one machine — the pool is thread-local, so a \
+         context built per applied fun still finds it"
+    );
+    assert_eq!(machine_pool::pooled_len(), 1);
+    assert_eq!(machine_pool::pooled_modules(), vec![pool_key(&image)]);
+    let again = rt
+        .eval("lists:map(fun gc_ints:l1/1, [4, 3, 2])")
+        .expect("lists:map/2 applies it again");
+    assert_eq!(
+        rt.format_term(again, None)
+            .expect("~p renders the second mapped list")
+            .trim_end(),
+        "[10,6,3]",
+        "the recycled context/machine answers the same mapped list"
+    );
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        1,
+        "a second identical workload builds no machine at all"
+    );
+}
+
+/// **A recycled machine carries no state from the run before it.** After a run over
+/// `gc_ints`, the pool holds that callee's machine; the next run is over a **different**
+/// callee image (`gc_floats`), which must answer its own value — a stale label map, register
+/// file or literal binding would surface as a wrong term (or a typed error) instead.
+///
+/// The affinity rule is what makes this the *no-leak* case rather than the reuse case: a
+/// machine is only ever handed to a run of the callee it last ran, so the two callees each get
+/// their own entry (`fresh_builds` == 2, `pooled_len` == 2), and running each of them again
+/// answers the identical term.
+#[test]
+fn a_pooled_machine_carries_no_state_from_the_run_before_it() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let ints = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    let floats = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("the fixture is cached under its own name");
+    machine_pool::clear();
+    let run = |rt: &mut Runtime, image: &Module| {
+        let mut ctx = RuntimeContext::new(rt);
+        ctx.run_export(image, "loop", 2, &[make_small(4), make_small(0)])
+            .expect("the fixture's loop/2")
+    };
+    let ints_first = run(&mut rt, &ints);
+    assert_eq!(signed_value(ints_first), 10, "gc_ints:loop(4, 0) is 4+3+2+1");
+    let floats_first = run(&mut rt, &floats);
+    let printed = rt
+        .format_term(floats_first, None)
+        .expect("~p renders the float accumulator");
+    assert_eq!(
+        printed.trim_end(),
+        "6.146264369941973",
+        "gc_floats:loop(4, 0.0) sums sqrt(1)..sqrt(4) as floats, and answers a float even \
+         though the machine it runs on is the one that just answered an integer"
+    );
+    assert!(
+        machine_pool::pooled_modules().contains(&pool_key(&ints))
+            && machine_pool::pooled_modules().contains(&pool_key(&floats)),
+        "each callee keeps its own pooled entry: {:?} for ints={} floats={}",
+        machine_pool::pooled_modules(),
+        pool_key(&ints),
+        pool_key(&floats),
+    );
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        2,
+        "one fresh machine per callee — {ints:?} and {floats:?} are different images, so the \
+         second run found no entry for its own callee and built one"
+    );
+    let ints_again = run(&mut rt, &ints);
+    assert_eq!(
+        ints_again,
+        ints_first,
+        "the recycled machine answers the very same small integer"
+    );
+    let floats_again = run(&mut rt, &floats);
+    let printed_again = rt
+        .format_term(floats_again, None)
+        .expect("~p renders the second float accumulator");
+    assert_eq!(
+        printed_again.trim_end(),
+        printed.trim_end(),
+        "…and the other callee's recycled machine answers the same float (compared as a value: \
+         a boxed float term is a fresh heap word, so the words differ while the number does not)"
+    );
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        2,
+        "the two repeats popped their own callee's entry instead of building a machine"
+    );
+}
+
+/// **A recycled machine owns no off-heap payload.** `base64:encode/1`'s `bs_create_bin`
+/// accumulator passes `ERL_ONHEAP_BINARY_LIMIT` (64 bytes), so the **nested** machine that runs
+/// it builds an off-heap refc payload ([`Machine::refc_binaries`](beam_engine::Machine)); the
+/// epilogue adopts the handle into the runtime's escaped-payload store and then drains the
+/// reservoir (`RuntimeContext::adopt_nested_payloads`) before the machine is released.
+///
+/// [`super::machine_pool::pooled_reservoir_owners`] states that invariant after the fact, so
+/// this case pins it without depending on a `debug_assert!` firing — though the assertions in
+/// `release` do fire here too, which is what makes **every** `--lib` test that runs a nested
+/// call an assertion of the same drain.
+#[test]
+fn a_recycled_machine_owns_no_off_heap_payload() {
+    let mut rt = runtime();
+    machine_pool::clear();
+    // 120 bytes in ⇒ 160 bytes out, well past the on-heap binary limit the nested callee's
+    // append accumulator crosses.
+    let size = rt
+        .eval("erlang:byte_size(base64:encode(binary:copy(list_to_binary(\"ab\"), 60)))")
+        .expect("base64:encode/1 runs as a nested cross-module run");
+    assert_eq!(signed_value(size), 160, "120 base64-encoded bytes are 160");
+    assert!(
+        machine_pool::pooled_len() >= 1,
+        "the callee's machine really went through the pool"
+    );
+    assert_eq!(
+        machine_pool::pooled_reservoir_owners(),
+        0,
+        "no pooled machine owns a refc payload or a writable-append registration: the epilogue \
+         drained the reservoir before releasing it, and the debug assertions in \
+         `machine_pool::release` enforce the same rule on the release itself"
+    );
+}

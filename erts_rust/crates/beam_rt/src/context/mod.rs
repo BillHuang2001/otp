@@ -55,6 +55,9 @@
 //! * [`apply`] — fun application ([`LocalFunTarget`], `local_fun_target`,
 //!   `apply_non_local_fun`) and the callee-admission predicates behind the in-machine
 //!   cross-module seam.
+//! * [`ir_cache`] — the thread-local caches behind the two request-path lookups that are pure
+//!   functions of immutable loaded IR: the local-fun descriptor search and the cross-module
+//!   callee-admission verdict.
 //! * [`pump`] — the nested-run pump (`run_export`/`run_export_blocking`/`run_label_blocking`
 //!   and their bounded deadline).
 //! * [`execution`] — the single `impl ExecutionContext`, incl. the process-heap collector
@@ -78,7 +81,9 @@ mod export_gate;
 mod fun_identity;
 pub(crate) mod gc;
 pub(crate) mod gc_walk;
+mod ir_cache;
 mod memory_hook;
+mod machine_pool;
 mod module_info;
 mod node_hash;
 mod persistent_term;
