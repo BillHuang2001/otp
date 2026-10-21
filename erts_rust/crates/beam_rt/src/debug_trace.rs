@@ -94,3 +94,24 @@ pub(crate) fn mem(args: fmt::Arguments<'_>) {
         eprintln!("[rt-mem] {args}");
     }
 }
+/// Whether the **per-process heap** diagnostic is on (`BEAM_RT_GC_TRACE` present).
+///
+/// A fourth channel of its own, for the one question a whole-run memory figure cannot answer:
+/// *which* process's nursery is being grown, how full it is, and whether the collector is
+/// carrying retirement debt at that moment. The copy-out growth
+/// ([`crate::context::RuntimeContext`]'s `hint_grow_gate`) is a **no-collect** seam, so a
+/// chain that only ever grows is otherwise visible solely as an anonymous-mapping chain in
+/// `/proc/<pid>/smaps`. Resolved once per OS process, like [`enabled`].
+pub(crate) fn heap_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BEAM_RT_GC_TRACE").is_some())
+}
+/// Writes one per-process-heap line to stderr when [`heap_enabled`]; a no-op otherwise.
+///
+/// A diagnostic only — no behaviour depends on it, and with the variable unset a call site
+/// costs the one cached `OnceLock` load of [`heap_enabled`].
+pub(crate) fn heap(args: fmt::Arguments<'_>) {
+    if heap_enabled() {
+        eprintln!("[rt-heap] {args}");
+    }
+}

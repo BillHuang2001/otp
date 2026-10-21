@@ -4,8 +4,9 @@
 The crate's implementation root: the `main.rs` shim, the `Runtime` façade (`runtime.rs`, `runtime/`),
 the CLI (`cli.rs`, `cli/`), the concrete `ExecutionContext` glue (`context/`), the runtime-native BIF
 floor (`native.rs`, `native/`), the A.4 port layer (`port.rs`, `port/`), the A.8 introspection surface
-(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client/`), and the
-observability modules (`trace.rs`, `seq_trace.rs`, `crash_dump.rs`, `perf_map.rs`, `debug_trace.rs`).
+(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client/`), the allocator
+free-page release (`malloc.rs`) and the observability modules (`trace.rs`, `seq_trace.rs`,
+`crash_dump.rs`, `perf_map.rs`, `debug_trace.rs`).
 The crate-level API surface (CLI table, exit codes, `system_info` keys, boot status, gaps) lives in
 `../CONTEXT.md`; the per-module detail lives in the child `CONTEXT.md`s below.
 
@@ -273,7 +274,18 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `dist.rs` + `dist/` + `dist_client/` → the distributed node, accepting and connecting halves
   (`dist/CONTEXT.md`, `dist_client/CONTEXT.md`).
 - `eval/` → the `-eval` evaluator (AST/parser/`Flow`) (`eval/CONTEXT.md`).
-- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `timers.rs` (a min-heap of
+- `malloc.rs` → the crate's marked `unsafe` module and its **one** allocator lever:
+  `release_free_pages()` (`libc::malloc_trim(0)` on glibc, an honest `None` elsewhere), called once per
+  process from `main.rs` **after the driver thread has been joined** — the only quiescent *and* complete
+  point, because the driver thread still holds most of the run's memory until it exits (a trim from inside
+  `cli::run`, even after the runtime it built has been dropped, recovers only ~16 MB of ~75 MB). Measured
+  exit RSS (glibc 2.44; arena `in_use` ≤ 218 kB at that point in every case): bare boot 90 760 → 18 400 kB,
+  `compiler/cerl_clauses.erl` 211 168 → 19 068 kB, `stdlib/orddict.erl` 218 544 → 22 240 kB. Peak `VmHWM`
+  is **unchanged** (115 / 314 / 305 MB) because during the run that memory is *live*, not slack (a bare
+  boot's idle arena is 97 681 kB in use of 97 948 kB) — the census, the arena/heap layout, the measured
+  non-effect of a trim at the boot→action boundary (266 kB free there) and the fragmentation limit are in
+  the module docs. `BEAM_RT_MEM_TRACE` prints the call's answer as one `[rt-mem] heap-release=…` line.
+- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `malloc.rs`, `timers.rs` (a min-heap of
   absolute deadlines over `crate::hasher::FastHashMap` indexes, whose `prune_cancelled` reclaims
   non-head cancelled tombstones with a watermark heap rebuild), `nif.rs`, `hasher.rs`
   (the crate's one deterministic non-cryptographic `BuildHasher` — `FastHasher`/`FastBuildHasher`/
