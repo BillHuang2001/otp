@@ -544,6 +544,15 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
 
         // ... the copying collector, directly.
         let mut collector = Collector::new(policy.clone()).expect("collector");
+        // The initial fullsweep, pinned: a fresh collector has no old generation to promote into,
+        // so its first collection is a major (`Collector::has_old_generation`). Running it up
+        // front, on the still-empty nursery, leaves both strategies at `minor_since_major == 0`
+        // with an old generation in place — which is what makes the grow below the *same* (minor)
+        // collection on either of them, because the GenImmix entry point carries no
+        // old-generation guard of its own.
+        collector
+            .collect_kind(CollectionKind::Major, &mut [])
+            .expect("initial fullsweep");
         let mut roots = vec![
             tuple_in(collector.young_mut(), 1, 2),
             tuple_in(collector.young_mut(), 3, 4),
@@ -553,18 +562,25 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
             "the nursery starts too small"
         );
 
+        let before = collector.stats();
         let collection = collector
             .ensure_capacity(need, &mut roots)
             .expect("growth is reachable");
         assert_eq!(collection.kind, CollectionKind::Minor);
         assert!(collector.young().available_words() >= need);
         assert!(collector.young().capacity_words() >= need);
+        // Exactly one collection ran — on top of the pinned initial fullsweep, which is already in
+        // the stats.
         assert_eq!(
             collector.stats().minor_collections,
-            1,
-            "exactly one collection ran"
+            before.minor_collections + 1,
+            "exactly one minor ran"
         );
-        assert_eq!(collector.stats().major_collections, 0);
+        assert_eq!(
+            collector.stats().major_collections,
+            before.major_collections,
+            "and no fullsweep"
+        );
         assert!(
             roots.iter().all(|r| collector.mature().contains_term(*r)),
             "the live set was promoted by that one collection"
@@ -573,12 +589,18 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
 
         // ... the mark-region collector, directly.
         let mut collector = GenImmixCollector::from_policy(policy.clone()).expect("collector");
+        // The same pinned initial fullsweep, for the same reason: it keeps both strategies'
+        // grow-time collection a minor.
+        collector
+            .collect_kind(CollectionKind::Major, &mut [])
+            .expect("initial fullsweep");
         let mut roots = vec![
             tuple_in(collector.young_mut(), 1, 2),
             tuple_in(collector.young_mut(), 3, 4),
         ];
         assert!(collector.young().available_words() < need);
 
+        let before = collector.stats();
         let collection = collector
             .ensure_capacity(need, &mut roots)
             .expect("growth is reachable");
@@ -586,10 +608,14 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
         assert!(collector.young().available_words() >= need);
         assert_eq!(
             collector.stats().minor_collections,
-            1,
-            "exactly one collection ran"
+            before.minor_collections + 1,
+            "exactly one minor ran"
         );
-        assert_eq!(collector.stats().major_collections, 0);
+        assert_eq!(
+            collector.stats().major_collections,
+            before.major_collections,
+            "and no fullsweep"
+        );
         assert!(
             roots.iter().all(|r| collector.mature().contains_term(*r)),
             "the live set was promoted by that one collection"
@@ -599,7 +625,12 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
         // ... and through the strategy-dispatching wrapper, for both strategies.
         for kind in [MatureKind::Copying, MatureKind::Immix] {
             let mut any = any_for(kind, policy.clone());
+            // The pinned initial fullsweep again — an `AnyCollector` forwards it to whichever
+            // strategy it holds.
+            any.collect_kind(CollectionKind::Major, &mut [])
+                .expect("initial fullsweep");
             let mut roots = vec![tuple_in(any.young_mut(), 1, 2)];
+            let before = any.stats();
             let collection = any
                 .ensure_capacity(need, &mut roots)
                 .expect("growth is reachable");
@@ -610,9 +641,10 @@ fn ensure_capacity_grows_the_nursery_for_every_strategy_and_policy() {
             );
             assert_eq!(
                 any.stats().minor_collections + any.stats().major_collections,
-                1,
-                "{kind:?}: exactly one collection ran"
+                before.minor_collections + before.major_collections + 1,
+                "{kind:?}: exactly one collection ran on top of the initial fullsweep"
             );
+            assert_eq!(any.stats().major_collections, before.major_collections);
             assert_tuples_intact(&roots, &[(1, 2)]);
         }
     }
@@ -746,6 +778,15 @@ fn grown_nursery_filled_to_its_exact_boundary(kind: MatureKind) {
         tuple_expected.push((i, 2 * i));
     }
 
+    // The initial fullsweep, pinned: the first collection of a process has no old generation to
+    // promote into, so it is a major (`Collector::has_old_generation`). Running it here puts both
+    // strategies at `minor_since_major == 0` with an old generation in place and leaves the
+    // nursery on its live-set target (`young_after_fullsweep(51, 6) = young_target_words(6) = 90`
+    // for the copying side, the same figure from its own promote-and-collapse for the mark-region
+    // one), so the grow below is the minor this test drives on either of them.
+    c.collect_kind(CollectionKind::Major, &mut roots)
+        .expect("initial fullsweep");
+
     // 1206 words rounds up the table to 1598 (a whole number of 2-word cons cells).
     let need = 1206usize;
     let collection = c.ensure_capacity(need, &mut roots).expect("grow");
@@ -820,6 +861,14 @@ fn a_term_written_in_the_window_survives(kind: MatureKind) {
 
     let mut roots = Vec::new();
     let mut expected = Vec::new();
+
+    // The initial fullsweep, pinned: a fresh process's first collection has no old generation to
+    // promote into, so it is a major (`Collector::has_old_generation`). Running it before the
+    // live set exists puts both strategies at `minor_since_major == 0` with an old generation in
+    // place, so the grow and the collection below are the same (minor) rounds on either of them.
+    c.collect_kind(CollectionKind::Major, &mut roots)
+        .expect("initial fullsweep");
+
     for i in 0..2i64 {
         roots.push(tuple_in(c.young_mut(), i, 2 * i));
         expected.push((i, 2 * i));

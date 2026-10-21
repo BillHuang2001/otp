@@ -436,16 +436,23 @@ fn cyclic_graphs_collect_correctly_and_terminate_under_both_strategies() {
         let before = roots.clone();
         let mut roots = roots;
 
-        // The first collection is a minor: every live object is promoted exactly once. The
-        // copier's only cycle defence is its in-place forwarding pointer, so a cyclic graph must
-        // neither hang nor double-copy.
+        // Every live object is promoted exactly once. The copier's only cycle defence is its
+        // in-place forwarding pointer, so a cyclic graph must neither hang nor double-copy — and
+        // that holds for both kinds of collection: they run the same copier over the same graph,
+        // so the copy counts below are identical. What differs is only `collect`'s *choice*: the
+        // copying collector's first collection is the mandated initial fullsweep (the first
+        // collection of a process has no old generation to promote into), while the GenImmix entry
+        // point does not carry that guard yet, so its first collection is still the minor.
         let collection = collector
             .collect(&mut roots)
             .expect("a cyclic graph must collect");
         assert_eq!(
             collection.kind,
-            CollectionKind::Minor,
-            "{kind:?}: the first collection is a minor"
+            match kind {
+                MatureKind::Copying => CollectionKind::Major,
+                MatureKind::Immix => CollectionKind::Minor,
+            },
+            "{kind:?}: the first collection"
         );
         assert_eq!(
             collection.stats.objects_copied, CORPUS_OBJECTS,
@@ -469,8 +476,8 @@ fn cyclic_graphs_collect_correctly_and_terminate_under_both_strategies() {
             );
         }
 
-        // The graph is intact and every cycle closes on the copies. The nursery is empty after a
-        // minor, so "resident elsewhere" is simply "no longer in the nursery".
+        // The graph is intact and every cycle closes on the copies. The nursery is empty after the
+        // collection, so "resident elsewhere" is simply "no longer in the nursery".
         for (root, shape) in roots.iter().zip(shapes.iter()) {
             assert_shape(*root, *shape, |t| !collector.young().contains_term(t));
         }
