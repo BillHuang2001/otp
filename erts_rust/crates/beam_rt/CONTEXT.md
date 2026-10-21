@@ -123,9 +123,26 @@ The design rationale and binding invariants of the runtime glue — the mature-G
 * **An allocate-and-abandon loop is collector-bound, never arena-bound** — the per-op cost is the collector's own Cheney traversals, and on the **native** (default) tier a flat `heap_size`/`erlang:memory(processes)` is a converged capacity — `M1_GAPS.md` *Scheduler / runner*.
 * **The reported heap capacity RATCHETS: it is not flat in the number of registered-BIF calls.** A tail loop of `integer_to_list/1` calls leaves `total_heap_size` = **7,427,794 words (59 MB)** after 300 000 calls (the oracle: 2 585 words), `heap_size` = 466 (an empty nursery), and the figure is **unchanged 3 s later** — so the retained thing is *capacity*, never live data. Doubling the call count doubles the figure (≈25 retained capacity words per call).
   Every figure that exposes it — `process_info(P, total_heap_size)`, `erlang:memory(processes)`, and `MaxHeapUsage::heap_words` (what `max_heap_size` compares, `beam_process/src/max_heap.rs:176-185`) — is a **chain sum** of young+mature spaces, and `Nursery::grow`/`install` retires the old space without freeing it (`beam_gc/src/nursery.rs:334`/`:426`, released only by `collapse` at `:465`), so each grow permanently adds to the sum.
-  The trigger on a compile's hot path is the BIF-result copy-out (`src/context/calls.rs`'s `move_result_into_process_heap` headroom retry and `hint_grow_gate`) calling `Process::grow_nursery`; the capacity rule itself (`grow`'s `next_words(2·capacity)` doubling, `collapse`'s chain-sum argument) is `beam_gc/CONTEXT.md` *Capacity growth*.
-  Consequence for compiles: a `compile:file/2` of `lib/debugger/src/dbg_iload.erl` or `lib/kernel/src/inet_parse.erl` ratchets its capacity through `beam_ssa` → `beam_ssa_opt` (measured 3.8M → 26M → **590M words** = 4.7 GB) — under a `1<<24`-word `max_heap_size` it raises `error:system_limit` **inside `erl_lint:check_unused_types_1` → `reached_types/1`** (`{crash,lint_module,system_limit,[{sofs,fam2digraph,2,…}]}`) after 602 minor GCs that reclaimed only 1.4 M words; uncapped it grows to 271 M words by 6.6 s and 851 M words (6.8 GB, RSS 3.09 GB) by ~30 s and does not finish in 520 s.
-  Uncapped `inet_parse` instead **SIGSEGVs** (`exit 139`, reproducible, no polling involved) ~18 s in, right after a 590 M-word capacity was installed — a native crash, not a typed gap; RSS at the crash was only a few MB, so it is not OOM.
+  **For an in-process `compile:file/2` this ratchet is NOT the mechanism on either route** (measured):
+  the copy-out seam it needs is guarded by `mailbox_table.as_deref_mut()?` (`calls.rs:1490`) on the
+  table-less `-eval` route, and on the `run <file>` route the compile's work happens in nested runs whose
+  context also carries `mailbox_table: None`/`gc_armed: false` (`src/context/bridges.rs:192-195`) — so
+  after a *completed* `cerl_clauses` compile the process reads `total_heap_size`/`heap_size` **843 words**
+  (`run`, both spawned-child and target-process form) and **233 words** (`-eval`) with
+  `garbage_collection.minor_gcs = 0`.
+  The compile's host memory is instead a count of `heap_words`-sized reservations in the grow-only
+  `bif_heaps` pool — **134 217 728 B (128 MiB) per concurrent nested-run level**: measured peak
+  `std_alloc.live_bytes` 3.81 GB for `cerl_clauses`, 5.3 GB (peak 6.89 GB) for `inet_parse`, 23.02 GB for
+  `dbg_iload`, with sampling steps that are exact integral multiples of 134 217 728 B, peak `VmHWM`
+  334 MB / 2.08 GB / 9.18 GB, and `+hmax 1000000` collapsing `cerl_clauses` to 104 MB / 147 MB (still
+  `{ok,…}`). It is a **high-water mark reused across compiles** (two compiles in one runtime stay at
+  3.83 GB), released only when the `Runtime` drops. `erlang:memory(total)` is blind to it (~4.7 MB after a
+  full compile) because those reservations are `AllocType::Standard`.
+  Corrections to earlier figures from this node: `inet_parse` did **not** SIGSEGV and its peak was
+  **2.08 GB `VmHWM`** (RSS flat at 0.4–0.5 GB for 222 s, never finishing; a 39.92 GiB peak was not
+  reproducible) — its 5.3 GB lives in *reservations* the process never touches.
+  The full attribution, the `+hmax`/double-compile controls and the sound-vs-unsound reclaim list are
+  [`src/context/CONTEXT.md`](src/context/CONTEXT.md) *Host-memory retention …* + *Reclaim …*.
 * **A user process's nursery is live-set sized and flat in N** (not a gap; the rule is `beam_gc`'s `HeapPolicy::young_minor_target_words`, one × the round's own `GcStats::words_copied` plus the reserve): `reds_boundary`'s boundary `heap_size` is a flat **610** = `young_minor_target_words(401)` on both tiers, the interpreter control reads the **233**-word floor (`young_minor_target_words(0)`), and `churn` holds a flat **1 220**-word nursery and a flat **4 185**-word mature region at every N — [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md), [`src/runner/MEASURED.md`](src/runner/MEASURED.md).
 * **Execution tier defaults to `JitMode::Auto`** (`src/runner/tier.rs`), compiled lazily per function, `BEAM_RT_TIER` over it — `M1_GAPS.md` *Execution tier*.
 * **CLI divergences and subset gaps** (`-smp disable` accepted, `-setcookie` unmodeled, the `-eval`/`-s`/`-run` subsets) live in [`src/cli/CONTEXT.md`](src/cli/CONTEXT.md).
