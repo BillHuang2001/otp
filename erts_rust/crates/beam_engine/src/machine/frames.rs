@@ -155,11 +155,45 @@ impl Machine {
         self.stack.len()
     }
 
-    /// The current frame's continuation.
+    /// The current frame's continuation, **without** consuming it.
+    ///
+    /// Read-only introspection for the crate's own tests and for a caller that only
+    /// wants to *observe* where the frame would resume; every consumer that follows
+    /// the address must use [`Machine::take_continuation`] instead, so the slot cannot
+    /// outlive the call it describes.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn continuation(&self) -> Result<Continuation> {
         match self.frames.last() {
             Some(frame) => Ok(frame.continuation),
+            None => Err(error::unsupported("run: no current frame")),
+        }
+    }
+
+    /// **Consume** the current frame's continuation: read the slot and reset it to
+    /// [`Continuation::Halt`].
+    ///
+    /// A frame's continuation-pointer slot means exactly one thing — *this frame is
+    /// suspended inside a call and resumes at that address when the call returns* —
+    /// so whoever follows the address (a `return`, a `deallocate_return`, a
+    /// `call_ext_only`/`apply_last` frame discipline) must clear it in the same step.
+    /// C does precisely that in its `RETURN()` macro
+    /// (`../../erts/emulator/beam/emu/macros.tab:241-247`: `SET_I(cp_val(*E)); *E =
+    /// NIL;` — "Return to the function whose continuation pointer is stored at the top
+    /// of the stack and **set that word to NIL**"), which is why its stacktrace walk
+    /// (`gather_stacktrace`, `beam_common.c:782-842`) only admits words that still
+    /// look like a CP.
+    ///
+    /// Leaving the slot in place makes an already-returned caller look like a live
+    /// caller to every reader of the chain ([`Machine::resumption_contexts`] →
+    /// [`Machine::raise_stacktrace`] and [`Machine::current_stacktrace`]), duplicating
+    /// that frame in **every** derived stacktrace. This is the one definition of the
+    /// read-and-clear; [`Machine::continuation`] remains the read-only view for
+    /// introspection.
+    #[inline]
+    pub(crate) fn take_continuation(&mut self) -> Result<Continuation> {
+        match self.frames.last_mut() {
+            Some(frame) => Ok(std::mem::replace(&mut frame.continuation, Continuation::Halt)),
             None => Err(error::unsupported("run: no current frame")),
         }
     }

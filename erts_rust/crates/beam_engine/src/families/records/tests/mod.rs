@@ -27,9 +27,15 @@
 //! * the **fail-branch** path (a record-semantics failure the C reports with
 //!   `$FAIL($Fail)` / `$FAIL_HEAD_OR_BODY($Fail)` must produce
 //!   `Step::Goto { func, pc }` for the resolved `fail` label), and
-//! * the [`NO_FAIL`] path (the engine's single failed-clause raise, class `error` with
-//!   the bare atom `function_clause`, or the typed `unsupported` when the namespace
-//!   cannot name that atom — never a fall-through with a wrong result).
+//! * the [`NO_FAIL`] path, in the two shapes the C has: the four guards
+//!   (`is_any_native_record`, `is_native_record`, `get_record_elements`,
+//!   `is_record_accessible`) raise the engine's single failed-clause exception
+//!   (class `error`, bare atom `function_clause`), while the three
+//!   `$FAIL_HEAD_OR_BODY` opcodes (`put_record`'s update form, `update_record_id`,
+//!   `get_record_field`) raise the C's record reason — `{badfield,
+//!   {{Module,Name},Field}}` or `{badrecord, Src}`. Either route reports the typed
+//!   `unsupported` when the namespace cannot name its tag; neither ever falls
+//!   through with a wrong result.
 //!
 //! The fixtures are real native records built through [`beam_term::write_record`]
 //! (reached via the family's [`raw`](super::raw) forwarder) into the
@@ -51,7 +57,7 @@
 //! * [`foreign_create`] — the create form over the
 //!   [`foreign_record_definition`](crate::context::ExecutionContext::foreign_record_definition)
 //!   seam (a definition that is not the running module's own),
-//! * [`access`] — `is_record_accessible`,
+//! * [`access`] — `is_record_accessible` (the `external` and wildcard scopes),
 //! * [`field`] — `get_record_field`,
 //! * [`rooted`] — the two build paths driven under the mock **moving** collector
 //!   (the rooted-allocation reroute's regression proof).
@@ -61,7 +67,7 @@
 
 use crate::interpreter::LabelMap;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass};
 use beam_term::{make_atom, make_small, NIL};
 
 use super::*;
@@ -205,6 +211,81 @@ fn raise_reason_atom(module: &Module, result: beam_common::Result<Option<Step>>)
         .name(beam_term::atom_val(reason))
         .expect("the reason atom is one the running module can name")
         .to_string()
+}
+
+/// The `(class, reason)` a run that must have raised recorded — the machine's
+/// `pending_exception`, i.e. the pair the C keeps in `c->fvalue`/`c->freason` and
+/// `expand_error_value` (`beam_common.c:745-768`) renders as `{error_atom, Value}`.
+fn raised_reason<T: std::fmt::Debug>(
+    machine: &Machine,
+    result: &beam_common::Result<T>,
+) -> (ExceptionClass, Eterm) {
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "expected a raise, got {result:?}"
+    );
+    machine
+        .pending_exception()
+        .expect("a recorded exception")
+}
+
+/// Assert `reason` is exactly `{Tag, {{Owner, Name}, Field}}` and return the
+/// `{{Owner, Name}, Field}` payload.
+///
+/// This is the `$FAIL_HEAD_OR_BODY` record reason the C builds as
+/// `TUPLE2(TUPLE2(defp->module, defp->name), field)` — the create form's
+/// `badfield`/`novalue` (`erl_record.c:339-351`), the update form's `badfield`
+/// (`:746-756`) and the field readers' `badfield` (`:814-821`, `:872-879`) — wrapped
+/// by `expand_error_value` with `error_atom[r]`.
+fn assert_field_failure_reason(
+    reason: Eterm,
+    tag: Atom,
+    owner: Atom,
+    name: Atom,
+    field: Atom,
+) -> Eterm {
+    assert_eq!(terms::tuple_arity(reason).expect("a tuple"), 2, "reason arity");
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("tag element"),
+        make_atom(tag),
+        "the reason tag"
+    );
+    let value = terms::tuple_element(reason, 1).expect("payload element");
+    assert_eq!(terms::tuple_arity(value).expect("a tuple"), 2, "field pair arity");
+    let pair = terms::tuple_element(value, 0).expect("record id element");
+    assert_eq!(terms::tuple_arity(pair).expect("a tuple"), 2, "id pair arity");
+    assert_eq!(
+        terms::tuple_element(pair, 0).expect("owner"),
+        make_atom(owner),
+        "the definition's module"
+    );
+    assert_eq!(
+        terms::tuple_element(pair, 1).expect("name"),
+        make_atom(name),
+        "the definition's name"
+    );
+    assert_eq!(
+        terms::tuple_element(value, 1).expect("field"),
+        make_atom(field),
+        "the error field"
+    );
+    value
+}
+
+/// Assert `reason` is exactly `{BadRecord, Src}` — the C's `p->fvalue = src;
+/// p->freason = EXC_BADRECORD` (`erl_record.c:790-792`, `:832-834`, `:407-409`)
+/// wrapped by `expand_error_value` — where the payload is **the source term
+/// itself**, never a `{{Module,Name},Field}` graph.
+fn assert_badrecord_reason(reason: Eterm, badrecord: Atom, src: Eterm) -> Eterm {
+    assert_eq!(terms::tuple_arity(reason).expect("a tuple"), 2, "reason arity");
+    assert_eq!(
+        terms::tuple_element(reason, 0).expect("tag element"),
+        make_atom(badrecord),
+        "the reason tag is `badrecord`"
+    );
+    let payload = terms::tuple_element(reason, 1).expect("payload element");
+    assert_eq!(payload, src, "the payload is the source term itself");
+    payload
 }
 
 // ---------------------------------------------------------------------------

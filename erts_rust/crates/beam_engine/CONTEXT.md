@@ -138,6 +138,24 @@ Per-module `#[cfg(test)]` unit tests plus integration tests over committed real 
 - **CI.** `.github/workflows/erts_rust.yml` (path-triggered) builds the workspace (`--all-targets`), runs this test command, a non-blocking clippy and the differential gate.
 - **Oracle-checked = values baked at authoring time.** Most "oracle" suites embed oracle-derived expected values as committed data and load real OTP `.beam`s; only a few re-invoke the live `erl` per assertion (`tests/process_info.rs`, `tests/tailcall.rs`, `tests/func_info_stacktrace.rs`), and `tests/support/discovery.rs` shells out to `erl` (`code:lib_dir/0`) to locate the install. All such suites **skip loudly** when it is absent (so a green run without `erl` proves nothing about corpus parity).
 - Headline suites (the exhaustive enumeration is `TEST_NOTES.md`; the `support/` + `fixtures/` layout is `tests/CONTEXT.md`): the vertical slice (`tests/slice.rs`); the real-module sweep (`tests/stdlib_sweep.rs`: **all 1366** installed `.beam` over **34 applications** through one shared atom table, discovered generically); the oracle-pinned real-stdlib suites (`tests/stdlib_*.rs`, `tests/apps_lists.rs`); the host-gap suites, each asserting its EXACT typed error; the `NO_FAIL`-guard suite (`tests/no_fail.rs`); the execution census and dynamic ranking (`tests/census.rs` over `tests/support/probe/**`, `tests/dynamic_census.rs`); the real-`.beam` variant proofs (`tests/real_beam_variant_proofs.rs`); the in-machine BIF-dispatch tier-parity gate (`tests/bif_in_machine.rs`: both tiers reach `call_bif_in_machine` with byte-identical captures, and the default `false` probe keeps them on the plain `call_bif` path); and the BIF suspend channel proof suite (`tests/bif_suspend.rs`: the park address is the BIF instruction, resumption re-issues the BIF with identical operands, the operands stay in the machine's root set, both tiers agree, `apply/3`'s non-idempotent site is the typed gap, the non-blocking entries fold to `error::suspended()`, and a plain host stays byte-identical).
+- **Stacktrace regression rows (`tests/stacktrace_frames.rs`, over the `erlc +deterministic` fixture
+  `tests/fixtures/stacktrace_frames.erl`/`.beam`).**
+  Every row runs on **both** tiers (interpreter + native baseline) and the two must derive **byte-identical**
+  frames before either is compared with the oracle.
+  Each is cross-checked against the live `erl` oracle as a leading-prefix comparison (the oracle's trailing
+  `erl_eval`/`init` callers lie outside this engine's run) and skips **loudly** when no `erl` is on `PATH`.
+  The shapes: the `t0/0`, `t2/0`, `t3/0` rows (each frame named exactly once, including the tail-call elision
+  the oracle performs); `withcall/0` (a caller that already returned is named once, at the raising function);
+  `inhandler2/0` (a raise landing in the frame's own catch handler consumes that frame's slot, so the
+  handler's own nested caught `S` names the frame once — `[inhandler2/0 @28]`); `folded/0` + `refold/0`
+  (a supplied trace is preserved with no re-raise-site frame: `folded/0` → `[folded/0 @24]`, the ORIGINAL
+  raise site, and `refold/0` → `[g/1 @17, refold/0 @26]`, the row whose frame *identity* moves if a trace is
+  derived at the re-raise site).
+  Two entries are asserted by no row: `inhandler/0` (its handler's re-raise leaves the module uncaught as the
+  fieldless `error:badarith`, i.e. `BeamError::BadArith`, and a fieldless reason carries no symbolic frames —
+  a `beam_common` limitation) and `park/0` (`#[ignore]`d: the test `ModuleHost` supplies no mailbox, so the
+  `receive` reports `unsupported_opcode: receive_next` and `process_info/2`'s `current_stacktrace` is
+  unreachable).
 - Run everything through `scripts/cargo.sh` (`$HOME` is read-only in the sandbox); never `cd`, never touch `../tools/` or `../../erts/`. The project-level M1 **compatibility gate** is `../tools/differential/gate.sh` — run it for the live per-contract split and the ratchet exit code; this crate's tests are the engine-level evidence, the gate the project-level one.
 
 ## Measured / Execution coverage
@@ -158,16 +176,71 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
 - **A synthetic module's never-cached label map costs one `Arc` allocation per `run_*` entry**: **+16 % of the `engine_bench` `setup/empty` floor**, `0/10` paired rounds in its favour; a real module (load-time digest) never takes that route (`MEASURED.md`).
 - **A map `is_eq_exact` costs O(k log k) and two heap `Vec`s per comparison** (no map fast path in `eval_test`; `beam_term`'s `cmp_maps` collects and re-sorts both maps' pairs) -- detail: `src/families/maps/CONTEXT.md`.
 - **Small-int arithmetic (`+ - *`, `band`/`bor`/`bsr`) is inlined only by the native baseline tier**; the **interpreter has no arithmetic fast path** -- every `gc_bif` goes out through `exec_bif` -> `ExecutionContext::call_bif` -- detail: `src/interpreter/CONTEXT.md`.
-- **A captured stacktrace is engine-derived** (from the raise-time `raise_snapshot`; the uncaught funnel attaches the frames when the raw trace is `NIL`) **and nameable atoms are required** (`catch_end` needs `EXIT`; neither path substitutes a *different* atom).
+- **A captured stacktrace is engine-derived unless the raise supplied one** — a derived trace is cooked from the raise-time `raise_snapshot`, a supplied one (symbolic frames, or the trace term of a re-raised exception) is preserved verbatim and no re-raise-site frame is prepended — **and nameable atoms are required** (`catch_end` needs `EXIT`; no path substitutes a *different* atom). Detail: the two bullets below, `src/families/exceptions/CONTEXT.md`.
 - **The uncaught frames exist only for a `BeamError::Raise`** (`beam_common`'s reason variants are fieldless and carry no `StackTrace` slot).
 - **Records.** The whole native-record set executes; `PutRecord`'s create form works for the running module's own `Recs` and for a **foreign** `{Module,Name}` id through `foreign_record_definition` (exported definitions only, else the C's `error:{badrecord, Id}` raise), with the `Ok(None)` host keeping the typed `unsupported` and no `code:ensure_loaded/1` trap. Two divergences in that family are open: `is_record_accessible`'s wildcard arm compares the definition module against the `Scope` **operand** where `emu/ops.tab:1675` substitutes `$MODULE`, and `put_record`-update / `update_record_id` / `get_record_field` raise `function_clause` where the C's `$FAIL_HEAD_OR_BODY` `NO_FAIL` path raises `{badfield,…}`/`{badrecord,…}`. Detail: `src/families/records/CONTEXT.md`, `tests/gaps.rs`.
 - **Bitstrings.** `bs_init_writable` builds 0 bits over a capacity-carrying refc payload (the `x(0)` hint, else `DEFAULT_WRITABLE_SIZE = 1024`) registered writable **on the machine**; a **first-position** `private_append` appends **in place** and an outgrown payload **grows**, so the accumulator loop is amortised (64 KiB from a 1 KiB hint: 2 grows + 4 moves, 61 440 bytes copied -- `create/grow_tests.rs`); every other shape promotes to the byte-identical copy-rebuild.
 - **Bitstring residuals are typed results only, never a wrong value** (no term-level `BIN_FLAG_WRITABLE`/`_ACTIVE_WRITER`, no shrink-on-escape, unmodelled `binary:referenced_byte_size/1`, `as_bytes()` reports the reservation); the full list and the `beam_alloc` `set_len_written` handoff: `src/families/bitstrings/CONTEXT.md`; detail also `INSTRUCTION_SURFACE.md`.
+- **Contract A.9 rung L4 (`a9_selfhost_probe.sh ladder`) COMPILES `beam_flatten.erl` with the tree's own OTP-30 `compile.beam`, and the emitted `Code` chunk is byte-identical to the OTP-29 `erlc` oracle's apart from one byte.** The whole artifact diff is 17 bytes: `beam_dict:highest_opcode` (`beam_asm:reject_unsupported_versions/1` deliberately bumps it to `executable_line/2` = 183, which the OTP-29 compiler never does — a trivial OTP-29-compiled module reports 181) plus the `-vsn` attribute, which `beam_asm:module_md5/1` derives FROM the chunk binaries and therefore inherits that byte. The rung's "FAIL — an artifact was produced but it DIFFERS" verdict is a **rung-baseline artefact** (two compiler versions compared byte-for-byte; no OTP-30 `erl` exists on the host to give a same-version baseline), not a runtime divergence. The former `v3_core:ubody/2` crash no longer reproduces: `v3_core:module(Fs,[])` returns `{ok, #c_module{}, []}` and the minimal forms repro round-trips.
+- **L4's throughput, not its correctness, is the open A.9 blocker on this path.** In-process compiling the tree's own compiler sources is ~2 orders of magnitude too slow: a 17.7 KB synthetic 300-function module takes **8.9 s** (`erlc` 0.20 s), `beam_ssa_dead.erl` (55 KB) and `beam_types.erl` (75 KB) exceed **150 s**, and `v3_core.erl` (193 KB) exceeds **900 s** (`BLOCKING_PUMP_DEADLINE`). Records are NOT the cause (a `-record` twin and a tuple twin take 8.9 s / 7.5 s). `v3_core.erl` is not oracle-comparable either — the OTP-29 `erlc` rejects it.
+- **Printing a native record is the wrong debugging instrument here.** `io_lib:format/2,3` is a `beam_bifs` **native fast path** (`src/io.rs::format_lib_2` → `src/print/pretty.rs` → `src/print.rs::render_chunk`), so it contributes no `io_lib` frames to a trace, and `render_chunk` has no `RECORD_SUBTAG` arm — it falls through to `Err(badarg())` (`src/print.rs:655`), so `~w`/`~p`/`~P`/`~tp` of a **native record** raises a bare `badarg` even though the real `io_lib_pretty:print/4` on the same runtime renders it correctly. An AST dump through `~P` therefore fails silently before printing; print a shallow tag (`element(1,E)`-style) instead.
 - **Snapshot-style divergences are typed errors, never wrong results:** map enumeration order is storage order, and a `NO_FAIL` failure of `test`/`select_val`/a map read raises class `error` with the bare atom `function_clause` from the running module's own atom table.
 - **The stdlib module corpus is bounded by the mock test host's BIF floor** (`tests/support/bifs.rs`), never by the engine's own opcode coverage; the owning crates are `beam_bifs` and `beam_rt`, NOT this crate.
 - **Compiled arithmetic is oracle-exact on overflow** (`+ - * div rem` promote to exact bignums, as does an out-of-range integer operand).
 - **`apply_fun` must reproduce `call_fun`'s x-register order: arguments first, free variables after**, never `free ++ args`.
 - **The `call_fun`/`call_fun2` free-variable copy is NOT a GC hazard (verified; do not re-open)** (no admission point between the read and the writes); the real publication gap is the parked `pending_exception` reason term, owned host-side.
+- **A frame's continuation slot is consumed by whoever follows the address, so a derived stacktrace names a
+  returned caller only while it is still live.**
+  `Machine::take_continuation` (`src/machine/frames.rs`) reads the current frame's CP slot and resets it to
+  `Continuation::Halt` in the same step (C's `RETURN()`: `SET_I(cp_val(*E)); *E = NIL`,
+  `erts/emulator/beam/emu/macros.tab:241-247`).
+  Its complete consumer set is `return_step` (`src/interpreter/dispatch.rs`), `Machine::continuation_step`
+  (`src/machine/drive.rs`), `jit_return` and `jit_deallocate_return` (`src/jit/baseline/runtime.rs`).
+  A raise landing in a frame's catch handler clears that frame's slot too (`throw_with_trace`), because the
+  handler runs in it.
+  The remaining readers are read-only (`continuation()`, `resumption_contexts`/`resumption_addresses`,
+  `raise_stacktrace`/`snapshot_stacktrace`, `current_stacktrace`), and the `set_continuation` writers
+  (`Instr::Call`, `call_ext*`, the `Apply*`/`call_fun` arms, the baseline tier's `store_continuation`) are the
+  slot's only arms.
+  Detail: `src/machine/CONTEXT.md` §A frame's continuation slot is consumed by whoever follows it.
+- **A supplied trace is a TERM; a derived trace is built from `raise_snapshot`.**
+  `sys_core_fold` rewrites `catch C:R:S -> erlang:raise(C,R,S)` into `Instr::RawRaise`, so the
+  `erlang:raise/3` BIF never runs: that arm reads `x(2)` — an enclosing landing published the cooked
+  `[{M,F,A,Location}]` list of the exception being handled there — and when `x(2)` is `NIL` it cooks the
+  machine's preserved `raise_snapshot` chain **once** (rooted), then hands the result to
+  `Machine::raise_supplied`, whose one-shot `pending_supplied_term` latch `Machine::throw_with_trace`
+  promotes to the live `raise_supplied_term` and **skips** the `raise_snapshot` rebuild, so the chain of the
+  raise being re-raised survives and no re-raise-site frame is prepended.
+  A **landed** raise publishes that term as the handler's `x(2)` (C's register convention), so a re-raise
+  carries it onward; an **uncaught** one renders the preserved chain through
+  `Machine::with_uncaught_frames` (`Machine::snapshot_stacktrace`). `symbolic_stacktrace` returns an
+  already-cooked list found in the trace register verbatim (`is_list` — C's `is_raised_exc` arm,
+  `erts/emulator/beam/beam_common.c:1219-1223`), then falls back to supplied symbolic frames, then to the
+  snapshot (C's `raw_raise` stores the supplied trace and clears `EXF_SAVETRACE`, `:1148-1179`;
+  `save_stacktrace` runs only with that flag, `:505-507`).
+  The explicit-symbolic-frames flavour (`erlang:raise/3` with a non-empty list) rides the parallel
+  `pending_supplied_trace`/`raise_supplied_trace` pair and renders its own frames.
+  The two `Option<StackTrace>` latches are metadata (no rooting); the two term latches need none either —
+  nothing allocates between arming one and publishing it, and `x(2)` is inside the frozen root set.
+  `Machine::reset` clears all four.
+  Detail: `src/families/exceptions/CONTEXT.md`, `src/machine/CONTEXT.md`.
+- **Every tier decorates an uncaught raise.** The uniform funnel `Machine::with_uncaught_frames` runs on the
+  interpreter's `Machine::drive`, and the native baseline tier's three raise-carrying helpers
+  (`jit_family`, `jit_bitstr`, `jit_test`) run it **unconditionally** with the true `entry_module` (their
+  blocks never pass through `step_instruction`, so they are the one place a raise they report is decorated —
+  in the entry context and inside a cross-module callee alike). Detail: `src/jit/baseline/CONTEXT.md`.
+- **A supplied EMPTY trace is indistinguishable from "no trace supplied".**
+  `beam_common::Raise` carries no supplied-trace flag, so `erlang:raise(error, boom, [])` is the same value as
+  a raise with no trace and cooks the derived `raise_snapshot` chain where the oracle keeps `[]` (C's
+  discriminator is `is_raised_exc`, `erts/emulator/beam/beam_common.c:1119-1126`).
+  The fix is a `supplied_trace: bool` on `beam_common::Raise`, set by `with_stacktrace`, plus two engine hunks:
+  `src/interpreter/bif.rs`'s arming condition must test that flag instead of the list's length, and
+  `Machine::with_uncaught_frames` must keep its derived frames off when it is set.
+  The engine-side plumbing is in place (`pending_supplied_trace`/`raise_supplied_trace`, supplied-empty support
+  in `carve_supplied_frames`), and the gap is **owned by the sibling `beam_common` node**.
+  Pinned as a known divergent shape by
+  `tests/raise_with_trace.rs::an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`; detail:
+  `src/families/exceptions/CONTEXT.md` §Known Issues.
 ## Heap admission & allocation wiring (the exact engine->host doors)
 - **`test_heap`/`allocate_heap` -> `Machine::ensure_heap` (`src/machine/frames.rs`) -> `ExecutionContext::ensure_heap_full`** with the whole `RootSet` (x, stack **and fr**); the interpreter's two arms and the native tier's `jit_allocate_heap`/`jit_test_heap` are the only call sites and **the two tiers do not differ**, so a collecting host sees one admission point per execution with the same operands. The narrow `ensure_heap` has **no** engine call site, and the `test_heap Live` operand is only a hint (`RootSet::live_len`).
 - **`Instr::Allocate` makes no heap request at all** (frame-only, `jit_allocate` -> `Machine::push_frame`), which also skips C's heap check (C's `allocate` can collect) -- a conservative divergence; `gc_bif`/`bif`/`bif0`/`call_ext*` likewise leave term allocation to the host's `call_bif`.

@@ -213,6 +213,33 @@ impl Machine {
         self.raise_supplied_trace.take()
     }
 
+    /// Consume the **live raise**'s supplied trace term
+    /// ([`Machine::raise_supplied_term`]) — C's `c_p->ftrace` after `raw_raise`
+    /// (a **cooked** `[{M,F,A,Location}]` list; the engine's model of C's opaque raw
+    /// trace object).
+    ///
+    /// `Some(term)` means the exception currently in flight **arrived carrying**
+    /// that trace and derived nothing at the re-raise site, so the term is the whole
+    /// answer: the uncaught funnel renders the chain it preserves instead of
+    /// deriving one at the re-raise site, and a landing publishes it as `x(2)`.
+    /// `None` for every raise that supplied none.
+    ///
+    /// Taking it consumes it: the term describes exactly **one** raise.
+    pub(crate) fn take_raise_supplied_term(&mut self) -> Option<Eterm> {
+        self.raise_supplied_term.take()
+    }
+
+    /// Whether the raise currently in flight **supplied** its trace — either as
+    /// explicit symbolic frames or as a trace term — **without** consuming the
+    /// latch.
+    ///
+    /// The cooked-trace opcode needs this to decide whether to consult the supplied
+    /// state at all: a raise that supplied a trace carries no derived snapshot, so
+    /// the usual "empty snapshot ⇒ `NIL`" shortcut would drop the supplied trace.
+    pub(crate) fn has_raise_supplied_trace(&self) -> bool {
+        self.raise_supplied_trace.is_some() || self.raise_supplied_term.is_some()
+    }
+
     /// Push a catch frame (the `try`/`catch` handler target).
     ///
     /// The frame's module context is stamped from the context executing right now
@@ -411,6 +438,11 @@ impl Machine {
         // a non-empty trace), and this raise — whoever raised it — owns the live
         // state from here on, so a raise that arrived with no such frames clears it.
         self.raise_supplied_trace = self.pending_supplied_trace.take();
+        // The **term** flavour of the same protocol: `raw_raise` supplies the trace
+        // object itself (C's `c_p->ftrace`, with `EXF_SAVETRACE` cleared), so this
+        // raise must not rebuild the chain — the chain of the raise being re-raised
+        // IS the supplied trace, and the term is published as the handler's `x(2)`.
+        self.raise_supplied_term = self.pending_supplied_term.take();
         self.pending_exception = Some((class, reason));
         // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
         // handler's `build_stacktrace` (and the uncaught funnel) must be able to name
@@ -418,12 +450,20 @@ impl Machine {
         // `current_code` at its head, so it is exactly the raising instruction; the
         // live callers come from the call-frame stack, innermost first. This is the
         // engine's replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
-        self.raise_snapshot.clear();
-        if let Some((func, pc)) = self.current_code() {
-            self.raise_snapshot.push((self.current_context(), func, pc));
-        }
-        for (func, pc, context) in self.resumption_contexts() {
-            self.raise_snapshot.push((context, func, pc));
+        //
+        // A raise that **arrived carrying** a trace derives nothing
+        // (`raw_raise`/`raise/3` clear C's `EXF_SAVETRACE`, so `save_stacktrace`
+        // never runs: `../../erts/emulator/beam/beam_common.c:505-507`,
+        // `:1148-1179`), so the snapshot is left exactly as the landing found it —
+        // that preserved chain *is* the trace the re-raise carries.
+        if self.raise_supplied_trace.is_none() && self.raise_supplied_term.is_none() {
+            self.raise_snapshot.clear();
+            if let Some((func, pc)) = self.current_code() {
+                self.raise_snapshot.push((self.current_context(), func, pc));
+            }
+            for (func, pc, context) in self.resumption_contexts() {
+                self.raise_snapshot.push((context, func, pc));
+            }
         }
         let frame = match self.catch_frames.last() {
             Some(frame) => *frame,
@@ -443,7 +483,17 @@ impl Machine {
         // *uncaught* raise above never reaches this point.
         let class_atom = self.class_atom(class)?;
         self.unwind_to_frame(frame.frame_index)?;
-        self.land_exception(class_atom, reason, trace)?;
+        // The landing frame is no longer suspended in the call that raised: the handler
+        // runs in it. Leaving its continuation-pointer slot set would make the raise
+        // site look like its own caller to every later derivation from this frame (C's
+        // `next_catch` drops the frames above the catch frame, and its `RETURN()` clears
+        // a consumed slot — `emu/macros.tab:241-247`).
+        self.set_continuation(Continuation::Halt)?;
+        // The trace the handler sees in `x(2)`: the term this raise supplied when it
+        // supplied one (C's `c_p->ftrace = x(2)` after `raw_raise`), else the raise's
+        // own raw-trace word.
+        let supplied = self.raise_supplied_term.take();
+        self.land_exception(class_atom, reason, trace, supplied)?;
         // The handler's `(func, pc)` are indices into the *landing context's*
         // module, which is not necessarily the module the raise happened in (a raise
         // can unwind across a cross-module `call_ext`). Report the context change so
@@ -518,10 +568,21 @@ impl Machine {
             BeamError::Raise(raise)
                 if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
             {
-                // Consume the failed-clause argument list: it belongs to the raising
-                // frame, which is the frame this funnel names first.
-                let failed_clause_args = self.take_raise_function_clause_args();
-                let frames = self.raise_stacktrace(entry_module, func, pc, failed_clause_args);
+                // A raise that arrived carrying **explicit symbolic frames** renders
+                // those (an empty supplied trace stays empty); a raise that supplied a
+                // trace **term** renders the preserved chain — the trace of the raise
+                // it re-raises — instead of deriving one from this site.
+                if let Some(supplied) = self.take_raise_supplied_trace() {
+                    return BeamError::Raise(raise.with_stacktrace(supplied));
+                }
+                let frames = if self.take_raise_supplied_term().is_some() {
+                    self.snapshot_stacktrace(entry_module)
+                } else {
+                    // Consume the failed-clause argument list: it belongs to the raising
+                    // frame, which is the frame this funnel names first.
+                    let failed_clause_args = self.take_raise_function_clause_args();
+                    self.raise_stacktrace(entry_module, func, pc, failed_clause_args)
+                };
                 if frames.is_empty() {
                     BeamError::Raise(raise)
                 } else {
@@ -540,16 +601,54 @@ impl Machine {
     /// * `x(0) = THE_NON_VALUE` — the "the previous code completed abnormally"
     ///   marker that `catch_end`/`try_case` test (`emu/instrs.tab:1175-1227`);
     /// * `x(1) = reason` (the *expanded* error term, `expand_error_value`);
-    /// * `x(2) = trace` — the raw stacktrace (Milestone 1 captures none, so `NIL`);
+    /// * `x(2) = trace` — the exception's raw stacktrace **register**. C stores the
+    ///   raw `StackTrace` object (the saved continuation chain) it keeps in
+    ///   `c_p->ftrace`; the engine has no such object, so the two term shapes it can
+    ///   hand the handler are:
+    ///   - the **cooked** `[{M,F,A,Location}]` list a raise that *supplied* its trace
+    ///     arrived with (`supplied_term` — what `raw_raise` stores in `c_p->ftrace`,
+    ///     so a re-raise carries it onward as a term and an enclosing handler's
+    ///     `build_stacktrace` returns it verbatim);
+    ///   - the raise's own raw-trace word otherwise ([`NIL`] for every raise the
+    ///     engine derives itself, which `build_stacktrace` cooks from
+    ///     [`Machine::raise_snapshot`] — the engine's `c_p->ftrace` equivalent).
     /// * `x(3) = class_atom` — `exception_tag[GET_EXC_CLASS(freason)]`, installed by
     ///   [`Machine::set_class_atom`]; the handler only has to move it to `x(0)`
     ///   (`try_case`) or compare it against `throw`/`error` (`catch_end`).
-    fn land_exception(&mut self, class_atom: Eterm, reason: Eterm, trace: Eterm) -> Result<()> {
+    fn land_exception(
+        &mut self,
+        class_atom: Eterm,
+        reason: Eterm,
+        trace: Eterm,
+        supplied_term: Option<Eterm>,
+    ) -> Result<()> {
         self.set_x(0, Eterm::non_value())?;
         self.set_x(1, reason)?;
-        self.set_x(2, trace)?;
+        self.set_x(2, supplied_term.unwrap_or(trace))?;
         self.set_x(3, class_atom)?;
         Ok(())
+    }
+
+    /// Raise an exception that **supplies** its cooked trace term — C's `raw_raise`
+    /// (`../../erts/emulator/beam/beam_common.c:1148-1179`): `c_p->fvalue = value;
+    /// c_p->ftrace = stacktrace;` and `freason = class & ~EXF_SAVETRACE`, so nothing
+    /// is derived at this site and the raise carries `term` onward.
+    ///
+    /// The one-shot latch is armed here, immediately before the
+    /// [`Machine::throw_with_trace`] that lands (or propagates) the raise and
+    /// consumes it; a raise that lands publishes `term` as the handler's `x(2)`
+    /// ([`Machine::land_exception`]) and an uncaught one renders the chain it
+    /// preserves ([`Machine::raise_snapshot`]) in
+    /// [`Machine::with_uncaught_frames`]. No allocation happens between the two
+    /// steps, so the term never leaves the frozen root set.
+    pub(crate) fn raise_supplied(
+        &mut self,
+        class: ExceptionClass,
+        reason: Eterm,
+        term: Eterm,
+    ) -> Result<Step> {
+        self.pending_supplied_term = Some(term);
+        self.throw_with_trace(class, reason, term)
     }
 
     /// The [`StackTrace`] of a raise happening at `(func, pc)` **inside
@@ -607,6 +706,25 @@ impl Machine {
             };
             if let Some(module) = self.frame_module(entry_module, context) {
                 push_stack_frame(&mut trace, &module, func, pc, None);
+            }
+        }
+        trace
+    }
+
+    /// The [`StackTrace`] of the machine's **raise snapshot** ([`Machine::raise_snapshot`])
+    /// — the pre-unwind frame chain, resolved against each frame's own module.
+    ///
+    /// This is what a raise that **supplied** its trace renders: the engine's raw
+    /// trace equivalent is the snapshot (a supplied raise derives nothing, so the
+    /// snapshot still holds the frames of the exception it re-raises), and those
+    /// frames are the ones the original raise captured, verbatim, with no
+    /// re-raise-site frame added (`build_stacktrace`'s `is_raised_exc` arm,
+    /// `../../erts/emulator/beam/beam_common.c:1219-1223`).
+    fn snapshot_stacktrace(&self, entry_module: Option<&Module>) -> StackTrace {
+        let mut trace = StackTrace::new();
+        for (context, func, pc) in self.raise_snapshot() {
+            if let Some(module) = self.frame_module(entry_module, *context) {
+                push_stack_frame(&mut trace, &module, *func, *pc, None);
             }
         }
         trace

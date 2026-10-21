@@ -118,12 +118,14 @@ use crate::terms::{ContextSink, Sink};
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
 ///
 /// **When this is called.** C's raw trace is an opaque object of **saved code
-/// pointers** (`c_p->ftrace`), with no engine equivalent, so a landed exception still
-/// carries `x(2) = NIL`. The compiled path's `build_stacktrace` therefore cooks **this**
-/// function from the machine's raise-time snapshot whenever one is live (the compiler
-/// reaches it only from a `try`/`catch` handler clause that just landed an exception —
-/// see `super::Instr::BuildStacktrace`); a `NIL` raw trace with no recorded raise is
-/// the only shape that cooks to `NIL`. The oracle's own cooked `S` for
+/// pointers** (`c_p->ftrace`), with no engine equivalent, so a landed exception carries
+/// `x(2) = NIL` unless a raise **supplied** a trace — and a supplied one lands as the
+/// already-cooked list, which returns through the `is_list` passthrough at the head of
+/// this function (C's `is_raised_exc` arm). Everything else cooks **this** function
+/// from the machine's raise-time snapshot whenever one is live (the compiler reaches
+/// it only from a `try`/`catch` handler clause that just landed an exception — see
+/// `super::Instr::BuildStacktrace`); a `NIL` raw trace with no recorded raise is the
+/// only shape that cooks to `NIL`. The oracle's own cooked `S` for
 /// `try ... catch C:R:S -> S end` additionally holds host `init:*`/`erl_eval` frames
 /// that live *outside* this engine's run, so a snapshot-cooked trace is a
 /// strictly-**shorter prefix** of the oracle's — the engine's frames first, never a
@@ -143,15 +145,19 @@ use crate::terms::{ContextSink, Sink};
 /// and consed in front of the carved frames. The list is then never empty: an empty
 /// frame chain with a live head cooks to the **one-element** list `[Item]`.
 ///
-/// **Supplied frames come first.** A raise that **arrived carrying** explicit
-/// symbolic frames — `erlang:raise/3` with a non-empty trace list — renders THOSE
-/// frames verbatim and the `raise_snapshot` below is not consulted: the
-/// caller-supplied trace REPLACES the derived one, exactly as the oracle's
-/// `build_stacktrace` returns the supplied list unchanged. The live latch
-/// ([`Machine::take_raise_supplied_trace`]) is consumed **once** here, so a later
-/// raise that carries none falls back to the snapshot heuristic; an absent/empty
-/// supplied trace leaves every path byte-identical. A supplied frame carries an
-/// **arity** (never an argument list) in its `A` slot and its `Location` is the
+/// **Supplied traces come first.** A raise that **arrived carrying** a trace renders
+/// THAT trace, never the derived one, exactly as the oracle's `build_stacktrace`
+/// returns a supplied trace unchanged (`../../erts/emulator/beam/beam_common.c:1219-1223`).
+/// Two shapes reach here, both consumed **once**:
+/// * an already-cooked list in the operand the caller read (`is_list` — the term a
+///   landing published in `x(2)`, i.e. C's `c_p->ftrace` after `raw_raise`), returned
+///   verbatim;
+/// * explicit symbolic frames ([`Machine::take_raise_supplied_trace`]) —
+///   `erlang:raise/3` with a non-empty trace list — carved into the same
+///   `[{M,F,A,Location}]` shape, which REPLACES the derived trace.
+/// An absent/empty supplied trace leaves every path byte-identical to the
+/// `raise_snapshot`-derived behavior. A supplied frame carries an **arity** (never an
+/// argument list) in its `A` slot and its `Location` is the
 /// `[{file,File},{line,N}]` pair the [`SourceLocation`](beam_common::SourceLocation)
 /// describes when present, else [`NIL`]. Every name it needs is resolved from the
 /// running module's atom table — never substituted, so a name the table cannot
@@ -163,6 +169,18 @@ pub(crate) fn symbolic_stacktrace(
     head_operand: &Operand,
     head: bool,
 ) -> Result<Eterm> {
+    // An **already cooked** trace passes through verbatim: the landing publishes the
+    // cooked `[{M,F,A,Location}]` list of the exception being handled in `x(2)` (see
+    // [`Machine::land_exception`](crate::machine::Machine)), and C's
+    // `build_stacktrace` likewise returns a supplied trace unchanged
+    // (`get_args_from_exc` verbatim when `is_raised_exc`,
+    // `../../erts/emulator/beam/beam_common.c:1219-1223`). A raw-trace word is never
+    // a cons cell — it is `NIL` or one synthesized item (the callee head,
+    // [`super::callee`]) — so `is_list` is exactly the "already cooked" test.
+    let raw = read_operand(machine, ctx, head_operand)?;
+    if is_list(raw) {
+        return Ok(raw);
+    }
     // A raise that ARRIVED carrying explicit symbolic frames renders THOSE frames,
     // replacing the `raise_snapshot` heuristic. Consumed once, so a later raise that
     // carries none falls back to the snapshot below; `None` leaves this function

@@ -391,6 +391,17 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   iterations-per-slice pre-emption, and the residual tuple plus its interpreter control) over the
   committed `tests/fixtures/native_reds.{erl,beam}` fixture.
 
+* **An uncaught raise's stacktrace is never rendered on the compiled route.** The runner flattens a raise
+  to a reason **term** ([`mod.rs::reason::exit_reason`](reason.rs): atom → live term → `Display` text) and
+  the pump hands the original `BeamError` back to the CLI, which prints **one** line —
+  `beam_rt: <class> <reason>` (`beam_common`'s `Display for Raise`, with `cli.rs::reported_reason` swapping
+  in the `~w` rendering of a live structured reason on the `run`/`-boot` routes only).
+  There is no `** exception error:` / `=ERROR REPORT` crash-report renderer in this crate (the one ERTS
+  report text is the `max_heap_size` block, `../context/gc.rs`), so `Raise::stacktrace` — the symbolic
+  frames the engine attaches when a raise escapes a machine — has **no consumer** here: its only readers
+  are the `-eval` catch fold (`../eval/mod.rs::cook_supplied_trace`) and
+  `process_info(_, current_stacktrace)` (`../native/memory/`, from the live machine, not from a raise).
+
 ## The collection-site inventory this node owns (and what each site publishes)
 **The scheduled path is the ONLY path that collects at all.** `RuntimeContext::gc_armed` is
 [`take`](std::mem::take)n as the **first statement** of each rooted door

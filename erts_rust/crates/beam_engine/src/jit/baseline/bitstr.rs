@@ -92,6 +92,9 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // SAFETY: `runtime.module` points at the module the driver is running, which outlives
         // the loop.
         let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.entry_module` points at the run's entry module, which the driver
+        // holds alive for the whole loop.
+        let entry_module = unsafe { &*runtime.entry_module };
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives the
         // loop.
         let labels = unsafe { &*runtime.labels };
@@ -128,14 +131,13 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
             // Not this family's variant after all: the interpreter's own step, which reports
             // the exact diagnostic (or executes the instruction natively) for it.
             Ok(None) => return jit_step_one(rt, func, pc),
-            // The uniform raise funnel's context-`0` half, exactly as
-            // `Machine::step_instruction` runs it: in context `0` the active module IS the
-            // entry module, so a propagating raise is decorated here; a non-zero context is
-            // left to the driver, which knows the true entry module.
-            Err(err) if machine.current_context() == 0 => {
-                Err(machine.with_uncaught_frames(err, Some(module), func, pc))
-            }
-            Err(err) => Err(err),
+            // The uniform raise funnel, exactly as `Machine::drive` runs it: a block this
+            // helper is called from never passes through `step_instruction`, so this IS the
+            // one place the raise is decorated — in the entry context and inside a
+            // cross-module callee alike, with `func`/`pc` naming the raising instruction in
+            // the active module and `entry_module` the module every context-`0` frame
+            // belongs to.
+            Err(err) => Err(machine.with_uncaught_frames(err, Some(entry_module), func, pc)),
         }
     };
     match outcome {

@@ -10,7 +10,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `mod.rs` — `Machine` (x-register file, float-register (FR) file of `Eterm` term slots, Erlang stack,
   call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
   `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
-  replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate, reduction counter,
+  replacement for C's saved raw `StackTrace` (`c_p->ftrace`), left **untouched** by a raise that supplied its
+  own trace (nothing is derived at a re-raise site, so the preserved chain is the re-raised exception's) — latched A.8 trace gate, reduction counter,
   the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
   `ExecutionContext::wants_bif_in_machine` answer, latched once per run by `Machine::drive` **and** by the
   native baseline tier's driver, read by `Machine::dispatch_bif_call` — and the fourth latched gate,
@@ -42,26 +43,41 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (the whole file), `with_roots` (the prefix it hands over) and the native driver (the artifact's own
   `CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the extent
   is `NIL` by the refill invariant, which is what makes the narrow root hand-off sound by construction
-  rather than by host promise. `Machine::reset` clears the raise snapshot  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
-  latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
-  `raise_supplied_trace`).
-- `mod.rs` — the four raise latches. The failed-clause pair:
+  rather than by host promise. `Machine::reset` clears the raise snapshot alongside the module contexts (both
+  belong to the run that is starting) **and every raise latch** — the four one-shot/live pairs
+  `pending_callee_head`/`raise_head_item`, `pending_function_clause_args`/`raise_function_clause_args`,
+  `pending_supplied_trace`/`raise_supplied_trace` and `pending_supplied_term`/`raise_supplied_term`
+  (`registers.rs:407-421`).
+- `mod.rs` — the four raise latch pairs. The failed-clause pair:
   `pending_function_clause_args: Option<Eterm>` (one-shot — armed by the raise site, consumed by the
   `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale list for a later trace) and
   `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on every `throw_with_trace` and
   consumed exactly once by the two cooked-trace builders). The explicitly-supplied-trace pair:
   `pending_supplied_trace: Option<StackTrace>` (one-shot, armed only when an incoming `BeamError::Raise`
   carries **non-empty** symbolic frames — the `erlang:raise/3` trace-list shape) and
-  `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed).
+  `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed). The
+  supplied-**term** pair: `pending_supplied_term: Option<Eterm>` (one-shot, armed by `Machine::raise_supplied`,
+  which `Instr::RawRaise` calls — the shape `sys_core_fold` folds `catch C:R:S -> erlang:raise(C,R,S)` into)
+  and `raise_supplied_term: Option<Eterm>` (the live state; `throw_with_trace` promotes the one-shot latch
+  into it and then **skips** the `raise_snapshot` rebuild, so the chain of the raise being re-raised survives
+  — C's `raw_raise` stores the supplied trace and clears `EXF_SAVETRACE`,
+  `../../erts/emulator/beam/beam_common.c:1148-1179`). It is consumed exactly once, by whichever destination
+  the raise takes: a **landed** raise publishes it as the handler's `x(2)`
+  (`Machine::land_exception`'s `supplied_term` argument, C's register convention), an **uncaught** one renders
+  the preserved chain in `Machine::with_uncaught_frames`.
   **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`) PARKS the
   two armed heap-term latches** — `raise_function_clause_args` then `pending_function_clause_args` — onto the
   tail of `self.stack` for the duration of the hand-off, hands over the `RootSet`, then **re-seats** each
   field from its slot (`self.stack.get(cursor).copied()` — the stack is rooted in full, so a conforming host
   relocates the parked word and the engine reads the *moved* term back), and finally `stack.truncate(base)`.
   With both latches `None` the `RootSet` is handed over **unmodified** (byte-identical fast path). The
-  supplied-trace pair is plain `Vec<StackFrame>` **metadata**, not a heap term, so it needs no rooting.
+  supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
+  need no rooting either — nothing allocates between `raise_supplied` arming one and `throw_with_trace`
+  promoting it, and the promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
   `Machine::pending_exception` is **not** parked here — `beam_rt` roots it via `Registers::extra_roots`.
-- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
+- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
+  (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
+  `Machine::set_continuation` write), `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
 - `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`)
@@ -71,7 +87,20 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   survives for the handler. It also promotes the failed-clause argument list: it takes the one-shot
   `Machine::pending_function_clause_args` and stores it as the live `Machine::raise_function_clause_args`
   (a raise that carries no such list clears it, so no later trace can inherit a stale one); it does the same
-  for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace`.
+  for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace` and for
+  `Machine::pending_supplied_term` -> `Machine::raise_supplied_term`. It also clears the landing frame's
+  continuation slot (`set_continuation(Continuation::Halt)`, the handler runs in that frame) and then hands
+  `land_exception` the trace the handler must see in `x(2)`: the supplied **term** when this raise carried
+  one, else the raise's own raw-trace word.
+  **A supplied trace is preserved, a derived one is built here.** The `raise_snapshot` rebuild runs only
+  when the raise supplied **neither** flavour (a supplied symbolic trace renders its own frames; a supplied
+  trace term renders the preserved snapshot of the raise being re-raised, so rebuilding would replace it with
+  a re-raise-site chain) — see `## A frame's continuation slot is consumed by whoever follows it` and
+  `../families/exceptions/CONTEXT.md`. An **uncaught** raise still leaves through the frameless-`Raise` arm
+  (either the snapshot rebuild above has run, or the supplied trace is what the run renders), and
+  `Machine::with_uncaught_frames` attaches the frames at the run boundary: the live supplied-symbolic latch
+  when one is armed, else `Machine::snapshot_stacktrace` for the supplied-term case, else
+  `Machine::raise_stacktrace`.
   **The exception-class atoms and `namespace_atom`.** `Machine::ensure_class_atoms(ctx, module)` resolves every
   still-unresolved `error`/`exit`/`throw` atom from the engine's live atom namespace and installs it with
   `Machine::set_class_atom`; an atom already installed is never overwritten, and the per-run **`class_atoms_live`
@@ -99,8 +128,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   from the slot the host wrote the moved word back through — handing the re-seated list to the first
   frame's `A` slot (every outer frame keeps its declared arity); the list's elements are carved **inside**
   the reservation, so no element word is held across a collection. `Machine::take_raise_supplied_trace()` is the
-  consuming half of the supplied-trace latch: `symbolic_stacktrace` renders those frames **instead of** the
-  snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path byte-identical.
+  consuming half of the symbolic supplied-trace latch (`symbolic_stacktrace` renders those frames **instead
+  of** the snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path
+  byte-identical) and `Machine::take_raise_supplied_term()` the consuming half of the **term** latch — whose
+  consumer is not `symbolic_stacktrace` but the landed `x(2)` publication or the uncaught funnel, since a
+  supplied term is already a cooked `[{M,F,A,Location}]` list and `symbolic_stacktrace` returns such a list
+  from the trace register verbatim (`is_list`, C's `is_raised_exc` arm,
+  `../../erts/emulator/beam/beam_common.c:1219-1223`).
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `offheap.rs` — the off-heap refc-binary **retention seam**: `Machine::off_heap_overhead_bytes()` (the sum of
@@ -197,6 +231,31 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
   both survive it. The two off-heap rosters are released only by a host call to
   `Machine::retain_refc_binaries`.
+
+## A frame's continuation slot is consumed by whoever follows it
+`Machine::take_continuation` (`frames.rs`) is the **one** read-and-clear: it reads the current frame's
+`Continuation` slot and resets it to `Continuation::Halt` in the same step (C's `RETURN()` macro does
+`SET_I(cp_val(*E)); *E = NIL`, `../../erts/emulator/beam/emu/macros.tab:241-247`).
+A frame's slot means exactly one thing — *this frame is suspended inside a call and resumes at that address
+when the call returns* — so whoever follows the address clears it, and every reader may treat a non-`Halt`
+slot as a **live** caller.
+- **The complete consumer set** (each is a `take_continuation` call site): `return_step`
+  (`../interpreter/dispatch.rs`, the interpreter's `return`/`deallocate_return` arm),
+  `Machine::continuation_step` (`drive.rs`, the `Step` protocol's follow), and `jit_return` /
+  `jit_deallocate_return` (`../jit/baseline/runtime.rs`, the native baseline tier's twins of those arms).
+- **A raise landing in a frame's catch handler clears that frame's slot too** — `Machine::throw_with_trace`
+  ends its landing with `self.set_continuation(Continuation::Halt)`, because the handler runs *in* the
+  landing frame, which is therefore no longer suspended in the call that raised (C's `next_catch` drops the
+  frames above the catch frame for the same reason).
+- **The remaining readers are read-only and never reset it**: `continuation()` (the test-only observation
+  view), `resumption_contexts`/`resumption_addresses`, `raise_stacktrace`/`snapshot_stacktrace` and
+  `current_stacktrace`.
+- **The writers are unchanged**: `Instr::Call`, `call_ext*`, the `Apply*`/`call_fun` arms and the baseline
+  tier's `store_continuation` (`../jit/baseline/call.rs`) arm the slot through `set_continuation`.
+Consequence: a caller that already returned is never named a second time, so a derived stacktrace names the
+raising function once and thereafter only its **live** callers.
+C's `gather_stacktrace` (`../../erts/emulator/beam/beam_common.c:782-842`) likewise admits only words that
+still look like a CP.
 
 ## The cross-module call seam (`resolve_external_call`) and `Machine::drive` (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.

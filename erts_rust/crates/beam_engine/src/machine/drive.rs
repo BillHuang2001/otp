@@ -262,8 +262,12 @@ impl Machine {
     /// **current** module context is an intra-module [`Step::Goto`], and an address in
     /// another context is a [`Step::Enter`] the driver must switch for. The two are
     /// distinguished here (one integer compare) rather than at every call site.
-    pub(crate) fn continuation_step(&self) -> Result<Step> {
-        match self.continuation()? {
+    ///
+    /// The slot is **consumed** ([`Machine::take_continuation`]): following a
+    /// continuation means the frame is no longer suspended in that call, which is C's
+    /// `*E = NIL` in `RETURN()` (`../../erts/emulator/beam/emu/macros.tab:241-247`).
+    pub(crate) fn continuation_step(&mut self) -> Result<Step> {
+        match self.take_continuation()? {
             Continuation::Halt => Ok(Step::Done),
             Continuation::Address {
                 func,

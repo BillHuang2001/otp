@@ -287,6 +287,12 @@ pub struct Machine {
     /// funnel [`Machine::with_uncaught_frames`]) can still name the frames the
     /// raise unwound out of. Read back through [`Machine::raise_snapshot`].
     ///
+    /// A raise that **supplies** its trace ([`Machine::pending_supplied_term`],
+    /// [`Machine::pending_supplied_trace`]) does **not** rebuild it: nothing is
+    /// derived at a re-raise site (C's `raw_raise` clears `EXF_SAVETRACE`), so the
+    /// chain of the exception being re-raised survives the landing and is what that
+    /// raise carries out of the machine.
+    ///
     /// Cleared by [`Machine::reset`] (the snapshot belongs to the run that is
     /// starting) but **not** by a resume ([`Machine::resume_outcome`]), which must
     /// preserve it along with the machine's other suspended state.
@@ -370,6 +376,23 @@ pub struct Machine {
     /// — a raise with no live catch frame — cannot leave stale frames for a later,
     /// unrelated cooked trace to inherit.
     pub(crate) pending_supplied_trace: Option<StackTrace>,
+    /// A **one-shot latch**: the trace **term** the raise about to land supplies
+    /// ([`Instr::RawRaise`](beam_loader::Instr)'s `x(2)` operand, C's `c_p->ftrace`).
+    ///
+    /// C's `raw_raise` stores `x(2)` in `c_p->ftrace` and clears `EXF_SAVETRACE`
+    /// (`../../erts/emulator/beam/beam_common.c:1148-1179`), so `save_stacktrace`
+    /// does **not** run (its guard is `freason & EXF_SAVETRACE`, `:505-507`) and no
+    /// re-raise-site frame is ever prepended: `build_stacktrace` returns the stored
+    /// trace verbatim (`:1219-1223`).
+    ///
+    /// Armed by [`Instr::RawRaise`](beam_loader::Instr) **immediately before** the
+    /// [`Machine::raise_supplied`] that lands the raise and consumed by that call
+    /// (see [`Machine::raise_supplied_term`]). What rides here is the **cooked**
+    /// trace term of the exception being re-raised — the landed `x(2)` when the
+    /// landing published one, else the [`Machine::raise_snapshot`] chain cooked
+    /// once, rooted, at the `raw_raise` site — so C's raw object is modelled as a
+    /// real Erlang term and needs no second derivation.
+    pub(crate) pending_supplied_term: Option<Eterm>,
     /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
     /// explicit frames the raise currently in flight arrived carrying.
     ///
@@ -383,6 +406,28 @@ pub struct Machine {
     /// machine-held heap term, so they need no rooting across the cooked trace's
     /// reservation.
     pub(crate) raise_supplied_trace: Option<StackTrace>,
+    /// The **live raise** state behind [`Machine::pending_supplied_term`]: the trace
+    /// **term** the raise currently in flight supplies (C's `c_p->ftrace` after
+    /// `raw_raise`).
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// raise, so a raise that supplies no trace clears it. It is consumed **exactly
+    /// once**, by whichever of the two destinations the raise takes:
+    ///
+    /// * a **landed** (caught) raise publishes it as the handler's `x(2)`
+    ///   ([`Machine::land_exception`]), i.e. C's register convention, so the
+    ///   handler's own `build_stacktrace`/`raw_raise` re-reads the very term the
+    ///   raise arrived with;
+    /// * an **uncaught** raise renders the chain it preserves through
+    ///   [`Machine::with_uncaught_frames`] ([`Machine::raise_snapshot`] is *not*
+    ///   rebuilt for a supplied raise, so it still holds the re-raised exception's
+    ///   frames).
+    ///
+    /// A raise that supplies a trace makes **no allocation** between arming the
+    /// one-shot latch and publishing the term, and the published `x(2)` register is
+    /// inside the frozen root set ([`crate::context::RootSet`]), so the term never
+    /// needs parking in [`Machine::with_roots`].
+    pub(crate) raise_supplied_term: Option<Eterm>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -665,7 +710,9 @@ impl Machine {
             pending_function_clause_args: None,
             raise_function_clause_args: None,
             pending_supplied_trace: None,
+            pending_supplied_term: None,
             raise_supplied_trace: None,
+            raise_supplied_term: None,
             refc_binaries: Vec::new(),
             writable_payloads: Vec::new(),
             args_scratch: Vec::new(),
