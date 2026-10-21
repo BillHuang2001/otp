@@ -22,12 +22,27 @@
 //!
 //! A safe submodule of `crate::print` (it registers no BIFs) that ports
 //! `io_lib_pretty`'s template model — `print_length/7` (`build`), `write/1`
-//! (`write`) and `pp/8` (`pp`) — so a container whose single-line rendering is at
-//! least `line_length - column` characters is broken across lines exactly like the
-//! oracle. The leaf term renderer it re-flows stays in the parent module;
-//! [`pretty_chunk`] is the entry point `crate::io` calls, re-exported from
+//! (`write`) and `pp/8` (`pp`) — plus the record and field pieces of that model
+//! (`print_length_native_record/7` → `build_record`,
+//! `print_length_native_record_fields/8` → `record_fields_from`, `write/1`'s
+//! record/field clauses → `write_record_node`/`write_fields`/`write_field`,
+//! `pp_record`/`pp_fields_tail`/`pp_field`/`rec_indent` under the oracle's own
+//! names, and the `expand` record/field clauses), so a container whose single-line
+//! rendering is at least `line_length - column` characters is broken across lines
+//! exactly like the oracle. The leaf term renderer it re-flows stays in the parent
+//! module; [`pretty_chunk`] is the entry point `crate::io` calls, re-exported from
 //! `crate::print` so the rest of the crate is unaffected. The `cind/7` indentation
-//! probe lives in the [`cind`] submodule.
+//! probe lives in the [`cind`] submodule (`cind_record`/`cind_fields_tail`/
+//! `cind_field`/`cind_rec`, driven by [`while_fail_indent`]).
+//!
+//! A **native record** is the one class modelled as two templates rather than one,
+//! [`Tpl::Record`] (the oracle's `{record, [{Name,NameL} | L]}`) and [`Tpl::Field`]
+//! (`{field, Name, NameL, ValT}`), both over the parts the parent's `record`
+//! submodule (`RecordParts`/`record_parts`) extracts once per record; a truncated
+//! field sequence re-runs through [`More::Field1`]. `rec_indent` is the piece that
+//! decides a field's continuation: it breaks the line only when
+//! `t_ind > 0 && r_ind > t_ind`, and otherwise keeps the field on the current line
+//! at `r_ind`.
 //!
 //! See the parent module docs (`crate::print`) for the precise rule, the term
 //! classes and the narrowest repro.
@@ -37,22 +52,22 @@
 //! at a deeper depth, plus the [`intermediate`]/[`find_upper`]/[`search_depth`]
 //! depth search and [`expand`] that call it. [`pretty_write_limited`] is
 //! `io_lib:write/5` (`~w`/`~W` with a limit) and [`pretty_chunk_limited`] is
-//! `io_lib_pretty:print/10` (`~p`/`~P` with a limit). With a **negative** limit the
-//! new machinery is inert and the two unlimited entry points behave byte-identically
-//! to before.
+//! `io_lib_pretty:print/10` (`~p`/`~P` with a limit). A **negative** limit leaves
+//! that depth search inert: both limited entry points then fall through to the
+//! unlimited render above.
 //!
 //! **Totality.** The oracle recurses once per *element* of a list/tuple/map
 //! (`print_length_list1/7`, `print_length_tuple1/7`, `print_length_map_pairs/8`)
 //! and once per element again in the `pp` walk (`pp_tail/10`,
 //! `pp_pairs_tail/9`). Rust does **not** flatten those: each recursive call is
 //! followed by a `prepend`/`cons` that splices the step's own items in front of the
-//! result, so the walk is not a tail call and a long-but-valid container used to
+//! result, so the walk is not a tail call and a long-but-valid container would
 //! abort the process with a native stack overflow (`fatal runtime error: stack
 //! overflow`, SIGABRT). Those five helpers are therefore written **iteratively** —
 //! one stack frame per *container* — while producing the very same [`Seq`]/[`Chunk`]
 //! (element order, tail, `Len`/`Dots` and chunk nesting are unchanged).
 //! `cind_tail/7`/`cind_pairs_tail/7` (the [`cind`] submodule) recurse in *tail*
-//! position and are left as they are. Deep **nesting** still recurses through
+//! position and stay recursive. Deep **nesting** still recurses through
 //! [`build`]/[`pp`]; that is a separate (unbounded-depth) concern.
 
 use std::rc::Rc;
