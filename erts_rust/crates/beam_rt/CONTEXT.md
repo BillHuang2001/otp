@@ -57,6 +57,8 @@ Detail: `src/context/CONTEXT.md` (both indirections), `src/native/CONTEXT.md` (`
 | `-run Mod Func [Args…]` | as `-s`, but arguments are plain **strings** (char lists) |
 | `-pa Dir` / `-pz Dir` | add `Dir` to the code path: `-pa` **heads** it (the group in reverse order), `-pz` **tails** it (behind the system `ebin`s), on **every** route |
 | `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number) |
+| every value-taking `+` switch | accepts its value **attached or separate** (`+S1` ≡ `+S 1`, `+sbtu`, `+A0`, `+P65536`, `+sbwtlong`), the C's `get_arg` rule — that is the form the real `erlc` passes; per-switch value grammars (digit-prefix vs symbolic) are [`src/cli/CONTEXT.md`](src/cli/CONTEXT.md)'s |
+| `-extra …` / `-- …` | plain arguments → `init:get_plain_arguments/0` (a list of strings), never an init argument. Split per **entity** (`ERL_OTP30_FLAGS`, `ERL_AFLAGS`, argv, `ERL_FLAGS`, `ERL_ZFLAGS`) at that entity's first `-extra`, whose whole tail is plain; `--` collects until the next switch-looking token (`-`/`+`) |
 | `-smp enable\|disable\|auto` | scheduler model, recorded as an init argument (M1 runs single-threaded) |
 | `+A N` / `+P N` | async-thread pool size → `emulator.extra_emulator_flags` verbatim; max process count → `emulator.max_processes` |
 | `+Q N` | max port count → `RuntimeConfig::max_ports`; `system_info(port_limit)` = `min(next_power_of_two(request), 134217727)`, default `65536` |
