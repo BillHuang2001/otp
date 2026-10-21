@@ -151,6 +151,66 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
   whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
   the raw term **unstabilized**, and `eval_closures`' env can name one.
+## Host-side memory regions: sizing, release, and what `erlang:memory` cannot see
+The regions above are `Runtime` fields; this is their arithmetic, and why a long run's **RSS can be many
+times `erlang:memory(total)`**. Every one of them is a `beam_alloc::Heap`/`ReservedHeap`/`ContextHeap`
+region and therefore `AllocType::Standard`, which `context/memory_hook.rs:169-171` **excludes** from
+`emulator` — so none of them is counted by **any** `erlang:memory` key.
+- **`Runtime::arena`** (`runtime.rs:306`, a `beam_engine::MinimalContext`): a `ContextHeap` =
+  `Vec<ReservedHeap>` that **only ever grows** (`beam_engine/src/context.rs:1450-1461`) — first
+  reservation `HEAP_RESERVE_WORDS` = 4 MiB, commit 64 KiB, each later region doubles its predecessor's
+  reservation, `relocate` is never called and no region is freed before the `Runtime` drops
+  (`:1432,1516-1580`). `heap_available()` is `usize::MAX` and there is **no used/reserved accessor**
+  (`HANDOFF.md` carries the missing accessor as a handoff). The engine's term builders reserve through
+  `terms::slack::reserve` → `Machine::alloc_rooted` → `ExecutionContext::alloc_words_rooted`
+  (`beam_engine/src/terms/slack.rs:155-171`, pinned by
+  `terms/alloc_tests.rs::the_builders_route_every_allocation_through_the_rooted_seam`), and that door
+  hands **every unarmed (nested) run** `Runtime::alloc_words` → the arena, never the process young heap
+  (`context/gc.rs:1612-1619`). A nested run is every blocking cross-module callee
+  (`context/pump.rs:264-301`), every applied fun (`:343-374`) and the `-eval` evaluator
+  (`RuntimeContext::new` sets `mailbox_table: None`) — so an in-process `compile:file/2`, whose whole body
+  is nested calls, puts **every term word it builds** into a region that is never freed and never
+  accounted. This is the multi-GB sink of a long compile.
+- **`Runtime::bif_heaps`** (`runtime.rs:288`) is a stack pool with **retirement, not reuse**
+  (`context/calls.rs:160-181`): a region with less than `capacity()/16` free is pushed back
+  (`put_bif_heap`, `runtime.rs:2172`) and a fresh **doubled** region becomes the frontier, so the pool
+  accumulates one exhausted region per doubling and retains ≈2× the largest. The initial region is
+  `bif_heap_words = term_heap_words(config)` = `DEFAULT_HEAP_WORDS` = `1<<24` words = **128 MiB**
+  (`config.rs:68`, `runtime.rs:132-138,1353-1355`); a `+hmax` is the only cap. A region is rewound
+  (`Heap::reset_to`, `context/calls.rs:1048`) only on the safe arms — never for the six escaping
+  `DispatchHooks` arms, a reentrant fun-applying BIF, an error result or a refused copy-out (`:417-423`)
+  — and an un-rewound region is retired on the next overflow rather than reclaimed.
+- **`Runtime::eval_heap` + `eval_heap_retired`** (`runtime.rs:337,362`): initial region also 128 MiB;
+  `grow_eval_heap` (`runtime.rs:2286-2295`) doubles with a `needed` floor, has **no `+hmax` clamp**, and
+  moves the replaced region into `eval_heap_retired`, which is **never freed**. It grows only when a copy
+  onto the table-less store does not fit (`context/pool.rs:105-136`), plus `stabilize_term`
+  (`runtime.rs:2222-2236`, which never grows it).
+- **`Runtime::info_heap`** (`runtime.rs:319`) is 4 096 words, rewound per call by `reset_info_scratch`
+  unless the one-way `info_heap_tainted` valve latched (`:2119-2133`) — negligible and the only
+  reclaimed region here.
+- **`Runtime::eval_off_heap`** (`runtime.rs:352`) owns off-heap payload references; its payload **bytes**
+  are visible as `binary`, but the table has no per-entry removal (only `drain_binaries`), so a prune is
+  drain → filter → re-push, is budget-gated (`eval/reclaim.rs:186`, 46 422 words) and is **scoped to one
+  nested run's own adoptions** (`evall/reclaim.rs:350`, `Runtime::prune_off_heap`, `runtime.rs:2437`) —
+  everything else in it is retained for the runtime's life (`adopt_escaped_binaries`, `:2399-2410`).
+- **Equally uncounted, outside these fields:** the code server's `Arc<Module>` cache (retained for the
+  runtime's life, `codeserver.rs:124`; the `code` key reports only the `.beam` **file** sizes,
+  `context/memory_hook.rs:227-237`, never the lowered IR), the `beam_engine` thread-local baseline
+  `CodeCache` (unbounded, mmap'd per-function code buffers, cleared only at `Runtime::new` —
+  `beam_engine/src/jit/cache/mod.rs:131,463-468`), and two **insert-only** maps: `Runtime::mailboxes`
+  (one entry per pid that ever scanned a mailbox, each retaining off-heap payload handles, `runtime.rs:262`)
+  and `Runtime::references` (one entry per reference ever minted, `runtime.rs:635`). The ETS key is
+  `8` bytes per **table** (`context/memory_hook.rs:152-155`), not the table data (that is `ets_alloc` live
+  bytes inside `emulator`).
+- **Freed is not returned:** `beam_alloc` releases nothing eagerly — a slab carrier is never unmapped, an
+  MBC carrier only when fully free, and `mseg` keeps a 10-segment reuse cache; no `madvise` exists
+  anywhere. So even a dropped region's pages stay resident for the process's life.
+- **Discriminators for a live run:** `system_info({allocator,std_alloc})`'s `bytes` / `carriers size`
+  (the only report row that carries these bytes), and `processes_used` vs `processes` (the latter is a
+  **chain sum** of young+mature capacity *including retired spaces*, `beam_gc/src/nursery.rs:247-249`), so
+  climbing `processes` with flat `processes_used` is the `beam_gc` capacity ratchet while a flat
+  `processes` says the growth is outside every counted category.
+
 ## Reachability of a `-sname` node from a real peer (A.5, cross-cutting: dist · eval · scheduler)
 Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, same cookie as this runtime);
 `node()` on both sides is `@<hostname>` (short), so no host-form mismatch is involved.
