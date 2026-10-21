@@ -187,11 +187,14 @@ fn a_refc_binary_whose_onheap_handle_becomes_garbage_is_released_exactly_once() 
     let mut collector = Collector::new(policy(1, 4096, 8192)).expect("collector");
     let handle = write_refc(collector.young_mut().heap_mut(), &payload);
 
-    // Phase 1: the handle is a live root. The minor promotes it; the off-heap entry is
-    // retained because a reachable reference still names the payload.
+    // Phase 1: the handle is a live root. The collection promotes it; the off-heap entry is
+    // retained because a reachable reference still names the payload. It is the **initial
+    // fullsweep** — the first collection of a process has no old generation to promote into, so
+    // `Collector::collect` picks a major (`has_old_generation`) — and the copy is the same either
+    // way: one 8-word pair, moved once.
     let mut roots = [handle];
     let first = collector.collect(&mut roots).expect("collect");
-    assert_eq!(first.kind, CollectionKind::Minor);
+    assert_eq!(first.kind, CollectionKind::Major, "the initial fullsweep");
     assert!(collector.mature().contains_term(roots[0]));
     // SAFETY: the copied handle is still a live refc binary describing `payload`.
     assert!(unsafe { is_refc_binary(roots[0]) });
@@ -215,8 +218,14 @@ fn a_refc_binary_whose_onheap_handle_becomes_garbage_is_released_exactly_once() 
 
     // Phase 2: the handle is dropped from the roots, so the fullsweep reclaims the on-heap
     // pair; the now-unreachable off-heap entry is swept exactly once.
+    //
+    // The fullsweep is **pinned**: the pair now lives in the mature generation, which a minor
+    // never scans, and `collect` would not escalate here (the empty nursery "fits" trivially), so
+    // only `collect_kind(Major, …)` is the whole-heap evacuation that reclaims the pair.
     let mut no_roots: [Eterm; 0] = [];
-    let second = collector.collect(&mut no_roots).expect("collect");
+    let second = collector
+        .collect_kind(CollectionKind::Major, &mut no_roots)
+        .expect("collect");
     assert_eq!(
         second.kind,
         CollectionKind::Major,
@@ -358,11 +367,13 @@ fn a_fun_holding_a_refc_binary_keeps_it_alive_and_releases_it_when_the_fun_dies(
         }
     };
 
-    // The fun is live, so a minor promotes it (with the refc pair it holds) and the off-heap
-    // entry is retained.
+    // The fun is live, so the collection promotes it (with the refc pair it holds) and the
+    // off-heap entry is retained. It is the **initial fullsweep**: a fresh process's first
+    // collection has no old generation to promote into, so `Collector::collect` picks a major —
+    // the fun graph is moved exactly once either way.
     let mut roots = [fun];
     let first = collector.collect(&mut roots).expect("collect");
-    assert_eq!(first.kind, CollectionKind::Minor);
+    assert_eq!(first.kind, CollectionKind::Major, "the initial fullsweep");
     let copied = roots[0];
     assert!(collector.mature().contains_term(copied));
 
@@ -397,9 +408,13 @@ fn a_fun_holding_a_refc_binary_keeps_it_alive_and_releases_it_when_the_fun_dies(
     );
 
     // Once the fun is garbage a fullsweep reclaims it (and the refc pair with it); the
-    // off-heap binary is then released exactly once.
+    // off-heap binary is then released exactly once. The fullsweep is **pinned**: the fun graph
+    // lives in the mature generation now, which only a whole-heap evacuation scans, and `collect`
+    // would choose a minor here (the empty nursery fits).
     let mut no_roots: [Eterm; 0] = [];
-    let second = collector.collect(&mut no_roots).expect("collect");
+    let second = collector
+        .collect_kind(CollectionKind::Major, &mut no_roots)
+        .expect("collect");
     assert_eq!(second.kind, CollectionKind::Major);
     assert_eq!(
         collector.mature().used_words(),

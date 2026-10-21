@@ -171,7 +171,13 @@ fn hamt_map_survives_a_promotion_then_a_fullsweep() {
     );
 
     let mut roots = [map];
-    let first = collector.collect(&mut roots).expect("collect");
+    // Pinned minor — the promotion this scenario is about. `collect` would run the **initial
+    // fullsweep** here (a fresh process's first collection has no old generation to promote into),
+    // which would evacuate the map into a fresh mature space instead of promoting it into the
+    // pre-allocated one; the mature space has the room for the 2118-word map either way.
+    let first = collector
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("collect");
     assert_eq!(
         first.kind,
         CollectionKind::Minor,
@@ -184,7 +190,9 @@ fn hamt_map_survives_a_promotion_then_a_fullsweep() {
     assert_pairs(roots[0], N, &atoms);
 
     // A fullsweep evacuates the mature space into a fresh one: the head node and every
-    // inner/collision node move again and must be re-linked.
+    // inner/collision node move again and must be re-linked. It is `collect`'s own choice, and a
+    // fullsweep is what it must pick: the pinned minor above created no old generation, so the
+    // room test's second ground (`Collector::has_old_generation`) is still false.
     let second = collector.collect(&mut roots).expect("collect");
     assert_eq!(
         second.kind,
@@ -276,7 +284,11 @@ fn collision_node_survives_a_promotion_then_a_fullsweep() {
     };
 
     let mut roots = [map];
-    let first = collector.collect(&mut roots).expect("collect");
+    // Pinned minor, as in 4a: this scenario is the *promotion* of the collision node, and a fresh
+    // collector's first `collect` is the mandated initial fullsweep (no old generation yet).
+    let first = collector
+        .collect_kind(CollectionKind::Minor, &mut roots)
+        .expect("collect");
     assert_eq!(first.kind, CollectionKind::Minor);
     let copied = roots[0];
     assert!(collector.mature().contains_term(copied));
