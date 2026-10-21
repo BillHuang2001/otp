@@ -395,26 +395,6 @@ pub(crate) fn word_region(
     }
 }
 
-/// Whether `term` is a word a process's root hand-off can still relocate: an **immediate** or a
-/// **literal-area** pointer (nothing a collection moves, so nothing to publish), or a container
-/// inside a region `process`'s own collector actually relocates ([`WordRegion::Scanned`]).
-///
-/// A pointer-bearing word into a region the collector does **not** relocate — above all a word
-/// whose space has already been **freed**, which is what a machine-held term left unrelocated
-/// across a collection looks like — answers `false`. Such a word must never be published as a
-/// root: publishing it cannot relocate it (no collector scans that region), while the valve's
-/// reachability walk would dereference it to test whether it forwards a scanned word, i.e. read
-/// unmapped memory. Used by
-/// [`publish_parked_roots`](crate::runner::run::publish_parked_roots) to decide whether the
-/// parked machine's `Machine::pending_exception` reason is still a term at all.
-pub(crate) fn is_live_relocatable_root(process: &Process, term: Eterm) -> bool {
-    let bounds = process.collector().scanned_bounds();
-    matches!(
-        word_region(process, &bounds, term),
-        None | Some(WordRegion::Scanned)
-    )
-}
-
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
 /// a collection must follow and update, and therefore the word that makes the foreign container
 /// holding it a hazard.
