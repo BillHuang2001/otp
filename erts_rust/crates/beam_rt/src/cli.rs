@@ -1491,6 +1491,12 @@ pub fn run(args: Vec<String>) -> i32 {
             crate::debug_trace::mem(format_args!("exit {}", runtime.retention_stats()));
         }
     }
+    // The allocator's free pages are **not** released here, and this is the point where the
+    // temptation is greatest: the action is over, so it looks quiescent. Measured, it is not —
+    // the runtime above is still live (266 kB free out of a 97.9 MB arena on a bare boot, 1.8 MB
+    // after an in-process compile) and this thread still holds its own share, so a trim here
+    // returns ~16 MB of the 75 MB the process then exits with. The release point is the process
+    // entry, once the driver thread has exited: `src/main.rs`, `crate::malloc`.
     match outcome {
         // A successful action still exits with the status a **non-terminating** node stop
         // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
