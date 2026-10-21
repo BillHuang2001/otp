@@ -203,10 +203,6 @@ struct Lockstep {
     copying: AnyCollector,
     immix: AnyCollector,
     /// The kind of every collection, in order (asserted equal between the two runs).
-    ///
-    /// `kinds[0]` is the **initial fullsweep** both runs are pinned to before the workload
-    /// allocates anything (see [`run_lockstep`]); `kinds[1..]` are the collections the policy
-    /// chose, and that is the sequence the cadence assertions read.
     kinds: Vec<CollectionKind>,
     /// Every `should_collect` answer, in order (asserted equal between the two runs).
     asked: Vec<bool>,
@@ -301,11 +297,6 @@ fn alloc_pair(
 /// Drives the process-shaped workload through a copying collector and a mark-region collector
 /// **in lockstep**, asserting on the way that both ask the same admission questions, run the
 /// same collections, and hold structurally identical live graphs.
-///
-/// Both runs are first put through the **initial fullsweep** (see the inline comment): the
-/// copying collector's first collection is mandated to be a major because a fresh process has no
-/// old generation, and the mark-region driver has no such guard, so without pinning it the two
-/// runs would diverge at collection 0 instead of exercising the same policy-chosen cadence.
 fn run_lockstep() -> Lockstep {
     let atoms = AtomTable::new();
     // Explicitly pinned, so the variants under test are the ones that run.
@@ -328,33 +319,6 @@ fn run_lockstep() -> Lockstep {
     let mut asked = Vec::new();
     let mut roots_c: Vec<Eterm> = Vec::new();
     let mut roots_i: Vec<Eterm> = Vec::new();
-
-    // The **initial fullsweep**, pinned on both strategies before the workload allocates
-    // anything, so the lockstep below starts from one identical state on both sides: an existing
-    // old generation and `minor_since_major == 0`.
-    //
-    // The copying collector's first collection is mandated to be a fullsweep — a fresh process
-    // has no old generation (`old_heap_size_words() == 0` is the C's `OLD_HEAP(p) == NULL`,
-    // `erl_gc.c:1486-1488`), and `Collector::collect` selects `CollectionKind::Major` while that
-    // holds — while `GenImmixCollector::collect` has no such guard, so its first `collect` would
-    // be a minor and the two runs would diverge at collection 0. `collect_kind` neither chooses
-    // nor escalates, so the pinned fullsweep is exactly the "create the old generation" step and
-    // nothing else; a fullsweep also resets the fullsweep-cadence counter, so both runs then
-    // count their minors from 0 and pick the same kinds afterwards. It runs on the empty
-    // [`NURSERY_WORDS`] nursery, which is a sizing fixed point of the policy (see
-    // [`RESERVE_WORDS`]), so no capacity moves.
-    let warm_kc = copying
-        .collect_kind(CollectionKind::Major, &mut roots_c)
-        .expect("the copying run's initial fullsweep");
-    let warm_ki = immix
-        .collect_kind(CollectionKind::Major, &mut roots_i)
-        .expect("the mark-region run's initial fullsweep");
-    assert_eq!(
-        (warm_kc.kind, warm_ki.kind),
-        (CollectionKind::Major, CollectionKind::Major),
-        "`collect_kind` runs exactly the kind it is given"
-    );
-    kinds.push(warm_kc.kind);
 
     // The process's long-lived working set, written before the workload starts: [`LIVE_TUPLES`]
     // one-line tuples it keeps reachable for the whole run and replaces once per round.
@@ -505,22 +469,10 @@ fn both_strategies_run_the_same_collection_sequence_on_a_process_shaped_workload
     } = run;
 
     // The workload is a real one: many collections, and the cadence exercises both kinds.
-    // `kinds[0]` is the pinned initial fullsweep (see `run_lockstep`), so the *cadence* evidence
-    // is the sequence the policy chose — `kinds[1..]` — which must contain both kinds on its own
-    // and must not open with another fullsweep (the cadence counter was just reset, and
-    // `fullsweep_after = 2`).
     assert!(kinds.len() >= 8, "got {kinds:?}");
-    let cadence = &kinds[1..];
     assert!(
-        cadence.contains(&CollectionKind::Minor) && cadence.contains(&CollectionKind::Major),
+        kinds.contains(&CollectionKind::Minor) && kinds.contains(&CollectionKind::Major),
         "the workload must exercise both minors and majors, got {kinds:?}"
-    );
-    assert_eq!(
-        cadence[0],
-        CollectionKind::Minor,
-        "the collection after the initial fullsweep must be a minor (the run's first \
-         fullsweep was explicitly pinned, and `fullsweep_after = 2` is not due yet), got \
-         {kinds:?}"
     );
     assert!(asked.iter().any(|a| *a), "the workload filled the nursery");
 

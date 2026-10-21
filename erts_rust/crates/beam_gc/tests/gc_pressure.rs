@@ -27,16 +27,12 @@
 //! live graph survives every promotion. This file drives `Collector::collect` through
 //! many minors and majors with the `fullsweep_after` cadence set to **1**, **2** and the
 //! **default** (escalation-forced here), and after *each* collection asserts:
+//!
 //! * the nursery is empty (`young().used_words() == 0`);
 //! * **every** root is reachable and structurally intact — the round-tagged tuple and
 //!   its `[round, round+1, round+2]` list are read back from the updated root and their
 //!   leaf values checked, so a dropped or mis-forwarded object is caught immediately;
 //! * the sequence of [`CollectionKind`]s matches the configured cadence.
-//!
-//! Collection 0 of every run is the collector's **initial fullsweep**: a fresh collector has no
-//! old generation yet (`old_heap_size_words() == 0`, the C `OLD_HEAP(p) == NULL`,
-//! `erl_gc.c:1486-1488`), so its first collection is a major whatever the cadence — and, since
-//! that resets the minor counter, the cadence sequences below start from the second collection.
 //!
 //! The same corpus (scenario 1) is then re-driven through `AnyCollector` so it runs
 //! under both the copying mature space and the **GenImmix** mark-region mature space,
@@ -171,19 +167,15 @@ fn run_copying_cadence(cadence: u32, mature: usize, rounds: usize) -> Vec<Collec
     kinds
 }
 
-/// `fullsweep_after = 1`: collection 0 is the collector's **initial fullsweep** (a fresh
-/// collector has no old generation to promote into), and it resets the minor counter, so the
-/// cadence falls on every `cadence + 1 = 2`nd collection: Major, Minor, Major, Minor, …
+/// `fullsweep_after = 1`: the sequence alternates Minor, Major, Minor, Major, …
 #[test]
 fn fullsweep_after_one_alternates_minor_and_major_under_pressure() {
     let kinds = run_copying_cadence(1, 4096, 40);
     for (i, kind) in kinds.iter().enumerate() {
-        // One fullsweep every `cadence + 1` collections, the first of which is the initial
-        // fullsweep at index 0.
         let expected = if i % 2 == 0 {
-            CollectionKind::Major
-        } else {
             CollectionKind::Minor
+        } else {
+            CollectionKind::Major
         };
         assert_eq!(*kind, expected, "cadence 1 at collection {i}");
     }
@@ -191,14 +183,12 @@ fn fullsweep_after_one_alternates_minor_and_major_under_pressure() {
     assert!(kinds.contains(&CollectionKind::Major));
 }
 
-/// `fullsweep_after = 2`: collection 0 is the **initial fullsweep**, which resets the minor
-/// counter, so the cadence then falls on every `cadence + 1 = 3`rd collection:
-/// Major, Minor, Minor, Major, Minor, Minor, …
+/// `fullsweep_after = 2`: Minor, Minor, Major, Minor, Minor, Major, …
 #[test]
 fn fullsweep_after_two_runs_a_minor_then_a_major_every_third_collection() {
     let kinds = run_copying_cadence(2, 4096, 40);
     for (i, kind) in kinds.iter().enumerate() {
-        let expected = if i % 3 == 0 {
+        let expected = if i % 3 == 2 {
             CollectionKind::Major
         } else {
             CollectionKind::Minor
@@ -207,32 +197,23 @@ fn fullsweep_after_two_runs_a_minor_then_a_major_every_third_collection() {
     }
 }
 
-/// The **default** cadence (65535) with a small mature space: after the **initial fullsweep**
-/// (collection 0 — a fresh collector has no old generation yet), minors run until the mature
-/// space can no longer receive the nursery's live promotion, at which point a fullsweep is
-/// forced by escalation. Both kinds must occur, and the graph must survive both.
+/// The **default** cadence (65535) with a small mature space: minors run until the mature
+/// space can no longer receive the nursery, at which point a fullsweep is forced by
+/// escalation. Both kinds must occur, and the graph must survive both.
 #[test]
 fn default_cadence_escalates_to_major_when_the_mature_space_fills() {
     let kinds = run_copying_cadence(HeapPolicy::default().fullsweep_after, 64, 40);
     assert_eq!(
         kinds[0],
-        CollectionKind::Major,
-        "the first collection of a process is the mandatory initial fullsweep"
-    );
-    assert_eq!(
-        kinds[1],
         CollectionKind::Minor,
-        "the fullsweep left room, so the next collection is a minor"
+        "the first collection is a minor"
     );
     assert!(
         kinds.contains(&CollectionKind::Minor),
         "minors must run under the default cadence"
     );
-    // The escalation must happen *after* the initial fullsweep: with the default cadence the
-    // only way a later collection can be a major is a mature space too small for the
-    // nursery's live promotion.
     assert!(
-        kinds[1..].contains(&CollectionKind::Major),
+        kinds.contains(&CollectionKind::Major),
         "a full mature space must escalate a would-not-fit minor to a fullsweep"
     );
 }

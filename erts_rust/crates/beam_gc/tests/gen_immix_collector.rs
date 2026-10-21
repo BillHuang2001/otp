@@ -107,10 +107,6 @@ fn assert_graph(c: &AnyCollector, root: Eterm, atom: Eterm) {
 
 /// Promotes three successive graphs through `kind`'s collector (two minors then a major),
 /// asserting the live graph is intact after every collection; returns the collection kinds.
-///
-/// The measured sequence starts *after* the initial fullsweep this function pins on both
-/// strategies (see the comment in its body), so the kinds returned are the three policy-chosen
-/// collections only.
 fn drive(kind: MatureKind) -> Vec<CollectionKind> {
     let policy = HeapPolicy {
         fullsweep_after: 2,
@@ -124,20 +120,6 @@ fn drive(kind: MatureKind) -> Vec<CollectionKind> {
     let mut kinds = Vec::new();
     let mut roots: Vec<Eterm> = Vec::new();
     let mut atoms: Vec<Eterm> = Vec::new();
-
-    // The **initial fullsweep**, pinned on both strategies before the measured sequence.
-    //
-    // The copying collector's first collection is mandated to be a fullsweep: a fresh process
-    // has no old generation (`old_heap_size_words() == 0` is the C's `OLD_HEAP(p) == NULL`,
-    // `erl_gc.c:1486-1488`), so `Collector::collect` selects `CollectionKind::Major` while that
-    // holds. `GenImmixCollector::collect` has no such guard — its mark-region mature space is
-    // usable from construction — so its first `collect` can be a minor, and a lockstep
-    // comparison of the two strategies would diverge at collection 0. `collect_kind` neither
-    // chooses nor escalates, so pinning the fullsweep here leaves both strategies in the same
-    // state before the measured sequence: an existing old generation and `minor_since_major == 0`
-    // (a fullsweep resets the counter).
-    c.collect_kind(CollectionKind::Major, &mut roots)
-        .expect("the initial fullsweep");
 
     for round in 0..3 {
         let (outer, atom) = build_graph(&mut c);
@@ -172,11 +154,6 @@ fn the_same_corpus_stays_intact_under_both_strategies() {
     // The GenImmix mature space selects the same collections as the copying one, and the
     // corpus is young for the first two rounds (two minors) and due a fullsweep on the
     // third (a major) — so the escalating path is exercised for both strategies.
-    //
-    // Derived from `fullsweep_after = 2`: a fullsweep resets `minor_since_major`, so with the
-    // counter at 0 after the pinned initial fullsweep the cadence makes collection `i` a major
-    // iff `i % (fullsweep_after + 1) == 0` — i.e. never among the three measured collections,
-    // which are minors 1, 2 and the fullsweep the third's `fullsweep_due(2)` fires.
     assert_eq!(
         copying,
         vec![

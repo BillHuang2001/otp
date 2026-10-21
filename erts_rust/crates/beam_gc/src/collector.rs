@@ -212,55 +212,38 @@ impl Collector {
     /// The two bounds agree by construction: a fullsweep sizes the mature space from the live
     /// set plus the young occupancy it clamps to the nursery capacity that collapse installs
     /// (`HeapPolicy::mature_after_fullsweep`), so the room a fullsweep leaves is always at
-    /// least a live young set's worth — the collection after it is a minor. The fill is still
-    /// consulted **first** as a cheap short-circuit: it is an upper bound on the live count, so
-    /// when it already fits the answer is the same and the walk is skipped.
+    /// least a live young set's worth — the collection after it is a minor.
     fn minor_promotion_fits(&self, roots: &[Eterm]) -> bool {
-        let available = self.mature.available_words();
-        available >= self.nursery.used_words() || available >= self.young_promotion_words(roots)
+        self.mature.available_words() >= self.minor_room_words(roots)
     }
 
-    /// Whether the old generation **exists** yet — the Rust mirror of the C's
-    /// `OLD_HEAP(p) != NULL`, i.e. "there is somewhere for a minor to promote into".
+    /// The room a minor needs, in mature words — **the one decision input** of both the kind
+    /// choice ([`minor_promotion_fits`](Self::minor_promotion_fits),
+    /// [`collect`](Self::collect)) and the minor's own pre-copy refusal
+    /// ([`collect_minor`](Self::collect_minor)), so the two can never disagree: a `collect` that
+    /// chose a minor can never then be refused by it.
     ///
-    /// The C creates the old heap **inside a collection**, never at spawn
-    /// (`erl_gc.c:1470-1478`, the "Create new, empty old_heap" block of `minor_collection`;
-    /// `major_collection` discards and re-creates it). A process's first collection therefore
-    /// always finds `OLD_HEAP(p) == NULL`: `minor_collection`'s "is there an old heap *and* is it
-    /// large enough?" test is
+    /// It is the **exact live promotion** ([`young_promotion_words`](Self::young_promotion_words))
+    /// — the number of words `Copier::run` writes into the mature space — and it is a true upper
+    /// bound on that copy because the count and the copy share their primitives: both size an
+    /// object through [`copy::move_size`](crate::copy::move_size), both enumerate its reference
+    /// words through `beam_term`'s canonical child-slot walk,
+    /// [`copy::for_each_ref`](crate::copy::for_each_ref), and both visit each reachable object
+    /// exactly once (the counter by an address bitmap, the copier by its forwarding marker) — so
+    /// funs, refc binaries and their sub-binaries, flat and HAMT maps, list chunking and cycles
+    /// are counted with the same word counts they are copied with
+    /// (`tests/minor_room_upper_bound.rs` pins the equality from the outside: a mature space of
+    /// exactly the copy volume admits the minor, one word less refuses it).
     ///
-    /// ```c
-    /// if (OLD_HEAP(p) &&
-    ///     ((mature_size <= OLD_HEND(p) - OLD_HTOP(p)) && …))
-    /// ```
-    ///
-    /// (`erl_gc.c:1486-1488`), so with no old heap the minor cannot take its copy branch: it
-    /// falls through to the "Not enough room for a minor collection. Must force a major
-    /// collection." `return -1` (`erl_gc.c:1574-1577`), which `garbage_collect` turns into its
-    /// `do_major_collection` branch (`erl_gc.c:839-849`). The **first** collection of every
-    /// process is that fullsweep.
-    ///
-    /// This crate's old-generation fact is [`HeapObservable::old_heap_size_words`] — the C's
-    /// `p->old_heap ? old_hend - old_heap : 0` (`erts/emulator/beam/erl_bif_info.c:1023-1030`),
-    /// which answers `0` exactly while no collection has created the generation. It is a
-    /// *derived, observable* fact here rather than the raw pointer the C reads, but it is the
-    /// same fact: the mature space is pre-allocated empty by
-    /// [`Collector::with_allocator`](Collector::with_allocator), and only a collection makes it
-    /// the old generation.
-    ///
-    /// It also covers the second, independent ground, capacity: a mature space of
-    /// `capacity_words() == 0` cannot receive a single promoted word, so no minor that has
-    /// anything to promote can succeed into it — and such a minor would not create the
-    /// generation either, leaving the collector permanently on the wrong side of the C's test.
-    /// The `old_heap_size_words()` spelling answers `0` for both readings (never collected, or
-    /// an empty-capacity old generation), so it is the one this guard relies on.
-    ///
-    /// What the guard must not be replaced by is [`minor_promotion_fits`] alone: that predicate
-    /// answers `available >= used_words`, which is **vacuously true** for an empty nursery
-    /// (`0 >= 0`) — and the first collection of a fresh process is precisely the run that has to
-    /// create the old generation, whether or not it has anything to promote yet.
-    fn has_old_generation(&self) -> bool {
-        self.old_heap_size_words() != 0
+    /// The fill is consulted **first** as a cheap short-circuit: it is an upper bound on the live
+    /// count, so when it already fits the answer is the same and the walk is skipped.
+    fn minor_room_words(&self, roots: &[Eterm]) -> usize {
+        let fill = self.nursery.used_words();
+        if self.mature.available_words() >= fill {
+            fill
+        } else {
+            self.young_promotion_words(roots)
+        }
     }
 
     /// Runs a collection, picking minor vs major by policy and escalating a
@@ -268,15 +251,12 @@ impl Collector {
     ///
     /// A major is chosen when the fullsweep cadence is due
     /// ([`HeapPolicy::fullsweep_due`], the C `GEN_GCS(p) >= MAX_GEN_GCS(p)`,
-    /// `erl_gc.c:694,831`), **or** when there is no old generation yet
-    /// ([`has_old_generation`] — the C `OLD_HEAP(p)` test at `erl_gc.c:1486-1488` whose failure
-    /// sends the first collection to `do_major_collection`, `erl_gc.c:1574-1577`, `:839-849`),
-    /// **or** when the mature space cannot receive the nursery's live promotion
-    /// ([`minor_promotion_fits`] — the same `erl_gc.c:1486-1488` room test). Otherwise a minor
-    /// runs.
+    /// `erl_gc.c:694,831`), **or** when the mature space cannot receive the nursery's live
+    /// promotion ([`minor_promotion_fits`] — the C `erl_gc.c:1486-1488` room test, whose failure
+    /// sends the collection to `do_major_collection`, `erl_gc.c:1574-1577`, `:839-849`).
+    /// Otherwise a minor runs.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)
-            || !self.has_old_generation()
             || !self.minor_promotion_fits(roots)
         {
             CollectionKind::Major
@@ -335,16 +315,15 @@ impl Collector {
     /// **direct** call instead reports the typed heap exhaustion *before* a single word is
     /// copied, so a too-small mature space can never leave the nursery half-forwarded.
     ///
-    /// The room requirement is the **live** young word count
-    /// ([`young_promotion_words`](Self::young_promotion_words)) — the exact number of words
-    /// this call writes into the mature space, which is both what the copier needs and the
-    /// quantity the C's minor decision stands for (`erl_gc.c:1486-1488`; see
-    /// [`minor_promotion_fits`](Self::minor_promotion_fits)). The nursery's chain-summed fill
-    /// is an upper bound on it and is consulted first, so the read-only walk that counts the
-    /// live graph runs only when that cheap bound does not already fit. A fill-keyed test would
-    /// refuse a promotion the live set fits into whenever the mutator had abandoned more words
-    /// than the mature space has room for — permanently, because nothing ever buys room for a
-    /// dead figure.
+    /// The room requirement is [`minor_room_words`](Self::minor_room_words) — the very input
+    /// [`collect`](Self::collect)'s kind choice reads, so a minor that `collect` selected can
+    /// never be refused here — and it is the **live** young word count, the exact number of words
+    /// this call writes into the mature space (see
+    /// [`minor_promotion_fits`](Self::minor_promotion_fits)). The nursery's chain-summed fill is
+    /// an upper bound on it and is consulted first, so the read-only walk that counts the live
+    /// graph runs only when that cheap bound does not already fit. A fill-keyed test would refuse
+    /// a promotion the live set fits into whenever the mutator had abandoned more words than the
+    /// mature space has room for — permanently, because nothing ever buys room for a dead figure.
     ///
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space, sized from the **young
@@ -353,14 +332,20 @@ impl Collector {
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let mut from = FromSet::new();
         self.nursery.add_to_from_set(&mut from);
-        if self.mature.available_words() < self.nursery.used_words() {
-            // The whole fill does not fit, so only the live set can decide: count it.
-            let live = crate::live::live(&from, roots).words;
-            if self.mature.available_words() < live {
-                return Err(heap_exhausted(live));
-            }
+        let need = self.minor_room_words(roots);
+        if self.mature.available_words() < need {
+            return Err(heap_exhausted(need));
         }
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
+        // The room requirement is an upper bound on this copy by construction (the count and the
+        // copy share their sizing and child-slot primitives); the equality pin lives in
+        // `tests/minor_room_upper_bound.rs`.
+        debug_assert!(
+            stats.words_copied <= need,
+            "the minor's room requirement ({need} words) is a true upper bound on its copy \
+             ({} words)",
+            stats.words_copied
+        );
         self.minor_since_major += 1;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;

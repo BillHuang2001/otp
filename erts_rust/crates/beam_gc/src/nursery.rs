@@ -41,18 +41,19 @@
 //!   [`collapse`](Nursery::collapse) — the whole-collector half a host builds
 //!   [`ScannedBounds`](crate::ScannedBounds) from, so its unscanned-root valve can reject an
 //!   address outside the chain with one comparison instead of the indexed test.
-//! * **The chain is bounded.** A growth always installs a space **strictly larger** than the one
-//!   it retires ([`HeapPolicy::next_words_above`], the C's "never the same size when *growing*"
-//!   rule `erl_gc.c:310-338`), so a growth event can never stack an equally sized space onto the
-//!   chain — one whole retained capacity that grants no room. Once the nursery has **collected**
-//!   it also remembers the live-set target that collection derived and narrows every fresh space
-//!   from above at `max(one_step, live_target)` (`live_target_words`), so the growth seam cannot
-//!   install a capacity the next collection would have to give back. And a chain that already
-//!   **retains** a space may only grow while its summed capacity stays inside the live set's keep
-//!   band ([`HeapPolicy::chain_cap_words`], `YOUNG_SHRINK_FACTOR` times the live target) — the C's
-//!   one-young-block-plus-one-bounded-fragment shape (`delay_garbage_collection`,
-//!   `erl_gc.c:500-599`) — so `capacity_words()` is bounded by the **live set** and is *flat in
-//!   the number of growth events* rather than one capacity per event.
+//! * **A growth makes strict progress.** A growth always installs a space **strictly larger**
+//!   than the one it retires ([`HeapPolicy::next_words_above`], the C's "never the same size when
+//!   *growing*" rule `erl_gc.c:310-338`), so a growth event can never stack an equally sized space
+//!   onto the chain — one whole retained capacity that grants no room. Once the nursery has
+//!   **collected** it also remembers the live-set target that collection derived and narrows every
+//!   fresh space from above at `max(one_step, live_target)` (`live_target_words`), so the growth
+//!   seam cannot install a capacity the next collection would have to give back.
+//!   The seam does **not** bound the chain itself: a nursery cannot bound itself without
+//!   collecting (the C's answer to the same situation is to *collect* —
+//!   `delay_garbage_collection` sets `F_FORCE_GC`, `erl_gc.c:500-599`), and the caller owns that
+//!   decision ([`Collector::collection_debt`](crate::Collector::collection_debt) reports it), so
+//!   the growth seam keeps strict progress and honest accounting and leaves the bound to a
+//!   collection.
 //! * **The chain's *summed* capacity obeys the ceiling.** [`capacity_words`](Nursery::capacity_words)
 //!   is what `HeapPolicy::max_heap_words` bounds — a fresh space may only claim the budget the
 //!   chain has left, so `capacity_words() <= max_heap_words` after every successful growth. A
@@ -328,14 +329,7 @@ impl Nursery {
     ///    grants a genuinely large request its own `one_step` size. Every size is bounded by
     ///    [`min_heap_words`](HeapPolicy::min_heap_words) through
     ///    [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
-    /// 4. **Refuse at the chain cap.** Once the chain already **retains** a space, a growth that
-    ///    would take the summed capacity past
-    ///    [`HeapPolicy::chain_cap_words`] yields the typed
-    ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) — before anything is allocated or
-    ///    retired. The cap is the same `YOUNG_SHRINK_FACTOR` (8) multiple the heap-size policy
-    ///    treats as the acceptable keep band around a live-set target, so a growth can strand no
-    ///    more capacity than a collection would have kept in place.
-    /// 5. **Refuse at the ceiling.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or
+    /// 4. **Refuse at the ceiling.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or
     ///    growth-table) ceiling that cannot reach the request — or that can reach it only by
     ///    installing a space no larger than the current one — yields the typed
     ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched:
@@ -355,24 +349,17 @@ impl Nursery {
     /// `max_heap_words == 0` is "no upper bound", the crate's encoding
     /// for unbounded growth, and leaves the size of step 3 alone.
     ///
-    /// # The chain cap bounds the RETAINED capacity
+    /// # A collection, not the seam, bounds the RETAINED capacity
     ///
     /// A growth never moves a term, so every space it supersedes stays addressable and stays
     /// charged to [`capacity_words`](Nursery::capacity_words) until a collection collapses the
-    /// chain. The C never has more than **one young block plus one bounded fragment**
-    /// (`delay_garbage_collection`, `erl_gc.c:500-599`: one fragment sized to the actual need,
-    /// accounted separately, with `heap_sz` unchanged and `F_FORCE_GC` set so the next collection
-    /// folds it away). Step 4 is that bound, in capacity terms:
-    ///
-    /// * a chain holding **nothing** retained always grants the request — that is the C's one
-    ///   fragment, and refusing it would make a legitimate large allocation impossible;
-    /// * a chain that **does** retain something may only grow while the summed capacity stays
-    ///   within [`HeapPolicy::chain_cap_words`]`(live_target_or_fresh_size)` — so after the
-    ///   fragment, a further growth has to collect first, exactly as the C's `F_FORCE_GC` asks.
-    ///
-    /// The consequence is the property the seam was missing: `capacity_words()` is bounded by the
-    /// **live set** (times the keep band, plus the one space the first growth had to install) and
-    /// is **flat in the number of growth events** instead of one whole capacity per event.
+    /// chain. **A nursery cannot bound itself without collecting** — the C's answer to the same
+    /// situation is to collect (`delay_garbage_collection` sets `F_FORCE_GC`, `erl_gc.c:500-599`),
+    /// and the caller owns that decision — so this seam keeps strict progress (each grant is a
+    /// strictly larger space, so the chain grows *geometrically* and a given total costs `O(log)`
+    /// spaces) and honest accounting, and leaves the bound to a collection: a caller that has
+    /// grown the chain polls [`collection_debt`](crate::Collector::collection_debt) and collects,
+    /// which collapses the chain onto its live-set target.
     ///
     /// # What a refusal means
     ///
@@ -382,8 +369,7 @@ impl Nursery {
     /// [`retains_old_spaces`](Nursery::retains_old_spaces) answer, so the
     /// [`collection_debt`](crate::Collector::collection_debt) the host polls stays `true` and the
     /// caller is expected to **collect** (`Collector::collect`/`ensure_capacity` collapse the
-    /// chain, after which the request fits again). A refusal is never a wrong answer, and the
-    /// runtime host absorbs it: the allocation it was making simply stays in its own pool.
+    /// chain, after which the request fits again). A refusal is never a wrong answer.
     ///
     /// A superseded space is never *freed* here, whatever its occupancy: a space that handed the
     /// mutator words may hold live terms and only a [collection](Nursery::collapse) proves them
@@ -443,16 +429,6 @@ impl Nursery {
             if target <= capacity {
                 return Err(heap_exhausted(need_words));
             }
-        }
-        // The chain cap: the capacity this growth would leave **retained** must stay within the
-        // keep band's upper edge. A chain holding nothing retained always passes (the C's one
-        // bounded fragment); the cap is floored by `target` so a single large request is still
-        // granted its own space.
-        let cap = policy
-            .chain_cap_words(self.live_target_words.unwrap_or(target))
-            .max(target);
-        if self.retains_old_spaces() && self.capacity_words().saturating_add(target) > cap {
-            return Err(heap_exhausted(need_words));
         }
         let fresh = HeapSpace::with_allocator(self.current.allocator().clone(), target)?;
         // The chain gained the freshly installed space; the retired one was already covered (it

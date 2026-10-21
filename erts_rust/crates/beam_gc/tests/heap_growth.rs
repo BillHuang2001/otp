@@ -247,67 +247,30 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
         tail.iter().all(|cap| *cap == tail[0]),
         "the nursery capacity must plateau over the last {TAIL} rounds, got {young_caps:?}"
     );
-    // Every trailing round promotes exactly the constant batch, so every trailing round's target is
-    // the same figure — a minor's `young_minor_target_words(BATCH * 3)`, one times the young live
-    // set it evacuated.
-    let tail_target = policy.young_minor_target_words((BATCH * 3) as usize);
     assert_eq!(
+        tail[0],
         *targets.last().expect("non-empty"),
-        tail_target,
-        "the last round is a minor over the same {} -word batch, so its target is \
-         `young_minor_target_words({}) = {tail_target}`",
-        BATCH * 3,
+        "the plateau is the young live set's target ({} words promoted per round)",
         BATCH * 3
     );
-    // The plateau itself is **not** a target of the tail's own rule: the rule keeps any capacity
-    // inside the hysteresis band around the target, and gives memory back only above
-    // `YOUNG_SHRINK_FACTOR` times it. A plateau below the target would be grown onto it, so the
-    // plateau must sit in `[target, 8 * target]` — and it is a live-set target this run *did*
-    // install (the whole-live-set target of the fullsweep that escalated out of the mature
-    // space's room), never a growth step of the trailing minors' own.
-    assert!(
-        tail[0] >= tail_target && tail[0] <= YOUNG_SHRINK_FACTOR * tail_target,
-        "the plateau {} words must lie inside the {}x keep band around the {tail_target}-word \
-         minor target, which is exactly why the minor rule keeps it instead of re-sizing",
-        tail[0],
-        YOUNG_SHRINK_FACTOR
-    );
-    assert!(
-        targets.contains(&tail[0]),
-        "the plateau {} must be a live-set target some round of this run installed, got \
-         {targets:?}",
-        tail[0]
-    );
-    // Every step the capacity took landed on a live-set target, and it took more than one: the
-    // growth is real, and each step is a live-set step rather than an arbitrary growth-table step.
-    // The steps are exactly the fullsweeps' own targets, in order: the initial fullsweep (round 0,
-    // `young_target_words(<round-0 live set>)`) and every later escalation (`collect`'s
-    // `minor_promotion_fits`, the collection whose promotion the mature space could no longer
-    // receive). A minor never moves the capacity here — its 90-word target is below the capacity
-    // every fullsweep installs, so it keeps it.
-    let fullsweep_targets: Vec<usize> = kinds
-        .iter()
-        .enumerate()
-        .filter(|(_, kind)| **kind == CollectionKind::Major)
-        .map(|(round, _)| policy.young_target_words(lives[round]))
-        .collect();
-    let steps: Vec<usize> = core::iter::once(initial_young)
-        .chain(young_caps.iter().copied())
-        .collect::<Vec<usize>>()
+    // Every step the capacity took landed on a target, and it took more than one: the growth is
+    // real, and each step is a live-set step rather than an arbitrary growth-table step.
+    let steps: Vec<usize> = young_caps
         .windows(2)
         .filter(|w| w[0] != w[1])
         .map(|w| w[1])
         .collect();
-    assert_eq!(
-        steps, fullsweep_targets,
-        "every capacity step must be a fullsweep's whole-live-set target, got {steps:?} against \
-         {fullsweep_targets:?} ({young_caps:?})"
-    );
     assert!(
-        steps.len() > 1,
-        "the capacity must really move more than once (the initial fullsweep and an escalation), \
-         got {steps:?}"
+        steps.len() >= 3,
+        "the nursery must climb in live-set steps, got {steps:?}"
     );
+    for step in &steps {
+        assert!(
+            targets.contains(step),
+            "every capacity the nursery stepped to must be a live-set target: {step} not in \
+             {targets:?}"
+        );
+    }
 
     // A final fullsweep keeps everything alive and correct.
     collector.collect_major(&mut roots).expect("fullsweep");
@@ -490,15 +453,6 @@ fn ensure_capacity_grows_the_nursery_to_fit_a_large_request() {
     };
     let mut collector = Collector::new(policy).expect("collector");
 
-    // The initial fullsweep, pinned: the first collection of a process has no old generation to
-    // promote into, so it is a major (`Collector::has_old_generation`). Running it up front, on the
-    // still-empty nursery, leaves the collector with an old generation in place and
-    // `minor_since_major == 0`, so the grow below is the plain minor this test is about — and being
-    // a major, it leaves the minor counter below starting from zero.
-    collector
-        .collect_kind(CollectionKind::Major, &mut [])
-        .expect("initial fullsweep");
-
     // A little live data, then a request far larger than the nursery starts with.
     let mut roots = Vec::new();
     let mut expected = Vec::new();
@@ -563,16 +517,6 @@ fn ensure_capacity_reports_a_typed_error_when_growth_is_capped() {
     assert_eq!(collector.heap_size_words(), 51);
 
     // A small request under the same cap still succeeds, and the collector stays usable.
-    //
-    // The initial fullsweep first, kind-pinned: a fresh collector's first collection is a major
-    // (there is no old generation to promote into yet), and pinning it here — after the refusal
-    // above, which must see the untouched birth nursery — leaves the grow below a minor. The
-    // fullsweep itself installs `young_after_fullsweep(51, 3) = young_target_words(3) = 90` words,
-    // which is also the curated size the 64-word request wants (`next_words(64) = 90`), so the
-    // grow needs to add nothing.
-    collector
-        .collect_kind(CollectionKind::Major, &mut roots)
-        .expect("initial fullsweep");
     let collection = collector
         .ensure_capacity(64, &mut roots)
         .expect("fits under the cap");
@@ -603,12 +547,6 @@ fn any_collector_forwards_ensure_capacity_to_either_strategy() {
         let mut c = AnyCollector::from_config(&GcConfig::copying(policy).with_mature(kind))
             .expect("collector");
         assert_eq!(c.kind(), kind);
-
-        // The initial fullsweep, pinned through the wrapper: a fresh collector's first collection
-        // is a major (no old generation to promote into), so pinning it leaves the grow below the
-        // minor this test forwards.
-        c.collect_kind(CollectionKind::Major, &mut [])
-            .expect("initial fullsweep");
 
         let mut roots = Vec::new();
         for i in 0..4i64 {

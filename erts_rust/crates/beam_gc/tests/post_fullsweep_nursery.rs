@@ -584,13 +584,6 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
 
     // (b) The collector: a minor over a live set that the grown chain's band already covers
     // *keeps* the nursery it collected — it has no reason to move it either way.
-    //
-    // The kind is pinned (`collect_kind(Minor, …)`) because these three sections are about the
-    // **minor** rule's branches, not about `collect`'s choice: a fresh collector's first `collect`
-    // is the mandated initial fullsweep (there is no old generation to promote into yet), which
-    // would collapse the chain and leave nothing for the keep branch to be observed on. A pinned
-    // minor is exactly the round this section describes — it promotes into the pre-allocated
-    // mature space, which has the room (1024 words against a 400-word live set).
     let mut c = Collector::new(HeapPolicy {
         initial_mature_words: 1_024,
         ..policy.clone()
@@ -603,9 +596,7 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
     // The collapse sizes from the **chain's** summed capacity (`233 + 610 = 843`), not from the
     // current space's: that is the figure a collection has to give back.
     let before = c.heap_size_words();
-    let collection = c
-        .collect_kind(CollectionKind::Minor, &mut roots)
-        .expect("minor");
+    let collection = c.collect(&mut roots).expect("minor");
     assert_eq!(collection.kind, CollectionKind::Minor);
     assert_eq!(
         collection.stats.words_copied, live,
@@ -640,12 +631,7 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
     let mut roots = vec![tuple_in(c.young_mut(), &elems)];
     let before = c.heap_size_words();
     assert_eq!(before, 12, "the birth nursery");
-    // Pinned minor, as in (b): the 12-word birth nursery is the geometry this section is about, so
-    // the round must be the minor (the mature space has the room for the 2-word promotion) rather
-    // than the initial fullsweep a fresh collector's `collect` would run.
-    let collection = c
-        .collect_kind(CollectionKind::Minor, &mut roots)
-        .expect("minor");
+    let collection = c.collect(&mut roots).expect("minor");
     assert_eq!(collection.kind, CollectionKind::Minor);
     assert_eq!(
         collection.stats.words_copied, 2,
@@ -678,11 +664,7 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
     let elems: Vec<Eterm> = (0..2).map(|i| make_small(i as i64)).collect();
     let mut roots = vec![tuple_in(c.young_mut(), &elems)];
     fill_with_garbage(&mut c, 4);
-    // Pinned minor again: the shrink branch is a branch of the **minor** rule, and a fresh
-    // collector's `collect` would run the initial fullsweep instead.
-    let collection = c
-        .collect_kind(CollectionKind::Minor, &mut roots)
-        .expect("minor");
+    let collection = c.collect(&mut roots).expect("minor");
     assert_eq!(collection.kind, CollectionKind::Minor);
     assert_eq!(
         c.young().capacity_words(),

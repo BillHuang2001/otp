@@ -122,10 +122,6 @@ fn assert_graph_preserved(collector: &Collector, root: Eterm, atom: Eterm) {
     assert_eq!(signed_value(unsafe { *boxed_val(e2).add(2) }), 5);
 }
 
-// The promotion semantics pinned here are "a collection moves exactly the live young graph into
-// the old generation and empties the nursery". On a *fresh* collector that run is the initial
-// fullsweep (there is no old generation to promote into yet), which evacuates the same graph a
-// minor would; the counters therefore record a major.
 #[test]
 fn minor_collection_promotes_live_terms_and_empties_the_nursery() {
     let mut collector = Collector::new(HeapPolicy::default()).expect("collector");
@@ -149,16 +145,8 @@ fn minor_collection_promotes_live_terms_and_empties_the_nursery() {
     let mut roots = [outer];
     let collection = collector.collect(&mut roots).expect("collect");
 
-    // The initial fullsweep. A fresh collector has no old generation yet
-    // (`old_heap_size_words() == 0`, the C `OLD_HEAP(p) == NULL`, `erl_gc.c:1486-1488` →
-    // `:1574-1577` → `:839-849`), so its **first** collection is a major whatever the cadence.
-    // It evacuates exactly the live young graph into the fresh mature space, so every
-    // promotion figure below is the same one a well-fitting minor would report.
-    assert_eq!(
-        collection.kind,
-        CollectionKind::Major,
-        "the first collection of a process is the mandatory initial fullsweep"
-    );
+    // A well-fitting minor: the mature space holds the whole nursery, so no full sweep.
+    assert_eq!(collection.kind, CollectionKind::Minor);
     assert_eq!(collector.young().used_words(), 0, "the nursery is emptied");
     assert_eq!(
         collection.stats.words_copied, 13,
@@ -173,9 +161,9 @@ fn minor_collection_promotes_live_terms_and_empties_the_nursery() {
         "the nursery held no garbage"
     );
 
-    // The accumulated counters record exactly that one collection — a major.
-    assert_eq!(collector.stats().minor_collections, 0);
-    assert_eq!(collector.stats().major_collections, 1);
+    // The accumulated counters record exactly one minor and no major.
+    assert_eq!(collector.stats().minor_collections, 1);
+    assert_eq!(collector.stats().major_collections, 0);
     assert_eq!(collector.stats().words_copied, 13);
 
     // The graph survives, now reachable through the updated root in the mature space.
@@ -193,40 +181,25 @@ fn fullsweep_after_forces_a_major_on_the_next_collection() {
     let (first_term, atom) = build_graph(&mut collector);
     let mut roots = [first_term];
     let first = collector.collect(&mut roots).expect("first collect");
-    // The initial fullsweep: a fresh collector has no old generation yet
-    // (`old_heap_size_words() == 0`, the C `OLD_HEAP(p) == NULL`), so the first collection is a
-    // major regardless of `fullsweep_after`. It also resets the minor counter, so the cadence
-    // below starts from the *second* collection.
     assert_eq!(
         first.kind,
-        CollectionKind::Major,
-        "the first collection of a process is the mandatory initial fullsweep"
+        CollectionKind::Minor,
+        "the first collection is still a minor"
     );
-    assert_eq!(collector.stats().minor_collections, 0);
-    assert_eq!(collector.stats().major_collections, 1);
+    assert_eq!(collector.stats().minor_collections, 1);
+    assert_eq!(collector.stats().major_collections, 0);
 
-    // The nursery was reset; allocate again and keep the promoted root live too. The old
-    // generation now exists and `minor_since_major == 0 < fullsweep_after = 1`, so this one is a
-    // minor.
+    // The nursery was reset; allocate again and keep the promoted root live too.
     let extra = build_leaf_tuple(&mut collector, make_small(9));
     let mut roots = [roots[0], extra];
     let second = collector.collect(&mut roots).expect("second collect");
+
     assert_eq!(
         second.kind,
-        CollectionKind::Minor,
-        "the collection after the initial fullsweep is a minor (the cadence is not due yet)"
-    );
-    assert_eq!(collector.stats().major_collections, 1);
-    assert_eq!(collector.stats().minor_collections, 1);
-
-    // One minor has now run since the last fullsweep, so the cadence is due.
-    let third = collector.collect(&mut roots).expect("third collect");
-    assert_eq!(
-        third.kind,
         CollectionKind::Major,
         "fullsweep_after = 1 forces a fullsweep after one minor"
     );
-    assert_eq!(collector.stats().major_collections, 2);
+    assert_eq!(collector.stats().major_collections, 1);
     assert_eq!(collector.stats().minor_collections, 1, "no extra minor ran");
     assert_eq!(collector.young().used_words(), 0);
 

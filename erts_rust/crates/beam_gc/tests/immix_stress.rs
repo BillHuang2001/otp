@@ -895,27 +895,6 @@ fn run_mixed(kind: MatureKind, atoms: &AtomTable, baseline: &[Eterm]) -> MixedRu
     let mut roots: Vec<Eterm> = Vec::new();
     let mut kinds: Vec<CollectionKind> = Vec::new();
 
-    // The **initial fullsweep**, pinned on both strategies before round 0 allocates anything.
-    //
-    // The copying collector's first collection is mandated to be a fullsweep — a fresh process
-    // has no old generation (`old_heap_size_words() == 0` is the C's `OLD_HEAP(p) == NULL`,
-    // `erl_gc.c:1486-1488`), so `Collector::collect` selects `CollectionKind::Major` while that
-    // holds — while `GenImmixCollector::collect` has no such guard, so its first `collect` would
-    // be a minor and the two strategies' sequences would diverge at collection 0.
-    // `collect_kind` neither chooses nor escalates, and a fullsweep resets the fullsweep-cadence
-    // counter, so both runs then count minors from 0 and the `fullsweep_after = 3` cadence
-    // produces the identical sequence (see `mixed_workload_agrees_across_both_strategies`). It
-    // runs on the empty nursery, which [`mixed_policy`] pins as a fixed point of the sizing
-    // rules (`min_heap_words` floors both targets), so no capacity moves.
-    let warm = c
-        .collect_kind(CollectionKind::Major, &mut roots)
-        .expect("the initial fullsweep");
-    assert_eq!(
-        warm.kind,
-        CollectionKind::Major,
-        "`collect_kind` runs exactly the kind it is given"
-    );
-
     for round in 0..MIXED_ROUNDS {
         let fresh = build_mixed(c.young_mut().heap_mut(), atoms, round);
         roots.extend(fresh);
@@ -965,10 +944,7 @@ fn mixed_workload_agrees_across_both_strategies() {
     let immix = run_mixed(MatureKind::Immix, &atoms, &baseline);
 
     // Both strategies pick the same collections (Minor,Minor,Minor,Major,...), so the
-    // comparison below is over identical collection points. Derived from `fullsweep_after = 3`:
-    // a fullsweep resets `minor_since_major`, and both runs take the pinned initial fullsweep
-    // first (see `run_mixed`), so collection `i` is a major iff
-    // `i % (fullsweep_after + 1) == fullsweep_after`, i.e. every fourth round starting at 3.
+    // comparison below is over identical collection points.
     let expected: Vec<CollectionKind> = (0..MIXED_ROUNDS)
         .map(|r| {
             if r % 4 == 3 {

@@ -18,50 +18,17 @@
 //
 // %CopyrightEnd%
 
-//! **Capacity ratchet** — the in-crate reproducer for a nursery-chain capacity feedback.
+//! **The no-relocation growth seam's contract** — strict progress, a faithful reserved-capacity
+//! account, geometric chain growth, inert refusals and the collection that bounds the chain.
 //!
 //! `Nursery::grow` (`src/nursery.rs`) is the **no-relocation** growth seam: a space that cannot
 //! hold the next allocation is not enlarged in place, it is **retired** into the chain and a
 //! fresh space is installed (`Nursery::install`). Nothing ever frees a retired space outside a
 //! **collection** (`Nursery::collapse`), and `Nursery::capacity_words` — which is what
 //! [`HeapObservable::heap_size_words`] / [`HeapObservable::total_heap_size_words`] report — is
-//! the **chain sum**, not the current space's size. A growth event that is not followed by a
-//! collection therefore strands a whole space's worth of capacity into the reported figure, and
-//! the question this file answers is: *does a loop of growth events with no collection in
-//! between bound that figure by the live set, or does it ratchet?*
+//! the **chain sum**, not the current space's size.
 //!
-//! The loop modelled here is the **host's** use of the seam (`beam_rt`'s copy-out gate:
-//! `context/calls.rs`'s `hint_grow_gate` / `move_result_into_process_heap`, which grow the
-//! destination rather than collect because the running process's root set is not published at
-//! that point): fill the current space, then ask for room with a fixed hint, and collect
-//! nothing. One collection runs **before** the loop, so the nursery carries the live-set bound
-//! (`live_target_words`) that the seam is clamped by.
-//!
-//! # The contract (all four properties are asserted below)
-//!
-//! 1. **The reported capacity stays live-set bounded** — [`HeapObservable::total_heap_size_words`]
-//!    (and [`HeapObservable::heap_size_words`]) after `N` growth events stay within the heap-size
-//!    policy's own keep band (`YOUNG_SHRINK_FACTOR` × the capacity the establishing collection
-//!    installed) and are **flat in `N`**: identical at `N` and `2N`, because the number of growth
-//!    events is not a workload property.
-//! 2. **A successful growth makes strict progress** — the fresh current space is strictly larger
-//!    than the space it replaces, and because the chain gains a whole space
-//!    ([`AnyCollector::young_space_count`] +1) the summed capacity grows by **at least** that
-//!    space's own size.
-//! 3. **A refused growth changes nothing** — the chain cap's refusal leaves
-//!    [`HeapObservable::heap_size_words`], the current space's base, the chain length and the
-//!    collection debt **exactly** as they were, so the caller can collect and retry.
-//! 4. **A collection still collapses the chain onto its live-set target** (the green control) —
-//!    after [`AnyCollector::collect`] / [`AnyCollector::collect_minor`] the chain is exactly one
-//!    space ([`AnyCollector::young_space_count`] == 1), its capacity is what
-//!    [`HeapPolicy::young_after_collection`] / [`HeapPolicy::young_after_fullsweep`] prescribe
-//!    for that chain, and [`AnyCollector::collection_debt`] is false.
-//!
-//! Every corpus here is deterministic — assertions are on word counts, never on wall time — and
-//! every case is driven through both mature strategies wherever the cost allows (the nursery
-//! chain is shared by [`AnyCollector::Copying`] and [`AnyCollector::Immix`]).
-//!
-//! # The rule these cases pin (what the seam does now)
+//! # The rule these cases pin (what the seam does)
 //!
 //! A growth that has to allocate a fresh space sizes it as
 //!
@@ -77,17 +44,54 @@
 //! to install a space exactly the size of the one it retired (`[90→90, 90→90, …]`) and append a
 //! whole capacity to the chain per event.
 //!
-//! And a chain that already **retains** a space may only grow while its summed capacity stays
-//! within [`HeapPolicy::chain_cap_words`]`(live_target)` — `YOUNG_SHRINK_FACTOR` (8) × the live
-//! target, the same multiple the heap-size policy treats as the acceptable in-place band. That is
-//! the C's one-young-block-plus-one-bounded-fragment shape (`delay_garbage_collection`,
-//! `erl_gc.c:500-599`): the **first** growth after a collection is always granted (one fragment),
-//! and a second one has to collect first — so the reported capacity is bounded by the live set and
-//! **flat in the number of growth events**, and a growth loop is no longer quadratic in them
-//! (`Nursery::empty_retired_for` is an index, not a scan).
+//! **A nursery that is never collected grows with its allocation; bounding it requires a
+//! collection, which is the caller's decision and is what
+//! [`AnyCollector::collection_debt`] reports.** The seam is not the instrument for that bound: a
+//! refused growth cannot be honoured by this host (every growth site in `beam_rt` absorbs the
+//! `Err`, leaving the BIF result on its own pool), so the seam's contract is *strict progress plus
+//! an honest account* and the collapse seam — a collection — is the one reclamation point. The C
+//! says the same thing by other means: `delay_garbage_collection` (`erl_gc.c:500-599`) hands out
+//! one bounded fragment and sets `F_FORCE_GC`, i.e. it *asks for a collection* rather than
+//! refusing the allocation.
+//!
+//! # The contract (asserted below)
+//!
+//! 1. **A granted growth makes strict progress** — the fresh current space is at least
+//!    `next_words_above` the space it retires, so a growth event can never stack an equally sized
+//!    space onto the chain (one whole retained capacity that grants no room, repeatable forever).
+//! 2. **The chain grows *geometrically*.** Every curated size is at least `1.2x` its predecessor
+//!    (`heap_sizes`), so `N` granted growths cost `O(log N)` spaces and the reported figure is
+//!    `O(current capacity)`: the chain sum is at most the current space plus the geometric series
+//!    behind it (`<= base + 6 * current`), never one whole capacity per event on top of it.
+//! 3. **The reported figures are a faithful reserved-capacity account** —
+//!    [`HeapObservable::heap_size_words`] is exactly the sum of the spaces the chain has
+//!    installed (the initial one included), [`HeapObservable::total_heap_size_words`] is that plus
+//!    the mature generation, and [`HeapObservable::heap_used_words`] is the chain's fill.
+//! 4. **Nothing bounds the chain but a collection** — the chain sum strictly grows with the number
+//!    of events at a fixed live set, and every event is granted. This is the residual the module
+//!    doc states: the figure tracks the interval's allocation, not a live set.
+//! 5. **A refused growth changes nothing.** The two legitimate grounds — the growth table's
+//!    ceiling and a [`HeapPolicy::max_heap_words`] budget — leave
+//!    [`HeapObservable::heap_size_words`], the current space's base, the chain length and the
+//!    collection debt **exactly** as they were, so the caller can collect and retry; and the
+//!    refusal is `O(1)`-ish, so a long loop of refused growths stays fast.
+//! 6. **A collection still collapses the chain onto its live-set target** (the green control) —
+//!    after [`AnyCollector::collect`] / [`AnyCollector::collect_minor`] the chain is exactly one
+//!    space ([`AnyCollector::young_space_count`] == 1), its capacity is what
+//!    [`HeapPolicy::young_after_collection`] / [`HeapPolicy::young_after_fullsweep`] prescribe
+//!    for that chain, and [`AnyCollector::collection_debt`] is false.
+//! 7. **A provably empty retired space is re-adopted, not replaced** — the smallest adequate one,
+//!    allocating nothing and consuming none of the capacity budget (the `O(log)`-indexed
+//!    [`Nursery::empty_retired_for`] path that keeps a growth from scanning the chain).
+//!
+//! Every corpus here is deterministic — assertions are on word counts, never on wall time (the one
+//! exception is a generous ceiling that pins the refusal path is not a chain scan) — and every case
+//! is driven through both mature strategies wherever the cost allows (the nursery chain is shared by
+//! [`AnyCollector::Copying`] and [`AnyCollector::Immix`]).
 
 use beam_gc::prelude::{
-    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind, YOUNG_SHRINK_FACTOR,
+    AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind,
+    YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, Eterm};
 
@@ -108,6 +112,13 @@ const HOST_GROW_MIN_WORDS: usize = 1024;
 /// A small request — the shape a growth takes when the space is already much larger than what
 /// the next allocation needs (the host's bare-shortfall fallback is the same shape).
 const SMALL_REQUEST: usize = 32;
+
+/// The curated growth table's smallest ratio: every entry is at least `1.2x` its predecessor
+/// (`policy::heap_sizes`: Fibonacci-ish up to 233, then `+20%` per step), so `n` granted growths
+/// are covered by `O(log n)` spaces and the chain sum is a bounded multiple of its last space.
+fn at_least_one_point_two(before: usize, after: usize) -> bool {
+    after >= before.saturating_add(before / 5)
+}
 
 /// A collector for `policy` with `kind` **pinned** (an explicit override of the automatic
 /// rule), so a case is independent of the mature-generation selection rule.
@@ -172,7 +183,7 @@ fn establish(c: &mut AnyCollector, live_words: usize) -> (Vec<Eterm>, usize) {
 ///
 /// Returns `(before, after)`: the capacity of the current space immediately before the growth,
 /// and the capacity of the fresh space it installed — `None` when the seam **refused** the growth
-/// (the chain cap), which is a normal, non-destructive outcome.
+/// (one of the two legitimate ceilings), which is a normal, non-destructive outcome.
 fn growth_event(c: &mut AnyCollector, hint: usize) -> (usize, Option<usize>) {
     let had_room = c.young().available_words() >= hint;
     let filled = fill_to(c.young_mut(), hint);
@@ -199,271 +210,27 @@ fn growth_event(c: &mut AnyCollector, hint: usize) -> (usize, Option<usize>) {
             assert_eq!(
                 err.as_atom(),
                 Some("out_of_memory"),
-                "the chain cap's refusal is the typed heap exhaustion"
+                "a refused growth is the typed heap exhaustion"
             );
             (before, None)
         }
     }
 }
 
-/// Drives up to `events` growth events with **no collection in between**, and returns how many of
-/// them the seam granted (the rest were refused at the chain cap).
-fn drive_growth(c: &mut AnyCollector, hint: usize, events: usize) -> usize {
-    let mut granted = 0usize;
+/// Drives up to `events` growth events with **no collection in between**, and returns the
+/// capacities of the spaces the seam granted (the refusals are dropped).
+fn drive_growth(c: &mut AnyCollector, hint: usize, events: usize) -> Vec<usize> {
+    let mut granted = Vec::new();
     for _ in 0..events {
-        if growth_event(c, hint).1.is_some() {
-            granted += 1;
+        if let (_, Some(after)) = growth_event(c, hint) {
+            granted.push(after);
         }
     }
     granted
 }
 
 // ---------------------------------------------------------------------------
-// the report
-// ---------------------------------------------------------------------------
-
-/// One row of the measured table: a growth loop's geometry after `events` growth events.
-#[derive(Debug, Clone, Copy)]
-struct Row {
-    scenario: &'static str,
-    kind: MatureKind,
-    hint: usize,
-    events: usize,
-    /// The nursery capacity right after the establishing collection (the live-set figure).
-    base: usize,
-    /// The mature generation's capacity — constant over the loop, and part of `total`.
-    mature: usize,
-    /// [`HeapPolicy::chain_cap_words`] over the live-set target the establishing collection
-    /// remembered — the cap the growth seam itself refuses past.
-    cap: usize,
-    /// The **one-step** size for this scenario's request (`next_words(hint)`): the largest fresh
-    /// space a single growth can install for it.
-    step: usize,
-    /// `young_space_count()` after the loop.
-    spaces: usize,
-    /// How many of the `events` growth events the seam granted.
-    granted: usize,
-    /// `heap_size_words()` — the chain's **summed** nursery capacity.
-    heap_size: usize,
-    /// `total_heap_size_words()` — the chain plus the mature generation.
-    total: usize,
-}
-
-impl Row {
-    /// The live-set bound this file holds the reported capacity to, derived from the rule the
-    /// seam implements rather than from a hand-picked multiple.
-    ///
-    /// Every growth granted **behind a retained space** checks
-    /// `capacity_words() + target <= chain_cap_words(live_target)` *before* installing, so after
-    /// such a grant the chain is inside [`HeapPolicy::chain_cap_words`] — `YOUNG_SHRINK_FACTOR`
-    /// (8) times the live-set target the establishing collection remembered. The **first** growth
-    /// after a collection is deliberately exempt (the C's single bounded fragment,
-    /// `delay_garbage_collection`): it is granted whatever the cap, and it can only take the chain
-    /// to `base + step` — the capacity the collection installed plus one one-step space for this
-    /// request. The bound is therefore `max(cap, base + step)`, plus the mature generation (which
-    /// the growth loop cannot touch).
-    fn bound(&self) -> usize {
-        self.cap.max(self.base + self.step) + self.mature
-    }
-}
-
-/// Runs one measured growth loop: an establishing collection, then `events` growth events with
-/// no collection.
-fn run(kind: MatureKind, policy: HeapPolicy, live_words: usize, hint: usize, events: usize) -> Row {
-    let mut c = any_for(kind, policy.clone());
-    let (_roots, base) = establish(&mut c, live_words);
-    let mature = c.mature_capacity_words();
-    let cap = policy.chain_cap_words(policy.young_minor_target_words(live_words));
-    let step = policy.next_words(hint, 0);
-    let granted = drive_growth(&mut c, hint, events);
-    Row {
-        scenario: "",
-        kind,
-        hint,
-        events,
-        base,
-        mature,
-        cap,
-        step,
-        spaces: c.young_space_count(),
-        granted,
-        heap_size: c.heap_size_words(),
-        total: c.total_heap_size_words(),
-    }
-}
-
-/// The measured table, as one string, so a single assertion failure reports every figure.
-fn report(title: &str, rows: &[Row]) -> String {
-    let mut s = format!("\n{title}\n");
-    s.push_str(&format!(
-        "  {:<34} {:<8} {:>7} {:>7} {:>6} {:>7} {:>7} {:>6} {:>7} {:>10} {:>12} {:>12}\n",
-        "scenario",
-        "kind",
-        "request",
-        "events",
-        "base",
-        "cap",
-        "step",
-        "granted",
-        "spaces",
-        "heap_size",
-        "total_heap",
-        "bound"
-    ));
-    for r in rows {
-        s.push_str(&format!(
-            "  {:<34} {:<8} {:>7} {:>7} {:>6} {:>7} {:>7} {:>6} {:>7} {:>10} {:>12} {:>12}   \
-             ({:.1}x the base, {:.1}x the bound)\n",
-            r.scenario,
-            format!("{:?}", r.kind),
-            r.hint,
-            r.events,
-            r.base,
-            r.cap,
-            r.step,
-            r.granted,
-            r.spaces,
-            r.heap_size,
-            r.total,
-            r.bound(),
-            r.heap_size as f64 / r.base as f64,
-            r.total as f64 / r.bound() as f64,
-        ));
-    }
-    s
-}
-
-// ---------------------------------------------------------------------------
-// 1. The reported capacity must stay live-set bounded, and flat in the event count
-// ---------------------------------------------------------------------------
-
-/// The headline: a post-collection growth loop must not ratchet the reported heap size.
-///
-/// The two scenarios are the two request shapes a host produces — the copy-out gate's
-/// `GROW_MIN_WORDS`-floored request against a default 233-word nursery, and a small request
-/// against a nursery sized by the policy's own floor — each measured at three event counts, with
-/// a true `N` / `2N` pair per scenario.
-///
-/// # Why the ladder stops where it does
-///
-/// The reported figure is **flat** once the chain cap refuses (each further event is a refusal
-/// that changes nothing), so more events would report the same numbers. The ladder still reaches
-/// three points per scenario to show the plateau, and the 50 000-event case below shows it holds
-/// arbitrarily far out — and that the loop is not quadratic.
-#[test]
-fn the_reported_heap_size_does_not_ratchet_under_a_growth_loop() {
-    // The shape of `beam_rt`'s copy-out growth: an empty establishing live set on the crate
-    // default nursery (233 words), then ≥1024-word requests.
-    let host_policy = HeapPolicy::default();
-    // A nursery at the policy floor, so a long run stays cheap in bytes while the shape is the
-    // same: `need_reserve_words == 64` ⇒ `nursery_floor_words() == 90`.
-    let floor_policy = HeapPolicy {
-        initial_young_words: 90,
-        ..HeapPolicy::default()
-    };
-    assert_eq!(
-        floor_policy.nursery_floor_words(),
-        90,
-        "the floor-sized scenario really starts at the crate floor"
-    );
-
-    /// The host-shape ladder: `100 -> 200` is its `N` / `2N` pair.
-    const HOST_EVENTS: [usize; 3] = [100, 200, 1_000];
-    /// The small-request ladder: `1_000 -> 2_000` is its `N` / `2N` pair.
-    const FLOOR_EVENTS: [usize; 3] = [1_000, 2_000, 20_000];
-
-    let mut rows: Vec<Row> = Vec::new();
-    for kind in KINDS {
-        for events in HOST_EVENTS {
-            let mut r = run(kind, host_policy.clone(), 0, HOST_GROW_MIN_WORDS, events);
-            r.scenario = "host request (>=1024), 233 nursery";
-            rows.push(r);
-        }
-        for events in FLOOR_EVENTS {
-            let mut r = run(kind, floor_policy.clone(), 0, SMALL_REQUEST, events);
-            r.scenario = "small request (32), 90 nursery";
-            rows.push(r);
-        }
-    }
-
-    let table = report(
-        "the nursery chain under a post-collection growth loop (no collection between events):",
-        &rows,
-    );
-    // (1a) Every row stays within the rule's own bound: `max(chain cap, base + one-step space)`.
-    let over: Vec<&Row> = rows.iter().filter(|r| r.total > r.bound()).collect();
-    assert!(
-        over.is_empty(),
-        "the reported total heap size must stay within the growth seam's own bound \
-         (`max(HeapPolicy::chain_cap_words(live target), base + one one-step space)`, i.e. {}x the \
-         live-set target — `YOUNG_SHRINK_FACTOR` — plus at most the one unconditional fragment a \
-         collection's first growth may install) plus the mature generation; {} of {} rows exceed \
-         it — the growth loop ratchets the account: {table}",
-        YOUNG_SHRINK_FACTOR,
-        over.len(),
-        rows.len()
-    );
-
-    // (1a') The rule stated exactly: a growth granted behind a retained space never leaves the
-    // chain past the cap, so the only way to be outside it is the one unconditional first grant.
-    let outside: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.heap_size > r.cap && r.granted > 1)
-        .collect();
-    assert!(
-        outside.is_empty(),
-        "a chain that keeps a retained space may only grow inside `chain_cap_words(live target)` \
-         ({} x the live-set target = {{cap}}), so any row outside it must have made exactly one \
-         growth (the C's one bounded fragment); {} of {} rows grew past the cap more than once: \
-         {table}",
-        YOUNG_SHRINK_FACTOR,
-        outside.len(),
-        rows.len()
-    );
-
-    // (1b) The figure is flat in the number of growth events: N and 2N must agree, because the
-    // number of growth events is not a workload property. The pairs are the first two rungs of
-    // each ladder; the third rung shows the plateau continues.
-    let mut dyads: Vec<(&Row, &Row)> = Vec::new();
-    for kind in KINDS {
-        for hint in [HOST_GROW_MIN_WORDS, SMALL_REQUEST] {
-            let ladder: Vec<&Row> = rows
-                .iter()
-                .filter(|r| r.kind == kind && r.hint == hint)
-                .collect();
-            assert_eq!(ladder[1].events, 2 * ladder[0].events, "an N / 2N pair");
-            dyads.push((ladder[0], ladder[1]));
-        }
-    }
-    let moving: Vec<(&Row, &Row)> = dyads
-        .iter()
-        .copied()
-        .filter(|(a, b)| a.total != b.total || a.heap_size != b.heap_size)
-        .collect();
-    assert!(
-        moving.is_empty(),
-        "the reported total heap size must be identical at N and 2N growth events (flat in the \
-         event count); {} of {} pairs move — each extra event strands another space's capacity: \
-         {table}",
-        moving.len(),
-        dyads.len()
-    );
-
-    // (1c) The cap really bites: every scenario ran more events than the seam granted, so the
-    // plateau above is the chain cap's doing and not an under-run ladder.
-    let never_refused: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.granted == r.events || r.spaces < 2)
-        .collect();
-    assert!(
-        never_refused.is_empty(),
-        "every row must have exercised the chain cap (a granted growth and then a refusal), so \
-         the flatness is the rule's and not a short ladder: {table}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 2. A successful growth must make strict progress
+// 1. Strict progress, and a chain that grows geometrically
 // ---------------------------------------------------------------------------
 
 /// One growth event's capacity trace.
@@ -518,6 +285,11 @@ fn trace_report(title: &str, kind: MatureKind, hint: usize, steps: &[Step]) -> S
 
 /// A growth that installs a space **no larger** than the one it retires adds a whole capacity to
 /// the chain sum while making no progress in room: it can only be repeated, never finished.
+///
+/// The same case pins the **geometric** shape of the chain: because every curated size is at
+/// least `1.2x` its predecessor, `N` granted growths cost `O(log N)` spaces, so the chain sum is
+/// bounded by the current space plus the geometric series behind it — never one capacity per
+/// event piled on top of the current space.
 #[test]
 fn a_successful_growth_enlarges_the_space_it_replaces() {
     let policy = HeapPolicy {
@@ -526,6 +298,7 @@ fn a_successful_growth_enlarges_the_space_it_replaces() {
     };
     let mut traces: Vec<String> = Vec::new();
     let mut stalls: Vec<(MatureKind, usize, Step)> = Vec::new();
+    let mut slopes: Vec<(MatureKind, usize, Step)> = Vec::new();
     for kind in KINDS {
         for hint in [SMALL_REQUEST, HOST_GROW_MIN_WORDS] {
             let steps = progress_trace(kind, policy.clone(), 0, hint, 4);
@@ -536,18 +309,24 @@ fn a_successful_growth_enlarges_the_space_it_replaces() {
                 &steps,
             ));
             for st in &steps {
-                // A refused event installs nothing at all (its `after` is the `before` the
-                // helper substitutes), so it is excluded here; the refusal itself is pinned by
-                // `the_growth_seam_bounds_the_chain_without_collecting`.
-                if st.total_after != st.total_before && st.after <= st.before {
+                if st.total_after == st.total_before {
+                    // A refused event installs nothing at all (its `after` is the `before` the
+                    // helper substitutes); the refusal itself is pinned by
+                    // `a_refused_growth_is_inert_and_cheap`.
+                    continue;
+                }
+                if st.after <= st.before {
                     stalls.push((kind, hint, *st));
+                }
+                if !at_least_one_point_two(st.before, st.after) {
+                    slopes.push((kind, hint, *st));
                 }
             }
         }
     }
     let table = traces.join("");
 
-    // (2a) Strict progress in the current space's capacity.
+    // (1a) Strict progress in the current space's capacity.
     let first = stalls.first().map(|(kind, hint, st)| {
         format!(
             "first stall: {kind:?}, request {hint}, event {} installed a {}-word space over the \
@@ -564,7 +343,27 @@ fn a_successful_growth_enlarges_the_space_it_replaces() {
         first.unwrap_or_default()
     );
 
-    // (2b) Because the chain gains exactly one space per granted growth, the summed capacity must
+    // (1b) The chain grows geometrically: no install is smaller than 1.2x the space it retires,
+    // which is what makes the space count logarithmic in the chain's total.
+    let slowest = slopes.first().map(|(kind, hint, st)| {
+        format!(
+            "slowest: {kind:?}, request {hint}, event {} installed {} over {} ({:.3}x)",
+            st.event,
+            st.after,
+            st.before,
+            st.after as f64 / st.before as f64
+        )
+    });
+    assert!(
+        slopes.is_empty(),
+        "every growth must step the curated table by at least its smallest ratio (1.2x), so the \
+         chain's space count is O(log total) instead of one space per event; {} events fall short \
+         — {}\n{table}",
+        slopes.len(),
+        slowest.unwrap_or_default()
+    );
+
+    // (1c) Because the chain gains exactly one space per granted growth, the summed capacity must
     // grow by at least the new space's own size.
     let mut shortfalls: Vec<(MatureKind, usize, Step)> = Vec::new();
     for kind in KINDS {
@@ -586,113 +385,391 @@ fn a_successful_growth_enlarges_the_space_it_replaces() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. The paired A/B: only a measured live set bounds the chain
+// 2. The reported figures are a faithful reserved-capacity account
 // ---------------------------------------------------------------------------
 
-/// The same growth loop, from the same nursery and the same request, with **one** difference:
-/// whether a collection has run first.
+/// The chain sum is exactly what the seam installed, the total adds the mature generation, and
+/// the occupancy is the fill — the three figures a host reports (`process_info`,
+/// `erlang:memory(processes)`, `max_heap_size`).
 ///
-/// * **No collection yet** — the nursery has no remembered live-set target
-///   (`live_target_words == None`), so the chain cap is derived from the request's own size
-///   (`YOUNG_SHRINK_FACTOR × target`): every event is granted and the installed capacity climbs
-///   the growth table.
-/// * **After a collection** — the cap is `YOUNG_SHRINK_FACTOR × live_target`, so the first growth
-///   (the C's one bounded fragment) is granted and every further one is **refused** until a
-///   collection collapses the chain. The reported capacity is flat from then on.
-///
-/// The earlier form of this test isolated a *defect*: with the live-set bound applied to the
-/// whole choice, a collected nursery installed a space exactly the size of the one it retired on
-/// every event. The pair below now isolates the **fix** — the bound narrows the choice, it no
-/// longer discards the progress, and the cap is what stops the chain.
+/// The account matters because it is what a host *sees*: a growth that installs a space makes the
+/// reported capacity grow by exactly that space, and only a collection gives it back.
 #[test]
-fn only_a_measured_live_set_bounds_the_chain() {
-    // The nursery geometry is the crate default (a 233-word nursery). The mature generation is
-    // enlarged only so the **retry** collection at the end can run at all: a minor evacuates the
-    // whole chain's occupancy, so its mature space has to have room for it (the typed
-    // `heap_exhausted` otherwise, which is a different contract and not what this case pins). The
-    // mature capacity does not enter any nursery figure asserted here.
+fn the_reported_figures_are_the_installed_capacities() {
+    for kind in KINDS {
+        let policy = HeapPolicy {
+            initial_young_words: 90,
+            initial_mature_words: 4096,
+            ..HeapPolicy::default()
+        };
+        let mut c = any_for(kind, policy.clone());
+        let (_roots, base) = establish(&mut c, 0);
+        let mature = c.mature_capacity_words();
+        let mut installed = base;
+        assert_eq!(c.heap_size_words(), installed, "{kind:?}: one space to start");
+
+        for event in 0..12 {
+            let (before, after) = growth_event(&mut c, SMALL_REQUEST);
+            let after = after.expect("the default policy bounds nothing");
+            // The retired space stays charged to the chain: the account gains exactly the fresh
+            // space's capacity, not the difference.
+            installed += after;
+            assert_eq!(
+                c.heap_size_words(),
+                installed,
+                "{kind:?}: after event {event} the chain sum is the {before}-word space plus the \
+                 {after}-word one it installed, i.e. {installed} words"
+            );
+            assert_eq!(
+                c.total_heap_size_words(),
+                installed + mature,
+                "{kind:?}: the total adds the mature generation"
+            );
+            assert_eq!(
+                c.young_space_count(),
+                event + 2,
+                "{kind:?}: one space per granted growth, plus the current one"
+            );
+            // ... and the occupancy is the fill, which a growth only widens.
+            assert!(
+                c.heap_used_words() <= installed,
+                "{kind:?}: the fill is within the reserved capacity"
+            );
+        }
+
+        // The geometric bound: the chain sum is the current space plus a `1.2x`-ratio series
+        // behind it, i.e. at most `base + 6 * current` words — not one capacity per event.
+        let current = c.young().capacity_words();
+        assert!(
+            c.heap_size_words() <= base + 6 * current,
+            "{kind:?}: the chain sum ({}) is bounded by the current space ({current}) plus the \
+             geometric series behind it",
+            c.heap_size_words()
+        );
+
+        // The collapse gives the whole figure back: one space, the live set's target.
+        let expected = policy.young_after_collection(c.heap_size_words(), 0);
+        let stats = c.collect_minor(&mut []).expect("the collapse");
+        assert_eq!(stats.words_copied, 0, "{kind:?}: nothing live");
+        assert_eq!(c.young_space_count(), 1, "{kind:?}: the collection collapses the chain");
+        assert_eq!(
+            c.heap_size_words(),
+            expected,
+            "{kind:?}: the collapsed capacity is young_after_collection(chain, 0)"
+        );
+        assert_eq!(
+            c.heap_size_words(),
+            c.young().capacity_words(),
+            "{kind:?}: the chain sum is one space again"
+        );
+        assert_eq!(
+            c.total_heap_size_words(),
+            c.heap_size_words() + c.mature_capacity_words(),
+            "{kind:?}: the total is the nursery plus the mature generation"
+        );
+        assert!(!c.collection_debt(), "{kind:?}: the debt is settled");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Nothing bounds the chain but a collection (the stated residual)
+// ---------------------------------------------------------------------------
+
+/// **The residual, pinned as a contract**: at a fixed live set, the reported figure grows with
+/// the number of growth events, and every event is granted — the seam does not bound the chain.
+///
+/// This is the honest account of a seam that cannot collect: a bound would have to be a refusal,
+/// and a refusal cannot be honoured by a host that holds no root set (the allocation it was
+/// making simply stays in its own pool). The seam therefore keeps strict progress and honest
+/// accounting, and the caller — which *can* collect — owns the bound
+/// ([`AnyCollector::collection_debt`] reports it, and the collapse cases below show what the
+/// collection does with it).
+#[test]
+fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
     let policy = HeapPolicy {
-        initial_mature_words: 32768,
+        initial_young_words: 233,
+        initial_mature_words: 4096,
         ..HeapPolicy::default()
     };
     let hint = SMALL_REQUEST;
-    const EVENTS: usize = 5;
 
-    let mut fresh: Vec<usize> = Vec::new();
-    let mut after: Vec<usize> = Vec::new();
-    let mut refusals = 0usize;
+    let mut report = String::from("\n  events -> (granted, spaces, chain words)\n");
+    let mut figures: Vec<(usize, usize, usize, usize)> = Vec::new();
     for kind in KINDS {
-        // The uncollected control: a fresh nursery, never collected.
-        let mut c = any_for(kind, policy.clone());
-        assert_eq!(c.young().capacity_words(), 233, "{kind:?}: the default nursery");
-        assert!(!c.collection_debt(), "{kind:?}: no chain yet");
-        for _ in 0..EVENTS {
-            let (_before, installed) = growth_event(&mut c, hint);
-            fresh.push(installed.expect("an uncollected nursery's chain is bounded by the request"));
+        for events in [4usize, 8] {
+            let mut c = any_for(kind, policy.clone());
+            let (_roots, base) = establish(&mut c, 0);
+            let granted = drive_growth(&mut c, hint, events);
+            assert_eq!(
+                granted.len(),
+                events,
+                "{kind:?}: nothing but a collection bounds the chain, so every event is granted"
+            );
+            figures.push((events, granted.len(), c.young_space_count(), c.heap_size_words()));
+            report.push_str(&format!(
+                "  {kind:?} {events:>3} -> ({}, {}, {})\n",
+                granted.len(),
+                c.young_space_count(),
+                c.heap_size_words()
+            ));
+            assert!(
+                c.heap_size_words() > base,
+                "{kind:?}: {events} growth events must grow the chain past the {base}-word \
+                 collection target{report}"
+            );
+            assert!(c.collection_debt(), "{kind:?}: the chain is collection debt");
         }
-        // The case: identical policy, identical loop — one collection first.
-        let mut c = any_for(kind, policy.clone());
-        let (roots, base) = establish(&mut c, 0);
-        assert_eq!(base, 233, "{kind:?}: the collection kept the 233-word nursery");
-        for _ in 0..EVENTS {
-            let (_before, installed) = growth_event(&mut c, hint);
-            match installed {
-                Some(words) => after.push(words),
-                None => refusals += 1,
-            }
-        }
-        // The refused loop left the chain collected-and-retryable: one collection collapses it and
-        // clears the debt, which is what a host does next.
-        assert!(c.collection_debt(), "{kind:?}: the granted growth is debt");
-        let mut roots = roots;
-        c.collect_minor(&mut roots).expect("the retry collection");
-        assert_eq!(c.young_space_count(), 1, "{kind:?}");
-        assert!(!c.collection_debt(), "{kind:?}");
     }
-
-    let detail = format!(
-        "\n  request {hint} words, {EVENTS} growth events each, policy {policy:?}\n  \
-         uncollected nursery, installed spaces: {fresh:?}\n  \
-         collected nursery,   installed spaces: {after:?} (then {refusals} refusals)\n"
-    );
-
-    // (3a) Without a remembered live set the seam climbs the growth table on every event: the cap
-    // is derived from the request, so it does not bite here.
-    for pair in fresh.chunks(EVENTS) {
-        assert_eq!(pair.len(), EVENTS, "an uncollected nursery grants every event");
+    // ... and it is the *event count* it tracks: the same live set at twice the events reports
+    // strictly more capacity (the figure is not a live-set bound).
+    let pairs: Vec<&(usize, usize, usize, usize)> = figures.iter().filter(|f| f.0 == 4).collect();
+    for (i, small) in pairs.iter().enumerate() {
+        let large = figures.iter().filter(|f| f.0 == 8).nth(i).expect("the 2N row");
         assert!(
-            pair.windows(2).all(|w| w[1] > w[0]),
-            "an uncollected nursery must climb the growth table on every event (the doubling \
-             fallback is live when no live set has been measured){detail}"
+            large.3 > small.3,
+            "the reported capacity must grow with the event count (there is no cap): {small:?} vs \
+             {large:?}{report}"
         );
     }
-    // (3b) With one, the chain cap bounds the loop: some events are granted, each strictly larger
-    // than its predecessor, and the rest are refused (never a same-size install).
-    assert!(!after.is_empty(), "the first growth is always granted{detail}");
-    assert!(
-        refusals >= KINDS.len(),
-        "a collected nursery's chain must hit the cap within {EVENTS} events{detail}"
-    );
-    for pair in after.chunks(after.len() / KINDS.len()) {
-        assert!(
-            pair.windows(2).all(|w| w[1] > w[0]),
-            "every granted growth installs a strictly larger space{detail}"
+
+    // A collection, and only a collection, gives it back — on both strategies and both collapse
+    // seams (a minor sized from the young live set; see
+    // `a_collection_collapses_the_chain_onto_its_live_set_target` for the fullsweep).
+    for kind in KINDS {
+        let mut c = any_for(kind, policy.clone());
+        let (roots, _base) = establish(&mut c, 0);
+        drive_growth(&mut c, hint, 8);
+        assert!(c.collection_debt(), "{kind:?}");
+        let mut roots = roots;
+        c.collect_minor(&mut roots).expect("the collapse");
+        assert_eq!(c.young_space_count(), 1, "{kind:?}");
+        assert!(!c.collection_debt(), "{kind:?}: the collection settles the debt");
+        assert_eq!(
+            c.heap_size_words(),
+            policy.young_minor_target_words(0),
+            "{kind:?}: and lands on the live set's floor"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// 4. The green control: a collection still collapses the chain onto the live set
+// 4. A refused growth is inert, and cheap
+// ---------------------------------------------------------------------------
+
+/// The seam's two legitimate refusals — a [`HeapPolicy::max_heap_words`] budget that cannot reach
+/// the request, and the growth table's own ceiling — and the state a refusal leaves behind.
+///
+/// * **(i) strict progress** — every granted growth installs a space strictly larger than the one
+///   it retires (and the chain gains exactly one space);
+/// * **(ii) a refusal is inert** — `capacity_words()`, the current space's base, the chain length
+///   and the fill are byte-for-byte unchanged, and the collection debt stays true so the caller
+///   knows to collect;
+/// * **(iii) a refusal is not a chain scan** — a long loop of refused growths against a chained
+///   nursery completes in milliseconds, which the per-growth whole-chain scan the empty-retired
+///   index replaced could not do.
+#[test]
+fn a_refused_growth_is_inert_and_cheap() {
+    /// A budget that reaches the first few growths and then bites, so the refusal path (not the
+    /// allocation path) is what the loop below exercises.
+    fn capped() -> HeapPolicy {
+        HeapPolicy {
+            max_heap_words: 2048,
+            ..HeapPolicy::default()
+        }
+    }
+
+    for kind in KINDS {
+        let policy = capped();
+        let mut c = any_for(kind, policy.clone());
+        let (_roots, base) = establish(&mut c, 0);
+        assert_eq!(base, 233, "{kind:?}: the default nursery");
+
+        // (i) The granted phase, up to the budget.
+        let mut granted = 0usize;
+        loop {
+            let (before, after) = growth_event(&mut c, SMALL_REQUEST);
+            match after {
+                Some(words) => {
+                    assert!(
+                        words > before,
+                        "{kind:?}: event {granted} must install a strictly larger space \
+                         ({words} <= {before})"
+                    );
+                    granted += 1;
+                    assert_eq!(
+                        c.young_space_count(),
+                        granted + 1,
+                        "{kind:?}: each granted growth appends exactly one space"
+                    );
+                    assert!(
+                        c.heap_size_words() <= policy.max_heap_words,
+                        "{kind:?}: the chain's summed capacity stays within the ceiling ({})",
+                        policy.max_heap_words
+                    );
+                }
+                None => break,
+            }
+        }
+        assert!(granted >= 1, "{kind:?}: the first growth is granted");
+
+        // (ii) The refusal is inert: nothing was allocated, retired, moved or forgotten.
+        let (spaces, capacity, base_addr, used) = (
+            c.young_space_count(),
+            c.heap_size_words(),
+            c.young().base(),
+            c.heap_used_words(),
+        );
+        assert!(c.collection_debt(), "{kind:?}: the chain stays debt");
+        for _ in 0..8 {
+            let (before, after) = growth_event(&mut c, SMALL_REQUEST);
+            assert!(after.is_none(), "{kind:?}: the ceiling keeps refusing");
+            assert_eq!(before, c.young().capacity_words(), "{kind:?}: same current space");
+        }
+        assert_eq!(c.young_space_count(), spaces, "{kind:?}: a refusal retires nothing");
+        assert_eq!(c.heap_size_words(), capacity, "{kind:?}: a refusal consumes no capacity");
+        assert_eq!(c.young().base(), base_addr, "{kind:?}: a refusal replaces no space");
+        assert_eq!(c.heap_used_words(), used, "{kind:?}: a refusal grants no room");
+
+        // (iii) 20 000 refusals: each is a couple of comparisons against the ceiling, so the loop
+        // is fast and the reported figures do not move.
+        let before_figures = (
+            c.heap_size_words(),
+            c.total_heap_size_words(),
+            c.young_space_count(),
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..20_000 {
+            let (_before, after) = growth_event(&mut c, SMALL_REQUEST);
+            assert!(after.is_none(), "{kind:?}: the ceiling stays fixed");
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            (c.heap_size_words(), c.total_heap_size_words(), c.young_space_count()),
+            before_figures,
+            "{kind:?}: 20 000 more refused growths must not move the reported figures"
+        );
+        assert_eq!(c.young_space_count(), granted + 1, "{kind:?}: the chain length is unchanged");
+        // A ceiling, not a benchmark: the loop is 20 000 refusals, and a whole-chain scan per
+        // event would need minutes rather than the milliseconds it takes here.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "{kind:?}: 20 000 refused growths took {elapsed:?} — the growth path scans the chain"
+        );
+
+        // The caller's move: a collection collapses the chain and gives the budget back, after
+        // which the same request fits again.
+        let stats = c.collect_minor(&mut []).expect("the collapse");
+        assert_eq!(stats.words_copied, 0, "{kind:?}: nothing live");
+        assert_eq!(c.young_space_count(), 1, "{kind:?}");
+        assert!(!c.collection_debt(), "{kind:?}");
+        growth_event(&mut c, SMALL_REQUEST);
+        assert!(
+            c.young_space_count() >= 2,
+            "{kind:?}: the request is grantable again after the collection"
+        );
+
+        // (iv) The growth table's own ceiling: a request beyond the largest curated size cannot
+        // be reached by any size the table can name, and is refused without touching the chain.
+        let mut c = any_for(kind, HeapPolicy::default());
+        let (_roots, _base) = establish(&mut c, 0);
+        let before = (c.young_space_count(), c.heap_size_words(), c.young().base());
+        let err = c
+            .grow_nursery(usize::MAX)
+            .expect_err("the growth table cannot reach an unbounded request");
+        assert_eq!(err.as_atom(), Some("out_of_memory"), "{kind:?}");
+        assert_eq!(
+            (c.young_space_count(), c.heap_size_words(), c.young().base()),
+            before,
+            "{kind:?}: a table-ceiling refusal is inert too"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. A provably empty retired space is re-adopted, not replaced
+// ---------------------------------------------------------------------------
+
+/// A growth that retires a space the mutator never allocated in installs **that** space (the
+/// smallest adequate one, the oldest among equals) instead of allocating a fresh one: nothing is
+/// stranded, nothing is allocated, and the chain's summed capacity and length are unchanged.
+///
+/// This is the `O(log)`-indexed selection (`Nursery::empty_retired_for`) that keeps a growth from
+/// scanning the chain, pinned on word counts rather than on a clock.
+#[test]
+fn an_empty_retired_space_is_re_adopted_rather_than_replaced() {
+    for kind in KINDS {
+        let mut c = any_for(kind, HeapPolicy::default());
+        let (mut roots, _base) = establish(&mut c, 0);
+
+        // A growth with **nothing** allocated in the 233-word default space: it retires that
+        // space while empty and installs a larger one.
+        let retired_base = c.young().base();
+        let retired_capacity = c.young().capacity_words();
+        c.grow_nursery(300).expect("the first growth");
+        assert_ne!(
+            c.young().base(),
+            retired_base,
+            "{kind:?}: the growth installed a fresh space"
+        );
+        assert!(
+            c.young().capacity_words() > retired_capacity,
+            "{kind:?}: and retired the smaller one (strict progress)"
+        );
+        assert_eq!(c.young_space_count(), 2, "{kind:?}: one retired space, one current");
+
+        // Fill the current space so its remaining room is below the request below, while the
+        // retired space is still **provably empty** (nothing was ever allocated in it).
+        let filled = fill_to(c.young_mut(), 200);
+        assert!(filled > 0, "{kind:?}: the current space really fills");
+        assert!(
+            c.young().available_words() < 200,
+            "{kind:?}: the current space cannot serve the request"
+        );
+        let chained = c.heap_size_words();
+        let used = c.heap_used_words();
+
+        // The request the **retired** (smaller, but provably empty) space can serve: the index
+        // answers with it and the seam swaps it in without allocating.
+        c.grow_nursery(200).expect("the re-adoption");
+        assert_eq!(
+            c.young().base(),
+            retired_base,
+            "{kind:?}: the only adequate empty retired space is re-adopted"
+        );
+        assert_eq!(
+            c.young().capacity_words(),
+            retired_capacity,
+            "{kind:?}: ... the space the growth above had retired"
+        );
+        assert_eq!(
+            (c.young_space_count(), c.heap_size_words()),
+            (2, chained),
+            "{kind:?}: a re-adoption allocates nothing and changes no capacity"
+        );
+        assert_eq!(c.heap_used_words(), used, "{kind:?}: it strands nothing");
+        assert!(c.collection_debt(), "{kind:?}: the chain is still debt");
+
+        // The chain is still a nursery: a collection collapses it whole.
+        roots.clear();
+        c.collect_minor(&mut roots).expect("the collapse");
+        assert_eq!(c.young_space_count(), 1, "{kind:?}");
+        assert!(!c.collection_debt(), "{kind:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. The green control: a collection still collapses the chain onto the live set
 // ---------------------------------------------------------------------------
 
 /// Whatever the growth seam did, a collection must still take the chain back to **exactly one**
 /// space whose capacity is what the heap-size policy prescribes for that chain, and clear the
 /// collection debt.
 ///
-/// This is the behaviour the fix must not disturb: the collapse seam is the only reclamation
-/// point of the chain, so it has to keep working while the growth seam is bounded. Both collapse
+/// This is the behaviour the seam must not disturb: the collapse seam is the only reclamation
+/// point of the chain, so it is what bounds the figure the growth seam accumulates. Both collapse
 /// seams are exercised — a **minor** (sized from the young live set) and a **fullsweep** (sized
-/// from the whole-heap live set), including its shrink branch.
+/// from the whole-heap live set), including its shrink branch and a live root that survives in a
+/// **retired** space.
 #[test]
 fn a_collection_collapses_the_chain_onto_its_live_set_target() {
     /// A mature generation large enough for the whole chain's occupancy, so the minor path of
@@ -712,18 +789,19 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             let mut c = any_for(kind, policy.clone());
             let (_roots, base) = establish(&mut c, 0);
             assert_eq!(base, policy.nursery_floor_words(), "{kind:?}");
-            let granted = drive_growth(&mut c, hint, 20);
+            let granted = drive_growth(&mut c, hint, 6);
             let chained_spaces = c.young_space_count();
             let chained_words = c.heap_size_words();
-            assert!(
-                granted >= 1 && chained_spaces == granted + 1,
-                "{kind:?}: the chain is live ({granted} granted growths, {chained_spaces} spaces)"
+            assert_eq!(
+                chained_spaces,
+                granted.len() + 1,
+                "{kind:?}: the chain is live, one space per granted growth"
             );
             assert!(c.collection_debt(), "{kind:?}: the chain is debt");
 
-            // (4a) A **minor** over an empty young live set: the policy's own answer for the
+            // (6a) A **minor** over an empty young live set: the policy's own answer for the
             // collected chain — its target when the chain is past the keep band, the chain's own
-            // capacity when it is inside it (the cap keeps it inside).
+            // capacity when it is inside it.
             let expected = policy.young_after_collection(chained_words, 0);
             let stats = c.collect_minor(&mut []).expect("the minor collapse");
             assert_eq!(
@@ -748,8 +826,7 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
                 "{kind:?}: the chain sum is one space again"
             );
 
-            // (4b) A **minor** over a non-empty young live set: the target is the live set's own
-            // once the chain is below it.
+            // (6b) A **minor** over a non-empty young live set: the target is the live set's own.
             let live_words = 40;
             let mut roots = build_live(&mut c, live_words);
             let pre = c.young().capacity_words();
@@ -762,15 +839,14 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
                 "{kind:?}: the collapsed capacity is the policy's answer for the collected chain"
             );
 
-            // (4c) A **fullsweep** over a live set far **below** the chain: the shrink branch. A
+            // (6c) A **fullsweep** over a live set far **below** the chain: the shrink branch. A
             // fresh collector (with a nursery large enough for the establishing term) establishes
-            // a 401-word live set — so the chain cap and the capacity it leaves are that live
-            // set's — builds a 40-word live term, drops the 401-word root (which makes it
-            // garbage), and only then grows the chain past the band. The fullsweep therefore
-            // measures a live set far below the chain it inherits and gives the memory back onto
-            // the whole-heap target. The surviving 40-word root sits in a **retired** space by
-            // then, so this also pins that a fullsweep evacuates the whole chain, not just the
-            // current space.
+            // a 401-word live set, builds a 40-word live term, drops the 401-word root (which
+            // makes it garbage), and only then grows the chain past the band. The fullsweep
+            // therefore measures a live set far below the chain it inherits and gives the memory
+            // back onto the whole-heap target. The surviving 40-word root sits in a **retired**
+            // space by then, so this also pins that a fullsweep evacuates the whole chain, not just
+            // the current space.
             let mut c = any_for(
                 kind,
                 HeapPolicy {
@@ -781,7 +857,7 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
             let (establish_roots, _base) = establish(&mut c, 401);
             drop(establish_roots);
             let mut roots = build_live(&mut c, live_words);
-            drive_growth(&mut c, hint, 20);
+            drive_growth(&mut c, hint, 6);
             let collected_chain = c.heap_size_words();
             let target = policy.young_target_words(live_words);
             assert!(
@@ -811,96 +887,33 @@ fn a_collection_collapses_the_chain_onto_its_live_set_target() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5. The new properties: a bounded, non-quadratic, non-destructive growth seam
-// ---------------------------------------------------------------------------
-
-/// The growth seam's contract, pinned directly:
-///
-/// * **(i) strict progress** — every granted growth installs a space strictly larger than the one
-///   it retires (and the chain gains exactly one space);
-/// * **(ii) a refusal is inert** — `capacity_words()`, the current space's base and the chain
-///   length are byte-for-byte unchanged, and the collection debt stays true so the caller knows to
-///   collect;
-/// * **(iii) the loop is not quadratic** — 50 000 growth events against a capped chain complete
-///   quickly (they are refusals once the cap is reached) and leave the reported figures flat, which
-///   the earlier `empty_retired_for` chain scan could not do.
+/// `collect_kind` still runs **exactly** the kind it is given, whatever the growth seam left
+/// behind: a pinned minor over a chained nursery evacuates the whole chain and collapses it,
+/// while a pinned fullsweep collapses onto the whole-heap target — the kind-pinned control the
+/// runtime's `BEAM_RT_GC_STRATEGY`-style callers rely on.
 #[test]
-fn the_growth_seam_bounds_the_chain_without_collecting() {
-    let policy = HeapPolicy::default();
-    let hint = SMALL_REQUEST;
-
+fn a_kind_pinned_collection_still_collapses_a_chained_nursery() {
+    let policy = HeapPolicy {
+        initial_young_words: 90,
+        initial_mature_words: 32768,
+        ..HeapPolicy::default()
+    };
     for kind in KINDS {
-        // (i) + (ii): the granted events, then the first refusal.
         let mut c = any_for(kind, policy.clone());
-        let (_roots, base) = establish(&mut c, 0);
-        let cap = policy.chain_cap_words(base);
-        let mut granted = 0usize;
-        loop {
-            let (before, after) = growth_event(&mut c, hint);
-            match after {
-                Some(words) => {
-                    assert!(
-                        words > before,
-                        "{kind:?}: event {granted} must install a strictly larger space \
-                         ({words} <= {before})"
-                    );
-                    granted += 1;
-                    assert_eq!(
-                        c.young_space_count(),
-                        granted + 1,
-                        "{kind:?}: each granted growth appends exactly one space"
-                    );
-                    assert!(
-                        c.heap_size_words() <= cap,
-                        "{kind:?}: the chain stays within the {}x-live-set cap ({cap}), got {}",
-                        YOUNG_SHRINK_FACTOR,
-                        c.heap_size_words()
-                    );
-                }
-                None => break,
-            }
-        }
-        assert!(granted >= 1, "{kind:?}: the first growth is always granted");
-
-        // (ii) The refusal is inert: nothing was allocated, retired, moved or forgotten.
-        let (spaces, capacity, base_addr, used) = (
-            c.young_space_count(),
-            c.heap_size_words(),
-            c.young().base(),
-            c.heap_used_words(),
-        );
-        assert!(c.collection_debt(), "{kind:?}: the chain stays debt");
-        for _ in 0..8 {
-            let (before, after) = growth_event(&mut c, hint);
-            assert!(after.is_none(), "{kind:?}: the cap keeps refusing");
-            assert_eq!(before, c.young().capacity_words(), "{kind:?}: same current space");
-        }
-        assert_eq!(c.young_space_count(), spaces, "{kind:?}: a refusal retires nothing");
-        assert_eq!(c.heap_size_words(), capacity, "{kind:?}: a refusal consumes no capacity");
-        assert_eq!(c.young().base(), base_addr, "{kind:?}: a refusal replaces no space");
-        assert_eq!(c.heap_used_words(), used, "{kind:?}: a refusal grants no room");
-
-        // (iii) 50 000 events: every one after the cap is a refusal, so the loop is fast and the
-        // reported figures do not move.
-        let before_figures = (c.heap_size_words(), c.total_heap_size_words(), c.young_space_count());
-        let start = std::time::Instant::now();
-        for _ in 0..50_000 {
-            let (_before, after) = growth_event(&mut c, hint);
-            assert!(after.is_none(), "{kind:?}: the chain stays capped");
-        }
-        let elapsed = start.elapsed();
+        let (mut roots, _base) = establish(&mut c, 0);
+        let mut live = build_live(&mut c, 40);
+        roots.append(&mut live);
+        drive_growth(&mut c, SMALL_REQUEST, 4);
+        assert!(c.collection_debt(), "{kind:?}");
+        let collection = c
+            .collect_kind(CollectionKind::Minor, &mut roots)
+            .expect("the pinned minor fits");
+        assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
         assert_eq!(
-            (c.heap_size_words(), c.total_heap_size_words(), c.young_space_count()),
-            before_figures,
-            "{kind:?}: 50 000 more growth events must not move the reported figures"
+            collection.stats.words_copied, 40,
+            "{kind:?}: the whole chain was evacuated"
         );
-        assert_eq!(c.young_space_count(), granted + 1, "{kind:?}: the chain length is unchanged");
-        // A ceiling, not a benchmark: the loop is 50 000 refusals of an `O(log)` lookup, and a
-        // quadratic regression would need minutes rather than the milliseconds it takes here.
-        assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "{kind:?}: 50 000 growth events took {elapsed:?} — the growth path scans the chain"
-        );
+        assert_eq!(c.young_space_count(), 1, "{kind:?}: the chain collapsed");
+        assert!(!c.collection_debt(), "{kind:?}");
     }
 }

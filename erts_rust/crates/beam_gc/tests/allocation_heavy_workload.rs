@@ -52,13 +52,6 @@
 //! fresh space, while the mark-region fullsweep reclaims **in place** and pins the
 //! fully-live blocks.
 //!
-//! Each run first takes the **initial fullsweep** (`collect_kind(CollectionKind::Major)`, see
-//! [`run_workload`]) before the measured rounds — the copying collector's mandated first
-//! collection (a fresh process has no old generation) pinned on both strategies, so the cadence
-//! asserted below is the policy's own on both sides rather than the collector's first-collection
-//! special case. It allocates nothing, so round 0 still allocates exactly the long-lived set
-//! plus its transients and garbage.
-//!
 //! # What is asserted (deterministic counts only) versus printed
 //!
 //! Every assertion is on an **exact count** that follows from the corpus geometry:
@@ -437,34 +430,6 @@ fn run_workload(kind: MatureKind) -> Run {
 
     let mut long_lived: Vec<Eterm> = Vec::new();
     let mut samples: Vec<Sample> = Vec::with_capacity(ROUNDS);
-
-    // The **initial fullsweep**, pinned on both strategies before round 0 allocates anything, so
-    // the per-round cadence below is the policy's own on both sides.
-    //
-    // The copying collector's first collection is mandated to be a fullsweep — a fresh process
-    // has no old generation (`old_heap_size_words() == 0` is the C's `OLD_HEAP(p) == NULL`,
-    // `erl_gc.c:1486-1488`), so `Collector::collect` selects `CollectionKind::Major` while that
-    // holds — while `GenImmixCollector::collect` has no such guard and would open the run with a
-    // minor. `collect_kind` neither chooses nor escalates, so pinning the fullsweep here is
-    // exactly the "create the old generation" step; a fullsweep also resets the
-    // fullsweep-cadence counter, so both runs then count minors from 0 and the cadence is
-    // `is_major_round`'s `round % CYCLE == FULLSWEEP_AFTER` on both. Both capacities are fixed
-    // points of the policy at this point too ([`policy`] pins `min_heap_words` to
-    // [`MATURE_WORDS`], which floors every sizing target), so the warm-up moves no capacity.
-    let mut warm_roots: Vec<Eterm> = Vec::new();
-    let warm = c
-        .collect_kind(CollectionKind::Major, &mut warm_roots)
-        .expect("the initial fullsweep");
-    assert_eq!(
-        warm.kind,
-        CollectionKind::Major,
-        "`collect_kind` runs exactly the kind it is given"
-    );
-    assert_eq!(
-        (c.young().capacity_words(), mature_capacity(&c)),
-        (NURSERY_WORDS, MATURE_WORDS),
-        "{kind:?}: the initial fullsweep leaves both capacities on the policy's fixed point"
-    );
 
     for round in 0..ROUNDS {
         if round == 0 {

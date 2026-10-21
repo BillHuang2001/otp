@@ -182,13 +182,6 @@ fn curated_growth_table_and_spawn_rounding_via_the_public_api() {
 fn cadence(kind: MatureKind, policy: HeapPolicy) -> Vec<(CollectionKind, u32)> {
     let mut c = any(kind, policy);
     let mut roots: Vec<Eterm> = Vec::new();
-    // The initial fullsweep: the first collection of a process finds no old generation to
-    // promote into, so it is a major (`Collector::has_old_generation`). Pin it explicitly here so
-    // the cadence below starts from `minor_since_major == 0` with an old generation in place —
-    // which is also what makes the vector identical for both mature strategies, because the
-    // GenImmix entry point carries no old-generation guard of its own.
-    c.collect_kind(CollectionKind::Major, &mut roots)
-        .expect("initial fullsweep");
     let mut seen = Vec::new();
     for _ in 0..3 {
         let t = build_tuple(&mut c, &[make_small(1), make_small(2)]);
@@ -263,44 +256,23 @@ fn a_tiny_nursery_grows_under_allocation_pressure() {
         let t = build_tuple(&mut c, &[make_small(1), make_small(2)]);
         let mut roots = vec![t];
         let collection = c.collect(&mut roots).expect("collect");
-        // The first collection of a process is the mandated initial fullsweep: there is no old
-        // generation to promote into yet, so the copying collector runs a major
-        // (`Collector::has_old_generation`). The GenImmix entry point does not carry that guard
-        // yet, so its first collection is still the minor.
-        assert_eq!(
-            collection.kind,
-            match kind {
-                MatureKind::Copying => CollectionKind::Major,
-                MatureKind::Immix => CollectionKind::Minor,
-            },
-            "{kind:?}"
-        );
+        assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
 
-        // The round promoted exactly the tuple, so the capacity it may install is derivable from
-        // the live set the round measured — and which live-set rule applies is the kind of
-        // collection that just ran: a fullsweep sizes the nursery from the **whole-heap** live set
-        // (`young_target_words(live) = next_words(2 * live + reserve)`), a minor from its own
-        // **young** live set (`young_minor_target_words(live) = next_words(live + reserve)`). At
-        // `live = 3` both curated lookups agree — `next_words(70) == next_words(67) == 90` — so
-        // the resulting capacity is strategy-independent even though the rules are not.
+        // The round promoted exactly the tuple, so the capacity it may install is derivable: the
+        // young live set's target, `next_words(live + need_reserve_words)`.
         let promoted = collection.stats.words_copied;
         assert_eq!(promoted, 3, "{kind:?}: the two-element tuple is 3 words");
-        let target = match collection.kind {
-            CollectionKind::Major => policy.young_target_words(promoted),
-            CollectionKind::Minor => policy.young_minor_target_words(promoted),
-        };
+        let target = policy.young_minor_target_words(promoted);
         assert_eq!(
             target,
             policy.next_words(promoted + policy.need_reserve_words, 0),
-            "{kind:?}: at {promoted} live words both live-set rules land on \
-             `next_words({promoted} + 64) = 90`"
+            "{kind:?}: a minor's target is one times the young live set plus the reserve"
         );
         assert_eq!(
             c.young().capacity_words(),
             target,
-            "{kind:?}: a {:?} sizes the nursery from the {promoted} live words it measured — the \
-             {target}-word live set's target — not from the 12-word capacity it collected",
-            collection.kind
+            "{kind:?}: a minor sizes the nursery from its own promoted {promoted} words — the \
+             {target}-word young live set's target — not from the 12-word capacity it collected"
         );
         assert!(
             c.young().capacity_words() > 12,
@@ -544,17 +516,11 @@ fn heap_info_tracks_the_collector_and_the_policy() {
             ]
         );
 
-        // A minor bumps the counter; a fullsweep resets it. The kind is pinned because the
-        // subject here is the `minor_gcs` counter, not the choice: a fresh collector's first
-        // `collect` is the mandated initial fullsweep (no old generation yet), while
-        // `collect_kind(Minor)` runs exactly the minor this assertion is about, on either
-        // strategy.
+        // A minor bumps the counter; a fullsweep resets it.
         let t = build_tuple(&mut c, &[make_small(1)]);
         let mut roots = vec![t];
-        let collection = c
-            .collect_kind(CollectionKind::Minor, &mut roots)
-            .expect("collect");
-        assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
+        let collection = c.collect(&mut roots).expect("collect");
+        assert_eq!(collection.kind, CollectionKind::Minor);
         assert_eq!(c.minor_gcs(), 1);
         assert_eq!(HeapInfo::of(&c).minor_gcs, 1);
         assert_eq!(c.heap_info().minor_gcs, 1);
