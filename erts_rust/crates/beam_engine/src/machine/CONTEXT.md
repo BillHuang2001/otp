@@ -88,7 +88,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `../../erts/emulator/beam/beam_common.c:527`), which is sound precisely because the reason stays rooted here —
   C roots `fvalue`/`ftrace` for the window they exist (`setup_rootset`/`offset_rootset`,
   `../../erts/emulator/beam/erl_gc.c:2676-2693`, `:3513-3514`).
-- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
+  **Parking is unconditional** — an *immediate* reason (the common `function_clause`/`badarith` atoms, which no
+  collector can move) is parked too, keeping one uniform rule instead of a tag test at the door. Consequence: the
+  byte-identical no-loose-term fast path is unavailable for the **rest of a run that has caught an exception**
+  (`pending_exception` is cleared only by `Machine::reset`/the next raise), so every later door pays at most three
+  extra option reads plus the push/get/truncate of the armed words. Gate the reason slot on
+  `beam_term::is_immediate` in `Machine::loose_heap_terms` if a measurement ever shows that cost.- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
   (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
   `Machine::set_continuation` write), `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
