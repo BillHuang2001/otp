@@ -310,6 +310,46 @@ On the **scheduled** route it is reachable in code but not reached in practice f
 section's measurement: 843 words, `minor_gcs = 0`), because the compile's work happens in nested runs
 whose context carries `mailbox_table: None`.
 
+### Host memory: the touched pages, measured (RSS attribution)
+Measured on the release binary with the OTP-30 bootstrap compiler first on `-pa`, via
+`-eval 'compile:file("…/lib/compiler/src/cerl_clauses.erl",[no_spawn_compiler_process,deterministic,no_docs,{outdir,…}])'`:
+peak VmRSS **372–380 MB**, wall ~1.0 s, sampled from `/proc/<pid>/smaps` and cross-checked with
+`strace -f -k` and an `LD_PRELOAD` `malloc_stats`/`mallinfo2` shim.
+That peak's attribution:
+- **`Heap::new` does NOT touch its region, so region *sizing* alone can never move RSS.**
+  `Heap::with_allocator` is `alloc.alloc_bytes(bytes)` (`beam_alloc/src/heap.rs:64-66`) and the `mseg`
+  carrier writes only a 16-byte `BlockHdr` (`BLOCK_HEADER_SIZE = UNIT_SIZE`) plus a 64-byte
+  `MsegHeader` (`beam_alloc/src/mseg/header.rs:39`), so the two 128 MiB bootstrap reservations —
+  `bif_heaps: vec![Heap::new(heap_words)?]` (`runtime.rs:1447`) and `eval_heap: Heap::new(heap_words)?`
+  (`:1460`) — sit at **12–48 kB RSS** all through boot.
+  Only the caller's own writes into a region make pages resident.
+- **The large fully-resident anonymous mappings are glibc thread-arena heaps, not beam regions.**
+  `strace -f -k` attributes them to `alloc_new_heap` ← `arena_get2` ← `__libc_malloc` (an
+  `mmap(2 × 64 MiB, PROT_NONE)` followed by a 64-MiB-aligned `mprotect`), and their first words decode
+  as glibc's `heap_info { ar_ptr, prev, size = 0x4000000, mprotect_size }`, the `prev` chain linking the
+  heaps.
+  At boot they are 64 MiB + 31 MiB resident = **95 MB** of the 115 MB boot floor; during the
+  cerl_clauses compile three of them reach 64 348 + 63 772 + 56 792 kB ≈ **185 MB**.
+- **Those std-heap pages are a capacity high-water, not live data.**
+  An `LD_PRELOAD` `malloc_stats()` at exit reports `Arena 1: system bytes = 192 802 816` (183.9 MB)
+  against `in use bytes = 219 216` (214 kB), and `malloc_trim(0)` releases **1 byte** — the driver
+  thread's single arena keeps its freed pages mapped.
+  `GLIBC_TUNABLES=glibc.malloc.arena_max=1` does not change the total (peak 380 924 kB) and only re-lays
+  the mappings out, so the total is the runtime's std-allocation high-water, not an arena-count artefact.
+- **`eval_heap` is the one runtime heap that really fills on this route.**
+  Its 128 MiB region goes 46 708 → 104 440 → 131 080 kB resident (fully touched) during the compile,
+  then `grow_eval_heap` retires it (`eval_heap_retired_regions = 1`, `eval_heap_words = 33 554 432` =
+  256 MiB across two regions) and the retired 128 MB stays mapped and resident — **~128 MB of the
+  ~380 MB peak** is `beam_rt`'s own, never freed until the `Runtime` drops.
+- **`+hmax 1000000` is inert until the eval store fills.** It shrinks `eval_heap_words`/`bif_words` but
+  leaves the boot-only RSS unchanged (94 276 → 94 424 kB), because at boot both `Heap`s are untouched;
+  the flag's RSS effect exists only once the eval store would have filled.
+- **The `[rt-mem] exit` census alone is misleading.** For cerl_clauses it reads
+  `arena_words = 5 133 195` (~39 MB) and `bif_words = 20 185 088` (161 MB of *reservation*, with
+  `bif_peak_used_words = 12 953`), and it can name neither mechanism above: the glibc heap is outside
+  `beam_alloc` entirely, and the eval store's figures are capacity over `AllocType::Standard` regions,
+  which the `MemoryHook` excludes from `erlang:memory(emulator)`.
+
 ### Reclaim: what is sound without a collection, and what is not
 Ranked by the measured peak, and all of it **`beam_rt`-owned** (`Runtime::bif_heaps`, `bif_heap_words`,
 `take_bif_heap`/`put_bif_heap`/`take_bif_frontier`, `grow_eval_heap`) — no `beam_engine` API is needed
