@@ -227,6 +227,40 @@ Nothing here is per-`RuntimeContext`: a context is a borrow-only struct over `&'
 (`runtime_context.rs:198-287`), so it owns no heap at all and dropping it frees only its inline
 `dispatch_memo` slots and the boxes a miss put in them.
 Per-mechanism detail is [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; this is the cross-store attribution.
+
+### The measured attribution (release build, OTP-30 bootstrap compiler first on `-pa`)
+`erlang:memory(total)` is **blind** to all of it (≈4.7 MB after a full `cerl_clauses` compile) because the
+pool/arena heaps are `AllocType::Standard` and the `MemoryHook` excludes `Standard` from `emulator`
+(`memory_hook.rs:161-195`). The two figures that see the truth are `/proc/<pid>/status` `VmHWM` and
+`beam_alloc`'s `std_alloc.live_bytes` (`std_live`, the sum of the **whole reservations**).
+
+| workload | peak `VmHWM` | peak `std_live` | steady `std_live` | wall |
+|---|---|---|---|---|
+| bare `-eval 'halt(0).'` | 115 MB | 561 MB (≈4 regions) | — | 0.33 s |
+| `cerl_clauses` (13 793 B) | 334 MB (`-eval`) / 282 MB (`run`) | — / 3.81 GB | 3.79–3.83 GB | 1.0 s / 2.4 s |
+| `inet_parse` (36 960 B) | 2.08 GB | 6.89 GB | ≈5.3 GB | >222 s, never completes |
+| `dbg_iload` (48 353 B) | 9.18 GB | 23.02 GB | ≈13.5 GB | >300 s, never completes |
+
+The store is a **count of `heap_words`-sized regions**: `heap_words = 1 << 24` words = **134 217 728 B
+(128 MiB)** (`runtime.rs:1228` → `term_heap_words` `:132-139`), and every step of the sampled `std_live`
+series is an exact integral multiple of that figure (measured steps `+141 995 216`, `+135 177 168`,
+`+673 300 640` = 5×, `+2 569 MB` = 19×). Region counts: cerl_clauses **28.4**, inet_parse **39.7** (peak
+51.3), dbg_iload **171.5** — i.e. one full-size region **per concurrent nested-run level**, held in
+`bif_heaps` (the push/pop pool is a stack: live regions = max nesting depth).
+Two decisive controls:
+- **`+hmax 1000000`** (which caps `term_heap_words`, hence every `Heap::new(heap_words)` site) on the same
+  source and route: peak `std_live` 3.81 GB → **104 MB**, peak RSS 289 MB → **147 MB**, and still
+  `{ok,cerl_clauses}` (`inet_parse` at that cap answers `error`, so the cap is workload-dependent).
+- **Two compiles in one runtime**: `std_live` stays **3.83 GB**, not 7.6 GB — the pool is a
+  **high-water mark reused across compiles**, not a per-compile leak; it is released only when the
+  `Runtime` drops (or the pool is bounded, which it is not).
+RSS ≪ `std_live` because a fresh region is `mmap`ed and only the pages actually written become resident
+(inet_parse: 0.4–0.5 GB RSS against 5.3 GB live reservations).
+The **reserved-but-never-committed** tail is *not* what costs RSS: `ReservedHeap` tracks
+`reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and
+`try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers `std_live`
+and VmSize by its full size but RSS by **zero**. Only *not allocating* (or not touching) a region lowers
+RSS, which is why down-sizing `heap_words` is the lever and a reservation-truncating fix is not.
 - **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
   deep-copied onto the store (`runtime.rs:2286-2295`: `grow_eval_heap` doubles the region and pushes
   the replaced one onto `eval_heap_retired`, which is never freed).
