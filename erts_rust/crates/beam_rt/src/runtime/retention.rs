@@ -84,6 +84,33 @@ pub struct RetentionStats {
     pub bif_regions: usize,
     /// The summed [`Heap::capacity`](beam_alloc::Heap::capacity) of the pooled regions, in words.
     pub bif_words: u64,
+    /// The summed [`Heap::peak_used`](beam_alloc::Heap::peak_used) of the pooled regions, in words —
+    /// how much of them any caller has ever actually written.
+    ///
+    /// The counterpart of [`bif_words`](RetentionStats::bif_words): `peak_used` is a
+    /// **high-water mark that a rewind preserves** (`Heap::reset`/`reset_to` rewind the bump
+    /// pointer, never the peak), so this figure says what the pool's *capacity* bought — one
+    /// region that served 40 K words out of a 16 M-word reservation is 128 MiB of reservation for
+    /// 320 KiB of use.
+    pub bif_peak_used_words: u64,
+    /// The largest single pooled region's capacity, in words — the per-region figure whose
+    /// multiplication by the nesting depth is what a nested call's fresh region costs.
+    pub bif_max_capacity_words: u64,
+    /// How many pooled BIF heaps are **out on loan** right now — the runtime's current nested-call
+    /// depth (`Runtime::take_bif_heap` counts one up per heap handed out and
+    /// `Runtime::put_bif_heap` one down per heap returned).
+    ///
+    /// `0` between calls, `1` inside a top-level call, `2` and up inside a fun that call applied.
+    /// It is the multiplier the pooled BIF heap's retention used to scale with.
+    pub bif_heaps_taken: usize,
+    /// The seed size, in words, a **nested** call's fresh region gets when the pool is empty
+    /// ([`Runtime::bif_nested_heap_words`]).
+    pub bif_nested_heap_words: usize,
+    /// The high-water `used()` ever observed on a region a **nested** call held
+    /// ([`Runtime::bif_nested_peak_words`]) — the measurement
+    /// [`bif_nested_heap_words`](RetentionStats::bif_nested_heap_words) self-tunes from, and the
+    /// figure that says how much of a nested region's capacity was really bought.
+    pub bif_nested_peak_words: usize,
     /// The **current** `-eval` term store's capacity
     /// ([`Runtime::eval_heap`]'s [`Heap::capacity`](beam_alloc::Heap::capacity)), in words.
     ///
@@ -121,12 +148,19 @@ impl fmt::Display for RetentionStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "arena_words={} arena_allocs={} bif_regions={} bif_words={} eval_heap_words={} \
+            "arena_words={} arena_allocs={} bif_regions={} bif_words={} \
+             bif_peak_used_words={} bif_max_capacity_words={} bif_heaps_taken={} \
+             bif_nested_heap_words={} bif_nested_peak_words={} eval_heap_words={} \
              eval_heap_retired_regions={} eval_heap_retired_words={} eval_off_heap_handles={}",
             self.arena_words,
             self.arena_allocs,
             self.bif_regions,
             self.bif_words,
+            self.bif_peak_used_words,
+            self.bif_max_capacity_words,
+            self.bif_heaps_taken,
+            self.bif_nested_heap_words,
+            self.bif_nested_peak_words,
             self.eval_heap_words,
             self.eval_heap_retired_regions,
             self.eval_heap_retired_words,
@@ -152,6 +186,20 @@ impl Runtime {
                 .iter()
                 .map(|heap| heap.capacity() as u64)
                 .sum(),
+            bif_peak_used_words: self
+                .bif_heaps
+                .iter()
+                .map(|heap| heap.peak_used() as u64)
+                .sum(),
+            bif_max_capacity_words: self
+                .bif_heaps
+                .iter()
+                .map(|heap| heap.capacity())
+                .max()
+                .unwrap_or(0) as u64,
+            bif_heaps_taken: self.bif_heaps_taken,
+            bif_nested_heap_words: self.bif_nested_heap_words,
+            bif_nested_peak_words: self.bif_nested_peak_words,
             eval_heap_words: self.eval_heap.capacity() as u64,
             eval_heap_retired_regions: self.eval_heap_retired.len(),
             eval_heap_retired_words: self
@@ -167,6 +215,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::NESTED_BIF_HEAP_SEED_WORDS;
 
     /// The snapshot is a read of the runtime's own state, so the tests drive the regions through
     /// their real entry points (`alloc_words`, `take_bif_heap`, `grow_eval_heap`) and assert the
@@ -239,6 +288,199 @@ mod tests {
         );
     }
 
+    /// **The outermost region stays full size; a nested one is seeded from need.**
+    ///
+    /// The depth rule the fix rests on: [`Runtime::take_bif_heap`] reads the loan count *before*
+    /// counting its own loan, so the first heap of a chain is [`Runtime::bif_heap_words`] and every
+    /// later one is [`Runtime::bif_nested_heap_words`]. Both are read straight out of the heap that
+    /// was actually handed out, so a change to either policy fails here.
+    #[test]
+    fn the_outermost_region_is_full_size_and_a_nested_one_is_seeded_small() {
+        let mut rt = runtime();
+        let outermost = rt.take_bif_heap().expect("the seed region");
+        assert_eq!(
+            outermost.capacity(),
+            rt.bif_heap_words,
+            "the one-BIF-builds-a-huge-term shape keeps its full region"
+        );
+        assert_eq!(rt.retention_stats().bif_heaps_taken, 1);
+        let nested = rt.take_bif_heap().expect("a nested call's own region");
+        assert_eq!(
+            (nested.capacity(), rt.bif_nested_heap_words),
+            (NESTED_BIF_HEAP_SEED_WORDS, NESTED_BIF_HEAP_SEED_WORDS),
+            "a nested call is seeded from the measured need, not from heap_words"
+        );
+        assert!(
+            nested.capacity() < rt.bif_heap_words,
+            "the seed must be smaller than the outermost region for this to be a bound at all"
+        );
+        assert_eq!(rt.retention_stats().bif_heaps_taken, 2);
+        rt.put_bif_heap(nested);
+        rt.put_bif_heap(outermost);
+        assert_eq!(
+            rt.retention_stats().bif_heaps_taken,
+            0,
+            "the loan count is back to `0` — the pool holds every region again"
+        );
+    }
+
+    /// **200 nested BIF-heap loans stay bounded by the seed, not by `heap_words`.**
+    ///
+    /// This is the regression pin for the retention defect the depth rule fixes: the pool is a
+    /// stack of never-freed regions, one per concurrent call level, so before the rule its
+    /// retention was `nesting depth × bif_heap_words` — 27 regions of `1 << 24` words = 3.62 GB for
+    /// one in-process `compile:file("cerl_clauses.erl")` (a 13.8 KB source), which is what made
+    /// an in-process compile reserve gigabytes for a few hundred KiB of real need. The depth is
+    /// real and is *not* bounded here (one region per level is by design), and neither is the
+    /// outermost region — what the rule bounds is the **capacity a nested level may reserve for
+    /// itself**, which is why the bound asserted below is `outermost + N × seed` and not
+    /// `N × heap_words`.
+    ///
+    /// The synthetic chain is the real nesting path (`take_bif_heap`/`put_bif_heap` at increasing
+    /// depth) with the deepest nesting the compiler really reaches:
+    /// `cerl_clauses`/`orddict` each nest ~23–27 levels and their nested regions peak at 1 550 and
+    /// 2 841 words, i.e. two orders of magnitude below the seed.
+    #[test]
+    fn two_hundred_nested_bif_heap_loans_stay_bounded_by_the_seed() {
+        const DEPTH: usize = 200;
+        let mut rt = runtime();
+        let heap_words = rt.bif_heap_words;
+        let seed = rt.bif_nested_heap_words;
+        let mut loans = Vec::with_capacity(DEPTH);
+        for level in 0..DEPTH {
+            let heap = rt
+                .take_bif_heap()
+                .unwrap_or_else(|e| panic!("level {level}: a region: {e}"));
+            assert_eq!(
+                rt.retention_stats().bif_heaps_taken,
+                level + 1,
+                "level {level}: the loan count is the nesting depth"
+            );
+            if level > 0 {
+                assert_eq!(
+                    heap.capacity(),
+                    seed,
+                    "level {level}: every nested level is seeded from the same rule"
+                );
+            }
+            loans.push(heap);
+        }
+        while let Some(heap) = loans.pop() {
+            rt.put_bif_heap(heap);
+        }
+
+        let stats = rt.retention_stats();
+        assert_eq!(
+            (stats.bif_regions, stats.bif_heaps_taken),
+            (DEPTH, 0),
+            "one region per level — the count is the depth, and the pool holds them all again"
+        );
+        assert_eq!(
+            stats.bif_max_capacity_words, heap_words as u64,
+            "the outermost region is still exactly `bif_heap_words`"
+        );
+        assert_eq!(
+            heap_words, crate::config::DEFAULT_HEAP_WORDS,
+            "the configured region is unchanged by the depth rule"
+        );
+        // The bound: the one outermost region plus one seed per nested level. Nothing about the
+        // workload was measured here, so no seed grew, and the figures are exact rather than `<`.
+        assert_eq!(
+            stats.bif_words,
+            (heap_words + (DEPTH - 1) * seed) as u64,
+            "the pool holds the outermost region plus one seed per nested level"
+        );
+        // …and that is the point: the same depth under the old `heap_words`-per-level rule would
+        // have reserved `DEPTH × heap_words`, ~128× more.
+        assert!(
+            stats.bif_words * 64 < (DEPTH as u64) * (heap_words as u64),
+            "200 nested levels must cost far less than 200 full-size regions: {} words against {}",
+            stats.bif_words,
+            (DEPTH as u64) * (heap_words as u64)
+        );
+    }
+
+    /// **A nested region that really needs more raises the seed; nothing ever lowers it.**
+    ///
+    /// The self-tuning half of the rule: [`Runtime::put_bif_heap`] raises
+    /// [`Runtime::bif_nested_heap_words`] to twice the highest `peak_used()` a nested region ever
+    /// reached (capped at [`Runtime::bif_heap_words`]), so a workload whose nested calls are large
+    /// pays one growth step and is served from then on. It is a `max`, so a later small nested call
+    /// cannot shrink the seed back and re-introduce the growth.
+    #[test]
+    fn a_large_nested_need_raises_the_seed_and_a_small_one_never_lowers_it() {
+        let mut rt = runtime();
+        let seeded = rt.bif_nested_heap_words;
+        let outer = rt.take_bif_heap().expect("the outermost region");
+        let mut nested = rt.take_bif_heap().expect("a nested region");
+        // Write 70 000 words into the nested region: a `tuple/1` of that arity, so `used` — and
+        // therefore `peak_used` — really reaches the figure the tuning reads.
+        let elements = vec![beam_term::make_small(0); 70_000];
+        nested
+            .tuple(&elements)
+            .expect("70 000 elements fit the nested seed");
+        rt.put_bif_heap(nested);
+        rt.put_bif_heap(outer);
+        assert_eq!(
+            rt.retention_stats().bif_nested_peak_words,
+            70_001,
+            "the peak is the written word count (the tuple's own header included)"
+        );
+        assert_eq!(
+            rt.retention_stats().bif_nested_heap_words,
+            140_002,
+            "the seed is twice the observed nested need ({seeded} was too small to serve it twice)"
+        );
+        // A second round with a small nested need must not lower it.
+        let outer = rt.take_bif_heap().expect("the outermost region");
+        let nested = rt.take_bif_heap().expect("a nested region");
+        rt.put_bif_heap(nested);
+        rt.put_bif_heap(outer);
+        assert_eq!(
+            rt.retention_stats().bif_nested_heap_words,
+            140_002,
+            "the seed is a `max`: a small nested call cannot shrink it"
+        );
+    }
+
+    /// **The store's doubling chain is clamped, and a refusal retires nothing.**
+    ///
+    /// [`Runtime::grow_eval_heap`] doubles by region retirement, so an unclamped chain retains
+    /// twice its final region. A configured `+hmax` is the ceiling; `needed` is a floor only up to
+    /// it, and a request beyond it is the **typed** allocation failure a failed `Heap::new` reports
+    /// (never a truncated copy), leaving the store exactly as it was — same region, same retired
+    /// list.
+    #[test]
+    fn growing_the_eval_store_past_its_ceiling_is_a_typed_failure_that_retires_nothing() {
+        const ROUND_WORDS: usize = 2_048;
+        const CEILING: usize = 8_192;
+        let mut rt = Runtime::new(
+            crate::config::RuntimeConfig::new()
+                .with_heap_words(ROUND_WORDS)
+                .with_heap_options(crate::config::HeapOptions::new().with_max_heap_words(CEILING)),
+        )
+        .expect("a runtime whose `+hmax` is the store's ceiling");
+        rt.grow_eval_heap(ROUND_WORDS * 2)
+            .expect("a doubling inside the ceiling");
+        let grown = rt.retention_stats();
+        assert_eq!(grown.eval_heap_words, (ROUND_WORDS * 2) as u64);
+        assert_eq!(grown.eval_heap_retired_regions, 1);
+        let refused = rt
+            .grow_eval_heap(CEILING + 1)
+            .expect_err("a request past the ceiling cannot be served");
+        let exhausted = crate::error::enforce_term_heap_limit(refused);
+        assert!(
+            matches!(exhausted, beam_common::BeamError::SystemLimit),
+            "the refusal is the documented typed exhaustion, not a silently truncated copy: \
+             {exhausted:?}"
+        );
+        assert_eq!(
+            rt.retention_stats(),
+            grown,
+            "a refused growth leaves the store exactly as it was"
+        );
+    }
+
     #[test]
     fn growing_the_eval_store_moves_capacity_into_the_retired_figures() {
         let mut rt = runtime();
@@ -285,6 +527,11 @@ mod tests {
             arena_allocs: 2,
             bif_regions: 3,
             bif_words: 4,
+            bif_peak_used_words: 9,
+            bif_max_capacity_words: 10,
+            bif_heaps_taken: 11,
+            bif_nested_heap_words: 12,
+            bif_nested_peak_words: 13,
             eval_heap_words: 5,
             eval_heap_retired_regions: 6,
             eval_heap_retired_words: 7,

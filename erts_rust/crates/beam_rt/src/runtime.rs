@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
-use beam_common::{BeamError, Result};
+use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_gc::HeapPolicy;
 use beam_loader::Module;
@@ -115,6 +115,54 @@ pub use self::scheduler::RUN_DEADLINE;
 /// It is `reset()` at the start of every such call, so it only has to hold one
 /// materialized value.
 const INFO_HEAP_WORDS: usize = 4_096;
+
+/// The seed size, in words, of a **nested** BIF-heap region: the region a call gets when another
+/// call's region is already out on loan ([`Runtime::take_bif_heap`]).
+///
+/// # Why a nested region is not full size
+///
+/// The pool is a stack, so one region is out on loan per concurrent call level, and a region put
+/// back is never freed. Sizing every nested region like the outermost one therefore made the
+/// pool's retention `nesting depth × heap_words`: measured on an in-process
+/// `compile:file("lib/compiler/src/cerl_clauses.erl")`, **27 regions of exactly `1 << 24` words =
+/// 3.62 GB reserved** while the whole compile needed a few hundred KiB of pooled words per level
+/// (the same compile answers `{ok,cerl_clauses}` under `+hmax 1000000`, i.e. 8 MB regions).
+///
+/// # The figure
+///
+/// `131_072` words = 1 MiB, chosen from the measurement rather than taste: with it,
+/// `cerl_clauses` (13.8 KB) and `lib/stdlib/src/orddict.erl` (15.8 KB) both finish with
+/// `RetentionStats::bif_nested_peak_words` — the high-water `used()` of any region a nested call
+/// held — two orders of magnitude below it, and `lib/kernel/src/inet_parse.erl` (37 KB) stays
+/// below it too; see `src/context/CONTEXT.md` for the figures. [`Runtime::put_bif_heap`] raises the
+/// seed to twice any higher nested peak it observes (never lower), so a workload with a genuinely
+/// large nested need is served on its first repeat, and
+/// [`Runtime::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier)'s geometric
+/// growth covers a single call that outgrows the seed outright.
+///
+/// The **outermost** region keeps `bif_heap_words` (128 MiB by default) so the one-BIF-builds-a-
+/// huge-term shape (`binary:copy/2` and friends, bounded by the region's `available()`) is
+/// untouched.
+const NESTED_BIF_HEAP_SEED_WORDS: usize = 131_072;
+
+/// How much headroom a nested region's observed peak buys when [`Runtime::put_bif_heap`] raises
+/// [`Runtime::bif_nested_heap_words`]: twice the peak, so a repeated need is served without a
+/// growth step.
+const NESTED_SEED_HEADROOM: usize = 2;
+
+/// The absolute ceiling, in words, of the `-eval`/single-pass store
+/// ([`Runtime::grow_eval_heap`]) when no `+hmax` is configured.
+///
+/// The store doubles by **region replacement**, and a replaced region is never freed, so an
+/// unclamped doubling chain is a per-doubling leak whose total is twice the final region. This
+/// ceiling (`1 << 25` words = 256 MiB, twice the default region) bounds that chain; a `+hmax`
+/// takes precedence when one is configured. Reaching it is a **typed** exhaustion (the same
+/// `BeamError::Alloc` a failed [`beam_alloc::Heap::new`] reports, which
+/// [`crate::error::enforce_term_heap_limit`] renders as `error:system_limit`) — never a silently
+/// truncated copy: the store's one caller
+/// ([`crate::context::RuntimeContext::move_result_into_runtime_store`]) then leaves the result on
+/// the pooled BIF heap instead, exactly as for any other refused copy-out.
+const MAX_EVAL_HEAP_WORDS: usize = 1 << 25;
 
 /// The smallest process heap a runtime accepts (`heap_words` is floored at this).
 const MIN_HEAP_WORDS: usize = 1_024;
@@ -288,8 +336,40 @@ pub struct Runtime {
     /// every term built on it — reusing one heap for sequential calls keeps that free,
     /// while a nested call (inside a fun a BIF applied) gets its own heap.
     pub(crate) bif_heaps: Vec<Heap>,
-    /// The size in term words of a freshly created BIF heap.
+    /// The size in term words of a freshly created **outermost** BIF heap — the region a call gets
+    /// when no other call's region is out on loan.
+    ///
+    /// It is the seed's **ceiling** too ([`Runtime::bif_nested_heap_words`]) and the outermost
+    /// region's size; it is no longer the floor of a *nested* region or of the growth in
+    /// [`RuntimeContext::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier),
+    /// because multiplying it by the nesting depth is exactly the retention that made one
+    /// in-process compile reserve gigabytes.
     pub(crate) bif_heap_words: usize,
+    /// The seed size, in words, of a **nested** BIF-heap region — see
+    /// [`NESTED_BIF_HEAP_SEED_WORDS`], which is its initial value (clamped to
+    /// [`Runtime::bif_heap_words`] so a small `+hmax`/`heap_words` runtime never seeds a nested
+    /// region *larger* than its outermost one).
+    ///
+    /// It **self-tunes upward**: [`Runtime::put_bif_heap`] raises it to twice the highest
+    /// `peak_used()` any region handed to a nested call has ever reached, capped at
+    /// [`Runtime::bif_heap_words`]. It never shrinks, so the cost of learning is one growth step
+    /// of the region that taught it.
+    pub(crate) bif_nested_heap_words: usize,
+    /// The high-water `used()` ever observed on a region that was returned by a **nested** call —
+    /// the measurement [`Runtime::bif_nested_heap_words`]' self-tuning is derived from, and the
+    /// figure that says how much of a nested region's capacity was actually bought.
+    pub(crate) bif_nested_peak_words: usize,
+    /// How many pooled BIF heaps are **out on loan** right now.
+    ///
+    /// It is the runtime's current **nested-call depth**: [`Runtime::take_bif_heap`] adds one per
+    /// heap handed out and [`Runtime::put_bif_heap`] subtracts one per heap returned, so it is `0`
+    /// between calls (whenever the pool holds every region), `1` inside a top-level call and `2`
+    /// or more inside a fun that call applied. That is the multiplier the pooled BIF heap's
+    /// retention used to scale with, and the one decision
+    /// [`Runtime::take_bif_heap`] makes: `0` at take time means the region is the outermost one and
+    /// gets [`Runtime::bif_heap_words`]; anything else means it is nested and gets
+    /// [`Runtime::bif_nested_heap_words`].
+    pub(crate) bif_heaps_taken: usize,
     /// The single-threaded scheduler: the run queue of the processes
     /// [`Runtime::spawn_process`] created, plus its thread-progress counter.
     ///
@@ -1366,6 +1446,9 @@ impl Runtime {
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,
+            bif_nested_heap_words: NESTED_BIF_HEAP_SEED_WORDS.min(heap_words),
+            bif_nested_peak_words: 0,
+            bif_heaps_taken: 0,
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
             arena: MinimalContext::new(),
@@ -2156,6 +2239,28 @@ impl Runtime {
     /// applied) finds the pool empty and gets a fresh heap, so the outer call's heap is
     /// never aliased.
     ///
+    /// # Depth-aware sizing
+    ///
+    /// Because the pool is a stack, one **region is out on loan per concurrent call level** and a
+    /// region put back is never freed — so a fresh region's size is multiplied by the nesting
+    /// depth for as long as the runtime lives. The region is therefore sized by **depth**
+    /// ([`Runtime::bif_heaps_taken`], read *before* this loan is counted):
+    ///
+    /// * the **outermost** call (`bif_heaps_taken == 0`) gets [`Runtime::bif_heap_words`] — the
+    ///   configured region, byte for byte the pre-existing behaviour, so a single BIF that builds a
+    ///   huge term (`binary:copy/2` and friends, bounded by the region's `available()`) cannot
+    ///   regress;
+    /// * a **nested** call gets [`Runtime::bif_nested_heap_words`], the measured seed
+    ///   ([`NESTED_BIF_HEAP_SEED_WORDS`]) that self-tunes upward from observed nested need.
+    ///
+    /// A region popped from the pool is used whatever its size (reuse is always better than a fresh
+    /// allocation), and a nested region that turns out too small is grown geometrically from its own
+    /// size by [`RuntimeContext::take_bif_frontier`](crate::context::RuntimeContext::take_bif_frontier)
+    /// — never jumped straight to a full-size region.
+    ///
+    /// Sizing a *new* region changes nothing about what is retained: no region is freed, moved or
+    /// shrunk here, so no live term can dangle and nothing retained becomes unreachable.
+    ///
     /// # Copy out, then rewind
     ///
     /// A `beam_alloc::Heap` never moves its terms, and the pool is **not** rewound between the
@@ -2178,15 +2283,62 @@ impl Runtime {
     ///
     /// Propagates the fresh heap's allocation failure.
     pub(crate) fn take_bif_heap(&mut self) -> Result<Heap> {
-        match self.bif_heaps.pop() {
-            Some(heap) => Ok(heap),
-            None => Heap::new(self.bif_heap_words),
-        }
+        let seed = if self.bif_heaps_taken == 0 {
+            self.bif_heap_words
+        } else {
+            self.bif_nested_heap_words
+        };
+        let heap = match self.bif_heaps.pop() {
+            Some(heap) => heap,
+            None => Heap::new(seed)?,
+        };
+        self.bif_heaps_taken = self.bif_heaps_taken.saturating_add(1);
+        Ok(heap)
+    }
+
+    /// Allocates a **fresh** BIF-heap region of `words` and counts it as on loan.
+    ///
+    /// The counterpart of [`Runtime::take_bif_heap`]'s empty-pool arm for a caller that already
+    /// knows the size it wants — [`RuntimeContext::take_bif_frontier`]'s growth step, which retires
+    /// an exhausted region and continues on a wider one. Keeping the loan counter balanced here
+    /// (rather than letting the growth step allocate outside it) is what keeps
+    /// [`Runtime::bif_heaps_taken`] equal to the **real** nesting depth: the growth step returns one
+    /// region and takes one, so the depth is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the allocation failure; the loan counter is left unchanged, so a failed growth
+    /// cannot make the runtime believe it is nested deeper than it is.
+    pub(crate) fn take_fresh_bif_heap(&mut self, words: usize) -> Result<Heap> {
+        let heap = Heap::new(words)?;
+        self.bif_heaps_taken = self.bif_heaps_taken.saturating_add(1);
+        Ok(heap)
     }
 
     /// Returns a heap taken by [`Runtime::take_bif_heap`] to the pool.
+    ///
+    /// A region returned while another is still out on loan belongs to a **nested** call, so its
+    /// `peak_used()` is what [`Runtime::bif_nested_heap_words`]' self-tuning learns from: the seed
+    /// is raised to [`NESTED_SEED_HEADROOM`]× that peak (capped at [`Runtime::bif_heap_words`]) and
+    /// to the observed peak itself, and never lowered. Nothing is freed, moved or rewound here.
     pub(crate) fn put_bif_heap(&mut self, heap: Heap) {
+        // `>= 2` *before* the decrement: one of the two is the outer caller's.
+        if self.bif_heaps_taken >= 2 {
+            self.note_nested_heap_need(heap.peak_used());
+        }
+        self.bif_heaps_taken = self.bif_heaps_taken.saturating_sub(1);
         self.bif_heaps.push(heap);
+    }
+
+    /// Records that a region handed to a **nested** call needed `peak` words: raises
+    /// [`Runtime::bif_nested_peak_words`] and, with it, [`Runtime::bif_nested_heap_words`] to twice
+    /// that figure — a `max` that never shrinks and never exceeds [`Runtime::bif_heap_words`].
+    fn note_nested_heap_need(&mut self, peak: usize) {
+        self.bif_nested_peak_words = self.bif_nested_peak_words.max(peak);
+        let wanted = peak
+            .saturating_mul(NESTED_SEED_HEADROOM)
+            .min(self.bif_heap_words);
+        self.bif_nested_heap_words = self.bif_nested_heap_words.max(wanted);
     }
     /// Allocates `n` raw heap words from the pointer-stable arena.
     ///
@@ -2301,19 +2453,59 @@ impl Runtime {
     /// so no new retention is introduced — the same words simply live in a region that is still
     /// the allocation frontier.
     ///
+    /// # The ceiling
+    ///
+    /// The doubling is **clamped**: the replacement may not exceed the ceiling
+    /// [`Runtime::eval_heap_ceiling`] names — a configured `+hmax`, otherwise
+    /// [`MAX_EVAL_HEAP_WORDS`] — because every replacement also *retires* its predecessor, so an
+    /// unclamped chain retains twice its final region for the runtime's life. `needed` is a floor
+    /// up to that ceiling: a request the ceiling cannot satisfy is a **typed** exhaustion
+    /// (`BeamError::Alloc` of [`AllocKind::Heap`](beam_common::AllocKind), exactly what a failed
+    /// [`beam_alloc::Heap::new`] reports, which [`crate::error::enforce_term_heap_limit`] renders as
+    /// the documented `error:system_limit`) and **retires nothing** — never a silently truncated
+    /// copy. The store's own caller
+    /// ([`crate::context::RuntimeContext::move_result_into_runtime_store`]) treats the error as a
+    /// refused copy-out and leaves the result on the pooled BIF heap, so the words stay readable.
+    ///
     /// # Errors
     ///
-    /// Propagates the fresh region's allocation failure. The old region is replaced only **after**
-    /// the new one was allocated, so a failure leaves the store exactly as it was.
+    /// Propagates the fresh region's allocation failure, and reports the ceiling as one. The old
+    /// region is replaced only **after** the new one was allocated, so a failure leaves the store
+    /// exactly as it was.
     pub(crate) fn grow_eval_heap(&mut self, needed: usize) -> Result<()> {
         if self.eval_heap.available() >= needed {
             return Ok(());
         }
+        let ceiling = self.eval_heap_ceiling();
         let grown = self.eval_heap.capacity().saturating_mul(2).max(needed);
-        let fresh = Heap::new(grown)?;
+        let target = grown.min(ceiling);
+        if target < needed {
+            // The ceiling cannot serve this copy. Report it the way a failed allocation is
+            // reported and leave the store untouched: no region is retired, nothing is truncated.
+            return Err(BeamError::Alloc(AllocFailure::new(
+                AllocKind::Heap,
+                needed.saturating_mul(core::mem::size_of::<Eterm>()),
+            )));
+        }
+        let fresh = Heap::new(target)?;
         let retired = core::mem::replace(&mut self.eval_heap, fresh);
         self.eval_heap_retired.push(retired);
         Ok(())
+    }
+
+    /// The largest capacity [`Runtime::grow_eval_heap`] may install: a configured `+hmax`
+    /// ([`crate::config::RuntimeConfig::heap_options`]'s
+    /// [`policy`](crate::config::HeapOptions::policy) `max_heap_words`; `0` is "none configured"),
+    /// else [`MAX_EVAL_HEAP_WORDS`], and never below the region the store already has — a store that
+    /// was configured larger than the ceiling keeps its region (it is never shrunk).
+    fn eval_heap_ceiling(&self) -> usize {
+        let configured = self.config.heap_options().policy().max_heap_words;
+        let ceiling = if configured == 0 {
+            MAX_EVAL_HEAP_WORDS
+        } else {
+            configured
+        };
+        ceiling.max(self.eval_heap.capacity())
     }
 
     /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an

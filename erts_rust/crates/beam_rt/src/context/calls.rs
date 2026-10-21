@@ -141,8 +141,15 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// # The cap
     ///
-    /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]), never below
-    /// [`Runtime::bif_heap_words`], and capped by a configured `+hmax`
+    /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]) — **from the
+    /// region's own capacity**, never floored at [`Runtime::bif_heap_words`]: a nested call's region
+    /// is seeded far smaller than the outermost one on purpose
+    /// ([`Runtime::take_bif_heap`](crate::Runtime::take_bif_heap)), and jumping it straight back to a
+    /// full-size region is exactly the `nesting depth × heap_words` retention the seed removed. A
+    /// small region therefore climbs to whatever it needs in geometric steps, which is what the
+    /// doubling is for.
+    ///
+    /// The growth is capped by a configured `+hmax`
     /// ([`crate::config::RuntimeConfig::heap_options`]'s
     /// [`policy`](crate::config::HeapOptions::policy) `max_heap_words`; `0` is "no cap"). When the
     /// cap leaves no room (`computed <= capacity()`) the heap is returned **as it is**, so an
@@ -162,10 +169,7 @@ impl<'a> RuntimeContext<'a> {
         if heap.available() >= heap.capacity() / BIF_HEAP_GROWTH_DIVISOR {
             return Ok(heap);
         }
-        let doubled = heap
-            .capacity()
-            .saturating_mul(2)
-            .max(self.runtime.bif_heap_words);
+        let doubled = heap.capacity().saturating_mul(2);
         let max = self.runtime.config().heap_options().policy().max_heap_words;
         let grown = if max == 0 { doubled } else { doubled.min(max) };
         if grown <= heap.capacity() {
@@ -177,7 +181,7 @@ impl<'a> RuntimeContext<'a> {
         // in it stay valid — and continue the run in a fresh, larger frontier.
         perf_counters::bump(|c| &mut c.pool_grown);
         self.runtime.put_bif_heap(heap);
-        Heap::new(grown)
+        self.runtime.take_fresh_bif_heap(grown)
     }
 
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
