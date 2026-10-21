@@ -112,7 +112,7 @@ pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
 pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
 pub use crate::dist::{DistConnection, DistNode, NodeName};
 pub use crate::dist_client::DistClient;
-pub use crate::runtime::Runtime;
+pub use crate::runtime::{RetentionStats, Runtime};
 /// The conventional glob-import surface for downstream crates.
 ///
 /// `use beam_rt::prelude::*;` brings the runtime façade ([`Runtime`]), its code server

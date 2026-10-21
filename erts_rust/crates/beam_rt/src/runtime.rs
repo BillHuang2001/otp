@@ -100,12 +100,14 @@ mod ets_owner;
 #[cfg(test)]
 mod lost_peer_tests;
 mod gc;
+mod retention;
 mod scheduler;
 mod timer_wakes;
 
 pub use self::gc::GcStatsSnapshot;
 pub(crate) use self::gc::GcState;
 pub(crate) use self::executing::RootAction;
+pub use self::retention::RetentionStats;
 pub use self::scheduler::RUN_DEADLINE;
 
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
@@ -304,6 +306,18 @@ pub struct Runtime {
     runner_state: RunnerState,
     /// The pointer-stable arena serving the engine's `alloc_words` seam.
     pub(crate) arena: MinimalContext,
+    /// The **cumulative** words [`Runtime::alloc_words`] has handed out of [`Runtime::arena`].
+    ///
+    /// The arena retains every region it ever reserved (`beam_engine`'s `ContextHeap` never frees
+    /// one) but exposes no counter of its own, so its *demand* is the observable: this figure is a
+    /// lower bound on what it holds, and the true retained capacity exceeds it by the reservations'
+    /// doubling (`ContextHeap::fresh_region` reserves the previous region's size doubled, and a
+    /// request that does not fit the frontier's committed slice raises that commitment in place).
+    /// Read through [`Runtime::retention_stats`]; nothing in the runtime depends on it.
+    arena_alloc_words: u64,
+    /// How many calls [`Runtime::alloc_words`] has served — the count
+    /// [`Runtime::arena_alloc_words`] is summed over.
+    arena_allocs: u64,
     /// The **process-heap collection** state: the per-module float guard, the pin/halt sets,
     /// the global escape-store valve and the measured counters (see [`crate::runtime::gc`]).
     gc: GcState,
@@ -1355,6 +1369,8 @@ impl Runtime {
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
             arena: MinimalContext::new(),
+            arena_alloc_words: 0,
+            arena_allocs: 0,
             gc: GcState::with_latch(foreign_latch),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             info_heap_tainted: false,
@@ -2178,7 +2194,13 @@ impl Runtime {
     ///
     /// Propagates the arena's allocation failure.
     pub fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        self.arena.alloc_words(n)
+        let words = self.arena.alloc_words(n)?;
+        // Retention accounting ([`RetentionStats`]): the arena never frees a region, so its
+        // demand is the one figure an outside observer can have. Counted only for a served
+        // request — a refused one handed out nothing.
+        self.arena_alloc_words = self.arena_alloc_words.saturating_add(n as u64);
+        self.arena_allocs = self.arena_allocs.saturating_add(1);
+        Ok(words)
     }
 
     /// Copies a scheduled process's return value onto the runtime's long-lived,

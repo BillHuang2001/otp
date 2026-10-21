@@ -78,11 +78,16 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
   ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
   arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
-- **Four storage regions, none ever freed.** `arena` (`:240`); the pooled BIF heap `bif_heaps:
-  Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap` `:1398,1406`, grown by
-  **region retirement** in `context/calls.rs:158 take_bif_frontier`); `eval_heap: Heap` (`:271`) plus
-  `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap` `:1511`); and `eval_off_heap:
-  beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
+- **Four storage regions, none ever freed, all observable.** `arena` (`:240`); the pooled BIF heap
+  `bif_heaps: Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap` `:1398,1406`,
+  grown by **region retirement** in `context/calls.rs:158 take_bif_frontier`); `eval_heap: Heap`
+  (`:271`) plus `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap` `:1511`); and
+  `eval_off_heap: beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
+  `Runtime::retention_stats() -> RetentionStats` (`runtime/retention.rs`) reads all four — arena
+  demand words/calls, `bif_regions`/`bif_words`, `eval_heap_words`/`eval_heap_retired_regions`/
+  `eval_heap_retired_words`, `eval_off_heap_handles` (MSO slots only — `OffHeapTable::len` excludes
+  the table's refc binaries) — and `BEAM_RT_MEM_TRACE` prints it as one `[rt-mem] boot …` line after
+  the boot and one `[rt-mem] exit …` line on the way out of `cli::run` (silent unless set).
 - **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
   byte-aligned binary ≤64 bytes to `terms::make_heap_binary` (arena) and everything else —
   non-byte-aligned, or past `ERL_ONHEAP_BINARY_LIMIT` — to `beam_codec::term::make_bitstring` on
