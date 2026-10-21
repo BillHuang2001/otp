@@ -260,7 +260,8 @@ The **reserved-but-never-committed** tail is *not* what costs RSS: `ReservedHeap
 `reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and
 `try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers `std_live`
 and VmSize by its full size but RSS by **zero**. Only *not allocating* (or not touching) a region lowers
-RSS, which is why down-sizing `heap_words` is the lever and a reservation-truncating fix is not.
+RSS, so down-sizing `heap_words` lowers RSS exactly where a region actually fills (`eval_heap`, see
+*Host memory: the touched pages*) and a reservation-truncating fix never does.
 - **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
   deep-copied onto the store (`runtime.rs:2286-2295`: `grow_eval_heap` doubles the region and pushes
   the replaced one onto `eval_heap_retired`, which is never freed).
