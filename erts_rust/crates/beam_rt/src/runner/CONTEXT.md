@@ -276,16 +276,7 @@ per-iteration):
 The tier is taken on a process's **first** entry and then carried for its whole life, and the observable consequences are pinned structurally rather than timed: a pre-empted slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the process was selected for (`a_preempted_process_resumes_on_its_baseline_tier` / `a_receive_parked_process_resumes_on_its_baseline_tier`), an interpreter-tier process never changes through a resume (`an_interpreter_tier_process_is_unchanged_across_a_resume`), and a native block's slice charge is exact ([`tests/slice_charging.rs`](tests/slice_charging.rs)'s `the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice`).
 `BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the default (`Auto`, and its `baseline` alias) puts every process on the native tier.
 Per-workload speed and memory figures are **measured, never modelled**; the full cross-runtime record lives in [`../../PERF.md`](../../PERF.md) and the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md).
-Headline rust/sys ratios on this runtime's default baseline-JIT tier against OTP 29.1.1 / erts-17.1 — each with its own estimator, loop count and caveats in [`MEASURED.md`](MEASURED.md):
-
-| workload | rust/sys |
-|---|---|
-| `send_recv_plain` (delivery only) | **2.92×** |
-| `send_recv` (+ the ETF codec in the worker) | **5.11×** |
-| `ets_copy` | **10.8×** |
-| `etf_roundtrip` | **2.21×** |
-| `foreign` | **38.3×** (`bstr_to_lower`), **48.1×** (`bstr_capitalize_token`), **51.0×** (`emqx_base62_encode`), **35.8×** (`emqx_base62_decode`) |
-| `emqx_base62:encode/1`, end to end | **27.4×**, with `erlang:memory(binary)` and `VmHWM` flat in N |
+The headline rust/sys ratios, their estimators, loop counts and caveats are **not** kept here: they are [`MEASURED.md`](MEASURED.md)'s record (and `../../CONTEXT.md`'s summary), not this node's contract.
 
 - **The growth shapes' per-call work is flat in N, on deterministic counters.** `churn` collects 1.733133 / 1.733927 / 1.733757 times per call (3 468 / 17 341 / 69 352 collections, 169 / 838 / 3 347 majors) at `reductions`/call 1 808.98–1 809.84 for N = 2 000 / 10 000 / 40 000; `heap_growth` satisfies `collections == 1 + N / K` exactly, with `K == 2` iterations carried by its settled 843-word nursery; both hold one young space at every N, on a capacity that does not move with N (1 220 words for `churn`, 843 for `heap_growth`).
 - **The boundary door's rationing is pinned; its marginal cost is not.** It takes one `churn` boundary in 7.0–7.1 (128 / 258 / 646 of the 904 / 1 809 / 4 524 checks handed to it at N = 2 000 / 4 000 / 10 000), a **constant** 3.69 / 3.72 / 3.73 % of the run's own 3 468 / 6 939 / 17 341 collections, and a shape it is handed ≤1 boundary on per run cannot take a door collection at all; the ON-vs-OFF `Δ` needs a door-disabled build, so none is claimed.
