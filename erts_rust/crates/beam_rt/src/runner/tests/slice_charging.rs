@@ -53,12 +53,12 @@
 //! | native | 400 | 1 | 0 | 0 | 0 | 0 | 0 | 2 009 | 830 667 |
 //! | native | 700 | 1 | 0 | 0 | 0 | 0 | 0 | 3 509 | 2 030 224 |
 //! | native | 798 | 1 | 0 | 0 | 0 | 0 | 0 | 3 999 | 2 030 224 |
-//! | native | 799 | 2 | 1 | 0 | 1 | 1 | 1 | 4 004 | 233 |
-//! | native | 800 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 2 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 4 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | native | 20 000 | 2 | 1 | 0 | 1 | 1 | 1 | 4 006 | 233 |
-//! | interpreter | 798 | 4 | 3 | 0 | 3 | 1 | 1 | 14 386 | 188 558 |
+//! | native | 799 | 2 | 1 | 0 | 1 | 0 | 1 | 4 004 | 233 |
+//! | native | 800 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 2 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 4 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | native | 20 000 | 2 | 1 | 0 | 1 | 0 | 1 | 4 006 | 233 |
+//! | interpreter | 798 | 4 | 3 | 0 | 3 | 0 | 1 | 14 386 | 190 104 |
 //! | interpreter | 2 000 | 10 | 9 | 0 | 9 | 1 | 1 | 36 018 | 233 |
 //!
 //! (A row's `heap_size` is the capacity the nursery held when the loop returned, so on the
@@ -130,8 +130,12 @@
 //!    * a fixture of the same shape with **no** epilogue seam ends **zero** slices (measured
 //!      `slices=1, yields=0, reductions=4 000` at N = 8 000), which is what identifies the
 //!      epilogue as the refusing site rather than the loop;
-//!    * the single `Yield` *does* collect once (a major at the boundary), so the shape's
-//!      `heap_size` sits on the collector's floor (233) instead of tracking N. The memory half of
+//!    * the single `Yield` *does* collect once — as a **minor**, not a fullsweep: the door pins
+//!      `Process::collect_kind(CollectionKind::Minor)` first and escalates only when the live
+//!      promotion cannot fit the mature region, and this shape's boundary live set is empty (its
+//!      per-iteration tuples are all dead by then), so the minor is promotable and no fullsweep
+//!      is taken — leaving the shape's `heap_size` on the collector's floor (233) instead of
+//!      tracking N. The memory half of
 //!      the old residual has therefore closed; the
 //!      **charging** half has not: closing it needs a refusing charge the loop's own seams can
 //!      take, i.e. the `beam_engine` handoff that makes a call-seam refusal re-runnable (the
@@ -415,8 +419,24 @@ fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice(
                 row.major,
                 row.peak_young_spaces
             ),
-            (2, 1, 0, 1, 1, 1),
-            "N={n}: exactly one pre-emption and one boundary collection, whatever N is: {row:?}"
+            (2, 1, 0, 1, 0, 1),
+            "N={n}: exactly one pre-emption and one boundary collection, whatever N is — and that \
+             collection is a minor (`major == 0`): the door pins `CollectionKind::Minor` first \
+             and only escalates when the live promotion cannot fit the mature region, and this \
+             shape's boundary live set is empty, so it fits the 233-word initial region: {row:?}"
+        );
+        // The two mature figures say the same thing from the collector's side: the region is
+        // still the one a spawn policy installs (`initial_mature_words`, never re-sized, which
+        // only a fullsweep does) and nothing was ever promoted into it.
+        assert_eq!(
+            (row.peak_mature_capacity, row.peak_mature_used),
+            (
+                emulator_default_policy().initial_mature_words,
+                0
+            ),
+            "N={n}: `major == 0` is not an accident of the counter — the mature region is still \
+             the spawn policy's initial capacity (only a fullsweep re-sizes it) and holds \
+             nothing (the boundary's live promotion is empty): {row:?}"
         );
         // The one boundary collection collapses the run's whole retired chain, so — unlike the
         // pre-pin-4 shape — the heap now sits on the collector's floor instead of tracking N.
