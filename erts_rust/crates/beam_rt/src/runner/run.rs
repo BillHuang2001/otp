@@ -622,6 +622,16 @@ pub(super) fn publish_parked_roots(
     let Some(process) = table.get_mut(pid) else {
         return;
     };
+    // Publish only a reason that is **still a term**: an immediate/literal word, or a container in
+    // a region this process's collector relocates. `Machine::pending_exception` is a machine
+    // *field*, and `Machine::with_roots` deliberately does not park it (the engine treats it as a
+    // copy of the word `land_exception` already published in `x(1)`/`x(3)`), so a collection that
+    // runs **inside** a slice relocates the heap without updating the field: from that point the
+    // stale word may name freed space. Publishing it would hand the valve's reachability walk a
+    // dangling pointer to dereference (`forwards_scanned_word`), i.e. read unmapped memory.
+    // Dropping it is sound because a word no collector scans can never be relocated by publishing
+    // it — the extra-root set is not a liveness claim, only a relocation channel.
+    let reason = reason.filter(|&word| gc::is_live_relocatable_root(process, word));
     machine.with_roots(RootSet::ALL_LIVE, |roots| {
         gc::publish_roots_full(process, &roots, fr_count)
     });
