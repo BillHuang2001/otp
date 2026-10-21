@@ -187,7 +187,7 @@ The action's own process never becomes a scheduler slice: its `receive … after
 ### Build / bootstrapping (A.9)
 * `compile_file.rs` — `compile:forms/2` and `compile:file/2` driven in process, the artifact differentially compared (incl. a real stdlib module), plus the scheduled-route driver (`sched_compile_driver.erl`/`sched_compile_input.erl`).
 * `selfhost_chain.rs` — the A.9 chain in one `-eval` invocation each: compile in process → `code:add_patha/1` → `code:load_file/1` → run, plus the code-store probe.
-* `selfhost_breadth.rs` — **(opt-in)** the widened corpus sweep over every `lib/*/src/*.erl`, chunked by `BEAM_RT_BREADTH_APPS`/`_SHARD=i/n`/`_LIMIT`, with `BEAM_RT_BREADTH_SCHEDULED=1` selecting the spawned-compiler route.
+* `selfhost_breadth.rs` — **(opt-in)** the widened corpus sweep over every `lib/*/src/*.erl`, chunked by `BEAM_RT_BREADTH_APPS`/`_SHARD=i/n`/`_LIMIT`, with `BEAM_RT_BREADTH_SCHEDULED=1` selecting the spawned-compiler route, `_PA=a:b:c` putting the **tree's** compiler first on the path (absolute dirs only), `_COMPARE=artifact` relaxing whole-file byte identity to "an artifact was produced" (the OTP-30 tree stamps `opcode_max` 183), `_MAX_BYTES` size-filtering and `_DEADLINE_S` bounding each child — recipes, the sharding discipline and the host-RAM limit are in [`../TEST_STRATEGY.md`](../TEST_STRATEGY.md), the census in [`../CONTEXT.md`](../CONTEXT.md) *A.9*.
 * `selfhost_bootstrap.rs` — **(opt-in)** the staged self-hosted chain: one invocation rebuilds `epp` → `erl_scan` → `erl_lint` → `compile` and then compiles a stdlib module with the rebuilt compiler.
 
 ### File I/O and io devices
