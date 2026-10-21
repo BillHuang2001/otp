@@ -117,6 +117,11 @@ impl Machine {
     ///
     /// Set by [`Machine::throw`]; a host can inspect it after a run propagates a
     /// raise. `None` when no raise has been recorded.
+    ///
+    /// The reason is a **live root at every GC admission point**: [`Machine::with_roots`]
+    /// parks it at the tail of the Erlang stack and re-seats the relocated word
+    /// afterwards, so the word returned here has already been fixed up by any collection
+    /// that preceded the read (see the field's docs in `machine/mod.rs`).
     pub fn pending_exception(&self) -> Option<(ExceptionClass, Eterm)> {
         self.pending_exception
     }
@@ -125,11 +130,11 @@ impl Machine {
     /// [`Machine::pending_exception`].
     ///
     /// It hands out a mutable reference into the **same** slot the read accessor
-    /// returns, so a host that owns a moving (copying) heap can write the
-    /// **relocated** reason term back after a collection moves the process heap:
-    /// the `Eterm` reason is a GC root the collector must fix up, and
-    /// [`Machine::pending_exception`] yields only a copy of it. `None` when no
-    /// raise has been recorded.
+    /// returns, so a host that re-publishes the reason into its own root set can write
+    /// the **relocated** term back. The engine relocates the field itself — its rooted
+    /// doors park and re-seat the reason (see [`Machine::with_roots`]) — so a host that
+    /// does nothing here still reads a live word. `None` when no raise has been
+    /// recorded.
     ///
     /// The slot is the pending exception `(class, reason)` set by
     /// [`Machine::throw`]/[`Machine::throw_with_trace`].
