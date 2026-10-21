@@ -301,45 +301,36 @@ impl Collector {
         // space has to be able to receive a whole nursery's worth of promotion after the
         // fullsweep, otherwise the very next collection cannot be a minor and every
         // collection escalates to a fullsweep — the generational cadence never runs. But it is
-        // included **as the C includes it**, clamped to the capacity the nursery is about to
-        // have: the C's `need_after` term is `HEAP_TOP(p) - HEAP_START(p)`, the usage of a
-        // *single* young block, so it can never exceed that block's `HEAP_SIZE` — and the C
-        // re-sizes the young block from the live set at every collection (a fullsweep frees
-        // the old heap, `erl_gc.c:1875-1888`, and `adjust_after_fullsweep` sizes the next one
-        // from the post-copy live set, `erl_gc.c:2061-2098`), so `used <= HEAP_SIZE` is a
-        // live-set-derived bound. The same bound is restored here as
-        // [`HeapPolicy::young_target_words`] of the live set: that is the target
-        // [`crate::nursery::Nursery::collapse_after_fullsweep`] installs immediately below, and
-        // every branch of [`HeapPolicy::young_after_fullsweep`] either installs it or keeps a
-        // capacity at least `4/3` of it, so it is a true lower bound on the post-collapse
-        // capacity — the room the next minor really has to fill.
+        // included **as the C includes it**, clamped to the capacity that nursery will
+        // actually have: the C's `need_after` term is `HEAP_TOP(p) - HEAP_START(p)`, the usage
+        // of a *single* young block, so it can never exceed that block's `HEAP_SIZE` — and the C
+        // re-sizes the young block from the live set at every collection (a fullsweep frees the
+        // old heap, `erl_gc.c:1875-1888`, and `adjust_after_fullsweep` sizes the next one from
+        // the post-copy live set, `erl_gc.c:2061-2098`), so `used <= HEAP_SIZE` is a
+        // live-set-derived bound. The bound restored here is exactly the capacity
+        // [`crate::nursery::Nursery::collapse_after_fullsweep`] installs immediately below:
+        // [`HeapPolicy::young_after_fullsweep`] of the capacity the nursery chain has now and the
+        // live set this fullsweep measured. That is a pure function of the live set, upper-bounded
+        // by `YOUNG_SHRINK_FACTOR` (8) times `HeapPolicy::young_target_words(live)` — past that
+        // the collapse installs the target itself — so it is bounded, and it is the room the next
+        // minor really has.
         //
         // The clamp is what keeps the fresh mature space a function of the **live set**.
         // `Nursery::used_words` is the chain-summed occupancy of every nursery space, so it
         // also counts every dead word the mutator (or a host's unrooted BIF copy-out, which
         // bumps the process heap and never rewinds) accumulated since the last collection.
-        // That figure is genuinely unbounded, and folded into `need_after` it is baked into the
-        // next mature space: the following fullsweep then measures a larger live set and grows
-        // again — the mature-capacity feedback (see `tests/mature_capacity_feedback.rs`).
-        // Clamping leaves the term's purpose (a whole nursery's worth of promotion room, and
-        // therefore a *run* of minors between fullsweeps) intact while making it independent of
-        // the allocation history.
-        //
-        // The one consequence, stated honestly: when the collapse **keeps** a nursery it already
-        // has (the keep branch of [`HeapPolicy::young_after_fullsweep`], a capacity within
-        // `4/3..=8` times the target) that capacity is larger than this bound, so a mature space
-        // sized from the target may not admit the *next* minor's whole promotion and `collect`
-        // escalates that one collection to a fullsweep. It is self-limiting rather than sticky:
-        // the capacity that caused it is itself live-set-bounded (the collapse installs the
-        // target as soon as the chain's capacity passes `8 * target`), so it costs a handful of
-        // escalated collections after a live set shrinks, not a permanent cadence change. Sizing
-        // from the kept capacity instead would put the nursery's capacity history back into the
-        // mature space, i.e. straight back into the feedback.
+        // That figure is genuinely unbounded — a runaway process fills the nursery with
+        // millions of dead words — and folded into `need_after` it is baked into the next mature
+        // space: the following fullsweep then measures a larger live set and grows again — the
+        // mature-capacity feedback (see `tests/mature_capacity_feedback.rs`). Clamping leaves the
+        // term's purpose (a whole nursery's worth of promotion room, and therefore a *run* of
+        // minors between fullsweeps) intact while making it independent of the allocation
+        // history.
         let live = crate::live::live(&from, roots).words;
-        let young_occupancy = self
-            .nursery
-            .used_words()
-            .min(self.policy.young_target_words(live));
+        let young_capacity_after = self
+            .policy
+            .young_after_fullsweep(self.nursery.capacity_words(), live);
+        let young_occupancy = self.nursery.used_words().min(young_capacity_after);
         // Grow, shrink or keep the current mature capacity
         // (`HeapPolicy::mature_after_fullsweep`, the C `adjust_after_fullsweep`).
         let size =

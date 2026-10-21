@@ -30,16 +30,22 @@
 //! **dead** word the mutator — or a host's unrooted BIF copy-out, which bumps the process heap
 //! and never rewinds it — accumulated since the last collection. That figure is unbounded and
 //! has nothing to do with the live set, so baking it into the next mature space makes the
-//! capacity climb with the run's allocation: the feedback the measured
-//! `3.8 M → 26 M → 590 M`-word walk and the `{crash,lint_module,system_limit,…}` fullsweep are.
+//! capacity climb with the run's allocation: the feedback behind the measured
+//! `3.8 M → 26 M → 590 M`-word walk (and the `{crash,lint_module,system_limit,…}` fullsweep).
 //!
 //! The rule restored here is the C's own premise for that term: `HEAP_TOP(p) - HEAP_START(p)`
 //! is the usage of **one** young block, so it can never exceed that block's `HEAP_SIZE` — and
 //! the C re-sizes the young block from the live set at every collection (a fullsweep frees the
 //! old block, `erl_gc.c:1875-1888`; `adjust_after_fullsweep` sizes the next one from the
-//! post-copy live set, `erl_gc.c:2061-2098`). The Rust equivalent is
-//! `min(nursery.used_words(), HeapPolicy::young_target_words(live))`, the target the nursery's
-//! own collapse installs immediately after (`Nursery::collapse_after_fullsweep`).
+//! post-copy live set, `erl_gc.c:2061-2098`). The Rust equivalent is the capacity the nursery
+//! will **actually** have after this round's collapse —
+//! `HeapPolicy::young_after_fullsweep(nursery.capacity_words(), live)`, the same rule
+//! `Nursery::collapse_after_fullsweep` applies immediately afterwards — so the term is
+//! `min(nursery.used_words(), that capacity)`:
+//!
+//! ```text
+//! young_occupancy = min(used_words, young_after_fullsweep(capacity_words, live))
+//! ```
 //!
 //! Four contracts, each a deterministic **word count** (never a clock: nothing here is timed):
 //!
@@ -58,20 +64,20 @@
 //!    capped.
 //!
 //! Every corpus is deterministic (no randomness) and both strategies are driven through
-//! [`AnyCollector`].
+//! [`AnyCollector`]. Each case re-derives the expected mature capacity from the collector's own
+//! inputs (the chain capacity and the chain-summed occupancy before the sweep, and the live set
+//! the sweep keeps), so a change to the rule cannot pass silently.
 //!
 //! # Scope of the flatness claim
 //!
-//! The bound is the policy's nursery target for the live set
-//! ([`HeapPolicy::young_target_words`]), which the corpus' dead batches all exceed or all fall
-//! below — so the capacity is measured to be flat exactly where the unclamped input was
-//! unbounded. When the nursery's collapse instead **keeps** a capacity within its hysteresis band
-//! (the keep branch, `4/3..=8` times the target — a live set that shrank less than
-//! [`YOUNG_SHRINK_FACTOR`]-fold), the kept capacity is larger than the bound and one collection
-//! may escalate to a fullsweep until the chain passes `8 * target` and the collapse installs the
-//! target. That is bounded by the live set (it is not this feedback), so it is not pinned as a
-//! figure here; the mature capacity itself is asserted against the rule's own derivation in
-//! every case below.
+//! The bound is the *post-collapse* nursery capacity, which is
+//! `young_after_fullsweep(capacity, live)`: `young_target_words(live)` itself once the chain's
+//! capacity has passed `YOUNG_SHRINK_FACTOR` times it (`8`; the collapse then installs the
+//! target), and otherwise a capacity inside the policy's hysteresis band — at most `8` times the
+//! target. The dead batches below are chosen at both ends of that: 4 000 and 16 000 words of
+//! dead occupancy both sit far past the band edge (so they are indistinguishable — the flatness
+//! this file exists to pin), while 100 words sits below the bound and is therefore a *genuine*
+//! input (the term bounds the occupancy, it does not replace it with a constant).
 
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy, MatureKind,
@@ -102,57 +108,72 @@ const NEED_RESERVE_WORDS: usize = 64;
 
 /// A dead occupancy comfortably **above** the nursery's live-set target, so the clamp bites.
 ///
-/// The nursery's target for a 60-word live set is `young_target_words(60) = 233` words, so a
-/// 4 000-word dead batch is ~17 times it: the shape a host's unrooted BIF copy-out produces.
+/// The nursery's post-collapse capacity for a 60-word live set is at most
+/// `8 * young_target_words(60) = 8 * 233 = 1 864` words, so a 4 000-word dead batch is past the
+/// hysteresis band's upper edge (the collapse installs the 233-word target itself): the shape a
+/// host's unrooted BIF copy-out produces.
 const DEAD_ABOVE_TARGET_WORDS: usize = 4_000;
 
 /// The same burst four times larger — the "history grew" perturbation. The mature capacity must
 /// not see the difference.
 const DEAD_ABOVE_TARGET_X4_WORDS: usize = 4 * DEAD_ABOVE_TARGET_WORDS;
 
-/// A dead occupancy **below** the nursery's target: here the clamp is inert and the occupancy is
-/// a genuine, bounded input to `need_after` — the term must not be dropped.
+/// A dead occupancy **below** the nursery's bound: here the clamp is inert and the occupancy is a
+/// genuine, bounded input to `need_after` — the term must not be dropped.
 const DEAD_BELOW_TARGET_WORDS: usize = 100;
 
 /// Every mature strategy: the copying space and the mark-region space.
 const STRATEGIES: [MatureKind; 2] = [MatureKind::Copying, MatureKind::Immix];
 
 // ---------------------------------------------------------------------------
-// The derived figures
+// The derived figures (re-derived from the collector's own inputs)
 // ---------------------------------------------------------------------------
 
-/// The capacity the nursery will have after the collapse that follows a fullsweep keeping
-/// [`LIVE_WORDS`] — the bound the fullsweep's young-occupancy term must be clamped to.
-fn nursery_bound(policy: &HeapPolicy) -> usize {
-    policy.young_target_words(LIVE_WORDS)
+/// The capacity the nursery will have after the collapse that follows a fullsweep over the
+/// [`LIVE_WORDS`]-word live set, given the `chain_capacity` the nursery chain had going in —
+/// `HeapPolicy::young_after_fullsweep`, the rule the collapse applies. This is the bound the
+/// fullsweep's young-occupancy term is clamped to.
+fn nursery_bound(policy: &HeapPolicy, chain_capacity: usize) -> usize {
+    policy.young_after_fullsweep(chain_capacity, LIVE_WORDS)
 }
 
-/// The mature capacity a fullsweep over the [`LIVE_WORDS`]-word live set must aim at, derived
-/// from the **live set alone**: the term the policy's own rule produces when the nursery's
-/// occupancy is bounded by the capacity that nursery is about to have.
-fn live_set_target(policy: &HeapPolicy) -> usize {
-    policy.mature_target_words(LIVE_WORDS, nursery_bound(policy))
+/// The mature capacity a fullsweep must install for those inputs: the policy's own target for the
+/// **clamped** occupancy (`HeapPolicy::mature_target_words` of `need_after_fullsweep`).
+fn expected_capacity(policy: &HeapPolicy, chain_capacity: usize, occupancy: usize) -> usize {
+    policy.mature_target_words(
+        LIVE_WORDS,
+        occupancy.min(nursery_bound(policy, chain_capacity)),
+    )
 }
 
-/// Asserts a mature capacity is the live-set-derived figure for [`LIVE_WORDS`], per strategy: the
-/// copying space installs the policy's size in whole words, the mark-region space that size
-/// rounded up to whole [`BLOCK_WORDS`]-word blocks (it allocates by line).
-fn assert_is_live_set_target(kind: MatureKind, policy: &HeapPolicy, capacity: usize, what: &str) {
-    let target = live_set_target(policy);
+/// Asserts a mature capacity is that live-set-derived figure, per strategy: the copying space
+/// installs the policy's size in whole words, the mark-region space that size rounded up to whole
+/// [`BLOCK_WORDS`]-word blocks (it allocates by line).
+fn assert_is_live_set_target(
+    kind: MatureKind,
+    policy: &HeapPolicy,
+    capacity: usize,
+    chain_capacity: usize,
+    occupancy: usize,
+    what: &str,
+) {
+    let bound = nursery_bound(policy, chain_capacity);
+    let target = expected_capacity(policy, chain_capacity, occupancy);
+    let clamped = occupancy.min(bound);
     match kind {
         MatureKind::Copying => assert_eq!(
             capacity, target,
-            "{kind:?}: {what} must be the live-set target mature_target_words({LIVE_WORDS}, \
-             young_target_words({LIVE_WORDS}) = {}) = {target} words, got {capacity}",
-            nursery_bound(policy)
+            "{kind:?}: {what} must be mature_target_words({LIVE_WORDS}, \
+             min({occupancy}, young_after_fullsweep({chain_capacity}, {LIVE_WORDS}) = {bound}) = \
+             {clamped}) = {target} words, got {capacity}"
         ),
         MatureKind::Immix => {
             let block_rounded = target.div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
             assert!(
                 (target..=block_rounded).contains(&capacity),
-                "{kind:?}: {what} must be the live-set target {target} (nursery bound {}) \
-                 rounded up to whole {BLOCK_WORDS}-word blocks ({block_rounded}), got {capacity}",
-                nursery_bound(policy)
+                "{kind:?}: {what} must be the live-set target {target} (the same clamped \
+                 occupancy {clamped} of {bound}) rounded up to whole {BLOCK_WORDS}-word blocks \
+                 ({block_rounded}), got {capacity}"
             );
         }
     }
@@ -255,21 +276,22 @@ fn collector(kind: MatureKind, policy: &HeapPolicy) -> AnyCollector {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Flat in the dead occupancy (and bounded, not dropped, below the target)
+// 1. Flat in the dead occupancy (and bounded, not dropped, below the bound)
 // ---------------------------------------------------------------------------
 
 /// **The mature capacity does not follow the dead occupancy the nursery accumulated.**
 ///
 /// Three identical collectors see the same 60-word live set and three different dead batches:
-/// one *below* the nursery's own target (100 words) and two *above* it (4 000 and 16 000). If the
-/// fullsweep fed the chain-summed occupancy into `need_after` unclamped, the capacity would be a
-/// function of the dead words — three different, growing figures (the feedback). Clamped to the
-/// capacity the nursery is about to have, all three sweeps install the same live-set figure:
+/// one *below* the nursery's post-collapse capacity (100 words) and two *far above* it (4 000 and
+/// 16 000). If the fullsweep fed the chain-summed occupancy into `need_after` unclamped, the
+/// capacity would be a function of the dead words — three different, growing figures (the
+/// feedback). Clamped to the capacity the nursery is about to have, all three sweeps install a
+/// live-set-derived figure:
 ///
 /// * the **4 000**- and **16 000**-word batches are indistinguishable — that is the flatness the
 ///   fix buys, and it is a word count, not a timing;
 /// * the **100**-word batch is *not* folded away: it is below the bound, so it is a genuine input
-///   and the target is the larger `mature_target_words(60, 160)` — the bound bounds, it does not
+///   and the target is the larger `mature_target_words(60, 162)` — the bound bounds, it does not
 ///   pin. This is what keeps the term's purpose (a whole nursery's worth of promotion room, so a
 ///   *run* of minors fits between fullsweeps) intact.
 #[test]
@@ -279,11 +301,12 @@ fn the_mature_capacity_is_flat_in_the_dead_occupancy() {
         policy.need_reserve_words, NEED_RESERVE_WORDS,
         "the corpus' reserve constant must be the policy's"
     );
-    let bound = nursery_bound(&policy);
+    let live_target = policy.young_target_words(LIVE_WORDS);
 
     for kind in STRATEGIES {
         let mut capacities: Vec<usize> = Vec::new();
         let mut occupancies: Vec<usize> = Vec::new();
+        let mut bounds: Vec<usize> = Vec::new();
 
         for dead in [
             DEAD_BELOW_TARGET_WORDS,
@@ -302,7 +325,9 @@ fn the_mature_capacity_is_flat_in_the_dead_occupancy() {
 
             // The premise: the fullsweep really sees the dead words, and (for the two big
             // batches) they really exceed the capacity the nursery will be given back.
+            let chain = c.heap_size_words();
             let used_before = c.heap_used_words();
+            let bound = nursery_bound(&policy, chain);
             assert_eq!(
                 used_before,
                 LIVE_WORDS + built,
@@ -313,6 +338,13 @@ fn the_mature_capacity_is_flat_in_the_dead_occupancy() {
                     used_before > bound,
                     "{kind:?}: the {dead}-word dead batch must exceed the nursery's bound \
                      ({bound} words) for the clamp to bite, occupancy was {used_before}"
+                );
+                // ... and the bound really is the live-set target here, not a band capacity:
+                // this corpus is the one the unbounded input made astronomical.
+                assert_eq!(
+                    bound, live_target,
+                    "{kind:?}: a {dead}-word dead burst must leave the nursery on its live-set \
+                     target ({live_target} words), got {bound} (chain {chain})"
                 );
             }
 
@@ -328,58 +360,50 @@ fn the_mature_capacity_is_flat_in_the_dead_occupancy() {
                 );
             }
 
+            assert_is_live_set_target(
+                kind,
+                &policy,
+                capacity,
+                chain,
+                used_before,
+                "a fullsweep over a dead burst",
+            );
             if dead == DEAD_BELOW_TARGET_WORDS {
                 // Below the bound the occupancy is a real input, so this case is a *different*
                 // target than the clamped ones — it pins that the fix bounds the term rather than
                 // replacing it with a constant.
-                let expected = policy.mature_target_words(LIVE_WORDS, used_before);
-                match kind {
-                    MatureKind::Copying => assert_eq!(
-                        capacity, expected,
-                        "{kind:?}: below the bound the occupancy is still folded into \
-                         need_after, so the target is mature_target_words({LIVE_WORDS}, \
-                         {used_before}) = {expected}, got {capacity}"
-                    ),
-                    MatureKind::Immix => {
-                        let block_rounded = expected.div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
-                        assert!(
-                            (expected..=block_rounded).contains(&capacity),
-                            "{kind:?}: below the bound the target is {expected} (block-rounded \
-                             {block_rounded}), got {capacity}"
-                        );
-                    }
-                }
+                let below = expected_capacity(&policy, chain, used_before);
                 assert_ne!(
-                    expected,
-                    live_set_target(&policy),
-                    "{kind:?}: the below-bound case must be distinguishable from the clamped one, \
-                     otherwise this test could not see a constant"
+                    below, live_target,
+                    "{kind:?}: the below-bound case must be distinguishable from the clamped \
+                     one, otherwise this test could not see a constant"
                 );
-            } else {
-                assert_is_live_set_target(kind, &policy, capacity, "a fullsweep over a dead burst");
             }
 
             capacities.push(capacity);
             occupancies.push(used_before);
+            bounds.push(bound);
         }
 
         // The flatness: the two dead batches above the bound are irrelevant to the capacity.
         assert_eq!(
             capacities[1], capacities[2],
             "{kind:?}: the mature capacity must not depend on the dead occupancy — {} words of \
-             dead garbage and {} words both answer {} vs {} words (occupancies {occupancies:?})",
+             dead garbage and {} words both answer {} vs {} words (occupancies {occupancies:?}, \
+             bounds {bounds:?})",
             DEAD_ABOVE_TARGET_WORDS, DEAD_ABOVE_TARGET_X4_WORDS, capacities[1], capacities[2]
         );
         assert!(
             capacities[2] < occupancies[2],
-            "{kind:?}: the mutable figure ({}) must be far below the dead occupancy it saw \
-             ({})", capacities[2], occupancies[2]
+            "{kind:?}: the mutable figure ({}) must be far below the dead occupancy it saw ({})",
+            capacities[2],
+            occupancies[2]
         );
 
         eprintln!(
-            "{kind:?}: dead occupancy {occupancies:?} words -> mature capacity {capacities:?} \
-             words (nursery bound {bound}, live {LIVE_WORDS} words, live-set target {})",
-            live_set_target(&policy)
+            "{kind:?}: dead occupancy {occupancies:?} words, nursery bounds {bounds:?} -> mature \
+             capacity {capacities:?} words (live {LIVE_WORDS} words, live-set target \
+             {live_target})"
         );
     }
 }
@@ -394,18 +418,21 @@ fn the_mature_capacity_is_flat_in_the_dead_occupancy() {
 /// The shape is the *cumulative* one a runaway host produces: each round accumulates a dead
 /// batch twice the previous round's (K, 2K, 4K) with the same 60-word live set. The mature
 /// capacity is asserted, after every sweep, to be exactly the rule's own re-derivation
-/// `mature_after_fullsweep(capacity_before, live, young_target_words(live))` and to be the
-/// same live-set figure the first sweep installed. Under the feedback each round's capacity would
-/// grow with that round's dead words (the measured `3.8 M → 26 M → 590 M` walk); here the series
-/// is constant, so no round can double the previous one.
+/// `mature_after_fullsweep(capacity_before, live, min(occupancy, bound))` and to be the live-set
+/// figure (`matute_target_words(60, young_target_words(60))`) since every round's chain is past
+/// the band edge. Under the feedback each round's capacity would grow with that round's dead
+/// words (the measured `3.8 M → 26 M → 590 M` walk); here the series is constant, so no round can
+/// double the previous one.
 #[test]
 fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
     let policy = HeapPolicy::default();
+    let live_target = policy.young_target_words(LIVE_WORDS);
 
     for kind in STRATEGIES {
         let mut c = collector(kind, &policy);
         let mut roots: Vec<Eterm> = Vec::new();
-        let mut series: Vec<(usize, usize, usize)> = Vec::new(); // (before, after, occupancy)
+        // (capacity before, capacity after, young occupancy, nursery bound)
+        let mut series: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         for (round, dead) in [1usize, 2, 4]
             .into_iter()
@@ -418,36 +445,53 @@ fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
             build_live(&mut c, &mut roots, round as i64 + 1);
             fill_dead(&mut c, dead);
 
+            let chain = c.heap_size_words();
             let capacity_before = c.mature_capacity_words();
             let occupancy = c.heap_used_words();
+            let bound = nursery_bound(&policy, chain);
+            assert_eq!(
+                bound, live_target,
+                "{kind:?}: round {round}'s chain ({chain} words) is past the band edge, so the \
+                 collapse installs the live-set target ({live_target})"
+            );
             let capacity_after = fullsweep(&mut c, &mut roots);
 
             // The rule's own answer for what it was given, with the occupancy bounded by the
             // capacity the nursery is about to have. The copying space installs that answer in
             // whole words; the mark-region space installs it rounded up to whole blocks, which
             // `assert_is_live_set_target` pins for both strategies.
-            let bound = occupancy.min(nursery_bound(&policy));
             if kind == MatureKind::Copying {
-                let derived =
-                    policy.mature_after_fullsweep(capacity_before, LIVE_WORDS, bound);
+                let derived = policy.mature_after_fullsweep(
+                    capacity_before,
+                    LIVE_WORDS,
+                    occupancy.min(bound),
+                );
                 assert_eq!(
                     capacity_after, derived,
-                    "{kind:?}: round {round} (dead {dead}, occupancy {occupancy}) must install \
-                     mature_after_fullsweep({capacity_before}, {LIVE_WORDS}, {bound}) = \
-                     {derived}, got {capacity_after}"
+                    "{kind:?}: round {round} (dead {dead}, occupancy {occupancy}, bound {bound}) \
+                     must install mature_after_fullsweep({capacity_before}, {LIVE_WORDS}, {}) = \
+                     {derived}, got {capacity_after}",
+                    occupancy.min(bound)
+                );
+                assert_eq!(
+                    capacity_after,
+                    expected_capacity(&policy, chain, occupancy),
+                    "{kind:?}: round {round} must land on the live-set figure"
                 );
             }
             assert_is_live_set_target(
                 kind,
                 &policy,
                 capacity_after,
+                chain,
+                occupancy,
                 "every fullsweep of the cumulative-burst series",
             );
-            series.push((capacity_before, capacity_after, occupancy));
+            series.push((capacity_before, capacity_after, occupancy, bound));
         }
 
         // No feedback: the capacity series is constant, so no round doubles its predecessor.
-        let afters: Vec<usize> = series.iter().map(|&(_, after, _)| after).collect();
+        let afters: Vec<usize> = series.iter().map(|&(_, after, _, _)| after).collect();
         assert_eq!(
             afters[0], afters[1],
             "{kind:?}: the second consecutive fullsweep must not move the capacity: {series:?}"
@@ -456,40 +500,32 @@ fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
             afters[1], afters[2],
             "{kind:?}: the third consecutive fullsweep must not move the capacity: {series:?}"
         );
-        for (i, &(_, after, _)) in series.iter().enumerate() {
-            if i > 0 {
-                let previous = series[i - 1].1;
-                assert!(
-                    after <= previous,
-                    "{kind:?}: the capacity must never ratchet (round {i}: {previous} -> \
-                     {after}): {series:?}"
-                );
-            }
+        for i in 1..series.len() {
+            assert!(
+                series[i].1 <= series[i - 1].1,
+                "{kind:?}: the capacity must never ratchet (round {i}): {series:?}"
+            );
         }
         // And it is a real, useful capacity: it covers the live set and leaves room for a *run*
         // of promotions (that is what `MATURE_TARGET_LIVE_MULTIPLE` buys).
-        let target = live_set_target(&policy);
+        let target = expected_capacity(&policy, series[0].3.max(1), 0);
         assert!(
-            afters[2] >= target,
-            "{kind:?}: the fixed point ({}) must cover the live-set target ({target})",
+            afters[2] >= MATURE_TARGET_LIVE_MULTIPLE * policy.need_after_fullsweep(LIVE_WORDS, live_target),
+            "{kind:?}: the fixed point ({}) must hold {MATURE_TARGET_LIVE_MULTIPLE} `need_after` \
+             budgets (young bound {live_target}) so a run of minors fits",
             afters[2]
         );
         assert!(
-            afters[2]
-                >= MATURE_TARGET_LIVE_MULTIPLE
-                    * policy.need_after_fullsweep(LIVE_WORDS, nursery_bound(&policy)),
-            "{kind:?}: the fixed point must hold {MATURE_TARGET_LIVE_MULTIPLE} `need_after` \
-             budgets so a run of minors fits"
-        );
-        assert!(
-            afters[2] <= YOUNG_SHRINK_FACTOR * target,
-            "{kind:?}: the fixed point must stay inside the policy band around {target}, got {}",
+            afters[2] <= YOUNG_SHRINK_FACTOR * target.max(live_target),
+            "{kind:?}: the fixed point must stay inside the policy band around {live_target}, got \
+             {}",
             afters[2]
         );
 
         eprintln!(
-            "{kind:?}: (capacity before, capacity after, young occupancy) per fullsweep = \
-             {series:?}; fixed point = {} words, live-set target = {target} words",
+            "{kind:?}: (capacity before, capacity after, young occupancy, nursery bound) per \
+             fullsweep = {series:?}; fixed point = {} words, live-set target = \
+             {live_target} words",
             afters[2]
         );
     }
@@ -511,10 +547,11 @@ fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
 #[test]
 fn both_strategies_agree_on_the_live_set_figure() {
     let policy = HeapPolicy::default();
-    let target = live_set_target(&policy);
+    let target = policy.mature_target_words(LIVE_WORDS, policy.young_target_words(LIVE_WORDS));
     let block_rounded = target.div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
 
-    let mut converged: Vec<(MatureKind, usize, usize)> = Vec::new(); // (kind, K, 4K)
+    // (kind, K capacity, 4K capacity)
+    let mut converged: Vec<(MatureKind, usize, usize)> = Vec::new();
     for kind in STRATEGIES {
         let mut capacities: Vec<usize> = Vec::new();
         for dead in [DEAD_ABOVE_TARGET_WORDS, DEAD_ABOVE_TARGET_X4_WORDS] {
@@ -558,8 +595,8 @@ fn both_strategies_agree_on_the_live_set_figure() {
     );
 
     eprintln!(
-        "both strategies: K/4K = {} / {} words (copying), {} / {} words (immix), live-set target \
-         {target} words",
+        "both strategies: K / 4K = {} / {} words (copying), {} / {} words (immix), live-set \
+         target {target} words",
         copying.1, copying.2, immix.1, immix.2
     );
 }
@@ -579,6 +616,7 @@ fn both_strategies_agree_on_the_live_set_figure() {
 #[test]
 fn a_dropped_live_set_gives_the_mature_capacity_back() {
     let policy = HeapPolicy::default();
+    let small_target = policy.mature_target_words(LIVE_WORDS, policy.young_target_words(LIVE_WORDS));
 
     for kind in STRATEGIES {
         let mut c = collector(kind, &policy);
@@ -587,19 +625,35 @@ fn a_dropped_live_set_gives_the_mature_capacity_back() {
         let mut roots: Vec<Eterm> = Vec::new();
         build_tuples(&mut c, &mut roots, BIG_TUPLES, 1);
         let big_live = BIG_TUPLES as usize * TUPLE_WORDS;
-        let big_capacity = fullsweep(&mut c, &mut roots);
-        assert!(
-            big_capacity > big_live,
-            "{kind:?}: the big-phase capacity ({big_capacity}) must exceed the live set \
-             ({big_live}) so the shrink below is observable"
+        assert_eq!(
+            c.heap_used_words(),
+            big_live,
+            "{kind:?}: the whole big graph is live and resident"
         );
+        let big_capacity = fullsweep(&mut c, &mut roots);
+        let big_expected = policy.mature_target_words(
+            big_live,
+            big_live.min(policy.young_target_words(big_live)),
+        );
+        match kind {
+            MatureKind::Copying => assert_eq!(
+                big_capacity, big_expected,
+                "{kind:?}: the big phase installs mature_target_words({big_live}, …) = \
+                 {big_expected} words"
+            ),
+            MatureKind::Immix => assert!(
+                big_capacity >= big_expected,
+                "{kind:?}: the big phase covers the {big_expected}-word target (line-rounded), got \
+                 {big_capacity}"
+            ),
+        }
         // The premise of the case: the policy's shrink bracket will really be due at the small
         // live set's target, so the drop below is the shrink branch and not "already small".
         assert!(
-            policy.should_shrink(big_capacity, live_set_target(&policy)),
+            policy.should_shrink(big_capacity, small_target),
             "{kind:?}: the big-phase capacity ({big_capacity}) must be more than \
-             {YOUNG_SHRINK_FACTOR}x the small live set's target ({}) for the shrink to fire",
-            live_set_target(&policy)
+             {YOUNG_SHRINK_FACTOR}x the small live set's target ({small_target}) for the shrink to \
+             fire"
         );
 
         // The small phase: the big graph is dropped, the 60-word live set replaces it, and a
@@ -607,6 +661,8 @@ fn a_dropped_live_set_gives_the_mature_capacity_back() {
         roots.clear();
         build_live(&mut c, &mut roots, 9);
         fill_dead(&mut c, DEAD_ABOVE_TARGET_X4_WORDS);
+        let chain = c.heap_size_words();
+        let occupancy = c.heap_used_words();
         let small_capacity = fullsweep(&mut c, &mut roots);
 
         assert!(
@@ -618,6 +674,8 @@ fn a_dropped_live_set_gives_the_mature_capacity_back() {
             kind,
             &policy,
             small_capacity,
+            chain,
+            occupancy,
             "the fullsweep after the big live set was dropped",
         );
         // The live set is still intact after the shrink.
@@ -633,8 +691,8 @@ fn a_dropped_live_set_gives_the_mature_capacity_back() {
 
         eprintln!(
             "{kind:?}: big live {big_live} words -> capacity {big_capacity}, dropped to \
-             {LIVE_WORDS} words -> capacity {small_capacity} (live-set target {})",
-            live_set_target(&policy)
+             {LIVE_WORDS} words (+{DEAD_ABOVE_TARGET_X4_WORDS} dead) -> capacity {small_capacity} \
+             (live-set target {small_target})"
         );
     }
 }

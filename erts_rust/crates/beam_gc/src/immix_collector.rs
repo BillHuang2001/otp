@@ -650,33 +650,27 @@ impl GenImmixCollector {
         // (`capacity < target`) would fire on every fullsweep and creep the region
         // up without bound (see [`crate::live`]).
         //
-        // The young occupancy is clamped to the capacity the nursery is about to have —
-        // `young_target_words(live)`, the target
-        // `Nursery::collapse_after_fullsweep` installs below (every branch of
-        // `HeapPolicy::young_after_fullsweep` installs it or keeps at least `4/3` of it, so it
-        // is a true lower bound on the post-collapse capacity) — which restores the C's premise
-        // for the same term: `HEAP_TOP(p) - HEAP_START(p)` is one young block's usage, bounded
-        // by that block's `HEAP_SIZE`, and the C sizes the young block from the live set at
-        // every collection (`erl_gc.c:1875-1888`, `:2061-2098`). `Nursery::used_words()` is the
-        // chain-summed occupancy of every nursery space, so unclamped it also counts every dead
-        // word the mutator (or a host's unrooted BIF copy-out, which bumps the process heap and
-        // never rewinds) accumulated since the last collection — unbounded, and folded into
-        // `need_after` it is baked into the region's size, which the next fullsweep measures
-        // again: a capacity feedback. See the identical clamp, and its derivation, in
-        // [`crate::Collector::collect_major`] and the regression gate
-        // `tests/mature_capacity_feedback.rs`.
-        //
-        // The same honest consequence applies here: when the collapse **keeps** a nursery
-        // capacity larger than this bound (the keep branch of
-        // [`HeapPolicy::young_after_fullsweep`]), the next minor's promotion may not fit and
-        // [`Self::collect`] escalates that one collection — self-limiting, because the kept
-        // capacity is itself live-set-bounded.
+        // The young occupancy is clamped to the capacity the nursery will **actually** have
+        // after this round's collapse — `young_after_fullsweep(capacity, live)`, the same
+        // `Nursery::collapse_after_fullsweep` applies below — which restores the C's premise for
+        // the same term: `HEAP_TOP(p) - HEAP_START(p)` is one young block's usage, bounded by
+        // that block's `HEAP_SIZE`, and the C sizes the young block from the live set at every
+        // collection (`erl_gc.c:1875-1888`, `:2061-2098`). That capacity is a function of the
+        // live set alone, upper-bounded by `YOUNG_SHRINK_FACTOR` (8) times
+        // `HeapPolicy::young_target_words(live)` (past which the collapse installs the target
+        // itself). `Nursery::used_words()` is the chain-summed occupancy of every nursery space,
+        // so unclamped it also counts every dead word the mutator (or a host's unrooted BIF
+        // copy-out, which bumps the process heap and never rewinds) accumulated since the last
+        // collection — unbounded, and folded into `need_after` it is baked into the region's
+        // size, which the next fullsweep measures again: a capacity feedback. See the identical
+        // clamp, and its derivation, in [`crate::Collector::collect_major`] and the regression
+        // gate `tests/mature_capacity_feedback.rs`.
         let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
-        let young_occupancy = self
-            .nursery
-            .used_words()
-            .min(self.policy.young_target_words(live.words));
+        let young_capacity_after = self
+            .policy
+            .young_after_fullsweep(self.nursery.capacity_words(), live.words);
+        let young_occupancy = self.nursery.used_words().min(young_capacity_after);
         let target = self
             .policy
             .mature_after_fullsweep(capacity, live.words, young_occupancy);
