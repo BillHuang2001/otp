@@ -103,10 +103,17 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `Ok(Some(def))` = the host resolved it (`is_exported` is part of the answer) and `Ok(None)` = the
   family's typed `unsupported`; and `atoms`, the live atom
   namespace used by comparison AND by the raise path's `machine::catch::namespace_atom`), `RootSet`, `MinimalContext` (incl. its
-  `ContextHeap` — a pointer-stable region heap over `beam_alloc::ReservedHeap`: ~4 MiB is reserved up
-  front and **grown in place** as terms are built, so an allocation costs its payload only; on
-  reservation exhaustion a fresh, larger region starts and **every earlier region is kept alive**, so a
-  handed-out pointer stays valid and **unmoved** — `relocate` is deliberately never used. It does **not**
+  `ContextHeap` — a pointer-stable region heap (`regions: Vec<ReservedHeap>`, oldest first, the last one
+  is the allocation frontier) whose exact growth arithmetic is: `try_grow(n)` first (committed limit
+  raised **in place** to exactly `used + n`, no heuristic — `reserved_heap.rs:194-205`), else a fresh
+  region with `reserved = prev.reserved*2` floored at `HEAP_RESERVE_WORDS` (**4 MiB**) and raised to at
+  least `n`, and `committed = HEAP_COMMIT_WORDS` (**64 KiB**) raised to `n` and clamped to `reserved`
+  (`context.rs:1566-1577`). Regions are reserved from `beam_alloc` carriers (anonymous `mmap`), so a
+  reservation is address space only. **No region is ever freed, truncated, reset or reused before the
+  context is dropped** (`regions` only `push`es; `relocate` is deliberately never used), and there is
+  **no accessor** exposing region count / committed / used words and **no reclaim entry point** on
+  `MinimalContext` (`ContextHeap` is a private struct with private methods) — a host cannot measure or
+  release this arena; a fresh `MinimalContext` is the only way to start over. It does **not**
   override `alloc_words_rooted`, so it stays the test/embedding heap, not a collector; its
   `with_foreign_record_definitions`/`set_foreign_record_definitions` are the record-table hook behind
   `foreign_record_definition`, empty by default.)
