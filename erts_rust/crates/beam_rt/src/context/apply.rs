@@ -99,6 +99,9 @@ impl RuntimeContext<'_> {
     /// the blocking-aware local path (the runner's fun-entry arm) can keep the synchronous one
     /// for them.
     ///
+    /// The arity guard runs before the served-key decline, so a wrong argument count is
+    /// [`BeamError::BadArity`] whatever the descriptor names.
+    ///
     /// The served-key test costs the declining path two `O(1)` atom-table reads and one
     /// module-name comparison — no allocation, no registry or hash lookup — which is
     /// negligible beside the `FunT` search that resolved the descriptor (and beside the `Vec`
@@ -132,16 +135,17 @@ impl RuntimeContext<'_> {
         let (found, descriptor) = self
             .local_fun_descriptor(uniq, index)
             .ok_or(BeamError::BadArg)?;
-        // A named local reference to a **served** stub has no body to enter: decline it, so
-        // `apply_fun` dispatches it to the host instead of running the stub's
-        // `erlang:nif_error(undef)` (see the doc comment above). Tested **before** the argument
-        // vector is built, so a declined reference allocates nothing.
-        if served_local_key(&found, &descriptor).is_some() {
-            return Ok(None);
-        }
         let free = terms::fun_free(fun)?;
         if args.len() + free.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
+        }
+        // A named local reference to a **served** stub has no body to enter: decline it, so
+        // `apply_fun` dispatches it to the host instead of running the stub's
+        // `erlang:nif_error(undef)` (see the doc comment above). The arity guard runs first, so a
+        // mismatched call answers `BadArity` whether or not the key is served; tested **before**
+        // the argument vector is built, so a declined reference allocates nothing.
+        if served_local_key(&found, &descriptor).is_some() {
+            return Ok(None);
         }
         // Calling convention for a closure body (see `erts/emulator/beam/beam_common.c::call_fun`):
         // the call arguments occupy `x(0..arity)`, the captured free variables follow at
