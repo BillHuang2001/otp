@@ -46,9 +46,8 @@
 //! `values[field_order[i]]` ([`crate::access::native_record_declaration_order`]) —
 //! one linear pass, never an O(n²) key scan.
 //!
-//! The `is_exported` flag plays no part in either rendering (measured against the
-//! oracle: an exported and a non-exported record of the same definition print
-//! identically).
+//! `is_exported` never affects the rendered text: an exported record and a
+//! non-exported one print identically.
 //!
 //! # The two depth accountings
 //!
