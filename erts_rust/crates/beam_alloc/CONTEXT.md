@@ -279,22 +279,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
   only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
-- **Which figures a report carries:** `system_info({allocator,A})` ← `AllocatorInfo::from_stats`
-  (`stats.rs:529-546`): `blocks`/`bytes` are the **live** block bytes (block header + size-class-rounded
-  payload, never carrier slack), `carriers size` is `carrier_bytes` (mapped carriers, free blocks
-  included — the only *reserved* figure any row carries), and the four `mseg …` rows are the
-  process-global segment counters. `MsegStats::{cached, mapped_segments, mapped_bytes,
-  peak_mapped_bytes}` (the reuse cache's address space) exist in the snapshot but no report row pushes
-  them, and `push_policy`/`push_type` are not wired by `beam_rt`'s `allocator_report`.
-  `live_bytes` vs `carrier_bytes` is therefore the live-vs-resident split: under churn `carrier_bytes`
-  (and RSS) exceeds `live_bytes` by whole carriers, because a free unmaps a carrier only when its block
-  is the **last** live one (`allocator/core.rs:508-522`) and slab carriers are never released.
-- **Every `Heap`/`ReservedHeap` draws on `std_alloc`** (`registry.rs:74-77`), so its bytes land in
-  `std_alloc`'s *aggregate* `live_bytes`/`carrier_bytes` and in **no** per-type row; there is no
-  `max_footprint` cap by default (`allocator/config.rs:97`), so carriers grow unbounded. `erlang:memory(total)`
-  deliberately skips `std_alloc` (it assumes process heaps are already counted through `processes`;
-  `../../beam_rt/src/context/memory_hook.rs:164-171`), so a heap the runtime holds *outside* a process
-  (engine arena, BIF scratch, `-eval` chain, message fragments) is invisible there while still resident.
 - A `Heap` allocates through the **untyped** `Allocator::alloc` path (`alloc_bytes` → `alloc_impl(_, None)`),
   so per-type `TypeStats` rows do **not** attribute process heaps; read the aggregate counters
   (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
