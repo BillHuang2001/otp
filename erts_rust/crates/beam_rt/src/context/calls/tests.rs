@@ -1426,7 +1426,7 @@ thread_local! {
     /// The term the fixture BIF built on the pooled heap, so a test can assert the result came back
     /// **word-identical** (a copy would be a different address — and for a reference inside it, a
     /// different term).
-    static FIXTURE_BUILT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static FIXTURE_BUILT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// A registered BIF that allocates on the pooled heap and returns `{Ref}` — a container holding an
@@ -1455,14 +1455,18 @@ fn accumulator_result(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm
 /// to stay a unit test).
 const ACCUMULATOR_CELLS: i64 = 64;
 
-/// A fun term built on a scratch heap, used purely as a **reentrancy witness**: the dispatch
+/// A fun term built on the caller's `heap`, used purely as a **reentrancy witness**: the dispatch
 /// prologue's `reentrancy_capable` asks only whether some argument is a fun, which is what makes a
 /// real `lists:foldl/3` call reentrant. The raw atom indices are placeholders because nothing here
 /// applies the fun.
-fn reentrancy_witness() -> Eterm {
-    let mut heap = beam_alloc::Heap::new(16).expect("a scratch heap");
+///
+/// The heap is passed in rather than built here on purpose: [`beam_engine::terms::is_fun`] reads
+/// the term's header word, so the fun must still have a live region when the call runs (a heap
+/// dropped at this function's exit would leave the header read pointing at recycled memory and the
+/// call would look *non*-reentrant).
+fn reentrancy_witness(heap: &mut beam_alloc::Heap) -> Eterm {
     beam_codec::term::make_fun_external(
-        &mut heap,
+        heap,
         1,
         beam_term::Atom::from_raw(1),
         beam_term::Atom::from_raw(2),
@@ -1500,7 +1504,8 @@ fn fixture_runtime() -> crate::runtime::Runtime {
 #[test]
 fn a_table_less_reentrant_call_never_walks_its_result() {
     let mut rt = fixture_runtime();
-    let fun = reentrancy_witness();
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
     FIXTURE_BUILT.with(|c| c.set(0));
     let built = {
         let mut ctx = RuntimeContext::new(&mut rt);
@@ -1554,7 +1559,8 @@ fn rt_note(snapshot: &(usize, usize, usize)) -> bool {
 fn a_process_route_still_walks_its_result_and_still_declines_the_move() {
     let mut rt = fixture_runtime();
     let (mut table, pid) = process_table(&mut rt);
-    let fun = reentrancy_witness();
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
     FIXTURE_BUILT.with(|c| c.set(0));
     let built = {
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
@@ -1570,7 +1576,7 @@ fn a_process_route_still_walks_its_result_and_still_declines_the_move() {
         assert_eq!(
             notes::walk_snapshot().visits,
             2,
-            "the `{Ref}` container is two dereferenced objects: the tuple, then the reference block"
+            "the `{{Ref}}` container is two dereferenced objects: the tuple, then the reference block"
         );
         result.raw()
     };
@@ -1598,7 +1604,8 @@ fn a_process_route_still_walks_its_result_and_still_declines_the_move() {
 #[test]
 fn a_table_less_reentrant_accumulator_is_returned_unwalked() {
     let mut rt = fixture_runtime();
-    let fun = reentrancy_witness();
+    let mut witness = beam_alloc::Heap::new(16).expect("a scratch heap for the reentrancy witness");
+    let fun = reentrancy_witness(&mut witness);
     FIXTURE_BUILT.with(|c| c.set(0));
     let built = {
         let mut ctx = RuntimeContext::new(&mut rt);
@@ -1639,7 +1646,7 @@ fn a_table_less_reentrant_accumulator_is_returned_unwalked() {
 #[test]
 fn the_folded_visit_total_matches_the_per_visit_counter_on_every_exit() {
     let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
-    let mut list = NIL;
+    let mut list = beam_term::prelude::NIL;
     for index in (0..8i64).rev() {
         list = heap.cons(make_small(index), list).expect("a cell fits");
     }
@@ -1653,6 +1660,9 @@ fn the_folded_visit_total_matches_the_per_visit_counter_on_every_exit() {
         "the terminal exit folds the local counter exactly once"
     );
 
+    // The reference-header exit needs a **fresh** heap: `internal_reference` asserts the block is
+    // the heap's whole used prefix (it writes the header over `used_words_mut`).
+    let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
     let reference = internal_reference(&mut heap, 7);
     let tuple = heap.tuple(&[reference]).expect("the tuple fits");
     notes::reset();
