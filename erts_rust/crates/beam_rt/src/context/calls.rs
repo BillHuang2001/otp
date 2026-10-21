@@ -2120,6 +2120,8 @@ mod notes {
         static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static WALK_CALLS: Cell<usize> = const { Cell::new(0) };
         static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
+        static WALK_VISIT_FOLDS: Cell<usize> = const { Cell::new(0) };
+        static WALK_FOLDED_VISITS: Cell<usize> = const { Cell::new(0) };
         static WALK_HASH_INSERTS: Cell<usize> = const { Cell::new(0) };
         static WALK_SPILLS: Cell<usize> = const { Cell::new(0) };
         static ALIAS_COPIES: Cell<usize> = const { Cell::new(0) };
@@ -2179,6 +2181,27 @@ mod notes {
     /// Records one **dereferenced object** the reference walk visited.
     pub(super) fn note_walk_visit() {
         WALK_VISITS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records the walk's **single** per-invocation fold of its locally accumulated visit count —
+    /// the test-only counterpart of [`perf_counters::add_visits`], called from the same statement
+    /// so the two can never drift.
+    ///
+    /// `folds` counts the folds (one per finished walk), `visits` sums what they carried. A walk
+    /// that exits from one of its two early `break 'walk` sites therefore still folds exactly once,
+    /// which is what makes [`walk_fold_snapshot`]-vs-[`walk_snapshot`] an exactness pin rather than
+    /// a spot check: the folded total must equal the per-visit counter for every walk shape.
+    pub(super) fn note_walk_visit_fold(visits: usize) {
+        WALK_VISIT_FOLDS.with(|c| c.set(c.get() + 1));
+        WALK_FOLDED_VISITS.with(|c| c.set(c.get() + visits));
+    }
+
+    /// This thread's `(folds, folded visits)` — see [`note_walk_visit_fold`].
+    pub(super) fn walk_fold_snapshot() -> (usize, usize) {
+        (
+            WALK_VISIT_FOLDS.with(Cell::get),
+            WALK_FOLDED_VISITS.with(Cell::get),
+        )
     }
 
     /// This thread's count of **learned-hint** growths ([`note_hint_grow`]), i.e. of copies the
@@ -2263,6 +2286,8 @@ mod notes {
         EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
         WALK_CALLS.with(|c| c.set(0));
         WALK_VISITS.with(|c| c.set(0));
+        WALK_VISIT_FOLDS.with(|c| c.set(0));
+        WALK_FOLDED_VISITS.with(|c| c.set(0));
         WALK_HASH_INSERTS.with(|c| c.set(0));
         WALK_SPILLS.with(|c| c.set(0));
         ALIAS_COPIES.with(|c| c.set(0));
