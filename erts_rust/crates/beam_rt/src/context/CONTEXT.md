@@ -219,3 +219,34 @@ That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), th
 of the in-process `compile:file/2` route (A.9).
 The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
+## Host-memory retention on the table-less route — where the words actually accumulate
+An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
+false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route; the
+retention is a property of four runtime-level stores, and all four are grow-only.
+Per-mechanism detail is [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; this is the cross-store attribution.
+- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
+  deep-copied onto the store (`runtime.rs:2286-2295`: `grow_eval_heap` doubles the region and pushes
+  the replaced one onto `eval_heap_retired`, which is never freed).
+  The statement window that would reclaim a dead prefix is **pinned by the first nested run that
+  writes the store** (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), after which
+  `scratch::boundary` declines for the remainder of the expression — so a compile, which is one
+  `-eval` statement full of store-writing nested runs, only ever advances the store.
+- **`bif_heaps: Vec<Heap>`** — an unbounded push/pop pool with no cap, no eviction and no free
+  (`runtime.rs:2164-2174`); `take_bif_frontier` retires an *exhausted* region by pushing it back and
+  making the next one its doubled capacity (`calls.rs:160-181`).
+  A **reentrant** call on this route (`lists:foldl/3`, `lists:map/2`, `maps:map/2`) has
+  `safe_to_rewind == false` (`calls.rs:417`), hence `move_container == false` (`:934`): its
+  accumulator result is **not** copied out and `rewind` stays false, so that call's whole graph stays
+  owned by the region — which is what exhausts regions on a compile.
+  A retired region is kept rather than freed because **another caller still owns words in it**
+  (`calls.rs:177-179`), so its capacity is unreclaimable, not merely unreclaimed.
+- **`Runtime::arena`** — `heap_available`/`alloc_words` on a table-less context answer the arena
+  (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` (`runtime.rs:2180-2182`) → the
+  engine's `MinimalContext`, whose reserved regions are appended and never freed.
+- **Bounded, and therefore not the grower:** the nested-run `Machine` pool
+  (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32) and the wall-clock
+  `BLOCKING_PUMP_DEADLINE` (900 s). Neither holds a heap.
+**`Process::grow_nursery` is unreachable on this route.** `move_result_into_process_heap` returns at
+its first guard — `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`) — before
+`hint_grow_gate` (`:1494`) and before the growth block (`:1554-1568`), so only the **scheduled**
+(`for_process`) route ever grows a process nursery.
