@@ -57,14 +57,18 @@ Detail: `src/context/CONTEXT.md` (both indirections), `src/native/CONTEXT.md` (`
 | `-s Mod Func [Args…]` | apply `Mod:Func(a, b, …)` (arguments are **atoms**); result **discarded** |
 | `-run Mod Func [Args…]` | as `-s`, but arguments are plain **strings** (char lists) |
 | `-pa Dir` / `-pz Dir` | add `Dir` to the code path: `-pa` **heads** it (the group in reverse order), `-pz` **tails** it (behind the system `ebin`s), on **every** route |
-| `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number) |
+| `+S<n>[:<n>]` | normal scheduler count → `emulator.schedulers` (first number), the optional online half → `online_schedulers`; the `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio` sub-forms are validated and preserved verbatim (inert here) |
 | `-smp enable\|disable\|auto` | scheduler model, recorded as an init argument (M1 runs single-threaded) |
-| `+A N` / `+P N` | async-thread pool size → `emulator.extra_emulator_flags` verbatim; max process count → `emulator.max_processes` |
-| `+Q N` | max port count → `RuntimeConfig::max_ports`; `system_info(port_limit)` = `min(next_power_of_two(request), 134217727)`, default `65536` |
+| `+A<n>` / `+P<n>` | async-thread pool size → `emulator.extra_emulator_flags` verbatim; max process count → `emulator.max_processes` |
+| `+Q<n>` | max port count → `RuntimeConfig::max_ports`; `system_info(port_limit)` = `min(next_power_of_two(request), 134217727)`, default `65536` |
+| `+sbt<type>` | scheduler bind type, preserved verbatim (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`); an unknown type is the C's rejection |
+| `+K<true\|false>` | kernel-poll switch, preserved verbatim |
+| `-extra [token…]` | **ends the switch surface**: every remaining token is a **plain argument** (`RuntimeConfig::plain_args`), which `init:get_plain_arguments/0` answers; nothing after it is an init argument or a Start instruction |
 | `+hms`/`+hmbs`/`+hmax`/`+hmaxk\|el\|ib` | GC heap policy (`beam_gc::HeapPolicy`) rounded through the growth table; visible in `garbage_collection` |
 | `-name N` / `-sname N` | node name → `emulator.node_name`; **makes the runtime a distributed node** (A.5) |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | **the vertical slice**: run the file as a **scheduled process** via `Runtime::run_scheduled` (the full scheduler, so a blocking driver/port round trip is resumed by a later pass) and **print** the result (`~w~n`); bounded by `RUN_DEADLINE` |
 * **A `+`-switch with a value takes it attached or separated** (the C's `get_arg`): `+S1` ≡ `+S 1`, `+A0` ≡ `+A 0`, `+P65536` ≡ `+P 65536`, `+Q1024` ≡ `+Q 1024`, `+sbtu` ≡ `+sbt u`, and `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio` are the validated-but-inert percentage/dirty-scheduler sub-forms — [`src/cli/CONTEXT.md`](src/cli/CONTEXT.md) *The `+`-switch value rule*.
+* **The OTP `erlc` C front end drives this runtime unchanged**: `ERLC_EMULATOR=<beam_rt> erlc +deterministic -o <D> <src>` (argv `+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput -mode minimal -boot no_dot_erlang -s erl_compile compile_cmdline -extra …`) exits 0 and its artifact is **byte-identical** to the plain oracle `erlc`'s; the route needs the attached `+`-forms above and the `-extra` plain-argument list (`erl_compile:compile_cmdline/0` reads it).
 * **Every command-line flag is an init argument** (the source of `init:get_argument/1`) and an unmodeled switch is **data, not a usage error**; the full switch surface, the `run` action's `ARG` token kinds (`M1_GAPS.md` *CLI `run` argument tokens*) and the `ERL_AFLAGS`/`ERL_FLAGS`/`ERL_ZFLAGS` merge are [`src/cli/CONTEXT.md`](src/cli/CONTEXT.md)'s.
 ### The `-eval` route (`src/eval/`)
 `-eval` walks the Erlang **expression** subset `erl_eval`-style — arithmetic/comparison/**bit operators** dispatched to the **`beam_bifs` `erlang` registry**, binary segments accumulating a bit buffer — and anything outside the grammar is a **capability gap** (exit 3), per the grammar, quoted-atom and named-fun-form rules [`src/eval/CONTEXT.md`](src/eval/CONTEXT.md) states.
