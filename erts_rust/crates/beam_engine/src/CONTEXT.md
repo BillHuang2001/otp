@@ -219,17 +219,20 @@ allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: 
 (`raise_function_clause_args`/`pending_function_clause_args`) are **parked into the published root set**
 by `Machine::with_roots` for the duration of every hand-off and re-seated from their slots afterwards (a
 `with_roots` fast path hands over an unmodified `RootSet` when neither is armed), so a collecting host
-relocates them with no host-side change; the supplied-trace latches — `pending_supplied_trace`/
-`raise_supplied_trace` (`Option<StackTrace>`) and the raw-trace pair `pending_supplied_raw_trace`/
-`raise_supplied_raw_trace` (`bool`) — are metadata and need no rooting. `Machine::pending_exception`
+relocates them with no host-side change; the supplied-trace latches are metadata — `pending_supplied_trace`/
+`raise_supplied_trace` (`Option<StackTrace>`) — and need no rooting, and so are the two **term** latches
+`pending_supplied_term`/`raise_supplied_term` (`Option<Eterm>`): nothing allocates between `Instr::RawRaise`
+arming one (`Machine::raise_supplied`) and `Machine::throw_with_trace` promoting it, and the promotion's
+destination is either the handler's `x(2)` (inside the `RootSet`) or the uncaught funnel's rendering, which
+happens before any admission. `Machine::pending_exception`
 (`machine/catch.rs`) is the remaining engine-held live
 reason `Eterm`: it is rooted **host-side**, in the park window, by `beam_rt`'s `Registers::extra_roots`
 publication (read back through the write accessor `Machine::pending_exception_mut`), not by `with_roots`.
 The complete set of `Eterm`-typed `Machine` fields is `x`/`fr`/`stack` (the `RootSet`), `pending_exception`, `class_atoms: [Eterm; 3]`
-(atom **immediates** only — never a heap pointer, so no rooting needed), the two parked raise latches and
-`args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
+(atom **immediates** only — never a heap pointer, so no rooting needed), the two parked raise latches,
+`pending_supplied_term`/`raise_supplied_term` and `args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
 metadata or an `Arc<Module>` handle, so `current_code`, `raise_snapshot`, `entry_call`, the frame and
-catch-frame stacks and the supplied-trace latches carry no heap term. The other Rust-local vectors are
+catch-frame stacks and the symbolic supplied-trace latches carry no heap term. The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
 
 ## Execution position (`Machine::current_code`) — the complete store set

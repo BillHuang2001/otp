@@ -29,7 +29,9 @@ inhandler2() ->
 %% Cooked-catch-stacktrace oracle fixture (see ../stacktrace_frames.rs).
 %%
 %% Compiled with the system toolchain from a *neutral* directory:
-%% `env -C "$TMPDIR/fixgen" erlc +deterministic stacktrace_frames.erl`.
+%% `env -C "$TMPDIR/fixgen2" erlc +deterministic stacktrace_frames.erl`
+%% (so the `Line` chunk's file name is the bare `stacktrace_frames.erl`, never an
+%% absolute path).
 %%
 %% The three `try ... catch _C:_R:S -> S end` shapes that pin DEFECT 2 (a reported
 %% "duplicated top stacktrace frame" that does NOT reproduce — C's
@@ -53,13 +55,30 @@ inhandler2() ->
 %%   * `withcall/0` — `parent(ok)` returns, then the try body raises (`1 / 0`).
 %%                    The frame is named ONCE, at the raising `fdiv`; a stale
 %%                    slot would name it a second time at the returned-from call.
-%%   * `inhandler/0` — the try body's non-tail `g(0)` raises, the raise LANDS in
-%%                    this frame's catch handler, and the handler raises again.
-%%                    The landing consumes the slot, so the frame is named ONCE.
-%%   * `park/0` — `parent(ok)` returns, then the function parks in `receive`;
-%%                    `process_info(P, current_stacktrace)` names it ONCE.
+%%   * `inhandler2/0` — the try body's non-tail `g(0)` raises and LANDS in this
+%%                    frame's catch handler (consuming the frame's slot); the
+%%                    handler's OWN nested `try 1 / 0 catch _C:_R:S -> S end` then
+%%                    cooks `S` naming the frame exactly ONCE, at line 28. A stale
+%%                    slot would add a `g/1` frame.
 %%   * `folded/0` — `sys_core_fold` rewrites `catch C:R:S -> erlang:raise(C,R,S)`
 %%                    into the `raw_raise` instruction, which keeps the trace the
 %%                    re-raised exception already carried (C's `raw_raise` clears
 %%                    `EXF_SAVETRACE`, `beam_common.c:1148-1179`) — so `S` is the
 %%                    ORIGINAL raise chain, with no re-raise-site frame.
+%%   * `refold/0` — the same fold over a try whose body made a NON-TAIL `g(0)`
+%%                    call, so the re-raised exception's chain has two frames:
+%%                    `g/1` (the raising `fdiv`) then `refold/0` (its caller) — no
+%%                    re-raise-site frame, and never `refold/0` twice.
+%%
+%% Two shapes are present but NOT asserted:
+%%
+%%   * `inhandler/0` — its handler re-raises `1 / 0` and that raise leaves the
+%%                    module uncaught, so it reaches the harness as the fieldless
+%%                    `BeamError::BadArith`; a fieldless reason carries no symbolic
+%%                    frames by design (`beam_common::Raise`'s variants have no
+%%                    `StackTrace` slot), so there is nothing to compare. The
+%%                    landing clear it exercises is pinned instead by
+%%                    `inhandler2/0`, whose nested catch cooks an `S`.
+%%   * `park/0` — the test `ModuleHost` supplies no mailbox, so the `receive`
+%%                    reports `unsupported_opcode: receive_next` before the machine
+%%                    can park.

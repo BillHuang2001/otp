@@ -72,8 +72,7 @@
 //! | entry | Erlang | pinned frames |
 //! |---|---|---|
 //! | `withcall/0` | `parent(ok)`, then `try 1 / 0 catch _C:_R:S -> S end` | `[withcall/0 @16]` |
-//! | `inhandler/0` | `try g(0) catch _:_ -> 1 / 0 end` | `[inhandler/0 @19]` |
-//! | `park/0` | `parent(ok)`, then `receive _ -> ok end` | `[park/0 @21]` (`current_stacktrace`) |
+//! | `inhandler2/0` | `try g(0) catch _:_ -> try 1 / 0 catch _C:_R:S -> S end end` | `[inhandler2/0 @28]` |
 //! | `folded/0` | `try 1 / 0 catch C:R:S -> erlang:raise(C,R,S) end` (folded to `raw_raise`) | `[folded/0 @24]` |
 //! | `refold/0` | `try g(0) catch C:R:S -> erlang:raise(C,R,S) end` | `[g/1 @17, refold/0 @26]` |
 //!
@@ -83,6 +82,18 @@
 //! re-raised exception already carried (`beam_common.c:1148-1179`), so no
 //! re-raise-site frame is ever added — `refold/0` is the row whose frame *identity*
 //! moves when a trace is derived at the re-raise site instead.
+//!
+//! Two fixture entries are deliberately **not asserted**:
+//!
+//! * `inhandler/0` — `try g(0) catch _:_ -> 1 / 0 end` lets its handler's re-raise
+//!   leave the module uncaught, so it arrives as the fieldless `BeamError::BadArith`
+//!   (a plain `error:badarith`), and a fieldless reason carries no symbolic frames by
+//!   design (`beam_common::Raise`'s variants have no `StackTrace` slot). The landing
+//!   clear it exercises is pinned by `inhandler2/0`, whose nested catch cooks an `S`.
+//! * `park/0` — `parent(ok)`, then `receive _ -> ok end`: the test `ModuleHost`
+//!   supplies no mailbox, so the `receive` reports `unsupported_opcode: receive_next`
+//!   before the machine can park, and `process_info(P, current_stacktrace)` needs a
+//!   machine parked in a mailbox-backed receive.
 //!
 //! Every row above runs on **both** execution tiers — the interpreter and the native
 //! x86-64 baseline tier (whose `return`/`deallocate_return` bodies are the
@@ -681,18 +692,18 @@ fn withcall_names_the_returned_from_caller_once_at_the_raising_fdiv() {
 }
 
 #[test]
-#[ignore = "measured divergence: the handler's re-raise is an uncaught `error:badarith`, \
-            which leaves the machine as the fieldless `BeamError::BadArith` (not a \
-            `BeamError::Raise`), so the raise carries NO symbolic frames and the B1 \
-            landing clear is not observable on this shape until uncaught frames exist \
-            for fieldless reasons too"]
-fn inhandler_names_the_frame_once_after_the_raise_landed_in_it() {
-    // `inhandler/0`'s try body makes a **non-tail** `g(0)` call, whose `fdiv`
-    // raises; the raise lands in `inhandler/0`'s own catch handler, which then
-    // raises again. The landing consumes the frame's slot (the handler runs *in*
-    // that frame), so the second raise names `inhandler/0` ONCE — a stale slot
-    // would name it a second time at the call that raised.
-    assert_raise_row("inhandler", &[frame("inhandler", 0, 19)]);
+fn inhandler2_names_the_frame_once_after_the_raise_landed_in_it() {
+    // `inhandler2/0`'s try body makes a **non-tail** `g(0)` call, whose `fdiv`
+    // raises; the raise LANDS in `inhandler2/0`'s own catch handler (the handler runs
+    // *in* that frame), which consumes the frame's continuation slot. The handler's
+    // OWN nested raise is then caught by a second `try`, and the `S` it cooks names
+    // `inhandler2/0` exactly ONCE — at line 28, the nested raise — with no `g/1`
+    // frame: a stale slot would name `g/1` again at the call that raised.
+    //
+    // `inhandler/0` is the same shape with an uncaught handler raise, and stays
+    // unasserted: its reason is the fieldless `error:badarith`
+    // (`BeamError::BadArith`), and a fieldless reason carries no symbolic frames.
+    assert_cooked_row("inhandler2", &[frame("inhandler2", 0, 28)]);
 }
 
 #[test]
@@ -709,12 +720,6 @@ fn park_reports_one_frame_in_process_info_current_stacktrace() {
 }
 
 #[test]
-#[ignore = "measured divergence (TWO findings, both reported): (1) TIER DIVERGENCE — the \
-            interpreter yields `[folded/0 @24]` while the native baseline tier yields `[]` \
-            (an uncaught re-raise whose `fdiv` ran natively lands with an empty \
-            `raise_snapshot`); (2) even on the interpreter this shape does NOT discriminate \
-            B2, because the re-raise site and the original raise share line 24 — `refold/0` \
-            is the discriminating row"]
 fn folded_keeps_the_original_raise_chain_without_a_re_raise_site_frame() {
     // `folded/0` is `try 1 / 0 catch C:R:S -> erlang:raise(C, R, S) end`, which
     // `sys_core_fold` rewrites into the `raw_raise` instruction. C's `raw_raise`
@@ -725,10 +730,6 @@ fn folded_keeps_the_original_raise_chain_without_a_re_raise_site_frame() {
 }
 
 #[test]
-#[ignore = "measured divergence: the engine derives `[refold/0 @26]` (the `raw_raise` \
-            re-raise site) where the oracle preserves the ORIGINAL chain \
-            `[g/1 @17, refold/0 @26]` — B2's snapshot preservation does not take effect on \
-            this path, so the re-raise still looks re-derived"]
 fn refold_keeps_the_two_frame_chain_of_the_raise_it_re_raises() {
     // `refold/0` re-raises out of a try whose body made a **non-tail** `g(0)` call,
     // so the exception it re-raises carries a two-frame chain: `g/1` (the raising

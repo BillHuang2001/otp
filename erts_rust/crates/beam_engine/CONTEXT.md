@@ -146,10 +146,16 @@ Per-module `#[cfg(test)]` unit tests plus integration tests over committed real 
   `erl_eval`/`init` callers lie outside this engine's run) and skips **loudly** when no `erl` is on `PATH`.
   The shapes: the `t0/0`, `t2/0`, `t3/0` rows (each frame named exactly once, including the tail-call elision
   the oracle performs); `withcall/0` (a caller that already returned is named once, at the raising function);
-  `inhandler/0` (a raise landing in a frame's catch handler consumes that frame's slot, so the frame is named
-  once); `park/0` (`process_info/2`'s `current_stacktrace` names one frame); and `folded/0` + `refold/0`
-  (a supplied raw trace is preserved with no re-raise-site frame — `refold/0` is the row whose frame
-  *identity* moves if a trace is derived at the re-raise site).
+  `inhandler2/0` (a raise landing in the frame's own catch handler consumes that frame's slot, so the
+  handler's own nested caught `S` names the frame once — `[inhandler2/0 @28]`); `folded/0` + `refold/0`
+  (a supplied trace is preserved with no re-raise-site frame: `folded/0` → `[folded/0 @24]`, the ORIGINAL
+  raise site, and `refold/0` → `[g/1 @17, refold/0 @26]`, the row whose frame *identity* moves if a trace is
+  derived at the re-raise site).
+  Two entries are asserted by no row: `inhandler/0` (its handler's re-raise leaves the module uncaught as the
+  fieldless `error:badarith`, i.e. `BeamError::BadArith`, and a fieldless reason carries no symbolic frames —
+  a `beam_common` limitation) and `park/0` (`#[ignore]`d: the test `ModuleHost` supplies no mailbox, so the
+  `receive` reports `unsupported_opcode: receive_next` and `process_info/2`'s `current_stacktrace` is
+  unreachable).
 - Run everything through `scripts/cargo.sh` (`$HOME` is read-only in the sandbox); never `cd`, never touch `../tools/` or `../../erts/`. The project-level M1 **compatibility gate** is `../tools/differential/gate.sh` — run it for the live per-contract split and the ratchet exit code; this crate's tests are the engine-level evidence, the gate the project-level one.
 
 ## Measured / Execution coverage
@@ -170,7 +176,7 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
 - **A synthetic module's never-cached label map costs one `Arc` allocation per `run_*` entry**: **+16 % of the `engine_bench` `setup/empty` floor**, `0/10` paired rounds in its favour; a real module (load-time digest) never takes that route (`MEASURED.md`).
 - **A map `is_eq_exact` costs O(k log k) and two heap `Vec`s per comparison** (no map fast path in `eval_test`; `beam_term`'s `cmp_maps` collects and re-sorts both maps' pairs) -- detail: `src/families/maps/CONTEXT.md`.
 - **Small-int arithmetic (`+ - *`, `band`/`bor`/`bsr`) is inlined only by the native baseline tier**; the **interpreter has no arithmetic fast path** -- every `gc_bif` goes out through `exec_bif` -> `ExecutionContext::call_bif` -- detail: `src/interpreter/CONTEXT.md`.
-- **A captured stacktrace is engine-derived unless the raise supplied one** — a derived trace is cooked from the raise-time `raise_snapshot`, a supplied one (symbolic frames, or the raw trace of a re-raised exception) is preserved verbatim and no re-raise-site frame is prepended — **and nameable atoms are required** (`catch_end` needs `EXIT`; no path substitutes a *different* atom). Detail: the two bullets below, `src/families/exceptions/CONTEXT.md`.
+- **A captured stacktrace is engine-derived unless the raise supplied one** — a derived trace is cooked from the raise-time `raise_snapshot`, a supplied one (symbolic frames, or the trace term of a re-raised exception) is preserved verbatim and no re-raise-site frame is prepended — **and nameable atoms are required** (`catch_end` needs `EXIT`; no path substitutes a *different* atom). Detail: the two bullets below, `src/families/exceptions/CONTEXT.md`.
 - **The uncaught frames exist only for a `BeamError::Raise`** (`beam_common`'s reason variants are fieldless and carry no `StackTrace` slot).
 - **Records.** The whole native-record set executes; `PutRecord`'s create form works for the running module's own `Recs` and for a **foreign** `{Module,Name}` id through `foreign_record_definition` (exported definitions only, else the C's `error:{badrecord, Id}` raise), with the `Ok(None)` host keeping the typed `unsupported` and no `code:ensure_loaded/1` trap. Two divergences in that family are open: `is_record_accessible`'s wildcard arm compares the definition module against the `Scope` **operand** where `emu/ops.tab:1675` substitutes `$MODULE`, and `put_record`-update / `update_record_id` / `get_record_field` raise `function_clause` where the C's `$FAIL_HEAD_OR_BODY` `NO_FAIL` path raises `{badfield,…}`/`{badrecord,…}`. Detail: `src/families/records/CONTEXT.md`, `tests/gaps.rs`.
 - **Bitstrings.** `bs_init_writable` builds 0 bits over a capacity-carrying refc payload (the `x(0)` hint, else `DEFAULT_WRITABLE_SIZE = 1024`) registered writable **on the machine**; a **first-position** `private_append` appends **in place** and an outgrown payload **grows**, so the accumulator loop is amortised (64 KiB from a 1 KiB hint: 2 grows + 4 moves, 61 440 bytes copied -- `create/grow_tests.rs`); every other shape promotes to the byte-identical copy-rebuild.
@@ -197,20 +203,32 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
   (`Instr::Call`, `call_ext*`, the `Apply*`/`call_fun` arms, the baseline tier's `store_continuation`) are the
   slot's only arms.
   Detail: `src/machine/CONTEXT.md` §A frame's continuation slot is consumed by whoever follows it.
-- **A supplied trace is preserved verbatim; a derived trace is built from `raise_snapshot`.**
+- **A supplied trace is a TERM; a derived trace is built from `raise_snapshot`.**
   `sys_core_fold` rewrites `catch C:R:S -> erlang:raise(C,R,S)` into `Instr::RawRaise`, so the
-  `erlang:raise/3` BIF never runs: that arm arms the one-shot `pending_supplied_raw_trace` latch,
-  `Machine::throw_with_trace` promotes it to the live `raise_supplied_raw_trace` and **skips** the
-  `raise_snapshot` rebuild, so the snapshot of the raise being re-raised IS the supplied trace and no
-  re-raise-site frame is prepended.
-  `symbolic_stacktrace`, `Machine::snapshot_stacktrace` and `Machine::with_uncaught_frames` render that
-  preserved chain (C's `raw_raise` stores the supplied trace and clears `EXF_SAVETRACE`,
-  `erts/emulator/beam/beam_common.c:1148-1179`; `save_stacktrace` runs only with that flag, `:505-507`; and
-  `build_stacktrace` returns the stored trace, `:1219-1223`).
+  `erlang:raise/3` BIF never runs: that arm reads `x(2)` — an enclosing landing published the cooked
+  `[{M,F,A,Location}]` list of the exception being handled there — and when `x(2)` is `NIL` it cooks the
+  machine's preserved `raise_snapshot` chain **once** (rooted), then hands the result to
+  `Machine::raise_supplied`, whose one-shot `pending_supplied_term` latch `Machine::throw_with_trace`
+  promotes to the live `raise_supplied_term` and **skips** the `raise_snapshot` rebuild, so the chain of the
+  raise being re-raised survives and no re-raise-site frame is prepended.
+  A **landed** raise publishes that term as the handler's `x(2)` (C's register convention), so a re-raise
+  carries it onward; an **uncaught** one renders the preserved chain through
+  `Machine::with_uncaught_frames` (`Machine::snapshot_stacktrace`). `symbolic_stacktrace` returns an
+  already-cooked list found in the trace register verbatim (`is_list` — C's `is_raised_exc` arm,
+  `erts/emulator/beam/beam_common.c:1219-1223`), then falls back to supplied symbolic frames, then to the
+  snapshot (C's `raw_raise` stores the supplied trace and clears `EXF_SAVETRACE`, `:1148-1179`;
+  `save_stacktrace` runs only with that flag, `:505-507`).
   The explicit-symbolic-frames flavour (`erlang:raise/3` with a non-empty list) rides the parallel
   `pending_supplied_trace`/`raise_supplied_trace` pair and renders its own frames.
-  Both pairs are **metadata only** (`Option<StackTrace>`/`bool`, no rooting) and `Machine::reset` clears them.
+  The two `Option<StackTrace>` latches are metadata (no rooting); the two term latches need none either —
+  nothing allocates between arming one and publishing it, and `x(2)` is inside the frozen root set.
+  `Machine::reset` clears all four.
   Detail: `src/families/exceptions/CONTEXT.md`, `src/machine/CONTEXT.md`.
+- **Every tier decorates an uncaught raise.** The uniform funnel `Machine::with_uncaught_frames` runs on the
+  interpreter's `Machine::drive`, and the native baseline tier's three raise-carrying helpers
+  (`jit_family`, `jit_bitstr`, `jit_test`) run it **unconditionally** with the true `entry_module` (their
+  blocks never pass through `step_instruction`, so they are the one place a raise they report is decorated —
+  in the entry context and inside a cross-module callee alike). Detail: `src/jit/baseline/CONTEXT.md`.
 - **A supplied EMPTY trace is indistinguishable from "no trace supplied".**
   `beam_common::Raise` carries no supplied-trace flag, so `erlang:raise(error, boom, [])` is the same value as
   a raise with no trace and cooks the derived `raise_snapshot` chain where the oracle keeps `[]` (C's
