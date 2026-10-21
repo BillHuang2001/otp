@@ -251,6 +251,8 @@ Two decisive controls:
 - **`+hmax 1000000`** (which caps `term_heap_words`, hence every `Heap::new(heap_words)` site) on the same
   source and route: peak `std_live` 3.81 GB → **104 MB**, peak RSS 289 MB → **147 MB**, and still
   `{ok,cerl_clauses}` (`inet_parse` at that cap answers `error`, so the cap is workload-dependent).
+  Its RSS saving is entirely the eval store's fill that the smaller region avoids — the boot floor is
+  flag-invariant (see *Host memory: the touched pages*).
 - **Two compiles in one runtime**: `std_live` stays **3.83 GB**, not 7.6 GB — the pool is a
   **high-water mark reused across compiles**, not a per-compile leak; it is released only when the
   `Runtime` drops (or the pool is bounded, which it is not).
