@@ -292,6 +292,13 @@ const DEFAULT_MAPS: usize = 200_000;
 /// How many atoms the fixture table holds — the compiler's atom-key range.
 const N_ATOMS: usize = 512;
 
+/// The entry count of the separate large-map case (well inside the hash branch, where
+/// the per-insertion scan has the longest run to walk).
+const LARGE_N: usize = 1_000;
+
+/// The iteration count clamped for the large-map case (its per-map cost is milliseconds).
+const LARGE_MAX_ROUNDS: usize = 400;
+
 /// A deterministic xorshift64 generator, so the corpus is identical on every run.
 struct Rng(u64);
 
@@ -546,6 +553,35 @@ fn main() {
         fmt_ratio(total_live.ns_per_map(), total_old.ns_per_map()),
         fmt_ratio(total_old.ns_per_map(), total_live.ns_per_map()),
     );
+
+    // The large hash-map case, timed separately: a 1000-key map costs milliseconds, so it
+    // runs a much smaller iteration count than the corpus budget above (the count used is
+    // printed, and the row is therefore *not* comparable to the `ALL` row).
+    let large = Bucket {
+        label: "1000*",
+        maps: vec![make_map(&mut Rng(0x9E37_79B9_7F4A_7C15), LARGE_N)],
+    };
+    let large_rounds = (rounds_maps / 500).clamp(20, LARGE_MAX_ROUNDS);
+    let t0 = Instant::now();
+    let (live, old) = bench_bucket(&large, large_rounds, &atoms);
+    let wall = t0.elapsed();
+    println!(
+        "{:>8}  {:>8}  {:>12.3}  {:>15.3}  {:>13}  {:>13}",
+        large.label,
+        live.maps,
+        live.ns_per_map(),
+        old.ns_per_map(),
+        fmt_ratio(live.ns_per_map(), old.ns_per_map()),
+        fmt_ratio(old.ns_per_map(), live.ns_per_map()),
+    );
+    println!(
+        "  * {LARGE_N}-entry map, {} maps per side (a map that large costs ~{:.1} ms, so its \
+         count is clamped to {LARGE_MAX_ROUNDS}); wall {:?}",
+        live.maps,
+        live.ns_per_map() / 1.0e6,
+        wall
+    );
+
     for (label, took) in &timings {
         println!("  side bucket {label}: wall {:?}", took);
     }
