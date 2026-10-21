@@ -8978,3 +8978,162 @@ fn a_recycled_machine_owns_no_off_heap_payload() {
          `machine_pool::release` enforce the same rule on the release itself"
     );
 }
+/// **A recursive nested run of the *same* callee gets its own machine, and both find their way
+/// home into that callee's slot.**
+///
+/// The pool is a stack **per callee**: an `acquire` takes the machine out, so a second acquire
+/// of the same image — exactly what a nested run of `a` that reaches `a` again does — has
+/// nothing to pop and builds; both releases then land in the same slot. A pool that handed the
+/// same machine to two live runs (or kept a single machine per callee) would show a recycled
+/// machine in flight twice, which the fresh-count and depth pins below rule out.
+#[test]
+fn a_recursive_entry_of_the_same_callee_gets_its_own_machine() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    let image = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    let key = pool_key(&image);
+    machine_pool::clear();
+    // Two runs of the same callee in flight at once: an outer run that has not returned when
+    // the inner one starts.
+    let outer = machine_pool::acquire(&image);
+    assert_eq!(machine_pool::pooled_depth(key), 0, "the outer machine is out of the pool");
+    let inner = machine_pool::acquire(&image);
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        2,
+        "the slot was empty both times, so each in-flight run built its own machine"
+    );
+    assert_eq!(
+        machine_pool::pooled_len(),
+        0,
+        "no machine in the pool while both runs are live"
+    );
+    drop((outer, inner));
+    {
+        // Release both, inner first — the order a recursive round trip unwinds in.
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.run_export(&image, "loop", 2, &[make_small(4), make_small(0)])
+            .expect("gc_ints:loop(4, 0)");
+    }
+    assert_eq!(
+        machine_pool::pooled_depth(key),
+        1,
+        "the finished run's machine is idle in its own callee's slot"
+    );
+    let machines = {
+        // A second in-flight pair over the same callee, then both released: the slot must stack
+        // them rather than lose one.
+        let a = machine_pool::acquire(&image);
+        let b = if machine_pool::pooled_depth(key) > 0 {
+            machine_pool::acquire(&image)
+        } else {
+            machine_pool::acquire(&image)
+        };
+        machine_pool::release(a, &image);
+        machine_pool::release(b, &image);
+        machine_pool::pooled_depth(key)
+    };
+    assert_eq!(
+        machines, 2,
+        "the per-callee stack holds one idle machine per recursion depth, so a later recursive \
+         entry is served instead of built"
+    );
+    assert_eq!(
+        machine_pool::pooled_slots(),
+        1,
+        "one callee, one slot, whatever its depth"
+    );
+}
+/// **A callee's slot stacks idle machines up to the depth cap and then gives up its oldest
+/// one**, so a pathologically deep recursion cannot grow the pool without bound.
+///
+/// Each acquire of one callee with nothing pooled builds a machine, so a batch of acquires
+/// without releases is a measured nesting depth. Releasing them all must leave the slot at the
+/// cap — proofs that the stack really is per callee (nothing spilled into a second slot) and
+/// that the cap is enforced by dropping an *idle* machine.
+#[test]
+fn one_callee_s_slot_is_capped_in_depth() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    let image = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    let key = pool_key(&image);
+    machine_pool::clear();
+    let machines: Vec<_> = (0..40).map(|_| machine_pool::acquire(&image)).collect();
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        40,
+        "forty concurrent entries into one callee need forty machines"
+    );
+    assert_eq!(machine_pool::pooled_len(), 0, "all forty are in flight");
+    for machine in machines {
+        machine_pool::release(machine, &image);
+    }
+    let depth = machine_pool::pooled_depth(key);
+    assert!(depth < 40, "the slot is capped, not unbounded: depth {depth}");
+    assert!(depth > 1, "…and it does keep a stack, not a single machine: depth {depth}");
+    assert_eq!(
+        machine_pool::pooled_slots(),
+        1,
+        "all of them stayed in the one callee's slot"
+    );
+    assert_eq!(
+        machine_pool::pooled_len(),
+        depth,
+        "a dropped idle machine is subtracted from the table's total, not just from the slot"
+    );
+}
+/// **Two callees get two slots, and each slot serves only its own callee** — the shape pin for
+/// the slot table itself (the old pool was one stack keyed by a per-machine tag, so it could
+/// hold either callee's machine but not address one without a linear scan).
+#[test]
+fn each_callee_gets_its_own_slot() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let ints = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("the fixture is cached under its own name");
+    let floats = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("the fixture is cached under its own name");
+    machine_pool::clear();
+    machine_pool::release(machine_pool::acquire(&ints), &ints);
+    machine_pool::release(machine_pool::acquire(&floats), &floats);
+    assert_eq!(
+        machine_pool::pooled_slots(),
+        2,
+        "one slot per callee image"
+    );
+    assert_eq!(machine_pool::pooled_depth(pool_key(&ints)), 1);
+    assert_eq!(machine_pool::pooled_depth(pool_key(&floats)), 1);
+    assert_eq!(
+        machine_pool::fresh_builds(),
+        2,
+        "the second callee's slot was empty, so its machine was built"
+    );
+    // Each callee's own slot answers its next entry without building.
+    let ints_again = machine_pool::acquire(&ints);
+    assert_eq!(machine_pool::fresh_builds(), 2, "ints' slot served it");
+    assert_eq!(machine_pool::pooled_depth(pool_key(&ints)), 0);
+    assert_eq!(
+        machine_pool::pooled_depth(pool_key(&floats)),
+        1,
+        "…without touching the other callee's stack"
+    );
+    machine_pool::release(ints_again, &ints);
+    assert_eq!(machine_pool::pooled_depth(pool_key(&ints)), 1);
+    // A recycled machine still owns nothing off-heap, whatever its slot.
+    assert_eq!(machine_pool::pooled_reservoir_owners(), 0);
+}
