@@ -107,14 +107,15 @@ pub(crate) extern "C" fn jit_family(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // term construction and every error landing are the family's, unchanged.
         match crate::families::dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) {
             Ok(step) => Ok(step),
-            // The uniform raise funnel's context-`0` half, exactly as
-            // `Machine::step_instruction` runs it: in context `0` the active module IS the
-            // entry module, so a propagating raise is decorated here; a non-zero context
-            // is left to the driver, which knows the true entry module.
-            Err(err) if machine.current_context() == 0 => {
-                Err(machine.with_uncaught_frames(err, Some(module), func, pc))
-            }
-            Err(err) => Err(err),
+            // The uniform raise funnel, exactly as `Machine::drive` runs it: the blocks
+            // this helper is called from never pass through `step_instruction`, so this
+            // IS the one place a family raise is decorated — for a raise in the run's
+            // entry context (`0`, where the active module is the entry module) and for
+            // one inside a cross-module callee alike. `func`/`pc` are the raising
+            // instruction's address in the **active** module, and `entry_module` is what
+            // every context-`0` frame is named against, so this names the frames the
+            // same way the driver does for a deopted step.
+            Err(err) => Err(machine.with_uncaught_frames(err, Some(entry_module), func, pc)),
         }
     };
     match outcome {

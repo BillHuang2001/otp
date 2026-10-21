@@ -328,7 +328,7 @@ pub(crate) fn exec(
             // construction (the rebuild is skipped), so the supplied frames must still
             // reach `symbolic_stacktrace` — the one place that consumes them — even
             // when the raw trace is `NIL` and the snapshot is empty.
-            let supplied = machine.raise_supplied_raw_trace || machine.has_raise_supplied_trace();
+            let supplied = machine.has_raise_supplied_trace();
             // An `undef` raised by an unresolvable `call_ext*`/`apply` target carries
             // a synthesized **callee head item** as its raw trace (see
             // [`callee`]): C's innermost `build_stacktrace` item, the callee named
@@ -365,8 +365,23 @@ pub(crate) fn exec(
                     // C's `raw_raise` stores the supplied trace in `c_p->ftrace` and
                     // clears `EXF_SAVETRACE` (`beam_common.c:1148-1179`), so nothing is
                     // derived at this site: the raise keeps the trace it arrived with.
-                    machine.pending_supplied_raw_trace = true;
-                    machine.throw_with_trace(class, value, trace).map(Some)
+                    //
+                    // The engine's landed trace is a **term**: an enclosing landing
+                    // published the cooked `[{M,F,A,Location}]` list of the exception
+                    // being handled in `x(2)` (`Machine::land_exception`), and `try_case`
+                    // leaves `x(2)` untouched (`emu/instrs.tab:1221` only moves `x(3)`
+                    // into `x(0)`), so that list is read straight back here. When `x(2)`
+                    // holds no term the chain is the machine's live
+                    // [`Machine::raise_snapshot`] — the frames of the raise being
+                    // re-raised, C's `c_p->ftrace` — cooked **once** (rooted) into the
+                    // term the raise then supplies, so no re-raise-site frame is ever
+                    // derived.
+                    let supplied = if is_nil(trace) {
+                        symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?
+                    } else {
+                        trace
+                    };
+                    machine.raise_supplied(class, value, supplied).map(Some)
                 }
                 None => {
                     // C: an unknown class is not an error — `raw_raise` returns 1,

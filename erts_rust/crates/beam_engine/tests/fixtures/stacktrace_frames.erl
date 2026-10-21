@@ -1,5 +1,5 @@
 -module(stacktrace_frames).
--export([t0/0, t2/0, t3/0, withcall/0, inhandler/0, park/0, folded/0, refold/0]).
+-export([t0/0, t2/0, t3/0, withcall/0, inhandler/0, inhandler2/0, park/0, folded/0, refold/0]).
 t0() -> try f() catch _C:_R:S -> S end.
 f() -> erlang:error(boom).
 
@@ -24,6 +24,8 @@ folded() ->
     try 1 / 0 catch C:R:S -> erlang:raise(C, R, S) end.
 refold() ->
     try g(0) catch C:R:S -> erlang:raise(C, R, S) end.
+inhandler2() ->
+    try g(0) catch _:_ -> try 1 / 0 catch _C:_R:S -> S end end.
 %% Cooked-catch-stacktrace oracle fixture (see ../stacktrace_frames.rs).
 %%
 %% Compiled with the system toolchain from a *neutral* directory:
