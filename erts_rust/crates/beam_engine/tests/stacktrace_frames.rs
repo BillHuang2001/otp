@@ -289,6 +289,7 @@ fn cooked_frames_on_tier(host: &mut ModuleHost, function: &str, tier: Tier) -> V
 /// The frames of the uncaught raise `MODULE:function/0` propagates on `tier`.
 fn raise_frames_on_tier(host: &mut ModuleHost, function: &str, tier: Tier) -> Vec<Frame> {
     let (machine, outcome) = run_on_tier(host, function, tier);
+    let rendered = format!("{outcome:?}");
     let err = match outcome {
         Ok(outcome) => panic!("{MODULE}:{function}/0 must propagate its raise on {tier:?}, got {outcome:?}"),
         Err(err) => err,
@@ -296,7 +297,7 @@ fn raise_frames_on_tier(host: &mut ModuleHost, function: &str, tier: Tier) -> Ve
     drop(machine);
     let raise = err
         .into_raise()
-        .unwrap_or_else(|| panic!("{function}/0 must raise, not fail its capability"));
+        .unwrap_or_else(|| panic!("{function}/0 must raise, not fail its capability ({rendered})"));
     raise_frames(&raise)
 }
 
