@@ -125,6 +125,8 @@ Every gate above declines rather than guessing, so the residual of a declined co
 never a dangling pointer.
 The measured envelopes and their narratives live in [`../../../M1_GAPS_GC.md`](../../../M1_GAPS_GC.md).
 
+* **On the in-process compile path the walk costs ~30× the collector.** `perf record` over a `string.erl` compile puts the reachability descent this node runs before a collection or prune at `gc_walk::Visited::insert` 1.65 % + `Walk::seed` 0.25 % + `Walk::run` 0.12 % ≈ **2 %** of cycles, against the copier's **0.06 %** — so a future collection-path optimization here belongs to the walk's bookkeeping, not the copy loop. The valve is not negotiable for that reason: it is the arena fallback's soundness gate, and its only lever is its own gate order (`word_is_scanned`'s tier-one current-block test answers nearly every live root before the aggregate or exact tests).
+
 * **The float guard lives on the narrow door alone; the full doors are FR-safe.** `ensure_heap_full` publishes each register file up to its pointer-bearing prefix and the whole stack, so a live float register relocates like any other root; the **narrow** `ensure_heap` (x prefix + stack only) keeps its `module_uses_floats` guard but is not on the engine's path today, and every door refuses a run with **no** caller module (a fun entry, the `-eval` evaluator) rather than guess one.
   Bound and door short-circuits: [`IMPLEMENTATION.md`](../IMPLEMENTATION.md#the-pointer-bearing-prefix-bound-of-the-full-root-doors).
 
