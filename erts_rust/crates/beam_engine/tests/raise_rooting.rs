@@ -865,10 +865,10 @@ fn a_moved_failed_clause_argument_list_survives_the_cooked_trace_reservation() {
     );
 
     // The decisive witness: at the cooked-trace reservation the engine parked the
-    // armed latch as one extra stack word, and that word's **pre-move** address lies
-    // in the region the collection then vacated — while the cooked argument tuple
-    // does not. So the engine re-seated the latch from the slot the host wrote the
-    // relocated word back through.
+    // armed latch (and the pending exception's reason) as extra stack words, and the
+    // latch word's **pre-move** address lies in the region the collection then
+    // vacated — while the cooked argument tuple does not. So the engine re-seated the
+    // latch from the slot the host wrote the relocated word back through.
     assert_eq!(ctx.stack_seen.len(), RAISER_RESERVES);
     assert_eq!(
         ctx.stack_seen[0].len(),
@@ -882,10 +882,13 @@ fn a_moved_failed_clause_argument_list_survives_the_cooked_trace_reservation() {
     );
     assert_eq!(
         ctx.stack_seen[2].len(),
-        3,
-        "the armed latch is parked as one extra stack word for the cooked-trace hand-off"
+        4,
+        "the armed latch AND the landed exception's reason are parked as extra stack \
+         words for the cooked-trace hand-off"
     );
-    let pre_move_latch = *ctx.stack_seen[2].last().expect("the parked latch word");
+    // Parking order is `raise_function_clause_args`, `pending_function_clause_args`,
+    // then the pending exception's reason, so slot 2 of the tail is the latch.
+    let pre_move_latch = ctx.stack_seen[2][2];
     assert!(
         !ctx.points_into_current_region(pre_move_latch),
         "the latch's pre-move address is in the region the collection vacated — a \
@@ -899,8 +902,8 @@ fn a_moved_failed_clause_argument_list_survives_the_cooked_trace_reservation() {
 
 /// The **fast path**: a run with no armed latch hands over an *unmodified* root set.
 ///
-/// The contrast is inside one assertion pair — the same live-frame shape, one extra
-/// stack word **iff** a latch is armed — so the parking cannot fire on a latch-free
+/// The contrast is inside one assertion pair — the same live-frame shape, two extra
+/// stack words **iff** a raise is armed — so the parking cannot fire on a latch-free
 /// run and the pre-parking behaviour is byte-identical.
 #[test]
 fn the_latch_free_run_hands_over_an_unmodified_root_set() {
@@ -922,7 +925,8 @@ fn the_latch_free_run_hands_over_an_unmodified_root_set() {
     assert_eq!(machine.stack_depth(), 0, "the frame is popped by `deallocate 2`");
 
     // The contrast: the SAME frame shape on a run whose raise armed a latch hands
-    // over one extra word at the cooked-trace reservation and none before it.
+    // over the two parked words (the latch and the landed reason) at the cooked-trace
+    // reservation and none before it.
     let raiser = raising_module();
     let (mut ctx2, seen2) = StackRecorder::new();
     let mut machine2 = Machine::new();
@@ -932,8 +936,8 @@ fn the_latch_free_run_hands_over_an_unmodified_root_set() {
     assert_eq!(seen2.calls, RAISER_RESERVES);
     assert_eq!(
         seen2.stack.last().expect("the cooked-trace reservation").len(),
-        3,
-        "an armed latch adds exactly one parked word — the signal the fast path omits"
+        4,
+        "the armed latch and the pending reason add two parked words — the signal the fast path omits"
     );
 }
 
@@ -964,13 +968,13 @@ fn a_repeat_run_re_parks_the_latch_and_restores_the_stack() {
     assert_eq!(machine.stack_depth(), 0, "the second run restored the stack");
     assert_canonical_trace(second, &fixtures);
 
-    // Both runs parked exactly one word, and only at the cooked-trace hand-off.
+    // Both runs parked exactly two words, and only at the cooked-trace hand-off.
     let seen = seen.borrow();
     assert_eq!(seen.calls, 2 * RAISER_RESERVES, "one reservation set per run");
     for base in [0, RAISER_RESERVES] {
         assert_eq!(seen.stack[base].len(), 2);
         assert_eq!(seen.stack[base + 1].len(), 2);
-        assert_eq!(seen.stack[base + 2].len(), 3, "the parked latch");
+        assert_eq!(seen.stack[base + 2].len(), 4, "the parked latch and reason");
     }
 }
 

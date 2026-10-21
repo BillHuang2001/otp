@@ -176,8 +176,8 @@ as `&self` (`refc_binaries()` `:1114`, `off_heap_overhead_bytes()` `machine/offh
 `&mut Machine`. `retain_refc_binaries` (`machine/offheap.rs:126`) takes `&mut self`, so it also cannot run
 while a `RootSet` built from `&mut self.x`/`stack`/`fr` is alive — a prune hosted at a door needs a
 field-level split (the three register files and `refc_binaries`/`writable_payloads` are disjoint fields,
-`mod.rs:105/113/146/349/384`) behind a new closure shape, and must keep `with_roots`' raise-latch parking
-(`mod.rs:659-688`). The engine cannot derive the predicate itself: it does not depend on `beam_gc`
+`mod.rs:105/113/146/349/384`) behind a new closure shape, and must keep `with_roots`' loose-heap-term parking
+(`Machine::loose_heap_terms`, `machine/mod.rs`). The engine cannot derive the predicate itself: it does not depend on `beam_gc`
 (`Cargo.toml:8-13`). An in-slice prune is also unsound for the accumulator **in flight** — the roots do not
 name a `bs_init_writable` payload until its term is written back, while `retain_refc_binaries` prunes the
 writable registry in lockstep (`offheap.rs:138-142`).
@@ -215,22 +215,24 @@ allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: 
 `x(arity)`/the operand and re-collect `args` after the seam call and before `fun_free`, never to
 "publish" (there is no door to publish through).
 
-**Engine-held live terms and the published root set.** The two heap-term raise latches
-(`raise_function_clause_args`/`pending_function_clause_args`) are **parked into the published root set**
-by `Machine::with_roots` for the duration of every hand-off and re-seated from their slots afterwards (a
-`with_roots` fast path hands over an unmodified `RootSet` when neither is armed), so a collecting host
-relocates them with no host-side change; the supplied-trace latches are metadata — `pending_supplied_trace`/
-`raise_supplied_trace` (`Option<StackTrace>`) — and need no rooting, and so are the two **term** latches
-`pending_supplied_term`/`raise_supplied_term` (`Option<Eterm>`): nothing allocates between `Instr::RawRaise`
-arming one (`Machine::raise_supplied`) and `Machine::throw_with_trace` promoting it, and the promotion's
-destination is either the handler's `x(2)` (inside the `RootSet`) or the uncaught funnel's rendering, which
-happens before any admission. `Machine::pending_exception`
-(`machine/catch.rs`) is the remaining engine-held live
-reason `Eterm`: it is rooted **host-side**, in the park window, by `beam_rt`'s `Registers::extra_roots`
-publication (read back through the write accessor `Machine::pending_exception_mut`), not by `with_roots`.
-The complete set of `Eterm`-typed `Machine` fields is `x`/`fr`/`stack` (the `RootSet`), `pending_exception`, `class_atoms: [Eterm; 3]`
-(atom **immediates** only — never a heap pointer, so no rooting needed), the two parked raise latches,
-`pending_supplied_term`/`raise_supplied_term` and `args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
+**Engine-held live terms and the published root set.** The machine's loose heap terms
+(`Machine::loose_heap_terms`) are **parked into the published root set** by `Machine::with_roots` for the
+duration of every hand-off and re-seated from their slots afterwards (a `with_roots` fast path hands over an
+unmodified `RootSet` when none is armed), so a collecting host relocates them with no host-side change.
+The parked set is the two failed-clause argument latches
+(`raise_function_clause_args`/`pending_function_clause_args`) **and the pending exception's reason**
+(`Machine::pending_exception`, `machine/catch.rs`) — the field the engine does not clear at landing, so it stays
+readable for the rest of the run and is a live root at every door by construction.
+`beam_rt`'s park publication of that reason through `Registers::extra_roots` (read back through
+`Machine::pending_exception_mut`) is therefore reading an already-relocated word, not supplying the relocation.
+The supplied-trace latches are metadata — `pending_supplied_trace`/`raise_supplied_trace` (`Option<StackTrace>`) —
+and need no rooting, and so are the two **term** latches `pending_supplied_term`/`raise_supplied_term`
+(`Option<Eterm>`): nothing allocates between `Instr::RawRaise` arming one (`Machine::raise_supplied`) and
+`Machine::throw_with_trace` promoting it, and the promotion's destination is either the handler's `x(2)` (inside
+the `RootSet`) or the uncaught funnel's rendering, which happens before any admission.
+The complete set of `Eterm`-typed `Machine` fields is `x`/`fr`/`stack` (the `RootSet`), the three parked loose
+terms above, `class_atoms: [Eterm; 3]`
+(atom **immediates** only — never a heap pointer, so no rooting needed) and `args_scratch` (empty outside a dispatch). Everything else on the machine is `u32`/`bool`/`usize`
 metadata or an `Arc<Module>` handle, so `current_code`, `raise_snapshot`, `entry_call`, the frame and
 catch-frame stacks and the symbolic supplied-trace latches carry no heap term. The other Rust-local vectors are
 recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.

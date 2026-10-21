@@ -65,23 +65,29 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   the raise takes: a **landed** raise publishes it as the handler's `x(2)`
   (`Machine::land_exception`'s `supplied_term` argument, C's register convention), an **uncaught** one renders
   the preserved chain in `Machine::with_uncaught_frames`.
-  **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`) PARKS the
-  two armed heap-term latches** — `raise_function_clause_args` then `pending_function_clause_args` — onto the
-  tail of `self.stack` for the duration of the hand-off, hands over the `RootSet`, then **re-seats** each
-  field from its slot (`self.stack.get(cursor).copied()` — the stack is rooted in full, so a conforming host
-  relocates the parked word and the engine reads the *moved* term back), and finally `stack.truncate(base)`.
-  With both latches `None` the `RootSet` is handed over **unmodified** (byte-identical fast path). The
-  supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
+  **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`, hence behind
+  every term-allocation and heap-admission door on every tier) PARKS the machine's loose heap terms**
+  (`Machine::loose_heap_terms`, in this order: `raise_function_clause_args`, `pending_function_clause_args`,
+  then `pending_exception`'s reason) **onto the tail of `self.stack`** for the duration of the hand-off, hands
+  over the `RootSet`, then **re-seats** each field from its slot (`self.stack.get(cursor).copied()` — the stack
+  is rooted in full, so a conforming host relocates the parked word and the engine reads the *moved* term back),
+  and finally `stack.truncate(base)`.
+  With every loose term `None` the `RootSet` is handed over **unmodified** (byte-identical fast path).
+  A `None` read-back leaves its field untouched rather than clearing it (a host would have to move a slot out of
+  the `&mut [Eterm]` it was handed to produce one).
+  The source of truth for the parked set is the pair `Machine::loose_heap_terms`/`Machine::seat_loose_heap_terms`
+  plus the parking loop `Machine::with_parked_loose_terms`, so a future loose field is added in exactly one place.
+  The supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
   need no rooting either — nothing allocates between `raise_supplied` arming one and `throw_with_trace`
   promoting it, and the promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
-  **`Machine::pending_exception` is NOT parked here, and nothing else relocates it.** Its reason `Eterm` is a
-  *copy* of the word `land_exception` publishes in `x(1)` (the register is a root and moves; the field does
-  not), so after **any** collection in the run that follows a landing the field names the pre-move term.
-  The two readers: `beam_rt`'s park publication filters it through `is_live_relocatable_root` (a
-  scanned-**region** test, not a liveness proof) before putting it in `Registers::extra_roots`, and the
-  in-crate `families::bitstrings::raw::payload_aliased_elsewhere` reads it **unguarded** and dereferences a
-  boxed word's header. Parking it here is the shape that would make the field always relocatable; it also
-  keeps the reason alive for the rest of the run, where C clears `fvalue` at landing (`beam_common.c:527`).
+  **`Machine::pending_exception` IS parked**, so its reason is a live root at every door: a word a host reads from
+  the field has already been relocated by every collection that preceded the read, which is what makes `beam_rt`'s
+  park publication (`Registers::extra_roots`, read back through `Machine::pending_exception_mut`) and the in-crate
+  `families::bitstrings::raw::payload_aliased_elsewhere` read safe by construction.
+  The pair is **retained past landing** (C clears `c_p->fvalue` in `handle_error`,
+  `../../erts/emulator/beam/beam_common.c:527`), which is sound precisely because the reason stays rooted here —
+  C roots `fvalue`/`ftrace` for the window they exist (`setup_rootset`/`offset_rootset`,
+  `../../erts/emulator/beam/erl_gc.c:2676-2693`, `:3513-3514`).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
   (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
   `Machine::set_continuation` write), `Machine::ensure_heap`
