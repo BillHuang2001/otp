@@ -67,6 +67,10 @@
 //! after every run), and an **oracle** cross-check of the `A` slot against the real
 //! ERTS (which skips loudly when no `erl`/`erlc` is on `PATH`).
 //!
+//! A fifth case pins the same parking protocol for the **other** machine-held heap
+//! term a raise leaves behind: [`Machine::pending_exception`]'s reason, which the host
+//! dereferences long after the raise (`pending_exception_reason_survives_a_collection`).
+//!
 //! ```text
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
 //!     -p beam_engine --test raise_rooting
@@ -78,7 +82,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_engine::context::RootSet;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Export, Function, HeapNeed, Instr, Label, Module, Operand};
@@ -1011,6 +1015,176 @@ fn the_moving_collector_cooks_the_same_trace_as_a_plain_host() {
         .expect("the moving host cooks the trace"),
     );
     assert_canonical_trace(moved, &fixtures);
+}
+
+// ---------------------------------------------------------------------------
+// (d) A live `pending_exception` reason survives a collection
+// ---------------------------------------------------------------------------
+
+/// [`Machine::pending_exception`](beam_engine::Machine::pending_exception)'s reason
+/// term is a **machine-held heap term** that is *not* one of the frozen root-set
+/// files: it is set by the raise funnel, stays readable for the rest of the run
+/// (only `Machine::reset` clears it), and a host dereferences it **after** the
+/// collection that produced it — the off-heap reachability valve walks it and the
+/// writable-binary aliasing scan hands it to the collector's predicate. So it has to
+/// ride the root set exactly like the two failed-clause latches: whatever a collection
+/// does to the heap, the field must be **re-seated** with the collector's relocated
+/// word. A field still holding the pre-move pointer is a use-after-free, and the
+/// collector's vacated region is poisoned here, so the stale read is not a matter of
+/// allocator luck.
+///
+/// The test arms the slot the way the engine does (a caught `function_clause` raise)
+/// and then overwrites the reason with a **heap-resident** tuple through the host's own
+/// write half ([`Machine::pending_exception_mut`]) — the exact slot a collecting host
+/// fixes up. Nothing else names that tuple: the run restored the stack
+/// (`deallocate 2`) and the registers hold the *arming* run's terms, which live in the
+/// other host's arena, so the collection's only path to the reason is the field.
+///
+/// One rooted allocation is the whole engine activity: the collector relocates every
+/// block it can reach and poisons the region it vacated.
+#[test]
+fn pending_exception_reason_survives_a_collection() {
+    let fixtures = raising_module();
+
+    // (1) Arm the slot: `run/0`'s `try` catches the `function_clause` raise, so the
+    //     machine keeps `(error, function_clause)` — the host-visible pending
+    //     exception — after the run completes.
+    let mut machine = Machine::new();
+    let mut arming = beam_engine::MinimalContext::new();
+    let cooked = returned(
+        run(
+            &mut machine,
+            &fixtures.module,
+            fixtures.run,
+            0,
+            &[],
+            &mut arming,
+        )
+        .expect("the raising module cooks its trace"),
+    );
+    assert_canonical_trace(cooked, &fixtures);
+    let (class, armed) = machine
+        .pending_exception()
+        .expect("the caught raise records the pending exception");
+    assert_eq!(class, ExceptionClass::Error);
+    assert!(
+        !is_boxed_term(armed),
+        "the armed reason (function_clause) is an atom; the heap term is supplied below"
+    );
+
+    // (2) The reason the host has to keep alive: a tuple built in the *collecting*
+    //     host, so its words are the collector's to move (and to poison).
+    let mut ctx = MovingContext::new();
+    let reason =
+        terms::make_tuple_rooted(&mut machine, &mut ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
+            Ok(ARG_TUPLE.iter().map(|n| make_small(*n)).collect())
+        })
+        .expect("the reason tuple is built through the rooted seam");
+    assert!(
+        ctx.points_into_current_region(reason),
+        "a freshly built tuple lives in the region the collector hands out of"
+    );
+    let slot = machine
+        .pending_exception_mut()
+        .expect("the slot is armed, so the host can write the reason back");
+    *slot = (ExceptionClass::Error, reason);
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, reason)),
+        "the write half targets the slot the reader returns"
+    );
+
+    // Nothing else names the tuple, so the collection can only reach it through the
+    // field: the stack is empty and the registers hold the other host's terms.
+    assert_eq!(machine.stack_depth(), 0, "the arming run popped its frame");
+    let pre_addr = boxed_val(reason);
+    let collections_before = ctx.collections;
+
+    // (3) One real engine door: a rooted allocation collects.
+    machine
+        .alloc_rooted(&mut ctx, 3, RootSet::ALL_LIVE)
+        .expect("the rooted allocation runs the collector");
+    assert_eq!(
+        ctx.collections,
+        collections_before + 1,
+        "exactly one collection per rooted hand-off"
+    );
+
+    // (4) The invariant: the field was re-seated from the parked root-set word.
+    let (_, after) = machine
+        .pending_exception()
+        .expect("the slot is still armed after the collection");
+    assert!(
+        ctx.points_into_current_region(after),
+        "the pending-exception reason must be re-seated with the collector's relocated \
+         word, but it still points into the region the collection vacated: {after:?}"
+    );
+    assert_ne!(
+        boxed_val(after),
+        pre_addr,
+        "the collection moved the reason tuple, so the field's word must differ"
+    );
+    // The pre-move location is now the poison word: nothing relocated it, which is
+    // what makes the pre-fix field a dangling pointer rather than a lucky one.
+    //
+    // SAFETY: `pre_addr` names a word of the collector's *vacated* semi-space, which
+    // the context keeps alive (`MovingContext::_regions`) and the collection filled
+    // with `POISON`; the read is of initialised memory inside a live allocation.
+    let stale = unsafe { *(pre_addr as *const Eterm) };
+    assert_eq!(
+        stale, POISON,
+        "the vacated region holds the poison word, so the stale field reads garbage"
+    );
+    assert_eq!(
+        tuple_elements(after),
+        ARG_TUPLE.iter().map(|n| make_small(*n)).collect::<Vec<_>>(),
+        "the relocated reason reads back with the same tag and contents"
+    );
+    assert_eq!(
+        machine.stack_depth(),
+        0,
+        "the parked reason word is truncated after the hand-off"
+    );
+
+    // (5) The pristine path is unchanged: with a **non-collecting** host nothing moves,
+    //     so the field keeps exactly the word the host wrote.
+    let mut plain_machine = Machine::new();
+    let mut plain = beam_engine::MinimalContext::new();
+    let plain_cooked = returned(
+        run(
+            &mut plain_machine,
+            &fixtures.module,
+            fixtures.run,
+            0,
+            &[],
+            &mut plain,
+        )
+        .expect("the plain arena host cooks the trace"),
+    );
+    assert_canonical_trace(plain_cooked, &fixtures);
+    let plain_reason = terms::make_tuple_rooted(
+        &mut plain_machine,
+        &mut plain,
+        RootSet::ALL_LIVE,
+        3,
+        0,
+        |_, _| Ok(ARG_TUPLE.iter().map(|n| make_small(*n)).collect()),
+    )
+    .expect("the reason tuple is built in the arena host");
+    let (plain_class, _) = plain_machine
+        .pending_exception()
+        .expect("the caught raise recorded the pending exception");
+    *plain_machine
+        .pending_exception_mut()
+        .expect("the slot is armed") = (plain_class, plain_reason);
+    plain_machine
+        .alloc_rooted(&mut plain, 3, RootSet::ALL_LIVE)
+        .expect("the plain allocation");
+    assert_eq!(
+        plain_machine.pending_exception(),
+        Some((plain_class, plain_reason)),
+        "a non-collecting host leaves the pending-exception word alone"
+    );
 }
 
 // ---------------------------------------------------------------------------
