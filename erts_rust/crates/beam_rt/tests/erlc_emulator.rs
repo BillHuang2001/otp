@@ -50,29 +50,13 @@
 //! * **(c) the artifacts are real `.beam`s** — each one is loaded under the **oracle** and
 //!   its export is printed: `ecap:double(21)` ⇒ `42`, `finfo:greet()` ⇒ `hello`. Byte
 //!   equality alone would not prove the container is loadable; this does.
-//! * **(d) the recorded capability gap** — a source that makes the compiler emit a
-//!   **diagnostic** still fails: exit 1, empty stdout, and exactly one diagnostic on stderr
-//!   ([`COMPILER_DIAGNOSTIC_FAILURE`]). It is pinned as a **golden gap**, never a pass.
-//!
-//! # The golden gap, and what has to change for it to turn green
-//!
-//! `compile:report_warnings/1` (and `report_errors/1`) print through `lists:flatmap/2`, i.e.
-//! through a **nested fun application** inside the running slice. In this runtime a nested
-//! `run_label_blocking` cannot pump the scheduler (`src/context/pump.rs`'s
-//! `pump_until_returned` folds the empty pump into `beam_engine::blocked()`), so the call
-//! returns the typed gap's atom, which `erl_compile:compile_file/4`
-//! (`lib/stdlib/src/erl_compile.erl:391`) renders as
-//! `Compiler function compile:compile/3 returned:\n'…'` and the front end halts 1.
-//! The fix is therefore **a resumable nested-fun apply on the `-eval`/`erlc` route**: a
-//! `lists:flatmap/2` closure applied one `call_fun` deep must be able to park and be resumed
-//! by a later pass like any other process entry. Until then this row is the honest record,
-//! and a future fix must update it deliberately (the ratchet).
-//!
-//! Measured deviation from the letter of the task: the parent's summary asked for "NO
-//! `.beam` artifact was produced". A **warning-only** source (an unused variable) leaves the
-//! artifact **behind** — and byte-identical to the oracle's, because the emission happens
-//! before the diagnostics are printed — while a source with real **compile errors** leaves
-//! nothing. Both shapes are pinned below, one test each, so neither claim is fictional.
+//! * **(d) a diagnostic-producing source compiles exactly as under the system `erlc`** — a
+//!   source that makes the compiler emit a **warning** exits **0**, writes **nothing** to
+//!   stdout, its stderr is **byte-identical** to the system `erlc`'s (the 90-byte
+//!   [`WARN_DIAGNOSTIC`]), and `warn.beam` **is** emitted and byte-identical to the system
+//!   compiler's artifact; a source with **compile errors** exits **1**, writes nothing to
+//!   stdout, its stderr is byte-identical to the system `erlc`'s (the 184-byte
+//!   [`BERR_DIAGNOSTIC`]), and **no** artifact is left behind on either side.
 //!
 //! # Harness
 //!
@@ -107,9 +91,9 @@ const HDRS_HRL: &str = "-define(GREETING, hello).\n";
 /// A module that uses **both** include forms: `-include_lib/1` (resolved through the
 /// compiler's own `code:lib_dir/2`) and `-include/1` (resolved through `erlc`'s `-I`).
 ///
-/// Both functions are **exported**: an unexported one would make the compiler emit an
-/// "unused function" warning, and every diagnostic goes through the golden gap
-/// ([`a_compiler_warning_is_the_recorded_capability_gap`]) instead of the clean route.
+/// Both functions are **exported** so `finfo.erl` yields a clean route that emits **no**
+/// diagnostic at all — the option-carrying row asserts an empty stderr, so an unexported
+/// function (which the compiler warns about) is avoided rather than tolerated.
 const FINFO_ERL: &str = "\
 -module(finfo).
 -export([greet/0, size/0]).
@@ -120,7 +104,7 @@ size() -> #file_info.size.
 ";
 
 /// A module whose only diagnostic is a **warning** (`X` is unused): the compiler has a
-/// complete artifact to write, and then cannot print the warning.
+/// complete artifact to write and one warning to report.
 const WARN_ERL: &str = "\
 -module(warn).
 -export([f/0]).
@@ -128,21 +112,23 @@ f() -> X = 1, ok.
 ";
 
 /// A module with real **compile errors** (an unbound variable and an undefined function):
-/// the compiler has no artifact to write, and cannot print the errors either.
+/// the compiler has no artifact to write and two errors to report.
 const BERR_ERL: &str = "\
 -module(berr).
 -export([f/0]).
 f() -> unused(X), ok.
 ";
 
-/// The exact stderr a diagnostic-producing compile leaves, byte for byte:
-/// `erl_compile:compile_file/4`'s `io_lib:format("Compiler function ~w:~w/3 returned:\n~tp~n", …)`
-/// (`lib/stdlib/src/erl_compile.erl:391`) with the nested-fun-apply gap's reason atom, which
-/// `~tp` quotes because it contains spaces. Note the newline **after** `returned:` — it is
-/// part of the front end's format, not of the reason.
-const COMPILER_DIAGNOSTIC_FAILURE: &str = "Compiler function compile:compile/3 returned:\n\
-                                           'unsupported_opcode: run: process blocked \
-                                           (no message available)'\n";
+/// The compiler's own diagnostic for [`WARN_ERL`], byte for byte, cross-checked against the
+/// system `erlc`'s: one unused-variable warning with its source excerpt (a caret line under
+/// the offending column) and a blank line after it. The diagnostic names the file by its
+/// **basename** even though the source is passed as an absolute path.
+const WARN_DIAGNOSTIC: &str = "warn.erl:3:8: Warning: variable 'X' is unused\n%    3| f() -> X = 1, ok.\n%     |        ^\n\n";
+
+/// The compiler's own diagnostic for [`BERR_ERL`], byte for byte, cross-checked against the
+/// system `erlc`'s: the undefined function first, then the unbound variable, each with its
+/// excerpt and a blank line after it.
+const BERR_DIAGNOSTIC: &str = "berr.erl:3:8: function unused/1 undefined\n%    3| f() -> unused(X), ok.\n%     |        ^\n\nberr.erl:3:15: variable 'X' is unbound\n%    3| f() -> unused(X), ok.\n%     |               ^\n\n";
 
 // ---------------------------------------------------------------------------------------
 // Bounded child execution (the house pattern, with a longer bound for a booting `erlc`)
@@ -592,31 +578,24 @@ fn the_compiled_artifacts_load_and_run_under_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------------------
-// (d) the recorded capability gap
+// (d) a diagnostic-producing source: byte-identical to the system `erlc`
 // ---------------------------------------------------------------------------------------
 
-/// **The golden gap**: a source that makes the compiler print a **warning** cannot be
-/// compiled at all through this runtime.
+/// A source that makes the compiler emit a **warning** compiles through this runtime exactly
+/// as it does under the system `erlc`: exit **0**, empty stdout, the same **90-byte** stderr
+/// (the compiler's own diagnostic, [`WARN_DIAGNOSTIC`]) and the same `.beam` artifact.
 ///
-/// `compile:compile/3` returns the nested-fun-apply gap's atom instead of its normal result,
-/// and `erl_compile:compile_file/4` renders that as
-/// [`COMPILER_DIAGNOSTIC_FAILURE`] and halts 1. Pinned exactly: the exit code, that stdout
-/// is empty, and the whole stderr **prefix included** (byte for byte, trailing newline and
-/// all) — an assertion on a fragment would let the wording drift.
+/// This is the diagnostic *printer* running on the Rust runtime: `compile:report_warnings/1`
+/// reaches the compiler's own `lists:flatmap/2` closure over the running slice, so a warning
+/// lands on stderr character for character. Both halves are pinned twice — against the
+/// golden const *and* against the live system `erlc`'s own stderr, byte for byte — so a
+/// wording drift on either side fails here; a fragment assertion would let it through.
 ///
-/// The artifact is pinned too, because a warning is not an error: the compiler has already
-/// emitted `warn.beam` when the reporting step fails, and it is byte-identical to the
-/// system compiler's. (Only a source with real compile *errors* leaves nothing behind — see
-/// [`a_compile_error_is_the_same_golden_gap_and_leaves_no_artifact`].)
-///
-/// **What must change for this to become green:** a resumable nested-fun application on the
-/// `-eval`/`erlc` route. The diagnostic printer is `lists:flatmap/2` over a closure one
-/// `call_fun` deep inside the running slice; today the nested `run_label_blocking` cannot
-/// pump, so the apply folds into `beam_engine::blocked()`. Whichever change makes a nested
-/// `call_fun` parkable/resumable turns this row green — and must update it deliberately,
-/// since this suite is the record of the gap.
+/// The artifact is pinned too, because a warning is not an error: `warn.beam` is emitted and
+/// is byte-identical to the system compiler's. (A source with real compile *errors* leaves
+/// nothing behind — see [`a_compile_error_is_reported_byte_identically_and_leaves_no_artifact`].)
 #[test]
-fn a_compiler_warning_is_the_recorded_capability_gap() {
+fn a_compiler_warning_is_printed_byte_identically_and_the_artifact_is_emitted() {
     let erlc = require_erlc!();
     let scratch = Scratch::new("warning");
     let source = scratch.write("warn.erl", WARN_ERL);
@@ -624,8 +603,8 @@ fn a_compiler_warning_is_the_recorded_capability_gap() {
     let (ours, theirs, ours_beam, theirs_beam) = compile_both(&erlc, &scratch, &source, &[]);
 
     assert_eq!(
-        ours.code, 1,
-        "the warning route must fail with the front end's exit code — stderr:\n{}",
+        ours.code, 0,
+        "a warning-only source must compile — stderr:\n{}",
         ours.stderr()
     );
     assert_eq!(
@@ -636,53 +615,84 @@ fn a_compiler_warning_is_the_recorded_capability_gap() {
     );
     assert_eq!(
         ours.stderr(),
-        COMPILER_DIAGNOSTIC_FAILURE,
+        WARN_DIAGNOSTIC,
         "the warning route's stderr, verbatim ({} bytes)",
         ours.err.len()
     );
+    assert_eq!(
+        ours.err.len(),
+        90,
+        "the warning diagnostic is 90 bytes ({} here):\n{}",
+        ours.err.len(),
+        ours.stderr()
+    );
 
-    // A warning is not an error: the artifact was written before the reporting failed, and
-    // this runtime's compiler emitted the same bytes as the system one.
+    // A warning is not an error: the artifact is emitted, and this runtime's compiler emitted
+    // the same bytes as the system one.
     assert!(
         ours_beam.is_file(),
-        "a warning-only source still emits {} — the emission precedes the diagnostic",
+        "a warning-only source emits {}",
         ours_beam.display()
     );
     assert_identical_artifacts(&ours_beam, &theirs_beam);
 
-    // The reference half: the system `erlc` compiles the same source cleanly (it prints the
-    // warning to stderr, so only its exit code and artifact are comparable).
+    // The reference half: the system `erlc` compiles the same source and prints the *same*
+    // diagnostic, byte for byte.
     assert_eq!(
         theirs.code,
         0,
         "the system `erlc` must compile a warning-only source — stderr:\n{}",
         theirs.stderr()
     );
+    assert_eq!(
+        theirs.out,
+        Vec::<u8>::new(),
+        "the system `erlc` writes nothing to stdout, it printed:\n{}",
+        theirs.stdout()
+    );
     assert!(
         theirs.stderr().contains("Warning: variable 'X' is unused"),
-        "the system `erlc`'s diagnostic names the warning, it printed:\n{}",
+        "the diagnostic names the warning, the system `erlc` printed:\n{}",
+        theirs.stderr()
+    );
+    assert_eq!(
+        theirs.err.len(),
+        WARN_DIAGNOSTIC.len(),
+        "the system `erlc`'s diagnostic is {} bytes, the golden is {}:\n{}",
+        theirs.err.len(),
+        WARN_DIAGNOSTIC.len(),
+        theirs.stderr()
+    );
+    assert_eq!(
+        ours.err,
+        theirs.err,
+        "this runtime's diagnostic must be the system `erlc`'s, byte for byte\n\
+         ours:\n{}\ntheirs:\n{}",
+        ours.stderr(),
         theirs.stderr()
     );
 }
 
-/// The error half of the same golden gap: a source with real **compile errors** fails with
-/// the identical stderr and leaves **no** artifact.
+/// A source with real **compile errors** is reported exactly as under the system `erlc`:
+/// exit **1**, empty stdout, the same **184-byte** stderr (both errors, [`BERR_DIAGNOSTIC`])
+/// and **no** `.beam` on either side.
 ///
-/// This is the shape the task's letter described ("NO `.beam` artifact was produced") — it
-/// holds here because the compiler never reaches emission, not because the runtime refuses to
-/// write one. Pinned together with [`a_compiler_warning_is_the_recorded_capability_gap`] so
-/// the pair stays truthful.
+/// The compiler never reaches emission here, so the artifact is absent on both sides — that
+/// is what the pair with
+/// [`a_compiler_warning_is_printed_byte_identically_and_the_artifact_is_emitted`] pins: a
+/// warning still emits, an error emits nothing, and both diagnostics are byte-identical to
+/// the system compiler's.
 #[test]
-fn a_compile_error_is_the_same_golden_gap_and_leaves_no_artifact() {
+fn a_compile_error_is_reported_byte_identically_and_leaves_no_artifact() {
     let erlc = require_erlc!();
     let scratch = Scratch::new("error");
     let source = scratch.write("berr.erl", BERR_ERL);
 
-    let (ours, theirs, ours_beam, _theirs_beam) = compile_both(&erlc, &scratch, &source, &[]);
+    let (ours, theirs, ours_beam, theirs_beam) = compile_both(&erlc, &scratch, &source, &[]);
 
     assert_eq!(
         ours.code, 1,
-        "the error route must fail with the front end's exit code — stderr:\n{}",
+        "a source with compile errors must fail — stderr:\n{}",
         ours.stderr()
     );
     assert_eq!(
@@ -693,9 +703,16 @@ fn a_compile_error_is_the_same_golden_gap_and_leaves_no_artifact() {
     );
     assert_eq!(
         ours.stderr(),
-        COMPILER_DIAGNOSTIC_FAILURE,
+        BERR_DIAGNOSTIC,
         "the error route's stderr, verbatim ({} bytes)",
         ours.err.len()
+    );
+    assert_eq!(
+        ours.err.len(),
+        184,
+        "the error diagnostic is 184 bytes ({} here):\n{}",
+        ours.err.len(),
+        ours.stderr()
     );
     assert!(
         !ours_beam.exists(),
@@ -703,7 +720,8 @@ fn a_compile_error_is_the_same_golden_gap_and_leaves_no_artifact() {
         ours_beam.display()
     );
 
-    // The reference half: the system `erlc` reports the two errors and also writes nothing.
+    // The reference half: the system `erlc` reports the same two errors, writes nothing to
+    // stdout and writes no artifact either.
     assert_eq!(
         theirs.code,
         1,
@@ -715,5 +733,31 @@ fn a_compile_error_is_the_same_golden_gap_and_leaves_no_artifact() {
         Vec::<u8>::new(),
         "the system `erlc` writes nothing to stdout, it printed:\n{}",
         theirs.stdout()
+    );
+    assert!(
+        theirs.stderr().contains("function unused/1 undefined"),
+        "the diagnostic names the undefined function, the system `erlc` printed:\n{}",
+        theirs.stderr()
+    );
+    assert_eq!(
+        theirs.err.len(),
+        BERR_DIAGNOSTIC.len(),
+        "the system `erlc`'s diagnostic is {} bytes, the golden is {}:\n{}",
+        theirs.err.len(),
+        BERR_DIAGNOSTIC.len(),
+        theirs.stderr()
+    );
+    assert_eq!(
+        ours.err,
+        theirs.err,
+        "this runtime's diagnostic must be the system `erlc`'s, byte for byte\n\
+         ours:\n{}\ntheirs:\n{}",
+        ours.stderr(),
+        theirs.stderr()
+    );
+    assert!(
+        !theirs_beam.exists(),
+        "the system `erlc` leaves no artifact on a compile error, but {} exists",
+        theirs_beam.display()
     );
 }
