@@ -57,6 +57,17 @@ Valid oracle names whose gap reason names the missing accessor/hook: `backtrace`
 `heap_size` is the nursery's capacity, which is the process's own `min_heap_size` (`HeapPolicy::initial_heap_words`), so the default is the oracle's 233, `+hms 4000` answers 4185 and a `spawn_opt` `{min_heap_size,N}` is floored by the emulator's `+hms` and reported.
 `total_heap_size` composes the C's figure — `heap_size` plus the old generation's capacity **only once a collection has created it** (`erl_bif_info.c:1023-1030`), so a fresh process reports `total_heap_size == heap_size`, exactly as the oracle does.
 Both are pinned against the live oracle by `../../../tests/min_heap_size.rs`.
+
+### Which accessor each reported heap figure reads (chain sum vs one space)
+Two `beam_gc` readings differ by construction: `AnyCollector::total_heap_size_words()` is the **chain sum** — every nursery space a `grow_nursery` retired plus the mature generation (`beam_gc/src/collector.rs:652-661`) — while `young()` is the **current** space only and `heap_used_words()` is the chain-summed occupancy (`collector.rs:672-677`).
+The four reporting paths split accordingly:
+* `erlang:memory(processes)` — `../../context/memory_hook.rs::RuntimeMemory::new` sums `collector.total_heap_size_words()` over every live pid ⇒ **chain-summed capacity** (`memory_hook.rs:135`).
+* `erlang:memory(processes_used)` — the same loop sums `collector.young().used_words() + collector.mature_used_words()` ⇒ **the current nursery space only**, so each retired space contributes 0 occupied words (`memory_hook.rs:140-141`; the hole and its one-line fix are `beam_gc/src/ACCOUNTING.md` *Known issues* / *Handoffs* 1).
+* `process_info` — `heap_size` = `collector.heap_size_words()` (chain-summed nursery capacity, `mod.rs:1372`); `total_heap_size` = `heap_size_words() + old_heap_size_words()`, the C-shaped figure (**not** `total_heap_size_words()`, `mod.rs:1373-1381`); `memory` = `(total_heap_size + stack_size) * 8 + off_heap_bytes` (`mod.rs:1025-1027`).
+* `max_heap_size` — `MaxHeapUsage::heap_words` = `collector.total_heap_size_words()` (`beam_process/src/process.rs:1497-1500`, contract `beam_process/src/max_heap.rs:176-185`) ⇒ the same chain sum `memory(processes)` reports.
+So `memory(processes)`, `memory(P)`, `total_heap_size`/`heap_size` and the `max_heap_size` verdict are all readings of one chain sum, and `processes_used` is the only reported figure that reads a single space.
+Bytes **no** `erlang:memory` key counts, i.e. what can put peak RSS far above a reported `total`: the pointer-stable arena (`Runtime::alloc_words` → `MinimalContext`'s never-freed regions, `runtime.rs:2180-2182`), the `-eval` store (`Runtime::eval_heap`, whose `grow_eval_heap` retirements are never freed), the pooled BIF heaps (`Runtime::take_bif_heap`, an unscanned `Target::Foreign` pool), the retained `Arc<Module>` of every loaded module (`code` reports `fs::metadata(path).len()`, `memory_hook.rs:227-237`, never the loaded IR) and the engine's JIT block cache (`beam_gc/src/ACCOUNTING.md` *Categories this crate cannot see*).
+
 ### Documented divergences (correct-but-different-by-construction)
 `/1` emits 15 (registered) / 14 (unregistered) items where the oracle emits 17/16 when no execution position is readable.
 `memory`, `reductions`, `group_leader` (`Runtime::group_leader_of`'s real pid — the root pid by default, set by `erlang:group_leader/2`, inherited on spawn), `binary`'s `Ptr`/`Refc`, `error_handler` (the atom) and `suspending` (`[]`) are this runtime's own values.
