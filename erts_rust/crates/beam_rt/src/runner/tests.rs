@@ -3294,7 +3294,7 @@ fn the_churn_workloads_per_call_counters_are_flat_in_n() {
 /// slice-end boundary falls on a cycle boundary and any collection it takes is one the following
 /// admission would have taken anyway. Measured (this host, debug build) at N = 5 000 / 10 000 /
 /// 25 000 / 50 000 / 100 000: `collections` = 2 501 / 5 001 / 12 501 / 25 001 / 50 001 against
-/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 1 and
+/// `yields` = 6 / 12 / 31 / 62 / 125, at an 843-word nursery capacity with `major` 0 and
 /// `debt_boundaries` 0 on every row.
 ///
 /// # What would make it regress

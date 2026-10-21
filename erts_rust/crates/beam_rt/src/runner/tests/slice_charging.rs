@@ -71,13 +71,15 @@
 //!
 //! | N | slices | yields | waits | collections | major | peak_young_spaces | reductions |
 //! |---|---|---|---|---|---|---|---|
-//! | 2 000 | 3 | 2 | 0 | 1 001 | 1 | 1 | 10 005 |
-//! | 10 000 | 13 | 12 | 0 | 5 001 | 1 | 1 | 50 005 |
-//! | 20 000 | 26 | 25 | 0 | 10 001 | 1 | 1 | 100 005 |
-//! | 80 000 | 101 | 100 | 0 | 40 001 | 1 | 1 | 400 005 |
+//! | 2 000 | 3 | 2 | 0 | 1 001 | 0 | 1 | 10 005 |
+//! | 10 000 | 13 | 12 | 0 | 5 001 | 0 | 1 | 50 005 |
+//! | 20 000 | 26 | 25 | 0 | 10 001 | 0 | 1 | 100 005 |
+//! | 80 000 | 101 | 100 | 0 | 40 001 | 0 | 1 | 400 005 |
 //!
 //! so its collections are `1 + N/K` with `K == 2` — the iterations the settled nursery carries
-//! (see pin 3).
+//! (see pin 3) — and every one of them is a **minor**: the live set at that admission point is
+//! empty, so the promotion fits the mature region the spawn policy installed and nothing
+//! escalates to a fullsweep.
 //!
 //! # The four pins
 //!

@@ -292,9 +292,10 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
     }
     // The point of the door: a flat `heap_size` instead of a linear climb with N (the
     // door-disabled figures are 3 074 841 / 29 485 327 / 264 963 824 words — ≈ 1 300 retained
-    // words per iteration). The converged capacity is the minor rule's target for the boundary
-    // window's live set (`young_minor_target_words(401)`, 610 words — see the doc comment), and it
-    // is the same at every N — flatness, not the absolute figure, is the property.
+    // words per iteration). The converged capacity is the **fullsweep** rule's target for the
+    // boundary window's live set (`young_target_words(401)`, 987 words — the derivation is
+    // `plateau_words` and the doc comment above), and it is the same at every N — flatness, not
+    // the absolute figure, is the property.
     let plateau = plateau_words();
     for (n, heap) in [(n1, heap1), (n2, heap2), (n3, heap3)] {
         assert_eq!(heap, plateau, "the nursery must converge, not climb: N={n}");
