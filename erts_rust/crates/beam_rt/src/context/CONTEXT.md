@@ -33,7 +33,7 @@ Entering an external fun in the calling process (as C's `call_fun` does) is what
 The engine's doors (`ensure_heap`/`ensure_heap_full`, sharing `collect_or_grow`) collect and grow the nursery to fit an oversized request (`Process::ensure_capacity`, when `HeapPolicy::next_words(need,0) >= need`; a bounded `+hmax` below it falls back to `Process::collect()`) — see *Known Issues* for the arena fallback and its soundness valve.
 **Registry precedence (gotcha).** The native floor runs *before* the registry (a `beam_bifs` entry can never shadow a floor-served key) and the registry *before* the external-module load; a registration shadows the fallback for a non-`erlang` name, while an `erlang:*` one flips the unregistered answer — bare `error::undef`, or `unsupported` when curated in `error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`.
 ### The dispatch memo · `DispatchHooks`
-`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped 8-slot per-context memo of `{bif: Option<BifFn>, hooks: DispatchHooks}`, where `hooks` is **one boolean per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates) and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
+`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped per-context memo of `DISPATCH_MEMO_SLOTS = 128` slots (`dispatch.rs:53`, the count grew from 8 because `compile:file/2`'s 241-key hot set evicted itself at 8) holding a boxed `{bif: Option<BifFn>, hooks: DispatchHooks}` per slot — the slots are inline (`slots: [Option<Box<DispatchEntry>>; 128]`), so a fresh per-applied-fun context carries ~1 KiB of `None` slots and allocates a box only on a miss, where `hooks` is **one boolean per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates) and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
 A cached answer can never go stale: the one mutable input, the **NIF registry**, is deliberately not memoized (`call_bif` runs `try_call_nif` first on every call).
 Slot hash, the miss/collision rules, hit/miss cost, pooled BIF heap and `PendingInterner`: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-dispatch-memo--dispatchhooks).
 ### In-machine execution-position door (`position.rs`)
@@ -219,3 +219,47 @@ That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), th
 of the in-process `compile:file/2` route (A.9).
 The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
+## Host-memory retention on the table-less route — where the words actually accumulate
+An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
+false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route; the
+retention is a property of four runtime-level stores, and all four are grow-only.
+Nothing here is per-`RuntimeContext`: a context is a borrow-only struct over `&'a mut Runtime`
+(`runtime_context.rs:198-287`), so it owns no heap at all and dropping it frees only its inline
+`dispatch_memo` slots and the boxes a miss put in them.
+Per-mechanism detail is [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; this is the cross-store attribution.
+- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
+  deep-copied onto the store (`runtime.rs:2286-2295`: `grow_eval_heap` doubles the region and pushes
+  the replaced one onto `eval_heap_retired`, which is never freed).
+  The statement window that would reclaim a dead prefix is **pinned by the first nested run that
+  writes the store** (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), after which
+  `scratch::boundary` declines for the remainder of the expression — so a compile, which is one
+  `-eval` statement full of store-writing nested runs, only ever advances the store. (An `epp` source
+  read lands here too: the native file/prim replies build straight on the store.)
+- **`bif_heaps: Vec<Heap>`** — an unbounded push/pop pool with no cap, no eviction and no free
+  (`runtime.rs:2164-2174`); `take_bif_frontier` retires an *exhausted* region by pushing it back and
+  making the next one its doubled capacity (`calls.rs:160-181`).
+  A **reentrant** call on this route (`lists:foldl/3`, `lists:map/2`, `maps:map/2`) has
+  `safe_to_rewind == false` (`calls.rs:417`), hence `move_container == false` (`:934`): its
+  accumulator result is **not** copied out and `rewind` stays false, so that call's whole graph stays
+  owned by the region — which is what exhausts regions on a compile.
+  A retired region is kept rather than freed because **another caller still owns words in it**
+  (`calls.rs:177-179`), so its capacity is unreclaimable, not merely unreclaimed.
+- **`Runtime::arena`** — `heap_available`/`alloc_words` on a table-less context answer the arena
+  (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` (`runtime.rs:2180-2182`) → one
+  `MinimalContext` (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>`
+  that **only ever grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes
+  the frontier; freed only when the `Runtime` drops (`beam_engine/src/context.rs:1395-1577`).
+  A **scheduled** process's nested run allocates from its own young heap instead (`gc.rs:1509-1539`,
+  `gc_process_enabled`), whose `Process::grow_nursery` retires the space it replaces — the *capacity*
+  ratchet, never live data (`beam_gc`'s `Nursery::grow`/`install`).
+- **Bounded, and therefore not the grower:** the nested-run `Machine` pool
+  (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32; 16 KiB of register files per machine,
+  `Vec` high-water capacity retained by `Machine::reset`, never shrunk) and the wall-clock
+  `BLOCKING_PUMP_DEADLINE` (900 s). Neither holds a heap.
+**`Process::grow_nursery` is unreachable on this route.** `move_result_into_process_heap` returns at
+its first guard — `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`) — before
+`hint_grow_gate` (`:1494`) and before the growth block (`:1554-1568`), so only the **scheduled**
+(`for_process`) route ever grows a process nursery.
+The consequences for a long in-process `compile:file/2`, the per-call cost census and the pool's
+reuse counters (`BEAM_RT_PERF_COUNTERS=1`) are `../runtime/CONTEXT.md`'s and
+`../PERF.md`'s; the engine-side capacity facts are `beam_engine/src/machine/CONTEXT.md`'s.
