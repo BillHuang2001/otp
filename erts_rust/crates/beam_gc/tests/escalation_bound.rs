@@ -47,9 +47,7 @@
 //! * **(a) a dead-inclusive fill does not force a fullsweep** — a nursery whose chain-summed fill
 //!   is several times the mature space's remaining room, holding a tiny live set, keeps selecting
 //!   [`CollectionKind::Minor`], round after round, with the minor counter advancing and the major
-//!   counter untouched by anything but the `fullsweep_after` cadence and the one initial
-//!   fullsweep (the C's first collection of a process, which has no old heap to promote into:
-//!   `erl_gc.c:1486-1488` → `:1574-1577` → `:839-849`);
+//!   counter untouched by anything but the `fullsweep_after` cadence;
 //! * **(b) genuine room scarcity still escalates** — a nursery whose **live** young set does not
 //!   fit the mature space selects [`CollectionKind::Major`] (the fix is a bounding change, never
 //!   "never escalate");
@@ -61,7 +59,7 @@
 //! Deterministic counts only: no timing is measured or asserted.
 
 use beam_common::BeamError;
-use beam_gc::prelude::{AnyCollector, CollectionKind, GcConfig, HeapPolicy};
+use beam_gc::prelude::{AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy};
 use beam_term::prelude::{make_small, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -89,12 +87,12 @@ const ROUNDS: usize = 40;
 /// subject unmistakable.
 const FILL_MULTIPLE: usize = 2;
 
-/// The hard bound on one round's dead fill, in tuples: 220 tuples = 660 words, more than the
-/// largest fill a post-collection nursery chain's cap
-/// ([`HeapPolicy::chain_cap_words`](beam_gc::HeapPolicy::chain_cap_words)) can hold here. It is the
-/// **deterministic stopper**: the loop below must stop on a number of tuples, never on "the growth
-/// seam refused", because a nursery that has never collected is capped only by the growth table and
-/// such a loop walks it to the allocator's limit.
+/// The hard bound on one round's dead fill, in tuples: 220 tuples = 660 words, comfortably more
+/// than the largest fill the shape's mature room can hold here, and a fixed amount of work. It is
+/// the **deterministic stopper**: the fill must stop on a tuple count, never on "the growth seam
+/// refused", because a nursery that has not collected has no capability to bound itself — the
+/// growth seam no longer refuses at a chain cap, so an unbounded loop would walk the growth table
+/// to the allocator's limit.
 const MAX_DEAD_TUPLES: usize = 220;
 
 /// Builds a 3-word `{a, 2a}` tuple in `c`'s nursery, growing the nursery when it is full.
@@ -111,21 +109,28 @@ fn tuple(c: &mut AnyCollector, a: i64) -> Eterm {
         .expect("a 3-word nursery tuple")
 }
 
+/// The words handed out across **every** nursery space — the chain-summed fill
+/// ([`HeapObservable::heap_used_words`]), which counts the spaces a growth retired as well as the
+/// current one. This is the dead-inclusive figure the escalation test must **ignore**: only the
+/// live set the minor would promote is a room requirement, and the fill is an allocation history.
+fn young_fill(c: &AnyCollector) -> usize {
+    c.heap_used_words()
+}
 /// Fills the nursery with **dead** tuples (never rooted) until the chain-summed fill reaches
 /// `target_words`, returning the number of words it allocated — the **dead-inclusive occupancy**
 /// the escalation test must ignore.
 ///
-/// Two deterministic stoppers, both of them checked before a tuple is allocated:
+/// Three deterministic stoppers, all of them checked before a tuple is allocated:
 ///
 /// * `target_words` — the shape the round wants (a fill several times the mature room);
 /// * [`MAX_DEAD_TUPLES`] — the hard bound, so the round is a fixed amount of work;
-/// * a **refused** growth (the chain cap, [`HeapPolicy::chain_cap_words`]) also ends the fill: a
-///   chained nursery whose retained capacity reached its cap cannot grow again until a collection,
-///   and a collection here would destroy the very fill the round is about.
+/// * an **unrequestable** growth (the growth table's ceiling, or the `max_heap_words` budget) also
+///   ends the fill: the seam reports the typed exhaustion instead of installing a space, and a
+///   collection here would destroy the very fill the round is about.
 fn fill_with_dead_tuples(c: &mut AnyCollector, target_words: usize) -> usize {
-    let start = c.young().used_words();
+    let start = young_fill(c);
     for a in 0..MAX_DEAD_TUPLES as i64 {
-        if c.young().used_words() >= target_words {
+        if young_fill(c) >= target_words {
             break;
         }
         if c.grow_nursery(TUPLE_WORDS).is_err() {
@@ -133,7 +138,7 @@ fn fill_with_dead_tuples(c: &mut AnyCollector, target_words: usize) -> usize {
         }
         let _ = tuple(c, a);
     }
-    c.young().used_words() - start
+    young_fill(c) - start
 }
 
 /// The mature space's `(used, capacity)` words.
@@ -163,14 +168,6 @@ fn collector(policy: HeapPolicy) -> AnyCollector {
 /// With the fill in the predicate the first round would escalate to a fullsweep and every later
 /// round would too (a fullsweep sizes the mature space from the live set, so no fullsweep ever
 /// buys room for a dead figure) — `minor_gcs` would stay `0` for the whole run.
-///
-/// The **initial fullsweep** is run explicitly before the rounds. It is not one of them: the C
-/// forces a fullsweep on a process's first collection because there is no old heap to promote into
-/// yet (`erl_gc.c:1486-1488` → `:1574-1577` → `:839-849`), and this crate's `collect` now selects
-/// exactly that (no old generation ⇒ major). Running it here keeps the rounds the *steady-state*
-/// decisions the test is about — every one of them a minor — and gives round 0 a nursery that has
-/// already measured a live set, so its fill is bounded by the chain cap rather than by the growth
-/// table.
 #[test]
 fn a_dead_inclusive_fill_keeps_selecting_minor() {
     let policy = HeapPolicy {
@@ -178,14 +175,6 @@ fn a_dead_inclusive_fill_keeps_selecting_minor() {
         ..HeapPolicy::default()
     };
     let mut c = collector(policy);
-    // The C's first collection of a process: no old heap ⇒ a fullsweep. `collect_kind` pins it so
-    // the assertion is about *this* collection and not about the policy choice.
-    let warmup = c
-        .collect_kind(CollectionKind::Major, &mut [])
-        .expect("the initial fullsweep");
-    assert_eq!(warmup.kind, CollectionKind::Major);
-    assert_eq!(c.stats().major_collections, 1);
-    let majors_before = c.stats().major_collections;
 
     let mut minors = 0usize;
     let mut escalations = 0usize;
@@ -193,7 +182,7 @@ fn a_dead_inclusive_fill_keeps_selecting_minor() {
         let (mature_used, mature_capacity) = mature_words(&c);
         let available = mature_capacity - mature_used;
         let dead = fill_with_dead_tuples(&mut c, FILL_MULTIPLE * available);
-        let fill = c.young().used_words();
+        let fill = young_fill(&c);
         let mut roots = [tuple(&mut c, 1_000 + round as i64)];
         assert!(
             fill > available,
@@ -236,13 +225,8 @@ fn a_dead_inclusive_fill_keeps_selecting_minor() {
     );
     assert_eq!(
         c.stats().major_collections,
-        majors_before,
-        "no fullsweep ran in any round — the fill is not a live set"
-    );
-    assert_eq!(
-        c.stats().major_collections,
-        1,
-        "exactly the initial fullsweep (the first collection of a process), and nothing after it"
+        0,
+        "no fullsweep ran — the fill is not a live set"
     );
     assert_eq!(c.minor_gcs(), ROUNDS as u32, "the minors-since-major counter advanced");
 }
@@ -262,11 +246,8 @@ fn live_set(c: &mut AnyCollector) -> Vec<Eterm> {
 /// but the mature space has 8 words, so the promotion genuinely cannot fit and `collect` must run
 /// a major. This is what keeps the fix a *bounding* change rather than "never escalate".
 ///
-/// The first collection of a fresh process is a major on a second, independent ground too — there
-/// is no old generation to promote into yet (`Collector::collect`'s no-old-generation guard, the
-/// C's `OLD_HEAP(p)` test), and this shape is a first collection. The **room** half is isolated by
-/// the pinned-minor control below: it asks for exactly the minor and must see the typed refusal,
-/// which only the room test can produce.
+/// The **room** half is isolated by the pinned-minor control below: it asks for exactly the minor
+/// and must see the typed refusal, which only the room test can produce.
 #[test]
 fn a_live_promotion_that_cannot_fit_still_escalates() {
     let policy = HeapPolicy {
