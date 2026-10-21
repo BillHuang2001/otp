@@ -2048,6 +2048,18 @@ fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
     }
     #[cfg(test)]
     notes::note_hint_grow();
+    if crate::debug_trace::heap_enabled() {
+        crate::debug_trace::heap(format_args!(
+            "copy-out grow pid={:?} hint={hint} request={request} available={} young_cap={} chain_used={} chain_spaces={} debt={} exempt={}",
+            process.pid(),
+            process.heap_mut().available(),
+            process.collector().young().capacity_words(),
+            process.heap_used_words(),
+            process.collector().young_space_count(),
+            process.collection_debt(),
+            process.is_relocation_exempt(),
+        ));
+    }
     if process.grow_nursery(request).is_err() {
         // A `max_heap_size` ceiling: degrade to the bare hint, never a hard failure.
         let _ = process.grow_nursery(hint);
