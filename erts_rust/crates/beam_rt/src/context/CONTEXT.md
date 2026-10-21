@@ -242,13 +242,15 @@ the last `VmRSS` sample after `src/malloc.rs`'s one `malloc_trim(0)`, and `Runti
 | `cerl_clauses` 13 793 B, in-process | 372 MB | 962 MB | 21–30 MB | 0.87–0.99 s | 27 / 161 MB |
 | `cerl_clauses` 13 793 B, spawned child | 307 MB | 887 MB | 21–28 MB | 2.42 s | 27 / 161 MB |
 | `orddict` 15 800 B, in-process | 363 MB | — | 30.6 MB | 0.95 s | 23 / 157 MB |
-| `inet_parse` 36 960 B, in-process | 7.8 GB | — | 23.0 MB | 16.9 s (**completes**) | 34 / 169 MB |
+| `inet_parse` 36 960 B, in-process `-eval` | 5 203 MB | — | 23.0 MB | 12.1 s (**completes**) | 34 / 169 MB |
+| `inet_parse` 36 960 B, `run` route | 222 MB in-process / 671 MB spawned child | — | — | never completes (`RUN_DEADLINE`, 60 s) | — |
 | `dbg_iload` 48 353 B, in-process | 17.4 GB at the 25 s cap (still growing) | — | — (killed at 25 s) | **does not complete** | — |
 The pool's capacity is **depth-sized now**: the outermost call gets `bif_heap_words` (1 << 24 words = 128 MiB) and every nested level gets `NESTED_BIF_HEAP_SEED_WORDS` (131 072 words = 1 MiB), self-tuned upward to `2 ×` an observed nested peak by `note_nested_heap_need`, with `bif_heaps_taken` the live depth.
 For `cerl_clauses` that is 27 regions / 20 185 088 words = **161 MB**, where seeding every level at `bif_heap_words` gave the same 27 regions 27 × 16 777 216 = **3.62 GB** — 22× less reservation at an identical region count, with `bif_nested_peak_words` 1 550 (23 372 for `inet_parse`), two orders of magnitude under the seed.
 `take_bif_frontier` grows a region **geometrically from its own capacity** (no `bif_heap_words` floor) and is capped by `max_heap_words` only when `+hmax` is set.
 The pool is a **high-water mark reused across calls**: two compiles in one runtime (`cerl_clauses` then `orddict`) end at the same 27 regions / 161 MB, not at double.
 **Region capacity is not what costs RSS.** A fresh region is `mmap`ed and only the pages actually written become resident, so the pool's 161 MB of capacity corresponds to `bif_peak_used_words` = 28 916 words (226 kB) ever written; `ReservedHeap` tracks `reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and `try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers VmSize by its full size and RSS by **zero**.
+A `run`-route `cerl_clauses` compile ends at `bif_regions` = 6 / 17 432 576 words with `bif_peak_used_words` = 5 397 and peak `VmHWM` 423 844 kB, against 27 / 20 185 088 / 28 916 and 372 MB on the `-eval` route — the two routes reach different depths, so quote the route with the figure.
 The depth-sized seed therefore trades address space for written pages rather than winning on both: reservation fell 22× (3.62 GB → 161 MB) while `cerl_clauses`' in-process peak `VmHWM` moved 334 MB → 372 MB, because a nested region that now grows on demand writes pages a 128 MiB untouched seed never wrote.- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
   deep-copied onto the store (`Runtime::grow_eval_heap`: it doubles the region and pushes
   the replaced one onto `eval_heap_retired`, which is never freed).
