@@ -168,6 +168,10 @@ Switches:
   +Q N                      maximum number of ports (legacy, or 1024..=134217727)
   +K true|false             kernel-poll switch
   +sbt TYPE                 scheduler bind type (u|db|s|ps|ts|tnnps|nnps|nnts|ns)
+  +SP N[:N]                 normal schedulers as a percentage (validated; no effect here)
+  +SDcpu N[:N], +SDPcpu N[:N]
+                            dirty CPU schedulers / their percentage (validated; no effect)
+  +SDio N                   dirty I/O schedulers (validated; no effect here)
   -MNAME[=VALUE]            ERTS allocator flag (also +MM.../+MB...; preserved verbatim)
   +hms N                    minimum heap size, in words
   +hmbs N                   minimum binary virtual heap size, in words
@@ -184,6 +188,9 @@ Switches:
   -emu_flavor emu|jit|smp   emulator flavor
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
                             a +FLAG is an emulator flag and is not an init argument
+
+A +switch that reads a value takes it ATTACHED or as the next token: +S1 is +S 1,
++A0 is +A 0, +P65536 is +P 65536, +Q1024 is +Q 1024, +Ktrue is +K true, +sbtu is +sbt u.
 
 Environment (merged into the command line, real erl's order):
   ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
@@ -348,7 +355,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
     };
     let mut index = 0;
     while index < args.len() {
-        let argument = args[index].as_str();
+        let token = args[index].as_str();
+        // The C's attached-or-separated rule: a token carrying its value (`+S1`, `+A0`,
+        // `+sbtu`) is the switch plus that value, so the token is first resolved to the
+        // switch it spells ([`plus_switch_of`]) and the remainder travels as the value
+        // ([`plus_value_of`]). A token that is no attached spelling resolves to itself, so
+        // every separated spelling keeps behaving exactly as before.
+        let argument = plus_switch_of(token);
         match argument {
             "-version" | "--version" => {
                 builder.record(argument, Vec::new());
@@ -387,12 +400,12 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // launcher would reject such a name and force `isdistributed = 0`, which is
                 // a runtime-core fidelity gap (`M1_GAPS.md`), so only the exit status is
                 // matched here.
-                let value = plus_value_of(args, index, argument)?;
+                let (value, next) = plus_value_of(args, index, token, argument)?;
                 builder.record(argument, vec![value.clone()]);
                 if !is_switch(&value) {
                     builder.emulator.node_name = Some(value);
                 }
-                index += 2;
+                index = next;
             }
             "-setcookie" => {
                 // `-setcookie` takes a list of values exactly like `-pa`/`-pz`: the oracle
@@ -446,44 +459,50 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.emulator.flavor = flavor;
                 index += 2;
             }
+            // `+Q [N|legacy]` — the port table (`erl_init.c:1888-1905`). The value may be
+            // attached (`+Q1024`) or a separate token (`+Q 1024`); both are the same switch.
             "+Q" => {
-                let value = plus_value_of(args, index, "+Q")?;
+                let (value, next) = plus_value_of(args, index, token, "+Q")?;
                 builder.max_ports = flags::parse_max_ports("+Q", &value)?;
                 builder.preserve("+Q", &value);
-                index += 2;
+                index = next;
             }
+            // `+K [true|false]` — the kernel-poll switch (`erl_check_io.c:2467`), attached
+            // (`+Ktrue`) or separated (`+K true`).
             "+K" => {
-                let value = plus_value_of(args, index, "+K")?;
+                let (value, next) = plus_value_of(args, index, token, "+K")?;
                 // The emulator only `get_arg`s the value — there is **no** validation
                 // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and bare
                 // `+K` (which consumes whatever follows, blindly) included.
                 flags::parse_kernel_poll("+K", &value)?;
                 builder.preserve("+K", &value);
-                index += 2;
+                index = next;
             }
+            // `+sbt [TYPE]` — the scheduler bind type, attached (`+sbtu`, the spelling the
+            // real `erlc` front end sends) or separated (`+sbt u`).
             "+sbt" => {
-                let value = plus_value_of(args, index, "+sbt")?;
+                let (value, next) = plus_value_of(args, index, token, "+sbt")?;
                 flags::parse_sbt("+sbt", &value)?;
                 builder.preserve("+sbt", &value);
-                index += 2;
+                index = next;
             }
             // `+t N` — the atom-table size (`erl_init.c:2217-2234`); the value is
             // validated and preserved verbatim, so `atom_limit` can follow it
             // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
             "+t" => {
-                let value = plus_value_of(args, index, "+t")?;
+                let (value, next) = plus_value_of(args, index, token, "+t")?;
                 flags::parse_atom_table_size("+t", &value)?;
                 builder.preserve("+t", &value);
-                index += 2;
+                index = next;
             }
             // `+e N` — the maximum number of ETS tables (`erl_init.c:1696-1707`); only a
             // negative value is rejected; `ets_limit` follows the value (see
             // `crate::info::limits`).
             "+e" => {
-                let value = plus_value_of(args, index, "+e")?;
+                let (value, next) = plus_value_of(args, index, token, "+e")?;
                 flags::parse_ets_tables("+e", &value)?;
                 builder.preserve("+e", &value);
-                index += 2;
+                index = next;
             }
             // `+B [c|d|i]` (and the in-token `+Bi`/`+Bc`/`+Bd`) — the break-handler switch
             // (`erl_init.c:1822-1843`). It never rejects a value: an unrecognized one falls
@@ -514,16 +533,61 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             other if flags::is_allocator_switch(other) => {
                 index = flags::parse_allocator(&args[index], args, index)?;
             }
+            // `+S [TOTAL][:ONLINE]` — the normal scheduler counts (`erl_init.c:1102-1160`),
+            // attached (`+S1`, `+S2:1`) or separated (`+S 1`, `+S 2:1`); both spellings are
+            // the same switch and land in the same `emulator.schedulers` /
+            // `online_schedulers` fields.
             "+S" => {
-                let value = plus_value_of(args, index, "+S")?;
+                let (value, next) = plus_value_of(args, index, token, "+S")?;
                 let (total, online) = parse_schedulers(&value)?;
                 builder.emulator.schedulers = total;
                 builder.online_schedulers = online;
-                index += 2;
+                index = next;
+            }
+            // `+SP[PERCENT]` — the normal schedulers as a percentage of the processor count
+            // (`erl_init.c:966-1000`), attached (`+SP50`, `+SP:50`) or separated. This
+            // runtime has no percentage sizing, so the value is **validated** (the C's
+            // `%d`/`%d:%d`/`:%d` shape, no negative field) and **preserved verbatim** in
+            // `extra_emulator_flags`; it has no runtime-visible effect and is not silently
+            // dropped. `+SPabc` stays the emulator's exit-1 `bad schedulers percentage
+            // specifier`.
+            "+SP" => {
+                let (value, next) = plus_value_of(args, index, token, "+SP")?;
+                flags::parse_scheduler_percentage("+SP", &value)?;
+                builder.preserve("+SP", &value);
+                index = next;
+            }
+            // `+SDcpu[TOTAL][:ONLINE]` / `+SDPcpu[PERCENT][:PERCENT]` — the dirty CPU
+            // schedulers (`erl_init.c:1001-1080`). This runtime has no dirty schedulers, so
+            // the values are **validated** (`+SDcpu`: the C's `%d`/`%d:%d`/`:%d` shape, whose
+            // fields the C applies as counts or as offsets from the host's scheduler count;
+            // `+SDPcpu`: the same shape with no negative field) and **preserved verbatim**;
+            // they have no runtime-visible effect. A malformed value stays the emulator's
+            // exit-1 rejection.
+            "+SDcpu" | "+SDPcpu" => {
+                let (value, next) = plus_value_of(args, index, token, argument)?;
+                if argument == "+SDPcpu" {
+                    flags::parse_scheduler_percentage(argument, &value)?;
+                } else {
+                    flags::parse_dirty_schedulers(argument, &value)?;
+                }
+                builder.preserve(argument, &value);
+                index = next;
+            }
+            // `+SDio N` — the dirty I/O schedulers (`erl_init.c:1081-1096`), `atoi`-read and
+            // range-checked; validated and preserved verbatim, with no runtime-visible
+            // effect here (this runtime has no dirty schedulers).
+            "+SDio" => {
+                let (value, next) = plus_value_of(args, index, token, "+SDio")?;
+                flags::parse_dirty_io_schedulers("+SDio", &value)?;
+                builder.preserve("+SDio", &value);
+                index = next;
             }
             "-smp" => index = parse_smp_switch(args, index, &mut builder)?,
+            // `+A [N]` — the async-thread pool (`erl_init.c:929-940`), attached (`+A0`) or
+            // separated (`+A 0`); the value is preserved verbatim.
             "+A" => {
-                let value = plus_value_of(args, index, "+A")?;
+                let (value, next) = plus_value_of(args, index, token, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
                 // The emulator's reader is a bare `atoi`, so any value is accepted (junk
@@ -533,15 +597,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                     return Err(error::bad_switch_value("+A", &value));
                 }
                 builder.preserve("+A", &value);
-                index += 2;
+                index = next;
             }
+            // `+P [N|legacy]` — the process table (`erl_init.c:1870-1886`), attached
+            // (`+P65536`, the spelling the real `erlc` front end sends) or separated.
             "+P" => {
-                let value = plus_value_of(args, index, "+P")?;
+                let (value, next) = plus_value_of(args, index, token, "+P")?;
                 builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
-                index += 2;
+                index = next;
             }
             "+hms" => {
-                let value = plus_value_of(args, index, "+hms")?;
+                let (value, next) = plus_value_of(args, index, token, "+hms")?;
                 let raw = parse_heap_words("+hms", &value)?;
                 // The **raw** value is what the `+hmax` ordering rule compares against
                 // (`erl_init.c:1564` sets `H_MIN_SIZE` unrounded; the growth-table rounding
@@ -549,17 +615,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // options round it.
                 builder.raw_min_heap_words = raw;
                 builder.heap.set_min_heap_words(raw);
-                index += 2;
+                index = next;
             }
             "+hmbs" => {
-                let value = plus_value_of(args, index, "+hmbs")?;
+                let (value, next) = plus_value_of(args, index, token, "+hmbs")?;
                 builder
                     .heap
                     .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
-                index += 2;
+                index = next;
             }
             "+hmax" => {
-                let value = plus_value_of(args, index, "+hmax")?;
+                let (value, next) = plus_value_of(args, index, token, "+hmax")?;
                 let max = parse_max_heap_size(&value)?;
                 // The C's **order-dependent** parse-time rule (`erl_init.c:1634-1639`): when a
                 // `+hmax` is parsed and a **previous** one set a nonzero `H_MAX_SIZE` that is
@@ -575,12 +641,12 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                     ));
                 }
                 builder.heap.set_max_heap_words(max);
-                index += 2;
+                index = next;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
-                let value = plus_value_of(args, index, argument)?;
+                let (value, next) = plus_value_of(args, index, token, argument)?;
                 builder.set_max_heap_flag(argument, &value)?;
-                index += 2;
+                index = next;
             }
             // The perf-map / JIT-dump surface (contract A.8). The two switches are emulator
             // flags: they are validated here, preserved verbatim in `extra_emulator_flags`
@@ -588,16 +654,16 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             // value is taken verbatim — an unusable directory surfaces as a failed file
             // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
             "+JPperf" => {
-                let value = plus_value_of(args, index, "+JPperf")?;
+                let (value, next) = plus_value_of(args, index, token, "+JPperf")?;
                 builder.perf_map.set_flag(&value)?;
                 builder.preserve("+JPperf", &value);
-                index += 2;
+                index = next;
             }
             "+JPperfdirectory" => {
-                let value = plus_value_of(args, index, "+JPperfdirectory")?;
+                let (value, next) = plus_value_of(args, index, token, "+JPperfdirectory")?;
                 builder.perf_map.set_directory(value.clone());
                 builder.preserve("+JPperfdirectory", &value);
-                index += 2;
+                index = next;
             }
             "-s" => index = builder.parse_apply(args, index, "-s")?,
             "-run" => index = builder.parse_apply(args, index, "-run")?,
@@ -873,20 +939,83 @@ fn value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
         .ok_or_else(|| error::missing_value(switch))
 }
 
-/// The operand of a **`+`-switch**, consumed **blindly**.
+/// The `+`-switches whose value the C reads with its attached-or-separated rule
+/// ([`plus_value_of`]), as `(the letters after the `+`, the switch they spell)`.
+const ATTACHED_PLUS_SWITCHES: [(&str, &str); 7] = [
+    ("A", "+A"),
+    ("P", "+P"),
+    ("Q", "+Q"),
+    ("K", "+K"),
+    ("t", "+t"),
+    ("e", "+e"),
+    ("sbt", "+sbt"),
+];
+
+/// The switch the token `token` **spells**: the canonical `+`-switch name when the token is
+/// an attached spelling of one of them (`+S1` → `+S`, `+SP50` → `+SP`, `+sbtu` → `+sbt`),
+/// otherwise `token` itself.
 ///
-/// The oracle launcher's `NEXT_ARG_CHECK_NAMED` (`erts/etc/common/erlexec.c:414-418`, with
-/// `sep = "--"` at 193) rejects the switch only when it is the **last** token or the next
-/// token is exactly `--`; every other following token is taken as the value, even one that
-/// itself looks like a switch. So `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value
-/// (the `-eval` never runs) and exits 0, while `erl -noshell ... +K` and `erl +K -- ...`
-/// exit **1** with `Missing argument(s) for '+K'.`
+/// The C's argument loop reads a `+`-switch's value with `get_arg(argv[i] + n, argv[i+1],
+/// &i)` (`erts/emulator/beam/erl_init.c:496-508`): anything **attached** to the switch
+/// letters *is* the value, so `+S1`, `+A0` and `+sbtu` are the same switches as `+S 1`,
+/// `+A 0` and `+sbt u`. Resolving the token to its switch here lets every arm below handle
+/// both spellings, with [`plus_value_of`] splitting off the attached remainder.
+///
+/// `+S` is the one family with sub-forms, chosen — as in the C — by the first attached
+/// character (`argv[i][2]`, `erl_init.c:966`, `:1001`): `P` is the scheduler percentage
+/// (`+SP`), `Dcpu`/`DPcpu`/`Dio` are the dirty-scheduler switches, and everything else
+/// (including nothing) is the plain `+S`.
+fn plus_switch_of(token: &str) -> &str {
+    let Some(rest) = token.strip_prefix('+') else {
+        return token;
+    };
+    if let Some(after_s) = rest.strip_prefix('S') {
+        return match after_s {
+            attached if attached.starts_with("Dcpu") => "+SDcpu",
+            attached if attached.starts_with("DPcpu") => "+SDPcpu",
+            attached if attached.starts_with("Dio") => "+SDio",
+            attached if attached.starts_with('P') => "+SP",
+            _ => "+S",
+        };
+    }
+    match ATTACHED_PLUS_SWITCHES
+        .iter()
+        .find(|(letters, _)| rest.starts_with(letters))
+    {
+        Some((_, switch)) => switch,
+        None => token,
+    }
+}
+
+/// The value of the **`+`-switch** `switch`, which the token at `args[index]` spells as
+/// `token`, together with the index of the next switch.
+///
+/// This is the C's `get_arg` rule (`erts/emulator/beam/erl_init.c:496-508`): when the
+/// characters **attached** to the switch are non-empty they *are* the value — nothing else
+/// is consumed (`+S1` is `+S 1`, `+A0` is `+A 0`) — and only when they are empty (or absent)
+/// is the **next** token the value, still consumed **blindly**.
+///
+/// That blind consumption is the oracle launcher's `NEXT_ARG_CHECK_NAMED`
+/// (`erts/etc/common/erlexec.c:414-418`, with `sep = "--"` at 193): it rejects the switch
+/// only when it is the **last** token or the next token is exactly `--`; every other
+/// following token is taken as the value, even one that itself looks like a switch. So
+/// `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value (the `-eval` never runs) and
+/// exits 0, while `erl -noshell ... +K` and `erl +K -- ...` exit **1** with
+/// `Missing argument(s) for '+K'.`
 ///
 /// That diagnostic is the launcher's, so the error is [`error::missing_switch_operand`] (a
 /// flag rejection, exit 1), **not** [`error::missing_value`] (this CLI's usage status).
-fn plus_value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
+fn plus_value_of(
+    args: &[String],
+    index: usize,
+    token: &str,
+    switch: &str,
+) -> Result<(String, usize)> {
+    if let Some(attached) = token.strip_prefix(switch).filter(|rest| !rest.is_empty()) {
+        return Ok((attached.to_string(), index + 1));
+    }
     match args.get(index + 1) {
-        Some(next) if next != "--" => Ok(next.clone()),
+        Some(next) if next != "--" => Ok((next.clone(), index + 2)),
         _ => Err(error::missing_switch_operand(switch)),
     }
 }
@@ -2108,7 +2237,173 @@ mod tests {
         assert!(parse_args(&["+S"]).is_err());
     }
 
-    /// The `+hms`/`+hmbs` heap options, pinned against the oracle (OTP 29.1.1 /
+    /// The C's **attached-or-separated** value rule (`erts/emulator/beam/erl_init.c:496-508`,
+    /// `get_arg`): a `+`-switch may carry its value in the same token, and `+S1` / `+A0` /
+    /// `+P65536` / `+Q1024` / `+Ktrue` / `+sbtu` are the same switches as the two-token
+    /// spellings `+S 1` / `+A 0` / `+P 65536` / `+Q 1024` / `+K true` / `+sbt u`.
+    ///
+    /// This is the spelling the real `erlc` front end hands the runtime
+    /// (`+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput -mode minimal …`), so a scheduler-bind
+    /// value and a scheduler count arriving attached must not be the emulator's
+    /// `unknown flag` refusal.
+    #[test]
+    fn attached_plus_switch_values_are_the_separated_switches() {
+        // `+S1` — the scheduler count, *identical* to `+S 1` in every observable.
+        let attached = parsed(&["+S1"]);
+        let separated = parsed(&["+S", "1"]);
+        assert_eq!(attached.emulator.schedulers, Some(1));
+        assert_eq!(attached.emulator.schedulers, separated.emulator.schedulers);
+        assert_eq!(attached.online_schedulers, separated.online_schedulers);
+        assert_eq!(attached.action, separated.action);
+        assert_eq!(
+            attached.emulator.extra_emulator_flags,
+            separated.emulator.extra_emulator_flags
+        );
+        assert_eq!(attached.init_args.get("S"), None);
+
+        // The `total:online` form, in one token.
+        let config = parsed(&["+S2:1"]);
+        assert_eq!(config.emulator.schedulers, Some(2));
+        assert_eq!(config.online_schedulers, Some(1));
+        // `+S 0` selects the defaults in both spellings (`parse_schedulers`'s `0` rule), so
+        // the attached `+S0` is the same non-refusal.
+        assert_eq!(parsed(&["+S0"]).emulator.schedulers, None);
+        assert_eq!(
+            parsed(&["+S0"]).emulator.schedulers,
+            parsed(&["+S", "0"]).emulator.schedulers
+        );
+        // `+S:2` behaves exactly like the separated `+S :2` — whatever that is, the two
+        // spellings cannot disagree (both are the current parser's refusal of an empty
+        // total; the C's `:%d` online-only form is not modelled by `parse_schedulers`).
+        assert_eq!(
+            parse_args(&["+S:2"]).is_err(),
+            parse_args(&["+S", ":2"]).is_err()
+        );
+
+        // Each attached spelling preserves the same `(switch, value)` pair as the separated
+        // one, and every one of them is refused when its value is malformed.
+        for (attached_args, separated_args, switch, value) in [
+            (&["+A0"][..], &["+A", "0"][..], "+A", "0"),
+            (&["+P65536"][..], &["+P", "65536"][..], "+P", "65536"),
+            (&["+Q1024"][..], &["+Q", "1024"][..], "+Q", "1024"),
+            (&["+Ktrue"][..], &["+K", "true"][..], "+K", "true"),
+            (&["+sbtu"][..], &["+sbt", "u"][..], "+sbt", "u"),
+            (&["+t8192"][..], &["+t", "8192"][..], "+t", "8192"),
+            (&["+e100"][..], &["+e", "100"][..], "+e", "100"),
+        ] {
+            let config = parsed(attached_args);
+            let separated = parsed(separated_args);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                separated.emulator.extra_emulator_flags,
+                "{attached_args:?}"
+            );
+            // `+P` is modelled rather than preserved, so its channel is empty; every other
+            // switch in the table carries exactly its own pair.
+            if config.emulator.extra_emulator_flags.is_empty() {
+                assert_eq!(switch, "+P", "only +P is modelled instead of preserved");
+            } else {
+                assert_eq!(
+                    config.emulator.extra_emulator_flags,
+                    vec![switch.to_string(), value.to_string()],
+                    "{attached_args:?}"
+                );
+            }
+            assert_eq!(
+                config.emulator.max_processes,
+                separated.emulator.max_processes
+            );
+            assert_eq!(config.max_ports, separated.max_ports);
+            assert_eq!(config.action, separated.action);
+            assert_eq!(config.init_args.get(flag_name(switch)), None);
+        }
+        assert_eq!(parsed(&["+P65536"]).emulator.max_processes, Some(65_536));
+        assert_eq!(parsed(&["+Q1024"]).max_ports, Some(1024));
+
+        // The `+S` sub-forms: a percentage and a dirty-scheduler count are validated and
+        // preserved verbatim (this runtime has no percentage sizing and no dirty
+        // schedulers, so they have no runtime-visible effect).
+        for (args, switch, value) in [
+            (&["+SP50"][..], "+SP", "50"),
+            (&["+SDPcpu50"][..], "+SDPcpu", "50"),
+            (&["+SDcpu2"][..], "+SDcpu", "2"),
+            (&["+SDio2"][..], "+SDio", "2"),
+        ] {
+            let config = parsed(args);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec![switch.to_string(), value.to_string()],
+                "{args:?}"
+            );
+            assert_eq!(config.emulator.schedulers, None, "{args:?}");
+            assert_eq!(config.init_args.get(flag_name(switch)), None, "{args:?}");
+        }
+        // … and the separated spellings of the same sub-forms.
+        for (args, switch, value) in [
+            (&["+SP", "50"][..], "+SP", "50"),
+            (&["+SDcpu", "2"][..], "+SDcpu", "2"),
+        ] {
+            assert_eq!(
+                parsed(args).emulator.extra_emulator_flags,
+                vec![switch.to_string(), value.to_string()],
+                "{args:?}"
+            );
+        }
+
+        // Still refused, in **both** spellings, as the emulator refuses them (`bad amount of
+        // schedulers`, `invalid type`, `bad number of async threads`): a non-numeric or
+        // out-of-range value is never accepted just because it arrived attached.
+        for args in [
+            &["+Sabc"][..],
+            &["+S", "abc"][..],
+            &["+S4:5"][..],
+            &["+S", "4:5"][..],
+            &["+sbtzz"][..],
+            &["+sbt", "zz"][..],
+            &["+A", "-5"][..],
+            &["+SPabc"][..],
+            &["+SP-5"][..],
+            &["+SDcpuabc"][..],
+            &["+SDPcpu-5"][..],
+            &["+SDio0"][..],
+            &["+P1000"][..],
+            &["+Q0"][..],
+        ] {
+            let error = parse_args(args).expect_err("a malformed value is refused");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// An attached `+S`/`+A`/`+P`/`+Q`/`+K`/`+sbt` `/`+t`/`+e` spelling is consumed as one
+    /// token, so the switch after it is still parsed (nothing is swallowed as a value).
+    #[test]
+    fn an_attached_plus_value_consumes_only_its_own_token() {
+        let config = parsed(&["+S1", "+A0", "+sbtu", "+P65536", "+Q1024", "-eval", "halt(0)"]);
+        assert_eq!(config.emulator.schedulers, Some(1));
+        assert_eq!(config.emulator.max_processes, Some(65_536));
+        assert_eq!(config.max_ports, Some(1024));
+        assert_eq!(config.action, Action::Eval("halt(0)".to_string()));
+        assert_eq!(
+            config.emulator.extra_emulator_flags,
+            vec![
+                "+A".to_string(),
+                "0".to_string(),
+                "+sbt".to_string(),
+                "u".to_string(),
+                "+Q".to_string(),
+                "1024".to_string(),
+            ]
+        );
+        // A **missing** operand stays the launcher's exit-1 diagnostic rather than becoming
+        // an empty attached value.
+        for args in [&["+S"][..], &["+sbt"][..], &["+A"][..], &["+P"][..], &["+K"][..]] {
+            let error = parse_args(args).expect_err("a missing operand is refused");
+            assert!(
+                error::flag_rejected_diagnostic(&error).is_some(),
+                "{args:?}"
+            );
+        }
+    }    /// The `+hms`/`+hmbs` heap options, pinned against the oracle (OTP 29.1.1 /
     /// erts-17.1):
     ///
     /// ```text
@@ -2915,6 +3210,9 @@ mod tests {
             "+Q",
             "+K",
             "+sbt",
+            "+SP",
+            "+SDcpu",
+            "+SDio",
             "-MNAME",
             "+MM",
             "+MB",
