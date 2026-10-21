@@ -178,3 +178,39 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
 * [`../../../CONTEXT.md`](../../../CONTEXT.md) → the crate-level CLI/exit-code/`system_info` surface.
 * [`../../../M1_GAPS.md`](../../../M1_GAPS.md) · [`../../../TRACE_AND_PERF.md`](../../../TRACE_AND_PERF.md) · [`../../../PERF_DISPATCH.md`](../../../PERF_DISPATCH.md) → the gap index, the trace seam and the per-call measurement ledgers.
 * [`../../../../beam_bifs/CONTEXT.md`](../../../../beam_bifs/CONTEXT.md) → the BIF registry and the fifteen host seams this path installs.
+
+## The reference walk runs only where its answer is observable
+
+`RuntimeContext::call_registered`'s result tail walks the result graph for a reference
+(`RuntimeContext::graph_holds_reference`) **only when `move_container`** — i.e. on a process route
+(`mailbox_table.is_some()`) or on a table-less call no escaping arm took (`safe_to_rewind`).
+The walk's answer has exactly two consumers, both gated identically: this arm, which only sets
+`rewind = false`, and the copy arm, which copies and then sets `rewind = safe_to_rewind`.
+When `move_container` is false the copy arm cannot run and `rewind` is already `false`, so both
+answers of the walk produce the same `result` and the same `rewind` — the walk is unobservable
+there and is skipped.
+A **table-less reentrant** call — any call carrying a fun argument (`lists:foldl/3`, `lists:map/2`,
+`maps:map/2`, … where `!reentrant` is a conjunct of `safe_to_rewind`) — is therefore never walked:
+that is the accumulator shape, a whole intermediate compiler AST, and it was the quadratic term in
+the in-process `compile:file/2` route (contract A.9).
+Measured on this change: walk visits fall 79.4 % on `lib/stdlib/src/string.erl` (408.5 M → 84.1 M),
+82.2 % on `lib/compiler/src/v3_core.erl` (1.63 G → 290 M), 62.6 % on `maps.erl` and 60.3 % on
+`ordsets.erl`, with every compiled artifact byte-identical to the oracle's; the remaining walk calls
+(~87 % of the old count) are the non-reentrant ones, whose `[Fun|T]`-shaped results are legitimately
+observable.
+
+The walk's visit count is accumulated in a **local** `u64` and folded in once per walk through
+`perf_counters::add_visits` at the walk's single exit (both early answers `break 'walk` into it), so
+the diagnostic counter costs one `enabled()`/`borrow_mut` per walk rather than per visited object.
+`#[cfg(test)] notes::note_walk_visit_fold` is called from the same statement, so the test-only
+per-visit counter and the folded total are pinned to agree on every exit shape.
+
+### Rejected experiments — do not retry these
+* **Fusing reference detection with a per-visit pool-touch copy-skip** is a net loss: +2.4 %
+  instructions on `maps.erl` and +6.8 % on `string.erl`, because the extra per-visit test is charged
+  to a walk that still visits 10^8 objects.
+* **A fused walk plus a live-region registry** carries the same net loss: the per-visit charge is the
+  cost, not the lookup structure.
+* **The structural fix** — making internal reference terms literal-area terms, so every copier shares
+  them and no result ever needs the exemption — is a cross-crate change owned by
+  `beam_term`/`beam_message`/`beam_gc`, not this node.

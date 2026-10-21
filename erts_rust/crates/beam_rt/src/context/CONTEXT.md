@@ -210,3 +210,12 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
 * [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — companion detail for every pointer above, incl. the pinned root-set/relocation/cost sections.
 * [`calls/CONTEXT.md`](calls/CONTEXT.md) · [`gc/CONTEXT.md`](gc/CONTEXT.md) · [`pool/CONTEXT.md`](pool/CONTEXT.md) — the three subsystem children.
 
+
+## The copy-out's reference walk is gated on `move_container`
+`RuntimeContext::graph_holds_reference` runs only where its answer is observable — i.e. only when
+`move_container` holds in `RuntimeContext::call_registered`'s result tail — so a **table-less**
+route's reentrant call never walks its result.
+That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), the super-linear term
+of the in-process `compile:file/2` route (A.9).
+The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
+[`calls/CONTEXT.md`](calls/CONTEXT.md).
