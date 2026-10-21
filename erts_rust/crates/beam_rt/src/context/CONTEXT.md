@@ -90,7 +90,7 @@ Detail, gates and the residual list: [`gc/CONTEXT.md`](gc/CONTEXT.md); the pinni
 Mechanics: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-node-hash-a2--node_hashrs).
 
 ## Constraints
-* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with two narrowly-scoped exceptions (`gc_walk.rs`'s `beam_term::layout` object-walk; `../nif.rs`'s `enif_compare`/`enif_hash` `unsafe extern "C"` calls); the glue otherwise uses only the safe peripheries of the lower crates.
+* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with one `#![allow(unsafe_code)]` per marked module and a `// SAFETY:` rationale at each site — this node's `gc.rs`, `gc_walk.rs`, `gc/bin_vheap.rs`, `gc/valve_bounds.rs` (the word classifier and the reachability descent), `calls.rs` (the copy-out walk) and `eval/reclaim.rs` + `eval/reclaim/resource.rs` (the off-heap prune), plus `../nif.rs` and `../malloc.rs`; the glue otherwise uses only the safe peripheries of the lower crates.
 * **Return-based errors, no silent swallowing** ([`../../../CONTEXT.md`](../../../CONTEXT.md) §3): every fallible helper returns `beam_common::Result`; no `panic!`/`unwrap()` on runtime data.
 * **Call down, never duplicate**: a BIF is served by `beam_bifs`/the native floor, never re-implemented here.
 * **Never fabricate a value**: a seam answer is either real state or the typed gap — `NodeIdentity` reports the runtime's **live** creation (`Runtime::node_creation()`), and the node hash is a genuine per-process computation, never a constant.
@@ -221,95 +221,78 @@ The rule, the proof obligation, the measured visit reductions and the three reje
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
 ## Host-memory retention on the table-less route — where the words actually accumulate
 An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
-false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route; the
-retention is a property of four runtime-level stores, and all four are grow-only.
+false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route.
 Nothing here is per-`RuntimeContext`: a context is a borrow-only struct over `&'a mut Runtime`
 (`runtime_context.rs:198-287`), so it owns no heap at all and dropping it frees only its inline
 `dispatch_memo` slots and the boxes a miss put in them.
+Of the four runtime-level stores, two are now **sized by need** (the pooled BIF heap is depth-sized and reused, the `-eval` store is clamped at `MAX_EVAL_HEAP_WORDS` = 256 MiB), the escaped off-heap store is genuinely bounded, and **the `beam_engine` arena is the one unbounded region left**.
+A region's *capacity* is never what moves RSS: only written pages are resident (below).
 Per-mechanism detail is [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; this is the cross-store attribution.
 
 ### The measured attribution (release build, OTP-30 bootstrap compiler first on `-pa`)
 `erlang:memory(total)` is **blind** to all of it (≈4.7 MB after a full `cerl_clauses` compile) because the
 pool/arena heaps are `AllocType::Standard` and the `MemoryHook` excludes `Standard` from `emulator`
-(`memory_hook.rs:161-195`). The two figures that see the truth are `/proc/<pid>/status` `VmHWM` and
-`beam_alloc`'s `std_alloc.live_bytes` (`std_live`, the sum of the **whole reservations**).
+(`memory_hook.rs:161-195`). The figures that see the truth are `/proc/<pid>/status` `VmHWM`/`VmSize`,
+the last `VmRSS` sample after `src/malloc.rs`'s one `malloc_trim(0)`, and `Runtime::retention_stats()`
+(`BEAM_RT_MEM_TRACE=1`).
 
-| workload | peak `VmHWM` | peak `std_live` | steady `std_live` | wall |
-|---|---|---|---|---|
-| bare `-eval 'halt(0).'` | 115 MB | 561 MB (≈4 regions) | — | 0.33 s |
-| `cerl_clauses` (13 793 B) | 334 MB (`-eval`) / 282 MB (`run`) | — / 3.81 GB | 3.79–3.83 GB | 1.0 s / 2.4 s |
-| `inet_parse` (36 960 B) | 2.08 GB | 6.89 GB | ≈5.3 GB | >222 s, never completes |
-| `dbg_iload` (48 353 B) | 9.18 GB | 23.02 GB | ≈13.5 GB | >300 s, never completes |
-
-The store is a **count of `heap_words`-sized regions**: `heap_words = 1 << 24` words = **134 217 728 B
-(128 MiB)** (`runtime.rs:1228` → `term_heap_words` `:132-139`), and every step of the sampled `std_live`
-series is an exact integral multiple of that figure (measured steps `+141 995 216`, `+135 177 168`,
-`+673 300 640` = 5×, `+2 569 MB` = 19×). Region counts: cerl_clauses **28.4**, inet_parse **39.7** (peak
-51.3), dbg_iload **171.5** — i.e. one full-size region **per concurrent nested-run level**, held in
-`bif_heaps` (the push/pop pool is a stack: live regions = max nesting depth).
-Two decisive controls:
-- **`+hmax 1000000`** (which caps `term_heap_words`, hence every `Heap::new(heap_words)` site) on the same
-  source and route: peak `std_live` 3.81 GB → **104 MB**, peak RSS 289 MB → **147 MB**, and still
-  `{ok,cerl_clauses}` (`inet_parse` at that cap answers `error`, so the cap is workload-dependent).
-  Its RSS saving is entirely the eval store's fill that the smaller region avoids — the boot floor is
-  flag-invariant (see *Host memory: the touched pages*).
-- **Two compiles in one runtime**: `std_live` stays **3.83 GB**, not 7.6 GB — the pool is a
-  **high-water mark reused across compiles**, not a per-compile leak; it is released only when the
-  `Runtime` drops (or the pool is bounded, which it is not).
-RSS ≪ `std_live` because a fresh region is `mmap`ed and only the pages actually written become resident
-(inet_parse: 0.4–0.5 GB RSS against 5.3 GB live reservations).
-The **reserved-but-never-committed** tail is *not* what costs RSS: `ReservedHeap` tracks
-`reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and
-`try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers `std_live`
-and VmSize by its full size but RSS by **zero**. Only *not allocating* (or not touching) a region lowers
-RSS, so down-sizing `heap_words` lowers RSS exactly where a region actually fills (`eval_heap`, see
-*Host memory: the touched pages*) and a reservation-truncating fix never does.
-- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
-  deep-copied onto the store (`runtime.rs:2286-2295`: `grow_eval_heap` doubles the region and pushes
+| workload | peak `VmHWM` | peak `VmSize` | exit RSS | wall | exit `bif_regions` / `bif_words` |
+|---|---|---|---|---|---|
+| bare `-eval 'halt(0).'` | 118 MB | 587 MB | 23.2 MB | 0.27 s | 3 / 136 MB |
+| `cerl_clauses` 13 793 B, in-process | 372 MB | 962 MB | 21–30 MB | 0.87–0.99 s | 27 / 161 MB |
+| `cerl_clauses` 13 793 B, spawned child | 307 MB | 887 MB | 21–28 MB | 2.42 s | 27 / 161 MB |
+| `orddict` 15 800 B, in-process | 363 MB | — | 30.6 MB | 0.95 s | 23 / 157 MB |
+| `inet_parse` 36 960 B, in-process | 7.8 GB | — | 23.0 MB | 16.9 s (**completes**) | 34 / 169 MB |
+| `dbg_iload` 48 353 B, in-process | ≥19.7 GB at 25 s | — | — (killed at 25 s) | **does not complete** | — |
+The pool's capacity is **depth-sized now**: the outermost call gets `bif_heap_words` (1 << 24 words = 128 MiB) and every nested level gets `NESTED_BIF_HEAP_SEED_WORDS` (131 072 words = 1 MiB), self-tuned upward to `2 ×` an observed nested peak by `note_nested_heap_need`, with `bif_heaps_taken` the live depth.
+For `cerl_clauses` that is 27 regions / 20 185 088 words = **161 MB**, where seeding every level at `bif_heap_words` gave the same 27 regions 27 × 16 777 216 = **3.62 GB** — 22× less reservation at an identical region count, with `bif_nested_peak_words` 1 550 (23 372 for `inet_parse`), two orders of magnitude under the seed.
+`take_bif_frontier` grows a region **geometrically from its own capacity** (no `bif_heap_words` floor) and is capped by `max_heap_words` only when `+hmax` is set.
+The pool is a **high-water mark reused across calls**: two compiles in one runtime (`cerl_clauses` then `orddict`) end at the same 27 regions / 161 MB, not at double.
+**Region capacity is not what costs RSS.** A fresh region is `mmap`ed and only the pages actually written become resident, so the pool's 161 MB of capacity corresponds to `bif_peak_used_words` = 28 916 words (226 kB) ever written; `ReservedHeap` tracks `reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and `try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers VmSize by its full size and RSS by **zero**.
+The depth-sized seed therefore trades address space for written pages rather than winning on both: reservation fell 22× (3.62 GB → 161 MB) while `cerl_clauses`' in-process peak `VmHWM` moved 334 MB → 372 MB, because a nested region that now grows on demand writes pages a 128 MiB untouched seed never wrote.- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
+  deep-copied onto the store (`Runtime::grow_eval_heap`: it doubles the region and pushes
   the replaced one onto `eval_heap_retired`, which is never freed).
+  Growth is **clamped**: `eval_heap_ceiling()` = `MAX_EVAL_HEAP_WORDS.max(eval_heap.capacity())` (256 MiB), deliberately **not** `+hmax`, and a request past it is the typed `system_limit` that leaves the store exactly as it was (`retention.rs`'s own test).
+  So each step is bounded and the retired *chain* is not: `inet_parse` ends at `eval_heap_words` = 33 554 432 (the ceiling) with **19** retired regions totalling 620 756 992 words (4.96 GB of reservation).
   The statement window that would reclaim a dead prefix is **pinned by the first nested run that
   writes the store** (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), after which
   `scratch::boundary` declines for the remainder of the expression — so a compile, which is one
   `-eval` statement full of store-writing nested runs, only ever advances the store. (An `epp` source
   read lands here too: the native file/prim replies build straight on the store.)
-- **`bif_heaps: Vec<Heap>`** — an unbounded push/pop pool with no cap, no eviction and no free
-  (`runtime.rs:2164-2174`); `take_bif_frontier` retires an *exhausted* region by pushing it back and
-  making the next one its doubled capacity (`calls.rs:160-181`).
+- **`bif_heaps: Vec<Heap>`** — a push/pop pool whose regions are depth-sized and whose growth is geometric (`take_bif_heap`/`put_bif_heap`/`take_bif_frontier`, `note_nested_heap_need`).
   A **reentrant** call on this route (`lists:foldl/3`, `lists:map/2`, `maps:map/2`) has
   `safe_to_rewind == false` (`calls.rs:417`), hence `move_container == false` (`:934`): its
   accumulator result is **not** copied out and `rewind` stays false, so that call's whole graph stays
   owned by the region — which is what exhausts regions on a compile.
   A retired region is kept rather than freed because **another caller still owns words in it**
   (`calls.rs:177-179`), so its capacity is unreclaimable, not merely unreclaimed.
-  Measured: this pool **is** the dominant store, and its size is `max nesting depth × heap_words`
-  (`take_bif_heap`'s `None => Heap::new(self.bif_heap_words)`, `runtime.rs:2167`, is the per-level
-  allocation; the two other `heap_words`-sized sites — the NIF load host `bridges.rs:641` and the
-  foreign-send scratch `runtime.rs:1833` — are not on a compile's path).
+  Measured: the pool is no longer the dominant store (161 MB of capacity, 226 kB ever written); the two other `heap_words`-sized sites — the NIF load host `bridges.rs` and the foreign-send scratch `runtime.rs` — are not on a compile's path).
 - **`Runtime::arena`** — `heap_available`/`alloc_words` on a table-less context answer the arena
-  (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` (`runtime.rs:2180-2182`) → one
+  (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` → one
   `MinimalContext` (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>`
   that **only ever grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes
   the frontier; freed only when the `Runtime` drops (`beam_engine/src/context.rs:1395-1577`).
+  This is the **one unbounded region left** on the route: `arena_words` (cumulative words handed out) reads 5 133 247 (39 MB) after `cerl_clauses`, 9 397 639 (75 MB) after two compiles and 1 328 040 448 (10.6 GB) after `inet_parse`.
   A **scheduled** process's nested run is still `RuntimeContext::new` with `mailbox_table: None` and
-  `gc_armed: false` (`bridges.rs:192-195`), so its accumulator graph also stays on the pooled region
+  `gc_armed: false` (`bridges.rs:192-195`), so its accumulator graph also stays on the arena
   and never reaches a young heap. Measured end state after a *completed* `cerl_clauses` compile:
   `total_heap_size`/`heap_size` = **843 words** on `run <file>` (both the spawned-child and the
   target-process form) and **233 words** on `-eval`, with `garbage_collection.minor_gcs = 0` and
-  `eheap_live = 0` sampled throughout — i.e. **no nursery growth and no collection happen on either
-  route** for this workload. Caveat: `dbg_iload`/`inet_parse` never complete, and the scheduled route
-  does not pre-empt often enough for an Erlang-level poller to sample them mid-run (2 samples in 2.4 s),
-  so their mid-run `heap_size` cannot be read this way.
+  `eheap_live = 0` sampled throughout.
 - **Bounded, and therefore not the grower:** the nested-run `Machine` pool
   (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32; 16 KiB of register files per machine,
   `Vec` high-water capacity retained by `Machine::reset`, never shrunk) and the wall-clock
   `BLOCKING_PUMP_DEADLINE` (900 s). Neither holds a heap.
-**`Process::grow_nursery` is unreachable on the table-less route.** `move_result_into_process_heap`
-returns at its first guard — `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`) — before
-`hint_grow_gate` (`:1494`) and before the growth block (`:1554-1568`).
-On the **scheduled** route it is reachable in code but not reached in practice for a compile (previous
-section's measurement: 843 words, `minor_gcs = 0`), because the compile's work happens in nested runs
-whose context carries `mailbox_table: None`.
 
+### The one unbounded mechanism left: the exempt window's nursery chain
+`Process::grow_nursery` is unreachable on the **table-less** route — `move_result_into_process_heap` returns at its first guard, `let table = mailbox_table.as_deref_mut()?;` (`calls.rs:1490`), before `hint_grow_gate` and before the growth block.
+On the **scheduled** route a big compile's spawned child (`lib/compiler/src/compile.erl`'s `spawn_monitor`) does reach it, and there it is the only door: inside the nested `apply_fun`/`run_*_blocking` subtree the pid is **relocation-exempt** (`with_relocation_exempt`, `runtime_context.rs`, entered at `pump.rs:274` `run_export_blocking`, `pump.rs:353` `run_label_blocking` and `execution.rs:617-618` `apply_fun`), so `Process::has_unpublished_roots()` holds and every collapsing collection door declines.
+`beam_process::Process::grow_nursery` (`beam_process/src/process.rs`) is a **no-collect** seam — its refusal path is not a collection — so a request it cannot honour lengthens the young-space chain instead of collecting.
+Measured with `BEAM_RT_GC_TRACE=1` (one `[rt-heap]` line per copy-out growth): on a big compile the child's `chain_spaces` ratchets **1 → 20** and the chain-summed `chain_used` reaches **378 367 950 words (3.0 GB)** between the last collection and the guard trip, with `debt=true` throughout; even `cerl_clauses`' spawned child reaches `chain_spaces=5` (195 689 used words) and 74 of its 227 growth lines carry `exempt=true`, while the 25 s `dbg_iload` window shows 227 growths with `chain_spaces=1`.
+Closing it needs two sibling-crate APIs and three call sites (recorded here; **not** implemented in this crate):
+- `beam_engine::Machine::for_each_root(&self, f: impl FnMut(Eterm))` — enumerate one nested machine's pointer-bearing roots.
+- `beam_process::Process::collect_with(&self, extra_roots: &[&[Eterm]])` (or the same entry on `beam_gc::Collector`) — collect with caller-published extra roots; the shape `Registers::extra_roots` already carries for one process.
+- Wired at `pump.rs`'s `run_export_blocking`/`run_label_blocking` and `execution.rs`'s `apply_fun`, so the exempt window publishes the outstanding machine stack and **collects** instead of only growing.
 ### Host memory: the touched pages, measured (RSS attribution)
 Measured on the release binary with the OTP-30 bootstrap compiler first on `-pa`, via
 `-eval 'compile:file("…/lib/compiler/src/cerl_clauses.erl",[no_spawn_compiler_process,deterministic,no_docs,{outdir,…}])'`:
@@ -341,48 +324,26 @@ That peak's attribution:
   then `grow_eval_heap` retires it (`eval_heap_retired_regions = 1`, `eval_heap_words = 33 554 432` =
   256 MiB across two regions) and the retired 128 MB stays mapped and resident — **~128 MB of the
   ~380 MB peak** is `beam_rt`'s own, never freed until the `Runtime` drops.
-- **`+hmax 1000000` is inert until the eval store fills.** It shrinks `eval_heap_words`/`bif_words` but
-  leaves the boot-only RSS unchanged (94 276 → 94 424 kB), because at boot both `Heap`s are untouched;
-  the flag's RSS effect exists only once the eval store would have filled.
-- **The `[rt-mem] exit` census alone is misleading.** For cerl_clauses it reads
+- **`+hmax` sizes only the two boot-time regions.** It shrinks the pool's outermost region and `eval_heap`'s
+  seed, and leaves the boot-only RSS unchanged (94 276 → 94 424 kB), because at boot both `Heap`s are
+  untouched.
+  It does **not** bound growth: `eval_heap_ceiling()` deliberately ignores the policy and `take_bif_frontier`
+  applies `max_heap_words` only as a cap on one geometric step, so the flag's RSS effect exists only where a
+  region actually fills.- **The `[rt-mem] exit` census alone is misleading.** For cerl_clauses it reads
   `arena_words = 5 133 195` (~39 MB) and `bif_words = 20 185 088` (161 MB of *reservation*, with
   `bif_peak_used_words = 12 953`), and neither resident mechanism above is attributable from it: the
   glibc heap is outside `beam_alloc` entirely, and the eval store is reported as **capacity**
   (`eval_heap_words` + `eval_heap_retired_regions`), not as touched pages.
 
 ### Reclaim: what is sound without a collection, and what is not
-Ranked by the measured peak, and all of it **`beam_rt`-owned** (`Runtime::bif_heaps`, `bif_heap_words`,
-`take_bif_heap`/`put_bif_heap`/`take_bif_frontier`, `grow_eval_heap`) — no `beam_engine` API is needed
-for the dominant store.
-1. **SOUND — size the per-level region by need, not by `heap_words`.** Seed `bif_heaps`/`take_bif_heap`
-   from a small initial (e.g. 1 MiB) and let `take_bif_frontier`'s demand-driven growth do the rest. No
-   reachability question at all: a region that was never allocated is never a dangling pointer. This is
-   exactly what `+hmax` proves is possible (3.81 GB → 104 MB, same `{ok,…}` result); the difference from
-   `+hmax` is that the *growth ceiling* must stay uncapped, or a level needing more than the cap fails as
-   `system_limit` (measured: `inet_parse` at `+hmax 1000000` answers `error`).
-2. **SOUND — bound the pool's stored *count* and free the surplus, gated on the copy-out predicate.**
-   Dropping a region at `put_bif_heap` is sound **only** when the nested run's result was copied out
-   (`move_container`/`safe_to_rewind`, `calls.rs:417`/`:934`); with `move_container == false` the returned
-   term still lives on that region and the parent's registers point into it, which is precisely why the
-   pool does not free. A cap must therefore be applied to regions strictly older than the current depth
-   *and* after a copy-out — never blanket.
-3. **SOUND, minor — `eval_heap`'s retired chain** only shrinks by the same "did the store get pinned"
-   test; `pin_window_if_store_written` pins it on the first store-writing nested run, so a compile pins it
-   immediately (`resets == 0`). Banked value: 1–2 regions.
-4. **UNSOUND — `eval_heap`/arena `reset_to` at a `-eval` statement boundary for a compile.** A compile is
-   *one* statement, and the evaluator's environment holds live values built on the arena, so a
-   statement-boundary reset inside it would either do nothing (no boundary) or drop live values. The
-   existing `eval/mod.rs:417-423` reset is correctly gated on `depth != 0` for this reason.
-5. **UNSOUND without a collection — truncating the arena's older `ReservedHeap` regions.** A later region
-   can hold terms whose cons cells live in an earlier one; proving otherwise is a reachability scan
-   (`beam_gc`'s `copy_struct`), i.e. a GC. `beam_engine` exposes **no** stats or reclaim at all
-   (`ContextHeap`/`MinimalContext` have no `stats`/`reclaim`/`truncate`): an arena fix would need
-   `ContextHeap::stats(&self) -> ContextHeapStats { regions, reserved_words, committed_words, used_words,
-   peak_words }` + `ContextHeap::reclaim(&mut self, keep_regions: usize) -> usize`, surfaced as
-   `MinimalContext::heap_stats`/`reclaim_heap`, invoked from `src/context/pump.rs` after
-   `adopt_nested_payloads` + `machine_pool::release` in `run_export_blocking`/`run_label_blocking`
-   (`:264-301`/`:343-375`) and only once the caller's result has been stabilised off the arena.
-   Its measured contribution is bounded by the `+hmax` residual: **≤ ~104 MB of the 3.81 GB peak (~3 %)**.
+Ranked by the measured peak; items 1–3 have **landed**, 4–5 are what is left, and every remaining item is a sibling-crate API rather than a `beam_rt` policy.
+1. **LANDED — the per-level region is sized by need, not by `heap_words`.** `bif_heaps`' outermost region is `bif_heap_words`, a nested one `NESTED_BIF_HEAP_SEED_WORDS` (1 MiB, self-tuned to `2 ×` an observed peak), and `take_bif_frontier` grows geometrically from the region's own capacity: `cerl_clauses` 3.62 GB → 161 MB at an identical 27 regions.
+2. **LANDED — the eval store's growth is clamped** at `MAX_EVAL_HEAP_WORDS` (256 MiB); a refusal is the typed `system_limit` that leaves the store untouched, and it is deliberately **not** tied to `+hmax` (the flag must not turn a large compile into an error).
+3. **BOUNDED, not reusable — `eval_heap`'s retired chain** only shrinks by the "did the store get pinned" test, and `pin_window_if_store_written` pins it on the first store-writing nested run, so a compile pins it immediately (`resets == 0`): `inet_parse` still ends with 19 retired regions (4.96 GB of *capacity*, not RSS).
+4. **STILL OPEN and `beam_rt`-adjacent — the arena.** Truncating an older `ReservedHeap` needs a reachability proof (a later region can hold terms whose cons cells live in an earlier one), i.e. a GC: `beam_engine` exposes no stats or reclaim (`ContextHeap`/`MinimalContext` have no `stats`/`reclaim`/`truncate`), so the fix is `ContextHeap::stats(&self) -> ContextHeapStats { regions, reserved_words, committed_words, used_words, peak_words }` + `ContextHeap::reclaim(&mut self, keep_regions: usize) -> usize`, surfaced as `MinimalContext::heap_stats`/`reclaim_heap` and invoked from `pump.rs` after `adopt_nested_payloads` + `machine_pool::release` in `run_export_blocking`/`run_label_blocking`, once the caller's result has been stabilised off the arena.
+   Its measured size is `arena_words` itself: 39 MB after `cerl_clauses`, 75 MB after two compiles, 10.6 GB after `inet_parse`.
+5. **STILL OPEN, owned by `beam_process`/`beam_engine` — the exempt window's nursery chain** (previous section): `Machine::for_each_root` + `Process::collect_with`, wired at the three `apply_fun`/`run_*_blocking` sites.
+6. **UNSOUND — `eval_heap`/arena `reset_to` at a `-eval` statement boundary for a compile.** A compile is *one* statement and the evaluator's environment holds live values built on the arena, so a statement-boundary reset inside it would either do nothing (no boundary) or drop live values; the existing `eval/mod.rs` reset is correctly gated on `depth != 0` for this reason.
 The consequences for a long in-process `compile:file/2`, the per-call cost census and the pool's
 reuse counters (`BEAM_RT_PERF_COUNTERS=1`) are `../runtime/CONTEXT.md`'s and
 `../PERF.md`'s; the engine-side capacity facts are `beam_engine/src/machine/CONTEXT.md`'s.
