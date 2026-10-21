@@ -23,7 +23,8 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   `case_end` ⇒ `{case_clause,V}`, `try_case_end` ⇒ `{try_clause,V}`, `badrecord` ⇒
   `{badrecord,V}`, `if_end` ⇒ the bare atom `if_clause`, `raise Trace Value` (re-raise
   with `Machine::pending_class`), `raw_raise` (the x(0)=class / x(1)=value /
-  x(2)=trace protocol, incl. the "unknown class" `badarg` fall-through), and
+  x(2)=trace protocol, incl. the "unknown class" `badarg` fall-through and the
+  trace **term** it supplies through `Machine::raise_supplied`), and
   `build_stacktrace`.
 - `raise.rs` (private helper module): `raise_error_tuple` / `raise_error_atom` (reason
   construction through the **rooted** builders, so a moving collector can run under the
@@ -46,7 +47,11 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   built only for a bare `undef`, only with a live catch frame, and only when the arguments
   are readable — otherwise `Ok(None)` and the unmodified raise. `Location` is the empty
   list (the callee does not exist, so there is no source position).
-- `stacktrace.rs`: `symbolic_stacktrace(machine, module, ctx, head_operand, head)` — cooks
+- `stacktrace.rs`: `symbolic_stacktrace(machine, module, ctx, head_operand, head)` — the one
+  cooked-trace builder. It **first** re-reads `head_operand` and returns an **already-cooked** list
+  verbatim (`is_list` — the trace term a landing published in `x(2)`, C's `is_raised_exc` arm,
+  `erts/emulator/beam/beam_common.c:1219-1223`); otherwise it renders a supplied symbolic-frame latch;
+  otherwise it cooks
   the machine's raise-time snapshot into the symbolic `[{M,F,A,Location}]` list from
   `Machine::raise_snapshot()` (the **pre-unwind** `(context, func, pc)` chain every
   `Machine::throw_with_trace` rebuilds at raise time: the raising frame first, then every
@@ -72,16 +77,17 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   head word is re-read **after** the reservation through `head_operand` (the very register
   `build_stacktrace` read the raw trace from) and consed in front of the carved frames, so a
   head-bearing raise cooks to the **one-element** list `[Item]` even over an empty frame
-  chain. **Supplied frames win:** when the live raise arrived carrying explicit
-  non-empty symbolic frames (`Machine::take_raise_supplied_trace`), `symbolic_stacktrace`
-  consumes that latch first and renders THOSE frames (see the section below) — the
-  snapshot is not consulted and any head item is superseded.
+  chain. **Supplied traces win:** an already-cooked list in `head_operand` is returned verbatim
+  (`is_list`), and when the live raise arrived carrying explicit non-empty symbolic frames
+  (`Machine::take_raise_supplied_trace`), `symbolic_stacktrace` consumes that latch next and renders THOSE
+  frames (see the section below) — the snapshot is not consulted and any head item is superseded.
 
 ## A supplied trace is preserved verbatim; a derived one comes from the raise snapshot
 A raise that **arrives carrying** its own trace keeps it: no frame of the re-raise site is ever prepended,
 exactly as the oracle's `build_stacktrace` returns a supplied list verbatim.
-Two flavours exist, and both are **metadata only** (an `Option<StackTrace>` / a `bool` — no heap term, so
-nothing to root).
+Two flavours exist: the **explicit symbolic frames** are metadata (an `Option<StackTrace>`, no heap term),
+the **trace term** is a real `Eterm` carried by the raise and needs no rooting of its own (nothing allocates
+between arming its latch and publishing it; the destination is the handler's `x(2)`, inside the root set).
 C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace` it stores
 (`erts/emulator/beam/beam_common.c:1148-1179`), `save_stacktrace`'s `EXF_SAVETRACE` guard (`:505-507`) and
 `build_stacktrace`'s verbatim return (`:1219-1223`).
@@ -94,15 +100,22 @@ C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace`
   **arity** in the `A` slot (the model carries no argument list) and the `[{file,File},{line,N}]` location
   the `SourceLocation` describes; every name is resolved from the running module's atom table (never
   substituted — a name it cannot intern is a typed `unsupported`).
-- **A raw trace object** — `Instr::RawRaise`, the shape `sys_core_fold` folds `catch C:R:S ->
-  erlang:raise(C,R,S)` into (`lib/compiler/src/sys_core_fold.erl:2441-2465`). The engine keeps no raw
-  `StackTrace` object, so its equivalent of C's `c_p->ftrace` is `Machine::raise_snapshot`: `Instr::RawRaise`
-  arms the one-shot `pending_supplied_raw_trace` latch, `throw_with_trace` promotes it to the live
-  `raise_supplied_raw_trace` and then **skips** the snapshot rebuild — so the snapshot of the raise being
-  re-raised IS the supplied trace — and `symbolic_stacktrace` / `Machine::snapshot_stacktrace` /
-  `Machine::with_uncaught_frames` render that preserved chain.
-Both pairs are cleared by `Machine::reset`, together with the callee-head and failed-clause-argument pairs
-(`../../machine/registers.rs`).
+- **The trace TERM** — `Instr::RawRaise`, the shape `sys_core_fold` folds `catch C:R:S ->
+  erlang:raise(C,R,S)` into (`lib/compiler/src/sys_core_fold.erl:2441-2465`). The raise supplies its trace
+  as the **cooked** `[{M,F,A,Location}]` **list**: the arm reads `x(2)` (a landed exception published the
+  list of the exception being handled there), and when `x(2)` is `NIL` it cooks the machine's preserved
+  `raise_snapshot` chain **once**, rooted, at the `raw_raise` site. Either way the list is handed to
+  `Machine::raise_supplied`, which arms the one-shot `pending_supplied_term` latch; `throw_with_trace`
+  promotes it to the live `raise_supplied_term` and then **skips** the snapshot rebuild — so the preserved
+  chain of the raise being re-raised survives — and the term is consumed exactly once: a **landed** raise
+  publishes it as the handler's `x(2)` (C's register convention, so the next `raw_raise`/`build_stacktrace`
+  reads it straight back), an **uncaught** one renders the preserved chain through
+  `Machine::with_uncaught_frames` (`Machine::snapshot_stacktrace`).
+  `symbolic_stacktrace` therefore begins with an **already-cooked passthrough**: a trace register holding a
+  cons cell (`is_list`) is returned verbatim (C's `is_raised_exc` arm, `:1219-1223`), because a raw-trace
+  word is never a cons — it is `NIL` or the one synthesized callee head item (`callee.rs`).
+Both latch pairs are cleared by `Machine::reset`, together with the callee-head and failed-clause-argument
+pairs (`../../machine/registers.rs`).
 A raise that supplied neither flavour gets the derived trace: `throw_with_trace` rebuilds `raise_snapshot`
 (the **pre-unwind** `(context, func, pc)` chain, the raising frame first then every live caller
 innermost-first) and the cooking renders it.
@@ -138,7 +151,11 @@ cases the compiled handler moves the raw trace from `x(2)` into `x(0)`, which is
 the `raise_head_item`/`pending_callee_head` latch pair rather than by inspecting the word.
 C's `add_stacktrace` stays omitted and `catch_end` semantics are unchanged. The word therefore carries no
 engine object for a derived raise, which is why a re-raised exception's trace is preserved through the
-`raise_snapshot` latch (`pending_supplied_raw_trace`/`raise_supplied_raw_trace`) and not through `x(2)`.
+`raise_snapshot` chain plus the `pending_supplied_term`/`raise_supplied_term` latch pair, and only a raise
+that supplied a trace (or landed a re-raised one) has a **list** there — the shape
+`symbolic_stacktrace`'s `is_list` passthrough recognises. A landing publishes exactly that: a landed raise
+with no supplied term leaves `x(2)` the raise's own raw-trace word (`NIL`, or the head item), never a
+partially-cooked list.
 
 ## The two one-shot latches that carry the head item
 The head item is **not** a machine-held heap term: it travels as the raise's own raw-trace
@@ -212,8 +229,11 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
   [`crate::machine::deadline_tests`]). The engine's cooked list is asserted to be a
   **non-empty prefix** of the oracle's (host `erl_eval`/`init` callers lie outside the run).
 - `raising.rs` — the raising opcodes' reason expansion (caught and uncaught), the
-  `raise` re-raise opcode, `raw_raise`'s class protocol and `badarg` fall-through.
+  `raise` re-raise opcode, `raw_raise`'s class protocol and `badarg` fall-through, and (now) the trace-term
+  supply: `x(2)` holding a cooked list is passed through verbatim, a `NIL` `x(2)` cooks the preserved
+  `raise_snapshot` chain once, and a landed raise publishes that term as the next handler's `x(2)`.
 - `stacktrace.rs` — `build_stacktrace`: the `NIL` raw trace (`NIL` out), the
+  `is_list` passthrough of an already-cooked supplied trace,
   raise-snapshot ordering (a frame the raise *unwound* is still present, proving the
   snapshot is cooked rather than the live stack), a snapshot frame resolved in its own
   module context (with a context-`0` frame skipped from a non-zero handler context),
@@ -227,9 +247,10 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
   term, and the unresolvable-atom typed `unsupported` error.
 - `end_to_end.rs` — whole synthetic sequences.
 - Crate-level companion: `tests/stacktrace_frames.rs` pins the cooked `S` of `erlc`-compiled whole modules
-  on **both** tiers against the live `erl` oracle, including the `folded/0` + `refold/0` rows that exercise
-  this family's `raw_raise` supplied-trace rule and `withcall/0` + `inhandler/0` that exercise the consumed
-  continuation slot (`src/machine/CONTEXT.md`).
+  on **both** tiers against the live `erl` oracle, including the `folded/0` (`[folded/0 @24]`) + `refold/0`
+  (`[g/1 @17, refold/0 @26]`) rows that exercise this family's `raw_raise` supplied-trace rule and
+  `withcall/0` + `inhandler2/0` (`[inhandler2/0 @28]`) that exercise the consumed continuation slot
+  (`src/machine/CONTEXT.md`).
 - `cross_module.rs` — **cross-module containment**: one shared `beam_term::AtomTable`
   (`Universe`) so exception *class* atoms compare equal across modules, modules entered
   through `MinimalContext::with_external_resolver` (the `resolve_external_call` seam),
