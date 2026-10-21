@@ -38,9 +38,16 @@
 //! `build_stacktrace` must cook the **supplied** frames, not the engine's
 //! `raise_snapshot` heuristic.
 //!
-//! A raise whose supplied trace is **empty** (or absent) must leave every path
-//! byte-identical to today's `raise_snapshot`-derived output — pinned by
-//! [`an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`].
+//! A raise whose supplied trace is **empty** is currently indistinguishable from a
+//! raise that supplied none, so both cook the same `raise_snapshot`-derived output —
+//! pinned by [`an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace`].
+//! That equivalence is a **`beam_common::Raise` limitation, not intended semantics**:
+//! `Raise` carries no supplied-trace flag, so "supplied `[]`" and "no trace supplied"
+//! reach the engine as the same value. C's discriminator is `is_raised_exc`
+//! (`erts/emulator/beam/beam_common.c:1119-1126`), which keeps a supplied empty trace
+//! and returns it verbatim. The crate `CONTEXT.md` §Known Issues entry records the gap
+//! and the change it needs — the fix is owned by the sibling `beam_common` node, whose
+//! `Raise` has to carry the flag.
 //!
 //! Every name a supplied frame needs (`my`, `fake`, the `file`/`line` location keys)
 //! is resolved from the running module's atom table and is **never substituted**: a
@@ -323,14 +330,33 @@ fn a_supplied_frame_without_a_location_renders_an_empty_location() {
 }
 
 // ===========================================================================
-// 2. Regression: an empty supplied trace is byte-identical to today's output
+// 2. An empty supplied trace is indistinguishable from no supplied trace
 // ===========================================================================
 
+/// A raise carrying an explicitly **empty** trace list cooks exactly the same trace
+/// as a raise that supplied none.
+///
+/// The equivalence pins a **`beam_common::Raise` LIMITATION, not intended
+/// semantics**: `Raise` carries no supplied-trace flag, so "supplied `[]`" and "no
+/// trace supplied" are the same value by the time the engine sees the raise (the
+/// one-shot latch's arming condition is `!raise.stacktrace.is_empty()`, which a
+/// supplied `[]` cannot satisfy). C tells them apart with `is_raised_exc`
+/// (`erts/emulator/beam/beam_common.c:1119-1126`) and returns a stored `[]`
+/// verbatim (`raise_3` stores `NIL` behind the negative "already cooked" header),
+/// so the oracle answers `{error,boom,[]}` where the engine derives a frame list.
+///
+/// The crate `CONTEXT.md` §Known Issues entry records the gap and the change it
+/// needs — a `supplied_trace: bool` on `beam_common::Raise` plus two small engine
+/// hunks — and notes that it is owned by the sibling `beam_common` node, not by
+/// this crate. Treat this test as the pin on a known-divergent shape, **never** as
+/// a statement that the two raises are supposed to be equivalent.
 #[test]
 fn an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace() {
     // Two runs of the SAME synthetic module, differing only in whether the raise
-    // carried an explicitly EMPTY `StackTrace`: an empty trace arms nothing, so the
-    // two cooked traces are byte-identical.
+    // carried an explicitly EMPTY `StackTrace`. An empty trace cannot arm the
+    // one-shot supplied-trace latch (the `Raise` value carries no flag saying one was
+    // supplied, and an empty trace list is indistinguishable from an absent one), so
+    // the two cooked traces are byte-identical.
     let (without, module, _keep_without) = run_caught(None);
     let (empty, module_b, _keep_empty) = run_caught(Some(StackTrace::new()));
     assert!(
@@ -343,7 +369,10 @@ fn an_empty_supplied_trace_is_byte_identical_to_no_supplied_trace() {
     );
 
     // ... and both are the `raise_snapshot`-derived single raising frame (`run/0`),
-    // proving the empty case keeps today's heuristic.
+    // proving the empty case takes the derivation path. For a supplied empty trace the
+    // oracle keeps `[]` instead; that value is out of this engine's reach until
+    // `beam_common::Raise` carries the discriminator (see the doc comment above and
+    // the crate `CONTEXT.md` §Known Issues entry).
     let mut build = MinimalContext::new();
     let snapshot = expected_snapshot(&mut build, &module);
     for (label, cooked) in [("no trace", without), ("empty trace", empty)] {
@@ -438,15 +467,18 @@ fn the_oracle_replaces_the_derived_trace_with_the_supplied_one() {
 
 #[test]
 fn the_oracle_replaces_the_derived_trace_the_engine_heuristic_would_have_produced() {
-    // Contrast: a raise that carries NO trace (`erlang:raise/3` with `[]`) is not an
-    // oracle value this suite pins — the engine deliberately keeps its existing
-    // `raise_snapshot` heuristic for an empty supplied trace, so only the NON-EMPTY
-    // case is cross-checked here.
+    // Contrast: a raise that carries an EMPTY trace list. The oracle keeps `[]`, while
+    // the engine derives a trace, because `beam_common::Raise` cannot say "a trace was
+    // supplied" when that trace is empty. Only the NON-EMPTY case is cross-checked as a
+    // *shared* behaviour above; this row records the oracle's answer so the divergence
+    // is measured rather than assumed — the crate `CONTEXT.md` §Known Issues entry
+    // tracks it (owned by the sibling `beam_common` node).
     let expr = "try erlang:raise(error, boom, []) catch _C:_R:S -> io:format(\"~w\", [S]) end, halt().";
     match oracle(expr) {
         Some(actual) => assert_eq!(
             actual, "[]",
-            "the oracle's empty-trace answer (the engine's documented divergence)"
+            "the oracle keeps a supplied empty trace verbatim (the engine's known \
+             divergence, tracked in the crate CONTEXT.md §Known Issues)"
         ),
         None => eprintln!(
             "SKIP raise_with_trace: no system `erl` on PATH — the empty-trace oracle \
