@@ -74,7 +74,14 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
   need no rooting either — nothing allocates between `raise_supplied` arming one and `throw_with_trace`
   promoting it, and the promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
-  `Machine::pending_exception` is **not** parked here — `beam_rt` roots it via `Registers::extra_roots`.
+  **`Machine::pending_exception` is NOT parked here, and nothing else relocates it.** Its reason `Eterm` is a
+  *copy* of the word `land_exception` publishes in `x(1)` (the register is a root and moves; the field does
+  not), so after **any** collection in the run that follows a landing the field names the pre-move term.
+  The two readers: `beam_rt`'s park publication filters it through `is_live_relocatable_root` (a
+  scanned-**region** test, not a liveness proof) before putting it in `Registers::extra_roots`, and the
+  in-crate `families::bitstrings::raw::payload_aliased_elsewhere` reads it **unguarded** and dereferences a
+  boxed word's header. Parking it here is the shape that would make the field always relocatable; it also
+  keeps the reason alive for the rest of the run, where C clears `fvalue` at landing (`beam_common.c:527`).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
   (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
   `Machine::set_continuation` write), `Machine::ensure_heap`
