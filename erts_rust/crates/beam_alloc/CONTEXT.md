@@ -426,6 +426,9 @@ is), and a freed segment keeps whatever pages its previous owner dirtied while i
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
+- **`AllocatorConfig::zeroed_carriers` is inert** (`src/allocator/config.rs:40,84,146`): it is stored and
+  reported but never consulted by any allocation path, so it changes nothing — a fresh `mmap` is already
+  zero, and a segment reused from the mseg cache is *not* zeroed (see "Residency (RSS) at allocation time").
 - **Payload-growth limits.** The reservation is a *logical* limit inside one ordinary allocator block —
   there is no `mprotect`/`madvise` reservation, so committed RSS follows the writes and the process is
   charged carrier bytes for `reserved`, not for `len`; only `compact()` (or `Drop`) gives the slack
