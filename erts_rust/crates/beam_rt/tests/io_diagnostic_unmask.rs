@@ -36,9 +36,9 @@
 //! (`lib/compiler/src/beam_ssa_opt.erl:190-201`, `beam_ssa_bool.erl:143-151`,
 //! `beam_ssa_type.erl:227-235`, `beam_core_to_ssa.erl:270-278`, …). `io:fwrite/2` used to
 //! execute `io.erl`'s body, whose `o_request/2` posts the request to the caller's group
-//! leader — itself, for this runtime's own root process — and gets `{error, calling_self}`
-//! back, so the diagnostic call itself raised and the compiler's real reason was **masked**
-//! as `calling_self`. The `io` floor (`src/native/io.rs`) serves `io:fwrite/2` directly, so
+//! leader — here the runtime's root process, which runs no io server, so the round trip
+//! never completes — and the diagnostic call itself raised, masking the compiler's real
+//! reason as `calling_self`. The `io` floor (`src/native/io.rs`) serves `io:fwrite/2` directly, so
 //! the `Function: <name>/<arity>` line is printed and the real reason propagates.
 //!
 //! # What is asserted: the invariant, not the outcome
