@@ -25,9 +25,11 @@
 //! exit code into the process status. See `beam_rt::cli` for the supported switch
 //! subset (contract A.6) and `../CONTEXT.md` for the frozen surface.
 //!
-//! The one thing this shim does own is the **stack the runtime runs on**: the driver runs on
-//! a named thread with an explicit [`MAIN_STACK_BYTES`] stack instead of Rust's default
-//! 8 MiB main-thread stack (see the constant for why).
+//! The shim owns two things the library deliberately does not: the **stack the runtime runs on**
+//! (the driver runs on a named thread with an explicit [`MAIN_STACK_BYTES`] stack instead of Rust's
+//! default 8 MiB main-thread stack — see the constant for why), and the **allocator's free-page
+//! release** ([`beam_rt::release_free_pages`], called once after that thread has been joined —
+//! see [`run_on_driver_stack`]).
 
 use std::thread;
 
@@ -82,6 +84,26 @@ fn main() {
 /// Runs [`beam_rt::cli::run`] on a named thread with [`MAIN_STACK_BYTES`] of stack and answers the
 /// process status: the driver's own exit code, or [`beam_rt::cli::EXIT_RUNTIME`] when the thread
 /// could not be started or panicked — a failed driver must never be reported as success.
+///
+/// # The one allocator release point
+///
+/// After the join, and before the process status is handed to [`std::process::exit`],
+/// [`beam_rt::release_free_pages`] returns the process-global allocator's free pages to the OS.
+/// This is the only place that is both **quiescent** and **complete**:
+///
+/// * the driver thread has **exited**, so everything it owned — its thread-local state and,
+///   crucially, the arena attachment it allocated through — is gone, and what the allocator still
+///   maps is free; measured, a bare boot holds 88.8 MB of resident set with 210 kB of arena in use
+///   at the moment the driver returns, and one trim here takes that 88.8 MB down to ~18 MB (an
+///   in-process compile of `cerl_clauses.erl`: 206 MB → ~20 MB);
+/// * a trim from **inside** the driver — even after the runtime it built has been dropped — only
+///   recovers ~16 MB of that, because the thread itself still holds the rest until it exits, so
+///   the release is placed here rather than in `beam_rt::cli::run`.
+///
+/// It touches only the allocator's free-page bookkeeping (no term, heap, table or live
+/// allocation), so no result, exception or exit code can depend on it; the pages are re-faulted
+/// transparently if anything else in the process needs them. `src/malloc.rs` carries the census,
+/// the mechanism and the measurements.
 fn run_on_driver_stack(args: Vec<String>) -> i32 {
     let driver = thread::Builder::new()
         .name("beam_rt-driver".to_string())
@@ -94,7 +116,7 @@ fn run_on_driver_stack(args: Vec<String>) -> i32 {
             return beam_rt::cli::EXIT_RUNTIME;
         }
     };
-    match driver.join() {
+    let code = match driver.join() {
         Ok(code) => code,
         Err(_) => {
             // The panic itself has already been reported by the default hook; all that is left is
@@ -102,5 +124,7 @@ fn run_on_driver_stack(args: Vec<String>) -> i32 {
             eprintln!("beam_rt: the runtime driver panicked");
             beam_rt::cli::EXIT_RUNTIME
         }
-    }
+    };
+    beam_rt::release_free_pages();
+    code
 }

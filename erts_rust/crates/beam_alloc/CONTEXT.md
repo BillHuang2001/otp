@@ -285,6 +285,29 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   plus `AllocStats::mseg` (`cached`, `reused`, `unmaps`, `calls.create/destroy`, `mapped_bytes`).
   Both `MsegStats` and `stats.carriers` are process-global across allocator instances.
 
+### Residency (RSS) at allocation time — allocating never touches the payload
+Memory comes from `mmap(PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS)` (`src/mseg/mapping.rs:72-91`),
+with **no** `MAP_POPULATE` and no `madvise` (`MADV_WILLNEED`/`DONTNEED` appear nowhere in the crate),
+so pages are zero-fill-on-first-touch. What each path actually *writes* at allocation time:
+- **slab** (`alloc_small`): the whole carrier (default 1 MiB, or `block_size` if larger) is subdivided
+  and every free block is pushed onto its class's intrusive list — a 16-byte `BlockHdr` plus the two
+  link words in the payload head per block (`src/carrier.rs:270-297`, `src/free_list.rs:507-525`).
+  Because a class stride (16–1024 B payload) is below the page size, **all pages of the 1 MiB slab
+  carrier are touched** → a fresh slab carrier is ~fully resident.
+- **mid / multi-block** (`alloc_mid`): a fresh `MbcCarrier` writes one 16-byte block header at the base
+  plus the two link words of its single spanning free block (`src/mbc.rs:211-243`) — ~2 touched pages
+  of a 1 MiB carrier; the handed-out block is not written at all.
+- **large / dedicated SBC** (`alloc_large`, i.e. every request `>= sbct` = 512 KiB): exactly one 16-byte
+  `BlockHdr` at the mapping base (`src/allocator/core.rs:251-260`), the alignment padding **only when
+  `align > UNIT_SIZE`** (`core.rs:261-286`; `padding_for` is 0 for `MIN_ALIGN`, `src/allocator.rs:127-135`),
+  and the 56-byte mseg header in the page in front of the payload (`src/mseg/header.rs:81-87`).
+  So a `Heap::new(N)` / `ReservedHeap::new(N, m)` / large `RefcBinary` consumes **address space (VSZ)
+  immediately and RSS only as the caller writes**: 1–2 pages are resident right after the call.
+The only whole-payload writes are explicit: `Allocator::alloc_zeroed` (`src/allocator/trait.rs:76-83`,
+unused by `Heap`/`ReservedHeap`) and `RefcBinary::set_len`'s zero-fill (`src/binary/growth.rs:334`).
+Corollary for measurement: a segment **reused from the mseg cache is not zeroed** (only a fresh `mmap`
+is), and a freed segment keeps whatever pages its previous owner dirtied while it sits in the cache.
+
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
   (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
@@ -293,7 +316,11 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `core`/`state` submodules), `mbc`, `mseg`, `heap`, `binary` (incl. its `growth` submodule). Every `unsafe fn` has a `# Safety`
   section and every `unsafe` block a `// SAFETY:` rationale. `size_class`, `registry`, `stats`,
   `strategy`, `policy`, `refcount`, `error` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
-- **Carriers come from the OS via `mseg` (mmap)**, are page-aligned, and `munmap`'d on free/drop.
+- **Carriers come from the OS via `mseg` (mmap) and are page-aligned.** Release policy: a *slab* carrier is
+  never released (drained carriers are retained for the allocator's lifetime, a documented M1 policy); a
+  dedicated (large) carrier is released on the block's free and a fully-free multi-block carrier on its last
+  free — both into the mseg reuse cache (up to `max_cache_size` = 10 segments, FIFO eviction), so the mapping
+  survives until the cache evicts it and only then `munmap`s.
 - **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — nothing
   else. Adding a dependency edge requires reporting to `../`.
 - **`Heap` is fixed-capacity by contract** — never reallocate (workspace §2).
@@ -399,6 +426,9 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
+- **`AllocatorConfig::zeroed_carriers` is inert** (`src/allocator/config.rs:40,84,146`): it is stored and
+  reported but never consulted by any allocation path, so it changes nothing — a fresh `mmap` is already
+  zero, and a segment reused from the mseg cache is *not* zeroed (see "Residency (RSS) at allocation time").
 - **Payload-growth limits.** The reservation is a *logical* limit inside one ordinary allocator block —
   there is no `mprotect`/`madvise` reservation, so committed RSS follows the writes and the process is
   charged carrier bytes for `reserved`, not for `len`; only `compact()` (or `Drop`) gives the slack

@@ -63,9 +63,10 @@
 //! * **Errors are return-based** (workspace `CONTEXT.md` §3): every fallible API returns
 //!   [`beam_common::Result`]; there is no crate-local error enum and nothing is swallowed.
 //! * **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]` and the glue is built on the
-//!   safe peripheries of the lower crates. Two narrowly-scoped `#[allow(unsafe_code)]` overrides exist:
-//!   `context/gc_walk.rs`'s sanctioned `beam_term::layout` object-walk, and `nif.rs`'s `enif_compare`/
-//!   `enif_hash` `unsafe extern "C"` calls.
+//!   safe peripheries of the lower crates. Three narrowly-scoped `#[allow(unsafe_code)]` overrides exist:
+//!   `context/gc_walk.rs`'s sanctioned `beam_term::layout` object-walk, `nif.rs`'s `enif_compare`/
+//!   `enif_hash` `unsafe extern "C"` calls, and `malloc.rs`'s one `malloc_trim` call (the
+//!   allocator's free-page release).
 //! * **Call down, never duplicate**: BIFs come from `beam_bifs`, terms/heaps from `beam_term`/
 //!   `beam_alloc`, pids from `beam_process`, modules from `beam_loader` and execution from
 //!   `beam_engine`. The printer is the registered `io:format/2` BIF, not a second printer.
@@ -87,6 +88,7 @@ pub mod format;
 mod hasher;
 pub mod info;
 mod mailbox;
+mod malloc;
 mod native;
 mod nif;
 mod nif_monitor;
@@ -109,10 +111,11 @@ pub use crate::context::RuntimeContext;
 pub use crate::eval::eval;
 pub use crate::format::{term_to_string, term_to_string_w};
 pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
+pub use crate::malloc::release_free_pages;
 pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
 pub use crate::dist::{DistConnection, DistNode, NodeName};
 pub use crate::dist_client::DistClient;
-pub use crate::runtime::Runtime;
+pub use crate::runtime::{RetentionStats, Runtime};
 /// The conventional glob-import surface for downstream crates.
 ///
 /// `use beam_rt::prelude::*;` brings the runtime façade ([`Runtime`]), its code server

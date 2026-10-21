@@ -350,8 +350,69 @@ impl ExecutionContext for RuntimeContext<'_> {
         // there: it is overloaded with the module-unresolvable/missing-export cases). A
         // host-served MFA is not a `.beam` body here, so the seam declines and leaves the
         // synchronous `call_bif` route (NIF → runtime-native floor → registry) untouched.
+        //
+        // # The one exception: the fun-applying stdlib fast paths under collection debt
+        //
+        // [`nests_a_fun_apply`] names the `lists`/`maps` fast paths whose `beam_bifs`
+        // implementation **applies a fun argument** back into the runtime. Each of those
+        // applications runs through [`crate::context::bridges`]'s `FunBridge::nested` →
+        // [`Self::apply_fun`] → `pump::run_label_blocking`, i.e. a **second machine** built on
+        // a context with `gc_armed == false` and the process marked relocation-exempt for the
+        // whole application (see [`crate::context::gc`]). While such a run is live, no
+        // collection door can fire: the nested machine's admission points are unarmed, and the
+        // armed doors refuse a relocation-exempt process. Meanwhile that run's registered-BIF
+        // copy-outs still grow the process's young heap through the **no-collect**
+        // [`Process::grow_nursery`] seam, which *retires* the space it replaces — so the
+        // nursery becomes a chain nothing ever collapses, and a long compile that spends its
+        // time inside `lists:map`/`foldl` funs retains everything it ever allocated (contract
+        // A.9's host-memory ratchet, `BEAM_RT_GC_TRACE`'s `exempt=true` + `chain_spaces`).
+        //
+        // So while the calling process carries **collection debt**
+        // ([`Process::collection_debt`] — the growth seam's own signal that a retired chain is
+        // waiting for a collection), those keys resolve to the real `lists.erl`/`maps.erl`
+        // **body** instead, and the engine enters it **in this machine**: the callee's
+        // registers, stack and frames join the caller's root set, the fun it applies is entered
+        // through [`Self::resolve_local_fun`]'s in-machine local-closure entry
+        // ([`Self::resolve_external_call`]'s sibling seam), and every heap-admission point of
+        // the run is the caller's **armed** one — which is exactly the door that fires on
+        // [`Process::collection_debt`] and collapses the chain
+        // ([`crate::context::gc::ensure_heap_full`], `gc/reds_door.rs`).
+        //
+        // ## Why this is sound
+        //
+        // The Erlang body *is* the semantics the fast path mirrors — `lists.erl`'s `foldl/3`,
+        // `map/2`, … are the reference for `beam_bifs`'s ports (they were written from them),
+        // so the result is unchanged. The only in-machine-identity consequences are the ones
+        // this seam's docs already cover: `erlang:load_nif/2` and the two fun-image BIFs, and
+        // neither is in this key set — [`callee_admission`] would decline such a callee anyway
+        // (a `lists`/`maps` body observes no call site).
+        //
+        // ## Why the gate keeps the seam idempotent
+        //
+        // The native baseline tier consults this seam **twice** for one `call_ext*`
+        // ([`jit::baseline`]'s `jit_ext_call`, then `jit_step_one`, see the guard below), so a
+        // gate that answers differently on the two consultations would enter a callee the first
+        // refused. The debt bit cannot move between them: the two consultations are back-to-back
+        // inside one instruction step, and **nothing executes in between** — no Erlang code, no
+        // BIF, no allocation, hence no `Process::grow_nursery` (which is the only setter) and no
+        // collection (which is the only clearer). The bit is a function of the heap state the
+        // instruction was fetched under, so it is a constant for the instruction's duration.
+        //
+        // [`Process::grow_nursery`]: beam_process::Process::grow_nursery
+        // [`Process::collection_debt`]: beam_process::Process::collection_debt
+        // [`jit::baseline`]: beam_engine
         if self.host_serves(module, function, arity) {
-            return Ok(None);
+            if !(nests_a_fun_apply(module, function, arity)
+                && self.calling_process_has_collection_debt())
+            {
+                return Ok(None);
+            }
+            if crate::debug_trace::enabled() {
+                crate::debug_trace::trace(format_args!(
+                    "seam debt-gate [{trace_pid:?}] {module}:{function}/{arity}: entering the \
+                     .beam body in-machine"
+                ));
+            }
         }
         // Resolve the callee's module handle. A module that is **already cached** is used as
         // is; an uncached one is loaded **on demand**, exactly as [`Self::call_bif`] does, so
@@ -1012,6 +1073,32 @@ impl RuntimeContext<'_> {
         served
     }
 
+    /// Whether the **calling process** carries the collector's collection debt
+    /// ([`Process::collection_debt`](beam_process::Process::collection_debt)).
+    ///
+    /// This is the read side of [`nests_a_fun_apply`]'s gate in
+    /// [`Self::resolve_external_call`]: the debt is what a no-collect
+    /// [`Process::grow_nursery`](beam_process::Process::grow_nursery) growth leaves behind (it
+    /// *retires* the young space it replaces instead of freeing it), so it is exactly the signal
+    /// that a retired nursery chain is waiting for a collection that only an **armed**
+    /// heap-admission point can run.
+    ///
+    /// `false` for a context with no caller-supplied table: a table-less context (`-eval`'s
+    /// top-level run, `RuntimeContext::new`) allocates on the runtime's pointer-stable arena and
+    /// never grows a process nursery at all, so there is no chain to settle and the gate leaves
+    /// the synchronous route byte for byte as it is. A pid the table does not hold is the same
+    /// `false` — no process, no debt.
+    ///
+    /// The read is a plain field access on the process table (no allocation, no collection), so
+    /// it is safe on the per-`call_ext` seam.
+    fn calling_process_has_collection_debt(&self) -> bool {
+        let Some(table) = self.mailbox_table.as_deref() else {
+            return false;
+        };
+        table
+            .get(self.mailbox_pid)
+            .is_some_and(|process| process.collection_debt())
+    }
     /// Folds the [`suspend_requested`](RuntimeContext::suspend_requested) latch and a BIF's
     /// value into the engine's [`BifOutcome`] — the shared tail of both outcome doors
     /// ([`ExecutionContext::call_bif_outcome`] and
@@ -1028,4 +1115,27 @@ impl RuntimeContext<'_> {
         }
         BifOutcome::Return(value)
     }
+}
+/// Whether `(module, function, arity)` is one of the **fun-applying stdlib fast paths** whose
+/// `beam_bifs` implementation applies a fun argument back into the runtime — the keys
+/// [`RuntimeContext::resolve_external_call`]'s debt gate may route to the real `.beam` body.
+///
+/// The roster is **not** restated here: it is [`beam_bifs::needs_fun_caller`], the registry's
+/// own allocation-free (binary-search) answer to "does this key read the `FunCaller` seam",
+/// backed by [`beam_bifs::FUN_CALLER_BIFS`] — the 18 `lists` + 4 `maps` + 2 `ets` keys that a
+/// `beam_bifs` test pins equal to the registering modules' roster, so this predicate cannot
+/// drift away from the implementations that actually nest.
+///
+/// Only `lists` and `maps` are gated, deliberately:
+///
+/// * their bodies are the **reference semantics** of the fast paths (`beam_bifs`'s ports were
+///   written from those very files), so entering them in-machine cannot change a result;
+/// * the two `ets` folds stay on the synchronous path on purpose. `ets.erl`'s `foldl/3` walks
+///   the table through `ets:first/1`/`next/2` and calls `lists:foldl/3` internally — i.e. the
+///   key it would reach is a `lists` one, gated on its own turn — so gating `ets:foldl/3`
+///   would relocate the nesting rather than remove it, while replacing the adopted
+///   implementation (whose per-interior object ordering is pinned against the oracle) for no
+///   gain.
+fn nests_a_fun_apply(module: &str, function: &str, arity: u32) -> bool {
+    matches!(module, "lists" | "maps") && beam_bifs::needs_fun_caller(module, function, arity)
 }

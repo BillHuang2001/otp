@@ -1479,7 +1479,25 @@ pub fn run(args: Vec<String>) -> i32 {
     // environment (`ERL_CRASH_DUMP` / `ERL_CRASH_DUMP_SECONDS`), so keep a copy.
     let env = config.env.clone();
     let mut source = None;
-    match drive(config, &mut source) {
+    let outcome = drive(config, &mut source);
+    // The **second** of the retention diagnostic's two points (`BEAM_RT_MEM_TRACE`, silent unless
+    // set): the action has finished and the runtime it built is still alive, so this is the last
+    // moment its four never-freed storage regions can be read. Placed before the outcome is
+    // classified, so it covers *every* exit of a run that built a runtime — success, halt, a
+    // capability gap and an abnormal failure alike, each of which returns from the `match` below.
+    // `-version` and a command line that failed to parse build no runtime and print nothing.
+    if let Some(runtime) = source.as_ref() {
+        if crate::debug_trace::mem_enabled() {
+            crate::debug_trace::mem(format_args!("exit {}", runtime.retention_stats()));
+        }
+    }
+    // The allocator's free pages are **not** released here, and this is the point where the
+    // temptation is greatest: the action is over, so it looks quiescent. Measured, it is not —
+    // the runtime above is still live (266 kB free out of a 97.9 MB arena on a bare boot, 1.8 MB
+    // after an in-process compile) and this thread still holds its own share, so a trim here
+    // returns ~16 MB of the 75 MB the process then exits with. The release point is the process
+    // entry, once the driver thread has exited: `src/main.rs`, `crate::malloc`.
+    match outcome {
         // A successful action still exits with the status a **non-terminating** node stop
         // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
         // `ok` to a caller that keeps running, so the status is applied here — after the
@@ -1800,6 +1818,12 @@ where
     match script {
         Some(value) => run_boot_script(runtime, value)?,
         None => runtime.boot()?,
+    }
+    // The **first** of the retention diagnostic's two points (`BEAM_RT_MEM_TRACE`, silent unless
+    // set): the four never-freed storage regions as the boot script left them, before the action's
+    // own start instruction runs. A pure read — see [`Runtime::retention_stats`].
+    if crate::debug_trace::mem_enabled() {
+        crate::debug_trace::mem(format_args!("boot {}", runtime.retention_stats()));
     }
     instruction(runtime)
 }

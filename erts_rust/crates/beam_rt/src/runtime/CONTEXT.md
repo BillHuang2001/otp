@@ -5,10 +5,12 @@
 `../runtime/scheduler.rs` (+ `scheduler/tests.rs`) is the **scheduler-pass family**: it drives processes, ports, timers and distribution in bounded steps (the distribution half is **four** steps — the server pump/inbound and the connector's pump/inbound).
 `../runner/` (a sibling directory) is the `beam_process::ProcessRunner` each scheduled process runs through; it is documented here because it is the scheduler's own instrument.
 `gc.rs` holds the runtime-level GC state, accounting and safety valves, and `ets_owner.rs` the `ProcessExitObserver` host with the two owner-death drains.
+`retention.rs` is the **retention accounting**: `RetentionStats` (one snapshot of the four never-freed storage regions — arena demand counters, the pooled BIF heap's regions/words/capacity/peak-use plus its nested-call loan count and seed, the `-eval` store's current and retired capacity, the escaped off-heap store's handle count) and its `Runtime::retention_stats()` accessor, plus the one-line `Display` form `BEAM_RT_MEM_TRACE` prints.
 
 ## API Surface
 ### `runtime.rs` — the façade
 `Runtime` owns every table (config, atom table, processes + mailboxes, BIF heaps, scheduler + runner state, ETS/port/NIF registries, refs, timers, the node-global `persistent_terms` store, `file_services`, dist) and the scratch `info_heap`.
+`retention.rs` publishes the four never-freed regions' figures as `Runtime::retention_stats() -> RetentionStats` (a pure read, no allocation, nothing in the runtime consults it); `BEAM_RT_MEM_TRACE` prints one line of it after the boot and again on the way out of `cli::run`.
 The **scheduler-pass family** (`run_one_slice`/`run_slices`/`run_scheduler`/`pump_scheduler`/`pump_scheduler_now`/`pump_scheduler_boot`/`run_scheduled`, the shared pass body, wake absorption, the port/timer/distribution halves) lives in `src/runtime/scheduler.rs` (+ `tests.rs`), but every entry point stays an inherent `Runtime` method.
 * **boot/config**: `new(RuntimeConfig)`, `with_defaults()`, `boot()` (idempotent; A.7), `boot_from_script(path)` (A.7), `is_booted()`, `config()`, `load_module(path)`, `module(name)`, `preloaded()`, `preloaded_loaded()`/`is_preloaded_loaded(name)`.
 * **the slice**: `run_function(path, function, arity, args) -> Result<Eterm>` (x(0)); `run_module(module, function, arity, args, out: &mut dyn OutputSink)`.
