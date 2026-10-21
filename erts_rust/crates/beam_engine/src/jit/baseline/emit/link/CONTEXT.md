@@ -158,8 +158,8 @@ describing IR blocks only; they reserve no entry label (nothing branches to a co
 start with a full block prologue, and they are not counted as blocks. `entries` is probed **first** and
 `sub_entries` second, so a real block start always wins. **Each pass allocates for the range it emits** —
 `emit_sub_blocks` folds its sub-block touches into the per-function `Summary` as a superset while
-`emit_shared_sub_blocks` derives the same `allocate_registers(module, code, start, end)` and discards its
-touches, so the eager whole-module `Summary` stays exactly the IR blocks'. A sub-block is a fresh native
+`emit_shared_sub_blocks` derives the same `allocate_registers_with_labels(module, labels, code, start, end)`
+and discards its touches, so the eager whole-module `Summary` stays exactly the IR blocks'. A sub-block is a fresh native
 function whose prologue loads its own live-in set, so its `Allocation` must be entry-point-relative to
 `start`: the containing IR block's allocation is indexed from `block.start` (`block_start`, the per-`pc`
 `fill_sets`/`spill_sets` tables, the live-in `entry_fill` set — see `regs.rs`), and a cached register the
