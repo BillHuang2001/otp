@@ -61,7 +61,8 @@ use beam_common::Result;
 use beam_term::{signed_value, Eterm};
 
 use crate::access::{
-    car, cdr, is_atom, is_list, is_map, is_nil, is_small, is_tuple, tuple_element, tuple_size,
+    car, cdr, is_atom, is_list, is_map, is_nil, is_record, is_small, is_tuple, tuple_element,
+    tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -69,17 +70,17 @@ use crate::error::unsupported_bif;
 
 use super::{
     char_printable, dup_chars, latin1_printable_char, printable_string, proper_list, quoted_string,
-    resolve_map_pairs, term_chunk_order, Chunk, MapOrder, UNLIMITED_DEPTH,
+    record::RecordParts, resolve_map_pairs, term_chunk_order, Chunk, MapOrder, UNLIMITED_DEPTH,
 };
 
 mod cind;
 use cind::while_fail_indent;
 /// Whether the oracle's `io_lib_pretty` may break `term` across lines: a tuple, a
-/// map, a **non-printable** list, or a **non-printable** bitstring (`print_length/7`
-/// gives those a container intermediate; a printable string or binary is written on
-/// one line however long).
+/// map, a native **record**, a **non-printable** list, or a **non-printable**
+/// bitstring (`print_length/7` gives those a container intermediate; a printable
+/// string or binary is written on one line however long).
 pub(crate) fn is_reflowable(term: Eterm) -> bool {
-    if is_tuple(term) || is_map(term) {
+    if is_tuple(term) || is_map(term) || is_record(term) {
         return true;
     }
     if bits::is_bitstring(term) {
@@ -297,6 +298,15 @@ enum Tpl {
     Container(Kind, Seq),
     /// A `K => V` pair (the oracle's `{map_pair, K, V}`).
     Pair(Box<Node>, Box<Node>),
+    /// A native record (the oracle's `{record, [{Name,NameL} | L]}`): the
+    /// `#Module:Name` element, its `NameL` and the field sequence.
+    Record { parts: Rc<RecordParts>, fields: Seq },
+    /// One record field (the oracle's `{field, Name, NameL, ValT}`).
+    Field {
+        name: Chunk,
+        name_len: i64,
+        value: Box<Node>,
+    },
     /// A binary whose contents `pp_binary/7` repacks: the **element body** of the
     /// oracle's `{bin, S}` (`S` = `io_lib:write_binary/3`'s
     /// `[$<, $<, Body, $>, $>]`, so the `<<`/`>>` are added by [`write`] and
@@ -361,6 +371,13 @@ enum More {
         i: usize,
         d: i64,
         d0: i64,
+    },
+    /// `print_length_native_record_fields(Fs, Rec, D + Dd, T1, …)`. Owns the
+    /// record's parts (an `Rc`) so the closure outlives the builder's borrow.
+    Field1 {
+        parts: Rc<RecordParts>,
+        i: usize,
+        d: i64,
     },
 }
 /// A built template — `io_lib_pretty`'s `{S, Len, Dots, More}`.

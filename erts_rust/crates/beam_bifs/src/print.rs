@@ -181,7 +181,7 @@ use beam_term::{atom_val, signed_value, Eterm};
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
     is_external_pid, is_external_ref, is_float, is_function, is_internal_pid, is_internal_port,
-    is_internal_ref, is_list, is_map, is_nil, is_port, is_small, is_tuple, tuple_element,
+    is_internal_ref, is_list, is_map, is_nil, is_port, is_record, is_small, is_tuple, tuple_element,
     tuple_size,
 };
 use crate::bits;
@@ -189,6 +189,7 @@ use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 
 mod pretty;
+mod record;
 pub(crate) use pretty::{
     pretty_chunk, pretty_chunk_limited, pretty_chunk_order, pretty_write_limited, tsub,
 };
@@ -577,6 +578,15 @@ fn render_chunk(
             }
         }
         return render_list_chunk(ctx, term, printable, depth, order);
+    }
+    // A **native record** (`RECORD_SUBTAG`, made by `records:create/4`): both
+    // writers walk its fields, so its parts are extracted once in [`record`] and the
+    // field walk is that module's ([`record::flat_record_chunk`] is
+    // `io_lib:write1/4`'s `write_record/4`). It is **not** a tuple (`is_tuple` is an
+    // `ARITYVAL` test), but the arm sits here to mirror `write1/4`'s clause order.
+    if is_record(term) {
+        let parts = record::record_parts(ctx, term)?;
+        return record::flat_record_chunk(ctx, &parts, printable, depth, order);
     }
     if is_tuple(term) {
         let arity = tuple_size(term);
