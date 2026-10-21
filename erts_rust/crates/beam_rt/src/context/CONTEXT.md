@@ -287,9 +287,15 @@ RSS, which is why down-sizing `heap_words` is the lever and a reservation-trunca
   `MinimalContext` (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>`
   that **only ever grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes
   the frontier; freed only when the `Runtime` drops (`beam_engine/src/context.rs:1395-1577`).
-  A **scheduled** process's nested run allocates from its own young heap instead (`gc.rs:1509-1539`,
-  `gc_process_enabled`), whose `Process::grow_nursery` retires the space it replaces — the *capacity*
-  ratchet, never live data (`beam_gc`'s `Nursery::grow`/`install`).
+  A **scheduled** process's nested run is still `RuntimeContext::new` with `mailbox_table: None` and
+  `gc_armed: false` (`bridges.rs:192-195`), so its accumulator graph also stays on the pooled region
+  and never reaches a young heap. Measured end state after a *completed* `cerl_clauses` compile:
+  `total_heap_size`/`heap_size` = **843 words** on `run <file>` (both the spawned-child and the
+  target-process form) and **233 words** on `-eval`, with `garbage_collection.minor_gcs = 0` and
+  `eheap_live = 0` sampled throughout — i.e. **no nursery growth and no collection happen on either
+  route** for this workload. Caveat: `dbg_iload`/`inet_parse` never complete, and the scheduled route
+  does not pre-empt often enough for an Erlang-level poller to sample them mid-run (2 samples in 2.4 s),
+  so their mid-run `heap_size` cannot be read this way.
 - **Bounded, and therefore not the grower:** the nested-run `Machine` pool
   (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32; 16 KiB of register files per machine,
   `Vec` high-water capacity retained by `Machine::reset`, never shrunk) and the wall-clock
