@@ -197,15 +197,20 @@ fn attribute_decline(
         }
         Ok(())
     });
-    for (name, index, word) in rows.iter().take(MAX_REFUSING_ROOTS) {
+    // Every slot is examined (a refusal is only found where it is); the *report* is capped, so a
+    // corpus of hundreds of dictionary slots cannot bury the finding in its own noise.
+    for (name, index, word) in rows.iter() {
         examined += 1;
+        if reported >= MAX_REFUSING_ROOTS {
+            continue;
+        }
         if report_refusal(runtime, name, *index, *word, header, &no_candidates) {
             reported += 1;
         }
     }
     debug_trace::store(format_args!(
         "  {reported} of {examined} corpus slot(s) refuse on the walk (at most \
-         {MAX_REFUSING_ROOTS} family slots were examined)"
+         {MAX_REFUSING_ROOTS} refusals are printed)"
     ));
 }
 
@@ -420,7 +425,13 @@ fn locate(runtime: &mut Runtime, candidates: &[(usize, usize)], address: usize) 
     if read_word_at(runtime, address).is_some() {
         return String::from("a live arena region");
     }
-    String::from("NO live region — the word dangles (its region was released)")
+    // Deliberately *not* "it dangles": the two enumerable families are the store regions and the
+    // arena regions the engine seam hands out, so an address outside both is either a released
+    // region or an arena region that seam omits (a boot-time `erlang:put/2` value rendering
+    // perfectly while landing here proves the second case exists).
+    String::from(
+        "no region this diagnostic enumerates (released, or an arena region the arena seam omits)",
+    )
 }
 
 /// Whether `address` stands inside one of the runtime's live **store** regions (the term store, its
