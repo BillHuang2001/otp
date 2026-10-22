@@ -176,6 +176,18 @@ impl Machine {
     /// buffer — the same one the wide `gc_bif`/`call_ext` marshalling uses — cleared
     /// and given back empty, so a traced call allocates nothing once the buffer has
     /// grown to fit its widest arity.
+    ///
+    /// This is a second, independent window in which argument words live outside the
+    /// root set (the buffer is `mem::take`n out of the machine, so neither
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots) nor
+    /// [`Machine::for_each_root`](crate::machine::Machine::for_each_root) sees it). It
+    /// is sound under exactly the invariant the `Machine::args_scratch` field doc states:
+    /// `trace_event` is a `&mut self` call on the **context** and is handed the machine
+    /// only where the seam says so, and no rooted door (`alloc_words_rooted`,
+    /// `ensure_heap_full`) can be crossed while the buffer is out. The buffer is
+    /// reinstated empty on every path (there is no `?` between the `take` and the
+    /// reinstall, and the `break` on an out-of-range register still reaches it), so a
+    /// traced run leaves the field exactly as it found it.
     fn trace_call(
         &mut self,
         module_name: &str,

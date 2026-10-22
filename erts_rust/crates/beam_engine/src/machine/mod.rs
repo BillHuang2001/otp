@@ -423,6 +423,13 @@ pub struct Machine {
     /// landing published one, else the [`Machine::raise_snapshot`] chain cooked
     /// once, rooted, at the `raw_raise` site — so C's raw object is modelled as a
     /// real Erlang term and needs no second derivation.
+    ///
+    /// It holds a **process-heap** term in a field that is **not** part of the frozen
+    /// root set ([`crate::context::RootSet`]), so it is one of the machine's *loose
+    /// heap terms*: [`Machine::with_roots`] parks it at the tail of the Erlang stack
+    /// for the duration of every root hand-off and re-seats it from the word the host
+    /// writes back (see [`Machine::loose_heap_terms`]). No argument about an
+    /// allocation-free window is needed — and none is made.
     pub(crate) pending_supplied_term: Option<Eterm>,
     /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
     /// explicit frames the raise currently in flight arrived carrying.
@@ -454,10 +461,13 @@ pub struct Machine {
     ///   rebuilt for a supplied raise, so it still holds the re-raised exception's
     ///   frames).
     ///
-    /// A raise that supplies a trace makes **no allocation** between arming the
-    /// one-shot latch and publishing the term, and the published `x(2)` register is
-    /// inside the frozen root set ([`crate::context::RootSet`]), so the term never
-    /// needs parking in [`Machine::with_roots`].
+    /// It is the live-raise twin of [`Machine::pending_supplied_term`] and is rooted
+    /// the same way: the field holds a **process-heap** term outside the frozen root
+    /// set ([`crate::context::RootSet`]) while the raise is in flight, so
+    /// [`Machine::with_roots`] parks it at the tail of the Erlang stack for the
+    /// duration of every root hand-off and re-seats it from the word the host writes
+    /// back (see [`Machine::loose_heap_terms`]). A collection between the raise and
+    /// its consumption therefore **relocates** the cooked list instead of stranding it.
     pub(crate) raise_supplied_term: Option<Eterm>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
@@ -517,13 +527,50 @@ pub struct Machine {
     /// The interpreter marshals the arguments of a `gc_bif`/`bif`/`bif0`/
     /// `call_ext*` through a fixed stack array for every arity up to its
     /// `STACK_ARGS` arity bound — the common case, which therefore allocates
-    /// nothing. A **wider** call (a `call_ext` to a many-argument function) reuses
-    /// this buffer instead of minting a fresh `Vec` per call: the capacity is
-    /// retained across calls, so the steady state allocates nothing either.
+    /// nothing. A **wider** call (`arity > STACK_ARGS`) reuses this buffer instead of
+    /// minting a fresh `Vec` per call: the capacity is retained across calls, so the
+    /// steady state allocates nothing either. The tracing hook reuses it the same way
+    /// (`Interpreter::trace_call`).
     ///
-    /// The buffer is always **left empty** by the dispatcher (only its capacity
-    /// survives), so it never keeps a term alive and [`Machine::reset`] has nothing
-    /// to clear.
+    /// # It is not a root, and the window that makes that sound
+    ///
+    /// The dispatcher [`std::mem::take`]s the buffer out of the machine for the whole
+    /// wide dispatch and gives it back **empty** (only the capacity survives), so for
+    /// the duration the argument words are in no root set: neither
+    /// [`Machine::with_roots`]'s hand-off nor [`Machine::for_each_root`]'s walk can
+    /// see them. Nothing here can move those words — which is why no re-derivation
+    /// from the registers, and no parking at the stack tail, is needed. The window is
+    /// **structurally** collection-free:
+    ///
+    /// * the dispatch itself is [`Machine::dispatch_bif_call`], which takes `&self`,
+    ///   so a host is handed the machine **immutably** (`call_bif_in_machine*`) and
+    ///   can neither reach a rooted door nor start a nested run on it;
+    /// * both rooted doors — [`ExecutionContext::alloc_words_rooted`] and
+    ///   [`ExecutionContext::ensure_heap_full`] — take `&mut self` (the *context*) and
+    ///   a [`RootSet`](crate::context::RootSet) whose slices come **from this machine**,
+    ///   so the borrow checker forbids crossing either one while the machine is
+    ///   borrowed immutably;
+    /// * the only allocation the marshalling itself performs is a non-small integer
+    ///   operand, through the **unrooted** [`ExecutionContext::alloc_words`], which
+    ///   takes no roots and (per its contract) must never collect.
+    ///
+    /// **What a future change must preserve.** (1) `dispatch_bif_call` stays `&self`
+    /// and no in-window route reaches a `&mut Machine` (a host callback taking
+    /// `&mut Machine` would break it); (2) no rooted door is called from the
+    /// marshalling (`exec_bif`/`call_bif_named`/`dispatch_wide`) or from a host seam
+    /// reached inside the window; (3) `alloc_words` stays non-collecting. Break any of
+    /// the three and the argument words must be rooted — the durable fix is to keep
+    /// the filled buffer **in** the machine and enumerate it (or park it at the stack
+    /// tail), not to widen this comment. Pinned by `tests/bif_args_window.rs`.
+    ///
+    /// # Left empty on every exit path
+    ///
+    /// `dispatch_wide` clears the buffer and reinstalls it before returning; it has
+    /// **no `?`** between the `take` and the reinstall (the marshalling outcome is
+    /// only *stored*, and the BIF outcome is wrapped rather than propagated), so a
+    /// bad operand, a BIF failure, a guard failure and a suspension all leave the
+    /// field empty. [`Machine::reset`](crate::machine::Machine::reset) therefore has
+    /// nothing to clear, and the buffer never keeps a term alive.
     pub(crate) args_scratch: Vec<Eterm>,
     /// The **per-run tracing gate** (contract A.8): the cached answer of
     /// [`ExecutionContext::trace_enabled`](crate::context::ExecutionContext::trace_enabled)
@@ -823,11 +870,14 @@ impl Machine {
     /// [`RootSet`] — its *loose* heap terms ([`Machine::loose_heap_terms`]): the two
     /// failed-clause argument latches
     /// ([`Machine::pending_function_clause_args`] — armed immediately before the
-    /// `throw_with_trace` that lands the raise, so never live across an allocation —
+    /// `throw_with_trace` that lands the raise
     /// and [`Machine::raise_function_clause_args`] — the **live raise** state the
-    /// cooked-trace builders read *after* their rooted reservation) **and the pending
+    /// cooked-trace builders read *after* their rooted reservation), **the pending
     /// exception's reason** ([`Machine::pending_exception`], which stays readable for the
-    /// rest of the run because the engine — unlike C — does not clear it at landing).
+    /// rest of the run because the engine — unlike C — does not clear it at landing),
+    /// **and the two supplied-trace term latches**
+    /// ([`Machine::pending_supplied_term`] and [`Machine::raise_supplied_term`], which
+    /// hold the cooked `[{M,F,A,Loc}]` list of a re-raised exception).
     /// A collecting host must relocate those terms too, so this method **parks** whichever
     /// are armed at the end of the **Erlang stack** for the duration of `f` and
     /// **re-seats** each field from its slot afterwards — the stack is part of the
@@ -873,9 +923,9 @@ impl Machine {
 
     /// How many loose heap-term slots [`Machine::with_roots`] can park.
     ///
-    /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument latches
-    /// plus the pending exception's reason.
-    const LOOSE_HEAP_TERMS: usize = 3;
+    /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument latches,
+    /// the pending exception's reason and the two supplied-trace term latches.
+    const LOOSE_HEAP_TERMS: usize = 5;
 
     /// The machine's **loose heap terms**: the `Eterm`-typed fields that hold a
     /// process-heap term but are **not** part of the frozen [`RootSet`].
@@ -889,6 +939,8 @@ impl Machine {
             self.raise_function_clause_args,
             self.pending_function_clause_args,
             self.pending_exception.map(|(_class, reason)| reason),
+            self.pending_supplied_term,
+            self.raise_supplied_term,
         ]
     }
 
@@ -945,6 +997,12 @@ impl Machine {
         if let (Some(term), Some((_class, reason))) = (terms[2], self.pending_exception.as_mut()) {
             *reason = term;
         }
+        if let Some(term) = terms[3] {
+            self.pending_supplied_term = Some(term);
+        }
+        if let Some(term) = terms[4] {
+            self.raise_supplied_term = Some(term);
+        }
     }
 
     /// Walk every **pointer-bearing root word** this machine holds, skipping immediates.
@@ -956,9 +1014,10 @@ impl Machine {
     /// ([`Machine::used_x_extent`]), the **whole** Erlang stack (every Y slot of every
     /// live frame — it has no liveness map), the used prefix of the FR file
     /// ([`Machine::used_fr_extent`]) and then the machine's **loose heap terms**
-    /// ([`Machine::loose_heap_terms`]: the two failed-clause argument latches and the
-    /// pending exception's live reason) — the same fields and the same extent accessors
-    /// `with_roots` uses, so the two can never disagree about *what* is rooted.
+    /// ([`Machine::loose_heap_terms`]: the two failed-clause argument latches, the
+    /// pending exception's live reason and the two supplied-trace term latches) — the same
+    /// fields and the same extent accessors `with_roots` uses, so the two can never
+    /// disagree about *what* is rooted.
     ///
     /// A word is handed to `f` only when its primary tag is `LIST` or `BOXED`
     /// ([`beam_term::primary_tag`]), i.e. when it may hold a pointer into a heap: a small
@@ -972,8 +1031,13 @@ impl Machine {
     /// # What it does NOT cover
     ///
     /// **`args_scratch`** — the `call_bif` argument window is `mem::take`n *out* of the
-    /// machine for the whole wide dispatch, so it is unreachable from any door and is not
-    /// enumerated here (a host that must root it does so for the window's duration).
+    /// machine for the whole wide dispatch (`arity > STACK_ARGS`), so it is unreachable
+    /// from any door and is not enumerated here. That is sound because the same dispatch
+    /// holds the machine **immutably** ([`Machine::dispatch_bif_call`] is `&self`), so
+    /// neither of the two rooted doors (`alloc_words_rooted`, `ensure_heap_full`) — whose
+    /// receivers are `&mut self` and whose root slices come from this machine — can be
+    /// crossed while it is out; the invariant is stated on the field and pinned by
+    /// `tests/bif_args_window.rs`.
     /// `class_atoms` is not a gap: those are immediates. A foreign (`literal`-area) term
     /// and any host-side structure holding engine terms are likewise outside this walk.
     ///

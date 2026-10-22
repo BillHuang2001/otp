@@ -158,6 +158,20 @@ impl Machine {
     /// back **empty** — only its capacity survives, which is exactly the point: a
     /// call of any arity allocates nothing once the buffer has grown to fit it.
     ///
+    /// **No `?` sits between the `take` and the reinstall.** The marshalling outcome is
+    /// only *stored* (a bad operand, an out-of-range register) and the BIF outcome is
+    /// *wrapped*, so the buffer is cleared and given back on every exit path —
+    /// successful dispatch, marshalling error, BIF failure, gate failure and
+    /// [`BifOutcome::Suspend`] alike. That is what keeps
+    /// [`Machine::args_scratch`] empty between dispatches (and
+    /// [`Machine::reset`](crate::machine::Machine::reset) with nothing to clear), and it
+    /// is pinned by `tests/bif_args_window.rs` + the `bif` unit test beside the wide
+    /// marshalling proof.
+    ///
+    /// While the buffer **is** out, the argument words are in no root set. That is
+    /// sound because the dispatch cannot collect — the field doc on
+    /// [`Machine::args_scratch`] states the invariant a future change must preserve.
+    ///
     /// The return shape mirrors the stack-array path exactly: the **outer**
     /// [`Result`] is the *marshalling* outcome (a bad operand, propagated by the
     /// caller's `?` and never folded into a guard/raise decision) and the **inner**
@@ -660,5 +674,70 @@ mod tests {
         assert_eq!(step, Step::Goto { func: 0, pc: 9 });
         assert_eq!(machine.x(1), Some(reason), "the compound reason lands verbatim");
         assert_eq!(machine.x(3), Some(make_atom(error)));
+    }
+
+    /// The wide marshalling window's **exit discipline**: [`Machine::dispatch_wide`] takes
+    /// the argument buffer out of the machine and gives it back **empty** on **every**
+    /// exit path — a successful dispatch and a marshalling error alike — so the field
+    /// never holds a term between dispatches and `Machine::reset` has nothing to clear.
+    /// Only the capacity survives, which is the whole point of the buffer.
+    ///
+    /// The error path is the one with a `mem::take` in flight and no `?` to unwind
+    /// through: a register read fails *after* earlier arguments were already pushed, and
+    /// the buffer must still come back empty rather than be dropped with the machine.
+    #[test]
+    fn the_argument_scratch_is_left_empty_on_both_wide_dispatch_exit_paths() {
+        /// `host:sum/N` — the small-int sum of its arguments, allocating nothing.
+        fn sum_hook(_module: &str, _function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+            assert_eq!(arity as usize, args.len());
+            let mut total: i64 = 0;
+            for arg in args {
+                total += beam_term::signed_value(*arg);
+            }
+            Ok(make_small(total))
+        }
+
+        let module = Module::default();
+
+        // (a) the marshalling error path: a 2-slot register file cannot serve an
+        // arity-5 marshal, and the failure lands *after* two arguments were pushed.
+        let mut machine = Machine::with_max_register(2);
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(sum_hook));
+        let err = machine
+            .call_bif_named(&module, "host", "sum", 5, 5, &mut ctx)
+            .expect_err("marshalling x(0..5) out of a 2-slot register file fails");
+        assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+        assert!(
+            machine.args_scratch.is_empty(),
+            "the error path must reinstate the buffer EMPTY, never with a partially \
+             marshalled argument list in it: {:#?}",
+            machine.args_scratch
+        );
+        assert!(
+            machine.args_scratch.capacity() >= 5,
+            "capacity is what survives, so the next wide call reuses the same allocation"
+        );
+
+        // (b) the successful path: the buffer is filled, the BIF runs and the buffer goes
+        // back empty again.
+        let mut machine = Machine::with_max_register(5);
+        for index in 0..5u32 {
+            machine
+                .set_x(index, make_small(i64::from(index)))
+                .expect("the register is in range");
+        }
+        let outcome = machine
+            .call_bif_named(&module, "host", "sum", 5, 5, &mut ctx)
+            .expect("the dispatch returns");
+        assert!(
+            matches!(outcome, BifOutcome::Return(value) if value == make_small(10)),
+            "the hook summed x(0..5) = 0+1+2+3+4"
+        );
+        assert!(
+            machine.args_scratch.is_empty(),
+            "the success path must reinstate the buffer empty too: {:#?}",
+            machine.args_scratch
+        );
+        assert!(machine.args_scratch.capacity() >= 5);
     }
 }
