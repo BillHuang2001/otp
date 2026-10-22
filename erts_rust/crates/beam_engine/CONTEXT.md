@@ -198,10 +198,20 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
   the `RootSet`, so the machine relocates it and only the Rust local goes stale: the landed `x(1)`
   (`land_exception`, `src/machine/catch.rs:631`), `pending_exception`'s reason and an uncaught
   `Raise::live_reason` all end up naming the abandoned space, which a later
-  `install_collapsed` / mature-space replacement (`beam_gc/src/nursery.rs:576-583`, `collector.rs:452`) frees and unmaps --
-  a dangling cons-cell pointer surfaces later as a `beam_term::list::car` fault. It fires on exactly the shape
-  `sys_core_fold` emits (`catch C:R:S -> erlang:raise(C,R,S)`) whenever the landed exception was engine-derived, i.e. its
-  `x(2)` is `NIL` (only that branch allocates). Every other arm keeps the ordering (`raise_error_tuple` reads inside the
+  `install_collapsed` / mature-space replacement (`beam_gc/src/nursery.rs:576-583`, `collector.rs:452`) frees.
+  What the free MEANS is decided three layers down in `beam_alloc`: the nursery at compile scale is a dedicated
+  single-block carrier (>= 512 KiB / 65536 words), so `Heap::drop` (`beam_alloc/src/heap.rs:242`) releases it into the
+  10-entry process-global mseg reuse cache STILL MAPPED (recycled-but-mapped ⇒ a stale cons silently reads another owner's
+  words, no fault); a genuine `munmap` (`beam_alloc/src/mseg/state.rs:147-152` FIFO eviction, or `:183-204` a bad-fit tail
+  trim) is what turns the same stale word into a `beam_term::list::car` SIGSEGV -- so it is fault-vs-silent-aliasing, never
+  "safely recycled". It fires on exactly the shape `sys_core_fold` emits (`catch C:R:S -> erlang:raise(C,R,S)`) whenever the
+  landed exception was engine-derived, i.e. its `x(2)` is `NIL` (only that branch allocates) AND the reservation takes the
+  host's COLLECTION branch -- `beam_rt`'s `alloc_words_rooted` is bump-first (`gc.rs:1633-1665`), so it collects only on a
+  pending forced request (`erlang:garbage_collect`, dormant on the compile route) or a failed bump the no-relocation
+  `grow_nursery` also refused, NOT on every call. `MinimalContext` cannot reproduce it: it never overrides
+  `alloc_words_rooted` (`src/context.rs:780` is the discarding default) and its `ContextHeap` never relocates
+  (`src/context.rs:1516-1519`), so every `raw_raise` unit test (`tests/raising.rs:283-317`, always `x(1)` = a small int)
+  passes regardless; no test pins this ordering. Every other arm keeps the ordering (`raise_error_tuple` reads inside the
   reader closure, `raise.rs:66`; `catch_end` re-reads `x(1)`/`x(0)` after its reservation, `mod.rs:268`; `failed_clause_arglist`,
   `src/interpreter/dispatch.rs:1460`). Fix: move the `x(1)`/`x(2)` reads after the cooking (or re-read them from the machine),
   never reuse the pre-reserve words.
