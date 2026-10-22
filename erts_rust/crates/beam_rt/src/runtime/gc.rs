@@ -936,6 +936,60 @@ impl Runtime {
         }
     }
 
+    /// Copies a raise's **live reason term** onto the runtime-lifetime store, so the error can
+    /// outlive the heap that built it.
+    ///
+    /// A raise whose reason is a structured term (`{badkey, K}`, `{badmap, M}`,
+    /// `{case_clause, V}`, …) carries that term as a raw [`Eterm`] in the opaque
+    /// [`Raise::live_reason`](beam_common::Raise::live_reason) slot — the payload convention
+    /// [`crate::error::live_reason_term`] recovers. The term was built on whichever heap the
+    /// raising code was running on: a scheduled process's own young heap, or the pooled BIF
+    /// region (which is rewound after every call). **Neither outlives the raise**: the runner
+    /// terminates the process (its heap dies with it) and the pooled region is rewound, so a
+    /// raw slot read later is a use-after-free — observed as an allocator abort for a boxed
+    /// binary, a null-deref panic for a cons list, or a silently degraded rendering.
+    ///
+    /// This is therefore the **escape boundary** for an error: every producer of a
+    /// process-heap reason funnels its error through here *while the owning heap is still
+    /// alive*, so the raise that leaves carries a term that is valid for the runtime's
+    /// lifetime. Every rendering site (`crate::runner::exit_reason`, `crate::cli`'s
+    /// `reported_reason`, the crash dump) then consumes a safe term without knowing about
+    /// this move.
+    ///
+    /// It is exactly [`Runtime::try_stabilize_escaped_with`] applied to the slot's payload, so
+    /// the two failure classes stay as documented there: a genuine [`BeamError::SystemLimit`]
+    /// propagates (never a dangling term), while the off-heap capability gap keeps the original
+    /// term and freezes every process heap ([`Runtime::disable_gc`]). An error with no live
+    /// reason — a non-raise, or a raise whose reason **is** an atom (the authoritative one;
+    /// [`crate::error::live_reason_term`] answers `None` for both) — is returned untouched: no
+    /// copy, no allocation, no valve.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::SystemLimit`] when the reason genuinely does not fit the arena; the
+    /// original error is then **not** returned as if it were safe.
+    pub(crate) fn stabilize_error_live_reason(
+        &mut self,
+        error: BeamError,
+        src: &SourcePayloads,
+    ) -> Result<BeamError> {
+        let Some(term) = crate::error::live_reason_term(&error) else {
+            return Ok(error);
+        };
+        let term = self.try_stabilize_escaped_with(term, src)?;
+        match error {
+            // Rebuild the raise around the stabilized term: class, reason, stacktrace and
+            // stacktrace head are preserved, only the opaque payload is replaced.
+            BeamError::Raise(raise) => Ok(BeamError::Raise(
+                raise.with_live_reason(beam_common::LiveReason::new(term)),
+            )),
+            // Unreachable — `live_reason_term` only answers `Some` for a `Raise` — but a
+            // fallback that returns the error unchanged is still the honest answer, never a
+            // panic on runtime data.
+            other => Ok(other),
+        }
+    }
+
     /// The reusable placeholder fill of `n` words the safe heap bump pads with.
     ///
     /// Only ever grown, so a bump never allocates (see
@@ -1416,6 +1470,107 @@ mod tests {
         );
         assert_ne!(copied, arg, "the copy lives on the destination heap");
         assert!(!rt.gc_stats().disabled, "a successful store trips no valve");
+    }
+
+    /// **The raise's reason term is made runtime-lifetime at the escape boundary.**
+    ///
+    /// A structured reason is built on the heap the raising code was running on — a scheduled
+    /// process's own young heap, or the pooled BIF region (rewound after every call). Neither
+    /// outlives the raise: the runner terminates the process, so its heap is recycled while the
+    /// recorded `BeamError` lives on. [`Runtime::stabilize_error_live_reason`] copies the term
+    /// onto the pointer-stable store *before* that happens.
+    ///
+    /// This test **recycles the source heap explicitly** — it builds `{badkey, [1,2,3]}` on a
+    /// scratch heap, stabilizes the raise, then rewinds the heap and fills every word of it, which
+    /// is exactly what a reused region looks like. A raise whose slot still pointed there would
+    /// read the filler words (the pre-fix failure: an allocator abort for a boxed binary, a
+    /// null-deref panic for a cons list). The stabilized reason must still be the same value.
+    #[test]
+    fn a_raises_reason_term_survives_the_recycling_of_the_heap_that_built_it() {
+        use beam_common::{ExitReason, LiveReason, Raise};
+
+        let mut rt = small_runtime();
+        let badkey = rt.intern("badkey");
+        let mut heap = beam_term::heap::Heap::new(32);
+        let mut list = beam_term::NIL;
+        for value in [3, 2, 1] {
+            list = heap.cons(make_small(value), list).expect("the scratch cons");
+        }
+        let reason = heap.tuple(&[badkey, list]).expect("the scratch tuple");
+        let error = BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(reason)),
+        );
+
+        // The escape boundary: the copy happens while the source heap still holds the term.
+        let error = rt
+            .stabilize_error_live_reason(error, &SourcePayloads::default())
+            .expect("the reason is small enough for the arena");
+
+        // Now the source heap is recycled — rewound and overwritten, the way a reused region is.
+        heap.reset();
+        while heap.available() >= 2 {
+            heap.cons(make_small(-1), beam_term::NIL).expect("the filler");
+        }
+
+        // The raise's reason is still readable and still the value the producer built.
+        let stabilized = crate::error::live_reason_term(&error).expect("the live reason survived");
+        assert_ne!(stabilized, reason, "the reason lives on the destination heap now");
+        assert_eq!(
+            rt.format_term_w(stabilized, None)
+                .expect("a safe term renders")
+                .trim_end_matches('\n'),
+            "{badkey,[1,2,3]}",
+            "the stabilized reason still renders as the producer's term"
+        );
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "a successful copy trips no valve");
+        assert_eq!(stats.valve_trips, 0);
+    }
+
+    /// **An error with no live reason is returned untouched** — no copy, no allocation, no valve.
+    ///
+    /// That is the gate [`crate::error::live_reason_term`] applies: a non-raise, and a raise whose
+    /// reason **is** an atom (the authoritative one), carry no term to stabilize.
+    #[test]
+    fn an_error_without_a_live_reason_is_returned_untouched() {
+        use beam_common::{ExitReason, Raise};
+
+        let mut rt = small_runtime();
+        let atom_raise = BeamError::Raise(Raise::error(ExitReason::atom("badarg")));
+        let returned = rt
+            .stabilize_error_live_reason(atom_raise, &SourcePayloads::default())
+            .expect("there is nothing to copy");
+        assert_eq!(returned.as_atom(), Some("badarg"));
+        let returned = rt
+            .stabilize_error_live_reason(BeamError::BadArg, &SourcePayloads::default())
+            .expect("there is nothing to copy");
+        assert_eq!(returned.as_atom(), Some("badarg"));
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "nothing was stored, so nothing was frozen");
+        assert_eq!(stats.valve_trips, 0);
+    }
+
+    /// **A reason that genuinely cannot be copied is the honest `system_limit`** — never a raise
+    /// carrying a dangling term, and never a valve trip (nothing was stored).
+    #[test]
+    fn a_reason_that_cannot_be_copied_is_the_honest_system_limit() {
+        use beam_common::{ExitReason, LiveReason, Raise};
+
+        let mut rt = small_runtime();
+        let big = oversized_term(&mut rt);
+        let error = BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(big)),
+        );
+        assert!(
+            matches!(
+                rt.stabilize_error_live_reason(error, &SourcePayloads::default()),
+                Err(BeamError::SystemLimit)
+            ),
+            "an un-copyable reason is reported honestly, not stored dangling"
+        );
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "an honest failure trips no valve");
+        assert_eq!(stats.valve_trips, 0);
     }
 
     /// **The valve accessors answer identically whether their set is empty or populated** — the

@@ -4871,6 +4871,10 @@ impl Runtime {
     ///    The restore in step 4 happens first so the escape-store gate is latched for the pid that
     ///    will read the term back — the runtime's own ([`Runtime::self_pid`]) — not for the child
     ///    whose death drops the mark.
+    ///    A raised **error** escapes the same heap and is stabilized the same way
+    ///    ([`Runtime::stabilize_error_live_reason`]): its structured reason term travels in the
+    ///    raise's live-reason slot, so a copy made while the child is still alive is what lets the
+    ///    CLI render it after the child's heap is gone.
     /// 6. The child is then **ended the way this runtime ends every process that returns**: a
     ///    normal exit through [`ProcessTable::terminate`], not a silent removal from the table.
     ///    That is what the oracle's action process does when the action is over (it exits
@@ -4910,12 +4914,28 @@ impl Runtime {
         // action built off-heap (or received in a message) is resolved through the child's own
         // scan state and the runtime's escaped-payload store, exactly as the runner resolves a
         // scheduled process's `x(0)` (`Runtime::source_payloads`).
+        //
+        // A raised error escapes the same heap and is stabilized the same way: its structured
+        // reason (`{badkey, K}`, …) is a live term the action built on the child's heap (or on
+        // the pooled BIF region, which is rewound after every call), so without the copy the
+        // caller would hold a raise whose reason term points at freed/modified memory once the
+        // child is terminated below — read back by the CLI's `reported_reason` as an allocator
+        // abort or a null-deref. See `Runtime::stabilize_error_live_reason`.
         let result = match result {
             Ok(term) => {
                 let payloads = self.source_payloads(action_pid, &[]);
                 self.stabilize_term_with(term, &payloads)
             }
-            Err(err) => Err(err),
+            Err(error) => {
+                let payloads = self.source_payloads(action_pid, &[]);
+                // The stabilization answers the *stabilized error*; the body's own `Err` is
+                // what this method returns, so fold it back into the failing arm. A genuine
+                // `SystemLimit` from the copy replaces it (never a dangling term).
+                match self.stabilize_error_live_reason(error, &payloads) {
+                    Ok(error) => Err(error),
+                    Err(failure) => Err(failure),
+                }
+            }
         };
         // Step 6: the child exits `normal` — the reason a process that returns exits with — so a
         // normal end-of-action is not an abnormal one for anything watching the node.

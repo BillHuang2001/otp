@@ -67,9 +67,14 @@ pub(super) fn exit_reason(runtime: &mut Runtime, error: &BeamError) -> Eterm {
             return runtime.intern(name);
         }
     }
-    // A structured reason travels as a live term (the `beam_common::Raise` convention;
-    // the payload is the reason as an `Eterm`, built on a BIF heap that M1 never
-    // resets or moves). Return it directly — no reshaping, no loss.
+    // A structured reason travels as a live term (the `beam_common::Raise` convention).
+    //
+    // The slot holds a **runtime-lifetime** term: the heap that built it — the raising
+    // process's own young heap, or the pooled BIF region (rewound after every call) — is gone by
+    // the time a reader gets here, so the producer stabilized the term at the escape boundary
+    // (`Runtime::stabilize_error_live_reason`, called by this module's `Runner` arm and by
+    // `Runtime::as_action_process`) *before* the owning process was terminated. Return it
+    // directly — no reshaping, no loss, and no stale pointer to dereference.
     if let Some(term) = crate::error::live_reason_term(error) {
         return term;
     }

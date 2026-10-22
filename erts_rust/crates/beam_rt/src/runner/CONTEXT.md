@@ -61,10 +61,10 @@ characterisation and figures are in `PERF.md`).
   `retained_nodes`), since a payload the process *received from another process* carries its handles on
   the message envelope, not on this machine. They are stabilized *before*
   the engine goes back into — or is dropped out of — `RunnerState`: the return value through
-  `Runtime::stabilize_term_with`, the exit reason through `Runtime::try_stabilize_escaped_with`. An
+  `Runtime::stabilize_term_with`, the raise through `Runtime::stabilize_error_live_reason`. An
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
-  (the exit path) — whether the process **built** it or **received** it.
+  (the raise path) — whether the process **built** it or **received** it.
   The machine's `refc_binaries()` reservoir is **not** copied onto the running process: it is the one
   holder of every payload the process's own compiled bitstring code built, so
   `erlang:process_info(Pid, binary)` reads it straight through `RunnerState::reservoir_at(pid)` for
@@ -212,7 +212,7 @@ The **`Yield`** (pre-emption) arm is *not* exempt by the park itself, but the po
 This is **additional** to the installed host collection gate (`../context/gc_walk.rs`'s `RuntimeCollectionGate`, installed on the runtime's table by `Runtime::new`): the gate declines only when an unscanned container is reachable from the receiver's **gathered** roots, while the exemption refuses *any* relocation for the window — covering a live term the host holds outside that gathered set, which the walk cannot see.
 Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it when the slice ended with a dead FR prefix (`fr_mark() == 0`, so no exemption was opened) and it is declined by the exemption when the prefix was live, while the `Wait` arm's request is declined by the parked-window exemption.
 
-The runner's raise arm likewise copies the recorded exit reason through `Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap family the pid retained from received messages — refc binaries, MSO handles and node identities), so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared instead of tripping the valve, whether the process built it or received it; a reason that genuinely cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
+The runner's raise arm **is the escape boundary for a raised error**: it stabilizes the `BeamError` itself — its structured reason term is a raw `Eterm` in the raise's live-reason slot, built on the dying process's heap or on the recyclable pooled BIF region — through `Runtime::stabilize_error_live_reason`, with the copy's `SourcePayloads` built by `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap family the pid retained from received messages — refc binaries, MSO handles and node identities), so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared instead of tripping the valve, whether the process built it or received it. The recorded **exit reason** is then derived from the stabilized error (`reason::exit_reason`: atom → the stabilized live term → interned `Display` text), so one copy serves both the exit propagation and every later rendering; a reason that genuinely cannot be copied is still the honest `error:system_limit`, never a stored dangling word. `Runtime::as_action_process` is the same boundary for the `-eval`/`-s`/`-run`/boot-directive routes.
 
 ## The off-heap refc-binary reclamation at the slice boundary
 `run.rs`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` (`run.rs:367`) → `context::gc::reclaim`, called immediately after `collect_at_reds_boundary` and before `take_max_heap_kill` on the same park (`run.rs:1214`).
@@ -401,7 +401,12 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   to a reason **term** ([`mod.rs::reason::exit_reason`](reason.rs): atom → live term → `Display` text) and
   the pump hands the original `BeamError` back to the CLI, which prints **one** line —
   `beam_rt: <class> <reason>` (`beam_common`'s `Display for Raise`, with `cli.rs::reported_reason` swapping
-  in the `~w` rendering of a live structured reason on the `run`/`-boot` routes only).
+  in the `~w` rendering of a live structured reason on every route: `run`, `-boot`, `-eval`, `-s`
+  and `-run`).
+  The term it renders is safe because the raise was **stabilized at the escape boundary** — the
+  runner's raise arm (`Runtime::stabilize_error_live_reason`) for a scheduled process,
+  `Runtime::as_action_process` for the action routes — before the owning heap was terminated or
+  rewound.
   There is no `** exception error:` / `=ERROR REPORT` crash-report renderer in this crate (the one ERTS
   report text is the `max_heap_size` block, `../context/gc.rs`), so `Raise::stacktrace` — the symbolic
   frames the engine attaches when a raise escapes a machine — has **no consumer** here: its only readers

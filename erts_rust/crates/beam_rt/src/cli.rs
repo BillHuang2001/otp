@@ -1722,7 +1722,17 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             // evaluated for its effect only (`halt`, a start script, …).
             let result = boot_then(&mut runtime, boot_script.as_deref(), |runtime| {
                 runtime.eval(&expr).map(|_| ())
-            });
+            })
+            // A failed expression is often a **structured** raise reason (`{badkey, K}`, …)
+            // whose real term rides the raise's live-reason slot; `BeamError`'s `Display` can
+            // only render that as `<structured reason>`. Recover the term and render it through
+            // the runtime's one printer — the same treatment `Action::Boot` and the `run` action
+            // give a failure, so the diagnostic names the expression's real reason.
+            //
+            // The term is safe to read here because the raise was **stabilized at the escape
+            // boundary** where the action process was ended
+            // (`Runtime::stabilize_error_live_reason`).
+            .map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }
@@ -1738,7 +1748,11 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
                     terms.push(runtime.intern(name));
                 }
                 apply(runtime, &module, &function, &terms)
-            });
+            })
+            // A structured raise reason is rendered with its real term, exactly as the `run`
+            // action and `-eval` do (see [`reported_reason`]); the raise was stabilized at the
+            // action process's escape boundary, so the term is safe to print here.
+            .map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }
@@ -1752,7 +1766,9 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
                 let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
                 let terms = runtime.materialize_args(&parsed)?;
                 apply(runtime, &module, &function, &terms)
-            });
+            })
+            // As `Action::Apply`: the reason is rendered with its real, stabilized term.
+            .map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }

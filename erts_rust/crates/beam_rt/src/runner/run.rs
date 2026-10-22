@@ -1551,11 +1551,6 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // a capability gap is never masked by the kill — a `killed` reason replacing an
                 // `unsupported` one would hide a runtime defect from the differential gate.
                 let kill = self.runtime.take_max_heap_kill(pid);
-                let reason = if kill {
-                    killed(self.runtime)
-                } else {
-                    exit_reason(self.runtime, &error)
-                };
                 if crate::debug_trace::enabled() {
                     let entry = engine
                         .entry
@@ -1566,29 +1561,40 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         describe_site(&engine)
                     ));
                 }
-                // The reason may be a term the failing process built on **its own** heap,
-                // which the collector may move or drop the moment the process terminates:
-                // copy it onto the runtime's pointer-stable arena before it is recorded. A
-                // reason that *genuinely* cannot be copied is the honest `error:system_limit`
-                // (it is propagated, never stored dangling), while the documented off-heap
-                // capability gap keeps the original term and freezes the heaps — see
-                // `Runtime::try_stabilize_escaped_with`.
+                // **The escape boundary.** A structured reason (`{badkey, K}`, `{badmap, M}`, …)
+                // is a live term the failing process built on its **own** heap (or on the pooled
+                // BIF region, which is rewound after the call): both die with the process, which
+                // is terminated a few lines below, so the raise must stop pointing at them here,
+                // while `engine.machine` — and therefore the heap — is still in scope.
                 //
-                // The machine is still in scope and owns the off-heap payload handles for the
-                // refc binaries it built, while a binary the process **received** from another
-                // process carries its handles on this pid's scan state; the copy's source
-                // payloads are the union of the two (`Runtime::source_payloads`), so a reason
-                // like `exit(<<big/binary>>)` resolves either kind rather than tripping the valve
-                // over a payload the empty source table could not resolve.
-                let reason = {
+                // The machine owns the off-heap payload handles for the refc binaries it built,
+                // while a binary the process **received** from another process carries its
+                // handles on this pid's scan state; the copy's source payloads are the union of
+                // the two (`Runtime::source_payloads`), so a reason like `exit(<<big/binary>>)`
+                // resolves either kind rather than tripping the valve over a payload the empty
+                // source table could not resolve. A reason that *genuinely* cannot be copied is
+                // the honest `error:system_limit` (it is propagated, never stored dangling),
+                // while the documented off-heap capability gap keeps the original term and
+                // freezes the heaps — see `Runtime::try_stabilize_escaped_with`.
+                let error = {
                     let payloads =
                         self.runtime.source_payloads(pid, engine.machine.refc_binaries());
-                    self.runtime.try_stabilize_escaped_with(reason, &payloads)?
+                    self.runtime.stabilize_error_live_reason(error, &payloads)?
+                };
+                // The exit reason is now **derived from the stabilized error**, so it inherits the
+                // runtime-lifetime term: an atom reason interns the atom, a structured reason
+                // reuses the copy just made (no second pass, no second allocation), and plumbing
+                // without an atom interns its `Display` text. `state.exits` is therefore safe for
+                // every reader (`process_exit`, the crash dump, the `run` route's quiescence arm).
+                let reason = if kill {
+                    killed(self.runtime)
+                } else {
+                    exit_reason(self.runtime, &error)
                 };
                 self.state.exits.insert(pid, reason);
-                // Keep the original error as well: the reason *term* above is what the exit
-                // propagates, but only the error carries the raise class and the
-                // `unsupported` classification the CLI keys off (see `RunnerState::errors`).
+                // Keep the error as well: it carries the raise class and the `unsupported`
+                // classification the CLI keys off (see `RunnerState::errors`) — now with a
+                // reason term that outlives this process's heap.
                 self.state.errors.insert(pid, error);
                 Ok(RunOutcome::Exit(reason))
             }
