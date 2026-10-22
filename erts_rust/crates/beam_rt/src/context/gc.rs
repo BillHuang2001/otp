@@ -30,9 +30,14 @@
 //! the request to the arena. The unrooted [`alloc_words`] seam — which is handed **no** root
 //! set and so may not collect — instead grows the nursery through the **no-relocation**
 //! [`Process::grow_nursery`] seam and retries the bump, so a metadata-only allocation loop
-//! grows rather than falling back to the arena forever. Everything else keeps the runtime's
-//! pointer-stable arena, byte for byte as before — see [`crate::runtime::gc`] for the state,
-//! the accounting and the safety valves.
+//! grows rather than falling back to the arena forever. The runtime's pointer-stable **arena**
+//! is consequently a *refusal-only* fallback plus the home of a genuinely table-less context: it
+//! serves a block no live young heap can — a capacity refusal no legal growth can meet (and an
+//! impossible request past [`MAX_ARITYVAL`](beam_term::MAX_ARITYVAL)) — and every allocation of a
+//! context that names no process at all (the `-eval`/single-pass route, the boot drive, a pinned
+//! or halted pid). A nested run inside a slice is neither: it carries the pass's process table, so
+//! its blocks come from the running process's **scanned** young heap too. See
+//! [`crate::runtime::gc`] for the state, the accounting and the safety valves.
 //!
 //! # The root set is the WHOLE [`RootSet`], bounded to its pointer-bearing prefix
 //!
@@ -1446,11 +1451,15 @@ pub(crate) fn ensure_heap_full(
 /// publish, so the collapse can free a word this window still names: a growth taken inside the
 /// window buys addressability that a later collection revokes, and the window's own handles are
 /// exactly the ones the collection cannot relocate. That would be not a leak but a dangling word —
-/// and it is **not** what the in-process `compile:file/2` route trips: every growth site is guarded
-/// at HEAD, and lifting the two allocation seams' guards (so an exempt request grows the nursery
-/// instead of falling through to the arena) leaves that route's abort set **unchanged** (measured;
-/// see this node's `CONTEXT.md` *A term that outlives its heap …*), so the residual's holder is
-/// elsewhere.
+/// which is why the rule is stated as a predicate every growth site consults rather than left to
+/// each seam: a young space is **replaced** only with a complete root set
+/// ([`may_replace_young_space`], the single predicate behind all four growth sites here and in
+/// `calls.rs`), a growth only *retires* the space it replaces while only a *collection* collapses
+/// the chain, and every collapse door refuses a relocation-exempt process outright. The
+/// complementary half of the invariant lives at [`alloc_words_rooted`]'s **unarmed** arm: it
+/// serves the process's **scanned** young heap, so no engine container is built in the unscanned
+/// arena while that heap is live (the whole rule: this node's `CONTEXT.md` *A term that outlives
+/// its heap …*).
 ///
 /// A **published-root** caller (the ordinary scheduled slice, whose roots are the register file the
 /// machine hands in at every admission point) may replace the space freely: the collapse relocates

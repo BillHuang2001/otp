@@ -257,10 +257,14 @@ impl<'a> RuntimeContext<'a> {
     /// cannot see is suspended. This crate collects **only** at the slice's own heap-admission
     /// point, and only when its per-call GC latch is armed
     /// ([`RuntimeContext::arm_gc`] — the sole armer is the slice's `BudgetContext`, see
-    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed, the
-    /// pump's allocations fall back to the pointer-stable arena and nothing pauses here is
-    /// moved — the suspended machine's terms stay valid across the resume. Arming the latch
-    /// here too would move the paused roots.
+    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed and
+    /// nothing pauses here is moved — even though the run's blocks are served by the same
+    /// allocation seams: the process's own **scanned** young heap whenever this context carries a
+    /// process table (a nested run inside a scheduled slice), the pointer-stable arena only for a
+    /// table-less context or after a capacity refusal. The run is wrapped in
+    /// [`Self::with_relocation_exempt`], so the growth that could retire that heap is refused
+    /// ([`super::gc::may_replace_young_space`]) and the suspended machine's terms stay valid
+    /// across the resume. Arming the latch here too would move the paused roots.
     pub(super) fn run_export_blocking(
         &mut self,
         module: &Module,
@@ -341,10 +345,14 @@ impl<'a> RuntimeContext<'a> {
     /// cannot see is suspended. This crate collects **only** at the slice's own heap-admission
     /// point, and only when its per-call GC latch is armed
     /// ([`RuntimeContext::arm_gc`] — the sole armer is the slice's `BudgetContext`, see
-    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed, the
-    /// pump's allocations fall back to the pointer-stable arena and nothing paused here is
-    /// moved — the suspended machine's terms stay valid across the resume. Arming the latch
-    /// here too would move the paused roots.
+    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed and
+    /// nothing pauses here is moved — even though the run's blocks are served by the same
+    /// allocation seams: the process's own **scanned** young heap whenever this context carries a
+    /// process table (a nested run inside a scheduled slice), the pointer-stable arena only for a
+    /// table-less context or after a capacity refusal. The run is wrapped in
+    /// [`Self::with_relocation_exempt`], so the growth that could retire that heap is refused
+    /// ([`super::gc::may_replace_young_space`]) and the suspended machine's terms stay valid
+    /// across the resume. Arming the latch here too would move the paused roots.
     pub(super) fn run_label_blocking(
         &mut self,
         module: &Module,
@@ -491,8 +499,10 @@ impl<'a> RuntimeContext<'a> {
     /// is where the machine's whole root set is copied and nowhere else.
     ///
     /// The words are raw [`Eterm`]s (integers), so copying them out is always safe; they stay
-    /// valid because this context never arms the collection latch, so the pump's allocations
-    /// fall back to the pointer-stable arena and nothing paused here is moved
+    /// valid because this context never arms the collection latch and the run holds the process
+    /// relocation-exempt, so nothing paused here is moved — the run's own blocks landed on the
+    /// process's **scanned** young heap (or, in a table-less context or after a refusal, on the
+    /// never-reclaimed arena), and neither region relocates anything while the run is parked
     /// ([`RuntimeContext::run_export_blocking`]).
     fn publish_nested_roots(&mut self, machine: &mut Machine, term: Eterm) -> Vec<Eterm> {
         let mut roots = Vec::with_capacity(machine.register_count() as usize + 64);
