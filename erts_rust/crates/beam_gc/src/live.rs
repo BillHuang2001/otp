@@ -94,6 +94,39 @@ pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live {
     Live { words, lines }
 }
 
+/// The **exact** number of words a relocation of `roots` out of `from` copies — the public form
+/// of [`live`], for a host whose region is not a process heap.
+///
+/// Equality, not an estimate: it is exactly the `words_copied` an actual evacuation of the same
+/// from-set and roots reports (the walk sizes every object by the copier's own
+/// `move_size`, counts each object once however many references reach it, and skips exactly the
+/// references the copier classifies [`Target::Foreign`](crate::copy::Target::Foreign)), so it is
+/// the correct `required_words` for
+/// [`Relocator::new_checked`](crate::Relocator::new_checked) — the preflight that makes a
+/// **multi-root-slice** compaction atomic. The recommended recipe for a host whose roots are
+/// scattered:
+///
+/// ```
+/// # use beam_gc::{live_words_in, FromSet, Relocator, Relocation};
+/// # fn forward(from: &FromSet, slices: &mut [Vec<beam_term::prelude::Eterm>],
+/// #            dest: &mut dyn beam_gc::EvacDest) -> beam_common::Result<Relocation> {
+/// let need: usize = slices.iter().map(|slice| live_words_in(from, slice)).sum();
+/// let mut relocator = Relocator::new_checked(from, dest, need)?;
+/// for slice in slices.iter_mut() {
+///     relocator.forward_roots(slice)?;
+/// }
+/// relocator.complete()
+/// # }
+/// ```
+///
+/// It is read-only (no forwarding marker, no root rewritten), so it may run immediately before
+/// the relocation over the very same words. Summing it over **overlapping** slices
+/// over-estimates — an object reached from two slices is counted twice — which is the safe
+/// direction: an over-estimate only causes a conservative refusal, never a mid-copy one.
+pub fn live_words_in(from: &FromSet, roots: &[Eterm]) -> usize {
+    live(from, roots).words
+}
+
 /// Counts the graph a **mark-region** fullsweep evacuates: the nursery's live region (every
 /// space of a chained nursery), plus the whole span of the mark-region mature space (that
 /// space's own `contains` covers its free lines as well, so its from-range is

@@ -223,6 +223,29 @@ where
     })
 }
 
+/// Visits every **boxed object** reachable from `roots` out of the ranges of a from-set, each
+/// exactly once, passing a safe read-only [`ReachableObject`] view of it — the **public** form of
+/// [`for_each_reachable_view`], for a host whose region is not a process heap.
+///
+/// `from` may be built from raw word ranges
+/// ([`FromSet::from_ranges`](crate::FromSet::from_ranges)), so inspecting a foreign arena (a
+/// `beam_alloc::ReservedHeap`, a pre-reserved `Vec<Eterm>`, the engine's term arena) needs no
+/// collector and no `unsafe` of its own. It is the walk the collectors use, so it is **read-only**
+/// (it writes no forwarding marker, so it can run immediately before a
+/// [relocation](crate::Relocator) over the same ranges), **iterative** (a deep list cannot
+/// overflow the stack) and **deduplicated by object address** (a shared subterm or a cycle is
+/// reported once). A cons cell is *traversed* — the boxed objects behind it are reached — but is
+/// **not** reported: it carries no header word.
+///
+/// The visitor is `FnMut(ReachableObject<'_>)` (higher-ranked over the borrow), so it cannot
+/// retain the view past the callback.
+pub fn for_each_reachable_in<F>(from: &FromSet, roots: &[Eterm], visit: F) -> Result<()>
+where
+    F: FnMut(ReachableObject<'_>),
+{
+    for_each_reachable_view(from, roots, visit)
+}
+
 /// Visits every **boxed object** reachable from `roots` out of the ranges of `from`, each
 /// exactly once, passing the object's header word and a pointer to that header.
 ///
@@ -237,8 +260,8 @@ where
 /// no interior layout of its own beyond the canonical shape walk of [`beam_term::layout`], so
 /// it needs no knowledge of, and no dependency on, another crate's container interior.
 ///
-/// For a visitor that need not touch raw pointers, prefer [`for_each_reachable_view`], which
-/// reports the same objects as a safe [`ReachableObject`].
+/// For a visitor that need not touch raw pointers, prefer
+/// [`for_each_reachable_in`], which reports the same objects as a safe [`ReachableObject`].
 pub(crate) fn for_each_reachable<F>(from: &FromSet, roots: &[Eterm], mut visit: F) -> Result<()>
 where
     F: FnMut(Eterm, *const Eterm),
