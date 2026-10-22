@@ -138,6 +138,12 @@ Verified against the system `erlc` (OTP 29) disassembly:
   `beam_loader::load_file` table and asserts the exact typed
   `unsupported_opcode: maps: no 'badkey' atom in the module` (and no reason term). Neither can
   pass on the other's error.
+- `../../../tests/map_assoc_alloc.rs` pins the **capacity** count: a per-thread-armed counting
+  `#[global_allocator]` decomposes one `put_map_assoc` (1 000 and 2 775 source pairs) into
+  `harness + build + one source walk`, measured in the same binary, and requires the instruction to
+  fit that plus a slack smaller than a walk — so a re-introduced `map_entries(...).len()` second
+  walk fails — while the produced map is compared with the reference builder down to
+  `map_entries` storage order.
 - No differential-gate coverage of the compiled instruction path: the `errors/badmap_reason`,
   `errors/badmap_list_value`, `errors/badkey_reason`, `errors/badkey_compound_key` cases are all
   `CaseKind::Eval` (the `maps:get` BIF path), not a compiled `put_map_*`.
