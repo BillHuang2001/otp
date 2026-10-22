@@ -772,7 +772,9 @@ fn a_non_rewindable_table_less_call_is_not_moved_and_the_store_stays_empty() {
 ///
 /// 1. the **engine arena** ([`Runtime::arena`], the `MinimalContext`'s `ContextHeap`) — the heap
 ///    every term-build reservation lands on when there is no process heap to serve it. Its regions
-///    are never freed, shrunk or rewound, so what it holds is **its total requested words**;
+///    are never moved, so the words a build already handed out stay at their addresses; the region
+///    above the region-reclaim pass's recorded mark is rewound when nothing reachable stands in it,
+///    so what the arena retains is its **peak** requested words, not its total;
 /// 2. the **`-eval` store** ([`Runtime::eval_heap`]) — the destination of the copy-out this module
 ///    owns. A copy that does not fit replaces the region with a doubled one and **retires** the old
 ///    one, so what the store retains is **the copy-out volume since the runtime started**: every

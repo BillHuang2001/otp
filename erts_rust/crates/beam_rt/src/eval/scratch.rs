@@ -26,10 +26,11 @@
 //! [`Runtime::eval_heap`] is a pointer-stable [`beam_alloc::Heap`]: a bump arena whose `used`
 //! frontier only ever moves forward, and whose *replacement* growth
 //! ([`Runtime::grow_eval_heap`], taken when a copy does not fit) allocates a fresh region of twice
-//! the capacity and pushes the old one onto [`Runtime::eval_heap_retired`], which is never freed.
-//! Both halves are deliberate — a term on the store must stay valid for the runtime's lifetime —
-//! but neither *reclaims*: the words a `-eval` run's dead copies occupy are retained until the
-//! process exits, so a long run's memory is the **total volume it ever copied**, not its live set.
+//! the capacity and pushes the old one onto [`Runtime::eval_heap_retired`].
+//! A term on the store must stay valid for the runtime's lifetime, so neither half may *move* a
+//! word — but a retired region whose words no reachable term stands in **is** dropped, by
+//! [`crate::runtime::reclaim`]'s region-reclaim pass, which is driven from this module's two
+//! window sites (see below).
 //!
 //! This module reclaims the dead part at the one point where the live set is both small and
 //! nameable: the boundary **between the top-level statements** of a `-eval` expression.

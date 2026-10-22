@@ -440,8 +440,12 @@ impl Runtime {
     /// * `InMachinePosition` (an in-flight window no collection may run inside) and the per-call
     ///   NIF hosts (`NifHostImpl::envs`, `PendingNifSend`), which exist only inside a callback
     ///   window.
-    /// * The engine arena (`MinimalContext`/`ContextHeap`) and the distribution/payload scratch
-    ///   `Heap`s — regions owned by other crates with no word-range accessor.
+    /// * The distribution/payload scratch `Heap`s — regions owned by other crates with no
+    ///   word-range accessor.
+    ///
+    /// The engine arena is no longer in that list: `beam_engine::MinimalContext` now exposes
+    /// `heap_mark`/`heap_mark_matches`/`for_each_heap_region`/`heap_rewind`, and
+    /// [`crate::runtime::reclaim`] is their production caller.
     ///
     /// # Errors
     ///

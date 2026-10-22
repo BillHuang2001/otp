@@ -79,7 +79,7 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
   ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
   arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
-- **Four storage regions, all observable: one bounded, one depth-sized, two unbounded by construction.** `arena` (`:240`), `beam_engine`-owned, retains every word it ever handed out; the pooled BIF heap
+- **Four storage regions, all observable: one bounded, one depth-sized, two bounded by the region-reclaim pass.** `arena` (`:240`), `beam_engine`-owned, hands out words that stay at their address and is rewound above `src/runtime/reclaim.rs`'s mark once nothing reachable stands there; the pooled BIF heap
   `bif_heaps: Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap`, **depth-sized** —
   `bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` = 1 MiB for a nested one, self-tuned
   to `2 ×` an observed nested peak — and grown **geometrically** in `context/calls.rs take_bif_frontier`); `eval_heap: Heap`
@@ -293,7 +293,7 @@ dangles. `Runtime` is at `runtime.rs:289-1082`; `stabilize_*` copies land on **`
 whatever the `try_stabilize_escaped` call-site comments say.
 | field (line) | holds | built on | relocation status |
 |---|---|---|---|
-| `arena: MinimalContext` (`:398`) | every tuple/list/map/float/bignum a table-less context builds (`alloc_words`, `:2377`) | the arena's own `ContextHeap`, private to `beam_engine` | **pinned** (never freed, never reset, no host-side reclaim API) |
+| `arena: MinimalContext` (`:398`) | every tuple/list/map/float/bignum a table-less context builds (`alloc_words`, `:2377`) | the arena's own `ContextHeap` (`heap_mark`/`heap_mark_matches`/`for_each_heap_region`/`heap_rewind`) | **pinned** only as far as a word's address goes; the region above `src/runtime/reclaim.rs`'s recorded mark is rewound when nothing reachable stands in it |
 | `eval_heap: Heap` (`:454`) | `stabilize_term`/`_with` copies, BIF container results, non-byte-aligned bitstrings | itself | **relocatable in principle** — the ONE rewritable store (`eval/scratch.rs:360` `reset_to`), nothing outside it may name a word in it without being enumerated |
 | `eval_heap_retired: Vec<Heap>` (`:480`) | regions `grow_eval_heap` (`:2536`) replaced | themselves | pinned (every retired word must stay at its address) |
 | `eval_off_heap: OffHeapTable` (`:470`) | refc/Mso payload handles the copies depend on | off-heap payloads (not words) | pinned; also the prune's target |
