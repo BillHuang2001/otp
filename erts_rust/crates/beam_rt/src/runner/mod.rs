@@ -111,7 +111,7 @@ mod tier;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use entry::{registered_name, ProcessEntry, RunnerState, UnrunnableProcess};
+pub(crate) use entry::{registered_name, EngineParkCensus, ProcessEntry, RunnerState, UnrunnableProcess};
 pub(crate) use run::RuntimeRunner;
 /// The `#[cfg(test)]` slice/park/suspend accounting, re-exported for the suites outside this
 /// module that pin a structural park (a BIF suspend is not observable any other way — see

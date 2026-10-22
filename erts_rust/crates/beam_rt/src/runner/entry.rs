@@ -104,6 +104,71 @@ impl ProcessEntry {
         }
     }
 }
+/// A `Debug` render of the entry point — the module/function identity only — so the region-reclaim
+/// holder diagnostic (`crate::runtime::reclaim::holder`, `BEAM_RT_STORE_TRACE`) can attribute a
+/// census row to a **process** rather than to a pid number alone.
+///
+/// It renders no register and no term word (a [`ProcessEntry::Fun`] value is a heap word, and a
+/// `Debug` of it would be an address); the fields it *does* read — the module's and the function's
+/// atom names — are the identity the entry was built with.
+impl fmt::Debug for ProcessEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProcessEntry::Export {
+                module,
+                function,
+                arity,
+            } => write!(
+                f,
+                "Export({}:{}/{arity})",
+                module.atom_table.name(module.name).unwrap_or("?"),
+                module.atom_table.name(*function).unwrap_or("?")
+            ),
+            ProcessEntry::Fun { target, .. } => match target {
+                Some(target) => write!(
+                    f,
+                    "Fun({}@label {}/{})",
+                    target.module.atom_table.name(target.module.name).unwrap_or("?"),
+                    target.label.0,
+                    target.arity
+                ),
+                None => write!(f, "Fun(applied, no local label)"),
+            },
+        }
+    }
+}
+
+/// One engine's **park census** row — what [`RunnerState::for_each_engine_census`] hands its
+/// visitor, and the only way the region-reclaim holder diagnostic can resolve a
+/// `ParkedMachine[i]` corpus slot back to the pid and park window that own it.
+///
+/// Every field is a **copy**: the root words are cloned out of the machine's register files, so a
+/// visitor may hold a row while it uses `&mut Runtime` for a reachability descent (which is exactly
+/// what the diagnostic does). Diagnostic data only — no decision reads it.
+#[derive(Debug)]
+pub(crate) struct EngineParkCensus {
+    /// The engine's process id.
+    pub(crate) pid: ProcessId,
+    /// The `(func, pc)` the engine is parked at, or `None` for an engine that is **not** in a park
+    /// window (`ProcessEngine::parked`).
+    pub(crate) parked: Option<(u32, u32)>,
+    /// Whether the current park window published the machine's root set into the process
+    /// (`ProcessEngine::parked_published`). Meaningless while [`EngineParkCensus::parked`] is
+    /// `None`, where it is always `false` after the resume that ended the last window.
+    pub(crate) parked_published: bool,
+    /// The handed live `x`-register count (`roots.live_x().len()`).
+    pub(crate) live_x: usize,
+    /// The handed Erlang-stack word count.
+    pub(crate) stack_words: usize,
+    /// The handed live FR-prefix word count (`fr_mark()`, clamped to the FR file).
+    pub(crate) fr_words: usize,
+    /// The machines's handed root words — live `x`, then the Erlang stack, then the live FR prefix.
+    pub(crate) roots: Vec<Eterm>,
+    /// The engine's entry point, rendered (`ProcessEntry`'s own `Debug`), so a census row can be
+    /// attributed to a *process* rather than to a pid number alone.
+    pub(crate) entry: String,
+}
+
 /// The engine state of one runtime-scheduled process.
 pub(super) struct ProcessEngine {
     /// The process's engine machine. It outlives every single slice: a `receive` that
@@ -639,6 +704,73 @@ impl RunnerState {
             })?;
         }
         Ok(())
+    }
+
+    /// The **park census**: hands `f` one [`EngineParkCensus`] row per engine in this table —
+    /// the pid, the engine's park state ([`ProcessEngine::parked`] /
+    /// [`ProcessEngine::parked_published`]), the handed extent of its live `x` file, and a
+    /// **copy** of every root word the two gather doors would hand over (the live `x` prefix, the
+    /// Erlang stack, the live FR prefix).
+    ///
+    /// It exists for one reader: the region-reclaim **holder diagnostic**
+    /// (`crate::runtime::reclaim::holder`, `BEAM_RT_STORE_TRACE`), which must be able to say
+    /// *which* engine a refusing corpus slot belongs to and whether that engine is parked at all.
+    /// The published counters can only name the family and slot index
+    /// (`ParkedMachine[i]`), and the engine table is the one map that vocabulary cannot be
+    /// resolved through from outside this module.
+    ///
+    /// **Diagnostic only** — it decides nothing, retains nothing and frees nothing, and no
+    /// production path calls it (`BEAM_RT_STORE_TRACE` is unset in every measured build). It is
+    /// deliberately family-blind and gate-blind compared with
+    /// [`RunnerState::for_each_parked_machine_root_mut`]: **every** engine is reported, including a
+    /// dead pid's and a publishing window's, because the question it answers is "what does this
+    /// engine hold, and is it parked" rather than "what may a mover rewrite".
+    ///
+    /// The words are **copies** ([`Machine::with_roots`](beam_engine::Machine::with_roots) hands
+    /// out `&mut` slices, so they are read and cloned here); reading them through that door widens
+    /// the machine's `x`/FR **dirty extents** to the used extent, which only affects how much the
+    /// next [`Machine::reset`](beam_engine::Machine::reset) refills — no liveness, relocation or
+    /// collection decision reads those extents for an answer.
+    pub(crate) fn for_each_engine_census(&mut self, f: &mut impl FnMut(EngineParkCensus)) {
+        for (pid, engine) in self.engines.iter_mut() {
+            let fr = engine.machine.fr_mark() as usize;
+            let mut roots: Vec<Eterm> = Vec::new();
+            let mut live_x = 0usize;
+            let mut stack_words = 0usize;
+            engine.machine.with_roots(RootSet::ALL_LIVE, |roots_set| {
+                live_x = roots_set.live_x().len();
+                roots.extend_from_slice(roots_set.live_x());
+                stack_words = roots_set.stack.len();
+                roots.extend_from_slice(roots_set.stack);
+                let fr = fr.min(roots_set.fr.len());
+                roots.extend_from_slice(&roots_set.fr[..fr]);
+            });
+            f(EngineParkCensus {
+                pid: *pid,
+                parked: engine.parked,
+                parked_published: engine.parked_published,
+                live_x,
+                stack_words,
+                fr_words: fr,
+                roots,
+                entry: format!("{:?}", engine.entry),
+            });
+        }
+    }
+
+    /// Whether **any** engine in this table sits in a park window (`engine.parked.is_some()`),
+    /// whatever that window published.
+    ///
+    /// This is the store move's one conservative gate
+    /// ([`crate::runtime::reclaim::compact::attempt_move`]): a parked machine in a
+    /// relocation-exempt window holds the only copy of its root set (nothing published it into the
+    /// process's `Registers`), and the runtime's root corpus cannot rewrite its slots while it sits
+    /// outside the table — so a move that would evacuate a region those roots name must decline.
+    ///
+    /// `O(engines)` with a short-circuit; called once per move attempt, which is itself gated on
+    /// candidate regions existing.
+    pub(crate) fn any_engine_parked(&self) -> bool {
+        self.engines.values().any(|engine| engine.parked.is_some())
     }
 
     /// Visits the **recorded result** map ([`RunnerState::results`]) — a finished process's

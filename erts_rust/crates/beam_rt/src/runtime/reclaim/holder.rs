@@ -74,7 +74,7 @@ use core::mem::{align_of, size_of};
 use beam_term::Eterm;
 
 use super::compact::MoveSlots;
-use super::MoveHitOwner;
+use super::{MoveHitOwner, RangeProbe};
 use crate::debug_trace;
 use crate::eval::reclaim::{self, Reach, Walk};
 use crate::runtime::Runtime;
@@ -89,6 +89,8 @@ const MAX_CHAIN_DEPTH: usize = 48;
 const CHAIN_BUDGET: usize = 4096;
 /// How many corpus slots the refusal attribution examines (and prints).
 const MAX_REFUSING_ROOTS: usize = 64;
+/// How many engine rows the park census prints before it reports the remainder.
+const MAX_CENSUS_ROWS: usize = 64;
 
 /// The verification's hit: which corpus slot reproduced it, and what that slot's graph holds.
 pub(crate) fn move_hit(
@@ -120,6 +122,7 @@ pub(crate) fn move_hit(
             ));
         }
     }
+    trace_engines(runtime, root, candidates);
     trace_dictionary(runtime, candidates);
     trace_candidates(candidates);
 }
@@ -161,6 +164,7 @@ pub(crate) fn walk_decline(
         trace_chain(runtime, word, candidates);
     }
     attribute_decline(runtime, *header, slots);
+    trace_engines(runtime, None, candidates);
     trace_dictionary(runtime, candidates);
     trace_candidates(candidates);
 }
@@ -395,6 +399,127 @@ fn trace_candidates(candidates: &[(usize, usize)]) {
             (hi.saturating_sub(*lo)) / size_of::<Eterm>()
         ));
     }
+}
+
+/// The **engine park census**: for every engine in the runner's table, its park state
+/// ([`ProcessEngine::parked`](crate::runner::ProcessEngine::parked) /
+/// [`ProcessEngine::parked_published`](crate::runner::ProcessEngine::parked_published)), the handed
+/// extent of its live `x` file, and whether the corpus slot under examination is one of that
+/// engine's own root words.
+///
+/// This is the fact the published counters cannot carry: `ParkedMachine[i]` names a *family slot
+/// index*, and the region-reclaim refusal's whole question is whether the engine behind that slot is
+/// genuinely **in a park window** (its roots are the only copy, so the region it names must be
+/// kept) or is an engine the corpus enumerates with no park window open (a resumed — or never-run —
+/// engine whose registers happen to still hold a word nothing will read). The document-order of the
+/// engine map is what maps a family slot index back to a row here: both walks
+/// ([`RunnerState::for_each_parked_machine_root_mut`](crate::runner::RunnerState::for_each_parked_machine_root_mut)
+/// and this census) iterate `RunnerState::engines` in the same order, so a row's position in this
+/// printout is the slot index the refusal named — and the row prints the index explicitly.
+///
+/// `slot` is the word the refusal is about, when there is one (`None` for the whole-region walk,
+/// which refuses on a *header* rather than a corpus slot). A row reports four independent facts:
+///
+/// * `holds-slot` — the slot word appears **verbatim** in that engine's handed roots. Two engines
+///   holding the same word is exactly the shape of a dynamic-scope leftover, and it is what the
+///   `ParkedMachine[0]`/`ParkedMachine[8]` report showed;
+/// * `refuses` — that engine's own root graph, walked on its own, meets an unknown boxed header
+///   (the same refusal the corpus walk reports);
+/// * `reaches` — its graph names a word standing inside a candidate range, i.e. it is a genuine
+///   holder of something the pass would drop (`?` when the graph cannot be walked at all);
+/// * its park state, which decides all of the above.
+///
+/// Diagnostic only (`BEAM_RT_STORE_TRACE`): it decides nothing, and with the variable unset it
+/// returns on its first test.
+fn trace_engines(runtime: &mut Runtime, slot: Option<Eterm>, candidates: &[(usize, usize)]) {
+    if !debug_trace::store_enabled() {
+        return;
+    }
+    let mut rows: Vec<crate::runner::EngineParkCensus> = Vec::new();
+    runtime
+        .runner_state
+        .for_each_engine_census(&mut |census| rows.push(census));
+    let parked = rows.iter().filter(|row| row.parked.is_some()).count();
+    match slot {
+        Some(word) => debug_trace::store(format_args!(
+            "  engine park census: {} engine(s), {parked} in a park window (examining slot word={:#x})",
+            rows.len(),
+            word.raw()
+        )),
+        None => debug_trace::store(format_args!(
+            "  engine park census: {} engine(s), {parked} in a park window (no slot word)",
+            rows.len()
+        )),
+    }
+    for (index, row) in rows.iter().enumerate().take(MAX_CENSUS_ROWS) {
+        let holds = slot.is_some_and(|word| row.roots.contains(&word));
+        // The row's own graph: an unknown header is a refusal, a hit is a live word in a range.
+        let verdict = {
+            let mut sink = NullSink;
+            reclaim::walk(&row.roots, &mut sink)
+        };
+        let refuses = matches!(verdict, Walk::UnknownHeader { .. });
+        let reaches = if refuses {
+            String::from("refused")
+        } else {
+            let mut hits = vec![false; candidates.len()];
+            let probe = reclaim::walk(&row.roots, &mut RangeProbe::new(candidates, &mut hits));
+            match probe {
+                Walk::Complete if hits.iter().any(|hit| *hit) => String::from("yes"),
+                Walk::Complete => String::from("no"),
+                _ => String::from("?"),
+            }
+        };
+        debug_trace::store(format_args!(
+            "    [{index}] pid={:?} entry={} parked={} published={} live_x={} stack={} fr={} \
+             roots={} holds-slot={} reaches-candidates={reaches} refuses={refuses}",
+            row.pid,
+            row.entry,
+            match row.parked {
+                Some((func, pc)) => format!("+{pc}(func {func})"),
+                None => String::from("none"),
+            },
+            row.parked_published,
+            row.live_x,
+            row.stack_words,
+            row.fr_words,
+            row.roots.len(),
+            holds
+        ));
+        if refuses {
+            trace_engine_roots(runtime, index, row, candidates);
+        }
+    }
+    if rows.len() > MAX_CENSUS_ROWS {
+        debug_trace::store(format_args!(
+            "    … {} further engine(s) not printed",
+            rows.len() - MAX_CENSUS_ROWS
+        ));
+    }
+}
+/// A refusing engine's own root words, one line each: the slot, the word, where its address lives,
+/// and — when its graph is legible — the rendered term. Exactly one of them reproduces the walk's
+/// refusal; the render is what names the process state the word belongs to.
+fn trace_engine_roots(
+    runtime: &mut Runtime,
+    index: usize,
+    row: &crate::runner::EngineParkCensus,
+    candidates: &[(usize, usize)],
+) {
+    for (slot, word) in row.roots.iter().enumerate() {
+        let location = describe_term(runtime, candidates, *word);
+        let rendered = render_word(runtime, *word);
+        debug_trace::store(format_args!(
+            "      engine[{index}] root[{slot}] word={:#x} at {location} rendered={rendered}",
+            word.raw()
+        ));
+    }
+}
+
+/// [`render`] when the word's graph is legible, and the *single-word* walk's verdict otherwise — so
+/// a refusing root prints its refusal inline instead of hiding it behind the whole-engine verdict.
+fn render_word(runtime: &mut Runtime, word: Eterm) -> String {
+    render(runtime, word)
 }
 
 /// The term's address and its location, for a [`term_address`] result.
