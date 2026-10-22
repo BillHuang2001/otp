@@ -175,6 +175,15 @@ const NESTED_SEED_HEADROOM: usize = 2;
 /// the pooled BIF heap instead, exactly as for any other refused copy-out.
 const MAX_EVAL_HEAP_WORDS: usize = 1 << 25;
 
+/// The floor, in words, of one **replacement** request on the `-eval`/single-pass store.
+///
+/// [`Runtime::grow_eval_heap`] is asked for a copy's reported shortfall; the floor keeps a
+/// replacement from being sized to a single tiny copy, which would make the region chain
+/// one-region-per-oversized-result instead of logarithmic. It is part of the store's **growth
+/// policy**, so the region-reclaim move — which installs a region of its own and must size it by
+/// that same policy ([`Runtime::eval_store_growth_capacity`]) — shares it rather than restating it.
+pub(crate) const EVAL_STORE_GROWTH_FLOOR: usize = 256;
+
 /// The smallest process heap a runtime accepts (`heap_words` is floored at this).
 const MIN_HEAP_WORDS: usize = 1_024;
 
@@ -2560,9 +2569,7 @@ impl Runtime {
         if self.eval_heap.available() >= needed {
             return Ok(());
         }
-        let ceiling = self.eval_heap_ceiling();
-        let grown = self.eval_heap.capacity().saturating_mul(2).max(needed);
-        let target = grown.min(ceiling);
+        let target = self.eval_store_replacement_capacity(self.eval_heap.capacity(), needed);
         if target < needed {
             // The ceiling cannot serve this copy. Report it the way a failed allocation is
             // reported and leave the store untouched: no region is retired, nothing is truncated.
@@ -2577,7 +2584,46 @@ impl Runtime {
         Ok(())
     }
 
-    /// The largest capacity [`Runtime::grow_eval_heap`] may install: the absolute runaway guard
+    /// The capacity of the region the store installs when it must **replace** the region it has —
+    /// [`Runtime::grow_eval_heap`]'s sizing rule.
+    ///
+    /// A replacement is a **doubling with `request` as a floor** (a single copy larger than twice
+    /// the region must still fit), capped by the store's own ceiling
+    /// ([`Runtime::eval_heap_ceiling`]). A request the ceiling cannot serve answers a capacity
+    /// **below** `request`: both callers treat that as a refusal ([`Runtime::grow_eval_heap`] as the
+    /// typed exhaustion, the region-reclaim move as a decline) rather than installing a region that
+    /// cannot hold what it was built for.
+    ///
+    /// It is one function because it is one rule: `grow_eval_heap` applies it when a copy-out needs
+    /// a fresh region, and [`crate::runtime::reclaim`]'s evacuation move applies it when the live
+    /// set does not fit the region the move replaces — a move must not shrink the store's
+    /// allocation headroom, and this is the policy that defines that headroom
+    /// ([`Runtime::eval_heap`] has exactly one growing consumer, so every other writer's bound is
+    /// the region's free words).
+    pub(crate) fn eval_store_replacement_capacity(&self, current: usize, request: usize) -> usize {
+        current
+            .saturating_mul(2)
+            .max(request)
+            .min(self.eval_heap_ceiling())
+    }
+
+    /// The capacity the store's growth policy gives a store that must hold `request` words in one
+    /// region: the region it has when that region already serves the request, otherwise the
+    /// replacement capacity ([`Runtime::eval_store_replacement_capacity`]).
+    ///
+    /// This is the question the region-reclaim move asks ([`crate::runtime::reclaim`]): what region
+    /// may it install so that the store keeps the headroom its own growth policy would have given
+    /// it? Note the asymmetry with `grow_eval_heap`'s own ask — that one replaces a region whose
+    /// *free words* cannot hold a copy, so it must always double; a move is not short of free words
+    /// in the region it installs, it is choosing that region's size, and a region that already
+    /// serves the live set is exactly what the policy asks for.
+    pub(crate) fn eval_store_growth_capacity(&self, current: usize, request: usize) -> usize {
+        if request <= current {
+            current
+        } else {
+            self.eval_store_replacement_capacity(current, request)
+        }
+    }    /// The largest capacity [`Runtime::grow_eval_heap`] may install: the absolute runaway guard
     /// [`MAX_EVAL_HEAP_WORDS`], and never below the region the store already has — a store that
     /// was configured larger than it keeps its region (it is never shrunk).
     ///

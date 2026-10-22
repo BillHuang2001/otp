@@ -119,8 +119,38 @@
 //! it a refusal is recorded on the move's own counters
 //! ([`RegionReclaimStats::store_move_declines`](crate::runtime::RegionReclaimStats)).
 //!
-//! # Decline list (each recorded, both regions left usable)
+//! # The destination's capacity is the store's growth policy, not the live set
 //!
+//! The destination is sized by [`Runtime::eval_store_growth_capacity`] — the same rule
+//! [`Runtime::grow_eval_heap`] applies — anchored at the capacity of the region the move replaces,
+//! with `need` (floored by
+//! [`EVAL_STORE_GROWTH_FLOOR`](crate::runtime::EVAL_STORE_GROWTH_FLOOR)) as the growth request and
+//! the store's ceiling as the cap; the result is then clamped to the **total capacity the move
+//! replaces**, so a move never reserves more than it frees.
+//!
+//! That is a correctness requirement rather than tuning. [`Runtime::eval_heap`] has exactly one
+//! growing consumer — the table-less copy-out
+//! ([`move_result_into_runtime_store`](crate::context::RuntimeContext::move_result_into_runtime_store)
+//! → [`Runtime::grow_eval_heap`]) — while every other writer copies into the region it finds and
+//! reports the typed `error:system_limit` when the region is short: [`Runtime::stabilize_term`]
+//! (the gateway to every runtime-lifetime store), the evaluator's own term building
+//! (`crate::eval`'s `heap!`), and the native floor's `make_binary` replies (`src/native/**`). A move
+//! that installed a region sized from the live set alone (`need + need/8`) therefore shrank the
+//! store by orders of magnitude and made the *next* unrelated allocation fail. The memory a move
+//! releases comes from collapsing the source regions into **one**, not from making that one small,
+//! and a capacity-sized region is a lazy `mmap`: it costs address space, not RSS, until it is
+//! written.
+//!
+//! Two consequences worth knowing:
+//!
+//! * the destination's capacity is **never smaller** than the capacity of the region it replaces
+//!   (the request only grows the region), so a `stabilize_term` (or an evaluator build, or a file
+//!   reply) that the pre-move store could serve still fits afterwards;
+//! * a `keep_both` refusal keeps the destination as a retired region with that capacity — a
+//!   reservation whose live prefix is only the words the copy wrote, released by a later pass once
+//!   the roots that name it move on.
+//!
+//! # Decline list (each recorded, both regions left usable)//!
 //! * the move switch is off ([`RegionReclaimConfig::store_move`](crate::runtime::RegionReclaimConfig));
 //! * a **runtime-lifetime pin** latched the window at either site — a `stabilize_term` store that
 //!   the family walk may not cover, or a decoded port caller tag. This refusal is **empirically
@@ -134,7 +164,8 @@
 //!   a reader ([`RunnerState::for_each_error_live_reason`]) and no writable slot, so a region it
 //!   stands in may not move (mere presence is not a decline — a reason outside every candidate
 //!   range is unaffected);
-//! * the destination could not be allocated, or would exceed the store's own ceiling;
+//! * the store's own ceiling cannot serve the live set in one region, or the destination could not
+//!   be allocated;
 //! * the destination could not reserve the live set — the preflight
 //!   ([`Relocator::new_checked`]) refuses **before** the first word moves;
 //! * the corpus enumeration or the value descent could not complete;
@@ -425,11 +456,30 @@ pub(crate) fn attempt_move(
         // Less than half dead: the copy would cost more than it reclaims.
         return MoveOutcome::Skipped;
     }
-    // The destination: one fresh right-sized region, with a margin so the copy never runs out of
-    // words it was counted for.
-    let margin = core::cmp::max(need / 8, 64);
-    let capacity = need.saturating_add(margin);
-    if capacity > runtime.eval_heap_ceiling() {
+    // The destination: **one** region sized by the store's own growth policy, never by the live set
+    // alone. `Runtime::eval_heap` is the runtime's general-purpose `-eval` region and this move is
+    // its only *shrinking* writer: `move_result_into_runtime_store` grows on refusal, but every
+    // other writer — `Runtime::stabilize_term`, the evaluator's own term building, the native
+    // floor's `make_binary` replies (`src/native/**`) — copies into the region it finds and reports
+    // the typed `error:system_limit` when it is short. A destination sized `need + need/8` would
+    // therefore hand the store a region orders of magnitude smaller than the one it replaced, and
+    // the next unrelated allocation — not the move's own copy — would fail. Headroom is thus a
+    // **correctness property of a move**, not a tuning knob; the memory the move releases comes
+    // from collapsing the source regions into one, never from making that one small.
+    let source_total = retired.iter().fold(runtime.eval_heap.capacity(), |total, index| {
+        total.saturating_add(runtime.eval_heap_retired[*index].capacity())
+    });
+    let capacity = runtime.eval_store_growth_capacity(
+        runtime.eval_heap.capacity(),
+        need.max(crate::runtime::EVAL_STORE_GROWTH_FLOOR),
+    );
+    // Bounded by what it replaces: a move must never reserve more than it frees, so collapsing two
+    // or more regions always releases capacity. (`need <= source_total` holds by construction — the
+    // live words are a subset of the candidates' written prefixes — so the clamp never makes the
+    // destination too small.)
+    let capacity = capacity.min(source_total);
+    if capacity < need {
+        // The store's own ceiling cannot serve the live set in one region.
         runtime.region_reclaim.decline_move(R_DEST_CEILING);
         return MoveOutcome::Declined;
     }

@@ -68,15 +68,7 @@ use beam_term::Eterm;
 
 use super::calls::{copy_result_fresh, copy_shortfall_words};
 use super::runtime_context::RuntimeContext;
-
-/// The floor of a **replacement** store region, in words.
-///
-/// A copy that does not fit the current region replaces it with one twice as large
-/// ([`Runtime::grow_eval_heap`]); the floor only matters for a store whose capacity is so small
-/// that doubling would still be a single call's worth of words, and it keeps the region count
-/// logarithmic rather than one region per oversized result.
-const EVAL_STORE_GROWTH_FLOOR: usize = 256;
-
+use crate::runtime::EVAL_STORE_GROWTH_FLOOR;
 impl RuntimeContext<'_> {
     /// Moves a registered BIF's container result off the pooled BIF heap onto the runtime's
     /// long-lived `-eval`/single-pass store ([`Runtime::eval_heap`] + [`Runtime::eval_off_heap`]),

@@ -665,6 +665,116 @@ fn the_move_off_leaves_a_partially_live_region_whole_and_the_move_on_collapses_i
     assert_eq!(stats.store_move_declines, 0, "and no refusal");
 }
 
+// ---- the destination's capacity is the store's growth policy, not the live set -----------------
+
+/// **A completed move leaves the store at least the capacity (and so the headroom) it had before.**
+///
+/// The store ([`Runtime::eval_heap`]) is the runtime's general-purpose `-eval`/single-pass region,
+/// and exactly **one** of its writers grows on refusal: the table-less copy-out
+/// ([`crate::context::RuntimeContext::move_result_into_runtime_store`] →
+/// [`Runtime::grow_eval_heap`]). Every other writer copies into the region it finds and reports the
+/// typed `error:system_limit` when the region is short —
+/// [`Runtime::stabilize_term`] (the gateway to every runtime-lifetime store), the evaluator's own
+/// term building (`crate::eval`'s `heap!`), and the native floor's `make_binary` replies
+/// (`src/native/**`, e.g. a `filelib`/`prim_file`/`code` reply). So the move's destination capacity
+/// is a **correctness** property, not a tuning knob.
+///
+/// The shape this pins is the regression the old sizing produced: `need + max(need/8, 64)` sized
+/// the destination from the *live set*, so collapsing three regions of a store that offered 8 192
+/// words handed back a region of ~76 words — four orders of magnitude smaller — and the next
+/// unrelated `stabilize_term` (a timer message, an exit reason, a runner outcome…) failed with
+/// `error:system_limit`. The fix sizes the destination from the store's own growth policy
+/// ([`Runtime::eval_store_growth_capacity`]) and only bounds it by what the move replaces, so the
+/// capacity never shrinks while the collapse still releases the source regions.
+#[test]
+fn a_move_keeps_the_stores_capacity_and_the_headroom_the_growth_policy_gave_it() {
+    let mut rt = small_runtime();
+    open(&mut rt);
+    let mut a = build_partially_live_region(&mut rt, 10, 500);
+    let mut b = build_partially_live_region(&mut rt, 20, 500);
+    let mut c = build_partially_live_region(&mut rt, 30, 500);
+    let capacity_before = rt.eval_heap.capacity();
+    let used_before = rt.eval_heap.used();
+    assert_eq!(used_before, 0, "the third growth retired the filled region");
+    assert!(
+        capacity_before >= 8_192,
+        "the store grew to serve three filled regions ({capacity_before} words)"
+    );
+    // The total capacity the move replaces: the region it installs *as* the store plus every
+    // region it drops. The destination must stay at or below it, or the collapse would reserve
+    // more than it frees.
+    let source_total: usize = capacity_before
+        + rt.eval_heap_retired
+            .iter()
+            .map(beam_alloc::Heap::capacity)
+            .sum::<usize>();
+
+    // A term the **pre-move** store could serve: it fits the current region's free words. The old
+    // sizing made this exact copy fail after the move.
+    let elems: Vec<Eterm> = (0..3_000).map(|index| beam_term::make_small(index % 100)).collect();
+    let payload = beam_engine::terms::make_list(&mut rt.arena, &elems).expect("the arena is unbounded");
+    let payload_words = beam_term::size_object(payload);
+    assert_eq!(payload_words, 6_000, "a 3 000-element list is 6 000 words");
+    assert!(
+        payload_words <= capacity_before - used_before,
+        "the premise: {payload_words} words fit the store before the move"
+    );
+
+    move_pass(
+        &mut rt,
+        &[],
+        &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
+    );
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(stats.store_compactions, 1, "the move fired");
+    assert_eq!(stats.store_move_declines, 0, "and declined nothing");
+
+    // ---- 1. headroom: the same live volume in the same store must have the same room -----------
+    let live_after = rt.eval_heap.used();
+    assert!(
+        live_after < capacity_before,
+        "the evacuated live set ({live_after} words) is a fraction of the region it came from"
+    );
+    assert!(
+        rt.eval_heap.capacity() >= capacity_before,
+        "the destination ({} words) must not be smaller than the region it replaces \
+         ({capacity_before} words): a store has one growing consumer, so every other writer's \
+         bound is this region's free words",
+        rt.eval_heap.capacity()
+    );
+    assert!(
+        rt.eval_heap.available() >= capacity_before - live_after,
+        "the free words afterwards ({} words) must be at least what the pre-move store offered for \
+         the same live volume ({} words)",
+        rt.eval_heap.available(),
+        capacity_before - live_after
+    );
+
+    // ---- 2. the win: bounded by what it replaces, so a multi-region collapse releases ----------
+    assert!(
+        rt.eval_heap.capacity() <= source_total,
+        "the destination ({} words) may not reserve more than the move replaces ({source_total})",
+        rt.eval_heap.capacity()
+    );
+    assert!(
+        rt.eval_heap.capacity() < source_total,
+        "collapsing {} regions must release capacity ({} < {source_total})",
+        1 + stats.store_regions_dropped,
+        rt.eval_heap.capacity()
+    );
+
+    // ---- 3. the behaviour the regression actually broke ----------------------------------------
+    let copy = rt
+        .stabilize_term(payload)
+        .expect("a copy the pre-move store could serve must still be served after the move");
+    assert_eq!(
+        beam_term::size_object(copy),
+        payload_words,
+        "the copy is the whole payload"
+    );
+    assert!(beam_term::is_list(copy), "and it is still a list");
+}
+
 // ---- the post-move verification's forced hit (the `keep_both` obligation) ----------------------
 
 /// Builds one partially live region whose live value is a **cons cell**: a 2-word value reachable
