@@ -70,7 +70,7 @@ Reads treat a timeout/`WouldBlock` as "no data" (`handshake.rs:150-153`, `is_wou
 `ClientLink::pump` (`handshake.rs:137-175`) does read → `driver.feed` → `driver.step()` loop until `WouldBlock` → `flush_output`; on a driver error it flushes first then returns the error (`:164-170`).
 
 **Link lifecycle / retirement**
-`step_links` (`client.rs:660-678`) steps **only the outbound** half; a link that is no longer `is_live()` (`handshake.rs:82-87`) or whose pump errored is `retire`d (`client.rs:681-684`) — removed and its reason recorded in `last_error`, never raised. The retirement also records the peer's `node@host` in the runtime's shared `LostPeers` recorder (`use_lost_peers` installs that cell; `client.rs:728` is the one `note_lost_peer` site) — but **only when the retired link had established** — asked as `was_established()` (the latch [`ClientLink::pump`] sets the moment the driver reports `Established`), **not** `is_established()`: the pump that discovers the death is what moves the driver to `Closed`/`Failed`, so the live state answers `false` for every dying link. A link that never handshook was never a node down, and a graceful `DistClient::close` or `connect_addr`'s replace records nothing. `Runtime::service_lost_dist_peers` drains that recorder into `ProcessTable::node_down` on the next scheduler pass.
+`step_links` (`client.rs:660-678`) steps **only the outbound** half; a link that is no longer `is_live()` (`handshake.rs:82-87`) or whose pump errored is `retire`d (`client.rs:681-684`) — removed and its reason recorded in `last_error`, never raised. The retirement also records the peer's `node@host` in the runtime's shared `LostPeers` recorder (`use_lost_peers` installs that cell; `client.rs:728` is the one `note_lost_peer` site) — but **only when the retired link had established** — asked as `was_established()` (the latch [`ClientLink::pump`] sets the moment the driver reports `Established`), **not** `is_established()`: the pump that discovers the death is what moves the driver to `Closed`/`Failed`, so the live state answers `false` for every dying link. A link that never handshook was never a node down, and `connect_addr`'s replace records nothing. `Runtime::service_lost_dist_peers` drains that recorder into `ProcessTable::node_down` on the next scheduler pass.
 A cleanly-closed link records the placeholder `BadArg` (`client.rs:671`).
 `dispatch` (`client.rs:787-837`, public `dispatch_inbound` `client.rs:374-381`) is the **inbound** half of the same links: `dispatch_heap.reset()` once per drain (`:788`), then per established outbound link `driver.dispatch_inbound_checked` (`:821-823`), counting `DeliveryOutcome::Delivered` and retiring only the failing link (`:833`).
 The accepted links are drained by `DistNode::dispatch_inbound` (`../dist/node.rs:374`).
@@ -78,6 +78,32 @@ Scheduler pass order (`../runtime/scheduler.rs:1022-1070`): node monitors → `d
 
 **Payload externalisation** (`outbound_payload`, `client.rs:704-707`) is the one rewrite step of the message family: `PayloadArena::externalize` (`../dist/externalize.rs:208-248`) gates on `holds_local_id`, and for a payload carrying one of *our* internal pids/ports/refs re-encodes it with `Encoder::with_local_node(node_atom, creation)` and decodes the image back onto its own arena, so `Peer ! {reply, self()}` is sendable.
 A no-id payload is returned **unchanged, unallocated**.
+
+## Term storage — every term this node holds, its heap and its lifetime
+**No word held here points into the `beam_engine` arena, `Runtime::eval_heap`/`eval_heap_retired`, or a process heap.**
+Every term is built on one of the client's **own** `beam_alloc::Heap`s, a fixed-capacity bump arena that **never reallocates** (`beam_alloc/src/heap.rs:193-194`: "The heap never reallocates, so the pointer stays valid for the heap's lifetime"), so a word built there keeps its address for that heap's lifetime.
+Nothing in this node therefore needs relocation when the arena or the `-eval` store is compacted, and the only two dangles possible here are a **reset** of `scratch` and a **replacement** of `PayloadArena`'s heap — both of which the code prevents by construction, not by relocation.
+| path:line | owning type | field | what it holds | lifetime | relocatable? |
+|---|---|---|---|---|---|
+| `client.rs:73` | `Queued` | `node: Eterm` | the peer's node **atom immediate**, copied out of a `RemotePid` (`signals.rs:40-51`) | until the item leaves `pending` | n/a — immediate, no pointer |
+| `client.rs:77` | `Queued` | `args: Vec<Eterm>` | 3–4 control arguments: **boxed pointer words on `DistClientInner::scratch`** (`local_pid_term` `:806-814`, `RemotePid::to_eterm`, `monitor_ref_term`, `copy_struct_simple` `:1030`/`:1038`/`:1073`), except the `DOP_UNLINK_ID` id, an immediate built with no heap argument at all (`signals.rs:97-102`) | until `flush_pending` writes it or drops it (`client.rs:837-862`) | **pinned to `scratch`** — a compactor of any other heap must not touch it, and a compactor of `scratch` would have to relocate it |
+| `client.rs:97` | `DistClientInner` | `pending: VecDeque<Queued>` | the queue itself; a `Vec<Eterm>`'s buffer is `std` heap, the words it names are the scratch heap's | drained at every message send (`:601`, `:627`, `:660`) and every `pump` (`:394`) | the `Vec` may move; the words may not |
+| `client.rs:100` | `DistClientInner` | `scratch: Heap` (`SCRATCH_WORDS = 1<<12`, `:59`) | every queued argument | the client's lifetime; `reset()` at one site only, `:865` | never reallocates ⇒ addresses stable; reset (not move) ends a word's lifetime |
+| `client.rs:103` | `DistClientInner` | `dispatch_heap: Heap` | one inbound control message's decode | `reset()` once per drain (`:882`); the sink deep-copies each decoded term into a mailbox inside that drain | never reallocates |
+| `client.rs:108` | `DistClientInner` | `payloads: PayloadArena` | a message payload rewritten with this node's identity | one send: `externalize` resets the heap per use (`../dist/externalize.rs:234`) and `reserve` **replaces** it (`:254-258`) | must not outlive the send — a replacement invalidates every earlier term |
+| `client.rs:87` | `DistClientInner` | `our_node: Eterm` | this node's sysname **atom immediate** (`make_atom` from `Runtime::new`'s `set_identity`) | the client's lifetime | n/a — immediate |
+| `client.rs:85,91,110,124` | `DistClientInner` | `our_name: Vec<u8>`, `cookie: Vec<u8>`, `last_error: Option<String>`, `next_unlink_id: u64` | no terms | — | n/a |
+| `client.rs:116` | `DistClientInner` | `lost: LostPeers` | peer `node@host` **names** (`String`), shared with the accepting half | until `Runtime::service_lost_dist_peers` drains | n/a |
+| `client.rs:95` | `DistClientInner` | `links: DistLinks` | the `ClientLink`s plus the accepted `Rc<RefCell<Vec<DistConnection>>>` | the client's lifetime | via `handshake.rs:48` below |
+| `handshake.rs:48` | `ClientLink` | `node: Eterm` | the peer's node **atom immediate** (`make_atom(atoms.intern(..))`, `client.rs:347`) | the link's lifetime | n/a — immediate; matched by exact `==` in **linear scans** (`../dist/links.rs:167`, `:200`, `:225`), never a map key |
+| `router.rs:45` | `DistRouter` | `inner: Rc<RefCell<DistClientInner>>` | no term of its own; `route` stores nothing itself | — | n/a |
+| `lookup.rs` | — | — | no terms at all (`u16`/`String`) | — | n/a |
+
+**No `*mut Eterm` exists in this node**, and no term is a hashed key: `DistClientInner` holds no `HashMap`/`HashSet`, and the link family's one `FastHashMap` is `DistLinks::connection_ids` (`../dist/links.rs:111`), keyed by `String`.
+A queued `args` entry is self-contained against the signaller's heap but not against a heap swap here.
+`copy_struct_simple(reason, heap)` (`beam_message/src/copy.rs:742-747`) deep-copies with fresh empty `OffHeapTable`s on both sides, so a reason carrying an off-heap refc binary is **flattened** onto scratch rather than sharing the dying process's payload, and no queued word names the signaller's heap.
+The one exception is a **literal-tagged** subterm, which `is_shared` returns unchanged: a queued `args` word can point into an `Arc<Module>`'s `LiteralArea` — never into the arena or the `-eval` store — so a compactor must skip it exactly as `is_literal` does, and it carries the missing literal-area release handshake documented in `../CONTEXT.md` *Module literal areas*.
+`signal_node` returns that atom immediate, `monitor_ref_term` writes onto the caller's heap, and `unlink_id_term` allocates nothing at all.
 
 ## Constraints
 Every path (`crate::dist_client::X`, `beam_rt::dist_client::X`, `super::X` from a sibling submodule) resolves through the `mod.rs` façade.
@@ -91,6 +117,9 @@ No item here is re-implemented from the lower crates: terms come from `beam_term
 - **No pending-unlink record is kept** — the id is minted and forgotten, so an inbound `DOP_UNLINK_ID_ACK` has nothing here to match (the inbound side likewise has no reply channel to emit one).
 - **`DistSignal::Monitor`'s `kind` (`MonitorKind`) is dropped** by the `..` at `client.rs:910`: a **port** monitor encodes as `Dop::MonitorP` with no gate and no typed refusal.
 - **`step_links`' retirement of a cleanly-closed link records `BadArg`** (`client.rs:671`) — the diagnostic reads as a bad-argument error for an orderly EOF.
+- **`scratch` is reclaimed only by a drain that ends with the queue empty** (`client.rs:863-866`), and a drain *entered* with an empty queue returns before any reset (`client.rs:831-833`).
+  The words a message send writes there its own way — `local_pid_term` (4 words, `:806-814`) plus `RemotePid::to_eterm` (4 words, `:629`) — are therefore never reclaimed by that send's own drain, so a message-only workload walks the fixed 4096-word heap (`SCRATCH_WORDS`, `:59`) to a typed `BeamError::Alloc` after roughly 500 `send_message_pid`/`send_alias` calls unless a routed control signal happens to drain in between.
+  `payloads` is unaffected (it is reset per `externalize`, `../dist/externalize.rs:234`).
 
 ## Test Strategy
 The colocated suite (`tests.rs`, 18 tests) is hermetic: a loopback socket and a server-side `ConnectionDriver`, no `erl` and no real `epmd`.

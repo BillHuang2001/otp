@@ -284,6 +284,101 @@ Binding facts for anyone asking "where does a module constant live, and can it b
   is compiled into a real `beam_rt_eval_fun_<n>` module (`eval/compile.rs:180,445`) whose literal
   area then belongs to the code server like any other module's.
 
+## Runtime-level term stores — which region each word lives in (relocation inventory)
+Binding for any work that would MOVE a term region (a compacting store, a relocating arena): a raw
+`Eterm` in a `Runtime` field/Vec outlives every `beam_engine` call, so it must be rewritten or it
+dangles. `Runtime` is at `runtime.rs:289-1082`; `stabilize_*` copies land on **`Runtime::eval_heap`**
+(`runtime.rs:454`, the copy is `beam_message::copy_struct_simple(term, &mut self.eval_heap)` at
+`:2462`, and `copy_struct(term, &mut self.eval_heap, &mut ctx)` at `:2636`) — **not** on the arena,
+whatever the `try_stabilize_escaped` call-site comments say.
+| field (line) | holds | built on | relocation status |
+|---|---|---|---|
+| `arena: MinimalContext` (`:398`) | every tuple/list/map/float/bignum a table-less context builds (`alloc_words`, `:2377`) | the arena's own `ContextHeap`, private to `beam_engine` | **pinned** (never freed, never reset, no host-side reclaim API) |
+| `eval_heap: Heap` (`:454`) | `stabilize_term`/`_with` copies, BIF container results, non-byte-aligned bitstrings | itself | **relocatable in principle** — the ONE rewritable store (`eval/scratch.rs:360` `reset_to`), nothing outside it may name a word in it without being enumerated |
+| `eval_heap_retired: Vec<Heap>` (`:480`) | regions `grow_eval_heap` (`:2536`) replaced | themselves | pinned (every retired word must stay at its address) |
+| `eval_off_heap: OffHeapTable` (`:470`) | refc/Mso payload handles the copies depend on | off-heap payloads (not words) | pinned; also the prune's target |
+| `info_heap: Heap` (`:431`) | `system_info`/`format_term` scratch; reset per call (`:2245`, latched by `:2257`) | itself | pinned (rewound, and `relocate_off_scratch` runs first) |
+| `bif_heaps: Vec<Heap>` (`:348`) | pooled per-call BIF regions (rewound, `context/calls.rs:1052`) | themselves | pinned regions; a word a store keeps must come from a region the pool never re-issues as a rewound call region — this is why `references`/`Timers::refs` keys are minted on a **taken-and-returned** region (`native/process.rs:1231`, `native.rs:883`, `context/runtime_hooks.rs` `to_eterm(heap)`) |
+| `references: HashMap<Eterm, …>` (`:755`) | reference **terms** as keys (address identity) | pooled BIF heap (mints at `native/process.rs:176`, `native/process/monitor.rs:280,304`, `nif.rs:516,635`, `trace.rs:826`) | pinned + address-identity; a compaction that touched these regions breaks the key |
+| `eval_closures: Vec<Rc<FunBody>>` (`:898`) | `FunBody.env: HashMap<String, Eterm>` | arena **or** `eval_heap` (`-eval` route is table-less) | relocatable **iff** the env is rewritten; gathered as roots (`runtime.rs:2998`) |
+| `eval_compiled: FastHashMap<u32, Option<CompiledClosure>>` (`:910`) | `CompiledClosure.captures: Vec<Eterm>` (`eval/compile.rs:123`), copied out of `FunBody.env` (`eval/compile.rs:195`) | same words as the closure env | **relocatable — a second, un-enumerated copy of the closure env**: `gather_off_heap_roots` walks `eval_closures` only, so a moving store must update `captures` in lockstep with `FunBody.env` |
+| `timers: Timers` (`:920`) | `Pending{action: TimerAction, reference: Option<Eterm>}`; `Deliver{from, message}` | `message` = `eval_heap` (`try_stabilize_escaped`, `native.rs:817`, `context/runtime_hooks.rs:1343`); `from` = a pid **immediate**; `reference` = a pooled-BIF-heap mint | message relocatable (rooted, `timers.rs:432`); `reference` is also a `Timers::refs` **key** ⇒ pinned |
+| `timer_wake_targets: TimerWakes` (`:927`) | `(handle → ProcessId)` | ids only | no terms |
+| `pending_spawns: Vec<PendingSpawn>` (`:965`) | `PendingSpawn.args: Vec<Eterm>` (`:229`) + `ProcessEntry::Fun{fun}` | `eval_heap` via `try_stabilize_escaped` (`:4173`,`:4184`) | relocatable (rooted, `:3026`) |
+| `persistent_terms: Rc<RefCell<PersistentTermStore>>` (`:621`) | `entries: Vec<(Eterm, Eterm)>` (`context/persistent_term.rs:80`) | `eval_heap` (both args stabilized at `context/calls.rs:752-756`) | relocatable, but **deliberately not a gather root** (`:2957-2962`: the copy flattens an off-heap payload) |
+| `seq_trace: SeqTrace` (`:735`) | `Token{label: Eterm, from: Eterm}` (`seq_trace.rs:175,179`) | **whatever heap the BIF argument stood on** — `set_label` (`seq_trace.rs:343`) stores it **unstabilized** | the one store written raw on purpose; rooted for the payload prune (`:3002` → `seq_trace.rs:292`) but **not** stabilized for a moving heap |
+| `trace: TraceState` (`:336`) | `PatternEntry.match_spec: MatchSpec::Functions(Vec<Eterm>)` (`trace.rs:368`) | `eval_heap` (`native/erts_internal/trace.rs:169`), installed at `trace.rs:462` | relocatable, **deliberately not a gather root** (`:2963-2964`: stabilized copy flattens off-heap payloads) |
+| `node_monitors: FastHashMap<ProcessId, Vec<NodeMonitorLatch>>` (`:888`) | `NodeMonitorLatch.node: Eterm` (`:1128`) | the shared atom table | **immediates only** — never moves |
+| `local_node: Atom` (`:1014`) | an atom **index**, not a term; `local_node_term()` (`:4705`) builds one on demand | — | no stored word |
+| `cookie: Vec<u8>` (`:1006`) | bytes | — | no term |
+| `runner_state: RunnerState` (`:396`) | engine args (`arena`-stable), parked machines' root sets | arena | pinned; rooted via `runner/entry.rs:490` |
+| `mailboxes` (`:318`) | `MailboxState` — see `mailbox.rs` | mixed | see below |
+| `code_server: CodeServer` (`:298`) | `Arc<Module>`s ⇒ module **literal areas** (`beam_alloc::Heap` owned by the module) | literal areas | pinned for the `Arc`'s life; a stored literal word is a pointer into it |
+### `Runtime::gather_off_heap_roots` (`:2996`) — the root enumeration, in order
+`eval_closures` env (`:2998`) · `seq_trace` tokens (`:3002`) · every live process's dict + mailbox `payload/token/from` + `registers` + `saved_args` + `signals` (`:3008-3024`) · `pending_spawns` args + entry fun (`:3026`) · `RunnerState` (`:3040`, whose own walk is `runner/entry.rs:490-517`) · pending timer messages (`:3046`).
+**Not enumerated, each with its stated mechanism**: the runtime's term *regions* (handled by `for_each_off_heap_region`, `:3066` — which visits `eval_heap`, `eval_heap_retired`, `bif_heaps`, `info_heap` and **not** the arena, although `MinimalContext::for_each_heap_region` (`beam_engine/src/context.rs:2147`) exists) · `persistent_term` (`:2957`) · trace match specs (`:2963`) · ETS objects (`:2965`) · `references` (`:2970`) · `eval_compiled.captures` (not mentioned at all).
+### The store's own two rewinds
+`eval_heap` is rewritten at exactly two places: the `-eval` statement window (`eval/scratch.rs:360 reset_to(window.mark)`, whose every handing-out site pins — `runtime.rs:2458`, `:2618`) and region *replacement* (`grow_eval_heap`, `:2536`, which retires the old region, so it never moves a word). `MAX_EVAL_HEAP_WORDS = 1 << 25` (`:170`); the ceiling is `MAX_EVAL_HEAP_WORDS.max(eval_heap.capacity())` (`:2566`), so a bigger configured store is never shrunk.
+### `mailbox.rs` — positions and payload handles, no raw terms except the marker's reference
+`MailboxState` (`mailbox.rs:146`): `cursor: QueueCursor` (`:148`, an index — not a term) · `markers: Vec<Marker>` (`:150`) where `Marker.term` is `make_small` (`:338`) but `Marker.reference: Option<Eterm>` (`:129`) is the **raw** `make_ref` word `recv_marker_bind` recorded (`:357`, bound at `:361`) · `retained_fragments: Vec<Fragments>` (`:163`), `retained_binaries: Vec<RefcBinary>` (`:177`), `retained_off_heap: Vec<MsoHandle>` (`:189`, in message-slot order), `retained_nodes: Vec<NodeEntry>` (`:199`) — payload handles, not words. `remove_at` (`:253`) is the only producer; there is **no release point** (`Runtime::mailboxes` is never removed from), which is the soundness mechanism for a word that escaped the message.
+
+## Term-carrying stores in `nif*.rs` · `codeserver.rs` · `boot*` (raw-word inventory)
+What in these files holds a raw `Eterm` across a call boundary, and on which heap (§ *Host-side
+term stores* in `../CONTEXT.md` is the crate-wide rule; this is the sibling inventory those files
+have no entry for). Verified by reading the fields, not inferred.
+- **No NIF-side term is on the arena or the `-eval` store except the two `stabilize_term` copies.**
+  A per-call `NifHostImpl` heap is the **pooled BIF heap** (`context/calls.rs:1698` `take_bif_frontier`
+  → `:1737-1739` `put_bif_heap`); the load/unload host's is a dedicated
+  `beam_alloc::Heap::new(bif_heap_words)` owned by `NifEntry.host` (`context/bridges.rs:642`,
+  `nif.rs:189-198`). Neither region is compacted, so the hosts' words are stable by construction.
+- `nif.rs:294-302` `PendingNifSend { from: ProcessId, to: Eterm, msg: Eterm }` — `msg` is on the
+  **load host's own heap**; the `Vec` lives in the long-lived `NifhostImpl.load_sends`
+  (`nif.rs:712`) between the callback's push (`nif.rs:1278`) and `take_load_sends` (`nif.rs:755`), so
+  it is per-load-callback, never runtime-lifetime.
+- `nif.rs:696` `NifHostImpl.self_pid: Eterm` — a **pid immediate** (no heap word); lives as long as
+  the host (library lifetime for the load host).
+- `nif.rs:702` / `nif/thread_env.rs:224` `envs: Vec<Box<NifEnv>>` — `NifEnv`'s own
+  `pending_exception: Option<Eterm>` (`beam_abi/src/nif/host.rs:603`) and its
+  `recorded_atoms: Rc<RefCell<Vec<(usize, String)>>>` (raw atom **word**, atoms are immediates,
+  `host.rs:496`); both are per env, and an env a NIF leaked lives as long as the host.
+- `nif.rs:516` and `nif.rs:635` (`make_ref`, `monitor_process_result`) insert the minted reference
+  **term** into `Runtime::references: HashMap<Eterm, Option<MonitorRef>>` (`runtime.rs:755`).
+  `Eterm`'s `Hash` is the raw word (`beam_term/src/eterm.rs:36-37`), so those keys are the reference
+  block's **address** on the host heap — a store keyed by identity-of-address, not by id. Same shape
+  for `Timers::refs` / `native::process::reference_term`.
+- `nif_select.rs:189-197` is the only term this module **stabilises**: `reference` (or the
+  `CUSTOM_MSG` message) → `Runtime::stabilize_term` → `Runtime::eval_heap`
+  (`runtime.rs:2452-2462`) → stored as `SelectPayload::{Plain{reference}|Custom{message}}`
+  (`port/select.rs:146-159`) in `SelectWatch.registrations: HashMap<u64, SelectRegistration>`
+  (`port/select.rs:418`, field `payload` at `:401`; the sibling `handle: Eterm` at `:403` is
+  `make_small(fd)`, an immediate, and `obj: *mut c_void` at `:405`). **So a NIF select registration
+  holds words inside the `-eval` store** — the one cross-file landing point compaction must relocate.
+  The delivery-time resource mint is the other copy: `nif.rs:776-787` → `port.rs:4305-4308`
+  `stabilize_term` (same store).
+- `nif_monitor.rs:98` `armed: HashMap<MonitorId, ProcessId>` — `MonitorId([u8; REF_THING_BYTES])`
+  (`beam_abi/src/nif/enif/resources_monitors.rs:104`), a **byte copy** of the ref block (value
+  identity), and a `ProcessId`; no term, no address. `deliver_for`'s `pid_term` is a parameter.
+- `codeserver.rs` holds **no `Eterm` at all** (zero occurrences in the file). `CodeServer`
+  (`:108-181`) is `atoms: Rc<AtomTable>`, `modules: HashMap<String, Arc<Module>>`, two
+  `String`-keyed location maps, `loaded_generation`, `fun_modules: RefCell<Option<(u64,
+  Rc<Vec<(Arc<Module>, PathBuf)>>)>>`, path vectors. The `Arc<Module>` does carry a literal area —
+  `beam_loader/src/ir.rs:315 literals: Arc<LiteralArea>`, `:425-427 literal(idx) -> Option<Eterm>`
+  returns a **word into that area** — and `erlang:delete_module/1` drops the `Arc`
+  (`CodeServer::forget_module`), so a host store caching a literal word outlives its area (the
+  documented "no literal-area release handshake" issue).
+- `boot.rs` holds no term (`PreloadedModules { names: Vec<&'static str> }` at `:245-247`;
+  `PRELOADED_MODULE_NAMES` / `CORE_ATOMS` are `&[&str]`). `boot/preloaded.rs` has none either.
+- `boot/bootscript.rs:518` `boot_args -> Vec<Eterm>` is a **per-directive local** built through
+  `RuntimeContext::new` → `Runtime::alloc_words`, i.e. the **arena**; `intern_atoms`'s
+  `HashMap<String, Eterm>` (`:529`) holds atom immediates only. The `Vec` is handed straight to
+  `drive::start_kernel_process` (`:480`, parameter `args: Vec<Eterm>` at `drive.rs:209`) or
+  `drive::apply_boot_call` (`:484`, `&[Eterm]` at `drive.rs:353`) and never stored — but
+  `Runtime::spawn_process` → `note_pending_spawn` re-copies each arg onto the arena
+  (`runtime.rs:4181-4185`) into `PendingSpawn.args: Vec<Eterm>` (`runtime.rs:229`), which **is** a
+  struct field. `BootScript`/`Instruction`/`Mfa.args` (`bootscript.rs:129-182`) are owned typed
+  `Value`s — no term, so a parsed script survives any term movement. `drive.rs` `Mfa`-carried
+  `args` and `apply_boot_call`'s machine registers are per-call.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's trailing test region — the contiguous run of `#[cfg(test)]`-gated modules at EOF, inline or sibling).
 - `src/port.rs` 5 116 lines, 5 085 of production (unit suite in `port/tests.rs`, 4 226 lines, plus 21 sibling `port/*_tests.rs` suites — `accept_inherit`, `active_input`, `active_input_e2e`, `async_ready`, `busy_suspend`, `busy_wait`, `command_matrix`, `completion`, `control_capability`, `driver_output_shape`, `exit_status_matrix`, `failure`, `failure_e2e`, `inet_matrix`, `inet_opts`, `monitor`, `packet_framing`, `peer_closed`, `ram_file_matrix`, `spawn_driver`, `stream_shape` — and `port/test_support.rs`).

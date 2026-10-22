@@ -130,6 +130,14 @@ runs independently, and `reset_to`/`put_bif_heap` run on every path.
 
 * `pool/tests.rs` → `pool.rs`'s own units: the copy + rewind, an immediate result, a kept result surviving 500
   rewinds, growth by region retirement, and a refused copy.
+* `pool/tests.rs::the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand` (**sub-second, NOT
+  `#[ignore]`d**) is the **open host-memory bound pin**: it asserts the store route adds not one arena word
+  (`runtime.arena.heap_stats()` unchanged across four retiring copies) so the peak is their **sum**, plus both
+  mechanisms' retention arithmetic from the word/region census (`arena_words == used_words`,
+  `reserved_words == unit * ((1<<regions)-1)`, the store's retired-region ladder equality). It pins the
+  formula's **structure**, never an RSS figure — the only RSS assertion in this crate is `tests/rss_bound.rs`,
+  which runs the scheduled `run`-route `churn` fixture, not the `-eval` compile. The `#[ignore]`d real-workload
+  counterpart is `context/pump.rs::the_cerl_clauses_compile_bands_the_arena_and_the_eval_store`.
 * `calls/tests.rs`'s `#[ignore]`d `eval_route_pool_costs` is the eval-route pool measurement harness
   (`BEAM_RT_EVAL_POOL_CHILD` child per row, minor faults from `/proc/self/stat`, the pool's first-touch high-water
   and the store's committed words) — its table is in
