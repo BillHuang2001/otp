@@ -1002,6 +1002,41 @@ impl PortEvent {
             PortEvent::Signal { .. } | PortEvent::Select { .. } => None,
         }
     }
+
+    /// Visits the terms this event carries, mutably, so a **moving** collector can rewrite the
+    /// words in place — the per-variant half of
+    /// [`PortRegistry::for_each_pending_event_root_mut`].
+    ///
+    /// Only two variants carry a raw `Eterm`: [`PortEvent::Term`] (a C driver's emitted term) and
+    /// [`PortEvent::Select`] (a reported readiness's payload and its opaque handle). Every other
+    /// variant holds bytes, ids, atoms or pids — or a `Completion`/`ActiveInput` packet, which is
+    /// rendered into a term from its own bytes at delivery time and stores none.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; nothing is written back beyond what `f` itself wrote, because each
+    /// slice is a direct view of the stored word.
+    // Written ahead of its caller: the runtime-level `for_each_root_mut` door that drives this
+    // family is a separate change, so until it lands nothing in the crate calls it.
+    #[allow(dead_code)]
+    fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            PortEvent::Term { term, .. } => f(core::slice::from_mut(term)),
+            PortEvent::Select { payload, handle, .. } => {
+                f(core::slice::from_mut(handle))?;
+                payload.for_each_payload_root_mut(f)
+            }
+            PortEvent::Data { .. }
+            | PortEvent::Line { .. }
+            | PortEvent::Exited { .. }
+            | PortEvent::Completion { .. }
+            | PortEvent::ActiveInput { .. }
+            | PortEvent::Signal { .. } => Ok(()),
+        }
+    }
 }
 
 /// The node-global **I/O byte counters** behind `erlang:statistics(io)`.
@@ -3061,6 +3096,98 @@ impl PortRegistry {
         .into_iter()
         .chain(registered)
         .collect())
+    }
+}
+
+/// The port subsystem's **term-carrying slots**, enumerated mutably — the relocation half of the
+/// runtime's host-side stores (see `CONTEXT.md`'s "Host-side term stores").
+///
+/// A runtime-level `for_each_root_mut` door needs every word the port layer **stores across a
+/// pass**, not just the words it derives from them at delivery time. The inventory is split into
+/// three families, one method each (so no shared "family" type is needed):
+///
+/// | Method | The stored terms it visits |
+/// |---|---|
+/// | [`PortRegistry::for_each_pending_event_root_mut`] | [`PortRegistry::pending_events`]' [`PortEvent::Term`] term and [`PortEvent::Select`] handle + payload; every live port's held line frames ([`PortMeta::held_lines`]); and every live port's [`driver::TermQueue`] (the `erl_drv_output_term`/`erl_drv_send_term` entries [`PortRegistry::take_driver_terms`] turns into [`PortEvent::Term`]s) |
+/// | [`PortRegistry::for_each_port_data_root_mut`] | the `erlang:port_set_data/2` payloads of [`ops::PortExtras::data`] |
+/// | [`PortRegistry::for_each_select_root_mut`] | every armed [`select::SelectRegistration`]'s handle + payload (both `enif_select` and `prim_tty:tty_select/2`) |
+///
+/// Each visitor is a **rewriter**: it may write through the `&mut [Eterm]` it is handed, and the
+/// slice's length never changes (one word per slot, always). An `Err` stops the walk and is
+/// returned as-is.
+///
+/// None of this is a liveness statement: visiting a word retains nothing, and none of these methods
+/// starts or stops delivering, queueing or collecting anything. The deliberately **excluded**
+/// slot is [`select::SelectWatch`]'s `by_fd_handle` index — keyed by an address-derived
+/// `handle_key`, so a mover must *recompute* it rather than rewrite it (see
+/// [`select::SelectWatch::for_each_root_mut`]).
+//
+// Written ahead of its caller: the runtime-level `for_each_root_mut` door that calls these three
+// is a separate change, so until it lands nothing in the crate calls them.
+#[allow(dead_code)]
+impl PortRegistry {
+    /// Visits every term the **queued/pending port event** family stores, mutably.
+    ///
+    /// Three stores, all behind this one door: the harvested-but-unreported
+    /// [`PortRegistry::pending_events`] buffer, each live port's held line frames, and each live
+    /// port's [`driver::TermQueue`]. The visit order is the registry's own and carries no meaning.
+    ///
+    /// [`driver::TermQueue`] is shared by `Rc<RefCell<..>>` with the port's driver host, so its own
+    /// enumerator takes the cell's borrow per element and never holds it across `f` (a driver
+    /// callback pushing during the walk must still land its term).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; the walk stops there.
+    pub(crate) fn for_each_pending_event_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        for event in &mut self.pending_events {
+            event.for_each_root_mut(f)?;
+        }
+        for meta in self.meta.values_mut() {
+            // Only `PortEvent::Line` frames are held here today, but the walk is variant-generic so
+            // no term-carrying event a later producer parks here can hide from it.
+            for event in &mut meta.held_lines {
+                event.for_each_root_mut(f)?;
+            }
+            if let Some(queue) = meta.driver_terms.as_ref() {
+                queue.for_each_root_mut(f)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits every stored `erlang:port_set_data/2` payload, mutably — see
+    /// [`ops::PortExtras::for_each_data_root_mut`], which is the side table's whole term inventory.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; the walk stops there.
+    pub(crate) fn for_each_port_data_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        self.extras.for_each_data_root_mut(f)
+    }
+
+    /// Visits every term an **armed select registration** stores, mutably — see
+    /// [`select::SelectWatch::for_each_root_mut`].
+    ///
+    /// Readiness a registration has already reported is not here: it was moved into
+    /// [`PortRegistry::pending_events`] as a [`PortEvent::Select`], which the pending-event family
+    /// covers. A payload that is in both places is visited twice, which is exactly what it needs
+    /// (the two stores are independent copies of the word).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; the walk stops there.
+    pub(crate) fn for_each_select_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        self.select.for_each_root_mut(f)
     }
 }
 

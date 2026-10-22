@@ -549,6 +549,69 @@ impl TermQueue {
             pending.clear();
         }
     }
+
+    /// Visits every queued term mutably — the queued-event family's term store, reached through
+    /// [`PortRegistry::for_each_pending_event_root_mut`](crate::port::PortRegistry::for_each_pending_event_root_mut)
+    /// as the words [`PortRegistry::take_driver_terms`](crate::port::PortRegistry::take_driver_terms)
+    /// later turns into [`PortEvent::Term`](crate::port::PortEvent) events.
+    ///
+    /// Both halves of an entry are visited: the `Option<Eterm>` destination (`erl_drv_send_term`'s
+    /// explicit pid, absent for `erl_drv_output_term`) and the data term itself.
+    ///
+    /// The cell's borrow is taken **per element** — one short borrow to read an entry, one to write
+    /// it back — and never held across `f`. That is load-bearing twice over: the pushing side is a
+    /// driver callback (a held borrow would make its `try_borrow_mut` drop the term it emitted),
+    /// and `f` is free to call back into this queue without panicking. The entry count is read once
+    /// up front, so an entry appended during the walk is simply not visited by it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; the walk stops there, and the entry whose slot the visitor refused
+    /// keeps the words it had.
+    // Written ahead of its caller: the runtime-level `for_each_root_mut` door that reaches this
+    // queue through the port layer is a separate change, so until it lands nothing calls it.
+    #[allow(dead_code)]
+    pub(crate) fn for_each_root_mut(
+        &self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        let len = self.pending.borrow().len();
+        for index in 0..len {
+            let Some((mut destination, mut term)) = self.entry_at(index) else {
+                // The queue was emptied (a driver teardown `clear`) since the length was read.
+                continue;
+            };
+            if let Some(mut word) = destination {
+                f(core::slice::from_mut(&mut word))?;
+                destination = Some(word);
+                // Keep what the visitor already wrote: a later slot's refusal must not undo an
+                // earlier relocation.
+                self.store_entry(index, (destination, term));
+            }
+            f(core::slice::from_mut(&mut term))?;
+            self.store_entry(index, (destination, term));
+        }
+        Ok(())
+    }
+
+    /// The queued `(destination, term)` entry at `index`, copied out under one short borrow.
+    #[allow(dead_code)] // see `for_each_root_mut` above
+    fn entry_at(&self, index: usize) -> Option<(Option<Eterm>, Eterm)> {
+        self.pending.borrow().get(index).copied()
+    }
+
+    /// Writes a visited entry back at `index` under one short borrow.
+    ///
+    /// A vanished entry (the driver's teardown emptied the queue) is dropped rather than
+    /// re-appended: the arena its words were built on is gone with it.
+    #[allow(dead_code)] // see `for_each_root_mut` above
+    fn store_entry(&self, index: usize, entry: (Option<Eterm>, Eterm)) {
+        if let Ok(mut pending) = self.pending.try_borrow_mut() {
+            if let Some(slot) = pending.get_mut(index) {
+                *slot = entry;
+            }
+        }
+    }
 }
 
 /// The **busy state** of one driver port — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`,

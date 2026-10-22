@@ -158,6 +158,34 @@ pub(crate) enum SelectPayload {
     },
 }
 
+impl SelectPayload {
+    /// Visits the payload's one term mutably, so a **moving** collector can rewrite the word in
+    /// place.
+    ///
+    /// Shared by both places this payload is stored — the armed registration
+    /// ([`SelectRegistration`]) and the ready [`super::PortEvent::Select`] a reported readiness
+    /// left in the registry's pending buffer — so the payload's term inventory lives in exactly
+    /// one place.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; nothing is written back beyond what `f` itself wrote, because the
+    /// slice is a direct view of the stored word.
+    // Written ahead of its callers: the runtime-level `for_each_root_mut` door that reaches a
+    // select registration through the port layer is a separate change, so until it lands nothing
+    // calls it.
+    #[allow(dead_code)]
+    pub(crate) fn for_each_payload_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            SelectPayload::Plain { reference } => f(core::slice::from_mut(reference)),
+            SelectPayload::Custom { message } => f(core::slice::from_mut(message)),
+        }
+    }
+}
+
 /// Which of the C's three event atoms a readiness report carries (`erl_check_io.c:1451-1463`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SelectEvent {
@@ -407,6 +435,26 @@ struct SelectRegistration {
     hold: Option<SelectHold>,
 }
 
+impl SelectRegistration {
+    /// Visits this registration's two terms mutably — its opaque `handle` and its `payload` (see
+    /// [`SelectPayload::for_each_payload_root_mut`]).
+    ///
+    /// The resource `obj` is deliberately **not** visited: it is an opaque pointer, not a term,
+    /// and nothing about it is rewritten by a move.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers.
+    #[allow(dead_code)] // see `for_each_payload_root_mut` above
+    fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        f(core::slice::from_mut(&mut self.handle))?;
+        self.payload.for_each_payload_root_mut(f)
+    }
+}
+
 /// The runtime's registrations of `enif_select`/`prim_tty:tty_select/2` interests with its one port
 /// poller.
 ///
@@ -447,6 +495,28 @@ impl SelectWatch {
     /// out of the port scheduler's readiness batch.
     pub(crate) fn owns(&self, key: u64) -> bool {
         self.registrations.contains_key(&key)
+    }
+
+    /// Visits every term a **live registration** stores, mutably, so a moving collector can
+    /// rewrite the words in place (`enif_select`'s reference, `prim_tty:tty_select/2`'s, or a
+    /// custom message term).
+    ///
+    /// `by_fd` and `by_fd_handle` are **not** term stores and are deliberately left alone: the
+    /// former keys a descriptor, and the latter's key is `(fd, handle_key(handle))` — an
+    /// **address**-valued index a mover must **recompute**, never rewrite (see [`handle_key`]).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` answers; the walk stops there.
+    #[allow(dead_code)] // see `SelectPayload::for_each_payload_root_mut`
+    pub(crate) fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        for registration in self.registrations.values_mut() {
+            registration.for_each_root_mut(f)?;
+        }
+        Ok(())
     }
 
     /// Arms a **one-shot** interest on `fd` for `owner` — the C's `enif_select` registration.
