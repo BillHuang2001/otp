@@ -45,19 +45,44 @@
 //!
 //! # States
 //!
-//! Nine states, one builder each, together covering every family the walk can reach from a
-//! unit test. Three of them populate runtime state that has **no public constructor** by writing
-//! the runtime's own private fields directly (this module is a child of `crate::runtime`, so
+//! Ten states, one builder each, together covering every family the walk can reach from a unit
+//! test. Some of them populate runtime state that has **no public constructor** by writing the
+//! runtime's own private fields directly (this module is a child of `crate::runtime`, so
 //! `rt.runner_state`, `rt.pending_spawns`, `rt.trace` and `rt.persistent_terms` are in scope):
 //! that is deliberate — the point of the state is the *shape of the root set*, not the route that
 //! produced it, and no production seam exists to reach those holders from a test.
+//!
+//! ## What is populated, and what is exercised only by parity
+//!
+//! Every family the suite can reach is **visited**; the ones this suite cannot populate are listed
+//! here rather than left to be guessed from a visit count:
+//!
+//! * `ParkedMachine` — a live engine whose machine was parked in an **un-published** park window
+//!   (a `receive` park, or a `Yield` park with a live FR prefix) is never populated: parking is a
+//!   runner-side act (`crate::runner::run::park_window`) reachable only through a scheduler slice
+//!   that really suspends, and no fixture module in the workspace blocks on a `receive`. The family
+//!   is still compared: `Runtime::gather_off_heap_roots` walks the same engines through the same
+//!   two gates, so a state whose engines are all published or un-parked contributes nothing on
+//!   either side (see `only_a_stable_engines_arguments_are_visited`, which pins the *other* half of
+//!   that gate).
+//! * `DistQueuedMessage`, `SelectPayload` and `PortPendingEvent` — a live distribution link, an
+//!   armed `enif_select` registration and a driver's pending event terms each need a peer / a NIF /
+//!   a real driver write, so they are exercised by their own suites, not by a root-set state here.
+//! * `EvalCompiledCaptures` — populated only once a closure `erlang:spawn/1` started is *compiled*
+//!   (`Runtime::eval_compiled`); `eval_closure_state` registers a closure but does not spawn one, so
+//!   the family is visited-empty there.
+//! * `SeqTrace`, `MailboxMarker` and `AsyncGcRequestId` — no state here populates them (a sequential
+//!   trace token, a `recv_marker_bind` marker and a servable `erlang:garbage_collect` request are
+//!   each a live-runtime act); the walk visits them empty, and their own seams carry the pins.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use beam_message::Message;
-use beam_process::ProcessId;
+use beam_process::{
+    ExitFamily, MonitorKind, MonitorRef, PendingSignal, ProcessId,
+};
 use beam_term::{make_small, Eterm, NIL};
 
 use super::roots::RootFamily;
@@ -161,6 +186,13 @@ fn live_process_state() -> (Runtime, ProcessId) {
     let register_word = stable_term(&mut rt, "{register, 1}");
     let saved = stable_term(&mut rt, "{saved, arg}");
     let template = stable_term(&mut rt, "{timer, message}");
+    // The two queued signals: each reason is a boxed term (`SignalQueue::gather_roots` publishes
+    // the reason of every queued signal) and the monitor-`'DOWN'` also carries a user **tag**,
+    // which is the queue's second term-holding slot. A tag must be heap-independent, so it is an
+    // atom — an immediate.
+    let exit_reason = stable_term(&mut rt, "{exit, reason}");
+    let down_reason = stable_term(&mut rt, "{down, reason}");
+    let down_tag = rt.intern("root_coverage_tag");
     let from = rt.intern("timer_sender");
     let timer_ref = rt.intern("timer_reference");
     let process = rt
@@ -171,6 +203,16 @@ fn live_process_state() -> (Runtime, ProcessId) {
     process.mailbox_mut().enqueue(Message::new(payload_a, NIL));
     process.mailbox_mut().enqueue(Message::new(payload_b, NIL));
     process.saved_args_mut().push(saved);
+    process
+        .signals_mut()
+        .push(PendingSignal::exit(pid, exit_reason, ExitFamily::Explicit));
+    process.signals_mut().push(PendingSignal::down(
+        MonitorRef::from_id(1),
+        pid,
+        MonitorKind::Process,
+        Some(down_tag),
+        down_reason,
+    ));
     let registers = process.registers_mut();
     registers
         .x_mut()
@@ -207,7 +249,10 @@ fn eval_closure_state() -> (&'static str, Runtime) {
 
 /// A runtime whose `RunnerState` holds a recorded **result** (and, opportunistically, a recorded
 /// **exit**), produced by really running processes through the scheduler.
-fn runner_recorded_state() -> (&'static str, Runtime) {
+///
+/// The third element is the recorded result **word**, read back out of the runner state
+/// ([`Runtime::process_result`]) — the very slot the `RunnerResult` family visits.
+fn runner_recorded_state() -> (&'static str, Runtime, Eterm) {
     let mut rt = Runtime::with_defaults().expect("the default runtime");
     rt.load_module(slice_fixture()).expect("slice.beam loads");
     let pid = rt
@@ -217,12 +262,15 @@ fn runner_recorded_state() -> (&'static str, Runtime) {
     // (the family is covered by the parity assertion either way).
     let _ = rt.spawn_process("slice", "pick", vec![make_small(99)]);
     let _ = rt.run_scheduler().expect("the pass runs");
+    let result = rt
+        .process_result(pid)
+        .expect("the recorded result of the finished process");
     assert_eq!(
-        rt.process_result(pid).map(beam_term::signed_value),
-        Some(55),
+        beam_term::signed_value(result),
+        55,
         "the recorded result family is real"
     );
-    ("runner-recorded", rt)
+    ("runner-recorded", rt, result)
 }
 
 /// A runtime with one recorded-but-not-yet-absorbed spawn: an `Export` entry with a non-empty
@@ -230,6 +278,20 @@ fn runner_recorded_state() -> (&'static str, Runtime) {
 fn pending_spawn_state() -> (&'static str, Runtime) {
     let mut rt = Runtime::with_defaults().expect("the default runtime");
     rt.load_module(slice_fixture()).expect("slice.beam loads");
+    let entry = slice_fib_entry(&mut rt);
+    let arg = stable_term(&mut rt, "{spawn, arg}");
+    let pid = rt.processes.spawn_default().expect("a child pid slot");
+    rt.pending_spawns.push(PendingSpawn {
+        pid,
+        entry,
+        args: vec![arg],
+    });
+    ("pending-spawn", rt)
+}
+
+/// The loaded fixture's `slice:fib/1` entry point — the module the fixture was loaded from and
+/// `fib`'s atom **index** in *that* module's own atom table.
+fn slice_fib_entry(rt: &mut Runtime) -> ProcessEntry {
     let module: Arc<beam_loader::Module> = rt
         .code_server()
         .modules()
@@ -240,23 +302,24 @@ fn pending_spawn_state() -> (&'static str, Runtime) {
         .atom_table
         .lookup("fib")
         .expect("fib is in the module's atom table");
-    let arg = stable_term(&mut rt, "{spawn, arg}");
-    let pid = rt.processes.spawn_default().expect("a child pid slot");
-    rt.pending_spawns.push(PendingSpawn {
-        pid,
-        entry: ProcessEntry::Export {
-            module,
-            function,
-            arity: 1,
-        },
-        args: vec![arg],
-    });
-    ("pending-spawn", rt)
+    ProcessEntry::Export {
+        module,
+        function,
+        arity: 1,
+    }
 }
 
 /// A runtime with a `persistent_term` entry holding a **boxed** value — the one family whose
 /// presence in the mutable walk and absence from the value gather is the superset's clearest case.
-fn persistent_term_state() -> (&'static str, Runtime) {
+///
+/// The third element is the **value word the store keeps**, read back through the store's own read
+/// API ([`PersistentTermStore::get_all`](crate::context::PersistentTermStore)), and asserted to be
+/// the very word the builder put in: `put` keeps the word it is handed (the *writer* stabilizes,
+/// see that module's docs), so the store's word is the root slot the walk rewrites. Deriving the
+/// marker by re-evaluating an expression cannot work here — [`Runtime::eval`] copies its result
+/// onto the runtime store, so a second evaluation of the same text answers a **different**
+/// (structurally equal) address, not the stored one.
+fn persistent_term_state() -> (&'static str, Runtime, Eterm) {
     let mut rt = Runtime::with_defaults().expect("the default runtime");
     let key = rt.intern("root_coverage_persistent");
     let value = stable_term(&mut rt, "{persistent, value}");
@@ -267,11 +330,30 @@ fn persistent_term_state() -> (&'static str, Runtime) {
             .put(key, value, false, rt.atoms()),
         "the entry was stored"
     );
-    ("persistent-term", rt)
+    let stored = {
+        let entries = store.borrow().get_all();
+        assert_eq!(entries.len(), 1, "the store holds exactly one entry");
+        assert_eq!(
+            entries[0].0.raw(),
+            key.raw(),
+            "the store keeps the key word it was handed"
+        );
+        assert_eq!(
+            entries[0].1.raw(),
+            value.raw(),
+            "the store keeps the value word it was handed (put does not copy)"
+        );
+        entries[0].1
+    };
+    ("persistent-term", rt, stored)
 }
 
 /// A runtime with an installed function trace pattern carrying a `MatchSpec::Functions` body.
-fn trace_match_spec_state() -> (&'static str, Runtime) {
+///
+/// The third element is the pattern's **first function word**, read back out of the installed
+/// pattern ([`PatternTable::matches`](crate::trace::PatternTable)) rather than re-derived from an
+/// atom name.
+fn trace_match_spec_state() -> (&'static str, Runtime, Eterm) {
     let mut rt = Runtime::with_defaults().expect("the default runtime");
     let first = rt.intern("match_first");
     let second = rt.intern("match_second");
@@ -285,11 +367,24 @@ fn trace_match_spec_state() -> (&'static str, Runtime) {
         MatchSpec::Functions(vec![first, second]),
         flags,
     );
-    ("trace-match-spec", rt)
+    let stored = match &rt
+        .trace()
+        .patterns()
+        .matches("slice", "fib", 1)
+        .expect("the installed pattern governs slice:fib/1")
+        .match_spec
+    {
+        MatchSpec::Functions(functions) => *functions.first().expect("a non-empty spec"),
+        other => panic!("the installed spec is not a function set: {other:?}"),
+    };
+    ("trace-match-spec", rt, stored)
 }
 
 /// A runtime with one live built-in driver port carrying `port_set_data/2` data.
-fn port_data_state() -> (&'static str, Runtime) {
+///
+/// The third element is the **stored data word**, read back through the port registry's own
+/// [`port_data`](crate::port::PortRegistry::port_data) accessor.
+fn port_data_state() -> (&'static str, Runtime, Eterm) {
     let mut rt = Runtime::with_defaults().expect("the default runtime");
     let (id, _flags) = crate::port::test_support::register_control_port(
         &mut rt,
@@ -301,7 +396,43 @@ fn port_data_state() -> (&'static str, Runtime) {
         .borrow_mut()
         .set_port_data(id, data)
         .expect("the port is live");
-    ("port-data", rt)
+    let stored = rt
+        .ports
+        .borrow()
+        .port_data(id)
+        .expect("the port is live")
+        .expect("the data was stored");
+    assert_eq!(
+        stored.raw(),
+        data.raw(),
+        "the registry keeps the data word it was handed"
+    );
+    ("port-data", rt, stored)
+}
+
+/// A runtime with one live engine whose arguments came from the **stable** spawn route
+/// (`RunnerState::spawn_stable`) and whose child has not run yet: the `arena_args &&
+/// !args_consumed` shape the [`RootFamily::EngineArgs`] family publishes.
+fn engine_args_state() -> (&'static str, Runtime, ProcessId) {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.load_module(slice_fixture()).expect("slice.beam loads");
+    let entry = slice_fib_entry(&mut rt);
+    let arg = stable_term(&mut rt, "{engine, arg}");
+    let pid = rt.processes.spawn_default().expect("a child pid slot");
+    rt.runner_state.spawn_stable(pid, entry, vec![arg]);
+    ("engine-args", rt, pid)
+}
+
+/// The same engine through the **plain** spawn route ([`RunnerState::spawn`]): the control for the
+/// stability gate — a term on the spawning process's own heap must not be published as an engine
+/// root, so [`RootFamily::EngineArgs`] stays empty.
+fn plain_engine_state() -> (&'static str, Runtime, ProcessId) {
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.load_module(slice_fixture()).expect("slice.beam loads");
+    let entry = slice_fib_entry(&mut rt);
+    let pid = rt.processes.spawn_default().expect("a child pid slot");
+    rt.runner_state.spawn(pid, entry, vec![make_small(3)]);
+    ("plain-engine", rt, pid)
 }
 
 /// Every state the suite exercises, each built freshly.
@@ -312,12 +443,23 @@ fn states() -> Vec<(&'static str, Runtime)> {
         booted_state(),
         ("live-process", live),
         eval_closure_state(),
-        runner_recorded_state(),
+        without_marker(runner_recorded_state()),
         pending_spawn_state(),
-        persistent_term_state(),
-        trace_match_spec_state(),
-        port_data_state(),
+        without_marker(persistent_term_state()),
+        without_marker(trace_match_spec_state()),
+        without_marker(port_data_state()),
+        {
+            let (name, rt, _pid) = engine_args_state();
+            (name, rt)
+        },
     ]
+}
+
+/// The `(name, runtime)` projection of a marker-carrying builder's answer — the state list only
+/// needs the runtime, the owner's word being asserted by
+/// [`the_mutable_walk_covers_the_holders_the_value_gather_omits`].
+fn without_marker(built: (&'static str, Runtime, Eterm)) -> (&'static str, Runtime) {
+    (built.0, built.1)
 }
 
 // ---------------------------------------------------------------------------
@@ -391,42 +533,44 @@ fn the_family_walk_matches_the_value_gather_in_every_state() {
 /// The families the value gather deliberately skips are **populated**, not aspirational: each
 /// asserted state carries the expected word under the expected family, and the whole walk is a
 /// strict multiset superset of the gather.
+///
+/// Every marker is the **word the owning container actually keeps**, read back out of the owner by
+/// the builder that populated it. That is the only sound way to name a root: re-evaluating an
+/// expression builds a *new* term (each `-eval` result is copied onto the runtime store, so a
+/// second evaluation of the same text answers a different, merely structurally equal address), and
+/// asserting that a *fresh* word appears under a family would be false by construction. Reading the
+/// owner's own word keeps the assertion meaningful — it says "this family carries *this* root" —
+/// and the two remaining assertions bind the word to the family pair it must belong to: the marker
+/// must NOT appear in the value gather, and the walk must be a strict superset of it.
 #[test]
 fn the_mutable_walk_covers_the_holders_the_value_gather_omits() {
-    // (state name, the family expected to hold the marker, the marker's source expression)
-    let expectations: [(&str, RootFamily, &str); 4] = [
-        (
-            "persistent-term",
-            RootFamily::PersistentTermEntry,
-            "{persistent, value}",
-        ),
-        (
-            "trace-match-spec",
-            RootFamily::TraceMatchSpec,
-            "match_first",
-        ),
-        ("port-data", RootFamily::PortData, "{port, data}"),
-        ("runner-recorded", RootFamily::RunnerResult, "55"),
-    ];
-    for (state, family, marker) in expectations {
-        let mut rt = match state {
-            "persistent-term" => persistent_term_state().1,
-            "trace-match-spec" => trace_match_spec_state().1,
-            "port-data" => port_data_state().1,
-            "runner-recorded" => runner_recorded_state().1,
-            other => panic!("no builder for state {other}"),
-        };
-        let marker = rt
-            .eval(marker)
-            .expect("the marker expression evaluates")
-            .raw();
+    // (state name, the family expected to hold the marker, the built runtime + the owner's word)
+    for (state, family, mut rt, marker) in [
+        {
+            let (state, rt, marker) = persistent_term_state();
+            (state, RootFamily::PersistentTermEntry, rt, marker)
+        },
+        {
+            let (state, rt, marker) = trace_match_spec_state();
+            (state, RootFamily::TraceMatchSpec, rt, marker)
+        },
+        {
+            let (state, rt, marker) = port_data_state();
+            (state, RootFamily::PortData, rt, marker)
+        },
+        {
+            let (state, rt, marker) = runner_recorded_state();
+            (state, RootFamily::RunnerResult, rt, marker)
+        },
+    ] {
+        let marker = marker.raw();
         let gathered = value_gather(&mut rt);
         let walked = all_walk(&mut rt);
         let words: Vec<usize> = walked.iter().map(|(_, word)| *word).collect();
         assert!(
             walked.contains(&(family, marker)),
-            "state {state}: family {family:?} must carry the marker word {marker:#x}; it visits \
-             {:?}",
+            "state {state}: family {family:?} must carry the owner's marker word {marker:#x}; it \
+             visits {:?}",
             walked.iter().filter(|(f, _)| *f == family).count()
         );
         assert!(
@@ -443,6 +587,10 @@ fn the_mutable_walk_covers_the_holders_the_value_gather_omits() {
 
 /// Every populated per-process family is visited, and a visitor that rewrites each word to itself
 /// changes nothing: neither corpus, and not the mailbox's payload order.
+///
+/// `ProcessSignals` is populated by the state's own two queued signals (a boxed exit reason and a
+/// monitor-`'DOWN'` with a boxed reason plus an immediate user tag), so the family is asserted from
+/// real queue contents, not just visited.
 #[test]
 fn every_process_family_is_visited_and_an_identity_rewrite_changes_nothing() {
     let (mut rt, pid) = live_process_state();
@@ -452,6 +600,7 @@ fn every_process_family_is_visited_and_an_identity_rewrite_changes_nothing() {
         RootFamily::ProcessMailbox,
         RootFamily::ProcessRegisters,
         RootFamily::ProcessSavedArgs,
+        RootFamily::ProcessSignals,
         RootFamily::TimerDelivery,
     ] {
         assert!(
@@ -459,6 +608,15 @@ fn every_process_family_is_visited_and_an_identity_rewrite_changes_nothing() {
             "state live-process: {family:?} must be visited at least once, got {counts:?}"
         );
     }
+    assert_eq!(
+        rt.processes
+            .get(pid)
+            .expect("the live process")
+            .signals()
+            .len(),
+        2,
+        "the state really queued its two signals"
+    );
     let payments_before = payloads(&rt, pid);
     let gathered_before = value_gather(&mut rt);
     let walked_before = shared_walk(&mut rt);
@@ -485,6 +643,56 @@ fn every_process_family_is_visited_and_an_identity_rewrite_changes_nothing() {
         walked_before,
         "the identity rewrite left the mutable walk unchanged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. The stable-spawn engine family
+// ---------------------------------------------------------------------------
+
+/// An engine spawned through the **stable** route is visited under [`RootFamily::EngineArgs`],
+/// and the same engine spawned through the plain route is not: the family's publication is gated
+/// on the arguments being pointer-stable copies, so the gate is asserted from both sides.
+#[test]
+fn only_a_stable_engines_arguments_are_visited() {
+    let (_name, mut stable, stable_pid) = engine_args_state();
+    let counts = per_family_counts(&mut stable);
+    assert!(
+        counts.get(&RootFamily::EngineArgs).copied().unwrap_or(0) >= 1,
+        "state engine-args: EngineArgs must be visited at least once, got {counts:?}"
+    );
+    let words = family_words(&mut stable, RootFamily::EngineArgs);
+    assert_eq!(
+        words.len(),
+        1,
+        "the one stabilized spawn argument is the family's only word, got {words:?}"
+    );
+    assert!(
+        value_gather(&mut stable).contains(&words[0]),
+        "the stable engine's argument is in the value gather too (the family is a gather member)"
+    );
+    let (_name, mut plain, plain_pid) = plain_engine_state();
+    assert_eq!(
+        per_family_counts(&mut plain)
+            .get(&RootFamily::EngineArgs)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "a plain spawn publishes no engine-argument root"
+    );
+    assert!(
+        plain.processes.get(plain_pid).is_some(),
+        "the control engine's process is live too (the gate is the stability flag, not liveness)"
+    );
+    assert!(stable.processes.get(stable_pid).is_some());
+}
+
+/// Every word the walk visits under `family`, in visit order.
+fn family_words(rt: &mut Runtime, family: RootFamily) -> Vec<usize> {
+    all_walk(rt)
+        .into_iter()
+        .filter(|(visited, _)| *visited == family)
+        .map(|(_, word)| word)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
