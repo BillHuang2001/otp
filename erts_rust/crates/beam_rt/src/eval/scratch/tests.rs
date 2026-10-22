@@ -243,6 +243,57 @@ fn a_window_a_writer_latched_reports_its_reason() {
     );
 }
 
+/// **The driver's terminal term is a write-back slot, never a copy of one.**
+///
+/// The exit-site pass hands the store move its corpus as *writable slots*, so the word a move
+/// rewrites is the word the caller hands back. For the `-eval` driver the caller's half of that
+/// corpus is the evaluator's environment **plus the terminal flow the driver is about to return**
+/// (`Ok(value)`, or a raise's `reason`/`head`) — and the flow is the one holder that lives in a
+/// Rust local no runtime family can reach, so the driver lends its own fields (`&mut outcome`).
+///
+/// Lending a *copy* instead is invisible until a region the word stands in is evacuated: the pass
+/// rewrites the copy, `finish` hands back the original word, and that word names a region the move
+/// has just dropped — a dangling term, which any reader answers as `badarg` (the shape a
+/// `filelib:wildcard/1` result took on the `-eval` route).
+///
+/// One top-level statement, so the pass runs only at the exit (the boundary before it has an empty
+/// window): the expression builds three large lists, keeps one as its value, and leaves the store
+/// with far more dead words than live ones — the shape the move fires on. Both halves are asserted:
+/// the move really ran (`store_compactions`), and the returned list still reads.
+#[test]
+fn the_drivers_terminal_term_is_rewritten_by_a_store_move_rather_than_a_copy_of_it() {
+    let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+    let expr = format!(
+        "element(2, {{lists:seq(1,{ELEMENTS}), lists:seq(1,{ELEMENTS}), \
+         lists:seq(1,{ELEMENTS})}})"
+    );
+    let value = eval(&mut runtime, &expr).expect("the expression evaluates");
+    let stats = runtime.eval_region_stats();
+    assert!(
+        stats.reclaim.store_compactions > 0,
+        "the exit-site pass must move the store for this shape, else the pin proves nothing: \
+         used={} retired={} move_declines={} last_decline={:?}",
+        stats.used,
+        stats.retired_regions,
+        stats.reclaim.store_move_declines,
+        stats.reclaim.store_move_last_decline,
+    );
+    let expected = format!(
+        "[{}]",
+        (1..=ELEMENTS)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let rendered = runtime
+        .format_term(value, None)
+        .expect("the returned term is readable after the move");
+    // `~p` breaks a list past the printer's line width onto continuation lines; only the layout is
+    // dropped, never an element (the same comparison `tests/a9_native_floor.rs` makes).
+    let rendered: String = rendered.lines().map(str::trim_start).collect();
+    assert_eq!(rendered, expected, "the returned list is intact");
+}
+
 /// The measurement behind `PERF.md`'s growth table: the store's own figures for the reducible
 /// shape, per statement count, with the window **on** and **off** on two runtimes.
 ///

@@ -445,23 +445,28 @@ pub(crate) fn open(runtime: &mut Runtime) {
 /// term over (a [`Flow::Fatal`](crate::eval::Flow::Fatal) whose `BeamError` may carry a live reason
 /// word and exposes no mutable accessor) passes `withheld`, which declines the pass.
 ///
-/// # Why both halves are handed over **mutable**
+/// # Why both halves are handed over **mutable**, and as the holders themselves
 ///
 /// The pass may not only *drop* regions: the store move
 /// ([`crate::runtime::reclaim::compact`]) rewrites the words it evacuates, so every live term has to
 /// arrive as a writable slot. The environment's values and `extra` are two disjoint places, so both
 /// are lent as one [`MoveSlots`] corpus and a moved region leaves them naming the destination.
+///
+/// `extra` is therefore a set of **borrowed slots**, not a snapshot: the caller passes the very
+/// fields it is about to read its result out of (`&mut outcome`'s own words). A caller that passes a
+/// copy instead gets a corpus that is *rewritten but no longer read* — the word it hands back still
+/// names the region the move evacuated, which is a dangling term rather than a wrong one.
 pub(crate) fn close(
     runtime: &mut Runtime,
     env: &mut Env,
-    extra: &mut [Eterm],
+    extra: Vec<&mut Eterm>,
     withheld: Option<&'static str>,
 ) {
-    let mut value_roots: Vec<Eterm> = env.values().copied().collect();
-    value_roots.extend_from_slice(extra);
     let window = runtime.eval_scratch.state();
+    // One corpus, in one order: the environment's values, then the caller's own slots.
     let mut slots: Vec<&mut Eterm> = env.values_mut().collect();
-    slots.extend(extra.iter_mut());
+    slots.extend(extra);
+    let value_roots: Vec<Eterm> = slots.iter().map(|slot| **slot).collect();
     let mut slots = MoveSlots::new(slots);
     region_reclaim::pass(
         runtime,
