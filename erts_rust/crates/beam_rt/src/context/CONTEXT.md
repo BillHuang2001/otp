@@ -245,6 +245,19 @@ That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), th
 of the in-process `compile:file/2` route (A.9).
 The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
+## A term that outlives its heap — the unmap-class fault and the ranked suspects
+A fault in `beam_term::list::car` (a cons whose pointer lands in **unmapped** memory) is not a classifier bug: some region holding that cell was `munmap`ed while a term still named it.
+Only two kinds of region on this crate's routes actually return pages: a `beam_alloc::Heap` block at/above the single-block-carrier threshold (512 KiB = 65 536 words) is a dedicated mapping that `Drop` unmaps, and a **process nursery** space reaches that size once a compile-sized live set grows it (`crates/beam_alloc/CONTEXT.md`).
+Everything else on the route only rewinds or retires, so it can never dangle: `bif_heaps` (`take_bif_frontier` puts back, never frees), `eval_heap` + `eval_heap_retired` (`grow_eval_heap` retires, never frees), `info_heap` (`reset_info_scratch` is a bump rewind behind the `info_heap_tainted` latch, and `erlang:system_info/1` relocates off it first), `gc_scratch`, the `-eval` statement window (`eval_heap.reset_to`, pinned by every `stabilize_term`), the engine arena (only grows) and the port completion channel (arena-built).
+So `stabilize_term`/`note_escaped_store_roots` are not suspects either: the copy lands in the never-freed store and the note only latches `foreign_reachable` for `self_pid`.
+`hint_grow_gate`/`move_result_into_process_heap` (`calls.rs:1498`, `:1561`, `:2041-2067`) call only the **no-relocation** `Process::grow_nursery`, so the copy-out itself moves no term — but it **retires** the young space and hands back a word Erlang code only roots a moment later, so a collection in that gap frees the word (`calls/CONTEXT.md`).
+Per the beam_gc audit, the retired space itself is safe: `add_to_from_set` covers every space and `Nursery::collapse` runs only after a collection whose from-set contained them — the defect is therefore always an **incomplete root set at a collection door**, never the free.
+Ranked suspects (detail in the child nodes; nothing here is a `beam_rt` contract violation):
+1. `beam_engine`'s `Instr::RawRaise` reads `x(1)` before `symbolic_stacktrace`'s rooted reservation and reuses the pre-collection word — `../beam_engine/CONTEXT.md`.
+2. The supplied-stacktrace term (`Machine::pending_supplied_term`) is a heap **cons list** outside `LOOSE_HEAP_TERMS = 3`, i.e. not parked at a collection — same node.
+3. The runner's park publication omits `ProcessEngine::args`/`ProcessEntry::Fun`/`LocalFunTarget::args`, protected only by the `args_consumed` invariant and the relocation exemption — `../../runner/CONTEXT.md`.
+4. `beam_io`'s flat `DriverContext::input()` and this crate's bin-vheap prune hold no cons cell; a missed `BinRef` would dangle a payload, not a list (`gc/CONTEXT.md`).
+A reader debugging this must not read `RuntimeContext::new`'s `mailbox_table: None` as the crash route: `beam_rt run` drives a **scheduled slice** (`for_process_with_engines`, `mailbox_table: Some`), and only the in-slice **nested** run an in-process `compile:file/2` performs is table-less (`../bridges.rs`).
 ## Host-memory retention on the table-less route — where the words actually accumulate
 An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
 false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route.
