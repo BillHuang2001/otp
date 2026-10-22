@@ -204,6 +204,16 @@ type Env = HashMap<String, Eterm>;
 /// Stored on the [`Runtime`](crate::runtime::Runtime) (not on the evaluator) so a fun
 /// that escapes into a loaded module — `lists:map(F, …)` calling `F` back — can still
 /// be applied through [`RuntimeContext::apply_fun`](crate::context::RuntimeContext).
+///
+/// # Why `Clone` (clone-on-write)
+///
+/// The owner of the closure list is [`Runtime::eval_closures`], a `Vec<Rc<FunBody>>`, so a
+/// mutable walk reaches a body through `Rc::make_mut` — which needs `Clone` to split a body out
+/// of a shared `Rc`. That is sound here because the mutable walk runs only at the runtime's two
+/// **non-running** sites (the `-eval` statement boundary and a nested run's epilogue), never
+/// while a closure is being applied: no application can hold a borrow of the body that a
+/// clone-on-write would desynchronize.
+#[derive(Clone)]
 pub(crate) struct FunBody {
     /// What the fun does.
     kind: FunKind,
@@ -236,7 +246,51 @@ impl FunBody {
     pub(crate) fn env_terms(&self, out: &mut Vec<Eterm>) {
         out.extend(self.env.values().copied());
     }
+
+    /// Hands `f` the writable term slots of this closure's capture environment, one slice at
+    /// a time.
+    ///
+    /// This is the *move-capable* counterpart of [`Self::env_terms`]: a relocating walk must be
+    /// able to write each capture back, and the environment is where a closure's captured terms
+    /// are stored, so no other family can move them.
+    ///
+    /// The contract shared by every per-owner `for_each_root_mut`:
+    /// * `f` may replace the **elements** of a slice; a slice's **length** never changes, and
+    ///   the visitor must not depend on the iteration order (a `HashMap`'s order is an
+    ///   implementation detail).
+    /// * When `f` returns `Err`, the buffer is still written back before the error is
+    ///   returned, so no slot is lost.
+    /// * An empty environment calls no visitor and answers `Ok(())`.
+    ///
+    /// Write-back is **by key**: the pass snapshots `(key, word)` pairs so the buffer handed to
+    /// `f` and the write-back can never disagree about which key owns which slot.
+    ///
+    /// It runs only at the runtime's two non-running sites (the `-eval` statement boundary and a
+    /// nested run's epilogue), never while a closure is being applied — which is what makes the
+    /// owner's clone-on-write reach sound (see [`FunBody`]).
+    pub(crate) fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        if self.env.is_empty() {
+            return Ok(());
+        }
+        // One pass: snapshot (key, word) pairs so the buffer and the write-back can never
+        // disagree about which key owns which slot.
+        let mut pairs: Vec<(String, Eterm)> =
+            self.env.iter().map(|(key, word)| (key.clone(), *word)).collect();
+        let mut words: Vec<Eterm> = pairs.iter().map(|(_, word)| *word).collect();
+        let visited = f(&mut words);
+        for ((key, word), relocated) in pairs.iter_mut().zip(words) {
+            *word = relocated;
+            if let Some(slot) = self.env.get_mut(key.as_str()) {
+                *slot = relocated;
+            }
+        }
+        visited
+    }
 }
+#[derive(Clone)]
 enum FunKind {
     /// `fun (Params) -> Body end` — a closure over `env`.
     Local {

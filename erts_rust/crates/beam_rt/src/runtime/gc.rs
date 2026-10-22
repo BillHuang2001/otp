@@ -255,6 +255,33 @@ impl GcState {
         state.foreign = latch;
         state
     }
+
+    /// Hands `f` the live word of every **pending** asynchronous collection completion — a
+    /// 1-word `[ReqId]` slice per record of [`GcState::async_completions`], in request order —
+    /// so a caller that can *move* the store those words point into can rewrite them in place.
+    ///
+    /// [`AsyncGcCompletion::req_id`] is stabilized onto the runtime's pointer-stable arena
+    /// before the record is made (see that field's own docs), so the words cannot dangle today;
+    /// this enumerator exists so a future mover of that store re-points them instead. The record
+    /// is private to this module, which is why the seam lives here rather than in the caller.
+    ///
+    /// The contract is the caller's: `f` may replace any element of the slice, but never its
+    /// length; the iteration order and the slicing are implementation details the visitor must
+    /// not depend on. An `Err` from `f` stops at the record that produced it and is returned
+    /// as-is. [`GcState::scratch`] is deliberately **not** visited: it is a placeholder fill of
+    /// [`NIL`](beam_term::NIL) words, never a term graph, so it is not a root.
+    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
+    // method is legitimately unused in the meantime (the same allowance `gc_disabled_reason` carries).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_pending_completion_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        for completion in &mut self.async_completions {
+            f(core::slice::from_mut(&mut completion.req_id))?;
+        }
+        Ok(())
+    }
 }
 
 // The wiring lands the call sites incrementally (the collection point first, then the

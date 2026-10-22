@@ -701,6 +701,37 @@ impl DistClient {
             .try_borrow_mut()
             .map_err(|_| error::message("distribution: the client is already in use"))
     }
+
+    /// Hands `f` the **live words** of every control message the router has queued but not yet
+    /// written — the target node atom term and then the argument vector of each entry of
+    /// [`DistClientInner::pending`], in queue order — so a caller that can *move* the store those
+    /// words point into can rewrite them in place.
+    ///
+    /// [`Queued`]'s terms are materialised on [`DistClientInner::scratch`], which is reset
+    /// **exactly** when the queue empties, so a queued word cannot dangle while it is queued.
+    /// The `borrow_mut` of the shared cell is why this seam lives here: the cell is private to
+    /// this module (and shared with the [`DistSignalRouter`] installed on the process table).
+    ///
+    /// The contract is the caller's: `f` may replace any element of a slice, but never its
+    /// length; the iteration order is an implementation detail the visitor must not depend on,
+    /// and an empty queue calls `f` zero times. An `Err` from `f` is returned as-is, dropping the
+    /// borrow on the way out (nothing here re-enters the cell).
+    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
+    // method is legitimately unused in the meantime (the same allowance `local_identity` carries).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_queued_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        let mut inner = self.borrow_mut()?;
+        for queued in inner.pending.iter_mut() {
+            f(core::slice::from_mut(&mut queued.node))?;
+            if !queued.args.is_empty() {
+                f(&mut queued.args)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DistClientInner {

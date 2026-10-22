@@ -552,6 +552,35 @@ impl TraceState {
     pub fn patterns_mut(&mut self) -> &mut PatternTable {
         &mut self.patterns
     }
+
+    /// Visits every match-spec **term** the installed function trace patterns hold through `f`,
+    /// which may replace words in place (a spec's vector length never changes).
+    ///
+    /// The one term-holding site in this state is the node-global [`PatternTable`]: each installed
+    /// [`PatternEntry`] carries a [`MatchSpec`], and only a [`MatchSpec::Functions`] names terms.
+    /// A [`MatchSpec::MatchAll`] is the atom `true` and an empty `Functions` vector names nothing,
+    /// so neither calls `f`. The per-process `entries` map holds no terms at all — a
+    /// [`TraceEntry`] is a flags word plus an optional [`ProcessId`], and `trace_info`'s
+    /// `match_spec` item is always the empty list — so nothing else is enumerated.
+    ///
+    /// Patterns are visited in installation order — which the visitor must not depend on — and
+    /// replacement is in place, never a resize.
+    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
+    pub(crate) fn for_each_match_spec_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for (_, entry) in &mut self.patterns.entries {
+            let MatchSpec::Functions(functions) = &mut entry.match_spec else {
+                continue;
+            };
+            if !functions.is_empty() {
+                f(functions)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The mutable entry for `pid`, inserting a default (no flags, no tracer) if absent.
     ///
     /// The get-or-insert half of [`TraceState::set`]: a caller that only wants to *change* one

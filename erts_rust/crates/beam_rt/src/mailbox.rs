@@ -393,8 +393,33 @@ impl MailboxState {
             self.markers.remove(index);
         }
     }
-}
 
+    /// Visits every term a reserved **marker** holds through `f`, which may replace the word in
+    /// place.
+    ///
+    /// Per marker that is the marker's own opaque `term` and — only while it is bound — the
+    /// reference. Both are visited as one-element slices of the marker's own slots, so a
+    /// replacement lands directly in the marker: the marker's `anchor` counts messages, not terms,
+    /// and is not visited, and the retained payload families
+    /// ([`MailboxState::retained_fragments`], [`MailboxState::retained_binaries`],
+    /// [`MailboxState::retained_off_heap`], [`MailboxState::retained_nodes`]) are refcounted
+    /// **handles**, kept alive by their count rather than by this enumeration.
+    ///
+    /// Markers are visited in reservation order and no slice length ever changes.
+    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
+    pub(crate) fn for_each_marker_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for marker in &mut self.markers {
+            f(core::slice::from_mut(&mut marker.term))?;
+            if let Some(reference) = &mut marker.reference {
+                f(core::slice::from_mut(reference))?;
+            }
+        }
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

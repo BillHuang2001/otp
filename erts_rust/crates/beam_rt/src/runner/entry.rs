@@ -516,6 +516,145 @@ impl RunnerState {
         }
     }
 
+    /// Visits the **arguments family** of [`RunnerState::gather_off_heap_roots`] mutably — the
+    /// `arena_args && !args_consumed` engines' arguments, plus a [`ProcessEntry::Fun`] entry's fun
+    /// term — handing each term slice to `f` so a **rewriting** pass (a relocation, not a
+    /// liveness prune) can replace the words in place.
+    ///
+    /// This is the writable sibling of the value gather, family-for-family: the same stability
+    /// gate ([`ProcessEngine::arena_args`]) and the same liveness gate
+    /// ([`ProcessEngine::args_consumed`]), and **no** `live` filter — exactly like the value
+    /// gather, whose `live` predicate gates the *parked machine* half only. The terms are arena
+    /// copies, dereferenceable whatever became of the process, so a child that terminated before
+    /// its first run keeps its arguments enumerated here (the documented leak). `live` is accepted
+    /// and deliberately unused, so both doors have one shape for their shared caller.
+    ///
+    /// `/!\ ` **The words stay rooted only because the arena never moves them.** A relocation-aware
+    /// store must call this before it moves a region its terms name; the value gather's soundness
+    /// argument ([`ProcessEngine::arena_args`]) is what makes them valid to dereference at all.
+    ///
+    /// Slice lengths never change (the words are `Eterm`-sized and each slice is exactly the
+    /// family's own storage), so a visitor may replace elements but not resize. A `FastHashMap`'s
+    /// iteration order is an implementation detail the visitor must not depend on. A `f` error
+    /// stops the enumeration of this family immediately and is returned (the direct-`&mut`-slice
+    /// writes it already made stand); an empty family returns `Ok(())` without calling `f`.
+    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one);
+    // the allowance is what keeps this additive seam from breaking the warning-free build until
+    // that door lands.
+    #[allow(dead_code)]
+    pub(crate) fn for_each_engine_args_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+        _live: impl Fn(ProcessId) -> bool,
+    ) -> beam_common::Result<()> {
+        for engine in self.engines.values_mut() {
+            // `args` and `entry` are two fields of the same struct; splitting the borrow here is
+            // what lets them be visited one after the other.
+            let ProcessEngine {
+                args,
+                entry,
+                arena_args,
+                args_consumed,
+                ..
+            } = engine;
+            if !(*arena_args && !*args_consumed) {
+                continue;
+            }
+            if !args.is_empty() {
+                f(args)?;
+            }
+            if let ProcessEntry::Fun { fun, .. } = entry {
+                f(core::slice::from_mut(fun))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits the **parked machine** family of [`RunnerState::gather_off_heap_roots`] mutably —
+    /// the live root set of an engine parked in an **un-published** (relocation-exempt) window.
+    ///
+    /// The same two gates as the value gather: [`ProcessEngine::parked_published`] must be `false`
+    /// (a publishing window's truth is the process's own `Registers`, not the machine's copy) and
+    /// the process must still be in the live table (`live(*pid)`), because an engine outlives its
+    /// process and a terminated process's heap is gone. The FR prefix is clamped to the machine's
+    /// own handed extent exactly as the value gather does (`fr_mark()` against `roots.fr.len()`).
+    ///
+    /// The three slices are visited separately, in the value gather's order — live X registers,
+    /// the Erlang stack, then the live FR prefix — skipping an empty one. Slice lengths never
+    /// change; `f` may replace any element. `f`'s error propagates out of
+    /// [`Machine::with_roots`](beam_engine::Machine::with_roots) unchanged, so the enumeration of
+    /// this family stops there.
+    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_parked_machine_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+        live: impl Fn(ProcessId) -> bool,
+    ) -> beam_common::Result<()> {
+        for (pid, engine) in self.engines.iter_mut() {
+            if engine.parked_published || !live(*pid) {
+                continue;
+            }
+            let fr = engine.machine.fr_mark() as usize;
+            engine.machine.with_roots(RootSet::ALL_LIVE, |mut roots| -> beam_common::Result<()> {
+                let x = roots.live_x_mut();
+                if !x.is_empty() {
+                    f(x)?;
+                }
+                // The two remaining fields are taken by move so the `&mut self` borrow of
+                // `live_x_mut` above is over: the slices are disjoint, the writes are not.
+                let RootSet {
+                    stack, fr: fr_file, ..
+                } = roots;
+                if !stack.is_empty() {
+                    f(stack)?;
+                }
+                let fr = fr.min(fr_file.len());
+                let fr_prefix = &mut fr_file[..fr];
+                if !fr_prefix.is_empty() {
+                    f(fr_prefix)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Visits the two **recorded-outcome** maps whose words the value gather deliberately skips
+    /// because they are *stabilized copies*: [`RunnerState::results`] (a finished process's
+    /// `x(0)`) and [`RunnerState::exits`] (a raising process's reason term).
+    ///
+    /// [`RunnerState::gather_off_heap_roots`] leaves them out on purpose — the reclamation prunes
+    /// payload handles by identity and needs no copy of them — but a **rewriting** pass does: both
+    /// maps hold live words that are read again long after the process died
+    /// ([`RunnerState::result`] / [`RunnerState::exit`], and through them the CLI's
+    /// [`Runtime::take_process_error`](crate::runtime::Runtime::take_process_error)), so a region
+    /// they name must not move without them.
+    ///
+    /// [`RunnerState::errors`] is **deliberately not enumerated here**: it also carries a live
+    /// reason word ([`beam_common::Raise`]'s opaque `live_reason` slot, the `Eterm` payload a
+    /// structured raise records), but [`BeamError`] exposes no mutable term accessor — the slot is
+    /// private to `beam_common` — so reaching it would need a new seam upstream. Recorded here so
+    /// the omission is a known hole rather than an oversight: a relocation must not move a region
+    /// an `errors` entry's live reason names until such an accessor exists.
+    ///
+    /// One `f` call per entry (never a `&mut` getter on the map), lengths fixed, order
+    /// unspecified. An `f` error stops the enumeration and is returned; an empty map calls nothing.
+    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_recorded_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for value in self.results.values_mut() {
+            f(core::slice::from_mut(value))?;
+        }
+        for value in self.exits.values_mut() {
+            f(core::slice::from_mut(value))?;
+        }
+        Ok(())
+    }
+
     /// Whether `pid` is a process this runtime spawned an engine for.
     pub(crate) fn contains(&self, pid: ProcessId) -> bool {
         self.engines.contains_key(&pid)
