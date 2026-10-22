@@ -305,6 +305,39 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
   only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
+### When a free actually unmaps (pointer-invalidation map)
+`Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
+`CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
+`ReservedHeap::drop` (reserved_heap.rs:429) and `RefcBinary::drop` (binary.rs:512) go through the same
+free path, as do `ReservedHeap::relocate`'s retired block (reserved_heap.rs:249 → `free_block`, :401)
+and `RefcBinary`'s moving grow (binary/growth.rs:426).
+- **Block bytes ≤ 1024 B (a `Heap` of ≤ 128 words):** slab block back on its class free list
+  (`return_block`, core.rs:544+); the slab carrier is **never released** → memory stays mapped and
+  unzeroed, so a stale term silently aliases the next owner's words. No SIGSEGV from this arm.
+- **1025 B … 524 287 B (129 …= 65 535 words):** a block of a pooled variable-size MBC carrier; freeing
+  coalesces in place (`mbc.rs::dealloc`), the carrier is destroyed **only when it is fully free**
+  (core.rs:508-520) → `Carrier::unmap`.
+- **≥ 524 288 B (≥ 65 536 words — `policy.sbct`, policy.rs:461-462 + `uses_single_block_carrier`,
+  policy.rs:607-609, `size >= sbct`):** a dedicated single-block carrier → `Carrier::unmap` on free
+  (core.rs:527-536).
+- Either `unmap` (carrier.rs:227 = `drop(self)`) ends in `Segment::drop` (mseg/header.rs:250) →
+  `MsegInner::release` (mseg/state.rs:142): with the default `cache: true, max_cache_size: 10`
+  (mseg/config.rs:98-100) the segment is **pushed on the reuse cache (still mapped, still unzeroed)**
+  and only the **oldest** cached segment is `munmap`ed (`destroy` → `os_unmap`, mseg/state.rs:119-137,
+  mseg/mapping.rs:104) once the cache is full — i.e. the mapping in question is not necessarily the one
+  being freed. `MsegState::drop`/`purge_cache` never runs in production (the `mseg()` handle is a
+  `LazyLock` static, carrier.rs:104-107) and `clear_cache()` has no production caller, so **FIFO
+  eviction is the only munmap trigger**. Proof-by-test: carrier.rs:481-508 asserts `cached_segments ==
+  1` / `mapped_segments == 1` right after `unmap`, and 0 only after `clear_cache()`.
+- One extra unmapping path that bypasses eviction: reusing a cached segment that is a *bad fit*
+  tail-trims it (`take_cached`, mseg/state.rs:186-206) and munmaps the trimmed tail — so a pointer past
+  the new size faults even though the segment was "recycled".
+- `AllocatorState::drop` (allocator/state.rs:257) releases every carrier the allocator still holds (each
+  into the same global cache); it runs only for a non-registry allocator — the 12 registry allocators
+  are `static` and never dropped.
+- This crate holds **no `Vec<Eterm>`/scratch term buffer**: every `Vec` here is bookkeeping
+  (`AllocatorState::{carriers, mbcs, by_base, mbc_by_base}`, `MsegInner::cache`, `SizeClasses::classes`,
+  `AllocatorInfo::items`), so no term can be handed out of a Rust-collection allocation.
 - A `Heap` allocates through the **untyped** `Allocator::alloc` path (`alloc_bytes` → `alloc_impl(_, None)`),
   so per-type `TypeStats` rows do **not** attribute process heaps; read the aggregate counters
   (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
