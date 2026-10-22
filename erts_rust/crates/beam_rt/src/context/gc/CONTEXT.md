@@ -59,6 +59,12 @@ The latch's two halves split by **root-set completeness**: a door that hands the
 The gate a `beam_process` signal site consults is built from the runtime's **one** shared latch cell (`RuntimeCollectionGate::from(latch)`), so a decision is `O(1)` while the pid's bit is clear; the no-latch `RuntimeCollectionGate::new()` form (which always descends) is `#[cfg(test)]`-only.
 A term in a foreign region (pooled BIF heap, arena, `-eval` heap, message fragment) declines the collection only when it forwards a scanned word — **not** a foreign term that forwards nothing (see phase 1 above) — and never a registered-BIF result, which `call_registered` copies onto the running process's heap and rewinds the pool to the call's own `mark`, making it a scanned root rather than a foreign holder.
 
+### The root-set hand-off widths (no clamp ever binds; one width per door)
+Every door takes the machine's own slices from `Machine::with_roots`, which hands `x[..used_x_extent()]` / `fr[..used_fr_extent()]` (`beam_engine/src/machine/mod.rs:857-863`), and `used_extent = mark.max(dirty).min(len)` (`beam_engine/src/machine/registers.rs:108-110`), so `used_fr_extent() >= fr_mark()`.
+The reds door's `let fr_count = fr_count.min(roots.fr.len())` (`gc/reds_door.rs:252`) therefore never binds: the runner passes `engine.machine.fr_mark()` (`runner/run.rs:1221`, `:1295`, `:1313`), which is always inside the handed slice.
+`publish_roots_full`/`scatter_roots_full` apply the *same* clamp (`gc.rs:801`, `:846`), so one hand-off's two halves can never disagree on the published FR length — the `false`-halts-collection-forever hazard the door's doc warns about is unconstructible from these call sites.
+The **x** width is the one a door deliberately chooses: `ensure_heap_full`/`alloc_words_rooted` publish `roots.x` in full (`publish_roots_full` ignores `RootSet::live`), while the narrow `ensure_heap` publishes `x_regs.len().min(MAX_REG)` over an x-only slice and no FR file (`gc.rs:1177-1183`, `publish_roots`).
+
 ### Debt/valve cost of the admission doors
 `collection_debt()` is folded into both doors' occupancy OR, so a growth-retired chain makes the full door evaluate `any_root_is_unscanned` on **every** admission point even when the *current* space has room.
 The per-word `root_is_unscanned` classifies in **two tiers** (`gc.rs::word_is_scanned` / `outside_bounds`).
