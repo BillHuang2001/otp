@@ -44,7 +44,7 @@ The `TableRegistry` is installed from **two** sources, in precedence order:
 The copy-out has **two** destinations, chosen by who is running (`calls.rs::rehome_container_result`): a scheduled process gets the result on its own **scanned** young heap (`move_result_into_process_heap`), while the **table-less** route (the `-eval` evaluator, `-s`/`-run` and every single-pass `run_*` entry) copies it onto the runtime's long-lived `Runtime::eval_heap` + `Runtime::eval_off_heap` store (`pool.rs::move_result_into_runtime_store`).
 The process arm is **hinted**: the largest graph this context has been refused for is remembered
 (`RuntimeContext::copy_out_hint`, learned from the copier's own shortfall) and a destination with
-fewer free words than the hint (plus a margin) is grown — through the NO-RELOCATION
+fewer free words than the hint (plus a margin) is grown — **only while the process's root set is complete**, i.e. `!Process::is_relocation_exempt()` (`gc::may_replace_young_space`, the one predicate every growth site consults) — through the NO-RELOCATION
 `Process::grow_nursery` — **before** the attempt, so a copy-bound loop does not pay a refusal's
 five-traversal sizing walk per op; `hint == 0` (a context's first copy-out) takes the unhinted
 path, and the grow-and-retry fallback always applies (`calls.rs::hint_grow_gate`).
