@@ -32,6 +32,12 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
    still be structurally legal.
 4. All leaves are at the same depth. 5. The leaf chain visits every leaf exactly once, left to right.
 
+## Aliasing & term lifetime (what the tree owns vs. what it only points at)
+The interior owns **no term storage at all**: an [`Entry`] is two `Eterm` *handle* words (`node.rs:84-90`) and a branch holds `Vec<Eterm>` separators + `Vec<NodeId>` children. Every object payload lives in `crate::store::TermStore`; every stored `key`/`obj` word is either an immediate or a pointer into table-owned storage (`Entry.key` aliases element `keypos-1` of its own stored object tuple, derived by `Table::insert_stored` from the *table-owned copy*, `table/mod.rs:554-555`).
+Consequence: a split, a merge, a borrow, a separator rewrite, a `Vec::insert`/`remove`/`split_off`/`shrink_to_fit`/`trim_vec` and a whole-arena `NodeStore::compact` move **handle words only** — they can never relocate, copy or invalidate the terms those handles name, and no `Eterm` this module hands out ever points into interior-owned memory.
+So the tree cannot be the site of a use-after-free; it can only be the **victim** of one: its stored `key` words are dereferenced by `cmp_arith` on every descent (`search_entries`/`child_index`), so if a term the tree still holds is freed in `TermStore` (whose free lists reuse runs of the *exact* same word count, `store/mod.rs:413-424`, `477-486`) the next lookup reads overwritten words. The store's frees are ordered after the index mutation at every call site (`insert_stored` frees only after the replacing insert; `delete`/`delete_object` free after the interior removed the entry).
+The one window where an entry holds a **non-table-owned** term is the `Interior::update_counter`/`update_element` defaults (`table/interior.rs:280-331`): they build the replacement object on the caller's `beam_alloc::Heap` and insert it (with the caller's `key`) *before* `Table::relocate_rebuilt_object` (`table/element.rs:273-307`) deep-copies it into the store and re-inserts it with the table-owned key. It is transient — both steps run inside one `Table::update_*` call and a `beam_alloc::Heap` block never moves, only rewinds — but no other entry in the tree is ever anything but a `TermStore` alias.
+
 ## Design Decisions
 - **Separators are always re-materialised from the rightmost live leaf** via
   `NodeStore::subtree_max_key`, never read back from `branch.keys` to construct one: an `ets:insert`
