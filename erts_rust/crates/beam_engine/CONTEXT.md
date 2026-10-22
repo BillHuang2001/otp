@@ -191,6 +191,20 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
 - **A map `is_eq_exact` costs O(k log k) and two heap `Vec`s per comparison** (no map fast path in `eval_test`; `beam_term`'s `cmp_maps` collects and re-sorts both maps' pairs) -- detail: `src/families/maps/CONTEXT.md`.
 - **Small-int arithmetic (`+ - *`, `band`/`bor`/`bsr`) is inlined only by the native baseline tier**; the **interpreter has no arithmetic fast path** -- every `gc_bif` goes out through `exec_bif` -> `ExecutionContext::call_bif` -- detail: `src/interpreter/CONTEXT.md`.
 - **A captured stacktrace is engine-derived unless the raise supplied one** — a derived trace is cooked from the raise-time `raise_snapshot`, a supplied one (symbolic frames, or the trace term of a re-raised exception) is preserved verbatim and no re-raise-site frame is prepended — **and nameable atoms are required** (`catch_end` needs `EXIT`; no path substitutes a *different* atom). Detail: the two bullets below, `src/families/exceptions/CONTEXT.md`.
+- **`Instr::RawRaise` violates the reserve -> read -> write ordering: it re-raises with the pre-collection `x(1)` word.**
+  `src/families/exceptions/mod.rs:356` reads `value` out of `x(1)`, `:380` calls `symbolic_stacktrace`, whose reservation
+  (`src/families/exceptions/stacktrace.rs:248` -> `terms::reserve_slack` -> `Machine::alloc_rooted` -> `alloc_words_rooted`)
+  may **collect and move** every root, and `:384` then hands the stale `value` to `Machine::raise_supplied`. `x(1)` is inside
+  the `RootSet`, so the machine relocates it and only the Rust local goes stale: the landed `x(1)`
+  (`land_exception`, `src/machine/catch.rs:631`), `pending_exception`'s reason and an uncaught
+  `Raise::live_reason` all end up naming the abandoned space, which a later
+  `install_collapsed` / mature-space replacement (`beam_gc/src/nursery.rs:576-583`, `collector.rs:452`) frees and unmaps --
+  a dangling cons-cell pointer surfaces later as a `beam_term::list::car` fault. It fires on exactly the shape
+  `sys_core_fold` emits (`catch C:R:S -> erlang:raise(C,R,S)`) whenever the landed exception was engine-derived, i.e. its
+  `x(2)` is `NIL` (only that branch allocates). Every other arm keeps the ordering (`raise_error_tuple` reads inside the
+  reader closure, `raise.rs:66`; `catch_end` re-reads `x(1)`/`x(0)` after its reservation, `mod.rs:268`; `failed_clause_arglist`,
+  `src/interpreter/dispatch.rs:1460`). Fix: move the `x(1)`/`x(2)` reads after the cooking (or re-read them from the machine),
+  never reuse the pre-reserve words.
 - **The uncaught frames exist only for a `BeamError::Raise`** (`beam_common`'s reason variants are fieldless and carry no `StackTrace` slot).
 - **Records.** The whole native-record set executes; `PutRecord`'s create form works for the running module's own `Recs` and for a **foreign** `{Module,Name}` id through `foreign_record_definition` (exported definitions only, else the C's `error:{badrecord, Id}` raise), with the `Ok(None)` host keeping the typed `unsupported` and no `code:ensure_loaded/1` trap. Two divergences in that family are open: `is_record_accessible`'s wildcard arm compares the definition module against the `Scope` **operand** where `emu/ops.tab:1675` substitutes `$MODULE`, and `put_record`-update / `update_record_id` / `get_record_field` raise `function_clause` where the C's `$FAIL_HEAD_OR_BODY` `NO_FAIL` path raises `{badfield,…}`/`{badrecord,…}`. Detail: `src/families/records/CONTEXT.md`, `tests/gaps.rs`.
 - **Bitstrings.** `bs_init_writable` builds 0 bits over a capacity-carrying refc payload (the `x(0)` hint, else `DEFAULT_WRITABLE_SIZE = 1024`) registered writable **on the machine**; a **first-position** `private_append` appends **in place** and an outgrown payload **grows**, so the accumulator loop is amortised (64 KiB from a 1 KiB hint: 2 grows + 4 moves, 61 440 bytes copied -- `create/grow_tests.rs`); every other shape promotes to the byte-identical copy-rebuild.
