@@ -58,10 +58,11 @@
 //!   *measured* rate of two OR-ed gates (the 7/8 occupancy watermark and the growth seam's
 //!   collection debt, `crate::context::gc::reds_door`), so it is pinned as a band and never as a
 //!   nominal `checks / 8`; its **upper** edge is the structural half — the door may never collect
-//!   on more than one boundary in eight — and it is one notch *stricter* than the pre-policy-change
-//!   `checks / 7` because the space the watermark is measured against went from 1 220 to 2 585
-//!   words (next section), so a fixed-size slice's allocation is a smaller fraction of it and
-//!   crosses the watermark on fewer slice ends.
+//!   on more than one boundary in eight — and it is one notch *stricter* than a nominal `checks / 7`
+//!   because the settled space is sized from the shape's own live set (`young_minor_target_words(201)
+//!   = 376`, kept anywhere up to `8 x 376 = 3 008`, landing on **2 585** words — next section),
+//!   so a fixed-size slice's allocation is a smaller fraction of it and crosses the watermark on
+//!   fewer slice ends.
 //!   The door collects on **0.0525 / 0.0525 / 0.0532 calls**, i.e. **2.22 / 2.21 / 2.24 %** of a
 //!   run that collects 2.3628 / 2.3692 / 2.3755 times per call: a **constant** share, not a
 //!   rising one — the nursery's own capacity is constant (next section), so the allocation each
@@ -326,10 +327,10 @@ const MEASURED_YOUNG_CAPACITY: usize = 2_585;
 ///   i.e. **2.22 / 2.21 / 2.24 %** of the run's own collections. The upper edge is the
 ///   structural half — the door may never collect on more than one boundary in eight, because a
 ///   firing empties the space and `2 585 x 7/8 = 2 261.9` words of allocation have to accumulate
-///   before the watermark can be crossed again — and it is one notch *stricter* than the
-///   pre-policy-change `checks / 7`, not a widening of it: the space the watermark is measured
-///   against nearly doubled (1 220 → 2 585 words), so a fixed-size slice's allocation crosses it
-///   on fewer slice ends;
+///   before the watermark can be crossed again — and it is one notch *stricter* than a
+///   nominal `checks / 7`, not a widening of it: the settled space is the fixed point of
+///   `young_after_collection` for the shape's 201-word live figure (2 585 words, next bullet), so
+///   a fixed-size slice's allocation crosses it on fewer slice ends;
 /// * **the shape's own totals are a measured table** ([`MEASURED`]), pinned exactly per row:
 ///   4 728 / 325 at N = 2 000, 9 479 / 645 at N = 4 000 and 23 757 / 1 617 at N = 10 000, i.e.
 ///   **2.3628 / 2.3692 / 2.3755 collections and 0.1624 / 0.1612 / 0.1617 majors per call** —
