@@ -74,18 +74,18 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`, hence behind
   every term-allocation and heap-admission door on every tier) PARKS the machine's loose heap terms**
   (`Machine::loose_heap_terms`, in this order: `raise_function_clause_args`, `pending_function_clause_args`,
-  then `pending_exception`'s reason) **onto the tail of `self.stack`** for the duration of the hand-off, hands
-  over the `RootSet`, then **re-seats** each field from its slot (`self.stack.get(cursor).copied()` — the stack
-  is rooted in full, so a conforming host relocates the parked word and the engine reads the *moved* term back),
-  and finally `stack.truncate(base)`.
+  `pending_exception`'s reason, `pending_supplied_term`, `raise_supplied_term`) **onto the tail of
+  `self.stack`** for the duration of the hand-off, hands over the `RootSet`, then **re-seats** each field from
+  its slot (`self.stack.get(cursor).copied()` — the stack is rooted in full, so a conforming host relocates
+  the parked word and the engine reads the *moved* term back), and finally `stack.truncate(base)`.
   With every loose term `None` the `RootSet` is handed over **unmodified** (byte-identical fast path).
   A `None` read-back leaves its field untouched rather than clearing it (a host would have to move a slot out of
   the `&mut [Eterm]` it was handed to produce one).
   The source of truth for the parked set is the pair `Machine::loose_heap_terms`/`Machine::seat_loose_heap_terms`
   plus the parking loop `Machine::with_parked_loose_terms`, so a future loose field is added in exactly one place.
-  The supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
-  need no rooting either — nothing allocates between `raise_supplied` arming one and `throw_with_trace`
-  promoting it, and the promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
+  The `Option<StackTrace>` pairs (`pending_supplied_trace`/`raise_supplied_trace`) are **metadata**, never a
+  heap term, so they are not parked; both **term** pairs are — the failed-clause pair and the
+  supplied-trace pair — so neither depends on an "allocation-free window" argument any more.
   **`Machine::pending_exception` IS parked**, so its reason is a live root at every door: a word a host reads from
   the field has already been relocated by every collection that preceded the read, which is what makes `beam_rt`'s
   park publication (`Registers::extra_roots`, read back through `Machine::pending_exception_mut`) and the in-crate
@@ -97,16 +97,16 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   **Parking is unconditional** — an *immediate* reason (the common `function_clause`/`badarith` atoms, which no
   collector can move) is parked too, keeping one uniform rule instead of a tag test at the door. Consequence: the
   byte-identical no-loose-term fast path is unavailable for the **rest of a run that has caught an exception**
-  (`pending_exception` is cleared only by `Machine::reset`/the next raise), so every later door pays at most three
+  (`pending_exception` is cleared only by `Machine::reset`/the next raise), so every later door pays at most five
   extra option reads plus the push/get/truncate of the armed words. Gate the reason slot on
   `beam_term::is_immediate` in `Machine::loose_heap_terms` if a measurement ever shows that cost.
   **Host hand-off invariant (publish at a park → scatter at the resume).** The slice a host receives is
-  `roots.stack.len() == machine.stack.len() + armed_loose_terms`, and `armed_loose_terms` is **0..=3 and
+  `roots.stack.len() == machine.stack.len() + armed_loose_terms`, and `armed_loose_terms` is **0..=5 and
   state-dependent** (`loose_heap_terms`: `raise_function_clause_args`, `pending_function_clause_args`,
-  `pending_exception`'s reason), so a publish/scatter pair is length-correct only while **nothing touched the
-  machine in between** — no instruction ran, no raise landed (`throw_with_trace` sets
-  `pending_exception`/`raise_function_clause_args`, `catch.rs`), no `Machine::reset` (which clears all three
-  *and* `stack`).
+  `pending_exception`'s reason, `pending_supplied_term`, `raise_supplied_term`), so a publish/scatter pair is
+  length-correct only while **nothing touched the machine in between** — no instruction ran, no raise landed
+  (`throw_with_trace` sets `pending_exception`/`raise_function_clause_args`/`raise_supplied_term`, `catch.rs`),
+  no `Machine::reset` (which clears all five *and* `stack`).
   A host **cannot** compute or check that count: `loose_heap_terms`/`LOOSE_HEAP_TERMS`/the two clause latches are
   private (`pending_exception`'s presence is the only observable part) and `Machine::stack_depth()` is
   unreachable from inside the closure (the machine is mutably borrowed).
