@@ -97,7 +97,24 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   byte-identical no-loose-term fast path is unavailable for the **rest of a run that has caught an exception**
   (`pending_exception` is cleared only by `Machine::reset`/the next raise), so every later door pays at most three
   extra option reads plus the push/get/truncate of the armed words. Gate the reason slot on
-  `beam_term::is_immediate` in `Machine::loose_heap_terms` if a measurement ever shows that cost.- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
+  `beam_term::is_immediate` in `Machine::loose_heap_terms` if a measurement ever shows that cost.
+  **Host hand-off invariant (publish at a park → scatter at the resume).** The slice a host receives is
+  `roots.stack.len() == machine.stack.len() + armed_loose_terms`, and `armed_loose_terms` is **0..=3 and
+  state-dependent** (`loose_heap_terms`: `raise_function_clause_args`, `pending_function_clause_args`,
+  `pending_exception`'s reason), so a publish/scatter pair is length-correct only while **nothing touched the
+  machine in between** — no instruction ran, no raise landed (`throw_with_trace` sets
+  `pending_exception`/`raise_function_clause_args`, `catch.rs`), no `Machine::reset` (which clears all three
+  *and* `stack`).
+  A host **cannot** compute or check that count: `loose_heap_terms`/`LOOSE_HEAP_TERMS`/the two clause latches are
+  private (`pending_exception`'s presence is the only observable part) and `Machine::stack_depth()` is
+  unreachable from inside the closure (the machine is mutably borrowed).
+  So a host must round-trip `roots.stack` verbatim and treat a length mismatch as a contract violation — never as
+  a licence to keep words the collector may have left stale.
+  `roots.x.len()`/`roots.fr.len()` (`used_extent`) can only **grow** between the two calls (any `set_x` on a
+  higher register raises `x_mark`), so a host must record the published lengths rather than recompute them.
+  The variance is pinned by `tests/raise_rooting.rs::the_latch_free_run_hands_over_an_unmodified_root_set`
+  (one identical frame shape: 2 stack words unarmed, 4 with a raise armed).
+- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
   (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
   `Machine::set_continuation` write), `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
