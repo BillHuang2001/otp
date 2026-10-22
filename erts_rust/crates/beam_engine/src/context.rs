@@ -166,6 +166,19 @@ use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::machine::Machine;
 
+/// The arena's two **reclaim tiers** (`src/context/reclaim.rs`): the `HeapMark` rewind
+/// ([`ContextHeap::rewind`] / [`MinimalContext::heap_rewind`]) and the copying collapse
+/// ([`ContextHeap::reclaim`] / [`MinimalContext::reclaim_heap`]).
+///
+/// Both are **additive**: they change no allocation policy, are never invoked
+/// automatically, and leave [`MinimalContext::alloc_words`](ExecutionContext::alloc_words),
+/// `alloc_words_rooted`, [`ensure_heap`](ExecutionContext::ensure_heap) and
+/// [`heap_available`](ExecutionContext::heap_available) byte-identical. Each one is a
+/// *caller-asserted* operation — see the report types and the two doors for the liveness
+/// contract a host must establish first.
+mod reclaim;
+pub use reclaim::{HeapReclaim, HeapRewind};
+
 /// The mailbox/message-receive seam: the receive opcode family's host interface.
 ///
 /// One method per receive opcode group; `beam_engine` drives them at instruction
@@ -1420,7 +1433,7 @@ const HEAP_COMMIT_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
 /// `alloc_words` **may not move** a word it has handed out. That is the same
 /// "valid until the next `ensure_heap`" stability contract the trait documents (in
 /// this context `ensure_heap` never moves anything, so a pointer is valid until the
-/// context is dropped).
+/// arena is discarded).
 ///
 /// A single [`ReservedHeap`] cannot satisfy that once its reservation is exhausted:
 /// its only way forward is [`ReservedHeap::relocate`], which **moves the whole live
@@ -1446,18 +1459,52 @@ const HEAP_COMMIT_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
 /// did not move, so the retry lands on the same region. Only when the whole
 /// *reservation* is exhausted ([`GrowOutcome::MoveRequired`]) is a fresh, doubled
 /// region created and pushed; every earlier region stays alive and unmoved for the
-/// context's lifetime.
+/// arena's lifetime.
+///
+/// # The two reclaim tiers (never automatic)
+///
+/// Nothing here reclaims *by itself*: the growth path above never truncates, resets or
+/// reallocates a region, so `alloc_words` hands out words until the arena is dropped. Two
+/// **caller-invoked** doors exist beside it (see `src/context/reclaim.rs`), and each one
+/// makes a liveness claim the arena cannot check:
+///
+/// * [`rewind`](ContextHeap::rewind) moves the frontier's bump pointer back to a
+///   [`HeapMark`] and drops every later region — sound only when nothing reachable lies
+///   at or above the mark;
+/// * [`reclaim`](ContextHeap::reclaim) **copies** the live graph into one fresh region
+///   through [`beam_gc`]'s relocator and drops every old region — sound only when the
+///   forwarded root set really is the whole live set.
+///
+/// A region's `Drop` (the arena being dropped, or a rewind/reclaim dropping it) is the
+/// **only** path that returns the carrier's memory: [`ReservedHeap::reset`] merely moves
+/// the bump pointer back and frees nothing.
 struct ContextHeap {
-    /// Every region ever handed out, oldest first. The **last one is the allocation
-    /// frontier** (`regions.len() - 1` is the current-region index); the `Vec` only
-    /// ever grows, so no region is freed — and no word moves — before the context is
-    /// dropped.
+    /// Every region handed out, oldest first. The **last one is the allocation frontier**
+    /// (`regions.len() - 1` is the current-region index). The `Vec` grows on allocation
+    /// and shrinks **only** through the two caller-invoked reclaim tiers
+    /// ([`rewind`](ContextHeap::rewind) truncates it, [`reclaim`](ContextHeap::reclaim)
+    /// replaces it with a single survivor); nothing else frees a region, so no word moves
+    /// before then.
     regions: Vec<ReservedHeap>,
     /// The first region's reservation geometry, and the floor every later region's
     /// reservation doubles up from.
     reserve_words: usize,
     /// The words committed up front in a region.
     commit_words: usize,
+    /// The arena's **mark epoch**, bumped by every successful
+    /// [`rewind`](ContextHeap::rewind) and [`reclaim`](ContextHeap::reclaim).
+    ///
+    /// A [`HeapMark`] carries the epoch it was taken in, so a mark taken *before* a rewind
+    /// is refused afterwards **even when** its region index, base address and used figure
+    /// happen to line up with the new frontier again — the words written in between were
+    /// discarded, so a silent accept would let the caller rewind over live terms. `0` is a
+    /// fresh arena (nothing has been rewound or reclaimed yet), which is also
+    /// [`HeapMark::EMPTY`]'s epoch.
+    epoch: u64,
+    /// The words the two reclaim tiers have taken back out of the arena's live accounting,
+    /// summed over the arena's whole life. `stats()` adds this to `Σ regions[i].used()` so
+    /// that [`ContextHeapStats::used_words`] stays *cumulative demand* across a rewind.
+    released_words: usize,
 }
 
 impl ContextHeap {
@@ -1469,6 +1516,8 @@ impl ContextHeap {
             regions: Vec::new(),
             reserve_words: HEAP_RESERVE_WORDS,
             commit_words: HEAP_COMMIT_WORDS,
+            epoch: 0,
+            released_words: 0,
         }
     }
 
@@ -1481,6 +1530,8 @@ impl ContextHeap {
             regions: Vec::new(),
             reserve_words,
             commit_words,
+            epoch: 0,
+            released_words: 0,
         }
     }
 
@@ -1530,17 +1581,24 @@ impl ContextHeap {
     /// two allocations — it never allocates, never moves a word and never changes the
     /// allocation policy. The public door is
     /// [`MinimalContext::heap_stats`].
+    ///
+    /// `used_words` stays **cumulative demand** across a reclaim
+    /// ([`rewind`](ContextHeap::rewind)/[`reclaim`](ContextHeap::reclaim)) because the
+    /// words the tier took back are counted in `released_words` and added on;
+    /// `live_words` is the honest "words handed out right now" figure that *does* fall.
     fn stats(&self) -> ContextHeapStats {
         let mut stats = ContextHeapStats {
             regions: self.regions.len(),
+            released_words: self.released_words,
             ..ContextHeapStats::default()
         };
         for region in &self.regions {
             stats.reserved_words += region.reserved_words();
             stats.committed_words += region.committed_words();
-            stats.used_words += region.used();
+            stats.live_words += region.used();
             stats.peak_words += region.peak_used();
         }
+        stats.used_words = stats.live_words + self.released_words;
         if let Some(frontier) = self.regions.last() {
             stats.frontier_used = frontier.used();
             stats.frontier_available = frontier.available();
@@ -1549,7 +1607,8 @@ impl ContextHeap {
     }
 
     /// The **mark** of the current allocation frontier: its region index, its base
-    /// address and its [`used`](ReservedHeap::used) figure.
+    /// address, its [`used`](ReservedHeap::used) figure and the arena's current mark
+    /// epoch.
     ///
     /// [`HeapMark::EMPTY`] while no region has been reserved (a heap that has never
     /// allocated), so an empty mark is the "nothing was handed out yet" value a caller
@@ -1566,28 +1625,36 @@ impl ContextHeap {
                     region: Some(len - 1),
                     base: frontier.base() as usize,
                     used: frontier.used(),
+                    epoch: self.epoch,
                 }
             }
         }
     }
 
-    /// Whether `mark` still names **this** heap's current frontier region, and was taken
-    /// at or before the frontier's current [`used`](ReservedHeap::used) figure.
+    /// Whether `mark` still names **this** heap's current frontier region, was taken in
+    /// the arena's current epoch, and was taken at or before the frontier's current
+    /// [`used`](ReservedHeap::used) figure.
     ///
-    /// `true` means the region the mark was taken in has not been replaced and the bump
-    /// pointer has not gone backwards — the structural precondition for the mark to be
-    /// usable at all. `false` means the mark is **stale** (the region it named has since
-    /// been replaced by a fresh frontier region, so its words are still live but no longer
-    /// the allocation frontier) or **forward** (it claims more words than the frontier has
-    /// handed out — a mark from another heap, or a corrupted one).
+    /// `true` means the region the mark was taken in has not been replaced, no reclaim has
+    /// run since it was taken, and the bump pointer has not gone backwards — the structural
+    /// precondition for the mark to be usable at all. `false` means the mark is **stale**
+    /// (the region it named has since been replaced by a fresh frontier region, so its words
+    /// are still live but no longer the allocation frontier), **forward** (it claims more
+    /// words than the frontier has handed out — a mark from another heap, or a corrupted
+    /// one) or **pre-reclaim** (a [`rewind`](ContextHeap::rewind)/[`reclaim`](ContextHeap::reclaim)
+    /// has run since it was taken, so the words above it are gone).
     ///
-    /// A [`HeapMark::EMPTY`] mark matches **only** a heap that still has no region: once a
-    /// region exists, "no region existed yet" says nothing about the frontier that
-    /// appeared, so the conservative answer is `false`.
+    /// A [`HeapMark::EMPTY`] mark matches **only** a heap that still has no region *and* has
+    /// never been rewound or reclaimed (its epoch is `0`): once a region exists, "no region
+    /// existed yet" says nothing about the frontier that appeared, so the conservative
+    /// answer is `false`.
     ///
     /// This is a **precondition check, not a permission**: a matching mark still does not
     /// make a rewind sound (see [`HeapMark`]).
     fn mark_matches(&self, mark: HeapMark) -> bool {
+        if mark.epoch != self.epoch {
+            return false;
+        }
         match mark.region {
             None => self.regions.is_empty(),
             Some(index) => match self.regions.get(index) {
@@ -1713,16 +1780,19 @@ impl ContextHeap {
 ///
 /// # `used_words` is CUMULATIVE DEMAND, not live memory
 ///
-/// Regions are never freed, never shrunk and never reset (see [`MinimalContext`]'s
-/// [`ContextHeap`] docs — a rewind would invalidate every pointer the engine already
-/// holds), so [`used_words`](ContextHeapStats::used_words) is the **total** number of
-/// words ever handed out across the whole life of the context. It is a lower bound on
-/// the memory the arena holds and an upper bound on nothing: a run that allocated and
-/// discarded terms leaves `used_words` at its high-water figure forever, so this is
-/// **not** a live-memory reading and must not be compared with a collector's heap size.
-/// [`peak_words`](ContextHeapStats::peak_words) is the summed per-region high-water mark
-/// (`used_words == peak_words` whenever no region was reset, which is the only state a
-/// [`MinimalContext`] can reach).
+/// Nothing here reclaims by itself: allocation grows the arena and never frees, shrinks or
+/// resets a region (see [`ContextHeap`]'s docs — both reclaim tiers are explicit,
+/// caller-invoked operations). So [`used_words`](ContextHeapStats::used_words) is the
+/// **total** number of words ever handed out across the whole life of the context. It is a
+/// lower bound on the memory the arena holds and an upper bound on nothing: a run that
+/// allocated and discarded terms leaves `used_words` at its high-water figure forever, so
+/// this is **not** a live-memory reading and must not be compared with a collector's heap
+/// size. A reclaim ([`MinimalContext::heap_rewind`]/[`MinimalContext::reclaim_heap`]) keeps
+/// it unchanged by definition: the words it takes back are counted in
+/// [`released_words`](ContextHeapStats::released_words) and added on.
+///
+/// [`live_words`](ContextHeapStats::live_words) is the honest counterpart — the words the
+/// regions hold *right now* — and it does fall on a reclaim.
 ///
 /// # Why the arena reports an unbounded `heap_available`
 ///
@@ -1734,46 +1804,61 @@ impl ContextHeap {
 /// because the engine's `ensure_heap` is a no-op here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ContextHeapStats {
-    /// How many regions have been reserved (the first one lazily, on first
-    /// allocation; every later one when the previous **reservation** was exhausted).
-    /// `0` means the context has never allocated a word.
+    /// How many regions are currently held (the first one lazily, on first
+    /// allocation; every later one when the previous **reservation** was exhausted). It
+    /// falls again only when a reclaim drops regions. `0` means the context holds no word.
     pub regions: usize,
-    /// The reservation's total size in `Eterm` words, summed over every region. This is
-    /// **address space**, not resident memory: a reservation is one anonymous
-    /// (lazily-faulted) `mmap` per region.
+    /// The reservation's total size in `Eterm` words, summed over the regions currently
+    /// held. This is **address space**, not resident memory: a reservation is one
+    /// anonymous (lazily-faulted) `mmap` per region, released when that region is dropped.
     pub reserved_words: usize,
-    /// The total committed slice in `Eterm` words, summed over every region — the words
-    /// the bump allocators may hand out without growing a region first.
+    /// The total committed slice in `Eterm` words, summed over the regions currently held
+    /// — the words the bump allocators may hand out without growing a region first.
     pub committed_words: usize,
-    /// The total number of words **ever handed out**, summed over every region.
+    /// The total number of words **ever handed out**, summed over every region the arena
+    /// has held across its whole life.
     ///
-    /// **Cumulative demand, not live memory**: regions are never shrunk or reset, so this
-    /// figure only ever grows and includes terms the engine has already discarded (see
-    /// the type docs).
+    /// **Cumulative demand, not live memory**: this figure only ever grows and includes
+    /// terms the engine has already discarded *and* the words a reclaim has taken back (see
+    /// the type docs). Read [`live_words`](ContextHeapStats::live_words) for the current
+    /// figure.
     pub used_words: usize,
-    /// The summed per-region high-water mark of
-    /// [`used`](ContextHeapStats::used_words). Equal to
-    /// [`used_words`](ContextHeapStats::used_words) for every state a [`MinimalContext`]
-    /// can reach, because nothing here ever rewinds a region.
+    /// The words the regions **currently hold** — `Σ regions[i].used()` — i.e. the words
+    /// handed out and not since released.
+    ///
+    /// This is the one figure that falls on a reclaim; `used_words - live_words` is
+    /// [`released_words`](ContextHeapStats::released_words).
+    pub live_words: usize,
+    /// The words a reclaim ([`MinimalContext::heap_rewind`] or
+    /// [`MinimalContext::reclaim_heap`]) has taken back out of the arena, summed over the
+    /// arena's whole life. `0` until the first successful reclaim, and it only ever grows
+    /// (a reclaim that finds nothing to do does not run).
+    pub released_words: usize,
+    /// The summed per-region high-water mark of [`used`](ContextHeapStats::live_words) over
+    /// the regions **still held**. Equal to
+    /// [`live_words`](ContextHeapStats::live_words) whenever no region was reset, which is
+    /// every state that has not been through a [`MinimalContext::heap_rewind`]; a rewind
+    /// lowers `live_words` while leaving the surviving frontier's peak alone, and dropping a
+    /// region drops its peak with it.
     pub peak_words: usize,
-    /// The frontier (newest) region's [`used`](ContextHeapStats::used_words) figure, or
-    /// `0` when no region has been reserved yet. This is the figure a
-    /// [`HeapMark`] records.
+    /// The frontier (newest) region's [`used`](ContextHeapStats::live_words) figure, or
+    /// `0` when no region is held. This is the figure a [`HeapMark`] records.
     pub frontier_used: usize,
     /// The words still available in the frontier region's committed slice, or `0` when no
-    /// region has been reserved yet. An allocation larger than this asks the frontier to
-    /// raise its committed limit in place (and only a request past the whole reservation
-    /// pushes a fresh region).
+    /// region is held. An allocation larger than this asks the frontier to raise its
+    /// committed limit in place (and only a request past the whole reservation pushes a
+    /// fresh region).
     pub frontier_available: usize,
 }
 
 /// A **mark** of a [`MinimalContext`]'s allocation frontier: the region it names, that
-/// region's base address and how many words it had handed out.
+/// region's base address, how many words it had handed out and the arena's mark epoch.
 ///
 /// Returned by [`MinimalContext::heap_mark`] and checked by
-/// [`MinimalContext::heap_mark_matches`]. It is a `Copy` value with private fields — the
-/// only ways to obtain one are [`HeapMark::EMPTY`] and `heap_mark()` — so a mark always
-/// describes a state this heap actually reached.
+/// [`MinimalContext::heap_mark_matches`]; [`MinimalContext::heap_rewind`] is the door that
+/// acts on one. It is a `Copy` value with private fields — the only ways to obtain one are
+/// [`HeapMark::EMPTY`] and `heap_mark()` — so a mark always describes a state this heap
+/// actually reached.
 ///
 /// # What a mark is for, and what it is NOT
 ///
@@ -1793,13 +1878,12 @@ pub struct ContextHeapStats {
 /// The arena cannot check that: it cannot tell a term slot from raw payload bytes
 /// (telling them apart needs term-structure knowledge this heap seam deliberately does
 /// not have — the same reason it never calls
-/// [`ReservedHeap::relocate`](beam_alloc::ReservedHeap::relocate)). So this type is
-/// deliberately **inert**: there is no `rewind`, no `reset_to` and no unsafe primitive
-/// behind it, only the marker and the typed predicate. The reachability proof — a walk
-/// over the machine's roots ([`Machine::for_each_root`](crate::machine::Machine::for_each_root))
-/// and the heap's regions
-/// ([`MinimalContext::for_each_heap_region`]) — is the caller's, and it is the whole
-/// reason a future rewind is a *caller* decision rather than an arena one.
+/// [`ReservedHeap::relocate`](beam_alloc::ReservedHeap::relocate)). So the mark itself is
+/// **inert**: it carries the observation and the typed predicate, and the reachability
+/// proof — a walk over the machine's roots
+/// ([`Machine::for_each_root`](crate::machine::Machine::for_each_root)) and the heap's
+/// regions ([`MinimalContext::for_each_heap_region`]) — is the caller's, which is why
+/// [`MinimalContext::heap_rewind`] is a *caller* decision rather than an arena one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeapMark {
     /// The index of the region the mark was taken in (`None` = no region existed).
@@ -1809,25 +1893,48 @@ pub struct HeapMark {
     base: usize,
     /// The marked region's `used()` figure at the moment of the mark.
     used: usize,
+    /// The arena's **mark epoch** at the moment of the mark — bumped by every successful
+    /// rewind/reclaim, so a mark taken before one is refused afterwards even when its
+    /// index, base and used figure happen to line up again.
+    epoch: u64,
 }
 
 impl HeapMark {
     /// The mark of a heap that has **not reserved a region yet**.
     ///
-    /// It matches only a heap that still has no region
-    /// ([`MinimalContext::heap_mark_matches`]): once a region exists, "nothing has been
-    /// handed out" is no longer a state the frontier can be in, so an empty mark is
-    /// reported as not matching rather than silently accepting a rewind to a state the
-    /// heap cannot be rewound to.
+    /// It matches only a heap that still has no region ([`MinimalContext::heap_mark_matches`]):
+    /// once a region exists, "nothing has been handed out" is no longer a state the
+    /// frontier can be in, so an empty mark is reported as not matching rather than
+    /// silently accepting a rewind to a state the heap cannot be rewound to. Its epoch is
+    /// `0`, the epoch of a fresh arena, so it also stops matching once the arena has been
+    /// through a rewind or a reclaim.
+    ///
+    /// [`MinimalContext::heap_rewind`] accepts an epoch-matching empty mark as the
+    /// **arena-reset** door: it drops every region the arena holds.
     pub const EMPTY: HeapMark = HeapMark {
         region: None,
         base: 0,
         used: 0,
+        epoch: 0,
     };
 
     /// How many words the marked region had handed out (`0` for [`HeapMark::EMPTY`]).
     pub fn used(&self) -> usize {
         self.used
+    }
+
+    /// The index of the region the mark was taken in, or `None` for [`HeapMark::EMPTY`]
+    /// (a heap that held no region when the mark was taken).
+    pub fn region(&self) -> Option<usize> {
+        self.region
+    }
+
+    /// The marked region's **base address** (`0` for [`HeapMark::EMPTY`]).
+    ///
+    /// The one property a *replaced* region cannot preserve, which is what makes a stale
+    /// mark detectable even when its index coincides.
+    pub fn base(&self) -> usize {
+        self.base
     }
 }
 
@@ -2088,13 +2195,19 @@ impl MinimalContext {
     }
 
     /// The region heap's **[`census`](ContextHeapStats)**: region count, reserved /
-    /// committed / used / peak words and the frontier's own two figures.
+    /// committed / live / cumulative / released / peak words and the frontier's own two
+    /// figures.
     ///
     /// Infallible, allocation-free (`O(regions)`) and read-only: it changes no allocation
     /// state, so it is safe to call between any two allocations (and from a test that
     /// needs to assert the growth path). Read
     /// [`ContextHeapStats::used_words`] as **cumulative demand**, never as live memory —
-    /// the arena never frees, shrinks or rewinds a region.
+    /// allocation never frees or shrinks a region, and a reclaim keeps the cumulative
+    /// figure unchanged by moving the words it takes back into
+    /// [`released_words`](ContextHeapStats::released_words).
+    /// [`live_words`](ContextHeapStats::live_words) is the current figure, and the one
+    /// that falls on a [`heap_rewind`](MinimalContext::heap_rewind) or
+    /// [`reclaim_heap`](MinimalContext::reclaim_heap).
     pub fn heap_stats(&self) -> ContextHeapStats {
         self.heap.stats()
     }
@@ -2105,19 +2218,22 @@ impl MinimalContext {
     /// inert by design: it lets a caller detect that the frontier region was replaced
     /// ([`MinimalContext::heap_mark_matches`]) and nothing more — a rewind additionally
     /// requires a proof that nothing reachable lies at or above the mark, which is the
-    /// caller's to establish (see [`HeapMark`]).
+    /// caller's to establish (see [`HeapMark`] and
+    /// [`heap_rewind`](MinimalContext::heap_rewind)).
     pub fn heap_mark(&self) -> HeapMark {
         self.heap.mark()
     }
 
     /// Whether `mark` still names this context's **current allocation frontier**, taken
-    /// at or before its current used figure.
+    /// at or before its current used figure and in the arena's current mark epoch.
     ///
     /// `false` for a **stale** mark (the region it recorded has since been replaced by a
     /// fresh frontier region), for a **forward** mark (it claims more words than the
-    /// frontier has handed out) and for [`HeapMark::EMPTY`] once a region exists. This is
-    /// the typed predicate a caller applies *before* trusting a mark; it grants no
-    /// permission to rewind, and there is no unsafe primitive behind it.
+    /// frontier has handed out), for a **pre-reclaim** mark (a
+    /// [`heap_rewind`](MinimalContext::heap_rewind)/[`reclaim_heap`](MinimalContext::reclaim_heap)
+    /// has run since it was taken) and for [`HeapMark::EMPTY`] once a region exists. This
+    /// is the typed predicate a caller applies *before* trusting a mark; it grants no
+    /// permission to rewind.
     pub fn heap_mark_matches(&self, mark: HeapMark) -> bool {
         self.heap.mark_matches(mark)
     }
@@ -2127,8 +2243,9 @@ impl MinimalContext {
     ///
     /// This is the census/reachability-walk door the region heap exposes: a caller that
     /// must survey every word the arena has ever handed out (a liveness proof for a
-    /// future rewind, a leak census, a memory-accounting sweep) walks the regions here
-    /// instead of holding raw pointers. Regions with no words handed out are skipped.
+    /// [`heap_rewind`](MinimalContext::heap_rewind), a leak census, a memory-accounting
+    /// sweep) walks the regions here instead of holding raw pointers. Regions with no
+    /// words handed out are skipped.
     ///
     /// # `visit` MUST NOT interpret the words as terms, and MUST NOT keep the slice
     ///
