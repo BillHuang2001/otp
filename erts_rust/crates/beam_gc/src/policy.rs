@@ -69,21 +69,46 @@ const VH_DEFAULT_SIZE_WORDS: usize = 32768;
 ///   often — and it is the fullsweep that applies one here, because a fullsweep is the one
 ///   collection that measures the **whole-heap** live set exactly;
 /// * a minor's figure is the **young-only** live set, an under-estimate of that whole, so a
-///   multiple of it would be a multiple of an under-estimate. One times the figure makes the
-///   nursery hold `target / per-iteration allocation` iterations of the mutator's own
-///   allocation, so the capacity stays **flat in N** at a constant live set: on the dependent
-///   `beam_rt` `boundary_cost` churn fixture the nursery settles at **1 220** words against an
-///   806-word iteration (1.5 iterations), and the fixture measures **1.73 collections per
-///   iteration** over its 2 001 calls (its heap-admission and boundary doors together) — the
-///   canonical table and the protocol are `beam_rt`'s.
+///   multiple of it would be a multiple of an under-estimate.
+///   One times the figure is the rule instead: the capacity a minor installs is
+///   `next_words(young live + reserve)` — a function of the live set, never of the fill the round
+///   reached — while [`HeapPolicy::young_after_collection`] keeps an existing capacity anywhere
+///   inside `[target, YOUNG_SHRINK_FACTOR × target]`, so the growth seam may step the nursery one
+///   growth-table entry at a time up to the last entry below that band's upper edge and the
+///   capacity then **stops**: a fixed point at a constant live set.
+///   Every minor promotes its surviving young words into the mature region, which
+///   [`HeapPolicy::mature_target_words`] sizes from `MATURE_TARGET_LIVE_MULTIPLE` × the room one
+///   fullsweep leaves behind (`live` + the nursery occupancy a promotion must fit in + the
+///   reserve), and [`HeapPolicy::mature_after_fullsweep`] applies the same shape of rule — grown
+///   onto that target below it, given back once the capacity exceeds four times it, kept
+///   otherwise.
+///   Both capacities are therefore functions of the live set alone, which is what makes the pair
+///   settle rather than ratchet on the call count.
 /// * a larger minor multiple would amortise further and is **excluded**: it moves the converged
 ///   young capacity off the live set's own curated size, which is exactly the figure the
-///   dependents pin (`beam_rt`'s `reds_door` reads the converged `heap_size` **610** =
-///   `young_minor_target_words(401)` at both N = 2 000 and N = 20 000, its `slice_charging`
-///   control **233** = `young_minor_target_words(0)`), and it would spend memory on an
-///   under-estimate. The 2× memory-for-amortisation trade therefore lives on the **mature** side
+///   dependents pin.
+///   On a 401-word live set those curated sizes are `young_target_words(401) =` **987** words (the
+///   fullsweep target) and `young_minor_target_words(401) =` **610** (the minor target, the keep
+///   band's lower edge), and `beam_rt`'s `reds_door` measures the nursery converging on the
+///   987-word fullsweep target at both N = 2 000 and N = 20 000, its `slice_charging` interpreter
+///   control reading the **233**-word floor (`young_minor_target_words(0)`).
+///   The 2× memory-for-amortisation trade therefore lives on the **mature** side
 ///   ([`MATURE_TARGET_LIVE_MULTIPLE`], where the same 2× buys a *run* of minors between
 ///   fullsweeps) and only one live-set multiple **2** is applied per generation.
+///
+/// **The settled figures are measured, not read off the rule.** Both capacities are stated above
+/// as rules, and the values a particular workload lands on are whatever those rules reproduce at
+/// its live set — so they move whenever a sizing rule moves, and quoting one here is a
+/// measurement of the *current* geometry rather than part of the contract.
+/// For the current geometry, the dependent `beam_rt` `boundary_cost` churn fixture holds one
+/// **2 585**-word young space and a **6 772**-word mature region at **2.36 collections per
+/// call** over its 2 001 calls (its heap-admission and boundary doors together).
+/// The young figure is the 2 586-word growth-table entry, *inside* the band around that fixture's
+/// own 376-word minor target (its iteration allocates 806 words, so 3.2 iterations of
+/// allocation); the mature one is `next_words(2 × (201 + 2 585 + 64)) = next_words(5 700) =
+/// 6 772`.
+/// The canonical table and the protocol are `beam_rt`'s (`src/runner/tests/boundary_cost.rs`) and
+/// are re-measured, never recomputed, whenever either rule changes.
 pub const YOUNG_TARGET_LIVE_MULTIPLE: usize = 2;
 
 /// The factor by which a nursery must exceed its live-set-derived target

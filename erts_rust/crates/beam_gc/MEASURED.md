@@ -820,10 +820,15 @@ Three independent probes, all on this tree. The fixtures are `beam_rt`'s
 in-flight tuple and does not grow with N. Every figure is a count or a capacity — no timing.
 
 **1. The boundary-door pin (`beam_rt`'s `reds_door`, interpreter tier, collected at the
-reduction/yield boundary between slices).** `heap_size` is **610 words at both N = 2 000 and
-N = 20 000**, with `peak_young_spaces = 1` and **9 / 89** collections (one per pre-emption) —
-flat in N, and the same capacity at both ends of a 10× range. 610 = `young_minor_target_words(401)`
-= `next_words(401 + 64)`, the target of the live set the boundary window actually holds.
+reduction/yield boundary between slices).** `heap_size` is **987 words at N = 2 000, 20 000 and
+200 000**, with `peak_young_spaces = 1` and **9 / 89 / 899** collections (one per pre-emption) —
+flat in N, and the same capacity at every point of a 100× range.
+987 = `young_target_words(401)` = `next_words(2 × 401 + 64)`, the **fullsweep** rule's target for
+the live set the boundary window actually holds: the first boundary's kind-pinned minor cannot be
+promoted into the 233-word initial mature region, so it escalates and the fullsweep installs that
+target, which every later minor keeps because 987 sits inside
+`[young_minor_target_words(401) = 610, 8 × 610 = 4 880]` — 610 is the band's lower edge, not the
+converged capacity.
 
 **2. The interpreter control of the slice-charging pin (`beam_rt`'s `slice_charging`).** At
 N = 2 000 it reports `heap_size = 233` — the process's `min_heap_words`, i.e.
@@ -860,7 +865,10 @@ rebuilds a 400-element tuple every iteration and samples `process_info(self(), h
 iteration, run as a release build of the runtime at four N values spanning 2 000 … 200 000 (a 100×
 range). Over those samples the **min** `heap_size` is **987** and the **max** **830 667** on the native
 baseline-JIT tier, and **2 586** / **134 530** with `BEAM_RT_TIER=interpreter`; the post-loop reading
-is **610** = `young_minor_target_words(401)` on **both** tiers. Both ends are flat in N — the min is
+is the collector's floor, **233** = `young_minor_target_words(0)`, wherever the run ends on a
+collected row (`slice_charging`'s N = 2 000 control, **233** on both tiers; a run that ends inside an
+uncollected burst reads that burst's chain sum instead — see "The CLI flatness probe and the burst
+residual"). Both ends are flat in N — the min is
 the capacity the policy installs, the max is the **chain-summed** capacity mid-burst (`Nursery::grow`
 retires spaces without moving terms), so the max is a burst-cycle fixed point rather than a leak. A
 single sample is not a measurement: one arbitrary iteration of the same run reports anything from
@@ -874,17 +882,25 @@ occupancy, peak mature **10 958** / 8 118, peak resident **15 143** words, fulls
 546 / 1 353, end state nursery 4 185 / 0 and mature 10 958 / 4 059.
 
 **3. The dependent runtime fixture that reads the same ratio at a much larger allocation per
-iteration** — `beam_rt`'s `boundary_cost` (release, read-only from here), whose N = 2 000 row reads
-`collections=3468 major=169 door_checks=904 door_collections=128 peak_young_spaces=1
-peak_young_capacity=1220 peak_mature_capacity=4185 peak_mature_used=4068`. That is **1.73 collections
-per iteration** for a **1 220**-word nursery carrying **1.5** iterations of allocation (1 220 / 806),
-and its boundary door fires **one collection per 7.06 checks** (`904 / 128`, inside the 7..9 watermark
-band its owner pins) at `904 / 2 001 = 0.452` checks per call.
+iteration** — `beam_rt`'s `boundary_cost` (release, read-only from here), re-measured on this tree.
+Its N = 2 000 row reads
+`collections=4728 major=325 door_checks=904 door_collections=105 peak_young_spaces=1
+peak_young_capacity=2585 peak_mature_capacity=6772 peak_mature_used=6712`. That is **2.36
+collections per call** for a **2 585**-word nursery carrying **3.2** iterations of allocation
+(2 585 / 806) and a **6 772**-word mature region, its boundary door firing **one collection per
+8.61 checks** (`904 / 105`, inside the 7..9 watermark band its owner pins) at
+`904 / 2 001 = 0.452` checks per call. Both capacities are the live-set rules' fixed points, not
+policy captions: the nursery sits at the 2 586-word growth entry *inside* the keep band around the
+fixture's 376-word minor target (`next_words(201 + 64)`), and the mature region is
+`next_words(2 × (201 + 2 585 + 64)) = next_words(5 700) = 6 772`; its owner's `MEASURED` table
+(`crates/beam_rt/src/runner/tests/boundary_cost.rs`) re-derives both from every row.
 
-**4. The suite those probes live in** is `beam_rt`'s: 1 805 passed / 1 failed / 4 ignored, the single
-failure being that fixture's own stale `MEASURED` table, which its owner re-derives. The two `beam_gc`
-pins inside it both pass — `reds_door` (converged `heap_size` **610** at N = 2 000 and 20 000) and
-`slice_charging` (interpreter control **233**).
+**4. The suite those probes live in** is `beam_rt`'s: 1 805 passed / 1 failed / 4 ignored when this
+section was written, the single failure being that fixture's own stale `MEASURED` table — its owner has
+since re-derived it, and `the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape`
+passes on this tree (row quoted above). The two `beam_gc` pins inside it both pass — `reds_door`
+(converged `heap_size` **987** at N = 2 000, 20 000 and 200 000) and `slice_charging` (interpreter
+control **233**).
 
 ### The CLI flatness probe and the burst residual
 
@@ -905,8 +921,9 @@ stays on the floor — 233 words, flat in N.
 
 **The interpreter tier** is pre-empted (~89 slices at N = 20 000), so between two boundary
 collections it allocates the whole slice's worth of garbage — ~266 000 words at N = 20 000 — with no
-collection possible in between. The capacity **at a collection** is the live-set figure (233 / 610,
-measured above and flat at every N); the process's own *final* reading is a **mid-burst** sample of
+collection possible in between. The capacity **at a collection** is the live-set figure (233 / 987 —
+the floor and the 401-word live set's fullsweep target, measured above and flat at every N); the
+process's own *final* reading is a **mid-burst** sample of
 a nursery chain whose length tracks the burst's allocation count, so it is level in N but not
 identical across N. It is the slice's allocation demand, not a nursery-policy quantity, and the next
 collection collapses the chain back onto the live-set target.
