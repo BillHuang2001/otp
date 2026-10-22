@@ -349,7 +349,13 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
   boot's idle arena is 97 681 kB in use of 97 948 kB) — the census, the arena/heap layout, the measured
   non-effect of a trim at the boot→action boundary (266 kB free there) and the fragmentation limit are in
   the module docs. `BEAM_RT_MEM_TRACE` prints the call's answer as one `[rt-mem] heap-release=…` line.
-- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `malloc.rs`, `timers.rs` (a min-heap of
+- `mailbox.rs` → the per-pid scan state, and the **fragment lifetime invariant** that makes a received term usable after `remove_message`.
+  A removed message's `Fragments` chain is *moved* into `MailboxState::retained_fragments` (`mailbox.rs:267-268`) — retention, never `Fragments::move_into`, which no site in the workspace calls.
+  **There is no release point:** `Runtime::mailboxes` is only ever `entry()`/`get()`/`get_mut()`ed, never removed, so every fragment a process ever removed stays alive for the runtime's lifetime (the field's own doc, "released when the process's scan state is", cannot be reached).
+  That absence *is* the soundness mechanism for a payload word that escaped the message (the process heap, a container built around a received subterm, the `seq_trace` label, an ETS `copy_struct` source), and it is also why a receiver collection leaves such a payload alone (`Target::Foreign`: `beam_gc/src/copy.rs:334-361` classifies anything outside the from-set verbatim and does not descend into it).
+  Consequence for any future cleanup: adding a `mailboxes.remove(pid)` on process death would be a use-after-free for every raw-word store.
+  The two `Process::receive(|_| true)` **dequeue** sites (`native/file_server.rs:342`, `native/net_kernel.rs:215`) bypass the retention entirely: they are sound only because the reply envelope they derive is deep-copied (`beam_message::copy::copy_struct` takes no source-heap argument, so a fragment-resident subterm is copied, never shared) inside the same loop iteration, while the `Message` binding is still alive.
+- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `malloc.rs`, `timers.rs` (a min-heap of
   absolute deadlines over `crate::hasher::FastHashMap` indexes, whose `prune_cancelled` reclaims
   non-head cancelled tombstones with a watermark heap rebuild), `nif.rs`, `hasher.rs`
   (the crate's one deterministic non-cryptographic `BuildHasher` — `FastHasher`/`FastBuildHasher`/
