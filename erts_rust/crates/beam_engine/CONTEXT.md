@@ -302,7 +302,8 @@ Still open: **#1** receive/message + cross-module suspension (`beam_rt`); **#6**
 The child `CONTEXT.md` files own the per-subsystem detail; this table only routes.
 - `src/` -> `lib.rs` (crate docs, module wiring, root re-exports, `prelude`), `context.rs` (both seams + `RootSet` + `MinimalContext` + the arena's `ContextHeapStats`/`HeapMark`/region-walk surface), `supplied_stacktrace.rs` (the public encoder), `step.rs`, `operand.rs`, `predicates.rs`, `error.rs`, `generic.rs`, `interpreter/`; see `src/CONTEXT.md`.
 - `src/bench/` -> the `#[cfg(test)]`-only in-process foreign-workload decomposition harness; see `src/bench/CONTEXT.md`.
-- `src/machine/` -> the `Machine` split (registers, frames, catch, run, location, context, drive) plus `for_each_root` (in `mod.rs`, beside `with_roots`) and its pins in `root_tests.rs`; see `src/machine/CONTEXT.md`.
+- `src/context/` -> the arena's two reclaim tiers (Tier A `heap_rewind`, Tier B `reclaim_heap`/`reclaim_heap_with_capacity`), the `HeapRewind`/`HeapReclaim` reports, the epoch/mark rules and the caller contracts; see `src/context/CONTEXT.md`.
+- `src/machine/` -> the `Machine` split (registers, frames, catch, run, location, context, drive) plus the root doors `for_each_root` (read-only census) and `for_each_root_mut` (relocating twin, one `with_roots` hand-off) in `mod.rs` beside `with_roots`, and their parity pins in `root_tests.rs`; see `src/machine/CONTEXT.md`.
 - `src/terms/` -> the crate's only raw-heap builder/reader carve (`reserve`/`Slack`/`Sink`); see `src/terms/CONTEXT.md`.
 - `src/jit/` -> the tier seam, `cache/`, `emitter/`, `baseline/`, `cranelift/` (feature-gated) and `bench/`; see `src/jit/CONTEXT.md` and its child nodes.
 - `src/families/` -> the `dispatch` seam plus the nine owning families; see `src/families/CONTEXT.md` and its child nodes.
