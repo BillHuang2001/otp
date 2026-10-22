@@ -267,6 +267,18 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   ever executed and only dropping the machine frees it. `Machine::new` itself (`mod.rs`) allocates both
   1024-word register files (8 KiB each) before the first run.
 
+## What the machine owns (and what it does not)
+`Machine` owns **no process heap**: its only non-term field storage is `Arc<Module>`/`Arc<LiteralArea>` handles plus
+`Vec`s of words, and every `alloc_words`/`alloc_words_rooted`/`ensure_heap*` call allocates into the caller's
+`ExecutionContext` (`MinimalContext.heap: ContextHeap` here; `beam_rt`'s collector in production).
+There is **no `impl Drop for Machine`** (the crate's only `Drop` is `jit::emitter::CodeBuffer`): dropping a machine
+drops `refc_binaries`' `RefcBinary` handles, each of which decrements and frees its payload only when it was the last
+handle (`beam_alloc/src/binary.rs:511`); `writable_payloads` is `(usize, usize)` metadata that frees nothing.
+`Machine::reset` frees **no heap word and no payload**, so a returned or host-held `Eterm` outlives a run but never
+outlives the `ExecutionContext` whose heap it was built in — a `ContextHeap` region is unmapped only on context drop.
+A **nested run on the same machine is destructive**: `run_label_outcome` calls `reset()` (`run.rs:388`) and nothing
+saves the outer frame; `resume_outcome`/`run_loop` is the only state-preserving entry (no re-entrancy guard exists).
+
 ## A frame's continuation slot is consumed by whoever follows it
 `Machine::take_continuation` (`frames.rs`) is the **one** read-and-clear: it reads the current frame's
 `Continuation` slot and resets it to `Continuation::Halt` in the same step (C's `RETURN()` macro does
