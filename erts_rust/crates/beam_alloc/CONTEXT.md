@@ -309,7 +309,7 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 `Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
 `CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
 `ReservedHeap::drop` (reserved_heap.rs:429) and `RefcBinary::drop` (binary.rs:512) go through the same
-free path, as do `ReservedHeap::relocate`'s retired block (reserved_heap.rs:249 → `free_block`, :401)
+free path, as do `ReservedHeap::relocate`'s retired block (reserved_heap.rs:253 → `free_block`, :401)
 and `RefcBinary`'s moving grow (binary/growth.rs:426).
 - **Block bytes ≤ 1024 B (a `Heap` of ≤ 128 words):** slab block back on its class free list
   (`return_block`, core.rs:544+); the slab carrier is **never released** → memory stays mapped and
