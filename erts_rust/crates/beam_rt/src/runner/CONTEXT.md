@@ -37,9 +37,18 @@ characterisation and figures are in `PERF.md`).
   `ProcessEntry::Fun::fun` (`entry.rs:81`) + `target`'s `LocalFunTarget::args`, `RunnerState::results`/
   `exits` (`entry.rs:345`/`:347` — the words are on `Runtime::eval_heap`, not the arena) and
   `ProcessEngine::machine`'s root slices (`Machine::with_roots`'s `RootSet`); none has a `&mut` getter.
-  `gather_off_heap_roots` (`entry.rs:490`) is the one `&mut` walk — an `arena_args && !args_consumed`
-  engine's args+fun, and an un-published parked machine's roots (`live` filters that family only) —
-  and it never visits `results`/`exits`.
+  `gather_off_heap_roots` (`entry.rs:490`) is the one `&mut` **value** walk — an
+  `arena_args && !args_consumed` engine's args+fun, and an un-published parked machine's roots (`live`
+  filters that family only) — and it never visits `results`/`exits`.
+  The three **mutable** doors are its family-for-family siblings, handing `&mut [Eterm]` slices to a
+  rewriting visitor (`FnMut(&mut [Eterm]) -> beam_common::Result<()>`, lengths fixed, order
+  unspecified, an `f` error stopping that family): `for_each_engine_args_root_mut` (`entry.rs:545` —
+  the same stability/consumption gates, `live` accepted-and-unused like the value gather, the
+  `args`/`entry` borrow split by destructuring `ProcessEngine`), `for_each_parked_machine_root_mut`
+  (`entry.rs:589` — the same `parked_published`/`live` gates and `fr_mark()` clamp, through
+  `Machine::with_roots` + `live_x_mut()`/`stack`/`fr[..fr]`), and `for_each_recorded_root_mut`
+  (`entry.rs:645` — the `results`/`exits` words the value gather deliberately skips). `errors`' live
+  reason word is **not** reachable: `BeamError` exposes no mutable term accessor.
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root hand-off (`park_window`, whose `ProcessEngine::parked_published` flag gates the
