@@ -13,7 +13,7 @@ Ground truth (read-only, never modify): `../../erts/emulator/beam/emu/beam_emu.c
 **Where the detail lives.** This file is the crate-level *contract*: the frozen API seam, the binding execution semantics, the constraints, the test strategy, and summaries of the gaps/handoffs. The exhaustive surface, the design decisions and the full M1 gap list are in `INSTRUCTION_SURFACE.md`; the subsystem detail is in the child `CONTEXT.md` files under `src/` (routing table below).
 
 ## API Surface (FROZEN -- the runtime and tests design against this)
-Re-exported at the crate root and via `beam_engine::prelude::*`.
+Re-exported at the crate root; the seams, the machine and the tier roster also via `beam_engine::prelude::*` (the arena's measurement/reclaim types stay crate-root only, like `ContextHeapStats`).
 The crate embeds NO BIF table: computation goes through `ExecutionContext::call_bif`, and an in-machine callee through the resolver seams (`resolve_external_call`/`resolve_local_fun`, plus `resolve_local_call` which lets a host serve a **local** callee *as* a BIF), with `ExecutionContext::apply`/`apply_fun` the value-returning fallbacks. `ExecutionContext::atom_name` resolves a runtime atom **value** against the host's live atom namespace.
 
 ### The supplied-stacktrace encoder (`src/supplied_stacktrace.rs`)

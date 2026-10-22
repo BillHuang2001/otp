@@ -13,7 +13,8 @@ that would otherwise retain every byte it ever handed out.
 `MinimalContext`, `ContextHeap`, `HeapMark` and `ContextHeapStats` themselves live in `../context.rs`; this
 node owns only the two tiers over them.
 
-## API Surface (public; re-exported from the crate root and `prelude`)
+## API Surface (public; the report types are re-exported from the crate root — like
+`ContextHeapStats`, they stay out of `prelude`, which carries only the seams and the machine)
 - `MinimalContext::heap_rewind(&mut self, mark: HeapMark) -> Result<HeapRewind>` — Tier A.
 - `MinimalContext::reclaim_heap(&mut self, forward: impl FnMut(&mut Relocator<'_>) -> Result<()>) -> Result<Option<HeapReclaim>>` — Tier B, self-sizing.
 - `MinimalContext::reclaim_heap_with_capacity(&mut self, dest_capacity_words: usize, forward: impl FnMut(&mut Relocator<'_>) -> Result<()>) -> Result<Option<HeapReclaim>>` — Tier B with a caller-chosen destination capacity (the pre-copy refusal is a real path here).
