@@ -19,28 +19,28 @@
 // %CopyrightEnd%
 
 //! **Region reclamation** — dropping the parts of the runtime's two never-freed term regions that
-//! provably hold no live word.
+//! provably hold no live word, and (Phase 1b) **evacuating** the live words of a partially live
+//! store region so it can be dropped too.
 //!
 //! # The two regions, and why they grow without bound
 //!
 //! [`Runtime::eval_heap`] (the `-eval`/table-less copy-out **store**) and [`Runtime::arena`] (the
-//! engine `MinimalContext` every table-less `alloc_words` lands on) are both
-//! **pointer-stable**: a term they hold stays valid for the runtime's life, so nothing ever moves
-//! it. Their lifetimes are what makes a raw word handed to a caller sound, and neither one
-//! reclaims anything:
+//! engine `MinimalContext` every table-less `alloc_words` lands on) are both historically
+//! **pointer-stable**: a term on them stays valid until this pass releases it, so a raw word handed
+//! to a caller is sound. Neither one reclaims anything on its own:
 //!
 //! * **the store** is a [`beam_alloc::Heap`]: a bump arena whose *replacement* growth
 //!   ([`Runtime::grow_eval_heap`]) installs a doubled region and pushes the replaced one onto
 //!   [`Runtime::eval_heap_retired`]. A replaced region is ~full, so it is never rewritable, and it
-//!   is never dropped — what the store retains is the **total volume it ever copied**, not its
-//!   live set. (`Heap::reset_to` rewinds the *current* region's bump pointer but releases no
-//!   RSS; only a `Heap`'s `Drop` frees a region's carrier.)
+//!   is never dropped on its own — what the store retains is the **total volume it ever copied**,
+//!   not its live set. (`Heap::reset_to` rewinds the *current* region's bump pointer but releases
+//!   no RSS; only a `Heap`'s `Drop` frees a region's carrier.)
 //! * **the arena** is `beam_engine`'s `ContextHeap`: a ladder of reservations that only ever grows.
 //!   It has no `Drop`-on-rewind either — but it *does* expose the two doors a caller needs, which
 //!   this module is the first production caller of: [`MinimalContext::heap_mark`],
 //!   [`MinimalContext::for_each_heap_region`] and [`MinimalContext::heap_rewind`].
 //!
-//! # One descent, two actions
+//! # One descent, three actions
 //!
 //! A pass asks a single question of the term graph, once: **does any reachable term stand inside
 //! any of these address ranges?** The ranges cover exactly the words a pass may touch:
@@ -50,19 +50,25 @@
 //! * every arena region at or above the mark taken when the window opened (the marked region's
 //!   `[mark.used, used)` and every newer region in full).
 //!
-//! Then two independent actions follow from the answer:
+//! Then three independent actions follow from the answer:
 //!
 //! * **arena** — *Tier A*: no range hit means nothing reachable stands at or above the mark, which
 //!   is exactly [`MinimalContext::heap_rewind`]'s caller contract, so the arena collapses to the
 //!   mark (dropping every newer region, whose carrier `Drop` frees, and rewinding the surviving
 //!   frontier).
-//! * **store** — a *whole-dead region is dropped, no word is moved*: a retired region with no hit
-//!   leaves the `Vec` (its `Drop` frees the carrier, so RSS really falls), and the current region
-//!   with no hit in `[cursor, used)` is `reset_to(cursor)`.
+//! * **store, whole-region** — a *whole-dead region is dropped, no word is moved*: a retired region
+//!   with no hit leaves the `Vec` (its `Drop` frees the carrier, so RSS really falls), and the
+//!   current region with no hit in `[cursor, used)` is `reset_to(cursor)`.
+//! * **store, move** ([`compact`]) — the *interleaved* case the whole-region action cannot help:
+//!   when the candidates are only **partially** live (each retaining one live word and therefore
+//!   held whole) and their dead fraction is worth reclaiming, every word reachable from the
+//!   runtime's **mutable** root corpus is evacuated into one fresh right-sized region and the
+//!   sources are dropped. That is the one place a store word moves; the corpus, the post-move
+//!   verification, the thresholds and the decline list are [`compact`]'s own documentation.
 //!
-//! **Phase 1a never moves or copies a word.** There is no compactor here and no relocator: a
-//! region either holds a reachable word (and is left exactly as it was) or holds none (and is
-//! dropped whole). Phase 1b adds the evacuation move for the interleaved case.
+//! When the move fires, the whole-region action is skipped: there is no candidate left to classify.
+//! When it is skipped or declines, the whole-region action runs exactly as it always did, so the
+//! cheap case never depends on the expensive one.
 //!
 //! # This is where a `-eval` compile's 4.63 GB goes
 //!
@@ -72,8 +78,10 @@
 //! fully written and resident) and `resets == 0`. At the **driver exit** every one of those
 //! replaced regions is dead — the compile's result is the run's final value, standing in the
 //! current region — so a single descent over the exit's root set classifies all 18 retired regions
-//! as droppable and the chain collapses without moving a single word. That is Phase 1a's whole
-//! point: the biggest measured retention in the runtime needs no move at all, only a proof.
+//! as droppable and the chain collapses without moving a single word. That is the whole-region
+//! action's point: the biggest measured retention in the runtime needs no move at all, only a
+//! proof. What survives that pass is the *partially* live remainder — one retired region retained
+//! on evidence, and the current region holding the result — which is the shape the move exists for.
 //!
 //! # The completeness precondition (what makes a drop sound)
 //!
@@ -134,32 +142,40 @@
 //!    finished-and-not-yet-reported pids, which on the `-eval` route is the run's own last failure.
 //!    (A **moving** mechanism cannot lean on that accessor — it is read-only, and
 //!    [`beam_common::Raise`] exposes no mutable slot — so the move refuses a region a recorded
-//!    reason stands in; see [`attempt_move`].)//!
+//!    reason **stands in**, checked by address; see [`compact::attempt_move`].)
+//!
 //! # Why Tier A and not Tier B
 //!
 //! `beam_engine` also offers `reclaim_heap` (Tier B), which *copies* the live graph into a fresh
-//! survivor. It is deliberately not used here:
+//! survivor. It is deliberately not used for the arena:
 //!
 //! * its `forward` closure is **fallible**, and an `Err` from it leaves the arena **empty** with
 //!   the epoch bumped and the caller's roots abandoned — an unrecoverable state, documented at
 //!   `beam_engine/src/context/reclaim.rs`'s `reclaim_heap`;
-//! * the whole `-eval` driver runs under `RuntimeContext::with_relocation_exempt`, so its live
-//!   terms may not move (the exemption exists because the evaluator keeps its environment in Rust
-//!   locals that no collector can be handed);
-//! * Phase 1a's premise is that a provably-dead region needs **no move at all**, and Tier A's
-//!   refusal path is clean: `ContextHeap::rewind` validates the epoch, the region index, the base
-//!   address and the used figure **before it mutates anything**, so an `Err` leaves the arena
-//!   byte-identical. A refusal is therefore a decline, never an error to propagate.
+//! * Tier A's refusal path is clean: `ContextHeap::rewind` validates the epoch, the region index,
+//!   the base address and the used figure **before it mutates anything**, so an `Err` leaves the
+//!   arena byte-identical. A refusal is therefore a decline, never an error to propagate.
+//!
+//! The **store** move is a different matter: its live words are the ones that are still needed,
+//! and `beam_gc` is the crate that owns relocation — so the move drives
+//! [`beam_gc::Relocator`](compact) directly rather than the arena's Tier B door. The two terms
+//! that are exempt from relocation inside a `-eval` run are *process-heap* terms the evaluator
+//! keeps in Rust locals; the store move forwards those very slots instead
+//! ([`compact::MoveSlots`]), which is what makes it compatible with the exemption.
 //!
 //! # Off-heap payloads, `Visited`, and `Frontier` — three non-issues
 //!
-//! * **Refc payload handles survive a region drop.** A `[BinRef][ErlSubBits]` pair is on-heap, but
-//!   the payload it names lives in [`Runtime::eval_off_heap`], whose handles are released by the
-//!   escaped-payload prune (`crate::eval::reclaim::prune`), which derives reachability itself from
-//!   [`Runtime::for_each_off_heap_region`] and [`Runtime::gather_off_heap_roots`]. Dropping a
-//!   region removes on-heap pairs only; it never removes a handle, so it can neither orphan nor
-//!   over-release a payload. A dropped region is never "the last namer of a payload" in the prune's
-//!   terms, because the prune answers from its own descent, not from this one.
+//! * **Refc payload handles survive a region drop *and* a move.** A `[BinRef][ErlSubBits]` pair is
+//!   on-heap, but the payload it names lives in [`Runtime::eval_off_heap`], whose handles are
+//!   released by the escaped-payload prune (`crate::eval::reclaim::prune`), which derives
+//!   reachability itself from [`Runtime::for_each_off_heap_region`] and
+//!   [`Runtime::gather_off_heap_roots`]. Dropping a region removes on-heap pairs only; it never
+//!   removes a handle, so it can neither orphan nor over-release a payload. A moved pair keeps its
+//!   payload pointer (`BinRef::val` is not a heap word, so the copier treats the `BinRef` as a
+//!   leaf), and the destination — `eval_heap`, or a retired region on a post-copy refusal — is
+//!   covered by [`Runtime::for_each_off_heap_region`]. A dropped region is never "the last namer
+//!   of a payload" in the prune's terms, because the prune answers from its own descent, not from
+//!   this one.
 //! * **`src/context/gc_walk.rs`'s `Visited` set needs no reset.** Its validity domain is a single
 //!   walk: `Walk::begin` bumps a generation counter (`Visited::begin`, `O(1)`) and every probe
 //!   compares against it, so no stored address outlives the walk that stored it. A region dropped
@@ -177,10 +193,16 @@
 //! descent over the live set plus `O(regions)`; the descent stops as soon as *every* range has its
 //! answer (`Reach::done`), which for a mostly-live store is the first few words.
 //!
+//! A **move** costs one exact count walk over the same corpus, one copy of the live set, one
+//! destination scan and one verification descent — plus, on a refusal after the first copy, one
+//! extra region that is kept rather than dropped. It is decided only when half the candidates are
+//! dead, so a mostly-live store never pays it.
+//!
 //! # The switch
 //!
-//! [`RegionReclaimConfig`] has two independent bits (store, arena), both on by default, latched in
-//! [`Runtime::new`] from `BEAM_RT_REGION_RECLAIM` (`all`/`store`/`arena`/`off`) and settable with
+//! [`RegionReclaimConfig`] has three independent bits (store, the store **move**, arena), all on by
+//! default, latched in [`Runtime::new`] from `BEAM_RT_REGION_RECLAIM`
+//! (`all`/`store`/`arena`/`nomove`/`off`) and settable with
 //! [`Runtime::set_region_reclaim_enabled`]. The switch can only *disable* an action; it never
 //! disables a correctness guard (every decline below is decided independently of it), and it
 //! changes no rooting, no liveness and no reclamation-timing decision anywhere else.
@@ -201,23 +223,34 @@ use super::Runtime;
 use crate::eval::reclaim::{self, Walk};
 use crate::eval::scratch::{RangeProbe, WindowState};
 
-/// Which of the two runtime-owned regions a pass may act on.
+pub(crate) mod compact;
+pub(crate) use compact::{MoveSlots, MoveOutcome};
+
+/// Which of the runtime-owned regions a pass may act on.
 ///
-/// Two independent bits, both **on** by default. See [`Runtime::set_region_reclaim_enabled`] and
+/// Three independent bits, all **on** by default. See [`Runtime::set_region_reclaim_enabled`] and
 /// the module docs' *The switch*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionReclaimConfig {
     /// Whether the `-eval` term store's dead regions may be dropped
     /// ([`Runtime::eval_heap`] + [`Runtime::eval_heap_retired`]).
     pub store: bool,
+    /// Whether a **partially** live store region may be evacuated into a fresh region
+    /// ([`compact`]) — the store half's copy, without which a region holding one live word is
+    /// retained whole.
+    ///
+    /// Independent of [`store`](RegionReclaimConfig::store): the whole-region drop runs whether or
+    /// not a move is allowed, and a move is only ever attempted when that bit is also set.
+    pub store_move: bool,
     /// Whether the engine arena's dead tail may be rewound ([`Runtime::arena`]).
     pub arena: bool,
 }
 
 impl RegionReclaimConfig {
-    /// Both actions off — the A/B baseline a measurement compares against.
+    /// Every action off — the A/B baseline a measurement compares against.
     pub const OFF: RegionReclaimConfig = RegionReclaimConfig {
         store: false,
+        store_move: false,
         arena: false,
     };
 
@@ -228,9 +261,11 @@ impl RegionReclaimConfig {
 
     /// The configuration the `BEAM_RT_REGION_RECLAIM` environment gate selects.
     ///
-    /// `all` (the default, also what an **unrecognised** value yields), `store`, `arena`, `off`.
-    /// The gate exists so a measurement can hold one action out of the picture on the same binary,
-    /// like the two pre-existing diagnostic switches; it can only turn an action **off**.
+    /// `all` (the default, also what an **unrecognised** value yields), `store` (the whole-region
+    /// store action **and** its move), `store-whole` (the store action without the move), `arena`,
+    /// `nomove` (everything, minus the move) and `off`. The gate exists so a measurement can hold
+    /// one action out of the picture on the same binary, like the two pre-existing diagnostic
+    /// switches; it can only turn an action **off**.
     pub(crate) fn from_env() -> RegionReclaimConfig {
         match std::env::var("BEAM_RT_REGION_RECLAIM") {
             Ok(value) => RegionReclaimConfig::parse(value.trim()),
@@ -245,10 +280,21 @@ impl RegionReclaimConfig {
             "store" => RegionReclaimConfig {
                 store: true,
                 arena: false,
+                ..RegionReclaimConfig::default()
+            },
+            "store-whole" => RegionReclaimConfig {
+                store: true,
+                store_move: false,
+                arena: false,
             },
             "arena" => RegionReclaimConfig {
                 store: false,
                 arena: true,
+                ..RegionReclaimConfig::default()
+            },
+            "nomove" => RegionReclaimConfig {
+                store_move: false,
+                ..RegionReclaimConfig::default()
             },
             _ => RegionReclaimConfig::default(),
         }
@@ -259,6 +305,7 @@ impl Default for RegionReclaimConfig {
     fn default() -> RegionReclaimConfig {
         RegionReclaimConfig {
             store: true,
+            store_move: true,
             arena: true,
         }
     }
@@ -276,17 +323,32 @@ impl Default for RegionReclaimConfig {
 /// store drop moves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegionReclaimStats {
-    /// How many times a store region was **compacted** (its live words moved).
+    /// How many times a store region was **compacted** — its live words moved into a fresh region
+    /// and the sources dropped ([`compact`]).
     ///
-    /// Always `0` in Phase 1a, which never moves a word; Phase 1b fills it.
+    /// Zero while the move never fires: a store region whose live fraction is too high, whose
+    /// candidates are below the threshold, or whose pass declined is retained whole, exactly as the
+    /// whole-region action leaves it.
     pub store_compactions: u64,
     /// How many store words the drops reclaimed, summed.
     ///
     /// A dropped retired region contributes its whole written prefix; the current region
-    /// contributes the window prefix a reset released.
+    /// contributes the window prefix a reset released; a move contributes its candidates' **dead**
+    /// words (`total - live`), which is exactly what dropping the sources frees.
     pub store_words_reclaimed: u64,
-    /// How many **retired** store regions were dropped (each frees its region's carrier).
+    /// How many store regions were dropped (each frees its region's carrier).
+    ///
+    /// A whole-dead retired region, and — for a move — every retired candidate plus the old current
+    /// region when its below-cursor prefix is empty.
     pub store_regions_dropped: u64,
+    /// How many **move** attempts declined, for any reason in [`compact`]'s decline list.
+    ///
+    /// Kept separate from [`reclaim_declines`](RegionReclaimStats::reclaim_declines): the move is an
+    /// optional extra action, so a moved-off A/B run (or a store whose live fraction never justifies
+    /// a copy) must not read as if the whole pass had refused.
+    pub store_move_declines: u64,
+    /// The reason of the most recent move decline.
+    pub store_move_last_decline: Option<&'static str>,
     /// How many times the arena was rewound.
     pub arena_reclaims: u64,
     /// How many arena words the rewinds released, summed
@@ -330,7 +392,11 @@ pub(crate) struct PassInput<'a> {
     /// What the open statement window reports (opened-ness and its pin latches).
     pub(crate) window: WindowState,
     /// The caller's own live terms — the evaluator's `Env` values, plus the driver's result at
-    /// the exit. Added to [`Runtime::gather_off_heap_roots`] to form the descent's root set.
+    /// the exit. Added to [`Runtime::gather_off_heap_roots`] to form the descent's root set, and
+    /// added to [`Runtime::for_each_root_mut`] to form the move's corpus.
+    ///
+    /// These are **copies**: [`compact::attempt_move`] forwards the real slots
+    /// ([`MoveSlots`]), which are handed to [`pass`] separately.
     pub(crate) value_roots: &'a [Eterm],
     /// `Some(reason)` when the caller knows it holds a live term it **cannot** hand over (the
     /// `-eval` driver's `Flow::Fatal`: a `BeamError` may carry a live reason word and exposes no
@@ -357,9 +423,8 @@ struct Cursor {
 /// `-eval` driver run that opened it. Every field's meaning is in the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct RegionReclaim {
-    /// The two action bits ([`Runtime::set_region_reclaim_enabled`]).
-    config: RegionReclaimConfig,
-    /// The open window's frontiers, if a pass may run.
+    /// The three action bits ([`Runtime::set_region_reclaim_enabled`]).
+    config: RegionReclaimConfig,    /// The open window's frontiers, if a pass may run.
     cursor: Option<Cursor>,
     /// The published counters.
     stats: RegionReclaimStats,
@@ -384,7 +449,7 @@ impl RegionReclaim {
         }
     }
 
-    /// Replaces the two action bits. The switch can only disable an action.
+    /// Replaces the three action bits. The switch can only disable an action.
     pub(crate) fn set_config(&mut self, config: RegionReclaimConfig) {
         self.config = config;
     }
@@ -398,6 +463,12 @@ impl RegionReclaim {
     fn decline(&mut self, reason: &'static str) {
         self.stats.reclaim_declines = self.stats.reclaim_declines.saturating_add(1);
         self.stats.reclaim_last_decline = Some(reason);
+    }
+
+    /// Records a **move-only** decline on the move's own counters ([`compact`]'s decline list).
+    fn decline_move(&mut self, reason: &'static str) {
+        self.stats.store_move_declines = self.stats.store_move_declines.saturating_add(1);
+        self.stats.store_move_last_decline = Some(reason);
     }
 }
 
@@ -438,9 +509,13 @@ pub(crate) fn close(runtime: &mut Runtime) {    runtime.region_reclaim.cursor = 
 /// One region-reclaim **pass**: one descent, then the arena and/or store action.
 ///
 /// Every refusal is recorded on [`RegionReclaimStats`] and leaves both regions exactly as they
-/// were (the one documented exception is the arena's own rewind refusal, which the arena
-/// guarantees is byte-identical — see the module docs).
-pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
+/// were, with one exception the [`compact`] module owns and documents: a move that already copied a
+/// word keeps its destination installed alongside every source region (dropping nothing), because a
+/// forwarding marker in the source cannot be un-written.
+///
+/// `slots` is the caller's own live-term slots ([`MoveSlots`]) — the half of the move's corpus that
+/// is not a runtime root family. A pass that does not move ignores it.
+pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>, slots: &mut MoveSlots<'_>) {
     if let Some(reason) = refusal(runtime, &input) {
         runtime.region_reclaim.decline(reason);
         return;
@@ -511,9 +586,14 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
             }
         }
     }
-    // ---- the store action (whole-dead regions only; not one word moves) ----
+    // ---- the store action: the move first, then the whole-dead drops ----
     if runtime.region_reclaim.config.store {
-        store_action(runtime, &live, &hits);
+        // A move that fires leaves no candidate for the whole-region action to classify (every
+        // retired candidate was dropped and the current region is the fresh destination), so the
+        // two are mutually exclusive rather than layered.
+        if compact::attempt_move(runtime, &input, slots) != MoveOutcome::Moved {
+            store_action(runtime, &live, &hits);
+        }
     }
     // The store may have grown inside the window since the cursor was taken; a pass never leaves a
     // cursor pointing above the frontier.
@@ -775,9 +855,9 @@ impl Runtime {
         self.region_reclaim.stats()
     }
 
-    /// Sets the two region-reclaim action bits ([`RegionReclaimConfig`]).
+    /// Sets the three region-reclaim action bits ([`RegionReclaimConfig`]).
     ///
-    /// Both are **on** in every production route; this exists so a measurement can hold one action
+    /// All are **on** in every production route; this exists so a measurement can hold one action
     /// out of the picture and compare the same workload against itself on the same binary, like
     /// [`Runtime::set_eval_scratch_enabled`]. It can only *disable* an action — every soundness
     /// guard is independent of it, so the words an action would have reclaimed simply stay where
