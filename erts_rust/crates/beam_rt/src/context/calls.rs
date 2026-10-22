@@ -1384,7 +1384,14 @@ impl<'a> RuntimeContext<'a> {
     ///   `run_*` entries) → the runtime's long-lived `-eval` store
     ///   ([`Self::move_result_into_runtime_store`], the table-less arm in
     ///   [`super::pool`]), a destination reached only for a call whose pool may be rewound: on that
-    ///   route the copy exists to license the rewind, and the store it lands in is never reset.
+    ///   route the copy exists to license the rewind, and the store it lands in is never reset;
+    /// * a scheduled process **inside a relocation-exempt window** whose nursery cannot hold the
+    ///   graph → that same runtime store: the window forbids replacing the young space, so the copy
+    ///   is *stabilized* rather than grown for
+    ///   ([`Self::move_result_into_process_heap`]'s `refuse ⇒ stabilize, never dangle` rule).
+    ///
+    /// `None` on every route means the copy was refused for a reason capacity cannot fix, so the
+    /// caller leaves the pool un-rewound and the result on it.
     pub(crate) fn rehome_container_result(&mut self, term: Eterm) -> Option<Eterm> {
         if self.mailbox_table.is_some() {
             self.move_result_into_process_heap(term)
@@ -1396,6 +1403,10 @@ impl<'a> RuntimeContext<'a> {
     /// Moves a registered BIF's result `term` off the pooled BIF heap onto the running process's
     /// **own young heap**, returning the copy — or `None` when it cannot be re-homed, in which
     /// case the caller leaves both the result and the pool exactly as they were.
+    ///
+    /// A process **inside a relocation-exempt window** cannot grow that young heap (see *Inside an
+    /// exempt window* below), so a graph the nursery cannot hold is copied onto the runtime's
+    /// pointer-stable store instead and that copy is what is returned.
     ///
     /// # The destination is the process's SCANNED heap
     ///
@@ -1424,11 +1435,28 @@ impl<'a> RuntimeContext<'a> {
     /// door whose root set cannot name the words an exempt window is holding on the Rust side — so
     /// a replacement taken inside such a window buys addressability a later collapse revokes.
     ///
-    /// Inside an exempt window the copy is therefore still **attempted** (it needs no
-    /// replacement when the graph fits) but the hint gate and the growth are **skipped**, and an
-    /// exhaustion refusal answers `None`: the result stays on the never-rewound pooled BIF heap —
-    /// [`Self::call_registered`] leaves the pool at the call's own offset — so the residual is a
-    /// **leak, never a dangle**, bounded by the window's own length.
+    /// # Inside an exempt window a copy that does not fit is STABILIZED, never refused
+    ///
+    /// Inside an exempt window the copy is still **attempted** (it needs no replacement when the
+    /// graph fits), but the hint gate and the growth are **skipped**: replacing the young space is
+    /// exactly what the window forbids. A copy that does not fit the nursery is then
+    /// **stabilized** onto the runtime's pointer-stable, never-reset store
+    /// ([`Self::move_result_into_runtime_store`] — `Runtime::eval_heap` + `Runtime::eval_off_heap`,
+    /// grown by *region replacement*, which never moves a term), and that copy is what this
+    /// function returns.
+    ///
+    /// The rule is **refuse ⇒ stabilize, never dangle**. The two outcomes a window must never
+    /// produce are (a) a growth a later collection's chain collapse revokes — the young space's
+    /// addressability is not durable there — and (b) a live `Eterm` left on a pooled BIF region
+    /// that the caller's own rewind then recycles. Stabilizing produces neither: the answer is a
+    /// self-contained copy on a store no rewind and no collection touches, so the caller can hand
+    /// it out and rewind the pool exactly as on the non-exempt route.
+    ///
+    /// `None` therefore means exactly one thing now: the copy was refused for a reason capacity
+    /// cannot fix — the copier's malformed-graph `badarg`, an unresolvable off-heap container, a
+    /// store that could not be grown. The result then stays on the never-rewound pooled BIF heap
+    /// ([`Self::call_registered`] leaves the pool at the call's own offset), so the residual is a
+    /// **leak, never a dangle** — and a permanent one, since no growth would ever fix it.
     ///
     /// # A FRESH, EMPTY destination off-heap table per attempt
     ///
@@ -1498,109 +1526,129 @@ impl<'a> RuntimeContext<'a> {
         // what lets the refusal arm below write it back through `self`.
         let pid = self.mailbox_pid;
         let hint = self.copy_out_hint;
-        let RuntimeContext {
-            runtime,
-            mailbox_table,
-            ..
-        } = self;
-        // No caller-supplied table is the `-eval`/single-pass shape: leave today's behaviour byte
-        // for byte (the result stays on the pooled heap, which is then not rewound).
-        let table = mailbox_table.as_deref_mut()?;
-        let process = table.get_mut(pid)?;
-        // Read the window state **once** (the process is borrowed for the rest of the call, and
-        // the two seams below — the hint gate and the growth — must agree): a young-space
-        // REPLACEMENT is legal only while this process's root set is complete, see
-        // [`super::gc::may_replace_young_space`].
-        let republishable = super::gc::may_replace_young_space(process);
-        // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
-        // instead of paying the refusal it would otherwise teach us again — but only where the
-        // space may be replaced, because spending the hint IS a replacement.
-        if republishable {
-            hint_grow_gate(process, hint);
-        }
-        // One fresh destination table per attempt (see the docs above): a refused attempt's
-        // partial state is never rolled into the retry, so both attempts hand the copier an
-        // empty destination and take the single-traversal fast path.
-        let needed = match copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term) {
-            Ok(copied) => return Some(copied),
-            Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
-                // A refusal that is **not** the destination running out of room — above all the
-                // copier's malformed-graph `badarg` — is permanent: growing the destination
-                // cannot fix it, so a retry would re-walk the whole graph, grow a whole space for
-                // nothing and fail again with the very same reason. Leave both the result and the
-                // pool exactly as they were.
-                return None;
+        // Set when the destination refused the graph inside a relocation-exempt window. The
+        // stabilize arm runs *after* the destructured loan below ends, because it needs `&mut self`
+        // ([`Self::move_result_into_runtime_store`]); the flag is the only thing that crosses the
+        // boundary, so no borrow is held across it.
+        let mut stabilize = false;
+        let outcome = {
+            let RuntimeContext {
+                runtime,
+                mailbox_table,
+                ..
+            } = self;
+            // No caller-supplied table is the `-eval`/single-pass shape: leave today's behaviour byte
+            // for byte (the result stays on the pooled heap, which is then not rewound).
+            let table = mailbox_table.as_deref_mut()?;
+            let process = table.get_mut(pid)?;
+            // Read the window state **once** (the process is borrowed for the rest of the call, and
+            // the two seams below — the hint gate and the growth — must agree): a young-space
+            // REPLACEMENT is legal only while this process's root set is complete, see
+            // [`super::gc::may_replace_young_space`].
+            let republishable = super::gc::may_replace_young_space(process);
+            // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
+            // instead of paying the refusal it would otherwise teach us again — but only where the
+            // space may be replaced, because spending the hint IS a replacement.
+            if republishable {
+                hint_grow_gate(process, hint);
             }
-            // The destination could not hold the graph. The copier's **own** preflight has
-            // already counted the flat words it wanted and reports that count back in the
-            // exhaustion error (`AllocFailure::requested`, the `beam_message::error` contract's
-            // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
-            // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
-            // again *and* builds a `HashSet` plus a `Vec` on the way.
-            Err(error) => {
-                let needed = copy_shortfall_words(&error);
-                // LEARN: remember the graph size this process has proven it builds, so the
-                // next copy-out of the same shape is grown to fit *before* it is attempted.
-                // It is a `max`, so a one-off large result can never shrink what an earlier
-                // one taught, and the write is a disjoint field of the loans destructured
-                // above.
-                self.copy_out_hint = self.copy_out_hint.max(needed);
-                needed
+            // One fresh destination table per attempt (see the docs above): a refused attempt's
+            // partial state is never rolled into the retry, so both attempts hand the copier an
+            // empty destination and take the single-traversal fast path.
+            let needed = match copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term) {
+                Ok(copied) => return Some(copied),
+                Err(error) if !beam_message::is_message_heap_exhaustion(&error) => {
+                    // A refusal that is **not** the destination running out of room — above all the
+                    // copier's malformed-graph `badarg` — is permanent: growing the destination
+                    // cannot fix it, so a retry would re-walk the whole graph, grow a whole space for
+                    // nothing and fail again with the very same reason. Leave both the result and the
+                    // pool exactly as they were.
+                    return None;
+                }
+                // The destination could not hold the graph. The copier's **own** preflight has
+                // already counted the flat words it wanted and reports that count back in the
+                // exhaustion error (`AllocFailure::requested`, the `beam_message::error` contract's
+                // `words * size_of::<Eterm>()`), so the growth hint costs no second traversal of the
+                // graph: `beam_term::size_object(term)` — the obvious alternative — walks it all over
+                // again *and* builds a `HashSet` plus a `Vec` on the way.
+                Err(error) => {
+                    let needed = copy_shortfall_words(&error);
+                    // LEARN: remember the graph size this process has proven it builds, so the
+                    // next copy-out of the same shape is grown to fit *before* it is attempted.
+                    // It is a `max`, so a one-off large result can never shrink what an earlier
+                    // one taught, and the write is a disjoint field of the loans destructured
+                    // above. Learning is passive bookkeeping (no space is touched), so it happens
+                    // on the exempt route too.
+                    self.copy_out_hint = self.copy_out_hint.max(needed);
+                    needed
+                }
+            };
+            if !republishable {
+                // STABILIZE, not grow: replacing the young space is illegal here (see the docs
+                // above and [`super::gc::may_replace_young_space`]), so the result is copied onto
+                // the runtime's pointer-stable store instead — after this borrow scope ends, since
+                // that copy needs `&mut self`.
+                stabilize = true;
+                None
+            } else {
+                // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it
+                // replaces and moves no live term, so the copy can simply be re-attempted from the
+                // fresh space's base.
+                //
+                // The request carries **headroom**, never the copier's bare shortfall. Growing by
+                // `needed` alone leaves the fresh destination barely larger than the graph that
+                // forced it, so the next result of the same size refuses again and pays the whole
+                // sizing path of a refused copy (`try_copy_fast` → `preflight_words` → the bounded
+                // sizing walk → `size_object_with`) for one more table step. Asking for
+                // `needed * GROW_HEADROOM_FACTOR` instead (floored at `GROW_MIN_WORDS`) makes
+                // **one** growth serve many copies: 1024 words is already past the growth table's
+                // 987→1598 step ([`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words) over
+                // the C `heap_sizes[]`, `erl_gc.c:262-291`), so the installed young space is ≥1598
+                // words — one step up and with room to spare for the next ~20 results of the
+                // `copy_bound` shape.
+                //
+                // That is the discipline the C runtime applies to its own heaps: a collection never
+                // installs `size_before` but `next_heap_size(p, size_before, 0)`, i.e. **the next
+                // table size at or above the requirement**, and when that would not actually grow
+                // the heap it steps one entry further (`next_heap_size(p, HEAP_SIZE(p), 1)`,
+                // `erts/emulator/beam/erl_gc.c:1879-1888`). `Nursery::grow` rounds the request the
+                // same way and, when the one-step size would not enlarge the current space, at
+                // least doubles it — so a growth request is never "the shortfall, exactly".
+                //
+                // `Nursery::grow` may satisfy the whole request for free by re-adopting an already
+                // retired space nothing was ever allocated in (`empty_retired_for`), and the spaces
+                // it does retire are only reclaimed by a later **collection**
+                // (`Nursery::collapse`): the headroom is a capacity request, not an allocation, and
+                // it adds no per-call work.
+                #[cfg(test)]
+                notes::note_grow();
+                let request = needed
+                    .saturating_mul(GROW_HEADROOM_FACTOR)
+                    .max(GROW_MIN_WORDS);
+                if process.grow_nursery(request).is_err() {
+                    // A configured `max_heap_size` (`+hmax`, `spawn_opt`'s `{max_heap_size,…}`)
+                    // bounds the nursery chain's **summed** capacity, and `Nursery::grow` refuses a
+                    // request its remaining budget cannot reach
+                    // (`crates/beam_gc/src/nursery.rs:339-345`). The headroom request could
+                    // therefore be refused where the bare shortfall still fits, so fall back to
+                    // exactly that — the smallest growth the copier provably needs — rather than
+                    // turning a growth that was reachable into a hard failure. A refusal retires
+                    // nothing, so the retry starts from the identical nursery.
+                    #[cfg(test)]
+                    notes::note_grow();
+                    process.grow_nursery(needed.max(256)).ok()?;
+                }
+                copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
             }
         };
-        // REFUSE inside a relocation-exempt window: the destination could not hold the graph and
-        // replacing the young space is illegal here (see the docs above and
-        // [`super::gc::may_replace_young_space`]). `None` leaves the result on the pooled BIF
-        // heap **and** leaves the pool un-rewound ([`Self::call_registered`] sets `rewind` only
-        // after a successful re-home), so the residual is a leak, never a dangling word.
-        if !republishable {
-            return None;
+        if stabilize {
+            // The exempt-window destination could not hold the graph: hand the caller a
+            // self-contained copy on the runtime's pointer-stable store, so this call can license
+            // its pool rewind exactly as on the non-exempt route — `refuse ⇒ stabilize, never
+            // dangle`.
+            return self.move_result_into_runtime_store(term);
         }
-        // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
-        // and moves no live term, so the copy can simply be re-attempted from the fresh space's
-        // base.
-        //
-        // The request carries **headroom**, never the copier's bare shortfall. Growing by
-        // `needed` alone leaves the fresh destination barely larger than the graph that forced
-        // it, so the next result of the same size refuses again and pays the whole sizing path of
-        // a refused copy (`try_copy_fast` → `preflight_words` → the bounded sizing walk →
-        // `size_object_with`) for one more table step. Asking for
-        // `needed * GROW_HEADROOM_FACTOR` instead (floored at `GROW_MIN_WORDS`) makes **one**
-        // growth serve many copies: 1024 words is already past the growth table's 987→1598 step
-        // ([`HeapPolicy::next_words`](beam_gc::HeapPolicy::next_words) over the C `heap_sizes[]`,
-        // `erl_gc.c:262-291`), so the installed young space is ≥1598 words — one step up and with
-        // room to spare for the next ~20 results of the `copy_bound` shape.
-        //
-        // That is the discipline the C runtime applies to its own heaps: a collection never
-        // installs `size_before` but `next_heap_size(p, size_before, 0)`, i.e. **the next table
-        // size at or above the requirement**, and when that would not actually grow the heap it
-        // steps one entry further (`next_heap_size(p, HEAP_SIZE(p), 1)`,
-        // `erts/emulator/beam/erl_gc.c:1879-1888`). `Nursery::grow` rounds the request the same
-        // way and, when the one-step size would not enlarge the current space, at least doubles
-        // it — so a growth request is never "the shortfall, exactly".
-        //
-        // `Nursery::grow` may satisfy the whole request for free by re-adopting an already
-        // retired space nothing was ever allocated in (`empty_retired_for`), and the spaces it
-        // does retire are only reclaimed by a later **collection** (`Nursery::collapse`): the
-        // headroom is a capacity request, not an allocation, and it adds no per-call work.
-        #[cfg(test)]
-        notes::note_grow();
-        let request = needed
-            .saturating_mul(GROW_HEADROOM_FACTOR)
-            .max(GROW_MIN_WORDS);
-        if process.grow_nursery(request).is_err() {
-            // A configured `max_heap_size` (`+hmax`, `spawn_opt`'s `{max_heap_size,…}`) bounds
-            // the nursery chain's **summed** capacity, and `Nursery::grow` refuses a request its
-            // remaining budget cannot reach (`crates/beam_gc/src/nursery.rs:339-345`). The
-            // headroom request could therefore be refused where the bare shortfall still fits, so
-            // fall back to exactly that — the smallest growth the copier provably needs — rather
-            // than turning a growth that was reachable into a hard failure. A refusal retires
-            // nothing, so the retry starts from the identical nursery.
-            #[cfg(test)]
-            notes::note_grow();
-            process.grow_nursery(needed.max(256)).ok()?;
-        }
-        copy_result_fresh(process.heap_mut(), &mut runtime.eval_off_heap, term).ok()
+        outcome
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
