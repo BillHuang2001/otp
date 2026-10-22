@@ -267,10 +267,14 @@ both answer `beam_common::Result<()>`:
 It **decides nothing**: nothing in a collection, prune or reclaim path calls it, visiting a word retains
 nothing, and every per-owner enumerator it reaches lives in the owner's own module (`roots/process.rs`
 composes `beam_process`'s `gather_roots`/`scatter_roots` pairs + the mailbox rebuild).
-Its **only caller is the parity suite** (`root_tests.rs`, *The parity suite* below), so a non-test
-`cargo build -p beam_rt` reports the whole door — and every enumerator it reaches — as dead code
-(those `dead_code` warnings are exactly this family); the CI build (`--all-targets`) compiles the suite and
-is warning-free.
+Its **only caller is the parity suite** (`root_tests.rs`, *The parity suite* below): nothing in a
+collection, prune or reclaim path calls it, so a non-test build sees the whole door as dead code.
+The two entry points (`for_each_root_mut`, `for_each_root_family_mut`) and
+`RootFamily::in_value_gather` therefore carry `#[allow(dead_code)]` with that justification — a **lint
+allowance only**, not a behaviour claim; because the allow sits on the entry points, every enumerator
+they reach is live, so both the plain `cargo build -p beam_rt` and the `--all-targets` build are
+warning-free. Keeping the parity suite the **sole** caller is what stops a door with no production
+caller yet (a future relocation/compaction pass is the intended one) from rotting unnoticed.
 
 ### Traversal order (fixed) and the value-gather split
 | # | `RootFamily` | owner seam | in `gather_off_heap_roots` |

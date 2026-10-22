@@ -195,6 +195,12 @@ impl RootFamily {
     /// never an ordering one (the two walks deliberately visit the families in different orders:
     /// the value gather pushes the dictionary first, the moving pass follows `beam_process`'s own
     /// canonical order).
+    //
+    // A **lint allowance only**, not a behaviour claim: the parity suite
+    // (`src/runtime/root_tests.rs::the_family_walk_matches_the_value_gather`) is the sole reader of
+    // this rule today, so a non-test build sees it as dead code; a relocation/compaction pass
+    // consulting it is the intended production caller.
+    #[allow(dead_code)]
     pub(crate) fn in_value_gather(self) -> bool {
         match self {
             RootFamily::EvalClosureEnv
@@ -284,6 +290,13 @@ impl Runtime {
     /// written its buffer back, and every word `f` had replaced before that is in place.
     // The parity test (`src/runtime/root_tests.rs`) is this door's caller: it compares the walk's
     // corpus against the value gather's in every populated state.
+    //
+    // A **lint allowance only**, not a behaviour claim: nothing on a collection, relocation or
+    // prune path calls this door yet, so a non-test build sees the whole chain as dead code. The
+    // future relocation/compaction pass is its intended production caller, and the parity suite is
+    // deliberately the *sole* caller until then — which is what keeps the door from rotting
+    // unnoticed.
+    #[allow(dead_code)]
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
@@ -433,6 +446,14 @@ impl Runtime {
     /// # Errors
     ///
     /// Whatever `f` answers (see the visitor contract above).
+    //
+    // A **lint allowance only**, not a behaviour claim: the parity suite
+    // (`src/runtime/root_tests.rs::the_family_walk_matches_the_value_gather`) is this door's sole
+    // caller today, so a non-test build sees the whole walk — this method, `tagged`, and every
+    // family's `for_each_*_root_mut` — as dead code. The future relocation/compaction pass is the
+    // intended production caller; keeping the suite the only caller until it lands is what stops
+    // the door from rotting unnoticed.
+    #[allow(dead_code)]
     pub(crate) fn for_each_root_family_mut(
         &mut self,
         f: &mut impl FnMut(RootFamily, &mut [Eterm]) -> beam_common::Result<()>,
