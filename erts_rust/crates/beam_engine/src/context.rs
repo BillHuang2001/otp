@@ -1523,6 +1523,133 @@ impl ContextHeap {
         self.alloc_from_frontier(n)
     }
 
+    /// The heap's **census**: the region count, the summed reservation/commit/use/peak
+    /// figures and the frontier region's own two numbers.
+    ///
+    /// Read-only and allocation-free (`O(regions)`), so it is safe to call between any
+    /// two allocations — it never allocates, never moves a word and never changes the
+    /// allocation policy. The public door is
+    /// [`MinimalContext::heap_stats`].
+    fn stats(&self) -> ContextHeapStats {
+        let mut stats = ContextHeapStats {
+            regions: self.regions.len(),
+            ..ContextHeapStats::default()
+        };
+        for region in &self.regions {
+            stats.reserved_words += region.reserved_words();
+            stats.committed_words += region.committed_words();
+            stats.used_words += region.used();
+            stats.peak_words += region.peak_used();
+        }
+        if let Some(frontier) = self.regions.last() {
+            stats.frontier_used = frontier.used();
+            stats.frontier_available = frontier.available();
+        }
+        stats
+    }
+
+    /// The **mark** of the current allocation frontier: its region index, its base
+    /// address and its [`used`](ReservedHeap::used) figure.
+    ///
+    /// [`HeapMark::EMPTY`] while no region has been reserved (a heap that has never
+    /// allocated), so an empty mark is the "nothing was handed out yet" value a caller
+    /// can compare against later.
+    ///
+    /// The mark is a **pure observation** — it records where the frontier stands, and it
+    /// makes nothing safe: see [`HeapMark`] for what a rewind would additionally require.
+    fn mark(&self) -> HeapMark {
+        match self.regions.len() {
+            0 => HeapMark::EMPTY,
+            len => {
+                let frontier = &self.regions[len - 1];
+                HeapMark {
+                    region: Some(len - 1),
+                    base: frontier.base() as usize,
+                    used: frontier.used(),
+                }
+            }
+        }
+    }
+
+    /// Whether `mark` still names **this** heap's current frontier region, and was taken
+    /// at or before the frontier's current [`used`](ReservedHeap::used) figure.
+    ///
+    /// `true` means the region the mark was taken in has not been replaced and the bump
+    /// pointer has not gone backwards — the structural precondition for the mark to be
+    /// usable at all. `false` means the mark is **stale** (the region it named has since
+    /// been replaced by a fresh frontier region, so its words are still live but no longer
+    /// the allocation frontier) or **forward** (it claims more words than the frontier has
+    /// handed out — a mark from another heap, or a corrupted one).
+    ///
+    /// A [`HeapMark::EMPTY`] mark matches **only** a heap that still has no region: once a
+    /// region exists, "no region existed yet" says nothing about the frontier that
+    /// appeared, so the conservative answer is `false`.
+    ///
+    /// This is a **precondition check, not a permission**: a matching mark still does not
+    /// make a rewind sound (see [`HeapMark`]).
+    fn mark_matches(&self, mark: HeapMark) -> bool {
+        match mark.region {
+            None => self.regions.is_empty(),
+            Some(index) => match self.regions.get(index) {
+                // The index must be the CURRENT frontier (a region that was replaced is
+                // stale even though it is still live), and the base must be that
+                // region's — which is what catches a replaced region even if an index
+                // happened to coincide.
+                Some(region) => {
+                    index + 1 == self.regions.len()
+                        && region.base() as usize == mark.base
+                        && mark.used <= region.used()
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Visit every region's **written prefix** (`[0, used)`) oldest-first, as a mutable
+    /// word slice of exactly `used()` words.
+    ///
+    /// A region whose [`used`](ReservedHeap::used) is zero is skipped (an empty prefix
+    /// carries no words, and a zero-length slice would need no valid base); every other
+    /// region's slice spans exactly the words the bump pointer has passed, never the
+    /// committed-but-unwritten tail.
+    ///
+    /// # What the visitor may do with the slice
+    ///
+    /// **It must not interpret a word as a term.** [`alloc_words`](ExecutionContext::alloc_words)
+    /// hands out *uninitialised* words and the caller writes them, so the prefix is only
+    /// as initialised as the callers' writes left it: the words are raw payload (a
+    /// bitstring's bytes, a float's mantissa, a tuple's element words, a cons pair) and
+    /// only a reachability walk knows which of them are term slots. The slice is for a
+    /// **census or a reachability walk**, never for reading a term — use the frozen
+    /// [`RootSet`] door ([`Machine::with_roots`](crate::machine::Machine::with_roots)) for
+    /// anything that needs to interpret words.
+    ///
+    /// It must also **not keep** the slice: the borrow ends when `visit` returns, and a
+    /// later allocation may extend the same region.
+    ///
+    /// The `&mut self` borrow is what makes the slice exclusive: no allocation, and hence
+    /// no new word handed out, can run while one is being visited.
+    fn for_each_region(&mut self, mut visit: impl FnMut(&mut [Eterm])) {
+        for region in &mut self.regions {
+            let used = region.used();
+            if used == 0 {
+                continue;
+            }
+            let base = region.base();
+            // SAFETY: `base` is the start of the allocator-provided reservation and
+            // `used <= committed <= reserved` words, so the range is wholly inside this
+            // region's exclusively-owned block; `&mut self` makes this the sole access to
+            // those words for the slice's lifetime, and `used` bounds the slice to the
+            // prefix the bump pointer has passed (never the uncommitted reservation).
+            // The words themselves are only as initialised as the callers' own writes
+            // left them, which is why the visitor is forbidden from interpreting them as
+            // terms (see the docs above) — the same contract
+            // `beam_alloc::Heap::used_words_mut` carries.
+            let words = unsafe { core::slice::from_raw_parts_mut(base, used) };
+            visit(words);
+        }
+    }
+
     /// The allocation frontier: the newest region. Only called once a region exists.
     fn frontier(&self) -> &ReservedHeap {
         self.regions
@@ -1574,6 +1701,133 @@ impl ContextHeap {
             .max(n);
         let committed = self.commit_words.max(n).min(reserved);
         ReservedHeap::new(reserved, committed)
+    }
+}
+
+/// A **census** of a [`MinimalContext`]'s region heap: what it has reserved, committed,
+/// handed out and peaked at, region by region.
+///
+/// Returned by [`MinimalContext::heap_stats`]. Every word figure is exact for a 64-bit
+/// `Eterm` when converted with `size_of::<Eterm>()`; nothing here is sampled or
+/// estimated, and reading it changes no allocation state.
+///
+/// # `used_words` is CUMULATIVE DEMAND, not live memory
+///
+/// Regions are never freed, never shrunk and never reset (see [`MinimalContext`]'s
+/// [`ContextHeap`] docs — a rewind would invalidate every pointer the engine already
+/// holds), so [`used_words`](ContextHeapStats::used_words) is the **total** number of
+/// words ever handed out across the whole life of the context. It is a lower bound on
+/// the memory the arena holds and an upper bound on nothing: a run that allocated and
+/// discarded terms leaves `used_words` at its high-water figure forever, so this is
+/// **not** a live-memory reading and must not be compared with a collector's heap size.
+/// [`peak_words`](ContextHeapStats::peak_words) is the summed per-region high-water mark
+/// (`used_words == peak_words` whenever no region was reset, which is the only state a
+/// [`MinimalContext`] can reach).
+///
+/// # Why the arena reports an unbounded `heap_available`
+///
+/// [`ExecutionContext::heap_available`] answers `usize::MAX` for this context, and this
+/// census is the honest counterpart of that: the region heap **reserves lazily and never
+/// refuses** — an exhausted reservation is followed by a fresh, doubled one — so there is
+/// no capacity to report against, only what has been used so far. A host that needs a
+/// real admission bound must impose one (a `max_heap_size` check, a collection trigger),
+/// because the engine's `ensure_heap` is a no-op here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextHeapStats {
+    /// How many regions have been reserved (the first one lazily, on first
+    /// allocation; every later one when the previous **reservation** was exhausted).
+    /// `0` means the context has never allocated a word.
+    pub regions: usize,
+    /// The reservation's total size in `Eterm` words, summed over every region. This is
+    /// **address space**, not resident memory: a reservation is one anonymous
+    /// (lazily-faulted) `mmap` per region.
+    pub reserved_words: usize,
+    /// The total committed slice in `Eterm` words, summed over every region — the words
+    /// the bump allocators may hand out without growing a region first.
+    pub committed_words: usize,
+    /// The total number of words **ever handed out**, summed over every region.
+    ///
+    /// **Cumulative demand, not live memory**: regions are never shrunk or reset, so this
+    /// figure only ever grows and includes terms the engine has already discarded (see
+    /// the type docs).
+    pub used_words: usize,
+    /// The summed per-region high-water mark of
+    /// [`used`](ContextHeapStats::used_words). Equal to
+    /// [`used_words`](ContextHeapStats::used_words) for every state a [`MinimalContext`]
+    /// can reach, because nothing here ever rewinds a region.
+    pub peak_words: usize,
+    /// The frontier (newest) region's [`used`](ContextHeapStats::used_words) figure, or
+    /// `0` when no region has been reserved yet. This is the figure a
+    /// [`HeapMark`] records.
+    pub frontier_used: usize,
+    /// The words still available in the frontier region's committed slice, or `0` when no
+    /// region has been reserved yet. An allocation larger than this asks the frontier to
+    /// raise its committed limit in place (and only a request past the whole reservation
+    /// pushes a fresh region).
+    pub frontier_available: usize,
+}
+
+/// A **mark** of a [`MinimalContext`]'s allocation frontier: the region it names, that
+/// region's base address and how many words it had handed out.
+///
+/// Returned by [`MinimalContext::heap_mark`] and checked by
+/// [`MinimalContext::heap_mark_matches`]. It is a `Copy` value with private fields — the
+/// only ways to obtain one are [`HeapMark::EMPTY`] and `heap_mark()` — so a mark always
+/// describes a state this heap actually reached.
+///
+/// # What a mark is for, and what it is NOT
+///
+/// The mark exists so a caller can later ask the **typed question** "is the region I
+/// recorded still the allocation frontier, and has the bump pointer only moved
+/// forward?" — the structural precondition any rewind needs. It carries the region's
+/// **base address** as well as its index because a region can be *replaced* (an
+/// exhausted reservation is followed by a fresh, larger one whose words never overlap
+/// the old region's), and an address is the one property a replaced region cannot
+/// preserve. That is the same discipline `beam_rt`'s `-eval` scratch store applies when
+/// it windows its own heap.
+///
+/// A mark makes **nothing safe**. A rewind (moving the frontier's bump pointer back to
+/// `used()`) is sound only when the caller has independently proved that **nothing
+/// reachable lies at or above the mark** — because every word above it is, by
+/// construction, either unreachable *and* allowed to be overwritten, or it is garbage.
+/// The arena cannot check that: it cannot tell a term slot from raw payload bytes
+/// (telling them apart needs term-structure knowledge this heap seam deliberately does
+/// not have — the same reason it never calls
+/// [`ReservedHeap::relocate`](beam_alloc::ReservedHeap::relocate)). So this type is
+/// deliberately **inert**: there is no `rewind`, no `reset_to` and no unsafe primitive
+/// behind it, only the marker and the typed predicate. The reachability proof — a walk
+/// over the machine's roots ([`Machine::for_each_root`](crate::machine::Machine::for_each_root))
+/// and the heap's regions
+/// ([`MinimalContext::for_each_heap_region`]) — is the caller's, and it is the whole
+/// reason a future rewind is a *caller* decision rather than an arena one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapMark {
+    /// The index of the region the mark was taken in (`None` = no region existed).
+    region: Option<usize>,
+    /// The marked region's base address, as an address value (not a pointer, so a mark
+    /// stays a plain `Send + Sync` value and comparing two marks compares addresses).
+    base: usize,
+    /// The marked region's `used()` figure at the moment of the mark.
+    used: usize,
+}
+
+impl HeapMark {
+    /// The mark of a heap that has **not reserved a region yet**.
+    ///
+    /// It matches only a heap that still has no region
+    /// ([`MinimalContext::heap_mark_matches`]): once a region exists, "nothing has been
+    /// handed out" is no longer a state the frontier can be in, so an empty mark is
+    /// reported as not matching rather than silently accepting a rewind to a state the
+    /// heap cannot be rewound to.
+    pub const EMPTY: HeapMark = HeapMark {
+        region: None,
+        base: 0,
+        used: 0,
+    };
+
+    /// How many words the marked region had handed out (`0` for [`HeapMark::EMPTY`]).
+    pub fn used(&self) -> usize {
+        self.used
     }
 }
 
@@ -1832,6 +2086,68 @@ impl MinimalContext {
     pub fn set_shared_atoms(&mut self, atoms: AtomTable) {
         self.shared_atoms = Some(atoms);
     }
+
+    /// The region heap's **[`census`](ContextHeapStats)**: region count, reserved /
+    /// committed / used / peak words and the frontier's own two figures.
+    ///
+    /// Infallible, allocation-free (`O(regions)`) and read-only: it changes no allocation
+    /// state, so it is safe to call between any two allocations (and from a test that
+    /// needs to assert the growth path). Read
+    /// [`ContextHeapStats::used_words`] as **cumulative demand**, never as live memory —
+    /// the arena never frees, shrinks or rewinds a region.
+    pub fn heap_stats(&self) -> ContextHeapStats {
+        self.heap.stats()
+    }
+
+    /// A **[`HeapMark`]** of the current allocation frontier.
+    ///
+    /// [`HeapMark::EMPTY`] until the first allocation reserves a region. The mark is
+    /// inert by design: it lets a caller detect that the frontier region was replaced
+    /// ([`MinimalContext::heap_mark_matches`]) and nothing more — a rewind additionally
+    /// requires a proof that nothing reachable lies at or above the mark, which is the
+    /// caller's to establish (see [`HeapMark`]).
+    pub fn heap_mark(&self) -> HeapMark {
+        self.heap.mark()
+    }
+
+    /// Whether `mark` still names this context's **current allocation frontier**, taken
+    /// at or before its current used figure.
+    ///
+    /// `false` for a **stale** mark (the region it recorded has since been replaced by a
+    /// fresh frontier region), for a **forward** mark (it claims more words than the
+    /// frontier has handed out) and for [`HeapMark::EMPTY`] once a region exists. This is
+    /// the typed predicate a caller applies *before* trusting a mark; it grants no
+    /// permission to rewind, and there is no unsafe primitive behind it.
+    pub fn heap_mark_matches(&self, mark: HeapMark) -> bool {
+        self.heap.mark_matches(mark)
+    }
+
+    /// Visit every region's **written prefix** (`[0, used)` words) as a mutable slice,
+    /// **oldest region first**.
+    ///
+    /// This is the census/reachability-walk door the region heap exposes: a caller that
+    /// must survey every word the arena has ever handed out (a liveness proof for a
+    /// future rewind, a leak census, a memory-accounting sweep) walks the regions here
+    /// instead of holding raw pointers. Regions with no words handed out are skipped.
+    ///
+    /// # `visit` MUST NOT interpret the words as terms, and MUST NOT keep the slice
+    ///
+    /// [`ExecutionContext::alloc_words`] hands out **uninitialised** words that the
+    /// caller then writes, so a region's prefix holds a mixture of term words and raw
+    /// payload (a bitstring's bytes, a float's mantissa, a tuple's element words) — only
+    /// a walk that knows the term structure can tell them apart. `visit` therefore gets
+    /// opaque words: it may compare them or read them as raw bits
+    /// ([`Eterm::raw`](beam_term::Eterm::raw)), but dereferencing or interpreting one as a
+    /// term is a bug. The slice borrow ends when `visit` returns;
+    /// holding it (or a pointer derived from it) past that point is not supported, since a
+    /// later allocation may extend the very same region.
+    ///
+    /// The `&mut self` borrow makes that safety real: no allocation can run — hence no
+    /// word be handed out — while a region is being visited.
+    pub fn for_each_heap_region(&mut self, visit: impl FnMut(&mut [Eterm])) {
+        self.heap.for_each_region(visit);
+    }
+
     /// Forward to the installed mailbox, or return the receive seam's typed
     /// `unsupported` naming `method`.
     ///
@@ -2312,6 +2628,300 @@ mod tests {
             // SAFETY: as above.
             assert_eq!(unsafe { big.add(i).read() }, Eterm::from_raw(0x1000 + i));
         }
+    }
+
+    // ---- the heap census, mark and region walk ----------------------------
+    //
+    // The measurement + mark primitives added on top of the region heap. They change no
+    // allocation policy, no sizing and no reclaim, so each test asserts an *observation*
+    // of an exactly-known growth sequence (driven with `ContextHeap::with_geometry`).
+
+    #[test]
+    fn heap_stats_is_empty_before_the_first_allocation() {
+        let ctx = MinimalContext::new();
+        assert_eq!(
+            ctx.heap_stats(),
+            ContextHeapStats::default(),
+            "a context that has not allocated reports an all-zero census"
+        );
+        assert_eq!(ctx.heap_mark(), HeapMark::EMPTY, "no region, so no mark");
+        assert_eq!(ctx.heap_mark().used(), 0);
+        assert!(
+            ctx.heap_mark_matches(HeapMark::EMPTY),
+            "the empty mark matches the empty heap"
+        );
+
+        // A zero-word request reserves nothing (§ `alloc`'s documented dangling pointer),
+        // so the census stays empty and the walk visits no region at all.
+        let mut ctx = MinimalContext::new();
+        let _ = ctx.alloc_words(0).expect("a zero-word request is Ok");
+        assert_eq!(ctx.heap_stats(), ContextHeapStats::default());
+        let mut regions = 0;
+        ctx.for_each_heap_region(|words| {
+            regions += 1;
+            assert!(words.is_empty(), "an unallocated heap has no written prefix");
+        });
+        assert_eq!(regions, 0, "no region exists yet");
+
+        // ...and the public doors work at the production geometry: one allocation makes
+        // exactly one region, whose used figure is the cumulative demand.
+        let _ = ctx.alloc_words(3).expect("the first region is reserved lazily");
+        let stats = ctx.heap_stats();
+        assert_eq!(stats.regions, 1);
+        assert_eq!(stats.used_words, 3, "the three words just handed out");
+        assert_eq!(stats.peak_words, 3, "nothing rewinds, so peak == used");
+        assert_eq!(stats.frontier_used, 3);
+        assert_eq!(
+            stats.committed_words,
+            stats.frontier_used + stats.frontier_available,
+            "the frontier's two figures partition its committed slice"
+        );
+        assert!(
+            stats.reserved_words >= stats.committed_words,
+            "a reservation covers its committed slice"
+        );
+        assert!(
+            !ctx.heap_mark_matches(HeapMark::EMPTY),
+            "once a region exists, 'no region yet' no longer matches"
+        );
+        assert!(ctx.heap_mark_matches(ctx.heap_mark()));
+    }
+
+    #[test]
+    fn heap_stats_reports_every_region_and_the_frontier() {
+        // Reserve == commit == 4: every allocation of 4 words exactly fills a reservation,
+        // so each one is followed by a fresh, doubled region — three regions after four
+        // allocations, with no in-place growth in between.
+        let mut heap = ContextHeap::with_geometry(4, 4);
+        for _ in 0..4 {
+            let _ = heap.alloc(4).expect("every region serves 4 words");
+        }
+        assert_eq!(heap.regions.len(), 3, "three regions were pushed");
+
+        let stats = heap.stats();
+        assert_eq!(stats.regions, 3);
+        assert_eq!(
+            stats.reserved_words,
+            4 + 8 + 16,
+            "the reservations, summed over every region (each fresh one doubles)"
+        );
+        assert_eq!(
+            stats.committed_words,
+            4 + 8 + 4,
+            "each region commits its geometry (the last one starts over at 4)"
+        );
+        assert_eq!(stats.used_words, 4 + 8 + 4, "every region was filled");
+        assert_eq!(stats.peak_words, stats.used_words);
+        assert_eq!(
+            stats.frontier_used, 4,
+            "the frontier's own figure, not the total"
+        );
+        assert_eq!(stats.frontier_available, 0, "the frontier is full");
+
+        // The sums are over the regions, stated region by region.
+        assert_eq!(
+            stats.reserved_words,
+            heap.regions
+                .iter()
+                .map(ReservedHeap::reserved_words)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            stats.committed_words,
+            heap.regions
+                .iter()
+                .map(ReservedHeap::committed_words)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            stats.used_words,
+            heap.regions.iter().map(ReservedHeap::used).sum::<usize>()
+        );
+        assert_eq!(
+            stats.peak_words,
+            heap.regions.iter().map(ReservedHeap::peak_used).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn used_words_is_cumulative_across_regions() {
+        // Reserve 8 but commit only 2, so the committed limit is raised IN PLACE three
+        // times before the reservation is exhausted and a second region appears.
+        let mut heap = ContextHeap::with_geometry(8, 2);
+        let mut previous = heap.stats().used_words;
+        let mut readings = Vec::new();
+        for _ in 0..4 {
+            let _ = heap.alloc(2).expect("the first region is grown in place");
+            let stats = heap.stats();
+            assert_eq!(stats.regions, 1, "an in-place grow adds no region");
+            assert_eq!(
+                stats.used_words,
+                previous + 2,
+                "each allocation adds exactly its words to the cumulative figure"
+            );
+            previous = stats.used_words;
+            readings.push(stats.used_words);
+        }
+        assert_eq!(readings, vec![2, 4, 6, 8]);
+
+        // The fifth request cannot be served by the exhausted reservation: a fresh region
+        // becomes the frontier, and the OLD region's eight words stay counted.
+        let _ = heap.alloc(2).expect("a fresh region serves the request");
+        let stats = heap.stats();
+        assert_eq!(stats.regions, 2);
+        assert_eq!(stats.frontier_used, 2, "the fresh region has handed out 2 words");
+        assert_eq!(
+            stats.used_words, 10,
+            "cumulative demand: 8 in the retired region + 2 in the frontier"
+        );
+        assert_eq!(
+            stats.peak_words, stats.used_words,
+            "no region is ever reset, so peak == used"
+        );
+        assert!(
+            stats.used_words > stats.frontier_used,
+            "used_words is CUMULATIVE DEMAND, so it exceeds what the frontier holds"
+        );
+        assert_eq!(
+            stats.used_words,
+            heap.regions.iter().map(ReservedHeap::used).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn heap_mark_reports_the_frontier_and_detects_a_replaced_region() {
+        // Reserve 8, commit 4: two allocations of 2 grow the frontier in place, then 4
+        // more fill the reservation, then the next request replaces the region.
+        let mut heap = ContextHeap::with_geometry(8, 4);
+        let _ = heap.alloc(2).expect("the committed slice serves 2 words");
+        let mark = heap.mark();
+        assert_eq!(mark.used(), 2, "the mark records the frontier's used figure");
+        assert_eq!(heap.regions.len(), 1);
+        assert!(heap.mark_matches(mark), "the mark names the live frontier");
+
+        let _ = heap.alloc(2).expect("in-place growth serves the request");
+        assert!(
+            heap.mark_matches(mark),
+            "the bump pointer only moved FORWARD, so the older mark still matches"
+        );
+        let _ = heap.alloc(4).expect("the rest of the committed slice");
+        assert!(heap.mark_matches(mark), "still the same region");
+
+        // The reservation is now exhausted, so the next request replaces the region: the
+        // old mark names a region that is alive but no longer the allocation frontier.
+        let _ = heap.alloc(2).expect("a fresh region serves the request");
+        assert_eq!(heap.regions.len(), 2);
+        assert!(
+            !heap.mark_matches(mark),
+            "a replaced region makes the old mark stale"
+        );
+        let fresh = heap.mark();
+        assert_ne!(fresh, mark);
+        assert_eq!(fresh.used(), 2, "the fresh frontier's own used figure");
+        assert!(heap.mark_matches(fresh));
+
+        // A FORWARD mark — one claiming more words than the frontier has handed out — is
+        // rejected too, which is the second way a mark can be unusable.
+        let mut forward = fresh;
+        forward.used += 1;
+        assert!(
+            !heap.mark_matches(forward),
+            "a mark past the bump pointer is not a state the heap reached"
+        );
+        let mut behind = fresh;
+        behind.used -= 1;
+        assert!(
+            heap.mark_matches(behind),
+            "a mark at or behind the bump pointer in the same region still matches"
+        );
+
+        // A mark never outlives its heap's identity check: a mark from another heap's
+        // frontier (a different base) is rejected even at the same index and used figure.
+        let mut other = ContextHeap::with_geometry(8, 4);
+        let _ = other.alloc(2).expect("the other heap's first region");
+        if other.regions[0].base() as usize != heap.regions[1].base() as usize {
+            let other_mark = other.mark();
+            assert!(
+                !heap.mark_matches(other_mark),
+                "a mark names a region by address, so another heap's mark is stale here"
+            );
+        }
+    }
+
+    #[test]
+    fn for_each_heap_region_hands_only_the_written_prefix_oldest_first() {
+        // Reserve 16, commit 8: the first allocation leaves 6 committed-but-unwritten
+        // words, which the walk must NOT expose.
+        let mut heap = ContextHeap::with_geometry(16, 8);
+        let first = heap.alloc(2).expect("the committed slice serves 2 words");
+        // SAFETY: `alloc(2)` returned 2 exclusively-owned writable words.
+        unsafe {
+            first.write(Eterm::from_raw(0xA0));
+            first.add(1).write(Eterm::from_raw(0xA1));
+        }
+        // Fill the rest of the first region (14 more words) so the next request must
+        // replace it.
+        let rest = heap.alloc(14).expect("in-place growth fills the reservation");
+        for i in 0..14 {
+            // SAFETY: `rest` owns 14 exclusive words, so index `i` is in bounds.
+            unsafe { rest.add(i).write(Eterm::from_raw(0xB0 + i)) };
+        }
+        assert_eq!(heap.regions.len(), 1);
+        assert_eq!(heap.regions[0].used(), 16);
+        // A fresh region, committed to 8 words but with only 2 handed out.
+        let fresh = heap.alloc(2).expect("a fresh region serves the request");
+        // SAFETY: `fresh` owns 2 exclusively-owned writable words.
+        unsafe {
+            fresh.write(Eterm::from_raw(0xC0));
+            fresh.add(1).write(Eterm::from_raw(0xC1));
+        }
+        assert_eq!(heap.regions.len(), 2);
+        assert_eq!(heap.regions[1].committed_words(), 8);
+        assert_eq!(heap.regions[1].used(), 2);
+
+        let mut visits: Vec<Vec<Eterm>> = Vec::new();
+        heap.for_each_region(|words| visits.push(words.to_vec()));
+
+        assert_eq!(visits.len(), 2, "one visit per region with a written prefix");
+        let mut expected_first = vec![Eterm::from_raw(0xA0), Eterm::from_raw(0xA1)];
+        expected_first.extend((0..14).map(|i| Eterm::from_raw(0xB0 + i)));
+        assert_eq!(
+            visits[0], expected_first,
+            "the oldest region first, its words in allocation order"
+        );
+        assert_eq!(
+            visits[0].len(),
+            16,
+            "exactly the written prefix of a full region"
+        );
+        assert_eq!(
+            visits[1],
+            vec![Eterm::from_raw(0xC0), Eterm::from_raw(0xC1)],
+            "the frontier's written prefix, and NOT its committed-but-unwritten tail"
+        );
+        assert_eq!(
+            visits.iter().map(Vec::len).sum::<usize>(),
+            heap.stats().used_words,
+            "the walk covers exactly the cumulative demand"
+        );
+
+        // The slice is the LIVE region: a rewrite through it is visible afterwards.
+        heap.for_each_region(|words| {
+            for word in words.iter_mut() {
+                *word = Eterm::from_raw(0xDEAD);
+            }
+        });
+        // SAFETY: `first` still points into the first region, which is alive and unmoved.
+        assert_eq!(unsafe { first.read() }, Eterm::from_raw(0xDEAD));
+        // SAFETY: `fresh` still points into the second region's first word.
+        assert_eq!(unsafe { fresh.read() }, Eterm::from_raw(0xDEAD));
+        // The words past `used` were never handed to the visitor: the frontier still has
+        // six committed-but-unwritten words left after the walk.
+        assert_eq!(
+            heap.regions[1].committed_words() - heap.regions[1].used(),
+            6,
+            "six committed words stayed out of the walk"
+        );
     }
 
     #[test]
