@@ -117,6 +117,9 @@ No item here is re-implemented from the lower crates: terms come from `beam_term
 - **No pending-unlink record is kept** — the id is minted and forgotten, so an inbound `DOP_UNLINK_ID_ACK` has nothing here to match (the inbound side likewise has no reply channel to emit one).
 - **`DistSignal::Monitor`'s `kind` (`MonitorKind`) is dropped** by the `..` at `client.rs:910`: a **port** monitor encodes as `Dop::MonitorP` with no gate and no typed refusal.
 - **`step_links`' retirement of a cleanly-closed link records `BadArg`** (`client.rs:671`) — the diagnostic reads as a bad-argument error for an orderly EOF.
+- **`scratch` is reclaimed only by a drain that ends with the queue empty** (`client.rs:863-866`), and a drain *entered* with an empty queue returns before any reset (`client.rs:831-833`).
+  The words a message send writes there its own way — `local_pid_term` (4 words, `:806-814`) plus `RemotePid::to_eterm` (4 words, `:629`) — are therefore never reclaimed by that send's own drain, so a message-only workload walks the fixed 4096-word heap (`SCRATCH_WORDS`, `:59`) to a typed `BeamError::Alloc` after roughly 500 `send_message_pid`/`send_alias` calls unless a routed control signal happens to drain in between.
+  `payloads` is unaffected (it is reset per `externalize`, `../dist/externalize.rs:234`).
 
 ## Test Strategy
 The colocated suite (`tests.rs`, 18 tests) is hermetic: a loopback socket and a server-side `ConnectionDriver`, no `erl` and no real `epmd`.
