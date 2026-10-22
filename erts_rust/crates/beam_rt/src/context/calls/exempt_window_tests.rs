@@ -29,14 +29,22 @@
 //! ([`super::super::gc::may_replace_young_space`]), consulted by this copy-out and by the two
 //! `gc.rs` allocation seams.
 //!
-//! The three cases below are that rule's full boundary: inside the window an oversized copy-out
-//! never replaces the space (**the pin**), the window still re-homes what fits, and the same
-//! oversized copy-out grows again the moment the window closes — so the gate is window-scoped
+//! The cases below are that rule's full boundary: inside the window an oversized copy-out never
+//! replaces the space and is **stabilized** onto the runtime's pointer-stable store instead
+//! (**the pin** — `refuse ⇒ stabilize, never dangle`), the window still re-homes what fits, the
+//! stabilized result licenses the caller's pool rewind like any other copy, and the same oversized
+//! copy-out grows the nursery again the moment the window closes — so the gate is window-scoped
 //! rather than a permanent refusal.
 
+use std::rc::Rc;
+
+use beam_bifs::BifContext;
+use beam_common::Result;
+use beam_engine::ExecutionContext;
 use beam_process::SignalAtoms;
 use beam_process::ProcessId;
 use beam_term::make_small;
+use beam_term::NIL;
 
 use super::*;
 
@@ -61,7 +69,44 @@ fn int_list(heap: &mut beam_alloc::Heap, n: i64) -> Result<Eterm> {
     }
     Ok(list)
 }
-/// The same rule at the **allocation seams** ([`super::super::gc::alloc_words`] /
+
+/// Whether `term`'s own pointer lands inside the runtime's long-lived **store**
+/// ([`Runtime::eval_heap`](crate::runtime::Runtime::eval_heap)) — the pointer-stable, never-reset
+/// destination of [`RuntimeContext::move_result_into_runtime_store`], i.e. the region a
+/// stabilized copy-out must land on.
+///
+/// The check is on the **term's own address only** (no dereference): an immediate carries no
+/// address and a literal lives in its module's frozen area, so both answer `false` by the same
+/// reasoning that makes them immune to a pool rewind.
+fn lies_in_the_store(rt: &crate::runtime::Runtime, term: Eterm) -> bool {
+    if !(beam_term::prelude::is_list(term) || beam_term::prelude::is_boxed(term)) {
+        return false;
+    }
+    let address = beam_term::prelude::ptr_val(term) as usize & !0b11;
+    let hp = rt.eval_heap.hp() as usize;
+    let base = hp - rt.eval_heap.used() * core::mem::size_of::<Eterm>();
+    address >= base && address < hp
+}
+
+/// The pooled BIF heap's frontier, i.e. how many words the region the next call allocates on is
+/// currently handing out. A call that copied its container result out has rewound it to its own
+/// `mark`; a call that could not answers with a non-zero figure, which is the live word's address
+/// space.
+fn pool_frontier_used(rt: &crate::runtime::Runtime) -> usize {
+    rt.bif_heaps.last().expect("the pool keeps a region").used()
+}
+
+/// An `n`-cell list of small ints built on the **pooled BIF heap** — the shape a registered BIF
+/// hands back, so the fixture below returns a genuine foreign container result.
+const POOL_CELLS: usize = 500;
+
+fn pool_int_list(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let mut list = NIL;
+    for i in (1..=POOL_CELLS as i64).rev() {
+        list = ctx.heap().cons(make_small(i), list)?;
+    }
+    Ok(list)
+}/// The same rule at the **allocation seams** ([`super::super::gc::alloc_words`] /
 /// [`alloc_words_rooted`](super::super::gc::alloc_words_rooted)): an exempt application that asks
 /// for more words than the nursery has free gets the pointer-stable **arena** block and replaces
 /// nothing.
@@ -127,23 +172,29 @@ fn an_exempt_allocation_seam_does_not_replace_the_young_space() {
 }
 
 /// The **pin**: an oversized copy-out taken inside a relocation-exempt window leaves the young
-/// space exactly as it found it.
+/// space exactly as it found it, and answers a **stabilized** copy on the runtime store.
 ///
 /// The graph is provably larger than the destination's free words (asserted, not assumed), so the
-/// copy can only succeed by **replacing** the young space — which a window whose root set is
-/// incomplete may not do. Every observation is on the process itself and on the copy-out's own
-/// structural counters, so a future change cannot satisfy this case by anything but the rule:
+/// copy can only succeed on the young heap by **replacing** it — which a window whose root set is
+/// incomplete may not do. The rule is `refuse ⇒ stabilize, never dangle`: instead of either a
+/// growth a later chain collapse revokes or a live `Eterm` left on a pooled region the caller's
+/// own rewind then recycles, the result is copied onto the runtime's pointer-stable, never-reset
+/// store and that copy is the answer.
 ///
-/// * the answer is `None`, i.e. the result stays on the never-rewound pooled BIF heap (a leak,
-///   never a dangling word);
+/// Every observation is on the process itself, on the store and on the copy-out's own structural
+/// counters, so a future change cannot satisfy this case by anything but the rule:
+///
+/// * the answer is `Some(copy)` whose graph is **intact** (same flat word count as the source) and
+///   which lies on the store — **not** on the process young heap, which is what the pre-rule code
+///   could not produce (it answered `None`);
 /// * `young_space_count` and the current space's `capacity_words` are unchanged — **no**
-///   replacement, which is the assertion the pre-rule code fails;
+///   replacement;
 /// * `collection_debt` stays `false` — nothing was retired, so nothing owes a collection;
 /// * neither `notes` growth counter moved, so neither growth site ran: not the learned-hint gate
 ///   (which would otherwise grow *before* the first attempt, because the hint is set) and not the
 ///   post-refusal retry;
-/// * the copy **is still attempted** (`attempts == 1`), so the rule declines the *replacement*
-///   and not the retention.
+/// * the copy **is still attempted** exactly once (`attempts == 1`), so the rule declines the
+///   *replacement* and not the retention.
 #[test]
 fn an_exempt_copy_out_never_replaces_the_young_space() {
     /// Cells in the source graph: 500 cons cells = 1 000 words, against a 233-word nursery.
@@ -155,7 +206,7 @@ fn an_exempt_copy_out_never_replaces_the_young_space() {
     let mut source = beam_alloc::Heap::new(2 * CELLS as usize + 64).expect("the source heap");
     let container = int_list(&mut source, CELLS).expect("the source graph");
     // The precondition the case depends on, asserted rather than assumed: the graph does NOT fit
-    // the destination, so only a replacement could make the copy succeed.
+    // the destination, so only a replacement could make the copy succeed there.
     let available = table.get(pid).expect("the spawned process").heap().available();
     let graph_words = beam_term::size_object(container);
     assert!(
@@ -173,6 +224,11 @@ fn an_exempt_copy_out_never_replaces_the_young_space() {
         .collector()
         .young()
         .capacity_words();
+    assert_eq!(
+        rt.eval_heap.used(),
+        0,
+        "the store starts empty, so the copy is the only thing on it"
+    );
     // The window is opened the way `RuntimeContext::with_relocation_exempt` opens it: the
     // process's own mark, on the table the context runs against.
     table
@@ -186,44 +242,160 @@ fn an_exempt_copy_out_never_replaces_the_young_space() {
         notes::reset();
         ctx.move_result_into_process_heap(container)
     };
-    assert!(
-        copy.is_none(),
-        "an exempt window cannot re-home a result it would have to grow the space for: the \
-         answer must be `None`, so the result stays on the pooled heap and the pool is not rewound"
+    let copy = copy.expect(
+        "an exempt window STABILIZES a result it may not grow the space for: the answer must be \
+         the copy on the runtime store, never `None`",
     );
-    let process = table.get(pid).expect("the spawned process");
+    {
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            process.collector().young_space_count(),
+            spaces_before,
+            "an exempt copy-out must not REPLACE the young space"
+        );
+        assert_eq!(
+            process.collector().young().capacity_words(),
+            capacity_before,
+            "and must not install a larger current space either"
+        );
+        assert!(
+            !process.collection_debt(),
+            "nothing was retired, so nothing owes a collapsing collection"
+        );
+        assert!(
+            !process.collector().young().contains_term(copy),
+            "the answer must not be a word of the (unreplaceable) young space"
+        );
+    }
     assert_eq!(
-        process.collector().young_space_count(),
-        spaces_before,
-        "an exempt copy-out must not REPLACE the young space"
-    );
-    assert_eq!(
-        process.collector().young().capacity_words(),
-        capacity_before,
-        "and must not install a larger current space either"
+        beam_term::size_object(copy),
+        graph_words,
+        "the stabilized copy is the whole graph, not a truncated spine"
     );
     assert!(
-        !process.collection_debt(),
-        "nothing was retired, so nothing owes a collapsing collection"
+        lies_in_the_store(&rt, copy),
+        "the copy lives on the runtime's pointer-stable store — the destination a rewind and a \
+         chain collapse cannot reach"
+    );
+    assert_eq!(
+        rt.eval_heap.used(),
+        graph_words,
+        "the copy — and only the copy — is on the store"
     );
     let (attempts, grows, _empties) = notes::snapshot();
     assert_eq!(
         grows, 0,
         "neither growth site may run inside the window: the hint gate is gated on the same rule \
-         and the post-refusal retry returns before it"
+         and the post-refusal retry is not reached"
     );
     assert_eq!(
         notes::hint_grows(),
         0,
         "the learned-hint gate is a replacement too, so it is skipped even with a hint set"
     );
-    assert_eq!(
-        attempts, 1,
+    assert!(
+        attempts >= 2,
         "the copy is still ATTEMPTED inside the window — the rule declines the replacement, not \
-         the retention"
+         the retention — and the stabilized retry on the store is a second attempt (got {attempts})"
+    );
+    // The value is intact end to end: the renderer walks the copy on the store.
+    let rendered = rt
+        .format_term_w(copy, None)
+        .expect("the stabilized copy renders");
+    let rendered = rendered.trim_end();
+    assert!(
+        rendered.starts_with("[1,2,3,4,5,") && rendered.ends_with(",499,500]"),
+        "the stabilized copy is the whole list: {rendered}"
     );
 }
 
+/// The stabilized copy **licenses the caller's pool rewind**, which is the defect the refusal
+/// class produced: a `None` from the copy-out left the result on the pooled BIF region the
+/// caller then did not rewind, so the value kept pointing at words a *later* call would recycle.
+///
+/// This drives the real dispatch (`call_bif` → `call_registered` → the copy-out) on a registered
+/// fixture whose result is a 500-cell list built on the pool: inside the exempt window the young
+/// space is untouched, the returned value is a self-contained store copy, and the pool frontier
+/// returns to the call's `mark` — so the same call is now safe on both counts.
+#[test]
+fn an_exempt_copy_out_that_cannot_fit_still_licenses_the_pool_rewind() {
+    let mut rt = crate::runtime::Runtime::new(crate::config::RuntimeConfig::default())
+        .expect("the default runtime");
+    {
+        let registry = Rc::get_mut(&mut rt.registry).expect("the runtime holds the only handle");
+        let _ = registry.register("exempt_fixture", "big_list", 0, pool_int_list);
+    }
+    let (mut table, pid) = process_table(&mut rt);
+    let available = table.get(pid).expect("the spawned process").heap().available();
+    assert!(
+        2 * POOL_CELLS > available,
+        "the fixture's graph must not fit the destination: {} words against {available} free",
+        2 * POOL_CELLS
+    );
+    let spaces_before = table
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young_space_count();
+    let capacity_before = table
+        .get(pid)
+        .expect("the spawned process")
+        .collector()
+        .young()
+        .capacity_words();
+    assert_eq!(pool_frontier_used(&rt), 0, "the pool starts clean");
+    table
+        .set_relocation_exempt(pid, true)
+        .expect("the process is exempt");
+    let result = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        notes::reset();
+        ctx.call_bif("exempt_fixture", "big_list", 0, &[])
+            .expect("the fixture BIF returns")
+    };
+    assert_eq!(
+        pool_frontier_used(&rt),
+        0,
+        "a stabilized copy-out rewinds the pool exactly as a grown one does — the result is no \
+         longer left on a region a later call recycles"
+    );
+    {
+        let process = table.get(pid).expect("the spawned process");
+        assert_eq!(
+            process.collector().young_space_count(),
+            spaces_before,
+            "the window still replaces nothing"
+        );
+        assert_eq!(
+            process.collector().young().capacity_words(),
+            capacity_before,
+            "and installs no larger current space"
+        );
+        assert!(
+            !process.collector().young().contains_term(result),
+            "the returned value is not a young-space word"
+        );
+    }
+    assert!(
+        lies_in_the_store(&rt, result),
+        "the returned value lives on the runtime store"
+    );
+    assert_eq!(
+        beam_term::size_object(result),
+        2 * POOL_CELLS,
+        "and is the fixture's whole graph"
+    );
+    let rendered = rt
+        .format_term_w(result, None)
+        .expect("the returned value renders");
+    let rendered = rendered.trim_end();
+    assert!(
+        rendered.starts_with("[1,2,3,4,5,") && rendered.ends_with(",499,500]"),
+        "the returned value is intact after the rewind: {rendered}"
+    );
+    let (_attempts, grows, _empties) = notes::snapshot();
+    assert_eq!(grows, 0, "no growth ran inside the window");
+}
 /// The boundary the other way: a container that **fits** is still re-homed inside the window.
 ///
 /// An exempt window needs the retention as much as any other route — the pooled BIF heap is a
