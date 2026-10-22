@@ -1405,7 +1405,7 @@ impl<'a> RuntimeContext<'a> {
     /// engine already publishes (it lands in `x(0)` on return) and is relocated by a later
     /// collection, instead of declining every one through the unscanned-root valve.
     ///
-    /// # Growth is the NO-RELOCATION seam
+    /// # Growth is the NO-RELOCATION seam, and it is taken only for a published-root caller
     ///
     /// A full nursery is met by [`Process::grow_nursery`](beam_process::Process::grow_nursery) and
     /// **one** retry — deliberately **not** by
@@ -1413,8 +1413,22 @@ impl<'a> RuntimeContext<'a> {
     /// `process.regs.gather_roots()`, the process's *published* root set. Inside a BIF call the
     /// machine's live x registers and Erlang stack are **not** published, so collecting here would
     /// free live terms. `grow_nursery` retires the space it replaces and moves no live term, which
-    /// its own docs declare legal and correct for a host holding an incomplete or unpublished root
-    /// set — exactly this situation.
+    /// is why it is the right seam here.
+    ///
+    /// It is **not** however unconditionally legal: a replacement is taken only while this
+    /// process's root set is complete
+    /// ([`gc::may_replace_young_space`](super::gc::may_replace_young_space) — the process is not
+    /// [`relocation-exempt`](beam_process::Process::is_relocation_exempt)). A growth retires the
+    /// space it replaces and keeps a word addressable at its original address only **until the
+    /// next collection collapses the chain**, and that collection runs at a non-exempt admission
+    /// door whose root set cannot name the words an exempt window is holding on the Rust side — so
+    /// a replacement taken inside such a window buys addressability a later collapse revokes.
+    ///
+    /// Inside an exempt window the copy is therefore still **attempted** (it needs no
+    /// replacement when the graph fits) but the hint gate and the growth are **skipped**, and an
+    /// exhaustion refusal answers `None`: the result stays on the never-rewound pooled BIF heap —
+    /// [`Self::call_registered`] leaves the pool at the call's own offset — so the residual is a
+    /// **leak, never a dangle**, bounded by the window's own length.
     ///
     /// # A FRESH, EMPTY destination off-heap table per attempt
     ///
@@ -1493,9 +1507,17 @@ impl<'a> RuntimeContext<'a> {
         // for byte (the result stays on the pooled heap, which is then not rewound).
         let table = mailbox_table.as_deref_mut()?;
         let process = table.get_mut(pid)?;
+        // Read the window state **once** (the process is borrowed for the rest of the call, and
+        // the two seams below — the hint gate and the growth — must agree): a young-space
+        // REPLACEMENT is legal only while this process's root set is complete, see
+        // [`super::gc::may_replace_young_space`].
+        let republishable = super::gc::may_replace_young_space(process);
         // Spend the hint BEFORE the first attempt, so the copy succeeds on its first pass
-        // instead of paying the refusal it would otherwise teach us again.
-        hint_grow_gate(process, hint);
+        // instead of paying the refusal it would otherwise teach us again — but only where the
+        // space may be replaced, because spending the hint IS a replacement.
+        if republishable {
+            hint_grow_gate(process, hint);
+        }
         // One fresh destination table per attempt (see the docs above): a refused attempt's
         // partial state is never rolled into the retry, so both attempts hand the copier an
         // empty destination and take the single-traversal fast path.
@@ -1526,6 +1548,14 @@ impl<'a> RuntimeContext<'a> {
                 needed
             }
         };
+        // REFUSE inside a relocation-exempt window: the destination could not hold the graph and
+        // replacing the young space is illegal here (see the docs above and
+        // [`super::gc::may_replace_young_space`]). `None` leaves the result on the pooled BIF
+        // heap **and** leaves the pool un-rewound ([`Self::call_registered`] sets `rewind` only
+        // after a successful re-home), so the residual is a leak, never a dangling word.
+        if !republishable {
+            return None;
+        }
         // GROW: the NO-RELOCATION seam ([`Process::grow_nursery`]) retires the space it replaces
         // and moves no live term, so the copy can simply be re-attempted from the fresh space's
         // base.
@@ -2023,13 +2053,19 @@ const COPY_OUT_HINT_MIN_WORDS: usize = 8;
 /// destination also has room for the copy-out's own result slot and the caller's next few
 /// allocations.
 ///
-/// # The growth is the NO-RELOCATION seam, which is why it is legal here
+/// # The growth is the NO-RELOCATION seam — and it is only called where replacing is legal
 ///
 /// [`Process::grow_nursery`] retires the space it replaces and **moves no live term**, so it is
-/// correct for a host holding an incomplete or unpublished root set — exactly this situation: a
-/// registered BIF runs with the executing machine's x registers and Erlang stack *not*
-/// published ([`RuntimeContext::move_result_into_process_heap`]'s growth block states the same
-/// for its own retry). Collecting here instead would free live terms.
+/// the right seam for a BIF call, where the executing machine's x registers and Erlang stack are
+/// not published: collecting here instead would free live terms.
+///
+/// "Moves nothing" is not by itself a licence to replace the space, though. The replacement keeps
+/// every handed-out word addressable at its original address only until the next **collection
+/// collapses the chain**, and that collection's root set cannot name the words a relocation-exempt
+/// window holds on the Rust side — so this gate is called **only** for a process whose root set is
+/// complete ([`super::gc::may_replace_young_space`], tested by the caller). A refused gate costs
+/// nothing but the opportunity: the ordinary refusal → grow → retry path that follows is guarded
+/// by the same rule, and where it too may not grow the copy is simply not re-homed.
 ///
 /// A destination that already has `request` words free is left alone: `Nursery::grow` would
 /// return `Ok` without installing anything, so the test only saves the call.
@@ -2337,6 +2373,9 @@ mod tests;
 #[cfg(test)]
 #[path = "calls/alias_tests.rs"]
 mod alias_tests;
+#[cfg(test)]
+#[path = "calls/exempt_window_tests.rs"]
+mod exempt_window_tests;
 
 // ---------------------------------------------------------------------------------------
 // The reference walk's CONS SPINE — the shape it is called for most

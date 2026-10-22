@@ -1429,6 +1429,42 @@ pub(crate) fn ensure_heap_full(
     Ok(())
 }
 
+/// Whether `process`'s young space may be **replaced** right now — the one definition of the rule
+/// every growth seam in this node consults ([`alloc_words`], [`alloc_words_rooted`] and
+/// `calls.rs`'s copy-out growth sites).
+///
+/// # The invariant
+///
+/// **A young-space replacement is legal only while the process's root set is complete**, i.e.
+/// only when [`Process::is_relocation_exempt`] is `false`.
+///
+/// [`Process::grow_nursery`] retires the space it replaces and keeps every word it handed out
+/// addressable **at its original address** — but only until the next **collection collapses the
+/// chain**, and a collection runs at a *non-exempt* admission door whose root set is the machine's
+/// registers/stack. A relocation-exempt window is precisely the state in which the host holds live
+/// young-heap words in Rust locals / nested-`Machine` registers that the root set does **not**
+/// publish, so the collapse can free a word this window still names: a growth taken inside the
+/// window buys addressability that a later collection revokes, and the window's own handles are
+/// exactly the ones the collection cannot relocate. That is not a leak but a dangling word, and it
+/// is what the in-process `compile:file/2` route trips deterministically.
+///
+/// A **published-root** caller (the ordinary scheduled slice, whose roots are the register file the
+/// machine hands in at every admission point) may replace the space freely: the collapse relocates
+/// its roots and it re-reads them from `Process::regs`. So the growth seam stays the
+/// *no-relocation* choice for that caller — it is never `ensure_capacity`, which would collect
+/// against an unpublished set — and the exempt window's answer is a **refusal** instead.
+///
+/// # What a refusal costs, and what it is not
+///
+/// A declined growth only declines an *optimization*: the caller falls through to its existing
+/// non-growing path (the arena fallback here, `None` from the copy-out — the result then stays on
+/// the never-rewound pooled BIF heap, so the caller does not rewind it either). The residual is
+/// therefore a **leak, never a dangle**, and it is bounded by the window's own length: the growth
+/// becomes available again the moment the window closes.
+pub(super) fn may_replace_young_space(process: &beam_process::Process) -> bool {
+    !process.is_relocation_exempt()
+}
+
 /// Heap words still available to the running code.
 ///
 /// In a scheduled slice with collection enabled this is the **real** figure — the running
@@ -1465,12 +1501,17 @@ pub(crate) fn heap_available(ctx: &RuntimeContext<'_>) -> usize {
 /// metadata-only builds): it is handed **no** root set, so it may neither collect nor hand a
 /// collection roots. A young-heap refusal that is a **capacity** failure is therefore met by
 /// [`Process::grow_nursery`] — the **no-relocation** growth seam, which retires the space it
-/// replaces without moving a single live term, so it is safe against a root set the caller
-/// cannot publish — and the bump is then retried. Only when the growth itself fails (the
-/// policy's ceiling cannot reach the request) or the retried bump still does not fit does the
-/// block come from the pointer-stable arena, byte for byte as before this seam existed. A
-/// refusal that is **not** a capacity failure (an impossible request past
+/// replaces without moving a single live term — and the bump is then retried. Only when the growth
+/// itself fails (the policy's ceiling cannot reach the request) or the retried bump still does not
+/// fit does the block come from the pointer-stable arena, byte for byte as before this seam
+/// existed. A refusal that is **not** a capacity failure (an impossible request past
 /// [`MAX_ARITYVAL`](beam_term::MAX_ARITYVAL)) goes straight to the arena: growth cannot fix it.
+///
+/// The growth is not unconditional: it is taken only when the young space may actually be
+/// **replaced** ([`may_replace_young_space`] — the process's root set is complete). Inside a
+/// relocation-exempt window the request is simply not made and the existing arena fallback serves
+/// the block, because a replacement taken there buys addressability a later collapse revokes
+/// (the invariant is stated on [`may_replace_young_space`]).
 ///
 /// Because growth retains the space it replaces, a root can point into a *retired* nursery
 /// space; the admission-point valve ([`root_is_unscanned`]) accepts a pointer into **any**
@@ -1498,10 +1539,13 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
                 match first {
                     Ok(block) => return Ok(block),
                     // A capacity refusal: grow the nursery (no relocation, no collection) and
-                    // retry the bump. Growth that cannot reach the request, or a retry that
-                    // still does not fit, falls through to the arena.
+                    // retry the bump — but only while this process's young space may be replaced
+                    // at all ([`may_replace_young_space`]: an exempt window has an incomplete
+                    // root set). Growth that cannot reach the request, a request declined because
+                    // the space may not be replaced, or a retry that still does not fit falls
+                    // through to the arena.
                     Err(BeamError::Alloc(_)) => {
-                        if process.grow_nursery(n).is_ok() {
+                        if may_replace_young_space(process) && process.grow_nursery(n).is_ok() {
                             let fill = runtime.gc_scratch(n.saturating_sub(1));
                             if let Ok(block) = bump(process.heap_mut(), n, fill) {
                                 return Ok(block);
@@ -1552,10 +1596,16 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 /// A **capacity** refusal of the young-heap bump (or a request the policy's ceiling cannot
 /// reach) is met by [`Process::grow_nursery`] and a retried bump, exactly as in
 /// [`alloc_words`] — a non-forced attempt only. The growth is the **no-relocation** seam: it
-/// retires the space it replaces without moving a live term, so it is legal for a
-/// relocation-exempt process and cannot make a later collection less conservative. It leaves
-/// [`Process::collection_debt`] behind, which the next admission point's occupancy test
-/// ([`ensure_heap_full`]) turns into a real collection.
+/// retires the space it replaces without moving a live term, so it moves nothing the handed-in
+/// root set could not describe. It leaves [`Process::collection_debt`] behind, which the next
+/// admission point's occupancy test ([`ensure_heap_full`]) turns into a real collection.
+///
+/// Like [`alloc_words`]'s, the growth is taken only while the young space may be **replaced**
+/// ([`may_replace_young_space`] — a complete root set). A relocation-exempt process skips it and
+/// continues into the existing valve + arena path below, byte for byte as before; that branch is
+/// unreachable in every measured run of the in-process `compile:file/2` route (the census is
+/// recorded in this node's `CONTEXT.md`), so it is the conservative answer rather than a live
+/// path.
 ///
 /// Serving the block from the process's own — reclaimable — heap is what keeps an arena term
 /// out of the machine's registers: the pointer-stable arena is a region the collector does
@@ -1642,15 +1692,15 @@ pub(crate) fn alloc_words_rooted(
                 Ok(block) => return Ok(block),
                 // A **capacity** refusal: grow the nursery and retry the bump, exactly as
                 // [`alloc_words`] does. [`Process::grow_nursery`] is the **no-relocation**
-                // growth seam — it retires the space it replaces without moving a live term,
-                // so it is legal for a relocation-exempt process and cannot make a later
-                // collection less conservative — and it leaves
-                // [`Process::collection_debt`], which the next admission point's occupancy
-                // test turns into a real collection. Growth that cannot reach the request
-                // (the policy's ceiling, `+hmax N`), or a retry that still does not fit,
-                // falls through to the valve + arena path byte for byte as before.
+                // growth seam — it retires the space it replaces without moving a live term —
+                // and it leaves [`Process::collection_debt`], which the next admission point's
+                // occupancy test turns into a real collection. Growth that cannot reach the
+                // request (the policy's ceiling, `+hmax N`), a request declined because the
+                // space may not be replaced ([`may_replace_young_space`]), or a retry that
+                // still does not fit, falls through to the valve + arena path byte for byte as
+                // before.
                 Err(BeamError::Alloc(_)) => {
-                    if process.grow_nursery(n).is_ok() {
+                    if may_replace_young_space(process) && process.grow_nursery(n).is_ok() {
                         let fill = runtime.gc_scratch(n.saturating_sub(1));
                         if let Ok(block) = bump(process.heap_mut(), n, fill) {
                             return Ok(block);
