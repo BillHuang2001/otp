@@ -10,6 +10,10 @@ beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_alloc = { path = "../beam_alloc" }
 beam_loader = { path = "../beam_loader" }
+# The arena's Tier-B reclaim (`src/context/reclaim.rs`) drives `beam_gc`'s published
+# relocation API (`FromSet`/`LinearDest`/`Relocator`). Directionally legal: `beam_gc` is
+# wave 1, `beam_engine` is wave 4, and `beam_gc` does not depend on `beam_engine`.
+beam_gc = { path = "../beam_gc" }
 libc.workspace = true
 cranelift-codegen = { workspace = true, optional = true }
 cranelift-module = { workspace = true, optional = true }
