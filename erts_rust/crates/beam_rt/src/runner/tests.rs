@@ -23,6 +23,7 @@
 //! (blocking, resume-on-send) is `tests/scheduler.rs`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,8 +44,9 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::{
-    park_publish_counters, publish_parked_roots, reset_park_publish_counters,
-    reset_run_slice_counters, run_slice_counters, RuntimeRunner,
+    boundary_door_counters, park_publish_counters, park_window, publish_parked_roots,
+    reset_boundary_door_counters, reset_park_publish_counters, reset_run_slice_counters,
+    run_slice_counters, ParkExemption, ParkPublishCounters, RuntimeRunner,
 };
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
 mod boundary_cost;
@@ -3518,5 +3520,315 @@ run(N) ->
         big.peak_young_spaces,
         big.peak_young_capacity,
         big.debt_boundaries,
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The park invariant: a window that SKIPS the root publication HOLDS the exemption
+// ---------------------------------------------------------------------------------------
+/// The committed busy-port fixture (see `tests/fixtures/port_suspend.erl`): `command/1` issues one
+/// plain `port_command/2`, the one producer of a `BifOutcome::Suspend` on a busy port.
+const PORT_SUSPEND_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/port_suspend.beam"
+);/// **The one park entry point keeps both halves of the invariant together.**
+///
+/// A park either writes the machine's whole root set into the process (`publish_parked_roots`)
+/// or it skips that hand-off — and skipping is sound only when nothing may relocate the heap
+/// for the window's whole duration, i.e. when the process holds its relocation exemption. So
+/// `exempt` and "published" are one decision, and [`park_window`] is where it is made: the
+/// exemption is written from the same value that picks the branch, in **both** directions.
+///
+/// A park arm that passed `exempt = true` to the publication half without taking the exemption
+/// — the `Suspend` arm's shape before the entry point existed — left the parked machine (the
+/// only holder of the process's live `x`/stack once the slice is over) collectable with its
+/// roots unpublished. The three combinations below are the whole decision surface:
+///
+/// * `LiveFloats` with a **dead** FR prefix → publish, hold nothing;
+/// * `LiveFloats` with a **live** prefix → skip, hold the exemption;
+/// * `Always` → skip, hold the exemption.
+///
+/// And a publishing park after an exempt one **clears** the flag: a stale `true` would make the
+/// very collections the publication exists for refuse the move.
+#[test]
+fn park_window_holds_the_exemption_exactly_when_it_skips_the_publication() {
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Interpreter);
+    let engine = state.engines.get_mut(&pid).expect("the engine is registered");
+    reset_park_publish_counters();
+
+    // (1) `LiveFloats` with a **dead** FR prefix: the window publishes its whole root set, so it
+    // must hold nothing — a collection may relocate whatever it published.
+    assert!(
+        park_window(&mut table, pid, engine, 0, ParkExemption::LiveFloats),
+        "a dead FR prefix publishes the root set"
+    );
+    assert!(
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a publishing window must not hold the exemption: the collection it exists for would \
+         refuse the move"
+    );
+    assert!(
+        engine.parked_published,
+        "the engine records that its roots really were handed over"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 1,
+            skipped: 0
+        }
+    );
+
+    // (2) `LiveFloats` with a **live** prefix: the machine keeps those FR slots as roots of its
+    // own for the window, so nothing may move the heap — the publication is skipped **and** the
+    // exemption is held, from the one value that decided the skip.
+    assert!(
+        !park_window(&mut table, pid, engine, 1, ParkExemption::LiveFloats),
+        "a live FR prefix skips the publication"
+    );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a skipping park MUST hold the exemption for its window — this is the invariant the \
+         `Suspend` arm broke when the two halves were separate calls"
+    );
+    assert!(!engine.parked_published);
+    assert_eq!(
+        engine.fr_published, 1,
+        "the live FR prefix is recorded either way, so the resume replays exactly it"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 1,
+            skipped: 1
+        }
+    );
+
+    // (3) `Always` (the `receive` park): skips for a reason that has nothing to do with floats,
+    // and still holds the exemption.
+    assert!(
+        !park_window(&mut table, pid, engine, 0, ParkExemption::Always),
+        "the receive park always skips the publication"
+    );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "the receive park's window is exempt for its whole duration"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 1,
+            skipped: 2
+        }
+    );
+
+    // (4) Back to a publishing window from an exempt one: the flag is CLEARED, never inherited.
+    assert!(
+        park_window(&mut table, pid, engine, 0, ParkExemption::LiveFloats),
+        "a dead FR prefix publishes again"
+    );
+    assert!(
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a publishing park clears the stale exemption, so its own collections are not refused"
+    );
+}
+
+/// **The `Suspend` (BIF-park) arm holds the window's exemption when it skips the publication.**
+///
+/// The arm parks the machine on the unapplied BIF instruction and, when the slice ended with a
+/// **live** float-register prefix, skips the root hand-off — so the parked machine is the whole
+/// root set for the window and every relocation site must refuse the move. The arm used to pass
+/// `exempt` to the publication half **alone**, so the very next `Runtime::serve_gc_request` could
+/// collect the space the machine's live `x`/stack words name and the resume would run on pointers
+/// into the abandoned from-space.
+///
+/// The FR prefix is what selects the skipping branch, and it is **sticky** for the engine's whole
+/// life (`Machine::fr_mark` is cleared only by `Machine::reset`, which only a first entry runs), so
+/// any process that ever touched a float register takes it on every later park. The test therefore
+/// reaches it the way the runtime does: one slice that pre-empts before the BIF (a budget of one
+/// instruction), a float register written between the slices exactly as a float operation leaves
+/// it, then a full-budget slice that reaches `port_command/2` on a busy port — the one producer of
+/// `BifOutcome::Suspend` — and parks there.
+#[test]
+fn a_suspend_park_with_a_live_float_prefix_holds_the_window_exemption() {
+    /// The verb the registered fixture driver treats as the C driver's `$N` clear.
+    const CLEAR: u32 = 78;
+    let mut rt = runtime();
+    // Busy from the start: the first `port_command/2` attempt meets the C's busy arm.
+    let (port, _flag, _writes) = crate::port::test_support::register_busy_control_port(
+        &mut rt,
+        "suspend_park_exempt",
+        vec![crate::port::test_support::ControlVerb::clearing(CLEAR)],
+        true,
+        false,
+    );
+    rt.code_server
+        .load_path(PathBuf::from(PORT_SUSPEND_BEAM))
+        .expect("the committed port_suspend fixture loads");
+    let entry = rt
+        .resolve_export_entry("port_suspend", "command", 1)
+        .expect("port_suspend:command/1 resolves");
+    let mut state = RunnerState::default();
+    // The interpreter tier charges the budget once per instruction, which is what makes a
+    // one-reduction slice end before the `port_command/2` call.
+    state.jit_mode = Some(JitMode::Interpreter);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    state.spawn(pid, entry, vec![port.to_eterm()]);
+
+    // Slice 1: the one-reduction budget pre-empts the machine before it reaches the BIF, so the
+    // FR file is still untouched and the park publishes its (empty) prefix.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1)
+            .expect("the pre-empting slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "a one-reduction budget pre-empts on the first charge"
+    );
+    assert_eq!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the engine is parked")
+            .fr_published,
+        0,
+        "a float-free first slice parks a dead FR prefix"
+    );
+
+    // Between the slices: a live float register, which is exactly the engine state any float
+    // operation leaves behind. `fr_mark` is sticky, so from here the engine carries a live prefix.
+    {
+        let engine = state.engines.get_mut(&pid).expect("the engine is parked");
+        engine
+            .machine
+            .set_fr(0, make_small(42))
+            .expect("FR 0 is inside the 1024-slot file");
+        assert_eq!(
+            engine.machine.fr_mark(),
+            1,
+            "the float register is live, so the next park must skip the publication"
+        );
+    }
+    reset_run_slice_counters();
+    reset_park_publish_counters();
+
+    // Slice 2: the machine resumes and reaches `port_command/2`, which parks on the unapplied
+    // instruction with a LIVE FR prefix — the skipping branch.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 10_000)
+            .expect("the suspending slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "a BIF suspend re-enqueues the process instead of letting it sleep"
+    );
+    assert!(
+        run_slice_counters().suspends >= 1,
+        "the slice must end at the BIF-suspend arm, not at a pre-emption"
+    );
+    let engine = state.engines.get(&pid).expect("the parked engine");
+    assert!(
+        !engine.parked_published,
+        "a live FR prefix skips the root publication"
+    );
+    assert_eq!(
+        engine.fr_published, 1,
+        "the live FR prefix is recorded so the resume replays exactly it"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 0,
+            skipped: 1
+        },
+        "the suspend park really took the skipping branch"
+    );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a suspend park that SKIPPED the root publication must hold the relocation exemption: \
+         the parked machine is the process's whole root set for the window, so a collection here \
+         (the very next `serve_gc_request`) would evacuate the words its live x/stack name"
+    );
+}
+
+/// **A served `garbage_collect` request on a `Yield` park is not also handed to the boundary
+/// door.**
+///
+/// The `Yield` arm parks the machine (publishing its whole root set for a dead FR prefix) and then
+/// has two possible collectors: the pending `erlang:garbage_collect/0` request, and the
+/// reduction/yield-boundary door. The request runs **first** and relocates the process's registers
+/// in place — after which the machine's own `x`/`stack` words are **pre-collection**, reconciled
+/// only by the next slice's `resume_from_process_roots`. The door begins by re-publishing exactly
+/// those machine words into the process (`publish_roots_full`'s `copy_from_slice`), so running it
+/// after a served request would resurrect dead pointers and then relocate over them.
+///
+/// The structural pin is that the door is never **asked** in that case: one `Yield` park that
+/// served the request, zero boundary checks. The control half — the same loop with no pending
+/// request — shows the door is still asked exactly once, so the skip is request-driven rather than
+/// a blanket disable.
+#[test]
+fn a_served_gc_request_is_not_also_handed_to_the_boundary_door() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Interpreter);
+
+    // The request `erlang:garbage_collect/0` records through the runtime-native floor.
+    rt.request_gc(pid);
+    reset_boundary_door_counters();
+    let collections_before = rt.gc_stats().collections;
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the pre-empting slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    assert!(
+        rt.gc_stats().collections > collections_before,
+        "the pending request really collected over the just-published root set"
+    );
+    let requested = boundary_door_counters();
+    assert_eq!(
+        requested.checks, 0,
+        "the boundary door was never asked: its opening re-publication would write the machine's \
+         PRE-collection words over the registers the request just relocated"
+    );
+    assert_eq!(
+        requested.request_collected, 1,
+        "the served request is what decides the door's fate on this park"
+    );
+    assert_eq!(requested.collections, 0, "the door ran no collection of its own");
+
+    // Control: the same park WITHOUT a pending request does hand the door its check.
+    let control = table.spawn_default().expect("a second process");
+    spawn_preempting_loop(&mut state, control, JitMode::Interpreter);
+    reset_boundary_door_counters();
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(control, &mut table, 2)
+            .expect("the control slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield);
+    let plain = boundary_door_counters();
+    assert_eq!(
+        plain.request_collected, 0,
+        "nothing collected on the control park's behalf"
+    );
+    assert_eq!(
+        plain.checks, 1,
+        "a publishing Yield park with no served request still hands the door its check"
     );
 }

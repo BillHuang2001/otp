@@ -369,7 +369,7 @@ impl<'a> RuntimeRunner<'a> {
     ///
     /// # The window must be a publishing one
     ///
-    /// `park_machine` publishes the machine's whole root set only for a **non-exempt** window;
+    /// `park_window` publishes the machine's whole root set only for a **non-exempt** window;
     /// an exempt park (a live FR prefix at the slice's end) published nothing and its machine
     /// stays the authoritative root set, so a collection here would leave the machine's own
     /// words dangling into the evacuated from-space. `engine.parked_published` is exactly that
