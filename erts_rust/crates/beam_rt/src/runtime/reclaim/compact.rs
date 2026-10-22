@@ -498,6 +498,7 @@ fn verification_owner(
     drop(roots);
     if let Some(_header) = verdict.header() {
         runtime.region_reclaim.note_unknown_header(&verdict);
+        super::holder::walk_decline(runtime, &verdict, ranges, Some(slots));
     }
     let hit = match verdict {
         Walk::Complete => hits.iter().any(|hit| *hit),
@@ -507,7 +508,9 @@ fn verification_owner(
     if !hit {
         return None;
     }
-    Some(attribute_hit(runtime, slots, ranges))
+    let owner = attribute_hit(runtime, slots, ranges);
+    super::holder::move_hit(runtime, slots, ranges, owner);
+    Some(owner)
 }
 
 /// The verification's root corpus: the caller's slots as they are now (forwarded), then every

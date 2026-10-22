@@ -142,3 +142,24 @@ pub(crate) fn arena(args: fmt::Arguments<'_>) {
         eprintln!("[rt-arena] {args}");
     }
 }
+
+/// Whether the **region-reclaim holder** diagnostic is on (`BEAM_RT_STORE_TRACE` present).
+///
+/// A sixth channel, for the one question a family-and-slot counter cannot answer: *which* stored
+/// word made the region-reclaim pass keep a region, where that word's address lives, and whether it
+/// still names a live region at all ([`crate::runtime::reclaim::holder`]). Resolved once per OS
+/// process, like [`enabled`].
+pub(crate) fn store_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BEAM_RT_STORE_TRACE").is_some())
+}
+
+/// Writes one region-reclaim holder line to stderr when [`store_enabled`]; a no-op otherwise.
+///
+/// A diagnostic only — no behaviour depends on it, and with the variable unset every call site
+/// costs the one cached `OnceLock` load of [`store_enabled`].
+pub(crate) fn store(args: fmt::Arguments<'_>) {
+    if store_enabled() {
+        eprintln!("[rt-store] {args}");
+    }
+}

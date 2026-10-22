@@ -227,6 +227,7 @@ use crate::eval::reclaim::{self, Walk};
 use crate::eval::scratch::{RangeProbe, WindowState};
 
 pub(crate) mod compact;
+pub(crate) mod holder;
 pub(crate) use compact::{MoveSlots, MoveOutcome};
 
 /// Which of the runtime-owned regions a pass may act on.
@@ -657,6 +658,7 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>, slots: &mut Move
         return;
     }
     let mut hits = vec![false; live.len()];
+    let ranges: Vec<(usize, usize)> = live.iter().map(|candidate| candidate.range).collect();
     let roots = match gather_roots(runtime, input.value_roots) {
         Ok(roots) => roots,
         Err(reason) => {
@@ -665,9 +667,9 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>, slots: &mut Move
         }
     };
     {
-        let ranges: Vec<(usize, usize)> = live.iter().map(|candidate| candidate.range).collect();
         let verdict = reclaim::walk(&roots, &mut RangeProbe::new(&ranges, &mut hits));
         if !verdict.is_complete() {
+            holder::walk_decline(runtime, &verdict, &ranges, Some(&*slots));
             runtime.region_reclaim.decline_walk(&verdict);
             return;
         }
