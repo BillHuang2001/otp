@@ -20,13 +20,17 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
   run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the live `RootSet`, and `alloc_rooted` — the convenience
-  wrapper that calls `ExecutionContext::alloc_words_rooted`; plus **`for_each_root(&self, impl FnMut(Eterm))`**,
-  the read-only twin of `with_roots`: it enumerates exactly the **pointer-bearing** root words the hand-off
-  covers — `x[..used_x_extent()]`, the whole stack, `fr[..used_fr_extent()]` and the five loose heap terms,
-  with every `IMMED1` word skipped by `beam_term::primary_tag` — and it does **not** cover `args_scratch`,
-  which is `mem::take`n out of the machine for the whole wide dispatch; that window is sound only because
-  no rooted door can be crossed while it is open (pinned by `tests/bif_args_window.rs` — see
-  `## The loose-heap-term census`)); and the **off-heap refc-binary handle view**
+  wrapper that calls `ExecutionContext::alloc_words_rooted`; plus the two **root-enumeration doors**:
+  **`for_each_root(&self, impl FnMut(Eterm))`**, the read-only census, which enumerates exactly the
+  **pointer-bearing** root words the hand-off covers — `x[..used_x_extent()]`, the whole stack,
+  `fr[..used_fr_extent()]` and the five loose heap terms, with every `IMMED1` word skipped by
+  `beam_term::primary_tag` — and **`for_each_root_mut(&mut self, &mut impl FnMut(&mut [Eterm]) -> Result<()>)`**,
+  its **writable/relocating** twin: the same root words handed over as three `&mut [Eterm]` slices, one at a
+  time (`x` prefix, whole stack with the parked loose terms inside it, `fr` prefix, immediates included
+  because a contiguous prefix cannot be filtered). Neither covers `args_scratch`, which is `mem::take`n out
+  of the machine for the whole wide dispatch; that window is sound only because no rooted door can be
+  crossed while it is open (pinned by `tests/bif_args_window.rs` — see `## The loose-heap-term census`)); and
+  the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
   binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine);
