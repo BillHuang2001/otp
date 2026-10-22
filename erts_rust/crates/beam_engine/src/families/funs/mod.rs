@@ -543,13 +543,23 @@ fn call_fun(
         // check.
         return raise_badarity(machine, module, &source, arity, ctx).map(Some);
     }
+    // The seam's operands are read from the machine's own **root set** immediately
+    // before the consultation (`x(arity)` for the target, `x(0..arity)` for the
+    // arguments) and are **not** carried past it: a host may allocate through a rooted
+    // door (`alloc_words_rooted`/`ensure_heap_full`) and collect, which relocates
+    // everything the frozen [`RootSet`] holds — including these two — and leaves any
+    // `Eterm` still sitting in a Rust local pointing into the abandoned space.
     let args = register_args(machine, arity)?;
     match ctx.resolve_local_fun(fun, &args) {
         Ok(Some((callee, label))) => {
             // C's free-variable layout: the call arguments stay in `x(0..arity)`,
-            // the closure's captured variables follow at `x(arity..)`. The `fun`
-            // term's storage is read (never moved — no collection happens between
-            // the read and the writes), so the copies are plain `Eterm` loads.
+            // the closure's captured variables follow at `x(arity..)`. The seam above
+            // may have collected, so the target is **re-derived** from its
+            // re-readable source ([`FunSource`]) rather than reused, and
+            // `terms::fun_free` borrows the (now post-collection) block's storage.
+            // Nothing between this read and the `set_x` writes allocates: a register
+            // write is not a heap admission point, so the borrowed words stay live.
+            let fun = source.read(machine, ctx)?;
             let free = terms::fun_free(fun)?;
             for (i, value) in free.iter().enumerate() {
                 let slot = arity + i as u32;
@@ -587,20 +597,28 @@ fn call_fun(
         // served-callee arm). `apply_target`'s BIF dispatch is deliberately the
         // opposite — class B, a typed error — because `apply/3` has already rewritten
         // `x(0..arity)` by the time it dispatches.
-        Ok(None) => match ctx.apply_fun_outcome(fun, &args) {
-            Ok(FunOutcome::Return(result)) => {
-                machine.set_x(0, result)?;
-                Ok(Some(Step::Next))
+        Ok(None) => {
+            // The closure seam declined — and it may have collected while deciding, so
+            // the fallback is handed words **re-derived** from the machine's root set
+            // (`x(arity)` and `x(0..arity)`), never the pre-seam copies. A resumed
+            // `Suspend` re-enters this instruction and re-derives them again.
+            let fun = source.read(machine, ctx)?;
+            let args = register_args(machine, arity)?;
+            match ctx.apply_fun_outcome(fun, &args) {
+                Ok(FunOutcome::Return(result)) => {
+                    machine.set_x(0, result)?;
+                    Ok(Some(Step::Next))
+                }
+                // The application could not complete without waiting: the instruction was
+                // not applied, so the machine parks on it and the host's resume
+                // re-consults the seam (which must CONTINUE the pending application, not
+                // restart it — an evaluator body is not re-execution idempotent).
+                Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
+                // A raise inside the applied closure must route through the
+                // catch-aware funnel, not escape the caller's `try`/`catch`.
+                Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
             }
-            // The application could not complete without waiting: the instruction was
-            // not applied, so the machine parks on it and the host's resume
-            // re-consults the seam (which must CONTINUE the pending application, not
-            // restart it — an evaluator body is not re-execution idempotent).
-            Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
-            // A raise inside the applied closure must route through the
-            // catch-aware funnel, not escape the caller's `try`/`catch`.
-            Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
-        },
+        }
         Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
     }
 }
@@ -657,22 +675,23 @@ pub(crate) fn apply_target(
     arity: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<ApplyTarget> {
-    let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
-    let function_term = machine
-        .x(arity + 1)
-        .ok_or_else(|| error::bad_register(arity + 1))?;
     // `fixed_apply` (`beam_common.c:1539-1552`) checks the *function* first, then
     // the *module*; both a non-atom `module` and a non-atom `function` set
     // `p->freason = BADARG` and return NULL into `handle_error` → `next_catch`, so
     // the `badarg` is a **catchable raise**, not a bare return.
-    let (module_name, function_name) = match (
-        atom_name(ctx, module, module_term),
-        atom_name(ctx, module, function_term),
-    ) {
-        (Ok(module_name), Ok(function_name)) => (module_name, function_name),
-        _ => return raise_badarg(machine, module, ctx).map(ApplyTarget::Raised),
+    let (module_name, function_name) = {
+        let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
+        let function_term = machine
+            .x(arity + 1)
+            .ok_or_else(|| error::bad_register(arity + 1))?;
+        match (
+            atom_name(ctx, module, module_term),
+            atom_name(ctx, module, function_term),
+        ) {
+            (Ok(module_name), Ok(function_name)) => (module_name, function_name),
+            _ => return raise_badarg(machine, module, ctx).map(ApplyTarget::Raised),
+        }
     };
-    let args = register_args(machine, arity)?;
     // The triple handed to the host is exactly the one `call_bif` receives (the
     // applied `module:function/arity`), so a host answers the seam however it
     // answers the BIF dispatch. A resolved callee is registered as a module
@@ -689,6 +708,12 @@ pub(crate) fn apply_target(
         let (func, pc) = handle.labels.resolve(label)?;
         return Ok(ApplyTarget::Enter { context, func, pc });
     }
+    // The cross-module seam may have allocated through a rooted door and collected,
+    // so the argument list is built **after** it declines: an `Eterm` array copied
+    // before the call would name the region the collector vacated (the frozen
+    // [`RootSet`] — `x`/the Erlang stack/`fr` — is what survives a collection, and
+    // `x(0..arity)` is where the arguments have to be re-read from).
+    let args = register_args(machine, arity)?;
     // The host could not run the callee in-machine: dispatch it through the
     // synchronous BIF path. A **host BIF error** is not allowed to escape the
     // caller's live `try`/`catch`: C routes every apply failure through
@@ -708,10 +733,13 @@ pub(crate) fn apply_target(
     // An unresolvable target raises `error:undef`, and the oracle's cooked trace
     // then names the **callee** with its argument list as the innermost item (C's
     // `erts_build_mfa_item` with the exception's saved args — see
-    // [`callee`]). This site knows the callee (the two atoms checked above, both
-    // immediate terms that cannot move) and its arguments are the instruction's own
-    // `x(0..arity)` registers, so the item is synthesized here: a no-op for any
-    // other error shape and when the raise cannot land.
+    // [`callee`]). This site knows the callee (the two atoms checked above) and its
+    // arguments are the instruction's own `x(0..arity)` registers, so the item is
+    // synthesized here: a no-op for any other error shape and when the raise cannot
+    // land. The two atom words are **re-read** from `x(arity)`/`x(arity+1)` rather
+    // than carried across the dispatch: a host BIF reached through
+    // `dispatch_bif_call` may allocate and collect (and the in-machine door even
+    // hands it the live machine), so only a read taken after it is guaranteed live.
     match machine.dispatch_bif_call(
         entry_module,
         &module_name,
@@ -736,6 +764,10 @@ pub(crate) fn apply_target(
             "bif suspend at a non-idempotent dispatch site: apply/3 rewrites x(0..arity)",
         )),
         Err(e) => {
+            let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
+            let function_term = machine
+                .x(arity + 1)
+                .ok_or_else(|| error::bad_register(arity + 1))?;
             let head = callee::callee_head_item(machine, ctx, &e, module_term, function_term, arity)?;
             Ok(ApplyTarget::Raised(
                 machine.raise_bif_error_with_head(module, e, head, ctx)?,
