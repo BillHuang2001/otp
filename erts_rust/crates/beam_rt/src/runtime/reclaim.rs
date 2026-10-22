@@ -592,9 +592,13 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>, slots: &mut Move
     if runtime.region_reclaim.config.store {
         // A move that fires leaves no candidate for the whole-region action to classify (every
         // retired candidate was dropped and the current region is the fresh destination), so the
-        // two are mutually exclusive rather than layered.
-        if compact::attempt_move(runtime, &input, slots) != MoveOutcome::Moved {
-            store_action(runtime, &live, &hits);
+        // two are mutually exclusive rather than layered. A move that refused **after** a word
+        // moved is exclusive too, and for the opposite reason: `keep_both` kept every source region
+        // precisely because the verification found a live word its corpus does not enumerate, so
+        // this pass may not then classify those same regions on that same corpus.
+        match compact::attempt_move(runtime, &input, slots) {
+            MoveOutcome::Moved | MoveOutcome::KeptBoth => {}
+            MoveOutcome::Skipped | MoveOutcome::Declined => store_action(runtime, &live, &hits),
         }
     }
     // The store may have grown inside the window since the cursor was taken; a pass never leaves a

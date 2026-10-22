@@ -180,7 +180,9 @@ const R_CAPACITY: &str =
     "the destination region cannot reserve the live set, so the move is refused before the first word moves";
 const R_COPY: &str = "the destination refused a word after the first copy, so every source region is kept";
 const R_SCAN: &str = "the destination scan refused a word, so every source region is kept";
-const R_VERIFY_HIT: &str =
+/// The verification hit's reason. `pub(super)` so the tripwire's test can name it: the reason a
+/// forced hit records is part of what that test asserts.
+pub(super) const R_VERIFY_HIT: &str =
     "the post-move verification found a live word in an old store region, so every source region is kept";
 const R_ENUMERATION: &str = "the runtime's root enumeration refused to complete";
 const R_REASON: &str =
@@ -239,8 +241,16 @@ pub(crate) enum MoveOutcome {
     /// Nothing to do (below a threshold, nothing live, nothing to gain) — not a decline, and the
     /// whole-region action still runs.
     Skipped,
-    /// A refusal, recorded on the move's own counters; every region usable.
+    /// A refusal **before the first word moved**, recorded on the move's own counters; every
+    /// region is byte-identical and the whole-region action still runs.
     Declined,
+    /// A refusal **after** a word moved (a failed copy, or the verification hit): the destination
+    /// stays installed and every source region is left exactly where it is, so the whole-region
+    /// action must **not** run for this pass. Its verdict is the same descent that just failed to
+    /// see the holder [`keep_both`] exists for, so its corpus is known to be incomplete for these
+    /// ranges: dropping on it would free a region whose live word the verification had just found.
+    /// The next pass re-classifies every region on fresh evidence.
+    KeptBoth,
 }
 
 /// One **move attempt**, from the threshold decision to the commit.
@@ -311,12 +321,20 @@ pub(crate) fn attempt_move(
             runtime.eval_heap_retired[*index].used(),
         ));
     }
+    // The same ranges in the **byte** form every probe here takes: [`FromSet`]'s containment test
+    // wants `(base, used_words)` because that is the shape the copier classifies against, while
+    // [`RangeProbe`] asks the walker whether a reached word's *address* stands inside a half-open
+    // `[lo, hi)` byte range. The two forms are derived from one vector so they cannot drift.
+    let byte_ranges: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|(base, words)| (*base, base.saturating_add(words.saturating_mul(width))))
+        .collect();
     // A recorded raise's live reason has a reader and no writable slot: a region it stands in may
     // not move. Presence alone is not a refusal — a reason outside every candidate range is
     // unaffected by the move.
     {
-        let mut reason_hits = vec![false; ranges.len()];
-        let mut probe = RangeProbe::new(&ranges, &mut reason_hits);
+        let mut reason_hits = vec![false; byte_ranges.len()];
+        let mut probe = RangeProbe::new(&byte_ranges, &mut reason_hits);
         runtime
             .runner_state
             .for_each_error_live_reason(&mut |term| probe.word(term));
@@ -354,6 +372,8 @@ pub(crate) fn attempt_move(
         return MoveOutcome::Declined;
     }
     let need = beam_gc::live_words_in(&from, &corpus);
+    #[cfg(test)]
+    tripwire::record_pre_move_root(&corpus, &byte_ranges);
     drop(corpus);
     if need == 0 {
         // Nothing in the candidates is live: the whole-region action drops them all, and a move
@@ -390,11 +410,11 @@ pub(crate) fn attempt_move(
     let (copy, copied) = copied;
     if copy.is_err() {
         keep_both(runtime, destination, copied, copy.err().unwrap_or(R_COPY));
-        return MoveOutcome::Declined;
+        return MoveOutcome::KeptBoth;
     }
-    if verification_hits(runtime, slots, &ranges) {
+    if verification_hits(runtime, slots, &byte_ranges) {
         keep_both(runtime, destination, copied, R_VERIFY_HIT);
-        return MoveOutcome::Declined;
+        return MoveOutcome::KeptBoth;
     }
     commit(runtime, destination, copied, mark, &retired, dead);
     MoveOutcome::Moved
@@ -443,11 +463,110 @@ fn verification_hits(runtime: &mut Runtime, slots: &MoveSlots<'_>, ranges: &[(us
     {
         return true;
     }
+    // Test-only: a pre-move copy of an evacuated root, appended to the **verification** corpus
+    // only — the forwarding corpus was already consumed, so the copy in the source region stands
+    // there unrewritten and the descent below must hit it. See [`tripwire`].
+    #[cfg(test)]
+    if let Some(word) = tripwire::pre_move_root() {
+        roots.push(word);
+    }
     let mut hits = vec![false; ranges.len()];
     let verdict = reclaim::walk(&roots, &mut RangeProbe::new(ranges, &mut hits));
     match verdict {
         Walk::Complete => hits.iter().any(|hit| *hit),
         Walk::Declined(_) => true,
+    }
+}
+/// **Test-only fault injection** for the post-copy verification: arms a forced hit.
+///
+/// [`keep_both`]'s path is a *proof obligation* — "if the verification hits, no source region
+/// dangles" — that a production run reaches only when the moving corpus is incomplete, which a
+/// correct runtime never does. This module makes the obligation executable: armed on the test's
+/// own thread, [`attempt_move`] records one **pre-move copy** of a root that stands inside a
+/// candidate range, and [`verification_hits`] appends that copy to the *verification* corpus only,
+/// after the forward. Nothing enters the forwarding corpus or the count walk, so the copy in the
+/// source region is never rewritten and the descent necessarily hits it — the same shape an
+/// unenumerated holder produces.
+///
+/// Two properties make the injection honest rather than a weakening of a guard:
+///
+/// * it lives entirely behind `#[cfg(test)]` (no release build contains it), and it adds a root
+///   **only** to the verification descent — the very check it forces to fail;
+/// * the recorded word is a real root of the real corpus, so what the descent then reports is a
+///   genuine "a live word stands in an old region", not a fabricated verdict.
+///
+/// The state is thread-local because the workspace's tests share a process: a global cell would let
+/// one case's arming explain another's decline.
+///
+/// The recorded root is chosen to be a word the walker can *read* after forwarding: a cons cell
+/// (its car is `THE_NON_VALUE` and its cdr a destination pointer, both of which the descent's
+/// guards handle), never a boxed object whose header word now holds the BOXED marker — that shape
+/// is unreadable by a value descent by construction and is the residual [`keep_both`] documents.
+#[cfg(test)]
+pub(super) mod tripwire {
+    use core::cell::Cell;
+
+    use beam_term::Eterm;
+
+    thread_local! {
+        /// Whether this thread's moves must force a verification hit.
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        /// The pre-move copy of one evacuated root, once an attempt has recorded it.
+        static PRE_MOVE: Cell<Option<Eterm>> = const { Cell::new(None) };
+    }
+
+    /// Arms the injector on this thread (and forgets any earlier recording).
+    pub(crate) fn arm() {
+        PRE_MOVE.with(|cell| cell.set(None));
+        ARMED.with(|cell| cell.set(true));
+    }
+
+    /// Disarms the injector on this thread.
+    pub(crate) fn disarm() {
+        ARMED.with(|cell| cell.set(false));
+        PRE_MOVE.with(|cell| cell.set(None));
+    }
+
+    /// Whether this thread's moves are to force a hit.
+    fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    /// Records the first word of `corpus` that stands inside one of `ranges` — a root the copy is
+    /// about to evacuate, saved **before** it moves.
+    pub(super) fn record_pre_move_root(corpus: &[Eterm], ranges: &[(usize, usize)]) {
+        if !armed() {
+            return;
+        }
+        let word = corpus.iter().copied().find(|word| inside_a_range(*word, ranges));
+        if let Some(word) = word {
+            PRE_MOVE.with(|cell| cell.set(Some(word)));
+        }
+    }
+
+    /// The recorded pre-move copy, if this thread armed the injector and an attempt recorded one.
+    pub(super) fn pre_move_root() -> Option<Eterm> {
+        if !armed() {
+            return None;
+        }
+        PRE_MOVE.with(Cell::get)
+    }
+
+    /// Whether `word` is a term naming an address inside one of `ranges` — the same test
+    /// [`crate::eval::scratch::RangeProbe`] applies, so the recorded word is exactly one the
+    /// verification would report.
+    fn inside_a_range(word: Eterm, ranges: &[(usize, usize)]) -> bool {
+        if beam_term::literal::is_literal(word)
+            || !beam_term::tag::is_term_word(word)
+            || !(beam_term::boxed::is_boxed_term(word) || beam_term::prelude::is_list(word))
+        {
+            return false;
+        }
+        let address = beam_term::list::ptr_val(word) as usize;
+        address != 0
+            && ranges
+                .iter()
+                .any(|range| address >= range.0 && address < range.1)
     }
 }
 

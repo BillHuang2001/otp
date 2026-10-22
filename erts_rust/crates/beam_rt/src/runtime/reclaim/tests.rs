@@ -664,3 +664,161 @@ fn the_move_off_leaves_a_partially_live_region_whole_and_the_move_on_collapses_i
     assert_eq!(stats.store_compactions, 1, "one compaction");
     assert_eq!(stats.store_move_declines, 0, "and no refusal");
 }
+
+// ---- the post-move verification's forced hit (the `keep_both` obligation) ----------------------
+
+/// Builds one partially live region whose live value is a **cons cell**: a 2-word value reachable
+/// from a caller slot, then dead filler, then a growth that retires the region.
+///
+/// The tripwire's case uses a cons cell rather than a tuple for one reason, and it is a property of
+/// the walker rather than of the move: the injected pre-move word is dereferenced by the descent
+/// *after* its region's objects were forwarded, so its first word holds the cons marker
+/// (`THE_NON_VALUE`) and its second the destination pointer — both of which the descent's guards
+/// handle ([`crate::eval::reclaim::walk`]). A boxed object's forwarded header word holds the BOXED
+/// marker, which no value descent can read; that residual is [`compact`]'s own documentation.
+fn build_partially_live_cons_region(rt: &mut Runtime, tag: i64, fill_to: usize) -> Eterm {
+    let value = rt
+        .eval_heap
+        .cons(beam_term::make_small(tag), beam_term::make_small(tag + 1))
+        .expect("the store serves one cons cell");
+    fill_with_dead_until(rt, fill_to);
+    retire_current_region(rt);
+    value
+}
+
+/// A cons value's address and its two words, read back through the region scan.
+fn cons_readback(rt: &mut Runtime, value: Eterm) -> (usize, Vec<Eterm>) {
+    let address = beam_term::list::ptr_val(value) as usize;
+    let words = read_words_at(rt, address, 2).expect("the live value is in a live region");
+    (address, words)
+}
+
+#[test]
+fn a_forced_verification_hit_keeps_every_region_and_the_next_pass_classifies_them_on_evidence() {
+    let mut rt = small_runtime();
+    open(&mut rt);
+    // The interleaved shape: three regions, each holding one live cons cell among dead filler. The
+    // move's thresholds are met (a large dead fraction, well above `MIN_WINDOW_WORDS`), so the only
+    // thing deciding the outcome below is the verification.
+    let mut a = build_partially_live_cons_region(&mut rt, 10, 500);
+    let mut b = build_partially_live_cons_region(&mut rt, 20, 500);
+    let mut c = build_partially_live_cons_region(&mut rt, 30, 500);
+    assert_eq!(rt.eval_heap_retired.len(), 3, "three regions were retired");
+    let before = rt.region_reclaim_stats();
+    // What every value must read back as, wherever it ends up. The *words* are captured now; the
+    // *terms* are read from the slots after the pass, because a moved value's slot is forwarded
+    // while a saved copy of the pre-move term would still name the evacuated address.
+    let expected: Vec<Vec<Eterm>> = [a, b, c]
+        .iter()
+        .map(|value| cons_readback(&mut rt, *value).1)
+        .collect();
+    let sources: Vec<usize> = [a, b, c]
+        .iter()
+        .map(|value| beam_term::list::ptr_val(*value) as usize)
+        .collect();
+
+    // ---- the forced hit ----------------------------------------------------------------
+    compact::tripwire::arm();
+    move_pass(
+        &mut rt,
+        &[],
+        &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
+    );
+    compact::tripwire::disarm();
+
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(
+        stats.store_compactions, before.store_compactions,
+        "a verification hit must not count as a compaction"
+    );
+    assert_eq!(
+        stats.store_move_declines,
+        before.store_move_declines + 1,
+        "the refusal is recorded on the move's own counters"
+    );
+    assert_eq!(
+        stats.store_move_last_decline,
+        Some(compact::R_VERIFY_HIT),
+        "and with the verification's reason"
+    );
+    assert_eq!(
+        stats.store_regions_dropped, before.store_regions_dropped,
+        "keeping both means dropping nothing"
+    );
+    assert_eq!(
+        stats.store_words_reclaimed, before.store_words_reclaimed,
+        "and reclaiming nothing"
+    );
+    assert_eq!(
+        rt.eval_heap_retired.len(),
+        4,
+        "every source region is still installed, plus the destination"
+    );
+    // Every source region is still usable: the copy did happen (that is why the sources hold the
+    // forwarding marker), so the pre-move addresses must still be readable.
+    for address in &sources {
+        let words = read_words_at(&mut rt, *address, 2).expect("the source region is still installed");
+        assert_eq!(
+            words[0],
+            beam_term::THE_NON_VALUE,
+            "the evacuated cons cell's car holds the forwarding indicator, so the copy is real \
+             and not a rollback"
+        );
+    }
+    // Every previously reachable value reads back byte-for-byte at its forwarded address — which is
+    // inside the destination, the region the rewritten roots now name.
+    let (destination_base, destination_end) = {
+        let region = rt
+            .eval_heap_retired
+            .last()
+            .expect("the destination is the last installed region");
+        (
+            heap_region_base(region),
+            heap_region_base(region) + region.used() * size_of::<Eterm>(),
+        )
+    };
+    assert!(
+        destination_end > destination_base,
+        "the destination holds the copies it was installed for"
+    );
+    for (value, expected_words) in [a, b, c].iter().zip(expected.iter()) {
+        let (address, words) = cons_readback(&mut rt, *value);
+        assert_eq!(words, *expected_words, "the value is byte-for-byte identical");
+        assert!(
+            address >= destination_base && address < destination_end,
+            "the value now stands in the installed destination, so the rewritten root is valid"
+        );
+    }
+
+    // ---- the next, uninjected pass re-classifies on evidence ---------------------------
+    //
+    // The moving corpus is empty here and the values are named as value roots, so the move has
+    // nothing to count (`need == 0` ⇒ skipped) and the whole-region action decides: the three
+    // source regions hold no reachable word any more, the destination does.
+    let held: Vec<Eterm> = [a, b, c].to_vec();
+    let dropped_before = rt.region_reclaim_stats();
+    exit_pass(&mut rt, &held);
+
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(
+        stats.store_compactions, dropped_before.store_compactions,
+        "nothing moved on the evidence pass either"
+    );
+    assert_eq!(
+        stats.store_regions_dropped,
+        dropped_before.store_regions_dropped + 3,
+        "the three evacuated source regions are dropped on evidence"
+    );
+    assert_eq!(
+        rt.eval_heap_retired.len(),
+        1,
+        "only the destination survives, because it is the one region a value stands in"
+    );
+    for (value, expected_words) in [a, b, c].iter().zip(expected.iter()) {
+        let (_, words) = cons_readback(&mut rt, *value);
+        assert_eq!(
+            words, *expected_words,
+            "every value is still byte-for-byte identical after the sources were dropped"
+        );
+    }
+}
