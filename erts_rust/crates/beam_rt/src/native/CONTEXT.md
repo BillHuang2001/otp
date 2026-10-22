@@ -99,6 +99,49 @@ The floor stores very little: a native BIF builds its reply on the caller's heap
 - **IMMEDIATE-ONLY / nothing stored:** `group_leaders` (`HashMap<ProcessId, ProcessId>`), `prim_tty_handles` (`HashMap<u64, i32>`), `open_files` (`HashMap<u64, std::fs::File>` — the descriptor's `owner` pid lives only in the caller-held `#file_descriptor{}` term and is compared per call), the cookie (bytes), `NetKernelService` (a `ProcessId`), `MonitorTarget::Remote` (a per-call enum; the cross-call form is `beam_process`'s all-immediate `RemotePid`), and `FileServices`/`Device`, `io.rs`, `init.rs`, `code.rs`, `application.rs`, `prim.rs`, `ddll.rs`, `port.rs`, `net/*` (no `Eterm` field at all).
 - **The one un-stabilized cross-call store the floor's arms reach:** `erlang:seq_trace/2` (`native.rs` → `seq_trace.rs::SeqTrace::set_label`) records the caller's label word verbatim (documented at `seq_trace.rs`'s `gather_off_heap_roots`); the token family is an off-heap-payload root but not a relocation root, so a label on a collected heap is the sibling node's gap, not a store this floor owns.
 
+## Reply-term regions — where a native arm's reply words live
+The floor never copies out and never rewinds: `context/calls.rs::call_bif_routed` returns the `try_native`
+result at the floor arm **before** the registered-BIF copy-out cascade and before `call_registered`'s
+`heap.reset_to(mark)`, so a floor term is handed to Erlang exactly as the arm built it.
+Four regions are reachable from this node, and only one of them has recyclable words:
+- **Arena** (`Runtime::alloc_words`, `context/gc.rs::alloc_words`'s table-less tail) — never reset, never
+  freed. Every `RuntimeContext::new(&mut *self)` helper here is table-less (`mailbox_table: None`), so
+  `ctx.atom`/`ctx.charlist`/`terms::make_tuple`/`terms::make_list`/`prim_file_call` all land here, and so
+  does `EngineContinuation::call`'s engine run (`file_server/get_until.rs:302`, whose `Machine` owns no
+  term heap — `beam_engine` builds through `ExecutionContext::alloc_words`). Arena terms are immortal.
+- **`eval_heap`** (`RuntimeContext::eval_heap()` = `&mut self.runtime.eval_heap`, `context/runtime_context.rs:555`)
+  — pointer-stable but the crate's **only** recyclable region: `eval/scratch.rs:360` rewinds it at an
+  `-eval` top-level statement boundary when `used - mark >= MIN_WINDOW_WORDS` (1024) and the descent finds
+  no live word inside the window, and `context/pool.rs:126` replaces it
+  (`Runtime::grow_eval_heap`, runtime.rs:2536 — the old region is retired, never freed, so growth is
+  address-safe). `beam_codec::term::make_binary` writes an **on-heap** bitstring (no off-heap payload
+  owner), so a binary's store cost is ∝ its byte length: this is the one length-sensitive placement in the
+  node (`file_server.rs:1022` `{get_chars,…}`/`{read,…}` data, `prim_file.rs:277,469,541,633,674`,
+  `prim.rs:314,366`, `code.rs:238`, `erts_internal.rs:731,764`).
+- **`info_heap`** — the reset-per-call scratch (`Runtime::reset_info_scratch`, runtime.rs:2245, gated by
+  `info_heap_tainted`). Its only callers are `native.rs:948` (`system_info_tuple`), `native.rs:1034`
+  (`render`, which yields a `String`) and, outside this node, `runtime.rs:4806`/`:5003` and
+  `eval/compile.rs:485`. **No `file_server`/`prim_file`/`code` arm touches it**, and no arm resets it
+  mid-reply.
+- **Pooled BIF heap** — three sites take one (`process.rs:846` `mint_timer_ref`, `process.rs:1232`
+  `reference_term`, `prim_tty.rs:355` `tty_select`) and put it back **without** a copy-out. Safe by
+  identity, not by copying: a reference's identity is its address (`call_registered`'s
+  `graph_holds_reference`), the next taker's `mark = used()` sits above those words, and
+  `take_bif_frontier` retires an exhausted region instead of freeing it (a `beam_alloc::Heap` is never
+  moved or freed by the pool). Nothing in `file_server.rs` takes a pooled heap.
+**Consequence:** a `file_server_2` reply container (tuple/list) is arena-built and cannot dangle; a reply
+**binary** is on `eval_heap` and its words are recyclable only through the `-eval` statement window.
+
+## Known Issues
+- **`get_until`/`get_line` run the user continuation on a bare `Machine` and bypass the nested-run window
+  latch.** `file_server/get_until.rs:302-313` (and `get_line.rs`'s twin) calls
+  `machine.run_export_outcome` directly instead of `RuntimeContext::run_export_blocking`/
+  `run_label_blocking`, which are the two sites that call `Runtime::pin_window_if_store_written`
+  (`context/pump.rs:303`, `:380`). The run's own terms are arena words and its result is returned upward,
+  so the `-eval` window's descent can still see them through the evaluator's environment — but a holder
+  this run creates that the descent cannot enumerate would not be pinned the way the two pump sites pin
+  one. Flagged rather than fixed: it is the only nested engine run in this node that skips that latch.
+
 ## Test Strategy
 - **Unit tests** are colocated per module (`#[cfg(test)] mod tests`) and drive the floor through the crate's own dispatch (`test_support::call` ⇒ `RuntimeContext::call_bif` ⇒ `try_native`), so the *served surface* is pinned, not an internal function; fixtures live once in `test_support.rs`.
   The per-family suites are their child docs' — `memory/CONTEXT.md` (`process_info`, its oracle-probe bounds, the never-a-live-oracle `garbage_collection` rule), `process/CONTEXT.md`, `erts_internal/CONTEXT.md` and `file_server/CONTEXT.md`.
