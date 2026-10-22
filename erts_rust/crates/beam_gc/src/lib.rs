@@ -42,12 +42,25 @@
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
 //!
 //! `unsafe` is confined to `copy.rs` and `immix_collector.rs` (the word-level copier and
-//! the promotion driver), `reachable.rs` (the read-only, whole-heap reachability walk and its
-//! one-bit-per-word visited set), `live.rs` (the exact-live counter a fullsweep sizes
+//! the promotion driver), `relocate.rs` (the region-generic relocation driver and its
+//! host-owned flat destination), `reachable.rs` (the read-only, whole-heap reachability walk and
+//! its one-bit-per-word visited set), `live.rs` (the exact-live counter a fullsweep sizes
 //! itself from), `immix/` (the mark-region space's word-level mark/evacuation
-//! walks), the raw-pointer range tests in `space.rs` and the two narrow `NonNull`-deref /
-//! `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs`, `bounds.rs` and the collector
-//! driving logic are safe Rust.
+//! walks), the raw-pointer range tests in `space.rs` (plus the `FromSet::from_ranges`
+//! constructor, whose `unsafe` is the caller's assertion about a foreign region) and the two
+//! narrow `NonNull`-deref / `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs`,
+//! `bounds.rs`, `footprint.rs`, `offheap.rs` and the collector driving logic are safe Rust.
+//!
+//! # Region-generic relocating compaction
+//!
+//! [`Relocator`]/[`compact`] drive the same Cheney copy engine over a destination the **host**
+//! owns, so a foreign word region (a `beam_alloc::ReservedHeap`, a pre-reserved `Vec<Eterm>`,
+//! an mmap'd arena, the engine's term arena) can be compacted without a process heap: the
+//! from-set is built from raw ranges ([`FromSet::from_ranges`]), the destination implements
+//! [`EvacDest`] (or is the turnkey [`LinearDest`]), and the two walking helpers
+//! [`live_words_in`]/[`for_each_reachable_in`] size and inspect it. Collection behaviour is
+//! unaffected — nothing on the [`Collector`]/[`GenImmixCollector`]/[`AnyCollector`] path reads
+//! this surface.
 
 pub mod any_collector;
 pub mod bin_vheap;
@@ -65,8 +78,9 @@ pub mod mso;
 mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
 pub mod offheap;
 pub mod policy;
-pub(crate) mod reachable; // the read-only whole-heap reachability walk — NOT public
-pub use crate::reachable::ReachableObject; // the safe view a visitor reads — the walk stays crate-internal
+pub mod relocate;
+pub(crate) mod reachable; // the read-only whole-heap reachability walk — the `*_in` helpers are public
+pub use crate::reachable::{for_each_reachable_in, ReachableObject}; // the walk itself stays crate-internal
 pub mod selection;
 pub mod space;
 pub mod stats;
@@ -81,9 +95,11 @@ pub use crate::footprint::*;
 pub use crate::heap_info::*;
 pub use crate::immix::*;
 pub use crate::immix_collector::*;
+pub use crate::live::live_words_in;
 pub use crate::mso::*;
 pub use crate::offheap::{for_each_reachable_binary_payload, sweep_unreachable_binaries};
 pub use crate::policy::*;
+pub use crate::relocate::*;
 pub use crate::selection::*;
 pub use crate::space::*;
 pub use crate::stats::*;
@@ -100,10 +116,12 @@ pub mod prelude {
     pub use crate::heap_info::*;
     pub use crate::immix::*;
     pub use crate::immix_collector::*;
+    pub use crate::live::live_words_in;
     pub use crate::mso::*;
     pub use crate::offheap::{for_each_reachable_binary_payload, sweep_unreachable_binaries};
     pub use crate::policy::*;
-    pub use crate::reachable::ReachableObject;
+    pub use crate::reachable::{for_each_reachable_in, ReachableObject};
+    pub use crate::relocate::*;
     pub use crate::selection::*;
     pub use crate::space::*;
     pub use crate::stats::*;

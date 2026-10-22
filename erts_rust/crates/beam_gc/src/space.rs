@@ -22,8 +22,15 @@
 //! `beam_alloc::Heap`) and [`FromSet`] (the set of ranges a collection evacuates).
 //!
 //! `HeapSpace` never reallocates — growth happens by GC *replacement*, not by moving
-//! live terms (workspace `CONTEXT.md` §2). `unsafe` here is confined to the
-//! raw-pointer range tests.
+//! live terms (workspace `CONTEXT.md` §2).
+//!
+//! A [`FromSet`] is also constructible from **raw word ranges a host owns**
+//! ([`FromSet::from_ranges`]): the region need not be a [`HeapSpace`], so a foreign arena
+//! (a `beam_alloc::ReservedHeap`, a pre-reserved `Vec<Eterm>`, an mmap'd region) can be
+//! evacuated by the same copier. `unsafe` here is confined to the raw-pointer range tests
+//! and to that constructor, which is `unsafe` because the extent, the mutual disjointness and
+//! the **completeness** of a foreign region are the caller's assertion — this crate cannot
+//! check them.
 
 use beam_alloc::{AllocRef, Heap};
 use beam_common::Result;
@@ -159,6 +166,76 @@ impl FromSet {
         FromSet { ranges: Vec::new() }
     }
 
+    /// Builds a set from **raw word ranges the caller owns** — a foreign region (a
+    /// `beam_alloc::ReservedHeap`, a pre-reserved `Vec<Eterm>`, an mmap'd arena) that is not a
+    /// [`HeapSpace`] but does hold live terms a relocation must evacuate.
+    ///
+    /// Each entry is `(base_address, used_words)`: a **byte** base address and a count of
+    /// **term words** from it (note the asymmetry with [`ranges`](FromSet::ranges), which
+    /// reports byte pairs). Zero-length entries are skipped — an empty range covers nothing and
+    /// no address could fall in it. Every entry goes through the single insertion point
+    /// ([`insert`](FromSet::insert)), so the sorted-by-`lo` invariant and
+    /// [`locate`](FromSet::locate)'s "one interpreter of the range geometry" property hold
+    /// exactly as they do for [`add`](FromSet::add).
+    ///
+    /// # Safety
+    ///
+    /// The returned set is an assertion that a copier may read, and write forwarding markers
+    /// into, every word of every range. The caller must guarantee, for **each** entry:
+    ///
+    /// * `base_address` is aligned to `size_of::<Eterm>()`;
+    /// * `[base_address, base_address + used_words * size_of::<Eterm>())` is readable (and
+    ///   writable — a copier forwards in place) for as long as the set is in use;
+    /// * `used_words` is a **prefix of a real live allocation** — exactly the extent a mutator
+    ///   filled — never a fabricated extent and never one that names words a previous life of
+    ///   the region owned. A range that over-states its extent makes the copier read and
+    ///   rewrite words no term of the graph owns; one that under-states it silently strands
+    ///   live terms outside the evacuation (they are then left verbatim, `Target::Foreign`);
+    /// * the ranges are pairwise **disjoint**;
+    /// * no other thread frees, reallocates or mutates those words while a copy driven by the
+    ///   set is in flight, and no live term of the graph lives outside them (completeness is
+    ///   the caller's claim — this crate cannot check it; see `../CONTEXT.md` "What frees term
+    ///   memory").
+    pub unsafe fn from_ranges(ranges: &[(usize, usize)]) -> FromSet {
+        let word = core::mem::size_of::<Eterm>();
+        let mut set = FromSet::new();
+        for &(base_address, used_words) in ranges {
+            if used_words == 0 {
+                continue;
+            }
+            debug_assert_eq!(
+                base_address % word,
+                0,
+                "a from-range must be word-aligned, got {base_address:#x}"
+            );
+            // `saturating_*`: an absurd extent must stay a (huge) range rather than wrap into
+            // a small one — a wrap would silently drop words the caller claimed are live.
+            let hi = base_address.saturating_add(used_words.saturating_mul(word));
+            set.insert(base_address, hi);
+        }
+        // Debug-only: the disjointness the safety contract promises. A violation is caught
+        // here rather than as a mis-sized copy; release builds trust the caller.
+        if cfg!(debug_assertions) {
+            for pair in set.ranges.windows(2) {
+                debug_assert!(
+                    pair[0].1 <= pair[1].0,
+                    "from-ranges must be pairwise disjoint: [{:#x}, {:#x}) overlaps \
+                     [{:#x}, {:#x})",
+                    pair[0].0,
+                    pair[0].1,
+                    pair[1].0,
+                    pair[1].1
+                );
+            }
+        }
+        set
+    }
+
+    /// The number of evacuated ranges ([`words`](FromSet::words) is their summed span).
+    pub fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
+
     /// Adds the live region of `space` as a range this set evacuates.
     pub fn add(&mut self, space: &HeapSpace) {
         self.insert(space.base() as usize, space.top() as usize);
@@ -181,7 +258,11 @@ impl FromSet {
     }
 
     /// The evacuated ranges, as half-open byte-address pairs, **sorted by `lo`**.
-    pub(crate) fn ranges(&self) -> &[(usize, usize)] {
+    ///
+    /// The raw counterpart of [`words`](FromSet::words): a caller that has to reason about the
+    /// geometry itself (a host reporting which regions a relocation will read, a test
+    /// asserting a set was built as asked) reads it here rather than re-deriving it.
+    pub fn ranges(&self) -> &[(usize, usize)] {
         &self.ranges
     }
 

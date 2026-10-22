@@ -33,6 +33,12 @@
 //! copy-specific pieces and the reference-forwarding switch ([`forward_slot`], over the
 //! [`EvacDest`] seam), all `pub(crate)` so the two evacuating spaces share one
 //! implementation instead of each carrying its own copy of the marker scheme.
+//!
+//! [`Target`] and [`EvacDest`] are **public**: they are the destination seam a host implements
+//! when it wants this word-level protocol driven over memory it owns. The primitives that
+//! write the words ([`forward_slot`], [`forward_accounted`], [`move_size`], [`for_each_ref`])
+//! stay `pub(crate)` — a host supplies a destination and calls [`crate::Relocator`] or
+//! [`crate::compact`], never the marker scheme itself.
 
 use beam_common::Result;
 use beam_term::prelude::{
@@ -164,7 +170,7 @@ where
 
 /// How the object a BOXED/LIST reference points at relates to an evacuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Target {
+pub enum Target {
     /// Outside the evacuated set: leave the reference exactly as it is (a literal,
     /// another space, an off-heap pointer, a pinned object, or an object already in its
     /// final position).
@@ -177,10 +183,36 @@ pub(crate) enum Target {
 }
 
 /// The destination of an evacuation — *which* objects move is the only decision that
-/// differs between the copying collector ([`Copier`]) and the Immix mark-region space
-/// ([`crate::immix::ImmixSpace`]); the word-level protocol (object sizing, the in-place
-/// marker scheme, `copy_nonoverlapping`) is shared through [`forward_slot`].
-pub(crate) trait EvacDest {
+/// differs between the copying collector ([`Copier`]), the Immix mark-region space
+/// ([`crate::immix::ImmixSpace`]) and a host-owned flat region
+/// ([`crate::relocate::LinearDest`](crate::LinearDest)); the word-level protocol (object
+/// sizing, the in-place marker scheme, `copy_nonoverlapping`) is shared through the
+/// `pub(crate)` [`forward_slot`].
+///
+/// An implementation is the *classification* half of the C `sweep()` switch: report where the
+/// object a reference names lives, hand out the destination words a copy needs, and (for a
+/// destination a Cheney scan can walk) publish the end of the contiguous run copies land in.
+/// It never copies, never rewrites a reference and never writes a forwarding marker — that is
+/// [`forward_slot`]'s and [`crate::Relocator`]'s job, driven over this seam.
+///
+/// # Contract for an implementation
+///
+/// * A method may only dereference a pointer **after** establishing that the destination owns
+///   that memory. `classify_boxed`/`classify_cons` are handed the pointer word of a reference
+///   that may name anything at all — a literal, another process's heap, an off-heap payload, a
+///   fabricated word — and the one correct answer for such an address is
+///   [`Target::Foreign`]. A classification that reads a foreign address is undefined
+///   behaviour, so the containment test must come first.
+/// * [`reserve`](EvacDest::reserve) may be called only for a request
+///   [`can_reserve`](EvacDest::can_reserve) already admitted, and the words it returns must be
+///   exclusively owned by the destination, writable, and must not overlap any evacuated range:
+///   the copier writes a forwarding marker *into the source object*, so a destination that
+///   aliased the source would overwrite the copy it just made.
+/// * [`classify_boxed`](EvacDest::classify_boxed) must answer [`Target::Forwarded`] for an
+///   object of the evacuated set that has already been moved, i.e. whose header word now holds
+///   the forwarding marker — that is what makes a second visit a follow rather than a second
+///   copy.
+pub trait EvacDest {
     /// Classifies the object named by the BOXED reference `ptr`.
     ///
     /// # Safety
@@ -207,6 +239,25 @@ pub(crate) trait EvacDest {
     /// `words` must satisfy [`can_reserve`](EvacDest::can_reserve). The returned words
     /// may be uninitialised and must be written before they are read.
     unsafe fn reserve(&mut self, words: usize) -> Result<*mut Eterm>;
+
+    /// The exclusive end of the destination's contiguous copied region, or `None` when the
+    /// destination does not lay copies down in one contiguous run (the line-granular
+    /// mark-region space does).
+    ///
+    /// A [`Relocator`](crate::Relocator) requires `Some`; the value must advance monotonically
+    /// as [`reserve`](EvacDest::reserve) hands out words, and the run between the value at
+    /// construction time and the current value must be exactly the reserved words, laid down in
+    /// reservation order. That is what lets the Cheney destination scan
+    /// ([`Relocator::complete`](crate::Relocator::complete)) walk the copies in the order they
+    /// were made — the same "scan from where the to-space ended, up to where it now ends" loop
+    /// [`Copier::complete`] runs over a [`HeapSpace`](crate::HeapSpace).
+    ///
+    /// The default (`None`) declares the destination unwalkable, which is how a
+    /// mark-region destination — whose copies land in reclaimed lines wherever the line
+    /// allocator finds a run — keeps its own, block-structured driver.
+    fn copied_top(&self) -> Option<*mut Eterm> {
+        None
+    }
 }
 
 /// Forwards the term word at `slot` in place, returning the number of words copied
@@ -312,6 +363,32 @@ pub(crate) unsafe fn forward_slot<D: EvacDest + ?Sized>(
     }
 }
 
+/// Forwards the term word at `slot` through [`forward_slot`] and charges the moved object (when
+/// there was one) to `stats` — the one place the copy counters are advanced, shared by
+/// [`Copier`] and [`crate::Relocator`] so the two evolutions cannot account differently.
+///
+/// A `Foreign`/`Forwarded`/immediate/bare-header word copies nothing and is charged nothing:
+/// `words_copied`/`objects_copied` count only objects this call actually laid down, which is
+/// what makes `words_copied` exactly the destination's new used length for a linear
+/// destination.
+///
+/// # Safety
+///
+/// As [`forward_slot`].
+pub(crate) unsafe fn forward_accounted<D: EvacDest + ?Sized>(
+    dest: &mut D,
+    slot: *mut Eterm,
+    stats: &mut GcStats,
+) -> Result<()> {
+    // SAFETY: forwarded to the shared primitive, which the caller's guarantee covers.
+    let copied = unsafe { forward_slot(dest, slot)? };
+    if copied > 0 {
+        stats.objects_copied += 1;
+        stats.words_copied += copied;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The copying collector
 // ---------------------------------------------------------------------------
@@ -368,6 +445,12 @@ impl EvacDest for Copier<'_> {
         // SAFETY: the caller guarantees `words` fit (`can_reserve` just held), so this
         // hands out `words` exclusively-owned words at the to-space top.
         unsafe { self.to.heap_mut().alloc_words(words) }
+    }
+
+    /// The to-space top: a [`HeapSpace`] lays every copy down in one contiguous run starting at
+    /// the bump pointer it had when the copier was built, so the Cheney scan can walk it.
+    fn copied_top(&self) -> Option<*mut Eterm> {
+        Some(self.to.top())
     }
 }
 
@@ -465,22 +548,23 @@ impl<'a> Copier<'a> {
         self.complete()
     }
 
-    /// Forwards the term word at `slot` through the shared [`forward_slot`] primitive and
+    /// Forwards the term word at `slot` through the shared [`forward_accounted`] primitive and
     /// charges the moved object (when there was one) to this copier's statistics.
     ///
     /// # Safety
     ///
     /// As [`forward_slot`].
     unsafe fn forward_one(&mut self, slot: *mut Eterm) -> Result<()> {
+        // The counters are split out of the exclusive borrow so the destination half and the
+        // statistics half reach the shared accounting routine as two disjoint borrows
+        // (`GcStats` is `Copy`, so taking a copy and writing it back is free).
+        let mut stats = self.stats;
         // SAFETY: forwarded to the shared primitive; the caller guarantees `slot`, and
         // `Copier`'s `EvacDest` implementation only ever dereferences pointers inside
         // `self.from`.
-        let copied = unsafe { forward_slot(self, slot)? };
-        if copied > 0 {
-            self.stats.objects_copied += 1;
-            self.stats.words_copied += copied;
-        }
-        Ok(())
+        let result = unsafe { forward_accounted(self, slot, &mut stats) };
+        self.stats = stats;
+        result
     }
 }
 
