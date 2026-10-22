@@ -103,6 +103,7 @@ mod ets_owner;
 mod lost_peer_tests;
 mod gc;
 mod retention;
+pub(crate) mod roots;
 mod scheduler;
 mod timer_wakes;
 
