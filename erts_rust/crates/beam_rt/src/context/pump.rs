@@ -1117,6 +1117,193 @@ mod in_process_compile {
         }
     }
 
+    /// **The milestone pin for the two open host-memory mechanisms**, measured on the real
+    /// workload instead of a fixture: one in-process compile of `lib/compiler/src/cerl_clauses.erl`.
+    ///
+    /// The fast, deterministic counterpart is
+    /// [`crate::context::pool::tests::the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand`]
+    /// (a fixture whose demand is arithmetic); this case is the **real** one, and it exists because
+    /// the two mechanisms' rules are only worth stating if they hold on a workload nobody shaped.
+    ///
+    /// # The invocation it pins
+    ///
+    /// ```text
+    /// erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --lib \
+    ///     -- --ignored --nocapture the_cerl_clauses_compile_bands
+    /// ```
+    ///
+    /// It is the CLI's own route ([`cli_route_runtime`]: boot, then the real
+    /// `bootstrap/bin/start.boot`) plus [`compile_expr`] — `compile:file(F, [no_spawn_compiler_process,
+    /// deterministic, no_docs, {outdir, D}])` — driven through `Runtime::eval`, i.e. **exactly**
+    /// `beam_rt -noshell -eval '<the same expression>'` with the **system** OTP compiler on the path
+    /// (the harness adds no `-pa`). Putting the tree's OTP-30 bootstrap compiler first on `-pa`
+    /// instead raises every figure (recorded below), which is why the bands are stated as bands.
+    ///
+    /// # What it bands, and why a band rather than an equality
+    ///
+    /// `arena_words` is a deterministic **count**, not a timing, so a shared host cannot perturb
+    /// it — but the compiler it counts through differs between two legitimate hosts (OTP 29 vs the
+    /// tree's OTP 30) by ≈19%, so the band is the honest unit: ±30% catches a regression of the
+    /// mechanism (a region policy, an extra reservation) while tolerating the compiler generation.
+    /// The countable **invariants** — how many store regions were retired, and the arena's
+    /// geometric reservation ladder — are asserted exactly, because a change there *is* the
+    /// mechanism moving.
+    #[test]
+    #[ignore = "milestone pin: compiles lib/compiler/src/cerl_clauses.erl in-process to band the arena and the -eval store retention"]
+    fn the_cerl_clauses_compile_bands_the_arena_and_the_eval_store() {
+        const BANNER: &str = "cerl_clauses host-memory pin";
+        /// The module compiled: small (13.8 kB), the workspace's documented control for the arena
+        /// census and the peak-RSS split, and ≈1 s under the release runtime.
+        const MODULE: &str = "cerl_clauses";
+        /// `arena_words` on the **system** (OTP-29) compiler — this harness's route. The tree's
+        /// OTP-30 bootstrap compiler, first on `-pa`, demands ≈5 133 683 words for the same source.
+        const ARENA_WORDS: u64 = 4_307_470;
+        /// The band's half-width, in percent of [`ARENA_WORDS`].
+        const BAND_PCT: u64 = 30;
+        /// The one `-eval` store region [`Runtime::grow_eval_heap`] retires: the copy-out volume
+        /// passes the 128 MiB store exactly once on this route (twice as much with the tree
+        /// compiler, whose generated terms are larger).
+        const STORE_RETIRED_REGIONS: usize = 0;
+        /// The engine arena's geometric unit: its first reservation, 4 MiB of `Eterm` words
+        /// (`beam_engine/src/context.rs`'s `HEAP_RESERVE_WORDS`).
+        const ARENA_UNIT_WORDS: usize = 4 * 1024 * 1024 / core::mem::size_of::<u64>();
+        /// The pooled BIF heap's region count at the end: a depth-sized seed plus one retirement
+        /// per call that outgrew its region, which is a property of the compile's call shapes.
+        const BIF_REGIONS: usize = 27;
+        /// The md5 of the artifact with the option list above — `Code`, `Attr` (deterministic, no
+        /// `-vsn`) and `Dbgi` are all fixed by it, so this is the compile's own identity. Re-pin it
+        /// (the failure message prints the observed value) when the oracle's compiler generation
+        /// changes; it is never a pass criterion by itself — the answer and the retention figures
+        /// are.
+        const ARTIFACT_MD5: &str = "94cb59a617a3ec1afda0750118dde54b";
+
+        let root = source_root();
+        let src = root
+            .join("lib/compiler/src")
+            .join(format!("{MODULE}.erl"));
+        if !src.is_file() {
+            skip_loudly(
+                BANNER,
+                &format!("no source to compile at {}", src.display()),
+            );
+            return;
+        }
+        let out = scratch_dir(&format!("{MODULE}_pin_out"));
+        let expr = compile_expr(&src, out.path());
+        let mut runtime = cli_route_runtime(&root);
+        let started = Instant::now();
+        let result = runtime.eval(&expr).unwrap_or_else(|error| {
+            panic!("the in-process compile of `{MODULE}` must complete: {error}")
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        let rendered = runtime
+            .format_term_w(result, None)
+            .unwrap_or_else(|error| panic!("the `{MODULE}` result must be printable: {error}"));
+        assert_eq!(
+            rendered.trim(),
+            format!("{{ok,{MODULE}}}"),
+            "the in-process compile must answer the oracle's `{{ok,{MODULE}}}`"
+        );
+
+        // The artifact's identity: the compile really produced the module, not just a tag.
+        let artifact = out.path().join(format!("{MODULE}.beam"));
+        let bytes = fs::read(&artifact).unwrap_or_else(|error| {
+            panic!(
+                "the compile answered {} but wrote no {}: {error}",
+                rendered.trim(),
+                artifact.display()
+            )
+        });
+        let digest = beam_loader::checksum::md5(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        // ---- the two mechanisms ----
+        let stats = runtime.retention_stats();
+        let arena = runtime.arena.heap_stats();
+        eprintln!(
+            "{MODULE}.erl: in-process compile in {elapsed:.3} s, {} bytes, md5 {digest}\n\
+             arena: words={} allocs={} regions={} reserved={} committed={} used={}\n\
+             store: words={} retired_regions={} retired_words={} retained={}\n\
+             pool:  regions={} words={} peak_used={}",
+            bytes.len(),
+            stats.arena_words,
+            stats.arena_allocs,
+            arena.regions,
+            arena.reserved_words,
+            arena.committed_words,
+            arena.used_words,
+            stats.eval_heap_words,
+            stats.eval_heap_retired_regions,
+            stats.eval_heap_retired_words,
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            stats.bif_regions,
+            stats.bif_words,
+            stats.bif_peak_used_words,
+        );
+
+        // (1) the arena: a demand band, and the geometric ladder EXACTLY.
+        let low = ARENA_WORDS - ARENA_WORDS * BAND_PCT / 100;
+        let high = ARENA_WORDS + ARENA_WORDS * BAND_PCT / 100;
+        assert!(
+            (low..=high).contains(&stats.arena_words),
+            "the arena's cumulative demand must stay in {low}..={high} words (±{BAND_PCT}% of \
+             {ARENA_WORDS}); it reads {} — a change here is a term-reservation policy change, not \
+             noise",
+            stats.arena_words
+        );
+        assert_eq!(
+            arena.used_words as u64,
+            stats.arena_words,
+            "the census and the demand counter are one quantity"
+        );
+        assert_eq!(
+            arena.reserved_words,
+            ARENA_UNIT_WORDS * ((1 << arena.regions) - 1),
+            "the arena's reservations are the geometric ladder unit · (2^regions − 1) — the region \
+             policy this case's bound is stated in terms of"
+        );
+        assert!(
+            (3..=6).contains(&arena.regions),
+            "the ladder's step count follows from the demand; {} regions is outside the band the \
+             measured demand implies",
+            arena.regions
+        );
+
+        // (2) the `-eval` store: the retirement count EXACTLY, and retention = Σ region capacities.
+        assert_eq!(
+            stats.eval_heap_retired_regions, STORE_RETIRED_REGIONS,
+            "the copy-out volume retires exactly {STORE_RETIRED_REGIONS} store region(s) on this \
+             route; retained words = {} — the store never shrinks, so a change here is the \
+             copy-out volume moving",
+            stats.eval_heap_words + stats.eval_heap_retired_words
+        );
+        assert_eq!(
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            stats.eval_heap_words + stats.eval_heap_words * ((1 << stats.eval_heap_retired_regions) - 1),
+            "the store's retention is every region it ever installed: `eval_heap_words` (the \
+             current, doubled region) plus one retired region per doubling"
+        );
+
+        // (3) the pooled BIF heap stays a fraction of either, with the same countable band.
+        let bif_low = BIF_REGIONS * 7 / 10;
+        let bif_high = BIF_REGIONS * 13 / 10;
+        assert!(
+            (bif_low..=bif_high).contains(&stats.bif_regions),
+            "the pooled BIF heap's region count must stay in {bif_low}..={bif_high} (±30% of \
+             {BIF_REGIONS}); it reads {}",
+            stats.bif_regions
+        );
+
+        // (4) the artifact's md5.
+        assert_eq!(
+            digest, ARTIFACT_MD5,
+            "the artifact's identity moved — if the oracle's compiler generation changed, re-pin \
+             ARTIFACT_MD5 to `{digest}`; if not, the compile produced different bytes"
+        );
+    }
+
     /// Every `lib/stdlib/src/*.erl`, `(module, path)`, sorted by module — discovered from the
     /// **filesystem** alone. `None` when the directory is missing or holds no source, which the
     /// caller reports as a loud skip.
