@@ -171,6 +171,37 @@ impl PersistentTermStore {
             .sum();
         (self.entries.len() as u64, (words as u64) * 8)
     }
+
+    /// Hands `f` the **live words** of every stored entry — a 2-word `[Key, Value]` buffer per
+    /// entry, in insertion (store) order — so a caller that can *move* the store those words
+    /// point into can rewrite them in place.
+    ///
+    /// Both words are stabilized by the writer (see the module docs): a stored key or value is a
+    /// term the runtime holds for its whole lifetime, so it is a GC root, not a copy. That is why
+    /// this enumerator exists — the words are `stabilize_term`-**stable** today, and a future
+    /// mover of the store they name would re-point them here rather than dangle them.
+    ///
+    /// The contract is the caller's: `f` may replace any element of the slice, but never its
+    /// length; the iteration order (the `Vec`'s) and the slicing are implementation details the
+    /// visitor must not depend on. An `Err` from `f` still writes the current entry's buffer back
+    /// (whatever `f` left in it) and is then returned as-is, so a partial rewrite is never lost.
+    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
+    // method is legitimately unused in the meantime (the same allowance `gc_disabled_reason` and
+    // `local_identity` carry).
+    #[allow(dead_code)]
+    pub(crate) fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        for entry in &mut self.entries {
+            let mut words = [entry.0, entry.1];
+            let visited = f(&mut words);
+            entry.0 = words[0];
+            entry.1 = words[1];
+            visited?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for PersistentTermStore {
