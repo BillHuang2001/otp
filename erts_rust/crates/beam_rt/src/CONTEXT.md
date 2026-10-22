@@ -79,7 +79,7 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
   ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
   arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
-- **Four storage regions, all observable, three of them bounded by policy.** `arena` (`:240`), `beam_engine`-owned and the only unbounded one; the pooled BIF heap
+- **Four storage regions, all observable: one bounded, one depth-sized, two unbounded by construction.** `arena` (`:240`), `beam_engine`-owned, retains every word it ever handed out; the pooled BIF heap
   `bif_heaps: Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap`, **depth-sized** —
   `bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` = 1 MiB for a nested one, self-tuned
   to `2 ×` an observed nested peak — and grown **geometrically** in `context/calls.rs take_bif_frontier`); `eval_heap: Heap`
@@ -92,7 +92,7 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `eval_heap_retired_words`, `eval_off_heap_handles` (MSO slots only — `OffHeapTable::len` excludes
   the table's refc binaries) — and `BEAM_RT_MEM_TRACE` prints it as one `[rt-mem] boot …` line after
   the boot and one `[rt-mem] exit …` line on the way out of `cli::run` (silent unless set).
-  Every size field is a **capacity/reservation** figure, so it appears in `VmSize` and never by itself in RSS.- **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
+  The two arena/pool fields are **capacity/reservation** figures, so they appear in `VmSize` and only their written pages in RSS; the store's two retired ones are not — a region is retired only once it is full, so `eval_heap_retired_words` is ~fully written and resident (`inet_parse`'s peak is 59 % retired store / 37 % arena written pages / 2.4 % glibc / 1 % other).- **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
   byte-aligned binary ≤64 bytes to `terms::make_heap_binary` (arena) and everything else —
   non-byte-aligned, or past `ERL_ONHEAP_BINARY_LIMIT` — to `beam_codec::term::make_bitstring` on
   `eval_heap`. `binary:copy/2` likewise builds **on-heap** on the pooled BIF heap
