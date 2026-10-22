@@ -334,6 +334,31 @@ unused by `Heap`/`ReservedHeap`) and `RefcBinary::set_len`'s zero-fill (`src/bin
 Corollary for measurement: a segment **reused from the mseg cache is not zeroed** (only a fresh `mmap`
 is), and a freed segment keeps whatever pages its previous owner dirtied while it sits in the cache.
 
+### Freed-block liveness — what a stale pointer into a freed block sees
+`Heap::drop` (`src/heap.rs:242-261`) frees **one block**; whether that unmaps anything depends only on
+which routing band the block landed in (`core.rs:314-328`, defaults from `config.rs:89-101` +
+`policy.rs:461-474`: ladder to 1024 B, carrier 1 MiB, `sbct` 512 KiB):
+- **slab block** (`payload <= 1024 B`, `align <= UNIT_SIZE`): `return_block` pushes it onto the class
+  free list (`core.rs:544-570`, `state.rs:227-240`); the carrier is retained for the allocator's
+  lifetime (`state.rs:178`). Stays mapped; the *next* allocation of that class hands the same address
+  back, and `push`/`unlink` overwrite the payload's first two words with the intrusive links
+  (`free_list.rs:599-640`, cleared at `:557-562`).
+- **MBC block** (`1024 B < payload < sbct`): coalesced inside a pooled 1 MiB carrier
+  (`mbc.rs:343-...`); the carrier is destroyed only when `is_fully_free()` after this free
+  (`core.rs:508-522`, `mbc.rs:489-492`), and even then only into the `mseg` reuse cache.
+- **dedicated SBC block** (`payload >= sbct`, or `align > UNIT_SIZE`): the whole mapping is released
+  inside that same `dealloc` (`core.rs:527-543`) via `carrier.unmap` (`carrier.rs:227-229`) →
+  `Segment::drop` (`mseg/header.rs:250-254`) → the process-global `mseg` reuse cache
+  (`carrier.rs:104-107`, `mseg/state.rs:142-156`) — still mapped, unzeroed, re-handable at the same
+  address. `munmap` happens only on cache eviction (default `max_cache_size` = 10, FIFO,
+  `mseg/state.rs:147-151`) or a bad-fit tail trim on reuse (`mseg/state.rs:183-204`).
+So a stale pointer into a dropped `Heap` is normally mapped and readable (old bytes), and genuinely
+unmapped only on the SBC/MBC-carrier path plus a cache eviction. There is **no `madvise`/`MADV_DONTNEED`
+anywhere in the crate** (only doc mentions: `policy.rs:422`, `mbc.rs:105`), so freed-but-mapped memory is
+never zeroed by the allocator — a first-use `mmap` is zero, a recycled segment is not.
+The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std::alloc::dealloc` at
+`heap.rs:365`) is `#[cfg(test)]`-only and never on a runtime path.
+
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
   (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
