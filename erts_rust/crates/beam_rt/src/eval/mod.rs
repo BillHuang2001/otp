@@ -482,9 +482,10 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
         //
         // The driver's own live terms ride the close to the **exit-site** region-reclaim pass
         // (`crate::runtime::reclaim`): its environment plus the one term it is about to hand back —
-        // the result, or a raise's reason and its stacktrace head. A [`Flow::Fatal`] left with a
-        // `BeamError` that may carry a live reason word and exposes no mutable accessor, so the pass
-        // is told to decline instead of guessing.
+        // the result, or a raise's reason and its stacktrace head. Both halves are handed over
+        // **mutable**, because the pass may move the words it reclaims. A [`Flow::Fatal`] left with
+        // a `BeamError` that may carry a live reason word and exposes no mutable accessor, so the
+        // pass is told to decline instead of guessing.
         let mut exit_roots: Vec<Eterm> = Vec::new();
         let mut withheld: Option<&'static str> = None;
         match &outcome {
@@ -499,7 +500,12 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
                 withheld = Some("the driver left with a raise whose reason word cannot be handed over")
             }
         }
-        scratch::close(evaluator.ctx.runtime, &env, &exit_roots, withheld);
+        scratch::close(
+            evaluator.ctx.runtime,
+            &mut env,
+            &mut exit_roots,
+            withheld,
+        );
         finish(outcome, evaluator.ctx)
     })
 }

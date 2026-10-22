@@ -392,11 +392,11 @@ pub(crate) struct PassInput<'a> {
     /// What the open statement window reports (opened-ness and its pin latches).
     pub(crate) window: WindowState,
     /// The caller's own live terms — the evaluator's `Env` values, plus the driver's result at
-    /// the exit. Added to [`Runtime::gather_off_heap_roots`] to form the descent's root set, and
-    /// added to [`Runtime::for_each_root_mut`] to form the move's corpus.
+    /// the exit. Added to [`Runtime::gather_off_heap_roots`] to form the descent's root set.
     ///
-    /// These are **copies**: [`compact::attempt_move`] forwards the real slots
-    /// ([`MoveSlots`]), which are handed to [`pass`] separately.
+    /// These are **copies**, and the move ignores them: [`compact::attempt_move`] forwards — and
+    /// sizes its destination from — the real slots ([`MoveSlots`]), which are handed to [`pass`]
+    /// separately.
     pub(crate) value_roots: &'a [Eterm],
     /// `Some(reason)` when the caller knows it holds a live term it **cannot** hand over (the
     /// `-eval` driver's `Flow::Fatal`: a `BeamError` may carry a live reason word and exposes no
@@ -424,7 +424,8 @@ struct Cursor {
 #[derive(Debug, Clone)]
 pub(crate) struct RegionReclaim {
     /// The three action bits ([`Runtime::set_region_reclaim_enabled`]).
-    config: RegionReclaimConfig,    /// The open window's frontiers, if a pass may run.
+    config: RegionReclaimConfig,
+    /// The open window's frontiers, if a pass may run.
     cursor: Option<Cursor>,
     /// The published counters.
     stats: RegionReclaimStats,
@@ -503,7 +504,8 @@ pub(crate) fn open(runtime: &mut Runtime) {
 
 /// Closes the region-reclaim window. Called by [`crate::eval::scratch::close`] once the exit-site
 /// pass has run.
-pub(crate) fn close(runtime: &mut Runtime) {    runtime.region_reclaim.cursor = None;
+pub(crate) fn close(runtime: &mut Runtime) {
+    runtime.region_reclaim.cursor = None;
 }
 
 /// One region-reclaim **pass**: one descent, then the arena and/or store action.
@@ -693,6 +695,7 @@ fn gather_roots(
         .for_each_error_live_reason(&mut |term| roots.push(term));
     Ok(roots)
 }
+
 /// One region a pass may reclaim, and the action it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -722,7 +725,8 @@ fn live_ranges(runtime: &mut Runtime, cursor: Cursor) -> Vec<Candidate> {
     // current-region half — see `advance_cursor`.
     let base = heap_region_base(&runtime.eval_heap);
     if base == cursor.store_base && runtime.eval_heap.used() > cursor.store_mark {
-        candidates.push(Candidate {            target: Target::StoreCurrent,
+        candidates.push(Candidate {
+            target: Target::StoreCurrent,
             range: (
                 base + cursor.store_mark * width,
                 base + runtime.eval_heap.used() * width,
@@ -848,6 +852,7 @@ fn advance_cursor(runtime: &mut Runtime) {
         cursor.store_mark = used;
     }
 }
+
 /// The runtime's **region-reclaim accounting**.
 impl Runtime {
     /// The published region-reclaim counters ([`RegionReclaimStats`]).

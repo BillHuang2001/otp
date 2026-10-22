@@ -55,6 +55,9 @@ fn open_window() -> WindowState {
 }
 
 /// A pass at the exit site over `value_roots`, with the window reported as open and unpinned.
+///
+/// The move's corpus half is empty: these cases are about the **whole-region** action and the
+/// pass's decline list, so every case that expects a drop gives the move nothing to evacuate.
 fn exit_pass(rt: &mut Runtime, value_roots: &[Eterm]) {
     pass(
         rt,
@@ -64,6 +67,7 @@ fn exit_pass(rt: &mut Runtime, value_roots: &[Eterm]) {
             value_roots,
             withheld: None,
         },
+        &mut MoveSlots::default(),
     );
 }
 
@@ -253,6 +257,7 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 value_roots: &[],
                 withheld: None,
             },
+            &mut MoveSlots::default(),
         );
         assert_declined(&rt, before, "no statement window is open");
         assert_eq!(store_shape(&rt), shape);
@@ -284,6 +289,7 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 value_roots: &[],
                 withheld: None,
             },
+            &mut MoveSlots::default(),
         );
         let after = rt.region_reclaim_stats();
         assert_eq!(
@@ -319,6 +325,7 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 value_roots: &[],
                 withheld: None,
             },
+            &mut MoveSlots::default(),
         );
         assert_declined(&rt, before, "a machine in flight");
         assert_eq!(store_shape(&rt), shape, "the boundary declined");
@@ -335,6 +342,7 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 value_roots: &[],
                 withheld: None,
             },
+            &mut MoveSlots::default(),
         );
         let after = rt.region_reclaim_stats();
         assert_eq!(
@@ -365,6 +373,7 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 value_roots: &[],
                 withheld: Some("the driver cannot hand its live term over"),
             },
+            &mut MoveSlots::default(),
         );
         assert_declined(&rt, before, "the driver cannot hand its live term over");
         assert_eq!(store_shape(&rt), shape);

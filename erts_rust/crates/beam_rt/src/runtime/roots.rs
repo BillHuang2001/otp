@@ -288,15 +288,10 @@ impl Runtime {
     ///
     /// Whatever `f` answers; the walk stops there, the owner of the failing slice has already
     /// written its buffer back, and every word `f` had replaced before that is in place.
-    // The parity test (`src/runtime/root_tests.rs`) is this door's caller: it compares the walk's
-    // corpus against the value gather's in every populated state.
-    //
-    // A **lint allowance only**, not a behaviour claim: nothing on a collection, relocation or
-    // prune path calls this door yet, so a non-test build sees the whole chain as dead code. The
-    // future relocation/compaction pass is its intended production caller, and the parity suite is
-    // deliberately the *sole* caller until then — which is what keeps the door from rotting
-    // unnoticed.
-    #[allow(dead_code)]
+    // The parity test (`src/runtime/root_tests.rs`) and the store move
+    // (`crate::runtime::reclaim::compact`) are this door's two callers: the first compares the
+    // walk's corpus against the value gather's in every populated state, the second forwards every
+    // slot so a moved store region leaves each root naming the destination.
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
@@ -310,10 +305,10 @@ impl Runtime {
     /// This is the *moving* twin of
     /// [`Runtime::gather_off_heap_roots`](crate::Runtime::gather_off_heap_roots), which answers the
     /// read-only question ("which terms does the runtime keep alive?"). Here the same owners lend
-    /// the words themselves, so a future relocation/compaction pass can rewrite a root in place
-    /// instead of only learning that it exists. It **decides nothing**: it collects nothing,
-    /// retains nothing, prunes nothing, and no collection or prune path calls it — visiting a word
-    /// has no effect beyond the writes the visitor itself makes.
+    /// the words themselves, so a relocation can rewrite a root in place instead of only learning
+    /// that it exists; [`crate::runtime::reclaim::compact`] is that relocation. It **decides
+    /// nothing**: it collects nothing, retains nothing, prunes nothing — visiting a word has no
+    /// effect beyond the writes the visitor itself makes.
     ///
     /// # Coverage — the traversal order
     ///
@@ -420,23 +415,34 @@ impl Runtime {
     /// These holders are **known** and reported rather than visited, each for a reason that makes a
     /// slot impossible or meaningless. A mover must handle them another way (or not at all):
     ///
-    /// * The `-eval` evaluator's live `Env` and Rust-stack locals — they are Rust stack frames, so
-    ///   no `&mut` slot exists; the whole `-eval` driver runs under
+    /// * The `-eval` evaluator's **environment** and its Rust-stack locals. The evaluator's `Env`
+    ///   is a Rust local of `src/eval`, so no `&mut` slot of this walk reaches it — but the caller
+    ///   that owns it hands its value slots over separately, as
+    ///   [`MoveSlots`](crate::runtime::reclaim::MoveSlots) (`crate::eval::scratch::boundary` /
+    ///   `close`). Its deeper stack frames (a partially built term inside a nested `expr`) are
+    ///   never live at either site a move runs at. The whole `-eval` driver also runs under
     ///   [`RuntimeContext::with_relocation_exempt`](crate::context::RuntimeContext::with_relocation_exempt)
-    ///   (`src/eval/mod.rs`), so nothing it holds may move.
+    ///   (`src/eval/mod.rs`), which is why a *process*-heap term the evaluator holds in a Rust local
+    ///   cannot move.
     /// * The **word-image** regions — `eval_heap`, `eval_heap_retired`, `bif_heaps`, `info_heap`.
     ///   They are word images, not term arrays (a region also carries the payload bytes of every
     ///   on-heap binary it holds), and they are enumerated by
     ///   [`Runtime::for_each_off_heap_region`](crate::Runtime::for_each_off_heap_region), whose
     ///   visitor must not dereference a word. Handing them to *this* visitor would be a
-    ///   memory-safety defect.
+    ///   memory-safety defect. (The store move reaches the store's *words* a different way — through
+    ///   `beam_gc`'s relocator, which the sources' `FromSet` and the destination region describe.)
     /// * `RunnerState::errors` — a `BeamError` may carry a live reason word
     ///   ([`beam_common::Raise`]'s opaque `live_reason` slot), but `BeamError` exposes no mutable
-    ///   term accessor; reaching it needs an upstream `beam_common` seam.
+    ///   term accessor; reaching it needs an upstream `beam_common` seam. The store move therefore
+    ///   **declines** a candidate range such a word stands in rather than rewriting it.
     /// * **Address-valued bookkeeping** a mover must *re-key* or *recompute* rather than rewrite:
-    ///   `Runtime::references`, `Timers::refs`, `TimerWakes::deliver`,
-    ///   `SelectWatch::by_fd_handle`, and — the fact behind all four — `Eterm`'s `Hash`/`Eq` are
-    ///   the raw word, so every `Eterm`-keyed map in the runtime is keyed by **address**.
+    ///   `SelectWatch::by_fd_handle` (`SelectWatch::rekey_handles`, called by a move's commit),
+    ///   and — the fact behind it — `Eterm`'s `Hash`/`Eq` are the raw word, so every `Eterm`-keyed
+    ///   map in the runtime is keyed by **address**. `Runtime::references`, `Timers::refs` and
+    ///   `TimerWakes::deliver` need no re-keying, and structurally rather than by judgement: each
+    ///   key is minted on a **pooled BIF heap** (`src/native/process.rs`'s `reference_term`,
+    ///   `src/native.rs`'s `mint_timer_ref`), which is a different region family from the store —
+    ///   see [`crate::runtime::reclaim::compact`]'s *The address-keyed maps*.
     /// * `InMachinePosition` (an in-flight window no collection may run inside) and the per-call
     ///   NIF hosts (`NifHostImpl::envs`, `PendingNifSend`), which exist only inside a callback
     ///   window.
@@ -451,13 +457,9 @@ impl Runtime {
     ///
     /// Whatever `f` answers (see the visitor contract above).
     //
-    // A **lint allowance only**, not a behaviour claim: the parity suite
-    // (`src/runtime/root_tests.rs::the_family_walk_matches_the_value_gather`) is this door's sole
-    // caller today, so a non-test build sees the whole walk — this method, `tagged`, and every
-    // family's `for_each_*_root_mut` — as dead code. The future relocation/compaction pass is the
-    // intended production caller; keeping the suite the only caller until it lands is what stops
-    // the door from rotting unnoticed.
-    #[allow(dead_code)]
+    // Two callers: the parity suite (`src/runtime/root_tests.rs::the_family_walk_matches_the_value_gather`)
+    // and the store move (`crate::runtime::reclaim::compact`, which forwards every slice so a moved
+    // region leaves each root naming the destination).
     pub(crate) fn for_each_root_family_mut(
         &mut self,
         f: &mut impl FnMut(RootFamily, &mut [Eterm]) -> beam_common::Result<()>,

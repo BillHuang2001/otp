@@ -499,6 +499,8 @@ impl SelectWatch {
     /// `by_fd` and `by_fd_handle` are **not** term stores and are deliberately left alone: the
     /// former keys a descriptor, and the latter's key is `(fd, handle_key(handle))` — an
     /// **address**-valued index a mover must **recompute**, never rewrite (see [`handle_key`]).
+    /// That recompute is [`SelectWatch::rekey_handles`], which a move calls once its forwarding has
+    /// rewritten `handle` above.
     ///
     /// # Errors
     ///
@@ -511,6 +513,22 @@ impl SelectWatch {
             registration.for_each_root_mut(f)?;
         }
         Ok(())
+    }
+
+    /// Rebuilds the `(fd, handle)` lookup index from the registrations' **current** handles.
+    ///
+    /// [`SelectWatch::by_fd_handle`] is keyed by [`handle_key`], i.e. by a term's **address**, so a
+    /// move that rewrites a `handle` term leaves every one of its entries stale. Rebuilding is
+    /// exact rather than a patch-up: every entry of the index names exactly one live registration,
+    /// so the registrations are the authoritative source and the map is derived data.
+    ///
+    /// `O(registrations)`, and called only from a commit (never on a delivery path).
+    pub(crate) fn rekey_handles(&mut self) {
+        self.by_fd_handle.clear();
+        for (&key, registration) in &self.registrations {
+            self.by_fd_handle
+                .insert((registration.fd, handle_key(registration.handle)), key);
+        }
     }
 
     /// Arms a **one-shot** interest on `fd` for `owner` — the C's `enif_select` registration.

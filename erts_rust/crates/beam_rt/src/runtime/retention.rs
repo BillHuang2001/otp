@@ -145,15 +145,17 @@ pub struct RetentionStats {
     /// How many store regions a [`crate::runtime::reclaim`] pass **compacted** (its live words
     /// moved).
     ///
-    /// Always `0`: Phase 1a never moves or copies a word — a region either holds a reachable word
-    /// (and is retained whole) or holds none (and is dropped whole). Phase 1b fills it.
+    /// The store move ([`crate::runtime::reclaim::compact`]): one region holding a live word is
+    /// evacuated into a fresh right-sized region so its source can be dropped. A region whose live
+    /// fraction is too high, whose candidates are below the window threshold, or whose pass declined
+    /// is never compacted.
     pub store_compactions: u64,
     /// How many store words the reclaim pass's drops released, summed
     /// ([`RegionReclaimStats::store_words_reclaimed`](crate::runtime::RegionReclaimStats)).
     ///
     /// A dropped retired region contributes its whole written prefix; the current region
-    /// contributes the window prefix a reset released. [`eval_heap_retired_words`] is the falling
-    /// counterpart of the first half.
+    /// contributes the window prefix a reset released; a move contributes its candidates' **dead**
+    /// words. [`eval_heap_retired_words`] is the falling counterpart.
     ///
     /// [`eval_heap_retired_words`]: RetentionStats::eval_heap_retired_words
     pub store_words_reclaimed: u64,
@@ -163,6 +165,16 @@ pub struct RetentionStats {
     /// The falling counterpart of
     /// [`eval_heap_retired_regions`](RetentionStats::eval_heap_retired_regions).
     pub store_regions_dropped: u64,
+    /// How many store **move** attempts declined, for any reason in
+    /// [`crate::runtime::reclaim::compact`]'s decline list
+    /// ([`RegionReclaimStats::store_move_declines`](crate::runtime::RegionReclaimStats)).
+    ///
+    /// Kept apart from [`reclaim_declines`](RetentionStats::reclaim_declines): the move is an
+    /// optional extra action, so a moved-off A/B run must not read as if the whole pass refused.
+    pub store_move_declines: u64,
+    /// The reason of the most recent store-move decline — see
+    /// [`crate::runtime::reclaim::compact`]'s decline list. `None` until the first one.
+    pub store_move_last_decline: Option<&'static str>,
     /// How many times the reclaim pass rewound the **engine arena**
     /// ([`RegionReclaimStats::arena_reclaims`](crate::runtime::RegionReclaimStats)).
     pub arena_reclaims: u64,
@@ -197,6 +209,7 @@ impl fmt::Display for RetentionStats {
              bif_nested_heap_words={} bif_nested_peak_words={} eval_heap_words={} \
              eval_heap_retired_regions={} eval_heap_retired_words={} eval_off_heap_handles={} \
              store_compactions={} store_words_reclaimed={} store_regions_dropped={} \
+             store_move_declines={} store_move_last_decline={} \
              arena_reclaims={} arena_words_reclaimed={} arena_regions_dropped={} \
              reclaim_declines={} reclaim_last_decline={}",
             self.arena_words,
@@ -215,6 +228,8 @@ impl fmt::Display for RetentionStats {
             self.store_compactions,
             self.store_words_reclaimed,
             self.store_regions_dropped,
+            self.store_move_declines,
+            self.store_move_last_decline.unwrap_or("none"),
             self.arena_reclaims,
             self.arena_words_reclaimed,
             self.arena_regions_dropped,
@@ -269,6 +284,8 @@ impl Runtime {
             store_compactions: reclaim.store_compactions,
             store_words_reclaimed: reclaim.store_words_reclaimed,
             store_regions_dropped: reclaim.store_regions_dropped,
+            store_move_declines: reclaim.store_move_declines,
+            store_move_last_decline: reclaim.store_move_last_decline,
             arena_reclaims: reclaim.arena_reclaims,
             arena_words_reclaimed: reclaim.arena_words_reclaimed,
             arena_regions_dropped: reclaim.arena_regions_dropped,
@@ -620,6 +637,8 @@ mod tests {
             store_compactions: 14,
             store_words_reclaimed: 15,
             store_regions_dropped: 16,
+            store_move_declines: 21,
+            store_move_last_decline: Some("a move reason"),
             arena_reclaims: 17,
             arena_words_reclaimed: 18,
             arena_regions_dropped: 19,
@@ -640,6 +659,8 @@ mod tests {
             "store_compactions=14",
             "store_words_reclaimed=15",
             "store_regions_dropped=16",
+            "store_move_declines=21",
+            "store_move_last_decline=a move reason",
             "arena_reclaims=17",
             "arena_words_reclaimed=18",
             "arena_regions_dropped=19",
@@ -652,8 +673,9 @@ mod tests {
             );
         }
         // A pass that has never declined renders the documented `none`, so the pair is always
-        // present and a script can grep it unconditionally.
+        // present and a script can grep it unconditionally — for both decline reasons.
         let fresh = RetentionStats::default().to_string();
         assert!(fresh.ends_with("reclaim_last_decline=none"), "{fresh}");
+        assert!(fresh.contains("store_move_last_decline=none"), "{fresh}");
     }
 }

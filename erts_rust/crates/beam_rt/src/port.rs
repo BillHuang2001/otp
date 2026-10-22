@@ -3114,9 +3114,10 @@ impl PortRegistry {
 /// returned as-is.
 ///
 /// None of this is a liveness statement: visiting a word retains nothing, and none of these methods
-/// starts or stops delivering, queueing or collecting anything. The deliberately **excluded**
-/// slot is [`select::SelectWatch`]'s `by_fd_handle` index — keyed by an address-derived
-/// `handle_key`, so a mover must *recompute* it rather than rewrite it (see
+/// starts or stops delivering, queueing or collecting anything. The one term-keyed index here —
+/// [`select::SelectWatch`]'s `by_fd_handle`, keyed by the address-derived `handle_key` — is
+/// **recomputed** rather than rewritten by [`PortRegistry::rekey_select_handles`], which a store
+/// move calls after its forwarding rewrote the handles (see
 /// [`select::SelectWatch::for_each_root_mut`]).
 impl PortRegistry {
     /// Visits every term the **queued/pending port event** family stores, mutably.
@@ -3181,6 +3182,17 @@ impl PortRegistry {
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
     ) -> Result<()> {
         self.select.for_each_root_mut(f)
+    }
+
+    /// Rebuilds every address-valued index over a term this layer stores — today exactly one: the
+    /// armed select registrations' `(fd, handle)` lookup
+    /// ([`select::SelectWatch::rekey_handles`]).
+    ///
+    /// Called by the store move ([`crate::runtime::reclaim::compact`]) at its commit, once the
+    /// forwarding has rewritten the handles the index is keyed by. Nothing else needs it: a port's
+    /// own descriptor map is keyed by an `fd`, never by a term.
+    pub(crate) fn rekey_select_handles(&mut self) {
+        self.select.rekey_handles()
     }
 }
 

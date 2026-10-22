@@ -333,10 +333,16 @@ pub(crate) fn attempt_move(
     // (a `beam_alloc::Heap` never moves its block, and no region is dropped until the commit), and
     // the ranges are pairwise disjoint because they are distinct heap allocations.
     let from = unsafe { FromSet::from_ranges(&ranges) };
-    // The count walk, over the **same** corpus the copy will forward: the caller's live terms
-    // plus every runtime root family. `live_words_in` is exactly the `words_copied` the relocator
-    // reports for the same from-set and roots, so the destination is sized from a real figure.
-    let mut corpus: Vec<Eterm> = input.value_roots.to_vec();
+    // The count walk, over the **exact** corpus the copy will forward: the caller's live slots
+    // plus every runtime root family, in that order. Nothing else may be added — `live_words_in`
+    // dedups by object, so its answer is precisely the `words_copied` the relocator reports for
+    // this from-set and these roots, which is what lets the destination be sized from a real
+    // figure and `need <= destination capacity` hold by construction. The immutable
+    // `PassInput::value_roots` snapshot is deliberately **not** part of it: it may name a slot the
+    // caller has already replaced, and counting a word the copy will not forward would inflate the
+    // destination (harmless) while the converse — forwarding a word that was never counted — is
+    // what the preflight must refuse.
+    let mut corpus: Vec<Eterm> = slots.values();
     if runtime
         .for_each_root_mut(&mut |words| {
             corpus.extend_from_slice(words);
@@ -367,7 +373,7 @@ pub(crate) fn attempt_move(
         runtime.region_reclaim.decline_move(R_DEST_CEILING);
         return MoveOutcome::Declined;
     }
-    let Ok(mut destination) = beam_alloc::Heap::new(capacity) else {
+    let Ok(destination) = beam_alloc::Heap::new(capacity) else {
         runtime.region_reclaim.decline_move(R_DEST_ALLOC);
         return MoveOutcome::Declined;
     };
@@ -473,7 +479,7 @@ fn keep_both(runtime: &mut Runtime, mut destination: beam_alloc::Heap, copied: u
 /// dropped.
 fn commit(
     runtime: &mut Runtime,
-    destination: beam_alloc::Heap,
+    mut destination: beam_alloc::Heap,
     copied: usize,
     mark: usize,
     retired: &[usize],

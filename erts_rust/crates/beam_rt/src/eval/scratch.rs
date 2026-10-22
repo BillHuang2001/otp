@@ -124,6 +124,13 @@
 //! frontier and pin latches so the two mechanisms can never disagree about which words belong to
 //! the run.
 //!
+//! The pass **may move a word** (its store move, [`crate::runtime::reclaim::compact`]): it evacuates
+//! the live words of a partially live region into one fresh right-sized region and drops the
+//! sources. That is why [`boundary`], [`close`] and [`Evaluator::reset_scratch`] hand the
+//! evaluator's environment over as **writable slots** rather than as a snapshot, and why a move
+//! ends by [`ScratchState::stop`]ping this window — the mark it held named a region that is no
+//! longer current.
+//!
 //! # A pin is classified, and the classification changes nothing here
 //!
 //! [`pin`] records a **runtime-lifetime** reason ([`PinKind::Lifetime`]: a term a store still names
@@ -147,7 +154,7 @@ use beam_term::Eterm;
 
 use super::reclaim::{self, Reach, Walk};
 use super::{Env, Evaluator};
-use crate::runtime::reclaim::{self as region_reclaim, PassInput, Site};
+use crate::runtime::reclaim::{self as region_reclaim, MoveSlots, PassInput, Site};
 use crate::runtime::Runtime;
 /// The term store's region figures and the statement window's counters, as
 /// [`Runtime::eval_region_stats`] publishes them.
@@ -189,7 +196,11 @@ pub struct EvalRegionStats {
 /// Below it a boundary does nothing at all: the descent costs `O(live set)` and a statement that
 /// copied less than this would not repay it. The window then keeps growing until it is worth a
 /// walk, so nothing is *lost* — only deferred.
-const MIN_WINDOW_WORDS: usize = 1024;
+///
+/// The store move ([`crate::runtime::reclaim::compact`]) applies the same figure to the **total**
+/// words of its candidate sources, so a store that never grew a window worth resetting never pays
+/// for a copy either.
+pub(crate) const MIN_WINDOW_WORDS: usize = 1024;
 
 /// One open **statement window**: the part of the store the statement (or statements) since the
 /// mark have written.
@@ -342,6 +353,16 @@ impl ScratchState {
             }
         }
     }
+    /// Drops the open window **without** resetting it.
+    ///
+    /// A mark is an offset into the region it was taken in, so a store whose current region was
+    /// *replaced* under the window — which is exactly what the store move does — leaves this window
+    /// naming a region that is no longer current. Dropping it is the only sound answer: the next
+    /// boundary opens a fresh window above the new region's frontier.
+    pub(crate) fn stop(&mut self) {
+        self.window = None;
+    }
+
     /// What a region-reclaim pass needs to know about this window.
     pub(crate) fn state(&self) -> WindowState {
         match &self.window {
@@ -420,18 +441,28 @@ pub(crate) fn open(runtime: &mut Runtime) {
 /// At this instant the driver holds exactly its environment plus the one live term it is about to
 /// hand back — `Ok(value)`'s result, or a raise's `reason` and its stacktrace `head`. Those are the
 /// caller's `extra`; everything else that can name a store word is enumerated by
-/// [`Runtime::gather_off_heap_roots`], exactly as at a boundary. A caller that cannot hand its live
+/// [`Runtime::for_each_root_mut`], exactly as at a boundary. A caller that cannot hand its live
 /// term over (a [`Flow::Fatal`](crate::eval::Flow::Fatal) whose `BeamError` may carry a live reason
 /// word and exposes no mutable accessor) passes `withheld`, which declines the pass.
+///
+/// # Why both halves are handed over **mutable**
+///
+/// The pass may not only *drop* regions: the store move
+/// ([`crate::runtime::reclaim::compact`]) rewrites the words it evacuates, so every live term has to
+/// arrive as a writable slot. The environment's values and `extra` are two disjoint places, so both
+/// are lent as one [`MoveSlots`] corpus and a moved region leaves them naming the destination.
 pub(crate) fn close(
     runtime: &mut Runtime,
-    env: &Env,
-    extra: &[Eterm],
+    env: &mut Env,
+    extra: &mut [Eterm],
     withheld: Option<&'static str>,
 ) {
     let mut value_roots: Vec<Eterm> = env.values().copied().collect();
     value_roots.extend_from_slice(extra);
     let window = runtime.eval_scratch.state();
+    let mut slots: Vec<&mut Eterm> = env.values_mut().collect();
+    slots.extend(extra.iter_mut());
+    let mut slots = MoveSlots::new(slots);
     region_reclaim::pass(
         runtime,
         PassInput {
@@ -440,9 +471,10 @@ pub(crate) fn close(
             value_roots: &value_roots,
             withheld,
         },
+        &mut slots,
     );
     region_reclaim::close(runtime);
-    runtime.eval_scratch.window = None;
+    runtime.eval_scratch.stop();
 }
 
 /// Latches the open window with a **runtime-lifetime** reason ([`PinKind::Lifetime`]): a term was
@@ -477,9 +509,10 @@ pub(crate) fn pin_transient(runtime: &mut Runtime, reason: &'static str) {
 /// The boundary **before** a top-level statement: reclaims the previous statement's dead copies,
 /// then runs a **boundary-site** region-reclaim pass.
 ///
-/// `env_roots` is the evaluator's live set — every value its [`Env`] binds. Everything else that
-/// can name a store word is enumerated by [`Runtime::gather_off_heap_roots`]. See the module docs
-/// for why each refusal leaves the store exactly as it was.
+/// `env` is the evaluator's live set — every value its [`Env`] binds — handed over **mutable**,
+/// because the pass's store move rewrites the slots it evacuates. Everything else that can name a
+/// store word is enumerated by [`Runtime::for_each_root_mut`]. See the module docs for why each
+/// refusal leaves the store exactly as it was.
 ///
 /// # Why the pass runs even when the rewind was refused
 ///
@@ -490,20 +523,23 @@ pub(crate) fn pin_transient(runtime: &mut Runtime, reason: &'static str) {
 /// biggest retention is exactly the one the rewind must refuse and the pass can still act on. The
 /// pass therefore has its own decline list ([`region_reclaim::refusal`]) and is not gated on the
 /// rewind's verdict.
-pub(crate) fn boundary(runtime: &mut Runtime, env_roots: &[Eterm]) {
+pub(crate) fn boundary(runtime: &mut Runtime, env: &mut Env) {
     if !runtime.eval_scratch.enabled {
         return;
     }
-    rewind_window(runtime, env_roots);
+    let value_roots: Vec<Eterm> = env.values().copied().collect();
+    rewind_window(runtime, &value_roots);
     let window = runtime.eval_scratch.state();
+    let mut slots = MoveSlots::new(env.values_mut().collect());
     region_reclaim::pass(
         runtime,
         PassInput {
             site: Site::Boundary,
             window,
-            value_roots: env_roots,
+            value_roots: &value_roots,
             withheld: None,
         },
+        &mut slots,
     );
 }
 
@@ -656,12 +692,14 @@ impl Evaluator<'_, '_> {
     /// evaluator's caller holds terms this module cannot enumerate (see the module docs' holder
     /// table; such a nested evaluator also pins the window when it is applied,
     /// [`apply_eval_closure`](crate::eval::apply_eval_closure)).
-    pub(super) fn reset_scratch(&mut self, env: &Env) {
+    ///
+    /// `env` is forwarded **as real slots**, not as a snapshot: the boundary's pass may move the
+    /// words the environment binds (see [`boundary`]).
+    pub(super) fn reset_scratch(&mut self, env: &mut Env) {
         if !self.prune || self.depth != 0 {
             return;
         }
-        let roots: Vec<Eterm> = env.values().copied().collect();
-        boundary(self.ctx.runtime, &roots);
+        boundary(self.ctx.runtime, env);
     }
 }
 
