@@ -265,8 +265,8 @@ Consequence: `beam_gc` cannot itself be the cause of an unmap-class dangling poi
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
 
 ## Routing Table
-- `lib.rs` → crate docs, module wiring, root re-exports, `prelude` (where `BinVheap` and the two `offheap` seams are re-exported)
-- `space.rs` → `HeapSpace` + `FromSet` (base-sorted ranges, binary-search `locate`)
+- `lib.rs` → crate docs, module wiring, root re-exports, `prelude` (where `BinVheap`, the two `offheap` seams, `for_each_reachable_in`/`live_words_in` and the whole `relocate` surface are re-exported)
+- `space.rs` → `HeapSpace` + `FromSet` (base-sorted ranges, binary-search `locate`, `ranges`/`range_count`/`words`/`is_empty`) and the `unsafe` `FromSet::from_ranges` constructor for a host-owned foreign region (single `insert` path, zero-length skipped, debug-only alignment/disjointness asserts)
 - `nursery.rs` → `Nursery`: the young nursery **chain of spaces** (`grow`/`collapse`/`collapse_after_fullsweep`/`spaces`/`contains`/`add_to_from_set`/`used_words`/`capacity_words`), its indexed containment (`retired_regions`), its cached reserved-extent aggregate (`extent: ScannedBounds`, `bounds()`), its debt query (`retains_old_spaces`), the strict-progress growth rule over `HeapPolicy::next_words_above`, the `max_heap_words` chain budget and the provably-empty-space re-adoption (`empty_retired` — the `BTreeSet<(capacity, serial, base)>` index — with `empty_retired_for`/`readopt_retired`/`install`)
 - `nursery/tests.rs` → the nursery chain's in-module suite (growth contract, re-adoption, containment index, aggregate extent incl. a directly installed long chain)
 - `bounds.rs` → `ScannedBounds`: the O(1) aggregate extent over every scanned region (nursery chain + mature) and its geometry epoch — the fast-reject filter a host's unscanned-root valve calls
