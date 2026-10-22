@@ -108,7 +108,11 @@
 //!
 //! * the move switch is off ([`RegionReclaimConfig::store_move`](crate::runtime::RegionReclaimConfig));
 //! * a **runtime-lifetime pin** latched the window at either site — a `stabilize_term` store that
-//!   the family walk may not cover, or a decoded port caller tag;
+//!   the family walk may not cover, or a decoded port caller tag. This refusal is **empirically
+//!   necessary, not conservative-by-accident**: with it bypassed the post-move verification below
+//!   *hits* on `cerl_clauses` (a live store word really does stand in an old region that the
+//!   mutable corpus cannot rewrite) and the compile then fails with `system_limit`, so the pin is
+//!   the guard that keeps an incomplete corpus from costing a live term;
 //! * a machine in flight — decided by the pass's shared refusal before this module runs, because
 //!   a running machine's roots are unpublished;
 //! * a recorded raise's live reason word whose **address** falls inside a candidate range: it has
@@ -577,6 +581,18 @@ pub(super) mod tripwire {
 /// and whose words [`Runtime::for_each_off_heap_region`] visits — so the copies stay valid *and*
 /// stay visible to the off-heap payload scan. Its frontier is advanced to the words the copy really
 /// wrote, so the region's live prefix is exactly what it holds.
+///
+/// # The verification's residual, stated rather than hidden
+///
+/// Keeping both regions makes every holder's word usable again **except** one shape: an object that
+/// the corpus *did* enumerate therefore **moved**, and its old address now holds a forwarding
+/// marker. A holder the corpus missed that named such an object reads a marker word instead of the
+/// object — an indirection only a marker-protocol reader follows. And the verification's own reach is
+/// bounded the same way the descent's is: a **boxed** object whose source word was forwarded holds
+/// the `BOXED` marker in its header, which no *value* descent can read, so that shape is a miss the
+/// check structurally cannot report (a cons cell, whose two words are readable, is the shape it
+/// can). With a complete corpus neither case can arise, which is why every pin and every doubt above
+/// is a refusal rather than a warning.
 fn keep_both(runtime: &mut Runtime, mut destination: beam_alloc::Heap, copied: usize, reason: &'static str) {
     // The words were written by the relocator; `alloc_words` only advances the frontier over them,
     // which is what makes the region's written prefix (`used_words_mut`, the payload scan, and

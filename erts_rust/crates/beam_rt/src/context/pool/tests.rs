@@ -364,7 +364,10 @@ fn the_store_grows_by_region_replacement_and_earlier_terms_stay_valid() {
 /// and nothing more: a copy that fits the remaining room lands as it is, one that does not replaces
 /// the region with one **twice as wide** (`needed.max(EVAL_STORE_GROWTH_FLOOR)` only matters below
 /// 256 words, which `MIN_HEAP_WORDS` rules out) and lands at offset `0` of the fresh one — which is
-/// kept, never freed, so its words stay readable.
+/// kept for the rest of the run, so its words stay readable. A retired region is released only by
+/// the region-reclaim pass at its two non-running sites (the `-eval` statement boundary and the
+/// driver exit, `src/runtime/reclaim.rs`), and a bare `RuntimeContext::call_bif` here reaches
+/// neither.
 fn expected_store_shape(calls: usize, words: usize, region: usize) -> (usize, usize, Vec<usize>) {
     let mut frontier = 0;
     let mut capacity = region;
@@ -641,9 +644,10 @@ fn a_refused_copy_leaves_the_pooled_bif_heap_unrewound() {
 /// header plus two elements) against a [`REGION_WORDS`] region whose free-word floor is
 /// `REGION_WORDS / 16 = 128`, so the 642nd call — the first to start with fewer than 128 free
 /// words (`2048 - 1923 = 125`) — retires the region and continues on a 4096-word frontier.
-/// Nothing is relocated: the retired region goes back to the pool **as it is** — never rewound,
-/// never freed — so the words its callers still own stay valid and at their own address, and only
-/// the allocation rotation moves to the fresh, wider frontier.
+/// Nothing is relocated: the retired region goes back to the pool **as it is** — neither rewound
+/// nor freed, and outside the reach of the store move (`src/runtime/reclaim/compact.rs` evacuates
+/// only `eval_heap`/`eval_heap_retired`) — so the words its callers still own stay valid and at
+/// their own address, and only the allocation rotation moves to the fresh, wider frontier.
 #[test]
 fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
     let mut rt = small_region_runtime();
@@ -715,9 +719,10 @@ fn an_exhausted_pooled_region_is_retired_and_replaced_by_a_wider_frontier() {
 /// pins both halves of that decision over 20 rounds:
 ///
 /// * the store receives **nothing** — [`Runtime::eval_heap`]'s offset stays `0` — because a copy
-///   into a region that is never reset accumulates one result per call for the run's whole life,
-///   and a long run of such calls exhausts the term-heap arena (`error:system_limit`) for a reason
-///   that has nothing to do with the workload's live set;
+///   into a region that nothing resets accumulates one result per call until a region-reclaim site
+///   runs (`src/runtime/reclaim.rs`), and no such site runs inside a single `-eval` statement or a
+///   bare `call_bif`: a long run of such calls exhausts the term-heap arena
+///   (`error:system_limit`) for a reason that has nothing to do with the workload's live set;
 /// * the caller is handed the pool's own word ([`lies_in_the_pool`]), with the correct value, and
 ///   the frontier stays **above** the call's mark — the words the seam could have retained are
 ///   never handed out again.

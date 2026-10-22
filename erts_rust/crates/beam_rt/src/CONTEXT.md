@@ -84,7 +84,9 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` = 1 MiB for a nested one, self-tuned
   to `2 ×` an observed nested peak — and grown **geometrically** in `context/calls.rs take_bif_frontier`); `eval_heap: Heap`
   (`:271`) plus `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap`, whose growth is clamped
-  at `MAX_EVAL_HEAP_WORDS` = 256 MiB); and
+  at `MAX_EVAL_HEAP_WORDS` = 256 MiB — a retired region is **dropped whole** once the descent proves it
+  whole-dead, and a partially live one is **evacuated** into a fresh region by the store move; both at the
+  region-reclaim pass's two non-running sites, see `runtime/CONTEXT.md`); and
   `eval_off_heap: beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
   `Runtime::retention_stats() -> RetentionStats` (`runtime/retention.rs`) reads all four — arena
   demand words/calls, `bif_regions`/`bif_words`/`bif_peak_used_words`/`bif_max_capacity_words`/
@@ -295,7 +297,7 @@ whatever the `try_stabilize_escaped` call-site comments say.
 |---|---|---|---|
 | `arena: MinimalContext` (`:398`) | every tuple/list/map/float/bignum a table-less context builds (`alloc_words`, `:2377`) | the arena's own `ContextHeap` (`heap_mark`/`heap_mark_matches`/`for_each_heap_region`/`heap_rewind`) | **pinned** only as far as a word's address goes; the region above `src/runtime/reclaim.rs`'s recorded mark is rewound when nothing reachable stands in it |
 | `eval_heap: Heap` (`:454`) | `stabilize_term`/`_with` copies, BIF container results, non-byte-aligned bitstrings | itself | **relocatable in principle** — the ONE rewritable store (`eval/scratch.rs:360` `reset_to`), nothing outside it may name a word in it without being enumerated |
-| `eval_heap_retired: Vec<Heap>` (`:480`) | regions `grow_eval_heap` (`:2536`) replaced | themselves | pinned (every retired word must stay at its address) |
+| `eval_heap_retired: Vec<Heap>` (`:480`) | regions `grow_eval_heap` (`:2536`) replaced | themselves | **not pinned as a chain**: the region-reclaim pass drops a whole-dead one (freeing its carrier) and the store move evacuates a partially live one, so only regions holding a word the corpus names at one of the two non-running sites survive — a *live* word must stay at its address between those sites |
 | `eval_off_heap: OffHeapTable` (`:470`) | refc/Mso payload handles the copies depend on | off-heap payloads (not words) | pinned; also the prune's target |
 | `info_heap: Heap` (`:431`) | `system_info`/`format_term` scratch; reset per call (`:2245`, latched by `:2257`) | itself | pinned (rewound, and `relocate_off_scratch` runs first) |
 | `bif_heaps: Vec<Heap>` (`:348`) | pooled per-call BIF regions (rewound, `context/calls.rs:1052`) | themselves | pinned regions; a word a store keeps must come from a region the pool never re-issues as a rewound call region — this is why `references`/`Timers::refs` keys are minted on a **taken-and-returned** region (`native/process.rs:1231`, `native.rs:883`, `context/runtime_hooks.rs` `to_eterm(heap)`) |
@@ -317,8 +319,8 @@ whatever the `try_stabilize_escaped` call-site comments say.
 ### `Runtime::gather_off_heap_roots` (`:2996`) — the root enumeration, in order
 `eval_closures` env (`:2998`) · `seq_trace` tokens (`:3002`) · every live process's dict + mailbox `payload/token/from` + `registers` + `saved_args` + `signals` (`:3008-3024`) · `pending_spawns` args + entry fun (`:3026`) · `RunnerState` (`:3040`, whose own walk is `runner/entry.rs:490-517`) · pending timer messages (`:3046`).
 **Not enumerated by the gather, each with its stated mechanism** (the *mutable* twin, `runtime/roots.rs`, enumerates `persistent_term`, the trace match specs and `eval_compiled.captures` as well — see `runtime/CONTEXT.md`): the runtime's term *regions* (handled by `for_each_off_heap_region`, `:3066` — which visits `eval_heap`, `eval_heap_retired`, `bif_heaps`, `info_heap` and **not** the arena, although `MinimalContext::for_each_heap_region` (`beam_engine/src/context.rs:2147`) exists) · `persistent_term` (`:2957`) · trace match specs (`:2963`) · ETS objects (`:2965`) · `references` (`:2970`) · `eval_compiled.captures` (not mentioned at all).
-### The store's own two rewinds
-`eval_heap` is rewritten at exactly two places: the `-eval` statement window (`eval/scratch.rs:360 reset_to(window.mark)`, whose every handing-out site pins — `runtime.rs:2458`, `:2618`) and region *replacement* (`grow_eval_heap`, `:2536`, which retires the old region, so it never moves a word). `MAX_EVAL_HEAP_WORDS = 1 << 25` (`:170`); the ceiling is `MAX_EVAL_HEAP_WORDS.max(eval_heap.capacity())` (`:2566`), so a bigger configured store is never shrunk.
+### The store's rewinds, its drops and its one move
+`eval_heap` is rewritten at four places, all of them non-running sites: the `-eval` statement window (`eval/scratch.rs:360 reset_to(window.mark)`, whose every handing-out site pins — `runtime.rs:2458`, `:2618`), region *replacement* (`grow_eval_heap`, `:2536`, which retires the old region, so it never moves a word in place), and the region-reclaim pass's two actions — the current region's dead prefix `reset_to(cursor)` and, on the move, the fresh destination installed as the new current region while the old one is reset and retired or dropped. `MAX_EVAL_HEAP_WORDS = 1 << 25` (`:170`); the ceiling is `MAX_EVAL_HEAP_WORDS.max(eval_heap.capacity())` (`:2566`), so a bigger configured store is never shrunk.
 ### `mailbox.rs` — positions and payload handles, no raw terms except the marker's reference
 `MailboxState` (`mailbox.rs:146`): `cursor: QueueCursor` (`:148`, an index — not a term) · `markers: Vec<Marker>` (`:150`) where `Marker.term` is `make_small` (`:338`) but `Marker.reference: Option<Eterm>` (`:129`) is the **raw** `make_ref` word `recv_marker_bind` recorded (`:357`, bound at `:361`) · `retained_fragments: Vec<Fragments>` (`:163`), `retained_binaries: Vec<RefcBinary>` (`:177`), `retained_off_heap: Vec<MsoHandle>` (`:189`, in message-slot order), `retained_nodes: Vec<NodeEntry>` (`:199`) — payload handles, not words. `remove_at` (`:253`) is the only producer; there is **no release point** (`Runtime::mailboxes` is never removed from), which is the soundness mechanism for a word that escaped the message.
 
@@ -427,6 +429,15 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `runtime.rs` + `runtime/` → the `Runtime` façade, the scheduler-pass family and the GC/ETS-owner
   state (`runtime/CONTEXT.md`); its pid-keyed bookkeeping (`group_leaders`/`async_dist`/`monitor_nodes`/
   `timer_resumes`) and the `runtime/timer_wakes.rs` `TimerWakes` mirror are `crate::hasher` maps.
+- `runtime/reclaim.rs` + `runtime/reclaim/` → the **region-reclaim pass** over the runtime's two never-freed
+  term regions, **two mechanisms at two sites** (`runtime/CONTEXT.md` *The region-reclaim pass*): the
+  whole-region actions (`reclaim.rs` — drop a whole-dead `eval_heap_retired` region, reset the current
+  region's dead prefix, Tier A `arena.heap_rewind`) and the **store move** (`reclaim/compact.rs` — evacuate a
+  partially live region into one fresh region through `beam_gc`'s `Relocator`, gated by the post-move
+  verification and its `KeptBoth` obligation); the descent runs only at the `-eval` statement boundary and
+  the driver exit, its corpus is `Runtime::for_each_root_mut` + the caller's `MoveSlots`, and the residual is
+  **Phase 2**: a nested in-process `compile:file/2`'s in-flight machine roots and the evaluator's Rust-frame
+  terms have no `&mut` reachability at any in-run point, so the single-compile peak is unchanged.
 - `runner/` → the `beam_process::ProcessRunner` (`runner/CONTEXT.md`, whose measurement record is
   `runner/MEASURED.md`); `RunnerState`'s four pid-keyed
   maps (`engines`/`results`/`exits`/`errors`) are `crate::hasher::FastHashMap`.

@@ -67,8 +67,11 @@
 //!   verification, the thresholds and the decline list are [`compact`]'s own documentation.
 //!
 //! When the move fires, the whole-region action is skipped: there is no candidate left to classify.
-//! When it is skipped or declines, the whole-region action runs exactly as it always did, so the
-//! cheap case never depends on the expensive one.
+//! When it is skipped, or it declines **before the first word moves**, the whole-region action runs
+//! exactly as it always did, so the cheap case never depends on the expensive one. A refusal *after*
+//! a word moved ([`compact::MoveOutcome::KeptBoth`]) suppresses it instead: the descent that just
+//! failed is known to be incomplete for those very ranges, so classifying them on it would free a
+//! region whose live word the verification had just found.
 //!
 //! # This is where a `-eval` compile's 4.63 GB goes
 //!
