@@ -1475,11 +1475,20 @@ impl NifHost for NifHostImpl<'_> {
     /// In the C the destination env's heap is a *different* heap from the source's, so the term
     /// must be `size_object`d and `copy_struct`ed onto it (`erl_nif.c:1194-1197`, `:843-858`). Here
     /// [`NifHost::alloc_env`] builds every message env over **this same host** — one heap, one atom
-    /// table — so a term materialized on the message env already lives on the very heap
-    /// `enif_make_copy` would copy it to, and the copy is *exactly* the identity. The host's heap is
-    /// the runtime's **pointer-stable** pooled BIF heap (never reset, no GC in Milestone 1), so
-    /// reusing the source term is observationally identical to the C's copy and never hands a NIF a
-    /// wrong term (the atoms are the same indices either way).
+    /// table — so the message env and the call's pooled BIF region are the *same* heap: a term
+    /// materialized on the message env already lives where `enif_make_copy` would copy it, and the
+    /// copy is *exactly* the identity. Reusing the source term is therefore observationally
+    /// identical to the C's copy and never hands a NIF a wrong term (the atoms are the same indices
+    /// either way).
+    ///
+    /// What makes reusing the word sound is **when** that region is reclaimed, never that it is
+    /// never reclaimed: a registered BIF's container result is copied onto a region that outlives
+    /// the call and the pooled region is then rewound
+    /// ([`RuntimeContext::call_registered`](crate::context::RuntimeContext)), strictly **after** the
+    /// call returns — nothing rewinds it inside the call. A term that must outlive the call
+    /// therefore cannot stay here: it leaves through the C's own idiom (`enif_send` carries a
+    /// complete ETF image) or through the runtime's escape boundary
+    /// ([`Runtime::stabilize_term`](crate::Runtime::stabilize_term)).
     ///
     /// The trait default would answer `None`, and `enif_make_copy` would then return the ABI's
     /// `THE_NON_VALUE` — a bare header word that is **not** a term, which a NIF returning it hands

@@ -90,11 +90,14 @@
 //!
 //! # Ownership of the stored match specs
 //!
-//! A [`MatchSpec::Functions`] retains the raw [`Eterm`] words of the `[match_spec()]`
-//! argument. That is the same M1 contract the persistent-term store documents: the runtime
-//! never resets the heap a BIF argument lives on and there is no collector, so the words stay
-//! valid for the runtime's life — and when Stage 4's collector lands, this table is a root it
-//! must trace exactly like [`crate::context`]'s persistent-term store.
+//! A [`MatchSpec::Functions`] retains raw [`Eterm`] words, and the words it retains are
+//! **copies**: the installing call stabilizes every function onto the runtime's lifetime
+//! store ([`Runtime::try_stabilize_escaped`](crate::Runtime)) before the
+//! table takes them, because the argument's own heap does not outlive the call — the pooled BIF
+//! region is rewound when the call returns and a scheduled process's young heap is relocated by
+//! its collector. The table is outside every scanned heap, so a statement read back later in the
+//! same run also stays valid; a function the copier genuinely cannot copy is the honest
+//! `error:system_limit`, never a stored dangling word.
 //!
 //! Legacy C ground truth (read-only): `../../erts/emulator/beam/erl_bif_trace.c` (`trace_3`,
 //! `trace_info_2`, `trace_delivered_1`, `trace_pattern_3`) and

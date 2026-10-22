@@ -894,8 +894,8 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena. The
-    /// valve is **not** tripped in that case.
+    /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the runtime-lifetime
+    /// store. The valve is **not** tripped in that case.
     pub(crate) fn try_stabilize_escaped(&mut self, term: Eterm) -> Result<Eterm> {
         self.try_stabilize_escaped_with(term, &SourcePayloads::default())
     }
@@ -916,7 +916,7 @@ impl Runtime {
     /// # Errors
     ///
     /// As [`Runtime::try_stabilize_escaped`]: [`BeamError::SystemLimit`] when the term genuinely
-    /// cannot be copied onto the arena (the valve is **not** tripped then).
+    /// cannot be copied onto the runtime-lifetime store (the valve is **not** tripped then).
     pub(crate) fn try_stabilize_escaped_with(
         &mut self,
         term: Eterm,

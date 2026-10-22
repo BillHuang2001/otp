@@ -1343,8 +1343,8 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 if let Some(outcome) = self.take_max_heap_kill(pid) {
                     return Ok(outcome);
                 }
-                // `x(0)`, not an exit reason: copy it onto the runtime's pointer-stable
-                // arena (so it outlives the process, whose own heap dies with it) and
+                // `x(0)`, not an exit reason: copy it onto the runtime's `-eval` store
+                // (so it outlives the process, whose own heap dies with it) and
                 // record it, then terminate the process normally.
                 //
                 // The machine is still in scope and holds the off-heap payload handles for

@@ -2590,9 +2590,12 @@ impl Evaluator<'_, '_> {
     /// (`{badmap, M}`, `{badkey, K}`, `{case_clause, V}`, …) in the raise's
     /// [`live_reason`](beam_common::Raise::live_reason) slot — is a genuine
     /// Erlang exception and is converted to a **catchable** [`Flow::Raise`]
-    /// carrying that exact term. Its term was built on a pooled BIF heap that
-    /// Milestone 1 never resets and never moves, so it stays valid for the
-    /// runtime's lifetime; no copy is needed. Only an error that carries *no*
+    /// carrying that exact term. The term is read while the heap that built it is still alive —
+    /// the raise's own call never rewinds its pooled BIF region, and the evaluator consumes it
+    /// inside the same statement — so no copy is needed *here*; the error that leaves the driver
+    /// is copied onto the runtime-lifetime store at the escape boundary
+    /// ([`Runtime::stabilize_error_live_reason`](crate::Runtime)).
+    /// Only an error that carries *no*
     /// term at all is [`Flow::Fatal`] rather than silently reshaped.
     fn flow_from_error(&mut self, err: BeamError) -> Flow {
         if error::halt_status(&err).is_some() {

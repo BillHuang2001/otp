@@ -53,14 +53,16 @@
 //! A process that runs to its `return` exits with the reason `normal` — **not** with the
 //! value it produced (that is the BEAM contract: `x(0)` is the *return value* of the
 //! function, not the process's exit reason). The value would otherwise be lost, so the
-//! runner copies it onto the runtime's pointer-stable arena
-//! ([`Runtime::stabilize_term`](crate::Runtime::stabilize_term)) and records it per pid in
+//! runner copies it onto the runtime's `-eval` store
+//! ([`Runtime::stabilize_term`](crate::Runtime::stabilize_term) — `Runtime::eval_heap` plus
+//! its off-heap payload table) and records it per pid in
 //! [`RunnerState::result`], where
 //! [`Runtime::process_result`](crate::runtime::Runtime::process_result) exposes it after
 //! the pass. The copy matters: a value taken out of the mailbox (a port's stream, say)
-//! points into the *process's own* heap, which is dropped the moment it terminates. The
-//! arena never moves its terms and Milestone 1 never resets it, so the recorded value
-//! stays valid for the runtime's lifetime.
+//! points into the *process's own* heap, which is dropped the moment it terminates. That
+//! store never moves its terms and is never reset as a whole — it grows by replacing a
+//! region, and its one rewind (the `-eval` statement window) is pinned by every site that
+//! hands a word out — so the recorded value stays valid for the runtime's lifetime.
 //!
 //! A process that fails records the raise's reason term in [`RunnerState::exit`]
 //! ([`Runtime::process_exit`](crate::runtime::Runtime::process_exit)) and exits with that

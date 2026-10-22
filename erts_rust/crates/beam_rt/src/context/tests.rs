@@ -1160,8 +1160,10 @@ fn a_bif_send_forwards_a_mailbox_retained_off_heap_payload_by_sharing_it() {
 }
 
 /// The on-heap reference thing for `reference`, built on a pooled BIF heap — the production
-/// route (`src/native/process.rs::reference_term`), so the term stays valid after the heap goes
-/// back to the pool (a `beam_alloc::Heap` never resets).
+/// route (`src/native/process.rs::reference_term`). The words survive the heap going back to the
+/// pool because neither the return nor a later call's `mark` reaches below them: `put_bif_heap`
+/// does not reset, and a rewind only frees `[mark..used)` where `mark` was read when the region
+/// was taken — so only a region retirement (`take_bif_frontier`) ends their life.
 fn alias_reference_term(rt: &mut Runtime, reference: MonitorRef) -> Eterm {
     let mut heap = rt.take_bif_heap().expect("a pooled BIF heap");
     let term = reference.to_eterm(&mut heap).expect("the ref thing");
@@ -2818,7 +2820,9 @@ fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
     // never an error, never a fabricated identity. With no calling module (the `-eval`
     // context) there is nothing to derive from at all.
     let mut hook = FunIdentityBridge::new(rt.code_server(), None, node);
-    // `image` is a binary on the pooled, pointer-stable BIF heap, so it outlives `ctx`.
+    // `image` is a binary on the runtime's `-eval` store — the copy-out destination on a
+    // table-less route, where the pooled BIF heap it was built on is rewound — so it outlives
+    // `ctx`.
     for term in [make_small(7), NIL, image] {
         assert_eq!(
             hook.local_fun_identity(term).expect("a miss is never an error"),

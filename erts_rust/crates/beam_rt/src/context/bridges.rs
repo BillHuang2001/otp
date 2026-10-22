@@ -216,17 +216,18 @@ impl<'a> FunBridge<'a> {
 /// A pid the table does not hold is the typed capability gap [`crate::error::no_mailbox`],
 /// never a panic — the same convention as the receive seam.
 ///
-/// # Heap lifetime (the process-dictionary M1 decision)
+/// # Heap lifetime
 ///
-/// The keys and values stored here are the argument [`Eterm`]s themselves. `beam_bifs`
-/// builds **nothing** on its pooled BIF heap for a store, and Milestone-1's
-/// [`beam_alloc::Heap`] pool and engine arena are pointer-stable and never reset (there is
-/// no GC — see the module docs), so a stored term cannot dangle. The stronger
-/// [`beam_process::Dict`] contract — every key/value *copied into the process's young heap*
-/// — is **not** reachable from `beam_rt`: `Process::copy_into_heap` is `pub(crate)` to
-/// `beam_process` (out of this crate's scope). Registering the term on the runtime's
-/// pointer-stable arena is therefore the Milestone-1 decision; a future pass that wires the
-/// collector up must make [`Dict`](beam_process::Dict) a genuine GC sub-rootset here.
+/// The keys and values stored here are the argument [`Eterm`]s themselves, and nothing is
+/// copied: `beam_bifs` builds **nothing** on its pooled BIF heap for a store, and the words
+/// stay reachable from two sides. A word on the process's own heap is a **GC root** — the
+/// process dictionary is one of the root families `Process::collect` gathers and writes back
+/// (`Dict::gather_roots`/`scatter_roots`), beside the registers, mailbox, saved arguments and
+/// pending signals — and a word on a runtime-lifetime region (the arena, or the pooled BIF
+/// region of a call whose escaping `dict` arm cleared the rewind —
+/// [`crate::context::calls`]'s `safe_to_rewind`) is never relocated nor recycled under it.
+/// Registering the term on the runtime's pointer-stable arena remains the alternative for a
+/// value that must survive a heap move; it is not needed for a `put/2` argument.
 pub(super) struct DictBridge<'a> {
     /// The table the running process lives in.
     pub(super) table: &'a mut ProcessTable,

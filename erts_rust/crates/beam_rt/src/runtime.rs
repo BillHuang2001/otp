@@ -34,7 +34,8 @@
 //! * the process [`Heap`] (owned, so a term returned by `run_*` stays valid), a
 //!   separate scratch `info_heap` for `system_info`/`format_term`, and the
 //!   pointer-stable [`MinimalContext`] arena that serves the engine's
-//!   `alloc_words`/`ensure_heap` seam (Milestone-1 has no GC).
+//!   `alloc_words`/`ensure_heap` seam wherever there is no process heap: it is only
+//!   ever grown, never reset, and no collector scans it.
 //!
 //! The **scheduler pass** — the `run_*`/pump entry points, their shared pass body and the
 //! port/timer/distribution halves — lives in the [`scheduler`] submodule, so this file stays the
@@ -177,9 +178,10 @@ const MIN_HEAP_WORDS: usize = 1_024;
 /// It is [`RuntimeConfig::heap_words`] (default [`DEFAULT_HEAP_WORDS`]), floored at
 /// [`MIN_HEAP_WORDS`] so the smallest program still has room, and **capped by `+hmax`**
 /// when that switch is given: `+hmax N` is the emulator's maximum heap size, so a workload
-/// needing more than `N` words must hit the limit. Milestone 1 has no collector to grow
-/// the heap with (see [`crate::runtime`] and the crate `CONTEXT.md`), so the cap is
-/// enforced by *sizing* the heap; the allocation that would exceed it fails and
+/// needing more than `N` words must hit the limit. These are the runtime's own
+/// term-construction heaps, outside any process and so outside the collector — nothing collects
+/// them, they are grown by replacing a region — so the cap is enforced by *sizing* the heap,
+/// and the allocation that would exceed it fails and
 /// [`crate::error::enforce_term_heap_limit`] turns that into the documented
 /// `error:system_limit` raise. A `+hmax` below [`MIN_HEAP_WORDS`] is floored, exactly as
 /// `heap_words` is.
@@ -336,9 +338,13 @@ pub struct Runtime {
     preloaded: PreloadedModules,
     /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
     /// puts it back (see [`Runtime::take_bif_heap`]). A `beam_alloc::Heap` never moves its
-    /// terms and is never reset in Milestone-1 (there is no GC), so a heap must outlive
-    /// every term built on it — reusing one heap for sequential calls keeps that free,
-    /// while a nested call (inside a fun a BIF applied) gets its own heap.
+    /// terms, so a region must stay alive for every term built on it — reusing one region for
+    /// sequential calls is what makes that free, and the **rewind** is what licenses it: the
+    /// call's container result is copied onto a region that outlives it and the pool is then
+    /// rewound to the offset the call read before it started
+    /// ([`RuntimeContext::call_registered`](crate::context::RuntimeContext)), never inside the
+    /// call. A nested call (inside a fun a BIF applied) gets its own region, so the outer call's
+    /// words — which sit **below** the nested call's mark — stay untouched.
     pub(crate) bif_heaps: Vec<Heap>,
     /// The size in term words of a freshly created **outermost** BIF heap — the region a call gets
     /// when no other call's region is out on loan.
@@ -437,9 +443,14 @@ pub struct Runtime {
     /// [`beam_alloc::Heap`] rather than the engine arena — today a non-byte-aligned
     /// bitstring, which [`beam_codec::term::make_bitstring`] materializes.
     ///
-    /// Like [`Runtime::bif_heaps`] it never moves its terms and Milestone-1 never
-    /// resets it (there is no GC), so a term built on it stays valid for the runtime's
-    /// lifetime.
+    /// It never moves its terms and is never reset as a whole — it grows by **replacing** its
+    /// region ([`Runtime::grow_eval_heap`] retires the old one) — unlike the pooled
+    /// [`Runtime::bif_heaps`], which a call rewinds once its container result has been copied
+    /// here. The one rewind it does have is the `-eval` **statement window**
+    /// ([`crate::eval::scratch`]), which reclaims a dead prefix at a statement boundary against a
+    /// published complete root set and is **pinned** by every site that hands a word out of the
+    /// store, so a term that went through [`Runtime::stabilize_term`] stays valid for the
+    /// runtime's lifetime.
     pub(crate) eval_heap: Heap,
     /// The **destination** off-heap table for every copy onto [`Runtime::eval_heap`].
     ///
@@ -452,9 +463,10 @@ pub struct Runtime {
     /// payload references the copied term depends on, so it must outlive both the copied term
     /// and [`Runtime::eval_heap`] — which is exactly why it is a `Runtime` field rather than a
     /// throwaway local (a dropped destination table would free the payloads a stabilized term
-    /// still points at). It is only ever grown, never reset: like `eval_heap` it is a
-    /// runtime-lifetime store (Milestone 1 has no GC), so it can never free a payload a
-    /// stabilized term still needs.
+    /// still points at). It is only ever grown and never cleared: like `eval_heap` it is a
+    /// runtime-lifetime store outside every process's scanned heap, so the only thing that
+    /// releases a handle from it is the reachability prune ([`crate::eval::reclaim`]), and never
+    /// one a stabilized term still names.
     pub(crate) eval_off_heap: beam_message::OffHeapTable,
     /// The **retired** generations of [`Runtime::eval_heap`], kept alive by
     /// [`Runtime::grow_eval_heap`].
@@ -601,9 +613,11 @@ pub struct Runtime {
     /// [`RuntimeContext::call_registered`](crate::context::RuntimeContext::call_registered)
     /// can coexist with every other bridge. A **nested** borrow (a persistent-term
     /// operation re-entered from inside one) is reported as a typed capability gap rather
-    /// than panicking. The store keeps raw `Eterm` words, which is safe because Milestone-1
-    /// has no GC and every heap is pointer-stable (see
-    /// [`PersistentTermStore`](crate::context::PersistentTermStore)).
+    /// than panicking. The store keeps raw `Eterm` words, which is safe because the writer
+    /// stabilizes: `put/2`/`put_new/2` run both arguments through
+    /// [`Runtime::try_stabilize_escaped`] onto the runtime-lifetime store before they are
+    /// recorded, so no recorded word sits on a heap a collection relocates or a call recycles
+    /// (see [`PersistentTermStore`](crate::context::PersistentTermStore)).
     pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
@@ -2276,18 +2290,20 @@ impl Runtime {
     ///
     /// # Copy out, then rewind
     ///
-    /// A `beam_alloc::Heap` never moves its terms, and the pool is **not** rewound between the
-    /// calls of a plain `-eval`/nested run — so a term built here really is valid for the
-    /// runtime's lifetime, which is what those paths rely on. A **scheduled** process's call is
-    /// different: [`RuntimeContext::call_registered`](crate::context::RuntimeContext) **moves**
-    /// the BIF's result onto the running process's own (scanned) young heap and then rewinds
-    /// the pooled heap — [`Heap::reset_to`](beam_alloc::Heap::reset_to) at the offset it read
-    /// before the call — so a BIF-churn loop's peak memory is bounded by its live set instead of
-    /// growing with the loop count. The rewind is *not* applied when a heap word can outlive the
-    /// call — one of the six escaping `DispatchHooks` arms (process dictionary, process/port
-    /// registry, NIF private data, message send, `persistent_term`, timer heap / link set), a
-    /// **reentrant** fun-applying call, an **error** result (whose live reason term may point
-    /// into this heap), or **no scheduled process**. Because the pool is shared with the native
+    /// A `beam_alloc::Heap` never moves its terms, so nothing built here relocates — but the
+    /// region is **recycled**. [`RuntimeContext::call_registered`](crate::context::RuntimeContext)
+    /// copies a registered BIF's container result onto a region that outlives the call (the running
+    /// process's own scanned young heap, or the runtime's `-eval` store when no process is running)
+    /// and then rewinds the pooled heap —
+    /// [`Heap::reset_to`](beam_alloc::Heap::reset_to) at the offset it read before the call — so a
+    /// BIF-churn loop's peak memory is bounded by its live set instead of growing with the loop
+    /// count. A term built here is therefore valid for the duration of the call and no longer: the
+    /// rewind runs **after** the call, never inside it. It is *not* applied when a word could
+    /// already have escaped — one of the six escaping `DispatchHooks` arms (process dictionary,
+    /// process/port registry, NIF private data, message send, `persistent_term`, timer heap / link
+    /// set), a **reentrant** fun-applying call, an **error** result (whose live reason term may
+    /// point into this heap) or a copy that did not complete — and a **NIF** result is not copied
+    /// out at all, so a NIF's call never rewinds either. Because the pool is shared with the native
     /// floor (`mint_reference`/`reference_term`), trace and the ETS-owner sweep, which put a
     /// heap back *without* rewinding it, the rewind targets the call's own start offset and
     /// leaves the words below it — see that method for the exact rule.
@@ -2392,8 +2408,8 @@ impl Runtime {
         Some(arena_census::report())
     }
 
-    /// Copies a scheduled process's return value onto the runtime's long-lived,
-    /// never-reset `-eval` arena and returns the copy.
+    /// Copies a scheduled process's return value onto the runtime's long-lived `-eval` store
+    /// and returns the copy.
     ///
     /// A process's code runs on a heap that dies with it, and a value taken out of the
     /// mailbox lives in exactly that heap — so an `x(0)` that is a container or a binary
@@ -2403,13 +2419,16 @@ impl Runtime {
     /// valid for the runtime's lifetime — the property the scheduler tests rely on (see
     /// `tests/port_wake.rs`, where the receiver returns the port's stream binary).
     ///
-    /// The destination is the same pointer-stable arena the `-eval` evaluator's
-    /// non-byte-aligned bitstrings use ([`Runtime::eval_heap`]); nothing resets it in
-    /// Milestone 1. An immediate is returned unchanged (the copier shares immediates).
+    /// The destination is the same runtime-lifetime store the `-eval` evaluator's
+    /// non-byte-aligned bitstrings use ([`Runtime::eval_heap`]). It never moves its terms and is
+    /// never reset as a whole — it grows by replacing its region — and its one rewind (the
+    /// `-eval` statement window, [`crate::eval::scratch`]) is pinned by every site that hands a
+    /// word out of the store, here included. An immediate is returned unchanged (the copier
+    /// shares immediates).
     ///
     /// # Errors
     ///
-    /// The arena's allocation failure when the value does not fit, translated to the
+    /// The store's allocation failure when the value does not fit, translated to the
     /// emulator's documented `error:system_limit` — an honest error, never a dangling term
     /// (see [`crate::error::enforce_term_heap_limit`]).
     ///
@@ -3026,10 +3045,10 @@ impl Runtime {
         // root or a resource named only by a pending timer is released while it is still live.
         self.timers.gather_off_heap_roots(out);
     }
-    /// Hands `visit` the **word image** of every term region this runtime owns: the never-reset
-    /// `-eval`/single-pass store ([`Runtime::eval_heap`]), its retired generations, the pooled BIF
-    /// heaps and the `system_info` scratch heap. Only the written prefix (`[0, used)`) is handed
-    /// over — the words past `hp` are uninitialised.
+    /// Hands `visit` the **word image** of every term region this runtime owns: the
+    /// runtime-lifetime `-eval`/single-pass store ([`Runtime::eval_heap`]), its retired
+    /// generations, the pooled BIF heaps and the `system_info` scratch heap. Only the written
+    /// prefix (`[0, used)`) is handed over — the words past `hp` are uninitialised.
     ///
     /// This is the region half of the escaped-payload prune (`crate::eval::reclaim`), and its
     /// contract is narrow on purpose: **`visit` must not dereference a word.** A region holds the
@@ -3928,9 +3947,12 @@ impl Runtime {
     ///
     /// The module is resolved through the code path exactly as an external call is (`-pa`/
     /// `-pz` directories first, then the system library `ebin`s), so it is loaded on
-    /// demand and cached in the one shared atom table. `args` must already be valid terms:
-    /// the runtime never moves them (Milestone 1 has no GC), and they are seeded into the
-    /// process's `x(0..arity)` when it first runs.
+    /// demand and cached in the one shared atom table. `args` must be valid terms on a heap that
+    /// outlives the child, because this entry point records the words as they arrive and copies
+    /// nothing: a term left on a region a collector relocates or a later call recycles would
+    /// dangle. The in-slice `erlang:spawn*` route does copy
+    /// ([`Runtime::note_pending_spawn`]), and they are seeded into the process's `x(0..arity)`
+    /// when it first runs.
     ///
     /// The process does **not** run until [`Runtime::run_slices`]/
     /// [`Runtime::run_scheduler`] is called. Its `x(0)` is recorded and readable through
@@ -4185,8 +4207,11 @@ impl Runtime {
     /// scheduler's run queue — so it runs on the next scheduler pass, including a pass
     /// driven from inside `-eval` ([`Runtime::pump_scheduler`]).
     ///
-    /// `fun` must be a fun term built on a heap that outlives the process (the runtime's
-    /// arena or a pooled BIF heap — both are pointer-stable and never reset in Milestone 1).
+    /// `fun` must be a fun term on a heap that outlives the process: the record publishes the word
+    /// and a later pass reads it, and this entry point copies nothing. The one caller is the
+    /// native-floor `erlang:spawn/1,2,3`, which runs outside a slice on a table-less context, so
+    /// `fun` stands on the runtime's never-reset arena. A spawn made from **inside** a scheduler
+    /// slice takes the stabilized [`Runtime::note_pending_spawn`] route instead.
     ///
     /// # Errors
     ///

@@ -73,9 +73,11 @@ pub(crate) enum ProcessEntry {
     /// closure back into the evaluator (`crate::eval::apply_eval_closure`) instead of
     /// re-implementing the evaluator here.
     Fun {
-        /// The fun term to apply, built on a heap that outlives the process (the
-        /// runtime's arena or a pooled BIF heap — both are pointer-stable and never
-        /// reset in Milestone 1).
+        /// The fun term to apply, on a heap that outlives the process: the record stores the
+        /// word and a later slice reads it, so the only sound sources are a region no collector
+        /// relocates and nothing rewinds (the runtime's arena / `-eval` store), or the
+        /// stabilized copy [`Runtime::note_pending_spawn`] makes. A pooled BIF region is **not**
+        /// one of them — it is rewound once its call returns.
         fun: Eterm,
         /// The resolved launch target of a **local** fun, or `None`.
         ///

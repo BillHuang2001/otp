@@ -493,8 +493,9 @@ impl<'a> RuntimeContext<'a> {
     /// a term a *scheduled* process supplied would live on that process's own young heap —
     /// the heap the collector relocates at the engine's heap-admission point
     /// ([`crate::context::gc`]) — and a raw word kept past a collection would dangle. The
-    /// arguments of exactly these two keys are therefore copied onto the pointer-stable arena
-    /// before the call (the escape-store treatment, [`Runtime::try_stabilize_escaped`]).
+    /// arguments of exactly these two keys are therefore copied onto the runtime-lifetime `-eval`
+    /// store before the call (the escape-store treatment,
+    /// [`Runtime::try_stabilize_escaped`]).
     ///
     /// The other five keys (`get/0,1,2`, `erase/1`, `info/0`) read: every word they can hand
     /// back was stabilized when it was stored, and the key they receive is only *compared*
