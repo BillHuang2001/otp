@@ -19,16 +19,22 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
   `goto`, `fail_or_raise` (`:238`), `fail_or_function_clause` (`:260`),
   `raise_error_tuple` (`:280`).
 - `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:82`).
-- `write.rs` — `put_map_assoc` (`:68`), `put_map_exact` (`:119`); both reserve the whole map
+- `write.rs` — `put_map_assoc` (`:82`), `put_map_exact` (`:132`); both reserve the whole map
   block with one rooted allocation (`make_map_rooted` + `merge_slack_words`) and re-read every
   operand from the post-reserve machine state, so a moving collector may run in the reserve.
-- `tests.rs` — the unit suite (both layouts incl. the 32/33-key boundary, all failure paths).
+  The reservation's capacity is `key_count(...)` + the new pair count, where `key_count` is the
+  O(1) head-node size word (`beam_term::map::map_size`, the C's `flatmap_get_size`,
+  `beam_common.c:2002,2017`): the source's pair list is materialized **once** per instruction
+  (`put_map_assoc` by the merge, `put_map_exact` by the `{badkey,Key}` validation plus the merge),
+  never a second time for the length.
+- `tests.rs` — the unit suite (both layouts incl. the 32/33-key boundary, all failure paths, the
+  size-word/walk-count equivalence and the large-map reference-builder equivalence).
 
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
-| `read.rs:65,93` / `write.rs:84,135` | non-map `source` | jump | raise `{badmap,Source}` |
-| `write.rs:141` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
+| `read.rs:65,93` / `write.rs:102,155` | non-map `source` | jump | raise `{badmap,Source}` |
+| `write.rs:164` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
 | `read.rs:73,99` | key absent | jump | raise the **bare atom** `function_clause` |
 
 `fail_or_raise` (`mod.rs:238`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
@@ -85,10 +91,10 @@ instead of a substituted atom.
 Verified against the system `erlc` (OTP 29) disassembly:
 - `put_map_exact` **missing key** is emitted with `{f,0}` = `NO_FAIL` (and a preceding
   `test,is_map` guard). It is **reachable**: `up(#{}) -> M#{a := 1, b := 2}` on `#{}` ⇒ the
-  oracle raises `error:{badkey,b}`. This is the `badkey` path (`write.rs:141`).
+  oracle raises `error:{badkey,b}`. This is the `badkey` path (`write.rs:164`).
 - A **non-map** source with `NO_FAIL` is **not** reachable: the compiler always emits
   `test,is_map Fail` first, and its `Fail` path builds `{badmap,X}` and calls
-  `erlang:error/1` itself — the `badmap` arms (`read.rs:65,93`, `write.rs:84,135`) are reached
+  `erlang:error/1` itself — the `badmap` arms (`read.rs:65,93`, `write.rs:102,155`) are reached
   only from hand-built IR.
 - `get_map_elements`/`has_map_fields` are always emitted with the clause/case fail label (the
   matching forms), so their key-absent `NO_FAIL` branch (the engine-defined bare
@@ -146,8 +152,9 @@ Verified against the system `erlc` (OTP 29) disassembly:
   (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name all three, so the raise is the oracle's
   `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare `function_clause`) exactly.
 - `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
-  (`write.rs:105`); correct but unoptimised.
-- `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
+  (`write.rs:120`); correct but unoptimised. The source **walk** count is one per instruction
+  (`tests/map_assoc_alloc.rs` pins it with a counting allocator).
+- `write.rs:188` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
 ## Notes for Agents
