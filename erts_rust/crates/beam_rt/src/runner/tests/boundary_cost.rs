@@ -89,17 +89,24 @@
 //! for the band asserted below.
 //! That puts the minor target at `young_minor_target_words(201) = next_words(201 + 64) =
 //! next_words(265) = 376` words and the keep-band at `[376, 8 x 376 = 3 008]`; the sampled
-//! **2 585-word** capacity (`HeapSpace::capacity_words` of the growth table's 2 586-word entry)
-//! sits inside it, which is exactly why the capacity is a **fixed point** of the rule and does
-//! not move with N (2 585 / 2 585 / 2 585): the plateau is a steady state of
-//! `young_after_collection`'s *keeping* branch — the growth seam
-//! (`RuntimeContext::copy_out_hint` + `hint_grow_gate`) steps the capacity one growth-table entry
-//! at a time, and 2 586 is the last entry below the band's upper edge of 3 008, so the seam has
-//! nothing left to step to and the capacity stops there. (One entry higher, 4 185 > 3 008, the
-//! collection rule would install the 376-word target instead.)
+//! **2 585-word** capacity sits inside it, which is exactly why the capacity is a **fixed point**
+//! of the rule and does not move with N (2 585 / 2 585 / 2 585): the plateau is a steady state of
+//! `young_after_collection`'s *keeping* branch.
+//! 2 585 is **not** a growth-table entry (`…376, 610, 987, 1 598, 2 586, 4 185, 6 772…`) and no
+//! word is deducted from one — `beam_alloc::Heap::capacity` returns the constructed capacity
+//! verbatim and `HeapSpace::capacity_words` only forwards it.
+//! It is a **chain sum materialised into one space**: the growth seam
+//! (`RuntimeContext::copy_out_hint` + `hint_grow_gate`) retires the current space and installs a
+//! larger one over it, so the capacity a collection is handed is the chain's own sum
+//! (`Nursery::capacity_words`, summed over every space), the keeping branch returns that sum
+//! unchanged, and `install_collapsed` installs it as a single space — **2 585 = 987 + 1 598**
+//! (the settled *single* space therefore need not be a table entry at all; only the spaces the
+//! growth seam installs are).
+//! What the band bounds is that sum: a chain summing past the upper edge (1 597 + 2 586 = 4 183 >
+//! 3 008) makes the rule install the 376-word target instead of keeping the chain.
 //! The sampled young **occupancy** peak (1 551 words) is the watermark moment the door fires on:
-//! the watermark is `7/8` of the capacity that space had at that boundary, and the growth seam
-//! reaches 2 585 through the 1 597-word entry below it — `1 597 x 7/8 = 1 397.4 < 1 551`, so a
+//! the watermark is `7/8` of the capacity that space had at that boundary, and the chain sum one
+//! materialisation below the settled 2 585 is 1 597 — `1 597 x 7/8 = 1 397.4 < 1 551`, so a
 //! boundary sampled at that capacity crosses, while `2 585 x 7/8 = 2 261.9` is the headroom the
 //! settled space leaves the growth seam (which is what keeps the door from firing on every
 //! boundary, next bullet).
@@ -286,9 +293,16 @@ const MEASURED: [(i64, u64, u64); 3] = [
 /// the capacity's own band from [`beam_gc::HeapPolicy`] for each row's reported live figure
 /// (`nursery_floor_words() <= capacity <= YOUNG_SHRINK_FACTOR x young_minor_target_words(live)`),
 /// which is what makes 2 585 a *fixed point* of `young_after_collection` rather than a number
-/// this file happens to have read once. It is the growth table's 2 586-word entry less the one
-/// word `HeapSpace::capacity_words` accounts for: 2 586 is the last entry below the band's upper
-/// edge (8 x 376 = 3 008), so the copy-out's growth seam has nothing left to step to.
+/// this file happens to have read once.
+/// 2 585 is not a growth-table entry (`…376, 610, 987, 1 598, 2 586, 4 185, 6 772…`) and no word
+/// is deducted from one: `beam_alloc::Heap::capacity` returns the constructed capacity verbatim
+/// and `HeapSpace::capacity_words` only forwards it.
+/// It is the capacity the nursery **chain** held, materialised into one space —
+/// `Nursery::collapse` sizes `young_after_collection` from `Nursery::capacity_words` (summed over
+/// every space), the keeping branch returns that sum unchanged, and `install_collapsed` installs
+/// it as a single space: **2 585 = 987 + 1 598**.
+/// Only the spaces the copy-out's growth seam installs are table entries, and a chain summing past
+/// the band's upper edge (8 x 376 = 3 008) makes the rule install the 376-word target instead.
 const MEASURED_YOUNG_CAPACITY: usize = 2_585;
 
 /// **The boundary door is a per-pre-emption, watermarked site on the `gc_bound` churn shape —
