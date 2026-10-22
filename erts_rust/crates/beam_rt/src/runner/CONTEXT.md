@@ -494,7 +494,10 @@ its loose-term latches changed while parked.
   **un-consumed** arguments (plus a `ProcessEntry::Fun` entry's fun term, which stays live for a fun
   entry with no local target because that entry re-applies them on every run) and an **un-published**
   parked machine's own root set for a pid still in the process table, and which is **empty during a
-  pass** (`RunnerState` is `mem::take`n out of the runtime for the pass's duration), + `RunnerState`
+  pass** (`RunnerState` is `mem::take`n out of the runtime for the pass's duration) + its three
+  **mutable** siblings (`for_each_engine_args_root_mut`, `for_each_parked_machine_root_mut`,
+  `for_each_recorded_root_mut` — family-for-family, handing `&mut [Eterm]` slices to a rewriting
+  visitor; the last covers `results`/`exits`, which the value gather skips) + `RunnerState`
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
