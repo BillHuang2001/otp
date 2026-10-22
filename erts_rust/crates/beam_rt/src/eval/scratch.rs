@@ -120,8 +120,8 @@ use beam_term::Eterm;
 
 use super::reclaim::{self, Reach, Walk};
 use super::{Env, Evaluator};
+use crate::runtime::reclaim::{self as region_reclaim, PassInput, Site};
 use crate::runtime::Runtime;
-
 /// The term store's region figures and the statement window's counters, as
 /// [`Runtime::eval_region_stats`] publishes them.
 ///
@@ -150,8 +150,13 @@ pub struct EvalRegionStats {
     pub last_decline: Option<&'static str>,
     /// The words the resets reclaimed, summed.
     pub words_reclaimed: u64,
+    /// The **region reclamation** counters
+    /// ([`RegionReclaimStats`](crate::runtime::RegionReclaimStats)) of the same runs — the
+    /// [`crate::runtime::reclaim`] pass, which drops whole-dead store regions and rewinds the
+    /// engine arena at the two window sites. Independent of this window's own rewind: a window
+    /// whose region was replaced still leaves a reclaimable retired chain.
+    pub reclaim: crate::runtime::RegionReclaimStats,
 }
-
 /// The smallest window worth a reachability descent, in term words (8 KiB).
 ///
 /// Below it a boundary does nothing at all: the descent costs `O(live set)` and a statement that
@@ -169,10 +174,45 @@ struct Window {
     base: usize,
     /// The region's `used` frontier at the window's start, in words.
     mark: usize,
-    /// The first reason this window must not be reset, and why a pinned window merely advances.
+    /// The first reason this window must not be reset, of **either** kind, and why a pinned window
+    /// merely advances.
     pinned: Option<&'static str>,
+    /// The first reason a **runtime-lifetime** store latched this window ([`pin`]).
+    ///
+    /// A lifetime pin and a transient one are not the same claim (see [`PinKind`]): a lifetime
+    /// store still names its word after the driver returns, so it outlives the window, while a
+    /// machine-in-flight pin does not.
+    lifetime_pin: Option<&'static str>,
 }
 
+/// Why a window was latched, and whether the reason outlives the window.
+///
+/// The distinction is [`crate::runtime::reclaim`]'s one input the statement window owns; it never
+/// changes what *this* module does (any pin makes the window unresettable, exactly as before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinKind {
+    /// A store that outlives the `-eval` driver run keeps a store word —
+    /// [`Runtime::stabilize_term`]/[`Runtime::stabilize_term_with`] and
+    /// [`crate::port::completion`]'s decoded caller tag. Its word is still named after the driver
+    /// returns, so a region holding it may not be dropped at **either** site.
+    Lifetime,
+    /// A holder that exists only while something is executing — a nested run's machine, or a
+    /// nested `-eval` closure's applying machine. Its roots are dead by the time the driver
+    /// returns, so this pin is only a refusal at the **boundary**.
+    Transient,
+}
+
+/// What an open statement window reports to a region-reclaim pass
+/// ([`crate::runtime::reclaim::pass`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WindowState {
+    /// Whether a window is open at all — the pass has no site without one.
+    pub(crate) open: bool,
+    /// The first reason the window was pinned, of either kind.
+    pub(crate) pinned: Option<&'static str>,
+    /// The first **runtime-lifetime** reason, if one latched.
+    pub(crate) lifetime_pinned: Option<&'static str>,
+}
 /// The `-eval` route's statement-window bookkeeping on [`Runtime::eval_heap`].
 ///
 /// Always present on the runtime; `window` is `Some` only between [`open`] and [`close`], i.e.
@@ -228,6 +268,7 @@ impl ScratchState {
             base,
             mark: used,
             pinned: None,
+            lifetime_pin: None,
         });
         self.opens += 1;
     }
@@ -241,6 +282,7 @@ impl ScratchState {
             base,
             mark: used,
             pinned: None,
+            lifetime_pin: None,
         });
     }
 
@@ -251,6 +293,31 @@ impl ScratchState {
         self.words_reclaimed += words as u64;
         if let Some(window) = &mut self.window {
             window.pinned = None;
+            window.lifetime_pin = None;
+        }
+    }
+    /// Latches the window with `reason`, of the given [`PinKind`]. Only the **first** reason of
+    /// each kind is kept: the first overall explains the window's decline, and the first lifetime
+    /// one explains why a region that may hold it cannot be dropped even after the driver returns.
+    fn pin(&mut self, reason: &'static str, kind: PinKind) {
+        if let Some(window) = &mut self.window {
+            if window.pinned.is_none() {
+                window.pinned = Some(reason);
+            }
+            if kind == PinKind::Lifetime && window.lifetime_pin.is_none() {
+                window.lifetime_pin = Some(reason);
+            }
+        }
+    }
+    /// What a region-reclaim pass needs to know about this window.
+    pub(crate) fn state(&self) -> WindowState {
+        match &self.window {
+            Some(window) => WindowState {
+                open: true,
+                pinned: window.pinned,
+                lifetime_pinned: window.lifetime_pin,
+            },
+            None => WindowState::default(),
         }
     }
 }
