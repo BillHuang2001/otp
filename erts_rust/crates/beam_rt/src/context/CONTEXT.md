@@ -275,9 +275,15 @@ The depth-sized seed therefore trades address space for written pages rather tha
   that **only ever grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes
   the frontier; freed only when the `Runtime` drops (`beam_engine/src/context.rs:1395-1577`).
   This is the **one unbounded region left** on the route: `arena_words` (cumulative words handed out) reads 58 031 after an in-process `cerl_clauses` compile on the `run` route and 1 227 958 095 (9.8 GB over 6 068 802 calls) after one `-eval` `inet_parse` compile.
-  A **scheduled** process's nested run is still `RuntimeContext::new` with `mailbox_table: None` and
-  `gc_armed: false` (`bridges.rs:192-195`), so its accumulator graph also stays on the arena
-  and never reaches a young heap. Measured end state after a *completed* `cerl_clauses` compile:
+  A **nested** run is **not** a fresh `RuntimeContext::new`: `FunBridge::nested` (`bridges.rs:186`)
+  inherits the caller's `mailbox_table`, and `call_bif`'s external route runs on the same context, so
+  `gc_armed: false` (`bridges.rs:195`) is the only half that holds — no nested run may collect.
+  On a **scheduled** route the nested run therefore allocates from the pid's own young heap (a
+  refusing bump goes through `Process::grow_nursery` and a retry, and only a *failed* growth falls
+  through to the arena — `gc.rs:1503-1520`), which is why `arena_words` reads 58 031 there; a nested
+  run whose **caller** is table-less (`-eval`, the boot drive, `file_server`/`get_until`, all built
+  by `RuntimeContext::new`) allocates on the arena outright, the source of the 1 227 958 095 below.
+  Measured end state after a *completed* `cerl_clauses` compile:
   `total_heap_size`/`heap_size` = **843 words** on `run <file>` (both the spawned-child and the
   target-process form) and **233 words** on `-eval`, with `garbage_collection.minor_gcs = 0` and
   `eheap_live = 0` sampled throughout.
