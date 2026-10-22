@@ -213,8 +213,8 @@ Consequence: `beam_gc` cannot itself be the cause of an unmap-class dangling poi
   `retired.clear()`/`retired_regions.clear()`/`empty_retired.clear()` exist in exactly one place, `Nursery::install_collapsed` (`src/nursery.rs:576-578`), and `retired.push` in exactly one, `Nursery::install` (`src/nursery.rs:510`).
 - **Address-level membership is public; enumeration of the nursery chain is NOT.**
   From outside the crate a caller reaches only the current space (`young()`), a space count (`young_space_count()`) and a membership test over every space (`young_contains(ptr)`); the chain itself is `pub(crate)`, while the mature side is fully addressable (`mature_base`/`mature_capacity_words`/`mature_used_words`/`mature_contains`; `Collector::mature()`, `GenImmixCollector::mature()`).
-- **There is no public from-space / "retired spaces" / epoch accessor.**
-  `FromSet` is constructible (`new`/`add(&HeapSpace)`/`contains`/`words`) but `ranges()` is `pub(crate)`; a major drops the old mature space, so from-space ranges must be captured from `young()`/`mature_base()` **before** a collection runs.
+- **There is no public from-space / "retired spaces" / epoch accessor for a collector's OWN spaces.**
+  `FromSet` itself is fully public (`new`/`add(&HeapSpace)`/`unsafe from_ranges`/`ranges`/`range_count`/`words`/`is_empty`/`contains`), but nothing enumerates the nursery chain, and a major drops the old mature space, so a collection's own from-set must be captured from `young()`/`mature_base()` **before** it runs.
 - **The single-object size helper is `beam_term::layout::object_words(header, ptr) -> usize` (`pub unsafe`, in `beam_term::prelude`), NOT `beam_gc::copy::move_size`.**
   `move_size` is `pub(crate)` and equals `object_words` except for the `ErlSubBits` override; `beam_term::size::size_object(Eterm)` is the whole-graph public size, `for_each_ref` is `pub(crate)`, and the public enumerator is `beam_term::layout::for_each_child_slot`.
 - **Reading the counters for a leak-vs-recycle diagnosis.**
