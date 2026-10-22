@@ -20,7 +20,11 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
   run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the live `RootSet`, and `alloc_rooted` — the convenience
-  wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
+  wrapper that calls `ExecutionContext::alloc_words_rooted`; plus **`for_each_root(&self, impl FnMut(Eterm))`**,
+  the read-only twin of `with_roots`: it enumerates exactly the **pointer-bearing** root words the hand-off
+  covers — `x[..used_x_extent()]`, the whole stack, `fr[..used_fr_extent()]` and the three loose heap terms,
+  with every `IMMED1` word skipped by `beam_term::primary_tag` — and it does **not** cover `args_scratch`,
+  which is `mem::take`n out of the machine for the whole wide dispatch); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
   binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine);
@@ -222,6 +226,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   pops its frame like the in-machine route, and `reset` clears the memo. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
+- `root_tests.rs` — the pins for `Machine::for_each_root` (the read-only pointer-bearing root enumeration):
+  coverage of every rooted file plus the three loose terms in the documented order,
+  the immediate filter (a machine whose slots hold only small ints/atoms/`NIL` reports nothing, and one
+  boxed word in an otherwise immediate-only machine is the only thing reported), and **agreement with
+  `with_roots`** — the pointer-bearing word set the walk reports equals the one collected from the
+  `RootSet` slices for the same machine state, with the filter written out independently on both sides.
 - `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
   non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
   reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`

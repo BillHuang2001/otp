@@ -93,6 +93,7 @@ use crate::timers::{TimerHandle, Timers};
 use crate::trace::TraceState;
 use self::timer_wakes::{TimerSlot, TimerWakes};
 
+pub(crate) mod arena_census;
 pub(crate) mod executing;
 #[cfg(test)]
 mod dist_connect_tests;
@@ -401,6 +402,14 @@ pub struct Runtime {
     /// How many calls [`Runtime::alloc_words`] has served — the count
     /// [`Runtime::arena_alloc_words`] is summed over.
     arena_allocs: u64,
+    /// Whether the **arena allocation attribution** census is on (`BEAM_RT_ARENA_TRACE`), latched
+    /// when this runtime was built.
+    ///
+    /// A field rather than an environment read per allocation: [`Runtime::alloc_words`] is the
+    /// arena's only allocation path, so with the variable unset the census costs this runtime one
+    /// `bool` test and nothing else (see [`arena_census`]). It changes nothing about what is
+    /// allocated — the census only observes.
+    arena_census: bool,
     /// The **process-heap collection** state: the per-module float guard, the pin/halt sets,
     /// the global escape-store valve and the measured counters (see [`crate::runtime::gc`]).
     gc: GcState,
@@ -1457,6 +1466,7 @@ impl Runtime {
             arena: MinimalContext::new(),
             arena_alloc_words: 0,
             arena_allocs: 0,
+            arena_census: crate::debug_trace::arena_enabled(),
             gc: GcState::with_latch(foreign_latch),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             info_heap_tainted: false,
@@ -2355,7 +2365,31 @@ impl Runtime {
         // request — a refused one handed out nothing.
         self.arena_alloc_words = self.arena_alloc_words.saturating_add(n as u64);
         self.arena_allocs = self.arena_allocs.saturating_add(1);
+        // The attribution census ([`arena_census`], on only under `BEAM_RT_ARENA_TRACE`): the same
+        // served request, folded by size and by nested-run window. Off, this is one `bool` test.
+        if self.arena_census {
+            arena_census::record_alloc(n);
+        }
         Ok(words)
+    }
+    /// Whether the **arena allocation attribution** census is on for this runtime
+    /// ([`Runtime::arena_census_report`]) — the flag the nested-run window guard reads.
+    pub(crate) fn arena_census_enabled(&self) -> bool {
+        self.arena_census
+    }
+    /// The **arena allocation attribution** census, one line per figure — `None` unless
+    /// `BEAM_RT_ARENA_TRACE` was set when this runtime was built.
+    ///
+    /// It reports *which* requests produced [`RetentionStats::arena_words`]: a power-of-two size
+    /// histogram (calls and words per bucket), the ten largest single requests with a backtrace
+    /// each, the words allocated inside a nested run versus outside every one, and a per-window
+    /// word-delta histogram. A diagnostic only, like the retention snapshot: it changes no size, no
+    /// policy and no lifetime (see [`arena_census`]).
+    pub fn arena_census_report(&self) -> Option<Vec<String>> {
+        if !self.arena_census {
+            return None;
+        }
+        Some(arena_census::report())
     }
 
     /// Copies a scheduled process's return value onto the runtime's long-lived,

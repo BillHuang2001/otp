@@ -70,6 +70,9 @@
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
+//! * `root_tests` — the pins for [`Machine::for_each_root`] (the read-only
+//!   pointer-bearing root enumeration): coverage of every rooted file plus the loose
+//!   terms, the immediate filter, and agreement with the [`RootSet`] hand-off.
 //! * `deadline_tests` — the parked-`receive` deadline driven to completion on a real
 //!   compiled module (`erlc`) and cross-checked against the system `erl`, including the
 //!   nested / blocking run path a fired `after T` has to work through.
@@ -110,6 +113,8 @@ mod registers;
 mod run;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod root_tests;
 #[cfg(test)]
 pub(crate) mod test_support;/// Process-state core: x-register file, Erlang stack and call-frame stack.
 pub struct Machine {
@@ -942,6 +947,68 @@ impl Machine {
         }
     }
 
+    /// Walk every **pointer-bearing root word** this machine holds, skipping immediates.
+    ///
+    /// # What it enumerates
+    ///
+    /// Exactly the words [`Machine::with_roots`] hands a host, minus every word that
+    /// cannot name a heap object: the **used prefix** of the X-register file
+    /// ([`Machine::used_x_extent`]), the **whole** Erlang stack (every Y slot of every
+    /// live frame — it has no liveness map), the used prefix of the FR file
+    /// ([`Machine::used_fr_extent`]) and then the machine's **loose heap terms**
+    /// ([`Machine::loose_heap_terms`]: the two failed-clause argument latches and the
+    /// pending exception's live reason) — the same fields and the same extent accessors
+    /// `with_roots` uses, so the two can never disagree about *what* is rooted.
+    ///
+    /// A word is handed to `f` only when its primary tag is `LIST` or `BOXED`
+    /// ([`beam_term::primary_tag`]), i.e. when it may hold a pointer into a heap: a small
+    /// integer, an atom, a pid/port/reference, `NIL` and every other immediate is
+    /// skipped, because relocating it would be meaningless. A `LIST`/`BOXED` word is
+    /// handed over **verbatim** — a static literal is included (it carries the
+    /// [`beam_term::literal::TAG_LITERAL_PTR`] bit on a `LIST`/`BOXED` tag), so a visitor
+    /// that moves things must itself leave a literal word alone, exactly as it must when
+    /// it is handed the [`RootSet`].
+    ///
+    /// # What it does NOT cover
+    ///
+    /// **`args_scratch`** — the `call_bif` argument window is `mem::take`n *out* of the
+    /// machine for the whole wide dispatch, so it is unreachable from any door and is not
+    /// enumerated here (a host that must root it does so for the window's duration).
+    /// `class_atoms` is not a gap: those are immediates. A foreign (`literal`-area) term
+    /// and any host-side structure holding engine terms are likewise outside this walk.
+    ///
+    /// # Why it is read-only
+    ///
+    /// The walk is `&self` and hands out **copies**, so it can census reachability but
+    /// cannot relocate: a collecting host must still go through
+    /// [`Machine::with_roots`]'s mutable slices to write a moved word back. It allocates
+    /// nothing, collects nothing and changes no machine state, which is what makes it
+    /// safe to call between any two instructions.
+    pub fn for_each_root(&self, mut f: impl FnMut(Eterm)) {
+        let x_live = self.used_x_extent() as usize;
+        let fr_live = self.used_fr_extent() as usize;
+        for &word in &self.x[..x_live] {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for &word in &self.stack {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for &word in &self.fr[..fr_live] {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for term in self.loose_heap_terms().into_iter().flatten() {
+            if is_pointer_root(term) {
+                f(term);
+            }
+        }
+    }
+
     /// Allocate `n` heap words **with the live root set handed to `ctx`**, so a
     /// context with a real collector can collect (and move terms) as part of the
     /// allocation.
@@ -1407,4 +1474,25 @@ impl Default for Machine {
     fn default() -> Machine {
         Machine::new()
     }
+}
+
+/// Whether `word` may hold a **pointer into a heap** — i.e. whether it is a root a
+/// collector would have to relocate.
+///
+/// [`Machine::for_each_root`]'s filter: a `LIST` (cons cell) or `BOXED` (header-tagged
+/// boxed object) primary tag carries an address, so the word is a root; everything with
+/// the `IMMED1` primary tag (small integers, atoms, pids, ports, references, `NIL` and
+/// every other immediate) is a value the word itself *is*, so it can never be moved and
+/// is not reported. A `HEADER` primary tag is not a valid term word at all and is
+/// likewise not reported.
+///
+/// A static-literal pointer keeps its `LIST`/`BOXED` primary tag (the literal-area bit is
+/// [`beam_term::literal::TAG_LITERAL_PTR`], outside the 2-bit primary tag), so it **is**
+/// reported — a collector must know it exists in order to leave it alone.
+#[inline]
+fn is_pointer_root(word: Eterm) -> bool {
+    matches!(
+        beam_term::primary_tag(word),
+        beam_term::PrimaryTag::List | beam_term::PrimaryTag::Boxed
+    )
 }

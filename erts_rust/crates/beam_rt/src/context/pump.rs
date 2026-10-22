@@ -272,6 +272,11 @@ impl<'a> RuntimeContext<'a> {
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // The **arena census**'s window for this run (`BEAM_RT_ARENA_TRACE`, a diagnostic only):
+            // every word the eager run allocates from the pointer-stable arena is attributed to it,
+            // so the census can say whether one nested run eats a compile's whole demand or
+            // thousands of them share it. `None` — and then nothing at all — when the census is off.
+            let _arena_window = crate::runtime::arena_census::Window::enter(this.runtime);
             // The NIF-resource prune's scope for this run: the candidate set as it stands *before*
             // the run starts, so its epilogue may release only the resource terms this run itself
             // minted (see [`RuntimeContext::adopt_nested_payloads`]). A per-run local, because
@@ -351,6 +356,9 @@ impl<'a> RuntimeContext<'a> {
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // As [`Self::run_export_blocking`]: this run's arena-census window (a diagnostic only,
+            // `None` unless `BEAM_RT_ARENA_TRACE` is set).
+            let _arena_window = crate::runtime::arena_census::Window::enter(this.runtime);
             // As [`Self::run_export_blocking`]: this run's NIF-resource prune scope, taken before
             // the body runs.
             let frontier = crate::eval::reclaim::Frontier::snapshot();
