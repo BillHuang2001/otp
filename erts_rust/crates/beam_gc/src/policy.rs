@@ -103,10 +103,22 @@ const VH_DEFAULT_SIZE_WORDS: usize = 32768;
 /// For the current geometry, the dependent `beam_rt` `boundary_cost` churn fixture holds one
 /// **2 585**-word young space and a **6 772**-word mature region at **2.36 collections per
 /// call** over its 2 001 calls (its heap-admission and boundary doors together).
-/// The young figure is the 2 586-word growth-table entry, *inside* the band around that fixture's
-/// own 376-word minor target (its iteration allocates 806 words, so 3.2 iterations of
-/// allocation); the mature one is `next_words(2 × (201 + 2 585 + 64)) = next_words(5 700) =
-/// 6 772`.
+/// The young figure is a **chain sum materialised into a single young space** by
+/// [`HeapPolicy::young_after_collection`]'s keep branch, and not a growth-table entry — nor is it
+/// meant to be one: 2 585 is not in the table (2 586 is) because nothing ever picked it from there.
+/// The growth seam had taken the chain to `987 + 1598 = 2 585` words — a 987-word space a growth
+/// retired plus the 1 598-word one it installed — and that sum lies inside the keep band
+/// `[target, YOUNG_SHRINK_FACTOR × target] = [376, 3 008]` around the fixture's own 376-word minor
+/// target (`young_minor_target_words(201) = next_words(201 + 64)`).
+/// The keep branch therefore answers with the figure it was handed, and the collection installs it
+/// as **one** space: 2 585 words, 3.2 of the fixture's 806-word iterations of allocation.
+/// The identical materialisation is visible one step earlier in the runtime's own heap trace
+/// (`BEAM_RT_GC_TRACE=1` on the same fixture): its `young_cap` readings are `610` and
+/// `1597 = 610 + 987`, the same kept chain sum one collection earlier, and `1597` is no more a
+/// growth-table entry than `2 585` is.
+/// `HeapSpace::capacity_words` reports the constructed capacity verbatim, so a capacity outside
+/// the table needs no arithmetic story of its own and no word is "accounted for elsewhere".
+/// The mature one is `next_words(2 × (201 + 2 585 + 64)) = next_words(5 700) = 6 772`.
 /// The canonical table and the protocol are `beam_rt`'s (`src/runner/tests/boundary_cost.rs`) and
 /// are re-measured, never recomputed, whenever either rule changes.
 pub const YOUNG_TARGET_LIVE_MULTIPLE: usize = 2;
