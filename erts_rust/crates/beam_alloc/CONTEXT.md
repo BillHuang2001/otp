@@ -334,6 +334,29 @@ unused by `Heap`/`ReservedHeap`) and `RefcBinary::set_len`'s zero-fill (`src/bin
 Corollary for measurement: a segment **reused from the mseg cache is not zeroed** (only a fresh `mmap`
 is), and a freed segment keeps whatever pages its previous owner dirtied while it sits in the cache.
 
+### Free path (the mirror of the residency section) — a free does NOT return pages to the OS
+There are exactly four `munmap` triggers in the crate; nothing else returns memory (`madvise`/`mprotect`/
+`MAP_POPULATE` appear nowhere in `src/`, only in doc comments):
+1. **`mseg` cache eviction.** `MsegInner::release` (`src/mseg/state.rs:142-156`) caches a released segment
+   (default `max_cache_size` 10, FIFO); the oldest is `destroy`ed (`:119-139`) only when the cache is full.
+2. **Bad-fit tail trim on reuse.** `take_cached` (`src/mseg/state.rs:189-204`) `munmap`s the *tail* pages of
+   a cached segment too big for the request. The base survives, so a stale pointer into the retained head
+   aliases while one into the trimmed tail faults.
+3. **`MsegState::drop` → `purge_cache`** (`src/mseg/state.rs:43-48`) — unreachable for the process-global
+   `mseg()` (`&'static`, `src/carrier.rs:104-107`), reachable for a test-local `MsegAllocator`.
+4. **`AllocatorState::drop`** (`src/allocator/state.rs:256-275`) — unmaps every carrier; unreachable for the
+   12 registry allocators (`&'static AllocRef`, `src/registry.rs:54-72`), which live for the process.
+So by block size: a **slab** block (≤ 128 words = 1024 B) goes on its class free list inside a carrier that
+is **never** released, its payload head overwritten with `next`/`prev` (`src/free_list.rs:58-59,616-640`);
+a **mid** block (129..65535 words) is coalesced in place in a pooled MBC carrier (1 MiB by default) released
+only when *fully* free; a **dedicated-carrier** block (≥ 65536 words = 512 KiB, the size every non-tiny GC
+heap takes) is released whole — into the process-wide cache, **unzeroed and still mapped at the same base**,
+where `take_cached` can hand it to a *different* allocator (all 12 share the one `mseg`). A stale term
+pointer into a freed `Heap` therefore normally reads another owner's bytes silently; it faults only on the
+(rare) eviction/trim paths. `Heap`/`ReservedHeap` raw accessors carry no liveness proof either: the owner
+must uphold it (see the host-adoption contract) — `RefcBinary::payload_capacity` and `MsegAllocator::
+free_ptr`/`from_raw` (`src/mseg/allocator.rs:230,246`, magic-word checked only) are the same shape.
+
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
   (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
