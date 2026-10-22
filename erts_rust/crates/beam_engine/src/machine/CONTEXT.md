@@ -249,8 +249,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   pops its frame like the in-machine route, and `reset` clears the memo. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
-- `root_tests.rs` — the pins for `Machine::for_each_root` (the read-only pointer-bearing root enumeration):
-  coverage of every rooted file plus the five loose terms in the documented order,
+- `root_tests.rs` — the pins for both root-enumeration doors. For `Machine::for_each_root` (the read-only
+  pointer-bearing census): coverage of every rooted file plus the five loose terms in the documented order,
   the immediate filter (a machine whose slots hold only small ints/atoms/`NIL` reports nothing, and one
   boxed word in an otherwise immediate-only machine is the only thing reported), and **agreement with
   `with_roots`** — the pointer-bearing word set the walk reports equals the one collected from the
@@ -259,6 +259,20 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   supplied-trace **term** latches armed with cons cells, a hand-off whose visitor *relocates* every parked
   word, and the fields asserted to hold the **moved** terms afterwards (the stack restored, the walk
   reporting the moved words, and `with_roots`/`for_each_root` still agreeing).
+  **The parity gate between the doors** (a change to one that is not mirrored in the other fails here):
+  `for_each_root_mut_enumerates_the_same_roots_as_for_each_root` (three slices, one visit each; the same
+  sorted multiset of pointer-bearing words as the census — order differs because the loose terms ride the
+  stack slice — with the fixture's immediates and the parked loose terms asserted to sit inside the right
+  slice); `for_each_root_mut_relocates_the_very_slots_for_each_root_reports` (a moving visitor through the
+  writable door, after which the census reports exactly the relocated words and no abandoned one);
+  `for_each_root_mut_writes_are_observed_by_for_each_root` (every pointer word replaced by a distinguishable
+  **immediate** marker ⇒ the census reports nothing, a second visit checks slot-for-slot that the marker sits
+  where the census's word was and every immediate is byte-identical, then the originals are restored and the
+  census's multiset returns); and
+  `for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error` (the handed slices cover
+  exactly the `x` prefix + the stack with the armed loose words parked in it, none of their byte ranges
+  overlaps the `args_scratch` buffer, and an `Err` from the stack slice stops the walk yet still truncates
+  the stack and re-seats all five loose fields).
 - `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
   non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
   reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`
