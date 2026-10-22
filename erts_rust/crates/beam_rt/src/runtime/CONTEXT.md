@@ -177,6 +177,38 @@ There is **no** `{setup,…}`/`{nodeup,…}` control exchange in OTP distributio
   Measured on a `send_recv:plain/1` ping-pong (`receive … after 30000`), N = 20000: **0 `clock_nanosleep`** and, with the port half progress-aware, **6** blocking waits in total (≈ 137 ms, the boot's own idle rounds) instead of one 25 ms `epoll_wait` stall per pass, on both the default native-baseline tier and `BEAM_RT_TIER=interpreter`. The **port half** is progress-aware by the same flag: `scheduler_pass` computes `progressed` before the port half and hands `deliver_port_messages` `PORT_POLL_SLICE` only for a round that ran nothing, `Duration::ZERO` for a progressed round (it still polls — a driver may have bytes queued — it just does not block); without that, a live `inet_gethost` port keeps `has_nothing_to_poll()` false and every pass stalls the full 25 ms, which cost a 20 000-round ping-pong 1063 blocking waits / 26.9 s. Pinned by `scheduler/tests.rs::the_port_poll_blocks_only_for_a_round_that_ran_nothing` (the test-only `BLOCKING_PORT_ROUNDS` counter) and end-to-end by `tests/run_route_sleep.rs`. The `tools/bench` figure for the `copy_bound` case `send_recv_plain` does not reflect this wait (owner `tools/bench`).
 * **What still costs a decline: a *foreign container that forwards a word*.** The valve has **five** doors — `ensure_heap`, `ensure_heap_full`, `alloc_words_rooted`, the park arm's `serve_gc_request` and `context/gc/reds_door.rs`'s reduction/yield-boundary door — each running the **per-word** classification phase plus, once the pid's foreign-reachability bit is set, an `O(live)` descent of its root-reachable scanned graph (the walk itself is `../context/gc_walk.rs`). A container that forwards **nothing scanned** (`context/gc.rs::forwards_scanned_word` over `beam_term::layout::for_each_child_slot`) declines nothing — so a `make_ref/0`-per-iteration loop keeps its latch closed and its heap flat, and a young term met by a `Process::grow_nursery` retried bump stays on the reclaimable heap **before** the valve/arena path; one that **does** forward a scanned word declines at every valve call while reachable, and dropping it lets the next full admission door retire the latch on a foreign-free descent. Rule, one-way clearing and pins: [`DESIGN_DECISIONS.md`](../../DESIGN_DECISIONS.md) *A collection is declined only by a foreign container that forwards a scanned word*; here `context/gc/refs_plateau.rs` (a ref-minting loop against a reference-free control, at N and 2N) and `../../tests/foreign_root_loop.rs` (a loop holding a BIF container result — a *scanned* root, since the process-route copy-out re-homes it — with equal collection counts at N = 5 000 … 200 000). Per-iteration dispatch/profile figures: [`../../PERF.md`](../../PERF.md).
 
+## The inter-slice window's relocating doors, and the one ordering hazard
+A `Yield` park with a **dead** FR prefix (`fr_count == 0`) publishes the machine's whole root set into the
+process's `Registers` (`../runner/run.rs:1295 park_machine` → `../runner/run.rs:622 publish_parked_roots`) and
+leaves the process **not** relocation-exempt, so every site that delivers into the parked pid between slices
+may collect over those registers: `deliver_port_messages`, `fire_due_timers`, `deliver_gc_completions`,
+`service_file_requests`, `drain_ets_owner_exits`, `dispatch_dist_inbound`/`dispatch_dist_client_inbound`, all
+through `RuntimeContext::deliver_in_table` → `ProcessTable::deliver`
+(`../../beam_process/src/ptab.rs:858`) → `Process::deliver` (`../../beam_process/src/process.rs:1150`), gated by
+`Process::has_unpublished_roots()` (`relocation_exempt || state == Running`,
+`../../beam_process/src/process.rs:1439`) plus `RuntimeContext::delivery_collection_is_unsound`. A `Wait` park
+and a `Yield` park with a live FR prefix are exempt and publish nothing, so those sites refuse.
+Inside a slice the process is `Running`, so `slice_begin`'s `service_signals`
+(`../../beam_process/src/scheduler.rs:690`) and every in-slice delivery take the fragment route.
+**The machine is stale from the moment one of these doors collects** until the matching resume scatters
+(`../runner/run.rs:939 resume_from_process_roots` → `RuntimeContext::resync_parked_roots` →
+`context/gc.rs:839 scatter_roots_full`). Nothing in the window re-reads the machine, so that is sound.
+**Known issue — one ordering in the `Yield` arm breaks that invariant.** `serve_gc_request`
+(`../runner/run.rs:1305` → `gc.rs:507`) collects over the process's registers, leaving the machine's own
+`x`/`stack` pointing into the abandoned from-space; `collect_at_reds_boundary` (`../runner/run.rs:1313` →
+`context/gc/reds_door.rs:185`) then **re-publishes from the machine**
+(`reds_door.rs:288 publish_roots_full`), collects over those stale words and scatters the result back
+(`reds_door.rs:356`). The collector classifies an out-of-from-space word as `Target::Foreign`
+(`../../beam_gc/src/copy.rs:336-343 classify_cons`) and leaves it untouched, so the stale word survives
+verbatim — and the region it names becomes the next collection's to-space. The door's own gates
+(`collection_debt`/7-of-8 occupancy, `reds_door.rs:215-245`) currently decline right after a fresh
+collection, which is why this is latent rather than constant. The fix is to run the boundary door **before**
+`serve_gc_request`, or to skip it when a request was served.
+A resume can also fail to scatter at all: `scatter_roots_full`'s length check (`context/gc.rs:851`) counts the
+parked loose terms `Machine::with_roots` re-derives (`../../beam_engine/src/machine/mod.rs:878
+LOOSE_HEAP_TERMS = 3`), so a loose field armed or disarmed across the window makes it answer `false` →
+`halt_process_gc` → the machine keeps its pre-collection words with no scatter.
+
 ## The scheduled path's fixed costs (read before optimizing this crate's glue)
 `run_scheduled` (the CLI `run` action) drives **one** target pid after `boot_if_needed`.
 A bare `spawn(fun …)` child is created *inside* a slice (`src/native/process.rs::spawn_in_pass` → `note_pending_spawn` → `absorb_pending_spawns`), and every slice's end absorbs the wake list (`beam_process/src/scheduler.rs:435`), so a synchronous two-process ping-pong never empties the run queue and stays in **one** `run_ready` call (`run_ready_inner`, `scheduler.rs:513` `while !self.run_queue.is_empty()`) — it does **not** re-enter the pass boundary per iteration.
