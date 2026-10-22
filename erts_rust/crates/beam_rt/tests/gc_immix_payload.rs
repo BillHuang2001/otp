@@ -309,7 +309,8 @@ struct Measured {
     /// minor's `young_minor_target_words(live)` (once the young live set) does not.
     peak_nursery_words: usize,
     /// How many slice boundaries the mean above was taken over.
-    nursery_samples: u64,    /// Collections the **runtime** ran during the run (its `gc_stats()` delta).
+    nursery_samples: u64,
+    /// Collections the **runtime** ran during the run (its `gc_stats()` delta).
     collections: u64,
     /// Fullsweeps among them.
     major: u64,

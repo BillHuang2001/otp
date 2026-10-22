@@ -705,7 +705,8 @@ build(N, Size, Sum) ->
         machine
     }
 
-    /// Parks a machine that holds **nothing**: an empty register file, an empty stack and no FR    /// word — the root set of a slice that returned an immediate. No root word is pointer-bearing,
+    /// Parks a machine that holds **nothing**: an empty register file, an empty stack and no FR
+    /// word — the root set of a slice that returned an immediate. No root word is pointer-bearing,
     /// so neither valve can see a payload through them and the prune is free to reason about the
     /// reservoir alone.
     fn publish_empty_roots(table: &mut ProcessTable, pid: ProcessId) {
@@ -910,7 +911,8 @@ build(N, Size, Sum) ->
         );
     }
 
-    /// **The positive release path.** With roots that hold nothing (an empty register file, an    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
+    /// **The positive release path.** With roots that hold nothing (an empty register file, an
+    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
     /// nothing survives, and the process's off-heap byte figure is republished as `0`.
     #[test]
     fn a_prune_with_clean_roots_releases_every_payload_nothing_reaches() {

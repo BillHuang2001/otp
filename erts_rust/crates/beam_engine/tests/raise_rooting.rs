@@ -75,7 +75,7 @@
 //! instruction itself: the reason it raises with is `x(1)`, a heap term the cooking
 //! reservation of the supplied stacktrace may move, so the instruction must re-read
 //! it from the machine *after* that reservation
-//! (`a_raw_raise_reason_is_re_read_after_the_cooking_reservation`).//!
+//! (`a_raw_raise_reason_is_re_read_after_the_cooking_reservation`).
 //! ```text
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
 //!     -p beam_engine --test raise_rooting

@@ -409,7 +409,8 @@ fn the_slice_wrapper_forwards_the_foreign_record_definition_seam() {
     );
 }
 
-/// A scheduled export runs to completion through the runner's **tier-aware** first-entry/// path: its value is recorded and it exits `normal` (the selected tier is documented there).
+/// A scheduled export runs to completion through the runner's **tier-aware** first-entry
+/// path: its value is recorded and it exits `normal` (the selected tier is documented there).
 #[test]
 fn a_scheduled_export_runs_through_the_tier_aware_entry() {
     let mut rt = runtime();
@@ -3531,7 +3532,9 @@ run(N) ->
 const PORT_SUSPEND_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/port_suspend.beam"
-);/// **The one park entry point keeps both halves of the invariant together.**
+);
+
+/// **The one park entry point keeps both halves of the invariant together.**
 ///
 /// A park either writes the machine's whole root set into the process (`publish_parked_roots`)
 /// or it skips that hand-off — and skipping is sound only when nothing may relocate the heap

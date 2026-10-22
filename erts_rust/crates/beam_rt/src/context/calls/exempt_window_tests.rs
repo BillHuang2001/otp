@@ -106,7 +106,9 @@ fn pool_int_list(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
         list = ctx.heap().cons(make_small(i), list)?;
     }
     Ok(list)
-}/// The same rule at the **allocation seams** ([`super::super::gc::alloc_words`] /
+}
+
+/// The same rule at the **allocation seams** ([`super::super::gc::alloc_words`] /
 /// [`alloc_words_rooted`](super::super::gc::alloc_words_rooted)): an exempt application that asks
 /// for more words than the nursery has free gets the pointer-stable **arena** block and replaces
 /// nothing.
@@ -193,8 +195,9 @@ fn an_exempt_allocation_seam_does_not_replace_the_young_space() {
 /// * neither `notes` growth counter moved, so neither growth site ran: not the learned-hint gate
 ///   (which would otherwise grow *before* the first attempt, because the hint is set) and not the
 ///   post-refusal retry;
-/// * the copy **is still attempted** exactly once (`attempts == 1`), so the rule declines the
-///   *replacement* and not the retention.
+/// * the copy is still **attempted** — once on the process young heap and, when that refuses, once
+///   more on the store (`attempts >= 2`) — so the rule declines the *replacement* and not the
+///   retention.
 #[test]
 fn an_exempt_copy_out_never_replaces_the_young_space() {
     /// Cells in the source graph: 500 cons cells = 1 000 words, against a 233-word nursery.

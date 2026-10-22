@@ -359,7 +359,8 @@ fn a_marker_free_invocation_selects_no_plain_arguments() {
 
 // ---------------------------------------------------------------------------------------
 // The library side: the split is in the parser, not in the CLI driver
-// ---------------------------------------------------------------------------------------/// Parses `args` with no environment at all.
+// ---------------------------------------------------------------------------------------
+/// Parses `args` with no environment at all.
 fn parsed(args: &[&str]) -> beam_rt::config::RuntimeConfig {
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
     parse(&args).unwrap_or_else(|error| panic!("parse({args:?}) failed: {error}"))

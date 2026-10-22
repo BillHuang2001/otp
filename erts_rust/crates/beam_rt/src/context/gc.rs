@@ -1614,11 +1614,11 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 /// admission point's occupancy test ([`ensure_heap_full`]) turns into a real collection.
 ///
 /// Like [`alloc_words`]'s, the growth is taken only while the young space may be **replaced**
-/// ([`may_replace_young_space`] — a complete root set). A relocation-exempt process skips it and
-/// continues into the existing valve + arena path below, byte for byte as before; **this** seam's
-/// refusal is unreachable in every measured run of the in-process `compile:file/2` route (the
-/// census is recorded in this node's `CONTEXT.md` — the unrooted [`alloc_words`] seam *is* reached
-/// there, once per compile), so it is the conservative answer rather than a live path.
+/// ([`may_replace_young_space`] — a **complete root set**): a replacement *retires* the space it
+/// replaces and keeps every handed-out word addressable only until the next collection collapses
+/// the chain, and that collection's root set cannot name the words an exempt window holds on the
+/// Rust side. A relocation-exempt process therefore skips the growth and continues into the
+/// valve + arena path below, byte for byte as before — conservative, never wrong.
 ///
 /// Serving the block from the process's own — reclaimable — heap is what keeps an arena term
 /// out of the machine's registers: the pointer-stable arena is a region the collector does

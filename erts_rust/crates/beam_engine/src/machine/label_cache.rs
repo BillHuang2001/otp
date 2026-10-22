@@ -674,7 +674,9 @@ mod tests {
             Ok(("lists".to_string(), "reverse".to_string(), 1)),
             "and the shared answer is the import's own name"
         );
-    }    /// The ABA hazard the bare route has to survive: the entry names an address, the
+    }
+
+    /// The ABA hazard the bare route has to survive: the entry names an address, the
     /// module at that address is replaced with different content, and the probe must
     /// not answer with the stale map.
     ///

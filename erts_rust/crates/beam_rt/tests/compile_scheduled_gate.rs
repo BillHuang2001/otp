@@ -134,7 +134,9 @@ struct Run {
     code: i32,
     out: String,
     err: String,
-}/// The wall-clock bound on one probe. Deliberately **not** the shared
+}
+
+/// The wall-clock bound on one probe. Deliberately **not** the shared
 /// [`support::PROBE_TIMEOUT`]: a real-module compile takes ≈2.5 s (release) and this suite runs
 /// two of them, so the bound only has to be generous, never tight.
 const GATE_TIMEOUT: Duration = Duration::from_secs(240);
