@@ -1644,12 +1644,19 @@ pub(crate) fn alloc_words_rooted(
 ) -> Result<*mut Eterm> {
     let pid = ctx.mailbox_pid;
     // The latch is not set: every nested run — a cross-module callee's second machine, a fun
-    // the engine applied, the `-eval` evaluator — keeps `alloc_words`' arena fallback, byte
-    // for byte, and never collects, and it consumes **no** forced request: the machine that
-    // owns a nested run's roots is not the one this context was armed for.
+    // the engine applied, the `-eval` evaluator — behaves exactly like `alloc_words` (which is
+    // what the contract above says): it serves the young heap this context names, falls back to
+    // the arena only on a refusal, never collects, and consumes **no** forced request: the
+    // machine that owns a nested run's roots is not the one this context was armed for.
+    //
+    // Delegating rather than jumping straight at `Runtime::alloc_words` is load-bearing. A
+    // context inside a scheduled slice still carries the pass's process table, so its engine
+    // builds belong on the running process's **scanned** young heap; a block served from the
+    // arena instead is a container no collection descends into, and the young-heap children it
+    // holds are then relocated out from under it (the measured in-process `compile:file/2`
+    // abort; see this node's `CONTEXT.md`).
     if !armed {
-        let RuntimeContext { runtime, .. } = ctx;
-        return runtime.alloc_words(n);
+        return alloc_words(ctx, n);
     }
     // A fun entry or the `-eval` evaluator has no call site at all (`current_module`), and is
     // equally left alone: the door has no machine to name.
@@ -2571,6 +2578,61 @@ mod tests {
             rt.gc_stats().fallbacks,
             0,
             "no allocation may fall back to the pointer-stable arena once growth is available"
+        );
+    }
+
+    /// **A nested run's engine block is built on the process's own scanned young heap, never in
+    /// the arena.**
+    ///
+    /// [`alloc_words_rooted`]'s unarmed arm is the *nested* run's door: `Machine::alloc_rooted`
+    /// reaching the engine's term builders from a cross-module callee's second machine, a fun
+    /// the engine applied, or the `-eval` evaluator. Its contract is "behave exactly like
+    /// [`alloc_words`]" — serve the young heap this context names, never collect — because a
+    /// `RuntimeContext` inside a scheduled slice still carries the pass's process table, and a
+    /// block handed out by the **arena** instead is a container the collector neither scans nor
+    /// descends into: a collection then relocates the young-heap children it holds out from
+    /// under it.
+    ///
+    /// The assertions are the seam's two observable consequences: the block lies in a **nursery
+    /// space** of the process the context names, and the runtime records **no** arena fallback.
+    /// With the arm's previous body (`return runtime.alloc_words(n)`) both fail: the block lands
+    /// in the arena and [`Runtime::gc_stats`]`().fallbacks` counts it.
+    #[test]
+    fn an_unarmed_rooted_allocation_serves_the_process_young_heap_not_the_arena() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process in the pass table");
+
+        const BLOCK_WORDS: usize = 8;
+        let mut x = [NIL; 4];
+        let mut stack = [NIL; 2];
+        let mut fr = [NIL; 4];
+        let block = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            // `armed == false`: the nested-run shape.
+            alloc_words_rooted(
+                &mut ctx,
+                BLOCK_WORDS,
+                RootSet::new(&mut x[..], &mut stack[..], &mut fr[..], 1),
+                false,
+            )
+            .expect("the block is served")
+        };
+
+        assert!(
+            table
+                .get(pid)
+                .expect("the process is still in the table")
+                .collector()
+                .young_contains(block as *const Eterm),
+            "an unarmed rooted allocation must be served from a nursery space, never the arena"
+        );
+        assert_eq!(
+            rt.gc_stats().fallbacks,
+            0,
+            "the nested run's block must not fall back to the pointer-stable arena"
         );
     }
 
