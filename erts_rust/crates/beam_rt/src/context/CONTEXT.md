@@ -245,6 +245,12 @@ That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), th
 of the in-process `compile:file/2` route (A.9).
 The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
 [`calls/CONTEXT.md`](calls/CONTEXT.md).
+## Where a BIF result's words actually live (the three regions, and who may recycle them)
+A registered BIF builds on the pooled region (`call_registered`'s `take_bif_frontier`, `calls.rs:253`), and the tail either copies the container out (`rehome_container_result`) and rewinds to `mark` (`calls.rs:1052`) or leaves it on the region with `rewind == false` — never both.
+`put_bif_heap` (`runtime.rs:2353`) is a bare `push`: **no reset, no free, no move**, so the *only* invalidation of a pool word in the whole crate is that one `Heap::reset_to(mark)`, and it is gated only on `safe_to_rewind` (`calls.rs:421-427`, a hand-maintained seven-conjunct roster of escaping `DispatchHooks` arms) ∧ a successful copy.
+A store that keeps a pool word **without** being one of those arms is therefore a use-after-rewind, and `move_container == false` (`calls.rs:938`) disables the copy too — so on the table-less route an `!safe_to_rewind` call keeps its words only because nothing rewinds.
+The **native floor is not on the pooled region**: `try_native` runs on the `RuntimeContext` and builds through `ExecutionContext::alloc_words` → `gc.rs:1482-1521`, i.e. the process's scanned young heap in a slice and the never-reclaimed arena otherwise. (The inline comments at `calls.rs:1738` and `calls.rs:1816-1817` claim the opposite and are stale — the two regions have opposite lifetime properties, so reasoning from them gives a wrong model.)
+The third reset-per-call region is `Runtime::info_heap` (`runtime.rs:2245`, `reset_info_scratch`, 4 096 words), reset at the start of every `system_info`/`format_term` call and latched never-reset-again by `taint_info_scratch` (`runtime.rs:2257`) when `relocate_off_scratch` declines to re-home a retained value.
 ## Host-memory retention on the table-less route — where the words actually accumulate
 An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
 false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route.
