@@ -890,8 +890,11 @@ collections per call** for a **2 585**-word nursery carrying **3.2** iterations 
 (2 585 / 806) and a **6 772**-word mature region, its boundary door firing **one collection per
 8.61 checks** (`904 / 105`, inside the 7..9 watermark band its owner pins) at
 `904 / 2 001 = 0.452` checks per call. Both capacities are the live-set rules' fixed points, not
-policy captions: the nursery sits at the 2 586-word growth entry *inside* the keep band around the
-fixture's 376-word minor target (`next_words(201 + 64)`), and the mature region is
+policy captions: the nursery is a **chain sum materialised into a single young space** by
+`young_after_collection`'s keep branch — the growth seam had taken the chain to
+`987 + 1598 = 2 585` words, inside the keep band around the fixture's 376-word minor target
+(`next_words(201 + 64)`), so the collapse kept the figure it was handed and installed it as one
+space (2 585 is not a growth-table entry; 2 586 is) — and the mature region is
 `next_words(2 × (201 + 2 585 + 64)) = next_words(5 700) = 6 772`; its owner's `MEASURED` table
 (`crates/beam_rt/src/runner/tests/boundary_cost.rs`) re-derives both from every row.
 
