@@ -33,6 +33,13 @@ characterisation and figures are in `PERF.md`).
   (per-pid engine state, recorded `result`/`exit`, `jit_mode` override — its four pid-keyed maps
   `engines`/`results`/`exits`/`errors` are `crate::hasher::FastHashMap`, sound because each is only
   ever probed by pid and never iterated for an observable order).
+  **Term-word holders a rewriting pass must reach:** `ProcessEngine::args` (`entry.rs:126`),
+  `ProcessEntry::Fun::fun` (`entry.rs:81`) + `target`'s `LocalFunTarget::args`, `RunnerState::results`/
+  `exits` (`entry.rs:345`/`:347` — the words are on `Runtime::eval_heap`, not the arena) and
+  `ProcessEngine::machine`'s root slices (`Machine::with_roots`'s `RootSet`); none has a `&mut` getter.
+  `gather_off_heap_roots` (`entry.rs:490`) is the one `&mut` walk — an `arena_args && !args_consumed`
+  engine's args+fun, and an un-published parked machine's roots (`live` filters that family only) —
+  and it never visits `results`/`exits`.
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root hand-off (`park_window`, whose `ProcessEngine::parked_published` flag gates the
