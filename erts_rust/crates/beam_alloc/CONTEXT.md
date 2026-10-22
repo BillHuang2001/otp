@@ -129,6 +129,13 @@ heap never handed out — the same refusal rule [`ReservedHeap::relocate`] appli
 undersized reservation. This is what lets a *pooled* heap that reaches a caller already owning words
 handed over to another caller be rewound precisely instead of only when it is empty.
 
+### Term lifetime — what a stale term still pointing into a `Heap` reads
+- `reset`/`reset_to` only move `used` (`src/heap.rs:99-136`): words in `[mark, used)` are **not** zeroed, not wiped and not put on any free list — they stay mapped and the very next `alloc_words`/`cons`/`tuple` hands them out again. Only `Drop` (`src/heap.rs:242-261`) releases the block, and then only to the allocator (see the reuse/residency notes below). `Heap` has no `clear`/`truncate`/`free`; `used_words_mut` (`src/heap.rs:168-181`) is the only `&mut` word view and it cannot move `used`, so a `Heap` is never an in-place relocation destination — growth is always by *replacement* (a new `Heap` + a pointer-aware copy).
+- A term that outlives the rewind is therefore a **dangling-but-mapped** read, not an immediate fault: it silently reads whatever the next allocation wrote there. A recycled word is arbitrary data, so ~1 in 4 carry the `LIST`/`BOXED` primary tag and a stale read typically faults *later*, in a consumer (e.g. `beam_term::list::car` on a wild pointer) — never at the rewind itself.
+- A term that outlives the whole `Heap` is worse: `Drop` → `dealloc` → the dedicated-SBC arm (`src/allocator/core.rs:527-542`; every block `>= sbct` = 512 KiB) unmaps the carrier outright, so the next read faults — unless mseg cached the mapping (`src/mseg/state.rs:142-156`, default cache 10) and handed it to a later allocation at the **same base address**, which makes the stale read silently "work" against unrelated memory.
+- Consequence for debugging: a missed root or an over-eager rewind is deterministic per allocation *order*, not per call, and surfaces as a fault in a reader far from the heap that was rewound. This crate cannot detect it (it holds no liveness knowledge); the invariant is enforced by the rewinders — `beam_rt`'s pooled BIF heap (`src/context/calls.rs:1052`, `src/context/pool.rs`) and `beam_gc`'s nursery collapse (`src/nursery.rs:580`; `HeapSpace::reset` at `src/space.rs:102-104`).
+- `Heap` is neither `Send` nor `Sync` (it holds a raw `*mut Eterm`; the only `unsafe impl Send` in the crate is `RefcBinary`, `src/binary.rs:261`), so a stale-use defect is always same-thread — never a data race.
+
 ### `reserved_heap` — the reservation-capable per-process term heap (`ReservedHeap`)
 The **frozen seam** for hosts that must grow a live process heap. One backing block of
 `reserved_words` term words, obtained exactly once from an `AllocRef` (mseg/`mmap`-backed, so reserved
