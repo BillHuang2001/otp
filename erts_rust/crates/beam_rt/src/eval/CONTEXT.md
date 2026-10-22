@@ -125,6 +125,35 @@ Everything outside the grammar is a typed capability gap: the parser (and a few 
 - The compatibility gate (`../../tools/differential/`) is the end-to-end check; this node's corpus probes are the `Eval`/`semantics`/`boot` groups.
 - Integration (`../../tests/eval_region.rs`): the statement window's retention contract at the CLI boundary — a `persistent_term` value, an environment binding and a mailbox message each kept alive across 20 interposed builds of `lists:seq(1,2000)`, compared with the system `erl` on the identical expression text (golden + oracle, loud skip without a toolchain).
 
+## Raw-term-holder inventory (what a moving/compacting store would invalidate)
+Every holder below stores a raw `Eterm` (a machine word whose meaning is an address for a boxed/list term) and every one is **pointer-pinned**: none is relocatable today. This is the roster a heap-compaction design must either relocate through a root table or refuse to compact across.
+| site | owner | field/local | holds | lifetime |
+|---|---|---|---|---|
+| `mod.rs:200` | `Env` (type alias `HashMap<String, Eterm>`) | values | whatever a sub-expression produced: the **arena** (`Runtime::alloc_words`, the `-eval` route's `mailbox_table == None` arm), the **store** (`Runtime::eval_heap`, the table-less BIF copy-out), a **literal**, or an immediate | one frame; the driver `env` (`mod.rs:416`) spans every statement of the expression |
+| `mod.rs:207/211` | `FunBody` | `env: Env` | closure captures (same heap mix) | **runtime** — pushed to `Runtime::eval_closures` (`Vec<Rc<FunBody>>`, `mod.rs:1904-1906`); enumerated by `FunBody::env_terms` (`mod.rs:236-238`) → `Runtime::gather_off_heap_roots` |
+| `mod.rs:178/190` | `Flow::Raise` | `reason: Eterm`, `head: Option<Eterm>` | live reason (often a **pooled BIF heap** word, read by `flow_from_error` while that heap is alive) + a synthesized `undef` head item | one unwind; `finish` (`mod.rs:462`) attaches `reason` to `Raise::with_live_reason` |
+| `mod.rs:262-267` | `CompOut::List/Map` | `Vec<Eterm>` / `Vec<(Eterm,Eterm)>` | comprehension elements | one comprehension |
+| `mod.rs:279` | `BitBuf` | `bytes: Vec<u8>`, `bits` | **no terms** (raw bytes) | one binary build |
+| `mod.rs:252` | `CompTemplate<'x>` | AST refs only | — | borrow |
+| `mod.rs:701/717/735` | `Evaluator::{terms,list,map}` locals | `Vec<Eterm>` / `acc` / `Vec<(Eterm,Eterm)>` | evaluated sub-expressions | one call |
+| `mod.rs:1269` | `Evaluator::apply_value` | `function: Eterm`, `args: &[Eterm]` | fun term + args | one application |
+| `mod.rs:1745-1749` | `Evaluator::try_mailbox_receive` | `messages` (from `ctx.mailbox_messages()`), `bound: Env` | mailbox words + bindings | one receive scan |
+| `mod.rs:1448` | `Evaluator::catch_clauses` | `cooked_trace: Option<Eterm>` | stacktrace list | one catch |
+| `compile.rs:123` | `CompiledClosure` | `captures: Vec<Eterm>` | **word copies** of `FunBody.env` values (aliased, not deep-copied: `compile.rs:225-231` `*value`, `:195`); `arguments()` (`:132-137`) copies the words again | **runtime** — `Runtime::eval_compiled` (`FastHashMap<u32, Option<CompiledClosure>>`) |
+| `scratch.rs:165-175` | `Window` | `base: usize`, `mark: usize` | **address identity + word mark**, no terms | one `-eval` run |
+| `scratch.rs:378-385` | `WindowProbe` | `lo/hi: usize` | an address range | one `boundary()` |
+| `reclaim.rs:270-272` | `Live` | `payloads: FastHashSet<usize>` | `RefcBinary::data_ptr()` addresses | one prune |
+| `reclaim.rs:459` | `walk` | `work: Vec<Eterm>` | a worklist it **dereferences** (`:494-535`) | one prune |
+| `reclaim/resource.rs:155-167` | `Frontier` | `words: Vec<usize>` (`term.raw()`) | resource-term word addresses | runtime (`ResourcePruneState.frontier`) + per-run |
+| `reclaim/resource.rs:237-244` | `ResourceSink` | `candidates`/`reached`/`ids` | word addresses + ref ids | one prune |
+
+Compaction consequences (binding):
+- **The `Env` chain is the evaluator's only host-side root set, and it lives in Rust locals/parameters, never in the `Evaluator`.** `Evaluator` (`mod.rs:536-553`) has exactly `ctx`, `depth`, `prune` — no `env` field. The driver owns `env` (`mod.rs:416`) and clones it per clause/guard/`case`/`if`/`try`/`receive`/comprehension (`mod.rs:1319,1371,1388,1399,1429,1456,1551,1647,1721,1896,2000,2031,2432`). Only the root `env` is ever republished (as `extra` at the prune/window boundary); a clause-local clone is invisible to every root enumeration.
+- **`FunBody.env` and `CompiledClosure.captures` are ONE slot, not two families.** `compile.rs`'s "no new root family" claim holds only while they stay word-identical; a compaction must rewrite both in lockstep or a later spawn reads a stale word.
+- **`scratch::Window::base` and `WindowProbe::lo/hi` are address identities** (`scratch.rs:169`, `:396-399`): a moved region must recompute them or force a `decline` — never leave them stale (a stale `base` fails the `base != base` test and declines safely; a stale `lo/hi` can answer a false *miss*).
+- **`reclaim.rs`'s two halves differ under compaction:** `collect_region_payloads` (`:439-446`) only *pattern-matches* the `HEADER_BIN_REF` word and reads `window[1].raw()` as a value (sound if `BinRef.val` tracks the payload), while `walk` (`:458-538`) *dereferences* every boxed/list word — so any walk taken across a move must run on rewritten words.
+- **Two locations a store-only compaction cannot reach:** the arena (`Runtime::alloc_words` → `beam_engine::MinimalContext::ContextHeap`, never freed, no observed word-range accessor) and a nested run's `Machine` roots (`context/pump.rs:268,356` under `with_relocation_exempt`, deliberately absent from `Runtime::gather_off_heap_roots`).
+
 ## Routing Table
 - `mod.rs` → the tree-walking `Evaluator` (expressions, patterns, guards, comprehensions, the `BitBuf` binary builder), `Flow`/`EResult`/`Env`, the entry points (`eval`, `apply_eval_closure`, `EVAL_FUN_UNIQ`, `FunBody`), `finish`/`flow_from_error`, `with_callee_head_item`/`callee_head_item` (the `undef` callee head trace item), `catch_expr`/`catch_clauses`/`cook_supplied_trace` (the per-class caught-raise fold), and the colocated unit suite (incl. the evaluation-order gate).
 - `ast.rs` → the untyped AST: `Expr` (used for both expressions and patterns) plus `BinOp`/`UnOp`/`Seg`/`SegKind`/`Endian`/`Clause`/`CatchClause`/`FunClause`/`Try`/`Receive`/`Qual`/`MapField` and `is_var_name`.
