@@ -87,9 +87,10 @@
 //!
 //! The crate root keeps `#![deny(unsafe_code)]`; this module carries its own
 //! `#![allow(unsafe_code)]` because it is the arena's second raw-heap seam: it builds
-//! `beam_gc::FromSet`/`LinearDest` over the arena's own reservations, advances a bump
-//! pointer to a validated position, and performs the one `ptr::copy_nonoverlapping` that
-//! installs the survivor. Every `unsafe` block states its `// SAFETY:` rationale.
+//! `beam_gc::FromSet`/`LinearDest` over the arena's own reservations and advances a bump
+//! pointer to a validated position (Tier B copies **straight into** the survivor — there
+//! is no memcpy, see the destination note in `reclaim`). Every `unsafe` block states its
+//! `// SAFETY:` rationale.
 
 #![allow(unsafe_code)]
 

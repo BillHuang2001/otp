@@ -86,8 +86,8 @@
 //! crate's raw `beam_alloc::ReservedHeap` bump seam — see
 //! [`context::MinimalContext`]) and `context::reclaim` (the arena's two reclaim tiers:
 //! it builds `beam_gc`'s `FromSet`/`LinearDest` over the arena's own reservations and
-//! installs the survivor with one `copy_nonoverlapping` — see
-//! `src/context/CONTEXT.md`), `families::bitstrings::raw` (the frozen bitstring
+//! deposits the copies straight into the survivor region — see `src/context/CONTEXT.md`),
+//! `families::bitstrings::raw` (the frozen bitstring
 //! layouts), [`jit::emitter`] (the x86-64 encoder and the crate's only
 //! executable-memory mapping — see that module for its W^X policy), the baseline
 //! backend (`jit::baseline`), and the feature-gated `jit::cranelift`.
