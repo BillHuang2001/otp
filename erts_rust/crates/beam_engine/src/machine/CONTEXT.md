@@ -410,26 +410,27 @@ Moved verbatim from the crate `CONTEXT.md` (which keeps the contract and a point
 The complete inventory of `Eterm`-typed state on `Machine`, and its rooting status. Anything
 **not** in `x`/`fr`/`stack` is a "loose" term and is only safe if it is parked by
 `with_roots` or provably never live across an allocation.
-- **The three parked loose terms** (`mod.rs:887-893`, `LOOSE_HEAP_TERMS = 3`):
-  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception`'s reason.
-  `with_parked_loose_terms` (`mod.rs:903-929`) pushes them at the stack tail **before** the hand-off,
-  hands over the `RootSet`, reads each field back from its slot (`:923`) and `truncate`s (`:927`) —
+- **The five parked loose terms** (`mod.rs:937-945`, `LOOSE_HEAP_TERMS = 5`):
+  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception`'s reason,
+  `pending_supplied_term`, `raise_supplied_term`.
+  `with_parked_loose_terms` (`mod.rs:955-981`) pushes them at the stack tail **before** the hand-off,
+  hands over the `RootSet`, reads each field back from its slot and `truncate`s —
   unconditionally, so an `Err` out of the closure re-seats too (there is no `?` between the push and
-  the truncate). `seat_loose_heap_terms` (`:938-948`) leaves a field untouched on a `None` read-back.
-- **The two supplied-term latches** (`pending_supplied_term` `mod.rs:426`, `raise_supplied_term`
-  `:461`) are deliberately **not** parked: `Machine::raise_supplied` (`catch.rs:649-661`) arms one and
-  `throw_with_trace` (`catch.rs:450`) promotes it with **no allocation in between**, and the
-  promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
-- **`args_scratch` (`mod.rs:527`) is the one term vector that is not a root** — `mem::take`n out of the
-  machine for the whole wide dispatch (`interpreter/bif.rs:175/185`) and for `trace_call`
-  (`interpreter/trace.rs:186/211`), hence invisible to `for_each_root` (documented `mod.rs:974-978`)
-  and to `with_roots`. It cannot dangle **today** only because `Machine::dispatch_bif_call`
-  (`interpreter/bif.rs:324-338`) takes `&self` while every admission door (`ensure_heap_full`,
-  `alloc_words_rooted`) takes `&mut self`, so the borrow checker forbids a collection in the window;
-  and `alloc_words` — the only door a BIF can legally reach — never moves a `beam_rt` heap. Adding a
-  fourth loose entry in `loose_heap_terms` (with `LOOSE_HEAP_TERMS = 4`) is the durable fix if a
-  BIF-invoked seam ever gains a collection point.
-- **`class_atoms: [Eterm; 3]`** (`mod.rs:233`) are atom **immediates** — no rooting needed.
+  the truncate). `seat_loose_heap_terms` (`:990-1003`) leaves a field untouched on a `None` read-back.
+  Both **term** pairs are in that set; only the `Option<StackTrace>` pairs are metadata and stay out of it.
+- **`args_scratch` (`mod.rs:574`) is the one term vector that is not a root** — `mem::take`n out of the
+  machine for the whole wide dispatch (`interpreter/bif.rs`) and for `trace_call`
+  (`interpreter/trace.rs`), hence invisible to `for_each_root` (documented on that method) and to
+  `with_roots`. It cannot dangle because the window is **structurally** collection-free:
+  `Machine::dispatch_bif_call` takes `&self` while every admission door (`ensure_heap_full`,
+  `alloc_words_rooted`) takes `&mut self` plus this machine's root slices, so the borrow checker forbids
+  a collection in the window; and `alloc_words` — the only heap door a BIF can legally reach — never
+  collects. Pinned by `tests/bif_args_window.rs` (zero rooted-door crossings across a narrow and a wide
+  dispatch, the arguments equal to `x(0..arity)` on both BIF doors, a `test_heap` control proving the
+  probe fires) and by the `bif` unit test that the buffer comes back **empty** on the error and the
+  success path alike. A BIF-invoked seam that gained a collection point would make the argument words
+  have to be rooted — kept in the machine and enumerated, or parked like the loose terms.
+- **`class_atoms: [Eterm; 3]`** are atom **immediates** — no rooting needed.
 - **Nothing else stores a heap word**: `frames`/`catch_frames` (CP slots are `Continuation::Address{context,func,pc}`
   / `Halt`), `raise_snapshot` and `resumption_addresses`/`resumption_contexts` (`(u32,u32,u32)`),
   `contexts`/`ModuleContext` (`Arc<Module>` + `Arc<LabelMap>`, `context.rs:67-90`),
