@@ -246,11 +246,15 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
 - `root_tests.rs` — the pins for `Machine::for_each_root` (the read-only pointer-bearing root enumeration):
-  coverage of every rooted file plus the three loose terms in the documented order,
+  coverage of every rooted file plus the five loose terms in the documented order,
   the immediate filter (a machine whose slots hold only small ints/atoms/`NIL` reports nothing, and one
   boxed word in an otherwise immediate-only machine is the only thing reported), and **agreement with
   `with_roots`** — the pointer-bearing word set the walk reports equals the one collected from the
   `RootSet` slices for the same machine state, with the filter written out independently on both sides.
+  Plus `with_roots_re_seats_the_two_supplied_trace_term_latches_from_their_parked_slots`: both
+  supplied-trace **term** latches armed with cons cells, a hand-off whose visitor *relocates* every parked
+  word, and the fields asserted to hold the **moved** terms afterwards (the stack restored, the walk
+  reporting the moved words, and `with_roots`/`for_each_root` still agreeing).
 - `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
   non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
   reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`
