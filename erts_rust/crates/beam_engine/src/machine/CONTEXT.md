@@ -307,8 +307,7 @@ What the root set is **made of** and what it provably leaves out — the invaria
   words must be rooted** (kept in the machine and enumerated, or parked at the stack tail), never left to the
   comment. The buffer is reinstated **empty** on every exit path (no `?` between the `take` and the reinstall),
   pinned by the `bif` unit test beside the wide-marshalling proof.
-- **The hand-off width is `used_x_extent()`/`used_fr_extent()` = `max(mark, dirty)`** (`registers.rs:108-110`),
-  never `RootSet::live` (a hint only) — so `live` may be larger than the handed prefix and the slot set is still
+- **The hand-off width is `used_x_extent()`/`used_fr_extent()` = `max(mark, dirty)`** (`registers.rs:108-110`), — so `live` may be larger than the handed prefix and the slot set is still
   exact. The width is sound only while **every** writer reports: `set_x`/`set_fr` raise the mark
   (`registers.rs:251-288`), `x_mut`/`fr_mut`/`with_roots` raise `dirty` (`:139-142`), and a native block reports
   through the artifact's `native_write_extent` (`jit/baseline/mod.rs:696-702`, `code.rs:615-620`) — the one claim
