@@ -104,6 +104,8 @@ mod lost_peer_tests;
 mod gc;
 mod retention;
 pub(crate) mod roots;
+#[cfg(test)]
+mod root_tests;
 mod scheduler;
 mod timer_wakes;
 

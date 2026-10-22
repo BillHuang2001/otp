@@ -195,7 +195,6 @@ impl RootFamily {
     /// never an ordering one (the two walks deliberately visit the families in different orders:
     /// the value gather pushes the dictionary first, the moving pass follows `beam_process`'s own
     /// canonical order).
-    #[allow(dead_code)] // consumed by the parity test (`src/runtime/root_tests.rs`), not by the walk
     pub(crate) fn in_value_gather(self) -> bool {
         match self {
             RootFamily::EvalClosureEnv
@@ -283,11 +282,8 @@ impl Runtime {
     ///
     /// Whatever `f` answers; the walk stops there, the owner of the failing slice has already
     /// written its buffer back, and every word `f` had replaced before that is in place.
-    // The parity test (`src/runtime/root_tests.rs`, kept honest below) is this door's first
-    // caller; until it lands nothing in the crate names the door. Every owner seam it reaches is
-    // live because this function reaches it — the allowance is the root the whole walk hangs from,
-    // and it is what keeps the additive seam from breaking the warning-free build.
-    #[allow(dead_code)]
+    // The parity test (`src/runtime/root_tests.rs`) is this door's caller: it compares the walk's
+    // corpus against the value gather's in every populated state.
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
@@ -437,7 +433,6 @@ impl Runtime {
     /// # Errors
     ///
     /// Whatever `f` answers (see the visitor contract above).
-    #[allow(dead_code)] // see the note on [`Runtime::for_each_root_mut`]
     pub(crate) fn for_each_root_family_mut(
         &mut self,
         f: &mut impl FnMut(RootFamily, &mut [Eterm]) -> beam_common::Result<()>,
