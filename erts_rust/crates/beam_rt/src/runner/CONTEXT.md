@@ -452,6 +452,20 @@ marshalled BIF `args` copy (`beam_engine/src/interpreter/bif.rs:103-133`, `:165-
 door `Machine::dispatch_bif_call` (`bif.rs:324`) which has no write-back channel, and the
 `Runtime`-owned term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox`
 markers, `trace`/`seq_trace` specs, `eval_closures`).
+**Two hand-off asymmetries a dangling-pointer hunt must know.** (a) `publish_parked_roots` discards
+`publish_roots_full`'s answer (`run.rs:637-639`) while `park_machine` claims `parked_published = true`
+unconditionally (`run.rs:745`), so a failed publication would leave a **stale** published set behind a
+window a collection may still move; unreachable today only because `XRegs::set_live` errs on `n > MAX_REG`
+alone (`beam_process/src/registers.rs:77-83`) and `publish_roots_full` clamps to it (`gc.rs:802`).
+(b) A failed **scatter** halts collection *after* the collection already moved the heap (`gc.rs:1425-1427`,
+`../context/runtime_context.rs:515-517`), which is not the "unmoved heap"
+[`Runtime::halt_process_gc`](../runtime/gc.rs:801-809) documents: the parked machine keeps its from-space
+words and the process keeps running on them, so the failure surfaces later as a dangling term read rather
+than a typed error.
+The resume's re-derivation is self-consistent only because nothing on the host side touches the machine
+between park and resume: `scatter_roots_full` recomputes the expected width as `machine.stack.len() +
+armed loose terms` (`gc.rs:851`), and that count can only differ from the park's if the machine's stack or
+its loose-term latches changed while parked.
 
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
