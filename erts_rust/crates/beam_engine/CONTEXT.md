@@ -205,6 +205,12 @@ The full list, each with its ground-truth detail, is `INSTRUCTION_SURFACE.md`'s 
   reader closure, `raise.rs:66`; `catch_end` re-reads `x(1)`/`x(0)` after its reservation, `mod.rs:268`; `failed_clause_arglist`,
   `src/interpreter/dispatch.rs:1460`). Fix: move the `x(1)`/`x(2)` reads after the cooking (or re-read them from the machine),
   never reuse the pre-reserve words.
+  The defect has exactly ONE instance: both tiers run this same family body (`src/jit/baseline/emit/block.rs:910-925` routes
+  `RawRaise` to `emit_family`, not an inline lowering), so auditing the JIT separately is wasted effort. And a read is never
+  the hazard by itself — `read_operand` (`src/operand.rs:63-89`) does no collecting allocation (a register/Y/literal load, or a
+  non-small `Operand::Integer` through the **unrooted** `alloc_words`) — only a *rooted* door (`reserve`/`reserve_slack`/
+  `make_*_rooted`/`ensure_heap`) placed **after** a read strands a Rust local, which is why the reserve-then-read discipline is
+  sufficient everywhere else.
 - **The uncaught frames exist only for a `BeamError::Raise`** (`beam_common`'s reason variants are fieldless and carry no `StackTrace` slot).
 - **Records.** The whole native-record set executes; `PutRecord`'s create form works for the running module's own `Recs` and for a **foreign** `{Module,Name}` id through `foreign_record_definition` (exported definitions only, else the C's `error:{badrecord, Id}` raise), with the `Ok(None)` host keeping the typed `unsupported` and no `code:ensure_loaded/1` trap. Two divergences in that family are open: `is_record_accessible`'s wildcard arm compares the definition module against the `Scope` **operand** where `emu/ops.tab:1675` substitutes `$MODULE`, and `put_record`-update / `update_record_id` / `get_record_field` raise `function_clause` where the C's `$FAIL_HEAD_OR_BODY` `NO_FAIL` path raises `{badfield,…}`/`{badrecord,…}`. Detail: `src/families/records/CONTEXT.md`, `tests/gaps.rs`.
 - **Bitstrings.** `bs_init_writable` builds 0 bits over a capacity-carrying refc payload (the `x(0)` hint, else `DEFAULT_WRITABLE_SIZE = 1024`) registered writable **on the machine**; a **first-position** `private_append` appends **in place** and an outgrown payload **grows**, so the accumulator loop is amortised (64 KiB from a 1 KiB hint: 2 grows + 4 moves, 61 440 bytes copied -- `create/grow_tests.rs`); every other shape promotes to the byte-identical copy-rebuild.
