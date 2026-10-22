@@ -111,6 +111,24 @@ Every gate is a decline that retains everything: `is_relocation_exempt`, `gc_pro
 The engine's overhead figure is `Machine::off_heap_overhead_bytes` — Σ `RefcBinary::reserved_bytes` over the reservoir, i.e. the backing store matching this crate's `BinVheap` accounting, not `len()` — and a `Wait` park declines because that window publishes no root set, so the point is the `Yield`/park-after-slice arm.
 The process-owned PCB roster keeps its own two halves (`beam_process`'s `sweep_off_heap_binaries` for the declared-dead set, `sweep_off_heap_binaries_reachable` for the reachability set); `sweep_unreachable_binaries` stays the roster-owning form for a host that keeps a `beam_gc::OffHeap`, which the runtime's reservoir path does not.
 Pinch-points of the pair: the in-crate counter contract is `tests/offheap_retention.rs`, and the runtime consequence is the `## Measured` bullet in `../CONTEXT.md` (capacity, never latency).
+## Freed memory — the unmap-class set, and what has to be true for it
+
+A dangling pointer whose target was **freed/unmapped** (a SIGSEGV, not a wrong term) can only come from this list; every other invalidation in the crate merely **recycles** words and would show up as a wrong term instead.
+- `nursery.rs`'s `install_collapsed` (`self.retired.clear()` / `retired_regions.clear()` / `empty_retired.clear()`, then `self.current.reset()` or `self.current = HeapSpace::with_allocator(..)`).
+  Reachable only from `collect_minor`→`collapse` (`collector.rs:361`), `collect_major`→`collapse_after_fullsweep` (`collector.rs:467`) and the Immix siblings (`immix_collector.rs:622,724,881`) — i.e. only **after** a round evacuated the whole chain, so the precondition is "the copier forwarded every live word reachable from the slice it was given".
+- `collector.rs:452` `self.mature = fresh; // drops the old mature space` and `immix_collector.rs:858` `self.mature = fresh` (`relocate_major`).
+  Same precondition, over the fullsweep's single from-set (nursery chain + mature).
+- `mso.rs:364` `*slot = None` in `OffHeap::sweep` — drops the entry, and the payload's `beam_alloc` carrier comes back when the roster held the last reference (`MsoHandle::drop`'s `Box::from_raw`).
+- `beam_alloc::Heap::drop` (`beam_alloc/src/heap.rs:242-260`, `self.alloc.dealloc(ptr, layout)`) is the OS free behind all of the above.
+- **Recycle-class only** (never a SIGSEGV source): `HeapSpace::reset` (`space.rs:102`, rewinds `used`), `ImmixSpace::reset` (`immix/mod.rs:462`, "Invalidation, not reclamation"), `release_dead_lines`/`finalize` (`immix/collect.rs:282,298`, bits inside a still-live region), `release_words`/`release_lines` (`immix/mod.rs:640,677`) and `promote.rs::rollback` (reservation rollback; never dereferences `ptr`).
+
+Two invariants hold the unmap-class set sound, and both were re-verified by a static audit (see the parent report on the `compile:file/2` SIGSEGV):
+- **The from-set covers the whole chain, always.** `Nursery::spaces()` is `retired.iter().chain(once(&current))` and `add_to_from_set` adds every one of them; `retired`/`retired_regions`/`empty_retired` have exactly one insertion point (`install`) and one removal (`readopt_retired`), plus the two clears in `install_collapsed`, so there is no out-of-sync state.
+  `Copier::classify_boxed`/`classify_cons` answer `Target::Foreign` only when `!from.contains(ptr)`, and `FromSet::locate` is the single range-geometry interpreter shared with `live.rs`/`reachable.rs` — so a retired-space pointer is **never** skipped.
+- **`Nursery::install`'s `old.used_words() == 0` emptiness decision is exact.** `used_words` is the bump offset (`Heap::used()`), and the only `reset` that can zero it while words are live is `install_collapsed`'s, which runs *after* the round evacuated that same space and cleared the chain — so a space re-adopted by `readopt_retired` genuinely holds no word. (A `reset` while words were still reachable would be a *recycling* bug, and the re-adopted space is never unmapped.)
+
+Consequence: `beam_gc` cannot itself be the cause of an unmap-class dangling pointer **given a complete root slice** — the enforcement gap is the seam, not the copy. Every collection door takes a bare `&mut [Eterm]` (`collector.rs:258,297,332,383,497`, `immix_collector.rs:337,386,406,425,447`, forwarded by `any_collector.rs:270,296,308,316,332`) and none can verify completeness; a host that collects while its machine's live x-registers/stack/FR are unpublished frees exactly the words those roots name.
+
 ## Known Gaps (collector-internal)
 - **The mark-region strategy is reachable in production; the DEFAULT remains the copying `Collector`.**
   `beam_process::Process` owns an `AnyCollector` built from the spawn policy, and `beam_rt` drives it at its heap-admission point (`src/context/gc.rs::{ensure_heap, ensure_heap_full}`), reading the mature generation through `mature_contains` (the unscanned-root valve) and `mature_used_words` (the memory hook).
