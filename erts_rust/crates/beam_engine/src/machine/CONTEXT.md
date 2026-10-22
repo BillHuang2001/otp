@@ -324,6 +324,59 @@ Moved verbatim from the crate `CONTEXT.md` (which keeps the contract and a point
 - **Module contexts (`context.rs`).** A `call_ext*` the host resolved through `resolve_external_call` executes the callee **in this machine**, so `(func, pc)` are indices into *another* module's table and the machine must remember which. `Contexts` registers/dedups a `ModuleContext { module: Arc<Module>, labels }` by `Arc::ptr_eq` (context `0` is the run's **entry** module, which the machine never owns -- `entry_literals` records its literal area). `switch_context(id)` re-binds `literals` and an unregistered id is the typed `error::unsupported`. `reset` clears the set; a **resume does not** (a suspended cross-module frame must still name its module).
 - **Introspection (read-only).** `x(n)`/`get_fr(n)`/`fr_mark()`/`y(k)`/`frame_depth()`/`stack_depth()`/`catch_frame_depth()`/`pending_exception()`/`pending_exception_mut()`/`pending_class()`/`resumption_addresses()`/`resumption_contexts()`/`raise_snapshot()`/`wait_deadline()`/`reductions()`/`reset_reductions()`, plus the execution-position accessors (`current_code`/`entry_call`/`current_function`/`initial_call`/`current_location`/`current_stacktrace`/`current_module`, the engine half of `process_info/2`). Per-file roles: `src/machine/CONTEXT.md`.
 
+## Rooting audit: what this node holds outside the frozen `RootSet`
+
+The complete inventory of `Eterm`-typed state on `Machine`, and its rooting status. Anything
+**not** in `x`/`fr`/`stack` is a "loose" term and is only safe if it is parked by
+`with_roots` or provably never live across an allocation.
+- **The three parked loose terms** (`mod.rs:887-893`, `LOOSE_HEAP_TERMS = 3`):
+  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception`'s reason.
+  `with_parked_loose_terms` (`mod.rs:903-929`) pushes them at the stack tail **before** the hand-off,
+  hands over the `RootSet`, reads each field back from its slot (`:923`) and `truncate`s (`:927`) —
+  unconditionally, so an `Err` out of the closure re-seats too (there is no `?` between the push and
+  the truncate). `seat_loose_heap_terms` (`:938-948`) leaves a field untouched on a `None` read-back.
+- **The two supplied-term latches** (`pending_supplied_term` `mod.rs:426`, `raise_supplied_term`
+  `:461`) are deliberately **not** parked: `Machine::raise_supplied` (`catch.rs:649-661`) arms one and
+  `throw_with_trace` (`catch.rs:450`) promotes it with **no allocation in between**, and the
+  promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
+- **`args_scratch` (`mod.rs:527`) is the one term vector that is not a root** — `mem::take`n out of the
+  machine for the whole wide dispatch (`interpreter/bif.rs:175/185`) and for `trace_call`
+  (`interpreter/trace.rs:186/211`), hence invisible to `for_each_root` (documented `mod.rs:974-978`)
+  and to `with_roots`. It cannot dangle **today** only because `Machine::dispatch_bif_call`
+  (`interpreter/bif.rs:324-338`) takes `&self` while every admission door (`ensure_heap_full`,
+  `alloc_words_rooted`) takes `&mut self`, so the borrow checker forbids a collection in the window;
+  and `alloc_words` — the only door a BIF can legally reach — never moves a `beam_rt` heap. Adding a
+  fourth loose entry in `loose_heap_terms` (with `LOOSE_HEAP_TERMS = 4`) is the durable fix if a
+  BIF-invoked seam ever gains a collection point.
+- **`class_atoms: [Eterm; 3]`** (`mod.rs:233`) are atom **immediates** — no rooting needed.
+- **Nothing else stores a heap word**: `frames`/`catch_frames` (CP slots are `Continuation::Address{context,func,pc}`
+  / `Halt`), `raise_snapshot` and `resumption_addresses`/`resumption_contexts` (`(u32,u32,u32)`),
+  `contexts`/`ModuleContext` (`Arc<Module>` + `Arc<LabelMap>`, `context.rs:67-90`),
+  `label_maps` (`Digest` + `AtomSnapshot` + address keys, `label_cache.rs`), `local_callees`
+  (`CalleeKey`/`CalleeTarget`, `local_callee.rs`), and the literal binding
+  (`literals`/`entry_literals` = the load-time area, a separate never-collected heap). `RunOutcome`
+  carries only `Eterm` (a returned value) plus `u32` addresses, so a park/resume window holds no term
+  outside the registers/stack/FR file.
+- **The x/FR files' bounded-refill witnesses** (`registers.rs:290-361`, `used_extent`): `set_x`/`set_fr`
+  raise the mark, `x_mut`/`fr_mut` and a root hand-off note the extent they hand out, the native driver
+  notes the artifact's `native_write_extent` **before** the block runs (`jit/baseline/mod.rs:696-702`,
+  re-declared before an in-block transfer, `jit/baseline/runtime.rs:1708`/`:1728-1737`), and
+  `mark_regs_escaped` is the wide fallback. The invariant "every slot >= `max(mark, dirty)` is `NIL`"
+  therefore holds, so a stale register cannot survive a `reset`.
+- **`refc_binaries` / `writable_payloads`** are pruned only by `retain_refc_binaries`
+  (`offheap.rs:126-144`): `Vec::retain` never moves a payload, so a retained `BinRef.val` stays valid,
+  and the writable registry is pruned in the same call. The predicate's soundness is the **caller's**
+  assertion (a false reject frees a payload a live term names) — the engine cannot verify it.
+- **Cross-node hazard, not this node's to fix:** a host that publishes the machine's roots into a
+  process `Registers`, collects, and then re-publishes from `Machine::with_roots` again will overwrite
+  the relocated words with pre-collection ones (the engine's `with_roots` re-derives from `self.x`/
+  `self.stack`, which no collection has touched while the machine is parked). Any such sequence must
+  `resync` from the process root set first — see `beam_rt`'s `resync_parked_roots`
+  (`src/context/runtime_context.rs:490-523`) and the park/publish/resume protocol in
+  `src/runner/CONTEXT.md`. Likewise, a `resync` that declines for a slice-length mismatch halts the
+  process's future collections but has already re-seated the machine's loose terms from
+  unpublished slots.
+
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction_with_entry`, also the JIT deopt
   target).
