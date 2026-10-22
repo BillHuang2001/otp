@@ -166,7 +166,11 @@ fn a_live_value_in_a_retired_region_is_retained_while_a_dead_one_is_dropped() {
     );
     assert_eq!(
         stats.store_compactions, 0,
-        "Phase 1a moves no word: a region is dropped whole, never compacted"
+        "six candidate words are below the move's threshold, so no compaction is attempted"
+    );
+    assert_eq!(
+        stats.store_move_declines, 0,
+        "below the threshold the move is *skipped*, not declined"
     );
     assert_eq!(stats.reclaim_declines, 0, "the pass did not decline");
     // The live cell is still at its own address, unchanged — read back through the region scan.
@@ -477,4 +481,186 @@ fn the_current_region_is_reset_to_the_windows_mark_and_a_rooted_word_blocks_it()
         stats.store_words_reclaimed,
         "nothing more was reclaimed"
     );
+}
+
+// ---- the store **move** (Phase 1b): the interleaved shape ------------------------------------
+
+/// Fills the store's current region with dead cons cells until it holds at least `used` words (or
+/// has no room for another cell) — the dead filler that makes a region *partially* live.
+fn fill_with_dead_until(rt: &mut Runtime, used: usize) {
+    while rt.eval_heap.used() < used && rt.eval_heap.available() >= 2 {
+        cons_junk(rt);
+    }
+}
+
+/// Builds one **partially live** region: a live 3-element tuple, then dead filler, then a growth
+/// that retires the region. Answers the live value.
+///
+/// This is the shape the move exists for: the value is reachable from a caller slot, so the region
+/// holding it can never be dropped whole, and one live word therefore pins every dead word beside
+/// it.
+fn build_partially_live_region(rt: &mut Runtime, tag: i64, fill_to: usize) -> Eterm {
+    let value = rt
+        .eval_heap
+        .tuple(&[
+            beam_term::make_small(tag),
+            beam_term::make_small(tag + 1),
+            beam_term::make_small(tag + 2),
+        ])
+        .expect("the store serves one 3-element tuple");
+    fill_with_dead_until(rt, fill_to);
+    retire_current_region(rt);
+    value
+}
+
+/// A live value's current address and its words, read back through the region scan.
+fn readback(rt: &mut Runtime, value: Eterm, count: usize) -> (usize, Vec<Eterm>) {
+    let address = beam_term::tuple::tuple_val(value) as usize;
+    let words = read_words_at(rt, address, count).expect("the live value is in a live region");
+    (address, words)
+}
+
+/// A pass at the exit site that hands the move a real corpus.
+///
+/// `value_roots` is the *whole-region* action's corpus (a copy); the move forwards `slots`
+/// instead, which is why a caller hands both over.
+fn move_pass(rt: &mut Runtime, value_roots: &[Eterm], slots: &mut MoveSlots<'_>) {
+    pass(
+        rt,
+        PassInput {
+            site: Site::Exit,
+            window: open_window(),
+            value_roots,
+            withheld: None,
+        },
+        slots,
+    );
+}
+
+#[test]
+fn the_move_collapses_several_partially_live_regions_into_one_and_every_value_reads_back() {
+    let mut rt = small_runtime();
+    open(&mut rt);
+    // Three regions, each retaining one live value and therefore held whole by the whole-region
+    // action — the interleaved shape.
+    let mut a = build_partially_live_region(&mut rt, 10, 500);
+    let mut b = build_partially_live_region(&mut rt, 20, 500);
+    let mut c = build_partially_live_region(&mut rt, 30, 500);
+    assert_eq!(rt.eval_heap_retired.len(), 3, "three regions were retired");
+    let (address_a, words_a) = readback(&mut rt, a, 4);
+    let (address_b, words_b) = readback(&mut rt, b, 4);
+    let (address_c, words_c) = readback(&mut rt, c, 4);
+    assert_ne!(address_a, address_b, "each value stands in its own region");
+
+    move_pass(
+        &mut rt,
+        &[],
+        &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
+    );
+
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(stats.store_compactions, 1, "the move fired exactly once");
+    assert_eq!(stats.store_move_declines, 0, "and declined nothing");
+    assert_eq!(
+        rt.eval_heap_retired.len(),
+        0,
+        "every source region was dropped, so the three regions are one"
+    );
+    assert_eq!(stats.store_regions_dropped, 4, "three retired + the emptied one");
+    assert!(stats.store_words_reclaimed > 1000, "the dead filler was reclaimed");
+
+    // Every retained value moved, and reads back word-for-word at its new address.
+    for (tag, value, (old_address, old_words)) in [
+        (10_i64, a, (address_a, words_a)),
+        (20, b, (address_b, words_b)),
+        (30, c, (address_c, words_c)),
+    ] {
+        let (new_address, new_words) = readback(&mut rt, value, 4);
+        assert_ne!(new_address, old_address, "value {tag} moved");
+        assert_eq!(
+            new_words, old_words,
+            "value {tag} is byte-for-byte identical at its new address"
+        );
+    }
+
+    // ---- the same value pinned across a SECOND move ---------------------------------------
+    let (address_a_first, words_a_first) = readback(&mut rt, a, 4);
+    let mut second: Vec<Eterm> = (0..6)
+        .map(|k| build_partially_live_region(&mut rt, 100 + k, 500))
+        .collect();
+    let mut slot_list: Vec<&mut Eterm> = Vec::with_capacity(second.len() + 1);
+    slot_list.push(&mut a);
+    slot_list.extend(second.iter_mut());
+    move_pass(&mut rt, &[], &mut MoveSlots::new(slot_list));
+
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(stats.store_compactions, 2, "the move fired a second time");
+    let (address_a_second, words_a_second) = readback(&mut rt, a, 4);
+    assert_ne!(
+        address_a_second, address_a_first,
+        "the value pinned across both moves moved with the first move's destination"
+    );
+    assert_eq!(
+        words_a_second, words_a_first,
+        "and is still byte-for-byte identical after the second move"
+    );
+    for value in &second {
+        let (address, _) = readback(&mut rt, *value, 4);
+        assert!(
+            address != 0,
+            "every value built for the second move is readable afterwards"
+        );
+    }
+}
+
+#[test]
+fn the_move_off_leaves_a_partially_live_region_whole_and_the_move_on_collapses_it() {
+    /// Builds the interleaved shape and answers (retired regions before, after; the stats).
+    fn run(store_move: bool) -> (usize, usize, RegionReclaimStats) {
+        let mut rt = small_runtime();
+        rt.set_region_reclaim_enabled(RegionReclaimConfig {
+            store_move,
+            ..RegionReclaimConfig::default()
+        });
+        open(&mut rt);
+        let mut a = build_partially_live_region(&mut rt, 10, 500);
+        let mut b = build_partially_live_region(&mut rt, 20, 500);
+        let mut c = build_partially_live_region(&mut rt, 30, 500);
+        let before = rt.eval_heap_retired.len();
+        // The whole-region action roots itself in `value_roots`, so a move-off run must name
+        // its values there or their regions are dropped as dead.
+        let roots = vec![a, b, c];
+        move_pass(
+            &mut rt,
+            &roots,
+            &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
+        );
+        let stats = rt.region_reclaim_stats();
+        // Every value must still read back either way — the A/B differs in *where*, not in
+        // whether the runtime's values survive.
+        for value in [a, b, c] {
+            let (_, words) = readback(&mut rt, value, 4);
+            assert_eq!(words.len(), 4, "the value is unchanged");
+        }
+        (before, rt.eval_heap_retired.len(), stats)
+    }
+
+    let (before, after, stats) = run(false);
+    assert_eq!(before, 3, "three partially live regions");
+    assert_eq!(
+        after, 3,
+        "with the move off, one live word pins each region and every one is retained whole"
+    );
+    assert_eq!(stats.store_compactions, 0, "no region was compacted");
+    assert_eq!(stats.store_move_declines, 1, "the move was refused");
+    assert_eq!(
+        stats.store_move_last_decline,
+        Some("the store move switch is off")
+    );
+
+    let (before, after, stats) = run(true);
+    assert_eq!(before, 3, "the same shape");
+    assert_eq!(after, 0, "with the move on, the three regions collapse into one");
+    assert_eq!(stats.store_compactions, 1, "one compaction");
+    assert_eq!(stats.store_move_declines, 0, "and no refusal");
 }
