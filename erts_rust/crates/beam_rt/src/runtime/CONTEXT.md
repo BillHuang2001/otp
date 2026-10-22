@@ -275,13 +275,15 @@ Release build, `BEAM_RT_MEM_TRACE=1`, tree OTP-30 bootstrap compiler first on th
 
 | workload | pass | peak `VmHWM` | wall |
 |---|---|---|---|
-| `inet_parse` (1 statement) | on / off | 8 500 840 / 8 501 792 kB | 17.1 / 17.2 s |
-| `inet_parse` (**2 statements**) | on | **13 732 260 kB** | 33.4 s |
-| `inet_parse` (**2 statements**) | off | **16 778 772 kB** | 33.3 s |
-| `cerl_clauses` (1 statement) | on / off | 398 952 / 398 912 kB | 1.1 / 1.0 s |
-| `cerl_clauses` (**2 statements**) | on / off | 549 032 / 583 264 kB | 1.6 / 1.6 s |
+| bare `-eval 'halt(0).'` | on / off | 118 776 / 118 596 kB | 0.5 / 0.5 s |
+| `inet_parse` (1 statement) | on / off | 8 197 644 / 8 195 536 kB | 17.2 / 17.2 s |
+| `inet_parse` (**2 statements**) | on | **13 109 804 kB** | 33.3 s |
+| `inet_parse` (**2 statements**) | off | **16 175 512 kB** | 33.3 s |
+| `cerl_clauses` (1 statement) | on / off | 382 688 / 382 484 kB | 0.9 / 1.1 s |
+| `cerl_clauses` (**2 statements**) | on / off | 520 312 / 554 088 kB | 1.4 / 1.5 s |
 
-So the pass is worth **−3.05 GB (−18.2 %)** on the two-statement `inet_parse` run and **−34 MB (−5.9 %)** on `cerl_clauses`, and **nothing measurable** on either single statement — exactly what the two-site design implies.
+The `off` column is [`BEAM_RT_REGION_RECLAIM=off`] on the same binary; the bare-boot line is against the pre-pass build (`118 596 kB`), so its `+0.2 %` is noise. Three separate 1-statement `inet_parse` runs read `8 195 536` / `8 195 764` / `8 197 644 kB`, i.e. this figure is stable to 0.05 % and a **disagreement of a few hundred MB between two runs of the same commit is a property of the host, not of the pass** — re-measure rather than trust a lone figure.
+So the pass is worth **−3.07 GB (−19.0 %)** on the two-statement `inet_parse` run and **−33.8 MB (−6.1 %)** on `cerl_clauses`, and **nothing measurable** on a single statement — exactly what the two-site design implies.
 The win is the **arena rewind**, not the store: on the two-statement run `arena_reclaims=1`, `arena_words_reclaimed=1 328 160 655`, `arena_regions_dropped=11` (`inet_parse`) / `5 166 170` and `3` (`cerl_clauses`), while `store_compactions=0` and `store_regions_dropped=0` — the store chain stays **additive** there (`eval_heap_retired_regions` **41** with the pass on against **40** with it off: the refused move keeps its own destination region on top of every source).
 On the **single-statement** run the whole-region half does its work: `store_words_reclaimed=636 749 301`, `store_regions_dropped=19`, `eval_heap_retired_regions` **20 → 1** with the pass on (the earlier system-OTP-29 route read 19 → 1 with `603 193 147` / 18); the survivor is the 16 777 216-word retired region whose live words a move would have had to evacuate, plus the current region.
 Residual, stated honestly: the two-statement run ends with **one more** retired region than the pass-off run, because a refused move retains its destination. A run retains a region for one of two measured reasons — `R_PIN` on the single-statement route, `R_VERIFY_HIT` on the two-statement one — never because a move quietly dropped nothing.
