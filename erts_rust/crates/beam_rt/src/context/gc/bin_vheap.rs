@@ -146,20 +146,27 @@
 //!
 //! # What the unit suite can and cannot construct (read before "fixing" a case)
 //!
-//! A machine driven **outside** the runner's armed latch (`RuntimeContext::for_process`, which is
-//! what a unit-level fixture has) routes every allocation to the runtime's pointer-stable arena:
-//! measured, `process.heap_used_words()` is `0` after `ogcbuild:build/2` runs, and the returned
-//! tuple — with the `[BinRef][ErlSubBits]` pair inside it — is classified
-//! [`WordRegion::Foreign`](super::WordRegion). So the *fixture's own* returned term is a decline,
-//! not a retention (see `a_live_term_the_collector_cannot_scan_declines_the_prune`), and the
-//! original reading of this module's positive case — "the returned `{Sum, <<7:…>>}` is what the
-//! prune retains" — was simply false in this harness. The two positive halves are therefore pinned
-//! by roots the suite installs itself: an empty register file + stack for the **release**
-//! (`a_prune_with_clean_roots_releases_every_payload_nothing_reaches`) and an on-heap
+//! A machine driven **outside** the runner's armed latch — a nested run, which is what a unit-level
+//! fixture is (`RuntimeContext::for_process`) — allocates exactly like an armed slice: the unarmed
+//! rooted seam delegates to the unrooted one, so the blocks it builds land on the process's **own
+//! scanned young heap**, and the pointer-stable arena is a **refusal-only** fallback (the rule is
+//! this node's `CONTEXT.md`, *A young-space replacement needs a complete root set …*). Measured,
+//! `process.heap_used_words()` is non-zero after `ogcbuild:build/2` runs and the returned tuple —
+//! with the `[BinRef][ErlSubBits]` pair inside it — is classified
+//! [`WordRegion::Scanned`](super::WordRegion), so the *fixture's own* returned term is a
+//! **retention**.
+//!
+//! A decline therefore has to be **constructed**, and the suite builds it: the
+//! `[BinRef][ErlSubBits]` pair `a_live_term_the_collector_cannot_scan_declines_the_prune` installs
+//! as the sole root is written into the runtime's **pointer-stable arena** — the region
+//! [`Runtime::alloc_words`] serves and no collector scans — while the process's own young heap is
+//! live beside it. That coexistence *is* the hazard. The suite pins every half with roots it
+//! installs itself: an empty register file + stack for the **release**
+//! (`a_prune_with_clean_roots_releases_every_payload_nothing_reaches`), an on-heap
 //! `[BinRef][ErlSubBits]` pair written on the **process's own** young heap for the **retention**
-//! (`a_payload_a_scanned_root_reaches_is_retained`). Two declines are pinned as well — the foreign
-//! *root* and the foreign *child of a scanned root*, the latter asserting that the collection valve
-//! passes exactly what the prune refuses.
+//! (`a_payload_a_scanned_root_reaches_is_retained`), the arena pair for the foreign *root*, and a
+//! foreign *child of a scanned root* (`a_foreign_child_of_a_scanned_root_declines_the_prune`) to
+//! assert that the collection valve passes exactly what the prune refuses.
 //!
 //! What is still owed is the **end-to-end** witness: a real `.beam` run through the real scheduler,
 //! where the machine's live terms really are on the process heap and the park arm publishes them,
@@ -657,13 +664,10 @@ build(N, Size, Sum) ->
     /// plus the returned one in its reservoir. **Nothing is published**: each case below installs
     /// the root set it wants to reason about.
     ///
-    /// The machine's own register file is deliberately *not* used as a positive root set here. A
-    /// machine driven outside the runner's armed latch routes every allocation to the runtime's
-    /// pointer-stable arena (measured: `process.heap_used_words()` is `0` after the run), so the
-    /// returned tuple — and the `[BinRef][ErlSubBits]` pair inside it — lands in a region the
-    /// process collector never scans. That is precisely the shape the prune's own valve declines
-    /// (see the module docs and `a_live_term_the_collector_cannot_scan_declines_the_prune`), and it
-    /// is why the positive release/retain cases install their roots by hand.
+    /// The machine's own register file is deliberately *not* treated as a root set here. The run is
+    /// a nested one (`RuntimeContext::for_process`, no armed latch), so its blocks land on the
+    /// process's **scanned** young heap (see the module docs), and publishing them would make every
+    /// case a *retention* case. A decline has to be built from a root the suite places itself.
     fn machine_that_built_payloads(
         rt: &mut Runtime,
         table: &mut ProcessTable,
@@ -701,20 +705,7 @@ build(N, Size, Sum) ->
         machine
     }
 
-    /// Publishes the machine's **whole** root set into `pid`, exactly as the park arm does
-    /// (`RootSet::ALL_LIVE`, no FR words).
-    fn publish_machine_roots(machine: &mut Machine, table: &mut ProcessTable, pid: ProcessId) {
-        let process = table.get_mut(pid).expect("the process");
-        machine.with_roots(beam_engine::context::RootSet::ALL_LIVE, |roots| {
-            assert!(
-                super::super::publish_roots_full(process, &roots, 0),
-                "the machine's root set publishes into the process"
-            );
-        });
-    }
-
-    /// Parks a machine that holds **nothing**: an empty register file, an empty stack and no FR
-    /// word — the root set of a slice that returned an immediate. No root word is pointer-bearing,
+    /// Parks a machine that holds **nothing**: an empty register file, an empty stack and no FR    /// word — the root set of a slice that returned an immediate. No root word is pointer-bearing,
     /// so neither valve can see a payload through them and the prune is free to reason about the
     /// reservoir alone.
     fn publish_empty_roots(table: &mut ProcessTable, pid: ProcessId) {
@@ -780,13 +771,56 @@ build(N, Size, Sum) ->
         }
     }
 
-    /// **(ii), pinned — the cause of the original failure.** The machine's returned tuple is live
-    /// and named by the parked register file, yet it lives in a region the process collector does
-    /// not scan, so the collector's own reachability walk — the one [`reclaim`] leans on — reports
-    /// none of the payloads those roots name. The collection valve passes it (its hazard test is
-    /// "forwards a word a relocation would move", and `BinRef.val` names an **off-heap** payload no
-    /// collection moves); the prune's own valve declines it.
+    /// Writes the same `[BinRef][ErlSubBits]` pair into the runtime's **pointer-stable arena** — the
+    /// region [`Runtime::alloc_words`] serves and no collector ever scans — and returns the tagged
+    /// root (the `ErlSubBits`).
+    ///
+    /// This is the decline fixture's control. The arena is the one region a live `BinRef` pair can
+    /// stand in at unit level *while the process's own young heap is live* (the run these cases
+    /// share builds on the process heap, see
+    /// `a_live_term_the_collector_cannot_scan_declines_the_prune`), and it is precisely the fallback
+    /// seam's own region, so the shape is the runtime's rather than a test artefact.
+    ///
+    /// # Safety
+    ///
+    /// `data_ptr` must be a live, word-aligned payload of `len` bytes that outlives the returned
+    /// term — here the machine's reservoir owns it, and the prune never moves a payload.
+    #[allow(unsafe_code)]
+    unsafe fn pair_on_the_arena(rt: &mut Runtime, data_ptr: *mut u8, len: usize) -> Eterm {
+        // SAFETY: the caller keeps the payload alive for the returned term's lifetime and
+        // `data_ptr` is word-aligned (`beam_alloc` hands out `base + HEADER_SIZE`, a unit), so
+        // `write_refc_binary`'s flag-bit assert holds. The arena hands out exclusively-owned,
+        // writable words that are **never freed and never moved** (no region of it has a release
+        // path), so the 8-word pair stays live and addressable for as long as the root is used —
+        // and it lies outside every region the process collector relocates, which is the point.
+        unsafe {
+            let hp = rt
+                .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+                .expect("the arena serves an 8-word block");
+            beam_term::refc::write_refc_binary(
+                hp,
+                data_ptr as *mut Eterm,
+                core::ptr::null_mut(),
+                data_ptr,
+                0,
+                len * 8,
+            )
+        }
+    }
+
+    /// **The foreign-root decline.** A live `[BinRef][ErlSubBits]` pair standing in a region the
+    /// process collector does not scan, installed as the process's **only** root, so the
+    /// collector's own reachability walk — the one [`reclaim`] leans on — reports none of the
+    /// payload that root names. The collection valve passes it (its hazard test is "forwards a word
+    /// a relocation would move", and `BinRef.val` names an **off-heap** payload no collection
+    /// moves); the prune's own valve declines it.
+    ///
+    /// The premise is **constructed**: the shared run is a nested one and builds its blocks on the
+    /// process's scanned young heap, so this case has a live heap *and* a root stored outside it —
+    /// the exact coexistence in which a collection relocates children out from under a container,
+    /// and in which freeing a payload the walk cannot see is a dangling pointer.
     #[test]
+    #[allow(unsafe_code)]
     fn a_live_term_the_collector_cannot_scan_declines_the_prune() {
         let mut rt = runtime();
         let mut table = table();
@@ -796,42 +830,47 @@ build(N, Size, Sum) ->
             return; // the loud skip above
         }
         let before = machine.refc_binaries().len();
-        // (a) the residual x file after `run_export_outcome`: the machine still names live terms.
-        let x_words: Vec<Eterm> = machine
-            .with_roots(beam_engine::context::RootSet::ALL_LIVE, |roots| roots.x.to_vec());
-        let process = table.get(pid).expect("the process");
-        // (c) the process heap is untouched: this harness never allocates on it.
-        assert_eq!(
-            process.heap_used_words(),
-            0,
-            "a machine driven outside the runner's armed latch allocates on the pointer-stable \
-             arena, not on the process heap"
-        );
-        // (b) at least one root word is a live container *outside* every scanned region.
-        let unscanned: Vec<Eterm> = x_words
+        // A payload the loop discarded: the reservoir's handle alone does not make it reachable, so
+        // the pair below is what names it — and the walk must still not report it.
+        let (data_ptr, len) = machine
+            .refc_binaries()
             .iter()
-            .copied()
-            .filter(|word| {
-                super::super::word_region_exactly(process, *word)
-                    == Some(super::super::WordRegion::Foreign)
-            })
-            .collect();
+            .find(|binary| binary.as_bytes().iter().all(|byte| *byte == 0))
+            .map(|binary| (binary.data_ptr(), binary.as_bytes().len()))
+            .expect("a discarded loop payload is in the reservoir");
+        // (a) the live pair, deliberately outside every region the collector scans.
+        let root = {
+            // SAFETY: the reservoir owns `data_ptr` for the whole case and never moves it.
+            unsafe { pair_on_the_arena(&mut rt, data_ptr, len) }
+        };
+        let process = table.get(pid).expect("the process");
+        // (b) the process young heap IS live here: the nested run built the fixture's returned tuple
+        // (and the copy-outs) on it, so this case carries the crash shape — a live heap *plus* a
+        // root the collector never reaches — rather than a vacant one.
         assert!(
-            !unscanned.is_empty(),
-            "the fixture's returned term must be in a region the collector does not scan"
+            process.heap_used_words() > 0,
+            "the nested run builds on the process's scanned young heap, so this fixture has a live \
+             heap beside its foreign root"
         );
-        for word in &unscanned {
+        // (c) the root word, and the pair's **storage** under it, are outside every scanned region.
+        assert_eq!(
+            super::super::word_region_exactly(process, root),
+            Some(super::super::WordRegion::Foreign),
+            "the root must be a container in a region the collector does not scan"
+        );
+        let sub_bits = beam_term::list::ptr_val(root) as usize;
+        let bin_ref = sub_bits - beam_term::refc::bin_ref_size_words() * size_of::<Eterm>();
+        for storage in [sub_bits, bin_ref] {
             assert!(
-                super::super::outside_scanned_exactly(
-                    process.collector(),
-                    beam_term::list::ptr_val(*word) as usize
-                ),
-                "the exact per-region test agrees: no scanned region contains it"
+                super::super::outside_scanned_exactly(process.collector(), storage),
+                "the pair's own words are outside every region the collector relocates, so no \
+                 collection ever visits them"
             );
         }
-        // The park, verbatim: the machine's whole root set into the process.
-        publish_machine_roots(&mut machine, &mut table, pid);
+        // The constructed pair is the process's **only** root (the stack is cleared, x holds it).
+        root_in_registers(&mut table, pid, &[root]);
         let roots = gathered_roots(&table, pid);
+        assert_eq!(roots, vec![root], "the constructed root is the whole root set");
         let process = table.get(pid).expect("the process");
         // The collection valve passes these roots...
         let collection = super::super::valve_verdict(
@@ -871,8 +910,7 @@ build(N, Size, Sum) ->
         );
     }
 
-    /// **The positive release path.** With roots that hold nothing (an empty register file, an
-    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
+    /// **The positive release path.** With roots that hold nothing (an empty register file, an    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
     /// nothing survives, and the process's off-heap byte figure is republished as `0`.
     #[test]
     fn a_prune_with_clean_roots_releases_every_payload_nothing_reaches() {

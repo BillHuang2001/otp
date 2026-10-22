@@ -5,7 +5,8 @@
 The destination side of a registered call: where a `beam_bifs` result term is copied to, and what owns the
 memory it lands in.
 It owns the pooled BIF heap and its frontier, the two copy-out destinations (a scheduled process's own scanned
-young heap, or the runtime-lifetime `eval_heap` + `eval_off_heap` store for a table-less route), the learned
+young heap, or the runtime-lifetime `eval_heap` + `eval_off_heap` store for a table-less route — and for a
+scheduled process inside a relocation-exempt window that may not grow its young space), the learned
 `copy_out_hint` gate, and the `ets` table-alias witness that decides whether an aliased result is copied at all.
 The dispatch itself is [`../calls/CONTEXT.md`](../calls/CONTEXT.md)'s; the collection doors are
 [`../gc/CONTEXT.md`](../gc/CONTEXT.md)'s.
@@ -22,7 +23,8 @@ The grown capacity is the pre-growth capacity doubled (`saturating_mul(2)`) **fr
 ### The table-less arm and its store
 `call_registered`'s tail decides the copy-out off `move_container = self.mailbox_table.is_some() || safe_to_rewind` and then calls `calls.rs::rehome_container_result`, which picks the destination by **who is running**:
 * a scheduled process (`mailbox_table.is_some()`) → `move_result_into_process_heap`, an `Ok` container result onto its own **scanned** young heap (bit-for-bit unchanged), **unconditionally**: the pooled BIF heap is a region no process collector scans and a later call's rewind recycles, so a result Erlang code stores inside a heap object — a tuple, a map, a longer list; `compile:debug_info_chunk/1` storing `lists:filter/2`'s result in a tuple — would dangle there;
-* the **table-less** route (`RuntimeContext::new` — the `-eval` evaluator, `-s`/`-run` and every single-pass `run_*` entry, no scheduled process) → `pool.rs::move_result_into_runtime_store`, the result onto the runtime's long-lived store, **only when `safe_to_rewind`**: no process collector exists there and a non-rewindable call never rewinds, so an unconditional move would only duplicate the result into the runtime-lifetime store (measurably exhausting the term-heap arena on a long in-process compile).
+* the **table-less** route (`RuntimeContext::new` — the `-eval` evaluator, `-s`/`-run` and every single-pass `run_*` entry, no scheduled process) → `pool.rs::move_result_into_runtime_store`, the result onto the runtime's long-lived store, **only when `safe_to_rewind`**: no process collector exists there and a non-rewindable call never rewinds, so an unconditional move would only duplicate the result into the runtime-lifetime store (measurably exhausting the term-heap arena on a long in-process compile);
+* a scheduled process **inside a relocation-exempt window** whose young space cannot hold the graph → that same runtime store: the window forbids replacing the space (`../gc.rs::may_replace_young_space`), so `move_result_into_process_heap` grows nothing and **stabilizes** the copy there instead of answering `None` (`refuse ⇒ stabilize, never dangle`), which is what still licenses the call's pool rewind.
 
 **A reference-holding graph is never moved and never rewound** (`RuntimeContext::graph_holds_reference`): a reference's identity is its **address** (the M1 internal reference is a four-word all-immediate block, `Runtime::references` is a `HashMap<Eterm, _>` and `Timers::is_timer_ref` keys on the term word), so a copy would stop being the timer it names, `erlang:cancel_timer/1,2` would answer `badarg`, and `gen_server:cancel_timer/1` would turn that into a `kernel_sup` crash.
 The walk reads only readable terms: a non-term word (`beam_term::tag::is_term_word`), a boxed word that is not a dereferenceable term (`beam_term::boxed::is_boxed_term`) and a null/unaligned pointer (`super::gc::dereferenceable_pointer`, `pub(super)`) are skipped, never dereferenced — `is_boxed`/`is_list` are the C bit tricks and accept bare header words including `THE_NON_VALUE`.
@@ -30,7 +32,7 @@ The walk reads only readable terms: a non-term word (`beam_term::tag::is_term_wo
 **A payload no source table owns does not refuse the move.** `copy_result_fresh`'s own flattening turns an ownerless refc binary into a self-contained on-heap bitstring (byte-faithful) on both routes, so only an unresolvable off-heap container (an MSO reference with no owner) makes the copier refuse — and then the result stays on the pool with the rewind cleared, never a dangling payload.
 
 **Which route rewinds at which granularity.** Both rewind the pooled region with `heap.reset_to(mark)` — `mark` is the call's own frontier, so a pooled region a caller reached part-used still keeps the words that caller owns.
-The rewind is gated on all of `safe_to_rewind` (no escaping `DispatchHooks` arm — `dict`/`process_hook`/`nif_loader`/`send_hook`/`persistent_term`/`runtime_hooks` — and no reentrant fun-applying call), an **`Ok`** result (a raise may carry a live reason term — `beam_common::Raise::live_reason` — that points into this heap) and a move that ran and succeeded (or an immediate result, which is copied nowhere); a failed re-home returns early, leaves the result on the pool and the pool at the call's own offset, grows nothing, and also clears the rewind, because that call's words are still handed out.
+The rewind is gated on all of `safe_to_rewind` (no escaping `DispatchHooks` arm — `dict`/`process_hook`/`nif_loader`/`send_hook`/`persistent_term`/`runtime_hooks` — and no reentrant fun-applying call), an **`Ok`** result (a raise may carry a live reason term — `beam_common::Raise::live_reason` — that points into this heap) and a move that ran and succeeded (or an immediate result, which is copied nowhere); a **permanent** re-home failure (a malformed graph, an unresolvable off-heap container, a store that could not be grown — never a capacity refusal in a window, which stabilizes) returns early, leaves the result on the pool and the pool at the call's own offset, grows nothing, and also clears the rewind, because that call's words are still handed out.
 
 **Why the process-route move is load-bearing.** `selfhost/in_process_compile_file_no_spawn_deterministic` agrees with the oracle; a container result left on the recyclable pool while Erlang code stores it in a heap object would be a dangling boxed argument at the next rewind (`unsupported: external_term` or an `invalid boxed header subtag` abort).
 
@@ -145,7 +147,8 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
 * `calls.rs`'s copy-out half → `copy_result_fresh`/`copy_shortfall_words` (always a fresh, empty
   `beam_message::OffHeapTable` per attempt), `hint_grow_gate` with its `COPY_OUT_HINT_MARGIN_MIN`/
   `COPY_OUT_HINT_MIN_WORDS` constants and `copy_out_hint` (the learned largest refusal), `rehome_container_result`
-  and the two destinations `move_result_into_process_heap`/`move_result_into_runtime_store`, and the three-way
+  and the two destinations `move_result_into_process_heap`/`move_result_into_runtime_store` (the process one
+  stabilizing into the store when a relocation-exempt window forbids the growth), and the three-way
   aliased-result rule.
 * `calls/alias_tests.rs` → the aliased copy-out suite (6 cases).
 * The alias witness's reason for the copy-first ordering: those words are `beam_ets`'s `TermStore`'s (`free` recycles exact-fit runs), and a chunked `select` mixes them with a pool-built `{Objects, Cont}` tuple, so the rewind must not precede the copy.
