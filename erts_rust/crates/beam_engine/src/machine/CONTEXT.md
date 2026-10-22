@@ -266,24 +266,28 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 What the root set is **made of** and what it provably leaves out — the invariants a change to any
 `Eterm`-typed `Machine` field must not silently break.
 - **The term-bearing fields.** The frozen `RootSet` (`x[..used_x_extent]`, the whole `stack`, the whole `fr`),
-  the three **loose** fields the root set cannot carry (`loose_heap_terms`, `mod.rs:887-893`, in the fixed order
-  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception.reason`), and `args_scratch`.
-  Everything else that is `Eterm`-typed is an **immediate-only** file (`class_atoms: [Eterm; 3]`, `mod.rs:233` —
-  atoms; the two `Option<StackTrace>` latches — metadata) or off-heap (`refc_binaries`,
-  `writable_payloads`), which no collection relocates.
-- **Two `Eterm` fields are deliberately OUTSIDE the census.** `pending_supplied_term` (`mod.rs:426`) and
-  `raise_supplied_term` (`mod.rs:461`) hold the cooked `[{M,F,A,Loc}]` trace **term** across a `throw_with_trace`
-  call but never across an allocation: the pair is armed (`catch.rs:445`/`:450`, `:655`) and consumed
-  (`catch.rs:500`, `:583`) inside that one call, which allocates nothing, so no admission point can intervene and
-  the word also rides the handler's `x(2)` (`land_exception`, `catch.rs:630-633`) until the call returns.
-  **A future allocating step between the arm and the consume breaks the root set silently** — either add the two
-  fields to `loose_heap_terms` or keep the arm/consume window allocation-free.
-- **`args_scratch` (`mod.rs:527`) is `mem::take`n out of the machine for the whole wide BIF dispatch**
-  (`interpreter/bif.rs:175`, restored `:185`), so no `with_roots` hand-off can see it, and
-  `Machine::for_each_root` (`mod.rs:987-1010`) deliberately does not enumerate it either. That is sound only
-  because **BIF dispatch cannot collect**: `dispatch_bif_call` is `&self` (`interpreter/bif.rs:324-338`) and the
-  host's GC gate is armed solely by `BudgetContext::ensure_heap`, so `call_bif`/`call_bif_in_machine` re-enter the
-  engine with the heap unmoved. A host that made BIF dispatch a collection door would strand every argument.
+  the five **loose** fields the root set cannot carry (`loose_heap_terms`, `mod.rs:937-945`, in the fixed order
+  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception.reason`,
+  `pending_supplied_term`, `raise_supplied_term`), and `args_scratch`.
+  Everything else that is `Eterm`-typed is an **immediate-only** file (`class_atoms: [Eterm; 3]` — atoms; the
+  two `Option<StackTrace>` latches — metadata) or off-heap (`refc_binaries`, `writable_payloads`), which no
+  collection relocates.
+- **`args_scratch` (`mod.rs:574`) is `mem::take`n out of the machine for the whole wide BIF dispatch**
+  (`interpreter/bif.rs`, restored there; the same shape in `interpreter/trace.rs`), so no `with_roots` hand-off
+  can see it, and `Machine::for_each_root` (`mod.rs:1051-1072`) deliberately does not enumerate it either. That
+  is sound only because the dispatch window **cannot collect**, and the reason is structural rather than a host
+  promise: `dispatch_bif_call` (`interpreter/bif.rs`) takes **`&self`**, while both rooted doors
+  (`alloc_words_rooted`, `ensure_heap_full`) take `&mut self` (the *context*) plus a root set whose slices come
+  from *this* machine — so the borrow checker forbids crossing one while the machine is immutably borrowed, and
+  the only heap door the marshalling itself uses is the non-collecting `alloc_words` (a non-small integer
+  operand). `tests/bif_args_window.rs` pins it: a recording context counts every
+  `alloc_words_rooted`/`ensure_heap_full`/`ensure_heap` crossing over a narrow (`arity 2`) and a wide
+  (`arity 5`) `call_ext` run and requires **zero** (with a `test_heap` fixture as the live-probe control), and
+  the same suite asserts the host is handed exactly `x(0..arity)` on both doors. **Break any of the three legs
+  — `&self` dispatch, no rooted door in the marshalling, a non-collecting `alloc_words` — and the argument
+  words must be rooted** (kept in the machine and enumerated, or parked at the stack tail), never left to the
+  comment. The buffer is reinstated **empty** on every exit path (no `?` between the `take` and the reinstall),
+  pinned by the `bif` unit test beside the wide-marshalling proof.
 - **The hand-off width is `used_x_extent()`/`used_fr_extent()` = `max(mark, dirty)`** (`registers.rs:108-110`),
   never `RootSet::live` (a hint only) — so `live` may be larger than the handed prefix and the slot set is still
   exact. The width is sound only while **every** writer reports: `set_x`/`set_fr` raise the mark
