@@ -226,6 +226,7 @@ Gaps whose owner is another crate, each with the exact API this crate adopts onc
 - `PERF.md` → the measured record (§2 the structural per-shape table + the traversals table, §10 what remains by owner); every figure and repro command lives there, never here
 - `../../erts/emulator/beam/{copy.c,erl_message.h,erl_message.c,erl_node_tables.h,erl_gc.c}` → the authoritative copier, the message envelope/`ErlHeapFragment`/queue layout, `erts_ref_node_entry`/`erts_deref_node_entry` and the MSO/`OffHeap` sweep rule (read-only)
 - `../beam_gc/` → the collector + `MsoHandle`/`RefCount`/`OffHeap` this crate depends on (sibling — read-only, escalate writes to `..`)
+
 ## Notes for Agents
 - **The copier takes the source as a bare `Eterm` and holds NO source-region knowledge.** `copy_struct`/`copy_struct_simple`/`CopyContext::new` accept no base/extent/heap-identity for the source — `CopyContext` has exactly two fields, `src: &OffHeapTable` and `dst: &mut OffHeapTable` (`src/copy.rs:222-225`) — and the walk dereferences whatever the graph says (`src/copy.rs:527-543` for a cons, `:571-573` for a header, `:594-598` for `copy_nonoverlapping`).
   Source-word guards are **tag tests only** (`is_shared` at `src/copy.rs:267-275`, `primary_tag` dispatch at `:527`, the `PrimaryTag::Header` arm at `:614`), so a stale `LIST`/`BOXED`-tagged pointer into a reset/pooled `beam_alloc::Heap` or a `beam_ets::TermStore` passes every one of them.
