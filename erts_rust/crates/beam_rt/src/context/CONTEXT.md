@@ -277,6 +277,21 @@ Ranked suspects (detail in the child nodes; nothing here is a `beam_rt` contract
 2. The supplied-stacktrace term (`Machine::pending_supplied_term`) is a heap **cons list** outside `LOOSE_HEAP_TERMS = 3`, i.e. not parked at a collection — same node.
 3. The runner's park publication omits `ProcessEngine::args`/`ProcessEntry::Fun`/`LocalFunTarget::args`, protected only by the `args_consumed` invariant and the relocation exemption — `../../runner/CONTEXT.md`.
 4. `beam_io`'s flat `DriverContext::input()` and this crate's bin-vheap prune hold no cons cell; a missed `BinRef` would dangle a payload, not a list (`gc/CONTEXT.md`).
+**The two allocation seams' arena fallback is ruled out as the holder.** Measured at HEAD over the
+two-length reproducer (a `SELFHOST_DOCFILE_SOURCE` staged at an absolute path of 55 / 56 / 78
+characters, `run … selfhost_docfile:compile_self/0`), with temporary `env`-gated counters at both
+seams: the route's arena allocations are 359 from `alloc_words` with **no** process table, 285 from
+`alloc_words_rooted` on its `armed == false` branch (the unarmed door — a nested run whose machine
+is not the armed slice machine, so that door neither collects nor bumps a process heap), and exactly
+**one** genuine young-heap refusal — `alloc_words`, a 15-word request against a 233-word young space
+with 10 words free, taken inside a relocation-exempt window. That single refusal is the same at the
+aborting 55 and 78 as at the passing 56, so it is not the discriminator; and lifting the two seams'
+`may_replace_young_space` guards (so that request grows the nursery and the retried bump then
+succeeds, leaving **zero** exempt arena fallbacks) leaves the abort set **unchanged** — 55 and 78
+still abort 3/3 with the same subtags (`0x29` / `0x2a`) and the whole 50..80 × 3 sweep is identical
+to HEAD's. The holder is therefore one of the route's **primary** arena allocations (the 359
+table-less and 285 unarmed ones, which build engine containers in the unscanned arena while the
+process's young heap is live) or one of the ranked suspects above — never the fallback.
 A reader debugging this must not read `RuntimeContext::new`'s `mailbox_table: None` as the crash route: `beam_rt run` drives a **scheduled slice** (`for_process_with_engines`, `mailbox_table: Some`), and only the in-slice **nested** run an in-process `compile:file/2` performs is table-less (`../bridges.rs`).
 ## Where a BIF result's words actually live (the three regions, and who may recycle them)
 A registered BIF builds on the pooled region (`call_registered`'s `take_bif_frontier`, `calls.rs:253`), and the tail either copies the container out (`rehome_container_result`) and rewinds to `mark` (`calls.rs:1052`) or leaves it on the region with `rewind == false` — never both.

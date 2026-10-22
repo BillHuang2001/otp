@@ -1445,8 +1445,12 @@ pub(crate) fn ensure_heap_full(
 /// young-heap words in Rust locals / nested-`Machine` registers that the root set does **not**
 /// publish, so the collapse can free a word this window still names: a growth taken inside the
 /// window buys addressability that a later collection revokes, and the window's own handles are
-/// exactly the ones the collection cannot relocate. That is not a leak but a dangling word, and it
-/// is what the in-process `compile:file/2` route trips deterministically.
+/// exactly the ones the collection cannot relocate. That would be not a leak but a dangling word —
+/// and it is **not** what the in-process `compile:file/2` route trips: every growth site is guarded
+/// at HEAD, and lifting the two allocation seams' guards (so an exempt request grows the nursery
+/// instead of falling through to the arena) leaves that route's abort set **unchanged** (measured;
+/// see this node's `CONTEXT.md` *A term that outlives its heap …*), so the residual's holder is
+/// elsewhere.
 ///
 /// A **published-root** caller (the ordinary scheduled slice, whose roots are the register file the
 /// machine hands in at every admission point) may replace the space freely: the collapse relocates
@@ -1602,10 +1606,10 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///
 /// Like [`alloc_words`]'s, the growth is taken only while the young space may be **replaced**
 /// ([`may_replace_young_space`] — a complete root set). A relocation-exempt process skips it and
-/// continues into the existing valve + arena path below, byte for byte as before; that branch is
-/// unreachable in every measured run of the in-process `compile:file/2` route (the census is
-/// recorded in this node's `CONTEXT.md`), so it is the conservative answer rather than a live
-/// path.
+/// continues into the existing valve + arena path below, byte for byte as before; **this** seam's
+/// refusal is unreachable in every measured run of the in-process `compile:file/2` route (the
+/// census is recorded in this node's `CONTEXT.md` — the unrooted [`alloc_words`] seam *is* reached
+/// there, once per compile), so it is the conservative answer rather than a live path.
 ///
 /// Serving the block from the process's own — reclaimable — heap is what keeps an arena term
 /// out of the machine's registers: the pointer-stable arena is a region the collector does
