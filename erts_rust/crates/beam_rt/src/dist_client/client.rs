@@ -716,9 +716,6 @@ impl DistClient {
     /// length; the iteration order is an implementation detail the visitor must not depend on,
     /// and an empty queue calls `f` zero times. An `Err` from `f` is returned as-is, dropping the
     /// borrow on the way out (nothing here re-enters the cell).
-    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
-    // method is legitimately unused in the meantime (the same allowance `local_identity` carries).
-    #[allow(dead_code)]
     pub(crate) fn for_each_queued_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,

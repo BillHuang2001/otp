@@ -185,10 +185,6 @@ impl PersistentTermStore {
     /// length; the iteration order (the `Vec`'s) and the slicing are implementation details the
     /// visitor must not depend on. An `Err` from `f` still writes the current entry's buffer back
     /// (whatever `f` left in it) and is then returned as-is, so a partial rewrite is never lost.
-    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
-    // method is legitimately unused in the meantime (the same allowance `gc_disabled_reason` and
-    // `local_identity` carry).
-    #[allow(dead_code)]
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,

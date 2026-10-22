@@ -270,9 +270,6 @@ impl GcState {
     /// not depend on. An `Err` from `f` stops at the record that produced it and is returned
     /// as-is. [`GcState::scratch`] is deliberately **not** visited: it is a placeholder fill of
     /// [`NIL`](beam_term::NIL) words, never a term graph, so it is not a root.
-    // The runtime-level `for_each_root_mut` door that consumes this seam lands separately, so the
-    // method is legitimately unused in the meantime (the same allowance `gc_disabled_reason` carries).
-    #[allow(dead_code)]
     pub(crate) fn for_each_pending_completion_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,

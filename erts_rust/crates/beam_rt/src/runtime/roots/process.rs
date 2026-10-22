@@ -70,9 +70,6 @@ use super::RootFamily;
 /// Whatever `f` answers. The words gathered for the family that failed — and, for the families
 /// already visited, everything they had rewritten — are written back first, so a failed walk leaves
 /// every slot in place and loses nothing.
-// Written ahead of its caller: the runtime-level `Runtime::for_each_root_family_mut` traversal
-// that drives this door is a separate change, so until it lands nothing in the crate calls it.
-#[allow(dead_code)]
 pub(crate) trait ProcessRootsMut {
     /// Visits every root family of this process, tagging each slice with the [`RootFamily`] it
     /// belongs to.
@@ -85,9 +82,6 @@ pub(crate) trait ProcessRootsMut {
     ) -> beam_common::Result<()>;
 }
 
-// Written ahead of its caller: the runtime-level `Runtime::for_each_root_family_mut` traversal
-// that drives this door is a separate change, so until it lands nothing in the crate calls it.
-#[allow(dead_code)]
 impl ProcessRootsMut for beam_process::Process {
     fn for_each_root_mut(
         &mut self,
@@ -171,8 +165,6 @@ impl GatheredRoots for beam_process::SignalQueue {
 /// one word never loses it, and the owner's container never keeps a stale word while the error is
 /// on its way out. A family with no words is skipped entirely — no visitor call, nothing to write
 /// back.
-// Written ahead of its caller: see the comment on the `ProcessRootsMut` impl above.
-#[allow(dead_code)]
 fn visit_gathered<K, F>(
     container: &mut K,
     family: RootFamily,
@@ -235,8 +227,6 @@ where
 /// immediate back. The assertion is deliberately **not** weakened — a visitor that stores a young
 /// heap word in `from`/`token` (which the legacy C permits for a heap `token` tuple and a heap
 /// `Info`-tuple `from`) must fail loudly rather than leave a dangling envelope word behind.
-// Written ahead of its caller: see the comment on the `ProcessRootsMut` impl above.
-#[allow(dead_code)]
 fn visit_mailbox<F>(
     process: &mut beam_process::Process,
     f: &mut F,

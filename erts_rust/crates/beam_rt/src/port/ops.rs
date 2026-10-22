@@ -221,9 +221,6 @@ impl PortExtras {
     /// # Errors
     ///
     /// Whatever `f` answers; the walk stops there.
-    // Written ahead of its caller: the runtime-level `for_each_root_mut` door that reaches this
-    // table through the port layer is a separate change, so until it lands nothing calls it.
-    #[allow(dead_code)]
     pub(crate) fn for_each_data_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,

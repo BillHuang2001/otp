@@ -538,10 +538,6 @@ impl RunnerState {
     /// iteration order is an implementation detail the visitor must not depend on. A `f` error
     /// stops the enumeration of this family immediately and is returned (the direct-`&mut`-slice
     /// writes it already made stand); an empty family returns `Ok(())` without calling `f`.
-    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one);
-    // the allowance is what keeps this additive seam from breaking the warning-free build until
-    // that door lands.
-    #[allow(dead_code)]
     pub(crate) fn for_each_engine_args_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
@@ -584,8 +580,6 @@ impl RunnerState {
     /// change; `f` may replace any element. `f`'s error propagates out of
     /// [`Machine::with_roots`](beam_engine::Machine::with_roots) unchanged, so the enumeration of
     /// this family stops there.
-    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one).
-    #[allow(dead_code)]
     pub(crate) fn for_each_parked_machine_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
@@ -620,35 +614,48 @@ impl RunnerState {
         Ok(())
     }
 
-    /// Visits the two **recorded-outcome** maps whose words the value gather deliberately skips
-    /// because they are *stabilized copies*: [`RunnerState::results`] (a finished process's
-    /// `x(0)`) and [`RunnerState::exits`] (a raising process's reason term).
+    /// Visits the **recorded result** map ([`RunnerState::results`]) — a finished process's
+    /// `x(0)` — mutably, one 1-word slice per recorded process.
     ///
-    /// [`RunnerState::gather_off_heap_roots`] leaves them out on purpose — the reclamation prunes
-    /// payload handles by identity and needs no copy of them — but a **rewriting** pass does: both
-    /// maps hold live words that are read again long after the process died
-    /// ([`RunnerState::result`] / [`RunnerState::exit`], and through them the CLI's
+    /// [`RunnerState::gather_off_heap_roots`] leaves this map out on purpose — the reclamation
+    /// prunes payload handles by identity and needs no copy of them — but a **rewriting** pass
+    /// does: the map holds live words that are read again long after the process died
+    /// ([`RunnerState::result`], and through the CLI's
     /// [`Runtime::take_process_error`](crate::runtime::Runtime::take_process_error)), so a region
     /// they name must not move without them.
     ///
-    /// [`RunnerState::errors`] is **deliberately not enumerated here**: it also carries a live
-    /// reason word ([`beam_common::Raise`]'s opaque `live_reason` slot, the `Eterm` payload a
-    /// structured raise records), but [`BeamError`] exposes no mutable term accessor — the slot is
-    /// private to `beam_common` — so reaching it would need a new seam upstream. Recorded here so
-    /// the omission is a known hole rather than an oversight: a relocation must not move a region
-    /// an `errors` entry's live reason names until such an accessor exists.
-    ///
     /// One `f` call per entry (never a `&mut` getter on the map), lengths fixed, order
     /// unspecified. An `f` error stops the enumeration and is returned; an empty map calls nothing.
-    // The consumer is the runtime-level `for_each_root_mut` door (a sibling change to this one).
-    #[allow(dead_code)]
-    pub(crate) fn for_each_recorded_root_mut(
+    pub(crate) fn for_each_result_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
     ) -> beam_common::Result<()> {
         for value in self.results.values_mut() {
             f(core::slice::from_mut(value))?;
         }
+        Ok(())
+    }
+
+    /// Visits the **recorded exit** map ([`RunnerState::exits`]) — a raising process's reason
+    /// term, stabilized the same way as a result — mutably, one 1-word slice per recorded process.
+    ///
+    /// The exact counterpart of [`RunnerState::for_each_result_root_mut`], with the same contract
+    /// and the same reason for existing (the value gather deliberately skips the stabilized copies;
+    /// a rewriting pass must not); [`RunnerState::exit`] reads the words back.
+    ///
+    /// [`RunnerState::errors`] is **deliberately not enumerated** by either of these: it also
+    /// carries a live reason word ([`beam_common::Raise`]'s opaque `live_reason` slot, the `Eterm`
+    /// payload a structured raise records), but [`BeamError`] exposes no mutable term accessor —
+    /// the slot is private to `beam_common` — so reaching it would need a new seam upstream.
+    /// Recorded here so the omission is a known hole rather than an oversight: a relocation must
+    /// not move a region an `errors` entry's live reason names until such an accessor exists.
+    ///
+    /// One `f` call per entry, lengths fixed, order unspecified. An `f` error stops the
+    /// enumeration and is returned; an empty map calls nothing.
+    pub(crate) fn for_each_exit_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
         for value in self.exits.values_mut() {
             f(core::slice::from_mut(value))?;
         }

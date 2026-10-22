@@ -171,10 +171,6 @@ impl SelectPayload {
     ///
     /// Whatever `f` answers; nothing is written back beyond what `f` itself wrote, because the
     /// slice is a direct view of the stored word.
-    // Written ahead of its callers: the runtime-level `for_each_root_mut` door that reaches a
-    // select registration through the port layer is a separate change, so until it lands nothing
-    // calls it.
-    #[allow(dead_code)]
     pub(crate) fn for_each_payload_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
@@ -445,7 +441,6 @@ impl SelectRegistration {
     /// # Errors
     ///
     /// Whatever `f` answers.
-    #[allow(dead_code)] // see `for_each_payload_root_mut` above
     fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
@@ -508,7 +503,6 @@ impl SelectWatch {
     /// # Errors
     ///
     /// Whatever `f` answers; the walk stops there.
-    #[allow(dead_code)] // see `SelectPayload::for_each_payload_root_mut`
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,

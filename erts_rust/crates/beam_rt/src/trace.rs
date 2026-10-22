@@ -565,7 +565,6 @@ impl TraceState {
     ///
     /// Patterns are visited in installation order — which the visitor must not depend on — and
     /// replacement is in place, never a resize.
-    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
     pub(crate) fn for_each_match_spec_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,

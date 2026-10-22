@@ -1016,9 +1016,6 @@ impl PortEvent {
     ///
     /// Whatever `f` answers; nothing is written back beyond what `f` itself wrote, because each
     /// slice is a direct view of the stored word.
-    // Written ahead of its caller: the runtime-level `for_each_root_mut` door that drives this
-    // family is a separate change, so until it lands nothing in the crate calls it.
-    #[allow(dead_code)]
     fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
@@ -3121,10 +3118,6 @@ impl PortRegistry {
 /// slot is [`select::SelectWatch`]'s `by_fd_handle` index — keyed by an address-derived
 /// `handle_key`, so a mover must *recompute* it rather than rewrite it (see
 /// [`select::SelectWatch::for_each_root_mut`]).
-//
-// Written ahead of its caller: the runtime-level `for_each_root_mut` door that calls these three
-// is a separate change, so until it lands nothing in the crate calls them.
-#[allow(dead_code)]
 impl PortRegistry {
     /// Visits every term the **queued/pending port event** family stores, mutably.
     ///

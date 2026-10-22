@@ -256,7 +256,84 @@ Reproduce, from the repo root (`$PWD` is `$ERL_TOP`; the `-pa` flags must be wri
 `BEAM_RT_MEM_TRACE=1 BEAM_RT_ARENA_TRACE=1 erts_rust/target/release/beam_rt -noshell -pa "$PWD/bootstrap/lib/compiler/ebin" -pa "$PWD/bootstrap/lib/kernel/ebin" -pa "$PWD/bootstrap/lib/stdlib/ebin" -eval 'compile:file("'"$PWD"'/lib/kernel/src/inet_parse.erl",[no_spawn_compiler_process,deterministic,no_docs,{outdir,"<tmp>"}])'`
 `BEAM_RT_MEM_TRACE=1 BEAM_RT_ARENA_TRACE=1 erts_rust/target/release/beam_rt -noshell -pa "$PWD/bootstrap/lib/compiler/ebin" -pa "$PWD/bootstrap/lib/kernel/ebin" -pa "$PWD/bootstrap/lib/stdlib/ebin" -eval 'compile:file("'"$PWD"'/lib/compiler/src/cerl_clauses.erl",[no_spawn_compiler_process,deterministic,no_docs,{outdir,"<tmp>"}])'`
 
+## The runtime-level **mutable** root door — `roots.rs`
+`Runtime::for_each_root_family_mut` is the *moving* twin of `Runtime::gather_off_heap_roots` (which only
+answers liveness): it hands a visitor the writable `Eterm` slots of every host-side root family, one
+slice at a time, tagged with a `RootFamily`. `Runtime::for_each_root_mut` is the family-blind form of the
+same walk (a relocation rewrites a word the same way wherever it is stored). Both are `pub(crate)` and
+both answer `beam_common::Result<()>`:
+`for_each_root_mut(&mut self, f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>)` and
+`for_each_root_family_mut(&mut self, f: &mut impl FnMut(RootFamily, &mut [Eterm]) -> beam_common::Result<()>)`.
+It **decides nothing**: nothing in a collection, prune or reclaim path calls it, visiting a word retains
+nothing, and every per-owner enumerator it reaches lives in the owner's own module (`roots/process.rs`
+composes `beam_process`'s `gather_roots`/`scatter_roots` pairs + the mailbox rebuild). Written ahead of
+its consumer: the first caller is the parity test
+`root_tests.rs::the_family_walk_matches_the_value_gather`, so both entry points still carry a
+`#[allow(dead_code)]` (which is also the lint root every enumerator below hangs from).
+
+### Traversal order (fixed) and the value-gather split
+| # | `RootFamily` | owner seam | in `gather_off_heap_roots` |
+|---|---|---|---|
+| 1 | `EvalClosureEnv` | `Runtime::eval_closures` → `Rc::make_mut(body).for_each_root_mut` (clone-on-write; sound only at a non-running site) | yes |
+| 2 | `EvalCompiledCaptures` | `Runtime::eval_compiled` → `CompiledClosure::for_each_root_mut` (a **word copy** of #1) | no |
+| 3 | `SeqTrace` | `SeqTrace::for_each_root_mut` | yes |
+| 4 | `ProcessRegisters` / `ProcessMailbox` / `ProcessDict` / `ProcessSavedArgs` / `ProcessSignals` | every live pid via `ProcessRootsMut::for_each_root_mut` (`roots/process.rs`), in `beam_process`'s canonical collection order | yes |
+| 5 | `MailboxMarker` | `MailboxState::for_each_marker_root_mut` | no |
+| 6 | `PendingSpawn` | `PendingSpawn::for_each_root_mut` (`roots.rs`) — the argument vector, then `ProcessEntry::Fun`'s fun | yes |
+| 7 | `EngineArgs` | `RunnerState::for_each_engine_args_root_mut` | yes |
+| 8 | `ParkedMachine` | `RunnerState::for_each_parked_machine_root_mut` (x registers, stack, FR prefix; `live`-gated) | yes |
+| 9 | `RunnerResult` / `RunnerExit` | `RunnerState::for_each_result_root_mut` / `for_each_exit_root_mut` | no |
+| 10 | `TimerDelivery` | `Timers::for_each_delivery_root_mut` | yes |
+| 11 | `TimerReference` | `Timers::for_each_reference_root_mut` | no |
+| 12 | `PersistentTermEntry` | `PersistentTermStore::for_each_root_mut` | no |
+| 13 | `TraceMatchSpec` | `TraceState::for_each_match_spec_root_mut` | no |
+| 14 | `PortPendingEvent` | `PortRegistry::for_each_pending_event_root_mut` | no |
+| 15 | `PortData` | `PortRegistry::for_each_port_data_root_mut` | no |
+| 16 | `SelectPayload` | `PortRegistry::for_each_select_root_mut` | no |
+| 17 | `DistQueuedMessage` | `DistClient::for_each_queued_root_mut` | no |
+| 18 | `AsyncGcRequestId` | `GcState::for_each_pending_completion_root_mut` | no |
+
+`RootFamily::in_value_gather()` is the machine-checkable record of the last column, and the **documented
+superset** is every `false`: all of them are genuine roots, for one of three reasons — (2) is a second
+*copy* of another family's words (a mover must rewrite both; a prune reaches the payload through the
+original closure); (9) is a stabilized copy that is **read again after the owner died**; (5), (11)–(18) are
+stores the value gather deliberately leaves to another mechanism (markers/`#Ref<>` words name no payload;
+`persistent_term` and trace match specs are stabilized — i.e. flattened — by their writers; the port layer's
+words are stabilized or a driver's own; a dist queue's words live on the client's scratch heap, reset only
+when the queue empties; an async GC request id is an all-immediate reference term) — a *liveness* answer is
+already correct without them, a *moving* answer is not, because the word is stored and read again.
+
+### Visitor contract
+`f` may **replace any element** of a slice; it must **never** change a slice's length, reorder it, or depend
+on any container's hash/iteration order (an unordered owner buffers its words and scatters them back
+positionally). A slice is **one family of one owner**. One owner is borrowed at a time — the two
+`Rc<RefCell<…>>` stores (`persistent_terms`, `ports`) are borrowed for exactly the statement that visits
+them, so a visitor that re-enters them cannot trip a double borrow. An `Err` **aborts the walk** and is
+returned as-is, with the failing owner writing its (possibly half-rewritten) buffer back **first**: the
+container and the error leave together, and families already visited keep their writes.
+
+### Completeness — whole only at a non-running site
+The walk is complete only where nothing is executing: the `-eval` statement boundary and a nested run's
+epilogue. During a scheduler pass `runner_state`, `processes` and the scheduler are moved out of the
+`Runtime`, so the coverage argument and the remaining gap are exactly those `gather_off_heap_roots` states in
+its `# Residuals` section (a **running** machine's root set is published by the in-pass park arm instead,
+`../context/gc.rs::resources::reclaim`).
+
+### Deliberately not enumerated — the relocation checklist's remainder
+Each is reported, not fixed: the `-eval` evaluator's live `Env`/Rust-stack locals (no `&mut` slot exists;
+the whole driver runs under `RuntimeContext::with_relocation_exempt`, `../eval/mod.rs`); the **word-image**
+regions (`eval_heap`, `eval_heap_retired`, `bif_heaps`, `info_heap` — enumerated by
+`for_each_off_heap_region`, whose words must never be dereferenced); `RunnerState::errors` (a live reason
+word inside a `BeamError` with no mutable term accessor — needs an upstream `beam_common` seam); the
+**address-valued** bookkeeping a mover must *re-key*/*recompute* rather than rewrite (`Runtime::references`,
+`Timers::refs`, `TimerWakes::deliver`, `SelectWatch::by_fd_handle` — and the fact behind all four: `Eterm`'s
+`Hash`/`Eq` are the raw word, so every `Eterm`-keyed map is keyed by address); `InMachinePosition` and the
+per-call NIF hosts (`NifHostImpl::envs`, `PendingNifSend`), which exist only inside a callback window; and
+the engine arena (`MinimalContext`/`ContextHeap`) plus the dist/payload scratch `Heap`s — regions owned by
+other crates with no word-range accessor.
+
 ## Routing Table* `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`stabilize_term_with` + their destination off-heap table `eval_off_heap`, `materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, the `file_services` field, and the runtime's own `init`/`erl_prim_loader` process registrations).
+* `roots.rs` (+ `roots/process.rs`) → the **mutable** root door: `RootFamily` (the tag + the `in_value_gather` parity predicate), `Runtime::for_each_root_mut`/`for_each_root_family_mut` (the fixed-order traversal over every host-side root family), `PendingSpawn::for_each_root_mut`, and `ProcessRootsMut` — the extension trait that composes `beam_process`'s `gather_roots`/`scatter_roots` pairs plus the mailbox drain-and-rebuild, so no sibling crate is edited. It is the moving twin of `../runtime.rs`'s `gather_off_heap_roots` and of `for_each_off_heap_region` (word images) — see the section above.
 * `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps; the exact step order is the section above) + the `Runtime::with_port_table` short-borrow seam for port-aware `beam_process` operations.
 * `gc.rs` → `GcState` (the pin/halt/valve sets + the per-pid `foreign` descent latch — a shared `Rc<RefCell<HashSet<ProcessId, FastBuildHasher>>>` cell (`ForeignLatch`) the installed `RuntimeCollectionGate` also holds a clone of; a verdict-only set of internal pids, so it probes with the crate's own `hasher::FastBuildHasher`, not `RandomState`'s SipHash, and its `#[cfg(test)]` `latch_counters` count every probe/insert/fresh insert — plus `walk: WalkScratch`) + `gc_stats`/`GcStatsSnapshot` + `try_stabilize_escaped`/`try_stabilize_escaped_with` + `foreign_reachable`/`note_foreign_reachable`/`walk_scratch`.
 * `ets_owner.rs` → the `ProcessExitObserver` host (`OwnerIndex`/`EtsExitObserver`) + `Runtime::drain_ets_owner_exits`/`drain_port_monitor_exits`.

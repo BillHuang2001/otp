@@ -314,7 +314,6 @@ impl SeqTrace {
     ///
     /// The per-process map's iteration order is an implementation detail the visitor must not
     /// depend on, and a slice's length never changes.
-    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
     pub(crate) fn for_each_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,

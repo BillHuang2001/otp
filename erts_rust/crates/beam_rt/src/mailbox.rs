@@ -406,7 +406,6 @@ impl MailboxState {
     /// **handles**, kept alive by their count rather than by this enumeration.
     ///
     /// Markers are visited in reservation order and no slice length ever changes.
-    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
     pub(crate) fn for_each_marker_root_mut(
         &mut self,
         f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
