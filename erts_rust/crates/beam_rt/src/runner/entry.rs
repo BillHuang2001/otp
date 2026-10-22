@@ -382,18 +382,32 @@ impl RunnerState {
         self.jit_mode.unwrap_or_else(super::tier::env_default)
     }
 
-    /// Whether any process's recorded [`BeamError`] is still on the table
-    /// ([`RunnerState::errors`] is non-empty).
+    /// Visits the live **reason term** of every recorded [`BeamError`]
+    /// ([`RunnerState::errors`]), read-only.
     ///
-    /// A recorded error is the one *unnameable* root family in the runtime: a raise may carry
-    /// [`beam_common::Raise::live_reason`] — a term word — and [`BeamError`] exposes no mutable
-    /// accessor, so a pass that rewinds an arena or drops a store region cannot enumerate it. The
-    /// region-reclaim pass ([`crate::runtime::reclaim`]) therefore **declines** while this answers
-    /// `true`, and the recorded words stay exactly where they were. The condition clears on its own
-    /// when the CLI takes the error ([`RunnerState::take_error`]), which is why the pass is still
-    /// reachable in every ordinary run: the map holds only *finished-and-not-yet-reported* pids.
-    pub(crate) fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
+    /// A raise may carry [`beam_common::Raise::live_reason`] — a term word, structured reasons such
+    /// as `{badkey,K}` — and [`BeamError`] exposes no *mutable* accessor, so this is the only half
+    /// of that family a caller can be handed. It is enough for a **liveness** question: the word is
+    /// a real term, so a reachability descent may push it into its root set and then retain every
+    /// region it names ([`crate::runtime::reclaim`] does exactly that, with
+    /// [`crate::error::live_reason_term`] as the shared reader of the payload convention — the same
+    /// function `crate::runner`'s exit-reason rendering and the CLI's diagnostics use).
+    ///
+    /// It is **not** enough for a **moving** one: a relocation would have to write the forwarded
+    /// word back into the `Raise`, and there is no slot to write it to. A mover must therefore
+    /// refuse a region whose address falls inside a recorded reason's range rather than rewriting
+    /// it — that decision lives in the mover, not here.
+    ///
+    /// One `f` call per recorded error that carries such a reason (an atom reason — the
+    /// authoritative one — carries none, and an error with no reason term calls nothing). Order
+    /// unspecified; the map holds only *finished-and-not-yet-reported* pids, because the CLI takes
+    /// the error with [`RunnerState::take_error`].
+    pub(crate) fn for_each_error_live_reason(&self, f: &mut impl FnMut(Eterm)) {
+        for error in self.errors.values() {
+            if let Some(term) = crate::error::live_reason_term(error) {
+                f(term);
+            }
+        }
     }
     /// Registers the engine of a freshly spawned process.
     ///
@@ -656,13 +670,14 @@ impl RunnerState {
     /// and the same reason for existing (the value gather deliberately skips the stabilized copies;
     /// a rewriting pass must not); [`RunnerState::exit`] reads the words back.
     ///
-    /// [`RunnerState::errors`] is **deliberately not enumerated** by either of these: it also
-    /// carries a live reason word ([`beam_common::Raise`]'s opaque `live_reason` slot, the `Eterm`
-    /// payload a structured raise records), but [`BeamError`] exposes no mutable term accessor —
-    /// the slot is private to `beam_common` — so reaching it would need a new seam upstream.
-    /// Recorded here so the omission is a known hole rather than an oversight: a relocation must
-    /// not move a region an `errors` entry's live reason names until such an accessor exists.
-    ///
+    /// [`RunnerState::errors`] is **not** visited by this door, and cannot be: it also carries a
+    /// live reason word ([`beam_common::Raise`]'s opaque `live_reason` slot, the `Eterm` payload a
+    /// structured raise records), but [`BeamError`] exposes no *mutable* term accessor — the slot is
+    /// private to `beam_common` — so a rewriting pass has no slot to write a forwarded word into.
+    /// The read-only half does exist ([`RunnerState::for_each_error_live_reason`]), which is what a
+    /// liveness descent (retain/drop) needs; a **relocation** must instead refuse a region whose
+    /// address falls inside one of those words, and
+    /// [`crate::runtime::reclaim`]'s move does exactly that.    ///
     /// One `f` call per entry, lengths fixed, order unspecified. An `f` error stops the
     /// enumeration and is returned; an empty map calls nothing.
     pub(crate) fn for_each_exit_root_mut(

@@ -123,10 +123,18 @@
 //!    family and *not* pinned any more), so the pass must never touch them. That is why the
 //!    current region is reset to its **cursor** and not to `0`: `reset_to(0)` would need a proof
 //!    about words this pass cannot enumerate.
-//! 5. **Doubt ⇒ decline.** A walk that cannot finish (visit budget, unknown boxed header), an
-//!    arena that refuses the rewind, a machine in flight, a recorded `BeamError` — each records a
-//!    `&'static str` and leaves both regions exactly as they were.
-//!
+//! 5. **Doubt ⇒ decline.** A walk that cannot finish (visit budget, unknown boxed header), a
+//!    machine in flight, a refused rewind — each records a `&'static str` and leaves both regions
+//!    exactly as they were. A **recorded raise is not doubt**: its live reason word is read out of
+//!    [`RunnerState`](crate::runner::RunnerState) by
+//!    [`RunnerState::for_each_error_live_reason`](crate::runner::RunnerState::for_each_error_live_reason)
+//!    and pushed into the value root set, so a region holding one is simply *retained* by the same
+//!    descent as any other live word. Reclaiming the regions a pending error names costs nothing in
+//!    soundness and is often the only reclaimable state there is: the map holds exactly
+//!    finished-and-not-yet-reported pids, which on the `-eval` route is the run's own last failure.
+//!    (A **moving** mechanism cannot lean on that accessor — it is read-only, and
+//!    [`beam_common::Raise`] exposes no mutable slot — so the move refuses a region a recorded
+//!    reason stands in; see [`attempt_move`].)//!
 //! # Why Tier A and not Tier B
 //!
 //! `beam_engine` also offers `reclaim_heap` (Tier B), which *copies* the live graph into a fresh
@@ -342,17 +350,7 @@ struct Cursor {
     /// `eval_heap_retired.len()` at [`open`]: every retired region at or after this index was
     /// created **inside** the window, so its words were written inside the window.
     store_retired_baseline: usize,
-    /// The base address of a store region a **runtime-lifetime** store took a word in
-    /// ([`note_lifetime_store`]), while that region is still the *current* one.
-    ///
-    /// The current region may not be reset while this names it: a `stabilize_term` word is written
-    /// *after* the pin, and no root family enumerates its holder (`persistent_term`, a timer's
-    /// message, the runner's recorded outcomes), so the descent cannot find it. `None` once a
-    /// growth replaced that region — from then on [`Cursor::store_retired_baseline`] is what keeps
-    /// the retired region that holds it.
-    store_frozen_base: Option<usize>,
 }
-
 /// The region-reclaim pass's per-runtime state.
 ///
 /// Always present on the [`Runtime`]; `cursor` is `Some` only between [`open`] and the end of the
@@ -428,42 +426,13 @@ pub(crate) fn open(runtime: &mut Runtime) {
         store_base: heap_region_base(&runtime.eval_heap),
         store_mark: runtime.eval_heap.used(),
         store_retired_baseline: runtime.eval_heap_retired.len(),
-        store_frozen_base: None,
     };
     runtime.region_reclaim.cursor = Some(cursor);
 }
 
-/// Registers that a **runtime-lifetime** store just took a word in the store's current region.
-///
-/// Called from [`crate::eval::scratch::pin`], i.e. from the `stabilize_term` family and
-/// [`crate::port::completion`]'s decoded caller tag, *before* the copy that word belongs to is
-/// made. Two protections follow, and they are what keep this pass from freeing a word no descent
-/// can see (the family is deliberately not a root family — the statement window's own pin is the
-/// compensating guard, and that pin does not survive the window's decline):
-///
-/// * **the current region may not be reset** for the rest of its life as the current region
-///   ([`Cursor::store_frozen_base`]) — the pinned word is written *after* this call, so no
-///   watermark can bound it from below;
-/// * **every region retired from now on is excluded** from the retired candidates
-///   ([`Cursor::store_retired_baseline`] moves to `len + 1`, which is exactly the index the current
-///   region will get if a growth retires it), so a growth between the pin and the next pass cannot
-///   turn the pinned word into a droppable region.
-///
-/// A no-op when no window is open: the pin then protects nothing that a pass could reach.
-pub(crate) fn note_lifetime_store(runtime: &mut Runtime) {
-    let Some(cursor) = &mut runtime.region_reclaim.cursor else {
-        return;
-    };
-    cursor.store_frozen_base = Some(heap_region_base(&runtime.eval_heap));
-    cursor.store_retired_baseline = cursor
-        .store_retired_baseline
-        .max(runtime.eval_heap_retired.len() + 1);
-}
-
 /// Closes the region-reclaim window. Called by [`crate::eval::scratch::close`] once the exit-site
 /// pass has run.
-pub(crate) fn close(runtime: &mut Runtime) {
-    runtime.region_reclaim.cursor = None;
+pub(crate) fn close(runtime: &mut Runtime) {    runtime.region_reclaim.cursor = None;
 }
 
 /// One region-reclaim **pass**: one descent, then the arena and/or store action.
@@ -493,15 +462,17 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
         return;
     }
     let mut hits = vec![false; live.len()];
-    let mut roots: Vec<Eterm> = Vec::with_capacity(input.value_roots.len() + 64);
-    roots.extend_from_slice(input.value_roots);
-    // The complete runtime root enumeration: the same one the statement window's own rewind
-    // rests on. Every family it leaves out is a store the writer pinned, and the pin is honoured
-    // by `refusal` above — see the module docs' completeness precondition.
-    runtime.gather_off_heap_roots(&mut roots);
+    let roots = match gather_roots(runtime, input.value_roots) {
+        Ok(roots) => roots,
+        Err(reason) => {
+            runtime.region_reclaim.decline(reason);
+            return;
+        }
+    };
     {
         let ranges: Vec<(usize, usize)> = live.iter().map(|candidate| candidate.range).collect();
-        if let Walk::Declined(reason) = reclaim::walk(&roots, &mut RangeProbe::new(&ranges, &mut hits))
+        if let Walk::Declined(reason) =
+            reclaim::walk(&roots, &mut RangeProbe::new(&ranges, &mut hits))
         {
             runtime.region_reclaim.decline(reason);
             return;
@@ -583,14 +554,8 @@ fn refusal(runtime: &Runtime, input: &PassInput<'_>) -> Option<&'static str> {
     if runtime.in_machine.is_some() {
         return Some("a machine is in flight, so its roots are unpublished");
     }
-    if runtime.runner_state.has_errors() {
-        return Some("a recorded raise may carry a live reason word");
-    }
     if !input.window.open {
         return Some("no statement window is open");
-    }
-    if let Some(lifetime) = input.window.lifetime_pinned {
-        return Some(lifetime);
     }
     if input.site.honours_transient_pins() {
         if let Some(reason) = input.window.pinned {
@@ -600,6 +565,54 @@ fn refusal(runtime: &Runtime, input: &PassInput<'_>) -> Option<&'static str> {
     None
 }
 
+/// The pass's **complete** root set: the caller's own live terms plus every host-side root the
+/// runtime holds.
+///
+/// # Why this is one walk and not the value gather plus a pin
+///
+/// The statement window's own rewind ([`crate::eval::scratch`]) roots itself in
+/// [`Runtime::gather_off_heap_roots`] — the *liveness* gather, which deliberately skips the
+/// families whose words are a second copy, or already stable, or stored behind a mechanism that
+/// flattens a payload ([`RootFamily::in_value_gather`]). A **runtime-lifetime** store
+/// ([`Runtime::stabilize_term`]: a `persistent_term` value, a pending spawn, a timer's message, a
+/// driver-emitted port term, an armed `enif_select` payload, a recorded process outcome, …) writes
+/// into one of the skipped families, which is why that window's writer-side **pin** exists: it is
+/// the compensating guard for a *conservative* prune that cannot enumerate the holder.
+///
+/// This pass has no such excuse, because it runs at exactly the two sites where the runtime is not
+/// executing — the `-eval` statement boundary and the driver's exit — which is precisely the
+/// domain on which [`Runtime::for_each_root_mut`]'s documentation claims **completeness**
+/// (`src/runtime/roots.rs`, *Completeness — this walk is whole only at a non-running site*). Its
+/// eighteen families are a superset of the value gather's (`root_tests.rs` pins that multiset
+/// equality per shared family), so gathering through it covers every store a `stabilize_term`
+/// call could have pinned, and a region holding one is **retained by evidence** — the descent sees
+/// the word — instead of by a blanket latch.
+///
+/// The one root family the moving door cannot carry is a raise's live reason
+/// ([`RunnerState::for_each_error_live_reason`]): it has a *reader* and no writable slot, which is
+/// enough for the liveness question this pass asks. It is added here explicitly.
+///
+/// # Errors
+///
+/// A `&'static str` when the enumeration itself fails — today unreachable, because the visitor
+/// below cannot fail; a caller must treat it as one more decline (nothing touched).
+fn gather_roots(
+    runtime: &mut Runtime,
+    value_roots: &[Eterm],
+) -> core::result::Result<Vec<Eterm>, &'static str> {
+    let mut roots: Vec<Eterm> = Vec::with_capacity(value_roots.len() + 64);
+    roots.extend_from_slice(value_roots);
+    runtime
+        .for_each_root_mut(&mut |words| {
+            roots.extend_from_slice(words);
+            Ok(())
+        })
+        .map_err(|_| "the runtime's root enumeration refused to complete")?;
+    runtime
+        .runner_state
+        .for_each_error_live_reason(&mut |term| roots.push(term));
+    Ok(roots)
+}
 /// One region a pass may reclaim, and the action it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -628,12 +641,8 @@ fn live_ranges(runtime: &mut Runtime, cursor: Cursor) -> Vec<Candidate> {
     // the window) invalidates the cursor's *address*, not the retired chain, so it only costs the
     // current-region half — see `advance_cursor`.
     let base = heap_region_base(&runtime.eval_heap);
-    if base == cursor.store_base
-        && runtime.eval_heap.used() > cursor.store_mark
-        && cursor.store_frozen_base != Some(base)
-    {
-        candidates.push(Candidate {
-            target: Target::StoreCurrent,
+    if base == cursor.store_base && runtime.eval_heap.used() > cursor.store_mark {
+        candidates.push(Candidate {            target: Target::StoreCurrent,
             range: (
                 base + cursor.store_mark * width,
                 base + runtime.eval_heap.used() * width,
@@ -757,15 +766,8 @@ fn advance_cursor(runtime: &mut Runtime) {
     if base != cursor.store_base || used < cursor.store_mark {
         cursor.store_base = base;
         cursor.store_mark = used;
-        // A freeze applies to the region it was taken in and to nothing else: keep it only if it
-        // already names this (new) current region — which it does when the pin happened after the
-        // growth that this advance is catching up with.
-        if cursor.store_frozen_base != Some(base) {
-            cursor.store_frozen_base = None;
-        }
     }
 }
-
 /// The runtime's **region-reclaim accounting**.
 impl Runtime {
     /// The published region-reclaim counters ([`RegionReclaimStats`]).

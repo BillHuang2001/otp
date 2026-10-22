@@ -258,14 +258,19 @@ fn every_decline_records_its_reason_and_touches_nothing() {
         assert_eq!(store_shape(&rt), shape);
     }
 
-    // ---- 4. a runtime-lifetime store pinned the window ------------------------------------
+    // ---- 4. a runtime-lifetime pin is NOT a decline ---------------------------------------
+    //
+    // The pass roots itself in the runtime's **complete** host-side corpus
+    // (`Runtime::for_each_root_mut` plus a raise's live reason), gathered at exactly these two
+    // non-running sites, so a `stabilize_term` store's word is *found by the descent* and its
+    // region is retained by evidence. The latch therefore cannot block the whole, region either;
+    // it is kept only for the store move, which cannot rewrite a lifetime store's slot.
     {
         let mut rt = small_runtime();
         open(&mut rt);
         cons_junk(&mut rt);
         retire_current_region(&mut rt);
         cons_junk(&mut rt);
-        let shape = store_shape(&rt);
         let before = rt.region_reclaim_stats();
         pass(
             &mut rt,
@@ -280,8 +285,16 @@ fn every_decline_records_its_reason_and_touches_nothing() {
                 withheld: None,
             },
         );
-        assert_declined(&rt, before, "a lifetime store");
-        assert_eq!(store_shape(&rt), shape);
+        let after = rt.region_reclaim_stats();
+        assert_eq!(
+            after.reclaim_declines, before.reclaim_declines,
+            "a lifetime pin does not decline the whole-region pass"
+        );
+        assert_eq!(
+            after.store_regions_dropped,
+            before.store_regions_dropped + 1,
+            "the dead retired region was still dropped"
+        );
     }
 
     // ---- 5. a transient pin declines the BOUNDARY and not the exit ------------------------

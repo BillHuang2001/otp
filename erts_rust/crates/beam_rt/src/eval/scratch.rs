@@ -238,6 +238,12 @@ pub(crate) struct WindowState {
     /// The first reason the window was pinned, of either kind.
     pub(crate) pinned: Option<&'static str>,
     /// The first **runtime-lifetime** reason, if one latched.
+    ///
+    /// Read by the store move's decline list (a relocation cannot rewrite a lifetime store's slot,
+    /// so a latched lifetime pin declines the move at **both** sites) — see
+    /// [`crate::runtime::reclaim`]'s decline list. The whole-region pass itself needs no latch: its
+    /// root corpus is the complete host-side one.
+    #[allow(dead_code)]
     pub(crate) lifetime_pinned: Option<&'static str>,
 }
 /// The `-eval` route's statement-window bookkeeping on [`Runtime::eval_heap`].
@@ -441,20 +447,22 @@ pub(crate) fn close(
 
 /// Latches the open window with a **runtime-lifetime** reason ([`PinKind::Lifetime`]): a term was
 /// (or may have been) written onto the store and kept by a store that still names it after the
-/// driver returns, so the window must not be reset **and** no store region holding a word written
-/// inside it may be dropped.
+/// driver returns, so this window must not be reset.
 ///
 /// `O(1)`, and free when no window is open (the words then stand below the next window's mark).
 /// Only the **first** reason of each kind is kept, which is the one that explains the decline.
+///
+/// The latch stops at *this* window. The region-reclaim pass
+/// ([`crate::runtime::reclaim`]) does not need it: its root set is the runtime's **complete**
+/// host-side corpus ([`Runtime::for_each_root_mut`] plus a raise's live reason), gathered at these
+/// same two non-running sites, so a region holding a `stabilize_term` word is retained because the
+/// descent *finds* that word rather than because a latch forbade looking. The
+/// [`PinKind::Lifetime`] classification is kept for the pass's **move** (a relocation cannot
+/// rewrite every lifetime store's slot, so it declines on this reason) — see
+/// [`crate::runtime::reclaim`]'s decline list.
 pub(crate) fn pin(runtime: &mut Runtime, reason: &'static str) {
     runtime.eval_scratch.pin(reason, PinKind::Lifetime);
-    // This window's own latch is cleared by a decline (the mark then stands *above* the pinned
-    // words), but a region-reclaim pass has its own, lagging cursor and would otherwise be free to
-    // reset or drop the very region this pin just took a word in — so the store's lifetime word is
-    // registered with the pass as well.
-    region_reclaim::note_lifetime_store(runtime);
 }
-
 /// Latches the open window with a **transient** reason ([`PinKind::Transient`]): a holder that
 /// exists only while something executes — a nested run's machine, a nested `-eval` closure's
 /// applying machine — may name a word written inside the window.
