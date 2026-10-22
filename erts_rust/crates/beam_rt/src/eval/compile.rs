@@ -135,6 +135,28 @@ impl CompiledClosure {
         combined.extend_from_slice(args);
         combined
     }
+
+    /// Hands `f` the writable term slots of the captured values, one slice at a time.
+    ///
+    /// **This is a second copy of the owner closure's [`FunBody`](super::FunBody) capture
+    /// environment** (a plain word copy, see [`compile`]), so it must be rewritten **in the
+    /// same pass** as that environment: a walk that moved one without the other would leave
+    /// this cache naming stale words.
+    ///
+    /// The contract shared by every per-owner `for_each_root_mut`: `f` may replace the
+    /// **elements** of the slice, its **length** never changes, and the visitor must not depend
+    /// on any ordering beyond the stored one. When `f` returns `Err` the slot writes it already
+    /// made stay (they are made in place) and the error is returned; an empty capture list
+    /// calls no visitor and answers `Ok(())`.
+    pub(crate) fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        if self.captures.is_empty() {
+            return Ok(());
+        }
+        f(&mut self.captures)
+    }
 }
 
 /// The entry point of the `-eval` closure fun `fun`, compiling and loading the synthetic module
