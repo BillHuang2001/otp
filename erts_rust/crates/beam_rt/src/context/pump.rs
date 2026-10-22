@@ -1158,11 +1158,14 @@ mod in_process_compile {
     ///
     /// # What it bands, and why a band rather than an equality
     ///
-    /// `arena_words`/`arena_allocs` are deterministic **counts of demand**, not timings, so a shared
-    /// host cannot perturb them — but the compiler they count through differs between two
-    /// legitimate hosts (OTP 29 vs the tree's OTP 30) by ≈19%, so a band is the honest unit: ±30%
-    /// catches a regression of the mechanism (a region policy, an extra reservation) while
-    /// tolerating the compiler generation.
+    /// `arena_words`/`arena_allocs` are **counts of demand**, not timings: no scheduling decision on
+    /// a shared host moves them. They are not bit-reproducible, though — the compiler they count
+    /// through differs between two legitimate hosts (OTP 29 vs the tree's OTP 30) by ≈19%, and even
+    /// on one host the figures move by a handful of words from run to run (measured: 4 306 093 and
+    /// 4 306 107 words over 409 110 and 409 117 calls, 0.0003%, from the environment rather than
+    /// from the mechanism) — so a band is the honest unit: ±30% catches a regression of the
+    /// mechanism (a region policy, an extra reservation) while tolerating the compiler generation
+    /// and those few words.
     ///
     /// # Demand versus occupancy — the two figures this pin must never confuse
     ///
