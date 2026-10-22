@@ -478,6 +478,10 @@ is), and a freed segment keeps whatever pages its previous owner dirtied while i
 - `free_list::FreeList::refile` is dead (carries `#[allow(dead_code)]`): MBC coalescing (`mbc.rs::dealloc`)
   unlinks neighbours with `remove` and re-files with `insert`, so `refile` is exercised only by its own tests.
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
+- **The `mmsbc` / `MsegConfig::max_sbc_carriers` limit (256) is unreachable:** `Carrier::alloc_map`
+  always goes through `mseg().map(..)`, which classifies the segment `SegmentKind::MultiBlock`, and
+  `MsegAllocator::map_sbc` has test-only callers — so no carrier ever counts against the single-block
+  limit (every carrier counts as an MBC, whose default limit is unlimited).
 - `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,
   but the A.6 CLI surface is owned by `beam_rt`.
