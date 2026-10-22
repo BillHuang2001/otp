@@ -438,6 +438,63 @@ impl Timers {
         }
     }
 
+    /// Visits every term a pending **delivery** names — the sender and the message — through `f`,
+    /// which may replace either word in place.
+    ///
+    /// The mutable twin of [`Timers::gather_off_heap_roots`]: it names exactly the same family
+    /// (one two-word `[from, message]` buffer per pending [`TimerAction::Deliver`]) and nothing
+    /// else — a [`TimerAction::Resume`] carries a `(func, pc)` address, no term, and contributes
+    /// nothing. The variant is destructured **mutably** (`&mut pending.action`), so the visitor's
+    /// replacement is written straight back into the timer's own fields; the buffer is written
+    /// back even when `f` answers `Err` — a visitor that had already replaced one word never loses
+    /// it — and the error is then returned.
+    ///
+    /// The map's iteration order is an implementation detail the visitor must not depend on, and
+    /// a slice's length never changes.
+    ///
+    /// [`Timers::refs`] is deliberately **not** enumerated here (nor by
+    /// [`Timers::for_each_reference_root_mut`]): it is an `Eterm`-**keyed** map, so a key a visitor
+    /// replaced would have to be *re-keyed* rather than rewritten in place, which is a different
+    /// operation from this one.
+    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
+    pub(crate) fn for_each_delivery_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for pending in self.pending.values_mut() {
+            let TimerAction::Deliver { from, message, .. } = &mut pending.action else {
+                continue;
+            };
+            let mut words = [*from, *message];
+            let outcome = f(&mut words);
+            *from = words[0];
+            *message = words[1];
+            outcome?;
+        }
+        Ok(())
+    }
+
+    /// Visits the `#Ref<>` handle of every pending timer that holds one through `f`, which may
+    /// replace the word in place.
+    ///
+    /// A runtime-internal deadline (a `receive … after T` timeout) was recorded with no reference
+    /// and contributes nothing; the visitor is not called at all when no pending timer holds one.
+    ///
+    /// [`Timers::refs`] — the `Eterm`-keyed reference index — stays out of scope for the reason
+    /// [`Timers::for_each_delivery_root_mut`] gives: its **keys** need re-keying, not rewriting.
+    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
+    pub(crate) fn for_each_reference_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for pending in self.pending.values_mut() {
+            if let Some(reference) = &mut pending.reference {
+                f(core::slice::from_mut(reference))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Cancels the pending deadline `handle` identifies, answering whether it was still
     /// pending (and therefore will not fire).
     ///

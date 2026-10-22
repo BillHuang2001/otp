@@ -299,6 +299,38 @@ impl SeqTrace {
         }
     }
 
+    /// Visits every token **term** this state holds — the label and the `from` pid of each
+    /// process's token — through `f`, which may replace either word in place.
+    ///
+    /// The mutable twin of [`SeqTrace::gather_off_heap_roots`]: the same family, taken the same
+    /// way (the per-process record's `Option<Token>`, so a process without a token contributes
+    /// nothing) and handed over one two-word `[label, from]` buffer at a time. The buffer is
+    /// written back even when `f` answers `Err` — a visitor that had already replaced one word
+    /// never loses it — and the error is then returned.
+    ///
+    /// The caveat the gather carries applies here too: `set_label`/`set_from` store the caller's
+    /// word unstabilized, so a label may name an off-heap payload the runtime keeps alive through
+    /// this state alone.
+    ///
+    /// The per-process map's iteration order is an implementation detail the visitor must not
+    /// depend on, and a slice's length never changes.
+    #[allow(dead_code)] // consumed by the runtime-level root-enumeration door
+    pub(crate) fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> beam_common::Result<()>,
+    ) -> beam_common::Result<()> {
+        for state in self.processes.values_mut() {
+            let Some(token) = state.token.as_mut() else {
+                continue;
+            };
+            let mut words = [token.label, token.from];
+            let outcome = f(&mut words);
+            token.label = words[0];
+            token.from = words[1];
+            outcome?;
+        }
+        Ok(())
+    }
     /// `pid`'s token, created with the C's defaults when it has none — the C's
     /// `new_seq_trace_token` (`erl_if_trace.c:3133-3154`).
     pub fn ensure(&mut self, pid: ProcessId, from: Eterm) -> Token {
