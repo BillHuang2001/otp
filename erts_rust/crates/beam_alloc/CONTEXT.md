@@ -129,6 +129,19 @@ heap never handed out — the same refusal rule [`ReservedHeap::relocate`] appli
 undersized reservation. This is what lets a *pooled* heap that reaches a caller already owning words
 handed over to another caller be rewound precisely instead of only when it is empty.
 
+### Term lifetime — what a stale term still pointing into a `Heap` reads
+- `reset`/`reset_to` only move `used` (`src/heap.rs:99-136`): words in `[mark, used)` are **not** zeroed, not wiped and not put on any free list — they stay mapped and the very next `alloc_words`/`cons`/`tuple` hands them out again. Only `Drop` (`src/heap.rs:242-261`) releases the block, and then only to the allocator (see the reuse/residency notes below). `Heap` has no `clear`/`truncate`/`free`; `used_words_mut` (`src/heap.rs:168-181`) is the only `&mut` word view and it cannot move `used`, so a `Heap` is never an in-place relocation destination — growth is always by *replacement* (a new `Heap` + a pointer-aware copy).
+- A term that outlives the rewind is therefore a **dangling-but-mapped** read, not an immediate fault: it silently reads whatever the next allocation wrote there. A recycled word is arbitrary data and half of all 2-bit primary tags (`LIST`/`BOXED`) denote a pointer, so a stale read typically faults *later*, in a consumer (e.g. `beam_term::list::car` on a wild pointer) — never at the rewind itself.
+- A term that outlives the whole `Heap` is worse: `Drop` → `dealloc` → the dedicated-SBC arm (`src/allocator/core.rs:527-542`; every block `>= sbct` = 512 KiB) unmaps the carrier outright, so the next read faults — unless mseg cached the mapping (`src/mseg/state.rs:142-156`, default cache 10) and handed it to a later allocation at the **same base address**, which makes the stale read silently "work" against unrelated memory.
+- Consequence for debugging: a missed root or an over-eager rewind is deterministic per allocation *order*, not per call, and surfaces as a fault in a reader far from the heap that was rewound. This crate cannot detect it (it holds no liveness knowledge); the invariant is enforced by the rewinders — `beam_rt`'s pooled BIF heap (`src/context/calls.rs:1052`, `src/context/pool.rs`) and `beam_gc`'s nursery collapse (`src/nursery.rs:580`; `HeapSpace::reset` at `src/space.rs:102-104`).
+- `Heap` is neither `Send` nor `Sync` (it holds a raw `*mut Eterm`; the only `unsafe impl Send` in the crate are `Carrier` (`src/carrier.rs:129`), `RefcBinary` (`src/binary.rs:261`) and `FreeList` (`src/free_list.rs:175`)), so a stale-use defect is always same-thread — never a data race.
+
+### Diagnosing a stale/freed-heap pointer — what this crate cannot tell you
+- **`Heap` exposes no `base()`.** The region is reachable only as `hp()` (`src/heap.rs:139-143`, = base + `used`) and `hend()` (`src/heap.rs:146-149`, = base + `cap`), so the base is recoverable **only while `used() == 0`**; after any allocation the low bound is gone and `hend() - hp()` is the remaining span (`available() * 8`), not the region's extent. (`ReservedHeap` *does* expose `base()`/`limit()`/`reservation_end()`, `src/reserved_heap.rs:262-292` — the asymmetry is real, do not assume it on `Heap`.)
+- **There is no live-region registry, no region id and no generation counter** — anywhere in the crate (nor in `registry`, which holds one `AllocRef` per `AllocType`, `src/registry.rs`). Nothing can answer "does this address lie in a currently-live `Heap` region", so there is no way to *detect* a stale term before dereferencing it; only a sanitizer can.
+- **`CarrierAllocator::locate`/`plausible_header` are header-plausibility, not liveness, checks** (`src/allocator/core.rs:94-111`, `src/allocator.rs:182-202`). They *read* the 16-byte header at `payload - 16` and validate it against the recorded padding offset, so they can refuse a foreign pointer only if the address is readable — a stale pointer into an unmapped carrier faults inside `dealloc` rather than being logged as "refusing to free an unrecognised block" (`src/allocator/core.rs:486-491`). The `mseg` magic word (`src/mseg/header.rs:59-61,100-101`) validates a *segment* header, never a term pointer.
+- Two distinct fault shapes follow, and they discriminate the root cause: (a) a read fault (the `SIGSEGV` inside `beam_term::list::car`) means the carrier was `munmap`ed — a `Heap` whose block is `>= sbct` (512 KiB) goes down the dedicated-SBC arm and is unmapped on `Drop` (`src/allocator/core.rs:527-542`); (b) *no* fault but garbage/impossible term words means the address was reused — an mseg-cached segment is handed back at the **same base unzeroed** (`src/mseg/state.rs:142-156`) or the words were simply re-handed-out by the next bump allocation (this page, "Term lifetime").
+
 ### `reserved_heap` — the reservation-capable per-process term heap (`ReservedHeap`)
 The **frozen seam** for hosts that must grow a live process heap. One backing block of
 `reserved_words` term words, obtained exactly once from an `AllocRef` (mseg/`mmap`-backed, so reserved
@@ -161,6 +174,32 @@ byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`
    bitstring/refc-binary payload bytes needs term-structure knowledge owned by
    `beam_term`/`beam_gc` — so the fully-consistent move remains the collector's pointer-aware copy
    (`copy_struct`/Cheney), i.e. growth by *replacement*. Never cache a raw term pointer across a move.
+5. **`relocate` and `Drop` are the only pointer-invalidating operations.** `try_grow` is bookkeeping
+   alone (`reserved_heap.rs:194-205`, `committed = used + need`): the whole reservation is already one
+   ordinary allocator block, mapped read/write, so raising the limit neither moves the bump pointer nor
+   re-maps nor `mprotect`s anything. `reset` invalidates handed-out pointers *logically* (the words are
+   handed out again), never physically. There is no `truncate`/`shrink`/`set_len` on either heap —
+   `set_len` is a `RefcBinary` method (`src/binary/growth.rs`), unrelated to a term heap; the only ways
+   to give address space back are `Drop` and a shrinking `relocate` (which is a move).
+6. **What a `Drop`/`relocate` really does to the OS.** Both call the one private `free_block`, which
+   returns the block through the same `AllocRef` + exact `Layout` it was allocated with; the allocator
+   then re-derives the block's extent from its in-band header (it ignores `layout.size()`) and routes
+   by size: a reservation <= 1024 B is a **slab** block of a retained 1 MiB carrier, one in
+   `(1024, 512 KiB)` is a block of the pooled variable-size **MBC** carrier, and one >= `sbct`
+   (512 KiB) is a **dedicated** mapping. Only the dedicated case (and a *fully free* MBC carrier) can
+   ever reach `munmap`, and it reaches it by way of the process-global `mseg` reuse cache (default 10
+   segments, FIFO) — so a dropped region normally stays **mapped, unzeroed and re-handable at the same
+   address**, and a stale term pointer into it does not fault, it silently aliases the next owner's
+   bytes. Report returned-to-OS memory from `stats.mseg.unmaps`/`mapped_bytes`, not from
+   `carriers`/`carrier_bytes` (which drop when the *carrier* is released, i.e. possibly before the
+   mapping is gone).
+7. **No containment test, and the two heaps share no trait.** A collector's "this pointer is not mine"
+   decision has to be built from `base()`/`hp()`/`reservation_end()`/`reserved_words()`: the reserved
+   extent for an address-space question, `[base, hp)` for a live-word one. `beam_gc::HeapSpace`
+   (`src/space.rs`, `contains` over `[base, top)`) wraps a concrete `beam_alloc::Heap` via
+   `from_heap`/`into_heap` only, so a region grid of `ReservedHeap`s is not expressible through
+   `beam_gc`'s public API; `Heap` itself exposes `hp()`/`hend()` but **no** `base()` (recover it as
+   `hend().wrapping_sub(capacity())`).
 
 ### `bump` — the shared bump-pointer term-construction primitives (private, crate-internal)
 `alloc_words_at`/`alloc_tuple_at`/`cons_at`/`tuple_at`: pure `(hp, available, …)` helpers that
@@ -279,6 +318,39 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `mapped_bytes` stay flat while `cache_hits` (= `AllocStats::mseg.reused`) climbs. The address can
   only change on cache eviction (FIFO when full), or when `take_cached` picks a different smallest
   fitting cached segment (a bad fit is tail-trimmed, keeping the base).
+### When a free actually unmaps (pointer-invalidation map)
+`Heap::drop` (heap.rs:242) never unmaps anything itself — it only calls `AllocRef::dealloc` →
+`CarrierAllocator::dealloc_impl` (allocator/core.rs:484), whose routing decides everything below.
+`ReservedHeap::drop` (reserved_heap.rs:429) and `RefcBinary::drop` (binary.rs:512) go through the same
+free path, as do `ReservedHeap::relocate`'s retired block (reserved_heap.rs:253 → `free_block`, :401)
+and `RefcBinary`'s moving grow (binary/growth.rs:426).
+- **Block bytes ≤ 1024 B (a `Heap` of ≤ 128 words):** slab block back on its class free list
+  (`return_block`, core.rs:544+); the slab carrier is **never released** → memory stays mapped and
+  unzeroed, so a stale term silently aliases the next owner's words. No SIGSEGV from this arm.
+- **1025 B … 524 287 B (129 …= 65 535 words):** a block of a pooled variable-size MBC carrier; freeing
+  coalesces in place (`mbc.rs::dealloc`), the carrier is destroyed **only when it is fully free**
+  (core.rs:508-520) → `Carrier::unmap`.
+- **≥ 524 288 B (≥ 65 536 words — `policy.sbct`, policy.rs:461-462 + `uses_single_block_carrier`,
+  policy.rs:607-609, `size >= sbct`):** a dedicated single-block carrier → `Carrier::unmap` on free
+  (core.rs:527-536).
+- Either `unmap` (carrier.rs:227 = `drop(self)`) ends in `Segment::drop` (mseg/header.rs:250) →
+  `MsegInner::release` (mseg/state.rs:142): with the default `cache: true, max_cache_size: 10`
+  (mseg/config.rs:118-119) the segment is **pushed on the reuse cache (still mapped, still unzeroed)**
+  and only the **oldest** cached segment is `munmap`ed (`destroy` → `os_unmap`, mseg/state.rs:119-137,
+  mseg/mapping.rs:104) once the cache is full — i.e. the mapping in question is not necessarily the one
+  being freed. `MsegState::drop`/`purge_cache` never runs in production (the `mseg()` handle is a
+  `LazyLock` static, carrier.rs:104-107) and `clear_cache()` has no production caller, so **FIFO
+  eviction is the only munmap trigger**. Proof-by-test: carrier.rs:481-508 asserts `cached_segments ==
+  1` / `mapped_segments == 1` right after `unmap`, and 0 only after `clear_cache()`.
+- One extra unmapping path that bypasses eviction: reusing a cached segment that is a *bad fit*
+  tail-trims it (`take_cached`, mseg/state.rs:186-206) and munmaps the trimmed tail — so a pointer past
+  the new size faults even though the segment was "recycled".
+- `AllocatorState::drop` (allocator/state.rs:257) releases every carrier the allocator still holds (each
+  into the same global cache); it runs only for a non-registry allocator — the 12 registry allocators
+  are `static` and never dropped.
+- This crate holds **no `Vec<Eterm>`/scratch term buffer**: every `Vec` here is bookkeeping
+  (`AllocatorState::{carriers, mbcs, by_base, mbc_by_base}`, `MsegInner::cache`, `SizeClasses::classes`,
+  `AllocatorInfo::items`), so no term can be handed out of a Rust-collection allocation.
 - A `Heap` allocates through the **untyped** `Allocator::alloc` path (`alloc_bytes` → `alloc_impl(_, None)`),
   so per-type `TypeStats` rows do **not** attribute process heaps; read the aggregate counters
   (`alloc_calls`/`free_calls` cumulative, `live_bytes`, `peak_live_bytes`, `carriers`, `carrier_bytes`)
@@ -307,6 +379,31 @@ The only whole-payload writes are explicit: `Allocator::alloc_zeroed` (`src/allo
 unused by `Heap`/`ReservedHeap`) and `RefcBinary::set_len`'s zero-fill (`src/binary/growth.rs:334`).
 Corollary for measurement: a segment **reused from the mseg cache is not zeroed** (only a fresh `mmap`
 is), and a freed segment keeps whatever pages its previous owner dirtied while it sits in the cache.
+
+### Freed-block liveness — what a stale pointer into a freed block sees
+`Heap::drop` (`src/heap.rs:242-261`) frees **one block**; whether that unmaps anything depends only on
+which routing band the block landed in (`core.rs:314-328`, defaults from `config.rs:89-101` +
+`policy.rs:461-474`: ladder to 1024 B, carrier 1 MiB, `sbct` 512 KiB):
+- **slab block** (`payload <= 1024 B`, `align <= UNIT_SIZE`): `return_block` pushes it onto the class
+  free list (`core.rs:544-570`, `state.rs:227-240`); the carrier is retained for the allocator's
+  lifetime (`state.rs:178`). Stays mapped; the *next* allocation of that class hands the same address
+  back, and `push`/`unlink` overwrite the payload's first two words with the intrusive links
+  (`free_list.rs:599-640`, cleared at `:557-562`).
+- **MBC block** (`1024 B < payload < sbct`): coalesced inside a pooled 1 MiB carrier
+  (`mbc.rs:343-...`); the carrier is destroyed only when `is_fully_free()` after this free
+  (`core.rs:508-522`, `mbc.rs:489-492`), and even then only into the `mseg` reuse cache.
+- **dedicated SBC block** (`payload >= sbct`, or `align > UNIT_SIZE`): the whole mapping is released
+  inside that same `dealloc` (`core.rs:527-543`) via `carrier.unmap` (`carrier.rs:227-229`) →
+  `Segment::drop` (`mseg/header.rs:250-254`) → the process-global `mseg` reuse cache
+  (`carrier.rs:104-107`, `mseg/state.rs:142-156`) — still mapped, unzeroed, re-handable at the same
+  address. `munmap` happens only on cache eviction (default `max_cache_size` = 10, FIFO,
+  `mseg/state.rs:147-151`) or a bad-fit tail trim on reuse (`mseg/state.rs:183-204`).
+So a stale pointer into a dropped `Heap` is normally mapped and readable (old bytes), and genuinely
+unmapped only on the SBC/MBC-carrier path plus a cache eviction. There is **no `madvise`/`MADV_DONTNEED`
+anywhere in the crate** (only doc mentions: `policy.rs:422`, `mbc.rs:105`), so freed-but-mapped memory is
+never zeroed by the allocator — a first-use `mmap` is zero, a recycled segment is not.
+The `std::alloc`-backed `StdlibAllocator` (`heap.rs:296-381`, `dealloc` → `std::alloc::dealloc` at
+`heap.rs:365`) is `#[cfg(test)]`-only and never on a runtime path.
 
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
@@ -452,6 +549,10 @@ is), and a freed segment keeps whatever pages its previous owner dirtied while i
 - `free_list::FreeList::refile` is dead (carries `#[allow(dead_code)]`): MBC coalescing (`mbc.rs::dealloc`)
   unlinks neighbours with `remove` and re-files with `insert`, so `refile` is exercised only by its own tests.
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
+- **The `mmsbc` / `MsegConfig::max_sbc_carriers` limit (256) is unreachable:** `Carrier::alloc_map`
+  always goes through `mseg().map(..)`, which classifies the segment `SegmentKind::MultiBlock`, and
+  `MsegAllocator::map_sbc` has test-only callers — so no carrier ever counts against the single-block
+  limit (every carrier counts as an MBC, whose default limit is unlimited).
 - `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,
   but the A.6 CLI surface is owned by `beam_rt`.

@@ -44,6 +44,49 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   only through `beam_term`'s `write_big`/`big_parts`/`big_size_words` (heap-agnostic
   writers) — never a local term-layout writer.
 
+## Ownership / aliasing contract (no term is ever copied except by `binary_part`)
+**`compile` copies nothing.** It stores the caller's raw `Eterm` words verbatim, so the
+AST is a graph of *pointers into the match-spec term's storage* (the caller's heap /
+nursery). `MatchSpec`/`MatchClause`/`Pattern`/`Expr` are `Clone` but **not** `Copy` and
+carry **no lifetime parameter** — nothing ties an AST to the term it was decoded from.
+The raw-word leaves: `Pattern::Literal(Eterm)` (`pattern.rs:57`, produced at `:126`),
+`Pattern::Map(Vec<(Eterm, Pattern)>)` keys (`pattern.rs:65`, stored at `:120`),
+`Expr::Literal(Eterm)` (`expr/mod.rs:265`, produced at `:399`, `:407`, `:436`) and the
+`{const, X}` form (`expr/mod.rs:533-538` → `Expr::Literal(args[0])`, **undecoded** — an
+arbitrary term, list spine included). A bare list/tuple/map *body* element is recursed
+(`Expr::Cons`/`Expr::Tuple`/`Expr::Map`), so only `{const, X}` and the leaf kinds
+(binary, bignum, float block, sub-binary, fun, native record, external pid/port/ref)
+carry a whole raw word.
+**Evaluation returns raw words too** (`exec.rs:470-472`, `:500-503`): `Expr::Literal`
+(`expr/mod.rs:765`) aliases the *spec* storage; `Expr::Bind` (`:767-771`) and
+`Expr::WholeObject` (`:772`) alias the *table-owned* object; `Expr::Hd`/`Tl`
+(`:872-887`) return a raw `car`/`cdr` (a sub-spine); `Expr::Element` (`:849-853`),
+`Expr::MapGet` (`:908-915`), `Expr::Max`/`Min` (`:969-977`) and unary
+`+`-of-a-float (`expr/arith.rs:170-179` `Ok(term)`) hand back an operand word.
+Structurally-new results are built on the caller's `&mut beam_alloc::Heap`
+(`Expr::AllBindings`/`Tuple`/`Cons`/`Map`, `expr/mod.rs:773-796`, `:946-955`) but embed
+those raw words — the crate-level "mixed graph": invalidated by *either* a scratch-heap
+rewind *or* the aliased table/spec storage being freed/reused.
+**`MatchContinuation` is the long-lived hazard** (`continuation.rs:221-250`: `table_id`,
+`name`, `spec: MatchSpec`, `limit`, `cursor: Cursor`, `reverse`; `Clone`, no lifetimes).
+Its `Cursor::Anchor(Eterm)` (`:207`) is the raw key a `traverse_ordered` chunk ended on
+(`:340`), taken straight from `Table::first/last/next/prev` (`table/read.rs:192-235`) —
+i.e. an interior-stored key word aliasing `TermStore` storage. `resume` re-reads it as a
+**range bound** (`continuation.rs:313-318` → `ordered_interior/node.rs:526-531`
+`cmp_arith(entry.key, key, atoms)`), so a resumed continuation whose anchor object was
+deleted (its words returned to `TermStore`'s per-size free lists and reused) dereferences
+reclaimed memory — a list/tuple anchor key reaches `beam_term::list::car` on a freed cons
+cell. The identity check (`:429-431`) compares only `table_id` + `name`; nothing validates
+a still-resolvable anchor. The continuation is **not** dropped at the end of the call:
+`beam_bifs` stores it in `TableRegistry.continuations: HashMap<u64, Continuation>`
+(`beam_bifs/src/ets.rs:355-357`, `insert_continuation` `:533-555`) and `Clone`s it per
+resume (`:582-586`), so it also outlives the spec term's heap lifetime.
+`match_spec_run` (`run.rs:63-81`) has the same shape against its *caller's* list: results
+alias the element (a list spine) or the caller's spec storage (`run.rs:59-62`).
+The two `thread_local` seams (`ARITH_HOOK` `expr/mod.rs:232-236`, `SELF_HOOK`
+`expr/guard.rs:717-721`) hold `Rc<dyn … + 'static>` only — no `Eterm`; the host installs
+RAII-scoped hooks that restore the default on drop (`beam_bifs/src/ets/{arith,self}_hook.rs`).
+
 ## Known Issues (honest gaps)
 - **The guard-BIF surface is the whole C `guard_tab` class.** `expr/` decodes and
   evaluates the connectives (`andalso`/`and`/`orelse`/`or`/`not`), the comparisons,
