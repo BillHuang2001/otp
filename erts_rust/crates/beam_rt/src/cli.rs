@@ -1490,6 +1490,15 @@ pub fn run(args: Vec<String>) -> i32 {
         if crate::debug_trace::mem_enabled() {
             crate::debug_trace::mem(format_args!("exit {}", runtime.retention_stats()));
         }
+        // The **arena allocation attribution** census (a sibling of that line, and silent unless
+        // `BEAM_RT_ARENA_TRACE` is set): *which* requests produced the arena demand the
+        // retention line reports. One `[rt-arena]` line per figure, printed at the same point and
+        // for the same reason — the runtime is still alive, so nothing it recorded is gone yet.
+        if let Some(report) = runtime.arena_census_report() {
+            for line in report {
+                crate::debug_trace::arena(format_args!("{line}"));
+            }
+        }
     }
     // The allocator's free pages are **not** released here, and this is the point where the
     // temptation is greatest: the action is over, so it looks quiescent. Measured, it is not —
