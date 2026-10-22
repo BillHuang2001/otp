@@ -252,6 +252,45 @@ between sessions and up to 5× on a loaded one).
 - **`bitstrings` differential-corpus hole (tools-owned).** `bitstrings/CONTEXT.md` records the missing
   `wire`/bitstring gate cases; the owner is `tools/differential`, not this crate.
 
+## Rooting / lifetime audit of the families (verified against the code)
+Every in-crate construction arm routes through a `*_rooted` twin and obeys reserve -> read -> write; the
+findings below are the residuals that survived that pass. Mechanism that makes a stale word possible at all:
+`beam_rt`'s `call_registered` **rewinds** the pooled 16 MiB `bif_heaps` region to its call `mark`
+(`beam_rt/src/context/calls.rs`), and `Runtime::grow_eval_heap` **retires** an exhausted region; a term built
+in either and read afterwards is the "dangling boxed argument" class of `../../../../beam_rt/M1_GAPS_GC.md`
+(fixed once for a raise reason by commit `2f1bdc1909`'s copy-at-the-escape-boundary).
+- **`reserve_slack(machine, ctx, 0)` still runs the rooted door.** `terms/slack.rs`'s `reserve` ->
+  `machine.alloc_rooted(ctx, 0, ALL_LIVE)` is not short-circuited for `n == 0`, so a builder whose computed
+  graph size is zero (`symbolic_stacktrace`'s `total = 2*shapes.len() + Σ ItemShape::words + if head {2}`
+  with an empty/skipped snapshot and `head == false`; `carve_supplied_frames` likewise) performs a
+  collection-capable admission for a graph that needs no storage. Benign today (the shape metadata holds only
+  `Atom`s and borrowed `&str` file names, and `Sink::list(&[])` returns `NIL` without carving), but it is a
+  pointless admission point in the raise path — skip the reservation at `total == 0`.
+- **`MakeFun3` builds the closure block with no root between the reserve and the write.** The fun block is a
+  Rust-local `Eterm` until `write_operand(dst, fun)`, so the only thing keeping it alive is that
+  `make_fun_rooted`'s reader closure performs *pure operand loads*. That invariant is load-bearing and
+  undocumented at the call site (contrast `raise_badarity`, which states it explicitly).
+- **`apply_target` / `call_fun` hold an `Eterm` array across a host seam.** `register_args` copies
+  `x(0..arity)` into a `Vec<Eterm>` and that copy is then held across `ctx.resolve_external_call` +
+  `machine.dispatch_bif_call(&args, ..)` (`apply_target`) and `ctx.resolve_local_fun` +
+  `ctx.apply_fun_outcome` (`call_fun`); `call_fun` additionally re-reads `fun`'s raw storage via
+  `terms::fun_free` *after* the seam. Neither the `Vec` nor the `fun` word is in any `RootSet`. Sound for the
+  shipped host only by contract (verified: `BudgetContext::resolve_local_fun` forwards without arming;
+  `RuntimeContext::resolve_local_fun` is `&self` and BEAM-heap-free; `apply_fun_outcome` runs under
+  `with_relocation_exempt`) — the exact shape of the precedent bug if any of those ever allocates. The
+  re-read `fun` from `x(arity)`/the operand **after** the seam is the sound fix if it ever does.
+- **`total == 0` aside, the map builder's bound is sound (do not re-open).** `beam_term::map::map_words_capacity`
+  = `21n + 18` for `n > 32`, and the true HAMT footprint is `2n` cells + `trie_words` = `2N + g` where `N` is
+  the node count and `g` the hash-group count; since every node exists only from a >=2-way split,
+  `n_L <= g/2` at each of the 15 levels, so `trie_words <= 16g + 2` and the block needs `<= 18n + 2`. The
+  `debug_assert!` in `write_map` therefore never fires in release, and `terms::make_map_rooted`'s single
+  reservation cannot overrun into its neighbours.
+- **`InPlace`'s raw payload base is republished, not fragile.** `BitWriter::push_bits_from` promotes on
+  `source_overlaps` **before** any growth (order explicitly load-bearing), and `InPlace::grow` updates
+  `self.base` + `republish_over(self.src, new_base)`. The one surviving caveat is `raw::subject_bytes`'
+  unconstrained `&'a [u8]` (see `## Duplication with sibling crates`): a caller must re-derive it after any
+  `ensure_room`, which the current append arm does not need because it grows only through the writer.
+
 ## Handoffs (owned elsewhere — NOT closeable in this node)
 - **`records` foreign-module `put_record/6` create form** (a `{OtherModule,Name}` record id) ⇒ typed `unsupported`;
   the oracle creates it (C `erl_record.c` consults the code server's record table). Needs a host record-definition
