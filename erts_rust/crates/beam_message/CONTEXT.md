@@ -161,6 +161,12 @@ Each entry names the crate/node that owns closing it; a gap another crate owns i
 - **No producer fills `Message.token`; it stays `NIL`** (owner: `beam_rt`, `## Handoffs`): `Message::with_token`/`set_token` and the relocation surface exist, and `beam_process`'s collection already gathers and relocates the word, but nothing stamps a token (`beam_rt/src/seq_trace.rs` lists token propagation as deliberately out of scope — the send event is emitted from the sender's own token instead).
   Stamping one also needs this crate's debug-only enqueue tripwire relaxed, since a token tuple is a heap term.
 - **The external EMQX messaging target is an honest skip** (owner: `tools/bench`, `## Handoffs`): `../tools/bench/RESULTS.md` records `emqx` → `skipped(emqx-requires-otp-28)` (the checkout pins OTP 28.5.0.7-2, the host is OTP 29.1.1), so it contributes no figure; the messaging category is measured in-repo by the `copy_bound` workload (`Category::Messaging`, both runtimes).
+- **A payload word that points into a fragment has no lifetime tie to it** (owner: any host of this crate; `beam_rt` today satisfies it by never releasing a `MailboxState`).
+  `Message::payload` (`src/message.rs`) and `HeapFragment::copy_root`/`roots` hand the root out **by value** as a bare `Eterm`, while the fragment's words live in a standalone `beam_alloc::Heap` block that `Heap`'s `Drop` frees the moment the `Fragments` chain drops (a dequeued/dropped `Message`, `Queue::clear`).
+  So such a word is valid only while the owning `Message`/`Fragments` is alive; the copy-out paths are `Fragments::move_into` and any `copy_struct` into a live heap, and `Message::with_payload` carries the same hazard in its docs.
+  `HeapFragment::push_root` and `Message::with_payload` are safe but **unvalidated** entry points — nothing checks that the word points into the region a later `move_into` reads.
+  Moving a `Message` (queue removal, a `Vec` reallocation) is fine: the block address is stable (only the `HeapFragment` struct moves).
+
 ## Handoffs
 Gaps whose owner is another crate, each with the exact API this crate adopts once it appears (or the exact call site the owner must add where the API already exists).
 - **The sender's copy charge** — owner `beam_rt`, with `beam_common` + `beam_process` supplying the parts.
