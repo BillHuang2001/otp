@@ -866,6 +866,186 @@ fn put_map_assoc_growing_past_the_limit_enumerates_exactly_the_inserted_pairs() 
         assert!(cmp(found[0].1, *value, &module.atom_table).is_eq());
     }
 }
+// -- the O(1) capacity count ---------------------------------------------
+
+/// The sizes the capacity count is checked at: the empty map, the two ends of the
+/// flat layout, the first hash map and two ordinary hash-map sizes.
+const KEY_COUNT_SIZES: [usize; 6] = [0, 1, 31, 32, 33, 1_000];
+
+/// The pair count `put_map_assoc`/`put_map_exact` reserve from is the map head's own
+/// size word (`beam_term::map::map_size`, O(1)) and it equals the length of the
+/// `terms::map_entries` walk it replaced — on **both** layouts, at every boundary.
+///
+/// This is the equivalence the capacity substitution rests on: the old expression was
+/// `map_entries(map)?.len() + pairs.len()`, so the O(1) accessor must return exactly
+/// that length or a reservation could under-size (a typed error from
+/// `make_map_rooted`'s capacity guard) for a well-formed map.
+#[test]
+fn the_map_size_word_equals_the_entry_walk_length_on_both_layouts() {
+    let module = Fixture::new(&[]).finish();
+    let mut ctx = MinimalContext::new();
+    for n in KEY_COUNT_SIZES {
+        let pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+            .map(|i| (make_small(i), make_small(i * 3)))
+            .collect();
+        let map = terms::make_map(&mut ctx, &pairs, &module.atom_table).unwrap();
+        assert_eq!(
+            terms::is_hashmap(map),
+            n > 32,
+            "n={n}: the layout boundary must stay at MAP_SMALL_MAP_LIMIT"
+        );
+        let walked = terms::map_entries(map).unwrap().len();
+        let counted = beam_term::map::map_size(map, &module.atom_table).unwrap();
+        assert_eq!(counted, n, "n={n}: the size word is the key count");
+        assert_eq!(
+            counted, walked,
+            "n={n}: the O(1) count must equal the walk it replaced"
+        );
+    }
+}
+
+/// The capacity count is *not* the input pair count: a source map whose keys are all
+/// distinct counts each once, so `map_size` cannot be confused with the (unsorted,
+/// possibly duplicate) pair list a merge builds.
+#[test]
+fn the_map_size_word_counts_distinct_keys() {
+    let module = Fixture::new(&[]).finish();
+    let mut ctx = MinimalContext::new();
+    // 33 distinct keys through a list that repeats them: `write_map` deduplicates
+    // last-value-wins, so the map holds 33 pairs while the input list holds 40.
+    let mut input: Vec<(Eterm, Eterm)> = (0..33i64).map(|i| (make_small(i), make_small(i))).collect();
+    input.extend((0..7i64).map(|i| (make_small(i), make_small(i + 100))));
+    let map = terms::make_map(&mut ctx, &input, &module.atom_table).unwrap();
+    assert_eq!(beam_term::map::map_size(map, &module.atom_table).unwrap(), 33);
+    assert_eq!(
+        terms::map_entries(map).unwrap().len(),
+        33,
+        "the hash map deduplicated the repeated keys"
+    );
+}
+
+/// A `put_map_assoc` over a 1 000-pair hash map produces exactly the map the
+/// reference builder produces for the merged pair list — same key set, same values,
+/// same **storage order** (the HAMT shape, not just `cmp` equality) — and repeating
+/// the instruction on the same source yields the identical map again.
+///
+/// This pins the *result* independently of the capacity arithmetic: the reservation's
+/// size only has to be an upper bound (the builder deduplicates), so a wrong count
+/// would show up here as a `make_map_rooted` capacity error or a wrong map, never as a
+/// silently truncated update.
+#[test]
+fn put_map_assoc_over_a_large_hash_map_matches_the_reference_builder() {
+    let mut fixture = Fixture::new(&[]);
+    // Overwrite an existing key (999) and add a new one (5 000).
+    let (entry, _name) = assoc_function(
+        &mut fixture,
+        vec![
+            (Operand::Integer(999), Operand::Integer(-1)),
+            (Operand::Integer(5_000), Operand::Integer(5_000)),
+        ],
+    );
+    let module = fixture.finish();
+    let atoms = &module.atom_table;
+
+    let mut ctx = MinimalContext::new();
+    let source_pairs: Vec<(Eterm, Eterm)> = (0..1_000i64)
+        .map(|i| (make_small(i), make_small(i * 3)))
+        .collect();
+    let source = terms::make_map(&mut ctx, &source_pairs, atoms).unwrap();
+    assert!(terms::is_hashmap(source));
+
+    let (first, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let first = first.unwrap();
+    let (second, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let second = second.unwrap();
+    assert!(
+        cmp(first, second, atoms).is_eq(),
+        "the instruction is deterministic"
+    );
+
+    // The reference: the source pairs with the same two updates applied, built by the
+    // general builder.
+    let mut merged = source_pairs.clone();
+    let position = |pairs: &[(Eterm, Eterm)], key: Eterm| -> Option<usize> {
+        pairs
+            .iter()
+            .position(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+    };
+    for (key, value) in [(make_small(999), make_small(-1)), (make_small(5_000), make_small(5_000))] {
+        match position(&merged, key) {
+            Some(index) => merged[index].1 = value,
+            None => merged.push((key, value)),
+        }
+    }
+    let reference = terms::make_map(&mut ctx, &merged, atoms).unwrap();
+
+    assert!(cmp(first, reference, atoms).is_eq(), "same map");
+    assert_eq!(
+        beam_term::map::map_size(first, atoms).unwrap(),
+        1_001,
+        "999 stays, 5 000 is added"
+    );
+    // Storage order too (the HAMT shape), which `cmp` alone would not pin.
+    let produced = terms::map_entries(first).unwrap();
+    let expected = terms::map_entries(reference).unwrap();
+    assert_eq!(produced.len(), expected.len());
+    for (got, want) in produced.iter().zip(expected.iter()) {
+        assert!(
+            cmp(got.0, want.0, atoms).is_eq() && cmp(got.1, want.1, atoms).is_eq(),
+            "storage-order pair mismatch: {got:?} vs {want:?}"
+        );
+    }
+}
+
+/// The same reference check for `put_map_exact`: a 1 000-pair hash map with every key
+/// already present keeps its 1 000 keys and takes the new values.
+#[test]
+fn put_map_exact_over_a_large_hash_map_matches_the_reference_builder() {
+    let mut fixture = Fixture::new(&[]);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutMapExact(Box::new(MapWriteArgs {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            dst: Operand::X(0),
+            live: 1,
+            pairs: vec![
+                (Operand::Integer(0), Operand::Integer(-7)),
+                (Operand::Integer(7), Operand::Integer(70)),
+            ],
+        })),
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+    let atoms = &module.atom_table;
+
+    let mut ctx = MinimalContext::new();
+    let mut source_pairs: Vec<(Eterm, Eterm)> = (0..1_000i64)
+        .map(|i| (make_small(i), make_small(i * 3)))
+        .collect();
+    let source = terms::make_map(&mut ctx, &source_pairs, atoms).unwrap();
+    assert!(terms::is_hashmap(source));
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+    let result = result.unwrap();
+
+    source_pairs[0].1 = make_small(-7);
+    source_pairs[7].1 = make_small(70);
+    let reference = terms::make_map(&mut ctx, &source_pairs, atoms).unwrap();
+    assert!(cmp(result, reference, atoms).is_eq(), "same map");
+    assert_eq!(
+        beam_term::map::map_size(result, atoms).unwrap(),
+        1_000,
+        "an exact update adds no key"
+    );
+    assert_eq!(
+        terms::map_entries(result).unwrap().len(),
+        1_000,
+        "and the walk agrees with the size word"
+    );
+}
+
 // -- put_map_exact -------------------------------------------------------
 
 #[test]
