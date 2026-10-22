@@ -232,6 +232,58 @@ Measured against a real system `erl` (`-sname` only on this host). Facts that bi
 - **Oracle `monitor_node/2` on us agrees**: `{nodedown,'rustnode@billmini'}` (bare 2-tuple, no reason) arrives on our death; no `{nodeup,_}` is emitted on a later connect — a real-OTP↔real-OTP **control reproduces exactly this**, so it is oracle behaviour, not a divergence.
 - **A `-sname` node survives a connected peer**: `kernel_sup`'s `global_name_server` → `net_kernel:monitor_nodes(true, #{connection_id => true})` → `nodes(visible, #{connection_id => true})` answers the peer with its **real per-link integer** (`native/net/nodes.rs::nodes_2` over `Runtime::dist_connection_id`), never a capability gap, so the peer can dial in and outlive any pass (`erl -sname peerprobe -setcookie c123` pings `rustnode@…` ⇒ `pong` with `kernel_sup`/`global_name_server` still live, and the fixture module's own `nodes(visible, #{connection_id => true})` prints `[{peerprobe3@billmini,#{connection_id => 1}}]`).
 
+## Module literal areas — shared by word, owned by the `Module` (cross-cutting)
+Binding facts for anyone asking "where does a module constant live, and can it be copied or freed?".
+
+- **A module's `LitT` literals live in one immutable `beam_alloc::Heap` owned by the module**
+  (`beam_loader/src/literal.rs:76-90`), reached as `Module::literal(idx) -> Option<Eterm>`
+  (`beam_loader/src/ir.rs:425-432`), held behind `Arc<LiteralArea>`
+  (`beam_loader/src/literal.rs:177-182`) and literal-tagged exactly once at load
+  (`beam_loader/src/literal.rs:112-124` → `beam_term::literal::tag_literal_area`,
+  `beam_term/src/literal.rs:162-170`). `Module::literal` returns a **copy of the word**, i.e. a
+  pointer into that area.
+- **`beam_rt` never resolves, rebuilds or copies a module literal.** No `.literal(`/`LiteralArea`
+  use exists in this crate's production code (the engine resolves `Operand::Literal` against
+  `&Module`), and the arena (`Runtime::alloc_words`, `runtime.rs:2351`; the admission seam
+  `context/gc.rs:1482-1521`) only ever carries **newly built** terms.
+- **Every copy this crate performs shares a literal verbatim, at zero destination words.**
+  `Runtime::stabilize_term`/`stabilize_term_with` (`runtime.rs:2399`/`:2553`), `copy_result_fresh`
+  (`context/calls.rs:1878-1890`), the two re-homing arms (`context/pool.rs:105`,
+  `context/calls.rs:1480`) all drive `beam_message`'s copier, whose `is_shared`
+  (`beam_message/src/copy.rs:267-275`) returns a literal-tagged compound word unchanged
+  (`shallow` `:506-508`, `push_fixup` `:297-301`). A **root** literal is therefore skipped by every
+  re-homing check by design: `result_is_foreign_container` (`context/calls.rs:1131-1134`), the
+  immediates/literals skip (`context/calls.rs:889-890`) and `relocate_off_scratch`
+  (`context/calls.rs:1361-1365`).
+- **No collector or window walk touches a literal.** `word_region` answers `None` for it
+  (`context/gc.rs:377-396`), and the same literal test guards the valve oracle
+  (`context/gc/valve_bounds.rs:104`), the reachability descent (`context/gc_walk.rs:174`), the
+  statement-window reclaim (`eval/reclaim.rs:472`, `eval/reclaim/resource.rs:313`) and the window
+  latch test (`eval/scratch.rs:390`).
+- **Consequence: an object on a process heap, the arena, `eval_heap` or a pooled BIF heap may hold
+  a literal word as a raw child, and that is sound only while the owning `Module` is alive.**
+  Retention is `CodeServer.modules: HashMap<String, Arc<Module>>` (`codeserver.rs:124`) plus every
+  live clone: `ProcessEntry::Export{module}` (`runner/entry.rs:47-56`), `LocalFunTarget.module`
+  (`context/apply.rs:66`), the fun-identity snapshot (`codeserver.rs:144-151`), the thread-local
+  descriptor index (`context/ir_cache.rs:272-278`), `get_until`'s continuation
+  (`native/file_server/get_until.rs:235`).
+- **Known issue — there is no literal-area release handshake.** The code store's one removal really
+  unloads (`erlang:delete_module/1` → `context/runtime_hooks.rs:824` → `CodeServer::forget_module`,
+  `codeserver.rs:820-828`; a reload replaces the entry, `codeserver.rs:772-780`), each dropping the
+  cache's `Arc`, while `erts_internal:purge_module/2` and
+  `erts_literal_area_collector:release_area_switch/0` are the oracle's `notsup`/unimplemented
+  (`context/runtime_hooks.rs:42,1518`) and no old-code slot exists. A term kept in a runtime store
+  that carries a literal **word** — a `persistent_term` value (`context/persistent_term.rs:32-77`),
+  a timer's `Msg` (`context/runtime_hooks.rs:1343`), a `seq_trace` label (`seq_trace.rs:287-292`),
+  and any copier-based store such as ETS or a mailbox — can therefore outlive the module whose
+  literal area it names. ERTS prevents this with the old-code slot plus the release handshake;
+  this runtime has neither.
+- **An `-eval` "literal" is a different thing**: the expression has no module literal area, so the
+  evaluator builds each source literal on the run's store every time (`eval/mod.rs:774-783`
+  bitstrings, `:2665-2679` integers, the string literal builder), and an `erlang:spawn/1` closure
+  is compiled into a real `beam_rt_eval_fun_<n>` module (`eval/compile.rs:180,445`) whose literal
+  area then belongs to the code server like any other module's.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's trailing test region — the contiguous run of `#[cfg(test)]`-gated modules at EOF, inline or sibling).
 - `src/port.rs` 5 116 lines, 5 085 of production (unit suite in `port/tests.rs`, 4 226 lines, plus 21 sibling `port/*_tests.rs` suites — `accept_inherit`, `active_input`, `active_input_e2e`, `async_ready`, `busy_suspend`, `busy_wait`, `command_matrix`, `completion`, `control_capability`, `driver_output_shape`, `exit_status_matrix`, `failure`, `failure_e2e`, `inet_matrix`, `inet_opts`, `monitor`, `packet_framing`, `peer_closed`, `ram_file_matrix`, `spawn_driver`, `stream_shape` — and `port/test_support.rs`).
