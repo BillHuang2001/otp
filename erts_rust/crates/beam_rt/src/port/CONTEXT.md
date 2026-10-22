@@ -109,6 +109,16 @@ One further `beam_io` point this wait touches: a send-then-close peer loses its 
 - The `SignalFacility` is a `thread_local` (not a `Runtime` field) because the runtime is single-threaded (`!Send`), so the slot *is* the process's one facility.
 - Never a fabricated success: failures are typed `BeamError`s and an unservable state/lifecycle returns the C's own failure code.
 - A payload is credited where it is harvested and the queue it came from is empty afterwards (`fold_notifications` + `drain_pending_events` for the data lane, `PortNotification::Closed` for the signal lane).
+## Pinned-term census (any relocation/compaction of the eval store or the engine arena)
+This node stores raw `Eterm` words that outlive the call that created them, so every one of them is a **root** for any relocation, and a **dangle** under a naive compaction.
+Four fields hold them, all pre-stabilised by their callers (`Runtime::stabilize_term` / `try_stabilize_escaped`) and all read back raw:
+- `ops.rs:132` `PortExtras::data: HashMap<u64, Eterm>` — `port_set_data/2`'s term, stabilised at `context/runtime_hooks.rs:602`, handed back verbatim at `ops.rs:239`; lives until `PortExtras::forget_port` (`ops.rs:186-193`).
+- `select.rs:152`/`select.rs:157` `SelectPayload::{Plain{reference},Custom{message}}: Eterm` and `select.rs:403` `SelectRegistration::handle: Eterm` — armed at `port.rs:1467` from `nif_select.rs:189-197` / `native/prim_tty.rs:329-330`, lives until `stop`/`cancel`/`take_ready`/`prune_dead`.
+- `select.rs:770` `handle_key` = `handle.raw() as u64` is this node's **only** term-as-key (an address-identity key), backing `by_fd_handle` (`select.rs:422`); a relocating compaction must re-key it, not just re-point it.
+- `driver.rs:510` `TermQueue::pending: Rc<RefCell<Vec<(Option<Eterm>, Eterm)>>>` and `driver.rs:846` `DriverPort::sent` — but both are built on `DriverPort::heap` (`driver.rs:820`, never reset, **not** `Runtime::eval_heap`), so they are outside an eval-store/arena-only compaction; `PortEvent::Term` (`port.rs:889`) carries one for a single port round and is copied out by `stabilize_driver_term` (`port.rs:4548`).
+`PortRegistry::heap` (`port.rs:1152`) is a **third** never-reset arena (the `port_info/1` result store) — same caveat.
+`completion.rs:571` latches the `-eval` statement window precisely because the decoded caller tag (`completion.rs:579`, onto `Runtime::eval_heap`) is held in no struct field this node owns.
+Nothing here is relocatable as-is, and no field of this node holds a `*mut Eterm` (the single occurrence, `watch.rs:49`, is prose explaining why the runtime is `!Send`).
 ## Measured — the poll budget a pass hands this layer (`startup_ms`)
 The largest wall-clock cost this layer can impose on a CLI start-up is **not work**: the *blocking budget* a zero-slice scheduler pass hands `PortRegistry::pump`.
 - **`PORT_POLL_SLICE` is 25 ms**, *both* the poller's inner clamp and the `port_timeout` an empty pass passes in (`../runtime/scheduler.rs::scheduler_pass`), so a live-but-idle port costs a whole `epoll_wait(…, 25)` per such pass — `strace -f -w` measures five `epoll_wait(3, [], 1024, 25) = 0` at 25.07–26.2 ms each when it does.
