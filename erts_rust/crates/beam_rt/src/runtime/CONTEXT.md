@@ -204,10 +204,7 @@ verbatim — and the region it names becomes the next collection's to-space. The
 (`collection_debt`/7-of-8 occupancy, `reds_door.rs:215-245`) currently decline right after a fresh
 collection, which is why this is latent rather than constant. The fix is to run the boundary door **before**
 `serve_gc_request`, or to skip it when a request was served.
-A resume can also fail to scatter at all: `scatter_roots_full`'s length check (`context/gc.rs:851`) counts the
-parked loose terms `Machine::with_roots` re-derives (`../../beam_engine/src/machine/mod.rs:878
-LOOSE_HEAP_TERMS = 3`), so a loose field armed or disarmed across the window makes it answer `false` →
-`halt_process_gc` → the machine keeps its pre-collection words with no scatter.
+A resume can also fail to scatter at all: `scatter_roots_full`'s length check (`context/gc.rs:856`) counts the parked loose terms `Machine::with_roots` re-derives — the two failed-clause argument latches, the pending exception's reason and the two supplied-trace term latches (`../../beam_engine/src/machine/mod.rs:928`, `LOOSE_HEAP_TERMS = 5`) — so a loose field armed or disarmed across the window makes it answer `false` → `halt_process_gc` → the machine keeps its pre-collection words with no scatter.
 
 ## The scheduled path's fixed costs (read before optimizing this crate's glue)
 `run_scheduled` (the CLI `run` action) drives **one** target pid after `boot_if_needed`.

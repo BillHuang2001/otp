@@ -204,7 +204,7 @@ This node owns **which** arm publishes and **when** it may skip, and these are i
 * `fr_mark` is an **exact upper bound** after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by over-protecting: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park publishes **no** FR word instead of the 1024 slots `process.regs` would carry.
 * The count is stored on `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never sees a length mismatch (which would halt the process's collection).
 * `publish_parked_roots` **also** publishes the parked machine's live pending-exception reason (`Machine::pending_exception`) — the one term a parked machine holds that the closed `RootSet` shape cannot carry, because it is a machine *field*, not an `x`/stack/FR slot — as the process's `Registers::extra_roots` word (the host escape hatch `beam_process`'s `gather_roots`/`scatter_roots` relocate in place); with **no** live pending exception the extra-root set is left **empty** (cleared, never a NIL/placeholder), so a stale root can never keep an otherwise-dead term alive.
-* **The word it publishes is live by construction, so it is published unfiltered.** `Machine::with_roots` parks the machine's loose heap terms — the two failed-clause argument latches **and** the pending exception's reason (`beam_engine/src/machine/mod.rs`, `const LOOSE_HEAP_TERMS = 3`) — at the tail of the Erlang stack for the closure's duration and re-seats every field from the slot the host wrote back, and that funnel sits behind `Machine::alloc_rooted`/`Machine::ensure_heap`, hence behind **every** in-slice collection door on every tier: a machine that has left the slice and parked here was never moved out from under the field.
+* **The word it publishes is live by construction, so it is published unfiltered.** `Machine::with_roots` parks the machine's loose heap terms — the two failed-clause argument latches, the pending exception's reason **and** the two supplied-trace term latches (`beam_engine/src/machine/mod.rs`, `const LOOSE_HEAP_TERMS = 5`) — at the tail of the Erlang stack for the closure's duration and re-seats every field from the slot the host wrote back, and that funnel sits behind `Machine::alloc_rooted`/`Machine::ensure_heap`, hence behind **every** in-slice collection door on every tier: a machine that has left the slice and parked here was never moved out from under the field.
   An extra root is a **relocation channel, not a liveness claim**, so the published word is always an immediate or a literal-area pointer (nothing a collection moves) or a container inside a region `pid`'s own collector relocates — never a word a collection would have to follow without being able to move it.
   Pinned by `beam_engine`'s `tests/raise_rooting.rs::pending_exception_reason_survives_a_collection` and by this node's `a_parked_machines_pending_exception_reason_survives_a_moving_collection`, `publishing_a_machine_without_a_pending_exception_leaves_no_extra_root` and `publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extra_root`.
 * `resume_from_process_roots(ctx, pid, machine, fr_count)` is `RuntimeContext::resync_parked_roots`, called with the **same** `fr_count` the matching park used (`engine.fr_published`): it copies the process's authoritative root set back into the machine (the leading FR words only up to `fr_count`), reads the (already-relocated) extra-root reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
@@ -447,8 +447,8 @@ gathers every published slot, and no production site shrinks `live`. `is_pointer
 `(word & 3) != 3`, i.e. exactly "not `TAG_PRIMARY_IMMED1`" (`beam_term/src/tag.rs:37-45`,
 `boxed.rs:73-74`, `list.rs:68`), so an atom/small/NIL can never be bound away by
 `pointer_prefix_len`. `Machine::pending_exception`'s reason is covered on **both** sides of a park: in
-slice by `Machine::with_roots`' loose-heap-term parking (`beam_engine/src/machine/mod.rs:846-867`) and
-across one as `Registers::extra_roots` (`run.rs:622-647`). What is NOT covered by any root set: the
+slice by `Machine::with_roots`' loose-heap-term parking (`beam_engine/src/machine/mod.rs:867-1006`) and
+across one as `Registers::extra_roots` (`run.rs:656-662`). What is NOT covered by any root set: the
 marshalled BIF `args` copy (`beam_engine/src/interpreter/bif.rs:103-133`, `:165-187`) at the `&self`
 door `Machine::dispatch_bif_call` (`bif.rs:324`) which has no write-back channel, and the
 `Runtime`-owned term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox`
@@ -465,7 +465,7 @@ words and the process keeps running on them, so the failure surfaces later as a 
 than a typed error.
 The resume's re-derivation is self-consistent only because nothing on the host side touches the machine
 between park and resume: `scatter_roots_full` recomputes the expected width as `machine.stack.len() +
-armed loose terms` (`gc.rs:851`), and that count can only differ from the park's if the machine's stack or
+armed loose terms` (`gc.rs:856`), and that count can only differ from the park's if the machine's stack or
 its loose-term latches changed while parked.
 
 ## Routing Table
