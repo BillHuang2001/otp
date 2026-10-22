@@ -130,7 +130,8 @@ A dangling pointer whose target was **freed/unmapped** (a SIGSEGV, not a wrong t
   Reachable only from `collect_minor`→`collapse` (`collector.rs:361`), `collect_major`→`collapse_after_fullsweep` (`collector.rs:467`) and the Immix siblings (`immix_collector.rs:622,724,881`) — i.e. only **after** a round evacuated the whole chain, so the precondition is "the copier forwarded every live word reachable from the slice it was given".
 - `collector.rs:452` `self.mature = fresh; // drops the old mature space` and `immix_collector.rs:858` `self.mature = fresh` (`relocate_major`).
   Same precondition, over the fullsweep's single from-set (nursery chain + mature).
-- `mso.rs:364` `*slot = None` in `OffHeap::sweep` — drops the entry, and the payload's `beam_alloc` carrier comes back when the roster held the last reference (`MsoHandle::drop`'s `Box::from_raw`).
+- `mso.rs:364` `*slot = None` in `OffHeap::sweep` — drops the entry, so the payload goes when the roster held the last reference.
+  `MsoHandle::drop`'s `Box::from_raw` (`mso.rs:143-152`) frees through the **global** allocator, not `beam_alloc` — `Mso::new` boxes it (`mso.rs:72-77`) and nothing in production installs a custom `#[global_allocator]` — so a large MSO payload is the one site here whose pages glibc itself may `munmap`; a `RefcBinary` payload returns through the `beam_alloc` carrier path instead (`beam_alloc/src/binary.rs:511-529`).
 - `beam_alloc::Heap::drop` (`beam_alloc/src/heap.rs:242-260`, `self.alloc.dealloc(ptr, layout)`) is the OS free behind all of the above.
 - **Recycle-class only** (never a SIGSEGV source): `HeapSpace::reset` (`space.rs:102`, rewinds `used`), `ImmixSpace::reset` (`immix/mod.rs:462`, "Invalidation, not reclamation"), `release_dead_lines`/`finalize` (`immix/collect.rs:282,298`, bits inside a still-live region), `release_words`/`release_lines` (`immix/mod.rs:640,677`) and `promote.rs::rollback` (reservation rollback; never dereferences `ptr`).
 
