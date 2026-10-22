@@ -103,7 +103,7 @@
 //! * **The escaped runtime store holds it.** `Runtime::adopt_escaped_binaries` **clones** every
 //!   handle a finished nested machine left into `Runtime::eval_off_heap`
 //!   (`crates/beam_rt/src/runtime.rs:1618-1630`, called from the nested run's teardown at
-//!   `crates/beam_rt/src/context/pump.rs:282-284`), so a payload that store owns is a second owner
+//!   `crates/beam_rt/src/context/pump.rs:472`), so a payload that store owns is a second owner
 //!   with `refcount() > 1` and survives.
 //! * **Nested machines are never pruned — the correct decline.** `RuntimeContext::run_export`,
 //!   `apply_fun` and the `-eval` evaluator run a machine synchronously and drop it (adopting its

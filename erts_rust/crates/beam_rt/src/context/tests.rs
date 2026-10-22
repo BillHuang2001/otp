@@ -8633,10 +8633,10 @@ fn the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve() {
     //     arms, right beside `note_reached`): `declared_words` is the size of the root set the
     //     machine actually hands over — the x file's **used extent**, the whole Erlang stack and
     //     the FR file's used extent (`Machine::with_roots`,
-    //     `beam_engine/src/machine/mod.rs:768-782`; the frozen root-set contract in
+    //     `beam_engine/src/machine/mod.rs:907-913`; the frozen root-set contract in
     //     `beam_engine/src/context.rs:199-208`: "each carries the file's *used extent* … never a
     //     whole file"), and `published_words` is each register file's **pointer-bearing prefix**
-    //     plus the whole stack (`machine_root_bounds`, `gc.rs:659-661`) — the exact words phase 1
+    //     plus the whole stack (`machine_root_bounds`, `gc.rs:664-666`) — the exact words phase 1
     //     seeds and `publish_roots_full` pushes. `machine_words` is that same declared figure,
     //     recorded beside it by `note_reached`, so the pair states the bound as a **structure**:
     //     the pointer-bearing prefix can never exceed the slice it prefixes, the hand-off carries

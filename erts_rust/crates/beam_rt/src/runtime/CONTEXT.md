@@ -55,8 +55,8 @@ The collection gate is the **two-phase unscanned-root valve** (`context/gc.rs::r
 
 ## Re-entrancy: a nested pass cannot run the run queue (and has no guard that would stop it)
 `scheduler_pass` **extracts every mutable table before its first round** and restores them unconditionally at the end: `take_processes` (`scheduler.rs:916` → `:1756`, which `mem::replace`s `self.processes` with a **fresh empty** `ProcessTable::new`), `mem::replace(&mut self.scheduler, Scheduler::new())` (`:917`) and `mem::take(&mut self.runner_state)` (`:918`), restored at `:1285-1287`. So a pass invoked *from inside a slice* would drive those three placeholders and, on return, have its writes silently discarded by the outer restore. `run_ready` is therefore given `&mut table` / `&mut scheduler` / a `RuntimeRunner::new(self, &mut state)` explicitly (`:944-947`) — the state is threaded, never re-read from `Runtime`.
-* **The guard is cooperative only.** `RuntimeContext::may_pump_scheduler` (`../context/runtime_context.rs:260`, `false` in `for_process*`) is checked at **exactly one site**, `pump_once`'s first line (`../context/pump.rs:547-549` → `Ok(None)` → the typed `blocked()`). No `in_pass` flag, no debug assertion, no `RefCell` on the pass itself exists: a nested `scheduler_pass` would not trip anything, it would corrupt silently. The port registry's `try_borrow_mut` (`with_port_table` `:1801`, `deliver_port_messages` `../port.rs:4044`) and `is_quiescent`'s `Err ⇒ not quiescent` (`:687`) are the only borrow-level brakes.
-* **`&mut Runtime` is *owned* by the `RuntimeContext` for the whole slice** (`ctx.runtime`), so `self.runtime.pump_scheduler(..)` from inside `call_bif` does not typecheck as written — the borrow is already lent to the context and the context is the only holder. A mid-slice caller also cannot reach the pass's `ProcessTable` except through `RuntimeContext::mailbox_table` (`process_table_mut`), and during a slice the executing pid's `ProcessEngine` is out of `RunnerState::engines` (`../runner/run.rs:811`) while its `Process` is `Running`, so `has_unpublished_roots()` is `true` (`../../beam_process/src/process.rs:1439-1440`) — every delivery into it takes the heap-fragment route and no collection may move its heap.
+* **The guard is cooperative only.** `RuntimeContext::may_pump_scheduler` (`../context/runtime_context.rs:260`, `false` in `for_process*`) is checked at **exactly one site**, `pump_once`'s first line (`../context/pump.rs:578-580` → `Ok(None)` → the typed `blocked()`). No `in_pass` flag, no debug assertion, no `RefCell` on the pass itself exists: a nested `scheduler_pass` would not trip anything, it would corrupt silently. The port registry's `try_borrow_mut` (`with_port_table` `:1801`, `deliver_port_messages` `../port.rs:4044`) and `is_quiescent`'s `Err ⇒ not quiescent` (`:687`) are the only borrow-level brakes.
+* **`&mut Runtime` is *owned* by the `RuntimeContext` for the whole slice** (`ctx.runtime`), so `self.runtime.pump_scheduler(..)` from inside `call_bif` does not typecheck as written — the borrow is already lent to the context and the context is the only holder. A mid-slice caller also cannot reach the pass's `ProcessTable` except through `RuntimeContext::mailbox_table` (`process_table_mut`), and during a slice the executing pid's `ProcessEngine` is out of `RunnerState::engines` (`../runner/run.rs:896`) while its `Process` is `Running`, so `has_unpublished_roots()` is `true` (`../../beam_process/src/process.rs:1439-1440`) — every delivery into it takes the heap-fragment route and no collection may move its heap.
 * **Every service step IS separately callable**, which is the half a nested pass *could* use: `Runtime::service_file_requests` (`../native/file_server.rs:324`), `deliver_port_messages` (`../port.rs:4036`), `fire_due_timers` (`:1679`), `deliver_gc_completions` (`gc.rs:414`), `service_net_kernel` (`../native/net_kernel.rs:206`), `service_node_monitors` (`../runtime.rs:3102`), `pump_dist`/`pump_dist_client`, plus the non-delivering drains — each takes `&mut self` and at most `&mut ProcessTable`, none touches `Scheduler`/`RunnerState` except `absorb_pending_spawns`/`absorb_fragment_wakes`/`absorb_timer_wakes` and `drain_ets_owner_exits` (`&mut Scheduler`). What is missing for a service-only nested pass is a driver function that sequences them (that sequencing lives inline in the pass's `loop`) plus the wake-list bookkeeping, which belongs to the outer `Scheduler` the context cannot reach.
 
 ## Every site that can relocate a process heap (the soundness inventory)
@@ -69,7 +69,7 @@ pending-signal queue, gathered/scattered by `run_rooted_collection`
   `alloc_words_rooted:1568` (the *running* process; publish → collect → scatter);
 * the reduction/yield-boundary door — `../context/gc/reds_door.rs::collect_at_reds_boundary:176`
   (refuses `is_relocation_exempt` at `:216`, then the interval/occupancy gates at `:191`/`:234`);
-* `Runtime::serve_gc_request` (`gc.rs:507`), called from the runner's Yield arm (`../runner/run.rs:1241`)
+* `Runtime::serve_gc_request` (`gc.rs:507`), called from the runner's Yield arm (`../runner/run.rs:1374`)
   and Wait arm (`:1392`);
 * **message delivery**, i.e. the *receiver's* heap — `ProcessTable::deliver`
   (`../../beam_process/src/ptab.rs:858`, gate consulted at `:879-896`) → `Process::deliver`
@@ -179,7 +179,7 @@ There is **no** `{setup,…}`/`{nodeup,…}` control exchange in OTP distributio
 
 ## The inter-slice window's relocating doors, and the one ordering hazard
 A `Yield` park with a **dead** FR prefix (`fr_count == 0`) publishes the machine's whole root set into the
-process's `Registers` (`../runner/run.rs:1295 park_machine` → `../runner/run.rs:622 publish_parked_roots`) and
+process's `Registers` (`../runner/run.rs:744 park_machine` → `../runner/run.rs:638 publish_parked_roots`) and
 leaves the process **not** relocation-exempt, so every site that delivers into the parked pid between slices
 may collect over those registers: `deliver_port_messages`, `fire_due_timers`, `deliver_gc_completions`,
 `service_file_requests`, `drain_ets_owner_exits`, `dispatch_dist_inbound`/`dispatch_dist_client_inbound`, all
@@ -191,11 +191,11 @@ and a `Yield` park with a live FR prefix are exempt and publish nothing, so thos
 Inside a slice the process is `Running`, so `slice_begin`'s `service_signals`
 (`../../beam_process/src/scheduler.rs:690`) and every in-slice delivery take the fragment route.
 **The machine is stale from the moment one of these doors collects** until the matching resume scatters
-(`../runner/run.rs:939 resume_from_process_roots` → `RuntimeContext::resync_parked_roots` →
-`context/gc.rs:839 scatter_roots_full`). Nothing in the window re-reads the machine, so that is sound.
+(`../runner/run.rs:681 resume_from_process_roots` → `RuntimeContext::resync_parked_roots` →
+`context/gc.rs:844 scatter_roots_full`). Nothing in the window re-reads the machine, so that is sound.
 **Known issue — one ordering in the `Yield` arm breaks that invariant.** `serve_gc_request`
 (`../runner/run.rs:1305` → `gc.rs:507`) collects over the process's registers, leaving the machine's own
-`x`/`stack` pointing into the abandoned from-space; `collect_at_reds_boundary` (`../runner/run.rs:1313` →
+`x`/`stack` pointing into the abandoned from-space; `collect_at_reds_boundary` (`../runner/run.rs:1393` →
 `context/gc/reds_door.rs:185`) then **re-publishes from the machine**
 (`reds_door.rs:288 publish_roots_full`), collects over those stale words and scatters the result back
 (`reds_door.rs:356`). The collector classifies an out-of-from-space word as `Target::Foreign`

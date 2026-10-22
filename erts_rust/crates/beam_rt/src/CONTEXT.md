@@ -69,9 +69,9 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `Evaluator` holds only `ctx: &'a mut RuntimeContext<'b>` (`eval/mod.rs:460-463`) — the tree-walker
   builds terms through `beam_engine::terms`/`beam_bifs`, never through an engine. The only
   `Machine`s on this route are the **per-nested-call, short-lived** ones in
-  `context/pump.rs:270` (`run_export_blocking`) and `:340` (`run_label_blocking`), dropped at scope
-  exit after `Runtime::adopt_escaped_binaries(machine.refc_binaries())` (`pump.rs:282-283`,
-  `:349-350` → `runtime.rs:1618`). So there is no long-lived `Machine::refc_binaries` reservoir to
+  `context/pump.rs:268` (`run_export_blocking`) and `:356` (`run_label_blocking`), dropped at scope
+  exit after `Runtime::adopt_escaped_binaries(machine.refc_binaries())` (`pump.rs:472`
+  → `runtime.rs:1618`). So there is no long-lived `Machine::refc_binaries` reservoir to
   prune: the reservoir-equivalents are `Runtime` fields.
 - **`RuntimeContext::new` sets `mailbox_table: None`** (`context/runtime_context.rs:176-191`), so on
   this route `ExecutionContext::alloc_words`/`alloc_words_rooted` (`context/execution.rs:498,509`)
@@ -98,7 +98,7 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `eval_heap`. `binary:copy/2` likewise builds **on-heap** on the pooled BIF heap
   (`beam_bifs/src/binary.rs:679-697`, refusing `system_limit` past the region's `available()*8`), and
   the container result is then re-homed onto `eval_heap` (`context/pool.rs:105
-  move_result_into_runtime_store` ← `calls.rs:1175 rehome_container_result`, chosen because
+  move_result_into_runtime_store` ← `calls.rs:1395 rehome_container_result`, chosen because
   `mailbox_table.is_none()`).
 - **Off-heap refc payloads on this route come only from a nested `Machine`** (`bs_init_writable`/
   `bs_create_bin` → `beam_engine/src/machine/mod.rs:791/834 refc_binaries`), and their handles are
@@ -107,17 +107,17 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   `beam_codec/CONTEXT.md`), and `stabilize_term` (`runtime.rs:1456`, the `-eval` single-pass form)
   **flattens** an unresolvable payload on-heap.
 - **The runner's park prune cannot be reused here.**
-  `context/gc/bin_vheap.rs:352 reclaim` needs `&mut ProcessTable` + a `Process` (for
+  `context/gc/bin_vheap.rs:359 reclaim` needs `&mut ProcessTable` + a `Process` (for
   `collector().scanned_bounds()`) + `&mut Machine`; and its gate 6
   (`context/gc_walk.rs:381 reaches_an_unscanned_word`) uses `Criterion::PayloadPrune`
   (`gc_walk.rs:791-798`), which answers `hit = true` on the **first pointer-bearing word in
   `WordRegion::Foreign`** — and every eval-route root (arena / `eval_heap` / retired regions) is
-  `Foreign` by construction (`context/gc.rs:370 word_region`, `WordRegion` at `:259`). So a prune
+  `Foreign` by construction (`context/gc.rs:382 word_region`, `WordRegion` at `:271`). So a prune
   against the walker's roots always declines, and
   `beam_gc::for_each_reachable_binary_payload` (`beam_gc/src/offheap.rs:107`, whose walk only enters
   a from-space word) can never see them either.
 - **The only region-agnostic walker in this crate** is `RuntimeContext::graph_holds_reference`
-  (`context/calls.rs:1049`) — a `#![allow(unsafe_code)]` `Walklist` walk over
+  (`context/calls.rs:1221`) — a `#![allow(unsafe_code)]` `Walklist` walk over
   `beam_term::layout::for_each_child_slot` (`beam_term/src/layout.rs:303`) with the
   `dereferenceable_pointer`/`is_term_word`/`is_literal` guards, no visited set and a
   `WALK_VISIT_BUDGET`. It answers "does this graph hold a reference", not "which payloads does it
@@ -245,7 +245,7 @@ Binding facts for anyone asking "where does a module constant live, and can it b
 - **`beam_rt` never resolves, rebuilds or copies a module literal.** No `.literal(`/`LiteralArea`
   use exists in this crate's production code (the engine resolves `Operand::Literal` against
   `&Module`), and the arena (`Runtime::alloc_words`, `runtime.rs:2351`; the admission seam
-  `context/gc.rs:1482-1521`) only ever carries **newly built** terms.
+  `context/gc.rs:1536-1578`) only ever carries **newly built** terms.
 - **Every copy this crate performs shares a literal verbatim, at zero destination words.**
   `Runtime::stabilize_term`/`stabilize_term_with` (`runtime.rs:2399`/`:2553`), `copy_result_fresh`
   (`context/calls.rs:1878-1890`), the two re-homing arms (`context/pool.rs:105`,
@@ -256,7 +256,7 @@ Binding facts for anyone asking "where does a module constant live, and can it b
   immediates/literals skip (`context/calls.rs:889-890`) and `relocate_off_scratch`
   (`context/calls.rs:1361-1365`).
 - **No collector or window walk touches a literal.** `word_region` answers `None` for it
-  (`context/gc.rs:377-396`), and the same literal test guards the valve oracle
+  (`context/gc.rs:382-400`), and the same literal test guards the valve oracle
   (`context/gc/valve_bounds.rs:104`), the reachability descent (`context/gc_walk.rs:174`), the
   statement-window reclaim (`eval/reclaim.rs:472`, `eval/reclaim/resource.rs:313`) and the window
   latch test (`eval/scratch.rs:390`).

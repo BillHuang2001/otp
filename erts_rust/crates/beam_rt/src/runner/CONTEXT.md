@@ -190,7 +190,7 @@ A collection driven while the process is parked — `Process::deliver`'s exit ca
 [`run`] therefore hands the machine over at **all three** park arms — the pre-emption/`Yield` arm, the `Ok(EngineRunOutcome::Wait)` arm and the `Ok(EngineRunOutcome::Suspend)` (BIF-park) arm — through the **one** entry point `park_window(table, pid, engine, fr_count, ParkExemption)`, right before `engines.insert`, and calls `resume_from_process_roots(ctx, pid, machine, fr_count)` after `ctx.enter_module(module)` when `engine.parked.is_some()`.
 **The invariant is `skipped publication ⇒ the window holds the relocation exemption`**, and it is structurally impossible to split: `park_window` derives one `exempt` value from its `ParkExemption` argument, writes the flag from that value **in both directions** (so a publishing window can never inherit a stale `true`) and then delegates the publication to `park_machine(table, pid, engine, fr_count, exempt)`. A park arm therefore chooses a `ParkExemption` and cannot forget the flag — `Always` (the `receive` park, whose window a delivery or a signal really enters) or `LiveFloats` (`fr_count > 0`, the pre-emption and BIF-suspend parks, whose machine keeps those FR slots as roots of its own). The exemption has exactly **one writer** (`park_window`) and one clearer (`run`'s parked branch, `set_relocation_exempt(pid, false)`, which is where a parked window ends).
 `park_machine` is the publication half only (`fn`, `park_window` its sole caller): it always records the live FR-prefix count on `ProcessEngine::fr_published`, but publishes only a window that is **not** relocation-exempt — an exempt window sets `ProcessEngine::parked_published = false` and returns `false` without publishing, while a non-exempt one sets `parked_published = true`, calls `publish_parked_roots` and returns `true`.
-`parked_published` is therefore an **unconditional** claim, not `publish_roots_full`'s answer: `publish_parked_roots` (`run.rs:637-639`) discards the helper's `bool` and `park_machine` (`run.rs:745-746`) never reads one — sound only because both of `publish_roots_full`'s `false` arms are structurally unreachable today (`live = roots.x.len().min(MAX_REG)` cannot fail `set_live`, and the stack-length check cannot mismatch on the one append order), so any future change that can make it fail must gate `parked_published` on the answer instead, or the `Yield` arm's `collect_at_reds_boundary`/`reclaim_off_heap_binaries` would run against a **partially** published root set.
+`parked_published` is therefore an **unconditional** claim, not `publish_roots_full`'s answer: `publish_parked_roots` (`run.rs:653-655`) discards the helper's `bool` and `park_machine` (`run.rs:745-746`) never reads one — sound only because both of `publish_roots_full`'s `false` arms are structurally unreachable today (`live = roots.x.len().min(MAX_REG)` cannot fail `set_live`, and the stack-length check cannot mismatch on the one append order), so any future change that can make it fail must gate `parked_published` on the answer instead, or the `Yield` arm's `collect_at_reds_boundary`/`reclaim_off_heap_binaries` would run against a **partially** published root set.
 The `Yield` and `Suspend` arms pass `ParkExemption::LiveFloats` and the `Wait` arm passes `ParkExemption::Always`.
 `resume_from_process_roots` therefore runs **only** when the matching park published (`engine.parked_published`), which is then cleared; the window's `set_relocation_exempt(pid, false)` is cleared unconditionally afterwards.
 **The skip is sound because for the exempt window's whole duration nothing can relocate this process's heap**: `Process::collect`/`ensure_capacity`/`collect_if_needed` return the typed refusals, `ProcessTable::deliver` declines, the host collection gate's `declines_relocation` declines and `Runtime::serve_gc_request` returns `false` on `is_relocation_exempt`, and `Process::grow_nursery` — the one growth path that is deliberately not gated — relocates nothing.
@@ -217,7 +217,7 @@ Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1
 The runner's raise arm **is the escape boundary for a raised error**: it stabilizes the `BeamError` itself — its structured reason term is a raw `Eterm` in the raise's live-reason slot, built on the dying process's heap or on the recyclable pooled BIF region — through `Runtime::stabilize_error_live_reason`, with the copy's `SourcePayloads` built by `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap family the pid retained from received messages — refc binaries, MSO handles and node identities), so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared instead of tripping the valve, whether the process built it or received it. The recorded **exit reason** is then derived from the stabilized error (`reason::exit_reason`: atom → the stabilized live term → interned `Display` text), so one copy serves both the exit propagation and every later rendering; a reason that genuinely cannot be copied is still the honest `error:system_limit`, never a stored dangling word. `Runtime::as_action_process` is the same boundary for the `-eval`/`-s`/`-run`/boot-directive routes.
 
 ## The off-heap refc-binary reclamation at the slice boundary
-`run.rs`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` (`run.rs:367`) → `context::gc::reclaim`, called immediately after `collect_at_reds_boundary` and before `take_max_heap_kill` on the same park (`run.rs:1214`).
+`run.rs`'s `Yield` arm is the **one** site that prunes the machine's payload reservoir: `RuntimeRunner::reclaim_off_heap_binaries` (`run.rs:456`) → `context::gc::reclaim`, called immediately after `collect_at_reds_boundary` and before `take_max_heap_kill` on the same park (`run.rs:1412`).
 It is here because a prune is sound only against the process's **complete** root set, and the park is the one site holding `&mut Machine` (the runner just drove it), `&mut Process` (through the table) and `&mut Runtime` at once; a heap-admission door runs *inside* a slice, where the engine is held out of `RunnerState::engines` and the `ExecutionContext` seam exposes no `&mut Machine` at all.
 `reclaim_off_heap_binaries` refuses unless `engine.parked_published` — the park's own contract that the machine's whole root set was handed to the process.
 `Process::has_unpublished_roots()` is deliberately **not** the gate: it is `true` for a `Running` process, which a pre-empted process still is.
@@ -240,17 +240,17 @@ Beyond the `BudgetContext` charges (a per-instruction `reduce` on the interprete
 `ensure_heap` doors, and a per-BIF/per-call `spend` on the native tier), one slice's prologue/epilogue
 does this host work (each is amortized over the whole 4000-reduction budget, so it is per-`run`, never
 per-iteration):
-* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:383`/`817`), the
-  FR prefix read `Machine::fr_mark()` (`run.rs:677`), the tier lookup (`run.rs:430-438`),
-  `note_reductions` (`run.rs:602`), `serve_gc_request` (early-returns without a pending request),
-  and — on the `Yield` arm only — `current_code()` (`run.rs:778`) and
-  `reset_reductions`/`bump_reductions` (`run.rs:791-792`).
+* **O(1), no allocation:** `RunnerState::engines.remove(&pid)` / `insert` (`run.rs:896`/`:1340`), the
+  FR prefix read `Machine::fr_mark()` (`run.rs:1296`), the tier lookup (`run.rs:430-438`),
+  `note_reductions` (`run.rs:1219`), `serve_gc_request` (early-returns without a pending request),
+  and — on the `Yield` arm only — `current_code()` (`run.rs:1329`) and
+  `reset_reductions`/`bump_reductions` (`run.rs:1348-1349`).
 * **One allocation per slice:** `RuntimeContext::enter_module` (`run.rs:475` →
   `../context/runtime_context.rs:501-508`) builds a fresh `String` of the module name on **every**
   slice (a `RuntimeContext` itself is a stack value: `for_process_with_engines`, no heap alloc).
 * **O(size), on a park whose window is NOT relocation-exempt:** `park_window` → `park_machine` (`run.rs:959`,
   `run.rs:1084`) calls `publish_parked_roots` → `gc::publish_roots_full`
-  (`../context/gc.rs:370-395`), which copies the whole x file
+  (`../context/gc.rs:799-824`), which copies the whole x file
   (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
   Erlang stack plus the live FR prefix onto the process's root set. An exempt window — the `Wait`
   arm, and a `Yield` arm whose slice ended with a live FR prefix — skips the copy entirely.
@@ -260,9 +260,9 @@ per-iteration):
   since no slot is ever handed out on the process's own (never-compacted) off-heap table, and the
   reservoir is pruned only on a triggered `Yield` park (see *The off-heap refc-binary reclamation at the
   slice boundary*).
-* **First entry / flag-gated only:** `record_baseline_code` (`run.rs:692-694`, `+JPperf` only), the
-  `Arc::clone` of the entry module (`run.rs:413-420`), and `describe_site` (debug-trace only).
-  `source_payloads` (`run.rs:840-842`/`970-971`) runs only on the terminating `Returned`/`Err` arms.
+* **First entry / flag-gated only:** `record_baseline_code` (`run.rs:1300-1302`, `+JPperf` only), the
+  `Arc::clone` of the entry module (`run.rs:935`), and `describe_site` (debug-trace only).
+  `source_payloads` (`run.rs:1455`/`:1674`) runs only on the terminating `Returned`/`Err` arms.
 * **No production time read:** `Instant` appears only in `runner/tests.rs`; the slice path does no
   `sys` call of its own.
 
@@ -372,8 +372,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   The seam that would close it is a `ProcessTable::service_receive_signals(pid)` in `beam_process` — apply the head signal while its `exit_policy` is not `Terminate`, in FIFO order — which a sibling node owns.
 
 ## Known Issues / Handoffs
-* **An early return out of `run` between the engine take-out and a re-insert drops that process's machine.** The take-out is `run.rs:823`; the `Yield` arm's `current_code() == None` return (`run.rs:1271`) and the two `?`s at `run.rs:1313`/`:1321` all return while `engine` is still a local. The pid stays on the run queue, so the next slice answers `refuse_engine_less` → `Wait` with the state restored to `Runnable` (`run.rs:313-334`) and nothing ever runs it again — and the machine, the only holder of that process's live x/stack while it is parked, is gone. Minimal fix: re-insert the engine before returning the error.
-* **`RunnerState`'s per-pid maps are never pruned on process death.** The only `engines.remove` is the slice take-out (`run.rs:823`), so a terminated parked process keeps its machine (and that machine's refc-binary reservoir) for the runtime's life; `gather_off_heap_roots` gates the dead machine's dangling root set on `live(pid)` (`entry.rs:506`), so the residue is a leak, never a read.
+* **An early return out of `run` between the engine take-out and a re-insert drops that process's machine.** The take-out is `run.rs:896`; the `Yield` arm's `current_code() == None` return (`run.rs:1329`) and the two `?`s at `run.rs:1313`/`:1321` all return while `engine` is still a local. The pid stays on the run queue, so the next slice answers `refuse_engine_less` → `Wait` with the state restored to `Runnable` (`run.rs:313-334`) and nothing ever runs it again — and the machine, the only holder of that process's live x/stack while it is parked, is gone. Minimal fix: re-insert the engine before returning the error.
+* **`RunnerState`'s per-pid maps are never pruned on process death.** The only `engines.remove` is the slice take-out (`run.rs:896`), so a terminated parked process keeps its machine (and that machine's refc-binary reservoir) for the runtime's life; `gather_off_heap_roots` gates the dead machine's dangling root set on `live(pid)` (`entry.rs:506`), so the residue is a leak, never a read.
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like on an allocation-shaped loop.** Such a runtime runs **zero** collections (the admission declines and the nursery grows instead) where this one runs 4 728 collections and 325 majors on the same 2 001-call `churn` run (**2.3628** collections and **0.1624** majors per call, at the same per-call rate at N = 40 000: 95 057 / 6 465 over 40 001 calls = **2.3764** / **0.1616**), so the difference is the memory management each performs and the heap the other retains, not dispatch or tier.
   The figures behind that, and the dated 1.25×–1.60× band the allocation-shaped `foreign` rows once read, are [`MEASURED.md`](MEASURED.md) *Not like-for-like*.
 * **A natively executed compiled block is charged at a deopt, a heap-admission point and each **priced**
@@ -430,11 +430,11 @@ collect: **a heap can only move during a scheduler slice.** `BudgetContext::call
 dispatch — the invariant `../context/position.rs:67-69` relies on.
 | site | reached from | publishes | gate |
 |---|---|---|---|
-| `../context/gc.rs:1252` `ensure_heap_full` | `Instr::TestHeap`/`AllocateHeap` → `Machine::ensure_heap` (`beam_engine/src/machine/frames.rs:283-289`) + the baseline-JIT twins | `x[..pointer_prefix_len(x)]`, whole stack, `fr[..pointer_prefix_len(fr)]` (`gc.rs:1307`, rebuild `:1382-1383`) | `armed` + the unscanned-root valve |
-| `../context/gc.rs:1568` `alloc_words_rooted` | `terms/slack.rs:170` (`terms::reserve`, i.e. every `*_rooted` builder, per built term) | same narrowing (`gc.rs:1674`) | `armed` + valve |
-| `../context/gc.rs:1034` `ensure_heap` (narrow) | **no engine call site** (`gc.rs:1807`) | `x[..live]` + stack, **no FR file**; float-guarded | `armed` |
-| `../context/gc/reds_door.rs:176` `collect_at_reds_boundary` | `run.rs:1249` (the `Yield` arm only) | `RootSet::ALL_LIVE`: **all 1024 x slots** + whole stack + `fr[..fr_count]` (`reds_door.rs:279` → `gc.rs:786`) | `run.rs:337 parked_published`, `gc_process_enabled`, 4 000-red interval, `is_relocation_exempt`, 7/8 occupancy or `collection_debt`, valve |
-| `../context/gc.rs:1465` `alloc_words` | anywhere | **never collects** (grow + retry, else arena) | — |
+| `../context/gc.rs:1273` `ensure_heap_full` | `Instr::TestHeap`/`AllocateHeap` → `Machine::ensure_heap` (`beam_engine/src/machine/frames.rs:283-289`) + the baseline-JIT twins | `x[..pointer_prefix_len(x)]`, whole stack, `fr[..pointer_prefix_len(fr)]` (`gc.rs:1307`, rebuild `:1382-1383`) | `armed` + the unscanned-root valve |
+| `../context/gc.rs:1648` `alloc_words_rooted` | `terms/slack.rs:170` (`terms::reserve`, i.e. every `*_rooted` builder, per built term) | same narrowing (`gc.rs:1761`) | `armed` + valve |
+| `../context/gc.rs:1055` `ensure_heap` (narrow) | **no engine call site** (`gc.rs:1895`) | `x[..live]` + stack, **no FR file**; float-guarded | `armed` |
+| `../context/gc/reds_door.rs:176` `collect_at_reds_boundary` | `run.rs:1393` (the `Yield` arm only) | `RootSet::ALL_LIVE`: **all 1024 x slots** + whole stack + `fr[..fr_count]` (`reds_door.rs:279` → `gc.rs:786`) | `run.rs:337 parked_published`, `gc_process_enabled`, 4 000-red interval, `is_relocation_exempt`, 7/8 occupancy or `collection_debt`, valve |
+| `../context/gc.rs:1536` `alloc_words` | anywhere | **never collects** (grow + retry, else arena) | — |
 The slice-boundary off-heap prune is **not** a collection site and gets no row: it relocates nothing and publishes nothing of its own, it runs immediately after `collect_at_reds_boundary` on the same `Yield` park, and it prunes the machine's payload reservoir rather than a heap — see *The off-heap refc-binary reclamation at the slice boundary*.
 Out of slice, `ProcessTable::deliver`/`enqueue_exit_signal`/`grow_receiver_for_signal` relocate a
 **non-running** receiver only (`beam_process/src/ptab.rs:197`, `:243`, `:2661`, `:2715` all refuse on
@@ -454,7 +454,7 @@ door `Machine::dispatch_bif_call` (`bif.rs:324`) which has no write-back channel
 `Runtime`-owned term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox`
 markers, `trace`/`seq_trace` specs, `eval_closures`).
 **Two hand-off asymmetries a dangling-pointer hunt must know.** (a) `publish_parked_roots` discards
-`publish_roots_full`'s answer (`run.rs:637-639`) while `park_machine` claims `parked_published = true`
+`publish_roots_full`'s answer (`run.rs:653-655`) while `park_machine` claims `parked_published = true`
 unconditionally (`run.rs:745`), so a failed publication would leave a **stale** published set behind a
 window a collection may still move; unreachable today only because `XRegs::set_live` errs on `n > MAX_REG`
 alone (`beam_process/src/registers.rs:77-83`) and `publish_roots_full` clamps to it (`gc.rs:802`).

@@ -324,9 +324,9 @@ impl<'a> RuntimeContext<'a> {
     /// route (`SendBridge`) reaches this method through `ExecutionContext::send_message`, whose
     /// signature carries **no** handle parameter — and it cannot carry one: the in-flight
     /// `Machine` is removed from `RunnerState.engines` for the whole slice
-    /// (`runner/run.rs:169`), `BudgetContext` forwards only `&mut RuntimeContext`
+    /// (`runner/run.rs:896`), `BudgetContext` forwards only `&mut RuntimeContext`
     /// (`runner/budget.rs:169-174`), and `Machine::refc_binaries` is a plain `Vec` field
-    /// (`beam_engine/src/machine/mod.rs:241`) no context can observe mid-run. A compiled `A ! B`
+    /// (`beam_engine/src/machine/mod.rs:489`) no context can observe mid-run. A compiled `A ! B`
     /// therefore carries its machine's handles, while the BIF route can only resolve what
     /// `source_payloads` holds: a term the *running* machine just built with an off-heap payload
     /// and forwards from a BIF callee still **flattens**. Closing that needs a sibling change (a
