@@ -222,7 +222,7 @@ use core::mem::size_of;
 use beam_engine::HeapMark;
 use beam_term::Eterm;
 
-use super::Runtime;
+use super::{RootFamily, Runtime};
 use crate::eval::reclaim::{self, Walk};
 use crate::eval::scratch::{RangeProbe, WindowState};
 
@@ -364,6 +364,81 @@ pub struct RegionReclaimStats {
     pub reclaim_declines: u64,
     /// The reason of the most recent decline — see the module docs' decline list.
     pub reclaim_last_decline: Option<&'static str>,
+    /// The raw **header word** of the most recent *unknown-header* refusal: the walk read it as a
+    /// boxed object's first word, and its subtag (`header & beam_term::tag::TAG_HEADER_MASK`) is one
+    /// no constructor in this workspace writes.
+    ///
+    /// Two walks can refuse on it, and this is the one field that covers both: the **pass's own**
+    /// descent (which records the same refusal in [`reclaim_last_decline`]) and — after a word has
+    /// already moved — the store move's **post-move verification**, whose refusal is counted on the
+    /// move's own [`store_move_declines`](RegionReclaimStats::store_move_declines) /
+    /// [`store_move_last_decline`](RegionReclaimStats::store_move_last_decline) pair. It is `None`
+    /// after any other refusal (and until the first one), so a run reads the reason and the header
+    /// together instead of guessing which of the two walks refused.
+    pub reclaim_last_decline_header: Option<usize>,
+    /// What the store move's **post-move verification** hit first reproduced in — the holder that
+    /// names a live word inside a store region the move had just evacuated, which is why
+    /// [`store_compactions`](RegionReclaimStats::store_compactions) did not count that attempt and
+    /// every source region was kept ([`compact::MoveOutcome::KeptBoth`]).
+    ///
+    /// `None` until a verification first hit. [`MoveHitOwner::OutsideCorpus`] is itself a finding:
+    /// no slot of the move's corpus ([`RootFamily`] families plus the caller's [`MoveSlots`])
+    /// reproduces the hit, so the holder is a store the corpus does not enumerate.
+    pub store_move_hit: Option<MoveHitOwner>,
+}
+
+/// Which slot of the move's corpus the post-move verification's first hit reproduced in.
+///
+/// The verification re-walks the corpus **after** the copy, so a holder that was rewritten names the
+/// destination and only a holder the corpus cannot rewrite still names a source range. This names
+/// where the reproducing slot lives — the diagnostic a fix needs, because each variant answers a
+/// different question: a [`Family`](MoveHitOwner::Family) slot means the family walk reached it (so
+/// the move's forwarding skipped or mis-copied it); a
+/// [`CallerSlot`](MoveHitOwner::CallerSlot) means the caller's own slot corpus did; and
+/// [`OutsideCorpus`](MoveHitOwner::OutsideCorpus) means neither does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveHitOwner {
+    /// A family of `Runtime::for_each_root_family_mut`, at this slot index within its slice.
+    Family(RootFamily, usize),
+    /// The caller's own slot corpus (`MoveSlots`), at this index.
+    CallerSlot(usize),
+    /// No slot in the corpus reproduces the hit — the holder is outside it.
+    OutsideCorpus,
+}
+
+impl MoveHitOwner {
+    /// The root family a [`MoveHitOwner::Family`] owner names, `None` for the other two shapes.
+    pub fn family(&self) -> Option<RootFamily> {
+        match self {
+            MoveHitOwner::Family(family, _) => Some(*family),
+            MoveHitOwner::CallerSlot(_) | MoveHitOwner::OutsideCorpus => None,
+        }
+    }
+
+    /// The slot index within [`family`](MoveHitOwner::family)'s slice — or, for
+    /// [`MoveHitOwner::CallerSlot`], within the caller's own slot list. `None` for
+    /// [`MoveHitOwner::OutsideCorpus`], which reproduces in no slot at all.
+    pub fn slot(&self) -> Option<usize> {
+        match self {
+            MoveHitOwner::Family(_, slot) | MoveHitOwner::CallerSlot(slot) => Some(*slot),
+            MoveHitOwner::OutsideCorpus => None,
+        }
+    }
+}
+
+impl RegionReclaimStats {
+    /// The [`RootFamily`] of [`store_move_hit`](RegionReclaimStats::store_move_hit) when the hit
+    /// reproduced in a family slot; `None` for a caller slot, for `OutsideCorpus` and until a hit.
+    pub fn store_move_hit_family(&self) -> Option<RootFamily> {
+        self.store_move_hit.and_then(|owner| owner.family())
+    }
+
+    /// The slot index [`store_move_hit`](RegionReclaimStats::store_move_hit) reproduced in — within
+    /// the [family](RegionReclaimStats::store_move_hit_family)'s slice, or within the caller's own
+    /// slot list for a [`MoveHitOwner::CallerSlot`] hit; `None` for `OutsideCorpus` and until a hit.
+    pub fn store_move_hit_slot(&self) -> Option<usize> {
+        self.store_move_hit.and_then(|owner| owner.slot())
+    }
 }
 
 /// Where a pass runs.
@@ -464,9 +539,49 @@ impl RegionReclaim {
     }
 
     /// Records a decline: one counter plus the reason, and no region touched.
+    ///
+    /// It also clears [`RegionReclaimStats::reclaim_last_decline_header`], because the header
+    /// describes *this* refusal: a refusal that walked the graph and met no unknown header must not
+    /// leave the previous one's header standing beside its reason.
     fn decline(&mut self, reason: &'static str) {
         self.stats.reclaim_declines = self.stats.reclaim_declines.saturating_add(1);
         self.stats.reclaim_last_decline = Some(reason);
+        self.stats.reclaim_last_decline_header = None;
+    }
+
+    /// Records a **walk** verdict's refusal: the reason string every site has always recorded
+    /// ([`Walk::reason`]) plus, when that is what the walk met, the unknown header word
+    /// ([`Walk::header`]).
+    fn decline_walk(&mut self, verdict: &Walk) {
+        self.decline(verdict.reason());
+        self.note_unknown_header(verdict);
+    }
+
+    /// Records the unknown header a walk refused on, without touching the decline counters, and
+    /// traces it — the header word, its subtag and the term word that led there are the three facts
+    /// a one-line summary cannot carry, and a `[rt-mem]` line costs nothing unless the channel is on.
+    ///
+    /// Two walks reach it: this pass's own descent (whose reason is recorded by [`decline_walk`])
+    /// and a store move's **post-move verification**, whose refusal is counted on the move's own
+    /// [`RegionReclaimStats::store_move_declines`] and whose reason is
+    /// [`RegionReclaimStats::store_move_last_decline`]. The header field is the one place both meet,
+    /// which is what lets a single run report the move's hit and the header it met.
+    fn note_unknown_header(&mut self, verdict: &Walk) {
+        let Walk::UnknownHeader { header, term } = verdict else {
+            return;
+        };
+        self.stats.reclaim_last_decline_header = Some(*header);
+        crate::debug_trace::mem(format_args!(
+            "reclaim: the reachability walk met an unknown boxed header={header:#x} subtag={:#04x} \
+             term={term:#x}",
+            header & beam_term::tag::TAG_HEADER_MASK
+        ));
+    }
+
+    /// Records what the store move's post-move verification hit first reproduced in
+    /// ([`RegionReclaimStats::store_move_hit`]).
+    fn note_store_move_hit(&mut self, owner: MoveHitOwner) {
+        self.stats.store_move_hit = Some(owner);
     }
 
     /// Records a **move-only** decline on the move's own counters ([`compact`]'s decline list).
@@ -551,10 +666,9 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>, slots: &mut Move
     };
     {
         let ranges: Vec<(usize, usize)> = live.iter().map(|candidate| candidate.range).collect();
-        if let Walk::Declined(reason) =
-            reclaim::walk(&roots, &mut RangeProbe::new(&ranges, &mut hits))
-        {
-            runtime.region_reclaim.decline(reason);
+        let verdict = reclaim::walk(&roots, &mut RangeProbe::new(&ranges, &mut hits));
+        if !verdict.is_complete() {
+            runtime.region_reclaim.decline_walk(&verdict);
             return;
         }
     }

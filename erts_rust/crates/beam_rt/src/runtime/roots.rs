@@ -103,8 +103,13 @@ use crate::runner::ProcessEntry;
 ///
 /// Ordering is arbitrary (it is a `derive`d total order, useful to sort a report); nothing may
 /// depend on it semantically.
+///
+/// It is public because it is the vocabulary a **diagnostic** reports in: the store move's
+/// post-move verification names the family whose slot reproduced its hit
+/// ([`MoveHitOwner::Family`](crate::runtime::MoveHitOwner::Family)), rendered by the runtime's
+/// retention line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum RootFamily {
+pub enum RootFamily {
     /// The capture environment of an escaped `-eval` closure
     /// (`Runtime::eval_closures`' `FunBody::env_terms`).
     EvalClosureEnv,

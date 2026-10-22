@@ -85,6 +85,21 @@
 //! having happened, and it is why the move is gated on every pin and every doubt below — with a
 //! complete corpus it cannot occur.
 //!
+//! # The hit is attributed, because "a holder outside the corpus" is not a diagnosis
+//!
+//! A hit that names no holder leaves a fix with nothing to act on, so step 3's verdict is followed
+//! by an **attribution** ([`attribute_hit`], run only on the hit path): the corpus is re-walked one
+//! candidate at a time — the caller's slots, then each runtime family, and within a family that
+//! reproduces the hit, its individual roots — and the first reproduction is published as
+//! [`RegionReclaimStats::store_move_hit`](crate::runtime::RegionReclaimStats::store_move_hit)
+//! (`Family(family, slot)`, `CallerSlot(index)`, or `OutsideCorpus` when no slot of the corpus
+//! reproduces it). Each variant answers a different question for whoever fixes the corpus: a family
+//! slot means the walk *has* a slot for that word, so the copy skipped or mis-copied it; a caller
+//! slot means the caller's own corpus did; `OutsideCorpus` means the holder is a store neither
+//! enumerates. A walking decline (the visit budget, an unknown boxed header) is still a hit, and its
+//! unknown header rides the pass's `reclaim_last_decline_header` field so one run reports both the
+//! move's refusal and the header it met.
+//!
 //! # Thresholds
 //!
 //! The move costs one count walk, one copy and two verification descents. It therefore runs only
@@ -172,7 +187,7 @@ use core::mem::size_of;
 use beam_gc::{FromSet, LinearDest, Relocator};
 use beam_term::Eterm;
 
-use super::{advance_cursor, heap_region_base, PassInput};
+use super::{advance_cursor, heap_region_base, MoveHitOwner, PassInput};
 use crate::eval::reclaim::{self, Reach, Walk};
 use crate::eval::scratch::{RangeProbe, MIN_WINDOW_WORDS};
 use crate::runtime::Runtime;
@@ -377,7 +392,7 @@ pub(crate) fn attempt_move(
     }
     let need = beam_gc::live_words_in(&from, &corpus);
     #[cfg(test)]
-    tripwire::record_pre_move_root(&corpus, &byte_ranges);
+    tripwire::record_pre_move_root(&corpus, slots.slots.len(), &byte_ranges);
     drop(corpus);
     if need == 0 {
         // Nothing in the candidates is live: the whole-region action drops them all, and a move
@@ -416,7 +431,8 @@ pub(crate) fn attempt_move(
         keep_both(runtime, destination, copied, copy.err().unwrap_or(R_COPY));
         return MoveOutcome::KeptBoth;
     }
-    if verification_hits(runtime, slots, &byte_ranges) {
+    if let Some(owner) = verification_owner(runtime, slots, &byte_ranges) {
+        runtime.region_reclaim.note_store_move_hit(owner);
         keep_both(runtime, destination, copied, R_VERIFY_HIT);
         return MoveOutcome::KeptBoth;
     }
@@ -450,35 +466,136 @@ fn forward_corpus(
 }
 
 /// Re-runs the **value** descent from the forwarded roots over the OLD ranges: does any live term
-/// still stand in a region about to be dropped?
+/// still stand in a region about to be dropped? And, if so, **which slot of the corpus** names it?
 ///
 /// This is the gate on the move's one irreversible act. It descends from the slots and the runtime
 /// families *after* forwarding, so a root that moved names the destination and only a holder the
 /// corpus does not enumerate can put a word back into a source range. A descent that cannot
 /// complete is a hit — doubt is never an answer.
-fn verification_hits(runtime: &mut Runtime, slots: &MoveSlots<'_>, ranges: &[(usize, usize)]) -> bool {
+///
+/// `None` means **no hit**: every word the corpus names stands in a region that stays, so the move
+/// may commit. `Some(owner)` means hit **or** doubt, and `owner` is the attribution: the first slot
+/// that reproduces the hit ([`MoveHitOwner`]), or [`MoveHitOwner::OutsideCorpus`] when no slot of
+/// the corpus does. The attribution runs **only here**, on the hit path, so its cost (up to one
+/// extra descent per corpus slot) is never paid by a move that verifies clean.
+///
+/// The unknown header, when that is what this walk met, is recorded on the pass's
+/// `reclaim_last_decline_header` field too ([`RegionReclaim::note_decline_header`]) — the move's own
+/// reason stays [`R_VERIFY_HIT`], so one run reports both facts.
+fn verification_owner(
+    runtime: &mut Runtime,
+    slots: &MoveSlots<'_>,
+    ranges: &[(usize, usize)],
+) -> Option<MoveHitOwner> {
+    let roots = match verification_roots(runtime, slots) {
+        Ok(roots) => roots,
+        // The corpus enumeration refused to complete. Nothing was checked, so the verification's
+        // answer is doubt — a hit — and no slot can be named.
+        Err(()) => return Some(MoveHitOwner::OutsideCorpus),
+    };
+    let mut hits = vec![false; ranges.len()];
+    let verdict = reclaim::walk(&roots, &mut RangeProbe::new(ranges, &mut hits));
+    drop(roots);
+    if let Some(_header) = verdict.header() {
+        runtime.region_reclaim.note_unknown_header(&verdict);
+    }
+    let hit = match verdict {
+        Walk::Complete => hits.iter().any(|hit| *hit),
+        // A declined walk is a hit (see the module docs): what it could not read may name a source.
+        Walk::Declined(_) | Walk::UnknownHeader { .. } => true,
+    };
+    if !hit {
+        return None;
+    }
+    Some(attribute_hit(runtime, slots, ranges))
+}
+
+/// The verification's root corpus: the caller's slots as they are now (forwarded), then every
+/// runtime family — plus, test-only, the injected pre-move copy ([`tripwire`]).
+///
+/// # Errors
+///
+/// `()` when the runtime's root enumeration refuses to complete; the caller treats that as doubt.
+fn verification_roots(
+    runtime: &mut Runtime,
+    slots: &MoveSlots<'_>,
+) -> core::result::Result<Vec<Eterm>, ()> {
     let mut roots: Vec<Eterm> = slots.values();
-    if runtime
+    runtime
         .for_each_root_mut(&mut |words| {
             roots.extend_from_slice(words);
             Ok(())
         })
-        .is_err()
-    {
-        return true;
-    }
-    // Test-only: a pre-move copy of an evacuated root, appended to the **verification** corpus
+        .map_err(|_| ())?;
+    // Test-only: the injected copy of an evacuated root, appended to the **verification** corpus
     // only — the forwarding corpus was already consumed, so the copy in the source region stands
-    // there unrewritten and the descent below must hit it. See [`tripwire`].
+    // there unrewritten and the descent above must hit it. See [`tripwire`].
     #[cfg(test)]
-    if let Some(word) = tripwire::pre_move_root() {
+    if let Some((word, _slot)) = tripwire::recorded_hit() {
         roots.push(word);
     }
+    Ok(roots)
+}
+
+/// Attributes the verification's hit: **which slot of the move's corpus reproduces it**.
+///
+/// One descent per candidate, each asking the same question ("does this candidate's graph stand a
+/// term inside one of the old ranges?"), in the corpus's own order:
+///
+/// 1. the **caller's slots**, one at a time — their indices are the caller's own;
+/// 2. test-only, the injected pre-move copy, attributed to the slot it was taken from (it is a
+///    *snapshot* of that slot, which the copy has since forwarded);
+/// 3. the runtime's **families**, family by family through
+///    [`Runtime::for_each_root_family_mut`](crate::runtime::Runtime::for_each_root_family_mut):
+///    first one descent over the family's whole slice (a cheap reject), then — only for a family
+///    that hits — one descent per root of that slice, to name the slot.
+///
+/// A candidate whose own descent cannot complete is **doubt**, not a reproduction: it never reported
+/// a word inside a range, so attributing the hit to it would name a holder that does not name it.
+/// With no reproduction at all the answer is [`MoveHitOwner::OutsideCorpus`] — the finding itself.
+fn attribute_hit(
+    runtime: &mut Runtime,
+    slots: &MoveSlots<'_>,
+    ranges: &[(usize, usize)],
+) -> MoveHitOwner {
+    for (index, slot) in slots.slots.iter().enumerate() {
+        if reproduces(core::slice::from_ref(*slot), ranges) {
+            return MoveHitOwner::CallerSlot(index);
+        }
+    }
+    #[cfg(test)]
+    if let Some((word, Some(index))) = tripwire::recorded_hit() {
+        if reproduces(core::slice::from_ref(&word), ranges) {
+            return MoveHitOwner::CallerSlot(index);
+        }
+    }
+    let mut found: Option<MoveHitOwner> = None;
+    // An `Err` from the walk stops it; every family visited before it kept its writes (there are
+    // none — this is a read-only descent), and `found` is whatever was attributed so far.
+    let _ = runtime.for_each_root_family_mut(&mut |family, words| {
+        if found.is_some() || !reproduces(words, ranges) {
+            return Ok(());
+        }
+        for (index, word) in words.iter().enumerate() {
+            if reproduces(core::slice::from_ref(word), ranges) {
+                found = Some(MoveHitOwner::Family(family, index));
+                break;
+            }
+        }
+        Ok(())
+    });
+    found.unwrap_or(MoveHitOwner::OutsideCorpus)
+}
+
+/// Whether a descent from `roots` completes **and** reports a term standing inside one of `ranges`.
+///
+/// The same walker and the same sink the verification itself uses, asked of one candidate at a time;
+/// a descent that cannot complete answers `false` (doubt is never a reproduction).
+fn reproduces(roots: &[Eterm], ranges: &[(usize, usize)]) -> bool {
     let mut hits = vec![false; ranges.len()];
-    let verdict = reclaim::walk(&roots, &mut RangeProbe::new(ranges, &mut hits));
-    match verdict {
+    match reclaim::walk(roots, &mut RangeProbe::new(ranges, &mut hits)) {
         Walk::Complete => hits.iter().any(|hit| *hit),
-        Walk::Declined(_) => true,
+        Walk::Declined(_) | Walk::UnknownHeader { .. } => false,
     }
 }
 /// **Test-only fault injection** for the post-copy verification: arms a forced hit.
@@ -486,8 +603,8 @@ fn verification_hits(runtime: &mut Runtime, slots: &MoveSlots<'_>, ranges: &[(us
 /// [`keep_both`]'s path is a *proof obligation* — "if the verification hits, no source region
 /// dangles" — that a production run reaches only when the moving corpus is incomplete, which a
 /// correct runtime never does. This module makes the obligation executable: armed on the test's
-/// own thread, [`attempt_move`] records one **pre-move copy** of a root that stands inside a
-/// candidate range, and [`verification_hits`] appends that copy to the *verification* corpus only,
+/// own thread, [`attempt_move`] records one **pre-move copy** of a caller slot that stands inside a
+/// candidate range, and [`verification_roots`] appends that copy to the *verification* corpus only,
 /// after the forward. Nothing enters the forwarding corpus or the count walk, so the copy in the
 /// source region is never rewritten and the descent necessarily hits it — the same shape an
 /// unenumerated holder produces.
@@ -498,6 +615,13 @@ fn verification_hits(runtime: &mut Runtime, slots: &MoveSlots<'_>, ranges: &[(us
 ///   **only** to the verification descent — the very check it forces to fail;
 /// * the recorded word is a real root of the real corpus, so what the descent then reports is a
 ///   genuine "a live word stands in an old region", not a fabricated verdict.
+///
+/// The record also carries **which caller slot the word was taken from**, so the hit's attribution
+/// ([`super::attribute_hit`]) names that slot ([`MoveHitOwner::CallerSlot`]) instead of
+/// `OutsideCorpus`: the injected word is a snapshot of a slot the copy has since forwarded, so the
+/// slot's *current* value can no longer reproduce the hit and only the record can say where it came
+/// from. A corpus word from a runtime family is recorded with no slot (`None`); the attribution then
+/// falls through to the family walks, which is correct for a family-rooted injection.
 ///
 /// The state is thread-local because the workspace's tests share a process: a global cell would let
 /// one case's arming explain another's decline.
@@ -515,8 +639,9 @@ pub(super) mod tripwire {
     thread_local! {
         /// Whether this thread's moves must force a verification hit.
         static ARMED: Cell<bool> = const { Cell::new(false) };
-        /// The pre-move copy of one evacuated root, once an attempt has recorded it.
-        static PRE_MOVE: Cell<Option<Eterm>> = const { Cell::new(None) };
+        /// The pre-move copy of one evacuated root, once an attempt has recorded it, plus the
+        /// **caller slot** it was taken from (`None` for a runtime-family word).
+        static PRE_MOVE: Cell<Option<(Eterm, Option<usize>)>> = const { Cell::new(None) };
     }
 
     /// Arms the injector on this thread (and forgets any earlier recording).
@@ -537,19 +662,30 @@ pub(super) mod tripwire {
     }
 
     /// Records the first word of `corpus` that stands inside one of `ranges` — a root the copy is
-    /// about to evacuate, saved **before** it moves.
-    pub(super) fn record_pre_move_root(corpus: &[Eterm], ranges: &[(usize, usize)]) {
+    /// about to evacuate, saved **before** it moves — with the caller slot it came from, when it came
+    /// from the caller's own half of the corpus (the first `slot_count` words).
+    pub(super) fn record_pre_move_root(
+        corpus: &[Eterm],
+        slot_count: usize,
+        ranges: &[(usize, usize)],
+    ) {
         if !armed() {
             return;
         }
-        let word = corpus.iter().copied().find(|word| inside_a_range(*word, ranges));
-        if let Some(word) = word {
-            PRE_MOVE.with(|cell| cell.set(Some(word)));
+        let found = corpus
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, word)| inside_a_range(*word, ranges));
+        if let Some((index, word)) = found {
+            let slot = (index < slot_count).then_some(index);
+            PRE_MOVE.with(|cell| cell.set(Some((word, slot))));
         }
     }
 
-    /// The recorded pre-move copy, if this thread armed the injector and an attempt recorded one.
-    pub(super) fn pre_move_root() -> Option<Eterm> {
+    /// The recorded pre-move copy and the caller slot it was taken from, if this thread armed the
+    /// injector and an attempt recorded one.
+    pub(super) fn recorded_hit() -> Option<(Eterm, Option<usize>)> {
         if !armed() {
             return None;
         }

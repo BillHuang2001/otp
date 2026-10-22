@@ -152,7 +152,7 @@ use std::mem::size_of;
 
 use beam_term::Eterm;
 
-use super::reclaim::{self, Reach, Walk};
+use super::reclaim::{self, Reach};
 use super::{Env, Evaluator};
 use crate::runtime::reclaim::{self as region_reclaim, MoveSlots, PassInput, Site};
 use crate::runtime::Runtime;
@@ -581,8 +581,9 @@ fn rewind_window(runtime: &mut Runtime, env_roots: &[Eterm]) {
         ranges: [(base + window.mark * width, base + used * width)],
         hits: [false],
     };
-    if let Walk::Declined(reason) = reclaim::walk(&roots, &mut probe) {
-        runtime.eval_scratch.decline(base, used, reason);
+    let verdict = reclaim::walk(&roots, &mut probe);
+    if !verdict.is_complete() {
+        runtime.eval_scratch.decline(base, used, verdict.reason());
         return;
     }
     if probe.hits[0] {

@@ -741,6 +741,25 @@ fn a_forced_verification_hit_keeps_every_region_and_the_next_pass_classifies_the
         Some(compact::R_VERIFY_HIT),
         "and with the verification's reason"
     );
+    // The diagnostic itself, pinned: the forced hit's holder is named. The tripwire's injected word
+    // is a **snapshot of the first caller slot** that stands in a source region (slot 0 — `a`), so
+    // the attribution must answer `CallerSlot(0)` — not a family, not `OutsideCorpus`. That is the
+    // finding a fix is driven by, so it is asserted rather than left to a report.
+    assert_eq!(
+        stats.store_move_hit,
+        Some(MoveHitOwner::CallerSlot(0)),
+        "the hit names the corpus slot that reproduces it"
+    );
+    assert_eq!(
+        stats.store_move_hit_family(),
+        None,
+        "a caller slot is not a root family"
+    );
+    assert_eq!(
+        stats.store_move_hit_slot(),
+        Some(0),
+        "and its index is the index within the caller's own slot list"
+    );
     assert_eq!(
         stats.store_regions_dropped, before.store_regions_dropped,
         "keeping both means dropping nothing"

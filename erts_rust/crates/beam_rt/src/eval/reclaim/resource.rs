@@ -142,7 +142,7 @@ use beam_term::Eterm;
 
 use beam_abi::nif::enif::resources::{release_resource_terms, resource_terms};
 
-use super::{walk, Prune, Reach, Walk};
+use super::{walk, Prune, Reach};
 use crate::runtime::Runtime;
 
 /// The candidate set as of one point in time: the raw words of every live resource term
@@ -393,7 +393,9 @@ fn prune_beyond_observed(
     let mut sink = ResourceSink::new(fresh);
     // Gate 4: a walk that could not finish releases nothing (see the module docs: the observed
     // frontier still advances, so a persistent decline costs one walk rather than one per call).
-    if let Walk::Declined(reason) = walk(&roots, &mut sink) {
+    let verdict = walk(&roots, &mut sink);
+    if !verdict.is_complete() {
+        let reason = verdict.reason();
         runtime.resource_prune.declines += 1;
         runtime.resource_prune.last_decline = Some(reason);
         crate::debug_trace::trace(format_args!(
@@ -452,6 +454,9 @@ pub(crate) fn prune_at_statement_boundary(runtime: &mut Runtime, extra: &[Eterm]
 mod tests {
     use super::*;
     use beam_term::prelude::make_small;
+    // Only the refusal tests name the verdict type: the descent itself answers through
+    // `Walk::is_complete`, so the production half imports nothing extra.
+    use crate::eval::reclaim::Walk;
 
     /// A frontier over the given words (a helper so the diff's semantics can be tested without a
     /// registry: the words are opaque to [`Frontier`], which only orders and compares them).
@@ -597,9 +602,20 @@ mod tests {
             beam_term::boxed::make_boxed(hp)
         };
         let mut sink = ResourceSink::new(Vec::new());
+        let verdict = walk(&[bogus], &mut sink);
         assert!(
-            matches!(walk(&[bogus], &mut sink), Walk::Declined(_)),
+            matches!(verdict, Walk::UnknownHeader { .. }),
             "an unknown boxed header declines the walk"
+        );
+        assert_eq!(
+            verdict.header(),
+            Some(beam_term::boxed::make_header(1, 0x3C).raw()),
+            "and the verdict names the header word it refused on"
+        );
+        assert_eq!(
+            verdict.reason(),
+            "the reachability walk met an unknown boxed header",
+            "the recorded reason string is unchanged"
         );
     }
 

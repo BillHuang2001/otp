@@ -263,6 +263,48 @@ pub(crate) enum Walk {
     Complete,
     /// The walk could not be completed, so nothing may be released.
     Declined(&'static str),
+    /// The walk met a boxed **header word** no constructor in this workspace writes, so the object's
+    /// shape — and therefore every child slot it names — is unknowable.
+    ///
+    /// It is a refusal exactly like [`Walk::Declined`]: every caller treats it as "decline, retain,
+    /// keep both", never as [`Walk::Complete`]. The variant exists only so a diagnostic can name
+    /// *which* header was met and which dequeued term led there ([`Walk::header`]); the reason string
+    /// [`Walk::reason`] answers for it is byte-identical to the one the walk answered before the
+    /// variant existed.
+    UnknownHeader {
+        /// The raw header word — its subtag is `header & beam_term::tag::TAG_HEADER_MASK`.
+        header: usize,
+        /// The term word the walk dequeued; dereferencing it read `header` as its first word.
+        term: usize,
+    },
+}
+
+impl Walk {
+    /// The reason this verdict records, `""` for a completed walk.
+    ///
+    /// The strings are the ones each refusal site has always recorded, so a caller's published
+    /// reason (`reclaim_last_decline`, `store_move_last_decline`, a statement window's
+    /// `last_decline`, a resource prune's) is unchanged by the typed detail the verdict carries.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Walk::Complete => "",
+            Walk::Declined(reason) => reason,
+            Walk::UnknownHeader { .. } => "the reachability walk met an unknown boxed header",
+        }
+    }
+
+    /// The raw header word, when this verdict is [`Walk::UnknownHeader`].
+    pub(crate) fn header(&self) -> Option<usize> {
+        match self {
+            Walk::UnknownHeader { header, .. } => Some(*header),
+            _ => None,
+        }
+    }
+
+    /// Whether the walk reached its answer — the one question every caller asks first.
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self, Walk::Complete)
+    }
 }
 
 /// The reachable payloads the walk found — the refc-payload question's [`Reach`] sink.
@@ -364,8 +406,9 @@ pub(crate) fn prune_scoped(
     // decline), and the runtime's own term regions, scanned as **words** (which cannot fault
     // and cannot decline). See the module docs for why region words must never be roots.
     let mut live = Live::default();
-    if let Walk::Declined(reason) = walk(&roots, &mut live) {
-        return decline(runtime, reason);
+    let verdict = walk(&roots, &mut live);
+    if !verdict.is_complete() {
+        return decline(runtime, verdict.reason());
     }
     runtime.for_each_off_heap_region(|words| collect_region_payloads(words, &mut live));
     // The prune: drain (the table's only removal path), keep every payload that is reachable
@@ -529,8 +572,15 @@ pub(crate) fn walk<R: Reach>(roots: &[Eterm], sink: &mut R) -> Walk {
                 | beam_term::tag::EXTERNAL_PORT_SUBTAG
                 | beam_term::tag::EXTERNAL_REF_SUBTAG => {}
                 // A header word no constructor in this workspace writes: the term is corrupt,
-                // so what it names is unknowable — decline rather than free.
-                _ => return Walk::Declined("the reachability walk met an unknown boxed header"),
+                // so what it names is unknowable — decline rather than free. The variant carries
+                // the header and the term that led to it, so a diagnostic can name both while every
+                // caller keeps treating the verdict as a refusal.
+                _ => {
+                    return Walk::UnknownHeader {
+                        header: header.raw(),
+                        term: item.raw(),
+                    }
+                }
             }
         }
     }

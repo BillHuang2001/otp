@@ -114,7 +114,8 @@ pub use self::gc::GcStatsSnapshot;
 pub(crate) use self::gc::GcState;
 pub(crate) use self::executing::RootAction;
 pub use self::retention::RetentionStats;
-pub use self::reclaim::{RegionReclaimConfig, RegionReclaimStats};
+pub use self::reclaim::{MoveHitOwner, RegionReclaimConfig, RegionReclaimStats};
+pub use self::roots::RootFamily;
 pub use self::scheduler::RUN_DEADLINE;
 
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.

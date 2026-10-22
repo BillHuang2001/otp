@@ -48,7 +48,7 @@
 //! Nothing here frees, shrinks, caps or otherwise changes a region: the snapshot only reads sizes
 //! that already exist. A figure that grows across a long in-process `compile:file/2` is therefore
 //! a statement about the *current* allocation policy, not an effect of measuring it.
-use super::Runtime;
+use super::{MoveHitOwner, RootFamily, Runtime};
 use core::fmt;
 
 /// A snapshot of the words the runtime's four never-freed storage regions hold, plus the arena
@@ -175,6 +175,25 @@ pub struct RetentionStats {
     /// The reason of the most recent store-move decline — see
     /// [`crate::runtime::reclaim::compact`]'s decline list. `None` until the first one.
     pub store_move_last_decline: Option<&'static str>,
+    /// What the store move's **post-move verification** first hit reproduced in
+    /// ([`RegionReclaimStats::store_move_hit`](crate::runtime::RegionReclaimStats::store_move_hit)).
+    ///
+    /// `None` until a hit has happened. A hit means a live word really stood in an old store region
+    /// after the move, so the move kept both ([`MoveOutcome::KeptBoth`]) — and this field names the
+    /// holder: a family of the mutable root corpus, one of the caller's own `MoveSlots` slots, or
+    /// `OutsideCorpus` when no slot of the corpus reproduces it.
+    ///
+    /// [`MoveOutcome::KeptBoth`]: crate::runtime::MoveOutcome::KeptBoth
+    pub store_move_hit: Option<MoveHitOwner>,
+    /// The [`RootFamily`] of [`store_move_hit`](RetentionStats::store_move_hit)'s
+    /// [`MoveHitOwner::Family`], `None` for every other shape — see
+    /// [`RegionReclaimStats::store_move_hit_family`](crate::runtime::RegionReclaimStats::store_move_hit_family).
+    pub store_move_hit_family: Option<RootFamily>,
+    /// The slot index [`store_move_hit`](RetentionStats::store_move_hit) reproduced in: within that
+    /// family's slice, or within the caller's own slot list for a
+    /// [`MoveHitOwner::CallerSlot`](crate::runtime::MoveHitOwner::CallerSlot) hit. `None` when there
+    /// is no hit and for [`MoveHitOwner::OutsideCorpus`](crate::runtime::MoveHitOwner::OutsideCorpus).
+    pub store_move_hit_slot: Option<usize>,
     /// How many times the reclaim pass rewound the **engine arena**
     /// ([`RegionReclaimStats::arena_reclaims`](crate::runtime::RegionReclaimStats)).
     pub arena_reclaims: u64,
@@ -196,6 +215,11 @@ pub struct RetentionStats {
     /// The reason of the most recent reclaim decline — see [`crate::runtime::reclaim`]'s decline
     /// list. `None` until the first decline.
     pub reclaim_last_decline: Option<&'static str>,
+    /// The raw header word the most recent **unknown-header** refusal met
+    /// ([`RegionReclaimStats::reclaim_last_decline_header`](crate::runtime::RegionReclaimStats::reclaim_last_decline_header)),
+    /// `None` after any other refusal — and after a store-move verification that refused on one, so
+    /// one run can read the move's own reason and this header together.
+    pub reclaim_last_decline_header: Option<usize>,
 }
 
 impl fmt::Display for RetentionStats {
@@ -209,9 +233,10 @@ impl fmt::Display for RetentionStats {
              bif_nested_heap_words={} bif_nested_peak_words={} eval_heap_words={} \
              eval_heap_retired_regions={} eval_heap_retired_words={} eval_off_heap_handles={} \
              store_compactions={} store_words_reclaimed={} store_regions_dropped={} \
-             store_move_declines={} store_move_last_decline={} \
+             store_move_declines={} store_move_last_decline={} store_move_hit_family={} \
+             store_move_hit_slot={} \
              arena_reclaims={} arena_words_reclaimed={} arena_regions_dropped={} \
-             reclaim_declines={} reclaim_last_decline={}",
+             reclaim_declines={} reclaim_last_decline={} reclaim_last_decline_header={}",
             self.arena_words,
             self.arena_allocs,
             self.bif_regions,
@@ -230,6 +255,11 @@ impl fmt::Display for RetentionStats {
             self.store_regions_dropped,
             self.store_move_declines,
             self.store_move_last_decline.unwrap_or("none"),
+            // The hit's owner, as the two figures a reader greps for: the family's name (its
+            // `Debug` form) and the slot within it. `none` until a hit, and for the two shapes that
+            // name no family — see [`FamilyName`]/[`OrNone`].
+            FamilyName(self.store_move_hit_family),
+            OrNone(self.store_move_hit_slot),
             self.arena_reclaims,
             self.arena_words_reclaimed,
             self.arena_regions_dropped,
@@ -237,7 +267,36 @@ impl fmt::Display for RetentionStats {
             // `Option<&'static str>` has no `Display`: a `None` is the documented "no decline has
             // happened yet", rendered as `none` so the line stays one `label=value` pair per field.
             self.reclaim_last_decline.unwrap_or("none"),
+            OrNone(self.reclaim_last_decline_header),
         )
+    }
+}
+
+/// `Some(family)` as the family's `Debug` name, `None` as the documented `none`.
+///
+/// The two little wrappers below keep the diagnostic a single `write!` with no per-call allocation:
+/// `Option` has neither a `Display` impl its callers may rely on nor a `Debug` form that greps as
+/// cleanly as a bare name.
+struct FamilyName(Option<RootFamily>);
+
+impl fmt::Display for FamilyName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(family) => write!(f, "{family:?}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// `Some(value)` as its decimal form, `None` as the documented `none`.
+struct OrNone(Option<usize>);
+
+impl fmt::Display for OrNone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "{value}"),
+            None => f.write_str("none"),
+        }
     }
 }
 
@@ -286,11 +345,15 @@ impl Runtime {
             store_regions_dropped: reclaim.store_regions_dropped,
             store_move_declines: reclaim.store_move_declines,
             store_move_last_decline: reclaim.store_move_last_decline,
+            store_move_hit: reclaim.store_move_hit,
+            store_move_hit_family: reclaim.store_move_hit_family(),
+            store_move_hit_slot: reclaim.store_move_hit_slot(),
             arena_reclaims: reclaim.arena_reclaims,
             arena_words_reclaimed: reclaim.arena_words_reclaimed,
             arena_regions_dropped: reclaim.arena_regions_dropped,
             reclaim_declines: reclaim.reclaim_declines,
             reclaim_last_decline: reclaim.reclaim_last_decline,
+            reclaim_last_decline_header: reclaim.reclaim_last_decline_header,
         }
     }
 }
@@ -639,11 +702,15 @@ mod tests {
             store_regions_dropped: 16,
             store_move_declines: 21,
             store_move_last_decline: Some("a move reason"),
+            store_move_hit: Some(MoveHitOwner::Family(RootFamily::ProcessMailbox, 7)),
+            store_move_hit_family: Some(RootFamily::ProcessMailbox),
+            store_move_hit_slot: Some(7),
             arena_reclaims: 17,
             arena_words_reclaimed: 18,
             arena_regions_dropped: 19,
             reclaim_declines: 20,
             reclaim_last_decline: Some("a reason"),
+            reclaim_last_decline_header: Some(0x3c),
         };
         let line = stats.to_string();
         assert!(!line.contains('\n'), "the diagnostic is one line: {line}");
@@ -661,11 +728,14 @@ mod tests {
             "store_regions_dropped=16",
             "store_move_declines=21",
             "store_move_last_decline=a move reason",
+            "store_move_hit_family=ProcessMailbox",
+            "store_move_hit_slot=7",
             "arena_reclaims=17",
             "arena_words_reclaimed=18",
             "arena_regions_dropped=19",
             "reclaim_declines=20",
             "reclaim_last_decline=a reason",
+            "reclaim_last_decline_header=60",
         ] {
             assert!(
                 line.contains(field),
@@ -673,9 +743,16 @@ mod tests {
             );
         }
         // A pass that has never declined renders the documented `none`, so the pair is always
-        // present and a script can grep it unconditionally — for both decline reasons.
+        // present and a script can grep it unconditionally — for both decline reasons, the header
+        // of an unknown-header refusal, and the move's verification hit (which has not happened
+        // either, so both of its figures are `none`).
         let fresh = RetentionStats::default().to_string();
-        assert!(fresh.ends_with("reclaim_last_decline=none"), "{fresh}");
+        assert!(
+            fresh.ends_with("reclaim_last_decline_header=none"),
+            "{fresh}"
+        );
         assert!(fresh.contains("store_move_last_decline=none"), "{fresh}");
+        assert!(fresh.contains("store_move_hit_family=none"), "{fresh}");
+        assert!(fresh.contains("store_move_hit_slot=none"), "{fresh}");
     }
 }
