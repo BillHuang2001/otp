@@ -529,6 +529,11 @@ impl RegionReclaim {
         }
     }
 
+    /// The three action bits in force.
+    pub(crate) fn config(&self) -> RegionReclaimConfig {
+        self.config
+    }
+
     /// Replaces the three action bits. The switch can only disable an action.
     pub(crate) fn set_config(&mut self, config: RegionReclaimConfig) {
         self.config = config;
@@ -981,6 +986,18 @@ impl Runtime {
     /// The published region-reclaim counters ([`RegionReclaimStats`]).
     pub fn region_reclaim_stats(&self) -> RegionReclaimStats {
         self.region_reclaim.stats()
+    }
+
+    /// The three region-reclaim action bits currently in force ([`RegionReclaimConfig`]) — what
+    /// [`Runtime::new`] latched from `BEAM_RT_REGION_RECLAIM`, or what
+    /// [`Runtime::set_region_reclaim_enabled`] last set.
+    ///
+    /// A measurement reads this rather than re-parsing the environment, because the **latched**
+    /// configuration is the one the pass acts on: a pin that states a post-reclaim *shape* (an
+    /// emptied arena) is only truthful while the action that produces it is enabled, so the pin has
+    /// to ask the runtime which state it is in instead of assuming the default.
+    pub fn region_reclaim_enabled(&self) -> RegionReclaimConfig {
+        self.region_reclaim.config()
     }
 
     /// Sets the three region-reclaim action bits ([`RegionReclaimConfig`]).

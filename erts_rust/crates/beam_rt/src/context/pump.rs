@@ -1158,13 +1158,43 @@ mod in_process_compile {
     ///
     /// # What it bands, and why a band rather than an equality
     ///
-    /// `arena_words` is a deterministic **count**, not a timing, so a shared host cannot perturb
-    /// it — but the compiler it counts through differs between two legitimate hosts (OTP 29 vs the
-    /// tree's OTP 30) by ≈19%, so the band is the honest unit: ±30% catches a regression of the
-    /// mechanism (a region policy, an extra reservation) while tolerating the compiler generation.
-    /// The countable **invariants** — how many store regions were retired, and the arena's
-    /// geometric reservation ladder — are asserted exactly, because a change there *is* the
-    /// mechanism moving.
+    /// `arena_words`/`arena_allocs` are deterministic **counts of demand**, not timings, so a shared
+    /// host cannot perturb them — but the compiler they count through differs between two
+    /// legitimate hosts (OTP 29 vs the tree's OTP 30) by ≈19%, so a band is the honest unit: ±30%
+    /// catches a regression of the mechanism (a region policy, an extra reservation) while
+    /// tolerating the compiler generation.
+    ///
+    /// # Demand versus occupancy — the two figures this pin must never confuse
+    ///
+    /// [`RetentionStats::arena_words`] (and its twin
+    /// [`ContextHeapStats::used_words`](beam_engine::ContextHeapStats::used_words)) is the arena's
+    /// **cumulative demand**: every word the engine ever asked for. It only ever grows and a
+    /// reclamation does **not** lower it —
+    /// [`ContextHeapStats::live_words`](beam_engine::ContextHeapStats::live_words) is the figure
+    /// that falls. That matters here because the runtime's region-reclaim pass
+    /// ([`crate::runtime::reclaim`]) rewinds the arena at the `-eval` driver's exit, so the
+    /// *occupancy* after this compile legitimately reads `regions = 1` /
+    /// `reserved = ARENA_UNIT_WORDS` (the compile's result is a stabilized store word, so nothing
+    /// the arena still holds is reachable) while the demand is unchanged.
+    ///
+    /// Reading `used_words` as occupancy is therefore a category error, and this pin asserts the two
+    /// as the two different things they are:
+    ///
+    /// * the **demand** band, which is mode-independent — no action changes how many words the
+    ///   engine asked for;
+    /// * the **occupancy** shape, **per mode**, because the pass's arena action is what produces it:
+    ///   with the action enabled the rewind must have fired (`arena_reclaims ≥ 1`, `released_words
+    ///   > 0`) and left exactly the ladder's first rung (`regions = 1`, `reserved = 1 unit`, the
+    ///   live words inside it, occupancy far below the demand); with the action disabled nothing may
+    ///   have been released and the ladder must be the **minimal** rung covering the demand, which
+    ///   the geometric growth rule (`reserved = unit · (2^regions − 1)`) makes an exact, derived
+    ///   figure rather than a band.
+    ///
+    /// The mode is read from the runtime itself ([`Runtime::region_reclaim_enabled`], i.e. the
+    /// `BEAM_RT_REGION_RECLAIM` configuration [`Runtime::new`] latched), never assumed: the pin is
+    /// meant to be runnable in every mode, and each one then asserts the shape that mode implies.
+    /// The store's countable invariant — how many regions were retired — and the ladder identity are
+    /// asserted exactly in every mode, because a change there *is* the mechanism moving.
     #[test]
     #[ignore = "milestone pin: compiles lib/compiler/src/cerl_clauses.erl in-process to band the arena and the -eval store retention"]
     fn the_cerl_clauses_compile_bands_the_arena_and_the_eval_store() {
@@ -1172,10 +1202,16 @@ mod in_process_compile {
         /// The module compiled: small (13.8 kB), the workspace's documented control for the arena
         /// census and the peak-RSS split, and ≈1 s under the release runtime.
         const MODULE: &str = "cerl_clauses";
-        /// `arena_words` on the **system** (OTP-29) compiler — this harness's route. The tree's
-        /// OTP-30 bootstrap compiler, first on `-pa`, demands ≈5 133 683 words for the same source.
-        const ARENA_WORDS: u64 = 4_307_470;
-        /// The band's half-width, in percent of [`ARENA_WORDS`].
+        /// `arena_words` — the arena's **cumulative demand** — on the **system** (OTP-29) compiler,
+        /// this harness's route. Identical in every `BEAM_RT_REGION_RECLAIM` mode: the mode decides
+        /// what is *released*, never what the engine asked for. The tree's OTP-30 bootstrap compiler,
+        /// first on `-pa`, demands ≈5 133 683 words for the same source.
+        const ARENA_WORDS: u64 = 4_306_093;
+        /// `arena_allocs` — how many [`Runtime::alloc_words`] calls served [`ARENA_WORDS`]; the same
+        /// figure in every mode, and the second half of the demand pin (a demand that moved without
+        /// moving the call count, or the reverse, is a differently shaped workload).
+        const ARENA_ALLOCS: u64 = 409_110;
+        /// The band's half-width, in percent of [`ARENA_WORDS`] / [`ARENA_ALLOCS`].
         const BAND_PCT: u64 = 30;
         /// The one `-eval` store region [`Runtime::grow_eval_heap`] retires: the copy-out volume
         /// passes the 128 MiB store exactly once on this route (twice as much with the tree
@@ -1238,29 +1274,46 @@ mod in_process_compile {
 
         // ---- the two mechanisms ----
         let stats = runtime.retention_stats();
+        let reclaim = runtime.region_reclaim_stats();
+        let config = runtime.region_reclaim_enabled();
         let arena = runtime.arena.heap_stats();
         eprintln!(
             "{MODULE}.erl: in-process compile in {elapsed:.3} s, {} bytes, md5 {digest}\n\
-             arena: words={} allocs={} regions={} reserved={} committed={} used={}\n\
+             mode:  store={} store_move={} arena={}\n\
+             arena: demand_words={} allocs={} regions={} reserved={} committed={} live={} \
+             used={} released={}\n\
              store: words={} retired_regions={} retired_words={} retained={}\n\
+             reclaim: arena_reclaims={} arena_regions_dropped={} arena_words_reclaimed={} \
+             declines={} ({:?})\n\
              pool:  regions={} words={} peak_used={}",
             bytes.len(),
+            config.store,
+            config.store_move,
+            config.arena,
             stats.arena_words,
             stats.arena_allocs,
             arena.regions,
             arena.reserved_words,
             arena.committed_words,
+            arena.live_words,
             arena.used_words,
+            arena.released_words,
             stats.eval_heap_words,
             stats.eval_heap_retired_regions,
             stats.eval_heap_retired_words,
             stats.eval_heap_words + stats.eval_heap_retired_words,
+            reclaim.arena_reclaims,
+            reclaim.arena_regions_dropped,
+            reclaim.arena_words_reclaimed,
+            reclaim.reclaim_declines,
+            reclaim.reclaim_last_decline,
             stats.bif_regions,
             stats.bif_words,
             stats.bif_peak_used_words,
         );
 
-        // (1) the arena: a demand band, and the geometric ladder EXACTLY.
+        // (1a) the arena's DEMAND: two counts, banded, and the same in every mode. This is the
+        // figure the pin exists for — what the engine asked the arena for during the compile.
         let low = ARENA_WORDS - ARENA_WORDS * BAND_PCT / 100;
         let high = ARENA_WORDS + ARENA_WORDS * BAND_PCT / 100;
         assert!(
@@ -1270,11 +1323,27 @@ mod in_process_compile {
              noise",
             stats.arena_words
         );
+        let alloc_low = ARENA_ALLOCS - ARENA_ALLOCS * BAND_PCT / 100;
+        let alloc_high = ARENA_ALLOCS + ARENA_ALLOCS * BAND_PCT / 100;
+        assert!(
+            (alloc_low..=alloc_high).contains(&stats.arena_allocs),
+            "the arena's served-call count must stay in {alloc_low}..={alloc_high} \
+             (±{BAND_PCT}% of {ARENA_ALLOCS}); it reads {} — the call count is the demand's shape, \
+             and it moves with the workload the same way the word count does",
+            stats.arena_allocs
+        );
+
+        // (1b) `used_words` IS the demand, in every mode — the reclamation lowers `live_words`, not
+        // this one. Asserting the identity here is what makes it impossible to read the demand
+        // figure as occupancy by accident.
         assert_eq!(
             arena.used_words as u64,
             stats.arena_words,
-            "the census and the demand counter are one quantity"
+            "the census and the demand counter are one quantity (cumulative words handed out), and \
+             no mode may lower it — `live_words` is the figure a rewind lowers"
         );
+
+        // (1c) the ladder identity: exact in every mode, because it is the region *policy*.
         assert_eq!(
             arena.reserved_words,
             ARENA_UNIT_WORDS * ((1 << arena.regions) - 1),
@@ -1282,12 +1351,89 @@ mod in_process_compile {
              policy this case's bound is stated in terms of"
         );
         assert!(
-            (3..=6).contains(&arena.regions),
-            "the ladder's step count follows from the demand; {} regions is outside the band the \
-             measured demand implies",
-            arena.regions
+            arena.reserved_words >= arena.live_words,
+            "a reservation always covers the words the arena holds: {} reserved vs {} live",
+            arena.reserved_words,
+            arena.live_words
         );
 
+        // (1d) the OCCUPANCY, which is what the mode decides. `ladder_steps` is the derivation both
+        // branches state their region count in terms of: the geometric growth rule reserves a fresh
+        // region only once the previous reservations are exhausted, each doubling the last, so the
+        // ladder holds `unit · (2^steps − 1)` words with `steps` the smallest such step count.
+        let ladder_steps = |words: u64| {
+            let mut steps = 0usize;
+            while ARENA_UNIT_WORDS as u64 * ((1u64 << steps) - 1) < words {
+                steps += 1;
+            }
+            steps
+        };
+        if config.arena {
+            // The arena action is on: the driver-exit pass must have rewound the arena, which is
+            // what empties it. A decline here is the mechanism moving, so assert the action, not
+            // just the shape it happens to leave.
+            assert!(
+                reclaim.arena_reclaims >= 1 && arena.released_words > 0,
+                "with the arena action enabled the driver-exit pass must rewind the arena \
+                 (arena_reclaims={}, released_words={}, last decline {:?}); without it the \
+                 post-reclaim shape below would be vacuous",
+                reclaim.arena_reclaims,
+                arena.released_words,
+                reclaim.reclaim_last_decline
+            );
+            assert_eq!(
+                arena.regions, 1,
+                "the rewind drops every region above the window's mark, so the arena holds exactly \
+                 the first rung of the ladder afterwards; {} regions means the rewind did not act \
+                 on the compile's regions",
+                arena.regions
+            );
+            assert_eq!(
+                arena.reserved_words, ARENA_UNIT_WORDS,
+                "the surviving rung is the ladder's first unit of {ARENA_UNIT_WORDS} words"
+            );
+            assert_eq!(
+                reclaim.arena_regions_dropped as usize,
+                ladder_steps(arena.used_words as u64) - 1,
+                "the rewind drops every rung but the first: the unreclaimed ladder for {} demanded \
+                 words is {} rungs, so exactly {} may survive",
+                arena.used_words,
+                ladder_steps(arena.used_words as u64),
+                arena.regions
+            );
+            assert!(
+                arena.committed_words <= ARENA_UNIT_WORDS && arena.live_words <= arena.committed_words,
+                "the live words must fit the surviving region: committed={} live={} unit={}",
+                arena.committed_words,
+                arena.live_words,
+                ARENA_UNIT_WORDS
+            );
+            assert!(
+                arena.live_words as u64 * 8 <= stats.arena_words,
+                "post-reclaim occupancy ({} words) must stay far below the cumulative demand ({} \
+                 words) — this is the compile's retention being given back, not a smaller compile",
+                arena.live_words,
+                stats.arena_words
+            );
+        } else {
+            // The arena action is off: nothing may have been released, so the demand is still the
+            // occupancy and the ladder is the minimal one that covers it.
+            assert_eq!(
+                arena.released_words, 0,
+                "with the arena action disabled no pass may release an arena word"
+            );
+            assert_eq!(
+                arena.live_words, arena.used_words,
+                "nothing was released, so the arena still holds every word it handed out"
+            );
+            assert_eq!(
+                arena.regions,
+                ladder_steps(arena.live_words as u64),
+                "unreclaimed, the ladder has the minimal step count covering {} live words at a \
+                 {ARENA_UNIT_WORDS}-word unit",
+                arena.live_words
+            );
+        }
         // (2) the `-eval` store: the retirement count EXACTLY, and retention = Σ region capacities.
         assert_eq!(
             stats.eval_heap_retired_regions, STORE_RETIRED_REGIONS,
