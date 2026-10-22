@@ -727,9 +727,28 @@ fn a_forced_verification_hit_keeps_every_region_and_the_next_pass_classifies_the
     compact::tripwire::disarm();
 
     let stats = rt.region_reclaim_stats();
+    // ---- the `KeptBoth` obligation, stated absolutely -----------------------------------
+    //
+    // A `R_VERIFY_HIT` outcome is *not* a compaction: the sources are kept, the destination is
+    // installed as a retired region, nothing is released and nothing is counted as reclaimed. The
+    // figures are asserted against **zero** (not against a snapshot) because a fresh store has
+    // compacted and dropped nothing, so a future change that quietly releases one source on this
+    // path fails here rather than merely balancing against itself.
     assert_eq!(
-        stats.store_compactions, before.store_compactions,
+        before.store_compactions, 0,
+        "premise: this runtime has compacted nothing yet"
+    );
+    assert_eq!(
+        before.store_regions_dropped, 0,
+        "premise: and dropped no region yet"
+    );
+    assert_eq!(
+        stats.store_compactions, 0,
         "a verification hit must not count as a compaction"
+    );
+    assert!(
+        stats.store_move_hit.is_some(),
+        "the hit is attributed, not merely counted"
     );
     assert_eq!(
         stats.store_move_declines,
@@ -840,4 +859,234 @@ fn a_forced_verification_hit_keeps_every_region_and_the_next_pass_classifies_the
             "every value is still byte-for-byte identical after the sources were dropped"
         );
     }
+}
+
+// ---- the holder diagnostic's *classification* (not only its attribution) ----------------------
+
+/// The diagnostic that explains a verification hit (and a walk refusal) has two halves: **who**
+/// (the attributed corpus slot, pinned by the forced-hit case above) and **where** the word stands
+/// ([`holder`]'s classification, which is what turns "a live word is in an old region" into an
+/// addressable finding). This case pins the second half.
+///
+/// It reuses the forced-hit shape — a real corpus word whose pre-move copy the tripwire leaves in a
+/// source region — so the classification is asked of a word that is genuinely there, and asks it
+/// twice: once against a candidate range that contains the word (it must be named as a candidate
+/// range, i.e. a region the pass would have dropped) and once against a word that stands elsewhere
+/// (it must **not** be called a candidate, which is the answer that keeps a fix from looking at the
+/// wrong region).
+///
+/// [`holder`]: super::holder
+#[test]
+fn the_diagnostic_classifies_a_word_against_the_candidate_ranges_it_stands_in() {
+    let mut rt = small_runtime();
+    open(&mut rt);
+    let mut a = build_partially_live_cons_region(&mut rt, 10, 500);
+    let mut b = build_partially_live_cons_region(&mut rt, 20, 500);
+    let mut c = build_partially_live_cons_region(&mut rt, 30, 500);
+    let sources: Vec<usize> = [a, b, c]
+        .iter()
+        .map(|value| beam_term::list::ptr_val(*value) as usize)
+        .collect();
+
+    compact::tripwire::arm();
+    move_pass(
+        &mut rt,
+        &[],
+        &mut MoveSlots::new(vec![&mut a, &mut b, &mut c]),
+    );
+    compact::tripwire::disarm();
+
+    // The attributed owner: the tripwire's injected word is a snapshot of the first caller slot
+    // that stands in a source region, so the hit names slot 0 — the same finding the forced-hit
+    // case asserts, restated here because this case is about the *other* half of the report.
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(
+        stats.store_move_hit,
+        Some(MoveHitOwner::CallerSlot(0)),
+        "the hit is attributed to the corpus slot that reproduces it"
+    );
+
+    // The classification, asked of a **synthetic** candidate range built around the word that
+    // really stands in a source region (a range is a `(lo, hi)` byte interval, so a test may hand
+    // `locate` any interval it likes — that is exactly what makes this a unit test of the
+    // classifier rather than of the move).
+    let width = size_of::<Eterm>();
+    let candidates = vec![(sources[0], sources[0] + 2 * width)];
+    let inside = holder::locate(&mut rt, &candidates, sources[0]);
+    assert!(
+        inside.contains("candidate range #0"),
+        "a word standing inside a candidate range must be named as one: {inside}"
+    );
+    assert!(
+        inside.contains("a region the pass would drop"),
+        "and the classification must say what a candidate range *means*: {inside}"
+    );
+
+    // The same question about a word that stands **outside** every candidate range: the
+    // destination is a live store region, so the answer is "not a candidate" — the correction that
+    // tells a reader the retained region is not the one to look at.
+    let destination_base = {
+        let region = rt
+            .eval_heap_retired
+            .last()
+            .expect("the destination is the last installed region");
+        heap_region_base(region)
+    };
+    let outside = holder::locate(&mut rt, &candidates, destination_base);
+    assert!(
+        !outside.contains("candidate range"),
+        "a word outside every candidate range must not be called one: {outside}"
+    );
+    assert!(
+        outside.contains("live store/bif region"),
+        "and it must name the family it *does* belong to: {outside}"
+    );
+
+    // A word no enumerated region holds is reported as such — never dereferenced, never called a
+    // dangle (the two families this diagnostic can enumerate are the store's regions and the
+    // arena's).
+    let unheld = holder::locate(&mut rt, &candidates, usize::MAX & !(width - 1));
+    assert!(
+        !unheld.contains("candidate range"),
+        "an address outside every region is not a candidate either: {unheld}"
+    );
+    assert!(
+        unheld.contains("no region this diagnostic enumerates"),
+        "and the honest answer names what it checked: {unheld}"
+    );
+}
+
+// ---- the closed shape: a refc binary carried through the exit-site move, byte-exactly ---------
+
+/// The on-heap `[BinRef][ErlSubBits]` writers, which is the one piece of this case the crate
+/// cannot express safely: a refc pair is written by raw pointer into a region word block.
+///
+/// The crate is `#![deny(unsafe_code)]`; this nested module is the single exemption, the same shape
+/// `src/eval/reclaim.rs`'s own test helper (`pair`) and the `beam_message` integration suites use.
+mod refc_fixture {
+    #![allow(unsafe_code)]
+
+    use beam_alloc::RefcBinary;
+    use beam_term::Eterm;
+
+    /// Writes the on-heap `[BinRef][ErlSubBits]` pair naming `payload`'s bytes onto `heap`'s
+    /// current region, and answers the tagged root (the `ErlSubBits` word).
+    ///
+    /// The returned term borrows nothing: it names `payload`'s off-heap bytes by pointer, exactly
+    /// as a binary the engine materialized would.
+    pub(super) fn write_pair(
+        heap: &mut beam_alloc::Heap,
+        payload: &RefcBinary,
+        bits: usize,
+    ) -> Eterm {
+        // SAFETY: `alloc_words` reserves the pair's 8 words, which `write_refc_binary` fully
+        // writes. `payload` is a live `RefcBinary` owned by the caller for at least as long as the
+        // returned term, so the pointer the pair stores stays dereferenceable.
+        unsafe {
+            let hp = heap
+                .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+                .expect("the store has room for one refc pair");
+            beam_term::refc::write_refc_binary(
+                hp,
+                payload.data_ptr().cast::<Eterm>(),
+                core::ptr::null_mut(),
+                payload.data_ptr().cast_const(),
+                0,
+                bits,
+            )
+        }
+    }
+
+    /// The payload bytes and bit count the live pair `pair` names — the read half of
+    /// [`write_pair`], through the frozen accessors rather than through the raw pair words.
+    pub(super) fn read_pair(pair: Eterm) -> (Vec<u8>, usize) {
+        // SAFETY: `pair` is a live `[BinRef][ErlSubBits]` written by `write_pair`, and the
+        // `RefcBinary` handle its bytes live behind is the caller's for the whole of this call.
+        // The borrow ends at the `to_vec`, so nothing outlives the payload it points into.
+        unsafe {
+            (
+                beam_term::refc::refc_bytes(pair).to_vec(),
+                beam_term::refc::refc_size(pair),
+            )
+        }
+    }
+}
+
+/// **A value holding an off-heap binary survives the exit-site pass byte-exactly**, and the pass
+/// still reclaims the dead words beside it.
+///
+/// This is the "closed shape" the module docs claim and nothing else asserted: a `[BinRef]` /
+/// `[ErlSubBits]` pair is an **ordinary block** to the move — the `BinRef` is a leaf and its `val`
+/// is not a heap word — so the payload pointer is carried across verbatim while the pair itself is
+/// evacuated into the destination. A move that got that wrong would leave the value naming a
+/// released payload, and a length check alone would not see it: the assertions below compare the
+/// **bytes** read back through [`beam_term::refc::refc_bytes`] against the bytes written, and they
+/// also prove the pass did something (`store_compactions == 1`, `store_regions_dropped > 0`).
+#[test]
+fn a_refc_binary_value_survives_the_exit_site_move_byte_exactly() {
+    const BYTES: usize = 4096;
+    let mut rt = small_runtime();
+    open(&mut rt);
+    // Position-dependent bytes, so a shifted or truncated copy is visible in the comparison.
+    let written: Vec<u8> = (0..BYTES).map(|i| ((i * 7) % 251) as u8).collect();
+    let payload = beam_alloc::RefcBinary::new(&written).expect("the payload allocation");
+    // The runtime's escaped-payload store owns a handle, exactly as a payload the engine built
+    // would be adopted; the test keeps its own handle too, so the payload's life does not depend on
+    // the store's bookkeeping.
+    rt.eval_off_heap_mut().push_binary(payload.clone());
+    // The tagged root the store now holds: the pair's `ErlSubBits` word.
+    let mut value = refc_fixture::write_pair(&mut rt.eval_heap, &payload, BYTES * 8);
+    // The interleaved shape the move exists for: one live value, then dead filler filling the
+    // region (the move's threshold is `MIN_WINDOW_WORDS` words of candidates, so a region must be
+    // filled to the brim for the move to be attempted at all), then a growth that retires its
+    // region, then a dead tail in the current region.
+    fill_with_dead_until(&mut rt, 1024);
+    retire_current_region(&mut rt);
+    cons_junk(&mut rt);
+    assert_eq!(rt.eval_heap_retired.len(), 1, "one region was retired");
+    let before = rt.region_reclaim_stats();
+    assert_eq!(before.store_compactions, 0, "premise: nothing compacted yet");
+    assert_eq!(before.store_regions_dropped, 0, "nor dropped");
+
+    // Where the pair stands before the move: the `ErlSubBits` word's own address, which the frozen
+    // layout makes readable without dereferencing anything (`boxed_val` is a tag accessor).
+    let pair_address = beam_term::boxed::boxed_val(value) as usize;
+    assert_eq!(
+        read_words_at(&mut rt, pair_address, 8).map(|words| words.len()),
+        Some(8),
+        "the 8-word pair is written into a region the runtime holds"
+    );
+
+    move_pass(&mut rt, &[value], &mut MoveSlots::new(vec![&mut value]));
+
+    let stats = rt.region_reclaim_stats();
+    assert_eq!(stats.store_compactions, 1, "the exit-site move ran: {stats:?}");
+    assert!(
+        stats.store_regions_dropped >= 1,
+        "and it released at least one source region: every dead word beside the value is gone"
+    );
+    assert!(
+        stats.store_words_reclaimed > 0,
+        "which is the whole point of the move"
+    );
+    assert_eq!(
+        stats.store_move_hit, None,
+        "no verification hit: the pair is a root the corpus does enumerate"
+    );
+    // The bytes, read back through the frozen `beam_term::refc` accessors — never a length check
+    // alone and never a re-read of the (released) source region.
+    let (read_back, bits) = refc_fixture::read_pair(value);
+    assert_eq!(read_back.len(), BYTES, "the whole window is still named");
+    assert_eq!(read_back, written, "and every byte of it is intact");
+    assert_eq!(bits, BYTES * 8, "the window's bit count is unchanged");
+    // The pair itself really moved (the move's own claim), and it is readable at its new address.
+    let moved_address = beam_term::boxed::boxed_val(value) as usize;
+    assert_ne!(
+        moved_address, pair_address,
+        "the block was evacuated into the destination"
+    );
+    assert!(
+        read_words_at(&mut rt, moved_address, 8).is_some(),
+        "and the destination region holds it"
+    );
 }

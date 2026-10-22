@@ -758,23 +758,7 @@ impl RunnerState {
         }
     }
 
-    /// Whether **any** engine in this table sits in a park window (`engine.parked.is_some()`),
-    /// whatever that window published.
-    ///
-    /// This is the store move's one conservative gate
-    /// ([`crate::runtime::reclaim::compact::attempt_move`]): a parked machine in a
-    /// relocation-exempt window holds the only copy of its root set (nothing published it into the
-    /// process's `Registers`), and the runtime's root corpus cannot rewrite its slots while it sits
-    /// outside the table — so a move that would evacuate a region those roots name must decline.
-    ///
-    /// `O(engines)` with a short-circuit; called once per move attempt, which is itself gated on
-    /// candidate regions existing.
-    pub(crate) fn any_engine_parked(&self) -> bool {
-        self.engines.values().any(|engine| engine.parked.is_some())
-    }
-
-    /// Visits the **recorded result** map ([`RunnerState::results`]) — a finished process's
-    /// `x(0)` — mutably, one 1-word slice per recorded process.
+    /// Visits the **recorded result** map ([`RunnerState::results`]) — a finished process's    /// `x(0)` — mutably, one 1-word slice per recorded process.
     ///
     /// [`RunnerState::gather_off_heap_roots`] leaves this map out on purpose — the reclamation
     /// prunes payload handles by identity and needs no copy of them — but a **rewriting** pass

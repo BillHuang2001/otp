@@ -207,8 +207,6 @@ const R_ENUMERATION: &str = "the runtime's root enumeration refused to complete"
 const R_REASON: &str =
     "a recorded raise's live reason word stands inside a region the move would evacuate";
 const R_PIN: &str = "a runtime-lifetime store latched the window, and a move cannot rewrite its slot";
-const R_PARKED: &str =
-    "a machine is parked in a park window, whose root set is its own and may name an evacuated region";
 const R_SWITCH: &str = "the store move switch is off";
 
 /// The caller's own live terms as **writable slots** — the half of the move's corpus that is not
@@ -295,29 +293,27 @@ pub(crate) fn attempt_move(
         runtime.region_reclaim.decline_move(R_PIN);
         return MoveOutcome::Declined;
     }
-    // A machine sitting in a **park window** has no writable slot outside the engine table: its
-    // live `x`/stack/FR words are read through [`Machine::with_roots`](beam_engine::Machine), which
-    // hands them out only while the runner holds that engine — and the runner owns it for the
-    // duration of a slice, not here. The parked-machine family
-    // ([`RunnerState::for_each_parked_machine_root_mut`](crate::runner::RunnerState::for_each_parked_machine_root_mut))
-    // *is* reachable from this site and *is* forwarded, but its words are the engine's
-    // **used-extent** registers plus the whole Erlang stack, not a liveness map: a word at the edge
-    // of that extent may be a value the process has finished with, whose address can coincide with
-    // a store region (a released heap the store's mapping later covered), and copying such a word's
-    // "graph" is exactly what the post-move verification then catches — a full copy into a
-    // destination region that must be **kept anyway** (`MoveOutcome::KeptBoth`).
+    // **No "a machine is parked" gate belongs here.** A parked machine's root words are already in
+    // this move's corpus: [`Runtime::for_each_root_mut`](crate::runtime::for_each_root_mut) reaches
+    // the parked-machine family
+    // ([`RunnerState::for_each_parked_machine_root_mut`](crate::runner::RunnerState::for_each_parked_machine_root_mut),
+    // which visits the live `x` prefix, the Erlang stack and the FR prefix) and therefore *forwards*
+    // them, so a word a parked window holds ends up naming the destination like every other root.
+    // What a parked window can still contribute is a word the corpus **cannot** rewrite: one at the
+    // edge of the engine's used extent that the process has finished with and whose address happens
+    // to coincide with a store region (a released heap the store's mapping later covered). That is
+    // precisely the shape the **post-copy verification** below exists for, and it answers it with
+    // `MoveOutcome::KeptBoth`: every source region stays installed and the destination is kept too,
+    // so the stale word still names its region. The refusal is thus the verification hit, decided by
+    // an address test over the real corpus, and never a *proxy* for it.
     //
-    // Doubt is therefore a refusal **before the first word moves**, exactly like [`R_PIN`]: there
-    // is no way to prove from here that a parked machine's root set does not name a region this move
-    // would evacuate, and the honest cost is that the store face stays retained on a workload that
-    // has a process parked in a `receive` at the pass's site (see the module docs,
-    // *Declines*). Measured on the two-statement `cerl_clauses` compile: every one of the 31
-    // engines in the runner's table is parked at the boundary, so this refusal is the one that
-    // fires, and the move commits nowhere on that workload.
-    if runtime.runner_state.any_engine_parked() {
-        runtime.region_reclaim.decline_move(R_PARKED);
-        return MoveOutcome::Declined;
-    }
+    // "Any engine in the table is parked" is the wrong predicate on two counts. It is not the
+    // question (what matters is whether a held word stands in a candidate range, which the
+    // verification asks directly and per-word), and on this runtime the answer is unboundedly
+    // uninteresting: a process waiting in a `receive` is the *normal* state, so a workload with one
+    // parked server has every pass decline, which is exactly the state that once made
+    // `store_compactions` structurally unreachable. The gate's only effect was to disable the move
+    // permanently — it bought no soundness the verification does not already give.
     let Some(cursor) = runtime.region_reclaim.cursor else {
         // The shared refusal already declined this pass; kept as a typed belt-and-braces branch.
         return MoveOutcome::Skipped;

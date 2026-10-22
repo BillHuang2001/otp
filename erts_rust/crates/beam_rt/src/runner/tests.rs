@@ -3835,3 +3835,181 @@ fn a_served_gc_request_is_not_also_handed_to_the_boundary_door() {
         "a publishing Yield park with no served request still hands the door its check"
     );
 }
+
+/// **The park census, and the parked-machine door, are *true* about park state.**
+///
+/// The two doors are the region-reclaim pass's whole view of a process that is not running: the
+/// value/moving enumerations come from
+/// [`RunnerState::for_each_parked_machine_root_mut`](crate::runner::RunnerState::for_each_parked_machine_root_mut),
+/// and the `BEAM_RT_STORE_TRACE` holder diagnostic resolves a `ParkedMachine[i]` corpus slot back to
+/// a pid through
+/// [`RunnerState::for_each_engine_census`](crate::runner::RunnerState::for_each_engine_census).
+/// Neither had a test, so this one pins all three claims they rest on:
+///
+/// 1. an engine parked in a receive window (`parked = Some(..)`, `parked_published = false`)
+///    **is** handed over by the parked-machine door, and the words it hands over are exactly the
+///    ones the census reports for that pid;
+/// 2. an engine that is **not** in a park window (`parked = None`, a process spawned and never run)
+///    appears in the census as such — and contributes nothing to the door, whose three slices are
+///    empty for it;
+/// 3. a window whose roots went to the process's own registers (`parked_published = true`, what a
+///    `Yield` park with a dead FR prefix does) is **skipped** by the door even though its machine
+///    still holds the same words: the published copy is the truth for that window, and handing the
+///    machine's copy over as well would be a second, stale root set.
+///
+/// Claim 2 is why the door's gate is *publication* rather than `parked.is_some()`: a never-run
+/// engine is unpublished with nothing to hand over, so it is a no-op rather than a skip. The
+/// observable difference between the two is exactly what the counts below assert, and it is the
+/// property the move's corpus completeness rests on.
+#[test]
+fn the_park_census_and_the_parked_machine_door_agree_with_the_park_state() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module: module.clone(),
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+    // The control: a registered engine that has **never run**, i.e. not in a park window.
+    let idle = table.spawn_default().expect("a second process");
+    state.spawn(
+        idle,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // One slice parks the receive: `parked = Some(..)` and — the `receive` park is
+    // `ParkExemption::Always` — nothing was published, so the machine is the root set.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the bare receive parks");
+
+    // A live root word on the parked machine, so a visit is **observable**: a `{7,8}` tuple built
+    // on the process's own young heap and published as FR slot 0 through the engine's `set_fr`
+    // seam (which raises `fr_mark` to 1).
+    let live = {
+        let process = table.get_mut(pid).expect("the parked process");
+        let tuple = process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds {7,8}");
+        state
+            .engines
+            .get_mut(&pid)
+            .expect("the parked engine")
+            .machine
+            .set_fr(0, tuple)
+            .expect("slot 0 is in the FR file");
+        tuple
+    };
+
+    // ---- 1. the census reports the park state, per engine ------------------------------
+    let mut parked_row = None;
+    let mut idle_row = None;
+    state.for_each_engine_census(&mut |row| {
+        if row.pid == pid {
+            parked_row = Some((row.parked, row.parked_published, row.fr_words, row.roots));
+        } else if row.pid == idle {
+            idle_row = Some((row.parked, row.parked_published, row.roots.len()));
+        }
+    });
+    let (parked, published, fr_words, roots) =
+        parked_row.expect("the parked engine is in the census");
+    assert!(
+        parked.is_some(),
+        "the receive park is a park window, and the census says at which (func, pc)"
+    );
+    assert!(
+        !published,
+        "an exempt (receive) park published nothing, so the machine is authoritative"
+    );
+    assert_eq!(fr_words, 1, "the live FR prefix the park would replay is one word");
+    assert!(
+        roots.contains(&live),
+        "the census reports the machine's live root words, the FR slot included"
+    );
+    let (idle_parked, _idle_published, idle_roots) =
+        idle_row.expect("the never-run engine is in the census too");
+    assert_eq!(
+        idle_parked, None,
+        "an engine that never ran is not in a park window"
+    );
+    assert_eq!(idle_roots, 0, "and it hands over no root word");
+
+    // ---- 2. the door hands over exactly the parked engine's words ----------------------
+    let mut handed = 0usize;
+    let mut seen = false;
+    state
+        .for_each_parked_machine_root_mut(
+            &mut |words| {
+                handed += words.len();
+                seen = seen || words.contains(&live);
+                Ok(())
+            },
+            |candidate| candidate == pid || candidate == idle,
+        )
+        .expect("the parked-machine door completes");
+    assert!(seen, "the parked machine's live FR word is handed over");
+    assert_eq!(
+        handed,
+        roots.len(),
+        "the door's word count is the census's for the parked engine, so the never-run engine \
+         contributed nothing"
+    );
+
+    // ---- 3. a publishing window is skipped by the door ---------------------------------
+    {
+        let engine = state.engines.get_mut(&pid).expect("the parked engine");
+        assert!(
+            park_window(&mut table, pid, engine, 0, ParkExemption::LiveFloats),
+            "a Yield park with a dead FR prefix publishes the machine's root set"
+        );
+    }
+    let mut published_handed = 0usize;
+    state
+        .for_each_parked_machine_root_mut(
+            &mut |words| {
+                published_handed += words.len();
+                Ok(())
+            },
+            |_| true,
+        )
+        .expect("the door completes over a publishing window");
+    assert_eq!(
+        published_handed, 0,
+        "a window whose roots went to the process's registers is not handed over again — the \
+         machine's copy is stale the moment a collection relocates the published one"
+    );
+    // The machine still holds the word, so the zero above is the gate's answer and not an empty
+    // machine.
+    assert_eq!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .machine
+            .get_fr(0)
+            .expect("slot 0 is in the FR file"),
+        live,
+        "the machine still names the word the door declined to hand over"
+    );
+}

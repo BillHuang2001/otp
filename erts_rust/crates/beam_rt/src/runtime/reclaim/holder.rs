@@ -523,7 +523,11 @@ fn render_word(runtime: &mut Runtime, word: Eterm) -> String {
 }
 
 /// The term's address and its location, for a [`term_address`] result.
-fn describe(runtime: &mut Runtime, candidates: &[(usize, usize)], address: Option<usize>) -> String {
+pub(super) fn describe(
+    runtime: &mut Runtime,
+    candidates: &[(usize, usize)],
+    address: Option<usize>,
+) -> String {
     match address {
         Some(address) => format!("{address:#x} ({})", locate(runtime, candidates, address)),
         None => String::from("no address (an immediate or a literal word)"),
@@ -536,7 +540,12 @@ fn describe_term(runtime: &mut Runtime, candidates: &[(usize, usize)], word: Ete
 }
 
 /// Where `address` lives: a candidate range, a live region, or nothing at all.
-fn locate(runtime: &mut Runtime, candidates: &[(usize, usize)], address: usize) -> String {
+///
+/// `pub(super)` so the pass's own unit test can pin the **classification** this diagnostic reports
+/// (a word standing in a candidate range must be named as one, and a word standing elsewhere must
+/// not) without capturing the `BEAM_RT_STORE_TRACE` stream, which is a process-global stderr
+/// channel no in-process test can own.
+pub(super) fn locate(runtime: &mut Runtime, candidates: &[(usize, usize)], address: usize) -> String {
     if let Some((index, (lo, hi))) = candidates
         .iter()
         .enumerate()
