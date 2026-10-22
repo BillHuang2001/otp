@@ -322,7 +322,7 @@ and `RefcBinary`'s moving grow (binary/growth.rs:426).
   (core.rs:527-536).
 - Either `unmap` (carrier.rs:227 = `drop(self)`) ends in `Segment::drop` (mseg/header.rs:250) →
   `MsegInner::release` (mseg/state.rs:142): with the default `cache: true, max_cache_size: 10`
-  (mseg/config.rs:98-100) the segment is **pushed on the reuse cache (still mapped, still unzeroed)**
+  (mseg/config.rs:118-119) the segment is **pushed on the reuse cache (still mapped, still unzeroed)**
   and only the **oldest** cached segment is `munmap`ed (`destroy` → `os_unmap`, mseg/state.rs:119-137,
   mseg/mapping.rs:104) once the cache is full — i.e. the mapping in question is not necessarily the one
   being freed. `MsegState::drop`/`purge_cache` never runs in production (the `mseg()` handle is a
