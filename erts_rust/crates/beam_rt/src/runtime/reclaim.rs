@@ -62,9 +62,10 @@
 //! * **store, move** ([`compact`]) — the *interleaved* case the whole-region action cannot help:
 //!   when the candidates are only **partially** live (each retaining one live word and therefore
 //!   held whole) and their dead fraction is worth reclaiming, every word reachable from the
-//!   runtime's **mutable** root corpus is evacuated into one fresh right-sized region and the
-//!   sources are dropped. That is the one place a store word moves; the corpus, the post-move
-//!   verification, the thresholds and the decline list are [`compact`]'s own documentation.
+//!   runtime's **mutable** root corpus is evacuated into one fresh region sized by the store's own
+//!   growth policy ([`Runtime::eval_store_growth_capacity`]) and the sources are dropped. That is
+//!   the one place a store word moves; the corpus, the post-move verification, the thresholds and
+//!   the decline list are [`compact`]'s own documentation.
 //!
 //! When the move fires, the whole-region action is skipped: there is no candidate left to classify.
 //! When it is skipped, or it declines **before the first word moves**, the whole-region action runs

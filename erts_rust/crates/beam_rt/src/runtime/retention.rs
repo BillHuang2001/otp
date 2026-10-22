@@ -146,9 +146,9 @@ pub struct RetentionStats {
     /// moved).
     ///
     /// The store move ([`crate::runtime::reclaim::compact`]): one region holding a live word is
-    /// evacuated into a fresh right-sized region so its source can be dropped. A region whose live
-    /// fraction is too high, whose candidates are below the window threshold, or whose pass declined
-    /// is never compacted.
+    /// evacuated into a fresh region sized by the store's own growth policy, so the source can be
+    /// dropped without shrinking the store's headroom. A region whose live fraction is too high,
+    /// whose candidates are below the window threshold, or whose pass declined is never compacted.
     pub store_compactions: u64,
     /// How many store words the reclaim pass's drops released, summed
     /// ([`RegionReclaimStats::store_words_reclaimed`](crate::runtime::RegionReclaimStats)).

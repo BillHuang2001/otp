@@ -40,9 +40,18 @@ use crate::config::RuntimeConfig;
 ///
 /// The same shape `crate::context::pool::tests`'s `small_region_runtime` uses: only the *region*
 /// size is small, so nothing else about the runtime changes.
+///
+/// The three region-reclaim action bits are then set **explicitly** (all on,
+/// [`RegionReclaimConfig::default`]) because [`Runtime::new`] latches them from the
+/// `BEAM_RT_REGION_RECLAIM` diagnostic gate: a case here asserts what an action *did*, so the
+/// harness shell's environment must not be able to turn that action off underneath it. A case that
+/// exercises the gate itself (see `the_move_off_leaves_a_partially_live_region_whole_and_the_move_on_collapses_it`)
+/// sets its own configuration afterwards.
 fn small_runtime() -> Runtime {
-    Runtime::new(RuntimeConfig::default().with_heap_words(1024))
-        .expect("a runtime with a small (but legal) term-heap region")
+    let mut rt = Runtime::new(RuntimeConfig::default().with_heap_words(1024))
+        .expect("a runtime with a small (but legal) term-heap region");
+    rt.set_region_reclaim_enabled(RegionReclaimConfig::default());
+    rt
 }
 
 /// A store window state that admits a pass (`Site::Exit`'s transient-pin rule aside).
@@ -678,6 +687,10 @@ fn the_move_off_leaves_a_partially_live_region_whole_and_the_move_on_collapses_i
 /// term building (`crate::eval`'s `heap!`), and the native floor's `make_binary` replies
 /// (`src/native/**`, e.g. a `filelib`/`prim_file`/`code` reply). So the move's destination capacity
 /// is a **correctness** property, not a tuning knob.
+///
+/// The region-reclaim configuration is set **explicitly** by [`small_runtime`] (all three actions
+/// on) rather than left to the `BEAM_RT_REGION_RECLAIM` gate [`Runtime::new`] latches, so no
+/// environment can leave the move off and make this case fail for an environmental reason.
 ///
 /// The shape this pins is the regression the old sizing produced: `need + max(need/8, 64)` sized
 /// the destination from the *live set*, so collapsing three regions of a store that offered 8 192

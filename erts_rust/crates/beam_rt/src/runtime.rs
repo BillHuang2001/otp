@@ -2623,7 +2623,9 @@ impl Runtime {
         } else {
             self.eval_store_replacement_capacity(current, request)
         }
-    }    /// The largest capacity [`Runtime::grow_eval_heap`] may install: the absolute runaway guard
+    }
+
+    /// The largest capacity [`Runtime::grow_eval_heap`] may install: the absolute runaway guard
     /// [`MAX_EVAL_HEAP_WORDS`], and never below the region the store already has — a store that
     /// was configured larger than it keeps its region (it is never shrunk).
     ///

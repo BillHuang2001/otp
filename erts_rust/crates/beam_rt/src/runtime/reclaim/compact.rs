@@ -31,8 +31,9 @@
 //! *partially* live and each is retained **whole** — one live term pins an entire region.
 //!
 //! The move answers that shape: it evacuates every word reachable from the runtime's mutable root
-//! corpus out of the store's current region and every retired candidate into **one** fresh
-//! right-sized region, then drops the sources.
+//! corpus out of the store's current region and every retired candidate into **one** fresh region
+//! sized by the store's own growth policy ([`Runtime::eval_store_growth_capacity`]), then drops the
+//! sources.
 //!
 //! # The corpus (what makes the move sound)
 //!
@@ -121,12 +122,14 @@
 //!
 //! # The destination's capacity is the store's growth policy, not the live set
 //!
-//! The destination is sized by [`Runtime::eval_store_growth_capacity`] — the same rule
-//! [`Runtime::grow_eval_heap`] applies — anchored at the capacity of the region the move replaces,
-//! with `need` (floored by
-//! [`EVAL_STORE_GROWTH_FLOOR`](crate::runtime::EVAL_STORE_GROWTH_FLOOR)) as the growth request and
-//! the store's ceiling as the cap; the result is then clamped to the **total capacity the move
-//! replaces**, so a move never reserves more than it frees.
+//! The destination is sized by [`Runtime::eval_store_growth_capacity`] — the store's own growth
+//! policy: the region the move replaces keeps its capacity when that already serves the live set,
+//! otherwise it doubles, floored at
+//! [`EVAL_STORE_GROWTH_FLOOR`](crate::runtime::EVAL_STORE_GROWTH_FLOOR) and capped by the store's
+//! ceiling ([`Runtime::eval_heap_ceiling`], i.e.
+//! [`MAX_EVAL_HEAP_WORDS`](crate::runtime::MAX_EVAL_HEAP_WORDS)). The result is then clamped to the
+//! **total capacity of the regions the move replaces**, so a multi-region collapse always releases
+//! memory.
 //!
 //! That is a correctness requirement rather than tuning. [`Runtime::eval_heap`] has exactly one
 //! growing consumer — the table-less copy-out
@@ -135,11 +138,10 @@
 //! reports the typed `error:system_limit` when the region is short: [`Runtime::stabilize_term`]
 //! (the gateway to every runtime-lifetime store), the evaluator's own term building
 //! (`crate::eval`'s `heap!`), and the native floor's `make_binary` replies (`src/native/**`). A move
-//! that installed a region sized from the live set alone (`need + need/8`) therefore shrank the
-//! store by orders of magnitude and made the *next* unrelated allocation fail. The memory a move
-//! releases comes from collapsing the source regions into **one**, not from making that one small,
-//! and a capacity-sized region is a lazy `mmap`: it costs address space, not RSS, until it is
-//! written.
+//! whose destination were sized from the live set alone would therefore shrink the store by orders
+//! of magnitude and make the *next* unrelated allocation fail. The memory a move releases comes from
+//! collapsing the source regions into **one**, not from making that one small, and a capacity-sized
+//! region is a lazy `mmap`: it costs address space, not RSS, until it is written.
 //!
 //! Two consequences worth knowing:
 //!
@@ -150,7 +152,8 @@
 //!   reservation whose live prefix is only the words the copy wrote, released by a later pass once
 //!   the roots that name it move on.
 //!
-//! # Decline list (each recorded, both regions left usable)//!
+//! # Decline list (each recorded, both regions left usable)
+//!
 //! * the move switch is off ([`RegionReclaimConfig::store_move`](crate::runtime::RegionReclaimConfig));
 //! * a **runtime-lifetime pin** latched the window at either site — a `stabilize_term` store that
 //!   the family walk may not cover, or a decoded port caller tag. This refusal is **empirically
@@ -461,9 +464,9 @@ pub(crate) fn attempt_move(
     // its only *shrinking* writer: `move_result_into_runtime_store` grows on refusal, but every
     // other writer — `Runtime::stabilize_term`, the evaluator's own term building, the native
     // floor's `make_binary` replies (`src/native/**`) — copies into the region it finds and reports
-    // the typed `error:system_limit` when it is short. A destination sized `need + need/8` would
-    // therefore hand the store a region orders of magnitude smaller than the one it replaced, and
-    // the next unrelated allocation — not the move's own copy — would fail. Headroom is thus a
+    // the typed `error:system_limit` when it is short. A destination sized from the live set alone
+    // would therefore hand the store a region orders of magnitude smaller than the one it replaced,
+    // and the next unrelated allocation — not the move's own copy — would fail. Headroom is thus a
     // **correctness property of a move**, not a tuning knob; the memory the move releases comes
     // from collapsing the source regions into one, never from making that one small.
     let source_total = retired.iter().fold(runtime.eval_heap.capacity(), |total, index| {

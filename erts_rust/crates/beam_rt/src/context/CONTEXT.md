@@ -368,7 +368,7 @@ Both mechanisms are **resident**, not merely reserved: `grow_eval_heap` retires 
 `arena_words` (**1 328 040 494** words = 10.6 GB of **cumulative** demand over 7 047 134 calls) is an upper bound on the arena's resident bytes, not a figure in them: the demand is 69.67 % in 101 367 requests of 4 097–16 384 words (mean 11 442), whose `map_words_capacity(n) = 21n + 18` reservation is a deliberate upper bound while the written map is `3n + 2·nodes` ≈ 3.7 words/pair, and `write_map` never touches `[written_end, capacity)`.
 
 **The bound rule — what each mechanism retains, and why.**
-- **The store retains the copy-out volume since the last reclaimable statement boundary.** Every container result of a call that may rewind is deep-copied onto it, so one call's licence to rewind one pooled region becomes `n` store words; each region is capped at `MAX_EVAL_HEAP_WORDS` (256 MiB) and the *chain* has no cap of its own, because a retired region is **full and never rewritable in place** — growth always replaces, never relocates or reuses. `src/runtime/reclaim.rs` is where that is answered, by two mechanisms at the same two non-running sites (the `-eval` statement boundary and the driver exit): a whole-**dead** region is dropped (its `Heap::drop` frees the carrier) once a reachability descent proves no live term stands in it, and a **partially** live one is *evacuated* — its live words copied into one fresh right-sized region by `src/runtime/reclaim/compact.rs` and every root rewritten, `KeptBoth` if the post-move verification then finds a live word in an old region. Detail, thresholds and measured figures: [`../runtime/CONTEXT.md`](../runtime/CONTEXT.md).
+- **The store retains the copy-out volume since the last reclaimable statement boundary.** Every container result of a call that may rewind is deep-copied onto it, so one call's licence to rewind one pooled region becomes `n` store words; each region is capped at `MAX_EVAL_HEAP_WORDS` (256 MiB) and the *chain* has no cap of its own, because a retired region is **full and never rewritable in place** — growth always replaces, never relocates or reuses. `src/runtime/reclaim.rs` is where that is answered, by two mechanisms at the same two non-running sites (the `-eval` statement boundary and the driver exit): a whole-**dead** region is dropped (its `Heap::drop` frees the carrier) once a reachability descent proves no live term stands in it, and a **partially** live one is *evacuated* — its live words copied into one fresh region by `src/runtime/reclaim/compact.rs` and every root rewritten, `KeptBoth` if the post-move verification then finds a live word in an old region. That destination is sized by the store's own growth policy applied to the copied live set and clamped by the total capacity of the regions it replaces, so a collapse releases memory by turning N regions into one, never by shrinking that one (*The store's writers that do not grow* below). Detail, thresholds and measured figures: [`../runtime/CONTEXT.md`](../runtime/CONTEXT.md).
   The window that would reclaim a dead prefix is pinned by the first nested run that writes the store (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), so a compile — one `-eval` statement made of store-writing nested runs — only ever advances it.
 - **The arena retains every word it ever handed out.** `ContextHeap` is a `Vec<ReservedHeap>` that only grows: an exhausted region is kept, unmoved, and a fresh doubled one becomes the frontier, so a table-less compile's whole term-build graph accumulates there until `src/runtime/reclaim.rs` rewinds the region above its recorded mark (a word still reachable from the pass's roots refuses the rewind).
   `MinimalContext::heap_stats()` reports the census (`regions`/`reserved_words`/`committed_words`/`used_words`/`peak_words` + the frontier pair) and `heap_mark()`/`heap_mark_matches()` detect a replaced frontier, but `used_words` is cumulative demand, never live memory.
@@ -377,6 +377,33 @@ Both mechanisms are **resident**, not merely reserved: `grow_eval_heap` retires 
 - **The third mechanism IS bounded: the exempt-window nursery chain.** `Process::grow_nursery` is unreachable on the **table-less** route — `move_result_into_process_heap` returns at `let table = mailbox_table.as_deref_mut()?;` before `hint_grow_gate` — and on a **scheduled** route a big compile's child reaches it only inside a nested `apply_fun`/`run_*_blocking` subtree where the pid is **relocation-exempt**, so every collapsing collection door declines and a growth request that cannot be honoured lengthens the chain instead of collecting.
   `resolve_external_call` therefore declines the fun-applying stdlib fast paths (`beam_bifs::needs_fun_caller`'s `lists`/`maps` roster) while the calling process carries collection debt, entering the call in the caller's own **armed** machine so the debt door collapses the chain as it grows; the two `ets` folds stay synchronous (their bodies reach a gated `lists` key internally) and the gate is inert on a context with no process table.
   What it does **not** cover: a nested run entered while the caller owes no debt, and a fun-applying key outside the roster.
+
+### The store's writers that do not grow
+`Runtime::eval_heap` has exactly **one** growing consumer — the table-less copy-out
+([`move_result_into_runtime_store`](pool.rs) → `Runtime::grow_eval_heap`) — and three
+families of writers that copy into the region they find and fail when it is short:
+- `Runtime::stabilize_term` (`runtime.rs:2476`, `beam_message::copy_struct_simple` at `:2486`) and
+  `stabilize_term_with` (`:2677`) — the gateway to every runtime-lifetime store (a timer delivery, an
+  exit reason, a runner outcome, `persistent_term`, a trace match spec, the `enif_select` payload,
+  `port_set_data`'s data);
+- the `-eval` evaluator's `heap!` macro (`eval/mod.rs:162`) over `RuntimeContext::eval_heap()`
+  (`runtime_context.rs:555`) — its bitstring/binary materialization;
+- the native floor's `beam_codec::term::make_binary(self.eval_heap(), …)` replies —
+  `native/file_server.rs:1022`, `native/prim_file.rs:277,469,541,633,674`, `native/prim.rs:314,366`,
+  `native/code.rs:238`, `native/erts_internal.rs:731,764`, `port.rs:4861`, `eval/compile.rs:453`.
+A short region is `beam_alloc`'s `Alloc(Heap)` (`AllocKind::Heap`); the copy-out family and the
+native floor's replies surface it as the typed `error:system_limit` (`error.rs:91`, for a BIF at a
+dispatch tail `calls.rs:1057`/`:1818`), the evaluator's `heap!` as `Flow::Fatal` (the CLI's
+`beam_rt: allocation failure: heap (N bytes)`, exit 1). None of them grows the store and none of them
+returns a wrong term.
+**Why that is safe:** a completed move installs a destination whose capacity is at least the capacity
+of the region it replaces — and at least the live set it copied — so a move never reduces the store's
+headroom below what the pre-move store offered for the same live volume, which is exactly these
+writers' bound.
+The residual is the **multi-region** case: a collapse that also moves words *in* from retired regions
+leaves one region's free capacity where the separate regions had the sum of theirs, so these writers
+stay bounded by **one** region's capacity — the pre-move bound for the single region they were
+copying into — which is the bound they keep; they are deliberately given no growth path of their own.
 
 ### Host memory: the touched pages, measured (RSS attribution)
 Measured on the release binary with the OTP-30 bootstrap compiler first on `-pa`, via

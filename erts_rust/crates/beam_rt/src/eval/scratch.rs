@@ -125,9 +125,10 @@
 //! the run.
 //!
 //! The pass **may move a word** (its store move, [`crate::runtime::reclaim::compact`]): it evacuates
-//! the live words of a partially live region into one fresh right-sized region and drops the
-//! sources. That is why [`boundary`], [`close`] and [`Evaluator::reset_scratch`] hand the
-//! evaluator's environment over as **writable slots** rather than as a snapshot, and why a move
+//! the live words of a partially live region into one fresh region — sized by the store's own growth
+//! policy, so the store's headroom survives the move — and drops the sources. That is why
+//! [`boundary`], [`close`] and [`Evaluator::reset_scratch`] hand the evaluator's environment over as
+//! **writable slots** rather than as a snapshot, and why a move
 //! ends by [`ScratchState::stop`]ping this window — the mark it held named a region that is no
 //! longer current.
 //!
