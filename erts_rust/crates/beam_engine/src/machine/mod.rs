@@ -70,9 +70,11 @@
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
-//! * `root_tests` — the pins for [`Machine::for_each_root`] (the read-only
-//!   pointer-bearing root enumeration): coverage of every rooted file plus the loose
-//!   terms, the immediate filter, and agreement with the [`RootSet`] hand-off.
+//! * `root_tests` — the pins for the two root-enumeration doors
+//!   ([`Machine::for_each_root`], the read-only pointer-bearing census, and its writable
+//!   twin [`Machine::for_each_root_mut`]): coverage of every rooted file plus the loose
+//!   terms, the immediate filter, agreement with the [`RootSet`] hand-off, and the parity
+//!   between the two doors (same root words, same slots, shared `args_scratch` exclusion).
 //! * `deadline_tests` — the parked-`receive` deadline driven to completion on a real
 //!   compiled module (`erlc`) and cross-checked against the system `erl`, including the
 //!   nested / blocking run path a fired `after T` has to work through.
@@ -1045,9 +1047,20 @@ impl Machine {
     ///
     /// The walk is `&self` and hands out **copies**, so it can census reachability but
     /// cannot relocate: a collecting host must still go through
-    /// [`Machine::with_roots`]'s mutable slices to write a moved word back. It allocates
-    /// nothing, collects nothing and changes no machine state, which is what makes it
-    /// safe to call between any two instructions.
+    /// [`Machine::with_roots`]'s mutable slices to write a moved word back, or use the
+    /// writable twin [`Machine::for_each_root_mut`] (the same root words as `&mut [Eterm]`
+    /// slices). It allocates nothing, collects nothing and changes no machine state, which
+    /// is what makes it safe to call between any two instructions.
+    ///
+    /// **Coverage parity is pinned, not promised:** `root_tests::for_each_root_mut_…` keeps
+    /// this walk and [`Machine::for_each_root_mut`] from disagreeing about *what* is rooted —
+    /// `for_each_root_mut_enumerates_the_same_roots_as_for_each_root` compares the two
+    /// enumeration sets, `for_each_root_mut_relocates_the_very_slots_for_each_root_reports`
+    /// and `for_each_root_mut_writes_are_observed_by_for_each_root` prove a write through
+    /// the writable door lands in the very slots this walk reports, and
+    /// `for_each_root_mut_excludes_args_scratch_and_restores_the_parking_on_error` pins the
+    /// shared `args_scratch` exclusion. A change to either door that is not mirrored in the
+    /// other fails one of them.
     pub fn for_each_root(&self, mut f: impl FnMut(Eterm)) {
         let x_live = self.used_x_extent() as usize;
         let fr_live = self.used_fr_extent() as usize;
@@ -1071,6 +1084,93 @@ impl Machine {
                 f(term);
             }
         }
+    }
+
+    /// Hand every root word this machine holds to a **relocating** visitor, as three
+    /// `&mut [Eterm]` slices, one at a time.
+    ///
+    /// This is the **writable** twin of [`Machine::for_each_root`]: the same coverage, the
+    /// same extent accessors and the same loose-term parking discipline, but the visitor may
+    /// **rewrite** the words. [`Machine::for_each_root`] is `&self` and hands out copies, so
+    /// it can census reachability but cannot relocate; this is the door a **moving** pass
+    /// (a copying/compacting collector) uses.
+    ///
+    /// # What it hands over (exactly `for_each_root`'s root words)
+    ///
+    /// The three frozen [`RootSet`] files, in that order, each borrowed only for its own
+    /// visit: the **used prefix** of the X-register file ([`Machine::used_x_extent`]), the
+    /// **whole** Erlang stack (every Y slot of every live frame — there is no liveness map)
+    /// and the used prefix of the FR file ([`Machine::used_fr_extent`]). The machine's five
+    /// **loose heap terms** ([`Machine::loose_heap_terms`]: the two failed-clause argument
+    /// latches, the pending exception's reason and the two supplied-trace term latches) are
+    /// **parked at the stack tail before the stack slice is handed over**, so the visitor
+    /// relocates them *through that slice*, exactly as [`Machine::with_roots`] makes them
+    /// relocatable, and each field is **re-seated from its slot after the last slice** —
+    /// including when the visitor returns `Err` (the stack is truncated and every field
+    /// re-seated regardless; the error is propagated afterwards).
+    ///
+    /// The whole implementation is one [`Machine::with_roots`] hand-off, so the extent
+    /// accessors, the two dirty-extent notes ([`Machine::note_x_dirty`]/
+    /// [`Machine::note_fr_dirty`]) and the parking/reseating rule are literally the hand-off's
+    /// — there is **one** parking implementation in the crate, and this door cannot drift from
+    /// it.
+    ///
+    /// # Why the slices are not filtered
+    ///
+    /// [`Machine::for_each_root`] skips every word that cannot name a heap object, because a
+    /// census only wants roots. A slice cannot be filtered that way — it is one contiguous
+    /// prefix, so an immediate inside it cannot be removed — but it does not need to be: a
+    /// relocating visitor (`beam_gc`'s `Relocator::forward_roots`, or its `live_words_in`
+    /// preflight) leaves a non-pointer word **byte-identical** and copies nothing, so a small
+    /// integer, an atom, a pid/port/reference and `NIL` in the middle of a slice are no-ops.
+    /// What must match [`Machine::for_each_root`] is the **root coverage**, and that is pinned
+    /// in parity by `root_tests::for_each_root_mut_enumerates_the_same_roots_as_for_each_root`
+    /// (same multiset of pointer-bearing words) and
+    /// `for_each_root_mut_relocates_the_very_slots_for_each_root_reports` /
+    /// `for_each_root_mut_writes_are_observed_by_for_each_root` (a write through this door is
+    /// observed by the census, slot for slot).
+    ///
+    /// # The root-set contract (frozen)
+    ///
+    /// A moving visitor may rewrite **every** word in the slices — that is the point of the
+    /// door — with two obligations carried over from [`RootSet`]: a `LIST`/`BOXED` word is
+    /// handed over **verbatim** and a static literal (which carries
+    /// [`beam_term::literal::TAG_LITERAL_PTR`] on a `LIST`/`BOXED` tag) must be left alone.
+    /// Equally: once the visitor has run, **a raw `*mut Eterm` obtained from a previous
+    /// allocation is dead** — the caller must re-read its terms from these slices (or hand
+    /// them back through them), exactly as after a collecting [`Machine::alloc_rooted`].
+    ///
+    /// # What it does NOT cover
+    ///
+    /// **`args_scratch`**, for the reason stated on [`Machine::for_each_root`]: the wide
+    /// `call_bif` argument window is `mem::take`n *out* of the machine for the whole dispatch,
+    /// and [`Machine::dispatch_bif_call`] holds the machine immutably, so no `&mut self` door
+    /// can be crossed while it is out — this door least of all. `class_atoms` (immediates), a
+    /// foreign (`literal`-area) term and any host-side structure holding engine terms are
+    /// likewise outside, identically to the census.
+    ///
+    /// # Errors
+    ///
+    /// The visitor's error is propagated unchanged, and the walk **stops** there (the later
+    /// slices are never handed over). The three root files are left exactly as the visitor
+    /// wrote them — a partially-relocated root set is the visitor's own responsibility, and
+    /// the door does not attempt to undo a move — while the stack length and the five loose
+    /// fields are restored around the parking in every case.
+    pub fn for_each_root_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut [Eterm]) -> Result<()>,
+    ) -> Result<()> {
+        // One `with_roots` hand-off IS the implementation: the same extent accessors, the
+        // same dirty-extent notes and the one parking/reseating discipline, so this door and
+        // the collecting one can never disagree about what is rooted. The three slices are
+        // disjoint fields of the `RootSet`, so each borrow ends before the next begins — which
+        // is what makes "one at a time" a real invariant and not a convention: the visitor
+        // cannot hold (or alias) one root file while it is handed another.
+        self.with_roots(RootSet::ALL_LIVE, |roots| {
+            f(&mut roots.x[..])?;
+            f(&mut roots.stack[..])?;
+            f(&mut roots.fr[..])
+        })
     }
 
     /// Allocate `n` heap words **with the live root set handed to `ctx`**, so a
