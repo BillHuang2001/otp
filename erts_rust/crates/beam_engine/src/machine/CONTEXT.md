@@ -256,6 +256,48 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   against `erl` (loud skip when `erlc`/`erl` are absent); plus a cross-module-callee park proving the deadline
   is read from the callee context, never the entry module.
 
+## The loose-heap-term census, the hand-off width rule and the parked-park seams
+What the root set is **made of** and what it provably leaves out — the invariants a change to any
+`Eterm`-typed `Machine` field must not silently break.
+- **The term-bearing fields.** The frozen `RootSet` (`x[..used_x_extent]`, the whole `stack`, the whole `fr`),
+  the three **loose** fields the root set cannot carry (`loose_heap_terms`, `mod.rs:887-893`, in the fixed order
+  `raise_function_clause_args`, `pending_function_clause_args`, `pending_exception.reason`), and `args_scratch`.
+  Everything else that is `Eterm`-typed is an **immediate-only** file (`class_atoms: [Eterm; 3]`, `mod.rs:233` —
+  atoms; the two `Option<StackTrace>` latches — metadata) or off-heap (`refc_binaries`,
+  `writable_payloads`), which no collection relocates.
+- **Two `Eterm` fields are deliberately OUTSIDE the census.** `pending_supplied_term` (`mod.rs:426`) and
+  `raise_supplied_term` (`mod.rs:461`) hold the cooked `[{M,F,A,Loc}]` trace **term** across a `throw_with_trace`
+  call but never across an allocation: the pair is armed (`catch.rs:445`/`:450`, `:655`) and consumed
+  (`catch.rs:500`, `:583`) inside that one call, which allocates nothing, so no admission point can intervene and
+  the word also rides the handler's `x(2)` (`land_exception`, `catch.rs:630-633`) until the call returns.
+  **A future allocating step between the arm and the consume breaks the root set silently** — either add the two
+  fields to `loose_heap_terms` or keep the arm/consume window allocation-free.
+- **`args_scratch` (`mod.rs:527`) is `mem::take`n out of the machine for the whole wide BIF dispatch**
+  (`interpreter/bif.rs:175`, restored `:185`), so no `with_roots` hand-off can see it, and
+  `Machine::for_each_root` (`mod.rs:987-1010`) deliberately does not enumerate it either. That is sound only
+  because **BIF dispatch cannot collect**: `dispatch_bif_call` is `&self` (`interpreter/bif.rs:324-338`) and the
+  host's GC gate is armed solely by `BudgetContext::ensure_heap`, so `call_bif`/`call_bif_in_machine` re-enter the
+  engine with the heap unmoved. A host that made BIF dispatch a collection door would strand every argument.
+- **The hand-off width is `used_x_extent()`/`used_fr_extent()` = `max(mark, dirty)`** (`registers.rs:108-110`),
+  never `RootSet::live` (a hint only) — so `live` may be larger than the handed prefix and the slot set is still
+  exact. The width is sound only while **every** writer reports: `set_x`/`set_fr` raise the mark
+  (`registers.rs:251-288`), `x_mut`/`fr_mut`/`with_roots` raise `dirty` (`:139-142`), and a native block reports
+  through the artifact's `native_write_extent` (`jit/baseline/mod.rs:696-702`, `code.rs:615-620`) — the one claim
+  that is a **static property of the emitter** (`highest_native_register` must bound every generated store) and so
+  cannot be verified by reading the runtime alone. An under-reported extent shortens the hand-off and leaves a
+  live register unrooted, which surfaces as a stale word dereferenced later, not as a collector error.
+- **The parked hand-off re-derives its two widths at both ends.** `publish_parked_roots` publishes
+  `roots.x.len()` + `roots.stack.len()` (machine stack **plus the armed loose words `with_roots` just parked**) +
+  `fr_count`, and the resume's `scatter_roots_full` compares against the *then-current* `roots.x.len()` and
+  `roots.stack.len() + fr_count`. Nothing inside the engine mutates `x`/`stack`/the loose-arm set while the machine
+  is parked (no engine code runs), so the pair agrees; a host that writes `pending_exception_mut().1` before the
+  resume, or that resumes a machine it reset, changes one side only.
+- **A failed scatter is not a refusal — it is a dangling machine.** A `scatter_roots_full` width mismatch makes the
+  host `halt_process_gc` and *resume anyway* (`beam_rt`'s `resync_parked_roots`), while the from-space has already
+  been evacuated: every `x`/`stack` word then names freed memory and the first `terms::cons_head`/`cons_tail`/
+  `get_list` on it faults inside `beam_term::list::car`. The engine contributes the width rule above; the
+  turn-it-into-an-error decision lives in the host node.
+
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on
   runtime data; an unsupported opcode/operand is the documented `error::unsupported`.
