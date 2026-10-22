@@ -370,6 +370,30 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   The seam that would close it is a `ProcessTable::service_receive_signals(pid)` in `beam_process` — apply the head signal while its `exit_policy` is not `Terminate`, in FIFO order — which a sibling node owns.
 
 ## Known Issues / Handoffs
+* **The `Suspend` arm skips the root publication WITHOUT opening the window's relocation
+  exemption — an unpublished, collectable parked machine.** `run.rs:1540` calls
+  `park_machine(table, pid, &mut engine, fr_count, fr_count > 0)`, i.e. it can pass `exempt =
+  true` (publishing nothing, `parked_published = false`), but the arm never calls
+  `process.set_relocation_exempt(true)` — the only two setters in this file are the `Yield` arm
+  (`run.rs:1230`) and the `Wait` arm (`run.rs:1448`), whose parks are the two `park_machine`
+  calls that are allowed to skip. So with `fr_count > 0` the machine sits in
+  `RunnerState.engines` with roots that were never published while the process is `Runnable` and
+  **not** exempt: `has_unpublished_roots()` is `false`, so `Process::deliver`'s growth cascade,
+  every `beam_process` signal site and the `serve_gc_request` on the very next line
+  (`run.rs:1541`) all collect it. The collector relocates `process.registers()`, which hold the
+  *previous* window's words (or nothing, on the process's first park), and the real live terms —
+  the machine's `x`/`stack` — are evacuated; `resume_from_process_roots` (`run.rs:939`) is then
+  skipped because `parked_published` is `false`, so the resume runs on words naming a freed
+  space. Symptom: an arbitrary `beam_term::list::car` dereference of a recycled cons cell.
+  Reachability condition: `fr_count > 0` (`Machine::fr_mark()`, sticky for the process's whole
+  life — `fr_mark` is cleared only by `Machine::reset`, which only a first entry runs) **and** a
+  `BifOutcome::Suspend` park, whose only producer is `port::busy_wait::PortWrite::Parked` →
+  `RuntimeContext::request_suspend` (`native/port.rs:328`, `context/execution.rs:1116`) — i.e.
+  `port_command`/`io` output on a busy port. Minimal fix: mirror the `Yield` arm — set the
+  exemption when the park is going to skip (or drop the `fr_count` special case and always
+  publish on this arm), and give the `Suspend`/`Yield` arms one shared
+  `park_and_publish_or_exempt` helper so the park call and the exemption can never disagree
+  again.
 * **The `Yield` arm's post-park steps are order-sensitive.** `serve_gc_request` (`run.rs:1305`) collects against the process's `Registers` and writes **nothing** back into the parked machine, while the boundary door immediately after it (`run.rs:1313`) re-publishes those registers **from the machine** (`publish_roots_full`'s `copy_from_slice`, `context/gc.rs:806`). So a pending `erlang:garbage_collect` request that really collects leaves the machine's `x`/`stack` naming an evacuated from-space, and a boundary door that then fires publishes those stale words as roots and relocates over them (the resume's `resume_from_process_roots`, `run.rs:939`, is the only repair). Today the door's own `collection_debt`/7-of-8 occupancy gate is what keeps it from firing right after a fresh collection — an incidental, not a structural, exclusion. Minimal fix: run `collect_at_reds_boundary` before `serve_gc_request`, or skip the door when `serve_gc_request` answered `true`.
 * **An early return out of `run` between the engine take-out and a re-insert drops that process's machine.** The take-out is `run.rs:823`; the `Yield` arm's `current_code() == None` return (`run.rs:1271`) and the two `?`s at `run.rs:1313`/`:1321` all return while `engine` is still a local. The pid stays on the run queue, so the next slice answers `refuse_engine_less` → `Wait` with the state restored to `Runnable` (`run.rs:313-334`) and nothing ever runs it again — and the machine, the only holder of that process's live x/stack while it is parked, is gone. Minimal fix: re-insert the engine before returning the error.
 * **`RunnerState`'s per-pid maps are never pruned on process death.** The only `engines.remove` is the slice take-out (`run.rs:823`), so a terminated parked process keeps its machine (and that machine's refc-binary reservoir) for the runtime's life; `gather_off_heap_roots` gates the dead machine's dangling root set on `live(pid)` (`entry.rs:506`), so the residue is a leak, never a read.
