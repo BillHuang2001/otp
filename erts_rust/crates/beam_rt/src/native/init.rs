@@ -172,25 +172,35 @@ impl RuntimeContext<'_> {
             });
         self.atom(if relaxed { "relaxed" } else { "strict" })
     }
-    /// `init:get_plain_arguments/0`: the command-line tokens `init` did not consume as a
-    /// flag or a Start instruction, each as a string, in order (contract A.6).
+    /// `init:get_plain_arguments/0`: the arguments `-extra` and `--` selected, each as a
+    /// string (contract A.6).
     ///
-    /// The list is [`RuntimeConfig::plain_args`](crate::config::RuntimeConfig::plain_args),
-    /// which the CLI fills from the two sources the C `init` accumulates into its `Args`
-    /// field (`erts/preloaded/src/init.erl:1669-1710`): a stray **positional** token (an
-    /// `arg`) and — when the command line carries `-extra` — **every** token after it,
-    /// verbatim (`start_extra_arg`, `lists:reverse(As, Bs)`). It is `[]` for a command line
-    /// with neither, which is what the oracle answers for the argv of every `-eval`/`-s`/
-    /// `-run` invocation, and exactly what the real `erlc` front end relies on: it invokes
-    /// the emulator as `… -s erl_compile compile_cmdline -extra +deterministic -o <D> <src>`
-    /// and `erl_compile:compile_cmdline/0` (`lib/stdlib/src/erl_compile.erl:53-56`) reads the
-    /// file list straight out of this call. Verified against OTP 29.1.1 / erts-17.1:
-    /// `erl -noshell -eval '…' -extra a b` ⇒ `["a","b"]`, and `-extra` is not itself an init
-    /// argument (`init:get_argument(extra)` is the bare atom `error`).
+    /// The source is [`RuntimeConfig::plain_args`](crate::config::RuntimeConfig::plain_args),
+    /// split out of the merged command line **per entity** by the CLI
+    /// ([`crate::cli::env::split_plain`]): in flag mode a `-extra` is consumed and every
+    /// following token of that entity is plain (a later literal `-extra` included); a `--`
+    /// is consumed and the tokens after it are plain until the next switch-looking token
+    /// (`-`/`+`), which resumes flag parsing; and the tails of the `ERL_OTP<sysver>_FLAGS`,
+    /// `ERL_AFLAGS`, command-line, `ERL_FLAGS` and `ERL_ZFLAGS` entities concatenate in that
+    /// merge order (`erts/preloaded/src/init.erl:81-139,1664-1740`).
+    ///
+    /// A plain argument is therefore **not** an init argument: it never appears in
+    /// [`init:get_arguments/0`](Self::get_arguments) and `init:get_argument/1` cannot see it
+    /// (oracle-verified against OTP 29.1.1 — `-extra a b c` leaves
+    /// `init:get_arguments/0` at `[{root,…},{bindir,…},{progname,…},{home,…},{noshell,[]}]`
+    /// and `init:get_plain_arguments/0` at `["a","b","c"]`).
+    ///
+    /// The list is **snapshotted** out of the configuration before any term is built, so no
+    /// borrow of the runtime is held across the mutable term construction below.
     pub(super) fn get_plain_arguments(&mut self) -> Result<Eterm> {
-        let plain: Vec<String> = self.runtime.plain_args().to_vec();
-        self.string_list(&plain)
+        let plain: Vec<String> = self.runtime.config().plain_args.clone();
+        let mut values = Vec::with_capacity(plain.len());
+        for value in &plain {
+            values.push(self.charlist(value)?);
+        }
+        terms::make_list(self, &values)
     }
+
     /// `init:get_arguments/0`: the whole command line as `{Flag, [Value…]}` pairs
     /// (contract A.6).
     ///
@@ -604,34 +614,68 @@ mod tests {
     }
 
     #[test]
-    fn get_plain_arguments_reports_the_configured_plain_args() {
-        // `RuntimeConfig::plain_args` is the `init:get_plain_arguments/0` source (the C
-        // `init`'s `Args` field): a config that carries plain arguments answers them as
-        // strings, in order, and the default config answers `[]`.
-        let mut config = crate::config::RuntimeConfig::default();
-        config.plain_args = vec![
-            "+deterministic".to_string(),
-            "-o".to_string(),
-            "/tmp/x".to_string(),
-        ];
-        let mut configured = Runtime::new(config).expect("a runtime with plain args");
-        let plain = call(&mut configured, "init", "get_plain_arguments", &[]).expect("plain args");
-        let strings: Vec<String> = terms::list_elements(plain)
-            .expect("a list")
-            .iter()
-            .map(|argument| string_of(*argument))
-            .collect();
-        assert_eq!(strings, vec!["+deterministic", "-o", "/tmp/x"]);
-
-        // A host-built runtime (no plain arguments) answers the empty list — the oracle's
-        // `init:get_plain_arguments()` for a command line with neither a stray positional nor
-        // `-extra` (verified against OTP 29.1.1 / erts-17.1).
+    fn get_plain_arguments_is_empty_without_plain_args() {
+        // A bare `RuntimeConfig::default()` carries no `-extra`/`--` plain argument, so
+        // `init:get_plain_arguments/0` is the empty list — the oracle's answer for a
+        // command line with no such marker.
         let mut runtime = runtime();
-        assert!(runtime.plain_args().is_empty());
+        assert!(runtime.config().plain_args.is_empty());
         let plain = call(&mut runtime, "init", "get_plain_arguments", &[]).expect("plain args");
         assert_eq!(plain, beam_term::NIL);
         assert!(terms::list_elements(plain).expect("a list").is_empty());
     }
+
+    #[test]
+    fn get_plain_arguments_are_the_configured_plain_args() {
+        // Oracle: `erl -noshell -extra a b` ⇒ `init:get_plain_arguments()` is
+        // `["a","b"]` — a list of **strings** (char lists), in the order the markers
+        // selected them.
+        let mut config = crate::config::RuntimeConfig::default();
+        config.plain_args = vec!["a".to_string(), "b".to_string()];
+        let mut runtime = Runtime::new(config).expect("a runtime with plain args");
+        let plain = call(&mut runtime, "init", "get_plain_arguments", &[]).expect("plain args");
+        let elements = terms::list_elements(plain).expect("a list of strings");
+        let strings: Vec<String> = elements.iter().map(|element| string_of(*element)).collect();
+        assert_eq!(strings, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn get_arguments_neither_records_extra_nor_the_plain_arguments() {
+        // A plain argument is not an init argument: `-extra` itself is not a flag entry and
+        // the plain values are not values of any entry — verified against OTP 29.1.1, where
+        // `-extra a b c` leaves `init:get_arguments/0` at
+        // `[{root,…},{bindir,…},{progname,…},{home,…},{noshell,[]}]`.
+        let Some(mut runtime) = system_runtime_with_plain(
+            &[("noshell", vec![])],
+            &["a", "b"],
+        ) else {
+            return;
+        };
+        let all = call(&mut runtime, "init", "get_arguments", &[]).expect("get_arguments/0");
+        let pairs = decode_pairs(&mut runtime, all);
+        let flags: Vec<&str> = pairs.iter().map(|(flag, _)| flag.as_str()).collect();
+        assert!(
+            !flags.contains(&"extra"),
+            "`-extra` is no init argument: {flags:?}"
+        );
+        // Only the emulator's automatic flags may precede the command line's own.
+        let automatic: usize = flags
+            .iter()
+            .take_while(|flag| AUTOMATIC_FLAGS.contains(flag))
+            .count();
+        assert_eq!(
+            flags[automatic..].to_vec(),
+            vec!["noshell"],
+            "the plain arguments add no entry: {flags:?}"
+        );
+        for (flag, values) in &pairs[automatic..] {
+            assert!(
+                !values.iter().any(|value| value == "a" || value == "b"),
+                "`{flag}` carries no plain argument: {values:?}"
+            );
+        }
+    }
+
     /// The emulator's own **automatic** flags, in the order `init:get_arguments/0` lists
     /// them (`init.erl:363-388`).
     const AUTOMATIC_FLAGS: [&str; 4] = ["root", "bindir", "progname", "home"];
@@ -669,12 +713,19 @@ mod tests {
     /// skips **loudly**) when no system Erlang is available — the automatic `root`/`bindir`
     /// entries need one.
     fn system_runtime_with(flags: &[(&str, Vec<&str>)]) -> Option<Runtime> {
+        system_runtime_with_plain(flags, &[])
+    }
+
+    /// [`system_runtime_with`] plus the configuration's **plain arguments** (`-extra`/`--`;
+    /// see [`RuntimeConfig::plain_args`](crate::config::RuntimeConfig::plain_args)).
+    fn system_runtime_with_plain(flags: &[(&str, Vec<&str>)], plain: &[&str]) -> Option<Runtime> {
         let mut config = crate::config::RuntimeConfig::default();
         for (flag, values) in flags {
             config
                 .init_args
                 .record(flag, values.iter().map(|value| value.to_string()).collect());
         }
+        config.plain_args = plain.iter().map(|value| (*value).to_string()).collect();
         let mut runtime = Runtime::new(config).expect("a runtime with init args");
         match runtime.code_server.add_system_paths() {
             Ok(()) => Some(runtime),

@@ -138,7 +138,7 @@ use crate::runtime::Runtime;
 #[cfg(test)]
 use self::apply::{
     call_site_reading_imports, callee_observes_its_call_site, function_calls_a_fun_image_bif,
-    CallSiteReadingImports,
+    prefers_module_code_for_fun_apply, CallSiteReadingImports,
 };
 #[cfg(test)]
 use self::bridges::NodeIdentity;

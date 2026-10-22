@@ -32,7 +32,8 @@
 //! ([`callee_observes_its_call_site`] and its
 //! helpers) decide whether the engine's cross-module call seam may enter a callee **in-machine**
 //! or must keep it on the synchronous call route — and the external-fun resolver delegates to
-//! that seam so both routes share one verdict.
+//! that seam so both routes share one verdict. [`prefers_module_code_for_fun_apply`] is the same
+//! question asked about the **host fast path** for a key that applies a caller-supplied fun.
 
 use std::sync::Arc;
 
@@ -555,4 +556,63 @@ pub(super) fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bo
             Some("term_to_binary") | Some("external_size")
         )
         && (import.arity == 1 || import.arity == 2)
+}
+
+/// Whether the cross-module call seam must prefer `module`'s **own code** over the host fast path
+/// for a key that applies a caller-supplied fun, given whether this context can re-enter the
+/// scheduler ([`RuntimeContext::may_pump_scheduler`], passed as `can_pump`).
+///
+/// # The two facts
+///
+/// * **The host's implementation applies the fun through a nested run that cannot suspend.** The
+///   [`beam_bifs::needs_fun_caller`] keys (`lists`/`maps`/`ets` fast paths that take a fun)
+///   reach [`BifContext::call_fun`](beam_bifs::BifContext::call_fun) →
+///   [`FunBridge`](crate::context::bridges::FunBridge), which applies the fun through a **nested**
+///   run (`run_export_blocking`/`run_label_blocking`) under this context's inherited
+///   `may_pump_scheduler`. Inside a slice that nested run cannot advance, so a blocking `receive`
+///   in the applied fun folds into the typed [`beam_engine::blocked`] gap instead of suspending.
+/// * **The module's own body applies the fun in-machine.** Entering the callee through
+///   [`ExecutionContext::resolve_external_call`] runs its real Erlang body in the caller's
+///   machine, and the compiler lowers the fun application there to `call_fun` →
+///   [`ExecutionContext::resolve_local_fun`], which enters the closure body **in this machine** —
+///   so a blocking `receive` suspends the *process* through the ordinary
+///   [`beam_engine::RunOutcome::Wait`] path (runner park, then resume-on-send) and the scheduler
+///   resumes it when the message arrives.
+///
+/// # The precedent
+///
+/// This is the same principle the seam already applies to `io:*`: the floor owns only
+/// `io:put_chars/1,2`, and refusing the rest "would route them onto the synchronous non-pumping
+/// `call_bif` path, where a **scheduled** process's blocking `receive` on the io-device reply
+/// folds into the typed `blocked()` gap (exit 3) instead of suspending".
+///
+/// # Why `can_pump` gates it
+///
+/// When the context **can** pump — the `-eval` route, the boot drive, a nested run outside a
+/// slice — the host route's nested run suspends and resumes correctly, so the fast path stays
+/// exactly as it is. Only a context that cannot re-enter the scheduler needs the module's code.
+///
+/// # Idempotence (required by the baseline JIT)
+///
+/// [`RuntimeContext::may_pump_scheduler`] is fixed when the context is constructed (only
+/// [`RuntimeContext::for_process`] — a scheduler slice — answers `false`), so this predicate
+/// answers the same for the whole lifetime of one context. The native baseline tier consults the
+/// seam **twice** for one `call_ext*` (a fast attempt, then the whole instruction), and two
+/// disagreeing answers would enter a callee in-machine after the first consultation had declined
+/// it.
+///
+/// # One source of truth for the class
+///
+/// [`beam_bifs::needs_fun_caller`] is the registry's own roster
+/// ([`beam_bifs::FUN_CALLER_BIFS`], a `binary_search`), so this predicate cannot drift from it: a
+/// key that starts or stops applying a caller-supplied fun is a `beam_bifs` change and this
+/// predicate follows it.
+#[must_use]
+pub(crate) fn prefers_module_code_for_fun_apply(
+    can_pump: bool,
+    module: &str,
+    function: &str,
+    arity: u32,
+) -> bool {
+    !can_pump && beam_bifs::needs_fun_caller(module, function, arity)
 }

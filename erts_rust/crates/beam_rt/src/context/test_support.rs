@@ -63,14 +63,11 @@ pub(super) fn find_on_path(name: &str) -> Option<PathBuf> {
 
 /// Resolve the oracle the way `tools/differential` does: `$ERTS_ORACLE` if executable,
 /// else `erl` on `$PATH`.
-pub(super) fn resolve_oracle() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os("ERTS_ORACLE") {
-        let program = PathBuf::from(&value);
-        return is_executable(&program).then_some(program);
-    }
-    find_on_path("erl")
-}
-
+///
+/// The implementation is [`crate::native::test_support`]'s — the crate's **one** resolution
+/// (Prevent-Duplication: a second copy could drift from the runtime's own suites) — and this
+/// re-export keeps the name the `context` suites already import.
+pub(super) use crate::native::test_support::resolve_oracle;
 /// The compiler: a sibling of the oracle first (the same installation), then `$PATH`.
 pub(super) fn resolve_erlc() -> Option<PathBuf> {
     if let Some(oracle) = resolve_oracle() {

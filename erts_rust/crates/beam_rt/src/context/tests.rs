@@ -3515,8 +3515,9 @@ fn bif_tab_or_skip(banner: &str) -> Option<&'static BifTab> {
 }
 
 /// A stdlib **fast path** (`lists:map/2`) is NOT a builtin: with `lists` unloaded the answer
-/// must be `false`. This is the regression test for the wrong-value bug (the registry holds
-/// 640 keys, 79 of them stdlib fast paths, so `BifRegistry::contains` alone answered `true`).
+/// must be `false`. This is the regression test for the wrong-value bug — the registry holds
+/// stdlib fast paths beside the declared `bif.tab` keys (`beam_bifs/tests/roster_audit.rs` pins
+/// the split), so `BifRegistry::contains` alone answered `true`.
 #[test]
 fn function_exported_does_not_report_a_stdlib_fast_path_as_exported() {
     let mut rt = runtime();
@@ -9136,4 +9137,192 @@ fn each_callee_gets_its_own_slot() {
     assert_eq!(machine_pool::pooled_depth(pool_key(&ints)), 1);
     // A recycled machine still owns nothing off-heap, whatever its slot.
     assert_eq!(machine_pool::pooled_reservoir_owners(), 0);
+}
+
+// The cross-module seam vs the host fast path for a **fun-applying** key (the `erlc` blocker)
+// ---------------------------------------------------------------------------------------
+// `compile:report_warnings/1` calls `lists:flatmap/2`, whose `beam_bifs` fast path applies the
+// caller's fun through a nested run that a *scheduled* slice cannot advance: the fun's
+// `gen_server:call` / `file:read_file` round trip parks at `gen:do_call/4`'s `receive` and the
+// application folded into the typed `blocked()` gap. The seam therefore prefers the module's own
+// code for that class inside a slice, where the apply suspends the process instead. These are the
+// seam-level pins; `tests/erlc_warning.rs` is the end-to-end regression.
+
+/// **The predicate's own answers**: `true` only for a fun-applying key of a context that cannot
+/// re-enter the scheduler, so a non-fun-taking fast path (`lists:reverse/1`) and a name
+/// `beam_bifs` does not register both keep the host implementation.
+#[test]
+fn the_fun_applying_predicate_needs_both_a_fun_key_and_a_slice() {
+    assert!(
+        prefers_module_code_for_fun_apply(false, "lists", "flatmap", 2),
+        "`lists:flatmap/2` applies a caller-supplied fun, so a slice enters the module"
+    );
+    assert!(
+        !prefers_module_code_for_fun_apply(true, "lists", "flatmap", 2),
+        "a pumping context keeps the host fast path (its nested run suspends correctly)"
+    );
+    assert!(
+        !prefers_module_code_for_fun_apply(false, "lists", "reverse", 1),
+        "a fast path that takes no fun is never displaced"
+    );
+    assert!(
+        !prefers_module_code_for_fun_apply(false, "maps", "get", 3),
+        "an ordinary registry key is never displaced"
+    );
+    assert!(
+        !prefers_module_code_for_fun_apply(false, "no_such_module", "no_such_function", 7),
+        "a name `beam_bifs` does not register is never displaced"
+    );
+}
+
+/// **The class cannot silently narrow.** Every row of [`beam_bifs::FUN_CALLER_BIFS`] — the
+/// registry's own roster of keys that apply a caller-supplied fun — is displaced inside a slice
+/// and kept on the fast path outside one. The property is asserted over the table itself rather
+/// than over a copy of its contents, so a row added to (or removed from) `beam_bifs` is covered
+/// here without an edit.
+#[test]
+fn every_fun_applying_registry_key_is_displaced_inside_a_slice() {
+    assert!(
+        !beam_bifs::FUN_CALLER_BIFS.is_empty(),
+        "the roster is the class this predicate keys on"
+    );
+    for &(module, function, arity) in beam_bifs::FUN_CALLER_BIFS {
+        assert!(
+            beam_bifs::needs_fun_caller(module, function, arity),
+            "{module}:{function}/{arity} is a row of the roster"
+        );
+        assert!(
+            prefers_module_code_for_fun_apply(false, module, function, arity),
+            "{module}:{function}/{arity} must be entered as the module's own code inside a slice"
+        );
+        assert!(
+            !prefers_module_code_for_fun_apply(true, module, function, arity),
+            "{module}:{function}/{arity} must keep the host fast path when the context can pump"
+        );
+    }
+}
+
+/// **The seam's routing, on both context kinds.** Inside a slice ([`RuntimeContext::for_process`],
+/// `may_pump_scheduler() == false`) a fun-applying key resolves to the callee's real export label,
+/// so the engine enters `lists.beam` in the caller's machine; outside one
+/// ([`RuntimeContext::new`]) the same key is host-served (`Ok(None)`). A fast path that takes no
+/// fun is host-served in both.
+///
+/// The label is checked against the loaded module's own export entry, which is what the seam hands
+/// the engine; the module name is checked because a wrong module would be a wrong routing even
+/// with a plausible label.
+#[test]
+fn the_seam_prefers_the_modules_code_for_a_fun_applying_key_inside_a_slice() {
+    let mut rt = runtime();
+    let mut table = beam_process::ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut beam_term::prelude::AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("spawn a process");
+
+    let mut slice = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    assert!(
+        !slice.may_pump_scheduler(),
+        "a `for_process` context is a scheduler slice"
+    );
+    let (callee, label) = slice
+        .resolve_external_call("lists", "flatmap", 2)
+        .expect("the seam reports a routing, never an error")
+        .expect("a fun-applying key is entered in-machine inside a slice");
+    assert_eq!(
+        callee.atom_name(callee.name),
+        Some("lists"),
+        "the seam resolves the key's own module"
+    );
+    let flatmap = callee
+        .atom_table
+        .lookup("flatmap")
+        .expect("`flatmap` is interned in `lists.beam`");
+    assert_eq!(
+        Some(label),
+        callee.export(flatmap, 2),
+        "the resolved label is `lists:flatmap/2`'s own export entry"
+    );
+    assert!(
+        slice
+            .resolve_external_call("lists", "reverse", 1)
+            .expect("the seam reports a routing")
+            .is_none(),
+        "a non-fun-taking fast path stays host-served inside a slice"
+    );
+    drop(slice);
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.may_pump_scheduler(),
+        "a plain context may re-enter the scheduler"
+    );
+    assert!(
+        ctx.resolve_external_call("lists", "flatmap", 2)
+            .expect("the seam reports a routing")
+            .is_none(),
+        "a pumping context keeps the host fast path"
+    );
+    assert!(
+        ctx.resolve_external_call("lists", "reverse", 1)
+            .expect("the seam reports a routing")
+            .is_none(),
+        "a non-fun-taking fast path is host-served here too"
+    );
+}
+
+/// The behavioural fixture: a **scheduled** process that applies a fun which must await a
+/// message only another process can send. `lists:flatmap/2` is one of the fun-applying registry
+/// keys, so before the seam preferred the module's code this body folded into the typed
+/// `blocked()` gap — the host fast path ran the fun on a nested machine that a slice cannot
+/// advance — instead of suspending and being resumed when `{value, 42}` arrives.
+const FUN_APPLY_SLICE_SRC: &str = "-module(fun_apply_slice).
+-export([go/0]).
+go() ->
+    Self = self(),
+    _ = spawn(fun() -> Self ! {value, 42} end),
+    lists:flatmap(fun(X) -> receive {value, V} -> [X + V] end end, [1]).
+";
+
+/// **The fun application really suspends the scheduled process.** `go/0` runs as an ordinary
+/// scheduled process (`Runtime::run_scheduled`, the CLI `run` route, so its context is
+/// [`RuntimeContext::for_process`] with `may_pump_scheduler() == false`), spawns a child that
+/// answers, and applies the fun through `lists:flatmap/2` — the exact shape of the `erlc` warning
+/// blocker (`compile:report_warnings/1` → `lists:flatmap/2` → a fun that waits for the
+/// `file_server_2` reply).
+///
+/// The answered value (`[43]`) is the whole assertion: a folded `blocked()` would raise instead,
+/// and a fast path that ran the fun without the caller's mailbox would take the `receive`'s
+/// `after`-less branch and never complete. The fixture is compiled for real, so the compiler's own
+/// lowering of `flatmap(F, L)` to a cross-module call is what is being exercised.
+#[test]
+fn a_fun_applying_fast_path_suspends_the_scheduled_process_instead_of_blocking() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "fun-applying scheduled suspension",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "fun_apply_slice",
+        &[("fun_apply_slice", FUN_APPLY_SLICE_SRC)],
+    );
+    let beam = dir.path().join("fun_apply_slice.beam");
+
+    let mut rt = runtime();
+    let result = rt
+        .run_scheduled(&beam, "go", 0, &[])
+        .expect("the applied fun suspends the process and is resumed by the child's message");
+    let elements = terms::list_elements(result).expect("`lists:flatmap/2` answers a list");
+    assert_eq!(
+        elements.len(),
+        1,
+        "the fun's one-element list survived the suspension and resume"
+    );
+    assert_eq!(
+        signed_value(elements[0]),
+        43,
+        "the value the resumed fun received from the child"
+    );
 }

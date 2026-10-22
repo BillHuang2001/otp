@@ -93,6 +93,78 @@ pub(super) fn is_allocator_switch(argument: &str) -> bool {
     argument.starts_with("+M")
 }
 
+/// The C `strtol(s, NULL, 10)` reader, as every switch whose call site tests `errno` uses it
+/// (`+P`/`+Q`/`+t`, `erl_init.c:1870-1905`, `:2218-2234`): leading ASCII whitespace is skipped,
+/// an optional sign and at least one decimal digit are consumed, and **any trailing text is
+/// ignored** — the digit prefix is the value.
+///
+/// `None` is the reader's two failures: no digit at all (`abc`, `""`, `-`), and a value too
+/// large for the return type (the C's `errno == ERANGE`, which every `errno`-checking call site
+/// rejects). That is why the oracle accepts `+P 65536bogus` (its `65536`) but rejects
+/// `+P 99999999999999999999`.
+pub(super) fn strtol10(value: &str) -> Option<i64> {
+    let trimmed = value.trim_start();
+    let (negative, digits) = match trimmed.as_bytes().first()? {
+        b'-' => (true, &trimmed[1..]),
+        b'+' => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    let mut result: i64 = 0;
+    let mut consumed = false;
+    for byte in digits.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        consumed = true;
+        // `checked_*` is the `errno == ERANGE` arm: an overflowing value is a refusal, not a
+        // saturated number the range check would then judge on its own.
+        result = result.checked_mul(10)?.checked_add(i64::from(byte - b'0'))?;
+    }
+    if !consumed {
+        return None;
+    }
+    if negative {
+        result.checked_neg()
+    } else {
+        Some(result)
+    }
+}
+
+/// The C `sscanf(s, "%d", &n)` conversion **prefix**: leading whitespace skipped, an optional
+/// sign and at least one decimal digit, with the unconverted remainder returned alongside.
+///
+/// The `+S` family's value grammar is a `sscanf` cascade (`erl_init.c:1107-1153` for `+S`,
+/// `:955-1140` for the `+SP`/`+SDcpu`/`+SDPcpu` siblings), and "did the conversion happen" is
+/// what separates "only a total was given" from "the rest is junk the value is never judged
+/// on": `sscanf("1bogus:2", "%d:%d")` converts **one** field (the literal `:` never matched),
+/// so `+S1bogus:2` is a total of `1` and the trailing `:2` is ignored — exactly what the oracle
+/// answers (`erl +S1bogus:2 … system_info(schedulers)` is `1`).
+///
+/// A value past `i64` saturates here; the C's `%d` overflow is undefined behaviour, so no
+/// faithful answer exists for it (glibc saturates to `LONG_MAX` and truncates to `int`).
+pub(super) fn scan_int(value: &str) -> Option<(i64, &str)> {
+    let trimmed = value.trim_start();
+    let (sign, offset) = match trimmed.as_bytes().first()? {
+        b'-' => (-1i64, 1),
+        b'+' => (1i64, 1),
+        _ => (1i64, 0),
+    };
+    let digits = &trimmed[offset..];
+    let mut result: i64 = 0;
+    let mut len = 0;
+    for byte in digits.bytes() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        result = result.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+        len += 1;
+    }
+    if len == 0 {
+        return None;
+    }
+    Some((sign.saturating_mul(result), &digits[len..]))
+}
+
 /// `+Q N` — the maximum number of ports: `legacy` (`None`, the emulator's default
 /// table), or an integer in `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1888-1905`).
 ///
@@ -101,12 +173,15 @@ pub(super) fn is_allocator_switch(argument: &str) -> bool {
 /// power of two (`+Q 2000` observes 2048, `+Q 134217726` observes 134217727). That
 /// sizing step is applied by [`crate::info`]'s `port_limit`, where the request becomes
 /// observable — exactly as it is for `ERL_MAX_PORTS` (see [`crate::cli::vars`]).
+///
+/// The value reader is [`strtol10`] (the C's `strtol(…, NULL, 10)` + `errno`), so the digit
+/// prefix is the value: `+Q1024x` and `+Q 1024x` are both the oracle's `1024`.
 pub(super) fn parse_max_ports(switch: &str, value: &str) -> Result<Option<usize>> {
     if value == "legacy" {
         return Ok(None);
     }
-    match value.parse::<i64>() {
-        Ok(number) if (ERTS_MIN_PORTS..=ERTS_MAX_PORTS).contains(&number) => {
+    match strtol10(value) {
+        Some(number) if (ERTS_MIN_PORTS..=ERTS_MAX_PORTS).contains(&number) => {
             Ok(Some(number as usize))
         }
         _ => Err(error::bad_switch_value(switch, value)),
@@ -114,13 +189,14 @@ pub(super) fn parse_max_ports(switch: &str, value: &str) -> Result<Option<usize>
 }
 
 /// `+P N` — the maximum number of processes: `legacy` (`None`), or an integer in
-/// `[ERTS_MIN_PROCESSES, ERTS_MAX_PROCESSES]` (`erl_init.c:1870-1886`).
+/// `[ERTS_MIN_PROCESSES, ERTS_MAX_PROCESSES]` (`erl_init.c:1870-1886`), read with the C's
+/// `strtol` ([`strtol10`]: `+P65536bogus` is the oracle's `65536`).
 pub(super) fn parse_max_processes(switch: &str, value: &str) -> Result<Option<usize>> {
     if value == "legacy" {
         return Ok(None);
     }
-    match value.parse::<i64>() {
-        Ok(number) if (ERTS_MIN_PROCESSES..=ERTS_MAX_PROCESSES).contains(&number) => {
+    match strtol10(value) {
+        Some(number) if (ERTS_MIN_PROCESSES..=ERTS_MAX_PROCESSES).contains(&number) => {
             Ok(Some(number as usize))
         }
         _ => Err(error::bad_switch_value(switch, value)),
@@ -138,12 +214,53 @@ pub(super) fn parse_kernel_poll(switch: &str, value: &str) -> Result<()> {
 /// The nine `+sbt` scheduler bind types (`erl_cpu_topology.c:628-647`).
 pub(super) const SCHEDULER_BIND_TYPES: [&str; 9] =
     ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"];
-/// The `+s` sub-options with a value (`erlexec.c:129-150` `pluss_val_switches`, plus
-/// `early_init`'s `+ssrct`, `erl_init.c:943-954`).
-const EMULATOR_S_SUB_OPTIONS: &[&str] = &[
-    "sbt", "sbwtdcpu", "sbwtdio", "sbwt", "scl", "sct", "secio", "sfwi", "stbt", "swct",
-    "swtdcpu", "swtdio", "swt", "sws", "sss", "sssdcpu", "sssdio", "spp", "sub", "srct",
+/// The `+s*` scheduler sub-parameters — the text **after** `+s` (`erl_init.c`'s
+/// `sub_param = argv[i]+2`) — with the flag that says whether the sub-parameter reads a
+/// value.
+///
+/// This is `erl_init.c:1922-2210`'s `has_prefix` chain, in its own order: the entries are
+/// **longest first** within each family, so a prefix match resolves `bwtdcpu` before `bwt`,
+/// `wtdcpu` before `wt`, `ssdcpu` before `ss` and `ecio`/`ss` never as something shorter.
+/// Every one of them but `srct` reads a value with `get_arg(sub_param + <length>,
+/// argv[i+1], &i)`, i.e. the value may be **attached** (`+sbwt1000`) or the next token
+/// (`+sbwt 1000`); `+ssrct` (skip reading the CPU topology, handled in `early_init`,
+/// `erl_init.c:943-954`, and a no-op in the late pass) reads none.
+pub(super) const SCHEDULER_SUB_OPTIONS: &[(&str, bool)] = &[
+    ("bwtdcpu", true),
+    ("bwtdio", true),
+    ("ssdcpu", true),
+    ("ssdio", true),
+    ("wtdcpu", true),
+    ("wtdio", true),
+    ("ecio", true),
+    ("tbt", true),
+    ("wct", true),
+    ("bwt", true),
+    ("fwi", true),
+    ("bt", true),
+    ("cl", true),
+    ("ct", true),
+    ("pp", true),
+    ("ub", true),
+    ("wt", true),
+    ("ws", true),
+    ("ss", true),
+    ("srct", false),
 ];
+
+/// The **value-taking** `+s*` scheduler switch `argument` names, if any — the sub-parameter
+/// whose spelling the token carries (`+sbwt1000` and `+sbwt 1000` are both `sbwt`).
+///
+/// The caller prefixes the answer with `"+s"` to get the canonical switch spelling it
+/// preserves and reports ([`crate::cli`]'s `PLUS_VALUE_SWITCHES` handles the word-order
+/// switches; this is the one family whose spelling is data rather than a table row).
+pub(super) fn scheduler_value_switch(argument: &str) -> Option<&'static str> {
+    let rest = argument.strip_prefix("+s")?;
+    SCHEDULER_SUB_OPTIONS
+        .iter()
+        .find(|(option, takes_value)| *takes_value && rest.starts_with(option))
+        .map(|(option, _takes_value)| *option)
+}
 
 /// Whether the emulator's own argument loop recognizes the flag spelling `name` — the
 /// recognition rule the oracle's `+X` fallthrough depends on.
@@ -209,10 +326,11 @@ pub(super) fn emulator_flag_recognized(name: &str) -> bool {
         'B' => matches!(rest, "" | "i" | "c" | "d"),
         // `-n` requires `ns`/`na`/`nd` (`erl_init.c:1846-1869`).
         'n' => ["s", "a", "d"].iter().any(|option| rest.starts_with(option)),
-        // The `-s` scheduler sub-options (`erl_init.c:1922`).
-        's' => EMULATOR_S_SUB_OPTIONS
+        // The `-s` scheduler sub-options: `rest` is the text after the `s`, which IS the
+        // sub-parameter (`erl_init.c:1922-2210`).
+        's' => SCHEDULER_SUB_OPTIONS
             .iter()
-            .any(|option| rest.starts_with(option)),
+            .any(|(option, _takes_value)| rest.starts_with(option)),
         // `-S`/`-SP`/`-SD{cpu,Pcpu,io}` (the early-init scheduler switches,
         // `erl_init.c:955-...`); the bare `+S` is consumed by the CLI's own arm.
         'S' => ["P", "Dcpu", "DPcpu", "Dio"].contains(&rest),
@@ -234,6 +352,77 @@ pub(super) fn emulator_flag_recognized(name: &str) -> bool {
         _ => false,
     }
 }
+/// `ERTS_MAX_NO_OF_SCHEDULERS` (`erts/emulator/beam/erl_process.h:82`) — the upper bound of
+/// every scheduler **count** (`+S`, `+SDcpu`), shared by the dirty CPU pool
+/// (`ERTS_MAX_NO_OF_DIRTY_CPU_SCHEDULERS` is the same value, `:83`).
+pub(super) const ERTS_MAX_NO_OF_SCHEDULERS: i64 = 1_024;
+
+/// The `sscanf("%d:%d")` → `sscanf(":%d")` cascade of the scheduler-count switch family
+/// (`+S`, `+SP`, `+SDcpu`, `+SDPcpu`), as `(total, online)` **raw** halves.
+///
+/// * `(Some(total), Some(online))` — both fields converted (`+S 4:2`, `+S 4:5x`).
+/// * `(Some(total), None)` — only the first converted, because the literal `:` never matched
+///   the *next* character (`+S 4`, `+S 1bogus:2`) or the conversion after it failed
+///   (`+S 4:x`, `+S 4:`).
+/// * `(None, Some(online))` — the `:Online`-only spelling (`+S :3`), whose total is the
+///   `no_schedulers` default (`tot = no_schedulers`).
+///
+/// `None` is the C's `bad_S` path: neither `%d` converted (`+S abc`, `+S :`).
+pub(super) fn scan_count_pair(value: &str) -> Option<(Option<i64>, Option<i64>)> {
+    if let Some((total, rest)) = scan_int(value) {
+        let online = rest
+            .strip_prefix(':')
+            .and_then(scan_int)
+            .map(|(online, _rest)| online);
+        return Some((Some(total), online));
+    }
+    let (online, _rest) = scan_int(value.strip_prefix(':')?)?;
+    Some((None, Some(online)))
+}
+
+/// The `chk_S` block of the scheduler-count switches (`erl_init.c:1140-1162` for `+S`,
+/// `:1190-1212` for `+SDcpu`) — the raw halves resolved against the defaults and then bounded.
+///
+/// * a **non-positive** total is an offset from the default (`schdlrs = tot > 0 ? tot :
+///   no_schedulers + tot`), which is why `+S 0` is exactly the default and `+S -1` one fewer;
+/// * a non-positive online count is the same offset from the default online count;
+/// * without an explicit online half it is `min(<raw total>, <default online>)`;
+/// * the total must then land in `1..=ERTS_MAX_NO_OF_SCHEDULERS` and the online count in
+///   `1..=total`.
+///
+/// `default_total`/`default_online` are the C's `no_schedulers`/`no_schedulers_online`: this
+/// runtime's processor count ([`crate::info::logical_processors`]), which is also the figure
+/// [`crate::info::schedulers_count`] answers when no `+S` was given.
+pub(super) fn resolve_scheduler_counts(
+    (total, online): (Option<i64>, Option<i64>),
+    default_total: i64,
+    default_online: i64,
+) -> Option<(i64, i64)> {
+    let raw_total = total.unwrap_or(default_total);
+    let resolved_total = if raw_total > 0 {
+        raw_total
+    } else {
+        default_total + raw_total
+    };
+    let raw_online = online.unwrap_or(if raw_total < default_online {
+        raw_total
+    } else {
+        default_online
+    });
+    let resolved_online = if raw_online > 0 {
+        raw_online
+    } else {
+        default_online + raw_online
+    };
+    if !(1..=ERTS_MAX_NO_OF_SCHEDULERS).contains(&resolved_total) {
+        return None;
+    }
+    if resolved_online < 1 || resolved_total < resolved_online {
+        return None;
+    }
+    Some((resolved_total, resolved_online))
+}
+
 /// `+sbt <type>` — the scheduler bind type (`erl_cpu_topology.c:623-647`).
 pub(super) fn parse_sbt(switch: &str, value: &str) -> Result<()> {
     if SCHEDULER_BIND_TYPES.contains(&value) {
@@ -243,104 +432,167 @@ pub(super) fn parse_sbt(switch: &str, value: &str) -> Result<()> {
     }
 }
 
-/// `ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS` (`erts/emulator/beam/erl_process.h:84`).
-const ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS: i64 = 1024;
+/// The six busy-wait thresholds `erts_sched_set_busy_wait_threshold` accepts
+/// (`erts/emulator/beam/erl_process.c:5851-5888`) — **spin-count** names, not the
+/// `very_low..very_high` family the *wakeup* thresholds use.
+pub(super) const SCHEDULER_BUSY_WAIT_THRESHOLDS: [&str; 6] =
+    ["very_long", "long", "medium", "short", "very_short", "none"];
 
-/// Scans one `%d`-style field the way `sscanf` does: leading whitespace is skipped, an
-/// optional sign and the following digits are the number, and the **rest** of the input is
-/// returned untouched (`sscanf`'s prefix match, not a whole-string parse). `None` when no
-/// digit follows the optional sign.
-fn scan_decimal(value: &str) -> Option<(i64, &str)> {
-    let trimmed = value.trim_start_matches(|c: char| c.is_whitespace());
-    let bytes = trimmed.as_bytes();
-    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let digits_start = end;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
+/// `+sbwt` / `+sbwtdcpu` / `+sbwtdio <threshold>` — the busy-wait threshold
+/// (`erl_init.c:1963-1987`, `erts_sched_set_busy_wait_threshold`).
+///
+/// The value is **symbolic only**: the C compares it against six spin-count names, so
+/// anything else — a number (`+sbwt 1000`), a case variant (`+sbwt NONE`) or a stray suffix
+/// (`+sbwt highx`) — is `EINVAL` and a usage error. Verified against the oracle, attached and
+/// separated alike: `none`/`medium`/`very_long`/`long`/`short`/`very_short` exit 0, while
+/// `very_low`/`low`/`high`/`very_high`/`VERY_HIGH`/`NONE`/`0`/`1`/`highx` exit 1.
+pub(super) fn parse_busy_wait_threshold(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_BUSY_WAIT_THRESHOLDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
     }
-    if end == digits_start {
-        return None;
-    }
-    let number = trimmed[..end].parse::<i64>().ok()?;
-    Some((number, &trimmed[end..]))
 }
 
-/// The scheduler-specifier **shape** the C's `sscanf` readers accept, as
-/// `(total, online)` with a field `None` when the specifier does not give it.
-///
-/// This is the shared grammar of `+S`, `+SP`, `+SDcpu` and `+SDPcpu`
-/// (`erts/emulator/beam/erl_init.c:970-1075`, `:1109-1160`): `%d` (the total alone),
-/// `%d:%d` (both counts) and `:%d` (the C's `sscanf(arg, ":%d")` fallback, where only the
-/// online count is given). A missing or non-numeric total with no second field, or a value
-/// with no numeric field at all, is the C's `bad … specifier` rejection and yields `None`.
-///
-/// Because it is a prefix scanner, trailing junk after a complete match is ignored exactly
-/// as `sscanf` ignores it (`+S 4x` is the C's 4), and a `:` whose second field does not
-/// scan leaves the online count unset (the C's `sscanf` returns 1 there).
-fn scheduler_spec(value: &str) -> Option<(Option<i64>, Option<i64>)> {
-    if let Some((total, rest)) = scan_decimal(value) {
-        let online = rest
-            .strip_prefix(':')
-            .and_then(scan_decimal)
-            .map(|(online, _)| online);
-        return Some((Some(total), online));
+/// `+scl` / `+spp` / `+sub <bool>` — the three scheduler **boolean** sub-parameters
+/// (`erl_init.c:1988-2001` for `+scl`, `:2043-2053` for `+spp`, `:2064-2082` for `+sub`): each
+/// one `sys_strcmp`s the value against the two literals, so the accepted set is closed and
+/// exact — `+scl bogus`, `+scl TRUE` and `+scl 1` are all refused (verified: exit 1).
+pub(super) fn parse_scheduler_boolean(switch: &str, value: &str) -> Result<()> {
+    if matches!(value, "true" | "false") {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
     }
-    let (online, _) = scan_decimal(value.strip_prefix(':')?)?;
-    Some((None, Some(online)))
 }
 
-/// Validates a `+SP<value>` / `+SDPcpu<value>` scheduler **percentage** specifier
-/// (`erl_init.c:965-1000`, `:1002-1035`): the [`scheduler_spec`] shape, with every field
-/// it gives required to be non-negative (the C's `if (ptot < 0 || ponln < 0) goto bad`).
+/// The two `+sws` wakeup strategies (`erts_sched_set_wakeup_other_type`,
+/// `erts/emulator/beam/erl_process.c:5835-5849`).
+pub(super) const SCHEDULER_WAKEUP_STRATEGIES: [&str; 2] = ["default", "legacy"];
+
+/// `+sws <strategy>` — the scheduler wakeup strategy (`erl_init.c:2110-2121`): exactly
+/// [`SCHEDULER_WAKEUP_STRATEGIES`], anything else is `EINVAL` + usage (exit 1).
+pub(super) fn parse_wakeup_strategy(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKEUP_STRATEGIES.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// The five `+swt` wakeup thresholds (`erts_sched_set_wakeup_other_threshold`,
+/// `erts/emulator/beam/erl_process.c:5813-5833`) — the `very_low..very_high` family, **not**
+/// the `very_long..none` spin-count names `+sbwt` takes.
+pub(super) const SCHEDULER_WAKEUP_THRESHOLDS: [&str; 5] =
+    ["very_high", "high", "medium", "low", "very_low"];
+
+/// `+swt <threshold>` — the scheduler wakeup threshold (`erl_init.c:2098-2108`): symbolic only,
+/// so a number (`+swt 100`) and a spin-count name (`+swt very_long`) are both refused.
+pub(super) fn parse_wakeup_threshold(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKEUP_THRESHOLDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// The five `+swct` wake-cleanup thresholds (`erts_sched_set_wake_cleanup_threshold`,
+/// `erts/emulator/beam/erl_process.c:5891-5907`).
+pub(super) const SCHEDULER_WAKE_CLEANUP_THRESHOLDS: [&str; 5] =
+    ["very_lazy", "lazy", "medium", "eager", "very_eager"];
+
+/// `+swct <threshold>` — the thread-progress wake-cleanup threshold (`erl_init.c:2084-2096`):
+/// symbolic only, exactly [`SCHEDULER_WAKE_CLEANUP_THRESHOLDS`].
+pub(super) fn parse_wake_cleanup_threshold(switch: &str, value: &str) -> Result<()> {
+    if SCHEDULER_WAKE_CLEANUP_THRESHOLDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// `ERTS_SCHED_THREAD_MIN_STACK_SIZE` (`erts/emulator/beam/erl_process.h:118`) — in kilo words.
+pub(super) const SCHEDULER_MIN_STACK_SIZE: i64 = 20;
+/// `ERTS_SCHED_THREAD_MAX_STACK_SIZE` (`erts/emulator/beam/erl_process.h:119`) — in kilo words.
+pub(super) const SCHEDULER_MAX_STACK_SIZE: i64 = 8_192;
+
+/// `+sss` / `+sssdcpu` / `+sssdio <kilo words>` — the suggested scheduler-thread stack sizes
+/// (`erl_init.c:2163-2204`): the value is `atoi`ed (so a trailing suffix is ignored and junk is
+/// `0`) and must land in `[ERTS_SCHED_THREAD_MIN_STACK_SIZE,
+/// ERTS_SCHED_THREAD_MAX_STACK_SIZE]`, i.e. `20..=8192`.
 ///
-/// `+SP50` reads as "50 % of the schedulers", `+SP:50` as "the online count only"; the
-/// percentages themselves are **not** applied — this runtime has no percentage sizing and
-/// no dirty schedulers, so the switch is validated and preserved verbatim in
-/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags)
-/// ([`crate::cli`]'s `+SP` arm) and has no runtime-visible effect. `+SPabc`, `+SP-5` and
-/// `+SP1:-5` are the C's `bad schedulers percentage specifier` rejection (exit 1).
-pub(super) fn parse_scheduler_percentage(switch: &str, value: &str) -> Result<()> {
-    match scheduler_spec(value) {
-        Some((total, online))
-            if total.is_none_or(|total| total >= 0)
-                && online.is_none_or(|online| online >= 0) =>
-        {
-            Ok(())
-        }
+/// The C stores the `atoi` result in an `int`, so the reader is narrowed to 32 bits exactly as
+/// [`parse_ets_tables`]'s is.
+pub(super) fn parse_sched_thread_stack_size(switch: &str, value: &str) -> Result<()> {
+    let size = i64::from(atoi(value) as i32);
+    if (SCHEDULER_MIN_STACK_SIZE..=SCHEDULER_MAX_STACK_SIZE).contains(&size) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
+/// `+sfwi <interval>` — the run-queue-supervision forced-wakeup interval
+/// (`erl_init.c:2206-2216`): `strtol(arg, NULL, 10)` with the `errno`/negative test.
+///
+/// `strtol` leaves `errno` alone when it converts **nothing**, so a non-numeric value is the
+/// C's `0` and is accepted (`+sfwi x` exits 0); a negative value (`+sfwi -1`) and an
+/// out-of-range one (`errno == ERANGE`) are refused.
+pub(super) fn parse_forced_wakeup_interval(switch: &str, value: &str) -> Result<()> {
+    match strtol10(value) {
+        Some(interval) if interval >= 0 => Ok(()),
+        // No conversion at all: `strtol` answers `0` with `errno` untouched.
+        None if scan_int(value).is_none() => Ok(()),
         _ => Err(error::bad_switch_value(switch, value)),
     }
 }
 
-/// Validates a `+SDcpu<value>` dirty-CPU-scheduler specifier (`erl_init.c:1036-1080`):
-/// the [`scheduler_spec`] shape with **no** range check.
+/// `+SP <percent>[:<percent>]` and `+SDPcpu <percent>[:<percent>]` — the normal- and dirty-CPU
+/// scheduler **percentages** (`erl_init.c:955-1022` for `+SP`, `:1000-1022` for `+SDPcpu`):
+/// the same `sscanf("%d:%d")` → `sscanf(":%d")` cascade as `+S`, but the only test is
+/// `tot < 0 || onln < 0` — there is **no** upper bound and no total/online relation.
 ///
-/// The C applies the two fields as a count (when positive) or as an **offset from the
-/// host's scheduler count** (when negative) and then range-checks the *result* against
-/// `ERTS_MAX_NO_OF_DIRTY_CPU_SCHEDULERS`, so a negative field is legal there
-/// (`+SDcpu-1` is "one fewer than the host has"). This runtime has no dirty schedulers at
-/// all, so only the shape is decided here — the value is preserved verbatim in
-/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) and has no
-/// runtime-visible effect. `+SDcpuabc`, `+SDcpu1:2:3` and a bare `+SDcpu:` are the C's
-/// `bad amount of dirty CPU schedulers` rejection (exit 1).
-pub(super) fn parse_dirty_schedulers(switch: &str, value: &str) -> Result<()> {
-    match scheduler_spec(value) {
+/// Verified against OTP 29.1.1 / erts-17.1: `+SP50`, `+SP100:100`, `+SP:3`, `+SP0` exit 0;
+/// `+SPabc`, `+SP-1`, `+SP5:-1` exit 1.
+pub(super) fn parse_scheduler_percent(switch: &str, value: &str) -> Result<()> {
+    let negative = match scan_count_pair(value) {
+        Some((total, online)) => {
+            total.is_some_and(|percent| percent < 0) || online.is_some_and(|percent| percent < 0)
+        }
+        None => true,
+    };
+    if negative {
+        return Err(error::bad_switch_value(switch, value));
+    }
+    Ok(())
+}
+
+/// `+SDcpu <n>[:<n>]` — the dirty-CPU scheduler count (`erl_init.c:1023-1089`): the `+S`
+/// cascade and `chk_S` bounds, with `ERTS_MAX_NO_OF_DIRTY_CPU_SCHEDULERS` = the same `1024`.
+///
+/// A non-positive half is an **offset from the default** (`+SDcpu -1` is `no_schedulers - 1`
+/// and is accepted), which is why the rule is [`resolve_scheduler_counts`] rather than a
+/// negativity test.
+pub(super) fn parse_dirty_cpu_schedulers(
+    switch: &str,
+    value: &str,
+    default_total: i64,
+    default_online: i64,
+) -> Result<()> {
+    let pair = scan_count_pair(value)
+        .and_then(|pair| resolve_scheduler_counts(pair, default_total, default_online));
+    match pair {
         Some(_) => Ok(()),
         None => Err(error::bad_switch_value(switch, value)),
     }
 }
 
-/// Validates a `+SDio<value>` dirty-I/O-scheduler specifier (`erl_init.c:1081-1096`): the
-/// C `atoi`s the value (so trailing junk is ignored) and requires
-/// `1 <= value <= ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS`.
-///
-/// The count itself is **not** applied — this runtime has no dirty schedulers, so the
-/// value is preserved verbatim in
-/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) and has no
-/// runtime-visible effect. `+SDio0`, `+SDioabc` (its `atoi` is 0) and `+SDio2000` are the
-/// C's `bad number of dirty I/O schedulers` rejection (exit 1).
+/// `+SDio <n>` — the dirty-I/O scheduler count (`erl_init.c:1090-1100`): a bare `atoi` bounded
+/// to `[1, ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS]` (the same `1024`). The C stores it in an
+/// `int`, hence the 32-bit narrowing (`+SDio 4294967297` `atoi`s to `1` and is accepted).
 pub(super) fn parse_dirty_io_schedulers(switch: &str, value: &str) -> Result<()> {
-    let schedulers = atoi(value);
-    if (1..=ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS).contains(&schedulers) {
+    let count = i64::from(atoi(value) as i32);
+    if (1..=ERTS_MAX_NO_OF_SCHEDULERS).contains(&count) {
         Ok(())
     } else {
         Err(error::bad_switch_value(switch, value))
@@ -367,27 +619,33 @@ pub(crate) const MAX_ATOM_TABLE_SIZE: i64 = (1 << 31) - 1;
 /// +t bogus      → exit 1, `bad atom table size bogus`   (strtol → 0)
 /// +t -1         → exit 1, `bad atom table size -1`
 /// +t 4000000000 → exit 1, `bad atom table size 4000000000`  (> MAX)
+/// +t 1048576x   → accepted, `atom_limit` = 1048576   (the C's digit-prefix `strtol`)
 /// +t 8192 / +t 1048576 / +t 2000000000 → accepted, and `atom_limit` follows the value
 /// ```
 ///
 /// `beam_rt` reports the emulator's own exit status (1) with its uniform one-line
 /// malformed-value diagnostic instead of the oracle's `bad atom table size …` + usage.
 pub(super) fn parse_atom_table_size(switch: &str, value: &str) -> Result<()> {
-    match value.parse::<i64>() {
-        Ok(size) if (MIN_ATOM_TABLE_SIZE..=MAX_ATOM_TABLE_SIZE).contains(&size) => Ok(()),
+    match strtol10(value) {
+        Some(size) if (MIN_ATOM_TABLE_SIZE..=MAX_ATOM_TABLE_SIZE).contains(&size) => Ok(()),
         _ => Err(error::bad_switch_value(switch, value)),
     }
 }
 
 /// Validates a `+e N` ETS-table count, mirroring the C's single check
-/// (`erts/emulator/beam/erl_init.c:1696-1707`): the value is `atoi`'d and only a
+/// (`erts/emulator/beam/erl_init.c:1696-1707`): the value goes through `atoi` and only a
 /// **negative** result is rejected; a non-numeric value `atoi`s to `0` and is accepted.
+///
+/// The C's `atoi` result is an **`int`**, so the reader here narrows [`atoi`] to 32 bits
+/// exactly as the C's `(int)strtol(…)` does — which is what makes `+e 2147483648` a refusal
+/// (`(int)2147483648` is negative) while `+e 4294967296` is accepted (its truncated value is
+/// `0`), both verified against the oracle.
 ///
 /// The effective `ets_limit` is `max(atoi(N), DB_DEF_MAX_TABS)` — `erl_db.c:4789-4792` —
 /// which is why `+e 100`, `+e 0` and `+e abc` all report `8192` while `+e 16384` reports
 /// `16384` (verified against OTP 29.1.1 / erts-17.1).
 pub(super) fn parse_ets_tables(switch: &str, value: &str) -> Result<()> {
-    if atoi(value) < 0 {
+    if (atoi(value) as i32) < 0 {
         Err(error::bad_switch_value(switch, value))
     } else {
         Ok(())
@@ -894,9 +1152,6 @@ mod tests {
             "-1",
             "abc",
             "",
-            // `ErtsStrToSint` silently ignores a trailing suffix; this parser does not
-            // (a documented divergence — the oracle accepts `+Q 1024abc` as 1024).
-            "1024abc",
         ] {
             assert!(
                 parse_max_ports("+Q", value).is_err(),

@@ -19,7 +19,7 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   ERTS_VERSION = "17.1"}` (`../beam_common/src/version.rs:39,42`). `erlang:system_info(otp_release /
   version / system_version / compat_rel)`, the NIF `ErlDrvSysInfo` strings and the `-version` banner
   are all served from them — `info/system.rs:116,117,126-130,182`, `boot.rs:317-319` (banner, printed
-  by `cli.rs:1217`), `nif.rs:476,480`.
+  by `cli.rs:1596`), `nif.rs:476,480`.
 - **The runtime has NO notion of its own root/release.** The code path/root is resolved **only from
   the filesystem**, preferring the `erl` on `$PATH` (`codeserver.rs::native_roots:660-683` — seed
   order: `erl`-on-`$PATH` ancestors, then `current_exe` ancestors, then `$ERL_TOP`, then
@@ -57,7 +57,7 @@ and `native/{code,init}.rs`, so they are recorded here rather than in any one ch
   (`init:get_argument(bindir)` = `<root>/erts-<vsn>/bin`), `native/code.rs::code_lib_dir_0:426-434`
   (`code:lib_dir/0`), `native/code.rs::code_root_dir:650-661` (`code:root_dir/0`),
   `native/init.rs:74,108,215` (`init:get_argument(root|bindir)`, `init:get_arguments/0`),
-  `cli.rs::boot_file_root:1443-1446`, `boot/bootscript.rs::expand_root:418-435` (the script's own
+  `cli.rs::boot_file_root:1868-1871`, `boot/bootscript.rs::expand_root:418-435` (the script's own
   `$ROOT` expansion).
 
 ## The `-eval` route's term storage and machine ownership (cross-cutting seam)
@@ -302,8 +302,8 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `src/port/peer_closed_tests.rs` 1 520 lines — **all test-only** (declared from `port/peer_closed.rs`'s tail), so the ~1000-line target does not bind it: it holds the peer-close channel's whole evidence, the mirror/latch units, the real-loopback delivery routes, and two spent-grant cases whose doc comments carry the quoted C lines plus the oracle's exact printed answers beside the two `erl` cross-checks of those same sequences.
 - `src/port/driver/port_term_tests.rs` 761 lines — a **test-only** suite (declared from `port/driver.rs`'s tail) for the `ERL_DRV_PORT` hook: the stamped handle↔`PortId` round trip through the real term-spec decoder, the foreign/null/unstamped refusals, the gone bit after `clear_driver_state`, and an end-to-end row through a real C driver that emits `{ERL_DRV_PORT, driver_mk_port(port)}`.
 - `src/port/failure.rs` 208 lines, 201 of production — **within target**; it is the driver-failure channel's runtime half (`signal_reason`, `PortRegistry::drain_failures`/`fail_port`, the ready-queue publication), declared inside `exit.rs`, and its two suites are `port/failure_tests.rs` (159, the reason-mapping units) and `port/failure_e2e_tests.rs` (above).
-- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 4 049 / 2 876, `nif.rs` 2 964 / 1 524, `cli.rs` 3 586 / 2 094, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 595 / 1 595, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 513 / 1 509, `eval/parse.rs` 1 642 / 1 284, `native/process.rs` 1 883 / 1 238, `native/prim.rs` 4 076 / 1 149, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 357 / 1 212, `native.rs` 2 032 / 1 210, `context/pump.rs` 1 453 / 1 399, `dist_client/client.rs` 1 079 / 1 079, `context/execution.rs` 1 141 / 1 141 (its debt gate added the predicate, the roster seam and their rustdoc; no test region, the suite is `context/tests.rs`), `dist/inbound.rs` 1 011 / 1 008.
-- **Files past ~1000 total lines whose production count stays under the target** (module docs and/or a trailing test region carry the rest; no split owed): `boot/bootscript.rs` 2 103 / 801, `native/port.rs` 1 814 / 733, `native/application.rs` 1 661 / 953, `runtime/gc.rs` 1 645 / 962, `context/process_bridge.rs` 1 302 / 463, `native/init.rs` 1 270 / 548, `info.rs` 1 225 / 769, `cli/flags.rs` 1 210 / 864, `config.rs` 1 126 / 823, `context/gc/bin_vheap.rs` 1 110 / 466, `timers.rs` 1 107 / 644, `mailbox.rs` 1 056 / 397, `seq_trace.rs` 1 052 / 761, `native/process/monitor.rs` 1 047 / 512.
+- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 4 049 / 2 876, `cli.rs` 3 684 / 2 029, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 585 / 1 585, `nif.rs` 2 964 / 1 524, `native/memory/mod.rs` 1 423 / 1 419, `context/pump.rs` 1 453 / 1 399, `eval/parse.rs` 1 642 / 1 284, `native/erts_internal.rs` 2 839 / 1 273, `native/process.rs` 1 883 / 1 238, `context/bridges.rs` 1 357 / 1 212, `native.rs` 2 032 / 1 210, `context/execution.rs` 1 141 / 1 141 (its debt gate added the predicate, the roster seam and their rustdoc; no test region, the suite is `context/tests.rs`), `native/prim.rs` 4 066 / 1 139, `dist_client/client.rs` 1 079 / 1 079, `trace.rs` 1 850 / 1 074, `dist/inbound.rs` 1 011 / 1 008.
+- **Files past ~1000 total lines whose production count stays under the target** (module docs and/or a trailing test region carry the rest; no split owed): `runtime/gc.rs` 1 645 / 962, `native/application.rs` 1 661 / 953, `cli/flags.rs` 1 210 / 864, `config.rs` 1 126 / 823, `boot/bootscript.rs` 2 103 / 801, `info.rs` 1 225 / 769, `seq_trace.rs` 1 052 / 761, `native/port.rs` 1 814 / 733, `timers.rs` 1 107 / 644, `native/init.rs` 1 270 / 548, `native/process/monitor.rs` 1 047 / 512, `context/gc/bin_vheap.rs` 1 110 / 466, `context/process_bridge.rs` 1 302 / 463, `mailbox.rs` 1 056 / 397.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the

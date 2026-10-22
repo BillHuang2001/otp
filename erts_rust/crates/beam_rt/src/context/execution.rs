@@ -43,7 +43,7 @@ use beam_loader::{Label, Module};
 use beam_process::PendingSignal;
 use beam_term::{Atom, AtomTable, Eterm};
 
-use super::apply::{callee_admission, LocalFunTarget};
+use super::apply::{self, callee_admission, LocalFunTarget};
 use super::gc;
 use super::runtime_context::RuntimeContext;
 use super::send::SendDestination;
@@ -307,15 +307,13 @@ impl ExecutionContext for RuntimeContext<'_> {
         // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
         // implementation. The exclusion is **key-granular** because one namespace is only
         // partly floor-served: the floor owns just `io:put_chars/1,2`, while every other
-        // `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is
-        // an ordinary `lib/stdlib/src/io.erl` body. Refusing those would route them onto the
-        // synchronous non-pumping `call_bif` path, where a **scheduled** process's blocking
-        // `receive` on the io-device reply folds into the typed `blocked()` gap (exit 3)
-        // instead of suspending — the contract A.9 `compile:file/2` blocker; entering them
-        // in-machine lets that `receive` suspend the process and be resumed when the device
-        // replies. The key list is [`crate::native::floor_shadows`], whose `io` exception a
-        // unit test below pins against `try_native`'s source so it can never drift out of the
-        // host's dispatch.
+        // `io:*` (`io:getopts/1`, `io:request/2`, `io:scan_erl_form/4`, …) is an ordinary
+        // `lib/stdlib/src/io.erl` body. Refusing those would route them onto the synchronous
+        // non-pumping `call_bif` path, where a **scheduled** process's blocking `receive` on the
+        // io-device reply folds into the typed `blocked()` gap instead of suspending — the
+        // contract A.9 `compile:file/2` blocker. The key list is
+        // [`crate::native::floor_shadows`], whose `io` exception a unit test below pins against
+        // `try_native`'s source so it can never drift out of the host's dispatch.
         // A module with a loaded NIF library is **never** entered here, for two reasons.
         //
         // * A NIF replaces the Erlang stub of the same `{module, function, arity}` at dispatch
@@ -323,33 +321,32 @@ impl ExecutionContext for RuntimeContext<'_> {
         //   `call_bif`. [`NifRegistry::lookup`] alone would answer that for the NIF's own
         //   names, but *not* for the module's ordinary Erlang functions.
         // * The interception is module-wide at **dispatch**, and the runtime's dispatch keys
-        //   the module off [`Self::current_module`] — which an in-machine callee does **not**
-        //   update (the engine's module-context switch never re-enters this context). Entering
-        //   a NIF module's body would therefore run its calls under the *caller's* identity: a
-        //   `erlang:load_nif/2` inside the body would target the caller module (the observed
-        //   `bad_lib` on a reload), not itself.
+        //   the module off [`Self::current_module`], which an in-machine callee does **not**
+        //   update — entering a NIF module's body would run its calls under the *caller's*
+        //   identity (a `erlang:load_nif/2` inside it would target the caller, the observed
+        //   `bad_lib` on a reload).
         //
         // Excluding the whole module keeps such a call byte-for-byte on the synchronous
-        // [`Self::call_bif`] path (which loads the module, sets the module identity and runs
-        // it with a machine whose own admission point is unarmed) — exactly its behaviour
-        // before this seam existed.
-        //
-        // This check reads the NIF registry's own loaded-library set and nothing this seam
-        // caches, so it is **idempotent**: resolving one instruction twice answers the same.
-        // (It is also why a *second* `load_nif` call from an already-loaded module is already
-        // refused here — the library is registered by then.)
+        // [`Self::call_bif`] path (which loads it, sets the module identity and runs it with a
+        // machine whose own admission point is unarmed) — exactly its behaviour before this
+        // seam existed. The check reads the NIF registry's loaded-library set and nothing
+        // cached here, so it is **idempotent**; it is also why a *second* `load_nif` from an
+        // already-loaded module is already refused here.
         //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
         // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
         // paths and `ets:*`) is the implementation `call_bif` serves; it is never a `.beam`
-        // body here.
-        //
-        // The three host-served families above are the **one** predicate
+        // body here. Those three host-served families are the **one** predicate
         // [`Self::host_serves`] — the single source of truth the runner's process-entry arm
         // asks directly (see that method for why this seam's own `Ok(None)` cannot be reused
-        // there: it is overloaded with the module-unresolvable/missing-export cases). A
-        // host-served MFA is not a `.beam` body here, so the seam declines and leaves the
-        // synchronous `call_bif` route (NIF → runtime-native floor → registry) untouched.
+        // there: it is overloaded with the module-unresolvable/missing-export cases).
+        // A **fun-applying** host key is the one exception: its host implementation applies the
+        // caller's fun through a nested run that cannot suspend, so inside a slice the module's
+        // A **fun-applying** host key is the one exception: its host implementation applies the
+        // caller's fun through a nested run that cannot suspend, so inside a slice the module's
+        // own code is entered instead and the apply suspends the process —
+        // [`apply::prefers_module_code_for_fun_apply`] carries the reasoning and the class
+        // (`beam_bifs::needs_fun_caller`, the registry's own roster).
         //
         // # The one exception: the fun-applying stdlib fast paths under collection debt
         //
@@ -401,18 +398,23 @@ impl ExecutionContext for RuntimeContext<'_> {
         // [`Process::grow_nursery`]: beam_process::Process::grow_nursery
         // [`Process::collection_debt`]: beam_process::Process::collection_debt
         // [`jit::baseline`]: beam_engine
-        if self.host_serves(module, function, arity) {
-            if !(nests_a_fun_apply(module, function, arity)
+        if self.host_serves(module, function, arity)
+            && !apply::prefers_module_code_for_fun_apply(
+                self.may_pump_scheduler(),
+                module,
+                function,
+                arity,
+            )
+            && !(nests_a_fun_apply(module, function, arity)
                 && self.calling_process_has_collection_debt())
-            {
-                return Ok(None);
-            }
-            if crate::debug_trace::enabled() {
-                crate::debug_trace::trace(format_args!(
-                    "seam debt-gate [{trace_pid:?}] {module}:{function}/{arity}: entering the \
-                     .beam body in-machine"
-                ));
-            }
+        {
+            return Ok(None);
+        }
+        if crate::debug_trace::enabled() {
+            crate::debug_trace::trace(format_args!(
+                "seam debt-gate [{trace_pid:?}] {module}:{function}/{arity}: entering the \
+                 .beam body in-machine"
+            ));
         }
         // Resolve the callee's module handle. A module that is **already cached** is used as
         // is; an uncached one is loaded **on demand**, exactly as [`Self::call_bif`] does, so

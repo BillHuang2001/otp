@@ -36,6 +36,47 @@ use beam_term::{make_atom, signed_value, Eterm};
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
+/// Whether `p` is an existing executable file.
+fn is_executable(p: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(p) {
+            Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// The system oracle: `$ERTS_ORACLE` when it is executable, else `erl` on `$PATH`.
+///
+/// The same resolution `tools/differential` uses, so a suite that cross-checks a value
+/// against the live system Erlang names the runtime the compatibility gate names.
+pub(crate) fn resolve_oracle() -> Option<std::path::PathBuf> {
+    if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+        let program = std::path::PathBuf::from(&value);
+        return is_executable(&program).then_some(program);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("erl"))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Prints the loud skip banner — a missing oracle is never a silent pass.
+pub(crate) fn skip_oracle_loudly(banner: &str, what: &str) {
+    eprintln!();
+    eprintln!("=============== beam_rt {banner} SKIPPED ===============");
+    eprintln!("no system `erl` (`$ERTS_ORACLE` or `$PATH`): {what} cannot run.");
+    eprintln!("Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
+    eprintln!("=====================================================");
+    eprintln!();
+}
 /// A runtime over a code-path-less code server plus the core atom seed.
 pub(crate) fn runtime() -> Runtime {
     Runtime::with_defaults().expect("the default runtime")

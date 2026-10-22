@@ -883,6 +883,13 @@ call(F) -> F().
     }
 }
 
+/// The nested fun-application matrix: the four fun-applying `lists` keys × the four fun kinds
+/// (pure / `io:format` / file read / a spawn-satisfied `receive`), each cell run as a scheduled
+/// process and compared with the live oracle — plus the `maps`/`ets` keys, the `-eval`-route
+/// counterpart and the negative control for the documented `apply/3` residual.
+#[cfg(test)]
+mod fun_apply_matrix;
+
 /// Pins the nested pump's **bound and sleep policy** through their observable consequence: real
 /// stdlib modules must compile in-process on the pumping `-eval` route, byte-identically to the
 /// oracle — including the modules that weigh the most on this route, which is what

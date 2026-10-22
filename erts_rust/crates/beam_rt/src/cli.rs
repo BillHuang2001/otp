@@ -52,6 +52,18 @@
 //! | `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`); `ERL_SYM_MAP_FILE` overrides the map's whole path |
 //! | `run File Mod:Func/Arity [Args…]` | the non-interactive batch runner: load `File`, run the function, print the result **and nothing else** — it records the `noshell` init argument (so the booted kernel prints no OTP slogan) while still driving the full default boot script |
 //!
+//! # A `+`-switch takes its value attached or separated
+//!
+//! A value-taking `+` switch reads its value the way the C's `get_arg` does
+//! (`erl_init.c:496-509`): the **remainder of the token** when there is one, the next token
+//! otherwise. So `+S1` ≡ `+S 1`, `+A0` ≡ `+A 0`, `+P65536` ≡ `+P 65536`, `+Q1024` ≡ `+Q 1024`,
+//! `+hms233` ≡ `+hms 233`, `+hmaxktrue` ≡ `+hmaxk true` and `+sbwtmedium` ≡ `+sbwt medium`. The
+//! switch is resolved by **longest prefix**, so `+sbwtdcpu`, `+hmaxel`, `+hmbs`,
+//! `+JPperfdirectory` and `+SDcpu` are never read as their shorter siblings. That is also how
+//! a real `erlc` launches the emulator:
+//! `+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput -mode minimal -boot no_dot_erlang -s erl_compile
+//! compile_cmdline -extra Foo.erl`.
+//!
 //! # `ERL_*FLAGS`
 //!
 //! The [`run`] driver first merges the `ERL_*FLAGS` environment variables into the
@@ -72,9 +84,8 @@
 //! is recorded and ignored. An **unrecognized `+`-flag** is different: the launcher
 //! rewrites it to `-X` for the emulator, which prints `unknown flag -X` and exits **1**
 //! (a *recognized* spelling such as `+Weird` stays accepted). A **plain positional
-//! argument** is never a usage error: the launcher forwards it to `init`, which collects it
-//! into the **plain-argument** list, and `-extra` hands it everything that follows (see
-//! [`parse`] and [`RuntimeConfig::plain_args`]).
+//! argument** is accepted and ignored, never a usage error (the launcher forwards it to
+//! `init`, which accepts it).
 //!
 //! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
 //! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
@@ -143,7 +154,9 @@ use crate::runtime::Runtime;
 mod env;
 pub(crate) mod flags;
 mod vars;
-pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
+pub use env::{
+    merge_argv, merge_argv_with_plain, otp_flags_var, split_plain, tokenize, Env, MapEnv, ProcessEnv,
+};
 pub use vars::{from_env, ErlEnv};
 
 /// The usage text, printed on a usage (exit 2) error.
@@ -188,10 +201,11 @@ Switches:
   -emu_flavor emu|jit|smp   emulator flavor
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
                             a +FLAG is an emulator flag and is not an init argument
-
+  -extra [ARG...]           every following argument is a plain argument
+                            (init:get_plain_arguments/0), never an init argument
+  -- [ARG...]               the following arguments are plain until the next switch
 A +switch that reads a value takes it ATTACHED or as the next token: +S1 is +S 1,
 +A0 is +A 0, +P65536 is +P 65536, +Q1024 is +Q 1024, +Ktrue is +K true, +sbtu is +sbt u.
-
 Environment (merged into the command line, real erl's order):
   ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
 Environment (read by the emulator/launcher; never an init argument):
@@ -216,7 +230,10 @@ Exit codes:
   2  usage error         3  unsupported
 
 A malformed value of an emulator switch (+t/+P/+Q/+S/+hms/+hmax/+sbt/...), a -env with
-no operand and an unreadable -config exit 1, as the oracle's emulator/launcher do.";
+no operand and an unreadable -config exit 1, as the oracle's emulator/launcher do.
+
+A value-taking +switch takes its value attached or separated: +S1 = +S 1, +P65536 =
++P 65536, +hms233 = +hms 233, +sbwtmedium = +sbwt medium.";
 /// The exit code of a successful run.
 pub const EXIT_OK: i32 = 0;
 /// The exit code of a genuine runtime error (a load/execute/BIF failure).
@@ -274,8 +291,14 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 ///
 /// Exactly the errors [`parse`] reports for the merged command line.
 pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
-    let merged = env::merge_argv(args, env);
+    // The merge keeps the environment's plain-argument tails apart from its flags, in merge
+    // order, because `-extra` acts per entity (`init.erl:127-139`). The **flag stream** is
+    // byte-identical to [`env::merge_argv`]'s output, so everything downstream — including
+    // [`vars::has_plus_q_switch`] — reads exactly what it read before; the plain tails only
+    // feed `init:get_plain_arguments/0`.
+    let (merged, plain) = env::merge_argv_with_plain(args, env);
     let mut config = parse(&merged)?;
+    config.plain_args = plain;
     let env_vars = vars::from_env(env);
     // `ERL_MAX_PORTS` acts exactly like a `+Q` the command line does not already carry
     // (the oracle: any `+Q` in the merged argv overrides the variable). The two tokens go
@@ -319,23 +342,20 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 /// launcher's own rejections — an **unrecognized `+`-flag** ([`error::unknown_flag`]), a
 /// **missing operand of a `+`-switch** or of `-name`/`-sname`
 /// ([`error::missing_switch_operand`]) and the **refused `-smp disable`**
-/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is never a usage
-/// error: it is collected into [`RuntimeConfig::plain_args`], and `-extra` collects
-/// everything after it there too (see below). A malformed
+/// ([`error::smp_disable_not_supported`]). A **plain positional argument** is accepted and
+/// ignored, never a usage error, and the two markers `-extra`/`--` hand their tails to
+/// [`RuntimeConfig::plain_args`] (the source of `init:get_plain_arguments/0`) instead of
+/// recording them as init arguments. A malformed
 /// `-eval` expression is *not* decided here — it is a capability gap detected when the
 /// expression is evaluated (exit code [`EXIT_UNSUPPORTED`], see [`crate::eval`]).
-///
-/// # The plain-argument surface (`-extra`, contract A.6)
-///
-/// [`RuntimeConfig::plain_args`] reproduces the C `init`'s `Args` accumulator
-/// (`erts/preloaded/src/init.erl:1669-1710`): a stray **positional** token is an `arg`, and
-/// `-extra` is `start_extra_arg` — it appends **every** remaining token, verbatim and in
-/// order, and stops parsing, so nothing after it is an init argument or a Start instruction
-/// (`-extra` itself is neither). Oracle-verified (OTP 29.1.1 / erts-17.1):
-/// `erl -noshell -eval '…' -extra +deterministic -o /tmp/x /tmp/s.erl` answers
-/// `["+deterministic","-o","/tmp/x","/tmp/s.erl"]`, `erl stray -noshell -eval '…' -extra a b`
-/// answers `["stray","a","b"]`, and `init:get_argument(extra)` is the bare atom `error`.
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
+    // The invocation's own stream splits into its **flags** and its **plain arguments**
+    // (`-extra`/`--`, per entity — [`env::split_plain`]). Only the flags are switches: an
+    // `-extra` is consumed by `init` and is therefore never an init argument, which is why
+    // the flag loop walks the split rather than `args` itself. A marker-free invocation
+    // splits to `(args, [])`, so its parse is byte-identical to before.
+    let (flags, plain) = env::split_plain(args);
+    let flags = flags.as_slice();
     let mut builder = Builder {
         emulator: EmulatorConfig::default(),
         pa: Vec::new(),
@@ -349,19 +369,12 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         prev_max_heap_words: 0,
         max_ports: None,
         init_args: InitArgs::new(),
-        plain_args: Vec::new(),
         perf_map: PerfMapConfig::new(),
         action: Action::Boot,
     };
     let mut index = 0;
-    while index < args.len() {
-        let token = args[index].as_str();
-        // The C's attached-or-separated rule: a token carrying its value (`+S1`, `+A0`,
-        // `+sbtu`) is the switch plus that value, so the token is first resolved to the
-        // switch it spells ([`plus_switch_of`]) and the remainder travels as the value
-        // ([`plus_value_of`]). A token that is no attached spelling resolves to itself, so
-        // every separated spelling keeps behaving exactly as before.
-        let argument = plus_switch_of(token);
+    while index < flags.len() {
+        let argument = flags[index].as_str();
         match argument {
             "-version" | "--version" => {
                 builder.record(argument, Vec::new());
@@ -373,7 +386,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 1;
             }
             "-eval" => {
-                let expr = value_of(args, index, "-eval")?;
+                let expr = value_of(flags, index, "-eval")?;
                 // `-eval` is a **Start instruction**, not an init argument: the oracle
                 // consumes it in `init`'s `parse_boot_args/1`, so
                 // `init:get_argument(eval)` is the bare atom `error` (verified against
@@ -382,13 +395,13 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 index += 2;
             }
             "-pa" => {
-                let (values, next) = path_values(args, index, "-pa")?;
+                let (values, next) = path_values(flags, index, "-pa")?;
                 builder.record(argument, values.clone());
                 builder.pa.extend(values.into_iter().map(PathBuf::from));
                 index = next;
             }
             "-pz" => {
-                let (values, next) = path_values(args, index, "-pz")?;
+                let (values, next) = path_values(flags, index, "-pz")?;
                 builder.record(argument, values.clone());
                 builder.pz.extend(values.into_iter().map(PathBuf::from));
                 index = next;
@@ -400,12 +413,12 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // launcher would reject such a name and force `isdistributed = 0`, which is
                 // a runtime-core fidelity gap (`M1_GAPS.md`), so only the exit status is
                 // matched here.
-                let (value, next) = plus_value_of(args, index, token, argument)?;
+                let value = plus_value_of(flags, index, argument)?;
                 builder.record(argument, vec![value.clone()]);
                 if !is_switch(&value) {
                     builder.emulator.node_name = Some(value);
                 }
-                index = next;
+                index += 2;
             }
             "-setcookie" => {
                 // `-setcookie` takes a list of values exactly like `-pa`/`-pz`: the oracle
@@ -414,7 +427,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // `{ok,[["a","b"]]}`), and with anything but a single value it leaves the
                 // cookie unset (`erlang:get_cookie()` is `nocookie`) — verified against
                 // OTP 29.1.1 / erts-17.1.
-                let (values, next) = path_values(args, index, "-setcookie")?;
+                let (values, next) = path_values(flags, index, "-setcookie")?;
                 builder.record(argument, values.clone());
                 builder.emulator.cookie = match values.as_slice() {
                     [only] => Some(only.clone()),
@@ -428,30 +441,15 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // `error` — verified against OTP 29.1.1 / erts-17.1. The two values are
                 // taken blindly (the oracle consumes the following token even when it
                 // looks like a switch, e.g. `-noshell`).
-                index = parse_env_switch(args, index)?;
+                index = parse_env_switch(flags, index)?;
             }
             "-config" | "-boot" => {
-                let value = value_of(args, index, argument)?;
+                let value = value_of(flags, index, argument)?;
                 builder.record(argument, vec![value]);
                 index += 2;
             }
-            // `-extra` **ends** the switch surface. The C `init` treats it as
-            // `start_extra_arg` (`erts/preloaded/src/init.erl:1674-1675`), which answers
-            // `lists:reverse(As, Bs)` — the stray positional arguments collected so far plus
-            // **every** remaining token, verbatim and in order — as the plain-argument list,
-            // and stops parsing: nothing after `-extra` is an init argument or a Start
-            // instruction, and `-extra` itself is neither (the oracle's
-            // `init:get_argument(extra)` is the bare atom `error`). Verified against OTP
-            // 29.1.1 / erts-17.1:
-            // `erl -noshell -eval '…' -extra a b` ⇒ `init:get_plain_arguments()` is
-            // `["a","b"]`, `init:get_argument(extra)` is `error`, and a `-eval` written after
-            // the `-extra` never runs (it is a plain argument).
-            "-extra" => {
-                builder.plain_args.extend(args[index + 1..].iter().cloned());
-                index = args.len();
-            }
             "-emu_flavor" => {
-                let value = value_of(args, index, "-emu_flavor")?;
+                let value = value_of(flags, index, "-emu_flavor")?;
                 builder.record(argument, vec![value.clone()]);
                 let flavor = flags::parse_emu_flavor("-emu_flavor", &value)?;
                 builder.emulator.features =
@@ -459,246 +457,33 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.emulator.flavor = flavor;
                 index += 2;
             }
-            // `+Q [N|legacy]` — the port table (`erl_init.c:1888-1905`). The value may be
-            // attached (`+Q1024`) or a separate token (`+Q 1024`); both are the same switch.
-            "+Q" => {
-                let (value, next) = plus_value_of(args, index, token, "+Q")?;
-                builder.max_ports = flags::parse_max_ports("+Q", &value)?;
-                builder.preserve("+Q", &value);
-                index = next;
+            // Every `+`-flag is an **emulator** flag. The value-taking ones are resolved by
+            // **longest prefix**, so the C's attached (`+S1`, `+A0`, `+hms233`, `+sbtu`) and
+            // separated (`+S 1`) spellings are the one switch they name — `erl_init.c`'s
+            // `get_arg(argv[i]+2, argv[i+1], &i)`, where a non-empty remainder IS the value.
+            // `+B`'s family and the allocator `+M*` surface keep their own shapes; a
+            // recognized-but-unmodeled spelling is accepted, and an unrecognized one is the
+            // emulator's `unknown flag -X` (exit 1). No `+`-flag is ever an `init` argument.
+            other if other.starts_with('+') => {
+                index = parse_plus_switch(flags, index, &mut builder)?;
             }
-            // `+K [true|false]` — the kernel-poll switch (`erl_check_io.c:2467`), attached
-            // (`+Ktrue`) or separated (`+K true`).
-            "+K" => {
-                let (value, next) = plus_value_of(args, index, token, "+K")?;
-                // The emulator only `get_arg`s the value — there is **no** validation
-                // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and bare
-                // `+K` (which consumes whatever follows, blindly) included.
-                flags::parse_kernel_poll("+K", &value)?;
-                builder.preserve("+K", &value);
-                index = next;
-            }
-            // `+sbt [TYPE]` — the scheduler bind type, attached (`+sbtu`, the spelling the
-            // real `erlc` front end sends) or separated (`+sbt u`).
-            "+sbt" => {
-                let (value, next) = plus_value_of(args, index, token, "+sbt")?;
-                flags::parse_sbt("+sbt", &value)?;
-                builder.preserve("+sbt", &value);
-                index = next;
-            }
-            // `+t N` — the atom-table size (`erl_init.c:2217-2234`); the value is
-            // validated and preserved verbatim, so `atom_limit` can follow it
-            // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
-            "+t" => {
-                let (value, next) = plus_value_of(args, index, token, "+t")?;
-                flags::parse_atom_table_size("+t", &value)?;
-                builder.preserve("+t", &value);
-                index = next;
-            }
-            // `+e N` — the maximum number of ETS tables (`erl_init.c:1696-1707`); only a
-            // negative value is rejected; `ets_limit` follows the value (see
-            // `crate::info::limits`).
-            "+e" => {
-                let (value, next) = plus_value_of(args, index, token, "+e")?;
-                flags::parse_ets_tables("+e", &value)?;
-                builder.preserve("+e", &value);
-                index = next;
-            }
-            // `+B [c|d|i]` (and the in-token `+Bi`/`+Bc`/`+Bd`) — the break-handler switch
-            // (`erl_init.c:1822-1843`). It never rejects a value: an unrecognized one falls
-            // to the `+B` arm (`have_break_handler = 0`). Only `+B i` sets `ignore_break`,
-            // which `erlang:system_info(break_ignored)` reports (see `crate::info::system`).
-            // The switch and its value are preserved verbatim so that derivation can read
-            // them; a valueless `+B` preserves an empty value so the `(switch, value)` stride
-            // stays even.
-            "+B" => {
-                // The oracle's `+B` consumes a following single-letter `i`/`c`/`d` (setting
-                // the break mode) and otherwise emits `-B` alone, leaving the token as a
-                // **plain positional** `init` argument — which the oracle then answers by
-                // starting its interactive shell. This runtime has no interactive shell, so
-                // the token is consumed and ignored instead: the exit status (`+B x` ⇒ 0)
-                // matches the oracle, and that status is the observable.
-                let value = match args.get(index + 1) {
-                    Some(candidate) if !is_switch(candidate) => candidate.clone(),
-                    _ => String::new(),
-                };
-                let consumed = !value.is_empty();
-                builder.preserve("+B", &value);
-                index += if consumed { 2 } else { 1 };
-            }
-            "+Bi" | "+Bc" | "+Bd" => {
-                builder.preserve("+B", &argument[2..]);
-                index += 1;
-            }
-            other if flags::is_allocator_switch(other) => {
-                index = flags::parse_allocator(&args[index], args, index)?;
-            }
-            // `+S [TOTAL][:ONLINE]` — the normal scheduler counts (`erl_init.c:1102-1160`),
-            // attached (`+S1`, `+S2:1`) or separated (`+S 1`, `+S 2:1`); both spellings are
-            // the same switch and land in the same `emulator.schedulers` /
-            // `online_schedulers` fields.
-            "+S" => {
-                let (value, next) = plus_value_of(args, index, token, "+S")?;
-                let (total, online) = parse_schedulers(&value)?;
-                builder.emulator.schedulers = total;
-                builder.online_schedulers = online;
-                index = next;
-            }
-            // `+SP[PERCENT]` — the normal schedulers as a percentage of the processor count
-            // (`erl_init.c:966-1000`), attached (`+SP50`, `+SP:50`) or separated. This
-            // runtime has no percentage sizing, so the value is **validated** (the C's
-            // `%d`/`%d:%d`/`:%d` shape, no negative field) and **preserved verbatim** in
-            // `extra_emulator_flags`; it has no runtime-visible effect and is not silently
-            // dropped. `+SPabc` stays the emulator's exit-1 `bad schedulers percentage
-            // specifier`.
-            "+SP" => {
-                let (value, next) = plus_value_of(args, index, token, "+SP")?;
-                flags::parse_scheduler_percentage("+SP", &value)?;
-                builder.preserve("+SP", &value);
-                index = next;
-            }
-            // `+SDcpu[TOTAL][:ONLINE]` / `+SDPcpu[PERCENT][:PERCENT]` — the dirty CPU
-            // schedulers (`erl_init.c:1001-1080`). This runtime has no dirty schedulers, so
-            // the values are **validated** (`+SDcpu`: the C's `%d`/`%d:%d`/`:%d` shape, whose
-            // fields the C applies as counts or as offsets from the host's scheduler count;
-            // `+SDPcpu`: the same shape with no negative field) and **preserved verbatim**;
-            // they have no runtime-visible effect. A malformed value stays the emulator's
-            // exit-1 rejection.
-            "+SDcpu" | "+SDPcpu" => {
-                let (value, next) = plus_value_of(args, index, token, argument)?;
-                if argument == "+SDPcpu" {
-                    flags::parse_scheduler_percentage(argument, &value)?;
-                } else {
-                    flags::parse_dirty_schedulers(argument, &value)?;
-                }
-                builder.preserve(argument, &value);
-                index = next;
-            }
-            // `+SDio N` — the dirty I/O schedulers (`erl_init.c:1081-1096`), `atoi`-read and
-            // range-checked; validated and preserved verbatim, with no runtime-visible
-            // effect here (this runtime has no dirty schedulers).
-            "+SDio" => {
-                let (value, next) = plus_value_of(args, index, token, "+SDio")?;
-                flags::parse_dirty_io_schedulers("+SDio", &value)?;
-                builder.preserve("+SDio", &value);
-                index = next;
-            }
-            "-smp" => index = parse_smp_switch(args, index, &mut builder)?,
-            // `+A [N]` — the async-thread pool (`erl_init.c:929-940`), attached (`+A0`) or
-            // separated (`+A 0`); the value is preserved verbatim.
-            "+A" => {
-                let (value, next) = plus_value_of(args, index, token, "+A")?;
-                // The async-thread pool is not modelled by the runtime core; it is
-                // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
-                // The emulator's reader is a bare `atoi`, so any value is accepted (junk
-                // parses to 0: `+A abc` exits 0) and only a **negative** result is rejected
-                // (`+A -5` exits 1).
-                if flags::atoi(&value) < 0 {
-                    return Err(error::bad_switch_value("+A", &value));
-                }
-                builder.preserve("+A", &value);
-                index = next;
-            }
-            // `+P [N|legacy]` — the process table (`erl_init.c:1870-1886`), attached
-            // (`+P65536`, the spelling the real `erlc` front end sends) or separated.
-            "+P" => {
-                let (value, next) = plus_value_of(args, index, token, "+P")?;
-                builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
-                index = next;
-            }
-            "+hms" => {
-                let (value, next) = plus_value_of(args, index, token, "+hms")?;
-                let raw = parse_heap_words("+hms", &value)?;
-                // The **raw** value is what the `+hmax` ordering rule compares against
-                // (`erl_init.c:1564` sets `H_MIN_SIZE` unrounded; the growth-table rounding
-                // runs after the whole command line, `:283`), so it is recorded before the
-                // options round it.
-                builder.raw_min_heap_words = raw;
-                builder.heap.set_min_heap_words(raw);
-                index = next;
-            }
-            "+hmbs" => {
-                let (value, next) = plus_value_of(args, index, token, "+hmbs")?;
-                builder
-                    .heap
-                    .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
-                index = next;
-            }
-            "+hmax" => {
-                let (value, next) = plus_value_of(args, index, token, "+hmax")?;
-                let max = parse_max_heap_size(&value)?;
-                // The C's **order-dependent** parse-time rule (`erl_init.c:1634-1639`): when a
-                // `+hmax` is parsed and a **previous** one set a nonzero `H_MAX_SIZE` that is
-                // now below the current `H_MIN_SIZE` (raw, as parsed at `erl_init.c:1564` — the
-                // growth-table rounding at `:283` runs after the whole command line), the
-                // invocation is rejected. It compares the *previous* value, so
-                // `+hmax 500 +hms 4000` is accepted (and the boot process is then killed at
-                // runtime) while `+hmax 500 +hms 1000 +hmax 200` is a usage error.
-                if builder.rejects_max_heap(max) {
-                    return Err(error::max_heap_below_min_heap(
-                        &value,
-                        builder.raw_min_heap_words(),
-                    ));
-                }
-                builder.heap.set_max_heap_words(max);
-                index = next;
-            }
-            "+hmaxk" | "+hmaxel" | "+hmaxib" => {
-                let (value, next) = plus_value_of(args, index, token, argument)?;
-                builder.set_max_heap_flag(argument, &value)?;
-                index = next;
-            }
-            // The perf-map / JIT-dump surface (contract A.8). The two switches are emulator
-            // flags: they are validated here, preserved verbatim in `extra_emulator_flags`
-            // and **never** an `init` argument (like `+Q`/`+K`/`+sbt`). `+JPperfdirectory`'s
-            // value is taken verbatim — an unusable directory surfaces as a failed file
-            // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
-            "+JPperf" => {
-                let (value, next) = plus_value_of(args, index, token, "+JPperf")?;
-                builder.perf_map.set_flag(&value)?;
-                builder.preserve("+JPperf", &value);
-                index = next;
-            }
-            "+JPperfdirectory" => {
-                let (value, next) = plus_value_of(args, index, token, "+JPperfdirectory")?;
-                builder.perf_map.set_directory(value.clone());
-                builder.preserve("+JPperfdirectory", &value);
-                index = next;
-            }
-            "-s" => index = builder.parse_apply(args, index, "-s")?,
-            "-run" => index = builder.parse_apply(args, index, "-run")?,
-            "run" => index = parse_run_file(args, index, &mut builder)?,
+            "-smp" => index = parse_smp_switch(flags, index, &mut builder)?,
+            "-s" => index = builder.parse_apply(flags, index, "-s")?,
+            "-run" => index = builder.parse_apply(flags, index, "-run")?,
+            "run" => index = parse_run_file(flags, index, &mut builder)?,
             // `-smpdisable` is the one-token spelling of the refused `-smp disable`.
             "-smpdisable" => return Err(error::smp_disable_not_supported()),
-            // The `erlexec` default: an unrecognized `+X` is rewritten to `-X` and handed to
-            // the emulator, which prints `unknown flag -X` and exits **1** for a flag it has
-            // no `case` for (`erl_init.c:2488-2490`). A *recognized* spelling — and any
-            // `-`-switch — is recorded exactly as before.
-            other if is_switch(other) => {
-                if let Some(name) = other.strip_prefix('+') {
-                    if !flags::emulator_flag_recognized(name) {
-                        return Err(error::unknown_flag(other));
-                    }
-                }
-                index = builder.record_unmodeled(args, index);
-            }
-            // A plain positional token: the oracle's launcher forwards it to `init`, which
-            // collects it as an `arg` into the plain-argument list
-            // (`erts/preloaded/src/init.erl:1704-1705`: `parse_boot_args(Bs, Ss, Fs, [B|As])`),
-            // so `erl stray -noshell …` answers `init:get_plain_arguments()` = `["stray"]`
-            // (verified against OTP 29.1.1 / erts-17.1). It is never a usage error and never
-            // an init argument.
-            //
-            // Residual: the oracle's flags are **greedy** — a positional token directly after
-            // a valueless flag is that flag's *value* (`init.erl:1735-1747`'s `get_args`), so
-            // `erl -noinput stray` is `init:get_argument(noinput)` = `{ok,[["stray"]]}` with an
-            // empty plain-argument list, where this parser records `noinput` with no values
-            // and `stray` as a plain argument. That flag/value grammar is the `-`-switch
-            // surface's own concern (`M1_GAPS.md`), not the plain-argument collector's.
-            _ => {
-                builder.plain_args.push(argument.to_string());
-                index += 1;
-            }
+            // A `-`-switch the table above does not model is accepted and recorded exactly as
+            // before (real `erl` never rejects one). A `+`-flag never reaches this arm: the
+            // arm above resolves (or, for an unrecognized spelling, rejects) every one of them.
+            other if is_switch(other) => index = builder.record_unmodeled(flags, index),
+            // A **plain positional** token is never a usage error: the oracle's launcher
+            // forwards it to `init` as an ordinary argument. This runtime accepts and ignores
+            // it (no usage block, no init argument). The oracle's own treatment is not a
+            // drivable reference: `erl -noshell junk` brings up the shell anyway and
+            // `erl junk -noshell` waits for ever, so there is no answer to reproduce — see
+            // `M1_GAPS.md`.
+            _ => index += 1,
         }
     }
     let code_paths = builder.code_paths();
@@ -712,7 +497,6 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: builder.heap,
         max_ports: builder.max_ports,
         init_args: builder.init_args,
-        plain_args: builder.plain_args,
         perf_map: builder.perf_map,
         // The CLI resolves the script it drives in `drive`, once the whole command line
         // (and therefore the action) is known — `-version` is the one action that boots
@@ -722,6 +506,10 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         // The environment family is read only by `parse_with_env`; the pure `parse` sees
         // an empty one (it must never read the process environment).
         env: ErlEnv::default(),
+        // The plain arguments this invocation's OWN stream selected (`-extra`/`--`). They
+        // are never init arguments; `parse_with_env` replaces them with the merged form's
+        // tails when the `ERL_*FLAGS` entities contribute any of their own.
+        plain_args: plain,
     })
 }
 
@@ -751,10 +539,6 @@ struct Builder {
     max_ports: Option<usize>,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
     init_args: InitArgs,
-    /// The **plain arguments** collected so far, in command-line order: a stray positional
-    /// token (the C `init`'s `arg`), then everything after `-extra` (its
-    /// `start_extra_arg` clause) — the `init:get_plain_arguments/0` source.
-    plain_args: Vec<String>,
     /// The perf-map / JIT-dump surface (`+JPperf`/`+JPperfdirectory`) being assembled
     /// (contract A.8).
     perf_map: PerfMapConfig,
@@ -895,6 +679,319 @@ impl Builder {
     }
 }
 
+/// The **value-taking** `+` switches, longest spelling first.
+///
+/// `erl_init.c` reaches each of these through a `has_prefix` chain over `argv[i]+2` (the text
+/// after the `+`) and then reads its value with `get_arg(<switch text>, argv[i+1], &i)`: a
+/// non-empty remainder of the token **is** the value (`+hms233`, `+P65536`), and only an
+/// empty one takes the next token (`+hms 233`). The table is ordered longest-first so a
+/// prefix match resolves `+hmaxk`/`+hmaxel`/`+hmaxib` as themselves and never as `+hmax`,
+/// `+hmbs` as itself and never as `+hms`, `+JPperfdirectory` as itself and never as
+/// `+JPperf`, and `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio` as themselves and never as `+S`.
+///
+/// * The `+s*` scheduler sub-parameter family is **not** listed here: its spelling is data
+///   (twenty `has_prefix` rows, `erl_init.c:1922-2210`), so it is resolved by
+///   [`flags::scheduler_value_switch`] against `flags::SCHEDULER_SUB_OPTIONS`.
+/// * `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio` are the scheduler-*size* switches — a `+S` plus a
+///   letter, `erl_init.c:955-1140` (skipped again by `:1907-1920`). Note the case: these
+///   are `+S`, never the `+s` family.
+/// * `+ec` is deliberately absent: it is the ETS-compression switch, not `+e` with the
+///   value `c` (`erl_init.c:1692`).
+const PLUS_VALUE_SWITCHES: &[&str] = &[
+    "+JPperfdirectory",
+    "+SDPcpu",
+    "+hmaxel",
+    "+hmaxib",
+    "+JPperf",
+    "+SDcpu",
+    "+hmaxk",
+    "+hmax",
+    "+hmbs",
+    "+SDio",
+    "+hms",
+    "+SP",
+    "+S",
+    "+P",
+    "+A",
+    "+Q",
+    "+K",
+    "+t",
+    "+e",
+];
+
+/// The value-taking `+` switch `argument` names, if any: the **longest** entry of
+/// [`PLUS_VALUE_SWITCHES`] that prefixes it.
+fn plus_value_switch(argument: &str) -> Option<&'static str> {
+    PLUS_VALUE_SWITCHES
+        .iter()
+        .copied()
+        .find(|switch| argument.starts_with(switch))
+}
+
+/// Parses one **`+`-flag** (an emulator switch), returning the index of the next switch.
+///
+/// The order is the C's: the `+B` break-handler family (which is *not* `get_arg`-shaped),
+/// the allocator `+M*` family (its own grammar, `erl_alloc.c:handle_args`), `+ec`, the
+/// value-taking switches of [`PLUS_VALUE_SWITCHES`] (attached or separated value, exactly
+/// `get_arg`), and finally a recognized-but-unmodeled spelling — accepted, never an `init`
+/// argument — or the emulator's `unknown flag -X` (exit 1, `erl_init.c:2488-2490`).
+fn parse_plus_switch(args: &[String], index: usize, builder: &mut Builder) -> Result<usize> {
+    let argument = args[index].as_str();
+    // `+B [c|d|i]` (and the in-token `+Bi`/`+Bc`/`+Bd`) — the break-handler switch
+    // (`erl_init.c:1822-1843`). It never rejects a value: an unrecognized one falls to the
+    // `+B` arm (`have_break_handler = 0`). Only `+B i` sets `ignore_break`, which
+    // `erlang:system_info(break_ignored)` reports (see `crate::info::system`). The switch
+    // and its value are preserved verbatim so that derivation can read them; a valueless
+    // `+B` preserves an empty value so the `(switch, value)` stride stays even.
+    //
+    // The oracle's `+B` consumes a following single-letter `i`/`c`/`d` (setting the break
+    // mode) and otherwise emits `-B` alone, leaving the token as a **plain positional**
+    // `init` argument — which the oracle then answers by starting its interactive shell.
+    // This runtime has no interactive shell, so the token is consumed and ignored instead:
+    // the exit status (`+B x` ⇒ 0) matches the oracle, and that status is the observable.
+    if argument == "+B" {
+        let value = match args.get(index + 1) {
+            Some(candidate) if !is_switch(candidate) => candidate.clone(),
+            _ => String::new(),
+        };
+        let consumed = !value.is_empty();
+        builder.preserve("+B", &value);
+        return Ok(index + if consumed { 2 } else { 1 });
+    }
+    // `+Bi`/`+Bc`/`+Bd` are in-token values (`argv[i][2]`), not `get_arg` values.
+    if let Some(mode) = argument
+        .strip_prefix("+B")
+        .filter(|rest| matches!(*rest, "i" | "c" | "d"))
+    {
+        builder.preserve("+B", mode);
+        return Ok(index + 1);
+    }
+    // A `+M*` allocator flag has its own grammar, including its own in-token/next-token
+    // value reader (`flags::parse_allocator`, `erl_alloc.c:1115-1131`).
+    if flags::is_allocator_switch(argument) {
+        return flags::parse_allocator(argument, args, index);
+    }
+    // `+ec` is the ETS-compression switch: it reads no value at all.
+    if argument == "+ec" {
+        return Ok(index + 1);
+    }
+    if let Some(switch) = plus_value_switch(argument) {
+        let (value, next) = plus_arg_of(args, index, switch, &argument[switch.len()..])?;
+        apply_plus_value(builder, switch, &value)?;
+        return Ok(next);
+    }
+    // The `+s*` scheduler sub-parameters (`+sbwt medium`, `+sbwtmedium`, `+scl false`, …): the
+    // spelling after the `+s` is data, so it is resolved against the sub-option table and
+    // the canonical switch is rebuilt from it.
+    if let Some(sub_option) = flags::scheduler_value_switch(argument) {
+        let switch = format!("+s{sub_option}");
+        let (value, next) = plus_arg_of(args, index, &switch, &argument[switch.len()..])?;
+        apply_plus_value(builder, &switch, &value)?;
+        return Ok(next);
+    }
+    // The `erlexec` default: an unrecognized `+X` is rewritten to `-X` and handed to the
+    // emulator, which prints `unknown flag -X` and exits **1** for a flag it has no `case`
+    // for (`erl_init.c:2488-2490`). A *recognized* spelling (`+Weird`, `+spp true`, …) is
+    // accepted and consumed like any other emulator flag, and is never an `init` argument.
+    if !flags::emulator_flag_recognized(&argument[1..]) {
+        return Err(error::unknown_flag(argument));
+    }
+    Ok(builder.record_unmodeled(args, index))
+}
+
+/// Applies the value of the value-taking `+` switch `switch`.
+///
+/// One arm per switch, carrying the validation, the effect and the `preserve` call that
+/// switch has always had — so the attached (`+S1`) and separated (`+S 1`) spellings are
+/// indistinguishable to everything downstream, `extra_emulator_flags` included (its
+/// `(switch, value)` two-token stride is kept even when the value arrived attached).
+fn apply_plus_value(builder: &mut Builder, switch: &str, value: &str) -> Result<()> {
+    match switch {
+        "+Q" => {
+            builder.max_ports = flags::parse_max_ports("+Q", value)?;
+            builder.preserve("+Q", value);
+        }
+        "+K" => {
+            // The emulator only `get_arg`s the value — there is **no** validation
+            // (`erl_check_io.c:2467`) — so every value is accepted, `+K bogus` and `+Kbogus`
+            // (which consumes whatever follows, blindly) included.
+            flags::parse_kernel_poll("+K", value)?;
+            builder.preserve("+K", value);
+        }
+        "+sbt" => {
+            flags::parse_sbt("+sbt", value)?;
+            builder.preserve("+sbt", value);
+        }
+        // `+sbwt`/`+sbwtdcpu`/`+sbwtdio N` — the busy-wait thresholds
+        // (`erl_init.c:1963-1987`). The C compares the value against six **spin-count** names
+        // and refuses everything else, so this is a symbolic-set-only switch: a numeric value
+        // is a usage error, never an `atoi` read (`+sbwt 1000` exits 1 in the oracle).
+        "+sbwt" | "+sbwtdcpu" | "+sbwtdio" => {
+            flags::parse_busy_wait_threshold(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+t N` — the atom-table size (`erl_init.c:2217-2234`); the value is
+        // validated and preserved verbatim, so `atom_limit` can follow it
+        // (`crate::info::limits`). Like every `+`-flag it is not an init argument.
+        "+t" => {
+            flags::parse_atom_table_size("+t", value)?;
+            builder.preserve("+t", value);
+        }
+        // `+e N` — the maximum number of ETS tables (`erl_init.c:1696-1707`); only a
+        // negative value is rejected; `ets_limit` follows the value (see
+        // `crate::info::limits`).
+        "+e" => {
+            flags::parse_ets_tables("+e", value)?;
+            builder.preserve("+e", value);
+        }
+        "+S" => {
+            let (total, online) = parse_schedulers(value)?;
+            builder.emulator.schedulers = total;
+            builder.online_schedulers = online;
+        }
+        "+A" => {
+            // The async-thread pool is not modelled by the runtime core; it is
+            // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
+            // The emulator's reader is a bare `atoi`, so any value is accepted (junk
+            // parses to 0: `+A abc` exits 0) and only a **negative** result is rejected
+            // (`+A -5` exits 1).
+            if flags::atoi(value) < 0 {
+                return Err(error::bad_switch_value("+A", value));
+            }
+            builder.preserve("+A", value);
+        }
+        "+P" => builder.emulator.max_processes = flags::parse_max_processes("+P", value)?,
+        "+hms" => {
+            let raw = parse_heap_words("+hms", value)?;
+            // The **raw** value is what the `+hmax` ordering rule compares against
+            // (`erl_init.c:1564` sets `H_MIN_SIZE` unrounded; the growth-table rounding
+            // runs after the whole command line, `:283`), so it is recorded before the
+            // options round it.
+            builder.raw_min_heap_words = raw;
+            builder.heap.set_min_heap_words(raw);
+        }
+        "+hmbs" => builder
+            .heap
+            .set_min_bin_vheap_words(parse_heap_words("+hmbs", value)?),
+        "+hmax" => {
+            let max = parse_max_heap_size(value)?;
+            // The C's **order-dependent** parse-time rule (`erl_init.c:1634-1639`): when a
+            // `+hmax` is parsed and a **previous** one set a nonzero `H_MAX_SIZE` that is
+            // now below the current `H_MIN_SIZE` (raw, as parsed at `erl_init.c:1564` — the
+            // growth-table rounding at `:283` runs after the whole command line), the
+            // invocation is rejected. It compares the *previous* value, so
+            // `+hmax 500 +hms 4000` is accepted (and the boot process is then killed at
+            // runtime) while `+hmax 500 +hms 1000 +hmax 200` is a usage error.
+            if builder.rejects_max_heap(max) {
+                return Err(error::max_heap_below_min_heap(
+                    value,
+                    builder.raw_min_heap_words(),
+                ));
+            }
+            builder.heap.set_max_heap_words(max);
+        }
+        "+hmaxk" | "+hmaxel" | "+hmaxib" => builder.set_max_heap_flag(switch, value)?,
+        // The perf-map / JIT-dump surface (contract A.8). The two switches are emulator
+        // flags: they are validated here, preserved verbatim in `extra_emulator_flags`
+        // and **never** an `init` argument (like `+Q`/`+K`/`+sbt`). `+JPperfdirectory`'s
+        // value is taken verbatim — an unusable directory surfaces as a failed file
+        // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
+        "+JPperf" => {
+            builder.perf_map.set_flag(value)?;
+            builder.preserve("+JPperf", value);
+        }
+        "+JPperfdirectory" => {
+            builder.perf_map.set_directory(value.to_string());
+            builder.preserve("+JPperfdirectory", value);
+        }
+        // The rest of the `+s*` scheduler sub-parameter family (`erl_init.c:1922-2210`), each
+        // with the value grammar the C gives it. The validation never changes the effect
+        // (none of these is modelled): the pair is preserved verbatim either way.
+        //
+        // `+scl`/`+spp`/`+sub` — the three scheduler booleans (`:1988-2001`, `:2043-2053`,
+        // `:2064-2082`): exactly `true`/`false`.
+        "+scl" | "+spp" | "+sub" => {
+            flags::parse_scheduler_boolean(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+sws`/`+swt`/`+swct` — the three named scheduler tuning families (`:2084-2121`):
+        // the wakeup strategy, the wakeup threshold and the wake-cleanup threshold, each a
+        // closed symbolic set.
+        "+sws" => {
+            flags::parse_wakeup_strategy(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        "+swt" => {
+            flags::parse_wakeup_threshold(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        "+swct" => {
+            flags::parse_wake_cleanup_threshold(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+stbt` — the same nine bind types as `+sbt` (`:2055-2062` calls the same
+        // `erts_init_scheduler_bind_type_string`), so the one table is reused; only an
+        // `invalid type` result is fatal there (`not supported`/`no cpu topology` pass).
+        "+stbt" => {
+            flags::parse_sbt("+stbt", value)?;
+            builder.preserve("+stbt", value);
+        }
+        // `+sss`/`+sssdcpu`/`+sssdio` — the suggested thread stack sizes (`:2163-2204`):
+        // `atoi` then `20..=8192` kilo words.
+        "+sss" | "+sssdcpu" | "+sssdio" => {
+            flags::parse_sched_thread_stack_size(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+sfwi N` — the forced-wakeup interval (`:2206-2216`): `strtol` + `errno`, and a
+        // negative result is refused (`+sfwi -1` exits 1, `+sfwi x` exits 0).
+        "+sfwi" => {
+            flags::parse_forced_wakeup_interval(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+secio V` — **no validation at all**, and deliberately so: the C reads the value
+        // with `get_arg` only to discard it ("ignore argument, eager check io no longer used",
+        // `:2037-2041`), so `+secio bogus` exits 0 in the oracle.
+        "+secio" => builder.preserve(switch, value),
+        // `+SP`/`+SDPcpu` — the scheduler **percentage** switches (`early_init`,
+        // `:955-1022`): the `+S`-shaped `sscanf` cascade whose only test is negativity, with no
+        // upper bound (`+SP 50`, `+SP 100:100` and `+SP :3` are fine; `+SP -1` is not).
+        "+SP" | "+SDPcpu" => {
+            flags::parse_scheduler_percent(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // `+SDcpu` — the dirty-CPU scheduler count: the `+S` cascade *and* `chk_S` bounds
+        // (`1..=1024`, online `1..=total`), so a non-positive half is an offset from the
+        // default and `+SDcpu -1` is accepted.
+        "+SDcpu" => {
+            let default_schedulers = crate::info::logical_processors();
+            flags::parse_dirty_cpu_schedulers(
+                switch,
+                value,
+                default_schedulers,
+                default_schedulers,
+            )?;
+            builder.preserve(switch, value);
+        }
+        // `+SDio` — the dirty-I/O scheduler count: `atoi` then `1..=1024` (`+SDio 0` and
+        // `+SDio 1025` are refused, `+SDio abc` `atoi`s to `0` and is refused too).
+        "+SDio" => {
+            flags::parse_dirty_io_schedulers(switch, value)?;
+            builder.preserve(switch, value);
+        }
+        // The remaining `+s*` sub-parameter is `+sct`, whose value is **not** a scalar but the
+        // full CPU-topology token language (`erts/emulator/beam/erts_cpu_topology.c:1076-1300`:
+        // `cpus`/`cpu`/`node`/`core`/`thread`/`processor` nodes, `id=…`/`logical=…`,
+        // `/`-separated lists, `;`-separated declarations). Its grammar is deliberately **not**
+        // modelled here, so `+sct` stays accepted-and-preserved rather than half-validated.
+        //
+        // `+swtdcpu`/`+swtdio` (the per-scheduler-type wakeup thresholds,
+        // `erts_sched_set_wakeup_other_threshold`) are likewise preserved unvalidated: this
+        // runtime models no scheduler pool for them to configure.
+        _ => builder.preserve(switch, value),
+    }
+    Ok(())
+}
+
 /// Whether `argument` looks like an emulator switch.
 fn is_switch(argument: &str) -> bool {
     argument.starts_with('-') || argument.starts_with('+')
@@ -939,85 +1036,40 @@ fn value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
         .ok_or_else(|| error::missing_value(switch))
 }
 
-/// The `+`-switches whose value the C reads with its attached-or-separated rule
-/// ([`plus_value_of`]), as `(the letters after the `+`, the switch they spell)`.
-const ATTACHED_PLUS_SWITCHES: [(&str, &str); 7] = [
-    ("A", "+A"),
-    ("P", "+P"),
-    ("Q", "+Q"),
-    ("K", "+K"),
-    ("t", "+t"),
-    ("e", "+e"),
-    ("sbt", "+sbt"),
-];
-
-/// The switch the token `token` **spells**: the canonical `+`-switch name when the token is
-/// an attached spelling of one of them (`+S1` → `+S`, `+SP50` → `+SP`, `+sbtu` → `+sbt`),
-/// otherwise `token` itself.
+/// The value of a **`+`-switch** and the index of the next switch — the emulator's own
+/// `get_arg(char *rest, char *next, int *ip)` (`erl_init.c:496-509`) reproduced.
 ///
-/// The C's argument loop reads a `+`-switch's value with `get_arg(argv[i] + n, argv[i+1],
-/// &i)` (`erts/emulator/beam/erl_init.c:496-508`): anything **attached** to the switch
-/// letters *is* the value, so `+S1`, `+A0` and `+sbtu` are the same switches as `+S 1`,
-/// `+A 0` and `+sbt u`. Resolving the token to its switch here lets every arm below handle
-/// both spellings, with [`plus_value_of`] splitting off the attached remainder.
+/// A non-empty `rest` — the token's own remainder after the switch text — **is** the value
+/// and consumes no further token; an empty one takes the following token and steps over it.
+/// Every value-taking `+` switch calls `get_arg(argv[i]+2, argv[i+1], &i)` (and the `+s*`
+/// family `get_arg(sub_param+N, argv[i+1], &i)`), so `+S1`, `+A0`, `+P65536`, `+hms233`,
+/// `+hmaxktrue` and `+sbtu` name exactly the switches `+S 1`, `+A 0`, `+P 65536`,
+/// `+hms 233`, `+hmaxk true` and `+sbt u` do — and a real `erlc` launches the emulator with
+/// the attached forms (`+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput …`).
 ///
-/// `+S` is the one family with sub-forms, chosen — as in the C — by the first attached
-/// character (`argv[i][2]`, `erl_init.c:966`, `:1001`): `P` is the scheduler percentage
-/// (`+SP`), `Dcpu`/`DPcpu`/`Dio` are the dirty-scheduler switches, and everything else
-/// (including nothing) is the plain `+S`.
-fn plus_switch_of(token: &str) -> &str {
-    let Some(rest) = token.strip_prefix('+') else {
-        return token;
-    };
-    if let Some(after_s) = rest.strip_prefix('S') {
-        return match after_s {
-            attached if attached.starts_with("Dcpu") => "+SDcpu",
-            attached if attached.starts_with("DPcpu") => "+SDPcpu",
-            attached if attached.starts_with("Dio") => "+SDio",
-            attached if attached.starts_with('P') => "+SP",
-            _ => "+S",
-        };
-    }
-    match ATTACHED_PLUS_SWITCHES
-        .iter()
-        .find(|(letters, _)| rest.starts_with(letters))
-    {
-        Some((_, switch)) => switch,
-        None => token,
-    }
-}
-
-/// The value of the **`+`-switch** `switch`, which the token at `args[index]` spells as
-/// `token`, together with the index of the next switch.
-///
-/// This is the C's `get_arg` rule (`erts/emulator/beam/erl_init.c:496-508`): when the
-/// characters **attached** to the switch are non-empty they *are* the value — nothing else
-/// is consumed (`+S1` is `+S 1`, `+A0` is `+A 0`) — and only when they are empty (or absent)
-/// is the **next** token the value, still consumed **blindly**.
-///
-/// That blind consumption is the oracle launcher's `NEXT_ARG_CHECK_NAMED`
-/// (`erts/etc/common/erlexec.c:414-418`, with `sep = "--"` at 193): it rejects the switch
-/// only when it is the **last** token or the next token is exactly `--`; every other
-/// following token is taken as the value, even one that itself looks like a switch. So
-/// `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value (the `-eval` never runs) and
-/// exits 0, while `erl -noshell ... +K` and `erl +K -- ...` exit **1** with
-/// `Missing argument(s) for '+K'.`
+/// The oracle launcher's `NEXT_ARG_CHECK_NAMED` (`erts/etc/common/erlexec.c:414-418`, with
+/// `sep = "--"` at 193) rejects the switch only when it is the **last** token or the next
+/// token is exactly `--`; every other following token is taken as the value, even one that
+/// itself looks like a switch. So `erl +K -eval 'halt(0).'` consumes `-eval` as `+K`'s value
+/// (the `-eval` never runs) and exits 0, while `erl -noshell ... +K` and `erl +K -- ...`
+/// exit **1** with `Missing argument(s) for '+K'.`
 ///
 /// That diagnostic is the launcher's, so the error is [`error::missing_switch_operand`] (a
 /// flag rejection, exit 1), **not** [`error::missing_value`] (this CLI's usage status).
-fn plus_value_of(
-    args: &[String],
-    index: usize,
-    token: &str,
-    switch: &str,
-) -> Result<(String, usize)> {
-    if let Some(attached) = token.strip_prefix(switch).filter(|rest| !rest.is_empty()) {
-        return Ok((attached.to_string(), index + 1));
+fn plus_arg_of(args: &[String], index: usize, switch: &str, rest: &str) -> Result<(String, usize)> {
+    if !rest.is_empty() {
+        return Ok((rest.to_string(), index + 1));
     }
     match args.get(index + 1) {
         Some(next) if next != "--" => Ok((next.clone(), index + 2)),
         _ => Err(error::missing_switch_operand(switch)),
     }
+}
+
+/// The operand of a **`-`-switch** (`-name`/`-sname`), consumed **blindly** — the separated
+/// form of [`plus_arg_of`], with the same launcher diagnostic on a missing operand.
+fn plus_value_of(args: &[String], index: usize, switch: &str) -> Result<String> {
+    plus_arg_of(args, index, switch, "").map(|(value, _next)| value)
 }
 
 /// `-eval` tolerates **one** trailing `.` (the shell-style statement terminator):
@@ -1027,13 +1079,6 @@ fn strip_trailing_dot(expr: &str) -> String {
         Some(head) => head.to_string(),
         None => expr.to_string(),
     }
-}
-
-/// Parses a `u32` switch value.
-fn parse_u32(switch: &str, value: &str) -> Result<u32> {
-    value
-        .parse::<u32>()
-        .map_err(|_| error::bad_switch_value(switch, value))
 }
 
 /// Parses a `+hms` / `+hmbs` heap-size value with the C's own `atoi` reader, so a value
@@ -1072,52 +1117,47 @@ fn parse_max_heap_size(value: &str) -> Result<usize> {
 
 /// Parses the `+S N[:N]` value into `(total, online)`.
 ///
-/// Both halves are `Option`: `0` is the oracle's "use the default" spelling, so
-/// `+S 0` and `+S 0:0` select the defaults for both counts (`None`/`None`).
+/// Both halves are `Option`: `None` is "the default", so `+S 0` and `+S 0:0` select the
+/// defaults for both counts, and a total of `None` is the `:Online`-only spelling `+S :3`
+/// (the C's `tot = no_schedulers`).
 ///
-/// The grammar is `erl_init.c:1107-1153`:
-/// * `+S Total` — the online count is **not** the total: the C sets it to
-///   `min(Total, <default online>)` (`onln = tot < schdlrs_onln ? tot : schdlrs_onln`),
-///   which is why `erl +S 16` reports `16` schedulers but only `14` online on a
-///   16-CPU box. That resolution needs the host's processor count, so it happens where
-///   the value is answered ([`crate::info`]'s `schedulers_online`), not here.
-/// * `+S Total:Online` — the online count is explicit and must be `1..=Total`
-///   (`bad amount of schedulers online`); `+S 4:5` and `+S 4:0` are rejected, while
-///   `+S 0:2` is accepted (the total defaults to the processor count).
-/// * Anything else (`+S 1:2:3`, a non-number) is rejected.
+/// The grammar is `erl_init.c:1107-1153`, a **`sscanf` cascade** — not a `split(':')`:
+/// * `sscanf(arg, "%d:%d")` converts two fields ⇒ both halves were given. The `%d` conversion
+///   is a digit prefix and the literal `:` must follow it **immediately**, which is why
+///   `+S 4:5x` is a pair (`4`, `5` — trailing junk ignored) while `+S 1bogus:2` is the single
+///   field `1` and the `:2` is never read.
+/// * one field ⇒ only the total. The online count is then `min(total, <default online>)`
+///   (`onln = tot < schdlrs_onln ? tot : schdlrs_onln`), which is why `erl +S 16` reports `16`
+///   schedulers but only `14` online on a 16-CPU box. That resolution needs the host's
+///   processor count, so it happens where the value is answered ([`crate::info`]'s
+///   `schedulers_online`), not here.
+/// * no field, but `sscanf(arg, ":%d")` converts one ⇒ `+S :Online`, the total defaulting to
+///   the processor count. Anything else (`+S abc`) is `bad amount of schedulers <value>`.
+/// * a **non-positive** half is an offset from the default (`+S -1` is one fewer than the
+///   processor count), which is the C's `schdlrs = tot > 0 ? tot : no_schedulers + tot`.
+/// * the resolved total must land in `1..=ERTS_MAX_NO_OF_SCHEDULERS` (1024) and the online
+///   count in `1..=total`; `+S 4:5` and `+S 4:0` are rejected, while `+S 0:2`, `+S 4:x` and
+///   `+S 1bogus:2` are accepted.
 ///
 /// A malformed value is the emulator's own rejection: the oracle prints
 /// `bad amount of schedulers <value>` plus its usage text and exits **1**, and this
 /// runtime reports that same exit status with its one-line diagnostic.
 fn parse_schedulers(value: &str) -> Result<(Option<u32>, Option<u32>)> {
-    let mut parts = value.split(':');
-    let total = parse_u32("+S", parts.next().unwrap_or(value))?;
-    let online = match parts.next() {
-        Some(online) => Some(parse_u32("+S", online)?),
-        None => None,
-    };
-    if parts.next().is_some() {
-        return Err(error::bad_switch_value("+S", value));
-    }
-    // `0` selects the default of that count; an explicit total of `0` therefore means
-    // "the processor count".
-    let schedulers = (total > 0).then_some(total);
-    let online = match online {
-        // `+S 0:0` is the all-defaults spelling.
-        Some(0) if total == 0 => None,
-        Some(online) if online > 0 => {
-            let ceiling = schedulers.unwrap_or_else(|| {
-                // The default total the online count can never exceed.
-                u32::try_from(crate::info::logical_processors()).unwrap_or(u32::MAX)
-            });
-            if online > ceiling {
-                return Err(error::bad_switch_value("+S", value));
-            }
-            Some(online)
-        }
-        Some(_) => return Err(error::bad_switch_value("+S", value)),
-        None => None,
-    };
+    let default_total = crate::info::logical_processors();
+    let pair = flags::scan_count_pair(value)
+        .ok_or_else(|| error::bad_switch_value("+S", value))?;
+    let (total, online) = flags::resolve_scheduler_counts(pair, default_total, default_total)
+        .ok_or_else(|| error::bad_switch_value("+S", value))?;
+    // A resolved figure that *is* the default is stored as the default, so only an explicit
+    // value reaches the configuration (and `+S 0` stays indistinguishable from no `+S`).
+    // The derived online half is answered downstream by
+    // [`crate::info::schedulers_online_count`]'s `min(total, <default online>)` rule, so it is
+    // deliberately **not** recorded here — one source of truth for the derivation.
+    let schedulers = (total != default_total).then_some(total as u32);
+    // The derived online count is `min(total, <default online>)`. An explicit half that
+    // already equals it is likewise the default, so `+S 0:0` records nothing at all.
+    let derived_online = total.min(default_total);
+    let online = (pair.1.is_some() && online != derived_online).then_some(online as u32);
     Ok((schedulers, online))
 }
 
@@ -2256,7 +2296,9 @@ mod tests {
         assert_eq!(config.emulator.schedulers, None);
         assert_eq!(config.init_args.get("A"), None);
         assert!(parse_args(&["+S", "x"]).is_err());
-        assert!(parse_args(&["+S", "1:x"]).is_err());
+        // `. . . but a trailing field that never converts is ignored` (`erl +S 1:x` is a
+        // bare total of 1 in the oracle, so it is accepted here too).
+        assert_eq!(parsed(&["+S", "1:x"]).emulator.schedulers, Some(1));
         assert!(parse_args(&["+P", "-1"]).is_err());
         // `+A` uses the C's bare `atoi`, so a value that parses to a non-negative result —
         // junk like `many`/`abc` included (both parse to 0) — is accepted (`erl +A abc
@@ -2270,173 +2312,7 @@ mod tests {
         assert!(parse_args(&["+S"]).is_err());
     }
 
-    /// The C's **attached-or-separated** value rule (`erts/emulator/beam/erl_init.c:496-508`,
-    /// `get_arg`): a `+`-switch may carry its value in the same token, and `+S1` / `+A0` /
-    /// `+P65536` / `+Q1024` / `+Ktrue` / `+sbtu` are the same switches as the two-token
-    /// spellings `+S 1` / `+A 0` / `+P 65536` / `+Q 1024` / `+K true` / `+sbt u`.
-    ///
-    /// This is the spelling the real `erlc` front end hands the runtime
-    /// (`+S1 +sbtu +A0 +P 65536 +Q 1024 -noinput -mode minimal …`), so a scheduler-bind
-    /// value and a scheduler count arriving attached must not be the emulator's
-    /// `unknown flag` refusal.
-    #[test]
-    fn attached_plus_switch_values_are_the_separated_switches() {
-        // `+S1` — the scheduler count, *identical* to `+S 1` in every observable.
-        let attached = parsed(&["+S1"]);
-        let separated = parsed(&["+S", "1"]);
-        assert_eq!(attached.emulator.schedulers, Some(1));
-        assert_eq!(attached.emulator.schedulers, separated.emulator.schedulers);
-        assert_eq!(attached.online_schedulers, separated.online_schedulers);
-        assert_eq!(attached.action, separated.action);
-        assert_eq!(
-            attached.emulator.extra_emulator_flags,
-            separated.emulator.extra_emulator_flags
-        );
-        assert_eq!(attached.init_args.get("S"), None);
-
-        // The `total:online` form, in one token.
-        let config = parsed(&["+S2:1"]);
-        assert_eq!(config.emulator.schedulers, Some(2));
-        assert_eq!(config.online_schedulers, Some(1));
-        // `+S 0` selects the defaults in both spellings (`parse_schedulers`'s `0` rule), so
-        // the attached `+S0` is the same non-refusal.
-        assert_eq!(parsed(&["+S0"]).emulator.schedulers, None);
-        assert_eq!(
-            parsed(&["+S0"]).emulator.schedulers,
-            parsed(&["+S", "0"]).emulator.schedulers
-        );
-        // `+S:2` behaves exactly like the separated `+S :2` — whatever that is, the two
-        // spellings cannot disagree (both are the current parser's refusal of an empty
-        // total; the C's `:%d` online-only form is not modelled by `parse_schedulers`).
-        assert_eq!(
-            parse_args(&["+S:2"]).is_err(),
-            parse_args(&["+S", ":2"]).is_err()
-        );
-
-        // Each attached spelling preserves the same `(switch, value)` pair as the separated
-        // one, and every one of them is refused when its value is malformed.
-        for (attached_args, separated_args, switch, value) in [
-            (&["+A0"][..], &["+A", "0"][..], "+A", "0"),
-            (&["+P65536"][..], &["+P", "65536"][..], "+P", "65536"),
-            (&["+Q1024"][..], &["+Q", "1024"][..], "+Q", "1024"),
-            (&["+Ktrue"][..], &["+K", "true"][..], "+K", "true"),
-            (&["+sbtu"][..], &["+sbt", "u"][..], "+sbt", "u"),
-            (&["+t8192"][..], &["+t", "8192"][..], "+t", "8192"),
-            (&["+e100"][..], &["+e", "100"][..], "+e", "100"),
-        ] {
-            let config = parsed(attached_args);
-            let separated = parsed(separated_args);
-            assert_eq!(
-                config.emulator.extra_emulator_flags,
-                separated.emulator.extra_emulator_flags,
-                "{attached_args:?}"
-            );
-            // `+P` is modelled rather than preserved, so its channel is empty; every other
-            // switch in the table carries exactly its own pair.
-            if config.emulator.extra_emulator_flags.is_empty() {
-                assert_eq!(switch, "+P", "only +P is modelled instead of preserved");
-            } else {
-                assert_eq!(
-                    config.emulator.extra_emulator_flags,
-                    vec![switch.to_string(), value.to_string()],
-                    "{attached_args:?}"
-                );
-            }
-            assert_eq!(
-                config.emulator.max_processes,
-                separated.emulator.max_processes
-            );
-            assert_eq!(config.max_ports, separated.max_ports);
-            assert_eq!(config.action, separated.action);
-            assert_eq!(config.init_args.get(flag_name(switch)), None);
-        }
-        assert_eq!(parsed(&["+P65536"]).emulator.max_processes, Some(65_536));
-        assert_eq!(parsed(&["+Q1024"]).max_ports, Some(1024));
-
-        // The `+S` sub-forms: a percentage and a dirty-scheduler count are validated and
-        // preserved verbatim (this runtime has no percentage sizing and no dirty
-        // schedulers, so they have no runtime-visible effect).
-        for (args, switch, value) in [
-            (&["+SP50"][..], "+SP", "50"),
-            (&["+SDPcpu50"][..], "+SDPcpu", "50"),
-            (&["+SDcpu2"][..], "+SDcpu", "2"),
-            (&["+SDio2"][..], "+SDio", "2"),
-        ] {
-            let config = parsed(args);
-            assert_eq!(
-                config.emulator.extra_emulator_flags,
-                vec![switch.to_string(), value.to_string()],
-                "{args:?}"
-            );
-            assert_eq!(config.emulator.schedulers, None, "{args:?}");
-            assert_eq!(config.init_args.get(flag_name(switch)), None, "{args:?}");
-        }
-        // … and the separated spellings of the same sub-forms.
-        for (args, switch, value) in [
-            (&["+SP", "50"][..], "+SP", "50"),
-            (&["+SDcpu", "2"][..], "+SDcpu", "2"),
-        ] {
-            assert_eq!(
-                parsed(args).emulator.extra_emulator_flags,
-                vec![switch.to_string(), value.to_string()],
-                "{args:?}"
-            );
-        }
-
-        // Still refused, in **both** spellings, as the emulator refuses them (`bad amount of
-        // schedulers`, `invalid type`, `bad number of async threads`): a non-numeric or
-        // out-of-range value is never accepted just because it arrived attached.
-        for args in [
-            &["+Sabc"][..],
-            &["+S", "abc"][..],
-            &["+S4:5"][..],
-            &["+S", "4:5"][..],
-            &["+sbtzz"][..],
-            &["+sbt", "zz"][..],
-            &["+A", "-5"][..],
-            &["+SPabc"][..],
-            &["+SP-5"][..],
-            &["+SDcpuabc"][..],
-            &["+SDPcpu-5"][..],
-            &["+SDio0"][..],
-            &["+P1000"][..],
-            &["+Q0"][..],
-        ] {
-            let error = parse_args(args).expect_err("a malformed value is refused");
-            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
-        }
-    }
-
-    /// An attached `+S`/`+A`/`+P`/`+Q`/`+K`/`+sbt` `/`+t`/`+e` spelling is consumed as one
-    /// token, so the switch after it is still parsed (nothing is swallowed as a value).
-    #[test]
-    fn an_attached_plus_value_consumes_only_its_own_token() {
-        let config = parsed(&["+S1", "+A0", "+sbtu", "+P65536", "+Q1024", "-eval", "halt(0)"]);
-        assert_eq!(config.emulator.schedulers, Some(1));
-        assert_eq!(config.emulator.max_processes, Some(65_536));
-        assert_eq!(config.max_ports, Some(1024));
-        assert_eq!(config.action, Action::Eval("halt(0)".to_string()));
-        assert_eq!(
-            config.emulator.extra_emulator_flags,
-            vec![
-                "+A".to_string(),
-                "0".to_string(),
-                "+sbt".to_string(),
-                "u".to_string(),
-                "+Q".to_string(),
-                "1024".to_string(),
-            ]
-        );
-        // A **missing** operand stays the launcher's exit-1 diagnostic rather than becoming
-        // an empty attached value.
-        for args in [&["+S"][..], &["+sbt"][..], &["+A"][..], &["+P"][..], &["+K"][..]] {
-            let error = parse_args(args).expect_err("a missing operand is refused");
-            assert!(
-                error::flag_rejected_diagnostic(&error).is_some(),
-                "{args:?}"
-            );
-        }
-    }    /// The `+hms`/`+hmbs` heap options, pinned against the oracle (OTP 29.1.1 /
+    /// The `+hms`/`+hmbs` heap options, pinned against the oracle (OTP 29.1.1 /
     /// erts-17.1):
     ///
     /// ```text
@@ -2932,65 +2808,6 @@ mod tests {
         assert_eq!(parsed(&["junk"]).action, Action::Boot);
     }
 
-    /// The **plain-argument** surface (contract A.6): the C `init`'s `Args` accumulator — a
-    /// stray positional `arg`, plus **everything** after `-extra`, verbatim and in order —
-    /// is [`RuntimeConfig::plain_args`], the source of `init:get_plain_arguments/0`.
-    ///
-    /// Oracle-verified (OTP 29.1.1 / erts-17.1): `erl -noshell -eval '…' -extra a b` ⇒
-    /// `["a","b"]` with `init:get_argument(extra)` = the bare atom `error`; `erl stray
-    /// -noshell -eval '…' -extra a b` ⇒ `["stray","a","b"]`; a `-eval` written **after** the
-    /// `-extra` never runs (it is a plain argument).
-    #[test]
-    fn extra_and_stray_positionals_are_the_plain_arguments() {
-        // The exact tail the real `erlc` front end appends, which
-        // `erl_compile:compile_cmdline/0` (`lib/stdlib/src/erl_compile.erl:53-56`) reads
-        // through `init:get_plain_arguments/0`.
-        let config = parsed(&[
-            "-noshell",
-            "-s",
-            "erl_compile",
-            "compile_cmdline",
-            "-extra",
-            "+deterministic",
-            "-o",
-            "/tmp/x",
-            "/tmp/s.erl",
-        ]);
-        assert_eq!(
-            config.plain_args,
-            vec!["+deterministic", "-o", "/tmp/x", "/tmp/s.erl"]
-        );
-        // `-extra` is **not** an init argument, and the Start instruction before it still
-        // took effect.
-        assert_eq!(config.init_args.get("extra"), None);
-        assert_eq!(
-            config.action,
-            Action::Apply {
-                module: "erl_compile".to_string(),
-                function: "compile_cmdline".to_string(),
-                args: Vec::new(),
-            }
-        );
-
-        // Nothing after `-extra` is a switch or a Start instruction any more: the `-eval`
-        // below is a plain argument and never replaces the action.
-        let config = parsed(&["-noshell", "-extra", "-eval", "halt(0)."]);
-        assert_eq!(config.plain_args, vec!["-eval", "halt(0)."]);
-        assert_eq!(config.action, Action::Boot);
-        assert_eq!(config.init_args.get("eval"), None);
-
-        // A stray positional token is the C's `arg`: it comes first, ahead of the `-extra`
-        // tail (`lists:reverse(As, Bs)`), and is never an init argument.
-        let config = parsed(&["stray", "-noshell", "-extra", "a", "b"]);
-        assert_eq!(config.plain_args, vec!["stray", "a", "b"]);
-        assert_eq!(config.init_args.get("stray"), None);
-        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
-
-        // Which is why a command line with neither answers the empty list, exactly as the
-        // oracle answers for the argv of an `-eval`/`-s`/`-run` invocation.
-        assert!(parsed(&["-noshell"]).plain_args.is_empty());
-        assert!(RuntimeConfig::default().plain_args.is_empty());
-    }
     /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
     /// each is an **init argument**, exactly as the oracle
     /// (`erl -setcookie abc -noshell -eval 'io:format("~w~n",[init:get_argument(setcookie)]), halt().'`
@@ -3101,7 +2918,7 @@ mod tests {
         assert_eq!(config.max_ports, None);
         // Without `+Q` there is no request either.
         assert_eq!(parsed(&[]).max_ports, None);
-        for value in ["1000", "0", "1023", "134217728", "abc", "1024abc", ""] {
+        for value in ["1000", "0", "1023", "134217728", "abc", ""] {
             let error = parse_args(&["+Q", value]).expect_err("a bad +Q value");
             assert_eq!(error::unsupported_reason(&error), None, "{value:?}");
         }
@@ -3148,6 +2965,676 @@ mod tests {
         for args in [&["+sbt", "bogus"][..], &["+sbt"][..]] {
             let error = parse_args(args).expect_err("a bad/missing +sbt value");
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The observable effect of a `+`-switch: every field an **attached** spelling (`+S1`)
+    /// and its **separated** twin (`+S 1`) must agree on.
+    #[derive(Debug, PartialEq)]
+    struct PlusEffect {
+        schedulers: Option<u32>,
+        online_schedulers: Option<u32>,
+        max_processes: Option<usize>,
+        max_ports: Option<usize>,
+        min_heap_words: usize,
+        min_bin_vheap_words: usize,
+        max_heap_words: usize,
+        max_heap_flags: MaxHeapFlags,
+        extra_emulator_flags: Vec<String>,
+    }
+
+    fn plus_effect(config: &RuntimeConfig) -> PlusEffect {
+        let options = config.heap_options();
+        let policy = options.policy();
+        PlusEffect {
+            schedulers: config.emulator.schedulers,
+            online_schedulers: config.online_schedulers,
+            max_processes: config.emulator.max_processes,
+            max_ports: config.max_ports,
+            min_heap_words: policy.min_heap_words,
+            min_bin_vheap_words: policy.min_bin_vheap_words,
+            max_heap_words: policy.max_heap_words,
+            max_heap_flags: options.max_heap_flags(),
+            extra_emulator_flags: config.emulator.extra_emulator_flags.clone(),
+        }
+    }
+
+    /// Asserts that the attached and the separated spelling of a `+`-switch are the **one**
+    /// switch: the C reads every value with `get_arg(argv[i]+2, argv[i+1], &i)`
+    /// (`erl_init.c:496-509`), where a non-empty remainder of the token *is* the value and
+    /// only an empty one takes the next token. Neither spelling may record an `init`
+    /// argument.
+    fn assert_attached_equals_separated(attached: &[&str], separated: &[&str]) {
+        let attached_config = parsed(attached);
+        let separated_config = parsed(separated);
+        assert_eq!(
+            plus_effect(&attached_config),
+            plus_effect(&separated_config),
+            "{attached:?} must mean {separated:?}"
+        );
+        assert!(
+            attached_config.init_args.is_empty(),
+            "{attached:?} is a `+`-flag: never an init argument"
+        );
+        assert_eq!(attached_config.action, separated_config.action, "{attached:?}");
+    }
+
+    /// The C's **attached** value forms (`erl_init.c`'s `get_arg`) — the spelling a real
+    /// `erlc` launches the emulator with (`+S1 +A0 …`). Each one must be indistinguishable
+    /// from its separated twin, down to the preserved `(switch, value)` pair.
+    #[test]
+    fn attached_plus_values_are_the_separated_spellings() {
+        for (attached, separated) in [
+            (&["+S1"][..], &["+S", "1"][..]),
+            (&["+S4:2"][..], &["+S", "4:2"][..]),
+            (&["+A0"][..], &["+A", "0"][..]),
+            (&["+A5"][..], &["+A", "5"][..]),
+            (&["+P65536"][..], &["+P", "65536"][..]),
+            (&["+Plegacy"][..], &["+P", "legacy"][..]),
+            (&["+Q1024"][..], &["+Q", "1024"][..]),
+            (&["+Ktrue"][..], &["+K", "true"][..]),
+            (&["+t100000"][..], &["+t", "100000"][..]),
+            (&["+e10000"][..], &["+e", "10000"][..]),
+            (&["+hms233"][..], &["+hms", "233"][..]),
+            (&["+hmbs5000"][..], &["+hmbs", "5000"][..]),
+            (&["+hmax1000000"][..], &["+hmax", "1000000"][..]),
+            (&["+hmaxktrue"][..], &["+hmaxk", "true"][..]),
+            (&["+hmaxeltrue"][..], &["+hmaxel", "true"][..]),
+            (&["+hmaxibtrue"][..], &["+hmaxib", "true"][..]),
+            // The scheduler-*size* switches are `+S` plus a letter — never the `+s` family,
+            // and never the bare `+S` they prefix.
+            (&["+SP50"][..], &["+SP", "50"][..]),
+            (&["+SDcpu50"][..], &["+SDcpu", "50"][..]),
+            (&["+SDPcpu50:25"][..], &["+SDPcpu", "50:25"][..]),
+            (&["+SDio25"][..], &["+SDio", "25"][..]),
+        ] {
+            assert_attached_equals_separated(attached, separated);
+        }
+        // The values themselves, not just the equality: an attached value has to *reach* the
+        // field its separated twin sets.
+        let config = parsed(&["+S1"]);
+        assert_eq!(config.emulator.schedulers, Some(1));
+        assert_eq!(config.online_schedulers, None);
+        assert_eq!(parsed(&["+S4:2"]).online_schedulers, Some(2));
+        assert_eq!(parsed(&["+P65536"]).emulator.max_processes, Some(65536));
+        assert_eq!(parsed(&["+Q1024"]).max_ports, Some(1024));
+        assert_eq!(
+            parsed(&["+A0"]).emulator.extra_emulator_flags,
+            vec!["+A".to_string(), "0".to_string()],
+            "the preserved pair stays two tokens even for an attached value"
+        );
+        assert!(parsed(&["+A0"]).init_args.get("A").is_none());
+        assert_eq!(
+            parsed(&["+Q1024"]).emulator.extra_emulator_flags,
+            vec!["+Q".to_string(), "1024".to_string()]
+        );
+        assert_eq!(
+            parsed(&["+hms233"]).heap_options().policy().min_heap_words,
+            parsed(&["+hms", "233"]).heap_options().policy().min_heap_words
+        );
+        assert!(parsed(&["+hmaxktrue"]).heap_options().max_heap_flags().kill);
+        assert!(!parsed(&["+hmaxkfalse"]).heap_options().max_heap_flags().kill);
+        // A recognized-but-unmodeled spelling keeps its verbatim pair too.
+        assert_eq!(
+            parsed(&["+SP50"]).emulator.extra_emulator_flags,
+            vec!["+SP".to_string(), "50".to_string()]
+        );
+    }
+
+    /// The `+s*` scheduler sub-parameter family (`erl_init.c:1922-2210`): the value may be
+    /// attached (`+sbwt1000`) or the next token (`+sbwt 1000`), and the preserved pair always
+    /// names the full sub-parameter spelling. Every one here exits 0 on the oracle.
+    #[test]
+    fn the_scheduler_sub_parameters_take_attached_values() {
+        for (attached, separated, switch, value) in [
+            (&["+sbtu"][..], &["+sbt", "u"][..], "+sbt", "u"),
+            (&["+sbwtmedium"][..], &["+sbwt", "medium"][..], "+sbwt", "medium"),
+            (
+                &["+sbwtdcpushort"][..],
+                &["+sbwtdcpu", "short"][..],
+                "+sbwtdcpu",
+                "short",
+            ),
+            (
+                &["+sbwtdionone"][..],
+                &["+sbwtdio", "none"][..],
+                "+sbwtdio",
+                "none",
+            ),
+            (&["+sclfalse"][..], &["+scl", "false"][..], "+scl", "false"),
+            (&["+spptrue"][..], &["+spp", "true"][..], "+spp", "true"),
+            (&["+sctts"][..], &["+sct", "ts"][..], "+sct", "ts"),
+            (&["+seciotrue"][..], &["+secio", "true"][..], "+secio", "true"),
+            (&["+sss64"][..], &["+sss", "64"][..], "+sss", "64"),
+            (&["+sssdcpu64"][..], &["+sssdcpu", "64"][..], "+sssdcpu", "64"),
+            (&["+sssdio64"][..], &["+sssdio", "64"][..], "+sssdio", "64"),
+            (&["+sfwi100"][..], &["+sfwi", "100"][..], "+sfwi", "100"),
+            (&["+stbtu"][..], &["+stbt", "u"][..], "+stbt", "u"),
+            (&["+swcteager"][..], &["+swct", "eager"][..], "+swct", "eager"),
+            (&["+subtrue"][..], &["+sub", "true"][..], "+sub", "true"),
+        ] {
+            assert_attached_equals_separated(attached, separated);
+            let config = parsed(attached);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec![switch.to_string(), value.to_string()],
+                "{attached:?} preserves its own (switch, value) pair"
+            );
+            assert!(
+                config.init_args.is_empty(),
+                "{attached:?} is an emulator flag: never an init argument"
+            );
+        }
+        // The longest-prefix rule: `+sbwtdcpu…` is never read as `+sbwt`, `+sssdcpu…` never
+        // as `+sss`/`+ss`, `+sssdio…` never as `+sss`.
+        assert_eq!(
+            parsed(&["+sbwtdcpumedium"]).emulator.extra_emulator_flags,
+            vec!["+sbwtdcpu".to_string(), "medium".to_string()]
+        );
+        assert_eq!(
+            parsed(&["+sssdcpu64"]).emulator.extra_emulator_flags,
+            vec!["+sssdcpu".to_string(), "64".to_string()]
+        );
+        // `+srct`/`+ssrct` read no value at all (`early_init` only sets a flag).
+        let config = parsed(&["+ssrct"]);
+        assert!(config.emulator.extra_emulator_flags.is_empty());
+        assert!(config.init_args.is_empty());
+        // `+ec` is the ETS-compression switch, not `+e` with the value `c`.
+        let config = parsed(&["+ec"]);
+        assert!(config.emulator.extra_emulator_flags.is_empty());
+        assert!(config.init_args.is_empty());
+    }
+
+    /// The exact emulator argv a real `erlc` launches (captured from `ERLC_EMULATOR`), which
+    /// is what made the attached forms load-bearing: `+S1 +sbtu +A0 +P 65536 +Q 1024`.
+    #[test]
+    fn the_real_erlc_argv_parses_to_the_compile_action() {
+        let config = parsed(&[
+            "+S1",
+            "+sbtu",
+            "+A0",
+            "+P",
+            "65536",
+            "+Q",
+            "1024",
+            "-noinput",
+            "-mode",
+            "minimal",
+            "-boot",
+            "no_dot_erlang",
+            "-s",
+            "erl_compile",
+            "compile_cmdline",
+            "-extra",
+            "Foo.erl",
+        ]);
+        assert_eq!(
+            config.action,
+            Action::Apply {
+                module: "erl_compile".to_string(),
+                function: "compile_cmdline".to_string(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(config.emulator.schedulers, Some(1));
+        assert_eq!(config.emulator.max_processes, Some(65536));
+        assert_eq!(config.max_ports, Some(1024));
+        assert_eq!(
+            config
+                .emulator
+                .extra_emulator_flags
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["+sbt", "u", "+A", "0", "+Q", "1024"],
+            "every attached value is preserved as its two-token pair"
+        );
+        // The launcher's `-` switches are init arguments; the `+` ones are not.
+        for name in ["S", "sbt", "A", "P", "Q", "s"] {
+            assert_eq!(config.init_args.get(name), None, "{name}");
+        }
+        assert_eq!(
+            config.init_args.get("mode"),
+            Some(vec![&["minimal".to_string()][..]])
+        );
+        assert_eq!(
+            config.init_args.get("noinput"),
+            Some(vec![&[][..]])
+        );
+        // The `-extra` tail is a **plain argument**, never an init argument: the real `erlc`
+        // hands the source file that way, so `init:get_plain_arguments/0` reports
+        // `["Foo.erl"]` and `init:get_argument(extra)` is the bare atom `error`.
+        assert_eq!(config.plain_args, vec!["Foo.erl".to_string()]);
+        assert_eq!(config.init_args.get("extra"), None);
+    }
+
+    /// `-extra` claims the whole rest of its own entity, a later switch-looking token
+    /// included, and neither the marker nor a token in the tail becomes an init argument.
+    #[test]
+    fn an_extra_claims_the_rest_of_its_entity_as_plain_arguments() {
+        let config = parsed(&["-noshell", "-extra", "a", "b", "-o", "outdir"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(
+            config.plain_args,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "-o".to_string(),
+                "outdir".to_string()
+            ]
+        );
+        assert_eq!(config.init_args.get("extra"), None);
+        assert_eq!(
+            config.init_args.get("o"),
+            None,
+            "a switch-looking token in an -extra tail is data"
+        );
+        assert_eq!(
+            config.init_args.get("noshell"),
+            Some(vec![&[][..]]),
+            "the flags before the marker are unaffected"
+        );
+    }
+
+    /// `--` opens a plain run that the next switch-looking token ends, so a switch after it
+    /// is parsed as a flag again and only the tokens before it are plain.
+    #[test]
+    fn a_double_dash_run_ends_at_the_next_switch() {
+        let config = parsed(&["--", "a", "b"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(
+            config.plain_args,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(config.init_args.is_empty(), "`--` is not an init argument");
+
+        // `-- a -noshell b` ⇒ plain `["a"]`: `-noshell` resumes flag mode (and `b` is its
+        // neighbour, never a plain argument).
+        let config = parsed(&["--", "a", "-noshell", "b"]);
+        assert_eq!(config.plain_args, vec!["a".to_string()]);
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+    }
+
+    /// A marker-free invocation splits to `(args, [])`, so its parse is unchanged.
+    #[test]
+    fn an_invocation_without_a_marker_has_no_plain_arguments() {
+        let config = parsed(&["-noshell", "-eval", "2+3"]);
+        assert!(config.plain_args.is_empty());
+        assert_eq!(config.action, Action::Eval("2+3".to_string()));
+        assert_eq!(config.init_args.get("noshell"), Some(vec![&[][..]]));
+        assert!(parsed(&[]).plain_args.is_empty());
+    }
+
+    /// The merged route keeps the `ERL_*FLAGS` entities' plain tails, in merge order, and
+    /// leaves the flag stream byte-identical to [`env::merge_argv`]'s.
+    #[test]
+    fn the_environment_merge_carries_the_plain_tails() {
+        let env = MapEnv(std::collections::HashMap::from([
+            ("ERL_AFLAGS".to_string(), "-extra a".to_string()),
+            ("ERL_ZFLAGS".to_string(), "-extra d".to_string()),
+        ]));
+        let args: Vec<String> = ["-noshell", "-extra", "b", "-extra", "c"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = parse_with_env(&args, &env).expect("the merged command line parses");
+        assert_eq!(
+            config.plain_args,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "-extra".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "each entity splits at its own first -extra, in merge order"
+        );
+        assert_eq!(config.init_args.get("extra"), None);
+        assert_eq!(
+            config.init_args.get("noshell"),
+            Some(vec![&[][..]]),
+            "the command line's own switch survives the merge"
+        );
+        assert_eq!(
+            config.init_args.len(),
+            1,
+            "no plain tail, and no marker, is an init argument"
+        );
+    }
+
+    /// The refusals the attached forms must not weaken: an unknown `+X` is the emulator's
+    /// `unknown flag` (exit 1, no usage block), a missing operand is the launcher's
+    /// `Missing argument(s)` (exit 1), and a bad attached value keeps the `+X`/value shape of
+    /// the separated form's diagnostic.
+    #[test]
+    fn attached_plus_value_refusals() {
+        // An unknown `+Xyz` stays a rejection naming the token **as typed**.
+        for flag in ["+Xyz", "+zzz"] {
+            let error = parse_args(&[flag]).expect_err("an unknown +flag is refused");
+            assert_eq!(
+                error::flag_rejected_diagnostic(&error),
+                Some(format!("unknown flag -{}", &flag[1..]).as_str()),
+                "{flag}"
+            );
+            assert_eq!(error::unsupported_reason(&error), None, "{flag}");
+        }
+        // A missing operand of a value-taking `+` switch is the launcher's diagnostic, and a
+        // following `--` is not a value either (`erlexec.c`'s `NEXT_ARG_CHECK_NAMED`).
+        for switch in ["+S", "+P", "+Q", "+A", "+K", "+t", "+e", "+hms", "+hmax"] {
+            for args in [vec![switch], vec![switch, "--"]] {
+                let borrowed: Vec<&str> = args.clone();
+                let error = parse_args(&borrowed).expect_err("a missing +switch operand");
+                assert_eq!(
+                    error::flag_rejected_diagnostic(&error),
+                    Some(format!("Missing argument(s) for '{switch}'.").as_str()),
+                    "{args:?}"
+                );
+                assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            }
+        }
+        // A bad **attached** value is the same rejection as the separated one.
+        for args in [
+            &["+Sx"][..],
+            &["+S", "x"][..],
+            &["+Pbogus"][..],
+            &["+P", "bogus"][..],
+            &["+Qbogus"][..],
+            &["+Q", "bogus"][..],
+            &["+hms0"][..],
+            &["+hms", "0"][..],
+            &["+hmaxk maybe"][..],
+            &["+Q0"][..],
+        ] {
+            let error = parse_args(args).expect_err("a bad +switch value is refused");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            assert!(
+                error::flag_rejected_diagnostic(&error).is_some(),
+                "{args:?}: a rejected value, never a capability gap"
+            );
+        }
+        // `+sbt` validates its attached value exactly like its separated one.
+        for args in [&["+sbtbogus"][..], &["+sbt", "bogus"][..], &["+sbt"][..]] {
+            let error = parse_args(args).expect_err("a bad/missing +sbt value");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The numeric `+` switches read their value with the **C's own reader**, so a trailing
+    /// garbage suffix is not a bad value — the digit prefix is the value.
+    ///
+    /// `+S`/`+P`/`+Q`/`+t` all parse with `strtol` (`erl_init.c:1870-1905`, `:2218-2234`) and
+    /// `+e` with `atoi` (`:1696-1707`), neither of which looks past the digits. Verified
+    /// against OTP 29.1.1 / erts-17.1 — each row is the oracle's own exit status and, for the
+    /// accepted ones, the `system_info/1` figure it answers:
+    ///
+    /// ```text
+    /// erl +S1bogus    … system_info(schedulers)   → 1     (exit 0)
+    /// erl +P65536bogus … system_info(process_limit) → 65536 (exit 0)
+    /// erl +Q1024x     … system_info(port_limit)   → 1024  (exit 0)
+    /// erl +t1048576x  … system_info(atom_limit)   → 1048576 (exit 0)
+    /// erl +S abc / +Sabc / +S 4:5 / +Pabc / +P0 / +P-1 / +Q0 / +t0 / +t-1 / +tabc → exit 1
+    /// erl +e 2147483648 → exit 1 (its `atoi` result is an `int`: the value truncates negative)
+    /// erl +e 4294967296 → exit 0 (that same truncation is `0`)
+    /// ```
+    #[test]
+    fn the_numeric_plus_switches_accept_the_c_digit_prefix() {
+        // Attached and separated spellings are indistinguishable to everything downstream.
+        for (attached, separated) in [
+            (&["+S1bogus"][..], &["+S", "1bogus"][..]),
+            (&["+S1x"][..], &["+S", "1x"][..]),
+            (&["+P65536bogus"][..], &["+P", "65536bogus"][..]),
+            (&["+Q1024x"][..], &["+Q", "1024x"][..]),
+            (&["+t1048576x"][..], &["+t", "1048576x"][..]),
+        ] {
+            let compact = parsed(attached);
+            assert_eq!(compact, parsed(separated), "{attached:?} vs {separated:?}");
+        }
+        // … and the digit prefix really is the value the switch acts on.
+        assert_eq!(parsed(&["+S1bogus"]).emulator.schedulers, Some(1));
+        assert_eq!(parsed(&["+P65536bogus"]).emulator.max_processes, Some(65_536));
+        assert_eq!(
+            parsed(&["+Q1024x"]).emulator.extra_emulator_flags,
+            vec!["+Q".to_string(), "1024x".to_string()]
+        );
+        // A value that parses to nothing, or lands outside the switch's range, stays refused —
+        // in both spellings.
+        for args in [
+            &["+Sabc"][..],
+            &["+S", "abc"][..],
+            &["+Sx"][..],
+            &["+S", "x"][..],
+            &["+S", "4:5"][..],
+            &["+Pabc"][..],
+            &["+P", "abc"][..],
+            &["+P0"][..],
+            &["+P", "0"][..],
+            &["+P-1"][..],
+            &["+P", "-1"][..],
+            &["+Qabc"][..],
+            &["+Q", "abc"][..],
+            &["+Q0"][..],
+            &["+Q", "0"][..],
+            &["+tabc"][..],
+            &["+t", "abc"][..],
+            &["+t0"][..],
+            &["+t", "0"][..],
+            &["+t-1"][..],
+            &["+t", "-1"][..],
+        ] {
+            let error = parse_args(args).expect_err("a bad +switch value is refused");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            assert!(
+                error::flag_rejected_diagnostic(&error).is_some(),
+                "{args:?}: a rejected value, never a capability gap"
+            );
+        }
+        // `+e`'s reader is `atoi`, whose result the C narrows to `int` before testing the sign.
+        assert_eq!(
+            parsed(&["+e", "100x"]).emulator.extra_emulator_flags,
+            vec!["+e".to_string(), "100x".to_string()]
+        );
+        for args in [&["+e", "2147483648"][..], &["+e", "-1"][..]] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+        for args in [&["+e", "4294967296"][..], &["+e", "abc"][..]] {
+            assert!(parse_args(args).is_ok(), "{args:?}");
+        }
+    }
+
+    /// `+S`'s value grammar is the C's **`sscanf` cascade**, not a `split(':')`
+    /// (`erl_init.c:1107-1153`): `%d` is a digit prefix, and the literal `:` must follow it
+    /// immediately for a second field to be read at all.
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1 (`+S <v> -noshell -eval
+    /// 'io:format("~p ~p~n",[erlang:system_info(schedulers),
+    /// erlang:system_info(schedulers_online)])'`):
+    ///
+    /// ```text
+    /// +S 1bogus:2 → 1 1     (the `:2` never converts: `b` is not `:`)
+    /// +S 4:x      → 4 4     (only a total; the failed second field is ignored)
+    /// +S 4:       → 4 4
+    /// +S :3       → <default> 3   (the `:Online`-only spelling)
+    /// +S 4:5x     → 4 5     (both fields; trailing junk ignored)  … then rejected, 5 > 4
+    /// +S 1025     → exit 1  (`ERTS_MAX_NO_OF_SCHEDULERS` is 1024)
+    /// +S 4:0      → exit 1  (a zero online count offsets the default, which exceeds 4)
+    /// ```
+    #[test]
+    fn the_scheduler_count_grammar_is_the_sscanf_cascade() {
+        // A trailing field that never converts is ignored, so the token is a bare total.
+        assert_eq!(parsed(&["+S", "1bogus:2"]).emulator.schedulers, Some(1));
+        assert_eq!(parsed(&["+S", "1bogus:2"]).online_schedulers, None);
+        assert_eq!(parsed(&["+S1bogus:2"]), parsed(&["+S", "1bogus:2"]));
+        assert_eq!(parsed(&["+S", "4:x"]).emulator.schedulers, Some(4));
+        assert_eq!(parsed(&["+S", "4:"]).emulator.schedulers, Some(4));
+        // The `:Online`-only spelling: the total is the default (none recorded).
+        assert_eq!(parsed(&["+S", ":3"]).emulator.schedulers, None);
+        assert_eq!(parsed(&["+S", ":3"]).online_schedulers, Some(3));
+        // A pair whose online half is explicit and satisfiable is recorded as such.
+        let config = parsed(&["+S", "4:2x"]);
+        assert_eq!(config.emulator.schedulers, Some(4));
+        assert_eq!(config.online_schedulers, Some(2));
+        // The bounds: `1..=1024` for the total, `1..=total` for the online count.
+        assert_eq!(parsed(&["+S", "1024"]).emulator.schedulers, Some(1024));
+        for args in [
+            &["+S", "1025"][..],
+            &["+S", "4:5"][..],
+            &["+S", "0:65536"][..],
+            &["+S", "1:2:3"][..],
+            &["+S", ":"][..],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+        // A non-positive total is an offset from the default, not a refusal.
+        assert_eq!(parsed(&["+S", "0"]).emulator.schedulers, None);
+        assert_eq!(parsed(&["+S", "0:0"]).emulator.schedulers, None);
+        assert_eq!(parsed(&["+S", "0:0"]).online_schedulers, None);
+        assert_eq!(
+            parsed(&["+S", "-1"]).emulator.schedulers,
+            Some(u32::try_from(crate::info::logical_processors() - 1).unwrap())
+        );
+        assert_eq!(parsed(&["+S", "+3"]).emulator.schedulers, Some(3));
+    }
+
+    /// `+sbwt`/`+sbwtdcpu`/`+sbwtdio` accept **only** the six spin-count names
+    /// `erts_sched_set_busy_wait_threshold` knows (`erl_process.c:5851-5888`) — never a number,
+    /// and never the `very_low..very_high` family the *wakeup* thresholds use.
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1, attached and separated alike:
+    /// `very_long`/`long`/`medium`/`short`/`very_short`/`none` exit 0; `very_low`/`low`/`high`/
+    /// `very_high`/`VERY_HIGH`/`NONE`/`0`/`1`/`highx`/`1000` exit 1.
+    #[test]
+    fn the_busy_wait_thresholds_accept_only_the_six_spin_count_names() {
+        for threshold in ["very_long", "long", "medium", "short", "very_short", "none"] {
+            for switch in ["+sbwt", "+sbwtdcpu", "+sbwtdio"] {
+                let separated = [switch, threshold];
+                let attached = [format!("{switch}{threshold}")];
+                let attached: Vec<&str> = attached.iter().map(String::as_str).collect();
+                assert_eq!(
+                    parsed(&separated),
+                    parsed(&attached),
+                    "{switch} {threshold} vs {switch}{threshold}"
+                );
+                assert_eq!(
+                    parsed(&separated).emulator.extra_emulator_flags,
+                    vec![switch.to_string(), threshold.to_string()]
+                );
+            }
+        }
+        for value in [
+            "very_low",
+            "low",
+            "high",
+            "very_high",
+            "VERY_HIGH",
+            "NONE",
+            "0",
+            "1",
+            "highx",
+            "1000",
+        ] {
+            for switch in ["+sbwt", "+sbwtdcpu", "+sbwtdio"] {
+                let args = [switch, value];
+                let error = parse_args(&args).expect_err("a non-spin-count threshold");
+                assert_eq!(
+                    error::flag_rejected_diagnostic(&error),
+                    Some(format!("bad value {value:?} for switch {switch}").as_str()),
+                    "{args:?}"
+                );
+                assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+                let attached = format!("{switch}{value}");
+                assert!(parse_args(&[attached.as_str()]).is_err(), "{attached}");
+            }
+        }
+    }
+
+    /// The `+s*` scheduler sub-parameters and the four scheduler-**size** switches are
+    /// **validated**, not merely consumed: each one's own value grammar
+    /// (`erl_init.c:955-1180` for `+SP`/`+SDcpu`/`+SDPcpu`/`+SDio`, `:1922-2210` for the `+s`
+    /// family) refuses a bad value with the emulator's `bad …` + usage, i.e. exit **1** — never
+    /// a capability gap — and accepts a good one in both spellings alike.
+    ///
+    /// Verified against OTP 29.1.1 / erts-17.1 (attached and separated alike):
+    /// `+SP 50`/`+SP 100:100`/`+SP :3`/`+SP -5`-free forms exit 0 while `+SPabc` exits 1;
+    /// `+SDcpu 64` exits 0 while `+SDcpu1025` exits 1 (but `+SDcpu-1` is an offset and exits 0);
+    /// `+SDPcpu 50:25` exits 0 while `+SDPcpu-1` exits 1;
+    /// `+SDio 64` exits 0 while `+SDio0`/`+SDio1025` exit 1;
+    /// `+scltrue`/`+spptrue`/`+subtrue` exit 0 while `+sclbogus`/`+sppx`/`+subx` exit 1;
+    /// `+swsdefault`/`+swslegacy` exit 0 while `+swsx` exits 1;
+    /// `+swtvery_high` exits 0 while `+swtturbo` exits 1;
+    /// `+swctvery_lazy`/`+swctvery_eager` exit 0 while `+swctfoo` exits 1;
+    /// `+stbt u` exits 0 while `+stbtx` exits 1;
+    /// `+sss 64`/`+sssdcpu 64`/`+sssdio 64` exit 0 while `+sss19`/`+sss8193` exit 1;
+    /// `+sfwi 100`/`+sfwi x` exit 0 while `+sfwi-1` exits 1;
+    /// `+secio bogus` exits 0 (the C ignores the value: `erl_init.c:2037-2041`).
+    #[test]
+    fn the_scheduler_sub_parameter_grammars_match_the_c() {
+        // (switch, a value the oracle accepts, a value it refuses) — never the same pair, and
+        // never a switch this runtime models an effect for (`+sbt` has its own test above).
+        let rows: &[(&str, &str, &str)] = &[
+            ("+SP", "50:100", "abc"),
+            ("+SDcpu", "64", "1025"),
+            ("+SDPcpu", "50:25", "-1"),
+            ("+SDio", "64", "0"),
+            ("+scl", "true", "bogus"),
+            ("+spp", "false", "1"),
+            ("+sub", "true", "black"),
+            ("+sws", "legacy", "turbo"),
+            ("+swt", "very_high", "turbo"),
+            ("+swct", "very_lazy", "100"),
+            ("+stbt", "tnnps", "bogus"),
+            ("+sss", "20", "19"),
+            ("+sssdcpu", "8192", "8193"),
+            ("+sssdio", "64", "0"),
+            ("+sfwi", "100", "-1"),
+        ];
+        for &(switch, accepted, refused) in rows {
+            let separated = [switch, accepted];
+            let attached = [format!("{switch}{accepted}")];
+            let attached: Vec<&str> = attached.iter().map(String::as_str).collect();
+            assert_eq!(
+                parsed(&separated),
+                parsed(&attached),
+                "{switch} {accepted} vs {switch}{accepted}"
+            );
+            assert_eq!(
+                parsed(&separated).emulator.extra_emulator_flags,
+                vec![switch.to_string(), accepted.to_string()],
+                "{switch} {accepted} keeps its (switch, value) pair"
+            );
+            for args in [vec![switch, refused], vec![&*format!("{switch}{refused}")]] {
+                let error = parse_args(&args).expect_err("a bad scheduler value is refused");
+                assert_eq!(
+                    error::flag_rejected_diagnostic(&error),
+                    Some(format!("bad value {refused:?} for switch {switch}").as_str()),
+                    "{args:?}"
+                );
+                assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+            }
+        }
+        // `+secio`'s value is read and **discarded** by the C, so it accepts anything.
+        for value in ["bogus", "true", "0"] {
+            for args in [vec!["+secio", value], vec![&*format!("+secio{value}")]] {
+                assert!(parse_args(&args).is_ok(), "{args:?}");
+            }
+        }
+        // `+SDcpu`'s non-positive halves are offsets from the default, not refusals
+        // (`erl_init.c:1046-1052`), so `-1` is accepted while `4:5` (online > total) is not.
+        for accepted in ["-1", "1", "1024", "4:2", ":2", "0:0"] {
+            for args in [vec!["+SDcpu", accepted], vec![&*format!("+SDcpu{accepted}")]] {
+                assert!(parse_args(&args).is_ok(), "{args:?}");
+            }
+        }
+        for refused in ["4:5", "1025", ":", "1:2:3"] {
+            for args in [vec!["+SDcpu", refused], vec![&*format!("+SDcpu{refused}")]] {
+                assert!(parse_args(&args).is_err(), "{args:?}");
+            }
+        }
+        // `+SP`/`+SDPcpu` have **no** upper bound and no total/online relation.
+        for accepted in ["0", "100", "100:100", ":3", "9999"] {
+            for switch in ["+SP", "+SDPcpu"] {
+                let args = [switch, accepted];
+                assert!(parse_args(&args).is_ok(), "{args:?}");
+            }
         }
     }
 
@@ -3243,9 +3730,6 @@ mod tests {
             "+Q",
             "+K",
             "+sbt",
-            "+SP",
-            "+SDcpu",
-            "+SDio",
             "-MNAME",
             "+MM",
             "+MB",

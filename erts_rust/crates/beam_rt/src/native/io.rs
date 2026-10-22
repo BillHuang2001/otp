@@ -59,20 +59,24 @@
 //!
 //! | Device | Oracle | Here |
 //! |---|---|---|
-//! | omitted (`io:put_chars/1`, `io:nl/0`, `io:fwrite/1,2`, `io:write/1`, `io:format/1,2`) | the caller's **group leader** | the caller's output stream (stdout) |
+//! | omitted (`io:put_chars/1`, `io:nl/0`, `io:fwrite/1,2`, `io:write/1`, `io:format/1,2`) | the caller's **group leader** | that leader's stream: stderr when it is the registered `standard_error` device, else the output stream (stdout) |
 //! | `standard_io` | `request/3`'s `standard_io` clause rewrites it to `group_leader()` | stdout |
 //! | `user` | the registered terminal device | stdout |
 //! | `standard_error` | the registered stderr device | stderr |
-//! | the caller **itself** (`self()`) | `execute_request/3`'s first clause → `{ErrorTag, calling_self}` → `error:calling_self` | `error:calling_self` |
-//! | the caller's **group leader** pid (a **distinct** process) | that device (the terminal) | stdout |
 //! | the registered `standard_error` pid | that device | stderr |
-//! | another **live** device pid | the `{io_request, …}` round trip | the typed `unsupported` (a BIF cannot block) |
+//! | the caller's **own** group-leader pid | that device (the terminal) | stdout |
+//! | another **registered** device pid | the `{io_request, …}` round trip | the typed `unsupported` (a BIF cannot block) |
 //! | an **unregistered** atom | `{ErrorTag, arguments}` → `error:badarg` | `error:badarg` |
 //! | not an atom and not a pid | no `o_request/2` clause matches → `error:function_clause` | `error:function_clause` |
 //!
-//! The self test is `execute_request/3`'s **first** clause, so it comes first here too and
-//! wins over every other reading — an atom registered to the caller, and a group leader that
-//! *is* the caller, are both `calling_self`.
+//! Both device routes classify a **pid by identity first**: a device pid that is the one
+//! registered as `standard_error` is the error stream whatever named it — an explicit pid, a
+//! registered name resolving to it, or the caller's own **group leader**. Only a group leader
+//! that is *not* that device falls back to the caller's output stream.
+//! That is the shape `lib/stdlib/src/erl_compile.erl`'s `compile_cmdline1/0` creates for
+//! `erlc`: its worker sets `group_leader(whereis(standard_error), self())` and then prints
+//! with the omitted device (`compile.erl:3089`'s `io:put_chars(Str)`), so the diagnostic
+//! belongs on fd 2 — exactly where the oracle puts it.
 //!
 //! A non-stdout device that this runtime *can* serve is never silently redirected to
 //! stdout, and a device it cannot reach is a typed `unsupported` rather than a fabricated
@@ -257,11 +261,9 @@ impl RuntimeContext<'_> {
     /// The stream a request's **effective device** selects, or the raise the oracle
     /// produces for a device this runtime cannot serve.
     ///
-    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`
-    /// (`io.erl:1710`), which this runtime's single output stream stands in for — the
-    /// substituted default that keeps the installed compiler's `io:fwrite/2` diagnostics
-    /// printing (see the module docs). The **explicit** device is resolved by
-    /// [`Self::io_device`], so it is never substituted.
+    /// `None` is the omitted (default) device: `default_output/0` is `group_leader()`, so the
+    /// caller's group leader decides the stream ([`Self::group_leader_stream`]) rather than
+    /// this runtime's output stream being assumed.
     ///
     /// # Errors
     ///
@@ -272,7 +274,7 @@ impl RuntimeContext<'_> {
     /// to stdout.
     fn io_stream(&self, device: Option<Eterm>) -> Result<Stream> {
         let Some(device) = device else {
-            return Ok(Stream::Output);
+            return Ok(self.group_leader_stream());
         };
         match self.io_device(device) {
             Device::Stream(stream) => Ok(stream),
@@ -281,6 +283,33 @@ impl RuntimeContext<'_> {
             Device::NoClause => Err(prim::function_clause()),
             Device::Unreachable => Err(error::unsupported(UNREACHABLE_DEVICE)),
         }
+    }
+
+    /// The stream the caller's **group leader** selects (`default_output/0`).
+    ///
+    /// A group leader that is the pid registered as `standard_error` is the error stream —
+    /// `erl_compile`'s worker sets exactly that leader and then prints through the omitted
+    /// device — and every other group leader is this runtime's one output stream, whatever
+    /// process it is (a custom io device keeps the output stream it has always had).
+    fn group_leader_stream(&self) -> Stream {
+        if Some(self.runtime.group_leader_of(self.pid())) == self.standard_error_pid() {
+            Stream::Stderr
+        } else {
+            Stream::Output
+        }
+    }
+
+    /// The pid registered as `standard_error`, if this runtime has one.
+    ///
+    /// `kernel` registers the name from the `standard_error` process it starts in its
+    /// supervision tree (`lib/kernel/src/kernel.erl:124-129`), so the name exists on every
+    /// boot-driven route and is absent on a runtime that never booted.
+    fn standard_error_pid(&self) -> Option<ProcessId> {
+        self.runtime
+            .code_server
+            .atoms()
+            .lookup("standard_error")
+            .and_then(|name| self.process_table().whereis(name))
     }
 
     /// Classifies an `io:*` device argument (`o_request/2` + `request/3`'s device rules).
@@ -311,31 +340,24 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// The class a **live** device pid selects.
+    /// The stream a **live** device pid selects — by **identity** first, then by the
+    /// group-leader default.
     ///
-    /// The caller **itself** is `execute_request/3`'s **first** clause (`io.erl:1665`), so
-    /// that test runs before every other reading — a registered name that resolves to the
-    /// caller and a group leader that happens to be the caller are both that clause. The
-    /// caller's own **group leader** (a distinct process here) is the default device — the
-    /// terminal this runtime writes to — and the registered `standard_error` device is the
-    /// process's standard error. Every other live device would need the
-    /// `{io_request, …}`/`{io_reply, …}` round trip, which a BIF cannot perform
-    /// ([`Device::Unreachable`]).
+    /// The registered `standard_error` device is the process's standard error whatever route
+    /// named it: an explicit pid, a registered name that resolves to it, or a **group leader**
+    /// that happens to be it. Only a pid that is not that device is then compared with the
+    /// caller's own group leader, which is the terminal this runtime writes to; every other
+    /// live device would need the `{io_request, …}`/`{io_reply, …}` round trip, which a BIF
+    /// cannot perform ([`Device::Unreachable`]).
     fn io_pid_device(&self, pid: ProcessId) -> Device {
         if pid == self.pid() {
             return Device::CallingSelf;
         }
+        if Some(pid) == self.standard_error_pid() {
+            return Device::Stream(Stream::Stderr);
+        }
         if pid == self.runtime.group_leader_of(self.pid()) {
             return Device::Stream(Stream::Output);
-        }
-        let standard_error = self
-            .runtime
-            .code_server
-            .atoms()
-            .lookup("standard_error")
-            .and_then(|name| self.process_table().whereis(name));
-        if standard_error == Some(pid) {
-            return Device::Stream(Stream::Stderr);
         }
         Device::Unreachable
     }
@@ -389,21 +411,49 @@ mod tests {
         terms::make_list(&mut context, &[]).expect("the empty list")
     }
 
-    /// The `[[1,2]]` argument list `~p` renders in the arity probes.
-    fn one_two(runtime: &mut Runtime) -> Eterm {
+    /// A live child process in the runtime's own table.
+    ///
+    /// A device-name fixture needs one: `erlang:register/2` refuses a dead pid, and
+    /// `whereis/1` resolves a name whose process is gone to nothing, so the `standard_error`
+    /// these tests register must name a process that can really run.
+    fn live_child(runtime: &mut Runtime) -> ProcessId {
+        let policy = runtime.default_spawn_policy();
         let mut sink = beam_bifs::NullSink;
         let mut context = RuntimeContext::with_output(runtime, &mut sink);
-        let inner = terms::make_list(&mut context, &[make_small(1), make_small(2)])
-            .expect("a two-element list");
-        terms::make_list(&mut context, &[inner]).expect("a one-element list")
+        context
+            .process_table_mut()
+            .spawn(policy)
+            .expect("a child process")
     }
 
-    /// The pid this context runs as, as a term.
-    fn own_pid(runtime: &mut Runtime) -> ProcessId {
+    /// Registers `pid` under `name` in the runtime's own name registry.
+    fn register(runtime: &mut Runtime, name: &str, pid: ProcessId) {
+        let name = runtime.code_server_atoms_mut().intern(name);
         let mut sink = beam_bifs::NullSink;
-        let context = RuntimeContext::with_output(runtime, &mut sink);
-        context.pid()
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        context
+            .process_table_mut()
+            .register(name, pid)
+            .expect("a free name and a live pid");
     }
+
+    /// A runtime whose `standard_error` device is a live child and whose **own** process has
+    /// that child as its group leader — the shape `erl_compile`'s `compile_cmdline1/0`
+    /// creates for `erlc` (`group_leader(whereis(standard_error), self())`).
+    fn runtime_led_by_standard_error() -> (Runtime, ProcessId) {
+        let mut runtime = runtime();
+        let device = live_child(&mut runtime);
+        register(&mut runtime, "standard_error", device);
+        let caller = runtime.self_pid();
+        runtime.set_group_leader(caller, device);
+        (runtime, device)
+    }
+
+    /// The text the fd-2 probes write, so a misrouted byte is recognizable in a stream.
+    const STDERR_MARKER: &str = "io-floor: standard_error probe";
+
+    /// The environment variable that makes the `#[ignore]`d child half run its probe.
+    const STDERR_CHILD_ENV: &str = "BEAM_RT_IO_STDERR_CHILD";
     /// `io:nl/0` writes exactly one newline and answers `ok`; `io:nl/1` does the same for
     /// every device this runtime serves.
     #[test]
@@ -599,122 +649,174 @@ mod tests {
         assert_eq!(error.as_atom(), Some("badarg"), "{error}");
     }
 
-    /// `io:format/3` is `(Device, Format, Args)`, and OTP has **no** options-taking
-    /// `io:format/3` (`io.erl:1350`): an `io:format(Format, Args, Options)`-shaped call passes
-    /// the *format string* as the **device**, so it is the bare `function_clause` — on the
-    /// oracle exactly as here, never `badarg` and never a silent `ok`. The device forms that
-    /// really name a stream render `~p` and answer `ok`.
+    /// A device pid that **is** the registered `standard_error` process is the error stream,
+    /// whatever route named it — here an explicit pid (`io:put_chars(whereis(standard_error),
+    /// …)`, the shape `erl_compile.erl`'s `{error, Output}` arm uses by name).
     #[test]
-    fn format_3_is_device_format_args() {
-        // `io:format("~p~n", [[1,2]], [])`: the format string lands in the device slot, and
-        // `[]` lands in the argument slot, so `o_request/2` has no clause to pick.
+    fn an_explicit_standard_error_pid_is_the_error_stream() {
         let mut runtime = runtime();
-        let format = chars(&mut runtime, "~p~n");
-        let data = one_two(&mut runtime);
-        let empty = no_args(&mut runtime);
-        let (result, out) = call_capturing(&mut runtime, "format", &[format, data, empty]);
-        let error = result.expect_err("format(\"~p~n\", [[1,2]], [])");
-        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
-        assert_eq!(out, "", "a raised request writes nothing to the output stream");
-
-        for name in ["standard_io", "user"] {
-            let mut served = crate::native::test_support::runtime();
-            let device = atom(&mut served, name);
-            let format = chars(&mut served, "~p~n");
-            let data = one_two(&mut served);
-            let (result, out) = call_capturing(&mut served, "format", &[device, format, data]);
+        let device = live_child(&mut runtime);
+        register(&mut runtime, "standard_error", device);
+        {
+            let mut sink = beam_bifs::NullSink;
+            let context = RuntimeContext::with_output(&mut runtime, &mut sink);
             assert_eq!(
-                served.atom_name_of(result.expect("format/3")),
-                Some("ok"),
-                "format({name}, ...)"
+                context.io_device(device.to_eterm()),
+                Device::Stream(Stream::Stderr),
+                "the registered standard_error pid is the error stream"
             );
-            assert_eq!(out, "[1,2]\n", "format({name}, ...)");
         }
-
-        // `group_leader()` is the caller's group leader — a **distinct** process here — and a
-        // device this runtime answers on the output stream. (The unit-test caller *is* the
-        // runtime's root, whose default leader is itself, so it gets a leader of its own.)
-        let mut leader = crate::native::test_support::runtime();
-        let root = own_pid(&mut leader);
-        let group_leader = ProcessId::new(root.number() + 1000, root.serial());
-        leader.set_group_leader(root, group_leader);
-        let device = group_leader.to_eterm();
-        let format = chars(&mut leader, "~p~n");
-        let data = one_two(&mut leader);
-        let (result, out) = call_capturing(&mut leader, "format", &[device, format, data]);
+        let text = chars(&mut runtime, STDERR_MARKER);
+        let (result, out) = call_capturing(&mut runtime, "put_chars", &[device.to_eterm(), text]);
         assert_eq!(
-            leader.atom_name_of(result.expect("format(group_leader(), ...)")),
+            runtime.atom_name_of(result.expect("put_chars/2")),
             Some("ok")
         );
-        assert_eq!(out, "[1,2]\n", "format(group_leader(), ...)");
+        assert_eq!(out, "", "nothing may reach the output stream");
     }
 
-    /// An **explicit `self()` device** is `execute_request/3`'s first clause
-    /// (`io.erl:1665`) — `error:calling_self` on the oracle, and here too, for every
-    /// device-taking entry point. Nothing reaches the output stream, because the request is
-    /// refused before the payload is read.
+    /// A caller whose **group leader** is the registered `standard_error` device writes to the
+    /// error stream through the omitted device — `erl_compile`'s worker sets exactly that
+    /// leader and `compile.erl` prints its warnings with `io:put_chars(Str)`.
+    ///
+    /// The identity of the group leader wins over the group-leader default: the same pid is
+    /// both here, and only that ordering sends the diagnostic to fd 2 instead of stdout.
     #[test]
-    fn explicit_self_device_raises_calling_self() {
-        let mut runtime = runtime();
-        let me = own_pid(&mut runtime);
-        let me_term = me.to_eterm();
-        let format = chars(&mut runtime, "~p~n");
-        let data = no_args(&mut runtime);
-        let text = chars(&mut runtime, "hi");
-        let hi = atom(&mut runtime, "hi");
-
-        for (what, function, args) in [
-            ("io:format/3", "format", vec![me_term, format, data]),
-            ("io:fwrite/3", "fwrite", vec![me_term, format, data]),
-            ("io:put_chars/2", "put_chars", vec![me_term, text]),
-            ("io:nl/1", "nl", vec![me_term]),
-            ("io:write/2", "write", vec![me_term, hi]),
-        ] {
-            let (result, out) = call_capturing(&mut runtime, function, &args);
-            let error = result.expect_err(what);
-            assert_eq!(error.as_atom(), Some("calling_self"), "{what}: {error}");
-            assert_eq!(out, "", "{what}: nothing may reach the output stream");
+    fn a_standard_error_group_leader_is_the_error_stream() {
+        let (mut runtime, device) = runtime_led_by_standard_error();
+        {
+            let mut sink = beam_bifs::NullSink;
+            let context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            assert_eq!(
+                context.io_stream(None).expect("the default device"),
+                Stream::Stderr,
+                "`default_output/0` is `group_leader()`, which is the standard_error device"
+            );
+            assert_eq!(
+                context.io_device(device.to_eterm()),
+                Device::Stream(Stream::Stderr)
+            );
         }
-
-        // The `whereis` path reaches the same clause: an atom registered to the caller **is**
-        // the caller, so it is `calling_self` too — not the output stream.
-        runtime
-            .register_boot_process("the_calling_process", me)
-            .expect("register the caller's name");
-        let named = atom(&mut runtime, "the_calling_process");
-        let (result, out) = call_capturing(&mut runtime, "nl", &[named]);
-        let error = result.expect_err("io:nl(<name of self>)");
-        assert_eq!(error.as_atom(), Some("calling_self"), "{error}");
-        assert_eq!(out, "");
+        let text = chars(&mut runtime, STDERR_MARKER);
+        let (result, out) = call_capturing(&mut runtime, "put_chars", &[text]);
+        assert_eq!(
+            runtime.atom_name_of(result.expect("put_chars/1")),
+            Some("ok")
+        );
+        assert_eq!(out, "", "the diagnostic must not reach the output stream");
     }
 
-    /// A live device pid that is **neither** the caller nor its group leader stays the typed
-    /// capability gap (a BIF cannot block on the `{io_request, …}`/`{io_reply, …}` round
-    /// trip), for every device-taking entry point — never a silent redirect to stdout.
+    /// Every other group leader keeps the output stream: no `standard_error` device at all, a
+    /// `standard_error` device that is not this caller's leader, and a custom (live) leader.
     #[test]
-    fn another_live_device_pid_is_the_typed_gap() {
-        let mut runtime = runtime();
-        let own = own_pid(&mut runtime);
-        let other = ProcessId::new(own.number() + 1000, own.serial()).to_eterm();
-        let format = chars(&mut runtime, "~p~n");
-        let data = no_args(&mut runtime);
-        let text = chars(&mut runtime, "hi");
-        let hi = atom(&mut runtime, "hi");
+    fn another_group_leader_keeps_the_output_stream() {
+        // No `standard_error` registered: the caller's leader is this runtime's output stream.
+        let mut plain = runtime();
+        let text = chars(&mut plain, "plain");
+        let (result, out) = call_capturing(&mut plain, "put_chars", &[text]);
+        assert_eq!(plain.atom_name_of(result.expect("put_chars/1")), Some("ok"));
+        assert_eq!(out, "plain");
 
-        for (what, function, args) in [
-            ("io:format/3", "format", vec![other, format, data]),
-            ("io:fwrite/3", "fwrite", vec![other, format, data]),
-            ("io:put_chars/2", "put_chars", vec![other, text]),
-            ("io:nl/1", "nl", vec![other]),
-            ("io:write/2", "write", vec![other, hi]),
-        ] {
-            let (result, out) = call_capturing(&mut runtime, function, &args);
-            let error = result.expect_err(what);
-            let reason = crate::error::unsupported_reason(&error).unwrap_or_else(|| {
-                panic!("{what}: a live non-stdio device must be the typed capability gap: {error}")
-            });
-            assert!(reason.contains("io-device"), "{what}: {reason}");
-            assert_eq!(out, "", "{what}: a capability gap writes nothing");
+        // A `standard_error` device somewhere else is not the caller's leader.
+        let mut other = runtime();
+        let device = live_child(&mut other);
+        register(&mut other, "standard_error", device);
+        let text = chars(&mut other, "plain");
+        let (result, out) = call_capturing(&mut other, "put_chars", &[text]);
+        assert_eq!(other.atom_name_of(result.expect("put_chars/1")), Some("ok"));
+        assert_eq!(out, "plain", "only the caller's own leader decides");
+
+        // A custom group leader — neither the standard_error device nor a std stream — keeps
+        // the output stream it has always had.
+        let custom = live_child(&mut other);
+        let caller = other.self_pid();
+        other.set_group_leader(caller, custom);
+        let text = chars(&mut other, "custom");
+        let (result, out) = call_capturing(&mut other, "put_chars", &[text]);
+        assert_eq!(other.atom_name_of(result.expect("put_chars/1")), Some("ok"));
+        assert_eq!(out, "custom", "a custom io device is unchanged");
+    }
+
+    /// The **child** half of [`a_standard_error_group_leader_writes_to_fd_2_on_both_runtimes`]:
+    /// one process whose only route to the byte is fd 2.
+    ///
+    /// It runs in a fresh OS process so the two streams are observable separately; the context
+    /// has **no** capture sink, so a misrouted byte lands on the child's real stdout.
+    #[test]
+    #[ignore = "the child half of the fd-2 probe; the parent test runs it"]
+    fn standard_error_group_leader_child() {
+        if std::env::var_os(STDERR_CHILD_ENV).is_none() {
+            return;
+        }
+        let (mut runtime, _device) = runtime_led_by_standard_error();
+        let text = chars(&mut runtime, STDERR_MARKER);
+        // `io:put_chars/1`: the omitted device, i.e. `group_leader()`.
+        RuntimeContext::new(&mut runtime)
+            .call_bif("io", "put_chars", 1, &[text])
+            .expect("put_chars/1");
+    }
+
+    /// The oracle's own rule, cross-checked: a process whose group leader is the
+    /// `standard_error` device writes the bytes to **fd 2** and leaves stdout empty — under the
+    /// system `erl` and here.
+    #[test]
+    fn a_standard_error_group_leader_writes_to_fd_2_on_both_runtimes() {
+        use std::process::{Command, Stdio};
+
+        let Some(oracle) = crate::native::test_support::resolve_oracle() else {
+            crate::native::test_support::skip_oracle_loudly(
+                "io floor fd-2 cross-check",
+                "the `standard_error` group-leader probe",
+            );
+            return;
+        };
+        // The oracle, same shape: set the group leader to `whereis(standard_error)` and print
+        // with the omitted device.
+        let eval = format!(
+            "group_leader(whereis(standard_error), self()), io:put_chars(\"{STDERR_MARKER}\"), halt(0)."
+        );
+        let oracle_output = Command::new(&oracle)
+            .args(["-noshell", "-eval", &eval])
+            .stdin(Stdio::null())
+            .output()
+            .expect("the oracle runs");
+        assert!(
+            oracle_output.status.success(),
+            "the oracle probe failed: {}",
+            String::from_utf8_lossy(&oracle_output.stderr)
+        );
+
+        // This runtime, through the child half of the probe in its own OS process.
+        let exe = std::env::current_exe().expect("the test binary");
+        let ours = Command::new(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "native::io::tests::standard_error_group_leader_child",
+            ])
+            .env(STDERR_CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("the child test process runs");
+        assert!(
+            ours.status.success(),
+            "the child probe failed: {}",
+            String::from_utf8_lossy(&ours.stderr)
+        );
+
+        for (label, output) in [("oracle", &oracle_output), ("beam_rt", &ours)] {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stdout.contains(STDERR_MARKER),
+                "{label}: the marker reached stdout:\n{stdout}"
+            );
+            assert!(
+                stderr.contains(STDERR_MARKER),
+                "{label}: the marker is not on stderr:\n{stderr}"
+            );
         }
     }
 }

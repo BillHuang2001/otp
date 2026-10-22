@@ -529,18 +529,21 @@ pub struct RuntimeConfig {
     pub max_ports: Option<usize>,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
-    /// The **plain arguments** — the command-line tokens `init` did not consume as a flag or
-    /// as a Start instruction (contract A.6; the source of `init:get_plain_arguments/0`).
+    /// The **plain arguments** — the source of `init:get_plain_arguments/0` (contract A.6).
     ///
-    /// Exactly the C `init`'s `Args` accumulator (`erts/preloaded/src/init.erl:1669-1710`):
-    /// a stray **positional** token collected as an `arg`, in command-line order, followed —
-    /// when the command line carries `-extra` — by **every** token after it, verbatim (the
-    /// `start_extra_arg` clause's `lists:reverse(As, Bs)`). `-extra` itself is neither a
-    /// plain argument nor an init argument: it ends the switch surface, so nothing after it
-    /// is an init argument or a Start instruction either. Each entry is served as an Erlang
-    /// string (a char list) in this order, and an empty list — the
-    /// [`RuntimeConfig::default`] value, i.e. a bare invocation — is what
-    /// `init:get_plain_arguments/0` answers when the command line carried neither.
+    /// These are the tokens `-extra` and `--` select, kept as strings in the order the
+    /// entities that carried them contribute them (`ERL_OTP<sysver>_FLAGS`, `ERL_AFLAGS`,
+    /// the command line, `ERL_FLAGS`, `ERL_ZFLAGS` — the merge order, with each entity
+    /// splitting at its **own** marker); [`crate::cli::env::merge_argv_with_plain`] is where
+    /// that split happens. The rule is `init`'s: everything after a `-extra`, and everything
+    /// after a `--` up to the next switch-looking token, is a plain argument
+    /// (`erts/preloaded/src/init.erl:81-139,1664-1740`).
+    ///
+    /// A plain argument is **not** an init argument: it never appears in
+    /// [`init_args`](Self::init_args), so `init:get_argument/1` cannot see it and
+    /// `init:get_arguments/0` lists no entry for it — verified against OTP 29.1.1, where
+    /// `-extra a b c` leaves `init:get_arguments/0` at
+    /// `[{root,…},{bindir,…},{progname,…},{home,…},{noshell,[]}]`.
     pub plain_args: Vec<String>,
     /// The boot script this invocation drives, as the CLI **resolved** it: the explicit
     /// `-boot FILE` value when one was given, else `init`'s own default (the literal
@@ -837,6 +840,9 @@ mod tests {
         assert_eq!(config.heap, HeapOptions::default());
         assert_eq!(config.max_ports, None);
         assert!(config.init_args.is_empty());
+        // No `-extra`/`--` marker in a bare invocation, so no plain argument either
+        // (`init:get_plain_arguments/0` is `[]`).
+        assert!(config.plain_args.is_empty());
         assert_eq!(config.action, Action::Boot);
         assert_eq!(config.env_vars(), &ErlEnv::default());
         assert!(!config.is_version());
