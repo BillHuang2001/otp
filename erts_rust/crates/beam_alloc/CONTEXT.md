@@ -161,6 +161,32 @@ byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`
    bitstring/refc-binary payload bytes needs term-structure knowledge owned by
    `beam_term`/`beam_gc` — so the fully-consistent move remains the collector's pointer-aware copy
    (`copy_struct`/Cheney), i.e. growth by *replacement*. Never cache a raw term pointer across a move.
+5. **`relocate` and `Drop` are the only pointer-invalidating operations.** `try_grow` is bookkeeping
+   alone (`reserved_heap.rs:194-205`, `committed = used + need`): the whole reservation is already one
+   ordinary allocator block, mapped read/write, so raising the limit neither moves the bump pointer nor
+   re-maps nor `mprotect`s anything. `reset` invalidates handed-out pointers *logically* (the words are
+   handed out again), never physically. There is no `truncate`/`shrink`/`set_len` on either heap —
+   `set_len` is a `RefcBinary` method (`src/binary/growth.rs`), unrelated to a term heap; the only ways
+   to give address space back are `Drop` and a shrinking `relocate` (which is a move).
+6. **What a `Drop`/`relocate` really does to the OS.** Both call the one private `free_block`, which
+   returns the block through the same `AllocRef` + exact `Layout` it was allocated with; the allocator
+   then re-derives the block's extent from its in-band header (it ignores `layout.size()`) and routes
+   by size: a reservation <= 1024 B is a **slab** block of a retained 1 MiB carrier, one in
+   `(1024, 512 KiB)` is a block of the pooled variable-size **MBC** carrier, and one >= `sbct`
+   (512 KiB) is a **dedicated** mapping. Only the dedicated case (and a *fully free* MBC carrier) can
+   ever reach `munmap`, and it reaches it by way of the process-global `mseg` reuse cache (default 10
+   segments, FIFO) — so a dropped region normally stays **mapped, unzeroed and re-handable at the same
+   address**, and a stale term pointer into it does not fault, it silently aliases the next owner's
+   bytes. Report returned-to-OS memory from `stats.mseg.unmaps`/`mapped_bytes`, not from
+   `carriers`/`carrier_bytes` (which drop when the *carrier* is released, i.e. possibly before the
+   mapping is gone).
+7. **No containment test, and the two heaps share no trait.** A collector's "this pointer is not mine"
+   decision has to be built from `base()`/`hp()`/`reservation_end()`/`reserved_words()`: the reserved
+   extent for an address-space question, `[base, hp)` for a live-word one. `beam_gc::HeapSpace`
+   (`src/space.rs`, `contains` over `[base, top)`) wraps a concrete `beam_alloc::Heap` via
+   `from_heap`/`into_heap` only, so a region grid of `ReservedHeap`s is not expressible through
+   `beam_gc`'s public API; `Heap` itself exposes `hp()`/`hend()` but **no** `base()` (recover it as
+   `hend().wrapping_sub(capacity())`).
 
 ### `bump` — the shared bump-pointer term-construction primitives (private, crate-internal)
 `alloc_words_at`/`alloc_tuple_at`/`cons_at`/`tuple_at`: pure `(hp, available, …)` helpers that
