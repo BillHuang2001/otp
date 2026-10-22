@@ -103,6 +103,7 @@ mod ets_owner;
 mod lost_peer_tests;
 mod gc;
 mod retention;
+pub(crate) mod reclaim;
 pub(crate) mod roots;
 #[cfg(test)]
 mod root_tests;
@@ -113,6 +114,7 @@ pub use self::gc::GcStatsSnapshot;
 pub(crate) use self::gc::GcState;
 pub(crate) use self::executing::RootAction;
 pub use self::retention::RetentionStats;
+pub use self::reclaim::{RegionReclaimConfig, RegionReclaimStats};
 pub use self::scheduler::RUN_DEADLINE;
 
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
@@ -488,6 +490,14 @@ pub struct Runtime {
     ///
     /// It is always present; its window is open only for the duration of one `-eval` driver run.
     pub(crate) eval_scratch: crate::eval::scratch::ScratchState,
+    /// The **region reclamation** pass's state ([`crate::runtime::reclaim`]): the two action bits,
+    /// the open window's frontiers, and the published counters.
+    ///
+    /// It is always present; its cursor is `Some` only between
+    /// [`reclaim::open`](crate::runtime::reclaim::open) — which
+    /// [`crate::eval::scratch::open`] runs right after opening the statement window — and the end of
+    /// the `-eval` driver run that opened it.
+    pub(crate) region_reclaim: reclaim::RegionReclaim,
     /// The `-eval` route's escaped-payload store bookkeeping
     /// ([`crate::eval::reclaim::PruneState`]): the last observed handle count (the `O(1)`
     /// half of the prune trigger), the prune/decline counters and the most recent decline
@@ -1491,6 +1501,7 @@ impl Runtime {
             eval_off_heap: beam_message::OffHeapTable::new(),
             eval_heap_retired: Vec::new(),
             eval_scratch: crate::eval::scratch::ScratchState::default(),
+            region_reclaim: reclaim::RegionReclaim::from_env(),
             eval_prune: crate::eval::reclaim::PruneState::default(),
             eval_prune_enabled: true,
             resource_prune: crate::eval::reclaim::ResourcePruneState::default(),
@@ -2503,8 +2514,9 @@ impl Runtime {
     ///
     /// # Region replacement, never relocation
     ///
-    /// The replaced region is moved to [`Runtime::eval_heap_retired`] — never freed and never
-    /// moved — so every word it handed out stays valid and at its own address; the fresh region is
+    /// The replaced region is moved to [`Runtime::eval_heap_retired`] — never moved and never
+    /// rewritten in place — so every word it handed out stays valid and at its own address; the
+    /// fresh region is
     /// the old capacity **doubled** ([`usize::saturating_mul`]) with `needed` as a floor, exactly
     /// the policy [`crate::context::RuntimeContext::take_bif_frontier`] applies to the pooled BIF
     /// heap. What this retains is strictly **less** than the pool retained before the rewind
@@ -2512,12 +2524,19 @@ impl Runtime {
     /// so no new retention is introduced — the same words simply live in a region that is still
     /// the allocation frontier.
     ///
+    /// A retired region is **not** kept for the runtime's life: it survives exactly as long as a
+    /// live term stands in it. [`crate::runtime::reclaim`] — the pass that runs at each `-eval`
+    /// statement boundary and at the driver's exit — drops a retired region whose words a
+    /// reachability descent proved dead (its `Drop` frees the carrier) and leaves every region a
+    /// live word names exactly where it was. There is no move: a region is either retained whole or
+    /// dropped whole.
+    ///
     /// # The ceiling
     ///
     /// The doubling is **clamped**: the replacement may not exceed the one ceiling
     /// [`Runtime::eval_heap_ceiling`] names — [`MAX_EVAL_HEAP_WORDS`] — because every replacement
-    /// also *retires* its predecessor, so an unclamped chain retains twice its final region for
-    /// the runtime's life. `needed` is a floor up to that ceiling: a request the ceiling cannot
+    /// also *retires* its predecessor, so an unclamped chain would retain twice its final region
+    /// until a reclaim pass ran. `needed` is a floor up to that ceiling: a request the ceiling cannot
     /// satisfy is a **typed** exhaustion
     /// (`BeamError::Alloc` of [`AllocKind::Heap`](beam_common::AllocKind), exactly what a failed
     /// [`beam_alloc::Heap::new`] reports, which [`crate::error::enforce_term_heap_limit`] renders as
@@ -2768,6 +2787,12 @@ impl Runtime {
     ///
     /// A run whose window works answers a `used` that does not move with the statement count —
     /// that is the claim `src/eval/scratch/tests.rs` and `PERF.md` pin.
+    ///
+    /// `reclaim` is the sibling **region-reclaim** pass's counters ([`RegionReclaimStats`]) for the
+    /// same runs: the store regions that pass dropped, the arena tail it rewound, and why it
+    /// declined when it did. It is reported here because the two mechanisms share one window, so
+    /// `retired_regions` and `reclaim.store_regions_dropped` are the two halves of the same story —
+    /// a `retired_regions` that stays flat while `store_regions_dropped` climbs is the pass working.
     pub fn eval_region_stats(&self) -> crate::eval::scratch::EvalRegionStats {
         let retired_regions = self.eval_heap_retired.len();
         crate::eval::scratch::EvalRegionStats {
@@ -2784,6 +2809,7 @@ impl Runtime {
             declines: self.eval_scratch.declines,
             last_decline: self.eval_scratch.last_decline,
             words_reclaimed: self.eval_scratch.words_reclaimed,
+            reclaim: self.region_reclaim_stats(),
         }
     }
 
@@ -2814,7 +2840,7 @@ impl Runtime {
         if self.eval_heap.used() == used_before {
             return false;
         }
-        crate::eval::scratch::pin(
+        crate::eval::scratch::pin_transient(
             self,
             "a nested run wrote on the store and its machine's roots cannot be enumerated",
         );

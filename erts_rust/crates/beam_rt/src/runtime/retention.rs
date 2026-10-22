@@ -142,6 +142,48 @@ pub struct RetentionStats {
     /// A table that has only had `push_binary` calls made on it therefore still reads `0` here
     /// (the trap `src/CONTEXT.md` records for anyone pruning that table).
     pub eval_off_heap_handles: usize,
+    /// How many store regions a [`crate::runtime::reclaim`] pass **compacted** (its live words
+    /// moved).
+    ///
+    /// Always `0`: Phase 1a never moves or copies a word — a region either holds a reachable word
+    /// (and is retained whole) or holds none (and is dropped whole). Phase 1b fills it.
+    pub store_compactions: u64,
+    /// How many store words the reclaim pass's drops released, summed
+    /// ([`RegionReclaimStats::store_words_reclaimed`](crate::runtime::RegionReclaimStats)).
+    ///
+    /// A dropped retired region contributes its whole written prefix; the current region
+    /// contributes the window prefix a reset released. [`eval_heap_retired_words`] is the falling
+    /// counterpart of the first half.
+    ///
+    /// [`eval_heap_retired_words`]: RetentionStats::eval_heap_retired_words
+    pub store_words_reclaimed: u64,
+    /// How many **retired** store regions the reclaim pass dropped, summed
+    /// ([`RegionReclaimStats::store_regions_dropped`](crate::runtime::RegionReclaimStats)).
+    ///
+    /// The falling counterpart of
+    /// [`eval_heap_retired_regions`](RetentionStats::eval_heap_retired_regions).
+    pub store_regions_dropped: u64,
+    /// How many times the reclaim pass rewound the **engine arena**
+    /// ([`RegionReclaimStats::arena_reclaims`](crate::runtime::RegionReclaimStats)).
+    pub arena_reclaims: u64,
+    /// How many arena words the rewinds released, summed.
+    ///
+    /// This is the **live** side of the arena, and the counterpart of
+    /// [`arena_words`](RetentionStats::arena_words) — which keeps its cumulative-demand meaning and
+    /// is *not* lowered by a rewind. `beam_engine::ContextHeapStats::live_words` is the same figure
+    /// as a level.
+    pub arena_words_reclaimed: u64,
+    /// How many arena regions the rewinds dropped, summed.
+    pub arena_regions_dropped: u64,
+    /// How many reclaim passes declined because soundness could not be shown.
+    ///
+    /// A decline touches nothing: both regions stay exactly as they were, so this counter and
+    /// [`reclaim_last_decline`](RetentionStats::reclaim_last_decline) are how a measurement tells
+    /// "the pass did nothing" from "the pass had nothing to do".
+    pub reclaim_declines: u64,
+    /// The reason of the most recent reclaim decline — see [`crate::runtime::reclaim`]'s decline
+    /// list. `None` until the first decline.
+    pub reclaim_last_decline: Option<&'static str>,
 }
 
 impl fmt::Display for RetentionStats {
@@ -153,7 +195,10 @@ impl fmt::Display for RetentionStats {
             "arena_words={} arena_allocs={} bif_regions={} bif_words={} \
              bif_peak_used_words={} bif_max_capacity_words={} bif_heaps_taken={} \
              bif_nested_heap_words={} bif_nested_peak_words={} eval_heap_words={} \
-             eval_heap_retired_regions={} eval_heap_retired_words={} eval_off_heap_handles={}",
+             eval_heap_retired_regions={} eval_heap_retired_words={} eval_off_heap_handles={} \
+             store_compactions={} store_words_reclaimed={} store_regions_dropped={} \
+             arena_reclaims={} arena_words_reclaimed={} arena_regions_dropped={} \
+             reclaim_declines={} reclaim_last_decline={}",
             self.arena_words,
             self.arena_allocs,
             self.bif_regions,
@@ -167,6 +212,16 @@ impl fmt::Display for RetentionStats {
             self.eval_heap_retired_regions,
             self.eval_heap_retired_words,
             self.eval_off_heap_handles,
+            self.store_compactions,
+            self.store_words_reclaimed,
+            self.store_regions_dropped,
+            self.arena_reclaims,
+            self.arena_words_reclaimed,
+            self.arena_regions_dropped,
+            self.reclaim_declines,
+            // `Option<&'static str>` has no `Display`: a `None` is the documented "no decline has
+            // happened yet", rendered as `none` so the line stays one `label=value` pair per field.
+            self.reclaim_last_decline.unwrap_or("none"),
         )
     }
 }
@@ -179,6 +234,7 @@ impl Runtime {
     /// the retired store regions), no allocation, no mutation — so a test or a diagnostic may call
     /// it at any point. Nothing in the runtime consults it.
     pub fn retention_stats(&self) -> RetentionStats {
+        let reclaim = self.region_reclaim_stats();
         RetentionStats {
             arena_words: self.arena_alloc_words,
             arena_allocs: self.arena_allocs,
@@ -210,6 +266,14 @@ impl Runtime {
                 .map(|heap| heap.capacity() as u64)
                 .sum(),
             eval_off_heap_handles: self.eval_off_heap.len(),
+            store_compactions: reclaim.store_compactions,
+            store_words_reclaimed: reclaim.store_words_reclaimed,
+            store_regions_dropped: reclaim.store_regions_dropped,
+            arena_reclaims: reclaim.arena_reclaims,
+            arena_words_reclaimed: reclaim.arena_words_reclaimed,
+            arena_regions_dropped: reclaim.arena_regions_dropped,
+            reclaim_declines: reclaim.reclaim_declines,
+            reclaim_last_decline: reclaim.reclaim_last_decline,
         }
     }
 }
@@ -553,6 +617,14 @@ mod tests {
             eval_heap_retired_regions: 6,
             eval_heap_retired_words: 7,
             eval_off_heap_handles: 8,
+            store_compactions: 14,
+            store_words_reclaimed: 15,
+            store_regions_dropped: 16,
+            arena_reclaims: 17,
+            arena_words_reclaimed: 18,
+            arena_regions_dropped: 19,
+            reclaim_declines: 20,
+            reclaim_last_decline: Some("a reason"),
         };
         let line = stats.to_string();
         assert!(!line.contains('\n'), "the diagnostic is one line: {line}");
@@ -565,11 +637,23 @@ mod tests {
             "eval_heap_retired_regions=6",
             "eval_heap_retired_words=7",
             "eval_off_heap_handles=8",
+            "store_compactions=14",
+            "store_words_reclaimed=15",
+            "store_regions_dropped=16",
+            "arena_reclaims=17",
+            "arena_words_reclaimed=18",
+            "arena_regions_dropped=19",
+            "reclaim_declines=20",
+            "reclaim_last_decline=a reason",
         ] {
             assert!(
                 line.contains(field),
                 "the line must carry `{field}`: {line}"
             );
         }
+        // A pass that has never declined renders the documented `none`, so the pair is always
+        // present and a script can grep it unconditionally.
+        let fresh = RetentionStats::default().to_string();
+        assert!(fresh.ends_with("reclaim_last_decline=none"), "{fresh}");
     }
 }

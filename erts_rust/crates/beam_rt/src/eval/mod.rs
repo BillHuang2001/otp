@@ -479,7 +479,27 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
         // The window is closed **without** being reset: the run's result may stand in it, so its
         // words must stay — dropping the window is what makes the next `-eval` run open above
         // this result instead of reusing a mark that could free it (`scratch`).
-        scratch::close(evaluator.ctx.runtime);
+        //
+        // The driver's own live terms ride the close to the **exit-site** region-reclaim pass
+        // (`crate::runtime::reclaim`): its environment plus the one term it is about to hand back —
+        // the result, or a raise's reason and its stacktrace head. A [`Flow::Fatal`] left with a
+        // `BeamError` that may carry a live reason word and exposes no mutable accessor, so the pass
+        // is told to decline instead of guessing.
+        let mut exit_roots: Vec<Eterm> = Vec::new();
+        let mut withheld: Option<&'static str> = None;
+        match &outcome {
+            Ok(value) => exit_roots.push(*value),
+            Err(Flow::Raise { reason, head, .. }) => {
+                exit_roots.push(*reason);
+                if let Some(head) = head {
+                    exit_roots.push(*head);
+                }
+            }
+            Err(Flow::Fatal(_)) => {
+                withheld = Some("the driver left with a raise whose reason word cannot be handed over")
+            }
+        }
+        scratch::close(evaluator.ctx.runtime, &env, &exit_roots, withheld);
         finish(outcome, evaluator.ctx)
     })
 }
@@ -572,8 +592,10 @@ pub(crate) fn apply_eval_closure(
     };
     // This application's copies onto the runtime store are held by whatever machine is driving
     // it (e.g. `lists:map/2`'s own accumulator), which the `-eval` statement window cannot
-    // enumerate — so the window must not be reset across it (`crate::eval::scratch`).
-    scratch::pin(
+    // enumerate — so the window must not be reset across it (`crate::eval::scratch`). The pin is
+    // **transient**: that machine is dropped inside the same top-level statement, so its roots name
+    // nothing once the driver returns.
+    scratch::pin_transient(
         ctx.runtime,
         "a nested -eval closure's copies are held by the machine that applied it",
     );

@@ -382,6 +382,19 @@ impl RunnerState {
         self.jit_mode.unwrap_or_else(super::tier::env_default)
     }
 
+    /// Whether any process's recorded [`BeamError`] is still on the table
+    /// ([`RunnerState::errors`] is non-empty).
+    ///
+    /// A recorded error is the one *unnameable* root family in the runtime: a raise may carry
+    /// [`beam_common::Raise::live_reason`] — a term word — and [`BeamError`] exposes no mutable
+    /// accessor, so a pass that rewinds an arena or drops a store region cannot enumerate it. The
+    /// region-reclaim pass ([`crate::runtime::reclaim`]) therefore **declines** while this answers
+    /// `true`, and the recorded words stay exactly where they were. The condition clears on its own
+    /// when the CLI takes the error ([`RunnerState::take_error`]), which is why the pass is still
+    /// reachable in every ordinary run: the map holds only *finished-and-not-yet-reported* pids.
+    pub(crate) fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
     /// Registers the engine of a freshly spawned process.
     ///
     /// The arguments are **not** asserted stable ([`ProcessEngine::arena_args`] is `false`), so

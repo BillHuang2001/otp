@@ -101,6 +101,20 @@
 //!    declines the boundary and not the exit. That distinction is what makes the exit-site pass
 //!    reachable at all: a compile pins the window on its **first** store-writing nested run, so a
 //!    transient pin honoured at the exit would disable the one case this module exists for.
+//!
+//!    A lifetime pin is honoured twice, because the statement window's own latch does not survive
+//!    its own decline (a declined window's mark jumps to the store's frontier and its latches are
+//!    cleared — correct for that window, but it would leave this pass's lagging cursor free to
+//!    reset or drop the very region the pin just took a word in). [`note_lifetime_store`]
+//!    therefore registers the region **with this pass**: the current region may not be reset for
+//!    the rest of its life as the current region, and every region retired from then on is
+//!    excluded from the retired candidates. Both are lifted by the next growth of the store.
+//!
+//! 3b. **The current region is shared with the statement window.** That window's mark only ever
+//!    advances, so it is this pass's **floor** ([`raise_store_floor`]): a reset below it would
+//!    leave the window pointing above the store's frontier and its next boundary could prove
+//!    nothing. The two mechanisms therefore always agree about which words the current region has
+//!    already been accounted for.
 //! 4. **Only words written inside the window are candidates.** The store's retired candidates are
 //!    `eval_heap_retired[baseline..]` where `baseline` was recorded at [`open`], and the current
 //!    region's candidate range starts at this pass's cursor — never at the region base. Words
@@ -328,6 +342,15 @@ struct Cursor {
     /// `eval_heap_retired.len()` at [`open`]: every retired region at or after this index was
     /// created **inside** the window, so its words were written inside the window.
     store_retired_baseline: usize,
+    /// The base address of a store region a **runtime-lifetime** store took a word in
+    /// ([`note_lifetime_store`]), while that region is still the *current* one.
+    ///
+    /// The current region may not be reset while this names it: a `stabilize_term` word is written
+    /// *after* the pin, and no root family enumerates its holder (`persistent_term`, a timer's
+    /// message, the runner's recorded outcomes), so the descent cannot find it. `None` once a
+    /// growth replaced that region — from then on [`Cursor::store_retired_baseline`] is what keeps
+    /// the retired region that holds it.
+    store_frozen_base: Option<usize>,
 }
 
 /// The region-reclaim pass's per-runtime state.
@@ -405,8 +428,36 @@ pub(crate) fn open(runtime: &mut Runtime) {
         store_base: heap_region_base(&runtime.eval_heap),
         store_mark: runtime.eval_heap.used(),
         store_retired_baseline: runtime.eval_heap_retired.len(),
+        store_frozen_base: None,
     };
     runtime.region_reclaim.cursor = Some(cursor);
+}
+
+/// Registers that a **runtime-lifetime** store just took a word in the store's current region.
+///
+/// Called from [`crate::eval::scratch::pin`], i.e. from the `stabilize_term` family and
+/// [`crate::port::completion`]'s decoded caller tag, *before* the copy that word belongs to is
+/// made. Two protections follow, and they are what keep this pass from freeing a word no descent
+/// can see (the family is deliberately not a root family — the statement window's own pin is the
+/// compensating guard, and that pin does not survive the window's decline):
+///
+/// * **the current region may not be reset** for the rest of its life as the current region
+///   ([`Cursor::store_frozen_base`]) — the pinned word is written *after* this call, so no
+///   watermark can bound it from below;
+/// * **every region retired from now on is excluded** from the retired candidates
+///   ([`Cursor::store_retired_baseline`] moves to `len + 1`, which is exactly the index the current
+///   region will get if a growth retires it), so a growth between the pin and the next pass cannot
+///   turn the pinned word into a droppable region.
+///
+/// A no-op when no window is open: the pin then protects nothing that a pass could reach.
+pub(crate) fn note_lifetime_store(runtime: &mut Runtime) {
+    let Some(cursor) = &mut runtime.region_reclaim.cursor else {
+        return;
+    };
+    cursor.store_frozen_base = Some(heap_region_base(&runtime.eval_heap));
+    cursor.store_retired_baseline = cursor
+        .store_retired_baseline
+        .max(runtime.eval_heap_retired.len() + 1);
 }
 
 /// Closes the region-reclaim window. Called by [`crate::eval::scratch::close`] once the exit-site
@@ -425,8 +476,15 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
         runtime.region_reclaim.decline(reason);
         return;
     }
-    let Some(cursor) = runtime.region_reclaim.cursor else {
+    if runtime.region_reclaim.cursor.is_none() {
         // `refusal` already declined this; kept as a typed belt-and-braces branch.
+        return;
+    }
+    // The current region is **shared** with the statement window, whose mark only ever advances:
+    // a reset below it would leave that window pointing above the store's frontier, so the pass's
+    // floor is whichever of the two is higher. Adopting it is not a decline and moves no word.
+    raise_store_floor(runtime);
+    let Some(cursor) = runtime.region_reclaim.cursor else {
         return;
     };
     let live = live_ranges(runtime, cursor);
@@ -434,7 +492,6 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
         // Nothing was written inside the window: no work, and no descent.
         return;
     }
-    let width = size_of::<Eterm>();
     let mut hits = vec![false; live.len()];
     let mut roots: Vec<Eterm> = Vec::with_capacity(input.value_roots.len() + 64);
     roots.extend_from_slice(input.value_roots);
@@ -490,6 +547,26 @@ pub(crate) fn pass(runtime: &mut Runtime, input: PassInput<'_>) {
     // The store may have grown inside the window since the cursor was taken; a pass never leaves a
     // cursor pointing above the frontier.
     advance_cursor(runtime);
+}
+
+/// Raises the pass's current-region floor to the statement window's mark, when the two name the
+/// same region.
+///
+/// See [`crate::eval::scratch::ScratchState::current_region`]: the statement window's mark is the
+/// frontier it has already accounted for, so it is a floor rather than a candidate range — lowering
+/// the store below it would make the *next* boundary refuse "the window's mark stands above the
+/// store's frontier". `O(1)`, and a no-op when no statement window is open (no `-eval` route, the
+/// scratch mechanism switched off) or when a growth moved the region.
+fn raise_store_floor(runtime: &mut Runtime) {
+    let Some((base, mark)) = runtime.eval_scratch.current_region() else {
+        return;
+    };
+    let Some(cursor) = &mut runtime.region_reclaim.cursor else {
+        return;
+    };
+    if cursor.store_base == base && mark > cursor.store_mark {
+        cursor.store_mark = mark;
+    }
 }
 
 /// The pass's cheap preconditions — each one a recorded reason, never a guess.
@@ -551,7 +628,10 @@ fn live_ranges(runtime: &mut Runtime, cursor: Cursor) -> Vec<Candidate> {
     // the window) invalidates the cursor's *address*, not the retired chain, so it only costs the
     // current-region half — see `advance_cursor`.
     let base = heap_region_base(&runtime.eval_heap);
-    if base == cursor.store_base && runtime.eval_heap.used() > cursor.store_mark {
+    if base == cursor.store_base
+        && runtime.eval_heap.used() > cursor.store_mark
+        && cursor.store_frozen_base != Some(base)
+    {
         candidates.push(Candidate {
             target: Target::StoreCurrent,
             range: (
@@ -677,6 +757,12 @@ fn advance_cursor(runtime: &mut Runtime) {
     if base != cursor.store_base || used < cursor.store_mark {
         cursor.store_base = base;
         cursor.store_mark = used;
+        // A freeze applies to the region it was taken in and to nothing else: keep it only if it
+        // already names this (new) current region — which it does when the pin happened after the
+        // growth that this advance is catching up with.
+        if cursor.store_frozen_base != Some(base) {
+            cursor.store_frozen_base = None;
+        }
     }
 }
 
@@ -698,3 +784,6 @@ impl Runtime {
         self.region_reclaim.set_config(config);
     }
 }
+
+#[cfg(test)]
+mod tests;
