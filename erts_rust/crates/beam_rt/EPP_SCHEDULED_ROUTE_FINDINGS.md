@@ -80,7 +80,7 @@ and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_wind
 On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
 The pool rewind that follows stays gated on `safe_to_rewind`: only a call the six escaping `DispatchHooks` seams and reentrancy cannot have run on, with an `Ok` result, is rewound to its own start offset.
 A graph that holds a reference is neither moved nor rewound — a reference's identity is its address.
-The table-less `-eval` route keeps the older gated move: it has no collector, so the copy lands on the pointer-stable, never-reset runtime store (`Runtime::eval_heap` + `Runtime::eval_off_heap`) instead of an object a collection would relocate.
+The table-less `-eval` route keeps the older gated move: it has no collector, so the copy lands on the pointer-stable runtime store (`Runtime::eval_heap` + `Runtime::eval_off_heap`) instead of an object a collection would relocate.
 The invariant is [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)'s and [`src/context/calls.rs`](src/context/calls.rs) implements it.
 
 ## 4. Where the refusal lives

@@ -77,8 +77,8 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   this route `ExecutionContext::alloc_words`/`alloc_words_rooted` (`context/execution.rs:498,509`)
   bypass the process heap entirely and go to `Runtime::alloc_words` → `Runtime::arena`
   (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
-  ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
-  arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
+  ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable** arena (no
+  region of it ever moves, and nothing collects it); `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
 - **Four storage regions, all observable: one bounded, one depth-sized, two bounded by the region-reclaim pass.** `arena` (`:240`), `beam_engine`-owned, hands out words that stay at their address and is rewound above `src/runtime/reclaim.rs`'s mark once nothing reachable stands there; the pooled BIF heap
   `bif_heaps: Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap`, **depth-sized** —
   `bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` = 1 MiB for a nested one, self-tuned
@@ -429,7 +429,7 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `runtime.rs` + `runtime/` → the `Runtime` façade, the scheduler-pass family and the GC/ETS-owner
   state (`runtime/CONTEXT.md`); its pid-keyed bookkeeping (`group_leaders`/`async_dist`/`monitor_nodes`/
   `timer_resumes`) and the `runtime/timer_wakes.rs` `TimerWakes` mirror are `crate::hasher` maps.
-- `runtime/reclaim.rs` + `runtime/reclaim/` → the **region-reclaim pass** over the runtime's two never-freed
+- `runtime/reclaim.rs` + `runtime/reclaim/` → the **region-reclaim pass** over the runtime's two long-lived
   term regions, **two mechanisms at two sites** (`runtime/CONTEXT.md` *The region-reclaim pass*): the
   whole-region actions (`reclaim.rs` — drop a whole-dead `eval_heap_retired` region, reset the current
   region's dead prefix, Tier A `arena.heap_rewind`) and the **store move** (`reclaim/compact.rs` — evacuate a

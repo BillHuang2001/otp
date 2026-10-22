@@ -10,7 +10,7 @@ Detail: [`pool/CONTEXT.md`](pool/CONTEXT.md).
 
 ### The table-less arm and its store
 `RuntimeContext`'s copy-out has **two** destinations, chosen by who is running (`calls.rs::rehome_container_result`): a scheduled process gets the result on its own **scanned** young heap (`move_result_into_process_heap`), while the **table-less** route (the `-eval` evaluator, `-s`/`-run` and every single-pass `run_*` entry) copies it onto the runtime's long-lived `Runtime::eval_heap` + `Runtime::eval_off_heap` store (`pool.rs::move_result_into_runtime_store`).
-That store never frees its regions — it grows by **region retirement** (`Runtime::grow_eval_heap`), so the rewind it licenses is sound only for a `safe_to_rewind` call that succeeded, and a reference-holding graph is neither moved nor rewound.
+That store grows by **region retirement** (`Runtime::grow_eval_heap`), so the rewind it licenses is sound only for a `safe_to_rewind` call that succeeded, and a reference-holding graph is neither moved nor rewound; the regions it retires are reclaimed by `src/runtime/reclaim.rs` alone, at the two sites where nothing is executing (the `-eval` statement boundary and the driver exit), where a whole-dead region is dropped and a partially live one is evacuated into one fresh region with every root rewritten.
 The copy, the rewind's soundness argument, the growth/refusal rules and the measured counter deltas: [`pool/CONTEXT.md`](pool/CONTEXT.md).
 
 ### The dispatch memo · `DispatchHooks`

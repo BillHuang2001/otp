@@ -124,7 +124,7 @@ There is **no in-tree collection tracer** and none is needed for this question; 
   1. the process's own `beam_gc` young heap (`process.heap_mut()` — the only *scanned* region, target of both alloc seams *and* of the process-route BIF copy-out);
   2. the runtime's pointer-stable `arena` (`Runtime::alloc_words`, unscanned — the refusal-only fallback);
   3. the pooled `beam_alloc::Heap` regions (`Runtime::take_bif_heap`/`put_bif_heap`, where a registered BIF/NIF builds its result, and which `call_registered` rewinds to that call's `mark` once the result has been copied out);
-  4. the **table-less store** (`Runtime::eval_heap`, its off-heap payload owner `Runtime::eval_off_heap`, and its retired regions `Runtime::eval_heap_retired` — the `-eval`/single-pass copy-out's destination; pointer-stable, never `reset`, grown only by region replacement, and retained for the run's life because Milestone 1 has no collector on it).
+  4. the **table-less store** (`Runtime::eval_heap`, its off-heap payload owner `Runtime::eval_off_heap`, and its retired regions `Runtime::eval_heap_retired` — the `-eval`/single-pass copy-out's destination; pointer-stable, grown only by region replacement, with `eval_heap`'s regions reclaimed only by the region-reclaim pass at a site where nothing is executing and `eval_off_heap` only ever grown).
 
 ### A young-space replacement needs a complete root set, and a live heap must serve its own builds
 
