@@ -115,7 +115,10 @@ mod step;
 mod supplied_stacktrace;
 #[allow(unsafe_code)]
 pub mod terms;
-pub use context::{BifOutcome, ExecutionContext, FunOutcome, Mailbox, MinimalContext, TraceEvent};
+pub use context::{
+    BifOutcome, ContextHeapStats, ExecutionContext, FunOutcome, HeapMark, Mailbox, MinimalContext,
+    TraceEvent,
+};
 pub use error::{bad_register, blocked, suspended, unknown_label, unsupported};
 pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};

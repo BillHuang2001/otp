@@ -77,6 +77,8 @@ use super::bridges::{DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridg
 use super::dispatch::DispatchHooks;
 use super::export_gate::ExportGateBridge;
 use super::fun_identity::FunIdentityBridge;
+pub(super) mod perf_counters;
+
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
 use super::persistent_term::PersistentTermBridge;
@@ -139,8 +141,15 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// # The cap
     ///
-    /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]), never below
-    /// [`Runtime::bif_heap_words`], and capped by a configured `+hmax`
+    /// The new frontier is the old capacity doubled ([`usize::saturating_mul`]) — **from the
+    /// region's own capacity**, never floored at [`Runtime::bif_heap_words`]: a nested call's region
+    /// is seeded far smaller than the outermost one on purpose
+    /// ([`Runtime::take_bif_heap`](crate::Runtime::take_bif_heap)), and jumping it straight back to a
+    /// full-size region is exactly the `nesting depth × heap_words` retention the seed removed. A
+    /// small region therefore climbs to whatever it needs in geometric steps, which is what the
+    /// doubling is for.
+    ///
+    /// The growth is capped by a configured `+hmax`
     /// ([`crate::config::RuntimeConfig::heap_options`]'s
     /// [`policy`](crate::config::HeapOptions::policy) `max_heap_words`; `0` is "no cap"). When the
     /// cap leaves no room (`computed <= capacity()`) the heap is returned **as it is**, so an
@@ -160,10 +169,7 @@ impl<'a> RuntimeContext<'a> {
         if heap.available() >= heap.capacity() / BIF_HEAP_GROWTH_DIVISOR {
             return Ok(heap);
         }
-        let doubled = heap
-            .capacity()
-            .saturating_mul(2)
-            .max(self.runtime.bif_heap_words);
+        let doubled = heap.capacity().saturating_mul(2);
         let max = self.runtime.config().heap_options().policy().max_heap_words;
         let grown = if max == 0 { doubled } else { doubled.min(max) };
         if grown <= heap.capacity() {
@@ -173,8 +179,9 @@ impl<'a> RuntimeContext<'a> {
         }
         // Retire the exhausted region — never freed, never moved, so the words another caller owns
         // in it stay valid — and continue the run in a fresh, larger frontier.
+        perf_counters::bump(|c| &mut c.pool_grown);
         self.runtime.put_bif_heap(heap);
-        Heap::new(grown)
+        self.runtime.take_fresh_bif_heap(grown)
     }
 
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
@@ -257,6 +264,9 @@ impl<'a> RuntimeContext<'a> {
         // another owner still holds. `mark == 0` (a heap taken clean) makes that the plain
         // `reset()` it used to be. See [`Self::call_registered`]'s copy-out rule.
         let mark = heap.used();
+        if mark != 0 {
+            perf_counters::bump(|c| &mut c.pool_dirty);
+        }
         // `self_pid` is the pid this context runs as: `erlang:self/0` reports it, and a
         // `receive` in a fun a BIF applies resolves its mailbox against it.
         let self_pid = self.mailbox_pid;
@@ -365,6 +375,9 @@ impl<'a> RuntimeContext<'a> {
         // [`Self::reentrancy_capable`]). Hoisted out of the dispatch block below because the
         // result-rewind gate needs it too.
         let reentrant = Self::reentrancy_capable(args);
+        if reentrant {
+            perf_counters::bump(|c| &mut c.reentrant);
+        }
         // Whether this call must **hold the shared `TableRegistry` cell** for its whole
         // duration. This is deliberately a *separate* predicate from `reentrant` (which keeps
         // its own meaning for the `safe_to_rewind` gate below): a reentrant call no longer
@@ -469,11 +482,17 @@ impl<'a> RuntimeContext<'a> {
             //
             // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must degrade to
             // "no ETS", never panic.
+            if lent_tables.is_some() {
+                perf_counters::bump(|c| &mut c.tables_lent);
+            }
             let mut held_tables = if lent_tables.is_none() && install_tables {
                 tables_handle.try_borrow_mut().ok()
             } else {
                 None
             };
+            if held_tables.is_some() {
+                perf_counters::bump(|c| &mut c.tables_held);
+            }
             // `held_tables` must outlive `tables` (it owns the cell borrow the latter reborrows).
             let mut tables: Option<&mut TableRegistry> = match lent_tables.as_deref_mut() {
                 Some(lent) => Some(lent),
@@ -485,6 +504,7 @@ impl<'a> RuntimeContext<'a> {
             // answers from the runtime's own port table (see `crate::port`).
             let mut ports = RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
             if uses_dict {
+                perf_counters::bump(|c| &mut c.arm_dict);
                 // The running process's directory: resolve the table the same way the
                 // mailbox/`self` seam does — the caller-supplied table (a scheduler pass)
                 // when there is one, else the runtime's own process table (a `-eval`
@@ -518,6 +538,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_process_hook {
+                perf_counters::bump(|c| &mut c.arm_process_hook);
                 // The eleven process/name/global-state BIFs: the bridge borrows the process
                 // table (the caller-supplied pass table when there is one, else the
                 // runtime's own) *and* the runtime (for the `process_info` arena), exactly
@@ -550,6 +571,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_nif_loader {
+                perf_counters::bump(|c| &mut c.arm_nif_loader);
                 // `erlang:load_nif/2`: the NIF bridge needs `&mut Runtime` (to store the loaded
                 // library in the runtime's NIF registry), so it is the only runtime borrow in
                 // this arm — mutually exclusive with the dict/fun-caller arms. Its host shares
@@ -585,6 +607,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_record_source {
+                perf_counters::bump(|c| &mut c.arm_record_source);
                 // `records:get_definition/2` answers from the *loaded module's* `Recs` chunk,
                 // which lives in the code server's module map — a `&CodeServer` borrow, so it
                 // is its own mutually exclusive arm (see [`RecordBridge`]). The BIF applies no
@@ -612,6 +635,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_export_gate {
+                perf_counters::bump(|c| &mut c.arm_export_gate);
                 // `erlang:binary_to_term/2`: the `[safe]` decode's `EXPORT_EXT` check asks "is
                 // this `M:F/A` exported by code loaded *now*?", which only the runtime knows —
                 // the loaded-module cache plus the registered BIFs (see [`ExportGateBridge`]).
@@ -641,6 +665,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_send_hook {
+                perf_counters::bump(|c| &mut c.arm_send_hook);
                 // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
                 // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
                 // path, so nothing about delivery is re-implemented), making it mutually
@@ -675,6 +700,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_module_info {
+                perf_counters::bump(|c| &mut c.arm_module_info);
                 // `erlang:get_module_info/1,2`: answers from the loaded module's IR — a
                 // `&CodeServer` borrow, its own mutually exclusive arm. It applies no fun
                 // argument.
@@ -701,6 +727,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_persistent_term {
+                perf_counters::bump(|c| &mut c.arm_persistent_term);
                 // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
                 // node-global store, plus a clone of the shared atom-table handle so the
                 // store can compare keys/values **structurally** (`beam_term::eq`) — two
@@ -751,6 +778,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else if uses_runtime_hooks {
+                perf_counters::bump(|c| &mut c.arm_runtime_hooks);
                 // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
                 // reference space (`&mut Runtime`) plus the caller's process table
                 // (`&mut ProcessTable`) — the same pair the dict arm resolves, so it is its
@@ -783,6 +811,7 @@ impl<'a> RuntimeContext<'a> {
                 }
                 invoke_registered(bif, arity, &mut context, args)
             } else {
+                perf_counters::bump(|c| &mut c.arm_fun_caller);
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
                 // inherits the caller's module name so a nested call still knows its call site.
@@ -897,6 +926,9 @@ impl<'a> RuntimeContext<'a> {
         // `system_limit` the tail's own `enforce_term_heap_limit` maps an allocation refusal to. The
         // pool is left un-rewound, the same residual a failed move already has.
         let aliased = alias.get();
+        if result.as_ref().is_ok_and(|term| Self::result_is_foreign_container(*term)) {
+            perf_counters::bump(|c| &mut c.foreign_result);
+        }
         // The witness's own tally: a test that asserts "no copy ran for this immediate" is only
         // meaningful once the cell is known to have been **set** by the `ets` helper (a witness
         // that was never installed would skip the copy for the trivial reason that `aliased` is
@@ -921,6 +953,7 @@ impl<'a> RuntimeContext<'a> {
                 notes::note_alias_copy_pool(mark, heap.used());
                 match self.rehome_container_result(term) {
                     Some(copied) => {
+                        perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
                     }
@@ -931,15 +964,41 @@ impl<'a> RuntimeContext<'a> {
                         result = Err(BeamError::SystemLimit);
                     }
                 }
-            } else if Self::graph_holds_reference(term) {
+            } else if move_container && Self::graph_holds_reference(term) {
+                perf_counters::bump(|c| &mut c.ref_held);
                 // A reference's identity **is** its address (see the comment above): the copy
                 // would be a different term, so the result stays where it is and the pool is
                 // not rewound.
+                //
+                // # Why the walk is gated on `move_container` — it is unobservable otherwise
+                //
+                // The walk's answer has exactly two consumers: this arm, which only sets
+                // `rewind = false`, and the `move_container` arm below, which copies the result
+                // **and then** sets `rewind = safe_to_rewind`. When `move_container == false` —
+                // that is, `mailbox_table.is_none() && !safe_to_rewind` — the copy arm cannot run
+                // either (it is gated on the same `move_container`), and `rewind` is already
+                // `false`: `move_container == false` implies `!safe_to_rewind`, and `rewind` is
+                // only ever assigned `safe_to_rewind`. So both possible answers of the walk
+                // produce the **same** `result` and the same `rewind` — the walk is unobservable
+                // in that state, and skipping it changes nothing but its own diagnostic counters.
+                // (`result` is never modified by the walk, so no term moves either way.)
+                //
+                // Where this bites hardest is the table-less route's **reentrant** call — a
+                // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
+                // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries and
+                // the in-process `compile:file/2` route of contract A.9): `!reentrant` is one
+                // conjunct of `safe_to_rewind`, so such a call has `move_container == false` and
+                // never walks its result. That is exactly the **accumulator** shape — a container
+                // the applied fun returned, i.e. a whole intermediate compiler AST — so the
+                // per-call walk of the entire accumulator disappears where it was quadratic
+                // (measured on `lib/stdlib/src/string.erl`: `lists:foldl/3` + `lists:map/2` + a
+                // share of `lists:foldr/3` were 236.5 M + 76.1 M of 408.5 M walk visits).
                 rewind = false;
             } else if move_container {
                 // The copy first and, only once it succeeded, the rewind: a refused copy leaves
                 // both the result and the pool exactly as they were.
                 if let Some(copied) = self.rehome_container_result(term) {
+                    perf_counters::bump(|c| &mut c.rehomed);
                     result = Ok(copied);
                     rewind = safe_to_rewind;
                 }
@@ -967,6 +1026,7 @@ impl<'a> RuntimeContext<'a> {
         drop(atoms);
         drop(memory);
         if !pending.is_empty() {
+            perf_counters::bump(|c| &mut c.intern_commit);
             self.runtime.code_server.intern_pending(&pending);
         }
         // Rewind to this call's mark and give the heap back to the pool. Every word this call
@@ -986,6 +1046,9 @@ impl<'a> RuntimeContext<'a> {
         // leaves the heap untouched (its own contract), so the honest answer is to surface it —
         // that is a `BeamError::BadArg` out of the same `Result` this call already returns, never
         // a recycled live word and never a silently mis-sized pool.
+        if rewind {
+            perf_counters::bump(|c| &mut c.rewound);
+        }
         let rewound = if rewind { heap.reset_to(mark) } else { Ok(()) };
         self.runtime.put_bif_heap(heap);
         rewound?;
@@ -1070,6 +1133,35 @@ impl<'a> RuntimeContext<'a> {
             && !beam_term::literal::is_literal(term)
     }
 
+    /// The cheap tag pre-check a word must pass before the reference walk spends anything on it —
+    /// either to **visit** it or to push it as a child candidate.
+    ///
+    /// A word that fails it can never lead to a reference, and it is exactly the walk's admission
+    /// test (its old inline form), factored out because the cons spin below asks it per **child**
+    /// word *before* pushing: a rejected child then costs the test alone instead of a push plus a
+    /// pop plus the same test.
+    ///
+    /// Each conjunct rejects a class of word that must never be dereferenced:
+    ///
+    /// * [`beam_term::literal::is_literal`] — a frozen code constant lives in the literal area and
+    ///   can name nothing on this heap. (It is *also* true for a small integer, whose low four bits
+    ///   are all set, so the immediates that dominate a cons spine are rejected on the first test.)
+    /// * [`beam_term::tag::is_term_word`] — a word whose primary tag is `HEADER` is **not a term at
+    ///   all**, yet the frozen `is_boxed`/`is_list` bit tricks are true for it, and its "pointer"
+    ///   can be `NULL` (`THE_NON_VALUE`) or a plausible-looking non-address.
+    /// * the container tricks themselves ([`beam_term::boxed::is_boxed`] /
+    ///   [`beam_term::prelude::is_list`]) — an atom, a pid, a port and `NIL` are neither a boxed
+    ///   term nor a cons cell.
+    ///
+    /// `is_term_word && is_boxed` is [`beam_term::boxed::is_boxed_term`], so this is the same
+    /// predicate the walk applied inline before, with the same three guards in the same meaning.
+    #[inline]
+    fn walk_may_lead_further(word: Eterm) -> bool {
+        !beam_term::literal::is_literal(word)
+            && beam_term::tag::is_term_word(word)
+            && (beam_term::boxed::is_boxed(word) || beam_term::prelude::is_list(word))
+    }
+
     /// Whether anything in the graph rooted at `term` is a **reference** term — the one shape that
     /// must never be moved off the pooled heap.
     ///
@@ -1102,6 +1194,16 @@ impl<'a> RuntimeContext<'a> {
     /// documents at its call site), never a wrong move. A *shared* subgraph is re-walked once per
     /// parent, which costs a bounded constant factor and no allocation.
     ///
+    /// A **cons spine** is the one shape that does not pay the worklist at all. It is the walk's
+    /// common input — a `lists:reverse/1` result, a `lists:foldl/3` accumulator, an iolist — and
+    /// its cells have their two children at the fixed offsets `0` and `1`. So a cell is read
+    /// directly, only a child that could lead further is pushed
+    /// ([`Self::walk_may_lead_further`]), and a CDR that is itself a readable cons cell becomes the
+    /// next iteration of the same loop instead of a worklist round trip: one loop iteration per
+    /// cell instead of a push, a pop and a full admission test per cell. Everything the generic
+    /// step enforces still holds on the spine — the same guards, one budget charge per
+    /// dereferenced object, one visit per object.
+    ///
     /// Literals are skipped: a frozen code constant lives in the literal area and can name nothing
     /// on this heap. So is every word that is **not a readable term** (see *Safety*).
     ///
@@ -1119,72 +1221,113 @@ impl<'a> RuntimeContext<'a> {
     fn graph_holds_reference(term: Eterm) -> bool {
         #[cfg(test)]
         notes::note_walk_call();
+        perf_counters::bump(|c| &mut c.walk_calls);
+        // The visit count is accumulated **locally** and folded in exactly once, at the walk's
+        // single exit ([`perf_counters::add_visits`]): a `bump` per visited object would put an
+        // `enabled()` load and a thread-local `borrow_mut` in the innermost loop, and a large
+        // in-process compile visits 10^8 objects. Two answers leave the loop early — an exhausted
+        // budget and a reference header — so the loop is `break 'walk`-ed rather than `return`ed
+        // and `found` carries the answer out; that keeps the fold single-sited by construction,
+        // so no future exit can silently under-count.
+        let mut visits: u64 = 0;
+        let mut found = false;
         let mut work = Walklist::new();
         let mut budget = WALK_VISIT_BUDGET;
         work.push(term);
-        while let Some(item) = work.pop() {
-            // Three words can reach the worklist without being a readable container, and each is
-            // skipped here so nothing below ever dereferences it.
-            //
-            // * A literal is a frozen code constant, which lives in the literal area and can name
-            //   nothing on this heap.
-            // * An immediate is neither boxed nor a cons.
-            // * A word whose primary tag is `HEADER` is **not a term at all**
-            //   ([`beam_term::tag::is_term_word`]): the frozen `is_boxed`/`is_list` bit tricks are
-            //   also true for it, and `boxed_val`/`ptr_val` of one is `NULL` — the C ABI's
-            //   `THE_NON_VALUE` (`make_header(0, 0)`) is exactly such a word, and it is a shape a
-            //   registered BIF may legitimately return.
-            if beam_term::literal::is_literal(item)
-                || !beam_term::tag::is_term_word(item)
-                || !(beam_term::boxed::is_boxed_term(item) || beam_term::prelude::is_list(item))
-            {
+        'walk: while let Some(popped) = work.pop() {
+            // Three kinds of word can reach the worklist without being a readable container, and
+            // each is skipped here so nothing below ever dereferences it: a literal (a frozen code
+            // constant, which names nothing on this heap), an immediate, and a `HEADER`-tagged
+            // word, which is not a term at all ([`Self::walk_may_lead_further`]).
+            if !Self::walk_may_lead_further(popped) {
                 continue;
             }
-            // The address `item`'s pointer bits name, or `None` when no live term can be there —
+            // The address `popped`'s pointer bits name, or `None` when no live term can be there —
             // the same guard the unscanned-root valve applies
             // ([`super::gc::dereferenceable_pointer`]), so the two walks cannot disagree about
             // which words are readable.
-            let Some(address) = super::gc::dereferenceable_pointer(item) else {
+            let Some(address) = super::gc::dereferenceable_pointer(popped) else {
                 continue;
             };
-            let address = address as *const Eterm;
-            #[cfg(test)]
-            notes::note_walk_visit();
-            // The budget is the only bound the walk has (see *The walk*): a forged cycle would
-            // otherwise spin here forever.
-            if budget == 0 {
-                return true;
-            }
-            budget -= 1;
-            if beam_term::prelude::is_list(item) {
+            // Walk the **cons spine** `popped` starts in place (see *The walk*): `item`/`cell` are
+            // the current cell, and the loop advances to the CDR while it is itself a readable cons
+            // cell, so only a spine's non-cons children ever reach the worklist.
+            let mut item = popped;
+            let mut address = address;
+            loop {
+                #[cfg(test)]
+                notes::note_walk_visit();
+                visits += 1;
+                // The budget is the only bound the walk has (see *The walk*): a forged cycle would
+                // otherwise spin here forever. It is charged **per dereferenced object**, exactly
+                // as the generic step charged it, so exhaustion answers the same `true`.
+                if budget == 0 {
+                    found = true;
+                    break 'walk;
+                }
+                budget -= 1;
+                if !beam_term::prelude::is_list(item) {
+                    let address = address as *const Eterm;
+                    // SAFETY: `item` passed [`Self::walk_may_lead_further`] and is not a cons, so it
+                    // is a boxed **term** word ([`beam_term::boxed::is_boxed_term`]) whose object
+                    // pointer is non-null and aligned; the word at that address is its live header.
+                    unsafe {
+                        let header = *address;
+                        if beam_term::boxed::is_ref_thing_header(header)
+                            || beam_term::boxed::is_external_ref_header(header)
+                        {
+                            found = true;
+                            break 'walk;
+                        }
+                        // SAFETY: `address` heads the live object `header` names, so
+                        // `for_each_child_slot` visits exactly that shape's term-reference slots —
+                        // offsets relative to the header word, every one in bounds and live. A child
+                        // that cannot lead further is not queued, so every worklist item is a
+                        // candidate for a visit rather than something to be re-rejected.
+                        beam_term::layout::for_each_child_slot(header, address, |offset| {
+                            let child = *address.add(offset);
+                            if Self::walk_may_lead_further(child) {
+                                work.push(child);
+                            }
+                        });
+                    }
+                    break;
+                }
+                let cell = address as *const Eterm;
                 // SAFETY: `item` is a term word with the `LIST` primary tag whose cell pointer is
                 // non-null and aligned, so the two words at that address are its live `car` and
                 // `cdr`.
-                unsafe {
-                    work.push(*address);
-                    work.push(*address.add(1));
+                let (car, cdr) = unsafe { (*cell, *cell.add(1)) };
+                // The CAR is a candidate only when it could lead further: a spine of immediates —
+                // the accumulator this walk is called for — pushes nothing at all.
+                if Self::walk_may_lead_further(car) {
+                    work.push(car);
                 }
-                continue;
-            }
-            // SAFETY: `item` is a boxed **term** word ([`beam_term::boxed::is_boxed_term`]) whose
-            // object pointer is non-null and aligned, so the word at that address is its live
-            // header.
-            unsafe {
-                let header = *address;
-                if beam_term::boxed::is_ref_thing_header(header)
-                    || beam_term::boxed::is_external_ref_header(header)
-                {
-                    return true;
+                // The CDR: stay on the spine when it is itself a readable cons cell, and otherwise
+                // queue it only when it could lead further — an improper tail (a boxed object) is a
+                // real candidate, an immediate or a literal is not.
+                if Self::walk_may_lead_further(cdr) {
+                    if beam_term::prelude::is_list(cdr) {
+                        match super::gc::dereferenceable_pointer(cdr) {
+                            Some(next) => {
+                                item = cdr;
+                                address = next;
+                                continue;
+                            }
+                            // A `LIST` word whose cell pointer is `NULL` or mis-aligned is skipped,
+                            // which is exactly what the admission step above would do with it.
+                            None => break,
+                        }
+                    }
+                    work.push(cdr);
                 }
-                // SAFETY: `address` heads the live object `header` names, so `for_each_child_slot`
-                // visits exactly that shape's term-reference slots — offsets relative to the
-                // header word, every one in bounds and live.
-                beam_term::layout::for_each_child_slot(header, address, |offset| {
-                    work.push(*address.add(offset));
-                });
+                break;
             }
         }
-        false
+        perf_counters::add_visits(visits);
+        #[cfg(test)]
+        notes::note_walk_visit_fold(visits as usize);
+        found
     }
 
     /// Moves a container a **scratch region** owns onto a region that **outlives the call**,
@@ -1581,10 +1724,17 @@ impl RuntimeContext<'_> {
     ) -> Result<Eterm> {
         // A loaded NIF library wins over every other route: a NIF replaces the Erlang stub of
         // the same `{module, function, arity}`. On a miss this is a no-op (`Ok(None)`).
+        perf_counters::bump(|c| &mut c.call_bif);
+        perf_counters::note_key(module, function, arity);
+        if !self.runtime.nifs.borrow().is_empty() {
+            perf_counters::bump(|c| &mut c.nif_probe);
+        }
         if let Some(term) = self.try_call_nif(module, function, arity, args)? {
+            perf_counters::bump(|c| &mut c.nif_hit);
             return Ok(term);
         }
         if let Some(result) = self.try_native(module, function, arity, args) {
+            perf_counters::bump(|c| &mut c.native_hit);
             // The floor builds its terms on the same pooled BIF heap, so an exhaustion
             // there is the same documented limit (see `error::enforce_term_heap_limit`).
             return result.map_err(error::enforce_term_heap_limit);
@@ -1594,6 +1744,7 @@ impl RuntimeContext<'_> {
         // `BifRegistry::lookup`, which stays the single source of truth — and the resolved
         // `BifFn` is what `call_registered` invokes (no second registry lookup).
         if let Some(bif) = dispatch.bif {
+            perf_counters::bump(|c| &mut c.registered);
             // A table-creating `ets:new/2` is observed here so the runtime's owner index can
             // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
             // a `named_table` is reachable through the registry's *public* surface, so only it
@@ -1638,6 +1789,7 @@ impl RuntimeContext<'_> {
         // time a module has to be resolved, so an external call reaches the real stdlib
         // without an explicit `-pa`. A miss here is not fatal: `CodeServer::load` below
         // reports it, naming every directory searched.
+        perf_counters::bump(|c| &mut c.external);
         let _ = self.runtime.find_module_file(module);
         let loaded = match self.runtime.code_server.load(module) {
             Ok(loaded) => loaded,
@@ -1896,6 +2048,18 @@ fn hint_grow_gate(process: &mut beam_process::Process, hint: usize) {
     }
     #[cfg(test)]
     notes::note_hint_grow();
+    if crate::debug_trace::heap_enabled() {
+        crate::debug_trace::heap(format_args!(
+            "copy-out grow pid={:?} hint={hint} request={request} available={} young_cap={} chain_used={} chain_spaces={} debt={} exempt={}",
+            process.pid(),
+            process.heap_mut().available(),
+            process.collector().young().capacity_words(),
+            process.heap_used_words(),
+            process.collector().young_space_count(),
+            process.collection_debt(),
+            process.is_relocation_exempt(),
+        ));
+    }
     if process.grow_nursery(request).is_err() {
         // A `max_heap_size` ceiling: degrade to the bare hint, never a hard failure.
         let _ = process.grow_nursery(hint);
@@ -1972,6 +2136,8 @@ mod notes {
         static EMPTY_DESTINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static WALK_CALLS: Cell<usize> = const { Cell::new(0) };
         static WALK_VISITS: Cell<usize> = const { Cell::new(0) };
+        static WALK_VISIT_FOLDS: Cell<usize> = const { Cell::new(0) };
+        static WALK_FOLDED_VISITS: Cell<usize> = const { Cell::new(0) };
         static WALK_HASH_INSERTS: Cell<usize> = const { Cell::new(0) };
         static WALK_SPILLS: Cell<usize> = const { Cell::new(0) };
         static ALIAS_COPIES: Cell<usize> = const { Cell::new(0) };
@@ -2031,6 +2197,27 @@ mod notes {
     /// Records one **dereferenced object** the reference walk visited.
     pub(super) fn note_walk_visit() {
         WALK_VISITS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records the walk's **single** per-invocation fold of its locally accumulated visit count —
+    /// the test-only counterpart of [`perf_counters::add_visits`], called from the same statement
+    /// so the two can never drift.
+    ///
+    /// `folds` counts the folds (one per finished walk), `visits` sums what they carried. A walk
+    /// that exits from one of its two early `break 'walk` sites therefore still folds exactly once,
+    /// which is what makes [`walk_fold_snapshot`]-vs-[`walk_snapshot`] an exactness pin rather than
+    /// a spot check: the folded total must equal the per-visit counter for every walk shape.
+    pub(super) fn note_walk_visit_fold(visits: usize) {
+        WALK_VISIT_FOLDS.with(|c| c.set(c.get() + 1));
+        WALK_FOLDED_VISITS.with(|c| c.set(c.get() + visits));
+    }
+
+    /// This thread's `(folds, folded visits)` — see [`note_walk_visit_fold`].
+    pub(super) fn walk_fold_snapshot() -> (usize, usize) {
+        (
+            WALK_VISIT_FOLDS.with(Cell::get),
+            WALK_FOLDED_VISITS.with(Cell::get),
+        )
     }
 
     /// This thread's count of **learned-hint** growths ([`note_hint_grow`]), i.e. of copies the
@@ -2115,6 +2302,8 @@ mod notes {
         EMPTY_DESTINATION_ATTEMPTS.with(|c| c.set(0));
         WALK_CALLS.with(|c| c.set(0));
         WALK_VISITS.with(|c| c.set(0));
+        WALK_VISIT_FOLDS.with(|c| c.set(0));
+        WALK_FOLDED_VISITS.with(|c| c.set(0));
         WALK_HASH_INSERTS.with(|c| c.set(0));
         WALK_SPILLS.with(|c| c.set(0));
         ALIAS_COPIES.with(|c| c.set(0));
@@ -2148,3 +2337,175 @@ mod tests;
 #[cfg(test)]
 #[path = "calls/alias_tests.rs"]
 mod alias_tests;
+
+// ---------------------------------------------------------------------------------------
+// The reference walk's CONS SPINE — the shape it is called for most
+// ---------------------------------------------------------------------------------------
+
+/// The walk's cons-spine fast path, on the shapes a registered BIF really returns.
+///
+/// A spine of cons cells (a `lists:reverse/1` result, a `lists:foldl/3` accumulator, an iolist)
+/// is the walk's common input: 5 000 cells of immediates is one measured container result's
+/// shape, scaled up. Three properties are pinned here, all of them **answers**, plus the visit
+/// accounting the walk's other suite pins at 27 objects for the `etf_roundtrip` payload:
+///
+/// * a long spine of immediates holds **no** reference, terminates, and pays exactly one visit
+///   (one budget charge) per cons cell;
+/// * an **improper** tail — a CDR that is not a cons cell — is still visited, and a reference
+///   reachable through it is still found;
+/// * a reference in a spine's **CAR** is found too (the CAR is pushed only when it could lead
+///   further, which is what the cheap pre-check is for).
+///
+/// The terms are built with the public `beam_alloc`/`beam_term` writers, the way the walk's
+/// `src/context/tests.rs` suite builds them; the reference block is the frozen M1 internal
+/// reference (`[make_header(3, REF_SUBTAG), 0, 0, id]`, exactly what
+/// [`beam_term::boxed::write_internal_ref`] writes) written through the safe initialised-prefix
+/// view, because this crate is `#![deny(unsafe_code)]`.
+#[cfg(test)]
+mod cons_spine_tests {
+    use super::*;
+    use beam_term::make_small;
+    use beam_term::prelude::make_header;
+
+    /// The spine length: long enough that the worklist design shows, short enough to stay a unit
+    /// test (it is 5 000 cons cells = 10 000 heap words).
+    const SPINE_CELLS: i64 = 5_000;
+
+    /// The frozen M1 internal-reference block for `id`, through the safe initialised-prefix view
+    /// of the heap — the same construction `src/context/tests.rs` uses, so both suites walk the
+    /// identical term.
+    fn internal_reference(heap: &mut beam_alloc::Heap, id: i64) -> Eterm {
+        let words = beam_term::prelude::INTERNAL_REF_WORDS;
+        heap.tuple(&vec![beam_term::prelude::NIL; words - 1])
+            .expect("the reference's words fit");
+        let base = {
+            let block = heap.used_words_mut();
+            assert_eq!(
+                block.len(),
+                words,
+                "the reference block is the whole used prefix"
+            );
+            block[0] = make_header(words - 1, beam_term::prelude::REF_SUBTAG);
+            block[1] = make_small(0); // node: the local node
+            block[2] = make_small(0); // serial: one id space in M1
+            block[3] = make_small(id); // id
+            block.as_mut_ptr()
+        };
+        beam_term::prelude::make_boxed(base)
+    }
+
+    /// A spine of `cells` cons cells over immediates, ending in the tail `tail`.
+    fn spine(heap: &mut beam_alloc::Heap, cells: i64, tail: Eterm) -> Eterm {
+        let mut list = tail;
+        for index in (0..cells).rev() {
+            list = heap
+                .cons(make_small(index), list)
+                .expect("the spine's next cell fits");
+        }
+        list
+    }
+
+    #[test]
+    fn a_long_spine_of_immediates_holds_no_reference_and_visits_each_cell_once() {
+        let mut heap = beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let list = spine(&mut heap, SPINE_CELLS, beam_term::prelude::NIL);
+        notes::reset();
+        assert!(
+            !RuntimeContext::graph_holds_reference(list),
+            "a spine of small integers holds no reference"
+        );
+        assert_eq!(
+            notes::walk_snapshot(),
+            notes::WalkCounts {
+                calls: 1,
+                // One visit (one budget charge) per **dereferenced object**: the spine has
+                // exactly `SPINE_CELLS` cons cells, and `NIL` is an immediate that is never
+                // pushed, let alone visited.
+                visits: SPINE_CELLS as usize,
+                hash_inserts: 0,
+                spills: 0,
+            },
+            "the spine is walked one cell at a time, hash-free and without spilling"
+        );
+    }
+
+    #[test]
+    fn an_improper_tail_terminates_and_is_still_visited() {
+        let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+        // `[1, 2 | {3, 4}]`: the CDR of the last cell is a tuple, not a cons cell.
+        let tuple = heap
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the improper tail");
+        let list = spine(&mut heap, 2, tuple);
+        notes::reset();
+        assert!(
+            !RuntimeContext::graph_holds_reference(list),
+            "an improper tail of immediates holds no reference"
+        );
+        assert_eq!(
+            notes::walk_snapshot().visits,
+            3,
+            "two cons cells plus the tuple: the tail is a candidate and is visited"
+        );
+    }
+
+    #[test]
+    fn a_reference_reachable_through_a_spines_tail_is_found() {
+        let mut heap = beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let reference = internal_reference(&mut heap, 11);
+        let list = spine(&mut heap, SPINE_CELLS, reference);
+        assert!(
+            RuntimeContext::graph_holds_reference(list),
+            "the reference at the end of the spine is found"
+        );
+        // The improper shape the same spine takes when the tail is a container holding the
+        // reference: `[… | {ref, 0}]`.
+        let mut boxed_tail_heap =
+            beam_alloc::Heap::new(2 * SPINE_CELLS as usize + 64).expect("the term heap");
+        let reference = internal_reference(&mut boxed_tail_heap, 12);
+        let tuple = boxed_tail_heap
+            .tuple(&[reference, make_small(0)])
+            .expect("the improper tail over the reference");
+        let improper = spine(&mut boxed_tail_heap, SPINE_CELLS, tuple);
+        assert!(
+            RuntimeContext::graph_holds_reference(improper),
+            "a reference one container down an improper tail is found"
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_spines_car_is_found() {
+        let mut heap = beam_alloc::Heap::new(256).expect("the term heap");
+        let reference = internal_reference(&mut heap, 13);
+        // `[[ref, 0], 1, 2]`: the reference sits two levels down a CAR, so it is only reachable
+        // through the worklist the spine queues its non-immediate CARs on.
+        let inner = heap
+            .cons(reference, beam_term::prelude::NIL)
+            .expect("the inner cons over the reference");
+        let list = spine(&mut heap, 3, beam_term::prelude::NIL);
+        let with_car = heap
+            .cons(inner, list)
+            .expect("the spine's head over the inner cons");
+        assert!(
+            RuntimeContext::graph_holds_reference(with_car),
+            "a reference in a spine's CAR is found"
+        );
+        // A `LIST` word whose cell pointer is `NULL` is skipped rather than dereferenced, in the
+        // CDR position the spine advances along and in the CAR position it queues.
+        let null_list = Eterm::from_raw(1);
+        let null_cdr = heap
+            .cons(make_small(1), null_list)
+            .expect("a cons over a NULL-cell list word");
+        assert!(
+            !RuntimeContext::graph_holds_reference(null_cdr),
+            "a list word with a NULL cell pointer is skipped in the CDR position"
+        );
+        let null_car = heap
+            .cons(null_list, beam_term::prelude::NIL)
+            .expect("a cons whose car is a NULL-cell list word");
+        assert!(
+            !RuntimeContext::graph_holds_reference(null_car),
+            "a list word with a NULL cell pointer is skipped in the CAR position"
+        );
+    }
+}

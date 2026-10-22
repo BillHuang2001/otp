@@ -5,7 +5,7 @@ The subsystem detail lives in the three children — [`calls/CONTEXT.md`](calls/
 
 ### The pooled BIF-heap frontier — `take_bif_frontier`
 Both pool-consuming call sites (`call_registered`, `try_call_nif`) take their allocation frontier through `take_bif_frontier` rather than `Runtime::take_bif_heap` directly, because the pool is shared and the region handed back may be nearly exhausted (`available() < capacity() / BIF_HEAP_GROWTH_DIVISOR`, 16).
-Growth is by **region replacement** — never relocation, never a retry: the exhausted region is pushed back and a fresh, larger one becomes this call's frontier before the bump, doubled (`saturating_mul(2)`), floored at `Runtime::bif_heap_words` and capped by a configured `+hmax`.
+Growth is by **region replacement** — never relocation, never a retry: the exhausted region is pushed back and a fresh, larger one becomes this call's frontier before the bump, doubled (`saturating_mul(2)`), doubled from the region's **own** capacity (no `Runtime::bif_heap_words` floor) and capped by a configured `+hmax`.
 Detail: [`pool/CONTEXT.md`](pool/CONTEXT.md).
 
 ### The table-less arm and its store

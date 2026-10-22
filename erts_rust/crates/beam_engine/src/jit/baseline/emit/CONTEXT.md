@@ -166,8 +166,12 @@ by construction).
   `emit_shared_sub_blocks`, `emit_function`, and the code-size budgets (`BLOCK_BYTES`/`INSTRUCTION_BYTES`/
   `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
   `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
-- `regalloc.rs` -> `allocate_registers` (incl. the `y_last`/`y_first`/`frame_republish_first`, `written`
-  and `spill_sets` derivations) +
+- `regalloc.rs` -> `allocate_registers_with_labels` (the production entry: it takes the module-wide
+  `LabelMap` the compilation builds once and threads through `emit_function`/`emit_sub_blocks`/
+  `emit_shared_sub_blocks`, so no IR block, function or continuation sub-block rebuilds it) and its
+  build-on-demand twin `allocate_registers` (the in-crate unit tests' entry, which builds the map itself
+  and delegates) — incl. the `y_last`/`y_first`/`frame_republish_first`, `written`
+  and `spill_sets` derivations +
   `cacheable_touches`
   (the per-instruction native touches) + `cacheable_writes` (the block's written x-registers, mirroring each lowering's shape
   test but returning destinations) + `spill_sets`/`is_inlined`/`test_helper_inlined` (the per-pc

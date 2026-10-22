@@ -998,6 +998,16 @@ pub(super) fn function_clause() -> BeamError {
     )))
 }
 
+/// The `error:calling_self` an `io:*` request raises when its device is the **calling process
+/// itself**: `execute_request/3`'s first clause (`io.erl:1665`) answers
+/// `{ErrorTag, calling_self}`, which `o_request/2` re-raises as the reason atom
+/// `calling_self` (`conv_reason/1`, `io.erl:784`).
+pub(super) fn calling_self() -> BeamError {
+    BeamError::Raise(beam_common::Raise::error(beam_common::ExitReason::atom(
+        "calling_self",
+    )))
+}
+
 /// The `[First, Second]` pattern of `prim_file:get_cwd/1` (`prim_file.erl:771-778`):
 /// `Some` only for a **proper** two-element list, so the caller's `[_|_]` clause covers
 /// every other cons cell.

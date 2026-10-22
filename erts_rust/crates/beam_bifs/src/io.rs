@@ -146,9 +146,8 @@
 //! (`~.1e`, `~.0f`, `~.0g`), a precision on a directive whose effective precision
 //! is smaller than the field width when the directive forbids it, a wrong argument
 //! type or count for a directive, running out of arguments, leaving arguments
-//! unconsumed, a `~` at the end of the format, a `~-<n>p`/`~-p` (a left-adjusted
-//! `~p`, which has no clause in `io_lib_format`), and a `~p`/`~P` of a long
-//! container outside the re-flow model (see below).
+//! unconsumed, a `~` at the end of the format, and a `~-<n>p`/`~-p` (a left-adjusted
+//! `~p`, which has no clause in `io_lib_format`).
 //!
 //! # `~p`/`~P` re-flow (`io_lib_pretty`)
 //!
@@ -160,24 +159,29 @@
 //! fun, **printable** list or **printable** binary — are always emitted on one
 //! line however long.
 //!
-//! This engine reproduces the break ([`crate::print::pretty_chunk`]) for a
-//! **proper or improper list, a tagged or untagged tuple, and a map** each of
-//! whose elements renders single-line, at unlimited depth. It wraps with a break
-//! separator `,` (an improper-list tail uses `|`), indenting continuation lines by
-//! one space, by `tag_len + 2` after a tuple tag, and by two after `#{`; the
-//! narrowest repro is the oracle's own boundary —
+//! [`crate::print::pretty_chunk`] is a port of that template model —
+//! `print_length/7` (its `build`), `write/1`, `pp/8` and the `cind/7` indentation
+//! probe (`pretty::cind`) — so every class the model gives a container
+//! intermediate re-flows: a proper/improper list, a tagged/untagged tuple, a map,
+//! a **native record**, a non-printable binary or bitstring (`pp_binary` packs its
+//! own number of bytes per line), a nested container (an element too long for its
+//! line breaks inside the broken container), a long tuple tag, and a depth-limited
+//! `~P`. It wraps with a break separator `,` (an improper-list tail uses `|`),
+//! indenting continuation lines by one space, by `tag_len + 2` after a tuple tag,
+//! by two after `#{`, and through a record's own `rec_indent`; the narrowest repro
+//! is the oracle's own boundary —
 //! `io_lib:format("~p", [lists:seq(1,29)])` (79 chars) returns `[1,…,28,` / ` 29]`
 //! (a break after the 28th element, one-space indent), while `lists:seq(1,28)`
 //! (76 chars) and `lists:seq(1,28) ++ [x]` (78 chars) stay on one line. The flat
 //! condition is the oracle's `length < line_length - column`
 //! (`io_lib_pretty:print/10`, erts-17.1).
 //!
-//! Re-flow is **not** modelled for a container holding another container (nested
-//! re-flow), an element too long to fit on a line of its own, a non-printable
-//! bitstring (`pp_binary` packs its own number of bytes per line), a long tuple
-//! tag (`cind/7` then selects a different indent), or a depth-limited `~P`; those
-//! raise the typed `error:badarg` rather than emit a line the oracle would have
-//! broken differently — never a wrong string.
+//! The only typed [`unsupported_bif`] reachable from this path is the `More`
+//! dispatcher's (`pretty`'s `expand_dots`, a truncated template state `build` never
+//! produces), or a leaf's own documented gap (an **external** pid/port/ref, or a
+//! `Local` fun with no `LocalFunIdentity` seam). No printable class, depth or
+//! `chars_limit` is rejected for being outside the re-flow model; the printer's own
+//! module docs ([`crate::print`]) carry the per-class detail.
 //!
 //! # Deviations from the oracle (documented)
 //!
@@ -2026,8 +2030,8 @@ fn decode_utf8_strict(bytes: &[u8]) -> Option<Vec<char>> {
 
 /// `io_lib_format:print/…` for `~p`/`~P`: the printable rendering, re-flowed the
 /// way `io_lib_pretty` breaks a container across lines when it does not fit
-/// `line_length - column` (see [`crate::print::pretty_chunk`] and the module docs
-/// for the supported forms and the remaining gap).
+/// `line_length - column` (see [`crate::print::pretty_chunk`] and [`crate::print`]'s
+/// module docs for the term classes it re-flows).
 ///
 /// A **non-negative** `chars_limit` selects the limited path
 /// ([`pretty_chunk_limited`], `io_lib_pretty:print/10` with `T = chars_limit`),

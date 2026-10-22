@@ -38,6 +38,7 @@ use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
+use beam_term::Eterm;
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
@@ -48,6 +49,21 @@ use crate::terms;
 use crate::Step;
 
 use super::{fail_or_raise, position};
+
+/// The key count of the map `map` — O(1), from the map head node's own size word
+/// (`beam_term::map::map_size`, the C `erts_map_size`), never a walk of the pair
+/// list.
+///
+/// This is the *capacity* the update reserves: the builder deduplicates, so the
+/// produced map holds at most `key count + new pairs`. The C update sizes its
+/// reservation the same way, from the header's size word alone — `num_old =
+/// flatmap_get_size(old_mp)` then `need = 2*(num_old+num_updates) + 1 + …`
+/// (`beam_common.c:2002,2017`). The namespace argument of the accessor is unused
+/// for counting; it is taken from the host so the count is read in the same atom
+/// namespace as every other map operation.
+fn key_count(ctx: &dyn ExecutionContext, module: &Module, map: Eterm) -> Result<usize> {
+    Ok(beam_term::map::map_size(map, ctx.atoms(module))?)
+}
 
 /// The spacer words the reserve must add for the `Eterm` operands a map update
 /// re-reads after the reserve: the source operand plus every key/value operand
@@ -78,12 +94,14 @@ pub(super) fn put_map_assoc(
 ) -> Result<Step> {
     let _ = live;
     // Phase A (nothing retained past the reserve): the `badmap` check and the entry
-    // count that sizes the reservation. Both are pure reads.
+    // count that sizes the reservation. Both are pure reads, and the count is the head
+    // node's own size word ([`key_count`]) — not a walk of the pair list: the source is
+    // enumerated exactly once, by the merge below, and never here.
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
         return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
-    let capacity = terms::map_entries(map)?.len() + pairs.len();
+    let capacity = key_count(ctx, module, map)? + pairs.len();
     // Phase B: reserve the whole map block (one rooted allocation a moving collector
     // may run under), then re-read the source and every key/value operand from the
     // post-collection state and merge into a pair list that is only ever read.
@@ -127,12 +145,16 @@ pub(super) fn put_map_exact(
     pairs: &[(Operand, Operand)],
 ) -> Result<Step> {
     let _ = live;
-    // Phase A: the `badmap` check, the entry count, and the `{badkey,Key}` validation
-    // — all pure reads, nothing retained past the reserve.
+    // Phase A: the `badmap` check, the `{badkey,Key}` validation and the entry count
+    // that sizes the reservation — all pure reads, nothing retained past the reserve.
+    // The count is the head node's own size word ([`key_count`]), so it costs no walk;
+    // the pair list is materialized once here (the validation needs it) and once by the
+    // merge below.
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
         return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
+    let capacity = key_count(ctx, module, map)? + pairs.len();
     let existing = terms::map_entries(map)?;
     for (key_operand, _) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
@@ -142,7 +164,6 @@ pub(super) fn put_map_exact(
             return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key_operand);
         }
     }
-    let capacity = existing.len() + pairs.len();
     // Phase B: reserve, then re-read and merge (the pre-validated keys are re-read so
     // the merge uses the post-collection terms).
     let extra = merge_slack_words(source, pairs);

@@ -4,8 +4,9 @@
 The crate's implementation root: the `main.rs` shim, the `Runtime` façade (`runtime.rs`, `runtime/`),
 the CLI (`cli.rs`, `cli/`), the concrete `ExecutionContext` glue (`context/`), the runtime-native BIF
 floor (`native.rs`, `native/`), the A.4 port layer (`port.rs`, `port/`), the A.8 introspection surface
-(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client/`), and the
-observability modules (`trace.rs`, `seq_trace.rs`, `crash_dump.rs`, `perf_map.rs`, `debug_trace.rs`).
+(`info.rs`, `info/`), the distribution node (`dist.rs`, `dist/`, `dist_client/`), the allocator
+free-page release (`malloc.rs`) and the observability modules (`trace.rs`, `seq_trace.rs`,
+`crash_dump.rs`, `perf_map.rs`, `debug_trace.rs`).
 The crate-level API surface (CLI table, exit codes, `system_info` keys, boot status, gaps) lives in
 `../CONTEXT.md`; the per-module detail lives in the child `CONTEXT.md`s below.
 
@@ -78,12 +79,20 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   (`runtime.rs:1414`, `arena: MinimalContext` at `:240`). Every tuple/list/map/float/bignum and every
   ≤64-byte binary the walker builds (`terms::make_*`) lives in that **pointer-stable, never-freed**
   arena; `gc_armed` is `false` (`runtime_context.rs:186`), so no collection ever runs there.
-- **Four storage regions, none ever freed.** `arena` (`:240`); the pooled BIF heap `bif_heaps:
-  Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap` `:1398,1406`, grown by
-  **region retirement** in `context/calls.rs:158 take_bif_frontier`); `eval_heap: Heap` (`:271`) plus
-  `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap` `:1511`); and `eval_off_heap:
-  beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
-- **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
+- **Four storage regions, all observable: one bounded, one depth-sized, two unbounded by construction.** `arena` (`:240`), `beam_engine`-owned, retains every word it ever handed out; the pooled BIF heap
+  `bif_heaps: Vec<Heap>` (`:222`, taken/returned by `take_bif_heap`/`put_bif_heap`, **depth-sized** —
+  `bif_heap_words` for the outermost call, `NESTED_BIF_HEAP_SEED_WORDS` = 1 MiB for a nested one, self-tuned
+  to `2 ×` an observed nested peak — and grown **geometrically** in `context/calls.rs take_bif_frontier`); `eval_heap: Heap`
+  (`:271`) plus `eval_heap_retired: Vec<Heap>` (`:296`, filled by `grow_eval_heap`, whose growth is clamped
+  at `MAX_EVAL_HEAP_WORDS` = 256 MiB); and
+  `eval_off_heap: beam_message::OffHeapTable` (`:286`), the off-heap payload **owner** table.
+  `Runtime::retention_stats() -> RetentionStats` (`runtime/retention.rs`) reads all four — arena
+  demand words/calls, `bif_regions`/`bif_words`/`bif_peak_used_words`/`bif_max_capacity_words`/
+  `bif_heaps_taken` (the live nesting depth)/`bif_nested_heap_words`/`bif_nested_peak_words`, `eval_heap_words`/`eval_heap_retired_regions`/
+  `eval_heap_retired_words`, `eval_off_heap_handles` (MSO slots only — `OffHeapTable::len` excludes
+  the table's refc binaries) — and `BEAM_RT_MEM_TRACE` prints it as one `[rt-mem] boot …` line after
+  the boot and one `[rt-mem] exit …` line on the way out of `cli::run` (silent unless set).
+  The two arena/pool fields are **capacity/reservation** figures, so they appear in `VmSize` and only their written pages in RSS; the store's two retired ones are not — a region is retired only once it is full, so `eval_heap_retired_words` is ~fully written and resident (`inet_parse`'s peak is 59 % retired store / 37 % arena written pages / 2.4 % glibc / 1 % other).- **A big binary literal is ON-heap.** `Evaluator::materialize_bits` (`eval/mod.rs:601-610`) sends a
   byte-aligned binary ≤64 bytes to `terms::make_heap_binary` (arena) and everything else —
   non-byte-aligned, or past `ERL_ONHEAP_BINARY_LIMIT` — to `beam_codec::term::make_bitstring` on
   `eval_heap`. `binary:copy/2` likewise builds **on-heap** on the pooled BIF heap
@@ -151,6 +160,13 @@ Binding facts for anyone touching `Action::Eval`, `Runtime::eval` or `crate::eva
   none of those three can name a `[BinRef][ErlSubBits]` payload (the simple copy flattens it) —
   whereas `seq_trace`'s `set_label` (`seq_trace.rs:324-329`, reached from `seq_trace_2:461`) stores
   the raw term **unstabilized**, and `eval_closures`' env can name one.
+## The debt gate on the fun-applying stdlib fast paths (cross-cutting: execution · bridges · gc)
+Binding facts for anyone touching `RuntimeContext::resolve_external_call`, `FunBridge` or the collection doors.
+- **What it gates:** `lists`/`maps` keys whose `beam_bifs` implementation applies a fun argument back into the runtime — the roster is **not** restated in `beam_rt`: it is `beam_bifs::needs_fun_caller(module, function, arity)` (the registry's own allocation-free binary-search answer, backed by `FUN_CALLER_BIFS`' pinned 18 `lists` + 4 `maps` + 2 `ets` keys), narrowed to `module` ∈ {`lists`, `maps`} by `execution.rs`'s `nests_a_fun_apply`.
+- **The predicate:** `RuntimeContext::calling_process_has_collection_debt` (`execution.rs`) reads `Process::collection_debt` for `mailbox_pid` off `mailbox_table`; a **table-less** context answers `false` (no process, no debt), which is what keeps the `-eval` route's synchronous dispatch byte-for-byte unchanged.
+- **What a decline buys:** the key's real `.beam` body is entered **in this machine**, so the callee's registers/stack/frames join the caller's root set and every heap-admission point is the caller's **armed** one — the door that fires on `Process::collection_debt` and collapses the retired-nursery chain. The `lists`/`maps` bodies *are* the reference semantics of the fast paths, so no result changes; the seam's existing in-machine-identity caveats (`erlang:load_nif/2`, the fun-image BIFs) are outside this key set.
+- **Why the gate must be a pure function of the heap state:** the native baseline tier consults `resolve_external_call` **twice** per `call_ext*` (`jit::baseline`'s `jit_ext_call`, then `jit_step_one`). The two consultations are back-to-back inside one instruction step with nothing executing in between, and `Process::grow_nursery` (the only setter) and a collection (the only clearer) both need execution — so the bit is constant for the instruction's duration and the second consultation cannot answer differently.
+- **The two `ets` folds stay on the synchronous path on purpose:** `ets.erl`'s `foldl/3`/`foldr/3` reach `ets:first/1`/`next/2` and then a `lists` key internally, so gating them would relocate the nesting rather than remove it while replacing an implementation whose per-interior object ordering is pinned against the oracle.
 ## Reachability of a `-sname` node from a real peer (A.5, cross-cutting: dist · eval · scheduler)
 Measured end-to-end with an OTP 29.1.1 peer (`erl -sname … -setcookie …`, same cookie as this runtime);
 `node()` on both sides is `@<hostname>` (short), so no host-form mismatch is involved.
@@ -216,25 +232,78 @@ Measured against a real system `erl` (`-sname` only on this host). Facts that bi
 - **Oracle `monitor_node/2` on us agrees**: `{nodedown,'rustnode@billmini'}` (bare 2-tuple, no reason) arrives on our death; no `{nodeup,_}` is emitted on a later connect — a real-OTP↔real-OTP **control reproduces exactly this**, so it is oracle behaviour, not a divergence.
 - **A `-sname` node survives a connected peer**: `kernel_sup`'s `global_name_server` → `net_kernel:monitor_nodes(true, #{connection_id => true})` → `nodes(visible, #{connection_id => true})` answers the peer with its **real per-link integer** (`native/net/nodes.rs::nodes_2` over `Runtime::dist_connection_id`), never a capability gap, so the peer can dial in and outlive any pass (`erl -sname peerprobe -setcookie c123` pings `rustnode@…` ⇒ `pong` with `kernel_sup`/`global_name_server` still live, and the fixture module's own `nodes(visible, #{connection_id => true})` prints `[{peerprobe3@billmini,#{connection_id => 1}}]`).
 
+## Module literal areas — shared by word, owned by the `Module` (cross-cutting)
+Binding facts for anyone asking "where does a module constant live, and can it be copied or freed?".
+
+- **A module's `LitT` literals live in one immutable `beam_alloc::Heap` owned by the module**
+  (`beam_loader/src/literal.rs:76-90`), reached as `Module::literal(idx) -> Option<Eterm>`
+  (`beam_loader/src/ir.rs:425-432`), held behind `Arc<LiteralArea>`
+  (`beam_loader/src/literal.rs:177-182`) and literal-tagged exactly once at load
+  (`beam_loader/src/literal.rs:112-124` → `beam_term::literal::tag_literal_area`,
+  `beam_term/src/literal.rs:162-170`). `Module::literal` returns a **copy of the word**, i.e. a
+  pointer into that area.
+- **`beam_rt` never resolves, rebuilds or copies a module literal.** No `.literal(`/`LiteralArea`
+  use exists in this crate's production code (the engine resolves `Operand::Literal` against
+  `&Module`), and the arena (`Runtime::alloc_words`, `runtime.rs:2351`; the admission seam
+  `context/gc.rs:1482-1521`) only ever carries **newly built** terms.
+- **Every copy this crate performs shares a literal verbatim, at zero destination words.**
+  `Runtime::stabilize_term`/`stabilize_term_with` (`runtime.rs:2399`/`:2553`), `copy_result_fresh`
+  (`context/calls.rs:1878-1890`), the two re-homing arms (`context/pool.rs:105`,
+  `context/calls.rs:1480`) all drive `beam_message`'s copier, whose `is_shared`
+  (`beam_message/src/copy.rs:267-275`) returns a literal-tagged compound word unchanged
+  (`shallow` `:506-508`, `push_fixup` `:297-301`). A **root** literal is therefore skipped by every
+  re-homing check by design: `result_is_foreign_container` (`context/calls.rs:1131-1134`), the
+  immediates/literals skip (`context/calls.rs:889-890`) and `relocate_off_scratch`
+  (`context/calls.rs:1361-1365`).
+- **No collector or window walk touches a literal.** `word_region` answers `None` for it
+  (`context/gc.rs:377-396`), and the same literal test guards the valve oracle
+  (`context/gc/valve_bounds.rs:104`), the reachability descent (`context/gc_walk.rs:174`), the
+  statement-window reclaim (`eval/reclaim.rs:472`, `eval/reclaim/resource.rs:313`) and the window
+  latch test (`eval/scratch.rs:390`).
+- **Consequence: an object on a process heap, the arena, `eval_heap` or a pooled BIF heap may hold
+  a literal word as a raw child, and that is sound only while the owning `Module` is alive.**
+  Retention is `CodeServer.modules: HashMap<String, Arc<Module>>` (`codeserver.rs:124`) plus every
+  live clone: `ProcessEntry::Export{module}` (`runner/entry.rs:47-56`), `LocalFunTarget.module`
+  (`context/apply.rs:66`), the fun-identity snapshot (`codeserver.rs:144-151`), the thread-local
+  descriptor index (`context/ir_cache.rs:272-278`), `get_until`'s continuation
+  (`native/file_server/get_until.rs:235`).
+- **Known issue — there is no literal-area release handshake.** The code store's one removal really
+  unloads (`erlang:delete_module/1` → `context/runtime_hooks.rs:824` → `CodeServer::forget_module`,
+  `codeserver.rs:820-828`; a reload replaces the entry, `codeserver.rs:772-780`), each dropping the
+  cache's `Arc`, while `erts_internal:purge_module/2` and
+  `erts_literal_area_collector:release_area_switch/0` are the oracle's `notsup`/unimplemented
+  (`context/runtime_hooks.rs:42,1518`) and no old-code slot exists. A term kept in a runtime store
+  that carries a literal **word** — a `persistent_term` value (`context/persistent_term.rs:32-77`),
+  a timer's `Msg` (`context/runtime_hooks.rs:1343`), a `seq_trace` label (`seq_trace.rs:287-292`),
+  and any copier-based store such as ETS or a mailbox — can therefore outlive the module whose
+  literal area it names. ERTS prevents this with the old-code slot plus the release handshake;
+  this runtime has neither.
+- **An `-eval` "literal" is a different thing**: the expression has no module literal area, so the
+  evaluator builds each source literal on the run's store every time (`eval/mod.rs:774-783`
+  bitstrings, `:2665-2679` integers, the string literal builder), and an `erlang:spawn/1` closure
+  is compiled into a real `beam_rt_eval_fun_<n>` module (`eval/compile.rs:180,445`) whose literal
+  area then belongs to the code server like any other module's.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's trailing test region — the contiguous run of `#[cfg(test)]`-gated modules at EOF, inline or sibling).
-- `src/port.rs` 5 116 lines, 5 035 of production (unit suite in `port/tests.rs`, 4 226 lines, plus 21 sibling `port/*_tests.rs` suites — `accept_inherit`, `active_input`, `active_input_e2e`, `async_ready`, `busy_suspend`, `busy_wait`, `command_matrix`, `completion`, `control_capability`, `driver_output_shape`, `exit_status_matrix`, `failure`, `failure_e2e`, `inet_matrix`, `inet_opts`, `monitor`, `packet_framing`, `peer_closed`, `ram_file_matrix`, `spawn_driver`, `stream_shape` — and `port/test_support.rs`).
-- `src/runtime.rs` 5 652 lines — 4 598 of production, the rest the colocated unit test module (from line 4 599).
+- `src/port.rs` 5 116 lines, 5 085 of production (unit suite in `port/tests.rs`, 4 226 lines, plus 21 sibling `port/*_tests.rs` suites — `accept_inherit`, `active_input`, `active_input_e2e`, `async_ready`, `busy_suspend`, `busy_wait`, `command_matrix`, `completion`, `control_capability`, `driver_output_shape`, `exit_status_matrix`, `failure`, `failure_e2e`, `inet_matrix`, `inet_opts`, `monitor`, `packet_framing`, `peer_closed`, `ram_file_matrix`, `spawn_driver`, `stream_shape` — and `port/test_support.rs`).
+- `src/runtime.rs` 6 027 lines — 4 973 of production, the rest the colocated unit test module (from line 4 974).
 - `src/port/driver.rs` 3 911 lines, 3 502 of production: the driver C-ABI host (`DriverPort`/`DriverPortAdapter` — the concrete `beam_abi::DriverHost` behind a driver's `ErlDrvPort`), with its suites as the sibling `port/driver/{control,control_reply_oracle,ddll,fire,hooks,liveness,monitor,port_attributes,port_term,ready_output,stop_select}_tests.rs` modules declared from its tail.
-- `src/context/gc.rs` 3 238 lines, 1 816 of production — the remainder is the test-only counters modules (`valve_counters`/`prefix_counters`) and the inline suites; its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
+- `src/context/gc.rs` 3 257 lines, 2 367 of production — the remainder is the test-only counters modules (`valve_counters`/`prefix_counters`) and the inline suites; its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
 - `src/native/code.rs` 2 902 lines, 1 033 of production: the `code:*` floor (the path/load/name readers and the path mutators) with its oracle-cross-checked colocated suite in the remaining 1 869 lines.
 - `src/codeserver.rs` 1 869 lines, 1 306 of production: the shared `Rc<AtomTable>`, the module cache with both location maps, the code path, the file-load routes and the store's one removal op, plus its colocated unit suite (563 lines).
 - `src/context/gc_walk.rs` 2 156 lines: 1 159 of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation), the test-only `seed_counters` module and the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
 - `src/context/runtime_hooks.rs` 1 823 lines of production with no inline tests — the `RuntimeHooks` bridge, whose per-arm rustdoc blocks carry the oracle columns and the served/fixed/gap reasoning (suites `context/tests.rs` and `tests/runtime_hooks.rs`).
-- `src/context/calls.rs` 2 150 lines, 1 963 of production (the BIF-dispatch + BIF-result-copy-out machinery; the 187-line tail is the test-only dispatch notes plus the declaration of the suite in `context/calls/tests.rs`, 1 412 lines).
-- `src/runtime/scheduler.rs` 1 991 lines, 1 793 of production (the pass family), the remaining tail being inline pins for the code they measure plus the declaration of the sibling suite (`runtime/scheduler/tests.rs`, 1 389 lines).
+- `src/context/calls.rs` 2 511 lines, 2 334 of production (the BIF-dispatch + BIF-result-copy-out machinery; the 177-line tail is the test-only dispatch notes plus the declaration of the suite in `context/calls/tests.rs`, 1 677 lines).
+- `src/runtime/scheduler.rs` 2 011 lines, 1 813 of production (the pass family), the remaining tail being inline pins for the code they measure plus the declaration of the sibling suite (`runtime/scheduler/tests.rs`, 1 389 lines).
 - `src/error.rs` 1 333 lines, 777 of production: the `pub(crate)` `BeamError` constructors, the halt helpers, `enforce_term_heap_limit`, `unsupported_reason`/`live_reason_term` and the `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` set with its drift guard, plus its colocated suite (556 lines).
 - `src/native/file_server.rs` 1 185 lines, 1 183 of production (the io-device request dispatch table; suite in `native/file_server/tests.rs`, 1 970 lines).
 - `src/port/failure_e2e_tests.rs` 863 lines — a **test-only** suite (declared from `port/failure.rs`'s tail), so it is legitimately long: it compiles its own real C `.so` and drives one row per oracle opcode through the whole `port_command → output → FailureLatch → settle → signal_failure → drain_failures → push_ready` road, asserting each published `PortSignal` list whole.
 - `src/port/peer_closed_tests.rs` 1 520 lines — **all test-only** (declared from `port/peer_closed.rs`'s tail), so the ~1000-line target does not bind it: it holds the peer-close channel's whole evidence, the mirror/latch units, the real-loopback delivery routes, and two spent-grant cases whose doc comments carry the quoted C lines plus the oracle's exact printed answers beside the two `erl` cross-checks of those same sequences.
 - `src/port/driver/port_term_tests.rs` 761 lines — a **test-only** suite (declared from `port/driver.rs`'s tail) for the `ERL_DRV_PORT` hook: the stamped handle↔`PortId` round trip through the real term-spec decoder, the foreign/null/unstamped refusals, the gone bit after `clear_driver_state`, and an end-to-end row through a real C driver that emits `{ERL_DRV_PORT, driver_mk_port(port)}`.
 - `src/port/failure.rs` 208 lines, 201 of production — **within target**; it is the driver-failure channel's runtime half (`signal_reason`, `PortRegistry::drain_failures`/`fail_port`, the ready-queue publication), declared inside `exit.rs`, and its two suites are `port/failure_tests.rs` (159, the reason-mapping units) and `port/failure_e2e_tests.rs` (above).
-- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 4 049 / 2 876, `nif.rs` 2 964 / 1 524, `cli.rs` 3 159 / 1 894, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 585 / 1 585, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 423 / 1 419, `eval/parse.rs` 1 642 / 1 284, `native/process.rs` 1 883 / 1 238, `native/prim.rs` 4 066 / 1 139, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 357 / 1 212.
+- **Other files past the target in production lines** (one responsibility each, no split prescribed; same measurement): `eval/mod.rs` 4 049 / 2 876, `nif.rs` 2 964 / 1 524, `cli.rs` 3 586 / 2 094, `native/prim_file.rs` 1 601 / 1 601, `runner/run.rs` 1 595 / 1 595, `native/erts_internal.rs` 2 839 / 1 273, `native/memory/mod.rs` 1 513 / 1 509, `eval/parse.rs` 1 642 / 1 284, `native/process.rs` 1 883 / 1 238, `native/prim.rs` 4 076 / 1 149, `trace.rs` 1 850 / 1 074, `context/bridges.rs` 1 357 / 1 212, `native.rs` 2 032 / 1 210, `context/pump.rs` 1 453 / 1 399, `dist_client/client.rs` 1 079 / 1 079, `context/execution.rs` 1 141 / 1 141 (its debt gate added the predicate, the roster seam and their rustdoc; no test region, the suite is `context/tests.rs`), `dist/inbound.rs` 1 011 / 1 008.
+- **Files past ~1000 total lines whose production count stays under the target** (module docs and/or a trailing test region carry the rest; no split owed): `boot/bootscript.rs` 2 103 / 801, `native/port.rs` 1 814 / 733, `native/application.rs` 1 661 / 953, `runtime/gc.rs` 1 645 / 962, `context/process_bridge.rs` 1 302 / 463, `native/init.rs` 1 270 / 548, `info.rs` 1 225 / 769, `cli/flags.rs` 1 210 / 864, `config.rs` 1 126 / 823, `context/gc/bin_vheap.rs` 1 110 / 466, `timers.rs` 1 107 / 644, `mailbox.rs` 1 056 / 397, `seq_trace.rs` 1 052 / 761, `native/process/monitor.rs` 1 047 / 512.
 
 ## Routing Table
 - `boot.rs` + `boot/` → preloaded-module set (`PreloadedModules`/`CORE_ATOMS`), the boot banner, the
@@ -242,7 +311,9 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `cli.rs` + `cli/` → the A.6 CLI parser/driver, the four `EXIT_*` codes and the boot-script drive
   (`cli/CONTEXT.md`).
 - `context/` → the concrete `ExecutionContext` glue, the host-seam bridges and the NIF-dispatch order
-  (`context/CONTEXT.md`); its children own one subject each — `context/calls/CONTEXT.md` (the registered-call
+  (`context/CONTEXT.md`), including `context/execution.rs`'s **debt-gated fun-applying seam**
+  (`resolve_external_call`'s `nests_a_fun_apply` ∧ `calling_process_has_collection_debt`, own section
+  above); its children own one subject each — `context/calls/CONTEXT.md` (the registered-call
   path: the gated dispatch arms, the lent/held `TableRegistry`, `PendingInterner`, the `[safe]` export gate),
   `context/pool/CONTEXT.md` (the BIF-result copy-out: the pooled frontier, the table-less arm, the learned
   copy-out hint, the aliased `ets` witness) and `context/gc/CONTEXT.md` (the collection doors, the unscanned-root
@@ -267,7 +338,18 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `dist.rs` + `dist/` + `dist_client/` → the distributed node, accepting and connecting halves
   (`dist/CONTEXT.md`, `dist_client/CONTEXT.md`).
 - `eval/` → the `-eval` evaluator (AST/parser/`Flow`) (`eval/CONTEXT.md`).
-- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `timers.rs` (a min-heap of
+- `malloc.rs` → the crate's marked `unsafe` module and its **one** allocator lever:
+  `release_free_pages()` (`libc::malloc_trim(0)` on glibc, an honest `None` elsewhere), called once per
+  process from `main.rs` **after the driver thread has been joined** — the only quiescent *and* complete
+  point, because the driver thread still holds most of the run's memory until it exits (a trim from inside
+  `cli::run`, even after the runtime it built has been dropped, recovers only ~16 MB of ~75 MB). Measured
+  exit RSS (glibc 2.44; arena `in_use` ≤ 218 kB at that point in every case): bare boot 90 760 → 18 400 kB,
+  `compiler/cerl_clauses.erl` 211 168 → 19 068 kB, `stdlib/orddict.erl` 218 544 → 22 240 kB. Peak `VmHWM`
+  is **unchanged** (115 / 314 / 305 MB) because during the run that memory is *live*, not slack (a bare
+  boot's idle arena is 97 681 kB in use of 97 948 kB) — the census, the arena/heap layout, the measured
+  non-effect of a trim at the boot→action boundary (266 kB free there) and the fragmentation limit are in
+  the module docs. `BEAM_RT_MEM_TRACE` prints the call's answer as one `[rt-mem] heap-release=…` line.
+- `codeserver.rs`, `error.rs`, `config.rs`, `format.rs`, `mailbox.rs`, `malloc.rs`, `timers.rs` (a min-heap of
   absolute deadlines over `crate::hasher::FastHashMap` indexes, whose `prune_cancelled` reclaims
   non-head cancelled tombstones with a watermark heap rebuild), `nif.rs`, `hasher.rs`
   (the crate's one deterministic non-cryptographic `BuildHasher` — `FastHasher`/`FastBuildHasher`/

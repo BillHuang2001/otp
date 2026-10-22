@@ -764,3 +764,208 @@ fn a_non_rewindable_table_less_call_is_not_moved_and_the_store_stays_empty() {
         );
     }
 }
+
+/// **The two host-memory mechanisms the table-less route leaves open, pinned to their rule.**
+///
+/// A long in-process `compile:file/2` (`-eval`, i.e. no scheduled process) retains host memory in
+/// exactly two places, and neither can be reclaimed without a collection:
+///
+/// 1. the **engine arena** ([`Runtime::arena`], the `MinimalContext`'s `ContextHeap`) — the heap
+///    every term-build reservation lands on when there is no process heap to serve it. Its regions
+///    are never freed, shrunk or rewound, so what it holds is **its total requested words**;
+/// 2. the **`-eval` store** ([`Runtime::eval_heap`]) — the destination of the copy-out this module
+///    owns. A copy that does not fit replaces the region with a doubled one and **retires** the old
+///    one, so what the store retains is **the copy-out volume since the runtime started**: every
+///    region it ever installed is still alive, because a retired region is ~full and never
+///    rewritable.
+///
+/// This case pins both rules with a fixture whose demand is arithmetic rather than luck — no
+/// wall-clock, no compile, no allocation policy involved:
+///
+/// * arena: 1 word reserves the first region, `unit − 1` words fill it, and the next word pushes a
+///   fresh **doubled** region. `used_words` is then exactly the words requested, `reserved_words`
+///   is the geometric ladder (`unit · (2^regions − 1)`), and the mark taken in the first region no
+///   longer matches — the arena has no state it can be rewound to;
+/// * store: [`COPIES`] container results ([`COPY_WORDS`] store words each) cross a [`REGION_WORDS`]
+///   region twice, so the store's shape is [`expected_store_shape`]'s and its retention is the
+///   geometric sum of **every** region that ever existed, which a later copy that fits cannot
+///   reduce.
+///
+/// The store route must also add **not one** arena word: the reservation volume and the copy-out
+/// volume are independent, which is what makes their sum the honest bound.
+#[test]
+fn the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand() {
+    /// 900 cons cells: a legal `lists:seq/2` result on a [`REGION_WORDS`] pool that is also more
+    /// than half the store's region, so a replacement is arithmetic.
+    const ELEMENTS: usize = 900;
+    /// The store words one copy of [`ELEMENTS`] costs.
+    const COPY_WORDS: usize = 2 * ELEMENTS;
+    /// Enough copies to cross two store regions ([`expected_store_shape`] is the model).
+    const COPIES: usize = 4;
+
+    let mut rt = small_region_runtime();
+    assert_eq!(
+        REGION_WORDS, 2_048,
+        "this case's store arithmetic assumes the suite's region"
+    );
+
+    let (unit, demand, arena) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        // ---- (a) the arena: a known demand, region after region ----
+        assert_eq!(
+            ctx.runtime.arena.heap_stats().regions,
+            0,
+            "a fresh runtime has reserved nothing on the engine arena: the region heap grows \
+             lazily, so every word it holds was requested by a run"
+        );
+        assert_eq!(
+            ctx.runtime.arena.heap_mark(),
+            beam_engine::HeapMark::EMPTY,
+            "no region, so no mark"
+        );
+
+        // One word reserves the first region — the geometric unit the whole chain is built from.
+        let _ = ctx.alloc_words(1).expect("one arena word");
+        let first = ctx.runtime.arena.heap_stats();
+        assert_eq!(
+            (first.regions, first.used_words, first.frontier_used),
+            (1, 1, 1),
+            "the first request reserves the first region"
+        );
+        let unit = first.reserved_words;
+        let first_mark = ctx.runtime.arena.heap_mark();
+
+        // The rest of the first reservation, exactly: one region, filled to its last word.
+        let _ = ctx
+            .alloc_words(unit - 1)
+            .expect("the rest of the first reservation");
+        let filled = ctx.runtime.arena.heap_stats();
+        assert_eq!(
+            (filled.regions, filled.used_words, filled.frontier_available),
+            (1, unit, 0),
+            "the first reservation is exactly `unit` words and is now exhausted"
+        );
+
+        // One word past it cannot come from that reservation: the arena reserves a fresh,
+        // doubled region and keeps the old one alive and unmoved.
+        let _ = ctx.alloc_words(1).expect("a word past the first reservation");
+        let demand = unit + 1;
+        let grown = ctx.runtime.arena.heap_stats();
+        assert_eq!(grown.regions, 2, "the exhausted reservation is replaced");
+        assert_eq!(
+            grown.used_words, demand,
+            "`used_words` is the arena's CUMULATIVE demand: exactly the words requested"
+        );
+        assert_eq!(
+            grown.reserved_words,
+            unit * ((1 << grown.regions) - 1),
+            "the reservations obey the documented geometric rule: each fresh region doubles the \
+             previous one, so their sum is `unit · (2^regions − 1)`"
+        );
+        assert!(
+            grown.committed_words < grown.reserved_words,
+            "a reservation is committed lazily, so the arena's address space is looser than its \
+             committed words ({} < {})",
+            grown.committed_words,
+            grown.reserved_words
+        );
+        assert!(
+            !ctx.runtime.arena.heap_mark_matches(first_mark),
+            "the first region is no longer the frontier and never becomes it again — the arena has \
+             no state a rewind could restore, which is why its retention is its total demand"
+        );
+        assert_eq!(
+            ctx.runtime.retention_stats().arena_words,
+            grown.used_words as u64,
+            "the retention counter and the census are one quantity, not two estimates"
+        );
+
+        // ---- (b) the store: the copy-out volume, region after region ----
+        assert_eq!(
+            ctx.runtime.retention_stats().eval_heap_retired_regions,
+            0,
+            "no copy has happened yet"
+        );
+        for round in 0..COPIES {
+            let copied = ctx
+                .call_bif(
+                    "lists",
+                    "seq",
+                    2,
+                    &[make_small(1), make_small(ELEMENTS as i64)],
+                )
+                .unwrap_or_else(|error| panic!("round {round}: lists:seq(1, {ELEMENTS}): {error}"));
+            assert_eq!(
+                terms::cons_head(copied).expect("a cons cell"),
+                make_small(1),
+                "round {round}: every copy is a complete list"
+            );
+        }
+        let (frontier, capacity, retired) = expected_store_shape(COPIES, COPY_WORDS, REGION_WORDS);
+        assert_eq!(
+            retired.len(),
+            2,
+            "the case's own arithmetic: {COPIES} × {COPY_WORDS} words crosses two regions"
+        );
+        let stats = ctx.runtime.retention_stats();
+        assert_eq!(
+            stats.eval_heap_retired_regions,
+            retired.len(),
+            "the store retires exactly the regions the copy volume outgrew"
+        );
+        assert_eq!(
+            (stats.eval_heap_words, ctx.runtime.eval_heap.used()),
+            (capacity as u64, frontier),
+            "the store's current region is the doubled one, holding the last copy"
+        );
+        assert_eq!(
+            stats.eval_heap_retired_words,
+            retired.iter().sum::<usize>() as u64,
+            "the retired figure is the summed capacity of the replaced regions {retired:?}"
+        );
+        // THE RULE: retention is every region that ever existed — it does not shrink.
+        let ladder = REGION_WORDS as u64 * ((1 << (retired.len() + 1)) - 1);
+        assert_eq!(
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            ladder,
+            "the store's total retention is the geometric sum of every region it ever installed \
+             ({REGION_WORDS} · (2^{} − 1)) — the copy-out volume, not the live one",
+            retired.len() + 1
+        );
+
+        // A copy that fits changes none of it: a retired region is full and is never made the
+        // frontier again, so the bound can only grow or hold.
+        let _ = ctx
+            .call_bif("lists", "seq", 2, &[make_small(1), make_small(10)])
+            .expect("lists:seq(1, 10) fits the current region");
+        let after = ctx.runtime.retention_stats();
+        assert_eq!(
+            (
+                after.eval_heap_retired_regions,
+                after.eval_heap_words,
+                after.eval_heap_words + after.eval_heap_retired_words,
+            ),
+            (retired.len(), capacity as u64, ladder),
+            "a copy that fits retires nothing and rewrites no retired region"
+        );
+
+        // The two mechanisms are independent: the copy-out route allocates nothing on the arena.
+        assert_eq!(
+            ctx.runtime.arena.heap_stats(),
+            grown,
+            "the store route adds not one arena word, so the peak is their SUM"
+        );
+        (unit, demand, grown)
+    };
+
+    let stats = rt.retention_stats();
+    eprintln!(
+        "bound pin: arena unit={unit} demand={demand} regions={} reserved={} used={} | store \
+         per-copy={COPY_WORDS} copies={COPIES} retired_regions={} retained={}",
+        arena.regions,
+        arena.reserved_words,
+        arena.used_words,
+        stats.eval_heap_retired_regions,
+        stats.eval_heap_words + stats.eval_heap_retired_words,
+    );
+}

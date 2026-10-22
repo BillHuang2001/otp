@@ -86,6 +86,20 @@
 //! [`build_trie`] consumes [`hashmap_nibble`], so equal-nibble runs stay contiguous
 //! at every level and one contiguous grouping pass reproduces the C's
 //! ascending-nibble slot order.
+//!
+//! # Deduplication (sort once, duplicates become adjacent)
+//!
+//! [`write_map`] collapses duplicate keys with **one stable sort followed by one
+//! linear pass over adjacent [`eq`]-equal runs** (`collapse_eq_runs`), the shape of
+//! the C `erts_validate_and_sort_flatmap` (`erl_map.c`) — never a per-insertion scan.
+//! Both branches' sort keys (`cmp_flatmap_keys`, and the hash branch's
+//! `(swizzle, cmp)` pair) order `eq`-equal keys as `Equal`, so `eq`-equal keys are
+//! necessarily *adjacent* — and, the sort being a **stable** one, in input order.
+//! One run is therefore one key, and keeping the run's first element while taking
+//! its last value is exactly the first-occurrence-key / last-value result of a
+//! per-insertion scan.
+//! Each sort is a total order on the surviving set, so the produced map stays
+//! independent of the caller's pair order.
 
 use crate::atom::AtomTable;
 use crate::boxed::{
@@ -299,6 +313,42 @@ fn serialize_node(
 // Writer
 // ---------------------------------------------------------------------------
 
+/// Collapses every maximal run of **adjacent** [`eq`]-equal keys in `items` to one
+/// element: the run's **first** element (keeping its key word, and on the hash branch
+/// its `erts_map_hash`), carrying the run's **last** value.
+///
+/// `key` reads the element's key word and `take_value` overwrites the first element's
+/// value word from a later one; both operate on the element tuple in **host** memory,
+/// so the collapse never touches the reserved heap words.
+/// `items` must already be sorted by a total order that orders `eq`-equal keys as
+/// `Equal` with a **stable** sort, so that each run is contiguous and in input order;
+/// then this is exactly the first-occurrence-key / last-value result of a
+/// per-insertion scan, in one linear pass. See the module's *Deduplication* section
+/// for why both branches' sort keys have that property.
+fn collapse_eq_runs<T: Copy>(
+    items: &mut Vec<T>,
+    key: impl Fn(&T) -> Eterm,
+    take_value: impl Fn(&mut T, &T),
+    atoms: &AtomTable,
+) {
+    // `run` indexes the current run's surviving element; `i` walks the buffer. Because
+    // `run <= i` always, the in-place move only ever overwrites elements already
+    // folded into a survivor.
+    let mut run = 0;
+    for i in 1..items.len() {
+        if eq(key(&items[run]), key(&items[i]), atoms) {
+            let later = items[i];
+            take_value(&mut items[run], &later);
+        } else {
+            run += 1;
+            items[run] = items[i];
+        }
+    }
+    if !items.is_empty() {
+        items.truncate(run + 1);
+    }
+}
+
 /// Builds a map term from `pairs` at `hp` and returns the tagged root.
 ///
 /// Reproduces `erts_map_from_ks_and_vs` (`erl_map.c:673`) / `erts_maps_put`
@@ -308,12 +358,17 @@ fn serialize_node(
 /// [`erts_map_hash`], so its stored pair order equals the oracle's
 /// `maps:to_list/1` order. The pair order of `pairs` is irrelevant.
 ///
+/// Construction is the C's *sort once, duplicates become adjacent* shape (the module's
+/// *Deduplication* section has the byte-equivalence argument): one stable sort of the
+/// input pairs followed by `collapse_eq_runs`'s single linear pass, never a
+/// per-insertion scan.
 /// The layout is decided by the **input** arity first, because deduplication can
 /// only shrink the key count: an input of at most [`MAP_SMALL_MAP_LIMIT`] pairs is
-/// necessarily a flat map, so it is deduplicated by [`eq`] (no hashing) and sorted
-/// straight into [`write_flatmap`] — one buffer, the same bytes the hash-dedup path
-/// used to produce with two. Only a larger input needs the hash map's
-/// [`erts_map_hash`] placement.
+/// necessarily a flat map, so it is copied into one buffer, sorted by
+/// [`cmp_flatmap_keys`] (no hashing), collapsed, and written with [`write_flatmap`] —
+/// the layout is known from the input arity, so no hashing is needed to pick it.
+/// Only a larger input needs the hash map's [`erts_map_hash`] placement, one hash per
+/// input key.
 ///
 /// # Safety
 ///
@@ -327,48 +382,28 @@ pub unsafe fn write_map(
     atoms: &AtomTable,
 ) -> TermResult<Eterm> {
     if pairs.len() <= MAP_SMALL_MAP_LIMIT {
-        // Collapse duplicates (last value wins) into a single buffer. `eq` is the same
-        // predicate the hash path filters with, and `=:=` keys hash equally, so the
-        // deduplicated key set — and hence the produced bytes — is identical.
-        let mut flat: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
-        for &(key, value) in pairs {
-            match flat.iter_mut().find(|(k, _)| eq(*k, key, atoms)) {
-                Some(entry) => entry.1 = value,
-                None => flat.push((key, value)),
-            }
-        }
+        // One buffer: the input copy is sorted in `cmp_flatmap_keys` order — which
+        // orders `eq`-equal keys `Equal`, so a stable sort leaves each such run
+        // adjacent and in input order — then collapsed in place. `eq` alone decides
+        // identity here: the flat branch never hashes.
+        let mut flat: Vec<(Eterm, Eterm)> = pairs.to_vec();
         flat.sort_by(|a, b| cmp_flatmap_keys(a.0, b.0, atoms));
+        collapse_eq_runs(&mut flat, |p| p.0, |dst, src| dst.1 = src.1, atoms);
         // SAFETY: the caller reserved `flatmap_size_words(pairs.len())` words, which is
-        // at least `flatmap_size_words(flat.len())` for the deduplicated length, and
+        // at least `flatmap_size_words(flat.len())` for the collapsed length, and
         // `flat.len() <= MAP_SMALL_MAP_LIMIT` — the preconditions `write_flatmap`
         // documents. `pairs.len() == 0` yields the 3-word empty block, as before.
         return Ok(unsafe { write_flatmap(hp, &flat) });
     }
 
-    // More than `MAP_SMALL_MAP_LIMIT` input pairs: collapse duplicates (last value
-    // wins) while hashing each key once, then choose the layout from the *distinct*
-    // count. (Deduplication below the limit is the rare case here, so its extra
-    // collect stays on this branch.)
+    // More than `MAP_SMALL_MAP_LIMIT` input pairs: hash each key once, sort into the
+    // canonical leaf order, then collapse adjacent equal keys in one pass and choose
+    // the layout from the *distinct* count.
     let mut entries: Vec<(u64, Eterm, Eterm)> = Vec::with_capacity(pairs.len());
     for &(key, value) in pairs {
-        let hash = erts_map_hash(key);
-        match entries
-            .iter_mut()
-            .find(|(h, k, _)| *h == hash && eq(*k, key, atoms))
-        {
-            Some(entry) => entry.2 = value,
-            None => entries.push((hash, key, value)),
-        }
+        entries.push((erts_map_hash(key), key, value));
     }
-    let n = entries.len();
 
-    if n <= MAP_SMALL_MAP_LIMIT {
-        entries.sort_by(|a, b| cmp_flatmap_keys(a.1, b.1, atoms));
-        let flat: Vec<(Eterm, Eterm)> = entries.iter().map(|(_, k, v)| (*k, *v)).collect();
-        // SAFETY: the caller reserved `flatmap_size_words(pairs.len())` words, which
-        // is at least `flatmap_size_words(n)` for the deduplicated `n`.
-        return Ok(unsafe { write_flatmap(hp, &flat) });
-    }
     // Hash map. Lay the key/value cons cells at the base of the block in
     // *canonical* order — ascending by `swizzle_map_hash(hash)` (the C's
     // `hxnodecmp` order, a nibble reversal of the hash so the trie's per-level
@@ -376,12 +411,25 @@ pub unsafe fn write_map(
     // `CMP_TERM` (the C's `hxnodecmpkey` collision-node order) — so the produced
     // buffer is independent of the caller's pair order (matching the C, which lays
     // out the swizzle-sorted `hxns`). The leaves are then already sorted for
-    // `build_trie`.
+    // `build_trie`. `eq`-equal keys share an `erts_map_hash` (the invariant the trie
+    // itself relies on), so this order leaves each duplicate run adjacent, in input
+    // order, for the collapse.
     entries.sort_by(|a, b| {
         swizzle_map_hash(a.0)
             .cmp(&swizzle_map_hash(b.0))
             .then_with(|| cmp(a.1, b.1, atoms))
     });
+    collapse_eq_runs(&mut entries, |e| e.1, |dst, src| dst.2 = src.2, atoms);
+    let n = entries.len();
+    if n <= MAP_SMALL_MAP_LIMIT {
+        // Collapsing more than `MAP_SMALL_MAP_LIMIT` pairs can land at or below the
+        // limit, which makes it a flat map after all.
+        entries.sort_by(|a, b| cmp_flatmap_keys(a.1, b.1, atoms));
+        let flat: Vec<(Eterm, Eterm)> = entries.iter().map(|(_, k, v)| (*k, *v)).collect();
+        // SAFETY: the caller reserved `flatmap_size_words(pairs.len())` words, which
+        // is at least `flatmap_size_words(n)` for the collapsed `n`.
+        return Ok(unsafe { write_flatmap(hp, &flat) });
+    }
     let mut cur = hp;
     let mut leaves: Vec<(u64, Eterm)> = Vec::with_capacity(n);
     for &(hash, key, value) in &entries {

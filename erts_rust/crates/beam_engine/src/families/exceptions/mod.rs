@@ -324,6 +324,11 @@ pub(crate) fn exec(
             // `get_trace_from_exc(NIL) == NULL` answer; a non-NIL raw is cooked as
             // before.
             let has_snapshot = !machine.raise_snapshot().is_empty();
+            // A raise that **supplied** its trace has no derived snapshot by
+            // construction (the rebuild is skipped), so the supplied frames must still
+            // reach `symbolic_stacktrace` — the one place that consumes them — even
+            // when the raw trace is `NIL` and the snapshot is empty.
+            let supplied = machine.has_raise_supplied_trace();
             // An `undef` raised by an unresolvable `call_ext*`/`apply` target carries
             // a synthesized **callee head item** as its raw trace (see
             // [`callee`]): C's innermost `build_stacktrace` item, the callee named
@@ -332,7 +337,7 @@ pub(crate) fn exec(
             // must be re-read through, never a pre-computed term that could have
             // moved) to the trace builder.
             let head = machine.take_raise_head_item();
-            let cooked = if is_nil(raw) && !has_snapshot && !head {
+            let cooked = if is_nil(raw) && !has_snapshot && !head && !supplied {
                 NIL
             } else {
                 symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(0), head)?
@@ -357,7 +362,26 @@ pub(crate) fn exec(
                     // it in `x(3)` (C stores the class in the `StackTrace` struct
                     // *and* in `c_p->freason`, `beam_common.c:1151-1175`).
                     install_class_atom(machine, module, ctx, class)?;
-                    machine.throw_with_trace(class, value, trace).map(Some)
+                    // C's `raw_raise` stores the supplied trace in `c_p->ftrace` and
+                    // clears `EXF_SAVETRACE` (`beam_common.c:1148-1179`), so nothing is
+                    // derived at this site: the raise keeps the trace it arrived with.
+                    //
+                    // The engine's landed trace is a **term**: an enclosing landing
+                    // published the cooked `[{M,F,A,Location}]` list of the exception
+                    // being handled in `x(2)` (`Machine::land_exception`), and `try_case`
+                    // leaves `x(2)` untouched (`emu/instrs.tab:1221` only moves `x(3)`
+                    // into `x(0)`), so that list is read straight back here. When `x(2)`
+                    // holds no term the chain is the machine's live
+                    // [`Machine::raise_snapshot`] — the frames of the raise being
+                    // re-raised, C's `c_p->ftrace` — cooked **once** (rooted) into the
+                    // term the raise then supplies, so no re-raise-site frame is ever
+                    // derived.
+                    let supplied = if is_nil(trace) {
+                        symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?
+                    } else {
+                        trace
+                    };
+                    machine.raise_supplied(class, value, supplied).map(Some)
                 }
                 None => {
                     // C: an unknown class is not an error — `raw_raise` returns 1,

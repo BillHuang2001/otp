@@ -138,16 +138,26 @@
 //! * A **record-semantics** failure the C reports by branching — a non-record
 //!   source, a definition `module`/`name` mismatch, a field name the record does
 //!   not have, a definition that is not exported where accessibility is required —
-//!   **branches to the instruction's `fail` label** ([`fail_step`]), exactly the
-//!   C's `$FAIL($Fail)` / `$FAIL_HEAD_OR_BODY($Fail)`. The C reaches several of
+//!   **branches to the instruction's `fail` label** ([`fail_step`] /
+//!   [`failure::fail_step_with_reason`]), exactly the C's `$FAIL($Fail)` /
+//!   `$FAIL_HEAD_OR_BODY($Fail)`. The C reaches several of
 //!   these through an `ASSERT(is_record(src))` because the compiler always puts the
 //!   corresponding guard in front; treating a non-record as a failed guard is the
 //!   same decision that guard would have made and never fabricates a value.
-//! * `fail == NO_FAIL` (the compiler promised the guard cannot fail) ⇒ the engine's
-//!   one failed-clause raise, class `error` with the bare atom `function_clause`
-//!   ([`crate::interpreter::raise_function_clause_no_fail`]) — C's branchless
-//!   `FAIL(0)` reaches exactly that raise through `func_info`/`handle_error`, and
-//!   every family routes it the same way. Never a fall-through with a wrong result.
+//! * `fail == NO_FAIL` (the compiler promised the guard cannot fail) ⇒ the raise the
+//!   C reaches, which **depends on the opcode group**:
+//!   * the four guards (`is_any_native_record`, `is_native_record`,
+//!     `get_record_elements`, `is_record_accessible`) take C's plain
+//!     `$FAIL($Fail)`, which sets **no** reason ⇒ the engine's one failed-clause
+//!     raise, class `error` with the bare atom `function_clause`
+//!     ([`crate::interpreter::raise_function_clause_no_fail`]).
+//!   * `put_record`'s update form, `update_record_id` and `get_record_field` take
+//!     `$FAIL_HEAD_OR_BODY` **after** their C helper set `p->fvalue`/`p->freason`
+//!     (`erl_record.c:746-756`, `:790-821`, `:832-879`), so the raise is class
+//!     `error` with the record reason — `{badfield, {{Module,Name}, Field}}` or
+//!     `{badrecord, Src}` — built by [`failure::fail_step_with_reason`].
+//!
+//!   Either way it is never a fall-through with a wrong result.
 //! * A genuine **capability gap** ⇒ a typed `error::unsupported("<instr>: <what>")`.
 //!   The one such gap here is the *create* form of [`Instr::PutRecord`] with an
 //!   `Id` naming **another module's** record on a host that **cannot answer for it**:
@@ -168,6 +178,7 @@
 //!   the `terms` readers/writers propagate their own typed errors.
 #![allow(clippy::too_many_arguments)]
 mod create;
+mod failure;
 mod raw;
 #[cfg(test)]
 mod tests;
@@ -187,6 +198,7 @@ use crate::operand::{operand_slack_words, read_operand, read_operand_slack, writ
 use crate::predicates;
 use crate::terms;
 use crate::Step;
+use failure::{fail_step_with_reason, RecordReason, BADFIELD};
 
 /// Execute a record-family instruction.
 ///
@@ -397,8 +409,14 @@ pub(crate) fn exec(
                 // `erl_is_record_accessible`: the definition must be exported.
                 exported
             } else {
-                // `erl_is_wildcard_record_accessible(src, $MODULE)`.
-                exported || raw::record_definition_module_is(source, scope)?
+                // `erl_is_wildcard_record_accessible(src, $MODULE)` — the module
+                // the C passes is the **running** one (`emu/ops.tab:1677`
+                // substitutes `$MODULE`, expanded from `st->module` by
+                // `../../erts/emulator/utils/beam_makeops:2554`), not the `Scope`
+                // operand's atom: the compiler writes `external` or `auto_local`
+                // there (`lib/compiler/src/beam_core_to_ssa.erl:904-909`), so
+                // comparing against the operand would never match.
+                exported || raw::record_definition_module_is(source, module.name)?
             };
             if accessible {
                 Ok(Some(Step::Next))
@@ -464,7 +482,7 @@ pub(crate) fn exec(
     }
 }
 
-/// The `$FAIL($Fail)` decision shared by every native-record guard.
+/// The `$FAIL($Fail)` decision shared by the native-record **guards**.
 ///
 /// A live label is a jump; [`NO_FAIL`] — the compiler's "this test cannot fail"
 /// marker — is the engine's single failed-clause raise, exactly as the sibling
@@ -476,6 +494,14 @@ pub(crate) fn exec(
 /// class atoms resolve through the live atom namespace, so a name only the host's
 /// shared table knows still raises; a name **neither** source knows is the honest
 /// typed `error::unsupported`, never a substituted atom.
+///
+/// This is the route for the four C sites that take a plain `$FAIL($Fail)`
+/// (`is_any_native_record`, `i_is_native_record`, `i_get_record_elements`,
+/// `i_is_record_accessible`/`i_is_wildcard_record_accessible`,
+/// `emu/instrs.tab:1323-1356`). A site that takes `$FAIL_HEAD_OR_BODY` **after**
+/// its C helper set an exception reason uses
+/// [`failure::fail_step_with_reason`] instead, whose `NO_FAIL` arm raises that
+/// reason.
 fn fail_step(
     machine: &mut Machine,
     module: &Module,
@@ -603,9 +629,11 @@ fn get_record_elements(
 /// Reproduces `erl_get_local_record_field` (`erl_record.c:782-822`, the `Id` is an
 /// atom naming the record in the running module) and `erl_get_record_field`
 /// (`erl_record.c:824-880`, the `Id` is a `{Module,Name}` pair and the definition
-/// must be exported) branch for branch: a non-record, a definition mismatch, a
-/// non-exported foreign record or an absent field name is the C's `badrecord`/
-/// `badfield` ⇒ `$FAIL_HEAD_OR_BODY($Fail)`.
+/// must be exported) branch for branch. Both set an exception reason before taking
+/// `$FAIL_HEAD_OR_BODY($Fail)` (`emu/instrs.tab:1447`, `:1458`): a non-record, a
+/// definition mismatch or a non-exported foreign record is `p->fvalue = src;
+/// p->freason = EXC_BADRECORD` ⇒ `{badrecord, Src}`, and an absent field name is
+/// `{badfield, {{Module,Name}, Field}}` ([`fail_step_with_reason`]).
 fn get_record_field(
     machine: &mut Machine,
     labels: &LabelMap,
@@ -621,23 +649,55 @@ fn get_record_field(
     let source = read_operand(machine, ctx, src)?;
     if !predicates::is_record(source) {
         // `is_not_record(src)` ⇒ `badrecord` ⇒ `$FAIL_HEAD_OR_BODY`.
-        return fail_step(machine, module, labels, fail, instruction, ctx);
+        return fail_step_with_reason(
+            machine,
+            module,
+            labels,
+            fail,
+            instruction,
+            RecordReason::BadRecord { src },
+            ctx,
+        );
     }
     match read_record_id(machine, ctx, id, instruction)? {
         RecordId::Local(name) => {
             // `if (name != am_Underscore && defp->name != name) goto badrecord;`
             if module.atom_name(name) != Some(UNDERSCORE) && !raw::record_name_is(source, name) {
-                return fail_step(machine, module, labels, fail, instruction, ctx);
+                return fail_step_with_reason(
+                    machine,
+                    module,
+                    labels,
+                    fail,
+                    instruction,
+                    RecordReason::BadRecord { src },
+                    ctx,
+                );
             }
         }
         RecordId::Foreign { module: owner, name } => {
             // `if (defp->module != module || defp->name != name) goto badrecord;`
             if !raw::record_is_native(source, owner, name) {
-                return fail_step(machine, module, labels, fail, instruction, ctx);
+                return fail_step_with_reason(
+                    machine,
+                    module,
+                    labels,
+                    fail,
+                    instruction,
+                    RecordReason::BadRecord { src },
+                    ctx,
+                );
             }
             // `if (defp->is_exported == am_false) goto badrecord;`
             if !raw::record_is_exported(source)? {
-                return fail_step(machine, module, labels, fail, instruction, ctx);
+                return fail_step_with_reason(
+                    machine,
+                    module,
+                    labels,
+                    fail,
+                    instruction,
+                    RecordReason::BadRecord { src },
+                    ctx,
+                );
             }
         }
     }
@@ -648,7 +708,23 @@ fn get_record_field(
             Ok(Step::Next)
         }
         // The C's `badfield` after scanning every key.
-        None => fail_step(machine, module, labels, fail, instruction, ctx),
+        None => {
+            let definition = record_definition(source, instruction)?;
+            fail_step_with_reason(
+                machine,
+                module,
+                labels,
+                fail,
+                instruction,
+                RecordReason::BadField {
+                    tag: BADFIELD,
+                    owner: raw::definition_module(definition)?,
+                    name: raw::definition_name(definition)?,
+                    field,
+                },
+                ctx,
+            )
+        }
     }
 }
 
@@ -711,7 +787,28 @@ fn update_native_record(
         let key = read_atom(machine, ctx, field, instruction)?;
         let index = match finding(keys.iter(), key) {
             Some(index) => index,
-            None => return fail_step(machine, module, labels, fail, instruction, ctx),
+            None => {
+                // `p->fvalue = TUPLE2(TUPLE2(defp->module, defp->name), new_p[0]);
+                //  p->freason = EXC_BADFIELD;` (`erl_record.c:746-756`) — the
+                // unconsumed update entry's key names the offending field. The
+                // reason is built before this arm returns; the block reserved above
+                // is abandoned unwritten (its pointer was never a root), exactly as
+                // the C leaves its half-built instance.
+                return fail_step_with_reason(
+                    machine,
+                    module,
+                    labels,
+                    fail,
+                    instruction,
+                    RecordReason::BadField {
+                        tag: BADFIELD,
+                        owner: raw::definition_module(definition)?,
+                        name: raw::definition_name(definition)?,
+                        field: key,
+                    },
+                    ctx,
+                );
+            }
         };
         // Read the value only once its field resolved, and before `Dst` is written.
         values[index] = read_operand(machine, ctx, value)?;

@@ -1041,6 +1041,47 @@ pub(crate) fn native_record_declaration_keys(def: Eterm) -> Result<Vec<Eterm>> {
     Ok(unsafe { beam_term::record_declaration_keys(def)? })
 }
 
+/// The definition's `field_order` ranks — `order[i]` is the **sorted-key** rank of
+/// the field declared `i`-th (`record_declaration_keys` walks the same tuple).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition or a rank is
+/// not a non-negative small integer (`TermError::BadRecord` reconciled to
+/// `badarg`).
+pub(crate) fn native_record_declaration_order(def: Eterm) -> Result<Vec<usize>> {
+    // SAFETY: `def` is a live definition term obtained from
+    // `native_record_definition`; `record_definition_field_order` re-validates it
+    // and returns a slice into its own block, which is copied out here.
+    let order = unsafe { beam_term::record_definition_field_order(def)? };
+    let mut out = Vec::with_capacity(order.len());
+    for &entry in order {
+        if !is_small(entry) {
+            return Err(BeamError::BadArg);
+        }
+        match usize::try_from(signed_value(entry)) {
+            Ok(rank) => out.push(rank),
+            Err(_) => return Err(BeamError::BadArg),
+        }
+    }
+    Ok(out)
+}
+
+/// The field **value** words of a native-record instance, in **sorted-key** order
+/// (`record_values`) — index them by [`native_record_declaration_order`] to get
+/// declaration order.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `rec` is not a well-formed native record.
+pub(crate) fn native_record_values(rec: Eterm) -> Result<Vec<Eterm>> {
+    // SAFETY: `rec` is a live machine word; `record_values` returns
+    // `TermError::BadRecord` for a non-record and never reads past the block it
+    // validated. The returned slice borrows the block, so it is copied out here and
+    // no lifetime escapes the call.
+    Ok(unsafe { beam_term::record_values(rec)? }.to_vec())
+}
+
 /// The value of the field whose key equals `key`, or `None` when no key matches
 /// (`records_get_2`, `erl_record.c:1247-1274`).
 ///

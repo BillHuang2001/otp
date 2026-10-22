@@ -33,7 +33,7 @@ Entering an external fun in the calling process (as C's `call_fun` does) is what
 The engine's doors (`ensure_heap`/`ensure_heap_full`, sharing `collect_or_grow`) collect and grow the nursery to fit an oversized request (`Process::ensure_capacity`, when `HeapPolicy::next_words(need,0) >= need`; a bounded `+hmax` below it falls back to `Process::collect()`) — see *Known Issues* for the arena fallback and its soundness valve.
 **Registry precedence (gotcha).** The native floor runs *before* the registry (a `beam_bifs` entry can never shadow a floor-served key) and the registry *before* the external-module load; a registration shadows the fallback for a non-`erlang` name, while an `erlang:*` one flips the unregistered answer — bare `error::undef`, or `unsupported` when curated in `error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`.
 ### The dispatch memo · `DispatchHooks`
-`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped 8-slot per-context memo of `{bif: Option<BifFn>, hooks: DispatchHooks}`, where `hooks` is **one boolean per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates) and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
+`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped per-context memo of `DISPATCH_MEMO_SLOTS = 128` slots (`dispatch.rs:53`, the count grew from 8 because `compile:file/2`'s 241-key hot set evicted itself at 8) holding a boxed `{bif: Option<BifFn>, hooks: DispatchHooks}` per slot — the slots are inline (`slots: [Option<Box<DispatchEntry>>; 128]`), so a fresh per-applied-fun context carries ~1 KiB of `None` slots and allocates a box only on a miss, where `hooks` is **one boolean per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates) and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
 A cached answer can never go stale: the one mutable input, the **NIF registry**, is deliberately not memoized (`call_bif` runs `try_call_nif` first on every call).
 Slot hash, the miss/collision rules, hit/miss cost, pooled BIF heap and `PendingInterner`: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-dispatch-memo--dispatchhooks).
 ### In-machine execution-position door (`position.rs`)
@@ -63,7 +63,7 @@ The result's copy-out and rewind are [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; the
 ### The nine bridges
 Exactly **one** bridge is selected, first-match, from `DispatchHooks`: `DictBridge` (`DictHook`), `ProcessBridge` (`ProcessHook`), `NifBridge` (`NifLoader`), `RecordBridge` (`RecordSource`), `SendBridge` (`SendHook`), `ModuleInfoBridge` (`ModuleInfo`; `erlang:get_module_info/1,2` from the loaded module's IR), `PersistentTermBridge` (`PersistentTerm`), `RuntimeHooksBridge` (`RuntimeHooks`; 40 of the 143-key `RUNTIME_HOOKS_BIFS` roster served, the other 103 answering the typed `unsupported: <module>:<function>/<arity>`) and `FunBridge` (`FunCaller`; the fallback), with the `[safe]` export gate as the eleventh `DispatchHooks` entry.
 Per-arm API surface: [`calls/CONTEXT.md`](calls/CONTEXT.md).
-The record seam's reach is **BIF-only**: `RecordBridge`'s `RecordSource` is consulted by exactly one key (`beam_bifs::RECORD_SOURCE_BIFS` = `records:get_definition/2`) through `BifContext::record_definition`; no `beam_engine::ExecutionContext` method exposes `Recs`-chunk data, so a native-record *instruction* (the create form for another module's `{Module,Name}` id) cannot reach a definition today — that would be a new defaulted engine seam implemented here over the same `&CodeServer`.
+The record table has **two** consumers over the one lookup `records::loaded_record`: `RecordBridge`'s `RecordSource`, consulted by exactly one key (`beam_bifs::RECORD_SOURCE_BIFS` = `records:get_definition/2`) through `BifContext::record_definition`, and `ExecutionContext::foreign_record_definition` (`records.rs`), the native-record *instruction* path — a `put_record` create whose `Id` names another module's `{Module,Name}` record: the owner is loaded and the lookup retried when the code server does not hold it, and the definition's `is_exported` flag is returned **unfiltered** (the engine applies the C's gate and raises `error:{badrecord, Id}`).
 The `Recs` data has no table of its own: it lives in each cached `Arc<Module>` (`CodeServer::modules`, `module_handle`) and comes back through `Module::records()`/`record()`/`record_by_name()`.
 ### The `[safe]` export gate — `export_gate.rs` (the 16th `BifContext` seam)
 `ExportGateBridge` implements `beam_codec::ExportGate`; its `is_export_active(m,f,a)` is the shared `runtime_hooks.rs::is_active_export` helper **OR** `registry.contains(m,f,a)` — the registry disjunct exists because this runtime's code server holds only the 22 preloaded modules.
@@ -90,7 +90,7 @@ Detail, gates and the residual list: [`gc/CONTEXT.md`](gc/CONTEXT.md); the pinni
 Mechanics: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-node-hash-a2--node_hashrs).
 
 ## Constraints
-* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with two narrowly-scoped exceptions (`gc_walk.rs`'s `beam_term::layout` object-walk; `../nif.rs`'s `enif_compare`/`enif_hash` `unsafe extern "C"` calls); the glue otherwise uses only the safe peripheries of the lower crates.
+* **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]`, with one `#![allow(unsafe_code)]` per marked module and a `// SAFETY:` rationale at each site — this node's `gc.rs`, `gc_walk.rs`, `gc/bin_vheap.rs`, `gc/valve_bounds.rs` (the word classifier and the reachability descent), `calls.rs` (the copy-out walk) and `eval/reclaim.rs` + `eval/reclaim/resource.rs` (the off-heap prune), plus `../nif.rs` and `../malloc.rs`; the glue otherwise uses only the safe peripheries of the lower crates.
 * **Return-based errors, no silent swallowing** ([`../../../CONTEXT.md`](../../../CONTEXT.md) §3): every fallible helper returns `beam_common::Result`; no `panic!`/`unwrap()` on runtime data.
 * **Call down, never duplicate**: a BIF is served by `beam_bifs`/the native floor, never re-implemented here.
 * **Never fabricate a value**: a seam answer is either real state or the typed gap — `NodeIdentity` reports the runtime's **live** creation (`Runtime::node_creation()`), and the node hash is a genuine per-process computation, never a constant.
@@ -105,8 +105,8 @@ The GC/heap-model ledger is [`../../M1_GAPS_GC.md`](../../M1_GAPS_GC.md), the ca
 * **The "no collection can run while a BIF call is in flight" invariant is a conjunction of facts, not an enforced guard** — the BIF route (`call_bif` → `try_call_nif` → `try_native` → dispatch memo → `call_registered`) reaches no `context/gc.rs` door (`BifContext` exposes only the pooled pointer-stable `Heap`), and `gc_armed` is `take`n at each door's first statement (`execution.rs:472,486,510`), armed only by `BudgetContext` immediately before a forward.
   Both halves are structural: the latch is **unreadable** inside the dispatch (`call_registered`'s destructure discards it) and the machine is handed as `&self`, so no arm can consult it and the engine cannot mutate the register file mid-call.
   Two term holders ride that window with **no root set covering them**: the marshalled argument copy (a `[Eterm; 2]` stack array / `Machine::args_scratch`) and `InMachinePosition`'s five `Eterm`s published in `Runtime::in_machine` (`position.rs`), which `alloc_words` places on the process's **scanned young heap**; the roster `off_heap_binaries` beside them is plain `(usize, usize, usize)` data, so it holds no term and needs no root set.
-  `Machine::pending_exception` is a third, deliberately **not** parked by `with_roots` and rooted explicitly only in the park window via `Registers::extra_roots` (`runner/run.rs:527-540`); the copy-out is **not** a collection site (`calls.rs:964-1006`: `grow_nursery` + one retry), and the one in-call collection that exists — a delivery's `Process::deliver` on the receiver — is refused for the running process by the sender/receiver relocation exemption (`send.rs:352-502`).
-* **A scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks in a `receive` is the typed `blocked()` gap** — the call goes `call_bif` → `run_export_blocking` (a fresh `Machine` on the same pid under a `for_process*` context, so `may_pump_scheduler()` is `false`) and `pump_once` returns `Ok(None)` on its first line, folding the parked callee into the uncatchable `beam_engine::blocked()` whether or not its `receive` carries an `after T`.
+  `Machine::pending_exception` is a third holder, and unlike the two above it **is** parked: `Machine::with_roots` parks the machine's loose heap terms (the two failed-clause arg latches and this reason, `const LOOSE_HEAP_TERMS = 3`) at the tail of the Erlang stack for the closure's duration and re-seats them from the slots the host wrote back (`beam_engine/src/machine/mod.rs`), a funnel every in-slice collection door passes through, and across a park window it rides `Registers::extra_roots` (`runner/run.rs:622-647`); the copy-out is **not** a collection site (`calls.rs:964-1006`: `grow_nursery` + one retry), and the one in-call collection that exists — a delivery's `Process::deliver` on the receiver — is refused for the running process by the sender/receiver relocation exemption (`send.rs:352-502`).
+* **A scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks in a `receive` is the typed `blocked()` gap** — the call goes `call_bif` → `run_export_blocking` (a pooled `Machine` on the same pid under a `for_process*` context, so `may_pump_scheduler()` is `false`) and `pump_once` returns `Ok(None)` on its first line, folding the parked callee into the uncatchable `beam_engine::blocked()` whether or not its `receive` carries an `after T`.
 * **`erlang:fun_info/1,2` reads the `LocalFunIdentity` seam, and its `name` item comes from two wiring sites here.** `bridges.rs::local_fun_identity` attaches the `FunT` entry's `function` to the derived `FunIdentity` for a compiled `make_fun3` fun (`with_function`; introspection-only, so the `term_to_binary` bytes are unchanged); `fun_identity.rs::imported_identity` resolves a decoded `NEW_FUN_EXT` fun's `name` from the loaded module named by its own `module` atom.
   Residual: an imported fun whose **defining module is not loaded** is the typed `unsupported_bif` gap where the oracle reports `{name,[]}` (C `mfa == NULL ⇒ NIL`) — never a fabricated name; pinned by `an_imported_funs_unloaded_defining_module_is_the_typed_gap_not_an_empty_name`.
 * **The `NEW_FUN_EXT` identity seam is installed on every encode path; which `Ok(None)` branches are LIVE decides where `unsupported_local_fun` (exit 3, CLI reason `local_fun`) still bites.** `uses_fun_identity` (`dispatch.rs:511`) covers `erlang:term_to_binary/1,2` + `erlang:external_size/1,2` (`beam_bifs::LOCAL_FUN_IDENTITY_BIFS`) and the introspection pair, `call_registered` installs `FunIdentityBridge` on **every** dispatch arm, and `nif.rs`'s `enif_term_to_binary` derives through the same `fun_identity_for`. Live gaps: (a) an `-eval` lambda (`eval/mod.rs`'s `EVAL_FUN_UNIQ` sentinel + `eval_closures` index matches no loaded `FunT` — the recorded `wire/new_fun_ext_encode`); (b) a module loaded through `code:load_binary/3` (`insert_loaded` removes its path ⇒ `fun_module_snapshot` skips it, so `descriptor_position` is never consulted); (c) a module whose `.beam` was deleted after it loaded (`std::fs::read(path)` fails ⇒ the deliberate `Ok(None)`). Not fun-reachable: the `zlib` stash encoder (`beam_bifs/src/zlib/stream/lifecycle.rs:133` — its internal `-nifs` only ever carry `{Kind,Output}` state, the user-facing `getStash`/`setStash` are gone from `zlib.erl`), `crash_dump`/`persistent_term`/`seq_trace` (no encoder at all), and the NIF-created-thread host (`nif/thread_env.rs:255` never installs one; its whole `enif_term_to_binary` hook is unsupported). The outbound `dist` payload rewrite (`dist/externalize.rs:227`) and `beam_dist`'s own control encoder both build their `Encoder` with **no** fun identity, so a `make_fun3` fun addressed to a remote pid/name is a typed refusal where the oracle encodes it.
@@ -132,11 +132,32 @@ Every suite here is colocated (`tests.rs` + `test_support.rs`) or an integration
 * **The A.9 in-process-compile sweep** (`pump.rs`'s `#[ignore]`d `every_stdlib_source_compiles_in_process_like_the_oracle`) enumerates every `lib/stdlib/src/*.erl` from the filesystem, gives each source a fresh boot-script-driven runtime and compiles it through the `-eval` route, pinning the **set**, the **count** and the **bytes** against the oracle's own compilable set; `BEAM_RT_SWEEP_SHARD=i/n` shards the corpus across parallel runs (a malformed value is a loud failure), and the sweep body runs on a 32 MiB stack (`SWEEP_STACK_BYTES`) with its panic payload re-raised via `std::panic::resume_unwind`.
   The measured set/count and the oracle-side `-I` limit: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-a9-in-process-compile-sweep).
 * Run the crate gate `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --lib --no-fail-fast`.
-  The boot-drive/CLI suites are wall-clock sensitive (`DRIVE_DEADLINE`) and can fail on a heavily loaded host — re-run before calling a failure a regression.
+  The boot-drive/CLI suites are wall-clock sensitive (`DRIVE_DEADLINE`) and can fail on a heavily loaded host — re-run before calling a failure a regression.- **The host-memory bound is pinned, not described.** `src/context/pool/tests.rs`'s
+  `the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand` runs by default (<1 s, no
+  toolchain, no wall clock): it drives the table-less route through `ExecutionContext::alloc_words` and
+  real `lists:seq/2` copy-outs and asserts the arena's exact cumulative demand, its geometric
+  reservation ladder (`reserved = unit × (2^regions − 1)`), the retirement count the fixture provokes,
+  and the rule `eval_heap_words + eval_heap_retired_words == region × (2^(retired+1) − 1)` — i.e. the
+  store retains Σ retired capacities and never shrinks.
+- **The same bound on the real workload** is `src/context/pump.rs`'s `#[ignore]`d
+  `the_cerl_clauses_compile_bands_the_arena_and_the_eval_store` (~1 s of compile, system compiler):
+  bands `arena_words` ±30 %, asserts the exact region ladder, `eval_heap_retired_regions`, the retention
+  identity, `bif_regions` ±30 % and the artifact's md5.
+
 ## Notes for Agents
+- **The measured per-call cost of the in-process `compile:file/2` route (A.9), descending** — callgrind on `lib/stdlib/src/ordsets.erl`, 3.10 G Ir, release profile: the `gc_walk` valve descent **~24–26 %** (the full-graph `Walk::run` alone 15.65 %, reached 499× from the collection doors, because the BIF-result copy-out opens the descent latch on every process so each admission door re-walks), libc `malloc`/`free` **~22.6 %** (~1.9 M `malloc` and ~2.06 M `free` calls), `build_label_map` **~3.3 %** after the machine pool (22 745 `module_fingerprint` calls — the callee set exceeds the pool's 32 affinity slots), and SipHash **~7.1 %** (dominated by `beam_engine::jit::cache::key::HashWriter::write_str`, 3.89 M calls).
+  Read the **ratios**, never the absolute times: on a loaded host the same binary measured 1 090–2 036 ms for `ordsets` (load average 16.7–29.6).
+  Which door fires is a route fact: the **top-level** `-eval` context is table-less (`RuntimeContext::new` sets `mailbox_table: None`, `gc_armed: false`), so `heap_available`/`alloc_words` answer the never-reclaimed `Runtime::arena` (`gc.rs::heap_available`) and the in-slice doors do not run — but every **nested** run executes under `for_process`, so it allocates from the pid's real young heap and its collection doors (hence the valve descent above) do run.
+  A nested run therefore also takes the **in-machine seam, not `run_export`**: a plain `call_ext` between interpreted modules goes `interpreter/dispatch.rs`'s `resolve_external_entry` → `resolve_external_call`, and `run_export` is reached only from a declined call, a top-level entry, or a fun application (`execution.rs` → `run_label_blocking`); `run_export`'s `current_module` `String` allocation is therefore not a per-`call_ext` cost.
 - **Layout: `mod.rs` is root-only plumbing over concern-scoped submodules** (module `//!` overview + submodule map, `mod …;` declarations, crate-visible re-exports, `#[cfg(test)]`-gated name plumbing; no logic).
   Because Rust forbids a second `impl ExecutionContext` (E0119), the seam lives in **one** block in `execution.rs`, its methods delegating to inherent helpers in the sibling that owns the concern.
   Five siblings exceed the ~1000-line target — `runtime_hooks.rs`, `calls.rs`, `gc.rs`, `pump.rs`, `bridges.rs` — each one cohesive pre-existing concern documented at its own top; `tests.rs` is the node's shared unit suite and `calls/tests.rs` the colocated suite for `calls.rs`, and the names `tests.rs`/`pump.rs`'s inline `mod blocking_fun_apply` reach through `use super::*;` are re-imported in `mod.rs` under `#[cfg(test)]` (`DispatchMemo` alone stays ungated).
+- **Every nested cross-module run reuses a recycled `Machine` on the tier-less interpreter entries, and never touches `jit::cache`.** `run_export_blocking` and `run_label_blocking` (`pump.rs`) take their machine from the thread-local pool in `machine_pool.rs` — a **module-affine slot table** (one `Slot` per callee image, `MAX_CALLEE_SLOTS = 96`, each holding a `VecDeque` stack capped at `MAX_CALLEE_DEPTH = 32`, the whole table capped at `MAX_POOLED_MACHINES = 32` with the least-recently-used **callee** giving up its idle machines) — and hand it back at the run's epilogue, so `acquire` is one `FastHashMap` probe plus a `pop_back` and no scan or `Machine` memmove.
+  **The pool's ceiling is measured, and it is not the label-map cost.** It answers 99.5 % of acquires from an entry (ordsets: 14 932/15 007 hits, 75 fresh builds, 44 distinct callees, peak depth 13; maps 76 865/76 966, 101 fresh; string 501 576/501 915, 339 fresh), and a 128-machine ceiling was measured **worse** (+2.7 % user CPU on `string.erl`, identical `build_label_map` census) because the extra idle machines pin one-entry label caches that can never be reused. The per-callee slot table buys an O(1) probe and no live-callee eviction; it buys no time.
+  The residual is a `beam_engine` property: the label cache holds **one** entry and `Machine::reset` clears the context registry, so every run re-registers its in-machine callees through `label_map_arc` and rebuilds each one's whole-module map. Measured share of the fills that are the pool's own bare route: **8 %** (ordsets: 4 733 misses of 15 109 probes against 59 277 fills); the other **92 %** is that per-callee-per-run `Arc` route (string.erl: 1 925 467 of 1 934 350 builds). Removing it needs a multi-entry `LabelMaps` (or a context registry surviving `reset`) in `beam_engine` — no pool shape reaches it.
+  `release` `reset()`s the machine before pushing it and `debug_assert!`s both off-heap reservoirs empty; the drain itself is the epilogue's (`Machine::retain_refc_binaries(|_| false)` in `adopt_nested_payloads`, after `Runtime::adopt_escaped_binaries` has taken every handle), so a recycled machine carries no term and owns no payload.
+  Affinity is a **hint, never an identity claim**: `label_cache.rs` keys its entry on the image's digest + atom namespace + address, so a stale hint costs one build exactly as no pool would and can never answer with another module's map.
+  A run's own resumes still reuse the same machine (`Machine::resume_outcome`). Entry is `Machine::run_export_outcome`/`run_label_outcome`, which delegate to the tier-free `run_loop`/`run_loop_with_map` → `Machine::drive`; **no `Tier` is passed anywhere on this path**, so a nested callee never runs on the default baseline JIT and `BEAM_RT_TIER` does not change its tier (`run_export_outcome_with_tier`/`resume_outcome_with_tier` are the runner slice's). `beam_engine::jit::cache::remember_module` has **no production caller**; only the runner slice entry (`../runner/run.rs:863` `select_entry_tier` → the `*_with_tier` entries) compiles into / reads the cache. The module handle is the code server's cached `Arc<Module>` (`resolve_local_fun`/`resolve_external_call`'s `module_handle`, and `call_bif`'s `CodeServer::load` at `calls.rs:1642-1658`), never a per-call `Module` clone — `CodeServer::load`'s `module.clone()` (`../../codeserver.rs:718`) is an `Arc` handle clone.
 - **The nested blocking pump is wall-clock bounded, and a finite `receive … after T` it must wait out itself.** `run_export_blocking`/`run_label_blocking` drive a suspended callee's `receive` through the shared `pump_until_returned` driver, capped by `BLOCKING_PUMP_DEADLINE` (900 s) — the nested counterpart of the boot drive's `DRIVE_DEADLINE`; the wait policy and the rejected forward-progress alternative: [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-nested-blocking-pump-and-its-bounds).
 - **A nested `receive` that a live port's own asynchronous operation will answer is sat out, not gaped.** `pump_once` hands such a wait to `wait_for_port_event` when `Runtime::ports_awaiting_async` reports a queued operation (a passive `gen_tcp:recv/2,3`, an `accept`, a datagram read), which drives the blocking pass until one of **three** progress signals moves — an executed slice, a delivered port message (`Runtime::port_events_delivered`), or no live port owing an asynchronous answer — and is bounded by `crate::port::PORT_EVENT_DEADLINE` (5 s of consecutive no-progress rounds, re-armed on every round that made some).
   The wait arms, latches and consumes nothing, so a re-park waits on the same queued operation and never issues a second one; the `-eval` bare receive's port branch applies the same three signals and the same window rule.
@@ -161,9 +182,14 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
 * `calls/tests.rs` → the `calls.rs` copy-out unit suite (three retry-policy cases over `mod notes`) plus the `#[ignore]`d measurement harness `eval_route_pool_costs` — [`pool/CONTEXT.md`](pool/CONTEXT.md).
 * `pool.rs` → the **table-less** route's BIF-result store (`move_result_into_runtime_store`, `grow_eval_heap`) with the rewind's soundness argument; units in `pool/tests.rs` — [`pool/CONTEXT.md`](pool/CONTEXT.md).
 
+* `machine_pool.rs` → the thread-local (not per-context, because `FunBridge::nested` builds a fresh `RuntimeContext` per applied fun) **module-affine slot table** of finished nested-run `Machine`s (`Pool`/`Slot`: `index: FastHashMap<callee image address, slot>`, per-slot `VecDeque<Machine>`, `MAX_CALLEE_SLOTS = 96`, `MAX_CALLEE_DEPTH = 32`, `MAX_POOLED_MACHINES = 32`), so `acquire` is one hash probe and `release` one `push_back`, a recursive entry of one callee stacks inside its own slot, and past the ceiling the least-recently-used **callee** gives up its idle machines; `release` resets the machine and `debug_assert!`s its off-heap reservoirs are empty. Its `perf` module is the **env-gated reuse census** (`BEAM_RT_PERF_COUNTERS=1`: acquires, hits, fresh builds, evictions, distinct callees, peak pool size, peak callee depth, per-callee rows, printed from a thread-local `Drop`) — zero work when unset beyond one `OnceLock` load.
+* `harness` for that census: `erts_rust/target/release/beam_rt -noshell -eval '<a `compile:file/2` or `lists:map/2` workload>'` with `BEAM_RT_PERF_COUNTERS=1` prints the reuse rows beside the dispatch-path counters.
+* `ir_cache.rs` → the two request-path caches for lookups that are **pure functions of immutable loaded IR**: `local_fun_descriptor` (`(uniq, index) → (Arc<Module>, FunDescriptor)`, one index over the code server's loaded set, invalidated by an `Rc::ptr_eq` identity change of `CodeServer::fun_module_snapshot()` and by nothing else, holding a clone of that snapshot so a recycled address cannot alias) and `callee_admission` (`(module address + image digest + atom namespace, function atom, arity) → (call-site verdict, export label)`, `ADMISSION_CAPACITY = 8192`, no invalidation needed because a different image can never hit, and an all-zero-checksum synthetic image never cached).
 * `send.rs` → the send/deliver family: `classify_send_destination`/`SendDestination` (the **one** shared by all three send routes) + `remote_alias_destination` (the external-reference ⇒ `RemoteAlias` test) + `resolve_send_destination`/`deliver_remote`, `send_source`, the `deliver_message*`/`deliver_into_mailbox`/`delivery_collection_is_unsound`/`send_fragmented_message` set, the `#[cfg(test)]`-only `resolve_send_target`, the mailbox scan surface (`mailbox_parts`/`mailbox_messages`/`remove_mailbox_message`) and `deliver_in_table`.
 * `apply.rs` → fun application (`pub(crate) LocalFunTarget`/`local_fun_target`/`apply_non_local_fun`, the served-local-stub predicate `served_local_key`) and the callee-admission predicates (`CallSiteReadingImports`/`call_site_reading_imports`/`callee_observes_its_call_site`/`function_calls_a_fun_image_bif`/`import_is_a_fun_image_bif`).
-* `pump.rs` → the nested-run pump (`run_export`, `run_export_blocking`/`run_label_blocking`, `pump_until_returned`/`pump_once`/`wait_for_port_event`, `RUN_EXPORT_PUMP_SLICES`/`BLOCKING_PUMP_DEADLINE`, over `crate::port::PORT_EVENT_DEADLINE` for the port wait) plus the inline `#[cfg(test)]` modules `blocking_fun_apply`, `in_process_compile` (seven stdlib compiles byte-compared with the oracle, plus the `#[ignore]`d `every_stdlib_source_compiles_in_process_like_the_oracle` sweep, shardable by `BEAM_RT_SWEEP_SHARD`) and `nested_pump_bound` (the injectable-`limit` deadline proof).
+  `local_fun_target`'s order is load-bearing: the **arity guard precedes the served-key decline**, so a wrong argument count is `BadArity` whatever the descriptor names, and the served test precedes the one `Vec::with_capacity` build, so a declined served key allocates nothing.
+  The descriptor search behind `local_fun_target` is `ir_cache::local_fun_descriptor`, and the per-call callee verdict behind `callee_observes_its_call_site` is `ir_cache::callee_admission`.
+* `pump.rs` → the nested-run pump (`run_export`, `run_export_blocking`/`run_label_blocking`, `pump_until_returned`/`pump_once`/`wait_for_port_event`, `RUN_EXPORT_PUMP_SLICES`/`BLOCKING_PUMP_DEADLINE`, over `crate::port::PORT_EVENT_DEADLINE` for the port wait); every nested run executes on a machine from `machine_pool.rs`, and `adopt_nested_payloads(&mut Machine, …)` adopts the run's payload handles, then **drains** the reservoir with `Machine::retain_refc_binaries(|_| false)` so the recycled machine owns no payload plus the inline `#[cfg(test)]` modules `blocking_fun_apply`, `in_process_compile` (seven stdlib compiles byte-compared with the oracle, plus the `#[ignore]`d `every_stdlib_source_compiles_in_process_like_the_oracle` sweep, shardable by `BEAM_RT_SWEEP_SHARD`) and `nested_pump_bound` (the injectable-`limit` deadline proof).
 * `execution.rs` → the **single** `impl ExecutionContext for RuntimeContext<'_>` (every trait method, split **by concern inside the block**, each delegating to an inherent helper in the sibling that owns the concern), incl. the atom-namespace pair `atom_name`/`atoms` (the runtime's **live** shared table, so guard/`select_val`/map-key comparisons order atoms by name).
   It is also the **one** definition of the dead-destination send policy: `send_message_with_off_heap` folds a delivery's `TermNotFound` (a pid no process backs) into the oracle's silent success (`bif.c:2478-2480`), still emitting the `send` trace event and deliberately not the enqueue-time `receive` one — every other send route (`bridges.rs`'s `SendBridge`, `eval`'s `!`, the engine's `send` instruction) inherits it, and `nif_send.rs` is the one arm that re-applies the C's own `erts_proc_lookup` gate on top.
   It also carries the one inherent helper `host_serves(module, function, arity)` (floor ∪ NIF-loaded module ∪ registered `beam_bifs` key) — the **single** source of truth for "the host serves this MFA", which `resolve_external_call` refuses on first and the runner's export-entry arm asks directly (`../runner/CONTEXT.md`), because that seam's `Ok(None)` is overloaded.
@@ -171,6 +197,7 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
   `host_serves`'s NIF arm is module-granular (`NifRegistry::is_loaded`, not `lookup`), so a mid-run `load_nif/2` **does** flip it for every key of that module — the one runtime-mutable input either seam has.
   The receive-scan method `receive_next` applies a signal queue whose every pending signal is a `PendingSignal::Down` (the one class that can only deliver a `{'DOWN', …}` message) through the public `ProcessTable::service_signals` and re-reads the scan when the candidate scan is exhausted — the C `i_loop_rec` fetch (`../../erts/emulator/beam/emu/msg_instrs.tab:80-112` → `erts_proc_sig_fetch`, `../../erts/emulator/beam/erl_proc_sig_queue.c:7729`) — so a process's own monitor `'DOWN'` needs no extra scheduling round; every other signal class is the runner park arm's (`../runner/CONTEXT.md`).
 * `bridges.rs` → the nine bridges (incl. `FunBridge`'s `call_fun_with_tables` override + its private `nested`), `NodeIdentity` (with its real `local_node_hash`), `local_fun_identity`/`module_md5`; `SendBridge` is a thin delegator to the shared classifier.
+* `records.rs` → the **one** code-server record-table lookup `loaded_record` (shared with `RecordBridge`, so the two consumers cannot drift) and `RuntimeContext::foreign_record_definition`, the host side of the engine's foreign-`put_record`-create seam.
 * `node_hash.rs` → the node's `LOCAL_EXT` hash (`node_hash()`, the self-contained port of the C's Bob-Jenkins `block_hash`) — mechanics in [`IMPLEMENTATION.md`](IMPLEMENTATION.md#the-node-hash-a2--node_hashrs).
 * `position.rs` → the in-machine execution-position door: `InMachinePosition`, `in_machine_probe`/`dispatch_in_machine` + `machine_position`, the published-slot readers `in_machine_value`/`in_machine_off_heap_binaries` that `../native/memory` consults first, and `off_heap_binaries`' `(addr, size, refc)` roster (read only for the `binary` item).
 * `alias.rs` → `alias_destination`, the shared **provenance-classified** reference-alias → (`owner`, `MonitorRef`) lookup behind all three send routes.
@@ -194,3 +221,180 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
 * [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — companion detail for every pointer above, incl. the pinned root-set/relocation/cost sections.
 * [`calls/CONTEXT.md`](calls/CONTEXT.md) · [`gc/CONTEXT.md`](gc/CONTEXT.md) · [`pool/CONTEXT.md`](pool/CONTEXT.md) — the three subsystem children.
 
+
+## The copy-out's reference walk is gated on `move_container`
+`RuntimeContext::graph_holds_reference` runs only where its answer is observable — i.e. only when
+`move_container` holds in `RuntimeContext::call_registered`'s result tail — so a **table-less**
+route's reentrant call never walks its result.
+That is the accumulator shape (`lists:foldl/3`, `lists:map/2`, `maps:map/2`), the super-linear term
+of the in-process `compile:file/2` route (A.9).
+The rule, the proof obligation, the measured visit reductions and the three rejected experiments are
+[`calls/CONTEXT.md`](calls/CONTEXT.md).
+## Host-memory retention on the table-less route — where the words actually accumulate
+An in-process `compile:file/2` runs on `RuntimeContext::new` (`mailbox_table: None`, `gc_armed:
+false`, `runtime_context.rs:204,208`), so **no collector reclaims anything** on this route.
+Nothing here is per-`RuntimeContext`: a context is a borrow-only struct over `&'a mut Runtime`
+(`runtime_context.rs:198-287`), so it owns no heap at all and dropping it frees only its inline
+`dispatch_memo` slots and the boxes a miss put in them.
+Of the four runtime-level stores, the pooled BIF heap is **sized by need** (depth-sized and reused) and the escaped off-heap store is genuinely bounded, while two grow with the workload by construction: the `-eval` store (each region clamped at `MAX_EVAL_HEAP_WORDS` = 256 MiB, the **chain** not clamped) and the `beam_engine` arena (never reclaims).
+A *reserved* region's capacity is never what moves RSS: only written pages are resident — and a **retired** store region is fully written, so its words are resident (both facts measured, next section).
+Per-mechanism detail is [`pool/CONTEXT.md`](pool/CONTEXT.md)'s; this is the cross-store attribution.
+
+### The measured attribution (release build, OTP-30 bootstrap compiler first on `-pa`)
+`erlang:memory(total)` is **blind** to all of it (≈4.7 MB after a full `cerl_clauses` compile) because the
+pool/arena heaps are `AllocType::Standard` and the `MemoryHook` excludes `Standard` from `emulator`
+(`memory_hook.rs:161-195`). The figures that see the truth are `/proc/<pid>/status` `VmHWM`/`VmSize`,
+the last `VmRSS` sample after `src/malloc.rs`'s one `malloc_trim(0)`, and `Runtime::retention_stats()`
+(`BEAM_RT_MEM_TRACE=1`).
+
+| workload | peak `VmHWM` | peak `VmSize` | exit RSS | wall | exit `bif_regions` / `bif_words` |
+|---|---|---|---|---|---|
+| bare `-eval 'halt(0).'` | 118 MB | 587 MB | 23.2 MB | 0.27 s | 3 / 136 MB |
+| `cerl_clauses` 13 793 B, in-process | 372 MB | 962 MB | 21–30 MB | 0.87–0.99 s | 27 / 161 MB |
+| `cerl_clauses` 13 793 B, spawned child | 307 MB | 887 MB | 21–28 MB | 2.42 s | 27 / 161 MB |
+| `orddict` 15 800 B, in-process | 363 MB | — | 30.6 MB | 0.95 s | 23 / 157 MB |
+| `inet_parse` 36 960 B, in-process `-eval` | 5 203 MB | — | 23.0 MB | 12.1 s (**completes**) | 34 / 169 MB |
+| `inet_parse` 36 960 B, `run` route | 222 MB in-process / 671 MB spawned child | — | — | never completes (`RUN_DEADLINE`, 60 s) | — |
+| `dbg_iload` 48 353 B, in-process | 17.4 GB at the 25 s cap (still growing) | — | — (killed at 25 s) | **does not complete** | — |
+The pool's capacity is **depth-sized now**: the outermost call gets `bif_heap_words` (1 << 24 words = 128 MiB) and every nested level gets `NESTED_BIF_HEAP_SEED_WORDS` (131 072 words = 1 MiB), self-tuned upward to `2 ×` an observed nested peak by `note_nested_heap_need`, with `bif_heaps_taken` the live depth.
+For `cerl_clauses` that is 27 regions / 20 185 088 words = **161 MB**, where seeding every level at `bif_heap_words` gave the same 27 regions 27 × 16 777 216 = **3.62 GB** — 22× less reservation at an identical region count, with `bif_nested_peak_words` 1 550 (23 372 for `inet_parse`), two orders of magnitude under the seed.
+`take_bif_frontier` grows a region **geometrically from its own capacity** (no `bif_heap_words` floor) and is capped by `max_heap_words` only when `+hmax` is set.
+The pool is a **high-water mark reused across calls**: two compiles in one runtime (`cerl_clauses` then `orddict`) end at the same 27 regions / 161 MB, not at double.
+**Region capacity is not what costs RSS.** A fresh region is `mmap`ed and only the pages actually written become resident, so the pool's 161 MB of capacity corresponds to `bif_peak_used_words` = 28 916 words (226 kB) ever written; `ReservedHeap` tracks `reserved_words()` vs `committed_words()`/`used()` (`beam_alloc/src/reserved_heap.rs:295-324`) and `try_grow` is pure bookkeeping (`:194-205`, no `mprotect`), so abandoning a reservation lowers VmSize by its full size and RSS by **zero**.
+A `run`-route `cerl_clauses` compile ends at `bif_regions` = 6 / 17 432 576 words with `bif_peak_used_words` = 5 397 and peak `VmHWM` 423 844 kB, against 27 / 20 185 088 / 28 916 and 372 MB on the `-eval` route — the two routes reach different depths, so quote the route with the figure.
+The depth-sized seed therefore trades address space for written pages rather than winning on both: reservation fell 22× (3.62 GB → 161 MB) while `cerl_clauses`' in-process peak `VmHWM` moved 334 MB → 372 MB, because a nested region that now grows on demand writes pages a 128 MiB untouched seed never wrote.- **`eval_heap` + `eval_heap_retired`** — every container result of a call that *may* rewind is
+  deep-copied onto the store (`Runtime::grow_eval_heap`: it doubles the region and pushes
+  the replaced one onto `eval_heap_retired`, which is never freed).
+  Growth is **clamped**: `eval_heap_ceiling()` = `MAX_EVAL_HEAP_WORDS.max(eval_heap.capacity())` (256 MiB), deliberately **not** `+hmax`, and a request past it is the typed `system_limit` that leaves the store exactly as it was (`retention.rs`'s own test).
+  So each step is bounded and the retired *chain* is not: `inet_parse` ends at `eval_heap_words` = 33 554 432 (the ceiling) with **19** retired regions totalling 620 756 992 words (4.96 GB of reservation) under the tree compiler, and **9** regions / 285 212 672 words (2.18 GB) under the system OTP-29 compiler.
+  The statement window that would reclaim a dead prefix is **pinned by the first nested run that
+  writes the store** (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), after which
+  `scratch::boundary` declines for the remainder of the expression — so a compile, which is one
+  `-eval` statement full of store-writing nested runs, only ever advances the store. (An `epp` source
+  read lands here too: the native file/prim replies build straight on the store.)
+- **`bif_heaps: Vec<Heap>`** — a push/pop pool whose regions are depth-sized and whose growth is geometric (`take_bif_heap`/`put_bif_heap`/`take_bif_frontier`, `note_nested_heap_need`).
+  A **reentrant** call on this route (`lists:foldl/3`, `lists:map/2`, `maps:map/2`) has
+  `safe_to_rewind == false` (`calls.rs:417`), hence `move_container == false` (`:934`): its
+  accumulator result is **not** copied out and `rewind` stays false, so that call's whole graph stays
+  owned by the region — which is what exhausts regions on a compile.
+  A retired region is kept rather than freed because **another caller still owns words in it**
+  (`calls.rs:177-179`), so its capacity is unreclaimable, not merely unreclaimed.
+  Measured: the pool is no longer the dominant store (161 MB of capacity, 226 kB ever written); the two other `heap_words`-sized sites — the NIF load host `bridges.rs` and the foreign-send scratch `runtime.rs` — are not on a compile's path).
+- **`Runtime::arena`** — `heap_available`/`alloc_words` on a table-less context answer the arena
+  (`gc.rs:1457-1468`, `:1502-1541` tail) → `Runtime::alloc_words` → one
+  `MinimalContext` (`runtime.rs:306`, built at `:1357`) whose `ContextHeap` is a `Vec<ReservedHeap>`
+  that **only ever grows** — an exhausted region is kept, unmoved, and a fresh doubled one becomes
+  the frontier; freed only when the `Runtime` drops (`beam_engine/src/context.rs:1395-1577`).
+  It never reclaims, so its retention is its **cumulative demand**: `arena_words` reads 58 031 after an in-process `cerl_clauses` compile on the `run` route, and 5 133 683 / 1 328 040 494 (10.6 GB over 7 047 134 calls, 2.85 GB of written pages) after a `-eval` `cerl_clauses` / `inet_parse` compile.
+  A **nested** run is **not** a fresh `RuntimeContext::new`: `FunBridge::nested` (`bridges.rs:186`)
+  inherits the caller's `mailbox_table`, and `call_bif`'s external route runs on the same context, so
+  `gc_armed: false` (`bridges.rs:195`) is the only half that holds — no nested run may collect.
+  On a **scheduled** route the nested run therefore allocates from the pid's own young heap (a
+  refusing bump goes through `Process::grow_nursery` and a retry, and only a *failed* growth falls
+  through to the arena — `gc.rs:1503-1520`), which is why `arena_words` reads 58 031 there; a nested
+  run whose **caller** is table-less (`-eval`, the boot drive, `file_server`/`get_until`, all built
+  by `RuntimeContext::new`) allocates on the arena outright, the source of the 1 227 958 095 below.
+  Measured end state after a *completed* `cerl_clauses` compile:
+  `total_heap_size`/`heap_size` = **843 words** on `run <file>` (both the spawned-child and the
+  target-process form) and **233 words** on `-eval`, with `garbage_collection.minor_gcs = 0` and
+  `eheap_live = 0` sampled throughout.
+- **Bounded, and therefore not the grower:** the nested-run `Machine` pool
+  (`machine_pool.rs`: 32 machines / 96 callee slots / depth 32; 16 KiB of register files per machine,
+  `Vec` high-water capacity retained by `Machine::reset`, never shrunk) and the wall-clock
+  `BLOCKING_PUMP_DEADLINE` (900 s). Neither holds a heap.
+
+### The bound: the store's copy-out volume plus the arena's written words (measured)
+The `inet_parse` `-eval` peak (`VmHWM` **7.81 GB**, ~17 s, tree OTP-30 bootstrap compiler first on `-pa`) splits, per-mapping from `/proc/<pid>/smaps` plus an `LD_PRELOAD` `mallinfo2` sampler, as:
+
+| share | mechanism | figure |
+|---|---|---|
+| 59 % | the `-eval` store's **retired** chain (`eval_heap_retired`) | 4.63 GB: 19 mappings (18 × 256 MiB + 1 × 128 MiB) each at `Rss ≥ 90 %` of `Size` — **fully written and resident** — matching `eval_heap_retired_regions=19` / `eval_heap_retired_words=620 756 992` |
+| 37 % | **arena written pages** | 2.85 GB touched of **16.18 GB** reserved (the doubling chain 8192/4096/2048/1024/512/256/128/64/32/16 MB at `Rss ≪ Size`) |
+| 2.4 % | glibc std-heap in use | 0.185 GB, flat from ~1.4 s to the end (`malloc_trim(0)` releases 1 byte) |
+| 1 % | pooled BIF heap (1.2 MB written of 169 MB), JIT code, file-backed mappings, stacks | ≈0.12 GB |
+
+Both mechanisms are **resident**, not merely reserved: `grow_eval_heap` retires a region only once `available() < needed`, so a retired region is ~fully written, and the arena's written pages are the term-build reservations `put_map_assoc → make_map_rooted → slack::reserve` actually filled.
+`arena_words` (**1 328 040 494** words = 10.6 GB of **cumulative** demand over 7 047 134 calls) is an upper bound on the arena's resident bytes, not a figure in them: the demand is 69.67 % in 101 367 requests of 4 097–16 384 words (mean 11 442), whose `map_words_capacity(n) = 21n + 18` reservation is a deliberate upper bound while the written map is `3n + 2·nodes` ≈ 3.7 words/pair, and `write_map` never touches `[written_end, capacity)`.
+
+**The bound rule — what each mechanism retains, and why.**
+- **The store retains the copy-out volume since the last reclaimable statement boundary.** Every container result of a call that may rewind is deep-copied onto it, so one call's licence to rewind one pooled region becomes `n` store words; each region is capped at `MAX_EVAL_HEAP_WORDS` (256 MiB) but the *chain* has no cap, because a retired region is **full and never rewritable** — growth always replaces, never relocates or reuses.
+  The window that would reclaim a dead prefix is pinned by the first nested run that writes the store (`Runtime::pin_window_if_store_written` → `eval::scratch::pin`), so a compile — one `-eval` statement made of store-writing nested runs — only ever advances it.
+- **The arena retains every word it ever handed out.** `ContextHeap` is a `Vec<ReservedHeap>` that only grows: an exhausted region is kept, unmoved, and a fresh doubled one becomes the frontier, so a table-less compile's whole term-build graph accumulates there for the `Runtime`'s lifetime.
+  `MinimalContext::heap_stats()` reports the census (`regions`/`reserved_words`/`committed_words`/`used_words`/`peak_words` + the frontier pair) and `heap_mark()`/`heap_mark_matches()` detect a replaced frontier, but `used_words` is cumulative demand, never live memory.
+- **Therefore peak RSS ≈ copy-out volume + arena written words + O(1)** — for `inet_parse` 4.63 + 2.85 + 0.23 GB.
+  Both terms grow with the workload itself, and neither is a policy a flag can move.
+- **The third mechanism IS bounded: the exempt-window nursery chain.** `Process::grow_nursery` is unreachable on the **table-less** route — `move_result_into_process_heap` returns at `let table = mailbox_table.as_deref_mut()?;` before `hint_grow_gate` — and on a **scheduled** route a big compile's child reaches it only inside a nested `apply_fun`/`run_*_blocking` subtree where the pid is **relocation-exempt**, so every collapsing collection door declines and a growth request that cannot be honoured lengthens the chain instead of collecting.
+  `resolve_external_call` therefore declines the fun-applying stdlib fast paths (`beam_bifs::needs_fun_caller`'s `lists`/`maps` roster) while the calling process carries collection debt, entering the call in the caller's own **armed** machine so the debt door collapses the chain as it grows; the two `ets` folds stay synchronous (their bodies reach a gated `lists` key internally) and the gate is inert on a context with no process table.
+  What it does **not** cover: a nested run entered while the caller owes no debt, and a fun-applying key outside the roster.
+
+### Host memory: the touched pages, measured (RSS attribution)
+Measured on the release binary with the OTP-30 bootstrap compiler first on `-pa`, via
+`-eval 'compile:file("…/lib/compiler/src/cerl_clauses.erl",[no_spawn_compiler_process,deterministic,no_docs,{outdir,…}])'`:
+peak VmRSS **372–380 MB**, wall ~1.0 s, sampled from `/proc/<pid>/smaps` and cross-checked with
+`strace -f -k` and an `LD_PRELOAD` `malloc_stats`/`mallinfo2` shim.
+That peak's attribution:
+- **`Heap::new` does NOT touch its region, so region *sizing* alone can never move RSS.**
+  `Heap::with_allocator` is `alloc.alloc_bytes(bytes)` (`beam_alloc/src/heap.rs:64-66`) and the `mseg`
+  carrier writes only a 16-byte `BlockHdr` (`BLOCK_HEADER_SIZE = UNIT_SIZE`) plus a 64-byte
+  `MsegHeader` (`beam_alloc/src/mseg/header.rs:39`), so the two 128 MiB bootstrap reservations —
+  `bif_heaps: vec![Heap::new(heap_words)?]` (`runtime.rs:1447`) and `eval_heap: Heap::new(heap_words)?`
+  (`:1460`) — sit at **12–48 kB RSS** all through boot.
+  Only the caller's own writes into a region make pages resident.
+- **The large fully-resident anonymous mappings are glibc thread-arena heaps, not beam regions.**
+  `strace -f -k` attributes them to `alloc_new_heap` ← `arena_get2` ← `__libc_malloc` (an
+  `mmap(2 × 64 MiB, PROT_NONE)` followed by a 64-MiB-aligned `mprotect`), and their first words decode
+  as glibc's `heap_info { ar_ptr, prev, size = 0x4000000, mprotect_size }`, the `prev` chain linking the
+  heaps.
+  At boot they are 64 MiB + 31 MiB resident = **95 MB** of the 115 MB boot floor; during the
+  cerl_clauses compile three of them reach 64 348 + 63 772 + 56 792 kB ≈ **185 MB**.
+- **Those std-heap pages are a capacity high-water, not live data.**
+  An `LD_PRELOAD` `malloc_stats()` at exit reports `Arena 1: system bytes = 192 802 816` (183.9 MB)
+  against `in use bytes = 219 216` (214 kB), and `malloc_trim(0)` releases **1 byte** — the driver
+  thread's single arena keeps its freed pages mapped.
+  `GLIBC_TUNABLES=glibc.malloc.arena_max=1` does not change the total (peak 380 924 kB) and only re-lays
+  the mappings out, so the total is the runtime's std-allocation high-water, not an arena-count artefact.
+- **`eval_heap` is the one runtime heap that really fills on this route.**
+  Its 128 MiB region goes 46 708 → 104 440 → 131 080 kB resident (fully touched) during the compile,
+  then `grow_eval_heap` retires it (`eval_heap_retired_regions = 1`, `eval_heap_words = 33 554 432` =
+  256 MiB across two regions) and the retired 128 MB stays mapped and resident — **~128 MB of the
+  ~380 MB peak** is `beam_rt`'s own, never freed until the `Runtime` drops.
+- **`+hmax` sizes only the two boot-time regions.** It shrinks the pool's outermost region and `eval_heap`'s
+  seed, and leaves the boot-only RSS unchanged (94 276 → 94 424 kB), because at boot both `Heap`s are
+  untouched.
+  It does **not** bound growth: `eval_heap_ceiling()` deliberately ignores the policy and `take_bif_frontier`
+  applies `max_heap_words` only as a cap on one geometric step, so the flag's RSS effect exists only where a
+  region actually fills.- **The `[rt-mem] exit` census alone is misleading.** For cerl_clauses it reads
+  `arena_words = 5 133 195` (~39 MB) and `bif_words = 20 185 088` (161 MB of *reservation*, with
+  `bif_peak_used_words = 12 953`), and neither resident mechanism above is attributable from it: the
+  glibc heap is outside `beam_alloc` entirely, and the eval store is reported as **capacity**
+  (`eval_heap_words` + `eval_heap_retired_regions`), not as touched pages.
+
+### Reclaim: what is sound without a collection, and what is not
+Ranked by the measured peak; items 1–3 have **landed**, 4–5 are what is left, and every remaining item is a sibling-crate API rather than a `beam_rt` policy.
+1. **LANDED — the per-level region is sized by need, not by `heap_words`.** `bif_heaps`' outermost region is `bif_heap_words`, a nested one `NESTED_BIF_HEAP_SEED_WORDS` (1 MiB, self-tuned to `2 ×` an observed peak), and `take_bif_frontier` grows geometrically from the region's own capacity: `cerl_clauses` 3.62 GB → 161 MB at an identical 27 regions.
+2. **LANDED — the eval store's growth is clamped** at `MAX_EVAL_HEAP_WORDS` (256 MiB); a refusal is the typed `system_limit` that leaves the store untouched, and it is deliberately **not** tied to `+hmax` (the flag must not turn a large compile into an error).
+3. **BOUNDED BY RULE, NOT RECLAIMABLE — `eval_heap`'s retired chain** (the figures and the mechanism are the section above's).
+   Only the "did the store get pinned" test would let it shrink, and `pin_window_if_store_written` pins it on the first store-writing nested run (`resets == 0`), so a compile pins it immediately: `inet_parse` ends with **19** regions / 620 756 992 words — 4.63 GB, **resident**, 59 % of the peak — under the tree compiler, and **9** / 285 212 672 words (2.18 GB) under system OTP-29.
+   Nothing in that chain can be freed, retargeted or reused, and the reason is *not* the pooled BIF heap's (`calls.rs:177-179`'s `take_bif_frontier` accounts for the pool, not the store): `Runtime::eval_heap` is **pointer-stable for the runtime's lifetime** — a host-side term store keeps raw store words (`Runtime::stabilize_term`'s contract) — and an in-flight `Machine` holds arena/store words that no door enumerates during a call, so a drop or a relocation would have to prove that no reachable word lies at or above the region it retires.
+4. **STILL OPEN and `beam_rt`-adjacent — the arena.** Truncating an older `ReservedHeap` needs a reachability proof (a later region can hold terms whose cons cells live in an earlier one), i.e. a GC.
+   Its census now exists (`MinimalContext::heap_stats`, `heap_mark`/`heap_mark_matches`, `for_each_heap_region`), as does the per-machine root walk (`Machine::for_each_root`); what does not is `ContextHeap::reclaim`/`MinimalContext::reclaim_heap` and a collect-with-extra-roots entry.
+   Its measured size is `arena_words` itself: 58 031 words after an in-process `cerl_clauses` compile (the `run` route), 5 133 683 / 1 328 040 494 words after a `-eval` `cerl_clauses` / `inet_parse` compile (and 2.85 GB of written pages at the `inet_parse` peak).
+5. **GATED — the exempt window's nursery chain** (the section above): `resolve_external_call`'s debt gate routes the `lists`/`maps` fun-applying keys in-machine on the caller's armed machine while the caller owes a collection, so the chain is collapsed as it grows.
+   The residual is the exempt window itself (`Process::collect_with` at the three `apply_fun`/`run_*_blocking` sites), which a nested run entered while the caller owes **no** debt still opens.
+6. **UNSOUND — `eval_heap`/arena `reset_to` at a `-eval` statement boundary for a compile.** A compile is *one* statement and the evaluator's environment holds live values built on the arena, so a statement-boundary reset inside it would either do nothing (no boundary) or drop live values; the existing `eval/mod.rs` reset is correctly gated on `depth != 0` for this reason.
+
+**What closing items 3–4 needs, and why every route is blocked today.** The owner of that work is a **collect-with-extra-roots** API: a **relocatable** arena/store, writable root enumeration across parked and in-flight machines, and `beam_gc`'s walker made region-generic (`beam_gc::copy::collect(from, to, roots)` today moves one `HeapSpace` into another with `&mut [Eterm]` roots).
+Each route to it is blocked by a present-day invariant:
+- **Relocation is impossible for both stores** — the arena's and the store's words are pointer-stable by contract, because a host-side term store keeps the word.
+- **The root set is enumerable only at a statement boundary** (`depth == 0`, which a compile never reaches: it is one statement whose evaluator environment holds live arena terms) **and at the engine's `RootSet` hand-off points** (`Machine::with_roots`, which parks the three loose heap-term slots and hands mutable register/stack slices).
+- **A nested run is relocation-exempt** (`with_relocation_exempt`), so no collection may fire inside it — which is exactly where a compile's words are built.
+- **`Machine::for_each_root` is `&self`** and hands out copies: it censuses one machine's roots but cannot write a moved word back.
+
+Truncation is not a weaker form of the missing entry point — it is a different operation, and the difference is what decides this.
+A window rewind is `eval_heap.reset_to(mark)` gated by the read-only `reclaim::walk`/`WindowProbe` descent in `src/eval/scratch.rs`, so it can reclaim only the **contiguous suffix** `[mark, used)` and only when nothing reachable stands inside it: a mark below the live set is declined (`"a live term stands inside the window"`), and a mark above it would drop live words.
+On this route the compiler's live results **interleave** with dead ones, so no mark separates them and closing the bound needs **compaction (relocation)** rather than truncation — which is why a read-only `Machine::for_each_root` is necessary but not sufficient.
+The itemised sibling APIs, with their status: `Machine::for_each_root` — **exists**; `MinimalContext::heap_stats` + `heap_mark`/`heap_mark_matches`/`for_each_heap_region` — **exists**; `ContextHeap::reclaim`/`MinimalContext::reclaim_heap` — **missing**; a collect-with-extra-roots entry on `beam_process::Process`/`beam_gc::Collector` (`Process::collect` takes no extra roots) — **missing**; the wiring at `pump.rs`'s `run_export_blocking`/`run_label_blocking` (after `adopt_nested_payloads` + `machine_pool::release`, once the caller's result is stabilised off the arena) and `execution.rs`'s `apply_fun` — **missing**.
+
+The consequences for a long in-process `compile:file/2`, the per-call cost census and the pool's
+reuse counters (`BEAM_RT_PERF_COUNTERS=1`) are `../runtime/CONTEXT.md`'s and
+`../PERF.md`'s; the engine-side capacity facts are `beam_engine/src/machine/CONTEXT.md`'s.

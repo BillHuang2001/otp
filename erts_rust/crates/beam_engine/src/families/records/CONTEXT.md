@@ -61,31 +61,60 @@ has two shapes:
   the `EXTERNAL`/`UNDERSCORE` scope atoms. New per-variant work goes to a submodule, not here.
 - `create.rs` — the `put_record` **create** path: the definition resolver
   (`resolve`/`Resolved`/`Resolution`, incl. the host seam and the live-namespace re-resolution), the
-  instance writer (`create_native_record`/`write_created_record`) and the two failure graphs
-  (`create_failure`'s `{Tag, {{Module,Name}, Field}}` and `create_badrecord`'s `{badrecord, Id}`).
+  instance writer (`create_native_record`/`write_created_record`) and the delayed-field failure
+  (`create_failure`, which routes through `failure::fail_step_with_reason`).
+- `failure.rs` — the family's **reason-carrying** failure path: `RecordReason` (`BadRecord { src }` /
+  `BadField { tag, owner, name, field }`), `fail_step_with_reason` (a live `fail` label is
+  `fail_step`; `NO_FAIL` raises the C reason as class `error`), and the `BADFIELD`/`BADRECORD` tag
+  names. The reason/class atoms are resolved through `crate::machine::namespace_atom` before any
+  reservation, and every build is one rooted one (a `{badrecord, Src}` re-reads its operand after
+  the reserve).
 - `raw.rs` — the family's **single** `#[allow(unsafe_code)]` module. Every function forwards to
   `beam_term::record` (the term-layout LCA); no layout is re-derived. Its one hand-rolled build
-  is `write_create_failure_reason` — the create form's `{Tag, {{Module,Name}, Field}}` reason
-  graph, whose three tuples must share **one** rooted reservation.
+  is `write_field_failure_reason` — the `{Tag, {{Module,Name}, Field}}` reason graph shared by the
+  create form's `badfield`/`novalue`, the update form's `badfield` and the field readers'
+  `badfield`, whose three tuples must share **one** rooted reservation.
 - `tests/` — the per-variant unit suite (see Test Strategy); `tests/foreign_create.rs` is the create
   form's foreign-definition suite over the host seam.
 
 ## Failure model
 - A **record-semantics** failure the C reports by branching (non-record source, definition
   `module`/`name` mismatch, absent field name, non-exported definition where accessibility is
-  required) **branches to the instruction's `fail` label** — the C's `$FAIL` /
-  `$FAIL_HEAD_OR_BODY`.
-- `fail == NO_FAIL` ⇒ the shared failed-clause raise
-  `crate::interpreter::raise_function_clause_no_fail`: class `error`, bare atom
-  `function_clause`, resolved through the live atom namespace. Documented in
-  `../CONTEXT.md` §"Capability gaps" — cross-reference it rather than restating.
+  required) **branches to the instruction's `fail` label** — the C's `$FAIL` / `$FAIL_HEAD_OR_BODY`.
+- `fail == NO_FAIL` (the compiler promised the test cannot fail) raises exactly what the C's
+  branchless path raises, and **which raise that is depends on the opcode group** — the C macros'
+  two shapes (`emu/macros.tab:56` vs `:266-278`):
+  - the five **guard-shaped** variants — `is_any_native_record`, `is_native_record`,
+    `get_record_elements`, `get_record_elements_id`, `is_record_accessible` — take a plain
+    `$FAIL($Fail)`, which sets **no** exception reason, so the raise is class `error` with the bare
+    atom `function_clause` (`mod.rs::fail_step` →
+    `crate::interpreter::raise_function_clause_no_fail`). Documented in `../CONTEXT.md`
+    §"Capability gaps" — cross-reference it rather than restating.
+  - `put_record`'s **update** form, `update_record_id` and `get_record_field` take
+    `$FAIL_HEAD_OR_BODY($Fail)` **after** their C helper set `p->fvalue`/`p->freason`
+    (`erl_record.c:746-756`, `:790-821`, `:832-879`), so the raise is class `error` with the record
+    reason: **`{badfield, {{Module,Name}, Field}}`** (the record's own definition identity + the
+    unconsumed update entry's key, or the requested field name) or **`{badrecord, Src}`** (the
+    source term itself, for every non-record/mismatch/non-exported exit; the *create* form's
+    `{badrecord, Id}` carries the `Id` operand instead, `erl_record.c:407-409`). Built by
+    `failure::fail_step_with_reason`.
+- That reason is the only observable difference between the two groups, and the C's two helpers
+  share one route: a live `fail` label branches (`fail_step`), `NO_FAIL` raises.
+- The reason tags (`badfield`, `badrecord`, and the create form's `novalue`) and the `error` class
+  atom are C's **global** `error_atom[…]` cells (`beam_common.c:754-768`), present in every
+  universe; here they are resolved through the live atom namespace
+  (`crate::machine::namespace_atom`: `ExecutionContext::atoms` first, the running module's
+  load-time snapshot as fallback). A name **neither** source can spell is the typed
+  `error::unsupported` at the site (`"<instr>: no '<tag>' atom in the module"` /
+  `"<instr>: create: no '<tag>' atom in the module"`) — never a substituted atom.
 - A genuine capability gap is a typed `error::unsupported`, never a wrong value. In this family they
   are all in the create form: an atom `Id` naming a record the running module does not define; a
   `{Module, Name}` `Id` naming **another** module on a host whose `foreign_record_definition`
   answers `Ok(None)` (see "Record-definition resolution"); a definition whose names the caller's
-  atom namespace cannot spell; and an error tag atom the running module cannot name. Everything the
+  atom namespace cannot spell; and a failure tag no available namespace can spell. Everything the
   definitions can answer **builds** — the running module's own create form, a foreign create through
-  the seam, and every *update* form (the source instance carries its own definition).
+  the seam, every *update* form and every field read (the source instance carries its own
+  definition).
 
 ## Constraints
 - `#![deny(unsafe_code)]` crate-wide; `raw.rs` is this node's only non-test exemption, and every
@@ -132,6 +161,11 @@ expectation above is pinned from the C ground truth (`erts/emulator/beam/erl_rec
 `emu/instrs.tab`, `emu/ops.tab`, `emu/macros.tab`) — no oracle agreement is claimed.
 
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
+
+
+## Known divergence (open, verified against the C)
+- **`foreign_record_definition` cannot express "this module defines no such record".** `Ok(None)` means both "no record table at all" (typed `unsupported`) and "the module is resolved and has no such record", where C's create path ends in `error:{badrecord, Id}` even after its load retry (`erl_record.c:509-565` ⇒ `erl_create_native_record(…, indicate_unloaded=false)` ⇒ `:407-409`). A host wanting the oracle's reason can answer with a **non-exported** definition — its fields are never read on the `badrecord` arm (`create::resolve`), so that is a zero-engine-change route.
+
 ## Coverage notes
 - The `differential` gate's `records` group (46 cases: 35 `Eval` + 11 `Module`) pins every
   `records:*` BIF and six of the eight opcodes (186–191; 192/193 are unreachable from the

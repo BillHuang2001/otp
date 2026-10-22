@@ -89,8 +89,9 @@ fn is_record_accessible_external_scope_rejects_a_non_exported_record() {
 
 #[test]
 fn is_record_accessible_wildcard_scope_accepts_a_record_created_in_that_module() {
-    // Any scope atom other than `external` is the `$MODULE` wildcard: exported
-    // **or** created in that module.
+    // Any scope atom other than `external` selects the `$MODULE` wildcard: exported
+    // **or** created in the **running** module (`emu/ops.tab:1677` substitutes
+    // `$MODULE`, not the scope operand).
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (m, r, a) = (fx.atom("m"), fx.atom("r"), fx.atom("a"));
@@ -111,6 +112,66 @@ fn is_record_accessible_wildcard_scope_accepts_a_record_created_in_that_module()
     )
     .unwrap();
     assert_eq!(step, Some(Step::Next));
+}
+
+#[test]
+fn is_record_accessible_auto_local_scope_accepts_a_non_exported_record_of_the_running_module() {
+    // `auto_local` is the scope atom the real compiler writes for a record that is
+    // used locally (`lib/compiler/src/beam_core_to_ssa.erl:904-909`). The C's test is
+    // `defp->is_exported == am_true || defp->module == <running module>`
+    // (`erl_record.c:773-780`), so a NON-exported record defined in the running
+    // module is accessible — comparing the definition's module against the *scope*
+    // atom would never match, because `auto_local` is not a module name.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (m, r, a) = (fx.atom("m"), fx.atom("r"), fx.atom("a"));
+    let auto_local = fx.atom("auto_local");
+    assert_ne!(auto_local, m, "the scope atom is not the module's name");
+    let rec = record(&mut ctx, m, r, false, &[(a, make_small(1))]);
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+
+    let step = run(
+        fx.module(),
+        &labels_with(Label(7), 0, 4),
+        &mut machine,
+        &Instr::IsRecordAccessible {
+            fail: Label(7),
+            src: Operand::X(0),
+            scope: Operand::Atom(auto_local),
+        },
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(step, Some(Step::Next));
+}
+
+#[test]
+fn is_record_accessible_auto_local_scope_rejects_a_record_of_another_module() {
+    // The same `auto_local` scope, but the definition belongs to another module and
+    // is not exported: the wildcard's `defp->module == <running module>` half fails
+    // too, so the guard branches.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (r, a, other) = (fx.atom("r"), fx.atom("a"), fx.atom("other"));
+    let auto_local = fx.atom("auto_local");
+    let rec = record(&mut ctx, other, r, false, &[(a, make_small(1))]);
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+
+    let step = run(
+        fx.module(),
+        &labels_with(Label(7), 0, 4),
+        &mut machine,
+        &Instr::IsRecordAccessible {
+            fail: Label(7),
+            src: Operand::X(0),
+            scope: Operand::Atom(auto_local),
+        },
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(step, Some(Step::Goto { func: 0, pc: 4 }));
 }
 
 #[test]

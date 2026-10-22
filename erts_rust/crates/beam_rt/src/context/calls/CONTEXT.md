@@ -14,14 +14,16 @@ the term stores are [`../pool/CONTEXT.md`](../pool/CONTEXT.md)'s; the seam-level
 ## API Surface
 
 ### The dispatch memo · `DispatchHooks`
-`dispatch(module, function, arity) -> DispatchAnswer` is the **only** producer of a registered call's dispatch answer; it is memoized in a per-context **direct-mapped 8-slot** `DispatchMemo` (the slot from `dispatch_slot` over the key's **name bytes** and the arity).
+`dispatch(module, function, arity) -> DispatchAnswer` is the **only** producer of a registered call's dispatch answer; it is memoized in a per-context **direct-mapped 128-slot** `DispatchMemo` (the slot from `dispatch_slot` over the key's **name bytes** and the arity), whose slots are `Option<Box<DispatchEntry>>` — boxed so the memo costs 1 KiB of the context rather than 10 KiB, which a nested-run context (~100 Rust frames deep on the A.9 compile path) cannot afford.
 `DispatchAnswer` is `{ bif: Option<BifFn>, hooks: DispatchHooks }`: `bif` is `registry.lookup(module, function, arity)` — the implementation the caller then **invokes directly** (no second lookup); `contains` **is** `lookup(…).is_some()` (`beam_bifs/src/registry.rs:189`, pinned equal by that crate's `contains_always_agrees_with_lookup`), so `call_registered` is reached only on `Some`.
 `hooks` is one boolean per `uses_*` predicate — the eight mutually-exclusive arm selectors plus the build gates (`fun_identity`, `memory_hook`) — computed by `DispatchHooks::of`, the **only** place the `binary_search`es over `beam_bifs`' `&'static` `needs_*` rosters run; `call_registered` selects its arm and optional handles from `hooks.*` instead of re-running the predicates.
 A **miss** computes and stores; a **slot collision** overwrites, and the evicted key recomputes on its next call — an eviction costs work, never a result.
-`dispatch_slot` hashes the key's **bytes** (FNV-1a over `module`, a `0xFF` separator, `function`, then the arity) and avalanches with a fixed multiply, so same-length keys span distinct slots (`ets:insert/2` and `ets:lookup/2` do not collide); the constant is **chosen**, not derived, so the measured hot key set occupies distinct slots. Eight slots is the binding limit: more than eight hot keys still collide somewhere, costing the whole prologue on every miss — never a wrong answer; enlarging the table means changing the churn assertion in `tests.rs` (`../../PERF_DISPATCH.md` *DISPATCH-CUT*).
+`dispatch_slot` hashes the key's **bytes** (FNV-1a over `module`, a `0xFF` separator, `function`, then the arity) and avalanches with a fixed multiply, so same-length keys span distinct slots (`ets:insert/2` and `ets:lookup/2` do not collide); the constant is **chosen**, not derived.
+A **warm** slot is overwritten **in place** (`DispatchEntry::retag`: `clear` + `push_str` on both `String`s), so a steady-state miss allocates nothing; only a still-`None` slot allocates (once per key ever seen on that context).
+The slot count is **measured**, not chosen for taste: the A.9 in-process `compile:file/2` route reaches **217** distinct keys for `lib/stdlib/src/ordsets.erl` and **241** for `string.erl`. At the chosen 128 slots that route reports 4 159 136 hits / 511 125 misses = 372 181 cold + **138 944** collision (88.96 % hits), where an 8-slot table misses **29.9 %** of the same route's probes with 71 % of those collisions (`string.erl`: 3 227 465 hits / 1 442 796 misses = 343 044 cold + 1 099 752 collision) — a collision still only costs work, never a result, so the width is behaviour-preserving by construction and is pinned by `dispatch.rs`'s `memo_reuse_tests` (a brute-forced colliding pair answers each key its own answer in alternation; the `String` buffers' `as_ptr()` identity proves the reuse) plus `tests.rs`'s churn suite (whose probe set is wider than the memo and includes one `erlang:+/arity` sibling per arity, so a hit test weaker than the whole key is caught).
 **Why a cached answer cannot go stale.** Both inputs are immutable for the life of the runtime: the `needs_*` rosters are `&'static` tables with pure membership predicates, and `registry` is an `Rc<BifRegistry>` built once at boot (nothing calls `Rc::make_mut`/`Rc::get_mut` on it); the one runtime-mutable input — the NIF registry `load_nif/2` grows — is deliberately **not** memoized, since `call_bif` runs `try_call_nif` first on **every** call, so a library loaded mid-slice wins immediately (`../../tests/nif.rs`).
 The memo lives on the `RuntimeContext`, so it is exactly as long-lived as one run; a nested run builds a fresh context with an empty memo.
-**Two prologue costs are gone.** (a) The **second registry lookup** — `call_bif_routed` hands the already-resolved `BifFn` to `call_registered`, and `invoke_registered` reproduces `BifRegistry::call`'s arity check so the error path is unchanged. (b) The **NIF probe** — `try_call_nif` short-circuits on `NifRegistry::is_empty()`.
+**Two costs the prologue does not pay.** (a) The **second registry lookup** — `call_bif_routed` hands the already-resolved `BifFn` to `call_registered`, and `invoke_registered` reproduces `BifRegistry::call`'s arity check so the error path is unchanged. (b) The **NIF probe** — `try_call_nif` short-circuits on `NifRegistry::is_empty()`.
 
 ### `PendingInterner` · caller-module tracking · NIF dispatch
 `PendingInterner` keeps its `{base, names}` state **inline** (`InternerState::Inline(RefCell<…>)`) and allocates only when `share` promotes it into a shared `Rc<RefCell<…>>`: `new(base)` roots it at the shared table's length, `commit` interns the recorded names in order at their predicted indices, and `beam_bifs::AtomInterner` gives append-only prediction + in-call dedup (`binary_to_term`/`list_to_atom`/`binary_to_atom` are the BIF writers).
@@ -44,12 +46,15 @@ The process arm is **hinted**: the largest graph this context has been refused f
 (`RuntimeContext::copy_out_hint`, learned from the copier's own shortfall) and a destination with
 fewer free words than the hint (plus a margin) is grown — through the NO-RELOCATION
 `Process::grow_nursery` — **before** the attempt, so a copy-bound loop does not pay a refusal's
-five-traversal sizing walk per op; `hint == 0` (a context's first copy-out) is byte-for-byte
-today's behaviour and the grow-and-retry fallback is unchanged (`calls.rs::hint_grow_gate`).
+five-traversal sizing walk per op; `hint == 0` (a context's first copy-out) takes the unhinted
+path, and the grow-and-retry fallback always applies (`calls.rs::hint_grow_gate`).
 See [IMPLEMENTATION.md](../IMPLEMENTATION.md#the-learned-copy-out-hint--copy_out_hint--hint_grow_gate-the-copy-bound-fix).
 The **move** is unconditional on a process route (`move_container = mailbox_table.is_some() || safe_to_rewind`): a container result left on the pooled BIF heap sits in a region no collector scans and a later call's rewind recycles, so Erlang code that stores it in a heap object would hold a dangling pointer (`compile:debug_info_chunk/1` storing `lists:filter/2`'s result inside a tuple is that shape).
 On the **table-less** route the move stays gated on `safe_to_rewind`: there is no collector to make the result collectable and a non-rewindable call never rewinds, so an unconditional move would only duplicate it into the runtime-lifetime store.
 A **reference-holding** graph (`calls.rs::graph_holds_reference`) is neither moved nor rewound — a reference's identity is its address (`Runtime::references` is a `HashMap<Eterm, _>` and `Timers::is_timer_ref` keys on the term word), so a copy would stop being the timer/monitor it names.
+The walk behind that test is **cons-spine driven**: its inner loop advances the CDR in place while it is a readable cons and pushes only the children `walk_may_lead_further` admits, so a long list costs one heap step per cell instead of a push + pop + re-read (the `apply_fun`-heavy compile route calls it ~64 k times per `ordsets.erl` compile, where the cons-spine loop holds its self time at 5.9 % against 15.5 % for a push-then-pop form).
+Every readability guard (`is_literal`/`is_term_word`/`dereferenceable_pointer`, the null/mis-aligned refusal), the one-charge-per-dereferenced-object `WALK_VISIT_BUDGET` (`budget == 0 ⇒ true`), the visit/spill counters and every answer are unchanged — pinned by `cons_spine_tests` (a 5 000-cell spine answers `false` with exactly 5 000 visits, plus the improper-tail, reference-in-tail, reference-in-CAR and NULL-cell-`LIST`-word cases).
+That list shape is also why the walk needed no new `unsafe` block and no new guard: the budget's charge is per dereferenced object, never per cell, so the soundness valve stays the readability test.
 The **rewind** is the gated half: both arms deep-copy through a **fresh, empty, per-attempt** `beam_message::OffHeapTable` (so `copy_struct` takes its single-traversal `try_copy_fast` path), **adopt** its drained handles/binaries/nodes on success only, and rewind the pool to that call's `mark` only when `safe_to_rewind` holds **and** the copy succeeded (or the result is an immediate) — a refusal, an `Err` result (whose live reason term may point into this heap) and a non-rewindable call leave the result on the pool at the call's own offset and never rewind.
 The store's growth by region replacement, the rewind's soundness argument and the measured counter deltas (and why they do not reduce first-touch faults): [`IMPLEMENTATION.md`](../IMPLEMENTATION.md#the-table-less-arm-and-its-store).
 `tables_capable` (`dispatch.rs`) names the seam's consumers, derived from `beam_bifs` (read-only; `src/ets*.rs`): **every registered `ets:*` verb** (each resolves its handle through `resolve_handle`/`take_table_gated`, all reading `ctx.tables()`) plus the two `erts_internal` raw-walk aliases `ets_raw_first/1`/`ets_raw_next/2`.
@@ -82,7 +87,7 @@ An `External` fun and a non-fun are the clean `Ok(None)`; a decoded `Imported` f
 `ExportGateBridge<'a> { code_server: &'a CodeServer, registry: &'a BifRegistry }` implements `beam_codec::ExportGate`; its `is_export_active(m,f,a)` is the shared `runtime_hooks.rs::is_active_export` helper (`erlang:function_exported/3` now delegates to it) **OR** `registry.contains(m,f,a)` — the registry disjunct exists because this runtime's code server holds only the 22 preloaded modules.
 The arm is its **own** mutually-exclusive `DispatchHooks` entry — the 11th, `export_gate`, from `RuntimeContext::uses_export_gate` = `beam_bifs::needs_export_gate`, whose roster `beam_bifs::EXPORT_GATE_BIFS` is exactly `erlang:binary_to_term/2` — installed in `calls.rs` next to `uses_record_source` because it borrows `&CodeServer` + `&BifRegistry` immutably while the fun/send/dict arms hold `&mut Runtime`.
 Oracle-verified: `[safe]` accepts `lists:map/2` and `erlang:system_info/1` and refuses with `badarg` `lists:map/3`, `lists:no_such_fun_xyz/1`, `erlang:no_such_bif_xyz/1` and an unloaded module's export; the flag-free form never consults the gate.
-A deliberate widening to record: a registry key is accepted even when its module is not loaded here.
+A deliberate widening: a registry key is accepted even when its module is not loaded here.
 Evidence: [`../../../tests/safe_binary_to_term.rs`](../../../tests/safe_binary_to_term.rs) (4 tests) + 6 in-module unit tests.
 
 ## Known Issues
@@ -92,7 +97,7 @@ Every entry is a typed capability gap or a documented divergence, never a wrong 
 * **The "no collection can run while a BIF call is in flight" invariant is a conjunction of facts, not an enforced guard** — the BIF route (`call_bif` → `try_call_nif` → `try_native` → dispatch memo → `call_registered`) reaches no `context/gc.rs` door (`BifContext` exposes only the pooled pointer-stable `Heap`), and `gc_armed` is `take`n at each door's first statement (`execution.rs:472,486,510`), armed only by `BudgetContext` immediately before a forward.
   Both halves are structural: the latch is **unreadable** inside the dispatch (`call_registered`'s destructure discards it) and the machine is handed as `&self`, so no arm can consult it and the engine cannot mutate the register file mid-call.
   Two term holders ride that window with **no root set covering them**: the marshalled argument copy (a `[Eterm; 2]` stack array / `Machine::args_scratch`) and `InMachinePosition`'s five `Eterm`s published in `Runtime::in_machine` (`position.rs`), which `alloc_words` places on the process's **scanned young heap**; the roster `off_heap_binaries` beside them is plain `(usize, usize, usize)` data, so it holds no term and needs no root set.
-  `Machine::pending_exception` is a third, deliberately **not** parked by `with_roots` and rooted explicitly only in the park window via `Registers::extra_roots` (`runner/run.rs:527-540`); the copy-out is **not** a collection site (`calls.rs:964-1006`: `grow_nursery` + one retry), and the one in-call collection that exists — a delivery's `Process::deliver` on the receiver — is refused for the running process by the sender/receiver relocation exemption (`send.rs:352-502`).
+  `Machine::pending_exception` is a third holder, and unlike the two above it **is** parked: `Machine::with_roots` parks the machine's loose heap terms (the two failed-clause arg latches and this reason, `const LOOSE_HEAP_TERMS = 3`) at the tail of the Erlang stack for the closure's duration and re-seats them from the slots the host wrote back (`beam_engine/src/machine/mod.rs`), a funnel every in-slice collection door passes through, and across a park window it rides `Registers::extra_roots` (`runner/run.rs:622-647`); the copy-out is **not** a collection site (`calls.rs:964-1006`: `grow_nursery` + one retry), and the one in-call collection that exists — a delivery's `Process::deliver` on the receiver — is refused for the running process by the sender/receiver relocation exemption (`send.rs:352-502`).
 
 * **A scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks in a `receive` is the typed `blocked()` gap** — the call goes `call_bif` → `run_export_blocking` (a fresh `Machine` on the same pid under a `for_process*` context, so `may_pump_scheduler()` is `false`) and `pump_once` returns `Ok(None)` on its first line, folding the parked callee into the uncatchable `beam_engine::blocked()` whether or not its `receive` carries an `after T`.
 
@@ -137,6 +142,7 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
 
 * `calls.rs` → `call_bif_routed` (the three dispatch routes), `call_registered` (the nine arms + the lent/held `TableRegistry` rule + the re-home/rewind), the re-home arms `move_result_into_process_heap`/`rehome_container_result`, the copy-out helpers `copy_result_fresh`/`copy_shortfall_words`, the learned-hint gate `hint_grow_gate` with its constants `COPY_OUT_HINT_MARGIN_MIN`/`COPY_OUT_HINT_MIN_WORDS`, plus the growth-policy constants `GROW_HEADROOM_FACTOR`/`GROW_MIN_WORDS` (+ the `#[cfg(test)] mod notes` counters), `try_call_nif`, `take_bif_frontier`, `open_gate_for_foreign_result`; suite in `calls/tests.rs`.
 
+* `perf_counters.rs` → the `pub(crate)` **env-gated** per-call counters (`BEAM_RT_PERF_COUNTERS=1`; a `Counters` behind a `OnceLock`, one relaxed load per call site when unset) that this path's `dispatch`/`call_bif_routed`/`call_registered`/`graph_holds_reference` sites bump: dispatch hit/miss/cold/evict, the route split (`call_bif`/`nif_probe`/`nif_hit`/`native_hit`/`registered`/`external`), the ten arm counters, `tables_held`/`tables_lent`, the copy-out/rewind family, the walk's calls/visits and a `per_key` map whose 24 hottest `(module, function, arity)` keys print on `Drop`. No behaviour depends on it and nothing is emitted unless the variable is set; the measured reports it produced are quoted under [the dispatch memo](#the-dispatch-memo--dispatchhooks).
 * `calls/tests.rs` → the `calls.rs` copy-out unit suite (the three retry-policy cases over `mod notes`) plus the `#[ignore]`d **measurement harness** `eval_route_pool_costs` (`BEAM_RT_EVAL_POOL_CHILD` child per row, minor faults from `/proc/self/stat`, the pool's first-touch high-water and the store's committed words; table in [`IMPLEMENTATION.md`](../IMPLEMENTATION.md#the-table-less-arm-and-its-store)).
 
   It also carries the one inherent helper `host_serves(module, function, arity)` (floor ∪ NIF-loaded module ∪ registered `beam_bifs` key) — the **single** source of truth for "the host serves this MFA", which `resolve_external_call` refuses on first and the runner's export-entry arm asks directly (`../runner/CONTEXT.md`), because that seam's `Ok(None)` is overloaded.
@@ -172,3 +178,39 @@ Each entry is the module's one-line purpose; the mechanics companion is [`../IMP
 * [`../../../CONTEXT.md`](../../../CONTEXT.md) → the crate-level CLI/exit-code/`system_info` surface.
 * [`../../../M1_GAPS.md`](../../../M1_GAPS.md) · [`../../../TRACE_AND_PERF.md`](../../../TRACE_AND_PERF.md) · [`../../../PERF_DISPATCH.md`](../../../PERF_DISPATCH.md) → the gap index, the trace seam and the per-call measurement ledgers.
 * [`../../../../beam_bifs/CONTEXT.md`](../../../../beam_bifs/CONTEXT.md) → the BIF registry and the fifteen host seams this path installs.
+
+## The reference walk runs only where its answer is observable
+
+`RuntimeContext::call_registered`'s result tail walks the result graph for a reference
+(`RuntimeContext::graph_holds_reference`) **only when `move_container`** — i.e. on a process route
+(`mailbox_table.is_some()`) or on a table-less call no escaping arm took (`safe_to_rewind`).
+The walk's answer has exactly two consumers, both gated identically: this arm, which only sets
+`rewind = false`, and the copy arm, which copies and then sets `rewind = safe_to_rewind`.
+When `move_container` is false the copy arm cannot run and `rewind` is already `false`, so both
+answers of the walk produce the same `result` and the same `rewind` — the walk is unobservable
+there and is skipped.
+A **table-less reentrant** call — any call carrying a fun argument (`lists:foldl/3`, `lists:map/2`,
+`maps:map/2`, … where `!reentrant` is a conjunct of `safe_to_rewind`) — is therefore never walked:
+that is the accumulator shape, a whole intermediate compiler AST, and it is the super-linear term in
+the in-process `compile:file/2` route (contract A.9).
+On that route the gate's effect is measured: walk visits are 84.1 M against 408.5 M ungated on
+`lib/stdlib/src/string.erl`, 290 M against 1.63 G on `lib/compiler/src/v3_core.erl`, and 62.6 % /
+60.3 % lower on `maps.erl` / `ordsets.erl`, with every compiled artifact byte-identical to the
+oracle's; the walk calls that remain (87 % of the ungated count) are the non-reentrant ones, whose
+`[Fun|T]`-shaped results are legitimately observable.
+
+The walk's visit count is accumulated in a **local** `u64` and folded in once per walk through
+`perf_counters::add_visits` at the walk's single exit (both early answers `break 'walk` into it), so
+the diagnostic counter costs one `enabled()`/`borrow_mut` per walk rather than per visited object.
+`#[cfg(test)] notes::note_walk_visit_fold` is called from the same statement, so the test-only
+per-visit counter and the folded total are pinned to agree on every exit shape.
+
+### Rejected experiments — do not retry these
+* **Fusing reference detection with a per-visit pool-touch copy-skip** is a net loss: +2.4 %
+  instructions on `maps.erl` and +6.8 % on `string.erl`, because the extra per-visit test is charged
+  to a walk that still visits 10^8 objects.
+* **A fused walk plus a live-region registry** carries the same net loss: the per-visit charge is the
+  cost, not the lookup structure.
+* **The structural fix** — making internal reference terms literal-area terms, so every copier shares
+  them and no result ever needs the exemption — is a cross-crate change owned by
+  `beam_term`/`beam_message`/`beam_gc`, not this node.

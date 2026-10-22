@@ -21,10 +21,11 @@
 //! The `~w`/`~p`/`~W`/`~P` term printer used by `io:format`/`io_lib:format`.
 //!
 //! A safe helper module for [`crate::io`] (it registers no BIFs). It renders the
-//! Milestone-1 term set the way `io_lib:write/…` and the `~p` pretty printer do,
-//! and pins every case against the OTP oracle (erts-17.1): small integers, atoms
-//! (bare vs quoted), `NIL`, floats, proper/improper lists, tuples, maps, binaries,
-//! bignums, internal pids, internal ports and internal refs.
+//! printable term set the way `io_lib:write/…` and the `~p` pretty printer do,
+//! and pins every case against the OTP oracle (erts-17.1): small integers, bignums,
+//! atoms (bare vs quoted), `NIL`, floats, proper/improper lists, tuples, maps,
+//! binaries, non-byte-aligned bitstrings, internal pids, internal ports, internal
+//! refs, funs and native records.
 //!
 //! This module owns the **leaf renderer** ([`term_chunk`]/[`render_chunk`], the
 //! `io_lib:write1/4` tree) and the shared `io_lib_format` chunk helpers; the
@@ -90,18 +91,26 @@
 //!
 //! The oracle runs `io_lib_pretty`, which breaks a container across lines when its
 //! single-line rendering is at least `line_length - column` characters (80 columns
-//! and column 1 by default). [`pretty_chunk`] reproduces that break for a
-//! proper/improper list, a tagged/untagged tuple and a map each of whose elements
-//! renders single-line (the break separator `,`, the improper tail after `|`, a
-//! `tag_len + 2` indent after a tuple tag, a two-space indent after `#{`), and for a
-//! **non-printable byte-aligned binary**, whose `integer_to_list/1` byte elements
-//! `pp_binary/7` packs `N = max(8, min(Ll - Col, M - 4))` per line. For the forms it
-//! does not model — a nested container, an element too long to fit on a line of its
-//! own, an all-printable binary (the oracle's string leaf), a non-byte-aligned
-//! bitstring, a long tuple tag, a depth-limited `~P` — it raises `error:badarg`
-//! rather than emit a line the oracle would have broken differently. See the
-//! `crate::io` module docs for the precise rule, the term classes and the narrowest
-//! repro.
+//! and column 1 by default). [`pretty_chunk`] is a port of that template model —
+//! `print_length/7` (`pretty`'s `build`), `write/1`, `pp/8` and the `cind/7`
+//! indentation probe (`pretty::cind`) — so it reproduces the break for every class
+//! the model gives a container intermediate: a proper/improper list, a
+//! tagged/untagged tuple, a map, a **native record**, and a non-printable binary or
+//! bitstring, whose `integer_to_list/1` byte elements `pp_binary/7` packs
+//! `N = max(8, min(Ll - Col, M - 4))` per line. The break separator is `,` (an
+//! improper tail follows `|`), a list's continuation indents by one, a tagged
+//! tuple's by `tag_len + 2`, a map's by two, and a record's through its own
+//! `rec_indent`. Nested containers re-flow recursively (an element too long for its
+//! line breaks inside the broken container), and so do a long tuple tag and a
+//! depth-limited `~P`; an all-printable list or binary is the oracle's one-line
+//! leaf and is never broken while the depth stays unlimited.
+//!
+//! The typed [`BeamError::UnsupportedBif`](beam_common::BeamError) reachable from
+//! this path comes only from the `More` dispatcher (`pretty`'s `expand_dots`) — a
+//! truncated template that carries no re-run closure, a state `build` never
+//! produces — or from a leaf's own gap (an external identifier, a `Local` fun with
+//! no identity seam). No printable class, depth or `chars_limit` is rejected for
+//! being outside the re-flow model.
 //!
 //! # Floats
 //!
@@ -126,6 +135,43 @@
 //! control character is an octal/`\n`/`\t`/… escape, `16#7F` is `\d`, and a
 //! character above `16#FF` is `\x{H}`. See [`format_atom`].
 //!
+//! # Native records
+//!
+//! A **native record** (`beam_term`'s `RECORD_SUBTAG` term, made by
+//! `records:create/4`) renders `#Module:Name{field = value,…}` under `~w`, `~W`,
+//! `~p`, `~P` and the `{chars_limit,N}` routes, with the fields in **declaration**
+//! order and the module/name/field atoms going through the same [`format_atom`]
+//! quoting as a bare atom leaf (`#'Weird Mod':'R R'{'a b' = 1}`). It is the one
+//! printable class that is not a leaf: both writers walk its fields, so the parts
+//! are extracted once by [`record::record_parts`] (the `#Module:Name` prefix, its
+//! length, and each field's quoted key, `" = "`-inclusive length and value) and
+//! each writer applies its own depth accounting.
+//!
+//! The flat writer ([`record::flat_record_chunk`], `io_lib:write1/4`'s
+//! `write_record/4` → `write_record_1/5`) spends **one** level: field names at `D`,
+//! values at `D-1`, and each *later* field at `D-1`, so `~W 2` of a two-field record
+//! is `#m:r{a = 1,...}` and `~W 1` is `#m:r{...}`. The `io_lib_pretty` writer spends
+//! **two** (`print_length_native_record/7` enters the field sequence at `D-1`, so
+//! the values sit at `D-2`), which makes `~P D` show the field count of `~W (D-1)`
+//! with the values one level deeper: `~P 3` is `#m:r{a = 1,...}`, `~P 4` the whole
+//! record, and `~P 1`/`~P 2` the flat depth-1 text `#m:r{...}`. A record of no
+//! fields is `#m:r{}` at every positive depth.
+//!
+//! Under `~p`/`~P` a record re-flows like a container: `pp_record` places the first
+//! field after `rec_indent`'s break and the rest through `pp_fields_tail`, with the
+//! record's own continuation column `NInd = len("#Mod:Name") + 1`. `rec_indent`
+//! inserts the newline only when `TInd > 0 && NInd > TInd` (`TInd` is
+//! `while_fail_indent`'s `[-1, 4]`-then-`1` answer for the render), so a narrow
+//! `line_length` breaks the fields at `TInd` — 4 spaces at `~16p`/`~20p` of the
+//! 12-field fixture, 1 space at `~12p`/`~10p`/`~8p` — while a wide line that
+//! `while_fail_indent` answers `-1` for (the 80-column default, `~40p`) keeps them
+//! at `NInd` (`len("#recmod:longrec") + 1` = 16 there). A field's own value re-runs
+//! the same rule through `pp_field` with the field's `key_len` as `RInd`: it breaks
+//! only when `TInd > 0 && key_len > TInd`, and then after the `" ="` separator at
+//! `TInd` in from the field's indent (`~8p` ⇒ ` f1 =\n  1,`), keeping `" = "` and
+//! continuing at `key_len` otherwise; a value that is itself re-flowable breaks
+//! under its own bracket instead, at that container's indent.
+//!
 //! # Deviations from the oracle (documented)
 //!
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
@@ -137,20 +183,13 @@
 //!   only `Id` varies. The oracle's numbers are the same shape.
 //! * **Internal ports** render as `#Port<0.N>` (see [`format_port`]), the oracle's
 //!   `#Port<Channel.Num>` with the local node's channel `0`.
-//! * **External identifiers** (a pid, port or ref naming another node) and a
-//!   **native record** are outside the Milestone-1 printable set. The oracle renders
-//!   both, but for an external identifier the rendered channel number is
+//! * **External identifiers** (a pid, port or ref naming another node) are outside
+//!   the printable set. The oracle renders them, but the rendered channel number is
 //!   `atom_val(x->sysname)` — the node-name atom's index in the **running VM's** atom
 //!   table, runtime state the frozen external-identifier term does not carry (measured:
 //!   the same wire image printed `#Port<10643.7>` and `#Port<10639.7>` in two runs), so
 //!   no byte-faithful text exists; each is rejected with the typed
-//!   `BeamError::UnsupportedBif` (a capability gap) rather than guessed. A native
-//!   record's *single-line* form (`#rec:r{a = 1,b = 2}`) is derivable from
-//!   [`beam_term::record`], but the printer cannot emit it as a leaf: `~p`/`~P` route a
-//!   record through the same [`render_chunk`] and would then print the flat form where
-//!   the oracle's `io_lib_pretty` **re-flows** a long record (`pp_record`/`rec_indent` in
-//!   `lib/stdlib/src/io_lib_pretty.erl:249-376`), a *silently wrong* result — so the
-//!   whole class stays a typed gap until that template is ported.
+//!   `BeamError::UnsupportedBif` (a capability gap) rather than guessed.
 //!
 //! # Funs
 //!
@@ -181,7 +220,7 @@ use beam_term::{atom_val, signed_value, Eterm};
 use crate::access::{
     bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
     is_external_pid, is_external_ref, is_float, is_function, is_internal_pid, is_internal_port,
-    is_internal_ref, is_list, is_map, is_nil, is_port, is_small, is_tuple, tuple_element,
+    is_internal_ref, is_list, is_map, is_nil, is_port, is_record, is_small, is_tuple, tuple_element,
     tuple_size,
 };
 use crate::bits;
@@ -189,6 +228,7 @@ use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 
 mod pretty;
+mod record;
 pub(crate) use pretty::{
     pretty_chunk, pretty_chunk_limited, pretty_chunk_order, pretty_write_limited, tsub,
 };
@@ -577,6 +617,15 @@ fn render_chunk(
             }
         }
         return render_list_chunk(ctx, term, printable, depth, order);
+    }
+    // A **native record** (`RECORD_SUBTAG`, made by `records:create/4`): both
+    // writers walk its fields, so its parts are extracted once in [`record`] and the
+    // field walk is that module's ([`record::flat_record_chunk`] is
+    // `io_lib:write1/4`'s `write_record/4`). It is **not** a tuple (`is_tuple` is an
+    // `ARITYVAL` test), but the arm sits here to mirror `write1/4`'s clause order.
+    if is_record(term) {
+        let parts = record::record_parts(ctx, term)?;
+        return record::flat_record_chunk(ctx, &parts, printable, depth, order);
     }
     if is_tuple(term) {
         let arity = tuple_size(term);

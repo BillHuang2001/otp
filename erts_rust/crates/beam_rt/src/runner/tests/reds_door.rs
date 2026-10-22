@@ -34,13 +34,13 @@
 //! / 264 963 824** words for N = 2 000 / 20 000 / 200 000 and **0** collections, i.e. ≈ 1 300
 //! words retained per iteration.
 //!
-//! With the door live, the same three runs read **9 / 89 / 899** collections, `minor_gcs`
-//! **8 / 88 / 898** and a **flat `heap_size` of 610 words** with a one-space nursery throughout —
-//! the live set the boundary window holds is the single in-flight 400-element tuple, so the
-//! capacity is the live-set-targeted minor rule's target for it
-//! ([`HeapPolicy::young_minor_target_words`](beam_gc::HeapPolicy::young_minor_target_words)) at
-//! every N, never a quantity that follows the loop count. The test below drives all three N, so
-//! the figures are reproducible from it.
+//! With the door live, the same three runs read **9 / 89 / 899** collections, **8 / 86 / 876**
+//! minors (the rest are the door's escalating fullsweeps) and a **flat `heap_size` of 987 words**
+//! with a one-space nursery throughout — the live set the boundary window holds is the single
+//! in-flight 400-element tuple, so the capacity is the **fullsweep** rule's target for it
+//! ([`HeapPolicy::young_target_words`](beam_gc::HeapPolicy::young_target_words)) at every N,
+//! never a quantity that follows the loop count. The test below drives all three N, so the
+//! figures are reproducible from it.
 //!
 //! # Why the run is forced onto the **interpreter**
 //!
@@ -123,23 +123,47 @@ fn peak_heap_size(module: &str, n: i64) -> usize {
 /// before the iteration abandons it.
 const BOUNDARY_LIVE_WORDS: usize = 401;
 
-/// The young-nursery capacity the live-set-targeted minor rule installs for
-/// [`BOUNDARY_LIVE_WORDS`] — `young_minor_target_words(live)` = `next_words(live +
-/// need_reserve_words)`, floored by `nursery_floor_words()` — under the emulator-default policy a
-/// plain `spawn` child is created with ([`HeapOptions::new`](crate::config::HeapOptions::new), the
-/// `heap` field of the [`RuntimeConfig`](crate::config::RuntimeConfig) [`growth_runtime`] builds
-/// its runtime from).
+/// The young-nursery capacity the **fullsweep** rule installs for [`BOUNDARY_LIVE_WORDS`] —
+/// `young_target_words(live)` = `next_words(2 x live + need_reserve_words)`, floored by
+/// `nursery_floor_words()` — under the emulator-default policy a plain `spawn` child is created
+/// with ([`HeapOptions::new`](crate::config::HeapOptions::new), the `heap` field of the
+/// [`RuntimeConfig`](crate::config::RuntimeConfig) [`growth_runtime`] builds its runtime from).
 ///
-/// This is the plateau the two rows below must both read, so the pin is the rule rather than a
-/// measured integer: at 401 live words it is 610, and any live set the fixture's own allocation
-/// could leave maps onto the same growth-table entry.
+/// This is the plateau every row must read, so the pin is the rule rather than a measured
+/// integer: at 401 live words `next_words(866)` is **987**. It is the *fullsweep* target and not
+/// the minor one (`next_words(465)` = 610) because the run's **first** collection is the door's
+/// escalating fullsweep — the mature region a spawn policy starts at holds 233 words, far less
+/// than the ~800-word live promotion the first pre-emption holds, so the kind-pinned minor
+/// refuses and `Process::collect` runs a fullsweep, whose `collapse_after_fullsweep` installs
+/// this target. Every later minor then *keeps* it, because 987 sits inside
+/// `young_after_collection`'s band `[young_minor_target_words(401) = 610, 8 x 610 = 4 880]`.
+/// The two fixed-point assertions below pin exactly that: the plateau is a steady state of
+/// **both** rules, which is what makes it flat in N instead of a ratchet.
 fn plateau_words() -> usize {
     let policy = crate::config::HeapOptions::default().policy().clone();
-    let target = policy.young_minor_target_words(BOUNDARY_LIVE_WORDS);
+    let target = policy.young_target_words(BOUNDARY_LIVE_WORDS);
     assert!(
         target >= policy.nursery_floor_words(),
-        "the minor target can never sit below the policy's floor: {target} < {}",
+        "the fullsweep target can never sit below the policy's floor: {target} < {}",
         policy.nursery_floor_words()
+    );
+    assert_eq!(
+        policy.young_after_fullsweep(target, BOUNDARY_LIVE_WORDS),
+        target,
+        "the fullsweep rule must reproduce its own target (a next fullsweep keeps it)"
+    );
+    let minor = policy.young_minor_target_words(BOUNDARY_LIVE_WORDS);
+    assert!(
+        target >= minor && target <= beam_gc::YOUNG_SHRINK_FACTOR * minor,
+        "a kept nursery lives inside [young_minor_target_words({BOUNDARY_LIVE_WORDS}) = {minor}, \
+         YOUNG_SHRINK_FACTOR x that = {}] — that band is why the fullsweep's {target} survives \
+         every later minor",
+        beam_gc::YOUNG_SHRINK_FACTOR * minor
+    );
+    assert_eq!(
+        policy.young_after_collection(target, BOUNDARY_LIVE_WORDS),
+        target,
+        "hence the minor rule keeps it: the plateau is a fixed point of both rules"
     );
     target
 }
@@ -161,23 +185,29 @@ fn plateau_words() -> usize {
 ///   measured **17.8–18.0 reds per iteration**, i.e. ~200–225 iterations per 4 000-reduction
 ///   slice ([`crate::context::gc::REDS_BOUNDARY_MIN_REDS`]), against ~14 before that pricing.
 ///   The band below is that measured rate, not a calibrated constant.
-/// * **`minor_gcs` follows the same relation minus the one fullsweep** each run reaches
-///   (`collections - 1` at every N measured, hence `(8, 88, 898)` for the three rows below). That
-///   fullsweep is the door's own escalating `collect`, and its reason is the shape: the mature
-///   region a spawn policy starts at holds 233 words while the chain-wide nursery occupancy this
-///   shape accumulates before its first collection is orders of magnitude larger, so the earliest
-///   boundary minors refuse; the fullsweep sizes that region from the occupancy, far more than the
-///   young live set each later boundary promotes, so the cadence is minors to the end. The policy's
-///   `fullsweep_after` cadence (65 535) never fires at these N. This is what makes the
-///   `garbage_collection` item's counter move with real collections instead of sitting at the
-///   pre-fix `0`.
+/// * **`minor_gcs` follows the same relation minus the door's escalating fullsweeps** —
+///   `collections - major` at every N, measured **(8, 86, 876)** for the three rows below. A
+///   fullsweep is what the door falls back to when its kind-pinned minor cannot be promoted: the
+///   mature region a spawn policy starts at holds 233 words (`HeapPolicy::initial_mature_words`)
+///   while the live promotion the **first** pre-emption holds is ~800 words (`lists:seq(1, 400)`
+///   consed plus the 401-word tuple), so that first minor refuses and `Process::collect` runs a
+///   fullsweep — which is what sizes the region from the live set and makes the cadence minors
+///   afterwards. Later fullsweeps are the same refusal recurring as that region fills (the
+///   promotion of each minor is counted against its room by `minor_room_words`, the **live**
+///   promotion, `beam_gc`'s `collector.rs`), so a run takes `1 / 3 / 23` of them: at least one
+///   (the first, always) and never more than one per two minors — `MATURE_TARGET_LIVE_MULTIPLE`
+///   (2) is exactly the number of promotions a fullsweep sizes the region for, so a fullsweep
+///   can never be the common outcome. This is what makes the `garbage_collection` item's counter
+///   move with real collections instead of sitting at the pre-fix `0`.
 /// * **`heap_size` is bounded**: the peak chain capacity **converges** — one young space of
-///   `young_minor_target_words(401)` words (610, [`plateau_words`]) at every N measured. The
+///   `young_target_words(401)` words (987, [`plateau_words`]) at every N measured. The
 ///   fixture's live set at a boundary is the single in-flight 400-element `list_to_tuple/1`
-///   result (401 words), and the minor rule installs one times that live set plus the reserve, so
-///   the capacity is a function of the iteration's footprint and never of the loop count. What
-///   the pin is *for* — flatness in N and a single retired space — is unchanged (with the door
-///   disabled: 3 074 841 / 29 485 327 / 264 963 824 words for N = 2 000 / 20 000 / 200 000).
+///   result (401 words), the fullsweep sizes one nursery at twice that plus the reserve
+///   (`next_words(866)`), and the minor rule then keeps it because 987 lies inside
+///   `[610, 4 880]` — so the capacity is a function of the iteration's footprint and never of the
+///   loop count. What the pin is *for* — flatness in N and a single retired space — is unchanged
+///   (with the door disabled: 3 074 841 / 29 485 327 / 264 963 824 words for N = 2 000 /
+///   20 000 / 200 000).
 ///
 /// No collection may fail (`errors`, `halted`) and no run may park in a `receive`.
 #[test]
@@ -226,22 +256,46 @@ fn a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus
         r1.collections < r2.collections && r2.collections < r3.collections,
         "more iterations ⇒ more collections: {r1:?} {r2:?} {r3:?}"
     );
-    // `minor_gcs` is the minors since the last fullsweep, so it is the collection count minus
-    // the one fullsweep each run reaches (the door's escalating `collect` while the mature region
-    // is still the 233-word one a spawn policy installs; the `fullsweep_after` cadence never fires
-    // at these N).
+    // `minor_gcs` is the collections minus the door's escalating fullsweeps: the first boundary's
+    // kind-pinned minor cannot be promoted into the 233-word mature region a spawn policy starts
+    // with (~800 live words), so it escalates once, and later escalations recur only as that
+    // region fills — 1 / 3 / 23 fullsweeps over 9 / 89 / 899 collections.
     let minor = |r: &super::GrowthCounters| r.collections - r.major;
     assert_eq!(
         (minor(&r1), minor(&r2), minor(&r3)),
-        (8, 88, 898),
+        (8, 86, 876),
         "the garbage_collection item's counter must move with the collections: \
          {r1:?} {r2:?} {r3:?}"
     );
+    // ... and the split is the door's own: the minors really are the pre-emptions' collections
+    // minus the escalations (the `yields == collections` identity above makes this exact), every
+    // run escalates at least once (the first boundary, the derivation above), and a fullsweep can
+    // never be the common outcome — one fullsweep sizes the mature region for
+    // `MATURE_TARGET_LIVE_MULTIPLE` (2) promotions, so a minor cannot be outnumbered by one.
+    for (n, row) in [(n1, &r1), (n2, &r2), (n3, &r3)] {
+        assert!(
+            row.major > 0,
+            "the first boundary's minor always refuses the 233-word initial mature region, so \
+             every run escalates at least once: N={n} {row:?}"
+        );
+        assert_eq!(
+            minor(row),
+            row.yields as u64 - row.major,
+            "minors = pre-emptions - escalations at N={n}: {row:?}"
+        );
+        assert!(
+            row.major * beam_gc::MATURE_TARGET_LIVE_MULTIPLE as u64 <= minor(row),
+            "a fullsweep sizes the mature region for {} promotions, so minors must outnumber \
+             fullsweeps by at least that factor: N={n} {row:?}",
+            beam_gc::MATURE_TARGET_LIVE_MULTIPLE
+        );
+    }
     // The point of the door: a flat `heap_size` instead of a linear climb with N (the
     // door-disabled figures are 3 074 841 / 29 485 327 / 264 963 824 words — ≈ 1 300 retained
-    // words per iteration). The converged capacity is the minor rule's target for the boundary
-    // window's live set (`young_minor_target_words(401)`, 610 words — see the doc comment), and it
-    // is the same at every N — flatness, not the absolute figure, is the property.
+    // words per iteration). The converged capacity is the **fullsweep** rule's target for the
+    // boundary window's live set (`young_target_words(401)`, 987 words — the derivation is
+    // `plateau_words` and the doc comment above), and it is the same at every N — flatness, not
+    // the absolute figure, is the property.
     let plateau = plateau_words();
     for (n, heap) in [(n1, heap1), (n2, heap2), (n3, heap3)] {
         assert_eq!(heap, plateau, "the nursery must converge, not climb: N={n}");

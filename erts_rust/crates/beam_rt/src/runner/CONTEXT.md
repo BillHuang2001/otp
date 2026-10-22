@@ -202,6 +202,9 @@ This node owns **which** arm publishes and **when** it may skip, and these are i
 * `fr_mark` is an **exact upper bound** after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by over-protecting: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park publishes **no** FR word instead of the 1024 slots `process.regs` would carry.
 * The count is stored on `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never sees a length mismatch (which would halt the process's collection).
 * `publish_parked_roots` **also** publishes the parked machine's live pending-exception reason (`Machine::pending_exception`) — the one term a parked machine holds that the closed `RootSet` shape cannot carry, because it is a machine *field*, not an `x`/stack/FR slot — as the process's `Registers::extra_roots` word (the host escape hatch `beam_process`'s `gather_roots`/`scatter_roots` relocate in place); with **no** live pending exception the extra-root set is left **empty** (cleared, never a NIL/placeholder), so a stale root can never keep an otherwise-dead term alive.
+* **The word it publishes is live by construction, so it is published unfiltered.** `Machine::with_roots` parks the machine's loose heap terms — the two failed-clause argument latches **and** the pending exception's reason (`beam_engine/src/machine/mod.rs`, `const LOOSE_HEAP_TERMS = 3`) — at the tail of the Erlang stack for the closure's duration and re-seats every field from the slot the host wrote back, and that funnel sits behind `Machine::alloc_rooted`/`Machine::ensure_heap`, hence behind **every** in-slice collection door on every tier: a machine that has left the slice and parked here was never moved out from under the field.
+  An extra root is a **relocation channel, not a liveness claim**, so the published word is always an immediate or a literal-area pointer (nothing a collection moves) or a container inside a region `pid`'s own collector relocates — never a word a collection would have to follow without being able to move it.
+  Pinned by `beam_engine`'s `tests/raise_rooting.rs::pending_exception_reason_survives_a_collection` and by this node's `a_parked_machines_pending_exception_reason_survives_a_moving_collection`, `publishing_a_machine_without_a_pending_exception_leaves_no_extra_root` and `publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extra_root`.
 * `resume_from_process_roots(ctx, pid, machine, fr_count)` is `RuntimeContext::resync_parked_roots`, called with the **same** `fr_count` the matching park used (`engine.fr_published`): it copies the process's authoritative root set back into the machine (the leading FR words only up to `fr_count`), reads the (already-relocated) extra-root reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
 
 The **`Wait` park arm** marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback.
@@ -276,8 +279,8 @@ Headline rust/sys ratios on this runtime's default baseline-JIT tier against OTP
 | `foreign` | **38.3×** (`bstr_to_lower`), **48.1×** (`bstr_capitalize_token`), **51.0×** (`emqx_base62_encode`), **35.8×** (`emqx_base62_decode`) |
 | `emqx_base62:encode/1`, end to end | **27.4×**, with `erlang:memory(binary)` and `VmHWM` flat in N |
 
-- **The growth shapes' per-call work is flat in N, on deterministic counters.** `churn` collects 1.733133 / 1.733927 / 1.733757 times per call (3 468 / 17 341 / 69 352 collections, 169 / 838 / 3 347 majors) at `reductions`/call 1 808.98–1 809.84 for N = 2 000 / 10 000 / 40 000; `heap_growth` satisfies `collections == 1 + N / K` exactly, with `K == 2` iterations carried by its settled 843-word nursery; both hold one young space at every N, on a capacity that does not move with N (1 220 words for `churn`, 843 for `heap_growth`).
-- **The boundary door's rationing is pinned; its marginal cost is not.** It takes one `churn` boundary in 7.0–7.1 (128 / 258 / 646 of the 904 / 1 809 / 4 524 checks handed to it at N = 2 000 / 4 000 / 10 000), a **constant** 3.69 / 3.72 / 3.73 % of the run's own 3 468 / 6 939 / 17 341 collections, and a shape it is handed ≤1 boundary on per run cannot take a door collection at all; the ON-vs-OFF `Δ` needs a door-disabled build, so none is claimed.
+- **The growth shapes' per-call work is flat in N, on deterministic counters.** `churn` collects 2.362819 / 2.375462 / 2.376366 times per call (4 728 / 23 757 / 95 057 collections, 325 / 1 617 / 6 465 majors) at `reductions`/call 1 808.98–1 809.84 for N = 2 000 / 10 000 / 40 000; `heap_growth` satisfies `collections == 1 + N / K` exactly, with `K == 2` iterations carried by its settled 843-word nursery; both hold one young space at every N, on a capacity that does not move with N (2 585 words for `churn`, 843 for `heap_growth`).
+- **The boundary door's rationing is pinned; its marginal cost is not.** It takes one `churn` boundary in 8.5–8.6 (105 / 210 / 532 of the 904 / 1 809 / 4 524 checks handed to it at N = 2 000 / 4 000 / 10 000), a **constant** 2.22 / 2.22 / 2.24 % of the run's own 4 728 / 9 479 / 23 757 collections, and a shape it is handed ≤1 boundary on per run cannot take a door collection at all; the ON-vs-OFF `Δ` needs a door-disabled build, so none is claimed.
 - **The `run` route never sleeps while it has work**: 0 `clock_nanosleep` on a 200 000-round two-process ping-pong, and still ≥1 for a parked `receive … after T`.
 - **The native tier's slice charge is exact**: `reductions == 5N + 9` with a **4 006** ceiling, and a **refusing** seam — not the pricing one — is what ends a slice.
 Everything behind those lines — the per-workload tables and their loop counts, the per-iteration collection/major rates and nursery geometry, the boundary door's rationing and the `Δ` it does not claim, the `foreign` literal-area-tagging mechanism, the slice budget's full charge table, the off-heap prune's per-fixture envelope and the `emqx_base62:encode/1` end-to-end record — is [`MEASURED.md`](MEASURED.md).
@@ -323,8 +326,11 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   `tests/fixtures/native_reds.{erl,beam}` fixture: the exact `reductions == 5N + 9` charge on the native
   tier to the derived budget boundary (N = 798 charges 3 999 in one slice, N = 799 charges 4 004 and needs two) and its flat **4 006** ceiling above it (`budget` 4 000 + a measured 6-unit epilogue), the bounded-iterations-per-slice
   pre-emption of the allocating shape (`yields + 1 == slices`, `slices == ceil(reductions / budget)`),
-  and the residual tuple `(slices, yields, waits, collections, major) == (2, 1, 0, 1, 1)` with its
-  interpreter-tier control. It asserts the default tier (and fails loudly if `BEAM_RT_TIER` pins the
+  and the residual tuple `(slices, yields, waits, collections) == (2, 1, 0, 1)` on one young space, with
+  `major` deliberately **unpinned** (`0` on the native rows, `1` on the interpreter control: the door asks
+  for a young-only minor and escalates only when the promotion cannot fit the mature region, so the kind of
+  that one firing is a consequence of the mature generation's sizing, not a property of the door). It
+  asserts the default tier (and fails loudly if `BEAM_RT_TIER` pins the
   interpreter), never a wall clock.
 * The park hand-off and its exempt-window short-circuit:
   `a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption` and
@@ -364,7 +370,7 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   The seam that would close it is a `ProcessTable::service_receive_signals(pid)` in `beam_process` — apply the head signal while its `exit_policy` is not `Terminate`, in FIFO order — which a sibling node owns.
 
 ## Known Issues / Handoffs
-* **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like on an allocation-shaped loop.** Such a runtime runs **zero** collections (the admission declines and the nursery grows instead) where this one runs 3 468 collections and 169 majors on the same 2 001-call `churn` run (**1.7331** and **0.0845** per call, at the same per-call rate at N = 40 000: 69 352 / 3 347 over 40 001 calls), so the difference is the memory management each performs and the heap the other retains, not dispatch or tier.
+* **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like on an allocation-shaped loop.** Such a runtime runs **zero** collections (the admission declines and the nursery grows instead) where this one runs 4 728 collections and 325 majors on the same 2 001-call `churn` run (**2.3628** collections and **0.1624** majors per call, at the same per-call rate at N = 40 000: 95 057 / 6 465 over 40 001 calls = **2.3764** / **0.1616**), so the difference is the memory management each performs and the heap the other retains, not dispatch or tier.
   The figures behind that, and the dated 1.25×–1.60× band the allocation-shaped `foreign` rows once read, are [`MEASURED.md`](MEASURED.md) *Not like-for-like*.
 * **A natively executed compiled block is charged at a deopt, a heap-admission point and each **priced**
   BIF/call seam — but only a *refusing* seam can end its slice.** The per-instruction charge belongs to
@@ -391,6 +397,17 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   iterations-per-slice pre-emption, and the residual tuple plus its interpreter control) over the
   committed `tests/fixtures/native_reds.{erl,beam}` fixture.
 
+* **An uncaught raise's stacktrace is never rendered on the compiled route.** The runner flattens a raise
+  to a reason **term** ([`mod.rs::reason::exit_reason`](reason.rs): atom → live term → `Display` text) and
+  the pump hands the original `BeamError` back to the CLI, which prints **one** line —
+  `beam_rt: <class> <reason>` (`beam_common`'s `Display for Raise`, with `cli.rs::reported_reason` swapping
+  in the `~w` rendering of a live structured reason on the `run`/`-boot` routes only).
+  There is no `** exception error:` / `=ERROR REPORT` crash-report renderer in this crate (the one ERTS
+  report text is the `max_heap_size` block, `../context/gc.rs`), so `Raise::stacktrace` — the symbolic
+  frames the engine attaches when a raise escapes a machine — has **no consumer** here: its only readers
+  are the `-eval` catch fold (`../eval/mod.rs::cook_supplied_trace`) and
+  `process_info(_, current_stacktrace)` (`../native/memory/`, from the live machine, not from a raise).
+
 ## The collection-site inventory this node owns (and what each site publishes)
 **The scheduled path is the ONLY path that collects at all.** `RuntimeContext::gc_armed` is
 [`take`](std::mem::take)n as the **first statement** of each rooted door
@@ -415,18 +432,18 @@ Out of slice, `ProcessTable::deliver`/`enqueue_exit_signal`/`grow_receiver_for_s
 `has_unpublished_roots()`, which is `relocation_exempt || Running`), so they cannot touch a running
 process's heap.
 **Publication is airtight for `x`/`stack`/`fr`; the open root-set question is a holder that is in NO
-root set.** The park publishes all 1024 x slots (`gc.rs:786` sets `live = min(x.len(), MAX_REG)`), so
+root set.** The park publishes all 1024 x slots (`gc.rs:802` sets `live = min(x.len(), MAX_REG)`), so
 `XRegs::gather_roots` (`beam_process/src/registers.rs:250-256`, which reads `x[0..live)` only)
 gathers every published slot, and no production site shrinks `live`. `is_pointer_bearing` is
 `(word & 3) != 3`, i.e. exactly "not `TAG_PRIMARY_IMMED1`" (`beam_term/src/tag.rs:37-45`,
 `boxed.rs:73-74`, `list.rs:68`), so an atom/small/NIL can never be bound away by
-`pointer_prefix_len`. What is NOT covered by any root set: `Machine::pending_exception`'s reason
-(`beam_engine/src/machine/mod.rs:151`; unrooted in-slice, published only across a park as
-`Registers::extra_roots`, `run.rs:527-540`), the marshalled BIF `args` copy
-(`beam_engine/src/interpreter/bif.rs:232-246`, `:157-168`) at the `&self` door
-`Machine::dispatch_bif_call` (`bif.rs:291`) which has no write-back channel, and the `Runtime`-owned
-term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox` markers,
-`trace`/`seq_trace` specs, `eval_closures`).
+`pointer_prefix_len`. `Machine::pending_exception`'s reason is covered on **both** sides of a park: in
+slice by `Machine::with_roots`' loose-heap-term parking (`beam_engine/src/machine/mod.rs:846-867`) and
+across one as `Registers::extra_roots` (`run.rs:622-647`). What is NOT covered by any root set: the
+marshalled BIF `args` copy (`beam_engine/src/interpreter/bif.rs:103-133`, `:165-187`) at the `&self`
+door `Machine::dispatch_bif_call` (`bif.rs:324`) which has no write-back channel, and the
+`Runtime`-owned term stores (`Runtime::in_machine`, `timers`' reference key, `references`, `mailbox`
+markers, `trace`/`seq_trace` specs, `eval_closures`).
 
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,

@@ -67,30 +67,22 @@
 //! namespace cannot spell is a typed error, so a foreign table's index is never
 //! written into a term (see `ExecutionContext::foreign_record_definition`).
 
-use beam_common::{ExceptionClass, Result};
+use beam_common::Result;
 use beam_loader::{Label, Module, Operand, RecordDefinition, NO_FAIL};
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
+use super::failure::{fail_step_with_reason, RecordReason, BADFIELD};
 use super::{fail_step, raw, read_atom, read_record_id, RecordId};
 use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::interpreter::LabelMap;
-use crate::machine::{namespace_atom, Machine};
-use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
-use crate::terms;
+use crate::machine::Machine;
+use crate::operand::{read_operand, write_operand};
 use crate::Step;
-
-/// The atom `badfield` (`am_badfield`, `EXC_BADFIELD`, `error.h:172` /
-/// `error_atom[21]`, `atom.names:127`).
-const BADFIELD: &str = "badfield";
 
 /// The atom `novalue` (`am_novalue`, `EXC_NOVALUE`, `error.h:174` /
 /// `error_atom[22]`, `atom.names:539`).
 const NOVALUE: &str = "novalue";
-
-/// The atom `badrecord` (`am_badrecord`, `EXC_BADRECORD`, `error.h:171` /
-/// `error_atom[20]`).
-const BADRECORD: &str = "badrecord";
 
 /// A create form's resolved definition, plus the **owner** atom its instance's
 /// definition block must carry.
@@ -344,9 +336,20 @@ fn resolve(
                 })),
                 // `defp->is_exported != am_true`, or no definition at all for a
                 // module that *is* loaded: `p->fvalue = id; p->freason =
-                // EXC_BADRECORD` (`erl_record.c:407-409`).
-                _ => create_badrecord(machine, module, labels, ctx, instruction, fail, id)
-                    .map(Resolution::Failed),
+                // EXC_BADRECORD` (`erl_record.c:407-409`) ⇒ a live `fail` label
+                // branches, and `NO_FAIL` raises class `error` with the reason
+                // **`{badrecord, Id}`** — the `Id` term itself, deliberately not the
+                // `{Tag, {{Module,Name}, Field}}` shape [`create_failure`] builds.
+                _ => fail_step_with_reason(
+                    machine,
+                    module,
+                    labels,
+                    fail,
+                    instruction,
+                    RecordReason::BadRecord { src: id },
+                    ctx,
+                )
+                .map(Resolution::Failed),
             }
         }
     }
@@ -397,18 +400,14 @@ fn live_atom(
 ///
 /// `owner`/`name` are the **definition's** identity — the running module for the
 /// atom-`Id` form, the `Id`'s own `Module` when the definition came from the host —
-/// so the reason names the record that actually failed.
+/// so the reason names the record that actually failed. `tag` names the reason's own
+/// tag (`badfield`/`novalue`).
 ///
-/// The tag atom is resolved from the running module's atom table; a module that
-/// never mentions it cannot name the reason, so a missing atom is a documented
-/// typed `error::unsupported` (never a substituted, wrong atom) — the same
-/// convention the maps family's `{badmap,_}`/`{badkey,_}` reasons follow.
-///
-/// The whole reason graph is laid out as **one** 9-word block reserved with a
-/// single rooted allocation ([`crate::terms::reserve`]) and carved by
-/// [`raw::write_create_failure_reason`]: three successive allocations would strand
-/// the earlier tuples under a moving collector, and the graph's elements are all
-/// immediates (atoms and `arityval` headers), so it needs no spare tail.
+/// The mechanics — resolving the tag and class atoms through the live namespace
+/// (with the running module's snapshot as fallback) and laying the whole reason
+/// graph out as **one** 9-word rooted reservation — are
+/// [`fail_step_with_reason`]'s (`RecordReason::BadField`), shared with the update
+/// and field-reader opcodes that raise the same shape.
 fn create_failure(
     machine: &mut Machine,
     module: &Module,
@@ -424,65 +423,22 @@ fn create_failure(
     if fail != NO_FAIL {
         return fail_step(machine, module, labels, fail, instruction, ctx);
     }
-    let tag = module.atom_table.lookup(tag).ok_or_else(|| {
-        error::unsupported(&format!(
-            "{instruction}: create: no '{tag}' atom in the module"
-        ))
-    })?;
-    // `{Tag, {{Module, Name}, Field}}` in one reservation (see the doc above).
-    let reason = raw::write_create_failure_reason(machine, ctx, owner, name, field, tag)?;
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
-        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
-    }
-    machine.throw_error(reason)
-}
-
-/// The create form's **`badrecord`** path — `erl_create_native_record`'s fall-out
-/// (`erl_record.c:407-409`), reached when the record table's entry is missing or
-/// its definition is not exported.
-///
-/// A live `fail` label is the C's `$FAIL_HEAD_OR_BODY($Fail)` branch (set
-/// `badrecord` and take it — `emu/macros.tab:266-278`); no reason is built there.
-/// [`NO_FAIL`] is the C's `goto find_func_info`, which raises class `error` with the
-/// reason **`{badrecord, Id}`** — the C keeps the `Id` term itself in `p->fvalue`
-/// (`p->fvalue = id`) and `expand_error_value` (`beam_common.c:761-767`) wraps it
-/// with `error_atom[EXC_BADRECORD]`. That is deliberately **not** the
-/// `{Tag, {{Module,Name}, Field}}` shape [`create_failure`] builds.
-///
-/// The 3-word tuple is **one** rooted reservation, and the `Id` operand is re-read
-/// from the machine's **post-collection** state inside the reader closure (the
-/// frozen reserve → read → write discipline). The tag atom is resolved through the
-/// live namespace seam with the module's snapshot as fallback
-/// ([`crate::machine::namespace_atom`]); a namespace that cannot spell it is the
-/// typed `error::unsupported`, never a substituted atom. The class atom is set the
-/// same way [`create_failure`] sets it.
-fn create_badrecord(
-    machine: &mut Machine,
-    module: &Module,
-    labels: &LabelMap,
-    ctx: &mut dyn ExecutionContext,
-    instruction: &str,
-    fail: Label,
-    id: &Operand,
-) -> Result<Step> {
-    if fail != NO_FAIL {
-        return fail_step(machine, module, labels, fail, instruction, ctx);
-    }
-    let tag = namespace_atom(ctx, module, BADRECORD).ok_or_else(|| {
-        error::unsupported(&format!(
-            "{instruction}: create: no '{BADRECORD}' atom in the module"
-        ))
-    })?;
-    // Reserve the reason block first, then re-read the `Id` operand (a moving
-    // collector may run inside the reserve).
-    let extra = operand_slack_words(id);
-    let reason = terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
-        Ok(vec![make_atom(tag), read_operand_slack(m, id, s)?])
-    })?;
-    if let Some(class_atom) = namespace_atom(ctx, module, ExceptionClass::Error.as_str()) {
-        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
-    }
-    machine.throw_error(reason)
+    // The create form's diagnostic names the `create` path it failed in
+    // (`put_record: create: no 'novalue' atom in the module`).
+    fail_step_with_reason(
+        machine,
+        module,
+        labels,
+        NO_FAIL,
+        &format!("{instruction}: create"),
+        RecordReason::BadField {
+            tag,
+            owner,
+            name,
+            field,
+        },
+        ctx,
+    )
 }
 
 /// Build a fresh native-record instance from the resolved `definition` — the

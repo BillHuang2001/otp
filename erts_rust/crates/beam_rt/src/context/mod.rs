@@ -55,6 +55,9 @@
 //! * [`apply`] — fun application ([`LocalFunTarget`], `local_fun_target`,
 //!   `apply_non_local_fun`) and the callee-admission predicates behind the in-machine
 //!   cross-module seam.
+//! * [`ir_cache`] — the thread-local caches behind the two request-path lookups that are pure
+//!   functions of immutable loaded IR: the local-fun descriptor search and the cross-module
+//!   callee-admission verdict.
 //! * [`pump`] — the nested-run pump (`run_export`/`run_export_blocking`/`run_label_blocking`
 //!   and their bounded deadline).
 //! * [`execution`] — the single `impl ExecutionContext`, incl. the process-heap collector
@@ -62,6 +65,8 @@
 //! * [`gc`]/[`gc_walk`] — the heap-admission point and the unscanned-root valve.
 //! * [`position`] — the **in-machine** BIF door that answers `erlang:process_info/1,2`'s
 //!   execution-position items for the process that is executing the query.
+//! * [`records`] — the one code-server record-table lookup (shared with the
+//!   `records:get_definition/2` bridge) and the engine's foreign-record-definition seam.
 //! * [`bridges`]/[`export_gate`]/[`fun_identity`]/[`memory_hook`]/[`module_info`]/
 //!   [`node_hash`]/[`persistent_term`]/[`process_bridge`]/[`runtime_hooks`]/[`signal`]/
 //!   [`trace`]/[`alias`] — the host-seam bridges and the runtime-level facilities they wrap.
@@ -76,7 +81,9 @@ mod export_gate;
 mod fun_identity;
 pub(crate) mod gc;
 pub(crate) mod gc_walk;
+mod ir_cache;
 mod memory_hook;
+mod machine_pool;
 mod module_info;
 mod node_hash;
 mod persistent_term;
@@ -84,6 +91,7 @@ mod pool;
 mod position;
 mod process_bridge;
 mod pump;
+mod records;
 mod runtime_context;
 mod runtime_hooks;
 mod send;

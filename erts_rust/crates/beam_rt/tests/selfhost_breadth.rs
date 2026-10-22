@@ -81,7 +81,11 @@
 //! | `BEAM_RT_BREADTH_APPS=kernel,stdlib` | restrict the run to these applications (an unknown name panics) |
 //! | `BEAM_RT_BREADTH_SHARD=i/n` | keep the sources whose 0-based index in the filtered, sorted list is `i mod n` |
 //! | `BEAM_RT_BREADTH_LIMIT=<n>` | keep the first `n` sources after the two filters above |
+//! | `BEAM_RT_BREADTH_MAX_BYTES=<n>` | skip sources whose file is **larger** than `n` bytes, before the shard/limit filters (the skipped count is always reported) |
 //! | `BEAM_RT_BREADTH_SCHEDULED=1` | drive the **scheduled** (spawn-a-compiler-process) route; `0`/unset is the in-process route; any other value panics |
+//! | `BEAM_RT_BREADTH_PA=a:b:c` | put these directories first on the runtime's code path (one `-pa` group, in the given order): this is how a sweep is run with **the tree's own compiler** (`bootstrap/lib/compiler/ebin:bootstrap/lib/kernel/ebin:bootstrap/lib/stdlib/ebin`) instead of the system one |
+//! | `BEAM_RT_BREADTH_DEADLINE_S=<n>` | the per-child bound (default 900 s): a compile that outlives it is killed and reaped and counted as `timed out (per-source bound)` |
+//! | `BEAM_RT_BREADTH_COMPARE=bytes\|artifact` | the verdict: `bytes` (default) asserts whole-file byte identity against the oracle; `artifact` asks only that an artifact was produced (the tree's OTP-30 compiler legitimately stamps `opcode_max` 183 where OTP 29 stamps 181, so its output can never be byte-identical) and still reports the byte relation, unasserted |
 //!
 //! The corpus is sorted by application then module, so a shard (or a `LIMIT`) is a stable,
 //! reproducible slice: the shards partition the corpus, and each shard computes its own oracle
@@ -148,6 +152,29 @@ const BANNER: &str = "selfhost breadth";
 /// per-source deadline the corpus measurement quotes: generous for the slowest real source, short
 /// enough that a wedged runtime is reported rather than slept on.
 const SOURCE_DEADLINE: Duration = Duration::from_secs(900);
+
+/// `BEAM_RT_BREADTH_DEADLINE_S=<n>`: the per-child bound, defaulting to [`SOURCE_DEADLINE`].
+///
+/// A sweep whose corpus is *throughput*-limited (a slow compiler, or a runtime that is orders of
+/// magnitude slower than the oracle) needs a bound it chose rather than one it inherited: a
+/// source that outlives it is reported as `timed out (per-source bound)` — a measurement, never a
+/// silent omission — so a shorter bound buys breadth at the cost of an explicit timeout count.
+fn source_deadline() -> Duration {
+    source_deadline_from(std::env::var("BEAM_RT_BREADTH_DEADLINE_S").ok().as_deref())
+}
+
+/// The switch's parsing, split out so the unit tests can pin it without a process-wide environment.
+fn source_deadline_from(value: Option<&str>) -> Duration {
+    match value.map(str::trim) {
+        None | Some("") => SOURCE_DEADLINE,
+        Some(text) => match text.parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
+            _ => panic!(
+                "BEAM_RT_BREADTH_DEADLINE_S must be a positive number of seconds, got `{text}`"
+            ),
+        },
+    }
+}
 
 /// How often a running child's exit is polled.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -314,6 +341,92 @@ fn limit_selection() -> Option<usize> {
     }
 }
 
+/// `BEAM_RT_BREADTH_MAX_BYTES=<n>`: keep only sources whose file is at most `n` bytes.
+///
+/// The threshold exists because the *compile cost is superlinear in source size* while the runtime's
+/// in-process route is bounded by `BLOCKING_PUMP_DEADLINE` (900 s): a sweep that wants a **broad**
+/// census rather than a handful of hour-long probes selects by size.
+fn max_bytes_selection() -> Option<u64> {
+    let value = std::env::var("BEAM_RT_BREADTH_MAX_BYTES").ok()?;
+    match value.trim().parse::<u64>() {
+        Ok(max) => Some(max),
+        Err(_) => panic!(
+            "BEAM_RT_BREADTH_MAX_BYTES must be a non-negative integer byte count, got `{value}`"
+        ),
+    }
+}
+
+/// The size filter's own predicate: no threshold keeps everything.
+fn keep_by_size(max_bytes: Option<u64>, length: u64) -> bool {
+    match max_bytes {
+        None => true,
+        Some(max) => length <= max,
+    }
+}
+
+/// `BEAM_RT_BREADTH_PA=a:b:c`: the directories a sweep puts **first** on the runtime's code path.
+///
+/// One `-pa` group (OTP's own form: `-pa D1 D2 D3` heads the path with `D1` first), so a sweep can
+/// drive the compiler the *tree* ships in `bootstrap/lib/{compiler,kernel,stdlib}/ebin` rather than
+/// the system one — contract A.9's "does the tree compile the tree" measurement. An empty entry is a
+/// loud panic (it would silently add the CWD to the code path); an empty/unset value adds nothing.
+fn pa_selection() -> Vec<PathBuf> {
+    let Some(value) = std::env::var("BEAM_RT_BREADTH_PA").ok() else {
+        return Vec::new();
+    };
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+    value
+        .split(':')
+        .map(|dir| {
+            if dir.trim().is_empty() {
+                panic!("BEAM_RT_BREADTH_PA has an empty entry: `{value}`");
+            }
+            PathBuf::from(dir)
+        })
+        .collect()
+}
+
+/// What a produced artifact is measured against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compare {
+    /// Whole-file byte identity with the oracle's artifact — the system compiler's own contract.
+    Bytes,
+    /// The artifact merely **exists** (the byte relation is still reported, never asserted): the
+    /// shape a sweep with a *different compiler version* on the code path needs, because the tree's
+    /// OTP-30 compiler stamps `opcode_max` 183 where OTP 29 stamps 181 and the `Attr` `vsn` (and each
+    /// `FunT` uniq) follow from that payload — so byte identity is impossible by construction.
+    Artifact,
+}
+
+impl Compare {
+    /// The label the header and the summary carry, so a captured log names its contract.
+    fn name(self) -> &'static str {
+        match self {
+            Compare::Bytes => "bytes",
+            Compare::Artifact => "artifact",
+        }
+    }
+}
+
+/// `BEAM_RT_BREADTH_COMPARE=bytes|artifact`: the selected verdict (default `bytes`); any other value
+/// is a loud panic, so a typo can never quietly weaken the contract.
+fn compare_selection() -> Compare {
+    compare_from(std::env::var("BEAM_RT_BREADTH_COMPARE").ok().as_deref())
+}
+
+/// The switch's parsing, split out so the unit tests can pin it without a process-wide environment.
+fn compare_from(value: Option<&str>) -> Compare {
+    match value.map(str::trim) {
+        None | Some("") | Some("bytes") => Compare::Bytes,
+        Some("artifact") => Compare::Artifact,
+        Some(other) => panic!(
+            "BEAM_RT_BREADTH_COMPARE must be `bytes` (whole-file identity) or `artifact` (an \
+             artifact was produced), got `{other}`"
+        ),
+    }
+}
 // ---------------------------------------------------------------------------------------
 // The route switch (in-process vs scheduled — parsed once, loudly)
 // ---------------------------------------------------------------------------------------
@@ -377,9 +490,12 @@ fn route_from(value: Option<&str>) -> Route {
     }
 }
 
-/// The filtered, sorted selection: application filter, then shard, then limit — in that order, so
-/// `LIMIT` is a prefix of the (sharded) list a reader can replay.
-fn select(corpus: &Corpus) -> Vec<Source> {
+/// The filtered, sorted selection: application filter, then the size threshold, then shard, then
+/// limit — in that order, so `LIMIT` is a prefix of the (sharded) list a reader can replay.
+///
+/// The second element is how many sources the size threshold dropped, so a run always reports that
+/// it measured a *slice* rather than silently pretending the corpus was smaller.
+fn select(corpus: &Corpus) -> (Vec<Source>, usize) {
     let mut selected: Vec<Source> = match apps_filter() {
         Some(apps) => {
             for app in &apps {
@@ -401,6 +517,17 @@ fn select(corpus: &Corpus) -> Vec<Source> {
         }
         None => corpus.sources.clone(),
     };
+    let mut size_skipped = 0;
+    if let Some(max_bytes) = max_bytes_selection() {
+        let before = selected.len();
+        selected.retain(|source| {
+            // A source whose size cannot be read (a race with a checkout) is kept: the compile
+            // verdict, not the harness, decides what it is.
+            let length = std::fs::metadata(&source.path).map(|meta| meta.len()).unwrap_or(0);
+            keep_by_size(Some(max_bytes), length)
+        });
+        size_skipped = before - selected.len();
+    }
     if let Some((index, count)) = shard_selection() {
         selected = selected
             .into_iter()
@@ -412,9 +539,8 @@ fn select(corpus: &Corpus) -> Vec<Source> {
     if let Some(limit) = limit_selection() {
         selected.truncate(limit);
     }
-    selected
+    (selected, size_skipped)
 }
-
 // ---------------------------------------------------------------------------------------
 // Bounded child execution (a per-source deadline of its own)
 // ---------------------------------------------------------------------------------------
@@ -433,13 +559,23 @@ struct Probe {
 /// never has to invent one. The child is polled rather than waited on for the reason
 /// [`support::run_bounded`] documents: a probe that blocks must be killable, not waited on for ever.
 fn run_bounded(program: &Path, args: &[&str], deadline: Duration) -> Result<Probe, String> {
+    let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    run_bounded_os(program, &argv, deadline)
+}
+
+/// [`run_bounded`] over an already-assembled argv (the runtime's invocation carries `-pa` directory
+/// arguments as well as the `-eval` expression, so it is built as `OsString`s).
+fn run_bounded_os(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    deadline: Duration,
+) -> Result<Probe, String> {
     let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let name = program.display().to_string();
+        .stderr(Stdio::piped());    let name = program.display().to_string();
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot spawn `{name}`: {error}"))?;
@@ -585,6 +721,7 @@ fn compile_with_erlc(
     corpus: &Corpus,
     outdir: &Path,
     route: Route,
+    deadline: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut arguments: Vec<&str> = vec!["-o", path_arg(outdir)];
     if route.compiles_in_calling_process() {
@@ -598,7 +735,7 @@ fn compile_with_erlc(
     }
     arguments.push(path_arg(&source.path));
 
-    let probe = run_bounded(erlc, &arguments, SOURCE_DEADLINE)?;
+    let probe = run_bounded(erlc, &arguments, deadline)?;
     if probe.code != Some(0) {
         return Err(reason_of(&probe));
     }
@@ -611,23 +748,29 @@ fn compile_with_erlc(
 ///
 /// The invocation is the real CLI in both cases: `beam_rt -noshell -eval '<compile:file(…)>'`. The
 /// expression is the compile call and nothing else — the `-eval` action exits 0 on its own and a
-/// successful compile prints nothing, so the artifact on disk is the whole verdict.
+/// successful compile prints nothing, so the artifact on disk is the whole verdict. `pa` (when not
+/// empty) is prepended as one `-pa` group, so the compiler the sweep drives is named by the caller.
 fn compile_on_route(
     source: &Source,
     corpus: &Corpus,
     outdir: &Path,
     route: Route,
+    pa: &[PathBuf],
+    deadline: Duration,
 ) -> Result<Vec<u8>, String> {
     let expression = compile_expr(source, corpus, outdir, route);
-    let probe = run_bounded(
-        Path::new(BINARY),
-        &["-noshell", "-eval", &expression],
-        SOURCE_DEADLINE,
-    )?;
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    if !pa.is_empty() {
+        argv.push("-pa".into());
+        argv.extend(pa.iter().map(|dir| dir.as_os_str().to_owned()));
+    }
+    argv.push("-noshell".into());
+    argv.push("-eval".into());
+    argv.push(expression.into());
+    let probe = run_bounded_os(Path::new(BINARY), &argv, deadline)?;
     if probe.code != Some(0) {
         return Err(reason_of(&probe));
-    }
-    let artifact = source.artifact(outdir);
+    }    let artifact = source.artifact(outdir);
     match std::fs::read(&artifact) {
         Ok(bytes) if bytes.is_empty() => Err(format!("wrote an EMPTY {}", artifact.display())),
         Ok(bytes) => Ok(bytes),
@@ -794,10 +937,13 @@ fn sweep_body() {
     // must never be able to hide a typo in the switch).
     let route = route_selection();
     let route_name = route.name();
+    let compare = compare_selection();
+    let deadline = source_deadline();
+    let compare_name = compare.name();
+    let pa = pa_selection();
     let Some(oracle) = support::require_oracle(BANNER) else {
         return;
-    };
-    let Some(erlc) = resolve_erlc() else {
+    };    let Some(erlc) = resolve_erlc() else {
         support::skip_loudly(BANNER, "no `erlc` on $PATH (and no executable $ERLC)");
         return;
     };
@@ -812,7 +958,7 @@ fn sweep_body() {
         );
         return;
     };
-    let sources = select(&corpus);
+    let (sources, size_skipped) = select(&corpus);
     if sources.is_empty() {
         panic!(
             "the BEAM_RT_BREADTH_* filters selected none of this checkout's {} sources across {} \
@@ -823,16 +969,24 @@ fn sweep_body() {
     }
     let total = sources.len();
     eprintln!(
-        "breadth sweep ({route_name} route): {total} sources selected of {} across {} \
-         applications; {} include directories; oracle {} (baseline via {}); {} s per-source deadline",
+        "breadth sweep ({route_name} route, {compare_name} compare): {total} sources selected of {} \
+         across {} applications; {} include directories; oracle {} (baseline via {}); {} s \
+         per-source deadline",
         corpus.sources.len(),
         corpus.apps.len(),
         corpus.include_dirs.len(),
         oracle.display(),
         erlc.display(),
-        SOURCE_DEADLINE.as_secs(),
+        deadline.as_secs(),
     );
-    for dir in &corpus.include_dirs {
+    for dir in &pa {
+        eprintln!("  code path first: {}", dir.display());
+    }
+    if size_skipped > 0 {
+        eprintln!(
+            "  size filter: {size_skipped} source(s) larger than the threshold were not attempted"
+        );
+    }    for dir in &corpus.include_dirs {
         eprintln!("  include: {}", dir.display());
     }
     if let Some((index, count)) = shard_selection() {
@@ -869,7 +1023,7 @@ fn sweep_body() {
         // ---- the oracle's own verdict: the baseline, compiled with this route's option list ----
         let oracle_out = scratch.outdir(source, "oracle");
         let oracle_started = Instant::now();
-        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out, route) {
+        let reference = match compile_with_erlc(&erlc, source, &corpus, &oracle_out, route, deadline) {
             Ok(bytes) => bytes,
             Err(reason) => {
                 eprintln!(
@@ -886,8 +1040,7 @@ fn sweep_body() {
         // ---- the runtime's verdict, on the selected route, in a runtime of its own ----
         let rust_out = scratch.outdir(source, "rust");
         let route_started = Instant::now();
-        let mine = compile_on_route(source, &corpus, &rust_out, route);
-        let route_elapsed = route_started.elapsed();
+        let mine = compile_on_route(source, &corpus, &rust_out, route, &pa, deadline);        let route_elapsed = route_started.elapsed();
         route_wall += route_elapsed;
 
         let mine = match mine {
@@ -921,13 +1074,22 @@ fn sweep_body() {
                 mine.len(),
                 reference.len()
             ));
-            format!(
-                "BYTE MISMATCH at {at} ({} vs {} bytes)",
-                mine.len(),
-                reference.len()
-            )
-        };
-        eprintln!(
+            match compare {
+                Compare::Bytes => format!(
+                    "BYTE MISMATCH at {at} ({} vs {} bytes)",
+                    mine.len(),
+                    reference.len()
+                ),
+                // Reported, never asserted: a different compiler *version* on the code path stamps a
+                // different `opcode_max` (and therefore a different `vsn`), so this is the expected
+                // relation rather than a divergence.
+                Compare::Artifact => format!(
+                    "artifact ok, differs from the oracle at {at} ({} vs {} bytes; not asserted)",
+                    mine.len(),
+                    reference.len()
+                ),
+            }
+        };        eprintln!(
             "[{route_name}] [{position}/{total}] {label}: {:.3} s, {} B, {verdict}",
             route_elapsed.as_secs_f64(),
             mine.len()
@@ -936,9 +1098,9 @@ fn sweep_body() {
 
     let elapsed = sweep_started.elapsed();
     eprintln!(
-        "breadth sweep ({route_name} route): {total} sources in {:.1} s; oracle compiled {}, \
-         {route_name} compiled {}, oracle-only {}, byte-mismatched {}, oracle-excluded {}; \
-         {route_name} route {:.1} s → {:.2} files/s",
+        "breadth sweep ({route_name} route, {compare_name} compare): {total} sources in {:.1} s; \
+         oracle compiled {}, {route_name} compiled {}, oracle-only {}, byte-mismatched {}, \
+         oracle-excluded {}; {route_name} route {:.1} s → {:.2} files/s",
         elapsed.as_secs_f64(),
         oracle_ok.len(),
         compiled_ok.len(),
@@ -953,8 +1115,7 @@ fn sweep_body() {
     if ledger.is_empty() {
         eprintln!(
             "failure ledger ({route_name} route): empty — every oracle-compilable source compiled"
-        );
-    } else {
+        );    } else {
         let mut rows: Vec<(&String, &Vec<String>)> = ledger.iter().collect();
         rows.sort_by(|(cause_a, a), (cause_b, b)| b.len().cmp(&a.len()).then(cause_a.cmp(cause_b)));
         eprintln!("failure ledger ({route_name} route; cause × count, one example module each):");
@@ -976,10 +1137,10 @@ fn sweep_body() {
         eprintln!("  residual: {failure}");
     }
     for mismatch in &mismatched {
-        eprintln!("  byte mismatch: {mismatch}");
+        eprintln!("  artifact differs: {mismatch}");
     }
 
-    // ---- the asserts: set, then count, then bytes ----
+    // ---- the asserts: set, then count, then bytes (in `bytes` compare mode only) ----
     assert!(
         oracle_only.is_empty(),
         "every source the oracle compiles must compile on the {route_name} route too; {} did \
@@ -997,15 +1158,24 @@ fn sweep_body() {
         oracle_only.join("\n"),
         ledger_summary(&ledger)
     );
-    assert!(
-        mismatched.is_empty(),
-        "every `.beam` this runtime writes on the {route_name} route must be byte-identical to the \
-         oracle's artifact for that route; {} differ:\n{}",
-        mismatched.len(),
-        mismatched.join("\n")
-    );
+    if compare == Compare::Bytes {
+        assert!(
+            mismatched.is_empty(),
+            "every `.beam` this runtime writes on the {route_name} route must be byte-identical to \
+             the oracle's artifact for that route; {} differ:\n{}",
+            mismatched.len(),
+            mismatched.join("\n")
+        );
+    } else {
+        eprintln!(
+            "artifact compare: {} of {} produced artifact(s) differ from the oracle's — reported, \
+             never asserted (a different compiler version on the code path stamps a different \
+             opcode_max, so its `vsn`/`FunT` follow)",
+            mismatched.len(),
+            compiled_ok.len()
+        );
+    }
 }
-
 /// The ledger rendered for an assertion message (the same rows the summary printed).
 fn ledger_summary(ledger: &BTreeMap<String, Vec<String>>) -> String {
     let mut rows: Vec<(&String, &Vec<String>)> = ledger.iter().collect();
@@ -1092,8 +1262,7 @@ mod tests {
     #[test]
     fn the_scheduled_route_switch_is_off_unless_explicitly_on() {
         assert_eq!(route_from(None), Route::InProcess);
-        assert_eq!(route_from(Some("0")), Route::InProcess);
-        assert_eq!(route_from(Some("1")), Route::Scheduled);
+        assert_eq!(route_from(Some("0")), Route::InProcess);        assert_eq!(route_from(Some("1")), Route::Scheduled);
         // The route names are the report labels, so they cannot drift.
         assert_eq!(Route::InProcess.name(), "in-process");
         assert_eq!(Route::Scheduled.name(), "scheduled");
@@ -1105,5 +1274,41 @@ mod tests {
             let panicked = std::panic::catch_unwind(|| route_from(Some(bogus))).is_err();
             assert!(panicked, "`{bogus}` must panic, not select a route");
         }
+    }
+
+    #[test]
+    fn the_compare_switch_defaults_to_byte_identity() {
+        assert_eq!(compare_from(None), Compare::Bytes);
+        assert_eq!(compare_from(Some("")), Compare::Bytes);
+        assert_eq!(compare_from(Some("bytes")), Compare::Bytes);
+        assert_eq!(compare_from(Some("artifact")), Compare::Artifact);
+        // The labels are what a captured log names its contract by, so they cannot drift.
+        assert_eq!(Compare::Bytes.name(), "bytes");
+        assert_eq!(Compare::Artifact.name(), "artifact");
+        for bogus in ["artifacts", "byte", "none", "1"] {
+            let panicked = std::panic::catch_unwind(|| compare_from(Some(bogus))).is_err();
+            assert!(panicked, "`{bogus}` must panic, not weaken the contract");
+        }
+    }
+
+    #[test]
+    fn the_per_source_deadline_defaults_and_parses() {
+        assert_eq!(source_deadline_from(None), SOURCE_DEADLINE);
+        assert_eq!(source_deadline_from(Some("")), SOURCE_DEADLINE);
+        assert_eq!(source_deadline_from(Some("300")), Duration::from_secs(300));
+        for bogus in ["0", "-1", "abc", "1.5"] {
+            let panicked = std::panic::catch_unwind(|| source_deadline_from(Some(bogus))).is_err();
+            assert!(panicked, "`{bogus}` must panic, not silently bound a run");
+        }
+    }
+
+    #[test]
+    fn the_size_filter_boundary_is_inclusive() {
+        assert!(keep_by_size(None, u64::MAX));
+        assert!(keep_by_size(Some(100), 100));
+        assert!(!keep_by_size(Some(100), 101));
+        assert!(keep_by_size(Some(0), 0));
+        // An unreadable file contributes length 0 (`select`'s choice), so it is always kept.
+        assert!(keep_by_size(Some(1), 0));
     }
 }

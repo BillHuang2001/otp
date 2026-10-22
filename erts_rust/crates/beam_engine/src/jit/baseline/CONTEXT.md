@@ -97,15 +97,18 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `fold_err`. **The success path never boxes**: the family's own `Result<Step, BeamError>` is matched in
   place and only an `Err` is handed on, so a successful family instruction pays no `Box::new` — a
   boxed `Result` re-boxed the 72-byte `Ok` payload too, i.e. two `malloc`/`free` pairs per instruction
-  (`perf annotate`'s top row before the split). The context-`0` `with_uncaught_frames` decoration still
-  runs on the `Err` arm, before the error is stored.
+  (`perf annotate`'s top row before the split). The `with_uncaught_frames` decoration still
+  runs on the `Err` arm, before the error is stored — **unconditionally**, with the run's true
+  `entry_module`: a block this helper is called from never passes through `step_instruction`, so this is
+  the one place a raise it reports is decorated, in the entry context and inside a cross-module callee
+  alike.
 - `bitstr.rs` — `jit_bitstr`: the bitstring family's own helper. The emitter claims on the family's
   own `families::bitstrings::claimed` predicate — the one function the router
   (`families/mod.rs`'s `_ if bitstrings::claimed(instr)` arm) routes on — and reaches
   `crate::families::bitstrings::exec` **directly**, skipping `crate::families::dispatch`'s variant
   re-match: same position store, same resolve-or-decline to `jit_step_one` (also for a variant the
-  family answers `Ok(None)` for), same context-`0` raise decoration, same `fold_ok_step`/`fold_err`
-  encoding. The `class_atoms_live` latch is the **family entry's** own (`bitstrings::exec` installs it
+  family answers `Ok(None)` for), same unconditional `with_uncaught_frames` raise decoration (with the
+  run's `entry_module`), same `fold_ok_step`/`fold_err` encoding. The `class_atoms_live` latch is the **family entry's** own (`bitstrings::exec` installs it
   before the variant check), so a direct caller gets it too and this helper performs no copy of it.
   It runs **no** per-execution shape predicate: the route is decided at compile time (re-testing it
   per execution measured ≈⅓ of the win). `bitstr_calls()` is `#[cfg(test)]`-only — it proves the

@@ -32,10 +32,12 @@ use beam_term::prelude::Eterm;
 /// Heap exhaustion is a **normal** condition, reported as
 /// `BeamError::Alloc(beam_common::AllocFailure::new(beam_common::AllocKind::Heap, bytes))`
 /// so the caller can collect and retry — never a panic and never a crate-local
-/// error enum. `words` is the number of term words the copy wanted.
+/// error enum. `words` is the number of term words the copy wanted; the byte figure
+/// **saturates**, because a refusal must be reportable for any request (an absurd request is
+/// exactly when a refusal is due, so it may not turn into an arithmetic overflow here).
 pub(crate) fn heap_exhausted(words: usize) -> BeamError {
     BeamError::Alloc(AllocFailure::new(
         AllocKind::Heap,
-        words * core::mem::size_of::<Eterm>(),
+        words.saturating_mul(core::mem::size_of::<Eterm>()),
     ))
 }

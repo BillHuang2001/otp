@@ -270,6 +270,63 @@ fn a_second_run_of_a_real_module_builds_no_label_map() {
     }
 }
 
+/// Two modules **alternated** across run entries build one map each, and every return to
+/// either is a hit.
+///
+/// This is the shape the cache is sized for: a run enters its entry module and then each
+/// in-machine cross-module callee, and `Machine::reset` clears the module-context registry
+/// on every run, so a nested run re-registers and re-resolves them all. The sequence
+/// `A → B → A → B → A` therefore asks for five label maps of two distinct modules; the LRU
+/// answers with exactly **two** builds (each module once, then three hits). A one-entry
+/// cache — the shape before the LRU — rebuilds on every switch, i.e. five builds for this
+/// sequence.
+#[test]
+fn two_modules_alternated_across_runs_build_one_map_each() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("alt_a", "lmcache_a", SOURCE_A),
+        compile("alt_b", "lmcache_b", SOURCE_B),
+    ) else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the alternation build count is not pinned");
+        return;
+    };
+    let (module_a, g_a) = load_g(&beam_a);
+    let (module_b, g_b) = load_g(&beam_b);
+    let mut machine = Machine::new();
+    let mut ctx = import_ctx();
+
+    reset_label_map_builds();
+    assert_eq!(
+        machine.run_export(&module_a, g_a, 0, &[], &mut ctx).unwrap(),
+        make_small(REVERSE_ANSWER),
+        "the first image answers with its own import"
+    );
+    assert_eq!(label_map_builds(), 1, "A's map is built on the first entry");
+    assert_eq!(
+        machine.run_export(&module_b, g_b, 0, &[], &mut ctx).unwrap(),
+        make_small(DUPLICATE_ANSWER),
+        "and the other module with its own"
+    );
+    assert_eq!(label_map_builds(), 2, "B's map is built on its first entry");
+    assert_eq!(
+        machine.run_export(&module_a, g_a, 0, &[], &mut ctx).unwrap(),
+        make_small(REVERSE_ANSWER)
+    );
+    assert_eq!(
+        machine.run_export(&module_b, g_b, 0, &[], &mut ctx).unwrap(),
+        make_small(DUPLICATE_ANSWER)
+    );
+    assert_eq!(
+        machine.run_export(&module_a, g_a, 0, &[], &mut ctx).unwrap(),
+        make_small(REVERSE_ANSWER)
+    );
+    assert_eq!(
+        label_map_builds(),
+        2,
+        "A -> B -> A -> B -> A over two distinct modules builds exactly one map each; \
+         every return to either is a hit (a one-entry cache would build 5 times)"
+    );
+}
+
 /// A module **replaced in place** — same address, different bytes — resolves its own
 /// labels and its own imports.
 ///

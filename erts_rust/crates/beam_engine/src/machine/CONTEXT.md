@@ -10,7 +10,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `mod.rs` — `Machine` (x-register file, float-register (FR) file of `Eterm` term slots, Erlang stack,
   call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
   `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
-  replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate, reduction counter,
+  replacement for C's saved raw `StackTrace` (`c_p->ftrace`), left **untouched** by a raise that supplied its
+  own trace (nothing is derived at a re-raise site, so the preserved chain is the re-raised exception's) — latched A.8 trace gate, reduction counter,
   the **in-machine BIF-dispatch gate** `bif_in_machine_on` — the cached
   `ExecutionContext::wants_bif_in_machine` answer, latched once per run by `Machine::drive` **and** by the
   native baseline tier's driver, read by `Machine::dispatch_bif_call` — and the fourth latched gate,
@@ -19,7 +20,11 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   every instruction (cleared by `reset`, latched by both drivers, so a mid-run `enable()` takes effect at the
   run's next entry)); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the live `RootSet`, and `alloc_rooted` — the convenience
-  wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
+  wrapper that calls `ExecutionContext::alloc_words_rooted`; plus **`for_each_root(&self, impl FnMut(Eterm))`**,
+  the read-only twin of `with_roots`: it enumerates exactly the **pointer-bearing** root words the hand-off
+  covers — `x[..used_x_extent()]`, the whole stack, `fr[..used_fr_extent()]` and the three loose heap terms,
+  with every `IMMED1` word skipped by `beam_term::primary_tag` — and it does **not** cover `args_scratch`,
+  which is `mem::take`n out of the machine for the whole wide dispatch); and the **off-heap refc-binary handle view**
   `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
   which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
   binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine);
@@ -42,26 +47,59 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (the whole file), `with_roots` (the prefix it hands over) and the native driver (the artifact's own
   `CompiledModule::native_write_extent`, noted **before** the block runs). Every slot at or beyond the extent
   is `NIL` by the refill invariant, which is what makes the narrow root hand-off sound by construction
-  rather than by host promise. `Machine::reset` clears the raise snapshot  alongside the module contexts (both belong to the run that is starting) **and clears all four raise
-  latches** (`pending_function_clause_args`/`raise_function_clause_args`/`pending_supplied_trace`/
-  `raise_supplied_trace`).
-- `mod.rs` — the four raise latches. The failed-clause pair:
+  rather than by host promise. `Machine::reset` clears the raise snapshot alongside the module contexts (both
+  belong to the run that is starting) **and every raise latch** — the four one-shot/live pairs
+  `pending_callee_head`/`raise_head_item`, `pending_function_clause_args`/`raise_function_clause_args`,
+  `pending_supplied_trace`/`raise_supplied_trace` and `pending_supplied_term`/`raise_supplied_term`
+  (`registers.rs:407-421`).
+- `mod.rs` — the four raise latch pairs. The failed-clause pair:
   `pending_function_clause_args: Option<Eterm>` (one-shot — armed by the raise site, consumed by the
   `throw_with_trace` that lands it, so a propelling `Err` cannot leave a stale list for a later trace) and
   `raise_function_clause_args: Option<Eterm>` (the **live raise** state, set on every `throw_with_trace` and
   consumed exactly once by the two cooked-trace builders). The explicitly-supplied-trace pair:
   `pending_supplied_trace: Option<StackTrace>` (one-shot, armed only when an incoming `BeamError::Raise`
   carries **non-empty** symbolic frames — the `erlang:raise/3` trace-list shape) and
-  `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed).
-  **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`) PARKS the
-  two armed heap-term latches** — `raise_function_clause_args` then `pending_function_clause_args` — onto the
-  tail of `self.stack` for the duration of the hand-off, hands over the `RootSet`, then **re-seats** each
-  field from its slot (`self.stack.get(cursor).copied()` — the stack is rooted in full, so a conforming host
-  relocates the parked word and the engine reads the *moved* term back), and finally `stack.truncate(base)`.
-  With both latches `None` the `RootSet` is handed over **unmodified** (byte-identical fast path). The
-  supplied-trace pair is plain `Vec<StackFrame>` **metadata**, not a heap term, so it needs no rooting.
-  `Machine::pending_exception` is **not** parked here — `beam_rt` roots it via `Registers::extra_roots`.
-- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
+  `raise_supplied_trace: Option<StackTrace>` (the live state for the raise being landed). The
+  supplied-**term** pair: `pending_supplied_term: Option<Eterm>` (one-shot, armed by `Machine::raise_supplied`,
+  which `Instr::RawRaise` calls — the shape `sys_core_fold` folds `catch C:R:S -> erlang:raise(C,R,S)` into)
+  and `raise_supplied_term: Option<Eterm>` (the live state; `throw_with_trace` promotes the one-shot latch
+  into it and then **skips** the `raise_snapshot` rebuild, so the chain of the raise being re-raised survives
+  — C's `raw_raise` stores the supplied trace and clears `EXF_SAVETRACE`,
+  `../../erts/emulator/beam/beam_common.c:1148-1179`). It is consumed exactly once, by whichever destination
+  the raise takes: a **landed** raise publishes it as the handler's `x(2)`
+  (`Machine::land_exception`'s `supplied_term` argument, C's register convention), an **uncaught** one renders
+  the preserved chain in `Machine::with_uncaught_frames`.
+  **Rooting: `Machine::with_roots` (the single root hand-off behind `alloc_rooted`/`ensure_heap`, hence behind
+  every term-allocation and heap-admission door on every tier) PARKS the machine's loose heap terms**
+  (`Machine::loose_heap_terms`, in this order: `raise_function_clause_args`, `pending_function_clause_args`,
+  then `pending_exception`'s reason) **onto the tail of `self.stack`** for the duration of the hand-off, hands
+  over the `RootSet`, then **re-seats** each field from its slot (`self.stack.get(cursor).copied()` — the stack
+  is rooted in full, so a conforming host relocates the parked word and the engine reads the *moved* term back),
+  and finally `stack.truncate(base)`.
+  With every loose term `None` the `RootSet` is handed over **unmodified** (byte-identical fast path).
+  A `None` read-back leaves its field untouched rather than clearing it (a host would have to move a slot out of
+  the `&mut [Eterm]` it was handed to produce one).
+  The source of truth for the parked set is the pair `Machine::loose_heap_terms`/`Machine::seat_loose_heap_terms`
+  plus the parking loop `Machine::with_parked_loose_terms`, so a future loose field is added in exactly one place.
+  The supplied-trace pairs are not parked: `Option<StackTrace>` is metadata, and the two supplied-**term** latches
+  need no rooting either — nothing allocates between `raise_supplied` arming one and `throw_with_trace`
+  promoting it, and the promotion's destination is `x(2)` (inside the `RootSet`) or the uncaught funnel.
+  **`Machine::pending_exception` IS parked**, so its reason is a live root at every door: a word a host reads from
+  the field has already been relocated by every collection that preceded the read, which is what makes `beam_rt`'s
+  park publication (`Registers::extra_roots`, read back through `Machine::pending_exception_mut`) and the in-crate
+  `families::bitstrings::raw::payload_aliased_elsewhere` read safe by construction.
+  The pair is **retained past landing** (C clears `c_p->fvalue` in `handle_error`,
+  `../../erts/emulator/beam/beam_common.c:527`), which is sound precisely because the reason stays rooted here —
+  C roots `fvalue`/`ftrace` for the window they exist (`setup_rootset`/`offset_rootset`,
+  `../../erts/emulator/beam/erl_gc.c:2676-2693`, `:3513-3514`).
+  **Parking is unconditional** — an *immediate* reason (the common `function_clause`/`badarith` atoms, which no
+  collector can move) is parked too, keeping one uniform rule instead of a tag test at the door. Consequence: the
+  byte-identical no-loose-term fast path is unavailable for the **rest of a run that has caught an exception**
+  (`pending_exception` is cleared only by `Machine::reset`/the next raise), so every later door pays at most three
+  extra option reads plus the push/get/truncate of the armed words. Gate the reason slot on
+  `beam_term::is_immediate` in `Machine::loose_heap_terms` if a measurement ever shows that cost.- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
+  (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
+  `Machine::set_continuation` write), `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
 - `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`)
@@ -71,7 +109,20 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   survives for the handler. It also promotes the failed-clause argument list: it takes the one-shot
   `Machine::pending_function_clause_args` and stores it as the live `Machine::raise_function_clause_args`
   (a raise that carries no such list clears it, so no later trace can inherit a stale one); it does the same
-  for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace`.
+  for `Machine::pending_supplied_trace` -> `Machine::raise_supplied_trace` and for
+  `Machine::pending_supplied_term` -> `Machine::raise_supplied_term`. It also clears the landing frame's
+  continuation slot (`set_continuation(Continuation::Halt)`, the handler runs in that frame) and then hands
+  `land_exception` the trace the handler must see in `x(2)`: the supplied **term** when this raise carried
+  one, else the raise's own raw-trace word.
+  **A supplied trace is preserved, a derived one is built here.** The `raise_snapshot` rebuild runs only
+  when the raise supplied **neither** flavour (a supplied symbolic trace renders its own frames; a supplied
+  trace term renders the preserved snapshot of the raise being re-raised, so rebuilding would replace it with
+  a re-raise-site chain) — see `## A frame's continuation slot is consumed by whoever follows it` and
+  `../families/exceptions/CONTEXT.md`. An **uncaught** raise still leaves through the frameless-`Raise` arm
+  (either the snapshot rebuild above has run, or the supplied trace is what the run renders), and
+  `Machine::with_uncaught_frames` attaches the frames at the run boundary: the live supplied-symbolic latch
+  when one is armed, else `Machine::snapshot_stacktrace` for the supplied-term case, else
+  `Machine::raise_stacktrace`.
   **The exception-class atoms and `namespace_atom`.** `Machine::ensure_class_atoms(ctx, module)` resolves every
   still-unresolved `error`/`exit`/`throw` atom from the engine's live atom namespace and installs it with
   `Machine::set_class_atom`; an atom already installed is never overwritten, and the per-run **`class_atoms_live`
@@ -99,8 +150,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   from the slot the host wrote the moved word back through — handing the re-seated list to the first
   frame's `A` slot (every outer frame keeps its declared arity); the list's elements are carved **inside**
   the reservation, so no element word is held across a collection. `Machine::take_raise_supplied_trace()` is the
-  consuming half of the supplied-trace latch: `symbolic_stacktrace` renders those frames **instead of** the
-  snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path byte-identical.
+  consuming half of the symbolic supplied-trace latch (`symbolic_stacktrace` renders those frames **instead
+  of** the snapshot heuristic when it is armed, and an absent/empty supplied trace leaves every path
+  byte-identical) and `Machine::take_raise_supplied_term()` the consuming half of the **term** latch — whose
+  consumer is not `symbolic_stacktrace` but the landed `x(2)` publication or the uncaught funnel, since a
+  supplied term is already a cooked `[{M,F,A,Location}]` list and `symbolic_stacktrace` returns such a list
+  from the trace register verbatim (`is_list`, C's `is_raised_exc` arm,
+  `../../erts/emulator/beam/beam_common.c:1219-1223`).
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `offheap.rs` — the off-heap refc-binary **retention seam**: `Machine::off_heap_overhead_bytes()` (the sum of
@@ -170,6 +226,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   pops its frame like the in-machine route, and `reset` clears the memo. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
+- `root_tests.rs` — the pins for `Machine::for_each_root` (the read-only pointer-bearing root enumeration):
+  coverage of every rooted file plus the three loose terms in the documented order,
+  the immediate filter (a machine whose slots hold only small ints/atoms/`NIL` reports nothing, and one
+  boxed word in an otherwise immediate-only machine is the only thing reported), and **agreement with
+  `with_roots`** — the pointer-bearing word set the walk reports equals the one collected from the
+  `RootSet` slices for the same machine state, with the filter written out independently on both sides.
 - `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
   non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
   reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`
@@ -197,6 +259,38 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `machine/mod.rs`, ever sets it); a resume (`resume_outcome`) resets nothing, so the contexts and the raise snapshot
   both survive it. The two off-heap rosters are released only by a host call to
   `Machine::retain_refc_binaries`.
+  **Nothing is ever released or shrunk**: the register/FR files are `fill_nil`-refilled only over their *used
+  extent* (never `truncate`d, never reallocated once the length matches), `stack`/`frames`/`catch_frames`/
+  `raise_snapshot`/`args_scratch`/`refc_binaries`/`writable_payloads`/`label_maps.entries` all use
+  `clear`/`truncate`/`pop`, which **keep capacity**, and no `shrink_to_fit`/`shrink_to`/`reserve_exact` exists
+  anywhere in the crate — so a machine's resident footprint is the high-water mark of the heaviest run it has
+  ever executed and only dropping the machine frees it. `Machine::new` itself (`mod.rs`) allocates both
+  1024-word register files (8 KiB each) before the first run.
+
+## A frame's continuation slot is consumed by whoever follows it
+`Machine::take_continuation` (`frames.rs`) is the **one** read-and-clear: it reads the current frame's
+`Continuation` slot and resets it to `Continuation::Halt` in the same step (C's `RETURN()` macro does
+`SET_I(cp_val(*E)); *E = NIL`, `../../erts/emulator/beam/emu/macros.tab:241-247`).
+A frame's slot means exactly one thing — *this frame is suspended inside a call and resumes at that address
+when the call returns* — so whoever follows the address clears it, and every reader may treat a non-`Halt`
+slot as a **live** caller.
+- **The complete consumer set** (each is a `take_continuation` call site): `return_step`
+  (`../interpreter/dispatch.rs`, the interpreter's `return`/`deallocate_return` arm),
+  `Machine::continuation_step` (`drive.rs`, the `Step` protocol's follow), and `jit_return` /
+  `jit_deallocate_return` (`../jit/baseline/runtime.rs`, the native baseline tier's twins of those arms).
+- **A raise landing in a frame's catch handler clears that frame's slot too** — `Machine::throw_with_trace`
+  ends its landing with `self.set_continuation(Continuation::Halt)`, because the handler runs *in* the
+  landing frame, which is therefore no longer suspended in the call that raised (C's `next_catch` drops the
+  frames above the catch frame for the same reason).
+- **The remaining readers are read-only and never reset it**: `continuation()` (the test-only observation
+  view), `resumption_contexts`/`resumption_addresses`, `raise_stacktrace`/`snapshot_stacktrace` and
+  `current_stacktrace`.
+- **The writers are unchanged**: `Instr::Call`, `call_ext*`, the `Apply*`/`call_fun` arms and the baseline
+  tier's `store_continuation` (`../jit/baseline/call.rs`) arm the slot through `set_continuation`.
+Consequence: a caller that already returned is never named a second time, so a derived stacktrace names the
+raising function once and thereafter only its **live** callers.
+C's `gather_stacktrace` (`../../erts/emulator/beam/beam_common.c:782-842`) likewise admits only words that
+still look like a CP.
 
 ## The cross-module call seam (`resolve_external_call`) and `Machine::drive` (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
@@ -218,7 +312,13 @@ Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside th
 ## The machine: sub-stores, run entries, raise funnel, contexts, introspection (from `../CONTEXT.md`)
 Moved verbatim from the crate `CONTEXT.md` (which keeps the contract and a pointer).
 `Machine` is the process-state core: the x-register file (`MAX_REGISTER = 1024`, C's `MAX_REG`), the float-register (FR) file (`MAX_FLOAT_REGISTER = 1024`, holding **`Eterm` term slots**), the Erlang stack, the call-frame and exception catch-frame stacks, the `refc_binaries` arena (never cleared by `reset`, host-prunable through `retain_refc_binaries`), the running module's decoded **literal area**, the **module-context registry** (`contexts` + `context` + `entry_literals`), the reduction counter, the **raise-time snapshot** `raise_snapshot`, the latched A.8 gate `trace_on`, and the per-module **label-map cache** (`label_maps`, `src/machine/label_cache.rs`).
-- **The label-map cache (`label_cache.rs`).** `build_label_map` is a whole-module value (one traversal per function plus the module's entire import table) and a pure function of the module's immutable content, so `Machine::label_map(&mut self, &Module)` / `Machine::label_map_arc(&mut self, &Arc<Module>)` answer one cached `Arc<LabelMap>` and build only on a miss. The key is **identity, never content**: `Module::checksum()`'s `Digest` + `Module::atom_table`'s `AtomSnapshot` + the module address. A synthetic image (all-zero checksum) is **never cached**; a second load of one `.beam` and a `Module::clone` each mint a fresh atom-table identity and so are a **miss** (one extra build, never a wrong map); the entry survives `Machine::reset`, and the `Arc` route holds the handle so its address cannot be recycled. Pinned by `src/machine/label_cache_tests.rs` (the `interpreter::label_map_builds()` tally) over the seven `label_cache.rs` unit tests; measured in `MEASURED.md`'s label-map-cache section.
+- **The label-map cache (`label_cache.rs`).** `build_label_map` is a whole-module value (one traversal per function plus the module's entire import table) and a pure function of the module's immutable content, so `Machine::label_map(&mut self, &Module)` / `Machine::label_map_arc(&mut self, &Arc<Module>)` answer a cached `Arc<LabelMap>` and build only on a miss.
+  The cache is a **bounded LRU**: `LabelMaps` holds up to `LABEL_MAP_CAPACITY` (32) `Entry { key, held, map, stamp }` in a `Vec`, `stamp` is a monotone use counter, a hit bumps the entry's stamp **in place** (the `Vec` is never reordered — a move-to-front would memmove up to `capacity` entries on every probe, the regression `local_callee.rs`'s memo documents), and a miss inserts as most-recently-used and, when full, evicts the entry with the smallest stamp (`swap_remove`, so only the eviction path scans).
+  An eviction is only a performance event: the evicted module's next probe rebuilds the identical map, never serves a stale one.
+  Capacity 32 covers the working set of a compile-shaped run (entry module + the 10–20 distinct in-machine callees of a phase), and retention is bounded by `capacity × live machines` because label maps are per-machine copies.
+  The key is **identity, never content**: `Module::checksum()`'s `Digest` + `Module::atom_table`'s `AtomSnapshot` + the module address — the digest covers exactly the chunks the map derives from (`Code` label slots, `AtU8`/`ImpT` imports), the atom snapshot witnesses the namespace the import *names* were resolved against, and the address is what `LabelMap::imports_owner` checks, so a hit is byte-identical to a fresh build and the key may never hold anything runtime-mutable.
+  A synthetic image (all-zero checksum) is **never cached**; a second load of one `.beam` and a `Module::clone` each mint a fresh atom-table identity and so are a **miss** (one extra build, never a wrong map); the entries survive `Machine::reset` (which does clear the context registry, so a nested run re-resolves its callees through the `Arc` route — the alternation the LRU exists for), and the `Arc` route holds the handle so its address cannot be recycled (a hit on a bare-route entry installs it).
+  Pinned by `src/machine/label_cache_tests.rs` (the `interpreter::label_map_builds()` tally: one build per module, and 2 builds for an A→B→A→B→A run alternation) over the `label_cache.rs` unit tests (hit/alternation at capacity `C` vs 1, LRU eviction, cached-vs-fresh equality over the whole label and import id range); measured in `MEASURED.md`'s label-map-cache section.
 - **Run entries (`run.rs`).** `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome` (blocking-aware; `RunOutcome { Returned(Eterm), Wait { func, pc }, Suspend { func, pc } }`), plus the tier-aware `run_with_tier`/`run_export_outcome_with_tier`/`run_label_outcome_with_tier`/`resume_outcome_with_tier`. `run_export` resolves `function/arity`'s export entry label, seeds `x[0..arity]` from `args`, pushes the bottom frame, runs to `return`, yields `x(0)`; `run_label` runs a raw entry label; a missing export/label is a typed error. The loop is `run_loop`/`run_loop_with_map` (`src/interpreter/dispatch.rs`), thin wrappers over `Machine::drive`.
 - **The uniform raise funnel (`catch.rs`).** `throw`/`throw_error`/`throw_with_trace` are the raise/unwind entries the families call; `throw_with_trace` first **rebuilds the raise-time frame snapshot** (the **raising** frame from `current_code`/`current_context`, then every live caller innermost-first, each in its own module context) *before* any unwind, so it survives on **both** the caught and the uncaught path. The symbolic `StackTrace` an **uncaught** raise carries is attached not at the raise site but by the single funnel `Machine::with_uncaught_frames(err, entry_module, func, pc)` as the raise leaves the machine (at the `step_instruction`/`drive` boundary), so **every** raise kind gets the same frames -- only when `raise.stacktrace.is_empty()` and the reason is not an engine diagnostic. A **caught** raise carries no symbolic trace; the same raise-time snapshot is what `Instr::BuildStacktrace` cooks into the `try … catch C:R:S` binding.
 - **Module contexts (`context.rs`).** A `call_ext*` the host resolved through `resolve_external_call` executes the callee **in this machine**, so `(func, pc)` are indices into *another* module's table and the machine must remember which. `Contexts` registers/dedups a `ModuleContext { module: Arc<Module>, labels }` by `Arc::ptr_eq` (context `0` is the run's **entry** module, which the machine never owns -- `entry_literals` records its literal area). `switch_context(id)` re-binds `literals` and an unregistered id is the typed `error::unsupported`. `reset` clears the set; a **resume does not** (a suspended cross-module frame must still name its module).
@@ -315,9 +415,9 @@ The wall-clock record and the full per-round tables (moved from `MEASURED.md`, b
 Headline: the cache alone is an interpreter median **0.9861** (sign 14/15) and a baseline-JIT median **0.9662** (sign 12/15) on `cowboy_bstr:to_lower/1`, i.e. ~1.4 % / ~3.4 %; it costs a reproducible ~+20 ns/run (+16 % of the `engine_bench` `setup/empty` floor) on the never-cached synthetic route.
 
 ## Measured (per-`Machine` label-map cache)
-`src/machine/label_cache.rs` caches **one** `Arc<LabelMap>` per `Machine` (key = `Module::checksum()`'s `Digest` + `AtomSnapshot` + module address; a synthetic all-zero-checksum image is **never** cached), so a `run_*` entry re-entering a module does not rebuild the module-wide `LabelMap`. Mechanism/structural counter: the bullet in `## Measured (interpreter hot-loop micro-optimizations)`; this section is the wall clock, including the cost on the route the cache does not serve.
+`src/machine/label_cache.rs` caches up to `LABEL_MAP_CAPACITY` (32) `Arc<LabelMap>`s per `Machine` in a bounded LRU (key = `Module::checksum()`'s `Digest` + `AtomSnapshot` + module address; a hit bumps the entry's stamp in place, a miss inserts as most-recently-used and evicts the smallest stamp; a synthetic all-zero-checksum image is **never** cached), so a `run_*` entry re-entering a module does not rebuild the module-wide `LabelMap`. Mechanism/structural counter: the bullet in `## Measured (interpreter hot-loop micro-optimizations)`; this section is the wall clock, including the cost on the route the cache does not serve.
 **Protocol (both rows).** One benchmark process at a time, `taskset -c 3` + `setsid -w`, legs alternated back to back in one session with the visit order rotated per round, `/proc/loadavg` at both ends of every leg. All legs are one `dev`/`test` profile (`opt-level = 1`, deps at 2, `debug = 1`, debug-assertions on); comparing across profiles would invalidate the ratio. Three sides, all built in one session from `git archive` snapshots: `BASE` = `6ef145d8b1` (pre-cache), `CACHE` = `99d3fad27b` (the cache alone), `HEAD` = `8ab438477b` (= `CACHE` + the sibling census-latch commit `d01240e4`), because `HEAD/BASE` alone would credit a per-*entry* change with the latch's per-*instruction* win. The **ratio** is the figure: 1-min load ran **13–89** across these sessions, so absolute ns move by tens of percent.
-**Structural counter (deterministic — no timing).** `interpreter::label_map_builds()` (a `cfg(test)` tally), pinned by `machine::label_cache_tests::a_second_run_of_a_real_module_builds_no_label_map` over `erlc`-compiled fixtures: **1** build after a module's first `run_export`, still **1** after a second and third entry (**0** new builds); **2** after a *different* module's run, still 2 on its second entry; **1** after a **second load of the same bytes** (a fresh atom-table identity ⇒ one miss, then hits); **1** for a `Module::clone`; **n** after the *n*-th entry of a **synthetic** module. `machine::label_cache::tests` pins the key/route rules (7 tests, incl. the recycled-address ABA case) and `jit::baseline::tests::runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it` asserts `built_by_one_run == 0`. Green: `--lib -- label_cache` **9 passed**, `-- jit::baseline::tests::runs_reuse` **1 passed**.
+**Structural counter (deterministic — no timing).** `interpreter::label_map_builds()` (a `cfg(test)` tally), pinned by `machine::label_cache_tests::a_second_run_of_a_real_module_builds_no_label_map` over `erlc`-compiled fixtures: **1** build after a module's first `run_export`, still **1** after a second and third entry (**0** new builds); **2** after a *different* module's run, still 2 on its second entry; **1** after a **second load of the same bytes** (a fresh atom-table identity ⇒ one miss, then hits); **1** for a `Module::clone`; **n** after the *n*-th entry of a **synthetic** module. `machine::label_cache::tests` pins the key/route rules and the LRU policy (11 tests, incl. the recycled-address ABA case, the capacity-`C`-vs-1 alternation counts, the LRU eviction order and the cached-vs-fresh map equality) and `jit::baseline::tests::runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it` asserts `built_by_one_run == 0`. Green: `--lib -- label_cache` **14 passed**, `-- jit::baseline::tests::runs_reuse` **1 passed**.
 **Primary row — `--lib -- --ignored --nocapture foreign_bstr_to_lower_decomposition`** (`cowboy_bstr:to_lower/1`, a **real** `erlc` artifact: 5 functions / 129 instructions / **39** distinct labels, so the batch's first `run_*` entry builds the map once). `BENCH_ITERS=50000`, `BENCH_WARMUP=3000`, N=15; 1-min load 53.16–88.92. ns/call is the harness' **min** of 5 sub-runs; `CACHE/BASE`/`HEAD/BASE` are per-round paired ratios:
 | round | `BASE` interp | `CACHE` interp | `HEAD` interp | `CACHE/BASE` | `HEAD/BASE` | `BASE` baseline | `CACHE` baseline | `HEAD` baseline | `CACHE/BASE` | `HEAD/BASE` |
 |---|---|---|---|---|---|---|---|---|---|---|

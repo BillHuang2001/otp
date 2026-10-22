@@ -1,11 +1,17 @@
 # `emit/regalloc` — the register picker and the block's gate derivation
 
 ## Intent
-`regalloc.rs::allocate_registers`: the live-interval x-register selection (≤5 cache slots) and the three gates derived from the same scans — the Y publish/refresh triple (`y_last`/`y_first`/`frame_republish_first` → `prologue_publishes_y`) and the per-`pc` dirty set (`spill_sets`).
+`regalloc.rs::allocate_registers_with_labels`: the live-interval x-register selection (≤5 cache slots) and the three gates derived from the same scans — the Y publish/refresh triple (`y_last`/`y_first`/`frame_republish_first` → `prologue_publishes_y`) and the per-`pc` dirty set (`spill_sets`).
 The selector is a greedy linear scan by descending interval length, tie-broken by ascending register index; physical assignment is by first-appearance order, so it is deterministic.
 Membership is **fixed for the whole block** — the correctness contract that keeps the two representations from disagreeing.
 
-## Register picker (`regalloc.rs::allocate_registers`)
+## Register picker (`regalloc.rs::allocate_registers_with_labels`)
+The block's shape tests need the module-wide `LabelMap`, so it arrives as an argument: the compilation
+builds it once (`compile_module` in the eager layout, the caller in the lazy one, where `compile_function`
+receives it as a parameter) and threads it into `emit_function`/`emit_sub_blocks`/`emit_shared_sub_blocks`,
+so no IR block, function or continuation sub-block rebuilds it.
+`allocate_registers(module, code, start, end)` is the build-on-demand twin the in-crate unit tests call: it
+builds the map itself and delegates.
 Liveness-based, by **live interval**. `cacheable_touches` reports the x-register operands **of each
 instruction the tier would actually inline** (it mirrors each lowering's own shape test, so regalloc and
 `emit_block` agree); `cacheable_writes` reports the same instructions' destination registers. A candidate
@@ -23,7 +29,7 @@ Under `#[cfg(test)]` the scan also records live-range statistics on `Allocation`
 (`live_candidates` / `live_total` / `live_max`), which `counters::record_block` folds into the per-run
 structural counters; they hold no production state.
 
-`allocate_registers` also derives the block's Y-gate triple, all from the same `arith::uses_y` scan (the
+`allocate_registers_with_labels` also derives the block's Y-gate triple, all from the same `arith::uses_y` scan (the
 union of every lowering's per-shape Y test — including `bif::bif_uses_y` for the named-BIF accessors,
 whose `Value` route is never a Y-window access): `Allocation::y_last` (the highest pc whose instruction
 accesses a Y slot — the compile-time gate for the emitter's post-helper refresh), `Allocation::y_first`
@@ -38,7 +44,7 @@ and every way out of the middle lands in another emitted range with its own prol
 `highest_native_register`: a stack slot must not refuse native entry (the driver's bound is
 `machine.x.len() > bound`).
 
-`allocate_registers` also derives `Allocation::spill_sets` — the block's per-`pc` **dirty** set, the store
+`allocate_registers_with_labels` also derives `Allocation::spill_sets` — the block's per-`pc` **dirty** set, the store
 set every `spill` uses. It is a forward walk over the block: push the dirty set entering each instruction,
 union `cacheable_writes` when the instruction inlines (`is_inlined`, which mirrors the emitter's own
 compile-time inlining decision and is biased toward "inlined"), and clear it otherwise (a purely-helper

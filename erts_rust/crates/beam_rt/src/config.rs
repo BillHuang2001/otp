@@ -529,6 +529,19 @@ pub struct RuntimeConfig {
     pub max_ports: Option<usize>,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
+    /// The **plain arguments** — the command-line tokens `init` did not consume as a flag or
+    /// as a Start instruction (contract A.6; the source of `init:get_plain_arguments/0`).
+    ///
+    /// Exactly the C `init`'s `Args` accumulator (`erts/preloaded/src/init.erl:1669-1710`):
+    /// a stray **positional** token collected as an `arg`, in command-line order, followed —
+    /// when the command line carries `-extra` — by **every** token after it, verbatim (the
+    /// `start_extra_arg` clause's `lists:reverse(As, Bs)`). `-extra` itself is neither a
+    /// plain argument nor an init argument: it ends the switch surface, so nothing after it
+    /// is an init argument or a Start instruction either. Each entry is served as an Erlang
+    /// string (a char list) in this order, and an empty list — the
+    /// [`RuntimeConfig::default`] value, i.e. a bare invocation — is what
+    /// `init:get_plain_arguments/0` answers when the command line carried neither.
+    pub plain_args: Vec<String>,
     /// The boot script this invocation drives, as the CLI **resolved** it: the explicit
     /// `-boot FILE` value when one was given, else `init`'s own default (the literal
     /// `start`) — for every action but `-version`, which boots nothing.
@@ -566,9 +579,9 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
     /// path (both the `-pa` head and the `-pz` tail), a [`DEFAULT_HEAP_WORDS`]-word heap,
-    /// the emulator's heap-size defaults, no init arguments, [`Action::Boot`], no
-    /// port-table request, no explicit online scheduler count, no resolved boot script and
-    /// no environment variables.
+    /// the emulator's heap-size defaults, no init arguments, no plain arguments,
+    /// [`Action::Boot`], no port-table request, no explicit online scheduler count, no
+    /// resolved boot script and no environment variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
@@ -579,6 +592,7 @@ impl Default for RuntimeConfig {
             heap: HeapOptions::default(),
             max_ports: None,
             init_args: InitArgs::default(),
+            plain_args: Vec::new(),
             resolved_boot_script: None,
             action: Boot,
             perf_map: PerfMapConfig::new(),

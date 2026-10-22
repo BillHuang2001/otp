@@ -70,6 +70,9 @@
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
+//! * `root_tests` — the pins for [`Machine::for_each_root`] (the read-only
+//!   pointer-bearing root enumeration): coverage of every rooted file plus the loose
+//!   terms, the immediate filter, and agreement with the [`RootSet`] hand-off.
 //! * `deadline_tests` — the parked-`receive` deadline driven to completion on a real
 //!   compiled module (`erlc`) and cross-checked against the system `erl`, including the
 //!   nested / blocking run path a fired `after T` has to work through.
@@ -110,6 +113,8 @@ mod registers;
 mod run;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod root_tests;
 #[cfg(test)]
 pub(crate) mod test_support;/// Process-state core: x-register file, Erlang stack and call-frame stack.
 pub struct Machine {
@@ -190,6 +195,28 @@ pub struct Machine {
     pub(crate) catch_frames: Vec<CatchFrame>,
     /// The pending exception `(class, reason)` recorded by [`Machine::throw`],
     /// if any.
+    ///
+    /// `class` is metadata ([`ExceptionClass`]); `reason` is a **process-heap term**.
+    /// Its one writer is [`Machine::throw_with_trace`], its one clear site
+    /// [`Machine::reset`], and a host reads it through
+    /// [`Machine::pending_exception`]/[`Machine::pending_exception_mut`] — which is why
+    /// the field stays `pub(crate)` rather than becoming a public one.
+    ///
+    /// **Rooting invariant: the reason is parked at the stack tail by
+    /// [`Machine::with_roots`] at every GC admission point and re-seated afterwards**, so
+    /// it is a live root by construction — no door has to remember to publish it, and no
+    /// liveness filter can drop it. A word a host reads out of this field has therefore
+    /// already been relocated by every collection that preceded the read.
+    /// The parking set is the machine's *loose* heap terms:
+    /// this reason plus the two failed-clause argument latches
+    /// ([`Machine::raise_function_clause_args`], [`Machine::pending_function_clause_args`]).
+    ///
+    /// **Retained past landing.** C clears `c_p->fvalue = NIL` once `handle_error` has
+    /// moved the value into `reg[1]`
+    /// (`../../erts/emulator/beam/beam_common.c:527`); the engine keeps the pair until the
+    /// next raise or [`Machine::reset`], which is sound *precisely because* the reason is
+    /// rooted here (C's `setup_rootset` roots `fvalue`/`ftrace` for exactly the window it
+    /// exists — `../../erts/emulator/beam/erl_gc.c:2676-2693`).
     pub(crate) pending_exception: Option<(ExceptionClass, Eterm)>,
     /// The exception-class atoms (`error`, `exit`, `throw`) resolved from the
     /// running module's atom table, indexed by [`exception_class_index`];
@@ -260,9 +287,12 @@ pub struct Machine {
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
     pub(crate) context: u32,
-    /// The **label-map cache**: one already-built module-wide label index (plus the
-    /// import table derived from it), for the module this machine most recently
-    /// entered.
+    /// The **label-map cache**: a bounded LRU (`label_cache::LABEL_MAP_CAPACITY`, 32
+    /// entries) of already-built module-wide label indexes (plus the import table derived
+    /// from each), so a re-entered module does not rebuild its own — including the modules
+    /// a run enters as in-machine cross-module callees, which are resolved through
+    /// [`Machine::label_map_arc`] from the module-context registry and re-registered on
+    /// every run because [`Machine::reset`] clears that registry.
     ///
     /// [`interpreter::build_label_map`](crate::interpreter) is a whole-module value —
     /// a traversal of every function's label table plus a resolution of the whole
@@ -274,8 +304,9 @@ pub struct Machine {
     /// **Content-keyed, not run-keyed**, so [`Machine::reset`] deliberately does
     /// **not** clear it: a machine that runs one module repeatedly builds its map once.
     /// The key is the module's load-time digest plus its atom-table snapshot plus its
-    /// address — see `label_cache.rs` for why that triple is sound on the bare
-    /// `&Module` route and why a synthetic (all-zero-checksum) module is never cached.
+    /// address — see `label_cache.rs` for why that triple proves image identity, why the
+    /// bare `&Module` route can never stale-hit a recycled address, and why a synthetic
+    /// (all-zero-checksum) module is never cached.
     pub(crate) label_maps: LabelMaps,
     /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
     /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
@@ -286,6 +317,12 @@ pub struct Machine {
     /// call-frame stack, so the handler's `build_stacktrace` (and the uncaught
     /// funnel [`Machine::with_uncaught_frames`]) can still name the frames the
     /// raise unwound out of. Read back through [`Machine::raise_snapshot`].
+    ///
+    /// A raise that **supplies** its trace ([`Machine::pending_supplied_term`],
+    /// [`Machine::pending_supplied_trace`]) does **not** rebuild it: nothing is
+    /// derived at a re-raise site (C's `raw_raise` clears `EXF_SAVETRACE`), so the
+    /// chain of the exception being re-raised survives the landing and is what that
+    /// raise carries out of the machine.
     ///
     /// Cleared by [`Machine::reset`] (the snapshot belongs to the run that is
     /// starting) but **not** by a resume ([`Machine::resume_outcome`]), which must
@@ -370,6 +407,23 @@ pub struct Machine {
     /// — a raise with no live catch frame — cannot leave stale frames for a later,
     /// unrelated cooked trace to inherit.
     pub(crate) pending_supplied_trace: Option<StackTrace>,
+    /// A **one-shot latch**: the trace **term** the raise about to land supplies
+    /// ([`Instr::RawRaise`](beam_loader::Instr)'s `x(2)` operand, C's `c_p->ftrace`).
+    ///
+    /// C's `raw_raise` stores `x(2)` in `c_p->ftrace` and clears `EXF_SAVETRACE`
+    /// (`../../erts/emulator/beam/beam_common.c:1148-1179`), so `save_stacktrace`
+    /// does **not** run (its guard is `freason & EXF_SAVETRACE`, `:505-507`) and no
+    /// re-raise-site frame is ever prepended: `build_stacktrace` returns the stored
+    /// trace verbatim (`:1219-1223`).
+    ///
+    /// Armed by [`Instr::RawRaise`](beam_loader::Instr) **immediately before** the
+    /// [`Machine::raise_supplied`] that lands the raise and consumed by that call
+    /// (see [`Machine::raise_supplied_term`]). What rides here is the **cooked**
+    /// trace term of the exception being re-raised — the landed `x(2)` when the
+    /// landing published one, else the [`Machine::raise_snapshot`] chain cooked
+    /// once, rooted, at the `raw_raise` site — so C's raw object is modelled as a
+    /// real Erlang term and needs no second derivation.
+    pub(crate) pending_supplied_term: Option<Eterm>,
     /// The **live raise** state behind [`Machine::pending_supplied_trace`]: the
     /// explicit frames the raise currently in flight arrived carrying.
     ///
@@ -383,6 +437,28 @@ pub struct Machine {
     /// machine-held heap term, so they need no rooting across the cooked trace's
     /// reservation.
     pub(crate) raise_supplied_trace: Option<StackTrace>,
+    /// The **live raise** state behind [`Machine::pending_supplied_term`]: the trace
+    /// **term** the raise currently in flight supplies (C's `c_p->ftrace` after
+    /// `raw_raise`).
+    ///
+    /// [`Machine::throw_with_trace`] sets it (from the one-shot latch) on **every**
+    /// raise, so a raise that supplies no trace clears it. It is consumed **exactly
+    /// once**, by whichever of the two destinations the raise takes:
+    ///
+    /// * a **landed** (caught) raise publishes it as the handler's `x(2)`
+    ///   ([`Machine::land_exception`]), i.e. C's register convention, so the
+    ///   handler's own `build_stacktrace`/`raw_raise` re-reads the very term the
+    ///   raise arrived with;
+    /// * an **uncaught** raise renders the chain it preserves through
+    ///   [`Machine::with_uncaught_frames`] ([`Machine::raise_snapshot`] is *not*
+    ///   rebuilt for a supplied raise, so it still holds the re-raised exception's
+    ///   frames).
+    ///
+    /// A raise that supplies a trace makes **no allocation** between arming the
+    /// one-shot latch and publishing the term, and the published `x(2)` register is
+    /// inside the frozen root set ([`crate::context::RootSet`]), so the term never
+    /// needs parking in [`Machine::with_roots`].
+    pub(crate) raise_supplied_term: Option<Eterm>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -665,7 +741,9 @@ impl Machine {
             pending_function_clause_args: None,
             raise_function_clause_args: None,
             pending_supplied_trace: None,
+            pending_supplied_term: None,
             raise_supplied_trace: None,
+            raise_supplied_term: None,
             refc_binaries: Vec::new(),
             writable_payloads: Vec::new(),
             args_scratch: Vec::new(),
@@ -739,32 +817,37 @@ impl Machine {
     /// keep a term alive, never free a live one). The root-set contract itself is
     /// the frozen one on [`RootSet`].
     ///
-    /// # The machine-held heap terms `f` also roots
+    /// # The machine's loose heap terms `f` also roots
     ///
-    /// A raise parks heap terms in `Machine` fields that are **not** part of the
-    /// frozen [`RootSet`]: the two failed-clause argument latches
+    /// `Machine` holds heap terms in fields that are **not** part of the frozen
+    /// [`RootSet`] — its *loose* heap terms ([`Machine::loose_heap_terms`]): the two
+    /// failed-clause argument latches
     /// ([`Machine::pending_function_clause_args`] — armed immediately before the
     /// `throw_with_trace` that lands the raise, so never live across an allocation —
     /// and [`Machine::raise_function_clause_args`] — the **live raise** state the
-    /// cooked-trace builders read *after* their rooted reservation). A collecting
-    /// host must relocate those terms too, so this method **parks** whichever of the
-    /// two is armed at the end of the **Erlang stack** for the duration of `f` and
+    /// cooked-trace builders read *after* their rooted reservation) **and the pending
+    /// exception's reason** ([`Machine::pending_exception`], which stays readable for the
+    /// rest of the run because the engine — unlike C — does not clear it at landing).
+    /// A collecting host must relocate those terms too, so this method **parks** whichever
+    /// are armed at the end of the **Erlang stack** for the duration of `f` and
     /// **re-seats** each field from its slot afterwards — the stack is part of the
     /// frozen root set and is rooted in full (there is no liveness map over Y slots),
-    /// so a conforming host that only scans `x[0..live_len()]` roots the parked term
+    /// so a conforming host that only scans `x[0..live_len()]` roots the parked terms
     /// regardless of the `live` hint. The parked words lengthen `roots.stack` by at
-    /// most two; over-approximating a root set is always safe for a copying
-    /// collector, and the length is restored before this method returns, so no
-    /// engine state observes the temporary words.
+    /// most [`Machine::LOOSE_HEAP_TERMS`]; over-approximating a root set is always safe
+    /// for a copying collector, and the length is restored before this method returns,
+    /// so no engine state observes the temporary words.
     ///
-    /// When no latch is armed (the overwhelming majority of hand-offs) the stack is
-    /// untouched and this method is byte-identical to the pre-parking behavior.
+    /// Parking here — in the ONE funnel behind [`Machine::alloc_rooted`] and
+    /// [`Machine::ensure_heap`], hence behind every term-allocation and heap-admission
+    /// door on every tier — is what makes a loose field relocation-safe **by
+    /// construction**: a host cannot leave one stale, and no liveness filter has to be
+    /// remembered. (C's equivalent is `setup_rootset`'s `fvalue`/`ftrace` entries plus
+    /// `offset_rootset` writing the relocated words back into the PCB —
+    /// `../../erts/emulator/beam/erl_gc.c:2676-2693`, `:3513-3514`.)
     ///
-    /// [`Machine::pending_exception`]'s reason term is deliberately **not** parked
-    /// here: it is a copy of the word `land_exception` publishes in `x(1)`/`x(3)`,
-    /// so it is already relocated through the ordinary root set on the caught path
-    /// (and rides out of the machine in the raise's live-reason slot on the uncaught
-    /// path, never re-read from the field).
+    /// When no loose term is held the stack is untouched and this method is
+    /// byte-identical to the pre-parking behavior.
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
         // The receiver is handed mutable slices of BOTH register files, but only the
         // **prefix that can hold a term**: every slot at or beyond the run's used extent
@@ -775,36 +858,155 @@ impl Machine {
         let fr_live = self.used_fr_extent() as usize;
         self.note_x_dirty(x_live as u32);
         self.note_fr_dirty(fr_live as u32);
-        let raise_args = self.raise_function_clause_args;
-        let pending_args = self.pending_function_clause_args;
-        if raise_args.is_none() && pending_args.is_none() {
+        let loose = self.loose_heap_terms();
+        if loose.iter().all(Option::is_none) {
             let roots = RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
             return f(roots);
         }
-        // A raise is in flight and holds at least one heap-term latch: park them so the
-        // host roots (and relocates) them, then re-seat them from the slots the host
-        // wrote back through.
+        // The machine holds at least one heap term outside the root-set files: park them
+        // so the host roots (and relocates) them, then re-seat them from the slots the
+        // host wrote back through.
+        let (result, reseated) = self.with_parked_loose_terms(x_live, fr_live, live, loose, f);
+        self.seat_loose_heap_terms(reseated);
+        result
+    }
+
+    /// How many loose heap-term slots [`Machine::with_roots`] can park.
+    ///
+    /// The length of [`Machine::loose_heap_terms`]: the two failed-clause argument latches
+    /// plus the pending exception's reason.
+    const LOOSE_HEAP_TERMS: usize = 3;
+
+    /// The machine's **loose heap terms**: the `Eterm`-typed fields that hold a
+    /// process-heap term but are **not** part of the frozen [`RootSet`].
+    ///
+    /// Read by [`Machine::with_roots`], which parks the armed entries at the tail of the
+    /// Erlang stack, and written back by [`Machine::seat_loose_heap_terms`] in the same
+    /// order — so **adding a loose field means adding it here and nowhere else**. `None`
+    /// means "this field holds no term right now" and parks (and re-seats) nothing.
+    fn loose_heap_terms(&self) -> [Option<Eterm>; Self::LOOSE_HEAP_TERMS] {
+        [
+            self.raise_function_clause_args,
+            self.pending_function_clause_args,
+            self.pending_exception.map(|(_class, reason)| reason),
+        ]
+    }
+
+    /// Park every armed entry of `loose` at the tail of the Erlang stack, hand `f` the
+    /// [`RootSet`] (which then carries them), and answer `f`'s result together with the
+    /// words read back from the parking slots.
+    ///
+    /// A `None` read-back means its slot was not readable afterwards — the host would have
+    /// to move a slot out of the `&mut [Eterm]` it was handed to manage that — and is
+    /// reported as `None` rather than substituted. The stack length is restored before
+    /// returning, so the parked words never survive this call.
+    fn with_parked_loose_terms<R>(
+        &mut self,
+        x_live: usize,
+        fr_live: usize,
+        live: u32,
+        loose: [Option<Eterm>; Self::LOOSE_HEAP_TERMS],
+        f: impl FnOnce(RootSet<'_>) -> R,
+    ) -> (R, [Option<Eterm>; Self::LOOSE_HEAP_TERMS]) {
         let base = self.stack.len();
-        if let Some(term) = raise_args {
-            self.stack.push(term);
-        }
-        if let Some(term) = pending_args {
-            self.stack.push(term);
+        for term in loose.iter().flatten() {
+            self.stack.push(*term);
         }
         let result = {
             let roots = RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
             f(roots)
         };
+        let mut reseated = [None; Self::LOOSE_HEAP_TERMS];
         let mut cursor = base;
-        if raise_args.is_some() {
-            self.raise_function_clause_args = self.stack.get(cursor).copied();
-            cursor += 1;
-        }
-        if pending_args.is_some() {
-            self.pending_function_clause_args = self.stack.get(cursor).copied();
+        for (slot, parked) in reseated.iter_mut().zip(loose.iter()) {
+            if parked.is_some() {
+                *slot = self.stack.get(cursor).copied();
+                cursor += 1;
+            }
         }
         self.stack.truncate(base);
-        result
+        (result, reseated)
+    }
+
+    /// Write the re-seated loose heap terms back into their fields, in
+    /// [`Machine::loose_heap_terms`] order.
+    ///
+    /// A `None` entry leaves its field **exactly as it was** (see
+    /// [`Machine::with_parked_loose_terms`]): dropping a live raise on an unexpected
+    /// read-back would be silent data loss, and the pre-hand-off word is the only
+    /// candidate left.
+    fn seat_loose_heap_terms(&mut self, terms: [Option<Eterm>; Self::LOOSE_HEAP_TERMS]) {
+        if let Some(term) = terms[0] {
+            self.raise_function_clause_args = Some(term);
+        }
+        if let Some(term) = terms[1] {
+            self.pending_function_clause_args = Some(term);
+        }
+        if let (Some(term), Some((_class, reason))) = (terms[2], self.pending_exception.as_mut()) {
+            *reason = term;
+        }
+    }
+
+    /// Walk every **pointer-bearing root word** this machine holds, skipping immediates.
+    ///
+    /// # What it enumerates
+    ///
+    /// Exactly the words [`Machine::with_roots`] hands a host, minus every word that
+    /// cannot name a heap object: the **used prefix** of the X-register file
+    /// ([`Machine::used_x_extent`]), the **whole** Erlang stack (every Y slot of every
+    /// live frame — it has no liveness map), the used prefix of the FR file
+    /// ([`Machine::used_fr_extent`]) and then the machine's **loose heap terms**
+    /// ([`Machine::loose_heap_terms`]: the two failed-clause argument latches and the
+    /// pending exception's live reason) — the same fields and the same extent accessors
+    /// `with_roots` uses, so the two can never disagree about *what* is rooted.
+    ///
+    /// A word is handed to `f` only when its primary tag is `LIST` or `BOXED`
+    /// ([`beam_term::primary_tag`]), i.e. when it may hold a pointer into a heap: a small
+    /// integer, an atom, a pid/port/reference, `NIL` and every other immediate is
+    /// skipped, because relocating it would be meaningless. A `LIST`/`BOXED` word is
+    /// handed over **verbatim** — a static literal is included (it carries the
+    /// [`beam_term::literal::TAG_LITERAL_PTR`] bit on a `LIST`/`BOXED` tag), so a visitor
+    /// that moves things must itself leave a literal word alone, exactly as it must when
+    /// it is handed the [`RootSet`].
+    ///
+    /// # What it does NOT cover
+    ///
+    /// **`args_scratch`** — the `call_bif` argument window is `mem::take`n *out* of the
+    /// machine for the whole wide dispatch, so it is unreachable from any door and is not
+    /// enumerated here (a host that must root it does so for the window's duration).
+    /// `class_atoms` is not a gap: those are immediates. A foreign (`literal`-area) term
+    /// and any host-side structure holding engine terms are likewise outside this walk.
+    ///
+    /// # Why it is read-only
+    ///
+    /// The walk is `&self` and hands out **copies**, so it can census reachability but
+    /// cannot relocate: a collecting host must still go through
+    /// [`Machine::with_roots`]'s mutable slices to write a moved word back. It allocates
+    /// nothing, collects nothing and changes no machine state, which is what makes it
+    /// safe to call between any two instructions.
+    pub fn for_each_root(&self, mut f: impl FnMut(Eterm)) {
+        let x_live = self.used_x_extent() as usize;
+        let fr_live = self.used_fr_extent() as usize;
+        for &word in &self.x[..x_live] {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for &word in &self.stack {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for &word in &self.fr[..fr_live] {
+            if is_pointer_root(word) {
+                f(word);
+            }
+        }
+        for term in self.loose_heap_terms().into_iter().flatten() {
+            if is_pointer_root(term) {
+                f(term);
+            }
+        }
     }
 
     /// Allocate `n` heap words **with the live root set handed to `ctx`**, so a
@@ -1272,4 +1474,25 @@ impl Default for Machine {
     fn default() -> Machine {
         Machine::new()
     }
+}
+
+/// Whether `word` may hold a **pointer into a heap** — i.e. whether it is a root a
+/// collector would have to relocate.
+///
+/// [`Machine::for_each_root`]'s filter: a `LIST` (cons cell) or `BOXED` (header-tagged
+/// boxed object) primary tag carries an address, so the word is a root; everything with
+/// the `IMMED1` primary tag (small integers, atoms, pids, ports, references, `NIL` and
+/// every other immediate) is a value the word itself *is*, so it can never be moved and
+/// is not reported. A `HEADER` primary tag is not a valid term word at all and is
+/// likewise not reported.
+///
+/// A static-literal pointer keeps its `LIST`/`BOXED` primary tag (the literal-area bit is
+/// [`beam_term::literal::TAG_LITERAL_PTR`], outside the 2-bit primary tag), so it **is**
+/// reported — a collector must know it exists in order to leave it alone.
+#[inline]
+fn is_pointer_root(word: Eterm) -> bool {
+    matches!(
+        beam_term::primary_tag(word),
+        beam_term::PrimaryTag::List | beam_term::PrimaryTag::Boxed
+    )
 }

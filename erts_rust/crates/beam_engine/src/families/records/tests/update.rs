@@ -140,33 +140,74 @@ fn put_record_branches_to_fail_on_an_absent_update_field() {
 }
 
 #[test]
-fn put_record_with_no_fail_raises_function_clause() {
+fn put_record_with_no_fail_raises_badfield_naming_the_record_and_field() {
+    // `erl_update_native_record` sets `p->fvalue = TUPLE2(TUPLE2(defp->module,
+    // defp->name), new_p[0]); p->freason = EXC_BADFIELD` for the unconsumed update
+    // entry (`erl_record.c:746-756`) and only then takes
+    // `$FAIL_HEAD_OR_BODY($Fail)` (`emu/instrs.tab:1418-1431`), so `NO_FAIL` raises
+    // class `error` with `{badfield, {{Module,Name}, Field}}` — never the bare
+    // `function_clause`.
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
-    let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
+    let (rec, _a, _b, r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
-    fx.atom("function_clause");
+    let badfield = fx.atom("badfield");
+    fx.atom("error");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(
+    let result = run(
         fx.module(),
-        run(
-            fx.module(),
-            &LabelMap::new(),
-            &mut machine,
-            &Instr::PutRecord(Box::new(PutRecordArgs {
-                fail: NO_FAIL,
-                id: Operand::Nil,
-                src: Operand::X(0),
-                dst: Operand::X(0),
-                live: 1,
-                updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-            })),
-            &mut ctx,
-        ),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::PutRecord(Box::new(PutRecordArgs {
+            fail: NO_FAIL,
+            id: Operand::Nil,
+            src: Operand::X(0),
+            dst: Operand::X(0),
+            live: 1,
+            updates: vec![(Operand::Atom(z), Operand::Integer(9))],
+        })),
+        &mut ctx,
     );
-    assert_eq!(reason, "function_clause");
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_field_failure_reason(reason, badfield, fx.module().name, r, z);
+    assert_eq!(machine.x(0), Some(rec), "the destination is untouched on a raise");
+}
+
+#[test]
+fn put_record_with_no_fail_names_the_definition_owner_not_the_running_module() {
+    // The `{{Module,Name}, Field}` payload names the **definition's** identity
+    // (`defp->module`/`defp->name`), which for a record created in another module is
+    // that module — not the module executing the instruction.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (other, r, a) = (fx.atom("other"), fx.atom("r"), fx.atom("a"));
+    let z = fx.atom("z");
+    let badfield = fx.atom("badfield");
+    fx.atom("error");
+    let rec = record(&mut ctx, other, r, false, &[(a, make_small(11))]);
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(0, rec).unwrap();
+
+    let result = run(
+        fx.module(),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::PutRecord(Box::new(PutRecordArgs {
+            fail: NO_FAIL,
+            id: Operand::Nil,
+            src: Operand::X(0),
+            dst: Operand::X(0),
+            live: 1,
+            updates: vec![(Operand::Atom(z), Operand::Integer(9))],
+        })),
+        &mut ctx,
+    );
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_field_failure_reason(reason, badfield, other, r, z);
 }
 
 #[test]
@@ -312,34 +353,39 @@ fn update_record_id_branches_to_fail_on_an_absent_update_field() {
 }
 
 #[test]
-fn update_record_id_with_no_fail_raises_function_clause() {
+fn update_record_id_with_no_fail_raises_badfield_naming_the_record_and_field() {
+    // `update_record_id` lowers to the same `i_update_native_record`
+    // (`emu/ops.tab:1689-1691`), so `NO_FAIL` is the same
+    // `{badfield, {{Module,Name}, Field}}` class-`error` raise
+    // (`erl_record.c:746-756`).
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
-    let (rec, _a, _b, _r) = two_field_record(&mut fx, &mut ctx);
+    let (rec, _a, _b, r) = two_field_record(&mut fx, &mut ctx);
     let z = fx.atom("z");
-    fx.atom("function_clause");
+    let badfield = fx.atom("badfield");
+    fx.atom("error");
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
 
-    let reason = raise_reason_atom(
+    let result = run(
         fx.module(),
-        run(
-            fx.module(),
-            &LabelMap::new(),
-            &mut machine,
-            &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
-                fail: NO_FAIL,
-                hint: Operand::Nil,
-                id: Operand::Nil,
-                src: Operand::X(0),
-                dst: Operand::X(0),
-                live: 1,
-                updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-            })),
-            &mut ctx,
-        ),
+        &LabelMap::new(),
+        &mut machine,
+        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
+            fail: NO_FAIL,
+            hint: Operand::Nil,
+            id: Operand::Nil,
+            src: Operand::X(0),
+            dst: Operand::X(0),
+            live: 1,
+            updates: vec![(Operand::Atom(z), Operand::Integer(9))],
+        })),
+        &mut ctx,
     );
-    assert_eq!(reason, "function_clause");
+    let (class, reason) = raised_reason(&machine, &result);
+    assert_eq!(class, beam_common::ExceptionClass::Error);
+    assert_field_failure_reason(reason, badfield, fx.module().name, r, z);
+    assert_eq!(machine.x(0), Some(rec), "the destination is untouched on a raise");
 }
 
 #[test]

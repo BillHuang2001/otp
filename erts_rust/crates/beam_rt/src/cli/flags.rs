@@ -243,6 +243,110 @@ pub(super) fn parse_sbt(switch: &str, value: &str) -> Result<()> {
     }
 }
 
+/// `ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS` (`erts/emulator/beam/erl_process.h:84`).
+const ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS: i64 = 1024;
+
+/// Scans one `%d`-style field the way `sscanf` does: leading whitespace is skipped, an
+/// optional sign and the following digits are the number, and the **rest** of the input is
+/// returned untouched (`sscanf`'s prefix match, not a whole-string parse). `None` when no
+/// digit follows the optional sign.
+fn scan_decimal(value: &str) -> Option<(i64, &str)> {
+    let trimmed = value.trim_start_matches(|c: char| c.is_whitespace());
+    let bytes = trimmed.as_bytes();
+    let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return None;
+    }
+    let number = trimmed[..end].parse::<i64>().ok()?;
+    Some((number, &trimmed[end..]))
+}
+
+/// The scheduler-specifier **shape** the C's `sscanf` readers accept, as
+/// `(total, online)` with a field `None` when the specifier does not give it.
+///
+/// This is the shared grammar of `+S`, `+SP`, `+SDcpu` and `+SDPcpu`
+/// (`erts/emulator/beam/erl_init.c:970-1075`, `:1109-1160`): `%d` (the total alone),
+/// `%d:%d` (both counts) and `:%d` (the C's `sscanf(arg, ":%d")` fallback, where only the
+/// online count is given). A missing or non-numeric total with no second field, or a value
+/// with no numeric field at all, is the C's `bad … specifier` rejection and yields `None`.
+///
+/// Because it is a prefix scanner, trailing junk after a complete match is ignored exactly
+/// as `sscanf` ignores it (`+S 4x` is the C's 4), and a `:` whose second field does not
+/// scan leaves the online count unset (the C's `sscanf` returns 1 there).
+fn scheduler_spec(value: &str) -> Option<(Option<i64>, Option<i64>)> {
+    if let Some((total, rest)) = scan_decimal(value) {
+        let online = rest
+            .strip_prefix(':')
+            .and_then(scan_decimal)
+            .map(|(online, _)| online);
+        return Some((Some(total), online));
+    }
+    let (online, _) = scan_decimal(value.strip_prefix(':')?)?;
+    Some((None, Some(online)))
+}
+
+/// Validates a `+SP<value>` / `+SDPcpu<value>` scheduler **percentage** specifier
+/// (`erl_init.c:965-1000`, `:1002-1035`): the [`scheduler_spec`] shape, with every field
+/// it gives required to be non-negative (the C's `if (ptot < 0 || ponln < 0) goto bad`).
+///
+/// `+SP50` reads as "50 % of the schedulers", `+SP:50` as "the online count only"; the
+/// percentages themselves are **not** applied — this runtime has no percentage sizing and
+/// no dirty schedulers, so the switch is validated and preserved verbatim in
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags)
+/// ([`crate::cli`]'s `+SP` arm) and has no runtime-visible effect. `+SPabc`, `+SP-5` and
+/// `+SP1:-5` are the C's `bad schedulers percentage specifier` rejection (exit 1).
+pub(super) fn parse_scheduler_percentage(switch: &str, value: &str) -> Result<()> {
+    match scheduler_spec(value) {
+        Some((total, online))
+            if total.is_none_or(|total| total >= 0)
+                && online.is_none_or(|online| online >= 0) =>
+        {
+            Ok(())
+        }
+        _ => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
+/// Validates a `+SDcpu<value>` dirty-CPU-scheduler specifier (`erl_init.c:1036-1080`):
+/// the [`scheduler_spec`] shape with **no** range check.
+///
+/// The C applies the two fields as a count (when positive) or as an **offset from the
+/// host's scheduler count** (when negative) and then range-checks the *result* against
+/// `ERTS_MAX_NO_OF_DIRTY_CPU_SCHEDULERS`, so a negative field is legal there
+/// (`+SDcpu-1` is "one fewer than the host has"). This runtime has no dirty schedulers at
+/// all, so only the shape is decided here — the value is preserved verbatim in
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) and has no
+/// runtime-visible effect. `+SDcpuabc`, `+SDcpu1:2:3` and a bare `+SDcpu:` are the C's
+/// `bad amount of dirty CPU schedulers` rejection (exit 1).
+pub(super) fn parse_dirty_schedulers(switch: &str, value: &str) -> Result<()> {
+    match scheduler_spec(value) {
+        Some(_) => Ok(()),
+        None => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
+/// Validates a `+SDio<value>` dirty-I/O-scheduler specifier (`erl_init.c:1081-1096`): the
+/// C `atoi`s the value (so trailing junk is ignored) and requires
+/// `1 <= value <= ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS`.
+///
+/// The count itself is **not** applied — this runtime has no dirty schedulers, so the
+/// value is preserved verbatim in
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) and has no
+/// runtime-visible effect. `+SDio0`, `+SDioabc` (its `atoi` is 0) and `+SDio2000` are the
+/// C's `bad number of dirty I/O schedulers` rejection (exit 1).
+pub(super) fn parse_dirty_io_schedulers(switch: &str, value: &str) -> Result<()> {
+    let schedulers = atoi(value);
+    if (1..=ERTS_MAX_NO_OF_DIRTY_IO_SCHEDULERS).contains(&schedulers) {
+        Ok(())
+    } else {
+        Err(error::bad_switch_value(switch, value))
+    }
+}
+
 /// `MIN_ATOM_TABLE_SIZE` (`erts/emulator/beam/atom.h:33`).
 ///
 /// `pub(crate)` because the `+t` effect (`crate::info::limits`) reads a preserved value

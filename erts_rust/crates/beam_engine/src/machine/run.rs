@@ -368,12 +368,15 @@ impl Machine {
     /// label's `(func, pc)`.
     ///
     /// The module-wide label index is built **at most once per module**, not once per
-    /// run: the entry label is resolved against [`Machine::label_map`]'s cache entry
-    /// and the very same map is handed to the dispatch loop, so a machine that runs one
-    /// module repeatedly pays the whole-module build (a traversal of every function's
-    /// label table plus the module's entire import table) on its first run only. A
-    /// synthetic module — the `Module::default()`-shaped image with no load-time digest
-    /// — is never cached and is built per run, exactly as before.
+    /// run: the entry label is resolved against [`Machine::label_map`]'s cache and the
+    /// very same map is handed to the dispatch loop, so a machine that runs one module
+    /// repeatedly pays the whole-module build (a traversal of every function's label
+    /// table plus the module's entire import table) on its first run only. The cache is a
+    /// bounded LRU, so that also holds for the modules a run enters as in-machine
+    /// callees (which [`Machine::reset`] re-registers on every run) as long as the
+    /// working set fits its capacity; a module it had to evict is rebuilt, never served
+    /// wrong. A synthetic module — the `Module::default()`-shaped image with no load-time
+    /// digest — is never cached and is built per run, exactly as before.
     pub fn run_label_outcome(
         &mut self,
         module: &Module,
@@ -572,9 +575,9 @@ mod tests {
     /// A run builds the module-wide label index **exactly once**.
     ///
     /// The module here is synthetic (no content identity, so `label_cache` never holds
-    /// it), so the single entry pays exactly one `build_label_map` — resolving the entry
-    /// label and the dispatch loop share that one map instead of each deriving its own.
-    /// The `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.
+    /// it), so the run pays exactly one `build_label_map` — resolving the entry label and
+    /// the dispatch loop share that one map instead of each deriving its own. The
+    /// `cfg(test)` counter ([`crate::interpreter`]) makes the count observable here.
     #[test]
     fn run_export_builds_the_label_map_exactly_once() {
         let (module, name) = module_with_code(

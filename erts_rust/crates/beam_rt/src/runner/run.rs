@@ -570,6 +570,15 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 /// set is left **empty** (cleared, never a placeholder), so a stale root can never keep an
 /// otherwise-dead term alive.
 ///
+/// The published word is a live term **by construction**, which is why it needs no liveness
+/// filter: `Machine::with_roots` parks the field on the Erlang stack for the duration of every
+/// allocation that may collect (`Machine::loose_heap_terms`) and re-seats it from the slot the
+/// host wrote back, and that funnel — behind `Machine::alloc_rooted` and `Machine::ensure_heap` —
+/// is behind **every** in-slice collection door on every tier. So a machine that has left the
+/// slice and parked here was never moved out from under the field, and the word is an
+/// immediate/a literal-area pointer (nothing a collection moves) or a container inside a region
+/// this process's collector relocates.
+///
 /// A `pid` with no process in `table` has nothing to publish into; the machine is left as it is.
 ///
 /// # `fr_count` — the live-FR prefix, never the whole file
@@ -622,6 +631,9 @@ pub(super) fn publish_parked_roots(
     let Some(process) = table.get_mut(pid) else {
         return;
     };
+    // The reason is a live word: `Machine::with_roots` re-seats the field after every collection
+    // that runs inside a slice (see the root-hand-off section above), so it names either an
+    // immediate/a literal or a container this process's collector relocates.
     machine.with_roots(RootSet::ALL_LIVE, |roots| {
         gc::publish_roots_full(process, &roots, fr_count)
     });

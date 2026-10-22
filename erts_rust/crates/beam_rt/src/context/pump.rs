@@ -20,12 +20,17 @@
 
 //! The nested-run pump: running a module export as a **scheduled process**.
 //!
-//! [`RuntimeContext::run_export`] drives one export on a fresh [`Machine`], and its blocking
+//! [`RuntimeContext::run_export`] drives one export on a pooled [`Machine`], and its blocking
 //! twins ([`RuntimeContext::run_export_blocking`] / [`RuntimeContext::run_label_blocking`])
 //! pump the scheduler while a cross-module callee is suspended in a `receive`, so the callee
 //! **suspends and resumes** instead of folding into the typed [`beam_engine::blocked`] gap.
 //! [`pump_until_returned`] is the shared bounded loop and [`BLOCKING_PUMP_DEADLINE`] its
 //! wall-clock safety cap.
+//!
+//! The machine each run executes on comes from [`super::machine_pool`], which recycles a
+//! finished run's machine instead of building a fresh one, so the engine's whole-module label
+//! map (and the register-file allocations) survive across cross-module calls into the same
+//! callee.
 
 use std::time::{Duration, Instant};
 
@@ -263,10 +268,15 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        // The fresh `Machine` below holds its `x`/stack outside the process root set a
+        // The `Machine` below holds its `x`/stack outside the process root set a
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // The **arena census**'s window for this run (`BEAM_RT_ARENA_TRACE`, a diagnostic only):
+            // every word the eager run allocates from the pointer-stable arena is attributed to it,
+            // so the census can say whether one nested run eats a compile's whole demand or
+            // thousands of them share it. `None` — and then nothing at all — when the census is off.
+            let _arena_window = crate::runtime::arena_census::Window::enter(this.runtime);
             // The NIF-resource prune's scope for this run: the candidate set as it stands *before*
             // the run starts, so its epilogue may release only the resource terms this run itself
             // minted (see [`RuntimeContext::adopt_nested_payloads`]). A per-run local, because
@@ -277,19 +287,19 @@ impl<'a> RuntimeContext<'a> {
             // store latches the window (see `crate::eval::scratch` and
             // `Runtime::pin_window_if_store_written`).
             let store_used_before = this.runtime.eval_heap.used();
-            let mut machine = Machine::new();
+            let mut machine = super::machine_pool::acquire(module);
             let result = match machine.run_export_outcome(module, function, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
                     this.pump_once(&mut machine, module, func, pc)
                 }),
                 Err(err) => Err(err),
             };
-            // The machine is dropped when this scope ends, releasing every off-heap payload
-            // handle it built — but the returned term (and any term the callee stored where
-            // this run cannot see it) may still point at one. Adopt them into the runtime's
-            // escaped-payload store **before** that drop, and release the ones this run built
-            // that nothing names any more (see [`RuntimeContext::adopt_nested_payloads`]).
-            this.adopt_nested_payloads(machine, &result, &frontier);
+            // The returned term (and any term the callee stored where this run cannot see it) may
+            // still point at an off-heap payload this run built, so those handles are adopted into
+            // the runtime's escaped-payload store and the machine's reservoir is drained **before**
+            // the machine is recycled (see [`RuntimeContext::adopt_nested_payloads`]).
+            this.adopt_nested_payloads(&mut machine, &result, &frontier);
+            super::machine_pool::release(machine, module);
             let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
@@ -342,27 +352,31 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        // The closure's fresh `Machine` holds its `x`/stack outside the process root set a
+        // The closure's `Machine` holds its `x`/stack outside the process root set a
         // delivery-driven collection publishes, so the process is relocation-exempt for the
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
+            // As [`Self::run_export_blocking`]: this run's arena-census window (a diagnostic only,
+            // `None` unless `BEAM_RT_ARENA_TRACE` is set).
+            let _arena_window = crate::runtime::arena_census::Window::enter(this.runtime);
             // As [`Self::run_export_blocking`]: this run's NIF-resource prune scope, taken before
             // the body runs.
             let frontier = crate::eval::reclaim::Frontier::snapshot();
             // As [`Self::run_export_blocking`]: the `-eval` statement window's latch for this run,
             // because the closure's `Machine` holds its roots outside the window's descent.
             let store_used_before = this.runtime.eval_heap.used();
-            let mut machine = Machine::new();
+            let mut machine = super::machine_pool::acquire(module);
             let result = match machine.run_label_outcome(module, label, arity, args, this) {
                 Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
                     this.pump_once(&mut machine, module, func, pc)
                 }),
                 Err(err) => Err(err),
             };
-            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
-            // before the machine holding them is dropped, and release the ones this run built
-            // that nothing names any more.
-            this.adopt_nested_payloads(machine, &result, &frontier);
+            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles and
+            // drain the machine's reservoir before it is recycled, then release the ones this run
+            // built that nothing names any more.
+            this.adopt_nested_payloads(&mut machine, &result, &frontier);
+            super::machine_pool::release(machine, module);
             let _ = this.runtime.pin_window_if_store_written(store_used_before);
             result
         })
@@ -371,10 +385,11 @@ impl<'a> RuntimeContext<'a> {
     /// The nested run's epilogue: adopt every off-heap payload handle the just-finished
     /// `machine` built, then release the ones **this run itself** built that no live term names —
     /// for both stores this runtime owns, the escaped refc-payload store and the ABI's NIF
-    /// **resource-term** registry.
+    /// **resource-term** registry — and finally drain the machine's own reservoir so it can be
+    /// recycled.
     ///
     /// Adoption is unconditional: the returned term (and every term the callee stored where
-    /// this run cannot see it) may name a payload whose only owner is about to be dropped, so
+    /// this run cannot see it) may name a payload whose only owner is the machine, so
     /// [`Runtime::adopt_escaped_binaries`](crate::runtime::Runtime) hands ownership to the
     /// runtime on **every** path — errors and deferred prunes included.
     ///
@@ -394,15 +409,18 @@ impl<'a> RuntimeContext<'a> {
     /// ordinary call that built nothing off-heap pays two compares and no copy of the machine's
     /// register file.
     ///
-    /// # Why the machine is dropped between the two steps
+    /// # Why the machine is drained before the prune
     ///
     /// The refc prune retains any payload whose `RefCount > 1` (another owner exists outside its
-    /// enumeration). While this machine lives **it** is such an owner for every payload it
-    /// built, so a prune run before the drop would retain exactly the payloads this run is
-    /// asking about. The adoption above has already cloned each handle into the store, so
-    /// dropping the machine here frees nothing. (A NIF resource *term* holds no such per-machine
-    /// reference — a copy of it shares the term binding — so the resource prune is unaffected by
-    /// the drop either way; it runs here so both prunes read one code path.)
+    /// enumeration). While this machine holds a handle it **is** such an owner for every payload
+    /// it built, so a prune run before the drain would retain exactly the payloads this run is
+    /// asking about. The adoption above has already cloned each handle into the store, so the
+    /// drain here frees nothing that a live term names — it only gives up this machine's claims,
+    /// which is what lets the caller recycle the machine
+    /// ([`machine_pool::release`](super::machine_pool)) instead of dropping it. (A NIF resource
+    /// *term* holds no such per-machine reference — a copy of it shares the term binding — so the
+    /// resource prune is unaffected by the drain either way; it runs here so both prunes read one
+    /// code path.)
     ///
     /// # Why only this run's own payloads and resource terms may be released
     ///
@@ -418,10 +436,12 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A raise's reason term is not part of the frozen root set — it escapes in
     /// [`beam_common::Raise`]'s live-reason slot — so a failed run takes the plain adopt path
-    /// and leaves both stores alone (a bounded leak).
+    /// and leaves both stores alone (a bounded leak). The reservoir is still drained, because the
+    /// adoption has taken over every handle (the machine may not keep owning one across a
+    /// recycle).
     fn adopt_nested_payloads(
         &mut self,
-        mut machine: Machine,
+        machine: &mut Machine,
         result: &Result<Eterm>,
         frontier: &crate::eval::reclaim::Frontier,
     ) {
@@ -432,7 +452,7 @@ impl<'a> RuntimeContext<'a> {
                 let refc_due = self.runtime.off_heap_prune_pending();
                 let resources_due = crate::eval::reclaim::resources_pending(self.runtime, frontier);
                 if refc_due || resources_due {
-                    let roots = self.publish_nested_roots(&mut machine, *term);
+                    let roots = self.publish_nested_roots(machine, *term);
                     (Some(roots), refc_due, resources_due)
                 } else {
                     (None, false, false)
@@ -450,8 +470,9 @@ impl<'a> RuntimeContext<'a> {
                 .collect(),
             None => Vec::new(),
         };
-        // The machine must not outlive this point as a payload owner (see above).
-        drop(machine);
+        // The machine must not own a payload past this point: the store holds every handle now,
+        // and the machine is about to be recycled (see above).
+        machine.retain_refc_binaries(|_| false);
         let Some(roots) = roots else {
             return;
         };
@@ -1094,6 +1115,193 @@ mod in_process_compile {
                 mine.len()
             );
         }
+    }
+
+    /// **The milestone pin for the two open host-memory mechanisms**, measured on the real
+    /// workload instead of a fixture: one in-process compile of `lib/compiler/src/cerl_clauses.erl`.
+    ///
+    /// The fast, deterministic counterpart is
+    /// [`crate::context::pool::tests::the_open_host_memory_bound_is_the_copy_out_volume_plus_the_arena_demand`]
+    /// (a fixture whose demand is arithmetic); this case is the **real** one, and it exists because
+    /// the two mechanisms' rules are only worth stating if they hold on a workload nobody shaped.
+    ///
+    /// # The invocation it pins
+    ///
+    /// ```text
+    /// erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --lib \
+    ///     -- --ignored --nocapture the_cerl_clauses_compile_bands
+    /// ```
+    ///
+    /// It is the CLI's own route ([`cli_route_runtime`]: boot, then the real
+    /// `bootstrap/bin/start.boot`) plus [`compile_expr`] — `compile:file(F, [no_spawn_compiler_process,
+    /// deterministic, no_docs, {outdir, D}])` — driven through `Runtime::eval`, i.e. **exactly**
+    /// `beam_rt -noshell -eval '<the same expression>'` with the **system** OTP compiler on the path
+    /// (the harness adds no `-pa`). Putting the tree's OTP-30 bootstrap compiler first on `-pa`
+    /// instead raises every figure (recorded below), which is why the bands are stated as bands.
+    ///
+    /// # What it bands, and why a band rather than an equality
+    ///
+    /// `arena_words` is a deterministic **count**, not a timing, so a shared host cannot perturb
+    /// it — but the compiler it counts through differs between two legitimate hosts (OTP 29 vs the
+    /// tree's OTP 30) by ≈19%, so the band is the honest unit: ±30% catches a regression of the
+    /// mechanism (a region policy, an extra reservation) while tolerating the compiler generation.
+    /// The countable **invariants** — how many store regions were retired, and the arena's
+    /// geometric reservation ladder — are asserted exactly, because a change there *is* the
+    /// mechanism moving.
+    #[test]
+    #[ignore = "milestone pin: compiles lib/compiler/src/cerl_clauses.erl in-process to band the arena and the -eval store retention"]
+    fn the_cerl_clauses_compile_bands_the_arena_and_the_eval_store() {
+        const BANNER: &str = "cerl_clauses host-memory pin";
+        /// The module compiled: small (13.8 kB), the workspace's documented control for the arena
+        /// census and the peak-RSS split, and ≈1 s under the release runtime.
+        const MODULE: &str = "cerl_clauses";
+        /// `arena_words` on the **system** (OTP-29) compiler — this harness's route. The tree's
+        /// OTP-30 bootstrap compiler, first on `-pa`, demands ≈5 133 683 words for the same source.
+        const ARENA_WORDS: u64 = 4_307_470;
+        /// The band's half-width, in percent of [`ARENA_WORDS`].
+        const BAND_PCT: u64 = 30;
+        /// The one `-eval` store region [`Runtime::grow_eval_heap`] retires: the copy-out volume
+        /// passes the 128 MiB store exactly once on this route (twice as much with the tree
+        /// compiler, whose generated terms are larger).
+        const STORE_RETIRED_REGIONS: usize = 0;
+        /// The engine arena's geometric unit: its first reservation, 4 MiB of `Eterm` words
+        /// (`beam_engine/src/context.rs`'s `HEAP_RESERVE_WORDS`).
+        const ARENA_UNIT_WORDS: usize = 4 * 1024 * 1024 / core::mem::size_of::<u64>();
+        /// The pooled BIF heap's region count at the end: a depth-sized seed plus one retirement
+        /// per call that outgrew its region, which is a property of the compile's call shapes.
+        const BIF_REGIONS: usize = 27;
+        /// The md5 of the artifact with the option list above — `Code`, `Attr` (deterministic, no
+        /// `-vsn`) and `Dbgi` are all fixed by it, so this is the compile's own identity. Re-pin it
+        /// (the failure message prints the observed value) when the oracle's compiler generation
+        /// changes; it is never a pass criterion by itself — the answer and the retention figures
+        /// are.
+        const ARTIFACT_MD5: &str = "94cb59a617a3ec1afda0750118dde54b";
+
+        let root = source_root();
+        let src = root
+            .join("lib/compiler/src")
+            .join(format!("{MODULE}.erl"));
+        if !src.is_file() {
+            skip_loudly(
+                BANNER,
+                &format!("no source to compile at {}", src.display()),
+            );
+            return;
+        }
+        let out = scratch_dir(&format!("{MODULE}_pin_out"));
+        let expr = compile_expr(&src, out.path());
+        let mut runtime = cli_route_runtime(&root);
+        let started = Instant::now();
+        let result = runtime.eval(&expr).unwrap_or_else(|error| {
+            panic!("the in-process compile of `{MODULE}` must complete: {error}")
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        let rendered = runtime
+            .format_term_w(result, None)
+            .unwrap_or_else(|error| panic!("the `{MODULE}` result must be printable: {error}"));
+        assert_eq!(
+            rendered.trim(),
+            format!("{{ok,{MODULE}}}"),
+            "the in-process compile must answer the oracle's `{{ok,{MODULE}}}`"
+        );
+
+        // The artifact's identity: the compile really produced the module, not just a tag.
+        let artifact = out.path().join(format!("{MODULE}.beam"));
+        let bytes = fs::read(&artifact).unwrap_or_else(|error| {
+            panic!(
+                "the compile answered {} but wrote no {}: {error}",
+                rendered.trim(),
+                artifact.display()
+            )
+        });
+        let digest = beam_loader::checksum::md5(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        // ---- the two mechanisms ----
+        let stats = runtime.retention_stats();
+        let arena = runtime.arena.heap_stats();
+        eprintln!(
+            "{MODULE}.erl: in-process compile in {elapsed:.3} s, {} bytes, md5 {digest}\n\
+             arena: words={} allocs={} regions={} reserved={} committed={} used={}\n\
+             store: words={} retired_regions={} retired_words={} retained={}\n\
+             pool:  regions={} words={} peak_used={}",
+            bytes.len(),
+            stats.arena_words,
+            stats.arena_allocs,
+            arena.regions,
+            arena.reserved_words,
+            arena.committed_words,
+            arena.used_words,
+            stats.eval_heap_words,
+            stats.eval_heap_retired_regions,
+            stats.eval_heap_retired_words,
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            stats.bif_regions,
+            stats.bif_words,
+            stats.bif_peak_used_words,
+        );
+
+        // (1) the arena: a demand band, and the geometric ladder EXACTLY.
+        let low = ARENA_WORDS - ARENA_WORDS * BAND_PCT / 100;
+        let high = ARENA_WORDS + ARENA_WORDS * BAND_PCT / 100;
+        assert!(
+            (low..=high).contains(&stats.arena_words),
+            "the arena's cumulative demand must stay in {low}..={high} words (±{BAND_PCT}% of \
+             {ARENA_WORDS}); it reads {} — a change here is a term-reservation policy change, not \
+             noise",
+            stats.arena_words
+        );
+        assert_eq!(
+            arena.used_words as u64,
+            stats.arena_words,
+            "the census and the demand counter are one quantity"
+        );
+        assert_eq!(
+            arena.reserved_words,
+            ARENA_UNIT_WORDS * ((1 << arena.regions) - 1),
+            "the arena's reservations are the geometric ladder unit · (2^regions − 1) — the region \
+             policy this case's bound is stated in terms of"
+        );
+        assert!(
+            (3..=6).contains(&arena.regions),
+            "the ladder's step count follows from the demand; {} regions is outside the band the \
+             measured demand implies",
+            arena.regions
+        );
+
+        // (2) the `-eval` store: the retirement count EXACTLY, and retention = Σ region capacities.
+        assert_eq!(
+            stats.eval_heap_retired_regions, STORE_RETIRED_REGIONS,
+            "the copy-out volume retires exactly {STORE_RETIRED_REGIONS} store region(s) on this \
+             route; retained words = {} — the store never shrinks, so a change here is the \
+             copy-out volume moving",
+            stats.eval_heap_words + stats.eval_heap_retired_words
+        );
+        assert_eq!(
+            stats.eval_heap_words + stats.eval_heap_retired_words,
+            stats.eval_heap_words + stats.eval_heap_words * ((1 << stats.eval_heap_retired_regions) - 1),
+            "the store's retention is every region it ever installed: `eval_heap_words` (the \
+             current, doubled region) plus one retired region per doubling"
+        );
+
+        // (3) the pooled BIF heap stays a fraction of either, with the same countable band.
+        let bif_low = BIF_REGIONS * 7 / 10;
+        let bif_high = BIF_REGIONS * 13 / 10;
+        assert!(
+            (bif_low..=bif_high).contains(&stats.bif_regions),
+            "the pooled BIF heap's region count must stay in {bif_low}..={bif_high} (±30% of \
+             {BIF_REGIONS}); it reads {}",
+            stats.bif_regions
+        );
+
+        // (4) the artifact's md5.
+        assert_eq!(
+            digest, ARTIFACT_MD5,
+            "the artifact's identity moved — if the oracle's compiler generation changed, re-pin \
+             ARTIFACT_MD5 to `{digest}`; if not, the compile produced different bytes"
+        );
     }
 
     /// Every `lib/stdlib/src/*.erl`, `(module, path)`, sorted by module — discovered from the

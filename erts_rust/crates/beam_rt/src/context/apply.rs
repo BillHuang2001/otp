@@ -42,6 +42,7 @@ use beam_loader::{Atom, FunDescriptor, Function, ImportRef, Instr, Label, Module
 use beam_term::Eterm;
 
 use super::bridges::descriptor_of;
+use super::ir_cache::CalleeAdmission;
 use super::runtime_context::RuntimeContext;
 
 /// The launch target of a `.beam` **local** (`make_fun3`) closure.
@@ -98,6 +99,9 @@ impl RuntimeContext<'_> {
     /// the blocking-aware local path (the runner's fun-entry arm) can keep the synchronous one
     /// for them.
     ///
+    /// The arity guard runs before the served-key decline, so a wrong argument count is
+    /// [`BeamError::BadArity`] whatever the descriptor names.
+    ///
     /// The served-key test costs the declining path two `O(1)` atom-table reads and one
     /// module-name comparison — no allocation, no registry or hash lookup — which is
     /// negligible beside the `FunT` search that resolved the descriptor (and beside the `Vec`
@@ -128,25 +132,33 @@ impl RuntimeContext<'_> {
             return Ok(None);
         }
         let index = terms::fun_index(fun)?;
+        let (found, descriptor) = self
+            .local_fun_descriptor(uniq, index)
+            .ok_or(BeamError::BadArg)?;
+        let free = terms::fun_free(fun)?;
+        if args.len() + free.len() != descriptor.arity as usize {
+            return Err(BeamError::BadArity);
+        }
+        // A named local reference to a **served** stub has no body to enter: decline it, so
+        // `apply_fun` dispatches it to the host instead of running the stub's
+        // `erlang:nif_error(undef)` (see the doc comment above). The arity guard runs first, so a
+        // mismatched call answers `BadArity` whether or not the key is served; tested **before**
+        // the argument vector is built, so a declined reference allocates nothing.
+        if served_local_key(&found, &descriptor).is_some() {
+            return Ok(None);
+        }
         // Calling convention for a closure body (see `erts/emulator/beam/beam_common.c::call_fun`):
         // the call arguments occupy `x(0..arity)`, the captured free variables follow at
         // `x(arity..arity+free)`. The compiler emits exactly this layout — for
         // `fun({K,V}) -> {N,K,V} end` the body is `-f-fun-0-/2` and reads its *argument* from
         // `{x,0}` and its free variable `N` from `{x,1}`.
-        let mut combined = args.to_vec();
-        combined.extend_from_slice(terms::fun_free(fun)?);
-        let (found, descriptor) = self
-            .local_fun_descriptor(uniq, index)
-            .ok_or(BeamError::BadArg)?;
-        if combined.len() != descriptor.arity as usize {
-            return Err(BeamError::BadArity);
-        }
-        // A named local reference to a **served** stub has no body to enter: decline it, so
-        // `apply_fun` dispatches it to the host instead of running the stub's
-        // `erlang:nif_error(undef)` (see the doc comment above).
-        if served_local_key(&found, &descriptor).is_some() {
-            return Ok(None);
-        }
+        //
+        // One allocation of exactly the entry arity: `args.to_vec()` followed by an
+        // `extend_from_slice` reallocated on **every** applied fun, which a `lists:foldl/3` pays
+        // once per element.
+        let mut combined = Vec::with_capacity(descriptor.arity as usize);
+        combined.extend_from_slice(args);
+        combined.extend_from_slice(free);
         Ok(Some(LocalFunTarget {
             module: found,
             label: descriptor.label,
@@ -163,7 +175,24 @@ impl RuntimeContext<'_> {
     /// carries only its per-module `uniq` and its module-level lambda `index`, so the defining
     /// module is the one whose `FunT` table carries the entry. `None` when no loaded module
     /// does.
+    ///
+    /// It runs once per **applied** local fun — once per element of every `lists:foldl/3`,
+    /// `maps:fold/3`, … — so the search is answered from [`ir_cache`]'s index, which is
+    /// (re)built only when the loaded module set changes
+    /// ([`ir_cache::local_fun_descriptor`] carries the invalidation argument). The answer is
+    /// identical to the direct scan this replaces, in the same order.
+    ///
+    /// A miss from the index falls back to that direct scan, so an index that somehow did not
+    /// see a module can only ever cost the pre-cache scan, never a wrong `None` (which would
+    /// surface as a spurious [`BeamError::BadArg`]).
     fn local_fun_descriptor(&self, uniq: u64, index: u32) -> Option<(Arc<Module>, FunDescriptor)> {
+        if let Some(found) = super::ir_cache::local_fun_descriptor(
+            &self.runtime.code_server,
+            uniq,
+            index,
+        ) {
+            return Some(found);
+        }
         self.runtime.code_server.modules().find_map(|module| {
             descriptor_of(module, uniq, index).map(|entry| (Arc::clone(module), entry))
         })
@@ -466,6 +495,29 @@ pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, ari
             None => true,
         },
     }
+}
+
+/// The **memoized** pair the in-machine cross-module seam needs from one callee:
+/// [`callee_observes_its_call_site`]'s verdict and [`Module::export`]'s entry label.
+///
+/// Both are pure functions of the callee's **immutable** loaded IR — its `ImpT`, its `Code`
+/// chunk and its `ExpT` — so the answer cannot change while the module image is the same, and
+/// the cache ([`ir_cache::callee_admission`]) is keyed on that image's identity
+/// (`ModuleKey`: address + load-time MD5 + atom namespace), never on the call. Deriving it per
+/// `call_ext` meant a full pass over the callee's whole import table plus a linear scan of its
+/// function body and its export table on **every** cross-module entry, which is millions of
+/// times in one `compile:file/2`.
+///
+/// What is **not** memoized is anything runtime-mutable: the seam's `host_serves` refusal (its
+/// NIF arm flips on a mid-run `erlang:load_nif/2`), the callee's name lookup and the
+/// `prim_tty` exemption all stay per-call at
+/// [`ExecutionContext::resolve_external_call`](beam_engine::ExecutionContext::resolve_external_call).
+/// This predicate's own two inputs are the only pure ones in that chain.
+pub(crate) fn callee_admission(module: &Module, function: Atom, arity: u32) -> CalleeAdmission {
+    super::ir_cache::callee_admission(module, function, arity, || CalleeAdmission {
+        observes_call_site: callee_observes_its_call_site(module, function, arity),
+        label: module.export(function, arity),
+    })
 }
 
 /// Whether `function`'s **own** lowered body issues a guarded fun-image BIF
