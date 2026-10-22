@@ -284,6 +284,63 @@ Binding facts for anyone asking "where does a module constant live, and can it b
   is compiled into a real `beam_rt_eval_fun_<n>` module (`eval/compile.rs:180,445`) whose literal
   area then belongs to the code server like any other module's.
 
+## Term-carrying stores in `nif*.rs` · `codeserver.rs` · `boot*` (raw-word inventory)
+What in these files holds a raw `Eterm` across a call boundary, and on which heap (§ *Host-side
+term stores* in `../CONTEXT.md` is the crate-wide rule; this is the sibling inventory those files
+have no entry for). Verified by reading the fields, not inferred.
+- **No NIF-side term is on the arena or the `-eval` store except the two `stabilize_term` copies.**
+  A per-call `NifHostImpl` heap is the **pooled BIF heap** (`context/calls.rs:1698` `take_bif_frontier`
+  → `:1737-1739` `put_bif_heap`); the load/unload host's is a dedicated
+  `beam_alloc::Heap::new(bif_heap_words)` owned by `NifEntry.host` (`context/bridges.rs:642`,
+  `nif.rs:189-198`). Neither region is compacted, so the hosts' words are stable by construction.
+- `nif.rs:294-302` `PendingNifSend { from: ProcessId, to: Eterm, msg: Eterm }` — `msg` is on the
+  **load host's own heap**; the `Vec` lives in the long-lived `NifhostImpl.load_sends`
+  (`nif.rs:712`) between the callback's push (`nif.rs:1278`) and `take_load_sends` (`nif.rs:755`), so
+  it is per-load-callback, never runtime-lifetime.
+- `nif.rs:696` `NifHostImpl.self_pid: Eterm` — a **pid immediate** (no heap word); lives as long as
+  the host (library lifetime for the load host).
+- `nif.rs:702` / `nif/thread_env.rs:224` `envs: Vec<Box<NifEnv>>` — `NifEnv`'s own
+  `pending_exception: Option<Eterm>` (`beam_abi/src/nif/host.rs:603`) and its
+  `recorded_atoms: Rc<RefCell<Vec<(usize, String)>>>` (raw atom **word**, atoms are immediates,
+  `host.rs:496`); both are per env, and an env a NIF leaked lives as long as the host.
+- `nif.rs:516` and `nif.rs:635` (`make_ref`, `monitor_process_result`) insert the minted reference
+  **term** into `Runtime::references: HashMap<Eterm, Option<MonitorRef>>` (`runtime.rs:755`).
+  `Eterm`'s `Hash` is the raw word (`beam_term/src/eterm.rs:36-37`), so those keys are the reference
+  block's **address** on the host heap — a store keyed by identity-of-address, not by id. Same shape
+  for `Timers::refs` / `native::process::reference_term`.
+- `nif_select.rs:189-197` is the only term this module **stabilises**: `reference` (or the
+  `CUSTOM_MSG` message) → `Runtime::stabilize_term` → `Runtime::eval_heap`
+  (`runtime.rs:2452-2462`) → stored as `SelectPayload::{Plain{reference}|Custom{message}}`
+  (`port/select.rs:146-159`) in `SelectWatch.registrations: HashMap<u64, SelectRegistration>`
+  (`port/select.rs:418`, field `payload` at `:401`; the sibling `handle: Eterm` at `:403` is
+  `make_small(fd)`, an immediate, and `obj: *mut c_void` at `:405`). **So a NIF select registration
+  holds words inside the `-eval` store** — the one cross-file landing point compaction must relocate.
+  The delivery-time resource mint is the other copy: `nif.rs:776-787` → `port.rs:4305-4308`
+  `stabilize_term` (same store).
+- `nif_monitor.rs:98` `armed: HashMap<MonitorId, ProcessId>` — `MonitorId([u8; REF_THING_BYTES])`
+  (`beam_abi/src/nif/enif/resources_monitors.rs:104`), a **byte copy** of the ref block (value
+  identity), and a `ProcessId`; no term, no address. `deliver_for`'s `pid_term` is a parameter.
+- `codeserver.rs` holds **no `Eterm` at all** (zero occurrences in the file). `CodeServer`
+  (`:108-181`) is `atoms: Rc<AtomTable>`, `modules: HashMap<String, Arc<Module>>`, two
+  `String`-keyed location maps, `loaded_generation`, `fun_modules: RefCell<Option<(u64,
+  Rc<Vec<(Arc<Module>, PathBuf)>>)>>`, path vectors. The `Arc<Module>` does carry a literal area —
+  `beam_loader/src/ir.rs:315 literals: Arc<LiteralArea>`, `:425-427 literal(idx) -> Option<Eterm>`
+  returns a **word into that area** — and `erlang:delete_module/1` drops the `Arc`
+  (`CodeServer::forget_module`), so a host store caching a literal word outlives its area (the
+  documented "no literal-area release handshake" issue).
+- `boot.rs` holds no term (`PreloadedModules { names: Vec<&'static str> }` at `:245-247`;
+  `PRELOADED_MODULE_NAMES` / `CORE_ATOMS` are `&[&str]`). `boot/preloaded.rs` has none either.
+- `boot/bootscript.rs:518` `boot_args -> Vec<Eterm>` is a **per-directive local** built through
+  `RuntimeContext::new` → `Runtime::alloc_words`, i.e. the **arena**; `intern_atoms`'s
+  `HashMap<String, Eterm>` (`:529`) holds atom immediates only. The `Vec` is handed straight to
+  `drive::start_kernel_process` (`:480`, parameter `args: Vec<Eterm>` at `drive.rs:209`) or
+  `drive::apply_boot_call` (`:484`, `&[Eterm]` at `drive.rs:353`) and never stored — but
+  `Runtime::spawn_process` → `note_pending_spawn` re-copies each arg onto the arena
+  (`runtime.rs:4181-4185`) into `PendingSpawn.args: Vec<Eterm>` (`runtime.rs:229`), which **is** a
+  struct field. `BootScript`/`Instruction`/`Mfa.args` (`bootscript.rs:129-182`) are owned typed
+  `Value`s — no term, so a parsed script survives any term movement. `drive.rs` `Mfa`-carried
+  `args` and `apply_boot_call`'s machine registers are per-call.
+
 ## File-size overages
 The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existing oversize below, which are **not** restructured (line counts measured with `wc -l`; a "production" count excludes the file's trailing test region — the contiguous run of `#[cfg(test)]`-gated modules at EOF, inline or sibling).
 - `src/port.rs` 5 116 lines, 5 085 of production (unit suite in `port/tests.rs`, 4 226 lines, plus 21 sibling `port/*_tests.rs` suites — `accept_inherit`, `active_input`, `active_input_e2e`, `async_ready`, `busy_suspend`, `busy_wait`, `command_matrix`, `completion`, `control_capability`, `driver_output_shape`, `exit_status_matrix`, `failure`, `failure_e2e`, `inet_matrix`, `inet_opts`, `monitor`, `packet_framing`, `peer_closed`, `ram_file_matrix`, `spawn_driver`, `stream_shape` — and `port/test_support.rs`).
