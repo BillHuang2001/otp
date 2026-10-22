@@ -808,12 +808,12 @@ build(N, Size, Sum) ->
         }
     }
 
-    /// **(ii), pinned — the shape the prune's own valve exists for.** A live
-    /// `[BinRef][ErlSubBits]` pair standing in a region the process collector does not scan,
-    /// installed as the process's **only** root, so the collector's own reachability walk — the one
-    /// [`reclaim`] leans on — reports none of the payload that root names. The collection valve
-    /// passes it (its hazard test is "forwards a word a relocation would move", and `BinRef.val`
-    /// names an **off-heap** payload no collection moves); the prune's own valve declines it.
+    /// **The foreign-root decline.** A live `[BinRef][ErlSubBits]` pair standing in a region the
+    /// process collector does not scan, installed as the process's **only** root, so the
+    /// collector's own reachability walk — the one [`reclaim`] leans on — reports none of the
+    /// payload that root names. The collection valve passes it (its hazard test is "forwards a word
+    /// a relocation would move", and `BinRef.val` names an **off-heap** payload no collection
+    /// moves); the prune's own valve declines it.
     ///
     /// The premise is **constructed**: the shared run is a nested one and builds its blocks on the
     /// process's scanned young heap, so this case has a live heap *and* a root stored outside it —
@@ -909,8 +909,8 @@ build(N, Size, Sum) ->
             "the decline opens the pid's descent latch, exactly as the collection valve's does"
         );
     }
-    /// **The positive release path.** With roots that hold nothing (an empty register file, an
-    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
+
+    /// **The positive release path.** With roots that hold nothing (an empty register file, an    /// empty stack) the prune runs its walk and releases **every** payload: nothing is live, so
     /// nothing survives, and the process's off-heap byte figure is republished as `0`.
     #[test]
     fn a_prune_with_clean_roots_releases_every_payload_nothing_reaches() {
