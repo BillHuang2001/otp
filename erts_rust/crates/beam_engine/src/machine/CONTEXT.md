@@ -292,7 +292,8 @@ What the root set is **made of** and what it provably leaves out — the invaria
   collection relocates.
 - **`args_scratch` (`mod.rs:574`) is `mem::take`n out of the machine for the whole wide BIF dispatch**
   (`interpreter/bif.rs`, restored there; the same shape in `interpreter/trace.rs`), so no `with_roots` hand-off
-  can see it, and `Machine::for_each_root` (`mod.rs:1051-1072`) deliberately does not enumerate it either. That
+  can see it, and **both** root-enumeration doors (`Machine::for_each_root`, the read-only census, and
+  `Machine::for_each_root_mut`) deliberately leave it out. That
   is sound only because the dispatch window **cannot collect**, and the reason is structural rather than a host
   promise: `dispatch_bif_call` (`interpreter/bif.rs`) takes **`&self`**, while both rooted doors
   (`alloc_words_rooted`, `ensure_heap_full`) take `&mut self` (the *context*) plus a root set whose slices come
