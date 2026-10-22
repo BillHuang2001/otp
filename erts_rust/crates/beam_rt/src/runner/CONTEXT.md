@@ -35,7 +35,7 @@ characterisation and figures are in `PERF.md`).
   ever probed by pid and never iterated for an observable order).
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
-  parked-machine root hand-off (`park_machine`, whose `ProcessEngine::parked_published` flag gates the
+  parked-machine root hand-off (`park_window`, whose `ProcessEngine::parked_published` flag gates the
   resume's `resume_from_process_roots`), the
   parked-receive deadline rearming and the recorded outcome.
   An **export** entry is classified once, before the context borrows its budget wrapper, through the
@@ -187,10 +187,11 @@ The one remaining host-side obligation is **enforced outright**, not through a p
 ## Parked-machine root publication (the runner↔GC hand-off)
 A suspended process's machine lives in [`RunnerState::engines`], but its registers are only a *copy* of the process's own root set.
 A collection driven while the process is parked — `Process::deliver`'s exit cascade (`beam_process`) is **not** gated by `Runtime::gc_process_enabled` — relocates the process's heap against its own `regs`, so a parked machine that had not published its roots would be collected against a partial root set and left with a stale word in its `x`.
-[`run`] therefore hands the machine over at **both** park arms — the pre-emption/`Yield` arm and the `Ok(EngineRunOutcome::Wait)` arm — through the **one** hand-off `park_machine(table, pid, engine, fr_count, exempt)`, right before `engines.insert`, and calls `resume_from_process_roots(ctx, pid, machine, fr_count)` after `ctx.enter_module(module)` when `engine.parked.is_some()`.
-`park_machine` always records the live FR-prefix count on `ProcessEngine::fr_published`, but publishes only a window that is **not** relocation-exempt: an exempt window sets `ProcessEngine::parked_published = false` and returns `false` without publishing, while a non-exempt one sets `parked_published = true`, calls `publish_parked_roots` and returns `true`.
+[`run`] therefore hands the machine over at **all three** park arms — the pre-emption/`Yield` arm, the `Ok(EngineRunOutcome::Wait)` arm and the `Ok(EngineRunOutcome::Suspend)` (BIF-park) arm — through the **one** entry point `park_window(table, pid, engine, fr_count, ParkExemption)`, right before `engines.insert`, and calls `resume_from_process_roots(ctx, pid, machine, fr_count)` after `ctx.enter_module(module)` when `engine.parked.is_some()`.
+**The invariant is `skipped publication ⇒ the window holds the relocation exemption`**, and it is structurally impossible to split: `park_window` derives one `exempt` value from its `ParkExemption` argument, writes the flag from that value **in both directions** (so a publishing window can never inherit a stale `true`) and then delegates the publication to `park_machine(table, pid, engine, fr_count, exempt)`. A park arm therefore chooses a `ParkExemption` and cannot forget the flag — `Always` (the `receive` park, whose window a delivery or a signal really enters) or `LiveFloats` (`fr_count > 0`, the pre-emption and BIF-suspend parks, whose machine keeps those FR slots as roots of its own). The exemption has exactly **one writer** (`park_window`) and one clearer (`run`'s parked branch, `set_relocation_exempt(pid, false)`, which is where a parked window ends).
+`park_machine` is the publication half only (`fn`, `park_window` its sole caller): it always records the live FR-prefix count on `ProcessEngine::fr_published`, but publishes only a window that is **not** relocation-exempt — an exempt window sets `ProcessEngine::parked_published = false` and returns `false` without publishing, while a non-exempt one sets `parked_published = true`, calls `publish_parked_roots` and returns `true`.
 `parked_published` is therefore an **unconditional** claim, not `publish_roots_full`'s answer: `publish_parked_roots` (`run.rs:637-639`) discards the helper's `bool` and `park_machine` (`run.rs:745-746`) never reads one — sound only because both of `publish_roots_full`'s `false` arms are structurally unreachable today (`live = roots.x.len().min(MAX_REG)` cannot fail `set_live`, and the stack-length check cannot mismatch on the one append order), so any future change that can make it fail must gate `parked_published` on the answer instead, or the `Yield` arm's `collect_at_reds_boundary`/`reclaim_off_heap_binaries` would run against a **partially** published root set.
-The `Yield` arm passes `exempt = fr_count > 0` (its post-slice `fr_mark` check already opened the window exemption for a slice that ended with a live FR prefix) and the `Wait` arm passes `exempt = true`.
+The `Yield` and `Suspend` arms pass `ParkExemption::LiveFloats` and the `Wait` arm passes `ParkExemption::Always`.
 `resume_from_process_roots` therefore runs **only** when the matching park published (`engine.parked_published`), which is then cleared; the window's `set_relocation_exempt(pid, false)` is cleared unconditionally afterwards.
 **The skip is sound because for the exempt window's whole duration nothing can relocate this process's heap**: `Process::collect`/`ensure_capacity`/`collect_if_needed` return the typed refusals, `ProcessTable::deliver` declines, the host collection gate's `declines_relocation` declines and `Runtime::serve_gc_request` returns `false` on `is_relocation_exempt`, and `Process::grow_nursery` — the one growth path that is deliberately not gated — relocates nothing.
 So the parked machine stays the authoritative root set and the publish+resync pair would be a pure identity round-trip over a `min(x.len(), MAX_REG)`-word x file plus the Erlang stack, both ways (the rationale is on `park_machine` itself).
@@ -198,7 +199,7 @@ So the parked machine stays the authoritative root set and the publish+resync pa
 What the two calls publish and read back is the **shared** root-hand-off mechanism, not this node's: `publish_parked_roots` and `resume_from_process_roots` delegate to `context::gc`'s one implementation (`publish_roots_full`/`scatter_roots_full`, the `fr_count` parameter bounding how many leading FR words are published), which the in-slice heap-admission points (`ensure_heap_full`/`alloc_words_rooted`, bound by `machine_root_bounds`) also use — so the park/resume and the admission points can never drift (the mechanism's own copy: [`../context/IMPLEMENTATION.md`](../context/IMPLEMENTATION.md), [`../context/gc/CONTEXT.md`](../context/gc/CONTEXT.md) *A parked machine's live `Machine::pending_exception` reason IS a GC root across the park window*).
 This node owns **which** arm publishes and **when** it may skip, and these are its facts about the two calls:
 * `publish_parked_roots` hands the machine's roots over with `RootSet::ALL_LIVE` — the conservative (always-safe) choice, since a parked machine's live count is not exposed and over-approximating a copying collector's root set can only keep a term alive, never free a live one.
-* **The FR file is published only up to its live leading prefix `fr_mark()`.** The runner reads the count **once** per slice (`Machine::fr_mark()`, the engine's exclusive high-water mark of FR writes since the machine's last reset) and reuses it for both the post-slice reaction and the `publish_parked_roots(.., fr_count)` call in the same slice; `fr_mark() > 0` also marks the process **relocation-exempt for the inter-slice window** (`ProcessTable::set_relocation_exempt(pid, true)`, cleared by the next slice entry), and that exemption is exactly what makes a `Yield` park with a live FR prefix **skip** its publication (`park_machine`'s `exempt` argument) instead of copying the file: the parked machine's own FR slots are protected from the delivery-driven collection — which is not gated by `gc_process_enabled` — by the exemption rather than by a copy.
+* **The FR file is published only up to its live leading prefix `fr_mark()`.** The runner reads the count **once** per slice (`Machine::fr_mark()`, the engine's exclusive high-water mark of FR writes since the machine's last reset) and reuses it for both the post-slice reaction and the `publish_parked_roots(.., fr_count)` call in the same slice; `fr_mark() > 0` also marks the process **relocation-exempt for the inter-slice window** (`park_window`'s `ParkExemption::LiveFloats`, cleared by `run`'s parked branch on resume), and that exemption is exactly what makes a `Yield` park with a live FR prefix **skip** its publication (`park_machine`'s `exempt` argument) instead of copying the file: the parked machine's own FR slots are protected from the delivery-driven collection — which is not gated by `gc_process_enabled` — by the exemption rather than by a copy.
 * The reaction is **per slice, never a permanent pin**: inside a slice the engine reaches only the full door, which publishes the FR file up to its pointer-bearing prefix and applies no float guard, so a float-using call site collects exactly like a float-free one.
 * `fr_mark` is an **exact upper bound** after a slice — every FR write goes through `Machine::set_fr`, and the baseline JIT tier refuses an FR destination (deopting to the interpreter) — and a bound can only err by over-protecting: a slot at or above it is `NIL`, and a `NIL` word roots nothing, so a float-free park publishes **no** FR word instead of the 1024 slots `process.regs` would carry.
 * The count is stored on `ProcessEngine::fr_published` at the park and replayed at the resume, so `scatter_roots_full` never sees a length mismatch (which would halt the process's collection).
@@ -247,7 +248,7 @@ per-iteration):
 * **One allocation per slice:** `RuntimeContext::enter_module` (`run.rs:475` →
   `../context/runtime_context.rs:501-508`) builds a fresh `String` of the module name on **every**
   slice (a `RuntimeContext` itself is a stack value: `for_process_with_engines`, no heap alloc).
-* **O(size), on a park whose window is NOT relocation-exempt:** `park_machine` (`run.rs:959`,
+* **O(size), on a park whose window is NOT relocation-exempt:** `park_window` → `park_machine` (`run.rs:959`,
   `run.rs:1084`) calls `publish_parked_roots` → `gc::publish_roots_full`
   (`../context/gc.rs:370-395`), which copies the whole x file
   (`min(x.len(), MAX_REG)` = up to 1024 words, `beam_process::registers::MAX_REG`) plus the whole
@@ -371,31 +372,6 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   The seam that would close it is a `ProcessTable::service_receive_signals(pid)` in `beam_process` — apply the head signal while its `exit_policy` is not `Terminate`, in FIFO order — which a sibling node owns.
 
 ## Known Issues / Handoffs
-* **The `Suspend` arm skips the root publication WITHOUT opening the window's relocation
-  exemption — an unpublished, collectable parked machine.** `run.rs:1540` calls
-  `park_machine(table, pid, &mut engine, fr_count, fr_count > 0)`, i.e. it can pass `exempt =
-  true` (publishing nothing, `parked_published = false`), but the arm never calls
-  `process.set_relocation_exempt(true)` — the only two setters in this file are the `Yield` arm
-  (`run.rs:1230`) and the `Wait` arm (`run.rs:1448`), whose parks are the two `park_machine`
-  calls that are allowed to skip. So with `fr_count > 0` the machine sits in
-  `RunnerState.engines` with roots that were never published while the process is `Runnable` and
-  **not** exempt: `has_unpublished_roots()` is `false`, so `Process::deliver`'s growth cascade,
-  every `beam_process` signal site and the `serve_gc_request` on the very next line
-  (`run.rs:1541`) all collect it. The collector relocates `process.registers()`, which hold the
-  *previous* window's words (or nothing, on the process's first park), and the real live terms —
-  the machine's `x`/`stack` — are evacuated; `resume_from_process_roots` (`run.rs:939`) is then
-  skipped because `parked_published` is `false`, so the resume runs on words naming a freed
-  space. Symptom: an arbitrary `beam_term::list::car` dereference of a recycled cons cell.
-  Reachability condition: `fr_count > 0` (`Machine::fr_mark()`, sticky for the process's whole
-  life — `fr_mark` is cleared only by `Machine::reset`, which only a first entry runs) **and** a
-  `BifOutcome::Suspend` park, whose only producer is `port::busy_wait::PortWrite::Parked` →
-  `RuntimeContext::request_suspend` (`native/port.rs:328`, `context/execution.rs:1116`) — i.e.
-  `port_command`/`io` output on a busy port. Minimal fix: mirror the `Yield` arm — set the
-  exemption when the park is going to skip (or drop the `fr_count` special case and always
-  publish on this arm), and give the `Suspend`/`Yield` arms one shared
-  `park_and_publish_or_exempt` helper so the park call and the exemption can never disagree
-  again.
-* **The `Yield` arm's post-park steps are order-sensitive.** `serve_gc_request` (`run.rs:1305`) collects against the process's `Registers` and writes **nothing** back into the parked machine, while the boundary door immediately after it (`run.rs:1313`) re-publishes those registers **from the machine** (`publish_roots_full`'s `copy_from_slice`, `context/gc.rs:806`). So a pending `erlang:garbage_collect` request that really collects leaves the machine's `x`/`stack` naming an evacuated from-space, and a boundary door that then fires publishes those stale words as roots and relocates over them (the resume's `resume_from_process_roots`, `run.rs:939`, is the only repair). Today the door's own `collection_debt`/7-of-8 occupancy gate is what keeps it from firing right after a fresh collection — an incidental, not a structural, exclusion. Minimal fix: run `collect_at_reds_boundary` before `serve_gc_request`, or skip the door when `serve_gc_request` answered `true`.
 * **An early return out of `run` between the engine take-out and a re-insert drops that process's machine.** The take-out is `run.rs:823`; the `Yield` arm's `current_code() == None` return (`run.rs:1271`) and the two `?`s at `run.rs:1313`/`:1321` all return while `engine` is still a local. The pid stays on the run queue, so the next slice answers `refuse_engine_less` → `Wait` with the state restored to `Runnable` (`run.rs:313-334`) and nothing ever runs it again — and the machine, the only holder of that process's live x/stack while it is parked, is gone. Minimal fix: re-insert the engine before returning the error.
 * **`RunnerState`'s per-pid maps are never pruned on process death.** The only `engines.remove` is the slice take-out (`run.rs:823`), so a terminated parked process keeps its machine (and that machine's refc-binary reservoir) for the runtime's life; `gather_off_heap_roots` gates the dead machine's dangling root set on `live(pid)` (`entry.rs:506`), so the residue is a leak, never a read.
 * **A matched-N `ns_per_call` comparison against a runtime that never collects is not like-for-like on an allocation-shaped loop.** Such a runtime runs **zero** collections (the admission declines and the nursery grows instead) where this one runs 4 728 collections and 325 majors on the same 2 001-call `churn` run (**2.3628** collections and **0.1624** majors per call, at the same per-call rate at N = 40 000: 95 057 / 6 465 over 40 001 calls = **2.3764** / **0.1616**), so the difference is the memory management each performs and the heap the other retains, not dispatch or tier.
@@ -506,7 +482,8 @@ its loose-term latches changed while parked.
   (the `jit_mode` field, the `jit_mode()` accessor and the `reservoir_at(pid)` read-only off-heap
   roster seam).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
-  parked-machine root hand-off (`park_machine` → `publish_parked_roots`/`resume_from_process_roots`,
+  parked-machine root hand-off (`park_window` → `park_machine` → `publish_parked_roots` /
+  `resume_from_process_roots`; `ParkExemption` makes the exemption and the publication one decision),
   whose `fr_count` argument is the live prefix `Machine::fr_mark()` — the value that also opens the
   inter-slice window's relocation exemption, whose presence makes `park_machine` skip the publication),
   the
