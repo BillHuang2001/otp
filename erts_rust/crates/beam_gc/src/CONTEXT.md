@@ -274,8 +274,8 @@ Consequence: `beam_gc` cannot itself be the cause of an unmap-class dangling poi
 - `relocate.rs` → the **region-generic relocating compactor**: `Relocator` (`new`/`new_checked`/`forward_roots`/`words_copied`/`objects_copied`/`dest_words_used`/`complete`) driving the same copy engine over a host-owned destination, the atomic single-slice `compact`, `Relocation`, and the turnkey `LinearDest` for a flat foreign region
 - `relocate/tests.rs` → the region-generic seam's in-module suite (the synthetic `Region` fixture, `from_ranges`' geometry, `LinearDest`, `compact`'s exact copy, root-slice idempotence, preflight atomicity and the `BadArg` refusal)
 - `collector.rs` → the two-generation `Collector` driver (incl. the kind-pinned `collect_kind`), its kind choice over `minor_promotion_fits`/`minor_room_words` (the live promotion the minor would move), and the fullsweep's sizing with the young occupancy clamped to the capacity the collapse installs
-- `live.rs` → the exact-live counter (`live`/`live_full`, `Live { words, lines }`)
-- `reachable.rs` → the read-only whole-heap walk: `ReachableObject`, `walk_reachable`, `for_each_reachable_view`/`for_each_reachable`, the `Visited` set (its `index` delegates to `FromSet::locate`)
+- `live.rs` → the exact-live counter (`live`/`live_full`, `Live { words, lines }`) and its public `live_words_in` form (the exact copy volume, hence the right `required_words` for `Relocator::new_checked`)
+- `reachable.rs` → the read-only whole-heap walk: `ReachableObject`, `walk_reachable`, `for_each_reachable_view`/`for_each_reachable` and the public `for_each_reachable_in` wrapper, the `Visited` set (its `index` delegates to `FromSet::locate`)
 - `config.rs` → `GcConfig`, `MatureKind`, `MatureSelection`, `mature()`/`mature_choice()`, `growable`
 - `selection.rs` → the automatic rule: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice`
 - `immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, the `release_*` rollback primitives, `ImmixStats`/`ImmixCounters`
