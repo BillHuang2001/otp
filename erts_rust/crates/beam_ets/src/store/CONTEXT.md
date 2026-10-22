@@ -46,6 +46,7 @@ Parent: `../CONTEXT.md` (the `Table` seam). Contract source: `../../CONTEXT.md` 
 - **A sub-bitstring is re-materialised, never aliased.** Its data lives outside the term graph (an off-heap refc payload, or another heap), so the payload bytes are gathered and re-written as an on-heap bitstring; a null base or an inverted window is a typed `badarg` rather than a fault.
 - **`free` returns 0 for an untracked root by design** — idempotent operator; `Drop`/`reset` do the wholesale release.
 - **`free` is keyed by the root word.** Address reuse means a *stale* root handle can equal a live object's root; callers must drop the handle when they free (the table does, removing the entry in the same step). Documented, not enforced.
+- **Reclamation and reuse are per-RUN, not per-object, and reuse is LIFO.** `free(root)` releases each of the object's runs into per-exact-word-count buckets and `alloc_words` pops from the end of the matching bucket (`take_free_run`), so *any* stale `Eterm` pointing **anywhere inside** a freed object is at risk, not just its root: the next `copy` that needs a run of that word count overwrites it in place — a cons cell is always a 2-word run, so every later list copy competes for the same bucket. This is the mechanism behind a read term aliasing recycled storage (never a wrong value from a *live* term).
 - **`relinquish` never returns words to the free lists** — the difference from `free`; the arena cannot shrink, so checked-out words are held until `reset`/`Drop`.
 
 ## Known Issues / Limits (honest)
