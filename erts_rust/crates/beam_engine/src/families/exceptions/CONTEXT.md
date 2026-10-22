@@ -94,8 +94,10 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
 A raise that **arrives carrying** its own trace keeps it: no frame of the re-raise site is ever prepended,
 exactly as the oracle's `build_stacktrace` returns a supplied list verbatim.
 Two flavours exist: the **explicit symbolic frames** are metadata (an `Option<StackTrace>`, no heap term),
-the **trace term** is a real `Eterm` carried by the raise and needs no rooting of its own (nothing allocates
-between arming its latch and publishing it; the destination is the handler's `x(2)`, inside the root set).
+the **trace term** is a real `Eterm` carried by the raise and is one of the machine's **loose heap terms**:
+`Machine::with_roots` parks `pending_supplied_term`/`raise_supplied_term` at the Erlang-stack tail for the
+duration of every root hand-off and re-seats them (`src/machine/CONTEXT.md`), so a collection between arming
+a latch and publishing it relocates the cooked list instead of stranding it.
 C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace` it stores
 (`erts/emulator/beam/beam_common.c:1148-1179`), `save_stacktrace`'s `EXF_SAVETRACE` guard (`:505-507`) and
 `build_stacktrace`'s verbatim return (`:1219-1223`).
