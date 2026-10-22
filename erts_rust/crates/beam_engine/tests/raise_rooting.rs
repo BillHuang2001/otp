@@ -71,6 +71,11 @@
 //! term a raise leaves behind: [`Machine::pending_exception`]'s reason, which the host
 //! dereferences long after the raise (`pending_exception_reason_survives_a_collection`).
 //!
+//! A sixth case pins the **reserve → read → write** ordering at the `raw_raise`
+//! instruction itself: the reason it raises with is `x(1)`, a heap term the cooking
+//! reservation of the supplied stacktrace may move, so the instruction must re-read
+//! it from the machine *after* that reservation
+//! (`a_raw_raise_reason_is_re_read_after_the_cooking_reservation`).//!
 //! ```text
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml \
 //!     -p beam_engine --test raise_rooting
@@ -1192,9 +1197,199 @@ fn pending_exception_reason_survives_a_collection() {
 }
 
 // ---------------------------------------------------------------------------
-// Oracle cross-check (real ERTS), skipped loudly without `erlc`/`erl`
+// (e) `raw_raise` re-reads its reason after the cooking reservation
 // ---------------------------------------------------------------------------
 
+/// `run/0`'s entry label of the `raw_raise` fixture.
+const L_RAW: Label = Label(1);
+/// The label of the `try` handler that catches the fixture's first (arming) raise.
+const L_RAW_HANDLER: Label = Label(3);
+
+/// The reason the `raw_raise` fixture raises: a **heap container** of small ints, so
+/// the collector has something to relocate (a small int is an immediate and never
+/// moves — which is exactly why the pre-existing `raw_raise` unit test,
+/// `tests/families/exceptions/tests/raising.rs`, cannot see this hazard).
+const RAW_REASON: [i64; 3] = [11, 22, 33];
+
+/// The rooted reservations the `raw_raise` fixture performs: one `put_tuple2` that
+/// builds the reason, and one `reserve_slack` that cooks the supplied trace. The
+/// arming raise (`if_end`) allocates nothing — it is a bare-atom reason.
+const RAW_RESERVES: usize = 2;
+
+/// A module whose `run/0` raises through the **register protocol** `raw_raise` with
+/// a heap-resident reason:
+///
+/// ```text
+/// run/0:
+///   allocate 1
+///   try Y0, L3
+///   if_end                     % a caught raise, so raise_snapshot is ARMED
+///   try_end Y0 ; deallocate 1 ; return
+/// L3:
+///   try_case Y0                % pops the frame (no handler left ⇒ uncaught)
+///   X1 = {11, 22, 33}          % the reason — a heap term
+///   X0 = error                 % the class atom
+///   X2 = NIL                   % no supplied trace ⇒ the chain is COOKED here
+///   raw_raise
+///   deallocate 1 ; return
+/// ```
+///
+/// The leading caught raise is not decoration: it leaves `Machine::raise_snapshot`
+/// populated, so `raw_raise`'s cooking reservation asks for a **non-zero** word count
+/// and the moving collector really has an allocation to run under. (It also proves the
+/// hazard is independent of the engine's zero-word `reserve_slack` admission, which is
+/// a residual of its own — see `src/families/CONTEXT.md`.)
+///
+/// No handler is live at the `raw_raise`, so that raise propagates out of the machine
+/// as the typed `Err(BeamError::Raise(..))` and both host-visible reasons — the
+/// machine's [`Machine::pending_exception`] slot and the raise's live-reason term —
+/// must name the word the instruction handed the raise funnel.
+fn raw_raise_module() -> Fixtures {
+    let mut fixture = Fixture::new("rawraise");
+    let error_atom = fixture.atom("error");
+    // The arming raise's bare-atom reason, resolved from the running module's table.
+    fixture.atom("if_clause");
+    let code = vec![
+        Instr::Label(L_RAW),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Try {
+            frame: Operand::Y(0),
+            fail: L_RAW_HANDLER,
+        },
+        Instr::IfEnd,
+        Instr::TryEnd {
+            frame: Operand::Y(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+        Instr::Label(L_RAW_HANDLER),
+        Instr::TryCase {
+            frame: Operand::Y(0),
+        },
+        Instr::PutTuple2 {
+            dst: Operand::X(1),
+            elements: RAW_REASON.iter().map(|n| Operand::Integer(*n)).collect(),
+        },
+        Instr::Move {
+            src: Operand::Atom(error_atom),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Nil,
+            dst: Operand::X(2),
+        },
+        Instr::RawRaise,
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    let label = fixture.add_function("rawraise", 0, code);
+    let run = fixture.export("rawraise", 0, label);
+    Fixtures {
+        module: fixture.finish(),
+        run,
+        f: run,
+    }
+}
+
+/// **`raw_raise` re-reads the reason from the machine after the cooking
+/// reservation.**
+///
+/// `Instr::RawRaise` takes its reason from `x(1)` — a heap container — and cooks the
+/// chain from `x(2)` when that register holds `NIL`. The cooking reserves through the
+/// rooted allocation seam ([`terms::reserve_slack`] → `Machine::alloc_rooted`), so a
+/// collecting host may **move every root**: `x(1)`/`x(2)` are relocated inside the
+/// machine, and a word captured *before* the reservation addresses the region the
+/// collector then vacated. The instruction therefore re-reads both registers after the
+/// reservation (reserve → read → write) instead of raising with the pre-collection
+/// copies.
+///
+/// The failure this pins is silent or fatal, never cosmetic: the reason a raise
+/// carries is compared, walked and rendered downstream, so a stranded container is a
+/// use-after-free (`beam_term::tuple_arity` on the poison word) rather than a wrong
+/// comparison. The assertions below are ordered so the *first* one to fail names the
+/// defect: the installed reason must live in the region the collector hands out of
+/// now.
+#[test]
+fn a_raw_raise_reason_is_re_read_after_the_cooking_reservation() {
+    let fixtures = raw_raise_module();
+    let mut ctx = MovingContext::new();
+    let mut machine = Machine::new();
+
+    let err = run(&mut machine, &fixtures.module, fixtures.run, 0, &[], &mut ctx)
+        .expect_err("run/0 has no handler, so the raise leaves the machine");
+    let BeamError::Raise(raise) = &err else {
+        panic!("expected the typed Err(BeamError::Raise(..)), got {err:?}");
+    };
+    assert_eq!(raise.class, ExceptionClass::Error);
+
+    // The collector really ran, once per rooted reservation (the tuple build, then the
+    // cooked-trace reservation), and relocated a live block.
+    assert_eq!(ctx.collections, RAW_RESERVES, "one collection per reservation");
+    assert!(ctx.moved_any, "no block was ever relocated");
+
+    // The word the engine installed as the raise reason, from both host-visible
+    // channels: the machine's pending-exception slot and the propagated raise.
+    let (class, installed) = machine
+        .pending_exception()
+        .expect("the raise records the pending exception");
+    assert_eq!(class, ExceptionClass::Error);
+    let live = raise
+        .live_reason()
+        .and_then(|lr| lr.downcast_ref::<Eterm>())
+        .copied()
+        .expect("an uncaught structured raise carries its live reason term");
+    assert_eq!(
+        live, installed,
+        "the propagated raise and the machine's slot name the same reason word"
+    );
+
+    // DECISIVE: the reason is the collector's relocated word, not the pre-move one.
+    assert!(
+        ctx.points_into_current_region(installed),
+        "the raw_raise reason must be the term the collector wrote back, but it still \
+         points into the region the collection vacated: {installed:?}"
+    );
+    let seen = ctx.x_seen.last().expect("the cooking hand-off");
+    assert!(
+        seen.len() > 1,
+        "the cooking hand-off roots at least x(0) and x(1)"
+    );
+    let pre_move = seen[1];
+    assert!(
+        !ctx.points_into_current_region(pre_move),
+        "the pre-move reason word is in the vacated region — a raise built from it \
+         reads poison"
+    );
+    assert_ne!(
+        installed, pre_move,
+        "the collection moved the reason, so the raised word must differ from the \
+         pre-reservation one"
+    );
+
+    // The pre-move location holds the poison word, so the pre-fix word was a dangling
+    // pointer rather than a lucky alias; and the relocated term reads back intact.
+    //
+    // SAFETY: `pre_move` names a word of the collector's *vacated* semi-space, which
+    // the context keeps alive (`MovingContext::_regions`) and the collection filled
+    // with `POISON`; the read is of initialised memory inside a live allocation.
+    let stale = unsafe { *(boxed_val(pre_move) as *const Eterm) };
+    assert_eq!(
+        stale, POISON,
+        "the vacated region holds the poison word, so the stranded reason reads garbage"
+    );
+    assert_eq!(
+        tuple_elements(installed),
+        RAW_REASON.iter().map(|n| make_small(*n)).collect::<Vec<_>>(),
+        "the relocated reason reads back with the same tag and contents"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check (real ERTS), skipped loudly without `erlc`/`erl`
+// ---------------------------------------------------------------------------
 /// Compile the `.erl` fixture below with the system `erlc` into a scratch directory
 /// and hand back its path, or `None` when no runnable `erlc` is on `PATH` at all.
 ///

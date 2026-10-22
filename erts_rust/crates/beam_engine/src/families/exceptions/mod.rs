@@ -352,9 +352,14 @@ pub(crate) fn exec(
         // `catch C:R:S -> erlang:raise(C, R, S)` shape into
         // (`lib/compiler/src/sys_core_fold.erl:2441-2465`).
         Instr::RawRaise => {
+            // Classify from `x(0)` **first**: the class is an atom — an immediate, so
+            // it can never be relocated — and the arm it selects has to be chosen
+            // before anything allocates. The two other register words
+            // (`x(1)` the reason, `x(2)` the raw trace) are heap terms: they are read
+            // **after** the reservation below, from the machine's post-collection
+            // registers, never captured as pre-reservation Rust locals (the frozen
+            // reserve → read → write ordering, `../../CONTEXT.md` §3).
             let class_term = read_operand(machine, ctx, &Operand::X(0))?;
-            let value = read_operand(machine, ctx, &Operand::X(1))?;
-            let trace = read_operand(machine, ctx, &Operand::X(2))?;
             match classify_class(module, class_term) {
                 Some(class) => {
                     // The class atom is exactly the one we matched, so it is
@@ -376,11 +381,34 @@ pub(crate) fn exec(
                     // re-raised, C's `c_p->ftrace` — cooked **once** (rooted) into the
                     // term the raise then supplies, so no re-raise-site frame is ever
                     // derived.
-                    let supplied = if is_nil(trace) {
-                        symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?
+                    //
+                    // Whether the trace must be cooked at all is a **tag test** on `x(2)`:
+                    // keep the answer as a `bool`, never the term, because the cooking
+                    // itself reserves (and a collecting host may move every root).
+                    let cook = is_nil(read_operand(machine, ctx, &Operand::X(2))?);
+                    let cooked = if cook {
+                        Some(symbolic_stacktrace(machine, entry_module, ctx, &Operand::X(2), false)?)
                     } else {
-                        trace
+                        None
                     };
+                    // The reservation above (`symbolic_stacktrace`'s `reserve_slack` →
+                    // `Machine::alloc_rooted` → the host's `alloc_words_rooted`) may have
+                    // MOVED every live term the machine holds: a collecting host relocates
+                    // `x`/stack/FR **in place**, so the registers now carry the relocated
+                    // words and any word captured before the reservation addresses the
+                    // region the collector vacated. The reason and the supplied trace are
+                    // therefore re-read HERE, from the machine — the same discipline
+                    // `catch_end` above follows by re-reading `x(1)`/`x(0)` inside its
+                    // builder's reader closure.
+                    let value = read_operand(machine, ctx, &Operand::X(1))?;
+                    let supplied = match cooked {
+                        Some(cooked) => cooked,
+                        None => read_operand(machine, ctx, &Operand::X(2))?,
+                    };
+                    // Nothing allocates between these reads and `raise_supplied` (it arms
+                    // the one-shot latch and forwards to `throw_with_trace`, which only
+                    // unwinds and writes registers), so both words stay valid to the
+                    // raise.
                     machine.raise_supplied(class, value, supplied).map(Some)
                 }
                 None => {
