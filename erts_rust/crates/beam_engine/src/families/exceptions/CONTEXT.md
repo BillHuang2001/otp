@@ -26,6 +26,14 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   x(2)=trace protocol, incl. the "unknown class" `badarg` fall-through and the
   trace **term** it supplies through `Machine::raise_supplied`), and
   `build_stacktrace`.
+  `raw_raise` follows the reserve → read → write ordering: `x(0)` is classified
+  **first** (the class is an atom — an immediate, so it can never be relocated) and
+  `x(2)`'s `NIL` tag test decides whether a cooking allocation happens at all, but
+  the **reason** (`x(1)`) and the **supplied trace** (`x(2)`) are read only **after**
+  the cooking reservation, from the machine's post-collection registers — a
+  collecting host relocates `x` in place, so a pre-reservation word would address the
+  region it vacated. Nothing allocates between those reads and
+  `Machine::raise_supplied`, so both words stay valid to the raise.
 - `raise.rs` (private helper module): `raise_error_tuple` / `raise_error_atom` (reason
   construction through the **rooted** builders, so a moving collector can run under the
   reserve), `install_class_atom` (never substitutes an atom the module cannot name) and
@@ -111,6 +119,9 @@ C's discriminators are `raw_raise`'s `EXF_SAVETRACE` clear and the `c_p->ftrace`
   publishes it as the handler's `x(2)` (C's register convention, so the next `raw_raise`/`build_stacktrace`
   reads it straight back), an **uncaught** one renders the preserved chain through
   `Machine::with_uncaught_frames` (`Machine::snapshot_stacktrace`).
+  The reason the raise carries is `x(1)`, a heap container whenever the exception is structured, so it is
+  read **after** the cooking reservation too, together with a `NIL` `x(2)`: the reservation runs the host's
+  collecting door and relocates every register in place, and only the post-collection words survive.
   `symbolic_stacktrace` therefore begins with an **already-cooked passthrough**: a trace register holding a
   cons cell (`is_list`) is returned verbatim (C's `is_raised_exc` arm, `:1219-1223`), because a raw-trace
   word is never a cons — it is `NIL` or the one synthesized callee head item (`callee.rs`).
@@ -229,9 +240,13 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
   [`crate::machine::deadline_tests`]). The engine's cooked list is asserted to be a
   **non-empty prefix** of the oracle's (host `erl_eval`/`init` callers lie outside the run).
 - `raising.rs` — the raising opcodes' reason expansion (caught and uncaught), the
-  `raise` re-raise opcode, `raw_raise`'s class protocol and `badarg` fall-through, and (now) the trace-term
+  `raise` re-raise opcode, `raw_raise`'s class protocol and `badarg` fall-through, and the trace-term
   supply: `x(2)` holding a cooked list is passed through verbatim, a `NIL` `x(2)` cooks the preserved
   `raise_snapshot` chain once, and a landed raise publishes that term as the next handler's `x(2)`.
+  These unit cases drive `exec` directly with a non-collecting host and an immediate reason, so they
+  cannot observe a move; the crate-level `tests/raise_rooting.rs`
+  (`a_raw_raise_reason_is_re_read_after_the_cooking_reservation`) is the moving-collector gate for the
+  reserve → read → write ordering of `raw_raise`'s reason and supplied trace.
 - `stacktrace.rs` — `build_stacktrace`: the `NIL` raw trace (`NIL` out), the
   `is_list` passthrough of an already-cooked supplied trace,
   raise-snapshot ordering (a frame the raise *unwound* is still present, proving the
