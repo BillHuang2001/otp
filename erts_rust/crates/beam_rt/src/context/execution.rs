@@ -80,7 +80,15 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `Ok(false)` for everything else and stay allocation-free: both predicates begin with a
     /// **module-name equality** check (`prim_tty`, `zlib`) and only then test membership in a
     /// fixed `(name, arity)` table — no registry lookup, no hash, no term is built.
+    ///
+    /// The leading `matches!` guard is a fast path that is **equivalent to, not narrower than**
+    /// the two predicates: `prim_tty::serves_local_call` and `beam_bifs::serves_local_call` each
+    /// start with a module-name equality (`prim_tty`, `zlib`) over exactly these two names, so no
+    /// other module can reach their `true` and the guard can never mask one.
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
+        if !matches!(module, "prim_tty" | "zlib") {
+            return Ok(false);
+        }
         if crate::native::prim_tty::serves_local_call(module, function, arity) {
             return Ok(true);
         }

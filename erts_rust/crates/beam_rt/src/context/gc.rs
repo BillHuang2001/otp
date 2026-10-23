@@ -1080,11 +1080,23 @@ pub(crate) fn ensure_heap(
     // collection it drove could dangle a live float register. Only a call site whose module is
     // known to be float-free may therefore be collected over. An unknown call site (a fun
     // entry, the `-eval` evaluator) is skipped, never guessed at.
-    let Some(name) = ctx.current_module.clone() else {
-        return Ok(());
-    };
-    if !module_may_be_collected(ctx.runtime, &name) {
-        return Ok(());
+    //
+    // The caller module is read **in place** (`as_deref`) rather than cloned: `module_may_be_collected`
+    // needs `&mut Runtime` while the name lives in a sibling field, so the two are taken as
+    // disjoint borrows of the same context instead of paying a `String` malloc + memcpy + free
+    // on every armed heap admission.
+    {
+        let RuntimeContext {
+            runtime,
+            current_module,
+            ..
+        } = &mut *ctx;
+        let Some(name) = current_module.as_deref() else {
+            return Ok(());
+        };
+        if !module_may_be_collected(runtime, name) {
+            return Ok(());
+        }
     }
 
     // The two disjoint fields: the process table (the caller's, for a slice) and the
