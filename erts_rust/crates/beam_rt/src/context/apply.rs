@@ -187,9 +187,14 @@ impl RuntimeContext<'_> {
     /// [`crate::error::bad_fun`] (class `error`, reason atom `badfun`). The C's
     /// `expand_error_value` step (`{badfun, Fun}`) is the engine's, not this seam's: the
     /// fun reaches here as a bare `Eterm` that must not be held across an allocation —
-    /// see [`crate::error::bad_fun`] for the reasoning and the residual. An image naming
-    /// **no loadable module** stays [`BeamError::BadArg`]: the oracle answers
-    /// `error:undef` there (`error_handler:undefined_lambda/3`), a separate divergence.
+    /// see [`crate::error::bad_fun`] for the reasoning.
+    ///
+    /// An image naming **no loadable module** is a *different* failure: the C hands it to
+    /// `error_handler:undefined_lambda/3` (`beam_common.c:1707-1722`), whose crash path raises
+    /// bare `error:undef` with the applied fun as the innermost trace item. That is
+    /// [`crate::error::undefined_lambda`], the marker the engine expands into the oracle's
+    /// `{Fun, ArgList, []}` head item
+    /// ([`beam_engine::families::funs`](beam_engine)'s `fun_apply_error`).
     pub(crate) fn imported_fun_target(
         &mut self,
         fun: Eterm,
@@ -221,7 +226,11 @@ impl RuntimeContext<'_> {
             None => {
                 let _ = self.runtime.find_module_file(&name);
                 let Ok(callee) = self.runtime.code_server.load(&name) else {
-                    return Err(BeamError::BadArg);
+                    // No current code for this module and none loadable — the C's
+                    // `call_fun` arm that dispatches to `error_handler:undefined_lambda/3`
+                    // and ends in bare `error:undef` (`beam_common.c:1707-1722`). The head
+                    // item the oracle prints for it is the engine's to synthesize.
+                    return Err(beam_engine::error::undefined_lambda());
                 };
                 callee
             }
@@ -400,11 +409,14 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArity`] for an argument count the descriptor disagrees with, and
+    /// [`BeamError::BadArity`] for an argument count the descriptor disagrees with,
     /// [`crate::error::bad_fun`] for an image that names no lambda of a loaded module (the
     /// C's `EXC_BADFUN`, whose `{badfun, Fun}` expansion is the engine's — see
-    /// [`crate::error::bad_fun`]). An image naming no **loadable** module keeps
-    /// [`BeamError::BadArg`], as in [`RuntimeContext::imported_fun_target`].
+    /// [`crate::error::bad_fun`]), and [`crate::error::undefined_lambda`] for one whose module
+    /// has no loadable code (the C's `error_handler:undefined_lambda/3` arm). A `module` the
+    /// code server does not hold at all is [`BeamError::BadArg`]: the in-machine arm
+    /// ([`RuntimeContext::imported_fun_target`]) is the one that loads on demand, so reaching
+    /// this host fallback with an unloaded module means no body is available to enter.
     fn dispatch_served_imported_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         let (uniq, index) = terms::fun_local_key(fun)?;
         let name = self

@@ -9740,15 +9740,122 @@ fn a_decoded_closure_resolves_to_its_lambda_and_applies_through_both_routes() {
     );
 }
 
-/// Asserts the C's `EXC_BADFUN` **pre-expansion** signal: class `error`, reason atom
-/// `badfun`.
+/// **An imported fun whose module is neither loaded nor loadable raises the C's
+/// `error:undef`, not `EXC_BADFUN`.**
 ///
-/// `beam_common.c:1696-1706` sets `p->freason = EXC_BADFUN` (and `p->fvalue = fun`) when a
-/// module **is** loaded but the fun is not defined in it; `expand_error_value`
-/// (`:750-772`) then wraps the pair into `TUPLE2(am_badfun, fun)`. The host seam can only
-/// report the first half (it holds the fun as a bare `Eterm` that must not survive the
-/// tuple's allocation), so it is the class + reason atom that is asserted here; the
-/// expansion is the engine's (`beam_engine::families::funs::raise_badfun`).
+/// `call_fun` (`erts/emulator/beam/beam_common.c:1696-1722`) splits the two failures: a module
+/// that **is** loaded but defines no such fun entry is `EXC_BADFUN` (`{badfun, Fun}`, pinned by
+/// [`an_imported_fun_naming_no_lambda_raises_badfun`]), while a module with **no current code**
+/// is dispatched to `error_handler:undefined_lambda/3`, which — once `ensure_loaded/1` fails —
+/// raises bare `error:undef` with the applied fun as the innermost trace item
+/// (`lib/kernel/src/error_handler.erl:117-127`, `:162-171`). Measured on OTP 29.1.1: a
+/// `NEW_FUN_EXT` image whose module atom names nothing answers
+/// `{error, undef, {#Fun<nofun.0.…>, [41], []}}`.
+///
+/// The host reports the class/reason **and** the typed
+/// [`beam_engine::error::undefined_lambda`] marker, so the engine can cook the
+/// `{Fun, ArgList, []}` head item from the fun it is applying (the host must not: the fun
+/// reaches it as a bare `Eterm` it may not hold across an allocation).
+#[test]
+fn an_imported_fun_naming_an_unloadable_module_raises_undef() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "new_fun_ext seam",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "new_fun_ext_unloadable", &[("dfun", DFUN_SRC)]);
+    let mut rt = runtime();
+    rt.load_module(dir.path().join("dfun.beam"))
+        .expect("the fixture loads into the code server");
+    let image = dfun_image(&mut rt, dir.path(), "img0");
+    let mut heap = beam_alloc::Heap::new(256).expect("a scratch heap");
+    let genuine = decode_fun_image(&mut rt, &mut heap, &image);
+    // The genuine image's identity, re-labelled with a module atom that names nothing: no
+    // loaded module, and no `nosuchmd.beam` on any code path either.
+    let checksum = beam_codec::term::fun_uniq_bytes(genuine).expect("the image's 16-byte uniq");
+    let (index, old_index, uniq) = (
+        beam_codec::term::fun_index_term(genuine).expect("the index field"),
+        beam_codec::term::fun_old_index_term(genuine).expect("the old_index field"),
+        beam_codec::term::fun_old_uniq_term(genuine).expect("the old_uniq field"),
+    );
+    let missing_module = atom_val(rt.intern("nosuchmd"));
+    let creator = beam_codec::term::FunPid {
+        node: atom_val(rt.intern("nonode@nohost")),
+        number: 0,
+        serial: 0,
+        creation: 0,
+    };
+    let orphan = beam_codec::term::make_fun_imported(
+        &mut heap,
+        1,
+        missing_module,
+        &checksum,
+        index,
+        old_index,
+        uniq,
+        creator,
+        &[],
+    )
+    .expect("the wire image builds");
+    assert!(
+        rt.code_server().module_handle("nosuchmd").is_none(),
+        "the fixture must not accidentally load a module of that name"
+    );
+
+    let args = [make_small(41)];
+    let mut ctx = RuntimeContext::new(&mut rt);
+    for (route, error) in [
+        (
+            "imported_fun_target",
+            match ctx.imported_fun_target(orphan, &args) {
+                Err(error) => error,
+                Ok(_) => panic!("an unloadable module must not resolve to an entry"),
+            },
+        ),
+        (
+            "resolve_local_fun",
+            match ctx.resolve_local_fun(orphan, &args) {
+                Err(error) => error,
+                Ok(_) => panic!("an unloadable module must not enter an in-machine label"),
+            },
+        ),
+        (
+            "apply_fun",
+            match ctx.apply_fun(orphan, &args) {
+                Err(error) => error,
+                Ok(_) => panic!("an unloadable module must not be applied"),
+            },
+        ),
+    ] {
+        match &error {
+            BeamError::Raise(raise) => {
+                assert_eq!(
+                    raise.class,
+                    beam_common::ExceptionClass::Error,
+                    "{route}: the oracle's class is `error`, got {error:?}"
+                );
+                assert_eq!(
+                    raise.reason.as_atom(),
+                    Some("undef"),
+                    "{route}: the oracle's reason atom is `undef`, got {error:?}"
+                );
+            }
+            other => panic!("{route}: expected the `undef` raise, got {other:?}"),
+        }
+        assert!(
+            beam_engine::error::is_undefined_lambda(&error),
+            "{route}: the raise must carry the typed marker the engine cooks the \
+             {{Fun, ArgList, []}} head item from, so a user `erlang:error(undef)` is never \
+             expanded"
+        );
+        assert!(
+            !beam_engine::error::is_bad_fun(&error),
+            "{route}: an unloadable module is not the C's EXC_BADFUN"
+        );
+    }
+}
 fn assert_badfun(error: BeamError, what: &str) {
     match &error {
         BeamError::Raise(raise) => {

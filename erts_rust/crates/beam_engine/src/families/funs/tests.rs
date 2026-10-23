@@ -1008,6 +1008,226 @@ fn call_fun_with_a_non_fun_without_a_catch_frame_keeps_the_live_reason() {
 }
 
 // -----------------------------------------------------------------------
+// The `error_handler:undefined_lambda/3` raise of a fun apply
+// -----------------------------------------------------------------------
+
+/// `f(F) -> try F(7) catch C:R:S -> S end.` as a compiled `call_fun 1` inside a
+/// `try`, returning the **cooked stacktrace** (`BuildStacktrace`), so a test can
+/// read the raise's innermost item.
+///
+/// ```text
+/// f/1:
+///     allocate 1
+///     move x(0) -> x(1)          ; the `call_fun` target register
+///     move 7    -> x(0)          ; the applied argument
+///     try y(0) 20
+///     call_fun 1
+///     try_end y(0)
+///     deallocate 1
+///     return
+/// 20: try_case y(0)              ; x(1)=reason, x(2)=raw trace, x(3)=class
+///     move x(2) -> x(0)
+///     build_stacktrace
+///     deallocate 1
+///     return
+/// ```
+fn call_fun_in_a_try(fixture: &mut Fixture) -> Label {
+    let entry = fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::Try {
+                frame: Operand::Y(0),
+                fail: Label(20),
+            },
+            Instr::CallFun { arity: 1 },
+            Instr::TryEnd {
+                frame: Operand::Y(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+            Instr::Label(Label(20)),
+            Instr::TryCase {
+                frame: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::X(2),
+                dst: Operand::X(0),
+            },
+            Instr::BuildStacktrace,
+            Instr::Deallocate(1),
+            Instr::Return,
+        ],
+    );
+    fixture.add_export("f", 1, entry);
+    entry
+}
+
+/// A fixture naming every atom the fun-apply raise needs.
+fn undefined_lambda_fixture() -> (Fixture, Label, u32) {
+    let mut fixture = Fixture::new();
+    for name in ["badfun", "badarity", "undef", "error"] {
+        fixture.atom(name);
+    }
+    let entry = call_fun_in_a_try(&mut fixture);
+    // The `uniq`/`index` pair identifies the closure in the synthesized item.
+    let index = fixture.add_fun("g", 1, 0, 0x1234);
+    (fixture, entry, index)
+}
+
+/// The engine expands [`crate::error::undefined_lambda`] into the oracle's
+/// `{Fun, ArgList, []}` head item — the `error_handler:undefined_lambda/3` crash shape.
+///
+/// Measured on OTP 29.1.1 (`fun nfbadfun` in `tests/decoded_fun_badfun.rs`):
+/// `try G(41) catch C:R:S -> {C,R,hd(S)} end` for a `NEW_FUN_EXT` image naming an unloaded
+/// module answers `{error, undef, {#Fun<nofun.0.…>, [41], []}}` — a **3-tuple** whose first
+/// element is the applied fun (`error_handler.erl`'s `crash(Fun, Args) -> crash({Fun,Args,[]})`),
+/// the real argument list, and the empty location. Contrast the 4-tuple
+/// `{Module, Function, ArgList, []}` a `call_ext` to a missing export cooks
+/// (`families::exceptions::callee`).
+#[test]
+fn call_fun_with_the_undefined_lambda_marker_cooks_the_applied_fun_head_item() {
+    let (mut fixture, entry, index) = undefined_lambda_fixture();
+    let undef = fixture.atom("undef");
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::with_apply_hook(Box::new(|fun, args| {
+        assert!(terms::is_fun(fun), "the fallback receives the genuine fun");
+        assert_eq!(args, [make_small(7)], "the applied argument list");
+        Err(crate::error::undefined_lambda())
+    }));
+    let fun = terms::make_fun(&mut ctx, 1, 0x1234, index, &[]).expect("materialize the closure");
+
+    let mut machine = Machine::new();
+    let cooked = machine
+        .run_export(&module, module.atom_table.lookup("f").expect("f"), 1, &[fun], &mut ctx)
+        .expect("the handler returns the cooked trace");
+
+    // The landed reason is the oracle's: class `error`, bare reason atom `undef`.
+    assert_eq!(
+        machine.x(1),
+        Some(make_atom(undef)),
+        "the landed reason is the bare atom `undef`"
+    );
+    let frames = terms::list_elements(cooked).expect("the cooked trace is a proper list");
+    assert_eq!(
+        frames.len(),
+        2,
+        "the synthesized head item plus the raising frame"
+    );
+    let item = frames[0];
+    assert_eq!(
+        terms::tuple_arity(item).expect("the item is a tuple"),
+        3,
+        "the undefined-lambda item is a 3-TUPLE {{Fun, Args, []}}, not the call-site \
+         4-tuple {{Module, Function, ArgList, []}}"
+    );
+    let applied = terms::tuple_element(item, 0).expect("element 0");
+    assert!(terms::is_fun(applied), "element 0 is the applied FUN");
+    assert_eq!(
+        terms::fun_uniq(applied).expect("the applied fun's uniq"),
+        0x1234,
+        "the item names the closure that was actually applied"
+    );
+    assert_eq!(
+        terms::fun_index(applied).expect("the applied fun's index"),
+        index,
+        "and its own fun-table index"
+    );
+    assert_eq!(
+        terms::list_elements(
+            terms::tuple_element(item, 1).expect("element 1")
+        )
+        .expect("the item's ArgList is a proper list"),
+        vec![make_small(7)],
+        "the REAL argument list the fun was applied to"
+    );
+    assert_eq!(
+        terms::tuple_element(item, 2).expect("element 2"),
+        NIL,
+        "the Location of a callee that does not exist is the empty list"
+    );
+    assert_eq!(
+        terms::tuple_element(frames[1], 1).expect("the raising frame's function"),
+        make_atom(module.atom_table.lookup("f").expect("f")),
+        "then the raising frame"
+    );
+}
+
+/// A **plain** `undef` (no marker) is never given the fun-apply head item.
+///
+/// The marker is what distinguishes `error_handler:undefined_lambda/3` (whose innermost item is
+/// the applied fun) from every other `undef` — a nested machine's raise, a `call_ext`, a
+/// `call_bif` such as `(fun m:missing/1)(X)`. Synthesizing `{Fun, Args, []}` for those would
+/// attribute an unrelated raise to the fun being applied.
+#[test]
+fn a_plain_undef_at_a_fun_apply_is_not_given_a_head_item() {
+    let (mut fixture, _entry, index) = undefined_lambda_fixture();
+    let undef = fixture.atom("undef");
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::with_apply_hook(Box::new(|_fun, _args| {
+        Err(BeamError::Raise(beam_common::Raise::error(
+            beam_common::ExitReason::atom("undef"),
+        )))
+    }));
+    let fun = terms::make_fun(&mut ctx, 1, 0, index, &[]).expect("materialize the closure");
+
+    let mut machine = Machine::new();
+    let cooked = machine
+        .run_export(&module, module.atom_table.lookup("f").expect("f"), 1, &[fun], &mut ctx)
+        .expect("the handler returns the cooked trace");
+
+    assert_eq!(
+        machine.x(1),
+        Some(make_atom(undef)),
+        "the reason is unchanged"
+    );
+    let frames = terms::list_elements(cooked).expect("the cooked trace is a proper list");
+    assert_eq!(
+        frames.len(),
+        1,
+        "no head item is fabricated for a raise that did not come from the seam's marker"
+    );
+    assert_eq!(
+        terms::tuple_element(frames[0], 1).expect("the raising frame's function"),
+        make_atom(module.atom_table.lookup("f").expect("f")),
+        "the snapshot's own frame"
+    );
+}
+
+/// `undefined_lambda` is a **typed** marker: the same class/atom a user `erlang:error(undef)`
+/// raises must not be mistaken for it.
+#[test]
+fn the_undefined_lambda_marker_is_typed() {
+    let marker = crate::error::undefined_lambda();
+    assert!(crate::error::is_undefined_lambda(&marker));
+    assert!(
+        !crate::error::is_bad_fun(&marker),
+        "the two markers are distinct"
+    );
+    // A user raise of the same class and atom is NOT the marker.
+    let user = BeamError::Raise(beam_common::Raise::error(beam_common::ExitReason::atom("undef")));
+    assert!(!crate::error::is_undefined_lambda(&user));
+    // Nor is the `EXC_BADFUN` marker, and vice versa.
+    assert!(crate::error::is_bad_fun(&crate::error::bad_fun()));
+    assert!(!crate::error::is_undefined_lambda(&crate::error::bad_fun()));
+}
+
+// -----------------------------------------------------------------------
 // Apply / ApplyLast
 // -----------------------------------------------------------------------
 

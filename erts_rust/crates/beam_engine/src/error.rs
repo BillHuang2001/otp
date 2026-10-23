@@ -62,6 +62,43 @@ pub fn is_bad_fun(error: &BeamError) -> bool {
         _ => false,
     }
 }
+/// The `error_handler:undefined_lambda/3` marker: a host's closure seam reports that the applied
+/// fun names a module with **no loadable code** at all — the sibling of [`bad_fun`].
+///
+/// `call_fun` (`../../erts/emulator/beam/beam_common.c:1696-1715`) splits the two failures
+/// precisely here: a module that IS loaded but defines no such fun entry is `EXC_BADFUN`
+/// (`{badfun, Fun}`, [`bad_fun`]), while a module with **no current code** is handed to
+/// `error_handler:undefined_lambda/3`, which — after `ensure_loaded/1` fails — raises bare
+/// `undef` with the applied fun itself as the innermost cooked-stacktrace item
+/// (`lib/kernel/src/error_handler.erl`'s `crash(Fun, Args) -> crash({Fun,Args,[]})`).
+///
+/// Like [`bad_fun`] the marker carries a `()` live-reason payload so it is a **typed**
+/// discriminator: a user `erlang:error(undef)` raises the same class and atom and must never be
+/// given a synthesized `{Fun, Args, []}` head item. The atom reason itself is the oracle's, so
+/// the raise is already correct without the engine; only the head item needs the
+/// [`FunSource`](crate::families::funs) the engine holds — see [`is_undefined_lambda`] and
+/// `families::funs::fun_apply_error`.
+pub fn undefined_lambda() -> BeamError {
+    BeamError::Raise(
+        Raise::error(ExitReason::atom("undef"))
+            .with_live_reason(beam_common::LiveReason::new(())),
+    )
+}
+
+/// Whether `error` is the [`undefined_lambda`] marker (its reason atom **and** the `()` payload).
+pub fn is_undefined_lambda(error: &BeamError) -> bool {
+    match error {
+        BeamError::Raise(raise) => {
+            raise.reason.as_atom() == Some("undef")
+                && raise
+                    .live_reason()
+                    .and_then(|live| live.downcast_ref::<()>())
+                    .is_some()
+        }
+        _ => false,
+    }
+}
+
 /// The engine cannot execute this instruction/operand (a Milestone-1 coverage
 /// limit).
 ///

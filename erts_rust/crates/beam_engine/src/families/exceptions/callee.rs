@@ -81,7 +81,18 @@ use crate::terms::{self, Sink};
 /// `ExitReason`, whose `as_atom` also sees an owned-`String`-backed name) and — for
 /// a `&'static str`-backed name — [`BeamError::as_atom`]. Both are consulted, so the
 /// gate does not depend on which representation the host used.
+///
+/// The [`crate::error::undefined_lambda`] marker is **excluded**: it is the raise a fun
+/// *apply* produces when the fun's module has no loadable code
+/// (`error_handler:undefined_lambda/3`), and its innermost cooked item is the applied fun —
+/// `{Fun, Args, []}`, synthesized by `families::funs::fun_apply_error` — not the
+/// `{Module, Function, Args, []}` this module builds for a call site that named a target.
+/// Synthesizing a call-site item for it would name a callee that exists (`lists:map` for a
+/// `lists:map(BadFun, L)` whose inner apply raised), i.e. it would fabricate a frame.
 pub(crate) fn is_unresolved_undef(error: &BeamError) -> bool {
+    if crate::error::is_undefined_lambda(error) {
+        return false;
+    }
     if error.as_atom() == Some("undef") {
         return true;
     }

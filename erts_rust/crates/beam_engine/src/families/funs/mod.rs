@@ -121,7 +121,7 @@ use crate::interpreter::LabelMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Module, Operand};
-use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm};
+use beam_term::{atom_val, is_atom, make_atom, Atom, Eterm, NIL};
 
 use crate::context::{BifOutcome, ExecutionContext, FunOutcome, RootSet};
 use crate::error;
@@ -616,36 +616,111 @@ fn call_fun(
                 Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
                 // A raise inside the applied closure must route through the
                 // catch-aware funnel, not escape the caller's `try`/`catch`.
-                Err(e) => Ok(Some(fun_apply_error(machine, module, &source, e, ctx)?)),
+                Err(e) => Ok(Some(fun_apply_error(machine, module, &source, arity, e, ctx)?)),
             }
         }
-        Err(e) => Ok(Some(fun_apply_error(machine, module, &source, e, ctx)?)),
+        Err(e) => Ok(Some(fun_apply_error(machine, module, &source, arity, e, ctx)?)),
     }
 }
 
-/// Route a fun-apply seam error, expanding the host's `EXC_BADFUN` marker into the oracle's
-/// `{badfun, Fun}`.
+/// Route a fun-apply seam error, expanding the host's two exception markers into the oracle's
+/// shape.
 ///
-/// `call_fun` (`../../erts/emulator/beam/beam_common.c:1696-1706`) raises `EXC_BADFUN` with
-/// `fvalue = fun` when the fun's module **is** loaded and simply defines no such fun entry, and
-/// `expand_error_value` (`:750-772`) then builds `TUPLE2(am_badfun, fvalue)` — the reason a
-/// `try` observes as `{error,{badfun,Fun}}`. A host closure seam can only report the first half
+/// [`crate::error::is_bad_fun`] — the C's `EXC_BADFUN` (`{badfun, Fun}`): `call_fun`
+/// (`../../erts/emulator/beam/beam_common.c:1696-1706`) raises it with `fvalue = fun` when the
+/// fun's module **is** loaded and simply defines no such fun entry, and `expand_error_value`
+/// (`:750-772`) then builds `TUPLE2(am_badfun, fvalue)` — the reason a `try` observes as
+/// `{error,{badfun,Fun}}`. A host closure seam can only report the first half
 /// ([`crate::error::bad_fun`]: the fun reaches it as a bare term it must not hold across an
-/// allocation), so the expansion happens here, where the target is a re-readable
-/// [`FunSource`] and [`raise_badfun`] already builds the rooted 2-tuple.
+/// allocation), so the expansion happens here, where the target is a re-readable [`FunSource`]
+/// and [`raise_badfun`] already builds the rooted 2-tuple.
+///
+/// [`crate::error::is_undefined_lambda`] — the C's `EXC_UNDEF` handed to
+/// `error_handler:undefined_lambda/3` because the fun's module has **no loadable code**
+/// (`:1707-1722`): the reason stays the bare atom `undef`, but the cooked stacktrace's
+/// innermost item is the applied **fun** itself with the arguments it was called with —
+/// `crash(Fun, Args) -> crash({Fun,Args,[]})` in `lib/kernel/src/error_handler.erl`, i.e. a
+/// **3-tuple** `{Fun, ArgList, []}` (measured on OTP 29.1.1, not inferred). Only the innermost
+/// item is synthesized ([`lambda_head_item`]); the trailing `erl_eval`/`init` frames the oracle
+/// prints are deliberately not fabricated.
 ///
 /// Every other error keeps the catch-aware funnel unchanged.
 fn fun_apply_error(
     machine: &mut Machine,
     module: &Module,
     source: &FunSource<'_>,
+    arity: u32,
     error: beam_common::BeamError,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
     if crate::error::is_bad_fun(&error) {
         return raise_badfun(machine, module, source, ctx);
     }
-    machine.raise_bif_error(module, error, ctx)
+    let head = lambda_head_item(machine, source, arity, &error, ctx)?;
+    machine.raise_bif_error_with_head(module, error, head, ctx)
+}
+
+/// The synthesized innermost cooked-stacktrace item for an
+/// `error_handler:undefined_lambda/3` raise — `{Fun, ArgList, []}` — or `None` when nothing must
+/// be synthesized.
+///
+/// The shape is the oracle's, term for term: `undefined_lambda/3` can only load the module or
+/// crash, and its crash arms are `crash(Fun, Args) -> crash({Fun, Args, []})` followed by
+/// `Stk = [Tuple | tl(Stacktrace)]` (`lib/kernel/src/error_handler.erl:117-127`, `:162-171`).
+/// The first element is therefore the **fun term**, not a `{Module, Function}` pair, and the
+/// location is the empty list (the callee does not exist). Contrast
+/// [`callee::callee_head_item`], the 4-tuple `{Module, Function, ArgList, []}` an unresolved
+/// `call_ext*`/`apply` produces.
+///
+/// Returns `None` — today's behaviour, an unmodified raise — when any of:
+///
+/// * `error` is not the [`crate::error::undefined_lambda`] marker (a plain `undef` from a nested
+///   machine, a `call_ext` or a `call_bif` is somebody else's raise and must keep its own head);
+/// * **no catch frame is live**, so the raise cannot land and the cooked trace is never reached
+///   (the *uncaught* path derives its frames from the raise snapshot, which this deliberately
+///   does not touch);
+/// * the applied arguments are not readable as registers (a malformed call, not a runtime
+///   value) — nothing is fabricated in their place.
+///
+/// Never fabricates a frame: the item is built only from the raise a real fun apply produced, the
+/// fun that was applied and the **real** arguments it was applied to.
+fn lambda_head_item(
+    machine: &mut Machine,
+    source: &FunSource<'_>,
+    arity: u32,
+    error: &beam_common::BeamError,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Eterm>> {
+    if !crate::error::is_undefined_lambda(error) || machine.catch_frame_depth() == 0 {
+        return Ok(None);
+    }
+    // `x(0..arity)` must name real registers: an unreadable one is malformed input, and the
+    // honest answer is to synthesize nothing rather than a wrong argument list.
+    for i in 0..arity {
+        if machine.x(i).is_none() {
+            return Ok(None);
+        }
+    }
+    // ONE rooted reservation for the whole graph: the `arity` list cells (`2` words each, the
+    // source's own slack tail included) plus the 3-tuple's `4` words.
+    let extra = 2 * arity as usize + source.slack_words();
+    let item = terms::make_tuple_rooted(
+        machine,
+        ctx,
+        RootSet::ALL_LIVE,
+        3,
+        extra,
+        |m, slack| {
+            // Post-collection reads, then writes — in that order, exactly as
+            // [`raise_badarity`] does: a moving collector may run under the reservation, so the
+            // fun and the arguments are re-read from the machine's own post-collection state.
+            let fun = source.read_slack(m, slack)?;
+            let args = register_args(m, arity)?;
+            let args_list = slack.list(&args)?;
+            Ok(vec![fun, args_list, NIL])
+        },
+    )?;
+    Ok(Some(item))
 }
 /// The outcome of an `apply`/`apply_last` target dispatch ([`apply_target`]).
 pub(crate) enum ApplyTarget {
