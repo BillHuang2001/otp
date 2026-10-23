@@ -58,24 +58,20 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
   `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
   through `JitRuntime.entry_module` (a field generated code never reads).
-- **The local-call seam memoizes the callee identity *and* the host's verdict, per run.** `Machine::local_call_seam`
-  (`interpreter/dispatch.rs`) names the same-module callee of every local `call`/`call_only`/`call_last` and asks
-  `ExecutionContext::resolve_local_call(module, function, arity)`. Both halves are pure functions of the immutable
-  module image plus the host's answer set, so `Machine::local_callees` (`machine/local_callee.rs`) memoizes the
-  three-value identity **and** the verdict as a one-byte `Verdict` per `(module address, function index)`;
-  `resolve_local_call` is therefore consulted **once per distinct callee per run**, and an un-nameable callee zero
-  times (a memoized sentinel). Caching the verdict is the *faithful* choice: ERTS charges nothing for an
-  intra-module call, so the consultation it replaces was spending a reduction unit the oracle never charges.
-  Three doors invalidate — `Machine::reset` (which also keeps the address key ABA-free), the BIF-dispatch funnel
-  `Machine::dispatch_bif_call` when it dispatches `erlang:load_nif/2` (the BIF installs the stub a later local call
-  must be served from; the funnel is `&self`, so it only **arms** a `Cell` flag and the seam clears the verdicts at
-  its next local call), and the public `Machine::invalidate_local_call_verdicts` for a host whose answer set changes
-  by any other means.
-  The verdicts live in a **per-module-context index-addressed table** (`LocalVerdicts`: one
-  `Cell<Verdict>` slot per entry of `Module::functions`), so a repeat local call is one bounds-checked slot load —
-  no scan, no key compare, no data-dependent branch; the key-scan predecessors were measured as regressions (a
-  move-to-front variant memmoved on *every* call of an alternating two-callee loop, and the fixed scan that
-  replaced it still left one unpredictable branch per call). Both tiers drive this one
+- **The local-call seam memoizes the host's verdict, per callee function index, per run.** `Machine::local_call_seam`
+  (`interpreter/dispatch.rs`) names the same-module callee of every local `call`/`call_only`/`call_last` and can ask
+  `ExecutionContext::resolve_local_call(module, function, arity)`. The identity and the verdict are pure functions of
+  the immutable module image plus the host's answer set, so `LocalVerdicts` (`machine/local_callee.rs`) holds both in
+  the executing module context's table — one `Cell<Verdict>` slot per entry of `Module::functions` — and a repeat local
+  call reads the callee's own slot; `resolve_local_call` is therefore consulted **once per distinct callee per run**,
+  and an un-nameable callee zero times (a memoized sentinel). Caching the verdict is the *faithful* choice: ERTS charges
+  nothing for an intra-module call, so a per-call consultation spends a reduction unit the oracle never charges.
+  Three doors invalidate — `Machine::reset` (which drops the contexts that own the tables, and clears the entry table
+  with them), the BIF-dispatch funnel `Machine::dispatch_bif_call` when it dispatches `erlang:load_nif/2` (the BIF
+  installs the stub a later local call must be served from; the funnel is `&self`, so it only **arms** a `Cell` flag
+  and the seam clears the verdicts at its next local call), and the public
+  `Machine::invalidate_local_call_verdicts` for a host whose answer set changes by any other means.
+  The hot path is the slot read alone: no scan, no key compare, no data-dependent branch. Both tiers drive this one
   definition, so the memo needs no `src/jit/**` change. What is **not** legitimate is baking a verdict into
   **compiled code**: `JitBackend::compile(&mut self, module: &Module)` is handed no `ExecutionContext`, and the
   cross-run `CodeCache` is content-keyed and shared across runs, machines and hosts — the memo is a per-machine,
