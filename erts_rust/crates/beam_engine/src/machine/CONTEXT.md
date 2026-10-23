@@ -523,8 +523,9 @@ block, and both then restore the `len == capacity` handle invariant through
 `Machine::cover_writable_capacity` (C's `bin_size`; a relocation copies exactly `len()` bytes, so this
 is what keeps the appender's bytes alive). Every refusal — an unregistered payload, a shared handle, the
 `max_capacity` cap — folds into `Ok(None)` (the caller promotes to the copy-rebuild form), because each
-is a runtime condition with a correct fallback, not an internal fault. Republishing the accumulator's
-own `[BinRef][ErlSubBits]` pair over a moved base is the *caller's* job (`raw::InPlace::grow`): this
+is a runtime condition with a correct fallback, not an internal fault. Republishing the two
+payload-naming words of the accumulator's own `[BinRef][ErlSubBits]` pair (`BinRef.val`,
+`ErlSubBits.base_flags`) over a moved base is the *caller's* job (`raw::InPlace::grow`): this
 door is safe Rust and never dereferences a term. It is consulted **only on a shortfall**, since it
 scans the roster; `Machine::retain_refc_binaries` is not on the append path.
 
