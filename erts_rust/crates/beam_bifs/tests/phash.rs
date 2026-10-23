@@ -27,19 +27,30 @@
 //! differential values are *not* derivable from the term alone — that is the whole
 //! point of pinning them.
 //!
+//! The `make_fun3` (`FunKind::Local`) section additionally drives the
+//! [`LocalFunIdentity`] seam: a closure carries only `uniq`/`index` inline, so its
+//! hash needs the defining module from the host, and the section pins both the
+//! attributed case (equal to the equivalent `NEW_FUN_EXT` image) and the three
+//! unattributable ones (no hook, `Ok(None)`, a failing hook) — the last of which must
+//! surface the seam's own error rather than the generic capability gap.
+//!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] plus the
 //! declared dependency crates (`beam_alloc` for the heap, `beam_codec::term` for
 //! the binary/bitstring/bignum constructors).
 
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry};
+use beam_bifs::{default_registry, BifContext, BifRegistry, LocalFunIdentity};
 use beam_codec::term::{
-    make_big, make_binary, make_bitstring, make_flatmap, make_fun_external, make_fun_imported,
-    FunPid,
+    bitstring_bytes, make_big, make_binary, make_bitstring, make_flatmap, make_fun_external,
+    make_fun_imported, FunPid,
 };
 use beam_common::BeamError;
 use beam_process::ProcessId;
-use beam_term::{signed_value, AtomTable, Eterm, NIL};
+use beam_term::fun::{fun_words, write_fun_local, FunKind};
+use beam_term::{signed_value, Atom, AtomTable, Eterm, NIL};
 
 /// The atom names the cases below use. Only interned names resolve, and the atom
 /// hash is computed from the name, so the table is seeded up front.
@@ -457,6 +468,407 @@ fn imported_funs_match_the_oracle() {
             "phash(a local/imported fun, 1000000) must be a small integer in range"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// `make_fun3` (`FunKind::Local`) funs — the fun-identity seam
+// ---------------------------------------------------------------------------
+//
+// A `make_fun3` closure inlines only `[uniq:u64][index:u32]`: C's local-fun hash
+// arms additionally mix `fe->module`'s atom-table `hvalue` (`erl_term_hashing.c:
+// 242-261` for `make_hash`, `:1224-1246` for `make_hash2`), which the term does not
+// carry. `erlang:phash/2`/`phash2/1,2` therefore ask the [`LocalFunIdentity`] seam
+// for the closure's defining module (`src/compare.rs`'s `SeamFunIdentity`) — the same
+// host answer that makes `term_to_binary/1` byte-faithful — and hash exactly like the
+// equivalent `NEW_FUN_EXT` image when the seam can attribute the closure.
+//
+// The legacy identity below is the one `imported_funs_match_the_oracle` pins: the
+// oracle closure `fun(X) -> {X,1} end` compiled in a module named `h`.
+
+/// The 16-byte MD5 (`ErlFunEntry.uniq`) of that module — the `erefuniq` bytes of
+/// the real `NEW_FUN_EXT` image.
+const H_UNIQ: [u8; 16] = [
+    186, 85, 98, 89, 101, 7, 175, 30, 108, 198, 92, 203, 158, 188, 155, 63,
+];
+
+/// `ErlFunEntry.old_uniq` of the same lambda — the word a `make_fun3` closure
+/// stores as its `uniq` descriptor (`beam_term::fun::fun_uniq`).
+const H_OLD_UNIQ: u32 = 97_692_434;
+
+/// The pinned `phash2/1` value of that closure (`imported_funs_match_the_oracle`).
+const H_PHASH2: i64 = 10_652_292;
+
+/// Writes a `FunKind::Local` (`make_fun3`) closure block on `heap`.
+///
+/// The block is built with [`beam_term::fun`]'s own writer — the crate that owns the
+/// frozen fun layout — rather than through the codec's convenience constructor, so
+/// these cases hash a term laid out by the lowest common ancestor itself.
+fn make_local_fun(heap: &mut Heap, arity: usize, uniq: u64, index: u32, env: &[Eterm]) -> Eterm {
+    // SAFETY: `alloc_words` returns `fun_words(FunKind::Local, env.len())` fresh,
+    // exclusively-owned and writable words in this test's own heap — exactly the
+    // block size `write_fun_local` documents.
+    let hp = unsafe { heap.alloc_words(fun_words(FunKind::Local, env.len())) }
+        .expect("the test heap has room for one local fun");
+    // SAFETY: `hp` owns exactly those words, and `write_fun_local` initialises every
+    // one of them (header, `uniq`, `index`, then the `env` words).
+    unsafe { write_fun_local(hp, arity, uniq, index, env) }.expect("a valid local-fun header")
+}
+
+/// The creator pid both sides of the identity use — `<0.0.0>`'s four descriptor
+/// words, the same ones `imported_funs_match_the_oracle` builds its image with.
+fn h_creator(atoms: &AtomTable) -> FunPid {
+    FunPid {
+        node: atoms.lookup("node").expect("seeded"),
+        number: 0,
+        serial: 0,
+        creation: 0,
+    }
+}
+
+/// A [`LocalFunIdentity`] hook that attributes every local fun to the oracle module
+/// `h` — what `beam_rt` answers for a closure compiled in a loaded module.
+struct HFunIdentity {
+    module: Atom,
+    creator: FunPid,
+}
+
+impl LocalFunIdentity for HFunIdentity {
+    fn local_fun_identity(
+        &mut self,
+        _term: Eterm,
+    ) -> beam_common::Result<Option<beam_codec::FunIdentity>> {
+        Ok(Some(beam_codec::FunIdentity::new(
+            self.module,
+            H_UNIQ,
+            0,
+            H_OLD_UNIQ,
+            self.creator,
+        )))
+    }
+}
+
+/// The "I cannot attribute this closure" answer — what the `-eval` `erl_eval`
+/// template closure gets (it was never compiled by a module).
+struct UnknownFunIdentity;
+
+impl LocalFunIdentity for UnknownFunIdentity {
+    fn local_fun_identity(
+        &mut self,
+        _term: Eterm,
+    ) -> beam_common::Result<Option<beam_codec::FunIdentity>> {
+        Ok(None)
+    }
+}
+
+/// A hook whose seam fails outright. The failure is arbitrary — the property under
+/// test is that it surfaces **as itself**, never as the generic capability gap.
+struct FailingFunIdentity;
+
+impl LocalFunIdentity for FailingFunIdentity {
+    fn local_fun_identity(
+        &mut self,
+        _term: Eterm,
+    ) -> beam_common::Result<Option<beam_codec::FunIdentity>> {
+        Err(BeamError::BadArg)
+    }
+}
+
+/// A context over `heap`/`atoms` with `hook` installed as the fun-identity seam.
+///
+/// [`BifContext::with_local_fun_identity`] consumes the context, so a hook-bearing
+/// context cannot be produced by [`run`].
+fn hook_context<'a>(
+    heap: &'a mut Heap,
+    atoms: &'a AtomTable,
+    hook: &'a mut dyn LocalFunIdentity,
+) -> BifContext<'a> {
+    BifContext::new(heap, atoms, ProcessId::new(1, 0)).with_local_fun_identity(hook)
+}
+
+/// Asserts the call raised the crate's typed `unsupported_bif` capability gap.
+fn assert_unsupported_bif(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    function: &str,
+    args: &[Eterm],
+    what: &str,
+) {
+    match reg.call("erlang", function, args.len() as u32, ctx, args) {
+        Err(BeamError::Raise(raise)) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_bif"),
+            "{what}: expected the typed unsupported_bif gap, got {:?}",
+            raise.reason
+        ),
+        other => panic!("{what}: expected the typed unsupported_bif gap, got {other:?}"),
+    }
+}
+
+#[test]
+fn local_fun_hashes_match_its_imported_image_when_the_seam_attributes_it() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let module = atoms.lookup("h").expect("seeded");
+    let creator = h_creator(&atoms);
+
+    // The terms first: a hook-less context builds them and is then dropped, so the
+    // heap can be re-borrowed by each leg below.
+    let (local, imported) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let local = make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[]);
+        let imported = make_fun_imported(
+            ctx.heap(),
+            1,
+            module,
+            &H_UNIQ,
+            0,
+            0,
+            H_OLD_UNIQ,
+            creator,
+            &[],
+        )
+        .expect("fits");
+        (local, imported)
+    };
+
+    let mut hook = HFunIdentity { module, creator };
+    let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+
+    // `phash2/1` of the closure is the pinned `NEW_FUN_EXT` image's value: the C mixes
+    // the same four fields (`num_free`, the module's `hvalue`, `index`, `old_uniq`)
+    // and then the environment — for both representations of the same lambda.
+    assert_phash2(
+        &mut ctx,
+        &[local],
+        H_PHASH2,
+        "phash2(a make_fun3 local fun attributed to module h)",
+    );
+    assert_phash2(&mut ctx, &[imported], H_PHASH2, "phash2(the same Image)");
+
+    // The two remaining ports agree with the image's answers too. `phash2/2` folds the
+    // *full* 32-bit hash to `hash rem Range` (so it is not the 27-bit `phash2/1` value
+    // reduced); `phash/2` folds it to `1 + (hash rem Range)`.
+    let range = int_term(&mut ctx, 1_000_000);
+    let local_p2 = signed_value(phash2(&reg, &mut ctx, &[local, range]));
+    let imported_p2 = signed_value(phash2(&reg, &mut ctx, &[imported, range]));
+    assert_eq!(
+        local_p2, imported_p2,
+        "phash2(a local fun, 1000000) must equal phash2(its NEW_FUN_EXT image, 1000000)"
+    );
+    // Oracle-verified (OTP 29.1.1) for this closure: `make_hash2` of it is
+    // `96_640_4…`, whose low 27 bits are `H_PHASH2` and whose `rem 1000000` is this.
+    assert_eq!(local_p2, 966_404, "phash2(F, 1000000) of the h closure");
+
+    let local_p1 = signed_value(phash(&reg, &mut ctx, local, range));
+    let imported_p1 = signed_value(phash(&reg, &mut ctx, imported, range));
+    assert_eq!(
+        local_p1, imported_p1,
+        "phash(a local fun, 1000000) must equal phash(its NEW_FUN_EXT image, 1000000)"
+    );
+    assert!(
+        (1..=1_000_000).contains(&local_p1),
+        "phash/2 answers `1 + hash rem Range`, so it lies in [1, Range]; got {local_p1}"
+    );
+}
+
+#[test]
+fn a_local_fun_no_seam_attributes_is_the_typed_gap() {
+    // (a) No `LocalFunIdentity` hook at all: the defining module is unknown, so the
+    // hash is the typed capability gap — never a number mixed from a substitute.
+    run(|reg, ctx| {
+        let local = make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[]);
+        let range = int_term(ctx, 1_000_000);
+        assert_unsupported_bif(reg, ctx, "phash2", &[local], "phash2/1 without a seam");
+        assert_unsupported_bif(
+            reg,
+            ctx,
+            "phash2",
+            &[local, range],
+            "phash2/2 without a seam",
+        );
+        assert_unsupported_bif(
+            reg,
+            ctx,
+            "phash",
+            &[local, range],
+            "phash/2 without a seam",
+        );
+    });
+
+    // (b) A hook that answers `Ok(None)` — the `-eval`/`erl_eval` template closure,
+    // which no module compiled. Same gap, same three ports.
+    let mut hook = UnknownFunIdentity;
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let atoms = seeded_atoms();
+    let local = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[])
+    };
+    let reg = default_registry();
+    let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+    let range = int_term(&mut ctx, 1_000_000);
+    assert_unsupported_bif(&reg, &mut ctx, "phash2", &[local], "phash2/1, unknown identity");
+    assert_unsupported_bif(
+        &reg,
+        &mut ctx,
+        "phash2",
+        &[local, range],
+        "phash2/2, unknown identity",
+    );
+    assert_unsupported_bif(
+        &reg,
+        &mut ctx,
+        "phash",
+        &[local, range],
+        "phash/2, unknown identity",
+    );
+}
+
+#[test]
+fn a_failing_identity_seam_surfaces_as_itself_not_as_the_gap() {
+    // A seam *failure* is the host's error, not "the identity is unknown": it must be
+    // reported unchanged (`BeamError::BadArg` here), never collapsed into the generic
+    // `unsupported_bif` gap — otherwise a host bug would look like a capability gap.
+    let mut hook = FailingFunIdentity;
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let atoms = seeded_atoms();
+    let local = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[])
+    };
+    let reg = default_registry();
+    let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+    let range = int_term(&mut ctx, 1_000_000);
+
+    for (function, args, what) in [
+        ("phash2", vec![local], "phash2/1"),
+        ("phash2", vec![local, range], "phash2/2"),
+        ("phash", vec![local, range], "phash/2"),
+    ] {
+        match reg.call("erlang", function, args.len() as u32, &mut ctx, &args) {
+            Err(BeamError::BadArg) => {}
+            other => panic!(
+                "{what} with a failing identity seam must report the seam's own \
+                 error (badarg), got {other:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn distinct_local_funs_hash_differently_and_stably() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let module = atoms.lookup("h").expect("seeded");
+    let creator = h_creator(&atoms);
+
+    // (label, uniq, index, env) — every field the local-fun hash arms mix except the
+    // module, which the seam supplies.
+    let (base, other_index, with_env) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let free = ctx.int(7).expect("a small integer fits");
+        let base = make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[]);
+        let other_index = make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ + 1), 1, &[]);
+        let with_env = make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[free]);
+        (base, other_index, with_env)
+    };
+
+    let mut hook = HFunIdentity { module, creator };
+    let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+    // The `2^32` range keeps the whole 32-bit hash (`hash rem 2^32 == hash`), so these
+    // comparisons are not narrowed to `phash2/1`'s low 27 bits.
+    let full = int_term(&mut ctx, 4_294_967_296);
+    let hash_of = |ctx: &mut BifContext<'_>, term: Eterm| {
+        signed_value(phash2(&reg, ctx, &[term, full]))
+    };
+
+    let base_hash = hash_of(&mut ctx, base);
+    let other_index_hash = hash_of(&mut ctx, other_index);
+    let with_env_hash = hash_of(&mut ctx, with_env);
+    assert_ne!(
+        base_hash, other_index_hash,
+        "a different `index`/`uniq` descriptor must hash differently"
+    );
+    assert_ne!(
+        base_hash, with_env_hash,
+        "a captured free variable must change the hash (`num_free` plus the env)"
+    );
+    assert_ne!(
+        other_index_hash, with_env_hash,
+        "the three local funs are pairwise distinct"
+    );
+
+    // The legacy port varies with the same fields (`h*F10+num_free; h*F1+hvalue(module);
+    // h*F2+index; h*F2+old_uniq`, then the environment).
+    assert_ne!(
+        signed_value(phash(&reg, &mut ctx, base, full)),
+        signed_value(phash(&reg, &mut ctx, other_index, full)),
+        "`phash/2` must separate two descriptors that differ only in index/uniq"
+    );
+    assert_ne!(
+        signed_value(phash(&reg, &mut ctx, base, full)),
+        signed_value(phash(&reg, &mut ctx, with_env, full)),
+        "`phash/2` must separate a closure from one with a captured variable"
+    );
+
+    // The same term hashed twice is the same number — the hash is a pure function of
+    // the term (and of the seam's identity), never of call order.
+    assert_eq!(
+        hash_of(&mut ctx, base),
+        base_hash,
+        "hashing the same local fun twice must be stable"
+    );
+    assert_eq!(
+        hash_of(&mut ctx, with_env),
+        with_env_hash,
+        "hashing the same local fun twice must be stable"
+    );
+}
+
+#[test]
+fn a_local_fun_round_trips_through_term_to_binary_with_its_hash() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let module = atoms.lookup("h").expect("seeded");
+    let creator = h_creator(&atoms);
+
+    let local = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[])
+    };
+
+    // Encoding a `make_fun3` closure needs the same seam (the codec's `NEW_FUN_EXT`
+    // writer reads `context::local_fun_identity`).
+    let image = {
+        let mut hook = HFunIdentity { module, creator };
+        let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+        let encoded = call(&reg, &mut ctx, "erlang", "term_to_binary", &[local]);
+        let (bytes, offset, size_bits) = bitstring_bytes(encoded).expect("a binary");
+        assert_eq!(offset, 0, "`term_to_binary` builds a fresh, bit-0 binary");
+        assert_eq!(size_bits % 8, 0, "`term_to_binary` is byte-aligned");
+        bytes[..size_bits / 8].to_vec()
+    };
+
+    // The decode side needs no seam: a `NEW_FUN_EXT` image carries the whole identity.
+    let decoded = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let blob = make_binary(ctx.heap(), &image).expect("fits");
+        call(&reg, &mut ctx, "erlang", "binary_to_term", &[blob])
+    };
+
+    let mut hook = HFunIdentity { module, creator };
+    let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+    let before = signed_value(phash2(&reg, &mut ctx, &[local]));
+    assert_eq!(before, H_PHASH2, "phash2/1 of the make_fun3 closure");
+    let after = signed_value(phash2(&reg, &mut ctx, &[decoded]));
+    assert_eq!(
+        after, before,
+        "binary_to_term(term_to_binary(F)) must hash like F (the image carries the \
+         whole identity)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,4 +1536,161 @@ fn phash2_is_registered() {
     assert!(reg.contains("erlang", "phash2", 1));
     assert!(reg.contains("erlang", "phash2", 2));
     assert!(!reg.contains("erlang", "phash2", 3));
+}
+
+// ---------------------------------------------------------------------------
+// The live oracle
+// ---------------------------------------------------------------------------
+//
+// The local-fun goldens above are pinned numbers; this leg re-derives them from a
+// real VM. The oracle cannot be handed a `make_fun3` closure through `-eval` without
+// compiling a module, so it hashes the **`NEW_FUN_EXT` image** the closure encodes to
+// instead: for C both are the same `ErlFunEntry`-backed local fun, which is exactly
+// what these cases assert. Skips loudly (a banner, never a silent pass) when no
+// oracle can be run.
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// `$ERTS_ORACLE` when it names an executable, else `erl` on `$PATH` — the same
+/// resolution `tools/differential` and this crate's sibling oracle files use.
+fn resolve_oracle() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+        let program = PathBuf::from(&value);
+        if is_executable(&program) {
+            return Some(program);
+        }
+        eprintln!(
+            "[beam_bifs phash] $ERTS_ORACLE='{}' is not an existing executable — \
+             treating it as no oracle.",
+            program.display()
+        );
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("erl"))
+        .find(|candidate| is_executable(candidate))
+}
+
+#[test]
+fn local_fun_hashes_match_the_live_oracle_through_its_imported_image() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!();
+        eprintln!("=========== beam_bifs phash: live oracle SKIPPED ===========");
+        eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+        eprintln!("executable, and no `erl` on $PATH).");
+        eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+        eprintln!("===========================================================");
+        eprintln!();
+        return;
+    };
+
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let module = atoms.lookup("h").expect("seeded");
+    let creator = h_creator(&atoms);
+
+    let local = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        make_local_fun(ctx.heap(), 1, u64::from(H_OLD_UNIQ), 0, &[])
+    };
+
+    // The closure's wire image, produced by this crate's own encoder through the same
+    // fun-identity seam the hash uses.
+    let image = {
+        let mut hook = HFunIdentity { module, creator };
+        let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+        let encoded = call(&reg, &mut ctx, "erlang", "term_to_binary", &[local]);
+        let (bytes, offset, size_bits) = bitstring_bytes(encoded).expect("a binary");
+        assert_eq!(offset, 0, "`term_to_binary` builds a fresh, bit-0 binary");
+        assert_eq!(size_bits % 8, 0, "`term_to_binary` is byte-aligned");
+        bytes[..size_bits / 8].to_vec()
+    };
+
+    // `F = binary_to_term(<<…>>)` is the oracle's own local fun for that lambda.
+    let literal = image
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let eval = format!(
+        "F = binary_to_term(<<{literal}>>), \
+         io:format(\"~w ~w ~w~n\", [erlang:phash2(F), erlang:phash2(F, 1000000), \
+         erlang:phash(F, 1000000)]), halt()."
+    );
+
+    // A scratch cwd of our own, so an `erl_crash.dump` can never land in the repo.
+    let scratch = std::env::temp_dir().join(format!("beam_bifs_phash_{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", scratch.display()));
+    let output = Command::new(&oracle)
+        .args(["-noshell", "-eval", &eval, "-s", "init", "stop"])
+        .current_dir(&scratch)
+        .stdin(Stdio::null())
+        .output();
+    // Removed before any assertion below, so a failed comparison leaves nothing behind.
+    match std::fs::remove_dir_all(&scratch) {
+        Ok(()) => {}
+        Err(error) => println!("note: could not remove {}: {error}", scratch.display()),
+    }
+    let output = output
+        .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+    assert!(
+        output.status.success(),
+        "the oracle '{}' exited with {:?}\n--- stderr ---\n{}\n--- eval ---\n{eval}",
+        oracle.display(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|e| panic!("the oracle printed non-UTF-8 to stdout: {e}"));
+    let theirs: Vec<i64> = stdout
+        .split_whitespace()
+        .map(|field| {
+            field
+                .parse()
+                .unwrap_or_else(|e| panic!("the oracle printed {field:?}, not an integer: {e}"))
+        })
+        .collect();
+    assert_eq!(
+        theirs.len(),
+        3,
+        "the oracle printed an unexpected transcript: {stdout:?}"
+    );
+
+    // Ours: the `make_fun3` closure through the very same three ports.
+    let ours = {
+        let mut hook = HFunIdentity { module, creator };
+        let mut ctx = hook_context(&mut heap, &atoms, &mut hook);
+        let range = int_term(&mut ctx, 1_000_000);
+        [
+            signed_value(phash2(&reg, &mut ctx, &[local])),
+            signed_value(phash2(&reg, &mut ctx, &[local, range])),
+            signed_value(phash(&reg, &mut ctx, local, range)),
+        ]
+    };
+    assert_eq!(
+        theirs, ours,
+        "{{phash2(F), phash2(F,1000000), phash(F,1000000)}}: the oracle's local fun vs \
+         this crate's make_fun3 closure (oracle image {image:?})"
+    );
+
+    // Spot-pin the first field, so a regression reads even though the triplet was
+    // compared above.
+    assert_eq!(ours[0], H_PHASH2, "phash2/1 of the h closure (OTP 29.1.1)");
 }
