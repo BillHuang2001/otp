@@ -85,10 +85,6 @@ All re-exported from `mod.rs` and via `beam_io::prelude::*`.
   representable (every protocol continuation returns a flat buffer).
 - **No output-encoding cache / no `erl_scan` internals** — the `erl_scan`-specific
   `invalid_unicode_error/4` position hack (`file_io_server.erl:695-707`) is not reproduced.
-- The `("get_until", 5)` request is **not yet wired** in `beam_rt`: its
-  `native/file_server.rs::serve_device_request` still answers the typed `unsupported` for every
-  device request (see Handoff).
-
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`.
 **41 in-module tests + 1 doctest**: `tests.rs` 26 (a scripted `ByteSource` + a scripted
@@ -102,8 +98,8 @@ read modes, a read error, `NoEngineContinuation`, a raising continuation, state 
 starters, the four transcode directions, `encode_code_points`, the typed sentinels),
 `source.rs` 5 (successive/empty slices, `EmptySource`, a real file, a directory read as
 `BeamError::Io`), `continuation.rs` 3.
-No `erl` oracle case yet — the layer is verified against the Erl sources by reading, not by the
-differential harness (the gate cannot express a device request today).
+No `erl` oracle case exercises a device request yet — the layer is verified against the Erl sources
+by reading, not by the differential harness.
 
 ## Notes for Agents
 
@@ -131,17 +127,20 @@ differential harness (the gate cannot express a device request today).
   `NO_ENGINE_CONTINUATION`.
 - `tests.rs` → the device-loop suite.
 - `../registry.rs` / `../port.rs` → the io request reaches a device through `beam_rt`, not this crate.
-- `../../../beam_rt/src/native/file_server.rs` → the runtime's io-server floor that must adopt the
-  `Continuation` seam (sibling — read-only).
+- `../../../beam_rt/src/native/file_server.rs` → the runtime's io-server floor, which installs the
+  engine-backed `Continuation` (`get_until.rs` runs `Mod:Func`, `get_line.rs` runs
+  `io_lib:collect_line/4`) over this seam (sibling — read-only).
 
 ## Handoff to `beam_rt` (owner: `beam_rt`, out of this node)
-- Replace the `_ => error::unsupported(…)` fallback in
-  `crates/beam_rt/src/native/file_server.rs::serve_device_request` with a `("get_until", 5)` arm
-  that decodes `Enc`/`Mod`/`Func`/`XtraArgs`, builds `IoDevice::new(self.device_file(service)?, enc,
-  read_mode)`, and installs an **engine-backed `Continuation`** (running the real `Mod:Func`;
-  `cast_reply` = `io_lib`'s list→binary cast). Until then the request stays the typed `unsupported`.
-- The same `unicode:characters_to_binary/3` conversion also unblocks `reply_get_chars`/
-  `reply_put_chars`, which today hard-refuse every non-`latin1` encoding.
+- **Residual: `reply_get_chars`/`reply_put_chars` serve `latin1` only** — a non-`latin1`
+  encoding (or a non-`latin1` `put_chars` payload) is the typed `unsupported` in
+  `crates/beam_rt/src/native/file_server.rs`; serving it needs the
+  `unicode:characters_to_binary/3` conversion this crate's device loop already performs
+  (`encoding.rs`).
+- Running the real `Mod:Func` and `io_lib`'s reply cast are the runtime's half: its
+  `native/file_server/get_until.rs` + `get_line.rs` install the engine-backed `Continuation`, so
+  `NoEngineContinuation`/`NO_ENGINE_CONTINUATION` stay this crate's not-installed default for
+  every other host.
 
 ## See Also
 - `../CONTEXT.md` → the crate's Intent/API Surface/Constraints and the `{get_until,…}` handoff.
