@@ -522,6 +522,15 @@ fn both_tiers_report_and_resume_the_same_suspend() {
     let expected_pc = call_fun_pc(&module);
     let mut outcomes = Vec::new();
     let mut values = Vec::new();
+    // Term lifetime contract (`beam_engine::context`'s "# Lifetime contract: a term belongs
+    // to the context that built it"): a term a run produced is readable only while the
+    // `MinimalContext` that built it lives — dropping it returns its carrier blocks to
+    // `beam_alloc`'s process-global pool and the next arena reuses them. `ParkingHost` owns
+    // the ONLY copy of its arena, so every host is hoisted here and kept alive until the
+    // post-loop comparisons: the resumed value is the `RESULT` immediate only by accident of
+    // the current fixture, and a comparison of two *boxed* results (tuple/float/binary/fun)
+    // across a dropped arena would be a use-after-free, not a test failure.
+    let mut hosts: Vec<ParkingHost> = Vec::new();
     for tier in [Tier::Interpreter, Tier::BaselineJit] {
         let mut ctx = ParkingHost::new(1);
         let (outcome, mut machine) =
@@ -556,6 +565,9 @@ fn both_tiers_report_and_resume_the_same_suspend() {
             RunOutcome::Returned(value) => values.push((tier, value)),
             other => panic!("{tier:?}: the resumed run must return a value, got {other:?}"),
         }
+        // The loop body ends here, so the arena must be moved out instead of dropped: the
+        // value just pushed is read after the loop closes.
+        hosts.push(ctx);
     }
     assert_eq!(
         outcomes[0].1, outcomes[1].1,
@@ -574,6 +586,10 @@ fn both_tiers_report_and_resume_the_same_suspend() {
         make_small(RESULT),
         "the shared value is the continued application's"
     );
+    // Explicit, and deliberately AFTER the last read: the terms in `outcomes`/`values` were
+    // produced by these arenas, so both hosts must outlive every assertion above (a term
+    // belongs to the context that built it — see the hoist comment).
+    drop(hosts);
 }
 // ---------------------------------------------------------------------------
 // (4) the non-blocking entries
