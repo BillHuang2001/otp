@@ -1104,9 +1104,9 @@ mod tests {
         // Per-op costs measured on the reference host (2026-10-23, `--quick`, paired-median
         // marginals, default baseline-JIT tier) — see the case table's doc comment.
         const COST_NS: &[(&str, f64, i64)] = &[
-            (SEND_RECV, 25_000.0, 25_000),
-            (ETS_COPY, 13_000.0, 40_000),
-            (COMPILE, 350_000_000.0, 2),
+            (SEND_RECV, 50_721.0, 25_000),
+            (ETS_COPY, 13_808.0, 40_000),
+            (COMPILE, 324_895_719.0, 2),
         ];
         assert_eq!(COST_NS.len(), CASES.len());
         for (name, ns_per_op, n_rust) in COST_NS {

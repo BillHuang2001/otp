@@ -192,8 +192,9 @@ impl Case {
 /// own run-to-run boot/startup jitter** (measured at ≈±0.1 s on the rust boot). The rust
 /// floor is therefore **≥0.5 s of loop work**. The measured rust per-op cost on that host
 /// (2026-10-23, `/proc/loadavg` ≈5, `--quick`, default baseline-JIT tier) is
-/// **≈45 µs** (`write_read`), **≈48 µs** (`handle_rw`) and **≈52 µs** (`ram_file`), so the
-/// counts below are ≈0.9 s, ≈0.96 s and ≈1.04 s of loop work — ≳20× the paired estimator's
+/// **≈98 µs** (`write_read`), **≈1.51 ms** (`handle_rw`); `ram_file` is refused by `beam_rt`
+/// (absent), so its cost is the earlier estimate. The counts below are ≈1.95 s, ≈1.51 s and
+/// ≈1.04 s of loop work — ≳20× the paired estimator's
 /// measured residual noise band. The oracle's much smaller startup jitter needs a
 /// correspondingly smaller marginal, so its counts are an order of magnitude larger.
 ///
@@ -218,7 +219,7 @@ static CASES: &[Case] = &[
         name: HANDLE_RW,
         function: HANDLE_RW,
         optional: false,
-        n_rust: 20_000,
+        n_rust: 1_000,
         n_sys: 200_000,
     },
     Case {
@@ -832,8 +833,8 @@ mod tests {
         // Per-op costs measured on the reference host (2026-10-23, `--quick`, paired-median
         // marginals, default baseline-JIT tier) — see the case table's doc comment.
         const COST_NS: &[(&str, f64, i64)] = &[
-            (WRITE_READ, 45_000.0, 20_000),
-            (HANDLE_RW, 48_000.0, 20_000),
+            (WRITE_READ, 98_000.0, 20_000),
+            (HANDLE_RW, 1_512_000.0, 1_000),
             (RAM_FILE, 52_000.0, 20_000),
         ];
         assert_eq!(COST_NS.len(), CASES.len());
