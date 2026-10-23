@@ -37,7 +37,7 @@ use crate::error;
 use crate::families;
 use crate::families::exceptions::callee;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
-use crate::machine::{namespace_atom, CalleeTarget, Continuation, Machine, RunOutcome};
+use crate::machine::{namespace_atom, Continuation, Machine, RunOutcome, Verdict};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::terms::{reserve_slack, Sink};
@@ -1126,15 +1126,24 @@ impl Machine {
     ///
     /// # Cost
     ///
-    /// The callee's `(module, function, arity)` is **memoized** per
-    /// `(module address, function index)` ([`Machine::local_callees`],
-    /// [`crate::machine::LocalCallees`]): a repeat call is one fixed scan of an 8-entry
-    /// key array that **reorders nothing** (a hit leaves its slot where it is, so the
-    /// two-callee alternation `list_walk`'s inner loop performs is all hits after its
-    /// first cycle). The host's **verdict is never memoized** —
-    /// [`ExecutionContext::resolve_local_call`] is asked exactly once per (nameable)
-    /// local call, because a host spends one reduction unit per consultation and
-    /// `erlang:load_nif/2` can install a stub mid-run.
+    /// Both halves are **memoized** per `(module address, function index)`
+    /// ([`Machine::local_callees`], [`crate::machine::LocalCallees`]): the callee's
+    /// `(module, function, arity)` identity (a pure function of a loaded module) and the
+    /// host's **verdict** for it. A repeat local call is therefore one fixed scan of an
+    /// 8-entry key array that **reorders nothing** (a hit leaves its slot where it is, so
+    /// the two-callee alternation `list_walk`'s inner loop performs is all hits after its
+    /// first cycle) plus one byte load — no virtual call, no string comparison.
+    /// [`ExecutionContext::resolve_local_call`] is consulted **once per distinct callee
+    /// per run**, not once per call: its answer is a pure function of the triple for
+    /// `beam_rt` (`prim_tty`'s stubs plus `beam_bifs`' `zlib` table), and ERTS itself
+    /// charges nothing for an intra-module call, so caching is the *faithful* choice
+    /// rather than a shortcut.
+    ///
+    /// The verdict is invalidated by `erlang:load_nif/2` (the BIF-dispatch funnel clears
+    /// every verdict when it dispatches `("erlang", "load_nif", 2)` — a stub a later local
+    /// call must reach), by [`Machine::reset`] (the start of every run) and by the public
+    /// [`Machine::invalidate_local_call_verdicts`] door a host with a stateful answer set
+    /// calls itself. Invalidation re-asks the host but re-derives nothing.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn local_call_seam(
@@ -1148,30 +1157,79 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> std::result::Result<Option<Step>, Box<BeamError>> {
-        // Phase 1 — every local call: the memoized identity, then the host's **per-call**
-        // verdict. The memo borrows one field of `self`; `ctx` is a separate parameter,
-        // so the two never conflict.
-        let callee_id: &Option<CalleeTarget> = self.local_callees.resolve(module, callee);
-        let Some(target) = callee_id.as_ref() else {
-            // A memoized un-nameable callee: no function entry, or a name atom the
-            // module cannot resolve. Declining keeps the caller's in-machine jump and
-            // never asks the host about a fabricated name (nor spends a reduction).
-            return Ok(None);
-        };
-        if !ctx
-            .resolve_local_call(
-                target.module.as_ref(),
-                target.function.as_ref(),
-                target.arity,
-            )
-            .map_err(Box::new)?
-        {
-            return Ok(None);
+        // Phase 1a — every local call: the memo's answer, which is a **byte** (no borrow
+        // of `self` survives it, so the host consultation below can hold `&mut self` for
+        // its own bookkeeping afterwards).
+        match self.local_callees.lookup(module, callee) {
+            // A memoized un-nameable callee (no function entry, or a name atom the module
+            // cannot resolve) is consulted **zero** times, and a memoized decline is the
+            // host's own earlier answer: both keep the caller's in-machine jump and mutate
+            // nothing.
+            Verdict::Unnameable | Verdict::Declined => Ok(None),
+            // Phase 1b — once per distinct callee: ask the host, then remember its answer.
+            Verdict::Ask => {
+                let Some(target) = self.local_callees.target(module, callee) else {
+                    // Unreachable: `Ask` is only ever stored beside a derived identity.
+                    // Declining (the unchanged in-machine jump) is the only
+                    // non-fabricating answer.
+                    return Ok(None);
+                };
+                let served = ctx
+                    .resolve_local_call(
+                        target.module.as_ref(),
+                        target.function.as_ref(),
+                        target.arity,
+                    )
+                    .map_err(Box::new)?;
+                self.local_callees.record(module, callee, served);
+                if served {
+                    self.serve_local_callee(
+                        entry_module,
+                        module,
+                        callee,
+                        nregs,
+                        frame,
+                        func,
+                        pc,
+                        ctx,
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
+            // Phase 2 — the host serves this callee (memoized `true`): dispatch it.
+            Verdict::Served => self.serve_local_callee(
+                entry_module,
+                module,
+                callee,
+                nregs,
+                frame,
+                func,
+                pc,
+                ctx,
+            ),
         }
-        // Phase 2 — rare (the host serves this callee as a BIF): re-derive the identity
-        // from the `module` **parameter** so the names borrow `module` rather than `self`,
-        // leaving `&mut self` free for the dispatch below. Nothing is allocated on either
-        // path; the memo's borrow ended with the `callee_id` reads above.
+    }
+    /// The **served** half of [`Machine::local_call_seam`]: dispatch the same-module
+    /// callee the host answered `true` for through [`Machine::call_bif_named`] under the
+    /// arm's own frame discipline.
+    ///
+    /// Rare by construction — the host serves a module's unexported `*_nif` stubs and
+    /// nothing else — so it re-derives the identity from the `module` parameter (which
+    /// lets the names borrow `module` rather than `self`, leaving `&mut self` free for
+    /// the dispatch below). Nothing is allocated on either path.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_local_callee(
+        &mut self,
+        entry_module: &Module,
+        module: &Module,
+        callee: u32,
+        nregs: u32,
+        frame: ImportFrame,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> std::result::Result<Option<Step>, Box<BeamError>> {
         let Some((module_name, function_name, arity)) = local_callee_identity(module, callee) else {
             // Unreachable: the memo named this callee, and both derivations are pure
             // functions of the same immutable module image. Declining (the unchanged

@@ -188,24 +188,30 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   rejects, returning how many were released, and prunes `writable_payloads` in lockstep). It is a separate
   file to keep both modules under the line budget; a child module of `machine` sees the parent's fields.
   Detail: `## The off-heap refc-binary retention seam`.
-- `local_callee.rs` — the **local-callee identity memo** `Machine::local_callees` (`LocalCallees`,
-  `CalleeKey`, `CalleeTarget`): the `(module name, function name, arity)` derivation the local-call seam
-  (`../interpreter/dispatch.rs::local_call_seam`) would otherwise repeat on every local
-  `call`/`call_only`/`call_last`, memoized per `(module address, function index)` in a fixed
-  `CAP = 8` array held as two parallel slices — a compact `keys: [CalleeKey; 8]` (16 bytes per slot,
-  the only thing the hot scan reads) beside the `targets` payloads that own their name text.
+- `local_callee.rs` — the **local-call memo** `Machine::local_callees` (`LocalCallees`, `CalleeKey`,
+  `CalleeTarget`, `Verdict`): **both** halves of what the local-call seam
+  (`../interpreter/dispatch.rs::local_call_seam`) needs — the `(module name, function name, arity)`
+  derivation *and* the host's `resolve_local_call` verdict — memoized per `(module address, function
+  index)` in a fixed `CAP = 8` cache held as three parallel slices: a compact `keys: [CalleeKey; 8]`
+  (16 bytes per slot), a `verdicts: [Verdict; 8]` byte array (the only other thing the hot path reads)
+  and the `targets` payloads that own their name text (cold paths only).
+  `Verdict` is `Unnameable` (no function entry / unresolvable name atom — the host is asked **zero**
+  times; it doubles as the vacant-slot value) / `Ask` (fill or invalidated) / `Served` / `Declined`, so
+  the seam's hot path is `lookup`'s single scan over the **occupied prefix** `keys[..len]` plus one
+  bool: a repeat local call makes **no** host call at all.
   **Policy: insert-at-front on a miss; a hit never reorders** (the entry keeps its slot), and the
   oldest *insertion* falls off the end. That is deliberate: `list_walk`'s inner loop alternates two
   callees (`sum/1`, `walk/3`), so an MRU move-to-front fired on every call and memmoved up to eight
-  owned entries in the innermost loop. With the fixed policy the seam's share of **retired
-  instructions** is **1.85 %** (interpreter) / **4.05 %** (baseline tier) against the un-memoized
-  derivation's 3.22 % / 7.93 %, i.e. **−0.5 % / −2.2 %** retired instructions per walked element
-  (model-free `perf stat -e cpu_core/instructions/` route, three reps agreeing to 0.01 %). An
-  un-nameable callee is memoized as `None` and is then consulted **zero** times. **Invariant: the
-  memo holds the identity derivation only — never the host's verdict**
-  (`ExecutionContext::resolve_local_call` is consulted, and spends one reduction unit, exactly once
-  per local call). Cleared by `reset` (`registers.rs`), which is what keeps the address key ABA-free;
-  a resume does not clear it.
+  owned entries in the innermost loop.
+  **Invalidation** (the host's answer set is a pure function of the triple for `beam_rt` — `prim_tty`'s
+  stubs plus `beam_bifs`' `zlib` table — so only an *installation* can change it):
+  `erlang:load_nif/2` (the BIF-dispatch funnel `Machine::dispatch_bif`, `../interpreter/bif.rs`, clears
+  every verdict when the dispatched triple is `("erlang","load_nif",2)` — one arity compare on the cold
+  path), [Machine::reset] (which clears the whole memo, keeping the address key ABA-free; a resume does
+  not reset) and the **public** `Machine::invalidate_local_call_verdicts` door, which a host whose
+  answer set changes by any other means (its own plugins, a reload, a config toggle) calls itself.
+  Invalidation re-asks the host but **re-derives nothing** — identities are pure functions of an
+  immutable module image and cannot go stale.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
   `initial_call`, `current_stacktrace`, `current_module`/`active_context`) **and** the parked-`receive`
   deadline seam `Machine::wait_deadline`/`timeout_delay` + `WaitDeadline { delay_ms, resume }`: it reads the
@@ -244,9 +250,11 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (`throw`/`error`/`exit` `raw_raise`, a BIF error, `func_info`, a nested call, a cross-module callee), each run
   through a real run entry and asserting the propagated `Err(BeamError::Raise)` frames name the raising function and
   every live caller innermost first, plus the guard that a caught raise lands unchanged. It also pins the
-  local-call seam's memo against a counting host: two consecutive local calls consult `resolve_local_call`
-  **twice** while the identity is derived **once**, the memo holds the callee's own names, a served `call_last`
-  pops its frame like the in-machine route, and `reset` clears the memo. `test_support.rs`
+  local-call memo against a counting host: two consecutive local calls to one callee consult
+  `resolve_local_call` **once** (a different callee consults again), `invalidate_local_call_verdicts`
+  and `reset` each force a re-consultation, dispatching `erlang:load_nif/2` invalidates while an
+  ordinary BIF dispatch does not, the identity is derived **once**, the memo holds the callee's own
+  names, and a served `call_last` pops its frame like the in-machine route. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
 - `root_tests.rs` — the pins for both root-enumeration doors. For `Machine::for_each_root` (the read-only
