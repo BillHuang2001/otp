@@ -379,9 +379,12 @@ Both mechanisms are **resident**, not merely reserved: `grow_eval_heap` retires 
   What it does **not** cover: a nested run entered while the caller owes no debt, and a fun-applying key outside the roster.
 
 ### The store's writers that do not grow
-`Runtime::eval_heap` has exactly **one** growing consumer — the table-less copy-out
-([`move_result_into_runtime_store`](pool.rs) → `Runtime::grow_eval_heap`) — and three
-families of writers that copy into the region they find and fail when it is short:
+`Runtime::eval_heap`'s **one** growing seam is [`move_result_into_runtime_store`](pool.rs) →
+`Runtime::grow_eval_heap`, and it has **two** callers — the table-less route's re-home
+(`calls.rs:1398`, `rehome_container_result` under `mailbox_table.is_none()`) and the
+**exempt-window stabilize** arm (`calls.rs:1649`) — so a *scheduled* process writes the store too,
+not only the `-eval` route.
+Three further families copy into the region they find and fail when it is short:
 - `Runtime::stabilize_term` (`runtime.rs:2476`, `beam_message::copy_struct_simple` at `:2486`) and
   `stabilize_term_with` (`:2677`) — the gateway to every runtime-lifetime store (a timer delivery, an
   exit reason, a runner outcome, `persistent_term`, a trace match spec, the `enif_select` payload,
