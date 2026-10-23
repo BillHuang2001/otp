@@ -78,6 +78,26 @@ What a `beam_rt` driver must know about the relocation seam (each pinned by a ca
   `object_words` reports 8 for the pair as one object.
 - `BinRef.val` (the off-heap payload pointer) and its refcount are **not** touched by a relocation: the
   payload never moves, so a host keeps its own liveness/refcount accounting.
+- **Copying-vs-Immix cost A/Bs (same harness, same geometry, both strategies driven) live in**
+  `allocation_heavy_workload.rs`, `immix_measure.rs`, `immix_workloads.rs`, `immix_break_even.rs`,
+  `immix_selection_curve.rs`, `steady_state.rs`, `generational_cadence.rs`,
+  `mature_capacity_convergence.rs`, `mature_capacity_feedback.rs`, `nursery_growth_retention.rs`,
+  `offheap_steady_state.rs`, `retained_vs_live.rs` (the one that also samples RSS, `read_rss_bytes`),
+  `post_fullsweep_nursery.rs` and `production_dispatch.rs`.
+  `immix_parity.rs`, `gen_immix_collector.rs` and `immix_stress.rs` also drive both strategies but
+  compare *observable results*, not cost.
+- **No messaging/copy-bound and no real `compile:file/2` workload is measured under both strategies
+  here**: this crate's dev-deps are `beam_codec` only, so a `beam_message`/`beam_rt` shape cannot be
+  driven from this suite — such an A/B belongs to the parent (`beam_rt`'s `tests/gc_immix_payload.rs`
+  is the runtime-shaped precedent).
+- **No per-file wall time is recorded anywhere**; the only in-crate figure is
+  `nursery_growth_retention.rs`'s whole-5-test file at 0.01 s (`../MEASURED.md:497`). Nothing under
+  `tests/` is `#[ignore]`d (the crate's only two ignores are doctest fences, `src/offheap.rs:102,153`).
+- `AnyCollector`'s variants are **public** (`Copying(Collector)` / `Immix(GenImmixCollector)`,
+  `../src/any_collector.rs:52`), so a test reaches `ImmixStats`
+  (`GenImmixCollector::last_immix_stats`, `../src/immix_collector.rs:280`) and `mature().used_lines()`
+  with a two-arm match; `AnyCollector` itself exposes only `GcStats`, `HeapObservable` and
+  `HeapFootprint`.
 
 ## Test Strategy
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
