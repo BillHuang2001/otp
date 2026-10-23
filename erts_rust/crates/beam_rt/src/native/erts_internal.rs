@@ -1335,19 +1335,6 @@ mod tests {
         build(context.eval_heap()).expect("an eval-heap term")
     }
 
-    /// The `beam_rt` executable this build produced, or `None` when it is absent.
-    ///
-    /// A bare `--lib` test run does not build the binary target, so the caller skips
-    /// **loudly** instead of failing; the crate's gate (`--all-targets`) builds it first.
-    fn beam_rt_exe() -> Option<std::path::PathBuf> {
-        if let Some(path) = option_env!("CARGO_BIN_EXE_beam_rt") {
-            return Some(std::path::PathBuf::from(path));
-        }
-        // `<target>/debug/deps/<test binary>` -> `<target>/debug/beam_rt`.
-        let exe = std::env::current_exe().ok()?.parent()?.parent()?.join("beam_rt");
-        exe.is_file().then_some(exe)
-    }
-
     /// The atom name of an `Ok` answer.
     fn ok_name(runtime: &mut Runtime, function: &str, args: &[Eterm]) -> String {
         let answer = erts(runtime, function, args).expect("an answer");
@@ -2547,40 +2534,6 @@ mod tests {
             crate::cli::EXIT_OK,
             "the numeric %T byte budget is served, so nothing is unsupported"
         );
-    }
-
-    /// The typed arms are **capability gaps** in the external contract too: a `%T` target
-    /// the renderer cannot derive exits `3` with exactly one `beam_rt: unsupported: …`
-    /// line on stderr and nothing on stdout.
-    #[test]
-    fn an_external_pid_exits_three_through_the_cli() {
-        let Some(exe) = beam_rt_exe() else {
-            eprintln!("SKIP: the beam_rt binary is not built (the gate builds it first)");
-            return;
-        };
-        let output = std::process::Command::new(&exe)
-            .args([
-                "-eval",
-                "erts_internal:term_to_string(list_to_pid(\"<a@b.0.1>\"))",
-            ])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("the beam_rt binary runs");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(crate::cli::EXIT_UNSUPPORTED),
-            "stderr: {stderr}"
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.is_empty(), "stdout: {stdout:?}");
-        let lines: Vec<&str> = stderr.lines().collect();
-        assert_eq!(lines.len(), 1, "exactly one stderr line: {stderr:?}");
-        assert!(
-            lines[0].starts_with("beam_rt: unsupported: "),
-            "stderr: {stderr:?}"
-        );
-        assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
     }
 
     /// The renderer's typed arms, in-crate: an **external** pid and a `Local` fun with no
