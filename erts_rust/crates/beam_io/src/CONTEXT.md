@@ -273,9 +273,11 @@ of `drv->stop` (`io.c:3752`).
 - `drivers/inet/mod.rs` → the **read-path ordering rule** (owned by the inet node — see
   `drivers/inet/CONTEXT.md`): a complete buffered unit wins over a pending peer close, so
   `{Port,{data,…}}` is delivered before `{tcp_closed,…}`. The observation is kept in
-  `TcpInetDriver::deferred_close` and applied at the single latch site
+  `TcpInetDriver::pending_close` and applied at the single latch site
   `TcpInetDriver::latch_peer_close` once nothing complete is left to deliver
-  (`TcpInetDriver::latch_deferred`).
+  (`TcpInetDriver::latch_pending`), and only by a read the C would have made:
+  `ReadReport::Answered` applies it, the reactor's eager passive read
+  (`ReadReport::Unselected`) merely records it.
 - `port.rs` → `PortState::Closing` is a **real observable state** (`Port::is_closing()`/
   `is_closed()`/`state()`), not a transient: `Port::close` is two halves.
   **Begin** (always): `state = Closing`, record `closing_watermark`, `driver_flush` (the four
