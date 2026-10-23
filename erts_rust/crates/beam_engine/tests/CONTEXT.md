@@ -135,21 +135,43 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
   prefix cross-check), and `the_block_allocator_engages_on_real_stdlib_modules` (7 real
   modules, engine-internal artifact assertions only). `jit_compare.rs` / `local_call_seam.rs` are
   **synthetic-only**.
-- **`Tier::Cranelift`** — real-module half is `jit_cranelift_real.rs`: a 26-row curated real-stdlib
-  set whose expected values ARE the oracle's (`:365`, `compared >= 20` at `:663`; `lists`/`ordsets`/
-  `proplists`/`calendar`), a **bounded** breadth sweep (≤`MAX_BREADTH_MODULES` 30 modules ×
-  ≤`PER_MODULE` 2 = ≤60 cases; floors 40 cases / 20 modules, `:107-121`, `:1140-1148`) and a
-  bounded error sweep (floors 30 cases / 10 `function_clause`, `:123-129`, `:1353-1358`) — both
-  compare interpreter vs Cranelift only, never the oracle value. `jit_cranelift.rs` runs slice.beam
-  on all three tiers behind one `agree(..)` (`:121-130`) and is synthetic otherwise; `jit_coverage.rs`
-  adds `Cranelift` to `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/
-  `try`-raise/maps/bitstrings) is covered on it too.
-- **Gaps by tier:** the 504+232 corpora and `jit_cross_module.rs` are baseline-only (Cranelift gets
-  bounded prefixes only); no suite drives `Tier::Cranelift` over `census.rs`/`dynamic_census.rs`/
-  `real_beam_variant_proofs.rs`/`stdlib_sweep.rs`. `jit_cranelift_real.rs:324`'s roster test calls
-  `host()` with **no** skip guard, so it PANICS (not skips) when the OTP stdlib is absent; the
-  `skip_reason()` guard elsewhere needs the stdlib `.beam` files only (no live `erl` per assertion —
-  values are baked, except `jit_cross_module.rs`'s test-time `erlc` and the live-oracle suites).
+- **`Tier::Cranelift`** — `jit_cranelift_real.rs` runs the **same full corpus** as the other two
+  tiers, oracle-checked per tier: all **504** breadth rows over **171** modules and all **232**
+  error-path rows over **215** modules, through the one shared `support/oracle.rs` machinery. Per row
+  it asserts (a) interpreter vs Cranelift agreement and (b) *each* tier's outcome against the baked
+  oracle value/reason (`Expected::matches`; `verify_error` requiring `Matches`); a Cranelift codegen
+  failure is a counted `SKIP:` line, a typed gap on both tiers a counted `BLOCKED:` line (the 9
+  fixture-`unsupported` error rows), and a value/reason that differs from the oracle FAILS quoting the
+  row's own `erl` command. Floors: breadth `480` cases / `480` oracle-checked **per tier** / `171`
+  modules / `blocked == 0`; error path `220` cases / `200` oracle-checked per tier / `200` modules /
+  `200` bare-atom `function_clause` agreements. Measured: `oracle-checked interpreter=504
+  cranelift=504` and `223/223`, 207 `function_clause` agreements, the whole 23-test file in ~84 s.
+  Plus a 26-row curated real-stdlib set whose expected values are the oracle's. The file serializes
+  its own tests on a `JIT_SERIAL` mutex: `cranelift-jit` 0.116 maps one `mmap` per allocation and
+  emits a 16-byte PLT stub per declared function whose `rel32` must reach that function's GOT slot, so
+  two corpora's JIT modules alive at once can drift past the ±2 GiB `rel32` reach and the *dependency*
+  panics with `TryFromIntError(NegOverflow)` in `write_plt_entry_bytes` (~50 % with the two sweeps
+  parallel, never solo) — an address-space limitation of the dependency, never a tier divergence; the
+  mutex is equivalent to `--test-threads=1`. `jit_cranelift.rs` runs slice.beam on all three tiers
+  behind one `agree(..)` and is synthetic otherwise; `jit_coverage.rs` adds `Cranelift` to
+  `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/`try`-raise/maps/bitstrings)
+  is covered on it too; `jit_cross_module.rs` drives Cranelift through its single `run_both` funnel for
+  the resolved cross-module call, the nested recursive chain and the dynamic `apply` — the
+  parked-suspension row stays on interpreter+baseline because
+  `Machine::resume_outcome_with_tier(.., Tier::Cranelift)` is the typed
+  `unsupported_opcode: cranelift jit: cannot resume at an arbitrary pc`.
+- **Gaps by tier:** all three tiers now run the full 504+232 corpus oracle-checked
+  (`jit_real_module.rs` for interpreter+baseline; `jit_cranelift_real.rs` for interpreter+Cranelift).
+  No suite drives `Tier::Cranelift` over `census.rs`/`dynamic_census.rs`/`real_beam_variant_proofs.rs`/
+  `stdlib_sweep.rs`, and the corpora reach 171/215 of the installed modules, not all 1366.
+  `stdlib_sweep.rs::sweep_loads_every_installed_beam` remains **load-only** (it executes no
+  instruction): a per-module execution sample over all 1366 modules has no oracle column, because a
+  module's only universally-present exports are `module_info/0,1`, which the compiler lowers to the
+  `erlang:get_module_info/1,2` BIF that the test host's BIF floor does not serve — so no expectation
+  could be produced reliably. The execution evidence is the separate `sweep_*` tests plus the 504-row
+  corpus. Values are baked at authoring time (no live `erl` per assertion) except
+  `jit_cross_module.rs`'s test-time `erlc` and the live-oracle suites (`trace.rs`,
+  `func_info_stacktrace.rs`, `raise_stacktrace.rs`, `stacktrace_frames.rs`).
 - **`#[ignore]`d suites here:** exactly two — `stacktrace_frames.rs:710` (`#[ignore = "capability
   gap: `ModuleHost` supplies no mailbox, …"]`) and `jit_bench.rs:57` (`#[ignore = "measurement
   table: run with --ignored --nocapture"]`). Run either with
