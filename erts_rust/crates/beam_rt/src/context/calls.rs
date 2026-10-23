@@ -66,7 +66,7 @@ use beam_alloc::Heap;
 use beam_bifs::{AtomInterner, BifContext, BifFn, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessTable;
-use beam_term::Eterm;
+use beam_term::{AtomTable, Eterm};
 
 use crate::error;
 use crate::nif::{NifHostImpl, RuntimeNifServices};
@@ -95,6 +95,18 @@ use super::runtime_hooks::RuntimeHooksBridge;
 /// makes the check a single compare on the hot path — the pool is taken on **every** registered
 /// call.
 const BIF_HEAP_GROWTH_DIVISOR: usize = 16;
+
+/// [`error::enforce_term_heap_limit`], out of line for the registered-call tail.
+///
+/// The mapping is identity for every error but a term-heap exhaustion, and it is only ever reached
+/// on a **failed** call — so the tail's hot arm must not have to rebuild a `Result` to apply it.
+/// `#[cold]`/`#[inline(never)]` keep the (large, error-shaped) callee out of the tail's frame; the
+/// answer is unchanged either way, which is what lets this be a pure outlining move.
+#[cold]
+#[inline(never)]
+fn cold_term_heap_limit(failure: BeamError) -> BeamError {
+    error::enforce_term_heap_limit(failure)
+}
 
 impl<'a> RuntimeContext<'a> {
     /// Takes the pooled BIF heap this call allocates on, **growing the frontier** when the region
@@ -164,11 +176,27 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// Propagates the fresh region's allocation failure — raised **before** the BIF has run, so no
     /// side effect is repeated and no result is fabricated.
+    #[inline]
     fn take_bif_frontier(&mut self) -> Result<Heap> {
         let heap = self.runtime.take_bif_heap()?;
         if heap.available() >= heap.capacity() / BIF_HEAP_GROWTH_DIVISOR {
             return Ok(heap);
         }
+        self.grow_bif_frontier(heap)
+    }
+
+    /// [`Self::take_bif_frontier`]'s **growth** arm, out of line.
+    ///
+    /// The frontier is taken on **every** registered call (and every NIF call), and the answer is
+    /// "the pooled region, unchanged" for all but the handful of calls that arrive when the region
+    /// has less than `1/BIF_HEAP_GROWTH_DIVISOR` of its capacity free. Keeping the growth here is
+    /// what makes the taker a handful of instructions: inlined together, the growth's own frame
+    /// (six saved registers and a 200-byte scratch area — it calls `Runtime::config`, reads the
+    /// heap policy, and may allocate) was paid by every call, `#[cold]`-marked or not, because
+    /// LLVM could not shrink a function whose two arms it had to keep reachable from one prologue.
+    #[cold]
+    #[inline(never)]
+    fn grow_bif_frontier(&mut self, heap: Heap) -> Result<Heap> {
         let doubled = heap.capacity().saturating_mul(2);
         let max = self.runtime.config().heap_options().policy().max_heap_words;
         let grown = if max == 0 { doubled } else { doubled.min(max) };
@@ -233,6 +261,31 @@ impl<'a> RuntimeContext<'a> {
     /// produce `bif`, and [`Self::call_bif_routed`] only reaches this method when it answered
     /// `Some`.
 
+    ///
+    /// # The two paths
+    ///
+    /// The dispatch memo resolved a [`DispatchHooks`] roster for this key, and *that* is what
+    /// decides how much of this method is work:
+    ///
+    /// * **no hook set and no lent `TableRegistry`** — the call is the ten-arm chain's `else`
+    ///   (the `FunBridge` arm), so nothing has to be selected, and this method builds **one**
+    ///   [`BifContext`] for it;
+    /// * **anything else** — the whole bridge selection runs, in
+    ///   [`Self::call_registered_full`], which is `#[cold]` and `#[inline(never)]`.
+    ///
+    /// The split exists because of what the *shape* of the unsplit method cost, measured on
+    /// `bench_gc_bound:churn/1` (20 000 rounds, `perf annotate`, `BEAM_RT_PERF_COUNTERS=1`): the
+    /// hook-free arm is **99.91 %** of all registered calls (5 171 194 of 5 171 517), yet the
+    /// compiler emitted **~10 full builds** of the 320-byte, 40-word [`BifContext`] — one per arm,
+    /// ~26–30 stores each plus 8 unconditional zeroing stores — because all ten had to stay
+    /// reachable from one prologue, and it ran at an IPC of 4.7 with 0.18 % cache misses: the cost
+    /// was pure store/`mov` volume. With the ten arms behind a `#[cold]` call, the hot path holds
+    /// one build.
+    ///
+    /// Both paths share [`Self::begin_registered`]'s frontier (and its `mark`), the alias witness,
+    /// the interner and the whole tail ([`Self::finish_registered_call`]), so they can differ only
+    /// in which bridge they install — never in what they hand it or in what they do with its
+    /// result.
     pub(super) fn call_registered(
         &mut self,
         bif: BifFn,
@@ -273,6 +326,162 @@ impl<'a> RuntimeContext<'a> {
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
+        // The `ets` **table-alias witness** (`BifContext::with_table_aliasing`), installed on every
+        // path — one stack `Cell<bool>` per dispatch, never an allocation (its full rationale, and
+        // the three facts that make the pair sound, are in [`Self::call_registered_full`], whose
+        // arms install the same cell).
+        let alias = std::cell::Cell::new(false);
+        // The one-bit arm test. A **lent** `TableRegistry` is exclusive by construction, so its
+        // presence also has to send the call to the full path: the shared cell must not be
+        // consulted while one is lent, and only the full path installs the lent one.
+        if hooks.any() || self.lent_tables.is_some() {
+            return self.call_registered_full(
+                bif,
+                module,
+                function,
+                arity,
+                args,
+                hooks,
+                heap,
+                mark,
+                self_pid,
+                atoms,
+                pending,
+                alias,
+                tables_handle,
+                ports_handle,
+            );
+        }
+        // ---- the hook-free fast path ---------------------------------------------------------
+        //
+        // `hooks.any() == false` and no lent registry: the call is the chain's `else` arm, so the
+        // one thing to *select* is already known. What remains is exactly what the full path does
+        // for that arm, with the same inputs and the same tail.
+        //
+        // Every invariant of the full path holds here by construction:
+        //
+        // * the cell is taken with `try_borrow_mut` (**never** `borrow_mut`) and only when
+        //   `install_tables`, so an unexpected outer borrow degrades to "no ETS", never a panic;
+        // * a **lent** registry cannot reach this path at all (the test above), so the shared cell
+        //   is never consulted while one is lent, and the lent-precedence rule is untouched;
+        // * a **dict** hook cannot be set here either (`hooks.dict` is one of the eleven bits), so
+        //   the dict-substitutes-for-tables rule has nothing to substitute;
+        // * the alias witness, the atom interner, the port provider, the local-node identity and
+        //   the fun-caller bridge are installed exactly as the `else` arm installs them, and the
+        //   intern commit still happens in the tail (after the context, the interner's borrowers
+        //   and the atom handles are all released) at its predicted indices;
+        // * `safe_to_rewind` is `!reentrant`: six of its seven disjuncts are hook flags, all of
+        //   them `false` on this path.
+        let reentrant = Self::reentrancy_capable(args);
+        if reentrant {
+            perf_counters::bump(|c| &mut c.reentrant);
+        }
+        let install_tables = !reentrant || Self::tables_capable(module, function, arity);
+        // The cell borrow, held for this call's whole duration when it is taken (`held_tables`
+        // owns it, `tables` reborrows it, and both are dropped before the tail's commit).
+        let mut held_tables = if install_tables {
+            tables_handle.try_borrow_mut().ok()
+        } else {
+            None
+        };
+        if held_tables.is_some() {
+            perf_counters::bump(|c| &mut c.tables_held);
+        }
+        // The local-node identity: **this runtime's own node**, paired with its **live** creation,
+        // read per call and never snapshotted — see [`NodeIdentity`] and the longer note in
+        // [`Self::call_registered_full`], whose arms read the same pair the same way.
+        let mut local_node = NodeIdentity {
+            node: Some(self.runtime.local_node()),
+            creation: self.runtime.node_creation(),
+        };
+        let mut ports = RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
+        let result = {
+            perf_counters::bump(|c| &mut c.arm_fun_caller);
+            let RuntimeContext {
+                runtime,
+                output,
+                mailbox_pid,
+                mailbox_table,
+                may_pump_scheduler,
+                current_module: caller_module,
+                engines,
+                // Neither latch can be armed across a dispatch, the memo is not consulted here,
+                // no registry is lent on this path and the copy-out hint is the process's own.
+                gc_armed: _,
+                suspend_requested: _,
+                dispatch_memo: _,
+                lent_tables: _,
+                copy_out_hint: _,
+            } = self;
+            // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies writes to
+            // the caller's sink (not stdout), and it inherits the caller's module name **borrowed**
+            // (never cloned) so a nested call still knows its call site.
+            let mut bridge = FunBridge {
+                runtime,
+                output: output.clone(),
+                mailbox_pid: *mailbox_pid,
+                mailbox_table: mailbox_table.as_deref_mut(),
+                may_pump_scheduler: *may_pump_scheduler,
+                current_module: caller_module.as_deref(),
+                engines: *engines,
+            };
+            let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                .with_table_aliasing(&alias)
+                .with_atom_interner(&mut pending)
+                .with_fun_caller(&mut bridge)
+                .with_port_hook(&mut ports)
+                .with_local_node(&mut local_node);
+            if let Some(sink) = output.as_mut() {
+                context = context.with_output(sink);
+            }
+            if let Some(tables) = held_tables.as_deref_mut() {
+                context = context.with_tables(tables);
+            }
+            invoke_registered(bif, arity, &mut context, args)
+        };
+        self.finish_registered_call(
+            result,
+            heap,
+            mark,
+            !reentrant,
+            &alias,
+            atoms,
+            None,
+            pending,
+        )
+    }
+
+    /// [`Self::call_registered`]'s **full** path: the ten bridge arms, first match wins.
+    ///
+    /// `#[cold]` and `#[inline(never)]` because it is the rare path — a hook is set for 0.09 % of a
+    /// `bench_gc_bound:churn/1` run's registered calls — and because keeping it out of the caller is
+    /// what lets the hook-free arm be a single [`BifContext`] build (see
+    /// [`Self::call_registered`]'s *The two paths*).
+    ///
+    /// It is handed the whole prologue [`Self::call_registered`] already paid for — the frontier
+    /// and its `mark`, the atom handle, the interner, the alias witness and the two registry
+    /// handles — so neither path can differ in what it starts from. The tail is
+    /// [`Self::finish_registered_call`], shared with the hot path.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn call_registered_full(
+        &mut self,
+        bif: BifFn,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+        hooks: DispatchHooks,
+        mut heap: Heap,
+        mark: usize,
+        self_pid: beam_process::ProcessId,
+        atoms: Rc<AtomTable>,
+        mut pending: PendingInterner,
+        alias: std::cell::Cell<bool>,
+        tables_handle: Rc<std::cell::RefCell<TableRegistry>>,
+        ports_handle: Rc<std::cell::RefCell<crate::port::PortRegistry>>,
+    ) -> Result<Eterm> {
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
@@ -445,9 +654,10 @@ impl<'a> RuntimeContext<'a> {
         //   non-`ets` BIF, so the dispatch prologue's cost is one stack slot.
         //
         // A **nested** call (a fun a BIF applies) re-enters `call_registered` and gets its own
-        // cell, so a nested `ets:*` cannot confuse the outer call's answer.
-        let alias = std::cell::Cell::new(false);
-        let mut result = {
+        // cell, so a nested `ets:*` cannot confuse the outer call's answer. The cell is created
+        // once per dispatch by [`Self::call_registered`] and handed to this path, so both paths
+        // install the *same* witness.
+        let result = {
             let RuntimeContext {
                 runtime,
                 output,
@@ -851,6 +1061,31 @@ impl<'a> RuntimeContext<'a> {
                 invoke_registered(bif, arity, &mut context, args)
             }
         };
+        self.finish_registered_call(result, heap, mark, safe_to_rewind, &alias, atoms, memory, pending)
+    }
+
+    /// The tail **both** registered paths run, once the BIF has returned and every borrow it needed
+    /// is released: the reference/copy-out decision, the interner commit, the pool rewind and the
+    /// term-heap-limit mapping.
+    ///
+    /// It is one function rather than two because the two paths must not be able to drift: a
+    /// hand-built arm and a memo-selected arm have to hand their result back through the same
+    /// copy-out rule, or a term would live on a region with a different lifetime depending on which
+    /// bridge happened to serve the key. Everything it needs is an **input**: the result, the
+    /// frontier and this call's `mark` on it, `safe_to_rewind` (the escaping-arm gate), the alias
+    /// witness, the atom handle and the `RuntimeMemory` snapshot (both owned here so the commit
+    /// below can take the append-only `Rc::get_mut` path) and the interner.
+    fn finish_registered_call(
+        &mut self,
+        mut result: Result<Eterm>,
+        mut heap: Heap,
+        mark: usize,
+        safe_to_rewind: bool,
+        alias: &std::cell::Cell<bool>,
+        atoms: Rc<AtomTable>,
+        memory: Option<RuntimeMemory>,
+        pending: PendingInterner,
+    ) -> Result<Eterm> {
         // The result is still on the pooled BIF heap. A **container** result must not stay there on
         // a **process route**: the pool is a region no process collector scans, so Erlang code that
         // stores such a result inside a heap object (a tuple, a map, a longer list) leaves a live
@@ -1059,8 +1294,15 @@ impl<'a> RuntimeContext<'a> {
         self.runtime.put_bif_heap(heap);
         rewound?;
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
-        // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
-        result.map_err(error::enforce_term_heap_limit)
+        // not a host-level allocation abort (see `error::enforce_term_heap_limit`). The mapping
+        // runs on the **failing** arm only, out of line: spelled as `result.map_err(..)` it
+        // rewrote the whole `Result` in place — a second multi-word write-back of a value the callee
+        // had just built into the same return slot — where this shape moves the `Ok` term and
+        // leaves the cold arm a call.
+        match result {
+            Ok(term) => Ok(term),
+            Err(failure) => Err(cold_term_heap_limit(failure)),
+        }
     }
 
     /// Names a failed call's **reason atom** in the runtime's one shared atom table, so the

@@ -21,10 +21,23 @@
 //! Env-gated counters for the registered-call dispatch path (`BEAM_RT_PERF_COUNTERS=1`).
 //!
 //! A diagnostic build aid, not a runtime feature: every counter sits behind
-//! [`enabled`], which reads a `OnceLock` once per call site, and nothing here
-//! *changes* a dispatch decision — the counters observe the same prologue the
-//! uninstrumented build runs. With the variable unset the only cost is one
-//! `Relaxed` load of a `OnceLock` per call site.
+//! [`enabled`], and nothing here *changes* a dispatch decision — the counters observe the same
+//! prologue the uninstrumented build runs.
+//!
+//! # Why the gate is one `Relaxed` load and not a `OnceLock` read
+//!
+//! [`enabled`] is on the registered-BIF hot path ([`bump`] is called ~8 times per call, and
+//! `call_registered` runs 5.17 M times over a 20 000-round `bench_gc_bound:churn/1`), and it was
+//! **0.98 % of that whole run with the counters off** — because a `OnceLock<bool>` read is not one
+//! load: the cell is `bool` + an initialised flag, so LLVM emitted the payload load, the flag
+//! `cmpb`, and a call into the cold `get_or_init` arm (whose address it must keep live) — and
+//! [`COUNTERS`] is a `thread_local!`, so the *enabled* arm pays a TLS canary test and a `RefCell`
+//! borrow flag as well.
+//!
+//! [`STATE`] collapses the whole gate into **one relaxed load of one byte**: `0` is "not decided
+//! yet" (impossible after the first call), `1` off, `2` on. The environment is read exactly once, in
+//! the cold [`init_state`], so the observable behaviour of `BEAM_RT_PERF_COUNTERS` is unchanged —
+//! including the rule that it is read once per process.
 //!
 //! The summary is printed by the thread-local's `Drop`, i.e. when the main
 //! thread unwinds out of `main` — which is the route every CLI action takes
@@ -32,24 +45,54 @@
 //! that leaves through `erlang:halt/0,1` skips it.
 
 use core::cell::RefCell;
-use std::sync::OnceLock;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use std::collections::HashMap;
 
+/// [`STATE`]'s "the environment has not been read yet" value.
+const UNINIT: u8 = 0;
+/// [`STATE`]'s "the counters are off" value.
+const OFF: u8 = 1;
+/// [`STATE`]'s "the counters are on" value.
+const ON: u8 = 2;
+
+/// Whether the counters are on (`BEAM_RT_PERF_COUNTERS` set to anything non-empty), as a
+/// one-byte relaxed-load gate.
+///
+/// The hot path is `load` + compare against [`ON`]; the `0` and [`OFF`] answers both leave the
+/// `if` false, so a not-yet-initialised state can only ever be *read* by a thread that is about to
+/// initialise it. Every store is [`Ordering::Relaxed`] and every thread computes the same answer
+/// from the same immutable environment, so no ordering is load-bearing.
+static STATE: AtomicU8 = AtomicU8::new(UNINIT);
+
 /// Whether the counters are on (`BEAM_RT_PERF_COUNTERS` set to anything non-empty).
+#[inline]
 pub(crate) fn enabled() -> bool {
     // A unit test cannot turn the shipping gate on for itself: the gate is a process-wide
-    // `OnceLock`, already `false` by the time any test runs (every dispatch site reads it). The
+    // static, already decided by the time any test runs (every dispatch site reads it). The
     // thread-local override is test-only and read first, so a test can observe **this thread's**
     // counters without touching any other test's.
     #[cfg(test)]
     if test_override::forced() {
         return true;
     }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("BEAM_RT_PERF_COUNTERS").is_some_and(|value| !value.is_empty())
-    })
+    match STATE.load(Ordering::Relaxed) {
+        ON => true,
+        OFF => false,
+        _ => init_state(),
+    }
+}
+
+/// Reads `BEAM_RT_PERF_COUNTERS` once and records the answer in [`STATE`].
+///
+/// Out of line and `cold` so the hot [`enabled`] is a load, a compare and nothing else — the
+/// environment read and the `var_os` call belong to the process's first counter site only.
+#[cold]
+#[inline(never)]
+fn init_state() -> bool {
+    let on = std::env::var_os("BEAM_RT_PERF_COUNTERS").is_some_and(|value| !value.is_empty());
+    STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+    on
 }
 
 /// Test-only override of [`enabled`], scoped to the calling thread.
@@ -240,6 +283,10 @@ thread_local! {
 }
 
 /// Bumps one counter, when the counters are on.
+///
+/// `#[inline]` because the disabled answer is a load and a compare on [`STATE`]: inlined, every
+/// site is a pair of instructions; outlined, it is a call the hot path cannot afford.
+#[inline]
 pub(crate) fn bump(pick: impl FnOnce(&mut Counters) -> &mut u64) {
     if !enabled() {
         return;
