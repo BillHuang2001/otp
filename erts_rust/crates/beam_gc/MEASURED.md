@@ -1149,3 +1149,160 @@ each, modal value of 20 / 12 runs: `total` 13 222 861 → 6 788 542 B, of which 
 tables and the handoffs live in `src/ACCOUNTING.md`; this section records only the figures. Not a
 crate assertion — these are the runtime's own totals, and the per-key spread across repeated runs
 (`processes` in whole-heap-size steps of 1 872–6 024 B) is why each side is quoted as a modal value.
+
+## The mature-strategy sweep — C1 and C2 at the collector level
+Source: `tests/mature_strategy_sweep.rs` (its `//!` doc is the authority on the protocol), run from the
+repository root with
+
+```
+erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --release -p beam_gc \
+    --test mature_strategy_sweep -- --nocapture --test-threads=1
+```
+
+**The arms.** Both are built through `AnyCollector::from_config` with an **explicit pin** —
+`GcConfig::copying(policy)` / `GcConfig::immix(policy)` — at **one identical `HeapPolicy` per class**, so the
+strategy is the only difference; `GenImmixCollector::with_config` is never used because it ignores
+`MatureKind`. The resolved arm is asserted **inside the measured child** (`collector.kind()` and
+`GcConfig::mature_choice()`), so a run where both arms silently take the copying space cannot be reported.
+
+**The schedule.** One fresh child process per `(class, arm, round)` — re-exec'd from the test binary, because
+a collector's `GcStats` is cumulative and because `VmHWM` is monotonic for a process's life, so two arms in
+one process could not each have a peak. Arms are **strictly interleaved** within a class (`Copying`, `Immix`,
+`Copying`, …), never arm-blocked, and every figure below is the **median paired difference / ratio**
+(`Immix − Copying` / `Immix ÷ Copying`). Three rounds per class. `/proc/loadavg` is read before and after
+every round; the parent polls the child's `/proc/<pid>/status` for `VmHWM`.
+
+**What is asserted.** Only deterministic counts: the arm identity, the geometry formulas (live roots/words,
+`footprint_capacity_bytes == (young_capacity + mature_capacity) × 8`, capacity ≥ used), one collection per
+round, `minors + majors == collections == reported_collections`, the due-fullsweep floor, structural
+intactness of the live set under both strategies (`beam_term::compare` against a witness built in a separate
+arena), and the noise floor's bit-identity. **Wall time and every RSS figure are printed only, never asserted.**
+
+**Sizes.** Release: `churn` N = 2 048, `growth` N = 1 024, `copy_out` N = 2 048; debug runs a quarter of each
+(every assertion is a function of the geometry and N, so both sizes are checked identically). Release profile,
+two independent sessions, 14-core host.
+
+### C1 — allocation-churn, low live set (`churn`)
+32 persistent 4-word tuples (128 words live) plus, per round, 128 transients (3 words) that are reachable at
+the round's collection — so a minor promotes them — and are dropped immediately after, plus 576 unreferenced
+garbage tuples (1 728 words). `fullsweep_after = 2`; nursery 4 096 and mature 4 096 words for **both** arms.
+
+| metric | Copying | Immix | median ratio |
+|---|---|---|---|
+| minor collections | 1 366 | 1 365 | 0.999 |
+| fullsweeps | 682 | 683 | 1.001 |
+| `words_copied` | 873 856 | 786 688 | **0.900×** |
+| `objects_copied` | 284 000 | 262 208 | 0.923 |
+| `words_reclaimed` | 4 324 224 | 7 731 584 | 1.788 (unit caveat) |
+| peak mature occupancy | 1 280 **promoted object words** | 6 656 **line-words** (416 lines) | **5.200×** |
+| mature capacity | 6 772 | 6 912 | 1.021 |
+| nursery capacity (settled) | 4 096 | 4 096 | 1.000 |
+| `HeapFootprint` capacity | 86 944 B | 88 064 B | 1.013 |
+| `HeapFootprint` used | 10 240 B | 20 480 B | **2.000×** |
+| peak RSS | 3 452–3 500 kB | 3 520–3 544 kB | 1.013–1.018 |
+| wall (child's measured window) | 15.5–15.9 ms | 34.7–38.1 ms | **2.234–2.417×** |
+
+The 1 280 promoted words are exactly the 128 live words plus the `fullsweep_after + 1 = 3` dead promoted
+batches of 128 transients × 3 words; the mark region's 416 lines are the same `32 + 3 × 128` objects with each
+3-word transient claiming a whole `LINE_WORDS`(16)-word line, so its occupancy is charged in a unit that turns
+a 3-word object into 16.
+
+### C2 — heap-growth, high live set that keeps growing (`growth`)
+48 kept 3-word tuples per round (the live set grows by 48 roots / 144 words per round, never dropped) plus 250
+unreferenced garbage tuples (750 words). N = 1 024 rounds leaves **49 152 roots / 147 456 words** live. Nursery
+1 598 and mature 4 096 words for both arms, with an unbounded ceiling.
+
+| metric | Copying | Immix | median ratio |
+|---|---|---|---|
+| minor collections | 683 | 680 | 0.996 |
+| fullsweeps | 341 | 344 | 1.009 |
+| `words_copied` | 25 288 704 | 495 792 | **0.020×** |
+| `objects_copied` | 8 429 568 | 165 264 | 0.020 |
+| `words_reclaimed` | 768 000 | 2 277 456 | 2.965 (unit caveat) |
+| peak mature occupancy | 147 456 **promoted object words** | 786 432 **line-words** (49 152 lines) | **5.333×** |
+| mature capacity | 318 187 | 833 280 | 2.619 |
+| nursery capacity | 233 | 1 220 | 5.236 |
+| live set at the end | 49 152 roots / 147 456 words | identical | 1.000 |
+| `HeapFootprint` capacity | 2 547 360 B | 6 676 000 B | 2.621 |
+| `HeapFootprint` used | 1 179 648 B | 6 291 456 B | **5.333×** |
+| peak RSS | 11 068–11 200 kB | 26 084–26 204 kB | **2.338–2.340×** |
+| wall (child's measured window) | 209.0–209.9 ms | 356.7–358.5 ms | **1.711–1.721×** |
+
+The copying arm's 25.3 M words are ≈ `341 fullsweeps × the average live set` (the live set grows linearly to
+147 456 words, so its mean is ≈ half), i.e. every fullsweep re-copies the entire live set into a fresh space;
+the mark region pins the kept tuples in place and copies only what the nursery promotes. Its 786 432 line-words
+are exactly 49 152 lines — one 16-word line per 3-word kept tuple (`16/3 = 5.333`). The nursery divergence
+(233 vs 1 220 words) is each strategy's own whole-heap live-set target: the mark region contributes its
+line-granular occupancy to that live figure, the copying space its promoted object words. It is measured, not
+configured — both arms start from the same policy.
+
+### The C3 geometry without a runtime (`copy_out`)
+64 table rows of 3 words (192 words live) in a `Vec`-backed stand-in table, with a 192-word structural copy-out
+per round: the `ets_copy` allocation shape with no runtime, message layer or ETS table involved.
+
+| metric | Copying | Immix | median ratio |
+|---|---|---|---|
+| minor collections / fullsweeps | 1 366 / 682 | 1 366 / 682 | 1.000 / 1.000 |
+| `words_copied` | 524 352 | 393 408 | **0.750×** |
+| `objects_copied` | 174 784 | 131 136 | 0.750 |
+| peak mature occupancy | 768 **promoted object words** | 4 096 **line-words** (256 lines) | 5.333× |
+| mature / nursery capacity | 4 096 / 987 | 4 096 / 987 | 1.000 / 1.000 |
+| `HeapFootprint` capacity / used | 40 664 B / 6 144 B | 40 664 B / 32 768 B | 1.000 / **5.333×** |
+| peak RSS | 3 436–3 476 kB | 3 476–3 488 kB | 1.007–1.009 |
+| wall | 11.2–12.5 ms | 21.7–21.8 ms | **1.742–1.940×** |
+
+### The noise floor, and the load
+The copying arm on `churn` at N = 2 048, three times, in each of the two release sessions plus the debug pass:
+**every deterministic counter is bit-identical** (`words_copied` 873 856, `objects_copied` 284 000,
+`mature_peak_words` 1 280, `footprint` 86 944 B / 10 240 B, and the other 16 fields) — spread **1.000×**
+everywhere, exactly as a count must be. Peak RSS spread **1.001–1.003×**; wall spread **1.191×** and
+**1.400×** in the two release sessions (18.6–26.0 ms windows) and **1.057×** in debug.
+
+That wide relative wall band is a property of the window, not of the arms: at these N the child measures
+10–40 ms for `churn`/`copy_out`, so page faults and process scheduling dominate a single sample. The **paired
+difference** is what carries the signal, and it reproduces in every round of both sessions: **+19.2 / +20.8 ms**
+on `churn` and **+10.9 / +11.5 ms** on `copy_out`, with `growth` at **+150.8 / +149.2 ms** on a ≈210 ms base
+(per-round spread ±5 %). Both sessions ran at 1-minute loadavg **0.28–0.61** on 14 cores.
+
+## The four-class record and the standing decision
+One row per workload class: **C1** and **C2** from the collector-level sweep above, **C3** and **C4** from
+`../beam_rt/GC_STRATEGY_MEASURED.md`, which is **canonical** for those two (five interleaved rounds, release,
+the 2047-vs-2048 mature-word arms). The ratios there are summarised here; that file's per-round tables are
+not duplicated. Every ratio is `Immix ÷ Copying`.
+
+| class | copy work (`words_copied`) | footprint | peak RSS | wall | loadavg | verdict |
+|---|---|---|---|---|---|---|
+| **C1** allocation-churn, low live (collector) | **0.900×** (objects 0.923×) | used **2.000×**, capacity 1.013× | 1.013–1.018× (image-dominated) | **2.234–2.417×** | 0.28–0.61 | Does not win: a 10 % copy saving for 2× the payload footprint and ~2.3× the wall. |
+| **C2** heap-growth, high live growing (collector) | **0.020×** (objects 0.020×) | used **5.333×**, capacity 2.621× | **2.338–2.340×** | **1.711–1.721×** | 0.28–0.61 | Wins copy work 50× and pays 5.3× payload footprint and 1.7× wall — a copy-work win that is not a wall win. |
+| **C3** messaging / copy-bound (runtime: `send_recv` / `ets_copy`) | **1.462×** / 1.010× | mature occupancy 14.476× / 5.333× | **0.520×** / 1.001× | **0.863×** / 1.119× | 1.60–7.63 | `send_recv` wins time and footprint while moving *more* words; `ets_copy` wins nothing. The collector-level `copy_out` shape above reaches the same verdict without a runtime (0.750× words, 5.333× payload footprint, 1.742–1.940× wall). |
+| **C4** a real in-process compile (runtime) | **0.473×** (objects 0.486×) | mature capacity 11.097×, occupancy 40.305× | 1.044× | **1.145×** | 1.60–7.63 | Wins copy work 2.1× and pays 11.1× mature capacity, 4.4 % peak RSS and 14.5 % wall. |
+
+**No class wins on all three axes** (copy work, footprint, pause/wall), and no two classes agree on which axis
+the mark region loses. The three classes where copy work falls are the ones with a large live set — C2
+(**0.020×**) and C4 (**0.473×**), both measured at a mature geometry ≥ `IMMIX_BREAK_EVEN_WORDS` — and the two
+where it does not are the small-live-set ones (C1 0.900×, C3 `ets_copy` 1.010×, C3 `send_recv` 1.462×). That
+is the break-even the automatic rule already encodes, read off the copy-work axis.
+
+### The decision
+* **`MatureKind::Copying` remains the default.** `GcConfig::default()` resolves to it, and nothing in this
+  record moves it: every class has at least one axis on which the copying space is the cheaper choice, and the
+  copying space is the one whose cost does not depend on the live set's shape or size.
+* **The mark-region mature generation stays a default-OFF opt-in**, reachable only through the automatic size
+  rule (`select_mature`: ≥ `IMMIX_BREAK_EVEN_WORDS` = 2 048 configured mature words, which is 8 whole
+  `BLOCK_WORDS`(256) blocks) or an explicit pin (`GcConfig::immix`, `BEAM_RT_GC_STRATEGY=immix`).
+* **No class-keyed default can be installed.** `HeapPolicy` carries *geometry* (min/max heap words,
+  `fullsweep_after`, initial young/mature sizes), not a workload class; there is no seam through which a
+  collector could learn that a process is allocating churn rather than compiling, and inventing one would put a
+  guess on the spawn path of every process. And below one 256-word block the mark region is **strictly
+  dominated** — it has no full block to pin, so it moves *more* words than a copy and costs a multiple of the
+  footprint — which is exactly the geometry the default policy has (**233** mature words). The size-keyed rule
+  is therefore the right proxy for the class distinction this record measures; the data gives no evidence for
+  replacing it with a class-keyed one.
+* **What the record does not settle.** (a) The *mediator* of the C2 peak-RSS gap: 2.34× peak RSS against a
+  2.62× reserved-capacity ratio, with the 14.9 MB difference larger than the 4.1 MB footprint difference, is
+  consistent with allocator-carrier retention (the same unattributed class as C3 `send_recv`'s 0.520× anomaly in
+  `../beam_rt/GC_STRATEGY_MEASURED.md`) and no counter here isolates it. (b) **Pause** is not measured by this
+  sweep at all — no wall is stopped — so the pause column of the pause axis remains the printed, single-threaded
+  in-process signal of "The allocation-heavy workload" above (Immix 95–126 µs against copying 54–57 µs on five
+  forced fullsweeps), never an assertion. (c) The `churn`/`copy_out` wall windows are 10–40 ms, so their wall
+  ratios are directionally reproducible in every round of both sessions but are not precise figures.
