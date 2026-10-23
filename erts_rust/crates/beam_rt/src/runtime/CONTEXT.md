@@ -442,3 +442,39 @@ address-keyed — needs **re-keying**, not rewriting, (c) unrelocatable, and why
 * `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`tier.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`; its own node is [`../runner/CONTEXT.md`](../runner/CONTEXT.md).
 * `../context/gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) that drives this state; `../context/gc_walk.rs` → the two-phase valve's reachability walk (`any_root_is_unscanned`/`process_roots_are_unscanned` + `WalkScratch`) and the `CollectionGate` host seam (`RuntimeCollectionGate`) — [`../context/CONTEXT.md`](../context/CONTEXT.md).
 * `../boot/CONTEXT.md`, `../cli/CONTEXT.md`, `../info/CONTEXT.md` → the boot, A.6 and A.8 surfaces layered on the façade; `../port/CONTEXT.md` → the port half this node drives; `../dist/CONTEXT.md` + `../dist_client/CONTEXT.md` → the two distribution halves; [`../../M1_GAPS.md`](../../M1_GAPS.md) / [`../../M1_GAPS_GC.md`](../../M1_GAPS_GC.md) → the per-item gap ledgers.
+
+## Measured: what the pass does *not* cost
+A peak-RSS measurement on the single-compile `-eval` route (one statement compiling
+`lib/stdlib/src/io_lib_fread.erl` in process, ~125 s, `/proc/<pid>/status` sampled every 20 ms) pins
+both the pass's actions and its own accounting, so a future investigation of that route's peak should
+read this before re-running the sweep:
+
+| `BEAM_RT_REGION_RECLAIM` | peak VmHWM | peak VmSize |
+|---|---|---|
+| `off` | 319 952 kB | 995 052 kB |
+| `arena` | 319 696 kB | 995 052 kB |
+| `nomove` | 319 468 kB | 993 616 kB |
+| `store-whole` | 320 048 kB | 993 616 kB |
+| `store` | 319 564 kB | 995 632 kB |
+| `all` (default) | 319 516 kB | 993 908 kB |
+| pre-window binary (no pass at all) | 290 668 kB | 1 019 892 kB |
+
+The whole spread across the six modes is **580 kB**: no action of this pass accounts for the ~29 MB gap,
+and the switch cannot recover it. The exit `[rt-mem]` line agrees — `store_compactions=0`,
+`store_regions_dropped=0`, `store_move_declines=0`, `eval_heap_retired_regions=0`,
+`eval_heap_words=16777216` (the seed's *capacity*, unchanged at boot and exit), and `arena_reclaims=2`
+releasing 275–285 words.
+
+The store move does not even *attempt* on this route rather than declining: its threshold refuses to
+install a fresh region without releasing one, and the pass's window opens on a store whose current region
+already has a non-zero below-cursor prefix and whose retired chain inside the window is empty (see
+[`compact`]'s *Thresholds*), so `store_move_declines` stays `0` and no destination is built — a declined
+move's residual (the pages its copy wrote, never its capacity) is therefore not part of this route's peak
+either.
+
+Two related facts a measurement of this pass must keep in mind: `RetentionStats::eval_heap_words` is
+`Heap::capacity()`, **blind to `used()`** (the store's written prefix, which is what costs RSS — read it
+through `Runtime::eval_region_stats`), and `RetentionStats::arena_words` is **cumulative demand**, so a
+rewind does not lower it. The store's real writer on this route is the exempt-window stabilize arm
+([`crate::context`] → `crate::context::pool`), documented in
+[`../context/CONTEXT.md`](../context/CONTEXT.md).
