@@ -39,13 +39,49 @@
 //! in ascending-key order). The scalar/list introspection results use [`Probe::Value`],
 //! which is the other rendering a runtime must reproduce exactly.
 //!
-//! # The module case: create the record at runtime, then use record *syntax*
-//! A native-record *creation* with compile-time syntax (`#r{a = 1}`) lowers to
-//! `put_record`'s create form, which the engine reports as a typed `unsupported` (a
-//! documented capability gap, tracked in `crates/beam_engine/CONTEXT.md`). The embedded
-//! module therefore obtains its record from the `records:create/4` **BIF** (the same
-//! module/name the compile-time `-record #rec{}` declares) and then uses ordinary record
-//! *syntax* on it, so the access/update/matching opcodes really do execute end to end.
+//! # The module case: a record built at runtime, then read through record *syntax*
+//! Most of the compiled module's records come from the `records:create/4` **BIF** (with the
+//! same module/name the compile-time `-record #rec{}` declares), and ordinary record
+//! *syntax* is then used on them, so the access/update/matching opcodes really do execute end
+//! to end. `create_local/0` is the other half: a compile-time `#rec{a = 1, b = 2}` literal,
+//! which the compiler lowers to `put_record`'s **create** form (`Src` is the literal `nil`)
+//! with the running module's own record identity.
+//!
+//! # `put_record`'s create form, and the *foreign* record id
+//!
+//! The create form's `Id` operand has two shapes (`emu/ops.tab:1648-1651`), and the group pins
+//! both:
+//!
+//! * an **atom** — one of the *running* module's own records (`i_create_local_native_record`,
+//!   no export requirement, `erl_record.c:254-353`) — `create_local/0`;
+//! * a **`{Module,Name}`** pair — `i_create_native_record`, which resolves the definition
+//!   through the code server's record table (`erts_record_find_entry`, `erl_record.c:376`)
+//!   and **requires** `is_exported` (`:401`), else raises `error:{badrecord, Id}` (`:407`) —
+//!   the `nr_foreign` cases below.
+//!
+//! The second shape is the one whose definition the engine cannot read out of the running
+//! module's own `Recs` chunk: it asks the host through the defaulted
+//! `beam_engine::ExecutionContext::foreign_record_definition` seam, which `beam_rt` answers
+//! from its code server's retained modules. `nr_foreign` writes `#recdef:rec{a = 1, b = 2}` —
+//! an explicit `#Module:Name{}` literal, so the system `erlc` emits the `{recdef, rec}`
+//! **pair** even though the field list comes from the module's own local `-record #rec{a, b}`
+//! (verified with `erlc -S`) — and is run as a [`CaseKind::ModuleEnv`] case whose `recdef`/
+//! `recbad` helper modules live in the compiled directory, reachable only through the case
+//! environment (`ERL_AFLAGS=-pa {dir}`).
+//!
+//! Two measured facts shape that fixture:
+//!
+//! * **the oracle's create form does not load a not-yet-loaded owner.** Measured on the
+//!   installed OTP-29 (`erl -noshell -pa <dir> -eval 'nr_foreign:mk_field()'`, nothing else
+//!   loaded) it raises `error:{badrecord,{recdef,rec}}`; loading the owner first
+//!   (`code:ensure_loaded(recdef)`) makes the same call answer `1`. The module therefore
+//!   loads it explicitly, which is what makes the case about the **definition lookup for an
+//!   already-loaded foreign module** — precisely the host seam — rather than about a
+//!   code-server load trap.
+//! * **the export flag is part of the answer, not a filter.** `recbad` declares the same
+//!   record **without** `-export_record([rec])`, and `mk_not_exported/0` pins the C's
+//!   `error:{badrecord,{recbad,rec}}` for it: a host that answered `Ok(None)` there would turn
+//!   that raise into a capability gap, and one that filtered the definition away would too.
 //!
 //! # Which native-record opcodes the embedded module executes
 //! The mapping below is read off the system `erlc`'s own disassembly (`erlc -S`), the only
@@ -98,7 +134,7 @@
 //! absent field, a non-record) and the `records:is_exported/1` boolean **do** agree too and
 //! are covered below.
 
-use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+use super::{Case, CaseKind, Contract, EmbeddedModule, Golden, ModuleRun, Probe};
 
 /// The embedded module the native-record [`CaseKind::Module`] cases compile and run.
 ///
@@ -110,7 +146,7 @@ use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 /// opcodes execute under both runtimes.
 pub(crate) const NATIVE_RECORD_SOURCE: &str = r##"-module(nr_native).
 -export([fld_a/0, fld_b/0, total/0, upd_a/0, upd_total/0, guard/0, match_scale/0,
-         ext_fld/0, ext_acc/0, ext_upd/0, def_fields/0]).
+         ext_fld/0, ext_acc/0, ext_upd/0, def_fields/0, create_local/0]).
 
 -import_record(nr_ext, [ext]).
 -record #rec{a, b}.
@@ -132,8 +168,63 @@ ext_fld() -> R = ext_mk(), R#nr_ext:ext.a.
 ext_acc() -> R = ext_mk(), #nr_ext:ext{a = A, b = B} = R, A * 10 + B.
 ext_upd() -> R = ext_mk(), R2 = R#nr_ext:ext{a = 5}, R2#nr_ext:ext.a.
 def_fields() -> {_, Fs} = records:get_definition(nr_native, rec), length(Fs).
+create_local() -> R = #rec{a = 1, b = 2}, R#rec.a + R#rec.b.
 "##;
 
+/// The [`CaseKind::ModuleEnv`] module behind the **foreign** create-form cases: every record
+/// it reads is built by a `#Module:Name{}` create-form `put_record` whose definition lives in
+/// *another* module's `Recs` chunk (see the module docs).
+///
+/// `#recdef:rec{a = 1, b = 2}` names `recdef` explicitly, so the compiler emits the
+/// `{recdef, rec}` identity pair; the local `-record #rec{a, b}` only supplies the field list.
+/// The owner is loaded with `code:ensure_loaded/1` first, because the oracle's create form
+/// does not load an absent owner (a measured fact — see the module docs).
+pub(crate) const FOREIGN_RECORD_SOURCE: &str = r##"-module(nr_foreign).
+-export([mk_field/0, mk_total/0, mk_definition/0, mk_not_exported/0]).
+
+-record #rec{a, b}.
+
+mk() ->
+    {module, recdef} = code:ensure_loaded(recdef),
+    #recdef:rec{a = 1, b = 2}.
+
+mk_field() -> R = mk(), R#recdef:rec.a.
+mk_total() -> R = mk(), R#recdef:rec.a + R#recdef:rec.b.
+
+mk_definition() ->
+    R = mk(),
+    case {records:get_module(R), records:get_name(R), records:get_field_names(R)} of
+        {recdef, rec, [a, b]} -> 1;
+        _ -> 0
+    end.
+
+mk_not_exported() ->
+    {module, recbad} = code:ensure_loaded(recbad),
+    try
+        _Created = #recbad:rec{a = 1, b = 2},
+        0
+    catch
+        error:{badrecord, Id} when Id =:= {recbad, rec} -> 1;
+        error:_ -> 2
+    end.
+"##;
+
+/// The **owner** the foreign create form's `{recdef, rec}` id names: it declares `rec` and
+/// exports it with `-export_record([rec])`, so the create form may build an instance of it.
+pub(crate) const RECORD_DEFINER_SOURCE: &str = r##"-module(recdef).
+-export([marker/0]).
+-export_record([rec]).
+-record #rec{a, b}.
+marker() -> #rec{a = 0, b = 0}.
+"##;
+
+/// The **non-exported** owner: the same record, declared but never exported, so the create
+/// form must raise `error:{badrecord, {recbad, rec}}` instead of building anything.
+pub(crate) const RECORD_UNEXPORTED_SOURCE: &str = r##"-module(recbad).
+-export([marker/0]).
+-record #rec{a, b}.
+marker() -> #rec{a = 0, b = 0}.
+"##;
 /// Build one eval case.
 ///
 /// `exit_code` is `0` for a value line and `1` for an `exception …` line.
@@ -192,6 +283,53 @@ fn module_case(
     }
 }
 
+/// Build one [`CaseKind::ModuleEnv`] case over [`FOREIGN_RECORD_SOURCE`] (a 0-arity integer
+/// function whose record comes from `recdef`/`recbad`, a *foreign* module's `Recs` chunk).
+///
+/// The two owner modules are compiled into the case's own temp dir and reach the code path
+/// **only** through `ERL_AFLAGS=-pa {dir}` — the oracle argv carries no `-pa` — so the
+/// environment is what makes the foreign definition resolvable at all (see the module docs).
+fn foreign_module_case(
+    id: &'static str,
+    description: &'static str,
+    function: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[
+            Contract::BeamAsm,
+            Contract::LanguageSemantics,
+            Contract::OtpApps,
+        ],
+        kind: CaseKind::ModuleEnv {
+            run: ModuleRun {
+                source: FOREIGN_RECORD_SOURCE,
+                module: "nr_foreign",
+                function,
+                arity: 0,
+                args: &[],
+                nif: None,
+            },
+            extra: &[
+                EmbeddedModule {
+                    module: "recdef",
+                    source: RECORD_DEFINER_SOURCE,
+                },
+                EmbeddedModule {
+                    module: "recbad",
+                    source: RECORD_UNEXPORTED_SOURCE,
+                },
+            ],
+            env: &[("ERL_AFLAGS", "-pa {dir}")],
+        },
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
 /// The native-record corpus group (contracts A.1/A.2/A.7).
 pub(crate) fn group() -> Vec<Case> {
     // A native record compares as canonical ETF bytes (A.2); the producing/consuming BIFs
@@ -535,7 +673,42 @@ pub(crate) fn group() -> Vec<Case> {
             "def_fields",
             "2",
         ),
-        // --- widened: the create/update encoding and the structured refusal reasons --------
+        // `put_record`'s create form with the running module's **own** atom identity (no export
+        // requirement): `#rec{a = 1, b = 2}` is a compile-time literal, so the opcode is
+        // `i_create_local_native_record`. The golden sums both fields (1 + 2).
+        module_case(
+            "records/module_native_record_create_local",
+            "a compile-time #rec{a = 1, b = 2} literal (the create form, local atom identity) agrees",
+            "create_local",
+            "3",
+        ),
+        // --- A.1/A.7: the create form for a *foreign* `{Module,Name}` record id -------------
+        // Each case needs `recdef` (or `recbad`) in the code path, so all four are
+        // `ModuleEnv` cases over the same compiled module (see `foreign_module_case`).
+        foreign_module_case(
+            "records/module_foreign_record_create_field",
+            "a create-form record id {recdef,rec} resolves a foreign module's definition, then get_record_field reads it",
+            "mk_field",
+            "1",
+        ),
+        foreign_module_case(
+            "records/module_foreign_record_create_total",
+            "both fields of the create-form foreign record sum (get_record_field twice)",
+            "mk_total",
+            "3",
+        ),
+        foreign_module_case(
+            "records/module_foreign_record_create_definition",
+            "the create-form foreign record carries the resolved definition: module, name and declaration-order fields",
+            "mk_definition",
+            "1",
+        ),
+        foreign_module_case(
+            "records/module_foreign_record_create_not_exported",
+            "the create form raises {badrecord,{recbad,rec}} for a loaded owner whose record is not exported",
+            "mk_not_exported",
+            "1",
+        ),        // --- widened: the create/update encoding and the structured refusal reasons --------
         eval(
             "records/create_three_fields",
             "records:create/4 encodes a three-field native record in ascending-key order",
@@ -604,8 +777,11 @@ pub(crate) fn group() -> Vec<Case> {
 
 #[cfg(test)]
 mod tests {
-    use super::{group, NATIVE_RECORD_SOURCE};
-    use crate::corpus::{CaseKind, Contract, Probe};
+    use super::{
+        group, FOREIGN_RECORD_SOURCE, NATIVE_RECORD_SOURCE, RECORD_DEFINER_SOURCE,
+        RECORD_UNEXPORTED_SOURCE,
+    };
+    use crate::corpus::{CaseKind, Contract, Probe, DIR_PLACEHOLDER};
     use std::collections::HashSet;
 
     #[test]
@@ -664,16 +840,43 @@ mod tests {
                         case.id
                     );
                 }
-                CaseKind::EvalEnv { .. } | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => {
+                CaseKind::ModuleEnv { run, extra, env } => {
+                    // The group's only environment-variable cases: the create form's `foreign`
+                    // record id, whose owner modules reach the code path through `ERL_AFLAGS`
+                    // alone.
+                    assert_eq!(case.golden.exit_code, 0, "{} exit code", case.id);
+                    assert_eq!(case.kind_label(), "module-run", "{}", case.id);
+                    assert_eq!(run.source, FOREIGN_RECORD_SOURCE, "{} source", case.id);
+                    assert_eq!(run.module, "nr_foreign", "{} module", case.id);
+                    assert_eq!(run.arity as usize, run.args.len(), "{} arity", case.id);
+                    let owners: Vec<&str> = extra.iter().map(|helper| helper.module).collect();
+                    assert_eq!(owners, ["recdef", "recbad"], "{} owners", case.id);
+                    assert_eq!(env.len(), 1, "{} env", case.id);
+                    assert_eq!(env[0].0, "ERL_AFLAGS", "{} env", case.id);
+                    assert!(
+                        env[0].1.contains(DIR_PLACEHOLDER),
+                        "{}: the compiled dir must reach the code path through the env, got {:?}",
+                        case.id,
+                        env[0].1
+                    );
+                    assert!(
+                        golden
+                            .trim_start_matches('-')
+                            .chars()
+                            .all(|c| c.is_ascii_digit()),
+                        "{}: a module golden is an integer line, got {golden:?}",
+                        case.id
+                    );
+                }
+                CaseKind::EvalEnv { .. } | CaseKind::Command(_) => {
                     panic!(
-                        "{}: the records group declares no environment-variable cases",
+                        "{}: the records group declares no eval-env or command cases",
                         case.id
                     )
                 }
             }
         }
     }
-
     #[test]
     fn the_group_covers_the_create_update_and_get_definition_bifs_and_the_opcode_module() {
         let cases = group();
@@ -694,15 +897,14 @@ mod tests {
         let functions: Vec<&str> = cases
             .iter()
             .filter_map(|c| match &c.kind {
-                CaseKind::Module(run) => Some(run.function),
-                CaseKind::Eval { .. }
-                | CaseKind::EvalEnv { .. }
-                | CaseKind::ModuleEnv { .. }
-                | CaseKind::Command(_) => None,
+                CaseKind::Module(run) | CaseKind::ModuleEnv { run, .. } => Some(run.function),
+                CaseKind::Eval { .. } | CaseKind::EvalEnv { .. } | CaseKind::Command(_) => None,
             })
             .collect();
         // Field access, update, guard, match and the external-record paths all execute the
-        // native-record opcodes; `def_fields` reaches the get_definition BIF from a module.
+        // native-record opcodes; `def_fields` reaches the get_definition BIF from a module;
+        // `create_local` is the create form with an own-record atom identity, and the
+        // `mk_*` functions the create form with a `{Module,Name}` foreign identity.
         for expected in [
             "fld_a",
             "fld_b",
@@ -715,6 +917,11 @@ mod tests {
             "ext_acc",
             "ext_upd",
             "def_fields",
+            "create_local",
+            "mk_field",
+            "mk_total",
+            "mk_definition",
+            "mk_not_exported",
         ] {
             assert!(
                 functions.contains(&expected),
@@ -737,8 +944,38 @@ mod tests {
         assert!(NATIVE_RECORD_SOURCE.contains("R#rec.a"));
         assert!(NATIVE_RECORD_SOURCE.contains("R#rec{a = 9}"));
         assert!(NATIVE_RECORD_SOURCE.contains("#rec{a = A, b = B} = R"));
+        // The create form with the running module's **own** record identity: a compile-time
+        // literal (`put_record` create form, `Src` is `nil`), not the `records:create/4` BIF.
+        assert!(NATIVE_RECORD_SOURCE
+            .contains("create_local() -> R = #rec{a = 1, b = 2}, R#rec.a + R#rec.b."));
     }
 
+    #[test]
+    fn the_foreign_create_form_module_names_another_modules_record_id() {
+        // `#recdef:rec{…}` (an explicit `#Module:Name{}` literal) is what makes the compiler
+        // emit the `{recdef, rec}` identity **pair** — the create form the engine cannot
+        // resolve from the running module's own `Recs` chunk. The field list comes from the
+        // module's own local `-record #rec{a, b}` declaration.
+        assert!(FOREIGN_RECORD_SOURCE.contains("-module(nr_foreign)."));
+        assert!(FOREIGN_RECORD_SOURCE.contains("-record #rec{a, b}."));
+        assert!(FOREIGN_RECORD_SOURCE.contains("#recdef:rec{a = 1, b = 2}"));
+        assert!(FOREIGN_RECORD_SOURCE.contains("#recbad:rec{a = 1, b = 2}"));
+        // The owner is loaded explicitly: the oracle's create form does not load an absent
+        // owner (see the module docs), so both runtimes see a *loaded* foreign module.
+        assert!(FOREIGN_RECORD_SOURCE.contains("code:ensure_loaded(recdef)"));
+        assert!(FOREIGN_RECORD_SOURCE.contains("code:ensure_loaded(recbad)"));
+        // The two owners differ in exactly one way: `recdef` exports its record.
+        assert!(RECORD_DEFINER_SOURCE.contains("-export_record([rec])."));
+        assert!(!RECORD_UNEXPORTED_SOURCE.contains("-export_record"));
+        // Both declare the same record, so the only difference the create form can observe is
+        // the export flag.
+        assert!(RECORD_DEFINER_SOURCE.contains("-record #rec{a, b}."));
+        assert!(RECORD_UNEXPORTED_SOURCE.contains("-record #rec{a, b}."));
+        assert!(group().iter().any(|c| matches!(
+            &c.kind,
+            CaseKind::ModuleEnv { run, .. } if run.function == "mk_not_exported"
+        )));
+    }
     #[test]
     fn the_embedded_module_reaches_the_external_record_and_the_get_definition_bif() {
         // `is_record_accessible` (190) needs an external record: the module imports the

@@ -1044,9 +1044,18 @@ mod tests {
                 "case {}: a ModuleEnv case must set an environment",
                 case.id
             );
+            // The environment is not always the *subject*: a case may carry the compiled dir
+            // there purely so that a **helper module** resolves, with the case itself
+            // evidencing another contract — the native-record group's foreign create form
+            // needs `recdef`/`recbad` loadable and is A.1/A.2/A.7 evidence. The CLI claim is
+            // therefore required exactly when the environment carries more than the compiled
+            // dir; the flag family pins its own `[Contract::Cli]` claim in `flags_apply`'s
+            // tests.
             assert!(
-                case.contracts.contains(&Contract::Cli),
-                "case {}: an A.6 flag-application case must claim the CLI contract",
+                case.contracts.contains(&Contract::Cli)
+                    || env.iter().all(|(_, value)| value.contains(DIR_PLACEHOLDER)),
+                "case {}: an environment carrying more than the compiled dir is an A.6 \
+                 flag-application case and must claim the CLI contract",
                 case.id
             );
             assert!(

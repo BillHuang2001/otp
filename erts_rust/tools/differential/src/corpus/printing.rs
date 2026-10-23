@@ -38,6 +38,25 @@
 //! `io_lib_pretty` one `~P` goes through, but their **binary depth-elision agrees with the
 //! oracle at every depth** (both print `<<1,...>>` for `<<1,2,3>>` at depth 2), so no
 //! `~W`/`~P` depth divergence remains.
+//!
+//! # Native records
+//! A native record (the OTP-29 `RECORD_SUBTAG` term, built here with the `records:create/4`
+//! BIF — the only way an `-eval` expression can construct one, since the syntax has no
+//! literal form outside a compiled module) is the one printable class that is **not a leaf**
+//! and is not a tuple: `io_lib:write_record/4` (`lib/stdlib/src/io_lib.erl:856`) renders it
+//! `#Module:Name{field = value,…}` from `records:get_module/1`/`get_name/1`/
+//! `get_field_names/1`/`get/2`, with the fields in **declaration** order.
+//!
+//! That rendering is **position-independent**, and the five `print/native_record_*` cases pin
+//! it in all five positions a term can occupy in the compared line: on its own, as a tuple
+//! element, as a list element, as a map **value** and as a map **key**. The map cases stay
+//! order-stable because each map has exactly one key.
+//!
+//! There is no separate "record reference" form: a `#Ref<…>` is the *ref* class
+//! (`io_lib.erl`'s `write_ref/…`), a distinct printable class that never stands in for a
+//! record — measured on the oracle, an
+//! `#{is_exported => false}` record prints exactly like an exported one (`#m:r{a = 1,b = 2}`),
+//! so the definition's export flag is not part of the rendering either.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -199,6 +218,81 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the native record in the five positions a term can occupy in the line ---------
+        // `records:create/4` builds `#m:r{a = 1,b = 2}` (module `m`, record `r`, fields in
+        // declaration order); each case renders the *same* record through `~w` with a
+        // different enclosing context, so a printer that loses the record's own
+        // module/name/field walk in one position is a different golden.
+        Case {
+            id: "print/native_record_directly",
+            description: "~w of a native record on its own renders #Module:Name{field = value,…}",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~w\", [records:create(m, r, [{a,1},{b,2}], #{is_exported=>true})]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [35,109,58,114,123,97,32,61,32,49,44,98,32,61,32,50,125]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/native_record_in_tuple",
+            description: "~w of a native record nested as a tuple element keeps the record rendering",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~w\", [{records:create(m, r, [{a,1},{b,2}], #{is_exported=>true}), 1}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [123,35,109,58,114,123,97,32,61,32,49,44,98,32,61,32,50,125,44,49,125]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/native_record_in_list",
+            description: "~w of a native record nested in a list keeps the record rendering",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~w\", [[records:create(m, r, [{a,1},{b,2}], #{is_exported=>true})]]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [91,35,109,58,114,123,97,32,61,32,49,44,98,32,61,32,50,125,93]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/native_record_map_value",
+            description: "~w of a native record as a (single-key) map value keeps the record rendering",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~w\", [#{k => records:create(m, r, [{a,1},{b,2}], #{is_exported=>true})}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [35,123,107,32,61,62,32,35,109,58,114,123,97,32,61,32,49,44,98,32,61,32,50,125,125]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "print/native_record_map_key",
+            description: "~w of a native record as a (single-key) map key keeps the record rendering",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:flatten(io_lib:format(\"~w\", [#{records:create(m, r, [{a,1},{b,2}], #{is_exported=>true}) => v}]))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [35,123,35,109,58,114,123,97,32,61,32,49,44,98,32,61,32,50,125,32,61,62,32,118,125]"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -209,7 +303,7 @@ mod tests {
 
     /// Every case id in this group (the group's contract is pinned by the registry tests
     /// too, but this keeps the ids in one place for the assertions below).
-    const IDS: [&str; 11] = [
+    const IDS: [&str; 16] = [
         "float/short_to_list",
         "float/short_to_binary",
         "print/p_nested_containers",
@@ -221,6 +315,11 @@ mod tests {
         "print/format_float_directives",
         "print/format_s_and_ts",
         "print/float_to_list_precision",
+        "print/native_record_directly",
+        "print/native_record_in_tuple",
+        "print/native_record_in_list",
+        "print/native_record_map_value",
+        "print/native_record_map_key",
     ];
 
     fn golden(id: &str) -> &'static str {
@@ -231,6 +330,25 @@ mod tests {
         case.golden.stdout.expect("a golden stdout")
     }
 
+    /// The character sequence a `ok [<codepoint>,…]` value golden stands for — a
+    /// `Probe::Value` case prints the `~w` render of a `lists:flatten/1`ed format string, so
+    /// the golden is that string as a char-code list.
+    fn rendered(id: &str) -> String {
+        let golden = golden(id);
+        let list = golden
+            .strip_prefix("ok [")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("{id}: not a char-code list golden: {golden}"));
+        list.split(',')
+            .map(|code| {
+                let value: u32 = code
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{id}: not a codepoint: {code:?}"));
+                char::from_u32(value)
+                    .unwrap_or_else(|| panic!("{id}: not a unicode scalar: {value}"))
+            })
+            .collect()
+    }
     fn expr(id: &str) -> &'static str {
         let case = group()
             .into_iter()
@@ -347,6 +465,49 @@ mod tests {
             assert!(
                 expr.contains(&format!("io_lib:format(\"~P\", [<<1,2,3>>, {depth}])")),
                 "missing the ~P depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_native_record_goldens_pin_one_rendering_in_five_positions() {
+        // The record `records:create(m, r, [{a,1},{b,2}], …)` builds, as `io_lib:write_record/4`
+        // renders it: module, name, and the fields in declaration order.
+        const RECORD: &str = "#m:r{a = 1,b = 2}";
+        assert_eq!(rendered("print/native_record_directly"), RECORD);
+        assert_eq!(
+            rendered("print/native_record_in_tuple"),
+            format!("{{{RECORD},1}}")
+        );
+        assert_eq!(
+            rendered("print/native_record_in_list"),
+            format!("[{RECORD}]")
+        );
+        assert_eq!(
+            rendered("print/native_record_map_value"),
+            format!("#{{k => {RECORD}}}")
+        );
+        assert_eq!(
+            rendered("print/native_record_map_key"),
+            format!("#{{{RECORD} => v}}")
+        );
+        // Every case builds the record with the `records:create/4` BIF (no literal form exists
+        // in an `-eval` expression) and renders it through the flat `~w` writer.
+        for id in [
+            "print/native_record_directly",
+            "print/native_record_in_tuple",
+            "print/native_record_in_list",
+            "print/native_record_map_value",
+            "print/native_record_map_key",
+        ] {
+            let body = expr(id);
+            assert!(
+                body.contains("records:create(m, r, [{a,1},{b,2}], #{is_exported=>true})"),
+                "{id}: the record must come from records:create/4"
+            );
+            assert!(
+                body.contains("io_lib:format(\"~w\""),
+                "{id}: the rendering under test is the flat `~w` writer"
             );
         }
     }
