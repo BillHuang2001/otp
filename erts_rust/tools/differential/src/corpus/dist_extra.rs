@@ -161,8 +161,8 @@
 //! wire message that must be *delivered*, not refused. The C's "id `0` ⇒ write no ack" rule
 //! (`reply_dist_unlink_ack`, `erl_proc_sig_queue.c:2753-2791`) is a *signal*-layer rule, so a
 //! zero-id ACK never reaches the wire between two real nodes: the oracle writes no ack for a
-//! zero id, and this runtime mints its unlink ids non-zero
-//! (`beam_rt`'s `dist_client` — `next_unlink_id = next_unlink_id.max(1)`). **No live two-VM case
+//! zero id, and this runtime mints its unlink ids non-zero (`beam_rt`'s `dist_client`:
+//! `next_unlink_id = next_unlink_id.wrapping_add(1).max(1)`). **No live two-VM case
 //! can therefore pin the zero-id-ACK acceptance** — it needs a peer that *injects* the frame and
 //! neither side's public API can produce one, so the rule is exercised at the codec level
 //! instead (`beam_dist`'s `Delivery::classify_validated` tests, in-crate, outside this corpus).
