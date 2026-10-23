@@ -287,7 +287,20 @@ in either and read afterwards is the "dangling boxed argument" class of `../../.
   reservation cannot overrun into its neighbours.
 - **`InPlace`'s raw payload base is republished, not fragile.** `BitWriter::push_bits_from` promotes on
   `source_overlaps` **before** any growth (order explicitly load-bearing), and `InPlace::grow` updates
-  `self.base` + `republish_over(self.src, new_base)`. The one surviving caveat is `raw::subject_bytes`'
+  `self.base` + `republish_over(self.src, new_base)`.
+  `republish_over` writes **exactly the two words that name the payload** — `BinRef.val` (word 1 of the
+  `orig` block) and `ErlSubBits.base_flags` (word 1 of the `src` block, flag bits preserved) — as **two
+  independent writers**, re-deriving `orig` fresh from `src` on every call. It must never be replaced by
+  `beam_term::refc::write_refc_binary`, which writes the whole contiguous 8-word
+  `[BinRef(3)][ErlSubBits(5)]` pair from one address: a collection copies the pair as **two separate
+  allocations** (`beam_gc::copy::move_size` copies the `ErlSubBits` block's own five words and forwards
+  the `BinRef` as its child), so that adjacency does not hold — such a write spills five words past the
+  end of the 3-word `BinRef`. Pinned by `bitstrings/raw_tests.rs`'s split-pair canary cases
+  (`a_split_pairs_payload_move_keeps_the_next_append_in_place` plants an 8-word canary directly behind
+  the `BinRef` and asserts it word-for-word; a whole-pair write fails it in **release**, not only via
+  `debug_assert`). A first-position append after a move stays **in place**, so the amortisation is
+  unchanged.
+  The one surviving caveat is `raw::subject_bytes`'
   unconstrained `&'a [u8]` (see `## Duplication with sibling crates`): a caller must re-derive it after any
   `ensure_room`, which the current append arm does not need because it grows only through the writer.
 
