@@ -491,9 +491,31 @@ impl Runtime {
     }
 
     /// Whether `pid` has an **unserved** forced-GC request (see [`Runtime::request_gc`]).
+    ///
+    /// Split so a caller's *fast* path carries only the length compare: the empty set — the
+    /// state of every workload that never calls `erlang:garbage_collect/0,1` — is answered by
+    /// two instructions, and the SipHash probe behind it is a call
+    /// ([`Runtime::gc_requested_contains`]). Both heap-admission doors take this predicate on
+    /// every admission that finds room in the nursery, so the split is what keeps the probe's
+    /// body (and, worse, the *register pressure* it creates — its callee-saved operands force
+    /// the doors to push six registers in their **prologue**, paid by every admission) out of
+    /// their inlined frames.
+    ///
+    /// The `#[inline]`/`#[inline(never)]` pair is load-bearing rather than decorative: the
+    /// release profile is `lto = "thin"`, `codegen-units = 1`, so a plain non-`inline` helper
+    /// is inlined across crates anyway (that is how the probe used to end up *inside* the
+    /// doors despite the outline in `crate::context::gc::forced_gc_request`). The attribute is
+    /// the only way to state the boundary the profile would otherwise erase.
+    #[inline]
     pub(crate) fn gc_request_pending(&self, pid: ProcessId) -> bool {
         // Empty case (the common one) == a length compare; see `gc_process_enabled`.
-        !self.gc.requested.is_empty() && self.gc.requested.contains(&pid)
+        !self.gc.requested.is_empty() && self.gc_requested_contains(pid)
+    }
+    /// The hash-probe half of [`Runtime::gc_request_pending`], **outlined**: only a runtime
+    /// that has a forced-GC request armed ever enters it.
+    #[inline(never)]
+    fn gc_requested_contains(&self, pid: ProcessId) -> bool {
+        self.gc.requested.contains(&pid)
     }
 
     /// Consumes `pid`'s forced-GC request, answering whether there was one.
