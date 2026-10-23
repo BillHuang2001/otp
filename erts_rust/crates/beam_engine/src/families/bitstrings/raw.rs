@@ -670,40 +670,103 @@ fn payload_aliased_elsewhere(machine: &Machine, base: *const u8, own: Eterm) -> 
 }
 
 /// Republish the accumulator's `[BinRef][ErlSubBits]` pair over the payload's **new**
-/// address after a relocation, preserving its window (`start`/`end`) and its
-/// `BinRef.next` chain word.
+/// address after a relocation, preserving its window (`start`/`end`), the flag bits of
+/// `ErlSubBits.base_flags` and its `BinRef.next` chain word.
 ///
-/// Only the two words that name the payload change — `BinRef.val` (word 1 of the pair)
-/// and the `ErlSubBits.base_flags` word (which *is* the payload pointer, `erl_bits.h:95`)
-/// — because `beam_term::refc::write_refc_binary` rewrites the whole pair from the
-/// arguments and `beam_term` owns that frozen layout, so this never hand-rolls it. The
-/// pair's address and the returned `Eterm` are unchanged: every alias of the *term* (the
-/// same `Eterm` in a register, a Y slot, a copied pair) reads the new payload.
+/// # The two blocks are independent writers
+///
+/// Only the two words that name the payload change — `BinRef.val` (word 1 of the
+/// `[HEADER_BIN_REF, val, next]` block) and the `ErlSubBits.base_flags` word (word 1 of the
+/// `[thing_word, base_flags, start, end, orig]` block, which *is* the payload pointer,
+/// `erl_bits.h:95`) — and nothing else is written.
+///
+/// That is not an optimisation: the two blocks are **not** one contiguous allocation and
+/// may sit at unrelated addresses. `beam_gc` copies an `ErlSubBits` as its own
+/// [`ERL_SUB_BITS_SIZE`] words and forwards its `orig` word, so the 3-word `BinRef` is
+/// copied as that block's **child**, i.e. as a separate allocation the collector may place
+/// anywhere in the to-space (`beam_gc/src/copy.rs`'s `move_size`; pinned by
+/// `beam_gc/tests/stress_cross_generation.rs`). A collection between two appends therefore
+/// separates them, and a whole-pair rewrite from the `BinRef`'s address would write five
+/// words past the end of a 3-word block.
+///
+/// `orig` is derived **fresh** from `src` (never cached across an admission point), because
+/// a relocated `BinRef` has a new address too.
+///
+/// The pair's *root* address and the returned `Eterm` are unchanged: every alias of the
+/// *term* (the same `Eterm` in a register, a Y slot, a copied pair) reads the new payload.
+///
+/// # Why this is not delegated to `beam_term`
+///
+/// `beam_term::refc::write_refc_binary` writes the whole 8-word pair at one address, and
+/// nothing upstream exposes a single-word writer for `BinRef.val` or
+/// `ErlSubBits.base_flags`. Writing the two frozen words here — in the bitstring family's
+/// single raw-heap accessor module — is the local form of that missing setter; the wanted
+/// `beam_term` API is `refc::set_bin_ref_val(t, new_base)` +
+/// `bitstring::set_sub_bits_base_flags(t, new_base)` (or one
+/// `refc::republish_payload(pair_root, new_base)` doing exactly these two words).
 fn republish_over(src: Eterm, new_base: *mut u8) {
-    // SAFETY: `src` is a live refc-binary pair (the caller's accumulator), so its
-    // `ErlSubBits` words 1..4 are initialised: `orig` is the live `BinRef` of the pair and
-    // its 8 words (`ERL_REFC_BITS_SIZE`) are the exclusively-owned block
-    // `write_refc_binary` rewrites. `new_base` is the payload the machine's own handle now
-    // names, `UNIT_SIZE`-aligned (so the flag bits are clear) and covering the same window
-    // the pair already had (a relocation copies the live bytes and never changes the
-    // window).
+    let new_payload = new_base as usize;
+    // SAFETY: `src` is the caller's live refc-binary pair root, so it is a live
+    // `ErlSubBits`: `sub_bits_parts` reads its words 1..4, which `write_refc_binary`
+    // initialised. Its `orig` word is the live `BinRef` of that pair (the caller reached
+    // here through `writable_append_target`, whose `is_refc_binary` test is exactly
+    // "`ErlSubBits` whose `orig` is a `BinRef`"), so word 0 is `HEADER_BIN_REF` and words
+    // 1/2 are initialised. Both blocks are kept alive by the caller for the whole call (an
+    // `ErlSubBits` on the machine's heap, and its `BinRef` block, which nothing frees in
+    // between). `new_base` is the payload the machine's own `beam_alloc` handle now names
+    // — `UNIT_SIZE`-aligned by the allocator's payload contract, so its low
+    // `ERL_SUB_BITS_FLAG_MASK` bits are clear and ORing the preserved flag bits back in is
+    // exact. The relocation copies the live bytes and never changes the window, so
+    // `start`/`end`/`orig` are left byte-identical.
     unsafe {
-        let (_base_flags, start, end, orig) = beam_term::bitstring::sub_bits_parts(src);
-        let (_val, next) = beam_term::refc::bin_ref_parts(orig);
-        let (start, end) = (start.raw(), end.raw());
-        let pair = boxed_val(orig);
-        let republished = beam_term::refc::write_refc_binary(
-            pair,
-            new_base.cast::<Eterm>(),
-            next,
+        let (base_flags, start_before, end_before, orig) =
+            beam_term::bitstring::sub_bits_parts(src);
+        let flags = base_flags.raw() & beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK;
+        let root_block = boxed_val(src);
+        let bin_ref_block = boxed_val(orig);
+        let (_val_before, next_before) = beam_term::refc::bin_ref_parts(orig);
+
+        // Writer 1 — the `BinRef` block: `val` (word 1) is the payload's first data byte.
+        // `next` (word 2) is the off-heap chain link and is deliberately NOT written.
+        *bin_ref_block.add(1) = Eterm::from_raw(new_payload);
+
+        // Writer 2 — the `ErlSubBits` block: `base_flags` (word 1) is the payload pointer
+        // with the two flag bits in its low `ERL_SUB_BITS_FLAG_MASK` bits. `start`/`end`/
+        // `orig` (words 2/3/4) are deliberately NOT written: a payload relocation changes
+        // neither the window nor the back-pointer to the `BinRef`.
+        *root_block.add(beam_term::SUB_BITS_BASE_WORD) = Eterm::from_raw(new_payload | flags);
+
+        // The invariant that actually holds. When the pair *is* still contiguous these two
+        // writes are byte-identical to the old whole-pair form for the words it touched;
+        // the words it no longer rewrites (`next`, `start`, `end`, `orig`) are the values
+        // already in place, which is what the last two assertions pin.
+        let (_base_flags_after, start_after, end_after, orig_after) =
+            beam_term::bitstring::sub_bits_parts(src);
+        let (val_after, next_after) = beam_term::refc::bin_ref_parts(orig_after);
+        debug_assert_eq!(val_after as *const u8, new_base, "`BinRef.val` names the payload");
+        debug_assert_eq!(
+            (_base_flags_after.raw() & !beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK)
+                as *const u8,
             new_base,
-            start,
-            end - start,
+            "`ErlSubBits.base_flags` names the payload"
         );
         debug_assert_eq!(
-            republished, src,
-            "a republish keeps the pair's address and its `ErlSubBits` root"
+            _base_flags_after.raw() & beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK,
+            flags,
+            "the flag bits are preserved"
         );
+        debug_assert_eq!(boxed_val(src), root_block, "the root keeps its address");
+        debug_assert_eq!(
+            boxed_val(orig_after),
+            bin_ref_block,
+            "the pair keeps its own `BinRef`, wherever it now lives"
+        );
+        debug_assert_eq!(
+            (start_after.raw(), end_after.raw()),
+            (start_before.raw(), end_before.raw()),
+            "a relocation never changes the window"
+        );
+        debug_assert_eq!(next_after, next_before, "`BinRef.next` is not rewritten");
     }
 }
 
@@ -816,11 +879,15 @@ impl InPlace {
     /// # `Moved` — the republish
     ///
     /// `beam_alloc` frees the old block on a move, so the accumulator's own pair is
-    /// rewritten over the new address ([`republish_over`]): the `BinRef.val` word and the
-    /// `ErlSubBits.base_flags` pointer word move, the pair's address, its `start`/`end`
-    /// window and the returned `Eterm` (it is `self.src`, untouched) do not. `self.base`
-    /// follows, and `self.capacity` is re-read from the bytes `beam_alloc` reports, so the
-    /// invariant below holds for the widened payload too.
+    /// rewritten over the new address ([`republish_over`]): exactly two words move — the
+    /// `BinRef.val` word and the `ErlSubBits.base_flags` pointer word (flag bits
+    /// preserved). The pair's *root* address, its `start`/`end` window, its `BinRef.next`
+    /// chain word, its `orig` back-pointer and the returned `Eterm` (it is `self.src`,
+    /// untouched) do not. The two blocks are **not** assumed to be adjacent: a collection
+    /// copies the `ErlSubBits` root and its `orig` `BinRef` as independent allocations, so
+    /// the words between them belong to no one in particular. `self.base` follows, and
+    /// `self.capacity` is re-read from the bytes `beam_alloc` reports, so the invariant
+    /// below holds for the widened payload too.
     ///
     /// The bytes this sink already wrote survive the move because the machine keeps the
     /// payload's logical length at its whole capacity
@@ -832,9 +899,11 @@ impl InPlace {
     ///
     /// The republish writes through `self.src`'s frozen pair, and it is sound for exactly
     /// the reasons the payload mutation is (see the struct's `SAFETY` section), plus two
-    /// more this method establishes: (a) the pair is the accumulator's own — its `ErlSubBits`
-    /// root and `BinRef` block are the ones `InPlace` was built for, so the write touches
-    /// no other term's words, and (b) no **other** on-heap pair names the old payload
+    /// more this method establishes: (a) both blocks the republish writes are the
+    /// accumulator's own — its `ErlSubBits` root and the `BinRef` that root's `orig` word
+    /// names are the two blocks `InPlace` was built for, so the write touches no other
+    /// term's words (they need not be adjacent, and [`republish_over`] never assumes they
+    /// are), and (b) no **other** on-heap pair names the old payload
     /// ([`payload_aliased_elsewhere`] over the machine's root set), so no word outside this
     /// pair is left pointing at the block `beam_alloc` freed.
     ///
@@ -986,6 +1055,9 @@ impl InPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The writer a `bs_create_bin` build drives over this sink, and what it produces (the
+    // split-pair cases assert the in-place `Term` form, never a copy-rebuild).
+    use super::super::{BitWriter, Built};
     use crate::context::{ExecutionContext, MinimalContext};
 
     /// `make_binary` picks the frozen representation: an on-heap `ErlHeapBits` at
@@ -1438,6 +1510,15 @@ mod tests {
         sink.copy_bytes(&[1, 2, 3]);
         let acc = sink.finish();
         let size_before = beam_term::size::size_object(acc);
+        // The two blocks of the pair, captured before the growth: the republish keeps both
+        // addresses, so they are the identity this case asserts afterwards. (Nothing
+        // collects in a `MinimalContext`, so these words cannot go stale in between.)
+        // SAFETY: `acc` is the live refc-binary accumulator, so its `orig` slot is the live
+        // `BinRef` of that same pair.
+        let (pair_block, bin_ref_block) = unsafe {
+            let root = boxed_val(acc);
+            (root, boxed_val(*root.add(beam_term::SUB_BITS_ORIG_WORD)))
+        };
 
         // Grow well past the 8-byte capacity / 32-byte reservation: the payload moves.
         let (base, capacity_bits, end_bits) = writable_append_target(&machine, acc).expect("writable");
@@ -1478,8 +1559,15 @@ mod tests {
         );
         assert_eq!(
             boxed_val(orig),
-            boxed_val(grown).wrapping_sub(beam_term::ERL_BIN_REF_SIZE),
-            "and it is still this pair's own `BinRef`, at its fixed offset"
+            bin_ref_block,
+            "and it is still this pair's own `BinRef` block — the republish names it through \
+             the root's `orig` word, never through a fixed offset from the root (a collection \
+             copies the two blocks independently)"
+        );
+        assert_eq!(
+            boxed_val(grown),
+            pair_block,
+            "the republish keeps the `ErlSubBits` root's own address"
         );
         assert_eq!(
             machine.writable_capacity(new_base),
@@ -1508,6 +1596,381 @@ mod tests {
         // payload's capacity and reservation never enter the term's size.
         assert_eq!(beam_term::size::size_object(grown), size_before);
         assert_eq!(size_before, beam_term::refc::ERL_REFC_BITS_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
+    // The split pair: a republish writes two words and nothing else
+    // -----------------------------------------------------------------------
+    //
+    // `republish_over` names the relocated payload in exactly two frozen words — the
+    // `BinRef`'s `val` word and the `ErlSubBits`'s `base_flags` word. Nothing in the
+    // representation makes those two blocks one allocation: a collection copies an
+    // `ErlSubBits` as its own five words and forwards its `orig` word as that block's
+    // *child* (`beam_gc/src/copy.rs`'s `move_size`), so the 3-word `BinRef` lands as an
+    // independent allocation the collector may place anywhere in the to-space. These
+    // cases build that split layout by hand and plant a canary directly behind the
+    // `BinRef`, so a rewrite that assumed adjacency (a whole-pair write from the
+    // `BinRef`'s address) is caught as a five-word overrun — a canary assertion, not a
+    // check on the resulting bytes, which the overrun would leave perfectly correct.
+
+    /// The canary block's word count — one word more than the five an old whole-pair
+    /// rewrite would have overrun into, with margin.
+    const CANARY_WORDS: usize = 8;
+
+    /// The `i`-th canary word's raw value: recognisable, and distinct from every frozen
+    /// header word and from every pointer these cases allocate.
+    fn canary_word(i: usize) -> usize {
+        0xCAFE_0000 | i
+    }
+
+    /// A **split** refc pair — an `ErlSubBits` whose `orig` word names a `BinRef` block
+    /// at an unrelated address — with a canary block planted immediately after the
+    /// 3-word `BinRef`.
+    ///
+    /// The arena is a bump allocator, so two consecutive reservations are adjacent:
+    /// reserving the `BinRef` and then the canary puts the canary exactly at
+    /// `BinRef + ERL_BIN_REF_SIZE`, where a whole-pair rewrite from the `BinRef`'s
+    /// address would write. The `ErlSubBits` is reserved last, after the canary, so the
+    /// pair is genuinely split rather than merely reordered.
+    struct SplitPair {
+        /// The boxed `ErlSubBits` — the accumulator term.
+        root: Eterm,
+        /// Its `orig` word: the boxed `BinRef` term.
+        orig: Eterm,
+        /// The `ErlSubBits` block's own address.
+        root_block: *mut Eterm,
+        /// The `BinRef` block's address.
+        bin_ref_block: *mut Eterm,
+        /// The canary block's address, directly behind the `BinRef`.
+        canary: *mut Eterm,
+        /// The `BinRef.next` chain word, which a republish must never touch.
+        next: *mut Eterm,
+    }
+
+    /// Builds the split pair over `payload`, with the window `start_bits..end_bits` and
+    /// `flags` in the low `ERL_SUB_BITS_FLAG_MASK` bits of `base_flags`.
+    fn split_pair(
+        machine: &mut Machine,
+        ctx: &mut MinimalContext,
+        payload: *mut u8,
+        start_bits: usize,
+        end_bits: usize,
+        flags: usize,
+    ) -> SplitPair {
+        // A `next` link no allocator issues, so "the republish left it alone" is exact.
+        let next = 0xDEAD_BEEFu64 as *mut Eterm;
+
+        let bin_ref_size = beam_term::refc::bin_ref_size_words();
+        let bin_ref_block = reserve(machine, ctx, bin_ref_size, RootSet::ALL_LIVE)
+            .expect("the arena hands out the BinRef block");
+        let canary = reserve(machine, ctx, CANARY_WORDS, RootSet::ALL_LIVE)
+            .expect("the arena hands out the canary block");
+        let root_block = reserve(
+            machine,
+            ctx,
+            beam_term::refc::sub_bits_size_words(),
+            RootSet::ALL_LIVE,
+        )
+        .expect("the arena hands out the ErlSubBits block");
+        assert_eq!(
+            bin_ref_block.wrapping_add(bin_ref_size),
+            canary,
+            "the bump arena places the canary directly behind the BinRef"
+        );
+        assert_ne!(
+            root_block, bin_ref_block,
+            "the pair is split: the ErlSubBits does not follow its BinRef"
+        );
+        for i in 0..CANARY_WORDS {
+            // SAFETY: `i < CANARY_WORDS`, inside the block just reserved.
+            unsafe { *canary.add(i) = Eterm::from_raw(canary_word(i)) };
+        }
+        // SAFETY: `bin_ref_block` is `bin_ref_size` exclusively-owned words; `payload` is
+        // the caller's live payload, which covers bits `start_bits..end_bits`; `next` is a
+        // distinguishable chain link.
+        let orig = unsafe {
+            beam_term::refc::write_bin_ref(bin_ref_block, payload.cast::<Eterm>(), next)
+        };
+        // SAFETY: `root_block` is `sub_bits_size_words()` exclusively-owned words;
+        // `base_flags` packs the live `payload` with `flags` in its masked low bits; the
+        // window is inside that payload; `orig` is the live `BinRef` just written.
+        let root = unsafe {
+            beam_term::bitstring::write_sub_bits(
+                root_block,
+                Eterm::from_raw(payload as usize | flags),
+                Eterm::from_raw(start_bits),
+                Eterm::from_raw(end_bits),
+                orig,
+            )
+        };
+        SplitPair {
+            root,
+            orig,
+            root_block,
+            bin_ref_block,
+            canary,
+            next,
+        }
+    }
+
+    /// The canary block's words as they stand now.
+    fn canary_snapshot(canary: *mut Eterm) -> Vec<usize> {
+        (0..CANARY_WORDS)
+            .map(|i| {
+                // SAFETY: `i < CANARY_WORDS`, inside the canary block `split_pair`
+                // reserved for the whole case.
+                unsafe { *canary.add(i) }.raw()
+            })
+            .collect()
+    }
+
+    /// **A republish writes exactly two words and never overruns a split pair.**
+    ///
+    /// The relocated-payload republish (`raw::republish_over`) must name the new payload
+    /// in the `BinRef`'s `val` word and the `ErlSubBits`'s `base_flags` word, and write
+    /// nothing else: a whole-pair rewrite from the `BinRef`'s address would write five
+    /// words past the end of a 3-word block — a heap overrun whenever a collection has
+    /// separated the two blocks, which is the normal state after any collection between
+    /// two appends.
+    ///
+    /// The canary assertion is the point of this case: the resulting bytes are correct
+    /// under either implementation, so only a word-for-word check on the `BinRef`'s
+    /// neighbour can see the difference.
+    #[test]
+    fn a_republish_writes_only_the_two_payload_words_and_leaves_a_split_pairs_neighbour_intact() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+
+        // The payload before the relocation, holding three written bytes.
+        let mut old_payload: Vec<Eterm> = vec![Eterm::default(); 2];
+        let written = [0xA1u8, 0xB2, 0xC3];
+        // SAFETY: `old_payload` is 16 bytes and the copy is 3 bytes, so it is in bounds
+        // within the buffer's own allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                written.as_ptr(),
+                old_payload.as_mut_ptr().cast::<u8>(),
+                written.len(),
+            );
+        }
+        let old_base = old_payload.as_mut_ptr().cast::<u8>();
+
+        // A non-zero flag bit, so "the flags survive" is not vacuously true.
+        let flags = beam_term::bitstring::ERL_SUB_BITS_FLAG_VOLATILE;
+        let pair = split_pair(&mut machine, &mut ctx, old_base, 0, 24, flags);
+        let canary_before = canary_snapshot(pair.canary);
+        assert_eq!(
+            canary_before[0],
+            canary_word(0),
+            "the canary block is planted"
+        );
+
+        // The payload's new home — what a relocation copies the live bytes to, at an
+        // address unrelated to either block of the pair.
+        let mut new_payload: Vec<Eterm> = vec![Eterm::default(); 2];
+        // SAFETY: `new_payload` is the same size as `old_payload`, and `old_base` covers
+        // the three written bytes copied here.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_base,
+                new_payload.as_mut_ptr().cast::<u8>(),
+                written.len(),
+            );
+        }
+        let new_base = new_payload.as_mut_ptr().cast::<u8>();
+        assert_ne!(new_base, old_base, "the payload really moved");
+
+        republish_over(pair.root, new_base);
+
+        // Nothing outside the pair was written: the `BinRef`'s neighbour is byte-identical
+        // word for word. (A plain `assert_eq!`, so a release build checks it too.)
+        assert_eq!(
+            canary_snapshot(pair.canary),
+            canary_before,
+            "the republish writes no word past the 3-word BinRef — a whole-pair rewrite \
+             would overrun five words into this block"
+        );
+
+        // The `BinRef`: `val` names the new payload, `next` is untouched.
+        // SAFETY: `pair.orig` is the live `BinRef` term `split_pair` wrote, and
+        // `pair.root` is the live `ErlSubBits` naming it.
+        let (val_after, next_after) = unsafe { beam_term::refc::bin_ref_parts(pair.orig) };
+        assert_eq!(
+            val_after as *const u8, new_base,
+            "`BinRef.val` names the new payload"
+        );
+        assert_eq!(
+            next_after, pair.next,
+            "`BinRef.next` is the off-heap chain link and is not rewritten"
+        );
+
+        // The `ErlSubBits`: `base_flags` names the new payload with its flag bits kept,
+        // and the window plus the back-pointer to the `BinRef` are byte-identical.
+        // SAFETY: `pair.root` is the live `ErlSubBits` term `split_pair` built.
+        let (base_flags_after, start_after, end_after, orig_after) =
+            unsafe { beam_term::bitstring::sub_bits_parts(pair.root) };
+        assert_eq!(
+            (base_flags_after.raw() & !beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK) as *const u8,
+            new_base,
+            "`ErlSubBits.base_flags` names the new payload"
+        );
+        assert_eq!(
+            base_flags_after.raw() & beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK,
+            flags,
+            "the flag bits of `base_flags` survive the republish"
+        );
+        assert_eq!(
+            (start_after.raw(), end_after.raw()),
+            (0, 24),
+            "a payload relocation changes neither the window start nor its end"
+        );
+        assert_eq!(
+            orig_after, pair.orig,
+            "the back-pointer to the pair's own `BinRef` is unchanged"
+        );
+        assert_eq!(
+            boxed_val(pair.orig),
+            pair.bin_ref_block,
+            "the pair still names its own `BinRef` block — the one the canary follows"
+        );
+        assert_eq!(
+            boxed_val(pair.root),
+            pair.root_block,
+            "the root keeps its own address, so every alias of the term reads the new payload"
+        );
+
+        // The term now reads the relocated payload's bytes, and nothing in the pair's
+        // on-heap size changed.
+        assert_eq!(
+            subject_bytes(pair.root).unwrap(),
+            (&written[..], 0),
+            "the republished pair reads the relocated bytes"
+        );
+        assert_eq!(
+            beam_term::size::size_object(pair.root),
+            beam_term::refc::ERL_REFC_BITS_SIZE,
+            "the pair is still the frozen 8-word shape"
+        );
+    }
+
+    /// **The same invariant through the real growth route.** A writable accumulator whose
+    /// pair a collection has split grows its payload past its reservation, so
+    /// [`InPlace::grow`] takes the `Moved` arm and republishes; the bytes before and after
+    /// the move concatenate, the `BinRef`'s neighbour is untouched, and — the amortisation
+    /// property — the *next* append still lands **in place** (`Built::Term`, never the
+    /// copy-rebuild `Built::Bytes`).
+    #[test]
+    fn a_split_pairs_payload_move_keeps_the_next_append_in_place() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+
+        // A payload the machine owns and has registered writable, seeded with a three-byte
+        // written prefix through the real sink.
+        let mut seeded = make_writable(&mut machine, &mut ctx, 8).unwrap();
+        let (payload, capacity_bits, _end) =
+            writable_append_target(&machine, seeded).expect("writable");
+        let mut sink = InPlace::new(payload, capacity_bits, 0, seeded);
+        sink.copy_bytes(&[1, 2, 3]);
+        seeded = sink.finish();
+        // SAFETY: `seeded` is a live refc binary whose window the sink just published.
+        let (_, start, size) = unsafe { beam_term::bitstring_parts(seeded) };
+        assert_eq!((start, size), (0, 24), "the accumulator holds three bytes");
+
+        // Now hand the accumulator's role to a **split** pair over the same payload: the
+        // shape a collection leaves between two appends. (The original contiguous pair
+        // `make_writable` built is simply unreferenced from here on.)
+        let flags = beam_term::bitstring::ERL_SUB_BITS_FLAG_VOLATILE;
+        let pair = split_pair(&mut machine, &mut ctx, payload, 0, 24, flags);
+        let canary_before = canary_snapshot(pair.canary);
+
+        // A build that outgrows the 8-byte capacity *and* its 32-byte reservation: the
+        // payload is relocated and the pair republished.
+        let (base, capacity_bits, end_bits) =
+            writable_append_target(&machine, pair.root).expect("writable");
+        assert_eq!(end_bits, 24, "the split pair carries the written prefix");
+        let mut writer = BitWriter::in_place(InPlace::new(base, capacity_bits, end_bits, pair.root));
+        writer
+            .push_bits_from(&[4u8; 64], 0, 64 * 8, &mut machine)
+            .expect("the build grows the payload and appends");
+        let grown = match writer.finish_built() {
+            Built::Term(term) => term,
+            Built::Bytes(..) => panic!("the payload moved, it did not promote to a copy-rebuild"),
+        };
+        assert_eq!(grown, pair.root, "the republish keeps the accumulator's term");
+
+        // Nothing outside the pair was written while the payload moved.
+        assert_eq!(
+            canary_snapshot(pair.canary),
+            canary_before,
+            "the growth's republish writes no word past the 3-word BinRef"
+        );
+
+        // The pair names the payload's new home, with the window, the chain word and the
+        // flag bits all unchanged.
+        let new_base = machine.refc_binaries()[0].data_ptr();
+        assert_ne!(new_base, payload, "the payload was relocated");
+        // SAFETY: `pair.orig` is the live `BinRef` of the split pair.
+        let (val_after, next_after) = unsafe { beam_term::refc::bin_ref_parts(pair.orig) };
+        assert_eq!(val_after as *const u8, new_base, "`BinRef.val` followed the move");
+        assert_eq!(next_after, pair.next, "`BinRef.next` is not rewritten");
+        // SAFETY: `pair.root` is the live `ErlSubBits` of the split pair.
+        let (base_flags_after, start_after, end_after, orig_after) =
+            unsafe { beam_term::bitstring::sub_bits_parts(pair.root) };
+        assert_eq!(
+            (base_flags_after.raw() & !beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK) as *const u8,
+            new_base,
+            "`ErlSubBits.base_flags` followed the move"
+        );
+        assert_eq!(
+            base_flags_after.raw() & beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK,
+            flags,
+            "the flag bits survive the growth's republish"
+        );
+        assert_eq!((start_after.raw(), end_after.raw()), (0, 24 + 64 * 8));
+        assert_eq!(orig_after, pair.orig, "the `BinRef` back-pointer is unchanged");
+        assert_eq!(
+            boxed_val(pair.orig),
+            pair.bin_ref_block,
+            "the pair still names its own `BinRef` block after two appends"
+        );
+        assert_eq!(boxed_val(pair.root), pair.root_block, "the root keeps its address");
+        assert_eq!(
+            machine.writable_capacity(new_base),
+            Some(machine.refc_binaries()[0].capacity()),
+            "the registry followed the move"
+        );
+
+        // The bytes are the concatenation: the prefix written before the move, then the
+        // appended tail.
+        let mut expected: Vec<u8> = vec![1, 2, 3];
+        expected.extend_from_slice(&[4u8; 64]);
+        assert_eq!(subject_bytes(grown).unwrap(), (&expected[..], 0));
+
+        // The amortisation property: the next append still lands **in place** over the
+        // relocated payload, so the accumulator loop stays O(1) per iteration.
+        let (base, capacity_bits, end_bits) =
+            writable_append_target(&machine, grown).expect("still writable after the move");
+        assert_eq!(base, new_base, "the append target is the relocated payload");
+        let mut writer = BitWriter::in_place(InPlace::new(base, capacity_bits, end_bits, grown));
+        writer
+            .push_bits_from(&[5u8; 8], 0, 8 * 8, &mut machine)
+            .expect("the follow-up append succeeds");
+        let grown_again = match writer.finish_built() {
+            Built::Term(term) => term,
+            Built::Bytes(..) => panic!("the follow-up append must stay in place, not rebuild"),
+        };
+        assert_eq!(grown_again, pair.root, "an in-place append keeps the term");
+        assert_eq!(
+            canary_snapshot(pair.canary),
+            canary_before,
+            "the follow-up append writes no word outside the payload either"
+        );
+        expected.extend_from_slice(&[5u8; 8]);
+        assert_eq!(
+            subject_bytes(pair.root).unwrap(),
+            (&expected[..], 0),
+            "the whole window reads back after both appends"
+        );
     }
 
     /// A second on-heap pair over the **same** payload (a GC copy, a family-built
