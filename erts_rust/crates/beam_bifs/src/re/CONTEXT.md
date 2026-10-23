@@ -74,7 +74,7 @@ Each gap below raises the typed `unsupported_bif` (never a fabricated value), wi
 - **`{match_limit,N}` counts our own dispatched instructions, not PCRE2's internal match calls** — the same result class with a different give-up threshold (see Error behaviour).
 
 ## Handoffs
-- The differential gate `../../../../tools/differential/` (sibling, out of this node's scope) does not yet cover `re`; its corpus should add an `re` group, for which `src/re/oracle.rs` is the ready-made case source. Suggested coverage: capture shapes; `global`/`{offset,N}`; the option flags; pattern syntax (possessive/lazy quantifiers, backreferences, named groups, classes, anchors); the compile-error `{Msg,Pos}` positions; `inspect(MP, namelist)`; `version/0`; and the `export`→`import`→`run` round-trip.
+- The differential gate covers `re` in its own group — `../../../../tools/differential/src/corpus/re.rs`, registered in `corpus/mod.rs` and promoted from this node's case source `src/re/oracle.rs`: capture shapes; `global`/`{offset,N}`; the option flags; pattern syntax (possessive/lazy quantifiers, backreferences, named groups, classes, anchors); the compile-error `{Msg,Pos}` positions; `inspect(MP, namelist)`; `version/0`; and the `export`→`import`→`run` round-trip.
 - `beam_rt` needs **no** seam for `re` — the engine is self-contained and the 8 keys reach the registry through the ordinary `crate::re::register` path, so the stdlib `re.erl` layer works unchanged.
 
 ## Routing Table
