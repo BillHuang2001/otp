@@ -40,6 +40,11 @@
 //! `key.rs`. This module is the cache itself: the entries, the resolution memo and the
 //! entry points.
 //!
+//! [`CacheKey`] is `pub(crate)` and is the **one** module-identity scheme both native tiers
+//! key on: the Cranelift hot tier's retained-artifact store
+//! ([`cranelift::cache`](crate::jit::cranelift)) uses `CacheKey::of` too, so the same
+//! question — "which module, against which atom namespace?" — has exactly one answer in
+//! the crate.//!
 //! # Ownership and thread-safety
 //!
 //! The entry **owns** its [`CompiledModule`] (and therefore its sealed executable
@@ -101,7 +106,8 @@ use crate::jit::CodeRegion;
 use crate::machine::{Machine, RunOutcome};
 
 mod key;
-use key::{module_address, CacheKey};
+pub(crate) use key::CacheKey;
+use key::module_address;
 // `module_fingerprint` is re-exported with its own (inlined) docs from `key`, so
 // `crate::jit::cache::module_fingerprint` keeps resolving for the crate and its host.
 #[doc(inline)]

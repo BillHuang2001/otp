@@ -169,15 +169,17 @@ use cranelift_module::ModuleError;
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::jit::baseline::{
-    run_native, run_native_label_outcome, run_native_outcome, JitRuntime, NativeCode,
+    run_native, run_native_label_outcome, run_native_outcome, run_native_resume_outcome,
+    JitRuntime, NativeCode,
 };
 use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 
 /// The tier's **retained-artifact store**: compiles each module once per sound identity
-/// (load-time digest + atom-namespace witness) and keeps the artifact — with its
-/// executable mapping — alive across runs, so nothing has to be recompiled and a
-/// suspended run's code stays mapped. See [`cache`].
+/// (the crate's one [`CacheKey`](crate::jit::cache::CacheKey) — the module's `ModuleKey`
+/// plus its atom-namespace witness) and keeps the artifact — with its executable mapping
+/// and the label map it carries — alive across runs, so nothing has to be recompiled and a
+/// suspended run's code stays mapped and re-enterable. See [`cache`].
 mod cache;
 mod codegen;
 mod compare;
@@ -347,39 +349,46 @@ pub(crate) fn run_label_outcome(
 }
 /// Resume a suspended machine on the Cranelift hot tier.
 ///
-/// **What the tier now has.** A module's artifact survives the park: [`run_outcome`] and
-/// its label sibling take it from the tier's retained-artifact store ([`cache`]), so the
-/// compiled code — with its executable mapping — is still there when the process parks,
-/// and the artifact carries the module-wide label map ([`CompiledFunctions::labels`]) a
-/// resumed run would rebind against.
+/// A resume is an ordinary entry of this tier now: the artifact comes from the same
+/// retained-artifact store every other entry uses ([`cache::handle`], a hit for a module
+/// this thread has already compiled and a compile otherwise), the `Rc` handle keeps it —
+/// and its executable mapping — alive for the whole resumed slice, and the driver is the
+/// shared [`NativeCode`]-generic **no-reset** resume seam
+/// ([`baseline::run_native_resume_outcome`](crate::jit::baseline::run_native_resume_outcome)),
+/// the same one the baseline tier resumes through. So a process that parked in a
+/// `receive` (or on a suspending BIF) continues on this tier instead of being moved to
+/// another one: the registers, the Erlang stack and every live call frame survive, the
+/// reduction counter restarts at the slice boundary, and the module-wide label map is the
+/// artifact's own ([`CompiledFunctions::labels`]).
 ///
-/// **What is still missing, and why this reports instead of pretending.** The resume
-/// needs a **no-reset driver** to re-enter a parked `(func, pc)` in place of the
-/// [`Machine::reset`](crate::Machine)-style setup the first-entry drivers perform, and
-/// that seam is not reachable from here: the shared driver
-/// `baseline::drive` is private to [`crate::jit::baseline`], and
-/// [`baseline::run_compiled_resume_outcome`](crate::jit::baseline::run_compiled_resume_outcome)
-/// accepts only the baseline tier's **own** `CompiledModule` — there is no
-/// [`NativeCode`]-generic resume entry point to hand a Cranelift artifact to.
-/// Reimplementing the block-ABI driver loop here, silently recompiling the module on
-/// every resume, or falling back to another tier would each hide a real capability limit
-/// and misreport which tier ran the slice, so this keeps the honest typed error. The
-/// resume position is not even examined. This backs
-/// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
+/// What a resumed slice can actually enter natively is the artifact's own rule: an address
+/// in [`CompiledFunctions::is_enterable`] (an IR block start, or a non-tail-call
+/// continuation) runs compiled code; any other address — most visibly a `wait`/
+/// `wait_timeout` suspension pc, which no block boundary names — advances by the driver's
+/// per-instruction interpreter step, exactly as an address this tier compiled nothing for
+/// always has. A park inside a **non-zero module context** is landed by the driver
+/// ([`Machine::current_context`](crate::Machine) → the context switch), and because this
+/// tier holds no blocks for a cross-module callee
+/// ([`NativeCode::module_blocks`] defaults to `None`) that callee runs per-instruction
+/// there. Every one of those routes is the interpreter's exact semantics — never a wrong
+/// result and never a silent change of tier.
+///
+/// This backs [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
 /// for [`Tier::Cranelift`](crate::jit::Tier::Cranelift) (see
 /// [`crate::jit::run_cranelift_resume_outcome`]).
 pub(crate) fn run_resume_outcome(
-    _machine: &mut Machine,
-    _module: &Module,
-    _func: u32,
-    _pc: u32,
-    _ctx: &mut dyn ExecutionContext,
+    machine: &mut Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    Err(error::unsupported(
-        "cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)",
-    ))
+    let compiled = cache::handle(module)?;
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+    run_native_resume_outcome(machine, module, func, pc, ctx, &code)
 }
-
 /// The artifact [`CraneliftJit::compile`] produces: the Cranelift [`JITModule`]
 /// that owns the executable mapping plus the per-function native entries.
 ///
