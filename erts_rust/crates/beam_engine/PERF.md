@@ -4,6 +4,9 @@ Current-state record of execution-tier performance investigations (the default *
 Detailed current measured figures and execution-coverage evidence live in `MEASURED.md`; this file owns the *tier-regression* narrative (what was slower than what, why, and what changed).
 **The sandbox is heavily oversubscribed**, so every figure here is wall-clock with no CPU pinning: a single sample is meaningless — read the explicitly two-sided **ratio** and the `/proc/loadavg` recorded with it, never an absolute number.
 
+> **How to read the figures in this file — the `X → Y` pairs are two-tree-state measurements.** Every `X → Y` pair below (the Batch 54 spill stores `4 678 655 → 1 594 678`, the `341 653 629 → 320 065 790 → 306 024 443` emitted-byte chain of Batches 54 and 55, the Batch 55 register ops `7 167 996 → 2 707 930` and prologue loads `756 632 → 352 537`, and every sibling pair) compares **two tree states**: `X` is the tree *before* that batch's change and `Y` the tree *after* it, both derived by the same run in the same measurement window. A pair is therefore a **delta**, not a current absolute — the corpus and the emitter have moved on since, so a fresh absolute measured on this host today would differ on **both** sides while the pair remains that batch's attributable contribution. The same reading applies to each batch's gate counts (`… passed / … failed / … ignored`) and to the batch-time wall-clock rows: they record what a run reported when the batch landed, not a standing figure to reproduce.
+> Only the static deopt census (Batch 55 section) is kept refreshed against the corpus as it stands now, and the crate gate count is the one re-observed alongside it.
+
 ## Batch 55 — baseline-JIT code quality: variable-length frame + live-in prologue fill
 ### What changed
 - **Lever A — variable-length native frame** (`src/jit/baseline/emit/mod.rs::native_frame_regs` + `frame_slot_len`, torn down by `src/jit/baseline/emit/link.rs::emit_frame_teardown`): a block's prologue now pushes only `rbx` plus the callee-saved machine registers it actually holds as cache slots — not the canonical six-register `SAVED_REGISTERS` set (`native_frame_regs` pins every per-block subset against it with a `debug_assert!`) — and reserves an `8`- or `16`-byte `rt` slot (`frame_slot_len(k)`, `8` when `1 + slots.len()` is even else `16`) so `rsp` stays 16-byte aligned at every helper call for the pushes the block actually makes.
@@ -16,7 +19,7 @@ Detailed current measured figures and execution-coverage evidence live in `MEASU
 - **New file `src/jit/baseline/emit/prologue.rs` (158 lines)** — the block prologue (`emit_block_prologue`: frame setup, the `rt` slot, the position store / Y publish, the live-in cache load) plus its three helpers (`emit_position_store`/`emit_publish_y`/`emit_prologue_helper`), moved **verbatim** out of `emit/block.rs` (`1093 → 993` lines).
   Proof it is a pure move: the deterministic census grand total is byte-identical.
 ### Structural counters (deterministic, `src/jit/baseline/counters.rs`) — one recorded corpus pass
-`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` over the generically-discovered installed-OTP corpus (1353 modules / 103 008 functions / 597 333 blocks / 3 585 490 IR instructions):
+`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` over the generically-discovered installed-OTP corpus (**1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** instruction instances summed over the emitted block ranges):
 
 | counter | before | after | delta |
 |---|---|---|---|
@@ -27,16 +30,24 @@ Detailed current measured figures and execution-coverage evidence live in `MEASU
 | spill stores (dirty set) | 1 594 678 | 1 594 678 | untouched |
 
 `blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation): `cache_slots` **756 632**, `written_slots` **621 058**.
-The census is deterministic and load-independent (it compiles modules directly, never through `CodeCache`), and its other recorded models are: whole-cache fill **3 950 215**, written-set spill stores **4 678 655**, whole-cache spill stores **5 578 219**; the static deopt census is **3 113 483** instances / **119 840** deopts (FuncInfo 103 008 · Bif 10 014 · GcBif 3 282 · Bif0 3 204 · NifStart 300 · Test(IsBoolean) 17 · Test(IsFunction2) 9 · OnLoad 6).
+The census is deterministic and load-independent (it compiles modules directly, never through `CodeCache`), and its other recorded models are: whole-cache fill **3 950 215**, written-set spill stores **4 678 655**, whole-cache spill stores **5 578 219** (the before/after columns of one pass — see the reading note at the top).
+
+**Static deopt census, current corpus:** **119 912** deopts over **3 114 364** visited instruction instances = **3.85 %**.
+By variant: `FuncInfo` **103 079** (86.0 % of all deopts — exactly one per function, and never executed, so it is the only instruction that deopts unconditionally), `Bif` 10 014, `GcBif` 3 282, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6.
+Excluding `FuncInfo` the residual is **16 833 / 3 011 285 = 0.56 %**.
+`Bif0`/`NifStart`/`OnLoad` have no baseline arm at all, and `Generic` is a typed `unsupported_opcode` error rather than a step, so it is not part of this census.
+For scale, the deopt reference block emits **212 B** of code, with a marginal **60 B per deopt**.
+**Denominator caveat — a deopt fraction may only use the visited-instance base.** Three bases exist and are not interchangeable: the raw IR size (`function.code.len()`, never printed here), the **3 586 410** instruction instances summed over the emitted block ranges, and the **3 114 364** visited instances.
+The **13.2 %** gap between the last two is the emitter's **nine** terminator `break` sites in `src/jit/baseline/emit/block.rs` plus continuation sub-blocks re-covering a tail — those words are covered by a block range but never visited.
 Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_register_cache_traffic_census_over_the_corpus_is_printed -- --nocapture`.
 ### Wall-clock — HONEST NEGATIVE
 9 **paired** rounds (`bench run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound`, **at most one benchmark process at a time**, the order reversed between rounds, `/proc/loadavg` **8 → 123** recorded at every run): every case's paired after/before ratio flips sign across rounds and each side's own run-to-run spread is **1.5–5.2×**, so no case clears the spread (the min-over-N ratios 0.86–1.98 are confounded — the two minima come from different rounds).
 - **Verdict: a ≲2 % wall-clock effect, below this host's resolution — no attributable movement.** The evidence is the deterministic count/byte reduction, not a measured speedup; do not re-run this A/B expecting signal on a loaded host.
 - The tier-ratio instrument itself *is* stable (default JIT ÷ `BEAM_RT_TIER=interpreter`): `list_walk` reads **6.87×** here, reproducing `tools/bench/RESULTS.md` §5's **6.86×**; the default tier is the cheaper side on 9 of 10 cases.
 ### Gate
-- `-p beam_engine`: **74 suites, 1595 passed / 0 failed / 2 ignored**; with `--features jit-cranelift`: **74 suites, 1648 passed / 0 failed / 3 ignored**.
+- `-p beam_engine`: **85 suites, 2199 passed / 0 failed / 9 ignored**; with `--features jit-cranelift`: **85 suites, 2277 passed / 0 failed / 10 ignored**.
 - Independent end-to-end confirmation: a **40**-case default-tier per-case differential subset (groups `errors`/`records`/`selfhost`/`boot`/`mexec`/`modules`/`lists`/`maps`/`semantics`) reports `total 40 / agree 40 / mismatch 0 / unsupported 0 / skipped 0` across contracts A.1/A.2/A.7/A.9 against the OTP 29.1.1 / erts-17.1 oracle, and `beam_rt --test boot_repeat` is 2/2.
-- The **Cranelift verdict stands, still default-OFF**: `default = []`, no `cranelift*` crate in `cargo tree` without the feature, the feature still compiles and tests green, and the tier is still not reachable end-to-end through `beam_rt`.
+- The **Cranelift verdict stands, still default-OFF**: `default = []`, no `cranelift*` crate in `cargo tree` without the feature, and the feature compiles and tests green. The tier **is selectable end-to-end through `beam_rt`** now — `BEAM_RT_TIER=cranelift` plus the `cranelift` feature (a pure forward to `beam_engine/jit-cranelift`) — and without the feature an explicit request is a **typed refusal naming the feature** (exit 3), never a substitute tier. Default-OFF is therefore a *measured* verdict, not a wiring gap.
 - The tier ratios on this host (**14** CPUs, `/proc/loadavg` **≈140–175**, position-balanced, one timing process at a time): Cranelift beats the baseline only on the list walk (`walk/2` **0.31–0.54×**, mean **≈0.46×**), is a tie on `aggr`/`fib`/`call_ext`/`build`/`map`/`select`, and loses on comparison streams (`cmp` **1.13–1.31×**, `kernel` **1.09–1.25×**, `wide` **1.29–1.96×**), non-tail recursion (`sum` **2.52–3.07×**), the mailbox (`send_recv` **2.02–2.12×**) and cross-module (`cross` **1.27–1.54×**); its codegen cost is **≈7–114×** the baseline's.
   ABBA paired means over three independent runs: `aggr` **0.969–1.036×**, `arith` **1.502–1.573×**, `cmp` **1.225–1.323×**.
   Full detail: `src/jit/cranelift/CONTEXT.md` §"Measured verdict".
@@ -62,7 +73,7 @@ Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p 
 That reference is a **position-keyed whole-cache** cache (`consolidate(offset)`/`validAt(offset)` evict the whole cache when the emit position moves) with **no** per-register dirty bit, so this rule is the tier's own design, not a port.
 Full design note: `src/jit/baseline/emit/regalloc.rs` module docs + `src/jit/baseline/emit/regs/CONTEXT.md` §"The soundness contract".
 ### Structural counters (test-only, `src/jit/baseline/counters.rs`) — one recorded pass, all three models
-`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` (32 committed `erlc` fixtures + a 1321-module installed-OTP sample = 103 008 functions / 597 333 blocks / 3 585 490 IR instructions).
+`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` (38 committed `erlc` fixtures + a 1321-module installed-OTP sample = **1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** instruction instances summed over the emitted block ranges).
 The counters compute the **replaced** models alongside the shipped one **in the same run**, so the store-count comparison is a single measurement — the counterfactual columns are exactly the before/after:
 
 | model | spill stores | note |
@@ -72,9 +83,9 @@ The counters compute the **replaced** models alongside the shipped one **in the 
 | **dirty set (shipped)** | **1 594 678** | **−65.9 %** vs written-set |
 
 3 083 977 redundant already-clean stores removed; emitted bytes **341 653 629 → 320 065 790 (−6.32 %)**, exactly 7 B × the removed store count.
-Fixtures only (32 modules / 351 functions / 960 blocks / 3 650 IR instrs): spill stores 342 dirty / 1 035 written / 1 473 full-cache; `code_len` **253 272 → 248 288 B**.
+Fixtures only (the then-32 committed fixtures: 351 functions / 960 blocks / 3 650 IR instrs): spill stores 342 dirty / 1 035 written / 1 473 full-cache; `code_len` **253 272 → 248 288 B**.
 `fill` is **unchanged** by this batch: 3 695 119 liveness-restricted loads vs 3 950 215 whole-cache.
-The static deopt census is **unchanged** — 3 113 483 instances / 119 840 deopts over 8 deopting variants (FuncInfo 103 008, Bif 10 014, GcBif 3 282, Bif0 3 204, NifStart 300, Test(IsBoolean) 17, Test(IsFunction2) 9, OnLoad 6) — because the batch changes only *how many stores a spill emits*, never which instruction deopts.
+The static deopt census is **unchanged by this batch** — **119 912** deopts over **3 114 364** visited instances (3.85 %) across 8 deopting variants (`FuncInfo` 103 079, `Bif` 10 014, `GcBif` 3 282, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6) — because the batch changes only *how many stores a spill emits*, never which instruction deopts.
 Two-process copy-bound probe (`src/jit/baseline/tests.rs::the_two_process_copy_bound_shape_is_measured_on_both_tiers`; 14 blocks / 70 IR instrs / 12 cached slots):
 
 | counter | before (written-set) | after (dirty-set) |
@@ -150,8 +161,7 @@ A census of the whole committed `erlc` fixture corpus (27 fixtures → 325 funct
 4× calls → ~4× bytes (linear) vs ~16× before. At 256 calls: ~41× smaller eager, ~37× smaller lazy. Real-module figures are unchanged where a block holds one continuation per tail (the cap is inert). Pinned by `emit/compile.rs::the_continuation_sub_blocks_scale_linearly_not_quadratically` (both layouts) and `::the_disjoint_sub_blocks_still_run_every_call_ext`.
 
 ### Pins
-No existing pinned counter value changed — the new counters are purely additive. New pins: the interleaved A/B test; the two `emit/compile.rs` sub-block tests; the partial-fill clobber test. `src/jit/baseline/tests.rs::the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt`, `tests/jit_real_module.rs` (736/736 tier equivalence), `tests/jit_cross_module.rs` and `tests/jit_linking.rs` all stay green; `-p beam_engine` = **1408 passed / 0 failed / 2 ignored**; `--features jit-cranelift` builds warning-free.
-
+No existing pinned counter value changed — the new counters are purely additive. New pins: the interleaved A/B test; the two `emit/compile.rs` sub-block tests; the partial-fill clobber test. `src/jit/baseline/tests.rs::the_receive_and_send_family_is_lowered_without_a_jit_step_one_deopt`, `tests/jit_real_module.rs` (**727** oracle-checked rows **on each of the three tiers** — 504 breadth + 223 error-path), `tests/jit_cross_module.rs` and `tests/jit_linking.rs` all stay green; `-p beam_engine` = **85 suites, 2199 passed / 0 failed / 9 ignored** (with `--features jit-cranelift`: **85 suites, 2277 passed / 0 failed / 10 ignored**); `--features jit-cranelift` builds warning-free.
 ## Batch 52 — item 2: baseline-JIT `send_recv` regression (CLOSED)
 
 ### Symptom
