@@ -844,8 +844,15 @@ mod tests {
             );
             match &case.kind {
                 CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => {
+                    // The **probe's** line is the golden's *last* line, not necessarily its
+                    // whole body: an expression may print ahead of the probe — `erlang:display/1`
+                    // writes its `%T` rendering plus a CRLF through the emulator's own stdout,
+                    // which lands before the probe's own `ok …` line, so the golden reads
+                    // `<rendered>\r\nok <value>`. A single-line golden is unchanged by this
+                    // rule (its last line is the whole golden).
+                    let probe_line = golden.rsplit('\n').next().unwrap_or(golden);
                     assert!(
-                        golden.starts_with("ok ") || golden.starts_with("exception "),
+                        probe_line.starts_with("ok ") || probe_line.starts_with("exception "),
                         "case {}: unexpected golden shape {golden:?}",
                         case.id
                     );
@@ -854,7 +861,7 @@ mod tests {
                         "case {} has a suspicious expression",
                         case.id
                     );
-                    if golden.starts_with("exception ") {
+                    if probe_line.starts_with("exception ") {
                         assert_ne!(
                             case.golden.exit_code, 0,
                             "case {}: an exception must not exit 0",
