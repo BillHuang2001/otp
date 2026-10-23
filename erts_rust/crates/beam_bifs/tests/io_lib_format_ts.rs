@@ -161,9 +161,8 @@ struct Case {
     expect: Expect,
 }
 
-/// The whole pinned corpus — §2.4 (the decoded rows) and §2.5 (the `badarg` rows)
-/// of `HANDOFF_io_ts_chars_limit.md`, each re-verified against the live oracle
-/// before this file was written.
+/// The whole pinned corpus — §2.4 (the decoded rows) and §2.5 (the `badarg` rows),
+/// each re-verified against the live oracle before this file was written.
 fn cases() -> Vec<Case> {
     vec![
         // ---- §2.4: the decoded rows ------------------------------------------

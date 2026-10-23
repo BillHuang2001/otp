@@ -119,10 +119,12 @@ fn seeded_atoms() -> AtomTable {
         "hello",
         "lists",
         "reverse",
-        // `io:format/2` resolves its encoding atom and `io_lib:format/3` its option
-        // tag; both are runtime-provided names, so the fixture table carries them.
+        // `io:format/2` resolves its encoding atom (`latin1`), `io_lib:format/3` its
+        // option tag (`chars_limit`) and `io:format/2` its return value (`ok`); all
+        // three are runtime-provided names, so the fixture table carries them.
         "latin1",
         "chars_limit",
+        "ok",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -668,14 +670,16 @@ fn writer_corpus() -> Vec<WriterRow> {
         ("w_fun_external", Term::FunExternal, "~w", None, None, "fun lists:reverse/1"),
         ("w_bitstring", Term::Bitstring, "~w", None, None, "<<1:3>>"),
         ("w_binary_text", Term::BinaryText, "~w", None, None, "<<120,121>>"),
-        // The depth-limited writers, truncating inside the field list.
+        // The depth-limited writers, truncating inside the field list. `~W` passes the
+        // depth unchanged to the field values, `~P` decrements it once more; both keep
+        // the fields before the elision and end the list with `,...`.
         (
             "W3_rec_values",
             Term::RecValues,
             "~W",
             Some(3),
             None,
-            "#recmod:vals{ddlfa = #recmod:r{...},...}",
+            "#recmod:vals{ddlfa = #recmod:r{ddlfa = 1,...},ddlfb = {...},...}",
         ),
         (
             "P4_rec_values",
@@ -683,7 +687,7 @@ fn writer_corpus() -> Vec<WriterRow> {
             "~P",
             Some(4),
             None,
-            "#recmod:vals{ddlfa = #recmod:r{...},...}",
+            "#recmod:vals{ddlfa = #recmod:r{...},ddlfb = {...},...}",
         ),
         (
             "W2_rec_two",
@@ -703,14 +707,16 @@ fn writer_corpus() -> Vec<WriterRow> {
         ("P3_rec_zero", Term::RecZero, "~P", Some(3), None, "#ddlmod:empty{}"),
         ("W0_rec_zero", Term::RecZero, "~W", Some(0), None, "..."),
         ("P0_rec_zero", Term::RecZero, "~P", Some(0), None, "..."),
-        // `{chars_limit, N}` on the io_lib route.
+        // `{chars_limit, N}` on the io_lib route. A budget of 17 already truncates the
+        // field tail: `#recmod:r{ddlfa = 1,ddlfb = 2}` is 28 characters, so 17 and 15
+        // both render `#recmod:r{ddlfa = 1,...}` (measured live, not inferred).
         (
             "p_rec_two_cl17",
             Term::RecTwo,
             "~p",
             None,
             Some(17),
-            "#recmod:r{ddlfa = 1,ddlfb = 2}",
+            "#recmod:r{ddlfa = 1,...}",
         ),
         (
             "p_rec_two_cl15",
