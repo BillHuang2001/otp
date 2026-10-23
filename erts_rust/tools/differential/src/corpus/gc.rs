@@ -34,7 +34,8 @@
 //!   answers a different value, which is exactly the kind of divergence this group exists to
 //!   catch;
 //! * pin the **shape** of the `erlang:process_info/2` fields the collector owns
-//!   (`memory`'s integer, `garbage_collection`'s documented key set) — never their values;
+//!   (`memory`'s integer, `garbage_collection`'s documented key set, the `binary` item's
+//!   `{Ref, Size, Refc}` entry shape) — never their values;
 //! * pin the return value (`true`) of every `erlang:garbage_collect` arity — `/0`, `/1` and the
 //!   `/2` option form (`[]`, `{type, minor}`, `{type, major}`) — and the `/2` form's
 //!   `error:badarg` refusal of an unknown `type` — contract A.7.
@@ -51,8 +52,12 @@
 //! `process_info(self(), memory)` **byte total**, the `garbage_collection` **counters/limits**
 //! (`minor_gcs`, `min_heap_size`, `fullsweep_after`, …) and the `max_heap_size` **map image**
 //! (its atom keys encode in a different order in the Rust runtime — a genuine divergence, not
-//! a gap) are internal per-runtime quantities, and `erlang:process_info/2`'s `binary` item is
-//! an honest Rust capability gap (exit `3`) that must not enter the corpus until it agrees.
+//! a gap) are internal per-runtime quantities. `erlang:process_info/2`'s `binary` item **is**
+//! served by both runtimes, so it is compared — by its **shape** only: the item is tagged
+//! `binary`, its value is a list, and every entry is the three-integer tuple
+//! `{Ref, Size, Refc}` (vacuously true for the Rust runtime's empty list). No entry list can be
+//! pinned: each entry carries a per-runtime heap **address**, and the oracle lists the
+//! off-heap binaries an `-eval` process already holds.
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module compiled for the module-run cases.
@@ -395,6 +400,16 @@ pub(crate) fn group() -> Vec<Case> {
              element(2, erlang:process_info(self(), garbage_collection)))))",
             "ok <<131,119,4,116,114,117,101>>",
         ),
+        bifs(
+            "gc/process_info_binary_item_shape",
+            "process_info(self(), binary) is tagged `binary` and holds a list of {Ref, Size, Refc} \
+             integer tuples (the entries carry per-runtime heap addresses, so they are not pinned)",
+            "(fun() -> Item = erlang:process_info(self(), binary), \
+             element(1, Item) =:= binary andalso is_list(element(2, Item)) andalso \
+             lists:all(fun(E) -> is_tuple(E) andalso tuple_size(E) =:= 3 andalso \
+             lists:all(fun erlang:is_integer/1, tuple_to_list(E)) end, element(2, Item)) end)()",
+            "ok <<131,119,4,116,114,117,101>>",
+        ),
         // --- A.7: the two-argument erlang:garbage_collect/2 option form ---------------------
         bifs(
             "gc/garbage_collect_2_empty_options_returns_true",
@@ -520,6 +535,7 @@ mod tests {
         "gc/process_info_gc_key_set_is_stable",
         "gc/process_info_gc_max_heap_size_is_a_map",
         "gc/process_info_gc_min_heap_size_is_integer",
+        "gc/process_info_binary_item_shape",
     ];
 
     /// The compiled-bytecode (`run` action) cases.
@@ -686,6 +702,29 @@ mod tests {
             find_golden(cases, "gc/process_info_memory_key_is_memory"),
             "ok <<131,119,6,109,101,109,111,114,121>>",
             "the memory field's key is pinned by name"
+        );
+        // The `binary` item is pinned by its shape: the tag, the list type and the
+        // three-integer entry form — never the (address-bearing) entry list.
+        let binary = case(cases, "gc/process_info_binary_item_shape");
+        assert_eq!(
+            binary.golden.stdout,
+            Some("ok <<131,119,4,116,114,117,101>>"),
+            "the binary item's shape assertion answers true"
+        );
+        assert_eq!(binary.golden.exit_code, 0, "the binary item is served, not a gap");
+        let expr = binary.expr().expect("an Eval case has an expr");
+        assert!(
+            expr.contains("erlang:process_info(self(), binary)"),
+            "the case must read the binary item: {expr:?}"
+        );
+        assert!(
+            expr.contains("element(1, Item) =:= binary")
+                && expr.contains("is_list(element(2, Item))"),
+            "the case must pin the item's tag and its list value: {expr:?}"
+        );
+        assert!(
+            !expr.contains("~w") && !expr.contains("term_to_binary(Item)"),
+            "the case must never render the address-bearing entry list: {expr:?}"
         );
     }
 

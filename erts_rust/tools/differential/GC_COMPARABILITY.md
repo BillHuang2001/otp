@@ -42,6 +42,8 @@ The `erlang:process_info(self(), garbage_collection)` proplist is pinned by **st
 documented key set (`fullsweep_after`, `max_heap_size`, `min_bin_vheap_size`, `min_heap_size`,
 `minor_gcs`), the membership of `min_heap_size`, the integer *type* of its fields and the fact that
 `max_heap_size` is an option map.
+`erlang:process_info(self(), binary)` is pinned by **shape** only: the item is tagged `binary`, its
+value is a list, and every element is a three-integer tuple `{Ref, Size, Refc}`.
 The five `gc/module_*` cases drive the same properties through **compiled `erlc` bytecode** and the
 runtime's `run` action, where allocation and collection are driven by the engine rather than by the
 `-eval` tree-walker; a module-run golden is the integer the function returns.
@@ -64,8 +66,14 @@ The same divergence reproduces on the smallest possible term
 (`term_to_binary(#{b => 2, a => 1})`), so it is a property of the runtime's ETF encoder, not of the
 collector; it is left out of this group for that reason (the `wire` group pins no multi-key
 atom-keyed image — only single-key ones and float/list/binary-keyed images).
-`erlang:process_info(self(), binary)` is a capability gap: the Rust runtime exits `3` with
-`beam_rt: unsupported: process_info: binary …`, so it is left out of the corpus until it agrees.
+`erlang:process_info(self(), binary)` **is** served by both runtimes and is oracle-compared by its
+**shape** (`gc/process_info_binary_item_shape`): the item is tagged `binary`, its value is a list,
+and every element is a three-integer tuple `{Ref, Size, Refc}` (vacuously true for the Rust
+runtime's empty list).
+Its **entry list** is not pinned, because each entry is `{Ref, Size, Refc}` carrying a per-runtime
+heap **address** — the oracle lists the off-heap binaries an `-eval` process already holds, while
+the Rust runtime answers `[]` — so only the tag, the list type and the element shape are
+comparable.
 `erlang:garbage_collect/1`'s **reduction cost**, the nursery/mature sizes and any GC trace output are
 not pinned: none of them is observable through the black-box CLI contract the harness uses.
 The `gc/*` cases therefore assert nothing about *how* the collector works — only that every value it
