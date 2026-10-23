@@ -143,7 +143,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_gc::{AnyCollector, Collection, CollectionKind, ScannedBounds};
 use beam_loader::{Instr, Module};
-use beam_process::{Process, ProcessTable, MAX_REG};
+use beam_process::{Process, ProcessId, ProcessTable, MAX_REG};
 use beam_term::Eterm;
 
 use crate::runtime::Runtime;
@@ -255,6 +255,25 @@ const PLAIN_BUMP_FILL_WORDS: usize = 32;
 /// `&mut Runtime` call nor a `Vec` length test to produce the same placeholder.
 static PLAIN_BUMP_FILL: [Eterm; PLAIN_BUMP_FILL_WORDS] = [beam_term::NIL; PLAIN_BUMP_FILL_WORDS];
 
+/// The **constant-length** placeholder fills [`plain_bump`] uses for the small reservations —
+/// one, two and three words.
+///
+/// They exist because the general fill's length is a **run-time** value: `heap.tuple` over
+/// `&PLAIN_BUMP_FILL[..n - 1]` reaches `beam_alloc`'s element loop with an unknown count, which
+/// LLVM lowers to a **`memcpy` call**. For a one- or two-word copy that call — a GOT-indirect
+/// jump plus glibc's size-dispatching entry — costs more than the rest of the allocation put
+/// together, and on `bench_gc_bound:churn/1` it was **1.95 %** of every instruction the run
+/// retired (the node's single largest heap-admission item). With the length a constant the copy
+/// folds to one `mov` per word and the call disappears.
+///
+/// `n == 2` (a one-word fill) is the engine's per-cons-cell reservation, i.e. the dominant
+/// request on any term-building loop; `n == 1` and `n == 3` are here because they are the same
+/// two-instruction arms and cover a one-word block and a two-word tuple/cons-plus-header. Every
+/// larger request keeps the general dynamic fill: it is already on the cold side of the length
+/// test and a `memcpy` is the right lowering there.
+static PLAIN_BUMP_FILL_ONE: [Eterm; 1] = [beam_term::NIL];
+static PLAIN_BUMP_FILL_TWO: [Eterm; 2] = [beam_term::NIL; 2];
+
 /// [`bump`] restricted to a request the frontier can **already** serve, answering `None` — never
 /// an error — for the two refusals [`bump`] would report.
 ///
@@ -288,8 +307,32 @@ fn plain_bump(heap: &mut Heap, n: usize) -> Option<*mut Eterm> {
     let base = heap.hp();
     // The two tests above are exactly `bump`'s refusals, so this bump cannot fail; a `None`
     // here is unreachable and is answered with the cold path all the same.
-    heap.tuple(&PLAIN_BUMP_FILL[..n - 1]).ok()?;
+    //
+    // The small reservations take a **constant-length** fill so the placeholder write is a
+    // store instead of a `memcpy` call (see [`PLAIN_BUMP_FILL_ONE`]); every larger request
+    // falls through to the general dynamic fill, which is already on this arm's cold side.
+    match n {
+        1 => heap.tuple(&[]).ok()?,
+        2 => heap.tuple(&PLAIN_BUMP_FILL_ONE).ok()?,
+        3 => heap.tuple(&PLAIN_BUMP_FILL_TWO).ok()?,
+        _ => heap.tuple(&PLAIN_BUMP_FILL[..n - 1]).ok()?,
+    };
     Some(base)
+}
+
+/// Whether `pid` has an **unserved** forced-collection request — the two full-root doors' peek
+/// at [`Runtime::gc_request_pending`], **outlined**.
+///
+/// The predicate is itself three instructions (an `is_empty` length compare in front of a hash
+/// probe), but the hash probe behind it is a call into the standard library's SipHash: keeping it
+/// inline forces the doors to hold the runtime, the pid, the heap request and the root-set
+/// pointer across that call, i.e. to push six callee-saved registers and a scratch area in their
+/// **prologue** — paid by every admission, though a requested collection is one admission in
+/// thousands. Outlining it here keeps the doors' hot path register-light; the call costs less
+/// than the spill it removes.
+#[inline]
+fn forced_gc_request(runtime: &Runtime, pid: ProcessId) -> bool {
+    runtime.gc_request_pending(pid)
 }
 
 /// Whether `name`'s module may be collected over: `true` only when the module is loaded
@@ -1366,6 +1409,7 @@ pub(crate) fn ensure_heap(
 /// As [`ensure_heap`]: no failure mode reaches the program. A failed (or mis-sized)
 /// collection halts collection for that process
 /// ([`Runtime::halt_process_gc`](crate::runtime::gc)) and reports success.
+#[inline]
 pub(crate) fn ensure_heap_full(
     ctx: &mut RuntimeContext<'_>,
     heap_need: u32,
@@ -1428,12 +1472,70 @@ pub(crate) fn ensure_heap_full(
     let occupancy = process.should_collect(heap_need as usize);
     // A nursery with room and no retained chain has nothing for this door to do unless a
     // collection was **requested**, so the request probe is taken on that branch alone.
-    if !occupancy && !debt && !runtime.gc_request_pending(pid) {
+    if !occupancy && !debt && !forced_gc_request(runtime, pid) {
         return Ok(());
     }
-    // Past the short-circuit the door is committed to acting, so `forced` — needed by the
-    // request's consume and by the test-only tallies below — is re-read rather than carried out
-    // of the disjunction above (both probes are pure reads of the same flag).
+    // The door is committed to acting, so the whole frame the rest of this function needs —
+    // the two register-file bounds, the valve's descent, the publish/scatter pair and the
+    // collection itself — belongs to a **cold continuation**. This split is the whole point of
+    // the shape: it is the same lever the dispatch frontier took (`calls.rs`'s
+    // `take_bif_frontier` + `#[cold] grow_bif_frontier`), and for the same reason. Inlined
+    // together, the continuation's frame (its spills, its scratch and the callee-saved
+    // registers its own calls force) was paid by **every** admission, `#[cold]`-marked or not,
+    // because LLVM cannot shrink a function whose two arms it must keep reachable from one
+    // prologue. The short-circuit above decides the overwhelming majority of admissions, so it
+    // now costs the three cheap field/table reads above plus one inlined return, and the
+    // continuation is a real call taken once per ~331 admissions.
+    ensure_heap_full_commit(ctx, heap_need, roots)
+}
+
+/// The **cold continuation** of [`ensure_heap_full`] — everything the door does once its
+/// occupancy/debt/request short-circuit has committed it to acting.
+///
+/// Split out (with `#[cold]` + `#[inline(never)]`) so the continuation's frame is paid only by
+/// the admissions that take it: see the call site. The gate **order** is exactly the one
+/// [`ensure_heap_full`]'s docs state — request → valves → caller module → commit-once — and it
+/// is unchanged by the split, because the short-circuit the hot entry evaluated is a
+/// **precondition** of reaching here, never a decision this function re-makes: `occupancy`,
+/// `debt` and `forced` are re-read as pure reads of the same state, so an admission that took
+/// the continuation cannot come to a different verdict about the same instant.
+///
+/// # Errors
+///
+/// As [`ensure_heap_full`]: no failure mode reaches the program.
+#[cold]
+#[inline(never)]
+fn ensure_heap_full_commit(
+    ctx: &mut RuntimeContext<'_>,
+    heap_need: u32,
+    roots: RootSet<'_>,
+) -> Result<()> {
+    // The context is re-destructured and the running process re-resolved rather than carried
+    // in from the hot entry: holding a `&mut Process` across the call would make the hot
+    // entry's borrow of the context escape into a non-inlined callee, i.e. exactly the frame
+    // this split exists to remove. One extra process-table probe on a path taken once per
+    // ~331 admissions is the price, and it is not measurable.
+    let pid = ctx.mailbox_pid;
+    let RuntimeContext {
+        runtime,
+        mailbox_table,
+        ..
+    } = ctx;
+    let table: &mut ProcessTable = match mailbox_table {
+        Some(table) => table,
+        None => return Ok(()),
+    };
+    let Some(process) = table.get_mut(pid) else {
+        return Ok(());
+    };
+    // The two terms the hot entry's short-circuit consumed, re-read here for the **test-only**
+    // tallies below: they are pure reads with no side effect, and a release build has no other
+    // consumer (the decision they inform was taken by the caller), so they are `cfg`-gated rather
+    // than carried in and silently unused.
+    #[cfg(test)]
+    let debt = process.collection_debt();
+    #[cfg(test)]
+    let occupancy = process.should_collect(heap_need as usize);
     let forced = runtime.gc_request_pending(pid);
     if !runtime.gc_process_enabled(pid) {
         runtime.take_gc_request(pid);
@@ -1778,6 +1880,7 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
+#[inline]
 pub(crate) fn alloc_words_rooted(
     ctx: &mut RuntimeContext<'_>,
     n: usize,
@@ -1818,7 +1921,7 @@ pub(crate) fn alloc_words_rooted(
     // valves → caller module → commit-once. The peek is gated on the call site for the same
     // reason the collection is: a run with no module to collect for must not consume a
     // request it can never serve.
-    let forced = call_site_known && runtime.gc_request_pending(pid);
+    let forced = call_site_known && forced_gc_request(runtime, pid);
     // THE FAST ARM — the overwhelmingly common case, and the only one this door is on a
     // per-built-term path for: the running process's frontier still has room for `n`, so the
     // whole allocation is one bump. It is deliberately placed **ahead** of the collector valves
@@ -1842,6 +1945,51 @@ pub(crate) fn alloc_words_rooted(
             }
         }
     }
+    // The bump declined (no room, or `n` past the static placeholder fill) or a forced request
+    // is armed: everything from here on — the collector valves, the growth seam, the unscanned-
+    // root descent and the whole collection path — is a **cold continuation**, split out for
+    // exactly the reason [`ensure_heap_full`]'s is (the same lever the dispatch frontier took in
+    // `calls.rs`): a function's frame — its spills, its scratch and the callee-saved registers its
+    // own calls force — is paid by every caller of the function, so a continuation reachable from
+    // the same prologue as the fast arm is a tax on every allocation. Above is the whole
+    // allocation for the engine's per-term reservations; below is once per ~331 admissions.
+    alloc_words_rooted_commit(ctx, n, roots)
+}
+
+/// The **cold continuation** of [`alloc_words_rooted`]: everything the door does once its fast
+/// arm has declined (a frontier refusal, or an armed forced-request) and it must therefore
+/// either grow the nursery, collect, or fall back to the pointer-stable arena.
+///
+/// Split out with `#[cold]` + `#[inline(never)]` so its frame is paid only by the admissions
+/// that reach it — see the call site. The gate **order** is unchanged: latch → request →
+/// valves → caller module → commit-once. `forced` and `call_site_known` are re-derived here as
+/// pure reads of the same state, so the continuation reaches the same verdict the hot entry's
+/// fast arm did about the same instant.
+///
+/// # Errors
+///
+/// As [`alloc_words_rooted`]: the arena's allocation failure only.
+#[cold]
+#[inline(never)]
+fn alloc_words_rooted_commit(
+    ctx: &mut RuntimeContext<'_>,
+    n: usize,
+    roots: RootSet<'_>,
+) -> Result<*mut Eterm> {
+    // Re-derived rather than carried in: holding a `&mut Process`/`&mut ProcessTable` across the
+    // call would make the hot entry's borrow of the context escape into a non-inlined callee,
+    // i.e. exactly the frame this split removes.
+    let pid = ctx.mailbox_pid;
+    let call_site_known = ctx.current_module.is_some();
+    let RuntimeContext {
+        runtime,
+        mailbox_table,
+        ..
+    } = ctx;
+    let Some(table) = mailbox_table else {
+        return runtime.alloc_words(n);
+    };
+    let forced = call_site_known && forced_gc_request(runtime, pid);
     if !runtime.gc_process_enabled(pid) {
         // The valves refuse the pid outright (a post-slice float pin, a halt from an earlier
         // failure, or the runtime-wide escape-store valve): the request can never be served,

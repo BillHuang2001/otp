@@ -623,6 +623,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// [`BudgetContext`](crate::runner) armed can collect: a nested machine built on this
     /// same context (an external module call, a fun a BIF applied, the evaluator) finds the
     /// latch clear and can never be collected over.
+    #[inline]
     fn ensure_heap(
         &mut self,
         heap_need: u32,
@@ -643,6 +644,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// the engine declared live. The [`gc_armed`](Self::gc_armed) latch is
     /// [`take`](std::mem::take)n exactly as in [`ensure_heap`](Self::ensure_heap), so only the
     /// admission point the slice's own [`BudgetContext`](crate::runner) armed can collect.
+    #[inline]
     fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {
         let armed = std::mem::take(&mut self.gc_armed);
         gc::ensure_heap_full(self, heap_need, roots, armed)
@@ -667,6 +669,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// The [`gc_armed`](Self::gc_armed) latch is [`take`](std::mem::take)n here too, so a
     /// nested machine ([`Self::run_export`], a fun a BIF applied, the evaluator) behaves
     /// exactly like [`alloc_words`](Self::alloc_words) and never collects.
+    #[inline]
     fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm> {
         let armed = std::mem::take(&mut self.gc_armed);
         gc::alloc_words_rooted(self, n, roots, armed)
