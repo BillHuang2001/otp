@@ -67,6 +67,7 @@ use beam_term::prelude::*;
 use self::tree::Tree;
 use crate::error::badarg;
 use crate::key::key_of;
+use crate::stats::TreeStats;
 use crate::table::Interior;
 
 pub use self::sorted::SortedOrderedInterior;
@@ -225,6 +226,18 @@ impl Interior for OrderedSetInterior {
     fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
         // The largest stored key strictly less than `key` (the mirror of `next_key`).
         OrderedSetInterior::prev(self, key, atoms)
+    }
+    /// This interior's own **node/depth shape** for `ets:info(Tab, stats)`: the
+    /// B+-tree's routing (branch) nodes, its leaves and the deepest number of
+    /// routing levels on any root-to-leaf path.
+    ///
+    /// These are the analogues of the catree figures ERTS reports for a fine-locked
+    /// `ordered_set` (`db_calc_stats_catree` — route nodes, base nodes, max depth),
+    /// measured on **this** tree: a K-ary B+-tree of order 32, whose leaves hold the
+    /// objects and whose branches route. An empty tree is one empty leaf
+    /// (`{0,1,0}`), exactly the shape the oracle prints for its own tree interior.
+    fn node_shape(&self) -> Option<TreeStats> {
+        Some(self.tree.node_shape())
     }
 }
 #[cfg(test)]

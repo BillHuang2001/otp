@@ -58,6 +58,7 @@ use beam_term::prelude::*;
 
 use crate::error::badarg;
 use crate::key::key_of;
+use crate::stats::BucketChains;
 use crate::table::Interior;
 
 /// Bits of the hash consumed per tree level (32-way branching).
@@ -569,6 +570,65 @@ impl Interior for ChampInterior {
         // surviving node's over-sized slot vectors (`trim_capacities`), so the
         // count tracks the live tree rather than its high-water mark.
         words_of::<Node>() + heap_words(&self.root)
+    }
+
+    /// The CHAMP's own **bucket occupancy** for `ets:info(Tab, stats)`: one chain
+    /// per *index slot* of every bitmap node.
+    ///
+    /// A CHAMP bitmap node indexes [`SLOTS`] (= 32) hash-derived slots of its
+    /// level — the width of its `datamap`/`nodemap` pair. That slot space is this
+    /// interior's addressable "bucket array", the analogue of ERTS's `nactive`
+    /// slots, so:
+    ///
+    /// * a **`datamap` (inline) slot** holds exactly one entry — a chain of length
+    ///   `1` (a `set` keeps one object per key, so this interior never chains);
+    /// * a **`nodemap` (routing) slot** and a **free slot** hold no entry of their
+    ///   own — a chain of length `0`. A routed child's entries are counted at that
+    ///   child's own slots, so every object is still counted exactly once;
+    /// * a **collision node** (entries sharing one full 64-bit hash) is one chain of
+    ///   its whole entry list — the only place this interior chains at all.
+    ///
+    /// The compression is a *representation* detail: the 32-slot index space exists
+    /// per node whether or not its bitmap allocates words for all of it, which is
+    /// why the count is `32 × bitmap-nodes` and not the allocated words.
+    ///
+    /// So `sum(chain_len)` is exactly the table's object count and the metric is a
+    /// real measurement of this tree's spread — never the oracle's figures, which
+    /// measure ERTS's bucket-chained hash table (see [`crate::stats`]).
+    fn bucket_chains(&self) -> Option<BucketChains> {
+        let mut chains = BucketChains::new();
+        measure_slots(&self.root, &mut chains);
+        Some(chains)
+    }
+}
+
+/// The CHAMP index slots per bitmap node: `2^WIDTH`, the width of
+/// `datamap`/`nodemap` (each level consumes [`WIDTH`] bits of the key hash).
+const SLOTS: usize = 1 << WIDTH;
+
+/// Feed `node`'s (and its whole subtree's) index slots into `chains` — the
+/// measurement behind [`ChampInterior::bucket_chains`].
+///
+/// Iterative (an explicit stack, never native recursion), so the walk's own depth
+/// cannot overflow the stack whatever the tree's shape.
+fn measure_slots(node: &Node, chains: &mut BucketChains) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Collision(col) => chains.add_chain(col.entries.len()),
+            Node::Bitmap(bm) => {
+                // Each occupied inline slot is one single-entry chain; every other
+                // slot of the node's index space — routing or free — is empty.
+                // `data.len()` is the popcount of `datamap`, so it never exceeds
+                // `SLOTS`; the saturating form keeps a broken invariant from
+                // panicking if one is ever introduced.
+                chains.add_chains(bm.data.len(), 1);
+                chains.add_chains(SLOTS.saturating_sub(bm.data.len()), 0);
+                for child in &bm.nodes {
+                    stack.push(child);
+                }
+            }
+        }
     }
 }
 

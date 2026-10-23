@@ -62,6 +62,7 @@ pub mod key;
 pub mod kind;
 pub mod ordered_interior;
 pub mod select;
+pub mod stats;
 pub mod store;
 pub mod table;
 
@@ -79,6 +80,7 @@ pub use crate::key::*;
 pub use crate::kind::*;
 pub use crate::ordered_interior::*;
 pub use crate::select::*;
+pub use crate::stats::*;
 pub use crate::store::*;
 pub use crate::table::*;
 
@@ -91,6 +93,7 @@ pub mod prelude {
     pub use crate::kind::*;
     pub use crate::ordered_interior::*;
     pub use crate::select::*;
+    pub use crate::stats::*;
     pub use crate::store::*;
     pub use crate::table::*;
 }
