@@ -39,7 +39,10 @@ Two conventions are load-bearing:
   (fullsweep_after + 1)` in both arms, exact (to within one fullsweep cycle) for the copying arm on
   the classes whose live set cannot outgrow a mature generation; both arms comparable; and the noise
   floor's deterministic counters **bit-identical** across its repeats. Wall time and peak RSS are
-  printed, never asserted. `N` is scaled on `cfg!(debug_assertions)`; `BEAM_GC_SWEEP_ROUNDS` /
+  printed, never bounded or compared; the only RSS assertion is the *definition* of the reported
+  per-arm peak — the union `max(child's own VmHWM, parent's polled peak)`, since the child reads
+  before it prints/exits while the poll runs until exit, so neither reading bounds the other.
+  `N` is scaled on `cfg!(debug_assertions)`; `BEAM_GC_SWEEP_ROUNDS` /
   `BEAM_GC_SWEEP_N` override. The class geometry and its fixed-point reasoning live in
   `mature_strategy_sweep/fixtures.rs`.
 - `mature_strategy_sweep/fixtures.rs` → its class-shape module (included by `#[path]`): the three
