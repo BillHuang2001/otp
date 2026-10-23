@@ -2046,6 +2046,105 @@ fn receive_next_peeks_and_the_scan_operations_position_the_mailbox() {
 }
 
 #[test]
+fn an_exhausted_scan_applies_a_trapped_exit_and_stops_at_a_terminating_head() {
+    // The C's in-scan fetch (`i_loop_rec` → `erts_proc_sig_receive_helper` → `erts_proc_sig_fetch`,
+    // `erts/emulator/beam/emu/msg_instrs.tab:80-112`): a signal a process queues on ITSELF during
+    // its own slice is turned into a mailbox message by the receive scan, so the very next
+    // `loop_rec` re-read can match it. The drain is
+    // `ProcessTable::service_receive_signals` — FIFO, and it stops *before* the head it may not
+    // apply, which is the `Terminate` half below.
+    let mut rt = runtime();
+    let mut atoms = beam_term::prelude::AtomTable::new();
+    let signals = beam_process::SignalAtoms::from_table(&mut atoms);
+    let exit_atom = make_atom(signals.exit());
+    let mut table = beam_process::ProcessTable::new(signals);
+
+    let receiver = table.spawn_default().expect("spawn a receiver");
+    let signaller = table.spawn_default().expect("spawn a signaller");
+    {
+        let process = table.get_mut(receiver).expect("live");
+        process.set_trap_exit(true);
+        // The executing receiver's own signal is deferred to its next schedule-in, which is the
+        // state the in-scan fetch exists for (`apply_exit_signal`'s eager-service arm skips a
+        // `Running` target).
+        process.set_state(beam_process::ProcessState::Running);
+    }
+    // A plain (non-`normal`) reason on a trapping receiver: a signal that is queued, not applied,
+    // so the scan is the only site that can materialise it before the schedule-out.
+    table
+        .send_exit(signaller, receiver, make_small(42))
+        .expect("the exit signal is queued");
+    assert_eq!(
+        table.pending_signals(receiver).unwrap(),
+        1,
+        "the signal waits in the queue, unapplied"
+    );
+    assert_eq!(table.get(receiver).expect("live").mailbox().len(), 0);
+
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, receiver);
+    let message = ctx
+        .receive_next()
+        .expect("the scan")
+        .expect("the trapped exit is applied in-scan and re-matched");
+    assert_eq!(terms::tuple_arity(message).expect("a 3-tuple"), 3);
+    assert_eq!(
+        terms::tuple_element(message, 0).expect("in range"),
+        exit_atom,
+        "the message head is the `'EXIT'` atom"
+    );
+    assert_eq!(
+        terms::tuple_element(message, 1).expect("in range"),
+        signaller.to_eterm(),
+        "the signaller is the exit sender"
+    );
+    assert_eq!(
+        terms::tuple_element(message, 2).expect("in range"),
+        make_small(42),
+        "the reason rides the message verbatim"
+    );
+    drop(ctx);
+    assert_eq!(
+        table.pending_signals(receiver).unwrap(),
+        0,
+        "the applied signal is popped"
+    );
+    assert_eq!(
+        table.get(receiver).expect("live").mailbox().len(),
+        1,
+        "the drained signal is a message in the mailbox"
+    );
+
+    // The half the scan must NOT do: on a non-trapping receiver the same plain reason is a
+    // `Terminate` verdict, so the drain leaves that head — and everything behind it — queued and
+    // the scan reports an exhausted mailbox. The death and its cascade stay the schedule-out
+    // net's and the next schedule-in's.
+    let doomed = table.spawn_default().expect("spawn a non-trapping receiver");
+    table
+        .get_mut(doomed)
+        .expect("live")
+        .set_state(beam_process::ProcessState::Running);
+    table
+        .send_exit(signaller, doomed, make_small(43))
+        .expect("the exit signal is queued");
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, doomed);
+    assert_eq!(
+        ctx.receive_next().expect("the scan"),
+        None,
+        "an unappliable head is not turned into a message"
+    );
+    drop(ctx);
+    assert_eq!(
+        table.pending_signals(doomed).unwrap(),
+        1,
+        "the terminating head is left queued"
+    );
+    assert!(
+        table.get(doomed).is_some(),
+        "the scan never terminates a process from inside its own instruction stream"
+    );
+}
+
+#[test]
 fn remove_message_unlinks_only_the_matched_candidate() {
     let mut rt = runtime();
     let pid = self_term(&rt);

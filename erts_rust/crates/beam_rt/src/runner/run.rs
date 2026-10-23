@@ -1557,12 +1557,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // The **schedule-out net**: a process that still owes its own queue a signal may
                 // not sleep yet.
                 //
-                // `receive_next` (`crate::context::execution`) applies a queue whose every
-                // pending signal is a `'DOWN'` — the one class that can only deliver a message.
-                // Everything else is left here, because applying it from inside the machine's
-                // instruction stream (a `Terminate(_)` verdict, a cascade) has no channel to
-                // report the death or its propagation. The C instead re-queues such a process at
-                // schedule-out (`schedule_out_process`,
+                // `receive_next` (`crate::context::execution`) has already applied the
+                // **receive-applicable** prefix of that queue in-scan
+                // (`ProcessTable::service_receive_signals`: a trapped exit becomes
+                // `{'EXIT', From, Reason}`, a monitor DOWN becomes `{'DOWN', …}`, an ignored
+                // exit is discarded, strictly FIFO, stopping *before* the first head whose
+                // `exit_policy` is `Terminate`). What a non-zero count here means is therefore a
+                // head the scan could not apply: a `Terminate(_)` verdict, whose application from
+                // inside the machine's instruction stream (a death plus its cascade) has no
+                // channel to report itself. The C instead re-queues such a process at                // schedule-out (`schedule_out_process`,
                 // `../../erts/emulator/beam/erl_process.c:6777-6801`, plus
                 // `active_sys_enqueue` `:7027-7094`; the flag itself is
                 // `erts_proc_notify_new_sig`, `../../erts/emulator/beam/erl_proc_sig_queue.h:2062-2075`):
