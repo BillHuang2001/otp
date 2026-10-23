@@ -786,6 +786,15 @@ impl TcpInetDriver {
         if self.state.is_connected() && !self.peer_close.seen {
             let payload_len = ctx.output().len();
             if payload_len == 0 && frame::write_header(&self.options, payload_len).is_none() {
+                // The **executed** command is still counted. `inet_output_count(INETP(desc),
+                // len + h_len)` is `tcp_sendv`'s first statement (`inet_drv.c:13763`), which runs
+                // *before* the empty-send shortcut at `:13798` — so the zero-length command adds
+                // one to `send_cnt`, follows the `f64` mean (`5 + (0 - 5)/2 = 2.5` → rendered
+                // `2`) and adds no octet. Measured on the oracle (OTP 29.1.1): the `{packet,
+                // raw}` rows `send_cnt` `1..5` with only the non-empty sends contributing octets.
+                // `h_len` is zero on this arm by construction, so the counted length is the empty
+                // payload alone.
+                self.stat.output(0);
                 self.out_framed = false;
                 self.caller_stripped = false;
                 if let Some(tag) = self.caller_ref.take() {
@@ -794,6 +803,9 @@ impl TcpInetDriver {
                         reply: InetReply::Ok,
                     })?;
                 }
+                // Nothing is left queued: the strip took the command's tag off and the payload
+                // was empty, so the queue's whole net shrinkage is the stripped prefix — the
+                // figure [`crate::Port`]'s write accounting compares against its own measurement.
                 return Ok(stripped);
             }
         }
