@@ -120,9 +120,14 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   higher register raises `x_mark`), so a host must record the published lengths rather than recompute them.
   The variance is pinned by `tests/raise_rooting.rs::the_latch_free_run_hands_over_an_unmodified_root_set`
   (one identical frame shape: 2 stack words unarmed, 4 with a raise armed).
-- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot
-  (`Machine::continuation` read-only, `Machine::take_continuation` read-and-clear,
-  `Machine::set_continuation` write), `Machine::ensure_heap`
+- `frames.rs` — the frame push/pop pair (`Machine::push_frame`, and `Machine::push_frame_window`,
+  the same push that also hands back the pushed frame's `(y_base, y_count)` — the push has just
+  materialised both figures, so a caller that must publish the Y window need not re-derive it from
+  `frames.last()`; `pop_frame`, and the size-checked `pop_frame_checked`, whose single `Vec::pop`
+  **is** the only read of the top frame — a mismatched `y_count` is the cold arm and restores the
+  identical frame, since `Frame` is `Copy`), `allocate*`/`deallocate*`/`trim`, the typed
+  `Continuation` CP slot (`Machine::continuation` read-only, `Machine::take_continuation`
+  read-and-clear, `Machine::set_continuation` write), `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
   caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
 - `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`)
@@ -218,7 +223,11 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   `wait_timeout` at `current_code` (the blocked instruction, exact because a blocking op is never JIT-inlined)
   in the module `active_context()` names — the callee's own module when the park is inside a cross-module
   callee (context != 0), else the passed entry module — and reports the `timeout` continuation (`pc + 1`) a
-  host re-enters when its own timer fires. `Machine::timeout_delay` accepts every operand shape the compiled
+  host re-enters when its own timer fires. The position itself is **one packed `u64`**
+  (`(func as u64) << 32 | pc`, `pack_current_code`/`unpack_current_code`, `CURRENT_CODE_NONE = u64::MAX`
+  with the `func == u32::MAX` sentinel), so `Machine::set_current_code` is a **single store** and every
+  reader — `current_code`, `current_function`, `current_location`, `current_stacktrace`, `wait_deadline` —
+  goes through the unpacker. `Machine::timeout_delay` accepts every operand shape the compiled
   `wait_timeout` can carry: an `Integer`/`Literal` delay, an `X`/`Y` register, and an `Operand::Typed { reg, .. }`
   (the `{tr,..}` typed-register operand, unwrapped to its `X`/`Y` register — the type annotation is a
   compiler hint, not a heap type). The engine arms no timer: a non-zero `wait_timeout` just suspends.
@@ -357,9 +366,10 @@ What the root set is **made of** and what it provably leaves out — the invaria
   a raise landing in another context's live catch frame (pinned by `drive.rs`'s tests
   `a_cross_module_return_switches_the_machine_back_into_the_caller_context` and
   `a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context`).
-- `reset` (`registers.rs`) clears the register files, stacks, catch frames, contexts, the local-callee identity
-  memo (`local_callees` — its entries are address-keyed, so they belong to the run that filled them; that is also
-  what makes the key ABA-free), the raise snapshot, the pending
+- `reset` (`registers.rs`) clears the register files, stacks, catch frames, contexts, the local-call
+  memo (`local_callees` — the callee identity **and** the host's verdict; its entries are address-keyed,
+  so they belong to the run that filled them, and that is also what makes the key ABA-free), the raise
+  snapshot, the pending
   exception, the exception-class atoms + their `class_atoms_live` latch, the execution-position fields and the
   trace/reduce gates, but **not** the `refc_binaries` arena, the `writable_payloads` registry, or
   `bif_in_machine_on` (latched per run into the machine by both drivers; only `Machine::new`,
@@ -373,6 +383,12 @@ What the root set is **made of** and what it provably leaves out — the invaria
   anywhere in the crate — so a machine's resident footprint is the high-water mark of the heaviest run it has
   ever executed and only dropping the machine frees it. `Machine::new` itself (`mod.rs`) allocates both
   1024-word register files (8 KiB each) before the first run.
+  **The three frame vectors are reserved up front** (`STACK_RESERVE_WORDS = 256` words,
+  `FRAMES_RESERVE = 256` frames, `CATCH_FRAMES_RESERVE = 8`, via `Vec::with_capacity` in
+  `Machine::with_max_register`), so the frame push/pop pair — every non-tail call on every tier — stays off
+  `RawVec`'s growth arm on a machine's first run too; because `reset` only `clear`s them, the capacity a
+  deeper run grew to survives into the next one. The floors are deliberately modest (2 KiB + 8 KiB + a few
+  hundred bytes), so a deep recursion or a nested-`try` storm still grows by the usual doubling.
 
 ## What the machine owns (and what it does not)
 `Machine` owns **no process heap**: its only non-term field storage is `Arc<Module>`/`Arc<LiteralArea>` handles plus
@@ -577,12 +593,13 @@ machine into its own off-heap table (the clone bumps the refcount, so the payloa
 Pinned by `offheap.rs`'s unit tests (address stability across a retain, released-reservation accounting, a
 shared payload outliving a released handle, writable-registry pruning both ways, the empty no-op).
 
-## The local-call seam's memo boundary (`Machine::local_call_seam`)
+## The local-call seam's memo (`Machine::local_call_seam`)
 
-All five call sites — the interpreter's three local-call arms (`../interpreter/dispatch.rs:421`/`:467`/`:496`) and the baseline tier's two helpers (`../jit/baseline/call.rs:398`, `../jit/baseline/runtime.rs:1172`) — route through `Machine::local_call_seam` (`../interpreter/dispatch.rs:1109-1142`), which consults the host's `ExecutionContext::resolve_local_call` (`../context.rs:794`). That method lives in `../interpreter/`, not here; what belongs to **this** node is the memo boundary:
-- **The decline path (`Ok(None)`) reads no `Machine` state and mutates none.** It derives the callee identity from the immutable `Module` — `local_callee_identity` (`../interpreter/dispatch.rs:1234-1239`): `module.functions.get(func)` plus two `module.atom_name(..)` (`beam_term/src/atom.rs:308-310`, a `Vec` index — no hash, no clone) — then asks the host. The answer is a pure function of `(Module, func index, host tables)`; `nregs` plays no part in it (it is the BIF marshalling arity only).
-- **The *identity* is memoizable here; the *verdict* is not.** A per-module `func index -> resolved (owner, name, arity)` table follows the proven `ImportTarget` precedent (`../interpreter/mod.rs:93-118`: ~5 ns per resolution against ~0.5 ns cached; names stored **owned** because `JitRuntime` is `#[repr(C)]` and cannot carry the module's lifetime). Its natural owner is a sibling of `ModuleContext.labels` (`context.rs:65-72` — per-run, `Arc::ptr_eq`-deduped, dropped by `Machine::reset`) for contexts `> 0`, plus an `entry_*` twin for context `0`, which has **no** `ModuleContext`. Key on the module's `Arc` identity, never on content: a `Module::clone` mints a fresh atom table, so content-keyed entries would mix atom namespaces.
-- **A cached verdict may not skip the host call.** `BudgetContext::resolve_local_call` prices one reduction per local call (`beam_rt/src/runner/budget.rs:482-485`) — load-bearing slice accounting — and the shipped host is already a single `&str` compare for every non-`prim_tty` module (`beam_rt/src/native/prim_tty.rs:123-125`), so there is nothing left to save there. Never bake a verdict into compiled code: `JitBackend::compile(&mut self, module: &Module)` is handed no `ExecutionContext` (`../jit/mod.rs:245`), and the cross-run `CodeCache` is content-keyed and shared across runs, machines and hosts.
+All five call sites — the interpreter's three local-call arms (`../interpreter/dispatch.rs:429`/`:475`/`:504`) and the baseline tier's two helpers (`../jit/baseline/call.rs:398`, `../jit/baseline/runtime.rs:1269`) — route through `Machine::local_call_seam` (`../interpreter/dispatch.rs:1149-1212`), which consults the host's `ExecutionContext::resolve_local_call` (`../context.rs:1116`). That method lives in `../interpreter/`, not here; what belongs to **this** node is the memo.
+- **Both halves are memoized, per `(module image address, function index)`, for the life of a run.** `Machine::local_callees` (`local_callee.rs`, `CAP = 8`) holds the callee's `(module, function, arity)` identity (`local_callee_identity`, `../interpreter/dispatch.rs:1354`: `module.functions.get(func)` plus two `module.atom_name(..)` — a `Vec` index, no hash, no clone) **and** the host's verdict as a one-byte `Verdict` (`Unnameable`/`Ask`/`Served`/`Declined`) in a parallel array beside the keys, so the hot path is one fixed scan of the occupied prefix plus one byte load: **no** `dyn` call, no `&str` predicate, no re-derivation. `resolve_local_call` is therefore consulted **once per distinct callee per run**, not once per call. `nregs` plays no part in either half (it is the BIF marshalling arity only).
+- **Caching the verdict is the faithful choice, not a shortcut.** The host predicate is a pure function of the `(module, function, arity)` triple (for `beam_rt`: `prim_tty`'s stubs plus `beam_bifs`' `zlib` table), and ERTS itself charges **nothing** for an intra-module call — so the per-call consultation the memo replaces was spending a reduction unit (`beam_rt/src/runner/budget.rs:542`, load-bearing slice accounting) the oracle never charges.
+- **Three invalidation doors, and invalidation re-asks the host but re-derives nothing** (an identity is a pure function of an immutable module image and cannot go stale). An *installation* is the only thing that can change an answer: `erlang:load_nif/2` clears every verdict at the one BIF funnel (`Machine::dispatch_bif`, `../interpreter/bif.rs`, gated on `module == "erlang" && function == "load_nif" && arity == 2`, so an ordinary BIF pays one arity compare) because it installs the stub a later local call must reach; `Machine::reset` clears the whole memo, which is also what keeps the address key ABA-free; and the public `Machine::invalidate_local_call_verdicts` (`mod.rs`) is the door for a host whose answer set changes by any other means (its own plugins, a reload, a config toggle).
+- **A verdict must still never reach compiled code.** `JitBackend::compile(&mut self, module: &Module)` is handed no `ExecutionContext` (`../jit/mod.rs:245`), and the cross-run `CodeCache` is content-keyed and shared across runs, machines and hosts — so the memo is legitimate strictly as a **per-machine, per-run, invalidatable** cache, and nothing the emitter generates may bake a verdict in.
 
 ## Measured: the per-`Machine` label-map cache (`label_cache.rs`)
 The wall-clock record and the full per-round tables (moved from `MEASURED.md`, because this node owns the cache).

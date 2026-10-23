@@ -54,7 +54,7 @@ What remains on this path is **not in this node**: `families::bitstrings`' `run_
 The run entry itself is bounded by design: `Machine::reset` refills only each register file's used extent (`machine/registers.rs::used_extent`) and `Machine::label_map` builds a module's map once per machine, 0 times on a re-entry (`machine/label_cache.rs`).
 Within this node the largest remaining row is `jit_refresh_y` (5.0 %), whose removal is unsound without closing the `fold_step` `pc + 1` hole.
 
-**The frame-changing helpers re-publish the Y window themselves** (`jit_allocate`/`jit_allocate_heap`/`jit_trim`/`jit_deallocate` call `JitRuntime::refresh_y_base` on their success path instead of the emitted continue arm calling `jit_refresh_y`).
+**The frame-changing helpers re-publish the Y window themselves** (`jit_allocate`/`jit_allocate_heap` publish it from the `(y_base, y_count)` `Machine::push_frame_window` just computed — `JitRuntime::publish_y_window`, no derivation — while `jit_trim`/`jit_deallocate` re-derive it through `JitRuntime::refresh_y_base`; the emitted continue arm never calls `jit_refresh_y` for them).
 Same instrument, same discipline, before/after binary of the same worktree, 5 paired rounds:
 
 | workload | per-rep slope before | after | paired min / median |
