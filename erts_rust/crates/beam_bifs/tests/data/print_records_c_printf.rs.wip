@@ -119,6 +119,10 @@ fn seeded_atoms() -> AtomTable {
         "hello",
         "lists",
         "reverse",
+        // `io:format/2` resolves its encoding atom and `io_lib:format/3` its option
+        // tag; both are runtime-provided names, so the fixture table carries them.
+        "latin1",
+        "chars_limit",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -874,11 +878,13 @@ fn an_unreadable_record_is_the_typed_badarg_on_every_route() {
     let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
     // The build-side table: everything the record needs.
     let mut wide = AtomTable::new();
-    wide.seed(
-        ["false", "true", "is_exported", "ddlfa", "ghost_mod", "ghost_rec"]
-            .iter()
-            .copied(),
-    );
+    wide.seed(["false", "true", "is_exported", "ddlfa"].iter().copied());
+    // The record's module/name atoms are interned **past** the render table's last
+    // index, so the renderer cannot name them: their indices are outside the table a
+    // term of the runtime can ever carry, which is exactly the unreadable shape.
+    let fillers: Vec<String> = (0..32).map(|i| format!("ddlfiller{i}")).collect();
+    wide.seed(fillers.iter().map(String::as_str));
+    wide.seed(["ghost_mod", "ghost_rec"].iter().copied());
     let module = wide.lookup("ghost_mod").expect("seeded");
     let name = wide.lookup("ghost_rec").expect("seeded");
     let key = wide.lookup("ddlfa").expect("seeded");
@@ -894,8 +900,12 @@ fn an_unreadable_record_is_the_typed_badarg_on_every_route() {
     // The render-side table: the same terms, minus the record's module/name atoms.
     let atoms = seeded_atoms();
     assert!(
-        atoms.lookup("ghost_mod").is_none(),
-        "the fixture's atom must not leak into the render table"
+        atoms.lookup("ghost_mod").is_none() && atoms.lookup("ghost_rec").is_none(),
+        "the fixture's atoms must not leak into the render table"
+    );
+    assert!(
+        module.raw() as usize >= atoms.len() && name.raw() as usize >= atoms.len(),
+        "the record's module/name indices must lie outside the render table"
     );
 
     // `display` — the `%T` route.
