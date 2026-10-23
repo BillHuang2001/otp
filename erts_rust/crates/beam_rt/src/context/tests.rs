@@ -9893,13 +9893,12 @@ fn assert_badfun(error: BeamError, what: &str) {
 /// Before this change every one of them answered [`BeamError::BadArg`], i.e. the oracle's
 /// class was wrong *and* its reason was wrong.
 ///
-/// **Residual, measured rather than hidden:** the reason is the bare atom, so a catch
-/// observes `{error, badfun}` where the oracle gives `{error, {badfun, F}}` — the
-/// `expand_error_value` half is the engine's and is not wired yet (see
-/// [`crate::error::bad_fun`]). The **class and the reason atom agree with the oracle**,
-/// which is the divergence this test pins; the integration suite
-/// `tests/decoded_fun_badfun.rs` pins the same answer end to end on both execution tiers.
-#[test]
+/// **What this test sees is the *pre-expansion* marker, by design.** The seam answers the C's
+/// `freason = EXC_BADFUN` half — class `error`, reason atom `badfun` — and the
+/// `expand_error_value` half (`{badfun, F}`) is built by the engine at `call_fun`, which is where
+/// the applied fun is still a re-readable `FunSource` (see [`crate::error::bad_fun`]). The
+/// end-to-end shape, `{badfun, F}` with `F =:= G`, is pinned by the integration suite
+/// `tests/decoded_fun_badfun.rs` on both execution tiers.#[test]
 fn an_imported_fun_naming_no_lambda_raises_badfun() {
     let Some(erlc) = resolve_erlc() else {
         skip_loudly(
