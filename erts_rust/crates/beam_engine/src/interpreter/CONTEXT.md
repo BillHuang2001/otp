@@ -285,8 +285,10 @@ memo inside it benefits the baseline tier with **zero** `../jit/baseline/**` edi
 **Why the verdict may be cached here at all.** The host predicate is a pure function of the
 `(module, function, arity)` triple and ERTS charges **nothing** for an intra-module call, so a per-call
 consultation is the deviation, not the memo. What can change an answer mid-run is an *installation*, so there
-are exactly three invalidation doors: `erlang:load_nif/2` (cleared at the one BIF funnel
-`Machine::dispatch_bif`, `bif.rs`, so an ordinary BIF pays one arity compare), `Machine::reset`, and the public
+are exactly three invalidation doors: `erlang:load_nif/2` (the one BIF funnel `Machine::dispatch_bif_call`,
+`bif.rs`, **arms** a pending invalidation through a `Cell` when the dispatched triple is
+`("erlang","load_nif",2)` — the funnel is `&self` so it cannot clear the memo itself — and this seam, which is
+`&mut self` on every tier, clears the verdicts at its next local call), `Machine::reset`, and the public
 `Machine::invalidate_local_call_verdicts` a host with a stateful answer set calls itself.
 Pinned by `../machine/tests.rs`'s seam tests (2 calls → 1 consultation, 1 derivation; each door forces a
 re-consultation; an ordinary BIF dispatch does not; a served `call_last` pops its frame like the in-machine
