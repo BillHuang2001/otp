@@ -100,6 +100,7 @@ pub use self::run::RunOutcome;
 use crate::context::{ExecutionContext, RootSet};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
+pub(crate) use self::location::CURRENT_CODE_NONE;
 
 mod catch;
 mod context;
@@ -728,7 +729,14 @@ pub struct Machine {
     /// native baseline tier the driver publishes each **block entry** before it is
     /// entered, so mid-block the recorded address is that block's entry (the address a
     /// pre-empted machine resumes at), never a fabricated mid-block one.
-    pub(crate) current_code: Option<(u32, u32)>,
+    ///
+    /// **Packed into one word** ([`CURRENT_CODE_NONE`] = "no position yet", else
+    /// `func << 32 | pc`) rather than an `Option<(u32, u32)>`, whose missing niche made
+    /// the store three words wide. A function index and a code offset are both far
+    /// below [`u32::MAX`], so the all-ones `func` cannot collide with a real position;
+    /// the accessors [`Machine::current_code`]/[`Machine::set_current_code`] are the
+    /// only readers and writers.
+    pub(crate) current_code: u64,
     /// The `(function index, arity)` this run was **entered** at — the engine's
     /// analogue of ERTS's `$initial_call`.
     ///
@@ -768,6 +776,24 @@ pub struct Machine {
     pub(crate) reductions: u64,
 }
 
+/// The Erlang stack's initial capacity in words.
+///
+/// Reserving up front keeps the frame push/pop pair — the hot path of every non-tail
+/// call on every tier — off `RawVec`'s growth arm on the way in: `Machine::reset` only
+/// `clear`s the stack, so a machine that has run once keeps whatever capacity it grew
+/// to, and this is only the *first* run's floor. It is deliberately modest (2 KiB per
+/// machine): a deep recursion grows past it by the usual doubling, and a machine is one
+/// per process (recycled through the runtime's nested-run pool).
+const STACK_RESERVE_WORDS: usize = 256;
+
+/// The call-frame stack's initial capacity in frames (8 KiB per machine); see
+/// [`STACK_RESERVE_WORDS`] for why it is reserved at all and why it is this small.
+const FRAMES_RESERVE: usize = 256;
+
+/// The catch-frame stack's initial capacity. A raise path is not hot; this only keeps
+/// the first `try` of a run from reallocating.
+const CATCH_FRAMES_RESERVE: usize = 8;
+
 impl Machine {
     /// A machine with the default register file ([`MAX_REGISTER`] registers).
     pub fn new() -> Machine {
@@ -783,9 +809,9 @@ impl Machine {
             fr_mark: 0,
             x_dirty: 0,
             fr_dirty: 0,
-            refilled_words: 0,            stack: Vec::new(),
-            frames: Vec::new(),
-            catch_frames: Vec::new(),
+            refilled_words: 0,            stack: Vec::with_capacity(STACK_RESERVE_WORDS),
+            frames: Vec::with_capacity(FRAMES_RESERVE),
+            catch_frames: Vec::with_capacity(CATCH_FRAMES_RESERVE),
             pending_exception: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             class_atoms_live: false,            max_register,
@@ -811,7 +837,7 @@ impl Machine {
             bif_in_machine_on: false,
             census_on: false,
             local_callees: LocalCallees::new(),
-            current_code: None,
+            current_code: CURRENT_CODE_NONE,
             entry_call: None,
             reductions: 0,
         };

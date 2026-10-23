@@ -423,7 +423,7 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).
-        self.current_code = None;
+        self.current_code = crate::machine::CURRENT_CODE_NONE;
         self.entry_call = None;
         // The A.8 tracing gate is re-latched from the context at every run entry
         // (`run_loop_with_map` / the native driver). Clearing it here means a run

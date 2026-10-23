@@ -101,6 +101,38 @@ use crate::terms::{ContextSink, Sink};
 
 use super::{Machine, ModuleContext};
 
+/// The `Machine::current_code` word's "no position yet" sentinel.
+///
+/// See [`pack_current_code`] for the encoding. `u32::MAX` is not a function index —
+/// it would need a module with 4 294 967 295 functions — so the sentinel cannot
+/// collide with a real position.
+pub(crate) const CURRENT_CODE_NONE: u64 = u64::MAX;
+
+/// Pack `(func, pc)` into [`Machine::current_code`]'s single word: `func` in the high
+/// half, `pc` in the low half.
+///
+/// An `Option<(u32, u32)>` has no niche, so Rust lays it out as **three** words
+/// (a discriminant plus both fields) and the store every helper makes at its entry —
+/// `set_current_code` is on the per-instruction path of both execution tiers — wrote
+/// all three. A function index and a code offset are both far below `u32::MAX`, so
+/// the all-ones `func` half is free to mean "no position", and the whole position
+/// becomes one word one store wide.
+#[inline]
+fn pack_current_code(func: u32, pc: u32) -> u64 {
+    ((func as u64) << 32) | u64::from(pc)
+}
+
+/// The read half of [`pack_current_code`].
+#[inline]
+fn unpack_current_code(raw: u64) -> Option<(u32, u32)> {
+    let func = (raw >> 32) as u32;
+    if func == u32::MAX {
+        None
+    } else {
+        Some((func, raw as u32))
+    }
+}
+
 impl Machine {
     /// The **registered** module context the machine is executing in, or `None`
     /// when that is the run's entry module (context `0`).
@@ -142,7 +174,7 @@ impl Machine {
     /// like them it is exact at a suspension point and is the *last interpreted*
     /// instruction while a native JIT tier runs a block mid-flight.
     pub fn current_code(&self) -> Option<(u32, u32)> {
-        self.current_code
+        unpack_current_code(self.current_code)
     }
 
     /// Record the machine's current execution position as `(function index, code
@@ -157,8 +189,12 @@ impl Machine {
     /// position within some module the machine is executing, and the derived
     /// accessors reject an out-of-range index with their typed error rather than
     /// this setter inventing a failure.
+    ///
+    /// One store: the position is packed into a single word ([`pack_current_code`]),
+    /// which is what keeps this per-instruction write off the hot path's critical
+    /// resources in both tiers.
     pub(crate) fn set_current_code(&mut self, func: u32, pc: u32) {
-        self.current_code = Some((func, pc));
+        self.current_code = pack_current_code(func, pc);
     }
     /// The `(function index, arity)` the run was entered at — the engine's
     /// analogue of ERTS's `$initial_call`.
@@ -185,7 +221,7 @@ impl Machine {
         module: &Module,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Option<Eterm>> {
-        let (func, _pc) = match self.current_code {
+        let (func, _pc) = match self.current_code() {
             Some(code) => code,
             None => return Ok(None),
         };
@@ -231,7 +267,7 @@ impl Machine {
         module: &Module,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Option<Eterm>> {
-        let (func, pc) = match self.current_code {
+        let (func, pc) = match self.current_code() {
             Some(code) => code,
             None => return Ok(None),
         };
@@ -263,7 +299,7 @@ impl Machine {
         module: &Module,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
-        let (func, pc) = match self.current_code {
+        let (func, pc) = match self.current_code() {
             Some(code) => code,
             None => return Ok(NIL),
         };
@@ -333,7 +369,7 @@ impl Machine {
     /// callee reads the callee's own instruction stream instead (see
     /// [`Machine::current_module`]).
     pub fn wait_deadline(&self, module: &Module) -> Option<WaitDeadline> {
-        let (func, pc) = self.current_code?;
+        let (func, pc) = self.current_code()?;
         match self.active_context() {
             Some(context) => deadline_at(self, &context.module, func, pc),
             None => deadline_at(self, module, func, pc),

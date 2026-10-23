@@ -198,7 +198,7 @@ impl Machine {
         // both call it — so the address is exact at every suspension point (a
         // blocking `wait` is interpreted, never inlined); a natively-executed JIT
         // block does not update it (see the field docs).
-        self.current_code = Some((func, pc));
+        self.set_current_code(func, pc);
         let result = self.step_instruction_inner(entry_module, module, labels, func, pc, ctx);
         // The uniform raise funnel (see this method's docs). In context `0` the
         // active module is the entry module, so `Some(module)` is exactly the
