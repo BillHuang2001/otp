@@ -63,10 +63,12 @@
 //!   ([`Machine::off_heap_overhead_bytes`] and [`Machine::retain_refc_binaries`]): the
 //!   reservoir is host-prunable by a reachability predicate, and its backing-store bytes
 //!   are the figure a host prices against `beam_gc`'s off-heap trigger.
-//! * `local_callee` — the **local-callee identity memo** ([`LocalCallees`]): the
-//!   `(module, function, arity)` derivation the local-call seam would otherwise repeat on
-//!   every local call, memoized per `(module address, function index)`. It memoizes the
-//!   *derivation* only, never the host's verdict.
+//! * `local_callee` — the **local-call memo** ([`LocalCallees`]): the
+//!   `(module, function, arity)` derivation *and* the host's
+//!   `resolve_local_call` verdict for it, both memoized per
+//!   `(module address, function index)` and both invalidated by
+//!   `erlang:load_nif/2`, [`Machine::reset`] and
+//!   [`Machine::invalidate_local_call_verdicts`].
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
@@ -90,7 +92,7 @@ pub use self::catch::CatchFrame;
 pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
 pub(crate) use self::label_cache::LabelMaps;
-pub(crate) use self::local_callee::{CalleeTarget, LocalCallees};
+pub(crate) use self::local_callee::{LocalCallees, Verdict};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
@@ -669,19 +671,27 @@ pub struct Machine {
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale `true` from an earlier counted run.
     pub(crate) census_on: bool,
-    /// The **local-callee identity memo** the local-call seam consults on every local
+    /// The **local-call memo** the local-call seam consults on every local
     /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
     ///
-    /// Naming the same-module callee costs the callee's function entry plus two atom
-    /// names, and all three are immutable for a loaded module, so the derivation is
-    /// memoized per `(module address, function index)` ([`LocalCallees`]).
+    /// Both questions the seam asks are memoized per `(module address, function index)`,
+    /// because neither can go stale on its own:
     ///
-    /// **Only the derivation is memoized — never the host's verdict.** The seam still
-    /// calls [`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)
-    /// exactly once per local call: a host spends one reduction unit per consultation,
-    /// and `erlang:load_nif/2` can install a stub mid-run that a later call must be
-    /// served from. An un-nameable callee is memoized as `None`, so it keeps costing the
-    /// host *zero* consultations.
+    /// * **who** the same-module callee is — its `(module, function, arity)` — which costs
+    ///   the callee's function entry plus two atom names, all immutable for a loaded
+    ///   module;
+    /// * **whether the host serves it** as a BIF
+    ///   ([`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)),
+    ///   whose answer is a pure function of that triple for `beam_rt` (`prim_tty`'s stubs
+    ///   and `beam_bifs`' `zlib` table read no run state). ERTS charges nothing at all for
+    ///   an intra-module call, so paying one host consultation per call was strictly
+    ///   *less* faithful than caching.
+    ///
+    /// A repeat local call is therefore one fixed key scan plus one byte load. The
+    /// verdicts are invalidated by `erlang:load_nif/2` (through
+    /// [`Machine::dispatch_bif`](crate::machine::Machine)), by [`Machine::reset`], and by
+    /// the public [`Machine::invalidate_local_call_verdicts`] door; an un-nameable callee
+    /// is memoized as such and keeps costing the host *zero* consultations.
     ///
     /// **`pub(crate)`** so the seam (`crate::interpreter::dispatch`) can hold
     /// `&mut self.local_callees` for the memo while `resolve_local_call`'s
@@ -1200,6 +1210,36 @@ impl Machine {
         live: u32,
     ) -> Result<*mut Eterm> {
         self.with_roots(live, |roots| ctx.alloc_words_rooted(n, roots))
+    }
+    /// Forget every memoized **host verdict** of the local-call seam, so the next local
+    /// call to each known callee consults
+    /// [`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)
+    /// again.
+    ///
+    /// The seam memoizes the host's answer per `(module address, function index)` for the
+    /// life of a run (see [`LocalCallees`]), which is correct while the host's answer set
+    /// is a pure function of the `(module, function, arity)` triple — `beam_rt`'s is
+    /// (`prim_tty`'s NIF stubs plus `beam_bifs`' `zlib` table). This door is what a host
+    /// whose answer set **changes** mid-run calls to invalidate that assumption.
+    ///
+    /// Three things reach it, and a host that changes its answer set by any *other* means
+    /// (a plugin reload, a configuration toggle of its own) must call it explicitly:
+    ///
+    /// * the BIF-dispatch funnel ([`Machine::dispatch_bif`](crate::machine::Machine))
+    ///   calls it when it dispatches `erlang:load_nif/2` — the one documented way a
+    ///   mid-run install makes a module's unexported `*_nif` stub reachable, so every
+    ///   tier gets this;
+    /// * [`Machine::reset`](crate::Machine) drops the whole memo at the start of every run
+    ///   (the keys are module addresses, so they are only valid for the run that filled
+    ///   them);
+    /// * this method, for everything else.
+    ///
+    /// Only the **verdicts** are cleared: the memoized identities are pure functions of a
+    /// loaded module and never go stale, so a re-ask re-derives nothing. This is a full
+    /// walk of one eight-byte array, and it allocates nothing.
+    #[inline]
+    pub fn invalidate_local_call_verdicts(&mut self) {
+        self.local_callees.invalidate_verdicts();
     }
     /// The module-wide label index of `module` — **the** label-map door.
     ///

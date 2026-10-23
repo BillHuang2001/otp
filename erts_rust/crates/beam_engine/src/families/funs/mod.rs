@@ -837,9 +837,9 @@ pub(crate) fn apply_target(
     // synthesized here: a no-op for any other error shape and when the raise cannot
     // land. The two atom words are **re-read** from `x(arity)`/`x(arity+1)` rather
     // than carried across the dispatch: a host BIF reached through
-    // `dispatch_bif_call` may allocate and collect (and the in-machine door even
+    // `dispatch_bif` may allocate and collect (and the in-machine door even
     // hands it the live machine), so only a read taken after it is guaranteed live.
-    match machine.dispatch_bif_call(
+    match machine.dispatch_bif(
         entry_module,
         &module_name,
         &function_name,
