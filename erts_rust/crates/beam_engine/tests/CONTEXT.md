@@ -131,9 +131,9 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
   both tiers), `jit_coverage.rs` (coverage.beam × `NATIVE_TIERS`, `:154`/`:158`),
   `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_reductions.rs` (slice.beam),
   `jit_cross_module.rs` (fixtures compiled by the system `erlc` at test time; every tier in the
-  roster on its cross-module rows — interpreter + baseline always, Cranelift with the feature — while
-  its same-tier resume row is pinned on the interpreter and the baseline tier only; `NATIVE_TIERS`
-  `:499`/`:503`, the `run_both` funnel `:606`), `stacktrace_frames.rs`
+  roster on **all four** rows — interpreter + baseline always, Cranelift with the feature — the
+  parked-and-resumed row included; `NATIVE_TIERS` `:504`/`:508`, the `run_both` funnel `:611`, the
+  parked row `:749`), `stacktrace_frames.rs`
   (`TIERS = [Interpreter, BaselineJit]`, `:127`, live-`erl` prefix cross-check), and
   `the_block_allocator_engages_on_real_stdlib_modules` (7 real modules, engine-internal artifact
   assertions only). `jit_compare.rs` / `local_call_seam.rs` are **synthetic-only**.
