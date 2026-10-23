@@ -8,10 +8,15 @@ With the feature off the crate carries **no** Cranelift dependency and `Tier::Cr
 a typed `unsupported("jit-cranelift tier not built")` — never a panic, never a silent fallback.
 
 ## API Surface
-- `mod.rs` — `CraneliftJit` (the `JitBackend`), `CompiledFunctions` (owns the `JITModule`; accessors
-  `entry`/`entry_pc`/`function_count`/`highest_native_register`/`is_enterable` + the `inlined_*`
-  introspection), `run_cranelift*`.
-- `codegen.rs` — `compile_module` (`emit_pc` per instruction); `inline.rs`/`compare.rs`/`shape.rs` —
+- `mod.rs` — `CraneliftJit` (the `JitBackend`, whose `run_export` override routes through the store),
+  `CompiledFunctions` (owns the `JITModule`; accessors
+  `entry`/`entry_pc`/`function_count`/`labels`/`highest_native_register`/`is_enterable` + the `inlined_*`
+  introspection), `run_outcome`/`run_label_outcome`/`run_resume_outcome`, `run_cranelift*`.
+- `cache.rs` — the **retained-artifact store**: `handle(module) -> Result<Rc<CompiledFunctions>>`
+  (compile once per sound identity, reuse afterwards) plus the test-gated `len`/`compile_count`/`clear`
+  introspection.
+- `codegen.rs` — `compile_module` (`emit_pc` per instruction; the module-wide label map it builds is kept
+  on the artifact, not dropped); `inline.rs`/`compare.rs`/`shape.rs` —
   the inline-set lowering and shape tests; `report.rs` — `CodegenReport`
   (`inlined_tests`/`inlined_gc_bifs`/`inlined_comparisons`/`inlined_select_vals`/`inlined_tuple_reads`/
   `inlined_list_reads`/`inlined_swaps`/`inlined_tail_calls`).
