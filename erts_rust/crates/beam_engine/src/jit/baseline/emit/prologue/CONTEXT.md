@@ -23,8 +23,9 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
   so the reservation and the teardown's matching `lea rsp,[rsp+frame_slot_len(k)]` always agree
   (`emit/link.rs::emit_frame_teardown` derives both sides from the same `native_frame_regs`). Corpus
-  counters (grand total over the generically-discovered installed-OTP corpus): 597 333 blocks /
-  756 632 cache slots, push/pop ops 7 167 996 → 2 707 930 (−62.2 %), emitted bytes
+  counters (grand total over **that recorded pass's** corpus — the then-32 committed `erlc` fixtures +
+  a 1321-module installed-OTP sample; the corpus' current size is `../../census/CONTEXT.md`'s):
+  597 333 blocks / 756 632 cache slots, push/pop ops 7 167 996 → 2 707 930 (−62.2 %), emitted bytes
   320 065 790 → 306 024 443 (−4.39 %), with every per-block cache/write set and IR size unchanged.
   The prologue load set is `Allocation::entry_fill`, which cuts corpus prologue loads
   **756 632 → 352 537** (−53.4 %).

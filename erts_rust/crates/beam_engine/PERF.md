@@ -19,7 +19,7 @@ Detailed current measured figures and execution-coverage evidence live in `MEASU
 - **New file `src/jit/baseline/emit/prologue.rs` (158 lines)** — the block prologue (`emit_block_prologue`: frame setup, the `rt` slot, the position store / Y publish, the live-in cache load) plus its three helpers (`emit_position_store`/`emit_publish_y`/`emit_prologue_helper`), moved **verbatim** out of `emit/block.rs` (`1093 → 993` lines).
   Proof it is a pure move: the deterministic census grand total is byte-identical.
 ### Structural counters (deterministic, `src/jit/baseline/counters.rs`) — one recorded corpus pass
-`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` over the generically-discovered installed-OTP corpus (**1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** instruction instances summed over the emitted block ranges):
+`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed`, read from **that recorded pass's** corpus — the then-32 committed `erlc` fixtures + a 1321-module installed-OTP sample = **1353** modules / **103 008** functions / **597 333** blocks / **3 585 490** instruction instances summed over the emitted block ranges:
 
 | counter | before | after | delta |
 |---|---|---|---|
@@ -29,7 +29,9 @@ Detailed current measured figures and execution-coverage evidence live in `MEASU
 | liveness-restricted `fill` loads | 3 695 119 | 3 291 024 | −11.0 % |
 | spill stores (dirty set) | 1 594 678 | 1 594 678 | untouched |
 
-`blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation): `cache_slots` **756 632**, `written_slots` **621 058**.
+Every absolute in that table is that pass's, not today's. A fresh pass over the corpus as it stands — the 38 committed `erlc` fixtures, i.e. **1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** range-instances (`src/jit/baseline/census/CONTEXT.md`) — moves all of them while each delta stays that pass's two-tree-state contribution; the *ratios* are corpus-dependent too and the census node records the current ones.
+
+`blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation): `cache_slots` **756 632**, `written_slots` **621 058** — that pass's figures, like every other number in this subsection.
 The census is deterministic and load-independent (it compiles modules directly, never through `CodeCache`), and its other recorded models are: whole-cache fill **3 950 215**, written-set spill stores **4 678 655**, whole-cache spill stores **5 578 219** (the before/after columns of one pass — see the reading note at the top).
 
 **Static deopt census, current corpus:** **119 912** deopts over **3 114 364** visited instruction instances = **3.85 %**.
@@ -73,7 +75,7 @@ Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p 
 That reference is a **position-keyed whole-cache** cache (`consolidate(offset)`/`validAt(offset)` evict the whole cache when the emit position moves) with **no** per-register dirty bit, so this rule is the tier's own design, not a port.
 Full design note: `src/jit/baseline/emit/regalloc.rs` module docs + `src/jit/baseline/emit/regs/CONTEXT.md` §"The soundness contract".
 ### Structural counters (test-only, `src/jit/baseline/counters.rs`) — one recorded pass, all three models
-`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed` (38 committed `erlc` fixtures + a 1321-module installed-OTP sample = **1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** instruction instances summed over the emitted block ranges).
+`src/jit/baseline/census.rs::the_register_cache_traffic_census_over_the_corpus_is_printed`, read from **that recorded pass's** corpus — the then-32 committed `erlc` fixtures + a 1321-module installed-OTP sample = **1353** modules / **103 008** functions / **597 333** blocks / **3 585 490** instruction instances summed over the emitted block ranges (a fresh pass over the corpus as it stands, the 38 fixtures → **1359** modules / **103 079** functions / **597 565** blocks / **3 586 410** range-instances, moves every absolute here while each delta stays that pass's; `src/jit/baseline/census/CONTEXT.md` owns the current figure).
 The counters compute the **replaced** models alongside the shipped one **in the same run**, so the store-count comparison is a single measurement — the counterfactual columns are exactly the before/after:
 
 | model | spill stores | note |

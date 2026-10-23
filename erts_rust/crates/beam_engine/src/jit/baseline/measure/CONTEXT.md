@@ -137,7 +137,7 @@ The split is printed by `../census.rs::the_static_deopt_census_over_the_corpus_i
 Shares inflate as the total shrinks, so compare only across one window.
 
 ## The variable-length frame and the live-in prologue fill (counters)
-Deterministic corpus counters (`../counters.rs`, grand total over the generically-discovered installed-OTP corpus, 1 353 modules / 103 008 functions):
+Deterministic corpus counters (`../counters.rs`, grand total over **that recorded pass's** corpus — 1 353 modules / 103 008 functions, the then-32 committed fixtures + a 1321-module installed-OTP sample; the corpus as it stands today is `../census/CONTEXT.md`'s, 1359 modules / 103 079 functions / 597 565 blocks / 3 586 410 range-instances):
 
 | counter | before | after |
 |---|---|---|
@@ -148,7 +148,7 @@ Deterministic corpus counters (`../counters.rs`, grand total over the genericall
 | prologue loads (live-in fill) | 756 632 | **352 537** (−53.4 %) |
 | `emitted_bytes` (both levers, cumulative) | 320 065 790 | **306 024 443** (−4.39 %) |
 
-`ir_instrs = 3 585 490`, `written_slots = 621 058`, and the per-block cache-size histogram, every fill/spill **count** and both per-block histograms are unchanged — the levers change no register allocation.
+`ir_instrs = 3 585 490` (that pass's range-instance base), `written_slots = 621 058`, and the per-block cache-size histogram, every fill/spill **count** and both per-block histograms are unchanged — the levers change no register allocation.
 
 **Both levers reduce counts but have no measurable throughput effect on this host (honest negative).**
 Interleaved A/B (before = the pre-lever tree, after = the variable-length frame + the live-in prologue fill; 9 paired rounds with the order reversed between rounds, `bench run --quick --runtime rust --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound`, one benchmark process at a time, `/proc/loadavg` 8–123 recorded at every run): every case's paired after/before ratio flips sign across rounds and each side's own run-to-run spread is 1.5–5.2×, so no case clears the spread (the min-over-N ratios 0.86–1.98 are confounded, because the two minima come from different rounds).
