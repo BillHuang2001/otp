@@ -74,6 +74,12 @@
 //!   `integer_to_list/1`, `list_to_atom/1`, `lists:keyfind/3`, and the typed
 //!   `persistent_term:get/1,2` refusal).
 //! * [`assertions`] — the shared term builders/asserters.
+//! * [`oracle`] — the **oracle-corpus machinery**: the parsers for the two
+//!   committed corpora (`tests/fixtures/stdlib_breadth_targets.txt` and
+//!   `tests/fixtures/error_path_targets.txt`), the argument/expectation term
+//!   builders, the `~w` renderer and the error-path comparator — one
+//!   implementation shared by every suite asserting an engine result against the
+//!   system `erl`.
 //! * [`probe`] — the **census probe harness**: one [`Probe`] per `Instr` under test
 //!   (valid operands, per-probe module extras, hooks, an installed mailbox and a
 //!   declared [`Expect`]), the generated two-sink probe module, the [`ProbeMailbox`]
@@ -88,6 +94,7 @@ mod atoms;
 mod bifs;
 mod discovery;
 mod host;
+mod oracle;
 mod probe;
 
 // The facade re-exports the harness's **full** public surface at its original
@@ -105,5 +112,16 @@ pub use bifs::*;
 pub use discovery::*;
 #[allow(unused_imports)]
 pub use host::*;
+// The `oracle` surface is re-exported **by name** rather than by glob: `probe`'s
+// census renderer is also called `render_term` (`&Module` → `String`, the probe
+// report's spelling) while the corpus renderer here is `&ModuleHost` →
+// `Option<String>`, and two glob re-exports of one name would be ambiguous.
+#[allow(unused_imports)]
+pub use oracle::{
+    arg_term, breadth_args, describe_error, parse_breadth_target, parse_error_targets,
+    parse_expected_value, parse_poison, poison_term, render_atom, render_binary, render_float,
+    render_term, split_arg_terms, verify_error, BreadthTarget, ErrorTarget, ErrorVerdict, Expected,
+    ExpectedError, Poison, POISON_ATOM,
+};
 #[allow(unused_imports)]
 pub use probe::*;

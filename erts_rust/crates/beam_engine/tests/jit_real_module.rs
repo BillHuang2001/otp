@@ -18,14 +18,15 @@
 //
 // %CopyrightEnd%
 
-//! **Baseline-JIT tier equivalence on the REAL installed OTP corpus.**
+//! **Baseline-JIT tier equivalence on the REAL installed OTP corpus, checked
+//! against the real system `erl`.**
 //!
 //! `tests/jit.rs` proves the native tier on the vertical slice, `tests/jit_coverage.rs`
 //! on the broad hand-authored `coverage.beam` fixture. This file closes the remaining
 //! question: does the **baseline JIT** (`Tier::BaselineJit`, the x86-64 block back end
 //! in `src/jit/baseline/`) produce results **identical to the interpreter**
-//! (`Tier::Interpreter`) on **real, `erlc`-produced system modules** -- the modules a real
-//! OTP install actually ships?
+//! (`Tier::Interpreter`) -- *and* to the **system `erl`** -- on **real,
+//! `erlc`-produced system modules**, the modules a real OTP install actually ships?
 //!
 //! # What is compared, and why it is a strong claim
 //!
@@ -35,27 +36,49 @@
 //!
 //! * `tests/fixtures/stdlib_breadth_targets.txt` -- 504 happy-path calls over **171**
 //!   distinct installed modules (`lists`, `unicode`, `string`, `calendar`, `zip`, ...),
-//!   each carrying the exact `erl -noshell -eval ...` command that produced its expected
-//!   value;
-//! * `tests/fixtures/error_path_targets.txt` -- 232 error-path calls over **213**
-//!   modules, where the *compiled code itself* raises (`func_info` -> `function_clause`,
-//!   `case_end`, `badmatch`, `badrecord`).
+//!   each carrying the exact `erl -noshell -eval ...` command that produced its
+//!   expected value;
+//! * `tests/fixtures/error_path_targets.txt` -- 232 error-path calls over **215**
+//!   distinct modules, where the *compiled code itself* raises (`func_info` ->
+//!   `function_clause`, `case_end`, `badmatch`, `badrecord`).
 //!
-//! Each call is run **twice over the same loaded module** -- once on `Tier::Interpreter`,
-//! once on `Tier::BaselineJit` -- and the two outcomes must be **the same**:
+//! Each call is run **twice over the same loaded module** -- once on
+//! `Tier::Interpreter`, once on `Tier::BaselineJit` -- and every row makes **two**
+//! assertions:
 //!
-//! * both returned a value, and the values are the same term under `beam_term::cmp` (the
-//!   module's exact `=:=` ordering, so boxed tuples/lists/floats compare by value); or
-//! * both returned a typed [`beam_common::BeamError`], and the errors are the **same
-//!   shape** (`Debug`-identical: class, reason, stacktrace, live-reason presence) -- a
-//!   typed error on one tier and a value on the other **fails**, and two *different*
-//!   typed errors **fail** too.
+//! 1. **The tiers agree with each other.** Both returned a value and the values are the
+//!    same term under `beam_term::cmp` (the module's exact `=:=` ordering, so boxed
+//!    tuples/lists/floats compare by value), or both returned a typed
+//!    [`beam_common::BeamError`] and the errors are the **same shape**
+//!    (`Debug`-identical: class, reason, stacktrace, live-reason presence). A typed
+//!    error on one tier and a value on the other **fails**, and two *different* typed
+//!    errors **fail** too.
+//! 2. **Each tier agrees with the oracle.** The breadth fixture's `expected` column is
+//!    the verbatim `~w` rendering the system `erl` printed for that very call; it is
+//!    parsed back into a **term** (`tests/support/oracle.rs::parse_expected_value`) and
+//!    compared with the engine's result through `beam_term::cmp`. The error-path
+//!    fixture's `expected` column is the *exception* the oracle raises, and
+//!    `tests/support/oracle.rs::verify_error` requires the engine's raise to carry the
+//!    oracle's class (`error`) **and** its reason term.
+//!
+//! A row is counted as *oracle-checked* only when both of those hold on the tier in
+//! question. Tier-vs-tier agreement alone can no longer hide a shared mistake: a value
+//! both tiers got identically **wrong** is now a failure, and so is a raise with a
+//! reason the system `erl` never produces. A tier that answers a **typed gap** (it
+//! cannot execute the call at all -- a documented engine limitation) is printed as a
+//! loud `BLOCKED:` line and counted separately, never silently folded into an
+//! agreement and never treated as a wrong result.
+//!
+//! The corpus parsing, the argument/expectation term builders, the `~w` renderer and
+//! the error comparator are the **one** implementation in `tests/support/oracle.rs`
+//! (shared with the interpreter suites and with the feature-gated Cranelift suite), so
+//! no suite can drift into its own corpus grammar.
 //!
 //! The corpora are curated exactly so this is safe: every call is a real, terminating
 //! call over small representative arguments, so neither tier can loop forever, and the
 //! same calls already run to completion on the interpreter in the two suites above.
-//! Nothing here is guessed -- the *oracle fidelity* of the interpreter is those suites'
-//! job; this suite's job is that the native tier is observationally the interpreter.
+//! Nothing here is guessed -- every expectation was produced by the real system `erl`
+//! (OTP 29 / erts-17.1), and this suite asserts **both** tiers against it.
 //!
 //! # Why the real modules (and not only fixtures)
 //!
@@ -82,6 +105,24 @@
 //! enter a function that does not exist), so it is reported rather than silently averaged
 //! away.
 //!
+//! # What this suite measures today
+//!
+//! Measured on this tree with the `jit-cranelift` feature off
+//! (`cargo test -p beam_engine --test jit_real_module -- --nocapture`):
+//!
+//! ```text
+//! JIT-REAL (breadth): 504 calls; oracle-checked interpreter=504 baseline=504; blocked=0; modules=171; skipped=0
+//! JIT-REAL (error-path): 232 poisoned calls; oracle-checked interpreter=223 baseline=223; blocked=18; modules=215; skipped=0
+//! ```
+//!
+//! So **736** corpus rows run on both tiers and **727** of them (504 + 223) are
+//! oracle-checked on *each* tier. The other **9** error-path rows are the fixture's own
+//! `unsupported` expectation — a documented engine/host gap (`receive_marker_reserve`,
+//! `receive_next`, or a blocking `receive`), printed as `BLOCKED:` lines and counted
+//! (`blocked=18` is those 9 rows on 2 tiers). **No row disagrees with the oracle.** The
+//! per-corpus floors below are the guard: a regression that blocks a row, breaks the two
+//! tiers' agreement, or makes *either* tier disagree with the system `erl` fails the suite.
+//!
 //! # The allocator evidence
 //!
 //! Agreement alone would also hold if the native tier only ever deopted, so
@@ -99,10 +140,14 @@ use std::sync::Arc;
 use beam_common::{BeamError, Result};
 use beam_engine::jit::baseline::BaselineJit;
 use beam_engine::jit::JitBackend;
-use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier, MAX_REGISTER};
+use beam_engine::{available_tiers, Machine, MinimalContext, Tier, MAX_REGISTER};
 use beam_loader::{load_file, Module};
 use beam_term::Eterm;
-use support::{all_otp_ebins, app_ebin, skip_reason, stdlib_ebin, ModuleHost};
+use support::{
+    all_otp_ebins, app_ebin, breadth_args, describe_error, parse_breadth_target,
+    parse_error_targets, parse_expected_value, render_term, skip_reason, stdlib_ebin, verify_error,
+    ErrorTarget, ErrorVerdict, Expected, ModuleHost,
+};
 
 // ---------------------------------------------------------------------------
 // Host + skip guard
@@ -213,7 +258,92 @@ fn compare(host: &ModuleHost, label: &str, interp: &TierRun, jit: &TierRun) -> V
     }
 }
 
-/// Drives one `module:function/args` through **both** tiers and asserts they agree.
+/// What the committed corpus says a target's outcome must be.
+///
+/// The two corpora bake two different kinds of expectation, and each is asserted
+/// **per tier**:
+///
+/// * the breadth corpus bakes a **value** — the verbatim `~w` rendering the system
+///   `erl` printed, parsed back into a term by
+///   [`parse_expected_value`](support::parse_expected_value) and compared with
+///   `beam_term::cmp`;
+/// * the error-path corpus bakes an **exception** — the class and reason term the
+///   system `erl` raises, checked by [`verify_error`](support::verify_error).
+#[derive(Clone, Copy)]
+enum Expectation<'a> {
+    /// The breadth corpus: the oracle's value.
+    Value(&'a Expected),
+    /// The error-path corpus: the oracle's exception.
+    Error(&'a ErrorTarget),
+}
+
+/// One tier's outcome checked against the baked oracle expectation.
+enum OracleCheck {
+    /// The tier reproduced the oracle's value (or its class **and** reason term).
+    Checked,
+    /// The tier answered a typed gap instead of executing the corpus call, so it can
+    /// be compared neither way. Reported loudly and counted, never a failure and never
+    /// an agreement.
+    Blocked(String),
+}
+
+/// How one corpus row fared on both tiers.
+#[derive(Clone, Copy, Debug)]
+struct RowOutcome {
+    /// How the two tiers related to each other.
+    verdict: Verdict,
+    /// Per tier: `true` when that tier's own outcome was asserted against the baked
+    /// oracle expectation. `false` means a counted typed gap (a `BLOCKED:` line).
+    oracle_checked: [bool; 2],
+}
+
+/// Asserts one tier's outcome against the baked oracle expectation.
+///
+/// A disagreement **panics immediately** with the row's label, the tier, both values
+/// and (for the error corpus) the row's own quoted `erl -noshell -eval …` command, so
+/// the failure is reproducible from the message alone.
+fn check_oracle(
+    host: &mut ModuleHost,
+    label: &str,
+    tier: Tier,
+    result: &Result<Eterm>,
+    expected: &Expectation<'_>,
+) -> OracleCheck {
+    match expected {
+        Expectation::Value(expected) => match result {
+            Ok(actual) => {
+                assert!(
+                    expected.matches(host, *actual),
+                    "ORACLE MISMATCH for `{label}` on {tier:?}: the engine returned {}, \
+                     the system erl returns {}",
+                    render_term(host, *actual).unwrap_or_else(|| format!("{actual:?}")),
+                    expected
+                        .render(host)
+                        .unwrap_or_else(|| "<unrenderable>".to_string())
+                );
+                OracleCheck::Checked
+            }
+            Err(error) => OracleCheck::Blocked(format!(
+                "{tier:?}: the oracle returns a value, the engine answered {}",
+                describe_error(error)
+            )),
+        },
+        Expectation::Error(target) => match verify_error(host, result, target) {
+            ErrorVerdict::Matches => OracleCheck::Checked,
+            ErrorVerdict::TypedGap(gap) => {
+                OracleCheck::Blocked(format!("{tier:?}: {gap}"))
+            }
+            ErrorVerdict::Wrong(detail) => panic!(
+                "ORACLE MISMATCH for `{label}` on {tier:?}: {detail}\n  re-derive with: {}",
+                target.oracle
+            ),
+        },
+    }
+}
+
+/// Drives one `module:function/args` through **both** tiers, asserts they agree with
+/// each other, and asserts each tier's own outcome against the baked oracle
+/// expectation.
 ///
 /// `None` means the target could not be driven at all -- the module did not load, or the
 /// module exports no such `function/arity` (the one case in which the two tiers' entry
@@ -225,7 +355,8 @@ fn run_target(
     function: &str,
     args: &[Eterm],
     label: &str,
-) -> Option<Verdict> {
+    expected: &Expectation<'_>,
+) -> Option<RowOutcome> {
     let module = match host.load(module_name) {
         Ok(module) => module,
         Err(error) => {
@@ -253,7 +384,23 @@ fn run_target(
     // stays in scope until the comparison has read both results.
     let interp = run_tier(host, &module, function, arity, args, Tier::Interpreter);
     let jit = run_tier(host, &module, function, arity, args, Tier::BaselineJit);
-    Some(compare(host, label, &interp, &jit))
+    let verdict = compare(host, label, &interp, &jit);
+
+    // ... and then each tier on its own against the real system `erl`.
+    let mut oracle_checked = [false; 2];
+    for (slot, tier, run) in [
+        (0usize, Tier::Interpreter, &interp),
+        (1usize, Tier::BaselineJit, &jit),
+    ] {
+        match check_oracle(host, label, tier, &run.result, expected) {
+            OracleCheck::Checked => oracle_checked[slot] = true,
+            OracleCheck::Blocked(gap) => println!("BLOCKED: {label} -- {gap}"),
+        }
+    }
+    Some(RowOutcome {
+        verdict,
+        oracle_checked,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -273,116 +420,23 @@ const BREADTH_VALUE_FLOOR: usize = 480;
 /// Floor on the number of distinct installed modules reached (measured: 171).
 const BREADTH_MODULE_FLOOR: usize = 171;
 
-/// Parses one `module:function(args) => expected` corpus line; `None` for a comment/blank
-/// line. A malformed *target* line panics (a corpus bug), so a broken fixture can never
-/// be silently skipped.
-fn parse_breadth_target(line: &str) -> Option<(&str, &str, &str)> {
-    let line = line.split("  # oracle:").next().unwrap_or(line).trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let (key, _expected) = line.split_once(" => ").expect("corpus line without ` => `");
-    let (module, rest) = key.split_once(':').expect("corpus key without `:`");
-    let (function, args) = rest.split_once('(').expect("corpus key without `(`");
-    let args = args.strip_suffix(')').expect("corpus key without `)`");
-    Some((module, function, args))
-}
+// The corpus parsing, the argument/term builders and the `~w` renderer are NOT
+// re-defined here: they are the one shared implementation in
+// `tests/support/oracle.rs` (`parse_breadth_target`, `breadth_args`,
+// `parse_expected_value`, `render_term`), which the interpreter suites and the
+// feature-gated Cranelift suite drive too.
 
-/// Splits an argument list on **top-level** commas, respecting `[]`/`{}`/`<<>>` nesting
-/// and `"`-quoted strings.
-fn split_arg_terms(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut start = 0usize;
-    for (index, &byte) in args.as_bytes().iter().enumerate() {
-        match byte {
-            b'"' => in_string = !in_string,
-            b'[' | b'{' | b'<' if !in_string => depth += 1,
-            b']' | b'}' | b'>' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                parts.push(&args[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&args[start..]);
-    parts
-}
-
-/// Builds one corpus argument from its source text: `[]`, `[a,b,c]`, `{a,b}`,
-/// `<<1,2,3>>`, `"abc"`, an integer, an atom (bare or `'quoted'`).
-fn arg_term(host: &mut ModuleHost, text: &str) -> Eterm {
-    let text = text.trim();
-    if let Some(inner) = text.strip_prefix("<<").and_then(|t| t.strip_suffix(">>")) {
-        let bytes: Vec<u8> = if inner.trim().is_empty() {
-            Vec::new()
-        } else {
-            split_arg_terms(inner)
-                .iter()
-                .map(|part| {
-                    part.trim()
-                        .parse::<u8>()
-                        .expect("a corpus binary element is a byte literal")
-                })
-                .collect()
-        };
-        return terms::make_heap_binary(host, &bytes).expect("build the corpus binary argument");
-    }
-    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-        if inner.trim().is_empty() {
-            return beam_term::NIL;
-        }
-        let elements: Vec<Eterm> = split_arg_terms(inner)
-            .iter()
-            .map(|part| arg_term(host, part))
-            .collect();
-        return terms::make_list(host, &elements).expect("build the corpus list argument");
-    }
-    if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
-        let elements: Vec<Eterm> = split_arg_terms(inner)
-            .iter()
-            .map(|part| arg_term(host, part))
-            .collect();
-        return terms::make_tuple(host, &elements).expect("build the corpus tuple argument");
-    }
-    if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-        let chars: Vec<Eterm> = inner
-            .bytes()
-            .map(|byte| beam_term::make_small(i64::from(byte)))
-            .collect();
-        return terms::make_list(host, &chars).expect("build the corpus string argument");
-    }
-    if let Ok(value) = text.parse::<i64>() {
-        return beam_term::make_small(value);
-    }
-    match text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
-        Some(quoted) => host.intern(quoted),
-        None => host.intern(text),
-    }
-}
-
-/// Builds the argument list for a corpus call from its `(<args>)` text; the empty text is
-/// the zero-arity call.
-fn breadth_args(host: &mut ModuleHost, args: &str) -> Vec<Eterm> {
-    if args.trim().is_empty() {
-        return Vec::new();
-    }
-    split_arg_terms(args)
-        .iter()
-        .map(|part| arg_term(host, part))
-        .collect()
-}
-
-/// **The headline measurement: both tiers, every happy-path corpus call.**
+/// **The headline measurement: both tiers, every happy-path corpus call, checked
+/// against the real system `erl`.**
 ///
 /// Runs each of the 504 real calls through the interpreter and the baseline JIT over one
-/// shared host, and requires the outcomes to be identical (same term, or the same typed
-/// error). Prints the aggregate and enforces the floors, so a regression that turns the
-/// native tier into a deopt-only or wrong-value path is caught.
+/// shared host, and requires (a) the two tiers' outcomes to be identical (the same term,
+/// or the same typed error) and (b) **each tier's** outcome to equal the fixture's baked
+/// oracle value. Prints the aggregate and enforces the floors, so a regression that turns
+/// the native tier into a deopt-only path -- or that makes *either* tier return a term the
+/// real Erlang never returns -- is caught.
 #[test]
-fn interpreter_and_baseline_agree_over_the_stdlib_breadth_corpus() {
+fn interpreter_and_baseline_are_oracle_checked_over_the_stdlib_breadth_corpus() {
     if skip_if_unavailable() {
         return;
     }
@@ -390,44 +444,78 @@ fn interpreter_and_baseline_agree_over_the_stdlib_breadth_corpus() {
     let mut values = 0usize;
     let mut errors = 0usize;
     let mut skips = 0usize;
+    let mut checked = [0usize; 2];
     let mut modules: BTreeSet<String> = BTreeSet::new();
 
     for line in BREADTH_TARGETS.lines() {
-        let Some((module, function, args_text)) = parse_breadth_target(line) else {
+        let Some(target) = parse_breadth_target(line) else {
             continue;
         };
-        let args = breadth_args(&mut host, args_text);
-        let label = format!("{module}:{function}({args_text})");
-        match run_target(&mut host, module, function, &args, &label) {
-            Some(Verdict::Value) => {
-                values += 1;
-                modules.insert(module.to_string());
-            }
-            Some(Verdict::Error) => {
-                errors += 1;
-                modules.insert(module.to_string());
+        let args = breadth_args(&mut host, target.args);
+        let expected = parse_expected_value(&mut host, target.expected);
+        let label = target.label();
+        let outcome = run_target(
+            &mut host,
+            target.module,
+            target.function,
+            &args,
+            &label,
+            &Expectation::Value(&expected),
+        );
+        match outcome {
+            Some(row) => {
+                modules.insert(target.module.to_string());
+                match row.verdict {
+                    Verdict::Value => values += 1,
+                    Verdict::Error => errors += 1,
+                }
+                for (slot, is_checked) in row.oracle_checked.iter().enumerate() {
+                    if *is_checked {
+                        checked[slot] += 1;
+                    }
+                }
             }
             None => skips += 1,
         }
     }
 
+    let compared = values + errors;
+    let blocked = compared * 2 - (checked[0] + checked[1]);
+    assert_eq!(
+        blocked, 0,
+        "a breadth corpus row is a typed gap on at least one tier (see the `BLOCKED:` \
+         lines above), so its oracle value could not be checked: this corpus executes on \
+         both tiers today, so a gap here is a regression"
+    );
     println!(
-        "JIT-REAL (breadth): {} real calls compared across interpreter|baseline-jit \
-         ({values} agreed on a value, {errors} agreed on a typed error); \
-         distinct modules reached: {}; skipped: {skips}",
-        values + errors,
+        "JIT-REAL (breadth): {compared} calls; oracle-checked interpreter={} baseline={}; \
+         blocked={blocked}; modules={}; skipped={skips} \
+         ({values} agreed on a value, {errors} agreed on a typed error)",
+        checked[0],
+        checked[1],
         modules.len()
     );
     assert!(
-        values + errors >= BREADTH_COMPARISON_FLOOR,
-        "only {} corpus calls were compared across both tiers (floor \
-         {BREADTH_COMPARISON_FLOOR}); {skips} were skipped",
-        values + errors
+        compared >= BREADTH_COMPARISON_FLOOR,
+        "only {compared} corpus calls were compared across both tiers (floor \
+         {BREADTH_COMPARISON_FLOOR}); {skips} were skipped"
     );
     assert!(
         values >= BREADTH_VALUE_FLOOR,
         "only {values} comparisons agreed on a VALUE (floor {BREADTH_VALUE_FLOOR}) -- the \
          suite must not pass by agreeing only on typed errors"
+    );
+    assert!(
+        checked[0] >= BREADTH_COMPARISON_FLOOR,
+        "only {} breadth calls were oracle-checked on Tier::Interpreter (floor \
+         {BREADTH_COMPARISON_FLOOR})",
+        checked[0]
+    );
+    assert!(
+        checked[1] >= BREADTH_COMPARISON_FLOOR,
+        "only {} breadth calls were oracle-checked on Tier::BaselineJit (floor \
+         {BREADTH_COMPARISON_FLOOR})",
+        checked[1]
     );
     assert!(
         modules.len() >= BREADTH_MODULE_FLOOR,
@@ -454,106 +542,26 @@ const ERROR_RAISE_FLOOR: usize = 200;
 /// Floor on the number of distinct installed modules reached (measured: 215).
 const ERROR_MODULE_FLOOR: usize = 200;
 
-/// The poison argument a target function is called with.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Poison {
-    /// The atom `genesis_poison` (matches no clause).
-    Atom,
-    /// The small integer `7`.
-    Int,
-    /// The empty list `[]`.
-    Nil,
-    /// The empty tuple `{}`.
-    Tuple0,
-}
+// The error-corpus parsing, its poison arguments and the oracle comparator are the one
+// shared implementation in `tests/support/oracle.rs` (`parse_error_targets`,
+// `ErrorTarget::args`, `verify_error`, `describe_error`), which
+// `tests/exceptions_corpus.rs` drives on the interpreter too.
 
-/// One parsed error-corpus line.
-struct ErrorTarget {
-    module: String,
-    function: String,
-    arity: u32,
-    /// One poison per argument (the file's `POISONS` list; its length equals the arity).
-    poisons: Vec<Poison>,
-}
-
-/// Parses the committed error-path corpus, panicking (a test-authoring bug, never runtime
-/// data) on a malformed line.
-fn parse_error_targets() -> Vec<ErrorTarget> {
-    let mut targets = Vec::new();
-    for (index, raw) in ERROR_TARGETS.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // The justification rides in a trailing `# ...` comment.
-        let spec = line.split_once('#').map(|(spec, _)| spec.trim()).unwrap_or(line);
-        let tokens: Vec<&str> = spec.split_whitespace().collect();
-        assert_eq!(
-            tokens.len(),
-            4,
-            "line {}: expected `<module>:<f>/<n> <poisons> => <expected>`, got {spec:?}",
-            index + 1
-        );
-        assert_eq!(tokens[2], "=>", "line {}: missing `=>`: {spec:?}", index + 1);
-        let (module, rest) = tokens[0]
-            .split_once(':')
-            .unwrap_or_else(|| panic!("line {}: no `:` in {:?}", index + 1, tokens[0]));
-        let (function, arity) = rest
-            .split_once('/')
-            .unwrap_or_else(|| panic!("line {}: no `/` in {:?}", index + 1, tokens[0]));
-        let arity: u32 = arity
-            .parse()
-            .unwrap_or_else(|_| panic!("line {}: bad arity in {:?}", index + 1, tokens[0]));
-        let poisons: Vec<Poison> = tokens[1]
-            .split(',')
-            .map(|token| match token {
-                "atom" => Poison::Atom,
-                "int" => Poison::Int,
-                "nil" => Poison::Nil,
-                "tuple0" => Poison::Tuple0,
-                other => panic!("line {}: unknown poison {other:?}", index + 1),
-            })
-            .collect();
-        assert_eq!(
-            poisons.len(),
-            arity as usize,
-            "line {}: {} poison(s) for arity {arity}",
-            index + 1,
-            poisons.len()
-        );
-        targets.push(ErrorTarget {
-            module: module.to_string(),
-            function: function.to_string(),
-            arity,
-            poisons,
-        });
-    }
-    targets
-}
-
-/// Builds one poison argument on `host`'s arena (which outlives the run).
-fn poison_term(host: &mut ModuleHost, poison: Poison) -> Eterm {
-    match poison {
-        Poison::Atom => host.intern("genesis_poison"),
-        Poison::Int => beam_term::make_small(7),
-        Poison::Nil => beam_term::NIL,
-        Poison::Tuple0 => terms::make_tuple(host, &[]).expect("build the empty tuple"),
-    }
-}
-
-/// **The error-path measurement: both tiers, every poisoned corpus call.**
+/// **The error-path measurement: both tiers, every poisoned corpus call, checked
+/// against the real system `erl`.**
 ///
 /// Every target makes the *compiled code itself* raise, so this is the raise/catch/unwind
-/// path's tier equivalence: the native tier must reproduce the interpreter's typed error
-/// exactly (class, reason shape and stacktrace presence), never a value and never a
-/// different error.
+/// path's tier equivalence **and** its oracle fidelity: the native tier must reproduce the
+/// interpreter's typed error exactly (class, reason shape and stacktrace presence), never
+/// a value and never a different error, and each tier's raise must carry the class and
+/// reason term the system `erl` produces.
 #[test]
-fn interpreter_and_baseline_agree_over_the_real_error_path_corpus() {
+fn interpreter_and_baseline_are_oracle_checked_over_the_real_error_path_corpus() {
     if skip_if_unavailable() {
         return;
     }
     let mut host = host();
-    let targets = parse_error_targets();
+    let targets = parse_error_targets(ERROR_TARGETS);
     assert!(
         targets.len() >= ERROR_COMPARISON_FLOOR,
         "the error-path corpus shrank: {} < {ERROR_COMPARISON_FLOOR}",
@@ -564,32 +572,45 @@ fn interpreter_and_baseline_agree_over_the_real_error_path_corpus() {
     let mut raised = 0usize;
     let mut values = 0usize;
     let mut skips = 0usize;
+    let mut checked = [0usize; 2];
     let mut modules: BTreeSet<String> = BTreeSet::new();
 
     for target in &targets {
-        let args: Vec<Eterm> = target
-            .poisons
-            .iter()
-            .map(|poison| poison_term(&mut host, *poison))
-            .collect();
+        let args = target.args(&mut host);
         let label = target.label();
-        match run_target(&mut host, &target.module, &target.function, &args, &label) {
-            Some(verdict) => {
+        let outcome = run_target(
+            &mut host,
+            &target.module,
+            &target.function,
+            &args,
+            &label,
+            &Expectation::Error(target),
+        );
+        match outcome {
+            Some(row) => {
                 compared += 1;
                 modules.insert(target.module.clone());
-                match verdict {
+                match row.verdict {
                     Verdict::Error => raised += 1,
                     Verdict::Value => values += 1,
+                }
+                for (slot, is_checked) in row.oracle_checked.iter().enumerate() {
+                    if *is_checked {
+                        checked[slot] += 1;
+                    }
                 }
             }
             None => skips += 1,
         }
     }
 
+    let blocked = compared * 2 - (checked[0] + checked[1]);
     println!(
-        "JIT-REAL (error-path): {compared} poisoned calls compared across \
-         interpreter|baseline-jit ({raised} agreed on a raise/typed error, \
-         {values} agreed on a value); distinct modules reached: {}; skipped: {skips}",
+        "JIT-REAL (error-path): {compared} poisoned calls; oracle-checked \
+         interpreter={} baseline={}; blocked={blocked}; modules={}; skipped={skips} \
+         ({raised} agreed on a raise/typed error, {values} agreed on a value)",
+        checked[0],
+        checked[1],
         modules.len()
     );
     assert!(
@@ -603,17 +624,24 @@ fn interpreter_and_baseline_agree_over_the_real_error_path_corpus() {
          {ERROR_RAISE_FLOOR}) -- the raise path's tier equivalence is not exercised"
     );
     assert!(
+        checked[0] >= ERROR_RAISE_FLOOR,
+        "only {} error-path calls were oracle-checked on Tier::Interpreter (floor \
+         {ERROR_RAISE_FLOOR}) -- {blocked} tier outcome(s) were typed gaps (see the \
+         `BLOCKED:` lines above)",
+        checked[0]
+    );
+    assert!(
+        checked[1] >= ERROR_RAISE_FLOOR,
+        "only {} error-path calls were oracle-checked on Tier::BaselineJit (floor \
+         {ERROR_RAISE_FLOOR}) -- {blocked} tier outcome(s) were typed gaps (see the \
+         `BLOCKED:` lines above)",
+        checked[1]
+    );
+    assert!(
         modules.len() >= ERROR_MODULE_FLOOR,
         "only {} distinct installed modules were reached (floor {ERROR_MODULE_FLOOR})",
         modules.len()
     );
-}
-
-impl ErrorTarget {
-    /// The `<module>:<function>/<arity>` label used in the report.
-    fn label(&self) -> String {
-        format!("{}:{}/{}", self.module, self.function, self.arity)
-    }
 }
 
 // ---------------------------------------------------------------------------
