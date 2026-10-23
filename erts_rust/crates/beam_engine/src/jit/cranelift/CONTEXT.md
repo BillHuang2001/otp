@@ -39,8 +39,21 @@ chain is unchanged. Since the tier caches **no** x-registers across instructions
 correct by construction.
 
 `run_resume_outcome` remains a typed `error::unsupported("cranelift jit: cannot resume at an arbitrary
-pc (the cranelift tier has no resume entry point)")`: unlike first entry it is handed **no** compiled
-artifact and the tier has no path that would compile and bind one at a parked address on demand.
+pc (the cranelift tier has no resume entry point)")` (`mod.rs:326-336`): unlike first entry it is handed
+**no** compiled artifact and the tier has no path that would compile and bind one at a parked address on
+demand.
+What a resume needs is **plumbing, not new codegen**: the only structural gap is that nothing keeps a
+`CompiledFunctions` alive across a park — `run_outcome`/`run_label_outcome` compile a fresh artifact per
+call and drop it on return (`mod.rs:271-312`), so a resume has neither an artifact nor a label map.
+The reusable pieces already exist: `CompiledFunctions::entry`/`is_enterable` (`mod.rs:456,472`), the
+`emit_pc_entry_dispatch` prologue (`codegen.rs:829`) that gives one native entry per function
+dispatching over `candidate_pcs` (`codegen.rs:870`), `Machine::label_map` (`machine/mod.rs:1220` — the
+fallback `enter_machine` already uses when `NativeCode::labels` answers `None`, `../baseline/mod.rs:759-762`),
+and the shared driver `baseline::drive` (`../baseline/mod.rs:1027`) behind a `CompiledEntries`. The
+shape to copy is `baseline::run_compiled_resume_outcome` (`../baseline/mod.rs:507-524`:
+`reset_reductions` → `enter_run` → `drive`). No per-`pc` stub and no compile-on-demand is required: a
+suspension address outside `candidate_pcs` (the `wait` pc) would simply take the driver's
+per-instruction step (`../baseline/mod.rs:1304-1332`).
 
 ## Inline set relative to the baseline
 **A far narrower subset than the baseline's — and nothing here raises.** Every `Instr` the `match` in
