@@ -1292,11 +1292,13 @@ pub(crate) fn ensure_heap_full(
         return Ok(());
     }
     let pid = ctx.mailbox_pid;
-    let forced = ctx.runtime.gc_request_pending(pid);
-    if !ctx.runtime.gc_process_enabled(pid) {
-        ctx.runtime.take_gc_request(pid);
-        return Ok(());
-    }
+    // The two **context-field** tests come first because they are the cheapest possible reads — a
+    // discriminant each — while `gc_request_pending`/`gc_process_enabled` each probe the runtime's
+    // valve sets (three empty-set length compares in the common case, a hash otherwise) and the
+    // process table is a `HashMap` lookup. Both tests are **pure reads** that return `Ok(())`
+    // without touching any runtime state, so their position here is a cost decision, never a
+    // verdict one: every path below still reaches the same gates in the same order.
+    //
     // The door needs a caller module to name at all — a fun entry, or the `-eval` evaluator,
     // has none — and is otherwise left alone. This is **not** a float guard: this door publishes
     // each register file's pointer-bearing prefix ([`publish_roots_full`]), the FR file's
@@ -1304,6 +1306,16 @@ pub(crate) fn ensure_heap_full(
     // prefix — is relocated like any other root and a float-using call site collects exactly like
     // a float-free one (see the module docs' float-guard section).
     if ctx.current_module.is_none() {
+        return Ok(());
+    }
+    // A table-less context (the `-eval` evaluator, the boot drive) has no process to collect for.
+    // Pure field read, same argument as above.
+    if ctx.mailbox_table.is_none() {
+        return Ok(());
+    }
+    let forced = ctx.runtime.gc_request_pending(pid);
+    if !ctx.runtime.gc_process_enabled(pid) {
+        ctx.runtime.take_gc_request(pid);
         return Ok(());
     }
     let RuntimeContext {

@@ -677,7 +677,10 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_pid: *mailbox_pid,
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
-                    current_module: caller_module.clone(),
+                    // **Borrowed**, never cloned: the caller's recorded module must survive this
+                    // call (a later `load_nif/2` reads it) and an owned copy would cost a
+                    // `malloc`+`memcpy` per registered BIF call for a name most arms never read.
+                    current_module: caller_module.as_deref(),
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
@@ -821,7 +824,10 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_pid: *mailbox_pid,
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
-                    current_module: caller_module.clone(),
+                    // **Borrowed**, never cloned — this is the arm the overwhelming majority of
+                    // registered calls take, so an owned copy of a name it only forwards to a
+                    // nested context would be one `malloc`+`memcpy`+`free` per BIF call.
+                    current_module: caller_module.as_deref(),
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
@@ -1686,7 +1692,16 @@ impl<'a> RuntimeContext<'a> {
             // `is_empty()` (a length compare) short-circuits *before* the `HashMap` SipHash of
             // the module name that `lookup` pays on this fast path.
             let nifs = self.runtime.nifs.borrow();
-            if nifs.is_empty() || !nifs.lookup(module, function, arity) {
+            if nifs.is_empty() {
+                return Ok(None);
+            }
+            // The diagnostic counter for "the NIF probe actually ran": bumped **here**, on this
+            // borrow, because it is the one place the registry's emptiness is read on the dispatch
+            // path. `call_bif_routed` used to pay a second, redundant `RefCell` borrow per call
+            // purely to feed it (the borrow was the `if`'s argument expression, so it happened even
+            // with the counters OFF).
+            perf_counters::bump(|c| &mut c.nif_probe);
+            if !nifs.lookup(module, function, arity) {
                 return Ok(None);
             }
         }
@@ -1802,11 +1817,11 @@ impl RuntimeContext<'_> {
     ) -> Result<Eterm> {
         // A loaded NIF library wins over every other route: a NIF replaces the Erlang stub of
         // the same `{module, function, arity}`. On a miss this is a no-op (`Ok(None)`).
+        //
+        // No registry borrow is taken *here*: `try_call_nif` opens its own and bumps the
+        // `nif_probe` counter on it, so this line costs one call rather than a borrow plus a call.
         perf_counters::bump(|c| &mut c.call_bif);
         perf_counters::note_key(module, function, arity);
-        if !self.runtime.nifs.borrow().is_empty() {
-            perf_counters::bump(|c| &mut c.nif_probe);
-        }
         if let Some(term) = self.try_call_nif(module, function, arity, args)? {
             perf_counters::bump(|c| &mut c.nif_hit);
             return Ok(term);

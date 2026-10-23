@@ -38,9 +38,48 @@ use std::collections::HashMap;
 
 /// Whether the counters are on (`BEAM_RT_PERF_COUNTERS` set to anything non-empty).
 pub(crate) fn enabled() -> bool {
+    // A unit test cannot turn the shipping gate on for itself: the gate is a process-wide
+    // `OnceLock`, already `false` by the time any test runs (every dispatch site reads it). The
+    // thread-local override is test-only and read first, so a test can observe **this thread's**
+    // counters without touching any other test's.
+    #[cfg(test)]
+    if test_override::forced() {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("BEAM_RT_PERF_COUNTERS").is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// Test-only override of [`enabled`], scoped to the calling thread.
+#[cfg(test)]
+pub(crate) mod test_override {
+    use core::cell::Cell;
+    thread_local! {
+        /// Whether this thread's counters were forced on by a test.
+        static FORCED: Cell<bool> = Cell::new(false);
+    }
+    /// Whether this thread forced the counters on.
+    pub(crate) fn forced() -> bool {
+        FORCED.with(Cell::get)
+    }
+    /// Force this thread's counters on (`true`) or back off (`false`).
+    pub(crate) fn force(on: bool) {
+        FORCED.with(|cell| cell.set(on));
+    }
+}
+
+/// Test-only: this thread's `(call_bif, nif_probe)` counts, read under
+/// [`test_override::force`]-`n` so a case can assert a **delta** across one call.
+///
+/// Nothing in the shipping build can read the counters (they exist to be printed by the
+/// thread-local's `Drop`), so this is the one way to pin their accounting from a unit test.
+#[cfg(test)]
+pub(crate) fn probe_counts() -> (u64, u64) {
+    COUNTERS.with(|counters| {
+        let counters = counters.borrow();
+        (counters.call_bif, counters.nif_probe)
     })
 }
 

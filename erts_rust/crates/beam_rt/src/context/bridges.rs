@@ -133,7 +133,14 @@ pub(super) struct FunBridge<'a> {
     pub(super) may_pump_scheduler: bool,
     /// The outer call's executing-module name, inherited so a nested call keeps the same
     /// call-site identity (see [`RuntimeContext::current_module`]).
-    pub(super) current_module: Option<String>,
+    ///
+    /// **Borrowed** from the outer context rather than owned: [`RuntimeContext::call_registered`]
+    /// builds this bridge on every registered BIF call — the arm below is the fallback, so it
+    /// sees nearly all of them — and an owned copy would put one `malloc`+`memcpy`+`free` on that
+    /// path for a name only a *nested* call ([`FunBridge::nested`]) actually consumes. It is also
+    /// why the outer context's field is untouched by the call: a later `erlang:load_nif/2` in the
+    /// same module still reads its own call site.
+    pub(super) current_module: Option<&'a str>,
     /// The outer call's [`RuntimeContext::engines`] view, inherited so a nested
     /// `process_info/2` execution-position item still reads the pass's other processes.
     pub(super) engines: Option<&'a crate::runner::RunnerState>,
@@ -185,7 +192,9 @@ impl<'a> FunBridge<'a> {
             mailbox_pid: self.mailbox_pid,
             mailbox_table: self.mailbox_table.as_deref_mut(),
             may_pump_scheduler: self.may_pump_scheduler,
-            current_module: self.current_module.clone(),
+            // The nested context **owns** its name (it outlives this borrow), so this is the one
+            // place the caller's call site is materialized — a fun application, not a dispatch.
+            current_module: self.current_module.map(str::to_string),
             engines: self.engines,
             // A nested run starts with no copy-out hint: the outer context's learned graph
             // sizes are the outer process's, and this delivery/apply builds its own results.
@@ -333,8 +342,10 @@ pub(super) struct SendBridge<'a> {
     /// The outer call's scheduler-pump permission (a `send` never pumps the scheduler, but
     /// the nested context is built with the caller's identity intact).
     pub(super) may_pump_scheduler: bool,
-    /// The outer call's executing-module name (see [`RuntimeContext::current_module`]).
-    pub(super) current_module: Option<String>,
+    /// The outer call's executing-module name, **borrowed** from the outer context (see
+    /// [`FunBridge::current_module`]): an owned copy here would be an allocation on every
+    /// `erlang:send/2` for a name only the nested delivery context reads.
+    pub(super) current_module: Option<&'a str>,
     /// The outer call's [`RuntimeContext::engines`] view (see [`FunBridge::engines`]).
     pub(super) engines: Option<&'a crate::runner::RunnerState>,
 }
@@ -386,7 +397,9 @@ impl SendHook for SendBridge<'_> {
                         mailbox_pid: self.mailbox_pid,
                         mailbox_table: self.mailbox_table.as_deref_mut(),
                         may_pump_scheduler: self.may_pump_scheduler,
-                        current_module: self.current_module.clone(),
+                        // The nested context **owns** its name; the dispatch that built this
+                        // bridge only borrowed it (see [`FunBridge::current_module`]).
+                        current_module: self.current_module.map(str::to_string),
                         engines: self.engines,
                         copy_out_hint: 0,
                         // A **nested** run: the delivery itself allocates no roots to
@@ -427,7 +440,8 @@ impl SendHook for SendBridge<'_> {
                     mailbox_pid: self.mailbox_pid,
                     mailbox_table: self.mailbox_table.as_deref_mut(),
                     may_pump_scheduler: self.may_pump_scheduler,
-                    current_module: self.current_module.clone(),
+                    // The nested context **owns** its name (see [`FunBridge::current_module`]).
+                    current_module: self.current_module.map(str::to_string),
                     engines: self.engines,
                     copy_out_hint: 0,
                     gc_armed: false,
@@ -480,7 +494,8 @@ impl SendHook for SendBridge<'_> {
             mailbox_pid: self.mailbox_pid,
             mailbox_table: self.mailbox_table.as_deref_mut(),
             may_pump_scheduler: self.may_pump_scheduler,
-            current_module: self.current_module.clone(),
+            // The nested context **owns** its name (see [`FunBridge::current_module`]).
+            current_module: self.current_module.map(str::to_string),
             engines: self.engines,
             copy_out_hint: 0,
             gc_armed: false,

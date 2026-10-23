@@ -32,7 +32,7 @@ use crate::context::test_support::{
     compile_fixtures, find_on_path, resolve_erlc, resolve_oracle, run_oracle_probe_exact,
     skip_loudly,
 };
-use crate::native::test_support::remote_pid;
+use crate::native::test_support::{chars, remote_pid};
 use crate::runtime::GcStatsSnapshot;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
@@ -10067,5 +10067,187 @@ fn the_local_call_module_guard_is_equivalent_to_the_two_predicates() {
     assert!(
         zlib_hits > 0,
         "at least one zlib stub is served through the guard, saw {zlib_hits}"
+    );
+}
+// ---------------------------------------------------------------------------------------
+// Per-call fast paths: the caller's module name and the NIF probe
+// ---------------------------------------------------------------------------------------
+/// **`enter_module` reuses the recorded buffer** instead of allocating a fresh `String` per
+/// cross-module entry.
+///
+/// The seam runs on **every** in-machine cross-module entry (the engine's `enter_module` on
+/// `resolve_external_call`'s verdict), so a tight loop calling another module's exported function
+/// would otherwise pay one `malloc`+`free` per call. The recorded **value** may not change: the
+/// field is what the NIF-loading, record-source, send and fun-caller arms hand their bridge, and a
+/// wrong or missing name changes which call site a `load_nif/2` sees.
+///
+/// Two properties are pinned — the value is the module's own name on every entry, and the bytes
+/// are the ones the **first** entry allocated (`clear` + `push_str`). The pointer/ capacity
+/// assertions are one-way: a reused buffer answers the same address by construction, so they can
+/// only fail on a rewritten `Some(name.to_string())` assignment, never spuriously.
+#[test]
+fn enter_module_records_the_name_and_reuses_the_buffer() {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the integer fixture loads into the code server");
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let ints = rt
+        .code_server()
+        .module_handle("gc_ints")
+        .expect("cached under its own name");
+    let floats = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("cached under its own name");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.current_module.is_none(),
+        "a fresh context has entered no module"
+    );
+    ctx.enter_module(&ints);
+    assert_eq!(
+        ctx.current_module.as_deref(),
+        Some("gc_ints"),
+        "the first entry records the module's own name"
+    );
+    // Growing into a longer name is the one entry allowed to reallocate; every later entry —
+    // shorter or not — writes into that buffer.
+    ctx.enter_module(&floats);
+    assert_eq!(ctx.current_module.as_deref(), Some("gc_floats"));
+    let (buffer, capacity) = {
+        let recorded = ctx.current_module.as_ref().expect("a recorded name");
+        (recorded.as_ptr(), recorded.capacity())
+    };
+    for round in 0..2 {
+        ctx.enter_module(&ints);
+        let recorded = ctx.current_module.as_ref().expect("a recorded name");
+        assert_eq!(
+            recorded.as_str(),
+            "gc_ints",
+            "round {round}: a shorter name is recorded exactly"
+        );
+        assert_eq!(
+            (recorded.as_ptr(), recorded.capacity()),
+            (buffer, capacity),
+            "round {round}: the shorter name is written into the existing buffer"
+        );
+        ctx.enter_module(&floats);
+        let recorded = ctx.current_module.as_ref().expect("a recorded name");
+        assert_eq!(recorded.as_str(), "gc_floats", "round {round}: and back");
+        assert_eq!(
+            (recorded.as_ptr(), recorded.capacity()),
+            (buffer, capacity),
+            "round {round}: a name the buffer already holds does not grow or move it"
+        );
+    }
+}
+/// **The dispatch arms still see the caller's recorded module, and leave it in place.**
+///
+/// [`RuntimeContext::current_module`] is read by the dispatch arms' bridges (`NifBridge` forwards
+/// it to `erlang:load_nif/2`, the fun-caller arm inherits it for a nested call) and by the
+/// engine's call-site guard *after* the call, so an arm may neither consume nor rewrite it. The
+/// two arms that used to take an **owned** copy per call now **borrow** it; this case pins both
+/// halves of the behaviour the borrow replaced.
+///
+/// The observation channel is `load_nif/2`'s own use of the name: `prim_tty` is ERTS's statically
+/// linked library, so loading it answers the oracle's `ok` without touching the filesystem — the
+/// name can only have crossed the seam if the arm forwarded the caller's, and any other name makes
+/// the very same call fail to `dlopen` and answer `{error,{load_failed,…}}`.
+#[test]
+fn the_dispatch_arms_still_see_the_callers_recorded_module() {
+    let mut rt = runtime();
+    let ok = crate::native::test_support::atom(&mut rt, "ok");
+    let list = chars(&mut rt, "ab");
+    let path = chars(&mut rt, "/nonexistent/beam_rt_probe_lib");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    // The fun-caller arm — the fallback nearly every registered call takes.
+    ctx.current_module = Some(GC_CALL_SITE.to_string());
+    let reversed = ctx
+        .call_bif("lists", "reverse", 1, &[list])
+        .expect("lists:reverse/1");
+    assert_eq!(
+        terms::list_elements(reversed).expect("a proper list"),
+        vec![make_small('b' as i64), make_small('a' as i64)],
+        "the result of a call through the borrowed arm"
+    );
+    assert_eq!(
+        ctx.current_module.as_deref(),
+        Some(GC_CALL_SITE),
+        "the fun-caller arm borrows the recorded module: it neither consumes nor rewrites it"
+    );
+    // The NIF-loading arm, with the caller's name being a built-in library's.
+    ctx.current_module = Some("prim_tty".to_string());
+    let loaded = ctx
+        .call_bif("erlang", "load_nif", 2, &[path, NIL])
+        .expect("load_nif/2 answers a term; a load failure is returned, never raised");
+    assert_eq!(
+        loaded, ok,
+        "the caller's own module name reached the loader and resolved the static library"
+    );
+    assert_eq!(
+        ctx.current_module.as_deref(),
+        Some("prim_tty"),
+        "the NIF-loading arm leaves the recorded module in place"
+    );
+    // The control: the identical call under a name that is no built-in library cannot `dlopen`
+    // the path, so the `ok` above can only have come from the caller's name crossing the seam.
+    ctx.current_module = Some("beam_rt_not_a_builtin_library".to_string());
+    let failed = ctx
+        .call_bif("erlang", "load_nif", 2, &[path, NIL])
+        .expect("a load failure is returned as {error, {Reason, Text}}");
+    assert_ne!(failed, ok, "an unknown library does not resolve");
+    assert_eq!(
+        terms::tuple_arity(failed).expect("the {error, {Reason, Text}} tuple"),
+        2,
+        "the oracle's answer shape"
+    );
+    let inner = terms::tuple_element(failed, 1).expect("in range");
+    assert_eq!(
+        terms::tuple_arity(inner).expect("the {Reason, Text} pair"),
+        2,
+        "the inner pair names the reason and the loader's text"
+    );
+    assert_eq!(
+        ctx.current_module.as_deref(),
+        Some("beam_rt_not_a_builtin_library"),
+        "a failed load leaves the recorded module in place too"
+    );
+}
+/// **The `nif_probe` counter keeps its meaning: it ticks only when the NIF probe really ran.**
+///
+/// `call_bif` used to pay a second, redundant `RefCell` borrow of the NIF registry purely to feed
+/// this counter (as the `if`'s argument expression, so even with the counters off). The counter
+/// now ticks inside [`RuntimeContext::try_call_nif`]'s own borrow, immediately after its
+/// `is_empty` test — so a runtime with no library loaded must count one `call_bif` and **zero**
+/// probes, and a ticking probe would mean the emptiness gate had moved above the bump.
+///
+/// The counters are env-gated by a process-wide `OnceLock` (already collapsed once any other test
+/// has dispatched a BIF), so this case forces them on for its own thread and reads its own
+/// thread-local counts — the only way a unit test can observe an accounting claim.
+#[test]
+fn the_nif_probe_counter_never_ticks_without_a_loaded_library() {
+    use super::calls::perf_counters;
+    let mut rt = runtime();
+    assert!(
+        rt.nifs.borrow().is_empty(),
+        "premise: nothing calls `erlang:load_nif/2` here, so the registry is empty"
+    );
+    let list = chars(&mut rt, "ab");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    perf_counters::test_override::force(true);
+    let (calls_before, probes_before) = perf_counters::probe_counts();
+    let answer = ctx.call_bif("lists", "reverse", 1, &[list]);
+    let (calls_after, probes_after) = perf_counters::probe_counts();
+    perf_counters::test_override::force(false);
+    answer.expect("lists:reverse/1");
+    assert_eq!(
+        calls_after,
+        calls_before + 1,
+        "the probe's own test needs the counter it reads: exactly one `call_bif` entry"
+    );
+    assert_eq!(
+        probes_after, probes_before,
+        "an empty NIF registry is answered by `is_empty` before the probe counter ticks"
     );
 }

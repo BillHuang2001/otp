@@ -569,13 +569,23 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A module whose atom table cannot name itself records the empty name, exactly as
     /// [`RuntimeContext::run_export`]'s `unwrap_or_default` does — never a guessed one.
+    ///
+    /// # No allocation per entry
+    ///
+    /// The recorded name is written into the **existing** buffer whenever there already is one
+    /// (`clear` + `push_str`), so an in-machine cross-module entry — a tight loop calling another
+    /// module's exported function — pays no `malloc`/`free` per call; only the very first entry of
+    /// a context allocates. The recorded value is byte-identical either way: same
+    /// `Option<String>` contents, and a context that had never entered a module stays `None`.
     pub(crate) fn enter_module(&mut self, module: &Module) {
-        self.current_module = Some(
-            module
-                .atom_name(module.name)
-                .unwrap_or_default()
-                .to_string(),
-        );
+        let name = module.atom_name(module.name).unwrap_or_default();
+        match &mut self.current_module {
+            Some(current) => {
+                current.clear();
+                current.push_str(name);
+            }
+            None => self.current_module = Some(name.to_string()),
+        }
     }
 
     /// The name of the module whose **code** is executing, or `None` when no compiled module
