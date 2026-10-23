@@ -114,7 +114,7 @@ Inside the action `self()` is **not** the pid registered as `init`, `erlang:proc
 The child is spawned into the runtime's own process table the way the never-enqueued service stand-ins are and takes the root process's group leader (so `erlang:group_leader/0` is unchanged).
 When the action ends the result is copied onto the runtime's stable arena **before** the child exits, and the child then dies through the real process-death path (`beam_process::ProcessTable::terminate`, reason `normal`, running the exit observer) — never a silent removal, which would free the heap the returned term points into.
 Its death leaves no table entry, so `erlang:processes/0`, `system_info(process_count)` and the `+JPperf` map describe the node the action left.
-The boot script still runs **first** on the runtime's own root process, which stays registered as `init`; the action's identity is the only thing that moves, so `whereis(init)`, `process_info(init, …)`, `which_applications/0` and `init:get_status/0` keep answering the root.
+The boot script still runs **first** on the runtime's own root process; the action's identity is the only thing that moves, so `whereis(init)`, `process_info(init, …)`, `which_applications/0` and `init:get_status/0` keep answering what they answered before. `whereis(init)` is the **`init` stand-in** (`Runtime::init_pid`, `<0.0.0>`) — the pid the root also reports as its `parent` — never the root process (`<0.1.0>`), which holds no registered name.
 `run <file.beam>` (`Action::RunFile`) is unchanged: it runs its own scheduled process through `Runtime::run_scheduled`.
 
 ## `ERL_*FLAGS` — the environment merge
