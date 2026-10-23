@@ -33,12 +33,12 @@ The engine consults the seam **first**: on `Some` it places the closure's free v
 Entering an external fun in the calling process (as C's `call_fun` does) is what lets `gen_server`'s `fun Mod:handle_call/3` callback suspend *this* process (`RunOutcome::Wait`).
 **Resume contract:** `resume_outcome` takes the run's ENTRY module; the suspended `(func, pc)` live in `Machine::context`, and `reset` — not `resume_outcome` — clears contexts; a fun-bodied process entry resolves its own `LocalFunTarget` once and enters via `run_label_outcome_with_tier`.
 **The heap seams.** `alloc_words`/`alloc_words_rooted`/`heap_available` (`gc.rs`) serve a scheduled process from its **own** young heap: both allocation seams meet a **capacity** refusal of the bump with the no-relocation `Process::grow_nursery` and a retried bump (and only then fall back), while the unrooted `alloc_words` is handed no root set and **never collects**.
-`alloc_words_rooted` serves the overwhelming majority of blocks from a **valve-free bump fast arm** (`plain_bump`, `gc.rs:281`): with a `mailbox_table` and a `current_module` present and no GC request armed, it bumps the pid's own young frontier — one arityval header plus up to 32 `NIL` placeholders from a static, non-root fill, with no `Result` built and no `Runtime::gc_process_enabled` read — because a bump moves nothing, so the collector valves cannot change its answer.
+`alloc_words_rooted` serves the overwhelming majority of blocks from a **valve-free bump fast arm** (`plain_bump`, `gc.rs:300`): with a `mailbox_table` and a `current_module` present and no GC request armed, it bumps the pid's own young frontier — one arityval header plus up to 32 `NIL` placeholders from a static, non-root fill (**a constant-length one for `n ∈ {1,2,3}`**, so the placeholder write is a store rather than a `memcpy` call), with no `Result` built and no `Runtime::gc_process_enabled` read — because a bump moves nothing, so the collector valves cannot change its answer. Everything the door does past that arm is a `#[cold] #[inline(never)]` continuation.
 `alloc_words_rooted` additionally collects over the machine's handed-in root set when the retried bump still fails or a forced request bypassed it.
 The engine's doors (`ensure_heap`/`ensure_heap_full`, sharing `collect_or_grow`) collect and grow the nursery to fit an oversized request (`Process::ensure_capacity`, when `HeapPolicy::next_words(need,0) >= need`; a bounded `+hmax` below it falls back to `Process::collect()`) — see *Known Issues* for the arena fallback and its soundness valve.
 **Registry precedence (gotcha).** The native floor runs *before* the registry (a `beam_bifs` entry can never shadow a floor-served key) and the registry *before* the external-module load; a registration shadows the fallback for a non-`erlang` name, while an `erlang:*` one flips the unregistered answer — bare `error::undef`, or `unsupported` when curated in `error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`.
 ### The dispatch memo · `DispatchHooks`
-`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped per-context memo of `DISPATCH_MEMO_SLOTS = 128` slots (`dispatch.rs:53`, the count grew from 8 because `compile:file/2`'s 241-key hot set evicted itself at 8) holding a boxed `{bif: Option<BifFn>, hooks: DispatchHooks}` per slot — the slots are inline (`slots: [Option<Box<DispatchEntry>>; 128]`), so a fresh per-applied-fun context carries ~1 KiB of `None` slots and allocates a box only on a miss, where `hooks` is **one boolean per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates) and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
+`dispatch(module, function, arity)` is the **only** producer of a registered call's dispatch answer: a direct-mapped per-context memo of `DISPATCH_MEMO_SLOTS = 128` slots (`dispatch.rs:53`, the count grew from 8 because `compile:file/2`'s 241-key hot set evicted itself at 8) holding a boxed `{bif: Option<BifFn>, hooks: DispatchHooks}` per slot — the slots are inline (`slots: [Option<Box<DispatchEntry>>; 128]`), so a fresh per-applied-fun context carries ~1 KiB of `None` slots and allocates a box only on a miss, where `hooks` is **one bit per `uses_*` predicate** (the eight mutually-exclusive bridge-arm selectors plus the `fun_identity`/`memory_hook`/`export_gate` build gates), packed into a `DispatchHooks(u16)` so the whole `{bif, hooks}` answer is 16 bytes and crosses its call boundaries in registers, and `bif` is the `BifRegistry` lookup the caller then invokes **directly** (no second lookup); `call_registered` is reached only on `Some`.
 A cached answer can never go stale: the one mutable input, the **NIF registry**, is deliberately not memoized (`call_bif` runs `try_call_nif` first on every call).
 In front of the slot hash sits a **one-entry MRU hint** (`DispatchMemo::last`, the slot the previous `dispatch` resolved), because the fold is the prologue's largest self cost and a real workload repeats one key: on `bench_gc_bound:churn/1` (20 000 rounds) 98.9 % of all BIF calls are `erlang:rem/2` and the memo reports 5 145 218 hits of 5 176 023 calls. The hint answers only after the memo's own **full field-for-field key equality** (`DispatchEntry::matches`, the same test the hashed slot's hit path uses), so a hint naming a slot that holds another key (or one overwritten since) falls through to the hash: it can only skip work, never change an answer, and `tests.rs::the_mru_hint_in_front_of_the_slot_hash_never_answers_for_another_key` pins the sequence, the re-warmed hint and both counter outcomes.
 The BIF-result gate `calls.rs::open_gate_for_foreign_result` — the one thing `call_bif` observes about a result before the copy-out — is **shape-tested before the process-table probe** (`gc::result_may_be_foreign`: pointer-bearing, non-literal, dereferenceable), so an immediate result never reads the process; the rejected words are exactly the ones `gc::word_region` answers `None` for, so the verdict is unchanged.
@@ -145,10 +145,14 @@ The GC/heap-model ledger is [`../../M1_GAPS_GC.md`](../../M1_GAPS_GC.md), the ca
 ## Measured per-call cost of a registered BIF — and the levers left
 ### The per-call instruction budget
 
-**Estimator: a two-point ablation, never `I(N) − I(0)`.** Startup is **2 706 344 834 ± 0.1 %**
-instructions on this host, which swamps any per-call signal. So each fixture carries two entry
-points one BIF call apart (`F1` is the loop, `F2` is the loop plus exactly one call), and
-`C(key) = I(F2) − I(F1)` at N = 1 000 000; `L = 2·I(F1) − I(F2)` is the loop overhead.
+**Estimator: a two-point ablation, never `I(N) − I(0)`.** Startup is **≈2.70 G ± 0.05 %**
+instructions on this host (`2 704 063 000` pre-wave and `2 699 459 000` post-wave, four paired
+`N=0` rounds each; the earlier probe read `2 706 344 834 ± 0.1 %`), which swamps any per-call
+signal. So each fixture carries two entry points one BIF call apart (`F1` is the loop, `F2` is the
+loop plus exactly one call), and `C(key) = I(F2) − I(F1)` at N = 1 000 000; `L = 2·I(F1) − I(F2)`
+is the loop overhead. A **paired** estimator — the same binary at `N` and at `0` sampled back to
+back inside one round, differenced, never two separate means — is the right one for a *run-level*
+total (`churn`), where the startup cost is 10 % of the signal rather than 1000×.
 
 **Pinning is mandatory.** This host is a hybrid Intel Core Ultra 7 356H (`cpu_core` = 0-3,
 `cpu_atom` = 4-15), so `instructions:u` emits **two** PMU instances and an unpinned run drifts by a
@@ -169,16 +173,20 @@ loop body, not a call. Any "registered call" figure must come from a key the com
 inline, which is why `rem`/`div` (a `Big::div_rem` for a variable operand) and the `binconv`
 builders are the probes.
 
-**Where a `churn/1` run's 26 758.8 M instructions go** (`perf record -e instructions:u -c 100000`,
-`perf report --sort sym,srcline`, core 2; a round issues **258** registered BIF calls — 256
-`erlang:rem/2` — and **768** heap admissions, so the per-call and per-admission columns divide
-5 171 517 calls and 15 360 000 admissions into the percentage):
+**Where a *pre-wave* `churn/1` run's 26 758.8 M instructions went** (`perf record -e instructions:u
+-c 100000`, `perf report --sort sym,srcline`, core 2; a round issues **258** registered BIF calls —
+256 `erlang:rem/2` — and **768** heap admissions, so the per-call and per-admission columns divide
+5 171 517 calls and 15 360 000 admissions into the percentage). The same run on the current tree is
+**26 027.7 M** — the two landings below took **−2.72 %** off `I(N=20000)` and **−3.01 %** off the
+marginal — so read every row as the *pre-wave* attribution it is: the two `RuntimeContext` heap-door
+rows and the `dispatch.rs` one have all since moved, and none of these percentages should be added
+up (they overlap).
 
 | self % | symbol | owner | per call / admission |
 |---|---|---|---|
-| 5.76 | `RuntimeContext::ensure_heap_full` | **this node** | ≈100 /admission |
+| 5.76 | `RuntimeContext::ensure_heap_full` | **this node** — split, this wave | ≈100 /admission |
 | 5.56 | `RuntimeContext::call_registered` | **this node** | ≈288 /call |
-| 5.29 | `RuntimeContext::alloc_words_rooted` | **this node** | ≈92 /admission |
+| 5.29 | `RuntimeContext::alloc_words_rooted` | **this node** — split, this wave | ≈92 /admission |
 | 5.06 | `beam_engine::families::dispatch` | `beam_engine` | — |
 | 4.24 | `BudgetContext::call_bif_in_machine_outcome` | `src/runner/budget.rs` | — |
 | 3.92 | `BudgetContext::resolve_local_call` | `src/runner/budget.rs` | — |
@@ -188,7 +196,7 @@ builders are the probes.
 | 2.94 | `Machine::local_call_seam` | `beam_engine` | — |
 | 2.80 | `jit_set_position` | `beam_engine` | — |
 | 2.55 | `beam_bifs::binconv::list_to_binary_1` | `beam_bifs` | BIF body |
-| 2.46 | `RuntimeContext::finish_registered_call` | **this node** | ≈127 /call |
+| 2.46 | `RuntimeContext::finish_registered_call` | **this node** — `&mut Heap`, this wave | ≈127 /call |
 | 2.20 | `Machine::exec_bif` | `beam_engine` | — |
 | 1.79 + 1.69 | `jit_family` + `Big::div_rem` | sibling / `beam_bifs` | — |
 | 1.70 | `read_operand_pure` | `beam_engine` | — |
@@ -197,59 +205,169 @@ builders are the probes.
 | 1.42 | `Machine::with_roots<ensure_heap>` | `beam_engine` | — |
 | 1.21 | SipHash `Hasher::write` | startup-only (module fingerprint) + `gc.requested` | — |
 
-**The budget statement.** A dispatched `erlang:rem/2` call is **≈1 795 instructions**, and its split
-is *not* dominated by the BIF: **this node owns ≈498** (routing `call_bif` 83 + `call_registered`
-288 + tail `finish_registered_call` 127), of which the largest single line is
-`dispatch.rs:150` (`DispatchHooks::any`'s `self.dict`) at **1.41 %** of the whole run — ≈65 of the
-288 — followed by `beam_bifs`' `BifContext::with_local_node` build at 1.07 %. The **siblings own the
-rest**: `beam_engine`'s `families::dispatch` + `Machine::exec_bif` + `local_call_seam` +
-`alloc_rooted` + `with_roots`, the runner's `BudgetContext` triple (**9.74 %** together — the
-single biggest block in the run, and entirely outside this node), and `beam_bifs`' `int_rem` /
-`Big::div_rem` / `list_to_binary_1`. **`beam_bifs` (the BIF body) is ≈7.9 %; this node ≈14.9 %; the
-two heap doors ≈11 %; libc malloc/free 8.3 %.**
+**The budget statement (pre-wave figures; the wave's own effect is measured at run level).** A
+dispatched `erlang:rem/2` call was **≈1 795 instructions**, and its split is *not* dominated by the
+BIF: this node owned **≈498** (routing `call_bif` 83 + `call_registered` 288 + tail
+`finish_registered_call` 127) — of which the largest single line was the roster fold in
+`DispatchHooks::any` at **1.41 %** of the whole run, ≈65 of the 288, followed by `beam_bifs`'
+`BifContext::with_local_node` build at 1.07 %. The **siblings own the rest**: `beam_engine`'s
+`families::dispatch` + `Machine::exec_bif` + `local_call_seam` + `alloc_rooted` + `with_roots`, the
+runner's `BudgetContext` triple (**9.74 %** together — the single biggest block in the run, and
+entirely outside this node), and `beam_bifs`' `int_rem` / `Big::div_rem` / `list_to_binary_1`.
+**`beam_bifs` (the BIF body) is ≈7.9 %; this node ≈14.9 %; the two heap doors ≈11 %; libc
+malloc/free 8.3 %.** Both node-owned hotspots in that list have since been addressed (the roster
+fold by the `u16` mask, the doors by the cold-half split — see *What this wave landed*); re-profile
+before quoting a per-line figure again, and never sum two rows of the table.
 
-**The heap-admission doors are the addressable mass.** `alloc_words_rooted` (≈92) +
-`ensure_heap_full` (≈100) = **11.05 %** of the run for what is, on the hot arm, one bump — and
-`plain_bump` is already the wave-2 fast arm. The residue is this file's own gate chain plus
-`non_null.rs:1650` at 1.95 % (`heap.tuple(..)`'s `Option<NonNull>`/`Result` plumbing inside
-`plain_bump`) and `runtime/gc.rs`'s `gc_request_pending` (a non-empty `HashSet::contains`) /
-`gc_process_enabled` (two `HashSet` probes). Both of those live in `src/runtime/gc.rs` — a sibling —
-so the ceiling of an in-node fix is bounded by them (see the rejections below).
+**The heap-admission doors were the addressable mass, and the wave took them.** `alloc_words_rooted`
+(≈92) + `ensure_heap_full` (≈100) = **11.05 %** of the run for what is, on the hot arm, one bump.
+The addressable part was not the bump: it was (a) each door's **frame** — the spills, the scratch
+and the callee-saved registers its cold arms' calls force, paid by every admission because LLVM
+cannot shrink a function whose two arms it must keep reachable from one prologue — and (b)
+`plain_bump`'s placeholder write, lowered to a **`memcpy` call** because the fill's length was a
+run-time value (`non_null.rs:1650` at **1.95 %** of every instruction the run retired). Both are
+gone (see *What this wave landed*). What is left inside the doors is the two-probe gate chain, and
+its two `src/runtime/gc.rs` probes are the reason an in-node fix is now bounded by a sibling (see
+*Sibling levers*).
+
+### What this wave landed (measured, paired, `taskset -c 2`, `instructions:u`)
+
+Two landings, each measured **alone** by its author and then **together** by an independent run of
+this document's own recipe (control rebuilt from `a328ad0e53`'s five `context/` sources in this same
+tree, alternate `{base, final}` inside every round, four rounds):
+
+- **`DispatchHooks(u16)` — the roster packed into a bitmask (`dispatch.rs`).** Eleven `bool` fields
+  behind the eight-byte `bif` word made `DispatchAnswer` 24 bytes, over the 16-byte limit of the
+  x86-64 SysV integer-return convention, so `dispatch` → `call_bif_routed` → `call_registered`
+  returned it through a hidden **`sret`** pointer and `any()` folded eleven spilled bytes (the
+  earlier profile's largest self-time line, 1.41 % of the run). The packed mask makes the aggregate
+  16 bytes — `bif` in one register, the roster in the next — so the answer crosses both call
+  boundaries in registers and `any()` is one `test` against `ANY_MASK`. The roster stays the single
+  source of truth: `of()` evaluates the same eleven `uses_*` predicates into an array it
+  **destructures exhaustively** (adding or removing an arm fails to compile), `ALL` names every bit,
+  `ANY_MASK` is a `const` fold over `ALL`, a `const _: ()` assertion proves the bits are pairwise
+  distinct and gap-free, and every field read is a `const fn` accessor. **−1.06 % alone**
+  (−1.06…−1.11 %, mean −1.08 %, spread 0.047 %).
+- **The heap doors' cold halves split out, the small bumps constant-filled, and the three trait
+  impls inlined (`gc.rs`, `execution.rs`).** `ensure_heap_full` and `alloc_words_rooted` are now an
+  `#[inline]` hot entry that ends at the occupancy/debt/request short-circuit (resp. the
+  `-> plain_bump` fast arm) and delegate to a `#[cold] #[inline(never)]` **continuation**
+  (`ensure_heap_full_commit` / `alloc_words_rooted_commit`) holding the valves, the growth seam, the
+  collection and the arena fallback — the same lever `calls.rs` used on the dispatch frontier
+  (`take_bif_frontier` + `#[cold] grow_bif_frontier`). Each continuation **re-resolves** the process
+  instead of taking a `&mut Process` across the call, so the hot entry's borrow does not escape; the
+  gate order (request → valves → caller module → commit-once) is unchanged, and the short-circuit is
+  a *precondition*, never a decision the continuation re-makes differently. `plain_bump`'s fill is a
+  **constant-length** slice for `n ∈ {1,2,3}` (`PLAIN_BUMP_FILL_ONE`/`_TWO`) instead of
+  `&PLAIN_BUMP_FILL[..n - 1]`, whose run-time-length copy lowered to a GOT-indirect
+  `memcpy@GLIBC` on the per-cons-cell (`n == 2`) path; larger requests keep the dynamic fill, which
+  is already on that arm's cold side. `#[inline]` on the three `execution.rs` heap-door trait impls
+  collapses the `BudgetContext` → `RuntimeContext` → `gc` hop to a trampoline. **−1.633 % alone**
+  (spread 0.036 %), with the collection cadence bit-for-bit unchanged (`{48013, 37294061, 0}` on
+  both sides).
+- **Combined, verified (this document's own recipe).** `bench_gc_bound:churn/1` at `N=20000`:
+  **−2.72 %** on `I(N=20000)` (26 756.4 M → 26 027.7 M) and **−3.01 %** on the marginal
+  `I(N=20000) − I(N=0)` (24 052.4 M → 23 328.3 M); per-round paired ratios **−2.96…−3.07 %**, i.e.
+  every round clears the spread. Startup `N=0`: 2 704.1 M → 2 699.5 M (**−0.17 %**, a small *win*,
+  not the regression the estimator's noise would have hidden). On the four
+  `bench_foreign_driver` entry points at `N=20000` (marginal instructions, three alternating
+  rounds): `dec` **−1.08 %**, `enc` **−1.12 %**, `lower` +0.01 %, `cap` +0.02 % — the last two are
+  the noise floor (**±0.05 %**), which is also why wall clock is *not* quoted for them.
+- **Variants measured and reverted (do not re-land).** `#[inline(never)]` on `forced_gc_request`
+  **+0.78 %** (outlining the call costs more than the spills it saves once the cold bodies are
+  separate functions — it is `#[inline]` for that reason); `#[inline(always)]` on the three
+  `execution.rs` impls **+0.1 %** (plain `#[inline]` is the shape that measured).
+- **The two-build control spread was ZERO for these binaries.** Two rebuilds of the pre-wave control
+  from its own source produced **bit-identical** `beam_rt` binaries (md5 `c7bf0021…`, and the same
+  for two rebuilds of the final tree), so instruction comparison here needs no two-build allowance —
+  the 2–4 % floor quoted below is a **wall-clock** phenomenon (see *Control discipline*).
+- **The wave-1 tail items are kept for the eliminated work, not for a win.** `finish_registered_call`
+  taking `heap: &mut Heap` (one borrow at each transfer point instead of a 40-byte `Heap` copied in
+  and out per call) and the single `result_is_foreign_container` shape test measured ≈0 % on their
+  own.
 
 ### Levers that were measured and rejected (do not retry)
 
-- **`DispatchHooks` as a `u16` bitmask instead of eleven `bool` fields** — the leading candidate
-  (`dispatch.rs:150` is 1.41 % of the run, and the aggregate would then ride in a register so
-  `DispatchAnswer` returns without a hidden `sret` slot). Implemented in full (eleven `const` bits,
-  eleven `const fn` accessors, `any()` as `self.0 != 0`, `of()` folding the same eleven
-  `uses_*` predicates into the mask) and **reverted unmeasured**: the change is decision-preserving
-  but it cannot clear the ≥2 % bar on its own (its theoretical ceiling is the 1.41 % line it targets
-  minus the fold it removes, i.e. well under 1 %), so a speculative landing was refused. It stays a
-  candidate *only* as part of a bundle that also takes the `beam_bifs` half below.
+- **`DispatchHooks` as a `u16` bitmask** used to head this list, *reverted unmeasured* on the theory
+  that its ceiling was under 1 %. It is **landed** and measured **−1.06 % alone** (−3.01 % combined)
+  — see above. The lesson is the one to keep: a line at 1.41 % of a run is a real target even when
+  it is called "just the fold", and "too small to clear the bar" must be *measured*, not assumed.
 - **A one-entry cache of the resolved `Process` across two doors** (to serve `alloc_words_rooted`'s
   `table.get_mut(pid)` from `ensure_heap_full`'s) — refused on soundness, not on cost: the two
   invalidation hazards are (a) the `Process` moving inside `ProcessTable::slots` on any table
   mutation and (b) a *different* `RuntimeContext` on the same `Process` in a nested run, and the
   crate is `#![deny(unsafe_code)]` with ten named exemptions that a raw-pointer memo would have to
-  join. The leftover is quantified above: one extra `ptab` probe (a `Vec` index + a serial compare)
-  per admission, ≈2–4 instructions of the ≈100.
+  join. The leftover is quantified below: one extra `ptab` probe (a `Vec` index + a serial compare)
+  per admission, ≈2–4 instructions.
+- **A module-namespace gate in front of `try_native`'s 125-arm match** — **+0.29 %** instructions on
+  `churn` over five interleaved reps: `erlang` is itself one of the floor's namespaces and ~99 % of
+  `churn`'s calls, so the gate is pure added cost there, and there is nothing to win on foreign
+  modules either (**−0.02 %** on `bench_foreign_driver:lower/1`, ≈9 K instructions over 500 K calls)
+  because the arm walk is already a well-predicted ~1 instruction/call.
 - **`length/1` as a representative registered call** — measured at ≈25 instructions because the
   compiler inlines it to the engine's own `length` instruction. Rejected as a probe, kept as the
-  control that proves the estimator can see a call at all.A registered call is this node's hot path, and `calls.rs`'s prologue runs once per key per context because the `dispatch` memo answers it. Measure with `BEAM_RT_PERF_COUNTERS=1` (the `calls/perf_counters` counters) over a workload with a known key mix, never with a wall clock alone.
+  control that proves the estimator can see a call at all.
+
+A registered call is this node's hot path, and `calls.rs`'s prologue runs once per key per context
+because the `dispatch` memo answers it. Measure with `BEAM_RT_PERF_COUNTERS=1` (the
+`calls/perf_counters` counters) over a workload with a known key mix, never with a wall clock alone.
+
+### Sibling levers, with their bounded wins (do not re-derive)
+
+Every item below is *measured*, is owned by a **sibling** node, and is listed with its ceiling so a
+later wave neither re-derives it nor expects this node to move it. Percentages are self-time shares
+of the pre-wave `churn` profile above.
+
+- **`src/runner/budget.rs`'s `BudgetContext` triple — `call_bif_in_machine_outcome` 4.24 % +
+  `resolve_local_call` 3.92 % + `ensure_heap_full` 1.58 % = 9.74 %**, the single biggest block in the
+  run and entirely outside this node: it is the trampoline the scheduled path inserts in front of
+  every context call. Reserved for `src/runner/**`; nothing here can shrink it.
+- **`beam_engine`'s share** — `families::dispatch` 5.06 %, `Machine::alloc_rooted` 3.29 %,
+  `local_call_seam` 2.94 %, `jit_set_position` 2.80 %, `exec_bif` 2.20 %, `read_operand_pure`
+  1.70 %, `with_roots<ensure_heap>` 1.42 %. The doors' cadence is this sibling's too:
+  `test_heap`/`put_list` are `ensure_heap_full`'s only callers and the `Machine` publishes no
+  free-words figure, so a door cannot skip itself on already-known headroom.
+- **`beam_bifs::arith::int_rem` 3.65 % + `Big::div_rem` 1.69 %** — the baseline JIT's small-arith
+  inlineset has no `rem`/`div` (`../beam_engine/src/jit/baseline/emit/arith.rs`), so `N rem 256`
+  reaches `beam_bifs` → `Big::div_rem`, whose conversions and results build three heap `Vec`s. An
+  A/B of `rem` against `band` over the same loop measures **~50 % of `churn`'s whole marginal** —
+  the largest single outstanding item anywhere in the run, and `beam_engine`/`beam_bifs` work.
+- **libc `malloc`/`free` — 8.33 %** (`__libc_malloc2` 3.35 + `_int_free_chunk` 2.67 + `cfree` 1.27
+  + `malloc` 1.04): the collector's per-collection scratch (`beam_gc`/`beam_process`), not this
+  node's per-call work (nothing here allocates per term — see *The hit path*).
+- **`beam_alloc::Heap::tuple` / `bump::tuple_at` ≈27 instructions of each reservation** — a
+  header+placeholder primitive returning the base **without** the `Result<Eterm>`/`Option<NonNull>`
+  plumbing would remove what the constant fills only shrank; ceiling **≈0.5–0.8 %**, and it is
+  `beam_alloc` work (its `n ∈ {1,2,3}` arms are already one `mov` per word, so the residue is the
+  wrapper, not the copy).
+- **`ProcessTable::get_mut` probed twice per admission** (once per door) — ≈2–4 instructions per
+  admission, and *unnumerable* inside this node: the one-entry cache that would collapse it was
+  refused as unsound (above), and a raw-pointer version would need an eleventh `unsafe` exemption.
+- **`src/runtime/gc.rs`'s `gc_request_pending`** (`!requested.is_empty() && requested.contains(&pid)`)
+  — the second half is a SipHash probe, and because it sits in the same body it forces the doors'
+  frame; an `is_empty` inline in front of an **outlined** `contains` is worth **≈0.8 %** (measured by
+  the doors' author, not landed because the file is a sibling's). The same file's
+  `gc_process_enabled` (two `HashSet` probes) may be treated the same way.
+- **Hoisting `gc_process_enabled` to slice entry is unsound** — `halt_process_gc` and
+  `note_foreign_reachable` both fire mid-slice — so it is off the *bump* path only and must never be
+  hoisted; see [`gc/CONTEXT.md`](gc/CONTEXT.md).
+- **The `SipHash` a profile shows is `beam_engine`'s and startup-only.**
+  `beam_engine::jit::cache::key::module_fingerprint` hashes a `{:?}` Debug render of a whole module
+  IR through a `HashWriter<DefaultHasher>` (reached from the boot drive and a process's first
+  entry): 7.78 % of a run at N=0 and 0.07 % at N=500 000; a second instance is
+  `beam_term::AtomTable::clone`, one per module load and ≈3.7 % of startup. Nothing on this path
+  hashes per call: `try_call_nif` tests `nifs.is_empty()` before its lookup, `dispatch_slot` is
+  FNV-1a over the key's bytes, `resolve_local_call`/`resolve_external_call` hash nothing,
+  `record_saved_call` uses `crate::hasher::FastHasher` and is unarmed when nothing asks for it, and
+  `BifRegistry::lookup`'s SipHash is reached only on a memo miss.
 ### The hit path, and what it is made of (`BEAM_RT_PERF_COUNTERS=1`)
 
 - **The memo answers ~99 % of calls**, so the cost that matters is the **hit** path, not the roster derivation. `bench_gc_bound:churn/1` (20 000 rounds): `call_bif` 5 176 023 = `registered` 5 171 521 (99.91 %) + native floor 2 517 + external-module load 1 985 + NIF probe 0; `dispatch` hits 5 145 218 / misses 28 288 / **collisions 17**; `erlang:rem/2` alone is 5 120 003 (98.9 %). The win therefore came from making the hit cheaper (`DispatchMemo::last`, the one-entry MRU hint in front of the slot hash — see [the dispatch memo](#the-dispatch-memo--dispatchhooks)).
 - **Nothing on this path allocates per term.** `BifContext` is a stack value, `take_bif_frontier`'s inlined arm is a `Vec::pop` (its growth is the `#[cold]` outline), `RuntimePorts::new` is an `Rc::clone`, and the copy-out is what re-homes a container onto a heap the collector scans; the libc `malloc`/`free` traffic a profile shows (≈1.5 % + 1.3 %) belongs to the collector's per-collection scratch (`beam_gc`/`beam_process`), not here.
-  The hook-free arm builds that context **once** per call (`DispatchHooks::any` is one eleven-field bitwise OR, `dispatch.rs:149`); the full path's ten arms live behind `#[cold] call_registered_full` — see [`calls/CONTEXT.md`](calls/CONTEXT.md).
+  The hook-free arm builds that context **once** per call (`DispatchHooks::any` is one `test` of the packed `u16` against `ANY_MASK`); the full path's ten arms live behind `#[cold] call_registered_full` — see [`calls/CONTEXT.md`](calls/CONTEXT.md).
 - **Control discipline: a stashed binary is not a control.** A `beam_rt` built before the work was kept as a file and compared against later builds; a *fresh build of the identical tree* then measured **2–4 % slower** than that file on two workloads, which turned an apparent `-3.4 %` regression into a `+1.6 %` win. Rebuild the control from the same tree state (`git checkout <rev> -- erts_rust/crates/beam_rt/src/context`, build, restore) and alternate the two binaries **inside** one round; a 2–4 % delta between two builds of the *same* source is the binary's own variance, not a code effect. Use a marginal estimator — `(t(N) − t(0)) / N` — with `N` large enough that a ~15 ms startup wobble is < 1 % of the delta (≥ 200 000 ops on a 4 µs workload).
-- **Levers, and which node owns each.** Every line below is a statement about the current shape, so none of them is worth re-deriving.
-  (a) **The baseline JIT's small-arith inlineset omits `rem`/`div`** (`../beam_engine/src/jit/baseline/emit/arith.rs`), so `N rem 256` costs ~220 ns: the call reaches `beam_bifs::arith::int_rem` → `Big::div_rem`, whose conversions and results build three heap `Vec`s. An A/B of `rem` against `band` over the same loop measures ~50 % of `churn`'s whole marginal — the largest single outstanding item, and `beam_engine`/`beam_bifs` work.
-  (b) **The doors' cadence is the engine's.** `test_heap`/`put_list` are `ensure_heap_full`'s only callers and the `Machine` publishes no free-words figure, so a door cannot skip itself on already-known headroom. `beam_engine` work.
-  (c) **Each admission probes `ProcessTable` once per door.** `ensure_heap_full` and `alloc_words_rooted` each `get_mut(pid)` on a table the context already resolved, so one admission of a `test_heap`-then-build sequence reads twice.
-  (d) **A module-namespace gate in front of `try_native`'s 125-arm match does NOT pay** and must not be retried: `erlang` is itself one of the floor's namespaces and is ~99 % of `churn`'s calls, so the gate is pure added cost there (**+0.29 %** instructions on `churn`, five interleaved reps), and there is nothing to win on foreign modules either (**−0.02 %** on `bench_foreign_driver:lower/1`, ≈9 K instructions over 500 K calls) because the arm walk is already a well-predicted ~1 instruction/call.
-  (e) **Hoisting `gc_process_enabled` to slice entry is unsound** — `halt_process_gc` and `note_foreign_reachable` both fire mid-slice — so it is off the *bump* path only and must never be hoisted; see [`gc/CONTEXT.md`](gc/CONTEXT.md).
-  (f) **The `SipHash` in a profile is `beam_engine`'s and startup-only.** `beam_engine::jit::cache::key::module_fingerprint` hashes a `{:?}` Debug render of a whole module IR through a `HashWriter<DefaultHasher>` (reached from the boot drive and a process's first entry): 7.78 % of a run at N=0 and 0.07 % at N=500 000; a second instance is `beam_term::AtomTable::clone`, one per module load and ≈3.7 % of startup.
-  Nothing on this path hashes per call: `try_call_nif` tests `nifs.is_empty()` before its lookup, `dispatch_slot` is FNV-1a over the key's bytes, `resolve_local_call`/`resolve_external_call` hash nothing, `record_saved_call` uses `crate::hasher::FastHasher` and is unarmed when nothing asks for it, and `BifRegistry::lookup`'s SipHash is reached only on a memo miss. The remaining fix is `beam_engine`/`beam_term`'s.
+  That 2–4 % floor is a **wall-clock** floor. For `instructions:u` on this host it does not exist: two rebuilds of the pre-wave control from its own source were **bit-identical** (so were two rebuilds of the post-wave tree), and the paired instruction measurement's own spread is ≈0.05 % (marginal) / ≈0.04 % (startup) — which is why an instruction delta of −3 % needs no build allowance, while the same change's wall-clock delta (churn `ns/op` moves ±1 % across a two-binary comparison on this shared host) proves nothing either way. Quote wall for shape and throughput, instructions for a change.
+
 ## Test Strategy
 The suites' routing, the per-suite evidence and the measurement harnesses are per child node: [`calls/CONTEXT.md`](calls/CONTEXT.md) (dispatch, bridges, interners), [`gc/CONTEXT.md`](gc/CONTEXT.md) (heap doors, valves, off-heap prunes) and [`pool/CONTEXT.md`](pool/CONTEXT.md) (copy-out, `ets` aliasing).
 Every suite here is colocated (`tests.rs` + `test_support.rs`) or an integration suite under [`../../tests/`](../../tests/CONTEXT.md); no test compares live GC counters, `process_info(_, garbage_collection)` or `erlang:memory` figures against the oracle.
