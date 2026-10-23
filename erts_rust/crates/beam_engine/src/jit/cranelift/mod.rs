@@ -174,12 +174,16 @@ use crate::jit::baseline::{
 use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 
+/// The tier's **retained-artifact store**: compiles each module once per sound identity
+/// (load-time digest + atom-namespace witness) and keeps the artifact — with its
+/// executable mapping — alive across runs, so nothing has to be recompiled and a
+/// suspended run's code stays mapped. See [`cache`].
+mod cache;
 mod codegen;
 mod compare;
 mod inline;
 mod report;
 mod shape;
-
 #[cfg(test)]
 mod tests;
 
@@ -257,17 +261,49 @@ impl JitBackend for CraneliftJit {
         let code = CompiledEntries { compiled };
         run_native(machine, module, function, arity, args, ctx, &code)
     }
+
+    /// Compile `module` and immediately run exported `function/arity`, yielding `x(0)`.
+    ///
+    /// The provided body would [`compile`](JitBackend::compile) an artifact here and drop
+    /// it at the end of the run, so [`Tier::Cranelift`](crate::jit::Tier::Cranelift)'s
+    /// [`Machine::run_with_tier`](crate::Machine::run_with_tier) path recompiled the whole
+    /// module per call. This override goes through [`run_outcome`] instead, whose artifact
+    /// comes from the tier's retained-artifact store ([`cache`]) — so a second run of the
+    /// same module reuses the compiled code — and folds the outcome exactly as the shared
+    /// non-blocking driver does ([`run_native`]): a [`RunOutcome::Wait`] becomes the typed
+    /// [`error::blocked`] and a [`RunOutcome::Suspend`] the typed
+    /// [`error::suspended`], never a substituted value.
+    fn run_export(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
+        match run_outcome(machine, module, function, arity, args, ctx)? {
+            RunOutcome::Returned(value) => Ok(value),
+            RunOutcome::Wait { .. } => Err(error::blocked()),
+            RunOutcome::Suspend { .. } => Err(error::suspended()),
+        }
+    }
 }
 
 /// Compile `module` and run exported `function/arity`, reporting whether the run
 /// returned or blocked in a `receive`.
 ///
-/// The outcome-aware sibling of [`JitBackend::run_export`]: the artifact is compiled
-/// and immediately run through the shared outcome-aware driver
+/// The outcome-aware sibling of [`JitBackend::run_export`]: the module's artifact is
+/// taken from the tier's retained-artifact store ([`cache::handle`], compiled on first
+/// sight and **reused** afterwards) and run through the shared outcome-aware driver
 /// ([`run_native_outcome`](crate::jit::baseline::run_native_outcome)), so a `receive`
 /// that finds no message arrives as [`RunOutcome::Wait`] with the interpreter's own
 /// resume address instead of the folded typed `blocked` error. Everything else is
 /// identical, including the per-instruction deopt to the shared interpreter helper.
+///
+/// The `Rc` handle keeps the artifact — and its executable mapping — alive for the whole
+/// run while the store's borrow is already released, which is what lets a re-entrant
+/// path (a BIF that runs another Cranelift export on this thread) touch the store again.
 pub(crate) fn run_outcome(
     machine: &mut Machine,
     module: &Module,
@@ -276,8 +312,7 @@ pub(crate) fn run_outcome(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    let mut backend = CraneliftJit::new();
-    let compiled = backend.compile(module)?;
+    let compiled = cache::handle(module)?;
     let code = CompiledEntries {
         compiled: &compiled,
     };
@@ -287,14 +322,15 @@ pub(crate) fn run_outcome(
 /// Compile `module` and run the raw entry `label`, reporting whether the run
 /// returned or blocked in a `receive`.
 ///
-/// The label-addressed counterpart of [`run_outcome`]: the shared outcome-aware
-/// label driver ([`run_native_label_outcome`](crate::jit::baseline::run_native_label_outcome))
-/// resolves `label` against the module-wide label map and enters the compiled code
-/// natively at that address whenever the compiled function for the resolved
-/// `(func, pc)` can be entered there (an IR block start, which every label position
-/// is, or a non-tail-call continuation). An address outside that set stays on the
-/// driver's interpreter step — the documented per-instruction deopt, never a wrong
-/// result.
+/// The label-addressed counterpart of [`run_outcome`]: the artifact comes from the same
+/// retained-artifact store ([`cache::handle`]) and the shared outcome-aware label driver
+/// ([`run_native_label_outcome`](crate::jit::baseline::run_native_label_outcome))
+/// resolves `label` against the module-wide label map **the artifact already holds**
+/// ([`CompiledFunctions::labels`]) and enters the compiled code natively at that address
+/// whenever the compiled function for the resolved `(func, pc)` can be entered there (an
+/// IR block start, which every label position is, or a non-tail-call continuation). An
+/// address outside that set stays on the driver's interpreter step — the documented
+/// per-instruction deopt, never a wrong result.
 pub(crate) fn run_label_outcome(
     machine: &mut Machine,
     module: &Module,
@@ -303,23 +339,32 @@ pub(crate) fn run_label_outcome(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    let mut backend = CraneliftJit::new();
-    let compiled = backend.compile(module)?;
+    let compiled = cache::handle(module)?;
     let code = CompiledEntries {
         compiled: &compiled,
     };
     run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
 }
-
 /// Resume a suspended machine on the Cranelift hot tier.
 ///
-/// Unlike first entry, a resume is handed **no** compiled artifact: this entry point
-/// receives only `(machine, module, func, pc)` and the tier has no path that would
-/// compile and bind an artifact at a parked address on demand, so the Cranelift tier
-/// has no resume entry point at all. Rather than silently recompile the whole module
-/// on every resume or fall back to another tier (which would hide a real capability
-/// limit and misreport which tier ran the slice), this reports the honest typed
-/// error. The resume position is not even examined. This backs
+/// **What the tier now has.** A module's artifact survives the park: [`run_outcome`] and
+/// its label sibling take it from the tier's retained-artifact store ([`cache`]), so the
+/// compiled code — with its executable mapping — is still there when the process parks,
+/// and the artifact carries the module-wide label map ([`CompiledFunctions::labels`]) a
+/// resumed run would rebind against.
+///
+/// **What is still missing, and why this reports instead of pretending.** The resume
+/// needs a **no-reset driver** to re-enter a parked `(func, pc)` in place of the
+/// [`Machine::reset`](crate::Machine)-style setup the first-entry drivers perform, and
+/// that seam is not reachable from here: the shared driver
+/// `baseline::drive` is private to [`crate::jit::baseline`], and
+/// [`baseline::run_compiled_resume_outcome`](crate::jit::baseline::run_compiled_resume_outcome)
+/// accepts only the baseline tier's **own** `CompiledModule` — there is no
+/// [`NativeCode`]-generic resume entry point to hand a Cranelift artifact to.
+/// Reimplementing the block-ABI driver loop here, silently recompiling the module on
+/// every resume, or falling back to another tier would each hide a real capability limit
+/// and misreport which tier ran the slice, so this keeps the honest typed error. The
+/// resume position is not even examined. This backs
 /// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
 /// for [`Tier::Cranelift`](crate::jit::Tier::Cranelift) (see
 /// [`crate::jit::run_cranelift_resume_outcome`]).
@@ -371,6 +416,21 @@ pub struct CompiledFunctions {
     /// of on the driver's interpreter step. A `pc` outside the set is not enterable and
     /// stays on the interpreter step. An uncompiled function has no entry here.
     enter_pcs: HashMap<u32, Vec<u32>>,
+    /// The module-wide `Label -> (func, pc)` map, built **once** at compilation.
+    ///
+    /// The lowering resolves every inlined `jump`/`call_only` target through it, and the
+    /// artifact then keeps it so the shared native driver
+    /// ([`baseline::run_native_outcome`](crate::jit::baseline::run_native_outcome) and
+    /// its label/resume siblings) resolves the run's entry label and every import against
+    /// this one map instead of rebuilding a per-module `LabelMap` per run — the
+    /// `RunLabels::Stored` fast path [`NativeCode::labels`] exposes. It is also what a
+    /// **resumed** run would rebind against when the park sits in a non-zero module
+    /// context: the map is the module's own, so the parked `(func, pc)` resolves in
+    /// every context it covers without a rebuild.
+    ///
+    /// Read through [`CompiledFunctions::labels`] (in-crate) or [`NativeCode::labels`]
+    /// (the driver's seam).
+    labels: crate::interpreter::LabelMap,
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`.
     ///
@@ -480,6 +540,23 @@ impl CompiledFunctions {
         self.entries.len()
     }
 
+    /// The module-wide label map this artifact holds, built once at compilation.
+    ///
+    /// The mirror of
+    /// [`CompiledModule::labels`](crate::jit::baseline::CompiledModule::labels)
+    /// for this tier: the shared native driver resolves a run's entry label and every
+    /// import through it ([`NativeCode::labels`]) instead of rebuilding a per-module
+    /// map per run, so a run of an already-compiled module pays no whole-module
+    /// `LabelMap` build. It is also what a **resumed** run would rebind against in a
+    /// non-zero module context — the parked `(func, pc)` resolves in any context the
+    /// module's own map covers.
+    ///
+    /// `pub(crate)` rather than `pub` because
+    /// [`LabelMap`](crate::interpreter::LabelMap) is a crate type; the seam the driver
+    /// and a host use is [`NativeCode::labels`].
+    pub(crate) fn labels(&self) -> &crate::interpreter::LabelMap {
+        &self.labels
+    }
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`, if any instruction was inlined.
     pub fn highest_native_register(&self) -> Option<u32> {
@@ -612,7 +689,17 @@ impl NativeCode for CompiledEntries<'_> {
         let code: NativeFunc = unsafe { mem::transmute(entry) };
         Some(code(rt as i64, pc as i64))
     }
+
+    /// The artifact's own label map, built once at compilation: a run of the artifact
+    /// resolves its entry label and every import through it instead of rebuilding one per
+    /// run, so the shared driver takes the
+    /// [`RunLabels::Stored`](crate::jit::baseline::RunLabels) fast path for **every**
+    /// Cranelift entry.
+    fn labels(&self, _module: &Module) -> Option<&crate::interpreter::LabelMap> {
+        Some(self.compiled.labels())
+    }
 }
+
 // ---------------------------------------------------------------------------
 // Compilation
 // ---------------------------------------------------------------------------

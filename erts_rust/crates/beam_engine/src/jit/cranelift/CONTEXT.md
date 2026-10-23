@@ -94,10 +94,32 @@ that half alone.
 
 ## Constraints
 `unsafe` only inside the `mod.rs` module subtree: `mod.rs` declares `#![allow(unsafe_code)]` and its
-children inherit it, so `codegen.rs`/`inline.rs`/`compare.rs`/`shape.rs`/`report.rs` are safe Rust and
-the one `unsafe` block in the `#[cfg(test)] mod tests` is test-only. The tier never touches `Machine`
-state a block cannot address — anything requiring a frame pop or context switch deopts to the shared
-helper.
+children inherit it, so `codegen.rs`/`cache.rs`/`inline.rs`/`compare.rs`/`shape.rs`/`report.rs` are safe
+Rust and the one `unsafe` block in the `#[cfg(test)] mod tests` is test-only. The tier never touches
+`Machine` state a block cannot address — anything requiring a frame pop or context switch deopts to the
+shared helper.
+
+## Artifact retention (the store in `cache.rs`)
+A `CompiledFunctions` owns an executable mapping plus raw pointers into it, so it is neither `Send` nor
+`Sync`: the store is a `thread_local!` `RefCell<ArtifactCache>`, exactly like the baseline tier's
+`crate::jit::cache`. Three entries now obtain their artifact through `cache::handle(module)?` —
+`run_outcome`, `run_label_outcome` and the `JitBackend::run_export` override (which folds the outcome:
+`Returned(v) => Ok(v)`, `Wait{..} => Err(error::blocked())`, `Suspend{..} => Err(error::suspended())`)
+— so a repeated run of one module compiles once. `run_compiled` is unchanged (caller-owned artifact),
+and the handle is released before the driver runs (no `RefCell` borrow is held across execution).
+- **Identity is the baseline's two-part witness, from public accessors only**: `module.checksum()` (the
+  load-time MD5, `Copy`) plus `module.atom_table.snapshot()`. The namespace witness is load-bearing —
+  Cranelift bakes atom **immediates** into the emitted `move`/`test`/`select_val`/comparison fast paths,
+  so a different namespace must be a **miss**, never a wrong answer. Two separately loaded copies of one
+  `.beam` are two entries (a deliberate extra compile at worst).
+- **A module whose `checksum()` is all-zero (the `Module::default()` sentinel of a hand-built/synthetic
+  module) is not cached**: `Key::of` returns `None`, so it compiles per entry — always correct, a wasted
+  recompile at worst. The baseline cache's content-fingerprint fallback is deliberately **not**
+  duplicated here.
+- **Re-entrancy is uncached, never a panic**: `handle` uses `try_borrow_mut()`; on `Err` it compiles
+  uncached and returns that artifact (mirroring `jit::cache::run_baseline_cached`'s re-entrant arm).
+- The test-gated `len`/`compile_count`/`clear` are `pub(super)` only — the in-module suite reaches them;
+  nothing is re-exported from `jit/mod.rs`.
 
 ## Cross-module transfer
 The tier runs on the **shared** driver (`../baseline`), which handles a `Step::Enter` (a
@@ -190,9 +212,24 @@ is not a clean tier comparison even where reachable.
   typed `unsupported`), so the slice cannot be resumed. `beam_rt` never selects this tier
   (`BEAM_RT_TIER` maps only to `Interpreter`/`BaselineJit`), and the tier's own tests use
   non-pre-empting contexts, so nothing on a supported path reaches this.
+- **The artifact store retains, it does not resume.** It makes a park cost no recompile (the artifact
+  and its label map stay mapped) but `run_resume_outcome` is still the typed `unsupported`: the missing
+  seam is a `NativeCode`-generic no-reset driver entry, which lives in `crate::jit::baseline`
+  (`drive` is private; `run_compiled_resume_outcome` accepts only the baseline's `CompiledModule`) —
+  a higher node's change, not this one.
+- **The store is per thread and unbounded.** A `CompiledFunctions` owns an executable mapping, so the
+  store is a `thread_local!`; a run on another thread recompiles (correct, slower), and nothing evicts
+  (the tier is default-OFF and `beam_rt` never selects it, so the retained set is bounded in practice;
+  `clear` exists for the tests).
+- **A synthetic module is never cached** (an all-zero `checksum()` is the `Module::default()` sentinel,
+  so it has no sound identity): each entry compiles again. The baseline cache's content-fingerprint
+  fallback is deliberately not duplicated — a wasted recompile, never a wrong answer.
 
 ## Routing Table
-- `codegen.rs`/`inline.rs`/`shape.rs`/`compare.rs` → the inline set + shape tests; `report.rs` → the introspection report; `tests.rs` → in-module unit tests; `bench.rs` → the `#[ignore]`d ABBA Cranelift-vs-baseline measurement harness (its synthetic-`Module` builder, BIF hook and ns/op primitives are the shared `crate::jit::bench::support`, not a second copy); `mod.rs` → the backend + accessors.- Tier equivalence on real modules: crate `tests/jit_cranelift.rs`, `tests/jit_cranelift_real.rs` (see `../CONTEXT.md`).
+- `mod.rs` → the backend (`CraneliftJit`, incl. the `run_export` override), `CompiledFunctions` (the artifact: native entries, `is_enterable`, `labels`), `CompiledEntries`' `NativeCode` impl, `run_outcome`/`run_label_outcome`/`run_resume_outcome`, `run_cranelift*`.
+- `cache.rs` → the thread-local retained-artifact store: `Key` (load-time digest + `AtomSnapshot`, `None` for an all-zero-checksum synthetic module), `handle(module) -> Result<Rc<CompiledFunctions>>`, and the test-gated `len`/`compile_count`/`clear`.
+- `codegen.rs`/`inline.rs`/`shape.rs`/`compare.rs` → the inline set + shape tests; `report.rs` → the introspection report; `tests.rs` → in-module unit tests; `bench.rs` → the `#[ignore]`d ABBA Cranelift-vs-baseline measurement harness (its synthetic-`Module` builder, BIF hook and ns/op primitives are the shared `crate::jit::bench::support`, not a second copy).
+- Tier equivalence on real modules: crate `tests/jit_cranelift.rs`, `tests/jit_cranelift_real.rs` (see `../CONTEXT.md`).
 - `bench.rs` is run with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --features jit-cranelift --lib -- --ignored --nocapture cl_bench`.
 
 ## Test Strategy
@@ -202,3 +239,13 @@ points, the reported inlined set, a direct native call into a compiled entry, an
 block starts ∪ non-tail-call continuations) on the `coverage.beam` fixture, asserting the entry `pc`
 and every `call_site + 1` are enterable while an interior `pc` no boundary names is not. Tier
 equivalence on real modules lives in the crate's `tests/jit_cranelift.rs` / `tests/jit_cranelift_real.rs`.
+The artifact store's own coverage (5 cases, all in `tests.rs`, each comparing to `Tier::Interpreter`
+where it executes something): `a_second_run_of_the_same_module_reuses_the_cached_artifact` (one compile
+for two runs of one loaded module, plus the deliberate miss for a separately loaded copy),
+`the_artifact_carries_the_module_wide_label_map` (every label resolves as a rebuilt
+`build_label_map(module)` does, and `NativeCode::labels` answers `Some` ⇒ `RunLabels::Stored`),
+`a_receive_park_reports_the_interpreters_address_and_keeps_the_artifact` (the `recv.beam` `recv:wait/0`
+park address equals the interpreter's resumption address — proved by resuming there — and the artifact
+is still held afterwards), `a_synthetic_module_without_a_digest_is_not_cached` (all-zero checksum ⇒ two
+equal runs, `len() == 0`, `compile_count() == 0`) and
+`clear_drops_every_artifact_and_resets_the_compile_count`.

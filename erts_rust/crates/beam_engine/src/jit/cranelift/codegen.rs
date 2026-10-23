@@ -99,6 +99,11 @@ pub(super) fn x_offset(x: u32) -> i32 {
 ///
 /// Functions without code (or without a resolvable entry label) are skipped: the
 /// driver simply keeps interpreting them, which is always correct.
+///
+/// The module-wide label map the lowering resolves its jump targets through is **built
+/// once here and kept on the artifact** ([`CompiledFunctions::labels`]), so every driver
+/// run of the artifact resolves its entry label and every import against that one map
+/// instead of rebuilding a per-module value per run.
 pub(super) fn compile_module(
     module: &Module,
     builder_context: &mut FunctionBuilderContext,
@@ -196,6 +201,7 @@ pub(super) fn compile_module(
         entries,
         entry_pc,
         enter_pcs,
+        labels,
         highest_native_register: report.highest_native_register,
         inlined_tests: report.inlined_tests,
         inlined_gc_bifs: report.inlined_gc_bifs,
