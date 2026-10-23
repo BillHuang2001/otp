@@ -47,13 +47,31 @@
 //! | feature-OFF, `cranelift`, `run slice.beam slice:fib/1 10` | exit **3**, empty stdout, one `beam_rt: unsupported: …` line naming `cranelift` and the Cargo feature |
 //! | feature-OFF, `cranelift`, `-version` | exit **0** and the banner: `-version` runs no code, so it selects no tier |
 //! | every build, unset / `auto` / `baseline`, same `run` | `55`, exit 0 — the check must fire on **nothing** else |
-//! | feature-ON, `cranelift`, same `run` | the startup check never answers (a built tier is not refused); the session's own outcome is the resume gap, not this check |
+//! | feature-ON, `cranelift`, same `run` | the startup check never answers (a built tier is not refused) **and the session completes**: `55`, exit 0, empty stderr — a parked or pre-empted process resumes on the tier |
+//! | every build, the three CLI rows, once per **served** tier | identical stdout (`55` / `timeout` / `50`), exit 0, empty stderr and no `unsupported` line on `interpreter` and `baseline`, plus `cranelift` when the feature is built; the feature-off run is the negative control |
 //!
 //! The child is the **built** binary ([`CARGO_BIN_EXE_beam_rt`]) run through the crate's shared
 //! bounded harness ([`support::run_bounded_with_env`], a 30 s probe bound), so a blocking child
 //! can never hang the suite and the test process's own environment is never mutated (the crate
 //! is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in edition 2024) — the variable is set
 //! or **removed** on the child alone.
+//!
+//! # Three-tier equivalence, at the CLI boundary
+//!
+//! The last row is the executable's own equivalence claim, and it is deliberately *not*
+//! feature-gated: a feature-off build serves two of the three tiers, so the same body is the
+//! positive equivalence check there and the negative control in a `cranelift` build (it never
+//! names a tier that build must refuse). The three rows are chosen for the three shapes a
+//! session takes — a pure computation (`slice:fib/1 10`), a process that **parks** on a finite
+//! `receive … after T` (`recv_after:after20/0`), and a **two-process** ping-pong that parks and
+//! resumes 50 times (`pingpong:go/1 50`). Each tier's stdout is compared both to the fixture's
+//! fixed answer **and** to the interpreter's own run of the same row, so the reference is a
+//! real execution rather than a table.
+//!
+//! Its in-process half lives in `src/runner/tests.rs`
+//! (`a_preempted_process_resumes_on_its_cranelift_tier`,
+//! `a_receive_parked_process_resumes_on_its_cranelift_tier`); this row is the same property
+//! through the whole binary, boot script included.
 
 // This binary uses one helper of the shared harness (the bounded child runner), so the rest of it
 // (the oracle probes, the two-VM session) folds away and would otherwise warn on the entry points
@@ -69,6 +87,19 @@ const SLICE_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../beam_loader/tests/fixtures/slice.beam"
 );
+
+/// The committed finite-`receive` fixture (`erlc +deterministic recv_after.erl`):
+/// `recv_after:after20/0` parks ~20 ms on an empty mailbox, then prints `timeout`. It is the
+/// equivalence row that makes a **resume** part of the session.
+const RECV_AFTER_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/recv_after.beam"
+);
+
+/// The committed two-process ping-pong fixture (`erlc +deterministic pingpong.erl`):
+/// `pingpong:go/1 50` empties the run queue between every round trip, so the driver process
+/// parks and resumes fifty times.
+const PINGPONG_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pingpong.beam");
 
 /// The feature's own name in the diagnostic the startup check prints (used by the feature-off
 /// rows only, because that is the only build where the check fires).
@@ -114,6 +145,42 @@ fn beam_rt(args: &[&str], tier: Option<&str>) -> Run {
 /// the test process's working directory is the crate directory.
 fn fib_args() -> [&'static str; 5] {
     ["-noshell", "run", SLICE_BEAM, "slice:fib/1", "10"]
+}
+
+/// The tiers **this build** serves, in the order the equivalence row drives them.
+///
+/// `interpreter` and `baseline` exist in every build; the Cranelift hot tier exists only with
+/// this crate's `cranelift` Cargo feature (default OFF), which is why the list is computed from
+/// `cfg!` rather than being a constant. A feature-off build therefore never *names* the tier its
+/// startup check must refuse — the same test body is the negative control there.
+fn served_tiers() -> Vec<&'static str> {
+    let mut tiers = vec!["interpreter", "baseline"];
+    if cfg!(feature = "cranelift") {
+        tiers.push("cranelift");
+    }
+    tiers
+}
+
+/// The three CLI rows the equivalence test drives: a label (for failure messages), the argument
+/// vector, and the exact stdout the committed fixture prints.
+///
+/// They cover the three shapes a session takes: a pure computation, a process parked on a finite
+/// `receive … after T`, and a two-process ping-pong that parks and resumes between every round
+/// trip. The fib row reuses [`fib_args`] so the slice's argument vector has one definition.
+fn equivalence_rows() -> Vec<(&'static str, Vec<&'static str>, &'static str)> {
+    vec![
+        ("slice:fib/1 10", fib_args().to_vec(), "55\n"),
+        (
+            "recv_after:after20/0",
+            vec!["-noshell", "run", RECV_AFTER_BEAM, "recv_after:after20/0"],
+            "timeout\n",
+        ),
+        (
+            "pingpong:go/1 50",
+            vec!["-noshell", "run", PINGPONG_BEAM, "pingpong:go/1", "50"],
+            "50\n",
+        ),
+    ]
 }
 
 /// **Feature off: naming the Cranelift tier is refused at the CLI boundary with exit 3.**
@@ -225,10 +292,14 @@ fn the_served_tiers_still_run_the_slice() {
 /// **Feature on: a built tier is never refused by the startup check.**
 ///
 /// The check reads the same Cargo feature the engine's entry points do, so in a `cranelift` build
-/// it answers `None` and the invocation proceeds. What that session then does is a *different*
-/// question — at this HEAD a boot-script process (or any slice that parks) hits the tier's
-/// missing resume entry point, a typed gap owned by `beam_engine` — so this row pins only the
-/// startup check's silence: the reason it prints in a feature-off build must not appear here.
+/// it answers `None` and the invocation proceeds — all the way to its own answer. A parked or
+/// pre-empted process resumes **on the tier it was selected for**
+/// (`Machine::resume_outcome_with_tier` dispatching to the Cranelift resume entry over the
+/// backend's retained artifact store, an address that is not an enterable block start advancing
+/// by the driver's per-instruction interpreter step), so the session completes rather than
+/// reporting a gap. This row pins only the startup check's silence — the completion itself, on
+/// all three tiers, is
+/// [`every_served_tier_runs_the_cli_rows_identically`]'s subject.
 #[cfg(feature = "cranelift")]
 #[test]
 fn a_built_cranelift_tier_is_not_refused_at_startup() {
@@ -243,4 +314,84 @@ fn a_built_cranelift_tier_is_not_refused_at_startup() {
         "the startup check's reason is absent in a build that serves the tier: {:?}",
         run.stderr
     );
+}
+
+/// **Every build: each served tier answers the three CLI rows identically.**
+///
+/// The rule is three-tier equivalence at the *CLI* boundary: for a pure computation, a process
+/// parked on a finite `receive … after T`, and a two-process ping-pong that parks and resumes
+/// between round trips, every tier this build serves must produce the fixture's own answer, an
+/// exit code of 0, an empty stderr and no `unsupported` line anywhere. The interpreter is the
+/// reference implementation, so its run of each row is captured first and every other tier is
+/// compared to that run's stdout as well as to the fixed answer — a table alone cannot catch two
+/// tiers agreeing on a wrong value.
+///
+/// The test is deliberately **not** feature-gated: one body executes in both builds. With the
+/// `cranelift` feature off, [`served_tiers`] names only `interpreter`/`baseline`, so this is the
+/// negative control (it never asks for a tier that build must refuse — the refusal has its own
+/// feature-off rows above). With it on, the hot tier participates and `recv_after`/`pingpong`
+/// make a resume part of the comparison; the in-process half of that property is
+/// `src/runner/tests.rs`'s `a_preempted_process_resumes_on_its_cranelift_tier` and
+/// `a_receive_parked_process_resumes_on_its_cranelift_tier`.
+///
+/// [`support::PROBE_TIMEOUT`] needs no tier awareness: measured on a dev-profile build on a
+/// *shared* host, one `run` invocation costs ≈0.29–0.48 s on the interpreter tier, ≈0.34–0.55 s
+/// on the baseline tier and ≈1.21–1.94 s on the Cranelift tier (the hot tier eagerly compiles
+/// every module the boot script touches, so its figure is the whole session's) — the spread is
+/// two measurements of the same binary under different host load, and even its top end sits
+/// ~16× under the 30 s bound. Re-measure before tightening it: these are dev figures, and
+/// absolute wall times on this host are not stable.
+#[test]
+fn every_served_tier_runs_the_cli_rows_identically() {
+    for (label, args, expected) in equivalence_rows() {
+        // The reference run first: the comparison is against a real execution of the same row.
+        let reference = beam_rt(&args, Some("interpreter"));
+        assert_eq!(
+            reference.code, 0,
+            "{label} must run on the reference interpreter tier: stdout={:?} stderr={:?}",
+            reference.stdout, reference.stderr
+        );
+        assert_eq!(
+            reference.stdout, expected,
+            "{label} prints its fixture's answer on the interpreter tier: stderr={:?}",
+            reference.stderr
+        );
+        assert!(
+            reference.stderr.is_empty(),
+            "{label} is silent on stderr on the interpreter tier: {:?}",
+            reference.stderr
+        );
+
+        for tier in served_tiers() {
+            let run = beam_rt(&args, Some(tier));
+            assert_eq!(
+                run.code, 0,
+                "{label} must complete on the {tier} tier: stdout={:?} stderr={:?}",
+                run.stdout, run.stderr
+            );
+            assert_eq!(
+                run.stdout, expected,
+                "{label} must print its fixture's answer on the {tier} tier: stderr={:?}",
+                run.stderr
+            );
+            assert_eq!(
+                run.stdout, reference.stdout,
+                "{label} on the {tier} tier must agree with the interpreter reference: \
+                 stderr={:?}",
+                run.stderr
+            );
+            assert!(
+                run.stderr.is_empty(),
+                "{label} must be silent on stderr on the {tier} tier: {:?}",
+                run.stderr
+            );
+            assert!(
+                !run.stdout.contains("unsupported") && !run.stderr.contains("unsupported"),
+                "{label} on the {tier} tier must not report a capability gap: \
+                 stdout={:?} stderr={:?}",
+                run.stdout,
+                run.stderr
+            );
+        }
+    }
 }
