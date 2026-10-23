@@ -75,7 +75,9 @@ The same corpus is quoted on three denominators, and they are not interchangeabl
   taken on.
 Why visited < ranges (the gap is **472 046 = 13.2 %**), in two mechanisms:
 1. **The loop stops at a terminator.** `emit_block`'s range loop sets `terminated = true` and breaks
-   at **nine** sites (`../emit/block.rs:373, 477, 492, 501, 569, 640, 677, 770, 861`), so every
+   at **nine** sites — one per terminator arm, each a `terminated = true` + `break;` pair, the `break;`s
+   at `../emit/block.rs:374, 478, 493, 502, 570, 641, 678, 771, 862` (this is the tree's **only**
+   per-site enumeration; prose elsewhere names the nine pairs and points here) — so every
    instruction of a block's `[start, end)` range after its first block-terminating instruction is
    never counted — while `record_block` records the full `end − start`.
 2. **A continuation sub-block re-covers a tail.** `../emit/compile.rs::emit_sub_blocks` emits
@@ -272,9 +274,12 @@ else follows the installed OTP tree and is recorded as method + figure, never as
 - **Three different denominators are in circulation** (raw IR, Σ block ranges, visited instances) and
   no instrument prints the first. Quote a deopt fraction only against the **visited** total, and say
   so; `3.85 %` (visited) and `3.34 %` (Σ ranges) are the same 119 912 deopts.
-- **The recording-break sites are nine**: `../emit/block.rs` sets `terminated = true` (and `break`s
-  on the next line) at `:373, 477, 492, 501, 569, 640, 677, 770, 861` — prose elsewhere in the tree
-  says ten, and the list there names these same nine lines.
+- **The terminator sites are nine**: `../emit/block.rs` sets `terminated = true` and `break;`s on the
+  next line, one such pair per terminator arm. The **per-site line enumeration lives only** in "The
+  three instruction counting bases" above; every prose restatement elsewhere in the tree
+  (`MEASURED.md` §register cache traffic, `PERF.md`, `src/jit/CONTEXT.md`) names the nine
+  `terminated = true` + `break;` pairs and defers the numbers here instead of keeping a second list
+  that drifts.
 - **Crate-level copies of these figures are restatements, not the record.** The same corpus counters are
   quoted in `../../../MEASURED.md` (§register cache traffic: corpus line, the three store models and the
   byte deltas), `../../../PERF.md`, `../../../TEST_NOTES.md` (the census entry-point row),
