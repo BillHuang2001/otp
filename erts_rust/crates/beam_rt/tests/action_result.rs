@@ -216,9 +216,9 @@ fn an_action_leaves_no_process_behind() {
         inside - 1,
         "the second action must not leave a process behind either"
     );
-    let registered = rt.eval("whereis(init)").expect("the root is registered");
+    let registered = rt.eval("whereis(init)").expect("the `init` name is held");
     assert!(
         !beam_term::is_nil(registered),
-        "the root process must still be registered as `init` after the actions"
+        "the `init` name must still resolve after the actions"
     );
 }

@@ -84,6 +84,18 @@ const CLIENT_CREATION: u32 = 7;
 /// A scratch arena big enough for every payload these tests build.
 const HEAP_WORDS: usize = 1 << 16;
 
+/// The local name a test **registers for itself** on the process it then inspects.
+///
+/// A `DOP_REG_SEND` resolves its `To` through this runtime's name registry, so a test that
+/// wants the message to sit in *its own* process's mailbox must install a name on that
+/// process. It must **not** borrow one of `Runtime::new`'s names: [`Runtime::self_pid`] —
+/// the root process every action runs as (`<0.1.0>`) — is registered under **no** name,
+/// while the built-in `init` belongs to the runtime's **`init` stand-in**
+/// (`Runtime::init_pid`, `<0.0.0>`), a *different*, never-enqueued process. Addressing
+/// `init` therefore delivers into the stand-in's mailbox — which is exactly right for the
+/// wire, and useless for a test that watches the root.
+const DELIVERY_NAME: &str = "delivery-probe";
+
 // ---------------------------------------------------------------------------
 // The hermetic two-driver harness (mirrors `beam_dist/tests/delivery.rs`)
 // ---------------------------------------------------------------------------
@@ -230,9 +242,11 @@ fn an_inbound_reg_send_reaches_a_registered_name() {
     let (mut client, mut server) = establish();
     let mut heap = Heap::new(HEAP_WORDS).expect("heap");
 
-    // `init` is the name `Runtime::new` registers for the runtime's own root
-    // process, so it is the one local name a fresh runtime really holds.
-    let name = rt.intern("init");
+    // The recipient is a name this test registers for the runtime's own root process, so
+    // the lookup really has a local process behind it (see `DELIVERY_NAME`).
+    let root = rt.self_pid();
+    register_name(&mut rt, DELIVERY_NAME, root);
+    let name = rt.intern(DELIVERY_NAME);
     let from = make_small(11);
     let message = make_small(1234);
 
@@ -719,7 +733,14 @@ fn mailbox_len(rt: &Runtime, pid: ProcessId) -> usize {
         None => 0,
     }
 }
-
+/// Installs `name` on `pid` in this runtime's own name registry — what
+/// `erlang:register/2` does — so an inbound `DOP_REG_SEND` addressing it resolves to
+/// `pid` (see [`DELIVERY_NAME`] for why a test must install its own name rather than
+/// borrow a built-in one).
+fn register_name(rt: &mut Runtime, name: &str, pid: ProcessId) {
+    rt.register_boot_process(name, pid)
+        .expect("the test's own name is free and `pid` is live");
+}
 /// A **malformed** inbound `DOP_REG_SEND` reaches no mailbox and **retires its link**,
 /// while a well-formed one on the *same* link is delivered first.
 ///
@@ -736,9 +757,10 @@ fn a_malformed_inbound_reg_send_is_refused_and_retires_its_link() {
 
     let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
     let pid = rt.self_pid();
-    // The recipient is the runtime's own root process, which `Runtime::new` registers as
-    // `init` — a real local name, so the recipient alone would never stop a delivery.
-    let name = make_atom(atoms.intern("init"));
+    // The recipient is the runtime's own root process under a name this test registers for
+    // it — a real local name, so the recipient alone would never stop a delivery.
+    register_name(&mut rt, DELIVERY_NAME, pid);
+    let name = make_atom(atoms.intern(DELIVERY_NAME));
     let empty = make_small(0);
     // A well-formed sender: an external pid of **this link's peer**.
     let peer_pid =
@@ -829,6 +851,10 @@ fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
     let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
     let other_node = make_atom(atoms.intern("somewhere-else@host"));
     let pid = rt.self_pid();
+    // The recipient name, registered on the addressed process by the test itself — the
+    // `To` of every `DOP_REG_SEND` below must name a *local* process (see
+    // [`DELIVERY_NAME`]).
+    register_name(&mut rt, DELIVERY_NAME, pid);
     let to = make_external_pid(
         &mut heap,
         our_node,
@@ -837,10 +863,11 @@ fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
         creation,
     )
     .expect("the addressed pid");
-    let name = make_atom(atoms.intern("init"));
+    let name = make_atom(atoms.intern(DELIVERY_NAME));
     let empty = make_small(0);
     let peer_pid =
         make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION).expect("the peer's pid");
+
     let third_pid = make_external_pid(&mut heap, other_node, 3, 0, CLIENT_CREATION)
         .expect("a third node's pid");
 
@@ -938,6 +965,9 @@ fn a_zero_id_inbound_unlink_id_is_refused_and_retires_only_its_link() {
 
     let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
     let pid = rt.self_pid();
+    // The recipient name, registered on the addressed process by the test itself (see
+    // [`DELIVERY_NAME`]).
+    register_name(&mut rt, DELIVERY_NAME, pid);
     // The addressed local pid, in the shape the wire carries it: an external pid naming
     // **this** node at **this** creation (which the decode-side `LocalIdentity` demotes
     // back to the internal term). Its node atom is interned in the client's own table,
@@ -955,7 +985,7 @@ fn a_zero_id_inbound_unlink_id_is_refused_and_retires_only_its_link() {
         creation,
     )
     .expect("the addressed pid");
-    let name = make_atom(atoms.intern("init"));
+    let name = make_atom(atoms.intern(DELIVERY_NAME));
     let empty = make_small(0);
     let peer_pid = make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION)
         .expect("the peer's pid");
