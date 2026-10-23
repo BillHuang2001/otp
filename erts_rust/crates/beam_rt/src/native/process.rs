@@ -488,22 +488,26 @@ impl RuntimeContext<'_> {
             // cross-check that the generated `run/<captures + arity>` is the shape the argument
             // list has, so the child can never start at an entry of another arity.
             if call_args.len() as u32 == compiled.arity {
-                return Ok(self
-                    .runtime
-                    .spawn_process_with_policy(
-                        &compiled.module,
-                        crate::eval::compile::ENTRY_FUNCTION,
-                        call_args,
-                        policy,
-                        priority,
-                    )?
-                    .to_eterm());
+                let pid = self.runtime.spawn_process_with_policy(
+                    &compiled.module,
+                    crate::eval::compile::ENTRY_FUNCTION,
+                    call_args,
+                    policy,
+                    priority,
+                )?;
+                // As `spawn_in_pass`: the recorded parent is the **spawning** process, not the
+                // runtime's root (see `Runtime::set_parent`).
+                let parent = self.pid();
+                self.runtime.set_parent(pid, parent);
+                return Ok(pid.to_eterm());
             }
         }
-        Ok(self
+        let pid = self
             .runtime
-            .spawn_fun_process_with_policy(fun, args, policy, priority)?
-            .to_eterm())
+            .spawn_fun_process_with_policy(fun, args, policy, priority)?;
+        let parent = self.pid();
+        self.runtime.set_parent(pid, parent);
+        Ok(pid.to_eterm())
     }
 
     /// Spawns an `Module:Function(Args…)` child and answers its pid term.
@@ -537,10 +541,14 @@ impl RuntimeContext<'_> {
                 .resolve_export_entry(module, function, args.len() as u32)?;
             return self.spawn_in_pass(policy, priority, entry, args);
         }
-        Ok(self
+        let pid = self
             .runtime
-            .spawn_process_with_policy(module, function, args, policy, priority)?
-            .to_eterm())
+            .spawn_process_with_policy(module, function, args, policy, priority)?;
+        // As `spawn_in_pass`: the recorded parent is the **spawning** process, not the
+        // runtime's root (see `Runtime::set_parent`).
+        let parent = self.pid();
+        self.runtime.set_parent(pid, parent);
+        Ok(pid.to_eterm())
     }
 
     /// Creates a child in the **pass's** process table and records it for the pass to
@@ -579,6 +587,12 @@ impl RuntimeContext<'_> {
         // observed by everything `Parent` later spawns. The store lives on the `Runtime`, so
         // it is reachable from inside a scheduler slice too.
         self.runtime.inherit_group_leader(parent, pid);
+        // The C's `p->parent` (`erl_process.c`): the **spawning** process, which is what
+        // `process_info(Child, parent)` reports. Recording it here — rather than leaving the pid
+        // to the runtime's `init`-stand-in fallback — is what makes a grandchild name its real
+        // parent (measured on OTP 29.1.1 / erts-17.1: `<0.10.0>` spawns `<0.83.0>` spawns
+        // `<0.84.0>`, and the grandchild's `parent` is `<0.83.0>`, the middle process).
+        self.runtime.set_parent(pid, parent);
         self.runtime.note_pending_spawn(PendingSpawn { pid, entry, args })?;
         Ok(pid.to_eterm())
     }
