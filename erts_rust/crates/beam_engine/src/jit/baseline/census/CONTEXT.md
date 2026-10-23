@@ -275,9 +275,21 @@ else follows the installed OTP tree and is recorded as method + figure, never as
 - **The recording-break sites are nine**: `../emit/block.rs` sets `terminated = true` (and `break`s
   on the next line) at `:373, 477, 492, 501, 569, 640, 677, 770, 861` — prose elsewhere in the tree
   says ten, and the list there names these same nine lines.
-- **Crate-level copies of these figures live elsewhere** (`../../../MEASURED.md`, `../../../PERF.md`,
-  `../../../TEST_NOTES.md`) and are restatements, not the record: this node owns the method and the
-  corpus definition, so a figure quoted in prose elsewhere must be checked against the command here.
+- **Crate-level copies of these figures are restatements, not the record.** The same corpus counters are
+  quoted in `../../../MEASURED.md` (§register cache traffic: corpus line, the three store models and the
+  byte deltas), `../../../PERF.md`, `../../../TEST_NOTES.md` (the census entry-point row),
+  `../../../CONTEXT.md` (the inline-set row and the per-function `CodeBuffer` sizing row),
+  `../../CONTEXT.md` (Known Issues: the prose-only-totals row) and
+  `../{measure,emit/regs,emit/prologue,inlineset}/CONTEXT.md` (each lever's deterministic
+  counters). This node owns the method and the corpus definition, so a figure quoted there must be
+  re-derived from the command here, never copied onward.
+- **A two-state A/B pair cannot be refreshed by one run.** Several recorded deltas are before/after pairs
+  measured over **two tree states** at one corpus (`320 065 790 → 306 024 443` bytes, `7 167 996 →
+  2 707 930` push/pop ops, `756 632 → 352 537` prologue loads). A single census run yields only the
+  *current* absolute figure — re-measuring a pair means checking out both states, so a fresh absolute
+  must never be substituted into a pair's row. The *ratios* are also corpus-dependent: the dirty-vs-written
+  store ratio reads **−68.6 %** on today's 1359-module corpus against the **−65.9 %** recorded on the
+  1353-module one, so neither the absolutes nor the percentage carries over.
 - **A `Bif` total differs between Table 1 and Table 6** (10 014 vs 8 633) because the static census
   counts a **visited** instruction per emitted block while the refusal census counts each IR
   instruction **once**; neither is wrong and they are not comparable.
