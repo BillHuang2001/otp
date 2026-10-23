@@ -300,6 +300,16 @@ impl ExecutionContext for RuntimeContext<'_> {
         function: &str,
         arity: u32,
     ) -> Result<Option<(Arc<Module>, Label)>> {
+        // Record the call in the caller's `save_calls` ring — the C's
+        // `dispatch_save_calls_export` (`jit/x86/instr_call.rs:100-118`), which every
+        // `call_ext*` lands in while a buffer is armed, **whatever** the target turns out to be
+        // (a NIF, a fast-path BIF, a floor-served BIF, or a real `.beam` export). This is the
+        // one funnel both execution tiers resolve external calls through (`Machine::
+        // resolve_external_entry` for the interpreter, `jit_ext_call` for the native tier), so
+        // the ring sees exactly one entry per emitted `call_ext*`, like the oracle. A disarmed
+        // process costs one absent map probe.
+        self.runtime
+            .record_saved_call(self.pid(), module, function, arity);
         let trace_pid = self.mailbox_pid;
         // The floor's namespaces: `try_native` serves them for modules that are *also*
         // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
@@ -886,6 +896,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `remove_message`: unlink the matched candidate and reposition the scan at the
     /// first message.
     fn receive_remove(&mut self) -> Result<()> {
+        // The pseudo entry `'receive'` (`save_calls(c_p, &exp_receive)`,
+        // `jit/beam_jit_common.cpp:1098`), recorded when a matched message is taken.
+        let pid = self.pid();
+        self.runtime
+            .record_saved_pseudo(pid, crate::native::memory::last_calls::SavedEntry::Receive);
         let (queue, state) = self.mailbox_parts()?;
         state.remove(queue);
         Ok(())
@@ -893,6 +908,11 @@ impl ExecutionContext for RuntimeContext<'_> {
 
     /// `timeout`: reset the scan position to the first message.
     fn receive_reset(&mut self) -> Result<()> {
+        // The pseudo entry `timeout` (`save_calls(c_p, &exp_timeout)`,
+        // `jit/beam_jit_common.cpp:1251`), recorded when a `receive … after` fires.
+        let pid = self.pid();
+        self.runtime
+            .record_saved_pseudo(pid, crate::native::memory::last_calls::SavedEntry::Timeout);
         let (queue, state) = self.mailbox_parts()?;
         state.reset(queue);
         Ok(())

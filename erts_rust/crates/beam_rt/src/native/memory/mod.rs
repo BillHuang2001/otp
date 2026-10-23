@@ -244,6 +244,7 @@ use super::RuntimeContext;
 use crate::config::MaxHeapSetting;
 
 mod binary;
+pub(crate) mod last_calls;
 /// The C's `pi_1_keys[]` (`erl_bif_info.c:1008-1026`), in order — the item set *and* order
 /// `erlang:process_info/1` answers. `registered_name` is skipped when the process is
 /// unregistered (the C's `nil` skip), which is why the oracle emits 16 items.
@@ -306,6 +307,11 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "sequential_trace_token",
     "suspending",
     "last_calls",
+    "parent",
+    "label",
+    "priority_messages",
+    "magic_ref",
+    "garbage_collection_info",
     "memory",
     "binary",
 ];
@@ -315,52 +321,18 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
 ///
 /// `catchlevel` is **not** here: it is answerable through the engine (see
 /// [`RuntimeContext::catchlevel_value`]).
-const UNSUPPORTED_ITEMS: &[&str] = &[
-    "backtrace",
-    "magic_ref",
-    "parent",
-    "label",
-    "priority_messages",
-    "garbage_collection_info",
-];
+const UNSUPPORTED_ITEMS: &[&str] = &["backtrace"];
 
 /// Why each item in [`UNSUPPORTED_ITEMS`] cannot be answered — the precise missing
 /// accessor/hook, verified against the real backing code. [`RuntimeContext::unsupported_item`]
 /// reports this text, so a capability gap names what is actually missing instead of a vague
 /// placeholder. An item whose data becomes available must move to [`IMPLEMENTED_ITEMS`] and
 /// lose its row here.
-const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[
-    (
-        "backtrace",
-        "no raw/binary stack-dump accessor: the engine exposes only the cooked \
-         `Machine::current_stacktrace` list, never the C's `erts_stack_dump` binary",
-    ),
-    (
-        "magic_ref",
-        "no magic ref is bound into a process off-heap table: `beam_abi`'s NIF resource API \
-         (`enif_alloc_resource`/`enif_make_resource`) is unbound and nothing registers a \
-         resource with a process",
-    ),
-    (
-        "parent",
-        "no parent field on the PCB (`beam_process::Process`): the spawn path \
-         (`Runtime::spawn_process`/`spawn_fun_process`) never records the spawning process",
-    ),
-    (
-        "label",
-        "no label field on the PCB (`beam_process::Process`)",
-    ),
-    (
-        "priority_messages",
-        "no priority_messages flag in `beam_process::ProcessFlags`",
-    ),
-    (
-        "garbage_collection_info",
-        "`beam_gc::HeapInfo` tracks no per-generation block detail: the oracle's \
-         `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/\
-         `bin_old_vheap_block_size` are not measured by the collector",
-    ),
-];
+const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[(
+    "backtrace",
+    "no raw/binary stack-dump accessor: the engine exposes only the cooked \
+     `Machine::current_stacktrace` list, never the C's `erts_stack_dump` binary",
+)];
 
 /// One parsed `process_info` item: an atom name, or the `{dictionary, Key}` 2-tuple.
 enum Item {
@@ -450,6 +422,46 @@ impl Item {
                 terms::make_tuple(ctx, &[tag, *key])
             }
         }
+    }
+}
+
+/// The eleven figures of the `garbage_collection_info` item, in the oracle's key order
+/// (`erts_process_gc_info`, `erl_gc.c:3650-3740`).
+///
+/// Every field is a **word count read out of this runtime's own state** — never a constant
+/// copied from the oracle. Three of them (`mbuf_size`, `recent_size`, `bin_old_vheap_size`) are
+/// truthfully `0` here because this runtime has no such region/accounting at all; the module
+/// docs and this crate's `CONTEXT.md` name them.
+struct GcInfo {
+    old_heap_block_size: usize,
+    heap_block_size: usize,
+    mbuf_size: usize,
+    recent_size: usize,
+    stack_size: usize,
+    old_heap_size: usize,
+    heap_size: usize,
+    bin_vheap_size: usize,
+    bin_vheap_block_size: usize,
+    bin_old_vheap_size: usize,
+    bin_old_vheap_block_size: usize,
+}
+
+impl GcInfo {
+    /// The figures in the C's `values[]` order (`erl_gc.c:3667-3680`).
+    fn values(&self) -> [i64; 11] {
+        [
+            self.old_heap_block_size as i64,
+            self.heap_block_size as i64,
+            self.mbuf_size as i64,
+            self.recent_size as i64,
+            self.stack_size as i64,
+            self.old_heap_size as i64,
+            self.heap_size as i64,
+            self.bin_vheap_size as i64,
+            self.bin_vheap_block_size as i64,
+            self.bin_old_vheap_size as i64,
+            self.bin_old_vheap_block_size as i64,
+        ]
     }
 }
 
@@ -549,7 +561,18 @@ struct Snapshot {
     /// places a payload can be owned (see [`RuntimeContext::snapshot`], which reads the
     /// **executing** process's roster from the in-machine BIF door instead of the runner
     /// state), copied out so the reply can be built after the process table borrow ends.
-    off_heap_binaries: Vec<(usize, usize, usize)>,}
+    off_heap_binaries: Vec<(usize, usize, usize)>,
+    /// The spawning process — the `parent` item. This runtime's root pid stands in for `init`,
+    /// which is what a `-eval`/`-s`/`-run` process reports as its parent and what the runtime
+    /// records for every other process it spawns.
+    parent: ProcessId,
+    /// The process dictionary's `'$process_label'` value, or `None` when unset — the `label`
+    /// item. The C reads the same dictionary key (`erl_bif_info.c:2305-2315`), so a
+    /// `put('$process_label', X)` is reflected and nothing is cached.
+    label: Option<Eterm>,
+    /// The eleven `garbage_collection_info` figures.
+    gc_info: GcInfo,
+}
 
 /// The atom name of a boolean flag value (`true` / `false`).
 fn bool_atom(value: bool) -> &'static str {
@@ -1014,11 +1037,28 @@ impl RuntimeContext<'_> {
             },
             // An unchanging M1 default: no `suspend_process`.
             "suspending" => NIL,
-            // The oracle's own answer for a process with no saved-calls buffer
-            // (`erl_bif_info.c:2184-2188` returns `am_false`), which is every process this
-            // runtime runs: it never saves calls, so there is no `call`-flag call list to
-            // report. Not a placeholder — the true value.
-            "last_calls" => self.atom("false")?,
+            // The armed `save_calls` ring, newest first; the bare `false` while no buffer is
+            // armed (`erl_bif_info.c:2184-2188`). See [`Self::last_calls_value`].
+            "last_calls" => self.last_calls_value(snapshot.pid)?,
+            // The C's `p->parent` PCB field (`erl_bif_info.c:2300-2304`).
+            "parent" => snapshot.parent.to_eterm(),
+            // The process dictionary's `'$process_label'` (`erl_bif_info.c:2305-2315`), which is
+            // exactly what `process_flag`-style labelling writes; unset ⇒ `undefined`.
+            "label" => match snapshot.label {
+                Some(value) => value,
+                None => self.atom("undefined")?,
+            },
+            // The C's `F_PRIORITY_RECEIVE` flag as a **boolean** (`erl_bif_info.c:2288`). This
+            // runtime has no priority message queue, so `false` is the true value.
+            "priority_messages" => self.atom("false")?,
+            // The C's magic-ref list (`bld_magic_ref_bin_list`, `erl_bif_info.c`): magic refs
+            // bound to a *resource* are listed and all others skipped, so a process that bound
+            // none answers the empty list — which is every process here, since nothing in this
+            // runtime binds a magic ref to a process off-heap table.
+            "magic_ref" => NIL,
+            // The eleven-figure proplist in the C's own key order — see
+            // [`Self::garbage_collection_info`].
+            "garbage_collection_info" => self.garbage_collection_info(snapshot)?,
             // The process's off-heap refc binaries as the oracle's `[{Ptr, Size, Refc}, …]`
             // roster (the empty list when it owns none) — see [`Self::binary_value`].
             "binary" => self.binary_value(snapshot)?,
@@ -1030,6 +1070,75 @@ impl RuntimeContext<'_> {
             _ => return Ok(None),
         };
         Ok(Some(value))
+    }
+
+    /// The `garbage_collection_info` item: the oracle's ordered **eleven**-pair proplist, in
+    /// the C's key order (`erl_gc.c:3650-3740`; verified against OTP 29.1.1 / erts-17.1).
+    ///
+    /// Every value is this runtime's own figure ([`GcInfo`]): the nursery/mature capacities and
+    /// live word counts out of the process's collector, the Erlang stack's word count, and the
+    /// off-heap overhead in words. `mbuf_size`, `recent_size` and `bin_old_vheap_size` are `0`
+    /// — this runtime has no on-heap message buffers, no heap high-water counter and no old
+    /// bin-vheap accounting — and `bin_vheap_block_size`/`bin_old_vheap_block_size` are the bin
+    /// vheap block size the process's heap policy installs (the reclaimer's limit), which is the
+    /// figure the C keeps in `p->bin_vheap_sz`/`p->bin_old_vheap_sz`.
+    fn garbage_collection_info(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
+        const KEYS: [&str; 11] = [
+            "old_heap_block_size",
+            "heap_block_size",
+            "mbuf_size",
+            "recent_size",
+            "stack_size",
+            "old_heap_size",
+            "heap_size",
+            "bin_vheap_size",
+            "bin_vheap_block_size",
+            "bin_old_vheap_size",
+            "bin_old_vheap_block_size",
+        ];
+        let values = snapshot.gc_info.values();
+        let mut entries = Vec::with_capacity(KEYS.len());
+        for (key, value) in KEYS.iter().zip(values) {
+            let key = self.atom(key)?;
+            entries.push(terms::make_tuple(self, &[key, make_small(value)])?);
+        }
+        terms::make_list(self, &entries)
+    }
+
+    /// The `last_calls` item: the bare `false` while no `save_calls` buffer is armed, else the
+    /// ring's entries **newest first**, each a `{Module, Function, Arity}` triple or one of the
+    /// bare atoms `send`/`'receive'`/`timeout`.
+    ///
+    /// The ring is read out of [`Runtime::saved_calls`](crate::Runtime::saved_calls) — the same
+    /// store `process_flag(save_calls, N)` arms and the call sites append to, so the item, the
+    /// flag's previous-value reply and the recordings can never disagree.
+    fn last_calls_value(&mut self, pid: ProcessId) -> Result<Eterm> {
+        let Some(ring) = self.runtime.saved_calls(pid) else {
+            return self.atom("false");
+        };
+        // Copied out before anything is built: the reply needs `&mut self` while `ring` borrows
+        // the runtime. A `SavedEntry` is owned text plus an integer, so this is a shallow clone
+        // of nothing heap-unsafe (the owned-copy rule — no term outlives a heap here).
+        let recorded: Vec<last_calls::SavedEntry> = ring.entries().cloned().collect();
+        let mut entries = Vec::with_capacity(recorded.len());
+        for entry in recorded.iter().rev() {
+            let term = match entry {
+                last_calls::SavedEntry::Mfa {
+                    module,
+                    function,
+                    arity,
+                } => {
+                    let module = self.atom(module)?;
+                    let function = self.atom(function)?;
+                    terms::make_tuple(self, &[module, function, make_small(i64::from(*arity))])?
+                }
+                last_calls::SavedEntry::Send => self.atom("send")?,
+                last_calls::SavedEntry::Receive => self.atom("receive")?,
+                last_calls::SavedEntry::Timeout => self.atom("timeout")?,
+            };
+            entries.push(term);
+        }
+        terms::make_list(self, &entries)
     }
 
     /// The `monitors` value: `[{process | port, Pid}]`.
@@ -1395,6 +1504,53 @@ impl RuntimeContext<'_> {
             },
             off_heap_bytes: process.off_heap().overhead_bytes(),
             off_heap_binaries,
+            parent: self.runtime.parent_of(pid),
+            label: {
+                let key = atoms.lookup("$process_label").map(beam_term::make_atom);
+                key.and_then(|key| {
+                    process
+                        .dict()
+                        .entries()
+                        .find(|(stored, _)| *stored == key)
+                        .map(|(_, value)| value)
+                })
+            },
+            gc_info: GcInfo {
+                // `OLD_HEAP ? OLD_HEND - OLD_HEAP : 0` (`erl_gc.c:3668`): the mature block's
+                // capacity, and `0` while no collection has created one — which is exactly when
+                // `old_heap_size_words()` is 0 here.
+                old_heap_block_size: process.collector().old_heap_size_words(),
+                // `HEAP_SIZE(p)` (`erl_gc.c:3669`): the C's own `heap_size` item.
+                heap_block_size: process.collector().heap_size_words(),
+                // `MBUF_SIZE(p)`: on-heap message buffers. This runtime's message queue is a
+                // heap-resident Rust FIFO with no on-heap block, so there is no such region.
+                mbuf_size: 0,
+                // `HIGH_WATER(p) - HEAP_START(p)`: the high-water mark since the last
+                // collection. The collector tracks no high-water mark, so this runtime cannot
+                // answer it (see the crate `CONTEXT.md` `## Known Issues`).
+                recent_size: 0,
+                // `STACK_START(p) - p->stop` (`erl_gc.c:3672`) — the same figure the
+                // `stack_size` item reports.
+                stack_size: process.registers().stack().len(),
+                // `OLD_HEAP ? OLD_HTOP - OLD_HEAP : 0`: the mature generation's live words.
+                old_heap_size: process
+                    .collector()
+                    .total_heap_used_words()
+                    .saturating_sub(process.collector().heap_used_words()),
+                // `HEAP_TOP - HEAP_START`: the nursery's live words.
+                heap_size: process.collector().heap_used_words(),
+                // `MSO(p).overhead`, in words (the off-heap overhead the `memory` item charges
+                // in bytes).
+                bin_vheap_size: process.off_heap().overhead_bytes() / 8,
+                // `p->bin_vheap_sz`: the bin vheap block this process's heap policy installs
+                // (the off-heap reclaimer's limit, `crate::context::gc::bin_vheap`).
+                bin_vheap_block_size: process.collector().policy().min_bin_vheap_words,
+                // `p->bin_old_vheap`: the old bin-vheap accounting. This runtime keeps one bin
+                // vheap per process and no old generation for it (see the crate `CONTEXT.md`).
+                bin_old_vheap_size: 0,
+                // `p->bin_old_vheap_sz` — the same block size, as in the C.
+                bin_old_vheap_block_size: process.collector().policy().min_bin_vheap_words,
+            },
         })
     }
 
