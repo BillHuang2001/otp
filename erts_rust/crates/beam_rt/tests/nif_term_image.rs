@@ -369,14 +369,16 @@ fn enif_term_to_binary_of_a_local_fun_emits_new_fun_ext() {
     match applied {
         "applied}" => {}
         // `binary_to_term/1` of a `NEW_FUN_EXT` image yields this tree's `Imported` fun kind,
-        // which `RuntimeContext::local_fun_target` declines (`beam_term::fun::fun_uniq` rejects
-        // a non-`Local` fun), so `apply_fun` answers `badarg`. That is a *decode-side apply*
-        // gap, independent of the encoding closed here: it is reported loudly, never hidden.
+        // which `RuntimeContext::imported_fun_target` resolves to the lambda the image names
+        // (the C's `call_fun` cannot tell the two encodings apart either), so `apply_fun` runs
+        // the body. A failed apply is therefore a real regression, reported loudly — an image
+        // naming **no** lambda of a loaded module is the C's `EXC_BADFUN`
+        // (`crate::error::bad_fun`), never the old `badarg`.
         "failed}" => eprintln!(
             "SKIP (pre-existing gap, not this test's subject): applying the decoded \
-             NEW_FUN_EXT fun answers badarg — `local_fun_target` has no `Imported`-kind arm \
-             (`apply_fun` -> `apply_non_local_fun` -> the `-eval` closure store). The image \
-             itself is correct: {stdout}"
+             NEW_FUN_EXT fun failed — the `Imported`-kind arm (`imported_fun_target`) \
+             should have resolved the image's own `(uniq, index)` entry \
+             (`apply_fun` -> `run_label_blocking`). The image itself is correct: {stdout}"
         ),
         other => panic!("the decoded fun must apply to 43 - 1 = 42, got {other} in {stdout:?}"),
     }

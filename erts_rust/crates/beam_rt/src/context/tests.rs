@@ -9740,7 +9740,35 @@ fn a_decoded_closure_resolves_to_its_lambda_and_applies_through_both_routes() {
     );
 }
 
-/// **An imported fun whose identity names no lambda of its module is the typed `badarg`.**
+/// Asserts the C's `EXC_BADFUN` **pre-expansion** signal: class `error`, reason atom
+/// `badfun`.
+///
+/// `beam_common.c:1696-1706` sets `p->freason = EXC_BADFUN` (and `p->fvalue = fun`) when a
+/// module **is** loaded but the fun is not defined in it; `expand_error_value`
+/// (`:750-772`) then wraps the pair into `TUPLE2(am_badfun, fun)`. The host seam can only
+/// report the first half (it holds the fun as a bare `Eterm` that must not survive the
+/// tuple's allocation), so it is the class + reason atom that is asserted here; the
+/// expansion is the engine's (`beam_engine::families::funs::raise_badfun`).
+fn assert_badfun(error: BeamError, what: &str) {
+    match &error {
+        BeamError::Raise(raise) => {
+            assert_eq!(
+                raise.class,
+                beam_common::ExceptionClass::Error,
+                "{what}: the C's EXC_BADFUN is an `error`-class raise, got {error:?}"
+            );
+            assert_eq!(
+                raise.reason.as_atom(),
+                Some("badfun"),
+                "{what}: the C's EXC_BADFUN reason atom is `badfun`, got {error:?}"
+            );
+        }
+        other => panic!("{what}: expected the C's EXC_BADFUN raise, got {other:?}"),
+    }
+}
+
+/// **An imported fun whose identity names no lambda of its module raises the C's
+/// `EXC_BADFUN`.**
 ///
 /// Two wire images that differ from a genuinely resolvable one in exactly one identity
 /// field, both built with [`beam_codec::term::make_fun_imported`] over the loaded `dfun`
@@ -9749,21 +9777,23 @@ fn a_decoded_closure_resolves_to_its_lambda_and_applies_through_both_routes() {
 /// * an `index` no `FunT` entry carries (`index + 7`) — the descriptor lookup fails;
 /// * a 16-byte `uniq` with **one flipped byte** — the C's `fun_cmp` compares the module's
 ///   checksum, so a stale image must not bind to a recompiled module's lambda
-///   (`erts/emulator/beam/erl_fun.c::fun_cmp`).
+///   (`erts/emulator/beam/erl_fun.c::fun_cmp`). The oracle raises the **same** `badfun`
+///   for it as for a bad index (measured on OTP 29.1.1).
 ///
-/// Both answer [`BeamError::BadArg`] on every entry point that resolves an imported closure
+/// Both answer the `badfun` raise on every entry point that resolves an imported closure
 /// ([`RuntimeContext::imported_fun_target`], the engine's
 /// [`ExecutionContext::resolve_local_fun`] seam and [`ExecutionContext::apply_fun`]).
+/// Before this change every one of them answered [`BeamError::BadArg`], i.e. the oracle's
+/// class was wrong *and* its reason was wrong.
 ///
-/// **Honest residual, pinned here rather than hidden:** for an *imported* closure over a
-/// module that **is** loaded and simply names no lambda, the oracle raises
-/// `{error,{badfun,F}}` (C's `call_fun`, `beam_common.c:1700-1707`; measured
-/// `{error,badfun}` on OTP 29.1.1) where this runtime answers the typed `badarg` — its
-/// fun-apply seams cannot yet distinguish "no such lambda" from "the host cannot run this
-/// fun in-machine", and fabricating an entry is not an option. Closing it needs a seam
-/// answer with that third outcome.
+/// **Residual, measured rather than hidden:** the reason is the bare atom, so a catch
+/// observes `{error, badfun}` where the oracle gives `{error, {badfun, F}}` — the
+/// `expand_error_value` half is the engine's and is not wired yet (see
+/// [`crate::error::bad_fun`]). The **class and the reason atom agree with the oracle**,
+/// which is the divergence this test pins; the integration suite
+/// `tests/decoded_fun_badfun.rs` pins the same answer end to end on both execution tiers.
 #[test]
-fn an_imported_fun_naming_no_lambda_is_the_typed_badarg() {
+fn an_imported_fun_naming_no_lambda_raises_badfun() {
     let Some(erlc) = resolve_erlc() else {
         skip_loudly(
             "new_fun_ext seam",
@@ -9826,18 +9856,23 @@ fn an_imported_fun_naming_no_lambda_is_the_typed_badarg() {
         ("an index no lambda carries", no_such_lambda),
         ("a flipped `uniq` byte", stale_module),
     ] {
-        assert!(
-            matches!(ctx.imported_fun_target(fun, &args), Err(BeamError::BadArg)),
-            "{name} must not resolve to an entry"
-        );
-        assert!(
-            matches!(ctx.resolve_local_fun(fun, &args), Err(BeamError::BadArg)),
-            "{name} must not enter an in-machine label"
-        );
-        assert!(
-            matches!(ctx.apply_fun(fun, &args), Err(BeamError::BadArg)),
-            "{name} must not be applied"
-        );
+        // `LocalFunTarget` is not `Debug`, so the error half is taken by `match` rather than
+        // `expect_err`.
+        let error = match ctx.imported_fun_target(fun, &args) {
+            Err(error) => error,
+            Ok(_) => panic!("{name} must not resolve to an entry"),
+        };
+        assert_badfun(error, name);
+        let error = match ctx.resolve_local_fun(fun, &args) {
+            Err(error) => error,
+            Ok(_) => panic!("{name} must not enter an in-machine label"),
+        };
+        assert_badfun(error, name);
+        let error = match ctx.apply_fun(fun, &args) {
+            Err(error) => error,
+            Ok(_) => panic!("{name} must not be applied"),
+        };
+        assert_badfun(error, name);
     }
     // The control: the same construction with the genuine identity **does** resolve, so the two
     // refusals above are the identity guard's and not a broken fixture.
