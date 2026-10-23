@@ -98,8 +98,10 @@ use beam_term::prelude::{
 /// sink is called, so this arm serves only the unchecked view.
 ///
 /// **Not routed** — the distributed-spawn family and [`Delivery::Other`] are reported as
-/// [`DeliveryOutcome::Unsupported`], with the still-missing sibling API named at each
-/// match arm. (The `DOP_MONITOR_P_EXIT`-on-local-death echo a recorded
+/// [`DeliveryOutcome::Unsupported`], each for its own reason at the arm: the spawn family
+/// lacks this crate's half of the seam only (`beam_process`'s reservation surface and
+/// `beam_dist`'s model of both opcodes both exist), while `beam_dist` models no delivery
+/// for [`Delivery::Other`] at all. (The `DOP_MONITOR_P_EXIT`-on-local-death echo a recorded
 /// [`RemoteWatcher`](beam_process::RemoteWatcher) owes its peer is the **outbound** half,
 /// not this sink's: `ProcessTable::terminate_into` routes a
 /// [`DistSignal::MonitorExit`](beam_process::DistSignal) per watched record and
