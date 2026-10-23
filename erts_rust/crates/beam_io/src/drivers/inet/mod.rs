@@ -1471,6 +1471,16 @@ impl TcpInetDriver {
             source.reason().unwrap_or(InetReason::Closed),
         )?;
         ctx.output().clear();
+        // The C's `tcp_desc_close` → `tcp_clear_output` leaves **no** half-stripped command
+        // behind: the next `port_command` is a fresh `ev` and `init_caller` runs on it from
+        // scratch (`inet_drv.c:1820`). This floor's strip state is per-command bookkeeping that
+        // survives the queue, so it must be reset with it — otherwise the **next** command's tag
+        // is never taken off (`strip_command_prefix` short-circuits on `caller_stripped`) and its
+        // caller is never answered at all: the process parks on the port instead of reading the
+        // ladder's `{error, enotconn}`. Measured (`gen_tcp` after `shutdown(S, write)`): the
+        // second non-empty send is exactly that command.
+        self.caller_stripped = false;
+        self.out_framed = false;
         let released = self.deregister(ctx);
         // `tcp_recv_closed`/`tcp_recv_error`/`tcp_send_or_shutdown_error`'s passive
         // `tcp_desc_close` (`inet_drv.c:12825`, `:12873`, `:13670`).
@@ -2749,6 +2759,9 @@ mod tests;
 #[cfg(test)]
 #[path = "write_frame_tests.rs"]
 mod write_frame_tests;
+#[cfg(test)]
+#[path = "write_shutdown_matrix_tests.rs"]
+mod write_shutdown_matrix_tests;
 // The **read-path ordering** pin: a complete buffered unit wins over a pending close — the C's
 // `tcp_recv` delivers what the drain collected (`inet_drv.c:13216`-`:13217`/`:13229`-`:13230`)
 // before a later call's `n == 0` may reach `tcp_recv_closed` (`:13206`-`:13208`).

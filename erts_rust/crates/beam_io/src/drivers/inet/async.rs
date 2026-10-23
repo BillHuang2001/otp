@@ -767,6 +767,36 @@ impl TcpInetDriver {
         // touch a dead socket (`self.peer_close.seen`, `mod.rs`) and leaves the payload queued with
         // **no** reply at all, where the C answers `{error, closed}`/`{error, enotconn}` from the
         // send ladder below. The two conditions are therefore one arm, not two.
+        //
+        // The C's **zero-length exemption precedes every closed check**. `tcp_inet_commandv`'s
+        // `!IS_CONNECTED` arm replies and never queues, so the output queue is always empty when
+        // `tcp_sendv` runs, and its shortcut `if ((h_len == 0) && (len == 0)) return 0;`
+        // (`inet_drv.c:13736`, inside the `driver_sizeq(port) == 0` arm) therefore answers
+        // `inet_reply_ok` for an empty write **unconditionally and any number of times** — an
+        // empty write is exempt from the half-close's closed ladder until a non-empty write has
+        // actually failed and the descriptor is closed. Measured on the oracle (OTP 29.1.1):
+        // after `gen_tcp:shutdown(S, write)` every `gen_tcp:send(S, <<>>)` / `[]` / `[<<>>,[]]`
+        // answers `ok`, and only after a *non-empty* send has answered `{error,closed}` does an
+        // empty one answer `{error,enotconn}`.
+        //
+        // So an empty payload is answered `ok` here — before the ladder — while the socket is
+        // still connected and no close has been latched. Under `{packet, N}` the C's `h_len` is
+        // not zero (a 1-/2-/4-byte header is still written for an empty payload), so the
+        // exemption is keyed on **both** lengths, exactly as the C is.
+        if self.state.is_connected() && !self.peer_close.seen {
+            let payload_len = ctx.output().len();
+            if payload_len == 0 && frame::write_header(&self.options, payload_len).is_none() {
+                self.out_framed = false;
+                self.caller_stripped = false;
+                if let Some(tag) = self.caller_ref.take() {
+                    ctx.deliver_completion(CompletionEvent::InetReply {
+                        caller_ref: Some(tag),
+                        reply: InetReply::Ok,
+                    })?;
+                }
+                return Ok(stripped);
+            }
+        }
         if !self.state.is_connected() || self.peer_close.seen {
             // The C's `!IS_CONNECTED` arm (`:12674`-`:12683`): the command is accepted (the port
             // charged `prt->bytes_out += size` for it) but never written, and the caller learns
