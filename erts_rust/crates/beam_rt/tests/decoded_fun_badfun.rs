@@ -338,17 +338,20 @@ struct Run {
 }
 
 /// Runs `program args` with `/dev/null` as stdin, polling so a probe that blocks is killed at
-/// [`support::PROBE_TIMEOUT`] instead of hanging the suite.
-fn run_bounded(program: &Path, args: &[&str], env: Option<(&str, &str)>) -> Run {
+/// [`support::PROBE_TIMEOUT`] instead of hanging the suite. The `env` pair is always applied: a
+/// `None` value **removes** the variable, so the `default` tier row is the process default even
+/// when the ambient environment carries a `BEAM_RT_TIER`.
+fn run_bounded(program: &Path, args: &[&str], env: (&str, Option<&str>)) -> Run {
     let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some((key, value)) = env {
-        command.env(key, value);
-    }
+    match env.1 {
+        Some(value) => command.env(env.0, value),
+        None => command.env_remove(env.0),
+    };
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("cannot spawn `{}`: {error}", program.display()));
@@ -378,7 +381,8 @@ fn run_bounded(program: &Path, args: &[&str], env: Option<(&str, &str)>) -> Run 
 }
 
 /// `beam_rt run nfbadfun.beam nfbadfun:<function>/0` on the tier `tier` names (`None` = the
-/// process default), printing the result with `~w` exactly as the CLI does.
+/// process default, i.e. the variable is **removed** from the child), printing the result with
+/// `~w` exactly as the CLI does.
 fn run_on_tier(fixtures: &Fixtures, function: &str, tier: Option<&str>) -> Run {
     let beam = fixtures.beam();
     let beam = beam
@@ -388,7 +392,7 @@ fn run_on_tier(fixtures: &Fixtures, function: &str, tier: Option<&str>) -> Run {
     run_bounded(
         Path::new(BINARY),
         &["-noshell", "-pa", fixtures.dir_str(), "run", beam, &spec],
-        tier.map(|tier| ("BEAM_RT_TIER", tier)),
+        ("BEAM_RT_TIER", tier),
     )
 }
 

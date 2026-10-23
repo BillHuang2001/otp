@@ -74,12 +74,19 @@
 //!
 //! # The execution tier of a first entry
 //!
-//! A process's **first** entry can run on either execution tier (`beam_engine::Tier`), and the
-//! chosen tier is carried across every later slice. [`tier`] owns the selection and the
-//! soundness argument for it: the engine's baseline driver handles the module-context switch
-//! (`Step::Enter`), so the native tier is sound for **any** module and [`JitMode::Auto`] —
-//! **the default** — selects it for every process entry. [`Interpreter`](tier::JitMode::Interpreter)
-//! (the `BEAM_RT_TIER=interpreter` kill switch) pins the always-correct reference tier.
+//! A process's **first** entry can run on any of the engine's three execution tiers
+//! (`beam_engine::Tier`), and the chosen tier is carried across every later slice. [`tier`] owns
+//! the selection and the soundness argument for it: the engine's baseline driver handles the
+//! module-context switch (`Step::Enter`), so the native tier is sound for **any** module and
+//! [`JitMode::Auto`] — **the default** — selects it for every process entry.
+//! [`Interpreter`](tier::JitMode::Interpreter) (the `BEAM_RT_TIER=interpreter` kill switch) pins
+//! the always-correct reference tier, and `BEAM_RT_TIER=cranelift` selects the optional Cranelift
+//! hot tier (`JitMode::Cranelift`), which exists only in a build with this crate's `cranelift`
+//! Cargo feature (forwarding `beam_engine/jit-cranelift`): with the feature off the engine answers
+//! a typed `unsupported` naming the feature and the process exits 3 — never a substitute tier.
+//! At this HEAD the hot tier serves a **first entry** (compiled per function, deopting per
+//! instruction, so interpreter-identical) but **not a resume**: a suspension on it is a typed
+//! capability gap, not a silently demoted tier.
 //!
 //! # Why the default is the native tier
 //!

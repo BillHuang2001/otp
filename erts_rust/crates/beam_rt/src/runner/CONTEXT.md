@@ -10,8 +10,10 @@ that runs **as that pid** in the caller-supplied process table, takes the pid's 
 (the return value on the pointer-stable arena, or the raise's reason term).
 
 This node additionally owns **the execution-tier decision**: a process's *first* entry runs on the
-native baseline tier ([`beam_engine::Tier::BaselineJit`]) unless the mode pins the interpreter, and the
-decision is **remembered on the engine** (`ProcessEngine::tier`) and re-used by every later re-entry,
+native baseline tier ([`beam_engine::Tier::BaselineJit`]) unless the mode pins the reference
+interpreter ([`beam_engine::Tier::Interpreter`]) or the optional Cranelift hot tier
+([`beam_engine::Tier::Cranelift`]), and the decision is **remembered on the engine**
+(`ProcessEngine::tier`) and re-used by every later re-entry,
 so a process keeps its tier for its whole life. The **default is `Auto`**, which selects the baseline
 tier for **every** process entry: the engine's driver handles the module-context switch itself, so no
 per-module safety predicate exists (see `## The tier is sound for any module`).
@@ -140,7 +142,7 @@ characterisation and figures are in `PERF.md`).
   `BudgetContext`/`BudgetProbe` construction is **stack-only** (no `Vec`/`String`/`Rc` on the hot path);
   the only per-slice heap work below the outcome match is the machine's own off-heap reservoir, which
   is left where it is (no registration, no slot handed out).
-* [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
+* [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline` / `Cranelift`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
   tier-decision seam.
@@ -156,10 +158,22 @@ characterisation and figures are in `PERF.md`).
 | unset | `Auto` | **the default**: the native baseline tier for **every** process entry |
 | `auto` | `Auto` | the default, named explicitly |
 | `baseline` | `Baseline` | the same selection, forced explicitly (a measurement/debugging alias of the default) |
+| `cranelift`, `jit-cranelift` | `Cranelift` | the optional Cranelift hot tier (`Tier::Cranelift`); selectable only in a build with the runtime's `cranelift` Cargo feature — see `## The Cranelift tier and its feature gate` |
 | `interpreter`, anything else | `Interpreter` | the always-correct reference tier, and the **kill switch**; an unknown value resolves to it, never an error |
 
 `JitMode`'s derived `Default` is `Auto`, so omitting the mode anywhere selects the native tier;
 `env_default()` memoizes the environment resolution in a `OnceLock` (one `getenv` per process).
+`jit-cranelift` is accepted because it is the spelling of [`Tier::Cranelift`](beam_engine::Tier::Cranelift)'s own `name()`, so a value copied from a tier report selects that tier back.
+`hot` is deliberately not a value: the hot tier is named by what it is, not by how fast it should be.
+
+## The Cranelift tier and its feature gate
+The Cranelift backend is compiled in only behind the runtime's **`cranelift`** Cargo feature, which forwards `beam_engine/jit-cranelift`; it is **default OFF**, so a plain `cargo build` has no hot tier at all.
+The selection is not feature-gated — `select_entry_tier` answers `Tier::Cranelift` for `JitMode::Cranelift` unconditionally — because the gate belongs to the crate that owns the backend: with the feature off, `beam_engine`'s Cranelift entry points answer `Err(unsupported("jit-cranelift tier not built"))`, which `crate::error::unsupported_reason` classifies, so the CLI prints `beam_rt: unsupported: opcode: jit-cranelift tier not built` and exits `EXIT_UNSUPPORTED` (3).
+That failure is **loud by design**: no other tier is run in its place, so a `BEAM_RT_TIER=cranelift` invocation in a feature-off build can never be mistaken for a working hot tier.
+`beam_rt` adds no second feature gate of its own.
+
+A Cranelift process's **first entry is supported and tier-equivalent** to the interpreter (the tier compiles per function and deopts per instruction to `Machine::step_instruction`), but a **suspension is a typed capability gap at this HEAD**: the tier has no resume entry point, so `beam_engine` answers `unsupported("cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)")` and a process that pre-empts on the reduction budget or parks in a `receive` dies with that exit-3 error instead of resuming.
+The tier is still selected once, at the first entry, and remembered on the engine (`ProcessEngine::tier`); a resume re-enters through `Machine::resume_outcome_with_tier` on that same tier.
 
 ## How the tier is selected
 In [`run`]'s slice, **before** the `RuntimeContext` borrow (the context takes `Runtime` mutably):
@@ -180,6 +194,7 @@ to the plain `Machine::resume_outcome` (so an interpreter-tier process is byte-f
 baseline tier is sound for any module (see `## The tier is sound for any module`), so neither the
 entry's module nor its code is inspected. The mode resolves from `state.jit_mode` if set (tests), else
 the process-wide `BEAM_RT_TIER` default ([`env_default`]).
+`JitMode::Cranelift` selects its own tier (`Tier::Cranelift`) and changes nothing else about the decision; whether that tier exists in the current build is the engine's `jit-cranelift` feature gate, so there is no second availability arm here (see `## The Cranelift tier and its feature gate`).
 
 ## The tier is sound for any module
 [`select_entry_tier`] picks `BaselineJit` from the mode alone: there is **no module the baseline tier
@@ -286,7 +301,7 @@ per-iteration):
 
 ## Measured
 The tier is taken on a process's **first** entry and then carried for its whole life, and the observable consequences are pinned structurally rather than timed: a pre-empted slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the process was selected for (`a_preempted_process_resumes_on_its_baseline_tier` / `a_receive_parked_process_resumes_on_its_baseline_tier`), an interpreter-tier process never changes through a resume (`an_interpreter_tier_process_is_unchanged_across_a_resume`), and a native block's slice charge is exact ([`tests/slice_charging.rs`](tests/slice_charging.rs)'s `the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice`).
-`BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the default (`Auto`, and its `baseline` alias) puts every process on the native tier.
+`BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the default (`Auto`, and its `baseline` alias) puts every process on the native tier, and `cranelift`/`jit-cranelift` names the optional hot tier without changing the default.
 Per-workload speed and memory figures are **measured, never modelled**; the full cross-runtime record lives in [`../../PERF.md`](../../PERF.md) and the bench driver's [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md).
 Headline rust/sys ratios on this runtime's default baseline-JIT tier against OTP 29.1.1 / erts-17.1 — each with its own estimator, loop count and caveats in [`MEASURED.md`](MEASURED.md):
 
@@ -314,7 +329,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   makes it `unsafe`). `BEAM_RT_TIER` is the CLI-facing equivalent, and its semantics are pinned through
   the pure `mode_from_value` (not through the environment).
 * `JitMode::Baseline` is an alias of the default selection (`Tier::BaselineJit`); only
-  `JitMode::Interpreter` turns the native tier off.
+  `JitMode::Interpreter` turns the native tier off, and `JitMode::Cranelift` is the third selection
+  (its availability is the engine's `jit-cranelift` feature, never a mode).
 
 ## Test Strategy
 * `#[cfg(test)]` units in [`tests`]: `select_entry_tier` over the real tier fixtures — the default
@@ -323,7 +339,21 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   unresolved **fun** entry takes the same tier as an export entry; only `Interpreter` selects
   `Tier::Interpreter`. `the_unset_default_resolves_to_auto` pins the `BEAM_RT_TIER` value semantics and
   `JitMode::default()` through the pure `mode_from_value`.
-* Tier persistence across a resume, proven through the per-thread **baseline compiled-block cache**
+* The third tier's rows of the same suite pin its contract: the pure resolution — `cranelift` and
+  `jit-cranelift` both `Cranelift`, the four named values and the **unknown-value rule** (an
+  unrecognised string is `Interpreter`, never an error and never the hot tier) — `select_entry_tier`
+  answering `Tier::Cranelift` over the same real tier fixtures the baseline rows use, and the
+  **feature-off typed gap** (the entry fails with the engine's
+  `unsupported: opcode: jit-cranelift tier not built`, never a substituted tier); on a `cranelift`
+  build a **three-tier first-entry agreement** runs one entry on `Interpreter`/`BaselineJit`/`Cranelift`
+  and asserts the same answer on all three. The `cranelift` Cargo feature is not required by the crate
+  gate, so the feature-off row is the one that always runs.
+* **The suites that enumerate tiers as strings enumerate exactly two, deliberately.** `tests/nif.rs`'s
+  `TIERS`, `tests/zlib_{guards,one_shot,stream_levels,stream_dict}.rs`'s `Tier` enums,
+  `tests/decoded_fun_badfun.rs`'s `TIERS` and `tests/compile_file.rs`'s tier loop all pin the
+  **default** and the **kill switch**, and the third tier needs the `cranelift` Cargo feature, which
+  those suites must not require; each one sets or **removes** `BEAM_RT_TIER` in the child explicitly, so
+  an ambient value cannot reach them.* Tier persistence across a resume, proven through the per-thread **baseline compiled-block cache**
   (`beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache}`) — empty the cache between the
   park and the resume, so a resume that came back on the baseline tier is the only thing that can
   repopulate it: `a_preempted_process_resumes_on_its_baseline_tier` (`preempt:alloc_loop/1` under a tiny
@@ -350,8 +380,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   `major` deliberately **unpinned** (`0` on the native rows, `1` on the interpreter control: the door asks
   for a young-only minor and escalates only when the promotion cannot fit the mature region, so the kind of
   that one firing is a consequence of the mature generation's sizing, not a property of the door). It
-  asserts the default tier (and fails loudly if `BEAM_RT_TIER` pins the
-  interpreter), never a wall clock.
+  asserts the native baseline tier (and fails loudly if `BEAM_RT_TIER` pins any other
+  mode — the interpreter, or the cranelift hot tier), never a wall clock.
 * The park hand-off and its exempt-window short-circuit:
   `a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption` and
   `a_float_free_park_does_not_publish_the_fr_file` assert the structural `park_publish_counters()` —

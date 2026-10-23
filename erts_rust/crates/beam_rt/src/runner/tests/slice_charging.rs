@@ -159,6 +159,12 @@
 //! still in place (measured 159 640 / 234 593 / 310 300 at N = 1 000 / 1 500 / 10 000 and
 //! **309 923** at N = 20 000 — *below* the N = 10 000 reading, so the reading is bounded, never a
 //! function of the work).
+//!
+//! Every figure above other than that control row is the **native baseline** tier's, so any other
+//! mode invalidates them: the control is reached by forcing the interpreter on this thread, never
+//! through the process environment, and `BEAM_RT_TIER=cranelift` (with the runtime's `cranelift`
+//! Cargo feature) would take every measured row on the hot tier instead — which is why the test
+//! opens by asserting the native baseline selection.
 use super::super::tier::{JitMode, clear, force};
 use super::{GrowthCounters, growth_runtime, run_growth_function};
 use beam_process::DEFAULT_REDUCTIONS_PER_SLICE;
@@ -284,18 +290,33 @@ fn report(module: &str, label: &str, n: i64, row: &GrowthCounters) {
 /// **The slice budget really is spent by native-tier work, a refusing seam still ends the slice,
 /// and the shape whose own seams cannot refuse saturates at a flat ceiling.**
 ///
+/// Every figure here is the **native baseline** tier's. The interpreter control — the last row —
+/// is reached by forcing [`JitMode::Interpreter`] on this thread, never by the ambient
+/// environment, because a process-wide non-baseline mode (the `BEAM_RT_TIER=interpreter` kill
+/// switch, or `BEAM_RT_TIER=cranelift` with the runtime's `cranelift` Cargo feature) would move
+/// every count in the suite; the test fails loudly instead of comparing such a run against
+/// native-tier figures.
+///
 /// See the module docs for the measured tables, the derivation of every law, and the
 /// `beam_engine` handoff that the fourth pin will need when it lands.
 #[test]
 fn the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice() {
-    // The measurements below are the **default** tier's. `BEAM_RT_TIER=interpreter` (or any
-    // unknown value) pins the reference tier process-wide, where every count in this suite moves
-    // — that is what the control row at the end measures. Fail loudly rather than compare an
-    // interpreter run against native-tier figures.
-    assert_ne!(
-        super::super::tier::env_default(),
-        JitMode::Interpreter,
-        "this suite measures the default (native baseline) tier; unset BEAM_RT_TIER"
+    // The measurements below are the **native baseline** tier's. `BEAM_RT_TIER=interpreter` (or
+    // any unknown value) pins the reference tier process-wide, and `BEAM_RT_TIER=cranelift`
+    // (feature enabled) would take every measured row on the hot tier — either way every count in
+    // this suite moves, so the precondition is that the environment default is one of the two
+    // native baseline selections (`Auto`, the unset default, and its `Baseline` alias). That is
+    // also why the interpreter control row forces its mode per thread
+    // (`InterpreterTier`) instead of through the process environment. Fail loudly rather than
+    // compare a non-baseline run against native-baseline figures.
+    assert!(
+        matches!(
+            super::super::tier::env_default(),
+            JitMode::Auto | JitMode::Baseline
+        ),
+        "this suite measures the native baseline tier; BEAM_RT_TIER must be unset/auto/baseline, \
+         got {:?}",
+        super::super::tier::env_default()
     );
     let budget = u64::from(DEFAULT_REDUCTIONS_PER_SLICE);
     // The floor every collected row's own `heap_size` report sits on, derived from the policy the
