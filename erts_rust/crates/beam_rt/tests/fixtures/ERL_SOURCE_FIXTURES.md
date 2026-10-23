@@ -241,7 +241,27 @@ Both fixtures print their transcript with `io:format/2` and return `ok`, so the 
 is the printed transcript and never the `run` route's `~w` result line; no binary is ever printed
 (probes answer atoms, integers, booleans and small tuples).
 
-## See Also
+## `erlang:display/1` terms (`display_terms.erl`, compiled at test time, never committed)
 
+`tests/display_oracle.rs` compiles this source with the system `erlc` into a per-case scratch
+directory holding **only** that module (so it is also a safe single `-pa` for the oracle) and runs
+it on **both** runtimes through the same `-eval 'display_terms:all(), halt(0).'`.
+
+`all/0` displays one term per line, in this order — a **native record** (`-record #r{zz, yy}` is
+the OTP-29 native-record syntax, so `#r{}` really is a `RECORD_INST`), a **map**, a **float**, an
+**atom** and a **printable list** — and returns `ok`, which the `-eval` route discards, so each
+side's stdout is the `display` output alone.
+
+The compared observable is that stdout **byte for byte**, terminator included: `%T` writes each
+line with the C's `\r\n` (`write_f_add_cr`), and a `~p`-based renderer would end it with a bare
+`\n`. Measured on the oracle (OTP 29.1.1 / `erts-17.1`), the five lines are
+`#display_terms:r{yy="xy",zz=1}`, `#{alpha=>1,beta=>[1,2]}`, `1.500000e+00`, `hello`, `"xy"`
+(each `\r\n`-terminated): the record's fields are in the definition's **stored key order**
+(ascending atom index), which is why the suite asserts both `key=value` pairs are present rather
+than pinning their order. Every term is pure ASCII — the `%T` renderer's documented deviation
+needs a printable string carrying a latin-1 code unit ≥ `16#80` (see `beam_bifs`'
+`term_conv::display_1`), which would not be comparable.
+
+## See Also
 * [`README.md`](README.md) — the index, the committed `.beam` images, the `## Regeneration` recipe and the `## Oracle values` table.
 * [`PORT_AND_DRIVER_FIXTURES.md`](PORT_AND_DRIVER_FIXTURES.md) — the C driver and port fixtures.

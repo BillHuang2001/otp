@@ -201,7 +201,7 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `scheduled_io_device.rs` — scheduled io-device round trips (`io:getopts/1`, `io:setopts/2`, `io:scan_erl_form/4`), each line oracle-cross-checked.
 * `io_device.rs` — the native io floor's request wrappers, so an installed compiler `catch` handler's diagnostic is not replaced by `error:calling_self`.
 * `io_diagnostic_unmask.rs` — that unmasking end to end: the compiler's own `Function: ~w/~w` report still prints before it re-raises.
-
+* `display_oracle.rs` — `erlang:display/1` byte-for-byte against the live `erl`: the `%T` renderer's record/map/float/atom/printable-list shapes and the `\r\n` terminator, over the same compiled fixture (`display_terms.erl`) and over `-eval` literals, with the whole stdout image compared (the registry's `term_conv::display_1` — the floor does not shadow the key).
 ### Introspection and tracing (A.8)
 * `system_info_oracle.rs` — every served `system_info/1` key against the oracle, plus the guard that fails if an unclassified oracle-accepted key appears.
 * `system_info_retained.rs` — a `system_info/1` value kept while a second call materializes survives (the scratch-lifetime pin).
@@ -215,6 +215,9 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `trace_timestamp.rs` — the three timestamp flavours report one clock: the monotonic pair agrees with `erlang:monotonic_time/0`'s origin.
 * `perf_map.rs` — `+JPperf map`/`dump` through the built binary: the file name, path and line formatter the oracle produces.
 * `crash_dump.rs` — `erlang:halt/0,1,2` and `ERL_CRASH_DUMP`: which shapes terminate with a status, an abort or a dump.
+
+### Fixture hygiene
+* `fixtures_are_path_free.rs` — the **path-free guard** over every committed `.beam` in `fixtures/` (enumerated **recursively** at run time, so a new subdirectory is covered — no hard-coded list): fails on any absolute-path marker (`/home/`, `/tmp/`, `/Source/`, `/Users/`, `/private/`, `/nix/store/`, `.genesis/`, `/genesis/`) or a Windows drive-letter path anywhere in the raw image, and on one hiding in a zlib-framed chunk payload (ETF `COMPRESSED` `[131][80][len:4][zlib]`, a bare stream, and `LitT`'s `[len:4][zlib]` framing) after inflating it with `beam_codec::compress::decompress_bounded`; the chunk walk is `beam_loader::container::parse`, so a malformed image fails as well. Non-vacuous (a floor on both the enumerated count and the bytes scanned), with unit tests pinning a synthetic `/tmp/x.erl`, `C:\Users\…`, both compressed framings and relative-path negative controls. A **test-only duplicate** of `beam_loader`'s guard by design — each crate guards its own fixtures rather than buying a cross-crate dependency edge for a test.
 
 ## Asserted residuals (current state, pinned by the suites above)
 * The one `#[ignore]`d `inet_nested.rs` case: a `beam_io` accepted socket whose payload was buffered **before** the read armed raises no event, so this runtime answers `{error,closed}` where the oracle answers `{ok, <<"hi">>}`.

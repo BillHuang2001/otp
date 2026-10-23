@@ -198,9 +198,10 @@ use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
-    Driver, DriverRegistry, Event, Interest, Poller, PortCommandOptions, PortCommandOutcome,
-    PortExitReason, PortNotification, PortRegistry as IoPortRegistry, PortTaskOutcome, ReadMessage,
-    SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions, PORT_REDS_EXECUTE,
+    Driver, DriverFlags, DriverRegistry, Event, Interest, Poller, PortCommandOptions,
+    PortCommandOutcome, PortExitReason, PortNotification, PortRegistry as IoPortRegistry,
+    PortTaskOutcome, ReadMessage, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions,
+    PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, PortMonitor, PortTable, ProcessId, ProcessTable};
 use beam_term::{
@@ -647,22 +648,28 @@ struct PortMeta {
     /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
     /// is the oracle's own `badarg`.
     driver_control_flags: Option<Rc<Cell<c_int>>>,
-    /// The **busy state** of a `{spawn_driver, Name}` port's C driver — the C's
+    /// The **busy state** of a `{spawn_driver, Name}` port's driver — the C's
     /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, as the driver's own `set_busy_port` sets it.
     ///
     /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does (`io.c:1749-1764` and
     /// `erl_bif_port.c:192-220`): `nosuspend` on a busy port answers `false`, `force` bypasses the
     /// busy check, and a plain command on a busy port waits for the idle state and is then
     /// re-issued ([`busy_wait`]). The handle also carries
-    /// whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, which decides the `force` arm.
-    /// Seized from the host with [`driver::DriverPort::busy_flag`] before the host is moved into the
-    /// port lifecycle (the boxed driver exposes no host), the same way [`PortMeta::driver_terms`],
-    /// [`PortMeta::driver_atoms`] and [`PortMeta::driver_control_flags`] are.
+    /// whether the driver advertises `ERL_DRV_FLAG_SOFT_BUSY`, which decides the `force` arm.
     ///
-    /// `None` for every port without a C driver (a `spawn`/`fd` port) — and for a **built-in**
-    /// driver port, whose entry flags are not exposed by the built-in registry. Both are the C's
-    /// "never busy, no `SOFT_BUSY`" case, i.e. `force` ⇒ `notsup`, matching the oracle's own answers
-    /// for `{spawn, Cmd}` and `{fd, N}` ports.
+    /// Two kinds of driver stamp it, from the two places that own the answer:
+    /// * a **loaded C entry** — seized from the host with [`driver::DriverPort::busy_flag`] before
+    ///   the host is moved into the port lifecycle (the boxed driver exposes no host), with
+    ///   `DriverPortAdapter::load` writing the entry's flag word onto the same handle;
+    /// * a **built-in** driver — created here at construction, with only the `soft_busy` half
+    ///   written, from the driver's own [`beam_io::Driver::flags`] while the concrete driver is
+    ///   still in hand. A built-in driver reports its busy *state* through
+    ///   [`beam_io::Driver::is_busy`] directly (which is what `beam_io::Port::command` decides on),
+    ///   never through a `set_busy_port` cell.
+    ///
+    /// `None` for every port without a driver at all (a `spawn`/`fd` port) — the C's "never busy,
+    /// no `SOFT_BUSY`" case, i.e. `force` ⇒ `notsup`, matching the oracle's own answers for a
+    /// `{spawn, Cmd}` and a `{fd, N}` port.
     driver_busy: Option<driver::BusyFlag>,
     /// The **OS child pid** a `{spawn_driver, Name}` port's C driver recorded through
     /// `erl_drv_set_os_pid` — the C's `prt->os_pid` (`io.c:2971`), which
@@ -1688,9 +1695,9 @@ impl PortRegistry {
     ///
     /// Both facts are the ones the port layer's own decision reads — the state through
     /// [`beam_io::Driver::is_busy`] (whom [`beam_io::PortRegistry::is_busy`] forwards to) and the
-    /// entry flag through [`PortRegistry::soft_busy`], the runtime's mirror of the
-    /// `ERL_DRV_FLAG_SOFT_BUSY` bit a loaded driver entry reported (the very handle
-    /// [`driver::DriverPortAdapter::flags`] answers from) — so the gate can never disagree with the
+    /// capability bit through [`PortRegistry::soft_busy`], the runtime's mirror of the driver's
+    /// `ERL_DRV_FLAG_SOFT_BUSY` (`PortMeta::driver_busy`): a loaded entry's `driver_flags`, or a
+    /// built-in driver's [`beam_io::Driver::flags`], so the gate can never disagree with the
     /// decision that follows it.
     ///
     /// # Errors
@@ -2033,9 +2040,10 @@ impl PortRegistry {
     /// ([`busy_wait`]), and lets `force` through — when the driver entry advertises
     /// `ERL_DRV_FLAG_SOFT_BUSY` ([`PortRegistry::soft_busy`]).
     ///
-    /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port and a
-    /// built-in driver port), none of which can ever report busy — the oracle's own answer for a
-    /// `{spawn, Cmd}`/`{fd, N}` port.
+    /// `false` for an unknown port and for every port without a `set_busy_port` cell to read — a
+    /// `spawn`/`fd` port, and a **built-in** driver port, whose busy state its own
+    /// [`beam_io::Driver::is_busy`] reports (which is what `beam_io::Port::command` decides on).
+    /// The oracle's own answer for a `{spawn, Cmd}`/`{fd, N}` port.
     pub fn is_busy(&self, id: PortId) -> bool {
         self.meta
             .get(&id.number())
@@ -2043,13 +2051,17 @@ impl PortRegistry {
             .is_some_and(driver::BusyFlag::is_busy)
     }
 
-    /// Whether `id`'s C driver **entry** advertises `ERL_DRV_FLAG_SOFT_BUSY` — the bit
+    /// Whether `id`'s driver advertises `ERL_DRV_FLAG_SOFT_BUSY` — the bit
     /// `erlang:port_command/2,3`'s `force` arm tests (`erl_bif_port.c:195-198`).
     ///
-    /// `true` only for a `{spawn_driver, Name}` port whose loaded `ErlDrvEntry::driver_flags`
-    /// carries the bit; `false` for an unknown port, for every `spawn`/`fd` port, for a built-in
-    /// driver port and for a `{spawn_driver, Name}` port whose entry does not advertise it — in
-    /// every one of which `[force]` is the oracle's `error:notsup`.
+    /// The bit is the driver's own capability word, mirrored from whichever place owns it: a loaded
+    /// `ErlDrvEntry::driver_flags` for a `{spawn_driver, Name}` port, and the built-in driver's
+    /// [`beam_io::Driver::flags`] for a static one — stamped at construction, see
+    /// [`PortMeta::driver_busy`]. So it answers `true` for a `{spawn_driver,"tcp_inet"}` port and
+    /// `false` for `{spawn_driver,"udp_inet"}`/`{spawn_driver,"ram_file_drv"}`, the oracle's own
+    /// matrix (`inet_drv.c:1374` vs `:1432`), as well as for an unknown port, for every `spawn`/`fd`
+    /// port and for a driver entry that does not advertise the bit. In every `false` case `[force]`
+    /// is the oracle's `error:notsup`.
     pub fn soft_busy(&self, id: PortId) -> bool {
         self.meta
             .get(&id.number())
@@ -3865,6 +3877,20 @@ impl PortHook for RuntimePorts {
                 // into `register` — `ram_file_drv`'s C entry leaves the slot `NULL`, the two socket
                 // drivers declare `inet_control`.
                 let driver_has_control = driver.has_control();
+                // And its **capability flag word**, read at the same instant for the same reason:
+                // `Driver::flags` is the `ErlDrvEntry::driver_flags` counterpart of a built-in
+                // driver, which a loaded C entry reports through `DriverPortAdapter::flags` (see
+                // [`PortMeta::driver_busy`]). Stamping it here — from the driver's own
+                // advertisement, never from a driver-name test — is what keeps
+                // [`PortRegistry::soft_busy`] a mirror of that word for **both** kinds of driver:
+                // `tcp_inet` sets `SOFT_BUSY` (`inet_drv.c:1374`), so `[force]` on a
+                // `{spawn_driver,"tcp_inet"}` port is the oracle's `true`, while `udp_inet`
+                // (`:1432`) and `ram_file_drv` leave the word empty and keep the oracle's
+                // `error:notsup`. Only the `soft_busy` half is stamped: a built-in driver reports
+                // its busy state through `Driver::is_busy` directly (which is what
+                // `beam_io::Port::command` decides on), never through a `set_busy_port` cell.
+                let driver_busy = driver::BusyFlag::new();
+                driver_busy.set_soft_busy(driver.flags().contains(DriverFlags::SOFT_BUSY));
                 let meta = PortMeta {
                     command: spec.command,
                     // A built-in driver port owns no OS child; `port_info(Port, os_pid)` is
@@ -3880,12 +3906,13 @@ impl PortHook for RuntimePorts {
                     owner: self.owner,
                     kind: PortName::SpawnDriverBuiltin,
                     driver_has_control,
-                    // A built-in driver has no C host, so it has no term queue, interns no name,
-                    // sets no control flags and holds no process monitors.
+                    // A built-in driver has no C host, so it has no term queue, interns no name and
+                    // sets no control flags — but it does advertise a capability word, which is
+                    // stamped onto this handle above (see [`PortMeta::driver_busy`]).
                     driver_terms: None,
                     driver_atoms: None,
                     driver_control_flags: None,
-                    driver_busy: None,
+                    driver_busy: Some(driver_busy),
                     // A built-in driver is this crate's Rust driver, not a loaded `ErlDrvEntry`:
                     // it has no `erl_drv_set_os_pid` hook to record an OS child through.
                     driver_os_pid: None,
@@ -5200,6 +5227,12 @@ mod monitor_tests;
 /// minimal always-ready driver and the port-registration helper (see `src/port/test_support.rs`).
 #[cfg(test)]
 pub(crate) mod test_support;
+/// The **built-in drivers' `[force]`** suite: the `ERL_DRV_FLAG_SOFT_BUSY` mirror a statically
+/// linked driver stamps from its own `Driver::flags` — `{spawn_driver,"tcp_inet"}` answers the
+/// oracle's `true`, `udp_inet`/`ram_file_drv` its `error:notsup` (see
+/// `src/port/soft_busy_builtin_tests.rs`). A separate file so it does not grow this one.
+#[cfg(test)]
+mod soft_busy_builtin_tests;
 /// The `{spawn_driver, Name}` **namespace** suite: the statically linked set, the oracle's
 /// `badarg` for everything else, and the `erl_ddll:loaded_drivers/0` agreement
 /// (see `src/port/spawn_driver_tests.rs`). A separate file so the namespace suite does not grow

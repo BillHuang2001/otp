@@ -55,14 +55,17 @@
 //! | Port state | Options | Answer |
 //! |---|---|---|
 //! | busy | `[nosuspend]` (no `force`) | the atom `false` — the command is dropped, nothing written |
-//! | busy | `[force]` | `true` if the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, else `error:notsup` |
+//! | busy | `[force]` | `true` if the driver advertises `ERL_DRV_FLAG_SOFT_BUSY`, else `error:notsup` |
 //! | busy | neither | the caller **waits** until the port is idle and the command is then re-issued ⇒ `true` (the C's `erts_suspend` + `ERTS_BIF_YIELD3` re-run, `crate::port::busy_wait`); a port still busy at the deadline, or a caller that may not pump, is a typed capability gap (see [`RuntimeContext::port_command`]) |
 //! | idle | any | `true` — except `[force]` on a driver **without** `ERL_DRV_FLAG_SOFT_BUSY`, which is `error:notsup` |
 //!
-//! The `force` rule is a property of the driver **entry**, not of the current busy state: the C
-//! rejects `[force]` with `notsup` whenever the driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`
-//! (`erl_bif_port.c:195-198`), idle or busy alike. A `spawn`/`fd` port — and a built-in driver
-//! port, whose entry flags the built-in registry does not expose — therefore always answers
+//! The `force` rule is a property of the driver's **capability flag word**, not of the current busy
+//! state: the C rejects `[force]` with `notsup` whenever the driver does not advertise
+//! `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`), idle or busy alike, and this runtime reads
+//! that word from the driver itself — a loaded `ErlDrvEntry::driver_flags` or a built-in driver's
+//! `Driver::flags` (see `crate::port::PortRegistry::soft_busy`), so
+//! `{spawn_driver,"tcp_inet"}` answers `true` and `udp_inet`/`ram_file_drv` `notsup`, the oracle's
+//! own matrix. A `spawn`/`fd` port has no driver flag word at all and therefore always answers
 //! `notsup` for `[force]`, which is the oracle's own answer for `{spawn, Cmd}` and `{fd, N}`.
 //! `nosuspend` on an idle port, like an empty option list, changes nothing.
 //!
