@@ -196,7 +196,9 @@ pub enum Delivery {
     /// `DOP_UNLINK_ID` (`dist.c:2284`: `{DOP_UNLINK_ID, Id, From, To}`): the
     /// unlink id handshake (OTP 26+ link protocol).
     UnlinkId {
-        /// The unlink id (`Id`).
+        /// The unlink id (`Id`) — a **non-zero** unsigned integer on the wire
+        /// (`dist.c:2291-2295`); a zero id is `invalid_message`, so
+        /// [`Delivery::classify_validated`] refuses it (see `is_nonzero_uint`).
         id: Eterm,
         /// The remote process.
         from: Eterm,
@@ -205,7 +207,9 @@ pub enum Delivery {
     },
     /// `DOP_UNLINK_ID_ACK` (`dist.c:2315`: `{DOP_UNLINK_ID_ACK, Id, From, To}`).
     UnlinkIdAck {
-        /// The unlink id (`Id`).
+        /// The echoed unlink id (`Id`) — range-checked as an unsigned integer
+        /// **only** (`dist.c:2320-2322`), so a zero id is legitimate here (see
+        /// `is_uint`).
         id: Eterm,
         /// The remote process.
         from: Eterm,
