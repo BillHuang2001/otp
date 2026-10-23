@@ -37,8 +37,10 @@
 //!   A.1 half of this group); and
 //! * **introspection** — the stable `info/2` items (`size`, `type`, `protection`, `keypos`,
 //!   `name`, `named_table`, `compressed`, `id`-is-a-reference, `memory`-is-an-integer) plus
-//!   `badarg` for an unknown item; and
-//! * **ownership transfer** — `ets:give_away/3` (the `ets/give_away_*` cases): the new owner
+//!   `badarg` for an unknown item; and the whole `info/1` item set
+//!   (`ets/info_all_item_keys_and_deterministic_counters`), whose 12 deterministic pairs for a
+//!   fresh 3-object `set` are pinned while the per-VM ones (`id` a reference, `owner` a pid,
+//!   `memory` a byte count) stay relational; and//! * **ownership transfer** — `ets:give_away/3` (the `ets/give_away_*` cases): the new owner
 //!   really receives the `{'ETS-TRANSFER', Tab, From, Gift}` transfer message, so the gift
 //!   *data* reaches it, and the message body's shape is pinned with the per-VM `Tab`/`From`
 //!   reduced to their types.
@@ -64,6 +66,19 @@
 //! `error:undef`, an *observation* rather than a capability-gap signal, so a case for them
 //! would be a `mismatch` and none is pinned. **Handoff to the runtime nodes** (`beam_bifs` /
 //! `beam_ets`).
+//!
+//! # `ets:info(T, stats)` is a **capability gap**, not an observation
+//!
+//! The one `info/2` item that cannot be pinned at all is `stats`: the oracle answers it with an
+//! 8-element tuple of hash-table figures — `{256,0.01171875,0.13926206529140472,
+//! 0.10804153978824615,0,2,0,1}` for a fresh `set` with 3 objects (identical on every VM start,
+//! and for `bag`/`duplicate_bag`) and the atom `false` for an `ordered_set` — while the Rust
+//! runtime answers `ets:info(T, stats)` with its typed capability gap (`beam_rt: unsupported:
+//! bif`, exit `3`; served as `Err(unsupported_bif())` in `crates/beam_bifs/src/ets.rs`). A case
+//! pinning it would therefore be an `unsupported` verdict, i.e. an unauthorized gap in the
+//! ratchet, so **no** case is pinned — the closest *served* observation is the whole `info/1`
+//! item set, pinned by `ets/info_all_item_keys_and_deterministic_counters`. The gap is a handoff
+//! to the runtime nodes (`beam_bifs` / `beam_ets`): the interior's chain/tree statistics.
 //!
 //! # Other verified divergences found while authoring — deliberately NOT pinned
 //!
@@ -712,6 +727,37 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // The whole `info/1` item set. `ets:info(T, stats)` itself is the runtime's typed
+        // capability gap (see the module docs), so this is the *served* table-metadata
+        // observation: the sorted item **keys**, the twelve `{Item, Value}` pairs that are
+        // deterministic for a fixed table content (a fresh `set` holding 3 objects), and the
+        // per-VM values asserted only by their **type** — `memory` is a byte count, `id` a
+        // reference and `owner` a pid, never an exact figure.
+        //
+        // `Picked` is `lists:sort`ed because `info/1`'s item order is an implementation detail
+        // (both runtimes happen to agree on it, but it is not part of the contract).
+        Case {
+            id: "ets/info_all_item_keys_and_deterministic_counters",
+            description: "ets:info/1 returns the full ordered item set: the 12 deterministic pairs of a fresh 3-object set are pinned and id/owner/memory stay relational",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(ets_info_all, [set]), \
+                       ets:insert(T, [{a,1},{b,2},{c,3}]), Items = ets:info(T), \
+                       Stable = [size,type,keypos,protection,named_table,compressed,\
+                       read_concurrency,write_concurrency,decentralized_counters,name,node,heir], \
+                       Picked = lists:sort([{K,V} || {K,V} <- Items, lists:member(K, Stable)]), \
+                       {lists:sort([K || {K,_} <- Items]), Picked, \
+                        is_integer(element(2, lists:keyfind(memory, 1, Items))), \
+                        is_reference(element(2, lists:keyfind(id, 1, Items))), \
+                        is_pid(element(2, lists:keyfind(owner, 1, Items)))} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],[{compressed,false},{decentralized_counters,false},{heir,none},{keypos,1},{name,ets_info_all},{named_table,false},{node,nonode@nohost},{protection,protected},{read_concurrency,false},{size,3},{type,set},{write_concurrency,false}],true,true,true}"),
+                exit_code: 0,
+            },
+        },
         // --- table types ---
         Case {
             id: "ets/bag_dedups_identical_object",
@@ -1094,4 +1140,62 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group;
+    use crate::corpus::Contract;
+
+    /// Every case in this group claims the OTP-application contract (A.7) — the term-ordered
+    /// navigation cases claim A.1 alongside it — and renders its observation with the *value*
+    /// probe, so a golden here is always a `~w` line.
+    #[test]
+    fn every_case_is_an_otp_apps_value_observation() {
+        let cases = group();
+        assert!(cases.len() >= 60, "the group keeps its breadth");
+        let mut otp_apps_only = 0;
+        for case in &cases {
+            assert!(
+                case.contracts.contains(&Contract::OtpApps),
+                "{}: every ets case evidences A.7",
+                case.id
+            );
+            assert!(
+                case.contracts
+                    .iter()
+                    .all(|c| matches!(c, Contract::OtpApps | Contract::LanguageSemantics)),
+                "{}: an ets case claims A.7 (plus A.1 for a navigation case) only",
+                case.id
+            );
+            if case.contracts == [Contract::OtpApps] {
+                otp_apps_only += 1;
+            }
+            assert_eq!(case.kind_label(), "value", "{}", case.id);
+            assert!(case.golden.stdout.is_some(), "{}", case.id);
+        }
+        assert!(otp_apps_only >= 55, "most cases are pure A.7");
+    }
+
+    /// The `info/1` case is the *served* table-metadata observation. It must stay relational
+    /// about the per-VM values: `memory`/`id`/`owner` are asserted by type only, and the twelve
+    /// pinned pairs are `lists:sort`ed so the item order can never become the golden.
+    #[test]
+    fn the_info_all_case_pins_sorted_pairs_and_keeps_the_per_vm_values_relational() {
+        let cases = group();
+        let case = cases
+            .iter()
+            .find(|c| c.id == "ets/info_all_item_keys_and_deterministic_counters")
+            .expect("registered");
+        let expr = case.expr().expect("an eval expression");
+        assert!(expr.contains("lists:sort([K || {K,_} <- Items])"));
+        assert!(expr.contains("lists:sort([{K,V} || {K,V} <- Items"));
+        assert!(expr.contains("is_integer(element(2, lists:keyfind(memory, 1, Items)))"));
+        assert!(expr.contains("is_reference(element(2, lists:keyfind(id, 1, Items)))"));
+        assert!(expr.contains("is_pid(element(2, lists:keyfind(owner, 1, Items)))"));
+        // No `stats` selector: that item is the runtime's capability gap (module docs), so
+        // pinning it would make the case `unsupported`, never an agreement.
+        assert!(!expr.contains("stats"));
+        assert_eq!(case.golden.exit_code, 0);
+    }
 }

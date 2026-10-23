@@ -48,7 +48,17 @@
 //!   an internal port — carry per-VM-start values and are pinned (by their stable leading shape)
 //!   in the [`super::wire_ids`] group instead;
 //! * funs/records — `EXPORT_EXT` (113) (encode and decode → re-encode round-trip),
-//!   `NEW_FUN_EXT` (112), and the nominal-record `RECORD_EXT` (67) (decode → re-encode);
+//!   `NEW_FUN_EXT` (112), and the nominal-record `RECORD_EXT` (67) (decode → re-encode).
+//!   `NEW_FUN_EXT` has two halves: the `-eval` (`erl_eval`) lambda, whose image is the one
+//!   encode the Rust runtime does not serve ([`wire/new_fun_ext_encode`], a documented gap), and
+//!   a **compiled** module's local fun, whose image is byte-identical on both runtimes. The
+//!   module-run case `wire/fun_ext_multi_closure_roundtrip` pins the *compiled* half — a fun
+//!   that captures a variable from the enclosing scope of a **multi-closure** module (two
+//!   `make_fun3` funs, plus a nested `fun`-returning-`fun`) — through the round trip's
+//!   observable **shape** (`is_function/2`, the `fun_info/1` identity items, the image byte size
+//!   and the re-encode identity), never the image's identity bytes. It claims contract A.2 (the
+//!   `.beam`/ETF byte contract) because a module-run case may only claim the contracts it
+//!   evidences directly (`corpus::tests::module_run_cases_are_registered_and_well_formed`);
 //! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option (both
 //!   directions, including its declared uncompressed-size bound), and `{minor_version, 0|1|2}`;
 //! * `ATOM_CACHE_REF` (82) — a blob carrying one is decoded with **no** atom-cache context,
@@ -70,7 +80,14 @@
 //!
 //! * The free-standing encode of a `NEW_FUN_EXT` (112) fun is the Rust runtime's remaining
 //!   A.5 *encode*-side gap; `wire/new_fun_ext_encode` pins it as `unsupported` (`beam_rt:
-//!   unsupported: local_fun`), never a mismatch.
+//!   unsupported: local_fun`), never a mismatch. It is the `-eval` (`erl_eval`) half only: the
+//!   *compiled*-module half **agrees** byte-for-byte (see `wire/fun_ext_multi_closure_roundtrip`).
+//! * Calling a fun that was decoded from its own `NEW_FUN_EXT` image
+//!   (`F = binary_to_term(term_to_binary(F))`, then `F(Args)`) still raises a plain `badarg` on
+//!   the Rust runtime while the oracle applies it — a real divergence with an *ordinary* reason
+//!   (not a capability-gap signal), so no case pins it: the module-run case calls the
+//!   **original** fun and asserts the decoded fun's identity only. Handoff to the runtime nodes
+//!   (the `beam_engine` fun-call machinery for an imported `NEW_FUN_EXT` closure).
 //! * `term_to_binary/2` with `{minor_version, 0|1}` reproduces the *legacy* `ATOM_EXT` (100) /
 //!   `FLOAT_EXT` (99) forms, so the `wire/minor_version_*_legacy_encode` cases `agree`.
 //!   Decoding a `compressed` (80) blob is covered by the `wire/compressed_decode_*` cases.
@@ -93,7 +110,40 @@
 //!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is
 //!   the tag that matters for the distribution wire.
 
-use super::{Case, CaseKind, Contract, Golden, Probe};
+use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+
+/// The module behind `wire/fun_ext_multi_closure_roundtrip`: **two** closures in one module (so
+/// the module's `make_fun3` fun table is a real entry the `NEW_FUN_EXT` index has to name) plus a
+/// *nested* `fun`-returning-`fun` whose inner closure captures a variable (`A`) from its
+/// enclosing fun's scope — the two shapes a fun image has to carry: `index`/`uniq` and the
+/// free-variable environment.
+///
+/// The identity observations are hard `=` matches (a wrong `fun_info/2` item aborts the run as a
+/// `badmatch`, so it can never be a silent pass) and the function answers with **one integer**
+/// as the corpus requires of a module run: the two image byte sizes (stable for this compiled
+/// module, and the only *classification* of a fun's identity bytes the case allows itself)
+/// followed by a 3-bit flag mask that is `7` when all three round-trip relations hold.
+const WIRE_FUN_ETF_SOURCE: &str = "-module(wire_fun_etf).\n\
+-export([multi_closure_roundtrip/0]).\n\
+mk_adder(N) -> fun(X) -> X + N end.\n\
+mk_doubler() -> fun(X) -> X * 2 end.\n\
+bit(true, B) -> B;\n\
+bit(false, _) -> 0.\n\
+multi_closure_roundtrip() ->\n\
+F = mk_adder(3),\n\
+D = mk_doubler(),\n\
+B = term_to_binary(F),\n\
+G = binary_to_term(B),\n\
+Inner = (fun(A) -> fun(K) -> A * K end end)(6),\n\
+{type, local} = erlang:fun_info(G, type),\n\
+{module, wire_fun_etf} = erlang:fun_info(G, module),\n\
+{arity, 1} = erlang:fun_info(G, arity),\n\
+42 = F(39),\n\
+42 = D(21),\n\
+42 = Inner(7),\n\
+Flags = bit(is_function(F, 1), 1) bor bit(is_function(G, 1), 2)\n\
+bor bit(term_to_binary(G) =:= B, 4),\n\
+byte_size(B) * 10000 + byte_size(term_to_binary(Inner)) * 100 + Flags.\n";
 
 /// The A.5 cases: the ETF codec used by the distribution wire.
 pub(crate) fn group() -> Vec<Case> {
@@ -635,6 +685,33 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok <<131,112,0,0,0,136,0,248,37,47,246,123,244,211,6,126,138,154,65,205,61,207,38,0,0,0,43,0,0,0,1,119,8,101,114,108,95,101,118,97,108,97,43,98,7,193,41,127,88,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,0,0,0,0,0,0,0,0,0,0,0,0,104,6,97,1,106,119,4,110,111,110,101,119,4,110,111,110,101,116,0,0,0,0,108,0,0,0,1,104,5,119,6,99,108,97,117,115,101,97,1,106,106,108,0,0,0,1,104,3,119,4,97,116,111,109,97,1,119,2,111,107,106,106>>"),
+                exit_code: 0,
+            },
+        },
+        // -- a *compiled* module's fun: the NEW_FUN_EXT form a `.beam` really produces ------
+        //
+        // See `WIRE_FUN_ETF_SOURCE` for the module. Nothing here is an identity byte: the module
+        // asserts the round trip's *shape* (`is_function/2`, the `fun_info/1`
+        // type/module/arity of the decoded fun, the re-encode identity `term_to_binary(G) =:= B`)
+        // and the applications of the **original** funs (`F(39)`, `D(21)`) and of the nested
+        // closure (`Inner(7)`) with hard matches, then classifies the two `NEW_FUN_EXT` image
+        // byte sizes — stable integers for a fixed compiled module — plus a 3-bit relation mask
+        // into one integer: `82*10000 + 80*100 + 7 = 828007`. The decoded fun is never *called*:
+        // that is the runtime gap documented in the module docs.
+        Case {
+            id: "wire/fun_ext_multi_closure_roundtrip",
+            description: "a capturing fun of a multi-closure compiled module round-trips through NEW_FUN_EXT (112): is_function, fun_info identity, image sizes and re-encode identity, classified into one integer",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Module(ModuleRun {
+                source: WIRE_FUN_ETF_SOURCE,
+                module: "wire_fun_etf",
+                function: "multi_closure_roundtrip",
+                arity: 0,
+                args: &[],
+                nif: None,
+            }),
+            golden: Golden {
+                stdout: Some("828007"),
                 exit_code: 0,
             },
         },
@@ -1263,7 +1340,7 @@ pub(crate) fn group() -> Vec<Case> {
 #[cfg(test)]
 mod tests {
     use super::group;
-    use crate::corpus::Contract;
+    use crate::corpus::{CaseKind, Contract};
 
     #[test]
     fn new_wire_cases_are_registered_under_the_distribution_contract() {
@@ -1293,9 +1370,37 @@ mod tests {
         }
     }
 
+    /// The one `NEW_FUN_EXT`-image case that is a **module run** (a compiled module's local fun,
+    /// whose image both runtimes encode identically): it evidences contract A.2 — the
+    /// `.beam`/ETF byte contract — because a module-run case may only claim the contracts it
+    /// evidences directly, so it is not one of the `Distribution`-claiming eval cases above.
     #[test]
-    fn exception_wire_cases_raise_badarg_under_the_distribution_contract() {
+    fn the_compiled_fun_image_case_is_a_module_run_under_the_beam_asm_contract() {
         let cases = group();
+        let case = cases
+            .iter()
+            .find(|c| c.id == "wire/fun_ext_multi_closure_roundtrip")
+            .expect("registered");
+        assert_eq!(case.contracts, &[Contract::BeamAsm]);
+        assert_eq!(case.kind_label(), "module-run");
+        let CaseKind::Module(run) = &case.kind else {
+            panic!("the compiled-fun case runs a compiled module");
+        };
+        assert_eq!(run.module, "wire_fun_etf");
+        assert_eq!(run.function, "multi_closure_roundtrip");
+        assert_eq!(run.arity, 0);
+        assert!(run.args.is_empty());
+        assert!(run.nif.is_none());
+        // The golden is the oracle's integer line, never an identity byte: the two image sizes
+        // (82 bytes for the capturing closure, 80 for the nested one) are stable integers for a
+        // fixed compiled module and the 3-bit mask (7) says every round-trip relation holds. The
+        // decoded fun is only *identified* (`is_function/2` + `fun_info/1`), never called.
+        assert_eq!(case.golden.stdout, Some("828007"));
+        assert_eq!(case.golden.exit_code, 0);
+    }
+
+    #[test]
+    fn exception_wire_cases_raise_badarg_under_the_distribution_contract() {        let cases = group();
         for id in [
             "wire/map_ext_duplicate_key_badarg",
             "wire/compressed_declared_size_mismatch_badarg",
