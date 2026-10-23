@@ -439,6 +439,18 @@ impl<'a> RuntimeContext<'a> {
             }
             invoke_registered(bif, arity, &mut context, args)
         };
+        // `ports` holds an `Rc<AtomTable>` clone ([`RuntimePorts::atoms`]), and it is declared
+        // **outside** the invoke block above, so it is still alive here. The tail's atom commit
+        // ([`CodeServer::intern_pending`]) only takes its append-only `Rc::get_mut` fast path
+        // while this runtime's code server is the table's **only** owner: an outstanding handle
+        // pins the strong count at 2 and makes the commit `Rc::make_mut` — a deep clone of the
+        // whole `AtomTable`, one `String` allocation per atom, on every interning call. The
+        // provider is dropped explicitly (with the `BifContext`/bridge borrows the block above
+        // already released) so the commit really appends in place; `src/codeserver.rs`'s
+        // `intern_pending` documents that contract, and `tests/atom_table_commit_alloc.rs` pins
+        // it. The full path builds its `RuntimePorts` **inside** its invoke block, so it already
+        // reaches the tail with one owner.
+        drop(ports);
         self.finish_registered_call(
             result,
             heap,
@@ -1255,7 +1267,9 @@ impl<'a> RuntimeContext<'a> {
         // in place or deep-clones it. This call's own `atoms` binding and the `RuntimeMemory`
         // snapshot built for `erlang:memory/0,1` (which stores `Rc::clone(&atoms)`) are two
         // such owners -- the BIF context, the port/persistent-term/NIF bridges built inside the
-        // block above have already been dropped with it. Neither handle is read after the call
+        // block above have already been dropped with it, and the hook-free path's `RuntimePorts`
+        // (whose own `Rc<AtomTable>` clone is the one handle of this call that could outlive its
+        // invoke block) is `drop`ped there before this call. Neither handle is read after the call
         // (the result is a term, and the rewind above touches only the heap), so dropping them
         // hands the commit the append-only fast path: `CodeServer::intern_pending` takes
         // `Rc::get_mut` and appends, instead of `Rc::make_mut` cloning the whole `AtomTable`
