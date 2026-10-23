@@ -439,7 +439,7 @@ fn build_case(
         .call("ets", "new", 2, ctx, &[name, options])
         .expect("ets:new");
 
-    let mut insert = |ctx: &mut BifContext<'_>, key: i64| {
+    let insert = |ctx: &mut BifContext<'_>, key: i64| {
         let obj = object(ctx, key);
         let out = bifs
             .call("ets", "insert", 2, ctx, &[handle, obj])
@@ -598,7 +598,7 @@ fn the_oracle_transcript_covers_all_three_answers() {
     assert_eq!(
         line_for("fixed_one_of_five_deleted")
             .split_whitespace()
-            .nth(6),
+            .nth(3),
         Some("1"),
         "kept_items of the fixed, one-deleted table"
     );
@@ -613,7 +613,7 @@ fn the_oracle_transcript_covers_all_three_answers() {
         ("wc_private", "1"),
     ] {
         assert_eq!(
-            line_for(tag).split_whitespace().nth(7),
+            line_for(tag).split_whitespace().nth(4),
             Some(nlocks),
             "{tag}: nlocks"
         );
