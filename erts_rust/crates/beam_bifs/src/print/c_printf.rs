@@ -242,17 +242,23 @@ fn render(
     if access::is_tuple(obj) {
         let arity = access::tuple_size(obj);
         out.push('{');
-        push_seq(
-            stack,
-            &[
-                Item::ArrayElem {
-                    tuple: obj,
-                    index: 0,
-                    remaining: arity.saturating_sub(1),
-                },
-                Item::CloseTuple,
-            ],
-        );
+        // The C pushes the element tag only for a non-empty tuple
+        // (`if (i > 0) WSTACK_PUSH2(...)`), so `{}` pushes the closer alone.
+        if arity > 0 {
+            push_seq(
+                stack,
+                &[
+                    Item::ArrayElem {
+                        tuple: obj,
+                        index: 0,
+                        remaining: arity - 1,
+                    },
+                    Item::CloseTuple,
+                ],
+            );
+        } else {
+            push_seq(stack, &[Item::CloseTuple]);
+        }
         return Ok(true);
     }
     if access::is_map(obj) {
