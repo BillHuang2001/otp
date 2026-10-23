@@ -160,9 +160,14 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
   behind one `agree(..)` and is synthetic otherwise; `jit_coverage.rs` adds `Cranelift` to
   `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/`try`-raise/maps/bitstrings)
   is covered on it too; `jit_cross_module.rs` drives Cranelift through its single `run_both` funnel for
-  the resolved cross-module call, the nested recursive chain and the dynamic `apply`; its
-  parked-and-resumed row stays on the interpreter and the baseline tier, and the Cranelift resume
-  (including a resume parked in a non-zero module context) is the case documented next.
+  the resolved cross-module call, the nested recursive chain and the dynamic `apply`, and its
+  parked-and-resumed row covers the same roster as well — that row consults `NATIVE_TIERS` directly
+  because it must resume **and** inspect each tier's own `Machine`, and it asserts the same callee park
+  address, the same non-entry `park_b` context and the same resumed value on every tier (the hot tier
+  resumes through the shared no-reset native seam, stepping per instruction at any address its retained
+  artifact holds no compiled entry for, a cross-module callee's blocks included); the tier's own
+  park/resume cases (the Cranelift resume, including one parked in a non-zero module context) are the
+  case documented next.
 - **Cranelift park/resume** (`src/jit/cranelift/tests.rs`): the hot tier **has** a resume entry point
   — `jit::baseline::run_native_resume_outcome` over the retained artifact store
   (`jit/cranelift/cache.rs`, keyed by `jit::cache::CacheKey`) — and
