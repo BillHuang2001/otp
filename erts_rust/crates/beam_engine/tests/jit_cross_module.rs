@@ -55,18 +55,22 @@
 //!   transfer and the callee's own blocks are compiled on first sight
 //!   (`NativeCode::module_blocks` -> the per-thread `CodeCache`).
 //! - [`Tier::Cranelift`] additionally with the **`jit-cranelift`** Cargo feature
-//!   (default OFF), on every case below **except** the parked-suspension row. That
-//!   tier does **not** accelerate a cross-module callee: it runs each `call_ext*`
-//!   through the same shared interpreter-backed per-instruction helper, so the
-//!   claim it carries here is **correctness** (the seam's callee resolution, the
-//!   recursive module-context re-entry and the dynamic `apply` decode all produce
-//!   the interpreter's answer), never acceleration.
-//! - The parked-suspension row (`a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier`)
-//!   deliberately stays on the interpreter and the baseline tier: Cranelift cannot
-//!   resume at a mid-function `pc` and answers the honest typed `unsupported` from
-//!   [`Machine::resume_outcome_with_tier`], so a *same-tier resume* is only
-//!   expressible on the two tiers that support it (see `beam_engine/CONTEXT.md`,
-//!   "The JIT tier seam").
+//!   (default OFF), on every case below. That tier does **not** accelerate a
+//!   cross-module callee: it runs each `call_ext*` through the same shared
+//!   interpreter-backed per-instruction helper, so the claim it carries here is
+//!   **correctness** (the seam's callee resolution, the recursive module-context
+//!   re-entry and the dynamic `apply` decode all produce the interpreter's answer),
+//!   never acceleration.
+//! - The parked-suspension row
+//!   (`a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier`) is no
+//!   exception: **every** tier in the roster resumes a slice parked at a mid-function
+//!   `pc` through [`Machine::resume_outcome_with_tier`], which sends the hot tier
+//!   through the shared no-reset native resume seam over its retained artifact store.
+//!   An address that store holds no compiled entry for -- **every** instruction of a
+//!   cross-module callee included, since a callee's blocks are not compiled into the
+//!   caller's artifact -- advances by the driver's per-instruction interpreter step,
+//!   i.e. interpreter semantics and simply unaccelerated. With `jit-cranelift` off
+//!   that tier is not in the roster at all, so no typed refusal is tested here.
 //!
 //! # The cases
 //!
@@ -85,9 +89,8 @@
 //!    empty and reports [`RunOutcome::Wait`] with the callee's own address. The
 //!    suspension is asserted to be in a **non-entry** module context
 //!    ([`Machine::current_module`] is `park_b`); the process is then resumed **on the
-//!    same tier** through `Machine::resume_outcome_with_tier` after a message is
-//!    delivered, and both tiers must yield the delivered term. This is the one row
-//!    restricted to the interpreter and the baseline tier (see *Tier coverage*).
+//!    same tier** through [`Machine::resume_outcome_with_tier`] after a message is
+//!    delivered, and every tier in the roster must yield the delivered term.
 //! 4. **A dynamic `apply/3` on registers.** `apply_a:run/3` tail-calls
 //!    `erlang:apply/3` with `M`/`F`/`A` read out of `x(0)`/`x(1)`/`x(2)`; the engine's
 //!    `fixed_apply` special case decodes them and resolves the *computed* target
@@ -493,8 +496,10 @@ fn fixture_host() -> SeamHost {
 /// that uses [`run_both`] asserts tier-vs-interpreter equivalence for whichever
 /// tiers are compiled in.
 ///
-/// The one row that does **not** use this roster is the parked-suspension case,
-/// because Cranelift has no mid-function resume (see the module docs).
+/// The one row that does **not** drive this roster through [`run_both`] is the
+/// parked-suspension case, which consults [`NATIVE_TIERS`] directly: it has to
+/// **resume** each tier's parked machine and inspect that machine, and [`run_both`]
+/// only reports `(interpreter, baseline)` outcomes.
 #[cfg(feature = "jit-cranelift")]
 const NATIVE_TIERS: [Tier; 2] = [Tier::BaselineJit, Tier::Cranelift];
 
@@ -724,18 +729,22 @@ fn a_nested_recursive_cross_module_chain_agrees_across_tiers() {
 // ---------------------------------------------------------------------------
 
 /// `park_a:run/0` tail-calls `park_b:await/0`, whose `receive` finds the mailbox
-/// empty: both tiers must report the **same** [`RunOutcome::Wait`], and the machine
-/// must be in the **callee's** (non-entry) module context. Delivering a message and
-/// resuming **on the same tier** must yield the delivered term on both.
+/// empty: every tier in [`NATIVE_TIERS`] must report the **same**
+/// [`RunOutcome::Wait`] the interpreter reports, and the machine must be in the
+/// **callee's** (non-entry) module context. Delivering a message and resuming **on the
+/// same tier** must yield the delivered term on every one of them.
 ///
-/// This is the one row that does **not** use [`run_both`] / [`NATIVE_TIERS`]: it is
-/// the only case whose point is a **resume**, and the Cranelift hot tier has no
-/// mid-function resume entry point. (Its *first* entry does report the same
-/// [`RunOutcome::Wait`] address as the other tiers, so it is `run_both`-compatible
-/// up to the park; the resume is what excludes it.) Asking that tier to resume is
-/// the honest typed `Err(unsupported_opcode: cranelift jit: cannot resume at an
-/// arbitrary pc (the cranelift tier has no resume entry point))`, so a same-tier
-/// resume row is only meaningful on the interpreter and the baseline tier.
+/// This row does **not** go through [`run_both`] because it has to **resume** and then
+/// inspect each tier's own [`Machine`] (its module context) -- [`run_both`] reports
+/// only `(interpreter, baseline)` outcomes. It covers the same roster nonetheless:
+/// every tier parks at the same callee address in the same non-entry `park_b` context
+/// and resumes on the same tier to the delivered term.
+///
+/// The hot tier's resume is interpreter-identical: it enters compiled code wherever
+/// its artifact holds an entry and advances by the driver's per-instruction
+/// interpreter step everywhere else. A cross-module callee's blocks are not compiled
+/// into the caller's artifact (`NativeCode::module_blocks` stays unpopulated there),
+/// so that path is unaccelerated -- never wrong.
 #[test]
 fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
     if skip_if_unavailable() {
@@ -745,42 +754,28 @@ fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
     let entry = host.module("park_a");
     let callee = host.module("park_b");
 
-    // The interpreter and the baseline tier only (see the doc comment above).
+    // The interpreter first: its suspension address is the one every tier in the roster
+    // must reproduce, and the address they are all resumed at.
     host.clear_mailbox();
     let mut interp = run_tier(&mut host, &entry, "run", &[], Tier::Interpreter);
-    host.clear_mailbox();
-    let mut jit = run_tier(&mut host, &entry, "run", &[], Tier::BaselineJit);
-    assert_tiers_agree(&host, "park_a:run/0", &interp, &jit, Tier::BaselineJit);
-    // Both tiers suspended, at the same callee address.
-    let wait = match (&interp.outcome, &jit.outcome) {
-        (
-            Ok(RunOutcome::Wait {
-                func: interp_func,
-                pc: interp_pc,
-            }),
-            Ok(RunOutcome::Wait {
-                func: jit_func,
-                pc: jit_pc,
-            }),
-        ) => {
-            assert_eq!((interp_func, interp_pc), (jit_func, jit_pc));
-            (*interp_func, *interp_pc)
-        }
-        other => panic!("`park_a:run/0` must park on both tiers, got {other:?}"),
+    let wait = match &interp.outcome {
+        Ok(RunOutcome::Wait { func, pc }) => (*func, *pc),
+        other => panic!("`park_a:run/0` must park on the interpreter, got {other:?}"),
     };
 
     // The suspension is inside the cross-module callee: the machine's module context
     // is `park_b`, not the run's entry module (context 0). This is what makes the
     // resume below a resume in a **non-entry** context.
-    for (tier, run) in [("interpreter", &interp), ("baseline", &jit)] {
-        let context_module = run.machine.current_module().unwrap_or_else(|| {
-            panic!("the {tier} suspension must be inside the cross-module callee, not the entry module")
-        });
-        assert!(
-            Arc::ptr_eq(&context_module, &callee),
-            "the {tier} suspension must be in the `park_b` module context"
-        );
-    }
+    let interp_context = interp.machine.current_module().unwrap_or_else(|| {
+        panic!(
+            "the interpreter suspension must be inside the cross-module callee, not the entry \
+             module"
+        )
+    });
+    assert!(
+        Arc::ptr_eq(&interp_context, &callee),
+        "the interpreter suspension must be in the `park_b` module context"
+    );
 
     // Deliver the message and resume **on the same tier** the slice parked on.
     let delivered = make_small(42);
@@ -792,23 +787,53 @@ fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
         .resume_outcome_with_tier(&*entry, wait.0, wait.1, &mut host, Tier::Interpreter)
         .expect("the interpreter resume completes");
 
-    host.clear_mailbox();
-    host.enqueue(delivered);
-    let resumed_jit = jit
-        .machine
-        .resume_outcome_with_tier(&*entry, wait.0, wait.1, &mut host, Tier::BaselineJit)
-        .expect("the baseline-tier resume completes");
-
     assert_eq!(
         resumed_interp,
         RunOutcome::Returned(delivered),
         "the interpreter's resume must yield the delivered term"
     );
-    assert_eq!(
-        resumed_jit,
-        RunOutcome::Returned(delivered),
-        "the baseline tier's resume must yield the delivered term"
-    );
+
+    // Every native tier this build compiles in: same park, same non-entry callee
+    // context, same resumption to the delivered term -- resumed **on that tier**.
+    for tier in NATIVE_TIERS {
+        let name = tier.name();
+
+        host.clear_mailbox();
+        let mut run = run_tier(&mut host, &entry, "run", &[], tier);
+        assert_tiers_agree(&host, "park_a:run/0", &interp, &run, tier);
+
+        match &run.outcome {
+            Ok(RunOutcome::Wait { func, pc }) => assert_eq!(
+                (*func, *pc),
+                wait,
+                "the {name} tier parked at a DIFFERENT address than the interpreter"
+            ),
+            other => panic!("`park_a:run/0` must park on {name} too, got {other:?}"),
+        }
+
+        let context_module = run.machine.current_module().unwrap_or_else(|| {
+            panic!(
+                "the {name} suspension must be inside the cross-module callee, not the entry module"
+            )
+        });
+        assert!(
+            Arc::ptr_eq(&context_module, &callee),
+            "the {name} suspension must be in the `park_b` module context"
+        );
+
+        host.clear_mailbox();
+        host.enqueue(delivered);
+        let resumed = run
+            .machine
+            .resume_outcome_with_tier(&*entry, wait.0, wait.1, &mut host, tier)
+            .unwrap_or_else(|error| panic!("the {name} resume completes: {error:?}"));
+
+        assert_eq!(
+            resumed,
+            RunOutcome::Returned(delivered),
+            "the {name} tier's resume must yield the delivered term"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
