@@ -88,6 +88,18 @@ never touched from here.
   type; no caller). `Expected::Term` (`support/oracle.rs:165`) is likewise parsed against one host and
   must be `matches`-ed against that same host. `ProbeRun` itself is the *correct* shape: it owns
   `module` + `machine` + `ctx` beside the terms.
+- Two shapes defeat that rule silently, because a recycled carrier block usually lands at the same
+  address with the same words and `beam_term::cmp_impl` short-circuits on `a.raw() == b.raw()`:
+  (a) the tier-parity loop `for tier in [Tier::Interpreter, Tier::BaselineJit] { let mut ctx =
+  Host::new(..); values.push((tier, value)); }` with a comparison AFTER the loop — each iteration's
+  host owns the heap of the value it pushed, so hoist `let mut hosts: Vec<Host> = Vec::new()` and push
+  one per iteration (keeping every existing assertion), or move the comparison into the loop body;
+  (b) a `&mut MinimalContext::new()` passed as an argument — the temporary dies at the end of that
+  statement, so a helper that runs through it and returns `Result<Eterm>` hands back a term whose arena
+  is already gone (a helper that must return a term returns the context beside it, or takes a
+  caller-owned `&mut MinimalContext`). Shadowing is NOT a drop point: `let mut ctx = ..; let mut ctx =
+  ..;` keeps the first arena alive to the end of the block — that is why the both-tiers-in-one-body
+  `jit.rs` register-file-size tests are sound.
 
 ## Per-fixture suites
 Produced by the system `erlc`, the differential oracle — see `tests/fixtures/README.md` for the regeneration recipe and the opcode coverage of each fixture:
