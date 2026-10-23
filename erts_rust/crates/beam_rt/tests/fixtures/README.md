@@ -30,7 +30,7 @@ All 27 committed images, by name (byte sizes are the committed files' own):
 | `recv_after.beam` | 824 | `## Committed oracle fixtures` |
 | `dist_echo.beam` | 632 | `## Committed oracle fixtures` |
 | `port_exit.beam` | 2 512 | `## Committed oracle fixtures` |
-| `port_suspend.beam` | 1 048 | `## Committed oracle fixtures` |
+| `port_suspend.beam` | 840 | `## Committed oracle fixtures` |
 | `bifent.beam` | 720 | `## Committed oracle fixtures` |
 | `tmr.beam` | 660 | `## Committed oracle fixtures` |
 | `pingpong.beam` | 1 004 | `## Committed oracle fixtures` |
@@ -38,7 +38,7 @@ All 27 committed images, by name (byte sizes are the committed files' own):
 | `port_failure.beam` | 2 656 | [`PORT_AND_DRIVER_FIXTURES.md`](PORT_AND_DRIVER_FIXTURES.md) |
 | `maxheap.beam` | 6 088 | `../max_heap_enforce.rs` |
 | `preempt.beam` | 748 | `../preempt.rs` |
-| `reds_boundary.beam` | 928 | `src/runner/tests/reds_door.rs` |
+| `reds_boundary.beam` | 684 | `src/runner/tests/reds_door.rs` |
 | `native_reds.beam` | 796 | `src/runner/tests/slice_charging.rs` |
 | `gc_loop.beam` | 784 | `## GC fixtures` |
 | `gc_ints.beam` | 664 | `## GC fixtures` |
@@ -55,12 +55,12 @@ All 27 committed images, by name (byte sizes are the committed files' own):
 `function_clause_fixture.beam`, `recv_after.beam`, `dist_echo.beam`, `port_exit.beam`,
 `port_suspend.beam` and `pingpong.beam` are committed oracle fixtures: real `.beam` images produced
 by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
-* `port_suspend.beam` (`port_suspend.erl`, compiled with the plain system `erlc`) is the **busy-port
-  BIF-suspend** image for `src/port/busy_suspend_tests.rs`: `park/1` opens a busy driver port and
-  calls `port_command/2` on it (the shape that parks), and `park_with_clearing_helper/1` additionally
-  spawns a helper that blocks in `receive after 50` and then calls `port_control(Port, $N, <<>>)`
-  (the fixture's `set_busy_port(port, 0)`), so one `run_scheduled` proves park → pump → resume and
-  that the driver was written to **exactly once**.
+* `port_suspend.beam` (`port_suspend.erl`, compiled with the system `erlc +deterministic`) is the
+  **busy-port BIF-suspend** image for `src/port/busy_suspend_tests.rs`: `command/1` issues one plain
+  `port_command/2` against a port the harness hands it and has made **busy** (the shape that parks),
+  and `command_after/2` additionally spawns a helper that blocks in `receive … after Delay` and then
+  calls `port_control(Port, $N, <<>>)` (the driver's clear), so one `run_scheduled` proves
+  park → pump → resume and that the driver was written to **exactly once**.
 * `pingpong.beam` is the **two-process ping-pong** image for the `run` route's sleep
   accounting (`tests/run_route_sleep.rs`): `go/1` spawns one fun-bodied worker and runs `N`
   synchronous round trips (`Worker ! {self(), N}` / a bound-variable `receive {_, N}`, with
@@ -129,10 +129,10 @@ by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the dif
 
 ## Regeneration
 
-`mailbox`, `sched`, `port_recv`, `raise_structured` and `function_clause_fixture` are compiled
-with `+deterministic`, which strips the embedded source path from the `CInf` (compile info) and
-`Dbgi` (debug info) chunks — the committed `.beam` is therefore **path-free**. Compile from a
-neutral scratch dir under `$TMPDIR` so nothing about the local checkout is recorded:
+Every committed image in this directory is compiled with `+deterministic`, which strips the embedded
+source path from the `CInf` (compile info) and `Dbgi` (debug info) chunks — the committed `.beam` is
+therefore **path-free**, and `../fixtures_are_path_free.rs` fails on any image that is not.
+Compile from a neutral scratch dir under `$TMPDIR` so nothing about the local checkout is recorded:
 
 ```sh
 # mailbox.beam (740 bytes)
@@ -224,11 +224,23 @@ cp port_failure.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic port_failure.erl )
 cp "$SCRATCH/gen/port_failure.beam" port_failure.beam    # 2 656 bytes
 git add -f port_failure.beam
+
+# port_suspend.beam (840 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_port_suspend_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp port_suspend.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic port_suspend.erl )
+cp "$SCRATCH/gen/port_suspend.beam" port_suspend.beam
+
+# reds_boundary.beam (684 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_reds_boundary_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp reds_boundary.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic reds_boundary.erl )
+cp "$SCRATCH/gen/reds_boundary.beam" reds_boundary.beam
 ```
-Every fixture in this section is built with `+deterministic` in a `$TMPDIR` scratch dir, which strips the embedded source path.
-Two committed images are **not** path-free — `strings reds_boundary.beam port_suspend.beam | rg '/home/'` reports a worktree path in each:
-`reds_boundary.beam` and `port_suspend.beam` were compiled without `+deterministic`.
-Neither suite compares its image bytes, so nothing is flaky; recompiling either one with the deterministic recipe above removes the leak.
+`port_suspend.beam` and `reds_boundary.beam` need no option beyond `+deterministic`: each one's `Code` chunk is byte-identical to its earlier non-deterministic build.
+Only `CInf` (`[{version,"10.0.6"}]`), `Dbgi` (`{debug_info_v1,erl_abstract_code,{none,[deterministic]}}`) and — for `reds_boundary.beam` — the `Line` chunk's file-name entry change with the flag.
 
 The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
 **force-added**: `git add -f sched.beam`.
