@@ -100,6 +100,28 @@ never touched from here.
   caller-owned `&mut MinimalContext`). Shadowing is NOT a drop point: `let mut ctx = ..; let mut ctx =
   ..;` keeps the first arena alive to the end of the block — that is why the both-tiers-in-one-body
   `jit.rs` register-file-size tests are sound.
+- **The lifetime rule, site by site.** The tier-parity idiom (hoist `let mut hosts: Vec<Host> = Vec::new()`
+  before the loop, `hosts.push(ctx)` at the end of every iteration, `drop(hosts)` after the last read) is
+  used by the two suites whose cross-tier comparison reads a term produced *inside* the loop:
+  `bif_suspend.rs::both_tiers_report_and_resume_the_same_suspend` (the resumed value is a boxed `{7,8}`
+  tuple, so a dropped arena is a real use-after-free) and
+  `fun_suspend.rs::both_tiers_report_and_resume_the_same_suspend` (its `make_small(RESULT)` is an
+  immediate only by accident of the current fixture, so it keeps the same shape). The per-tier host
+  checks (`ctx.calls`, `ctx.applications`) stay *inside* the iteration, before the push.
+  Audited and **correct by construction** — leave them alone: `jit.rs`'s two register-file-size tests
+  (shadowed bindings: shadowing is not a drop point, so both arenas live to the end of the block);
+  `support/probe/mod.rs`'s `ProbeRun`, `bignum_compiled.rs::run` and `raise_with_trace.rs::run_caught`
+  (each hands the context back beside the term); `tailcall.rs::run` and `bif_in_machine.rs::run_on_tier`
+  (same, or a caller-owned `&mut` host); `jit_cranelift.rs::agree_shape` (small ints only, and the
+  sibling `agree_outcome_with` documents why a reason term needs a caller-owned context);
+  `jit_compare.rs::agree_module` (contexts are `&mut MinimalContext::new()` temporaries, but every caller
+  consumes a comparison `bool`); `select_val.rs` (the loop normalizes the value into an owned
+  `Atom`/`Small` before the host drops); `jit_coverage.rs::agree` / `jit_cross_module.rs::run_both` /
+  `stacktrace_frames.rs` / `real_beam_variant_proofs/receive.rs` (one host created outside the loop, or
+  a caller-owned `&mut`); `local_call_seam.rs`, `jit_cache.rs`, `opcodes.rs`, `gaps.rs`, `dynamic_census.rs`
+  (only immediates, typed errors or `Display` text escape, or an explicit `drop(ctx)` after the reads).
+  Reference for the "read it, then drop the arena" shape: `opcodes.rs`'s `put_tuple2` case, which
+  comments the reason and drops the context only after reading the tuple.
 
 ## Per-fixture suites
 Produced by the system `erlc`, the differential oracle — see `tests/fixtures/README.md` for the regeneration recipe and the opcode coverage of each fixture:
