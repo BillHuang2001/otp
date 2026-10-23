@@ -849,6 +849,152 @@ fn the_dispatch_memo_stays_correct_under_slot_churn() {
 }
 
 // -----------------------------------------------------------------------
+// the dispatch memo's one-entry MRU hint, in front of the slot hash
+// -----------------------------------------------------------------------
+
+/// **The MRU hint can only skip the fold, never change an answer.**
+///
+/// [`RuntimeContext::dispatch`] tries the slot the *previous* call resolved
+/// ([`DispatchMemo::last`]) before it runs [`dispatch_slot`]'s byte fold, because a real
+/// workload's calls overwhelmingly repeat one key. The hint answers only through the memo's own
+/// full field-for-field key equality ([`DispatchEntry::matches`]) — the same test the hashed
+/// slot's hit path performs — so this pins all three consequences:
+///
+/// 1. every answer in a mixed sequence equals that key's own uncached prologue answer;
+/// 2. after each call the hint names the slot that answer was resolved in (a hit through the
+///    hash re-warms it, a miss fills it); and
+/// 3. a hint naming a slot whose entry is a **different** key declines — a wrong answer is
+///    impossible, and the cost is a miss (the fold), while a hint naming some other key's slot
+///    still lets the key's own slot hit.
+#[test]
+fn the_mru_hint_in_front_of_the_slot_hash_never_answers_for_another_key() {
+    use super::calls::perf_counters;
+    // `A` and `B` hash to different slots, so the sequence below alternates between the hint and
+    // the fold. `C` claims `A`'s **own** slot, which is what lets the hint name a slot whose
+    // entry is not the requested key.
+    const A: (&str, &str, u32) = ("lists", "reverse", 1);
+    const B: (&str, &str, u32) = ("erlang", "memory", 0);
+    const C: (&str, &str, u32) = ("records", "get_definition", 2);
+    assert_ne!(
+        dispatch_slot(A.0, A.1, A.2),
+        dispatch_slot(B.0, B.1, B.2),
+        "the sequence must alternate between the hint and the hashed slot"
+    );
+    assert_eq!(
+        dispatch_slot(C.0, C.1, C.2),
+        dispatch_slot(A.0, A.1, A.2),
+        "`C` must claim `A`'s slot, or the wrong-key half below is vacuous"
+    );
+
+    let mut rt = runtime();
+    let (want_a, want_b, want_c) = {
+        let want = |key| shape(uncached_dispatch(&rt, key));
+        (want(A), want(B), want(C))
+    };
+    let slot_a = dispatch_slot(A.0, A.1, A.2);
+    let slot_b = dispatch_slot(B.0, B.1, B.2);
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert_eq!(
+        ctx.dispatch_memo.last, None,
+        "a fresh context has no hint, so its first call pays the fold"
+    );
+
+    // (1) + (2): the answers, and the hint after each of them.
+    for (round, (key, want)) in [
+        (A, want_a),
+        (A, want_a),
+        (A, want_a),
+        (B, want_b),
+        (A, want_a),
+        (B, want_b),
+        (B, want_b),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let got = ctx.dispatch(key.0, key.1, key.2);
+        assert_eq!(
+            shape((got.bif, got.hooks)),
+            want,
+            "round {round}: {}:{}/{} answered something the uncached prologue would not",
+            key.0,
+            key.1,
+            key.2
+        );
+        assert_eq!(
+            ctx.dispatch_memo.last,
+            Some(dispatch_slot(key.0, key.1, key.2)),
+            "round {round}: the hint must name the slot {}:{}/{} was resolved in",
+            key.0,
+            key.1,
+            key.2
+        );
+    }
+
+    // (3a) The hint now names `B`'s slot. Dispatching `C` — whose slot is `A`'s, and which is a
+    // different key from the one that slot holds — declines on the hint and lands in the fold, so
+    // it costs a miss and still answers `C`'s own shape.
+    perf_counters::test_override::force(true);
+    let (hits, misses, _, _) = perf_counters::dispatch_counts();
+    let got = ctx.dispatch(C.0, C.1, C.2);
+    let (hits_after, misses_after, _, _) = perf_counters::dispatch_counts();
+    perf_counters::test_override::force(false);
+    assert_eq!(
+        shape((got.bif, got.hooks)),
+        want_c,
+        "a hint naming another key's slot must not answer with that key's implementation"
+    );
+    assert_eq!(
+        hits_after, hits,
+        "the declined hint must not be counted as a hit"
+    );
+    assert_eq!(
+        misses_after,
+        misses + 1,
+        "the declined hint falls through to the fold, which is a miss"
+    );
+    assert_eq!(
+        ctx.dispatch_memo.last,
+        Some(slot_a),
+        "the miss re-pointed the hint at the slot it filled"
+    );
+
+    // (3b) `A`'s slot now holds `C`, so `A` itself misses and reclaims it; then a hint pointing
+    // at `B`'s slot must still let `A` hit through the fold, charging no miss.
+    ctx.dispatch(A.0, A.1, A.2);
+    ctx.dispatch(B.0, B.1, B.2);
+    assert_eq!(
+        ctx.dispatch_memo.last,
+        Some(slot_b),
+        "premise: the hint names `B`'s slot while `A`'s slot holds `A`"
+    );
+    perf_counters::test_override::force(true);
+    let (hits, misses, _, _) = perf_counters::dispatch_counts();
+    let got = ctx.dispatch(A.0, A.1, A.2);
+    let (hits_after, misses_after, _, _) = perf_counters::dispatch_counts();
+    perf_counters::test_override::force(false);
+    assert_eq!(
+        shape((got.bif, got.hooks)),
+        want_a,
+        "`A` must answer its own shape after the hint declined"
+    );
+    assert_eq!(
+        hits_after,
+        hits + 1,
+        "a hint on another key's slot costs the fold, and the fold still hits"
+    );
+    assert_eq!(
+        misses_after, misses,
+        "a declined hint must never turn a hashed hit into a miss"
+    );
+    assert_eq!(
+        ctx.dispatch_memo.last,
+        Some(slot_a),
+        "the hash path's hit re-warms the hint"
+    );
+}
+
+// -----------------------------------------------------------------------
 // the receive/mailbox seam over the running process's real mailbox
 // -----------------------------------------------------------------------
 

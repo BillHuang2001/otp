@@ -83,6 +83,22 @@ pub(crate) fn probe_counts() -> (u64, u64) {
     })
 }
 
+/// Test-only: this thread's `(hit, miss, cold, evict)` dispatch-memo counts, read under
+/// [`test_override::force`] so a case can assert a **delta** across one dispatch — the only way
+/// to pin that the MRU hint declines (a miss) instead of answering for the wrong key.
+#[cfg(test)]
+pub(crate) fn dispatch_counts() -> (u64, u64, u64, u64) {
+    COUNTERS.with(|counters| {
+        let counters = counters.borrow();
+        (
+            counters.dispatch_hit,
+            counters.dispatch_miss,
+            counters.dispatch_cold,
+            counters.dispatch_evict,
+        )
+    })
+}
+
 /// What the counters observed, and where the time goes.
 #[derive(Default)]
 pub(crate) struct Counters {

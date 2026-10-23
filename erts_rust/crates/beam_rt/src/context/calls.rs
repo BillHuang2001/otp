@@ -1922,7 +1922,18 @@ impl RuntimeContext<'_> {
     /// branches and the `O(live objects)` descent stays off the allocator's path. A process with
     /// no table (`-eval`/single-pass) or none the table still holds cannot collect, so it needs
     /// no gate.
+    ///
+    /// The **shape test runs before the process-table probe** ([`gc::result_may_be_foreign`]):
+    /// this function runs once per successful `call_bif`, and most results are immediates
+    /// (`erlang:rem/2`'s small int in an arithmetic loop), which the gate classifies as inert
+    /// without ever reading the process. The `Process` lookup therefore only happens for a
+    /// pointer-bearing, non-literal, dereferenceable word — the same words
+    /// [`gc::word_region`](crate::context::gc::word_region) would have classified first anyway, so
+    /// the verdict is unchanged.
     pub(super) fn open_gate_for_foreign_result(&mut self, term: Eterm) {
+        if !crate::context::gc::result_may_be_foreign(term) {
+            return;
+        }
         let pid = self.mailbox_pid;
         let foreign = match self
             .mailbox_table

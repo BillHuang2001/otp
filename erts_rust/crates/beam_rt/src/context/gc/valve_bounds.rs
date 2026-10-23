@@ -59,12 +59,15 @@
 //! `span_words()` for both and pins the property that makes the reject sound.
 use beam_gc::{AnyCollector, HeapPolicy, MatureKind, ScannedBounds, IMMIX_BREAK_EVEN_WORDS};
 use beam_process::{Process, ProcessTable};
-use beam_term::prelude::{is_boxed, is_list, make_small, Eterm, NIL};
+use beam_term::prelude::{
+    is_boxed, is_list, make_atom, make_boxed, make_internal_pid, make_internal_port, make_pid_data,
+    make_port_data, make_small, Atom, Eterm, NIL,
+};
 use beam_term::AtomTable;
 
 use super::{
-    bump, forwards_word_matching, in_heap_block, outside_bounds, root_is_unscanned,
-    word_region_exactly, WordRegion,
+    bump, forwards_word_matching, in_heap_block, outside_bounds, result_may_be_foreign,
+    root_is_unscanned, word_region, word_region_exactly, WordRegion,
 };
 
 /// The **pre-filter predicate**: the valve's verdict re-derived without the aggregate fast
@@ -799,6 +802,83 @@ fn the_filter_does_not_change_a_collections_counters() {
             assert_eq!(
                 window[0], window[1],
                 "{kind:?}: the same workload must collect identically every time"
+            );
+        }
+    }
+}
+
+/// **The BIF-result shape test is exactly [`word_region`]'s own prelude.**
+///
+/// `RuntimeContext::open_gate_for_foreign_result` asks [`result_may_be_foreign`] *before* it
+/// probes the process table, so the two entry points must classify every word identically: a word
+/// the shape test rejects is a word `word_region` answers `None` for (inert, so the gate stays
+/// closed), and a word it accepts is one `word_region` places in a region. This is the whole
+/// classification space the gate can be handed:
+///
+/// * an **immediate** of each shape — small int, atom, `NIL`, internal pid, internal port;
+/// * a **literal-area** word (a tagged pointer to a term that never moves);
+/// * a **fabricated container** word whose pointer no term can live at
+///   ([`beam_term::boxed::make_boxed`] over a misaligned address, the C ABI's `THE_NON_VALUE`
+///   class that `dereferenceable_pointer` rejects);
+/// * a **heap boxed term** and a **heap cons** — the two pointer-bearing shapes, which are the
+///   only words the gate must ever take to the probe.
+///
+/// A reference is deliberately absent: M1's internal reference is a **boxed block**
+/// (`write_internal_ref`), i.e. it is covered by the heap boxed term above, and no reference
+/// word is an immediate in the frozen layout.
+#[test]
+fn the_result_shape_test_is_the_region_classifiers_own_prelude() {
+    for kind in KINDS {
+        let (mut table, pid) = process_with(kind);
+        let (boxed, cons, literal) = {
+            let process = table.get_mut(pid).expect("the process");
+            let boxed = process
+                .heap_mut()
+                .tuple(&[make_small(1), make_small(2)])
+                .expect("a young-heap 2-tuple");
+            let cons = process
+                .heap_mut()
+                .cons(make_small(3), NIL)
+                .expect("a young-heap cons");
+            // A literal-area word: the tag, not the payload, is what the shape test reads.
+            let literal = beam_term::literal::make_literal(boxed);
+            (boxed, cons, literal)
+        };
+        let process = table.get(pid).expect("the process");
+        let bounds = process.collector().scanned_bounds();
+        let cases: [(&str, Eterm, bool); 9] = [
+            ("a small int", make_small(7), false),
+            ("an atom", make_atom(Atom::from_raw(3)), false),
+            ("NIL", NIL, false),
+            (
+                "an internal pid",
+                make_internal_pid(make_pid_data(0, 1)),
+                false,
+            ),
+            (
+                "an internal port",
+                make_internal_port(make_port_data(1)),
+                false,
+            ),
+            ("a literal-area word", literal, false),
+            (
+                "a fabricated container word",
+                make_boxed(1 as *const Eterm),
+                false,
+            ),
+            ("a heap 2-tuple", boxed, true),
+            ("a heap cons", cons, true),
+        ];
+        for (what, term, may_be_foreign) in cases {
+            assert_eq!(
+                result_may_be_foreign(term),
+                may_be_foreign,
+                "{kind:?}: the shape test's verdict for {what}"
+            );
+            assert_eq!(
+                word_region(process, &bounds, term).is_some(),
+                may_be_foreign,
+                "{kind:?}: the region classifier disagrees with the shape test on {what}"
             );
         }
     }

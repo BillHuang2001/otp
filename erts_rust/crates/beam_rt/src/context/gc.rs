@@ -384,20 +384,47 @@ pub(crate) fn word_region(
     bounds: &ScannedBounds,
     word: Eterm,
 ) -> Option<WordRegion> {
-    if !is_pointer_bearing(word) {
-        return None;
-    }
-    if beam_term::literal::is_literal(word) {
-        return None;
-    }
-    let Some(ptr) = dereferenceable_pointer(word) else {
-        return None;
-    };
+    // The three **term-only** tests, shared with [`result_may_be_foreign`] and handing back the
+    // address they already had to compute, so the placement test below needs no second
+    // `dereferenceable_pointer` call and the two entry points cannot drift apart.
+    let ptr = foreign_shape_pointer(word)?;
     if in_heap_block(process.heap(), ptr) || !outside_bounds(process.collector(), bounds, ptr) {
         Some(WordRegion::Scanned)
     } else {
         Some(WordRegion::Foreign)
     }
+}
+
+/// Whether `word` could name a container in a region the collector does **not** scan — the three
+/// **term-only** tests [`word_region`] performs before it reads the process at all
+/// ([`is_pointer_bearing`], the literal-area tag, and [`dereferenceable_pointer`]), as a predicate
+/// that needs no [`Process`].
+///
+/// It is deliberately *not* the region test: an answer of `true` means only "a relocation could
+/// have to look at this word", never "it is foreign". Its one caller is the BIF-result gate
+/// (`RuntimeContext::open_gate_for_foreign_result`), which runs once per successful `call_bif`
+/// and whose results are overwhelmingly immediates (a small int from `erlang:rem/2`): hoisting
+/// the shape test ahead of the process-table probe keeps that common case off the table entirely,
+/// with a verdict identical to the probe's own, because [`word_region`] answers `None` (and
+/// [`root_is_unscanned_with`] therefore `false`) for exactly these words.
+#[inline]
+pub(crate) fn result_may_be_foreign(word: Eterm) -> bool {
+    foreign_shape_pointer(word).is_some()
+}
+
+/// The address a **container-shaped** term word names, or `None` for a word whose placement a
+/// relocation never has to know: an immediate, a literal-area pointer, or a pointer naming no
+/// address a term can live at ([`dereferenceable_pointer`]).
+///
+/// The single definition of "this word could be a foreign container" — [`word_region`] continues
+/// from the address it returns and [`result_may_be_foreign`] stops at its presence — so the two
+/// can never disagree about which words are worth a region test.
+#[inline]
+fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
+    if !is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
+        return None;
+    }
+    dereferenceable_pointer(word)
 }
 
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
