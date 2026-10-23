@@ -692,42 +692,42 @@ fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
     for &(module, function, arity) in DISPATCH_PROBE_KEYS {
         let hooks = ctx.dispatch(module, function, arity).hooks;
         assert_eq!(
-            hooks.dict,
+            hooks.dict(),
             beam_bifs::needs_dict_hook(module, function, arity),
             "{module}:{function}/{arity} dict arm"
         );
         assert_eq!(
-            hooks.process_hook,
+            hooks.process_hook(),
             beam_bifs::needs_process_hook(module, function, arity),
             "{module}:{function}/{arity} process arm"
         );
         assert_eq!(
-            hooks.nif_loader,
+            hooks.nif_loader(),
             beam_bifs::needs_nif_loader(module, function, arity),
             "{module}:{function}/{arity} NIF-loader arm"
         );
         assert_eq!(
-            hooks.record_source,
+            hooks.record_source(),
             beam_bifs::needs_record_source(module, function, arity),
             "{module}:{function}/{arity} record-source arm"
         );
         assert_eq!(
-            hooks.send_hook,
+            hooks.send_hook(),
             beam_bifs::needs_send_hook(module, function, arity),
             "{module}:{function}/{arity} send arm"
         );
         assert_eq!(
-            hooks.module_info,
+            hooks.module_info(),
             beam_bifs::needs_module_info(module, function, arity),
             "{module}:{function}/{arity} module-info arm"
         );
         assert_eq!(
-            hooks.persistent_term,
+            hooks.persistent_term(),
             beam_bifs::needs_persistent_term(module, function, arity),
             "{module}:{function}/{arity} persistent-term arm"
         );
         assert_eq!(
-            hooks.runtime_hooks,
+            hooks.runtime_hooks(),
             beam_bifs::needs_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity} runtime-hooks arm"
         );
@@ -736,12 +736,12 @@ fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
         // `the_fun_identity_gate_selects_the_image_and_introspection_bifs` for the
         // divergence the roster itself does not carry).
         assert_eq!(
-            hooks.fun_identity,
+            hooks.fun_identity(),
             beam_bifs::needs_local_fun_identity(module, function, arity),
             "{module}:{function}/{arity} local-fun-identity gate"
         );
         assert_eq!(
-            hooks.memory_hook,
+            hooks.memory_hook(),
             beam_bifs::needs_memory_hook(module, function, arity),
             "{module}:{function}/{arity} memory-hook gate"
         );
@@ -2743,8 +2743,8 @@ fn the_fun_identity_gate_selects_the_image_and_introspection_bifs() {
     assert!(!beam_bifs::needs_local_fun_identity("erlang", "fun_info", 2));
     // The widened gate is what the dispatch memo records, so the bridge really is installed
     // on the introspection arm (`DispatchHooks::of` reads the gate, not the roster).
-    assert!(DispatchHooks::of("erlang", "fun_info", 1).fun_identity);
-    assert!(DispatchHooks::of("erlang", "fun_info", 2).fun_identity);
+    assert!(DispatchHooks::of("erlang", "fun_info", 1).fun_identity());
+    assert!(DispatchHooks::of("erlang", "fun_info", 2).fun_identity());
     for (module, function, arity) in [
         ("erlang", "term_to_binary", 0),
         ("erlang", "term_to_binary", 3),

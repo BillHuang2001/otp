@@ -93,7 +93,7 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 
 /// The `beam_bifs` hook roster one `(module, function, arity)` key needs.
 ///
-/// One field per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
+/// One **bit** per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
 /// build gates (`fun_identity`, `memory_hook`) — so [`RuntimeContext::call_registered`] can
 /// select its arm from one value instead of running ten `binary_search`es over
 /// [`beam_bifs`]' `&'static` rosters (each of which is a chain of `bcmp` calls across a crate
@@ -102,33 +102,92 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 /// [`DispatchHooks::of`] is the **only** place the predicates are evaluated, and it calls the
 /// same `uses_*` functions the arms are documented against, so the roster can never drift from
 /// what `beam_bifs` routes through each seam.
+///
+/// # Why one `u16` and not eleven `bool` fields
+///
+/// The roster rides inside [`DispatchAnswer`], which [`RuntimeContext::dispatch`] **returns by
+/// value** to [`RuntimeContext::call_bif_routed`] and on to
+/// [`RuntimeContext::call_registered`]. Eleven `bool`s behind the eight-byte `bif` pointer make
+/// the aggregate 24 bytes, over the 16-byte limit of the x86-64 SysV return convention, so it
+/// came back through a **hidden `sret` pointer**: the callee stored the whole answer into the
+/// caller's stack slot and the caller re-read the roster's eleven spilled bytes from it. The
+/// packed mask makes the aggregate 16 bytes — `bif` in one register, the roster in the next —
+/// so the whole answer crosses both call boundaries **in registers** and
+/// [`DispatchHooks::any`]'s fold (measured as `dispatch.rs:150`'s `self.dict`, 1.41 % of a
+/// `bench_gc_bound:churn/1` run: the first of the eleven reloads attributed to one line)
+/// collapses to one `test` of a register.
+///
+/// # What keeps the roster honest
+///
+/// * [`DispatchHooks::of`] evaluates the predicates into an array and destructures it
+///   **exhaustively**, so an arm added to (or removed from) the roster changes the array's
+///   length and fails to compile rather than silently missing a bit.
+/// * [`DispatchHooks::ALL`] lists every named bit and
+///   [`DispatchHooks::ANY_MASK`] folds it; the `const` assertion right after this type proves
+///   the bits are pairwise distinct and together fill the low `ALL.len()` bits, so no named bit
+///   can alias another's slot or leave a gap a future bit would fall into.
+/// * [`DispatchHooks::any`] tests the whole `ANY_MASK`, so a bit set for an arm the selector no
+///   longer names is still "any" — a new arm can never be silently inert.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub(super) struct DispatchHooks {
-    /// [`RuntimeContext::uses_dict`] — the process-dictionary arm.
-    pub(super) dict: bool,
-    /// [`RuntimeContext::uses_process_hook`] — the process/name/global-state arm.
-    pub(super) process_hook: bool,
-    /// [`RuntimeContext::uses_nif_loader`] — the `load_nif/2` arm.
-    pub(super) nif_loader: bool,
-    /// [`RuntimeContext::uses_record_source`] — the record-source arm.
-    pub(super) record_source: bool,
-    /// [`RuntimeContext::uses_export_gate`] — the `[safe]` export-gate arm.
-    pub(super) export_gate: bool,
-    /// [`RuntimeContext::uses_send_hook`] — the message-delivery arm.
-    pub(super) send_hook: bool,
-    /// [`RuntimeContext::uses_module_info`] — the module-info arm.
-    pub(super) module_info: bool,
-    /// [`RuntimeContext::uses_persistent_term`] — the persistent-term arm.
-    pub(super) persistent_term: bool,
-    /// [`RuntimeContext::uses_runtime_hooks`] — the timer/reference/link arm.
-    pub(super) runtime_hooks: bool,
-    /// [`RuntimeContext::uses_fun_identity`] — the local-fun-identity build gate.
-    pub(super) fun_identity: bool,
-    /// [`RuntimeContext::uses_memory_hook`] — the `erlang:memory/0,1` build gate.
-    pub(super) memory_hook: bool,
-}
+pub(super) struct DispatchHooks(u16);
 
 impl DispatchHooks {
+    /// [`RuntimeContext::uses_dict`] — the process-dictionary arm.
+    const DICT: u16 = 1 << 0;
+    /// [`RuntimeContext::uses_process_hook`] — the process/name/global-state arm.
+    const PROCESS_HOOK: u16 = 1 << 1;
+    /// [`RuntimeContext::uses_nif_loader`] — the `load_nif/2` arm.
+    const NIF_LOADER: u16 = 1 << 2;
+    /// [`RuntimeContext::uses_record_source`] — the record-source arm.
+    const RECORD_SOURCE: u16 = 1 << 3;
+    /// [`RuntimeContext::uses_export_gate`] — the `[safe]` export-gate arm.
+    const EXPORT_GATE: u16 = 1 << 4;
+    /// [`RuntimeContext::uses_send_hook`] — the message-delivery arm.
+    const SEND_HOOK: u16 = 1 << 5;
+    /// [`RuntimeContext::uses_module_info`] — the module-info arm.
+    const MODULE_INFO: u16 = 1 << 6;
+    /// [`RuntimeContext::uses_persistent_term`] — the persistent-term arm.
+    const PERSISTENT_TERM: u16 = 1 << 7;
+    /// [`RuntimeContext::uses_runtime_hooks`] — the timer/reference/link arm.
+    const RUNTIME_HOOKS: u16 = 1 << 8;
+    /// [`RuntimeContext::uses_fun_identity`] — the local-fun-identity build gate.
+    const FUN_IDENTITY: u16 = 1 << 9;
+    /// [`RuntimeContext::uses_memory_hook`] — the `erlang:memory/0,1` build gate.
+    const MEMORY_HOOK: u16 = 1 << 10;
+
+    /// **Every** named bit, in declaration order — the one list the exhaustive assertion below
+    /// and [`Self::ANY_MASK`] are derived from.
+    const ALL: [u16; 11] = [
+        Self::DICT,
+        Self::PROCESS_HOOK,
+        Self::NIF_LOADER,
+        Self::RECORD_SOURCE,
+        Self::EXPORT_GATE,
+        Self::SEND_HOOK,
+        Self::MODULE_INFO,
+        Self::PERSISTENT_TERM,
+        Self::RUNTIME_HOOKS,
+        Self::FUN_IDENTITY,
+        Self::MEMORY_HOOK,
+    ];
+
+    /// The fold of [`Self::ALL`]: the set of bits [`Self::any`] tests, built from every named
+    /// bit rather than written out as a literal.
+    const ANY_MASK: u16 = {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            mask |= Self::ALL[i];
+            i += 1;
+        }
+        mask
+    };
+
+    /// The roster's bit when `on`, nothing otherwise — [`Self::of`]'s only setter.
+    const fn bit(bit: u16, on: bool) -> u16 {
+        if on { bit } else { 0 }
+    }
+
     /// Whether **any** hook is set — the one-bit test [`RuntimeContext::call_registered`] makes to
     /// pick between its hook-free fast path and its full (cold) one.
     ///
@@ -140,27 +199,85 @@ impl DispatchHooks {
     /// 5 171 194 of 5 171 517), so the test is what keeps the eleven per-arm predicates and their
     /// eleven spilled bytes off the path an arithmetic loop takes.
     ///
-    /// Every field is `bool`, and the `|` chain is a plain bitwise fold over eleven bytes: it is
-    /// deliberately **not** `||`, whose short-circuit would cost up to eleven branches where one OR
-    /// tree costs none, and it is deliberately written out in full (rather than
-    /// `*self != DispatchHooks::default()`) so a field added to the struct fails to compile here
-    /// instead of silently dropping out of the test.
+    /// One `test` of one register against [`Self::ANY_MASK`]; no short-circuit and no per-arm
+    /// branch, and the mask is a fold over [`Self::ALL`] rather than a literal, so the test cannot
+    /// lose an arm.
     #[inline]
     pub(super) fn any(&self) -> bool {
-        self.dict
-            | self.process_hook
-            | self.nif_loader
-            | self.record_source
-            | self.export_gate
-            | self.send_hook
-            | self.module_info
-            | self.persistent_term
-            | self.runtime_hooks
-            | self.fun_identity
-            | self.memory_hook
+        self.0 & Self::ANY_MASK != 0
+    }
+
+    /// [`RuntimeContext::uses_dict`] — the process-dictionary arm.
+    #[inline]
+    pub(super) const fn dict(&self) -> bool {
+        self.0 & Self::DICT != 0
+    }
+
+    /// [`RuntimeContext::uses_process_hook`] — the process/name/global-state arm.
+    #[inline]
+    pub(super) const fn process_hook(&self) -> bool {
+        self.0 & Self::PROCESS_HOOK != 0
+    }
+
+    /// [`RuntimeContext::uses_nif_loader`] — the `load_nif/2` arm.
+    #[inline]
+    pub(super) const fn nif_loader(&self) -> bool {
+        self.0 & Self::NIF_LOADER != 0
+    }
+
+    /// [`RuntimeContext::uses_record_source`] — the record-source arm.
+    #[inline]
+    pub(super) const fn record_source(&self) -> bool {
+        self.0 & Self::RECORD_SOURCE != 0
+    }
+
+    /// [`RuntimeContext::uses_export_gate`] — the `[safe]` export-gate arm.
+    #[inline]
+    pub(super) const fn export_gate(&self) -> bool {
+        self.0 & Self::EXPORT_GATE != 0
+    }
+
+    /// [`RuntimeContext::uses_send_hook`] — the message-delivery arm.
+    #[inline]
+    pub(super) const fn send_hook(&self) -> bool {
+        self.0 & Self::SEND_HOOK != 0
+    }
+
+    /// [`RuntimeContext::uses_module_info`] — the module-info arm.
+    #[inline]
+    pub(super) const fn module_info(&self) -> bool {
+        self.0 & Self::MODULE_INFO != 0
+    }
+
+    /// [`RuntimeContext::uses_persistent_term`] — the persistent-term arm.
+    #[inline]
+    pub(super) const fn persistent_term(&self) -> bool {
+        self.0 & Self::PERSISTENT_TERM != 0
+    }
+
+    /// [`RuntimeContext::uses_runtime_hooks`] — the timer/reference/link arm.
+    #[inline]
+    pub(super) const fn runtime_hooks(&self) -> bool {
+        self.0 & Self::RUNTIME_HOOKS != 0
+    }
+
+    /// [`RuntimeContext::uses_fun_identity`] — the local-fun-identity build gate.
+    #[inline]
+    pub(super) const fn fun_identity(&self) -> bool {
+        self.0 & Self::FUN_IDENTITY != 0
+    }
+
+    /// [`RuntimeContext::uses_memory_hook`] — the `erlang:memory/0,1` build gate.
+    #[inline]
+    pub(super) const fn memory_hook(&self) -> bool {
+        self.0 & Self::MEMORY_HOOK != 0
     }
 
     /// The predicates for `(module, function, arity)`, evaluated once.
+    ///
+    /// The roster array and its **exhaustive destructure** are the compile-time guard: adding or
+    /// removing a predicate changes the array's length, which fails to compile here instead of
+    /// silently leaving a new arm with no bit.
     pub(super) fn of(module: &str, function: &str, arity: u32) -> DispatchHooks {
         let roster = [
             RuntimeContext::uses_dict(module, function, arity),
@@ -177,25 +294,34 @@ impl DispatchHooks {
         ];
         let [dict, process_hook, nif_loader, record_source, export_gate, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook] =
             roster;
-        DispatchHooks {
-            dict,
-            process_hook,
-            nif_loader,
-            record_source,
-            export_gate,
-            send_hook,
-            module_info,
-            persistent_term,
-            runtime_hooks,
-            fun_identity,
-            memory_hook,
-        }
+        DispatchHooks(
+            Self::bit(Self::DICT, dict)
+                | Self::bit(Self::PROCESS_HOOK, process_hook)
+                | Self::bit(Self::NIF_LOADER, nif_loader)
+                | Self::bit(Self::RECORD_SOURCE, record_source)
+                | Self::bit(Self::EXPORT_GATE, export_gate)
+                | Self::bit(Self::SEND_HOOK, send_hook)
+                | Self::bit(Self::MODULE_INFO, module_info)
+                | Self::bit(Self::PERSISTENT_TERM, persistent_term)
+                | Self::bit(Self::RUNTIME_HOOKS, runtime_hooks)
+                | Self::bit(Self::FUN_IDENTITY, fun_identity)
+                | Self::bit(Self::MEMORY_HOOK, memory_hook),
+        )
     }
 }
+
+/// The roster's bits are pairwise distinct and together fill the low `ALL.len()` bits, so
+/// [`DispatchHooks::ANY_MASK`] covers every arm and a future bit cannot alias an existing one.
+const _: () = assert!(DispatchHooks::ANY_MASK == (1 << DispatchHooks::ALL.len() as u16) - 1);
 
 /// The cachable part of a dispatch answer for one `(module, function, arity)` key.
 ///
 /// The key itself is not part of it — the caller already holds it.
+///
+/// **Layout is load-bearing.** `Option<BifFn>` is one eight-byte word (a `fn` pointer's null
+/// niche) and [`DispatchHooks`] is a `u16`, so the whole answer is 16 bytes and crosses both
+/// call boundaries — `dispatch` → `call_bif_routed` → `call_registered` — in **two registers**
+/// rather than through a hidden `sret` pointer. See [`DispatchHooks`].
 #[derive(Clone, Copy)]
 pub(super) struct DispatchAnswer {
     /// The `beam_bifs` implementation registered for the key, if any. `Some` is exactly

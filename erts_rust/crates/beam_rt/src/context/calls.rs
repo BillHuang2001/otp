@@ -364,7 +364,8 @@ impl<'a> RuntimeContext<'a> {
         //   `install_tables`, so an unexpected outer borrow degrades to "no ETS", never a panic;
         // * a **lent** registry cannot reach this path at all (the test above), so the shared cell
         //   is never consulted while one is lent, and the lent-precedence rule is untouched;
-        // * a **dict** hook cannot be set here either (`hooks.dict` is one of the eleven bits), so
+        // * a **dict** hook cannot be set here either (`DispatchHooks::dict()` is one of the eleven
+        //   bits), so
         //   the dict-substitutes-for-tables rule has nothing to substitute;
         // * the alias witness, the atom interner, the port provider, the local-node identity and
         //   the fun-caller bridge are installed exactly as the `else` arm installs them, and the
@@ -451,16 +452,23 @@ impl<'a> RuntimeContext<'a> {
         // it. The full path builds its `RuntimePorts` **inside** its invoke block, so it already
         // reaches the tail with one owner.
         drop(ports);
-        self.finish_registered_call(
+        let outcome = self.finish_registered_call(
             result,
-            heap,
+            &mut heap,
             mark,
             !reentrant,
             &alias,
             atoms,
             None,
             pending,
-        )
+        );
+        // The frontier goes back to the pool **here**, not in the tail, so the tail borrows it
+        // instead of owning it: one borrow at the call boundary instead of a by-value
+        // `beam_alloc::Heap` (an `AllocRef` plus four words) copied into the tail's frame and out
+        // again into the pool. The order is the tail's own — the intern commit and the rewind
+        // have both already run — so nothing observes the move.
+        self.runtime.put_bif_heap(heap);
+        outcome
     }
 
     /// [`Self::call_registered`]'s **full** path: the ten bridge arms, first match wins.
@@ -497,37 +505,37 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
-        let uses_dict = hooks.dict;
+        let uses_dict = hooks.dict();
         // Whether this is one of the eleven process/name/global-state BIFs, which need the
         // process-table/port-registry bridge (a `&mut ProcessTable` borrow, like the dict
         // arm — see [`ProcessBridge`]).
-        let uses_process_hook = hooks.process_hook;
+        let uses_process_hook = hooks.process_hook();
         // Whether this is `erlang:load_nif/2`, which needs the NIF-loading bridge (also a
         // `&mut Runtime` borrow, and therefore a third mutually exclusive arm).
-        let uses_nif_loader = hooks.nif_loader;
+        let uses_nif_loader = hooks.nif_loader();
         // Whether this is `records:get_definition/2`, which needs the record-source bridge
         // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
-        let uses_record_source = hooks.record_source;
+        let uses_record_source = hooks.record_source();
         // Whether this is `erlang:binary_to_term/2`, whose `[safe]` decode consults the
         // active-export gate — a `&CodeServer` **plus** `&BifRegistry` borrow, and therefore its
         // own mutually exclusive arm next to the record-source one (see [`ExportGateBridge`]).
-        let uses_export_gate = hooks.export_gate;
+        let uses_export_gate = hooks.export_gate();
         // Whether this is `erlang:send/2`/`erlang:'!'/2`, which need the message-delivery
         // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
         // the two cannot co-exist — see [`SendBridge`]).
-        let uses_send_hook = hooks.send_hook;
+        let uses_send_hook = hooks.send_hook();
         // Whether this is `erlang:get_module_info/1,2`, which needs the module-info bridge
         // (a `&CodeServer` borrow, and therefore its own mutually exclusive arm).
-        let uses_module_info = hooks.module_info;
+        let uses_module_info = hooks.module_info();
         // Whether this is one of the seven `persistent_term:*` BIFs, which need the
         // node-global store bridge (a cheap `Rc` clone: no runtime borrow at all).
-        let uses_persistent_term = hooks.persistent_term;
+        let uses_persistent_term = hooks.persistent_term();
         // Whether this is one of the runtime-coupled BIF families (the timers, the loaded
         // export check, the link set) that only the running runtime can answer, and which
         // need the timer heap / reference space / process table (`&mut Runtime` plus a
         // `&mut ProcessTable`, like the dict arm — and therefore its own mutually exclusive
         // arm; see [`RuntimeHooksBridge`]).
-        let uses_runtime_hooks = hooks.runtime_hooks;
+        let uses_runtime_hooks = hooks.runtime_hooks();
         // The local-node identity: **this runtime's own node** — the configured
         // `node@host` atom when `-name`/`-sname` made it a distributed node, else the fixed
         // `nonode@nohost` ([`Runtime::local_node`] is the single source of truth for both),
@@ -562,7 +570,7 @@ impl<'a> RuntimeContext<'a> {
         // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
         // `FunT`, so they keep the codec's typed `unsupported_local_fun` (see
         // [`FunIdentityBridge`]).
-        let mut fun_identity = if hooks.fun_identity {
+        let mut fun_identity = if hooks.fun_identity() {
             Some(FunIdentityBridge::new(
                 &self.runtime.code_server,
                 self.current_module.as_deref(),
@@ -580,7 +588,7 @@ impl<'a> RuntimeContext<'a> {
         // loaded module's `.beam` (one `stat` syscall per module, ~23 after boot), so building
         // it on *every* registered BIF call would add ~10 us to each arithmetic operation. No
         // other BIF consults the [`MemoryHook`] seam.
-        let mut memory = if hooks.memory_hook {
+        let mut memory = if hooks.memory_hook() {
             Some(RuntimeMemory::new(
                 Rc::clone(&atoms),
                 self.mailbox_table
@@ -639,12 +647,12 @@ impl<'a> RuntimeContext<'a> {
         // `record_source`, `module_info` and the `fun_identity`/`memory_hook` build gates — are
         // pure reads of loader/runtime state, and the output sink is pure output, so none of them
         // retains a heap word.
-        let safe_to_rewind = !hooks.dict
-            && !hooks.process_hook
-            && !hooks.nif_loader
-            && !hooks.send_hook
-            && !hooks.persistent_term
-            && !hooks.runtime_hooks
+        let safe_to_rewind = !hooks.dict()
+            && !hooks.process_hook()
+            && !hooks.nif_loader()
+            && !hooks.send_hook()
+            && !hooks.persistent_term()
+            && !hooks.runtime_hooks()
             && !reentrant;
         // The `ets` **table-alias witness** (`BifContext::with_table_aliasing`), installed on every
         // arm below. With it the `ets` copy-out helpers (`beam_bifs::ets::copy_out`/`copy_out_list`)
@@ -1073,7 +1081,20 @@ impl<'a> RuntimeContext<'a> {
                 invoke_registered(bif, arity, &mut context, args)
             }
         };
-        self.finish_registered_call(result, heap, mark, safe_to_rewind, &alias, atoms, memory, pending)
+        let outcome = self.finish_registered_call(
+            result,
+            &mut heap,
+            mark,
+            safe_to_rewind,
+            &alias,
+            atoms,
+            memory,
+            pending,
+        );
+        // The frontier returns to the pool here, the tail having only **borrowed** it (`drop(atoms)`
+        // above already released the other owners the atom commit needed). See the hot path's note.
+        self.runtime.put_bif_heap(heap);
+        outcome
     }
 
     /// The tail **both** registered paths run, once the BIF has returned and every borrow it needed
@@ -1090,7 +1111,7 @@ impl<'a> RuntimeContext<'a> {
     fn finish_registered_call(
         &mut self,
         mut result: Result<Eterm>,
-        mut heap: Heap,
+        heap: &mut Heap,
         mark: usize,
         safe_to_rewind: bool,
         alias: &std::cell::Cell<bool>,
@@ -1179,9 +1200,6 @@ impl<'a> RuntimeContext<'a> {
         // `system_limit` the tail's own `enforce_term_heap_limit` maps an allocation refusal to. The
         // pool is left un-rewound, the same residual a failed move already has.
         let aliased = alias.get();
-        if result.as_ref().is_ok_and(|term| Self::result_is_foreign_container(*term)) {
-            perf_counters::bump(|c| &mut c.foreign_result);
-        }
         // The witness's own tally: a test that asserts "no copy ran for this immediate" is only
         // meaningful once the cell is known to have been **set** by the `ets` helper (a witness
         // that was never installed would skip the copy for the trivial reason that `aliased` is
@@ -1191,69 +1209,77 @@ impl<'a> RuntimeContext<'a> {
         let move_container = self.mailbox_table.is_some() || safe_to_rewind;
         let mut rewind = false;
         if let Ok(term) = result {
+            // **One** shape test for both of the tail's consumers — the `foreign_result` tally and
+            // the copy-out decision below. The two used to be separate evaluations of the same
+            // predicate (an `is_ok_and` for the counter, then the `if`), i.e. one extra tag/literal
+            // test on every registered call; folding them changes no decision, because the counter
+            // was only ever bumped on the `Ok`-and-container arm this `if` opens.
             if !Self::result_is_foreign_container(term) {
                 // Nothing reachable lives on this heap — and an **aliased** result that is an
                 // immediate (a small int, an atom, `'$end_of_table'`) names no table word either,
                 // even though the helper set the cell for it — so no byte of either region was
                 // handed out: rewinding disturbs nothing.
                 rewind = safe_to_rewind;
-            } else if aliased {
-                // The one copy, onto the region that outlives the call, unconditionally and before
-                // the rewind (see the block comment above).
-                #[cfg(test)]
-                notes::note_alias_copy();
-                #[cfg(test)]
-                notes::note_alias_copy_pool(mark, heap.used());
-                match self.rehome_container_result(term) {
-                    Some(copied) => {
+            } else {
+                perf_counters::bump(|c| &mut c.foreign_result);
+                if aliased {
+                    // The one copy, onto the region that outlives the call, unconditionally and
+                    // before the rewind (see the block comment above).
+                    #[cfg(test)]
+                    notes::note_alias_copy();
+                    #[cfg(test)]
+                    notes::note_alias_copy_pool(mark, heap.used());
+                    match self.rehome_container_result(term) {
+                        Some(copied) => {
+                            perf_counters::bump(|c| &mut c.rehomed);
+                            result = Ok(copied);
+                            rewind = safe_to_rewind;
+                        }
+                        None => {
+                            // Never the un-copied term: it points into the table's `TermStore`.
+                            #[cfg(test)]
+                            notes::note_alias_refusal();
+                            result = Err(BeamError::SystemLimit);
+                        }
+                    }
+                } else if move_container && Self::graph_holds_reference(term) {
+                    perf_counters::bump(|c| &mut c.ref_held);
+                    // A reference's identity **is** its address (see the comment above): the copy
+                    // would be a different term, so the result stays where it is and the pool is
+                    // not rewound.
+                    //
+                    // # Why the walk is gated on `move_container` — it is unobservable otherwise
+                    //
+                    // The walk's answer has exactly two consumers: this arm, which only sets
+                    // `rewind = false`, and the `move_container` arm below, which copies the result
+                    // **and then** sets `rewind = safe_to_rewind`. When `move_container == false` —
+                    // that is, `mailbox_table.is_none() && !safe_to_rewind` — the copy arm cannot run
+                    // either (it is gated on the same `move_container`), and `rewind` is already
+                    // `false`: `move_container == false` implies `!safe_to_rewind`, and `rewind` is
+                    // only ever assigned `safe_to_rewind`. So both possible answers of the walk
+                    // produce the **same** `result` and the same `rewind` — the walk is unobservable
+                    // in that state, and skipping it changes nothing but its own diagnostic counters.
+                    // (`result` is never modified by the walk, so no term moves either way.)
+                    //
+                    // Where this bites hardest is the table-less route's **reentrant** call — a
+                    // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
+                    // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries and
+                    // the in-process `compile:file/2` route of contract A.9): `!reentrant` is one
+                    // conjunct of `safe_to_rewind`, so such a call has `move_container == false` and
+                    // never walks its result. That is exactly the **accumulator** shape — a container
+                    // the applied fun returned, i.e. a whole intermediate compiler AST — so the
+                    // per-call walk of the entire accumulator disappears where it was quadratic
+                    // (measured on `lib/stdlib/src/string.erl`: `lists:foldl/3` + `lists:map/2` + a
+                    // share of `lists:foldr/3` were 236.5 M + 76.1 M of 408.5 M walk visits).
+                    rewind = false;
+                } else if move_container {
+                    // The copy first and, only once it succeeded, the rewind: a refused copy leaves
+                    // both the result and the pool exactly as they were.
+                    if let Some(copied) = self.rehome_container_result(term) {
                         perf_counters::bump(|c| &mut c.rehomed);
                         result = Ok(copied);
                         rewind = safe_to_rewind;
                     }
-                    None => {
-                        // Never the un-copied term: it points into the table's `TermStore`.
-                        #[cfg(test)]
-                        notes::note_alias_refusal();
-                        result = Err(BeamError::SystemLimit);
-                    }
-                }
-            } else if move_container && Self::graph_holds_reference(term) {
-                perf_counters::bump(|c| &mut c.ref_held);
-                // A reference's identity **is** its address (see the comment above): the copy
-                // would be a different term, so the result stays where it is and the pool is
-                // not rewound.
-                //
-                // # Why the walk is gated on `move_container` — it is unobservable otherwise
-                //
-                // The walk's answer has exactly two consumers: this arm, which only sets
-                // `rewind = false`, and the `move_container` arm below, which copies the result
-                // **and then** sets `rewind = safe_to_rewind`. When `move_container == false` —
-                // that is, `mailbox_table.is_none() && !safe_to_rewind` — the copy arm cannot run
-                // either (it is gated on the same `move_container`), and `rewind` is already
-                // `false`: `move_container == false` implies `!safe_to_rewind`, and `rewind` is
-                // only ever assigned `safe_to_rewind`. So both possible answers of the walk
-                // produce the **same** `result` and the same `rewind` — the walk is unobservable
-                // in that state, and skipping it changes nothing but its own diagnostic counters.
-                // (`result` is never modified by the walk, so no term moves either way.)
-                //
-                // Where this bites hardest is the table-less route's **reentrant** call — a
-                // fun-applying BIF (`lists:foldl/3`, `lists:map/2`, `maps:map/2`, …) on
-                // `RuntimeContext::new` (`-eval`/`-s`/`-run`, the single-pass `run_*` entries and
-                // the in-process `compile:file/2` route of contract A.9): `!reentrant` is one
-                // conjunct of `safe_to_rewind`, so such a call has `move_container == false` and
-                // never walks its result. That is exactly the **accumulator** shape — a container
-                // the applied fun returned, i.e. a whole intermediate compiler AST — so the
-                // per-call walk of the entire accumulator disappears where it was quadratic
-                // (measured on `lib/stdlib/src/string.erl`: `lists:foldl/3` + `lists:map/2` + a
-                // share of `lists:foldr/3` were 236.5 M + 76.1 M of 408.5 M walk visits).
-                rewind = false;
-            } else if move_container {
-                // The copy first and, only once it succeeded, the rewind: a refused copy leaves
-                // both the result and the pool exactly as they were.
-                if let Some(copied) = self.rehome_container_result(term) {
-                    perf_counters::bump(|c| &mut c.rehomed);
-                    result = Ok(copied);
-                    rewind = safe_to_rewind;
                 }
             }
         }
@@ -1284,13 +1310,18 @@ impl<'a> RuntimeContext<'a> {
             perf_counters::bump(|c| &mut c.intern_commit);
             self.runtime.code_server.intern_pending(&pending);
         }
-        // Rewind to this call's mark and give the heap back to the pool. Every word this call
-        // handed out of the pooled heap is now either unreachable (the BIF's intermediate terms)
-        // or has a copy on a region that outlives the call — the process's scanned young heap, or
-        // the runtime's `-eval` store ([`Self::rehome_container_result`]) — so the bump pointer
-        // can safely return to `mark`: the words below it belong to another caller and stay owned.
-        // The pooled heap then serves the next call from `mark` instead of marching toward the
-        // pool's capacity.
+        // Rewind to this call's mark; the caller then gives the heap back to the pool. Every word
+        // this call handed out of the pooled heap is now either unreachable (the BIF's intermediate
+        // terms) or has a copy on a region that outlives the call — the process's scanned young
+        // heap, or the runtime's `-eval` store ([`Self::rehome_container_result`]) — so the bump
+        // pointer can safely return to `mark`: the words below it belong to another caller and stay
+        // owned. The pooled heap then serves the next call from `mark` instead of marching toward
+        // the pool's capacity.
+        //
+        // The frontier arrives **borrowed** (`&mut Heap`) rather than owned: an owned
+        // `beam_alloc::Heap` (an `AllocRef` plus four words) would be copied into this frame by
+        // value at the call boundary and out again into the pool on every registered call, where a
+        // borrow makes both transfer points a single register.
         //
         // `reset_to` is fallible, but the error arm is unreachable: `mark` was read from **this**
         // heap at the top of this call, the heap is a local held for the call's whole body, and
@@ -1303,10 +1334,8 @@ impl<'a> RuntimeContext<'a> {
         // a recycled live word and never a silently mis-sized pool.
         if rewind {
             perf_counters::bump(|c| &mut c.rewound);
+            heap.reset_to(mark)?;
         }
-        let rewound = if rewind { heap.reset_to(mark) } else { Ok(()) };
-        self.runtime.put_bif_heap(heap);
-        rewound?;
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`). The mapping
         // runs on the **failing** arm only, out of line: spelled as `result.map_err(..)` it
