@@ -244,13 +244,6 @@ is not a clean tier comparison even where reachable.
   store is a `thread_local!`; a run on another thread recompiles (correct, slower), and nothing evicts
   (the tier is default-OFF and `beam_rt` never selects it, so the retained set is bounded in practice;
   `clear` exists for the tests).
-- **A synthetic module is cached under its content fingerprint.** The store keys on
-  `crate::jit::cache::CacheKey` — the ONE identity scheme both native tiers use — so a `Module` with no
-  load-time digest (an all-zero `checksum()`, the `Module::default()` sentinel) is identified by the
-  fingerprint over its decoded IR: two runs of one synthetic module compile once, and an edited module is
-  a different entry. A fingerprint collision would be a wrong answer, which is why the key mixes the
-  module content with the atom-table snapshot, exactly as the baseline cache does.
-
 ## Routing Table
 - `mod.rs` → the backend (`CraneliftJit`, incl. the `run_export` override), `CompiledFunctions` (the artifact: native entries, `is_enterable`, `labels`), `CompiledEntries`' `NativeCode` impl, `run_outcome`/`run_label_outcome`/`run_resume_outcome`, `run_cranelift*`.
 - `cache.rs` → the thread-local retained-artifact store: `handle(module) -> Result<Rc<CompiledFunctions>>` keyed on `crate::jit::cache::CacheKey` (the shared `ModuleKey` — load-time MD5, else a content fingerprint — plus the `AtomSnapshot`), and the test-gated `len`/`compile_count`/`clear`.
