@@ -139,7 +139,7 @@ fn binary_printable(term: Eterm) -> bool {
 ///
 /// # Errors
 ///
-/// As [`crate::print::term_chunk`].
+/// As [`crate::print::render_chunk`].
 pub(crate) fn pretty_chunk(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -213,7 +213,7 @@ pub(crate) fn pretty_chunk_order(
 ///
 /// # Errors
 ///
-/// As [`crate::print::term_chunk`], plus the typed gaps [`intermediate`] may report.
+/// As [`crate::print::render_chunk`], plus the typed gaps [`intermediate`] may report.
 pub(crate) fn pretty_write_limited(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -243,7 +243,7 @@ pub(crate) fn pretty_write_limited(
 ///
 /// # Errors
 ///
-/// As [`crate::print::term_chunk`], plus the typed gaps [`intermediate`] may report.
+/// As [`crate::print::render_chunk`], plus the typed gaps [`intermediate`] may report.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pretty_chunk_limited(
     ctx: &mut BifContext<'_>,
@@ -561,7 +561,7 @@ const PREFIX_RESERVE: usize = 32;
 ///
 /// # Errors
 ///
-/// As [`crate::print::term_chunk`]: a term outside the Milestone-1 printable set.
+/// As [`crate::print::render_chunk`]: a term outside the Milestone-1 printable set.
 fn build(
     ctx: &mut BifContext<'_>,
     term: Eterm,

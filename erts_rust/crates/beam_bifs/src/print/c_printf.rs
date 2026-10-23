@@ -59,7 +59,7 @@
 //! # Documented deviation: a byte >= `16#80` in a printable list
 //!
 //! The sink is a Rust `String`, so a printable list's or binary's raw latin-1 byte is
-//! written as UTF-8, exactly as [`super::term_chunk`]'s `~p` leaf does (see
+//! written as UTF-8, exactly as [`super::render_chunk`]'s `~p` leaf does (see
 //! `crate::term_conv::display_1`'s note). Every byte `<= 16#7F` — the whole ASCII
 //! surface — is byte-identical to the oracle.
 
@@ -161,12 +161,13 @@ pub(crate) fn term_text(
                     let next = if access::is_list(tail) {
                         Item::OneCons(tail)
                     } else {
-                        // `WSTACK_PUSH3(tl, PRT_TERM, PRT_BAR)`.
-                        push_seq(&mut stack, &[Item::Term(tail), Item::Bar]);
+                        // `WSTACK_PUSH3(tl, PRT_TERM, PRT_BAR)` — the bar pops
+                        // before the tail term.
+                        push_seq(&mut stack, &[Item::Bar, Item::Term(tail)]);
                         pending = Some(head);
                         continue 'walk;
                     };
-                    push_seq(&mut stack, &[next, Item::Comma]);
+                    push_seq(&mut stack, &[Item::Comma, next]);
                 }
                 pending = Some(head);
             }
@@ -265,7 +266,6 @@ fn render(
         let pairs = access::map_pairs_storage_order(obj)?;
         out.push_str("#{");
         let mut seq: Vec<Item> = Vec::with_capacity(pairs.len() * 5 + 1);
-        seq.push(Item::CloseTuple);
         for (i, (key, value)) in pairs.iter().enumerate() {
             if i > 0 {
                 seq.push(Item::Comma);
@@ -274,8 +274,8 @@ fn render(
             seq.push(Item::Assoc);
             seq.push(Item::Term(*value));
         }
-        // The C pushes the pairs from the highest index down, so they pop in
-        // ascending order; `push_seq` reproduces that pop order directly.
+        // The closer was pushed first by the C, so it pops last.
+        seq.push(Item::CloseTuple);
         push_seq(stack, &seq);
         return Ok(true);
     }
@@ -354,7 +354,6 @@ fn record(
     }
     out.push('{');
     let mut seq: Vec<Item> = Vec::with_capacity(keys.len() * 5 + 1);
-    seq.push(Item::CloseTuple);
     for (i, (&key, &value)) in keys.iter().zip(values.iter()).enumerate() {
         if i > 0 {
             seq.push(Item::Comma);
@@ -363,6 +362,8 @@ fn record(
         seq.push(Item::Equals);
         seq.push(Item::Term(value));
     }
+    // `WSTACK_PUSH(PRT_CLOSE_TUPLE)` runs before the pairs, so the closer pops last.
+    seq.push(Item::CloseTuple);
     push_seq(stack, &seq);
     Ok(true)
 }
@@ -540,8 +541,8 @@ mod tests {
     /// The atoms the cases below need, seeded so their indices are stable.
     fn atoms() -> AtomTable {
         let mut names: Vec<String> = [
-            "false", "true", "a", "b", "c", "hello", "k", "v", "x", "and", "a b", "A",
-            "a@b", "recmod", "r", "m", "empty",
+            "false", "true", "is_exported", "a", "b", "c", "hello", "k", "v", "x",
+            "and", "a b", "A", "a@b", "recmod", "r", "m", "empty",
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -649,7 +650,7 @@ mod tests {
             assert_eq!(limited(ctx, string, 7), "\"hello\"");
 
             let one_char = string_term(ctx, "a");
-            assert_eq!(limited(ctx, one_char, 2), "\"a... ");
+            assert_eq!(limited(ctx, one_char, 2), "\"a\"... ");
             assert_eq!(limited(ctx, one_char, 3), "\"a\"");
 
             let one = ctx.int(1).expect("fits");

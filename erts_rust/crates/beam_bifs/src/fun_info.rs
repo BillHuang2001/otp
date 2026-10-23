@@ -192,7 +192,7 @@
 //! `fun_to_list_1` splices (`bif.c:4494-4504`), so the two routes must never drift.
 //! The text's one home is [`fun_text_str`], reached through the single
 //! [`BifContext`]-taking adapter [`fun_text`] by both. Because every printer entry
-//! point (`crate::print::term_chunk`/`term_chunk_order`/`format_term` and the
+//! point (`crate::print`'s `render_chunk`/`term_chunk_order`/`format_term` and the
 //! `pretty_*` family) already takes a `&mut BifContext`, the printer's recursive
 //! cluster threads it down to the leaf, so the `FunKind::Local` arm can ask the
 //! [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam for the

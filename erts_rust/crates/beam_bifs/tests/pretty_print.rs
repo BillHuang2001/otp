@@ -492,7 +492,7 @@ fn depth_limited_renderings_reflow_like_the_oracle() {
 
     // NOTE: `~W` (the depth-limited `~w`) does **not** go through
     // `crate::print::pretty_chunk` — `io.rs` renders it with the flat
-    // `term_chunk` — so its depth-limited binary truncation is pinned by
+    // `render_chunk` — so its depth-limited binary truncation is pinned by
     // `tests/io_lib.rs`, not here.
     // `~P <<"abcdef">> D` — the printable binary leaf truncates by element count.
     let binstr = |ctx: &mut BifContext<'_>, reg: &BifRegistry| binary(ctx, reg, b"abcdef");
