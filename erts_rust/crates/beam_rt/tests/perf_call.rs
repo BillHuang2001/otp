@@ -198,6 +198,54 @@ fn the_harness_prints_every_row_and_block_it_documents() {
         stdout.contains("marginal_ns"),
         "the harness must print the load-invariant marginal column"
     );
+    // Every documented row must be printed **under the block it belongs to**, not merely
+    // somewhere in the output. Without this, a block that silently produced no rows still passes
+    // the label check above as long as the other block printed the same label — and the two
+    // blocks measure *different* paths (A = a table-less context, B = a scheduled process's
+    // heap), so a missing block is a lost measurement, not a cosmetic change.
+    for (title, label) in BLOCK_ROWS {
+        let section = block_section(&stdout, title);
+        assert!(
+            section.contains(label),
+            "the block `{title}` no longer prints the row `{label}` — that path is no longer \
+             measured; the block reads:\n{section}"
+        );
+        assert!(
+            section.contains("ns/call"),
+            "the block `{title}` printed no measurement table; it reads:\n{section}"
+        );
+    }
+}
+
+/// The rows each block must print **in its own table**.
+///
+/// `blocks A2`/`B2` are the ETS rows under each path. They are the pairs that pinned a real
+/// defect: the table is created by the runtime's root process (the set-up block runs over
+/// `RuntimeContext::new`), so a `protected` table made block B2's `ets:insert/2` raise `badarg`
+/// — a write from a process that is not the owner, which is exactly what the oracle does too.
+/// The harness therefore creates it `public`; this asserts both blocks still *measure* it.
+const BLOCK_ROWS: &[(&str, &str)] = &[
+    ("block A2: the same context, the ETS rows", "ets:insert/2"),
+    ("block A2: the same context, the ETS rows", "ets:lookup/2"),
+    ("block B2: the same context, the ETS rows", "ets:insert/2"),
+    ("block B2: the same context, the ETS rows", "ets:lookup/2"),
+];
+
+/// The slice of `stdout` belonging to `title`: from that block's banner up to the next banner
+/// (or the run's closing `loadavg (end):` line).
+fn block_section<'a>(stdout: &'a str, title: &str) -> &'a str {
+    let start = stdout
+        .find(title)
+        .unwrap_or_else(|| panic!("the harness no longer prints the block `{title}`"));
+    let rest = &stdout[start..];
+    let end = BLOCK_TITLES
+        .iter()
+        .copied()
+        .chain(std::iter::once("loadavg (end):"))
+        .filter_map(|other| rest[title.len()..].find(other).map(|at| at + title.len()))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
