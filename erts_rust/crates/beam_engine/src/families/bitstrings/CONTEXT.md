@@ -442,9 +442,15 @@ reservation. A write past the capacity asks the payload to widen (`raw::InPlace:
 outcome commits capacity inside the existing reservation, so the sink's cached capacity moves and it
 keeps writing at the same base (the
 registry entry's capacity is refreshed); a `Moved(rel)` outcome reallocates at `rel.to()`,
-`raw::republish_over` rewrites the accumulator's own `[BinRef][ErlSubBits]` pair over the new base
-(the same `Eterm`, the same `start`/`end` window) and the registry is re-keyed
-(`Machine::rekey_writable`). The door is consulted **only on a shortfall** (it scans the machine's
+`raw::republish_over` re-points the accumulator's pair at the new base and the registry is re-keyed
+(`Machine::rekey_writable`). The republish writes **exactly two words** — the `BinRef`'s `val` word
+and the `ErlSubBits`'s `base_flags` pointer word — and preserves every other word (`BinRef.next`,
+the `start`/`end` window, the `orig` back-pointer) and the flag bits packed into `base_flags`, so
+the same `Eterm` names the new payload. It works on two **independent** blocks and never assumes
+they are adjacent: `beam_gc` copies an `ErlSubBits` as its own `ERL_SUB_BITS_SIZE` words and
+forwards its `orig` word as that block's child (`beam_gc/src/copy.rs`'s `move_size`), so a
+collection between two appends leaves the 3-word `BinRef` as a separate allocation the collector
+may place anywhere in the to-space. The door is consulted **only on a shortfall** (it scans the machine's
 payload roster), and `Machine::retain_refc_binaries` is deliberately not on the append path.
 
 Promotion, not failure, covers what growth cannot do. A payload `beam_alloc` will not relocate (a
