@@ -64,26 +64,35 @@
 //!   [`ErlNifTimeUnit`] is a four-variant `#[repr(C)]` enum, so an out-of-range code is not a
 //!   representable Rust value and the path is unreachable by construction; every call returns a
 //!   *real* time. (As elsewhere in this crate, a malformed input is refused rather than trusted.)
-//! * **`enif_consume_timeslice`.** This seam has no scheduler/process accounting, so the C's
-//!   "timeslice consumed" answer cannot be computed. The call delegates to
-//!   [`NifHost::consume_timeslice`](crate::nif::host::NifHost::consume_timeslice) and, with no host
-//!   support, returns the C's **"not reached"** answer `0` — i.e. "the process need not yield".
-//!   It never fabricates a `1` (which would force a yield that never happened).
+//! * **`enif_consume_timeslice`.** The C charges `((CONTEXT_REDS+99)/100) * percent` reductions to
+//!   the calling process and answers `1` only once that process's slice is exhausted (`0` outright on
+//!   a dirty scheduler). The clamp to `[1, 100]` is applied here and the verdict is delegated to
+//!   [`NifHost::consume_timeslice`](crate::nif::host::NifHost::consume_timeslice), which **no host in
+//!   the workspace installs** — so a NIF receives the C's `0` ("the process need not yield"), never a
+//!   fabricated `1` (which would force a yield that never happened). The accounting the C reads
+//!   *does* exist in this workspace: `beam_rt`'s runner keeps the per-slice reduction budget
+//!   (`BudgetProbe` over `beam_common::CONTEXT_REDS` units), charges it at its
+//!   instruction/heap-admission/BIF seams and turns exhaustion into a pre-emption. `beam_rt`'s
+//!   `NifHostImpl` leaves this hook at its default on purpose — the slice's budget already prices that
+//!   quantum, so a charge from inside a NIF would account it twice. The residual gap is that a NIF
+//!   cannot shorten its own slice: scheduling fairness, never a wrong value.
 //! * **`enif_system_info` values.** The runtime-dependent fields prefer the host's
 //!   [`NifHost::system_info`](crate::nif::host::NifHost::system_info) block — reached through the
 //!   current-call host stack, because the C entry point takes no env — and fall back to the
-//!   built-ins when no host hook answers. With no host, `scheduler_threads` is reported as `1` (the
-//!   runtime is single-threaded) and `async_threads` as `0`, exactly as the sibling
-//!   `driver_system_info` in this crate reports them — the C implements `enif_system_info` *as*
-//!   `driver_system_info`, so the two must agree. The built-in `otp_release` is the frozen workspace
-//!   claim (`"30"`), which differs from the installed oracle's `"29"`; `erts_version` (`"17.1"`)
-//!   matches the oracle. `beam_rt`'s `NifHostImpl` must supply the emulator's real values for the
-//!   oracle to be matched.
-//! * **`enif_make_unique_integer`** honours both SDK flag bits over a crate-internal monotonic
-//!   counter when the host supplies no `unique_integer` hook. The counter's *base* is reproduced
-//!   from the oracle's observed first values; the values are real, distinct, and monotone per flag
-//!   set exactly as the C's are, but they are not the oracle's exact sequence (that counter is
-//!   emulator state).
+//!   built-ins when no host hook answers. With no host, `scheduler_threads` is reported as `1` and
+//!   `async_threads` as `0`, the same built-in pair the sibling `driver_system_info` in this crate
+//!   reports — the C implements `enif_system_info` *as* `driver_system_info`, so the two must agree.
+//!   The built-in `otp_release` is the frozen workspace claim (`"30"`), which differs from the
+//!   installed oracle's `"29"`; `erts_version` (`"17.1"`) matches the oracle. `beam_rt`'s
+//!   `NifHostImpl` answers the hook with the runtime's own state (`scheduler_threads` is its real
+//!   `+S`/parallelism count, the version strings are the same frozen pair), except
+//!   `dirty_scheduler_support`, which stays `0` because this runtime has no dirty schedulers where
+//!   the C hard-codes `1`.
+//! * **`enif_make_unique_integer`** honours both SDK flag bits over one crate-internal monotonic
+//!   counter per flag combination when the host supplies no `unique_integer` hook. Each counter's
+//!   *base* is reproduced from the oracle's observed first values; the values are real, distinct, and
+//!   monotone per flag set exactly as the C's are, but they are not the oracle's exact sequence (that
+//!   counter is emulator state).
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -540,10 +549,11 @@ pub unsafe extern "C" fn enif_make_unique_integer(
 
 /// `int enif_consume_timeslice(ErlNifEnv *env, int percent);` — charge `percent` of a timeslice.
 ///
-/// The C clamps `percent` into `[1, 100]` and answers whether the process must yield. With no
-/// process/timeslice accounting in this seam the answer comes from
-/// [`NifHost::consume_timeslice`](crate::nif::host::NifHost::consume_timeslice) and, absent host
-/// support, is the C's **"not reached"** answer `0` (see the module docs).
+/// The C clamps `percent` into `[1, 100]` and answers whether the process must yield. This seam
+/// carries no process of its own, so the verdict comes from
+/// [`NifHost::consume_timeslice`](crate::nif::host::NifHost::consume_timeslice) — a hook no host in
+/// the workspace installs — and is therefore the C's `0` ("need not yield"); see the module docs for
+/// the per-slice reduction accounting that does exist and why `beam_rt` declines to charge it twice.
 ///
 /// # Safety
 ///
@@ -992,7 +1002,7 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { enif_consume_timeslice(env.as_ptr(), 999) }, 1);
         assert_eq!(host.slices, vec![50, 1, 100], "percent is clamped to [1,100]");
-        // A null env answers the C's "not reached" without touching a host.
+        // A null env answers the C's "need not yield" `0` without touching a host.
         // SAFETY: a null env is explicitly allowed.
         assert_eq!(unsafe { enif_consume_timeslice(core::ptr::null_mut(), 50) }, 0);
     }
