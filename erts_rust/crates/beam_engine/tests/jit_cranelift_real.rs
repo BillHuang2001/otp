@@ -59,78 +59,154 @@
 //!    asserted from a file that does not exist without the feature; it is pinned by
 //!    `src/jit/mod.rs`'s `cranelift_tier_is_a_typed_error_not_a_silent_fallback`
 //!    unit test, and by `cargo tree -p beam_engine` listing no `cranelift-*` crate.)
+//! 4. **The whole committed corpus, not a sample of it.** The two sweeps drive
+//!    **every** row of the same two corpora `tests/jit_real_module.rs` drives on the
+//!    interpreter + baseline pair -- all **504** breadth calls over **171** distinct
+//!    installed modules and all **232** error-path calls over **215** modules -- so
+//!    the three tiers are measured on exactly the same evidence, with no bounded
+//!    prefix and no per-module cap. See
+//!    [`breadth_corpus_agrees_between_the_interpreter_and_cranelift`] and
+//!    [`error_path_corpus_agrees_and_exercises_the_deopt_path`].
+//! 5. **Oracle fidelity per tier, not only tier agreement.** Every corpus row's baked
+//!    expectation is the system `erl`'s own answer, and *each* tier is checked
+//!    against it -- so a value both tiers compute identically but **wrongly** is now
+//!    a failure, and so is a raise whose reason the system `erl` never produces. The
+//!    corpus parsing, the argument/expectation builders, the `~w` renderer and the
+//!    error comparator are **not** re-implemented here: they are the one shared
+//!    implementation in `tests/support/oracle.rs`
+//!    (`parse_breadth_target`/`breadth_args`/`parse_expected_value`/
+//!    `Expected::matches`/`render_term`, `parse_error_targets`/`verify_error`).
 //!
 //! # Termination
 //!
 //! Nothing here runs an unbounded loop. The curated targets are fixed calls with
 //! representative small arguments whose values were taken verbatim from the system
-//! `erl`; the two sweeps take **bounded prefixes** of the committed, oracle-checked
-//! corpora (`tests/fixtures/stdlib_breadth_targets.txt` and
-//! `tests/fixtures/error_path_targets.txt`), keeping at most
-//! [`MAX_BREADTH_MODULES`]/[`MAX_ERROR_MODULES`] distinct modules with at most
-//! [`PER_MODULE`] targets each. Every corpus line was admitted only after a real
-//! `erl` run terminated on it (a value or an exception), which is the termination
-//! argument for the sweep.
+//! `erl`, and the two sweeps iterate the committed, oracle-checked corpora
+//! (`tests/fixtures/stdlib_breadth_targets.txt` and
+//! `tests/fixtures/error_path_targets.txt`) line for line. Every corpus line was
+//! admitted only after a real `erl` run **terminated** on it (a value or an
+//! exception), which is the termination argument for the sweep: the sweep is exactly
+//! as bounded as the corpus is.
 //!
 //! The module cache compiles each real module **once** and reuses the artifact (the
 //! tier's compile-once / run-many [`JitBackend::run_compiled`] entry), so the cost
-//! of Cranelift codegen is paid at most once per swept module.
+//! of Cranelift codegen is paid at most once per swept module -- 171 compiles for the
+//! whole 504-call breadth corpus.
+//!
+//! # What this suite measures today
+//!
+//! Measured on this tree with the feature on
+//! (`cargo test -p beam_engine --features jit-cranelift --test jit_cranelift_real --
+//! --nocapture`), the whole file in ~84 s (the tests are serialized -- see
+//! [`JIT_SERIAL`] and the note there on `cranelift-jit`'s per-allocation `mmap`):
+//!
+//! ```text
+//! BREADTH: selected 504 case(s); compared 504 over 171 module(s); oracle-checked
+//!          interpreter=504 cranelift=504; blocked=0 skipped=0 (504 agreed on a value)
+//! ERROR-PATHS: selected 232 case(s); compared 232 over 215 module(s), 207 bare-atom
+//!          `function_clause` agreement(s) (the deopted `func_info` path);
+//!          oracle-checked interpreter=223 cranelift=223; blocked=9 skipped=0
+//! ```
+//!
+//! So every one of the 736 corpus rows agrees between the two tiers, and **727**
+//! (504 + 223) are oracle-checked on *each* tier. The other **9** error-path rows are
+//! the fixture's own `unsupported` expectation -- a documented **host** gap
+//! (`receive_marker_reserve`/`receive_next`, or a blocking `receive`), not a tier
+//! divergence: both tiers answer the identical typed error, and the row is printed as
+//! a `BLOCKED:` line and counted. **No row disagrees with the oracle.** The per-corpus
+//! floors below are the guard.
 #![cfg(feature = "jit-cranelift")]
 
 mod support;
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use beam_common::{BeamError, ExceptionClass, Raise};
 use beam_engine::jit::cranelift::{CompiledFunctions, CraneliftJit, SmallArith};
 use beam_engine::jit::JitBackend;
 use beam_engine::{available_tiers, terms, ExecutionContext, Machine, Tier};
 use beam_loader::Module;
-use beam_term::{cmp, make_atom, make_small, AtomTable, Eterm, NIL};
+use beam_term::{cmp, make_atom, make_small, AtomTable, Eterm};
 use support::{
-    all_otp_ebins, assert_atom, assert_int_list, assert_keyed_list, assert_small, int_list,
-    keyed_tuple, skip_reason, stdlib_ebin, term_list, ModuleHost,
+    all_otp_ebins, assert_atom, assert_int_list, assert_keyed_list, assert_small, breadth_args,
+    describe_error, int_list, keyed_tuple, parse_breadth_target, parse_error_targets,
+    parse_expected_value, render_term, skip_reason, stdlib_ebin, term_list, verify_error,
+    ErrorVerdict, ModuleHost,
 };
 
-/// The oracle-checked call corpus (module/function/args; its values are pinned by
-/// the sibling `stdlib_lists.rs`; here it supplies the *calls*).
+/// The oracle-checked call corpus (module/function/args/expected-value; the same data
+/// `tests/stdlib_lists.rs` drives on the interpreter and `tests/jit_real_module.rs` on
+/// the interpreter + baseline pair).
 const BREADTH_TXT: &str = include_str!("fixtures/stdlib_breadth_targets.txt");
 
 /// The oracle-checked error-path corpus (poisoned calls that must raise).
 const ERROR_TXT: &str = include_str!("fixtures/error_path_targets.txt");
 
-/// The atom every `atom`-shaped error-corpus argument is called with (it matches no
-/// clause, so the compiled head-clause test fails).
-const POISON_ATOM: &str = "genesis_poison";
+/// How many breadth corpus rows the sweep must actually compare (the corpus holds
+/// 504), so a degenerate corpus read fails the suite instead of silently weakening it.
+const MIN_BREADTH_CASES: usize = 480;
 
-/// How many distinct corpus modules the breadth sweep compiles and runs.
-const MAX_BREADTH_MODULES: usize = 30;
+/// How many breadth rows **each tier** must reproduce the baked oracle value for
+/// (504 today) -- a floor on the oracle-checked count per tier, so a regression that
+/// stops checking can never pass.
+const MIN_BREADTH_ORACLE_CHECKS: usize = 480;
 
-/// How many distinct corpus modules the error-path sweep compiles and runs.
-const MAX_ERROR_MODULES: usize = 30;
+/// How many distinct breadth corpus modules the sweep must reach (the corpus spans
+/// 171, and so must the sweep).
+const MIN_BREADTH_MODULES: usize = 171;
 
-/// The most targets taken per swept module (keeps the tail of a sweep bounded).
-const PER_MODULE: usize = 2;
+/// How many error-path corpus rows the sweep must actually compare (the corpus holds
+/// 232).
+const MIN_ERROR_CASES: usize = 220;
 
-/// The smallest number of breadth cases the sweep must actually compare, so a
-/// degenerate corpus selection fails the suite instead of silently weakening it.
-const MIN_BREADTH_CASES: usize = 40;
+/// How many error-path rows **each tier** must reproduce the oracle's exception class
+/// and reason for (223 today) -- the per-tier floor on oracle-checked raises.
+const MIN_ERROR_ORACLE_CHECKS: usize = 200;
 
-/// The smallest number of breadth corpus modules the sweep must compare.
-const MIN_BREADTH_MODULES: usize = 20;
-
-/// The smallest number of error-path cases the sweep must actually compare.
-const MIN_ERROR_CASES: usize = 30;
+/// How many distinct error-path corpus modules the sweep must reach (the corpus spans
+/// 215).
+const MIN_ERROR_MODULES: usize = 200;
 
 /// The smallest number of error-path cases that must raise `function_clause` on
 /// **both** tiers -- the behavioural proof that the never-inlined `func_info` step
 /// was executed by the shared helper on the Cranelift tier.
-const MIN_FUNCTION_CLAUSE_AGREEMENTS: usize = 10;
+const MIN_FUNCTION_CLAUSE_AGREEMENTS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // The real-module host
 // ---------------------------------------------------------------------------
+
+/// The process-wide serialization of this file's tests.
+///
+/// **Why a lock, and why it changes no assertion.** `cranelift-jit` 0.116 allocates
+/// **one `mmap` per allocation** in its code and writable memories
+/// (`cranelift_jit::memory::Memory::allocate`, whose own comment reads
+/// `// TODO: Allocate more at a time.`), and it emits a 16-byte PLT stub for every
+/// declared function whose `rel32` displacement must reach that function's 8-byte GOT
+/// slot (`JITModule::declare_function` -> `new_func_plt_entry` ->
+/// `write_plt_entry_bytes`). One corpus is a few hundred modules and some 10^5
+/// declared functions, i.e. some 10^5 single-page mappings; two corpora's modules
+/// **alive at the same time** walk the address space far enough that the PLT entry and
+/// its GOT slot drift more than 2 GiB apart, and the dependency then panics with
+/// `TryFromIntError(NegOverflow)` from `i32::try_from(what - at).unwrap()` -- an
+/// address-space limitation of the dependency, never a tier divergence (the
+/// interpreter half of the same row had already completed).
+///
+/// Taking this lock makes at most **one** corpus's JIT modules live at a time, which
+/// is deterministic and is exactly what `--test-threads=1` did (measured: 2/2 green
+/// runs serial, ~50 % panics with only the two sweeps in parallel). The floors, the
+/// comparisons and the skip policy are untouched.
+static JIT_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Serializes the calling test with the rest of this file. A poisoned lock (an
+/// earlier test in the same binary already failed) is taken over, so the remaining
+/// tests still run and report their own verdicts instead of dying on the poison.
+fn serialize_jit() -> MutexGuard<'static, ()> {
+    JIT_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Skips the calling test (loudly) when the oracle OTP install is unavailable.
 fn skip_if_unavailable() -> bool {
@@ -323,6 +399,8 @@ fn ok(outcome: Result<Eterm, BeamError>, label: &str) -> Eterm {
 #[test]
 fn the_feature_builds_the_cranelift_tier_into_the_roster() {
     // With the feature on the roster is exactly interpreter, baseline, cranelift.
+    // The roster itself is the engine's own static data, so this half needs no OTP
+    // install at all.
     assert_eq!(
         available_tiers(),
         &["interpreter", "baseline-jit", "jit-cranelift"]
@@ -333,7 +411,12 @@ fn the_feature_builds_the_cranelift_tier_into_the_roster() {
 
     // Selecting the tier runs Cranelift (it does not return the feature-OFF typed
     // error and does not fall back to another tier); this is the feature-ON half of
-    // the "no silent fallback" claim.
+    // the "no silent fallback" claim. It needs the real `lists` module, so it is
+    // guarded like every other test in this file.
+    if skip_if_unavailable() {
+        return;
+    }
+    let _guard = serialize_jit();
     let mut host = host();
     let mut cache = Cache::new();
     let mut keep = Vec::new();
@@ -366,6 +449,7 @@ fn curated_real_stdlib_targets_agree_and_match_the_oracle() {
     if skip_if_unavailable() {
         return;
     }
+    let _guard = serialize_jit();
     let mut host = host();
     let mut cache = Cache::new();
     let mut keep = Vec::new();
@@ -718,6 +802,7 @@ fn the_small_int_fast_path_runs_natively_and_its_guard_deopts() {
     if skip_if_unavailable() {
         return;
     }
+    let _guard = serialize_jit();
     let mut host = host();
     let module = host
         .load("lists")
@@ -836,166 +921,18 @@ fn the_small_int_fast_path_runs_natively_and_its_guard_deopts() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The bounded breadth sweep over the oracle-checked call corpus
+// 4. The full breadth sweep over the oracle-checked call corpus
 // ---------------------------------------------------------------------------
 
-/// One parsed breadth-corpus line: `module:function(args)`.
-struct SweepCase {
-    module: String,
-    function: String,
-    /// The raw `(<args>)` text (built by [`breadth_args`]).
-    args: String,
-}
-
-/// Parses the breadth corpus, keeping only the call key (the expected value is
-/// pinned by the sibling `stdlib_lists.rs`; here it is the *agreement* that is
-/// under test).
-fn parse_breadth_cases() -> Vec<SweepCase> {
-    let mut cases = Vec::new();
-    for raw in BREADTH_TXT.lines() {
-        let line = raw.split("  # oracle:").next().unwrap_or(raw).trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, _expected) = line
-            .split_once(" => ")
-            .unwrap_or_else(|| panic!("breadth corpus line without ` => `: {line:?}"));
-        let (module, rest) = key
-            .split_once(':')
-            .unwrap_or_else(|| panic!("breadth corpus key without `:`: {key:?}"));
-        let (function, args) = rest
-            .split_once('(')
-            .unwrap_or_else(|| panic!("breadth corpus key without `(`: {key:?}"));
-        let args = args
-            .strip_suffix(')')
-            .unwrap_or_else(|| panic!("breadth corpus key without `)`: {key:?}"));
-        cases.push(SweepCase {
-            module: module.to_string(),
-            function: function.to_string(),
-            args: args.to_string(),
-        });
-    }
-    cases
-}
-
-/// The bounded, deterministic selection: the first `max_modules` distinct corpus
-/// modules (in corpus order), with at most `per_module` cases each.
-fn select_cases<'a>(
-    modules: &[String],
-    max_modules: usize,
-    per_module: usize,
-) -> Vec<usize> {
-    let mut order: Vec<&str> = Vec::new();
-    for name in modules {
-        if !order.contains(&name.as_str()) {
-            order.push(name);
-        }
-    }
-    let chosen: Vec<&str> = order.into_iter().take(max_modules).collect();
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    let mut selected = Vec::new();
-    for (index, name) in modules.iter().enumerate() {
-        let name = name.as_str();
-        if !chosen.contains(&name) {
-            continue;
-        }
-        let count = seen.entry(name).or_insert(0);
-        if *count < per_module {
-            *count += 1;
-            selected.push(index);
-        }
-    }
-    selected
-}
-
-/// Splits an argument list on **top-level** commas, respecting `[]`/`{}`/`<<>>`
-/// nesting and `"`-quoted strings.
-fn split_arg_terms(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut start = 0usize;
-    for (index, &byte) in args.as_bytes().iter().enumerate() {
-        match byte {
-            b'"' => in_string = !in_string,
-            b'[' | b'{' | b'<' if !in_string => depth += 1,
-            b']' | b'}' | b'>' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                parts.push(&args[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&args[start..]);
-    parts
-}
-
-/// Builds one corpus argument from its source text: `[]`, `[a,b]`, `{a,b}`,
-/// `<<1,2>>` (a byte binary), `"abc"` (a code-point string), an integer, a float,
-/// or an atom (bare or `'quoted'`).
-fn arg_term(host: &mut ModuleHost, text: &str) -> Eterm {
-    let text = text.trim();
-    if let Some(inner) = text.strip_prefix("<<").and_then(|t| t.strip_suffix(">>")) {
-        let bytes: Vec<u8> = if inner.trim().is_empty() {
-            Vec::new()
-        } else {
-            split_arg_terms(inner)
-                .iter()
-                .map(|part| {
-                    part.trim()
-                        .parse::<u8>()
-                        .expect("a corpus binary element is a byte literal")
-                })
-                .collect()
-        };
-        return terms::make_heap_binary(host, &bytes).expect("build a corpus binary argument");
-    }
-    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-        if inner.trim().is_empty() {
-            return NIL;
-        }
-        let elements: Vec<Eterm> = split_arg_terms(inner)
-            .iter()
-            .map(|part| arg_term(host, part))
-            .collect();
-        return terms::make_list(host, &elements).expect("build a corpus list argument");
-    }
-    if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
-        let elements: Vec<Eterm> = split_arg_terms(inner)
-            .iter()
-            .map(|part| arg_term(host, part))
-            .collect();
-        return terms::make_tuple(host, &elements).expect("build a corpus tuple argument");
-    }
-    if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-        let codes: Vec<Eterm> = inner
-            .bytes()
-            .map(|byte| make_small(i64::from(byte)))
-            .collect();
-        return terms::make_list(host, &codes).expect("build a corpus string argument");
-    }
-    if let Ok(value) = text.parse::<i64>() {
-        return make_small(value);
-    }
-    if let Ok(value) = text.parse::<f64>() {
-        return terms::make_float(host, value).expect("build a corpus float argument");
-    }
-    match text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
-        Some(quoted) => host.intern(quoted),
-        None => host.intern(text),
-    }
-}
-
-/// Builds the argument list for a corpus call from its `(<args>)` text.
-fn breadth_args(host: &mut ModuleHost, args: &str) -> Vec<Eterm> {
-    if args.trim().is_empty() {
-        return Vec::new();
-    }
-    split_arg_terms(args)
-        .iter()
-        .map(|part| arg_term(host, part))
-        .collect()
+/// The quoted `erl -noshell -eval …` command a breadth-corpus line carries as its
+/// trailing `# oracle:` comment, so a mismatch is reproducible from the failure
+/// message alone.
+///
+/// [`parse_breadth_target`] drops the comment, so this reads it back out of the raw
+/// line; the target grammar itself is **not** re-implemented here (there is one
+/// parser, in `tests/support/oracle.rs`).
+fn oracle_command(raw: &str) -> &str {
+    raw.split("# oracle:").nth(1).map(str::trim).unwrap_or("")
 }
 
 /// The union of the inlined-op categories the real compiled modules report, so a
@@ -1013,6 +950,9 @@ struct InlinedReport {
 }
 
 /// Folds one compiled real module's read-only codegen report into `into`.
+///
+/// Called once per **newly compiled** module (never once per corpus row), so
+/// [`InlinedReport::modules`] is a distinct-module count rather than a row count.
 fn record_inlined(compiled: &CompiledFunctions, into: &mut InlinedReport) {
     into.modules += 1;
     for kind in compiled.inlined_test_kinds() {
@@ -1033,75 +973,136 @@ fn record_inlined(compiled: &CompiledFunctions, into: &mut InlinedReport) {
     into.select_vals += compiled.inlined_select_val_count();
 }
 
+/// **The headline measurement: every happy-path corpus call, on both tiers, checked
+/// against the real system `erl`.**
+///
+/// Iterates the **whole** committed corpus -- all 504 calls over 171 distinct
+/// installed modules, the same rows `tests/jit_real_module.rs` drives on the
+/// interpreter + baseline pair -- with no bounded prefix and no per-module cap. Each
+/// row makes **two** assertions:
+///
+/// 1. **The two tiers agree with each other** ([`outcomes_agree`]): the same term
+///    under `beam_term::cmp`, or the same typed [`BeamError`]. A typed error on one
+///    tier and a value on the other fails.
+/// 2. **Each tier reproduces the oracle's value.** The corpus's `expected` column is
+///    the verbatim `~w` rendering the system `erl` printed for that very call, parsed
+///    back into a term and compared with `beam_term::cmp` -- on
+///    [`Tier::Interpreter`] **and** on [`Tier::Cranelift`]. Tier agreement alone can
+///    therefore no longer hide a mistake both tiers share.
+///
+/// A row whose call the engine cannot execute at all on **either** tier (a typed
+/// gap, identical on both since they agree) is printed as a loud `BLOCKED:` line and
+/// counted -- never silently folded into an agreement. A module Cranelift cannot
+/// compile is a loud `SKIP:` line, counted the same way.
 #[test]
-fn breadth_corpus_agrees_between_the_interpreter_and_cranelift() {    if skip_if_unavailable() {
+fn breadth_corpus_agrees_between_the_interpreter_and_cranelift() {
+    if skip_if_unavailable() {
         return;
     }
-    let all = parse_breadth_cases();
-    assert!(
-        all.len() >= 200,
-        "the breadth corpus shrank below its historic size: {} < 200",
-        all.len()
-    );
-    let names: Vec<String> = all.iter().map(|case| case.module.clone()).collect();
-    let selected: Vec<&SweepCase> = select_cases(&names, MAX_BREADTH_MODULES, PER_MODULE)
-        .into_iter()
-        .map(|index| &all[index])
-        .collect();
-
+    let _guard = serialize_jit();
     let mut host = host();
     let mut cache = Cache::new();
     let mut keep = Vec::new();
+    let mut selected = 0usize;
     let mut compared = 0usize;
+    let mut values = 0usize;
+    let mut checked = [0usize; 2];
     let mut modules: BTreeSet<String> = BTreeSet::new();
+    let mut blocked: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut skips: Vec<String> = Vec::new();
     let mut inlined = InlinedReport::default();
 
-    for case in &selected {        let args = breadth_args(&mut host, &case.args);
+    for raw in BREADTH_TXT.lines() {
+        let Some(target) = parse_breadth_target(raw) else {
+            continue;
+        };
+        selected += 1;
+        let args = breadth_args(&mut host, target.args);
+        let expected = parse_expected_value(&mut host, target.expected);
+        let label = target.label();
+
         // A module Cranelift cannot compile is skipped LOUDLY (a codegen failure is
         // the tier's documented typed error, not a wrong result); every other
         // divergence fails.
-        if let Err(error) = ensure_compiled(&mut host, &mut cache, &case.module) {
-            skips.push(format!(
-                "SKIP: {}:{} -- cranelift codegen: {error:?}",
-                case.module, case.function
-            ));
+        let newly_compiled = !cache.contains_key(target.module);
+        if let Err(error) = ensure_compiled(&mut host, &mut cache, target.module) {
+            skips.push(format!("SKIP: {label} -- cranelift codegen: {error:?}"));
             continue;
         }
-        let interpreted = host.call(&case.module, &case.function, &args);
+        if newly_compiled {
+            if let Some(compiled) = cache.get(target.module) {
+                record_inlined(&compiled.compiled, &mut inlined);
+            }
+        }
+
+        let interpreted = host.call(target.module, target.function, &args);
         let cranelift = run_cranelift(
             &mut host,
             &mut cache,
             &mut keep,
-            &case.module,
-            &case.function,
+            target.module,
+            target.function,
             &args,
         );
         compared += 1;
-        if let Some(compiled) = cache.get(&case.module) {
-            record_inlined(&compiled.compiled, &mut inlined);
-        }
-        if outcomes_agree(host.atom_table(), &interpreted, &cranelift) {
-            modules.insert(case.module.clone());
-        } else {            failures.push(format!(
-                "DIVERGENCE {}:{}/{} on args ({}) -- interpreter {} vs cranelift {}",
-                case.module,
-                case.function,
-                args.len(),
-                case.args,
+
+        // (a) the two tiers must agree with each other ...
+        if !outcomes_agree(host.atom_table(), &interpreted, &cranelift) {
+            failures.push(format!(
+                "DIVERGENCE {label} on args ({}) -- interpreter {} vs cranelift {}",
+                target.args,
                 describe(&interpreted),
                 describe(&cranelift)
             ));
+            continue;
+        }
+        modules.insert(target.module.to_string());
+
+        // ... and (b) EACH tier must reproduce the oracle's value.
+        match (&interpreted, &cranelift) {
+            (Ok(interpreted), Ok(cranelift)) => {
+                values += 1;
+                for (slot, tier_name, actual) in [
+                    (0usize, "Tier::Interpreter", *interpreted),
+                    (1usize, "Tier::Cranelift", *cranelift),
+                ] {
+                    if expected.matches(&host, actual) {
+                        checked[slot] += 1;
+                    } else {
+                        failures.push(format!(
+                            "ORACLE MISMATCH for `{label}` on {tier_name}: the engine returns {}, \
+                             the system erl returns {}  [{}]",
+                            render_term(&host, actual).unwrap_or_else(|| format!("{actual:?}")),
+                            expected
+                                .render(&host)
+                                .unwrap_or_else(|| "<unrenderable>".to_string()),
+                            oracle_command(raw),
+                        ));
+                    }
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => blocked.push(format!(
+                "BLOCKED: {label} -- the oracle returns a value, both tiers answered {}",
+                describe_error(error)
+            )),
         }
     }
 
     println!(
-        "BREADTH: selected {} case(s); compared {compared} over {} module(s)",
-        selected.len(),
-        modules.len()
+        "BREADTH: selected {selected} case(s); compared {compared} over {} module(s); \
+         oracle-checked interpreter={} cranelift={}; blocked={} skipped={} ({values} agreed on a \
+         value)",
+        modules.len(),
+        checked[0],
+        checked[1],
+        blocked.len(),
+        skips.len()
     );
     for line in &skips {
+        println!("{line}");
+    }
+    for line in &blocked {
         println!("{line}");
     }
     println!(
@@ -1133,13 +1134,33 @@ fn breadth_corpus_agrees_between_the_interpreter_and_cranelift() {    if skip_if
     );
 
     assert!(
-        failures.is_empty(),        "{} breadth case(s) diverge between the interpreter and the Cranelift tier:\n{}",
+        failures.is_empty(),
+        "{} breadth case(s) diverge between the interpreter and the Cranelift tier, or disagree \
+         with the system `erl`:\n{}",
         failures.len(),
         failures.join("\n")
     );
     assert!(
+        blocked.is_empty(),
+        "{} breadth corpus row(s) became a typed gap on both tiers (see the `BLOCKED:` lines \
+         above): this corpus executes on this host today, so a gap here is a regression",
+        blocked.len()
+    );
+    assert!(
         compared >= MIN_BREADTH_CASES,
         "only {compared} breadth case(s) were compared (floor {MIN_BREADTH_CASES})"
+    );
+    assert!(
+        checked[0] >= MIN_BREADTH_ORACLE_CHECKS,
+        "only {} breadth value(s) were oracle-checked on Tier::Interpreter (floor \
+         {MIN_BREADTH_ORACLE_CHECKS})",
+        checked[0]
+    );
+    assert!(
+        checked[1] >= MIN_BREADTH_ORACLE_CHECKS,
+        "only {} breadth value(s) were oracle-checked on Tier::Cranelift (floor \
+         {MIN_BREADTH_ORACLE_CHECKS})",
+        checked[1]
     );
     assert!(
         modules.len() >= MIN_BREADTH_MODULES,
@@ -1149,87 +1170,8 @@ fn breadth_corpus_agrees_between_the_interpreter_and_cranelift() {    if skip_if
 }
 
 // ---------------------------------------------------------------------------
-// 5. The bounded error-path sweep (the deopt path, behaviourally)
+// 5. The full error-path sweep (the deopt path, behaviourally, on both tiers)
 // ---------------------------------------------------------------------------
-
-/// One argument shape the error corpus uses.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Poison {
-    /// The atom [`POISON_ATOM`].
-    Atom,
-    /// The small integer `7`.
-    Int,
-    /// The empty list `[]`.
-    Nil,
-    /// The empty tuple `{}`.
-    Tuple0,
-}
-
-/// One parsed error-path corpus line.
-struct ErrorCase {
-    module: String,
-    function: String,
-    arity: u32,
-    poisons: Vec<Poison>,
-}
-
-/// Parses the error-path corpus: `<module>:<function>/<arity> <poisons> => <expected>`.
-fn parse_error_cases() -> Vec<ErrorCase> {
-    let mut cases = Vec::new();
-    for raw in ERROR_TXT.lines() {
-        let line = raw.split('#').next().unwrap_or(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(
-            tokens.len(),
-            4,
-            "expected `<module>:<f>/<n> <poison> => <expected>`, got {line:?}"
-        );
-        assert_eq!(tokens[2], "=>", "missing the `=>` separator: {line:?}");
-        let (module, rest) = tokens[0]
-            .split_once(':')
-            .unwrap_or_else(|| panic!("no `:` in {:?}", tokens[0]));
-        let (function, arity) = rest
-            .split_once('/')
-            .unwrap_or_else(|| panic!("no `/` in {:?}", tokens[0]));
-        let arity: u32 = arity.parse().expect("a numeric arity");
-        let poisons: Vec<Poison> = tokens[1]
-            .split(',')
-            .map(|token| match token {
-                "atom" => Poison::Atom,
-                "int" => Poison::Int,
-                "nil" => Poison::Nil,
-                "tuple0" => Poison::Tuple0,
-                other => panic!("unknown poison token {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            poisons.len(),
-            arity as usize,
-            "{} poison(s) for arity {arity}: {line:?}",
-            poisons.len()
-        );
-        cases.push(ErrorCase {
-            module: module.to_string(),
-            function: function.to_string(),
-            arity,
-            poisons,
-        });
-    }
-    cases
-}
-
-/// The term a poison argument stands for (allocated on the host's arena).
-fn poison_term(host: &mut ModuleHost, poison: Poison) -> Eterm {
-    match poison {
-        Poison::Atom => host.intern(POISON_ATOM),
-        Poison::Int => make_small(7),
-        Poison::Nil => NIL,
-        Poison::Tuple0 => terms::make_tuple(host, &[]).expect("build the empty tuple"),
-    }
-}
 
 /// Whether `outcome` is a class-`error` raise whose reason is the bare atom
 /// `function_clause` -- the failed-head-clause shape only the **never-inlined**
@@ -1255,6 +1197,7 @@ fn is_function_clause(atoms: &AtomTable, outcome: &Result<Eterm, BeamError>) -> 
     let expected = make_atom(atom);
     live_reason_term(raise).is_some_and(|term| cmp(term, expected, atoms).is_eq())
 }
+
 /// A short label for an outcome's reason, for the sweeps' histogram printout.
 fn reason_label(outcome: &Result<Eterm, BeamError>) -> String {
     match outcome {
@@ -1264,21 +1207,32 @@ fn reason_label(outcome: &Result<Eterm, BeamError>) -> String {
     }
 }
 
+/// **The error-path measurement: every poisoned corpus call, on both tiers, checked
+/// against the real system `erl`.**
+///
+/// Iterates the **whole** committed error-path corpus -- all 232 poisoned calls over
+/// 215 distinct installed modules, the same rows `tests/jit_real_module.rs` drives on
+/// the interpreter + baseline pair -- with no bounded prefix and no per-module cap.
+/// Every target makes the *compiled code itself* raise (`func_info` ->
+/// `function_clause`, `case_end`, `badmatch`, `badrecord`), so this is the
+/// raise/unwind path's tier equivalence **and** its oracle fidelity.
+///
+/// Each row asserts two things:
+///
+/// 1. **The two tiers agree**: the native tier must reproduce the interpreter's
+///    typed error exactly (class, reason and live reason term), never a value and
+///    never a different error.
+/// 2. **Each tier agrees with the oracle**: [`verify_error`] requires the raise to
+///    carry the class and reason term the system `erl` produces
+///    ([`ErrorVerdict::Matches`]). A typed gap ([`ErrorVerdict::TypedGap`]) is a
+///    counted `BLOCKED:` line; a disagreement ([`ErrorVerdict::Wrong`]) fails.
 #[test]
-fn error_path_corpus_agrees_and_exercises_the_deopt_path() {    if skip_if_unavailable() {
+fn error_path_corpus_agrees_and_exercises_the_deopt_path() {
+    if skip_if_unavailable() {
         return;
     }
-    let all = parse_error_cases();
-    assert!(
-        all.len() >= 200,
-        "the error-path corpus shrank below its historic size: {} < 200",
-        all.len()
-    );
-    let names: Vec<String> = all.iter().map(|case| case.module.clone()).collect();
-    let selected: Vec<&ErrorCase> = select_cases(&names, MAX_ERROR_MODULES, PER_MODULE)
-        .into_iter()
-        .map(|index| &all[index])
-        .collect();
+    let _guard = serialize_jit();
+    let targets = parse_error_targets(ERROR_TXT);
 
     let mut host = host();
     let mut cache = Cache::new();
@@ -1287,72 +1241,122 @@ fn error_path_corpus_agrees_and_exercises_the_deopt_path() {    if skip_if_unava
     let mut function_clauses = 0usize;
     let mut histogram: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
+    let mut checked = [0usize; 2];
     let mut modules: BTreeSet<String> = BTreeSet::new();
+    let mut blocked: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut skips: Vec<String> = Vec::new();
-    for case in &selected {
-        let args: Vec<Eterm> = case
-            .poisons
-            .iter()
-            .map(|poison| poison_term(&mut host, *poison))
-            .collect();
-        assert_eq!(args.len(), case.arity as usize, "poison/arity mismatch");
-        if let Err(error) = ensure_compiled(&mut host, &mut cache, &case.module) {
-            skips.push(format!(
-                "SKIP: {}:{} -- cranelift codegen: {error:?}",
-                case.module, case.function
-            ));
+
+    for target in &targets {
+        let args = target.args(&mut host);
+        assert_eq!(
+            args.len(),
+            target.arity as usize,
+            "poison/arity mismatch for {}",
+            target.label()
+        );
+        let label = target.label();
+
+        if let Err(error) = ensure_compiled(&mut host, &mut cache, &target.module) {
+            skips.push(format!("SKIP: {label} -- cranelift codegen: {error:?}"));
             continue;
         }
-        let interpreted = host.call(&case.module, &case.function, &args);
+
+        let interpreted = host.call(&target.module, &target.function, &args);
         let cranelift = run_cranelift(
             &mut host,
             &mut cache,
             &mut keep,
-            &case.module,
-            &case.function,
+            &target.module,
+            &target.function,
             &args,
         );
         compared += 1;
         *histogram.entry(reason_label(&interpreted)).or_insert(0) += 1;
-        if outcomes_agree(host.atom_table(), &interpreted, &cranelift) {
-            modules.insert(case.module.clone());
-            if is_function_clause(host.atom_table(), &interpreted)
-                && is_function_clause(host.atom_table(), &cranelift)
-            {                function_clauses += 1;
-            }        } else {
+
+        // (a) the tiers must agree with each other ...
+        if !outcomes_agree(host.atom_table(), &interpreted, &cranelift) {
             failures.push(format!(
-                "DIVERGENCE {}:{}/{} -- interpreter {} vs cranelift {}",
-                case.module,
-                case.function,
-                case.arity,
+                "DIVERGENCE {label} -- interpreter {} vs cranelift {}",
                 describe(&interpreted),
                 describe(&cranelift)
             ));
+            continue;
+        }
+        modules.insert(target.module.clone());
+        if is_function_clause(host.atom_table(), &interpreted)
+            && is_function_clause(host.atom_table(), &cranelift)
+        {
+            function_clauses += 1;
+        }
+
+        // ... and (b) EACH tier must reproduce the oracle's exception.
+        let mut gaps: Vec<String> = Vec::new();
+        for (slot, tier_name, outcome) in [
+            (0usize, "Tier::Interpreter", &interpreted),
+            (1usize, "Tier::Cranelift", &cranelift),
+        ] {
+            match verify_error(&mut host, outcome, target) {
+                ErrorVerdict::Matches => checked[slot] += 1,
+                ErrorVerdict::TypedGap(gap) => gaps.push(format!("{tier_name}: {gap}")),
+                ErrorVerdict::Wrong(detail) => failures.push(format!(
+                    "ORACLE MISMATCH for `{label}` on {tier_name}: {detail}"
+                )),
+            }
+        }
+        if gaps.len() == 2 {
+            blocked.push(format!("BLOCKED: {label} -- {}", gaps.join("; ")));
         }
     }
 
     println!(
         "ERROR-PATHS: selected {} case(s); compared {compared} over {} module(s), \
-         {function_clauses} bare-atom `function_clause` agreement(s) (the deopted `func_info` path)",
-        selected.len(),
-        modules.len()
+         {function_clauses} bare-atom `function_clause` agreement(s) (the deopted `func_info` \
+         path); oracle-checked interpreter={} cranelift={}; blocked={} skipped={}",
+        targets.len(),
+        modules.len(),
+        checked[0],
+        checked[1],
+        blocked.len(),
+        skips.len()
     );
     for (label, count) in &histogram {
         println!("  reason {label} x{count}");
-    }    for line in &skips {
+    }
+    for line in &skips {
+        println!("{line}");
+    }
+    for line in &blocked {
         println!("{line}");
     }
 
     assert!(
         failures.is_empty(),
-        "{} error-path case(s) diverge between the interpreter and the Cranelift tier:\n{}",
+        "{} error-path case(s) diverge between the interpreter and the Cranelift tier, or \
+         disagree with the system `erl`:\n{}",
         failures.len(),
         failures.join("\n")
     );
     assert!(
         compared >= MIN_ERROR_CASES,
         "only {compared} error-path case(s) were compared (floor {MIN_ERROR_CASES})"
+    );
+    assert!(
+        checked[0] >= MIN_ERROR_ORACLE_CHECKS,
+        "only {} error-path raise(s) were oracle-checked on Tier::Interpreter (floor \
+         {MIN_ERROR_ORACLE_CHECKS})",
+        checked[0]
+    );
+    assert!(
+        checked[1] >= MIN_ERROR_ORACLE_CHECKS,
+        "only {} error-path raise(s) were oracle-checked on Tier::Cranelift (floor \
+         {MIN_ERROR_ORACLE_CHECKS})",
+        checked[1]
+    );
+    assert!(
+        modules.len() >= MIN_ERROR_MODULES,
+        "only {} error-path corpus module(s) were compared (floor {MIN_ERROR_MODULES})",
+        modules.len()
     );
     assert!(
         function_clauses >= MIN_FUNCTION_CLAUSE_AGREEMENTS,
@@ -1370,6 +1374,7 @@ fn the_real_module_report_shows_inlined_instructions() {
     if skip_if_unavailable() {
         return;
     }
+    let _guard = serialize_jit();
     let mut host = host();
     let module = host.load("lists").expect("load the system `lists` module");
     let mut backend = CraneliftJit::new();

@@ -114,37 +114,64 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
   `real_beam_variant_proofs/` (`harness.rs` uses `run_export`); `dynamic_census.rs:807` pins
   `Tier::Interpreter` deliberately (the census funnel is interpreter-only).
 - **`Tier::BaselineJit`** — `jit_real_module.rs::run_target` drives each target twice on the SAME
-  loaded module (`:254` interpreter, `:255` baseline) over two committed corpora:
+  loaded module (interpreter, then baseline) over two committed corpora:
   `fixtures/stdlib_breadth_targets.txt` (504 targets / 171 modules; floors
-  `BREADTH_COMPARISON_FLOOR` 480, `BREADTH_VALUE_FLOOR` 480, `BREADTH_MODULE_FLOOR` 171,
-  `:269-274`) and `fixtures/error_path_targets.txt` (232 targets / 215 modules; floors 220/200/200,
-  `:449-455`). **It is TIER-vs-TIER, not tier-vs-oracle**: `parse_breadth_target` binds
-  `_expected` and discards the corpus's expected column (`:284`), and the error corpus likewise
-  compares only the two tiers' `Debug` shapes (`:195-204`) — oracle fidelity is
-  `stdlib_lists.rs`'s / `exceptions_corpus.rs`'s job. `PERF.md:153` records the observed 736/736
-  (504 + 232). Other baseline real-module evidence: `jit.rs` (slice.beam, 9 `agree(..)` rows over
+  `BREADTH_COMPARISON_FLOOR` 480, `BREADTH_VALUE_FLOOR` 480, `BREADTH_MODULE_FLOOR` 171) and
+  `fixtures/error_path_targets.txt` (232 targets / 215 modules; floors 220/200/200), and it now
+  asserts **two** things per row: (a) the two tiers agree with each other (same term under
+  `beam_term::cmp`, or the same `Debug` error shape) and (b) **each tier** agrees with the baked
+  oracle expectation — the breadth value is parsed back into a term and compared with
+  `beam_term::cmp`, the error-path reason through `verify_error` (class `error` + the oracle's
+  reason term). It is therefore **oracle-checked on both tiers**, not tier-vs-tier: measured
+  `oracle-checked interpreter=504 baseline=504` (breadth) and `223/223` (error path), with the 9
+  error-path rows whose fixture expectation IS `unsupported` reported as `BLOCKED:` lines
+  (`blocked=18` = 9 rows × 2 tiers); no row disagrees. All corpus machinery is the one shared
+  `support/oracle.rs`. `PERF.md:153` records the observed 736/736 (504 + 232) tier comparisons.
+  Other baseline real-module evidence: `jit.rs` (slice.beam, 9 `agree(..)` rows over
   both tiers), `jit_coverage.rs` (coverage.beam × `NATIVE_TIERS`, `:154`/`:158`),
   `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_reductions.rs` (slice.beam),
   `jit_cross_module.rs` (fixtures compiled by the system `erlc` at test time, both tiers at
   `:550-551`), `stacktrace_frames.rs` (`TIERS = [Interpreter, BaselineJit]`, `:127`, live-`erl`
-  prefix cross-check), and `the_block_allocator_engages_on_real_stdlib_modules` (`:638`, 7 real
+  prefix cross-check), and `the_block_allocator_engages_on_real_stdlib_modules` (7 real
   modules, engine-internal artifact assertions only). `jit_compare.rs` / `local_call_seam.rs` are
   **synthetic-only**.
-- **`Tier::Cranelift`** — real-module half is `jit_cranelift_real.rs`: a 26-row curated real-stdlib
-  set whose expected values ARE the oracle's (`:365`, `compared >= 20` at `:663`; `lists`/`ordsets`/
-  `proplists`/`calendar`), a **bounded** breadth sweep (≤`MAX_BREADTH_MODULES` 30 modules ×
-  ≤`PER_MODULE` 2 = ≤60 cases; floors 40 cases / 20 modules, `:107-121`, `:1140-1148`) and a
-  bounded error sweep (floors 30 cases / 10 `function_clause`, `:123-129`, `:1353-1358`) — both
-  compare interpreter vs Cranelift only, never the oracle value. `jit_cranelift.rs` runs slice.beam
-  on all three tiers behind one `agree(..)` (`:121-130`) and is synthetic otherwise; `jit_coverage.rs`
-  adds `Cranelift` to `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/
-  `try`-raise/maps/bitstrings) is covered on it too.
-- **Gaps by tier:** the 504+232 corpora and `jit_cross_module.rs` are baseline-only (Cranelift gets
-  bounded prefixes only); no suite drives `Tier::Cranelift` over `census.rs`/`dynamic_census.rs`/
-  `real_beam_variant_proofs.rs`/`stdlib_sweep.rs`. `jit_cranelift_real.rs:324`'s roster test calls
-  `host()` with **no** skip guard, so it PANICS (not skips) when the OTP stdlib is absent; the
-  `skip_reason()` guard elsewhere needs the stdlib `.beam` files only (no live `erl` per assertion —
-  values are baked, except `jit_cross_module.rs`'s test-time `erlc` and the live-oracle suites).
+- **`Tier::Cranelift`** — `jit_cranelift_real.rs` runs the **same full corpus** as the other two
+  tiers, oracle-checked per tier: all **504** breadth rows over **171** modules and all **232**
+  error-path rows over **215** modules, through the one shared `support/oracle.rs` machinery. Per row
+  it asserts (a) interpreter vs Cranelift agreement and (b) *each* tier's outcome against the baked
+  oracle value/reason (`Expected::matches`; `verify_error` requiring `Matches`); a Cranelift codegen
+  failure is a counted `SKIP:` line, a typed gap on both tiers a counted `BLOCKED:` line (the 9
+  fixture-`unsupported` error rows), and a value/reason that differs from the oracle FAILS quoting the
+  row's own `erl` command. Floors: breadth `480` cases / `480` oracle-checked **per tier** / `171`
+  modules / `blocked == 0`; error path `220` cases / `200` oracle-checked per tier / `200` modules /
+  `200` bare-atom `function_clause` agreements. Measured: `oracle-checked interpreter=504
+  cranelift=504` and `223/223`, 207 `function_clause` agreements, the whole 23-test file in ~84 s.
+  Plus a 26-row curated real-stdlib set whose expected values are the oracle's. The file serializes
+  its own tests on a `JIT_SERIAL` mutex: `cranelift-jit` 0.116 maps one `mmap` per allocation and
+  emits a 16-byte PLT stub per declared function whose `rel32` must reach that function's GOT slot, so
+  two corpora's JIT modules alive at once can drift past the ±2 GiB `rel32` reach and the *dependency*
+  panics with `TryFromIntError(NegOverflow)` in `write_plt_entry_bytes` (~50 % with the two sweeps
+  parallel, never solo) — an address-space limitation of the dependency, never a tier divergence; the
+  mutex is equivalent to `--test-threads=1`. `jit_cranelift.rs` runs slice.beam on all three tiers
+  behind one `agree(..)` and is synthetic otherwise; `jit_coverage.rs` adds `Cranelift` to
+  `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/`try`-raise/maps/bitstrings)
+  is covered on it too; `jit_cross_module.rs` drives Cranelift through its single `run_both` funnel for
+  the resolved cross-module call, the nested recursive chain and the dynamic `apply` — the
+  parked-suspension row stays on interpreter+baseline because
+  `Machine::resume_outcome_with_tier(.., Tier::Cranelift)` is the typed
+  `unsupported_opcode: cranelift jit: cannot resume at an arbitrary pc`.
+- **Gaps by tier:** all three tiers now run the full 504+232 corpus oracle-checked
+  (`jit_real_module.rs` for interpreter+baseline; `jit_cranelift_real.rs` for interpreter+Cranelift).
+  No suite drives `Tier::Cranelift` over `census.rs`/`dynamic_census.rs`/`real_beam_variant_proofs.rs`/
+  `stdlib_sweep.rs`, and the corpora reach 171/215 of the installed modules, not all 1366.
+  `stdlib_sweep.rs::sweep_loads_every_installed_beam` remains **load-only** (it executes no
+  instruction): a per-module execution sample over all 1366 modules has no oracle column, because a
+  module's only universally-present exports are `module_info/0,1`, which the compiler lowers to the
+  `erlang:get_module_info/1,2` BIF that the test host's BIF floor does not serve — so no expectation
+  could be produced reliably. The execution evidence is the separate `sweep_*` tests plus the 504-row
+  corpus. Values are baked at authoring time (no live `erl` per assertion) except
+  `jit_cross_module.rs`'s test-time `erlc` and the live-oracle suites (`trace.rs`,
+  `func_info_stacktrace.rs`, `raise_stacktrace.rs`, `stacktrace_frames.rs`).
 - **`#[ignore]`d suites here:** exactly two — `stacktrace_frames.rs:710` (`#[ignore = "capability
   gap: `ModuleHost` supplies no mailbox, …"]`) and `jit_bench.rs:57` (`#[ignore = "measurement
   table: run with --ignored --nocapture"]`). Run either with
@@ -153,6 +180,7 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
 
 ## Routing Table
 - `support/` → shared multi-module `ExecutionContext` host: OTP discovery (`otp_lib_root`/`all_otp_beams`), the shared atom universe, the BIF floor, assertion helpers
+- `support/oracle.rs` → the **one** implementation of the corpus machinery every oracle-checking suite uses: `parse_breadth_target`/`BreadthTarget` + `split_arg_terms`/`arg_term`/`breadth_args`, `parse_expected_value`/`Expected` (+ `matches` through `beam_term::cmp`), the `~w` renderer `render_term`, and the error-path half `parse_error_targets`/`ErrorTarget`/`ErrorVerdict`/`verify_error` (+ `Poison`/`poison_term`, `describe_error`). Re-exported **by name** from the facade (its `render_term` would collide with `probe`'s in a glob); `stdlib_lists.rs`, `exceptions_corpus.rs` and `jit_real_module.rs` all consume it — `jit_cranelift_real.rs` is the remaining consumer
 - `support/probe/` → the valid-operand probe harness (`mod.rs`: `ProbeAtoms`, `ProbeMailbox`, `Expect`, `Observed`, `Verdict`, the `Probe` builder, `ProbeRun`, `render_term`, the fixed entry/aux/fail-sink labels) and its roster in `rows/` — one file per instruction group (`core.rs`, `data.rs`, `exceptions.rs`, `receive.rs`, `bitstrings.rs`, unioned by `rows/mod.rs::all_rows`), keyed by the variant name **derived** from the constructed `Instr` so a row can override a legacy row but never invent a name
 - `fixtures/` → committed system-`erlc`-produced `.beam` fixtures + `.erl` sources + target lists. The real-`.beam` variant proofs own five of them: `vb_calls` (`Call`/`CallExt`/`CallLast`/`CallExtOnly`/`CallExtLast`/`ApplyLast`/`Apply` shapes), `vb_data` (tuple/list/map reads and writes), `vb_funs` (`MakeFun3`/`CallFun`/`CallFun2`), `vb_exc` (`Try`/`TryCase`/`TryCaseEnd`/`TryEnd`/`Catch`/`CatchEnd`/`IfEnd`/`BuildStacktrace`), `vb_bitstr` (the `Bs*` match/create set), each committed as `.erl` + `.beam` so a proof needs no compiler at test time
 - `rooted_alloc.rs` → proves the engine's term-construction instruction arms route storage through `ExecutionContext::alloc_words_rooted` (whole-root hand-off; a counting context whose `alloc_words` stays the typed-error default so any fallback fails loudly; a moving-collector relocation proof)
@@ -168,7 +196,7 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
 - `gc_roots.rs`, `gc_arena.rs`, `bif_alloc.rs` → GC root-set hand-off, the region heap, BIF-driven allocation
 - `heap_reclaim.rs` → the arena's two reclaim tiers (`heap_rewind` / `reclaim_heap` / `reclaim_heap_with_capacity`) through their **public** doors at the **production** geometry (4 MiB reservation / 64 KiB commit, a second region only past a bulk request): both tiers end to end, the reachable refusal arms (foreign / pre-rewind / spent-`EMPTY` marks) with byte-identical arenas, the reset door, both `Ok(None)` arms, the pre-copy `heap_exhausted` capacity refusal, and one `Machine`-rooted forward through `Machine::for_each_root_mut`; the exact-number `ContextHeap::with_geometry` half lives in `src/context/reclaim/tests.rs`
 - `map_assoc_alloc.rs` → `put_map_assoc`'s capacity count is O(1): a per-thread-armed counting `#[global_allocator]` decomposes one instruction's allocation cost into `harness + build + one source walk` (measured in-binary) and requires the instruction to fit that plus a slack smaller than a walk, so a re-introduced `map_entries(...).len()` second walk fails; the produced map is pinned against the reference builder down to `map_entries` storage order
-- `jit.rs`, `jit_real_module.rs` → native baseline tier equivalence (synthetic + real-`erlc` modules; see `## Per-tier real-module execution evidence` for which tier each suite drives and the exact corpora/floors); `jit_cross_module.rs` → the native tier's in-machine module-context switch on `erlc`-compiled-at-test-time modules (both tiers); `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_compare.rs`, `jit_coverage.rs` → block linking, the cross-run cache, the host code map, and baseline-vs-interpreter coverage; `jit_bench.rs` → the thin driver over the `crate::jit::bench` measurement harness; `jit_cranelift.rs`, `jit_cranelift_real.rs` → the feature-gated Cranelift hot tier
+- `jit.rs`, `jit_real_module.rs` → native baseline tier equivalence (synthetic + real-`erlc` modules; see `## Per-tier real-module execution evidence` for which tier each suite drives and the exact corpora/floors). `jit_real_module.rs` is **oracle-checked on BOTH tiers**: per corpus row it runs interpreter + baseline, asserts they agree with each other, then additionally asserts *each* tier's own outcome against the fixture's baked oracle expectation (`Expected::matches` for a breadth value, `support::verify_error` requiring `Matches` for an error-path row; a `TypedGap` prints as a counted `BLOCKED:` line, a `Wrong` panics quoting the row's `erl` command) — measured `interpreter=504 baseline=504` breadth / `223/223` error path; `jit_cross_module.rs` → the native tier's in-machine module-context switch on `erlc`-compiled-at-test-time modules (both tiers); `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_compare.rs`, `jit_coverage.rs` → block linking, the cross-run cache, the host code map, and baseline-vs-interpreter coverage; `jit_bench.rs` → the thin driver over the `crate::jit::bench` measurement harness; `jit_cranelift.rs`, `jit_cranelift_real.rs` → the feature-gated Cranelift hot tier
 - `no_fail.rs` → the integration-level `NO_FAIL`-guard evidence: drives `test` / `select_val` / `get_map_elements` / `has_map_fields` with `fail == NO_FAIL` through the real public entry `Machine::run_label` and asserts the DEFINED raise is class `error` + the bare atom `function_clause`, **both** uncaught (a `BeamError::Raise` carrying the live reason term) **and** caught in a live `try` frame (handler observes class `error` / reason `function_clause`). The positive counterpart to `gaps.rs`'s typed "no such atom" pins; complements the in-crate unit tests in `src/interpreter/tests.rs` and `src/families/maps/tests.rs`
 - `stdlib_text.rs` → the text / byte-encoding / collection-list stdlib surface on the real installed stdlib: `string` (case mapping + `trim`/`slice`/`join`/`tokens`), `base64` (`decode/1`, `encode/2` with its option maps), `unicode` normalisers, the `io_lib` writers/predicates, the reshaping + fun-taking `lists` exports, and `ordsets`; targets still needing an unserved NIF (`unicode:characters_to_list/1`, `binary:compile_pattern/1`) are recorded as blocked mechanisms with their exact typed error
 - `stdlib_text_more.rs` → the second text half: the `unicode` character-property surface (`is_whitespace`/`is_id_*`/`category`/`bin_is_7bit`/`bom_to_encoding`/`encoding_to_bom` + the list-only `characters_to_nfkc_list`/`nfkd_list`), the obsolete/alignment `string` helpers (`strip`/`left`/`right`/`substr`/`equal`/`prefix`/`centre`/`pad`), `io_lib` `fwrite/2`/`nl/0`/`printable_*`, the `lists` tuple-key/`prefix`/`suffix`/`merge` family, and the n-ary `ordsets` `union/1`/`intersection/1`
