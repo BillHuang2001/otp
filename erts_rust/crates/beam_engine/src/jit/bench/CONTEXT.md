@@ -257,7 +257,8 @@ compiled shape.
 
 ## Known Issues
 - **The harness is eager-only**: it drives `JitBackend::compile`, so it pins the **eager** whole-module artifact and does **not** measure the **lazy** per-entry path `CodeCache::compiled_handle` gives the runtime. Per-process/startup figures live in `../../../MEASURED.md` (`Measured (baseline-JIT cold start …)`) and the lazy path's correctness in `tests/jit_cache.rs`/`tests/jit_real_module.rs`.
-
+- **`../../../MEASURED.md`'s `## Measured (JIT tier micro-benchmark …)` section still says "Twelve workloads" and tabulates 12 rows** — `send_recv/2`, this node's 13th workload, has no row there; its figures exist only in the `Measured: send_recv/2` section above (and `send_recv.rs`'s module docs). The other 12 rows' workload set and figures match this node's table.
+- **`mod.rs`'s module docs (the `# Caveats` list) still claim "`beam_rt` still hardcodes `Tier::Interpreter`"** — stale: the runtime defaults to `Tier::BaselineJit` (`beam_rt/src/runner/tier.rs`'s `JitMode::Auto`/`Baseline`, `BEAM_RT_TIER=interpreter` the only kill switch), as `MEASURED.md` records. Read the caveat's intent as "these are engine-mechanism figures, not end-to-end runtime figures".
 ## Routing Table
 - `support.rs` → the shared scaffolding (see API Surface); `workloads.rs` → the four deopted workloads
   (`build/0`, `map/2`, `select/1`, `walk/2`), the partially-inlined `sum/1`, the cross-module `cross/2`
