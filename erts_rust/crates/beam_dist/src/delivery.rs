@@ -726,30 +726,33 @@ impl Delivery {
                     return Err(BeamError::BadArg);
                 }
             }
-            // `{DOP_UNLINK_ID[_ACK], Id, From, To}` (the OTP-26 link protocol):
-            // `Id` is a non-zero unsigned integer — the C checks `term_to_Uint64`
-            // and then `id == 0` for `DOP_UNLINK_ID` (`dist.c:2291-2295`); the ACK
-            // form checks `term_to_Uint64` alone (`dist.c:2320`), and this validator
-            // applies the same non-zero rule to both forms. `From` is an external
-            // pid of this link's peer (`dist.c:2299-2302` / `2325-2328`) and `To` a
-            // local pid (`dist.c:2304-2309` / `2330-2335`).
-            Delivery::UnlinkId { id, from, to } | Delivery::UnlinkIdAck { id, from, to } => {
+            // `{DOP_UNLINK_ID, Id, From, To}` (the OTP-26 link protocol): `Id` must
+            // be a **non-zero** unsigned integer — the C range-checks it with
+            // `term_to_Uint64` and then rejects `id == 0` (`dist.c:2291-2295`). The
+            // endpoints are shared with the ACK form (see `unlink_endpoints_ok`).
+            Delivery::UnlinkId { id, from, to } => {
                 if !is_nonzero_uint(*id) {
                     return Err(BeamError::BadArg);
                 }
-                if external_pid_node(*from) != Some(link.peer_node) {
+                if !unlink_endpoints_ok(*from, *to, link) {
                     return Err(BeamError::BadArg);
                 }
-                // LITERAL C QUIRK, mirrored on purpose: the C's old-incarnation
-                // escape hatch compares **`from`'s** distribution entry against this
-                // node — not `to`'s — (`erts_this_dist_entry ==
-                // external_pid_dist_entry(from)`, `dist.c:2304-2306` and
-                // `dist.c:2330-2332`), so the term compared against `local_node`
-                // here is `from`'s node, exactly as the C does it.
-                let from_node = external_pid_node(*from).ok_or(BeamError::BadArg)?;
-                let to_ok = is_internal_pid(*to)
-                    || (is_external_pid(*to) && from_node == link.local_node);
-                if !to_ok {
+            }
+            // `{DOP_UNLINK_ID_ACK, Id, From, To}`: `Id` is range-checked **only** as
+            // an unsigned integer — `term_to_Uint64` with **no** zero test
+            // (`dist.c:2320-2322`) — so an ACK carrying id `0` is a legitimate wire
+            // message and is accepted here. The C's "id `0` ⇒ send no ack" rule is a
+            // *signal*-layer rule, not a wire form: `reply_dist_unlink_ack` returns
+            // without writing anything when `sdulnk->id == 0`
+            // (`erl_proc_sig_queue.c:2753-2791`, "'id' is zero if the other side not
+            // understand unlink-ack signals"), and the wire never carries a zero-id
+            // `DOP_UNLINK_ID` for it to answer in the first place. Endpoints as in
+            // the arm above.
+            Delivery::UnlinkIdAck { id, from, to } => {
+                if !is_uint(*id) {
+                    return Err(BeamError::BadArg);
+                }
+                if !unlink_endpoints_ok(*from, *to, link) {
                     return Err(BeamError::BadArg);
                 }
             }
@@ -1053,14 +1056,57 @@ fn is_internal_ref(x: Eterm) -> bool {
     internal_ref_id(x).is_ok()
 }
 
+/// The **endpoint** checks shared by `DOP_UNLINK_ID` and `DOP_UNLINK_ID_ACK`
+/// (`dist.c:2296-2309` / `2318-2333`): `From` must be an external pid of this
+/// link's peer (`is_not_external_pid(from) ||
+/// dep != external_pid_dist_entry(from)`), and `To` a local pid — with the C's
+/// *literal* old-incarnation escape hatch, which compares **`from`'s** node
+/// against this node rather than `to`'s (`erts_this_dist_entry ==
+/// external_pid_dist_entry(from)`, `dist.c:2304-2306` / `2330-2332`).
+///
+/// The two opcodes spell those three steps identically, so they live here once;
+/// the two validator arms differ only in their `Id` rule.
+fn unlink_endpoints_ok(from: Eterm, to: Eterm, link: &LinkIdentity) -> bool {
+    // `is_not_external_pid(from)`: a non-external `from` has no node at all.
+    let from_node = match external_pid_node(from) {
+        Some(node) => node,
+        None => return false,
+    };
+    // `dep != external_pid_dist_entry(from)` — the anti-spoof check.
+    if from_node != link.peer_node {
+        return false;
+    }
+    // LITERAL C QUIRK, mirrored on purpose: the escape hatch compares **`from`'s**
+    // distribution entry against this node — not `to`'s — (`dist.c:2304-2306` and
+    // `dist.c:2330-2332`), so the term compared against `local_node` here is
+    // `from`'s node, exactly as the C does it. Otherwise `To` must be a local pid
+    // (`is_not_internal_pid(to)`, `dist.c:2307`/`2331`).
+    is_internal_pid(to) || (is_external_pid(to) && from_node == link.local_node)
+}
+
 /// A non-zero, non-negative **small** integer — the C's `term_to_Uint64(…) &&
-/// id != 0` (`dist.c:2291-2295`).
+/// id != 0` (`dist.c:2291-2295`, the `DOP_UNLINK_ID` id).
+///
+/// The ACK form's rule is looser (no zero test, [`is_uint`], `dist.c:2320`).
 ///
 /// A bignum id, which the C's `term_to_Uint64` also accepts, is **out of scope for
 /// this safe path** (there is no safe bignum accessor at this layer) and is
 /// reported as a violation rather than guessed at.
 fn is_nonzero_uint(x: Eterm) -> bool {
     is_small(x) && signed_value(x) > 0
+}
+
+/// A non-negative **small** integer — the C's bare `term_to_Uint64` with **no**
+/// value restriction (`dist.c:2320-2322`, the `DOP_UNLINK_ID_ACK` id), so a zero
+/// id is inside the domain.
+///
+/// A **bignum** id, which the C's `term_to_Uint64` accepts — and which
+/// `erts_dsig_send_unlink` itself emits once the id exceeds `MAX_SMALL` — is still
+/// a typed [`BeamError::BadArg`] here: there is no safe bignum accessor at this
+/// layer, and an honest refusal beats an approximation. A negative value is a
+/// violation on both forms (`term_to_Uint64` is unsigned).
+fn is_uint(x: Eterm) -> bool {
+    is_small(x) && signed_value(x) >= 0
 }
 
 /// Reads the `Flags` field of `DOP_SPAWN_REPLY` as an [`DistSpawnFlags`] word.
@@ -1380,6 +1426,69 @@ mod tests {
         );
         assert!(matches!(
             Delivery::classify_validated(&remote_target, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn the_unlink_id_family_applies_a_different_id_rule_per_opcode() {
+        let (mut heap, mut atoms, link) = setup();
+        let from = pid_on(&mut heap, &mut atoms, PEER);
+        let to = local_pid();
+
+        // `DOP_UNLINK_ID`: `term_to_Uint64` **and** `id != 0` (`dist.c:2291-2295`),
+        // so a zero id is the C's `invalid_message`.
+        let zero_id = msg(Dop::UnlinkId, vec![make_small(0), from, to]);
+        assert_eq!(
+            Delivery::classify(&zero_id).expect("classify is shape-only"),
+            Delivery::UnlinkId { id: make_small(0), from, to },
+            "the unchecked view still yields the id-0 UnlinkId delivery",
+        );
+        assert!(matches!(
+            Delivery::classify_validated(&zero_id, &link),
+            Err(BeamError::BadArg)
+        ));
+        // The same message with a non-zero id validates.
+        let one_id = msg(Dop::UnlinkId, vec![make_small(1), from, to]);
+        assert_eq!(
+            Delivery::classify_validated(&one_id, &link).expect("a non-zero id validates"),
+            Delivery::UnlinkId { id: make_small(1), from, to },
+        );
+
+        // `DOP_UNLINK_ID_ACK`: `term_to_Uint64` alone (`dist.c:2320-2322`) — there
+        // is **no** zero test, so an id of `0` is a legitimate acknowledgement.
+        let ack_zero = msg(Dop::UnlinkIdAck, vec![make_small(0), from, to]);
+        assert_eq!(
+            Delivery::classify_validated(&ack_zero, &link)
+                .expect("a zero-id unlink-ack validates"),
+            Delivery::UnlinkIdAck { id: make_small(0), from, to },
+        );
+        assert_eq!(
+            Delivery::classify(&ack_zero).expect("shape-only view"),
+            Delivery::UnlinkIdAck { id: make_small(0), from, to },
+        );
+
+        // `term_to_Uint64` is unsigned: a negative id is a violation on **both**
+        // forms (including the ACK's looser zero-allowing rule).
+        let ack_negative = msg(Dop::UnlinkIdAck, vec![make_small(-1), from, to]);
+        assert!(matches!(
+            Delivery::classify_validated(&ack_negative, &link),
+            Err(BeamError::BadArg)
+        ));
+
+        // The endpoints are validated identically on both forms: a `from` naming a
+        // third node is a spoof whichever id rule applies (`dist.c:2299-2302` /
+        // `2325-2328`), and a non-local `to` is `is_not_internal_pid(to)`
+        // (`dist.c:2304-2309` / `2330-2335`).
+        let spoofed_ack =
+            msg(Dop::UnlinkIdAck, vec![make_small(0), pid_on(&mut heap, &mut atoms, OTHER), to]);
+        assert!(matches!(
+            Delivery::classify_validated(&spoofed_ack, &link),
+            Err(BeamError::BadArg)
+        ));
+        let remote_to = msg(Dop::UnlinkIdAck, vec![make_small(0), from, make_small(1)]);
+        assert!(matches!(
+            Delivery::classify_validated(&remote_to, &link),
             Err(BeamError::BadArg)
         ));
     }

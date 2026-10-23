@@ -34,7 +34,10 @@
 //!   [`Connection::recv_delivery`]/[`ConnectionDriver::next_delivery`] still accept
 //!   it (no regression);
 //! * a `DOP_MONITOR_P` with a real external-pid `watcher` validates, while a
-//!   small-int stand-in in the watcher slot is rejected.
+//!   small-int stand-in in the watcher slot is rejected;
+//! * the OTP-26+ unlink-id family applies the C's **two different** id rules over
+//!   the wire — `DOP_UNLINK_ID` rejects `id == 0` as `invalid_message`, while
+//!   `DOP_UNLINK_ID_ACK` accepts it — and neither half ever writes a reply.
 //!
 //! Everything here is hermetic: two endpoints of *this* crate over a real loopback
 //! `TcpStream` ([`TcpListener`]/[`TcpTransport`]), or two [`ConnectionDriver`]s
@@ -55,7 +58,7 @@ use beam_common::BeamError;
 use beam_dist::flags::Dop;
 use beam_dist::{
     Connection, ConnectionDriver, Delivery, DeliveryOutcome, Dispatched, DriverState, InboundSink,
-    TcpListener, TcpTransport,
+    LocalIdentity, TcpListener, TcpTransport,
 };
 use beam_term::prelude::{make_atom, make_small, Eterm};
 use beam_term::AtomTable;
@@ -407,4 +410,97 @@ fn the_driver_dispatch_inbound_checked_routes_every_validated_message() {
     assert!(dispatched.iter().all(|d: &Dispatched| matches!(d.delivery, Delivery::Link { .. })));
     assert!(dispatched.iter().all(|d| d.outcome == DeliveryOutcome::Delivered));
     assert_eq!(sink.delivered.len(), 2);
+}
+
+/// The OTP-26+ unlink-id family, over a real wire: the C applies **two different**
+/// id rules (`DOP_UNLINK_ID` rejects `id == 0` as `invalid_message`,
+/// `dist.c:2291-2295`; `DOP_UNLINK_ID_ACK` only range-checks the id as a `Uint64`,
+/// `dist.c:2320-2322`), and neither half owes the peer a reply.
+///
+/// The C's "id `0` ⇒ send no ack" rule is a *signal*-layer rule inside
+/// `reply_dist_unlink_ack` (`erl_proc_sig_queue.c:2753-2791`), never a wire form —
+/// the wire cannot deliver a zero-id `DOP_UNLINK_ID` to it at all. This crate has no
+/// `DOP_UNLINK_ID_ACK` reply path, so the two `take_output()` pins below assert the
+/// whole crate's behaviour: a rejected unlink id and a delivered unlink-ack both
+/// leave the wire silent.
+#[test]
+fn the_driver_applies_the_c_id_rule_per_unlink_opcode_and_never_replies() {
+    let (mut alpha, mut beta) = establish_drivers();
+
+    let mut beta_atoms = AtomTable::new();
+    let mut beta_heap = Heap::new(1 << 16).expect("client heap");
+    // `from` is an external pid of the peer (the C's `dep` check).
+    let from = external_pid(&mut beta_heap, &mut beta_atoms, BETA_NAME);
+    // `to` names **this** node, as a real peer writes it. The receiver decodes it to
+    // an internal pid once a `LocalIdentity` is installed, which is the only `to`
+    // shape the C accepts for a live local process (`is_not_internal_pid(to)`,
+    // `dist.c:2307`).
+    let to = make_external_pid(
+        &mut beta_heap,
+        make_atom(beta_atoms.intern(ALPHA_NAME)),
+        9,
+        1,
+        ALPHA_CREATION,
+    )
+    .expect("materialize a this-node pid");
+
+    // A zero-id `DOP_UNLINK_ID` (`dist.c:2284`): the C's `invalid_message`.
+    beta.send_control(Dop::UnlinkId, &[make_small(0), from, to], &beta_atoms)
+        .expect("send a zero-id DOP_UNLINK_ID");
+    alpha.feed(&beta.take_output());
+    alpha.step().expect("server step");
+
+    let mut alpha_atoms = AtomTable::new();
+    let mut alpha_heap = Heap::new(1 << 16).expect("server heap");
+    let identity = LocalIdentity::intern(&mut alpha_atoms, ALPHA_NAME.as_bytes(), ALPHA_CREATION)
+        .expect("intern this node's identity");
+    alpha.set_local_identity(identity);
+    // Drain any handshake residue so the `take_output()` pins below are about the
+    // *message*, not the `'N'`/`'s'`/`'r'`/`'a'` exchange that preceded it.
+    let _ = alpha.take_output();
+
+    let err = alpha
+        .next_delivery_checked(&mut alpha_heap, &mut alpha_atoms)
+        .expect_err("a zero-id DOP_UNLINK_ID is the C's invalid_message");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert!(
+        alpha.take_output().is_empty(),
+        "a rejected zero-id unlink id owes the peer no acknowledgement",
+    );
+
+    // The very same endpoints with a non-zero id DO validate on this link, so the
+    // rejection above is the id rule and nothing else.
+    beta.send_control(Dop::UnlinkId, &[make_small(1), from, to], &beta_atoms)
+        .expect("send a non-zero-id DOP_UNLINK_ID");
+    alpha.feed(&beta.take_output());
+    alpha.step().expect("server step");
+    let delivery = alpha
+        .next_delivery_checked(&mut alpha_heap, &mut alpha_atoms)
+        .expect("a non-zero unlink id validates")
+        .expect("one queued message");
+    match delivery {
+        Delivery::UnlinkId { id, .. } => assert_eq!(id, make_small(1)),
+        other => panic!("expected Delivery::UnlinkId, got {other:?}"),
+    }
+    assert!(alpha.take_output().is_empty(), "a delivered unlink id owes no reply either");
+    // A zero-id `DOP_UNLINK_ID_ACK` (`dist.c:2315`): accepted — no zero test.
+    beta.send_control(Dop::UnlinkIdAck, &[make_small(0), from, to], &beta_atoms)
+        .expect("send a zero-id DOP_UNLINK_ID_ACK");
+    alpha.feed(&beta.take_output());
+    alpha.step().expect("server step");
+
+    let delivery = alpha
+        .next_delivery_checked(&mut alpha_heap, &mut alpha_atoms)
+        .expect("a zero-id unlink-ack is structurally valid")
+        .expect("one queued message");
+    match delivery {
+        Delivery::UnlinkIdAck { id, .. } => {
+            assert_eq!(id, make_small(0), "the zero id is carried verbatim");
+        }
+        other => panic!("expected Delivery::UnlinkIdAck, got {other:?}"),
+    }
+    assert!(
+        alpha.take_output().is_empty(),
+        "a delivered unlink-ack owes the peer no reply",
+    );
 }
