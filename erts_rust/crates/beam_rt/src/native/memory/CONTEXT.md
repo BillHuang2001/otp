@@ -51,7 +51,8 @@ A **fun-bodied** process with no resolved local target, a never-scheduled pid an
 Residuals: the door's `initial_call` is the process's **entry MFA** where the oracle answers `{erlang,apply,2}` for some spawn shapes, and the slot is runtime-wide, so a **nested** fun-applied run reads the **outer** machine's position (`../../../tests/position.rs`).
 
 ### Honest typed `unsupported` items
-Valid oracle names whose gap reason names the missing accessor/hook: `backtrace` (no raw/binary stack-dump accessor), `magic_ref` (the NIF resource API is unbound), `parent`/`label` (no such PCB field), `priority_messages` (no such `beam_process::ProcessFlags`), `garbage_collection_info` (`beam_gc::HeapInfo` measures no per-generation block sizes).
+`backtrace` is the **one** remaining gap (`UNSUPPORTED_ITEMS == ["backtrace"]`): it names the missing raw/binary stack-dump accessor — the engine builds only the cooked `current_stacktrace` list, never the C's `erts_stack_dump` binary.
+`parent`, `label`, `priority_messages`, `magic_ref` and `garbage_collection_info` are **served**; the three carrying a decision or a caveat are the three sections below.
 
 ### The heap-size items are oracle figures, not this runtime's own
 `heap_size` is the nursery's capacity, which is the process's own `min_heap_size` (`HeapPolicy::initial_heap_words`), so the default is the oracle's 233, `+hms 4000` answers 4185 and a `spawn_opt` `{min_heap_size,N}` is floored by the emulator's `+hms` and reported.
@@ -63,7 +64,20 @@ Both are pinned against the live oracle by `../../../tests/min_heap_size.rs`.
 `status` is `running` for the caller (single-threaded), else the process's `ProcessState`.
 `message_queue_data` is `on_heap` (the queue is heap-resident), with an **explicit** `process_flag(message_queue_data, off_heap)` accepted-and-ignored.
 `trace` is the **live** tracee-flag **bitmask** integer (`0` while untraced), never `trace_info(P, flags)`'s atom list.
-The one outright divergence is **`last_calls`** — hard-coded `false` while `Process::save_calls()` holds a real flag (`mod.rs:803`).
+
+### `last_calls` — the `save_calls` ring
+Three oracle-verified states: the bare atom `false` while no buffer is armed (`process_flag(save_calls, 0)` disarms and answers `false`), the empty list `[]` while armed and empty, else the ring rendered in **recorded order (oldest first)**. The C's `ERTS_PI_IX_LAST_CALLS` (`erl_bif_info.c:2183-2225`) walks the ring newest-first (`j = scb->cur - i - 1`) but `CONS`-prepends each term, so the answer it returns is chronological and the querying `{erlang,process_info,2}` is **last**. Entries are `{M,F,A}` triples plus the bare atoms `send`, `'receive'`, `timeout`.
+Record sites: `{M,F,A}` from `RuntimeContext::resolve_external_call` (both execution tiers); `'receive'`/`timeout` from the mailbox seam (`Runtime::record_saved_receive` in `receive_remove`, `record_saved_pseudo` in `receive_reset`); `send` from `Runtime::record_saved_send`, called by the one send funnel `crate::context::send::send_message_with_off_heap` for every non-remote destination (and on its `badarg` arm, the C's final `else`) — it pushes the `{erlang,send,2}` call entry first unless the ring already ends with it, which absorbs the BIF route's own entry. The compiled `send` instruction mirrors `call_light_bif` for `erlang:send/2` (`jit/x86/instr_bif.cpp` `RET = imm(send_2)`), so the call entry is recorded at the instruction and only the pseudo entry comes from the funnel; the C's `save_calls(p, &exp_send)` happens once per local send whichever route reached `do_send`. The three remote arms (`RemotePid`/`RemoteAlias`/`RemoteName`) record nothing, going through `remote_send`, which never touches `save_calls`.
+The ring lives on `Runtime` (`saved_calls(&pid)`, armed by `arm_saved_calls`) keyed by pid, so a parent reads an armed idle child's ring — `[{erlang,send,2}, send]` for the spawner's own `!` into it — and re-arming resets it.
+This runtime records **every** `call_ext`, so its ring is a **superset** of the oracle's: the oracle drops calls by peephole (`lists:reverse/1`, `lists:sort/1`, `lists:append/2` with an unused result are frequently absent there, `lists:sum/1` present). Superset, never a wrong entry.
+
+### `parent` — the recorded spawner, else the `init` stand-in
+`parent` is the recorded spawner (`Runtime::set_parent`, applied by every spawn path: `spawn_in_pass`, the direct `spawn_export_child_with_policy` arm and the fun-spawn arm), so a grandchild names the **middle** process, as the oracle does.
+A process this runtime did not see spawned answers `Runtime::init_pid`: a pid **drawn first** from the process table (`processes.alloc_pid()?`, before the root's `processes.spawn(system_spawn_policy(..))`), so it renders as the oracle's `<0.0.0>` and the root moves to `<0.1.0>`. Nothing runs behind it — absent from `processes/0`, no heap, never receives.
+Why a stand-in rather than the root pid: on the oracle the `-eval` root's parent is `init` `<0.0.0>`, which is **not** itself, while here the `-eval` action already runs in a child of the root (`Runtime::as_action_process`) and the root plays `init` for `whereis(init)`. Answering the root's own pid would make `element(2, process_info(self(), parent)) =:= self()` true, which the oracle answers `false`; a distinct table identity satisfies the relation without fabricating a term.
+
+### `garbage_collection_info` — the eleven figures
+The oracle's ordered eleven-pair proplist (integer values from `GcInfo`): `old_heap_block_size, heap_block_size, mbuf_size, recent_size, stack_size, old_heap_size, heap_size, bin_vheap_size, bin_vheap_block_size, bin_old_vheap_size, bin_old_vheap_block_size`. Three are honest `0`s — see Known Issues.
 
 ### `registered_name` is the queried process's
 `registered_name` is the truth of the **queried** process (resolved by pid, never the caller's), which is what makes the `-eval`/`-s`/`-run` action routes agree with the oracle.
@@ -107,13 +121,6 @@ The dispatch-level pin is `tests.rs::registered_name_is_the_queried_processes_na
   high-water mark), and `bin_old_vheap_size` (one bin vheap per process, no old generation for it).
   `bin_vheap_block_size`/`bin_old_vheap_block_size` are the heap policy's `min_bin_vheap_words`, the
   block size the off-heap reclaimer is installed with (`p->bin_vheap_sz`/`p->bin_old_vheap_sz` in the C).
-- `last_calls` records `{M,F,A}` for every `call_ext*` (both execution tiers, via
-  `RuntimeContext::resolve_external_call`), plus the `'receive'`/`timeout` pseudo entries from the
-  mailbox seam. The `send` pseudo entry is **not** recorded yet: this runtime's send funnel
-  (`crate::context::send::classify_send_destination`) decides the destination from `&Runtime`, so no
-  mutable runtime is in hand at the point the C calls `save_calls(p, &exp_send)`. An explicit
-  `erlang:send/2` still appears as its own `{erlang,send,2}` triple (it is a `call_ext`).
+- `last_calls`' ring is a **superset** of the oracle's (every `call_ext` is recorded; the oracle's
+  peephole drops some) — see the section above.
 - `backtrace` remains the only `process_info/2` item in `UNSUPPORTED_ITEMS`.
-- `parent` reports this runtime's root pid for a process with no recorded spawner (the `-eval`/`-s`/`-run`
-  process and anything spawned through a path that does not record one) — the stand-in for `init`, the
-  same divergence class as `group_leader`.
