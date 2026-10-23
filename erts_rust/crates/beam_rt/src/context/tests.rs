@@ -9898,7 +9898,8 @@ fn assert_badfun(error: BeamError, what: &str) {
 /// `expand_error_value` half (`{badfun, F}`) is built by the engine at `call_fun`, which is where
 /// the applied fun is still a re-readable `FunSource` (see [`crate::error::bad_fun`]). The
 /// end-to-end shape, `{badfun, F}` with `F =:= G`, is pinned by the integration suite
-/// `tests/decoded_fun_badfun.rs` on both execution tiers.#[test]
+/// `tests/decoded_fun_badfun.rs` on both execution tiers.
+#[test]
 fn an_imported_fun_naming_no_lambda_raises_badfun() {
     let Some(erlc) = resolve_erlc() else {
         skip_loudly(
