@@ -90,14 +90,23 @@
 //! [`CHILD_DEADLINE`] is a **hard failure**, never a skip.
 //!
 //! A child of one of these classes is **sub-millisecond**, so a 15 ms poll can only bracket its
-//! start: the polled figure is a *lower bound* and the **reported** peak RSS is the child's own
-//! `VmHWM` read at its exit ([`Row::self_kb`]), which is the same kernel counter read in-process
-//! (`offheap_retention.rs:132`). Both are printed, and the invariant that ties them —
-//! `polled <= self`, because `VmHWM` never decreases — is asserted.
+//! start. The child reads its own `VmHWM` ([`Row::self_kb`]) — the same kernel counter, read
+//! in-process (`offheap_retention.rs:132`) — but it reads it *before* it formats and prints its row
+//! and before the test harness tears the process down, either of which can still fault a page in;
+//! the parent's poll, by contrast, runs until the child is gone. The two figures are therefore the
+//! **same monotonic quantity sampled at different instants**, and neither bounds the other: a
+//! parent sample taken after the child's own read is legitimately *higher*, and a poll that
+//! bracketed only the child's start is legitimately *lower*.
+//! The **reported** per-arm peak RSS is the union of the two observations,
+//! `peak_rss_kib = max(self_kb, polled peak)` ([`ChildRun::peak_rss_kib`]); that is the figure the
+//! rows print and the estimator pairs, and only its *definition* is asserted (plus, when the parent
+//! took at least one sample, that the sample is nonzero — a broken poll must not pass silently).
 //! The honest caveat: at these `N`s a child's resident set is dominated by the test binary's own
-//! image (~3.5 MB, identical for both arms), so the RSS column carries **no strategy signal**;
-//! the figure that does is [`HeapFootprint`](beam_gc::HeapFootprint)'s reserved-capacity bytes,
-//! which is printed per row and is exactly the two generations' words.
+//! image (~3.4–3.6 MB, identical for both arms) on the `churn` and `copy_out` classes, so there
+//! the RSS column carries **no strategy signal**; on `growth` the heap is large enough for the
+//! figure to be strategy-driven. The footprint axis for the small classes is
+//! [`HeapFootprint`](beam_gc::HeapFootprint)'s reserved-capacity bytes, which is printed per row and
+//! is exactly the two generations' words.
 //! Without procfs the peak RSS is reported as `0`/`n/a` behind a loud warning; the deterministic
 //! counters the assertions read are unaffected, so the sweep never degrades into a silent pass.
 //!
@@ -148,7 +157,10 @@
 //!    (whole-row equality over every counter, so no `1.000x` claim rests on rounding).
 //!
 //! Everything else — wall time, peak RSS, `words_copied`, `objects_copied`, occupancy, capacity —
-//! is **printed only**: those are the measurements, not invariants.
+//! is **printed only**: those are the measurements, not invariants. The peak RSS column has one
+//! assertion of its own and it is only the *definition* of the composite (see the RSS paragraph
+//! above) plus "a poll that sampled the child observed something"; no RSS figure or ratio is ever
+//! bounded, compared or trended.
 //!
 //! `N` is **scaled on `cfg!(debug_assertions)`** ([`N_RELEASE`] / [`N_DEBUG`]) so the file fits its
 //! budget in both profiles (≤ ~10 s release, ≤ ~60 s debug); every assertion is a function of the
@@ -296,10 +308,12 @@ fn source_name(source: MatureSource) -> &'static str {
 
 /// Everything one measured arm reports: the collector's counters, the live-set verification, the
 /// geometry the footprint accounts, the strategy that was really in effect, and the two figures
-/// that are printed but never asserted (wall time, and the child's own `VmHWM`).
+/// that are printed but never asserted (wall time, and the child's own `VmHWM` — one half of the
+/// run's reported peak RSS).
 ///
 /// The child prints it as one `ROW key=value …` line; the parent parses those keys back into this
-/// struct and adds the one figure it observed itself (the polled peak `VmHWM`).
+/// struct and joins the figure it observed itself (its polled peak `VmHWM`) to make a
+/// [`ChildRun`], whose `peak_rss_kib` is the larger of the two.
 #[derive(Debug, Clone)]
 struct Row {
     /// The class this arm measured.
@@ -368,9 +382,11 @@ struct Row {
     intact: bool,
     /// The child's measured wall time in milliseconds — printed, never asserted.
     wall_ms: f64,
-    /// The child's own `VmHWM` at exit, in kB — the **true** peak RSS of the arm, because
-    /// `/proc/self/status` is the kernel's monotonic high-water mark and the child reads it after
-    /// all of its measured work. This is the reported RSS figure.
+    /// The child's own `VmHWM`, in kB, read in-process *before* it prints its row and exits.
+    ///
+    /// One half of the reported peak: [`ChildRun::peak_rss_kib`] is the larger of this and the
+    /// parent's polled samples (see the module docs — the two are the same monotonic counter read at
+    /// different instants, so neither bounds the other).
     self_kb: u64,
 }
 
@@ -726,11 +742,18 @@ struct ChildRun {
     row: Row,
     /// The largest `VmHWM` (kB) sampled while the child lived — the kernel's monotonic watermark.
     ///
-    /// The child of a class like these is **sub-millisecond**, so a polled sample set is a *lower
-    /// bound*: it can only ever be at most the child's own exit-time reading ([`Row::self_kb`],
-    /// which is the reported peak). It is kept and printed because it is the house protocol and
-    /// because it independently confirms the figure's order of magnitude.
+    /// The child of a class like these is **sub-millisecond**, so a polled sample set can bracket
+    /// only its start and is often well below the child's own reading ([`Row::self_kb`]) — but the
+    /// poll runs for as long as the child lives, so a sample taken after the child's own read is
+    /// legitimately *higher*. Neither figure bounds the other (module docs).
     peak_kib: u64,
+    /// The **reported** peak RSS of the arm, in kB: the union of the two observations,
+    /// `max(row.self_kb, peak_kib)`.
+    ///
+    /// Computed here, where the run is assembled, so every consumer (the printed rows, the
+    /// estimator, the noise floor) reads one figure and cannot accidentally re-derive a narrower
+    /// one. It is a measurement, never an invariant: no assertion compares it with another arm's.
+    peak_rss_kib: u64,
     /// How many `/proc/<pid>/status` samples contributed (`0` ⇒ no procfs, or the run was missed).
     hwm_samples: usize,
     /// `/proc/loadavg` immediately before the child was spawned.
@@ -879,6 +902,7 @@ fn run_child(job: &ChildJob<'_>) -> ChildRun {
     assert_eq!(row.n, job.n, "the child ran the N it was asked for");
     assert_eq!(row.round, job.round, "the child reported the round it was asked for");
     ChildRun {
+        peak_rss_kib: row.self_kb.max(peak_kib),
         row,
         peak_kib,
         hwm_samples,
@@ -952,14 +976,23 @@ fn assert_arm(class: &str, round: usize, run: &ChildRun) {
     let row = &run.row;
     let where_ = format!("class {class}, round {round}, arm {}", row.arm.name());
 
-    // 0. The two RSS readings are consistent: `VmHWM` is monotonic for a process's whole life, so
-    //    no polled sample can exceed the child's own exit-time reading.
-    assert!(
-        run.peak_kib <= row.self_kb,
-        "{where_}: the parent's polled peak ({} kB) cannot exceed the child's own exit-time \
-         VmHWM ({} kB)",
-        run.peak_kib,
-        row.self_kb
+    // 0. The reported peak RSS is the *union* of the two observations, and a poll that did sample
+    //    the child observed something. There is deliberately no ordering invariant between them:
+    //    the child reads its own `VmHWM` before it prints and exits while the parent keeps
+    //    sampling until the child is gone, so either figure may be the larger (module docs).
+    if run.hwm_samples > 0 {
+        assert!(
+            run.peak_kib > 0,
+            "{where_}: the parent took {} VmHWM samples of the child and every one read 0 kB — the \
+             poll is broken",
+            run.hwm_samples
+        );
+    }
+    assert_eq!(
+        run.peak_rss_kib,
+        row.self_kb.max(run.peak_kib),
+        "{where_}: the reported peak RSS must be the union of the child's own VmHWM and the \
+         parent's polled peak, not one arm's figure"
     );
     // 1. The arm was real, and its pin was recorded.
     assert_eq!(
@@ -1144,7 +1177,8 @@ fn assert_pair(class: &str, round: usize, copying: &Row, immix: &Row) {
 // ---------------------------------------------------------------------------------------------
 
 /// Prints one arm's row: the machine-readable line first (unindented, so it is greppable and
-/// re-parseable), then a human line with the kernel's and the child's own peak RSS attached.
+/// re-parseable), then a human line carrying the reported peak RSS — the union of the child's own
+/// `VmHWM` and the parent's polled samples — beside the parent's polled figure alone.
 fn print_arm_row(run: &ChildRun) {
     println!("{}", run.row.to_line());
     let row = &run.row;
@@ -1176,7 +1210,7 @@ fn print_arm_row(run: &ChildRun) {
         row.live_roots,
         row.live_words,
         row.intact,
-        row.self_kb,
+        run.peak_rss_kib,
         run.peak_kib,
         row.wall_ms,
     );
@@ -1217,7 +1251,7 @@ impl Paired {
         let row = &run.row;
         match name {
             "wall_ms" => row.wall_ms,
-            "peak_rss_kib" => row.self_kb as f64,
+            "peak_rss_kib" => run.peak_rss_kib as f64,
             "polled_kib" => run.peak_kib as f64,
             "collections" => row.collections as f64,
             "minors" => row.minors as f64,
