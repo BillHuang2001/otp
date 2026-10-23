@@ -103,7 +103,8 @@
 //! The remaining refusals (`TermError::NotATerm`, and `BadFun` for a forged fun block)
 //! reject input that is not a term at all.
 //!
-//! # Pinned against the OTP 29 oracle//!
+//! # Pinned against the OTP 29 oracle
+//!
 //! * `1 == 1.0` ⇒ `true`, `1 =:= 1.0` ⇒ `false`.
 //! * `1 < 1.0` ⇒ `false`, `1 =< 1.0` ⇒ `true`.
 //! * `a < {a}` ⇒ `true` (atom sorts before tuple in the term order).
@@ -292,7 +293,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// rather than being collapsed into a plain `badarg` by `From<TermError>`.
 fn hashing_gap(_: TermError) -> BeamError {
     unsupported_bif()
-}/// `phash_2`'s `Range` argument (`bif.c:5376-5385`) — the `Uint32` modulus, or `0`
+}
+
+/// `phash_2`'s `Range` argument (`bif.c:5376-5385`) — the `Uint32` modulus, or `0`
 /// for the special `2^32` range.
 ///
 /// # Errors

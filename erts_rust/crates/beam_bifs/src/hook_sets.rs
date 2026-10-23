@@ -1118,7 +1118,8 @@ mod tests {
     /// `src/binconv.rs`/`src/term_conv.rs`, the two legacy hash ports in
     /// `src/compare.rs`, the fun-taking surface across
     /// `src/lists.rs`/`src/maps.rs`/`src/ets/adopt.rs` — and catches a key listed
-    /// under the wrong module (a typo, or a BIF that moved).    #[test]
+    /// under the wrong module (a typo, or a BIF that moved).
+    #[test]
     fn subset_tables_are_contained_in_their_defining_modules() {
         let cases: &[(&str, &[(&str, &str, u32)], &[fn(&mut BifRegistry)])] = &[
             (
@@ -1136,7 +1137,8 @@ mod tests {
                     crate::io::register,
                     crate::compare::register,
                 ],
-            ),            (
+            ),
+            (
                 "PORT_HOOK_BIFS",
                 PORT_HOOK_BIFS,
                 &[crate::port::register, crate::runtime::register],
@@ -1322,7 +1324,8 @@ mod tests {
             aggregate, 226,
             "the documented seam surface is 226 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
-        );    }
+        );
+    }
 
     /// The registration bodies are **pairwise disjoint**: [`BifRegistry::register`]
     /// keeps the *last* implementation registered for a key, so an overlap between two

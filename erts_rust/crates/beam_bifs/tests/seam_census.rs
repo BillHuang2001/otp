@@ -1375,7 +1375,8 @@ fn the_class_b_rows_are_the_seam_union_minus_the_documented_defaults() {
         overlap, encoders,
         "the class-D rows that a class-B table lists must be exactly the four \
          `LOCAL_FUN_IDENTITY_BIFS` encoders plus its three hash ports"
-    );    assert!(
+    );
+    assert!(
         overlap.is_subset(&local_fun_identity),
         "every overlapping class-D row must be a `LOCAL_FUN_IDENTITY_BIFS` member"
     );
@@ -1432,7 +1433,8 @@ fn the_class_counts_are_pinned() {
         (Class::B, 211),
         (Class::C, 23),
         (Class::D, 11),
-    ];    for (class, expected) in counts {
+    ];
+    for (class, expected) in counts {
         assert_eq!(
             rows_of(class).count(),
             expected,
