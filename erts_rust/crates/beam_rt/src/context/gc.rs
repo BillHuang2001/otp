@@ -237,6 +237,61 @@ pub(crate) fn bump(heap: &mut Heap, n: usize, fill: &[Eterm]) -> Result<*mut Ete
     Ok(base)
 }
 
+/// How many placeholder words [`plain_bump`] can fill from its **static** slice — i.e. the
+/// largest block (`PLAIN_BUMP_FILL_WORDS + 1` words) the allocation doors' fast arm serves
+/// without asking the runtime for a pooled scratch slice.
+///
+/// The engine's per-cons-cell reservations are two words (one placeholder), so this is two
+/// orders of magnitude of headroom; a larger request simply takes the door's cold path, which
+/// fills from [`Runtime::gc_scratch`](crate::runtime::gc) exactly as before.
+const PLAIN_BUMP_FILL_WORDS: usize = 32;
+
+/// [`PLAIN_BUMP_FILL_WORDS`] placeholder words for [`plain_bump`].
+///
+/// Every word is [`NIL`](beam_term::NIL) — an immediate atom, never a heap pointer — so this
+/// static holds no term graph and is deliberately **not** a GC root: the words are overwritten
+/// by the engine before the block they pad is ever reachable, exactly like the pooled scratch
+/// slice [`bump`] fills from. It exists so the fast arm of the allocation doors needs neither a
+/// `&mut Runtime` call nor a `Vec` length test to produce the same placeholder.
+static PLAIN_BUMP_FILL: [Eterm; PLAIN_BUMP_FILL_WORDS] = [beam_term::NIL; PLAIN_BUMP_FILL_WORDS];
+
+/// [`bump`] restricted to a request the frontier can **already** serve, answering `None` — never
+/// an error — for the two refusals [`bump`] would report.
+///
+/// This is the allocation doors' fast arm: it is the same bump (one arityval header word plus
+/// `n - 1` [`NIL`](beam_term::NIL) placeholders, `used` advanced by `n`), with three properties a
+/// per-allocation path wants and the general [`bump`] does not have:
+///
+/// * **no error is constructed** — both refusals are tested here as plain comparisons, so the
+///   `Ok`/`Err` pair [`bump`] returns (whose error variant carries a whole
+///   [`BeamError`](beam_common::BeamError)) never materialises on this path. A `None` is not a
+///   swallowed error: it means "not the fast case", and the caller re-enters [`bump`] itself on
+///   its cold path, where the error is handled exactly as before;
+/// * **no runtime state is touched** — the placeholder comes from [`PLAIN_BUMP_FILL`] rather than
+///   a pooled scratch slice (see [`PLAIN_BUMP_FILL_WORDS`]);
+/// * it moves nothing and collects nothing, which is why it is sound for a process whose
+///   collection is pinned or halted (see [`alloc_words_rooted`]).
+///
+/// The two refusals are [`bump`]'s: a block that does not fit the live frontier
+/// (`n > heap.available()`), and a request whose arity the header cannot express
+/// (`n - 1 >` [`MAX_ARITYVAL`](beam_term::MAX_ARITYVAL), implied here by
+/// [`PLAIN_BUMP_FILL_WORDS`]). A `n == 0` request reserves nothing and is served at the current
+/// pointer, exactly as [`bump`] does.
+#[inline]
+fn plain_bump(heap: &mut Heap, n: usize) -> Option<*mut Eterm> {
+    if n == 0 {
+        return Some(heap.hp());
+    }
+    if n - 1 > PLAIN_BUMP_FILL_WORDS || n > heap.available() {
+        return None;
+    }
+    let base = heap.hp();
+    // The two tests above are exactly `bump`'s refusals, so this bump cannot fail; a `None`
+    // here is unreachable and is answered with the cold path all the same.
+    heap.tuple(&PLAIN_BUMP_FILL[..n - 1]).ok()?;
+    Some(base)
+}
+
 /// Whether `name`'s module may be collected over: `true` only when the module is loaded
 /// **and** contains no float-family instruction.
 ///
@@ -1265,10 +1320,12 @@ pub(crate) fn ensure_heap(
 /// This is the full-root twin of [`ensure_heap`], reached by
 /// `Machine::ensure_heap`/`test_heap`/`allocate_heap` through
 /// [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full).
-/// The gate order is the narrow door's — the latch, the forced-collection request, the
-/// collectability test, the "this door has a caller module" test, the table/process lookup, the
-/// occupancy-or-debt test and the "committed" request consume — and only the root hand-off
-/// differs: it publishes and scatters `roots` — the whole stack plus each register file's
+/// The gates are the narrow door's — the latch, the "this door has a caller module" test, the
+/// table/process lookup, the occupancy-or-debt test, the forced-collection request, the
+/// collectability valve, the unscanned-root valve and the "committed" request consume — but they
+/// are **ordered by cost** (the two context-field reads first, then the process's own price,
+/// then the request/valve probes): see the prologue's comments. Only the root hand-off differs:
+/// it publishes and scatters `roots` — the whole stack plus each register file's
 /// [`pointer_prefix_len`] ([`machine_root_bounds`]) — through
 /// [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
 /// It applies **no caller-module float guard**: because the FR file's pointer-bearing prefix is
@@ -1320,11 +1377,10 @@ pub(crate) fn ensure_heap_full(
     }
     let pid = ctx.mailbox_pid;
     // The two **context-field** tests come first because they are the cheapest possible reads — a
-    // discriminant each — while `gc_request_pending`/`gc_process_enabled` each probe the runtime's
-    // valve sets (three empty-set length compares in the common case, a hash otherwise) and the
-    // process table is a `HashMap` lookup. Both tests are **pure reads** that return `Ok(())`
-    // without touching any runtime state, so their position here is a cost decision, never a
-    // verdict one: every path below still reaches the same gates in the same order.
+    // discriminant each — while the process-table probe and both valve sets are far more
+    // expensive. Both tests are **pure reads** that return `Ok(())` without touching any runtime
+    // state, so their position here is a cost decision, never a verdict one: every path below
+    // reaches the same gates.
     //
     // The door needs a caller module to name at all — a fun entry, or the `-eval` evaluator,
     // has none — and is otherwise left alone. This is **not** a float guard: this door publishes
@@ -1340,11 +1396,6 @@ pub(crate) fn ensure_heap_full(
     if ctx.mailbox_table.is_none() {
         return Ok(());
     }
-    let forced = ctx.runtime.gc_request_pending(pid);
-    if !ctx.runtime.gc_process_enabled(pid) {
-        ctx.runtime.take_gc_request(pid);
-        return Ok(());
-    }
     let RuntimeContext {
         runtime,
         mailbox_table,
@@ -1357,18 +1408,35 @@ pub(crate) fn ensure_heap_full(
     let Some(process) = table.get_mut(pid) else {
         return Ok(());
     };
-    // The **occupancy** test, plus the collector's **collection debt**. The debt term is what a
-    // no-collect [`Process::grow_nursery`] growth leaves behind: it retires the young space it
-    // replaces instead of freeing it, so the nursery becomes a chain holding everything the
-    // earlier spaces ever allocated until a real collection evacuates it. A retained chain
-    // therefore forces the collection even when the *current* space still has room — without
-    // the term, a growth-shaped workload keeps its whole allocation history resident.
+    // The **occupancy** test, plus the collector's **collection debt**, taken **before** any valve
+    // probe: between them they decide the overwhelming majority of admissions on their own, from
+    // state this door already has in hand (the process), and every gate below — the request probe,
+    // the collector valves and the whole collection path — is reachable only when one of them is
+    // set. The debt term is what a no-collect [`Process::grow_nursery`] growth leaves behind: it
+    // retires the young space it replaces instead of freeing it, so the nursery becomes a chain
+    // holding everything the earlier spaces ever allocated until a real collection evacuates it. A
+    // retained chain therefore forces the collection even when the *current* space still has room —
+    // without the term, a growth-shaped workload keeps its whole allocation history resident.
     //
     // The two terms stay disjoint: [`Process::should_collect`] is the occupancy test alone
     // (pinned as such), and the debt is the growth seam's own signal.
+    //
+    // Neither term is an *admission* decision this door may skip a collection for — see
+    // [`collect_or_grow`], whose `should_collect` is literally `available_words() < need_words`,
+    // so the same test answering `true` is what the collector itself would decide.
     let debt = process.collection_debt();
     let occupancy = process.should_collect(heap_need as usize);
-    if !forced && !occupancy && !debt {
+    // A nursery with room and no retained chain has nothing for this door to do unless a
+    // collection was **requested**, so the request probe is taken on that branch alone.
+    if !occupancy && !debt && !runtime.gc_request_pending(pid) {
+        return Ok(());
+    }
+    // Past the short-circuit the door is committed to acting, so `forced` — needed by the
+    // request's consume and by the test-only tallies below — is re-read rather than carried out
+    // of the disjunction above (both probes are pure reads of the same flag).
+    let forced = runtime.gc_request_pending(pid);
+    if !runtime.gc_process_enabled(pid) {
+        runtime.take_gc_request(pid);
         return Ok(());
     }
     // The **pointer-bearing prefix** of each register file, computed **once** (see the module
@@ -1693,6 +1761,20 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 /// unscanned-root valve) leaves the request armed, so the runner's park arm
 /// ([`Runtime::serve_gc_request`](crate::runtime::gc)) may still serve it.
 ///
+/// # The fast arm (no valve, no growth, no collection)
+///
+/// When the running process's frontier still has room for `n` and no collection has been
+/// requested, this door is one [`plain_bump`]: no collector valve, no growth seam, no error, and
+/// nothing moved. That is the whole allocation for the engine's per-term reservations, and it is
+/// sound to skip the valves there because **pinning and halting constrain collections and
+/// growth**, both of which move or retire a space, while a bump only writes at the frontier: a
+/// pinned or halted pid keeps bumping its own young heap — a *scanned* region, which is strictly
+/// better for the unscanned-root valve than the arena that pid used to get — and a refused bump
+/// (no room, or `n` past the static placeholder fill) falls into the cold path below, where the
+/// collector valve, the no-relocation growth seam and the whole collection path are exactly what
+/// they were. See [`plain_bump`] and [`may_replace_young_space`] for why a bump is unaffected by
+/// a valve that only ever forbids *replacing* a young space.
+///
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
@@ -1737,6 +1819,29 @@ pub(crate) fn alloc_words_rooted(
     // reason the collection is: a run with no module to collect for must not consume a
     // request it can never serve.
     let forced = call_site_known && runtime.gc_request_pending(pid);
+    // THE FAST ARM — the overwhelmingly common case, and the only one this door is on a
+    // per-built-term path for: the running process's frontier still has room for `n`, so the
+    // whole allocation is one bump. It is deliberately placed **ahead** of the collector valves
+    // and skips them, for the reason [`plain_bump`] states: pinning and halting constrain
+    // **collections** and **growth** — both of which move or retire a space — while a bump moves
+    // nothing. A pinned or halted process therefore keeps allocating on its own (never collected,
+    // never grown, so never collapsed) young heap instead of being pushed to the pointer-stable
+    // arena, which is also strictly better for the unscanned-root valve: a block served here is
+    // scanned, where an arena block is a container no collection may descend into.
+    //
+    // The forced-request peek above is what keeps this arm honest: a requested collection must
+    // still be served, so an armed request bypasses the bump and takes the collection path below
+    // (see the request/commit-once note on [`Runtime::request_gc`](crate::runtime::Runtime)).
+    // Every other gate of this door — the latch, the caller module, the process table, the
+    // collector valve, the growth valve, the whole collection path — is untouched: a refusal here
+    // simply falls through to it, byte for byte as before.
+    if !forced {
+        if let Some(process) = table.get_mut(pid) {
+            if let Some(block) = plain_bump(process.heap_mut(), n) {
+                return Ok(block);
+            }
+        }
+    }
     if !runtime.gc_process_enabled(pid) {
         // The valves refuse the pid outright (a post-slice float pin, a halt from an earlier
         // failure, or the runtime-wide escape-store valve): the request can never be served,
@@ -1746,8 +1851,11 @@ pub(crate) fn alloc_words_rooted(
         runtime.take_gc_request(pid);
         return runtime.alloc_words(n);
     }
-    // The same attempt `alloc_words` makes: the running process's own young heap. A forced
-    // request **bypasses** it: the block is the collection's to serve, and a bump taken first
+    // The same attempt `alloc_words` makes: the running process's own young heap. Reached only
+    // when the fast arm above declined — the frontier has no room for `n`, or `n` is larger than
+    // the fast arm's static placeholder fill — so this is the cold path's own attempt, which
+    // keeps the pooled-scratch fill (any `n`) and the growth seam below. A forced request
+    // **bypasses** it: the block is the collection's to serve, and a bump taken first
     // would end this call with the request still armed — the exact way a
     // `erlang:garbage_collect()` from a process whose only allocation goes through this seam
     // used to be carried, silently, to the pass boundary.
