@@ -44,9 +44,9 @@
 //! # Why the baseline tier is sound for *any* module
 //!
 //! A step that reports [`Step::Enter`](beam_engine::interpreter) — "continue in *another*
-//! module's code" — was historically the one shape a native tier could not take: a compiled
+//! module's code" — is the one shape a native tier cannot take on its own: a compiled
 //! block's code, label map and literal area are all bound to a single module. The engine's
-//! driver now handles it. A `Step::Enter` (raised by its own interpreter step, or handed back
+//! driver handles it. A `Step::Enter` (raised by its own interpreter step, or handed back
 //! as the `ENTER` word by a compiled `call_ext`/`return`) switches the machine context
 //! (`Machine::switch_context`), rebinds the module / label map / literal area and continues in
 //! the **callee's** compiled blocks — including the first sight of a module the context switch
@@ -85,14 +85,19 @@
 //! [`crate::error::unsupported_reason`] classifies as unsupported — the CLI's exit code 3 when
 //! that raise is the error the action reports — loud, never a silent downgrade to another tier.
 //!
-//! One further engine-side fact bounds what the tier can do: a Cranelift **resume** at an
-//! arbitrary pc is handed no compiled artifact, and the tier has no path that would compile and
-//! bind one at a parked address on demand, so it answers a typed `unsupported` error instead
-//! (`beam_engine`'s `jit::run_cranelift_resume_outcome` is the authority on the current
-//! answer). A slice that runs to completion inside its first slice therefore runs on Cranelift;
-//! a slice that pre-empts on the reduction budget or parks in a `receive` re-enters through that
-//! seam and gets the typed error rather than a downgrade to another tier. See *The tier
-//! survives a suspension* for the mechanism the tier plugs into.
+//! A Cranelift **resume** is an ordinary entry of this tier: `beam_engine`'s
+//! `jit::run_cranelift_resume_outcome` takes the artifact its retained-artifact store hands back
+//! (`beam_engine`'s `jit::cranelift::cache`, keyed by the very `jit::cache::CacheKey` the baseline
+//! tier's own cross-run cache uses — a hit for a module this thread already compiled, a compile
+//! otherwise) and re-enters the parked address through the shared no-reset native resume seam, so
+//! the registers, the Erlang stack and every live call frame survive the suspension. An address
+//! the artifact holds no compiled entry for — most visibly a `wait`/`wait_timeout` suspension pc,
+//! which no block boundary names — advances by the driver's per-instruction interpreter step, the
+//! same deopt every un-lowered instruction already takes. A slice that runs to completion inside
+//! its first slice therefore runs on Cranelift, and one that pre-empts on the reduction budget or
+//! parks in a `receive` continues **on that same tier** — by compiled code, or by that
+//! per-instruction step, never by a typed error and never by a downgrade to another tier. See
+//! *The tier survives a suspension* for the mechanism the tier plugs into.
 //!
 //! # The tier survives a suspension
 //!
@@ -126,9 +131,9 @@
 //! and are re-measured there rather than transcribed here.
 //!
 //! The optional Cranelift hot tier is deliberately **not** the default: it is off in the shipped
-//! build (an extra codegen dependency the standalone runtime does not need to run anything), it
-//! cannot yet re-enter a pre-empted or parked slice, and promoting a tier is a measurement-gated
-//! decision rather than a configuration default. Naming it is how a session opts in.
+//! build (an extra codegen dependency the standalone runtime does not need to run anything), and
+//! promoting a tier is a measurement-gated decision rather than a configuration default. Naming
+//! it is how a session opts in.
 //!
 //! [`BEAM_RT_TIER=interpreter`](JitMode::Interpreter) is the kill switch that pins the
 //! reference tier; every differential-gate baseline is taken there.
