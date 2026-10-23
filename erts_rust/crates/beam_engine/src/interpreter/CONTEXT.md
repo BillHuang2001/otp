@@ -253,32 +253,38 @@ that owns a shared table.
 — the blocking-aware entries report `RunOutcome::Wait`; the non-blocking `run_export`/`run_label` fold it
 (Handoff #1, owner `beam_rt`).
 
-## The local-call seam's memo (`Machine::local_callees`)
+## The local-call seam's verdict table (`Machine::verdict_table`)
 The local-call arm (`dispatch.rs:413-515`, seams at `:429`/`:475`/`:504`) does **not** call the host once per
-call: both the callee identity **and** the host's verdict are memoized per `(module image address, function
-index)` in `Machine::local_callees` (`../machine/local_callee.rs`, `LocalCallees`).
-`Machine::local_call_seam` (`dispatch.rs:1149-1212`) reads it in three phases.
-**Phase 1a, every local call:** `self.local_callees.lookup(module, callee)` — a fixed `CAP = 8` array held
-as a compact 16-byte `keys` array (the only thing the scan reads) plus a parallel `verdicts: [Verdict; 8]`
-byte array. **A hit reorders nothing** (the entry keeps its slot) and only a **miss** inserts — at the front,
-dropping the oldest *insertion* — because the workloads this seam is priced on alternate two callees per
-element (an MRU move-to-front memmoved up to eight entries on *every* call). The lookup returns a **byte**:
-`Unnameable` (the memoized "no function entry / unresolvable name atom" — zero consultations) and `Declined`
-(the host's own earlier `false`) both take the caller's unchanged in-machine jump, `Served` goes straight to
-phase 2.
-**Phase 1b, `Ask` only (once per distinct callee per run):** the host's `resolve_local_call` is asked and the
-answer recorded (`record`), so the hot path makes **no** `dyn` call and never runs the host's `&str` predicate.
-**Phase 2, served only:** the rare path re-derives the names from the `module` **parameter** through
-`local_callee_identity` (`dispatch.rs:1354`), so the `&str`s borrow the module and not `self` and the BIF
-dispatch keeps `&mut self` free; nothing is allocated on either path.
-The memo's key is `(module as *const Module as usize, func)` — the address plus the function index — which is why
-`Machine::reset` (`../machine/registers.rs`) clears it (the entries belong to the run that filled them, and every
-module a run entered is kept alive by the context registry, so no address can be recycled while the memo holds it);
-a resume does not reset.
-The in-crate empirical anchor for the derivation's price is the sibling `LabelMap` cache: ~**5 ns** per BIF call
-for resolving one import's two names against ~**0.5 ns** for the cached hit (`mod.rs:93-111`, `ImportTarget`,
-which stores the two names `Box<str>` **owned** because the map is reached through a bare pointer inside
-`JitRuntime` and cannot carry the module's lifetime) — the template `LocalCallees` follows.
+call: the host's verdict is memoized **per callee function index** in the executing module context's table
+(`../machine/local_callee.rs`, `LocalVerdicts`; context `0` uses the machine-owned
+`Machine::entry_verdicts`).
+`Machine::local_call_seam` (`dispatch.rs:1149-1212`) reads it in phases.
+**Phase 0, every local call:** one `Cell` read of the lazily armed
+`Machine::local_call_invalidation_pending` (only `erlang:load_nif/2` sets it; the out-of-line
+`Machine::invalidate_local_call_verdicts` then clears every context's table).
+**Phase 1, every local call:** `self.verdict_table()` then `table.get(callee)` — **one bounds-checked slot
+load**, no scan, no key compare. The slot is a property of the *callee* rather than of the call history, so
+the alternating two-callee loop this seam is priced on (`sum/1`/`walk/3`) costs exactly what a single-callee
+loop costs; the MRU variant memmoved on every call, and the fixed `CAP = 8` key scan that replaced it still
+left one unpredictable branch per call. The answer is a **byte**: `Unnameable` (the memoized "no function
+entry / unresolvable name atom" — zero consultations) and `Declined` (the host's own earlier `false`) both
+take the caller's unchanged in-machine jump, `Served` goes straight to phase 2, and only `Unknown` asks.
+**Phase 1b, `Unknown` only (once per distinct callee per run, out of line in
+`Machine::ask_local_callee`):** the identity is derived from the `module` **parameter** through
+`local_callee_identity`, the host's `resolve_local_call` is asked and the answer recorded, so the hot path
+makes **no** `dyn` call, never runs the host's `&str` predicate and allocates nothing. A host **error** is
+propagated without recording anything, so the slot stays `Unknown` and the next call asks again — a failure
+is never memoized as a verdict.
+**Phase 2, served only (out of line in `Machine::serve_local_callee`):** the rare path dispatches the callee
+as a BIF under the arm's own frame discipline, which is the only place a `zlib`/`prim_tty` stub reaches
+`call_bif` through this seam.
+The tables belong to the run that filled them, which is why `Machine::reset` (`../machine/registers.rs`)
+clears them *and* the context registry; a resume does not reset. A registered context's table lives in its
+`ModuleContext`, so its identity (which module's functions the indices belong to) is structural — `Contexts`
+dedups by `Arc::ptr_eq`, so a second load of the same `.beam` is a different context with its own table —
+and `LocalVerdicts::describes` (owner image + function count) is re-validated at every `enter_run` and
+debug-asserted by the seam. Slots are `Cell`s because the seam reads the table while the machine holds
+`&Module` borrows and a registered context's table is reached through the shared `Arc`.
 **`Machine::local_call_seam` is the ONE definition of the seam both tiers drive** — the interpreter's three
 local-call arms, `jit/baseline/call.rs::store_continuation` and `jit/baseline/runtime.rs::probe_local_call` — so the
 memo inside it benefits the baseline tier with **zero** `../jit/baseline/**` edits.

@@ -1254,8 +1254,8 @@ fn load_nif_last_module() -> Module {
     fixture.finish()
 }
 
-/// The function index whose label table holds `label`, i.e. the [`CalleeKey`] field the
-/// local-call memo is keyed on (a function may own several labels).
+/// The function index whose label table holds `label`, i.e. the index the local-call verdict
+/// table is addressed by (a function may own several labels).
 fn func_of(module: &Module, label: Label) -> u32 {
     module
         .functions

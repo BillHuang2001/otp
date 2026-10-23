@@ -71,9 +71,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   must be served from; the funnel is `&self`, so it only **arms** a `Cell` flag and the seam clears the verdicts at
   its next local call), and the public `Machine::invalidate_local_call_verdicts` for a host whose answer set changes
   by any other means.
-  A hit never reorders the memo and the keys live in a flat `[CalleeKey; 8]` beside the verdict bytes and the
-  payloads, so the scan is inlined and stays inside two cache lines (a move-to-front policy was measured as an
-  instruction regression: an alternating two-callee loop memmoved on every call). Both tiers drive this one
+  The verdicts live in a **per-module-context index-addressed table** (`LocalVerdicts`: one
+  `Cell<Verdict>` slot per entry of `Module::functions`), so a repeat local call is one bounds-checked slot load —
+  no scan, no key compare, no data-dependent branch; the key-scan predecessors were measured as regressions (a
+  move-to-front variant memmoved on *every* call of an alternating two-callee loop, and the fixed scan that
+  replaced it still left one unpredictable branch per call). Both tiers drive this one
   definition, so the memo needs no `src/jit/**` change. What is **not** legitimate is baking a verdict into
   **compiled code**: `JitBackend::compile(&mut self, module: &Module)` is handed no `ExecutionContext`, and the
   cross-run `CodeCache` is content-keyed and shared across runs, machines and hosts — the memo is a per-machine,

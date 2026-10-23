@@ -193,22 +193,27 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   rejects, returning how many were released, and prunes `writable_payloads` in lockstep). It is a separate
   file to keep both modules under the line budget; a child module of `machine` sees the parent's fields.
   Detail: `## The off-heap refc-binary retention seam`.
-- `local_callee.rs` — the **local-call memo** `Machine::local_callees` (`LocalCallees`, `CalleeKey`,
-  `CalleeTarget`, `Verdict`): **both** halves of what the local-call seam
-  (`../interpreter/dispatch.rs::local_call_seam`) needs — the `(module name, function name, arity)`
-  derivation *and* the host's `resolve_local_call` verdict — memoized per `(module address, function
-  index)` in a fixed `CAP = 8` cache held as three parallel slices: a compact `keys: [CalleeKey; 8]`
-  (16 bytes per slot), a `verdicts: [Verdict; 8]` byte array (the only other thing the hot path reads)
-  and the `targets` payloads that own their name text (cold paths only).
-  `Verdict` is `Unnameable` (no function entry / unresolvable name atom — the host is asked **zero**
-  times; it doubles as the vacant-slot value) / `Ask` (fill or invalidated) / `Served` / `Declined`, so
-  the seam's hot path is `lookup`'s single scan over the **occupied prefix** `keys[..len]` plus one
-  bool: a repeat local call makes **no** host call at all.
-  **Policy: insert-at-front on a miss; a hit never reorders** (the entry keeps its slot), and the
-  oldest *insertion* falls off the end. That is deliberate: `list_walk`'s inner loop alternates two
-  callees (`sum/1`, `walk/3`), so an MRU move-to-front fired on every call and memmoved up to eight
-  owned entries in the innermost loop.
-  **Invalidation** (the host's answer set is a pure function of the triple for `beam_rt` — `prim_tty`'s
+- `local_callee.rs` — the **local-call verdict table** `LocalVerdicts` (`Verdict`): the host's
+  `resolve_local_call` answer for one same-module callee, addressed **directly by the callee's
+  function index**. One table per **module context** (`ModuleContext::verdicts`, built at
+  registration from `module.functions.len()`) plus one machine-owned table for context `0`
+  (`Machine::entry_verdicts`, the run's entry module, which owns no `ModuleContext`); the seam
+  reaches whichever is executing through `Machine::verdict_table`. **Identity is free**: the
+  `Contexts` registry dedups by `Arc::ptr_eq`, so a second load of the same `.beam` is a different
+  context with its own table, and `LocalVerdicts::describes` (owner image address + function count)
+  is re-validated by `Machine::bind_entry_verdicts` at every `enter_run` and debug-asserted by the
+  seam.
+  Slots are `Cell<Verdict>` — the seam reads the table while the machine holds `&Module` borrows and
+  a registered context's table is reached through the shared `Arc` (a `&mut` would mean cloning the
+  `Arc` on every local call). `Verdict` is `Unknown` (no verdict, or no slot: the only answer that
+  cannot fabricate one — the seam derives the identity and asks) / `Unnameable` (no function entry or
+  an unresolvable name atom; the host is asked **zero** times) / `Served` / `Declined`, so a repeat
+  local call is **one bounds-checked slot load** and makes **no** host call at all.
+  **Why index-addressed, not a scan** (both earlier versions were measured): the slot a callee uses
+  is a property of the *callee*, not of the call history, so an alternating two-callee loop —
+  `list_walk`'s inner loop over `sum/1` and `walk/3` — costs exactly what a single-callee loop
+  costs. The MRU move-to-front version memmoved on *every* call of that loop, and the fixed `CAP = 8`
+  key scan that replaced it still left one **unpredictable** branch per call.  **Invalidation** (the host's answer set is a pure function of the triple for `beam_rt` — `prim_tty`'s
   stubs plus `beam_bifs`' `zlib` table — so only an *installation* can change it):
   `erlang:load_nif/2` (the BIF-dispatch funnel `Machine::dispatch_bif_call`, `../interpreter/bif.rs`, **arms**
   `Machine::local_call_invalidation_pending` — a `Cell<bool>` written through the funnel's `&self` receiver —
@@ -490,8 +495,8 @@ The complete inventory of `Eterm`-typed state on `Machine`, and its rooting stat
 - **Nothing else stores a heap word**: `frames`/`catch_frames` (CP slots are `Continuation::Address{context,func,pc}`
   / `Halt`), `raise_snapshot` and `resumption_addresses`/`resumption_contexts` (`(u32,u32,u32)`),
   `contexts`/`ModuleContext` (`Arc<Module>` + `Arc<LabelMap>`, `context.rs:67-90`),
-  `label_maps` (`Digest` + `AtomSnapshot` + address keys, `label_cache.rs`), `local_callees`
-  (`CalleeKey`/`CalleeTarget`, `local_callee.rs`), and the literal binding
+  `label_maps` (`Digest` + `AtomSnapshot` + address keys, `label_cache.rs`), `verdicts`/
+  `entry_verdicts` (`LocalVerdicts`, `local_callee.rs`), and the literal binding
   (`literals`/`entry_literals` = the load-time area, a separate never-collected heap). `RunOutcome`
   carries only `Eterm` (a returned value) plus `u32` addresses, so a park/resume window holds no term
   outside the registers/stack/FR file.
