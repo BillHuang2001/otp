@@ -93,7 +93,12 @@
 //! | `trace` | the process's **live** ERTS tracee-flag **bitmask**, as an integer (`0` while it is untraced) — see below |
 //! | `sequential_trace_token` | the process's sequential-trace token tuple, or the bare `[]` while tracing is inactive for it (see [`crate::seq_trace`]) |
 //! | `suspending` | `[]` (no `suspend_process` in M1) |
-//! | `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer |
+//! | `last_calls` | `false` while no `save_calls` buffer is armed; else the armed ring, in recorded order (oldest first), of `{M, F, A}` triples and the bare atoms `send`/`'receive'`/`timeout` — see below |
+//! | `parent` | the pid that spawned this process; the **`init` stand-in** (`<0.0.0>`, the oracle's `init`) for a process this runtime did not see spawned — see below |
+//! | `label` | the process dictionary's `'$process_label'`, or `undefined` |
+//! | `priority_messages` | `false` — this runtime has no priority message queue |
+//! | `magic_ref` | `[]` — a resource-bound magic-ref list; nothing binds one here |
+//! | `garbage_collection_info` | the oracle's ordered eleven-pair proplist — see below |
 //! | `memory` | this process's real bytes (heap + stack + off-heap) |
 //! | `binary` | a list of `{Ptr, Size, Refc}` 3-tuples for the process's off-heap refc binaries (payload pointer as an integer, payload byte length, payload refcount); the empty list `[]` when the process holds none — for **any** pid, the executing one included (see below) |//!
 //! ## Items this runtime honestly cannot answer (`unsupported`)
@@ -105,11 +110,6 @@
 //! | item | why / what is needed |
 //! |---|---|
 //! | `backtrace` | no raw/binary stack-dump accessor — the engine builds only the cooked `current_stacktrace` list, not the C's `erts_stack_dump` binary |
-//! | `magic_ref` | no magic ref is bound into a process off-heap table — `beam_abi`'s NIF resource API is unbound and nothing registers a resource with a process |
-//! | `parent` | no parent field on the PCB ([`beam_process::Process`]) — the spawn path never records the spawning process |
-//! | `label` | no label field on the PCB ([`beam_process::Process`]) |
-//! | `priority_messages` | no `priority_messages` flag in [`beam_process::ProcessFlags`] |
-//! | `garbage_collection_info` | [`beam_gc::HeapInfo`] tracks no per-generation block detail (the oracle's `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/`bin_old_vheap_block_size` are unmeasured) |
 //!
 //! The **execution-position** items (`current_function`, `initial_call`, `current_location`,
 //! `current_stacktrace`) and `catchlevel` are therefore *conditionally* answerable rather
@@ -562,9 +562,10 @@ struct Snapshot {
     /// **executing** process's roster from the in-machine BIF door instead of the runner
     /// state), copied out so the reply can be built after the process table borrow ends.
     off_heap_binaries: Vec<(usize, usize, usize)>,
-    /// The spawning process — the `parent` item. This runtime's root pid stands in for `init`,
-    /// which is what a `-eval`/`-s`/`-run` process reports as its parent and what the runtime
-    /// records for every other process it spawns.
+    /// The spawning process — the `parent` item ([`Runtime::parent_of`]). A pid with no
+    /// recorded spawner reports the runtime's **`init` stand-in**
+    /// ([`Runtime::init_pid`](crate::Runtime::init_pid)), which is the pid the root
+    /// `-eval`/`-s`/`-run` process reports (the oracle's `init`, `<0.0.0>`) and never itself.
     parent: ProcessId,
     /// The process dictionary's `'$process_label'` value, or `None` when unset — the `label`
     /// item. The C reads the same dictionary key (`erl_bif_info.c:2305-2315`), so a
@@ -1040,7 +1041,11 @@ impl RuntimeContext<'_> {
             // The armed `save_calls` ring, newest first; the bare `false` while no buffer is
             // armed (`erl_bif_info.c:2184-2188`). See [`Self::last_calls_value`].
             "last_calls" => self.last_calls_value(snapshot.pid)?,
-            // The C's `p->parent` PCB field (`erl_bif_info.c:2300-2304`).
+            // The C's `p->parent` PCB field (`erl_bif_info.c:2300-2304`): the process that
+            // spawned this one. A process this runtime did not see spawned — the root the
+            // `-eval`/`-s`/`-run` action runs in — reports the **`init` stand-in**, exactly as
+            // the oracle's `-eval` process reports `init` and never itself
+            // ([`Runtime::init_pid`](crate::Runtime::init_pid)).
             "parent" => snapshot.parent.to_eterm(),
             // The process dictionary's `'$process_label'` (`erl_bif_info.c:2305-2315`), which is
             // exactly what `process_flag`-style labelling writes; unset ⇒ `undefined`.
@@ -1106,12 +1111,16 @@ impl RuntimeContext<'_> {
     }
 
     /// The `last_calls` item: the bare `false` while no `save_calls` buffer is armed, else the
-    /// ring's entries **newest first**, each a `{Module, Function, Arity}` triple or one of the
-    /// bare atoms `send`/`'receive'`/`timeout`.
+    /// ring's entries in **recorded order** (oldest first), each a `{Module, Function, Arity}`
+    /// triple or one of the bare atoms `send`/`'receive'`/`timeout`.
     ///
-    /// The ring is read out of [`Runtime::saved_calls`](crate::Runtime::saved_calls) — the same
-    /// store `process_flag(save_calls, N)` arms and the call sites append to, so the item, the
-    /// flag's previous-value reply and the recordings can never disagree.
+    /// The C walks the ring newest-first but **prepends** each term onto the result
+    /// (`list = CONS(hp, term, list)`, `erl_bif_info.c:2222`), so the reported list is
+    /// chronological — verified on OTP 29.1.1 / erts-17.1 (see
+    /// [`last_calls`](crate::native::memory::last_calls)). The ring is read out of
+    /// [`Runtime::saved_calls`](crate::Runtime::saved_calls) — the same store
+    /// `process_flag(save_calls, N)` arms and the call sites append to, so the item, the flag's
+    /// previous-value reply and the recordings can never disagree.
     fn last_calls_value(&mut self, pid: ProcessId) -> Result<Eterm> {
         let Some(ring) = self.runtime.saved_calls(pid) else {
             return self.atom("false");
@@ -1121,7 +1130,7 @@ impl RuntimeContext<'_> {
         // of nothing heap-unsafe (the owned-copy rule — no term outlives a heap here).
         let recorded: Vec<last_calls::SavedEntry> = ring.entries().cloned().collect();
         let mut entries = Vec::with_capacity(recorded.len());
-        for entry in recorded.iter().rev() {
+        for entry in recorded.iter() {
             let term = match entry {
                 last_calls::SavedEntry::Mfa {
                     module,

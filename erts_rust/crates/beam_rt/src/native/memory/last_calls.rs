@@ -29,6 +29,16 @@
 //! pid ([`crate::Runtime::saved_calls`]) and renders it in
 //! [`crate::native::memory`].
 //!
+//! # The reported order is the recorded order (oldest first)
+//!
+//! `ERTS_PI_IX_LAST_CALLS` (`erl_bif_info.c:2183-2225`) *walks* the ring newest-first
+//! (`j = scb->cur - i - 1`) but **prepends** each rendered term onto the result
+//! (`list = CONS(hp, term, list)`), so the list it returns is oldest-first. Measured on
+//! OTP 29.1.1 / erts-17.1: an armed process that did `lists:seq/2` then `lists:last/1` and then
+//! queried answers `[{lists,seq,2}, {lists,last,1}, {erlang,process_info,2}]` — chronological,
+//! with the querying `process_info/2` call **last**. [`SavedCalls::entries`] is therefore
+//! already in reporting order; the renderer does not reverse it.
+//!
 //! # Owned copies, never terms
 //!
 //! The C stores an `Export *`, a pointer into the loaded-code area, and renders
@@ -65,11 +75,10 @@ pub(crate) enum SavedEntry {
     },
     /// The pseudo entry `send`.
     ///
-    /// The C records it from the send BIF's own arms (`save_calls(p, &exp_send)`,
-    /// `bif.c:2452-2672`). This runtime's send funnel (`crate::context::send`) classifies a
-    /// destination before it holds the runtime mutably, so the entry is not recorded yet — see
-    /// the crate `CONTEXT.md` `## Known Issues`.
-    #[allow(dead_code)]
+    /// The C records it from `do_send`'s own arms (`save_calls(p, &exp_send)`,
+    /// `bif.c:2473-2672`) — once per local send, whichever route reached it — so
+    /// [`crate::Runtime::record_saved_send`] appends it (after the `{erlang,send,2}` call
+    /// entry) from the runtime's one send funnel.
     Send,
     /// The pseudo entry `'receive'`.
     Receive,
@@ -79,9 +88,9 @@ pub(crate) enum SavedEntry {
 
 /// One process's armed `save_calls` ring — the C's `struct saved_calls`.
 ///
-/// Entries are stored **oldest first**; [`Self::entries`] yields them in that order and the
-/// renderer walks it in reverse, which is the oracle's newest-first list. Only ever created with
-/// a non-zero capacity (`process_flag(save_calls, 0)` removes the ring instead).
+/// Entries are stored **oldest first**; [`Self::entries`] yields them in that order, which is
+/// also the order the oracle *reports* them in (see the module docs). Only ever created with a
+/// non-zero capacity (`process_flag(save_calls, 0)` removes the ring instead).
 #[derive(Debug)]
 pub(crate) struct SavedCalls {
     entries: VecDeque<SavedEntry>,
@@ -118,9 +127,24 @@ impl SavedCalls {
         self.capacity
     }
 
-    /// The entries, **oldest first**.
+    /// The entries, **oldest first** — the order the oracle reports them in.
     pub(crate) fn entries(&self) -> impl DoubleEndedIterator<Item = &SavedEntry> {
         self.entries.iter()
+    }
+    /// Whether the newest (last recorded) entry is exactly the call `module:function/arity`.
+    ///
+    /// The send funnel uses it to avoid recording the `{erlang,send,2}` call entry twice on the
+    /// `erlang:send/2`-BIF route, where the ordinary call seam already recorded it
+    /// ([`crate::Runtime::record_saved_send`]).
+    pub(crate) fn newest_is_mfa(&self, module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            self.entries.back(),
+            Some(SavedEntry::Mfa {
+                module: m,
+                function: f,
+                arity: a,
+            }) if m == module && f == function && *a == arity
+        )
     }
 
     /// Append one entry, dropping the oldest once the ring is full (the C's

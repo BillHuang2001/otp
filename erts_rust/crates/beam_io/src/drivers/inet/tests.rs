@@ -28,7 +28,7 @@
 use super::wire::InetAddr;
 use super::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
-    PeerClose, CloseSource, ReadReport, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
+    PeerClose, CloseSource, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
     INET_AF_LOOPBACK, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT,
     INET_REP_OK, INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
@@ -346,7 +346,6 @@ fn the_peer_close_answers_once_per_direction() {
     let mut close = PeerClose::default();
     close.observe(CloseSource::Read {
         error: Some(libc::ECONNRESET),
-        report: ReadReport::Answered,
     });
     assert_eq!(close.observed_reason().atom_name(), "econnreset");
     assert_eq!(reply_name(close.recv_reply()).as_deref(), Some("enotconn"));

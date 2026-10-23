@@ -644,6 +644,25 @@ pub struct Runtime {
     pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
+    /// The **`init` stand-in** pid: the process every pid this runtime did not see being
+    /// spawned reports as its `parent`.
+    ///
+    /// The oracle's `p->parent` of a `-eval`/`-s`/`-run` process is the `init` server,
+    /// `<0.0.0>` — a process **distinct** from the `-eval` process itself, so
+    /// `element(2, process_info(self(), parent)) =:= self()` is `false` there. This runtime
+    /// *is* its own root process on that route (the root runs the `-eval` action), so falling
+    /// back to [`Runtime::self_pid`] would make the root report itself — an observable lie.
+    ///
+    /// The stand-in is therefore a **pid with no process**: the table's very first identity,
+    /// drawn with [`ProcessTable::alloc_pid`](beam_process::ProcessTable::alloc_pid) *before*
+    /// the root is spawned, so it renders exactly as the oracle's `init` pid does (`<0.0.0>`,
+    /// with the root moving to `<0.1.0>`). Nothing runs behind it, so it never appears in
+    /// `erlang:processes/0`, never receives a message and never holds a heap; it exists only so
+    /// the `parent` relation is graph-correct. `whereis(init)` stays the runtime's own root
+    /// (see the constructor): the two are different facts — the *name registry's* `init` is the
+    /// process that boots this runtime, the *parent* of everything the runtime did not spawn is
+    /// this stand-in — and the oracle has a single `<0.0.0>` playing both roles.
+    pub(crate) init_pid: ProcessId,
     /// The **root execution frame**: which root action ([`RootAction::Eval`] for `-eval`,
     /// [`RootAction::Module`] for `-s`/`-run`) is driving the runtime's own process right now,
     /// or `None` when no root action is running.
@@ -883,11 +902,12 @@ pub struct Runtime {
     ///
     /// `beam_process::ProcessFlags` carries no such store, so — like
     /// [`Runtime::group_leaders`] — the runtime keeps it in its own per-pid map, written by the
-    /// two spawn paths ([`Runtime::spawn_process_with_policy`],
-    /// [`Runtime::spawn_fun_process_with_policy`]). A pid with no recorded spawner reports this
-    /// runtime's root pid ([`Runtime::self_pid`]) — the stand-in for `init`, which is exactly
-    /// what a `-eval`/`-s`/`-run` process's parent is on the oracle, and what every other
-    /// process this runtime created was spawned by.
+    /// spawn paths ([`Runtime::spawn_process_with_policy`],
+    /// [`Runtime::spawn_fun_process_with_policy`] and the in-slice
+    /// [`RuntimeContext::spawn_in_pass`](crate::context::RuntimeContext)). A pid with no
+    /// recorded spawner reports the **`init` stand-in** ([`Runtime::init_pid`]) — the oracle's
+    /// parent for the `-eval`/`-s`/`-run` process, which is `init` and *not* the process
+    /// itself.
     ///
     /// Keyed by the whole [`ProcessId`] and only ever `insert`ed/`get`ed, so it probes with the
     /// crate's own [`FastHashMap`] over [`crate::hasher`].
@@ -1331,6 +1351,10 @@ impl Runtime {
             Rc::clone(&ets_owners),
             Rc::clone(&nif_monitors),
         )));
+        // The **`init` stand-in** (see [`Runtime::init_pid`]): a pid with no process, drawn
+        // *first* so it takes the table's first identity and renders exactly as the oracle's
+        // `init` (`<0.0.0>`), which is the `parent` of the `-eval`/`-s`/`-run` process there.
+        let init_pid = processes.alloc_pid()?;
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
@@ -1557,6 +1581,7 @@ impl Runtime {
             nif_thread_sends: None,
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
+            init_pid,
             executing: None,
             in_machine: None,
             reductions: 0,
@@ -3347,10 +3372,22 @@ impl Runtime {
         }
     }
 
-    /// `pid`'s recorded spawner, or this runtime's root pid when none was recorded — the
-    /// `parent` item (see [`Runtime::parents`]).
+    /// `pid`'s recorded spawner, or the **`init` stand-in** ([`Runtime::init_pid`]) when none
+    /// was recorded — the `parent` item (see [`Runtime::parents`]).
     pub(crate) fn parent_of(&self, pid: ProcessId) -> ProcessId {
-        self.parents.get(&pid).copied().unwrap_or(self.self_pid)
+        self.parents.get(&pid).copied().unwrap_or(self.init_pid)
+    }
+
+    /// Records `parent` as `child`'s spawner — the C's `p->parent` assignment
+    /// (`erl_process.c`), which `process_info(Child, parent)` reports.
+    ///
+    /// The spawn paths call this from the **spawning process's** context, so a grandchild
+    /// records its real (in-slice) parent instead of the runtime's root: the oracle's answer
+    /// for a spawned child is `{parent, SpawnerPid}` regardless of depth (`erl -noshell -eval
+    /// 'spawn(fun() -> spawn(fun() -> ... end) end)'` reports the *middle* process as the
+    /// grandchild's parent).
+    pub(crate) fn set_parent(&mut self, child: ProcessId, parent: ProcessId) {
+        self.parents.insert(child, parent);
     }
 
     /// `pid`'s armed `save_calls` ring, or `None` while no buffer is armed (see
@@ -3408,6 +3445,32 @@ impl Runtime {
     ) {
         if let Some(ring) = self.saved_calls.get_mut(&pid) {
             ring.push_pseudo(entry);
+        }
+    }
+
+    /// Records a **send** in `pid`'s `save_calls` ring, if one is armed: the call entry
+    /// `{erlang, send, 2}` followed by the bare `send` pseudo entry.
+    ///
+    /// The oracle produces exactly that pair for **both** send routes. The compiled
+    /// `send` instruction is a mirror of `call_light_bif` for `erlang:send/2`
+    /// (`jit/x86/instr_bif.cpp:691-701`'s `emit_send`, `RET = imm(send_2)`), so its light-bif
+    /// dispatch records the call entry and `do_send`'s
+    /// `save_calls(p, &exp_send)` (`bif.c:2473`) records the pseudo one; the
+    /// `erlang:send/2` **BIF** route records the call entry through the ordinary call seam and
+    /// the same pseudo entry. Measured on OTP 29.1.1 / erts-17.1: an armed process whose only
+    /// calls were one `P ! M` answers `{last_calls, [{erlang,send,2}, send]}`, and
+    /// `erlang:send(P, M)` answers the same.
+    ///
+    /// The call entry is **not** added when the ring's newest entry already is it: on the BIF
+    /// route [`RuntimeContext::resolve_external_call`](crate::context::RuntimeContext)
+    /// recorded it a moment earlier, and a second copy would be a fabricated entry. A compiled
+    /// `send` reaches this method with no such entry, so it records its own.
+    pub(crate) fn record_saved_send(&mut self, pid: ProcessId) {
+        if let Some(ring) = self.saved_calls.get_mut(&pid) {
+            if !ring.newest_is_mfa("erlang", "send", 2) {
+                ring.push_mfa("erlang", "send", 2);
+            }
+            ring.push_pseudo(crate::native::memory::last_calls::SavedEntry::Send);
         }
     }
 

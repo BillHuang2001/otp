@@ -588,23 +588,44 @@ fn monitors_carries_the_port_monitors_alongside_the_process_monitors() {
     );
 }
 
+/// The valid oracle items this runtime cannot answer are **only** [`UNSUPPORTED_ITEMS`], and each
+/// raises the typed capability gap — never a fabricated value and never a false `badarg`.
+///
+/// The five items that used to be gaps (`parent`, `label`, `priority_messages`, `magic_ref`,
+/// `garbage_collection_info`) are now served out of this runtime's own state, so they are pinned
+/// here as *answers*: a regression that silently moved one back into the gap list would fail both
+/// halves.
 #[test]
 fn every_unsupported_item_raises_the_typed_capability_gap() {
+    use super::UNSUPPORTED_ITEMS;
+
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
-    for name in [
-        "backtrace",
-        "magic_ref",
-        "parent",
-        "label",
-        "priority_messages",
-        "garbage_collection_info",
-    ] {
+    assert_eq!(
+        UNSUPPORTED_ITEMS,
+        ["backtrace"],
+        "`backtrace` is the one remaining valid oracle item this runtime cannot answer"
+    );
+    for name in UNSUPPORTED_ITEMS {
         let error = info(&mut runtime, pid, name).expect_err("must be a capability gap");
         assert!(
             crate::error::unsupported_reason(&error).is_some(),
             "{name} must be a typed `unsupported` gap, got {error}"
         );
+    }
+    // …and the five formerly-gapped items answer their own `{Item, Value}` pair.
+    for name in [
+        "parent",
+        "label",
+        "priority_messages",
+        "magic_ref",
+        "garbage_collection_info",
+    ] {
+        let reply = info(&mut runtime, pid, name).unwrap_or_else(|error| {
+            panic!("{name} is served now, but process_info/2 answered {error}")
+        });
+        let (key, _) = pair(reply);
+        assert_eq!(runtime.atom_name_of(key), Some(name));
     }
 }
 
@@ -1100,16 +1121,20 @@ fn the_binary_item_drops_a_payload_once_its_death_is_swept() {
 /// would need — rather than a vague placeholder.
 #[test]
 fn every_remaining_gap_names_its_missing_accessor() {
+    use super::{UNSUPPORTED_ITEMS, UNSUPPORTED_ITEM_REASONS};
+
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
-    for (name, missing) in [
-        ("backtrace", "stack-dump"),
-        ("magic_ref", "magic ref"),
-        ("parent", "parent field"),
-        ("label", "label field"),
-        ("priority_messages", "priority_messages flag"),
-        ("garbage_collection_info", "per-generation"),
-    ] {
+    // The reason table covers the gap list exactly: no gap without a reason, no stale reason.
+    assert_eq!(
+        UNSUPPORTED_ITEM_REASONS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>(),
+        UNSUPPORTED_ITEMS.to_vec(),
+        "every gap has exactly one reason row, and no row outlives its gap"
+    );
+    for (name, missing) in [("backtrace", "stack-dump")] {
         let error = info(&mut runtime, pid, name).expect_err("must be a capability gap");
         let reason = crate::error::unsupported_reason(&error)
             .unwrap_or_else(|| panic!("{name} must be a typed `unsupported` gap, got {error}"));
@@ -1577,5 +1602,146 @@ fn the_links_item_unions_a_local_link_with_an_inbound_distribution_link() {
         links_of(&mut runtime, victim_pid),
         local_only,
         "the fast path and the two-step path agree on the local-only case"
+    );
+}
+
+/// The `last_calls` value rendered as names: a recorded call as `Module:Function/Arity`, a pseudo
+/// entry as its bare atom. An atom value (the unarmed `false`) renders as the atom alone.
+fn last_calls_names(runtime: &mut crate::Runtime, pid: Eterm) -> Vec<String> {
+    let (key, value) = pair(info(runtime, pid, "last_calls").expect("last_calls"));
+    assert_eq!(runtime.atom_name_of(key), Some("last_calls"));
+    if is_atom(value) {
+        return vec![runtime.atom_name_of(value).expect("an atom").to_string()];
+    }
+    let entries = terms::list_elements(value).expect("the armed ring is a list");
+    entries
+        .iter()
+        .map(|entry| {
+            if is_atom(*entry) {
+                return runtime.atom_name_of(*entry).expect("an atom entry").to_string();
+            }
+            assert_eq!(
+                terms::tuple_arity(*entry).expect("a recorded call is a tuple"),
+                3,
+                "a recorded call is a {{Module, Function, Arity}} triple"
+            );
+            let module = terms::tuple_element(*entry, 0).expect("module");
+            let function = terms::tuple_element(*entry, 1).expect("function");
+            let arity = terms::tuple_element(*entry, 2).expect("arity");
+            format!(
+                "{}:{}/{}",
+                runtime.atom_name_of(module).expect("module atom"),
+                runtime.atom_name_of(function).expect("function atom"),
+                signed_value(arity)
+            )
+        })
+        .collect()
+}
+
+/// `last_calls` has exactly three states, and the armed one reports the ring in **recorded order**
+/// (oldest first) — the order the oracle reports it in, because `ERTS_PI_IX_LAST_CALLS` walks the
+/// ring newest-first but **prepends** each rendered term (`list = CONS(hp, term, list)`,
+/// `erl_bif_info.c:2222`).
+///
+/// Measured on OTP 29.1.1 / erts-17.1, so the assertions below are the oracle's answers, not an
+/// implementation preference: an armed process whose calls were `lists:seq/2` then one compiled
+/// `!` then a `receive` answers `[{lists,seq,2}, {erlang,send,2}, send, 'receive']`, with the
+/// querying `{erlang,process_info,2}` at the **tail**.
+#[test]
+fn the_last_calls_item_has_the_oracles_three_states_and_reports_the_ring_in_recorded_order() {
+    use crate::native::memory::last_calls::SavedEntry;
+
+    let mut runtime = runtime();
+    let pid_term = root_pid(&mut runtime);
+    let pid = ProcessId::from_eterm(pid_term).expect("a pid");
+
+    // (1) No buffer armed: the bare atom `false` — both never-armed and explicitly disarmed.
+    assert_eq!(last_calls_names(&mut runtime, pid_term), ["false"]);
+    runtime.arm_saved_calls(pid, 0);
+    assert_eq!(
+        last_calls_names(&mut runtime, pid_term),
+        ["false"],
+        "process_flag(save_calls, 0) disarms, so the item is `false` again"
+    );
+
+    // (2) Armed and empty: the empty list (the oracle's answer for an idle armed process).
+    runtime.arm_saved_calls(pid, 8);
+    assert!(
+        last_calls_names(&mut runtime, pid_term).is_empty(),
+        "an armed ring with nothing recorded answers []"
+    );
+
+    // (3) Armed and filling: recorded order, oldest first, with the `send` pair.
+    runtime.record_saved_call(pid, "lists", "seq", 2);
+    runtime.record_saved_send(pid);
+    runtime.record_saved_pseudo(pid, SavedEntry::Receive);
+    assert_eq!(
+        last_calls_names(&mut runtime, pid_term),
+        ["lists:seq/2", "erlang:send/2", "send", "receive"],
+        "the ring is chronological and a send records its call entry then the pseudo entry"
+    );
+
+    // The `erlang:send/2`-BIF route records the call entry through the ordinary external-call
+    // seam *before* the send funnel runs, so the funnel must not add a second copy of it.
+    runtime.record_saved_call(pid, "erlang", "send", 2);
+    runtime.record_saved_send(pid);
+    assert_eq!(
+        last_calls_names(&mut runtime, pid_term),
+        [
+            "lists:seq/2",
+            "erlang:send/2",
+            "send",
+            "receive",
+            "erlang:send/2",
+            "send"
+        ],
+        "a send whose call entry the call seam just recorded adds only the pseudo entry"
+    );
+
+    // Re-arming resets the ring (the C installs a brand-new zeroed buffer).
+    runtime.arm_saved_calls(pid, 8);
+    assert!(
+        last_calls_names(&mut runtime, pid_term).is_empty(),
+        "re-arming discards the previous entries"
+    );
+}
+
+/// The `parent` item of a process the runtime never saw being spawned (its own root — the process
+/// a `-eval`/`-s`/`-run` action runs in) is a **distinct** pid standing in for OTP's `init`.
+///
+/// The oracle's `-eval` process answers `{parent, <0.0.0>}` — `init`, never itself (measured on OTP
+/// 29.1.1 / erts-17.1: `element(2, process_info(self(), parent)) =:= self()` is `false`). This
+/// runtime *is* its own root process on that route, so falling back to the root pid would make the
+/// relation observably wrong; [`crate::Runtime::init_pid`] is the pid with no process that plays
+/// `init`'s role instead, and a spawned child records its real spawner.
+#[test]
+fn the_parent_item_is_the_init_stand_in_and_a_spawned_child_names_its_spawner() {
+    let mut runtime = runtime();
+    let root_term = root_pid(&mut runtime);
+    let root = ProcessId::from_eterm(root_term).expect("a pid");
+    let init = runtime.init_pid;
+    assert_ne!(init, root, "the init stand-in is a pid of its own");
+    assert_eq!(
+        init.to_eterm(),
+        ProcessId::new(0, 0).to_eterm(),
+        "it takes the table's first identity, so it renders as the oracle's `<0.0.0>` init"
+    );
+
+    let (key, value) = pair(info(&mut runtime, root_term, "parent").expect("parent"));
+    assert_eq!(runtime.atom_name_of(key), Some("parent"));
+    assert_eq!(value, init.to_eterm(), "the root's parent is the init stand-in");
+    assert_ne!(value, root_term, "…which is never the process itself");
+
+    // A pid with a recorded spawner reports it — the `{parent, SpawnerPid}` the oracle answers for
+    // every spawned process, at any depth (`Runtime::set_parent` is the one writer).
+    let spawner = ProcessId::new(4242, 1);
+    runtime.set_parent(root, spawner);
+    assert_eq!(runtime.parent_of(root), spawner);
+    let (_, value) = pair(info(&mut runtime, root_term, "parent").expect("parent"));
+    assert_eq!(value, spawner.to_eterm(), "the recorded spawner is what the item reports");
+    assert_eq!(
+        runtime.parent_of(ProcessId::new(4243, 0)),
+        init,
+        "an unrecorded pid still falls back to the init stand-in"
     );
 }

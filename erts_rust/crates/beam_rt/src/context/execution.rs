@@ -793,7 +793,34 @@ impl ExecutionContext for RuntimeContext<'_> {
         message: Eterm,
         src_binaries: &[beam_alloc::RefcBinary],
     ) -> Result<()> {
-        let destination = self.resolve_send_destination(to)?;
+        let destination = match self.resolve_send_destination(to) {
+            Ok(destination) => destination,
+            // The C records the send event before it reports `badarg` for a destination that is
+            // not sendable at all (`bif.c:2668-2674`, the final `else` arm), so an armed
+            // process's ring still shows the attempt.
+            Err(BeamError::BadArg) => {
+                let pid = self.mailbox_pid;
+                self.runtime.record_saved_send(pid);
+                return Err(BeamError::BadArg);
+            }
+            Err(other) => return Err(other),
+        };
+        // The `send` pseudo entry, recorded for every destination the C's `do_send` records it
+        // for — the local pid/alias/name arms, the port arm and the dropped-name arm
+        // (`bif.c:2473`-`2672`) — but **not** for a genuinely remote destination: those go
+        // through `remote_send`, which never touches `save_calls`. Recorded here, the one funnel
+        // every send route (the compiled `send` instruction, `erlang:send/2`/`!/2`, the `-eval`
+        // operator) shares, so the entry cannot be missed on one route and duplicated on
+        // another. See [`Runtime::record_saved_send`](crate::Runtime::record_saved_send).
+        match &destination {
+            SendDestination::RemotePid { .. }
+            | SendDestination::RemoteAlias { .. }
+            | SendDestination::RemoteName { .. } => {}
+            _ => {
+                let pid = self.mailbox_pid;
+                self.runtime.record_saved_send(pid);
+            }
+        }
         // A **remote** destination (an external pid, or a `{Name, Node}` pair naming another
         // node) has no local receiver to copy into: it is transmitted by the distribution client
         // exactly as the `erlang:send/2` BIF route transmits it, and the `send` seam is done.
