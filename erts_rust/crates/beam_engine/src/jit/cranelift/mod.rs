@@ -434,11 +434,23 @@ pub struct CompiledFunctions {
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`.
     ///
-    /// The inlined `move`/`test` fast paths read and write `[x_regs + x*8]`
-    /// **without a bounds check**, so the driver refuses native entry when the
-    /// running machine's register file is not at least this long (see
-    /// [`CompiledEntries::enter`]) — the same belt-and-braces guard the baseline
-    /// tier uses.
+    /// The inlined `move`/`swap`/`test`/`select_val`/comparison fast paths read and write
+    /// `[x_regs + x*8]` **without a bounds check**, so this figure has two load-bearing
+    /// uses, both in [`CompiledEntries::enter`]:
+    ///
+    /// 1. the **register-file bound guard**: native entry is refused when the running
+    ///    machine's register file is not at least this index plus one long — the same
+    ///    belt-and-braces guard the baseline tier uses;
+    /// 2. the **native register-write extent**: `highest + 1` is declared on the machine
+    ///    (`Machine::note_x_dirty`) **before** the native call, so the next
+    ///    [`Machine::reset`](crate::Machine::reset) refills every slot the generated code
+    ///    could have written, and a helper called mid-body sees an x-register root prefix
+    ///    covering them. It is an upper bound by construction: it is the emitted code's own
+    ///    highest addressed index.
+    ///
+    /// `None` means the tier inlined no register-addressed instruction at all, so
+    /// [`CompiledEntries::enter`] falls back to the wide
+    /// `Machine::mark_regs_escaped()`.
     highest_native_register: Option<u32>,
     /// The `test` kinds the tier inlined natively (deduped, in first-inlined
     /// order).
@@ -559,6 +571,10 @@ impl CompiledFunctions {
     }
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`, if any instruction was inlined.
+    ///
+    /// The two load-bearing uses of the figure (the register-file bound guard and the
+    /// register-write extent [`CompiledEntries::enter`] declares before the native call)
+    /// are documented on the field.
     pub fn highest_native_register(&self) -> Option<u32> {
         self.highest_native_register
     }
@@ -648,6 +664,15 @@ impl CompiledFunctions {
 /// address in its enterable pc set — its entry `pc`, any other IR block start, or a
 /// non-tail-call continuation (see [`CompiledFunctions::is_enterable`]). Every other
 /// address stays on the driver's interpreter step.
+///
+/// Every entry that reaches native code first declares the artifact's **native
+/// register-write extent** ([`CompiledFunctions::highest_native_register`]) on the
+/// machine, **before** the call: inlined code stores straight into `machine.x`, which no
+/// `set_x` mark can observe, so the declaration is what makes the next
+/// [`Machine::reset`](crate::Machine::reset) refill exactly the slots the run could have
+/// written and what lets a helper called mid-body (a deopted `test_heap` reaching
+/// `ensure_heap` → `with_roots`) hand a collecting host a root prefix covering those
+/// stores. It is noted once per entry and never widened afterwards.
 struct CompiledEntries<'a> {
     /// The compiled functions of the module being run.
     compiled: &'a CompiledFunctions,
@@ -678,6 +703,46 @@ impl NativeCode for CompiledEntries<'_> {
             }
         }
         let entry = self.compiled.entry(func)?;
+        // ── The native register-write extent, reported BEFORE the call ──
+        //
+        // Inlined code stores straight into `machine.x` through the pointer it holds
+        // (`[x_regs + x*8]`, see [`codegen`]'s `XREGS_DISP`/`x_offset` and the lowered
+        // `move`/`swap`/`test`/`select_val`/comparison fast paths), which the
+        // [`Machine::set_x`](crate::Machine) high-water mark cannot observe. The
+        // artifact bounds every such write: [`CompiledFunctions::highest_native_register`]
+        // is the highest x index any inlined instruction addresses, so declaring one
+        // past it makes the next [`Machine::reset`](crate::Machine::reset) refill exactly
+        // what the run could have written — a stale register above that bound would be a
+        // wrong result, and the figure is the emitted code's own upper bound, so it never
+        // under-covers.
+        //
+        // It is noted **here, before the call**, not after the function returns, because
+        // a helper the compiled body calls in the middle of itself reads the register
+        // files: a deopted `test_heap` reaches
+        // [`Machine::ensure_heap`](crate::Machine) → `with_roots`, which hands the host
+        // the x-register *prefix* [`Machine::used_x_extent`](crate::Machine) derives from
+        // this very figure. Noting it afterwards would hand such a helper an empty slice,
+        // making the inlined writes earlier in the same native function invisible to a
+        // collecting host — a missed relocation, i.e. a stale pointer after a moving
+        // collection. This is the baseline tier's rule
+        // (`baseline::enter_compiled_cached`) applied to the same block ABI.
+        //
+        // The FR file needs no note: nothing in this tier's lowering stores into it, so
+        // an FR slot is covered by the `set_fr` high-water mark. An artifact that inlined
+        // no register-addressed instruction at all (`highest_native_register == None`)
+        // falls back to the wide `mark_regs_escaped`, exactly as the baseline tier does
+        // for an artifact with no registered extent.
+        //
+        // SAFETY: `rt` is the live driver-owned runtime block and its `machine` pointer
+        // points at the driver's live `Machine`; no native code is running yet and the
+        // driver holds no `&mut` alias of it.
+        unsafe {
+            let machine = &mut *(*rt).machine;
+            match self.compiled.highest_native_register {
+                Some(highest) => machine.note_x_dirty(highest + 1),
+                None => machine.mark_regs_escaped(),
+            }
+        }
         // SAFETY: `entry` is the finalized entry of a function declared with the
         // `NativeFunc` signature (`extern "C" fn(i64, i64) -> i64`) in the JIT module
         // that owns it, so the pointer is callable with exactly that ABI; `rt` is the

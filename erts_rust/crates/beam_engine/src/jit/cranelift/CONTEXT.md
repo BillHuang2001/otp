@@ -11,7 +11,9 @@ a typed `unsupported("jit-cranelift tier not built")` — never a panic, never a
 - `mod.rs` — `CraneliftJit` (the `JitBackend`, whose `run_export` override routes through the store),
   `CompiledFunctions` (owns the `JITModule`; accessors
   `entry`/`entry_pc`/`function_count`/`labels`/`highest_native_register`/`is_enterable` + the `inlined_*`
-  introspection), `run_outcome`/`run_label_outcome`/`run_resume_outcome`, `run_cranelift*`.
+  introspection; `highest_native_register` is both the register-file bound guard's figure and the
+  register-write extent `enter` declares — see below), `run_outcome`/`run_label_outcome`/
+  `run_resume_outcome`, `run_cranelift*`.
 - `cache.rs` — the **retained-artifact store**: `handle(module) -> Result<Rc<CompiledFunctions>>`
   (compile once per sound identity, reuse afterwards) plus the test-gated `len`/`compile_count`/`clear`
   introspection.
@@ -42,6 +44,29 @@ chain): the two share the candidate set but neither shares the other's mechanism
 chain is unchanged. Since the tier caches **no** x-registers across instructions (it addresses
 `machine.x` directly), entering a function at a mid-function `pc` with the machine's current state is
 correct by construction.
+
+### The register-write extent `NativeCode::enter` declares (root-set soundness)
+Inlined code stores **straight into `machine.x`** (`[x_regs + x*8]`: `codegen.rs`'s `XREGS_DISP`/
+`x_offset`, `inline.rs`'s `move`/`swap`, the `test`/`select_val`/comparison fast paths), which no
+`Machine::set_x` high-water mark can observe. So `CompiledEntries::enter` declares the artifact's own
+write extent on the machine **before** the native call, on the path that actually enters native code
+(after the `is_enterable` and register-file-bound checks and the `entry` resolution):
+`machine.note_x_dirty(highest_native_register + 1)`, or the wide `machine.mark_regs_escaped()` for an
+artifact that inlined no register-addressed instruction at all (`highest_native_register == None`).
+`CompiledFunctions::highest_native_register` therefore has **two** load-bearing uses in `enter`: the
+register-file bound guard (the inlined addressing is unchecked) and this write extent — it is the
+*highest x index* the generated code addresses, so the extent is one past it.
+Both consequences are contracts, not conveniences:
+- `Machine::reset`'s refill is bounded by `used_x_extent() = max(x_mark, x_dirty)`, so without the note a
+  deep native write survives the reset and a later run hands a host a **stale word as a live root**;
+- a helper the compiled body calls **mid-body** (a deopted `test_heap` →
+  `Machine::ensure_heap` → `with_roots`) derives its x-register root prefix from the same figure, so
+  without the note a collecting host would be handed a zero-length slice and would miss the relocation
+  of every natively written register — a stale pointer after a moving collection.
+It is noted **once per entry, before the call, never widened afterwards** (an after-the-fact note would
+undo the narrowing the figure exists for), exactly as the baseline tier does it in
+`baseline::enter_compiled_cached`. The FR file needs no note: nothing in this tier's lowering stores
+into it, so an FR slot is covered by the `set_fr` mark.
 
 `run_resume_outcome` remains a typed `error::unsupported("cranelift jit: cannot resume at an arbitrary
 pc (the cranelift tier has no resume entry point)")`: what is missing is a **generic no-reset driver
@@ -249,3 +274,17 @@ park address equals the interpreter's resumption address — proved by resuming 
 is still held afterwards), `a_synthetic_module_without_a_digest_is_not_cached` (all-zero checksum ⇒ two
 equal runs, `len() == 0`, `compile_count() == 0`) and
 `clear_drops_every_artifact_and_resets_the_compile_count`.
+The register-write extent has its own **three** cases, one for each half of the contract:
+`a_native_entry_declares_the_register_write_extent` (a synthetic `f/0` whose body is one natively inlined
+`move` into `x9`; the runtime block is built by hand and the compiled entry called directly, so **no
+interpreter step runs in between** — the fresh machine's extent is `0` before the call and exactly
+`DEEP + 1` after it, then `Machine::reset` clears the deep slot and `refilled_words() == DEEP + 1` proves
+the refill is the declared extent, not the two files),
+`a_driver_run_on_a_real_module_declares_the_extent_too` (the same declaration on the driver's
+`NativeCode` path over `slice.beam`: the result is unchanged and `used_x_extent() >=
+highest_native_register + 1` after the run, with the following reset wiping every x slot) and
+`the_declared_extent_lets_a_mid_block_helper_see_native_writes` (the root-set half: a synthetic body that
+inlines two `move`s — one into `x9` — and then reaches the deopted `test_heap`, whose helper path
+(`ensure_heap_full` → `with_roots`) is recorded by an in-test `RootProbeCtx`; exactly one admission point
+is seen, its `live` hint is forwarded unchanged, and the handed x slice covers the deep register with its
+moved value).

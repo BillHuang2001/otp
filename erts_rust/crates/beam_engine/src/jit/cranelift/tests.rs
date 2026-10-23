@@ -606,3 +606,327 @@ fn clear_drops_every_artifact_and_resets_the_compile_count() {
     assert_eq!(cache::len(), 1);
     assert_eq!(cache::compile_count(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// the native register-write extent (`CompiledEntries::enter`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_native_entry_declares_the_register_write_extent() {
+    // The register-write half of the tier's soundness contract. Inlined code stores
+    // straight into `machine.x` through the pointer it holds, which no `set_x` mark can
+    // observe, so a native entry must declare the artifact's own write extent
+    // (`highest_native_register + 1`) **before** the call: that figure bounds the next
+    // `Machine::reset`'s refill (a stale register above it would be a wrong result) and
+    // lets a helper called mid-body hand a collecting host a root prefix covering those
+    // stores.
+    //
+    // The observation is made with **no interpreter step in between**: the runtime block
+    // is built by hand and the compiled entry is called directly, so the extent right
+    // after the call can only be the tier's own note (a `set_x` high-water mark would need
+    // a `set_x`, and the wide fallback would read 1024).
+    const DEEP: u32 = 9;
+    let (module, f) = crate::jit::bench::support::Fixture::new("cranelift_native_extent")
+        .finish(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(7),
+                    dst: Operand::X(DEEP),
+                },
+                Instr::Return,
+            ],
+        );
+    let entry_label = module.export(f, 0).expect("f/0 is exported");
+    let labels = crate::interpreter::build_label_map(&module);
+    let (func, pc) =
+        crate::interpreter::resolve_label(&module, entry_label).expect("the entry label resolves");
+
+    let compiled = CraneliftJit::new()
+        .compile(&module)
+        .expect("compile the fixture");
+    assert_eq!(
+        compiled.highest_native_register(),
+        Some(DEEP),
+        "the deep `move` is lowered natively, so the artifact bounds it"
+    );
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+
+    let mut machine = Machine::new();
+    machine.reset();
+    machine.push_frame(0).expect("push the bottom frame");
+    machine.set_literals(module.literals.clone());
+    assert_eq!(
+        machine.used_x_extent(),
+        0,
+        "a fresh machine has no used x-register slot, so nothing but the tier's own note \
+         can raise the extent"
+    );
+
+    let mut ctx = MinimalContext::new();
+    let x_regs: *mut Eterm = machine.x.as_mut_ptr();
+    let machine_ptr: *mut Machine = &mut machine;
+    let ctx_ptr = &mut ctx as *mut dyn ExecutionContext;
+    let mut rt = JitRuntime {
+        machine: machine_ptr,
+        x_regs,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
+        module: &module as *const Module,
+        entry_module: &module as *const Module,
+        labels: &labels as *const _,
+        ctx: ctx_ptr,
+        error: None,
+        enter: None,
+        suspend: None,
+        literals_base: std::ptr::null(),
+        literals_end: std::ptr::null(),
+        resume_entry: std::ptr::null(),
+        tables: crate::jit::baseline::runtime::EntryTables::NONE,
+        compiled: std::ptr::null(),
+    };
+
+    let word = code
+        .enter(&mut rt, &module, func, pc)
+        .expect("the entry address is compiled");
+    assert_eq!(word, HALT);
+    // SAFETY: `machine_ptr` points at the live `machine` above; no native code is
+    // running here.
+    let (deep_slot, extent) = unsafe { ((*machine_ptr).x(DEEP), (*machine_ptr).used_x_extent()) };
+    assert_eq!(
+        deep_slot,
+        Some(make_small(7)),
+        "the inlined `move` wrote the deep register natively"
+    );
+    assert_eq!(
+        extent,
+        DEEP + 1,
+        "the entry must declare one past the highest x slot the artifact addresses — \
+         without that note the native store is invisible to the extent, the next reset \
+         leaves it behind and a later run hands a stale word to a host as a live root"
+    );
+
+    machine.reset();
+    assert_eq!(
+        machine.x(DEEP),
+        Some(beam_term::NIL),
+        "a deep native write must not survive the reset"
+    );
+    assert!(machine.x.iter().all(|slot| *slot == beam_term::NIL));
+    assert!(
+        machine.fr.iter().all(|slot| *slot == beam_term::NIL),
+        "nothing in this tier stores into the FR file, so no FR slot is dirty"
+    );
+    assert_eq!(
+        machine.refilled_words(),
+        DEEP + 1,
+        "the refill is exactly the declared x extent (and no FR word), not the 2048 words \
+         of the two register files"
+    );
+}
+
+#[test]
+fn a_driver_run_on_a_real_module_declares_the_extent_too() {
+    // The same declaration on the driver path — the `NativeCode` seam the shared native
+    // driver calls — over a real `.beam`: after the run the machine's used x extent covers
+    // every register the artifact addresses natively, and the reset that follows wipes all
+    // of them.
+    let module = load_file(SLICE_BEAM).expect("load slice.beam");
+    let add = module
+        .atom_table
+        .lookup("add")
+        .expect("the fixture interns `add`");
+    let compiled = CraneliftJit::new()
+        .compile(&module)
+        .expect("compile slice.beam");
+    let highest = compiled
+        .highest_native_register()
+        .expect("the fixture inlines at least one register-addressed instruction");
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let outcome = run_native_outcome(
+        &mut machine,
+        &module,
+        add,
+        2,
+        &[make_small(2), make_small(3)],
+        &mut ctx,
+        &code,
+    )
+    .expect("run slice:add/2 natively");
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(5)),
+        "the declared extent changes no result"
+    );
+    assert!(
+        machine.used_x_extent() >= highest + 1,
+        "the driver's native entry must declare the artifact's write extent (up to x{highest}); \
+         got an extent of {}",
+        machine.used_x_extent()
+    );
+
+    machine.reset();
+    assert!(
+        machine.x.iter().all(|slot| *slot == beam_term::NIL),
+        "the refill covers every register the artifact can address natively"
+    );
+}
+
+/// A context that records the x-register root slice it is handed at the **heap admission
+/// point** (`ensure_heap_full`, which `Machine::ensure_heap` reaches for a `test_heap`),
+/// delegating the heap itself to a [`MinimalContext`].
+///
+/// The Cranelift twin of the baseline tier's `RootProbeCtx` — this tier caches no
+/// registers, so what the probe checks is the *extent* the tier declared before entering
+/// the block, not a spill.
+struct RootProbeCtx {
+    inner: MinimalContext,
+    /// Every handed x slice, in call order.
+    x_slices: Vec<Vec<Eterm>>,
+    /// The `live` hint of each of those calls.
+    lives: Vec<u32>,
+}
+
+impl RootProbeCtx {
+    fn new() -> RootProbeCtx {
+        RootProbeCtx {
+            inner: MinimalContext::new(),
+            x_slices: Vec::new(),
+            lives: Vec::new(),
+        }
+    }
+}
+
+impl ExecutionContext for RootProbeCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    /// The recording door. The narrow `ensure_heap` above records nothing, so a run that
+    /// reached only it leaves `x_slices` empty and the assertions below fail loudly.
+    fn ensure_heap_full(
+        &mut self,
+        heap_need: u32,
+        roots: crate::context::RootSet<'_>,
+    ) -> Result<()> {
+        self.lives.push(roots.live);
+        self.x_slices.push(roots.x.to_vec());
+        let live = roots.live;
+        self.inner
+            .ensure_heap(heap_need, live, roots.x, roots.stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+}
+
+#[test]
+fn the_declared_extent_lets_a_mid_block_helper_see_native_writes() {
+    // The root-set half of the same contract: a helper the compiled body calls **in the
+    // middle of itself** reads the register files through the same extent, so an inlined
+    // store earlier in the same native function must already be inside the prefix the host
+    // is handed. Without the pre-call note the host would see a zero-length slice — a
+    // missed relocation, i.e. a stale pointer after a moving collection.
+    //
+    // The experiment is a body that inlines two `move`s (one into the deep `x9`) and then
+    // reaches `test_heap`, which this tier deopts to `jit_step_one` — the interpreter's own
+    // step, hence `Machine::ensure_heap` → `with_roots` → the probe.
+    const DEEP: u32 = 9;
+    let (module, f) = crate::jit::bench::support::Fixture::new("cranelift_extent_probe")
+        .finish(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(11),
+                    dst: Operand::X(0),
+                },
+                Instr::Move {
+                    src: Operand::Integer(22),
+                    dst: Operand::X(DEEP),
+                },
+                Instr::TestHeap {
+                    heap_need: beam_loader::HeapNeed::Words(8),
+                    live: DEEP + 1,
+                },
+                Instr::Return,
+            ],
+        );
+    let compiled = CraneliftJit::new()
+        .compile(&module)
+        .expect("compile the fixture");
+    assert_eq!(
+        compiled.highest_native_register(),
+        Some(DEEP),
+        "both `move`s are lowered natively, not deopted"
+    );
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+
+    let mut machine = Machine::new();
+    let mut probe = RootProbeCtx::new();
+    let outcome = run_native_outcome(&mut machine, &module, f, 0, &[], &mut probe, &code)
+        .expect("the natively compiled run returns");
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(11)),
+        "the fixture still returns x(0) — the extent is a root-set figure, never a value"
+    );
+
+    assert_eq!(
+        probe.x_slices.len(),
+        1,
+        "exactly one heap admission point was reached"
+    );
+    assert_eq!(
+        probe.lives,
+        vec![DEEP + 1],
+        "the instruction's own live count is forwarded unchanged"
+    );
+    let handed = &probe.x_slices[0];
+    assert_eq!(
+        handed.len() as u32,
+        DEEP + 1,
+        "the hand-off is the artifact's own x write extent, declared before the native call \
+         — without it the inlined stores are invisible and the host would be handed an \
+         empty slice"
+    );
+    assert_eq!(
+        handed[0],
+        make_small(11),
+        "x0 must hold its moved value at the helper boundary"
+    );
+    assert_eq!(
+        handed[DEEP as usize],
+        make_small(22),
+        "the deep inlined write must be inside the handed root prefix"
+    );
+}
