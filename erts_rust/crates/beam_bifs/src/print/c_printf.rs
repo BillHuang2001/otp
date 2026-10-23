@@ -24,7 +24,8 @@
 //! [`term_text`] is the crate's only **public** `%T` entry point: the in-crate
 //! caller is `crate::term_conv::display_1` (`erlang:display/1`) and the outside
 //! caller is `beam_rt`, so it is what `beam_rt` calls to render a `%T` term.
-//!//! A safe submodule of `crate::print` (it registers no BIFs and touches neither the
+//!
+//! A safe submodule of `crate::print` (it registers no BIFs and touches neither the
 //! `io_lib` leaf renderer nor its `Chunk` tree). `erlang:display/1` is
 //! `erts_printf("%.*T\n", INT_MAX, Term)` (`bif.c:4148-4194`), and `%T` is a
 //! **different** renderer from `~w`/`~p`: no spaces around `=`/`=>`, atoms quoted by
