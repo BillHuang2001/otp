@@ -1,9 +1,9 @@
 # `beam_rt` — per-call dispatch and copy-out cost (`DISPATCH-CUT` · `COPY-OUT-CUT`)
 
-The two per-call cost analyses of the runtime's BIF call path — the registered-BIF dispatch prologue and the scheduler-shape BIF-result copy-out — each priced in-process with `examples/perf_call.rs` at the HEAD it names.
+The three per-call cost analyses of the runtime's BIF call path — the registered-BIF dispatch prologue, the scheduler-shape BIF-result copy-out, and the memo-**hit** path that superseded the prologue — each priced at the HEAD it names (`examples/perf_call.rs` for the first two, retired instructions on the `tools/bench` fixtures for the third).
 These are **cut records, not the current snapshot**: each prices what one change moved, as a before/after ratio measured on one host, never as today's absolute per-call figure.
 Current cross-runtime and execution-tier figures are in [`PERF.md`](PERF.md); the dated `BEFORE`/`AFTER` cross-runtime snapshots (including the CLI-level `nb*` registered-BIF columns) are in [`PERF_HISTORY.md`](PERF_HISTORY.md); the harnesses, the dispatch-cost narrative and the trace seam are in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md).
-`DISPATCH-CUT` cuts the registered-BIF dispatch prologue (the per-context dispatch memo, the byte-hashed slot, the empty-NIF short-circuit, and the path-C regression the byte hash introduced); `COPY-OUT-CUT` cuts the BIF-result copy-out's wasted graph walk and needless retry.
+`DISPATCH-CUT` cuts the registered-BIF dispatch prologue (the per-context dispatch memo, the byte-hashed slot, the empty-NIF short-circuit, and the path-C regression the byte hash introduced); `COPY-OUT-CUT` cuts the BIF-result copy-out's wasted graph walk and needless retry; `MEMO-HIT-CUT` cuts the **hit** path that the memo left behind (the slot fold, the hook roster, the tail, and the two heap doors).
 Every number here is **measured, never modelled**, and absolute timings are load-polluted on every host this was run on — read the ratios and the interleaved pairs, with both sides named.
 
 ## Measurement provenance — the arm labels (`Path A`/`Path B`, `copy-out ON`/`OFF`)
@@ -402,6 +402,43 @@ below.
 copy-out/rewind rules (`the_copy_out_always_hands_the_copier_an_empty_destination_table`,
 `a_refused_copy_out_leaves_the_pooled_bif_heap_unrewound`, …) are untouched.
 
+## `MEMO-HIT-CUT` — the cost a memo **hit** still paid
+### What the census said first
+`DISPATCH-CUT` made the prologue memoizable, so the next question was whether the memo was actually answering.
+`BEAM_RT_PERF_COUNTERS=1` on `bench_gc_bound:churn/1` (N=20 000, 5 176 023 `call_bif` entries): **5 145 218 memo hits / 28 288 misses / 17 collisions** — 99.40 % hits, no string hashing and no roster re-evaluation on the hit path. `erlang:rem/2` alone was 98.9 % of the calls. So the remaining cost was **not** the prologue; it was the hit path's own work, and the four levers below were re-ranked accordingly.
+The same census, run against `bench_foreign_driver` and a real `compile:file/2`, is the standing instrument for "is a per-key cost memoized yet".
+### What changed
+1. **A one-entry MRU hint in front of the 128-slot fold** (`src/context/dispatch.rs`). It answers only after the memo's own field-for-field key equality, so it can skip work but never change an answer; pinned against a real colliding pair. Largest single win of the cut.
+2. **The hook roster packed into a `u16`** (`DispatchHooks`), with `of()` keeping the exhaustive array destructure of all eleven `uses_*` predicates and a `const` assertion that the mask is gap-free — a new arm still fails to compile rather than silently answering "no hooks".
+3. **The lean/full split.** The hooks-free arm builds **one** `BifContext` in an `#[inline]` body; the ten-arm chain moved to `#[cold] #[inline(never)] call_registered_full`, both sharing one `finish_registered_call` tail. Before the split the compiler emitted ~10 duplicated 320-byte context builds per call (904-byte frame, IPC 4.69, 0.18 % cache misses — store-volume limited).
+4. **Both heap doors end at their short-circuit** (`alloc_words_rooted`, `ensure_heap_full`), committing in an outlined `*_commit` that re-derives the pid/process; the plain-bump fill is a constant-folded immediate slice with the `n == 1|2` sizes materialized, so the per-cons-cell fill is not a runtime-length `memcpy`.
+5. **A `String` clone removed from the per-call path.** The fun-caller/send bridges hold the caller module as `Option<&str>`, `enter_module` refills its buffer instead of allocating, and the BIF-result gate shape-tests before it probes the process table.
+6. **A real bug fixed:** the refactor had hoisted `RuntimePorts` (which holds `Rc::clone` of the shared atom table) out of the invoke block, so the atom commit's `Rc::get_mut` append-only fast path was lost and `make_mut` cloned the **whole table** — one `String` per atom, per interning call. `atom_table_commit_alloc` failed deterministically at 2041/8043 allocations; after dropping the provider before the commit it is 7 at both table sizes.
+### Before/after — retired instructions (deterministic; the control rebuilt from its own source)
+`perf stat -e instructions:u`, pinned to a P-core, marginal estimator `(I(N) − I(0)) / N`:
+| fixture (N) | before | after | Δ |
+|---|---|---|---|
+| `bench_gc_bound:churn/1` (20 000) | 30 479.4 M | 26 038.6 M | **−14.6 %** |
+| `bench_foreign_driver:dec/1` (200 000) | 26 701.8 M | 24 402.9 M | **−8.6 %** |
+| `bench_foreign_driver:enc/1` (200 000) | 15 923.0 M | 15 023.5 M | −5.7 % |
+| `bench_foreign_driver:lower/1` (200 000) | 19 857.4 M | 19 678.0 M | −0.9 % |
+| `bench_foreign_driver:cap/1` (200 000) | 24 296.7 M | 24 122.3 M | −0.7 % |
+Wall clock agrees on the same two families (`churn` −9.8 % then −5.8 %, `dec` −9.2 % then −3.2 %) and is **not** evidence on `lower`/`cap`, whose ±2–4 % band is this host's two-build wall spread while their instructions *fell*.
+### The per-call budget this cut leaves behind
+**≈430 instructions of this crate's own work** per registered BIF call: ≈83 routing (`call_bif`'s NIF → floor → memo draw), ≈223 `BifContext` build + arm selection, ≈127 tail. Everything else in a call is `beam_engine` (`families::dispatch`, `exec_bif`, `local_call_seam`, `alloc_rooted`, `jit_set_position`), `src/runner/budget.rs`'s forwarding triple, or the BIF body.
+### What is left, ranked and owned (do not re-derive)
+1. **`src/runner/budget.rs`'s per-call forwarding triple** — 9.74 % of a churn run. Two borrowed stack fields and UFCS forwarding only, so this is *event* count (the engine charges `reduce(1)` per in-block transfer), not indirection: a maintenance win, not a speed one.
+2. **`beam_engine`'s baseline-JIT arith inlineset omits `rem`/`div`**, so `erlang:rem/2` takes the whole `call_bif` road and reaches `beam_bifs::arith::int_rem` → `Big::div_rem`, which allocates three heap `Vec`s. `N rem 256` vs `N band 255` over the same loop measures **≈50 % of churn's entire marginal** — the largest fixable per-call cost in the runtime.
+3. **`beam_engine`'s dispatch/bookkeeping symbols** (~18 % of a churn run in aggregate), then `beam_gc`/`beam_process`'s per-collection scratch (`malloc`/`free` 8.3 %).
+4. **`src/runtime/gc.rs::gc_request_pending`** — inlining `is_empty` and outlining the SipHash `contains` is worth ≈0.8 %; a safe `Heap` primitive that writes the header + placeholders and returns the base without a `Result` is worth ≈0.5–0.8 %.
+### Rejected on measurement (recorded so it is not retried)
+* **A floor-namespace gate in front of `try_native`'s 125-arm match** (`src/native.rs`): **+0.29 % instructions** — `erlang` is itself one of the floor's 14 namespace names and ~99 % of churn's calls, and the arm walk is already a well-predicted ~1 instruction.
+* **A thin `BifContext`**: ablating the whole `with_*` chain on the hooks-free arm is ≤1.5 instructions per dispatch and wrong-signed; `black_box`ing the five handles (a fair model of *not* getting SROA) costs 18.5 instructions, so thin LTO + one codegen unit already removes the struct moves.
+* **A raw-pointer `Process` memo across the double admission probe**: would need an eleventh `unsafe` exemption, and both invalidation hazards (the `Process` moving inside `ProcessTable::slots`; a second `RuntimeContext` on the same `Process` in a nested run) are real. The leftover is 2–4 instructions per admission.
+* **Outlining `forced_gc_request`** (+0.78 %) and **`#[inline(always)]` on the door impls** (+0.1 %).
+### Reconciled: two mysteries the earlier rounds left open
+* **`foreign`'s per-call cost is not N-dependent.** It was: commit `72d778dcf1` ("drop the per-slice off-heap registration mirror") fixed the quadratic term, and `lower/1` now reads 4 624.8 / 5 061.5 / 4 990.0 / 4 978.5 ns at N = 10 k / 50 k / 200 k / 500 k — flat, and *lower* at the top. `RESULTS.md`'s N-dependence paragraph and its "common-mode per-op heap retention" theory are stale.
+* **The whole-`AtomTable` clone was never per-call.** Only `codeserver.rs` (the `Rc<AtomTable>` owner, its `atoms_mut`, and `intern_pending`'s fallback) touches the table as a whole, and the hot dispatch path deliberately drops the handle so the intern commit stays append-only; the clone showed up in the profile because a `perf record` of a whole process includes the module-loading phase (≈3.7 % of startup, one per module). The one *real* per-call clone was the `RuntimePorts` `Rc` bug above, and it is fixed.
 ## See Also
 - [`PERF.md`](PERF.md) → the current cross-runtime figures and the execution-tier effect.
 - [`PERF_HISTORY.md`](PERF_HISTORY.md) → the dated `BEFORE`/`AFTER` cross-runtime snapshots and their `nb*` registered-BIF columns.

@@ -315,10 +315,15 @@ impl Runtime {
     /// Whether `pid`'s own process heap may be moved (it is not pinned, not halted, and the
     /// global valve is closed).
     pub(crate) fn gc_process_enabled(&self, pid: ProcessId) -> bool {
-        // The per-pid valves are read on **every** heap-admission point, before the occupancy
-        // short-circuit, and in a normal workload both sets are empty — so answer the empty
-        // case with a length compare instead of a (SipHash) probe that can only miss. The
-        // verdicts are byte-for-byte the ones `!set.contains(&pid)` gives for every input.
+        // The doors read this **only after** their occupancy/collection-debt short-circuit (the
+        // bump arm that serves the overwhelming majority of admissions does not read it at all),
+        // and in a normal workload both sets are empty — so answer the empty case with a length
+        // compare instead of a (SipHash) probe that can only miss. The verdicts are
+        // byte-for-byte the ones `!set.contains(&pid)` gives for every input.
+        //
+        // Do not hoist this to slice entry: the valves are opened and closed *mid-slice*
+        // (`halt_process_gc`, `note_foreign_reachable`), so a value cached for the slice would
+        // authorize a collection the runtime has already forbidden.
         self.gc_enabled()
             && (self.gc.pinned.is_empty() || !self.gc.pinned.contains(&pid))
             && (self.gc.halted.is_empty() || !self.gc.halted.contains(&pid))
