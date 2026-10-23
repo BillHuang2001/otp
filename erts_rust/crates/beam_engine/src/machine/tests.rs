@@ -48,8 +48,7 @@ use super::{CatchFrame, Continuation, Machine, RunOutcome};
 use crate::context::MinimalContext;
 use crate::Step;
 
-use super::local_callee::{CalleeKey, CalleeTarget};
-use super::Verdict;
+use super::local_callee::Verdict;
 
 // The production builders take the `Machine` plus a reader closure so a moving
 // collector can relocate operands between the reserve and the read; these tests
@@ -827,8 +826,18 @@ fn atom_of(module: &Module, name: &str) -> Atom {
 struct SeamObservations {
     /// How many times the host's `resolve_local_call` was consulted.
     consultations: Rc<Cell<usize>>,
+    /// The `(module, function, arity)` triples the host was asked about, in order — the
+    /// identity the seam derived from the callee's **own** function entry.
+    asked: Rc<std::cell::RefCell<Vec<(String, String, u32)>>>,
     /// How many times the host's BIF hook was called.
     bif_calls: Rc<Cell<usize>>,
+}
+
+impl SeamObservations {
+    /// The triples the host was asked about.
+    fn asked(&self) -> Vec<(String, String, u32)> {
+        self.asked.borrow().clone()
+    }
 }
 
 /// The host for the seam tests: a BIF hook that serves `m:helper/0` as `7` (and
@@ -848,11 +857,45 @@ fn seam_context(serve: bool, observations: &SeamObservations) -> MinimalContext 
         },
     ));
     let consultations = Rc::clone(&observations.consultations);
+    let asked = Rc::clone(&observations.asked);
     ctx.set_local_call_resolver(Box::new(move |module: &str, function: &str, arity: u32| {
         consultations.set(consultations.get() + 1);
+        asked
+            .borrow_mut()
+            .push((module.to_string(), function.to_string(), arity));
         Ok(serve && module == "m" && function == "helper" && arity == 0)
     }));
     ctx
+}
+
+/// A host whose `resolve_local_call` answers with a **typed error** — a stateful host that
+/// cannot decide yet. A failed consultation must not leave a verdict behind.
+fn erroring_seam_context(observations: &SeamObservations) -> MinimalContext {
+    let mut ctx = seam_context(false, observations);
+    let consultations = Rc::clone(&observations.consultations);
+    ctx.set_local_call_resolver(Box::new(move |_module, _function, _arity| {
+        consultations.set(consultations.get() + 1);
+        Err(crate::error::unsupported(
+            "seam test: the host cannot answer yet",
+        ))
+    }));
+    ctx
+}
+
+/// The verdict the machine's **current** module context holds for function index `callee`.
+fn verdict_of(machine: &Machine, callee: u32) -> Verdict {
+    machine
+        .verdict_table()
+        .expect("the executing context has a verdict table")
+        .get(callee)
+}
+
+/// How many callee-identity derivations the **current** context's table has paid.
+fn derivations(machine: &Machine) -> u64 {
+    machine
+        .verdict_table()
+        .expect("the executing context has a verdict table")
+        .derivation_count()
 }
 
 /// Run `export/0` of a fixture and report the value plus the observations.
@@ -871,10 +914,10 @@ fn run_fixture(
 }
 
 /// **(a) The host is consulted once per distinct callee per run.** Two consecutive local
-/// calls to the same callee ask `resolve_local_call` **once** and derive the identity
-/// **once**, then answer both calls from the memo: the host's verdict for a fixed
-/// `(module, function, arity)` triple is a pure function of that triple, and ERTS itself
-/// charges nothing for an intra-module call, so caching is the faithful choice.
+/// calls to the same callee ask `resolve_local_call` **once** and derive the callee's
+/// identity **once**, then answer both calls from the table's slot: the host's verdict for
+/// a fixed `(module, function, arity)` triple is a pure function of that triple, and ERTS
+/// itself charges nothing for an intra-module call, so caching is the faithful choice.
 #[test]
 fn the_local_call_seam_consults_the_host_once_per_callee_and_derives_the_identity_once() {
     let module = two_call_module();
@@ -889,43 +932,29 @@ fn the_local_call_seam_consults_the_host_once_per_callee_and_derives_the_identit
     );
     assert_eq!(observations.bif_calls.get(), 0, "a declined callee is not a BIF");
     assert_eq!(
-        machine.local_callees.fill_count(),
+        derivations(&machine),
         1,
-        "the identity is derived once and read from the memo on the second call"
+        "the identity is derived once and answered from the table's slot on the second call"
     );
+    // The identity the seam derived is the callee's **own**: its function entry's module
+    // atom and name atom, and its declared arity.
     assert_eq!(
-        machine.local_callees.ask_count(),
-        1,
-        "the verdict is recorded once"
+        observations.asked(),
+        vec![("m".to_string(), "helper".to_string(), 0)],
+        "the host was asked about the callee's own triple"
     );
-    // The memo holds the callee's **own** identity (its function entry's module atom and
-    // name atom, its declared arity), keyed on the module image's address — `helper` is
+    // The verdict is filed in the slot the callee's **function index** names — `helper` is
     // function index 2 of the fixture.
-    let key = CalleeKey {
-        module: &module as *const Module as usize,
-        func: 2,
-    };
     assert_eq!(
-        machine.local_callees.verdict(key),
-        Some(Verdict::Declined),
-        "the host's answer is memoized beside the identity"
-    );
-    let target: &CalleeTarget = machine
-        .local_callees
-        .memoized(key)
-        .expect("the callee is memoized");
-    assert_eq!(
-        (
-            target.module.as_ref(),
-            target.function.as_ref(),
-            target.arity
-        ),
-        ("m", "helper", 0)
+        verdict_of(&machine, 2),
+        Verdict::Declined,
+        "the host's answer is filed under the callee's function index"
     );
 }
 
-/// **(b) A call to a different callee is consulted again** — the memo keys on the callee,
-/// so it never answers one callee's question with another's verdict.
+/// **(b) A call to a different callee is consulted again, and never reads the other
+/// callee's slot** — the table is index-addressed, so one callee's verdict can never
+/// answer another's question.
 #[test]
 fn a_different_local_callee_is_consulted_again() {
     let module = two_callee_module();
@@ -937,14 +966,73 @@ fn a_different_local_callee_is_consulted_again() {
         2,
         "two distinct callees are two questions"
     );
-    assert_eq!(machine.local_callees.fill_count(), 2, "two identities");
-    assert_eq!(machine.local_callees.ask_count(), 2, "two verdicts");
+    assert_eq!(derivations(&machine), 2, "two identities");
+    assert_eq!(
+        verdict_of(&machine, func_of(&module, HELPER)),
+        Verdict::Declined
+    );
+    assert_eq!(
+        verdict_of(&machine, func_of(&module, HELPER2)),
+        Verdict::Declined
+    );
 }
 
-/// **(c) `Machine::invalidate_local_call_verdicts` forces a re-consultation** while
-/// keeping every memoized identity: this is the door a host with a stateful answer set
-/// calls (`erlang:load_nif/2` reaches it through the BIF-dispatch funnel, and the
-/// dedicated case below pins that route end to end).
+/// A callee the module cannot **name** (no function entry, or a name atom its atom table
+/// does not resolve) costs the host **zero** consultations, however often it is called: the
+/// table records [`Verdict::Unnameable`] and the seam never asks about a fabricated name.
+#[test]
+fn an_unnameable_callee_is_never_consulted() {
+    let mut module = two_call_module();
+    // `helper` is function index 2; `Atom::MAX` is the "no such atom" id, so the callee's
+    // name cannot be resolved from the module's own atom table.
+    module.functions[2].name = Atom::MAX;
+    let (outcome, observations, machine) = run_fixture(&module, "run", false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(99)),
+        "the un-nameable callee still runs in this machine"
+    );
+    assert_eq!(
+        observations.consultations.get(),
+        0,
+        "an un-nameable callee is never asked about"
+    );
+    assert!(observations.asked().is_empty(), "no name was fabricated");
+    assert_eq!(
+        verdict_of(&machine, 2),
+        Verdict::Unnameable,
+        "the un-nameable verdict is filed once"
+    );
+    assert_eq!(derivations(&machine), 0, "there was no identity to derive");
+}
+
+/// A host **error** is not a verdict: the failed consultation leaves the slot
+/// [`Verdict::Unknown`], so the next call asks again instead of answering from a failure.
+#[test]
+fn a_host_error_is_not_memoized_as_a_verdict() {
+    let module = two_call_module();
+    let observations = SeamObservations::default();
+    let mut ctx = erroring_seam_context(&observations);
+    let mut machine = Machine::new();
+    let err = machine
+        .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
+        .expect_err("the host's error propagates out of the seam");
+    assert!(
+        matches!(err, BeamError::Raise(_)),
+        "the host's typed error is raised, not swallowed: {err:?}"
+    );
+    assert_eq!(observations.consultations.get(), 1);
+    assert_eq!(
+        verdict_of(&machine, 2),
+        Verdict::Unknown,
+        "a failed consultation leaves no verdict behind"
+    );
+    assert_eq!(derivations(&machine), 1, "the identity was derived once");
+}
+
+/// **(c) `Machine::invalidate_local_call_verdicts` forces a re-consultation.** This is the
+/// door a host with a stateful answer set calls (`erlang:load_nif/2` reaches it through the
+/// BIF-dispatch funnel, and the dedicated case below pins that route end to end).
 #[test]
 fn invalidating_the_verdicts_forces_a_re_consultation() {
     let module = two_call_module();
@@ -957,9 +1045,13 @@ fn invalidating_the_verdicts_forces_a_re_consultation() {
         .expect("the first run completes");
     assert_eq!(observations.consultations.get(), 1);
 
-    // Invalidate, then run again on the **same** machine: the seam must ask again, and
-    // the identity must come from the memo (so nothing is re-derived).
+    // Invalidate, then run again on the **same** machine: the seam must ask again.
     machine.invalidate_local_call_verdicts();
+    assert_eq!(
+        verdict_of(&machine, 2),
+        Verdict::Unknown,
+        "invalidation resets the slot to `Unknown`"
+    );
     let outcome = machine
         .run_export_outcome(&module, name, 0, &[], &mut ctx)
         .expect("the second run completes");
@@ -969,41 +1061,34 @@ fn invalidating_the_verdicts_forces_a_re_consultation() {
         2,
         "an invalidated verdict is re-asked"
     );
-    assert_eq!(
-        machine.local_callees.fill_count(),
-        2,
-        "… and only the run entry re-derives (the machine's `reset` cleared it)"
-    );
 }
 
-/// **(d) `Machine::reset` forces a re-consultation**: the memo is address-keyed, so a new
-/// run must not answer from an image that is no longer the one being executed.
+/// **(d) `Machine::reset` forces a re-consultation**: the tables belong to the run that
+/// filled them, so a new run must not answer from a previous one.
 #[test]
 fn resetting_the_machine_forces_a_re_consultation_and_a_re_derivation() {
     let module = two_call_module();
-    let (_outcome, observations, mut machine) = run_fixture(&module, "run", false);
-    assert_eq!(machine.local_callees.fill_count(), 1);
+    let (outcome, observations, machine) = run_fixture(&module, "run", false);
+    assert_eq!(outcome, RunOutcome::Returned(make_small(99)));
+    assert_eq!(derivations(&machine), 1);
     assert_eq!(observations.consultations.get(), 1);
+    let mut machine = machine;
     machine.reset();
     assert_eq!(
-        machine
-            .local_callees
-            .verdict(CalleeKey {
-                module: &module as *const Module as usize,
-                func: 2,
-            }),
-        None,
-        "`reset` empties the memo (verdicts and identities alike)"
+        verdict_of(&machine, 2),
+        Verdict::Unknown,
+        "`reset` drops the entry module's table"
     );
+    assert_eq!(derivations(&machine), 0, "… into a fresh, all-unknown table");
     let observations = SeamObservations::default();
     let mut ctx = seam_context(false, &observations);
     machine
         .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
         .expect("the fixture runs again");
     assert_eq!(
-        machine.local_callees.fill_count(),
-        2,
-        "the reset cleared the memo, so the new run derived again"
+        derivations(&machine),
+        1,
+        "the reset dropped the table, so the new run derived again"
     );
     assert_eq!(
         observations.consultations.get(),
@@ -1034,21 +1119,18 @@ fn a_served_local_callee_is_dispatched_once_per_call_from_the_memoized_verdict()
         "and its answer is honoured once per call"
     );
     assert_eq!(
-        machine.local_callees.fill_count(),
+        derivations(&machine),
         1,
-        "the identity derivation stays memoized across both calls"
+        "the identity derivation is paid once, on the asking call"
     );
     assert_eq!(
-        machine.local_callees.verdict(CalleeKey {
-            module: &module as *const Module as usize,
-            func: 2,
-        }),
-        Some(Verdict::Served),
-        "a served verdict is memoized too"
+        verdict_of(&machine, 2),
+        Verdict::Served,
+        "a served verdict is filed too"
     );
 }
 
-/// The `call_last` arm keeps its frame discipline when the verdict comes from the memo:
+/// The `call_last` arm keeps its frame discipline when the verdict comes from the table:
 /// the served route's resting depths equal the in-machine route's (the frame pop is the
 /// discriminant — a skipped pop leaves the caller's two Y slots on the stack).
 #[test]
@@ -1059,7 +1141,7 @@ fn a_served_local_tail_call_still_pops_its_frame_with_the_memoized_verdict() {
     assert_eq!(declined, RunOutcome::Returned(make_small(99)));
     assert_eq!(declined_observations.consultations.get(), 1);
     assert_eq!(declined_observations.bif_calls.get(), 0);
-    assert_eq!(declined_machine.local_callees.fill_count(), 1);
+    assert_eq!(derivations(&declined_machine), 1);
     assert_eq!(
         (
             declined_machine.frame_depth(),
@@ -1073,7 +1155,7 @@ fn a_served_local_tail_call_still_pops_its_frame_with_the_memoized_verdict() {
     assert_eq!(served, RunOutcome::Returned(make_small(7)));
     assert_eq!(served_observations.consultations.get(), 1);
     assert_eq!(served_observations.bif_calls.get(), 1);
-    assert_eq!(served_machine.local_callees.fill_count(), 1);
+    assert_eq!(derivations(&served_machine), 1);
     assert_eq!(
         (
             served_machine.frame_depth(),
@@ -1112,11 +1194,6 @@ fn dispatching_load_nif_invalidates_the_memoized_verdicts() {
         observations.bif_calls.get(),
         1,
         "the install itself is the only BIF the fixture dispatches"
-    );
-    assert_eq!(
-        machine.local_callees.fill_count(),
-        1,
-        "the identity is still derived once — invalidation keeps the memo's identities"
     );
 }
 
@@ -1206,18 +1283,14 @@ fn the_load_nif_invalidation_stays_pending_until_the_next_local_call() {
         RunOutcome::Returned(make_small(0)),
         "the tail `load_nif/2` dispatch's own value flows out"
     );
-    let key = CalleeKey {
-        module: &module as *const Module as usize,
-        func: func_of(&module, HELPER),
-    };
     assert_eq!(
         observations.consultations.get(),
         1,
         "the one local call before the install asked the host"
     );
     assert_eq!(
-        machine.local_callees.verdict(key),
-        Some(Verdict::Declined),
+        verdict_of(&machine, func_of(&module, HELPER)),
+        Verdict::Declined,
         "the dispatch did not clear the verdict itself — the seam does, at the next local call"
     );
     assert!(
@@ -1229,9 +1302,9 @@ fn the_load_nif_invalidation_stays_pending_until_the_next_local_call() {
     machine.invalidate_local_call_verdicts();
     assert!(!machine.local_call_invalidation_pending.get());
     assert_eq!(
-        machine.local_callees.verdict(key),
-        Some(Verdict::Ask),
-        "the verdicts were cleared (the identity stays, so the next call re-asks)"
+        verdict_of(&machine, func_of(&module, HELPER)),
+        Verdict::Unknown,
+        "the verdicts were reset, so the next call re-asks"
     );
 }
 
@@ -1271,16 +1344,132 @@ fn an_ordinary_bif_dispatch_keeps_the_memoized_verdicts() {
     );
     let verdicts: Vec<_> = [HELPER, HELPER2]
         .iter()
-        .map(|label| {
-            machine.local_callees.verdict(CalleeKey {
-                module: &module as *const Module as usize,
-                func: func_of(&module, *label),
-            })
-        })
+        .map(|label| verdict_of(&machine, func_of(&module, *label)))
         .collect();
     assert_eq!(
         verdicts,
-        vec![Some(Verdict::Declined), Some(Verdict::Declined)],
+        vec![Verdict::Declined, Verdict::Declined],
         "both verdicts survived (no `load_nif/2` was dispatched)"
+    );
+    assert_eq!(derivations(&machine), 2, "one derivation per callee");
+}
+
+/// A module named `n` whose `run/0` makes a **local** call to its own unexported
+/// `helper/0` — the callee shape a registered module context executes in-machine.
+fn callee_module() -> Module {
+    let mut fixture = Fixture::new("n");
+    let run = fixture.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Call {
+                target: HELPER,
+                arity: 0,
+            },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    fixture.add_function(
+        "helper",
+        0,
+        vec![
+            Instr::Label(HELPER),
+            Instr::Move {
+                src: Operand::Integer(99),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    fixture.add_export("run", 0, run);
+    fixture.finish()
+}
+
+/// A module named `m` whose `run/0` is a single `call_ext n:run/0` — the entry module that
+/// makes **no** local call at all.
+fn calling_entry_module() -> Module {
+    let mut fixture = Fixture::new("m");
+    let callee = fixture.import("n", "run", 0);
+    let run = fixture.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::CallExt {
+                target: callee,
+                arity: 0,
+            },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    fixture.add_export("run", 0, run);
+    fixture.finish()
+}
+
+/// **The table is per module context**, so a function index means the same thing in one
+/// table only: a local call made *inside* a registered cross-module callee files its verdict
+/// in **that** context's table, and the run's entry module — which makes no local call —
+/// keeps an all-`Unknown` table. A shared table would file `n:helper/0`'s verdict under
+/// `m`'s function index `2` (or vice versa), which is exactly the wrong-answer bug the
+/// context-owned table cannot have.
+#[test]
+fn a_local_call_inside_a_registered_context_files_its_verdict_in_that_contexts_table() {
+    let callee = Arc::new(callee_module());
+    let entry = calling_entry_module();
+    let observations = SeamObservations::default();
+    let mut ctx = seam(
+        vec![("n".to_string(), Arc::clone(&callee))],
+    );
+    // The cross-module seam context counts nothing; the **local**-call resolver must be
+    // consulted exactly once, for the callee module's own `helper/0`.
+    let consultations = Rc::clone(&observations.consultations);
+    let asked = Rc::clone(&observations.asked);
+    ctx.set_local_call_resolver(Box::new(move |module: &str, function: &str, arity: u32| {
+        consultations.set(consultations.get() + 1);
+        asked
+            .borrow_mut()
+            .push((module.to_string(), function.to_string(), arity));
+        Ok(false)
+    }));
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&entry, atom_of(&entry, "run"), 0, &[], &mut ctx)
+        .expect("the cross-module call runs in this machine");
+    assert_eq!(outcome, RunOutcome::Returned(make_small(99)));
+    assert_eq!(
+        observations.asked(),
+        vec![("n".to_string(), "helper".to_string(), 0)],
+        "the callee module's own local call, asked in the callee's own context"
+    );
+    // The registered context (`n`, context id 1) holds the verdict...
+    let table = machine
+        .contexts
+        .verdicts(1)
+        .expect("context 1 is the registered callee module");
+    assert_eq!(
+        table.get(func_of(&callee, HELPER)),
+        Verdict::Declined,
+        "the callee module's table holds its own callee's verdict"
+    );
+    assert!(
+        table.describes(&callee),
+        "the table belongs to the registered module image"
+    );
+    // ... and the entry module's table was never touched: `m:run/0` makes no local call.
+    assert!(
+        (0..entry.functions.len() as u32).all(|func| machine.entry_verdicts.get(func)
+            == Verdict::Unknown),
+        "the entry module filed nothing: it made no local call"
     );
 }
