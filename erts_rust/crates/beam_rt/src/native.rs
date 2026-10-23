@@ -127,7 +127,6 @@ use beam_term::{
 
 use crate::context::RuntimeContext;
 use crate::error;
-use crate::format;
 
 /// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
 ///
@@ -1017,23 +1016,6 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &elems)
     }
 
-    /// A term rendered by the registered `io:format` printer, using `format`'s control.
-    ///
-    /// The scratch heap is rewound first (through the scratch gate,
-    /// [`Runtime::reset_info_scratch`](crate::Runtime::reset_info_scratch)), so the text — not
-    /// any term — is the result.
-    fn render(&mut self, term: Eterm, control: &[u8]) -> Result<String> {
-        self.runtime.reset_info_scratch();
-        let runtime = &mut self.runtime;
-        format::term_to_string_with(
-            &runtime.registry,
-            &mut runtime.info_heap,
-            runtime.code_server.atoms(),
-            runtime.self_pid,
-            term,
-            control,
-        )
-    }
     /// Writes `text` to the installed output sink (stdout when none is installed).
     fn write_output(&mut self, text: &str) -> Result<()> {
         use beam_bifs::OutputSink;

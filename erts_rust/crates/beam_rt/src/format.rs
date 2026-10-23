@@ -20,8 +20,8 @@
 
 //! Printing a term: `term_to_string` drives the registered `io:format/2` `~p` printer.
 //!
-//! There is exactly **one** term printer in the workspace and it is the `io:format`
-//! BIF of [`beam_bifs`]; this module only knows how to *call* it. It builds the format
+//! No renderer is re-implemented here; this module only knows how to *call* the ones
+//! [`beam_bifs`] owns. The first is the `io:format` BIF: it builds the format
 //! list `"~p~n"` and the argument list `[Term]` on the destination heap, runs
 //! `io:format(Fmt, Args)` with the caller's atom table against a capture sink and hands
 //! back the captured text.
@@ -35,9 +35,17 @@
 //! does **not** collapse a list of printable characters into a string literal
 //! (`~w` of `[97,98,99]` is `[97,98,99]`).
 //!
-//! [`term_to_string_with`] is the one printer: it builds the format list from the
-//! requested format control and drives the BIF. Every other entry point is a thin
-//! wrapper over it, so a new format control never means a second printer.
+//! [`term_to_string_with`] is the one `io:format`-control printer: it builds the format
+//! list from the requested format control and drives the BIF. Every other
+//! `io:format`-control entry point is a thin wrapper over it, so a new format control
+//! never means a second printer.
+//!
+//! [`term_text`] is a **different** renderer: it drives `beam_bifs`'s faithful port of
+//! the C's `%T` (`erl_printf_term.c::print_term`) instead of `io:format`, so it is not
+//! built on [`term_to_string_with`]. The two disagree by construction — `%T` writes no
+//! spaces around `=`/`=>`, prints a float with `%e` (`1.500000e+00`), quotes a
+//! printable string, and (for a finite `precision`) stops at a **byte** budget and
+//! appends `"... "`.
 
 use beam_alloc::Heap;
 use beam_bifs::{BifContext, BifRegistry, BytesSink};
@@ -120,6 +128,44 @@ pub fn term_to_string_with(
     let mut context = BifContext::new(heap, atoms, self_pid).with_output(&mut sink);
     registry.call("io", "format", 2, &mut context, &[format, args])?;
     Ok(sink.as_str())
+}
+
+/// Renders `term` as the C's `%T` would (`erl_printf_term.c::print_term`), with
+/// `precision` as the C's **byte** budget.
+///
+/// This is a *different* renderer from [`term_to_string`]/[`term_to_string_w`], not a
+/// format control over the same one: it is [`beam_bifs`]'s faithful port of `%T`, so it
+/// writes no spaces around `=`/`=>` (`#{a=>1}`), prints a float with `%e`
+/// (`1.500000e+00`) and applies the printable-string rule (`<<"ab">>` stays a binary,
+/// `[104,101]` becomes `"he"`). `precision` is `i64::MAX` for the C's `INT_MAX`/
+/// unlimited form; any other value truncates at the exact byte the C stops at and
+/// appends the three-byte tail `"... "`. A byte budget, never a `~P` nesting depth.
+///
+/// The atom table is its **only** seam: the renderer allocates nothing on `heap` and
+/// consults no other host service, so everything it cannot derive (an external pid/port/
+/// reference, a `Local` fun with no
+/// [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) seam) is its own typed
+/// [`unsupported`](crate::error::unsupported) — never a fabricated rendering.
+///
+/// In-crate its one caller is the `erts_internal:term_to_string/1,2` native floor
+/// (`crate::native::erts_internal`), through [`crate::Runtime::format_term_text`]; there
+/// is deliberately no public `%T` surface beyond `beam_bifs`'s.
+///
+/// # Errors
+///
+/// Whatever the renderer reports: a typed
+/// [`unsupported`](crate::error::unsupported) for an external pid/port/reference or an
+/// identity-less `Local` fun, and
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed native record.
+pub fn term_text(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    self_pid: ProcessId,
+    term: Eterm,
+    precision: i64,
+) -> Result<String> {
+    let mut context = BifContext::new(heap, atoms, self_pid);
+    beam_bifs::print::c_printf::term_text(&mut context, term, precision)
 }
 
 #[cfg(test)]
