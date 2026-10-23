@@ -9776,9 +9776,9 @@ fn an_imported_fun_naming_an_unloadable_module_raises_undef() {
     // loaded module, and no `nosuchmd.beam` on any code path either.
     let checksum = beam_codec::term::fun_uniq_bytes(genuine).expect("the image's 16-byte uniq");
     let (index, old_index, uniq) = (
-        beam_codec::term::fun_index_term(genuine).expect("the index field"),
-        beam_codec::term::fun_old_index_term(genuine).expect("the old_index field"),
-        beam_codec::term::fun_old_uniq_term(genuine).expect("the old_uniq field"),
+        beam_codec::term::fun_index(genuine).expect("the index field"),
+        beam_codec::term::fun_old_index(genuine).expect("the old_index field"),
+        beam_codec::term::fun_old_uniq(genuine).expect("the old_uniq field"),
     );
     let missing_module = atom_val(rt.intern("nosuchmd"));
     let creator = beam_codec::term::FunPid {
