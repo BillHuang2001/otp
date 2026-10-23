@@ -71,6 +71,23 @@ never touched from here.
   (`-pa`, which crashes the emulator at boot with an EMPTY stdout+stderr).
 - `support/` is shared by every test crate; its facade re-exports the whole surface, so a
   re-export an individual crate does not use is not an unused import.
+- **Term lifetime = arena lifetime** (`src/context.rs:1949-1964`): an `Eterm` is readable only while
+  the `MinimalContext` that built it lives (the blocks go back to `beam_alloc`'s process-global pool
+  and the next arena overwrites them). `ModuleHost` owns the one arena (`support/host.rs:58`) and every
+  helper takes `host: &mut ModuleHost`, so a term returned by `ModuleHost::call`, `support::oracle`'s
+  `breadth_args`/`arg_term`/`parse_expected_value`/`poison_term`/`ErrorTarget::reason_term` or the
+  `assertions`/`int_list`-style builders is caller-owned and safe **as long as that host is alive** —
+  build the host once per test, never inside a `for`/`while` body, and keep a second host alive
+  whenever two runs' terms are compared. `Eterm`'s `PartialEq`/`Debug` are derived (raw word), so
+  `assert_eq!` does not dereference while `beam_term::cmp`/`eq`, `render_term`, `terms::*`, `as_atom`
+  and `atom_name` do.
+- Two provenance-free `Eterm` carriers exist in the shared helpers and are why the rule needs stating:
+  `Probe::resume_message` (`support/probe/mod.rs:615`, built outside the run's context, pushed into
+  the mailbox `run` hands the engine; no row sets it) and `Observed::value()`
+  (`support/probe/mod.rs:551`, documents "only valid while the `ProbeRun` is alive" but not in the
+  type; no caller). `Expected::Term` (`support/oracle.rs:165`) is likewise parsed against one host and
+  must be `matches`-ed against that same host. `ProbeRun` itself is the *correct* shape: it owns
+  `module` + `machine` + `ctx` beside the terms.
 
 ## Per-fixture suites
 Produced by the system `erlc`, the differential oracle — see `tests/fixtures/README.md` for the regeneration recipe and the opcode coverage of each fixture:
