@@ -453,23 +453,15 @@ impl InetState {
 ///   operation". A read that fails with `ECONNRESET` under `{show_econnreset,true}`
 ///   (`tcp_recv_error`, `:12849`) arms **nothing at all** — not even the reset bit.
 ///
-///   It is also armed — a documented substitution, not a C flag — by a read-side discovery the
-///   **reactor** makes with no receive queued ([`ReadReport::OwedToNextRecv`]). In the C that
-///   situation cannot arise in passive mode: read interest is armed only by a queued
-///   `TCP_REQ_RECV` (`sock_select(FD_READ|FD_CLOSE, 1)`, `:12315`), so the receive that armed it
-///   is always the one the end-of-file is answered to — through `async_error_am_all(am_closed)`
-///   (`tcp_recv_closed`, `:12829`) for an end-of-file, or `async_error_am_all(error_atom(err))`
-///   (`tcp_recv_error`, `:12877`) for a reset. This floor's poller is **edge-triggered** and keeps
-///   the socket's `READABLE` registration for its whole life, so `ready_input` routinely reads the
-///   end-of-file first, with nobody to answer. The reply that C discovery would have given the
-///   pending receive then belongs to the user's **next** `recv`, so it is armed here instead of
-///   being lost — keeping the *user-visible* sequence `closed` (then `enotconn`) whichever party
-///   made the observation.
+///   A **read** discovery never arms it, here or in the C: the C reads a socket only while it is
+///   selected (`{active, …}` or a waiting `TCP_REQ_RECV`), so the reader that finds the close is
+///   always the party it is answered to, and the reply is given inline through
+///   [`PeerClose::observed_reason`]. This floor's eager passive reactor read is *not* such a
+///   reader, so a close it finds is not applied at all — it stays pending for the read the C would
+///   have made (see [`ReadReport`] and [`TcpInetDriver::pending_close`]).
 /// * `DELAYED_ECONNRESET` — armed only when that write-path observation was an `ECONNRESET`
 ///   **and** `{show_econnreset,true}` was in effect at that moment (`:13615`, `:13683`-`:13685`).
-///   It turns the `closed` of either ladder into `econnreset`. (The reactor substitution above
-///   arms it too, for the `econnreset` the deferred reply owes — the C reaches that answer through
-///   `tcp_recv_error`'s `error_atom(err)` rather than through this bit, `:12877`.)
+///   It turns the `closed` of either ladder into `econnreset`.
 ///
 /// The two reply ladders are **asymmetric** and reproduce the C's exactly:
 ///
@@ -496,9 +488,8 @@ struct PeerClose {
     delayed_close_send: bool,
     /// The C's `TCP_ADDF_DELAYED_ECONNRESET`, generalised into the reason the deferred reply
     /// owes: `None` is the `closed` both ladders answer by default, `Some(reason)` is the
-    /// `econnreset` of a write-path reset under `{show_econnreset,true}` **and** the
-    /// `error_atom(err)` a reactor-discovered **read error** owes
-    /// (`tcp_recv_error`'s `async_error_am_all(error_atom(err))`, `inet_drv.c:12877`).
+    /// `econnreset` of a write-path reset under `{show_econnreset,true}` — the only site that arms
+    /// it (`tcp_send_or_shutdown_error`, `inet_drv.c:13683`-`:13685`).
     delayed_reason: Option<InetReason>,
     /// The reason the **discovering** operation reports, `None` being `closed`: `econnreset` for
     /// a reset under `{show_econnreset,true}`, the failing errno for a read error.
@@ -521,8 +512,6 @@ enum CloseSource {
         /// `ECONNRESET` to `tcp_recv_error` **only** under `{show_econnreset,true}`, so a reset
         /// without the option is `None` here and still `tcp_recv_closed`'s clean close.
         error: Option<i32>,
-        /// Who the discovery's `closed`/`econnreset` reply belongs to (see [`ReadReport`]).
-        report: ReadReport,
     },
     /// A **write** — or a `shutdown` refused because the connection was already gone — discovered
     /// it (`tcp_send_or_shutdown_error`, `inet_drv.c:13613`).
@@ -532,27 +521,46 @@ enum CloseSource {
     },
 }
 
-/// Who a **read**-side discovery's `closed`/`econnreset` reply belongs to.
+/// Whether a read is one the **C would have made**, and therefore whether a close it discovers is
+/// one.
 ///
-/// The C never has to ask: in passive mode the read interest is armed **only** by a queued
-/// `TCP_REQ_RECV` (`sock_select(FD_READ|FD_CLOSE, 1)`, `inet_drv.c:12315`), so the party that can
-/// read the end-of-file is always the receive it answers. This floor's poller is
-/// **edge-triggered** and keeps the socket's `READABLE` registration for its whole life (see
-/// `src/drivers/CONTEXT.md`), so the reactor may be the discoverer with no receive in sight — and
-/// then the answer the C gives that receive is still owed.
+/// The C selects a socket's read side in exactly two states: while `desc->inet.active > 0`
+/// (`sock_select(desc, (FD_READ|FD_CLOSE), (desc->active>0))` — `inet_drv.c:7966` on `setopts`,
+/// `:12126`/`:14286` on connect, `:11146` for the `setopts` inline trigger) and while a
+/// `TCP_REQ_RECV` is waiting for bytes (`sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)`,
+/// `:12317`). `tcp_deliver` deselects it when a delivery spends the grant (`:13110`), and
+/// `tcp_recv`'s own inline read runs inside the `TCP_REQ_RECV` control call. So **every** read the
+/// C performs is made on behalf of somebody who answers it: an `{active, …}` owner
+/// (`{tcp, S, Data}`/`{tcp_closed, S}`) or the waiting receive (`{error, closed}`).
+///
+/// This floor's poller is **edge-triggered** and keeps the socket's `READABLE` registration for
+/// its whole life (see `src/drivers/CONTEXT.md`), so `ready_input` also reads sockets the C would
+/// not have read — a passive connection with no receive queued ([`ReadReport::Unselected`], the
+/// passive `{Port, {data, …}}` floor). Such a read is a *delivery* shortcut, not a discovery: the
+/// bytes it collects are delivered, but a close it finds has **not** been discovered in the C's
+/// terms and must not end the connection (nor tear the descriptor down under the default
+/// `{exit_on_close,true}`) — it stays pending in [`TcpInetDriver::pending_close`] for the read the
+/// C would have made.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadReport {
-    /// The party that made the discovery also answers it: a queued `TCP_REQ_RECV`
+    /// The C's own reader: a queued `TCP_REQ_RECV`
     /// (`async_error_am_all(am_closed)`, `inet_drv.c:12829`; `async_error_am_all(error_atom(err))`,
-    /// `:12877`) or this floor's synchronous `recv` verb (`tcp_recv_closed`/`tcp_recv_error`'s own
-    /// return value, `:13185`-`:13196`). An active-mode delivery is the same shape: the close is
-    /// reported through `{tcp_closed, S}`/`{tcp_error, S, Reason}` (`:12841`/`:12871`) instead of a
-    /// receive reply.
+    /// `:12877`), this floor's synchronous `recv` verb (`tcp_recv_closed`/`tcp_recv_error`'s own
+    /// return value, `:13185`-`:13196`), or an active-mode delivery (the close is reported through
+    /// `{tcp_closed, S}`/`{tcp_error, S, Reason}`, `:12841`/`:12871`, instead of a receive reply).
+    /// It applies the close it discovers.
     Answered,
-    /// Nobody was there to answer it: the **reactor** read the end-of-file (or the reset) with no
-    /// operation queued, so the reply is armed as `TCP_ADDF_DELAYED_CLOSE_RECV` for the user's
-    /// **next** `recv` instead of being lost.
-    OwedToNextRecv,
+    /// A socket whose read side the C would **not** have selected: the **reactor**'s eager passive
+    /// read, with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force. It delivers the
+    /// bytes it reads and applies nothing.
+    Unselected,
+}
+
+impl ReadReport {
+    /// Whether the C would have made this read — i.e. whether a close it discovers is a discovery.
+    fn is_selected(self) -> bool {
+        matches!(self, ReadReport::Answered)
+    }
 }
 
 impl CloseSource {
@@ -563,7 +571,7 @@ impl CloseSource {
     /// `TCP_ADDF_DELAYED_*` latch.
     fn reason(self) -> Option<InetReason> {
         match self {
-            CloseSource::Read { error, .. } => error.map(InetReason::from_errno),
+            CloseSource::Read { error } => error.map(InetReason::from_errno),
             CloseSource::Write { reset } => reset.then(|| InetReason::from_errno(libc::ECONNRESET)),
         }
     }
@@ -583,18 +591,11 @@ impl PeerClose {
             // `tcp_recv_closed` (`:12810`-`:12819`) arms the *send* one-shot only — a clean
             // end-of-file owes the receive nothing beyond the reply it already gave.
             //
-            // Both hold for `ReadReport::Answered`, where the discovering operation takes that
-            // reply. A reactor-made discovery has no such operation, so the reply it owes is armed
-            // on the receive ladder — carrying `error_atom(err)` for a read failure and the plain
-            // `closed` for a clean end-of-file, because `tcp_recv_error` names the reason in its
-            // `async_error_am_all` argument while `tcp_recv_closed` names `am_closed`.
-            CloseSource::Read { error, report } => {
-                self.delayed_reason = error.map(InetReason::from_errno);
+            // Both assume the discovering operation took that reply, which is now guaranteed: only
+            // a read the C would have made is applied at all ([`ReadReport`]).
+            CloseSource::Read { error } => {
                 if error.is_none() {
                     self.delayed_close_send = true;
-                }
-                if report == ReadReport::OwedToNextRecv {
-                    self.delayed_close_recv = true;
                 }
             }
             CloseSource::Write { reset } => {
@@ -722,15 +723,28 @@ pub struct TcpInetDriver {
     /// data. A switch **to** [`PacketType::Raw`] therefore delivers the whole retained buffer
     /// (plus everything after it) verbatim, so raw mode stays authoritative for queued bytes.
     pending_input: Vec<u8>,
-    /// A close the socket reported that has **not** been latched yet.
+    /// A close a **read** observed and no reader has **applied** yet — the observation is sticky,
+    /// its consequences are not.
     ///
-    /// [`TcpInetDriver::read_bytes`] never latches: it reports the observation and leaves the
-    /// decision to its caller. A queued receive (`try_complete_recv`) that read data **and** the
-    /// peer's end of file in one drain must hand the data over first — the C's `tcp_recv`
-    /// answers a complete unit before it ever reaches the `n == 0` arm (`inet_drv.c:13216`,
-    /// `:13206`), so `{error, closed}` is owed to the *next* receive. Every other caller latches
-    /// straight away, which is the C's ordering for a discovery no operation is parked on.
-    deferred_close: Option<CloseSource>,
+    /// `read(2)` reports the peer's end of file for ever, but a reset (`ECONNRESET`) exactly
+    /// **once**, so the observation has to be kept: [`TcpInetDriver::read_bytes`] records it here
+    /// and re-answers it instead of reading again, and [`TcpInetDriver::latch_peer_close`] — the
+    /// only site that arms the reply ladders, drops the queued output and tears the descriptor
+    /// down — clears it.
+    ///
+    /// Two callers deliberately leave it pending for a later reader:
+    ///
+    /// * a **queued receive** (`try_complete_recv`) that read data **and** the peer's end of file
+    ///   in one drain must hand the data over first — the C's `tcp_recv` answers a complete unit
+    ///   before it ever reaches the `n == 0` arm (`inet_drv.c:13216`, `:13206`), so
+    ///   `{error, closed}` is owed to the *next* receive;
+    /// * the **reactor's** eager passive read ([`ReadReport::Unselected`]): the C selects a
+    ///   socket's read side only for a granted `{active, …}` or a waiting `TCP_REQ_RECV`
+    ///   (`sock_select(…, 1)`, `inet_drv.c:12317`, `(desc->active>0)`, `:7966`), so a close this
+    ///   floor reads outside those two states has **not** been discovered in the C's terms and
+    ///   must not end the connection — the bytes are delivered, and the observation waits for the
+    ///   read that the C would have made.
+    pending_close: Option<CloseSource>,
     /// The C descriptor's cached address family (`inet.sfamily`, `inet_drv.c:10925`), as the
     /// wire's [`INET_AF_INET`] tag, with `0` meaning "unset". Set by `open`/`fdopen` and
     /// **never** cleared by a close, which is why `INET_REQ_GETTYPE` still answers after one.
@@ -856,7 +870,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            deferred_close: None,
+            pending_close: None,
             family: 0,
             stype: 0,
             name_addr: None,
@@ -912,7 +926,7 @@ impl TcpInetDriver {
             connect_error: None,
             options: SocketOptions::default(),
             pending_input: Vec::new(),
-            deferred_close: None,
+            pending_close: None,
             family: u16::from(INET_AF_INET),
             stype: sys::socket_type(fd)?,
             name_addr: None,
@@ -1053,7 +1067,7 @@ impl TcpInetDriver {
                 // A fresh socket starts a fresh byte stream: any partial frame buffered for
                 // the previous socket no longer belongs to this one.
                 self.pending_input.clear();
-                self.deferred_close = None;
+                self.pending_close = None;
                 // ... and a fresh read side: nothing has been delivered on the new socket yet, so
                 // no `{active, …}` grant can be spent (see [`TcpInetDriver::read_armed`]).
                 self.read_armed = true;
@@ -1134,7 +1148,7 @@ impl TcpInetDriver {
         // A fresh socket starts a fresh byte stream: any partial frame buffered for the previous
         // socket no longer belongs to this one.
         self.pending_input.clear();
-        self.deferred_close = None;
+        self.pending_close = None;
         // The read side is selected again: the new socket has delivered nothing yet.
         self.read_armed = true;
         self.state = if connected {
@@ -1160,7 +1174,7 @@ impl TcpInetDriver {
         // The new connection's byte stream begins now: drop any partial frame buffered for the
         // socket this one replaces.
         self.pending_input.clear();
-        self.deferred_close = None;
+        self.pending_close = None;
         // ... and nothing has been delivered on it yet, so its read side is selected again.
         self.read_armed = true;
     }
@@ -1299,9 +1313,10 @@ impl TcpInetDriver {
     /// not `read(2)`) and the peer's close has not already been observed. Returns the number of
     /// bytes read.
     ///
-    /// `report` says whether **this caller** answers a peer close the read discovers
-    /// ([`ReadReport`]): the `recv` verbs do, the reactor (`ready_input`, with no operation
-    /// queued) does not and owes the reply to the user's next `recv`.
+    /// `report` says whether this read is one the **C would have made** ([`ReadReport`]): every
+    /// read of a **selected** socket applies the close it finds (the latch, then the bytes above),
+    /// while the reactor's eager read of an **unselected** one only delivers the bytes and leaves
+    /// the observation pending for the read the C would have made.
     ///
     /// # Errors
     ///
@@ -1312,14 +1327,17 @@ impl TcpInetDriver {
         report: ReadReport,
     ) -> Result<usize> {
         let mut bytes = Vec::new();
-        let close = self.read_bytes(&mut bytes, report)?;
+        self.read_bytes(&mut bytes)?;
         let read = bytes.len();
-        if let Some(source) = close {
-            // The close this read discovered is answered by **this** caller, and the latch runs
-            // before the bytes are queued so that a `{packet, N}` frame read in the same call
-            // survives the teardown's `tcp_clear_input` (the C's discovery sites clear and only
-            // then deliver, `inet_drv.c:12824`-`:12829`).
-            self.latch_peer_close(ctx, source)?;
+        // The close is answered by **this** caller only when the C would have made this read at
+        // all; otherwise it stays pending ([`TcpInetDriver::pending_close`]) for the reader that
+        // answers it. The latch runs before the bytes are queued so that a `{packet, N}` frame
+        // read in the same call survives the teardown's `tcp_clear_input` (the C's discovery sites
+        // clear and only then deliver, `inet_drv.c:12824`-`:12829`).
+        if report.is_selected() {
+            if let Some(source) = self.pending_close {
+                self.latch_peer_close(ctx, source)?;
+            }
         }
         if self.framed().is_some() {
             // `{packet, N}`: the bytes are not a message yet — hold them for the frame decoder.
@@ -1346,25 +1364,26 @@ impl TcpInetDriver {
     /// The edge-triggered poller means a caller must drain to `EAGAIN` per readiness callback,
     /// which this loop does.
     ///
-    /// Answers the peer-close **observation** when this drain is the one that made it, and latches
-    /// nothing itself: it only records [`TcpInetDriver::read_eof`] and hands the [`CloseSource`]
-    /// back, so the caller decides when the close is applied (the C's discovery sites clear and
-    /// only then deliver, `inet_drv.c:12824`-`:12829`) — see [`TcpInetDriver::read_available`]'s
-    /// latch and [`TcpInetDriver::deferred_close`] for the payload-first ordering. `report` is
-    /// threaded into the returned [`CloseSource::Read`] — see [`ReadReport`].
+    /// A close this drain discovers is **recorded**, never applied: it goes into
+    /// [`TcpInetDriver::pending_close`] (with [`TcpInetDriver::read_eof`]) and is re-answered by
+    /// every later call, so the caller — or a caller after it — decides when the close is latched
+    /// (the C's discovery sites clear and only then deliver, `inet_drv.c:12824`-`:12829`). Keeping
+    /// it is not optional: `read(2)` reports a peer's reset **once**, so a caller that declines to
+    /// apply it ([`ReadReport::Unselected`]) would otherwise lose the reason.
     ///
     /// # Errors
     ///
     /// [`TcpInetDriver::connected_socket`]'s `BadArg` (a connected state with no descriptor). A
     /// **read** failure is not one of them: it is classified through [`CloseSource::Read`] instead
     /// of being raised.
-    fn read_bytes(
-        &mut self,
-        out: &mut Vec<u8>,
-        report: ReadReport,
-    ) -> Result<Option<CloseSource>> {
+    fn read_bytes(&mut self, out: &mut Vec<u8>) -> Result<()> {
         if !self.state.is_connected() || self.peer_close.seen {
-            return Ok(None);
+            return Ok(());
+        }
+        if self.pending_close.is_some() {
+            // The observation is already made and nothing can follow it (a peer that sent its end
+            // of file never sends more), so this read has nothing to add.
+            return Ok(());
         }
         let fd = self.connected_socket()?;
         let mut buf = [0u8; READ_CHUNK];
@@ -1383,15 +1402,14 @@ impl TcpInetDriver {
                 // The peer closed its end cleanly: `tcp_recv`'s `n == 0` arm
                 // (`inet_drv.c:13206`) goes to `tcp_recv_closed`, which arms only the *send*
                 // one-shot (`:12816`) — the *receive* side is owed the `closed` of
-                // `async_error_am_all(am_closed)` (`:12829`), which this floor's reactor must
-                // defer to the next `recv` (`report`).
-                self.read_eof = true;
-                return Ok(Some(CloseSource::Read { error: None, report }));
+                // `async_error_am_all(am_closed)` (`:12829`), which the answering read gives it.
+                self.observe_read_close(None);
+                return Ok(());
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(None),
+                Some(libc::EAGAIN) => return Ok(()),
                 // The C's `tcp_recv` classification (`inet_drv.c:13185`-`:13210`), in its order:
                 // `ECONNRESET` goes to `tcp_recv_error` — which reports `error_atom(err)` and
                 // arms nothing — **only** while `TCP_ADDF_SHOW_ECONNRESET` is set
@@ -1406,10 +1424,25 @@ impl TcpInetDriver {
                     } else {
                         Some(errno)
                     };
-                    self.read_eof = true;
-                    return Ok(Some(CloseSource::Read { error, report }));
+                    self.observe_read_close(error);
+                    return Ok(());
                 }
             }
+        }
+    }
+
+    /// Records a close this driver's `read(2)` just discovered — the observation half of
+    /// [`TcpInetDriver::read_bytes`], shared by its two discovery arms.
+    ///
+    /// It sets [`TcpInetDriver::read_eof`] and parks the [`CloseSource`] in
+    /// [`TcpInetDriver::pending_close`], where the first reader the C would have made applies it
+    /// ([`TcpInetDriver::latch_peer_close`]). The first observation wins: a later read cannot
+    /// replace it (there is only ever one close, and a reset's reason must survive the clean
+    /// end-of-file that `read(2)` reports afterwards).
+    fn observe_read_close(&mut self, error: Option<i32>) {
+        self.read_eof = true;
+        if self.pending_close.is_none() {
+            self.pending_close = Some(CloseSource::Read { error });
         }
     }
 
@@ -1459,6 +1492,9 @@ impl TcpInetDriver {
             }
         }
         self.peer_close.observe(source);
+        // The observation is applied, so it is no longer pending: everything after this answers
+        // from the reply ladders (`peer_close.seen`) and never re-reads the socket.
+        self.pending_close = None;
         self.pending_shutdown = None;
         // The peer is gone, so every queued operation can only end one way: the C's
         // `async_error_am_all(am_closed)` (`inet_drv.c:11887`, `:2597`-`:2608`) for a clean close
@@ -1490,14 +1526,17 @@ impl TcpInetDriver {
         released
     }
 
-    /// Latches a close an earlier [`TcpInetDriver::read_bytes`] reported but no caller has
-    /// consumed yet, answering whether it ran.
+    /// Applies the close a [`TcpInetDriver::read_bytes`] recorded but no reader has applied yet,
+    /// answering whether it ran.
     ///
-    /// A queued receive that read its payload and the peer's end of file in one drain defers the
-    /// close ([`TcpInetDriver::deferred_close`]) so the payload reaches the operation first, and
-    /// runs this the moment nothing complete is left to deliver.
-    fn latch_deferred(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
-        match self.deferred_close.take() {
+    /// Two callers reach it rather than latching straight away: a queued receive that read its
+    /// payload and the peer's end of file in one drain defers the close
+    /// ([`TcpInetDriver::pending_close`]) so the payload reaches the operation first and runs this
+    /// the moment nothing complete is left to deliver; and the reactor's eager passive read leaves
+    /// the observation for the first read the C would have made, which is answered by this same
+    /// latch.
+    fn latch_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<bool> {
+        match self.pending_close {
             Some(source) => {
                 self.latch_peer_close(ctx, source)?;
                 Ok(true)

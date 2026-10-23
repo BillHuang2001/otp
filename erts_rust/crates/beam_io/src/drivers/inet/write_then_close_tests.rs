@@ -38,9 +38,11 @@
 //! * an **inherited** `{packet, 2}` complete record survives the close latch: `tcp_clear_input`
 //!   (`:11705`-`:11715`, reached from `tcp_recv_closed` at `:12823`) frees only the *partial*
 //!   framing buffer, never a frame the same call already decoded;
-//! * with **no** operation queued, the port reports `{Port, {data, …}}` for the bytes and the
-//!   peer's close separately (the latch's `port_closed()` observation), each exactly once, because
-//!   `read_available` queues the bytes it read **before** it latches;
+//! * with **no** operation queued, the reactor's eager passive read still moves the bytes onto the
+//!   port's `{Port, {data, …}}` channel, once — but it discovers **nothing**: the C selects a
+//!   socket's read side only for a waiting `TCP_REQ_RECV` or an `{active, …}` grant
+//!   (`inet_drv.c:12317`, `:7966`), so a close read outside those two states stays pending and
+//!   leaves the descriptor CONNECTED (the measured oracle row for this shape);
 //! * and the system `erl` agrees: a `gen_tcp:recv/3` on a write-then-close burst answers
 //!   `{ok, Data}`, then `{error, closed}`.
 //!
@@ -454,28 +456,29 @@ fn a_write_then_close_reports_data_before_closed_exactly_once() {
         "the bytes reach the owner as one {{Port,{{data,…}}}} notification"
     );
     assert!(
-        port.registry
+        !port
+            .registry
             .port_closed(port.id)
             .expect("the port is live"),
-        "the same round's latch reports the peer's close"
+        "the eager passive read does **not** discover the close: the C selects a socket's read \
+         side only for a waiting `TCP_REQ_RECV` or an `{{active, ...}}` grant (`inet_drv.c:12317`, \
+         `:7966`), so the measured oracle row for this shape keeps the descriptor CONNECTED and \
+         keeps answering a zero-length `send` `ok`"
     );
-
     // Exactly once: a further round down the same path reports neither the bytes again nor a
-    // second close observation.
+    // close observation.
     let again = port
         .registry
         .execute_port_tasks(&mut port.poller, DEFAULT_READINESS_RED_BUDGET)
         .expect("a port-task round")
         .notifications;
+    assert!(again.is_empty(), "the report is made once: {again:?}");
     assert!(
-        again.is_empty(),
-        "the report is made once: {again:?}"
-    );
-    assert!(
-        port.registry
+        !port
+            .registry
             .port_closed(port.id)
             .expect("the port is live"),
-        "and the close latch is sticky"
+        "and nothing is latched behind the owner's back"
     );
 }
 

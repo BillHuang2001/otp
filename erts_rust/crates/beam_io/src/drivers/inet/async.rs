@@ -452,10 +452,10 @@ impl TcpInetDriver {
             if self.peer_close.seen {
                 break;
             }
-            if self.deferred_close.is_some() {
-                // Nothing complete is buffered, so a close the read already reported can never be
-                // answered with data: latch it and let the tail report it.
-                self.latch_deferred(ctx)?;
+            if self.pending_close.is_some() {
+                // Nothing complete is buffered, so a close the read already observed can never be
+                // answered with data: apply it and let the tail report it.
+                self.latch_pending(ctx)?;
                 break;
             }
             // Not enough buffered bytes: read what the socket has and try once more.
@@ -463,21 +463,16 @@ impl TcpInetDriver {
             let mut bytes = Vec::new();
             // The queued operation is the party that consumes a discovery this read makes: it is
             // answered right below from the `peer_close` latch (`async_error_am_all(am_closed)`,
-            // `inet_drv.c:12829`), so the receive ladder stays unarmed.
-            let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
+            // `inet_drv.c:12829`), so the receive ladder stays unarmed. `read_bytes` **records**
+            // the observation (`pending_close`) rather than applying it, which is what lets the
+            // bytes it collected in the same drain be delivered first.
+            self.read_bytes(&mut bytes)?;
             self.pending_input.extend_from_slice(&bytes);
-            if let Some(source) = close {
-                // The bytes this read collected belong to the parked operation, so a complete unit
-                // is delivered **first**: the C's `tcp_recv` answers a complete unit and only
-                // reaches its `n == 0` arm on a later call (`inet_drv.c:13216`, `:13206`), which
-                // owes `{error, closed}` to the next receive rather than to this one.
-                self.deferred_close.get_or_insert(source);
-            }
             if self.pending_input.len() == before {
-                // `EAGAIN`, or a read that saw only the peer's end of file: a deferred close can
-                // no longer be answered with data, so latch it and let the tail report it
+                // `EAGAIN`, or a read that saw only the peer's end of file: a pending close can
+                // no longer be answered with data, so apply it and let the tail report it
                 // (`async_error_am_all(am_closed)`, `inet_drv.c:12829`).
-                self.latch_deferred(ctx)?;
+                self.latch_pending(ctx)?;
                 break;
             }        }
         if self.async_ops.recv().is_some() && self.peer_close.seen {
@@ -561,10 +556,16 @@ impl TcpInetDriver {
             self.try_complete_recv(ctx)?;
             return Ok(());
         }
-        // No operation is queued, so nothing can be answered here: a close this read discovers is
-        // owed to the user's next `recv` (see [`ReadReport`]). The C never reads in this state at
-        // all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) — which is why
-        // the reply has to be deferred rather than dropped.
+        // No operation is queued, so nothing can be answered here: the C never reads in this state
+        // at all — read interest is armed only by a queued `TCP_REQ_RECV` (`:12315`) or a granted
+        // `{active, …}` (`:7966`), never by a passive socket's mere readability. The bytes are
+        // still moved onto the port input queue (this floor's passive `{Port, {data, …}}`
+        // channel), which is why the read happens at all, but a close it finds is **not**
+        // discovered: it is left pending in [`TcpInetDriver::pending_close`] for the first read the
+        // C would have made — a queued receive, the `recv` verb, or (after an `{active, …}` arm)
+        // the active delivery. Latching it here would end a connection the oracle keeps using: the
+        // C never observes the peer's end of file, so it keeps answering `ok` to a zero-length
+        // `send` after `shutdown(S, write)` and never tears the descriptor down.
         //
         // The reactor's read is additionally gated on the descriptor's read **selection**
         // ([`TcpInetDriver::read_armed`]): a delivery that spent its `{active, …}` grant deselected
@@ -573,7 +574,7 @@ impl TcpInetDriver {
         if !self.read_armed {
             return Ok(());
         }
-        self.read_available(ctx, ReadReport::OwedToNextRecv)
+        self.read_available(ctx, ReadReport::Unselected)
             .map(|_read| ())
     }
 }

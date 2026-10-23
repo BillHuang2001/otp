@@ -113,7 +113,7 @@ use super::frame;
 use super::header;
 use super::opt::{set_options_tracked, OptScope};
 use super::stat;
-use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, ReadReport, TcpInetDriver};
+use super::{INET_MULTI, INET_ONCE, INET_PASSIVE, INET_REP_OK, TcpInetDriver};
 
 impl TcpInetDriver {
     /// Whether the port is in one of the active modes (`active > INET_PASSIVE`).
@@ -233,14 +233,14 @@ impl TcpInetDriver {
                     let mut bytes = Vec::new();
                     // An active-mode discovery is reported to the owner (`{tcp_closed, S}` /
                     // `{tcp_error, S, Reason}`, `inet_drv.c:12841`/`:12871`), not owed to a
-                    // receive, so it arms no receive one-shot.
-                    let read = {
-                        let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
-                        if let Some(source) = close {
-                            self.latch_peer_close(ctx, source)?;
-                        }
-                        bytes.len()
-                    };
+                    // receive, so it arms no receive one-shot. `read_bytes` records it in
+                    // `pending_close`; this reader is the one the C would have made
+                    // (`{active, …}` selects the read side, `:7966`), so it applies it here.
+                    self.read_bytes(&mut bytes)?;
+                    if let Some(source) = self.pending_close {
+                        self.latch_peer_close(ctx, source)?;
+                    }
+                    let read = bytes.len();
                     if read == 0 {
                         // `EAGAIN`, or a peer close the read latched: the socket is drained and
                         // the retained bytes are not a whole frame yet.
@@ -263,9 +263,10 @@ impl TcpInetDriver {
     fn deliver_raw(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let mut bytes = core::mem::take(&mut self.pending_input);
         // Same rule as [`TcpInetDriver::deliver_framed`]: an active-mode close is reported to the
-        // owner, so it owes no receive reply.
-        let close = self.read_bytes(&mut bytes, ReadReport::Answered)?;
-        if let Some(source) = close {
+        // owner, so it owes no receive reply — and an `{active, …}` grant is exactly what selects
+        // the read side in the C (`inet_drv.c:7966`), so this reader applies what it finds.
+        self.read_bytes(&mut bytes)?;
+        if let Some(source) = self.pending_close {
             self.latch_peer_close(ctx, source)?;
         }
         if bytes.is_empty() {

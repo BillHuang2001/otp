@@ -45,18 +45,23 @@
 //! always the party that reads the end-of-file — and `tcp_recv_closed` answers it through
 //! `async_error_am_all(am_closed)` (`:12829`) while arming only the *send* one-shot (`:12816`).
 //! This floor's poller is **edge-triggered** and keeps the socket's `READABLE` registration for its
-//! whole life, so the **reactor** (`ready_input`) routinely reads the end-of-file first, with no
-//! operation to answer. That discovery's `closed`/`econnreset` is still owed to the user, so it is
-//! armed as `TCP_ADDF_DELAYED_CLOSE_RECV` for the next `recv` (`ReadReport::OwedToNextRecv`) — and
-//! the *user-visible* sequence stays `closed` then `enotconn`, whichever route ran. The
-//! `a_reactor_discovered_*` and `the_reactor_rows_agree_with_the_erl_oracle` rows below pin that;
-//! the earlier rows pin the route where a `recv` makes the discovery itself.
+//! whole life, so the **reactor** (`ready_input`) also reads sockets the C would never have read —
+//! a passive connection with no `TCP_REQ_RECV` queued and no `{active, …}` grant in force. Such a
+//! read is a *delivery* shortcut, not a discovery (`ReadReport::Unselected`): the bytes it collects
+//! reach the owner, but a close it finds applies **nothing** — the C, which selects the read side
+//! only for a where-waiting receive or an active grant (`inet_drv.c:12317`, `:7966`), never observes
+//! that close, so it keeps the descriptor CONNECTED and keeps answering a zero-length `send` `ok`.
+//!
+//! The `a_reactor_discovered_*` and `the_reactor_rows_agree_with_the_erl_oracle` rows below
+//! therefore give the reactor a read the C **would** have made — a queued `TCP_REQ_RECV` — and pin
+//! that the answer the C gives that receive (`async_error_am_all(am_closed)`, `:12829`) is what the
+//! user sees. The earlier rows pin the route where a `recv` makes the discovery itself.
 use super::opcode_tests::{
     assert_agrees, erl_stdout, loopback_arg, op, open_arg, opened_port, oracle_replies, Rig, Rule,
     CONTROL_MAGIC,
 };
 use super::wire::{ctl_ok, ctl_xerror};
-use crate::completion::{CompletionEvent, InetReason, InetReply};
+use crate::completion::{CompletionEvent, InetAsyncResult, InetReason, InetReply};
 use beam_common::BeamError;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -173,28 +178,72 @@ fn close_peer_write(rig: &mut ResetRig) {
     wait_readable(rig.fd);
 }
 
-/// Hands the observation to the **reactor**: `poll(2)`s the port's poller and dispatches every
-/// ready event through the registry — the route `tests/inet.rs`'s
+/// Hands the readiness to the **reactor**: `poll(2)`s the port's poller and dispatches every ready
+/// event through the registry — the route `tests/inet.rs`'s
 /// `a_reactor_observed_peer_close_releases_the_registration_and_reports_closed` takes — until the
-/// driver has released the dead socket's registration, which is what its
-/// [`PeerClose`](super::PeerClose) latch does.
+/// poller is **quiescent** (a poll reports nothing ready) or the driver has released the dead
+/// socket's registration.
+///
+/// Quiescence, not an empty registration set, is the correct stop condition: the reactor reads a
+/// passive socket the C would not have selected (see [`super::ReadReport`]), and such a read
+/// applies **nothing** — not even the close it may find — so it leaves the registration in place.
 fn drive_reactor(rig: &mut ResetRig) {
     let deadline = Instant::now() + HANG_GUARD;
-    while !rig.port.poller.is_empty() {
+    loop {
         assert!(
             Instant::now() < deadline,
-            "the reactor never observed the peer's close"
+            "the reactor never settled on the peer's close"
         );
         let events = match rig.port.poller.poll(Some(Duration::from_millis(50))) {
             Ok(events) => events,
             Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => panic!("poll failed: {err:?}"),
         };
+        if events.is_empty() {
+            return; // quiescent: the readiness was consumed
+        }
         rig.port
             .registry
             .handle_events(&mut rig.port.poller, &events)
             .expect("the ready events are dispatched");
+        if rig.port.poller.is_empty() {
+            return; // the latch released the dead socket's registration
+        }
     }
+}
+
+/// The C's **read selection** for a passive socket: a queued `TCP_REQ_RECV`, whose async id is
+/// returned.
+///
+/// While it is queued the socket's read side is genuinely selected
+/// (`sock_select(INETP(desc),(FD_READ|FD_CLOSE),1)`, `inet_drv.c:12317`), so a read the reactor then
+/// makes is one the **C would have made** and a close it finds is a real discovery, answered to
+/// this operation (`async_error_am_all(am_closed)`, `:12829`) rather than latched behind its back.
+fn queue_recv(rig: &mut ResetRig) -> u16 {
+    let reply = rig.port.control(&op(42), &RECV_OPERAND);
+    assert_eq!(reply.len(), 3, "the receive is queued as `[1] ++ <<Id:16>>`: {reply:?}");
+    assert_eq!(reply[0], ctl_ok()[0], "the queueing succeeded: {reply:?}");
+    u16::from_be_bytes([reply[1], reply[2]])
+}
+
+/// The reason the queued receive `id` was answered with — `{error, Reason}` — after the reactor
+/// has read the peer's close on its behalf. The atom name is compared as the C's
+/// `ctl_reply(INET_REP_ERROR, …)` bytes would carry it.
+fn await_recv_reason(rig: &mut ResetRig, id: u16) -> String {
+    drive_reactor(rig);
+    let completions = rig.port.completions();
+    for completion in &completions {
+        if let CompletionEvent::InetAsync {
+            id: answered,
+            result: InetAsyncResult::Error(reason),
+        } = &completion.event
+        {
+            if *answered == id {
+                return reason.atom_name().to_string();
+            }
+        }
+    }
+    panic!("the queued receive `{id}` was never answered: {completions:?}");
 }
 
 /// A `prim_inet`-style command: the two-byte tag length, the ETF-led tag `[131, 97]` and a payload.
@@ -339,35 +388,37 @@ fn a_command_that_discovers_the_reset_arms_the_receive_ladder() {
 /// The C's basis: the receive that armed the read interest is answered by
 /// `async_error_am_all(am_closed)` (`inet_drv.c:12829`) and the *following* one gets the bare
 /// `ctl_error(ENOTCONN)` of the `TCP_REQ_RECV` ladder (`:12286`) because `tcp_recv_closed` armed
-/// only the send one-shot. Here the reactor consumed the observation, so that `closed` is armed on
-/// the receive ladder instead (`PeerClose::observe`'s `ReadReport::OwedToNextRecv`).
+/// only the send one-shot. The read is therefore made on behalf of a **queued** receive
+/// (`sock_select(…, 1)`, `:12317`) — the C's only passive read selection — which is what
+/// [`queue_recv`] establishes.
 #[test]
 fn a_reactor_discovered_end_of_file_answers_closed_then_enotconn() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
+    let id = queue_recv(&mut rig);
     rig.peer
         .as_ref()
         .expect("the far end is still held")
         .shutdown(Shutdown::Both)
         .expect("the peer shuts down");
-    drive_reactor(&mut rig);
+    assert_eq!(
+        await_recv_reason(&mut rig, id),
+        "closed",
+        "the selected read owes the queued receive a `closed`"
+    );
     assert!(
         rig.port.poller.is_empty(),
-        "the reactor's discovery released the dead socket's registration"
-    );
-    assert_eq!(
-        rig.port.control(&op(42), &RECV_OPERAND),
-        ctl_xerror("closed"),
-        "the reactor's discovery owes the user's first receive a `closed`"
+        "the discovery released the dead socket's registration"
     );
     assert_eq!(
         rig.port.control(&op(42), &RECV_OPERAND),
         ctl_xerror("enotconn"),
-        "the one-shot is spent: the connection is simply gone"
+        "the connection is gone and `tcp_recv_closed` armed no receive one-shot"
     );
 }
 
-/// The named `recv` verb reads `TCP_ADDF_DELAYED_CLOSE_RECV` through the same `recv_reply` the
-/// numeric `TCP_REQ_RECV`(42) guard does, so a reactor-discovered close answers it identically.
+/// The named `recv` verb makes the same read itself (it is the C's `tcp_recv`, `:13130`), so it is
+/// the party the close is answered to: after the reactor's eager — unselected, applying-nothing —
+/// read has drained the end-of-file, the verb still answers `closed` and then `enotconn`.
 #[test]
 fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
@@ -380,7 +431,7 @@ fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
     assert_eq!(
         rig.port.control("recv", b""),
         ctl_xerror("closed"),
-        "the one-shot is the driver's, not the caller's, so the verb sees it too"
+        "the verb's own read is the discovery, so it answers the `closed` itself"
     );
     assert_eq!(rig.port.control("recv", b""), ctl_xerror("enotconn"));
 }
@@ -394,17 +445,17 @@ fn a_reactor_discovered_end_of_file_answers_the_named_recv_verb_the_same_way() {
 fn a_reactor_discovered_reset_answers_econnreset_only_under_show_econnreset() {
     for (option, expected) in [(SHOW_ECONNRESET, "econnreset"), (HIDE_ECONNRESET, "closed")] {
         let mut rig = connected_rig(option);
+        let id = queue_recv(&mut rig);
         abort_peer(&mut rig);
-        drive_reactor(&mut rig);
         assert_eq!(
-            rig.port.control(&op(42), &RECV_OPERAND),
-            ctl_xerror(expected),
-            "{option:?}: the reactor's discovery owes the deferred reason"
+            await_recv_reason(&mut rig, id),
+            expected,
+            "{option:?}: the selected read owes the queued receive this reason"
         );
         assert_eq!(
             rig.port.control(&op(42), &RECV_OPERAND),
             ctl_xerror("enotconn"),
-            "{option:?}: the one-shot is spent"
+            "{option:?}: the connection is gone"
         );
     }
 }
@@ -417,8 +468,9 @@ fn a_reactor_discovered_reset_answers_econnreset_only_under_show_econnreset() {
 #[test]
 fn a_reactor_discovered_end_of_file_still_answers_a_send_with_closed() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
+    let id = queue_recv(&mut rig);
     close_peer_write(&mut rig);
-    drive_reactor(&mut rig);
+    assert_eq!(await_recv_reason(&mut rig, id), "closed");
 
     rig.port
         .command(&TAGGED_COMMAND)
@@ -437,11 +489,14 @@ fn a_reactor_discovered_end_of_file_still_answers_a_send_with_closed() {
         other => panic!("expected an {{inet_reply, …}} completion, got {other:?}"),
     }
 
-    // The send spent its own one-shot only: the receive's is still armed.
+    // The send spent its own one-shot only, and the receive ladder has none to spend: the read
+    // discovery answered its queued receive already and armed only the *send* bit
+    // (`tcp_recv_closed`, `inet_drv.c:12816`), so the next receive is the bare `enotconn` of the
+    // torn-down state (`:12286`).
     assert_eq!(
         rig.port.control(&op(42), &RECV_OPERAND),
-        ctl_xerror("closed"),
-        "the send ladder leaves the deferred receive reply armed"
+        ctl_xerror("enotconn"),
+        "a read discovery arms no receive one-shot"
     );
     assert_eq!(rig.port.control(&op(42), &RECV_OPERAND), ctl_xerror("enotconn"));
     assert_eq!(
@@ -500,16 +555,19 @@ fn the_reactor_rows_agree_with_the_erl_oracle() {
     ];
     for (label, abort, show, first) in rows {
         let mut rig = connected_rig(if show { SHOW_ECONNRESET } else { HIDE_ECONNRESET });
+        let id = queue_recv(&mut rig);
         if abort {
             abort_peer(&mut rig);
         } else {
             close_peer_write(&mut rig);
         }
-        drive_reactor(&mut rig);
-        let rust_first = rig.port.control(&op(42), &RECV_OPERAND);
-        let rust_second = rig.port.control(&op(42), &RECV_OPERAND);
-        assert_eq!(rust_first, ctl_xerror(first), "{label}: the first receive");
-        assert_eq!(rust_second, ctl_xerror("enotconn"), "{label}: the second receive");
+        let rust_first = await_recv_reason(&mut rig, id);
+        assert_eq!(rust_first, first, "{label}: the first (queued) receive");
+        assert_eq!(
+            rig.port.control(&op(42), &RECV_OPERAND),
+            ctl_xerror("enotconn"),
+            "{label}: the second receive"
+        );
 
         let Some(stdout) = erl_stdout(&oracle_recv_sequence_expression(abort, show)) else {
             continue; // the oracle is unavailable; the check skipped loudly above
@@ -650,11 +708,14 @@ fn oracle_state_expression(exit_on_close: bool) -> String {
 #[test]
 fn the_default_options_tear_the_descriptor_down_after_a_close() {
     let mut rig = connected_rig(HIDE_ECONNRESET);
+    // The C's read selection (`sock_select(FD_READ|FD_CLOSE, 1)`, `inet_drv.c:12317`) — which is
+    // what makes the read the reactor then performs a discovery (`tcp_recv_closed`, `:12824`).
+    let id = queue_recv(&mut rig);
     close_peer_write(&mut rig);
-    drive_reactor(&mut rig);
+    assert_eq!(await_recv_reason(&mut rig, id), "closed");
     assert!(
         rig.port.poller.is_empty(),
-        "the reactor's discovery released the dead socket's registration"
+        "the discovery released the dead socket's registration"
     );
 
     assert_eq!(
@@ -707,8 +768,9 @@ fn exit_on_close_false_keeps_the_descriptor_and_the_connected_state() {
         "the `{{exit_on_close,false}}` record is accepted"
     );
     let fd = rig.fd;
+    let id = queue_recv(&mut rig);
     close_peer_write(&mut rig);
-    drive_reactor(&mut rig);
+    assert_eq!(await_recv_reason(&mut rig, id), "closed");
 
     assert_eq!(
         rig.port.control(&op(16), &[]),
@@ -748,8 +810,13 @@ fn the_latch_keeps_its_one_shot_whatever_the_teardown_did() {
         if !exit_on_close {
             assert_eq!(rig.port.control(&op(7), &EXIT_ON_CLOSE_OFF), ctl_ok());
         }
+        let id = queue_recv(&mut rig);
         close_peer_write(&mut rig);
-        drive_reactor(&mut rig);
+        assert_eq!(
+            await_recv_reason(&mut rig, id),
+            "closed",
+            "{exit_on_close}: the armed receive is answered `closed`"
+        );
         if exit_on_close {
             // Torn down, so `INET_STATE_CLOSED` is set (`inet_drv.c:5106`) and both ladders'
             // flag-before-state order is load-bearing — the send's
@@ -766,11 +833,6 @@ fn the_latch_keeps_its_one_shot_whatever_the_teardown_did() {
                 "and it is spent after one use"
             );
         }
-        assert_eq!(
-            rig.port.control(&op(42), &RECV_OPERAND),
-            ctl_xerror("closed"),
-            "{exit_on_close}: the armed `TCP_ADDF_DELAYED_CLOSE_RECV` one-shot survives the latch"
-        );
         if exit_on_close {
             // `INET_STATE_CONNECTED` is gone, so the ladder's `else` is `enotconn`
             // (`inet_drv.c:12286`). (Without the teardown the C's socket is still open, so a
@@ -794,17 +856,17 @@ fn the_latch_keeps_its_one_shot_whatever_the_teardown_did() {
     // and it too must survive the teardown.
     for (option, expected) in [(SHOW_ECONNRESET, "econnreset"), (HIDE_ECONNRESET, "closed")] {
         let mut rig = connected_rig(option);
+        let id = queue_recv(&mut rig);
         abort_peer(&mut rig);
-        drive_reactor(&mut rig);
         assert_eq!(
-            rig.port.control(&op(42), &RECV_OPERAND),
-            ctl_xerror(expected),
-            "{option:?}: the teardown does not lose the armed reset one-shot"
+            await_recv_reason(&mut rig, id),
+            expected,
+            "{option:?}: the teardown does not lose the reset the discovery owes"
         );
         assert_eq!(
             rig.port.control(&op(42), &RECV_OPERAND),
             ctl_xerror("enotconn"),
-            "{option:?}: the one-shot is spent"
+            "{option:?}: the close is spent"
         );
     }
 }
@@ -829,14 +891,19 @@ fn the_state_rows_agree_with_the_erl_oracle_for_both_exit_on_close_values() {
                 "{label}: the option is accepted"
             );
         }
+        let id = queue_recv(&mut rig);
         close_peer_write(&mut rig);
-        drive_reactor(&mut rig);
+        assert_eq!(
+            await_recv_reason(&mut rig, id),
+            "closed",
+            "{label}: the selected read answers the queued receive"
+        );
         assert!(
             rig.port
                 .registry
                 .port_closed(rig.port.id)
                 .expect("the port is still live"),
-            "{label}: the reactor's discovery latched the peer close"
+            "{label}: the discovery latched the peer close"
         );
         let rust = rust_state_rows(&mut rig);
 
