@@ -17,6 +17,34 @@ Two conventions are load-bearing:
   bare `mod foo;` would look for `tests/foo.rs` — which Cargo would then also build as a test target.
 
 ## Routing Table
+- `mature_strategy_sweep.rs` → **the collector-level strategy sweep**: the barrier-free copying
+  mature generation against the mark-region (`Immix`) one over the two workload classes a collector
+  alone can express — C1 `churn` (low live set, high short-lived churn) and C2 `growth` (a live set
+  that grows monotonically), plus the optional C3-shaped `copy_out` (`ets_copy`'s allocation geometry
+  with no ETS and no runtime). One non-ignored `#[test]` is only a **driver**: it runs the arms
+  strictly interleaved, one **fresh child process per (class, arm, round)** (this binary re-exec'd
+  as the `#[ignore]`d `child_runs_one_arm_and_prints_a_row`, polled for `VmHWM` by the parent, with
+  `/proc/loadavg` read before and after every round), prints one machine-readable `ROW …` line per
+  arm plus a per-class estimator (the two arms' medians, the median paired difference
+  `Immix − Copying`, the median paired ratio, and the per-round differences' `[min .. max]`), and a
+  three-repeat **noise floor** of one arm. Both arms come only from `AnyCollector::from_config`
+  with an explicit `GcConfig::copying`/`GcConfig::immix` pin over the **same** `HeapPolicy`
+  (`GenImmixCollector::with_config` ignores `MatureKind`, so it is never used). Asserted: the arm's
+  `kind()` and the config's `mature_choice()` (`MatureSource::Explicit`); `minors + majors ==
+  collections == rounds == N` and the same from the collector's cumulative `GcStats`; `words_copied`
+  / `objects_copied` / `mature_peak_words` all `> 0`; the footprint is an exact reserved-capacity
+  account (`capacity_bytes == (young + mature) × 8` over an empty off-heap roster,
+  `capacity >= used`); `mature_capacity >= live_words`; the live set is `intact` and its
+  `Σ size_object` equals the class's geometry formula; the cadence floor `majors >= collections ÷
+  (fullsweep_after + 1)` in both arms, exact (to within one fullsweep cycle) for the copying arm on
+  the classes whose live set cannot outgrow a mature generation; both arms comparable; and the noise
+  floor's deterministic counters **bit-identical** across its repeats. Wall time and peak RSS are
+  printed, never asserted. `N` is scaled on `cfg!(debug_assertions)`; `BEAM_GC_SWEEP_ROUNDS` /
+  `BEAM_GC_SWEEP_N` override. The class geometry and its fixed-point reasoning live in
+  `mature_strategy_sweep/fixtures.rs`.
+- `mature_strategy_sweep/fixtures.rs` → its class-shape module (included by `#[path]`): the three
+  geometries and their `HeapPolicy`/`GcConfig` builders, the per-round driver (`run` → `Tally`), and
+  the independent live-set witness check. Nothing here is `#[test]`-annotated.
 - `region_relocation.rs` → **acceptance evidence for region-generic relocating compaction**: that a host
   can evacuate a *foreign* word region (not a process heap) with `FromSet::from_ranges` +
   `Relocator`/`compact` into an `EvacDest`, and that the copy rules those drivers rest on are the real
@@ -83,13 +111,16 @@ What a `beam_rt` driver must know about the relocation seam (each pinned by a ca
   `immix_selection_curve.rs`, `steady_state.rs`, `generational_cadence.rs`,
   `mature_capacity_convergence.rs`, `mature_capacity_feedback.rs`, `nursery_growth_retention.rs`,
   `offheap_steady_state.rs`, `retained_vs_live.rs` (the one that also samples RSS, `read_rss_bytes`),
-  `post_fullsweep_nursery.rs` and `production_dispatch.rs`.
+  `post_fullsweep_nursery.rs`, `production_dispatch.rs` and `mature_strategy_sweep.rs` (the
+  collector-level C1/C2/C3-shaped sweep, with per-class paired medians and a noise floor).
   `immix_parity.rs`, `gen_immix_collector.rs` and `immix_stress.rs` also drive both strategies but
   compare *observable results*, not cost.
 - **No messaging/copy-bound and no real `compile:file/2` workload is measured under both strategies
-  here**: this crate's dev-deps are `beam_codec` only, so a `beam_message`/`beam_rt` shape cannot be
-  driven from this suite — such an A/B belongs to the parent (`beam_rt`'s `tests/gc_immix_payload.rs`
-  is the runtime-shaped precedent).
+  here** — that remains true: this crate's dev-deps are `beam_codec` only, so a `beam_message`/`beam_rt`
+  shape cannot be driven from this suite. `mature_strategy_sweep.rs` is the **in-crate counterpart**
+  (the collector-level C1/C2 sweep plus a C3-*shaped* copy-out with no ETS); the real C3
+  (messaging/copy-bound) and C4 (a real in-process compile) measurements live in
+  `../../beam_rt/GC_STRATEGY_MEASURED.md` and their harness in `../../beam_rt/tests/gc_strategy_classes.rs`.
 - **No per-file wall time is recorded anywhere**; the only in-crate figure is
   `nursery_growth_retention.rs`'s whole-5-test file at 0.01 s (`../MEASURED.md:497`). Nothing under
   `tests/` is `#[ignore]`d (the crate's only two ignores are doctest fences, `src/offheap.rs:102,153`).
