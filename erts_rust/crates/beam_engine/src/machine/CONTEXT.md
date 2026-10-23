@@ -210,11 +210,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   owned entries in the innermost loop.
   **Invalidation** (the host's answer set is a pure function of the triple for `beam_rt` — `prim_tty`'s
   stubs plus `beam_bifs`' `zlib` table — so only an *installation* can change it):
-  `erlang:load_nif/2` (the BIF-dispatch funnel `Machine::dispatch_bif`, `../interpreter/bif.rs`, clears
-  every verdict when the dispatched triple is `("erlang","load_nif",2)` — one arity compare on the cold
-  path), [Machine::reset] (which clears the whole memo, keeping the address key ABA-free; a resume does
-  not reset) and the **public** `Machine::invalidate_local_call_verdicts` door, which a host whose
-  answer set changes by any other means (its own plugins, a reload, a config toggle) calls itself.
+  `erlang:load_nif/2` (the BIF-dispatch funnel `Machine::dispatch_bif_call`, `../interpreter/bif.rs`, **arms**
+  `Machine::local_call_invalidation_pending` — a `Cell<bool>` written through the funnel's `&self` receiver —
+  when the dispatched triple is `("erlang","load_nif",2)`, one arity compare on the cold path; the seam clears
+  the verdicts at its next local call, which is where `&mut self` is available), [Machine::reset] (which clears
+  the whole memo, keeping the address key ABA-free; a resume does not reset) and the **public**
+  `Machine::invalidate_local_call_verdicts` door, which a host whose answer set changes by any other means (its
+  own plugins, a reload, a config toggle) calls itself.
   Invalidation re-asks the host but **re-derives nothing** — identities are pure functions of an
   immutable module image and cannot go stale.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
