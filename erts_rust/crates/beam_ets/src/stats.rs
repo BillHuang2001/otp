@@ -285,7 +285,7 @@ mod tests {
         chains.add_chains(5, 1);
         let stats = chains.hash_stats(0, 1);
         assert_eq!(stats.active_buckets, 256);
-        assert_eq!(stats.objects(), 5);
+        assert_eq!(chains.objects(), 5);
         assert_eq!(stats.avg_chain_len, 0.01953125);
         assert_eq!(stats.min_chain_len, 0);
         assert_eq!(stats.max_chain_len, 1);
@@ -324,7 +324,7 @@ mod tests {
         chains.add_chain(13);
         let stats = chains.hash_stats(2, 64);
         assert_eq!(stats.active_buckets, 6);
-        assert_eq!(stats.objects(), 20);
+        assert_eq!(chains.objects(), 20);
         assert_eq!(stats.min_chain_len, 0);
         assert_eq!(stats.max_chain_len, 13);
         assert!(stats.std_dev_chain_len > stats.std_dev_expected);
