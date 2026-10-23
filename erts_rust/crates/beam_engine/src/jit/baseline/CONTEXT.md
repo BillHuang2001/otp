@@ -142,6 +142,14 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - The deopt / execution / code-size censuses and their gate commands: `census/CONTEXT.md`.
 - The test enumeration: `testing/CONTEXT.md`.
 
+## Emitted-byte arithmetic (derived from the encoder, not measured)
+`emit_mem_modrm` (`../../emitter/mod.rs:532-541`) always emits `mod=10` `disp32` (+ a `SIB` byte only when the base is `rsp`/`r12`), so **every** code sequence's size is a closed-form constant — no case needs disassembly to price:
+`mov_mr/mov_rm` with base `rbx`/`rdi`/`r11` = **7** B, base `rsp` = **8** B, `mov_ri` (always `movabs`) = **10** B, `call_r`/`jmp_r`/`cmp_rr`/`test_rr` = **3** B, `jcc` = **6** B, `jmp` = **5** B, `lea rsp,[rsp±d]` = **8** B, `push_r`/`pop_r` = 1 B (`rbx`/`rbp`) or 2 B (`r12`-`r15`), `ret` = 1 B.
+Consequences, with `S` = `Allocation::spill_slots_at(pc).len()` and `F` = `fill_slots(pc).len()`:
+`emit_helper_call` (`emit/mod.rs:323-338`) = `7S + 8 + 10·args + 13` (41 B for 2 args, 71 B for 5); `emit_continue_check` = `19 + 7F` (+21 B for the gated `emit_refresh_y`, `:409`); `emit_frame_change_continue` (`emit/heap.rs:218-229`) = 19 B with **no** refill; `emit_resume_or_exit` (`emit/frame.rs:259-276`) = `27 + teardown`; `emit_prologue_helper` (`emit/prologue.rs:152-163`) = 41 B; `emit_local_call_probe` (`emit/block.rs:1013-1040`) = `7S + 90`. Prologue = `65 + Σpush + 7E` (`E` = `entry_len()`), teardown = `8 + Σpop`, `done` epilogue = teardown + 1.
+So a `jit_allocate` in-block lowering is `7S + 70` B (+21 B if a later instruction of the block reads a `Y` slot) where the deopt it replaces is `7S + 7F + 60` B (+21 B): **+10 B of code to remove one interpreter step at run time**, and the only spill/refill it carries is the mandatory pre-call spill `S`.
+The authoritative *measured* per-kind bytes are `census.rs::the_per_kind_emitted_code_size_table_is_printed` (`measure_one_block`, `census.rs:846-851`), which is also where a new shape's row is cheapest to add.
+
 ## Known Issues
 - **A per-run memo for the cross-function in-block transfer is a measured net loss and is not in the tree.**
   `enter_in_block`'s cross-function arm (`resolve_resume_entry` → `cross_function_entry` →
