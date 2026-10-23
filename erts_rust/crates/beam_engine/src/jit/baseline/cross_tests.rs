@@ -217,14 +217,13 @@ fn the_cross_function_transfers_of_a_loop_are_exactly_two_per_iteration() {
         snapshot.cross_function_memo_hits,
     );
     assert_eq!(
-        snapshot.cross_function_resolutions, 2,
-        "the per-run memo holds two functions, so the first transfer into each \
-         (the callee, then its caller) is the only pair that reaches the artifact"
+        snapshot.cross_function_resolutions,
+        2 * ELEMENTS as u64,
+        "no memo exists yet, so every one of the transfers reaches the artifact"
     );
     assert_eq!(
-        snapshot.cross_function_memo_hits,
-        2 * ELEMENTS as u64 - 2,
-        "every transfer after that pair is answered from the memo"
+        snapshot.cross_function_memo_hits, 0,
+        "there is no per-run memo yet, so nothing can be answered from one"
     );
 }
 // ---------------------------------------------------------------------------

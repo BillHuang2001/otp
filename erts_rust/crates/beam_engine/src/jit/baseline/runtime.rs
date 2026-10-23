@@ -293,91 +293,6 @@ pub(crate) struct JitRuntime<'a> {
     ///
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
     pub(crate) compiled: *const CompiledModule,
-    /// The **per-run memo** of cross-function block-entry tables ([`CrossEntry`]) — what
-    /// [`resolve_resume_entry`] answers a transfer into the *other* function of a
-    /// call/return pair from, without reaching the artifact.
-    ///
-    /// Read and written **only by Rust**; [`CrossEntry::lookup`] re-stamps it against
-    /// [`Self::compiled`], so a publication of another artifact (a cross-module `ENTER`, a
-    /// driver interpreter step, a resumed slice) invalidates it without a separate clear.
-    pub(crate) cross: CrossEntry,
-}
-
-/// The per-run memo of **cross-function** block-entry resolutions: the two most recently
-/// resolved functions' [`EntryTables`], valid for the artifact it was built against.
-///
-/// A call/return pair alternates between exactly two functions (the caller's and the
-/// callee's), and each of those transfers used to reach the artifact
-/// ([`cross_function_entry`]: a `RefCell` probe, the per-function table build, the
-/// register-file bound check and the write-extent note) even though nothing about them
-/// changes between two iterations of the same loop. Two slots answer that steady state:
-/// slot `0` is the most recently resolved function, slot `1` the one before it, and a
-/// hit in slot `1` moves it to the front.
-///
-/// **Soundness.** A slot holds an `EntryTables` — four pointers into the artifact's own
-/// immutable entry vectors — that was published only after the target function's
-/// register-file bound was satisfied and its write extent noted, in this run. Nothing on
-/// this tier can shrink `machine.x` or un-compile a function, so a memoised answer stays
-/// true for as long as the stamp matches; a differing artifact (whose tables describe
-/// different code) resets both slots before the lookup.
-#[derive(Clone, Copy)]
-pub(crate) struct CrossEntry {
-    /// The artifact the two slots were built against ([`JitRuntime::compiled`] when the
-    /// last resolution ran). Any change invalidates both slots.
-    artifact: *const CompiledModule,
-    /// The two memoised functions' tables, most recently used first.
-    slots: [EntryTables; 2],
-}
-
-impl CrossEntry {
-    /// An empty memo — the value a fresh [`JitRuntime`] starts with.
-    pub(crate) const NONE: CrossEntry = CrossEntry {
-        artifact: std::ptr::null(),
-        slots: [EntryTables::NONE; 2],
-    };
-
-    /// The tables of an already-resolved function that names a block entry for
-    /// `(func, pc)`, if the memo holds one for this artifact.
-    ///
-    /// A miss — or a stamp mismatch, which resets the memo first — answers `None` and
-    /// leaves the caller to the artifact ([`cross_function_entry`]).
-    fn lookup(
-        &mut self,
-        artifact: *const CompiledModule,
-        func: u32,
-        pc: u32,
-    ) -> Option<EntryTables> {
-        if !std::ptr::eq(artifact, self.artifact) {
-            self.artifact = artifact;
-            self.slots = [EntryTables::NONE; 2];
-            return None;
-        }
-        for index in 0..self.slots.len() {
-            if self.slots[index].entry(func, pc).is_some() {
-                let tables = self.slots[index];
-                if index == 1 {
-                    self.slots.swap(0, 1);
-                }
-                return Some(tables);
-            }
-        }
-        None
-    }
-
-    /// Memoise `tables` as the most recently resolved function, demoting the previous one
-    /// to slot `1`.
-    fn insert(&mut self, artifact: *const CompiledModule, tables: EntryTables) {
-        if !std::ptr::eq(artifact, self.artifact) {
-            self.artifact = artifact;
-            self.slots = [EntryTables::NONE; 2];
-        }
-        if self.slots[0].func == tables.func {
-            self.slots[0] = tables;
-            return;
-        }
-        self.slots[1] = self.slots[0];
-        self.slots[0] = tables;
-    }
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -1821,36 +1736,18 @@ fn note_native_write_extent(runtime: &JitRuntime<'_>, artifact: &CompiledModule)
     machine.note_x_dirty(extent);
 }
 
-/// [`cross_function_entry`] behind two fast paths: the same-function shape answers from the
-/// published tables without touching the artifact (and needs no re-publishing — they already
-/// describe that function), and a transfer into the **other** function of a call/return pair
-/// answers from the per-run [`CrossEntry`] memo (which re-publishes that function's tables, so
-/// a nested transfer inside it takes the published-tables path). Only a function the memo does
-/// not hold yet reaches `cross_function_entry`.
+/// [`cross_function_entry`] behind the published-tables fast path: the same-function shape
+/// answers without touching the artifact, and no tables need re-publishing (they already
+/// describe that function).
 fn resolve_resume_entry(
-    runtime: &mut JitRuntime<'_>,
+    runtime: &JitRuntime<'_>,
     func: u32,
     pc: u32,
 ) -> Option<(*const u8, Option<EntryTables>)> {
-    if let Some(entry) = runtime.tables.entry(func, pc) {
-        return Some((entry, None));
+    match runtime.tables.entry(func, pc) {
+        Some(entry) => Some((entry, None)),
+        None => cross_function_entry(runtime, func, pc),
     }
-    // The alternating cache: a call/return pair lands in the caller's function, then the
-    // callee's, then the caller's again, so the two most recently resolved functions answer
-    // every transfer after the first two (see [`CrossEntry`]) — no `RefCell` probe, no
-    // per-function table build, no bound check, no write-extent note.
-    if let Some(tables) = runtime.cross.lookup(runtime.compiled, func, pc) {
-        // Structural counter: one cross-function transfer answered without the artifact.
-        #[cfg(test)]
-        super::counters::record_cross_function_memo_hit();
-        let entry = tables.entry(func, pc)?;
-        return Some((entry, Some(tables)));
-    }
-    let (entry, tables) = cross_function_entry(runtime, func, pc)?;
-    if let Some(tables) = tables {
-        runtime.cross.insert(runtime.compiled, tables);
-    }
-    Some((entry, tables))
 }
 /// The **`deallocate`** helper: pop the current frame with the interpreter's exact
 /// `Instr::Deallocate` semantics and hand the block the address to continue at.

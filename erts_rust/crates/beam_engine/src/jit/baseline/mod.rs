@@ -1167,7 +1167,6 @@ fn drive(
         resume_entry: std::ptr::null(),
         tables: runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
-        cross: runtime::CrossEntry::NONE,
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run
