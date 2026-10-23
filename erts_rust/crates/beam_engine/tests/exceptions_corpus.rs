@@ -92,7 +92,7 @@ use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::load_file;
 use beam_term::{cmp, make_atom, make_small, Eterm, NIL};
-use support::{app_ebin, skip_reason, ModuleHost};
+use support::{app_ebin, describe_error, skip_reason, ModuleHost};
 
 /// The committed oracle corpus (see the module docs).
 const TARGETS_TXT: &str = concat!(
@@ -161,17 +161,9 @@ impl Target {
     }
 }
 
-/// Renders a [`BeamError`] compactly for a `SKIP:` line: the engine's typed gap is a
-/// `Raise` whose reason is the `unsupported_opcode: <what>` atom, so print that atom;
-/// anything else prints its `Debug`.
-fn describe_error(error: &BeamError) -> String {
-    if let BeamError::Raise(raise) = error {
-        if let Some(reason) = raise.reason.as_atom() {
-            return format!("typed raise: {reason}");
-        }
-    }
-    format!("{error:?}")
-}
+// `describe_error` (the compact `SKIP:`-line rendering of a typed gap) is the
+// shared implementation in `tests/support/oracle.rs`, so this suite and
+// `tests/jit_real_module.rs` render a gap identically.
 
 /// Parses one poison token, or `None` for an unknown token.
 fn parse_poison(token: &str) -> Option<Poison> {
