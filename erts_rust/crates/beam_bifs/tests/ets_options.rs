@@ -242,6 +242,56 @@ fn info_bool(bifs: &BifRegistry, ctx: &mut BifContext<'_>, handle: Eterm, item: 
     }
 }
 
+/// The elements of the tuple `ets:info(Tab, stats)` reports, or `None` when it
+/// reports the atom `false` (the oracle's "no statistics for this interior").
+///
+/// Destructuring goes through the registered `erlang` BIFs (`tuple_size/1`,
+/// `element/2`), so the helper uses only the public surface.
+fn stats_elements(
+    bifs: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    handle: Eterm,
+) -> Option<Vec<Eterm>> {
+    let value = ets_info2(bifs, ctx, handle, "stats").expect("info/2 stats");
+    if is_false(ctx.atoms(), value) {
+        return None;
+    }
+    let is_a_tuple = bifs
+        .call("erlang", "is_tuple", 1, ctx, &[value])
+        .expect("erlang:is_tuple");
+    assert!(
+        is_true(ctx.atoms(), is_a_tuple),
+        "ets:info(T, stats) is a tuple or the atom false, got neither"
+    );
+    let arity = bifs
+        .call("erlang", "tuple_size", 1, ctx, &[value])
+        .expect("erlang:tuple_size");
+    let arity = signed_value(arity) as usize;
+    let mut elements = Vec::with_capacity(arity);
+    for index in 1..=arity {
+        let pos = ctx.int(index as i64).expect("fits");
+        let element = bifs
+            .call("erlang", "element", 2, ctx, &[pos, value])
+            .expect("erlang:element");
+        elements.push(element);
+    }
+    Some(elements)
+}
+
+/// The integer at 1-based `pos` of the `elements` of a tuple term.
+fn integer_at(
+    bifs: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    elements: &[Eterm],
+    pos: usize,
+) -> i64 {
+    let element = elements[pos - 1];
+    let is_int = bifs
+        .call("erlang", "is_integer", 1, ctx, &[element])
+        .expect("erlang:is_integer");
+    assert!(is_true(ctx.atoms(), is_int), "element {pos} is not an integer");
+    signed_value(element)
+}
 // ---------------------------------------------------------------- accept matrix
 
 /// The oracle:
@@ -1313,15 +1363,23 @@ fn insert_k(bifs: &BifRegistry, ctx: &mut BifContext<'_>, handle: Eterm, value: 
 /// fixed by any process now" (`IS_FIXED(tb)`, `erl_db_util.h:386`) and
 /// `ets:safe_fixtable/2` is the only way to make it `true`.
 ///
-/// The three values this crate cannot represent are the **typed gap**, never a
+/// Two values this crate cannot represent are the **typed gap**, never a
 /// fabrication: `safe_fixed*` on a *fixed* table (`{FixationTime, [{Pid,
 /// RefCount}]}` — the model keeps a single boolean, not a fixation timestamp and
-/// per-process reference counts), `binary` on a table that really holds a binary
-/// (host addresses and ERTS refcounts), and `stats` outright (the interiors'
-/// chain/catree statistics). An unknown item atom stays `badarg`, and none of the
-/// five items appears in `ets:info/1` — whose 15-field order is unchanged.
+/// per-process reference counts) and `binary` on a table that really holds a binary
+/// (host addresses and ERTS refcounts).
+///
+/// `stats` is **served**, from the table interior's own measurement
+/// (`beam_ets::Table::stats`): an eight-element occupancy tuple for the hash kinds,
+/// a three-element node/depth tuple for a fine-locked `ordered_set`, and the atom
+/// `false` for a plain one. Its shape, element order and element types are the
+/// oracle's; `kept_items` and `nlocks` agree with it **by value**; the chain and
+/// occupancy metrics measure this crate's interiors, so their values legitimately
+/// differ (`beam_ets/tests/ets_stats.rs` pins their invariants and the C's `float`
+/// precision model). An unknown item atom stays `badarg`, and none of the five items
+/// appears in `ets:info/1` — whose 15-field order is unchanged.
 #[test]
-fn info_serves_the_fixed_and_binary_items_and_gaps_stats() {
+fn info_serves_the_fixed_binary_and_stats_items() {
     let bifs = default_registry();
     let (mut heap, atoms, mut tables) = parts();
     let mut ctx =
@@ -1357,14 +1415,59 @@ fn info_serves_the_fixed_and_binary_items_and_gaps_stats() {
         );
         let binary = ets_info2(&bifs, &mut ctx, handle, "binary").expect("info/2 binary");
         assert_eq!(binary, NIL, "{label}: binary is []");
-
-        // `stats` needs the interiors' hash-chain/catree statistics (the oracle's
-        // eight- or three-element tuple), which `beam_ets` does not expose — the
-        // typed gap, never a fabricated count.
-        let err = ets_info2(&bifs, &mut ctx, handle, "stats").expect_err("stats gap");
-        assert!(is_unsupported(&err), "{label}: stats: {err:?}");
     }
 
+    // `stats` comes from the table interior's own measurement
+    // (`beam_ets::Table::stats`), and the oracle dispatches on the table *type*: a
+    // hash table (`set`/`bag`/`duplicate_bag`) answers the eight-element occupancy
+    // tuple. Its last two positions are the elements that agree with the oracle **by
+    // value** — `kept_items` (0 on an unfixed table) and `nlocks` (1 when not
+    // fine-locked). The chain/occupancy metrics in between measure this crate's own
+    // interior, so their values are not the oracle's (checked as invariants in
+    // `beam_ets/tests/ets_stats.rs`).
+    for (label, kind) in [("set", set), ("bag", bag), ("duplicate_bag", duplicate_bag)] {
+        let handle = ets_new_ok(&bifs, &mut ctx, "t", &[kind]);
+        insert_k(&bifs, &mut ctx, handle, one);
+        let elements = stats_elements(&bifs, &mut ctx, handle).expect("a hash table has stats");
+        assert_eq!(elements.len(), 8, "{label}: stats is an 8-tuple");
+        assert_eq!(
+            integer_at(&bifs, &mut ctx, &elements, 7),
+            0,
+            "{label}: kept_items (the seventh element)"
+        );
+        assert_eq!(
+            integer_at(&bifs, &mut ctx, &elements, 8),
+            1,
+            "{label}: nlocks (the eighth element)"
+        );
+    }
+
+    // A fine-locked `set` reports the normalized lock count, and a fine-locked
+    // `ordered_set` is a catree: a three-element node/depth tuple.
+    let wc_true = pair(&mut ctx, "write_concurrency", tf);
+    let wc_handle = ets_new_ok(&bifs, &mut ctx, "t", &[set, wc_true]);
+    insert_k(&bifs, &mut ctx, wc_handle, one);
+    let elements = stats_elements(&bifs, &mut ctx, wc_handle).expect("a hash table has stats");
+    assert_eq!(elements.len(), 8, "{label}: wc stats is an 8-tuple", label = "set");
+    assert_eq!(
+        integer_at(&bifs, &mut ctx, &elements, 8),
+        64,
+        "a {{write_concurrency, true}} table has 64 locks (the eighth element)"
+    );
+    let oset_wc = ets_new_ok(&bifs, &mut ctx, "t", &[ordered_set, wc_true]);
+    insert_k(&bifs, &mut ctx, oset_wc, one);
+    let elements =
+        stats_elements(&bifs, &mut ctx, oset_wc).expect("a fine-locked ordered_set has stats");
+    assert_eq!(elements.len(), 3, "the catree shape is a 3-tuple");
+
+    // A plain `ordered_set` has no statistics: the atom `false`, never a fabricated
+    // tuple and never a fabricated empty list.
+    let plain_oset = ets_new_ok(&bifs, &mut ctx, "t", &[ordered_set]);
+    insert_k(&bifs, &mut ctx, plain_oset, one);
+    assert!(
+        stats_elements(&bifs, &mut ctx, plain_oset).is_none(),
+        "a plain ordered_set answers the atom false"
+    );
     // A fixed table: `fixed` turns `true`; `safe_fixed*`'s fixation tuples need
     // state the model does not keep, so they stay the typed gap while fixed.
     let fixed_handle = ets_new_ok(&bifs, &mut ctx, "t", &[set]);

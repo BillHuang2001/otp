@@ -79,9 +79,6 @@ const WRITE_CONCURRENCY_MIN_LOCKS: i64 = 1;
 /// See [`WRITE_CONCURRENCY_MIN_LOCKS`].
 const WRITE_CONCURRENCY_MAX_LOCKS: i64 = 32768;
 
-/// The number of locks a fine-locked table has at minimum
-/// (`NLOCKS_WITH_ITEM_COUNTERS`, `erl_db_hash.c`).
-const NLOCKS_WITH_ITEM_COUNTERS: u64 = 64;
 
 // -------------------------------------------------------- table resolution
 
@@ -185,9 +182,9 @@ pub(super) enum TableProfile {
     /// `{write_concurrency, auto}` — the atom `auto`.
     Auto,
     /// `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}` — the hidden
-    /// tuple, with `N` the **normalized** lock count (`db_hash_create`'s rule: round
-    /// the requested count down to a power of two, then clamp up to
-    /// `NLOCKS_WITH_ITEM_COUNTERS`).
+    /// tuple, with `N` the **normalized** lock count
+    /// ([`beam_ets::WriteConcurrency::lock_count`]: the requested count rounded down
+    /// to a power of two, then clamped up to `NLOCKS_WITH_ITEM_COUNTERS`).
     FixedLocks(u64),
 }
 
@@ -381,7 +378,11 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
     // Only the two forms the model's boolean cannot express need a profile.
     let profile = match options.write_concurrency_mode() {
         WriteConcurrency::Auto => Some(TableProfile::Auto),
-        WriteConcurrency::FixedLocks(n) => Some(TableProfile::FixedLocks(normalize_locks(n))),
+        // The normalized lock count is the model's (`beam_ets::WriteConcurrency::lock_count`,
+        // the one implementation of `db_hash_init`'s rule) — never re-derived here.
+        WriteConcurrency::FixedLocks(_) => {
+            Some(TableProfile::FixedLocks(u64::from(options.lock_count())))
+        }
         WriteConcurrency::Off | WriteConcurrency::On => None,
     };
     Ok(ParsedOptions { options, profile })
@@ -418,20 +419,6 @@ fn pid_arg(term: Eterm) -> Result<ProcessId> {
     }
     ProcessId::from_eterm(term).map_err(|_| badarg())
 }
-
-/// `db_hash_create`'s lock-count normalization (`erl_db_hash.c:1040-1050`): round
-/// the requested count **down** to a power of two, then clamp up to
-/// `NLOCKS_WITH_ITEM_COUNTERS` (64).
-///
-/// `requested` is always `>= 1` (the option range is checked by [`locks_option`]),
-/// so the power-of-two rounding is well defined.
-fn normalize_locks(requested: u32) -> u64 {
-    let requested = u64::from(requested);
-    let shift = 63 - requested.leading_zeros();
-    (1u64 << shift).max(NLOCKS_WITH_ITEM_COUNTERS)
-}
-
-// ------------------------------------------------------------ access gating
 
 /// The access an `ets:*` BIF requires of its caller (`db_get_table_aux`'s
 /// `DB_READ`/`DB_WRITE` status masks).

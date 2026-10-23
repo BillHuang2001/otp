@@ -266,14 +266,13 @@ impl Concurrency {
 /// # The stored lock count is the *requested* one
 ///
 /// [`FixedLocks`](WriteConcurrency::FixedLocks) carries the count **as
-/// requested**. The `Nlocks` the oracle reports is that count rounded *down* to a
-/// power of two and then clamped *up* to `NLOCKS_WITH_ITEM_COUNTERS` (64), which
-/// `db_hash_create`/`db_hash_init` (`../../erts/emulator/beam/erl_db_hash.c`)
-/// derives when the table is created — a table-creation detail, not part of this
-/// model. So is the `1..=32768` accept range (`DB_WRITE_CONCURRENCY_MIN_LOCKS`/
-/// `_MAX_LOCKS`, `erl_db.c`:65-66) and the `ordered_set` rejection of the
-/// explicit-granularity form (`erl_db.c`:2727-2732): both belong to the
-/// `beam_bifs` option parser.
+/// requested**; the normalized count the oracle reports (that count rounded *down*
+/// to a power of two and then clamped *up* to `NLOCKS_WITH_ITEM_COUNTERS`, 64) is
+/// [`lock_count`](WriteConcurrency::lock_count)'s, so the model round-trips the
+/// option as given and derives the table-creation figure on demand. The `1..=32768`
+/// accept range (`DB_WRITE_CONCURRENCY_MIN_LOCKS`/`_MAX_LOCKS`, `erl_db.c`:65-66)
+/// and the `ordered_set` rejection of the explicit-granularity form
+/// (`erl_db.c`:2727-2732) both belong to the `beam_bifs` option parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WriteConcurrency {
     /// `{write_concurrency, false}`, or the option omitted — the default. The
@@ -344,6 +343,49 @@ impl WriteConcurrency {
             "true" => Some(WriteConcurrency::On),
             "auto" => Some(WriteConcurrency::Auto),
             _ => None,
+        }
+    }
+
+    /// The number of hash locks ERTS derives for this mode — `tb->hash.nlocks`, the
+    /// last element of `ets:info(Tab, stats)`.
+    ///
+    /// This reproduces `db_hash_init`'s normalization
+    /// (`../../erts/emulator/beam/erl_db_hash.c:1028-1058`), which is the **only**
+    /// implementation of the rule in this workspace:
+    ///
+    /// | mode | `nlocks` | the C |
+    /// |---|---|---|
+    /// | [`Off`](WriteConcurrency::Off) | `1` | the `!(type & DB_FINE_LOCKED)` branch sets `1` (the value doubles as the slot-iteration stride) |
+    /// | [`On`](WriteConcurrency::On) | `64` | `nlocks == 0` ⇒ `DB_HASH_LOCK_CNT` = 64, which the power-of-two rounding leaves alone |
+    /// | [`Auto`](WriteConcurrency::Auto) | `64` | the `DB_FINE_LOCKED_AUTO` branch ⇒ `LCK_AUTO_DEFAULT_NUMBER_OF_LOCKS` = 64 |
+    /// | [`FixedLocks`](WriteConcurrency::FixedLocks)`(n)` | `max(2^floor(log2(max(n,1))), 64)` | round **down** to a power of two, then clamp **up** to `NLOCKS_WITH_ITEM_COUNTERS` = 64 |
+    ///
+    /// Measured against the system `erl` (OTP 29.1.1 / erts-17.1): a requested `4`
+    /// and a requested `100` both report `64`, `1024` reports `1024` and `32768`
+    /// reports `32768`.
+    ///
+    /// The mode is taken **as given**; the `private` normalization is
+    /// [`TableOptions::write_concurrency_mode`]'s (and therefore
+    /// [`TableOptions::lock_count`]'s), exactly as it is for every other reader of
+    /// the mode.
+    pub fn lock_count(&self) -> u32 {
+        /// `NLOCKS_WITH_ITEM_COUNTERS`, `erl_db_hash.c:98` — the floor the C clamps
+        /// every fine-locked table's lock count up to (a table with at least this
+        /// many locks also keeps per-lock item counters).
+        const NLOCKS_WITH_ITEM_COUNTERS: u32 = 64;
+
+        match self {
+            WriteConcurrency::Off => 1,
+            WriteConcurrency::On | WriteConcurrency::Auto => NLOCKS_WITH_ITEM_COUNTERS,
+            WriteConcurrency::FixedLocks(requested) => {
+                // `1 << (erts_fit_in_bits_uint(nlocks) - 1)` — the requested count
+                // rounded down to a power of two. `max(1)` keeps a zero request
+                // (unreachable through the `ets:new/2` parser's `1..=32768` range,
+                // but constructible through this type) from underflowing the shift.
+                let requested = (*requested).max(1);
+                let rounded = 1u32 << (31 - requested.leading_zeros());
+                rounded.max(NLOCKS_WITH_ITEM_COUNTERS)
+            }
         }
     }
 }
@@ -598,7 +640,20 @@ impl TableOptions {
         self.read_concurrency && !self.is_private()
     }
 
-    /// Whether this option set describes a `private` table.
+    /// The table's hash lock count — `tb->hash.nlocks`, the last element of the
+    /// oracle's `ets:info(Tab, stats)` tuple.
+    ///
+    /// Delegates to [`WriteConcurrency::lock_count`] through the **effective**
+    /// mode ([`write_concurrency_mode`](TableOptions::write_concurrency_mode)), so a
+    /// `private` table with `{write_concurrency, true}` reports `1` — exactly what
+    /// the oracle does (`ets:new(t, [private, {write_concurrency, true}])` then
+    /// `ets:info(t, stats)` ends in `1`, the `DB_PRIVATE` gate in `ets_new_2`).
+    ///
+    /// Like the mode getters this is order-independent: the builder may be told the
+    /// access mode before or after the concurrency option.
+    pub fn lock_count(&self) -> u32 {
+        self.write_concurrency_mode().lock_count()
+    }    /// Whether this option set describes a `private` table.
     ///
     /// `private` is the one access mode the oracle treats specially: it forces the
     /// concurrency flags off. `compressed` is **not** affected (a private

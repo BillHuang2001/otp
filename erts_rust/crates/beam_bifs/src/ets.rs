@@ -202,7 +202,9 @@ use std::collections::HashMap;
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_ets::{compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo};
+use beam_ets::{
+    compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo, TableStats,
+};
 use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
@@ -942,6 +944,15 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         } else {
             ctx.list(&[])
         };
+    }
+    // `stats` is the other item whose value comes from the table's *interior* rather
+    // than from the [`TableInfo`] snapshot. The table model measures it
+    // ([`Table::stats`], O(n) — which is exactly why this is not part of
+    // `ets:info/1`), and the rendering below is the oracle's `db_get_info` arm.
+    if name == "stats" {
+        let stats = table.stats();
+        restore_table(ctx, handle, table)?;
+        return stats_term(ctx, stats);
     }
     restore_table(ctx, handle, table)?;
     let profile = {
@@ -1717,10 +1728,12 @@ pub(super) fn element_pos(term: Eterm) -> Result<usize> {
 /// creation-time `profile` for the forms the model's boolean cannot express (the
 /// atom `auto` and the hidden lock-count tuple) and the boolean otherwise.
 ///
-/// Three items of the oracle's `ets:info/2` surface are **not** part of
-/// [`INFO_ITEMS`] — `fixed`, `safe_fixed`/`safe_fixed_monotonic_time` and `stats`
-/// — and are answered here for [`info_2`] only (`binary` is answered by [`info_2`]
-/// itself, since it needs the table's *contents*; see [`table_holds_a_bitstring`]):
+/// Two items of the oracle's `ets:info/2` surface are **not** part of
+/// [`INFO_ITEMS`] — `fixed` and `safe_fixed`/`safe_fixed_monotonic_time` — and are
+/// answered here for [`info_2`] only. Two more are answered by [`info_2`] itself,
+/// because they need the table's *interior/contents* rather than the [`TableInfo`]
+/// snapshot: `binary` ([`table_holds_a_bitstring`]) and `stats` ([`stats_term`],
+/// whose measurement is [`Table::stats`]).
 ///
 /// * `fixed` is the oracle's `IS_FIXED(tb)` (`erl_db_util.h:386`) — whether *any*
 ///   process currently holds a fixation of the table — which `fixed` (the value
@@ -1731,12 +1744,6 @@ pub(super) fn element_pos(term: Eterm) -> Result<usize> {
 ///   the per-process reference counts — state the table model does not keep (it
 ///   has a single boolean) — so that case is the typed gap rather than a
 ///   fabricated tuple.
-/// * `stats` is a typed gap: the oracle answers it from the interior's chain/tree
-///   statistics (an eight-element hash tuple for `set`/`bag`/`duplicate_bag`, a
-///   three-element catree tuple for a fine-locked `ordered_set`), and those counts
-///   (active slots, average/standard-deviation chain length, per-lock fields) live
-///   in the ERTS interiors `beam_ets` does not expose. They must not be
-///   fabricated, so the item is left to the runtime to close.
 ///
 /// [`entries`]: TableInfo::entries
 fn info_field(
@@ -1808,10 +1815,54 @@ fn info_field(
                 ctx.boolean(false)
             }
         }
-        // The interior's chain/tree statistics, which `beam_ets` does not expose —
-        // see the `info_field` doc.
-        "stats" => Err(unsupported_bif()),
         _ => Err(badarg()),
+    }
+}
+
+/// `ets:info(Tab, stats)` as a term — the oracle's `db_get_info` `stats` arm
+/// (`../../erts/emulator/beam/erl_db.c:5585-5629`).
+///
+/// The three arms render exactly the oracle's shapes:
+///
+/// * [`TableStats::Hash`] — a **8-tuple**
+///   `{Nactive, AvgChainLen, StdDevChainLen, StdDevExpected, MinChainLen, MaxChainLen, KeptItems, NLocks}`:
+///   the bucket/chain counts as integers and the three derived figures as floats,
+///   in that positional order (the C's `TUPLE8`). The floats are already
+///   `f32`-rounded figures ([`beam_ets::BucketChains`] reproduces the C's `float`
+///   fields), so this is a plain float construction — no second rounding here.
+/// * [`TableStats::Tree`] — a **3-tuple** `{RouteNodes, BaseNodes, MaxDepth}`, all
+///   integers (the C's `TUPLE3`).
+/// * [`TableStats::Absent`] — the atom `false` (the C's `else ret = am_false`). The
+///   atom is interned, never a fabricated empty list.
+fn stats_term(ctx: &mut BifContext<'_>, stats: TableStats) -> Result<Eterm> {
+    match stats {
+        TableStats::Hash(hash) => {
+            let active_buckets = ctx.int(hash.active_buckets as i64)?;
+            let avg_chain_len = ctx.make_float(hash.avg_chain_len)?;
+            let std_dev_chain_len = ctx.make_float(hash.std_dev_chain_len)?;
+            let std_dev_expected = ctx.make_float(hash.std_dev_expected)?;
+            let min_chain_len = ctx.int(hash.min_chain_len as i64)?;
+            let max_chain_len = ctx.int(hash.max_chain_len as i64)?;
+            let kept_items = ctx.int(hash.kept_items as i64)?;
+            let nlocks = ctx.int(i64::from(hash.nlocks))?;
+            ctx.tuple(&[
+                active_buckets,
+                avg_chain_len,
+                std_dev_chain_len,
+                std_dev_expected,
+                min_chain_len,
+                max_chain_len,
+                kept_items,
+                nlocks,
+            ])
+        }
+        TableStats::Tree(tree) => {
+            let route_nodes = ctx.int(tree.route_nodes as i64)?;
+            let base_nodes = ctx.int(tree.base_nodes as i64)?;
+            let max_depth = ctx.int(tree.max_depth as i64)?;
+            ctx.tuple(&[route_nodes, base_nodes, max_depth])
+        }
+        TableStats::Absent => ctx.intern_atom("false"),
     }
 }
 

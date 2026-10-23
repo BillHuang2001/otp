@@ -570,6 +570,72 @@ fn write_concurrency_predicates_and_lock_count() {
     assert_eq!(WriteConcurrency::default(), WriteConcurrency::Off);
 }
 
+/// [`WriteConcurrency::lock_count`] is `db_hash_init`'s normalization
+/// (`../../erts/emulator/beam/erl_db_hash.c:1028-1058`): `1` when not fine-locked,
+/// `64` for the `true`/`auto` forms, and for the explicit granularity the requested
+/// count rounded **down** to a power of two then clamped **up** to
+/// `NLOCKS_WITH_ITEM_COUNTERS` = `64`.
+///
+/// Every figure here was read off the system `erl` (OTP 29.1.1 / erts-17.1) as the
+/// last element of `ets:info(T, stats)` — `4` and `100` report `64`, `1024` reports
+/// `1024`, `32768` reports `32768`.
+#[test]
+fn lock_count_is_the_cs_normalization() {
+    assert_eq!(WriteConcurrency::Off.lock_count(), 1);
+    assert_eq!(WriteConcurrency::On.lock_count(), 64);
+    assert_eq!(WriteConcurrency::Auto.lock_count(), 64);
+
+    // Rounded down to a power of two, then clamped up to 64.
+    assert_eq!(WriteConcurrency::FixedLocks(1).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(4).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(63).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(64).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(100).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(127).lock_count(), 64);
+    assert_eq!(WriteConcurrency::FixedLocks(128).lock_count(), 128);
+    assert_eq!(WriteConcurrency::FixedLocks(1000).lock_count(), 512);
+    assert_eq!(WriteConcurrency::FixedLocks(1024).lock_count(), 1024);
+    assert_eq!(WriteConcurrency::FixedLocks(1025).lock_count(), 1024);
+    assert_eq!(WriteConcurrency::FixedLocks(32768).lock_count(), 32768);
+    // `FixedLocks(0)` is unreachable through the `ets:new/2` parser's `1..=32768`
+    // range but constructible through the type: it must not underflow the shift.
+    assert_eq!(WriteConcurrency::FixedLocks(0).lock_count(), 64);
+}
+
+/// [`TableOptions::lock_count`] delegates through the **effective** mode, so a
+/// `private` table's requested concurrency is normalized away first.
+///
+/// Measured: `ets:new(t, [set, private, {write_concurrency, true}])` then
+/// `ets:info(t, stats)` ends in `1`, while the same options without `private` end in
+/// `64`.
+#[test]
+fn table_options_lock_count_follows_the_effective_mode() {
+    let mut opts = TableOptions::new();
+    assert_eq!(opts.lock_count(), 1);
+
+    opts.set_write_concurrency(true);
+    assert_eq!(opts.lock_count(), 64);
+
+    opts.set_write_concurrency_mode(WriteConcurrency::FixedLocks(1024));
+    assert_eq!(opts.lock_count(), 1024);
+
+    // The `DB_PRIVATE` gate wins over every requested mode, in either order.
+    opts.set_access(Access::Private);
+    assert_eq!(opts.lock_count(), 1);
+    let mut access_first = TableOptions::new();
+    access_first
+        .set_access(Access::Private)
+        .set_write_concurrency_mode(WriteConcurrency::FixedLocks(1024));
+    assert_eq!(access_first.lock_count(), 1);
+
+    // Public/protected keep the requested granularity.
+    let mut public = TableOptions::new();
+    public
+        .set_access(Access::Public)
+        .set_write_concurrency_mode(WriteConcurrency::Auto);
+    assert_eq!(public.lock_count(), 64);
+}
+
 /// The boolean `set_write_concurrency` API stays the `On`/`Off` projection of
 /// the richer mode, so the existing `beam_bifs` call sites are unchanged.
 #[test]
