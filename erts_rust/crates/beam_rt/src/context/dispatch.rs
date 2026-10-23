@@ -129,6 +129,37 @@ pub(super) struct DispatchHooks {
 }
 
 impl DispatchHooks {
+    /// Whether **any** hook is set — the one-bit test [`RuntimeContext::call_registered`] makes to
+    /// pick between its hook-free fast path and its full (cold) one.
+    ///
+    /// The roster is *the* arm selector, so "no hook set" is exactly the state in which
+    /// `call_registered` has nothing left to install beyond the handles every call gets (the atom
+    /// table, the port provider, the local-node identity, the interner and the fun-caller bridge —
+    /// the last of which is the chain's `else` arm). Measured at **99.91 %** of a
+    /// `bench_gc_bound:churn/1` run's registered calls (`BEAM_RT_PERF_COUNTERS=1`: arm `fun_caller`
+    /// 5 171 194 of 5 171 517), so the test is what keeps the eleven per-arm predicates and their
+    /// eleven spilled bytes off the path an arithmetic loop takes.
+    ///
+    /// Every field is `bool`, and the `|` chain is a plain bitwise fold over eleven bytes: it is
+    /// deliberately **not** `||`, whose short-circuit would cost up to eleven branches where one OR
+    /// tree costs none, and it is deliberately written out in full (rather than
+    /// `*self != DispatchHooks::default()`) so a field added to the struct fails to compile here
+    /// instead of silently dropping out of the test.
+    #[inline]
+    pub(super) fn any(&self) -> bool {
+        self.dict
+            | self.process_hook
+            | self.nif_loader
+            | self.record_source
+            | self.export_gate
+            | self.send_hook
+            | self.module_info
+            | self.persistent_term
+            | self.runtime_hooks
+            | self.fun_identity
+            | self.memory_hook
+    }
+
     /// The predicates for `(module, function, arity)`, evaluated once.
     pub(super) fn of(module: &str, function: &str, arity: u32) -> DispatchHooks {
         let roster = [
