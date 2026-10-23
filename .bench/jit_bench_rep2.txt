@@ -1,0 +1,125 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.04s
+     Running tests/jit_bench.rs (erts_rust/target/debug/deps/jit_bench-2713e3ea3748041f)
+
+running 1 test
+test interpreter_versus_native_tiers_measurement_table ... jit_bench | workload = build/0 (64 put_tuple2 + 64 put_list) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   15.501 ms |         5167.1 ns/op |       193532.2 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=   15.685 ms |         5228.5 ns/op |       191260.4 ops/s
+jit_bench |   baseline-jit: one-time compile = 95.716 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 0.99x
+jit_bench | tier=jit-cranelift runs=3000   total=   17.707 ms |         5902.2 ns/op |       169427.1 ops/s
+jit_bench |   jit-cranelift: one-time compile = 6393.964 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 0.88x
+
+jit_bench | workload = map/2 (32 rounds of has_map_fields + get_map_elements(3) + put_map_assoc) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   28.674 ms |         9558.0 ns/op |       104624.2 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=   22.675 ms |         7558.2 ns/op |       132306.9 ops/s
+jit_bench |   baseline-jit: one-time compile = 247.674 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 1.26x
+jit_bench | tier=jit-cranelift runs=3000   total=   22.915 ms |         7638.5 ns/op |       130916.4 ops/s
+jit_bench |   jit-cranelift: one-time compile = 13891.528 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 1.25x
+
+jit_bench | workload = select/1 (32 rounds: one inlined + one deopted select_val) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=    6.078 ms |         2026.2 ns/op |       493543.5 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    1.794 ms |          597.9 ns/op |      1672619.3 ops/s
+jit_bench |   baseline-jit: one-time compile = 205.792 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 3.39x
+jit_bench | tier=jit-cranelift runs=3000   total=    1.581 ms |          527.1 ns/op |      1897194.8 ops/s
+jit_bench |   jit-cranelift: one-time compile = 4112.309 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 3.84x
+
+jit_bench | workload = walk/2 (is_nonempty_list guard + get_list + '+'/2 + call_only over 64 cells) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=    9.031 ms |         3010.5 ns/op |       332171.4 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    1.997 ms |          665.6 ns/op |      1502349.7 ops/s
+jit_bench |   baseline-jit: one-time compile = 37.249 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 4.52x
+jit_bench | tier=jit-cranelift runs=3000   total=    0.655 ms |          218.5 ns/op |      4577545.9 ops/s
+jit_bench |   jit-cranelift: one-time compile = 337.642 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 13.78x
+
+jit_bench | workload = sum/1 (non-tail-recursive list sum + a Y-operand '+'/2 over 64 cells) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   17.152 ms |         5717.4 ns/op |       174906.1 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    4.339 ms |         1446.3 ns/op |       691404.0 ops/s
+jit_bench |   baseline-jit: one-time compile = 35.717 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 3.95x
+jit_bench | tier=jit-cranelift runs=3000   total=   15.854 ms |         5284.7 ns/op |       189224.2 ops/s
+jit_bench |   jit-cranelift: one-time compile = 376.488 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 1.08x
+
+jit_bench | workload = slice:fib/1 (20) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=    4.742 ms |         1580.5 ns/op |       632692.4 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    0.930 ms |          310.1 ns/op |      3224811.3 ops/s
+jit_bench |   baseline-jit: one-time compile = 73.162 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 5.10x
+jit_bench | tier=jit-cranelift runs=3000   total=    0.486 ms |          161.9 ns/op |      6178013.3 ops/s
+jit_bench |   jit-cranelift: one-time compile = 1090.942 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 9.76x
+
+jit_bench | workload = kernel/2 (256 chained gc_bif '+'/2) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   14.955 ms |         4985.0 ns/op |       200602.4 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    1.091 ms |          363.6 ns/op |      2749980.1 ops/s
+jit_bench |   baseline-jit: one-time compile = 431.696 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 13.71x
+jit_bench | tier=jit-cranelift runs=3000   total=    1.839 ms |          612.9 ns/op |      1631527.2 ops/s
+jit_bench |   jit-cranelift: one-time compile = 21432.628 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 8.13x
+
+jit_bench | workload = wide/2 (256 steps over 8 x-registers) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   19.161 ms |         6386.9 ns/op |       156571.6 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    1.166 ms |          388.6 ns/op |      2573128.3 ops/s
+jit_bench |   baseline-jit: one-time compile = 568.631 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 16.43x
+jit_bench | tier=jit-cranelift runs=3000   total=    1.963 ms |          654.4 ns/op |      1528061.3 ops/s
+jit_bench |   jit-cranelift: one-time compile = 24778.135 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 9.76x
+
+jit_bench | workload = aggr/2 (128 steps of get_list/get_hd/get_tl + get_tuple_element + gc_bif '*'/2) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   27.208 ms |         9069.5 ns/op |       110259.9 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    6.429 ms |         2142.9 ns/op |       466654.1 ops/s
+jit_bench |   baseline-jit: one-time compile = 1902.758 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 4.23x
+jit_bench | tier=jit-cranelift runs=3000   total=    6.184 ms |         2061.5 ns/op |       485084.0 ops/s
+jit_bench |   jit-cranelift: one-time compile = 110324.101 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 4.40x
+
+jit_bench | workload = cmp/2 (64 rounds of the eight comparison BIFs over 3 small-int x-registers) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   31.147 ms |        10382.5 ns/op |        96316.3 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=    3.410 ms |         1136.5 ns/op |       879862.7 ops/s
+jit_bench |   baseline-jit: one-time compile = 1511.782 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 9.14x
+jit_bench | tier=jit-cranelift runs=3000   total=    3.668 ms |         1222.5 ns/op |       817974.3 ops/s
+jit_bench |   jit-cranelift: one-time compile = 51518.688 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 8.49x
+
+jit_bench | workload = cross/2 (64 cross-module call_ext_last transfers between jit_bench_cross_a and jit_bench_cross_b) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   47.810 ms |        15936.5 ns/op |        62748.9 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=   41.548 ms |        13849.3 ns/op |        72205.6 ops/s
+jit_bench |   baseline-jit: one-time compile = 49.070 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 1.15x
+jit_bench | tier=jit-cranelift runs=3000   total=   55.356 ms |        18451.9 ns/op |        54195.0 ops/s
+jit_bench |   jit-cranelift: one-time compile = 426.201 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 0.86x
+
+jit_bench | workload = call_ext/0 (256 declined erlang:'+'/2 call_ext calls in a loop) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   30.775 ms |        10258.2 ns/op |        97482.8 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=   17.658 ms |         5885.9 ns/op |       169898.5 ops/s
+jit_bench |   baseline-jit: one-time compile = 29.084 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 1.74x
+jit_bench | tier=jit-cranelift runs=3000   total=   24.656 ms |         8218.7 ns/op |       121673.2 ops/s
+jit_bench |   jit-cranelift: one-time compile = 282.213 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 1.25x
+
+jit_bench | workload = send_recv/2 (64 send + receive loopback round-trips through the mailbox) | tiers = ["interpreter", "baseline-jit", "jit-cranelift"]
+jit_bench | tier=interpreter  runs=3000   total=   46.208 ms |        15402.8 ns/op |        64923.3 ops/s
+jit_bench | tier=baseline-jit runs=3000   total=   17.935 ms |         5978.5 ns/op |       167267.0 ops/s
+jit_bench |   baseline-jit: one-time compile = 62.135 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up baseline-jit over interpreter: 2.58x
+jit_bench | tier=jit-cranelift runs=3000   total=   41.793 ms |        13931.1 ns/op |        71781.7 ops/s
+jit_bench |   jit-cranelift: one-time compile = 717.508 us (excluded from the timed loop; the loop is 3000 run_compiled calls against that artifact)
+jit_bench |   speed-up jit-cranelift over interpreter: 1.11x
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.87s
+
