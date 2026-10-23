@@ -121,8 +121,11 @@ Totals over 38 fixtures / 422 functions: **440** deopts / **4 500** visited inst
 **4** deopting variants out of **99** visited.
 This is the one quantity in this node that **cannot drift with the installed OTP tree**, and it is
 the set worth pinning: it says exactly which shapes fall back on the baseline tier for real compiler
-output — the always-deopting `FuncInfo`, the un-armed `Bif0`/`NifStart`/`OnLoad` dispatch, and the
-`Bif`/`GcBif` shapes whose per-name predicates decline (Table 6 says which names).
+output — the always-deopting `FuncInfo` (one per function), the un-armed `Bif0` dispatch, and the
+`Bif`/`GcBif` shapes whose per-name predicates decline (Table 6 says which names; over the fixtures
+`Bif` declines every instance it sees while `GcBif` inlines 30 of its 34).
+`NifStart`/`OnLoad` deopt 1.0 as well but never occur in the fixtures, so they exist only in the OTP
+half of Table 1.
 The fixture corpus also gives the deterministic half of the register-cache totals:
 `modules=38 functions=422 blocks=1192 ir_instrs=4570 emitted_bytes=295 487`.
 
