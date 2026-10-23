@@ -68,7 +68,9 @@ report_payload(Parent, Bytes) ->
 
 report_payload_list(Parent, Bytes) ->
     {Roster, Size} = self_payload_list(Bytes),
-    Parent ! {result, canon({binary, Roster}) ++ [Size]}.report_none(Parent) ->
+    Parent ! {result, canon({binary, Roster}) ++ [Size]}.
+
+report_none(Parent) ->
     Parent ! {result, canon(self_none())}.
 
 report_other(Parent, Pid) ->
