@@ -100,6 +100,57 @@ Load **real system stdlib/kernel/compiler `.beam` modules** through the shared `
 - **The real-module sweep** (`tests/stdlib_sweep.rs` + the discovery helpers in `tests/support/mod.rs`): the `sweep_loads_every_installed_beam` test loads **every** `.beam` under the installed OTP lib root — `support::otp_lib_root` → `all_otp_beams`, generic discovery with **no** allowlist — and **all 1366** `.beam` over **34** applications load, each yielding ≥1 function with a non-empty label map, through the same shared-atom host, asserted as `loaded == total`. It then executes a curated, **oracle-derived** set of pure functions: `lists` (recursion/list building + `lists:zip/2`), `calendar`, `filename`, `string`, `array`, `ordsets`, `dict` (`store`/`lookup` plus insertion past the expansion threshold — the captured-variable closure path), plus `maps:new/0` and `erl_scan:reserved_word/1`. Where a mechanism is still blocked the test asserts its exact typed error and never a wrong result (`base64:encode/1` **works** — `sweep_base64_builds_an_off_heap_binary`: a 60-byte input → the 80-byte oracle string, an off-heap refc result; `maps:from_list/1`, `maps:size/1`/`get/2`/`keys/1`/`put/3`, `unicode:characters_to_binary/1`, `unicode:characters_to_list/1`, `ets:new/2`, `code:which/1`, `io:format/2` → `BadArg`, and `code_server:call/1` → the typed `unsupported_opcode: receive_marker_reserve`).
 - **Per-application execution breadth** (`tests/apps_lists.rs`): the widened oracle-checked sweep over OTP applications *beyond* `stdlib`/`kernel`/`compiler`, through a host whose search path is **every** installed application (`support::all_otp_ebins`) — `syntax_tools`/`erl_syntax`, `xmerl` (`xmerl_ucs`/`xmerl_lib`), `inets`/`httpd_util`, `edoc`/`edoc_lib`, `eunit`/`eunit_lib`, `dialyzer`/`dialyzer_utils`, `asn1`/`asn1ct_pretty_format`, `snmp` (`snmp_misc`/`snmp_pdus`) and `parsetools` (`leex`/`yecc:format_error/1`). `blocked_targets_report_their_typed_error` is the honest counterpart: targets the host cannot serve are asserted against their **exact** typed error (`asn1ct:use_legacy_types/0` → the process-dictionary `badarg`; `erl_syntax:atom_literal/1` → the `persistent_term` NIF refusal; `httpd_util:create_etag/1` → the structured `{badrecord, V}` raise).
 
+## Per-tier real-module execution evidence (which tier runs a REAL `.beam`)
+"Real module" = a committed `erlc +deterministic` fixture (`fixtures/`, or the sibling
+`beam_loader/tests/fixtures/{slice,coverage}.beam`) or an installed OTP `.beam` found by
+`support/discovery.rs`. `#![cfg(feature = "jit-cranelift")]` gates BOTH Cranelift files
+(`jit_cranelift.rs:55`, `jit_cranelift_real.rs:78`); the feature is default-OFF.
+- **`Tier::Interpreter`** — the whole corpus. `stdlib_sweep.rs` selects **no tier at all**
+  (`ModuleHost::call` → `Machine::run_export`, `support/host.rs:175`), and its
+  `sweep_loads_every_installed_beam` (`:189`) only **LOADS** every discovered `.beam` (floors
+  `total >= 1000` / `apps >= 20` / `loaded == total`, `:261-274`) — the value assertions are
+  separate `sweep_*` tests. Same interpreter-only entry for `coverage.rs` (`:277` over
+  `coverage.beam`), `slice.rs`, the stdlib/apps/corpus suites, `census.rs` (structural) and
+  `real_beam_variant_proofs/` (`harness.rs` uses `run_export`); `dynamic_census.rs:807` pins
+  `Tier::Interpreter` deliberately (the census funnel is interpreter-only).
+- **`Tier::BaselineJit`** — `jit_real_module.rs::run_target` drives each target twice on the SAME
+  loaded module (`:254` interpreter, `:255` baseline) over two committed corpora:
+  `fixtures/stdlib_breadth_targets.txt` (504 targets / 171 modules; floors
+  `BREADTH_COMPARISON_FLOOR` 480, `BREADTH_VALUE_FLOOR` 480, `BREADTH_MODULE_FLOOR` 171,
+  `:269-274`) and `fixtures/error_path_targets.txt` (232 targets / 215 modules; floors 220/200/200,
+  `:449-455`). **It is TIER-vs-TIER, not tier-vs-oracle**: `parse_breadth_target` binds
+  `_expected` and discards the corpus's expected column (`:284`), and the error corpus likewise
+  compares only the two tiers' `Debug` shapes (`:195-204`) — oracle fidelity is
+  `stdlib_lists.rs`'s / `exceptions_corpus.rs`'s job. `PERF.md:153` records the observed 736/736
+  (504 + 232). Other baseline real-module evidence: `jit.rs` (slice.beam, 9 `agree(..)` rows over
+  both tiers), `jit_coverage.rs` (coverage.beam × `NATIVE_TIERS`, `:154`/`:158`),
+  `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_reductions.rs` (slice.beam),
+  `jit_cross_module.rs` (fixtures compiled by the system `erlc` at test time, both tiers at
+  `:550-551`), `stacktrace_frames.rs` (`TIERS = [Interpreter, BaselineJit]`, `:127`, live-`erl`
+  prefix cross-check), and `the_block_allocator_engages_on_real_stdlib_modules` (`:638`, 7 real
+  modules, engine-internal artifact assertions only). `jit_compare.rs` / `local_call_seam.rs` are
+  **synthetic-only**.
+- **`Tier::Cranelift`** — real-module half is `jit_cranelift_real.rs`: a 26-row curated real-stdlib
+  set whose expected values ARE the oracle's (`:365`, `compared >= 20` at `:663`; `lists`/`ordsets`/
+  `proplists`/`calendar`), a **bounded** breadth sweep (≤`MAX_BREADTH_MODULES` 30 modules ×
+  ≤`PER_MODULE` 2 = ≤60 cases; floors 40 cases / 20 modules, `:107-121`, `:1140-1148`) and a
+  bounded error sweep (floors 30 cases / 10 `function_clause`, `:123-129`, `:1353-1358`) — both
+  compare interpreter vs Cranelift only, never the oracle value. `jit_cranelift.rs` runs slice.beam
+  on all three tiers behind one `agree(..)` (`:121-130`) and is synthetic otherwise; `jit_coverage.rs`
+  adds `Cranelift` to `NATIVE_TIERS` when the feature is on, so `coverage.beam` (funs/floats/
+  `try`-raise/maps/bitstrings) is covered on it too.
+- **Gaps by tier:** the 504+232 corpora and `jit_cross_module.rs` are baseline-only (Cranelift gets
+  bounded prefixes only); no suite drives `Tier::Cranelift` over `census.rs`/`dynamic_census.rs`/
+  `real_beam_variant_proofs.rs`/`stdlib_sweep.rs`. `jit_cranelift_real.rs:324`'s roster test calls
+  `host()` with **no** skip guard, so it PANICS (not skips) when the OTP stdlib is absent; the
+  `skip_reason()` guard elsewhere needs the stdlib `.beam` files only (no live `erl` per assertion —
+  values are baked, except `jit_cross_module.rs`'s test-time `erlc` and the live-oracle suites).
+- **`#[ignore]`d suites here:** exactly two — `stacktrace_frames.rs:710` (`#[ignore = "capability
+  gap: `ModuleHost` supplies no mailbox, …"]`) and `jit_bench.rs:57` (`#[ignore = "measurement
+  table: run with --ignored --nocapture"]`). Run either with
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test
+  <name> -- --ignored --nocapture`; nothing Cranelift is `#[ignore]`d (feature-gated instead).
+
 ## Routing Table
 - `support/` → shared multi-module `ExecutionContext` host: OTP discovery (`otp_lib_root`/`all_otp_beams`), the shared atom universe, the BIF floor, assertion helpers
 - `support/probe/` → the valid-operand probe harness (`mod.rs`: `ProbeAtoms`, `ProbeMailbox`, `Expect`, `Observed`, `Verdict`, the `Probe` builder, `ProbeRun`, `render_term`, the fixed entry/aux/fail-sink labels) and its roster in `rows/` — one file per instruction group (`core.rs`, `data.rs`, `exceptions.rs`, `receive.rs`, `bitstrings.rs`, unioned by `rows/mod.rs::all_rows`), keyed by the variant name **derived** from the constructed `Instr` so a row can override a legacy row but never invent a name
