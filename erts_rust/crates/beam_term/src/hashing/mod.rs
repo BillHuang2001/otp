@@ -70,11 +70,13 @@
 //! `make_hash2` and `make_hash` submodules (see the section comment below).
 
 mod common;
+mod identity;
 mod make_hash;
 mod make_hash2;
 
-pub use make_hash::make_hash;
-pub use make_hash2::{compute_record_definition_hash, make_hash2};
+pub use identity::LocalFunIdentity;
+pub use make_hash::{make_hash, make_hash_with_identity};
+pub use make_hash2::{compute_record_definition_hash, make_hash2, make_hash2_with_identity};
 
 use crate::atom::AtomTable;
 use crate::bitstring::{bitstring_parts, float_bits};

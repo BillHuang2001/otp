@@ -36,7 +36,13 @@
 //! * an **internal reference** mixes `internal_ref_numbers(term)[0]`
 //!   (`:288-290`) — an id of the node container this tree's M1 `Ref` thing does not
 //!   carry — so it is refused with `TermError::RefIdentityUnavailable` rather than
-//!   mixed from a different word.
+//!   mixed from a different word;
+//! * a **`make_fun3` (`FunKind::Local`) fun** mixes `atom_val(fe->module)`'s hvalue,
+//!   `fe->index`, `fe->old_uniq` and the capture count (`:242-261`). The frozen term
+//!   carries the middle two in its inlined descriptor, so only the **defining module**
+//!   is outside it: [`make_hash_with_identity`] takes a [`LocalFunIdentity`] provider,
+//!   and [`make_hash`] — the provider-less form — keeps the typed
+//!   `TermError::FunIdentityUnavailable` refusal.
 
 use crate::atom::AtomTable;
 use crate::bitstring::float_bits;
@@ -45,7 +51,7 @@ use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{
     fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_old_uniq,
-    fun_true_arity, FunKind,
+    fun_true_arity, fun_uniq, FunKind,
 };
 use crate::immediate::{
     atom_val, internal_port_data, is_byte, make_small, pid_number, signed_value, unsigned_value,
@@ -64,7 +70,8 @@ use super::common::{
     bitstring_parts_any, uint32_hash_step, HItem, HOp, FN1, FN10, FN11, FN12, FN13, FN14, FN15,
     FN2, FN3, FN4, FN5, FN6, FN8, FN9,
 };
-use super::make_hash2::{compute_record_definition_hash, make_hash2};
+use super::identity::{local_fun_module, reborrow, LocalFunIdentity};
+use super::make_hash2::{compute_record_definition_hash, make_hash2_with_identity};
 
 /// `hash_binary_bytes(bin, hash)` (`erl_term_hashing.c:114-163`) — `make_hash`'s
 /// byte-wise binary hash.
@@ -162,8 +169,31 @@ fn hash_tag_def(t: Eterm) -> TermResult<HOp> {
 ///
 /// `erlang:phash(T, R)` is `1 + (make_hash(T) % R)` for `R < 2^32`, and the raw
 /// `make_hash(T) + 1` for `R = 2^32` (`bif.c:5370-5420`).
+///
+/// Bit-exact for every term shape this tree can reproduce; a `make_fun3`
+/// (`FunKind::Local`) fun needs a [`LocalFunIdentity`] provider — see
+/// [`make_hash_with_identity`] — and without one answers
+/// [`TermError::FunIdentityUnavailable`].
 pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
+    make_hash_with_identity(t, atoms, None)
+}
+
+/// [`make_hash`] with a **fun-identity provider** for `make_fun3`
+/// (`FunKind::Local`) funs — the `erlang:phash/2` value of a closure.
+///
+/// The `make_hash` twin of [`make_hash2_with_identity`]: the C's local-fun arm
+/// reads the defining module out of the closure's out-of-line `ErlFunEntry`
+/// (`erl_term_hashing.c:242-251`), which this tree's inlined descriptor does not
+/// carry, so the module is asked of `identity`. With `identity == None` a `Local`
+/// fun is the typed [`TermError::FunIdentityUnavailable`]; every other term shape is
+/// unaffected.
+pub fn make_hash_with_identity(
+    t: Eterm,
+    atoms: &AtomTable,
+    identity: Option<&mut dyn LocalFunIdentity>,
+) -> TermResult<u32> {
     let mut hash: u32 = 0;
+    let mut identity = identity;
     let mut stack: Vec<HItem> = Vec::new();
     let mut term = t;
     let mut op = hash_tag_def(term)?;
@@ -232,8 +262,40 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                             .wrapping_mul(FN1)
                             .wrapping_add(atoms.hvalue(unsafe { fun_function(term)? }));
                     }
-                    // As in `make_hash2`: a `make_fun3` fun lacks module/`old_uniq`.
-                    FunKind::Local => return Err(TermError::FunIdentityUnavailable),
+                    // As in `make_hash2`: the descriptor carries `index`/`uniq`, and the
+                    // defining module comes from the caller's provider (`None` stays the
+                    // typed refusal).
+                    FunKind::Local => {
+                        let num_free = fun_num_free(hdr);
+                        let Some(module) = local_fun_module(&mut identity, term)? else {
+                            return Err(TermError::FunIdentityUnavailable);
+                        };
+                        hash = hash.wrapping_mul(FN10).wrapping_add(num_free as u32);
+                        hash = hash
+                            .wrapping_mul(FN1)
+                            .wrapping_add(atoms.hvalue(module));
+                        // SAFETY: `term` is a live local fun; both accessors re-check the
+                        // kind before reading the descriptor word.
+                        hash = hash
+                            .wrapping_mul(FN2)
+                            .wrapping_add(unsafe { fun_index(term)? });
+                        // `ErlFunEntry.old_uniq` is a `Uint32`, which is exactly the value
+                        // the term's `uniq` descriptor word holds (`FunDescriptor::uniq`).
+                        hash = hash
+                            .wrapping_mul(FN2)
+                            .wrapping_add(unsafe { fun_uniq(term)? } as u32);
+                        if num_free > 0 {
+                            let env = unsafe { fun_env(term)? };
+                            if num_free > 1 {
+                                stack.push(HItem::Ptr(env.as_ptr().wrapping_add(1)));
+                                stack.push(HItem::Count(num_free - 1));
+                                stack.push(HItem::Op(HOp::TermArray));
+                            }
+                            term = env[0];
+                            op = hash_tag_def(term)?;
+                            continue;
+                        }
+                    }
                 }
             }
             HOp::Pid | HOp::ExternalPid => {
@@ -295,10 +357,13 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                     .wrapping_add(((bits & 0xffff_ffff) as u32) ^ ((bits >> 32) as u32));
             }
             HOp::Map => {
+                // The C recurses into `make_hash2(term)` (`:366-368`) with no fresh
+                // state, so the provider rides along: a map whose value is a `make_fun3`
+                // closure must hash exactly like the closure alone would.
                 hash = hash
                     .wrapping_mul(FN13)
                     .wrapping_add(FN14)
-                    .wrapping_add(make_hash2(term, atoms)?);
+                    .wrapping_add(make_hash2_with_identity(term, atoms, reborrow(&mut identity))?);
             }
             HOp::TupleInit | HOp::RecordInit => {
                 // SAFETY: `term` is a tuple / record instance.
@@ -483,6 +548,7 @@ mod tests {
     //! end-to-end cross-check against the real runtime lives in `tests/oracle.rs`.
 
     use super::*;
+    use crate::hashing::make_hash2;
     use crate::heap::Heap;
     use crate::immediate::{make_atom, make_small, MAX_SMALL, MIN_SMALL, NIL};
     use crate::list::{car, cdr};
@@ -661,5 +727,74 @@ mod tests {
         let h2 = make_hash2(l, &t).unwrap();
         let h = make_hash(l, &t).unwrap();
         assert_ne!(h2, h);
+    }
+
+    /// The `make_hash` twin of `make_hash2`'s
+    /// `a_local_fun_with_a_provider_hashes_like_its_imported_image`.
+    ///
+    /// The C's legacy local-fun arm mixes `num_free`, the defining module's atom
+    /// hvalue, `fe->index` and `fe->old_uniq` (`erl_term_hashing.c:242-251`) — the very
+    /// same four fields its `make_fun3`-as-`NEW_FUN_EXT` arm mixes (`:262-270`), so the
+    /// two spellings of one closure must agree here too, with and without a provider.
+    #[test]
+    fn a_local_fun_with_a_provider_hashes_like_its_imported_image() {
+        use crate::fun::{fun_words, write_fun_imported, write_fun_local, FunPid};
+        use crate::hashing::identity::test_support::{Failing, FixedModule, Unknown};
+
+        let mut t = AtomTable::new();
+        t.seed(["h", "node", "a"]);
+        let module = t.lookup("h").unwrap();
+        let node = t.lookup("node").unwrap();
+        let mut heap = Heap::new(64);
+        let (index, old_uniq) = (0u32, 97_692_434u32);
+        let env = [make_small(7), make_atom(t.lookup("a").unwrap())];
+        // SAFETY: each heap block holds exactly `fun_words(kind, env.len())` words and
+        // the `Heap` keeps it alive for the whole test.
+        let (local, imported) = unsafe {
+            let p = heap_alloc(&mut heap, fun_words(FunKind::Local, env.len()));
+            let local = write_fun_local(p, 1, u64::from(old_uniq), index, &env).unwrap();
+            let p = heap_alloc(&mut heap, fun_words(FunKind::Imported, env.len()));
+            let imported = write_fun_imported(
+                p,
+                1,
+                module,
+                &[0u8; 16],
+                index,
+                0,
+                old_uniq,
+                FunPid {
+                    node,
+                    number: 0,
+                    serial: 0,
+                    creation: 0,
+                },
+                &env,
+            )
+            .unwrap();
+            (local, imported)
+        };
+
+        assert_eq!(make_hash(local, &t), Err(TermError::FunIdentityUnavailable));
+        assert_eq!(
+            make_hash_with_identity(local, &t, Some(&mut Unknown)),
+            Err(TermError::FunIdentityUnavailable)
+        );
+        assert_eq!(
+            make_hash_with_identity(local, &t, Some(&mut Failing)),
+            Err(TermError::HeapExhausted)
+        );
+
+        let want = make_hash(imported, &t).unwrap();
+        assert_eq!(
+            make_hash_with_identity(local, &t, Some(&mut FixedModule(module))).unwrap(),
+            want
+        );
+        // A different defining module changes the value, so the provider is really
+        // consulted (`hash*FN1 + hvalue(module)`).
+        assert_ne!(
+            make_hash_with_identity(local, &t, Some(&mut FixedModule(t.lookup("a").unwrap())))
+                .unwrap(),
+            want
+        );
     }
 }
