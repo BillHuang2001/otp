@@ -1112,6 +1112,27 @@ pub trait ExecutionContext {
     /// The default body returns `Ok(false)`, so every existing host compiles and
     /// behaves byte-identically (it pays only the call).
     ///
+    /// # The engine consults this **once per distinct callee per run**
+    ///
+    /// A local call is on the hottest path a module has, and OTP charges **no**
+    /// reduction for an intra-module call, so paying a virtual call plus a name
+    /// comparison per executed `call` would price an engine artefact into every
+    /// workload (`Machine::local_call_seam` does the memoizing).
+    /// The answer is therefore cached per `(module image address, function index)`
+    /// for the life of a run: a repeat local call costs one indexed load, not a
+    /// consultation.
+    ///
+    /// **The answer must be a pure function of `(module, function, arity)`** — that
+    /// purity is what makes the cache sound. A host whose answer set changes
+    /// **mid-run** must say so through
+    /// [`Machine::invalidate_local_call_verdicts`](crate::Machine); the engine
+    /// already arms that invalidation itself when it dispatches
+    /// `erlang:load_nif/2`, the one documented way a stub's verdict flips mid-run.
+    /// A verdict must never be baked into **compiled** code: `JitBackend::compile`
+    /// receives no `ExecutionContext` and the compiled-block cache is shared across
+    /// hosts and runs, so the memo lives on the `Machine` (per run), never on the
+    /// artifact.
+    ///
     /// [`call_bif`]: ExecutionContext::call_bif
     fn resolve_local_call(&mut self, module: &str, function: &str, arity: u32) -> Result<bool> {
         let _ = (module, function, arity);
