@@ -46,6 +46,11 @@
 //!   and a *boxed* term as `=<words>:<hex>` where `<words>` is its flat word count
 //!   ([`beam_term::size_object`]) and `<hex>` is its tagged root word. The oracle prints
 //!   the full payload word range; that range is unreachable here without `unsafe`.
+//! * a **record** has no dump shape of its own, so no arm here can render one: `#zzrec{a = 1}`
+//!   and `{zzrec, 1}` are the same heap object, and the oracle writes the identical
+//!   `t3:A5:zzrec,I…` object line for both (its `erl_process_dump.c` has no record notion at
+//!   all) — a record's name is just the tuple's first element atom and its field names never
+//!   appear in any term.
 //!
 //! Every numeric section is derived from **this runtime's own** counters, never from a
 //! hardcoded oracle figure: [`snapshot`] reads `system_info/1` (the `allocated_areas`,
@@ -392,6 +397,7 @@ fn render_pid(pid: beam_process::ProcessId) -> String {
 }
 
 /// One term, line-oriented (see the module docs).
+/// Shape-blind by design: an Erlang record is not a term (`#r{a = 1}` and `{r, 1}` are one heap object, and the oracle renders both as one tuple object line), so no record arm belongs here.
 fn render_term(term: Eterm) -> String {
     if is_immediate(term) {
         format!("=I{:x}", term.raw())
