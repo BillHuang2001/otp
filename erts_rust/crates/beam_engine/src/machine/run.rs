@@ -200,13 +200,14 @@ impl Machine {
     /// * [`Tier::BaselineJit`] — the native baseline backend over the per-thread
     ///   cross-run cache ([`crate::jit::cache`]), resuming through its no-reset
     ///   driver rather than recompiling or resetting.
-    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. A resume is handed
-    ///   **no** compiled artifact and the tier has no path that would compile and
-    ///   bind one at a parked address on demand, so resuming a mid-function
-    ///   `wait`/`suspend` address is unserviceable natively: this is a typed
-    ///   [`unsupported`](crate::error::unsupported) error (or, with the
-    ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
-    ///   path reports) — never a panic and never a silent fallback to another tier.
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. The resume takes
+    ///   the thread-local retained artifact and goes through the shared generic
+    ///   no-reset seam (`crate::jit::baseline::run_native_resume_outcome`), so a
+    ///   slice parked on `wait`/`suspend` continues on this tier with the
+    ///   interpreter's own result; an address the artifact cannot be entered at
+    ///   takes the per-instruction step. With the `jit-cranelift` feature off the
+    ///   same typed error the first-entry Cranelift path reports is returned —
+    ///   never a panic and never a silent fallback to another tier.
     pub fn resume_outcome_with_tier(
         &mut self,
         module: &Module,
@@ -921,17 +922,82 @@ mod tests {
         );
     }
 
-    /// A `Tier::Cranelift` resume is the honest typed `unsupported` error: the
-    /// resume path is handed **no** compiled artifact and the tier has no path that
-    /// would compile and bind one at a parked address on demand, so a mid-function
-    /// suspension address is unserviceable — never a silent fallback to the
-    /// interpreter.
+    /// A `Tier::Cranelift` resume continues the parked process on that tier and reports
+    /// exactly what the interpreter's resume of the same park reports — same
+    /// `RunOutcome`, same value, no reset and no silent fallback to another tier.
+    ///
+    /// The tier resumes through the shared no-reset native driver
+    /// ([`crate::jit::baseline::run_native_resume_outcome`]) over the artifact its own
+    /// retained-artifact store hands back, so a `wait` address (which no compiled block
+    /// starts at) advances by the driver's per-instruction interpreter step — the
+    /// documented deopt, never an error and never a wrong result.
     #[cfg(feature = "jit-cranelift")]
     #[test]
-    fn a_cranelift_tier_resume_is_the_honest_typed_unsupported_error() {
+    fn a_cranelift_tier_resume_continues_the_park_identically_to_the_interpreter() {
         let (module, name) = with_blocks(receive_module());
         // Park the machine on the empty mailbox through the interpreter; the
         // Cranelift resume is what we are exercising.
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::Interpreter,
+                )
+                .expect("interpreter run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+
+        // The interpreter's own resume of the same park is the reference outcome.
+        let mut interpreter = Machine::new();
+        assert_eq!(
+            interpreter
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::Interpreter,
+                )
+                .expect("interpreter run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+        let expected = interpreter
+            .resume_outcome(
+                &module,
+                0,
+                7,
+                &mut MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+                    messages: VecDeque::from([make_small(42)]),
+                })),
+            )
+            .expect("interpreter resume");
+        assert_eq!(expected, RunOutcome::Returned(make_small(42)));
+
+        let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        let got = machine
+            .resume_outcome_with_tier(&module, 0, 7, &mut ctx, Tier::Cranelift)
+            .expect("the cranelift tier resumes the parked process");
+        assert_eq!(
+            got, expected,
+            "a resumed cranelift slice must agree with the interpreter exactly"
+        );
+    }
+
+    /// With the backend **not** compiled in, the same tier selection stays the typed
+    /// `unsupported` error the first-entry Cranelift path reports — never a panic and
+    /// never a silent fallback to the interpreter.
+    #[cfg(not(feature = "jit-cranelift"))]
+    #[test]
+    fn a_cranelift_tier_resume_without_the_feature_is_the_typed_unsupported_error() {
+        let (module, name) = with_blocks(receive_module());
         let mut machine = Machine::new();
         assert_eq!(
             machine
@@ -952,19 +1018,13 @@ mod tests {
         }));
         let err = machine
             .resume_outcome_with_tier(&module, 0, 7, &mut ctx, Tier::Cranelift)
-            .expect_err("the cranelift tier cannot resume at an arbitrary pc");
-        match err {
-            BeamError::Raise(raise) => {
-                let reason = raise.reason.as_atom().unwrap_or_default();
-                assert!(
-                    reason.starts_with("unsupported_opcode: ") && reason.contains("cranelift"),
-                    "expected the honest cranelift resume error, got {reason:?}"
-                );
-            }
-            other => panic!("expected the typed cranelift unsupported error, got {other:?}"),
-        }
+            .expect_err("without the feature the tier has no backend");
+        assert_eq!(
+            err.to_string(),
+            crate::error::unsupported("jit-cranelift tier not built").to_string(),
+            "the feature-off answer is the typed `unsupported` error, unsubstituted"
+        );
     }
-
     #[test]
     fn the_label_entry_reports_the_same_wait_on_the_interpreter_and_baseline_tiers() {
         let (module, name) = with_blocks(receive_module());

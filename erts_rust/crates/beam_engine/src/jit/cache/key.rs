@@ -236,7 +236,7 @@ pub fn module_fingerprint(module: &Module) -> u64 {
 /// [`CodeCache`](super::CodeCache)'s map; the two variants hash their discriminant too, so
 /// a digest-keyed module and a content-keyed one can never share an entry.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum ModuleKey {
+pub(crate) enum ModuleKey {
     /// A real `.beam`: the 16-byte MD5 computed once at load time
     /// ([`Module::checksum`]), read here as a plain `Copy` — O(1), no hash, no
     /// allocation. Everything a
@@ -260,7 +260,7 @@ pub(super) enum ModuleKey {
 impl ModuleKey {
     /// The module half of `module`'s key: its load-time digest when it has one, else its
     /// content hash.
-    pub(super) fn of(module: &Module) -> ModuleKey {
+    pub(crate) fn of(module: &Module) -> ModuleKey {
         match digest_of(module) {
             Some(digest) => ModuleKey::Digest(digest),
             // No digest (a synthetic module): fall back to the honest content hash,
@@ -279,7 +279,7 @@ impl ModuleKey {
     /// digest); a synthetic module keeps the caller's fingerprint, which is the one the
     /// artifact recorded ([`CompiledModule::fingerprint`]) at its creation. Used when
     /// the fingerprint comes from that compiled artifact.
-    pub(super) fn with_fingerprint(module: &Module, fingerprint: u64) -> ModuleKey {
+    pub(crate) fn with_fingerprint(module: &Module, fingerprint: u64) -> ModuleKey {
         match digest_of(module) {
             Some(digest) => ModuleKey::Digest(digest),
             None => ModuleKey::Content {
@@ -308,9 +308,9 @@ impl ModuleKey {
 /// [`MemoEntry`](super::MemoEntry) goes through, so the two maps can never disagree about
 /// a module's identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CacheKey {
+pub(crate) struct CacheKey {
     /// The module's own identity (the digest, or the synthetic content hash).
-    pub(super) module: ModuleKey,
+    pub(crate) module: ModuleKey,
     /// The atom-namespace witness the artifact was compiled against.
     ///
     /// [`Module::atom_table`]'s [`AtomSnapshot`](beam_term::AtomSnapshot) — three scalars
@@ -318,7 +318,7 @@ pub(super) struct CacheKey {
     /// allocation. `AtomTable::clone` deliberately takes a **fresh** identity, so two
     /// loads of one `.beam` never share a snapshot; equal snapshots therefore imply the
     /// same index → name mapping over every index the artifact can embed.
-    pub(super) atoms: AtomSnapshot,
+    pub(crate) atoms: AtomSnapshot,
 }
 
 impl CacheKey {
@@ -326,7 +326,7 @@ impl CacheKey {
     ///
     /// The **only** way a key is derived from a bare [`Module`] (the `contains`/
     /// `get_or_compile`/`compiled_handle` paths).
-    pub(super) fn of(module: &Module) -> CacheKey {
+    pub(crate) fn of(module: &Module) -> CacheKey {
         CacheKey {
             module: ModuleKey::of(module),
             atoms: module.atom_table.snapshot(),
@@ -341,7 +341,7 @@ impl CacheKey {
     /// the stored fingerprint is reused instead of re-hashing the IR, so a synthetic
     /// module is keyed without a second hash while a real `.beam` still keys on its O(1)
     /// digest.
-    pub(super) fn with_fingerprint(module: &Module, fingerprint: u64) -> CacheKey {
+    pub(crate) fn with_fingerprint(module: &Module, fingerprint: u64) -> CacheKey {
         CacheKey {
             module: ModuleKey::with_fingerprint(module, fingerprint),
             atoms: module.atom_table.snapshot(),

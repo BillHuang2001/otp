@@ -504,6 +504,10 @@ pub(crate) fn run_compiled_label_outcome(
 /// the callee's own `(func, pc)`. The entry module's compiled blocks are not entered
 /// in that context; every address the tier has no block for stays on the documented
 /// per-instruction deopt.
+///
+/// It is a thin wrapper over the [`NativeCode`]-generic
+/// [`run_native_resume_outcome`], which every native tier resumes through, so the two
+/// cannot drift.
 pub(crate) fn run_compiled_resume_outcome(
     compiled: &CompiledModule,
     machine: &mut Machine,
@@ -512,17 +516,60 @@ pub(crate) fn run_compiled_resume_outcome(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
+    let code = block_entries(compiled);
+    run_native_resume_outcome(machine, module, func, pc, ctx, &code)
+}
+
+/// The [`NativeCode`]-generic **no-reset** resume driver: re-enter a parked machine at
+/// `(func, pc)` in place, on whichever native tier `code` belongs to.
+///
+/// This is the shared half of every native resume: it is [`run_compiled_resume_outcome`]'s
+/// body with the artifact abstracted away, so the baseline tier and the Cranelift hot tier
+/// resume a parked process through **one** driver and cannot drift.
+///
+/// What it deliberately does **not** do is [`enter_machine`] (which resets): a resume must
+/// preserve the suspended process — its registers, its Erlang stack and every call frame
+/// the park left live. It only
+///
+/// 1. zeroes the per-slice reduction counter (one resume is one scheduling slice, exactly
+///    as [`Machine::drive`] treats one interpreted slice; redundant over the driver's own
+///    zeroing, and kept as belt-and-braces);
+/// 2. re-binds the run's entry module/literal area through
+///    [`Machine::enter_run`](crate::Machine), which is idempotent for a resume (an entry
+///    call is recorded only when the run has none);
+/// 3. binds the module-wide label map the tier already holds
+///    ([`NativeCode::labels`], [`RunLabels::Stored`]) or the machine's cached one
+///    ([`RunLabels::Built`] — an **owned** `Arc`, so holding it does not borrow `machine`);
+/// 4. hands the loop to [`drive`].
+///
+/// `module` is the run's **entry** module (context `0`). A process parked inside a
+/// cross-module callee keeps its non-zero module context, which the driver recovers from
+/// [`Machine::current_context`](crate::Machine) and lands in ([`switch_into`] re-binds the
+/// callee's module, label map and literal area and asks the tier for the callee's compiled
+/// blocks through [`NativeCode::module_blocks`]); a tier with no blocks for that module —
+/// or an address outside the tier's enterable set — stays on the documented per-instruction
+/// interpreter step, never a wrong result and never a silent tier change.
+pub(crate) fn run_native_resume_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<RunOutcome> {
     // One resume is one scheduling slice: start the reduction count at zero, exactly
     // as `Machine::drive` does for the interpreter's resume (`run_loop` -> `drive`).
     machine.reset_reductions();
     machine.enter_run(module, func);
-    // The artifact already holds the module-wide label map (built once at creation),
-    // so a resume reuses it instead of rebuilding it per resume.
-    let labels = compiled.labels();
-    let code = block_entries(compiled);
-    drive(machine, module, labels, func, pc, ctx, &code)
+    // The tier's own module-wide label map when its artifact holds one, else the
+    // machine's cached one. `RunLabels::Built` owns its `Arc`, so no borrow of
+    // `machine` outlives the hand-off.
+    let labels = match code.labels(module) {
+        Some(labels) => RunLabels::Stored(labels),
+        None => RunLabels::Built(machine.label_map(module)),
+    };
+    drive(machine, module, &labels, func, pc, ctx, code)
 }
-
 /// The baseline tier's [`NativeCode`] lookup for `compiled`.
 ///
 /// The register-file guard is applied at entry time by [`enter_compiled_cached`] (from

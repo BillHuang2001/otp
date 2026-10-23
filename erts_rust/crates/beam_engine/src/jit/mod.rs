@@ -435,11 +435,14 @@ pub(crate) fn run_cranelift_label_outcome(
 ///
 /// Backs
 /// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
-/// for [`Tier::Cranelift`]: a resume is handed **no** compiled artifact and the tier
-/// has no path that would compile and bind one at a parked address on demand, so it
-/// reports the honest typed [`unsupported`](crate::error::unsupported) error (see
-/// [`cranelift::run_resume_outcome`]). Without the feature the backend is not
-/// compiled in at all, so this is the same typed `unsupported` error the first-entry
+/// for [`Tier::Cranelift`]: the tier re-enters the parked `(func, pc)` through the
+/// shared no-reset native resume seam
+/// ([`baseline::run_native_resume_outcome`]) over the artifact its own
+/// retained-artifact store hands back, so a slice that suspended on this tier
+/// continues on it — same registers, same Erlang stack, same call frames, same
+/// per-instruction interpreter step for any address it holds no compiled entry for
+/// (see [`cranelift::run_resume_outcome`]). Without the feature the backend is not
+/// compiled in at all, so this is the typed `unsupported` error the first-entry
 /// Cranelift path reports — never a panic and never a silent fallback to another
 /// tier.
 #[cfg(feature = "jit-cranelift")]

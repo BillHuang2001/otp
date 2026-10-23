@@ -23,8 +23,9 @@
 //! a direct native call into a compiled entry to prove native code really runs.
 use super::*;
 use crate::context::Mailbox;
-use crate::jit::baseline::HALT;
+use crate::jit::Tier;
 use crate::{Machine, MinimalContext};
+use crate::jit::baseline::HALT;
 use beam_common::BeamError;
 use beam_loader::{load_file, Instr, Operand};
 use beam_term::{is_small, make_small, signed_value};
@@ -519,10 +520,14 @@ fn a_receive_park_reports_the_interpreters_address_and_keeps_the_artifact() {
 }
 
 #[test]
-fn a_synthetic_module_without_a_digest_is_not_cached() {
+fn a_synthetic_module_is_cached_under_its_content_fingerprint() {
     // A hand-built module carries the all-zero `Module::default` checksum, i.e. no
-    // load-time identity: the store refuses to invent one, so the module is compiled per
-    // entry — always correct, merely a wasted recompile.
+    // load-time digest, so the store identifies it by the crate's shared `CacheKey` —
+    // whose module half is then the **content fingerprint** of the decoded IR. The
+    // consequence is the baseline cache's: the first entry compiles, a second entry of
+    // the very same module reuses that artifact (`CacheKey::of` is a pure function of
+    // the module's content and atom namespace), and a module that *differs* in any
+    // content still misses because the fingerprint differs.
     cache::clear();
     let (module, f) = crate::jit::bench::support::Fixture::new("cranelift_cache_synthetic")
         .finish(
@@ -551,14 +556,33 @@ fn a_synthetic_module_without_a_digest_is_not_cached() {
             RunOutcome::Returned(make_small(7))
         );
     }
-    assert_eq!(cache::len(), 0, "a synthetic module is never retained");
+    assert_eq!(
+        cache::len(),
+        1,
+        "the digest-less module is retained under its content fingerprint"
+    );
     assert_eq!(
         cache::compile_count(),
-        0,
-        "and no compilation of it is recorded"
+        1,
+        "so the second entry of the same module recompiles nothing"
+    );
+
+    // The fingerprint is content, not name: the module half of the shared key is a hash
+    // of the decoded IR, so the same module whose *body* changed keys differently — a
+    // stale artifact can never be handed back for it. (A `Module::clone` carries a fresh
+    // atom-table instance by design, so only the module half is compared here.)
+    let before = crate::jit::cache::CacheKey::of(&module).module;
+    let mut edited = module.clone();
+    edited.functions[0].code[1] = Instr::Move {
+        src: Operand::Integer(8),
+        dst: Operand::X(0),
+    };
+    assert_ne!(
+        before,
+        crate::jit::cache::CacheKey::of(&edited).module,
+        "a changed body must change the digest-less module's key"
     );
 }
-
 #[test]
 fn clear_drops_every_artifact_and_resets_the_compile_count() {
     cache::clear();
@@ -928,5 +952,707 @@ fn the_declared_extent_lets_a_mid_block_helper_see_native_writes() {
         handed[DEEP as usize],
         make_small(22),
         "the deep inlined write must be inside the handed root prefix"
+    );
+}
+// ---------------------------------------------------------------------------
+// The resume entry point (`run_resume_outcome`)
+// ---------------------------------------------------------------------------
+//
+// A parked machine is handed back to native code, so every case here is a park /
+// resume pair compared **clause for clause** with the interpreter: the same
+// `RunOutcome`, the same value, the same typed errors. The interpreter side always
+// goes through [`Machine::resume_outcome`], the tier under test through
+// [`Machine::resume_outcome_with_tier`] (`Tier::Cranelift`), which is the public door
+// that reaches `run_resume_outcome` → `baseline::run_native_resume_outcome`.
+
+/// Assemble several IR functions into one module, the first one exported.
+///
+/// [`crate::jit::bench::support::Fixture`] builds a **one**-function module; the resume
+/// cases here need a second function so the parked address can sit on the far side of a
+/// cross-function transfer (which is where the native driver regains control from a
+/// compiled block). Each function's blocks come from the loader's own decomposition, so a
+/// compiled function never lacks an entry point.
+fn multi_function_module(
+    name: &str,
+    imports: &[(&str, &str, u32)],
+    functions: Vec<(&str, u32, Vec<Instr>)>,
+) -> (Module, Atom) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern(name);
+    for (import_module, import_function, arity) in imports {
+        let m = module.atom_table.intern(import_module);
+        let f = module.atom_table.intern(import_function);
+        module.imports.push(beam_loader::Import {
+            module: m,
+            function: f,
+            arity: *arity,
+        });
+    }
+    let mut first = None;
+    for (function_name, arity, code) in functions {
+        let function = module.atom_table.intern(function_name);
+        let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+        let entry = blocks.first().map_or(Label(0), |block| block.label);
+        module.functions.push(beam_loader::Function {
+            func_label: entry,
+            entry_label: entry,
+            module: module.name,
+            name: function,
+            arity,
+            code,
+            blocks,
+            labels,
+        });
+        if first.is_none() {
+            first = Some((function, arity, entry));
+        }
+    }
+    let (function, arity, label) = first.expect("at least one function");
+    module.exports.push(beam_loader::Export {
+        function,
+        arity,
+        label,
+    });
+    (module, function)
+}
+
+/// The park-and-resume fixture: `run/0` calls `g/0` (a **cross-function** transfer, so the
+/// native driver regains control between them), then adds `1` to `g`'s result with the
+/// inlined `erlang:'+'/2` fast path.
+///
+/// ```text
+/// run/0:                          g/0:
+///   pc0 label 1                     pc0 label 10
+///   pc1 call 0 label 10             pc1 move 7 -> x0
+///   pc2 move 1 -> x1                pc2 return
+///   pc3 gc_bif + x0 x1 -> x0
+///   pc4 return
+/// ```
+///
+/// Uninterrupted it answers `8` in three driver iterations on the native tier (one per
+/// function entry/return) and in eight instructions on the interpreter.
+fn park_fixture() -> (Module, Atom) {
+    let run = vec![
+        Instr::Label(Label(1)),
+        Instr::Call {
+            arity: 0,
+            target: Label(10),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(1),
+        },
+        Instr::GcBif {
+            arity: 2,
+            bif: beam_loader::ImportRef(0),
+            fail: beam_loader::NO_FAIL,
+            live: 2,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let callee = vec![
+        Instr::Label(Label(10)),
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    multi_function_module(
+        "cranelift_park",
+        &[("erlang", "+", 2)],
+        vec![("run", 0, run), ("g", 0, callee)],
+    )
+}
+
+/// A context that wraps [`MinimalContext`] (borrowing its pointer-stable heap) and
+/// pre-empts through the **reduction hook**: the charge past `budget` is a typed `Err`,
+/// which parks the machine at the address about to run, with nothing of it executed.
+///
+/// `wants_reduce()` is forced `true` — `MinimalContext` itself opts out, so the engine
+/// would otherwise never call the hook.
+struct ChargeCtx {
+    inner: MinimalContext,
+    /// The `n` of every `reduce` call, in order (the refusing one included).
+    charges: Vec<u32>,
+    /// `None` once the budget is lifted, so the resumed slice runs to completion.
+    budget: Option<u32>,
+}
+
+impl ChargeCtx {
+    fn with_budget(budget: u32) -> ChargeCtx {
+        ChargeCtx {
+            inner: MinimalContext::with_bif_hook(crate::jit::bench::support::arith_hook(
+                None, None,
+            )),
+            charges: Vec::new(),
+            budget: Some(budget),
+        }
+    }
+
+    /// Lift the budget (the resumed slice is unbounded).
+    fn lift(&mut self) {
+        self.budget = None;
+    }
+}
+
+impl ExecutionContext for ChargeCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn reduce(&mut self, n: u32) -> Result<()> {
+        self.charges.push(n);
+        match self.budget {
+            Some(budget) if self.charges.len() as u32 > budget => {
+                Err(crate::error::unsupported("reduction budget exhausted"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn wants_reduce(&self) -> bool {
+        true
+    }
+}
+
+/// A mailbox whose queue a test can fill **after** the park (the park is only meaningful
+/// while no message is waiting).
+#[derive(Clone, Default)]
+struct SharedMessages(std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Eterm>>>);
+
+impl SharedMessages {
+    fn push(&self, message: Eterm) {
+        self.0.borrow_mut().push_back(message);
+    }
+}
+
+struct ScriptedMailbox {
+    messages: SharedMessages,
+}
+
+impl Mailbox for ScriptedMailbox {
+    fn send_message(&mut self, _to: Eterm, message: Eterm) -> beam_common::Result<()> {
+        self.messages.push(message);
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> beam_common::Result<Option<Eterm>> {
+        Ok(self.messages.0.borrow_mut().pop_front())
+    }
+
+    fn receive_skip(&mut self) -> beam_common::Result<()> {
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> beam_common::Result<()> {
+        // The consumed candidate is the one `receive_next` handed out.
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> beam_common::Result<()> {
+        Ok(())
+    }
+
+    fn receive_marker_reserve(&mut self) -> beam_common::Result<Eterm> {
+        Ok(beam_term::NIL)
+    }
+
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> beam_common::Result<()> {
+        Ok(())
+    }
+
+    fn receive_marker_use(&mut self, _reference: Eterm) -> beam_common::Result<()> {
+        Ok(())
+    }
+
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> beam_common::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_reduction_refusal_parks_the_machine_and_the_tier_resumes_it() {
+    // Case 1 of the resume contract: a pre-empting host (`reduce` answers a typed `Err`)
+    // parks the machine at the address about to run, and the tier resumes there — the
+    // registers, the Erlang stack and the live call frame intact — finishing with the
+    // interpreter's own value.
+    cache::clear();
+    let (module, run) = park_fixture();
+
+    // The uninterrupted runs are the reference: the tier and the interpreter agree, and
+    // the tier really did compile (a synthetic module is cached on its content
+    // fingerprint, so that is observable).
+    let mut tiered = Machine::new();
+    let mut tiered_ctx = ChargeCtx::with_budget(u32::MAX);
+    assert_eq!(
+        tiered
+            .run_export_outcome_with_tier(&module, run, 0, &[], &mut tiered_ctx, Tier::Cranelift)
+            .expect("the uninterrupted cranelift run returns"),
+        RunOutcome::Returned(make_small(8))
+    );
+    assert_eq!(
+        cache::compile_count(),
+        1,
+        "the tier compiled the fixture instead of interpreting it"
+    );
+    let tiered_uninterrupted_charges = tiered_ctx.charges.len();
+
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = ChargeCtx::with_budget(u32::MAX);
+    assert_eq!(
+        interpreter
+            .run_export_outcome_with_tier(
+                &module,
+                run,
+                0,
+                &[],
+                &mut interpreter_ctx,
+                Tier::Interpreter,
+            )
+            .expect("the uninterrupted interpreter run returns"),
+        RunOutcome::Returned(make_small(8))
+    );
+    let interpreter_uninterrupted_charges = interpreter_ctx.charges.len();
+    assert!(
+        interpreter_uninterrupted_charges > tiered_uninterrupted_charges,
+        "the interpreter is charged per instruction ({}), the native driver per block entry \
+         ({tiered_uninterrupted_charges})",
+        interpreter_uninterrupted_charges
+    );
+
+    // Park both on the same budget: one charge of headroom.
+    let mut parked = Machine::new();
+    let mut parked_ctx = ChargeCtx::with_budget(1);
+    parked
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut parked_ctx, Tier::Cranelift)
+        .expect_err("the second charge is refused");
+
+    let mut parked_interpreter = Machine::new();
+    let mut parked_interpreter_ctx = ChargeCtx::with_budget(1);
+    parked_interpreter
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut parked_interpreter_ctx, Tier::Interpreter)
+        .expect_err("the second charge is refused");
+
+    // The park address is the address about to run, never an already-executed one.
+    let (func, pc) = parked.current_code().expect("the driver published its position");
+    assert_eq!(
+        (func, pc),
+        (1, 0),
+        "the tier parked on the callee's entry, with nothing of it executed"
+    );
+    let (ifunc, ipc) = parked_interpreter
+        .current_code()
+        .expect("the interpreter published its position");
+    assert_eq!(
+        (ifunc, ipc),
+        (0, 1),
+        "the interpreter parked on the instruction it refused to charge"
+    );
+
+    // Resume both, with a message-free budget (the budget is lifted, nothing else changes).
+    let charges_before = parked_ctx.charges.len();
+    parked_ctx.lift();
+    assert_eq!(
+        parked
+            .resume_outcome_with_tier(&module, func, pc, &mut parked_ctx, Tier::Cranelift)
+            .expect("the cranelift tier resumes the parked process"),
+        RunOutcome::Returned(make_small(8)),
+        "a resumed cranelift slice must produce the interpreter's value"
+    );
+    parked_interpreter_ctx.lift();
+    assert_eq!(
+        parked_interpreter
+            .resume_outcome_with_tier(&module, ifunc, ipc, &mut parked_interpreter_ctx, Tier::Interpreter)
+            .expect("the interpreter resumes the parked process"),
+        RunOutcome::Returned(make_small(8))
+    );
+
+    // Nothing was replayed: the total charge count across park + resume is the
+    // uninterrupted count plus exactly the one refused charge (the resumed slice
+    // re-charges the block/instruction the park left unexecuted). A replay of the
+    // completed prefix would show up as a larger total.
+    assert_eq!(
+        parked_ctx.charges.len(),
+        tiered_uninterrupted_charges + 1,
+        "the resume re-charges only the parked address, never the executed prefix"
+    );
+    assert_eq!(
+        parked_interpreter_ctx.charges.len(),
+        interpreter_uninterrupted_charges + 1
+    );
+
+    // And the slice counter is per slice: the resumed slice charged exactly the calls made
+    // in it (the counter is not carried across the park, so nothing is double-counted).
+    let resumed_slice_charges = (parked_ctx.charges.len() - charges_before) as u64;
+    assert_eq!(
+        parked.reductions(),
+        resumed_slice_charges,
+        "the resumed slice's reduction count is its own charges, not the run's"
+    );
+}
+
+#[test]
+fn a_receive_park_on_the_tier_resumes_with_the_interpreters_result() {
+    // Case 2 of the resume contract: a `receive` that finds nothing parks the machine at
+    // the interpreter's own address, and the resume — once a message arrives — completes
+    // with the identical result.
+    cache::clear();
+    let module = load_file(RECV_BEAM).expect("load recv.beam");
+    let wait = module
+        .atom_table
+        .lookup("wait")
+        .expect("the fixture exports `wait/0`");
+
+    // Interpreter reference: park, then resume with the message.
+    let mut interpreter = Machine::new();
+    let messages = SharedMessages::default();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: messages.clone(),
+    }));
+    let interpreted_park = interpreter
+        .run_export_outcome_with_tier(&module, wait, 0, &[], &mut ctx, Tier::Interpreter)
+        .expect("interpret recv:wait/0");
+    let (func, pc) = match interpreted_park {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("recv:wait/0 must park in `receive`, got {other:?}"),
+    };
+    messages.push(make_small(42));
+    let expected = interpreter
+        .resume_outcome(&module, func, pc, &mut ctx)
+        .expect("the interpreter resume completes");
+    assert_eq!(expected, RunOutcome::Returned(make_small(42)));
+
+    // The tier: the very same park address, then the identical resumed result.
+    let mut machine = Machine::new();
+    let tier_messages = SharedMessages::default();
+    let mut tier_ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: tier_messages.clone(),
+    }));
+    assert_eq!(
+        machine
+            .run_export_outcome_with_tier(&module, wait, 0, &[], &mut tier_ctx, Tier::Cranelift)
+            .expect("run recv:wait/0 on the Cranelift tier"),
+        RunOutcome::Wait { func, pc },
+        "the tier must report the interpreter's own resume address"
+    );
+    tier_messages.push(make_small(42));
+    assert_eq!(
+        machine
+            .resume_outcome_with_tier(&module, func, pc, &mut tier_ctx, Tier::Cranelift)
+            .expect("the cranelift tier resumes the parked process"),
+        expected,
+        "a resumed cranelift slice must agree with the interpreter exactly"
+    );
+    assert_eq!(
+        cache::compile_count(),
+        1,
+        "the resume reused the artifact the park compiled"
+    );
+}
+
+#[test]
+fn a_resume_at_the_reported_wait_pc_advances_by_the_interpreters_rule() {
+    // Case 3 of the resume contract: a resume address the compiled function cannot be
+    // entered at is **not** an error — the driver takes its per-instruction interpreter
+    // step there and the run completes with the interpreter's result.
+    //
+    // A `receive` park reports the `wait` instruction's **branch target** (the
+    // `loop_rec`), which is a block boundary and therefore typically enterable; the
+    // non-enterable arm of the same rule is reached by every address `is_enterable`
+    // rejects (a mid-block pc, and every function the tier holds no compiled blocks
+    // for — the cross-module callee of the next case). What the resume must guarantee
+    // either way is the interpreter's own outcome, so this case pins the park address
+    // and the result against `Tier::Interpreter`.
+    cache::clear();
+    let module = load_file(RECV_BEAM).expect("load recv.beam");
+    let wait = module
+        .atom_table
+        .lookup("wait")
+        .expect("the fixture exports `wait/0`");
+
+    // Interpreter reference: park, then resume with the same message.
+    let reference_messages = SharedMessages::default();
+    let mut reference = Machine::new();
+    let mut reference_ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: reference_messages.clone(),
+    }));
+    let (ifunc, ipc) = match reference
+        .run_export_outcome_with_tier(&module, wait, 0, &[], &mut reference_ctx, Tier::Interpreter)
+        .expect("interpret recv:wait/0")
+    {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("recv:wait/0 must park in `receive`, got {other:?}"),
+    };
+    reference_messages.push(make_small(7));
+    let expected = reference
+        .resume_outcome(&module, ifunc, ipc, &mut reference_ctx)
+        .expect("the interpreter resume completes");
+
+    let messages = SharedMessages::default();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: messages.clone(),
+    }));
+    let mut machine = Machine::new();
+    let (func, pc) = match machine
+        .run_export_outcome_with_tier(&module, wait, 0, &[], &mut ctx, Tier::Cranelift)
+        .expect("run recv:wait/0 on the Cranelift tier")
+    {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("recv:wait/0 must park in `receive`, got {other:?}"),
+    };
+    assert_eq!(
+        (func, pc),
+        (ifunc, ipc),
+        "the tier must report the interpreter's park address"
+    );
+
+    // The artifact this thread compiled is retained across the park, and it names the
+    // function entry as an entry point (so the resume may re-enter natively).
+    let compiled = cache::handle(&module).expect("the parked run's artifact is retained");
+    assert!(
+        compiled.is_enterable(func, 0),
+        "the function's entry pc is a native entry point"
+    );
+
+    messages.push(make_small(7));
+    assert_eq!(
+        machine
+            .resume_outcome_with_tier(&module, func, pc, &mut ctx, Tier::Cranelift)
+            .expect("a resume at a non-enterable address is a per-instruction step, not an error"),
+        expected,
+        "the resumed cranelift slice must agree with the interpreter"
+    );
+    assert_eq!(expected, RunOutcome::Returned(make_small(7)));
+}
+
+#[test]
+fn a_resume_parked_in_a_non_zero_module_context_agrees_with_the_interpreter() {
+    // Case 4 of the resume contract: the process parked **inside a cross-module callee**,
+    // so the machine's current module context is not `0`. The driver lands in that context
+    // (`Machine::current_context` → the context switch) and re-enters the callee's
+    // `(func, pc)`; because the Cranelift tier holds no compiled blocks for that callee
+    // (`NativeCode::module_blocks` defaults to `None`), the callee runs on the
+    // per-instruction interpreter step there — correct, not an error.
+    cache::clear();
+
+    // The callee `c:g/1`: a bare `receive` that parks, then returns the matched message.
+    let (callee_module, g) = multi_function_module(
+        "c",
+        &[],
+        vec![(
+            "g",
+            1,
+            vec![
+                Instr::Label(Label(10)),
+                Instr::LoopRec {
+                    fail: Label(11),
+                    dst: Operand::X(0),
+                },
+                Instr::RemoveMessage,
+                Instr::Return,
+                Instr::Label(Label(11)),
+                Instr::Wait { target: Label(10) },
+            ],
+        )],
+    );
+    let callee = std::sync::Arc::new(callee_module);
+    let callee_entry = callee.export(g, 1).expect("c:g/1 is exported");
+
+    // The caller `run/0` applies `c:g/1` through the `resolve_external_call` seam.
+    let (caller, run) = {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern("caller");
+        let c = module.atom_table.intern("c");
+        let gg = module.atom_table.intern("g");
+        let run_name = module.atom_table.intern("run");
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Move {
+                src: Operand::Atom(c),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Atom(gg),
+                dst: Operand::X(2),
+            },
+            Instr::Apply { arity: 1 },
+            Instr::Return,
+        ];
+        let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+        let entry = blocks.first().expect("one block").label;
+        module.functions.push(beam_loader::Function {
+            func_label: entry,
+            entry_label: entry,
+            module: module.name,
+            name: run_name,
+            arity: 0,
+            code,
+            blocks,
+            labels,
+        });
+        module.exports.push(beam_loader::Export {
+            function: run_name,
+            arity: 0,
+            label: entry,
+        });
+        (module, run_name)
+    };
+
+    let resolver = {
+        let callee = std::sync::Arc::clone(&callee);
+        Box::new(move |module: &str, function: &str, arity: u32| {
+            if module == "c" && function == "g" && arity == 1 {
+                Ok(Some((std::sync::Arc::clone(&callee), callee_entry)))
+            } else {
+                Ok(None)
+            }
+        })
+    };
+
+    let mut machine = Machine::new();
+    let messages = SharedMessages::default();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: messages.clone(),
+    }));
+    ctx.set_external_resolver(resolver);
+    let (func, pc) = match machine
+        .run_export_outcome_with_tier(&caller, run, 0, &[], &mut ctx, Tier::Cranelift)
+        .expect("run caller:run/0 on the Cranelift tier")
+    {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("the callee's `receive` must park, got {other:?}"),
+    };
+    assert_eq!(
+        machine.current_context(),
+        1,
+        "the park sits in the callee's own module context"
+    );
+
+    messages.push(make_small(5));
+    let tiered = machine
+        .resume_outcome_with_tier(&caller, func, pc, &mut ctx, Tier::Cranelift)
+        .expect("the cranelift tier resumes inside the callee's context");
+
+    // The interpreter's own park / resume of the same fixture is the reference.
+    let mut reference = Machine::new();
+    let reference_messages = SharedMessages::default();
+    let mut reference_ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+        messages: reference_messages.clone(),
+    }));
+    reference_ctx.set_external_resolver({
+        let callee = std::sync::Arc::clone(&callee);
+        Box::new(move |module: &str, function: &str, arity: u32| {
+            if module == "c" && function == "g" && arity == 1 {
+                Ok(Some((std::sync::Arc::clone(&callee), callee_entry)))
+            } else {
+                Ok(None)
+            }
+        })
+    });
+    let (rfunc, rpc) = match reference
+        .run_export_outcome_with_tier(
+            &caller,
+            run,
+            0,
+            &[],
+            &mut reference_ctx,
+            Tier::Interpreter,
+        )
+        .expect("interpret caller:run/0")
+    {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("the callee's `receive` must park, got {other:?}"),
+    };
+    reference_messages.push(make_small(5));
+    let expected = reference
+        .resume_outcome(&caller, rfunc, rpc, &mut reference_ctx)
+        .expect("the interpreter resume completes");
+    assert_eq!((rfunc, rpc), (func, pc), "the same park address");
+    assert_eq!(
+        tiered, expected,
+        "a resumed cranelift slice inside a callee must agree with the interpreter"
+    );
+    assert_eq!(tiered, RunOutcome::Returned(make_small(5)));
+}
+
+#[test]
+fn a_resume_does_not_double_count_the_reduction_charge() {
+    // Case 5 of the resume contract: the resumed slice's `Machine::reductions()` counts
+    // **its own** charges only. Both tiers zero the counter at a slice boundary (the
+    // interpreter's `Machine::drive`, the native driver's own reset in
+    // `run_native_resume_outcome` behind `Machine::reset_reductions`), so the work the
+    // parked slice had already done is not charged again — and the resumed slice's total
+    // matches the interpreter's for the same park on a per-slice basis.
+    cache::clear();
+    let (module, run) = park_fixture();
+
+    let mut machine = Machine::new();
+    let mut ctx = ChargeCtx::with_budget(1);
+    machine
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut ctx, Tier::Cranelift)
+        .expect_err("the second charge is refused");
+    let parked_charges = ctx.charges.len();
+    let (func, pc) = machine.current_code().expect("a published position");
+    assert!(
+        machine.reductions() >= 1,
+        "the parked slice had charged at least once"
+    );
+
+    ctx.lift();
+    let resumed = machine
+        .resume_outcome_with_tier(&module, func, pc, &mut ctx, Tier::Cranelift)
+        .expect("the resume completes");
+    assert_eq!(resumed, RunOutcome::Returned(make_small(8)));
+    let slice_charges = (ctx.charges.len() - parked_charges) as u64;
+    assert!(slice_charges > 0, "the resumed slice did real work");
+    assert_eq!(
+        machine.reductions(),
+        slice_charges,
+        "the slice counter restarts at the resume instead of carrying the parked slice's \
+         charges (which would count them twice)"
+    );
+
+    // The interpreter's resumed slice behaves identically: its counter is its own charges.
+    let mut reference = Machine::new();
+    let mut reference_ctx = ChargeCtx::with_budget(1);
+    reference
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut reference_ctx, Tier::Interpreter)
+        .expect_err("the second charge is refused");
+    let (ifunc, ipc) = reference.current_code().expect("a published position");
+    let reference_parked = reference_ctx.charges.len();
+    reference_ctx.lift();
+    assert_eq!(
+        reference
+            .resume_outcome_with_tier(&module, ifunc, ipc, &mut reference_ctx, Tier::Interpreter)
+            .expect("the interpreter resume completes"),
+        resumed
+    );
+    assert_eq!(
+        reference.reductions(),
+        (reference_ctx.charges.len() - reference_parked) as u64,
+        "the interpreter's slice counter is per-slice too — the two tiers agree on the rule"
     );
 }

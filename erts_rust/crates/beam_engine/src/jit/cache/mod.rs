@@ -40,6 +40,11 @@
 //! `key.rs`. This module is the cache itself: the entries, the resolution memo and the
 //! entry points.
 //!
+//! [`CacheKey`] is `pub(crate)` and is the **one** module-identity scheme both native tiers
+//! key on: the Cranelift hot tier's retained-artifact store
+//! ([`cranelift::cache`](crate::jit::cranelift)) uses `CacheKey::of` too, so the same
+//! question — "which module, against which atom namespace?" — has exactly one answer in
+//! the crate.//!
 //! # Ownership and thread-safety
 //!
 //! The entry **owns** its [`CompiledModule`] (and therefore its sealed executable
@@ -101,7 +106,8 @@ use crate::jit::CodeRegion;
 use crate::machine::{Machine, RunOutcome};
 
 mod key;
-use key::{module_address, CacheKey};
+pub(crate) use key::CacheKey;
+use key::module_address;
 // `module_fingerprint` is re-exported with its own (inlined) docs from `key`, so
 // `crate::jit::cache::module_fingerprint` keeps resolving for the crate and its host.
 #[doc(inline)]
@@ -666,8 +672,11 @@ pub(crate) fn run_baseline_cached_label_outcome(
 /// A **re-entrant** call (a BIF or fun application that itself runs a baseline export
 /// on this thread while the cache is already borrowed) does not panic: it compiles
 /// its module uncached and runs it, exactly as [`run_baseline_cached_outcome`] does.
-/// A resume in a non-entry module context is the baseline driver's own typed error,
-/// never a silent fallback.
+/// A resume parked in a **non-entry module context** is served like the interpreter's
+/// own resume: the driver lands in `Machine::current_context` (`switch_into` re-binds
+/// the callee's module, label map and literal area) and re-enters the callee's
+/// `(func, pc)`; an address the tier has no compiled block for advances by one
+/// per-instruction step, never a silent fallback.
 pub(crate) fn run_baseline_cached_resume_outcome(
     machine: &mut Machine,
     module: &Module,
