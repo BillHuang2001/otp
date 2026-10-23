@@ -56,6 +56,15 @@
 //! the host's exact toolchain and both blockers. When the toolchain *does* match the checkout's
 //! pin, the real build runs and the row carries a real wall time — or
 //! `failed(emqx-build-failed)` with the captured error. No number is ever fabricated.
+//!
+//! **Why an OTP-28 `erl` alone does not unblock it.** The pin mismatch is only blocker (1);
+//! blocker (2) — the host build tooling / system libraries the NIF dependencies need — does not
+//! depend on the Erlang release. An OTP-28 `erl` *does* exist in the Nix store here and does
+//! evaluate the `env.mk` idiom, so the gate's note records that, plus which of
+//! [`HOST_BUILD_TOOLS`] are absent right now (re-probed per run), instead of claiming the OTP
+//! release is the sole obstacle. Swapping the release would still leave `:jq`'s
+//! `autoreconf`/`configure` and the krb5 headers unbuildable, so no per-workload OTP-28 route is
+//! implemented — it would produce a `failed` row, not a measurement.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -249,11 +258,33 @@ fn otp_gate_reason(required: u32, host: u32) -> Option<String> {
     (host > required).then(|| format!("emqx-requires-otp-{required}"))
 }
 
+/// The host build tools the umbrella's NIF dependencies need: `:jq`'s `autoreconf`/`configure`
+/// requires `automake` + `libtool`, and the `:rocksdb`/`:quicer` NIFs use `cmake`. None of them
+/// is part of the driver's toolchain; the gate note lists the ones this host lacks, so the
+/// claim is re-probed on every run instead of being asserted from memory.
+const HOST_BUILD_TOOLS: &[&str] = &["automake", "libtool", "cmake"];
+
+/// The [`HOST_BUILD_TOOLS`] that are **not** resolvable on `PATH` right now, in declaration
+/// order. Cheap (stat only) and subprocess-free, so it is safe next to the gate.
+fn absent_build_tools() -> Vec<&'static str> {
+    HOST_BUILD_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| proc::which(tool).is_none())
+        .collect()
+}
+
 /// The note explaining an [`otp_gate_reason`] skip: the exact pin (version + `file:line`), the
 /// host toolchain it conflicts with, and the **two verified blockers** — the `:ezstd` `env.mk`
-/// idiom that OTP ≥ 29 halts before evaluating, and (even once that idiom is patched) the host
-/// build tooling/system libraries this sandbox is missing.
+/// idiom that OTP ≥ 29 halts before evaluating, and (independently of the Erlang release) the
+/// host build tooling/system libraries this sandbox is missing.
 fn otp_gate_note(pin: &OtpPin, host: &HostOtp) -> String {
+    let absent = absent_build_tools();
+    let absent_note = if absent.is_empty() {
+        "all of them resolve on PATH right now".to_string()
+    } else {
+        format!("absent on this host right now: {}", absent.join(", "))
+    };
     format!(
         "EMQX pins Erlang/OTP {} ({}), but the `erl` on PATH ({}) is OTP {} (erts-{}) — a \
          combination EMQX does not build on. Two verified blockers: (1) the :ezstd dependency's \
@@ -262,8 +293,13 @@ fn otp_gate_note(pin: &OtpPin, host: &HostOtp) -> String {
          `mix compile` fails with \"No rule to make target '…/env.mk'\"; and (2) even with that \
          idiom patched the umbrella build needs host build tooling/system libraries absent here \
          (the :jq NIF runs autoreconf/configure and needs automake + libtool + cmake, and \
-         :sasl_auth needs Kerberos headers — krb5.h). The full enablement ladder is in \
-         results/m12-emqx-enablement-attempt.md; no number is fabricated",
+         :sasl_auth needs Kerberos headers — krb5.h; {absent_note}). Blocker (2) is independent \
+         of the Erlang release: an OTP-28 `erl` in the Nix store does evaluate that env.mk idiom \
+         (verified: `-s init stop -eval 'io:format(\"X~n\")'` prints `X` under OTP 28 and \
+         nothing under OTP 29 — commands and outputs in results/m19-target-notes.md), so \
+         swapping the Erlang release alone does not make the build pass the NIF toolchain. The \
+         full enablement ladder is in results/m12-emqx-enablement-attempt.md; no number is \
+         fabricated",
         pin.version,
         pin.source,
         host.program.display(),
@@ -584,11 +620,21 @@ mod tests {
             "libtool",
             "cmake",
             "krb5",
+            // Blocker 2 is independent of the Erlang release, and the note says so.
+            "independent of the Erlang release",
+            "OTP-28 `erl` in the Nix store",
+            // The explicitly probed tooling state (never asserted from memory): the note
+            // reports the current state either way, and names each tool it could not resolve.
+            "right now",
             // The committed evidence and the explicit no-fabrication statement.
             "m12-emqx-enablement-attempt.md",
+            "m19-target-notes.md",
             "no number is fabricated",
         ] {
             assert!(note.contains(needle), "{needle} missing from: {note}");
+        }
+        for absent in absent_build_tools() {
+            assert!(note.contains(absent), "{absent} missing from: {note}");
         }
     }
 
@@ -659,6 +705,41 @@ mod tests {
     fn toolchain_gate_is_silent_when_the_checkout_declares_nothing() {
         let s = Scratch::new("gate-none");
         assert!(toolchain_gate(&s.dir).is_none());
+    }
+
+    /// The tooling half of blocker 2 is **probed**, not asserted: the gate note must state the
+    /// current state of every [`HOST_BUILD_TOOLS`] entry, whichever way it resolves here — so
+    /// installing `automake` would change the note instead of leaving a stale claim in it.
+    #[test]
+    fn the_gate_note_reports_the_probed_host_build_tools() {
+        let absent = absent_build_tools();
+        assert!(
+            absent.iter().all(|tool| HOST_BUILD_TOOLS.contains(tool)),
+            "only declared tools may be reported: {absent:?}"
+        );
+        assert!(
+            absent.len() <= HOST_BUILD_TOOLS.len(),
+            "no tool may be reported twice: {absent:?}"
+        );
+
+        let pin = OtpPin {
+            version: "28.5.0.7-2".to_string(),
+            source: "env.sh:3 (export OTP_VSN=28.5.0.7-2)".to_string(),
+        };
+        let host = HostOtp {
+            major: 29,
+            erts: "17.1".to_string(),
+            program: PathBuf::from("/usr/bin/erl"),
+        };
+        let note = otp_gate_note(&pin, &host);
+        if absent.is_empty() {
+            assert!(note.contains("all of them resolve on PATH right now"), "{note}");
+        } else {
+            assert!(note.contains("absent on this host right now"), "{note}");
+            for tool in &absent {
+                assert!(note.contains(tool), "{tool} missing from: {note}");
+            }
+        }
     }
 
     #[test]

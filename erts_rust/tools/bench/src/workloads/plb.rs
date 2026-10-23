@@ -64,6 +64,19 @@
 //! carries trimmed diagnostics in `notes` (the fatal .NET exception from stderr plus the
 //! first error-looking line of the tool's own stdout log — or its tail when the log looks
 //! clean), so the row says *which* command broke, not merely that something did.
+//!
+//! **A `timeMS` of `0` is an absence, not an instant.** The tool writes one result JSON per
+//! problem input whether or not the run was timed; when the child does not exit cleanly (e.g.
+//! it is aborted at the input's declared timeout) it records `Elapsed = 0` while still
+//! reporting the CPU time it consumed (`bench/tool/ProcessUtils.cs` `MeasureAsync`). Those
+//! results are excluded from `test_time_ms` — folding them in would report a zero-millisecond
+//! kernel and drag the summary's minimum to zero — and each one is named in a `notes` entry.
+//! A row whose *every* result carries no timing is `failed(plb-no-results)`, exactly like a
+//! run that produced no result JSON at all.
+//!
+//! Because `test_time_ms` summarises over several different kernels, the row also records
+//! **which** kernels its figures cover (`langs=…`, the measured `test/input=time` list and
+//! the excluded ones), so the aggregate is auditable rather than opaque.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,6 +122,9 @@ const TASK_BENCH: &str = "bench";
 
 /// How many characters of captured output a diagnostic `notes` entry may carry.
 const NOTE_CHARS: usize = 400;
+
+/// How many kernel runs a coverage `notes` entry names before eliding the rest.
+const COVERAGE_ITEMS: usize = 12;
 
 /// `.NET` CLI switches that keep the SDK quiet and keep its first-run experience from
 /// writing anywhere outside the redirected home.
@@ -294,8 +310,8 @@ impl Workload for Plb {
         result.notes.extend(sdk_notes.iter().cloned());
 
         // Read the result JSON from the *scratch* copy, never the (read-only) source repo.
-        let (times, mems) = read_results(&bench_dir.join("build/_results"));
-        if times.is_empty() {
+        let (measured, excluded) = partition_results(read_results(&bench_dir.join("build/_results")));
+        if measured.is_empty() {
             // No measurement was produced, so the `wall_ms` recorded above is the *tool's*
             // own runtime and not a benchmark result: the row must never read as `ok`.
             // A non-zero exit is the tool failing; a zero exit with no results means it
@@ -303,24 +319,32 @@ impl Workload for Plb {
             result.status = Status::Failed;
             result.reason = Some(no_results_reason(out.success).to_string());
             result.notes.push(format!(
-                "no result JSON found (bench stage, dotnet exit {:?})",
-                out.exit_code
+                "no timed result found (bench stage, dotnet exit {:?}, {} result JSON, all with \
+                 timeMS=0)",
+                out.exit_code,
+                excluded.len()
             ));
             failure_notes(&out, &mut result.notes);
         } else {
+            let times: Vec<f64> = measured.iter().map(|r| r.time_ms).collect();
             result
                 .metrics
                 .push(Metric::samples("test_time_ms", "ms", &times));
-            if let Some(max_mem) = mems.iter().copied().fold(None, |a: Option<f64>, b| {
-                Some(match a {
-                    Some(a) => a.max(b),
-                    None => b,
-                })
-            }) {
+            let max_mem = measured
+                .iter()
+                .filter_map(|r| r.mem_bytes)
+                .fold(None, |a: Option<f64>, b| {
+                    Some(match a {
+                        Some(a) => a.max(b),
+                        None => b,
+                    })
+                });
+            if let Some(max_mem) = max_mem {
                 result
                     .metrics
                     .push(Metric::scalar("test_mem_bytes", "bytes", max_mem));
             }
+            coverage_notes(&measured, &excluded, &mut result.notes);
         }
         result
     }
@@ -497,10 +521,40 @@ fn failure_notes(out: &Completed, notes: &mut Vec<String>) {
     }
 }
 
-/// Reads `timeMS`/`memBytes` fields from every result JSON under `dir`.
-fn read_results(dir: &std::path::Path) -> (Vec<f64>, Vec<f64>) {
-    let mut times = Vec::new();
-    let mut mems = Vec::new();
+/// One kernel measurement from a result JSON (`bench/tool/Program.cs` writes one file per
+/// problem input).
+#[derive(Debug, Clone, PartialEq)]
+struct TestResult {
+    /// The Benchmarks-Game problem (`spectral-norm`).
+    test: String,
+    /// The input size (`4000`), so two runs of one problem stay distinguishable.
+    input: String,
+    /// The measured wall time. `0.0` means the tool could **not** measure this input: it
+    /// records `Elapsed = 0` whenever the child did not exit cleanly — which is how a run it
+    /// aborted at the problem's declared timeout comes back (its CPU time is still reported,
+    /// so the process clearly did work). Such a result is an *absence*, never an instant.
+    time_ms: f64,
+    /// The peak RSS the tool sampled, when it reported one.
+    mem_bytes: Option<f64>,
+}
+
+impl TestResult {
+    /// Whether this result carries a real measurement. A `0.0` time is the tool's marker for
+    /// "aborted, no timing" (see [`TestResult::time_ms`]), so it can never contribute to a
+    /// timing summary — that would report an instant kernel.
+    fn is_measured(&self) -> bool {
+        self.time_ms > 0.0
+    }
+
+    /// `test/input`, the way a note names one kernel run.
+    fn label(&self) -> String {
+        format!("{}/{}", self.test, self.input)
+    }
+}
+
+/// Reads every result JSON under `dir` into [`TestResult`]s, in a deterministic order.
+fn read_results(dir: &std::path::Path) -> Vec<TestResult> {
+    let mut results = Vec::new();
     for path in collect_files(dir, "json") {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -508,10 +562,84 @@ fn read_results(dir: &std::path::Path) -> (Vec<f64>, Vec<f64>) {
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        let mut times = Vec::new();
+        let mut mems = Vec::new();
         collect_number(&value, "timeMS", &mut times);
         collect_number(&value, "memBytes", &mut mems);
+        // A well-formed result names its problem and input; fall back to the file name so a
+        // result is still *reported* (and counted) rather than silently dropped.
+        let fallback = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        results.push(TestResult {
+            test: string_field(&value, "test").unwrap_or_else(|| fallback.clone()),
+            input: string_field(&value, "input").unwrap_or_default(),
+            time_ms: times.first().copied().unwrap_or(0.0),
+            mem_bytes: mems.first().copied(),
+        });
     }
-    (times, mems)
+    results
+}
+
+/// The string value stored under `key` in a result JSON.
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// Splits the tool's results into the kernels it actually measured and the ones it reported
+/// without a timing (see [`TestResult::time_ms`]), preserving their order.
+fn partition_results(results: Vec<TestResult>) -> (Vec<TestResult>, Vec<TestResult>) {
+    results.into_iter().partition(TestResult::is_measured)
+}
+
+/// The `notes` recording *which* kernels the row's figures cover: the language set the tool
+/// was driven with, the measured kernels with their times, and every kernel that came back
+/// without a timing. Bounded, so a wide sweep cannot bloat the report.
+fn coverage_notes(measured: &[TestResult], excluded: &[TestResult], notes: &mut Vec<String>) {
+    let measured_list = measured
+        .iter()
+        .take(COVERAGE_ITEMS)
+        .map(|r| format!("{}={:.0} ms", r.label(), r.time_ms))
+        .collect::<Vec<_>>()
+        .join(", ");
+    notes.push(format!(
+        "langs={LANG} (the tool's {LANG} environment only, driven with --no-docker); \
+         measured {} kernel run(s){}{}",
+        measured.len(),
+        if measured_list.is_empty() {
+            String::new()
+        } else {
+            format!(": {measured_list}")
+        },
+        if measured.len() > COVERAGE_ITEMS {
+            ", …"
+        } else {
+            ""
+        }
+    ));
+    if !excluded.is_empty() {
+        let list = excluded
+            .iter()
+            .take(COVERAGE_ITEMS)
+            .map(TestResult::label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(format!(
+            "excluded {} kernel run(s) the tool reported with timeMS=0 — its marker for a run it \
+             could not time (aborted at the problem's declared timeout): {list}{}",
+            excluded.len(),
+            if excluded.len() > COVERAGE_ITEMS {
+                ", …"
+            } else {
+                ""
+            }
+        ));
+    }
 }
 
 /// Recursively collects numeric values stored under `key`.
@@ -829,8 +957,117 @@ mod tests {
 
     #[test]
     fn read_results_handles_missing_dir() {
-        let (t, m) = read_results(std::path::Path::new("/nonexistent/xyzzy"));
-        assert!(t.is_empty() && m.is_empty());
+        assert!(read_results(std::path::Path::new("/nonexistent/xyzzy")).is_empty());
+    }
+
+    /// A self-cleaning result directory holding the given `(name, json)` files.
+    fn results_dir(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bench-plb-results-{}-{}-{:?}",
+            std::process::id(),
+            tag,
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create results dir");
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).expect("write result");
+        }
+        dir
+    }
+
+    fn result_json(test: &str, input: &str, time_ms: f64, mem: f64) -> String {
+        format!(
+            r#"{{"test":"{test}","input":"{input}","timeMS":{time_ms},"memBytes":{mem}}}"#
+        )
+    }
+
+    /// `read_results` reads one [`TestResult`] per file, naming the kernel it covers so the
+    /// coverage notes can say *which* runs the summary is built from.
+    #[test]
+    fn read_results_names_each_kernel_run() {
+        let dir = results_dir(
+            "named",
+            &[
+                ("b_4000.json", &result_json("spectral-norm", "4000", 0.0, 93_720_576.0)),
+                ("a_2000.json", &result_json("spectral-norm", "2000", 3411.6, 85_098_496.0)),
+                ("not-json.json", "not json at all"),
+            ],
+        );
+        let results = read_results(&dir);
+        assert_eq!(results.len(), 2, "the unparsable file is skipped: {results:?}");
+        // `collect_files` sorts, so the order is deterministic.
+        assert_eq!(results[0].label(), "spectral-norm/2000");
+        assert_eq!(results[0].time_ms, 3411.6);
+        assert_eq!(results[0].mem_bytes, Some(85_098_496.0));
+        assert_eq!(results[1].label(), "spectral-norm/4000");
+        assert_eq!(results[1].time_ms, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `timeMS` of `0` is the tool's "not timed" marker, so it is **excluded** from the
+    /// timing summary — an aggregate that folded it in would report a zero-millisecond
+    /// kernel and a zero minimum.
+    #[test]
+    fn a_zero_time_result_is_excluded_from_the_timed_set() {
+        let dir = results_dir(
+            "partition",
+            &[
+                ("a.json", &result_json("edigits", "100000", 664.4, 82_948_096.0)),
+                ("b.json", &result_json("spectral-norm", "4000", 0.0, 93_720_576.0)),
+                ("c.json", &result_json("spectral-norm", "8000", 0.0, 90_419_200.0)),
+            ],
+        );
+        let (measured, excluded) = partition_results(read_results(&dir));
+        assert_eq!(
+            measured.iter().map(TestResult::label).collect::<Vec<_>>(),
+            vec!["edigits/100000"]
+        );
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.iter().all(|r| !r.is_measured()));
+        // The coverage notes name the language set, the measured kernel and both exclusions.
+        let mut notes = Vec::new();
+        coverage_notes(&measured, &excluded, &mut notes);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("langs=elixir"), "{}", notes[0]);
+        assert!(notes[0].contains("measured 1 kernel run(s)"), "{}", notes[0]);
+        assert!(notes[0].contains("edigits/100000=664 ms"), "{}", notes[0]);
+        assert!(
+            notes[1].contains("excluded 2 kernel run(s)"),
+            "{}",
+            notes[1]
+        );
+        assert!(
+            notes[1].contains("spectral-norm/4000, spectral-norm/8000"),
+            "{}",
+            notes[1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The coverage notes are bounded: a wide sweep names at most [`COVERAGE_ITEMS`] of each.
+    #[test]
+    fn coverage_notes_are_bounded() {
+        let many: Vec<TestResult> = (0..COVERAGE_ITEMS + 5)
+            .map(|i| TestResult {
+                test: "helloworld".to_string(),
+                input: i.to_string(),
+                time_ms: 10.0,
+                mem_bytes: None,
+            })
+            .collect();
+        let mut notes = Vec::new();
+        coverage_notes(&many, &many, &mut notes);
+        assert!(notes[0].ends_with('…'), "{}", notes[0]);
+        assert!(notes[1].ends_with('…'), "{}", notes[1]);
+        // No exclusions ⇒ no exclusion note at all.
+        let mut notes = Vec::new();
+        coverage_notes(&many, &[], &mut notes);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        // Nothing measured at all is still described honestly (and never as a number).
+        let mut notes = Vec::new();
+        coverage_notes(&[], &many, &mut notes);
+        assert!(notes[0].contains("measured 0 kernel run(s)"), "{}", notes[0]);
     }
 
     /// A run that produced no result JSON is a **failure** — the recorded `wall_ms` is the
@@ -842,5 +1079,22 @@ mod tests {
         assert_eq!(no_results_reason(false), "plb-tool-failed");
         assert_eq!(no_results_reason(true), "plb-no-results");
         assert_ne!(no_results_reason(true), no_results_reason(false));
+    }
+
+    /// An empty results directory (or one holding only untimed results) drives the same
+    /// `failed` verdict as no directory at all: the row has no number to report.
+    #[test]
+    fn only_untimed_results_still_yield_no_measurement() {
+        let dir = results_dir(
+            "untimed",
+            &[(
+                "a.json",
+                &result_json("spectral-norm", "4000", 0.0, 93_720_576.0),
+            )],
+        );
+        let (measured, excluded) = partition_results(read_results(&dir));
+        assert!(measured.is_empty());
+        assert_eq!(excluded.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
