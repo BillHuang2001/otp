@@ -394,6 +394,28 @@ Three further families copy into the region they find and fail when it is short:
 - the native floor's `beam_codec::term::make_binary(self.eval_heap(), …)` replies —
   `native/file_server.rs:1022`, `native/prim_file.rs:277,469,541,633,674`, `native/prim.rs:314,366`,
   `native/code.rs:238`, `native/erts_internal.rs:731,764`, `port.rs:4861`, `eval/compile.rs:453`.
+- the **exempt-window stabilize arm** (`calls.rs:1586-1592`, `:1644-1650`), reached only on a
+  *process* route: a copy-out that does not fit the young space's free words
+  (`copy_result_fresh` at `:1558`) inside a relocation-exempt window may not grow that space
+  (`may_replace_young_space`, `gc.rs:1477` — the learned-hint gate is skipped for the same reason,
+  `:1552-1554`), so the **whole graph** is copied onto the store instead of a truncated spine.
+  The pooled source is then rewound whenever `safe_to_rewind` holds (`calls.rs:1003`, `:1052`), so
+  the store copy is the **sole** copy — this arm is not a duplicate, and there is nothing to
+  release early.
+  Its volume is *transient* data the store has no per-object free for: each graph is consumed
+  inside the nested run and unreachable afterwards, and the words can only be given back by a
+  rewind to a mark. No such rewind runs inside one `-eval` statement, because
+  `pin_window_if_store_written` (`pump.rs:307`/`:388` → `runtime.rs:2888`) latches the statement
+  window with a **transient** pin on the first such write and `scratch.rs:569` then refuses it
+  (`scratch.rs`'s own `boundary` docs name this case: "a compile pins the window on its first
+  store-writing nested run"), while `runtime/reclaim.rs:765` refuses while a machine is in flight.
+  So the store's written volume inside a statement is the **sum** of those graphs, reclaimed at the
+  next statement boundary (`Site::Boundary`) or the driver exit (`Site::Exit`), and its peak is
+  visible only while the statement runs — measured on one 125 s in-process `compile:file/2` of
+  `lib/stdlib/src/io_lib_fread.erl`: **~27 MB of written pages inside the 128 MiB seed region**
+  (`/proc/<pid>/smaps`, `eval_heap_retired_regions = 0`, i.e. bump-only growth).
+  A `-eval`/`-s`/`-run` context (`mailbox_table: None`) never reaches it: `:1542` returns before
+  the attempt.
 A short region is `beam_alloc`'s `Alloc(Heap)` (`AllocKind::Heap`); the copy-out family and the
 native floor's replies surface it as the typed `error:system_limit` (`error.rs:91`, for a BIF at a
 dispatch tail `calls.rs:1057`/`:1818`), the evaluator's `heap!` as `Flow::Fatal` (the CLI's
