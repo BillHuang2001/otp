@@ -53,7 +53,7 @@
 //! | `erts_internal:process_flag/3` | `bif.c:2262-2297` (`process_flag_aux:1896-2022`) | `(self(), save_calls, N)`→the previous length (`0` first, then `7`, `4`, …); `(self(), trap_exit, true)`/`(self(), save_calls, true)`/`(self(), save_calls, 10001)`→`error:badarg`; `(foo\|123, save_calls, 1)`→the **value** `badtype` |
 //! | `erts_internal:no_aux_work_threads/0` | `erl_process.c:9234-9237` (`:6219-6223`) | `erl`→`17` (16 schedulers + 1 + no dirty-alloc instances); `erl +S 1`→`2` |
 //! | `erts_internal:processes_next/1` | `bif.c:4111-4120` | `processes_next(1000000000000)`→`badarg`; `foo`→`badarg` |
-//! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4189` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`→`error:badarg` |
+//! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4193` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`/`2147483647`→`error:badarg`; a served numeric limit→the typed byte-budget gap |
 //! | `erts_internal:garbage_collect/1` | `bif.c:4081-4094` | `minor`/`major`→`true` (a request is recorded); `foo`/`1`→`error:badarg` |
 //! | `erlang:garbage_collect/0,1` | `erlang.erl:3051-3066` (both reduce to that `erts_internal` BIF) | `()`→`true`; `(self())`→`true`; `(LivePid)`→`true`; `(DeadPid)`→`false`; `(foo\|123\|[Pid])`→`error:badarg` |
 //! | `erlang:garbage_collect/2` | `erlang.erl:3073-3157` (`get_gc_opts/2`) + `erl_process.c:11309-11461` (`request_system_task`) | `(P,[])`→`true`; `(P,[{type,major\|minor}])`→`true`; `(DeadPid,[])`→`false`; `(P,[{async,ReqId}])`→`async`; `(P,[major\|foo\|42])`/`(P,42)`/`(P,[{type,foo}])`/`(P,[{type}])`/`(foo,[])`→`error:badarg` |
@@ -77,11 +77,23 @@
 //!   (one pid per call, in table order) instead of the C ptab's paginated index
 //!   space; `erlang:processes/0` is already a documented divergence for the same
 //!   reason.
-//! * `term_to_string/2`'s **numeric** depth limit is a typed
-//!   [`unsupported`](crate::error::unsupported) gap: the C implements it with the
-//!   `%.*T` `~P` depth directive, which the single workspace printer
-//!   ([`crate::format`]) does not expose. The `undefined`-limit form (`/1`) is
-//!   served exactly.
+//! * `term_to_string/2`'s numeric limit is **not** a depth. The C is
+//!   `erts_dsprintf(buf, "%.*T", limit, Term)` — `%T` with a **byte** budget
+//!   (`dcount`), which stops mid-term and appends `"... "`, and for which the
+//!   `undefined` limit is `INT_MAX`, i.e. unlimited (`bif.c:4155-4193` →
+//!   `erl_printf_term.c::print_term`). `beam_bifs`'s
+//!   `print::c_printf::term_text(ctx, term, precision)` is that renderer's faithful
+//!   port, but it is `pub(crate)` inside `beam_bifs` with no public entry point, so
+//!   this crate cannot name it and a **numeric** limit stays a typed
+//!   [`unsupported`](crate::error::unsupported) gap (`src/native/CONTEXT.md`
+//!   records the owed seam).
+//! * `term_to_string/1,2` is served through the registered `~w` control
+//!   ([`crate::format`]), **not** through `%T`, so its answer is the oracle's only
+//!   where the two renderers agree (small integers, atoms, and tuples/lists of
+//!   them). A printable string or binary, a float, a map and a native record render
+//!   differently — `%T` gives `"hello"`/`1.500000e+00`/`#{a=>1}` where `~w` gives
+//!   `[104,101,108,108,111]`/`1.5`/`#{a => 1}` — on the `/1` and the `undefined` form
+//!   alike. The same owed seam closes it.
 //!
 //! # Not served (falls through, then a real module load ⇒ an honest failure)
 //!
@@ -1179,32 +1191,43 @@ impl RuntimeContext<'_> {
 
     // -- erts_internal:term_to_string/1,2 ------------------------------------
 
-    /// `erts_internal:term_to_string/1,2` — `bif.c:4160-4189`.
+    /// `erts_internal:term_to_string/1,2` — `bif.c:4160-4193`.
     ///
-    /// The C formats with `"%.*T"`, i.e. the `~w` control with **no** line breaking
-    /// and no printable-string collapsing, on a single line and without a trailing
-    /// newline. The whole workspace has one printer, so this drives
-    /// [`crate::format`]'s `~w` control rather than re-implementing it.
+    /// The C formats with `erts_dsprintf(buf, "%.*T", limit, Term)`: `%T` with an
+    /// explicit **byte** budget — `erl_printf_term.c::print_term`'s `dcount`, which
+    /// stops mid-term and appends `"... "` — **not** a `~P` nesting depth. The
+    /// `undefined` limit is the C's `INT_MAX`, which `%T` treats as unlimited.
+    ///
+    /// The rendering this floor serves goes through [`crate::format`]'s registered
+    /// `~w` control, so it is the oracle's answer only where `~w` and `%T` agree.
     ///
     /// # Errors
     ///
-    /// * [`BeamError::BadArg`] when the limit is a small integer `<= 1`, or neither a
-    ///   small integer nor the atom `undefined` (the C's argument check);
-    /// * a typed [`unsupported`](crate::error::unsupported) for a **numeric** limit:
-    ///   the C's `.*` precision is the `~P` depth directive, which the registered
-    ///   printer does not expose (`src/native/CONTEXT.md` records the seam request);
+    /// * [`BeamError::BadArg`] for the C's argument check (`bif.c:4168-4176`): the
+    ///   limit must be a small integer **strictly** inside `1 .. INT_MAX` or the atom
+    ///   `undefined`, so a limit of `1`, `0`, a negative value and `2147483647`
+    ///   (`INT_MAX` itself) are all `badarg`;
+    /// * a typed [`unsupported`](crate::error::unsupported) for a numeric limit the C
+    ///   **would** serve: the byte-budget `%T` renderer
+    ///   (`beam_bifs::print::c_printf::term_text(ctx, term, precision)`) is
+    ///   `pub(crate)` inside `beam_bifs` with no public entry point, so this crate
+    ///   cannot name it, and the `~w` control it *can* reach would answer a different
+    ///   string (`src/native/CONTEXT.md` records the owed seam);
     /// * whatever the printer reports for a term outside its printable set.
     fn erts_term_to_string(&mut self, args: &[Eterm], with_limit: bool) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         if with_limit {
             let limit = *args.get(1).ok_or(BeamError::BadArg)?;
             if is_small(limit) {
+                // `bif.c:4168-4176`'s first arm is `1 < L < INT_MAX`; a limit that
+                // misses it falls through to the `undefined` test and is `badarg`, so
+                // `INT_MAX` itself is rejected rather than read as "unlimited".
                 let limit = signed_value(limit);
-                if limit <= 1 {
+                if limit <= 1 || limit >= i64::from(i32::MAX) {
                     return Err(BeamError::BadArg);
                 }
                 return Err(error::unsupported(
-                    "erts_internal:term_to_string/2 with a numeric depth limit (the ~P directive)",
+                    "erts_internal:term_to_string/2 with a numeric %T byte budget",
                 ));
             }
             match self.atom_name(limit) {
@@ -2394,8 +2417,8 @@ mod tests {
         assert_eq!(string_of(text), "{a,1}");
     }
 
-    /// Oracle: a limit of `1` ⇒ `error:badarg`; a limit that is neither a small integer
-    /// nor `undefined` ⇒ `error:badarg`.
+    /// Oracle: a limit of `1`, `0` or a negative value ⇒ `error:badarg`; a limit that is
+    /// neither a small integer nor `undefined` ⇒ `error:badarg`.
     #[test]
     fn term_to_string_rejects_a_limit_of_one_and_a_non_numeric_limit() {
         let mut runtime = runtime();
@@ -2404,10 +2427,15 @@ mod tests {
             terms::make_tuple(ctx, &[a, make_small(1)])
         });
 
-        assert!(matches!(
-            erts(&mut runtime, "term_to_string", &[tuple, make_small(1)]),
-            Err(BeamError::BadArg)
-        ));
+        for limit in [make_small(1), make_small(0), make_small(-1)] {
+            assert!(
+                matches!(
+                    erts(&mut runtime, "term_to_string", &[tuple, limit]),
+                    Err(BeamError::BadArg)
+                ),
+                "the C's first arm is 1 < L < INT_MAX"
+            );
+        }
         let foo = atom(&mut runtime, "foo");
         assert!(matches!(
             erts(&mut runtime, "term_to_string", &[tuple, foo]),
@@ -2415,22 +2443,75 @@ mod tests {
         ));
     }
 
-    /// documented divergence: the oracle truncates to the numeric depth limit
-    /// (`term_to_string({a,1},4)` ⇒ `"{a,1}... "`); this runtime reports a typed
-    /// capability gap, because the `~P` depth directive is not exposed by the
-    /// workspace's one printer (`src/native/CONTEXT.md` records the seam request).
+    /// Oracle (`erts-17.1`, measured): `term_to_string({a,1}, 2147483647)` ⇒
+    /// `error:badarg` — `INT_MAX` itself misses the C's `1 < L < INT_MAX` arm and then
+    /// fails the `undefined` test — while `2147483646` is **served** and answers
+    /// `"{a,1}"` (identical to the `/1` form). So the boundary is a rejection here and
+    /// the widest served limit is a *capability* gap (the byte budget it asks for is
+    /// the renderer this floor cannot reach), never `badarg` and never a wrong string.
     #[test]
-    fn term_to_string_reports_a_typed_gap_for_a_numeric_depth_limit() {
+    fn term_to_string_rejects_int_max_and_leaves_the_rest_of_the_served_range_a_gap() {
+        let mut runtime = runtime();
+        let a = atom(&mut runtime, "a");
+        let tuple = heap_term(&mut runtime, |ctx| {
+            terms::make_tuple(ctx, &[a, make_small(1)])
+        });
+
+        for limit in [2, 3, 4, 2_147_483_646] {
+            let error = erts(&mut runtime, "term_to_string", &[tuple, make_small(limit)])
+                .expect_err("a served numeric limit is a typed capability gap");
+            assert!(
+                error::unsupported_reason(&error).is_some(),
+                "limit {limit} is inside the C's served range: a capability gap, never badarg"
+            );
+        }
+
+        assert!(
+            matches!(
+                erts(
+                    &mut runtime,
+                    "term_to_string",
+                    &[tuple, make_small(i64::from(i32::MAX))]
+                ),
+                Err(BeamError::BadArg)
+            ),
+            "2147483647 is the C's INT_MAX: only `undefined` maps to unlimited"
+        );
+    }
+
+    /// documented divergence: the oracle truncates at `%T`'s **byte** budget, not a
+    /// depth (`term_to_string({a,1},4)` ⇒ `"{a,1}... "`, `term_to_string("hello",6)` ⇒
+    /// `"\"hello\"... "`); this runtime reports a typed capability gap, because the
+    /// byte-budget renderer (`beam_bifs::print::c_printf::term_text`) is `pub(crate)`
+    /// inside `beam_bifs` with no public entry point (`src/native/CONTEXT.md` records
+    /// the owed seam).
+    #[test]
+    fn term_to_string_reports_a_typed_gap_for_a_numeric_byte_budget() {
         let mut runtime = runtime();
         let a = atom(&mut runtime, "a");
         let tuple = heap_term(&mut runtime, |ctx| {
             terms::make_tuple(ctx, &[a, make_small(1)])
         });
         let error = erts(&mut runtime, "term_to_string", &[tuple, make_small(4)])
-            .expect_err("the numeric limit is a typed gap");
+            .expect_err("the numeric byte budget is a typed gap");
         assert_eq!(
             error::unsupported_reason(&error).as_deref(),
-            Some("erts_internal:term_to_string/2 with a numeric depth limit (the ~P directive)")
+            Some("erts_internal:term_to_string/2 with a numeric %T byte budget")
+        );
+    }
+
+    /// The numeric byte budget is a **capability gap** in the external contract too:
+    /// the CLI exits `3` with the single `beam_rt: unsupported: …` line, so the limit is
+    /// never answered with the `~w` string this floor could produce.
+    #[test]
+    fn the_numeric_byte_budget_exits_three_through_the_cli() {
+        assert_eq!(
+            crate::cli::run(vec![
+                "-eval".to_string(),
+                "erts_internal:term_to_string({a,1},4)".to_string(),
+            ]),
+            crate::cli::EXIT_UNSUPPORTED,
+            "a numeric %T byte budget is a capability gap, not a rendering"
         );
     }
 
