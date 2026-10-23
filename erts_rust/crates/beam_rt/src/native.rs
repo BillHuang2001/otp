@@ -29,7 +29,6 @@
 //! |---|---|
 //! | `erlang:halt/0,1,2` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
 //! | `erl_ddll:loaded_drivers/0`, `erl_ddll:try_load/3`, `erl_ddll:try_unload/2`, `erl_ddll:info/2` | the loaded-driver **list** an `open_port({spawn_driver, Name}, …)` resolves the name against: it is the runtime's own `dlopen`/port registry (`crate::port::driver`), not `beam_bifs`'s separate one |
-//! | `erlang:display/1` | writes to the *process's* output sink |
 //! | `io:put_chars/1,2`, `io:nl/0,1`, `io:fwrite/1,2,3`, `io:write/1,2`, `io:format/3` | the `io` **device** surface: the `io.erl` request wrappers' own `{io_request, …}` round trip against the caller's group leader (itself) answers `calling_self`, so the runtime resolves the device and writes to the process's output sink or its standard error itself (see [`io`]) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
@@ -66,6 +65,11 @@
 //! built through [`beam_engine::terms`] (`beam_rt` stays `unsafe`-free) on the heap the
 //! engine's `alloc_words` seam exposes.
 //!
+//! `erlang:display/1` is deliberately **not** a floor entry: `beam_bifs` serves it
+//! (`term_conv::display_1`) as the C's `erts_printf("%.*T\n", INT_MAX, Term)` — the `%T`
+//! renderer plus the `\r\n` its `write_f_add_cr` produces — through the same `OutputSink`
+//! seam `io:format/1,2` uses, which this crate installs on every dispatch, so the key
+//! reaches the registry.//!
 //! # The `halt` convention
 //!
 //! `halt` does not return a value; it raises an `exit`-class exception that terminates the
@@ -367,7 +371,6 @@ impl RuntimeContext<'_> {
             ("erlang", "halt", 0) => Some(Err(self.record_halt(0))),
             ("erlang", "halt", 1) => Some(self.halt_1(args)),
             ("erlang", "halt", 2) => Some(self.halt_2(args)),
-            ("erlang", "display", 1) => Some(self.display(args)),
             ("io", "put_chars", 1) => Some(self.io_put_chars(args, 1)),
             ("io", "put_chars", 2) => Some(self.io_put_chars(args, 2)),
             // The rest of the `io` **device** surface — the `io.erl` wrappers over
@@ -744,20 +747,9 @@ impl RuntimeContext<'_> {
     fn record_halt(&mut self, status: i32) -> BeamError {
         self.runtime.halt = Some(status);
         error::halt(status)
-    }    // -- erlang:display/1 ------------------------------------------------------
-
-    /// `erlang:display/1`: print the term on the process's output (`~p` plus a
-    /// newline, as the oracle does) and return `true`.
-    fn display(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let term = *args.first().ok_or(BeamError::BadArg)?;
-        let text = self.render(term, b"~p~n")?;
-        self.write_output(&text)?;
-        let true_atom = self.atom("true")?;
-        Ok(true_atom)
     }
 
     // -- erlang:apply/2,3 -----------------------------------------------------
-
     /// `erlang:apply(Mod, Fun)` / `erlang:apply(Mod, Fun, Args)`.
     ///
     /// Re-enters the host's dispatch with `self` as the context, so the target may be a
@@ -1684,9 +1676,12 @@ mod tests {
                 .expect("display/1")
         };
         assert_eq!(runtime.atom_name_of(displayed), Some("true"));
-        assert_eq!(sink.as_str(), "42\n");
+        // The key is the `beam_bifs` registry's (`term_conv::display_1`), not a floor entry:
+        // the C's `erts_printf("%.*T\n", …)` renders through the `%T` printer and terminates
+        // with the `\r\n` its `write_f_add_cr` adds, which is what `42` answering `"42\r\n"`
+        // pins — a `~p` renderer (the floor's deleted one) writes a bare `\n`.
+        assert_eq!(sink.as_str(), "42\r\n");
     }
-
     #[test]
     fn apply_of_two_arguments_calls_a_zero_arity_bif() {
         let mut runtime = runtime();

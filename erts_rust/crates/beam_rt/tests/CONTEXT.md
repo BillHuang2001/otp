@@ -201,7 +201,7 @@ The action's own process never becomes a scheduler slice: its `receive … after
 * `scheduled_io_device.rs` — scheduled io-device round trips (`io:getopts/1`, `io:setopts/2`, `io:scan_erl_form/4`), each line oracle-cross-checked.
 * `io_device.rs` — the native io floor's request wrappers, so an installed compiler `catch` handler's diagnostic is not replaced by `error:calling_self`.
 * `io_diagnostic_unmask.rs` — that unmasking end to end: the compiler's own `Function: ~w/~w` report still prints before it re-raises.
-
+* `display_oracle.rs` — `erlang:display/1` byte-for-byte against the live `erl`: the `%T` renderer's record/map/float/atom/printable-list shapes and the `\r\n` terminator, over the same compiled fixture (`display_terms.erl`) and over `-eval` literals, with the whole stdout image compared (the registry's `term_conv::display_1` — the floor does not shadow the key).
 ### Introspection and tracing (A.8)
 * `system_info_oracle.rs` — every served `system_info/1` key against the oracle, plus the guard that fails if an unclassified oracle-accepted key appears.
 * `system_info_retained.rs` — a `system_info/1` value kept while a second call materializes survives (the scratch-lifetime pin).
