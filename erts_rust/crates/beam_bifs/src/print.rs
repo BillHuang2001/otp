@@ -227,7 +227,7 @@ use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 
-pub(crate) mod c_printf;
+pub mod c_printf;
 mod pretty;
 mod record;
 pub(crate) use pretty::{

@@ -96,7 +96,7 @@ mod os_bif;
 mod packet;
 mod persistent_term;
 mod port;
-mod print;
+pub mod print;
 mod proc;
 mod proc_reg;
 mod re;

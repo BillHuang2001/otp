@@ -21,6 +21,10 @@
 //! The `%T` term renderer — `erts_printf_term.c`'s `print_term`, the format
 //! `erlang:display/1` prints through.
 //!
+//! [`term_text`] is the crate's only **public** `%T` entry point: the in-crate
+//! caller is `crate::term_conv::display_1` (`erlang:display/1`) and the outside
+//! caller is `beam_rt`, so it is what `beam_rt` calls to render a `%T` term.
+//!
 //! A safe submodule of `crate::print` (it registers no BIFs and touches neither the
 //! `io_lib` leaf renderer nor its `Chunk` tree). `erlang:display/1` is
 //! `erts_printf("%.*T\n", INT_MAX, Term)` (`bif.c:4148-4194`), and `%T` is a
@@ -107,9 +111,21 @@ enum Item {
 
 /// Renders `term` as `%T` would, with `precision` as the C's budget.
 ///
-/// `precision` is `erts_printf_term`'s argument: `i64::MAX` (the C's `INT_MAX` path,
-/// which becomes `LONG_MAX`) renders without truncation, and any other value
-/// truncates at the same point the C does, appending `"... "`.
+/// `precision` **is** `erts_printf_term`'s argument = the C `dcount`
+/// **byte budget**: `i64::MAX` is the C's `INT_MAX`/`LONG_MAX` unlimited form, so
+/// nothing is elided; any other value truncates at the exact byte the C stops at
+/// and appends the three-byte tail `"... "` — a stop inside a printable list's
+/// per-character loop abandons that list's closing quote too
+/// (`term_to_string("hello", 6)` ⇒ `"hello"... `). A byte budget, never a
+/// `~P`-style depth limit.
+///
+/// # Callers
+///
+/// The crate's only **public** `%T` entry point. In-crate it is
+/// `crate::term_conv::display_1` (`erlang:display/1`, which appends the `\r\n`
+/// terminator); `beam_rt` is the outside-crate caller, serving
+/// `erts_internal:term_to_string/1,2`'s byte budget and `erlang:display/1` through
+/// here, over the runtime's [`OutputSink`](crate::context::OutputSink).
 ///
 /// # Errors
 ///
@@ -118,7 +134,7 @@ enum Item {
 /// with no [`LocalFunIdentity`](crate::context::LocalFunIdentity) seam, and `badarg`
 /// for a malformed native record (`TermError::BadRecord` reconciled upstream) — never
 /// a fabricated rendering.
-pub(crate) fn term_text(
+pub fn term_text(
     ctx: &mut BifContext<'_>,
     term: Eterm,
     precision: i64,
