@@ -616,13 +616,37 @@ fn call_fun(
                 Ok(FunOutcome::Suspend) => Ok(Some(Step::Suspend { func, pc })),
                 // A raise inside the applied closure must route through the
                 // catch-aware funnel, not escape the caller's `try`/`catch`.
-                Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
+                Err(e) => Ok(Some(fun_apply_error(machine, module, &source, e, ctx)?)),
             }
         }
-        Err(e) => Ok(Some(machine.raise_bif_error(module, e, ctx)?)),
+        Err(e) => Ok(Some(fun_apply_error(machine, module, &source, e, ctx)?)),
     }
 }
 
+/// Route a fun-apply seam error, expanding the host's `EXC_BADFUN` marker into the oracle's
+/// `{badfun, Fun}`.
+///
+/// `call_fun` (`../../erts/emulator/beam/beam_common.c:1696-1706`) raises `EXC_BADFUN` with
+/// `fvalue = fun` when the fun's module **is** loaded and simply defines no such fun entry, and
+/// `expand_error_value` (`:750-772`) then builds `TUPLE2(am_badfun, fvalue)` — the reason a
+/// `try` observes as `{error,{badfun,Fun}}`. A host closure seam can only report the first half
+/// ([`crate::error::bad_fun`]: the fun reaches it as a bare term it must not hold across an
+/// allocation), so the expansion happens here, where the target is a re-readable
+/// [`FunSource`] and [`raise_badfun`] already builds the rooted 2-tuple.
+///
+/// Every other error keeps the catch-aware funnel unchanged.
+fn fun_apply_error(
+    machine: &mut Machine,
+    module: &Module,
+    source: &FunSource<'_>,
+    error: beam_common::BeamError,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
+    if crate::error::is_bad_fun(&error) {
+        return raise_badfun(machine, module, source, ctx);
+    }
+    machine.raise_bif_error(module, error, ctx)
+}
 /// The outcome of an `apply`/`apply_last` target dispatch ([`apply_target`]).
 pub(crate) enum ApplyTarget {
     /// The target was resolved to a `module:function` and dispatched; the applied

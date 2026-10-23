@@ -614,7 +614,7 @@ pub(crate) fn undef() -> BeamError {
 /// `None` for an owned-`String` atom (`ExitReason::Atom`'s `static_str`), and that
 /// accessor is how a landing consumer recognises the reason.
 pub(crate) fn bad_fun() -> BeamError {
-    BeamError::Raise(Raise::error(ExitReason::atom("badfun")))
+    beam_engine::error::bad_fun()
 }
 
 /// The live **structured reason term** carried by a raise, when it has one.

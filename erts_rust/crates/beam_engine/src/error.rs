@@ -28,6 +28,40 @@
 
 use beam_common::{BeamError, ExitReason, Raise};
 
+/// The C's `EXC_BADFUN` marker: a host's closure seam reports that the applied fun names **no
+/// fun entry** of the module it names.
+///
+/// `call_fun` (`../../erts/emulator/beam/beam_common.c:1696-1706`) sets `freason = EXC_BADFUN`
+/// with `fvalue = fun` when the module **is** loaded and the fun is simply not defined in it;
+/// `expand_error_value` (`:750-772`) then wraps the pair as `{badfun, Fun}`. Only the first half
+/// can come from a host seam: the fun reaches it as a bare `Eterm`, so the host must not allocate
+/// (and thereby possibly collect) before the reason term exists. The second half is therefore the
+/// engine's, which holds a re-readable [`FunSource`](crate::families::funs) — see
+/// [`is_bad_fun`] and `families::funs::raise_badfun`.
+///
+/// The marker is a **typed live-reason payload** (`()`), not merely the `badfun` atom: a user
+/// `erlang:error(badfun)` raises the same class and atom with `EXC_ERROR` and must never be
+/// expanded into `{badfun, Fun}`.
+pub fn bad_fun() -> BeamError {
+    BeamError::Raise(
+        Raise::error(ExitReason::atom("badfun"))
+            .with_live_reason(beam_common::LiveReason::new(())),
+    )
+}
+
+/// Whether `error` is the [`bad_fun`] marker (its reason atom **and** the `()` payload).
+pub fn is_bad_fun(error: &BeamError) -> bool {
+    match error {
+        BeamError::Raise(raise) => {
+            raise.reason.as_atom() == Some("badfun")
+                && raise
+                    .live_reason()
+                    .and_then(|live| live.downcast_ref::<()>())
+                    .is_some()
+        }
+        _ => false,
+    }
+}
 /// The engine cannot execute this instruction/operand (a Milestone-1 coverage
 /// limit).
 ///
