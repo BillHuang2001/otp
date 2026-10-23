@@ -1103,7 +1103,13 @@ fn call_fun_with_the_undefined_lambda_marker_cooks_the_applied_fun_head_item() {
     let (mut fixture, entry, index) = undefined_lambda_fixture();
     let undef = fixture.atom("undef");
     let module = fixture.finish();
-
+    // The function the raise lands in, identified by the entry label the fixture returned: the
+    // cooked trace's second item must name *this* function, not the applied fun.
+    let raising = module
+        .functions
+        .iter()
+        .find(|function| function.entry_label == entry)
+        .expect("the fixture's raising function is in the module");
     let mut ctx = MinimalContext::with_apply_hook(Box::new(|fun, args| {
         assert!(terms::is_fun(fun), "the fallback receives the genuine fun");
         assert_eq!(args, [make_small(7)], "the applied argument list");
@@ -1162,8 +1168,12 @@ fn call_fun_with_the_undefined_lambda_marker_cooks_the_applied_fun_head_item() {
     );
     assert_eq!(
         terms::tuple_element(frames[1], 1).expect("the raising frame's function"),
-        make_atom(module.atom_table.lookup("f").expect("f")),
+        make_atom(raising.name),
         "then the raising frame"
+    );
+    assert_eq!(
+        raising.arity, 1,
+        "and it is the f/1 the fixture entered at `entry`"
     );
 }
 
