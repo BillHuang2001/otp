@@ -101,6 +101,16 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `#[cfg(test)]`, so a plain `--lib` build would otherwise warn. The external test host
   `tests/support/bifs.rs` still cannot reach it: integration tests see this crate from the
   outside and `families` is a private module, so that floor would need a `pub` re-export.
+- `raw_tests.rs` → `raw`'s `#[cfg(test)]` unit tests, declared at the end of `raw.rs` as
+  `#[cfg(test)] #[path = "raw_tests.rs"] mod tests;` so `super` is the `raw` module itself and
+  its `#![allow(unsafe_code)]` is inherited: the frozen-layout accessors (`heap_bits`/
+  `subject_bytes`, the `ErlSubBits` match context, the bignum readers, `is_refc_binary`), the
+  size-dispatching result builders (`make_binary`/`make_bits`/`make_writable`, incl. the
+  zeroed-padding invariant), the writable-payload growth/relocation/refusal matrix, and the
+  split-pair canary cases that prove a payload republish writes only the two pointer words
+  (`a_republish_writes_only_the_two_payload_words_and_leaves_a_split_pairs_neighbour_intact`,
+  `a_split_pairs_payload_move_keeps_the_next_append_in_place`,
+  `a_second_pair_over_the_payload_refuses_the_move`).
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
     `bs_match_string`/`bs_test_tail2` opcodes. `bs_get_integer2` commits its advance through
@@ -236,7 +246,7 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `matching/utf_tests.rs` / `matching/elision_tests.rs` / `matching/rooted.rs`.
 
 ## Test Strategy
-Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls (`raw.rs`,
+Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls (`raw_tests.rs`,
 `mod.rs`, `matching/tests.rs`, each of the `create/*_tests.rs` and `matching/*_tests.rs`
 modules above), an end-to-end suite in `run_tests.rs` through `Machine::run_label`/
 `run_export`, and live `erlc`/`erl` oracle cross-checks (which skip loudly when the
