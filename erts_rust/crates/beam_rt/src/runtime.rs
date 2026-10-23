@@ -5092,6 +5092,30 @@ impl Runtime {
         };
         format::term_to_string_with(registry, info_heap, table, *self_pid, term, control)
     }
+    /// Renders `term` as the C's `%T` would, with `precision` as the C's **byte** budget.
+    ///
+    /// `precision` is `i64::MAX` for the C's `INT_MAX`/unlimited form; any other value is
+    /// the truncating budget with its `"... "` tail
+    /// ([`crate::format::term_text`]). Like [`Runtime::format_term`], the atom table the
+    /// renderer resolves atoms against is the runtime's shared one, and the scratch heap
+    /// is rewound first, so the returned text — not any term — is the result.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`unsupported`](crate::error::unsupported) for an external
+    /// pid/port/reference or an identity-less `Local` fun, and
+    /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed native
+    /// record.
+    pub(crate) fn format_term_text(&mut self, term: Eterm, precision: i64) -> Result<String> {
+        self.reset_info_scratch();
+        let Runtime {
+            info_heap,
+            code_server,
+            self_pid,
+            ..
+        } = self;
+        format::term_text(info_heap, code_server.atoms(), *self_pid, term, precision)
+    }
 
     /// Boots on demand (idempotent).
     fn boot_if_needed(&mut self) -> Result<()> {
