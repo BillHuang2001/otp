@@ -44,9 +44,9 @@
 //! # Why the baseline tier is sound for *any* module
 //!
 //! A step that reports [`Step::Enter`](beam_engine::interpreter) — "continue in *another*
-//! module's code" — was historically the one shape a native tier could not take: a compiled
+//! module's code" — is the one shape a native tier cannot take on its own: a compiled
 //! block's code, label map and literal area are all bound to a single module. The engine's
-//! driver now handles it. A `Step::Enter` (raised by its own interpreter step, or handed back
+//! driver handles it. A `Step::Enter` (raised by its own interpreter step, or handed back
 //! as the `ENTER` word by a compiled `call_ext`/`return`) switches the machine context
 //! (`Machine::switch_context`), rebinds the module / label map / literal area and continues in
 //! the **callee's** compiled blocks — including the first sight of a module the context switch
