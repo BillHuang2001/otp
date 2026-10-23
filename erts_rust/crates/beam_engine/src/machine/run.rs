@@ -52,6 +52,12 @@ use super::Machine;
 /// `run_export`) are **non-blocking**: they fold a [`RunOutcome::Wait`] into the
 /// typed `Err(`[`crate::error::blocked`]`)` and a [`RunOutcome::Suspend`] into
 /// `Err(`[`crate::error::suspended`]`)` rather than inventing a result.
+///
+/// A [`RunOutcome::Returned`] term lives in the **caller's** heap (the
+/// [`ExecutionContext`] that served the run), never in the [`Machine`]: a machine owns
+/// no words, so the value is readable exactly as long as that context lives. Dropping a
+/// test/embedding context (`MinimalContext`) while still holding the term is a
+/// use-after-free — see the lifetime contract in [`crate::context::MinimalContext`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     /// The run finished; this is `x(0)`.
