@@ -1259,19 +1259,32 @@ fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     key_or_end(ctx, outcome?)
 }
 
-/// `ets:slot(Tab, Slot)` — the objects of a table slot (a hash kind answers its
-/// own bucket decomposition; an `ordered_set` one object per key).
+/// `ets:slot(Tab, Slot)` — the objects of a table slot.
 ///
-/// The `Slot` argument must be a **small** integer: a non-integer and a bignum
-/// are both `badarg` (the C `signed_val(slot_term)` reads only a small int, and a
-/// bignum is far beyond any slot count). The read gate mirrors every other read
-/// verb ([`resolve::Gate::Read`], the oracle's `DB_READ` mask); a negative or
-/// out-of-range slot propagates [`Table::slot`]'s `badarg`, while the first slot
-/// past the end is the `'$end_of_table'` atom. Verified against the system `erl`
-/// (OTP 29.1.1 / erts-17.1): an `ordered_set` holding `{6,a},{3,b},{4,c},{8,d},{1,e}`
-/// yields slots `0..4` = `[{1,e}]`,`[{3,b}]`,`[{4,c}]`,`[{6,a}]`,`[{8,d}]` and slot
-/// `5` = `'$end_of_table'`, an empty `ordered_set`'s slot `0` is
-/// `'$end_of_table'`, and a negative/`99`/`1.0`/`1 bsl 100` slot is `badarg`.
+/// The contract is the oracle's (`ets_slot_2` → `db_slot_hash`/`db_slot_tree`,
+/// `erl_db.c:3744`): the slots are **0-based**, every in-range slot answers a
+/// **list** of objects (possibly empty), the first slot past the end is the
+/// `'$end_of_table'` atom, and anything above that — or below `0` — is `badarg`.
+/// Only the *figures* are the interior's own (`beam_ets`): an `ordered_set` slot is
+/// exact (the object of the `(n+1)`-th smallest key, one per slot, end of table at
+/// `size`), while a hash kind's slot is a bucket/root-index partition whose count and
+/// contents belong to this runtime's interior (CHAMP for `set`, a bucket array for
+/// `bag`/`duplicate_bag`) and must never be compared value-for-value with ERTS's.
+/// Because that count is a property of the index rather than of the object count, a
+/// hash kind's **free slot answers `[]`** — never a premature end-of-table.
+///
+/// The `Slot` argument must be a **small** integer: a non-integer and a bignum are
+/// both `badarg` (the C `signed_val(slot_term)` reads only a small int, and a bignum
+/// is far beyond any slot count). The read gate mirrors every other read verb
+/// ([`resolve::Gate::Read`], the oracle's `DB_READ` mask), so a non-owner of a
+/// non-public table is `badarg` too; an out-of-range slot propagates
+/// [`Table::slot`]'s `badarg`. Verified against the system `erl` (OTP 29.1.1 /
+/// erts-17.1): an `ordered_set` holding `{6,a},{3,b},{4,c},{8,d},{1,e}` yields slots
+/// `0..4` = `[{1,e}]`,`[{3,b}]`,`[{4,c}]`,`[{6,a}]`,`[{8,d}]` and slot `5` =
+/// `'$end_of_table'`; an empty `ordered_set`'s slot `0` is `'$end_of_table'`; a
+/// one-object `set` answers `[]` at slots `0` and `1`, `'$end_of_table'` at `256` and
+/// `badarg` at `257` (its own count); and a negative/`1.0`/`1 bsl 100` slot is
+/// `badarg`.
 fn slot_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let slot_term = args[1];

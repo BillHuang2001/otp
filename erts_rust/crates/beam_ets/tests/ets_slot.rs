@@ -289,11 +289,128 @@ fn sorted_ordered_interior_exposes_the_same_slot_contract() {
     assert!(matches!(table.slot(4, &atoms), Err(BeamError::BadArg)));
 }
 
+// ------------------------------------------------ hash kinds: the slot domain
+/// A hash kind's slot **domain does not track the object count**: a one-object
+/// table still exposes many slots, so slot `1` is a readable slot answering a list
+/// and *not* `'$end_of_table'`.
+///
+/// This is the regression the one-object-per-slot fallback caused: a `set` holding
+/// one object reported `'$end_of_table'` at slot `1` while the oracle answers the
+/// empty bucket `[]`.
+#[test]
+fn hash_kind_slot_domain_does_not_track_the_object_count() {
+    for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
+        let (table, atoms, _) = table_with(kind, &[(1, 10)]);
+        assert_eq!(table.size(), 1);
+        // Slot 0 and slot 1 are both in range and both answer a *list*.
+        assert!(
+            table.slot(0, &atoms).expect("in range").is_some(),
+            "{kind:?}: slot 0 must be a slot, not the end"
+        );
+        assert!(
+            table.slot(1, &atoms).expect("in range").is_some(),
+            "{kind:?}: slot 1 of a one-object table must be a slot, not the end"
+        );
+        // The walk sees a domain of at least two slots and at least one of them is
+        // an **empty** list — a one-object table cannot fill every slot.
+        let (objects, eot) = walk_slots(&table, &atoms);
+        assert_eq!(objects, vec![10], "{kind:?}: the slots hold the one object");
+        assert!(eot >= 2, "{kind:?}: the domain is not the object count");
+        let empties = (0..eot)
+            .filter(|&slot| {
+                table
+                    .slot(slot, &atoms)
+                    .expect("in range")
+                    .expect("not the end")
+                    .is_empty()
+            })
+            .count();
+        assert!(
+            empties >= 1,
+            "{kind:?}: a free slot must answer the empty list, not the end"
+        );
+        // The boundary is exactly one end-of-table slot then `badarg`.
+        assert_eq!(table.slot(eot, &atoms).unwrap(), None, "{kind:?}");
+        assert!(
+            matches!(table.slot(eot + 1, &atoms), Err(BeamError::BadArg)),
+            "{kind:?}: one past the end is badarg"
+        );
+    }
+}
+/// The CHAMP `set`'s slot count is its **own root index space** — a fixed figure of
+/// this interior (`2^WIDTH` root children, 32 today), *not* ERTS's 256-bucket
+/// `set` and not a function of the object count.
+///
+/// Pinning our own figure here is deliberate: a change to the CHAMP's fan-out must
+/// show up as a test change, and the doc/comment says which side the number
+/// belongs to. Nothing in this crate may pin ERTS's 256.
+#[test]
+fn champ_set_slot_count_is_its_root_index_space() {
+    for objects in [
+        Vec::new(),
+        vec![(1i64, 10i64)],
+        (1..=40).map(|k| (k, k * 10)).collect(),
+    ] {
+        let (table, atoms, _) = table_with(TableKind::Set, &objects);
+        let (seen, eot) = walk_slots(&table, &atoms);
+        assert_eq!(eot, 32, "the CHAMP root has 2^5 children");
+        assert_eq!(seen.len(), objects.len(), "every object appears once");
+        // The domain is independent of the contents.
+        assert!(table.slot(31, &atoms).expect("in range").is_some());
+        assert_eq!(table.slot(32, &atoms).unwrap(), None);
+        assert!(matches!(table.slot(33, &atoms), Err(BeamError::BadArg)));
+    }
+}
+/// The chained interiors (`bag`/`duplicate_bag`, opt-in chained `set`) expose their
+/// **bucket array**: with a handful of objects the count is the array's own (never
+/// the object count), every slot answers a list, and the boundary is `nactive` /
+/// `nactive + 1`.
+#[test]
+fn chained_interiors_expose_their_bucket_array() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+    for (kind, mut table) in [
+        (TableKind::Bag, new_table(TableKind::Bag)),
+        (TableKind::DuplicateBag, new_table(TableKind::DuplicateBag)),
+    ] {
+        table
+            .insert(object(&mut heap, 1, 10), &atoms)
+            .expect("insert");
+        let (objects, eot) = walk_slots(&table, &atoms);
+        assert_eq!(objects, vec![10], "{kind:?}");
+        assert!(eot >= 2, "{kind:?}: a bucket array has many buckets");
+        assert!(table.slot(eot - 1, &atoms).expect("in range").is_some());
+        assert_eq!(table.slot(eot, &atoms).unwrap(), None);
+        assert!(matches!(
+            table.slot(eot + 1, &atoms),
+            Err(BeamError::BadArg)
+        ));
+    }
+    // The opt-in chained `set` interior likewise answers lists in its own domain.
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::Set);
+    let mut chained_set =
+        Table::with_set_interior(TableId::next(), opts, SetInterior::Chained)
+            .expect("constructible");
+    chained_set
+        .insert(object(&mut heap, 1, 10), &atoms)
+        .expect("insert");
+    let (objects, eot) = walk_slots(&chained_set, &atoms);
+    assert_eq!(objects, vec![10]);
+    assert!(eot >= 2);
+    assert_eq!(chained_set.slot(eot, &atoms).unwrap(), None);
+    assert!(matches!(
+        chained_set.slot(eot + 1, &atoms),
+        Err(BeamError::BadArg)
+    ));
+}
 // ----------------------------------------------------------- access + views
 
 #[test]
 fn slot_is_read_gated_through_table_access() {
-    let mut table = new_table(TableKind::Set);
+    // An `ordered_set`, so slot 0 is *known* to hold the object: a hash kind's slot
+    // 0 is legitimately empty (its partition is the interior's own).
+    let mut table = new_table(TableKind::OrderedSet);
     let atoms = AtomTable::new();
     let mut heap = Heap::new(64);
     table

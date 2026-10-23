@@ -74,6 +74,8 @@ fn seeded_atoms() -> AtomTable {
         "undefined",
         "set",
         "ordered_set",
+        "bag",
+        "duplicate_bag",
         "public",
         "private",
         "named_table",
@@ -364,6 +366,70 @@ fn slot_of_an_empty_ordered_set_is_the_end() {
     );
 }
 
+/// `ets:slot/2` on a **hash** kind (`set`): the domain is the table's own slot
+/// index space, never the object count, and a free slot answers the **empty list**.
+///
+/// Oracle probe (`erl -noshell`, OTP 29.1.1 / erts-17.1), a `set` holding one object
+/// `{1,a}`: `ets:slot(T, 0)` and `ets:slot(T, 1)` are both `[]` (the bucket is
+/// empty), slot `256` is `'$end_of_table'` and `257` is `badarg`. This used to
+/// answer `'$end_of_table'` at slot 1 — a one-object-per-slot fallback whose domain
+/// was the object count. The slot *count* here is the interior's own
+/// (`beam_ets`'s CHAMP root index space), so only the relation is asserted: every
+/// in-range slot answers a list, at least one of them empty, the terminator is
+/// `'$end_of_table'` at the first slot past the end, and one past that is `badarg`.
+#[test]
+fn slot_of_a_hash_kind_answers_lists_and_ends_once() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+    for kind in ["set", "bag", "duplicate_bag"] {
+        let handle = new_table(&bifs, &mut ctx, "nav_t", &[kind]);
+        insert_pairs(&bifs, &mut ctx, handle, &[(1, 10)]);
+        // Slot 0 and slot 1 are both slots — neither is the end of the table.
+        let mut empties = 0;
+        let mut slot = 0i64;
+        let end = loop {
+            let s = int(&mut ctx, slot);
+            let out = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, s]).expect("ets:slot");
+            if atom_is(&atoms, out, "$end_of_table") {
+                break slot;
+            }
+            // A slot's answer is a list of objects; `[]` is a free slot.
+            let len =
+                call(&bifs, &mut ctx, "erlang", "length", 1, &[out]).expect("a slot is a list");
+            if as_int(len) == 0 {
+                empties += 1;
+            }
+            assert!(
+                slot <= 1024,
+                "{kind}: the slot walk never reached an end ({slot} slots)"
+            );
+            slot += 1;
+        };
+        assert!(
+            end >= 2,
+            "{kind}: a one-object table must expose more than one slot (got {end})"
+        );
+        assert!(
+            empties >= 1,
+            "{kind}: a free slot must answer `[]`, not the end of the table"
+        );
+        // Exactly one `'$end_of_table'` slot, then `badarg`.
+        let past = int(&mut ctx, end + 1);
+        let err = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, past])
+            .expect_err("one slot past the end is badarg");
+        assert!(matches!(err, BeamError::BadArg), "{kind}: {err:?}");
+        // A deleted table is `badarg` too.
+        let deleted = call(&bifs, &mut ctx, "ets", "delete", 1, &[handle]).expect("ets:delete");
+        assert!(atom_is(&atoms, deleted, "true"), "delete returns true");
+        let zero = int(&mut ctx, 0);
+        let err = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, zero])
+            .expect_err("a deleted table is badarg");
+        assert!(matches!(err, BeamError::BadArg), "{kind}: {err:?}");
+    }
+}
 /// Every ill-typed or out-of-range slot is the oracle's `badarg`: a **negative**
 /// slot, a slot past the end, a **float**, a **bignum** and a non-integer
 /// (oracle-verified: a bignum and a float are `badarg` because the C reads only a

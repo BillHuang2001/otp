@@ -139,6 +139,12 @@ fn slot_index(bitmap: u32, bit: u32) -> usize {
     (bitmap & (bit - 1)).count_ones() as usize
 }
 
+/// The **root-level index slot** a key's hash selects — the low [`WIDTH`] bits,
+/// which is what the root bitmap node dispatches on (`index_bit(hash, 0)`), and
+/// therefore the slot index `ets:slot/2` reports that key's object under.
+fn root_slot(hash: u64) -> usize {
+    (hash & MASK as u64) as usize
+}
 /// The `index`-th (0-based) set bit of `bitmap`. `index` must be in range.
 fn bit_at(bitmap: u32, index: usize) -> u32 {
     let mut bits = bitmap;
@@ -563,6 +569,48 @@ impl Interior for ChampInterior {
         self.iter_objects()
     }
 
+    /// `ets:slot/2` for a CHAMP `set`: the objects whose key's hash selects the
+    /// **root-level index slot** `slot` — one slot per root child, i.e. [`SLOTS`]
+    /// (`2^WIDTH`) of them, the same index space
+    /// [`bucket_chains`](Interior::bucket_chains) measures.
+    ///
+    /// The real ETS `set` is a bucket-chained hash table (`erl_db_hash.c:1733`
+    /// `db_slot_hash`): slot `n` is bucket `n` of `nactive`, `nactive` is
+    /// `'$end_of_table'` and `nactive + 1` is `badarg`. A CHAMP trie has no bucket
+    /// array, but its root node **is** a compressed [`SLOTS`]-way dispatch on the
+    /// low [`WIDTH`] bits of the key's hash, so the slots this interior exposes are
+    /// exactly that dispatch: [`root_slot`] of the key's hash. Every stored object
+    /// belongs to the one slot its trie path starts at, and a slot no object maps
+    /// to answers the **empty list** — the oracle's empty bucket, never a
+    /// premature `'$end_of_table'`.
+    ///
+    /// Both figures are this interior's own (workspace `CONTEXT.md` §2): the slot
+    /// *count* is [`SLOTS`] and *which* slot a key lands in follows
+    /// `beam_term::hashing::term_hash`, so neither is comparable value-for-value
+    /// with ERTS's 256-bucket `set`. Only the contract is reproduced — the slots
+    /// `0..SLOTS-1` answer a list (possibly empty), `SLOTS` is `'$end_of_table'`,
+    /// and anything above is `badarg` (a negative one never reaches here:
+    /// [`Table::slot`](crate::Table::slot) rejects it first, the C's
+    /// `signed_val(slot_term) < 0`).
+    ///
+    /// O(objects) per call — the partition is selected from the depth-first
+    /// [`collect`](ChampInterior::collect), the same order [`keys`](Interior::keys)
+    /// walks.
+    fn slot(&self, slot: usize, _atoms: &AtomTable) -> Result<Option<Vec<Eterm>>> {
+        if slot > SLOTS {
+            return Err(badarg());
+        }
+        if slot == SLOTS {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.collect()
+                .into_iter()
+                .filter(|entry| root_slot(entry.hash) == slot)
+                .map(|entry| entry.object)
+                .collect(),
+        ))
+    }
     fn memory(&self) -> usize {
         // The root is stored inline in the interior; every other node and every
         // node's vectors are heap-allocated and counted by `heap_words`. A
@@ -919,5 +967,126 @@ mod tests {
         // delete/re-insert churn cannot accumulate the high-water mark.
         t.insert(make_small(1), objs[0], &atoms).unwrap();
         assert!(t.memory() < 10_000, "a refilled interior is small again");
+    }
+    // ------------------------------------------------------ `ets:slot/2`
+    /// The slot count is the interior's **own root index space** ([`SLOTS`]), not
+    /// the object count — the defect this pins: a one-object `set` used to expose a
+    /// single slot, so `slot(1)` answered `'$end_of_table'` where the oracle answers
+    /// the empty bucket `[]`.
+    #[test]
+    fn slot_count_is_the_root_index_space_not_the_object_count() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(1024);
+        let mut t = ChampInterior::new();
+        // Empty: every slot is readable and empty, `SLOTS` is the end.
+        for slot in 0..SLOTS {
+            assert_eq!(t.slot(slot, &atoms).unwrap(), Some(Vec::new()), "slot {slot}");
+        }
+        assert_eq!(t.slot(SLOTS, &atoms).unwrap(), None);
+        assert!(matches!(t.slot(SLOTS + 1, &atoms), Err(BeamError::BadArg)));
+        // One object: the domain is unchanged, so slot 1 is still a list.
+        t.insert(make_small(1), object(&mut heap, 1, 10), &atoms).unwrap();
+        for slot in 0..SLOTS {
+            let here = t.slot(slot, &atoms).unwrap().expect("in range");
+            assert!(here.len() <= 1, "a `set` keeps one object per slot");
+        }
+        assert_eq!(t.slot(SLOTS, &atoms).unwrap(), None);
+        assert!(matches!(t.slot(SLOTS + 1, &atoms), Err(BeamError::BadArg)));
+        // The whole domain is stable as objects come and go.
+        for key in 2..=40 {
+            t.insert(make_small(key), object(&mut heap, key, key * 10), &atoms)
+                .unwrap();
+        }
+        assert_eq!(t.slot(SLOTS, &atoms).unwrap(), None);
+        assert!(matches!(t.slot(SLOTS + 1, &atoms), Err(BeamError::BadArg)));
+    }
+    /// The slots **partition** every object: each appears in exactly the slot its
+    /// key's hash selects (the root child its trie path starts at), so the union is
+    /// the interior's object multiset and no object is invented or duplicated.
+    #[test]
+    fn slot_partitions_every_object_by_its_root_index() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = ChampInterior::new();
+        // Enough keys that several root slots are occupied, including a hash with a
+        // deeper path (any key whose low `WIDTH` bits collide with another's).
+        for key in 0..64 {
+            t.insert(make_small(key), object(&mut heap, key, key * 10), &atoms)
+                .unwrap();
+        }
+        let mut seen: Vec<Eterm> = Vec::new();
+        let mut occupied = 0;
+        for slot in 0..SLOTS {
+            let objects = t.slot(slot, &atoms).unwrap().expect("in range");
+            if !objects.is_empty() {
+                occupied += 1;
+            }
+            for &o in &objects {
+                // The slot an object is reported under is its key's root slot.
+                let key = key_of(o, 1).unwrap();
+                let hash = term_hash(key, &atoms);
+                assert_eq!(root_slot(hash), slot, "object {o:?} in slot {slot}");
+            }
+            seen.extend(objects);
+        }
+        assert!(occupied > 1, "64 keys must spread over several root slots");
+        let mut want: Vec<Eterm> = t.iter_objects().collect();
+        seen.sort_unstable_by_key(|&o| o.raw());
+        want.sort_unstable_by_key(|&o| o.raw());
+        assert_eq!(seen, want, "the slots are a partition of every object");
+        assert!(seen.windows(2).all(|pair| pair[0] != pair[1]), "no duplicates");
+    }
+    /// An **upsert** and a **delete** keep the partition honest: the object of a
+    /// re-inserted key reports under the same slot (its key's root slot), and a
+    /// deleted key's object leaves exactly its own slot — the rest stay put.
+    #[test]
+    fn slot_partition_survives_upserts_and_deletes() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = ChampInterior::new();
+        for key in 0..24 {
+            t.insert(make_small(key), object(&mut heap, key, key), &atoms)
+                .unwrap();
+        }
+        let slot_of = |t: &ChampInterior, key: i64| {
+            let hash = term_hash(make_small(key), &atoms);
+            (0..SLOTS)
+                .find(|&s| {
+                    t.slot(s, &atoms)
+                        .unwrap()
+                        .expect("in range")
+                        .iter()
+                        .any(|&o| key_of(o, 1).unwrap() == make_small(key))
+                })
+                .map(|s| (s, root_slot(hash)))
+                .expect("every stored key is in some slot")
+        };
+        let (before, root) = slot_of(&t, 7);
+        assert_eq!(before, root);
+        // An upsert replaces the object of the same key: same slot, new value.
+        let replaced = object(&mut heap, 7, 70);
+        t.insert(make_small(7), replaced, &atoms).unwrap();
+        let (after, _) = slot_of(&t, 7);
+        assert_eq!(after, before, "an upsert must not move the object");
+        assert!(t.slot(after, &atoms).unwrap().unwrap().contains(&replaced));
+        // Deletes remove their own object from their own slot only.
+        for key in [0i64, 5, 11, 23] {
+            t.delete(make_small(key), &atoms).unwrap();
+        }
+        for key in [0i64, 5, 11, 23] {
+            let empty = (0..SLOTS).all(|s| {
+                !t.slot(s, &atoms)
+                    .unwrap()
+                    .expect("in range")
+                    .iter()
+                    .any(|&o| key_of(o, 1).unwrap() == make_small(key))
+            });
+            assert!(empty, "deleted key {key} still appears in a slot");
+        }
+        let mut all = Vec::new();
+        for s in 0..SLOTS {
+            all.extend(t.slot(s, &atoms).unwrap().expect("in range"));
+        }
+        assert_eq!(all.len(), t.size(), "the slots still hold every object once");
     }
 }

@@ -262,9 +262,14 @@ impl Table {
     /// (`../CONTEXT.md` §2): the interior decides its own partition of the stored
     /// objects (see `Interior::slot`), so which objects a hash slot holds, and how
     /// many slots there are, differ from ERTS's — only the partition, the single
-    /// end-of-table slot and the badarg boundary are reproduced. An `ordered_set`
-    /// is exact: slot `n` is the object with the (n+1)-th smallest key, and the
-    /// end-of-table slot is `size`.
+    /// end-of-table slot and the badarg boundary are reproduced. Two consequences
+    /// are contract, not freedom, and the earlier one-object-per-slot fallback got
+    /// them wrong: a hash kind's slot **count does not track `size`** (a one-object
+    /// `set` still exposes many slots, so slot `1` is a readable slot and not
+    /// `'$end_of_table'`), and a slot no object hashes to answers the **empty
+    /// list**, exactly like the oracle's empty bucket. An `ordered_set` is exact:
+    /// slot `n` is the object with the (n+1)-th smallest key, and the end-of-table
+    /// slot is `size`.
     pub fn slot(&self, slot: i64, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>> {
         // A negative slot is `badarg` before the interior is consulted, mirroring
         // the C `signed_val(slot_term) < 0`.

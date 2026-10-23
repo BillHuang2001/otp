@@ -221,21 +221,22 @@ pub(crate) trait Interior: Send + Sync {
     /// `'$end_of_table'` slot, `badarg` beyond it.
     ///
     /// The drop-in default is the **single-object-per-key** decomposition, which
-    /// is exactly what every interior holding at most one object per key needs:
-    /// the two `ordered_set` interiors (the B+-tree and the sorted `Vec`, whose
-    /// iteration orders are both ascending key order) **and** the CHAMP `set`
-    /// index. Real `ets` gives "the n'th node in the tree" for an `ordered_set`
+    /// is exactly what every interior holding at most one object per key and
+    /// ordering by key needs: the two `ordered_set` interiors (the B+-tree and the
+    /// sorted `Vec`, whose iteration orders are both ascending key order). Real
+    /// `ets` gives "the n'th node in the tree" for an `ordered_set`
     /// (`erl_db_tree.c:1139` `db_slot_tree_common`), so slot `n` is the object
     /// with the (n+1)-th smallest key — one object per slot — `slot == size` is
     /// `'$end_of_table'`, and `slot > size` is `badarg`.
     ///
-    /// The hash kinds have a **different** decomposition — a slot is a hash
-    /// *bucket* (`erl_db_hash.c:1733` `db_slot_hash`), so a slot may hold several
-    /// objects or none — and [`HashInterior`] overrides this with its bucket
-    /// array. The slot layout is **not** externally pinned (`../CONTEXT.md` §2),
-    /// so an interior with no bucket array is free to choose any partition of its
-    /// stored objects; CHAMP, having no bucket array and one object per key, uses
-    /// this one-object-per-slot partition.
+    /// The **hash kinds** must not use this default: their slot is a hash *bucket*
+    /// (`erl_db_hash.c:1733` `db_slot_hash`), so a slot may hold several objects
+    /// **or none at all**, and the slot count is a property of the index rather
+    /// than of the object count — a one-object table still has many slots. Both
+    /// hash interiors override it: [`HashInterior`](crate::HashInterior) with its
+    /// bucket array, [`ChampInterior`](crate::ChampInterior) with one slot per
+    /// root-level index slot of its trie (a partition over the trie's own hash
+    /// dispatch, so an empty slot exists even in a one-object table).
     ///
     /// A **negative** slot never reaches here: [`Table::slot`](super::Table::slot)
     /// rejects it with `badarg` before the interior is consulted, mirroring the C
