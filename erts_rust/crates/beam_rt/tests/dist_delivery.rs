@@ -914,6 +914,167 @@ fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
         "the retirement names the link's peer, not the spoofed node: {error}"
     );
 }
+
+/// A **zero-id** inbound `DOP_UNLINK_ID` is a **wire error**, not a deliverable signal:
+/// `dist.c:2291-2295` rejects an id that is not a non-zero unsigned integer with
+/// `invalid_message` (`term_to_Uint64` + `id != 0`), which `beam_dist`'s per-link
+/// `Delivery::classify_validated` reproduces — so the sink is never called. The C's
+/// `invalid_message` kills **that connection** (`erts_kill_dist_connection`,
+/// `dist.c:3186`), and so does this drive: the pass retires the offending link,
+/// records the reason, drops that link's unread queue, and leaves every other link —
+/// and everything already dispatched — untouched.
+///
+/// The control's `To` is a **recorded** remote link, so a sink that did run would have
+/// removed it: that the record survives is the proof the delivery never happened.
+#[test]
+fn a_zero_id_inbound_unlink_id_is_refused_and_retires_only_its_link() {
+    let mut rt = node_runtime("zerounlink");
+    rt.allow_inbound_delivery(true);
+    // Two links to the same peer: the refused control retires one of them and the other
+    // must keep working. The survivor also keeps the peer's node alive, so the
+    // retirement is not a node down (nothing but the offending link is affected).
+    let (mut first_stream, mut first, mut heap, mut atoms) = live_link(&mut rt);
+    let (mut second_stream, mut second, _, _) = live_link(&mut rt);
+
+    let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
+    let pid = rt.self_pid();
+    // The addressed local pid, in the shape the wire carries it: an external pid naming
+    // **this** node at **this** creation (which the decode-side `LocalIdentity` demotes
+    // back to the internal term). Its node atom is interned in the client's own table,
+    // the one the encoder reads.
+    let (node_name, creation) = {
+        let node = rt.dist_node().expect("a configured node");
+        (node.node_name().to_string(), node.creation())
+    };
+    let our_node = make_atom(atoms.intern(&node_name));
+    let to = make_external_pid(
+        &mut heap,
+        our_node,
+        pid.number() as u32,
+        pid.serial() as u32,
+        creation,
+    )
+    .expect("the addressed pid");
+    let name = make_atom(atoms.intern("init"));
+    let empty = make_small(0);
+    let peer_pid = make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION)
+        .expect("the peer's pid");
+
+    let dispatched = make_small(1010);
+    let queued_behind = make_small(2020);
+    let on_the_other_link = make_small(3030);
+
+    // 1. A real remote link is recorded (`DOP_LINK` is route-free), and the message
+    // queued behind it is delivered.
+    first
+        .send_control(Dop::Link, &[peer_pid, to], &atoms)
+        .expect("queue the peer's link");
+    first
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, dispatched], &atoms)
+        .expect("queue the message behind the link");
+    drive_until(
+        &mut rt,
+        &mut first_stream,
+        &mut first,
+        "record the peer's link and deliver the message behind it",
+        |rt| only_message(rt, pid) == Some(dispatched),
+    );
+    assert_eq!(
+        rt.processes().remote_links(pid).len(),
+        1,
+        "the peer's `DOP_LINK` was recorded as a remote link"
+    );
+
+    // 2. `{DOP_UNLINK_ID, 0, From, To}` — the zero id is `invalid_message`: the control
+    // is refused before the sink, so nothing is delivered (not even the message queued
+    // behind it) and the link is retired with the reason recorded.
+    first
+        .send_control(Dop::UnlinkId, &[make_small(0), peer_pid, to], &atoms)
+        .expect("queue the zero-id unlink");
+    first
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, queued_behind], &atoms)
+        .expect("queue a message behind the refused control");
+    drive_until(
+        &mut rt,
+        &mut first_stream,
+        &mut first,
+        "retire the link that carried a zero-id unlink",
+        |rt| {
+            rt.dist_node()
+                .expect("a configured node")
+                .last_link_error()
+                .is_some()
+        },
+    );
+
+    // 3. The retirement is recorded, never raised: a further pass still succeeds.
+    rt.run_one_slice().expect("a scheduler pass after the retirement");
+    let (error, links) = {
+        let node = rt.dist_node().expect("a configured node");
+        (
+            node.last_link_error()
+                .expect("the refusal is recorded")
+                .to_string(),
+            node.connections().len(),
+        )
+    };
+    assert!(
+        error.contains(PEER_NODE_NAME) && error.contains("badarg"),
+        "the retirement records the invalid-message `BadArg` for the peer: {error}"
+    );
+    assert_eq!(links, 1, "exactly the offending link was retired");
+
+    // 4. Nothing was delivered and nothing else was touched: the addressed process is
+    // still alive, its recorded remote link is still there (a sink that ran would have
+    // removed it), and the mailbox holds only the message dispatched *before* the
+    // refusal.
+    assert!(
+        rt.processes().contains(pid),
+        "the surviving link keeps the peer's node alive, so the retirement is not a node down"
+    );
+    assert_eq!(
+        rt.processes().remote_links(pid).len(),
+        1,
+        "the refused unlink never reached the sink: the recorded remote link survives"
+    );
+    assert_eq!(
+        only_message(&rt, pid),
+        Some(dispatched),
+        "the record removal and the message queued behind the refusal were both dropped"
+    );
+
+    // 5. The other link still carries traffic.
+    second
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, on_the_other_link], &atoms)
+        .expect("queue a message on the surviving link");
+    let deadline = Instant::now() + LIVE_TIMEOUT;
+    loop {
+        round(&mut second_stream, &mut second);
+        rt.run_one_slice().expect("a scheduler pass");
+        if mailbox_len(&rt, pid) == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the surviving link never delivered its message within {LIVE_TIMEOUT:?}"
+        );
+        std::thread::sleep(POLL_SLEEP);
+    }
+    let payloads: Vec<Eterm> = rt
+        .processes()
+        .get(pid)
+        .expect("the addressed process")
+        .mailbox()
+        .iter()
+        .map(|message| message.payload())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![dispatched, on_the_other_link],
+        "the surviving link delivers normally, and nothing from the refused link does"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (7) The routing table, driven **per family** through the public sink
 // ---------------------------------------------------------------------------
@@ -1648,10 +1809,16 @@ fn an_out_of_contract_signal_is_unsupported_not_substituted() {
     );
 }
 
-/// The OTP-26+ unlink-id handshake: `id == 0` owes no ack and is `Delivered` (the link
-/// record is dropped); `id != 0` drops the record too but owes a `DOP_UNLINK_ID_ACK` the
-/// sink cannot emit, so it reports the wire half `Unsupported`; the `_ACK` form consumes
-/// an ack and is `Delivered`.
+/// The OTP-26+ unlink-id handshake, driven through the **unchecked** sink view: a
+/// zero-id `DOP_UNLINK_ID` drops the link record and answers `Delivered` (no ack is
+/// owed here); a non-zero id drops the record too but owes a `DOP_UNLINK_ID_ACK` the
+/// sink cannot emit, so it reports the wire half `Unsupported`; the `_ACK` form
+/// consumes an ack and is `Delivered`.
+///
+/// A zero id is **not** the wire form of anything — `dist.c:2291-2295` rejects it as
+/// `invalid_message`, which `beam_dist`'s `Delivery::classify_validated` reproduces, so
+/// on the checked path it retires the link before this sink is reached (pinned by
+/// [`a_zero_id_inbound_unlink_id_is_refused_and_retires_only_its_link`]).
 #[test]
 fn an_inbound_unlink_id_without_an_ack_is_delivered_and_one_owing_an_ack_is_unsupported() {
     let mut fixture = Fixture::new();
@@ -1664,8 +1831,9 @@ fn an_inbound_unlink_id_without_an_ack_is_delivered_and_one_owing_an_ack_is_unsu
         to: pid.to_eterm(),
     };
 
-    // `Id == 0`: the C's `reply_dist_unlink_ack` sends nothing (`erl_proc_sig_queue.c:2753-2760`),
-    // so the unlink completes locally and is `Delivered`; the record is dropped.
+    // `Id == 0` on this unchecked view: the record is dropped and nothing is owed back
+    // (the C's `reply_dist_unlink_ack` would send nothing for it,
+    // `erl_proc_sig_queue.c:2753-2760` — the wire never carries the form at all).
     assert_eq!(
         route(&mut fixture.table, node, &link),
         DeliveryOutcome::Delivered

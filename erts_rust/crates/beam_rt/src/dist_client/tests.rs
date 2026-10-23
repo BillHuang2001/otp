@@ -35,7 +35,8 @@ use beam_common::BeamError;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::flags::DFLAG_PUBLISHED;
 use beam_dist::{
-    preferred_flags, publish_flag, Delivery, DistFlags, Dop, StepOutcome, UnsupportedSink,
+    preferred_flags, publish_flag, Delivery, DeliveryOutcome, DistFlags, Dop, InboundSink,
+    StepOutcome, UnsupportedSink,
 };
 use beam_process::{
     DistSignal, MonitorKind, ProcessId, RefAllocator, RemotePid, RemoteRef, RemoteWatcherRef,
@@ -968,5 +969,79 @@ fn a_retirement_that_had_established_records_its_peer_as_lost() {
         *lost.borrow(),
         vec!["peer@localhost".to_string()],
         "a link that had established is a peer whose node went down"
+    );
+}
+/// A sink that **counts** what it is asked to deliver and answers `Delivered` to
+/// everything — the witness a refused control message never reached the sink at all.
+#[derive(Default)]
+struct CountingSink {
+    /// How many deliveries the sink was asked to route.
+    delivered: usize,
+}
+
+impl InboundSink for CountingSink {
+    fn deliver(&mut self, _delivery: &Delivery) -> beam_common::Result<DeliveryOutcome> {
+        self.delivered += 1;
+        Ok(DeliveryOutcome::Delivered)
+    }
+}
+
+/// A **zero-id** inbound `DOP_UNLINK_ID` is the same **wire error** on the connecting
+/// half as on the accepting one: an id that is not a non-zero unsigned integer is the
+/// C's `invalid_message` (`dist.c:2291-2295`), which `Delivery::classify_validated`
+/// reproduces, so the control never reaches the sink. The drain retires **that one**
+/// link and records why in [`DistClient::last_error`] — it is never raised out of
+/// [`DistClient::dispatch_inbound`], and the well-formed control that arrived ahead of
+/// it in the same drain is still delivered.
+#[test]
+fn a_zero_id_inbound_unlink_id_retires_only_the_connecting_link() {
+    let (client, mut driver, mut stream, mut atoms) = loopback("cook", 7);
+    drive(&client, &mut driver, &mut stream, &mut atoms);
+    assert!(client.is_connected("peer@localhost"), "the handshake completed");
+
+    let peer_node = atom_term(atoms.intern("peer@localhost"));
+    let our_node = atom_term(atoms.intern("client@localhost"));
+    let mut heap = TestHeap::new(1 << 13).expect("the peer's arena");
+    let peer_pid = make_external_pid(&mut heap, peer_node, 3, 0, 7).expect("the peer's pid");
+    let to = make_external_pid(&mut heap, our_node, 1, 0, 7).expect("a local pid");
+    let name = atom_term(atoms.intern("sink"));
+    let empty = make_small(0);
+
+    // A well-formed control, then the zero-id unlink: one drain reads both, and only the
+    // first may be delivered.
+    driver
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, make_small(11)], &atoms)
+        .expect("queue the well-formed reg_send");
+    driver
+        .send_control(Dop::UnlinkId, &[make_small(0), peer_pid, to], &atoms)
+        .expect("queue the zero-id unlink");
+    let bytes = driver.take_output();
+    stream.write_all(&bytes).expect("peer write");
+    stream.flush().expect("peer flush");
+
+    let mut sink = CountingSink::default();
+    for _ in 0..200 {
+        client.pump(&mut atoms).expect("the client pump");
+        // The retirement is recorded, never raised: this is `Ok` on every pass.
+        client
+            .dispatch_inbound(&mut atoms, &mut sink)
+            .expect("a refused control message never fails the inbound drain");
+        if !client.has_links() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !client.has_links() && !client.is_connected("peer@localhost"),
+        "the link that carried the zero-id unlink is retired"
+    );
+    let error = client.last_error().expect("the retirement is recorded");
+    assert!(
+        error.contains("peer@localhost") && error.contains("badarg"),
+        "the retirement records the invalid-message `BadArg` for the peer: {error}"
+    );
+    assert_eq!(
+        sink.delivered, 1,
+        "the well-formed control was delivered; the refused one never reached the sink"
     );
 }
