@@ -878,6 +878,38 @@ pub struct Runtime {
     /// `entry`/`get_mut`/`remove`d (never iterated), so they probe with the crate's own
     /// [`FastHashMap`] over [`crate::hasher`], like [`Runtime::mailboxes`].
     pub(crate) monitor_nodes: FastHashMap<ProcessId, FastHashMap<u64, u64>>,
+    /// The spawning process of each pid — the C's `p->parent` PCB field, which
+    /// `erlang:process_info(Pid, parent)` reports (`erl_bif_info.c:2300-2304`).
+    ///
+    /// `beam_process::ProcessFlags` carries no such store, so — like
+    /// [`Runtime::group_leaders`] — the runtime keeps it in its own per-pid map, written by the
+    /// two spawn paths ([`Runtime::spawn_process_with_policy`],
+    /// [`Runtime::spawn_fun_process_with_policy`]). A pid with no recorded spawner reports this
+    /// runtime's root pid ([`Runtime::self_pid`]) — the stand-in for `init`, which is exactly
+    /// what a `-eval`/`-s`/`-run` process's parent is on the oracle, and what every other
+    /// process this runtime created was spawned by.
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `insert`ed/`get`ed, so it probes with the
+    /// crate's own [`FastHashMap`] over [`crate::hasher`].
+    pub(crate) parents: FastHashMap<ProcessId, ProcessId>,
+    /// The armed `process_flag(save_calls, N)` ring of each process — the C's
+    /// `ERTS_PROC_GET_SAVED_CALLS_BUF(p)` (`erl_process.h:2393`) and the store behind
+    /// `erlang:process_info(Pid, last_calls)`.
+    ///
+    /// A pid **absent** from this map has no buffer armed, which the item renders as the bare
+    /// `false`; that absence is also the recording sites' fast path
+    /// ([`Runtime::record_saved_call`] is one absent probe and no allocation when nothing was
+    /// ever armed). `process_flag(save_calls, 0)` removes the entry, `N > 0` installs a fresh
+    /// empty ring of `N` slots (the C allocates a new zeroed buffer).
+    ///
+    /// The ring holds **owned** names (`String`s), never terms: the item is queryable for
+    /// **another** pid, so an entry can outlive the recording process's heap — the owned-copy
+    /// rule for anything crossing a heap boundary.
+    ///
+    /// Keyed by the whole [`ProcessId`] and only ever `get_mut`/`insert`/`remove`d, so it
+    /// probes with the crate's own [`FastHashMap`] over [`crate::hasher`].
+    pub(crate) saved_calls:
+        FastHashMap<ProcessId, crate::native::memory::last_calls::SavedCalls>,
     /// The `erlang:monitor_node/2` subscriptions of every process — the C's
     /// `ERTS_MON_TYPE_NODE` monitor chain, the `bif.tab` BIF's own store.
     ///
@@ -1544,6 +1576,8 @@ impl Runtime {
             max_heap_set: FastHashSet::default(),
             max_heap_kill: FastHashSet::default(),
             monitor_nodes: FastHashMap::default(),
+            parents: FastHashMap::default(),
+            saved_calls: FastHashMap::default(),
             node_monitors: FastHashMap::default(),
             eval_closures: Vec::new(),
             eval_compiled: FastHashMap::default(),
@@ -3313,6 +3347,70 @@ impl Runtime {
         }
     }
 
+    /// `pid`'s recorded spawner, or this runtime's root pid when none was recorded — the
+    /// `parent` item (see [`Runtime::parents`]).
+    pub(crate) fn parent_of(&self, pid: ProcessId) -> ProcessId {
+        self.parents.get(&pid).copied().unwrap_or(self.self_pid)
+    }
+
+    /// `pid`'s armed `save_calls` ring, or `None` while no buffer is armed (see
+    /// [`Runtime::saved_calls`]).
+    pub(crate) fn saved_calls(
+        &self,
+        pid: ProcessId,
+    ) -> Option<&crate::native::memory::last_calls::SavedCalls> {
+        self.saved_calls.get(&pid)
+    }
+
+    /// Arms (or re-arms) `pid`'s `save_calls` ring with `capacity` slots, or removes it when
+    /// `capacity` is `0` — the C's `ERTS_PROC_SET_SAVED_CALLS_BUF` in `process_flag/2`
+    /// (`bif.c:1902-1935`). A re-arm always starts **empty**: the C installs a brand-new zeroed
+    /// buffer.
+    pub(crate) fn arm_saved_calls(&mut self, pid: ProcessId, capacity: u16) {
+        if capacity == 0 {
+            self.saved_calls.remove(&pid);
+            return;
+        }
+        match self.saved_calls.get_mut(&pid) {
+            Some(ring) => ring.rearm(capacity),
+            None => {
+                self.saved_calls.insert(
+                    pid,
+                    crate::native::memory::last_calls::SavedCalls::new(capacity),
+                );
+            }
+        }
+    }
+
+    /// Records a `{module, function, arity}` call in `pid`'s `save_calls` ring, if one is armed
+    /// — the C's `save_calls(p, e)` (`erl_trace.c:1409-1423`).
+    ///
+    /// The one hot-path cost when nothing is armed is the absent map probe; nothing is
+    /// allocated and no atom is interned.
+    pub(crate) fn record_saved_call(
+        &mut self,
+        pid: ProcessId,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) {
+        if let Some(ring) = self.saved_calls.get_mut(&pid) {
+            ring.push_mfa(module, function, arity);
+        }
+    }
+
+    /// Records one of the three bare-atom pseudo entries (`send`/`'receive'`/`timeout`) in
+    /// `pid`'s `save_calls` ring, if one is armed.
+    pub(crate) fn record_saved_pseudo(
+        &mut self,
+        pid: ProcessId,
+        entry: crate::native::memory::last_calls::SavedEntry,
+    ) {
+        if let Some(ring) = self.saved_calls.get_mut(&pid) {
+            ring.push_pseudo(entry);
+        }
+    }
+
     /// Whether `pid` carries an **explicitly set** `max_heap_size` — the provenance bit behind
     /// [`Runtime::max_heap_set`]. The setting's value is the process's own
     /// ([`Process::max_heap_size`](beam_process::Process::max_heap_size)); a pid absent from the
@@ -4144,6 +4242,9 @@ impl Runtime {
         // path only runs over the runtime's own table — i.e. as the runtime's root process —
         // so the parent is `self_pid` (see `RuntimeContext::owns_process_table`).
         self.inherit_group_leader(self.self_pid, pid);
+        // The C's `p->parent` (`erl_process.c`): the spawning process, which is what
+        // `process_info(Child, parent)` reports (see [`Runtime::parents`]).
+        self.parents.insert(pid, self.self_pid);
         // The child's first root set is the argument list below; open its descent gate when
         // any argument is a container (see [`Runtime::note_spawn_foreign_roots`]).
         self.note_spawn_foreign_roots(pid, &args, None);
@@ -4326,6 +4427,8 @@ impl Runtime {
         }
         // As `spawn_process_with_policy`: the child inherits the root process's group leader.
         self.inherit_group_leader(self.self_pid, pid);
+        // As `spawn_process_with_policy`: the recorded parent (see [`Runtime::parents`]).
+        self.parents.insert(pid, self.self_pid);
         // As `spawn_process_with_policy`, for the fun's own environment as well as the
         // arguments (see [`Runtime::note_spawn_foreign_roots`]).
         self.note_spawn_foreign_roots(pid, &args, Some(fun));

@@ -100,3 +100,20 @@ The dispatch-level pin is `tests.rs::registered_name_is_the_queried_processes_na
 - `../process/CONTEXT.md` → the process-control families (the `max_heap_size` setter side, `garbage_collect`).
 - `../../../../../../erts/emulator/beam/erl_bif_info.c` → `pi_1_keys[]`, `process_info_2`'s forms and the `always_wrap`/nil-skip rules (read-only ground truth).
 - `../../../M1_GAPS.md` *`process_info/1,2`* → the divergence ledger.
+
+## Known Issues
+- `garbage_collection_info` answers three honest `0`s: `mbuf_size` (this runtime's message queue is a
+  heap-resident Rust FIFO, not an on-heap `mbuf` block), `recent_size` (the collector keeps no
+  high-water mark), and `bin_old_vheap_size` (one bin vheap per process, no old generation for it).
+  `bin_vheap_block_size`/`bin_old_vheap_block_size` are the heap policy's `min_bin_vheap_words`, the
+  block size the off-heap reclaimer is installed with (`p->bin_vheap_sz`/`p->bin_old_vheap_sz` in the C).
+- `last_calls` records `{M,F,A}` for every `call_ext*` (both execution tiers, via
+  `RuntimeContext::resolve_external_call`), plus the `'receive'`/`timeout` pseudo entries from the
+  mailbox seam. The `send` pseudo entry is **not** recorded yet: this runtime's send funnel
+  (`crate::context::send::classify_send_destination`) decides the destination from `&Runtime`, so no
+  mutable runtime is in hand at the point the C calls `save_calls(p, &exp_send)`. An explicit
+  `erlang:send/2` still appears as its own `{erlang,send,2}` triple (it is a `call_ext`).
+- `backtrace` remains the only `process_info/2` item in `UNSUPPORTED_ITEMS`.
+- `parent` reports this runtime's root pid for a process with no recorded spawner (the `-eval`/`-s`/`-run`
+  process and anything spawned through a path that does not record one) — the stand-in for `init`, the
+  same divergence class as `group_leader`.

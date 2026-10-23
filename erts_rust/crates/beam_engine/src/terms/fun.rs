@@ -297,6 +297,22 @@ pub fn fun_free<'a>(t: Eterm) -> Result<&'a [Eterm]> {
     unsafe { beam_term::fun::fun_env(t) }.map_err(BeamError::from)
 }
 
+/// The `(uniq, index)` **lambda identity** of a fun term, for a fun that names a
+/// compiled lambda; a non-fun — or an external (`EXPORT_EXT`) fun, which names an
+/// `M:F/A` rather than a lambda entry — yields [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_local_key`] (the layout owner). The pair is
+/// the same for both encodings of one lambda: a `make_fun3` closure carries it in
+/// descriptor words 1/2, and a `NEW_FUN_EXT` image carries the defining module's
+/// `FunT` entry's `old_uniq`/`index` in descriptor words 6/4 — which is why a
+/// host resolves both kinds with one lookup (`beam_rt`'s `local_fun_target` /
+/// `imported_fun_target`).
+pub fn fun_local_key(t: Eterm) -> Result<(u64, u32)> {
+    // SAFETY: `t` must be a live fun term (the caller's contract); `fun_local_key`
+    // re-checks the fun subtag and the kind before reading any descriptor word.
+    unsafe { beam_term::fun::fun_local_key(t) }.map_err(BeamError::from)
+}
+
 /// The raw header word of a fun term, or [`BeamError::BadArg`] if `t` is not a fun.
 ///
 /// The type check [`fun_arity`]/[`fun_num_free`] share before forwarding the header

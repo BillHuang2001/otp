@@ -81,6 +81,7 @@
 use beam_term::prelude::*;
 
 use super::iter::LeafIter;
+use crate::stats::TreeStats;
 use super::node::{
     child_index, search_entries, trim_vec, Entry, Node, NodeId, NodeStore, MIN_OCCUPANCY, ORDER,
 };
@@ -830,6 +831,46 @@ impl Tree {
         )
     }
 
+    /// The tree's **node/depth shape** — the interior's own measurement behind
+    /// `ets:info(Tab, stats)` for an `ordered_set`.
+    ///
+    /// One breadth-first walk counts the *routing* (branch) nodes, the *base*
+    /// (leaf) nodes and the largest number of routing levels on any root-to-leaf
+    /// path. They are the K-ary B+-tree's analogues of the catree figures
+    /// (`db_calc_stats_catree`), whose route nodes are its binary branching nodes and
+    /// whose base nodes are the leaves that hold the objects; a root that is itself a
+    /// leaf is depth `0` in both, so an empty tree is `{0, 1, 0}`.
+    ///
+    /// The walk keeps its own queue (never native recursion), so a deep tree cannot
+    /// overflow the stack.
+    pub(crate) fn node_shape(&self) -> TreeStats {
+        let mut route_nodes = 0;
+        let mut base_nodes = 0;
+        let mut max_depth = 0;
+        let mut queue = vec![(self.root, 0usize)];
+        let mut cursor = 0usize;
+        while cursor < queue.len() {
+            let (id, depth) = queue[cursor];
+            cursor += 1;
+            match self.store.node(id) {
+                Node::Leaf(_) => {
+                    base_nodes += 1;
+                    max_depth = max_depth.max(depth);
+                }
+                Node::Branch(branch) => {
+                    route_nodes += 1;
+                    for &child in &branch.children {
+                        queue.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+        TreeStats {
+            route_nodes,
+            base_nodes,
+            max_depth,
+        }
+    }
     /// The number of leaves reachable from the root (test-only): the length of the
     /// leaf chain, which is the denominator of the tree's leaf density.
     #[cfg(test)]

@@ -51,6 +51,7 @@ use beam_term::prelude::*;
 use super::node::{search_entries, words_of, Entry};
 use crate::error::badarg;
 use crate::key::key_of;
+use crate::stats::TreeStats;
 use crate::table::Interior;
 
 /// The capacity-to-length ratio past which a removal releases the entry vector's
@@ -286,6 +287,21 @@ impl Interior for SortedOrderedInterior {
     fn memory(&self) -> usize {
         // The honest entry-vector count, not the `Interior` default of 0.
         SortedOrderedInterior::memory(self)
+    }
+
+    /// This interior's own **node/depth shape** for `ets:info(Tab, stats)`.
+    ///
+    /// A sorted entry run is a *single* node: it holds every object and routes
+    /// nowhere, so the figures are the ones a one-node tree has — no routing nodes,
+    /// one base node, depth `0`. That is a real measurement of this representation
+    /// (its whole point is that it has no node structure), not a copy of the
+    /// B+-tree's shape and not the oracle's catree figures.
+    fn node_shape(&self) -> Option<TreeStats> {
+        Some(TreeStats {
+            route_nodes: 0,
+            base_nodes: 1,
+            max_depth: 0,
+        })
     }
 
     fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {

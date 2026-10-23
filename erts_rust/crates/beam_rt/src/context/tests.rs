@@ -29,7 +29,8 @@ use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, A
 use super::*;
 use crate::config::RuntimeConfig;
 use crate::context::test_support::{
-    compile_fixtures, find_on_path, resolve_erlc, skip_loudly,
+    compile_fixtures, find_on_path, resolve_erlc, resolve_oracle, run_oracle_probe_exact,
+    skip_loudly,
 };
 use crate::native::test_support::remote_pid;
 use crate::runtime::GcStatsSnapshot;
@@ -9429,3 +9430,422 @@ fn a_fun_applying_fast_path_suspends_the_scheduled_process_instead_of_blocking()
         "the value the resumed fun received from the child"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// A `NEW_FUN_EXT`-decoded closure is the wire image of a `make_fun3` lambda — and callable
+// ---------------------------------------------------------------------------------------
+//
+// `binary_to_term(term_to_binary(F))` produces a [`beam_codec::FunKind::Imported`] fun whose
+// `(old_uniq, index)` pair is the very identity a `make_fun3` closure carries in its own
+// descriptor words, so one resolution path must serve both encodings (the C's `call_fun`
+// cannot tell them apart either: it dispatches whatever `funp->entry` names,
+// `erts/emulator/beam/beam_common.c:1604-1621`). The suites below pin the three shapes
+// (zero captures, one captured free variable, two arguments), the `lists:map/2` route, the
+// identity invariants that already agreed, the seam's own answer, and the honest refusals.
+
+/// The fixture: one lambda per shape — **zero captures**, **one captured free variable** and
+/// **two arguments** — each encoded, decoded and then applied **inside one body** (the round
+/// trip a decoded closure takes), plus the raw image of the zero-capture lambda for the
+/// Rust-side decode, a whole-list application through `lists:map/2`, the two identity
+/// queries, and one function returning all of them (the oracle-comparable container).
+const DFUN_SRC: &str = "\
+-module(dfun).
+-export([all/0, go/0, go1/0, go2/0, go_map/0, img0/0, info/0]).
+
+go()  -> F = fun(X) -> X + 1 end, G = binary_to_term(term_to_binary(F)), G(41).
+go1() -> N = 100, F = fun(X) -> X + N end, G = binary_to_term(term_to_binary(F)), G(41).
+go2() -> F = fun(X, Y) -> X * Y end, G = binary_to_term(term_to_binary(F)), G(6, 7).
+go_map() ->
+    F = fun(X) -> X + 1 end,
+    G = binary_to_term(term_to_binary(F)),
+    lists:map(G, [1, 2, 3]).
+img0() -> term_to_binary(fun(X) -> X + 1 end).
+info() ->
+    F = binary_to_term(term_to_binary(fun(X) -> X + 1 end)),
+    {erlang:is_function(F, 1), erlang:fun_info(F, arity), erlang:fun_info(F, type)}.
+all() -> {go(), go1(), go2(), go_map(), info()}.
+";
+
+/// `dfun:<function>/0`'s `term_to_binary/1` image, read back **through the registry**
+/// (`erlang:byte_size/1` + `binary:at/2`, this crate's only safe way to read a binary's
+/// storage), with the fixture's directory added to the code path so the on-demand load
+/// resolves it.
+fn dfun_image(rt: &mut Runtime, dir: &std::path::Path, function: &str) -> Vec<u8> {
+    rt.add_code_path(dir);
+    let mut ctx = RuntimeContext::new(rt);
+    let image = ctx
+        .call_bif("dfun", function, 0, &[])
+        .unwrap_or_else(|e| panic!("dfun:{function}/0 must encode the closure: {e:?}"));
+    registry_bytes(&mut ctx, image)
+}
+
+/// Decodes a `term_to_binary/1` image onto `heap`, interning its atoms into the runtime's
+/// **shared** table — the fun's `module` atom must resolve by name through that table for
+/// [`RuntimeContext::imported_fun_target`] to find the defining module.
+fn decode_fun_image(rt: &mut Runtime, heap: &mut beam_alloc::Heap, image: &[u8]) -> Eterm {
+    let mut decoder = beam_codec::Decoder::new(image).expect("a `VERSION_MAGIC` (131) image");
+    decoder
+        .decode(heap, rt.code_server.atoms_mut())
+        .expect("the `NEW_FUN_EXT` image decodes")
+}
+
+/// The module's `FunT` entry that a fun term's `(uniq, index)` lambda identity names — i.e.
+/// the descriptor [`RuntimeContext::imported_fun_target`] resolves through.
+fn lambda_descriptor(module: &Module, fun: Eterm) -> beam_loader::FunDescriptor {
+    let (uniq, index) = terms::fun_local_key(fun).expect("a fun naming a compiled lambda");
+    *module
+        .funs()
+        .iter()
+        .find(|entry| u64::from(entry.uniq) == uniq && entry.index == index)
+        .unwrap_or_else(|| panic!("no `FunT` entry of the module carries (uniq {uniq}, index {index})"))
+}
+
+/// **A decoded closure runs on a scheduled process, for every capture shape.**
+///
+/// `dfun:go/0`, `go1/0`, `go2/0` and `go_map/0` each build a closure, encode it with
+/// `term_to_binary/1`, decode the resulting `NEW_FUN_EXT` image and **apply it** — zero
+/// captures (`X + 1`), one captured free variable (`N = 100`, `X + N`) and two arguments
+/// (`X * Y`), plus the whole-list `lists:map/2` application — so the whole
+/// decode → resolve → enter path runs inside a real process on the run queue
+/// ([`Runtime::run_scheduled`], the scheduler-slice context whose `may_pump_scheduler()` is
+/// `false`).
+///
+/// The oracle's values are the whole assertion: `42`, `141`, `42` and `[2,3,4]`. A closure
+/// that lost its captured environment would answer `42` for `go1/0`; a wrong label or arity
+/// would raise. Skips **loudly** without `erl`/`erlc`.
+#[test]
+fn a_new_fun_ext_decoded_closure_runs_on_a_scheduled_process() {
+    if std::env::var_os("ERTS_STDLIB_DIR").is_none() && find_on_path("erl").is_none() {
+        skip_loudly(
+            "new_fun_ext apply",
+            "no `erl` on $PATH and no $ERTS_STDLIB_DIR",
+        );
+        return;
+    }
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "new_fun_ext apply",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "new_fun_ext_scheduled", &[("dfun", DFUN_SRC)]);
+    let beam = dir.path().join("dfun.beam");
+
+    let mut rt = runtime();
+    rt.add_code_path(dir.path());
+    for (function, expected) in [("go", 42), ("go1", 141), ("go2", 42)] {
+        let value = rt
+            .run_scheduled(&beam, function, 0, &[])
+            .unwrap_or_else(|e| {
+                panic!("dfun:{function}/0 must apply the decoded closure: {e:?}")
+            });
+        assert_eq!(
+            signed_value(value),
+            expected,
+            "dfun:{function}/0's decoded closure"
+        );
+    }
+    let mapped = rt
+        .run_scheduled(&beam, "go_map", 0, &[])
+        .expect("dfun:go_map/0 must drive the decoded closure through `lists:map/2`");
+    let elements = terms::list_elements(mapped).expect("`lists:map/2` answers a list");
+    assert_eq!(
+        elements.iter().map(|e| signed_value(*e)).collect::<Vec<_>>(),
+        vec![2, 3, 4],
+        "the decoded closure ran once per element, with its own captured state"
+    );
+}
+
+/// **The decoded closures, and the identity they report, agree with the oracle.**
+///
+/// One fixture container (`dfun:all/0`) holds the three applied-decoded-closure values, the
+/// `lists:map/2` result and the two identity queries on a decoded fun
+/// (`erlang:is_function/2` and `erlang:fun_info/1`'s `arity`/`type`), rendered with `~w` on
+/// both sides — this runtime's [`Runtime::format_term_w`] against
+/// `io:format("~w~n", [dfun:all()])` under the system `erl`. The oracle's render must be
+/// `{42,141,42,[2,3,4],{true,{arity,1},{type,local}}}`; the literal check keeps the
+/// comparison from being vacuously satisfied by two equal garbage renders. Skips
+/// **loudly** without `erl`/`erlc`.
+#[test]
+fn the_decoded_closures_and_their_identity_agree_with_the_oracle() {
+    let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+        skip_loudly("new_fun_ext apply", "no usable `erl` and/or `erlc`");
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "new_fun_ext_oracle", &[("dfun", DFUN_SRC)]);
+    let lines = run_oracle_probe_exact(&oracle, dir.path(), "io:format(\"~w~n\", [dfun:all()])");
+    assert_eq!(
+        lines.len(),
+        1,
+        "the oracle must print one container, got {lines:?}"
+    );
+    let expected = &lines[0];
+    assert!(
+        expected.contains("42,141,42,[2,3,4]")
+            && expected.contains("{true,{arity,1},{type,local}}"),
+        "the oracle's container must carry the decoded closures' values and the identity \
+         items, got {expected}"
+    );
+
+    let mut rt = runtime();
+    let result = rt
+        .run_function(dir.path().join("dfun.beam"), "all", 0, &[])
+        .unwrap_or_else(|e| panic!("dfun:all/0 must run: {e:?}"));
+    let printed = rt
+        .format_term_w(result, None)
+        .unwrap_or_else(|e| panic!("dfun:all/0's result must print: {e:?}"));
+    assert_eq!(
+        printed.trim_end(),
+        expected,
+        "\n  ours:   {}\n  oracle: {expected}",
+        printed.trim_end()
+    );
+}
+
+/// **A genuinely decoded closure resolves to its lambda's label and applies through both
+/// routes.**
+///
+/// The fun is the `NEW_FUN_EXT` image of `dfun:img0/0`'s `fun(X) -> X + 1 end`, decoded from
+/// the bytes the runtime itself produced (never hand-built), so every claim below is about a
+/// real wire image:
+///
+/// * it is the [`beam_codec::FunKind::Imported`] kind with no captures, and its
+///   `(old_uniq, index)` identity is the `FunT` entry of the loaded `dfun` module — the
+///   lookup [`RuntimeContext::imported_fun_target`] performs;
+/// * [`ExecutionContext::resolve_local_fun`] answers **that** entry's label and the code
+///   server's own `Arc<Module>`, so the engine can enter the lambda in the caller's machine;
+/// * [`ExecutionContext::apply_fun`] runs the body on a fresh machine and answers `42`;
+/// * the fun-applying BIF route (`lists:map/2` → `FunBridge` → a nested context) answers
+///   `[2,3,4]`, so a decoded closure works wherever a fun is *passed*, not only applied;
+/// * the identity invariants agree: `erlang:is_function(F, 1)` is `true` (and `/2` is
+///   `false`), and `erlang:fun_info/2` reports `arity = 1` and `type = local` (the whole
+///   `/1` list, which is the preloaded `erlang` module's own Erlang function, is covered by
+///   the fixture's `info/0` through the oracle comparison above).
+///
+/// Skips **loudly** without `erlc`.
+#[test]
+fn a_decoded_closure_resolves_to_its_lambda_and_applies_through_both_routes() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "new_fun_ext seam",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "new_fun_ext_seam", &[("dfun", DFUN_SRC)]);
+    let mut rt = runtime();
+    // The atom terms the identity assertions compare against, interned **before** the context
+    // borrows the runtime.
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let arity_atom = rt.intern("arity");
+    let type_atom = rt.intern("type");
+    let local_atom = rt.intern("local");
+
+    let image = dfun_image(&mut rt, dir.path(), "img0");
+    let module = rt
+        .code_server()
+        .module_handle("dfun")
+        .expect("the on-demand load cached the fixture under its own name");
+    let mut heap = beam_alloc::Heap::new(256).expect("a scratch heap");
+    let fun = decode_fun_image(&mut rt, &mut heap, &image);
+    assert_eq!(
+        beam_codec::term::fun_kind_term(fun).expect("a fun term"),
+        beam_codec::FunKind::Imported,
+        "the decoded image is the `NEW_FUN_EXT` kind, not a hand-built local closure"
+    );
+    assert_eq!(
+        beam_codec::term::fun_num_free_term(fun).expect("the `num_free` field"),
+        0,
+        "`fun(X) -> X + 1 end` captures nothing"
+    );
+    let descriptor = lambda_descriptor(&module, fun);
+    assert_eq!(
+        descriptor.arity, 1,
+        "the `FunT` entry the decoded identity names is the one-argument lambda"
+    );
+
+    // A proper `[1,2,3]` on the scratch heap, for the `lists:map/2` run below.
+    let mut list = NIL;
+    for n in [3, 2, 1] {
+        list = heap.cons(make_small(n), list).expect("a cons cell");
+    }
+
+    let args = [make_small(41)];
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let (callee, label) = ctx
+        .resolve_local_fun(fun, &args)
+        .expect("the seam reports a routing, never an error")
+        .expect("a decoded closure has the same in-machine entry a `make_fun3` closure has");
+    assert!(
+        Arc::ptr_eq(&callee, &module),
+        "the seam hands the engine the code server's own module image"
+    );
+    assert_eq!(
+        label, descriptor.label,
+        "the resolved label is the lambda's own `FunT` entry"
+    );
+
+    assert_eq!(
+        ctx.apply_fun(fun, &args)
+            .expect("the decoded closure applies"),
+        make_small(42),
+        "the body ran with the argument the call passed"
+    );
+    let mapped = ctx
+        .call_bif("lists", "map", 2, &[fun, list])
+        .expect("`lists:map/2` applies the decoded closure");
+    let elements = terms::list_elements(mapped).expect("`lists:map/2` answers a list");
+    assert_eq!(
+        elements.iter().map(|e| signed_value(*e)).collect::<Vec<_>>(),
+        vec![2, 3, 4],
+        "the fun-applying BIF route reaches the same lambda"
+    );
+
+    assert_eq!(
+        ctx.call_bif("erlang", "is_function", 2, &[fun, make_small(1)])
+            .expect("erlang:is_function/2"),
+        true_atom,
+        "a decoded closure of arity 1 is a function of arity 1"
+    );
+    assert_eq!(
+        ctx.call_bif("erlang", "is_function", 2, &[fun, make_small(2)])
+            .expect("erlang:is_function/2"),
+        false_atom,
+        "…and not one of arity 2"
+    );
+    // `erlang:fun_info/2` is the declared `bif.tab` key (`/1` is the preloaded `erlang`
+    // module's own Erlang function, so it needs a booted runtime — the fixture's `info/0`
+    // covers it through the oracle comparison above).
+    let arity = ctx
+        .call_bif("erlang", "fun_info", 2, &[fun, arity_atom])
+        .expect("erlang:fun_info(F, arity)");
+    assert_eq!(
+        terms::tuple_element(arity, 0).expect("the item's key"),
+        arity_atom
+    );
+    assert_eq!(
+        terms::tuple_element(arity, 1).expect("the item's value"),
+        make_small(1),
+        "a decoded closure of arity 1 reports `{{arity, 1}}`"
+    );
+    let kind = ctx
+        .call_bif("erlang", "fun_info", 2, &[fun, type_atom])
+        .expect("erlang:fun_info(F, type)");
+    assert_eq!(
+        terms::tuple_element(kind, 1).expect("the item's value"),
+        local_atom,
+        "a decoded `NEW_FUN_EXT` closure is a `local` fun, exactly as the oracle reports"
+    );
+}
+
+/// **An imported fun whose identity names no lambda of its module is the typed `badarg`.**
+///
+/// Two wire images that differ from a genuinely resolvable one in exactly one identity
+/// field, both built with [`beam_codec::term::make_fun_imported`] over the loaded `dfun`
+/// module's own atoms and 16-byte `uniq`:
+///
+/// * an `index` no `FunT` entry carries (`index + 7`) — the descriptor lookup fails;
+/// * a 16-byte `uniq` with **one flipped byte** — the C's `fun_cmp` compares the module's
+///   checksum, so a stale image must not bind to a recompiled module's lambda
+///   (`erts/emulator/beam/erl_fun.c::fun_cmp`).
+///
+/// Both answer [`BeamError::BadArg`] on every entry point that resolves an imported closure
+/// ([`RuntimeContext::imported_fun_target`], the engine's
+/// [`ExecutionContext::resolve_local_fun`] seam and [`ExecutionContext::apply_fun`]).
+///
+/// **Honest residual, pinned here rather than hidden:** for an *imported* closure over a
+/// module that **is** loaded and simply names no lambda, the oracle raises
+/// `{error,{badfun,F}}` (C's `call_fun`, `beam_common.c:1700-1707`; measured
+/// `{error,badfun}` on OTP 29.1.1) where this runtime answers the typed `badarg` — its
+/// fun-apply seams cannot yet distinguish "no such lambda" from "the host cannot run this
+/// fun in-machine", and fabricating an entry is not an option. Closing it needs a seam
+/// answer with that third outcome.
+#[test]
+fn an_imported_fun_naming_no_lambda_is_the_typed_badarg() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "new_fun_ext seam",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(&erlc, "new_fun_ext_negative", &[("dfun", DFUN_SRC)]);
+    let mut rt = runtime();
+    rt.load_module(dir.path().join("dfun.beam"))
+        .expect("the fixture loads into the code server");
+    let module = rt
+        .code_server()
+        .module_handle("dfun")
+        .expect("the fixture is cached under its own name");
+    let checksum = module.checksum();
+    // The lambda a *genuine* image names: `fun(X) -> X + 1 end` from `dfun:img0/0`.
+    let image = dfun_image(&mut rt, dir.path(), "img0");
+    let mut heap = beam_alloc::Heap::new(256).expect("a scratch heap");
+    let genuine = decode_fun_image(&mut rt, &mut heap, &image);
+    let descriptor = lambda_descriptor(&module, genuine);
+
+    let module_atom = atom_val(rt.intern("dfun"));
+    let creator = beam_codec::term::FunPid {
+        node: atom_val(rt.intern("nonode@nohost")),
+        number: 0,
+        serial: 0,
+        creation: 0,
+    };
+    let mut flipped = checksum;
+    flipped[0] ^= 0x01;
+    let no_such_lambda = beam_codec::term::make_fun_imported(
+        &mut heap,
+        1,
+        module_atom,
+        &checksum,
+        descriptor.index + 7,
+        descriptor.index,
+        descriptor.uniq,
+        creator,
+        &[],
+    )
+    .expect("the wire image builds");
+    let stale_module = beam_codec::term::make_fun_imported(
+        &mut heap,
+        1,
+        module_atom,
+        &flipped,
+        descriptor.index,
+        descriptor.index,
+        descriptor.uniq,
+        creator,
+        &[],
+    )
+    .expect("the wire image builds");
+
+    let args = [make_small(1)];
+    let mut ctx = RuntimeContext::new(&mut rt);
+    for (name, fun) in [
+        ("an index no lambda carries", no_such_lambda),
+        ("a flipped `uniq` byte", stale_module),
+    ] {
+        assert!(
+            matches!(ctx.imported_fun_target(fun, &args), Err(BeamError::BadArg)),
+            "{name} must not resolve to an entry"
+        );
+        assert!(
+            matches!(ctx.resolve_local_fun(fun, &args), Err(BeamError::BadArg)),
+            "{name} must not enter an in-machine label"
+        );
+        assert!(
+            matches!(ctx.apply_fun(fun, &args), Err(BeamError::BadArg)),
+            "{name} must not be applied"
+        );
+    }
+    // The control: the same construction with the genuine identity **does** resolve, so the two
+    // refusals above are the identity guard's and not a broken fixture.
+    assert!(
+        ctx.imported_fun_target(genuine, &args)
+            .expect("the seam reports a routing, never an error")
+            .is_some(),
+        "the genuine image resolves, so only the mutated identity field was refused"
+    );
+}
+

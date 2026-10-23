@@ -59,6 +59,7 @@ use beam_term::prelude::*;
 use crate::error::badarg;
 use crate::key::key_of;
 use crate::kind::TableKind;
+use crate::stats::BucketChains;
 use crate::table::{add_counters, counter_slot, replace_elements, Interior};
 
 mod capacity;
@@ -553,6 +554,30 @@ impl Interior for HashInterior {
 
     fn memory(&self) -> usize {
         self.memory_words()
+    }
+    /// The chained interior's own **bucket occupancy** for
+    /// `ets:info(Tab, stats)`: one chain length per bucket of its bucket array,
+    /// empty buckets included.
+    ///
+    /// A chain length is the number of objects in the bucket — every object of
+    /// every key that hashes there, which is exactly what ERTS's chain counts (it
+    /// holds one `DbTerm` per object, so a `bag` key with three objects is a chain
+    /// of three). `sum(chain_len)` is therefore the table's object count and
+    /// `buckets.len()` the active bucket count; the derived average/deviations are
+    /// the oracle's formulas over **this** array's occupancy
+    /// ([`BucketChains::hash_stats`]).
+    ///
+    /// The bucket *count* is an interior freedom (the crate `CONTEXT.md` §2): this
+    /// array starts at 8 buckets and grows past a 3/4 load factor, where ERTS starts
+    /// at 256 and grows by linear hashing, so the figures never reproduce the
+    /// oracle's numbers — only its shape and their meaning.
+    fn bucket_chains(&self) -> Option<BucketChains> {
+        let mut chains = BucketChains::new();
+        for bucket in &self.buckets {
+            let len = bucket.iter().map(|entry| entry.objs.len()).sum();
+            chains.add_chain(len);
+        }
+        Some(chains)
     }
 
     fn update_counter(

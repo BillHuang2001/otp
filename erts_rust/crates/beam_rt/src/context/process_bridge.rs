@@ -367,6 +367,13 @@ impl ProcessHook for ProcessBridge<'_> {
                     }
                 };
                 process.set_save_calls(next);
+                // The PCB field is the armed *size*; the ring itself lives on the runtime
+                // ([`Runtime::saved_calls`]), keyed by pid, because the call sites that append
+                // to it (`RuntimeContext::resolve_external_call`, the receive seam) hold the
+                // runtime rather than this bridge. Arming installs a fresh empty ring, disarming
+                // removes it — the C's `ERTS_PROC_SET_SAVED_CALLS_BUF` with a new zeroed buffer,
+                // or with `NULL` for a size of 0.
+                self.runtime.arm_saved_calls(pid, next);
                 Ok(Some(beam_term::make_small(i64::from(previous))))
             }
             "error_handler" => {

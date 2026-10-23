@@ -648,6 +648,43 @@ pub unsafe fn fun_old_uniq(t: Eterm) -> TermResult<u32> {
     unsafe { imported_descriptor_word(t, 6) }
 }
 
+/// The `(uniq, index)` **lambda identity** of a fun term that names a compiled
+/// lambda — the pair a host resolves against a loaded module's `FunT` table
+/// (that entry's `old_uniq` and `index` fields, in `beam_loader`'s
+/// `FunDescriptor`), whichever encoding the fun arrived in.
+///
+/// * [`FunKind::Local`] (`make_fun3`) — descriptor words 1 and 2, exactly what
+///   [`write_fun_local`] wrote: the `FunT` entry's `old_uniq` and its `index`.
+/// * [`FunKind::Imported`] (`NEW_FUN_EXT`) — the image's `old_uniq` (word 6) and
+///   `index` (word 4). Both are the *same* per-module values the local form
+///   carries: `beam_asm.erl`'s `finalize_fun_table/2` stamps the 27-bit MD5
+///   prefix into every `FunT` entry's `old_uniq` field, `emu_load.c:645-651`
+///   hands that field and the entry's `index` to `erts_fun_entry_put`, and the
+///   encoder writes both back out (`external.c:3966-3993`). The C entry lookup
+///   key is `(module, index, arity, uniq[16])` (`erl_fun.c::fun_cmp`), so the
+///   `old_uniq`/`index` pair of a `NEW_FUN_EXT` image names the very same
+///   lambda a `make_fun3` closure's `uniq`/`index` words name — which is why
+///   one resolution path serves both kinds.
+///
+/// A [`FunKind::External`] fun names an `M:F/A`, not a lambda entry, so it has
+/// no such pair and yields [`TermError::BadFun`], as does any non-fun.
+///
+/// # Safety
+///
+/// `t` must be a live boxed term; if it is a fun, its whole block must be live.
+pub unsafe fn fun_local_key(t: Eterm) -> TermResult<(u64, u32)> {
+    match term_fun_kind(t)? {
+        // SAFETY: `t` is a live local fun, so descriptor word 1 (the `uniq`) and
+        // word 2 (the `index`) are live and initialised.
+        FunKind::Local => unsafe { Ok((fun_uniq(t)?, fun_index(t)?)) },
+        // SAFETY: `t` is a live imported fun, so descriptor word 6 (`old_uniq`, the
+        // `FunT` entry's identity word) and word 4 (`index`) are live and
+        // initialised.
+        FunKind::Imported => unsafe { Ok((u64::from(fun_old_uniq(t)?), fun_index(t)?)) },
+        FunKind::External => Err(TermError::BadFun),
+    }
+}
+
 /// Descriptor word `word` (1-based after the header) of an **imported** fun, or
 /// [`TermError::BadFun`].
 ///
@@ -1056,8 +1093,72 @@ mod tests {
     }
 
     #[test]
-    fn imported_fun_without_free_variables_is_eleven_words() {
+    fn local_key_names_the_same_lambda_from_either_encoding() {
+        // The `(uniq, index)` identity a host resolves against a module's `FunT`
+        // table. A `make_fun3` closure carries it in words 1/2; a `NEW_FUN_EXT`
+        // image carries the *same* per-module `uniq` (the `FunT` entry's
+        // `old_uniq`, word 6) and `index` (word 4), so one resolution path serves
+        // both. Verified against the encoder: `external.c:3966-3993` writes
+        // `fe->index` and `fe->old_uniq` (`beam_asm.erl`'s `finalize_fun_table/2`
+        // stamps the 27-bit MD5 prefix into every entry's `old_uniq`).
         let a = atoms();
+        let module = a.lookup("module").unwrap();
+        let node = a.lookup("node").unwrap();
+        let uniq_word: u64 = 0x02E1_D2B4; // a 27-bit MD5 prefix, as the C stores it
+        let lambda_index: u32 = 17;
+        let mut heap = Heap::new(64);
+        let p = hp(&mut heap, fun_words(FunKind::Local, 0));
+        // SAFETY: `p` addresses exactly the 3 words of the local block.
+        let local =
+            unsafe { write_fun_local(p, 1, uniq_word, lambda_index, &[]) }.unwrap();
+        let p = hp(&mut heap, fun_words(FunKind::Imported, 0));
+        // SAFETY: `p` addresses exactly the 11 words of the imported block.
+        let imported = unsafe {
+            write_fun_imported(
+                p,
+                1,
+                module,
+                &[0x5Cu8; 16],
+                lambda_index,
+                0,                    // old_index (the `FunT` position)
+                uniq_word as u32,     // old_uniq
+                FunPid {
+                    node,
+                    number: 0,
+                    serial: 0,
+                    creation: 0,
+                },
+                &[],
+            )
+        }
+        .unwrap();
+        let p = hp(&mut heap, fun_words(FunKind::External, 0));
+        // SAFETY: `p` addresses exactly the 4 words of the external block.
+        let external = unsafe { write_fun_external(p, 1, module, node) }.unwrap();
+        // SAFETY: all three terms are live funs the heap owns.
+        unsafe {
+            assert_eq!(
+                fun_local_key(local).unwrap(),
+                (uniq_word, lambda_index),
+                "a local closure's own uniq/index words"
+            );
+            assert_eq!(
+                fun_local_key(imported).unwrap(),
+                (uniq_word, lambda_index),
+                "a NEW_FUN_EXT image names the same lambda through old_uniq/index"
+            );
+            assert_eq!(fun_local_key(external), Err(TermError::BadFun));
+            assert_eq!(fun_local_key(make_small(0)), Err(TermError::BadFun));
+            assert_eq!(fun_local_key(NIL), Err(TermError::BadFun));
+        }
+        let tuple = heap.tuple(&[make_small(1)]).unwrap();
+        // SAFETY: a live boxed non-fun term; the reader tests the subtag first.
+        unsafe {
+            assert_eq!(fun_local_key(tuple), Err(TermError::BadFun));
+        }
+    }
+    #[test]
+    fn imported_fun_without_free_variables_is_eleven_words() {        let a = atoms();
         let mut heap = Heap::new(16);
         let p = hp(&mut heap, fun_words(FunKind::Imported, 0));
         let creator = FunPid {

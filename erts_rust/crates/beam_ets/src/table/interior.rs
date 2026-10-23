@@ -35,6 +35,7 @@ use crate::hash_interior::HashInterior;
 use crate::key::key_of;
 use crate::kind::{OrderedInterior, SetInterior, TableKind};
 use crate::ordered_interior::{OrderedSetInterior, SortedOrderedInterior};
+use crate::stats::{BucketChains, TreeStats};
 
 use super::update::{add_counters, object_arity, read_counter, replace_elements};
 
@@ -261,6 +262,30 @@ pub(crate) trait Interior: Send + Sync {
     /// their honest bucket/entry and B+-tree node-arena allocations respectively.
     fn memory(&self) -> usize {
         0
+    }
+
+    // ------------------------------------- interior statistics (`info/2`)
+
+    /// The interior's own **bucket/chain occupancy histogram** — the hash family's
+    /// measurement for `ets:info(Tab, stats)` ([`crate::stats::HashStats`]).
+    ///
+    /// Every hash interior overrides this with a real walk of its bucket space
+    /// (one chain length per bucket, empty buckets included). The default is
+    /// `None`: a tree interior has no bucket array, and its figures come from
+    /// [`node_shape`](Interior::node_shape) instead.
+    fn bucket_chains(&self) -> Option<BucketChains> {
+        None
+    }
+
+    /// The interior's own **node/depth shape** — the tree family's measurement for
+    /// `ets:info(Tab, stats)` ([`crate::stats::TreeStats`]).
+    ///
+    /// Every ordered interior overrides this (a B+-tree with its routing nodes,
+    /// leaves and depth; a flat sorted run as the single node it is). The default
+    /// is `None`: a hash interior has no node tree, and its figures come from
+    /// [`bucket_chains`](Interior::bucket_chains) instead.
+    fn node_shape(&self) -> Option<TreeStats> {
+        None
     }
 
     // ------------------------------------- element updates (`ets:update_*`)
