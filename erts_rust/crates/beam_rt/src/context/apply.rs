@@ -122,9 +122,15 @@ impl RuntimeContext<'_> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
-        if matches!(
+        // The fun's **encoding** decides which identity words are readable. Only a
+        // `make_fun3` closure is this arm's business: an imported (`NEW_FUN_EXT`) closure is
+        // resolved by [`RuntimeContext::imported_fun_target`] (it additionally names its
+        // defining module), and an external fun by
+        // [`RuntimeContext::external_fun_target`]. Reading `terms::fun_uniq` on either of
+        // those would be a typed `BadArg` — the kind test must come first.
+        if !matches!(
             beam_codec::term::fun_kind_term(fun)?,
-            beam_codec::FunKind::External
+            beam_codec::FunKind::Local
         ) {
             return Ok(None);
         }
@@ -136,6 +142,110 @@ impl RuntimeContext<'_> {
         let (found, descriptor) = self
             .local_fun_descriptor(uniq, index)
             .ok_or(BeamError::BadArg)?;
+        self.closure_target(fun, found, descriptor, args)
+    }
+
+    /// Resolves a **`NEW_FUN_EXT`-decoded** ([`beam_codec::FunKind::Imported`]) closure to
+    /// the [`LocalFunTarget`] of the lambda it names; `Ok(None)` for every other fun kind and
+    /// for an image that names no lambda of a loaded module.
+    ///
+    /// An imported closure is the wire image of a `.beam` local (`make_fun3`) closure: the C
+    /// encoder writes the fun's `ErlFunEntry` fields out (`external.c:3966-3993` — `module`,
+    /// the module's 16-byte MD5, `index`, `arity`, `num_free`) and the decoder rebuilds the
+    /// entry with `erts_fun_entry_get_or_make_stub` (`external.c:5102-5170`), after which C's
+    /// `call_fun` (`beam_common.c:1604-1621`) dispatches it exactly like a freshly built
+    /// closure. So this arm makes the decoded closure **genuinely callable** — same captured
+    /// environment, same arity, same module code — instead of taking the
+    /// [`RuntimeContext::apply_non_local_fun`] fallback, which has no closure to run.
+    ///
+    /// # The identity it resolves on
+    ///
+    /// The C key is `(module, index, arity, uniq[16])` (`erl_fun.c::fun_cmp`), and every one
+    /// of those is on the wire:
+    ///
+    /// * `module` — the term's module atom; a **different** module than the one that defines
+    ///   the lambda is not the same entry, so the descriptor's own module must match;
+    /// * `uniq[16]` — the defining module's 16-byte checksum, compared against
+    ///   [`Module::checksum`] so a stale image cannot bind to a recompiled module's lambda;
+    /// * `index` + `old_uniq` — the identity pair [`beam_term::fun::fun_local_key`] returns,
+    ///   which is the very pair a `make_fun3` closure's own `uniq`/`index` words carry
+    ///   (`beam_asm.erl`'s `finalize_fun_table/2` stamps the 27-bit MD5 prefix into every
+    ///   `FunT` entry's `old_uniq`, `emu_load.c:645-651` keys the entry on it);
+    /// * `arity` — the closure arity, checked by [`Self::closure_target`] against the
+    ///   descriptor exactly as for a local closure.
+    ///
+    /// A module the code server has not cached is loaded on demand (the same
+    /// `find_module_file` + `CodeServer::load` pair the cross-module seam uses): the oracle
+    /// reaches the same code through `error_handler:undefined_lambda/3`, which applies
+    /// `M:F(Args)` once the fun's module is loaded.
+    ///
+    /// # Errors
+    ///
+    /// A non-fun is [`BeamError::BadArg`]; an image that names no lambda of the module it
+    /// names (or of no loadable module) is [`BeamError::BadArg`] — an honest typed refusal,
+    /// never a fabricated entry. The oracle raises `{badfun, Fun}` for the loaded-module case
+    /// (see the `apply_non_local_fun` residual note).
+    pub(crate) fn imported_fun_target(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<LocalFunTarget>> {
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        if !matches!(
+            beam_codec::term::fun_kind_term(fun)?,
+            beam_codec::FunKind::Imported
+        ) {
+            return Ok(None);
+        }
+        // The wire fields are read **before** the module lookup: the lookup may load a
+        // module (allocating, mutating the code server), and the term itself is not an
+        // allocation-rooted value — it is a caller-owned term outside the machine's heap.
+        let (uniq, index) = terms::fun_local_key(fun)?;
+        let checksum = beam_codec::term::fun_uniq_bytes(fun)?;
+        let name = self
+            .runtime
+            .code_server
+            .atoms()
+            .name(beam_codec::term::fun_module(fun)?)
+            .map(str::to_owned)
+            .ok_or(BeamError::BadArg)?;
+        let callee = match self.runtime.code_server.module_handle(&name) {
+            Some(callee) => callee,
+            None => {
+                let _ = self.runtime.find_module_file(&name);
+                let Ok(callee) = self.runtime.code_server.load(&name) else {
+                    return Err(BeamError::BadArg);
+                };
+                callee
+            }
+        };
+        // The C's `fun_cmp` compares the module's 16-byte `uniq`: a `NEW_FUN_EXT` image of a
+        // *different* build of the module names no entry here, so no lambda of this build may
+        // be entered for it.
+        if callee.checksum() != checksum {
+            return Err(BeamError::BadArg);
+        }
+        let descriptor =
+            descriptor_of(&callee, uniq, index).ok_or(BeamError::BadArg)?;
+        self.closure_target(fun, callee, descriptor, args)
+    }
+
+    /// Builds the launch target of a closure whose `FunT` `descriptor` (in `found`) the caller
+    /// has already resolved — the half a local (`make_fun3`) and an imported
+    /// (`NEW_FUN_EXT`) closure share.
+    ///
+    /// The arity guard, the served-local-stub decline and the arg layout are identical for
+    /// both encodings, so they live here once (module docs of
+    /// [`RuntimeContext::local_fun_target`] carry the details).
+    fn closure_target(
+        &self,
+        fun: Eterm,
+        found: Arc<Module>,
+        descriptor: FunDescriptor,
+        args: &[Eterm],
+    ) -> Result<Option<LocalFunTarget>> {
         let free = terms::fun_free(fun)?;
         if args.len() + free.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
@@ -232,12 +342,24 @@ impl RuntimeContext<'_> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
-        if matches!(
-            beam_codec::term::fun_kind_term(fun)?,
-            beam_codec::FunKind::External
-        ) {
-            let (module, function, arity) = self.external_fun_name(fun)?;
-            return self.call_bif(&module, &function, arity, args);
+        match beam_codec::term::fun_kind_term(fun)? {
+            beam_codec::FunKind::External => {
+                let (module, function, arity) = self.external_fun_name(fun)?;
+                return self.call_bif(&module, &function, arity, args);
+            }
+            // A `NEW_FUN_EXT`-decoded closure whose in-machine entry
+            // ([`RuntimeContext::imported_fun_target`]) was declined: either it names a
+            // **served** local stub (a decoded named `fun deflate_nif/4`, dispatched here
+            // exactly like its locally built twin) or its identity names no lambda of a
+            // loaded module. The evaluator store below is only ever asked about a `Local`
+            // term (the `-eval` closure, stamped with `EVAL_FUN_UNIQ`), so it must not be
+            // reached from here.
+            beam_codec::FunKind::Imported => {
+                return self.dispatch_served_imported_fun(fun, args)
+            }
+            // A `make_fun3` closure: the shared local route below (the served-stub dispatch,
+            // then the `-eval` evaluator's own store).
+            beam_codec::FunKind::Local => {}
         }
         let uniq = terms::fun_uniq(fun)?;
         let index = terms::fun_index(fun)?;
@@ -259,6 +381,46 @@ impl RuntimeContext<'_> {
             }
         }
         crate::eval::apply_eval_closure(self, fun, index as usize, args)
+    }
+    /// Dispatches a **decoded** (`NEW_FUN_EXT`) closure that resolves to a **served**
+    /// local-call key — the wire image of OTP's named local references
+    /// (`erts/preloaded/src/zlib.erl`'s `#zlib_opts{method = fun deflate_nif/4}`), whose body
+    /// is an `erlang:nif_error(undef)` stub.
+    ///
+    /// [`RuntimeContext::imported_fun_target`] declines such a fun
+    /// ([`RuntimeContext::closure_target`]'s served-key test), so it reaches the host here,
+    /// through the same [`RuntimeContext::call_bif`] its locally built twin uses
+    /// ([`RuntimeContext::apply_non_local_fun`]).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArity`] for an argument count the descriptor disagrees with, and
+    /// [`BeamError::BadArg`] for an image that names no lambda — the same honest refusals the
+    /// local arm reports.
+    fn dispatch_served_imported_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        let (uniq, index) = terms::fun_local_key(fun)?;
+        let name = self
+            .runtime
+            .code_server
+            .atoms()
+            .name(beam_codec::term::fun_module(fun)?)
+            .map(str::to_owned)
+            .ok_or(BeamError::BadArg)?;
+        let module = self
+            .runtime
+            .code_server
+            .module_handle(&name)
+            .ok_or(BeamError::BadArg)?;
+        let descriptor = descriptor_of(&module, uniq, index).ok_or(BeamError::BadArg)?;
+        // The **served** half only: any other decoded closure is unresolvable here (it was not
+        // declined by `closure_target`'s arity guard, so this cannot mask a `BadArity`).
+        let Some((module_name, function)) = served_local_key(&module, &descriptor) else {
+            return Err(BeamError::BadArg);
+        };
+        if args.len() as u32 != descriptor.arity {
+            return Err(BeamError::BadArity);
+        }
+        self.call_bif(module_name, function, descriptor.arity, args)
     }
     /// The `(module, function, arity)` identity of an **external** fun (`fun M:F/A`, the
     /// `EXPORT_EXT` encoding), as names.

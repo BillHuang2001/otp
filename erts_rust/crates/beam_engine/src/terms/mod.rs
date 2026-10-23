@@ -114,7 +114,8 @@ pub use construct::{
     make_heap_binary_rooted, make_list, make_list_rooted, make_tuple, make_tuple_rooted,
 };
 pub use fun::{
-    fun_arity, fun_free, fun_index, fun_num_free, fun_true_arity, fun_uniq, is_fun, make_fun,
+    fun_arity, fun_free, fun_index, fun_local_key, fun_num_free, fun_true_arity, fun_uniq, is_fun,
+    make_fun,
 };
 pub use fun::make_fun_rooted;
 #[cfg(test)]
