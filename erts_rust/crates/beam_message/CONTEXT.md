@@ -169,10 +169,9 @@ Each entry names the crate/node that owns closing it; a gap another crate owns i
 
 ## Handoffs
 Gaps whose owner is another crate, each with the exact API this crate adopts once it appears (or the exact call site the owner must add where the API already exists).
-- **The sender's copy charge** — owner `beam_rt`, with `beam_common` + `beam_process` supplying the parts.
-  `beam_common::ERTS_MSG_COPY_WORDS_PER_REDUCTION: usize = 64` (a new constant beside `beam_common::CONTEXT_REDS`; the C divisor, `erl_message.c:881-886`).
-  `beam_process::Process::charge_reductions(&mut self, reds: u32) -> u64` — saturating add to the process's reduction count, returning the new total.
-  `beam_rt` must then charge `beam_common::CONTEXT_REDS.min(4 + Message::heap_words() / ERTS_MSG_COPY_WORDS_PER_REDUCTION) as u32` to the **sender** at every send site — none does today, and `ERTS_MSG_COPY_WORDS_PER_REDUCTION` does not exist as an identifier yet (`src/context/send.rs` has no reduction charge at all).
+- **The sender's copy charge** — owner `beam_rt`, with `beam_common` supplying the divisor.
+  The C charges `min(msize / ERTS_MSG_COPY_WORDS_PER_REDUCTION, CONTEXT_REDS)` reds to the sender at queue time (`erl_message.c:881-886`); `beam_common` hosts `CONTEXT_REDS` but no `ERTS_MSG_COPY_WORDS_PER_REDUCTION` divisor, and no `beam_rt` send site charges anything (`src/context/send.rs` has no reduction charge; the runner's `process.bump_reductions(used)` accounts instruction use only).
+  The adoptable shape is the existing `beam_process::Process::bump_reductions(&mut self, n: u64)` fed with `beam_common::CONTEXT_REDS.min(4 + Message::heap_words() / ERTS_MSG_COPY_WORDS_PER_REDUCTION) as u32` at every send site.
   No `beam_message` change is needed: `Message::heap_words()` is the input.
 - **The holder's virtual binary heap** — owner `beam_process`.
   `Process::charge_virtual_binary_heap(&mut self, bytes: usize) -> usize` — `bin_vheap += bytes / size_of::<Eterm>()`, saturating, returning the new word total — and `Process::virtual_binary_heap_words(&self) -> usize`, fed from `Message::logical_binary_bytes()` the moment a message becomes the process's and surfaced as the oracle's `bin_vheap_size`/`virtual_reds` (`erl_gc.c:3046,3051`).
