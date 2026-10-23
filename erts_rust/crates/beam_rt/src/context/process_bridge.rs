@@ -48,7 +48,8 @@
 //!   atom value and answers the unchanging runtime default atom `error_handler` as the
 //!   previous value (the oracle's default for a fresh process).
 //! * `group_leader/0` answers this runtime's root pid — the same real, live pid the
-//!   runtime-native `group_leader/0` reported (M1 has no `init` process to lead everything).
+//!   runtime-native `group_leader/0` reports. Like the oracle's own leader (`<0.70.0>`), it
+//!   is a process distinct from `init`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -488,7 +489,7 @@ mod tests {
     use super::*;
     use beam_term::{make_small, NIL};
 
-    /// A runtime with the root `init` process registered (the default runtime).
+    /// A runtime with its `init` stand-in registered (the default runtime).
     fn runtime() -> Runtime {
         Runtime::with_defaults().expect("the default runtime")
     }
@@ -513,16 +514,22 @@ mod tests {
     }
 
     #[test]
-    fn whereis_resolves_the_root_and_reports_an_absent_name_as_none() {
+    fn whereis_resolves_the_init_stand_in_and_reports_an_absent_name_as_none() {
         let mut rt = runtime();
         let init = atom(&mut rt, "init");
         let absent = atom(&mut rt, "zz_bridge_absent_name");
         let ports = Rc::clone(&rt.ports);
         let self_pid = rt.self_pid();
+        let init_pid = rt.init_pid;
         let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
 
-        // The runtime registers its root process as `init` (the oracle's `<0.0.0>`).
-        assert_eq!(bridge.whereis(init).unwrap(), Some(self_pid.to_eterm()));
+        // The runtime registers the **`init` stand-in** as `init` (the oracle's `<0.0.0>`): a
+        // live pid that is *not* the root process.
+        assert_eq!(bridge.whereis(init).unwrap(), Some(init_pid.to_eterm()));
+        assert_ne!(
+            init_pid, self_pid,
+            "the `init` stand-in is a pid of its own, never the root process"
+        );
         // An unregistered name is `None` (the BIF layer renders the atom `undefined`).
         assert_eq!(bridge.whereis(absent).unwrap(), None);
     }

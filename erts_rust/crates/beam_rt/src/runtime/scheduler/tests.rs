@@ -201,8 +201,8 @@ fn send_after(rt: &mut Runtime, millis: i64, target: Eterm, message: Eterm) -> E
 /// the receiver's default nursery is carried in a heap fragment, and the delivery's wake
 /// note used to be recorded **whether or not the delivery moved the receiver**
 /// (`src/dist/inbound.rs`). A receiver that was *born* `Runnable` and never enqueued — the
-/// runtime's own `init` root (which is exactly what the `-eval`/`-s`/`-run` action child is)
-/// and the `erl_prim_loader`/`file_server_2` services — is such a pid: "`Runnable` and not
+/// runtime's own `init` stand-in and the `erl_prim_loader`/`file_server_2` services — is such
+/// a pid: "`Runnable` and not
 /// in a run queue" is **not** a valid "should be scheduled" test for it. Enqueued, it reached
 /// the runner with no engine, which used to kill the node with
 /// `scheduler: process … has no engine entry point`.
@@ -217,11 +217,11 @@ fn a_fragment_note_for_an_engine_less_pid_does_not_take_the_pass_down() {
         .spawn_process("slice", "fib", vec![make_small(10)])
         .expect("spawn slice:fib/1");
 
-    // The runtime's own root process: spawned, inserted, **never enqueued**, born
+    // The runtime's own `init` stand-in: spawned, inserted, **never enqueued**, born
     // `Runnable`, and holding no engine — and registered as `init`, which is what makes the
     // diagnostic actionable.
-    let engine_less = rt.self_pid();
-    let before = rt.processes().get(engine_less).expect("the root process");
+    let engine_less = rt.init_pid;
+    let before = rt.processes().get(engine_less).expect("the `init` stand-in");
     assert_eq!(before.state(), ProcessState::Runnable, "born runnable");
     assert!(!before.flags().in_run_queue(), "and never enqueued");
     assert!(!rt.runner_state().contains(engine_less), "it holds no engine");

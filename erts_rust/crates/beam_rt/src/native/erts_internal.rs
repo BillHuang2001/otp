@@ -2376,7 +2376,19 @@ mod tests {
         let batch = terms::list_elements(terms::tuple_element(answer, 1).expect("the batch"))
             .expect("a list");
         assert_eq!(batch.len(), 1, "one pid per call (documented divergence)");
-        assert_eq!(batch[0], runtime.self_pid().to_eterm());
+        // The walk is table order, so the first identity handed out is the `init` stand-in
+        // (`Runtime::init_pid`, the oracle's `<0.0.0>`) rather than the root process the
+        // runtime runs as.
+        assert_eq!(
+            batch[0],
+            runtime.init_pid.to_eterm(),
+            "the first table identity is the `init` stand-in"
+        );
+        assert_ne!(
+            batch[0],
+            runtime.self_pid().to_eterm(),
+            "the root process holds the table's next identity"
+        );
 
         let all = call(&mut runtime, "erlang", "processes", &[]).expect("processes/0");
         let limit = terms::list_elements(all).expect("a list").len() as i64;

@@ -645,23 +645,25 @@ pub struct Runtime {
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
     /// The **`init` stand-in** pid: the process every pid this runtime did not see being
-    /// spawned reports as its `parent`.
+    /// spawned reports as its `parent`, and the pid the `init` name is registered on.
     ///
     /// The oracle's `p->parent` of a `-eval`/`-s`/`-run` process is the `init` server,
     /// `<0.0.0>` — a process **distinct** from the `-eval` process itself, so
-    /// `element(2, process_info(self(), parent)) =:= self()` is `false` there. This runtime
-    /// *is* its own root process on that route (the root runs the `-eval` action), so falling
-    /// back to [`Runtime::self_pid`] would make the root report itself — an observable lie.
+    /// `element(2, process_info(self(), parent)) =:= self()` is `false` there — and
+    /// `erlang:whereis(init)` answers that very pid. This runtime's root process
+    /// ([`Runtime::self_pid`]) is the one that boots and runs the action, so registering the
+    /// name *there* made the two facts disagree: the action's `parent` would name a pid that
+    /// `whereis(init)` did not.
     ///
-    /// The stand-in is therefore a **pid with no process**: the table's very first identity,
-    /// drawn with [`ProcessTable::alloc_pid`](beam_process::ProcessTable::alloc_pid) *before*
-    /// the root is spawned, so it renders exactly as the oracle's `init` pid does (`<0.0.0>`,
-    /// with the root moving to `<0.1.0>`). Nothing runs behind it, so it never appears in
-    /// `erlang:processes/0`, never receives a message and never holds a heap; it exists only so
-    /// the `parent` relation is graph-correct. `whereis(init)` stays the runtime's own root
-    /// (see the constructor): the two are different facts — the *name registry's* `init` is the
-    /// process that boots this runtime, the *parent* of everything the runtime did not spawn is
-    /// this stand-in — and the oracle has a single `<0.0.0>` playing both roles.
+    /// One pid therefore plays both roles, as the oracle's `<0.0.0>` does. It is the table's
+    /// very first identity, drawn with
+    /// [`ProcessTable::spawn`](beam_process::ProcessTable::spawn) *before* the root, so it
+    /// renders exactly as the oracle's `init` pid (`<0.0.0>`, with the root moving to
+    /// `<0.1.0>`). It is a real, live process — because the oracle's `init` is one, so
+    /// `is_process_alive/1` and `process_info(whereis(init), registered_name)` describe a
+    /// process that exists — but a **process-less in effect** one: born `Runnable`, never put
+    /// on a run queue, it never executes a slice, never receives a message and never holds
+    /// more than its initial heap.
     pub(crate) init_pid: ProcessId,
     /// The **root execution frame**: which root action ([`RootAction::Eval`] for `-eval`,
     /// [`RootAction::Module`] for `-s`/`-run`) is driving the runtime's own process right now,
@@ -1351,26 +1353,36 @@ impl Runtime {
             Rc::clone(&ets_owners),
             Rc::clone(&nif_monitors),
         )));
-        // The **`init` stand-in** (see [`Runtime::init_pid`]): a pid with no process, drawn
-        // *first* so it takes the table's first identity and renders exactly as the oracle's
-        // `init` (`<0.0.0>`), which is the `parent` of the `-eval`/`-s`/`-run` process there.
-        let init_pid = processes.alloc_pid()?;
+        // The **`init` stand-in** (see [`Runtime::init_pid`]): drawn *first*, so it takes the
+        // table's first identity and renders exactly as the oracle's `init` (`<0.0.0>`), which
+        // is both the pid the `init` name resolves to there and the `parent` of the
+        // `-eval`/`-s`/`-run` process. It is spawned as a **real** process because the oracle's
+        // `init` is one: `erlang:whereis(init)`, `erlang:is_process_alive/1` and
+        // `erlang:process_info(whereis(init), registered_name)` must all describe a process
+        // that exists. It is born `Runnable` and is never put on a run queue, so it never
+        // executes a slice and never receives a message (the same shape as the native
+        // `erl_prim_loader` service below).
+        let init_pid = processes.spawn(system_spawn_policy(&config))?;
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
-        let self_pid = processes.spawn(system_spawn_policy(&config))?;        // The runtime's own root process stands in for OTP's `init`: it is the process the
-        // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
-        // already reports (`src/native/process.rs`). Registering the name is what makes
-        // `erlang:whereis(init)` answer that live pid — the oracle answers `<0.0.0>` — and
-        // makes `erlang:registered/0`/`erlang:whereis/1` honest about the runtime's own
-        // name registry rather than reporting an empty one. `init` is in the core-atom seed
-        // interned two lines up, so the lookup cannot miss.
+        // It is the process the runtime boots and runs the start action as, and the one
+        // `erlang:group_leader/0` reports (`src/native/process.rs`). It is **not** registered
+        // under any name — the oracle's `-eval`/`-s`/`-run` action process has none either.
+        let self_pid = processes.spawn(system_spawn_policy(&config))?;
+        // The **`init` name** resolves to the stand-in above — the same pid every process this
+        // runtime did not see being spawned reports as its `parent` (see
+        // [`Runtime::parent_of`]), exactly as the oracle's single `<0.0.0>` plays both roles.
+        // Registering the name is what makes `erlang:whereis(init)`, `erlang:registered/0` and
+        // `process_info(whereis(init), registered_name)` honest about the runtime's own name
+        // registry rather than reporting an empty one. `init` is in the core-atom seed interned
+        // above, so the lookup cannot miss.
         let init_name = code_server
             .atoms()
             .lookup("init")
             .ok_or_else(|| error::message("boot: the `init` atom is not seeded"))?;
         processes
-            .register(init_name, self_pid)
+            .register(init_name, init_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
         // The runtime-native **`erl_prim_loader` service process** (contracts A.7/A.9): a
         // `Runnable`, never-enqueued stand-in for the loader, registered under the loader's own
@@ -5105,11 +5117,11 @@ impl Runtime {
     ///
     /// The oracle runs an action in a process `init` *spawns*: `erl -noshell -eval
     /// 'process_info(self(), registered_name)'` answers `[]` while `whereis(init)` answers the
-    /// root pid, so `whereis(init) =:= self()` is `false` and `self()` is a pid no name is
+    /// `init` pid, so `whereis(init) =:= self()` is `false` and `self()` is a pid no name is
     /// registered for (probed on OTP 29.1.1 / erts-17.1: `rn=[] self=<0.10.0> init=<0.0.0>
-    /// eq=false ispid=true`). This runtime's `-eval`/`-s`/`-run` action had always run in the
-    /// process it registers as `init` ([`Runtime::self_pid`]), so the action answered
-    /// `{registered_name, init}` and `whereis(init) =:= self()` was `true`.
+    /// eq=false ispid=true`). This runtime's own root process ([`Runtime::self_pid`]) — the pid
+    /// an action would otherwise run as — is likewise **unregistered**: the `init` name belongs
+    /// to the stand-in [`Runtime::init_pid`], which no action ever runs in.
     ///
     /// # How
     ///
@@ -5388,18 +5400,22 @@ mod tests {
         let rt = runtime();
         assert!(rt.atoms().lookup("unix").is_some());
         assert!(rt.atoms().lookup("linux").is_some());
-        // `Runtime::new` starts exactly **three** processes, all of them the runtime's own —
+        // `Runtime::new` starts exactly **four** processes, all of them the runtime's own —
         // none was spawned by user code:
-        //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
-        //      the oracle answers `<0.0.0>`), which every action runs as;
-        //   2. the native **`erl_prim_loader` service** (contracts A.7/A.9), a `Runnable`,
+        //   1. the **`init` stand-in** (`erlang:init_pid`), a real but never-enqueued process
+        //      holding the table's first identity — so it renders as the oracle's `init`
+        //      (`<0.0.0>`) — registered under `init` and reported as the `parent` of every
+        //      process the runtime did not see being spawned;
+        //   2. the **root process**, which every action runs as (the oracle's `<0.0.0>` plus
+        //      one: `<0.1.0>`), registered under no name;
+        //   3. the native **`erl_prim_loader` service** (contracts A.7/A.9), a `Runnable`,
         //      never-enqueued process that stands in for the loader under the name the oracle
         //      registers its own loader process as (`erlang:whereis(erl_prim_loader)` answers a
         //      live pid, never `undefined`); and
-        //   3. the native **`file_server_2` service** (contract A.9), a `Runnable`,
+        //   4. the native **`file_server_2` service** (contract A.9), a `Runnable`,
         //      never-enqueued process that answers the OTP file protocol on the routes where it
         //      owns the name (`src/native/file_server.rs`).
-        assert_eq!(rt.processes().len(), 3);
+        assert_eq!(rt.processes().len(), 4);
         for name in ["init", "erl_prim_loader", "file_server_2"] {
             let atom = rt
                 .atoms()
@@ -5412,7 +5428,7 @@ mod tests {
         }
         assert_eq!(
             rt.system_info_value("process_count").expect("count"),
-            InfoValue::Int(3)
+            InfoValue::Int(4)
         );
     }
 
@@ -5443,13 +5459,13 @@ mod tests {
             }
         };
         // The service process is still spawned — the count is the same as on a route that
-        // drives none (the root `init` process, the native `erl_prim_loader` service and the
-        // native `file_server_2` service) — and `init` is still registered; only the
-        // `file_server_2` name stays free.
-        assert_eq!(booted.processes().len(), 3);
+        // drives none (the `init` stand-in, the root process, the native `erl_prim_loader`
+        // service and the native `file_server_2` service) — and `init` is still registered;
+        // only the `file_server_2` name stays free.
+        assert_eq!(booted.processes().len(), 4);
         assert_eq!(
             booted.system_info_value("process_count").expect("count"),
-            InfoValue::Int(3)
+            InfoValue::Int(4)
         );
         let init = booted.atoms().lookup("init").expect("`init` is a core atom");
         assert!(booted.processes().whereis(init).is_some());

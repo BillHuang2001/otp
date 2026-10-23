@@ -1738,22 +1738,104 @@ mod tests {
         assert!(!names.contains(&"lists"), "a library module is not preloaded");
     }
 
+    /// The `init` name resolves to the **`init` stand-in** ([`Runtime::init_pid`]) — a live pid
+    /// of the runtime's own, distinct from the root process every action runs as — and the
+    /// root's `parent` item names that same pid.
+    ///
+    /// Oracle probe (OTP 29.1.1 / erts-17.1), the facts asserted below:
+    ///
+    /// ```text
+    /// whereis(init)                                => <0.0.0>
+    /// process_info(self(), parent)                 => {parent,<0.0.0>}   (self() = <0.10.0>)
+    /// process_info(whereis(init), parent)          => {parent,undefined}
+    /// process_info(whereis(init), registered_name) => {registered_name,init}
+    /// is_process_alive(whereis(init))              => true
+    /// whereis(init) =:= self()                     => false
+    /// group_leader()                               => <0.70.0>   (a *different*, live pid)
+    /// ```
+    ///
+    /// So the oracle has one pid (`<0.0.0>`) playing both the `init` name and the role of
+    /// everyone's `parent`, while its group leader is some *other* process. This runtime
+    /// reproduces exactly that relation with [`Runtime::init_pid`] as both, and its own root
+    /// process ([`Runtime::self_pid`]) as the group leader — the two are different pids, and
+    /// neither may be reported as the other.
     #[test]
-    fn whereis_init_is_the_runtime_process() {
-        // The oracle registers its `init` process (`erlang:whereis(init)` ⇒ `<0.0.0>`).
-        // Milestone-1 runs no separate `init` process, so the runtime's own root process
-        // stands in for it and is registered under the name at construction — the *same*
-        // pid `erlang:group_leader/0` reports.
+    fn whereis_init_is_the_init_stand_in() {
         let mut runtime = runtime();
         let name = atom(&mut runtime, "init");
-        let answer = call(&mut runtime, "erlang", "whereis", &[name]).expect("whereis/1");
+        let whereis = call(&mut runtime, "erlang", "whereis", &[name]).expect("whereis/1");
+        assert!(is_pid(&mut runtime, whereis), "whereis(init) is a pid");
+        // It is the stand-in — a table identity of its own, never the root process.
         assert_eq!(
-            answer,
-            runtime.self_pid().to_eterm(),
-            "whereis(init) is the runtime's own process"
+            whereis,
+            runtime.init_pid.to_eterm(),
+            "whereis(init) is the `init` stand-in"
         );
+        let root = runtime.self_pid().to_eterm();
+        assert_ne!(whereis, root, "the root process is a different pid");
+        // The name registry agrees in the other direction: `init` is in `registered/0`, and the
+        // pid's own `registered_name` item is the wrapped pair.
+        let registered = call(&mut runtime, "erlang", "registered", &[]).expect("registered/0");
+        assert!(
+            terms::list_elements(registered)
+                .expect("a list")
+                .contains(&name),
+            "`registered/0` lists `init`"
+        );
+        let rn = atom(&mut runtime, "registered_name");
+        let info =
+            call(&mut runtime, "erlang", "process_info", &[whereis, rn]).expect("process_info/2");
+        assert_eq!(
+            atom_name(
+                &runtime,
+                terms::tuple_element(info, 0).expect("the item key")
+            ),
+            Some("registered_name")
+        );
+        assert_eq!(
+            atom_name(
+                &runtime,
+                terms::tuple_element(info, 1).expect("the item value")
+            ),
+            Some("init")
+        );
+        // Alive — the stand-in is a real process, never a pid the table merely handed out.
+        let alive = call(&mut runtime, "erlang", "is_process_alive", &[whereis])
+            .expect("is_process_alive/1");
+        assert_eq!(atom_name(&runtime, alive), Some("true"));
+        // The root of the `parent` graph: the root process reports the stand-in as its parent,
+        // and the stand-in itself has none (the C's `init` has no `p->parent`).
+        let parent = atom(&mut runtime, "parent");
+        let root_parent = call(&mut runtime, "erlang", "process_info", &[root, parent])
+            .expect("the root's parent");
+        assert_eq!(
+            atom_name(
+                &runtime,
+                terms::tuple_element(root_parent, 0).expect("the item key")
+            ),
+            Some("parent")
+        );
+        assert_eq!(
+            terms::tuple_element(root_parent, 1).expect("the item value"),
+            whereis,
+            "the root process's parent is the `init` stand-in"
+        );
+        let own_parent = call(&mut runtime, "erlang", "process_info", &[whereis, parent])
+            .expect("the stand-in's parent");
+        assert_eq!(
+            atom_name(
+                &runtime,
+                terms::tuple_element(own_parent, 1).expect("the item value")
+            ),
+            Some("undefined"),
+            "the `init` stand-in has no parent"
+        );
+        // The group leader is a real, live pid and it is **not** `init`: this runtime's root
+        // process, the same relation the oracle shows with its own `<0.70.0>`.
         let leader = call(&mut runtime, "erlang", "group_leader", &[]).expect("group_leader/0");
-        assert_eq!(answer, leader, "the init name and the group leader agree");
+        assert!(is_pid(&mut runtime, leader), "group_leader/0 is a pid");
+        assert_eq!(leader, root, "the group leader is this runtime's root process");
+        assert_ne!(leader, whereis, "the group leader is not the `init` stand-in");
     }
 
     #[test]

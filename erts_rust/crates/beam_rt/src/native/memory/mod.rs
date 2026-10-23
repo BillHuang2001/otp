@@ -231,8 +231,8 @@
 //!   while the caller's own item keeps its own. `process_info/1`'s item list **omits** the entry
 //!   for an unregistered process (the C's `nil` skip), so the `-eval`/`-s`/`-run` action routes
 //!   answer `[]` for the caller's own `process_info(self(), registered_name)` — the action runs in
-//!   a spawned, unregistered child of `init` (`src/runtime.rs::as_action_process`), as the oracle's
-//!   does.
+//!   a spawned, unregistered child (`src/runtime.rs::as_action_process`) of a root process that is
+//!   unregistered too, exactly as the oracle's action process and its spawner are.
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -1045,8 +1045,17 @@ impl RuntimeContext<'_> {
             // spawned this one. A process this runtime did not see spawned — the root the
             // `-eval`/`-s`/`-run` action runs in — reports the **`init` stand-in**, exactly as
             // the oracle's `-eval` process reports `init` and never itself
-            // ([`Runtime::init_pid`](crate::Runtime::init_pid)).
-            "parent" => snapshot.parent.to_eterm(),
+            // ([`Runtime::init_pid`](crate::Runtime::init_pid)). The stand-in is the root of
+            // that graph and the C's `init` has no parent at all: the oracle answers the bare
+            // atom `undefined` for it (`process_info(whereis(init), parent)`, probed on OTP
+            // 29.1.1 / erts-17.1).
+            "parent" => {
+                if snapshot.pid == self.runtime.init_pid {
+                    self.atom("undefined")?
+                } else {
+                    snapshot.parent.to_eterm()
+                }
+            }
             // The process dictionary's `'$process_label'` (`erl_bif_info.c:2305-2315`), which is
             // exactly what `process_flag`-style labelling writes; unset ⇒ `undefined`.
             "label" => match snapshot.label {

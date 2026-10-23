@@ -47,6 +47,13 @@ fn root_pid(runtime: &mut crate::Runtime) -> Eterm {
     runtime.self_pid().to_eterm()
 }
 
+/// `whereis(init)` — the runtime's **`init` stand-in**: a live process, registered under
+/// `init`, that is *not* the root process (`Runtime::init_pid`).
+fn init_pid(runtime: &mut crate::Runtime) -> Eterm {
+    let name = atom(runtime, "init");
+    call(runtime, "erlang", "whereis", &[name]).expect("whereis(init)")
+}
+
 /// A pid the process table never allocated.
 fn dead_pid() -> Eterm {
     ProcessId::new(999_999, 0).to_eterm()
@@ -121,12 +128,12 @@ fn entries_of(reply: Eterm) -> Vec<(Eterm, Eterm)> {
 #[test]
 fn process_info_1_is_the_oracle_order_with_registered_name_first() {
     let mut runtime = runtime();
-    let pid = root_pid(&mut runtime);
-    let reply = call(&mut runtime, "erlang", "process_info", &[pid]).expect("process_info/1");
+    let init = init_pid(&mut runtime);
+    let reply = call(&mut runtime, "erlang", "process_info", &[init]).expect("process_info/1");
     let keys = keys_of(&mut runtime, reply);
-    // The root process is registered as `init`, so `registered_name` is emitted (wrapped)
-    // first. Its four engine-derived items are honestly omitted (the `-eval` root process has
-    // no engine — see the module docs) — leaving these 15, in the oracle's relative order
+    // The `init` stand-in is registered as `init`, so `registered_name` is emitted (wrapped)
+    // first. Its four engine-derived items are honestly omitted (it never runs, so it has no
+    // engine — see the module docs) — leaving these 15, in the oracle's relative order
     // (checked below).
     assert_eq!(
         keys,
@@ -147,6 +154,16 @@ fn process_info_1_is_the_oracle_order_with_registered_name_first() {
             "garbage_collection",
             "suspending",
         ]
+    );
+    // The root process is a live **unregistered** process, so the same list omits
+    // `registered_name` and nothing else — the C's `nil` skip, which is why the oracle emits
+    // 16 items for a registered process and 15 for an unregistered one.
+    let root = root_pid(&mut runtime);
+    let reply = call(&mut runtime, "erlang", "process_info", &[root]).expect("process_info/1");
+    assert_eq!(
+        keys_of(&mut runtime, reply),
+        keys[1..].to_vec(),
+        "an unregistered process omits `registered_name` and keeps the rest"
     );
 }
 
@@ -202,26 +219,34 @@ fn an_empty_list_on_a_live_pid_is_the_empty_list_and_on_a_dead_pid_is_undefined(
 #[test]
 fn registered_name_is_wrapped_when_registered_and_bare_empty_when_unregistered() {
     let mut runtime = runtime();
-    let pid = root_pid(&mut runtime);
-    // The root process is registered as `init`: the single-atom form is the WRAPPED pair.
-    let (key, value) = pair(info(&mut runtime, pid, "registered_name").expect("process_info/2"));
+    // The `init` stand-in is registered as `init`: the single-atom form is the WRAPPED pair.
+    let init = init_pid(&mut runtime);
+    let (key, value) = pair(info(&mut runtime, init, "registered_name").expect("process_info/2"));
     assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
     assert_eq!(runtime.atom_name_of(value), Some("init"));
     // The list form is wrapped too.
     let name = atom(&mut runtime, "registered_name");
     let list = make_list(&mut runtime, &[name]);
-    let reply = call(&mut runtime, "erlang", "process_info", &[pid, list]).expect("process_info/2");
+    let reply = call(&mut runtime, "erlang", "process_info", &[init, list]).expect("process_info/2");
     let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
     assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
     assert_eq!(runtime.atom_name_of(value), Some("init"));
-    // Unregister `init` so the root becomes a LIVE, unregistered pid: the single-atom form is
-    // then the BARE `[]` (the oracle's `always_wrap = 0` nil case), while the list form wraps it.
-    let init = atom(&mut runtime, "init");
-    call(&mut runtime, "erlang", "unregister", &[init]).expect("unregister");
-    assert_eq!(info(&mut runtime, pid, "registered_name").expect("process_info/2"), NIL);
-    let name = atom(&mut runtime, "registered_name");
+    // The root process is a LIVE, unregistered pid: the single-atom form is the BARE `[]` (the
+    // oracle's `always_wrap = 0` nil case), while the list form wraps it.
+    let root = root_pid(&mut runtime);
+    assert_eq!(info(&mut runtime, root, "registered_name").expect("process_info/2"), NIL);
     let list = make_list(&mut runtime, &[name]);
-    let reply = call(&mut runtime, "erlang", "process_info", &[pid, list]).expect("process_info/2");
+    let reply = call(&mut runtime, "erlang", "process_info", &[root, list]).expect("process_info/2");
+    let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(value, NIL);
+    // Unregister `init` so the stand-in becomes a live, unregistered pid as well: the same bare
+    // `[]` / wrapped `{registered_name, []}` split applies to it.
+    let init_name = atom(&mut runtime, "init");
+    call(&mut runtime, "erlang", "unregister", &[init_name]).expect("unregister");
+    assert_eq!(info(&mut runtime, init, "registered_name").expect("process_info/2"), NIL);
+    let list = make_list(&mut runtime, &[name]);
+    let reply = call(&mut runtime, "erlang", "process_info", &[init, list]).expect("process_info/2");
     let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
     assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
     assert_eq!(value, NIL);
@@ -246,20 +271,21 @@ fn registered_name_is_wrapped_when_registered_and_bare_empty_when_unregistered()
 /// ```
 ///
 /// The one route where this runtime answers differently for *its own* process is the
-/// `-eval`/`-s`/`-run` action routes (see the module docs): those run the action in the root
-/// process, which is registered as `init`.
+/// `-eval`/`-s`/`-run` action routes (see the module docs): those run the action in a spawned
+/// child, so `process_info(self(), registered_name)` is the bare `[]` there — exactly the
+/// oracle's answer for its own `-eval` process.
 #[test]
 fn registered_name_is_the_queried_processes_name_not_the_callers() {
     let mut runtime = runtime();
     let query = atom(&mut runtime, "registered_name");
 
-    // A: `whereis(init)` resolves this runtime's root process, and its item is `init`.
-    let init_name = atom(&mut runtime, "init");
-    let init_pid = call(&mut runtime, "erlang", "whereis", &[init_name]).expect("whereis/1");
-    assert_eq!(
+    // A: `whereis(init)` resolves the runtime's `init` stand-in — a live process distinct from
+    // the root one — and its item is `init`.
+    let init_pid = init_pid(&mut runtime);
+    assert_ne!(
         init_pid,
         root_pid(&mut runtime),
-        "the root process is registered as `init`"
+        "the `init` name belongs to the stand-in, not to the root process"
     );
     let (key, value) = pair(
         call(&mut runtime, "erlang", "process_info", &[init_pid, query]).expect("process_info/2"),
@@ -276,12 +302,12 @@ fn registered_name_is_the_queried_processes_name_not_the_callers() {
         call(&mut runtime, "erlang", "register", &[probe, other_pid]).expect("register/2");
     assert_eq!(runtime.atom_name_of(answer), Some("true"));
 
-    // B: the queried process's name — NOT the caller's (`init`).
+    // B: the queried process's name — NOT the other process's.
     let (key, value) = pair(info(&mut runtime, other_pid, "registered_name").expect("B"));
     assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
     assert_eq!(runtime.atom_name_of(value), Some("probe_reg"));
-    // ... while the caller's own item still answers `init`.
-    let (_, own) = pair(info(&mut runtime, init_pid, "registered_name").expect("caller item"));
+    // ... while the `init` stand-in's own item still answers `init`.
+    let (_, own) = pair(info(&mut runtime, init_pid, "registered_name").expect("init item"));
     assert_eq!(runtime.atom_name_of(own), Some("init"));
     // Blist: the list form wraps the name too.
     let list = make_list(&mut runtime, &[query]);
@@ -827,7 +853,10 @@ fn oracle_pi_1_keys() -> Option<Vec<String>> {
 #[test]
 fn the_implemented_item_order_is_a_subsequence_of_the_oracles() {
     let mut runtime = runtime();
-    let pid = root_pid(&mut runtime);
+    // A **registered** process with no engine: the `init` stand-in. It emits the oracle's full
+    // item set minus the two engine-derived items, which is the shape this comparison needs
+    // (`registered_name` is present, so the oracle's 17 items are the yardstick).
+    let pid = init_pid(&mut runtime);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid]).expect("process_info/1");
     let ours = keys_of(&mut runtime, reply);
 

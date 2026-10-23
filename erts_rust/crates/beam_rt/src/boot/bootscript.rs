@@ -1479,12 +1479,14 @@ mod tests {
 -module(bootscript_fixture).
 -export([mark/0, marked/0]).
 %% The side effect the boot script's `apply` observes: a process-dictionary entry on the
-%% process the script runs as (the runtime's own `init` process).
-mark() -> erlang:put(bootscript_mark, seen).
+%% process the script runs as — plus a name that process registers for itself, so a later
+%% reader can address it (the process that runs an `{apply, …}` directive is this runtime's
+%% own root process, which holds no registered name).
+mark() -> erlang:put(bootscript_mark, seen), register(bootscript_apply, self()).
 %% Reads that entry back from the process the script ran as. The caller of this function is a
 %% **spawned action process** (the oracle's `-eval` shape), whose own dictionary is empty, so
-%% the mark is read from `init` — exactly where the directive's `apply` left it.
-marked() -> element(2, process_info(whereis(init), {dictionary, bootscript_mark})).
+%% the mark is read from the process that registered itself above.
+marked() -> element(2, process_info(whereis(bootscript_apply), {dictionary, bootscript_mark})).
 "#;
 
     /// A compiled fixture in its own scratch directory.
@@ -1745,13 +1747,15 @@ responder() ->
     register(bootscript_kernel, self()),
     receive {ping, From} -> From ! {pong, hello} end.
 %% The `{apply, …}` entry: ping the registered kernel process and block until it answers,
-%% recording the reply in the dictionary of the process the script runs as.
+%% recording the reply in the dictionary of the process the script runs as — which registers
+%% itself under `bootscript_apply` so a later reader can address it.
 ask() ->
+    register(bootscript_apply, self()),
     Pid = erlang:whereis(bootscript_kernel),
     Pid ! {ping, self()},
     receive {pong, Value} -> erlang:put(bootscript_seen, Value) end.
 %% Reads the recorded reply back.
-seen() -> element(2, process_info(whereis(init), {dictionary, bootscript_seen})).
+seen() -> element(2, process_info(whereis(bootscript_apply), {dictionary, bootscript_seen})).
 "#;
 
     /// The two process directives really **drive the scheduler**: a `{kernelProcess, …}`
@@ -1842,6 +1846,7 @@ serve() ->
 loop() ->
     receive {ping, From} -> From ! {pong, registered}, loop() end.
 probe() ->
+    register(bootscript_apply, self()),
     case erlang:whereis(bootscript_self) of
         Pid when is_pid(Pid) ->
             Pid ! {ping, self()},
@@ -1849,7 +1854,7 @@ probe() ->
         undefined ->
             erlang:put(bootscript_seen, not_registered)
     end.
-seen() -> element(2, process_info(whereis(init), {dictionary, bootscript_seen})).
+seen() -> element(2, process_info(whereis(bootscript_apply), {dictionary, bootscript_seen})).
 "#;
 
     /// `init.erl`'s `{kernelProcess, Name, {M,F,A}}` directive **never registers `Name`**:
@@ -1949,6 +1954,7 @@ server(Parent) ->
 loop() ->
     receive {ping, From} -> From ! {pong, self()}, loop() end.
 probe() ->
+    register(bootscript_apply, self()),
     Value =
         case {erlang:whereis(bootscript_ack), erlang:whereis(bootscript_ack_done)} of
             {Child, Done} when is_pid(Child), is_pid(Done) ->
@@ -1958,7 +1964,7 @@ probe() ->
                 not_acked
         end,
     erlang:put(bootscript_seen, Value).
-seen() -> element(2, process_info(whereis(init), {dictionary, bootscript_seen})).
+seen() -> element(2, process_info(whereis(bootscript_apply), {dictionary, bootscript_seen})).
 "#;
 
     /// The `{kernelProcess, …}` burst runs until the **directive's MFA has returned**, not
