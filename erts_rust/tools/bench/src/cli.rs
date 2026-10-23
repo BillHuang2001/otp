@@ -84,6 +84,10 @@ pub struct RunArgs {
     pub verbose: bool,
     /// Per-workload external-repo overrides (`--repo <id>=<path>`).
     pub repos: Vec<(String, PathBuf)>,
+    /// Exit `1` when at least one latency budget is exceeded (`--fail-on-budget`).
+    ///
+    /// A breach is only *reported* otherwise; a `not-measured` budget never fails a run.
+    pub fail_on_budget: bool,
 }
 
 impl Default for RunArgs {
@@ -97,6 +101,7 @@ impl Default for RunArgs {
             json: false,
             verbose: false,
             repos: Vec::new(),
+            fail_on_budget: false,
         }
     }
 }
@@ -111,7 +116,8 @@ pub enum Command {
     },
     /// `bench run [flags]`.
     Run(RunArgs),
-    /// `bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]`.
+    /// `bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]
+    /// [--fail-on-budget]`.
     Baseline {
         /// The profile.
         profile: Profile,
@@ -121,6 +127,8 @@ pub enum Command {
         out: Option<PathBuf>,
         /// Exact output file path override.
         out_file: Option<PathBuf>,
+        /// Exit `1` when at least one latency budget is exceeded.
+        fail_on_budget: bool,
     },
     /// `bench compare <a.json> <b.json> [--json]` (two-file), or
     /// `bench compare <report.json> [--json]` (cross-runtime, `sys` vs `rust` within
@@ -181,6 +189,7 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
     let mut json = false;
     let mut out = None;
     let mut out_file = None;
+    let mut fail_on_budget = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -188,6 +197,7 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
             "--quick" => profile = Profile::Quick,
             "--full" => profile = Profile::Full,
             "--json" => json = true,
+            "--fail-on-budget" => fail_on_budget = true,
             "--out" => {
                 out = Some(PathBuf::from(take_value(args, &mut i, "--out")?));
             }
@@ -203,7 +213,13 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
         }
         i += 1;
     }
-    Ok(Command::Baseline { profile, json, out, out_file })
+    Ok(Command::Baseline {
+        profile,
+        json,
+        out,
+        out_file,
+        fail_on_budget,
+    })
 }
 
 fn parse_run(args: &[String]) -> Result<Command> {
@@ -216,6 +232,7 @@ fn parse_run(args: &[String]) -> Result<Command> {
             "--full" => run.profile = Profile::Full,
             "--json" => run.json = true,
             "--verbose" => run.verbose = true,
+            "--fail-on-budget" => run.fail_on_budget = true,
             "--workloads" => {
                 let raw = take_value(args, &mut i, "--workloads")?;
                 let ids: Vec<String> = raw
@@ -325,7 +342,9 @@ pub fn usage() -> String {
          \x20 help      Show this help, or `help <subcommand>`\n\
          \n\
          Run `bench help <SUBCOMMAND>` for subcommand options.\n\
-         Exit codes: 0 = report produced, 2 = usage/env/IO/schema error.",
+         Every run also records latency-budget verdicts (met / exceeded / not-measured).\n\
+         Exit codes: 0 = report produced, 1 = a budget was exceeded and --fail-on-budget\n\
+         was given, 2 = usage/env/IO/schema error.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -336,13 +355,19 @@ pub fn subcommand_help(name: &str) -> Option<String> {
         "list" => "bench list [--json]\n\n  List workload ids, category, contract coverage and probe status.",
         "run" => "bench run [--quick|--full] [--workloads <ids,csv>] [--runtime <sys|rust|all>]\n\
                   \x20        [--out <dir>] [--out-file <path>] [--repo <id>=<path>]... [--json] [--verbose]\n\
+                  \x20        [--fail-on-budget]\n\
                   \n  Defaults: --quick, --runtime sys, all workloads.\n\
                   \x20 --out       Output directory for the timestamped report (default: out/).\n\
                   \x20 --out-file  Exact output path for the report (overrides --out naming).\n\
-                  \x20 --repo  Override an external workload's repo path (e.g. --repo cowboy=/src/cowboy).",
+                  \x20 --repo  Override an external workload's repo path (e.g. --repo cowboy=/src/cowboy).\n\
+                  \x20 --fail-on-budget  Exit 1 if at least one latency budget is exceeded. A breach is\n\
+                  \x20                   otherwise only reported (see the stderr budget block); a budget\n\
+                  \x20                   that could not be measured never fails a run.",
         "baseline" => "bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]\n\
+                       \x20              [--fail-on-budget]\n\
                        \n  System-ERTS baseline only.\n\
-                       \x20 --out-file  Exact output path for the report (overrides --out naming).",
+                       \x20 --out-file  Exact output path for the report (overrides --out naming).\n\
+                       \x20 --fail-on-budget  Exit 1 if at least one latency budget is exceeded.",
         "compare" => "bench compare <report.json> [--json]          # cross-runtime: sys vs rust within one report\n\
                       bench compare <a.json> <b.json> [--json]   # two-file: diff two reports\n\
                       \n  One report  Compare its `sys` rows against its `rust` rows, per (workload, metric)\n\
@@ -463,7 +488,8 @@ mod tests {
                 profile: Profile::Quick,
                 json: false,
                 out: None,
-                out_file: None
+                out_file: None,
+                fail_on_budget: false
             }
         );
         assert_eq!(
@@ -472,7 +498,8 @@ mod tests {
                 profile: Profile::Full,
                 json: true,
                 out: Some(PathBuf::from("o")),
-                out_file: None
+                out_file: None,
+                fail_on_budget: false
             }
         );
     }
@@ -485,9 +512,29 @@ mod tests {
                 profile: Profile::Quick,
                 json: false,
                 out: None,
-                out_file: Some(PathBuf::from("p"))
+                out_file: Some(PathBuf::from("p")),
+                fail_on_budget: false
             }
         );
+    }
+
+    #[test]
+    fn fail_on_budget_parses_on_run_and_baseline() {
+        let cmd = parse(&args(&["run", "--quick"])).unwrap();
+        let Command::Run(run) = cmd else { panic!("expected run") };
+        assert!(!run.fail_on_budget, "off by default");
+
+        let cmd = parse(&args(&["run", "--fail-on-budget"])).unwrap();
+        let Command::Run(run) = cmd else { panic!("expected run") };
+        assert!(run.fail_on_budget);
+
+        let cmd = parse(&args(&["baseline", "--fail-on-budget"])).unwrap();
+        let Command::Baseline { fail_on_budget, .. } = cmd else { panic!("expected baseline") };
+        assert!(fail_on_budget);
+
+        // `list`/`compare` do not judge budgets, so the flag is a usage error there.
+        assert!(parse(&args(&["list", "--fail-on-budget"])).is_err());
+        assert!(parse(&args(&["compare", "a.json", "--fail-on-budget"])).is_err());
     }
 
     #[test]
@@ -569,6 +616,10 @@ mod tests {
         assert!(t.contains("--workloads"));
         assert!(t.contains("--out"));
         assert!(t.contains("--out-file"));
+        assert!(t.contains("--fail-on-budget"));
+        assert!(t.contains("Exit 1 if at least one latency budget is exceeded"));
+        assert!(help_text(Some("baseline")).contains("--fail-on-budget"));
+        assert!(usage().contains("budget"));
         let t = help_text(Some("compare"));
         assert!(t.contains("cross-runtime"));
         assert!(t.contains("<report.json>"));

@@ -25,11 +25,17 @@
 //! [`BenchError`], which the binary maps to `2`). The core runner rule — *every
 //! scheduled `(workload × runtime)` pair yields exactly one [`WorkloadResult`]* — is
 //! implemented in [`run_all`].
+//!
+//! Every run also records the latency-budget verdicts ([`crate::budget`]) and prints
+//! them as a compact block on stderr, so a run is *judged* and not merely recorded. A
+//! breach is reported, not fatal, unless `--fail-on-budget` is given (then `1`); a
+//! `not-measured` budget never fails a run.
 
 use std::path::Path;
 
 use serde::Serialize;
 
+use crate::budget;
 use crate::cli::{self, Command, RunArgs, RuntimeSel};
 use crate::compare;
 use crate::error::{BenchError, Result};
@@ -48,10 +54,10 @@ pub fn dispatch(command: &Command) -> Result<i32> {
         }
         Command::List { json } => list(*json),
         Command::Run(args) => {
-            run_all(args)?;
-            Ok(0)
+            let report = run_all(args)?;
+            Ok(run_exit_code(&report, args.fail_on_budget))
         }
-        Command::Baseline { profile, json, out, out_file } => {
+        Command::Baseline { profile, json, out, out_file, fail_on_budget } => {
             let args = RunArgs {
                 profile: *profile,
                 workloads: Some(vec!["baseline".to_string()]),
@@ -61,15 +67,36 @@ pub fn dispatch(command: &Command) -> Result<i32> {
                 json: *json,
                 verbose: false,
                 repos: Vec::new(),
+                fail_on_budget: *fail_on_budget,
             };
-            run_all(&args)?;
-            Ok(0)
+            let report = run_all(&args)?;
+            Ok(run_exit_code(&report, args.fail_on_budget))
         }
         Command::Compare { a, b, json } => match b {
             Some(b) => compare_reports(a, b, *json),
             None => cross_compare_report(a, *json),
         },
     }
+}
+
+/// The exit code of a completed run.
+///
+/// Budget breaches are **reported, not fatal**, by default (`0`). With
+/// `--fail-on-budget` a breach makes the run exit `1` so CI can gate on it. A
+/// `not-measured` budget is never a failure — it means there was nothing to judge.
+fn run_exit_code(report: &Report, fail_on_budget: bool) -> i32 {
+    if !fail_on_budget {
+        return 0;
+    }
+    let exceeded = budget::exceeded_count(&report.budgets);
+    if exceeded == 0 {
+        return 0;
+    }
+    eprintln!(
+        "bench: --fail-on-budget: {exceeded} of {} budget(s) exceeded",
+        report.budgets.len()
+    );
+    1
 }
 
 /// A machine-readable listing entry for `bench list --json`.
@@ -183,7 +210,12 @@ fn run_all(args: &RunArgs) -> Result<Report> {
         }
     }
 
-    let report = Report::new(args.profile, infos, results);
+    let mut report = Report::new(args.profile, infos, results);
+    // Judge the finished result set against the pinned latency budgets. Pure and
+    // offline-computable: the verdicts go into the report so a later reader never has to
+    // re-run anything to know whether the run was acceptable.
+    report.budgets = budget::evaluate(&report);
+
     let out_path = match &args.out_file {
         Some(path) => {
             // Write to the exact requested path; make sure its parent exists.
@@ -202,6 +234,8 @@ fn run_all(args: &RunArgs) -> Result<Report> {
         println!("{}", report.to_json_pretty()?);
     } else {
         print_report(&report, &out_path, args.verbose);
+        // The budget block goes to stderr so it never pollutes the report on stdout.
+        eprintln!("{}", budget::render_block(&report.budgets));
     }
     Ok(report)
 }
@@ -449,5 +483,50 @@ mod tests {
         );
         assert_ne!(r.status, Status::Ok);
         assert!(r.reason.is_some());
+    }
+
+    fn report_with(verdict: crate::budget::BudgetVerdict) -> Report {
+        let mut report = Report::new(Profile::Quick, vec![], vec![]);
+        report.budgets = vec![verdict];
+        report
+    }
+
+    fn id() -> crate::budget::BudgetId {
+        crate::budget::BudgetId {
+            workload: "baseline".into(),
+            runtime: Some(RuntimeKind::Rust),
+            metric: "startup_ms".into(),
+            stat: crate::budget::Stat::P50,
+        }
+    }
+
+    #[test]
+    fn a_budget_breach_is_not_fatal_without_the_flag() {
+        let report = report_with(crate::budget::BudgetVerdict::Exceeded {
+            id: id(),
+            limit: crate::budget::Limit::AtMost(800.0),
+            measured: 900.0,
+            rationale: "r".into(),
+        });
+        assert_eq!(run_exit_code(&report, false), 0, "reported, not fatal");
+        assert_eq!(run_exit_code(&report, true), 1, "--fail-on-budget gates on it");
+    }
+
+    #[test]
+    fn a_met_or_unmeasured_budget_never_fails() {
+        let met = report_with(crate::budget::BudgetVerdict::Met {
+            id: id(),
+            limit: crate::budget::Limit::AtMost(800.0),
+            measured: 300.0,
+            rationale: "r".into(),
+        });
+        assert_eq!(run_exit_code(&met, true), 0);
+        let unmeasured = report_with(crate::budget::BudgetVerdict::NotMeasured {
+            id: id(),
+            limit: crate::budget::Limit::AtMost(800.0),
+            reason: "no rust runtime here".into(),
+            rationale: "r".into(),
+        });
+        assert_eq!(run_exit_code(&unmeasured, true), 0, "nothing to judge is not a failure");
     }
 }

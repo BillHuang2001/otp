@@ -56,6 +56,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+pub mod budget;
 pub mod cli;
 pub mod compare;
 pub mod error;
@@ -71,6 +72,7 @@ pub mod stats;
 pub mod workload;
 pub mod workloads;
 
+pub use budget::{Budget, BudgetId, BudgetVerdict, Limit, Stat, BUDGETS};
 pub use error::{BenchError, Result};
 pub use metrics::{Category, Metric, Probe, Runtimes, Status};
 pub use report::{Profile, Report, WorkloadResult, SCHEMA_VERSION};

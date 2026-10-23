@@ -25,12 +25,26 @@
 //! is not a matching, internally-consistent report (so `compare` fails loudly on
 //! garbage input instead of silently producing nonsense). Every `run`/`baseline`
 //! writes one of these under the crate's `out/` directory.
+//!
+//! # Schema version: still `1`, with a defaulted `budgets` section
+//!
+//! The latency-budget section ([`Report::budgets`]) was added **without** a version
+//! bump, because it is purely additive and carries `#[serde(default)]`: a report
+//! written before the mechanism (every archived `results/m17-*.json`) still parses,
+//! still validates and still compares, and simply reads back with an empty
+//! `budgets` vec. Bumping to `2` would have forced [`Report::validate`] to accept two
+//! versions forever to keep those archived reports loadable, for no gain in safety —
+//! the field cannot make an older reader produce a *wrong* number, it only carries extra
+//! verdicts. `budgets` is therefore documented as *recorded at run time, empty in
+//! pre-budget reports*; [`crate::budget::evaluate`] can always recompute it from any
+//! report, old or new.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::BudgetVerdict;
 use crate::error::{BenchError, Result};
 use crate::metrics::{Category, Metric, Status};
 use crate::runtime::{RuntimeInfo, RuntimeKind};
@@ -92,10 +106,21 @@ pub struct Report {
     pub runtimes: Vec<RuntimeInfo>,
     /// One entry per scheduled `(workload × runtime)` pair.
     pub results: Vec<WorkloadResult>,
+    /// The latency-budget verdicts recorded by this run (see [`crate::budget`]).
+    ///
+    /// Defaulted on load: a report written before the budget mechanism existed has no
+    /// such section and reads back as empty (see the module docs on the schema version).
+    #[serde(default)]
+    pub budgets: Vec<BudgetVerdict>,
 }
 
 impl Report {
     /// Builds a fresh report stamped with the current time.
+    ///
+    /// `budgets` starts empty: only the runner records verdicts (it evaluates them once
+    /// the result set is final, see [`crate::budget::evaluate`]), so a report
+    /// constructed elsewhere is honestly "no budgets recorded" rather than a silently
+    /// stale judgement.
     pub fn new(profile: Profile, runtimes: Vec<RuntimeInfo>, results: Vec<WorkloadResult>) -> Report {
         Report {
             schema_version: SCHEMA_VERSION,
@@ -105,6 +130,7 @@ impl Report {
             profile,
             runtimes,
             results,
+            budgets: Vec::new(),
         }
     }
 
@@ -370,5 +396,24 @@ mod tests {
             r.resolve_out_path(Path::new("/tmp/out")),
             Path::new("/tmp/out").join(name)
         );
+    }
+
+    #[test]
+    fn new_reports_start_with_no_budget_verdicts() {
+        assert!(sample_report().budgets.is_empty());
+    }
+
+    #[test]
+    fn a_pre_budget_report_without_the_field_still_loads_and_validates() {
+        // Exactly the shape of an archived `results/m17-*.json`: same schema_version,
+        // no `budgets` key at all.
+        let r = sample_report();
+        let mut value: serde_json::Value = serde_json::to_value(&r).unwrap();
+        value.as_object_mut().unwrap().remove("budgets");
+        assert!(value.get("budgets").is_none());
+        let back = Report::from_json(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert!(back.budgets.is_empty(), "the budget section defaults to empty");
+        assert_eq!(back.schema_version, SCHEMA_VERSION);
+        assert_eq!(back.results.len(), r.results.len());
     }
 }
