@@ -248,8 +248,14 @@ fn run() -> Result<(), Failure> {
     let dir = TempDir::create()?;
     let beam = compile_fixture(&erlc, dir.path())?;
 
-    // The argument terms every row reuses. `Runtime::eval` materializes them on the runtime's
-    // long-lived `-eval` heap, which Milestone 1 never resets, so they stay valid for the run.
+    // The argument terms every row reuses. `Runtime::eval` hands each result back **owned for the
+    // runtime's lifetime**: `Runtime::as_action_process` copies it off the (dying) action process's
+    // heap onto the runtime's pointer-stable `-eval` store (`Runtime::stabilize_term_with`), a
+    // bump arena that never moves a word — it grows by *replacing* its region and keeping the old
+    // one — and the copy is what `crate::eval::scratch`'s statement window is pinned against
+    // (`pin`, `PinKind::Lifetime`), so a later statement boundary cannot reclaim it. That is the
+    // same store `run_scheduled`'s return values land on, and why it is safe to hold these
+    // `Eterm`s across the whole run (see `crates/beam_rt/src/eval/CONTEXT.md`).
     // `1.5` drives `trunc/1` through the **float** path (`make_small` cannot build a float).
     let reverse_arg = eval(&mut rt, "[1,2,3,4]")?;
     let plusplus_args = vec![eval(&mut rt, "[1,2]")?, eval(&mut rt, "[3,4]")?];
@@ -258,7 +264,17 @@ fn run() -> Result<(), Failure> {
     let float_arg = eval(&mut rt, "1.5")?;
     let atom_true = eval(&mut rt, "true")?;
     let table_name = eval(&mut rt, "nb_tab")?;
-    let table_opts = eval(&mut rt, "[named_table]")?;
+    // `public`, not the `protected` default: this table is created here by the runtime's **root**
+    // process (the set-up block runs over `RuntimeContext::new`, which is the table-less `-eval`
+    // shape), while block B writes it as a **spawned** process. A `protected` table is
+    // owner-write-only, so `ets:insert/2` from any other process is `badarg` — verified on the
+    // system `erl` (OTP 29.1.1 / erts-17.1): `T = ets:new(nb_tab,[named_table]),
+    // spawn(fun() -> catch ets:insert(nb_tab,{k,1}) end)` answers
+    // `{'EXIT',{badarg,[{ets,insert,…}]}}` while `ets:lookup/2` from the same process succeeds.
+    // The harness needs **both** measurement paths to write the same table (that is what makes
+    // the A/B delta comparable), so the table must be `public` — exactly as a hand-written oracle
+    // benchmark of the same shape would have to declare it.
+    let table_opts = eval(&mut rt, "[named_table, public]")?;
     let insert_arg = eval(&mut rt, "{k,1}")?;
     let key = eval(&mut rt, "k")?;
 
@@ -308,6 +324,12 @@ fn run() -> Result<(), Failure> {
     // tables rather than the dispatch path. A `named_table`'s handle is its **name atom**, so
     // `table_name` is the handle both paths pass to `ets:insert/2` and `ets:lookup/2`, and a
     // `named_table` is global in the runtime's registry, so path B reaches the same table.
+    //
+    // The table is `public` (see the option set above) because the two paths write it as two
+    // **different** processes: this block runs over `RuntimeContext::new`, whose caller identity
+    // is the runtime's root process (a table-less context has no process of its own), while block
+    // B's rows run over `RuntimeContext::for_process` as a pid it spawned. A `protected`
+    // (default) table would answer `badarg` to exactly the write this harness is measuring.
     let table_handle = {
         let mut ctx = RuntimeContext::new(&mut rt);
         let new = Call {
