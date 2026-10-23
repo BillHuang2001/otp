@@ -581,6 +581,42 @@ pub(crate) fn undef() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("undef")))
 }
 
+/// The pre-expansion `EXC_BADFUN` signal: a fun term naming **no lambda of a loaded
+/// module** (an imported `NEW_FUN_EXT` image whose `index`/`uniq` matches no fun entry).
+///
+/// The C splits this failure in two. `call_fun` sets `p->freason = EXC_BADFUN` **and**
+/// `p->fvalue = fun`
+/// (`../../erts/emulator/beam/beam_common.c:1696-1706` — "*There is a module loaded, but
+/// obviously the fun is not defined in it*"), and `expand_error_value`
+/// (`:750-772`) then wraps the pair into `TUPLE2(am_badfun, fun)`, which an enclosing
+/// `try` observes as `{error, {badfun, Fun}}`. This constructor is the **first** half of
+/// that pair: class `error`, reason atom `badfun`.
+///
+/// # Why the host reports only the first half
+///
+/// The offending fun lives in the engine's own register file (`x(arity)`) and reaches
+/// the closure-apply seams as a bare `Eterm`; the allocation that would build the
+/// `{badfun, Fun}` tuple can collect and move that word, so a tuple built here would
+/// hold a dangling one. The expansion therefore belongs to the engine, which owns a
+/// re-readable `FunSource` for exactly this purpose — `beam_engine`'s
+/// `families::funs::raise_badfun` (the C's `expand_error_value` step, wired at the same
+/// site that already builds `{badfun, Fun}` for a *non-fun* target).
+///
+/// **Residual, measured rather than hidden:** that engine-side expansion is not wired
+/// yet, so a catch observes `{error, badfun}` where the oracle gives
+/// `{error, {badfun, Fun}}`. The **class and the reason atom now agree with the oracle**
+/// — this arm used to answer [`BeamError::BadArg`], i.e. `error:badarg` on both counts.
+/// Note the C's `error_handler:undefined_lambda/3` route is a *different* arm and keeps
+/// [`BeamError::BadArg`]: an **unloadable** module is `error:undef` on the oracle, not
+/// `badfun`.
+///
+/// The reason is backed by a `&'static str` on purpose: [`BeamError::as_atom`] returns
+/// `None` for an owned-`String` atom (`ExitReason::Atom`'s `static_str`), and that
+/// accessor is how a landing consumer recognises the reason.
+pub(crate) fn bad_fun() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("badfun")))
+}
+
 /// The live **structured reason term** carried by a raise, when it has one.
 ///
 /// A reason that is not an atom travels out of band: `beam_common`'s

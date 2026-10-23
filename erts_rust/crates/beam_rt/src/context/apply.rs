@@ -181,10 +181,15 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// A non-fun is [`BeamError::BadArg`]; an image that names no lambda of the module it
-    /// names (or of no loadable module) is [`BeamError::BadArg`] — an honest typed refusal,
-    /// never a fabricated entry. The oracle raises `{badfun, Fun}` for the loaded-module case
-    /// (see the `apply_non_local_fun` residual note).
+    /// A non-fun is [`BeamError::BadArg`]; an image whose identity names no lambda of the
+    /// loaded module it names — a stale 16-byte `uniq`, or an `index`/`old_uniq` pair no
+    /// `FunT` entry carries — is the C's `EXC_BADFUN`, raised as
+    /// [`crate::error::bad_fun`] (class `error`, reason atom `badfun`). The C's
+    /// `expand_error_value` step (`{badfun, Fun}`) is the engine's, not this seam's: the
+    /// fun reaches here as a bare `Eterm` that must not be held across an allocation —
+    /// see [`crate::error::bad_fun`] for the reasoning and the residual. An image naming
+    /// **no loadable module** stays [`BeamError::BadArg`]: the oracle answers
+    /// `error:undef` there (`error_handler:undefined_lambda/3`), a separate divergence.
     pub(crate) fn imported_fun_target(
         &mut self,
         fun: Eterm,
@@ -223,12 +228,12 @@ impl RuntimeContext<'_> {
         };
         // The C's `fun_cmp` compares the module's 16-byte `uniq`: a `NEW_FUN_EXT` image of a
         // *different* build of the module names no entry here, so no lambda of this build may
-        // be entered for it.
+        // be entered for it — the C's `EXC_BADFUN` (`beam_common.c:1696-1706`).
         if callee.checksum() != checksum {
-            return Err(BeamError::BadArg);
+            return Err(crate::error::bad_fun());
         }
         let descriptor =
-            descriptor_of(&callee, uniq, index).ok_or(BeamError::BadArg)?;
+            descriptor_of(&callee, uniq, index).ok_or_else(crate::error::bad_fun)?;
         self.closure_target(fun, callee, descriptor, args)
     }
 
@@ -348,12 +353,13 @@ impl RuntimeContext<'_> {
                 return self.call_bif(&module, &function, arity, args);
             }
             // A `NEW_FUN_EXT`-decoded closure whose in-machine entry
-            // ([`RuntimeContext::imported_fun_target`]) was declined: either it names a
+            // ([`RuntimeContext::imported_fun_target`]) was **declined**: it names a
             // **served** local stub (a decoded named `fun deflate_nif/4`, dispatched here
-            // exactly like its locally built twin) or its identity names no lambda of a
-            // loaded module. The evaluator store below is only ever asked about a `Local`
-            // term (the `-eval` closure, stamped with `EVAL_FUN_UNIQ`), so it must not be
-            // reached from here.
+            // exactly like its locally built twin). An image whose identity names no lambda
+            // of a loaded module never reaches here — `imported_fun_target` already raised
+            // the C's `EXC_BADFUN` ([`crate::error::bad_fun`]). The evaluator store below is
+            // only ever asked about a `Local` term (the `-eval` closure, stamped with
+            // `EVAL_FUN_UNIQ`), so it must not be reached from here.
             beam_codec::FunKind::Imported => {
                 return self.dispatch_served_imported_fun(fun, args)
             }
@@ -395,8 +401,10 @@ impl RuntimeContext<'_> {
     /// # Errors
     ///
     /// [`BeamError::BadArity`] for an argument count the descriptor disagrees with, and
-    /// [`BeamError::BadArg`] for an image that names no lambda — the same honest refusals the
-    /// local arm reports.
+    /// [`crate::error::bad_fun`] for an image that names no lambda of a loaded module (the
+    /// C's `EXC_BADFUN`, whose `{badfun, Fun}` expansion is the engine's — see
+    /// [`crate::error::bad_fun`]). An image naming no **loadable** module keeps
+    /// [`BeamError::BadArg`], as in [`RuntimeContext::imported_fun_target`].
     fn dispatch_served_imported_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         let (uniq, index) = terms::fun_local_key(fun)?;
         let name = self
@@ -411,7 +419,7 @@ impl RuntimeContext<'_> {
             .code_server
             .module_handle(&name)
             .ok_or(BeamError::BadArg)?;
-        let descriptor = descriptor_of(&module, uniq, index).ok_or(BeamError::BadArg)?;
+        let descriptor = descriptor_of(&module, uniq, index).ok_or_else(crate::error::bad_fun)?;
         // The **served** half only: any other decoded closure is unresolvable here (it was not
         // declined by `closure_target`'s arity guard, so this cannot mask a `BadArity`).
         let Some((module_name, function)) = served_local_key(&module, &descriptor) else {
