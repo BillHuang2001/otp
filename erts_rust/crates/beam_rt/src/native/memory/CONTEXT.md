@@ -81,7 +81,7 @@ The oracle's ordered eleven-pair proplist (integer values from `GcInfo`): `old_h
 
 ### `registered_name` is the queried process's
 `registered_name` is the truth of the **queried** process (resolved by pid, never the caller's), which is what makes the `-eval`/`-s`/`-run` action routes agree with the oracle.
-Those routes evaluate the action in a **freshly spawned, unregistered** child of the runtime's root process (`../../runtime.rs::as_action_process`), so the action's own `process_info(self(), registered_name)` answers the bare `[]` exactly as the oracle's `-eval` child of `init` does, while `process_info(init, registered_name)` still answers `init`.
+Those routes evaluate the action in a **freshly spawned, unregistered** child of the runtime's root process (`../../runtime.rs::as_action_process`), so the action's own `process_info(self(), registered_name)` answers the bare `[]` exactly as the oracle's `-eval` child of `init` does, while `process_info(init, registered_name)` still answers `init` (the `init` stand-in is registered; the root process is not).
 The dispatch-level pin is `tests.rs::registered_name_is_the_queried_processes_name_not_the_callers` (the root pid is registered as `init`, so a test can `unregister` it to reach the live-unregistered case).
 
 ## Constraints
