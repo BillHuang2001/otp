@@ -1128,7 +1128,16 @@ impl<'a> BifContext<'a> {
     }
 
     /// The atom table.
-    pub fn atoms(&self) -> &AtomTable {
+    ///
+    /// The returned reference carries the context's own lifetime (`&'a AtomTable`)
+    /// rather than the accessor's borrow: the field is a shared reference, so reading
+    /// it copies the reference out and the borrow of `self` ends at the call. That is
+    /// what lets a caller hold the (immutable) table **across** a later `&mut self`
+    /// use — e.g. [`BifContext::local_fun_identity`], whose seam has to be asked for a
+    /// `make_fun3` closure's defining module while the table being hashed against is
+    /// still in hand (see [`crate::compare`]'s `phash2/1,2`/`phash/2` provider). Same
+    /// pattern, same reason, as [`BifContext::export_gate`].
+    pub fn atoms(&self) -> &'a AtomTable {
         self.atoms
     }
 

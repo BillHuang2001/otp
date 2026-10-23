@@ -72,22 +72,9 @@
 //! hash this runtime cannot reproduce **faithfully**, and the BIF contract here is the
 //! crate-wide one — a **typed** `unsupported_bif` capability gap, never a wrong number
 //! and never a plain `badarg` — so every `TermError` is mapped to `unsupported_bif`
-//! ([`hashing_gap`]). Two of those refusals are *identity*, not layout, and each names
-//! exactly one missing capability:
+//! ([`hashing_gap`]). One refusal is *identity*, not layout, and it names exactly one
+//! missing capability:
 //!
-//! * **A `make_fun3` (`FunKind::Local`) fun** needs a **fun-identity provider** threaded
-//!   through `beam_term`'s two hash ports. The C's local-fun arm mixes the defining
-//!   module's atom-table hvalue, the lambda's `index`, its `old_uniq`, the `num_free`
-//!   capture count and then every free variable
-//!   (`erl_term_hashing.c:238-265` for `make_hash`, `:1219-1245` for `make_hash2` — the
-//!   `atom_tab(atom_val(fe->module))->slot.bucket.hvalue`, `fe->index`, `fe->old_uniq`
-//!   triple), and the frozen M1 term carries none of `fe->module`/`fe->old_uniq`: its
-//!   inlined descriptor is only `[uniq:u64][index:u32]`. The missing data is exactly a
-//!   `beam_codec::FunIdentity` — what the [`crate::LocalFunIdentity`] seam already
-//!   yields — so the fix is a provider parameter on `make_hash`/`make_hash2`, not a
-//!   term-layout change; until it exists both ports answer
-//!   `TermError::FunIdentityUnavailable` (`beam_term/src/hashing/make_hash2.rs:370`,
-//!   `beam_term/src/hashing/make_hash.rs:236`).
 //! * **An internal reference** needs no new data at all: the C mixes
 //!   `internal_ref_numbers(term)[0]` (`erl_term_hashing.c:288-290` for `make_hash`,
 //!   `:1454-1458` for `make_hash2`), i.e. `id & REF_MASK` — a pure projection of the
@@ -97,13 +84,26 @@
 //!   it — which is also why an internal and an external spelling of the same three
 //!   numbers hash identically on the oracle — and it only does not yet
 //!   (`TermError::RefIdentityUnavailable`,
-//!   `beam_term/src/hashing/make_hash2.rs:432-441`, `beam_term/src/hashing/make_hash.rs:264-272`).
+//!   `beam_term/src/hashing/make_hash2.rs:507`, `beam_term/src/hashing/make_hash.rs:334`).
 //!
-//! Those two are the only refusals a well-formed term can reach; the rest
-//! (`TermError::NotATerm`, and `BadFun` for a forged fun block) reject input that is not
-//! a term at all.//!
-//! # Pinned against the OTP 29 oracle
+//! The other refusal a well-formed term can reach — a `make_fun3` (`FunKind::Local`)
+//! fun — is **closed** by a fun-identity provider, and this module is that provider's
+//! only wiring: [`SeamFunIdentity`] forwards the crate's [`crate::LocalFunIdentity`]
+//! seam into `beam_term`'s [`make_hash_with_identity`]/[`make_hash2_with_identity`]
+//! (`beam_term/src/hashing/identity.rs`). With that provider a `Local` fun hashes
+//! exactly like the equivalent `NEW_FUN_EXT` image, because the C mixes the same four
+//! fields (`erl_term_hashing.c:238-265` for `make_hash`, `:1219-1245` for `make_hash2`
+//! — `atom_tab(atom_val(fe->module))->slot.bucket.hvalue`, `fe->index`, `fe->old_uniq`
+//! and `num_free` plus the env); the term carries the last three and the seam supplies
+//! the defining module. What still answers the gap is a `Local` fun **no seam can
+//! attribute**: no [`crate::LocalFunIdentity`] hook installed, or a hook answering
+//! `Ok(None)` (the `-eval` `erl_eval` template closure — it was never compiled by a
+//! module, so there is no module lambda table to resolve it in).
 //!
+//! The remaining refusals (`TermError::NotATerm`, and `BadFun` for a forged fun block)
+//! reject input that is not a term at all.
+//!
+//! # Pinned against the OTP 29 oracle//!
 //! * `1 == 1.0` ⇒ `true`, `1 =:= 1.0` ⇒ `false`.
 //! * `1 < 1.0` ⇒ `false`, `1 =< 1.0` ⇒ `true`.
 //! * `a < {a}` ⇒ `true` (atom sorts before tuple in the term order).
@@ -116,9 +116,10 @@ use beam_common::{BeamError, Result};
 use beam_term::compare::{
     cmp, cmp_arith, cmp_arith_with_local_node, cmp_with_local_node, LocalNodeId,
 };
-use beam_term::hashing::{make_hash, make_hash2};
-use beam_term::{AtomTable, Eterm, TermError};
-
+use beam_term::hashing::{
+    make_hash2_with_identity, make_hash_with_identity, LocalFunIdentity as TermFunIdentity,
+};
+use beam_term::{Atom, AtomTable, Eterm, TermError, TermResult};
 use crate::access;
 use crate::arith;
 use crate::context::BifContext;
@@ -275,22 +276,23 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 ///
 /// The two hashes are *frozen observable behaviour*, so a term whose hash this
 /// runtime cannot reproduce **faithfully** must never yield a number: the registry
-/// contract ([`crate::error::unsupported_bif`]) is a typed raise instead. Today that
-/// means the two LCA identity refusals — [`TermError::FunIdentityUnavailable`] for a
-/// `make_fun3` (`FunKind::Local`) fun, whose hash needs the defining module's atom
-/// hvalue and the lambda's `old_uniq` (the C mixes `fe->module`/`fe->index`/
-/// `fe->old_uniq`/`num_free` and the env, `erl_term_hashing.c:238-265`/`:1219-1245`),
-/// and [`TermError::RefIdentityUnavailable`] for an internal reference, whose C mix is
-/// `internal_ref_numbers(term)[0]` (`:288-290`/`:1454-1458`) — both of which a
-/// fun-identity provider / an `id & REF_MASK` step in `beam_term::hashing` would close
-/// (module docs, Handoffs). Mapping the whole `TermError` set — not just the classes we
-/// can name today — keeps that honest as `beam_term::hashing` grows: a new refusal there
-/// becomes a gap here rather than being collapsed into a plain `badarg` by
-/// `From<TermError>`.
+/// contract ([`crate::error::unsupported_bif`]) is a typed raise instead.
+///
+/// One class of refusal remains reachable from a well-formed term:
+/// [`TermError::RefIdentityUnavailable`] for an internal reference, whose C mix is
+/// `internal_ref_numbers(term)[0]` (`:288-290`/`:1454-1458`) — a pure projection of the
+/// `id` word the M1 reference thing stores, so the LCA can close it without new data
+/// (module docs, Handoffs). The other — [`TermError::FunIdentityUnavailable`] for a
+/// `make_fun3` (`FunKind::Local`) fun — is closed *for the request that carries a
+/// [`crate::LocalFunIdentity`] seam* by [`SeamFunIdentity`] below, and still raised
+/// when the seam cannot attribute the closure (no hook, or an `Ok(None)` answer).
+///
+/// Mapping the whole `TermError` set — not just the classes we can name today — keeps
+/// that honest as `beam_term::hashing` grows: a new refusal there becomes a gap here
+/// rather than being collapsed into a plain `badarg` by `From<TermError>`.
 fn hashing_gap(_: TermError) -> BeamError {
     unsupported_bif()
-}
-/// `phash_2`'s `Range` argument (`bif.c:5376-5385`) — the `Uint32` modulus, or `0`
+}/// `phash_2`'s `Range` argument (`bif.c:5376-5385`) — the `Uint32` modulus, or `0`
 /// for the special `2^32` range.
 ///
 /// # Errors
@@ -339,11 +341,13 @@ fn range_of(term: Eterm) -> Result<u32> {
 ///
 /// # Errors
 ///
-/// `badarg` for an invalid `Range` and the typed `unsupported_bif` gap for a term
-/// [`make_hash`] cannot reproduce.
+/// `badarg` for an invalid `Range`, a [`crate::LocalFunIdentity`] seam failure
+/// propagated unchanged, and the typed `unsupported_bif` gap for a term
+/// [`make_hash`](beam_term::hashing::make_hash) cannot reproduce (an internal
+/// reference, or a `make_fun3` fun no seam can attribute).
 fn phash_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let range = range_of(args[1])?;
-    let hash = phash_of(args[0], ctx.atoms())?;
+    let hash = phash_of(ctx, args[0])?;
     // `range != 0` ⇒ `1 + (hash % range)`, i.e. `[1..range]`; the `2^32` range
     // (`range == 0`) ⇒ `hash + 1` (one past the top of the `u32` space, promoted
     // exactly as the C `erts_mixed_plus` does).
@@ -360,9 +364,11 @@ fn phash_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// The typed `unsupported_bif` gap for a term [`make_hash2`] cannot reproduce.
+/// A [`crate::LocalFunIdentity`] seam failure propagated unchanged, and the typed
+/// `unsupported_bif` gap for a term [`make_hash2`](beam_term::hashing::make_hash2)
+/// cannot reproduce.
 fn phash2_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let hash = phash2_of(args[0], ctx.atoms())?;
+    let hash = phash2_of(ctx, args[0])?;
     // `make_small(hash & ((1L << 27) - 1))` — always a small integer.
     ctx.int(i64::from(hash & 0x07FF_FFFF))
 }
@@ -373,31 +379,105 @@ fn phash2_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// `badarg` for an invalid `Range` and the typed `unsupported_bif` gap for a term
-/// [`make_hash2`] cannot reproduce.
+/// `badarg` for an invalid `Range`, a [`crate::LocalFunIdentity`] seam failure
+/// propagated unchanged, and the typed `unsupported_bif` gap for a term
+/// [`make_hash2`](beam_term::hashing::make_hash2) cannot reproduce.
 fn phash2_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let range = range_of(args[1])?;
-    let hash = phash2_of(args[0], ctx.atoms())?;
+    let hash = phash2_of(ctx, args[0])?;
     let final_hash = if range != 0 { hash % range } else { hash };
     ctx.int(i64::from(final_hash))
 }
-
-/// [`make_hash`] behind this crate's typed-gap contract: a term the lowest-common-ancestor
-/// port cannot reproduce faithfully ([`hashing_gap`]) is the typed `unsupported_bif`
-/// capability gap, never a wrong number.
+/// [`make_hash`](beam_term::hashing::make_hash) behind this crate's typed-gap
+/// contract: a term the lowest-common-ancestor port cannot reproduce faithfully
+/// ([`hashing_gap`]) is the typed `unsupported_bif` capability gap, never a wrong
+/// number.
 ///
 /// `beam_term::hashing` is **authoritative** here — it resolves a native record's
 /// definition hash itself and refuses only a *term identity* it cannot derive (a
-/// `make_fun3` local fun, an internal reference) or an input that is not a term at all,
-/// so no consumer-side pre-check is needed (module docs).
-fn phash_of(t: Eterm, atoms: &AtomTable) -> Result<u32> {    make_hash(t, atoms).map_err(hashing_gap)
+/// `make_fun3` local fun whose defining module nobody can name, an internal
+/// reference) or an input that is not a term at all, so no consumer-side pre-check is
+/// needed (module docs). The local-fun half is answered by [`SeamFunIdentity`], which
+/// forwards this crate's [`crate::LocalFunIdentity`] seam to
+/// [`beam_term::hashing::make_hash_with_identity`].
+fn phash_of(ctx: &mut BifContext<'_>, t: Eterm) -> Result<u32> {
+    let atoms = ctx.atoms();
+    let mut identity = SeamFunIdentity {
+        ctx,
+        failure: None,
+    };
+    let hash = make_hash_with_identity(t, atoms, Some(&mut identity));
+    identity.finish(hash)
 }
 
-/// [`make_hash2`] behind this crate's typed-gap contract — see [`phash_of`].
-fn phash2_of(t: Eterm, atoms: &AtomTable) -> Result<u32> {
-    make_hash2(t, atoms).map_err(hashing_gap)
+/// [`make_hash2`](beam_term::hashing::make_hash2) behind this crate's typed-gap
+/// contract — see [`phash_of`].
+fn phash2_of(ctx: &mut BifContext<'_>, t: Eterm) -> Result<u32> {
+    let atoms = ctx.atoms();
+    let mut identity = SeamFunIdentity {
+        ctx,
+        failure: None,
+    };
+    let hash = make_hash2_with_identity(t, atoms, Some(&mut identity));
+    identity.finish(hash)
 }
 
+/// The [`beam_term::hashing::LocalFunIdentity`] provider the two legacy hash ports
+/// ask for a `make_fun3` (`FunKind::Local`) closure's **defining module** — backed by
+/// this crate's [`crate::LocalFunIdentity`] seam, i.e. the same host answer that makes
+/// `term_to_binary/1` and `#Fun<…>` rendering byte-faithful.
+///
+/// The C reads `fe->module` out of the closure's out-of-line `ErlFunEntry`
+/// (`erl_term_hashing.c:242-251`/`:1224-1246`); this tree's inlined descriptor carries
+/// only `uniq`/`index`, so the module has to be supplied by whoever knows which
+/// module the closure was compiled in. `beam_rt` resolves it from the calling module's
+/// lambda table and installs it whenever [`crate::hook_sets::LOCAL_FUN_IDENTITY_BIFS`]
+/// lists the dispatch (`beam_rt`'s `uses_fun_identity` gate).
+///
+/// # Errors are recorded, never swallowed
+///
+/// The trait's own signature is [`beam_term::TermResult`], so it cannot carry this
+/// crate's [`BeamError`]. When the seam fails (rather than answering `Ok(None)`) the
+/// provider answers `Ok(None)` — which makes the port refuse the fun — and *records*
+/// the seam's failure in [`Self::failure`] so [`Self::finish`] reports **that** error
+/// instead of collapsing it into the generic `unsupported_bif` gap. A host failure
+/// therefore surfaces as itself, and the generic gap is reserved for "the identity is
+/// genuinely unknown".
+struct SeamFunIdentity<'c, 'a> {
+    ctx: &'c mut BifContext<'a>,
+    /// The first [`crate::LocalFunIdentity`] failure seen, reported by [`Self::finish`].
+    failure: Option<BeamError>,
+}
+
+impl TermFunIdentity for SeamFunIdentity<'_, '_> {
+    fn local_fun_module(&mut self, term: Eterm) -> TermResult<Option<Atom>> {
+        match self.ctx.local_fun_identity(term) {
+            Ok(identity) => Ok(identity.map(|id| id.module)),
+            Err(err) => {
+                if self.failure.is_none() {
+                    self.failure = Some(err);
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl SeamFunIdentity<'_, '_> {
+    /// The BIF's answer: the port's own hash, or the seam's recorded failure, or the
+    /// typed capability gap when the port refused for a reason the seam did not cause
+    /// ([`hashing_gap`]).
+    fn finish(self, hash: TermResult<u32>) -> Result<u32> {
+        match hash {
+            Ok(hash) => Ok(hash),
+            // A refused hash *caused* by a failed seam reports the seam, not the gap.
+            Err(err) => match self.failure {
+                Some(failure) => Err(failure),
+                None => Err(hashing_gap(err)),
+            },
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

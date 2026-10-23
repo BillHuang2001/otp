@@ -35,7 +35,7 @@
 //! | seam | table | keys |
 //! |---|---|---|
 //! | [`MemoryHook`] | [`MEMORY_HOOK_BIFS`] | 2 |
-//! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 9 |
+//! | [`LocalFunIdentity`] | [`LOCAL_FUN_IDENTITY_BIFS`] | 12 |
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 8 |
@@ -140,7 +140,7 @@ pub const MEMORY_HOOK_BIFS: &[(&str, &str, u32)] = &[
 /// `make_fun3` (`Local`) fun's `#Fun<Module.OldIndex.OldUniq>` triple comes from,
 /// since the frozen descriptor carries only `(uniq, index)`.
 ///
-/// Two families reach it:
+/// Three families reach it:
 ///
 /// * the **encoders** — `erlang:term_to_binary/1,2` through `encode_image`/
 ///   `encode_body`, and `erlang:external_size/1,2` through `plain_image_of`, which
@@ -148,7 +148,11 @@ pub const MEMORY_HOOK_BIFS: &[(&str, &str, u32)] = &[
 ///   the external-term encoder);
 /// * the **renderers** — `erlang:fun_to_list/1` and the printer leaf behind
 ///   `io:format/2`, `io_lib:format/2,3` and `erlang:display/1`, all through
-///   `fun_info::fun_text` (the C's `FUN_DEF` arm, one text for both routes).
+///   `fun_info::fun_text` (the C's `FUN_DEF` arm, one text for both routes);
+/// * the **two legacy hash ports** — `erlang:phash/2` and `erlang:phash2/1,2`, whose
+///   `beam_term::hashing` local-fun arm mixes the defining module's atom-table
+///   `hvalue` exactly as the C's `fe->module` read does (`src/compare.rs`'s
+///   `SeamFunIdentity`).
 ///
 /// `io:format/1` is deliberately **absent**: it is `io:format(Format, [])`, so it has
 /// no argument term and no directive can ever render — listing it would be a
@@ -161,13 +165,15 @@ pub const LOCAL_FUN_IDENTITY_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "external_size", 1),
     ("erlang", "external_size", 2),
     ("erlang", "fun_to_list", 1),
+    ("erlang", "phash", 2),
+    ("erlang", "phash2", 1),
+    ("erlang", "phash2", 2),
     ("erlang", "term_to_binary", 1),
     ("erlang", "term_to_binary", 2),
     ("io", "format", 2),
     ("io_lib", "format", 2),
     ("io_lib", "format", 3),
 ];
-
 /// The registered BIFs that read the [`DictHook`] seam — the whole process-dictionary
 /// surface of `src/dict.rs`, each through a `dict_*` accessor.
 ///
@@ -825,12 +831,15 @@ mod tests {
     }
 
     #[test]
-    fn local_fun_identity_bifs_are_the_encoders_and_the_fun_renderers() {
+    fn local_fun_identity_bifs_are_the_encoders_the_fun_renderers_and_the_hash_ports() {
         // `encode_body` (binconv.rs) reads `ctx.local_fun_identity()`; it is reached
         // by `term_to_binary/1,2` (via `encode_image`) and by `external_size/1,2`
         // (via `plain_image_of`). `fun_info::fun_text` reads it for the printed
         // `#Fun<…>` triple — reached by `erlang:fun_to_list/1` and by the printer leaf
         // behind `io:format/2`, `io_lib:format/2,3` and `erlang:display/1`.
+        // `compare::SeamFunIdentity` reads it for the two legacy hash ports
+        // (`phash/2`, `phash2/1,2`), whose `beam_term::hashing` local-fun arm needs the
+        // closure's defining module.
         // `io:format/1` takes no argument term (`io:format(Format, [])`), so it can
         // never render a fun and is deliberately absent. Sorted by
         // `(module, function, arity)`.
@@ -841,6 +850,9 @@ mod tests {
                 ("erlang", "external_size", 1),
                 ("erlang", "external_size", 2),
                 ("erlang", "fun_to_list", 1),
+                ("erlang", "phash", 2),
+                ("erlang", "phash2", 1),
+                ("erlang", "phash2", 2),
                 ("erlang", "term_to_binary", 1),
                 ("erlang", "term_to_binary", 2),
                 ("io", "format", 2),
@@ -848,8 +860,11 @@ mod tests {
                 ("io_lib", "format", 3),
             ]
         );
+        // The table is what `binary_search` relies on, and a hash port whose module is
+        // quietly missing would make `beam_rt`'s `uses_fun_identity` gate skip the
+        // bridge — leaving the runtime path on the typed gap with nothing failing.
+        assert!(LOCAL_FUN_IDENTITY_BIFS.windows(2).all(|w| w[0] < w[1]));
     }
-
     #[test]
     fn dict_hook_bifs_are_exactly_the_dict_roster() {
         assert_eq!(
@@ -1100,10 +1115,10 @@ mod tests {
     /// "`erlang:send/2` and its quoted alias … the same `src/proc.rs`
     /// implementation" plus the `ets:give_away/3` transfer announcement in
     /// `src/ets/adopt.rs`, `node/0,1` in `src/convert.rs`, the encoders split across
-    /// `src/binconv.rs`/`src/term_conv.rs`, the fun-taking surface across
+    /// `src/binconv.rs`/`src/term_conv.rs`, the two legacy hash ports in
+    /// `src/compare.rs`, the fun-taking surface across
     /// `src/lists.rs`/`src/maps.rs`/`src/ets/adopt.rs` — and catches a key listed
-    /// under the wrong module (a typo, or a BIF that moved).
-    #[test]
+    /// under the wrong module (a typo, or a BIF that moved).    #[test]
     fn subset_tables_are_contained_in_their_defining_modules() {
         let cases: &[(&str, &[(&str, &str, u32)], &[fn(&mut BifRegistry)])] = &[
             (
@@ -1119,9 +1134,9 @@ mod tests {
                     crate::term_conv::register,
                     crate::fun_info::register,
                     crate::io::register,
+                    crate::compare::register,
                 ],
-            ),
-            (
+            ),            (
                 "PORT_HOOK_BIFS",
                 PORT_HOOK_BIFS,
                 &[crate::port::register, crate::runtime::register],
@@ -1304,11 +1319,10 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 223,
-            "the documented seam surface is 223 keys across the 14 tables; a table \
+            aggregate, 226,
+            "the documented seam surface is 226 keys across the 14 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
-        );
-    }
+        );    }
 
     /// The registration bodies are **pairwise disjoint**: [`BifRegistry::register`]
     /// keeps the *last* implementation registered for a key, so an overlap between two

@@ -113,9 +113,9 @@ const FAST_PATHS: usize = 111;
 const MISSING_DECLARED: usize = 0;
 
 /// The seam union and the partition of the declared surface it induces.
-const SEAM_UNION: usize = 219;
-const DECLARED_SEAM_BACKED: usize = 186;
-const DECLARED_IN_CRATE: usize = 370;
+const SEAM_UNION: usize = 222;
+const DECLARED_SEAM_BACKED: usize = 189;
+const DECLARED_IN_CRATE: usize = 367;
 const UNDECLARED_SEAM_MEMBERS: usize = 33;
 /// The keys two tables share — the four external-term encoders, which read the
 /// fun-identity **and** the local-node seams.
@@ -127,7 +127,7 @@ const SHARED_UNION_KEYS: usize = 4;
 /// [`TABLES`] order; the total column sums to [`SEAM_UNION`] + [`SHARED_UNION_KEYS`].
 const TABLE_PINS: &[(&str, usize, usize)] = &[
     ("MEMORY_HOOK_BIFS", 2, 0),
-    ("LOCAL_FUN_IDENTITY_BIFS", 9, 6),
+    ("LOCAL_FUN_IDENTITY_BIFS", 12, 9),
     ("DICT_HOOK_BIFS", 7, 7),
     ("PROCESS_HOOK_BIFS", 11, 11),
     ("PORT_HOOK_BIFS", 8, 4),

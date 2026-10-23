@@ -763,6 +763,33 @@ const CENSUS: &[Row] = &[
         Expect::Value(check_small_five, "the integer 5"),
         "`ExportGate` is *skipped*, not refused, with no hook installed: `[safe]`/`[]` decode the same image"
     ),
+    // The three legacy hash ports. Their `LocalFunIdentity` default is `Ok(None)`, which
+    // the two hash ports turn into the typed gap **only for a `make_fun3` closure** — a
+    // term with no local fun in it hashes normally (the `Ok(None)` arm is never
+    // consulted), so the census' ordinary arguments answer real values. The other leg —
+    // a local fun with no hook is the gap, exactly like the renderers — is pinned by
+    // [`the_hash_ports_refuse_an_unattributable_local_fun`].
+    default_value!(
+        "erlang",
+        "phash2",
+        1,
+        Expect::Value(check_phash2_of_one, "2614250"),
+        "`LocalFunIdentity`'s `Ok(None)` default only refuses a `make_fun3` closure: `make_hash2(1)` needs no identity"
+    ),
+    default_value!(
+        "erlang",
+        "phash2",
+        2,
+        Expect::Value(check_small_zero, "0"),
+        "as `phash2/1`: an integer argument never reaches the fun-identity seam, so the `Range` modulus answers"
+    ),
+    default_value!(
+        "erlang",
+        "phash",
+        2,
+        Expect::Value(check_phash_of_one_mod_two, "2"),
+        "as `phash2/1`: `make_hash` needs the identity for a `make_fun3` closure only, so `phash(1, 2)` answers"
+    ),
     default_value!(
         "records",
         "get_definition",
@@ -771,7 +798,6 @@ const CENSUS: &[Row] = &[
         "`RecordSource` answers `Ok(None)` with no hook, which `records:get_definition/2` renders as the oracle's `badarg`"
     ),
 ];
-
 // ---------------------------------------------------------------------------
 // Value predicates (the class-A / class-C / class-D pins).
 //
@@ -815,6 +841,22 @@ fn check_small_five(_atoms: &AtomTable, term: Eterm) -> bool {
     beam_term::is_small(term) && beam_term::signed_value(term) == 5
 }
 
+/// `term` is the small integer `value`.
+fn is_small_value(term: Eterm, value: i64) -> bool {
+    beam_term::is_small(term) && beam_term::signed_value(term) == value
+}
+
+/// `erlang:phash2(1)` = `2614250` (oracle-pinned, OTP 29.1.1). An integer never
+/// reaches the `LocalFunIdentity` seam, so this is the seam-free answer the class-D
+/// default documents.
+fn check_phash2_of_one(_atoms: &AtomTable, term: Eterm) -> bool {
+    is_small_value(term, 2_614_250)
+}
+
+/// `erlang:phash(1, 2)` = `2` (oracle-pinned; `1 + make_hash(1) % 2`).
+fn check_phash_of_one_mod_two(_atoms: &AtomTable, term: Eterm) -> bool {
+    is_small_value(term, 2)
+}
 /// A binary in the external term format (the version byte `131`).
 fn check_external_image(_atoms: &AtomTable, term: Eterm) -> bool {
     match bitstring_bytes(term) {
@@ -1312,24 +1354,28 @@ fn the_class_b_rows_are_the_seam_union_minus_the_documented_defaults() {
         extra.is_empty(),
         "class-B rows that no gap-defaulting seam table lists: {extra:?}"
     );
-    // The overlap is exactly the four `LOCAL_FUN_IDENTITY_BIFS` **encoders**, whose
-    // uninstalled default is `Ok(None)`, so they are class-D rows; the table's five
-    // renderers default to the typed gap instead and are ordinary class-B rows.
+    // The overlap is exactly the seven `LOCAL_FUN_IDENTITY_BIFS` defaults — the four
+    // **encoders** and the three **hash ports**, whose uninstalled default is
+    // `Ok(None)`, so they are class-D rows; the table's five renderers default to the
+    // typed gap instead and are ordinary class-B rows.
     let overlap: BTreeSet<Key> = universe.intersection(&defaults).copied().collect();
     let encoders: BTreeSet<Key> = [
         ("erlang", "term_to_binary", 1),
         ("erlang", "term_to_binary", 2),
         ("erlang", "external_size", 1),
         ("erlang", "external_size", 2),
+        ("erlang", "phash", 2),
+        ("erlang", "phash2", 1),
+        ("erlang", "phash2", 2),
     ]
     .into_iter()
     .collect();
     let local_fun_identity: BTreeSet<Key> = LOCAL_FUN_IDENTITY_BIFS.iter().copied().collect();
     assert_eq!(
         overlap, encoders,
-        "the class-D rows that a class-B table lists must be exactly the four `LOCAL_FUN_IDENTITY_BIFS` encoders"
-    );
-    assert!(
+        "the class-D rows that a class-B table lists must be exactly the four \
+         `LOCAL_FUN_IDENTITY_BIFS` encoders plus its three hash ports"
+    );    assert!(
         overlap.is_subset(&local_fun_identity),
         "every overlapping class-D row must be a `LOCAL_FUN_IDENTITY_BIFS` member"
     );
@@ -1376,18 +1422,17 @@ fn class_a_and_class_c_are_disjoint_from_the_seam_union() {
 /// | class | rows | meaning |
 /// |---|---|---|
 /// | A | 4 | closed in-crate |
-/// | B | 211 | `215` seam-table keys − the `4` `LOCAL_FUN_IDENTITY_BIFS` defaults |
+/// | B | 211 | `218` seam-table keys − the `7` `LOCAL_FUN_IDENTITY_BIFS` defaults |
 /// | C | 23 | `erl_debugger` 13 + `erts_debug` 8 + the 2 collector RPCs |
-/// | D | 8 | `LOCAL_NODE_BIFS` 6 + `RECORD_SOURCE_BIFS` 1 + `EXPORT_GATE_BIFS` 1 |
+/// | D | 11 | `LOCAL_NODE_BIFS` 6 + `RECORD_SOURCE_BIFS` 1 + `EXPORT_GATE_BIFS` 1 + the 3 `LOCAL_FUN_IDENTITY_BIFS` hash ports |
 #[test]
 fn the_class_counts_are_pinned() {
     let counts = [
         (Class::A, 4usize),
         (Class::B, 211),
         (Class::C, 23),
-        (Class::D, 8),
-    ];
-    for (class, expected) in counts {
+        (Class::D, 11),
+    ];    for (class, expected) in counts {
         assert_eq!(
             rows_of(class).count(),
             expected,
@@ -1470,5 +1515,39 @@ fn the_local_option_is_the_documented_gap() {
             "`[local]` needs a `local_node_hash` no host-side seam can invent"
         ),
         other => panic!("term_to_binary(1, [local]) must be the typed gap, got {other:?}"),
+    }
+}
+
+/// The other leg of the three **hash ports** — `erlang:phash/2` and
+/// `erlang:phash2/1,2` answer the typed `unsupported_bif` gap for a `make_fun3`
+/// (`FunKind::Local`) closure when no [`LocalFunIdentity`](beam_bifs::LocalFunIdentity)
+/// hook is installed, exactly like the five renderers.
+///
+/// This is what keeps their class-D rows honest. A class-D row pins the *non-gap*
+/// default (an ordinary term hashes), and this pins the leg where the `Ok(None)` default
+/// **is** the gap — the two together are the seam's complete uninstalled behaviour, and
+/// the same split [`the_local_option_is_the_documented_gap`] pins for `term_to_binary/2`.
+#[test]
+fn the_hash_ports_refuse_an_unattributable_local_fun() {
+    let reg = default_registry();
+    for (function, arity) in [("phash2", 1u32), ("phash2", 2), ("phash", 2)] {
+        let mut heap = test_heap();
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let fun = local_fun();
+        let range = ctx.int(1_000_000).expect("fits");
+        let args: Vec<Eterm> = if arity == 1 { vec![fun] } else { vec![fun, range] };
+        match reg.call("erlang", function, arity, &mut ctx, &args) {
+            Err(BeamError::Raise(raise)) => assert_eq!(
+                raise.reason,
+                ExitReason::atom("unsupported_bif"),
+                "{function}/{arity} of a make_fun3 closure with no fun-identity hook must be \
+                 the typed gap (its defining module is not in the term)"
+            ),
+            other => panic!(
+                "erlang:{function}/{arity} of a make_fun3 closure must be the typed gap, \
+                 got {other:?}"
+            ),
+        }
     }
 }
