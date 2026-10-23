@@ -65,6 +65,9 @@
 //! | `nested_payload_40_levels_deep` | a 40-level nested tuple term survives the same check |
 //! | `send_to_a_missing_remote_name` | a `DOP_REG_SEND` to a **non-registered** name on the peer is dropped (the send returns the message) and the link keeps working |
 //! | `send_to_a_dead_remote_pid` | a `DOP_SEND` to an **exited** process on the peer is dropped and the link keeps working |
+//! | `link_exit_crosses_the_wire` | the **inbound `DOP_EXIT` reply** really reaches a linked local process: the peer's worker dies `boom` and the trapping client gets `{'EXIT', Pid, boom}` with a pid of the peer's node |
+//! | `monitor_down_crosses_the_wire` | the **inbound `DOP_MONITOR_P_EXIT` reply** really reaches the watcher: the DOWN carries the client's **own** reference, a pid of the peer's node and the peer worker's compound reason |
+//! | `unlink_id_ack_is_consumed_without_retiring_the_link` | the **inbound `DOP_UNLINK_ID_ACK` reply** is consumed, not refused: the far side's link record drops, no EXIT arrives, and the node is still connected (`nodes()` is 1) and answering |
 //!
 //! The payload identity check is deliberately *relational*: the peer computes `phash2/1` and
 //! `byte_size(term_to_binary/1)` of what it received and the client compares them with its
@@ -93,33 +96,36 @@
 //! # The measured signal families: what works, in which direction, and what cannot be pinned
 //!
 //! Every claim below was measured by hand as a two-VM self-pair (client + a peer of the same
-//! program) on OTP 29.1.1 / erts-17.1 and `beam_rt` at its release build. `divergences.md` §A.5
-//! is the ledger; this paragraph exists so no future agent re-measures it.
+//! program) on OTP 29.1.1 / erts-17.1 and `beam_rt` (the `gate.sh` build). `divergences.md` §A.5
+//! is the ledger; this paragraph exists so no future agent re-measures it. The three inbound
+//! **reply** signals were re-measured when their cases landed and all three now agree — the
+//! `link`/`monitor`/`unlink` receipt paths were an older runtime's gaps:
 //!
-//! * **`link/1` + `DOP_EXIT` — no direction works.** Client links to a peer-side process that
-//!   then dies (`{'EXIT', Pid, boom}` on the oracle, under `process_flag(trap_exit, true)`):
-//!   the Rust side delivers **no signal** within 8 s. The mirror — the *peer* links to a
-//!   client-side process that then dies — is equally silent, and so is a *spawned linker* (a
-//!   client-side process that links to the peer's main process and then exits `boom`). A
-//!   cross-runtime probe localizes it to **both halves**: with a Rust client and an *oracle*
-//!   peer the oracle's own `process_info(self(), links)` never gains the Rust client's pid, so
-//!   the outbound `DOP_LINK` is not written; with an *oracle* client and a Rust peer the Rust
-//!   peer never records the incoming link. `erlang:unlink/1` rides the same path
-//!   (`DOP_UNLINK_ID`, whose ack the inbound sink documents as unemittable), so the paired
-//!   `no_exit` case cannot be pinned either.
-//! * **`erlang:exit(RemotePid, Reason)` — `unsupported: bif`, and `kill` is silently dropped.**
-//!   `erlang:exit/2` on a *remote* pid with a plain reason is the runtime's `unsupported: bif`
-//!   capability gap (the peer VM exits `3`); with reason `kill` it returns `true` but no signal
-//!   reaches the far side, so an "untrapped EXIT kills the linked far-side process" observable
-//!   (the far side reports its own local `DOWN`) is unavailable in either direction.
-//! * **`erlang:monitor/2` of a remote process (`DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`) — no
-//!   direction works.** A *client* monitoring a peer-side pid, a *peer* monitoring a
-//!   client-side pid, a monitor of a registered remote **name**, and a monitor of an
-//!   already-**dead** remote pid (the oracle answers `{'DOWN', _, process, _, noproc}`
-//!   immediately, in both directions) all deliver **nothing** on the Rust side: a process with
-//!   remote watchers drops their records at death instead of telling them
-//!   (`beam_process`'s documented gap), and the `noproc` reply has no channel in the inbound
-//!   sink. `demonitor` shares the path, so the paired `no_down` case is unpinnable too.
+//! * **`DOP_EXIT` (a link exit) is delivered.** Client links to a peer-side worker that then
+//!   dies `boom`: under `process_flag(trap_exit, true)` the client receives
+//!   `{'EXIT', Pid, boom}` with **a pid of the peer's node**, and `erlang:link/1` on the remote
+//!   pid returns `true`. Pinned by `link_exit_crosses_the_wire`. The *same* `process_info(self(),
+//!   links)` read is **VM-internal and differs** (2 entries on the oracle, 1 on the runtime for
+//!   the `-eval` process), which is why the case classifies the signal and never the link count.
+//!   Not re-measured, and therefore not pinned: the mirror direction (the *peer* linking to a
+//!   client-side process), a *spawned linker*, and an untrapped exit killing the far process.
+//! * **`DOP_MONITOR_P_EXIT` (a DOWN) is delivered.** A client monitoring a peer-side worker by
+//!   **pid** receives `{'DOWN', Ref, process, Pid, Reason}` whose reference is the client's
+//!   **own** monitor reference, whose object is a pid of the peer's node, and whose reason is the
+//!   compound term the worker died with (`{gone, 42}`). Pinned by
+//!   `monitor_down_crosses_the_wire`. Not re-measured, and therefore not pinned: a monitor of a
+//!   registered remote **name**, a monitor of an already-**dead** remote pid (the oracle's
+//!   immediate `noproc` DOWN), the mirror direction, and `demonitor`.
+//! * **`DOP_UNLINK_ID` / `DOP_UNLINK_ID_ACK` round-trip.** The peer really records the inbound
+//!   link (`peer_saw_link`), the client's `erlang:unlink/1` really drops the **far** side's
+//!   record (`peer_dropped`, read back through the peer's own `process_info(self(), links)`),
+//!   no `'EXIT'` follows, and the node is still connected and answering afterwards
+//!   (`nodes=1`, a second question answered) — so the inbound ACK is consumed rather than
+//!   refused. Pinned by `unlink_id_ack_is_consumed_without_retiring_the_link`.
+//! * **`erlang:exit(RemotePid, Reason)` is not pinned here.** The wire family is `DOP_EXIT2`
+//!   (a plain exit signal, not the *link* exit `DOP_EXIT` this group pins), and the strongest
+//!   observable it offers — an **untrapped** remote process dying — is a peer-internal fact no
+//!   client-side script can read back, so there is no VM-stable line to compare.
 //! * **A pid identity round trip.** `Pid =:= self()` after the pid went to the peer and came
 //!   back: `true` on the oracle, `false` on the Rust runtime, which is also why an `alias/0`
 //!   reference written by the peer is never delivered. `pid_crosses_the_wire_as_a_foreign_pid`
@@ -145,6 +151,23 @@
 //!   `dist/live_self_pair_handshake_and_message`, and neither side delivers a `{nodeup, _}`.
 //! * **`group_leader(RemotePid, self())`** could not be measured: the oracle's `-eval` wrapper
 //!   would not evaluate it (a silent exit `1`), so there is no oracle observation to pin.
+//!
+//! # The one reply form no live case can carry: a **zero-id** `DOP_UNLINK_ID_ACK`
+//!
+//! `beam_dist` range-checks the two unlink arms **differently** (`Delivery::classify_validated`;
+//! the C's ground truth is `dist.c:2291-2295` vs `dist.c:2320-2322`): `DOP_UNLINK_ID`'s id must
+//! be a **non-zero** unsigned integer (`invalid_message` otherwise), while `DOP_UNLINK_ID_ACK`'s
+//! id is checked as an unsigned integer **only**, so an ACK carrying id **0** is a legitimate
+//! wire message that must be *delivered*, not refused. The C's "id `0` ⇒ write no ack" rule
+//! (`reply_dist_unlink_ack`, `erl_proc_sig_queue.c:2753-2791`) is a *signal*-layer rule, so a
+//! zero-id ACK never reaches the wire between two real nodes: the oracle writes no ack for a
+//! zero id, and this runtime mints its unlink ids non-zero
+//! (`beam_rt`'s `dist_client` — `next_unlink_id = next_unlink_id.max(1)`). **No live two-VM case
+//! can therefore pin the zero-id-ACK acceptance** — it needs a peer that *injects* the frame and
+//! neither side's public API can produce one, so the rule is exercised at the codec level
+//! instead (`beam_dist`'s `Delivery::classify_validated` tests, in-crate, outside this corpus).
+//! The *non-zero* ack round trip is what `unlink_id_ack_is_consumed_without_retiring_the_link`
+//! pins end to end.
 //!
 //! # The `-eval` route's own boundary: a script ends when its last expression does
 //!
@@ -284,8 +307,38 @@ const SCRIPT_MISSING_NAME: &str = r#"try register(dxcli, self()), Peer = list_to
 /// prove the link still works.
 const SCRIPT_DEAD_PID: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, erlang:send({dxpeer, Peer}, {dead_pid, self()}), Msg = receive X -> X after 10000 -> timeout end, Gone = element(2, Msg), S = (catch erlang:send(Gone, {boo})), erlang:send({dxpeer, Peer}, {ping_me, self()}), Msg2 = receive Y -> Y after 10000 -> timeout end, io:format("pong=~p gone_ispid=~p send_ok=~p survived=~p~n", [Pong, is_pid(Gone), is_tuple(S), is_tuple(Msg2) andalso element(1, Msg2) =:= list_to_atom("still_here")]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
 
-/// The widened A.5 live two-node group: eleven self-pair cases over the `DOP_*` message
-/// families, the payload shapes and the refusal paths.
+/// Spawns a worker that dies with the plain reason `boom` when told to, reports the worker's
+/// pid, then relays the kill — the far half of an inbound `DOP_EXIT` (`{'EXIT', Pid, boom}`
+/// reaches a trapping client that linked the worker).
+const PEER_DYING_WORKER: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), W = spawn(fun() -> receive M -> exit(M) after 25000 -> ok end end), receive {ask, From} -> erlang:send(From, {worker, W}) after 25000 -> halt(2) end, receive {die_it} -> erlang:send(W, boom) after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The same worker with a **compound** exit reason (`{gone, 42}`), so the reason term itself
+/// is shown to cross the wire in the `DOP_MONITOR_P_EXIT`'s DOWN.
+const PEER_MONITORED_WORKER: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), W = spawn(fun() -> receive M -> exit(M) after 25000 -> ok end end), receive {ask, From} -> erlang:send(From, {worker, W}) after 25000 -> halt(2) end, receive {die_it} -> erlang:send(W, {gone, 42}) after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// Reports whether its **own** link list still holds a pid of the caller's node, twice: once
+/// while the caller's link is up and once after the caller's `erlang:unlink/1` — which is the
+/// only public observation of the far side really applying an inbound `DOP_UNLINK_ID`.
+const PEER_LINK_LEDGER: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), receive {hello, From} -> erlang:send(From, {peer_pid, self()}) after 25000 -> halt(2) end, receive {linksq, F2} -> L1 = element(2, process_info(self(), links)), erlang:send(F2, {links_back, lists:any(fun(X) -> is_pid(X) andalso erlang:node(X) =:= erlang:node(F2) end, L1)}) after 25000 -> halt(2) end, receive {linksq, F3} -> L2 = element(2, process_info(self(), links)), erlang:send(F3, {links_back, lists:any(fun(X) -> is_pid(X) andalso erlang:node(X) =:= erlang:node(F3) end, L2)}) after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The inbound-`DOP_EXIT` client: trap exits, link the peer's worker, have the peer kill it,
+/// and classify the `{'EXIT', Pid, Reason}` signal it receives — the pid must be a pid of the
+/// **peer's** node and the reason the one the worker died with.
+const SCRIPT_LINK_EXIT: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, process_flag(trap_exit, true), erlang:send({dxpeer, Peer}, {ask, self()}), M0 = receive X -> X after 10000 -> timeout end, Got = is_tuple(M0) andalso tuple_size(M0) =:= 2 andalso element(1, M0) =:= list_to_atom("worker"), Linked = case Got of true -> erlang:link(element(2, M0)); false -> no_worker end, erlang:send({dxpeer, Peer}, {die_it}), Msg = receive Y -> Y after 20000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p got_worker=~p linked=~p got_exit=~p tag=~p from_peer=~p reason=~p~n", [Pong, Got, Linked, Ok, Ok andalso element(1, Msg) =:= list_to_atom("EXIT"), Ok andalso is_pid(element(2, Msg)) andalso erlang:node(element(2, Msg)) =:= Peer, Ok andalso element(3, Msg)]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The inbound-`DOP_MONITOR_P_EXIT` client: monitor the peer's worker by **pid**, have the
+/// peer kill it, and classify the DOWN — the reference must be the monitor's own, the object a
+/// pid of the peer's node, and the reason the compound term the worker died with.
+const SCRIPT_MONITOR_DOWN: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, erlang:send({dxpeer, Peer}, {ask, self()}), M0 = receive X -> X after 10000 -> timeout end, Got = is_tuple(M0) andalso tuple_size(M0) =:= 2 andalso element(1, M0) =:= list_to_atom("worker"), Ref = case Got of true -> erlang:monitor(process, element(2, M0)); false -> make_ref() end, Armed = is_reference(Ref), erlang:send({dxpeer, Peer}, {die_it}), Msg = receive Y -> Y after 20000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 5, io:format("pong=~p got_worker=~p armed=~p down=~p tag=~p type=~p refmatch=~p object_is_pid=~p object_foreign=~p reason=~p~n", [Pong, Got, Armed, Ok, Ok andalso element(1, Msg) =:= list_to_atom("DOWN"), Ok andalso element(3, Msg) =:= process, Ok andalso element(2, Msg) =:= Ref, Ok andalso is_pid(element(4, Msg)), Ok andalso is_pid(element(4, Msg)) andalso erlang:node(element(4, Msg)) =:= Peer, Ok andalso element(5, Msg) =:= {gone, 42}]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The `DOP_UNLINK_ID` / `DOP_UNLINK_ID_ACK` client: link the peer's **main** process, confirm
+/// the far side recorded the link, unlink it, confirm the far record is gone, then prove the ack
+/// did not cost the connection (`nodes()` is still one, and the second question was answered).
+const SCRIPT_UNLINK_ID: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, process_flag(trap_exit, true), erlang:send({dxpeer, Peer}, {hello, self()}), M0 = receive X -> X after 10000 -> timeout end, Got = is_tuple(M0) andalso tuple_size(M0) =:= 2 andalso element(1, M0) =:= list_to_atom("peer_pid"), Linked = case Got of true -> erlang:link(element(2, M0)); false -> no_peer end, timer:sleep(300), erlang:send({dxpeer, Peer}, {linksq, self()}), M1 = receive Y -> Y after 15000 -> timeout end, Before = is_tuple(M1) andalso tuple_size(M1) =:= 2 andalso element(1, M1) =:= list_to_atom("links_back") andalso element(2, M1), Unlinked = case Got of true -> erlang:unlink(element(2, M0)); false -> no_peer end, timer:sleep(300), erlang:send({dxpeer, Peer}, {linksq, self()}), M2 = receive Z -> Z after 15000 -> timeout end, AfterOk = is_tuple(M2) andalso tuple_size(M2) =:= 2 andalso element(1, M2) =:= list_to_atom("links_back"), After = AfterOk andalso element(2, M2), Nodes = length(nodes()), io:format("pong=~p got_peer=~p linked=~p peer_saw_link=~p unlinked=~p second_reply=~p peer_dropped=~p nodes=~p~n", [Pong, Got, Linked, Before, Unlinked, AfterOk, AfterOk andalso not After, Nodes]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The widened A.5 live two-node group: self-pair cases over the `DOP_*` message families,
+/// the payload shapes, the refusal paths and the three inbound **reply** signals
+/// (`DOP_EXIT`, `DOP_MONITOR_P_EXIT`, `DOP_UNLINK_ID_ACK`).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         Case {
@@ -669,6 +722,90 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "dist_extra/link_exit_crosses_the_wire",
+            description: "a process linked across the wire really receives the DOP_EXIT reply: \
+                          the peer's worker dies 'boom' and the trapping client gets \
+                          {'EXIT', Pid, boom} whose pid belongs to the peer's node",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LINK_EXIT],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LINK_EXIT],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_DYING_WORKER],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong got_worker=true linked=true got_exit=true tag=true \
+                     from_peer=true reason=boom",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/monitor_down_crosses_the_wire",
+            description: "a remote monitor really receives the DOP_MONITOR_P_EXIT reply: the \
+                          DOWN carries the client's own reference, a pid of the peer's node \
+                          and the peer worker's compound reason",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_MONITOR_DOWN],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_MONITOR_DOWN],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_MONITORED_WORKER],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong got_worker=true armed=true down=true tag=true type=true \
+                     refmatch=true object_is_pid=true object_foreign=true reason=true",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link",
+            description: "an inbound DOP_UNLINK_ID_ACK is consumed, not refused: after the \
+                          client's unlink the far side's link record is gone, no EXIT comes, \
+                          and the node is still connected and answering",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_UNLINK_ID],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_UNLINK_ID],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_LINK_LEDGER],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong got_peer=true linked=true peer_saw_link=true unlinked=true \
+                     second_reply=true peer_dropped=true nodes=1",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -718,6 +855,18 @@ mod tests {
             "dist_extra/send_to_a_dead_remote_pid",
             "pong=pong gone_ispid=true send_ok=true survived=true",
         ),
+        (
+            "dist_extra/link_exit_crosses_the_wire",
+            "pong=pong got_worker=true linked=true got_exit=true tag=true from_peer=true reason=boom",
+        ),
+        (
+            "dist_extra/monitor_down_crosses_the_wire",
+            "pong=pong got_worker=true armed=true down=true tag=true type=true refmatch=true object_is_pid=true object_foreign=true reason=true",
+        ),
+        (
+            "dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link",
+            "pong=pong got_peer=true linked=true peer_saw_link=true unlinked=true second_reply=true peer_dropped=true nodes=1",
+        ),
     ];
 
     /// The ids in registry order (the corpus order is part of the report).
@@ -737,6 +886,9 @@ mod tests {
         "dist_extra/nested_payload_40_levels_deep",
         "dist_extra/send_to_a_missing_remote_name",
         "dist_extra/send_to_a_dead_remote_pid",
+        "dist_extra/link_exit_crosses_the_wire",
+        "dist_extra/monitor_down_crosses_the_wire",
+        "dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link",
     ];
 
     /// Every case is a `Command` **self-pair**: oracle side the resolved `erl`, Rust side the
@@ -1000,6 +1152,55 @@ mod tests {
                 other.id
             );
         }
+    }
+
+    /// The three inbound-**reply** cases really drive their signal: the exit client traps exits
+    /// and links the peer's pid, the DOWN client arms a monitor it later matches by reference,
+    /// and the unlink client unlinks a recorded far-side link and re-reads `nodes/0` afterwards.
+    /// A future edit that silently drops one of those steps would leave a case that still prints
+    /// the golden without exercising the reply — this test is what makes that impossible.
+    #[test]
+    fn the_inbound_reply_cases_drive_their_signal() {
+        let cases = group();
+        let expr_of = |id: &str| {
+            let case = cases.iter().find(|case| case.id == id).unwrap_or_else(|| panic!("{id}"));
+            let CaseKind::Command(run) = &case.kind else {
+                panic!("{id} must be a Command case");
+            };
+            let peer = run.peer.expect("a peer link ledger is needed");
+            (args_of(run.oracle.args, "-eval"), args_of(peer.args, "-eval"))
+        };
+
+        let (client, peer) = expr_of("dist_extra/link_exit_crosses_the_wire");
+        for needle in ["process_flag(trap_exit, true)", "erlang:link(", "erlang:node(element(2, Msg))"] {
+            assert!(client.contains(needle), "link_exit: the client must contain {needle:?}");
+        }
+        assert!(peer.contains("spawn(fun() ->"), "link_exit: the peer must spawn the worker");
+        assert!(peer.contains("exit(M)"), "link_exit: the worker dies with the relayed reason");
+
+        let (client, peer) = expr_of("dist_extra/monitor_down_crosses_the_wire");
+        for needle in ["erlang:monitor(process,", "element(2, Msg) =:= Ref", "erlang:node(element(4, Msg))"] {
+            assert!(client.contains(needle), "monitor_down: the client must contain {needle:?}");
+        }
+        assert!(
+            peer.contains("{gone, 42}"),
+            "monitor_down: the peer kills its worker with a compound reason"
+        );
+
+        let (client, peer) = expr_of("dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link");
+        for needle in ["erlang:link(", "erlang:unlink(", "length(nodes())", "timer:sleep(300)"] {
+            assert!(client.contains(needle), "unlink_ack: the client must contain {needle:?}");
+        }
+        // Both halves read the far side's own link list, so the `peer_dropped` field is a real
+        // observation of the inbound `DOP_UNLINK_ID`, never a local guess.
+        assert!(
+            peer.matches("process_info(self(), links)").count() == 2,
+            "unlink_ack: the peer reports its link list before and after"
+        );
+        assert!(
+            !client.contains("process_info(self(), links)"),
+            "unlink_ack: the client must not observe its own link list (it differs per VM)"
+        );
     }
 
     /// The value that follows `flag` in an argv (the corpus keeps `-sname`/`-eval`/`-setcookie`
