@@ -172,6 +172,23 @@ Thirteen workloads, split by how the baseline tier lowers them:
   the untouched **interpreter** column move ~17 %), so quote a **min over ≥3 runs** and compare only
   figures from the same run set.
 
+## Entry points and the exact commands (there is NO env-var gate)
+- `tests/jit_bench.rs::interpreter_and_native_tiers_agree_and_report_timings` — **not** `#[ignore]`d (runs in the ordinary suite) → `assert_tier_agreement()` at `AGREEMENT_RUNS = 4`, every available tier run **twice** per workload (once to verify its own value, once for the cross-tier structural comparison).
+- `tests/jit_bench.rs::interpreter_versus_native_tiers_measurement_table` — `#[ignore = "measurement table: run with --ignored --nocapture"]` → `run_measurement_table()`:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --ignored --nocapture` (add `--features jit-cranelift` for the Cranelift column). Debug profile — no documented invocation passes `--release`.
+- Cranelift ABBA table: `src/jit/cranelift/bench.rs::cl_bench_cranelift_vs_baseline_interleaved` — an `#[ignore]`d `#[test]` inside the **lib** target:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --features jit-cranelift --lib -- --ignored --nocapture cl_bench`.
+- Interpreter ns/instruction: `tests/engine_bench.rs::interpreter_reports_ns_per_instruction` — **not** gated, prints only under `--nocapture`:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test engine_bench -- --nocapture`.
+- No harness reads an environment variable. `BEAM_RT_TIER` is a `beam_rt` runtime knob (`beam_rt/src/runner/tier.rs`), never a bench knob; the only other env knobs in the crate (`BENCH_ITERS`/`BENCH_BATCH`/`BENCH_WARMUP`/`BENCH_TIER`) belong to `src/bench/` (the foreign-workload decomposition harness), not to this node.
+
+## What is actually computed (statistic, rounds, ordering)
+- **`jit_bench`**: ONE timed loop of `TIMED_RUNS = 3_000` calls after a single warm-up run, one sample per `(workload, tier)`; `ns/op = elapsed/3_000` is therefore the **mean**, and it includes the per-run setup (`Machine::reset` + run entry — the label map is cached per machine, built in the warm-up). Printed per row: `ns/op`, `ops/s`, the one-time `JitBackend::compile`, and `speed-up X over interpreter`. Tiers run in **fixed roster order** (interpreter → baseline → Cranelift), so the table is position-biased: **`jit_bench` has no interleaving/ABBA countermeasure**.
+- The `min of 3 timed runs` figures in the Measured sections below are **not** a harness statistic: they were produced by repeating the whole run three times and taking the per-column minimum by hand (the enforced discipline for a shared box).
+- **`cl_bench`**: `ROUNDS = 15` ABBA rounds (`baseline, cranelift, cranelift, baseline`) ⇒ 30 samples per tier, each a `AGGR_ITERATIONS = 2_500` / `ARITH_ITERATIONS = 5_000` / `CMP_ITERATIONS = 2_500`-run loop; reports **min**, median, compile µs and the per-round paired ratio `(ca+cb)/(ba+bb)` mean + range. One warm-up run per tier first; both tiers' pinned result is asserted before timing.
+- **`engine_bench`**: `SAMPLES = 5` timed samples after one warm-up, **median** (best in brackets) reported; `KIND_OPS = 2048` straight-line instructions per body, `800` iterations per sample (20 000 for `setup/empty`, `1` for the 1 000 000-element `list-walk/1`); division is by the instruction count *known by construction* (`7 * N + 6` for the list walk) or derived from the loaded IR for the real `tailcall:beam` fixture.
+- **The workload sets are not shared.** This node's table runs all **13** workloads on every available tier; `cl_bench` measures only the **two native tiers** (the interpreter is deliberately excluded as an order of magnitude away) over its **own three** synthetic kernels — `aggr` (`AGGR_STEPS = 128`), `arith` (`ARITH_OPS = 256`) and `cmp` (`CMP_ROUNDS = 64` × 8 operators) — built in `cranelift/bench.rs`, not here (its `aggr`/`cmp` kernels are deliberate near-twins of `inlined.rs`'s `aggr/2`/`cmp/2`). Only the scaffolding (`support`: `arith_hook`, `Fixture`, `Samples`, `ns_per_op`/`ops_per_sec`) is shared.
+
 ## Measured: `sum/1` — the `Y`-slot `'+'` path is native (min of 3 timed runs)
 `sum/1` is the harness's **partially inlined** workload: the small-int `'+'/2` `gc_bif` names a `Y`
 operand (the head survives in `Y(0)` across the non-tail recursive call) and writes a `Y` destination
