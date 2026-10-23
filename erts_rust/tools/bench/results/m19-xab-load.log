@@ -1,0 +1,26 @@
+2026-10-23T15:15:31Z PASS=m19-xab-rust-r1 side=rust round=1 event=before loadavg=3.28 2.76 2.30 1/839 5
+2026-10-23T15:17:57Z PASS=m19-xab-rust-r1 side=rust round=1 event=after loadavg=0.73 1.93 2.05 1/826 1547 rc=0 wall_s=146
+2026-10-23T15:18:07Z PASS=m19-xab-sys-r1 side=sys round=1 event=before loadavg=0.65 1.85 2.02 1/826 4
+2026-10-23T15:21:58Z PASS=m19-xab-sys-r1 side=sys round=1 event=after loadavg=2.76 2.17 2.11 1/799 10985 rc=0 wall_s=231
+2026-10-23T15:22:02Z PASS=m19-xab-sys-r2 side=sys round=2 event=before loadavg=2.76 2.17 2.11 1/803 4
+2026-10-23T15:25:53Z PASS=m19-xab-sys-r2 side=sys round=2 event=after loadavg=2.13 2.17 2.12 1/811 10985 rc=0 wall_s=231
+2026-10-23T15:25:53Z PASS=m19-xab-rust-r2 side=rust round=2 event=before loadavg=2.13 2.17 2.12 1/811 10988
+2026-10-23T15:28:18Z PASS=m19-xab-rust-r2 side=rust round=2 event=after loadavg=0.72 1.62 1.93 1/808 12530 rc=0 wall_s=145
+2026-10-23T15:28:21Z PASS=m19-xab-rust-r3 side=rust round=3 event=before loadavg=0.72 1.62 1.93 1/810 4
+2026-10-23T15:30:46Z PASS=m19-xab-rust-r3 side=rust round=3 event=after loadavg=0.54 1.24 1.74 1/808 1546 rc=0 wall_s=145
+2026-10-23T15:30:46Z PASS=m19-xab-sys-r3 side=sys round=3 event=before loadavg=0.54 1.24 1.74 1/808 1549
+2026-10-23T15:34:38Z PASS=m19-xab-sys-r3 side=sys round=3 event=after loadavg=3.07 2.01 1.94 4/815 12530 rc=0 wall_s=232
+2026-10-23T15:34:44Z PASS=m19-xab-rust-r4 side=rust round=4 event=before loadavg=2.83 1.98 1.93 1/815 4
+2026-10-23T15:37:10Z PASS=m19-xab-rust-r4 side=rust round=4 event=after loadavg=0.74 1.45 1.74 1/815 1546 rc=0 wall_s=146
+2026-10-23T15:37:10Z PASS=m19-xab-sys-r4 side=sys round=4 event=before loadavg=0.74 1.45 1.74 1/815 1549
+2026-10-23T15:41:02Z PASS=m19-xab-sys-r4 side=sys round=4 event=after loadavg=1.72 1.77 1.82 3/802 12530 rc=0 wall_s=232
+2026-10-23T15:41:04Z PASS=m19-xab-sys-r5 side=sys round=5 event=before loadavg=1.58 1.74 1.81 1/803 4
+2026-10-23T15:44:55Z PASS=m19-xab-sys-r5 side=sys round=5 event=after loadavg=2.07 2.12 1.98 1/809 10985 rc=0 wall_s=231
+2026-10-23T15:44:55Z PASS=m19-xab-rust-r5 side=rust round=5 event=before loadavg=2.07 2.12 1.98 1/809 10988
+2026-10-23T15:47:20Z PASS=m19-xab-rust-r5 side=rust round=5 event=after loadavg=0.72 1.56 1.79 1/810 12530 rc=0 wall_s=145
+2026-10-23T15:47:22Z PASS=m19-xab-rust-r6 side=rust round=6 event=before loadavg=0.72 1.56 1.79 1/811 4
+2026-10-23T15:49:48Z PASS=m19-xab-rust-r6 side=rust round=6 event=after loadavg=0.58 1.29 1.66 1/814 1546 rc=0 wall_s=146
+2026-10-23T15:49:48Z PASS=m19-xab-sys-r6 side=sys round=6 event=before loadavg=0.58 1.29 1.66 1/814 1549
+2026-10-23T15:53:40Z PASS=m19-xab-sys-r6 side=sys round=6 event=after loadavg=4.53 2.36 1.99 1/802 12530 rc=0 wall_s=232
+2026-10-23T15:53:45Z PASS=m19-budgetprobe-all event=before loadavg=4.16 2.32 1.98 1/803 4
+2026-10-23T16:00:00Z PASS=m19-budgetprobe-all event=after loadavg=0.59 1.67 1.87 1/803 12522 rc=0 wall_s=375
