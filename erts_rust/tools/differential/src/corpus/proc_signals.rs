@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! Contract **A.7** — process signals: the group leader, the distribution-tag
-//! (`dt_*`) switches, `erlang:statistics/1`, and the `spawn_monitor`/`monitor` surface.
+//! (`dt_*`) switches, `erlang:statistics/1`, and the `spawn_monitor`/`monitor` surface — plus the
+//! A.8 half of the same family, the `os:set_signal/2` **API surface** (`os_set_signal/*` ids).
 //!
 //! Every golden below is the **shape** the oracle prints, never a volatile identity:
 //!
@@ -57,6 +58,39 @@
 //! `proc_signals/monitor_port_unsupported` **agree** — their `_unsupported` id suffix (kept so
 //! the ids stay byte-stable) is historical. The extra `monitor_3_tag_*` / `monitor_3_*` cases
 //! below deepen that coverage so the behaviour cannot silently regress.
+//!
+//! # `os:set_signal/2` — contract A.8, the API surface only
+//!
+//! The `os_set_signal/*` cases pin the **answer surface** of the disposition API and nothing
+//! that would depend on a signal actually being *delivered*: a delivery needs the process
+//! registered as `erl_signal_server`, a peer that sends a real signal, and a racing scheduler
+//! round, so it is host- and timing-dependent and is never pinned. What *is* pinned is exactly
+//! what the oracle answers:
+//!
+//! * the success round trip — `ignore` → `default` → `handle` → `default` on `sigusr1`, each
+//!   answering the bare atom `ok` (`os_set_signal_ignore_default_handle_round_trip`);
+//! * the whole accepted **name** set: all twelve BEAM signal names
+//!   (`sighup`/`sigquit`/`sigabrt`/`sigalrm`/`sigterm`/`sigusr1`/`sigusr2`/`sigchld`/`sigstop`/
+//!   `sigtstp`/`sigcont`/`sigwinch`) take `handle` and go back to `default`, each answering `ok`
+//!   (`os_set_signal_accepts_all_twelve_signal_names`). Every disposition is restored inside the
+//!   case, so nothing is left armed when the probe prints;
+//! * the kernel-only `sigstop`: the kernel refuses every disposition change for it, the C
+//!   `sys_signal` failure is ignored, and the oracle still answers `ok` for `ignore`/`default`/
+//!   `handle` (`os_set_signal_kernel_only_sigstop_answers_ok`);
+//! * the facility is **process-global**: a freshly spawned process sets a disposition and the
+//!   caller restores it, both answering `ok`
+//!   (`os_set_signal_from_a_spawned_process_answers_ok`);
+//! * the refusal matrix, both as an escaped raise (`os_set_signal_unknown_signal_raises_badarg`
+//!   pins the probe's `exception error badarg` line at exit `1`) and classified per argument
+//!   (`os_set_signal_rejected_signal_names_are_badarg` /
+//!   `os_set_signal_rejected_actions_are_badarg`), so the exact accepted set cannot grow or
+//!   shrink silently. `siginfo` is deliberately **not** in the rejected list: it is absent from
+//!   this platform's libc, so pinning its refusal would make the golden host-dependent.
+//!
+//! Both ends of the disposition are covered by the runtime's own tests
+//! (`crates/beam_rt/src/context/signal.rs` for the answer surface and
+//! `crates/beam_rt/src/port/watch.rs` for the delivery half); these cases are the
+//! oracle-facing half of the same contract.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.7 case: evaluate `expr` under both runtimes and pin the oracle's `~w` rendering.
@@ -98,6 +132,36 @@ fn raises(
             exit_code: 1,
         },
         ..case(id, description, expr, golden)
+    }
+}
+
+/// One **A.8** case for the `os:set_signal/2` answer surface — same [`CaseKind::Eval`]/
+/// [`Probe::Value`] shape as [`case`], but claiming [`Contract::Introspection`].
+fn a8_case(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        contracts: &[Contract::Introspection],
+        ..case(id, description, expr, golden)
+    }
+}
+
+/// One A.8 case whose expression raises (`golden` is the probe's `exception …` line).
+fn a8_raises(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 1,
+        },
+        ..a8_case(id, description, expr, golden)
     }
 }
 
@@ -449,6 +513,88 @@ pub(crate) fn group() -> Vec<Case> {
             "is_process_alive(self())",
             "ok true",
         ),
+        // --- os:set_signal/2: the answer surface (contract A.8, see the module docs) ---------
+        // Every row pins only what the oracle answers for the *API*: an atom verdict or a
+        // `badarg`. Nothing here depends on a signal actually being delivered (that needs a
+        // registered `erl_signal_server` and a real sender, so it is host- and timing-dependent),
+        // and every successfully installed disposition is restored before the probe prints.
+        a8_case(
+            "proc_signals/os_set_signal_ignore_default_handle_round_trip",
+            "os:set_signal/2's success round trip on a harmless signal: ignore, default, handle \
+             and back to default all answer the bare atom ok",
+            "begin I = os:set_signal(sigusr1, ignore), \
+             Db = os:set_signal(sigusr1, default), \
+             H = os:set_signal(sigusr1, handle), \
+             Db2 = os:set_signal(sigusr1, default), \
+             {I, Db, H, Db2} end",
+            "ok {ok,ok,ok,ok}",
+        ),
+        a8_case(
+            "proc_signals/os_set_signal_accepts_all_twelve_signal_names",
+            "the accepted name set is the twelve BEAM signals — sighup, sigquit, sigabrt, sigalrm, \
+             sigterm, sigusr1, sigusr2, sigchld, sigstop, sigtstp, sigcont, sigwinch — and each \
+             takes handle and goes back to default, answering ok both times",
+            "begin Sigs = [sighup, sigquit, sigabrt, sigalrm, sigterm, sigusr1, sigusr2, \
+             sigchld, sigstop, sigtstp, sigcont, sigwinch], \
+             [{S, os:set_signal(S, handle), os:set_signal(S, default)} || S <- Sigs] end",
+            "ok [{sighup,ok,ok},{sigquit,ok,ok},{sigabrt,ok,ok},{sigalrm,ok,ok},\
+             {sigterm,ok,ok},{sigusr1,ok,ok},{sigusr2,ok,ok},{sigchld,ok,ok},{sigstop,ok,ok},\
+             {sigtstp,ok,ok},{sigcont,ok,ok},{sigwinch,ok,ok}]",
+        ),
+        a8_case(
+            "proc_signals/os_set_signal_kernel_only_sigstop_answers_ok",
+            "sigstop is kernel-only: the kernel refuses every disposition change for it, the \
+             install failure is ignored, and all three dispositions still answer ok",
+            "begin A = os:set_signal(sigstop, ignore), \
+             Db = os:set_signal(sigstop, default), \
+             H = os:set_signal(sigstop, handle), \
+             {A, Db, H} end",
+            "ok {ok,ok,ok}",
+        ),
+        a8_case(
+            "proc_signals/os_set_signal_from_a_spawned_process_answers_ok",
+            "an OS signal disposition is process-global: a freshly spawned process sets a \
+             disposition and the calling process restores it, both answering ok",
+            "begin Self = self(), \
+             P = spawn(fun() -> \
+                 Self ! {sigres, os:set_signal(sigusr2, handle)} end), \
+             Res = receive {sigres, RR} -> RR after 2000 -> timeout end, \
+             Back = os:set_signal(sigusr2, default), \
+             {is_pid(P), Res, Back} end",
+            "ok {true,ok,ok}",
+        ),
+        a8_raises(
+            "proc_signals/os_set_signal_unknown_signal_raises_badarg",
+            "os:set_signal/2 on an unmapped signal atom raises error:badarg (the escaped raise \
+             shape; the per-name matrix is classified by the two *_rejected_* cases)",
+            "os:set_signal(sigfoo, handle)",
+            "exception error badarg",
+        ),
+        a8_case(
+            "proc_signals/os_set_signal_rejected_signal_names_are_badarg",
+            "every signal name outside the accepted twelve raises error:badarg — sigkill (no C \
+             mapping), sigttin/sigttou (commented out in the C table), an unknown name, the \
+             uppercase atom, the empty atom, and the non-atom terms 42, \"sigusr1\" and \
+             {sigusr1} (siginfo is left unpinned: it is absent from this platform's libc)",
+            "begin Names = [sigkill, sigttin, sigttou, sigfoo, 'SIGTERM', '', 42, \"sigusr1\", \
+             {sigusr1}], \
+             Class = fun(N) -> \
+                 try os:set_signal(N, handle) of Res -> {unexpected, Res} \
+                 catch error:badarg -> badarg end end, \
+             [Class(N) || N <- Names] end",
+            "ok [badarg,badarg,badarg,badarg,badarg,badarg,badarg,badarg,badarg]",
+        ),
+        a8_case(
+            "proc_signals/os_set_signal_rejected_actions_are_badarg",
+            "every disposition outside ignore/default/handle raises error:badarg — an unknown \
+             atom, the capitalised atoms 'Default'/'Handle', the empty binary and the integer 1",
+            "begin Opts = [foo, 'Default', 'Handle', \"\", 1], \
+             Class = fun(O) -> \
+                 try os:set_signal(sigusr1, O) of Res -> {unexpected, Res} \
+                 catch error:badarg -> badarg end end, \
+             [Class(O) || O <- Opts] end",
+            "ok [badarg,badarg,badarg,badarg,badarg]",
+        ),
     ]
 }
 
@@ -509,6 +655,16 @@ mod tests {
         "proc_signals/monitor_3_tag_demonitor",
     ];
 
+    /// The A.8 `os:set_signal/2` answer-surface cases (the `os_set_signal/*` ids).
+    const SET_SIGNAL_CASES: &[&str] = &[
+        "proc_signals/os_set_signal_ignore_default_handle_round_trip",
+        "proc_signals/os_set_signal_accepts_all_twelve_signal_names",
+        "proc_signals/os_set_signal_kernel_only_sigstop_answers_ok",
+        "proc_signals/os_set_signal_from_a_spawned_process_answers_ok",
+        "proc_signals/os_set_signal_unknown_signal_raises_badarg",
+        "proc_signals/os_set_signal_rejected_signal_names_are_badarg",
+        "proc_signals/os_set_signal_rejected_actions_are_badarg",
+    ];
     fn case<'a>(cases: &'a [Case], id: &str) -> &'a Case {
         cases
             .iter()
@@ -537,9 +693,97 @@ mod tests {
             };
             assert_eq!(probe, Probe::Value, "case {id}");
         }
-        assert_eq!(cases.len(), SIGNAL_CASES.len() + MONITOR_CASES.len());
+        assert_eq!(
+            cases.len(),
+            SIGNAL_CASES.len() + MONITOR_CASES.len() + SET_SIGNAL_CASES.len()
+        );
     }
 
+    /// The `os:set_signal/2` rows are the same plain `Eval`/`Probe::Value` shape, but they claim
+    /// **A.8** ([`Contract::Introspection`]) rather than A.7: they pin the disposition API's
+    /// answer surface, not an OTP application contract.
+    #[test]
+    fn every_set_signal_case_is_a_plain_a8_eval_case() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in SET_SIGNAL_CASES {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::Introspection], "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id} must be an Eval case"
+            );
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id} takes no extra argv"
+            );
+            assert!(case.env().is_empty(), "case {id} sets no environment");
+            let CaseKind::Eval { probe, .. } = case.kind else {
+                unreachable!()
+            };
+            assert_eq!(probe, Probe::Value, "case {id}");
+            let expr = case.expr().expect("an Eval case has an expr");
+            assert!(
+                expr.contains("os:set_signal("),
+                "case {id} does not probe the disposition API"
+            );
+        }
+    }
+
+    /// A disposition *delivery* is host- and timing-dependent (it needs a registered
+    /// `erl_signal_server` and a real sender), so no `os_set_signal/*` row may depend on one: no
+    /// signal is raised, no signal server is registered, and no external command is run. The
+    /// runtime's own delivery half is pinned in `crates/beam_rt/src/port/tests.rs` instead.
+    #[test]
+    fn the_set_signal_cases_never_depend_on_a_delivered_signal() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in SET_SIGNAL_CASES {
+            let expr = case(cases, id).expr().expect("an Eval case has an expr");
+            for forbidden in [
+                "erl_signal_server",
+                "register(",
+                "os:cmd",
+                "kill(",
+                "notify",
+            ] {
+                assert!(
+                    !expr.contains(forbidden),
+                    "case {id} uses `{forbidden}`, which makes the answer depend on a real \
+                     signal delivery"
+                );
+            }
+            // The probe wrapper binds `V`, `C`, `R` (and `X`), so a case must not bind one of
+            // those names — the *oracle* would then fail to compile the wrapped expression and
+            // print nothing (a silent false mismatch).
+            let names: Vec<&str> = expr
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .filter(|token| !token.is_empty())
+                .collect();
+            for bound in ["V", "C", "R", "X"] {
+                assert!(
+                    !names.contains(&bound),
+                    "case {id} binds `{bound}`, which the probe wrapper already binds"
+                );
+            }
+            // Every disposition a case installs is restored to `default` before it answers, so no
+            // row leaves a handler armed for the rest of the VM's life. (The rows that pass
+            // `handle` as a *rejected* argument install nothing, so they are not in this list.)
+            if [
+                "proc_signals/os_set_signal_ignore_default_handle_round_trip",
+                "proc_signals/os_set_signal_accepts_all_twelve_signal_names",
+                "proc_signals/os_set_signal_kernel_only_sigstop_answers_ok",
+                "proc_signals/os_set_signal_from_a_spawned_process_answers_ok",
+            ]
+            .contains(&id)
+            {
+                assert!(
+                    expr.contains("default"),
+                    "case {id} leaves a disposition at `handle`"
+                );
+            }
+        }
+    }
     #[test]
     fn goldens_never_pin_a_volatile_pid_or_reference() {
         for case in group() {
@@ -565,6 +809,7 @@ mod tests {
             "proc_signals/erts_internal_group_leader_bad_option_is_badarg",
             "proc_signals/dt_spread_tag_bad_arg_is_badarg",
             "proc_signals/dt_restore_tag_non_boolean_is_badarg",
+            "proc_signals/os_set_signal_unknown_signal_raises_badarg",
         ] {
             let case = case(cases, id);
             assert_eq!(case.golden.stdout, Some("exception error badarg"), "case {id}");
