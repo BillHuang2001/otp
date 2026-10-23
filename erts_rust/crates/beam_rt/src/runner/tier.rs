@@ -135,6 +135,7 @@
 
 use std::sync::OnceLock;
 
+use beam_common::BeamError;
 use beam_engine::Tier;
 
 use super::entry::{ProcessEntry, RunnerState};
@@ -269,6 +270,49 @@ pub(super) fn force(mode: JitMode) {
 #[cfg(test)]
 pub(super) fn clear() {
     FORCED.with(|forced| forced.set(None));
+}
+
+/// The typed capability gap a build owes a `mode` it cannot serve, or `None` when it can.
+///
+/// This is the **CLI-facing half** of the rule *"the tier must be built to be selected"*: a
+/// request for [`JitMode::Cranelift`] in a build **without** this crate's `cranelift` Cargo
+/// feature (default OFF, forwarding `beam_engine/jit-cranelift`) has no backend to run on, so
+/// the invocation is refused before any work is done — with a reason that names the Cargo
+/// feature the caller has to rebuild with.
+///
+/// The engine's own feature-gated entry points remain the **second line of defence**: they
+/// answer `unsupported: opcode: jit-cranelift tier not built` at the moment a Cranelift entry is
+/// actually attempted. The two can never disagree, because they read the *same* feature: this
+/// function returns `None` for a feature-on build (the engine's entry points are the built
+/// ones) and `Some` for a feature-off one (the engine's entry points would refuse too). The
+/// point of the check is *where* the refusal happens — at the CLI boundary, instead of after a
+/// boot sequence has already died on it.
+///
+/// **Pure**: `mode` is the input and the environment is never read, so a test pins the
+/// semantics without mutating the process environment. Every mode but an unbuildable
+/// [`JitMode::Cranelift`] is `None` in **every** build — a served mode can never be refused
+/// here — and `Cranelift` with the feature on is `None` too.
+pub(super) fn tier_unavailable(mode: JitMode) -> Option<BeamError> {
+    match mode {
+        JitMode::Auto | JitMode::Interpreter | JitMode::Baseline => None,
+        JitMode::Cranelift if cfg!(not(feature = "cranelift")) => Some(crate::error::unsupported(
+            "BEAM_RT_TIER=cranelift: this build has no cranelift execution tier \
+             (rebuild with the `cranelift` Cargo feature)",
+        )),
+        JitMode::Cranelift => None,
+    }
+}
+
+/// The capability gap the **effective** `BEAM_RT_TIER` request owes this build, if any.
+///
+/// [`tier_unavailable`] over the process-wide default ([`env_default`]) — the seam
+/// [`crate::cli`] consults **once**, before it resolves or drives the boot script, so an
+/// invocation that names [`JitMode::Cranelift`] in a build without the `cranelift` Cargo feature
+/// reports `beam_rt: unsupported: …` and exits 3 instead of booting processes that would die on
+/// the request one at a time. `pub(crate)`: this is a runtime-internal check, not new public
+/// surface, and it adds no mode.
+pub(crate) fn unbuilt_tier_request() -> Option<BeamError> {
+    tier_unavailable(env_default())
 }
 /// The execution tier for a process's first entry.
 ///

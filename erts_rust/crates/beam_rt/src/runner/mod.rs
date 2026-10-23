@@ -120,6 +120,10 @@ mod tests;
 
 pub(crate) use entry::{registered_name, EngineParkCensus, ProcessEntry, RunnerState, UnrunnableProcess};
 pub(crate) use run::RuntimeRunner;
+/// The startup capability check the CLI consults before it drives anything: the typed gap the
+/// **effective** `BEAM_RT_TIER` request owes this build, or `None` (see `tier::tier_unavailable`).
+/// `pub(crate) use` — the check is the runtime's own, and it adds no public API.
+pub(crate) use tier::unbuilt_tier_request;
 /// The `#[cfg(test)]` slice/park/suspend accounting, re-exported for the suites outside this
 /// module that pin a structural park (a BIF suspend is not observable any other way — see
 /// `crate::port::busy_suspend_tests`).

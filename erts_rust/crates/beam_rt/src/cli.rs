@@ -1674,6 +1674,19 @@ fn report_unsupported(reason: &str) -> i32 {
 /// write a crash dump when the action fails abnormally. `Action::Version` builds none
 /// (there is nothing to snapshot), and neither does a runtime that could not even be
 /// constructed, so the slot stays empty and the dump is skipped.
+///
+/// # The one capability check, before any work
+///
+/// An execution tier this build cannot serve is refused **here**, ahead of the boot script
+/// and of every Start instruction: [`crate::runner::unbuilt_tier_request`] answers the typed
+/// capability gap for a `BEAM_RT_TIER=cranelift` request in a build without the `cranelift`
+/// Cargo feature ([`crate::runner`]'s `tier::tier_unavailable` owns the rule). Without it the
+/// boot processes would be the first to try the tier, and their per-process failures would be
+/// re-wrapped by the boot drive into an exit-1 diagnostic that names no feature — which is
+/// exactly what this check replaces with the stable `beam_rt: unsupported: …` line naming the
+/// Cargo feature, exit code [`EXIT_UNSUPPORTED`]. `-version` is exempt (it selects no tier
+/// because it runs no code), and in a `cranelift` build the check answers `None`, so nothing
+/// about that build's behaviour changes.
 fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     let action = config.action.clone();
     // `-config FILE` is read while the node **boots**, before any Start instruction runs: a
@@ -1682,6 +1695,13 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     // verified against OTP 29.1.1 / erts-17.1). Only `-version` builds no runtime at all, so
     // it stays exempt (`erl -version -config /nonexistent` ⇒ **0**, the banner).
     if !matches!(action, Action::Version) {
+        // The **effective** `BEAM_RT_TIER` request against what this binary was built with:
+        // a tier that is not compiled in is a capability gap reported before any boot work,
+        // not a per-process failure the boot drive would re-wrap into an unnameable exit 1.
+        // First, so the refusal depends on neither the configuration file nor the arguments.
+        if let Some(error) = crate::runner::unbuilt_tier_request() {
+            return Err(error);
+        }
         if let Some(path) = missing_config_file(&config) {
             // The oracle's aborted boot has a half-started node to snapshot, so its crash
             // dump is real and announced. Build the runtime this boot would have had and

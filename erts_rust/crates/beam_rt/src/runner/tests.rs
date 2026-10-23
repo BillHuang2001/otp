@@ -48,7 +48,7 @@ use super::run::{
     reset_boundary_door_counters, reset_park_publish_counters, reset_run_slice_counters,
     run_slice_counters, ParkExemption, ParkPublishCounters, RuntimeRunner,
 };
-use super::tier::{mode_from_value, select_entry_tier, JitMode};
+use super::tier::{mode_from_value, select_entry_tier, tier_unavailable, JitMode};
 mod boundary_cost;
 mod reds_door;
 mod slice_charging;
@@ -1764,6 +1764,62 @@ fn the_cranelift_tier_without_its_feature_is_the_typed_capability_gap() {
         reason.contains("cranelift"),
         "the reason names the missing tier: {reason}"
     );
+}
+
+/// **The startup capability check refuses exactly the unbuildable request, and nothing else.**
+///
+/// [`tier_unavailable`] is the CLI-facing half of *"the tier must be built to be selected"*: it
+/// answers the typed capability gap for a `JitMode::Cranelift` request in a build **without** the
+/// `cranelift` Cargo feature, and `None` for every mode the build can serve. That second half is
+/// asserted in **both** builds, because it is the property that keeps the check `src/cli.rs` runs
+/// before any boot work from ever refusing an invocation that would have run: no served mode may
+/// be refused, in any build.
+///
+/// The gap must be a **capability gap** ([`crate::error::unsupported_reason`] classifies it, which
+/// is what makes the CLI exit 3) and its text must name the Cargo feature the caller has to
+/// rebuild with — the whole point of deciding it at the CLI boundary instead of letting the
+/// per-process failure be re-wrapped into an exit-1 diagnostic that names nothing.
+#[test]
+fn tier_unavailable_refuses_only_the_unbuilt_cranelift_tier() {
+    for mode in [JitMode::Auto, JitMode::Baseline, JitMode::Interpreter] {
+        assert!(
+            tier_unavailable(mode).is_none(),
+            "{mode:?} is served by every build, so the startup check must never refuse it"
+        );
+    }
+
+    #[cfg(not(feature = "cranelift"))]
+    {
+        let error = tier_unavailable(JitMode::Cranelift)
+            .expect("a build without the `cranelift` feature has no tier to run Cranelift on");
+        let reason = crate::error::unsupported_reason(&error).expect(
+            "the refusal is a capability gap (exit 3), not a genuine runtime error (exit 1)",
+        );
+        assert!(
+            reason.contains("cranelift"),
+            "the reason names the tier that is missing: {reason}"
+        );
+        assert!(
+            reason.contains("Cargo feature"),
+            "the reason names what to rebuild with: {reason}"
+        );
+        assert!(
+            reason.contains("BEAM_RT_TIER"),
+            "the reason names the setting that triggered it: {reason}"
+        );
+    }
+
+    #[cfg(feature = "cranelift")]
+    {
+        assert!(
+            tier_unavailable(JitMode::Cranelift).is_none(),
+            "this build compiled the Cranelift tier in, so the startup check must not fire"
+        );
+        assert!(
+            Tier::Cranelift.is_available(),
+            "the runtime's `cranelift` feature compiles the engine's backend in"
+        );
+    }
 }
 
 /// **Feature on: `slice:fib/1 10` records the same `55` on all three tiers.**

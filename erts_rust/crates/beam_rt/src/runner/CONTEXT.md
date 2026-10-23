@@ -144,8 +144,10 @@ characterisation and figures are in `PERF.md`).
   is left where it is (no registration, no slot handed out).
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline` / `Cranelift`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
-  `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
-  tier-decision seam.
+  `env_default()` (the memoized unset-variable default), `select_entry_tier(...)` — the single
+  tier-decision seam — and the **startup capability check** `tier_unavailable(JitMode)` /
+  `unbuilt_tier_request()` (`pub(crate)`, re-exported by [`super`]) that [`crate::cli`]'s `drive`
+  calls once before it resolves or drives the boot script.
 * [`reason`] — the exit-reason translation only (`normal` + `exit_reason`); the finite-`receive`
   deadline recovery lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding sits here.
@@ -168,12 +170,14 @@ characterisation and figures are in `PERF.md`).
 
 ## The Cranelift tier and its feature gate
 The Cranelift backend is compiled in only behind the runtime's **`cranelift`** Cargo feature, which forwards `beam_engine/jit-cranelift`; it is **default OFF**, so a plain `cargo build` has no hot tier at all.
-The selection is not feature-gated — `select_entry_tier` answers `Tier::Cranelift` for `JitMode::Cranelift` unconditionally — because the gate belongs to the crate that owns the backend: with the feature off, `beam_engine`'s Cranelift entry points answer `Err(unsupported("jit-cranelift tier not built"))`, which `crate::error::unsupported_reason` classifies, so the CLI prints `beam_rt: unsupported: opcode: jit-cranelift tier not built` and exits `EXIT_UNSUPPORTED` (3).
-That failure is **loud by design**: no other tier is run in its place, so a `BEAM_RT_TIER=cranelift` invocation in a feature-off build can never be mistaken for a working hot tier.
-`beam_rt` adds no second feature gate of its own.
+The **selection** is not feature-gated — `select_entry_tier` answers `Tier::Cranelift` for `JitMode::Cranelift` unconditionally — so the choice of tier never depends on the build; what depends on the build is whether that tier can be served, and that is decided at **two** places, in a fixed order.
+1. **The startup rejection, owned by `beam_rt`'s CLI.** `tier_unavailable(mode)` answers the typed capability gap for a `Cranelift` request in a build whose `cranelift` feature is off (`None` for every other mode in every build, and `None` for `Cranelift` with the feature on), and `runner::unbuilt_tier_request()` is that check over the effective `BEAM_RT_TIER`. [`crate::cli`]'s `drive` calls it once, **before** the boot script is resolved or driven, so the invocation reports `beam_rt: unsupported: BEAM_RT_TIER=cranelift: this build has no cranelift execution tier (rebuild with the `cranelift` Cargo feature)` and exits `EXIT_UNSUPPORTED` (3) having done no boot work. It is a compile-time fact, so it never depends on the arguments, and `-version` is exempt (it runs no code, so it selects no tier).
+2. **The engine's feature-gated entry points, the second line of defence.** They answer `Err(unsupported("jit-cranelift tier not built"))` at the moment a Cranelift entry is actually attempted. The two can never disagree because they read the **same** feature — and they are ordered this way round because without the startup check the boot processes are the first to try the tier, their per-process failures are re-wrapped by the boot drive, and the CLI prints the exit-1 `beam_rt: exit <structured reason>`, which names no feature and reads like a crash.
+`beam_rt` therefore adds no second *feature* gate and no availability arm inside the selection.
 
-A Cranelift process's **first entry is supported and tier-equivalent** to the interpreter (the tier compiles per function and deopts per instruction to `Machine::step_instruction`), but a **suspension is a typed capability gap at this HEAD**: the tier has no resume entry point, so `beam_engine` answers `unsupported("cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)")` and a process that pre-empts on the reduction budget or parks in a `receive` dies with that exit-3 error instead of resuming.
+A Cranelift process's **first entry is supported and tier-equivalent** to the interpreter (the tier compiles per function and deopts per instruction to `Machine::step_instruction`), but a **suspension is a typed capability gap at this HEAD**: the tier has no resume entry point, so `beam_engine` answers `unsupported("cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)")` and a process that pre-empts on the reduction budget or parks in a `receive` dies with that error instead of resuming.
 The tier is still selected once, at the first entry, and remembered on the engine (`ProcessEngine::tier`); a resume re-enters through `Machine::resume_outcome_with_tier` on that same tier.
+**End to end this bounds what a `cranelift` build's CLI session can do.** `BEAM_RT_TIER` is process-wide, so the boot script's own processes (`heart`, `logger_server`, `application_controller`, …) are tiered on Cranelift too; every one of them parks (`wait`/`wait_timeout`), the resume is the typed gap above, and the boot drive re-wraps the failure — so a `-boot`/`-eval`/`run` invocation in a **feature-ON** build exits **1** with `beam_rt: exit <structured reason>` under `BEAM_RT_TIER=cranelift`. Only a **first entry** is servable, which is why the three-tier agreement evidence is an in-process runner test ([`tests`]' `fib_runs_to_the_same_result_on_all_three_tiers`) rather than a CLI probe.
 
 ## How the tier is selected
 In [`run`]'s slice, **before** the `RuntimeContext` borrow (the context takes `Runtime` mutably):
@@ -194,7 +198,7 @@ to the plain `Machine::resume_outcome` (so an interpreter-tier process is byte-f
 baseline tier is sound for any module (see `## The tier is sound for any module`), so neither the
 entry's module nor its code is inspected. The mode resolves from `state.jit_mode` if set (tests), else
 the process-wide `BEAM_RT_TIER` default ([`env_default`]).
-`JitMode::Cranelift` selects its own tier (`Tier::Cranelift`) and changes nothing else about the decision; whether that tier exists in the current build is the engine's `jit-cranelift` feature gate, so there is no second availability arm here (see `## The Cranelift tier and its feature gate`).
+`JitMode::Cranelift` selects its own tier (`Tier::Cranelift`) and changes nothing else about the decision; whether that tier can be **served** in the current build is the `cranelift` Cargo feature, read by the CLI-side startup check `tier_unavailable`/`unbuilt_tier_request` and, as the second line, by the engine's entry points — never by an availability arm inside the selection (see `## The Cranelift tier and its feature gate`).
 
 ## The tier is sound for any module
 [`select_entry_tier`] picks `BaselineJit` from the mode alone: there is **no module the baseline tier
@@ -330,7 +334,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   the pure `mode_from_value` (not through the environment).
 * `JitMode::Baseline` is an alias of the default selection (`Tier::BaselineJit`); only
   `JitMode::Interpreter` turns the native tier off, and `JitMode::Cranelift` is the third selection
-  (its availability is the engine's `jit-cranelift` feature, never a mode).
+  (whether that tier can be served is the `cranelift` Cargo feature, read by the CLI-side startup
+  check `tier_unavailable` — never a mode, and never an arm inside the selection).
 
 ## Test Strategy
 * `#[cfg(test)]` units in [`tests`]: `select_entry_tier` over the real tier fixtures — the default
@@ -348,6 +353,19 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   build a **three-tier first-entry agreement** runs one entry on `Interpreter`/`BaselineJit`/`Cranelift`
   and asserts the same answer on all three. The `cranelift` Cargo feature is not required by the crate
   gate, so the feature-off row is the one that always runs.
+  `tier_unavailable_refuses_only_the_unbuilt_cranelift_tier` pins the **startup check** in both
+  builds: the feature-off build gets the typed gap whose reason names `cranelift`, `BEAM_RT_TIER` and
+  the Cargo feature to rebuild with, the feature-on build gets `None`, and in **both** builds every
+  served mode (`Auto`/`Baseline`/`Interpreter`) is `None` — the property that keeps the CLI check
+  from ever refusing a working invocation.
+* [`tests/tier_selection.rs`](../../tests/tier_selection.rs) is the **CLI-level** suite for the same
+  surface: real `beam_rt` children through [`support::run_bounded_with_env`](../../tests/support/mod.rs),
+  with `BEAM_RT_TIER` set on the child (or **removed** for the unset row) so the test process's own
+  environment is never mutated. Its rows: a feature-off `cranelift` request on
+  `run slice.beam slice:fib/1 10` exits **3** with empty stdout and one `beam_rt: unsupported: …`
+  line naming the feature; `-version` under the same setting still exits **0** with the banner; and
+  unset/`auto`/`baseline`/`interpreter` still print `55` and exit 0 (the negative control — the check
+  must fire on nothing else). A feature-on row asserts the startup check stays silent there.
 * **The suites that enumerate tiers as strings enumerate exactly two, deliberately.** `tests/nif.rs`'s
   `TIERS`, `tests/zlib_{guards,one_shot,stream_levels,stream_dict}.rs`'s `Tier` enums,
   `tests/decoded_fun_badfun.rs`'s `TIERS` and `tests/compile_file.rs`'s tier loop all pin the
