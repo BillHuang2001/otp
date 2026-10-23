@@ -93,7 +93,9 @@ use beam_term::prelude::{
 /// **Partially routed** — [`Delivery::UnlinkId`]: the local link-record removal IS
 /// applied, but an `id != 0` additionally owes a `DOP_UNLINK_ID_ACK` this sink has no
 /// channel to emit, so that case reports the typed
-/// [`DeliveryOutcome::Unsupported`] for the wire half (see its arm).
+/// [`DeliveryOutcome::Unsupported`] for the wire half (see its arm). An `id == 0` is
+/// not a deliverable form at all — it is a wire error `beam_dist` rejects before any
+/// sink is called, so this arm serves only the unchecked view.
 ///
 /// **Not routed** — the distributed-spawn family and [`Delivery::Other`] are reported as
 /// [`DeliveryOutcome::Unsupported`], with the still-missing sibling API named at each
@@ -254,13 +256,24 @@ impl InboundSink for LocalDeliverySink<'_> {
             //
             // `DOP_UNLINK_ID` is the half that **must answer**. The C removes the link
             // and then sends `DOP_UNLINK_ID_ACK` unconditionally
-            // (`reply_dist_unlink_ack`, `erl_proc_sig_queue.c:2753-2760`; nothing is
-            // sent only when `id == 0`). The local link-record removal IS applied
-            // (`unlink_from_remote`), but the `ACK` **cannot be emitted**: `InboundSink`
-            // carries no reply channel and the drains count only `Delivered` (see the
-            // type docs), so this reports the typed `Unsupported` for the wire half
-            // rather than claiming an ack the runtime cannot produce. The `id == 0`
-            // form owes no ack and is `Delivered`.
+            // (`reply_dist_unlink_ack`, `erl_proc_sig_queue.c:2753-2760`). The local
+            // link-record removal IS applied (`unlink_from_remote`), but the `ACK`
+            // **cannot be emitted**: `InboundSink` carries no reply channel and the
+            // drains count only `Delivered` (see the type docs), so a non-zero id
+            // reports the typed `Unsupported` for the wire half rather than claiming an
+            // ack the runtime cannot produce.
+            //
+            // A **zero** id never reaches this sink on either production drive: both go
+            // through `ConnectionDriver::dispatch_inbound_checked`, and
+            // `beam_dist::Delivery::classify_validated` requires a non-zero small
+            // unsigned id (the C's `term_to_Uint64` + `id != 0`, `dist.c:2291-2295`),
+            // refusing anything else as `invalid_message` before a sink is called — so
+            // on the wire a zero-id `DOP_UNLINK_ID` delivers nothing and retires that
+            // one link. The arm serves the **unchecked** view only
+            // (`Delivery::classify` + this sink: the shape `beam_dist`'s
+            // `next_delivery`/`recv_delivery` hand a caller doing its own validation,
+            // and the shape the tests drive), where the truthful answer for a zero id
+            // is the record removal with no ack owed.
             Delivery::UnlinkId { id, from, to } => self.unlink_id(*id, *from, *to),
             Delivery::UnlinkIdAck { id, from, to } => self.unlink_ack(*id, *from, *to),
 
@@ -326,11 +339,19 @@ impl InboundSink for LocalDeliverySink<'_> {
             Delivery::GroupLeader { from, to } => self.group_leader(*from, *to),
 
             // The distributed-spawn family (`DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY`,
-            // `dist.c:2902-3093`): a `beam_rt` CLI process neither serves spawn
-            // requests nor holds spawn reservations, so there is no responder. Needs a
-            // `beam_process` spawn-responder/reservation API — a `DOP_SPAWN_REPLY`
-            // sender plus the reservation bookkeeping a `DOP_SPAWN_REQUEST` would key
-            // into — of which none exists.
+            // `dist.c:2902-3093`). The reservation half of the seam **exists** —
+            // `beam_process`'s `ProcessTable::{reserve_remote, reserve_identity,
+            // spawn_reserved, cancel_reservation}` claim the pid identity a request will
+            // occupy and install a process at exactly it (`beam_process/src/reserve.rs`)
+            // — and `beam_dist` models both opcodes. What this crate still lacks is its
+            // own half of the family: no **spawn responder** turns a request's
+            // `{MFA, Opts, args}` into a reservation + a process install, and there is no
+            // pending-spawn table keyed by `(peer, Ref)` for a reply to resolve into the
+            // waiting local parent (`erlang:spawn_request/*` is itself unimplemented, so
+            // this node never sends a request that a reply could answer). The reply has
+            // nowhere to go in either direction: `InboundSink` carries no reply channel
+            // (the same structural gap as the unlink ack), so no `DOP_SPAWN_REPLY` can be
+            // written for a request this sink accepts.
             Delivery::SpawnRequest { .. } | Delivery::SpawnReply { .. } => {
                 Ok(DeliveryOutcome::Unsupported)
             }
@@ -731,10 +752,19 @@ impl LocalDeliverySink<'_> {
     /// what the **wire** half owes (see the `UnlinkId` arm).
     ///
     /// `unlink_from_remote` hands back the id an ack is required for: `Some(id)` iff
-    /// `id != 0`, which is exactly the C's split (`reply_dist_unlink_ack` sends nothing
-    /// for `id == 0`, `erl_proc_sig_queue.c:2753-2760`). The link is dropped in both
-    /// cases; only the `id != 0` case additionally owes a `DOP_UNLINK_ID_ACK`, which
-    /// this sink has no channel to emit, so it is reported `Unsupported`.
+    /// `id != 0`. The link is dropped in both cases; the `id != 0` case additionally
+    /// owes a `DOP_UNLINK_ID_ACK`, which this sink has no channel to emit, so it is
+    /// reported `Unsupported`.
+    ///
+    /// **Defensive — reachable from the unchecked view only.** Neither production drive
+    /// can reach the zero-id branch below: both drain through
+    /// `ConnectionDriver::dispatch_inbound_checked`, whose
+    /// `beam_dist::Delivery::classify_validated` refuses an id that is not a non-zero
+    /// small unsigned integer as the C's `invalid_message` (`dist.c:2291-2295`), so a
+    /// zero-id `DOP_UNLINK_ID` **delivers nothing** and retires that one link. This
+    /// function therefore serves the shape-only `Delivery::classify` view (`beam_dist`'s
+    /// `next_delivery`/`recv_delivery`, and the tests that drive a `Delivery` straight
+    /// into this sink), where the record removal is applied and nothing is owed back.
     fn unlink_id(&mut self, id: Eterm, from: Eterm, to: Eterm) -> Result<DeliveryOutcome> {
         let pid = match self.resolve_live(to) {
             Ok(pid) => pid,
@@ -747,7 +777,8 @@ impl LocalDeliverySink<'_> {
             return Ok(DeliveryOutcome::Unsupported);
         };
         match self.table.unlink_from_remote(pid, remote, id) {
-            // `id == 0`: no ack owed, the unlink is complete locally.
+            // id == 0: a wire error on the checked path (see the doc above); in this
+            // unchecked view no ack is owed and the unlink is complete locally.
             Ok(None) => Ok(DeliveryOutcome::Delivered),
             // The link is dropped, but the ack this node owes cannot be emitted.
             Ok(Some(_)) => Ok(DeliveryOutcome::Unsupported),

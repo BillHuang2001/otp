@@ -10,9 +10,9 @@ the **canonical definitions of ERTS constants genuinely shared by two or more wo
 (`constants`, currently `CONTEXT_REDS`), the **one local reference-id space** every locally minted
 reference term draws from (`refid`), and the documented **`unsafe` marker convention**.
 
-This is a **dependency sink**: it depends on `std` (and `libc` for ABI-sized integer aliases) and on
-**nothing else** — deliberately no `thiserror`, no `tracing`, no `bitflags`. Adding any dependency
-here must be justified in `../../CONTEXT.md` and `../../../CHANGE.md`.
+This is a **dependency sink**: it depends on `std` and on **nothing else** — deliberately no
+`thiserror`, no `tracing`, no `bitflags`. Adding any dependency here must be justified in
+`../../CONTEXT.md` and `../../../CHANGE.md`.
 
 ## API Surface
 Re-exported at the crate root (`beam_common::…`); modules are private except `safety`.
@@ -109,7 +109,10 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
   `crates/beam_engine/src/terms/mod.rs`, `crates/beam_bifs/src/maps.rs`.
 - **`MAX_ARG`** (`= 255`, `erts/emulator/beam/erl_vm.h:48`) — published twice already
   (`beam_term::fun::MAX_ARG`, `beam_process::registers::MAX_ARG`); copies to drop:
-  `crates/beam_abi/src/nif/enif/process.rs` (`c_int`), `crates/beam_bifs/src/fun_info.rs` (`i64`).
+  `crates/beam_abi/src/nif/enif/process.rs` (`c_int`), `crates/beam_bifs/src/fun_info.rs` (`i64`),
+  `crates/beam_engine/src/interpreter/dispatch.rs` (`usize`),
+  `crates/beam_loader/src/chunk/table.rs` (`i32`) and
+  `crates/beam_loader/src/lower/validate.rs` (`u32`).
 - **`MAX_REG`** (`= 1024`, `erts/emulator/beam/erl_vm.h:49`) — canonical `beam_process::MAX_REG`
   (`crates/beam_process/src/registers.rs`); copy to drop: `crates/beam_loader/src/decode.rs` (`u64`).
 - **`MAX_ARITYVAL`** (`= (1<<24)-1`, `erts/emulator/beam/erl_term.h:322`) — canonical
@@ -129,36 +132,54 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
 A reference term is the on-heap block
 `[make_header(3, REF_SUBTAG), node = small(0), serial = small(0), id = small(N)]`, so its
 **identity is the `id` word alone** — `node`/`serial` are constant in M1 (one node, one local
-space). Three producers currently mint ids independently (`beam_abi`'s resource terms over a private
-`static AtomicUsize`, `beam_rt`'s `RefAllocator`-backed `make_ref`/timer/`seq_trace` ids,
-`beam_process::ProcessTable`'s own `RefAllocator` for monitors/aliases); overlapping spaces make a
-**dead** NIF resource term word-indistinguishable from a live plain reference, so an
-identity-matching reachability predicate (the runner's park-arm resource prune) retains the dead
-object and a liveness/monitor check can treat it as live.
+space).
+`refid` is that one space, and **no crate keeps a private reference-id counter** — every locally
+minted reference term's `id` comes from `beam_common::next_ref_id()`, so two producers can never hand
+out the same id.
+The `id`-only identity above is why: an overlapping space would make a **dead** NIF resource term
+word-indistinguishable from a live plain reference, so an identity-matching reachability predicate
+(the runner's park-arm resource prune) would retain the dead object and a liveness/monitor check
+could treat it as live.
 
-`refid` owns the single id space, and **no crate may keep a private reference-id counter** — every
-locally minted reference term's `id` comes from `beam_common::next_ref_id()`. It lives here because
-this crate is the lowest common ancestor: `beam_abi` (wave 0, which mints resource terms) cannot
-host something `beam_process` (wave 3, monitors/aliases) draws from, and `beam_process` must not
-depend on the NIF ABI crate. The typed wrappers stay with their owners (`beam_process::RefAllocator`
-/`MonitorRef`, `beam_abi`'s checked resource mint); `beam_common` only hands out the id. Adoption is
-pending: the three producers above still run their own counters and move their mint onto
-`next_ref_id()` in the following wave (`beam_abi` first, then `beam_process`/`beam_rt`).
+Every producer draws from it:
+- `erlang:make_ref/0`, the NIF `make_ref`, monitor references minted by the runtime, aliases, timer
+  references and `seq_trace` references, through `beam_rt`'s `Runtime::refs`
+  (`crates/beam_rt/src/runtime.rs` — a `RefAllocator`);
+- monitor/alias references through `beam_process::RefAllocator`, a **zero-sized handle** onto the
+  same counter rather than a counter of its own (`crates/beam_process/src/monitor.rs`);
+- NIF resource terms (`enif_make_resource` and the `enif_select` magic ref) through
+  `crates/beam_abi/src/nif/enif/resources.rs`, which narrows the drawn `u64` to the block's
+  `make_small` id slot **checked** against `beam_term::MAX_SMALL` — an unrepresentable id is a typed
+  refusal that publishes no term and takes no reference, never a truncated id.
+
+The space lives here because this crate is the lowest common ancestor: `beam_abi` (wave 0, which
+mints resource terms) cannot host something `beam_process` (wave 3, monitors/aliases) draws from, and
+`beam_process` must not depend on the NIF ABI crate.
+The typed wrappers stay with their owners (`beam_process::RefAllocator`/`MonitorRef`, `beam_abi`'s
+checked resource mint); `beam_common` only hands out the id.
+`beam_process::MonitorRef::from_id` is the one **explicit-id, non-mint** constructor — it draws
+nothing and its uniqueness is the caller's claim; its one workspace use is the unnamed-ETS-table tid,
+whose id must be the table handle so the tid decodes back through `beam_bifs::access::ref_thing_id`
+(`crates/beam_rt/src/runtime/ets_owner.rs`).
+The one-space invariant is pinned by `crates/beam_rt/tests/ref_id_space.rs` (all producers
+interleaved), `crates/beam_process/tests/reference_ids.rs` (a draw *is* the shared counter's next id)
+and `crates/beam_abi/src/nif/enif/resources_tests.rs` (the resource mint's draw).
 
 Two documented boundaries: (a) the counter is **not** bounded to the small-int range here (this
 crate must not depend on `beam_term`) — a caller writing the id via `make_small` range-checks the
-encoding itself and refuses an id past `MAX_SMALL` (2^59) with `BeamError::SystemLimit` rather than
-truncating it, a bound unreachable in practice and far below the counter's wrap point; (b) ids
+encoding itself and refuses an id past `MAX_SMALL` (2^59) rather than truncating it
+(`BeamError::SystemLimit` for a monitor reference, `None` from the NIF resource mint), a bound
+unreachable in practice and far below the counter's wrap point; (b) ids
 decoded from **another node** (ETF, `beam_codec`) are not from this space — real ERTS separates
 those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *locally minted* ids.
 
 ## Known Issues
 - **The `FeatureFlags` surface is largely inert.** Only `smp` is consumed anywhere (reported by
-  `beam_rt`'s `system_info(smp_support)`, `info/system.rs:102`); `interpreter`, `jit`, `cranelift`,
-  `dirty_schedulers`, `lock_checking`, `debug_assertions` and `memory_instrumentation` are set by the
-  builders / `for_flavor` but read by no crate. In particular `-emu_flavor emu` only flips the reported
-  `emu_flavor` atom (`for_flavor` sets `features.jit = false`, which nothing branches on) — it does not
-  disable the JIT.
+  `beam_rt`'s `system_info(smp_support)`, `crates/beam_rt/src/info/system.rs`); `interpreter`, `jit`,
+  `cranelift`, `dirty_schedulers`, `lock_checking`, `debug_assertions` and `memory_instrumentation`
+  are set by the builders / `for_flavor` but read by no crate. In particular `-emu_flavor emu` only
+  flips the reported `emu_flavor` atom (`for_flavor` sets `features.jit = false`, which nothing
+  branches on) — it does not disable the JIT.
 - **`RuntimeConfig::log_level` and `RuntimeConfig::dist_port_range` are never read** outside this crate
   (set + tested here only). `log_level` is not wired to the logging facade — the effective level comes
   solely from `ERTS_RUST_LOG`/`set_level`/`init_from_env`, so `with_log_level` has no runtime effect.

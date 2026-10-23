@@ -563,7 +563,7 @@ failed, 2 `#[ignore]`d, over 28 test binaries.**
   `../../../erts/emulator/sys/unix/sys_drivers.c:1029-1034` (`fd_flush`'s latch) and
   `drivers/common/ram_file_drv.c:120` (`flush = NULL`).
 
-## Oracle-pinned shapes still owed by the port layer (measured with the system `erl`)
+## Oracle-pinned shapes of the port layer (measured with the system `erl`)
 
 A C driver fixture (`driver_output(port,"",0)`, `driver_output(port,NULL,0)`,
 `driver_output2(port,"hdr",3,{NULL,""},"body",4)`, two calls per callback) run against

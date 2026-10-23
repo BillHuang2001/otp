@@ -148,7 +148,9 @@ RAII-scoped hooks that restore the default on drop (`beam_bifs/src/ets/{arith,se
   typed `badarg` — a `self/0` **guard** clause is then skipped (`guards_hold`
   treats the oracle's own `badarg` as a failed clause) and a `self/0` **body** is
   the typed `badarg`. The oracle evaluates it against the calling process, so
-  without an installed hook this is an honest SEMANTIC under-match. Pinned by
+  without an installed hook this is an honest SEMANTIC under-match; the runtime's
+  `beam_bifs` layer installs one per BIF (`beam_bifs/src/ets/self_hook.rs`'s
+  `SpecEval`), so only an un-hooked evaluation sees the default. Pinned by
   `tests/select.rs::documented_capability_gaps_are_typed_and_diverge_from_the_oracle`
   and `tests/match_spec_run.rs::documented_gaps_diverge_from_the_oracle_in_a_run`.
 - **Continuation cursors are kind-specific** (`continuation.rs`): an `ordered_set` resumes from the

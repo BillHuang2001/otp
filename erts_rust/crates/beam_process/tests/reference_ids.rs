@@ -430,8 +430,8 @@ fn from_id_names_its_explicit_id_and_encoding_stays_checked() {
 /// **`from_id` consumes no shared id** — it is O(1) for the caller and never perturbs the one
 /// process-wide space.
 ///
-/// This is the property the odometer-walk lacked: the caller used to burn a global id per step to
-/// *reach* a wanted id. A bracket of two shared draws around a `from_id` call proves nothing was
+/// This is the property a counter-walk lacks: reaching a wanted id by drawing would burn one
+/// shared id per step. A bracket of two shared draws around a `from_id` call proves nothing was
 /// drawn (the second draw is precisely the first `+ 1`), and a real mint afterwards is the shared
 /// space's next value — untouched by the fabricated reference.
 #[test]

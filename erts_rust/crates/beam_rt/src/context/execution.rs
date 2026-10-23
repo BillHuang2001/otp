@@ -40,7 +40,6 @@ use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::{BifOutcome, ExecutionContext};
 use beam_loader::{Label, Module};
-use beam_process::PendingSignal;
 use beam_term::{Atom, AtomTable, Eterm};
 
 use super::apply::{self, callee_admission, LocalFunTarget};
@@ -822,7 +821,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// it). Never `unsupported` while the running process exists — an empty mailbox is
     /// simply `Ok(None)`, which makes the compiled code jump to the `wait` that blocks.
     ///
-    /// # The fetch of a `'DOWN'`-only signal queue when the scan is exhausted
+    /// # The receive-applicable signal fetch when the scan is exhausted
     ///
     /// A process may commit to sleeping only **after** it has drained its own signal queue and
     /// re-checked that the drained queue yields no message. That is the C's `i_loop_rec`
@@ -838,20 +837,22 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// receiver that is still `Running`.
     ///
     /// So when the scan yields no message and the process has queued signals, they are applied
-    /// here — through the public [`ProcessTable::service_signals`], i.e. the same whole-queue
-    /// application the schedule-in uses, never a copy of its policy — and the scan is re-read.
+    /// here — through the public [`ProcessTable::service_receive_signals`], the
+    /// **receive-applicable** head drain (`beam_process/src/ptab.rs`: strictly FIFO, a trapped exit
+    /// becomes `{'EXIT', From, Reason}`, a monitor DOWN becomes `{'DOWN', …}`, an `Ignore` head is
+    /// discarded, and the walk stops *before* the first head whose `exit_policy` is `Terminate`,
+    /// leaving it and everything behind it queued) — and the scan is re-read.
     ///
-    /// **The `PendingSignal::Down`-only gate is mandatory.** `service_signals` applies the WHOLE
-    /// queue through `exit_policy`, and a `Terminate(_)` verdict would kill the running process
-    /// from **inside its own instruction stream**, where the runner has no channel to report the
-    /// death or propagate it. A `PendingSignal::Down` can only deliver a `{'DOWN', …}` message
-    /// (`ProcessTable::apply_head_signal`'s arm), so the gate is provably non-fatal without
-    /// re-deriving the policy table here. Every other signal class — the fatal ones included — is
-    /// left to the schedule-out net in the runner's park arm, which re-queues the process instead
-    /// of letting it sleep.
+    /// **Why that entry point and not `service_signals`.** the whole-queue application
+    /// (`service_signals`) runs every head through `exit_policy`, so a `Terminate(_)` verdict would
+    /// kill the running process from **inside its own instruction stream**, where the runner has no
+    /// channel to report the death or propagate it. The receive drain cannot: it stops at that
+    /// head, so the terminating classes are left to the schedule-out net in the runner's park arm,
+    /// which re-queues the process instead of letting it sleep (and the next schedule-in's
+    /// `service_signals` applies them and cascades).
     ///
     /// Two borrow facts make this shape necessary: `mailbox_parts` and the process-table
-    /// accessors each borrow `self`, so the gate is read (and its borrow dropped) before the
+    /// accessors each borrow `self`, so the queue is probed (and its borrow dropped) before the
     /// service, and the mailbox is re-read after it.
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
         let (queue, state) = self.mailbox_parts()?;
@@ -860,23 +861,17 @@ impl ExecutionContext for RuntimeContext<'_> {
             // touching the signal queue at all.
             return Ok(Some(message));
         }
-        // The scan is exhausted. Read the gate first, then drop the borrow before servicing.
+        // The scan is exhausted. Probe the queue and drop that borrow before servicing: an empty
+        // queue is the overwhelmingly common case and servicing it would be a no-op the scan must
+        // not mistake for progress.
         let pid = self.mailbox_pid;
-        let only_down_signals = {
-            let signals = self.process_table().signals(pid)?;
-            // `is_empty` is explicit: `Iterator::all` is vacuously true on an empty queue, and
-            // servicing a quiet process is a no-op the scan must not mistake for progress.
-            !signals.is_empty()
-                && signals
-                    .iter()
-                    .all(|signal| matches!(signal, PendingSignal::Down { .. }))
-        };
-        if !only_down_signals {
+        let has_signals = !self.process_table().signals(pid)?.is_empty();
+        if !has_signals {
             return Ok(None);
         }
-        self.process_table_mut().service_signals(pid)?;
-        // Re-read the scan: a delivered `'DOWN'` is a message like any other, so it is the
-        // candidate the following `loop_rec_end`/`remove_message` pair consumes.
+        self.process_table_mut().service_receive_signals(pid)?;
+        // Re-read the scan: a delivered `{'EXIT', …}`/`{'DOWN', …}` is a message like any other,
+        // so it is the candidate the following `loop_rec_end`/`remove_message` pair consumes.
         let (queue, state) = self.mailbox_parts()?;
         Ok(state.next(queue))
     }
