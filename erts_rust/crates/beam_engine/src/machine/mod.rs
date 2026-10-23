@@ -672,6 +672,29 @@ pub struct Machine {
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale `true` from an earlier counted run.
     pub(crate) census_on: bool,
+    /// The **lazy half** of the local-call memo's invalidation: set by the BIF-dispatch
+    /// funnel ([`Machine::dispatch_bif_call`](crate::machine::Machine)) when it dispatches
+    /// `erlang:load_nif/2`, consumed by the seam at its next local call.
+    ///
+    /// `load_nif/2` is the one documented way a host's answer set changes **mid-run**: it
+    /// installs the NIF a module's unexported `*_nif` stub needs, so a verdict memoized
+    /// before the install would keep entering the in-machine `erlang:nif_error(undef)`
+    /// body. The verdicts therefore have to be cleared — but **not** from the dispatch
+    /// itself: the BIF door is `&self` (see the receiver note on
+    /// [`Machine::dispatch_bif_call`](crate::machine::Machine); a `&mut self` receiver
+    /// there costs +6.9 % cycles/element on `list_walk` for +1.2 % instructions), while
+    /// clearing the memo needs `&mut self`. So the dispatch only **arms** this flag
+    /// through the cell and [`Machine::local_call_seam`](crate::machine::Machine) — which
+    /// is `&mut self` on every tier — consumes it at its very next call, before it reads
+    /// the memo.
+    ///
+    /// A `Cell` write through `&self` leaves the dispatch's codegen untouched (no aliasing
+    /// answer changes), and one `Cell` read per local call is what the seam pays for it.
+    /// Cleared by [`Machine::reset`](crate::machine::Machine::reset) (a fresh run has no
+    /// dispatch in flight) and by
+    /// [`Machine::invalidate_local_call_verdicts`](crate::machine::Machine) itself, so an
+    /// explicit host invalidation never leaves a pending one behind.
+    pub(crate) local_call_invalidation_pending: std::cell::Cell<bool>,
     /// The **local-call memo** the local-call seam consults on every local
     /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
     ///
@@ -689,10 +712,11 @@ pub struct Machine {
     ///   *less* faithful than caching.
     ///
     /// A repeat local call is therefore one fixed key scan plus one byte load. The
-    /// verdicts are invalidated by `erlang:load_nif/2` (through
-    /// [`Machine::dispatch_bif`](crate::machine::Machine)), by [`Machine::reset`], and by
-    /// the public [`Machine::invalidate_local_call_verdicts`] door; an un-nameable callee
-    /// is memoized as such and keeps costing the host *zero* consultations.
+    /// verdicts are invalidated **lazily** by `erlang:load_nif/2` (the BIF-dispatch funnel
+    /// arms [`Machine::local_call_invalidation_pending`], and the seam clears them here at
+    /// its next local call), by [`Machine::reset`], and by the public
+    /// [`Machine::invalidate_local_call_verdicts`] door; an un-nameable callee is memoized
+    /// as such and keeps costing the host *zero* consultations.
     ///
     /// **`pub(crate)`** so the seam (`crate::interpreter::dispatch`) can hold
     /// `&mut self.local_callees` for the memo while `resolve_local_call`'s
@@ -836,6 +860,7 @@ impl Machine {
             reduce_on: false,
             bif_in_machine_on: false,
             census_on: false,
+            local_call_invalidation_pending: std::cell::Cell::new(false),
             local_callees: LocalCallees::new(),
             current_code: CURRENT_CODE_NONE,
             entry_call: None,
@@ -1251,10 +1276,11 @@ impl Machine {
     /// Three things reach it, and a host that changes its answer set by any *other* means
     /// (a plugin reload, a configuration toggle of its own) must call it explicitly:
     ///
-    /// * the BIF-dispatch funnel ([`Machine::dispatch_bif`](crate::machine::Machine))
-    ///   calls it when it dispatches `erlang:load_nif/2` — the one documented way a
-    ///   mid-run install makes a module's unexported `*_nif` stub reachable, so every
-    ///   tier gets this;
+    /// * the local-call seam ([`Machine::local_call_seam`](crate::machine::Machine)) calls
+    ///   it when [`Machine::local_call_invalidation_pending`] is set, i.e. at the first
+    ///   local call after a BIF dispatch **armed** the flag by dispatching
+    ///   `erlang:load_nif/2` — the one documented way a mid-run install makes a module's
+    ///   unexported `*_nif` stub reachable, so every tier gets this;
     /// * [`Machine::reset`](crate::Machine) drops the whole memo at the start of every run
     ///   (the keys are module addresses, so they are only valid for the run that filled
     ///   them);
@@ -1262,9 +1288,11 @@ impl Machine {
     ///
     /// Only the **verdicts** are cleared: the memoized identities are pure functions of a
     /// loaded module and never go stale, so a re-ask re-derives nothing. This is a full
-    /// walk of one eight-byte array, and it allocates nothing.
+    /// walk of one eight-byte array, and it allocates nothing. It also clears any
+    /// **pending** invalidation, so an explicit call is never followed by a redundant one.
     #[inline]
     pub fn invalidate_local_call_verdicts(&mut self) {
+        self.local_call_invalidation_pending.set(false);
         self.local_callees.invalidate_verdicts();
     }
     /// The module-wide label index of `module` — **the** label-map door.

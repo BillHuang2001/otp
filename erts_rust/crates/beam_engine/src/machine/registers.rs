@@ -394,6 +394,10 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // with `contexts`, `resume_outcome` deliberately does **not** reset, and a
         // suspended machine's modules are still alive.
         self.local_callees.clear();
+        // … and with it any **pending** invalidation the previous run armed: a fresh run
+        // dispatches no BIF before its first local call, so a flag left over from an
+        // earlier run would only cost that run a redundant verdict clear.
+        self.local_call_invalidation_pending.set(false);
         // The raise-time snapshot belongs to the run that is starting too: it is the
         // pre-unwind frame chain of whichever raise last happened, and a fresh run
         // begins with no raise in flight. As with `contexts`, `resume_outcome`

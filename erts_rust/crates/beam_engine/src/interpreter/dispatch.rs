@@ -1139,11 +1139,15 @@ impl Machine {
     /// charges nothing for an intra-module call, so caching is the *faithful* choice
     /// rather than a shortcut.
     ///
-    /// The verdict is invalidated by `erlang:load_nif/2` (the BIF-dispatch funnel clears
-    /// every verdict when it dispatches `("erlang", "load_nif", 2)` — a stub a later local
-    /// call must reach), by [`Machine::reset`] (the start of every run) and by the public
-    /// [`Machine::invalidate_local_call_verdicts`] door a host with a stateful answer set
-    /// calls itself. Invalidation re-asks the host but re-derives nothing.
+    /// The memo is invalidatable, so the seam also pays one `Cell` read per call for the
+    /// **lazy** invalidation: the BIF-dispatch funnel is `&self` (keeping the hottest call
+    /// in the tier alias-free) and only **arms**
+    /// [`Machine::local_call_invalidation_pending`] when it dispatches
+    /// `("erlang", "load_nif", 2)`; this seam — `&mut self` on every tier — clears the
+    /// verdicts at its first call after such a dispatch (a stub a later local call must
+    /// reach). [`Machine::reset`] drops the whole memo at the start of every run, and the
+    /// public [`Machine::invalidate_local_call_verdicts`] door serves a host with a
+    /// stateful answer set. Invalidation re-asks the host but re-derives nothing.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn local_call_seam(
@@ -1157,6 +1161,14 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> std::result::Result<Option<Step>, Box<BeamError>> {
+        // Phase 0 — every local call: consume a **pending** invalidation armed by the
+        // BIF-dispatch funnel (`erlang:load_nif/2` installs the NIF a module's unexported
+        // `*_nif` stub needs, so every memoized verdict must be re-asked). This is where
+        // the memo is cleared because the funnel is `&self` by design and this seam is
+        // `&mut self`; one cell read, and the store only happens on a `load_nif` run.
+        if self.local_call_invalidation_pending.get() {
+            self.invalidate_local_call_verdicts();
+        }
         // Phase 1a — every local call: the memo's answer, which is a **byte** (no borrow
         // of `self` survives it, so the host consultation below can hold `&mut self` for
         // its own bookkeeping afterwards).

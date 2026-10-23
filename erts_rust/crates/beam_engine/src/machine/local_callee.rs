@@ -55,11 +55,13 @@
 //!
 //! The one documented way a host's answer set changes **mid-run** is
 //! `erlang:load_nif/2` installing a NIF for a stub a later local call must reach. The
-//! BIF-dispatch funnel therefore clears every verdict when it dispatches
-//! `("erlang", "load_nif", 2)` ([`Machine::invalidate_local_call_verdicts`], reached
-//! from `Machine::dispatch_bif`), and [`Machine::reset`](crate::Machine) clears the whole
-//! memo at the start of every run. A host whose answer set changes by any **other**
-//! means (its own plugins, a reload, a configuration toggle) calls
+//! BIF-dispatch funnel therefore **arms** an invalidation when it dispatches
+//! `("erlang", "load_nif", 2)` — a flag write through `&self`
+//! ([`Machine::local_call_invalidation_pending`]), because the dispatch door is `&self` —
+//! and the seam consumes it at its **next** local call, where it is `&mut self` and calls
+//! [`Machine::invalidate_local_call_verdicts`]. [`Machine::reset`](crate::Machine) clears
+//! the whole memo at the start of every run. A host whose answer set changes by any
+//! **other** means (its own plugins, a reload, a configuration toggle) calls
 //! [`Machine::invalidate_local_call_verdicts`] itself — that is the door's purpose, and
 //! it is public for exactly that reason.
 //!

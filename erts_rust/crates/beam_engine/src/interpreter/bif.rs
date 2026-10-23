@@ -56,7 +56,7 @@ pub(crate) const STACK_ARGS: usize = 2;
 const EMPTY_ARGS: [Eterm; STACK_ARGS] = [NIL; STACK_ARGS];
 
 /// The module of the **one** BIF whose dispatch invalidates the local-call seam's
-/// verdict memo (`erlang:load_nif/2`; see [`Machine::dispatch_bif`]).
+/// verdict memo (`erlang:load_nif/2`; see [`Machine::dispatch_bif_call`]).
 const ERLANG: &str = "erlang";
 /// That BIF's name.
 const LOAD_NIF: &str = "load_nif";
@@ -111,7 +111,7 @@ impl Machine {
             for (slot, arg) in buf.iter_mut().zip(args) {
                 *slot = read_operand(self, ctx, arg)?;
             }
-            self.dispatch_bif(
+            self.dispatch_bif_call(
                 entry_module,
                 module_name,
                 function_name,
@@ -197,7 +197,7 @@ impl Machine {
         scratch.reserve(len);
         let marshalled = fill(self, &mut *ctx, &mut scratch);
         let outcome = match marshalled {
-            Ok(()) => Ok(self.dispatch_bif(entry_module, module, function, arity, &scratch, ctx)),
+            Ok(()) => Ok(self.dispatch_bif_call(entry_module, module, function, arity, &scratch, ctx)),
             Err(e) => Err(e),
         };
         // Give the (now empty) buffer back so the next wide call reuses it.
@@ -283,7 +283,7 @@ impl Machine {
                     .x(i as u32)
                     .ok_or_else(|| error::bad_register(i as u32))?;
             }
-            self.dispatch_bif(
+            self.dispatch_bif_call(
                 entry_module,
                 module_name,
                 function_name,
@@ -312,46 +312,6 @@ impl Machine {
         }
     }
 
-    /// The **`&mut self` BIF-dispatch funnel**: note anything a dispatch changes about
-    /// the host's answer sets, then dispatch through [`Machine::dispatch_bif_call`].
-    ///
-    /// Every BIF-dispatch site in the crate calls this (`exec_bif` for a
-    /// `gc_bif`/`bif`/`bif0`, `call_bif_named` for a `call_ext*`/served local callee, the
-    /// wide-marshalling helper, and `families::funs`' `apply/3` route), so a semantic
-    /// change reaches **every** tier rather than one of them: the interpreter, the native
-    /// baseline tier and the Cranelift tier all end at the same place.
-    ///
-    /// # What a dispatch can invalidate
-    ///
-    /// Exactly one thing today: `erlang:load_nif/2` installs a NIF for a module's
-    /// unexported `*_nif` stub, which is precisely the callee the local-call seam
-    /// ([`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call))
-    /// serves — so a verdict memoized *before* the install would keep sending a later
-    /// local call into the in-machine stub body
-    /// (`erlang:nif_error(undef)`). The memo's verdicts are therefore cleared here, before
-    /// the dispatch, so the call that installed the NIF and every call after it re-ask the
-    /// host. The compare is short-circuited on the module name first and costs a length
-    /// test plus two short `memcmp`s on the cold path of an ordinary BIF dispatch.
-    ///
-    /// The window this wrapper opens is **not** a collection window: it hands the host no
-    /// machine at all, and [`Machine::dispatch_bif_call`] keeps its `&self` receiver, so
-    /// the marshalled argument slice stays unreachable from both rooted doors
-    /// (`tests/bif_args_window.rs`).
-    #[inline]
-    pub(crate) fn dispatch_bif(
-        &mut self,
-        entry_module: &Module,
-        module: &str,
-        function: &str,
-        arity: u32,
-        args: &[Eterm],
-        ctx: &mut dyn ExecutionContext,
-    ) -> Result<BifOutcome> {
-        if arity == 2 && function == LOAD_NIF && module == ERLANG {
-            self.invalidate_local_call_verdicts();
-        }
-        self.dispatch_bif_call(entry_module, module, function, arity, args, ctx)
-    }
     /// Dispatch a BIF through the host, taking the **in-machine** door when the
     /// host asked for it ([`ExecutionContext::wants_bif_in_machine`](crate::context::ExecutionContext::wants_bif_in_machine),
     /// latched into [`Machine::bif_in_machine_on`](crate::machine::Machine) once per
@@ -359,8 +319,12 @@ impl Machine {
     /// for the interpreter and the native baseline tier's own driver for
     /// [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit)).
     ///
-    /// This is the **single** low-level BIF-dispatch funnel [`Machine::dispatch_bif`] and
-    /// the engine's marshalling helpers reach, so the two doors can never drift:
+    /// This is the **single** low-level BIF-dispatch funnel **every** BIF-dispatch site
+    /// in the crate reaches (`exec_bif` for a `gc_bif`/`bif`/`bif0`, `call_bif_named` for a
+    /// `call_ext*`/served local callee, the wide-marshalling helper, and
+    /// `families::funs`' `apply/3` route), so a semantic change reaches **every** tier
+    /// rather than one of them: the interpreter, the native baseline tier and the
+    /// Cranelift tier all end at the same place. The two doors can never drift:
     ///
     /// * gate **off** (the default, every existing host): the plain
     ///   [`ExecutionContext::call_bif_outcome`](crate::context::ExecutionContext::call_bif_outcome)
@@ -377,6 +341,35 @@ impl Machine {
     /// site decides whether it may park (re-execution-idempotent) or must report a
     /// typed error (`apply/3`, which has already rewritten `x(0..arity)`).
     ///
+    /// # What a dispatch can invalidate (lazily — the funnel stays `&self`)
+    ///
+    /// Exactly one thing today: `erlang:load_nif/2` installs a NIF for a module's
+    /// unexported `*_nif` stub, which is precisely the callee the local-call seam
+    /// ([`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call))
+    /// serves — so a verdict memoized *before* the install would keep sending a later
+    /// local call into the in-machine stub body (`erlang:nif_error(undef)`).
+    ///
+    /// The funnel therefore only **arms** a flag here
+    /// ([`Machine::local_call_invalidation_pending`](crate::machine::Machine), a
+    /// `Cell<bool>` written through `&self`); the seam consumes it at its own next
+    /// local call, where it is `&mut self` anyway, and clears the verdicts there
+    /// ([`Machine::invalidate_local_call_verdicts`](crate::machine::Machine::invalidate_local_call_verdicts)).
+    /// Every tier gets this by construction, because every tier's local call reaches the
+    /// one `Machine::local_call_seam`.
+    ///
+    /// Keeping the receiver **`&self`** is not an accident to be "cleaned up": this is the
+    /// single hottest call in the interpreted tier (~42 % of `list_walk`'s cycles are BIF
+    /// dispatch), and a `&mut self` receiver forces the optimiser to assume every field of
+    /// `Machine` may be clobbered across it — measured at +6.9 % cycles per element on
+    /// `list_walk` for +1.2 % instructions, i.e. a pure stall. The compare below is
+    /// short-circuited on the arity first and then costs a length test plus two short
+    /// `memcmp`s on the cold path of an ordinary BIF dispatch, and the flag write is a
+    /// single store on the rare `load_nif` path.
+    ///
+    /// The dispatch window is **not** a collection window either: it hands the host the
+    /// machine only through the `&self` in-machine door, so the marshalled argument slice
+    /// stays unreachable from both rooted doors (`tests/bif_args_window.rs`).
+    ///
     /// `entry_module` is the module the run was entered at — the same one
     /// [`Machine::drive`](crate::machine::Machine::drive) threads down from its own
     /// entry module argument. It is unused when the gate is off.
@@ -390,6 +383,9 @@ impl Machine {
         args: &[Eterm],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<BifOutcome> {
+        if arity == 2 && function == LOAD_NIF && module == ERLANG {
+            self.local_call_invalidation_pending.set(true);
+        }
         if self.bif_in_machine_on {
             ctx.call_bif_in_machine_outcome(self, entry_module, module, function, arity, args)
         } else {

@@ -1088,8 +1088,11 @@ fn a_served_local_tail_call_still_pops_its_frame_with_the_memoized_verdict() {
 /// answer set changes mid-run. A local call **before** the install and the same local call
 /// **after** it are two questions, so a stub the NIF installed is reached by the second.
 ///
-/// The funnel is the BIF-dispatch one (`Machine::dispatch_bif`), so this covers every tier
-/// by construction; the interpreter is the tier exercised here.
+/// The invalidation is **lazy**: the BIF-dispatch funnel
+/// ([`Machine::dispatch_bif_call`], which stays `&self`) only arms
+/// [`Machine::local_call_invalidation_pending`]; the seam clears the verdicts at its next
+/// local call. So the funnel covers every tier by construction while the hot BIF door keeps
+/// its `&self` codegen; the interpreter is the tier exercised here.
 #[test]
 fn dispatching_load_nif_invalidates_the_memoized_verdicts() {
     let module = load_nif_module();
@@ -1117,6 +1120,140 @@ fn dispatching_load_nif_invalidates_the_memoized_verdicts() {
     );
 }
 
+/// A module whose `run/0` calls `helper/0` and then dispatches `erlang:load_nif/2` as its
+/// **last** instruction — the shape that leaves the armed invalidation **pending** when the
+/// run returns:
+///
+/// ```text
+/// run/0:     label 1; allocate 0,0; call helper; move 0 -> x0;
+///            move 0 -> x1; call_ext erlang:load_nif/2; deallocate 0; return
+/// helper/0:  label 5; move 99 -> x0; return
+/// ```
+fn load_nif_last_module() -> Module {
+    let mut fixture = Fixture::new("m");
+    let load_nif = fixture.import("erlang", "load_nif", 2);
+    let run = fixture.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Call {
+                target: HELPER,
+                arity: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(1),
+            },
+            Instr::CallExt {
+                target: load_nif,
+                arity: 2,
+            },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    fixture.add_function(
+        "helper",
+        0,
+        vec![
+            Instr::Label(HELPER),
+            Instr::Move {
+                src: Operand::Integer(99),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    fixture.add_export("run", 0, run);
+    fixture.finish()
+}
+
+/// The function index whose label table holds `label`, i.e. the [`CalleeKey`] field the
+/// local-call memo is keyed on (a function may own several labels).
+fn func_of(module: &Module, label: Label) -> u32 {
+    module
+        .functions
+        .iter()
+        .position(|function| function.labels.get(&label).is_some())
+        .expect("the fixture's function") as u32
+}
+
+/// The `load_nif/2` invalidation is **lazy**: the dispatch arms it and the seam consumes it
+/// at the next local call, so right after a run whose last instruction is the dispatch the
+/// flag is set and the memo still holds the pre-install answers. This is what lets the BIF
+/// door keep its `&self` receiver (the hottest call in the interpreted tier) while every
+/// tier still re-asks the host.
+#[test]
+fn the_load_nif_invalidation_stays_pending_until_the_next_local_call() {
+    let module = load_nif_last_module();
+    let observations = SeamObservations::default();
+    let mut ctx = seam_context(false, &observations);
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
+        .expect("the fixture runs");
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(0)),
+        "the tail `load_nif/2` dispatch's own value flows out"
+    );
+    let key = CalleeKey {
+        module: &module as *const Module as usize,
+        func: func_of(&module, HELPER),
+    };
+    assert_eq!(
+        observations.consultations.get(),
+        1,
+        "the one local call before the install asked the host"
+    );
+    assert_eq!(
+        machine.local_callees.verdict(key),
+        Some(Verdict::Declined),
+        "the dispatch did not clear the verdict itself — the seam does, at the next local call"
+    );
+    assert!(
+        machine.local_call_invalidation_pending.get(),
+        "the `load_nif/2` dispatch armed the pending invalidation"
+    );
+    // The public door consumes a pending invalidation too, so a host that invalidates
+    // explicitly is never followed by a redundant clear.
+    machine.invalidate_local_call_verdicts();
+    assert!(!machine.local_call_invalidation_pending.get());
+    assert_eq!(
+        machine.local_callees.verdict(key),
+        Some(Verdict::Ask),
+        "the verdicts were cleared (the identity stays, so the next call re-asks)"
+    );
+}
+
+/// A pending invalidation does **not** survive [`Machine::reset`]: a fresh run has dispatched
+/// nothing, so the flag belongs to the run that armed it.
+#[test]
+fn resetting_the_machine_clears_a_pending_invalidation() {
+    let module = load_nif_last_module();
+    let observations = SeamObservations::default();
+    let mut ctx = seam_context(false, &observations);
+    let mut machine = Machine::new();
+    machine
+        .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
+        .expect("the fixture runs");
+    assert!(machine.local_call_invalidation_pending.get());
+    machine.reset();
+    assert!(
+        !machine.local_call_invalidation_pending.get(),
+        "`reset` clears the flag with the memo it belongs to"
+    );
+}
+
 /// A BIF dispatch that is **not** `load_nif/2` leaves the verdicts alone: the funnel's
 /// compare must not clear the memo on every BIF (that would defeat the cache entirely).
 #[test]
@@ -1128,17 +1265,16 @@ fn an_ordinary_bif_dispatch_keeps_the_memoized_verdicts() {
     machine
         .run_export_outcome(&module, atom_of(&module, "run"), 0, &[], &mut ctx)
         .expect("the fixture runs");
+    assert!(
+        !machine.local_call_invalidation_pending.get(),
+        "no `load_nif/2` was dispatched, so nothing was armed"
+    );
     let verdicts: Vec<_> = [HELPER, HELPER2]
         .iter()
         .map(|label| {
-            let func = module
-                .functions
-                .iter()
-                .position(|function| function.labels.get(label).is_some())
-                .expect("the callee's function");
             machine.local_callees.verdict(CalleeKey {
                 module: &module as *const Module as usize,
-                func: func as u32,
+                func: func_of(&module, *label),
             })
         })
         .collect();
