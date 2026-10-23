@@ -39,7 +39,12 @@ Sections:
 * [The off-heap binary roster](#the-off-heap-binary-roster-reachability-reclaim-and-the-binary-virtual-heap-trigger)
   — the reachability sweep flat in N, and the pre-wiring runtime probe that shows what the missing
   trigger costs (one retained 64 KiB payload per call).
-
+* [The mature-strategy sweep — C1 and C2](#the-mature-strategy-sweep--c1-and-c2-at-the-collector-level)
+  — allocation-churn (low live) and heap-growth (high live, growing) measured per arm, interleaved and
+  paired, with the noise floor and the load.
+* [The four-class record and the standing decision](#the-four-class-record-and-the-standing-decision)
+  — C1/C2 from this crate, C3/C4 from `../beam_rt/GC_STRATEGY_MEASURED.md`, one row per class, and the
+  default it leaves in place.
 ## The allocation-heavy workload
 
 Source: `tests/allocation_heavy_workload.rs`, run from the repository root with
@@ -640,14 +645,24 @@ figures are not comparable across probe revisions — only the flatness in N, th
 `before → after` delta are carried as results. Load is shared, so no timing is quoted here.
 
 ## Runtime-shaped dispatch (the break-even through the runtime's own GC doors)
-Source: `../beam_rt/tests/gc_immix_payload.rs` and `../beam_rt/tests/gc_strategy.rs` (crate `beam_rt`,
-outside this crate's own test tree). The same workload driven through `beam_rt`'s own GC doors with a
-runtime-spawned process reproduces the small-object/high-churn verdict exactly at the break-even: with
-`initial_mature_words` **2047** (Copying) vs **2048** (Immix), Immix moves **1.146×** the words for
-**6.57×** the mature occupancy. That is why the automatic rule's default stays Copying and
-`MatureKind::Immix` remains an opt-in — `BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature
-generation past the break-even. Load-invariant counts only; timings are not asserted.
-
+Source: `../beam_rt/tests/gc_immix_payload.rs` (crate `beam_rt`, outside this crate's own test tree); its
+`//!` doc table is **canonical** for this workload and the figures below are that table, not a second
+measurement. The payload workload driven through `beam_rt`'s own GC doors with a runtime-spawned process
+reaches the small-object/high-churn verdict at the break-even: with `initial_mature_words` **2047**
+(Copying) vs **2048** (Immix), Immix moves **0.535×** the words (**0.527×** the objects — the mark region
+pins the promoted live set instead of re-copying it at every fullsweep) for **4.467×** the mature occupancy
+and **2.651×** the reported used process bytes, and reaches a fullsweep far more often — **291 of 558**
+collections against **196 of 588**, because a mark-region minor whose promotion does not fit the free lines
+escalates to a major. Its `collections × mean nursery capacity` product lands **0.996×**, inside the 1 %
+band the test asserts (both runs install the same two nursery capacities, 2 586 and 4 185 words, and differ
+only in how long they stay in each).
+Two caveats carry over from the cross-class record: the copy-work ratio is **not a direction** (copy volume
+follows whichever nursery each run's collection mix installs), and `collections × mean nursery capacity` is
+**not** a general cross-strategy invariant — it holds on this allocation-dominated payload and does not hold
+on the three runtime classes ([the four-class record](#the-four-class-record-and-the-standing-decision)).
+That is why the automatic rule's default stays Copying and `MatureKind::Immix` remains an opt-in —
+`BEAM_RT_GC_STRATEGY=immix` raises the spawned policy's mature generation past the break-even. Load-invariant
+counts only; timings are printed and never asserted.
 ## Per-op attribution of the `gc_bound/churn` shape (the collector's own counters)
 
 Source: `tests/churn_attribution.rs` (`--nocapture`; deterministic counts only, no timing asserted). It
