@@ -18,13 +18,13 @@
 //
 // %CopyrightEnd%
 
-//! **The native baseline tier's in-machine module-context handling, pinned
+//! **The native tiers' in-machine module-context handling, pinned
 //! interpreter-identical on REAL `erlc`-produced modules.**
 //!
 //! `tests/external_call.rs` proves the cross-module seam (`Step::Enter`, the
 //! driver-mediated module-context switch) on hand-built synthetic bytecode and
-//! `tests/jit_real_module.rs` proves the tier is observationally the interpreter
-//! over the whole installed OTP corpus -- but neither pins the **native tier's
+//! `tests/jit_real_module.rs` proves the tiers are observationally the interpreter
+//! over the whole installed OTP corpus -- but neither pins a **native tier's
 //! module-context machinery itself** on a real compiled module: the driver
 //! round-trip that resolves a `call_ext*` through
 //! [`ExecutionContext::resolve_external_call`], registers the callee as a module
@@ -33,14 +33,40 @@
 //!
 //! This suite is that independent engine-level proof: every fixture is a tiny
 //! `.beam` compiled from source by the **system `erlc`** at test time (the
-//! differential gate's own toolchain), and every case is driven through **both**
-//! `Machine::run_export_outcome_with_tier(.., Tier::BaselineJit)` and
-//! `Tier::Interpreter` over the *same* [`ExecutionContext`]. The two tiers must
-//! agree on the [`RunOutcome`] -- the **same value** (compared with
+//! differential gate's own toolchain), and every case is driven through the tiers
+//! this build compiles in over the *same* [`ExecutionContext`] -- always
+//! [`Tier::Interpreter`] and [`Tier::BaselineJit`], plus the optional
+//! [`Tier::Cranelift`] hot tier when the **`jit-cranelift`** feature is enabled
+//! (the roster is [`NATIVE_TIERS`], the same feature-gated shape
+//! `tests/jit_coverage.rs` drives). Every native tier must agree with the
+//! interpreter on the [`RunOutcome`] -- the **same value** (compared with
 //! `beam_term::cmp`, the module's exact `=:=` ordering, so boxed
 //! tuples/lists compare by value) or the **same** suspension address and the same
-//! typed error shape. A value on one tier and an error on the other **fails**, as
+//! typed error shape. A value on one tier and an error on another **fails**, as
 //! do two *different* errors or two different suspension addresses.
+//!
+//! # Tier coverage
+//!
+//! The roster is a build-time property, not a per-case choice:
+//!
+//! - [`Tier::Interpreter`] and [`Tier::BaselineJit`] in **every** build. The
+//!   baseline tier is the one that makes the cross-module seam *native*: a resolved
+//!   `call_ext*` leaves its compiled block as a driver-mediated module-context
+//!   transfer and the callee's own blocks are compiled on first sight
+//!   (`NativeCode::module_blocks` -> the per-thread `CodeCache`).
+//! - [`Tier::Cranelift`] additionally with the **`jit-cranelift`** Cargo feature
+//!   (default OFF), on every case below **except** the parked-suspension row. That
+//!   tier does **not** accelerate a cross-module callee: it runs each `call_ext*`
+//!   through the same shared interpreter-backed per-instruction helper, so the
+//!   claim it carries here is **correctness** (the seam's callee resolution, the
+//!   recursive module-context re-entry and the dynamic `apply` decode all produce
+//!   the interpreter's answer), never acceleration.
+//! - The parked-suspension row (`a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier`)
+//!   deliberately stays on the interpreter and the baseline tier: Cranelift cannot
+//!   resume at a mid-function `pc` and answers the honest typed `unsupported` from
+//!   [`Machine::resume_outcome_with_tier`], so a *same-tier resume* is only
+//!   expressible on the two tiers that support it (see `beam_engine/CONTEXT.md`,
+//!   "The JIT tier seam").
 //!
 //! # The cases
 //!
@@ -60,7 +86,8 @@
 //!    suspension is asserted to be in a **non-entry** module context
 //!    ([`Machine::current_module`] is `park_b`); the process is then resumed **on the
 //!    same tier** through `Machine::resume_outcome_with_tier` after a message is
-//!    delivered, and both tiers must yield the delivered term.
+//!    delivered, and both tiers must yield the delivered term. This is the one row
+//!    restricted to the interpreter and the baseline tier (see *Tier coverage*).
 //! 4. **A dynamic `apply/3` on registers.** `apply_a:run/3` tail-calls
 //!    `erlang:apply/3` with `M`/`F`/`A` read out of `x(0)`/`x(1)`/`x(2)`; the engine's
 //!    `fixed_apply` special case decodes them and resolves the *computed* target
@@ -454,8 +481,26 @@ fn fixture_host() -> SeamHost {
 }
 
 // ---------------------------------------------------------------------------
-// The two-tier driver
+// The multi-tier driver
 // ---------------------------------------------------------------------------
+
+/// The native tiers this build has to check the interpreter against.
+///
+/// The baseline tier is in every build; the Cranelift hot tier joins the roster
+/// with the **`jit-cranelift`** Cargo feature (the same feature-gated roster
+/// `tests/jit_coverage.rs` drives). Both run the *same* shared per-instruction
+/// interpreter-backed helper for everything they do not inline, so every case below
+/// that uses [`run_both`] asserts tier-vs-interpreter equivalence for whichever
+/// tiers are compiled in.
+///
+/// The one row that does **not** use this roster is the parked-suspension case,
+/// because Cranelift has no mid-function resume (see the module docs).
+#[cfg(feature = "jit-cranelift")]
+const NATIVE_TIERS: [Tier; 2] = [Tier::BaselineJit, Tier::Cranelift];
+
+/// The native tiers this build has to check the interpreter against (baseline only).
+#[cfg(not(feature = "jit-cranelift"))]
+const NATIVE_TIERS: [Tier; 1] = [Tier::BaselineJit];
 
 /// One target's run through one tier: the outcome plus the machine that produced it.
 ///
@@ -492,15 +537,25 @@ fn run_tier(
     TierRun { outcome, machine }
 }
 
-/// Asserts the two tiers' outcomes are **the same observation** -- the same value
-/// (under `beam_term::cmp`), the same suspension address, or the same typed error
-/// shape -- panicking loudly on any divergence.
-fn assert_tiers_agree(host: &SeamHost, label: &str, interp: &TierRun, jit: &TierRun) {
-    match (&interp.outcome, &jit.outcome) {
+/// Asserts one native tier's outcome is **the same observation** as the
+/// interpreter's -- the same value (under `beam_term::cmp`), the same suspension
+/// address, or the same typed error shape -- panicking loudly on any divergence.
+///
+/// Every message names the tier under test (`interpreter vs <tier name>`) so a
+/// divergence says *which* native tier it was.
+fn assert_tiers_agree(
+    host: &SeamHost,
+    label: &str,
+    interp: &TierRun,
+    native: &TierRun,
+    tier: Tier,
+) {
+    let name = tier.name();
+    match (&interp.outcome, &native.outcome) {
         (Ok(RunOutcome::Returned(expected)), Ok(RunOutcome::Returned(got))) => assert!(
             cmp(*got, *expected, host.atom_table()).is_eq(),
-            "TIER DIVERGENCE for `{label}`: the interpreter and the baseline tier returned \
-             DIFFERENT terms:\n  interpreter: {expected:?}\n  baseline-jit: {got:?}"
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): the tiers returned \
+             DIFFERENT terms:\n  interpreter: {expected:?}\n  {name}: {got:?}"
         ),
         (
             Ok(RunOutcome::Wait {
@@ -508,38 +563,46 @@ fn assert_tiers_agree(host: &SeamHost, label: &str, interp: &TierRun, jit: &Tier
                 pc: interp_pc,
             }),
             Ok(RunOutcome::Wait {
-                func: jit_func,
-                pc: jit_pc,
+                func: native_func,
+                pc: native_pc,
             }),
         ) => assert_eq!(
             (interp_func, interp_pc),
-            (jit_func, jit_pc),
-            "TIER DIVERGENCE for `{label}`: the two tiers suspended at DIFFERENT addresses"
+            (native_func, native_pc),
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): the tiers suspended at \
+             DIFFERENT addresses"
         ),
         (Ok(got), Ok(other)) => panic!(
-            "TIER DIVERGENCE for `{label}`: the two tiers agreed on an outcome -- one \
-             returned, the other suspended:\n  interpreter: {got:?}\n  baseline-jit: {other:?}"
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): the tiers agreed on an \
+             outcome -- one returned, the other suspended:\n  interpreter: {got:?}\n  {name}: \
+             {other:?}"
         ),
         (Ok(got), Err(error)) => panic!(
-            "TIER DIVERGENCE for `{label}`: the interpreter reported {got:?} while the \
-             baseline tier errored: {error:?}"
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): the interpreter reported \
+             {got:?} while this tier errored: {error:?}"
         ),
         (Err(error), Ok(got)) => panic!(
-            "TIER DIVERGENCE for `{label}`: the baseline tier reported {got:?} while the \
-             interpreter errored: {error:?}"
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): the tier reported {got:?} \
+             while the interpreter errored: {error:?}"
         ),
         (Err(expected), Err(got)) => assert_eq!(
             format!("{got:?}"),
             format!("{expected:?}"),
-            "TIER DIVERGENCE for `{label}`: both tiers errored, but with DIFFERENT typed \
-             errors (this compares the full error shape, not `is_err()`):\n  interpreter: \
-             {expected:?}\n  baseline-jit: {got:?}"
+            "TIER DIVERGENCE for `{label}` (interpreter vs {name}): both tiers errored, but \
+             with DIFFERENT typed errors (this compares the full error shape, not \
+             `is_err()`):\n  interpreter: {expected:?}\n  {name}: {got:?}"
         ),
     }
 }
 
-/// Drives one `module:function(args)` through **both** tiers over one host and
-/// returns both runs (after asserting they agree).
+/// Drives one `module:function(args)` through the interpreter and through **every**
+/// native tier in [`NATIVE_TIERS`] over one host, asserting each native run agrees
+/// with the interpreter, and returns `(interpreter, baseline)`.
+///
+/// The second element is always the [`Tier::BaselineJit`] run -- the first entry of
+/// [`NATIVE_TIERS`] in every build -- so a call site that cares about the
+/// *accelerated* cross-module path keeps its handle while the Cranelift hot tier is
+/// checked purely for equivalence.
 fn run_both(
     host: &mut SeamHost,
     module: &Arc<Module>,
@@ -548,19 +611,25 @@ fn run_both(
     label: &str,
 ) -> (TierRun, TierRun) {
     let interp = run_tier(host, module, function, args, Tier::Interpreter);
-    let jit = run_tier(host, module, function, args, Tier::BaselineJit);
-    assert_tiers_agree(host, label, &interp, &jit);
-    (interp, jit)
+    let mut baseline = None;
+    for tier in NATIVE_TIERS {
+        let native = run_tier(host, module, function, args, tier);
+        assert_tiers_agree(host, label, &interp, &native, tier);
+        if baseline.is_none() {
+            baseline = Some(native);
+        }
+    }
+    let baseline = baseline.expect("`NATIVE_TIERS` always starts with the baseline tier");
+    (interp, baseline)
 }
 
-/// The returned value of an outcome both tiers already agree on.
+/// The returned value of an outcome the tiers already agree on.
 fn value_of(run: &TierRun, label: &str) -> Eterm {
     match &run.outcome {
         Ok(RunOutcome::Returned(value)) => *value,
         other => panic!("`{label}` was expected to return a value, got {other:?}"),
     }
 }
-
 /// Asserts `value` is the term `expected` (under the host's exact ordering).
 fn assert_value(host: &SeamHost, value: Eterm, expected: Eterm, label: &str) {
     assert!(
@@ -580,14 +649,15 @@ fn expected_ok(host: &mut SeamHost, n: i64) -> Eterm {
 // ---------------------------------------------------------------------------
 
 /// `crosscall_a:run/1` (`N * 2` then `crosscall_b:add_one/1`) and `run0/0` (the bare
-/// cross-module tail call), on both tiers.
+/// cross-module tail call), on the interpreter and on every native tier in
+/// [`NATIVE_TIERS`].
 ///
 /// The native tier executes the caller's `gc_bif '*'/2` inlined and hands the
 /// `call_ext_only` to the driver as a module-context transfer into `crosscall_b`'s
 /// compiled blocks; the interpreter resolves the same seam from its own dispatch
-/// arm. Both must observe `{ok, 15}` / `{ok, 42}`.
+/// arm. All of them must observe `{ok, 15}` / `{ok, 42}`.
 #[test]
-fn a_native_block_makes_a_resolved_cross_module_call_on_both_tiers() {
+fn a_native_block_makes_a_resolved_cross_module_call_across_tiers() {
     if skip_if_unavailable() {
         return;
     }
@@ -633,7 +703,7 @@ fn a_native_block_makes_a_resolved_cross_module_call_on_both_tiers() {
 /// `walk(N)` is `2 * N` (each level adds two), so `run(5)` is `10` and `run(0)` is
 /// `0` -- verified against the real `erl` at authoring time.
 #[test]
-fn a_nested_recursive_cross_module_chain_agrees_on_both_tiers() {
+fn a_nested_recursive_cross_module_chain_agrees_across_tiers() {
     if skip_if_unavailable() {
         return;
     }
@@ -657,6 +727,15 @@ fn a_nested_recursive_cross_module_chain_agrees_on_both_tiers() {
 /// empty: both tiers must report the **same** [`RunOutcome::Wait`], and the machine
 /// must be in the **callee's** (non-entry) module context. Delivering a message and
 /// resuming **on the same tier** must yield the delivered term on both.
+///
+/// This is the one row that does **not** use [`run_both`] / [`NATIVE_TIERS`]: it is
+/// the only case whose point is a **resume**, and the Cranelift hot tier has no
+/// mid-function resume entry point. (Its *first* entry does report the same
+/// [`RunOutcome::Wait`] address as the other tiers, so it is `run_both`-compatible
+/// up to the park; the resume is what excludes it.) Asking that tier to resume is
+/// the honest typed `Err(unsupported_opcode: cranelift jit: cannot resume at an
+/// arbitrary pc (the cranelift tier has no resume entry point))`, so a same-tier
+/// resume row is only meaningful on the interpreter and the baseline tier.
 #[test]
 fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
     if skip_if_unavailable() {
@@ -666,9 +745,12 @@ fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
     let entry = host.module("park_a");
     let callee = host.module("park_b");
 
+    // The interpreter and the baseline tier only (see the doc comment above).
     host.clear_mailbox();
-    let (mut interp, mut jit) = run_both(&mut host, &entry, "run", &[], "park_a:run/0");
-
+    let mut interp = run_tier(&mut host, &entry, "run", &[], Tier::Interpreter);
+    host.clear_mailbox();
+    let mut jit = run_tier(&mut host, &entry, "run", &[], Tier::BaselineJit);
+    assert_tiers_agree(&host, "park_a:run/0", &interp, &jit, Tier::BaselineJit);
     // Both tiers suspended, at the same callee address.
     let wait = match (&interp.outcome, &jit.outcome) {
         (
@@ -736,9 +818,9 @@ fn a_slice_parked_in_a_cross_module_callee_resumes_on_the_same_tier() {
 /// `apply_a:run/3` tail-calls `erlang:apply/3` with the target read out of the
 /// registers; the engine's `fixed_apply` decode resolves the *computed* target
 /// through the cross-module seam, so `crosscall_b:add_one/1` runs in this machine on
-/// both tiers and both observe `{ok, 8}`.
+/// every tier in [`NATIVE_TIERS`] and all of them observe `{ok, 8}`.
 #[test]
-fn a_dynamic_apply_on_registers_agrees_on_both_tiers() {
+fn a_dynamic_apply_on_registers_agrees_across_tiers() {
     if skip_if_unavailable() {
         return;
     }
