@@ -34,7 +34,7 @@
 //! so at most one `-sname`/`-name` `erl` runs at a time — see the lock's own doc comment in
 //! `tests/common/mod.rs` for the full root cause. Do not remove it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
@@ -56,6 +56,19 @@ impl Invocation {
 }
 
 fn invoke(args: &[&str], envs: &[(&str, &str)]) -> Invocation {
+    run_binary(None, args, envs)
+}
+
+/// [`invoke`] with the child binary's **working directory** set explicitly.
+///
+/// This is how the crate's cwd-independence is pinned: the child must behave identically no
+/// matter where it was invoked from, so a corpus case may never depend on the caller's cwd.
+fn invoke_in(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Invocation {
+    run_binary(Some(dir), args, envs)
+}
+
+/// Spawn the built `differential` binary, optionally in an explicit working directory.
+fn run_binary(cwd: Option<&Path>, args: &[&str], envs: &[(&str, &str)]) -> Invocation {
     let mut command = Command::new(env!("CARGO_BIN_EXE_differential"));
     command.args(args).envs(envs.iter().copied());
     // Point the child at a **worktree-local** temp dir instead of the ambient `$TMPDIR`: the
@@ -64,6 +77,9 @@ fn invoke(args: &[&str], envs: &[(&str, &str)]) -> Invocation {
     // fixtures out of (`common::scratch_root`). This makes the tests independent of `$TMPDIR`
     // entirely — they pass even when it is missing or read-only.
     command.env("TMPDIR", common::scratch_root());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
     let output = command.output().expect("spawn the differential binary");
     Invocation {
         code: output.status.code(),
@@ -557,6 +573,87 @@ fn compare_evaluates_an_ad_hoc_expression_without_a_golden() {
     assert_eq!(
         json["cases"][0]["rust"]["exit_code"], json["cases"][0]["oracle"]["exit_code"],
         "{}",
+        invocation.describe()
+    );
+}
+
+/// A **tree-relative** contract-A.9 case must agree no matter where the harness is invoked
+/// from.
+///
+/// The subject is `epp:parse_file("lib/stdlib/src/ordsets.erl", [])`: the expression addresses
+/// the OTP tree **repo-relatively**, so the case can only agree if the *child runtimes* run in
+/// the tree root. `gate.sh` happens to be run from `$ERL_TOP`, but `cargo test` runs from the
+/// crate directory and a user may run the binary from anywhere — so the harness resolves the
+/// root itself (`runtime::otp_root`) and hands it to every child. Without that, **both** sides
+/// get `{badmatch,{error,enoent}}` and — because the oracle then no longer reproduces its
+/// golden — `compare::verdict_with` reports a (spurious) `mismatch`, i.e. exit `1`.
+///
+/// The child is deliberately started in a scratch directory that contains no `lib/stdlib/src`
+/// at all, so agreement can only come from the harness's own cwd control.
+#[test]
+fn a_tree_relative_selfhost_case_agrees_from_a_scratch_working_directory() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    if !rust_runtime_available() {
+        eprintln!("SKIP: no fresh Rust runtime (target/debug/beam_rt) — nothing to compare");
+        return;
+    }
+    let fresh = common::fresh_rust_runtime();
+    let helper = common::fresh_helper();
+    let env: Vec<(&str, &str)> = fresh_beam_rt_env(&fresh)
+        .into_iter()
+        .chain(fresh_helper_env(&helper))
+        .collect();
+
+    // The scratch dir the harness process runs in: a fresh directory outside the OTP tree,
+    // holding neither the repository nor any stdlib source.
+    let scratch = Scratch::new("cwd-scratch");
+    std::fs::create_dir_all(&scratch.0).expect("create the scratch working directory");
+    assert!(
+        !scratch.0.join("lib/stdlib/src/ordsets.erl").exists(),
+        "the scratch working directory must not contain the case's tree-relative subject"
+    );
+
+    let invocation = invoke_in(
+        &scratch.0,
+        &[
+            "run",
+            "selfhost/epp_parse_file_reads_a_real_stdlib_source_into_forms",
+            "--json",
+            "--out",
+            &scratch.arg(),
+        ],
+        &env,
+    );
+    assert_eq!(
+        invocation.code,
+        Some(0),
+        "a tree-relative selfhost case must agree from any working directory (the harness \
+         resolves the OTP tree root itself): {}",
+        invocation.describe()
+    );
+    let json: serde_json::Value = serde_json::from_str(&invocation.stdout).expect("parses");
+    let case = &json["cases"][0];
+    assert_eq!(
+        case["case_id"], "selfhost/epp_parse_file_reads_a_real_stdlib_source_into_forms",
+        "{}",
+        invocation.describe()
+    );
+    assert_eq!(
+        case["rust"]["available"], true,
+        "the injected fresh runtime must be observed: {}",
+        invocation.describe()
+    );
+    assert_eq!(
+        case["verdict"], "agree",
+        "the tree-relative case must agree, not drift into a mismatch: {}",
+        invocation.describe()
+    );
+    assert_eq!(
+        case["oracle"]["stdout"], "ok true\n",
+        "the oracle runs in the tree root too, so it sees the real stdlib source: {}",
         invocation.describe()
     );
 }
