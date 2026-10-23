@@ -113,6 +113,28 @@ The handler is **async-signal-safe** — one atomic bitmask OR swapped *before* 
 `ERRNO_NAMES` (**61 rows**) is the one table (the file/`fork`/`exec` set plus the socket set the inet drivers can produce). `errno_atom` is the `Option` form (unrecognised ⇒ `None`, never an invented atom); `errno_name` is the `[0] ++ Name` form the inet replies carry, with the C's `errno_<N>` fallback; `EOPNOTSUPP` renders **`enotsup`** (the emulator's collision list precedes its libc lookup). `drivers/inet/wire.rs::errno_name` forwards here and `InetReason`/`FailureReason` both read it, so no second table exists.
 
 ### Write shutdown — the answer matrix (oracle-measured, OTP 29.1.1)
+### The read-selection invariant (why an eager read past a half-close is not the C's)
+The C selects a socket's read side in exactly two states — a granted `{active, …}`
+(`sock_select(desc,(FD_READ|FD_CLOSE),(desc->active>0))`, `inet_drv.c:7966`) and a waiting
+`TCP_REQ_RECV` (`:12317`) — so every read it makes is one somebody answers (the active owner, or the
+queued receive via `async_error_am_all(am_closed)`, `:12829`). This floor's poller is edge-triggered
+and keeps `READABLE` registered for the socket's whole life, so the reactor also reads a **passive**
+socket with no receive queued: that read is a *delivery* shortcut for the passive
+`{Port, {data, …}}` channel, not a discovery. It is reported as `ReadReport::Unselected`: the bytes
+are delivered, and a close it finds is recorded in `TcpInetDriver::pending_close` and applies
+**nothing** — no `delayed_close_recv`/`delayed_close_send`, no teardown. The first read the C *would*
+have made (a queued `TCP_REQ_RECV`, the `recv` verb, or an `{active, …}` delivery) latches it
+(`ReadReport::Answered`), which is why `tcp_recv_closed`/`tcp_recv_error`'s reply ladder is
+unchanged in the selected case. `pending_close` is sticky (a reset is reported by `read(2)` once) and
+is cleared only by the latch.
+
+Consequence, measured against OTP 29.1.1 / erts-17.1: after `gen_tcp:shutdown(S, write)` a
+zero-length `gen_tcp:send` answers `ok` **for ever** (nine calls spaced ~40 ms: `{ok,ok,[ok×8]}`),
+because the C never observes the peer's end-of-file in that state; the first non-empty send answers
+`{error,closed}` and every later send `{error,enotconn}`. A read discovery also arms **no**
+`TCP_ADDF_DELAYED_CLOSE_RECV` (C-exact: `tcp_recv_closed` arms only the send one-shot, `:12816`), so
+after a queued receive was answered `closed` the next receive is the torn-down `enotconn`.
+
 
 `gen_tcp:shutdown(S, write)` (the `TCP_REQ_SHUTDOWN` control verb) only records the intent: the socket
 is *not* closed and its state stays `{ok,[connected,open]}` (`GETFD` still answers the descriptor). What
