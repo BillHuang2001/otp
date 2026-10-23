@@ -130,20 +130,23 @@ shared helper.
 ## Artifact retention (the store in `cache.rs`)
 A `CompiledFunctions` owns an executable mapping plus raw pointers into it, so it is neither `Send` nor
 `Sync`: the store is a `thread_local!` `RefCell<ArtifactCache>`, exactly like the baseline tier's
-`crate::jit::cache`. Three entries now obtain their artifact through `cache::handle(module)?` —
-`run_outcome`, `run_label_outcome` and the `JitBackend::run_export` override (which folds the outcome:
-`Returned(v) => Ok(v)`, `Wait{..} => Err(error::blocked())`, `Suspend{..} => Err(error::suspended())`)
-— so a repeated run of one module compiles once. `run_compiled` is unchanged (caller-owned artifact),
-and the handle is released before the driver runs (no `RefCell` borrow is held across execution).
-- **Identity is the baseline's two-part witness, from public accessors only**: `module.checksum()` (the
-  load-time MD5, `Copy`) plus `module.atom_table.snapshot()`. The namespace witness is load-bearing —
-  Cranelift bakes atom **immediates** into the emitted `move`/`test`/`select_val`/comparison fast paths,
-  so a different namespace must be a **miss**, never a wrong answer. Two separately loaded copies of one
-  `.beam` are two entries (a deliberate extra compile at worst).
-- **A module whose `checksum()` is all-zero (the `Module::default()` sentinel of a hand-built/synthetic
-  module) is not cached**: `Key::of` returns `None`, so it compiles per entry — always correct, a wasted
-  recompile at worst. The baseline cache's content-fingerprint fallback is deliberately **not**
-  duplicated here.
+`crate::jit::cache`. Four entries obtain their artifact through `cache::handle(module)?` —
+`run_outcome`, `run_label_outcome`, `run_resume_outcome` and the `JitBackend::run_export` override (which
+folds the outcome: `Returned(v) => Ok(v)`, `Wait{..} => Err(error::blocked())`,
+`Suspend{..} => Err(error::suspended())`) — so a repeated run of one module compiles once, and a resumed
+slice re-enters the same artifact. `run_compiled` is unchanged (caller-owned artifact). The `Rc` handle is
+held for the whole slice (the executable mapping must outlive every call into it), while no `RefCell`
+borrow is held across execution.
+- **Identity is the crate's ONE module identity, `crate::jit::cache::CacheKey::of(module)`** — the module's
+  `ModuleKey` (the load-time MD5 for a real `.beam`, else a content fingerprint over the decoded IR) plus
+  `module.atom_table.snapshot()`. The namespace witness is load-bearing — Cranelift bakes atom
+  **immediates** into the emitted `move`/`test`/`select_val`/comparison fast paths, so a different
+  namespace must be a **miss**, never a wrong answer. Two separately loaded copies of one `.beam` are two
+  entries (a deliberate extra compile at worst).
+- **A digest-less module (the `Module::default()` sentinel of a hand-built/synthetic module, checksum all
+  zero) is cached under its content fingerprint**, so two runs of one synthetic module compile once and an
+  edited module is a different entry. A fingerprint collision would be a wrong answer, which is why the
+  key mixes the module content with the atom-table snapshot, exactly as the baseline cache does.
 - **Re-entrancy is uncached, never a panic**: `handle` uses `try_borrow_mut()`; on `Err` it compiles
   uncached and returns that artifact (mirroring `jit::cache::run_baseline_cached`'s re-entrant arm).
 - The test-gated `len`/`compile_count`/`clear` are `pub(super)` only — the in-module suite reaches them;
