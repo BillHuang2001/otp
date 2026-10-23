@@ -39,17 +39,45 @@ chain is unchanged. Since the tier caches **no** x-registers across instructions
 correct by construction.
 
 `run_resume_outcome` remains a typed `error::unsupported("cranelift jit: cannot resume at an arbitrary
-pc (the cranelift tier has no resume entry point)")`: unlike first entry it is handed **no** compiled
-artifact and the tier has no path that would compile and bind one at a parked address on demand.
+pc (the cranelift tier has no resume entry point)")` (`mod.rs:326-336`): unlike first entry it is handed
+**no** compiled artifact and the tier has no path that would compile and bind one at a parked address on
+demand.
+What a resume needs is **plumbing, not new codegen**: the only structural gap is that nothing keeps a
+`CompiledFunctions` alive across a park — `run_outcome`/`run_label_outcome` compile a fresh artifact per
+call and drop it on return (`mod.rs:271-312`), so a resume has neither an artifact nor a label map.
+The reusable pieces already exist: `CompiledFunctions::entry`/`is_enterable` (`mod.rs:456,472`), the
+`emit_pc_entry_dispatch` prologue (`codegen.rs:829`) that gives one native entry per function
+dispatching over `candidate_pcs` (`codegen.rs:870`), `Machine::label_map` (`machine/mod.rs:1220` — the
+fallback `enter_machine` already uses when `NativeCode::labels` answers `None`, `../baseline/mod.rs:759-762`),
+and the shared driver `baseline::drive` (`../baseline/mod.rs:1027`) behind a `CompiledEntries`. The
+shape to copy is `baseline::run_compiled_resume_outcome` (`../baseline/mod.rs:507-524`:
+`reset_reductions` → `enter_run` → `drive`). No per-`pc` stub and no compile-on-demand is required: a
+suspension address outside `candidate_pcs` (the `wait` pc) would simply take the driver's
+per-instruction step (`../baseline/mod.rs:1304-1332`).
 
 ## Inline set relative to the baseline
-**Strict subset by `Instr` variant set**: identical to the baseline's *except* `CallLast`, which the
-baseline links natively and Cranelift always deopts (`call_last` needs the Rust-side frame pop).
-Shape-level the two are near-identical, with Cranelift marginally more permissive in two
-behaviourally-neutral spots (an un-interned `true`/`false` in `is_boolean`; a non-integer
-`select_tuple_arity` alternative). Both remain observationally identical to the interpreter.
-Inlined: metadata no-ops, `Move`, `Swap`, `Jump`, `CallOnly`, `Test`, small-int `GcBif`, comparison
-`GcBif`/`Bif`, `SelectVal`, `SelectTupleArity`, `GetTupleElement`, `GetList`/`GetHd`/`GetTl`.
+**A far narrower subset than the baseline's — and nothing here raises.** Every `Instr` the `match` in
+`codegen.rs::emit_pc` does not claim falls to `emit_helper_dispatch` → `jit_step_one`, i.e. exactly one
+interpreter step (`codegen.rs:672-675`), so this tier has **no** Cranelift-specific `unsupported`
+besides its own module errors and the resume error below.
+Inlined (the complete set, `codegen.rs:417-672`): metadata no-ops (`Label`/`Line`/`IntCodeEnd`/
+`ExecutableLine`/`DebugLine`), `Move` (x-register destination and an x-register or constant source only,
+`inline.rs:68`), `Swap` (two in-bound x-registers, `inline.rs:115`), `Jump`, `CallOnly`, `Test` (the
+word-compare subset, `inline.rs:544`), the small-int `GcBif` `erlang:'+'/2`/`'-'/2`/`'*'/2`
+(`inline.rs:231`), the eight comparison `GcBif`/`Bif` (`compare.rs:206`), `SelectVal` (immediate
+alternatives only, `shape.rs:97`), `SelectTupleArity`, `GetTupleElement`, `GetList`/`GetHd`/`GetTl`.
+Deopted here but inlined by the baseline (each a working per-instruction interpreter step, never an
+error): `FuncInfo`, `CallLast`, `Call`, `CallExt`/`CallExtOnly`/`CallExtLast`,
+`CallFun`/`CallFun2`/`Apply`/`ApplyLast`, `Return`/`Deallocate`/`DeallocateReturn`,
+`Allocate`/`AllocateHeap`/`TestHeap`/`Trim`, `InitYregs`, `SetTupleElement`, the receive family
+(`Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`), the bitwise half of the
+small-int `gc_bif` (`band`/`bor`/`bsr`), the named-BIF accessors (`hd`/`element`/`tuple_size`/
+`byte_size`/`length`), and the whole family-owned surface (put_list/put_tuple2, records, funs,
+try/catch/raise, floats, maps, bitstrings, `recv_marker_*`) — the baseline lowers all of these in-block
+(`../baseline/inlineset/CONTEXT.md`).
+Where the two inline sets overlap, the shapes are near-identical, with Cranelift marginally more
+permissive in two behaviourally-neutral spots (an un-interned `true`/`false` in `is_boolean`; a
+non-integer `select_tuple_arity` alternative). Both remain observationally identical to the interpreter.
 
 ## `constant_word`: one definition, three consumers
 `inline.rs::constant_word` is a **delegation** to `crate::interpreter::constant_word` — the single authority

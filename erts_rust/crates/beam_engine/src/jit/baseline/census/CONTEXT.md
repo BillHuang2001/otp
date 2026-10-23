@@ -50,6 +50,28 @@ The enumeration is `../testing/CONTEXT.md`; the figures are `../measure/CONTEXT.
 
 ## Known Issues
 - **`../census.rs` is `#[cfg(test)]`-only and 1583 lines.** It is one measurement instrument with four views over one corpus-discovery helper, so splitting it is a separate, parity-neutral refactor.
+- **No census pins an expected count.** Every corpus-level assertion is liveness/consistency only
+  (`../census.rs:374-401`, `:507-511`, `:555-615`, `:1046-1050`, `:1327-1386` `assert_reg_cache_row_consistent`;
+  `../emit/test/refusal_census.rs:419` is just `modules_loaded > 0`; `../operand_tests.rs:223-226` just
+  `total > 0` + no unclassified `??`). The recorded totals therefore live **only as prose** — crate
+  `../../../CONTEXT.md:184`, `../../../PERF.md:30,77`, `../../../MEASURED.md:146`, `../../../TEST_NOTES.md:83`
+  (`3 113 483` instances / `119 840` deopts / `103 008` `FuncInfo`; the per-variant decomposition sums to
+  `119 840` exactly) — and a rerun on a different tree will print different numbers without any test failing.
+  The only exact-number assertions in this node are on **synthetic** shapes (e.g. `../counters.rs:731-760`,
+  `../tests.rs:5621-5625`, `../cross_tests.rs:211-234`).
+- **The static census's denominator is *visited* instances, not IR instructions.** `record_instr_instance`
+  runs at the top of `emit_block`'s range loop (`../emit/block.rs:186`), but that loop `break`s at ten
+  `terminated = true` sites (`:373, 477, 492, 501, 569, 640, 677, 770, 861`), so the rest of a block's
+  `[start, end)` range is never counted, while `record_block` (`../counters.rs:576`, call site
+  `../emit/block.rs:957-962`) records the full `end − start`. That is why the recorded
+  **3 113 483** instances are smaller than the corpus's **3 585 490** IR instructions — two different
+  denominators for the same corpus, never interchangeable.
+- **Recorded corpus sizes drift from the tree.** The prose says "32 committed `erlc` fixtures"
+  (`../../../MEASURED.md:142`, `../../../PERF.md:65`, `../../regs/CONTEXT.md:70`), but `tests/fixtures/`
+  currently holds **38** `.beam` files and `../census.rs:190-203` scans the directory with no cap, so a
+  rerun censuses 38. The module count is likewise recorded twice (1321 at `../../../MEASURED.md:142`,
+  1353 at `../../../PERF.md:19` and `../../measure/CONTEXT.md:140`) because it follows the installed OTP
+  tree. Quote these figures as "as recorded on that corpus", never as current expectations.
 
 ## See Also
 - `../CONTEXT.md` → the tier contract (inline set, deopt rule, routing table).
