@@ -165,75 +165,86 @@ it *executes*, so a compiled caller reaches the callee and returns correctly; th
 ## Measured verdict — the tier stays DEFAULT-OFF
 The feature is measurement-gated, and the measurement says **no**: Cranelift is a
 correctness-complete mechanism but **not** a performance win over the baseline tier.
-Every figure is a **range over independent runs**, one timing process at a time, pinned to a single
-core (`taskset -c 3`), on a shared 14-CPU sandbox whose `/proc/loadavg` reads **≈9.5–10 at both ends
-of every run** (neighbouring worktrees are the load; it swings by an order of magnitude across days,
-so only the *ratios* are signal — never an absolute wall time, and never a single sample).
-Column ratios are **cost** ratios (`>1` = slower than the reference).
+Every figure is a **ratio over three independent reps**, one timing process at a time, pinned to a
+single core (`taskset -c 3`), in the **dev profile (`opt-level = 1`)**, on a shared host whose
+`/proc/loadavg` read **1.0–3.4 at every end** of every run — so only the *ratios* are signal, never
+an absolute wall time, and never a single sample.
 
-Per-workload ratio of Cranelift to the baseline, in-crate `crate::jit::bench` (`... -p beam_engine
---features jit-cranelift --test jit_bench -- --ignored --nocapture`), from the min `ns/op` of the
-3000-run timed loop. That table runs its tiers in a **fixed** order per workload (interpreter →
-baseline → Cranelift), so it is position-biased against Cranelift and is quoted only as the shape
-picture; the position-balanced evidence is the ABBA table below.
+Per-workload ratio over the **thirteen** workloads of the in-crate `crate::jit::bench` (`... -p
+beam_engine --features jit-cranelift --test jit_bench -- --ignored --nocapture`), from the median
+`ns/op` of the 3000-run timed loop, expressed as **baseline ÷ Cranelift** (`> 1` = Cranelift
+faster). That table runs its three tiers in a **fixed** order per workload (interpreter →
+baseline → Cranelift), so it is position-biased **against** Cranelift and is quoted only as the
+shape picture; the position-balanced evidence is the ABBA table below.
 
-| workload (shape) | CL ÷ baseline |
+| workload (shape) | baseline ÷ CL |
 |---|---|
-| `walk/2` — list walk | **≈0.48×** (the only win) |
-| `slice:fib/1` — call chain | 0.95× (tie) |
-| `aggr/2` — aggregate reads + `'*'` | 0.99× (tie) |
-| `call_ext/0` — declined host seam | 1.07× (tie) |
-| `map/2` | 1.08× |
-| `build/0` | 1.17× |
-| `select/1` | 1.24× |
-| `cmp/2` — comparison BIFs | **1.25×** |
-| `kernel/2` — inner-product loop | **1.36×** |
-| `wide/2` — wide tuple/list reads | **1.39×** |
-| `cross/2` — cross-module call | **1.45×** |
-| `send_recv/2` — two-process mailbox | **2.18×** |
-| `sum/1` — non-tail recursion | **2.50×** |
+| `walk/2` — list walk | **3.05×** (a win) |
+| `slice:fib/1` — tail-call chain | **1.94×** (a win) |
+| `select/1` | 1.14× |
+| `aggr/2` — aggregate reads + `'*'` | 1.06× |
+| `map/2` | 0.99× (tie) |
+| `cmp/2` — comparison BIFs | 0.93× |
+| `build/0` | 0.89× |
+| `cross/2` — cross-module call | 0.75× |
+| `call_ext/0` — declined host seam | 0.74× |
+| `kernel/2` — inner-product loop | 0.60× |
+| `wide/2` — wide tuple/list reads | 0.59× |
+| `send_recv/2` — two-process mailbox | 0.43× |
+| `sum/1` — non-tail recursion | **0.27×** |
+
+Geomeans over the same thirteen: **interpreter 6210, baseline 1727, Cranelift 2017 ns/op**, i.e.
+interpreter/baseline **3.60×**, interpreter/Cranelift **3.08×** and the **baseline 1.16× faster than
+Cranelift** on this mix.
 
 The order-balanced ABBA harness (`bench.rs`, the `#[ignore]`d `cl_bench` test, `--lib -- --ignored
---nocapture cl_bench`) brackets the same picture with per-round paired ratios (2 samples/tier × 15
-rounds, so position drift cancels); paired means over three independent runs:
+--nocapture cl_bench`) brackets the same picture with per-round paired ratios (15 rounds × 2
+samples per tier, so position drift cancels), three independent reps; **cost** ratio
+**Cranelift ÷ baseline** (`> 1` = Cranelift slower):
 
-| kernel | paired cranelift/baseline over 3 runs |
+| kernel | paired cranelift/baseline, 3 runs |
 |---|---|
-| `aggr` | 0.988–1.009× (tie) |
-| `arith` (256 chained `'+'`) | **1.616–1.621×** |
-| `cmp` | **1.364–1.422×** |
+| `aggr` | 0.938 / 0.943 / 0.939× |
+| `arith` (256 chained `'+'`) | **1.625 / 1.623 / 1.611×** |
+| `cmp` | **1.079 / 1.080 / 1.080×** |
 
-So the tier is a **tie** on the aggregate-read mix, **≈1.6× slower** on chained small-int arithmetic
-and **≈1.4× slower** on comparison-BIF streams.
+So the tier is marginally **ahead** on the aggregate-read mix, **≈1.6× slower** on chained
+small-int arithmetic and **≈1.08× slower** on comparison-BIF streams.
 
-**Codegen cost — what the hot tier must earn.** Cranelift's one-time compile is **≈6.5–60×** the
-baseline's (cheapest on `walk/2` at ≈6.5×, dearest on `build/0` at ≈60×; the range widens under heavy
-host load, which inflates the slower compiler far more). A hot tier that compiles that much more
-expensively must win on steady-state throughput to earn that cost, and outside `walk/2` it does not.
+**Codegen cost — what the hot tier must earn.** Cranelift's one-time compile costs **3.6–4× the
+baseline's startup** (end-to-end startup p50 **266 / 324 / 1183 ms** for interpreter / baseline /
+Cranelift, `tools/bench` with `BEAM_RT_TIER` per tier). On the real workloads it does not earn that
+back: `list_walk` costs **232 / 25.3 / 209.2 ns/element** and `gc_bound churn` **272 999 / 104 516 /
+122 543 ns/op** (interpreter / baseline / Cranelift, quick profile, min of 3) — so the Cranelift side
+is **8× slower than the baseline and ≈ the interpreter** on `list_walk`.
 
-Why: Cranelift re-loads/re-stores the x-register slots per instruction and **deopts
-`call_last`/`call_only`** (a strict subset of the baseline's `Instr` set), whereas the baseline is a
+Why: Cranelift re-loads/re-stores the x-register slots per instruction and deopts **~30 variant
+families** — the frame-preserving `call`, `call_last`, `call_ext*`, `call_fun*`, `apply*`, the frame
+ops, the receive family and the whole family-owned surface — whereas the baseline is a
 hand-written x86-64 backend that caches the five most-touched x-registers per block, addresses the
 rest directly in `machine.x`, links the local tail calls natively and reuses blocks across runs
-(§F/`../CONTEXT.md`). Its only real win is the list-walk shape (`walk/2`, ≈0.48× the baseline); the
-best everything else reaches is a tie (aggregate reads, the call chain, a declined `call_ext`) or a
-mild-to-serious loss (maps, tuple/list builds, `select_val`, comparison streams, wide reads,
-cross-module, non-tail recursion, the mailbox) — which cannot justify 6.5–60× the compile latency on a
-tier whose whole point is being *hot*.
+(§F/`../CONTEXT.md`). Its wins are therefore confined to **tail-call/straight-line shapes**
+(`walk/2` 3.05×, `slice:fib/1` 1.94× over the baseline); as soon as a workload uses a
+frame-preserving `call`, the win disappears (real `list_walk` 8× slower than the baseline, ≈ the
+interpreter) — which cannot justify 3.6–4× the compile latency on a tier whose whole point is being
+*hot*. It raises **no** typed error for any `Instr` (only its own module-level errors): every variant
+it does not inline is one interpreter step.
 
 Consequence: `jit-cranelift` **remains default-OFF** — a correctness-complete mechanism and an
-honest negative performance result, not a selected tier. Closing the gap is not a bounded change: it
-means porting the baseline's register cache, its direct `machine.x` addressing and its tail-call
-linking into the Cranelift lowering. Re-test with `bench.rs` before ever revisiting.
+honest negative performance result, not the default tier. It is nevertheless **selectable**:
+`BEAM_RT_TIER=cranelift` together with the runtime's `cranelift` Cargo feature
+(`= ["beam_engine/jit-cranelift"]`) reaches `Tier::Cranelift` end-to-end, and without the feature an
+explicit request is a typed refusal (the CLI's exit code 3) naming the feature, never a substitute
+tier. Closing the throughput gap is not a bounded change: it means porting the baseline's register
+cache, its direct `machine.x` addressing and its tail-call linking into the Cranelift lowering.
+Re-test with `bench.rs` before ever revisiting.
 
 **Measurement caveats (state them with any figure).** The in-crate harness uses **synthetic
-modules**, so it covers the tier's inline families, `CallOnly` tail calls and a declined `call_ext`,
-but it is **not** the `foreign` / `list_walk` / `gc_bound churn` workloads of `tools/bench`:
-`beam_rt` has **no `Tier::Cranelift` selection** (`beam_rt/src/runner/tier.rs` maps `BEAM_RT_TIER` →
-`JitMode::{Auto,Interpreter,Baseline}` with `Auto | Baseline ⇒ Tier::BaselineJit`), so the Cranelift
-tier is not reachable end-to-end and cannot be measured through the runtime. Also note the `foreign`
-workload's *interpreter* side carries a known super-linear `beam_rt` pathology owned elsewhere, so it
-is not a clean tier comparison even where reachable.
+modules**, so it covers the tier's inline families, `CallOnly` tail calls and a declined `call_ext`
+— it is quoted as the shape picture, and the real-workload part of the verdict above is the
+`tools/bench` figures (`list_walk`, `gc_bound churn`, startup). `tools/bench`'s `foreign` workload is
+deliberately not quoted: its *interpreter* side carries a known super-linear `beam_rt` pathology owned
+elsewhere, so it is not a clean tier comparison.
 
 ## Known Issues
 - **A cross-module callee runs per-instruction here.** `NativeCode::module_blocks` keeps its default
@@ -242,8 +253,7 @@ is not a clean tier comparison even where reachable.
   Correct and clause-identical to the interpreter, slower than a compiled callee would be.
 - **The store is per thread and unbounded.** A `CompiledFunctions` owns an executable mapping, so the
   store is a `thread_local!`; a run on another thread recompiles (correct, slower), and nothing evicts
-  (the tier is default-OFF and `beam_rt` never selects it, so the retained set is bounded in practice;
-  `clear` exists for the tests).
+  (the tier is default-OFF, so the retained set is bounded in practice; `clear` exists for the tests).
 ## Routing Table
 - `mod.rs` → the backend (`CraneliftJit`, incl. the `run_export` override), `CompiledFunctions` (the artifact: native entries, `is_enterable`, `labels`), `CompiledEntries`' `NativeCode` impl, `run_outcome`/`run_label_outcome`/`run_resume_outcome`, `run_cranelift*`.
 - `cache.rs` → the thread-local retained-artifact store: `handle(module) -> Result<Rc<CompiledFunctions>>` keyed on `crate::jit::cache::CacheKey` (the shared `ModuleKey` — load-time MD5, else a content fingerprint — plus the `AtomSnapshot`), and the test-gated `len`/`compile_count`/`clear`.
