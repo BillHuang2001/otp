@@ -82,9 +82,10 @@ Why visited < ranges (the gap is **472 046 = 13.2 %**), in two mechanisms:
    `[p, end)` of the containing IR block (capped at the next continuation address, so the sub-blocks
    are disjoint) for every frame-preserving call's continuation address — those instructions lie
    inside an IR block's range *and* in a sub-block's range, so the range total counts them twice.
-Both mechanisms have the same consequence for the router: a deopt fraction is a fraction of the
-**visited** population, so `119 912 / 3 114 364 = 3.85 %` and `119 912 / 3 586 410 = 3.34 %` describe
-the same deopts on two different (both defensible, never interchangeable) denominators.
+Neither mechanism is a defect — each is a deliberate property of the emitter — but they mean a deopt
+fraction is a fraction of the **visited** population, so `119 912 / 3 114 364 = 3.85 %` and
+`119 912 / 3 586 410 = 3.34 %` describe the same deopts on two different (both defensible, never
+interchangeable) denominators.
 
 ### Table 1 — the static deopt census (the primary evidence)
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
