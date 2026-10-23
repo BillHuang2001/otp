@@ -208,9 +208,9 @@ fn term_heap_words(config: &RuntimeConfig) -> usize {
     }
 }
 
-/// The heap policy the runtime gives the processes it starts **for itself** — the `init` root,
-/// the `erl_prim_loader`/`file_server_2` service stand-ins and every server a boot script
-/// starts — for `config`.
+/// The heap policy the runtime gives the processes it starts **for itself** — the `init`
+/// stand-in, the root process, the `erl_prim_loader`/`file_server_2` service stand-ins and
+/// every server a boot script starts — for `config`.
 ///
 /// It is the emulator's own policy ([`RuntimeConfig::heap_options`], so `+hms`/`+hmbs` and the
 /// `+hmax*` flag word all still apply) with the `+hmax` **size** deliberately left unbounded.
@@ -1395,7 +1395,7 @@ impl Runtime {
         // machine, `whereis(erl_prim_loader)` = a live pid running `erl_prim_loader:loop/3`), so
         // without one this runtime answered the oracle's pid with a bare `undefined` — a name
         // that named neither the loader it serves nor anything else. The spawned process is the
-        // same shape as the `init` root and the native `file_server_2` service: `Runnable` and
+        // same shape as the `init` stand-in and the native `file_server_2` service: `Runnable` and
         // never put on a run queue, so `Process::wake` never enqueues it and the scheduler's
         // runner never sees it (the loader floor is what answers a client, not this mailbox).
         //
@@ -3311,8 +3311,9 @@ impl Runtime {
         self.arena.ensure_heap(heap_need, live, x_regs, stack)
     }
 
-    /// The process table (a fresh runtime holds the runtime's own `init` root process and
-    /// the native `file_server_2` service; user code adds the rest).
+    /// The process table (a fresh runtime holds the runtime's own four: the `init` stand-in,
+    /// the root process, and the native `erl_prim_loader` and `file_server_2` services; user
+    /// code adds the rest).
     pub fn processes(&self) -> &ProcessTable {
         &self.processes
     }

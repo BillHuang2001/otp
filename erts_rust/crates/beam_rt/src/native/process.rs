@@ -930,7 +930,9 @@ impl RuntimeContext<'_> {
 
     /// `erlang:processes/0`: the terms of the live processes.
     ///
-    /// Milestone-1's process table holds the runtime's own process and every process
+    /// Milestone-1's process table holds the runtime's own four processes (the `init` stand-in,
+    /// the root process and the native `erl_prim_loader`/`file_server_2` services) and every
+    /// process
     /// `Runtime::spawn_process` created (plus any the scheduler still holds), so this is
     /// the honest "live processes" set — never the oracle's 43 background processes, which
     /// have no Milestone-1 counterpart.

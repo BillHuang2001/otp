@@ -48,7 +48,8 @@
 //! comparable: the oracle's `P` has `links=[]`, `trap_exit=false`, `registered_name=[]`
 //! (unregistered) and `status=waiting` — exactly this runtime's own parked process. (The
 //! oracle's `-eval` process is *not* comparable: it is `trap_exit=true` and linked to
-//! `<0.0.0>`, while this runtime's root process is registered as `init`.)
+//! `<0.0.0>`, while this runtime's root process is `<0.1.0>` and holds no name — the `init`
+//! name belongs to a separate, never-enqueued stand-in.)
 //!
 //! The `monitors`/`monitored_by` pair is compared in the one construction both runtimes can
 //! build — the probing process monitors the parked one — normalized to the facts that are

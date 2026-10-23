@@ -531,7 +531,7 @@ The request/reply surface, the errno mapping, the io-device and the remaining ga
 
 ## Notes for Agents — the `erl_prim_loader` name
 `erl_prim_loader` is a **preloaded module** whose functions the runtime serves from the native loader floor (`../native/loader.rs`), and it is also a **registered name**.
-`Runtime::new` spawns its own stand-in process — a `beam_process::Process` born `Runnable` and never enqueued, the same shape as the `init` root and the `file_server_2` service — and registers it under `erl_prim_loader` on **every** route that builds a runtime, so `erlang:whereis(erl_prim_loader)` answers a live pid exactly as the oracle does (the oracle's is its C `erts_prim_loader` state machine).
+`Runtime::new` spawns its own stand-in process — a `beam_process::Process` born `Runnable` and never enqueued, the same shape as the `init` stand-in and the `file_server_2` service — and registers it under `erl_prim_loader` on **every** route that builds a runtime, so `erlang:whereis(erl_prim_loader)` answers a live pid exactly as the oracle does (the oracle's is its C `erts_prim_loader` state machine).
 Unlike `file_server_2` there is **no** name conflict with the boot script: `init` starts the loader (it is in the script's `{preLoaded, …}` list, not a `{kernelProcess, …}` child), so nothing in `bootstrap/bin/start.boot` registers the name.
 The `-version` action is the only route with no runtime at all, so it has no name registry to answer from.
 

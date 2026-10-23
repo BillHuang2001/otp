@@ -57,8 +57,9 @@
 //!
 //! # Documented divergences (honoured, never hidden)
 //!
-//! * There is no `init`/`io` process, so an **unset** leader is this runtime's own root pid
-//!   (`<0.0.0>`) where the oracle answers its `io` server (`<0.70.0>`). Every assertion here
+//! * There is no `io` server process — the `init` stand-in is a separate, never-enqueued
+//!   process and is nobody's leader — so an **unset** leader is this runtime's own root pid
+//!   (`<0.1.0>`) where the oracle answers its `io` server (`<0.70.0>`). Every assertion here
 //!   is therefore relative to `self()`, never to a literal pid.
 //! * A wire **external** pid is `badarg` (the group-leader store is a local pid map), where
 //!   the C accepts one as the leader or answers `true` for a remote signal. The divergence is

@@ -243,19 +243,22 @@ fn erts_trace_targets_and_capability_gaps() {
     let mut sink = NullSink;
     let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
 
-    // Every group atom selects the runtime's own three processes: the `init` root process, the
-    // native `erl_prim_loader` service and the native `file_server_2` service
-    // (`src/native/file_server.rs`, contract A.9), all started by `Runtime::new` and none spawned
-    // by user code.
+    // Every group atom selects the runtime's own four processes: the `init` stand-in (the
+    // table's first identity, `<0.0.0>`, registered under `init`, never enqueued — see
+    // `src/runtime.rs`), the root process every action runs as (`<0.1.0>`, no name), the native
+    // `erl_prim_loader` service and the native `file_server_2` service
+    // (`src/native/file_server.rs`, contract A.9) — all started by `Runtime::new` and none
+    // spawned by user code. A never-enqueued process is still a process in the table, exactly
+    // as the oracle's own `init`/`erl_prim_loader` are.
     for target in [all, existing, existing_processes, processes] {
         let count = ctx
             .call_bif("erts_internal", "trace", 3, &[target, how_true, flags_list])
             .expect("erts_internal:trace/3");
         assert_eq!(
             signed_value(count),
-            3,
-            "the `init` root process, the native `erl_prim_loader` service and the native \
-             `file_server_2` service are all in the table"
+            4,
+            "the `init` stand-in, the root process, the native `erl_prim_loader` service and the \
+             native `file_server_2` service are all in the table"
         );
     }
 

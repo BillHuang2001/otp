@@ -354,8 +354,9 @@ fn the_run_action_identity_matches_the_oracle() {
 // ---------------------------------------------------------------------------------------
 
 /// The `init` process's view, read from **inside** an `-eval` action: `whereis(init)` is still
-/// the root pid (a live pid), it is still registered as `init`, it is not `self()`, the node
-/// reports `{starting,started}` and the application view is populated.
+/// the `init` stand-in (`<0.0.0>`, a live pid — the table's first identity, not the root
+/// process every action runs as), it is still registered as `init`, it is not `self()`, the
+/// node reports `{starting,started}` and the application view is populated.
 ///
 /// Two short lines rather than one long one, so the comparison never depends on the `~p`
 /// printer's line-wrapping width — a different concern from the action's identity.
@@ -380,7 +381,7 @@ fn the_init_process_identity_survives_the_action_routes() {
         "-eval must succeed: exit {} — {}",
         ours.code, ours.err
     );
-    // `init` stays the root pid, stays registered, and is still *not* the action's pid.
+    // `init` stays the stand-in `<0.0.0>`, stays registered, and is still *not* the action's pid.
     assert!(
         ours.out.contains("init=<0.0.0>")
             && ours.out.contains("ispid=true")

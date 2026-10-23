@@ -32,8 +32,9 @@
 //!
 //! `init:stop` does **not** terminate the caller: `init.erl:537,570` sends the stop request
 //! to the `init` process (`init ! {stop, …}`) and returns `ok` at once, and it is that
-//! process which eventually halts the **node**. This runtime has no live `init` process, so
-//! the `erlang:halt/1`-equivalent outcome is recorded on the runtime and applied by the host
+//! process which eventually halts the **node**. This runtime's `init` is a never-enqueued
+//! stand-in ([`crate::Runtime::init_pid`]) that executes no slice and drains no mailbox, so the
+//! `erlang:halt/1`-equivalent outcome is recorded on the runtime and applied by the host
 //! once the running action has finished ([`crate::cli::run`]) — the caller keeps running,
 //! exactly as the oracle's does. Only the argument **rejections** (`badarg`) and the
 //! crash-dump slogan form are raised in the caller, as the oracle raises them.
@@ -278,8 +279,9 @@ impl RuntimeContext<'_> {
     /// 0 (`init.erl:537` — `stop() -> init ! {stop,stop}, ok`).
     ///
     /// The caller is **not** terminated: the request goes to the `init` process, which
-    /// halts the node once it gets to it. This runtime has no live `init` process
-    /// (contract A.7 — the preloaded `init.beam` is not run), so the status is recorded and
+    /// halts the node once it gets to it. This runtime's `init` is a never-enqueued stand-in
+    /// ([`crate::Runtime::init_pid`]; contract A.7 — the preloaded `init.beam` is not run), so
+    /// the status is recorded and
     /// the host exits with it after the action has finished ([`crate::cli::run`]); the
     /// expression keeps running — oracle-verified, `io:format("a~n"), init:stop(),
     /// io:format("b~n")` prints both lines and exits 0.

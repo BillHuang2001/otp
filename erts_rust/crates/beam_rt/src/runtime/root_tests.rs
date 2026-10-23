@@ -155,7 +155,7 @@ fn per_family_counts(rt: &mut Runtime) -> BTreeMap<RootFamily, usize> {
 // State builders
 // ---------------------------------------------------------------------------
 
-/// A plain runtime: the three never-enqueued runtime-owned processes and nothing else.
+/// A plain runtime: the four runtime-owned, never-enqueued processes and nothing else.
 fn bare_state() -> (&'static str, Runtime) {
     ("bare", Runtime::with_defaults().expect("the default runtime"))
 }

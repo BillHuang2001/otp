@@ -130,7 +130,9 @@ fn is_badarg(result: beam_common::Result<Eterm>) -> bool {
 // ---------------------------------------------------------------------------------------
 
 /// `registered/0` is a proper list of atoms that contains `init` — the runtime registers its
-/// root process under that name, exactly as the oracle registers its `<0.0.0>`.
+/// **`init` stand-in** (`Runtime::init_pid`, the table's first identity) under that name,
+/// exactly as the oracle registers its own `<0.0.0>`; the root process every action runs as
+/// holds no name.
 #[test]
 fn registered_is_a_proper_list_of_atoms_containing_init() {
     let mut rt = runtime();

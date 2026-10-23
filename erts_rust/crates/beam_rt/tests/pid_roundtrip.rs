@@ -46,7 +46,9 @@
 //!
 //! # The pid *number* is own-state — never compared textually
 //!
-//! This runtime's root process is `init`, so the pid it prints has a different number from the
+//! This runtime's process ids are its own — the `init` stand-in holds the table's first identity
+//! `<0.0.0>`, the root process is `<0.1.0>`, and the `-eval` action runs in a child spawned
+//! after the runtime's own four — so the pid it prints has a different number from the
 //! oracle's `<0.10.0>` by construction. Only the `=:=` identity and the `<…>` render *shape* are
 //! asserted against the oracle; the node name the image carries is covered by the sibling tests
 //! ([`node_is_the_runtimes_own_node_and_the_oracle_agrees`] and
@@ -259,8 +261,9 @@ fn a_pid_image_carries_the_runtimes_own_node() {
 /// `BifContext::local_node` seam that `beam_rt` supplies (`src/context/bridges.rs`'s
 /// `NodeIdentity`), and `beam_codec` demotes a matching `NEW_PID_EXT` to the internal immediate.
 ///
-/// The pid's **number** is own-state (this runtime's root is `init`, so it prints `<0.0.0>`
-/// where the oracle prints `<0.10.0>`), so it is deliberately **not** compared textually: only
+/// The pid's **number** is own-state (this runtime's root process is `<0.1.0>` — the table's
+/// first identity, `<0.0.0>`, belongs to the never-enqueued `init` stand-in — where the oracle
+/// prints `<0.10.0>`), so it is deliberately **not** compared textually: only
 /// the `=:=` identity and the `<…>` render *shape* are pinned.
 ///
 /// The final block is the **negative control** that keeps the demotion honest: the *same* wire

@@ -885,8 +885,8 @@ fn the_implemented_item_order_is_a_subsequence_of_the_oracles() {
     assert_eq!(
         ours.len(),
         oracle.len() - 2,
-        "the `-eval` root process has no engine, so its current_function/initial_call are \
-         omitted (see the module docs)"
+        "the `init` stand-in has no engine (it never runs), so its current_function/initial_call \
+         are omitted (see the module docs)"
     );
 }
 
@@ -1735,14 +1735,15 @@ fn the_last_calls_item_has_the_oracles_three_states_and_reports_the_ring_in_reco
     );
 }
 
-/// The `parent` item of a process the runtime never saw being spawned (its own root — the process
-/// a `-eval`/`-s`/`-run` action runs in) is a **distinct** pid standing in for OTP's `init`.
+/// The `parent` item of a process the runtime never saw being spawned (the root, the action
+/// child `Runtime::as_action_process` runs the body in, and any pid without a recorded
+/// spawner) is a **distinct** pid standing in for OTP's `init`.
 ///
 /// The oracle's `-eval` process answers `{parent, <0.0.0>}` — `init`, never itself (measured on OTP
-/// 29.1.1 / erts-17.1: `element(2, process_info(self(), parent)) =:= self()` is `false`). This
-/// runtime *is* its own root process on that route, so falling back to the root pid would make the
-/// relation observably wrong; [`crate::Runtime::init_pid`] is the pid with no process that plays
-/// `init`'s role instead, and a spawned child records its real spawner.
+/// 29.1.1 / erts-17.1: `element(2, process_info(self(), parent)) =:= self()` is `false`).
+/// Answering the runtime's own root pid would name a process that is **not** OTP's `init`, so
+/// [`crate::Runtime::init_pid`] — a real, never-enqueued process of its own — plays `init`'s role
+/// instead, and a spawned child records its real spawner.
 #[test]
 fn the_parent_item_is_the_init_stand_in_and_a_spawned_child_names_its_spawner() {
     let mut runtime = runtime();
