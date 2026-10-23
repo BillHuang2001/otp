@@ -834,6 +834,12 @@ fn both_tiers_report_and_resume_the_same_suspend() {
     let (module, name) = suspending_module();
     let mut outcomes = Vec::new();
     let mut values = Vec::new();
+    // A term belongs to the `MinimalContext` that built it, and dropping a
+    // `MinimalContext` returns its carrier blocks to `beam_alloc`'s process-global
+    // segment pool, where the next arena in the process reclaims and overwrites them.
+    // Both tiers' resumed values are compared *after* the loop below, so every tier's
+    // arena is hoisted here and kept alive until the last read (`drop(hosts)`).
+    let mut hosts: Vec<ParkHost> = Vec::new();
     for tier in [Tier::Interpreter, Tier::BaselineJit] {
         let mut ctx = ParkHost::new(1);
         let (outcome, mut machine) =
@@ -858,6 +864,9 @@ fn both_tiers_report_and_resume_the_same_suspend() {
             RunOutcome::Returned(value) => values.push((tier, value)),
             other => panic!("{tier:?}: the resumed run must return a value, got {other:?}"),
         }
+        // Keep this tier's arena alive: the value just stashed out of the iteration
+        // lives on this host's heap.
+        hosts.push(ctx);
     }
     let (interpreter_tier, interpreter_outcome) = outcomes[0];
     let (jit_tier, jit_outcome) = outcomes[1];
@@ -874,6 +883,8 @@ fn both_tiers_report_and_resume_the_same_suspend() {
         values[1].0.name()
     );
     assert_operand_tuple(values[0].1, "the interpreter's resumed value");
+    // The last read of either tier's term is above: the per-tier arenas can go now.
+    drop(hosts);
 }
 
 // ---------------------------------------------------------------------------
