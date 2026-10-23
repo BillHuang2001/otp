@@ -138,10 +138,18 @@
 //!    (C3), and every produced `.beam` is non-empty and re-loadable as an image (C4);
 //! 3. **there really was GC** — `collections > 0` and `major > 0`, both in the runtime's own
 //!    schedule and in the measured process's counters;
-//! 4. **the allocation product agrees within 1 %** —
-//!    `collections × mean sampled nursery capacity` is the young words the run's own heap doors
-//!    admitted, and because both arms allocate exactly the same terms through the same live-set
-//!    nursery rule it must match (see [the accounting identity](#the-cadence-is-an-accounting-identity));
+//! 4. **the allocation product is printed, and on these classes only bounded** —
+//!    `collections × mean sampled nursery capacity` (the young words the run's own heap doors
+//!    admitted) is **reported** for every round pair together with the `Immix / Copying` ratio: the
+//!    1 % cross-arm assertion exists but is **enabled on no class** ([`IDENTITY_ASSERTED`] is an
+//!    empty list), so the only product assertion actually executed is that **both arms' doors
+//!    admitted some** young words. It is not a cross-strategy invariant here: a fullsweep re-sizes
+//!    the nursery from the **whole-heap** live set, whose mature component the two spaces report in
+//!    different units (line-granular occupancy vs promoted object words), and
+//!    `GenImmixCollector` promotes a due minor to a major when its block space is tight, so the two
+//!    collectors do not share a fullsweep cadence either (see
+//!    [the allocation product](#the-allocation-product-reported-not-asserted); the measured
+//!    per-class ratios and both mechanism halves are `../GC_STRATEGY_MEASURED.md`'s);
 //! 5. **the footprint axis has the strict sign where the shape holds a live payload** —
 //!    `mature_used_words` is strictly larger under Immix (the line-granular price the sibling
 //!    suite established on the allocation-bound shape);
@@ -152,22 +160,20 @@
 //! verbatim — a minor sizes the nursery from the young live set once over, a fullsweep from the
 //! whole-heap live set twice over).
 //!
-//! # The cadence is an accounting identity
+//! # The allocation product: reported, not asserted
 //!
 //! The two arms' collection **counts** are deliberately not compared: a percentage band on them is
 //! a number fitted to the data, and it moves whenever one run shifts by a single collection. What
-//! the mechanism fixes is a **product**. Every collection is triggered by a heap-admission door
-//! refusing the next request because the *current* young space has no room left, so the words one
-//! collection accounts for are its capacity minus the words the failing request could not fit:
+//! the accounting fixes instead is a **product**. Every collection is triggered by a heap-admission
+//! door refusing the next request because the *current* young space has no room left, so the words
+//! one collection accounts for are its capacity minus the words the failing request could not fit:
 //!
 //! ```text
 //! allocated young words = Σ_collections (capacity − free_at_admission)
 //! ```
 //!
-//! The left-hand side is **strategy-independent** — the fixture allocates the same terms in the
-//! same order under either mature strategy, and the mature generation's own capacity is not part of
-//! the young allocation at all. The right-hand side is what the run samples, with two refinements
-//! over the sibling suite's arithmetic mean:
+//! The right-hand side is what the run samples, with two refinements over the sibling suite's
+//! arithmetic mean:
 //!
 //! * the mean is **weighted by the collections observed in each slice** (`Σ kᵢ·Cᵢ / Σ kᵢ`, where
 //!   `kᵢ` is the delta of the process's own collection counters across slice `i` and `Cᵢ` the
@@ -179,27 +185,42 @@
 //!   runtime's own service processes — allocations this class does not account for. The runtime
 //!   delta is still printed as the authoritative schedule.
 //!
-//! Two residuals remain, both bounded rather than fitted: `Σ free_at_admission` (each interval is
-//! short by the request that did not fit — the fixture's rounds allocate a ~390-word term one
-//! binding at a time) and the **terminal slice** (the scheduler removes a terminated process at
-//! once, so the collections of the slice in which the process returns are unobservable; it is one
-//! partial slice out of hundreds, i.e. ≤ 1/`slices` of the run). The asserted tolerance is **1 %**.
-//! What still fails: a run whose doors admitted the same words under a smaller nursery (collecting
-//! without the allocation to justify it), a run that stopped collecting, and either residual
-//! growing.
+//! Read that way the product is an identity **inside one arm's own accountant**: for the arm that
+//! produced it, it is the young words that arm's doors admitted. It is **not** a cross-strategy
+//! invariant, and it is not asserted as one, because both of its inputs are strategy-dependent —
+//! a fullsweep re-sizes the nursery from the **whole-heap** live set, whose mature component the
+//! two spaces report in different units (the mark-region space's line-granular occupancy vs the
+//! copying space's promoted object words), and `GenImmixCollector` promotes a due minor to a major
+//! when its block space is tight, so the two collectors do not follow the same fullsweep cadence
+//! either. Both mechanisms, and the per-class ratios they produce, are
+//! `../GC_STRATEGY_MEASURED.md`'s (*The allocation product is not a cross-strategy invariant*).
+//! [`IDENTITY_ASSERTED`] names the classes on which the 1 % cross-arm assertion runs; it is empty,
+//! so the product is printed with its ratio every round and no cross-arm claim is made from it.
+//!
+//! Two residuals remain, both bounded rather than fitted, and both properties of the **within-arm**
+//! estimator: `Σ free_at_admission` (each interval is short by the request that did not fit — the
+//! fixture's rounds allocate a ~390-word term one binding at a time) and the **terminal slice**
+//! (the scheduler removes a terminated process at once, so the collections of the slice in which
+//! the process returns are unobservable; it is one partial slice out of hundreds, i.e. ≤ 1/`slices`
+//! of the run). What the assertions still refuse: an arm whose doors admitted no young words at
+//! all (a zero product means no nursery admission), a run that stopped collecting, and either
+//! residual growing.
 //!
 //! # Debug cost
 //!
 //! The file must add no more than ~60 s to a debug `cargo test` run, so under
 //! `cfg!(debug_assertions)` the rounds shrink to one and every class's N shrinks with them
 //! (`n_for`); release keeps ≥ 3 rounds. The measured debug wall time is in the file's own report
-//! (see the module table below), and no assertion is weakened in debug: the identity, the strategy
-//! check, the value checks and the GC-count checks all still run.
+//! (see the module table below), and no assertion is weakened in debug: the product check (both
+//! arms admitted young words), the strategy check, the value checks and the GC-count checks all
+//! still run.
 //!
 //! # The measured verdict
 //!
-//! See the *smoke measurement* section at the end of this comment: one release round of each class,
-//! with both arms' rows. Every figure is printed by the run itself; nothing here is asserted.
+//! The measured record is `../GC_STRATEGY_MEASURED.md`: three classes plus the noise floor, both
+//! arms' rows, the paired per-metric difference/ratio estimator, the resolved verdicts and the
+//! unattributed residuals. Every figure there and in this suite's stdout is printed by the run
+//! itself; nothing here is asserted.
 
 // The shared helper module is compiled into every integration-test binary, so this binary
 // would otherwise warn on the entry points it does not call.
@@ -758,7 +779,9 @@ fn child_runs_one_arm_and_prints_a_row() {
 ///
 /// Every assertion here is one of the file's six: the intended strategy really was in effect, the
 /// workload's value came back intact, there really was GC, and no failure counter moved. (The
-/// allocation-product identity and the footprint sign are cross-arm, so the parent asserts those.)
+/// footprint sign is cross-arm, so the parent asserts that; the allocation product is reported, and
+/// on these classes the parent asserts only that both arms' doors admitted young words — see
+/// [`IDENTITY_ASSERTED`].)
 fn child_measure() -> Row {
     refuse_ambient_strategy("gc_strategy_classes worker");
     let spec = ChildSpec::from_env();
