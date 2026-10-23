@@ -1004,7 +1004,7 @@ fn is_digit(c: u32) -> bool {
 /// a zero-padded 3-digit octal escape for a code point below 32 or in
 /// `128..=159` (127 is **not** escaped — oracle-verified for `0x01`, `0x1F`,
 /// `0x0B`, `0x7F`).
-fn quoted_atom(name: &str) -> String {
+pub(crate) fn quoted_atom(name: &str) -> String {
     let mut chars = name.chars();
     let need_quote = match chars.next() {
         // The empty atom prints as `''`.
