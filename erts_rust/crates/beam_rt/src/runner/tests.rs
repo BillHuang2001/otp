@@ -1837,10 +1837,11 @@ fn tier_unavailable_refuses_only_the_unbuilt_cranelift_tier() {
 /// the engine's Cranelift entry point the one that answers.
 ///
 /// The slice budget is deliberately far larger than `fib(10)` can charge (a default slice is
-/// `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 units): the subject of this test is the **first
-/// entry** on each tier, and at this HEAD a Cranelift re-entry at a parked address is a separate
-/// typed gap, so a pre-empted slice would end the run before the value was computed and the test
-/// would measure the wrong thing.
+/// `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 units): the subject here is the **first entry** on each
+/// tier, so the run is kept inside one slice. That a tiered process **survives a suspension** is
+/// the neighbouring resume rows' subject — `a_preempted_process_resumes_on_its_cranelift_tier` and
+/// `a_receive_parked_process_resumes_on_its_cranelift_tier` cover the hot tier exactly as the
+/// baseline and interpreter rows cover theirs.
 #[cfg(feature = "cranelift")]
 #[test]
 fn fib_runs_to_the_same_result_on_all_three_tiers() {
@@ -2152,6 +2153,237 @@ fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
         baseline_cache_len(),
         0,
         "an interpreter-tier process compiles no native code on either slice"
+    );
+}
+
+/// `alloc_loop`'s recorded result as element **values**.
+///
+/// Two runs of one fixture live on two different `Runtime` stores, so their words can never be
+/// compared directly; this fixture's elements are small ints, for which [`signed_value`] is an
+/// exact (not lossy) reading.
+#[cfg(feature = "cranelift")]
+fn preempt_list_values(result: Eterm) -> Vec<i64> {
+    let elements =
+        beam_engine::terms::list_elements(result).expect("alloc_loop returns a proper list");
+    elements.into_iter().map(signed_value).collect()
+}
+
+/// The Cranelift rows' reference: `preempt:alloc_loop/1` run to completion on the **interpreter**
+/// tier under the same budget schedule those rows use (`2`, `2`, then `1_000_000`), returned as
+/// the recorded result's element **values**.
+///
+/// The baseline siblings compare their result against a *length*, because their discriminating
+/// observable is the compiled-block cache. This tier's artifact store is `pub(super)` inside
+/// `beam_engine`, so the value itself carries the evidence — and it must be the reference
+/// interpreter's, not merely a list of the right length.
+#[cfg(feature = "cranelift")]
+fn preempt_interpreter_reference() -> Vec<i64> {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh control process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Interpreter);
+    for (budget, completing) in [(2, false), (2, false), (1_000_000, true)] {
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid, &mut table, budget)
+                .expect("the control slice runs")
+        };
+        if completing {
+            assert_eq!(
+                outcome,
+                ProcOutcome::Exit(normal(&mut rt)),
+                "the control's completing slice returns normally"
+            );
+        } else {
+            assert_eq!(outcome, ProcOutcome::Yield, "the control pre-empts too");
+        }
+    }
+    assert!(
+        state.take_error(pid).is_none(),
+        "the interpreter control runs the fixture with no error"
+    );
+    preempt_list_values(
+        state
+            .result(pid)
+            .expect("the control's value is recorded"),
+    )
+}
+
+/// A process selected for the **Cranelift** tier that is pre-empted on the reduction budget
+/// resumes on that **same** tier, and the two slices together compute the loop's whole result.
+///
+/// The baseline siblings discriminate their tier through the per-thread compiled-block cache
+/// ([`baseline_cache_len`]); this tier's artifact store keeps its observables `#[cfg(test)]
+/// pub(super)` inside `beam_engine`, so they are unreachable from here. The Cranelift evidence is
+/// threefold instead: the tier remembered on the engine across the park ([`ProcessEngine::tier`],
+/// read on both parks), the **absence of the typed resume gap** — a resume that fell back to the
+/// old refusal records no result and leaves [`RunnerState::take_error`] set — and the recorded
+/// value agreeing element for element with an **interpreter-tier control** run of the same
+/// fixture, on the same budget schedule, in this same test.
+///
+/// The schedule hands the process a tiny budget **twice** before the completing slice, so the
+/// tier is observed across a re-park as well as across the first park: a resume that silently
+/// substituted another tier would show up on the second park's `engine.tier`.
+#[cfg(feature = "cranelift")]
+#[test]
+fn a_preempted_process_resumes_on_its_cranelift_tier() {
+    assert!(
+        Tier::Cranelift.is_available(),
+        "the runtime's `cranelift` feature compiles the engine's backend in"
+    );
+
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Cranelift);
+
+    // The first slice: the allocating loop spends its (tiny) budget and is pre-empted.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Cranelift),
+        "the tier chosen at the first entry is remembered on the engine"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .is_some_and(|engine| engine.parked.is_some()),
+        "the pre-empted machine is parked at the exhausting instruction"
+    );
+
+    // A second tiny-budget slice: the resumed process parks again, still on its own tier.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the second slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "the resumed slice's own budget pre-empts it again"
+    );
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Cranelift),
+        "a resume never silently downgrades the process's tier"
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the completing slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert!(
+        state.take_error(pid).is_none(),
+        "the resumes took the Cranelift resume entry point, not a typed resume gap"
+    );
+    let cranelift = preempt_list_values(state.result(pid).expect("the value is recorded"));
+    assert_eq!(
+        cranelift.len(),
+        PREEMPT_N as usize,
+        "the three slices together ran the loop to completion"
+    );
+
+    // The interpreter-tier reference: the same fixture, the same budget schedule, its own runtime.
+    assert_eq!(
+        cranelift,
+        preempt_interpreter_reference(),
+        "the Cranelift slices compute the interpreter's exact result"
+    );
+}
+
+/// A process parked in a `receive` on the **Cranelift** tier and woken by a message resumes on
+/// its remembered tier and takes the delivered message.
+///
+/// This is the `wait` half of the same contract the pre-emption test above covers for a budget
+/// park: a `receive` suspension reports the `wait`'s branch target, an address the tier serves
+/// through its resume entry point (and, for an address it holds no block for, through the
+/// driver's per-instruction interpreter step — the documented deopt, never a wrong result). The
+/// observables are the same three the pre-emption test uses, because the tier's own artifact-store
+/// counters are `pub(super)` inside `beam_engine`: the remembered `ProcessEngine::tier`, the
+/// absence of a typed resume gap, and the delivered value.
+#[cfg(feature = "cranelift")]
+#[test]
+fn a_receive_parked_process_resumes_on_its_cranelift_tier() {
+    assert!(
+        Tier::Cranelift.is_available(),
+        "the runtime's `cranelift` feature compiles the engine's backend in"
+    );
+
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Cranelift);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // The first slice: `receive X -> X after infinity` parks on the empty mailbox.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Cranelift),
+        "the tier chosen at the first entry is remembered on the engine"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .is_some_and(|engine| engine.parked.is_some()),
+        "the parked machine is held for the resume"
+    );
+
+    // Wake the receiver through the very queue the runner's receive seam scans.
+    table
+        .deliver_simple(pid, pid.to_eterm(), make_small(42))
+        .expect("the message is delivered");
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert!(
+        state.take_error(pid).is_none(),
+        "the resume took the Cranelift resume entry point, not a typed resume gap"
+    );
+    assert_eq!(
+        signed_value(state.result(pid).expect("the received value is recorded")),
+        42,
+        "the resumed receive took the delivered message"
     );
 }
 

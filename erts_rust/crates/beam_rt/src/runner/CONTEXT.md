@@ -175,9 +175,10 @@ The **selection** is not feature-gated — `select_entry_tier` answers `Tier::Cr
 2. **The engine's feature-gated entry points, the second line of defence.** They answer `Err(unsupported("jit-cranelift tier not built"))` at the moment a Cranelift entry is actually attempted. The two can never disagree because they read the **same** feature — and they are ordered this way round because without the startup check the boot processes are the first to try the tier, their per-process failures are re-wrapped by the boot drive, and the CLI prints the exit-1 `beam_rt: exit <structured reason>`, which names no feature and reads like a crash.
 `beam_rt` therefore adds no second *feature* gate and no availability arm inside the selection.
 
-A Cranelift process's **first entry is supported and tier-equivalent** to the interpreter (the tier compiles per function and deopts per instruction to `Machine::step_instruction`), but a **suspension is a typed capability gap at this HEAD**: the tier has no resume entry point, so `beam_engine` answers `unsupported("cranelift jit: cannot resume at an arbitrary pc (the cranelift tier has no resume entry point)")` and a process that pre-empts on the reduction budget or parks in a `receive` dies with that error instead of resuming.
-The tier is still selected once, at the first entry, and remembered on the engine (`ProcessEngine::tier`); a resume re-enters through `Machine::resume_outcome_with_tier` on that same tier.
-**End to end this bounds what a `cranelift` build's CLI session can do.** `BEAM_RT_TIER` is process-wide, so the boot script's own processes (`heart`, `logger_server`, `application_controller`, …) are tiered on Cranelift too; every one of them parks (`wait`/`wait_timeout`), the resume is the typed gap above, and the boot drive re-wraps the failure — so a `-boot`/`-eval`/`run` invocation in a **feature-ON** build exits **1** with `beam_rt: exit <structured reason>` under `BEAM_RT_TIER=cranelift`. Only a **first entry** is servable, which is why the three-tier agreement evidence is an in-process runner test ([`tests`]' `fib_runs_to_the_same_result_on_all_three_tiers`) rather than a CLI probe.
+A Cranelift process **resumes on its remembered tier**: `Machine::resume_outcome_with_tier` sends `Tier::Cranelift` to `jit::run_cranelift_resume_outcome`, which takes the artifact from the tier's retained store (`beam_engine/src/jit/cranelift/cache.rs`, keyed by `jit::cache::CacheKey`) and hands it to the shared native resume seam — no recompile, no reset, and the same labels the park was compiled with.
+An address that is **not an enterable block start** advances by the driver's per-instruction interpreter step — the documented deopt, i.e. the interpreter's exact semantics: a `wait`/`wait_timeout` suspension pc, a mid-block reduction refusal, a suspended BIF's own instruction, and every instruction of a cross-module callee (a tier this narrow holds no blocks for the callee). That is never a wrong result and never a silent change of tier: the process keeps `ProcessEngine::tier` for its whole life.
+**So a feature-ON CLI session completes under `BEAM_RT_TIER=cranelift`** — both a `run`/`-eval` action and the whole `-boot` boot script, whose own processes (`heart`, `logger_server`, `application_controller`, …) all park and resume — while a feature-OFF build refuses the request at startup as above.
+The three-tier agreement (interpreter / baseline / Cranelift) is evidenced in process by [`tests`] — `fib_runs_to_the_same_result_on_all_three_tiers` for a first entry, `a_preempted_process_resumes_on_its_cranelift_tier` and `a_receive_parked_process_resumes_on_its_cranelift_tier` for the two suspension kinds — and at the CLI by [`tests/tier_selection.rs`](../../tests/tier_selection.rs).
 
 ## How the tier is selected
 In [`run`]'s slice, **before** the `RuntimeContext` borrow (the context takes `Runtime` mutably):
@@ -380,6 +381,17 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   `ProcessTable::deliver_simple` message wakes it and the resume takes it on the remembered tier), and
   `an_interpreter_tier_process_is_unchanged_across_a_resume` (same loop on `JitMode::Interpreter` records
   the same result and compiles nothing on either slice). Each asserts `ProcessEngine::tier` as well.
+  **The hot tier's two resume rows** (`#[cfg(feature = "cranelift")]`) cover the same two suspension
+  kinds on `JitMode::Cranelift`: `a_preempted_process_resumes_on_its_cranelift_tier` (the loop parks on a
+  tiny budget, re-parks on a second tiny slice — the "never silently downgraded" observation — then
+  completes, and its recorded list is compared **element by element by value** with an
+  interpreter-tier reference run of the same fixture on the same schedule, since two runs live on two
+  `Runtime` stores) and `a_receive_parked_process_resumes_on_its_cranelift_tier` (`recv_after:wait_forever/0`
+  → `Wait`, `ProcessTable::deliver_simple`, resume takes `42`). The baseline rows discriminate through the
+  compiled-block cache; this tier's artifact-store observables are `#[cfg(test)] pub(super)` inside
+  `beam_engine`, so the hot tier's evidence is the tier remembered on `ProcessEngine::tier` across the
+  park, the **absence of the typed resume gap** (`take_error` is `None` and a value is recorded), and the
+  value agreeing with the interpreter.
 * Pre-emption of a **non-allocating** loop on both tiers, over the committed `preempt` fixture's
   `spin/1` (whose `spin/1 -> spin/2` disassembly contains no heap-admission instruction at all):
   `a_non_allocating_interpreted_loop_is_pre_empted` (interpreter tier — a whole-budget slice yields and
