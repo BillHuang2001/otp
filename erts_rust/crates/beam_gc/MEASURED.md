@@ -1214,7 +1214,7 @@ garbage tuples (1 728 words). `fullsweep_after = 2`; nursery 4 096 and mature 4 
 | nursery capacity (settled) | 4 096 | 4 096 | 1.000 |
 | `HeapFootprint` capacity | 86 944 B | 88 064 B | 1.013 |
 | `HeapFootprint` used | 10 240 B | 20 480 B | **2.000×** |
-| peak RSS | 3 452–3 500 kB | 3 520–3 544 kB | 1.013–1.018 |
+| peak RSS | 3 452–3 564 kB | 3 520–3 544 kB | 1.013–1.018 (image-dominated; the ranges overlap) |
 | wall (child's measured window) | 15.5–15.9 ms | 34.7–38.1 ms | **2.234–2.417×** |
 
 The 1 280 promoted words are exactly the 128 live words plus the `fullsweep_after + 1 = 3` dead promoted
@@ -1275,8 +1275,9 @@ everywhere, exactly as a count must be. Peak RSS spread **1.001–1.003×**; wal
 
 That wide relative wall band is a property of the window, not of the arms: at these N the child measures
 10–40 ms for `churn`/`copy_out`, so page faults and process scheduling dominate a single sample. The **paired
-difference** is what carries the signal, and it reproduces in every round of both sessions: **+19.2 / +20.8 ms**
-on `churn` and **+10.9 / +11.5 ms** on `copy_out`, with `growth` at **+150.8 / +149.2 ms** on a ≈210 ms base
+difference** is what carries the signal, and it reproduces in every round of both sessions (session B /
+session A): **+19.2 / +20.8 ms** on `churn` and **+10.9 / +11.5 ms** on `copy_out`, with `growth` at
+**+150.8 / +149.2 ms** on a ≈210 ms base
 (per-round spread ±5 %). Both sessions ran at 1-minute loadavg **0.28–0.61** on 14 cores.
 
 ## The four-class record and the standing decision
