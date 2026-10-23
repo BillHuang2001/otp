@@ -43,6 +43,18 @@
 //! off — the cases then stay a loud *skipped* naming the reason, exactly as before. A failed
 //! build is never fatal either: it keeps the loud *skipped* and carries cargo's diagnosis.
 //!
+//! **Every spawned child runs in the OTP tree root** — see [`otp_root`]. A handful of
+//! contract-A.9 cases address the tree **repo-relatively** (`compile:file("lib/stdlib/src/timer.erl")`,
+//! `epp:parse_file("lib/stdlib/src/ordsets.erl", [])`, an `{i, "lib/xmerl/include"}` include
+//! path, …), so a child's working directory must never depend on where the harness happened to
+//! be invoked from: `gate.sh` runs it from `$ERL_TOP`, `cargo test` from the crate directory,
+//! and a plain `differential run` from wherever the user is. Off the tree root **both** sides
+//! would fail to find the source, the oracle would stop reproducing its golden, and
+//! [`crate::compare::verdict_with`] would (correctly, but spuriously) report a **mismatch** for
+//! a case that is really fine. The root is derived from this crate's position in the tree and
+//! overridable with `$DIFFERENTIAL_OTP_ROOT`; nothing is baked in, and a binary that was moved
+//! out of its tree degrades to inheriting the harness's own working directory.
+//!
 //! The workspace default searches `release` **before** `debug` on purpose: it is what the
 //! real CLI and the CI `gate.sh` want, so the fastest artifact present is measured. That
 //! order is *wrong* under `cargo test`, where only the `debug` artifacts are (re)built — a
@@ -675,12 +687,70 @@ fn is_transient_text_file_busy(err: &std::io::Error) -> bool {
     false
 }
 
+/// The environment variable that **overrides** the OTP tree root a child runtime runs in.
+///
+/// When set it must name an existing directory, otherwise resolution is a loud
+/// [`Error::Env`] — mirroring `$ERTS_ORACLE`/`$BEAM_RT`/`$BEAM_DIST_PROBE`, so the harness stays
+/// "overridable, no baked absolute paths". Setting it to a foreign directory is honoured as
+/// given (it is the one way to run the corpus against a *different* copy of the tree).
+pub const OTP_ROOT_ENV: &str = "DIFFERENTIAL_OTP_ROOT";
+
+/// Derive the OTP tree root (`$ERL_TOP`) from this crate's directory.
+///
+/// `manifest_dir` is `$CARGO_MANIFEST_DIR`, i.e. `…/erts_rust/tools/differential`, so the tree
+/// root is its **third** parent — `differential` → `tools` → `erts_rust` → `$ERL_TOP` (the
+/// crate lives exactly three levels below the root, next to `lib/`, `erts/` and
+/// `bootstrap/`). The derivation is *checked*: `Some` only when the derived directory exists.
+/// A binary that was moved out of its tree therefore degrades to inheriting the harness's own
+/// working directory instead of handing a child a directory that does not exist (which would
+/// fail every spawn outright).
+pub fn otp_root_from(manifest_dir: &Path) -> Option<PathBuf> {
+    let root = workspace_root(manifest_dir)?.parent()?;
+    root.is_dir().then(|| root.to_path_buf())
+}
+
+/// Resolve the OTP tree root a child runtime must run in, from the real environment.
+///
+/// `$DIFFERENTIAL_OTP_ROOT` wins when set (and must name an existing directory, else a loud
+/// [`Error::Env`] ⇒ exit 2); otherwise the root is derived from this crate's position
+/// ([`otp_root_from`]). `Ok(None)` means "no tree root could be derived" — the child then
+/// simply inherits the harness's working directory, which is the pre-existing behaviour.
+pub fn otp_root() -> Result<Option<PathBuf>> {
+    otp_root_with(
+        std::env::var_os(OTP_ROOT_ENV),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// Resolve the OTP tree root from explicit inputs (the injectable core of [`otp_root`]).
+///
+/// * `override_root` — the value of `$DIFFERENTIAL_OTP_ROOT`, if set. It must name an
+///   existing **directory**; anything else (a file, a path that is not there, an empty value)
+///   is a loud [`Error::Env`], never a silent fallback.
+/// * `manifest_dir` — the crate directory (`$CARGO_MANIFEST_DIR`), used for the derivation
+///   when there is no override.
+pub fn otp_root_with(
+    override_root: Option<OsString>,
+    manifest_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    if let Some(value) = override_root {
+        let root = PathBuf::from(&value);
+        if !root.is_dir() {
+            return Err(Error::env(format!(
+                "${OTP_ROOT_ENV} is set to '{}', which is not an existing directory",
+                root.display()
+            )));
+        }
+        return Ok(Some(root));
+    }
+    Ok(otp_root_from(manifest_dir))
+}
+
 /// Spawn `spec.program` with `argv` and the inherited environment, with `stdin` closed,
 /// and capture its output.
 pub fn run(spec: &RuntimeSpec, argv: &[String]) -> Result<Observation> {
     run_with_env(spec, argv, &[])
 }
-
 /// [`run`] with an explicit child **environment** (contract A.6).
 ///
 /// Each `(name, value)` is set on the child *in addition to* the inherited environment —
@@ -695,7 +765,27 @@ pub fn run(spec: &RuntimeSpec, argv: &[String]) -> Result<Observation> {
 /// The pairs are **owned** (`String`) because a module-run case's value may embed the
 /// compiled module's temp directory, which is only known at run time
 /// ([`crate::corpus::expand_env`]); [`own_env`] converts a case's `'static` slice.
+///
+/// The child's working directory is the OTP tree root ([`otp_root`]) — **not** the harness's
+/// own: the contract-A.9 `selfhost*` cases address the tree repo-relatively, so the child must
+/// see the tree no matter where the harness was invoked from. A root that cannot be derived
+/// leaves the child inheriting the harness's directory (the pre-existing behaviour).
 pub fn run_with_env(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<Observation> {
+    let root = otp_root()?;
+    run_with_env_in(root.as_deref(), spec, argv, env)
+}
+
+/// [`run_with_env`] with the child's working directory passed in explicitly (the injectable
+/// core, so a test can observe the cwd without touching the process-wide environment).
+///
+/// `root` is the OTP tree root the child runs in; `None` means "inherit the harness's own
+/// working directory" (what a binary that was relocated out of its tree does).
+pub(crate) fn run_with_env_in(
+    root: Option<&Path>,
     spec: &RuntimeSpec,
     argv: &[String],
     env: &[(String, String)],
@@ -705,6 +795,9 @@ pub fn run_with_env(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(root) = root {
+        cmd.current_dir(root);
+    }
     for (name, value) in env {
         cmd.env(name, value);
     }
@@ -926,6 +1019,12 @@ fn peer_scratch_dir() -> std::result::Result<PathBuf, String> {
 
 /// Spawn the peer child with its stdin closed and its stdout/stderr going to `stdout_path`
 /// and `stderr_path`.
+///
+/// The peer runs in the OTP tree root ([`otp_root`]), exactly like a directly observed child
+/// ([`run_with_env`]): both legs of a case must see the same working directory, or a
+/// tree-relative `selfhost*` subject would resolve differently on the two sides. An
+/// unresolvable root (`$DIFFERENTIAL_OTP_ROOT` naming no directory) is a loud skip reason, not
+/// a peer started in an arbitrary place.
 fn start_peer_child(
     spec: &RuntimeSpec,
     argv: &[String],
@@ -950,7 +1049,15 @@ fn start_peer_child(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    // An Erlang VM signals its own **process group** (SIGUSR1 for the break handler, and
+    // Same working directory as a directly observed child: the OTP tree root (see
+    // `start_peer_child`'s doc comment).
+    match otp_root() {
+        Ok(Some(root)) => {
+            cmd.current_dir(root);
+        }
+        Ok(None) => {}
+        Err(err) => return Err(reason("cannot resolve the OTP tree root", &err)),
+    }    // An Erlang VM signals its own **process group** (SIGUSR1 for the break handler, and
     // `erl_child_setup` on the way down), so the peer gets a group of its own: it can never
     // signal the harness or a sibling case.
     #[cfg(unix)]
@@ -1077,10 +1184,11 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        case_id_tag, eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry,
-        own_env, peer_nonce, ready_line_in, resolve_helper_from, resolve_oracle_from,
-        resolve_rust_from, run, run_with_env, spawn_peer, PeerStart, RuntimeId, RuntimeSource,
-        RuntimeSpec,
+        case_id_tag, eval_argv, eval_argv_owned, is_transient_text_file_busy, otp_root,
+        otp_root_from, otp_root_with, output_with_retry, own_env, peer_nonce, ready_line_in,
+        resolve_helper_from, resolve_oracle_from, resolve_rust_from, run, run_with_env,
+        run_with_env_in, spawn_peer, PeerStart, RuntimeId, RuntimeSource, RuntimeSpec,
+        OTP_ROOT_ENV,
     };
     use crate::error::Error;
     use std::ffi::{OsStr, OsString};
@@ -1167,6 +1275,173 @@ mod tests {
             let without_env = run(&spec, &argv).expect("spawn sh without the probe variable");
             assert_eq!(without_env.stdout, b"");
         }
+    }
+
+    /// A `RuntimeSpec` for a portable "print my working directory" child (`/bin/sh` is what
+    /// the crate's other spawn tests use too; `pwd -P` ignores an inherited `$PWD`).
+    #[cfg(unix)]
+    fn pwd_spec() -> (RuntimeSpec, Vec<String>) {
+        (
+            RuntimeSpec {
+                id: RuntimeId::Rust,
+                program: PathBuf::from("/bin/sh"),
+                source: RuntimeSource::Path,
+            },
+            vec!["-c".to_string(), "pwd -P".to_string()],
+        )
+    }
+
+    /// The stdout of a `pwd -P` child, resolved through the filesystem (so a symlinked
+    /// `$TMPDIR` cannot make a correct child look wrong).
+    #[cfg(unix)]
+    fn child_cwd(observation: &super::Observation) -> PathBuf {
+        assert_eq!(observation.exit_code, Some(0), "child must succeed");
+        let printed = String::from_utf8(observation.stdout.clone()).expect("pwd prints utf-8");
+        let printed = printed.trim_end_matches('\n');
+        std::fs::canonicalize(printed)
+            .unwrap_or_else(|err| panic!("cannot canonicalize the child's cwd '{printed}': {err}"))
+    }
+
+    #[test]
+    fn the_otp_tree_root_is_the_third_parent_of_the_crate_directory() {
+        // The crate sits at `<root>/erts_rust/tools/differential`, so `$ERL_TOP` is exactly
+        // three parents up: differential → tools → erts_rust → root.
+        let scratch = Scratch::new("otp-root-derive");
+        let manifest_dir = scratch.dir.join("erts_rust/tools/differential");
+        std::fs::create_dir_all(&manifest_dir).expect("create a fake crate directory");
+        assert_eq!(
+            otp_root_from(&manifest_dir),
+            Some(scratch.dir.clone()),
+            "three parents above the crate directory is the tree root"
+        );
+
+        // The real crate directory derives this checkout's own `$ERL_TOP`, which is where
+        // `lib/stdlib/src` (the tree-relative selfhost subject) lives.
+        let real_manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let derived = otp_root_from(real_manifest).expect("this crate always sits in its tree");
+        assert_eq!(
+            derived,
+            real_manifest
+                .ancestors()
+                .nth(3)
+                .expect("the crate is three levels below $ERL_TOP"),
+            "the derivation walks exactly three parents up from $CARGO_MANIFEST_DIR"
+        );
+        assert!(
+            derived.join("lib/stdlib/src/ordsets.erl").is_file(),
+            "'{}' must be the OTP tree root (it has to contain the tree-relative selfhost \
+             subjects)",
+            derived.display()
+        );
+    }
+
+    #[test]
+    fn a_missing_or_shallow_derivation_yields_no_root() {
+        // A derived root that is not there: the manifest directory need not even exist, only
+        // the *derived* directory is checked.
+        let scratch = Scratch::new("otp-root-absent");
+        let absent = scratch.dir.join("gone/erts_rust/tools/differential");
+        assert_eq!(
+            otp_root_from(&absent),
+            None,
+            "a derived root that does not exist is not used (the child then inherits the cwd)"
+        );
+
+        // Too shallow to have three parents at all.
+        assert_eq!(otp_root_from(Path::new("erts_rust/tools")), None);
+    }
+
+    #[test]
+    fn the_otp_root_override_wins_and_must_name_an_existing_directory() {
+        let scratch = Scratch::new("otp-root-override");
+        let real_manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // An existing directory wins over the derivation, even a derived-from candidate that
+        // would have resolved to this checkout's own root.
+        assert_eq!(
+            otp_root_with(Some(scratch.dir.clone().into_os_string()), real_manifest)
+                .expect("the override is an existing directory"),
+            Some(scratch.dir.clone())
+        );
+
+        // A non-existent path is a loud env error (exit 2), never a silent fallback.
+        let err = otp_root_with(
+            Some(OsString::from("/nonexistent/differential-otp-root")),
+            real_manifest,
+        )
+        .expect_err("a missing override must not resolve");
+        assert!(matches!(err, Error::Env(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains(OTP_ROOT_ENV),
+            "the error names the variable: {err}"
+        );
+
+        // A *file* is not a directory either.
+        let file = scratch.file("not-a-directory");
+        let err = otp_root_with(Some(file.into_os_string()), real_manifest)
+            .expect_err("a file is not a tree root");
+        assert!(matches!(err, Error::Env(_)), "{err:?}");
+        assert!(err.to_string().contains(OTP_ROOT_ENV), "{err}");
+    }
+
+    /// The spawn itself honours the root: a child gets the OTP tree root as its working
+    /// directory, never the directory the harness process happens to run in.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_runs_in_the_otp_tree_root_not_the_harness_cwd() {
+        let scratch = Scratch::new("otp-root-spawn");
+        let root = scratch.dir.join("otp-tree");
+        std::fs::create_dir_all(root.join("lib/stdlib/src")).expect("create the fake tree root");
+        let (spec, argv) = pwd_spec();
+
+        let observed =
+            run_with_env_in(Some(&root), &spec, &argv, &[]).expect("spawn the pwd child");
+        assert_eq!(
+            child_cwd(&observed),
+            std::fs::canonicalize(&root).expect("canonicalize the fake root"),
+            "the child's cwd is the tree root it was given"
+        );
+
+        // The harness's own working directory is *not* what the child saw: the spawn must not
+        // depend on where the harness was invoked from. (The test process's cwd is shared with
+        // every parallel test, so it is never mutated here — only compared.)
+        let harness_cwd = std::env::current_dir().expect("the harness has a working directory");
+        assert_ne!(
+            child_cwd(&observed),
+            std::fs::canonicalize(&harness_cwd).expect("canonicalize the harness cwd"),
+            "the child must not inherit the harness's working directory"
+        );
+
+        // No root ⇒ the pre-existing behaviour: the child inherits the harness's directory.
+        let inherited = run_with_env_in(None, &spec, &argv, &[]).expect("spawn without a root");
+        assert_eq!(
+            child_cwd(&inherited),
+            std::fs::canonicalize(&harness_cwd).expect("canonicalize the harness cwd"),
+            "an unresolvable root degrades to inheriting the harness's cwd"
+        );
+    }
+
+    /// [`run_with_env`] (the real spawn path) wires the **derived** root in — the property the
+    /// contract-A.9 tree-relative cases depend on when `cargo test` runs the harness from the
+    /// crate directory instead of `$ERL_TOP`.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_env_spawns_the_child_in_the_resolved_otp_tree_root() {
+        if std::env::var_os(OTP_ROOT_ENV).is_some() {
+            eprintln!("SKIP: ${OTP_ROOT_ENV} is set in this environment — the derivation is not used");
+            return;
+        }
+        let root = otp_root().expect("resolution cannot fail without an override").expect(
+            "this crate always sits in its tree, so a root is always derivable under cargo test",
+        );
+        let (spec, argv) = pwd_spec();
+        let observed = run_with_env(&spec, &argv, &[]).expect("spawn the pwd child");
+        assert_eq!(
+            child_cwd(&observed),
+            std::fs::canonicalize(&root).expect("canonicalize the derived tree root"),
+            "run_with_env must run the child in the derived OTP tree root"
+        );
     }
 
     #[test]

@@ -844,8 +844,15 @@ mod tests {
             );
             match &case.kind {
                 CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => {
+                    // The **probe's** line is the golden's *last* line, not necessarily its
+                    // whole body: an expression may print ahead of the probe — `erlang:display/1`
+                    // writes its `%T` rendering plus a CRLF through the emulator's own stdout,
+                    // which lands before the probe's own `ok …` line, so the golden reads
+                    // `<rendered>\r\nok <value>`. A single-line golden is unchanged by this
+                    // rule (its last line is the whole golden).
+                    let probe_line = golden.rsplit('\n').next().unwrap_or(golden);
                     assert!(
-                        golden.starts_with("ok ") || golden.starts_with("exception "),
+                        probe_line.starts_with("ok ") || probe_line.starts_with("exception "),
                         "case {}: unexpected golden shape {golden:?}",
                         case.id
                     );
@@ -854,7 +861,7 @@ mod tests {
                         "case {} has a suspicious expression",
                         case.id
                     );
-                    if golden.starts_with("exception ") {
+                    if probe_line.starts_with("exception ") {
                         assert_ne!(
                             case.golden.exit_code, 0,
                             "case {}: an exception must not exit 0",
@@ -1044,9 +1051,18 @@ mod tests {
                 "case {}: a ModuleEnv case must set an environment",
                 case.id
             );
+            // The environment is not always the *subject*: a case may carry the compiled dir
+            // there purely so that a **helper module** resolves, with the case itself
+            // evidencing another contract — the native-record group's foreign create form
+            // needs `recdef`/`recbad` loadable and is A.1/A.2/A.7 evidence. The CLI claim is
+            // therefore required exactly when the environment carries more than the compiled
+            // dir; the flag family pins its own `[Contract::Cli]` claim in `flags_apply`'s
+            // tests.
             assert!(
-                case.contracts.contains(&Contract::Cli),
-                "case {}: an A.6 flag-application case must claim the CLI contract",
+                case.contracts.contains(&Contract::Cli)
+                    || env.iter().all(|(_, value)| value.contains(DIR_PLACEHOLDER)),
+                "case {}: an environment carrying more than the compiled dir is an A.6 \
+                 flag-application case and must claim the CLI contract",
                 case.id
             );
             assert!(

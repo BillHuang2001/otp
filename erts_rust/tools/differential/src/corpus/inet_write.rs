@@ -81,12 +81,26 @@
 //!   (`[<<"ab">>, <<"cd">>]`) is one datagram carrying the 4-byte concatenation, a send of
 //!   `<<>>` is a *deliverable zero-length datagram* (the peer's receive answers
 //!   `{data, <<>>}`, not a timeout), and an 8192-byte datagram arrives byte-identical.
+//! * **`datagram_write_after_close_is_closed`** — the datagram writer's own refusal: after
+//!   `gen_udp:close/1` a `gen_udp:send/4` on that socket answers `{error, closed}` and the peer
+//!   receives nothing (a bounded `receive … after` answers `timeout`), so a closed datagram
+//!   socket never puts a datagram on the wire.
 //! * **`shutdown_write_then_send_closes_the_writer`** — the half-close: after a completed
 //!   `<<"hi">>`, `gen_tcp:shutdown(Cl, write)` answers `ok`, the peer still receives that
 //!   `<<"hi">>` and then its `{tcp_closed, A}` teardown, a later `gen_tcp:send/2` is
 //!   `{error, closed}`, and the repeated `shutdown(write)` plus the following `shutdown(read)`
 //!   are `{error, enotconn}`. (`closed` on the send, never `enotconn`: that is the
 //!   send-on-a-*listener* answer.)
+//! * **`repeated_write_shutdown_keeps_the_writer_closed`** — the repeated half-close on its own:
+//!   `shutdown(Cl, write)` **twice** before any send both answer `ok` (the second one is
+//!   idempotent and does not tear the socket down), and the send that follows is the same
+//!   `{error, closed}` the single-shutdown row pins. It is the send — not the shutdown — that
+//!   the driver's "fully closed" accounting hangs on (see the measured shapes below).
+//! * **`empty_payload_after_write_shutdown_is_a_noop_success`** — a **zero-length** write is
+//!   exempt from the half-close's closed check: on a write-shut socket `gen_tcp:send/2` of
+//!   `<<>>` is still `ok` (never `{error, closed}`), puts nothing on the stream, and the
+//!   *first* non-empty send after it is the `{error, closed}` refusal. Exactly one zero-length
+//!   send is pinned — a **second** one is a measured divergence (below).
 //! * **`send_counters_advance_with_the_writes`** — `inet:getstat/1`'s **send-side** counters:
 //!   `{send_cnt, 0}`/`{send_oct, 0}` before any write, and `{send_cnt, 2}`/`{send_oct, 6}` after
 //!   two completed 3-byte writes the peer drained in full, so the driver accounting follows the
@@ -136,14 +150,28 @@
 //! Verified in this environment (oracle OTP 29.1.1 / `erts-17.1`; the built `beam_rt`) by
 //! running the *same* expression under both runtimes:
 //!
-//! * **a *second* `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, write)` blocks (`beam_rt`).** The
-//!   **first** send after the shutdown agrees — `{error, closed}` on both sides, which is what
-//!   `shutdown_write_then_send_closes_the_writer` pins — but a second one makes the Rust runtime
-//!   exit `3` with `beam_rt: unsupported: opcode: run: process blocked (no message available)`
-//!   where the oracle answers `{error, enotconn}` (the driver marks the socket fully closed
-//!   after the first failed write). That is a typed capability gap, not a divergence, so the
-//!   pinned half-close row performs exactly **one** send after the shutdown. Owner: `beam_rt` /
-//!   `beam_io`.
+//! * **a *second* non-empty `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, write)` blocks
+//!   (`beam_rt`).** The **first** non-empty send after the shutdown agrees — `{error, closed}`
+//!   on both sides, which is what `shutdown_write_then_send_closes_the_writer` pins — but a
+//!   second one makes the Rust runtime exit `3` with
+//!   `beam_rt: unsupported: opcode: run: process blocked (no message available)` where the
+//!   oracle answers `{error, enotconn}` (the driver marks the socket fully closed after the
+//!   first failed write; measured 2/2 identical on both sides). That is a typed capability gap,
+//!   not a divergence, so the pinned half-close row performs exactly **one** send after the
+//!   shutdown. Owner: `beam_rt` / `beam_io`.
+//! * **a *second* zero-length `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, write)` is a plain
+//!   divergence (`beam_rt`).** The oracle answers `ok` for *every* zero-length write on a
+//!   write-shut socket (`<<>>`, `[]`, `[<<>>, []]` — any number of times, measured 3/3), while
+//!   `beam_rt` answers `ok` for the **first** one and `{error, closed}` for the second (measured
+//!   3/3). Both sides exit `0` with a plain value, so a row pinning it would be a hard
+//!   `mismatch`; `empty_payload_after_write_shutdown_is_a_noop_success` therefore performs
+//!   exactly **one** zero-length send. Owner: `beam_rt` / `beam_io`.
+//! * **a `gen_tcp:send/2` after `gen_tcp:shutdown(Cl, read_write)` is racy on the oracle.**
+//!   `shutdown(Cl, read_write)` itself answers `ok` on both sides, but the send that follows
+//!   answers `{error, closed}` or `{error, einval}` on the **oracle** from run to run (2 of 3
+//!   runs `einval` against `beam_rt`'s stable `{error, closed}`), so no row pins it. The
+//!   `write`-only half-close is the deterministic one and is pinned above. Owner: none — the
+//!   volatility is the oracle's, not this runtime's.
 //! * **a passive read whose data was queued *before* the call (`beam_rt`).** Only a passive read
 //!   armed **before** the bytes arrive is pinnable, and that shape is the read half's
 //!   ([`super::inet_control`]'s `passive_recv_*` rows). A `gen_tcp:recv/2,3` whose bytes were
@@ -483,6 +511,26 @@ pub(crate) fn group() -> Vec<Case> {
              {S1, G1, S2, G2, S3, G3} end",
             "ok {ok,{data,<<97,98,99,100>>},ok,{data,<<>>},ok,{size,8192,true}}",
         ),
+        // --- the datagram writer's own refusal -------------------------------------------------
+        case(
+            "inet_write/datagram_write_after_close_is_closed",
+            "a gen_udp:send/4 on a socket that gen_udp:close/1 closed answers {error,closed} and \
+             delivers nothing: the peer's bounded receive answers timeout, so a closed datagram \
+             socket puts no datagram on the wire",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, Wr} = gen_udp:open(0, [binary, {active, false}]), \
+             {ok, Rd} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, binary, \
+                                          {active, true}]), \
+             {ok, RdPort} = inet:port(Rd), \
+             S1 = gen_udp:send(Wr, {127, 0, 0, 1}, RdPort, <<\"a\">>), \
+             G1 = receive {udp, Rd, _, _, D1} -> {data, D1} after 2000 -> timeout1 end, \
+             Clo = gen_udp:close(Wr), \
+             S2 = gen_udp:send(Wr, {127, 0, 0, 1}, RdPort, <<\"b\">>), \
+             G2 = receive {udp, Rd, _, _, D2} -> {data, D2} after 2000 -> timeout2 end, \
+             gen_udp:close(Rd), \
+             {S1, G1, Clo, S2, G2} end",
+            "ok {ok,{data,<<97>>},ok,{error,closed},timeout2}",
+        ),
         // --- the half-close: what the writer answers after shutdown(write) ---------------------
         case(
             "inet_write/shutdown_write_then_send_closes_the_writer",
@@ -514,6 +562,68 @@ pub(crate) fn group() -> Vec<Case> {
              gen_tcp:close(L), \
              {Sent, Shut, S1, Shut2, ShutR, Got, Cls} end",
             "ok {ok,ok,{error,closed},{error,enotconn},{error,enotconn},<<104,105>>,closed}",
+        ),
+        // --- the repeated half-close (the send, not the shutdown, closes the writer) -----------
+        case(
+            "inet_write/repeated_write_shutdown_keeps_the_writer_closed",
+            "a second gen_tcp:shutdown(Cl,write) before any send still answers ok (it is \
+             idempotent and does not tear the socket down) and the following gen_tcp:send/2 is \
+             the same {error,closed} refusal the single-shutdown row pins, with the peer \
+             receiving only the pre-shutdown <<\"hi\">> and its {tcp_closed,A} teardown",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= 2 -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Sent = gen_tcp:send(Cl, <<\"hi\">>), \
+             Shut1 = gen_tcp:shutdown(Cl, write), \
+             Shut2 = gen_tcp:shutdown(Cl, write), \
+             S1 = gen_tcp:send(Cl, <<\"x\">>), \
+             Got = Drain(<<>>), \
+             Cls = receive {tcp_closed, A} -> closed after 2000 -> timeout2 end, \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Sent, Shut1, Shut2, S1, Got, Cls} end",
+            "ok {ok,ok,ok,{error,closed},<<104,105>>,closed}",
+        ),
+        // --- a zero-length write is exempt from the closed check -------------------------------
+        case(
+            "inet_write/empty_payload_after_write_shutdown_is_a_noop_success",
+            "a zero-length gen_tcp:send/2 on a write-shut socket is still a success (ok, never \
+             {error,closed}) and puts nothing on the stream: after gen_tcp:shutdown(Cl,write) \
+             the <<>> send answers ok, the peer still receives only the earlier <<\"hi\">>, and \
+             the first non-empty send after it is the {error,closed} refusal",
+            &[Contract::DriverAbi, Contract::OtpApps],
+            "begin {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}, binary, \
+             {active, false}]), \
+             {ok, Port} = inet:port(L), \
+             {ok, Cl} = gen_tcp:connect({127, 0, 0, 1}, Port, \
+                                        [binary, {active, false}]), \
+             {ok, A} = gen_tcp:accept(L), \
+             ok = inet:setopts(A, [{active, true}]), \
+             Drain = fun Loop(Acc) when byte_size(Acc) >= 2 -> Acc; \
+                         Loop(Acc) -> receive {tcp, A, Db} -> \
+                                          Loop(<<Acc/binary, Db/binary>>) \
+                                      after 2000 -> Acc end end, \
+             Sent = gen_tcp:send(Cl, <<\"hi\">>), \
+             Shut = gen_tcp:shutdown(Cl, write), \
+             Empty = gen_tcp:send(Cl, <<>>), \
+             S1 = gen_tcp:send(Cl, <<\"x\">>), \
+             Got = Drain(<<>>), \
+             Cls = receive {tcp_closed, A} -> closed after 2000 -> timeout2 end, \
+             gen_tcp:close(Cl), \
+             gen_tcp:close(A), \
+             gen_tcp:close(L), \
+             {Sent, Shut, Empty, S1, Got, Cls} end",
+            "ok {ok,ok,ok,{error,closed},<<104,105>>,closed}",
         ),
         // --- the send-side driver accounting ----------------------------------------------------
         case(
@@ -671,7 +781,7 @@ mod tests {
     #[test]
     fn every_case_is_a_described_exit_zero_inet_write_eval_case() {
         let cases = group();
-        assert_eq!(cases.len(), 17, "the group's size is pinned by this test");
+        assert_eq!(cases.len(), 20, "the group's size is pinned by this test");
         let mut ids = Vec::new();
         for case in &cases {
             assert!(
@@ -750,8 +860,13 @@ mod tests {
     /// The shapes that used to be listed here have **closed** and are pinned by this group:
     /// `gen_tcp:shutdown/2` after a completed write (`shutdown_write_then_send_closes_the_writer`,
     /// one send after it — a *second* one is still a capability gap, see the module docs), the
-    /// block framing modes on a **sender** (`{packet, 1|2|4}` prefixes the length header) and
-    /// `inet:getstat/1`'s send-side counters.
+    /// repeated half-close and the zero-length write on a write-shut socket
+    /// (`repeated_write_shutdown_keeps_the_writer_closed`,
+    /// `empty_payload_after_write_shutdown_is_a_noop_success` — the *second* zero-length send is
+    /// a measured divergence, see the module docs), the datagram writer's own refusal after
+    /// `gen_udp:close/1` (`datagram_write_after_close_is_closed`), the block framing modes on a
+    /// **sender** (`{packet, 1|2|4}` prefixes the length header) and `inet:getstat/1`'s
+    /// send-side counters.
     #[test]
     fn no_case_pins_a_measured_divergence() {
         for case in group() {

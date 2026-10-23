@@ -26,6 +26,39 @@
 //! exactly. Nothing in this group is a recorded capability gap, so nothing here relies on
 //! `known-gaps.txt`.
 //!
+//! # The two `%T` renderers (A.7)
+//!
+//! `erlang:display/1` and `erts_internal:term_to_string/1,2` are both the C's `%T` printer
+//! (`erl_printf_term.c`): the first writes the rendering plus the `\r\n` its `write_f_add_cr`
+//! appends, the second answers a **character list** and takes a byte **budget** whose overrun
+//! appends the `"... "` truncation marker.
+//!
+//! A `display/1` call *before* the probe's own line is pinnable byte-exactly, because a
+//! [`Golden`]'s stdout is the **whole** probe stdout minus the final newline
+//! (`crate::compare::normalize_probe_stdout`): the golden therefore reads
+//! `<rendered text>\r\nok <value>`. That is what pins the `%T` quoting rules (a printable list
+//! becomes a quoted string, a byte list of a binary either the quoted form or the numbered
+//! form, an atom that needs quotes gets them, a float uses the `%e` shape) and the CRLF
+//! terminator itself.
+//!
+//! `term_to_string/1,2` is pinned as the `~w` image of the returned character list — the
+//! exact bytes — or, where several renderings are compared at once, as an `=:=` matrix whose
+//! expected `%T` strings live in the expression. A golden of `ok [true,…]` still pins them:
+//! the *oracle* must reproduce it (`check_golden`), so a wrong rendering is corpus drift.
+//!
+//! # Why five `process_info` items are absent from this group
+//!
+//! `parent`, `label`, `priority_messages`, `magic_ref`, `garbage_collection_info` (and
+//! `backtrace`) are **typed capability gaps** in the runtime — `UNSUPPORTED_ITEMS` in
+//! `crates/beam_rt/src/native/memory/mod.rs`, where each names the missing accessor — so the
+//! query exits `3` with a `beam_rt: unsupported: process_info: <item> (…)` diagnostic. A case
+//! over one of them would classify as `unsupported`, never as an agreement, and this group
+//! asks for agreements only. `last_calls` *is* answered (always `false`), which is why it is
+//! pinnable **only** in its no-buffer state: a process with an *armed* `save_calls` buffer
+//! (`[]` when nothing has been recorded yet, a list of `{M,F,A}`/`send`/`receive` entries
+//! otherwise) is a runtime-side gap too. Both are reported to the runtime, never recorded
+//! here and never allowlisted.
+//!
 //! # Why the module-run route (and not only `-eval`)
 //!
 //! Two of the surfaces this group exists for cannot be reached from an `-eval` expression:
@@ -408,6 +441,25 @@ fn module_case0(
     module_case(id, description, contracts, function, 0, &[], golden)
 }
 
+/// `erts_internal:term_to_string/1` over one term of each kind, compared with the `%T` text the
+/// oracle renders (the expected strings are measured, not guessed: the float's `%e` shape, a
+/// single-key map's `#{k=>v}` form, a printable list as a quoted string and a printable binary
+/// as `<<"…">>` with escaped quotes).
+const TERM_TO_STRING_KINDS: &str = r##"[erts_internal:term_to_string(T) =:= S || {T,S} <- [{1.5,"1.500000e+00"},{#{a=>1},"#{a=>1}"},{"hello","\"hello\""},{<<"xy">>,"<<\"xy\">>"}]]"##;
+
+/// `erts_internal:term_to_string/2`'s accepted budget arms, compared with the measured
+/// renderings. Note the two counter-intuitive ones the C really produces: a budget of `4` is
+/// enough for `{a,1}` *and still* appends the marker (`"{a,1}... "`, nine bytes for a five-byte
+/// term), while `2` truncates mid-term (`"{a... "`); `undefined` and `INT_MAX - 1` are the
+/// unlimited forms.
+const TERM_TO_STRING_LIMITS: &str = r#"[erts_internal:term_to_string({a,1}, B) =:= S || {B,S} <- [{4,"{a,1}... "},{2,"{a... "},{undefined,"{a,1}"},{2147483646,"{a,1}"}]]"#;
+
+/// `erts_internal:term_to_string/2` over the limits the C's argument check rejects
+/// (`bif.c:4168-4176`: `1 < L < INT_MAX` or the atom `undefined`) — including `INT_MAX` itself,
+/// which is *not* read as "unlimited", and a non-integer/non-atom limit; each refusal is
+/// classified into `{Class, Reason}` so the golden is order-stable.
+const TERM_TO_STRING_BADARG_MATRIX: &str = "[try erts_internal:term_to_string({a,1}, L) of _ -> ok catch Cls:Rs -> {Cls, Rs} end || L <- [1, 0, -1, 2147483647, foo]]";
+
 /// The `bif_extra` cases.
 pub(crate) fn group() -> Vec<Case> {
     use Contract::{BeamAsm, OtpApps};
@@ -657,6 +709,17 @@ pub(crate) fn group() -> Vec<Case> {
              erlang:process_info(self(), dictionary) end",
             "ok {dictionary,[{diff_k,diff_v}]}",
         ),
+        info_case(
+            "bif_extra/process_info_self_last_calls_without_a_buffer",
+            "process_info/2's last_calls of a process with no saved-calls buffer is the atom \
+             `false` — both for the default (never armed) state and after an explicit \
+             process_flag(save_calls, 0), which is the only last_calls state this runtime \
+             answers (an armed buffer's list of recorded calls is a runtime-side gap)",
+            "{erlang:process_info(self(), last_calls), \
+             begin process_flag(save_calls, 0), \
+             erlang:process_info(self(), last_calls) end}",
+            "ok {{last_calls,false},{last_calls,false}}",
+        ),
         bif_case(
             "bif_extra/function_exported_after_ensure_loaded",
             "function_exported/3 answers true for an exported function and false for an \
@@ -685,6 +748,105 @@ pub(crate) fn group() -> Vec<Case> {
             "check_old_code/1 answers false for a module with no old-code version",
             "begin code:ensure_loaded(lists), erlang:check_old_code(lists) end",
             "ok false",
+        ),
+        // --- erlang:display/1 — the C %T renderer and its CRLF terminator (A.7) -----------
+        bif_case(
+            "bif_extra/display_atom_and_integer_are_bare_and_crlf_terminated",
+            "erlang:display/1 writes an atom and an integer bare through the C `%T` printer, \
+             one `\\r\\n`-terminated line per call, and the probe's own line follows them",
+            "begin erlang:display(hello), erlang:display(42), done end",
+            "hello\r\n42\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_tuple_quotes_a_printable_list_element",
+            "erlang:display/1 renders a tuple elementwise and quotes a printable list element \
+             (`\"s\"`), while the empty list stays `[]`",
+            "begin erlang:display({a,1,\"s\",[]}), done end",
+            "{a,1,\"s\",[]}\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_list_printable_elements_become_a_quoted_string",
+            "erlang:display/1 renders an all-printable list as its quoted string form (`\"hi\"`) \
+             and an improper list elementwise with the `|` tail marker",
+            "begin erlang:display([104,105]), erlang:display([1,2,3|tail]), done end",
+            "\"hi\"\r\n[1,2,3|tail]\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_binary_quotes_printable_bytes_and_numbers_the_rest",
+            "erlang:display/1 renders a printable binary in its quoted `<<\"…\">>` form and a \
+             binary with a non-printable byte in the numbered `<<1,2,255>>` form",
+            "begin erlang:display(<<\"bin\">>), erlang:display(<<1,2,255>>), done end",
+            "<<\"bin\">>\r\n<<1,2,255>>\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_float_uses_the_percent_t_exponent_format",
+            "erlang:display/1 renders a float with the `%T` printer's `%e` shape \
+             (`1.500000e+00`, not `1.5`) and a negative integer with its sign",
+            "begin erlang:display(1.5), erlang:display(-42), done end",
+            "1.500000e+00\r\n-42\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_quotes_an_atom_that_needs_it_and_renders_the_empty_tuple",
+            "erlang:display/1 quotes an atom that is not a plain lowercase name \
+             (`'hello world'`) and renders the empty tuple as `{}`",
+            "begin erlang:display('hello world'), erlang:display({}), done end",
+            "'hello world'\r\n{}\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_nests_without_a_pretty_print_depth_limit",
+            "erlang:display/1's `%T` printer has no `~p`-style depth or length limit: a \
+             seven-deep tuple and a list with a non-printable element both render in full",
+            "begin erlang:display({1,{2,{3,{4,{5,{6,{7,8}}}}}}}), \
+             erlang:display([97,98,300]), done end",
+            "{1,{2,{3,{4,{5,{6,{7,8}}}}}}}\r\n[97,98,300]\r\nok done",
+        ),
+        bif_case(
+            "bif_extra/display_returns_true_on_every_call",
+            "erlang:display/1 answers the atom `true` (not the term), so two calls in one \
+             expression render both lines and yield `{true,true}`",
+            "{erlang:display(one), erlang:display(two)}",
+            "one\r\ntwo\r\nok {true,true}",
+        ),
+        // --- erts_internal:term_to_string/1,2 — the same %T printer, budgeted (A.7) --------
+        bif_case(
+            "bif_extra/term_to_string_of_a_tuple_is_a_character_list",
+            "erts_internal:term_to_string/1 answers a character list (a list, never a binary) \
+             holding the `%T` rendering — `{a,1}` renders the five bytes `\"{a,1}\"`",
+            "{is_list(erts_internal:term_to_string({a,1})), \
+             is_binary(erts_internal:term_to_string({a,1})), \
+             erts_internal:term_to_string({a,1})}",
+            "ok {true,false,[123,97,44,49,125]}",
+        ),
+        bif_case(
+            "bif_extra/term_to_string_renders_every_term_kind_with_percent_t",
+            "erts_internal:term_to_string/1 renders a float, a map, a printable list and a \
+             printable binary exactly like the `%T` printer (the expected strings are the \
+             oracle's measured renderings)",
+            TERM_TO_STRING_KINDS,
+            "ok [true,true,true,true]",
+        ),
+        bif_case(
+            "bif_extra/term_to_string_limit_arms_and_the_truncation_marker",
+            "erts_internal:term_to_string/2 takes a byte budget: an affordable term still gains \
+             the `\"... \"` marker, a tight budget truncates mid-term, and `undefined` / \
+             `INT_MAX-1` are the unlimited arms",
+            TERM_TO_STRING_LIMITS,
+            "ok [true,true,true,true]",
+        ),
+        bif_case(
+            "bif_extra/term_to_string_limit_outside_the_accepted_arms_is_badarg",
+            "erts_internal:term_to_string/2's argument check accepts only `1 < Limit < INT_MAX` \
+             or the atom `undefined`, so 1, 0, -1, `INT_MAX` itself and a non-integer limit all \
+             raise error:badarg",
+            TERM_TO_STRING_BADARG_MATRIX,
+            "ok [{error,badarg},{error,badarg},{error,badarg},{error,badarg},{error,badarg}]",
+        ),
+        bif_case(
+            "bif_extra/term_to_string_of_the_wrong_arity_is_undef",
+            "erts_internal:term_to_string/0 is no exported function, so the call raises the \
+             oracle's bare error:undef",
+            "try erts_internal:term_to_string() of _ -> ok catch Cls:Rs -> {Cls, Rs} end",
+            "ok {error,undef}",
         ),
     ]
 }
@@ -725,10 +887,24 @@ mod tests {
         "bif_extra/process_info_self_position_items",
         "bif_extra/process_info_self_trap_exit_round_trip",
         "bif_extra/process_info_self_dictionary_after_put",
+        "bif_extra/process_info_self_last_calls_without_a_buffer",
         "bif_extra/function_exported_after_ensure_loaded",
         "bif_extra/is_builtin_of_a_declared_and_a_bogus_bif",
         "bif_extra/get_module_info_module_attribute",
         "bif_extra/check_old_code_of_a_loaded_module",
+        "bif_extra/display_atom_and_integer_are_bare_and_crlf_terminated",
+        "bif_extra/display_tuple_quotes_a_printable_list_element",
+        "bif_extra/display_list_printable_elements_become_a_quoted_string",
+        "bif_extra/display_binary_quotes_printable_bytes_and_numbers_the_rest",
+        "bif_extra/display_float_uses_the_percent_t_exponent_format",
+        "bif_extra/display_quotes_an_atom_that_needs_it_and_renders_the_empty_tuple",
+        "bif_extra/display_nests_without_a_pretty_print_depth_limit",
+        "bif_extra/display_returns_true_on_every_call",
+        "bif_extra/term_to_string_of_a_tuple_is_a_character_list",
+        "bif_extra/term_to_string_renders_every_term_kind_with_percent_t",
+        "bif_extra/term_to_string_limit_arms_and_the_truncation_marker",
+        "bif_extra/term_to_string_limit_outside_the_accepted_arms_is_badarg",
+        "bif_extra/term_to_string_of_the_wrong_arity_is_undef",
     ];
 
     /// The `process_info/2` items the shape case must keep covering (the "widest item set").
@@ -982,6 +1158,99 @@ mod tests {
             find("bif_extra/fun_info_local_whole_list").golden.stdout,
             Some("10"),
             "the whole-list case checks one key per entry"
+        );
+    }
+
+    /// The `erlang:display/1` cases are the group's **renderer** half: each one must pin the
+    /// `%T` rendering *and* the `\r\n` its `write_f_add_cr` appends, and each must keep the
+    /// probe's own line last (a golden is the whole probe stdout minus the final newline, so
+    /// the pre-printed text is part of it — see the module docs).
+    #[test]
+    fn every_display_case_pins_the_crlf_terminator_and_the_probe_line() {
+        let cases = group();
+        let display: Vec<&Case> = cases
+            .iter()
+            .filter(|case| case.id.starts_with("bif_extra/display_"))
+            .collect();
+        assert!(
+            display.len() >= 8,
+            "the renderer half must keep its eight display cases, got {}",
+            display.len()
+        );
+        for case in display {
+            let golden = case.golden.stdout.expect("stdout");
+            assert!(
+                golden.contains("\r\n"),
+                "case {}: a display/1 line is CRLF-terminated: {golden:?}",
+                case.id
+            );
+            let probe_line = golden.rsplit('\n').next().unwrap_or(golden);
+            assert!(
+                probe_line.starts_with("ok "),
+                "case {}: the probe's own line comes last: {golden:?}",
+                case.id
+            );
+            assert_eq!(
+                case.kind_label(),
+                "value",
+                "case {}: a renderer case pins the `~w` rendering, not an ETF image",
+                case.id
+            );
+        }
+    }
+
+    /// The renderer half must cover the term kinds whose `%T` quoting rules differ — a bare
+    /// atom/integer, a tuple, a printable list, a binary, a float and a quoted atom. Each is
+    /// named by the term it displays, so a rewrite that drops one fails here.
+    #[test]
+    fn the_display_cases_cover_every_quoting_rule() {
+        let exprs: Vec<&str> = group()
+            .into_iter()
+            .filter(|case| case.id.starts_with("bif_extra/display_"))
+            .filter_map(|case| case.expr())
+            .collect();
+        for displayed in [
+            "erlang:display(hello)",
+            "erlang:display(42)",
+            "erlang:display({a,1,\"s\",[]})",
+            "erlang:display([104,105])",
+            "erlang:display([1,2,3|tail])",
+            "erlang:display(<<\"bin\">>)",
+            "erlang:display(<<1,2,255>>)",
+            "erlang:display(1.5)",
+            "erlang:display('hello world')",
+            "erlang:display({})",
+        ] {
+            assert!(
+                exprs.iter().any(|expr| expr.contains(displayed)),
+                "no display case pins `{displayed}`"
+            );
+        }
+    }
+
+    /// The `erts_internal:term_to_string/1,2` cases must keep pinning all three arms the C has:
+    /// the `/1` form (a character list), the `/2` budget arms (including the truncation marker)
+    /// and the `/2` argument check (`1 < L < INT_MAX` or `undefined`, else `badarg`).
+    #[test]
+    fn the_term_to_string_cases_cover_the_three_arms() {
+        assert!(TERM_TO_STRING_KINDS.contains("term_to_string(T) =:="));
+        assert!(TERM_TO_STRING_LIMITS.contains("\"{a,1}... \""));
+        assert!(TERM_TO_STRING_LIMITS.contains("\"{a... \""));
+        assert!(TERM_TO_STRING_LIMITS.contains("undefined"));
+        assert!(TERM_TO_STRING_BADARG_MATRIX.contains("2147483647"));
+        assert_eq!(
+            find("bif_extra/term_to_string_of_a_tuple_is_a_character_list")
+                .golden
+                .stdout,
+            Some("ok {true,false,[123,97,44,49,125]}"),
+            "the /1 case pins the character list and its exact bytes (`\"{{a,1}}\"`)"
+        );
+        assert_eq!(
+            find("bif_extra/term_to_string_limit_outside_the_accepted_arms_is_badarg")
+                .golden
+                .stdout,
+            Some("ok [{error,badarg},{error,badarg},{error,badarg},{error,badarg},{error,badarg}]"),
+            "one badarg per rejected limit arm"
         );
     }
 
