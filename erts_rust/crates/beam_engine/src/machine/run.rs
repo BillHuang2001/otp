@@ -200,13 +200,14 @@ impl Machine {
     /// * [`Tier::BaselineJit`] — the native baseline backend over the per-thread
     ///   cross-run cache ([`crate::jit::cache`]), resuming through its no-reset
     ///   driver rather than recompiling or resetting.
-    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. A resume is handed
-    ///   **no** compiled artifact and the tier has no path that would compile and
-    ///   bind one at a parked address on demand, so resuming a mid-function
-    ///   `wait`/`suspend` address is unserviceable natively: this is a typed
-    ///   [`unsupported`](crate::error::unsupported) error (or, with the
-    ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
-    ///   path reports) — never a panic and never a silent fallback to another tier.
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. The resume takes
+    ///   the thread-local retained artifact and goes through the shared generic
+    ///   no-reset seam (`crate::jit::baseline::run_native_resume_outcome`), so a
+    ///   slice parked on `wait`/`suspend` continues on this tier with the
+    ///   interpreter's own result; an address the artifact cannot be entered at
+    ///   takes the per-instruction step. With the `jit-cranelift` feature off the
+    ///   same typed error the first-entry Cranelift path reports is returned —
+    ///   never a panic and never a silent fallback to another tier.
     pub fn resume_outcome_with_tier(
         &mut self,
         module: &Module,

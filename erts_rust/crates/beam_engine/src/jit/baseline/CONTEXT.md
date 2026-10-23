@@ -33,7 +33,8 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   probe `entries` first and `sub_entries` second, so a real IR-block start always wins.
 - `mod.rs` — `BaselineJit` (zero-sized `JitBackend`); the driver
   `run_compiled`/`run_compiled_outcome`/`run_compiled_label_outcome`, the no-reset
-  `run_compiled_resume_outcome`, and the shared `enter_machine`/`run_native`/`run_native_outcome`/
+  `run_native_resume_outcome` (the `NativeCode`-generic no-reset resume seam, which
+  `run_compiled_resume_outcome` wraps), and the shared `enter_machine`/`run_native`/`run_native_outcome`/
   `run_native_label_outcome`/`drive`; the `RunLabels` enum (`Stored` = the artifact's map, `Built` =
   the per-run fallback); the `NativeCode` trait (`enter(rt, module, func, pc)` + `module_blocks` +
   `labels`) and its `BlockEntries` impl; `enter_compiled`/`block_entries`.
