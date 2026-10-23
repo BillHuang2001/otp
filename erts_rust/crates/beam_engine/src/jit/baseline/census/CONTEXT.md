@@ -268,8 +268,9 @@ else follows the installed OTP tree and is recorded as method + figure, never as
 - **Three different denominators are in circulation** (raw IR, Σ block ranges, visited instances) and
   no instrument prints the first. Quote a deopt fraction only against the **visited** total, and say
   so; `3.85 %` (visited) and `3.34 %` (Σ ranges) are the same 119 912 deopts.
-- **The recording-break site count is nine**, not ten: `../emit/block.rs` sets `terminated = true` at
-  `:373, 477, 492, 501, 569, 640, 677, 770, 861`.
+- **The recording-break sites are nine**: `../emit/block.rs` sets `terminated = true` (and `break`s
+  on the next line) at `:373, 477, 492, 501, 569, 640, 677, 770, 861` — prose elsewhere in the tree
+  says ten, and the list there names these same nine lines.
 - **Crate-level copies of these figures live elsewhere** (`../../../MEASURED.md`, `../../../PERF.md`,
   `../../../TEST_NOTES.md`) and are restatements, not the record: this node owns the method and the
   corpus definition, so a figure quoted in prose elsewhere must be checked against the command here.
