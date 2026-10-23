@@ -10,7 +10,12 @@ The fixtures are compiled with `+deterministic`, which strips the embedded sourc
 path from the `CInf` (compile info) and `Dbgi` (debug info) chunks — the committed
 `.beam` files are therefore **path-free** (no worktree/`$TMPDIR` path leaks). Compile
 from a neutral scratch dir under `$TMPDIR` so nothing about the local checkout is
-recorded:
+recorded. `tests/fixtures_are_path_free.rs` enforces this: it enumerates every `*.beam`
+in this directory at run time and fails on an absolute-path marker, including one that
+only appears inside a compressed chunk.
+
+Example (`slice.erl`; every other fixture's exact invocation is in its own section
+below):
 
 ```sh
 SCRATCH="$TMPDIR/neuter_fixtures"
@@ -977,3 +982,66 @@ return
 
 i.e. the loader lowers it to `Instr::BsTestTail2 { fail: Label(3), ctx: X(1),
 bits: 0 }` — the `<<X:8>>` pattern requires exactly 0 bits to remain after the byte.
+
+## `bsalloc.beam` — `bs_create_bin` with an allocation-list `Alloc`
+
+The only committed fixture whose `bs_create_bin` carries the **`z,3` allocation-list**
+form of its `Alloc` operand (`tests/widened_ir.rs`). The compiler hoists a block's
+pending heap need into the `bs_create_bin` that precedes it
+(`beam_ssa_codegen.erl:342-352`, `need_heap_terminator`), so `Alloc` is written as
+`{alloc,[{words,N},{floats,N},{funs,N}]}` rather than a bare word count; `pack/2` needs
+`{words,4},{floats,0},{funs,1}` for the closure it builds right after the binary.
+
+### Regeneration
+
+```sh
+SCRATCH="$TMPDIR/neuter_bsalloc"
+mkdir -p "$SCRATCH/gen"
+cp bsalloc.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic bsalloc.erl )
+cp "$SCRATCH/gen/bsalloc.beam" bsalloc.beam   # writes bsalloc.beam (640 bytes)
+```
+
+`bsalloc.erl` (the input, also committed):
+
+```erlang
+-module(bsalloc).
+-export([pack/2]).
+
+pack(X, Y) ->
+    Z = <<X:8>>,
+    if is_binary(Z) -> {fun() -> X end, Y};
+       true -> Y
+    end.
+```
+
+### Wire summary
+
+**640 bytes**, `FOR1` form length **632**; chunks in file order (id · size):
+`AtU8` 75 · `Code` 113 · `StrT` 0 · `ImpT` 28 · `ExpT` 40 · `FunT` 28 · `Meta` 45 ·
+`LocT` 16 · `Attr` 39 · `CInf` 27 · `Dbgi` 66 · `Line` 23 · `Type` 10. `Code` header:
+`format_number 0`, `max_opcode 181`, `label_count 9`, `function_count 4`. Atoms
+(1..=7, varint length form): `bsalloc`, `pack`, `integer`, `module_info`, `erlang`,
+`get_module_info`, `'-pack/2-fun-0-'`. `CInf` is `[{version,"10.0.6"}]` alone (no
+`options`, no `source`) and `Dbgi` is
+`{debug_info_v1,erl_abstract_code,{none,[deterministic]}}` — the `+deterministic`
+effect `tests/fixtures_are_path_free.rs` pins. `Line`: `version 0`, `flags 0`,
+`instr_count 5`, `item_count 3`, `name_count 0` (⇒ `files == ["bsalloc.erl"]`).
+Opcodes: **`bs_create_bin`** (with the allocation-list `Alloc`) plus `make_fun3`,
+`put_tuple2`, `call_ext_only`, `func_info`, `line`, `move`. `pack/2`'s stream is
+
+```
+{func_info,{atom,bsalloc},{atom,pack},2}
+{label,2}
+{line,[{location,[],12}]}
+{bs_create_bin,{f,0},{alloc,[{words,4},{floats,0},{funs,1}]},2,8,{x,2},
+               {list,[{atom,integer},1,1,nil,{x,0},{integer,8}]}}
+{make_fun3,{bsalloc,'-pack/2-fun-0-',1},0,15349613,{x,0},{list,[{x,0}]}}
+{put_tuple2,{x,0},{list,[{x,0},{x,1}]}}
+return
+```
+
+i.e. the loader lowers it to `Instr::BsCreateBin { fail: NO_FAIL, alloc: 6, live: 2,
+unit: 8, dst: X(2), segments }` — `4` raw words + `0` floats + `1` fun (`ERL_FUN_SIZE`
+= 2 words each) = `6`, the word total `marshal_allocation_list` computes
+(`beam_file.c:2259-2284`).

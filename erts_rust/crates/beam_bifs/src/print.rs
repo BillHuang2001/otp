@@ -27,7 +27,7 @@
 //! binaries, non-byte-aligned bitstrings, internal pids, internal ports, internal
 //! refs, funs and native records.
 //!
-//! This module owns the **leaf renderer** ([`term_chunk`]/[`render_chunk`], the
+//! This module owns the **leaf renderer** ([`render_chunk`], the
 //! `io_lib:write1/4` tree) and the shared `io_lib_format` chunk helpers; the
 //! `io_lib_pretty` `~p`/`~P` line re-flow lives in the private [`pretty`] submodule
 //! and is re-exported here as [`pretty_chunk`], its `cind/7` probe in
@@ -227,6 +227,7 @@ use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 
+pub(crate) mod c_printf;
 mod pretty;
 mod record;
 pub(crate) use pretty::{
@@ -356,6 +357,11 @@ impl Chunk {
     }
 
     /// Appends the flattened text to `out`.
+    ///
+    /// Test-only: `crate::io` flattens through [`flatten_output`] (which applies the
+    /// unicode device's scalar-value check), so the only users are this module's
+    /// text assertions and the `crate::io`/`crate::print::pretty` test suites'.
+    #[cfg(test)]
     pub(crate) fn flatten_into(&self, out: &mut String) {
         match self {
             Chunk::Char(c) => out.push(*c),
@@ -399,6 +405,10 @@ impl Chunk {
 }
 
 /// Flattens a chunk sequence to its text.
+///
+/// Test-only: `crate::io` renders a directive through [`flatten_output`], which is
+/// the same walk with the unicode device's scalar-value check.
+#[cfg(test)]
 pub(crate) fn flatten(chunks: &[Chunk]) -> String {
     let mut out = String::new();
     for chunk in chunks {
@@ -512,30 +522,24 @@ pub(crate) fn format_term_depth(
     printable: bool,
     depth: i64,
 ) -> Result<String> {
-    Ok(flatten(&[term_chunk(ctx, term, printable, depth)?]))
+    Ok(flatten(&[render_chunk(
+        ctx,
+        term,
+        printable,
+        depth,
+        MapOrder::Storage,
+    )?]))
 }
 
-/// Renders `term` as one element chunk (`io_lib:write1/4`, or
-/// `io_lib_pretty:write/1` when `printable`, the `~p` string rule).
-///
-/// # Errors
-///
-/// As [`format_term`].
-pub(crate) fn term_chunk(
-    ctx: &mut BifContext<'_>,
-    term: Eterm,
-    printable: bool,
-    depth: i64,
-) -> Result<Chunk> {
-    render_chunk(ctx, term, printable, depth, MapOrder::Storage)
-}
-
-/// As [`term_chunk`], but with the map order a `~k`/`~K` modifier selected
+/// As [`render_chunk`], but with the map order a `~k`/`~K` modifier selected
 /// ([`MapOrder`]) applied to every map at any depth.
 ///
+/// The `~k`/`~K`-less directives (`~w`/`~p`/`~W`/`~P`) pass
+/// [`MapOrder::Storage`].
+///
 /// # Errors
 ///
-/// As [`term_chunk`].
+/// As [`render_chunk`].
 pub(crate) fn term_chunk_order(
     ctx: &mut BifContext<'_>,
     term: Eterm,

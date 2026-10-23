@@ -125,11 +125,13 @@
 //!
 //! # Gaps
 //!
-//! * `erts_internal:term_to_string/2` is **not registered**: `bif.c:4154-4194`
-//!   formats through the internal `%.*T` printer, whose output diverges from this
-//!   crate's `src/print.rs` renderer in several observable ways (a float as
-//!   `1.500000e+00`, a fun as `#Fun<erl_eval.42.130099583>`, the `"... "`
-//!   truncation tail), so no faithful implementation exists here.
+//! * `erts_internal:term_to_string/2` **is registered** — as a `RuntimeHooks` seam key
+//!   (`src/runtime/erts_internal.rs`), not as a body here: `beam_rt`'s native floor
+//!   shadows the key, so a body would never be reached. The renderer it needs does
+//!   exist — `src/print/c_printf.rs::term_text` is the C `%.*T`
+//!   (`bif.c:4154-4194` → `erl_printf_term.c::print_term`), whose `precision`
+//!   argument is the `dcount` byte budget (the `"... "` tail, `i64::MAX` for the
+//!   `undefined`/`INT_MAX` unlimited form), so wiring the BIF later is one call.
 //! * `erts_debug:size/1` (the *shared* sizer, `size_shared`), `get_internal_state/1`,
 //!   `set_internal_state/2` and `disassemble/1` are not registered (they need the
 //!   shared-term walk, the emulator's internal state and the BEAM code loader).

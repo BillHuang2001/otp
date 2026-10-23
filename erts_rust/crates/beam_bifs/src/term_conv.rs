@@ -118,7 +118,7 @@ use crate::binconv::{parse_term_to_binary_options, plain_image_of, T2bOptions};
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, system_limit, unsupported_bif};
-use crate::print::{flatten, proper_list, term_chunk, UNLIMITED_DEPTH};
+use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
 // ---------------------------------------------------------------------------
@@ -443,10 +443,23 @@ fn is_integer_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // display/1 and display_string/2
 // ---------------------------------------------------------------------------
 
-/// `display(Term)` (`bif.c:4148`) — the term as `~p` (the printable string rule,
-/// no depth limit, **no line wrapping**), followed by a line terminator, written
-/// through the [`OutputSink`](crate::context::OutputSink) `io:format/1,2` uses;
-/// returns `true`.
+/// `display(Term)` (`bif.c:4148`) — the term through the **`%T` renderer**
+/// ([`crate::print::c_printf::term_text`], the C's `print_term` in
+/// `erl_printf_term.c`), followed by a line terminator, written through the
+/// [`OutputSink`](crate::context::OutputSink) `io:format/1,2` uses; returns `true`.
+///
+/// `%T` is **not** the `~p` renderer, and the two differ observably:
+///
+/// * a native record is `#Module:Name{key=value,…}` — `=` with **no** spaces and the
+///   fields in the definition's **stored** (ascending atom-index) order, where `~w`/
+///   `~p` write `key = value` in declaration order;
+/// * a map is `#{k=>v}` with no spaces;
+/// * a float is printf's `%e` with six fraction digits (`1.500000e+00`);
+/// * an atom is quoted by the C's `print_atom_name` rule, which does **not** quote a
+///   reserved word (`and`, not `'and'`) and does quote anything carrying `@`.
+///
+/// `display/1` passes `INT_MAX` as the budget, which the C promotes to `LONG_MAX`
+/// (unlimited), so [`term_text`] is called with [`i64::MAX`].
 ///
 /// The terminator is `\r\n`, not `\n`: the C is `erts_printf("%.*T\n", …)` and
 /// `erts_printf` writes through `write_f_add_cr` on Unix
@@ -478,7 +491,7 @@ fn is_integer_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// Propagates the sink's I/O failure, and the leaf renderer's typed error for a
 /// term outside the Milestone-1 printable set (never a truncated line).
 fn display_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let text = flatten(&[term_chunk(ctx, args[0], true, UNLIMITED_DEPTH)?]);
+    let text = crate::print::c_printf::term_text(ctx, args[0], i64::MAX)?;
     ctx.write_output(&text)?;
     ctx.write_output("\r\n")?;
     ctx.boolean(true)

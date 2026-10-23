@@ -1041,6 +1041,24 @@ pub(crate) fn native_record_declaration_keys(def: Eterm) -> Result<Vec<Eterm>> {
     Ok(unsafe { beam_term::record_declaration_keys(def)? })
 }
 
+/// The definition's field **keys** in **stored** order — `defp->keys`, ascending
+/// atom index (`erts_cmp_flatmap_keys`, `erl_record.c:892-902`), i.e. exactly the
+/// order a native-record instance's value words sit in.
+///
+/// This is the order the `%T` renderer prints (`print_term`'s `RECORD_DEF` arm walks
+/// `defp->keys`/`instance->values` by index), which is why it is distinct from
+/// [`native_record_declaration_keys`].
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition.
+pub(crate) fn native_record_stored_keys(def: Eterm) -> Result<Vec<Eterm>> {
+    // SAFETY: `def` is a live definition term obtained from
+    // `native_record_definition`; `record_definition_keys` re-validates it and the
+    // slice it returns is copied out here, so no lifetime escapes the call.
+    Ok(unsafe { beam_term::record_definition_keys(def)? }.to_vec())
+}
+
 /// The definition's `field_order` ranks — `order[i]` is the **sorted-key** rank of
 /// the field declared `i`-th (`record_declaration_keys` walks the same tuple).
 ///

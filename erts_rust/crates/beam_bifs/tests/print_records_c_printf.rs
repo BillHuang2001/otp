@@ -1,0 +1,1299 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
+//! Integration tests: the **`%T` renderer** — `erlang:display/1`'s text.
+//!
+//! `erlang:display/1` is `erts_printf("%.*T\n", INT_MAX, Term)` (`bif.c:4148-4156`,
+//! returning `true`), and `%T` (`erts/emulator/beam/erl_printf_term.c::print_term`,
+//! `src/print/c_printf.rs`) is a **different** renderer from `io_lib`'s `~w`/`~p`:
+//! no spaces around `=`/`=>`, native-record fields in the definition's **stored**
+//! (ascending atom-index) order, `%e` floats with six fraction digits, and the C's
+//! own atom-quoting rule (`print_atom_name`: reserved words are *not* quoted, `@`
+//! forces quoting). Every row below therefore pins the exact bytes the oracle emits,
+//! including the `\r\n` display appends.
+//!
+//! # Route
+//!
+//! The fixtures are built and rendered through the crate's public surface only —
+//! `BifRegistry::call("records", "create", 4, …)` for a native record,
+//! `BifRegistry::call("erlang", "display", 1, …)` for the text, with a [`BytesSink`]
+//! capturing the output. That is exactly the way a runtime reaches them, and it keeps
+//! the fixture's record-definition hash the real one `records_create_4` computes.
+//!
+//! # Goldens
+//!
+//! Every expected string was measured on the system oracle (OTP 29.1.1 /
+//! erts-17.1). The `display` corpus comes from one `erl -noshell -eval` invocation
+//! that prints a name and then `erlang:display(Term)` with the real
+//! `records:create/4`, capturing **stdout's raw bytes** — so the `\r\n` terminator is
+//! measured too, not assumed. The `~w`/`~p` mirror rows come from the same session's
+//! `io_lib:format`. Only terms whose rendering is a single line take part (a `\r` is
+//! `IS_SPACE`, so `%T` emits it verbatim and a line-oriented transcript could not
+//! split on it); a `\n` inside a printable list *is* included, because the renderer
+//! escapes it.
+//!
+//! `displayed_terms_match_the_live_oracle` re-derives both corpora live, so the
+//! goldens can never drift: it compares the oracle, the golden and this crate's output
+//! three ways. That test is **fail-loud in the crate's live-oracle style** — with no
+//! usable `erl` it prints a banner and returns, which is *not* a pass.
+//!
+//! # Field order across two VMs
+//!
+//! A record definition stores its field keys sorted by **ascending atom index**
+//! (`beam_term::write_record`'s sort, the C's `erts_cmp_flatmap_keys`), and `%T` prints
+//! that stored order — so a multi-field record's rendering depends on the *per-VM*
+//! atom indices. The corpus removes the ambiguity the only sound way: its field atoms
+//! (`ddlfa`…`ddlfd`) are names no OTP module can pre-intern, and they are interned in
+//! declaration order on both sides (the oracle interns them in source order, this file
+//! seeds them in that same order), which makes the stored order the declaration order
+//! on both VMs — verified live, not assumed.
+//! `a_multi_field_record_prints_its_stored_order` pins the **property** on our side
+//! instead: it declares fields whose atom indices run *against* the declaration order
+//! and asserts the rendering follows ascending index, computing the expected order from
+//! the term's own atom indices.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use beam_alloc::Heap;
+use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
+use beam_codec::term::{make_big, make_binary, make_bitstring, make_flatmap, make_record};
+use beam_common::{BeamError, Result as BeamResult};
+use beam_process::ProcessId;
+use beam_term::{make_atom, make_small, AtomTable, Eterm};
+
+// ---------------------------------------------------------------------------
+// Scaffolding: the atom table, the context, the display route
+// ---------------------------------------------------------------------------
+
+/// The atoms every fixture needs.
+///
+/// `false`/`true` come **first** on purpose: a native-record definition stores its
+/// `is_exported` flag as the frozen `beam_term::AM_FALSE`/`AM_TRUE` index (`0`/`1`),
+/// so seeding them at those indices keeps the definition word identical to the one the
+/// runtime builds (`src/records.rs`'s own tests do the same).
+///
+/// The four field atoms follow in **declaration order** — the definition stores its
+/// keys by ascending atom index and `AtomTable::seed` interns in the order given, so
+/// this is what makes our stored order the declaration order (the same order the
+/// oracle reaches by interning them in source order).
+fn seeded_atoms() -> AtomTable {
+    let names: Vec<String> = [
+        "false",
+        "true",
+        "is_exported",
+        "ddlfa",
+        "ddlfb",
+        "ddlfc",
+        "ddlfd",
+        "ddlk",
+        "ddlv",
+        "ddltag",
+        "recmod",
+        "strrec",
+        "vals",
+        "ddlmod",
+        "empty",
+        "r",
+        "and",
+        "a@b",
+        "A",
+        "a b",
+        "hello",
+        "lists",
+        "reverse",
+        // `io:format/2` resolves its encoding atom (`latin1`), `io_lib:format/3` its
+        // option tag (`chars_limit`) and `io:format/2` its return value (`ok`); all
+        // three are runtime-provided names, so the fixture table carries them.
+        "latin1",
+        "chars_limit",
+        "ok",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let mut atoms = AtomTable::new();
+    atoms.seed(names.iter().map(String::as_str));
+    atoms
+}
+
+/// The heap every rendering gets (the widest fixture — the 40-element list — is a few
+/// dozen words).
+const HEAP_WORDS: usize = 1 << 20;
+
+/// A flat proper list of the byte-sized integers of `text` (an Erlang string).
+fn byte_list(ctx: &mut BifContext<'_>, text: &str) -> BeamResult<Eterm> {
+    let elems: Vec<Eterm> = text
+        .bytes()
+        .map(|b| ctx.int(i64::from(b)))
+        .collect::<BeamResult<Vec<Eterm>>>()?;
+    ctx.list(&elems)
+}
+
+/// A seeded atom on `ctx`'s heap.
+fn atom(ctx: &BifContext<'_>, name: &str) -> Eterm {
+    ctx.atom(name).expect("the atom is seeded")
+}
+
+/// `records:create(Module, Name, Fields, #{is_exported => true})` through the real
+/// registry.
+fn record(
+    ctx: &mut BifContext<'_>,
+    reg: &BifRegistry,
+    module: &str,
+    name: &str,
+    fields: &[(&str, Eterm)],
+) -> BeamResult<Eterm> {
+    let module = ctx.atom(module)?;
+    let name = ctx.atom(name)?;
+    let mut pairs = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        let key = ctx.atom(key)?;
+        pairs.push(ctx.tuple(&[key, *value])?);
+    }
+    let fields = ctx.list(&pairs)?;
+    let flag = ctx.atom("true")?;
+    let tag = ctx.atom("is_exported")?;
+    let opts = make_flatmap(ctx.heap(), &[(tag, flag)])?;
+    reg.call("records", "create", 4, ctx, &[module, name, fields, opts])
+}
+
+/// `erlang:display(Term)` through the real registry, with a capturing sink: the exact
+/// bytes a runtime's stdout would receive.
+fn display_bytes(term: Term) -> BeamResult<String> {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    let atoms = seeded_atoms();
+    let truth = make_atom(atoms.lookup("true").expect("seeded"));
+    let mut sink = BytesSink::new();
+    let result = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let term = term.build(&mut ctx, &reg)?;
+        reg.call("erlang", "display", 1, &mut ctx, &[term])
+    };
+    // The oracle's `display_1` returns `true` (`bif.c:4156`), measured.
+    let ret = result?;
+    assert_eq!(
+        beam_term::compare::cmp(ret, truth, &atoms),
+        std::cmp::Ordering::Equal,
+        "erlang:display/1 must return `true`"
+    );
+    Ok(String::from_utf8(sink.contents().to_vec()).expect("the renderer emits UTF-8"))
+}
+
+/// `io:format(Fmt, Args)` through a [`BytesSink`] — the `~w`/`~p`/`~W`/`~P` route,
+/// used to show it differs from `%T` where the two C renderers differ.
+fn render_io(fmt: &str, depth: Option<i64>, term: Term) -> BeamResult<String> {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    let result = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let format = byte_list(&mut ctx, fmt)?;
+        let mut args = vec![term.build(&mut ctx, &reg)?];
+        if let Some(depth) = depth {
+            args.push(ctx.int(depth)?);
+        }
+        let args = ctx.list(&args)?;
+        reg.call("io", "format", 2, &mut ctx, &[format, args])
+    };
+    result.map(|_| String::from_utf8(sink.contents().to_vec()).expect("the printer emits UTF-8"))
+}
+
+/// `io_lib:format(Fmt, Args[, [{chars_limit, N}]])` flattened to bytes.
+fn render_lib(
+    fmt: &str,
+    depth: Option<i64>,
+    chars_limit: Option<i64>,
+    term: Term,
+) -> BeamResult<String> {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+    let format = byte_list(&mut ctx, fmt)?;
+    let mut args = vec![term.build(&mut ctx, &reg)?];
+    if let Some(depth) = depth {
+        args.push(ctx.int(depth)?);
+    }
+    let args = ctx.list(&args)?;
+    let deep = match chars_limit {
+        None => reg.call("io_lib", "format", 2, &mut ctx, &[format, args])?,
+        Some(limit) => {
+            let tag = atom(&ctx, "chars_limit");
+            let limit = ctx.int(limit)?;
+            let option = ctx.tuple(&[tag, limit])?;
+            let options = ctx.list(&[option])?;
+            reg.call("io_lib", "format", 3, &mut ctx, &[format, args, options])?
+        }
+    };
+    let flat = reg.call("lists", "flatten", 1, &mut ctx, &[deep])?;
+    Ok(String::from_utf8(proper_bytes(flat)).expect("the printer emits UTF-8"))
+}
+
+/// The byte values of a proper character list.
+fn proper_bytes(term: Eterm) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut cur = term;
+    while beam_term::is_list(cur) {
+        let head = beam_codec::term::cons_head(cur).expect("a live cons cell");
+        let value = beam_term::signed_value(head);
+        assert!(
+            (0..=255).contains(&value),
+            "a character-list element out of byte range: {value}"
+        );
+        out.push(value as u8);
+        cur = beam_codec::term::cons_tail(cur).expect("a live cons cell");
+    }
+    assert!(beam_term::is_nil(cur), "not a proper list");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The fixtures — each one independently expressible on the oracle side
+// ---------------------------------------------------------------------------
+
+/// One displayed term: a crate-side builder plus the **independent** oracle-side
+/// expression of the same term, so the live cross-check never derives its expectation
+/// from this crate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Term {
+    // ---- atoms and their C quoting rule --------------------------------
+    /// `'and'` — a reserved word, which `%T` does **not** quote.
+    AtomReserved,
+    /// `'a@b'` — `@` is not a name character, so it forces quoting.
+    AtomAt,
+    /// `'A'` — a leading uppercase letter forces quoting.
+    AtomUpper,
+    /// `'a b'` — a space forces quoting.
+    AtomSpaced,
+    /// `hello` — a bare atom.
+    AtomPlain,
+    // ---- printable / non-printable lists -------------------------------
+    /// `"xy"` — a printable list, rendered as a string.
+    String,
+    /// The three characters `a`, `\`, `b` — a raw backslash is never escaped.
+    StringBackslash,
+    /// `"a\nb"` — a newline **is** escaped.
+    StringNewline,
+    /// `"a\"b"` — a quote **is** escaped.
+    StringQuote,
+    /// `[7]` — 7 is a control character, so the list is not printable.
+    ListNonPrintable,
+    /// `[]`.
+    ListEmpty,
+    // ---- binaries and bitstrings ---------------------------------------
+    /// `<<1,2,3>>` — not printable ASCII, so its bytes render as integers.
+    BinaryBytes,
+    /// `<<"xy">>` — printable ASCII renders as a string.
+    BinaryText,
+    /// `<<>>`.
+    BinaryEmpty,
+    /// `<<1:3>>` — a non-byte-aligned tail rides the `:bits` suffix.
+    Bitstring,
+    // ---- containers ----------------------------------------------------
+    /// `{'and',1}` — the reserved word inside a tuple is unquoted too.
+    Tuple,
+    /// `{}`.
+    TupleEmpty,
+    /// `#{ddlk => ddlv}`.
+    Map,
+    /// `#{}`.
+    MapEmpty,
+    // ---- numbers -------------------------------------------------------
+    /// `1.5` — `%e` with six fraction digits.
+    Float,
+    /// `-0.0` — a signed zero keeps its sign.
+    FloatNegZero,
+    /// `2^64` — a bignum.
+    Bignum,
+    // ---- identity terms ------------------------------------------------
+    /// `list_to_pid("<0.1.0>")` — an internal pid with fixed numbers.
+    Pid,
+    /// `list_to_ref("#Ref<0.0.0.5>")` — an internal ref with a fixed id.
+    Ref,
+    /// `fun lists:reverse/1` — an external fun.
+    FunExternal,
+    // ---- native records ------------------------------------------------
+    /// `#recmod:r{ddlfa = 1,ddlfb = 2}` — the two-field reference record.
+    RecTwo,
+    /// A zero-field record: `#ddlmod:empty{}`.
+    RecZero,
+    /// One printable-list field: `#recmod:strrec{ddlfb = "xy"}`.
+    RecStringField,
+    /// Four fields: a nested record, a tuple, a list and a map.
+    RecValues,
+    /// `{ddltag,R}` — a record nested in a tuple.
+    RecInTuple,
+    /// `[R]` — a record nested in a list.
+    RecInList,
+    /// `#{ddlk => R}` — a record as a map **value**.
+    RecMapValue,
+    /// `#{R => 1}` — a record as a map **key**.
+    RecMapKey,
+    // ---- the unbudgeted path -------------------------------------------
+    /// `lists:seq(1,40)` — long enough that a budgeted render would truncate;
+    /// `display/1` passes the C's `INT_MAX`, so nothing is elided.
+    LongList,
+}
+
+/// The oracle-side expression of the two-field record `recmod:r`.
+const REC_TWO_EXPR: &str = "records:create(recmod,r,[{ddlfa,1},{ddlfb,2}],#{is_exported=>true})";
+
+impl Term {
+    /// The oracle-side Erlang source of this fixture.
+    fn erl_expr(self) -> String {
+        match self {
+            Term::AtomReserved => "'and'".to_string(),
+            Term::AtomAt => "'a@b'".to_string(),
+            Term::AtomUpper => "'A'".to_string(),
+            Term::AtomSpaced => "'a b'".to_string(),
+            Term::AtomPlain => "hello".to_string(),
+            Term::String => "\"xy\"".to_string(),
+            // A backslash, escaped for the Erlang *source* (the term holds one char).
+            Term::StringBackslash => "\"a\\\\b\"".to_string(),
+            Term::StringNewline => "\"a\\nb\"".to_string(),
+            Term::StringQuote => "\"a\\\"b\"".to_string(),
+            Term::ListNonPrintable => "[7]".to_string(),
+            Term::ListEmpty => "[]".to_string(),
+            Term::BinaryBytes => "<<1,2,3>>".to_string(),
+            Term::BinaryText => "<<\"xy\">>".to_string(),
+            Term::BinaryEmpty => "<<>>".to_string(),
+            Term::Bitstring => "<<1:3>>".to_string(),
+            Term::Tuple => "{'and',1}".to_string(),
+            Term::TupleEmpty => "{}".to_string(),
+            Term::Map => "#{ddlk=>ddlv}".to_string(),
+            Term::MapEmpty => "#{}".to_string(),
+            Term::Float => "1.5".to_string(),
+            Term::FloatNegZero => "-0.0".to_string(),
+            Term::Bignum => "18446744073709551616".to_string(),
+            Term::Pid => "list_to_pid(\"<0.1.0>\")".to_string(),
+            Term::Ref => "list_to_ref(\"#Ref<0.0.0.5>\")".to_string(),
+            Term::FunExternal => "fun lists:reverse/1".to_string(),
+            Term::RecTwo => REC_TWO_EXPR.to_string(),
+            Term::RecZero => "records:create(ddlmod,empty,[],#{is_exported=>true})".to_string(),
+            Term::RecStringField => {
+                "records:create(recmod,strrec,[{ddlfb,\"xy\"}],#{is_exported=>true})".to_string()
+            }
+            Term::RecValues => format!(
+                "records:create(recmod,vals,[{{ddlfa,{REC_TWO_EXPR}}},{{ddlfb,{{ddltag,1,2}}}},\
+                 {{ddlfc,[1,2]}},{{ddlfd,#{{ddlk=>ddlv}}}}],#{{is_exported=>true}})"
+            ),
+            Term::RecInTuple => format!("{{ddltag,{REC_TWO_EXPR}}}"),
+            Term::RecInList => format!("[{REC_TWO_EXPR}]"),
+            Term::RecMapValue => format!("#{{ddlk=>{REC_TWO_EXPR}}}"),
+            Term::RecMapKey => format!("#{{{REC_TWO_EXPR}=>1}}"),
+            Term::LongList => "lists:seq(1,40)".to_string(),
+        }
+    }
+
+    /// Materializes this fixture on `ctx`'s heap.
+    fn build(self, ctx: &mut BifContext<'_>, reg: &BifRegistry) -> BeamResult<Eterm> {
+        match self {
+            Term::AtomReserved => Ok(atom(ctx, "and")),
+            Term::AtomAt => Ok(atom(ctx, "a@b")),
+            Term::AtomUpper => Ok(atom(ctx, "A")),
+            Term::AtomSpaced => Ok(atom(ctx, "a b")),
+            Term::AtomPlain => Ok(atom(ctx, "hello")),
+            Term::String => byte_list(ctx, "xy"),
+            // `"a\\b"` in Rust is the three characters `a`, `\`, `b`.
+            Term::StringBackslash => byte_list(ctx, "a\\b"),
+            Term::StringNewline => byte_list(ctx, "a\nb"),
+            Term::StringQuote => byte_list(ctx, "a\"b"),
+            Term::ListNonPrintable => {
+                let seven = ctx.int(7)?;
+                ctx.list(&[seven])
+            }
+            Term::ListEmpty => ctx.list(&[]),
+            Term::BinaryBytes => make_binary(ctx.heap(), &[1, 2, 3]),
+            Term::BinaryText => make_binary(ctx.heap(), b"xy"),
+            Term::BinaryEmpty => make_binary(ctx.heap(), &[]),
+            // `<<1:3>>` — three bits, packed into the high bits of one byte.
+            Term::Bitstring => make_bitstring(ctx.heap(), &[1 << 5], 3),
+            Term::Tuple => {
+                let reserved = atom(ctx, "and");
+                let one = ctx.int(1)?;
+                ctx.tuple(&[reserved, one])
+            }
+            Term::TupleEmpty => ctx.tuple(&[]),
+            Term::Map => {
+                let key = atom(ctx, "ddlk");
+                let value = atom(ctx, "ddlv");
+                make_flatmap(ctx.heap(), &[(key, value)])
+            }
+            Term::MapEmpty => make_flatmap(ctx.heap(), &[]),
+            Term::Float => ctx.make_float(1.5),
+            Term::FloatNegZero => ctx.make_float(-0.0),
+            // `2^64` — the smallest bignum a 64-bit `ErtsDigit` needs two limbs for.
+            Term::Bignum => make_big(ctx.heap(), false, &[0, 1]),
+            Term::Pid => {
+                let text = byte_list(ctx, "<0.1.0>")?;
+                reg.call("erlang", "list_to_pid", 1, ctx, &[text])
+            }
+            Term::Ref => {
+                let text = byte_list(ctx, "#Ref<0.0.0.5>")?;
+                reg.call("erlang", "list_to_ref", 1, ctx, &[text])
+            }
+            Term::FunExternal => {
+                let module = ctx.atom("lists")?;
+                let function = ctx.atom("reverse")?;
+                let arity = ctx.int(1)?;
+                reg.call("erlang", "make_fun", 3, ctx, &[module, function, arity])
+            }
+            Term::RecTwo => rec_two(ctx, reg),
+            Term::RecZero => record(ctx, reg, "ddlmod", "empty", &[]),
+            Term::RecStringField => {
+                let value = byte_list(ctx, "xy")?;
+                record(ctx, reg, "recmod", "strrec", &[("ddlfb", value)])
+            }
+            Term::RecValues => {
+                let nested = rec_two(ctx, reg)?;
+                let tag = atom(ctx, "ddltag");
+                let one = ctx.int(1)?;
+                let two = ctx.int(2)?;
+                let tuple = ctx.tuple(&[tag, one, two])?;
+                let list = ctx.list(&[one, two])?;
+                let key = atom(ctx, "ddlk");
+                let value = atom(ctx, "ddlv");
+                let map = make_flatmap(ctx.heap(), &[(key, value)])?;
+                record(
+                    ctx,
+                    reg,
+                    "recmod",
+                    "vals",
+                    &[
+                        ("ddlfa", nested),
+                        ("ddlfb", tuple),
+                        ("ddlfc", list),
+                        ("ddlfd", map),
+                    ],
+                )
+            }
+            Term::RecInTuple => {
+                let rec = rec_two(ctx, reg)?;
+                let tag = atom(ctx, "ddltag");
+                ctx.tuple(&[tag, rec])
+            }
+            Term::RecInList => {
+                let rec = rec_two(ctx, reg)?;
+                ctx.list(&[rec])
+            }
+            Term::RecMapValue => {
+                let rec = rec_two(ctx, reg)?;
+                let key = atom(ctx, "ddlk");
+                make_flatmap(ctx.heap(), &[(key, rec)])
+            }
+            Term::RecMapKey => {
+                let rec = rec_two(ctx, reg)?;
+                let one = ctx.int(1)?;
+                make_flatmap(ctx.heap(), &[(rec, one)])
+            }
+            Term::LongList => {
+                let mut elems = Vec::with_capacity(40);
+                for i in 1..=40 {
+                    elems.push(ctx.int(i)?);
+                }
+                ctx.list(&elems)
+            }
+        }
+    }
+}
+
+/// `records:create(recmod, r, [{ddlfa,1},{ddlfb,2}], #{is_exported => true})`.
+fn rec_two(ctx: &mut BifContext<'_>, reg: &BifRegistry) -> BeamResult<Eterm> {
+    let one = ctx.int(1)?;
+    let two = ctx.int(2)?;
+    record(ctx, reg, "recmod", "r", &[("ddlfa", one), ("ddlfb", two)])
+}
+
+// ---------------------------------------------------------------------------
+// The corpus: the pinned `%T` text of every row
+// ---------------------------------------------------------------------------
+
+/// One pinned rendering: the fixture, the name the oracle transcript uses and the
+/// exact bytes `erlang:display/1` writes (**including** the trailing `\r\n`).
+struct Row {
+    name: &'static str,
+    term: Term,
+    /// The oracle's text plus display's `\r\n` terminator.
+    expected: String,
+}
+
+/// The whole corpus, in reading order (records last).
+fn corpus() -> Vec<Row> {
+    vec![
+        // ---- atoms: the C `print_atom_name` quoting rule --------------------
+        row("atom_reserved", Term::AtomReserved, "and"),
+        row("atom_at", Term::AtomAt, "'a@b'"),
+        row("atom_upper", Term::AtomUpper, "'A'"),
+        row("atom_spaced", Term::AtomSpaced, "'a b'"),
+        row("atom_plain", Term::AtomPlain, "hello"),
+        // ---- printable and non-printable lists ------------------------------
+        row("string", Term::String, "\"xy\""),
+        // A backslash is printable and is NEVER escaped.
+        row("string_backslash", Term::StringBackslash, "\"a\\b\""),
+        row("string_newline", Term::StringNewline, "\"a\\nb\""),
+        row("string_quote", Term::StringQuote, "\"a\\\"b\""),
+        row("list_nonprintable", Term::ListNonPrintable, "[7]"),
+        row("list_empty", Term::ListEmpty, "[]"),
+        // ---- binaries and bitstrings ---------------------------------------
+        row("binary_bytes", Term::BinaryBytes, "<<1,2,3>>"),
+        row("binary_text", Term::BinaryText, "<<\"xy\">>"),
+        row("binary_empty", Term::BinaryEmpty, "<<>>"),
+        row("bitstring", Term::Bitstring, "<<1:3>>"),
+        // ---- containers ----------------------------------------------------
+        row("tuple", Term::Tuple, "{and,1}"),
+        row("tuple_empty", Term::TupleEmpty, "{}"),
+        row("map", Term::Map, "#{ddlk=>ddlv}"),
+        row("map_empty", Term::MapEmpty, "#{}"),
+        // ---- numbers -------------------------------------------------------
+        row("float", Term::Float, "1.500000e+00"),
+        row("float_negzero", Term::FloatNegZero, "-0.000000e+00"),
+        row("bignum", Term::Bignum, "18446744073709551616"),
+        // ---- identity terms ------------------------------------------------
+        row("pid", Term::Pid, "<0.1.0>"),
+        row("ref", Term::Ref, "#Ref<0.0.0.5>"),
+        row("fun_external", Term::FunExternal, "fun lists:reverse/1"),
+        // ---- native records: no spaces, stored order -----------------------
+        row("rec_two", Term::RecTwo, "#recmod:r{ddlfa=1,ddlfb=2}"),
+        row("rec_zero", Term::RecZero, "#ddlmod:empty{}"),
+        row(
+            "rec_string_field",
+            Term::RecStringField,
+            "#recmod:strrec{ddlfb=\"xy\"}",
+        ),
+        row(
+            "rec_values",
+            Term::RecValues,
+            "#recmod:vals{ddlfa=#recmod:r{ddlfa=1,ddlfb=2},ddlfb={ddltag,1,2},ddlfc=[1,2],\
+             ddlfd=#{ddlk=>ddlv}}",
+        ),
+        row(
+            "rec_in_tuple",
+            Term::RecInTuple,
+            "{ddltag,#recmod:r{ddlfa=1,ddlfb=2}}",
+        ),
+        row(
+            "rec_in_list",
+            Term::RecInList,
+            "[#recmod:r{ddlfa=1,ddlfb=2}]",
+        ),
+        row(
+            "rec_map_value",
+            Term::RecMapValue,
+            "#{ddlk=>#recmod:r{ddlfa=1,ddlfb=2}}",
+        ),
+        row(
+            "rec_map_key",
+            Term::RecMapKey,
+            "#{#recmod:r{ddlfa=1,ddlfb=2}=>1}",
+        ),
+        // ---- the unbudgeted path -------------------------------------------
+        row("long_list", Term::LongList, &long_list_text()),
+    ]
+}
+
+/// `lists:seq(1,40)` as `%T` renders it: every element, no elision (`display/1` passes
+/// the C's `INT_MAX` budget).
+fn long_list_text() -> String {
+    let elems: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+    format!("[{}]", elems.join(","))
+}
+
+/// Builds a corpus row, appending display's `\r\n` terminator to the oracle text.
+fn row(name: &'static str, term: Term, text: &str) -> Row {
+    assert!(
+        !text.contains('\r') && !text.contains('\n'),
+        "{name}: a `%T` text in this corpus must be one line (see the module docs)"
+    );
+    Row {
+        name,
+        term,
+        expected: format!("{text}\r\n"),
+    }
+}
+
+/// One `~w`/`~p` mirror row: the transcript name, the fixture, the directive (with its
+/// width and `.` precision), the `~W`/`~P` depth, the `io_lib:format/3`
+/// `{chars_limit, N}` and the oracle's text.
+type WriterRow = (
+    &'static str,
+    Term,
+    &'static str,
+    Option<i64>,
+    Option<i64>,
+    &'static str,
+);
+
+/// The `~w`/`~p` mirror rows: the same fixtures through the **other** renderer, so the
+/// two routes' difference is pinned on both sides.
+fn writer_corpus() -> Vec<WriterRow> {
+    vec![
+        ("w_rec_two", Term::RecTwo, "~w", None, None, "#recmod:r{ddlfa = 1,ddlfb = 2}"),
+        ("p_rec_two", Term::RecTwo, "~p", None, None, "#recmod:r{ddlfa = 1,ddlfb = 2}"),
+        (
+            "w_rec_values",
+            Term::RecValues,
+            "~w",
+            None,
+            None,
+            "#recmod:vals{ddlfa = #recmod:r{ddlfa = 1,ddlfb = 2},ddlfb = {ddltag,1,2},\
+             ddlfc = [1,2],ddlfd = #{ddlk => ddlv}}",
+        ),
+        ("w_map", Term::Map, "~w", None, None, "#{ddlk => ddlv}"),
+        ("w_atom_reserved", Term::AtomReserved, "~w", None, None, "'and'"),
+        ("w_float", Term::Float, "~w", None, None, "1.5"),
+        ("w_string", Term::String, "~w", None, None, "[120,121]"),
+        ("p_string", Term::String, "~p", None, None, "\"xy\""),
+        ("w_pid", Term::Pid, "~w", None, None, "<0.1.0>"),
+        ("w_ref", Term::Ref, "~w", None, None, "#Ref<0.0.0.5>"),
+        ("w_fun_external", Term::FunExternal, "~w", None, None, "fun lists:reverse/1"),
+        ("w_bitstring", Term::Bitstring, "~w", None, None, "<<1:3>>"),
+        ("w_binary_text", Term::BinaryText, "~w", None, None, "<<120,121>>"),
+        // The depth-limited writers, truncating inside the field list. `~W` passes the
+        // depth unchanged to the field values, `~P` decrements it once more; both keep
+        // the fields before the elision and end the list with `,...`.
+        (
+            "W3_rec_values",
+            Term::RecValues,
+            "~W",
+            Some(3),
+            None,
+            "#recmod:vals{ddlfa = #recmod:r{ddlfa = 1,...},ddlfb = {...},...}",
+        ),
+        (
+            "P4_rec_values",
+            Term::RecValues,
+            "~P",
+            Some(4),
+            None,
+            "#recmod:vals{ddlfa = #recmod:r{...},ddlfb = {...},...}",
+        ),
+        (
+            "W2_rec_two",
+            Term::RecTwo,
+            "~W",
+            Some(2),
+            None,
+            "#recmod:r{ddlfa = 1,...}",
+        ),
+        // A zero-field record at every depth (the empty field clause precedes the
+        // depth-1 `"..."` clause, so the braces survive).
+        ("W1_rec_zero", Term::RecZero, "~W", Some(1), None, "#ddlmod:empty{}"),
+        ("W2_rec_zero", Term::RecZero, "~W", Some(2), None, "#ddlmod:empty{}"),
+        ("W3_rec_zero", Term::RecZero, "~W", Some(3), None, "#ddlmod:empty{}"),
+        ("P1_rec_zero", Term::RecZero, "~P", Some(1), None, "#ddlmod:empty{}"),
+        ("P2_rec_zero", Term::RecZero, "~P", Some(2), None, "#ddlmod:empty{}"),
+        ("P3_rec_zero", Term::RecZero, "~P", Some(3), None, "#ddlmod:empty{}"),
+        ("W0_rec_zero", Term::RecZero, "~W", Some(0), None, "..."),
+        ("P0_rec_zero", Term::RecZero, "~P", Some(0), None, "..."),
+        // `{chars_limit, N}` on the io_lib route. A budget of 17 already truncates the
+        // field tail: `#recmod:r{ddlfa = 1,ddlfb = 2}` is 28 characters, so 17 and 15
+        // both render `#recmod:r{ddlfa = 1,...}` (measured live, not inferred).
+        (
+            "p_rec_two_cl17",
+            Term::RecTwo,
+            "~p",
+            None,
+            Some(17),
+            "#recmod:r{ddlfa = 1,...}",
+        ),
+        (
+            "p_rec_two_cl15",
+            Term::RecTwo,
+            "~p",
+            None,
+            Some(15),
+            "#recmod:r{ddlfa = 1,...}",
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// The goldens
+// ---------------------------------------------------------------------------
+
+/// Every row's `erlang:display/1` bytes, terminator included.
+#[test]
+fn display_writes_the_oracle_text_and_a_crlf() {
+    for row in corpus() {
+        let got = display_bytes(row.term)
+            .unwrap_or_else(|e| panic!("{}: display failed: {e:?}", row.name));
+        assert_eq!(
+            got, row.expected,
+            "{} ({}): does not match the oracle's `%T` bytes",
+            row.name,
+            row.term.erl_expr()
+        );
+        assert!(
+            got.ends_with("\r\n"),
+            "{}: display must terminate with CRLF, got {got:?}",
+            row.name
+        );
+    }
+}
+
+/// `%T` is **not** `io_lib`'s `~w`/`~p`: no spaces around `=`/`=>`, `%e` floats and the
+/// C atom-quoting rule — while the gated writers keep the `io_lib` spelling. Both
+/// sides' texts are oracle-measured (the `display` ones above, the `~w`/`~p` ones in
+/// `writer_corpus`, cross-checked live).
+#[test]
+fn display_and_the_gated_writers_differ_exactly_where_the_c_renderers_do() {
+    // A record: `%T` has `key=value`, `~w`/`~p` have `key = value`.
+    assert_eq!(
+        display_bytes(Term::RecTwo).expect("renders"),
+        "#recmod:r{ddlfa=1,ddlfb=2}\r\n"
+    );
+    // A map: `#{k=>v}` vs `#{k => v}`.
+    assert_eq!(
+        display_bytes(Term::Map).expect("renders"),
+        "#{ddlk=>ddlv}\r\n"
+    );
+    // The C quoting rule does not quote a reserved word; `io_lib` does.
+    assert_eq!(
+        display_bytes(Term::AtomReserved).expect("renders"),
+        "and\r\n"
+    );
+    // `%T` calls `printf("%e", …)`; `io_lib` writes the short form.
+    assert_eq!(
+        display_bytes(Term::Float).expect("renders"),
+        "1.500000e+00\r\n"
+    );
+    // A printable list renders as a string under `%T` even though `~w` does not apply
+    // the printable rule at all.
+    assert_eq!(display_bytes(Term::String).expect("renders"), "\"xy\"\r\n");
+
+    // The other side of every pair, from the oracle-measured writer corpus.
+    for (name, fixture, fmt, depth, chars_limit, expected) in writer_corpus() {
+        let got = match chars_limit {
+            Some(limit) => render_lib(fmt, depth, Some(limit), fixture),
+            None => render_io(fmt, depth, fixture),
+        }
+        .unwrap_or_else(|e| panic!("{name}: {fmt} failed: {e:?}"));
+        assert_eq!(got, expected, "{name}: {fmt} does not match the oracle");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The field-order property
+// ---------------------------------------------------------------------------
+
+/// A multi-field record prints its fields in the definition's **stored** order —
+/// ascending **atom index** — not the declaration order.
+///
+/// The expected order is computed from the term's own atoms, so this pins the property
+/// itself rather than a per-VM golden: the corpus rows above can only cross-check
+/// *bytes* because their field atoms are fresh and therefore interned in declaration
+/// order on both VMs.
+#[test]
+fn a_multi_field_record_prints_its_stored_order() {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    // `ddlfc` is seeded LAST, so its index is the largest: declaring the fields
+    // `ddlfc, ddlfa, ddlfb` must still print `ddlfa, ddlfb, ddlfc`.
+    let names = [
+        "false",
+        "true",
+        "is_exported",
+        "ddlfa",
+        "ddlfb",
+        "ddlfc",
+        "recmod",
+        "r",
+    ];
+    let mut atoms = AtomTable::new();
+    atoms.seed(names.iter().copied());
+    let declared = ["ddlfc", "ddlfa", "ddlfb"];
+    let mut sink = BytesSink::new();
+    let rendered = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let mut fields = Vec::with_capacity(declared.len());
+        for (i, key) in declared.iter().enumerate() {
+            let value = ctx.int(i as i64 + 1).expect("fits");
+            fields.push((*key, value));
+        }
+        let rec = record(&mut ctx, &reg, "recmod", "r", &fields).expect("creates");
+        reg.call("erlang", "display", 1, &mut ctx, &[rec])
+            .expect("renders");
+        String::from_utf8(sink.contents().to_vec()).expect("UTF-8")
+    };
+
+    let mut by_index: Vec<(u32, &str)> = declared
+        .iter()
+        .map(|key| (atoms.lookup(key).expect("seeded").raw(), *key))
+        .collect();
+    by_index.sort_unstable();
+    assert_eq!(
+        by_index.iter().map(|(_, key)| *key).collect::<Vec<&str>>(),
+        vec!["ddlfa", "ddlfb", "ddlfc"],
+        "the fixture's atom indices must run against its declaration order"
+    );
+    let expected = format!(
+        "#recmod:r{{{}}}\r\n",
+        by_index
+            .iter()
+            .map(|(_, key)| {
+                let position = declared
+                    .iter()
+                    .position(|candidate| candidate == key)
+                    .expect("declared")
+                    + 1;
+                format!("{key}={position}")
+            })
+            .collect::<Vec<String>>()
+            .join(",")
+    );
+    assert_eq!(rendered, expected);
+}
+
+// ---------------------------------------------------------------------------
+// The well-formedness negative
+// ---------------------------------------------------------------------------
+
+/// An **unreadable** record — one whose module atom is not in the rendering context's
+/// atom table — is the typed `badarg` on **every** route, `display` included. A
+/// renderer that printed a placeholder would be fabricating.
+///
+/// The term is built by `make_record` on a table that holds its names and rendered on a
+/// table that does not, so the record's structure is intact and the malformed-ness is
+/// exactly the unreadable-atom condition `%T`'s `print_atom_name` arm refuses.
+#[test]
+fn an_unreadable_record_is_the_typed_badarg_on_every_route() {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    // The build-side table: everything the record needs.
+    let mut wide = AtomTable::new();
+    wide.seed(["false", "true", "is_exported", "ddlfa"].iter().copied());
+    // The record's module/name atoms are interned **past** the render table's last
+    // index, so the renderer cannot name them: their indices are outside the table a
+    // term of the runtime can ever carry, which is exactly the unreadable shape.
+    let fillers: Vec<String> = (0..32).map(|i| format!("ddlfiller{i}")).collect();
+    wide.seed(fillers.iter().map(String::as_str));
+    wide.seed(["ghost_mod", "ghost_rec"].iter().copied());
+    let module = wide.lookup("ghost_mod").expect("seeded");
+    let name = wide.lookup("ghost_rec").expect("seeded");
+    let key = wide.lookup("ddlfa").expect("seeded");
+    let rec = make_record(
+        &mut heap,
+        &wide,
+        module,
+        name,
+        true,
+        &[(make_atom(key), make_small(1))],
+    )
+    .expect("the record is well formed");
+    // The render-side table: the same terms, minus the record's module/name atoms.
+    let atoms = seeded_atoms();
+    assert!(
+        atoms.lookup("ghost_mod").is_none() && atoms.lookup("ghost_rec").is_none(),
+        "the fixture's atoms must not leak into the render table"
+    );
+    assert!(
+        module.raw() as usize >= atoms.len() && name.raw() as usize >= atoms.len(),
+        "the record's module/name indices must lie outside the render table"
+    );
+
+    // `display` — the `%T` route.
+    {
+        let mut sink = BytesSink::new();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        expect_badarg(
+            reg.call("erlang", "display", 1, &mut ctx, &[rec]).err(),
+            "erlang:display/1",
+        );
+        assert!(
+            sink.contents().is_empty(),
+            "display must write nothing when the term is unreadable"
+        );
+    }
+
+    // `io:format/2` at every flat/pretty directive, with and without a depth.
+    for (fmt, depth) in [
+        ("~w", None),
+        ("~p", None),
+        ("~W", Some(3)),
+        ("~P", Some(3)),
+        ("~W", Some(1)),
+        ("~P", Some(1)),
+    ] {
+        let mut sink = BytesSink::new();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let format = byte_list(&mut ctx, fmt).expect("fits");
+        let mut args = vec![rec];
+        if let Some(depth) = depth {
+            args.push(ctx.int(depth).expect("fits"));
+        }
+        let args = ctx.list(&args).expect("fits");
+        expect_badarg(
+            reg.call("io", "format", 2, &mut ctx, &[format, args]).err(),
+            &format!("io:format/2 {fmt} depth {depth:?}"),
+        );
+        assert!(
+            sink.contents().is_empty(),
+            "io:format must write nothing when the term is unreadable"
+        );
+        expect_badarg(
+            render_lib_err(fmt, depth, None, rec, &atoms),
+            &format!("io_lib:format/2 {fmt} depth {depth:?}"),
+        );
+        expect_badarg(
+            render_lib_err(fmt, depth, Some(20), rec, &atoms),
+            &format!("io_lib:format/3 {fmt} depth {depth:?}"),
+        );
+    }
+}
+
+/// `io_lib:format` of a pre-built `rec` (which the fixture corpus cannot express,
+/// because it is built on a different atom table) — `Err` is the answer under test.
+fn render_lib_err(
+    fmt: &str,
+    depth: Option<i64>,
+    chars_limit: Option<i64>,
+    rec: Eterm,
+    atoms: &AtomTable,
+) -> Option<BeamError> {
+    let reg = default_registry();
+    let mut heap = Heap::new(HEAP_WORDS).expect("test heap");
+    let mut ctx = BifContext::new(&mut heap, atoms, ProcessId::new(1, 0));
+    let format = byte_list(&mut ctx, fmt).expect("fits");
+    let mut args = vec![rec];
+    if let Some(depth) = depth {
+        args.push(ctx.int(depth).expect("fits"));
+    }
+    let args = ctx.list(&args).expect("fits");
+    let result = match chars_limit {
+        None => reg.call("io_lib", "format", 2, &mut ctx, &[format, args]),
+        Some(limit) => {
+            let tag = atom(&ctx, "chars_limit");
+            let limit = ctx.int(limit).expect("fits");
+            let option = ctx.tuple(&[tag, limit]).expect("fits");
+            let options = ctx.list(&[option]).expect("fits");
+            reg.call("io_lib", "format", 3, &mut ctx, &[format, args, options])
+        }
+    };
+    result.err()
+}
+
+/// Asserts `err` is `error:badarg` — the class the oracle answers, never a fabricated
+/// rendering and never the typed `unsupported_bif` capability gap.
+fn expect_badarg(err: Option<BeamError>, route: &str) {
+    match err {
+        None => panic!("{route}: an unreadable record must be error:badarg, but it rendered"),
+        Some(BeamError::BadArg) => {}
+        Some(other) => panic!("{route}: expected error:badarg, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live-oracle cross-check
+// ---------------------------------------------------------------------------
+
+/// Whether `path` is an executable file (`$ERTS_ORACLE` may point at one).
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// `name` in the first `$PATH` directory that holds an executable of that name.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// The system `erl` — `$ERTS_ORACLE` when it names an executable, else `$PATH`.
+fn resolve_oracle() -> Option<PathBuf> {
+    match std::env::var_os("ERTS_ORACLE") {
+        Some(value) => {
+            let program = PathBuf::from(&value);
+            if is_executable(&program) {
+                Some(program)
+            } else {
+                eprintln!(
+                    "[beam_bifs print_records_c_printf] $ERTS_ORACLE='{}' is not an existing \
+                     executable — treating it as no oracle.",
+                    program.display()
+                );
+                None
+            }
+        }
+        None => on_path("erl"),
+    }
+}
+
+/// Runs one `erl -noshell -eval` body and returns its stdout bytes.
+fn run_oracle(erl: &Path, body: &str) -> Result<String, String> {
+    let output = Command::new(erl)
+        .args(["-noshell", "-eval", body])
+        .output()
+        .map_err(|e| format!("could not start {}: {e}", erl.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the oracle `erl` failed ({}); stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("the oracle emitted non-UTF-8 bytes: {e}"))
+}
+
+/// The `display` transcript: for each row, `name<TAB>` then `erlang:display(Term)`,
+/// whose own bytes are the answer. The stdout split is display's `\r\n` terminator, so
+/// the returned text keeps it.
+fn display_transcript(erl: &Path, rows: &[Row]) -> Result<Vec<(String, String)>, String> {
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&format!(
+            "io:format(\"~s\\t\", [\"{}\"]), erlang:display({}), ",
+            row.name,
+            row.term.erl_expr()
+        ));
+    }
+    body.push_str("halt()");
+    let stdout = run_oracle(erl, &body)?;
+    let mut transcript = Vec::with_capacity(rows.len());
+    let mut rest = stdout.as_str();
+    while !rest.is_empty() {
+        let Some((line, tail)) = rest.split_once("\r\n") else {
+            return Err(format!("unterminated oracle line: {rest:?}"));
+        };
+        let Some((name, text)) = line.split_once('\t') else {
+            return Err(format!("unparsable oracle line: {line:?}"));
+        };
+        transcript.push((name.to_string(), format!("{text}\r\n")));
+        rest = tail;
+    }
+    Ok(transcript)
+}
+
+/// The `~w`/`~p` mirror transcript: each row as `name<TAB>hex`, the hex being
+/// `iolist_to_binary(lists:flatten(io_lib:format(Fmt, Args[, Opts])))`.
+fn writer_transcript(erl: &Path, rows: &[WriterRow]) -> Result<Vec<(String, String)>, String> {
+    let mut body = String::new();
+    for (name, fixture, fmt, depth, chars_limit, _) in rows {
+        let args = match depth {
+            Some(depth) => format!("[{}, {}]", fixture.erl_expr(), depth),
+            None => format!("[{}]", fixture.erl_expr()),
+        };
+        let call = match chars_limit {
+            Some(limit) => format!(
+                "io_lib:format(\"{}\", {}, [{{chars_limit,{}}}])",
+                fmt, args, limit
+            ),
+            None => format!("io_lib:format(\"{}\", {})", fmt, args),
+        };
+        body.push_str(&format!(
+            "io:format(\"~s\\t~s~n\", [\"{}\", \
+             binary:encode_hex(iolist_to_binary(lists:flatten({})))]), ",
+            name, call
+        ));
+    }
+    body.push_str("halt()");
+    let stdout = run_oracle(erl, &body)?;
+    let mut transcript = Vec::with_capacity(rows.len());
+    for line in stdout.lines() {
+        let Some((name, hex)) = line.split_once('\t') else {
+            return Err(format!("unparsable oracle line: {line:?}"));
+        };
+        let bytes = hex_decode(hex).ok_or_else(|| format!("unparsable oracle hex: {hex:?}"))?;
+        let text =
+            String::from_utf8(bytes).map_err(|e| format!("the oracle emitted non-UTF-8: {e}"))?;
+        transcript.push((name.to_string(), text));
+    }
+    Ok(transcript)
+}
+
+/// Decodes a lowercase hex string (`binary:encode_hex/1`'s output).
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// **The live-oracle cross-check.** Every corpus row is rendered by the system oracle
+/// (OTP 29.1.1 / erts-17.1) and by this crate, and both are compared with the pinned
+/// golden — so the test never asserts a value against itself.
+///
+/// The multi-field property is cross-checked here too: the oracle's transcript shows
+/// its own stored order, and it must equal ours (both VMs intern the fresh field atoms
+/// in declaration order, so both stored orders are the declaration order).
+///
+/// With no usable `erl` it prints a loud banner and returns, which is **not** a pass
+/// (the crate's convention, `tests/zlib_stream.rs` / `tests/print_records.rs`).
+#[test]
+fn displayed_terms_match_the_live_oracle() {
+    let rows = corpus();
+    let writers = writer_corpus();
+    let Some(erl) = resolve_oracle() else {
+        eprintln!(
+            "\n[beam_bifs print_records_c_printf] SKIPPED: no `erl` oracle on PATH (and no \
+             usable $ERTS_ORACLE) — the live cross-check did NOT run. This is not a pass; the \
+             committed goldens in this file are the no-oracle evidence.\n"
+        );
+        return;
+    };
+    eprintln!(
+        "[beam_bifs print_records_c_printf] cross-checking {} `%T` renderings and {} `~w`/`~p` \
+         mirror rows against {}",
+        rows.len(),
+        writers.len(),
+        erl.display()
+    );
+
+    // ---- the `%T` corpus ------------------------------------------------
+    let transcript = match display_transcript(&erl, &rows) {
+        Ok(transcript) => transcript,
+        Err(message) => panic!("[beam_bifs print_records_c_printf] oracle failure: {message}"),
+    };
+    assert_eq!(
+        transcript.len(),
+        rows.len(),
+        "the oracle printed {} rows for {} corpus rows",
+        transcript.len(),
+        rows.len()
+    );
+    let mut divergences = Vec::new();
+    let mut compared = 0usize;
+    for (row, (name, oracle)) in rows.iter().zip(transcript.iter()) {
+        if name != row.name {
+            divergences.push(format!(
+                "{}: the transcript is out of order (got {name:?})",
+                row.name
+            ));
+            continue;
+        }
+        let ours = match display_bytes(row.term) {
+            Ok(text) => text,
+            Err(e) => {
+                divergences.push(format!("{}: our rendering failed: {e:?}", row.name));
+                continue;
+            }
+        };
+        compared += 1;
+        if ours != *oracle {
+            divergences.push(format!(
+                "{} ({}):\n  oracle: {:?}\n  ours:   {:?}",
+                row.name,
+                row.term.erl_expr(),
+                oracle,
+                ours
+            ));
+        } else if ours != row.expected {
+            divergences.push(format!(
+                "{}: the oracle agrees with ours but the pinned golden is stale:\n  golden: {:?}\n  \
+                 both:   {:?}",
+                row.name, row.expected, ours
+            ));
+        }
+    }
+
+    // ---- the `~w`/`~p` mirror corpus ------------------------------------
+    let transcript = match writer_transcript(&erl, &writers) {
+        Ok(transcript) => transcript,
+        Err(message) => panic!("[beam_bifs print_records_c_printf] oracle failure: {message}"),
+    };
+    assert_eq!(
+        transcript.len(),
+        writers.len(),
+        "the oracle printed {} writer rows for {} corpus rows",
+        transcript.len(),
+        writers.len()
+    );
+    let mut writer_compared = 0usize;
+    for ((name, fixture, fmt, depth, chars_limit, expected), (oracle_name, oracle)) in
+        writers.iter().zip(transcript.iter())
+    {
+        if oracle_name != name {
+            divergences.push(format!(
+                "{name}: the writer transcript is out of order (got {oracle_name:?})"
+            ));
+            continue;
+        }
+        let rendered = match chars_limit {
+            Some(limit) => render_lib(fmt, *depth, Some(*limit), *fixture),
+            None => render_io(fmt, *depth, *fixture),
+        };
+        let ours = match rendered {
+            Ok(text) => text,
+            Err(e) => {
+                divergences.push(format!("{name}: our rendering failed: {e:?}"));
+                continue;
+            }
+        };
+        writer_compared += 1;
+        if ours != *oracle {
+            divergences.push(format!(
+                "{name} ({fmt} depth {depth:?} chars_limit {chars_limit:?}):\n  oracle: {:?}\n  \
+                 ours:   {:?}",
+                oracle, ours
+            ));
+        } else if ours != *expected {
+            divergences.push(format!(
+                "{name}: the oracle agrees with ours but the pinned golden is stale:\n  golden: \
+                 {:?}\n  both:   {:?}",
+                expected, ours
+            ));
+        }
+    }
+
+    assert!(
+        divergences.is_empty(),
+        "[beam_bifs print_records_c_printf] {} rows disagree with the live oracle:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    assert_eq!(compared, rows.len(), "some `%T` rows were not compared");
+    assert_eq!(
+        writer_compared,
+        writers.len(),
+        "some `~w`/`~p` rows were not compared"
+    );
+    eprintln!(
+        "[beam_bifs print_records_c_printf] {compared} `%T` rows and {writer_compared} writer rows \
+         agree with the live oracle"
+    );
+}
