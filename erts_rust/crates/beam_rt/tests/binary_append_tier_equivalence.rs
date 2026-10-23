@@ -19,7 +19,7 @@
 // %CopyrightEnd%
 
 //! **Tier equivalence on a writable-accumulator binary append** — the executable's own
-//! reproducer for a known interpreter-tier divergence.
+//! regression pin for the in-place payload republish.
 //!
 //! # The program
 //!
@@ -53,27 +53,29 @@
 //! build does **not** serve is not part of the comparison and its (typed, exit-3) refusal is
 //! never treated as a failure — that refusal has its own rows in `tests/tier_selection.rs`.
 //!
-//! # Why the test is `#[ignore]`d
+//! # Why the accumulator can outlive a collection between two appends
 //!
-//! The **interpreter** tier dies part-way through this program at `N ≥ 16` (measured: `N ≤ 15`
-//! completes with the right answer, `16`, `24` and the `32` this test drives do not); the default
-//! baseline tier completes at every `N`. The accumulator's `[BinRef][ErlSubBits]` pair is **two
-//! separate heap blocks** that a collection copies independently (`../beam_gc/src/copy.rs`,
-//! pinned by `../beam_gc/tests/stress_cross_generation.rs`), but `republish_over`
-//! (`../beam_engine/src/families/bitstrings/raw.rs`) rewrites the pair as one contiguous
-//! 8-word block through `beam_term::refc::write_refc_binary`. After a collection has separated
-//! the two blocks that is wrong twice over: the live `ErlSubBits.base_flags` word (the payload
-//! pointer) is never rewritten — the old payload address stays behind — and the 8-word write
-//! clobbers the block that now follows the `BinRef`. A debug build therefore panics with
-//! `a republish keeps the pair's address and its ErlSubBits root` (the `debug_assert_eq!` in
-//! that function), and a release build raises the typed, wrong
-//! `unsupported: opcode: bitstring: subject is not a readable binary`. The baseline tier never
-//! crosses the per-instruction accounting hook, so it does not reach that state.
+//! The accumulator is a `[BinRef][ErlSubBits]` pair, and the pair is **two separate heap
+//! blocks** that a collection copies independently (`../beam_gc/src/copy.rs`, pinned by
+//! `../beam_gc/tests/stress_cross_generation.rs`), so after a collection the two blocks need not
+//! be adjacent. This program really does reach that state on the interpreter tier: the tier
+//! charges the reduction budget per interpreted *instruction*, so the build pre-empts
+//! mid-comprehension (the runner's park arm → `Runtime::scheduler_pass` →
+//! `Machine::resume_outcome_with_tier` on the tier the process remembers) and a collection runs at
+//! a heap-admission point between two `private_append`s. The in-place growth path then takes the
+//! `Moved` arm of `InPlace::grow` and republishes the pair at the payload's new address, writing
+//! only the **two** words that name it — the `BinRef`'s `val` and the `ErlSubBits`'s
+//! `base_flags` (its flag bits preserved) — at each block's own live address, with adjacency
+//! assumed nowhere (`../beam_engine/src/families/bitstrings/raw.rs::republish_over`).
 //!
-//! Un-ignore the test once `republish_over` writes the **two pointer words individually** (or
-//! `beam_term` exposes a pair-republish API) instead of assuming the pair is one contiguous
-//! block.
-
+//! The engine-side pins for that rule are
+//! `../beam_engine/src/families/bitstrings/raw_tests.rs`'s
+//! `a_republish_writes_only_the_two_payload_words_and_leaves_a_split_pairs_neighbour_intact` (a
+//! canary block planted directly behind the `BinRef`, byte-identical afterwards in a **debug and
+//! a release** build) and `a_split_pairs_payload_move_keeps_the_next_append_in_place` (the *next*
+//! append still lands in place, so the amortisation the shape measures survives the move). This
+//! file is the same invariant at the CLI boundary, where the tiers can be compared to each other
+//! rather than only to a constant.
 // The one helper this binary uses is the shared bounded child runner; the rest of the shared
 // harness folds away and would otherwise warn on the entry points it does not call.
 #[allow(dead_code)]
@@ -315,13 +317,10 @@ fn dump_stderr(outcomes: &[(&str, Run)]) {
 /// compared to the reference interpreter's — because a shared constant alone cannot catch two
 /// tiers agreeing on a wrong value.
 ///
-/// Today the interpreter leg fails at this `N` (see the module docs: `republish_over`'s
-/// adjacency assumption), which is exactly why this test is `#[ignore]`d.
+/// The interpreter is the reference, and it is the interesting leg: it pre-empts and collects
+/// between two appends, so its run is what exercises the pair republish. Every other served tier
+/// is compared to its raw stdout as well as to the fixed answer.
 #[test]
-#[ignore = "blocked on the engine-side `republish_over` adjacency assumption \
-            (beam_engine/src/families/bitstrings/raw.rs; see M1_GAPS.md): the interpreter tier \
-            dies on this program, so un-ignore once `republish_over` writes the pair's two \
-            pointer words individually (or `beam_term` exposes a pair-republish API)"]
 fn every_served_tier_prints_the_same_writable_accumulator_answer() {
     let Some(erlc) = resolve_erlc() else {
         support::skip_loudly(SUITE, "no `erlc` on $PATH");
