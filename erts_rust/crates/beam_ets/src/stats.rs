@@ -37,6 +37,11 @@
 //! from the oracle's figures. See [`TableStats`] for the per-element contract and
 //! the crate `CONTEXT.md` for the full positional table.
 //!
+//! The *arithmetic* on those metrics is reproduced exactly: ERTS computes the three
+//! floats in `float` (`f32`) fields (`erl_db_hash.h:121-129`), and
+//! [`BucketChains::hash_stats`] rounds each result through `f32` the same way, so a
+//! given occupancy histogram yields the oracle's own digits.
+//!
 //! Everything here is heap-free: [`TableStats`] is a plain snapshot of `usize`/
 //! `f64` values, and rendering it as terms is the BIF layer's job
 //! (`beam_bifs::ets`).
@@ -51,6 +56,15 @@
 /// [`avg_chain_len`](Self::avg_chain_len) and the two deviations therefore describe
 /// **this** interior's spread, which is the quantity ERTS's own tuple reports for
 /// its bucket array — the numbers differ, the meaning is the same.
+///
+/// The three fields are `f64` because that is the Rust representation of a term
+/// float, but each **value** is a `float` in the C: `DbHashStats` types all three
+/// as `float` (`../../erts/emulator/beam/erl_db_hash.h:121-129`) and
+/// `db_calc_stats_hash` stores each result back into that `float` field before
+/// `db_get_info` widens it to a double for the tuple
+/// (`../../erts/emulator/beam/erl_db.c:5594-5607`). [`BucketChains::hash_stats`]
+/// reproduces that rounding exactly, so the arithmetic — not just the formulas —
+/// agrees with the oracle.
 ///
 /// [`kept_items`](Self::kept_items) and [`nlocks`](Self::nlocks) are the two
 /// elements that **agree with the oracle by value** (see their own docs).
@@ -219,16 +233,45 @@ impl BucketChains {
     /// oracle's derived formulas (`db_calc_stats_hash`,
     /// `../../erts/emulator/beam/erl_db_hash.c:4072-4114`).
     ///
-    /// The arithmetic is this crate's own: the C computes in `float` (`f32`) over
-    /// `UWord` sums, here it is `f64` over `usize` sums, which is strictly more
-    /// precise. Both deviations are a square root of a non-negative quantity; the
-    /// radicands are clamped at `0.0` so floating-point rounding can never produce
-    /// a `NaN` (the C's `sqrt` of a tiny negative would).
+    /// # The precision model is the C's
+    ///
+    /// `DbHashStats` types `avg_chain_len`, `std_dev_chain_len` and
+    /// `std_dev_expected` as **`float`** (`../../erts/emulator/beam/erl_db_hash.h:121-129`),
+    /// and `db_calc_stats_hash` assigns each of the three results back into that
+    /// `float` field:
+    ///
+    /// ```text
+    /// stats->avg_chain_len    = (float)sum / NACTIVE(tb);
+    /// stats->std_dev_chain_len = sqrt((sq_sum - stats->avg_chain_len*sum) / NACTIVE(tb));
+    /// stats->std_dev_expected  = sqrt(stats->avg_chain_len * (1 - 1.0/NACTIVE(tb)));
+    /// ```
+    ///
+    /// so every one of the three observables is a `float`, computed from the
+    /// *already rounded* `avg`. `db_get_info` then widens each to a double for the
+    /// tuple (`../../erts/emulator/beam/erl_db.c:5594-5607`).
+    ///
+    /// This method reproduces that: the average is rounded through `f32` first, the
+    /// two deviations are computed in `f64` from that rounded average and each
+    /// result is rounded through `f32` again (`x as f32 as f64`). The double-only
+    /// arithmetic would be *more* precise and would therefore print different
+    /// digits — for the five-object `set` it gives `0.1383827311243621` /
+    /// `0.13948102399497753` where the oracle prints
+    /// `0.13838273286819458` / `0.13948102295398712`, the two `f32` roundings.
+    ///
+    /// Both deviations are a square root of a non-negative quantity; the radicands
+    /// are clamped at `0.0` so floating-point rounding can never produce a `NaN`
+    /// (the C's `sqrt` of a tiny negative would).
     ///
     /// `kept_items` is the caller's fixed-table retention count
     /// ([`Table::deferred_objects`](crate::Table::deferred_objects)) and `nlocks`
-    /// the modelled lock count of the table's effective write-concurrency mode.
+    /// the modelled lock count of the table's effective write-concurrency mode
+    /// ([`WriteConcurrency::lock_count`](crate::WriteConcurrency::lock_count)).
     pub(crate) fn hash_stats(&self, kept_items: usize, nlocks: u32) -> HashStats {
+        /// Round a derived figure the way the C's `float` field does.
+        fn as_c_float(value: f64) -> f64 {
+            value as f32 as f64
+        }
+
         let buckets = self.buckets;
         let (avg, std_dev, std_dev_expected) = if buckets == 0 {
             // No bucket space at all: every figure is `0.0` (there is nothing to
@@ -237,12 +280,20 @@ impl BucketChains {
             (0.0, 0.0, 0.0)
         } else {
             let n = buckets as f64;
-            let avg = self.sum as f64 / n;
+            // `sum(chain_len)` — the number of objects the bucket space holds.
+            let objects = self.objects() as f64;
+            // `avg_chain_len` is a `float` field, so the average is rounded first
+            // and the deviations below are derived from that rounded value.
+            let avg = as_c_float(objects / n);
             // `sum(len^2) - avg * sum(len)` distributed over the buckets.
-            let real = (self.sq_sum as f64 - avg * (self.sum as f64)) / n;
+            let real = (self.sq_sum as f64 - avg * objects) / n;
             // A uniform hash's binomial deviation for this load.
             let expected = avg * (1.0 - 1.0 / n);
-            (avg, real.max(0.0).sqrt(), expected.max(0.0).sqrt())
+            (
+                avg,
+                as_c_float(real.max(0.0).sqrt()),
+                as_c_float(expected.max(0.0).sqrt()),
+            )
         };
         HashStats {
             active_buckets: buckets,
@@ -275,9 +326,14 @@ mod tests {
     }
 
     /// The oracle's own measured figures for a 5-object `set` — 5 objects spread
-    /// one per bucket over 256 buckets — so this pins the *formulas* against
-    /// `db_calc_stats_hash`'s output (the values ERTS printed:
-    /// `{256,0.01953125,0.13838273286819458,0.13948102295398712,0,1,0,1}`).
+    /// one per bucket over 256 buckets — so this pins the *formulas* **and the
+    /// precision model** against `db_calc_stats_hash`'s output: the values ERTS
+    /// printed are `{256,0.01953125,0.13838273286819458,0.13948102295398712,0,1,0,1}`.
+    ///
+    /// The two deviations are asserted **exactly**: they are the `f32` roundings of
+    /// `0.1383827311243621` / `0.13948102399497753` (the double-only results), and
+    /// reproducing the oracle's digits is precisely what
+    /// [`BucketChains::hash_stats`]'s `float` model is for.
     #[test]
     fn the_hash_formulas_reproduce_the_oracles_figures() {
         let mut chains = BucketChains::new();
@@ -289,16 +345,36 @@ mod tests {
         assert_eq!(stats.avg_chain_len, 0.01953125);
         assert_eq!(stats.min_chain_len, 0);
         assert_eq!(stats.max_chain_len, 1);
-        // f64 vs the C's f32: the C prints 0.13838273286819458 / 0.13948102295398712.
-        assert!((stats.std_dev_chain_len - 0.138_382_732_868_194_58).abs() < 1.0e-12);
-        assert!((stats.std_dev_expected - 0.139_481_022_953_987_12).abs() < 1.0e-12);
+        assert_eq!(stats.std_dev_chain_len, 0.138_382_732_868_194_58);
+        assert_eq!(stats.std_dev_expected, 0.139_481_022_953_987_12);
+    }
+
+    /// The C's `float` model, spelled out: the double-only arithmetic would print
+    /// different digits, so the two `f32` roundings are load-bearing.
+    #[test]
+    fn the_float_rounding_is_what_matches_the_oracle() {
+        // The same 5-in-256 histogram, computed without the `f32` roundings.
+        let n = 256.0f64;
+        let sum = 5.0f64;
+        let sq_sum = 5.0f64;
+        let avg = sum / n;
+        let real = (sq_sum - avg * sum) / n;
+        let expected = avg * (1.0 - 1.0 / n);
+        assert_eq!(real.sqrt(), 0.138_382_731_124_362_1);
+        assert_eq!(expected.sqrt(), 0.139_481_023_994_977_53);
+        // ... and each is a different f64 from the oracle's printed figure, which is
+        // the `f32` rounding of it.
+        assert_ne!(real.sqrt(), 0.138_382_732_868_194_58);
+        assert_eq!(real.sqrt() as f32 as f64, 0.138_382_732_868_194_58);
+        assert_eq!(expected.sqrt() as f32 as f64, 0.139_481_022_953_987_12);
     }
 
     /// A uniformly loaded table: one object per bucket gives an average of exactly
     /// `1.0`, a real deviation of `0.0` and the binomial expectation
-    /// `sqrt(1 - 1/buckets)` (the oracle's 10000-object `set` prints
-    /// `{10000,1.0,1.0431681871414185,0.9999499917030334,0,7,0,1}` — a max of 7 from
-    /// the hash's own collisions).
+    /// `sqrt(1 - 1/buckets)` rounded through the C's `float` field (the oracle's
+    /// 10000-object `set` prints `{10000,1.0,1.0431681871414185,0.9999499917030334,0,7,0,1}`
+    /// — a max of 7 from the hash's own collisions, and the `f32`-rounded
+    /// expectation `0.9999499917030334`).
     #[test]
     fn a_uniform_load_has_unit_average_and_zero_real_deviation() {
         let mut chains = BucketChains::new();
@@ -308,8 +384,10 @@ mod tests {
         assert_eq!(stats.std_dev_chain_len, 0.0);
         assert_eq!(stats.min_chain_len, 1);
         assert_eq!(stats.max_chain_len, 1);
-        let expected = (1.0 - 1.0 / 10_000f64).sqrt();
-        assert!((stats.std_dev_expected - expected).abs() < 1.0e-15);
+        let expected = ((1.0 - 1.0 / 10_000f64).sqrt()) as f32 as f64;
+        assert_eq!(stats.std_dev_expected, expected);
+        // The oracle's own printed figure for its 10 000-object table.
+        assert_eq!(stats.std_dev_expected, 0.999_949_991_703_033_4);
     }
 
     /// A skewed distribution: the real deviation must exceed the uniform

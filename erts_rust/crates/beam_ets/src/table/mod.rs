@@ -44,6 +44,7 @@ use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
 use crate::kind::{can_read, can_write, Access, OrderedInterior, SetInterior, TableKind, TableOptions};
 use crate::select::SelectPredicate;
+use crate::stats::TableStats;
 use crate::store::TermStore;
 
 mod access;
@@ -520,6 +521,65 @@ impl Table {
             write_concurrency: self.opts.write_concurrency(),
             read_concurrency: self.opts.read_concurrency(),
             decentralized_counters: self.opts.decentralized_counters(),
+        }
+    }
+
+    /// `ets:info(Tab, stats)` — the table interior's own shape/occupancy figures.
+    ///
+    /// The oracle's `db_get_info` `stats` arm
+    /// (`../../erts/emulator/beam/erl_db.c:5585-5629`) dispatches on the table's
+    /// *type*, not on its contents:
+    ///
+    /// | kind | answer |
+    /// |---|---|
+    /// | `set`/`bag`/`duplicate_bag` (a hash table) | [`TableStats::Hash`] — the eight-element `{Nactive, AvgChainLen, StdDevChainLen, StdDevExpected, MinChainLen, MaxChainLen, KeptItems, NLocks}` |
+    /// | `ordered_set` **with** an effective `{write_concurrency, …}` (a catree) | [`TableStats::Tree`] — `{RouteNodes, BaseNodes, MaxDepth}` |
+    /// | any other `ordered_set` | [`TableStats::Absent`] — the atom `false` (the C's `else ret = am_false`) |
+    ///
+    /// Measured on the oracle: a plain `ordered_set` answers `false` at 0, 5, 1000
+    /// and 100 000 objects, while a fine-locked one answers `{0,1,0}` at every size.
+    /// A `private` table's `{write_concurrency, true}` is normalized away
+    /// ([`TableOptions::write_concurrency`]), so it is *not* a catree — the oracle
+    /// answers `false` there too.
+    ///
+    /// # Cost
+    ///
+    /// **O(n)** on purpose: the occupancy histogram walks the whole index (every
+    /// bucket, every CHAMP slot, every tree node). That is why it is a separate entry
+    /// point and deliberately **not** folded into [`info`](Table::info) — the 15-field
+    /// snapshot `ets:info/1` reports must stay O(1).
+    ///
+    /// The two elements that agree with the oracle **by value** are
+    /// [`kept_items`](crate::HashStats::kept_items) (this table's
+    /// [`deferred_objects`](Table::deferred_objects)) and
+    /// [`nlocks`](crate::HashStats::nlocks) ([`TableOptions::lock_count`]). The
+    /// chain/occupancy metrics measure *this* crate's interiors, which are not
+    /// ERTS's, so their values legitimately differ; the *arithmetic* over them is the
+    /// C's ([`crate::BucketChains`]).
+    pub fn stats(&self) -> TableStats {
+        match self.opts.kind() {
+            TableKind::Set | TableKind::Bag | TableKind::DuplicateBag => {
+                // Every hash kind is backed by an interior with a bucket space (the
+                // CHAMP index for `set`, the chained buckets for the multi kinds), so
+                // `bucket_chains` always answers; the `None` arm is the honest
+                // fallback for an interior that has no bucket array at all (it cannot
+                // occur through this crate's interior selection).
+                match self.interior.bucket_chains() {
+                    Some(chains) => TableStats::Hash(
+                        chains.hash_stats(self.deferred_objects(), self.opts.lock_count()),
+                    ),
+                    None => TableStats::Absent,
+                }
+            }
+            // Only a fine-locked `ordered_set` is a catree in the oracle; a plain one
+            // has no statistics at all.
+            TableKind::OrderedSet if self.opts.write_concurrency() => {
+                match self.interior.node_shape() {
+                    Some(shape) => TableStats::Tree(shape),
+                    None => TableStats::Absent,
+                }
+            }
+            TableKind::OrderedSet => TableStats::Absent,
         }
     }
 
