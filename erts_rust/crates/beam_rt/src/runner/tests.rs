@@ -1716,8 +1716,8 @@ fn fib_runs_to_the_same_result_on_both_tiers() {
 /// result and terminates the process abnormally: the runtime selects `Tier::Cranelift`
 /// unconditionally ([`select_entry_tier`] is not the feature gate) and the engine's own
 /// feature-gated entry point answers `unsupported: opcode: jit-cranelift tier not built` — the
-/// typed signal [`crate::error::unsupported_reason`] is the single interpreter of, which the CLI
-/// reports as exit code 3.
+/// typed signal [`crate::error::unsupported_reason`] is the single interpreter of (the CLI's exit
+/// code 3 whenever that raise is the error the action reports).
 #[cfg(not(feature = "cranelift"))]
 #[test]
 fn the_cranelift_tier_without_its_feature_is_the_typed_capability_gap() {
@@ -1772,6 +1772,13 @@ fn the_cranelift_tier_without_its_feature_is_the_typed_capability_gap() {
 /// independent claims, and the value each tier records is compared against the interpreter's.
 /// The seam's answer for the entry each process is spawned with is pinned too, so the tier is
 /// really *selected* per mode (a silently substituted tier would still compute `55`).
+///
+/// The remembered `ProcessEngine::tier` is not the observable here: it is only readable while a
+/// pid is still parked (the pre-emption and `receive` tests above read it there), and this process
+/// returns inside its first slice, so its engine leaves with it. The selection is pinned through
+/// [`select_entry_tier`] — the single seam the runner consults at a first entry — and, from the
+/// other side, by the feature-off sibling test above, where the *same* selection is what makes
+/// the engine's Cranelift entry point the one that answers.
 ///
 /// The slice budget is deliberately far larger than `fib(10)` can charge (a default slice is
 /// `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 units): the subject of this test is the **first
