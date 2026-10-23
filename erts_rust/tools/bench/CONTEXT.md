@@ -472,15 +472,15 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard scratch artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
-- The `foreign`/`binary_append` per-call N-dependence and the boot-dominated loop-workload rust peak RSS (with
-  the owner `file:line`s, which live **outside this node**) are in the dedicated *Known Issue* sections below —
-  read them before quoting one of those figures.
-- **No GC-strategy switch exists in this crate.** The mature collector is chosen by `beam_rt` alone — the host
-  knob `BEAM_RT_GC_STRATEGY=immix` opts into the mark-region generation, while `copying`/unset/unknown leave the
-  emulator default (`crates/beam_rt/src/config.rs:319-342`, applied once in `Runtime::new`,
-  `crates/beam_rt/src/runtime.rs:1317`) — and the driver has no field, flag or per-workload hook for it, sets no
-  env on the runtime it spawns, and never reads GC counters. A Copying-vs-Immix A/B is two whole-driver passes in
-  two environments, exactly like the `BEAM_RT_TIER` control.
+- **`foreign`'s and `binary_append`'s `case_<name>_ns_per_call` are N-dependent on the Rust runtime** (the
+  per-call cost drifts with `N`, a common-mode per-op heap retention), so they are
+  only comparable across runs that used the same `N`; the counts are those of m17 (§ Constraints), so
+  a figure from an older session is a *different* baseline. Each row emits a `case_<name>_calls` companion and an
+  explicit note. The rows are **not** a clean cross-runtime ratio, and the loop workloads' rust peak RSS is
+  **boot-dominated** (a general per-op heap retention beneath it, not ETS-specific).
+  Both facts, with the owner `file:line`s and the root causes (which live **outside this node**), are in the
+  dedicated *Known Issue* section below — read it before quoting a `foreign`/`binary_append` number or a
+  loop-workload RSS.
 - **The per-unit gaps against the oracle are the standing handoff, and the A/B decides which are *new*.** Every
   per-unit case is dearer than the system oracle; `RESULTS.md` §8 carries the current ratio and a one-line
   diagnosis per case, and §4 the binary A/B that attributes a change to code rather than to host load. The
