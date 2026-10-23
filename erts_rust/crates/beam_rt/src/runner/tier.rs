@@ -21,7 +21,7 @@
 //! **Execution-tier selection** for the runner's first entry, and the soundness argument for
 //! putting every scheduled process on the native baseline tier.
 //!
-//! # The two tiers
+//! # The three tiers
 //!
 //! [`Tier::Interpreter`] is the direct-threaded interpreter
 //! ([`beam_engine`]'s `interpreter`) — the reference semantics every other tier must match.
@@ -32,6 +32,14 @@
 //! (and every instruction the tier has no lowering for) therefore runs the *same* semantics,
 //! one instruction at a time, so the tier is interpreter-identical by construction rather than
 //! by parallel implementation.
+//!
+//! [`Tier::Cranelift`] is the engine's **optional** hot tier (`beam_engine`'s
+//! `jit::cranelift`): it lowers each IR function into a native Cranelift function that loops
+//! over the function's control flow and delegates per-instruction semantics to the same
+//! interpreter-backed helper, so it is interpreter-identical for the same reason. It is
+//! **opt-in twice over** — the runtime's `cranelift` Cargo feature (default OFF) must compile
+//! the backend in *and* `BEAM_RT_TIER=cranelift` must select it. See *The Cranelift tier is
+//! opt-in* below.
 //!
 //! # Why the baseline tier is sound for *any* module
 //!
@@ -63,6 +71,29 @@
 //!   [`RuntimeContext::resolve_external_call`](crate::context), which is written to be
 //!   idempotent for exactly this reason.
 //!
+//! # The Cranelift tier is opt-in, and its absence is a typed error
+//!
+//! [`Tier::Cranelift`] is never selected by default and never substituted for another tier.
+//! It is reachable only when **both** hold: the runtime was built with its `cranelift` Cargo
+//! feature, and `BEAM_RT_TIER` names it ([`JitMode::Cranelift`]). The feature is a pure
+//! re-export of `beam_engine`'s `jit-cranelift` feature (see this crate's `Cargo.toml`), so the
+//! **feature gate has exactly one definition and it is the engine's**: this module never tests
+//! `cfg!(feature = …)` and [`select_entry_tier`] never downgrades its answer, because a
+//! second gate here could disagree with the backend that is actually compiled in. With the
+//! feature off the engine's Cranelift entry points answer the typed capability gap
+//! (`unsupported: opcode: jit-cranelift tier not built`), which
+//! [`crate::error::unsupported_reason`] classifies as unsupported — the CLI's exit code 3 when
+//! that raise is the error the action reports — loud, never a silent downgrade to another tier.
+//!
+//! One further engine-side fact bounds what the tier can do: a Cranelift **resume** at an
+//! arbitrary pc is handed no compiled artifact, and the tier has no path that would compile and
+//! bind one at a parked address on demand, so it answers a typed `unsupported` error instead
+//! (`beam_engine`'s `jit::run_cranelift_resume_outcome` is the authority on the current
+//! answer). A slice that runs to completion inside its first slice therefore runs on Cranelift;
+//! a slice that pre-empts on the reduction budget or parks in a `receive` re-enters through that
+//! seam and gets the typed error rather than a downgrade to another tier. See *The tier
+//! survives a suspension* for the mechanism the tier plugs into.
+//!
 //! # The tier survives a suspension
 //!
 //! The tier is chosen for a process's **first** entry and remembered on its engine
@@ -93,6 +124,11 @@
 //! suspension address and every typed error), so the **default selects the baseline tier for
 //! every process entry**; measured workload figures live in `erts_rust/tools/bench/RESULTS.md`
 //! and are re-measured there rather than transcribed here.
+//!
+//! The optional Cranelift hot tier is deliberately **not** the default: it is off in the shipped
+//! build (an extra codegen dependency the standalone runtime does not need to run anything), it
+//! cannot yet re-enter a pre-empted or parked slice, and promoting a tier is a measurement-gated
+//! decision rather than a configuration default. Naming it is how a session opts in.
 //!
 //! [`BEAM_RT_TIER=interpreter`](JitMode::Interpreter) is the kill switch that pins the
 //! reference tier; every differential-gate baseline is taken there.
@@ -132,6 +168,19 @@ pub(super) enum JitMode {
     /// policy; the two are kept distinct because the environment surface names both and
     /// `interpreter` must remain the only value that turns the tier off.
     Baseline,
+    /// The optional Cranelift hot tier — `BEAM_RT_TIER=cranelift` (or, spelled as
+    /// [`Tier::name`] spells it, `jit-cranelift`).
+    ///
+    /// Reachable **only** with the runtime's `cranelift` Cargo feature, which is what compiles
+    /// `beam_engine`'s `jit-cranelift` backend in (see the module docs, *The Cranelift tier is
+    /// opt-in*). With the feature off the selection is still made — [`select_entry_tier`]
+    /// answers [`Tier::Cranelift`] and the engine's own feature-gated entry point produces the
+    /// typed `unsupported: opcode: jit-cranelift tier not built` capability gap (exit code 3),
+    /// so the gate lives in exactly one place and this crate never downgrades the request.
+    ///
+    /// It is **never substituted for another tier** and never used as a fallback: no other
+    /// value resolves here, and this value resolves to nothing else.
+    Cranelift,
 }
 
 /// [`JitMode`] for one `BEAM_RT_TIER` value — the **pure** resolution, and the single
@@ -141,6 +190,12 @@ pub(super) enum JitMode {
 ///   tier for every process entry (see the module docs).
 /// * `Some("auto")` → [`JitMode::Auto`] — the same mode, named explicitly.
 /// * `Some("baseline")` → [`JitMode::Baseline`] — the same selection, forced explicitly.
+/// * `Some("cranelift")` and `Some("jit-cranelift")` → [`JitMode::Cranelift`] — the optional hot
+///   tier. `"jit-cranelift"` is accepted because it is exactly [`Tier::name`]'s spelling, i.e.
+///   the same name the engine reports and parses; `"hot"` is deliberately **not** accepted —
+///   it names no tier, and a vague near-miss that silently changed the tier would be a
+///   typo-safety hazard. Whether the backend is actually compiled in is the `cranelift` Cargo
+///   feature's business (see [`JitMode::Cranelift`]), never this function's.
 /// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown value
 ///   resolves to the always-correct interpreter rather than being an error (so a typo re-enables
 ///   the reference tier instead of silently enabling the JIT).
@@ -152,15 +207,20 @@ pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
     match value {
         None | Some("auto") => JitMode::Auto,
         Some("baseline") => JitMode::Baseline,
+        Some("cranelift") | Some("jit-cranelift") => JitMode::Cranelift,
         _ => JitMode::Interpreter,
     }
 }
 
 /// The process-wide default tier mode from the `BEAM_RT_TIER` environment variable.
 ///
-/// The variable's semantics are [`mode_from_value`]'s; an unset value is the default
-/// [`JitMode::Auto`] and an unknown one the always-correct [`JitMode::Interpreter`]. Read
-/// **once** (a `OnceLock`), so a long-running process pays no repeated `getenv`.
+/// The variable's semantics are [`mode_from_value`]'s: `interpreter`, `auto`, `baseline`,
+/// `cranelift` (and the engine's `jit-cranelift` spelling of it) are the accepted values, an
+/// unset value is the default [`JitMode::Auto`] and an unknown one the always-correct
+/// [`JitMode::Interpreter`]. Read **once** (a `OnceLock`), so a long-running process pays no
+/// repeated `getenv`. The environment is read here and nowhere else — in particular a
+/// `cranelift` request is *not* re-tested against the Cargo feature in this crate (see
+/// [`JitMode::Cranelift`]).
 ///
 /// # The test-only override
 ///
@@ -214,15 +274,21 @@ pub(super) fn clear() {
 ///
 /// `runtime`, `state` and `entry` are not consulted: the baseline tier is sound for any module
 /// (see the module docs), so the mode alone decides. The parameters are kept because this is the
-/// runner's single tier-decision seam — a future policy (a Cranelift hot tier, a per-module
-/// measurement) would read them here, and the caller
-/// ([`RuntimeRunner`](super::RuntimeRunner)) resolves the tier **before** it builds the
-/// [`RuntimeContext`](crate::context::RuntimeContext) that borrows the runtime.
+/// runner's single tier-decision seam — a future policy (a per-module measurement) would read
+/// them here, and the caller ([`RuntimeRunner`](super::RuntimeRunner)) resolves the tier
+/// **before** it builds the [`RuntimeContext`](crate::context::RuntimeContext) that borrows the
+/// runtime.
 ///
 /// The tier is chosen from the [`ProcessEntry`] alone, i.e. **before** a fun entry's local
 /// launch target has been resolved (that resolution needs the context, and happens on the same
 /// first run). That is not a limitation here: the selection does not depend on the module, and
 /// the remembered tier is used by the label entry the resolved fun takes.
+///
+/// [`JitMode::Cranelift`] is answered **unconditionally** ([`Tier::Cranelift`]); this function
+/// is not the feature gate. Whether that tier has a backend is decided once, by `beam_engine`'s
+/// `jit-cranelift` feature, and a build without it answers the typed capability gap at the
+/// entry point — so the request is never silently turned into a different tier, and there is no
+/// second copy of the gate here to disagree with the engine.
 ///
 /// Called **once** per process, at its first entry; the caller remembers the answer on the
 /// engine, so no later slice selects a tier again (see [`JitMode`]).
@@ -235,5 +301,6 @@ pub(super) fn select_entry_tier(
     match mode {
         JitMode::Interpreter => Tier::Interpreter,
         JitMode::Auto | JitMode::Baseline => Tier::BaselineJit,
+        JitMode::Cranelift => Tier::Cranelift,
     }
 }

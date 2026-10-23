@@ -1537,6 +1537,32 @@ fn the_default_selects_the_baseline_tier_for_any_export_entry() {
     }
 }
 
+/// `JitMode::Cranelift` selects the optional Cranelift tier for a scheduled export entry —
+/// for **every** fixture shape, since the mode alone decides and nothing about the module is
+/// inspected.
+///
+/// The answer is unconditional: `select_entry_tier` is not the feature gate (that lives once, in
+/// `beam_engine`), so this holds in a build without the backend too — and it is exactly why a
+/// `cranelift` request in such a build is a typed capability gap rather than a downgrade.
+#[test]
+fn the_cranelift_mode_selects_the_cranelift_tier_for_any_export_entry() {
+    let rt = runtime();
+    let mut state = RunnerState::default();
+    for fixture in tier_fixtures() {
+        let module = Arc::new(beam_loader::load_file(fixture).expect("the fixture loads"));
+        let entry = ProcessEntry::Export {
+            module,
+            function: Atom::from_raw(0),
+            arity: 0,
+        };
+        assert_eq!(
+            select_entry_tier(&rt, &mut state, &entry, JitMode::Cranelift),
+            Tier::Cranelift,
+            "{fixture} is tiered on Cranelift when that mode is named"
+        );
+    }
+}
+
 /// `JitMode::Interpreter` forces the interpreter; the default (`JitMode::Auto`) and the
 /// explicit `JitMode::Baseline` alias select the native tier for the **same** entry, so the
 /// kill switch is the only thing that turns the tier off.
@@ -1587,12 +1613,18 @@ fn an_unresolved_fun_entry_takes_the_default_tier() {
         select_entry_tier(&rt, &mut state, &entry, JitMode::Interpreter),
         Tier::Interpreter
     );
+    assert_eq!(
+        select_entry_tier(&rt, &mut state, &entry, JitMode::Cranelift),
+        Tier::Cranelift,
+        "a fun entry takes the Cranelift tier when that mode is named"
+    );
 }
 // -- the process-wide default mode ----------------------------------------
 
 /// The effective mode for an **unset** `BEAM_RT_TIER` is `Auto`, which selects the native
-/// baseline tier for every process entry. `"baseline"` names that same default explicitly
-/// and any unknown value falls back to the always-correct interpreter. Pinned through the
+/// baseline tier for every process entry. `"baseline"` names that same default explicitly,
+/// `"cranelift"` (and the engine's own `"jit-cranelift"` spelling of it) names the optional hot
+/// tier, and any unknown value falls back to the always-correct interpreter. Pinned through the
 /// **pure** resolution helper ([`mode_from_value`]) rather than by mutating the process
 /// environment (the crate is `#![deny(unsafe_code)]`), and the derived [`JitMode::default`]
 /// must agree with it so no call site can pick a different tier by omission.
@@ -1602,19 +1634,32 @@ fn the_unset_default_resolves_to_auto() {
         mode_from_value(None),
         JitMode::Auto,
         "an unset BEAM_RT_TIER is the native-tier default"
-    );    assert_eq!(
-        mode_from_value(Some("interpreter")),
-        JitMode::Interpreter
     );
+    assert_eq!(mode_from_value(Some("interpreter")), JitMode::Interpreter);
     assert_eq!(
         mode_from_value(Some("auto")),
         JitMode::Auto,
         "`auto` names the default explicitly"
     );
     assert_eq!(mode_from_value(Some("baseline")), JitMode::Baseline);
-    // An unknown value is the always-correct interpreter, never an error and never the JIT.
-    assert_eq!(mode_from_value(Some("jit")), JitMode::Interpreter);
-    assert_eq!(mode_from_value(Some("")), JitMode::Interpreter);
+    // The optional hot tier, named either by the runtime's own spelling or by `Tier::name()`'s —
+    // the resolution never consults the Cargo feature, so both spellings work in every build
+    // (whether the backend is compiled in is the engine's answer, at the entry point).
+    assert_eq!(mode_from_value(Some("cranelift")), JitMode::Cranelift);
+    assert_eq!(
+        mode_from_value(Some("jit-cranelift")),
+        JitMode::Cranelift,
+        "`jit-cranelift` is `Tier::name()`'s spelling of the same request"
+    );
+    // An unknown value is the always-correct interpreter, never an error and never a JIT —
+    // including `"hot"`, which names no tier and must not quietly mean the Cranelift one.
+    for unknown in ["jit", "", "hot", "cranelift-jit", "CRANELIFT"] {
+        assert_eq!(
+            mode_from_value(Some(unknown)),
+            JitMode::Interpreter,
+            "{unknown:?} names no tier, so a typo must stay the always-correct interpreter"
+        );
+    }
     // The derived `Default` is the same tier an unset variable resolves to.
     assert_eq!(JitMode::default(), JitMode::Auto);
 }
@@ -1664,12 +1709,147 @@ fn fib_runs_to_the_same_result_on_both_tiers() {
     }
 }
 
+/// **Feature off: naming the Cranelift tier is a typed capability gap, never a silent
+/// substitution.**
+///
+/// `slice:fib/1 10` through the scheduled runner with `JitMode::Cranelift` records **no**
+/// result and terminates the process abnormally: the runtime selects `Tier::Cranelift`
+/// unconditionally ([`select_entry_tier`] is not the feature gate) and the engine's own
+/// feature-gated entry point answers `unsupported: opcode: jit-cranelift tier not built` — the
+/// typed signal [`crate::error::unsupported_reason`] is the single interpreter of (the CLI's exit
+/// code 3 whenever that raise is the error the action reports).
+#[cfg(not(feature = "cranelift"))]
+#[test]
+fn the_cranelift_tier_without_its_feature_is_the_typed_capability_gap() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Cranelift);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+    let function = module.atom_table.lookup("fib").expect("fib is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(10)],
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner.run(pid, &mut table, 1_000).expect("the slice runs")
+    };
+    assert!(
+        matches!(outcome, ProcOutcome::Exit(_)),
+        "a process on a tier with no backend terminates: {outcome:?}"
+    );
+    assert_ne!(
+        outcome,
+        ProcOutcome::Exit(normal(&mut rt)),
+        "the exit is abnormal — no other tier ran the code to a normal return"
+    );
+    assert!(
+        state.result(pid).is_none(),
+        "no value is recorded: nothing ran, so nothing was silently substituted"
+    );
+    let error = state
+        .take_error(pid)
+        .expect("the failure is recorded as the process's typed error");
+    let reason = crate::error::unsupported_reason(&error)
+        .expect("the refusal is a capability gap, not a runtime error");
+    assert!(
+        reason.contains("cranelift"),
+        "the reason names the missing tier: {reason}"
+    );
+}
+
+/// **Feature on: `slice:fib/1 10` records the same `55` on all three tiers.**
+///
+/// The three runs happen in one test so the row is a real three-tier agreement rather than three
+/// independent claims, and the value each tier records is compared against the interpreter's.
+/// The seam's answer for the entry each process is spawned with is pinned too, so the tier is
+/// really *selected* per mode (a silently substituted tier would still compute `55`).
+///
+/// The remembered `ProcessEngine::tier` is not the observable here: it is only readable while a
+/// pid is still parked (the pre-emption and `receive` tests above read it there), and this process
+/// returns inside its first slice, so its engine leaves with it. The selection is pinned through
+/// [`select_entry_tier`] — the single seam the runner consults at a first entry — and, from the
+/// other side, by the feature-off sibling test above, where the *same* selection is what makes
+/// the engine's Cranelift entry point the one that answers.
+///
+/// The slice budget is deliberately far larger than `fib(10)` can charge (a default slice is
+/// `DEFAULT_REDUCTIONS_PER_SLICE` = 4 000 units): the subject of this test is the **first
+/// entry** on each tier, and at this HEAD a Cranelift re-entry at a parked address is a separate
+/// typed gap, so a pre-empted slice would end the run before the value was computed and the test
+/// would measure the wrong thing.
+#[cfg(feature = "cranelift")]
+#[test]
+fn fib_runs_to_the_same_result_on_all_three_tiers() {
+    const EXPECTED: i64 = 55;
+    assert!(
+        Tier::Cranelift.is_available(),
+        "the runtime's `cranelift` feature compiles the engine's backend in"
+    );
+
+    let mut recorded = Vec::new();
+    for (mode, expected_tier) in [
+        (JitMode::Interpreter, Tier::Interpreter),
+        (JitMode::Auto, Tier::BaselineJit),
+        (JitMode::Cranelift, Tier::Cranelift),
+    ] {
+        let mut rt = runtime();
+        let mut state = RunnerState::default();
+        state.jit_mode = Some(mode);
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+        let function = module.atom_table.lookup("fib").expect("fib is interned");
+        let entry = ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        };
+        // The tier the runner picks at this process's first entry (and remembers on its engine
+        // for a later resume): `select_entry_tier` is that one decision seam.
+        assert_eq!(
+            select_entry_tier(&rt, &mut state, &entry, mode),
+            expected_tier,
+            "{mode:?} selects its own tier"
+        );
+        state.spawn(pid, entry, vec![make_small(10)]);
+
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid, &mut table, 1_000_000)
+                .unwrap_or_else(|error| panic!("the {mode:?} slice runs: {error}"))
+        };
+        assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)), "{mode:?}");
+        let result = state.result(pid).expect("the value is recorded");
+        assert_eq!(
+            signed_value(result),
+            EXPECTED,
+            "{expected_tier:?} computes fib(10) = {EXPECTED}"
+        );
+        recorded.push(signed_value(result));
+    }
+    assert_eq!(
+        recorded,
+        vec![EXPECTED; 3],
+        "the interpreter, baseline and Cranelift tiers agree"
+    );
+}
+
 /// The whole runtime's **scheduler** path (not just one slice) runs `slice:fib/1 10` and
 /// records `55` — the tier selection is wired into the real `RuntimeRunner` the scheduler
 /// drives, on whatever mode the process environment selects (an unset `BEAM_RT_TIER` ⇒ the
 /// baseline tier for `slice`). The test asserts the *result*, so it holds on every tier.
 #[test]
-fn the_scheduler_path_computes_fib_under_the_selected_tier() {    let mut rt = runtime();
+fn the_scheduler_path_computes_fib_under_the_selected_tier() {
+    let mut rt = runtime();
     rt.load_module(slice_fixture()).expect("slice.beam loads");
     let pid = rt
         .spawn_process("slice", "fib", vec![make_small(10)])
