@@ -112,6 +112,45 @@ The handler is **async-signal-safe** — one atomic bitmask OR swapped *before* 
 ### `error.rs` — the crate's single errno→name table
 `ERRNO_NAMES` (**61 rows**) is the one table (the file/`fork`/`exec` set plus the socket set the inet drivers can produce). `errno_atom` is the `Option` form (unrecognised ⇒ `None`, never an invented atom); `errno_name` is the `[0] ++ Name` form the inet replies carry, with the C's `errno_<N>` fallback; `EOPNOTSUPP` renders **`enotsup`** (the emulator's collision list precedes its libc lookup). `drivers/inet/wire.rs::errno_name` forwards here and `InetReason`/`FailureReason` both read it, so no second table exists.
 
+### Write shutdown — the answer matrix (oracle-measured, OTP 29.1.1)
+
+`gen_tcp:shutdown(S, write)` (the `TCP_REQ_SHUTDOWN` control verb) only records the intent: the socket
+is *not* closed and its state stays `{ok,[connected,open]}` (`GETFD` still answers the descriptor). What
+the next operations answer is `PeerClose`'s two one-shot ladders (`drivers/inet/mod.rs`), armed by the
+**first failing write**, never by the shutdown itself:
+
+| step | answer |
+|---|---|
+| `shutdown(S, write)` | `ok` — and again `ok` while no write has failed yet (idempotent) |
+| any number of **zero-length** `send` (`<<>>`, `[]`, `[<<>>,[]]`) | `ok` for ever (the write-shutdown arm of `TcpInetDriver::write_command` in `async.rs` answers them without writing) |
+| the **first non-empty** `send` | `{error, closed}` (`TCP_ADDF_DELAYED_CLOSE_SEND`, `inet_drv.c:12681`-`:12692`) |
+| **every later** `send` (non-empty *or* zero-length) | `{error, enotconn}` (the one-shot spent) |
+| `shutdown(S, write)` **after** a failed write | `{error, enotconn}` |
+| `shutdown(S, read)` after the write latch | `{error, enotconn}` |
+| `recv` after a **write**-latched close | the first answers `{error, closed}`, later ones `{error, enotconn}` — a write discovery arms the receive one-shot too (`tcp_send_or_shutdown_error`, `:13660`-`:13685`), so the read path needs nothing extra |
+| the peer | receives every pre-shutdown byte, then `{tcp_closed, S}` |
+
+`shutdown(S, read_write)` is **racy on the oracle** and is deliberately not pinned.
+
+Pinned by `drivers/inet/write_shutdown_matrix_tests.rs` (the answer matrix over a `Rig`) and, end to end,
+by the differential corpus's `inet_write` group — `shutdown_write_then_send_closes_the_writer`,
+`repeated_write_shutdown_keeps_the_writer_closed`,
+`empty_payload_after_write_shutdown_is_a_noop_success`, `send_counters_advance_with_the_writes`,
+`both_directions_of_the_stream_write`, `write_answer_matrix`, `empty_payload_is_a_successful_noop`.
+
+### The command accounting invariant (zero-length commands included)
+
+`InetStat::output(len)` counts a **command**, not a write: every command that reaches
+`TcpInetDriver::write_command` advances `send_cnt` by one and adds `payload + h_len` to `send_oct` — so a
+**zero-length** command advances `send_cnt` and adds nothing, `inet_drv.c:11560`-`:11582`
+(`inet_output_count`) running *before* `tcp_sendv`'s `(h_len == 0 && len == 0)` shortcut (`:13736`). The
+write-shutdown arm therefore calls `self.stat.output(0)` before it returns. `send_pend` is **not** the
+driver's: it is the port's own output-queue depth, rendered from `ctx.output().len()` at `inet:getstat/1`
+time, and the `usize` a command returns is what `Port` charges against that queue
+(`check_write_accounting`, `port.rs`) — a zero-length command consumes only its stripped caller tag, so
+the arm returns the same figure the normal path's net shrinkage would. Oracle-measured figures (the
+zero-length rows included) live in `drivers/inet/stat_send_tests.rs`'s `RAW_ROWS`.
+
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures⇒`BeamError::Io`, argument faults⇒`BeamError::BadArg`, id/registration exhaustion⇒`BeamError::SystemLimit`. Never panic on runtime data, never `unwrap()`, never `todo!`/`unreachable!` in shipped code.
 - **Safe Rust by default.** `unsafe` only in the raw syscall wrappers (`read`/`write`/`pipe`/`fcntl`/`open`/`dup`/`fstat`/`lseek`/`fsync`/`ftruncate`/`close`, the spawn driver's `fork`/`execve`/`waitpid`/`dup2`, `inet`'s `setsockopt`/`getsockopt`, `cpu_time`'s `getrusage`/`clock_gettime`, `signal`'s `pipe2`/`sigaction`, `ddll`'s `dlopen`/`dlsym`/`dlclose`, `fs_access`'s `access`/`geteuid`/`getegid`), `mio::unix::SourceFd` construction, and the `abi` host's raw `ErlDrv*` handling; every block carries a preceding `// SAFETY:` rationale and `unsafe_op_in_unsafe_fn` stays clean.
