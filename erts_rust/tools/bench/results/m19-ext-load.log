@@ -1,0 +1,40 @@
+2026-10-23T16:04:22Z PASS=m19-ext-erlc_compiler-r1 event=before loadavg=1.91 1.38 1.65 1/839 4
+2026-10-23T16:04:29Z PASS=m19-ext-erlc_compiler-r1 event=after loadavg=1.77 1.37 1.64 1/831 265 rc=0 wall_s=7
+2026-10-23T16:04:38Z PASS=m19-ext-erlc_compiler-r2 event=before loadavg=1.58 1.34 1.63 1/830 4
+2026-10-23T16:04:45Z PASS=m19-ext-erlc_compiler-r2 event=after loadavg=1.53 1.34 1.63 1/832 265 rc=0 wall_s=7
+2026-10-23T16:04:45Z PASS=m19-ext-erlc_compiler-r3 event=before loadavg=1.53 1.34 1.63 2/832 268
+2026-10-23T16:04:51Z PASS=m19-ext-erlc_compiler-r3 event=after loadavg=1.49 1.33 1.62 1/842 529 rc=0 wall_s=6
+2026-10-23T16:04:54Z PASS=m19-ext-elixir_compiler-r1 event=before loadavg=1.37 1.31 1.62 1/842 4
+2026-10-23T16:05:07Z PASS=m19-ext-elixir_compiler-r1 event=after loadavg=1.31 1.30 1.61 2/833 2273 rc=0 wall_s=13
+2026-10-23T16:05:07Z PASS=m19-ext-elixir_compiler-r2 event=before loadavg=1.31 1.30 1.61 1/833 2276
+2026-10-23T16:05:19Z PASS=m19-ext-elixir_compiler-r2 event=after loadavg=2.62 1.58 1.70 1/842 4545 rc=0 wall_s=12
+2026-10-23T16:05:19Z PASS=m19-ext-elixir_compiler-r3 event=before loadavg=2.62 1.58 1.70 1/842 4548
+2026-10-23T16:05:32Z PASS=m19-ext-elixir_compiler-r3 event=after loadavg=2.81 1.66 1.72 1/834 6817 rc=0 wall_s=13
+2026-10-23T16:05:37Z PASS=m19-ext-cowboy-r1 event=before loadavg=2.58 1.63 1.71 1/834 4
+2026-10-23T16:06:22Z PASS=m19-ext-cowboy-r1 event=after loadavg=3.08 1.85 1.78 1/839 2816 rc=0 wall_s=45
+2026-10-23T16:06:24Z PASS=m19-ext-cowboy-r2 event=before loadavg=2.83 1.82 1.77 1/840 4
+2026-10-23T16:07:10Z PASS=m19-ext-cowboy-r2 event=after loadavg=2.51 1.84 1.77 3/835 2816 rc=0 wall_s=46
+2026-10-23T16:07:12Z PASS=m19-ext-cowboy-r3 event=before loadavg=2.51 1.84 1.77 2/836 4
+2026-10-23T16:07:58Z PASS=m19-ext-cowboy-r3 event=after loadavg=1.59 1.68 1.72 1/833 2816 rc=0 wall_s=46
+2026-10-23T16:08:01Z PASS=m19-ext-khepri-r1 event=before loadavg=1.59 1.68 1.72 1/834 4
+2026-10-23T16:09:25Z PASS=m19-ext-khepri-r1 event=after loadavg=1.02 1.52 1.67 1/850 232 rc=0 wall_s=84
+2026-10-23T16:09:28Z PASS=m19-ext-khepri-r2 event=before loadavg=1.02 1.52 1.67 1/843 4
+2026-10-23T16:11:02Z PASS=m19-ext-khepri-r2 event=after loadavg=1.10 1.48 1.64 1/844 232 rc=0 wall_s=94
+2026-10-23T16:11:05Z PASS=m19-ext-khepri-r3 event=before loadavg=1.01 1.45 1.63 1/845 4
+2026-10-23T16:12:29Z PASS=m19-ext-khepri-r3 event=after loadavg=2.04 1.74 1.72 1/847 232 rc=0 wall_s=84
+2026-10-23T16:12:32Z PASS=m19-ext-plb-r1 event=before loadavg=2.04 1.74 1.72 1/848 4
+2026-10-23T16:14:07Z PASS=m19-ext-plb-r1 event=after loadavg=1.76 1.84 1.76 1/871 4157 rc=0 wall_s=95
+2026-10-23T16:14:10Z PASS=m19-ext-plb-r2 event=before loadavg=1.62 1.80 1.75 1/839 4
+2026-10-23T16:15:42Z PASS=m19-ext-plb-r2 event=after loadavg=1.67 1.84 1.77 1/870 4151 rc=0 wall_s=92
+2026-10-23T16:15:45Z PASS=m19-ext-plb-r3 event=before loadavg=1.54 1.81 1.76 1/844 4
+2026-10-23T16:17:16Z PASS=m19-ext-plb-r3 event=after loadavg=1.59 1.82 1.78 1/874 4160 rc=0 wall_s=91
+2026-10-23T16:17:20Z PASS=m19-ext-emqx event=before loadavg=1.46 1.79 1.77 2/842 4
+2026-10-23T16:17:20Z PASS=m19-ext-emqx event=after loadavg=1.46 1.79 1.77 1/842 201 rc=0 wall_s=0
+2026-10-23T16:17:24Z PASS=m19-full-baseline-rust event=before loadavg=1.34 1.76 1.76 1/841 4
+2026-10-23T16:17:40Z PASS=m19-full-baseline-rust event=after loadavg=1.27 1.72 1.75 1/832 415 rc=0 wall_s=16
+2026-10-23T16:17:42Z PASS=m19-full-baseline-sys event=before loadavg=1.27 1.72 1.75 1/832 4
+2026-10-23T16:17:49Z PASS=m19-full-baseline-sys event=after loadavg=1.22 1.70 1.74 1/840 3721 rc=0 wall_s=7
+2026-10-23T16:17:53Z PASS=m19-budgetprobe-all-cowboy event=before loadavg=1.13 1.67 1.73 1/839 4
+2026-10-23T16:21:45Z PASS=m19-budgetprobe-all-cowboy event=after loadavg=0.95 1.60 1.70 2/820 9364 rc=0 wall_s=232
+2026-10-23T16:24:10Z PASS=m19-budgetprobe-all-cowboy-rerun event=before loadavg=3.73 2.40 1.97 1/835 4
+2026-10-23T16:28:01Z PASS=m19-budgetprobe-all-cowboy-rerun event=after loadavg=0.71 1.68 1.79 1/828 9364 rc=0 wall_s=231

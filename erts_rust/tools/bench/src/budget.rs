@@ -49,8 +49,9 @@
 //! # How the numbers were chosen
 //!
 //! Every limit is a **regression alarm that passes today**, tuned against the recorded
-//! figures in `RESULTS.md` / `results/m17-*.json` (the current session) with headroom
-//! above the worst recorded round, and each rationale says so and says what the limit
+//! figures in `RESULTS.md` / the current session's `results/m19-*.json` (with the m17
+//! figures quoted where they are still the wider range) with headroom above the worst
+//! recorded round, and each rationale says so and says what the limit
 //! is *not* (never an SLO for this shared host; never a parity target). Where the
 //! illustrative constants in the task brief sat *below* what has actually been
 //! measured on this host — the absolute `startup_ms` ceilings, and a `4.0` startup
@@ -565,10 +566,11 @@ pub const BUDGETS: &[Budget] = &[
         metric: "startup_ms",
         stat: Stat::P50,
         limit: Limit::AtMost(800.0),
-        rationale: "A gross-regression alarm for the Rust boot median (the m17 rounds read \
-                    289-546 ms under a 1-min load of 3-92; quieter sessions read ~280-400 ms), \
-                    not an SLO — a shared host can double it without a code change, so the \
-                    load-robust judgement is the rust/sys ratio row.",
+        rationale: "A gross-regression alarm for the Rust boot median (the six m19 matched \
+                    rounds read 260.3-261.4 ms at a 1-min load of 0.5-4.5; m17's loaded rounds \
+                    read 289-546 ms at load 3-92), not an SLO — a shared host can double it \
+                    without a code change, so the load-robust judgement is the rust/sys ratio \
+                    row.",
     },
     Budget {
         workload: "baseline",
@@ -576,10 +578,10 @@ pub const BUDGETS: &[Budget] = &[
         metric: "startup_ms",
         stat: Stat::P99,
         limit: Limit::AtMost(2500.0),
-        rationale: "Catches a hang or an order-of-magnitude tail regression (the matched m17 \
-                    rounds read 291-485 ms p99, with a single 1702 ms outlier on a heavily \
-                    loaded A/B round), not an SLO: a boot's p99 is a handful of samples, so \
-                    this row only notices a gross failure.",
+        rationale: "Catches a hang or an order-of-magnitude tail regression (the six m19 \
+                    matched rounds read 261.9-267.6 ms p99; m17 read up to 485 ms, with a \
+                    single 1702 ms outlier on a heavily loaded A/B round), not an SLO: a boot's \
+                    p99 is a handful of samples, so this row only notices a gross failure.",
     },
     Budget {
         workload: "baseline",
@@ -587,8 +589,8 @@ pub const BUDGETS: &[Budget] = &[
         metric: "startup_ms",
         stat: Stat::P50,
         limit: Limit::RatioAtMost(6.0),
-        rationale: "The load-robust startup judgement: recorded matched-round ratios are \
-                    2.2-3.05x (m16 reached 3.79x), so 6x is a regression alarm with headroom \
+        rationale: "The load-robust startup judgement: the six m19 matched rounds read \
+                    2.51-2.53x (m16 reached 3.79x), so 6x is a regression alarm with headroom \
                     above every recorded round — not a target, and deliberately not so tight \
                     that ordinary host drift trips it.",
     },
@@ -598,9 +600,10 @@ pub const BUDGETS: &[Budget] = &[
         metric: "startup_ms",
         stat: Stat::P99,
         limit: Limit::RatioAtMost(6.0),
-        rationale: "The same instrument for the tail; recorded p99 ratios track the p50 ones \
-                    (2.1-3.4x) because a boot's p99 is a handful of samples, so the same 6x \
-                    alarm applies — not an SLO for a shared host.",
+        rationale: "The same instrument for the tail; the p99 ratios track the p50 ones \
+                    (2.35-2.58x across the six m19 matched rounds) because a boot's p99 is a \
+                    handful of samples, so the same 6x alarm applies — not an SLO for a shared \
+                    host.",
     },
     Budget {
         workload: "baseline",
@@ -608,9 +611,10 @@ pub const BUDGETS: &[Budget] = &[
         metric: "startup_ms",
         stat: Stat::P99,
         limit: Limit::AtMost(400.0),
-        rationale: "The oracle's own tail, recorded at 105-153 ms across m17: a host artifact \
-                    big enough to move the far less load-sensitive `sys` side shows up here \
-                    too, so it cannot be misread as a Rust regression — and 400 ms is \
+        rationale: "The oracle's own tail, recorded at 103.5-113.3 ms across the six m19 \
+                    matched rounds (m17 read 105-153 ms): a host artifact big enough to move the \
+                    far less load-sensitive `sys` side shows up here too, so it cannot be \
+                    misread as a Rust regression — and 400 ms is \
                     deliberately loose because this row exists to attribute, not to gate.",
     },
     Budget {
@@ -619,12 +623,13 @@ pub const BUDGETS: &[Budget] = &[
         metric: "latency_ms",
         stat: Stat::P99,
         limit: Limit::AtMost(5.0),
-        rationale: "The request-tail budget on the I/O-bound target, recorded at 3.03-3.59 ms \
-                    p99 while serving ~198k req/s through a real Cowboy release: 5 ms leaves \
-                    room for a loaded host yet still flags a real latency regression; it reads \
-                    the summary the cowboy row actually records (`latency_ms` — there is no \
-                    separate p99 metric) and it is sys-only because the Rust runtime cannot \
-                    boot an OTP release.",
+        rationale: "The request-tail budget on the I/O-bound target, recorded at 0.11-0.16 ms \
+                    p99 while serving ~119-124k req/s through a real Cowboy release across the \
+                    three m19 external reps (m17's contended pass read 3.03-3.59 ms at ~38k \
+                    req/s): 5 ms leaves room for a loaded host yet still flags a real latency \
+                    regression; it reads the summary the cowboy row actually records \
+                    (`latency_ms` — there is no separate p99 metric) and it is sys-only because \
+                    the Rust runtime cannot boot an OTP release.",
     },
     Budget {
         workload: "list_walk",
@@ -633,8 +638,9 @@ pub const BUDGETS: &[Budget] = &[
         stat: Stat::Value,
         limit: Limit::AtMost(2000.0),
         rationale: "The per-element dispatch budget for the standing per-unit gap, recorded at \
-                    22.6-48.2 ns/element across m17 (the oracle reads 2.3-2.8): roughly forty \
-                    times today's figure, so it is a regression alarm for the engine's \
+                    18.4-18.7 ns/element across the six m19 matched rounds (the oracle reads \
+                    2.30-2.34; m17's loaded rounds read up to 48.2): over a hundred times \
+                    today's figure, so it is a regression alarm for the engine's \
                     dispatch path and not a parity target — the gap itself is `beam_engine`'s \
                     to close.",
     },
@@ -645,9 +651,10 @@ pub const BUDGETS: &[Budget] = &[
         stat: Stat::Value,
         limit: Limit::AtMost(20000.0),
         rationale: "The messaging budget for the two-process send/receive round trip, recorded \
-                    at 8091-12450 ns/op across m17 (the oracle reads 1497-1943): ~1.6x above \
-                    the worst recorded round, so it is a regression alarm rather than a parity \
-                    target, and it is not a hard ceiling on a contended host.",
+                    at 6242-6338 ns/op across the six m19 matched rounds (the oracle reads \
+                    1487-1531; m17's worst round read 12450): ~3.2x above today's figure and \
+                    still ~1.6x above m17's worst, so it is a regression alarm rather than a \
+                    parity target, and it is not a hard ceiling on a contended host.",
     },
     Budget {
         workload: "gc_bound",
@@ -655,10 +662,10 @@ pub const BUDGETS: &[Budget] = &[
         metric: "case_churn_ns_per_op",
         stat: Stat::Value,
         limit: Limit::AtMost(200000.0),
-        rationale: "The GC-churn budget for allocate-and-abandon, recorded at 66.4k-106k ns/op \
-                    across m17 (the oracle reads 4.3k-5.0k): ~1.9x above the worst recorded \
-                    round, a regression alarm for a figure whose collection count the row does \
-                    not claim — not a parity target.",
+        rationale: "The GC-churn budget for allocate-and-abandon, recorded at 59.6k-60.3k ns/op \
+                    across the six m19 matched rounds (the oracle reads 4.24k-4.27k; m17's worst \
+                    round read 106k): ~3.3x above today's figure, a regression alarm for a figure \
+                    whose collection count the row does not claim — not a parity target.",
     },
     Budget {
         workload: "file_io",
@@ -666,10 +673,12 @@ pub const BUDGETS: &[Budget] = &[
         metric: "case_write_read_ns_per_op",
         stat: Stat::Value,
         limit: Limit::AtMost(200000.0),
-        rationale: "A first-pass regression alarm for the file-I/O workload class's \
-                    write-then-read round trip: no measured figure backs it yet (the workload \
-                    is reported not-measured until it exists and runs), so it is a placeholder \
-                    alarm, not a calibrated budget.",
+        rationale: "The file-I/O budget for the write-then-read round trip of a 4096-byte \
+                    payload, recorded at 97.6k-103.1k ns/op across the six m19 matched rounds \
+                    (median 98 643) while the oracle reads 133.9k-135.6k — i.e. the Rust runtime \
+                    is already ~1.36x cheaper on this case, so the limit sits ~2x above the \
+                    measured figure as a regression alarm for the file path, not a parity \
+                    target and not a clean cross-runtime ratio.",
     },
     Budget {
         workload: "gc_class",
@@ -677,9 +686,11 @@ pub const BUDGETS: &[Budget] = &[
         metric: "case_send_recv_ns_per_op",
         stat: Stat::Value,
         limit: Limit::AtMost(200000.0),
-        rationale: "A first-pass regression alarm for the GC-class workload's two-process round \
-                    trip: like `file_io` it is a placeholder until the workload exists and runs, \
-                    and it stays not-measured (never a pass, never a failure) until then, so \
-                    the limit is not yet evidence-backed.",
+        rationale: "The GC-class budget for the two-process round trip of a ~390-word payload \
+                    (deliberately above the nursery, so a collection is admitted), recorded at \
+                    51.0k-51.4k ns/op across the six m19 matched rounds (median 51 282) against \
+                    the oracle's 3.19k-3.27k: the limit is ~3.9x the measured figure, a \
+                    regression alarm for the copy-plus-collect path — the ~15.8x gap itself is \
+                    the engine's to close, not what this row gates.",
     },
 ];
