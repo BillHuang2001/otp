@@ -67,9 +67,10 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   times (a memoized sentinel). Caching the verdict is the *faithful* choice: ERTS charges nothing for an
   intra-module call, so the consultation it replaces was spending a reduction unit the oracle never charges.
   Three doors invalidate — `Machine::reset` (which also keeps the address key ABA-free), the BIF-dispatch funnel
-  `Machine::dispatch_bif` when it dispatches `erlang:load_nif/2` (the BIF installs the stub a later local call must
-  be served from), and the public `Machine::invalidate_local_call_verdicts` for a host whose answer set changes by
-  any other means.
+  `Machine::dispatch_bif_call` when it dispatches `erlang:load_nif/2` (the BIF installs the stub a later local call
+  must be served from; the funnel is `&self`, so it only **arms** a `Cell` flag and the seam clears the verdicts at
+  its next local call), and the public `Machine::invalidate_local_call_verdicts` for a host whose answer set changes
+  by any other means.
   A hit never reorders the memo and the keys live in a flat `[CalleeKey; 8]` beside the verdict bytes and the
   payloads, so the scan is inlined and stays inside two cache lines (a move-to-front policy was measured as an
   instruction regression: an alternating two-callee loop memmoved on every call). Both tiers drive this one
