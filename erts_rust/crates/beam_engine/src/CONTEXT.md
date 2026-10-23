@@ -95,6 +95,16 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `families/bitstrings/raw.rs`, `families/records/raw.rs`,
   `jit/emitter/*`, `jit/baseline/*`, feature-gated `jit/cranelift/*`). Errors are
   `beam_common::{Result, BeamError}` only, and unsupported cases stay typed errors.
+- **A term produced in a `MinimalContext` arena dies with that context.** The arena owns
+  the only copy of the words, a `Machine` owns no heap, and dropping the context returns
+  the carrier blocks to `beam_alloc`'s PROCESS-GLOBAL segment pool, where the next arena
+  (another tier's, or a parallel test's) writes over them. Reading such a term afterwards
+  is a use-after-free that surfaces as a **wrong value** or the term-integrity abort
+  `beam_term::ops::class: invalid boxed header subtag <n>` — never a typed error, and only
+  intermittently (it needs the recycled slot to hold a non-header word, so it can hide for
+  thousands of runs and then fire once under load). A test that compares terms from two
+  runs must keep **both** hosts alive to the comparison, or compare inside each run's own
+  scope. Contract text: the `MinimalContext` docs in `context.rs`.
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`

@@ -1946,6 +1946,23 @@ impl HeapMark {
 /// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words) hands out words
 /// from a pointer-stable region heap (see the field docs).
 ///
+/// # Lifetime contract: a term belongs to the context that built it
+///
+/// The arena owns the **only** copy of every term a run allocates in it, so an `Eterm`
+/// a run produced — the value a `RunOutcome::Returned` carries, and every register and
+/// stack word read back from the `Machine` — stays readable exactly as long as the
+/// `MinimalContext` that produced it lives. A `Machine` does **not** own the heap.
+/// Dropping the context releases its carrier blocks to `beam_alloc`'s process-global
+/// segment pool, and the next arena (another tier's context, or a concurrently running
+/// test's) reuses that memory and writes its own words over it, so reading a term after
+/// its context was dropped is a use-after-free whose symptom is a **wrong value** or the
+/// term-integrity abort `beam_term::ops::class: invalid boxed header subtag` — never a
+/// typed error, and never reliably reproducible (it needs the recycled slot to hold a
+/// non-header word).
+/// A test that compares terms produced by **two** runs (two tiers, an eager and a
+/// parking host) must therefore keep both hosts alive until the comparison, or compare
+/// inside each run's own scope.
+///
 /// An **apply hook** ([`with_apply_hook`](MinimalContext::with_apply_hook) /
 /// [`set_apply_hook`](MinimalContext::set_apply_hook)) may additionally be installed
 /// to serve [`apply_fun`](ExecutionContext::apply_fun); without one it is a typed
