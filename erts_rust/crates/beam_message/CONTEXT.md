@@ -193,7 +193,7 @@ Gaps whose owner is another crate, each with the exact API this crate adopts onc
 - **The message path's pre-attempt + retry, and stale prose** — owner `beam_rt`.
   A refused *delivery* is **2 copy attempts + 1 pricing walk** (`PERF.md` §2): `src/context/send.rs`'s `deliver_into_mailbox` calls `ProcessTable::deliver` and only then `send_fragmented_message`, which calls `beam_message::send_fragmented(…, 0)`. The message-path analogue of the existing `copy_out_hint`/`hint_grow_gate` gate (`src/context/calls.rs:1313-1332`) is what would stop the first, always-doomed attempt.
   That node's prose still describes the retired 3-walk/multi-traversal path: `src/context/calls.rs:1280`, `:1316`, `:1389`, `src/context/runtime_context.rs:159`, `src/context/calls/tests.rs:190`, `:529`, `PERF_DISPATCH.md:252`, `:279`, `:387`, `src/bench/CONTEXT.md:242`, `:270`.
-- **Control-signal fragment sizing** — owner `beam_process` (`src/ptab.rs:284`).
+- **Control-signal fragment sizing** — owner `beam_process` (`src/ptab.rs:344`, `enqueue_fragment_payload`).
   `HeapFragment::new(size_object(payload) + 8)` walks the whole payload once just to size the fragment; adopting this crate's refusal-derived exact price (`AllocFailure::requested / size_of::<Eterm>()`, the `send_fragmented` route) removes that walk.
 - **`send_recv` vs `send_recv_plain`** — owner `beam_codec`.
   The delta between those two cases (`PERF.md` §6) is the worker's `binary_to_term(term_to_binary(T))` round trip, **not the copy** — the plain case's payload copies are 3 words (the literal is shared). Measure the codec's share before claiming any part of that pair.
