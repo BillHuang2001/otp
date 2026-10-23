@@ -199,7 +199,7 @@ fn three_frame_machine() -> (Module, Machine) {
         })
         .unwrap();
     // The raising instruction: `run/0` at code offset 1.
-    machine.current_code = Some((0, 1));
+    machine.set_current_code(0, 1);
     // A catch frame owned by frame 1: landing there unwinds frame 2 (`outer`) away.
     machine.push_catch_frame(CatchFrame::new(1, 0, 1));
     machine.set_class_atom(ExceptionClass::Error, make_atom(Atom::from_raw(11)));

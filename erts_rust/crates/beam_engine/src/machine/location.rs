@@ -511,7 +511,7 @@ mod tests {
         // crate's typed error rather than indexing out of bounds or inventing a name.
         let module = Module::default();
         let mut machine = Machine::new();
-        machine.current_code = Some((3, 0));
+        machine.set_current_code(3, 0);
         machine.entry_call = Some((7, 2));
         let mut ctx = MinimalContext::new();
 

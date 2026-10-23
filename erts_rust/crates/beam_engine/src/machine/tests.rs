@@ -527,7 +527,7 @@ fn a_raise_snapshots_the_pre_unwind_frame_chain() {
         .unwrap();
     // `step_instruction` records `current_code` at the raising instruction; here it
     // is the function at index 5, code offset 11, in the entry context (0).
-    machine.current_code = Some((5, 11));
+    machine.set_current_code(5, 11);
 
     // A catch frame owned by frame 1: landing there unwinds frame 2 (G) away.
     machine.push_catch_frame(CatchFrame::new(20, 2, 1));
@@ -561,7 +561,7 @@ fn an_uncaught_raise_snapshots_the_frame_chain() {
             context: 0,
         })
         .unwrap();
-    machine.current_code = Some((5, 11));
+    machine.set_current_code(5, 11);
 
     let err = machine
         .throw(ExceptionClass::Exit, Eterm::from_raw(2))
@@ -583,7 +583,7 @@ fn reset_clears_the_raise_snapshot_but_a_resume_preserves_it() {
 
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
-    machine.current_code = Some((5, 3));
+    machine.set_current_code(5, 3);
     // An uncaught raise refreshes the snapshot (nothing is unwound here).
     let _ = machine
         .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
