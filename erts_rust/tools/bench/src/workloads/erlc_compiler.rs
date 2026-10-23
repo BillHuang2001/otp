@@ -347,7 +347,14 @@ impl Workload for ErlcCompiler {
             "corpus: {total_files} files ({total_loc} LOC) attempted from {sources}; \
              {total_produced} produced .beam ({total_produced_loc} LOC)"
         ));
-
+        // Compile-attribution guard (anti-`-pa`): record which `compile` module the `erlc`
+        // child's Erlang node actually resolves, so a figure produced by the *system* OTP
+        // compiler instead of this tree's is never quoted as an in-tree measurement. The probe
+        // inherits the same `ERL_FLAGS`/`ERL_COMPILER_OPTIONS` environment the `erlc` spawn
+        // does, and a probe that cannot answer records `unknown (<reason>)` — never nothing.
+        result
+            .notes
+            .push(super::gc_class::erl_compiler_which_note());
         if total_produced == 0 {
             let exit = runs.last().and_then(|r| r.completed.exit_code);
             let stderr = runs

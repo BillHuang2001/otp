@@ -131,8 +131,10 @@ fn comparison_flags_presence_and_status_changes() {
 /// `rust` runtime) and keep declaring the contracts it exercises. If it is ever flipped
 /// back to `SysOnly` or removed, this fails loudly — no silent loss of Rust coverage.
 ///
-/// The same guard covers the four other cross-runtime signals: `list_walk` (compute),
-/// `copy_bound` (messaging/copy), `gc_bound` (GC) and `binary_append` (binary building).
+/// The same guard covers the six other cross-runtime signals: `list_walk` (compute),
+/// `copy_bound` (messaging/copy), `gc_bound` (GC allocation churn), `binary_append` (binary
+/// building), `file_io` (I/O) and `gc_class` (GC classes: a collector-running ping-pong, the
+/// ETS copy boundary and an in-process compile).
 #[test]
 fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     let foreign = workload::find("foreign").expect("the `foreign` workload must be registered");
@@ -237,5 +239,45 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     assert!(
         rust_capable.contains(&"binary_append"),
         "the rust-schedulable workload set must include `binary_append`; got {rust_capable:?}"
+    );
+
+    // `file_io` closes the I/O-bound gap (it was the one mandated class with no cross-runtime
+    // workload: `cowboy` is `SysOnly`). Same guard: registered, `Both`, `io`, A.1+A.7.
+    let file_io = workload::find("file_io").expect("the `file_io` workload must be registered");
+    assert!(
+        matches!(file_io.runtimes(), Runtimes::Both),
+        "`file_io` must run under both runtimes, got {:?}",
+        file_io.runtimes()
+    );
+    assert_eq!(file_io.category(), Category::Io);
+    assert!(
+        file_io.contracts().contains(&"A.1") && file_io.contracts().contains(&"A.7"),
+        "contracts: {:?}",
+        file_io.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"file_io"),
+        "the rust-schedulable workload set must include `file_io`; got {rust_capable:?}"
+    );
+
+    // `gc_class` is the GC-bound *classes* signal (a real collector-running ping-pong, the ETS
+    // copy boundary and an in-process compile) — the GC class beyond `gc_bound`'s churn loop.
+    let gc_class = workload::find("gc_class").expect("the `gc_class` workload must be registered");
+    assert!(
+        matches!(gc_class.runtimes(), Runtimes::Both),
+        "`gc_class` must run under both runtimes, got {:?}",
+        gc_class.runtimes()
+    );
+    assert_eq!(gc_class.category(), Category::Gc);
+    for contract in ["A.1", "A.2", "A.5", "A.9"] {
+        assert!(
+            gc_class.contracts().contains(&contract),
+            "`gc_class` must declare {contract}; contracts: {:?}",
+            gc_class.contracts()
+        );
+    }
+    assert!(
+        rust_capable.contains(&"gc_class"),
+        "the rust-schedulable workload set must include `gc_class`; got {rust_capable:?}"
     );
 }

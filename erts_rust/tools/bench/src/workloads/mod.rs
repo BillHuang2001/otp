@@ -36,9 +36,11 @@ pub mod cowboy;
 pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;
+pub mod file_io;
 pub mod foreign;
 pub mod foreign_sample;
 pub mod gc_bound;
+pub mod gc_class;
 pub mod khepri;
 pub mod list_walk;
 pub mod plb;
@@ -130,6 +132,8 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(list_walk::ListWalk),
         Box::new(copy_bound::CopyBound),
         Box::new(gc_bound::GcBound),
+        Box::new(gc_class::GcClass),
+        Box::new(file_io::FileIo),
         Box::new(binary_append::BinaryAppend),
     ]
 }
@@ -137,7 +141,7 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::metrics::{Category, Runtimes};
     #[test]
     fn repo_env_var_names_are_uppercased() {
         assert_eq!(repo_env_var("cowboy"), "BENCH_COWBOY_REPO");
@@ -210,8 +214,45 @@ mod tests {
                 "list_walk",
                 "copy_bound",
                 "gc_bound",
+                "gc_class",
+                "file_io",
                 "binary_append"
             ]
         );
+    }
+
+    /// The mandate this suite exists for: the evaluation/deep-dive docs name four workload
+    /// classes (compute/JIT-bound, messaging/copy-bound, GC-bound, I-O-bound) **plus** startup,
+    /// and every one of them must be measurable under **both** runtimes — a class that only ever
+    /// runs the system oracle cannot express a cross-runtime number.
+    ///
+    /// This is a coverage pin: deleting (or demoting to `SysOnly`) the only `Both` workload of a
+    /// class fails here, by name, instead of silently shrinking the suite.
+    #[test]
+    fn every_mandated_workload_class_has_a_cross_runtime_workload() {
+        let registry = registry();
+        let mandated = [
+            Category::Startup,
+            Category::Compute,
+            Category::Messaging,
+            Category::Gc,
+            Category::Io,
+        ];
+        for category in mandated {
+            let both: Vec<&str> = registry
+                .iter()
+                .filter(|w| w.category() == category && w.runtimes() == Runtimes::Both)
+                .map(|w| w.id())
+                .collect();
+            assert!(
+                !both.is_empty(),
+                "no `Runtimes::Both` workload covers category {category:?} — the suite cannot \
+                 measure that mandated class cross-runtime (the full registry is: {:?})",
+                registry
+                    .iter()
+                    .map(|w| (w.id(), w.category(), w.runtimes()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -394,7 +394,12 @@ fn compile_corpus(
         Ok(version) => result.notes.push(format!("compiler: {version}")),
         Err(reason) => result.notes.push(reason),
     }
-    result.notes.push(
+    // Compile-attribution guard (anti-`-pa`): `elixirc` drives an Erlang node, so record which
+    // `compile` module *that* node resolves — the same guard the in-process compile rows carry.
+    // An undeterminable answer is recorded as `unknown (<reason>)`, never omitted silently.
+    result
+        .notes
+        .push(super::gc_class::erl_compiler_which_note());    result.notes.push(
         "corpus = the checkout's unbuilt, read-only .ex sources staged into $TMPDIR; \
          compiler = the installed system elixirc, so a version skew with the checkout is expected"
             .to_string(),
