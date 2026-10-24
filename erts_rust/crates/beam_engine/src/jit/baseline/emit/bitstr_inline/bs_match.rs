@@ -222,6 +222,15 @@ impl BsMatchShape {
                         return None;
                     }
                     let dst = Loc::of(commands.get(i + 5)?)?;
+                    // A destination that **is** the context slot is legitimate only as the
+                    // last command (`beam_asm:filter_essentials/1` elides the context when
+                    // this is its final use). Mid-list it would overwrite the context term —
+                    // which the family also does, but the family never has to re-execute, and
+                    // this lowering's `fallback` does: the interpreter step would re-read a
+                    // small integer where a context is due.
+                    if dst == ctx && end != commands.len() {
+                        return None;
+                    }
                     if dst.is_y() {
                         y_destinations += 1;
                         if y_destinations > 1 {
@@ -367,15 +376,14 @@ fn emit_bs_match_command(
             buffer.jcc(Cond::Ne, fail_arm)
         }
         BsMatchCmd::Skip { stride } => {
-            // `commands::skip_cmd`: a checked advance, then the commit.
+            // `commands::skip_cmd`: a checked advance, then the running position moves.
             buffer.mov_ri(Reg::Rcx, *stride as i64)?;
             buffer.add_rr(Reg::Rcx, Reg::Rsi)?;
             buffer.jcc(Cond::B, fail_arm)?;
             buffer.mov_rm(Reg::Rax, MOVE_SCRATCH, SUB_BITS_END_DISP)?;
             buffer.cmp_rr(Reg::Rcx, Reg::Rax)?;
             buffer.jcc(Cond::A, fail_arm)?;
-            buffer.mov_rr(Reg::Rsi, Reg::Rcx)?;
-            buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)
+            buffer.mov_rr(Reg::Rsi, Reg::Rcx)
         }
         BsMatchCmd::Integer { nbits, dst } => {
             // `nbits > remaining` -> the FAIL label.
@@ -387,10 +395,10 @@ fn emit_bs_match_command(
             let (base, bit_pos, num_bytes) =
                 emit_subject_view(buffer, MOVE_SCRATCH, Reg::Rsi, fallback)?;
             emit_bit_extract(buffer, base, bit_pos, *nbits, num_bytes, Reg::R8, fallback)?;
-            // The commit **before** the destination write (`ctx` may alias `dst`).
+            // The running position advances, then the destination is bound. The context's
+            // `start` word is **not** written here (see [`try_inline_bs_match`]).
             buffer.mov_ri(Reg::Rcx, *nbits as i64)?;
             buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
-            buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
             // `make_small(raw)` — `(raw << 4) | TAG_IMMED1_SMALL`, zero allocation.
             buffer.shl_ri(Reg::R8, 4)?;
             buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
@@ -406,20 +414,39 @@ fn emit_bs_match_command(
 /// ```text
 ///   <each Y destination's frame-window guard>   ; before any store
 ///   <the match-context guard>                   ; not a context -> fallback
-///   mov  rsi, [ctx + 16]                        ; pos
-///   <one sequence per command, in order>        ; each mutating one commits as it goes
+///   mov  rsi, [ctx + 16]                        ; the running position
+///   <one sequence per command, in order>        ; the position moves in `rsi` only
+///   mov  [ctx + 16], rsi                        ; the single accepted-path commit
 ///   jmp  fast_done
 /// fail_arm:
+///   mov  [ctx + 16], rsi                        ; the last successful command's position
 ///   <the linker's exit to the fail label>
 /// fallback:
 ///   <one interpreter step>
 /// ```
 ///
-/// **Position stores go command by command**, never batched: a rejected guard therefore
-/// leaves the context at the last successful command, exactly as the family's own
-/// command-by-command loop does. Nothing on the accepted path allocates and nothing raises,
-/// so no `emit_position_store` is needed and the context block base read by
-/// [`emit_ctx_guard`] stays valid for the whole list.
+/// **The context's `start` word is written exactly once on the accepted path and once on the
+/// fail path — never per command.** The two paths must not share a mutation policy, because
+/// they mean different things:
+///
+/// * the **fail** path leaves the family's own state: `families::bitstrings::matching::
+///   commands` commits after every successful `skip`/`integer`, so a rejected command sees
+///   the context at the last *successful* one — and that is exactly `rsi`, which only ever
+///   holds a command's outcome after that command succeeded;
+/// * the **fallback** path is a **deopt**, i.e. `jit_step_one` re-executing *this* instruction
+///   in the interpreter with the same operands. It therefore requires the instruction to be
+///   **re-execution idempotent**: any run-time state it mutated must be invisible to that
+///   re-execution. A per-command commit broke precisely this — a `skip 2` committed `start = 2`
+///   and a later `integer`'s extraction declined to the granular path, so the interpreter
+///   re-ran `ensure_exactly 8` against a window it had already shortened, rejected the match
+///   and raised `{badmatch, Subject}` on a body the family accepts. That is the `<<_:2,
+///   Field:6>>`-over-one-byte shape a base62 decoder runs per character, and it is a **wrong
+///   result**, the one outcome this tier must never produce.
+///
+/// Every guard that can take `fallback` — the `Y` destination windows, the context guard and
+/// the field extraction — therefore runs while `start` is still untouched, and nothing raises
+/// on the accepted path (no allocation and no error), so the block base in [`MOVE_SCRATCH`]
+/// stays valid for the whole list and needs no `emit_position_store`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::jit::baseline::emit) fn try_inline_bs_match(
     buffer: &mut CodeBuffer,
@@ -464,9 +491,11 @@ pub(in crate::jit::baseline::emit) fn try_inline_bs_match(
             highest_touched,
         )?;
     }
+    buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
     buffer.jmp(fast_done)?;
 
     buffer.bind(fail_arm)?;
+    buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
     linker.emit_exit(
         buffer,
         allocation,

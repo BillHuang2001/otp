@@ -70,7 +70,7 @@
 
 use beam_common::Result;
 use beam_term::{
-    Eterm, BITSTRING_TAG_MASK, ERL_SUB_BITS_FLAG_MASK, HEADER_BIN_REF, HEADER_SUB_BITS,
+    Eterm, BITSTRING_TAG_MASK, HEADER_BIN_REF, HEADER_SUB_BITS,
     HEAP_BITS_SUBTAG, TAG_IMMED1_MASK, TAG_IMMED1_SMALL, TAG_LITERAL_PTR, TAG_PRIMARY_BOXED,
     TAG_PRIMARY_MASK, TAG_PTR_MASK,
 };
@@ -131,15 +131,6 @@ const SUB_BITS_END_DISP: i32 = (3 * core::mem::size_of::<Eterm>()) as i32;
 /// The byte offset of an `ErlSubBits`'s `orig` word (word index 4) — the inner subject
 /// the context was created over (`erts/emulator/beam/erl_bits.h:60-82`).
 const SUB_BITS_ORIG_DISP: i32 = (4 * core::mem::size_of::<Eterm>()) as i32;
-
-/// The byte offset of an `ErlSubBits`'s `base_flags` word (word index 1) — the low
-/// [`ERL_SUB_BITS_FLAG_MASK`] bits are flags and the rest is the subject's byte base
-/// pointer (`erl_sub_bits_get_base`, `erts/emulator/beam/erl_bits.h:124-125`).
-const SUB_BITS_BASE_DISP: i32 = (core::mem::size_of::<Eterm>()) as i32;
-
-/// `!ERL_SUB_BITS_FLAG_MASK` — the mask an `ErlSubBits::base_flags` word needs before it
-/// is usable as a pointer (`beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK`).
-const SUB_BITS_BASE_MASK: i64 = !(ERL_SUB_BITS_FLAG_MASK as i64);
 
 /// The byte offset of an `ErlHeapBits`'s bit-`size` word (word index 1): the layout is
 /// `[thing_word, size_in_bits, data…]` (`erts/emulator/beam/erl_bits.h:150-164`).
@@ -490,14 +481,27 @@ pub(crate) fn emit_bit_extract(
 
 /// Emit the subject classification both field-extracting shapes share, and hand back the
 /// three registers [`emit_bit_extract`] consumes: the **byte base** of the readable window,
-/// the **bit position** of `pos` inside it and that window's **byte count**.
+/// the **bit position** of `pos` inside it and that window's **readable byte count**.
 ///
-/// Exactly `raw::heap_bits`' two readable subject forms: an on-heap `ErlHeapBits` (base =
-/// its data region, bit position = `pos`, size = its own bit-size word) and a refc `BinRef`
-/// window `ErlSubBits` (base = its byte base plus `pos / 8`, size = `end - pos`, off = `pos
-/// & 7`, bit position = `pos + off`). Every other value — a literal-area term, a match
-/// context, a bare `BinRef`, a non-boxed word — jumps to `fallback`, i.e. the family's own
-/// typed error through one interpreter step; no path here fabricates a view.
+/// Only `raw::heap_bits`' **on-heap** readable form is lowered: an `ErlHeapBits` (base = its
+/// data region, bit position = `pos`, since the form's bit offset is always `0`). Every other
+/// value jumps to `fallback`, i.e. one interpreter step — the family then answers the true
+/// value or its own typed error. That covers a non-boxed word, a literal-area term, a
+/// **refc window** (an `ErlSubBits` over a `BinRef`, whose payload byte base is not the
+/// context's `base_flags` — see below), a match context used as a subject, a bare `BinRef`
+/// and every non-bitstring; no path here fabricates a view.
+///
+/// **`num_bytes` is the window's readable byte count rounded up to whole words**, not the
+/// strict `ceil(bits / 8)`: an `ErlHeapBits` block is `[header, size, data…]` with its data
+/// region padded to a whole word (`heap_bits_size_words`), so the bytes between the last
+/// logical byte and the end of that final word are allocated and readable. The wider bound
+/// only ever admits a read of such a padding byte, and [`emit_bit_extract`]'s granular form
+/// reads a second byte **only** for a field whose bits reach past the first one — every
+/// field bit lies inside the remaining window, hence inside the logical subject — so the
+/// extra byte can never contribute a bit of the result. The narrow bound was a real
+/// performance bug: a `<<_:2, Field:6>>` match over a **1-byte** subject (a `base62`-style
+/// per-character binary) needs no second byte at all, yet `ceil(8 / 8) = 1` refused the
+/// two-byte window and forced a deopt on every character.
 ///
 /// # Register contract
 ///
@@ -510,8 +514,6 @@ fn emit_subject_view(
     pos: Reg,
     fallback: CodeLabel,
 ) -> Result<(Reg, Reg, Reg)> {
-    let refc_arm: CodeLabel = buffer.label();
-    let tail: CodeLabel = buffer.label();
     buffer.mov_rm(Reg::Rdx, ctx, SUB_BITS_ORIG_DISP)?;
     buffer.mov_ri(Reg::Rax, NOT_BOXED_MASK)?;
     buffer.test_rr(Reg::Rdx, Reg::Rax)?;
@@ -526,55 +528,29 @@ fn emit_subject_view(
     buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
     buffer.and_rr(Reg::Rdx, Reg::Rax)?;
     buffer.mov_rm(Reg::Rdi, Reg::Rdx, HEADER_DISP)?;
+    // An `ErlSubBits` as the inner subject is **not** lowered: a refc window's byte base is
+    // its own payload pointer plus its window bit offset (`raw::heap_bits`), never the
+    // context's `base_flags`, and a match context is not a readable subject at all. Both are
+    // one interpreter step — the family's answer, correct by construction.
     buffer.mov_ri(Reg::Rax, SUB_BITS_HEADER)?;
     buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
-    buffer.jcc(Cond::E, refc_arm)?;
-    // Not an `ErlSubBits`: only an on-heap `ErlHeapBits` is a readable subject (a bare
-    // `BinRef`, a tuple, an atom, … is the family's typed error).
+    buffer.jcc(Cond::E, fallback)?;
+    // Only an on-heap `ErlHeapBits` is a readable subject (a bare `BinRef`, a tuple, an
+    // atom, … is the family's typed error).
     buffer.mov_ri(Reg::Rax, BITSTRING_TAG_MASK_WORD)?;
     buffer.and_rr(Reg::Rdi, Reg::Rax)?;
     buffer.mov_ri(Reg::Rax, HEAP_BITS_SUBTAG_WORD)?;
     buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
     buffer.jcc(Cond::Ne, fallback)?;
-    // The on-heap arm: base = the data region (word 2), size = the `size` word, off = 0.
+    // The on-heap arm: base = the data region (word 2), bit position = `pos` (offset 0).
     buffer.lea(MOVE_SCRATCH_2, Reg::Rdx, HEAP_BITS_DATA_DISP)?;
     buffer.mov_rm(Reg::Rax, Reg::Rdx, HEAP_BITS_SIZE_DISP)?;
-    buffer.xor_rr(Reg::Rcx, Reg::Rcx)?;
-    buffer.jmp(tail)?;
-
-    // The refc-window arm (`raw::heap_bits`' `ErlSubBits` + `BinRef` case): the `orig` must
-    // really be a `BinRef`, and the window is the context's own `base_flags`/`start`/`end`.
-    buffer.bind(refc_arm)?;
-    buffer.mov_rm(Reg::Rdi, Reg::Rdx, HEADER_DISP)?;
-    buffer.mov_ri(Reg::Rax, BIN_REF_HEADER)?;
-    buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
-    buffer.jcc(Cond::Ne, fallback)?;
-    buffer.mov_rm(Reg::Rax, ctx, SUB_BITS_BASE_DISP)?;
-    buffer.mov_ri(Reg::Rdi, SUB_BITS_BASE_MASK)?;
-    buffer.and_rr(Reg::Rax, Reg::Rdi)?;
-    // `base + pos / 8` — the byte holding the window's first bit.
-    buffer.mov_rr(MOVE_SCRATCH_2, pos)?;
-    buffer.shr_ri(MOVE_SCRATCH_2, 3)?;
-    buffer.add_rr(MOVE_SCRATCH_2, Reg::Rax)?;
-    // `size = end - pos`, with `end < pos` refused rather than wrapped (`saturating_sub`
-    // would make such a window empty, and an empty window can never hold the field).
-    buffer.mov_rm(Reg::Rax, ctx, SUB_BITS_END_DISP)?;
-    buffer.cmp_rr(Reg::Rax, pos)?;
-    buffer.jcc(Cond::B, fallback)?;
-    buffer.sub_rr(Reg::Rax, pos)?;
-    // `off = pos & 7`.
-    buffer.mov_rr(Reg::Rcx, pos)?;
-    buffer.mov_ri(Reg::Rdi, 7)?;
-    buffer.and_rr(Reg::Rcx, Reg::Rdi)?;
-
-    // `num_bytes = (off + size + 7) >> 3` and `bit_pos = pos + off` — the interpreter's own
-    // two figures (`raw::subject_bytes` and `pos + off`).
-    buffer.bind(tail)?;
-    buffer.add_rr(Reg::Rax, Reg::Rcx)?;
-    buffer.mov_ri(Reg::Rdi, 7)?;
+    // `num_bytes = round_up_8(ceil(size / 8)) = ((size + 63) >> 6) << 3` — the block's own
+    // data-region extent, which is word-padded (see the doc comment).
+    buffer.mov_ri(Reg::Rdi, 63)?;
     buffer.add_rr(Reg::Rax, Reg::Rdi)?;
-    buffer.shr_ri(Reg::Rax, 3)?;
+    buffer.shr_ri(Reg::Rax, 6)?;
+    buffer.shl_ri(Reg::Rax, 3)?;
     buffer.mov_rr(Reg::Rdx, pos)?;
-    buffer.add_rr(Reg::Rdx, Reg::Rcx)?;
     Ok((MOVE_SCRATCH_2, Reg::Rdx, Reg::Rax))
 }
