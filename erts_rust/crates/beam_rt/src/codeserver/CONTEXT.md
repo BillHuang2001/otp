@@ -142,6 +142,11 @@ instructions):
   of the whole path is `../tests/code_path.rs`; the boot gates are
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test boot`
   and `beam_rt -noshell -boot bootstrap/bin/start` (exit 0, empty stdout/stderr).
+- **The full crate gate is `-p beam_rt --lib --no-fail-fast`**: 1978 passed / 4 failed / 7 ignored,
+  and the four are the pre-existing `src/runner/` *measured-table* pins
+  (`a_process_never_hands_out_off_heap_slots_across_slices`, `boundary_cost`, `reds_door`,
+  `slice_charging`) — number-drift pins owned by that node, not this one. The `codeserver::` slice
+  is green on its own (`--lib -- codeserver::`, 32 passed).
 - `system_path` reads the **ambient** `$ERL_LIBS`, so a test that manipulates it must be
   serialized by the caller (the crate's env discipline).
 
