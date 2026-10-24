@@ -123,6 +123,7 @@ use super::jit_step_one;
 mod aggregate;
 pub(super) mod arith;
 mod bif;
+mod bitstr_inline;
 mod block;
 mod compare;
 mod compile;

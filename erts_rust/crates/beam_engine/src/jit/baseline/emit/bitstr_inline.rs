@@ -52,10 +52,10 @@
 //! `crate::families::bitstrings::matching`.
 
 use beam_common::Result;
-use beam_loader::{Label, Operand, NO_FAIL};
+use beam_loader::{Label, Module, Operand, NO_FAIL};
 use beam_term::{
-    Eterm, HEADER_SUB_BITS, MAX_SMALL, TAG_IMMED1_MASK, TAG_IMMED1_SMALL, TAG_PRIMARY_BOXED,
-    TAG_PRIMARY_MASK, TAG_PTR_MASK,
+    Eterm, BITSTRING_TAG_MASK, HEADER_BIN_REF, HEADER_SUB_BITS, HEAP_BITS_SUBTAG, MAX_SMALL,
+    TAG_IMMED1_MASK, TAG_IMMED1_SMALL, TAG_PRIMARY_BOXED, TAG_PRIMARY_MASK, TAG_PTR_MASK,
 };
 
 use crate::interpreter::LabelMap;
@@ -86,6 +86,22 @@ const SUB_BITS_START_DISP: i32 = (2 * core::mem::size_of::<Eterm>()) as i32;
 /// The byte offset of an `ErlSubBits`'s `end` word (word index 3).
 const SUB_BITS_END_DISP: i32 = (3 * core::mem::size_of::<Eterm>()) as i32;
 
+/// The byte offset of an `ErlSubBits`'s `orig` word (word index 4) — the inner subject
+/// the context was created over (`erts/emulator/beam/erl_bits.h:60-82`).
+const SUB_BITS_ORIG_DISP: i32 = (4 * core::mem::size_of::<Eterm>()) as i32;
+
+/// `_BITSTRING_TAG_MASK` — the header mask `beam_term::boxed::is_bitstring_header` tests,
+/// which both bitstring headers (`HEAP_BITS_SUBTAG`/`SUB_BITS_SUBTAG`) share.
+const BITSTRING_TAG_MASK_WORD: i64 = BITSTRING_TAG_MASK as i64;
+
+/// `HEAP_BITS_SUBTAG` — the header subtag a bitstring header carries.
+const HEAP_BITS_SUBTAG_WORD: i64 = HEAP_BITS_SUBTAG as i64;
+
+/// `HEADER_BIN_REF` — an off-heap `BinRef`'s header word
+/// (`beam_term::boxed::is_bin_ref`). An `ErlSubBits` whose `orig` is one is a **refc
+/// window** over an off-heap payload, i.e. a fresh *subject*, not a match context.
+const BIN_REF_HEADER: i64 = HEADER_BIN_REF.raw() as i64;
+
 /// The byte offset of a term's header word (a boxed term points *at* it).
 const HEADER_DISP: i32 = 0;
 
@@ -97,8 +113,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 4;
-
+pub(crate) const SHAPE_COUNT: usize = 6;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
