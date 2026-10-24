@@ -80,6 +80,7 @@ mod execution;
 mod export_gate;
 mod fun_identity;
 pub(crate) mod gc;
+pub(crate) mod gc_valve_trace;
 pub(crate) mod gc_walk;
 mod ir_cache;
 mod memory_hook;

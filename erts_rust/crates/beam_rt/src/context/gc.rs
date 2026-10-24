@@ -163,7 +163,16 @@ use crate::RuntimeContext;
 ///
 /// It is re-exported here (rather than called by its own path at each site) so the three
 /// admission-point call sites and the runner's park arm cannot drift onto different valves.
-pub(crate) use super::gc_walk::{any_root_is_unscanned, reaches_an_unscanned_word, valve_verdict};
+// The door-tagged forms are what every production call site uses (each names its own
+// [`super::gc_valve_trace::ValveDoor`] so the invocation census can attribute the walk). The
+// un-doored forms are kept re-exported because the unit suites call them directly, and because the
+// per-site docs link to them; a production caller reaching for one of those would land in
+// `ValveDoor::Other` and show up unidentified in the census.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use super::gc_walk::{
+    any_root_is_unscanned, any_root_is_unscanned_at, reaches_an_unscanned_word,
+    reaches_an_unscanned_word_at, valve_verdict, valve_verdict_at,
+};
 mod reds_door;
 /// The **reduction/yield-boundary** collection point — the slice-end door a workload whose loop
 /// reaches no heap-admission point still gets collected at (see the module docs of
@@ -360,11 +369,115 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
 ///
 /// [`Heap::hp`] is the bump pointer and [`Heap::hend`] is one past the block, so the block's
 /// base is `hp - used` term words back from `hp`.
+///
+/// This is the **one-shot** form, kept for the `valve_bounds` suite's filter-less oracle
+/// ([`word_region_exactly`]); every production classifier inside a walk takes the block from a
+/// [`Geometry`] instead, so the descent reads these three fields once per walk rather than once
+/// per classified word (see [`Geometry`]).
+#[cfg(test)]
 fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
     let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
     let base = (heap.hp() as usize).wrapping_sub(words);
     let end = heap.hend() as usize;
     ptr >= base && ptr < end
+}
+
+/// The **two per-walk geometries** every per-word classification is decided against, read
+/// **once** per walk and carried as a `Copy` value:
+///
+/// * the mutator block's `[base, hend)` — what [`in_heap_block`] derives from three
+///   [`Heap`] reads (`used`, `hp`, `hend`) on **every** classified word;
+/// * the collector's aggregate geometry ([`ScannedBounds`]), which the walk already hoisted.
+///
+/// Nothing in a walk mutates either: a descent only reads the process's term graph, so the bump
+/// frontier, the block end and the collector's spaces are constant for its whole duration. That is
+/// what makes the hoist verdict-neutral — the values are the same ones the per-word form would
+/// read, read once. A caller that cannot promise immutability (anything that allocates or
+/// collects between two classifications) uses the one-shot free functions instead
+/// ([`word_region`], [`root_is_unscanned`]), which build a `Geometry` per call.
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    /// One past the mutator block's first word (`hp - used`).
+    base: usize,
+    /// The mutator block's end (`hend`).
+    end: usize,
+    /// The collector's aggregate scanned geometry.
+    bounds: ScannedBounds,
+}
+
+impl Geometry {
+    /// Reads both geometries off `process` — the form every walk entry point uses.
+    #[inline]
+    pub(crate) fn of(process: &Process) -> Geometry {
+        Geometry::from_bounds(process, process.collector().scanned_bounds())
+    }
+
+    /// Reads the mutator block off `process` and pairs it with a [`ScannedBounds`] the caller
+    /// already read — for a caller that keeps the two reads apart.
+    #[inline]
+    pub(crate) fn from_bounds(process: &Process, bounds: ScannedBounds) -> Geometry {
+        let heap = process.heap();
+        let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
+        Geometry {
+            base: (heap.hp() as usize).wrapping_sub(words),
+            end: heap.hend() as usize,
+            bounds,
+        }
+    }
+
+    /// [`in_heap_block`] against the hoisted block: two compares on values already in registers.
+    #[inline]
+    fn block_contains(&self, ptr: usize) -> bool {
+        ptr >= self.base && ptr < self.end
+    }
+
+    /// [`word_region`] against the hoisted geometry — the walk's per-word classifier.
+    #[inline]
+    pub(crate) fn word_region(
+        &self,
+        process: &Process,
+        word: Eterm,
+        traced: bool,
+    ) -> Option<WordRegion> {
+        let ptr = foreign_shape_pointer(word)?;
+        if self.block_contains(ptr) || !outside_bounds(process.collector(), &self.bounds, ptr, traced)
+        {
+            Some(WordRegion::Scanned)
+        } else {
+            Some(WordRegion::Foreign)
+        }
+    }
+
+    /// [`word_is_scanned`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn word_is_scanned(&self, process: &Process, word: Eterm, traced: bool) -> bool {
+        matches!(self.word_region(process, word, traced), Some(WordRegion::Scanned))
+    }
+
+    /// [`forwards_scanned_word`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn forwards_scanned_word(
+        &self,
+        process: &Process,
+        word: Eterm,
+        traced: bool,
+    ) -> bool {
+        forwards_word_matching(word, |child| self.word_is_scanned(process, child, traced))
+    }
+
+    /// [`root_is_unscanned_with`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn root_is_unscanned(
+        &self,
+        process: &Process,
+        term: Eterm,
+        traced: bool,
+    ) -> bool {
+        match self.word_region(process, term, traced) {
+            Some(WordRegion::Foreign) => self.forwards_scanned_word(process, term, traced),
+            Some(WordRegion::Scanned) | None => false,
+        }
+    }
 }
 
 /// Which side of the collector's scan boundary a heap pointer lies on — the classification
@@ -458,43 +571,32 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     // whole valve at 0.40 % of samples, and hoisting an aggregate load cannot move that. What it
     // buys is that the per-word classification and the forwarding test can never read two
     // different geometries inside one decision.
-    let bounds = process.collector().scanned_bounds();
-    root_is_unscanned_with(process, &bounds, term)
-}
-
-/// [`root_is_unscanned`] against a [scanned-bounds](ScannedBounds) value the caller already read
-/// — the form the reachability walk uses, so one aggregate read serves a whole walk.
-pub(crate) fn root_is_unscanned_with(
-    process: &Process,
-    bounds: &ScannedBounds,
-    term: Eterm,
-) -> bool {
-    match word_region(process, bounds, term) {
-        Some(WordRegion::Foreign) => forwards_scanned_word(process, bounds, term),
-        Some(WordRegion::Scanned) | None => false,
-    }
+    //
+    // The invocation census's flag ([`super::gc_valve_trace`]) is read here too, once per
+    // classification, because this one-shot form has no walk to hoist it out of: its production
+    // caller is the BIF-result gate, which reaches it at most once per `call_bif` and only after
+    // the shape test has already admitted the result.
+    Geometry::of(process).root_is_unscanned(process, term, super::gc_valve_trace::enabled())
 }
 
 /// Which region `word` points into: `None` for a word no relocation touches (an immediate, a
 /// literal-area pointer, or a word whose pointer names no address a term can live at —
 /// [`dereferenceable_pointer`]), otherwise the side of the scan boundary the container lives on.
 ///
-/// This is the **one** place the scanned test is applied, so the per-word root classification,
-/// the walk's descent and the foreign-container expansion can never disagree about a word.
+/// This is the **one-shot** form, kept for the suites that classify a handful of words with no
+/// walk around them (it reads the [`Geometry`] itself); every production classifier is
+/// [`Geometry::word_region`], which is the one place the scanned test is applied, so the per-word
+/// root classification, the walk's descent and the foreign-container expansion can never disagree
+/// about a word.
+#[cfg(test)]
+#[inline]
 pub(crate) fn word_region(
     process: &Process,
     bounds: &ScannedBounds,
     word: Eterm,
+    traced: bool,
 ) -> Option<WordRegion> {
-    // The three **term-only** tests, shared with [`result_may_be_foreign`] and handing back the
-    // address they already had to compute, so the placement test below needs no second
-    // `dereferenceable_pointer` call and the two entry points cannot drift apart.
-    let ptr = foreign_shape_pointer(word)?;
-    if in_heap_block(process.heap(), ptr) || !outside_bounds(process.collector(), bounds, ptr) {
-        Some(WordRegion::Scanned)
-    } else {
-        Some(WordRegion::Foreign)
-    }
+    Geometry::from_bounds(process, *bounds).word_region(process, word, traced)
 }
 
 /// Whether `word` could name a container in a region the collector does **not** scan — the three
@@ -507,8 +609,8 @@ pub(crate) fn word_region(
 /// (`RuntimeContext::open_gate_for_foreign_result`), which runs once per successful `call_bif`
 /// and whose results are overwhelmingly immediates (a small int from `erlang:rem/2`): hoisting
 /// the shape test ahead of the process-table probe keeps that common case off the table entirely,
-/// with a verdict identical to the probe's own, because [`word_region`] answers `None` (and
-/// [`root_is_unscanned_with`] therefore `false`) for exactly these words.
+/// with a verdict identical to the probe's own, because [`Geometry::word_region`] answers `None`
+/// (and [`Geometry::root_is_unscanned`] therefore `false`) for exactly these words.
 #[inline]
 pub(crate) fn result_may_be_foreign(word: Eterm) -> bool {
     foreign_shape_pointer(word).is_some()
@@ -518,9 +620,10 @@ pub(crate) fn result_may_be_foreign(word: Eterm) -> bool {
 /// relocation never has to know: an immediate, a literal-area pointer, or a pointer naming no
 /// address a term can live at ([`dereferenceable_pointer`]).
 ///
-/// The single definition of "this word could be a foreign container" — [`word_region`] continues
-/// from the address it returns and [`result_may_be_foreign`] stops at its presence — so the two
-/// can never disagree about which words are worth a region test.
+/// The single definition of "this word could be a foreign container" —
+/// [`Geometry::word_region`] continues from the address it returns and [`result_may_be_foreign`]
+/// stops at its presence — so the two can never disagree about which words are worth a region
+/// test.
 #[inline]
 fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
     if !is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
@@ -532,8 +635,17 @@ fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
 /// a collection must follow and update, and therefore the word that makes the foreign container
 /// holding it a hazard.
-pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: Eterm) -> bool {
-    matches!(word_region(process, bounds, word), Some(WordRegion::Scanned))
+///
+/// The one-shot form; the walk uses [`Geometry::word_is_scanned`].
+#[cfg(test)]
+#[inline]
+pub(crate) fn word_is_scanned(
+    process: &Process,
+    bounds: &ScannedBounds,
+    word: Eterm,
+    traced: bool,
+) -> bool {
+    Geometry::from_bounds(process, *bounds).word_is_scanned(process, word, traced)
 }
 
 /// Whether `ptr` lies outside **every** region `collector` scans — the two-tier scanned test
@@ -554,11 +666,62 @@ pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: E
 /// free line of a mark-region mature generation. `may_contain == true` is never treated as
 /// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only
 /// means "ask them".
-fn outside_bounds(collector: &AnyCollector, bounds: &ScannedBounds, ptr: usize) -> bool {
+#[inline]
+fn outside_bounds(
+    collector: &AnyCollector,
+    bounds: &ScannedBounds,
+    ptr: usize,
+    traced: bool,
+) -> bool {
+    // The invocation census's tier split ([`super::gc_valve_trace`]), carried in as a flag the
+    // caller hoisted (the walk reads it once per walk), so the untraced path pays a single
+    // predictable branch per tier instead of an environment probe per classified word.
     if bounds.definitely_unscanned(ptr as *const Eterm) {
+        if traced {
+            super::gc_valve_trace::record_tier1_foreign();
+        }
         return true;
     }
-    outside_scanned_exactly(collector, ptr)
+    let outside = outside_scanned_ordered(collector, ptr);
+    if traced {
+        super::gc_valve_trace::record_tier2(outside);
+    }
+    outside
+}
+
+/// The **production** form of [`outside_scanned_exactly`]: the same answer, computed in the order
+/// that answers a real graph fastest.
+///
+/// Two facts make the reordering free, and both are properties of pure predicates over one
+/// immutable geometry — no decision is approximated:
+///
+/// * `!young_contains(p) && !mature_contains(p)` is commutative, so testing the **mature**
+///   generation first cannot change the result. It does change the *cost*: the graph a valve walks
+///   lives mostly in the mature generation and in growth-retired nursery spaces (measured: 97 % of
+///   the classified container words fall through the aggregate fast reject into this test, and the
+///   trace's `tier2_scanned` counter puts almost all of them inside a scanned space), so a mature
+///   hit now answers the test without ever consulting the nursery chain's ordered retired-space
+///   index — the expensive half, an `O(log #spaces)` map query per classified word.
+/// * when the nursery chain holds **one** space (`young_space_count() == 1`, i.e. no growth retired
+///   a space) that space *is* the mutator block [`in_heap_block`] has already rejected —
+///   [`HeapSpace::contains`](beam_gc::HeapSpace::contains) is `[base, top)`, a subset of the
+///   block's `[base, hend)` — so the nursery half of the test is **false by construction** and
+///   costs nothing. The `debug_assert` below re-derives the answer from the exact test on every
+///   debug build (the whole lib suite, including the in-process stdlib compiles), so the shortcut
+///   is checked against the reference rather than trusted.
+#[inline]
+fn outside_scanned_ordered(collector: &AnyCollector, ptr: usize) -> bool {
+    if collector.mature_contains(ptr as *const Eterm) {
+        return false;
+    }
+    if collector.young_space_count() == 1 {
+        debug_assert!(
+            outside_scanned_exactly(collector, ptr),
+            "the single nursery space is the mutator block, which the caller already rejected"
+        );
+        return true;
+    }
+    !collector.young_contains(ptr as *const Eterm)
 }
 
 /// **Tier two on its own**: whether `ptr` lies outside every region `collector` relocates,
@@ -602,12 +765,15 @@ pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<Word
 /// values of those words are then classified by [`word_is_scanned`]: a leaf forwards nothing, a
 /// shape whose cells are all immediates forwards nothing, and each one is exactly as safe in a
 /// foreign region as an immediate is.
+#[cfg(test)]
+#[inline]
 pub(crate) fn forwards_scanned_word(
     process: &Process,
     bounds: &ScannedBounds,
     term: Eterm,
+    traced: bool,
 ) -> bool {
-    forwards_word_matching(term, |word| word_is_scanned(process, bounds, word))
+    Geometry::from_bounds(process, *bounds).forwards_scanned_word(process, term, traced)
 }
 
 /// [`forwards_scanned_word`] against an arbitrary child-word predicate — the enumeration without
@@ -1116,14 +1282,47 @@ fn report_max_heap_breach(process: &beam_process::Process, pid: beam_process::Pr
     let _ = writeln!(err, "     Message Queue Len:  {queue_len}");
 }
 
-fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> {
+fn collect_or_grow(
+    door: super::gc_valve_trace::ValveDoor,
+    process: &mut Process,
+    heap_need: u32,
+) -> Result<Collection> {
     let need = heap_need as usize;
+    // The invocation census' admission record ([`super::gc_valve_trace::note_admission`]): the
+    // words the admission wants and the nursery it wants them from, taken **before** the
+    // collection so the report can put the two beside the collection they produced. Gated on the
+    // census' own switch, so an untraced run pays one flag test per *collection* (not per
+    // allocation) and nothing else.
+    let capacity_before = process.heap().capacity();
+    super::gc_valve_trace::note_admission(
+        door,
+        process.pid(),
+        super::gc_valve_trace::Admission {
+            heap_need,
+            capacity: capacity_before,
+            available: process.heap().available(),
+            chain_used: process.heap_used_words(),
+            occupancy: process.should_collect(need),
+            debt: process.collection_debt(),
+        },
+    );
     let growable = process.collector().policy().next_words(need, 0) >= need;
-    if growable {
+    let action = if growable {
         process.ensure_capacity(need)
     } else {
         process.collect()
+    };
+    if let Ok(collection) = &action {
+        super::gc_valve_trace::note_collection(
+            door,
+            process.pid(),
+            matches!(collection.kind, CollectionKind::Major),
+            process.heap().capacity() > capacity_before,
+            collection.stats.words_copied,
+            collection.stats.words_reclaimed,
+        );
     }
+    action
 }
 
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
@@ -1273,7 +1472,8 @@ pub(crate) fn ensure_heap(
     // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
     // container really did reach a live root, which is the event the gate records.
     let descend = runtime.foreign_reachable(pid);
-    let declined = any_root_is_unscanned(
+    let declined = any_root_is_unscanned_at(
+        super::gc_valve_trace::ValveDoor::EnsureHeap,
         runtime.walk_scratch(),
         process,
         x_regs.iter().chain(stack.iter()),
@@ -1332,7 +1532,11 @@ pub(crate) fn ensure_heap(
     // actually reach `heap_need` — the collector's on-demand **growth** seam. See
     // [`collect_or_grow`] for why the growth is what keeps a request larger than the nursery
     // on the process's own reclaimable heap, and for the bounded-policy fallback.
-    let action = collect_or_grow(process, heap_need);
+    let action = collect_or_grow(
+        super::gc_valve_trace::ValveDoor::EnsureHeap,
+        process,
+        heap_need,
+    );
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -1583,7 +1787,13 @@ fn ensure_heap_full_commit(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict_at(
+        super::gc_valve_trace::ValveDoor::EnsureHeapFull,
+        runtime.walk_scratch(),
+        process,
+        machine_roots(),
+        descend,
+    );
     let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::EnsureHeapFull, descend, declined);
@@ -1635,7 +1845,11 @@ fn ensure_heap_full_commit(
 
     // The action is the same as the narrow door's: collect, or grow the nursery to fit a
     // request the post-collection nursery cannot hold. See [`collect_or_grow`].
-    let action = collect_or_grow(process, heap_need);
+    let action = collect_or_grow(
+        super::gc_valve_trace::ValveDoor::EnsureHeapFull,
+        process,
+        heap_need,
+    );
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -2092,7 +2306,13 @@ fn alloc_words_rooted_commit(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict_at(
+        super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+        runtime.walk_scratch(),
+        process,
+        machine_roots(),
+        descend,
+    );
     let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::AllocWordsRooted, descend, declined);
@@ -2144,8 +2364,31 @@ fn alloc_words_rooted_commit(
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
+    // The invocation census' admission/collection pair ([`super::gc_valve_trace`]), exactly as
+    // [`collect_or_grow`] records it for the two `heap_need` doors.
+    let capacity_before = process.heap().capacity();
+    super::gc_valve_trace::note_admission(
+        super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+        process.pid(),
+        super::gc_valve_trace::Admission {
+            heap_need: n.min(u32::MAX as usize) as u32,
+            capacity: capacity_before,
+            available: process.heap().available(),
+            chain_used: process.heap_used_words(),
+            occupancy: process.should_collect(n),
+            debt: process.collection_debt(),
+        },
+    );
     match process.collect() {
         Ok(collection) => {
+            super::gc_valve_trace::note_collection(
+                super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+                process.pid(),
+                matches!(collection.kind, CollectionKind::Major),
+                process.heap().capacity() > capacity_before,
+                collection.stats.words_copied,
+                collection.stats.words_reclaimed,
+            );
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
             // The `max_heap_size` verdict, drained exactly as the two heap-admission doors'
@@ -3481,7 +3724,12 @@ mod tests {
                 "the fixture's nursery term must live in the process's mutator block"
             );
             assert!(
-                word_is_scanned(process, &process.collector().scanned_bounds(), self.young),
+                word_is_scanned(
+                    process,
+                    &process.collector().scanned_bounds(),
+                    self.young,
+                    false,
+                ),
                 "the fixture's nursery term must be a word the collector relocates"
             );
         }
@@ -3583,7 +3831,7 @@ mod tests {
                 "the non-value is inert, never a hazard"
             );
             assert_eq!(
-                word_region(process, &process.collector().scanned_bounds(), non_value),
+                word_region(process, &process.collector().scanned_bounds(), non_value, false),
                 None,
                 "the classifier must not even place it in a region"
             );

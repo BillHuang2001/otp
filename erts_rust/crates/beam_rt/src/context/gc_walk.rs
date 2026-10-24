@@ -206,8 +206,8 @@ use beam_term::list::ptr_val;
 use beam_term::prelude::is_list;
 use beam_term::Eterm;
 
-use super::gc::{forwards_scanned_word, word_region, WordRegion};
-use beam_gc::ScannedBounds;
+use super::gc::{Geometry, WordRegion};
+use super::gc_valve_trace::{RootFamily, ValveDoor};
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
 
@@ -278,6 +278,11 @@ pub(crate) struct ValveVerdict {
 /// `false` the descent is skipped and only the cheap `O(roots)` per-word phase runs. The gate can
 /// only ever cost a collection, never allow a wrong one — and a gate that is *open* is closed
 /// again by a [verdict](ValveVerdict) that reached no foreign container at all.
+// Every production caller names its own [`ValveDoor`] (the `_at` form below), so the walk it
+// issues is attributable in the invocation census. These un-doored forms are what the unit
+// suites call directly and what the sibling modules' docs link to; a production caller
+// reaching for one would land in `ValveDoor::Other` and show up unidentified in the census.
+#[allow(dead_code)]
 pub(crate) fn any_root_is_unscanned<'a, I>(
     scratch: &mut WalkScratch,
     process: &Process,
@@ -287,11 +292,32 @@ pub(crate) fn any_root_is_unscanned<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    valve_verdict(scratch, process, machine_roots, descend).declined
+    any_root_is_unscanned_at(ValveDoor::Other, scratch, process, machine_roots, descend)
+}
+
+/// [`any_root_is_unscanned`], naming the [door](ValveDoor) that issued it so the invocation
+/// census ([`super::gc_valve_trace`]) can attribute the walk. The answer is identical — the door
+/// is a label, never an input.
+pub(crate) fn any_root_is_unscanned_at<'a, I>(
+    door: ValveDoor,
+    scratch: &mut WalkScratch,
+    process: &Process,
+    machine_roots: I,
+    descend: bool,
+) -> bool
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    valve_verdict_at(door, scratch, process, machine_roots, descend).declined
 }
 
 /// [`any_root_is_unscanned`], reporting **both** halves of the valve's answer so an admission
 /// point that handed over its whole root set can also close the process's descent latch.
+// Every production caller names its own [`ValveDoor`] (the `_at` form below), so the walk it
+// issues is attributable in the invocation census. These un-doored forms are what the unit
+// suites call directly and what the sibling modules' docs link to; a production caller
+// reaching for one would land in `ValveDoor::Other` and show up unidentified in the census.
+#[allow(dead_code)]
 pub(crate) fn valve_verdict<'a, I>(
     scratch: &mut WalkScratch,
     process: &Process,
@@ -301,14 +327,32 @@ pub(crate) fn valve_verdict<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    // The collector's aggregate geometry is read **once per call** and handed down to every
-    // per-word classification: hygiene, not a claimed win (the whole valve is 0.40 % of samples
-    // in a `beam_gc` peer's profile), but it keeps one decision on one geometry.
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin(scratch, bounds, Criterion::Collection);
+    valve_verdict_at(ValveDoor::Other, scratch, process, machine_roots, descend)
+}
+
+/// [`valve_verdict`], naming the [door](ValveDoor) that issued it for the invocation census.
+///
+/// The door is **observation only**: it is recorded after the verdict is computed and never read
+/// back, so a door label cannot change a decline, a `foreign_free` or a collection.
+pub(crate) fn valve_verdict_at<'a, I>(
+    door: ValveDoor,
+    scratch: &mut WalkScratch,
+    process: &Process,
+    machine_roots: I,
+    descend: bool,
+) -> ValveVerdict
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    // The two per-walk geometries (the mutator block and the collector's aggregate) are read
+    // **once per call** and handed down to every per-word classification: hygiene, not a claimed
+    // win (the whole valve is 0.40 % of samples in a `beam_gc` peer's profile), but it keeps one
+    // decision on one geometry — and the block's three `Heap` reads then cost nothing per word.
+    let mut walk = Walk::begin(scratch, process, Criterion::Collection);
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
+            super::gc_valve_trace::note_verdict(process.pid(), door, descend, true, false, false, 0);
             return ValveVerdict {
                 declined: true,
                 foreign_free: false,
@@ -316,28 +360,60 @@ where
         }
     }
     walk.seed_process_roots(process);
-    if !walk.hit && descend {
+    let phase1_hit = walk.hit;
+    if !phase1_hit && descend {
         walk.run(process);
     }
-    ValveVerdict {
+    let verdict = ValveVerdict {
         declined: walk.hit,
         // Only a descent may claim the graph is foreign-free: the per-word phase looked at the
         // roots alone, and a foreign container nested in a scanned one is exactly what it cannot
         // see.
         foreign_free: descend && !walk.foreign_reached,
-    }
+    };
+    super::gc_valve_trace::note_verdict(
+        process.pid(),
+        door,
+        descend,
+        phase1_hit,
+        walk.hit && !phase1_hit,
+        verdict.foreign_free,
+        walk.scratch.visited.len,
+    );
+    verdict
 }
 
 /// The [`Process`]-only form of [`any_root_is_unscanned`], for a collection site whose machine
 /// roots are **already published** into the process's own root set — the runner's park arm,
 /// where `publish_parked_roots` runs immediately before
 /// [`Runtime::serve_gc_request`](crate::runtime::Runtime).
+///
+/// The one production caller is that park arm
+/// ([`crate::runtime::gc`](crate::runtime::gc), outside this node), so the un-doored signature
+/// reports its walks as [`ValveDoor::ServeGcRequest`]; an in-node caller that is not the park arm
+/// uses [`process_roots_are_unscanned_at`] and names its own door.
 pub(crate) fn process_roots_are_unscanned(
     scratch: &mut WalkScratch,
     process: &Process,
     descend: bool,
 ) -> bool {
-    any_root_is_unscanned(scratch, process, std::iter::empty::<&Eterm>(), descend)
+    process_roots_are_unscanned_at(ValveDoor::ServeGcRequest, scratch, process, descend)
+}
+
+/// [`process_roots_are_unscanned`], naming the [door](ValveDoor) that issued it.
+pub(crate) fn process_roots_are_unscanned_at(
+    door: ValveDoor,
+    scratch: &mut WalkScratch,
+    process: &Process,
+    descend: bool,
+) -> bool {
+    any_root_is_unscanned_at(
+        door,
+        scratch,
+        process,
+        std::iter::empty::<&Eterm>(),
+        descend,
+    )
 }
 
 /// Whether the **off-heap payload prune** ([`super::gc::bin_vheap::reclaim`]) must decline —
@@ -382,6 +458,11 @@ pub(crate) fn process_roots_are_unscanned(
 /// graph, and a foreign `BinRef` pair need not open it (it forwards nothing a relocation follows).
 /// The prune runs only on a triggered binary virtual heap, i.e. never on the per-slice path, so it
 /// always descends rather than trusting a hint that cannot answer its question.
+// Every production caller names its own [`ValveDoor`] (the `_at` form below), so the walk it
+// issues is attributable in the invocation census. These un-doored forms are what the unit
+// suites call directly and what the sibling modules' docs link to; a production caller
+// reaching for one would land in `ValveDoor::Other` and show up unidentified in the census.
+#[allow(dead_code)]
 pub(crate) fn reaches_an_unscanned_word<'a, I>(
     scratch: &mut WalkScratch,
     process: &Process,
@@ -390,15 +471,47 @@ pub(crate) fn reaches_an_unscanned_word<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin(scratch, bounds, Criterion::PayloadPrune);
+    reaches_an_unscanned_word_at(ValveDoor::Other, scratch, process, roots)
+}
+
+/// [`reaches_an_unscanned_word`], naming the [door](ValveDoor) that issued it for the invocation
+/// census ([`super::gc_valve_trace`]). The door is a label, never an input.
+pub(crate) fn reaches_an_unscanned_word_at<'a, I>(
+    door: ValveDoor,
+    scratch: &mut WalkScratch,
+    process: &Process,
+    roots: I,
+) -> bool
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    let mut walk = Walk::begin(scratch, process, Criterion::PayloadPrune);
     for &word in roots {
         walk.seed(process, word);
         if walk.hit {
+            super::gc_valve_trace::note_verdict(
+                process.pid(),
+                door,
+                true,
+                true,
+                false,
+                false,
+                walk.scratch.visited.len,
+            );
             return true;
         }
     }
-    walk.run(process)
+    let hit = walk.run(process);
+    super::gc_valve_trace::note_verdict(
+        process.pid(),
+        door,
+        true,
+        false,
+        hit,
+        false,
+        walk.scratch.visited.len,
+    );
+    hit
 }
 
 /// The **one** per-runtime cell holding the pids whose descent latch is open.
@@ -527,7 +640,7 @@ impl beam_process::CollectionGate for RuntimeCollectionGate {
         if !descend {
             return false;
         }
-        process_roots_are_unscanned(&mut self.scratch, receiver, true)
+        process_roots_are_unscanned_at(ValveDoor::CollectionGate, &mut self.scratch, receiver, true)
     }
 }
 
@@ -564,9 +677,9 @@ enum Criterion {
 /// all has been reached.
 struct Walk<'a> {
     scratch: &'a mut WalkScratch,
-    /// The collector's aggregate scanned geometry, read once by the caller
-    /// ([`valve_verdict`]) and reused for every word of this walk.
-    bounds: ScannedBounds,
+    /// The two per-walk geometries — the mutator block and the collector's aggregate — read
+    /// once by [`Walk::begin`] and reused for every word of this walk ([`Geometry`]).
+    geometry: Geometry,
     /// The hazard this walk answers for (see [`Criterion`]).
     criterion: Criterion,
     /// A hazard was reached: a foreign container forwarding a scanned word (a collection), or any
@@ -583,6 +696,9 @@ struct Walk<'a> {
     /// [`Criterion::ResourcePrune`] only: the candidate words this walk reached, in visit order
     /// and possibly with duplicates (deduplicated by the entry point before it is returned).
     reached: Vec<usize>,
+    /// Whether the invocation census ([`super::gc_valve_trace`]) is on — read **once per walk** by
+    /// [`Walk::begin`], so [`Walk::expand`]'s per-object accounting is a field test.
+    traced: bool,
     /// [`Criterion::ResourcePrune`] only: the candidate words by **reference identity** —
     /// `(id, candidate word)`, sorted by id. A resource term is a reference term, so a **copy** of
     /// it (the send path, `ETS`, or any other `copy_struct` destination) is a different word with
@@ -645,6 +761,9 @@ struct Visited {
     /// Test-only: how many times the table has grown (the growth test's witness).
     #[cfg(test)]
     grows: u64,
+    /// Whether the invocation census ([`super::gc_valve_trace`]) is on, read **once per walk** by
+    /// [`Visited::begin`] so the per-object path pays a field test instead of an env probe.
+    traced: bool,
 }
 
 /// One slot of the visited set: the object address it holds, plus the generation that wrote it
@@ -669,6 +788,7 @@ impl Visited {
     /// reset). The only path that touches every slot is the wrap of the `u32` generation
     /// counter, once every four billion walks.
     fn begin(&mut self) {
+        self.traced = super::gc_valve_trace::enabled();
         if self.generation == u32::MAX {
             self.slots.clear();
             self.generation = 1;
@@ -689,23 +809,58 @@ impl Visited {
 
     /// Records `key`; answers whether it is **newly** recorded (`false` when the walk in
     /// progress already holds it — which is what makes a shared or cyclic graph terminate).
+    ///
+    /// The **room test is `O(1)` and the room *work* is out of line**. Creating the slot array on
+    /// a walk's first insert and doubling it when the current generation fills it are the only
+    /// two `O(len)` operations the descent performs, and they run ~7 times over a whole run
+    /// against ~1.9 M inserts; keeping them in this body made the function's frame carry the
+    /// spills of both (and made `insert` recurse through `grow`'s re-insert loop, which blocks
+    /// inlining it into its three callers). [`Visited::make_room`] is `#[cold]` +
+    /// `#[inline(never)]`, so the hot path is a compare-and-branch and the frame stays small.
     fn insert(&mut self, key: usize) -> bool {
-        if self.slots.is_empty() {
-            self.slots.resize(INITIAL_SLOTS, Slot::default());
-        } else if (self.len + 1) * 4 > self.slots.len() * 3 {
-            self.grow();
+        if self.slots.is_empty() || (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.make_room();
         }
         let mask = self.slots.len() - 1;
         #[cfg(test)]
         {
             self.inserts += 1;
         }
+        // The **first** probe is the overwhelmingly common case (the census measures 1.05 probes
+        // per insert on a real run), so it is answered before any counting: the invocation
+        // census's chain-length bookkeeping lives in the cold collision tail below, where only the
+        // 5 % of inserts that met an occupied slot pay for it.
         let mut slot = Self::probe(key) & mask;
+        let entry = self.slots[slot];
+        if entry.generation != self.generation {
+            self.slots[slot] = Slot {
+                key,
+                generation: self.generation,
+            };
+            self.len += 1;
+            if self.traced {
+                super::gc_valve_trace::record_insert(1, true);
+            }
+            return true;
+        }
+        if entry.key == key {
+            if self.traced {
+                super::gc_valve_trace::record_insert(1, false);
+            }
+            return false;
+        }
+        // The collision chain: probed linearly, and the only place the census counts steps.
+        let traced = self.traced;
+        let mut steps: u64 = 1;
         loop {
             #[cfg(test)]
             {
                 self.probes += 1;
             }
+            if traced {
+                steps += 1;
+            }
+            slot = (slot + 1) & mask;
             let entry = self.slots[slot];
             if entry.generation != self.generation {
                 self.slots[slot] = Slot {
@@ -713,17 +868,36 @@ impl Visited {
                     generation: self.generation,
                 };
                 self.len += 1;
+                if traced {
+                    super::gc_valve_trace::record_insert(steps, true);
+                }
                 return true;
             }
             if entry.key == key {
+                if traced {
+                    super::gc_valve_trace::record_insert(steps, false);
+                }
                 return false;
             }
-            slot = (slot + 1) & mask;
         }
     }
 
+    /// Makes room for one more key: allocates the slot array on a walk's first insert, or doubles
+    /// it when the current generation occupies three quarters of it. The `#[cold]` half of
+    /// [`Visited::insert`] — see its docs for why the split is load-bearing.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self) {
+        if self.slots.is_empty() {
+            self.slots.resize(INITIAL_SLOTS, Slot::default());
+        } else {
+            self.grow();
+        }
+    }
     /// Doubles the table and re-inserts the current generation's keys (the only allocation the
     /// descent ever performs, and it amortises away).
+    #[cold]
+    #[inline(never)]
     fn grow(&mut self) {
         // The key buffer is taken out of `self` so the rebuild can borrow the table mutably;
         // it is returned at the end, so a warm table's grows allocate the slot array alone.
@@ -739,6 +913,9 @@ impl Visited {
         #[cfg(test)]
         {
             self.grows += 1;
+        }
+        if self.traced {
+            super::gc_valve_trace::record_grow();
         }
         // The re-insert cannot re-enter `grow`: the table is twice one that was at most
         // three-quarters full, so the resulting load is at most three-eighths.
@@ -768,14 +945,19 @@ impl Visited {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk over `scratch` against `bounds` and `criterion`, resetting the reused state in
-    /// `O(1)`.
-    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds, criterion: Criterion) -> Walk<'a> {
+    /// Starts a walk over `scratch` against `process`'s geometries and `criterion`, resetting the
+    /// reused state in `O(1)`.
+    fn begin(
+        scratch: &'a mut WalkScratch,
+        process: &Process,
+        criterion: Criterion,
+    ) -> Walk<'a> {
         scratch.pending.clear();
         scratch.visited.begin();
         Walk {
+            traced: scratch.visited.traced,
             scratch,
-            bounds,
+            geometry: Geometry::of(process),
             criterion,
             hit: false,
             foreign_reached: false,
@@ -795,10 +977,10 @@ impl<'a> Walk<'a> {
     /// leak-never-dangle rule.
     fn begin_resource(
         scratch: &'a mut WalkScratch,
-        bounds: ScannedBounds,
+        process: &Process,
         candidates: &'a [usize],
     ) -> Walk<'a> {
-        let mut walk = Walk::begin(scratch, bounds, Criterion::ResourcePrune);
+        let mut walk = Walk::begin(scratch, process, Criterion::ResourcePrune);
         walk.candidates = Some(candidates);
         walk.resource_ids.reserve(candidates.len());
         for &word in candidates {
@@ -868,7 +1050,7 @@ impl<'a> Walk<'a> {
         // (a small integer, an atom, `NIL`, an internal pid/port id — no children, and neither
         // this walk nor the collector descends into it) and for a literal-area pointer (a frozen
         // code constant; see the module docs).
-        match word_region(process, &self.bounds, word) {
+        match self.geometry.word_region(process, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) => {
                 // A container the collector scans: descend into it (once — the visited set is what
@@ -916,7 +1098,7 @@ impl<'a> Walk<'a> {
             // The copy is a leaf of the same shape: nothing below it can be a candidate either.
             return;
         }
-        match word_region(process, &self.bounds, word) {
+        match self.geometry.word_region(process, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) | Some(WordRegion::Foreign) => {
                 if self.scratch.visited.insert(ptr_val(word) as usize) {
@@ -940,7 +1122,7 @@ impl<'a> Walk<'a> {
             self.hit = true;
             return;
         }
-        if forwards_scanned_word(process, &self.bounds, word) {
+        if self.geometry.forwards_scanned_word(process, word, self.traced) {
             self.hit = true;
             return;
         }
@@ -975,6 +1157,9 @@ impl<'a> Walk<'a> {
 
         // 1. The registers: `x[0..live)`, the whole Erlang stack, the extra roots.
         process.registers().gather_roots(&mut buf);
+        if self.traced {
+                super::gc_valve_trace::record_roots(RootFamily::Registers, buf.len());
+            }
         #[cfg(test)]
         {
             seed_counters::note_register_words(buf.len());
@@ -983,6 +1168,9 @@ impl<'a> Walk<'a> {
         self.seed_all(process, &buf);
         // 2. The mailbox envelope — three words per message, straight from the queue.
         if !self.hit {
+            if self.traced {
+                super::gc_valve_trace::record_roots(RootFamily::Mailbox, 3 * process.mailbox().len());
+            }
             #[cfg(test)]
             seed_counters::note_root_words(3 * process.mailbox().len());
             for message in process.mailbox().iter() {
@@ -996,6 +1184,9 @@ impl<'a> Walk<'a> {
         }
         // 3. The dictionary, straight from its entry iterator.
         if !self.hit {
+            if self.traced {
+                super::gc_valve_trace::record_roots(RootFamily::Dict, 2 * process.dict().len());
+            }
             #[cfg(test)]
             seed_counters::note_root_words(2 * process.dict().len());
             for (key, value) in process.dict().entries() {
@@ -1010,6 +1201,9 @@ impl<'a> Walk<'a> {
         if !self.hit {
             buf.clear();
             process.saved_args().gather_roots(&mut buf);
+            if self.traced {
+                super::gc_valve_trace::record_roots(RootFamily::SavedArgs, buf.len());
+            }
             #[cfg(test)]
             seed_counters::note_root_words(buf.len());
             self.seed_all(process, &buf);
@@ -1018,6 +1212,9 @@ impl<'a> Walk<'a> {
         if !self.hit {
             buf.clear();
             process.signals().gather_roots(&mut buf);
+            if self.traced {
+                super::gc_valve_trace::record_roots(RootFamily::Signals, buf.len());
+            }
             #[cfg(test)]
             seed_counters::note_root_words(buf.len());
             self.seed_all(process, &buf);
@@ -1051,6 +1248,9 @@ impl<'a> Walk<'a> {
 
     /// Classifies every child of the object `word` names.
     fn expand(&mut self, process: &Process, word: Eterm) {
+        if self.traced {
+            super::gc_valve_trace::record_expand();
+        }
         let address: *const Eterm = ptr_val(word);
         // SAFETY: `word` reaches the worklist only through `seed`/`reach_foreign`, which enqueue
         // exactly the boxed/cons words that are (a) genuine terms and (b) either addressed inside
@@ -1126,7 +1326,30 @@ impl<'a> Walk<'a> {
 /// The answer is the reachable subset of `candidates`, sorted. It is **not** a verdict: the caller
 /// decides what an unreached candidate means (and must decline — treat everything as reachable —
 /// whenever its own gates say the root set is not complete).
+// Every production caller names its own [`ValveDoor`] (the `_at` form below), so the walk it
+// issues is attributable in the invocation census. These un-doored forms are what the unit
+// suites call directly and what the sibling modules' docs link to; a production caller
+// reaching for one would land in `ValveDoor::Other` and show up unidentified in the census.
+#[allow(dead_code)]
 pub(crate) fn reachable_resource_words<'a, I, H>(
+    scratch: &mut WalkScratch,
+    process: &Process,
+    roots: I,
+    host: H,
+    candidates: &[usize],
+) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a Eterm>,
+    H: IntoIterator<Item = &'a Eterm>,
+{
+    reachable_resource_words_at(ValveDoor::Other, scratch, process, roots, host, candidates)
+}
+
+/// [`reachable_resource_words`], naming the [door](ValveDoor) that issued it for the invocation
+/// census ([`super::gc_valve_trace`]). The door is a label, never an input: the reachable subset is
+/// the same either way.
+pub(crate) fn reachable_resource_words_at<'a, I, H>(
+    door: ValveDoor,
     scratch: &mut WalkScratch,
     process: &Process,
     roots: I,
@@ -1141,8 +1364,7 @@ where
         candidates.windows(2).all(|pair| pair[0] < pair[1]),
         "the resource candidates must be sorted and deduplicated"
     );
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin_resource(scratch, bounds, candidates);
+    let mut walk = Walk::begin_resource(scratch, process, candidates);
     for &word in roots {
         walk.seed(process, word);
     }
@@ -1151,6 +1373,18 @@ where
     }
     walk.seed_process_roots(process);
     walk.run(process);
+    // This walk is neither a collection nor a valve over one: it has no phase-1/descent split and
+    // no `foreign_free` answer, so only its scale is reported (`descend = true` because the descent
+    // really ran).
+    super::gc_valve_trace::note_verdict(
+        process.pid(),
+        door,
+        true,
+        false,
+        false,
+        false,
+        walk.scratch.visited.len,
+    );
     let mut reached = std::mem::take(&mut walk.reached);
     reached.sort_unstable();
     reached.dedup();
