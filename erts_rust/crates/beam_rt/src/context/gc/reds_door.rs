@@ -343,11 +343,37 @@ pub(crate) fn collect_at_reds_boundary(
     // `beam_gc::AnyCollector::collect_minor` — a young-only collection that grows the mature space
     // instead of fullsweeping — is the seam that would remove the escalation (its owner is
     // `beam_gc`).
+    // The invocation census' admission/collection pair ([`crate::context::gc_valve_trace`]),
+    // exactly as [`super::collect_or_grow`] records it: this door's `heap_need` is the boundary's
+    // own trigger, which is an occupancy watermark rather than an allocation request, so the need
+    // it reports is `0` and the two capacity figures are the ones it decides against. Its two
+    // triggers are exactly the census' `occupancy`/`debt` pair, so it reports them verbatim.
+    let capacity_before = process.heap().capacity();
+    crate::context::gc_valve_trace::note_admission(
+        crate::context::gc_valve_trace::ValveDoor::RedsBoundary,
+        process.pid(),
+        crate::context::gc_valve_trace::Admission {
+            heap_need: 0,
+            capacity: capacity_before,
+            available: process.heap().available(),
+            chain_used: process.heap_used_words(),
+            occupancy: occupied,
+            debt,
+        },
+    );
     let action = process
         .collect_kind(CollectionKind::Minor)
         .or_else(|_| process.collect());
     match action {
         Ok(collection) => {
+            crate::context::gc_valve_trace::note_collection(
+                crate::context::gc_valve_trace::ValveDoor::RedsBoundary,
+                process.pid(),
+                matches!(collection.kind, CollectionKind::Major),
+                process.heap().capacity() > capacity_before,
+                collection.stats.words_copied,
+                collection.stats.words_reclaimed,
+            );
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
             // The `max_heap_size` verdict this collection latched on the PCB — the same drain

@@ -59,7 +59,15 @@
 //!   the [`Visited`](super::gc_walk) table's inserts/probes/grows, the object expansions, the
 //!   per-walk size histogram (once over every call, once over descents alone), and the two tiers of
 //!   the scanned test ([`super::gc::word_region`]) — the aggregate fast reject versus the exact
-//!   per-region fallback the profile shows as `Nursery::contains`.
+//!   per-region fallback the profile shows as `Nursery::contains`;
+//! * **per `ProcessId`** ([`PidCounts`], keyed by the process whose roots the walk was handed): its
+//!   valve calls, descents, visited objects and peak, and — the denominator a *descent count* needs
+//!   to be interpretable — every admission it paid ([`Admission`]: the words it wanted, the nursery
+//!   capacity/free words it wanted them from, its chain-summed occupancy, and the two trigger flags
+//!   [`beam_process::Process::should_collect`]/[`beam_process::Process::collection_debt`]) beside
+//!   the number of **real collections** that process ran, split into the ones whose nursery
+//!   capacity actually grew and the ones that only collapsed the chain, with the words they copied
+//!   and reclaimed ([`note_admission`]/[`note_collection`]).
 //!
 //! Nothing here changes a decision: a decline is still a decline and
 //! [`ValveVerdict::foreign_free`](super::gc_walk::ValveVerdict) is still reported only for a
@@ -68,6 +76,10 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::OnceLock;
+
+use beam_process::ProcessId;
+
+use crate::hasher::FastHashMap;
 
 /// The thread that runs the runtime — the only one whose counters are printed (`src/main.rs`).
 const DRIVER_THREAD: &str = "beam_rt-driver";
@@ -327,11 +339,73 @@ impl Counts {
     }
 }
 
+/// One process's census: the valve work it paid and what its collections actually did.
+///
+/// Keyed by [`ProcessId`], because *who* pays a descent decides which lever matters: one long-lived
+/// process paying hundreds of walks is its admission quantum, while many short-lived processes
+/// paying a handful each is a per-spawn (initial-heap) question. A descent count on its own says
+/// nothing either — it needs the process's **real collection count** beside it, which is why
+/// [`note_collection`] is called from every collection site this node owns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PidCounts {
+    /// Valve calls whose root set was this process's.
+    pub(crate) calls: u64,
+    /// Of those, the ones that ran the descent.
+    pub(crate) descents: u64,
+    /// The visited-set size summed over this process's walks.
+    pub(crate) visited: u64,
+    /// The largest visited-set size of any one of this process's walks.
+    pub(crate) visited_peak: u64,
+    /// Real collections this process ran (every site in this node: the two admission doors'
+    /// `collect_or_grow`, `alloc_words_rooted`'s `Process::collect` and the reductions boundary's
+    /// pinned minor). The denominator of `descents / collections`.
+    pub(crate) collections: u64,
+    /// Of those, the ones the collector ran as a **major** (fullsweep).
+    pub(crate) majors: u64,
+    /// Collections after which the nursery's capacity was **larger** — the growth seam's answer,
+    /// i.e. the "the heap had to get bigger", as opposed to a collection that only reclaimed.
+    pub(crate) grew: u64,
+    /// Collections that left the nursery's capacity **unchanged** (a pure evacuation/collapse).
+    pub(crate) collapsed_only: u64,
+    /// The `heap_need` summed over this process's recorded admissions.
+    pub(crate) need_sum: u64,
+    /// The largest `heap_need` this process ever admitted at.
+    pub(crate) need_peak: u64,
+    /// The nursery capacity summed over the same admissions (÷ [`PidCounts::admissions`] is the
+    /// mean the admission was measured against).
+    pub(crate) capacity_sum: u64,
+    /// The nursery free words summed over the same admissions.
+    pub(crate) available_sum: u64,
+    /// The process's **chain-summed** heap occupancy
+    /// ([`beam_process::Process::heap_used_words`]) summed over the same admissions — the figure a
+    /// nursery capacity alone cannot show, because a retired space still holds every word the
+    /// mutator wrote in it. A large `chain_used` beside a small `capacity` is the "the chain is
+    /// long, the current space is not full" case.
+    pub(crate) chain_used_sum: u64,
+    /// How many admissions were recorded (the denominators of the sums above).
+    pub(crate) admissions: u64,
+    /// Admissions whose **occupancy** test said the nursery could not serve the request
+    /// ([`beam_process::Process::should_collect`]) — the "the heap really is full" trigger.
+    pub(crate) occupancy: u64,
+    /// Admissions carrying the collector's **collection debt**
+    /// ([`beam_process::Process::collection_debt`]) — the growth seam retired a space, and only a
+    /// collection can collapse the chain. A debt-driven admission with free words left is the
+    /// "the heap is not full, the chain is long" case: the collection is *not* serving the request
+    /// in front of it.
+    pub(crate) debt: u64,
+    /// Term words the process's collections copied (the evacuation volume).
+    pub(crate) words_copied: u64,
+    /// Term words the process's collections reclaimed.
+    pub(crate) words_reclaimed: u64,
+}
+
 /// One thread's census plus the printing duty.
 struct Trace {
     /// The tallies; a `RefCell` so an event mutates in place instead of copying a whole
     /// [`Counts`] through a `Cell` on every event.
     counts: RefCell<Counts>,
+    /// The per-process tallies (see [`PidCounts`]); only ever written while [`enabled`].
+    pids: RefCell<FastHashMap<ProcessId, PidCounts>>,
     /// Whether this thread prints the block when it exits (only the runtime driver does).
     print: bool,
 }
@@ -341,6 +415,7 @@ impl Trace {
     fn new() -> Trace {
         Trace {
             counts: RefCell::new(Counts::ZERO),
+            pids: RefCell::new(FastHashMap::default()),
             print: std::thread::current().name() == Some(DRIVER_THREAD),
         }
     }
@@ -348,6 +423,11 @@ impl Trace {
     /// Folds `f` over this thread's tallies.
     fn with<R>(f: impl FnOnce(&mut Counts) -> R) -> R {
         COUNTERS.with(|trace| f(&mut trace.counts.borrow_mut()))
+    }
+
+    /// Folds `f` over `pid`'s tallies, creating the entry on first use.
+    fn with_pid<R>(pid: ProcessId, f: impl FnOnce(&mut PidCounts) -> R) -> R {
+        COUNTERS.with(|trace| f(trace.pids.borrow_mut().entry(pid).or_default()))
     }
 }
 
@@ -450,8 +530,131 @@ impl Drop for Trace {
                 counts.tier1_foreign + counts.tier2_calls
             )
         );
+        self.print_pids(&mut out);
         eprint!("{out}");
     }
+}
+
+impl Trace {
+    /// The per-[`ProcessId`] block: the top [`PID_ROWS`] processes by visited objects, twice — once
+    /// for the valve work they paid, once for the admissions and collections it produced, because
+    /// the two tables answer different questions and one row would be too wide to read.
+    ///
+    /// The ratio the descent count has to be read beside is `descents / collections`: a process
+    /// paying one descent per collection is a per-object cost question, while a process paying many
+    /// descents per collection is an admission-quantum question.
+    fn print_pids(&self, out: &mut String) {
+        let pids = self.pids.borrow();
+        if pids.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(&ProcessId, &PidCounts)> = pids.iter().collect();
+        // Top by visited objects, ties broken by pid so the block is reproducible.
+        rows.sort_by(|a, b| {
+            b.1.visited
+                .cmp(&a.1.visited)
+                .then_with(|| (a.0.number(), a.0.serial()).cmp(&(b.0.number(), b.0.serial())))
+        });
+        let total = rows.iter().fold(PidCounts::default(), |mut acc, (_, c)| {
+            acc.calls += c.calls;
+            acc.descents += c.descents;
+            acc.visited += c.visited;
+            acc.visited_peak = acc.visited_peak.max(c.visited_peak);
+            acc.collections += c.collections;
+            acc.majors += c.majors;
+            acc.grew += c.grew;
+            acc.collapsed_only += c.collapsed_only;
+            acc.need_sum += c.need_sum;
+            acc.need_peak = acc.need_peak.max(c.need_peak);
+            acc.capacity_sum += c.capacity_sum;
+            acc.available_sum += c.available_sum;
+            acc.chain_used_sum += c.chain_used_sum;
+            acc.admissions += c.admissions;
+            acc.occupancy += c.occupancy;
+            acc.debt += c.debt;
+            acc.words_copied += c.words_copied;
+            acc.words_reclaimed += c.words_reclaimed;
+            acc
+        });
+        let _ = writeln!(
+            out,
+            "[rt-valve] per-pid totals: {} process(es) with valve work, {} call(s), {} descent(s), \
+             {} collection(s), descents_per_collection={:.2}",
+            pids.len(),
+            total.calls,
+            total.descents,
+            total.collections,
+            ratio(total.descents, total.collections)
+        );
+        let _ = writeln!(
+            out,
+            "[rt-valve]   {:<18} {:>7} {:>8} {:>10} {:>7} {:>7} {:>10} {:>9}",
+            "pid", "calls", "descents", "visited", "vpeak", "col", "desc/col", "visited_mean"
+        );
+        for (pid, c) in rows.iter().take(PID_ROWS) {
+            let _ = writeln!(
+                out,
+                "[rt-valve]   {:<18} {:>7} {:>8} {:>10} {:>7} {:>7} {:>10.3} {:>9.1}",
+                pid_label(**pid),
+                c.calls,
+                c.descents,
+                c.visited,
+                c.visited_peak,
+                c.collections,
+                ratio(c.descents, c.collections),
+                ratio(c.visited, c.descents),
+            );
+        }
+        let _ = writeln!(
+            out,
+            "[rt-valve] per-pid admissions: {:<16} {:>6} {:>8} {:>9} {:>9} {:>9} {:>5} {:>5} \
+             {:>5} {:>5} {:>8}",
+            "pid", "adm", "need_pk", "cap_mean", "avail_mean", "chain_mn", "occ", "debt", "grew",
+            "only", "copied"
+        );
+        for (pid, c) in rows.iter().take(PID_ROWS) {
+            let _ = writeln!(
+                out,
+                "[rt-valve]                     {:<16} {:>6} {:>8} {:>9.0} {:>9.0} {:>9.0} {:>5} \
+                 {:>5} {:>5} {:>5} {:>8}",
+                pid_label(**pid),
+                c.admissions,
+                c.need_peak,
+                ratio(c.capacity_sum, c.admissions),
+                ratio(c.available_sum, c.admissions),
+                ratio(c.chain_used_sum, c.admissions),
+                c.occupancy,
+                c.debt,
+                c.grew,
+                c.collapsed_only,
+                c.words_copied,
+            );
+        }
+        let _ = writeln!(
+            out,
+            "[rt-valve] per-pid totals: admissions={} need_peak={} cap_mean={:.0} avail_mean={:.0} \
+             chain_mean={:.0} occupancy={} debt={} grew={} collapsed_only={} copied={} reclaimed={}",
+            total.admissions,
+            total.need_peak,
+            ratio(total.capacity_sum, total.admissions),
+            ratio(total.available_sum, total.admissions),
+            ratio(total.chain_used_sum, total.admissions),
+            total.occupancy,
+            total.debt,
+            total.grew,
+            total.collapsed_only,
+            total.words_copied,
+            total.words_reclaimed,
+        );
+    }
+}
+
+/// How many per-process rows the block prints (the rest are folded into the totals).
+const PID_ROWS: usize = 12;
+
+/// `<0.Number.Serial>` — the pid notation the rest of the runtime's diagnostics use.
+fn pid_label(pid: ProcessId) -> String {
+    format!("<0.{}.{}>", pid.number(), pid.serial())
 }
 
 /// One histogram row: ` label=count` for every bucket, in order.
@@ -485,6 +688,7 @@ thread_local! {
 /// end. `foreign_free` is the verdict's own flag, reported by the caller exactly as the valve
 /// reported it (never re-derived here).
 pub(crate) fn note_verdict(
+    pid: ProcessId,
     door: ValveDoor,
     descend: bool,
     phase1_hit: bool,
@@ -496,6 +700,7 @@ pub(crate) fn note_verdict(
         return;
     }
     record_verdict(
+        pid,
         door,
         descend,
         phase1_hit,
@@ -508,6 +713,7 @@ pub(crate) fn note_verdict(
 /// The arithmetic of [`note_verdict`], without the switch (the unit suite's entry point).
 #[inline]
 pub(crate) fn record_verdict(
+    pid: ProcessId,
     door: ValveDoor,
     descend: bool,
     phase1_hit: bool,
@@ -539,6 +745,123 @@ pub(crate) fn record_verdict(
         if descended {
             counts.hist_descents[bucket] += 1;
         }
+    });
+    Trace::with_pid(pid, |tally| {
+        tally.calls += 1;
+        if descend && !phase1_hit {
+            tally.descents += 1;
+        }
+        tally.visited += visited as u64;
+        tally.visited_peak = tally.visited_peak.max(visited as u64);
+    });
+}
+
+/// What a heap-admission (or slice-boundary) collection site was looking at, captured **before**
+/// the collection it triggered so the report can put a process's request beside the collection it
+/// actually ran.
+///
+/// The three candidate answers to "is a collection even needed here?" are separable from these
+/// six facts: `occupancy` says the current space really is full, `debt` says the collector is
+/// carrying a retired-space chain, and `chain_used` against `capacity`/`available` says how much
+/// of the process's footprint lives outside the current space at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Admission {
+    /// The words the admission wants (a boundary door's own trigger is an occupancy watermark, so
+    /// it reports `0`).
+    pub(crate) heap_need: u32,
+    /// The nursery **capacity** the request is measured against.
+    pub(crate) capacity: usize,
+    /// The nursery's free words at the admission.
+    pub(crate) available: usize,
+    /// The process's chain-summed heap occupancy
+    /// ([`beam_process::Process::heap_used_words`]): every retired space still holding the words
+    /// the mutator wrote in it.
+    pub(crate) chain_used: usize,
+    /// [`beam_process::Process::should_collect`]'s answer — the "the current space is full"
+    /// trigger.
+    pub(crate) occupancy: bool,
+    /// [`beam_process::Process::collection_debt`]'s answer — the "the chain is long, only a
+    /// collection collapses it" trigger.
+    pub(crate) debt: bool,
+}
+
+/// Records the state an admission door is looking at (see [`Admission`]).
+///
+/// Called from [`super::gc::collect_or_grow`] (the two `heap_need`-carrying heap-admission doors),
+/// from [`super::gc::alloc_words_rooted`]'s collection and from
+/// [`super::gc::collect_at_reds_boundary`], **before** the collection, so the per-process table
+/// can put a process's `heap_need` beside the collection it actually ran. The record is
+/// verdict-neutral — nothing reads it back — and gated on [`enabled`] like every other entry point.
+#[inline]
+pub(crate) fn note_admission(_door: ValveDoor, pid: ProcessId, at: Admission) {
+    if !enabled() {
+        return;
+    }
+    record_admission(pid, at);
+}
+
+/// The arithmetic of [`note_admission`], without the switch.
+#[inline]
+fn record_admission(pid: ProcessId, at: Admission) {
+    Trace::with_pid(pid, |tally| {
+        tally.admissions += 1;
+        tally.need_sum += at.heap_need as u64;
+        tally.need_peak = tally.need_peak.max(at.heap_need as u64);
+        tally.capacity_sum += at.capacity as u64;
+        tally.available_sum += at.available as u64;
+        tally.chain_used_sum += at.chain_used as u64;
+        if at.occupancy {
+            tally.occupancy += 1;
+        }
+        if at.debt {
+            tally.debt += 1;
+        }
+    });
+}
+
+/// Records one **real** collection a process ran, and the one fact that separates a collection
+/// that had to happen from one that only grew the heap: whether the nursery's capacity was larger
+/// afterwards.
+///
+/// `grew` is the caller's comparison of the nursery capacity before and after the collection, so a
+/// collection the growth seam took (capacity up, few words evacuated) is distinguishable from an
+/// evacuation that reclaimed room at the same capacity. Gated on [`enabled`].
+#[inline]
+pub(crate) fn note_collection(
+    _door: ValveDoor,
+    pid: ProcessId,
+    major: bool,
+    grew: bool,
+    words_copied: usize,
+    words_reclaimed: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    record_collection(pid, major, grew, words_copied, words_reclaimed);
+}
+
+/// The arithmetic of [`note_collection`], without the switch.
+#[inline]
+fn record_collection(
+    pid: ProcessId,
+    major: bool,
+    grew: bool,
+    words_copied: usize,
+    words_reclaimed: usize,
+) {
+    Trace::with_pid(pid, |tally| {
+        tally.collections += 1;
+        if major {
+            tally.majors += 1;
+        }
+        if grew {
+            tally.grew += 1;
+        } else {
+            tally.collapsed_only += 1;
+        }
+        tally.words_copied += words_copied as u64;
+        tally.words_reclaimed += words_reclaimed as u64;
     });
 }
 
@@ -606,6 +929,12 @@ fn snapshot() -> Counts {
     COUNTERS.with(|trace| *trace.counts.borrow())
 }
 
+/// `pid`'s census, for the module's own tests.
+#[cfg(test)]
+fn pid_snapshot(pid: ProcessId) -> PidCounts {
+    COUNTERS.with(|trace| trace.pids.borrow().get(&pid).copied().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,10 +997,12 @@ mod tests {
     /// inferred, a phase-1 decline never counts as a descent, and the two histograms separate.
     #[test]
     fn a_verdict_folds_into_its_own_door_only() {
+        let pid = ProcessId::new(1, 0);
         let before = snapshot();
-        record_verdict(ValveDoor::EnsureHeapFull, true, true, false, false, 0);
-        record_verdict(ValveDoor::EnsureHeapFull, true, false, false, true, 40);
-        record_verdict(ValveDoor::AllocWordsRooted, false, false, false, false, 7);
+        let before_pid = pid_snapshot(pid);
+        record_verdict(pid, ValveDoor::EnsureHeapFull, true, true, false, false, 0);
+        record_verdict(pid, ValveDoor::EnsureHeapFull, true, false, false, true, 40);
+        record_verdict(pid, ValveDoor::AllocWordsRooted, false, false, false, false, 7);
         let after = snapshot();
         let full = after.doors[ValveDoor::EnsureHeapFull.index()];
         let baseline = before.doors[ValveDoor::EnsureHeapFull.index()];
@@ -700,6 +1031,60 @@ mod tests {
             after.hist_descents[hist_bucket(40)],
             before.hist_descents[hist_bucket(40)] + 1
         );
+        // The per-pid twin of the same three calls: every call counted, the two descents
+        // counted, and the visited sum/peak per process.
+        let pid_after = pid_snapshot(pid);
+        assert_eq!(pid_after.calls, before_pid.calls + 3);
+        assert_eq!(pid_after.descents, before_pid.descents + 2);
+        assert_eq!(pid_after.visited, before_pid.visited + 40);
+        assert_eq!(pid_after.visited_peak.max(before_pid.visited_peak), 40);
+    }
+
+    /// The admission/collection pair is additive per process, and the two counters that separate a
+    /// collection that grew the heap from one that only collapsed are exclusive.
+    #[test]
+    fn admissions_and_collections_are_additive_and_split_growth_from_collapse() {
+        let pid = ProcessId::new(7, 3);
+        let before = pid_snapshot(pid);
+        record_admission(
+            pid,
+            Admission {
+                heap_need: 100,
+                capacity: 4096,
+                available: 512,
+                chain_used: 4160,
+                occupancy: false,
+                debt: true,
+            },
+        );
+        record_admission(
+            pid,
+            Admission {
+                heap_need: 300,
+                capacity: 8192,
+                available: 2048,
+                chain_used: 6144,
+                occupancy: true,
+                debt: false,
+            },
+        );
+        record_collection(pid, true, true, 11, 22);
+        record_collection(pid, false, false, 3, 44);
+        let after = pid_snapshot(pid);
+        assert_eq!(after.admissions, before.admissions + 2);
+        assert_eq!(after.need_sum, before.need_sum + 400);
+        assert_eq!(after.need_peak.max(before.need_peak), 300);
+        assert_eq!(after.capacity_sum, before.capacity_sum + 4096 + 8192);
+        assert_eq!(after.available_sum, before.available_sum + 512 + 2048);
+        assert_eq!(after.chain_used_sum, before.chain_used_sum + 4160 + 6144);
+        assert_eq!(after.occupancy, before.occupancy + 1);
+        assert_eq!(after.debt, before.debt + 1);
+        assert_eq!(after.collections, before.collections + 2);
+        assert_eq!(after.majors, before.majors + 1);
+        assert_eq!(after.grew, before.grew + 1);
+        assert_eq!(after.collapsed_only, before.collapsed_only + 1);
+        assert_eq!(after.words_copied, before.words_copied + 14);
+        assert_eq!(after.words_reclaimed, before.words_reclaimed + 66);
     }
 
     /// The root tallies are per family and additive, and a duplicate insert is counted as a

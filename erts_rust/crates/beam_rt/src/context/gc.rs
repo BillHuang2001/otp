@@ -485,6 +485,7 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
 ///
 /// `traced` is the invocation census's flag, hoisted by the walk (read once per walk) and passed
 /// down so the per-word scanned test never probes the environment itself.
+#[inline]
 pub(crate) fn root_is_unscanned_with(
     process: &Process,
     bounds: &ScannedBounds,
@@ -503,6 +504,7 @@ pub(crate) fn root_is_unscanned_with(
 ///
 /// This is the **one** place the scanned test is applied, so the per-word root classification,
 /// the walk's descent and the foreign-container expansion can never disagree about a word.
+#[inline]
 pub(crate) fn word_region(
     process: &Process,
     bounds: &ScannedBounds,
@@ -557,6 +559,7 @@ fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
 /// a collection must follow and update, and therefore the word that makes the foreign container
 /// holding it a hazard.
+#[inline]
 pub(crate) fn word_is_scanned(
     process: &Process,
     bounds: &ScannedBounds,
@@ -587,6 +590,7 @@ pub(crate) fn word_is_scanned(
 /// free line of a mark-region mature generation. `may_contain == true` is never treated as
 /// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only
 /// means "ask them".
+#[inline]
 fn outside_bounds(
     collector: &AnyCollector,
     bounds: &ScannedBounds,
@@ -685,6 +689,7 @@ pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<Word
 /// values of those words are then classified by [`word_is_scanned`]: a leaf forwards nothing, a
 /// shape whose cells are all immediates forwards nothing, and each one is exactly as safe in a
 /// foreign region as an immediate is.
+#[inline]
 pub(crate) fn forwards_scanned_word(
     process: &Process,
     bounds: &ScannedBounds,
@@ -1200,14 +1205,47 @@ fn report_max_heap_breach(process: &beam_process::Process, pid: beam_process::Pr
     let _ = writeln!(err, "     Message Queue Len:  {queue_len}");
 }
 
-fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> {
+fn collect_or_grow(
+    door: super::gc_valve_trace::ValveDoor,
+    process: &mut Process,
+    heap_need: u32,
+) -> Result<Collection> {
     let need = heap_need as usize;
+    // The invocation census' admission record ([`super::gc_valve_trace::note_admission`]): the
+    // words the admission wants and the nursery it wants them from, taken **before** the
+    // collection so the report can put the two beside the collection they produced. Gated on the
+    // census' own switch, so an untraced run pays one flag test per *collection* (not per
+    // allocation) and nothing else.
+    let capacity_before = process.heap().capacity();
+    super::gc_valve_trace::note_admission(
+        door,
+        process.pid(),
+        super::gc_valve_trace::Admission {
+            heap_need,
+            capacity: capacity_before,
+            available: process.heap().available(),
+            chain_used: process.heap_used_words(),
+            occupancy: process.should_collect(need),
+            debt: process.collection_debt(),
+        },
+    );
     let growable = process.collector().policy().next_words(need, 0) >= need;
-    if growable {
+    let action = if growable {
         process.ensure_capacity(need)
     } else {
         process.collect()
+    };
+    if let Ok(collection) = &action {
+        super::gc_valve_trace::note_collection(
+            door,
+            process.pid(),
+            matches!(collection.kind, CollectionKind::Major),
+            process.heap().capacity() > capacity_before,
+            collection.stats.words_copied,
+            collection.stats.words_reclaimed,
+        );
     }
+    action
 }
 
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
@@ -1417,7 +1455,11 @@ pub(crate) fn ensure_heap(
     // actually reach `heap_need` — the collector's on-demand **growth** seam. See
     // [`collect_or_grow`] for why the growth is what keeps a request larger than the nursery
     // on the process's own reclaimable heap, and for the bounded-policy fallback.
-    let action = collect_or_grow(process, heap_need);
+    let action = collect_or_grow(
+        super::gc_valve_trace::ValveDoor::EnsureHeap,
+        process,
+        heap_need,
+    );
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -1726,7 +1768,11 @@ fn ensure_heap_full_commit(
 
     // The action is the same as the narrow door's: collect, or grow the nursery to fit a
     // request the post-collection nursery cannot hold. See [`collect_or_grow`].
-    let action = collect_or_grow(process, heap_need);
+    let action = collect_or_grow(
+        super::gc_valve_trace::ValveDoor::EnsureHeapFull,
+        process,
+        heap_need,
+    );
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -2241,8 +2287,31 @@ fn alloc_words_rooted_commit(
         runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
+    // The invocation census' admission/collection pair ([`super::gc_valve_trace`]), exactly as
+    // [`collect_or_grow`] records it for the two `heap_need` doors.
+    let capacity_before = process.heap().capacity();
+    super::gc_valve_trace::note_admission(
+        super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+        process.pid(),
+        super::gc_valve_trace::Admission {
+            heap_need: n.min(u32::MAX as usize) as u32,
+            capacity: capacity_before,
+            available: process.heap().available(),
+            chain_used: process.heap_used_words(),
+            occupancy: process.should_collect(n),
+            debt: process.collection_debt(),
+        },
+    );
     match process.collect() {
         Ok(collection) => {
+            super::gc_valve_trace::note_collection(
+                super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+                process.pid(),
+                matches!(collection.kind, CollectionKind::Major),
+                process.heap().capacity() > capacity_before,
+                collection.stats.words_copied,
+                collection.stats.words_reclaimed,
+            );
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
             runtime.note_gc_reclaimed(collection.stats.words_reclaimed);
             // The `max_heap_size` verdict, drained exactly as the two heap-admission doors'

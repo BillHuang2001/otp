@@ -353,7 +353,7 @@ where
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
-            super::gc_valve_trace::note_verdict(door, descend, true, false, false, 0);
+            super::gc_valve_trace::note_verdict(process.pid(), door, descend, true, false, false, 0);
             return ValveVerdict {
                 declined: true,
                 foreign_free: false,
@@ -373,6 +373,7 @@ where
         foreign_free: descend && !walk.foreign_reached,
     };
     super::gc_valve_trace::note_verdict(
+        process.pid(),
         door,
         descend,
         phase1_hit,
@@ -491,6 +492,7 @@ where
         walk.seed(process, word);
         if walk.hit {
             super::gc_valve_trace::note_verdict(
+                process.pid(),
                 door,
                 true,
                 true,
@@ -503,6 +505,7 @@ where
     }
     let hit = walk.run(process);
     super::gc_valve_trace::note_verdict(
+        process.pid(),
         door,
         true,
         false,
@@ -1353,6 +1356,7 @@ where
     // no `foreign_free` answer, so only its scale is reported (`descend = true` because the descent
     // really ran).
     super::gc_valve_trace::note_verdict(
+        process.pid(),
         door,
         true,
         false,
