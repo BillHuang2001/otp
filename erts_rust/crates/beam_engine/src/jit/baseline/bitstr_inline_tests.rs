@@ -56,9 +56,8 @@
 //! `super::mod.rs`), so it reaches [`super::tests`]' harness by absolute path rather
 //! than by being `#[path]`-included from it.
 
-use beam_common::Result;
 use beam_loader::{BsGetArgs, Export, Instr, Label, Module, Operand, NO_FAIL};
-use beam_term::{Atom, Eterm};
+use beam_term::Atom;
 
 use super::bitstr::bitstr_calls;
 use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
@@ -68,7 +67,7 @@ use super::emit::bitstr_inline::{
     SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
-use super::tests::{assemble_function, assert_same_outcome};
+use super::tests::{assemble_function, assert_same_outcome, function_code_bytes};
 use crate::machine::RunOutcome;
 
 // ---------------------------------------------------------------------------
@@ -569,7 +568,7 @@ fn the_start_match4_resume_form_emits_on_a_cache_free_compile() {
 #[test]
 fn each_shape_agrees_with_the_interpreter_and_answers_the_right_value() {
     // (label, module factory, subject, expected)
-    let cases: [(&str, fn() -> Module, &'static [u8], i64); 8] = [
+    let cases: [(&str, fn() -> Module, &'static [u8], i64); 9] = [
         // After one 8-bit read the position is 8.
         ("bs_get_position", module_get_position, &[7, 9], 8),
         // The rewind makes the *first* byte the answer, not the second.
@@ -947,11 +946,15 @@ fn a_bs_get_integer2_result_is_usable_as_a_heap_term() {
         let RunOutcome::Returned(value) = returned else {
             panic!("unexpected outcome {returned:?}");
         };
-        assert!(beam_term::is_tuple(*value), "the answer must be a tuple");
-        let elements = beam_term::tuple_elements(*value).expect("a tuple");
-        assert_eq!(elements.len(), 2);
+        // `tuple_arity` is the safe reader: it answers `BadArg` for a non-tuple, so it
+        // doubles as the "the answer must be a tuple" assertion.
         assert_eq!(
-            beam_term::signed_value(elements[1]),
+            crate::terms::tuple_arity(*value).expect("the answer must be a tuple"),
+            2,
+            "the answer must be a 2-tuple"
+        );
+        assert_eq!(
+            beam_term::signed_value(crate::terms::tuple_element(*value, 1).expect("element 1")),
             0x2a,
             "the extracted byte must be the tuple's second element"
         );
@@ -1246,7 +1249,14 @@ fn every_deliberate_refusal_is_refused_by_the_shape_predicate() {
         "a non-label/non-atom `bs_start_match4` fail operand must refuse the arm"
     );
     assert!(
-        bitstr_inline::start_match4_shape(&module, &labels, &NO_FAIL.into(), &x1, &x0).is_none(),
+        bitstr_inline::start_match4_shape(
+            &module,
+            &labels,
+            &Operand::Label(NO_FAIL),
+            &x1,
+            &x0
+        )
+        .is_none(),
         "`NO_FAIL` must refuse `bs_start_match4`"
     );
 }
@@ -1427,7 +1437,7 @@ fn the_get_position_arm_emits_the_max_small_guard() {
     let module = module_get_position();
     let labels = crate::interpreter::build_label_map(&module);
     let function = super::emit::compile_function(&module, &labels, 0).expect("the block compiles");
-    let code = function.buffer.as_slice();
+    let code = function_code_bytes(&function);
     assert!(
         contains_immediate(code, beam_term::MAX_SMALL),
         "the `bs_get_position` arm must emit the `MAX_SMALL` position guard"
@@ -1447,7 +1457,7 @@ fn the_get_position_arm_emits_the_max_small_guard() {
     let labels = crate::interpreter::build_label_map(&plain);
     let function = super::emit::compile_function(&plain, &labels, 0).expect("the block compiles");
     assert!(
-        !contains_immediate(function.buffer.as_slice(), beam_term::MAX_SMALL),
+        !contains_immediate(function_code_bytes(&function), beam_term::MAX_SMALL),
         "a `move`-only block must not carry the position guard"
     );
 }
@@ -1609,6 +1619,3 @@ skip8(<<_:8, A:8, _/bits>>) -> A.
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `Eterm` type is named by [`bitstr_module`]'s callers through the arg builder only;
-/// this keeps the import used if the rows above change shape.
-const _: fn(Atom) -> Eterm = |_| unreachable!();

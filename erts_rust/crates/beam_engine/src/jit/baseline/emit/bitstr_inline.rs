@@ -334,7 +334,7 @@ pub(crate) fn get_position_shape(ctx: &Operand, dst: &Operand) -> Option<GetPosi
 ///   jmp  fast_done
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_get_position(
+pub(super) fn try_inline_bs_get_position(
     buffer: &mut CodeBuffer,
     ctx: &Operand,
     dst: &Operand,
@@ -487,7 +487,7 @@ pub(crate) fn set_position_shape(ctx: &Operand, pos: &Operand) -> Option<SetPosi
 ///   mov  [ctx + 16], new_start     ; ONE word store, no bounds check (the family does none)
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_set_position(
+pub(super) fn try_inline_bs_set_position(
     buffer: &mut CodeBuffer,
     ctx: &Operand,
     pos: &Operand,
@@ -652,7 +652,7 @@ pub(crate) fn test_tail2_shape(
 ///   <the linker's exit to the fail label>   ; a terminator on that path only
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_test_tail2(
+pub(super) fn try_inline_bs_test_tail2(
     buffer: &mut CodeBuffer,
     labels: &LabelMap,
     linker: &Linker<'_>,
@@ -816,7 +816,7 @@ pub(crate) fn skip_bits2_shape(
 ///   jmp  fast_done
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_skip_bits2(
+pub(super) fn try_inline_bs_skip_bits2(
     buffer: &mut CodeBuffer,
     labels: &LabelMap,
     linker: &Linker<'_>,
@@ -1161,7 +1161,7 @@ fn emit_start_match(
 ///   <one interpreter step>            ; the family's `make_ctx` / `badmatch` raise
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_start_match3(
+pub(super) fn try_inline_bs_start_match3(
     buffer: &mut CodeBuffer,
     labels: &LabelMap,
     linker: &Linker<'_>,
@@ -1200,7 +1200,7 @@ pub(crate) fn try_inline_bs_start_match3(
 /// condition), so its sequence is the same guard with a single `HEADER_SUB_BITS` compare
 /// — every other fail class reuses [`emit_start_match`]'s full classification.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_start_match4(
+pub(super) fn try_inline_bs_start_match4(
     buffer: &mut CodeBuffer,
     module: &Module,
     labels: &LabelMap,
@@ -1253,26 +1253,37 @@ pub(crate) fn try_inline_bs_start_match4(
 ///
 /// ```text
 ///   test bit_pos, 7 ; jne granular        ; only when nbits is 8/16/32
-///   ; the byte-aligned form: ONE 1/2/4-byte load, no shift, no mask
+///   ; the byte-aligned form: W byte loads, each shifted up and or-ed in
 ///   mov  rdi, bit_pos ; shr rdi, 3        ; j = bit_pos / 8
 ///   lea  rcx, [rdi + W]                   ; the read's exclusive byte bound
 ///   cmp  rcx, num_bytes ; ja fallback     ; j + W <= num_bytes, checked FIRST
 ///   add  rdi, base
-///   movzx / movzx_word / mov_rm32  scratch, [rdi]
+///   movzx  scratch, byte [rdi]            ; the field's most significant byte
+///   ; ... W - 1 times:
+///   shl  scratch, 8 ; movzx rcx, byte [rdi + i] ; or scratch, rcx
 ///   jmp  done
 /// granular:
+///   mov  rdi, bit_pos ; shr rdi, 3        ; j
+///   lea  rcx, [rdi + 2]                   ; the two-byte window's exclusive bound
+///   cmp  rcx, num_bytes ; ja fallback     ; j + 2 <= num_bytes, checked FIRST
+///   add  rdi, base
+///   movzx  scratch, byte [rdi]            ; the window's high byte
+///   shl  scratch, 8
+///   movzx  rcx, byte [rdi + 1]            ; and its low byte
+///   or   scratch, rcx                     ; the 16-bit BIG-ENDIAN window
 ///   mov  rdi, bit_pos ; and rdi, 7        ; rem = bit_pos % 8
 ///   cmp  rdi, 16 - nbits ; ja fallback    ; rem + nbits <= 16
 ///   mov  rcx, 16 - nbits ; sub rcx, rdi   ; the shift count 16 - rem - nbits
-///   mov  rdi, bit_pos ; shr rdi, 3        ; j
-///   lea  <tmp>, [rdi + 2]                 ; the two-byte window's exclusive bound
-///   cmp  <tmp>, num_bytes ; ja fallback   ; j + 2 <= num_bytes, checked FIRST
-///   add  rdi, base
-///   movzx_word  scratch, [rdi]            ; the 16-bit window holding the field
 ///   shr  scratch, cl                      ; drop the low 16 - rem - nbits
 ///   and  scratch, (1 << nbits) - 1        ; keep exactly nbits   (nbits < 16 only)
 /// done:
 /// ```
+///
+/// Both loads are **byte-wise and assembled most-significant byte first**, because the
+/// field is big-endian (bit `i` of the view is bit `i % 8`, MSB first, of `base[i / 8]`)
+/// while an x86 multi-byte load is little-endian: a plain 2-/4-byte load would produce the
+/// byte-reversed value — a wrong result with no error surfaced, which is exactly what
+/// `../../bitstr_inline_tests.rs`'s 16-/32-bit rows pin.
 ///
 /// The **over-read guard is always emitted before the load**, so the sequence never reads
 /// a byte outside the subject's own buffer, and a field that would need one is the
@@ -1337,40 +1348,54 @@ pub(crate) fn emit_bit_extract(
         buffer.cmp_rr(Reg::Rcx, num_bytes)?;
         buffer.jcc(Cond::A, fallback)?;
         buffer.add_rr(Reg::Rdi, base)?;
-        match width {
-            1 => buffer.movzx_byte(scratch, Reg::Rdi, 0)?,
-            2 => buffer.movzx_word(scratch, Reg::Rdi, 0)?,
-            _ => buffer.mov_rm32(scratch, Reg::Rdi, 0)?,
+        // The field is **big-endian** (bit `i` of the view is bit `i % 8`, MSB first, of
+        // `base[i / 8]`) while an x86 load is little-endian, so the value is assembled
+        // most-significant byte first in `scratch` — one `movzx` per byte, each earlier
+        // byte shifted up by eight. For `W == 1` this is the single load the aligned form
+        // is for; the bound check above left `Reg::Rcx` dead, which is why it serves as the
+        // byte temporary without disturbing the register contract.
+        buffer.movzx_byte(scratch, Reg::Rdi, 0)?;
+        for byte in 1..width {
+            buffer.shl_ri(scratch, 8)?;
+            buffer.movzx_byte(Reg::Rcx, Reg::Rdi, byte)?;
+            buffer.or_rr(scratch, Reg::Rcx)?;
         }
         buffer.jmp(done)?;
     }
 
-    // The granular form: a 16-bit window load plus a variable shift. It covers
-    // `bit_pos % 8 + nbits <= 16`, so a 16- or 32-bit field reaching this label can never
-    // satisfy it (its `rem` is non-zero here, and `16 - nbits <= 0`), which is why such a
-    // width is a plain rejection instead.
+    // The granular form: a 16-bit big-endian window assembled from the two bytes at `j`,
+    // then a variable shift. It covers `bit_pos % 8 + nbits <= 16`, so a 16- or 32-bit
+    // field reaching this label can never satisfy it (its `rem` is non-zero here, and
+    // `16 - nbits <= 0`), which is why such a width is a plain rejection instead.
     buffer.bind(granular)?;
     if nbits >= 16 {
         buffer.jmp(fallback)?;
     } else {
-        // `rem = bit_pos % 8`.
+        // `j = bit_pos / 8`; the over-read guard `j + 2 <= num_bytes` comes FIRST, before
+        // either byte of the window is read.
+        buffer.mov_rr(Reg::Rdi, bit_pos)?;
+        buffer.shr_ri(Reg::Rdi, 3)?;
+        buffer.lea(Reg::Rcx, Reg::Rdi, 2)?;
+        buffer.cmp_rr(Reg::Rcx, num_bytes)?;
+        buffer.jcc(Cond::A, fallback)?;
+        buffer.add_rr(Reg::Rdi, base)?;
+        // The window's own big-endian value: `base[j] << 8 | base[j + 1]` (`Reg::Rcx` is
+        // dead after the bound check, so it carries the low byte).
+        buffer.movzx_byte(scratch, Reg::Rdi, 0)?;
+        buffer.shl_ri(scratch, 8)?;
+        buffer.movzx_byte(Reg::Rcx, Reg::Rdi, 1)?;
+        buffer.or_rr(scratch, Reg::Rcx)?;
+        // `rem = bit_pos % 8`, then `rem + nbits <= 16`, i.e. `rem <= 16 - nbits` — the
+        // window's own reach. Both are recomputed here because the byte temporary above
+        // consumed `Reg::Rcx`, whose `cl` carries the shift count only from here on.
         buffer.mov_rr(Reg::Rdi, bit_pos)?;
         buffer.mov_ri(Reg::Rcx, 7)?;
         buffer.and_rr(Reg::Rdi, Reg::Rcx)?;
-        // `rem + nbits <= 16`, i.e. `rem <= 16 - nbits`.
         buffer.mov_ri(Reg::Rcx, (16 - nbits) as i64)?;
         buffer.cmp_rr(Reg::Rdi, Reg::Rcx)?;
         buffer.jcc(Cond::A, fallback)?;
         // The shift count `16 - rem - nbits` into `cl`.
         buffer.sub_rr(Reg::Rcx, Reg::Rdi)?;
-        // `j = bit_pos / 8`; the over-read guard `j + 2 <= num_bytes` comes FIRST.
-        buffer.mov_rr(Reg::Rdi, bit_pos)?;
-        buffer.shr_ri(Reg::Rdi, 3)?;
-        buffer.lea(scratch, Reg::Rdi, 2)?;
-        buffer.cmp_rr(scratch, num_bytes)?;
-        buffer.jcc(Cond::A, fallback)?;
-        buffer.add_rr(Reg::Rdi, base)?;
-        buffer.movzx_word(scratch, Reg::Rdi, 0)?;
         buffer.shr_cl(scratch)?;
         // Keep exactly `nbits` bits. A 16-bit window already bounds the field, so the mask
         // is only needed below that (`nbits == 0` masks everything away, which is exactly
@@ -1563,7 +1588,7 @@ pub(crate) fn get_integer2_shape(
 /// subject and every non-bitstring take `fallback`, i.e. the family's own typed error —
 /// never a fabricated value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_get_integer2(
+pub(super) fn try_inline_bs_get_integer2(
     buffer: &mut CodeBuffer,
     labels: &LabelMap,
     linker: &Linker<'_>,
@@ -1901,7 +1926,16 @@ impl BsMatchShape {
                 "skip" => parsed.push(BsMatchCmd::Skip {
                     stride: bs_match_static_size(commands.get(i + 1)?)?,
                 }),
-                _ => {
+                // `binary` / `get_tail` / `=:=` are decoded only to find their group's
+                // length, so the walk stays aligned — never to be lowered. Each one builds a
+                // fresh term on every execution (`raw::make_binary` reserves
+                // unconditionally), so a moving collection could relocate the context block
+                // in the middle of the list. `binary` matters most: its group is the *same
+                // width* as `integer`'s, so a fall-through into the `integer` arm below
+                // would read it as an integer field and bind an integer where a sub-binary
+                // is due — a wrong value, not a refusal.
+                "binary" | "get_tail" | "=:=" => return None,
+                "integer" => {
                     let flags = bs_match_integer_flags(module, commands.get(i + 2)?)?;
                     let size = bs_match_static_size(commands.get(i + 3)?)?;
                     let unit = bs_match_static_size(commands.get(i + 4)?)?;
@@ -1921,6 +1955,9 @@ impl BsMatchShape {
                     }
                     parsed.push(BsMatchCmd::Integer { nbits, dst });
                 }
+                // Unreachable: `bs_match_group_len` above already declined every name that
+                // is not one of the six it knows.
+                _ => return None,
             }
             i = end;
         }
@@ -2109,7 +2146,7 @@ fn emit_bs_match_command(
 /// so no `emit_position_store` is needed and the context block base read by
 /// [`emit_ctx_guard`] stays valid for the whole list.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_inline_bs_match(
+pub(super) fn try_inline_bs_match(
     buffer: &mut CodeBuffer,
     module: &Module,
     labels: &LabelMap,

@@ -4495,7 +4495,10 @@ fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const
 /// The sealed machine code of one compiled function, as bytes — the substrate every
 /// code-generation probe below searches (a helper's `movabs` immediate, the inline
 /// position store's encoding).
-fn function_code_bytes(function: &super::code::CompiledFunction) -> &[u8] {
+///
+/// `pub(crate)` so the sibling `bitstr_inline_tests` module's per-shape byte pins reuse it
+/// instead of opening a second raw view of the same mapping.
+pub(crate) fn function_code_bytes(function: &super::code::CompiledFunction) -> &[u8] {
     let start = function.buffer.code_ptr() as usize;
     let len = function.buffer.len();
     // SAFETY: `[start, start + len)` is the function's live, sealed executable mapping,
