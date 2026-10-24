@@ -462,10 +462,10 @@ Workloads were driven by `erts_rust/tools/bench` (`$BEAM_RT` selects the binary;
 ### Paired per-round ratios (subject/control), mean of the paired ratios
 | workload set | rounds | per-round ratios | paired result | within-side spread |
 |---|---|---|---|---|
-| `copy_bound,gc_class,foreign` | 5 | 0.986174 / 0.985797 / 0.986024 / 0.984932 / 0.985682 | **−1.428 %** | base 0.143 %, subj 0.063 % |
-| `copy_bound` | 3 | 0.994382 / 0.995154 / 0.993797 | **−0.556 %** | base 0.172 %, subj 0.274 % |
-| `gc_class` | 3 | 0.965329 / 0.965706 / 0.965796 | **−3.439 %** | base 0.029 %, subj 0.060 % |
-| `foreign` | 3 | 0.998779 / 0.998729 / 0.998820 | **−0.122 %** | base 0.010 %, subj 0.004 % |
+| `copy_bound,gc_class,foreign` | 5 | 0.986138 / 0.985798 / 0.986023 / 0.984571 / 0.985590 | **−1.438 %** | base 0.144 %, subj 0.063 % |
+| `copy_bound` | 3 | 0.994380 / 0.995156 / 0.991798 | **−0.622 %** | base 0.172 %, subj 0.274 % |
+| `gc_class` | 3 | 0.965444 / 0.965662 / 0.965898 | **−3.433 %** | base 0.029 %, subj 0.060 % |
+| `foreign` | 3 | 0.998779 / 0.998729 / 0.998821 | **−0.122 %** | base 0.010 %, subj 0.004 % |
 Noise band: ~**±0.15 %** worst-case within-side spread, and most workloads are tighter than ±0.06 %.
 Startup is unchanged — a startup-only paired ratio of 0.994 was measured on the seam change alone — so these are per-call cuts, not boot cuts.
 ### Attribution
