@@ -1,9 +1,9 @@
 # `beam_rt` — per-call dispatch and copy-out cost (`DISPATCH-CUT` · `COPY-OUT-CUT`)
 
-The three per-call cost analyses of the runtime's BIF call path — the registered-BIF dispatch prologue, the scheduler-shape BIF-result copy-out, and the memo-**hit** path that superseded the prologue — each priced at the HEAD it names (`examples/perf_call.rs` for the first two, retired instructions on the `tools/bench` fixtures for the third).
+The four per-call cost analyses of the runtime's call paths — the registered-BIF dispatch prologue, the scheduler-shape BIF-result copy-out, the memo-**hit** path that superseded the prologue, and the external-call (`call_ext*`) seam's fun-caller verdict — each priced at the HEAD it names (`examples/perf_call.rs` for the first two, retired instructions on the `tools/bench` fixtures for the rest).
 These are **cut records, not the current snapshot**: each prices what one change moved, as a before/after ratio measured on one host, never as today's absolute per-call figure.
 Current cross-runtime and execution-tier figures are in [`PERF.md`](PERF.md); the dated `BEFORE`/`AFTER` cross-runtime snapshots (including the CLI-level `nb*` registered-BIF columns) are in [`PERF_HISTORY.md`](PERF_HISTORY.md); the harnesses, the dispatch-cost narrative and the trace seam are in [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md).
-`DISPATCH-CUT` cuts the registered-BIF dispatch prologue (the per-context dispatch memo, the byte-hashed slot, the empty-NIF short-circuit, and the path-C regression the byte hash introduced); `COPY-OUT-CUT` cuts the BIF-result copy-out's wasted graph walk and needless retry; `MEMO-HIT-CUT` cuts the **hit** path that the memo left behind (the slot fold, the hook roster, the tail, and the two heap doors).
+`DISPATCH-CUT` cuts the registered-BIF dispatch prologue (the per-context dispatch memo, the byte-hashed slot, the empty-NIF short-circuit, and the path-C regression the byte hash introduced); `COPY-OUT-CUT` cuts the BIF-result copy-out's wasted graph walk and needless retry; `MEMO-HIT-CUT` cuts the **hit** path that the memo left behind (the slot fold, the hook roster, the tail, and the two heap doors); `CALL-EXT-CUT` cuts the **external-call seam**, which pays one memo lookup where it used to pay a registry hash lookup plus two `beam_bifs` fun-caller searches.
 Every number here is **measured, never modelled**, and absolute timings are load-polluted on every host this was run on — read the ratios and the interleaved pairs, with both sides named.
 
 ## Measurement provenance — the arm labels (`Path A`/`Path B`, `copy-out ON`/`OFF`)
@@ -385,7 +385,9 @@ below.
 - **The `ets_copy` remainder is NOT this node's.** After this cut `ets_copy` is still ≈1.51–1.56× the
   pre-regression binary; that residual is `crates/beam_message`'s destination-pricing walk
   (`src/copy.rs`'s `preflight_words`/`CopyPricing` over `beam_term::size::SizingPolicy`, commit
-  `f6fcc227d2`), a sibling crate — reported, not touched here.
+  `f6fcc227d2`), a sibling crate — reported, not touched here. It prices the ordinary
+  receiver-heap copy; the **fragment** route no longer re-prices at all, because it reserves the
+  refusal's own `AllocFailure::requested` (`CALL-EXT-CUT`).
 - **Nothing else was made dearer.** The counters are `#[cfg(test)]` only (no release-build cost), and the
   walk is a strict constant-factor improvement of one predicate: `send_recv_plain`, which never reaches
   it, is unchanged (0.975× / 0.989× — two independent estimates of the noise floor).
@@ -440,6 +442,52 @@ The last landing (`src/runtime/gc.rs`) is worth −0.78 % of `churn` on its own:
 ### Reconciled: two mysteries the earlier rounds left open
 * **`foreign`'s per-call cost is not N-dependent.** It was: commit `72d778dcf1` ("drop the per-slice off-heap registration mirror") fixed the quadratic term, and `lower/1` now reads 4 624.8 / 5 061.5 / 4 990.0 / 4 978.5 ns at N = 10 k / 50 k / 200 k / 500 k — flat, and *lower* at the top. `RESULTS.md`'s N-dependence paragraph and its "common-mode per-op heap retention" theory are stale.
 * **The whole-`AtomTable` clone was never per-call.** Only `codeserver.rs` (the `Rc<AtomTable>` owner, its `atoms_mut`, and `intern_pending`'s fallback) touches the table as a whole, and the hot dispatch path deliberately drops the handle so the intern commit stays append-only; the clone showed up in the profile because a `perf record` of a whole process includes the module-loading phase (≈3.7 % of startup, one per module). The one *real* per-call clone was the `RuntimePorts` `Rc` bug above, and it is fixed.
+## `CALL-EXT-CUT` — the external-call seam's fun-caller verdict
+### What changed
+`RuntimeContext::resolve_external_call` (`src/context/execution.rs`) used to evaluate, on **every** `call_ext*`, `host_serves(..)` — whose registered leg is a `BifRegistry` string-keyed hash lookup — **plus two** `beam_bifs::needs_fun_caller(module, function, arity)` `binary_search`es over the 24-row `FUN_CALLER_BIFS`, once through `apply::prefers_module_code_for_fun_apply` and once through `execution::nests_a_fun_apply`.
+It now takes **one** `self.dispatch(module, function, arity)` memo lookup and derives all three inputs from that one answer:
+* `DispatchHooks::FUN_CALLER` (`src/context/dispatch.rs`) is the roster's **twelfth** bit, whose value is `RuntimeContext::uses_fun_caller` → `beam_bifs::needs_fun_caller`.
+  It is evaluated once per `DispatchMemo` **miss** and read as one bit on every hit via `DispatchHooks::fun_caller()`.
+  It selects **no** bridge arm (the fun-caller bridge is `call_registered`'s fallback), so `DispatchHooks::ANY_MASK` is `ALL_MASK & !FUN_CALLER` and `call_registered`'s fast/cold arm selection is untouched; `ALL` is `[u16; 12]` and two `const` assertions pin `ALL_MASK == (1 << ALL.len()) - 1` and `FUN_CALLER == 1 << (ALL.len() - 1)`.
+* `DispatchAnswer::bif.is_some()` **is** `BifRegistry::contains`, so it supplies the registered leg: `RuntimeContext::host_serves_given(module, function, arity, registered)`, with `host_serves` delegating to it with `self.runtime.registry.contains(..)` (the runner's process-entry arm keeps that form).
+  The floor and NIF legs stay **per call** — the NIF registry is runtime-mutable (`load_nif/2`) and must never be folded into a cache.
+* Both branch predicates now read the verdict instead of searching for it: `apply::prefers_module_code_for_fun_apply(can_pump: bool, hooks: DispatchHooks)` and `execution::nests_a_fun_apply(module: &str, hooks: DispatchHooks)`.
+A free second win falls out of the shape: the seam's memo lookup warms `DispatchMemo::last`, so the `call_bif` that follows a host-served key becomes an MRU-hint hit.
+**This is a different site from the cuts above.** `MEMO-HIT-CUT` prices the registered-BIF dispatch (`call_registered`, reached only *after* the seam has declined the key); this cut prices the seam that decides whether `call_bif` runs at all, and what it removes is a registry hash lookup plus two `beam_bifs` `binary_search`es per external call — not the `BifContext` build, the arm selection or the copy-out.
+The pinning test is `src/context/tests.rs::the_memoized_fun_caller_verdict_equals_the_roster_on_a_miss_and_on_a_hit` (every `FUN_CALLER_BIFS` row plus five non-members; the hit answer equals the miss answer; an MRU-displacement partner and a same-slot-eviction partner, with a partner pool asserted to reach all 128 slots), and `a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field` compares the `fun_caller()` field too.
+### Method
+**Retired instructions**: `perf stat -e cpu_core/instructions/u` (the **slash** form — the colon form silently lands on `cpu_atom`), `taskset -c 2` (P-cores 0–3), one process at a time, the two binaries **alternated inside every round**, `/proc/loadavg` recorded per pass (3.19–17.41 across the session).
+Both sides were **rebuilt from their own source**: control = `41211294d2` (the merge base), subject = the merged tree.
+Workloads were driven by `erts_rust/tools/bench` (`$BEAM_RT` selects the binary; `bench run --quick --runtime rust --workloads …`), with the `bench` binary **byte-identical** on both sides and the same `case_*_ops` on both sides.
+### Paired per-round ratios (subject/control), mean of the paired ratios
+| workload set | rounds | per-round ratios | paired result | within-side spread |
+|---|---|---|---|---|
+| `copy_bound,gc_class,foreign` | 5 | 0.986174 / 0.985797 / 0.986024 / 0.984932 / 0.985682 | **−1.428 %** | base 0.143 %, subj 0.063 % |
+| `copy_bound` | 3 | 0.994382 / 0.995154 / 0.993797 | **−0.556 %** | base 0.172 %, subj 0.274 % |
+| `gc_class` | 3 | 0.965329 / 0.965706 / 0.965796 | **−3.439 %** | base 0.029 %, subj 0.060 % |
+| `foreign` | 3 | 0.998779 / 0.998729 / 0.998820 | **−0.122 %** | base 0.010 %, subj 0.004 % |
+Noise band: ~**±0.15 %** worst-case within-side spread, and most workloads are tighter than ±0.06 %.
+Startup is unchanged — a startup-only paired ratio of 0.994 was measured on the seam change alone — so these are per-call cuts, not boot cuts.
+### Attribution
+The whole movement is the memoized fun-caller verdict.
+`gc_class` is dominated by its `case_compile` (an in-process `compile:file/2`, the densest `call_ext*` stream any workload has) and `copy_bound` by its `ets_copy`/`send_recv` BIF calls.
+`foreign` only swaps `registry.contains` for the memo lookup — its calls into real Cowboy/EMQX modules are **not** host-served, so the two `needs_fun_caller` searches were already short-circuited there — which is why it reads −0.12 %.
+The fragment delivery route (below) is **inside the noise floor** and is not what these rows measure.
+### The seam alone, at the A/B scale
+An independent seam-level A/B on the memoized verdict alone (a `.beam` driven through `run`, so `may_pump_scheduler() == false` and the leg is live; body = `ets:insert/2` + `ets:lookup/2` per iteration, N = 3 000 000) reads **−12.32 % marginal** (per-round 0.87609 / 0.87689 / 0.87750), flat in N — **1 631 / 1 634 / 1 570** instructions saved per iteration at N = 1 M / 3 M / 6 M — and present on `BEAM_RT_TIER=interpreter` (≈1 491 per iteration).
+That is ≈1 600 instructions per iteration ≈ **380 per `call_ext*`**: the seam's own cost, not a JIT artifact.
+### The fragment route spends the refusal's own price (and why it is not the mover here)
+`src/context/send.rs::deliver_into_mailbox` hands the refusal's `AllocFailure::requested` straight to `send_fragmented_message_after_refusal`, which calls `beam_message::send_fragmented_after_refusal(from, message, process.mailbox_mut(), src, 0, requested_bytes)` — no trial copy on a receiver heap and **no `size_object` pricing walk** (that walk was measured at 41.9 % of a `gc_class/send_recv` round trip).
+`send_fragmented_message` remains the no-refusal-in-hand shape (it re-prices); the wake/descent-gate tail is shared through `finish_fragment_delivery`.
+That 41.9 % is **not** what a standing workload saves any more: a `receive`-parked process publishes its host-held terms through `Registers::extra_roots`, so `ParkExemption` is `LiveFloats` only and `has_unpublished_roots()` is false for a parked receiver — `Process::deliver` no longer refuses the move for the ordinary blocking-receiver shape.
+The fragment route now serves the **remaining** refusal classes (a `Running` receiver, a relocation-exempt receiver, a genuinely full destination after collection and growth), and no standing benchmark workload contains one — hence no row above moves for it.
+It is kept because it removes a redundant full-graph pricing walk (and the doc section that defended it), not because it shows a number here; the pinning test is `src/context/tests.rs::a_fragment_delivery_reserves_the_refusals_price_and_carries_the_payload_intact`.
+### Validation on the merged tree
+`cargo test -p beam_rt --no-fail-fast` → the same 8 known reds, no new red, `context::calls::tests` guards green; `beam_rt -noshell -boot bootstrap/bin/start` → exit 0 with empty stdout/stderr; the differential corpus at 16-way plus a merge against `tools/differential/known-gaps.txt` → `total=3439 agree=3438 mismatch=0 unsupported=1 skipped=0`, `ratchet: allowed=1 unauthorized=0 stale=0`, exit 0.
+### Caveats that invalidate a comparison (`CALL-EXT-CUT`)
+- Only the **paired per-round ratios** are signal; the absolute instruction totals are load-polluted (3.19–17.41 1-min loadavg across one session) and are never compared across windows.
+- `foreign` carries the smallest effect (−0.12 %) because its non-host-served calls already short-circuited the two searches; a workload whose calls are all module code would show nothing at all.
+- The seam-level −12.32 % is a **different instrument window** from the `bench` rows (a `run`-route fixture, not a workload set) and is quoted as the seam's own marginal, never as a speed-up of the `tools/bench` figures.
 ## See Also
 - [`PERF.md`](PERF.md) → the current cross-runtime figures and the execution-tier effect.
 - [`PERF_HISTORY.md`](PERF_HISTORY.md) → the dated `BEFORE`/`AFTER` cross-runtime snapshots and their `nb*` registered-BIF columns.
@@ -448,7 +496,8 @@ The last landing (`src/runtime/gc.rs`) is worth −0.78 % of `churn` on its own:
 
 ## The per-BIF-call cost, on one page
 The registered-call shape as the crate records it: the per-call instruction split, the structural choices it encodes, and the memo rule a change to `call_registered` must respect.
-* **Dispatch cost is a first-class concern.** `call_registered` runs per call, so a handle built there must be gated by a `uses_*` predicate, and the per-context `DispatchMemo` (128 direct-mapped FNV slots + a one-entry MRU hint, `src/context/dispatch.rs`) resolves the `BifFn` **and** the eleven hook predicates once per key — its hit rate is 99.4 % on real workloads, so the memo *hit* path, not the prologue, is what to price. Measure with `examples/perf_call.rs` (`examples/perf_bif.rs`'s `pc:*` inlines to a `gc_bif` and **cannot** measure registry dispatch) and read [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *MEMO-HIT-CUT* for the per-call instruction budget — [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *DISPATCH-CUT* / *COPY-OUT-CUT* / *WALK-CUT* remain the records of the earlier cuts.
+* **Dispatch cost is a first-class concern.** `call_registered` runs per call, so a handle built there must be gated by a `uses_*` predicate, and the per-context `DispatchMemo` (128 direct-mapped FNV slots + a one-entry MRU hint, `src/context/dispatch.rs`) resolves the `BifFn` **and** the hook roster once per key — its hit rate is 99.4 % on real workloads, so the memo *hit* path, not the prologue, is what to price. Measure with `examples/perf_call.rs` (`examples/perf_bif.rs`'s `pc:*` inlines to a `gc_bif` and **cannot** measure registry dispatch) and read [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *MEMO-HIT-CUT* for the per-call instruction budget — [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *DISPATCH-CUT* / *COPY-OUT-CUT* / *WALK-CUT* remain the records of the earlier cuts.
+* **The `call_ext*` seam is a different site.** Before `call_registered` is reached at all, `RuntimeContext::resolve_external_call` decides whether a cross-module callee runs in this machine; it pays **one** memo lookup for the registered leg (`host_serves_given`), the fun-caller verdict (the roster's twelfth, verdict-only bit) and both of that decision's branches — its per-call figures are [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *CALL-EXT-CUT*, never the registered-BIF rows above.
 A registered BIF call is **≈430 retired instructions**, of which this crate owns the routing (`call_bif`'s NIF → floor → memo draw, ≈83), the `BifContext` build and arm selection (≈223) and the tail (`finish_registered_call`'s copy-out, gate and rewind, ≈127); the rest is `beam_engine`'s dispatch/bookkeeping, `src/runner/budget.rs`'s forwarding triple, or the BIF body.
 What that bought in structure: `DispatchHooks` is a packed `u16` with an exhaustive `of()` and a `const` mask assertion (a new arm cannot drift out of `any()`); the hooks-free arm is a lean `#[inline]` body, the ten-arm chain is `#[cold] #[inline(never)] call_registered_full`, both sharing one tail; both heap doors end at their short-circuit and commit in an outlined `*_commit`; the plain-bump fill is a constant-folded immediate slice (a `n`-dependent length copy lowers to a GOT-indirect `memcpy`).
 **The remaining cost is mostly NOT this node's**, and the ranked levers with their owners — plus the changes rejected on measurement — are [`PERF_DISPATCH.md`](PERF_DISPATCH.md) *MEMO-HIT-CUT*.

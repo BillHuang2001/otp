@@ -717,8 +717,9 @@ impl Runtime {
     /// Records that a **heap-fragment** delivery woke `pid` (see
     /// [`Runtime::fragment_wakes`](Runtime)).
     ///
-    /// Called by the sender
-    /// ([`RuntimeContext::send_fragmented_message`](crate::context::RuntimeContext)) after
+    /// Called by the sender — the shared fragment tail `finish_fragment_delivery`, which
+    /// both heap-fragment routes end in
+    /// ([`RuntimeContext`](crate::context::RuntimeContext)) — after
     /// it has enqueued the payload and woken the receiver, and by the inbound distribution
     /// drain **only for a fragment delivery whose
     /// [`Process::wake`](beam_process::Process::wake) answered `true`**: this is the
@@ -1453,8 +1454,10 @@ impl Runtime {
             (dispatched, sink.take_fragment_deliveries())
         };
         // The two fragment notes for a message that had to go into a heap fragment, exactly
-        // the pair the local send path applies (`crate::context`'s
-        // `send_fragmented_message`): the descent gate for **every** fragment delivery,
+        // the pair the local send path's shared fragment tail applies
+        // (`crate::context`'s `finish_fragment_delivery`, which the refusal-driven
+        // `send_fragmented_message_after_refusal` route ends in): the descent gate for
+        // **every** fragment delivery,
         // because the payload lives in a region the receiver's collector does not scan, and
         // the wake note **only for a delivery that really moved the receiver** — the wake
         // list is a *should be scheduled* list, and a receiver that was already `Runnable`

@@ -170,9 +170,9 @@ impl<'a> LocalDeliverySink<'a> {
     ///
     /// The caller replays the runtime's two fragment notes for each pair after the drain —
     /// the reachability note for **every** pair, the wake note only for the `true` ones —
-    /// which is exactly the pair
-    /// [`RuntimeContext::send_fragmented_message`](crate::context) applies on the local
-    /// send path (it guards its own note with `if woken`). Taking the list clears it, so a
+    /// which is exactly the pair the local send path's shared fragment tail applies
+    /// ([`RuntimeContext`](crate::context::RuntimeContext)'s `finish_fragment_delivery`,
+    /// whose wake note is guarded by `if woken`). Taking the list clears it, so a
     /// sink reused across links records each fragment delivery once.
     pub(crate) fn take_fragment_deliveries(&mut self) -> Vec<(ProcessId, bool)> {
         std::mem::take(&mut self.fragment_deliveries)
@@ -594,8 +594,10 @@ impl LocalDeliverySink<'_> {
     /// raw [`AllocKind`](beam_common::AllocKind) refusal — what
     /// [`Process::deliver`](beam_process::Process::deliver) returns unchanged for a receiver
     /// whose roots are **unpublished** — is routed to the heap-fragment model by
-    /// [`Self::enqueue_fragmented`], exactly as the local send path does
-    /// ([`crate::context`]'s `send_fragmented_message`). So the message family has
+    /// [`Self::enqueue_fragmented`], exactly as the local send path does (its
+    /// refusal-driven route `send_fragmented_message_after_refusal`, which draws on the
+    /// same [`beam_message::send_fragmented`]; this sink drives that callee itself, because
+    /// it records the wake for its own caller to replay). So the message family has
     /// only two honest outcomes: `Delivered` (on the receiver's heap, or in a fragment) and
     /// `Dropped` (only when even the fragment could not be allocated). Neither is an
     /// `Err`, so a **delivery** refusal never retires the link; an `Err` here means a table
