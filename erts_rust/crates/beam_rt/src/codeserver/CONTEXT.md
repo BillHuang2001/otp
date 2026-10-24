@@ -54,13 +54,20 @@ instructions):
 - **This module is not on the hot path.** `cached_system_path` derives the layout **once per
   process**; its only recurring cost is the 36-`PathBuf` clone on a cache hit (~7 k
   instructions, ≈0.014 % of the floor). No sample lands inside `codeserver::path::*`.
-- **The recurring cost is the caller's re-insert loop.** `CodeServer::add_system_paths` costs
-  **1.32 M instructions per call** — measured from a `code:get_path/0` loop (300 calls cost
-  396 M, and 78 % of the BIF's own 1.69 M/call) — and a boot makes ~**39** such calls (52 M /
-  1.32 M) for **52 M ≈ 2.63 % of the floor**, re-inserting the *same* 36 directories each time.
-  Nearly all of it is two `Vec<PathBuf>::contains` scans per directory (`Path::eq` is
-  component-wise, `Components::eq`/`parse_next_component_back`, ~1000 instructions per compare),
-  i.e. ~1 300 component walks per call.
+- **The recurring cost WAS the caller's re-insert loop — now one-shot** (`../codeserver.rs`'s
+  `installed_tail` marker, see *The system half is installed once* below). Before it,
+  `CodeServer::add_system_paths` cost **1.32 M instructions per call** — measured from a
+  `code:get_path/0` loop (300 calls cost 396 M, and 78 % of the BIF's own 1.69 M/call) — and a
+  boot made ~**39** such calls, **52 M ≈ 2.63 % of the floor**, re-inserting the *same* 36
+  directories each time. Nearly all of it was two `Vec<PathBuf>::contains` scans per directory
+  (`Path::eq` is component-wise, `Components::eq`/`parse_next_component_back`, ~1000
+  instructions per compare), i.e. ~1 300 component walks per call.
+- **After the marker** (same recipe, `taskset -c 2`, 5 alternating control/new rounds): the floor
+  **1.9807 G → 1.9331 G instructions (−47.6 M, −2.40 %)**; the perf census puts
+  `<CodeServer>::add_system_paths` at **52 M → 4 M** (2.60 % → 0.20 % — what is left is the one
+  real install and its callees). The per-`code:get_path/0` slope falls **1.685 M → 0.529 M**
+  (N=0 vs N=300 loop probe): the install is gone from the query, and the residual is the BIF's
+  own list building and copy-out. `cached_system_path`'s 36-`PathBuf` clone is now paid once.
 - `find_file` builds one `PathBuf` per candidate and `stat`s it, but only 0.10 % of the run — a
   minimal run opens 99 `.beam` files and each is found in the first few entries.
 
@@ -72,8 +79,8 @@ instructions):
 - **A one-shot "already installed" short-circuit cannot live here.** A process-global
   "return the list only once" flag in `cached_system_path` would starve every *second*
   `CodeServer` in the same process of its system path — and the crate's tests build one server
-  per case. Duplicate-install suppression is **per-`CodeServer` state** (`codeserver.rs`), never
-  a module-level cache.
+  per case. Duplicate-install suppression is **per-`CodeServer` state** (`codeserver.rs`'s
+  `installed_tail`), never a module-level cache.
 - Deliberate divergences, each documented at its function: **no `.ez`/archive support** (an
   `.ez`-only tree contributes no entry where the oracle expands it) and **dedup by exact path,
   not by application name** (the only visible difference is an `$ERL_LIBS` second version of an
@@ -82,37 +89,54 @@ instructions):
   mutation live in the sibling file `../codeserver.rs` (`modules: HashMap<String, Arc<Module>>`).
 - Files ~1000 lines / Apache-2.0 header / `#![warn(missing_docs)]` per the crate constraints.
 
+## The system half is installed once (`../codeserver.rs`)
+`CodeServer::add_system_paths` is a **one-shot install**, per server: the field
+`installed_tail: Option<usize>` holds the `tail_paths` length the last successful install
+covered, a hit at the top of the method returns `Ok(())` immediately, and a success sets it.
+`code:get_path/0` calls it first (`src/native/code.rs:73`) and so does every other `code:*`
+reader, so the guard is what makes those cheap.
+
+- **A count, not a bool.** `tail_paths` grows only in `set_configured_paths`, so a `-pz`
+  directory configured after the first install still gets appended (after `.`, the oracle's
+  `add_pa_pz/3` order) — pinned by
+  `a_pz_directory_configured_after_the_install_is_still_appended`.
+- **A failed first attempt retries.** The `?` on `system_ebins()` leaves the field `None`.
+- **The body's inputs are exactly three**, and each keeps the marker sound: `system_lib_root`
+  (written only by the install itself, from the cached `system_ebins()`), `default_paths`
+  (monotone, `add_default_path` only — `set_configured_paths`' `-pa` group and the install), and
+  `tail_paths`. `reset_paths_to_defaults` restores from `default_paths`, which already holds the
+  system half, so a post-`init:restart/0` skip is still correct.
+- **Per-`CodeServer`, never process-global** (a global flag would starve every second server in
+  the process; the crate builds one per test case).
+- **The `HashSet<PathBuf>` duplicate-check idea is therefore closed as unnecessary.** It was the
+  second half of the original two-part plan (replacing `add_default_path`'s
+  `default_paths.contains` + `add_path`'s `paths.contains` with a set kept in lockstep); the
+  marker alone removed **48 of the 52 M** (the rest is the single real install), so the two
+  component-wise scans no longer run on any query path.
+- **`code:del_path/1` on a system `ebin` now persists**, which is the oracle's behaviour: the
+  entry is dropped from `paths` (`remove_path_where`, `src/native/code/path.rs:121`) and nothing
+  puts it back; the oracle restores its default path only on `init:restart/0`, here
+  `reset_paths_to_defaults`. Pinned by
+  `a_system_ebin_deleted_after_the_install_stays_deleted_until_a_restart`, and pinned against the
+  oracle end to end by `../tests/code_add_path.rs` (a fixture directory, unaffected by the
+  marker). No differential case exercises `del_path` (verified: none of the 3 439 case ids names
+  it) — adding one is the sibling `../../../tools/differential/` node's write, not this one's.
+
 ## Known Issues
-- **The system half of the code path is rebuilt on every `CodeServer::add_system_paths` call**
-  (~39 per boot, 1.32 M instructions each, 2.63 % of the startup floor) although its two inputs
-  are process-constant. The duplicate work is `add_default_path`'s
-  `default_paths.contains(&dir)` + `add_path`'s `paths.contains(&dir)` pair — O(n) component
-  comparisons over the 36-entry list — plus the 36-`PathBuf` clone this module returns.
-  The fix belongs in `../codeserver.rs` and is two independent changes: (a) a per-server
-  one-shot guard recording how many `tail_paths` the last successful install appended
-  (`Option<usize>`, so a `set_configured_paths` arriving later still appends its extra `-pz`
-  directories, and a failed first attempt still retries), and (b) replacing both `Vec::contains`
-  duplicate checks with a `HashSet<PathBuf>` kept in lockstep with `paths`/`default_paths`
-  (`Path`'s `Hash` normalises the same redundant separators `Eq` ignores, so membership answers
-  identically). (a) alone removes ~99 % of the 52 M.
-- **`code:del_path/1` on a system `ebin` is undone before it can be observed.** The deletion is
-  `remove_path_where` (`src/native/code/path.rs:121`), which edits `paths` only; the next
-  `add_system_paths` call re-installs the entry from the (still intact) `default_paths` — and
-  `code:get_path/0` calls `add_system_paths` **first** (`src/native/code.rs:73`), so
-  `code:del_path(Sys), code:get_path()` lists the directory again where the oracle drops it.
-  The one-shot guard above moves this to the oracle's answer (`default_paths` is restored only by
-  `reset_paths_to_defaults`, i.e. by `init:restart/0`), so it is a **behaviour change to declare**
-  — and a differential case worth adding beside the guard.
 - **`load_bytes`'s two interning loops call `self.atoms_mut()` once per atom** (`codeserver.rs`
   `:847-849`, `:864-868`), i.e. two `Rc::get_mut` calls per atom where one hoisted borrow would
-  do. It is a micro: the whole `AtomTable::intern` share is 26 M (1.31 %), dominated by the
-  name→index hash lookup itself.
+  do. It is a micro: `Rc`'s strong count is a non-atomic `Cell`, and the whole
+  `AtomTable::intern` share is ~26 M (1.31 %, and below the ±20 M sampling noise of the census),
+  dominated by the name→index hash lookup itself.
   Both loops are also **load-bearing and not removable**: the `wire` pre-pass must intern every
   module atom into the *shared* table because `build_module`'s clone has to start with an
   identical prefix for the wire indices to mean anything, and the merge-back must intern the
   literal-only atoms at exactly `base..` so the shared indices stay identical to the module's.
   The merge-back's lookups are the only avoidable half — the names are appended in index order,
-  so an append-only `AtomTable` push would do — but that surface is `beam_term`'s.
+  so an append-only push would do — but `AtomTable::intern` is that table's **only** mutating
+  API (`beam_term/src/atom.rs`: a name-keyed `index.get` fast path, one `Arc<str>` per new
+  name), so removing them needs a `beam_term` API, i.e. a **sibling node's** surface. Not done
+  here.
 - **The single largest attributable item in the load path is not this file's to fix**:
   `<AtomTable as Clone>::clone` at `codeserver.rs:862` (`lower::build_module(&chunks, &raw,
   (*self.atoms).clone())`) is 298 M / 15.07 % of the floor, 7.38 % of it `Arc<str>::from(&str)`
@@ -120,9 +144,10 @@ instructions):
 
 ## Notes for Agents
 - **Do not look for wins inside this module.** The measured share of `codeserver::path::*` is
-  0 samples out of 989; a change here cannot move the startup floor. The per-call money is in
-  `../codeserver.rs` (`add_system_paths`, and the `.clone()` handed to
-  `lower::build_module` — a `beam_term` fork seam owned by another node).
+  0 samples out of 989; a change here cannot move the startup floor. What used to be the per-call
+  money — `add_system_paths`'s re-insert loop — is now a one-shot install (above). The remaining
+  large item is the `.clone()` handed to `lower::build_module` (298 M, a `beam_term` fork seam
+  owned by another node).
 - Measurement recipe that produced the table above (keep it identical when comparing):
   `perf record -e instructions:u -c 2000000 --call-graph dwarf,16384 -o X.data -- taskset -c 2
   erts_rust/target/release/beam_rt -noshell -eval 'halt().'`, then exact inclusive shares by
@@ -130,23 +155,28 @@ instructions):
   stack names a symbol (each sample = 2 M instructions).
   `perf probe` is unavailable in this sandbox (`/sys/kernel/tracing` is not readable), so call
   counts come from **loop probes** instead: `-eval 'lists:foreach(fun(_) ->
-  code:get_path() end, lists:seq(1,N)), halt().'` is exactly linear (1.690 M/call at both
-  N=100 and N=300; N=0 = the floor), and the slope prices a per-call path operation.
+  code:get_path() end, lists:seq(1,N)), halt().'` is exactly linear — **1.685 M/call before the
+  marker, 0.529 M/call after** (N=0 = the floor) — and the slope prices a per-call path
+  operation.
 - **This node is irrelevant to literal-area lifetime**: it only derives directory strings. A
   module's `LiteralArea` lives as long as its `Arc<Module>`, which `../codeserver.rs` retains
   (`modules`, `forget_module`) — see the literal section of `../CONTEXT.md`.
 - Unit tests are colocated at the tail of `path.rs` (`vsn_to_num_accepts_only_ascii_digit_
   components`, `release_ebins_is_descending_by_application_name`,
   `user_lib_ebins_scans_every_erl_libs_element_and_keeps_only_ebin`,
-  `system_path_is_prim_then_erl_libs_then_release_then_dot`). The end-to-end oracle cross-check
-  of the whole path is `../tests/code_path.rs`; the boot gates are
+  `system_path_is_prim_then_erl_libs_then_release_then_dot`), and the `CodeServer`-level ones
+  (the path install/marker) at the tail of `../codeserver.rs`
+  (`a_system_ebin_deleted_after_the_install_stays_deleted_until_a_restart`,
+  `a_pz_directory_configured_after_the_install_is_still_appended`). The end-to-end oracle
+  cross-check of the whole path is `../tests/code_path.rs` (plus `../tests/boot_code_path.rs`
+  and `../tests/code_add_path.rs` for the mutators); the boot gates are
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test boot`
   and `beam_rt -noshell -boot bootstrap/bin/start` (exit 0, empty stdout/stderr).
 - **The full crate gate is `-p beam_rt --lib --no-fail-fast`**: 1978 passed / 4 failed / 7 ignored,
   and the four are the pre-existing `src/runner/` *measured-table* pins
   (`a_process_never_hands_out_off_heap_slots_across_slices`, `boundary_cost`, `reds_door`,
   `slice_charging`) — number-drift pins owned by that node, not this one. The `codeserver::` slice
-  is green on its own (`--lib -- codeserver::`, 32 passed).
+  is green on its own (`--lib -- codeserver`, 34 passed, the marker's two cases included).
 - `system_path` reads the **ambient** `$ERL_LIBS`, so a test that manipulates it must be
   serialized by the caller (the crate's env discipline).
 - **The cheapest end-to-end parity check of this module's output** (seconds, no differential

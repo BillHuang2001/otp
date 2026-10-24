@@ -164,6 +164,40 @@ pub struct CodeServer {
     /// registered by [`CodeServer::set_configured_paths`] and appended by
     /// [`CodeServer::add_system_paths`], i.e. once the system directories are in place.
     tail_paths: Vec<PathBuf>,
+    /// The **one-shot install marker** for [`CodeServer::add_system_paths`]: the
+    /// [`tail_paths`](CodeServer::tail_paths) length the last successful install appended,
+    /// or `None` while no install has completed.
+    ///
+    /// It is a *count*, not a bool, because the system half's install covers the `-pz` tail
+    /// too: a `set_configured_paths` that adds a `-pz` directory after the first boot must
+    /// still append it, and it does, because the count moved. A first attempt that failed
+    /// early (the `?` on `system_ebins()`) leaves it `None`, so the next call retries in
+    /// full — a failed boot never silently loses the system path.
+    ///
+    /// # Why the marker is sound
+    ///
+    /// The install body's inputs are exactly three pieces of state, each of which either is
+    /// constant after the first success or invalidates the marker:
+    ///
+    /// * `system_lib_root`, which the body itself writes (from the cached `system_ebins()`)
+    ///   and nothing else ever writes — so the value the skipped calls would recompute is
+    ///   already recorded;
+    /// * `default_paths`, a monotone set whose additions come from
+    ///   [`CodeServer::add_default_path`] (the `-pa` group at configuration time and this
+    ///   method itself) — never removed, so a longer `default_paths` cannot make the
+    ///   installed system half wrong;
+    /// * `tail_paths`, appended only by [`CodeServer::set_configured_paths`] — the count the
+    ///   marker compares.
+    ///
+    /// [`CodeServer::reset_paths_to_defaults`] restores the path from `default_paths`, which
+    /// already holds the system half (and the tail), so a post-`init:restart/0` skip is still
+    /// correct.
+    ///
+    /// It must stay **per-server**: a process-global flag would starve every second
+    /// [`CodeServer`] in the process of its system path (the crate's tests build one server
+    /// per case), which is why the suppression lives here and not in [`path`]'s module-level
+    /// cache.
+    installed_tail: Option<usize>,
     /// The **boot-time default** code path: the `-pa`/`-pz` directories the runtime was
     /// configured with plus the system `ebin` directories (everything added through
     /// [`CodeServer::add_default_path`]). Everything a boot script's `{path, …}` directive or
@@ -198,6 +232,7 @@ impl CodeServer {
             fun_snapshot_rebuilds: Cell::new(0),
             paths: Vec::new(),
             tail_paths: Vec::new(),
+            installed_tail: None,
             default_paths: Vec::new(),
             system_lib_root: None,
         }
@@ -348,11 +383,30 @@ impl CodeServer {
     /// derivation itself is cached ([`path::cached_system_path`]) exactly as the base
     /// resolution is ([`system_ebins`]).
     ///
+    /// # Installed once, not once per call
+    ///
+    /// The install is **one-shot**: the first successful call records the
+    /// [`tail_paths`](CodeServer::tail_paths) count it covered in
+    /// [`installed_tail`](CodeServer::installed_tail) and every later call returns
+    /// immediately. That is what keeps a `code:get_path/0` — which calls this first — from
+    /// re-running the whole system half (~1.3 M instructions: two component-wise
+    /// `Vec<PathBuf>::contains` scans per directory over the release's 36 entries) ~39 times
+    /// per boot. A later `-pz` growth moves the count and re-runs the install; see
+    /// [`installed_tail`](CodeServer::installed_tail) for the soundness argument.
+    ///
+    /// The observable consequence is the oracle's own: `code:del_path/1` on a system `ebin`
+    /// **persists** (the entry is dropped from `paths` and nothing puts it back), which is
+    /// what `code_server.erl` does too — its default path is only restored by
+    /// `init:restart/0`, i.e. here by [`CodeServer::reset_paths_to_defaults`].
+    ///
     /// # Errors
     ///
     /// A message-carrying [`beam_common::BeamError`] naming the environment variable or the
     /// `erl` invocation that failed.
     pub fn add_system_paths(&mut self) -> Result<()> {
+        if self.installed_tail == Some(self.tail_paths.len()) {
+            return Ok(());
+        }
         let base = system_ebins()?;
         // The installation's `<lib>` root, derived from the directories the resolution just
         // *proved* (each holds its probe module). Recording it here is what keeps
@@ -373,6 +427,9 @@ impl CodeServer {
         for dir in tail {
             self.add_default_path(dir);
         }
+        // The system half (and the tail it covered) is now installed: every later call is a
+        // no-op until a `set_configured_paths` grows the tail (see `installed_tail`).
+        self.installed_tail = Some(self.tail_paths.len());
         Ok(())
     }
 
@@ -1481,6 +1538,60 @@ mod tests {
             "`.` survives `reset_paths_to_defaults`"
         );
     }
+    /// The system half is installed **once**: a later call is a no-op, so a
+    /// `code:del_path/1` of a system `ebin` really stays deleted — the oracle's own
+    /// behaviour, where only `init:restart/0` restores the default path. `code:get_path/0`
+    /// calls `add_system_paths` first (`src/native/code.rs`), so before the marker existed
+    /// every query silently undid the delete.
+    #[test]
+    fn a_system_ebin_deleted_after_the_install_stays_deleted_until_a_restart() {
+        let Some(mut server) = system_server() else {
+            return;
+        };
+        let system = server.paths().to_vec();
+        let victim = system[0].clone();
+        assert!(
+            server.remove_path_where(|entry| entry == victim.as_path()),
+            "the first system directory is on the path"
+        );
+        // The re-install a query would trigger must not put it back.
+        server.add_system_paths().expect("the second install is a no-op");
+        assert!(
+            !server.paths().contains(&victim),
+            "a deleted system directory is not re-installed: {:?}",
+            server.paths()
+        );
+        assert_eq!(server.paths().len(), system.len() - 1);
+        // `init:restart/0`'s path half restores the boot-time default, victim included.
+        server.reset_paths_to_defaults();
+        assert_eq!(server.paths(), &system[..], "a reset restores the system half");
+    }
+
+    /// The marker is a **count of the `-pz` tail**, not a bool: a `set_configured_paths`
+    /// that adds a `-pz` directory after the first install still appends it (after `.`, the
+    /// oracle's `add_pa_pz/3` order).
+    #[test]
+    fn a_pz_directory_configured_after_the_install_is_still_appended() {
+        let pz = scratch("late-pz");
+        let mut server = CodeServer::new();
+        server.set_configured_paths(&[], &[]);
+        if let Err(error) = server.add_system_paths() {
+            eprintln!("SKIP: no system code path ({error})");
+            return;
+        }
+        let installed = server.paths().len();
+        assert_eq!(server.installed_tail, Some(0));
+        // A second call installs nothing.
+        server.add_system_paths().expect("a no-op re-install");
+        assert_eq!(server.paths().len(), installed);
+
+        server.set_configured_paths(&[], std::slice::from_ref(&pz));
+        server.add_system_paths().expect("the grown tail is installed");
+        assert_eq!(server.installed_tail, Some(1));
+        assert_eq!(server.paths().len(), installed + 1);
+        assert_eq!(server.paths().last(), Some(&pz), "the `-pz` tail is appended last");
+    }
+
     #[test]
     fn a_missing_module_raises_undef() {
         let mut server = CodeServer::new();
