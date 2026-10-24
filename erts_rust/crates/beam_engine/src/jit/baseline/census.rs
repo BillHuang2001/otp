@@ -81,11 +81,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use beam_loader::{Instr, Label, Module, Operand, TestKind};
+use beam_loader::{BsGetArgs, Instr, Label, Module, Operand, TestKind};
 
 use super::counters::{self, Counters};
 use super::emit::{compile_function, compile_module, FillSite, SpillSite};
-use super::tests::build_module;
+use super::tests::{assemble_function, build_module};
 
 /// A safety bound on how many installed-OTP `.beam`s the static census samples.
 ///
@@ -719,14 +719,53 @@ fn dynamic_execution_census() -> crate::exec_census::Snapshot {
 //   this worktree (the dispatch has only the small-int `+`/`-`/`*` `gc_bif` fast path
 //   and the comparison BIFs), so no row is reported for them; only the small-int
 //   `gc_bif` fast path is present to measure and is out of this table's scope.
+// * every row is a shape the tier **does** lower (`deopts == 0` is asserted per row): a
+//   body that fell through to the family helper or to `jit_step_one` would measure the
+//   deopt sequence plus the helper call, not the inline arm. The eight bitstring arms
+//   ([`super::super::emit::bitstr_inline`]) each carry a small shared prologue (the
+//   match-context guard and, where they can fail, an exit to the fail label), which is
+//   why their deltas are *positive* against the `func_info` reference: an inlined
+//   bitstring arm buys run time (no interpreter step, no helper call), not code size — the
+//   per-occurrence marginal is the figure to quote for that trade.
 
 /// The atoms of the reference `func_info`: its operands are never read (the emitter
 /// deopts the whole instruction), so the index is irrelevant.
 const REF_ATOM: beam_term::Atom = beam_term::Atom::MAX;
 
+/// The `bs_match` command names a measured body may name.
+///
+/// Minted into a measured module **before** its instruction stream is built, because a
+/// command name is an `Operand::Atom` whose id has to exist first — the same constraint
+/// [`super::bitstr_inline_tests`]' `bitstr_module` documents. Minting them for every row
+/// is uniform and costs a row nothing: an atom id is only read by the shape that names it.
+const BS_MATCH_COMMAND_ATOMS: [&str; 7] = [
+    "ensure_at_least",
+    "ensure_exactly",
+    "skip",
+    "integer",
+    "binary",
+    "get_tail",
+    "=:=",
+];
+
+/// A per-shape body builder: `repeat` copies of the shape plus a `return`.
+///
+/// It is handed the measured module because a body whose operands name module atoms
+/// (`bs_match`'s command list) must look their ids up in the table minted before the
+/// stream is assembled.
+type BodyBuilder = fn(&Module, usize) -> Vec<Instr>;
+
+/// The atom `name` of a measured module (minted by [`measure_one_block`]).
+fn measured_atom(module: &Module, name: &str) -> beam_term::Atom {
+    module
+        .atom_table
+        .lookup(name)
+        .unwrap_or_else(|| panic!("`{name}` must be minted before the body is built"))
+}
+
 /// A body of `repeat` always-deopting `func_info`s plus a `return` — the fixed
 /// deopt-sequence reference (its `2 − 1` marginal is the per-occurrence deopt cost).
-fn body_deopt(repeat: usize) -> Vec<Instr> {
+fn body_deopt(_module: &Module, repeat: usize) -> Vec<Instr> {
     let mut body = Vec::new();
     for _ in 0..repeat {
         body.push(Instr::FuncInfo {
@@ -740,7 +779,7 @@ fn body_deopt(repeat: usize) -> Vec<Instr> {
 }
 
 /// `move Integer -> X(0)` — the plain in-bound x-register `move`.
-fn body_move_x(repeat: usize) -> Vec<Instr> {
+fn body_move_x(_module: &Module, repeat: usize) -> Vec<Instr> {
     let mut body = Vec::new();
     for _ in 0..repeat {
         body.push(Instr::Move {
@@ -754,7 +793,7 @@ fn body_move_x(repeat: usize) -> Vec<Instr> {
 
 /// `move Literal(0) -> X(0)` — the **literal-area-source** `move` (a run-time-guarded
 /// literal load; the literal area need not exist to compile the shape).
-fn body_move_literal(repeat: usize) -> Vec<Instr> {
+fn body_move_literal(_module: &Module, repeat: usize) -> Vec<Instr> {
     let mut body = Vec::new();
     for _ in 0..repeat {
         body.push(Instr::Move {
@@ -768,7 +807,7 @@ fn body_move_literal(repeat: usize) -> Vec<Instr> {
 
 /// `test is_nil Y(0) Fail=self` — the **Y-operand** `test` (a guarded frame-window
 /// load). The fail label is the block's own entry, so the function stays one block.
-fn body_test_y(repeat: usize) -> Vec<Instr> {
+fn body_test_y(_module: &Module, repeat: usize) -> Vec<Instr> {
     let mut body = Vec::new();
     for _ in 0..repeat {
         body.push(Instr::Test {
@@ -783,7 +822,7 @@ fn body_test_y(repeat: usize) -> Vec<Instr> {
 
 /// `select_val Y(0) Fail=self {0 -> self}` — the **Y-operand** `select_val`. A switch
 /// always transfers control, so it ends its block (a second copy is unreachable).
-fn body_select_val_y(_repeat: usize) -> Vec<Instr> {
+fn body_select_val_y(_module: &Module, _repeat: usize) -> Vec<Instr> {
     vec![Instr::SelectVal {
         value: Operand::Y(0),
         fail: Label(2),
@@ -793,7 +832,7 @@ fn body_select_val_y(_repeat: usize) -> Vec<Instr> {
 
 /// `select_tuple_arity Y(0) Fail=self {2 -> self}` — the **Y-operand**
 /// `select_tuple_arity`. Like `select_val` it always transfers control.
-fn body_select_tuple_arity_y(_repeat: usize) -> Vec<Instr> {
+fn body_select_tuple_arity_y(_module: &Module, _repeat: usize) -> Vec<Instr> {
     vec![Instr::SelectTupleArity {
         tuple: Operand::Y(0),
         fail: Label(2),
@@ -803,7 +842,7 @@ fn body_select_tuple_arity_y(_repeat: usize) -> Vec<Instr> {
 
 /// `call 0 self` — the **frame-preserving local call** (the `jit_call_store` helper
 /// plus the local-call seam probe). It transfers control, so it ends its block.
-fn body_call(_repeat: usize) -> Vec<Instr> {
+fn body_call(_module: &Module, _repeat: usize) -> Vec<Instr> {
     vec![Instr::Call {
         arity: 0,
         target: Label(2),
@@ -812,12 +851,155 @@ fn body_call(_repeat: usize) -> Vec<Instr> {
 
 /// `put_tuple2` — a **family-owned** instruction (routed to `families::dispatch`'s
 /// owning family through `emit::family::emit_family`).
-fn body_family(repeat: usize) -> Vec<Instr> {
+fn body_family(_module: &Module, repeat: usize) -> Vec<Instr> {
     let mut body = Vec::new();
     for _ in 0..repeat {
         body.push(Instr::PutTuple2 {
             dst: Operand::X(0),
             elements: vec![Operand::Integer(1), Operand::Integer(2)],
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_get_position Ctx X(0) Dst X(1) Live=2` — the smallest match-context shape: the
+/// context guard, one `start`-word read and one destination store (no allocation, no
+/// fail path at all).
+fn body_bs_get_position(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsGetPosition {
+            ctx: Operand::X(0),
+            dst: Operand::X(1),
+            live: 2,
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_set_position Ctx X(0) Pos X(1)` — the mutating shape with a **register** position:
+/// the context guard, the position term's own classification (a boxed context or a
+/// non-negative small) and one heap-word commit. The fail label is the block's own entry,
+/// so the function stays one block.
+fn body_bs_set_position(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsSetPosition {
+            ctx: Operand::X(0),
+            pos: Operand::X(1),
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_test_tail2 Fail=self Ctx X(0) Bits=8` — a pure compare that branches to the fail
+/// label; its hit path continues in-block, so a second copy fits.
+fn body_bs_test_tail2(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsTestTail2 {
+            fail: Label(2),
+            ctx: Operand::X(0),
+            bits: 8,
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_skip_bits2 Fail=self Ctx X(0) Size=1 Unit=8 Flags=0` — the constant-size skip: the
+/// cheapest mutating shape (one commit, no destination).
+fn body_bs_skip_bits2(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsSkipBits2 {
+            fail: Label(2),
+            ctx: Operand::X(0),
+            size: Operand::Integer(1),
+            unit: 8,
+            flags: 0,
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_start_match3 Fail=self Bin X(0) Live=2 Dst X(1)` — the subject-classification
+/// shape (on-heap bits, a refc window, a reused context, else the fail label).
+fn body_bs_start_match3(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsStartMatch3 {
+            fail: Label(2),
+            bin: Operand::X(0),
+            live: 2,
+            dst: Operand::X(1),
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_start_match4 Fail=label Ctx Src X(0) Live=2 Dst X(1)` — the same classification
+/// with the fail operand as a `Label` **operand** (the form the compiler emits when the
+/// match can fail to a real label).
+fn body_bs_start_match4(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsStartMatch4 {
+            fail: Operand::Label(Label(2)),
+            live: 2,
+            src: Operand::X(0),
+            dst: Operand::X(1),
+        });
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_get_integer2 Fail=self Ctx X(0) Live=2 Size=1 Unit=8 Flags=0 Dst X(1)` — the
+/// field-extracting shape: the subject view, the bit extraction and the `start` commit
+/// ahead of the destination store.
+fn body_bs_get_integer2(_module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsGetInteger2(Box::new(BsGetArgs {
+            fail: Label(2),
+            ctx: Operand::X(0),
+            live: 2,
+            size: Operand::Integer(1),
+            unit: 8,
+            flags: 0,
+            dst: Operand::X(1),
+        })));
+    }
+    body.push(Instr::Return);
+    body
+}
+
+/// `bs_match Fail=self Ctx X(0) {ensure_at_least 2 8, integer 2 [] 1 8 X(1)}` — the
+/// fully **static** command list a compiled binary comprehension re-enters on every
+/// element: one bounded-remaining check, one constant-width extraction, one binding.
+fn body_bs_match(module: &Module, repeat: usize) -> Vec<Instr> {
+    let mut body = Vec::new();
+    for _ in 0..repeat {
+        body.push(Instr::BsMatch {
+            fail: Label(2),
+            ctx: Operand::X(0),
+            commands: vec![
+                Operand::Atom(measured_atom(module, "ensure_at_least")),
+                Operand::Integer(2),
+                Operand::Integer(8),
+                Operand::Atom(measured_atom(module, "integer")),
+                Operand::Integer(2),
+                Operand::Nil,
+                Operand::Integer(1),
+                Operand::Integer(8),
+                Operand::X(1),
+            ],
         });
     }
     body.push(Instr::Return);
@@ -840,16 +1022,27 @@ fn measure_module(module: &Module, func: u32) -> (u64, u64) {
     )
 }
 
-/// Compile a module whose function `f/0` is a **single** block carrying `body` (prefixed
-/// by the one entry label `Label(2)`) and return `measure_module`'s pair. One label means
-/// one IR block, so the summed `block_emitted_bytes` is that block's own size.
-fn measure_one_block(name: &str, body: Vec<Instr>) -> (u64, u64) {
+/// Compile a module whose function `f/0` is a **single** block carrying `build`'s body
+/// with `copies` repetitions of the shape (prefixed by the one entry label `Label(2)`) and
+/// return [`measure_module`]'s pair. One label means one IR block, so the summed
+/// `block_emitted_bytes` is that block's own size.
+///
+/// The atoms are minted **before** `build` runs ([`BS_MATCH_COMMAND_ATOMS`]) because a
+/// `bs_match` command name is an `Operand::Atom` whose id has to exist first; the stream is
+/// then assembled through [`assemble_function`], the same block decomposition
+/// [`build_module`] uses, so a measured module is cut into blocks exactly like a real
+/// `.beam`.
+fn measure_one_block(name: &str, build: BodyBuilder, copies: usize) -> (u64, u64) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern(name);
+    for atom in BS_MATCH_COMMAND_ATOMS {
+        module.atom_table.intern(atom);
+    }
     let mut code = vec![Instr::Label(Label(2))];
-    code.extend(body);
-    let module = build_module(name, &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+    code.extend(build(&module, copies));
+    assemble_function(&mut module, "f", 0, code, Some(Label(2)));
     measure_module(&module, 0)
 }
-
 /// **The per-kind emitted-code-size table** — the byte cost of each in-block lowering
 /// the native baseline tier carries, against the fixed per-occurrence deopt it replaces.
 ///
@@ -865,12 +1058,12 @@ fn measure_one_block(name: &str, body: Vec<Instr>) -> (u64, u64) {
 fn the_per_kind_emitted_code_size_table_is_printed() {
     // (1) The fixed deopt-sequence reference: a block with ONE always-deopting
     // `func_info`. Its `2 − 1` marginal is the confound-free per-occurrence deopt cost.
-    let (deopt_block, deopt_deopts) = measure_one_block("size_deopt_ref", body_deopt(1));
+    let (deopt_block, deopt_deopts) = measure_one_block("size_deopt_ref", body_deopt, 1);
     assert_eq!(
         deopt_deopts, 1,
         "the reference block must deopt exactly once (the one `func_info`)"
     );
-    let (deopt_block_2x, _) = measure_one_block("size_deopt_ref_2x", body_deopt(2));
+    let (deopt_block_2x, _) = measure_one_block("size_deopt_ref_2x", body_deopt, 2);
     let deopt_seq = deopt_block_2x.saturating_sub(deopt_block);
     assert!(
         deopt_seq > 0 && deopt_block > deopt_seq,
@@ -880,7 +1073,7 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 
     // (2) The shapes. `repeatable` is `true` only when a second copy fits in the same
     // block (a block-terminating shape cannot), which is what the marginal needs.
-    let kinds: [(&str, fn(usize) -> Vec<Instr>, bool); 7] = [
+    let kinds: [(&str, BodyBuilder, bool); 15] = [
         ("Move x<-int", body_move_x, true),
         ("Move x<-literal", body_move_literal, true),
         ("Test Y-src (is_nil)", body_test_y, true),
@@ -888,8 +1081,15 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
         ("SelectTupleArity Y-src", body_select_tuple_arity_y, false),
         ("Call (frame-preserving)", body_call, false),
         ("Family arm (put_tuple2)", body_family, true),
+        ("BsGetPosition", body_bs_get_position, true),
+        ("BsSetPosition", body_bs_set_position, true),
+        ("BsTestTail2", body_bs_test_tail2, true),
+        ("BsSkipBits2", body_bs_skip_bits2, true),
+        ("BsStartMatch3", body_bs_start_match3, true),
+        ("BsStartMatch4", body_bs_start_match4, true),
+        ("BsGetInteger2", body_bs_get_integer2, true),
+        ("BsMatch (static cmds)", body_bs_match, true),
     ];
-
     println!("=== baseline-JIT per-kind emitted-code size ===");
     println!(
         "deopt reference: a block with ONE always-deopting `func_info` = {deopt_block} bytes \
@@ -904,10 +1104,10 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
     let mut summed_delta: i64 = 0;
     let mut rows: Vec<(String, u64, i64, Option<i64>)> = Vec::new();
     for (name, build, repeatable) in &kinds {
-        let (bytes1, deopts1) = measure_one_block("size_kind", build(1));
+        let (bytes1, deopts1) = measure_one_block("size_kind", *build, 1);
         let lowered = deopts1 == 0;
         let per_occurrence = repeatable.then(|| {
-            let (bytes2, _) = measure_one_block("size_kind_2x", build(2));
+            let (bytes2, _) = measure_one_block("size_kind_2x", *build, 2);
             bytes2 as i64 - bytes1 as i64
         });
         let delta = bytes1 as i64 - deopt_block as i64;
@@ -990,7 +1190,7 @@ fn the_per_kind_emitted_code_size_table_is_printed() {
 
     // --- (4) liveness / consistency (never a threshold) ---------------------
     assert!(
-        rows.len() == 8,
+        rows.len() == 16,
         "the table must have one row per measured shape"
     );
     assert!(
