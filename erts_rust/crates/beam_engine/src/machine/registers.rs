@@ -401,7 +401,7 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // single bitstring cost on exactly that shape. `Machine::enter_run` re-binds the
         // table instead (`Machine::bind_entry_programs`), keeping it only when the new
         // entry module *is* the image it was filled from (address + content digest + atom
-        // namespace: `BitstrPrograms::describes`, the identity argument
+        // namespace: `ProgramWitness::describes`, the identity argument
         // `label_cache.rs` makes) and discarding it otherwise — so a fresh run can never
         // answer a `(func, pc)` from a previous run's image, and a synthetic image (all-zero
         // checksum, no content identity) is never retained at all. A registered context's

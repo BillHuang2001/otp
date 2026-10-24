@@ -78,9 +78,10 @@
 //! reference count touched ([`Machine::with_bitstr_programs`]).
 //!
 //! [`BitstrPrograms::owner`] additionally records the image address the table was filled
-//! for, so the entry table re-validates itself against whatever module the current run
-//! names, and [`BitstrPrograms::describes`] extends that witness (digest + atom
-//! namespace) so a table can outlive one run when the run re-enters the same image.
+//! for, so a lookup re-validates the table against whatever module it is executing, and
+//! [`ProgramWitness::describes`] extends that witness (digest + atom namespace) so the
+//! entry table can outlive one run when the next run re-enters the same image
+//! ([`Machine::bind_entry_programs`](crate::Machine)).
 //!
 //! It is **machine-owned by construction**, never part of the cross-run compiled-block
 //! cache (`jit/cache/`): that cache is shared between machines and is filled by
@@ -101,9 +102,10 @@
 //! ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)), so
 //! the executing code holds the programs locally and the borrow checker allows the
 //! `&mut Machine` the segment writers need — no reference count is touched and no
-//! slot is borrowed across the call. One call resolves the context's cell once and
-//! files the table back on every exit, so a table lost that way (an unwind) is simply
-//! re-prepared.
+//! slot is borrowed across the call. One call resolves the executing context's **id**
+//! once, swaps that slot (`Contexts::take_programs`/`put_programs`, or the machine's own
+//! field for context `0`) and files the table back on every ordinary exit, so a table
+//! lost that way (an unwind) is simply re-prepared.
 
 use beam_loader::Module;
 use beam_term::atom::AtomSnapshot;

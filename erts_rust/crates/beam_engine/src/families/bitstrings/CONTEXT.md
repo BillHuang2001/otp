@@ -122,8 +122,10 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   `a_split_pairs_payload_move_keeps_the_next_append_in_place`,
   `a_second_pair_over_the_payload_refuses_the_move`).
 - `programs.rs` → the **prepared bitstring program** cache: `Program::{Generic, Create, Match}`, `program_key(func, pc)` and `BitstrPrograms::get_or_prepare`.
-  One table per **module context** (so a `Module::clone` or a second load of the same `.beam` is a different table), machine-owned by construction and never part of the cross-run compiled-block cache.
-  The table reaches the executing family through the single seam `Machine::with_bitstr_programs`, which resolves the context's cell **once** per instruction (context `0` is a machine field, a registered context an `Arc` handle, an unregistered one a dropped throwaway) and files the table back on every ordinary exit.
+  One table per **module context** (so a `Module::clone` or a second load of the same `.beam` is a different table), machine-owned by construction and never part of the cross-run compiled-block cache; the tables live in a `Vec` parallel to `Contexts::entries` (plus `Machine::entry_programs` for context `0`), **not** inside the shared `ModuleContext` an instruction could only reach through an `Arc`.
+  The table reaches the executing family through the single seam `Machine::with_bitstr_programs`, which hands the executing context's table over by value — `Contexts::take_programs` for a registered context, the machine's own field for context `0`, a dropped throwaway for an unregistered one — and files it back into the **same** slot on every ordinary exit.
+  The context id is captured once, so a nested run inside the family cannot redirect the file-back, and both halves are plain struct moves: no `Arc` clone, no `RefCell` guard, no atomic.
+  `Machine::reset` keeps the entry table; `Machine::bind_entry_programs` (called from `enter_run`) **retains** it only when the run re-enters the very image it was filled from — same address, same `Module::checksum` digest, same atom snapshot (`ProgramWitness::describes`) — and never for an all-zero-checksum (hand-built) image, so a batch host that recycles the machine re-prepares nothing.
   `prepare` is consulted once per `(function, code offset)` and its answer filed; a shape it declines is `Program::Generic`, and a synthetic image (all-zero checksum, no content identity) never caches a `Match` program.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/

@@ -1489,7 +1489,7 @@ impl Machine {
     /// 64-slot table would be allocated, filled and dropped once per entry, which is the
     /// single largest bitstring cost on a batch harness that recycles the machine.
     ///
-    /// The retention test is [`BitstrPrograms::describes`], which is exactly as strict as
+    /// The retention test is [`ProgramWitness::describes`], which is exactly as strict as
     /// a fresh prepare needs it to be: same image **address** (the `(function, code
     /// offset)` key's numbers belong to that allocation), same content **digest** (the
     /// chunk subset a prepared program is derived from) and same **atom namespace**

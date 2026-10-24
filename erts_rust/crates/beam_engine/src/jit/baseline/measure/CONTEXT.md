@@ -210,39 +210,36 @@ cases (`rooted_calls_per_call = 2.00`, `local_call_requests_per_call` 2–3,
 `driver_round_trips_per_call = 3.00`, `step_one`/`step_ext` `0`, `deopt_count` empty,
 `block_entry_misses = 0`). So the ratio is the **bitstring family's per-instruction cost**, and any
 "BIF-call gap" framing of these four cases is wrong.
-**Profile the baseline tier alone.** `src/bench/foreign.rs`'s `selected_tiers` takes
-`interpreter|baseline|both` and **defaults to `both`** when `BENCH_TIER` is unset or misspelt — the
-interpreter leg is ~2.2× slower per call (8 322.9 vs 3 734.6 ns/call on `to_lower/1` at
-`instr_per_call = 438.00`), so it owns ~69 % of the samples and silently rewrites the attribution:
-a `both` profile puts `select::pair_eq` (5.60 %) + `select::first_match` (3.67 %) in the top ten,
-but those are the **interpreter's** `select_val` ladder, which the native tier inlines (its
-`select_pairs_by_word_per_call` is `0.00`). Always set `BENCH_TIER=baseline` before recording.
-**Baseline-JIT profile** (`BENCH_TIER=baseline BENCH_ITERS=100000`, release, `taskset -c 3`,
-`perf record -e cpu_core/cycles/u -F 2000`, both Cowboy cases in one run, self time):
-`bitstrings::exec` 9.04 %, `create::prepared::assemble_prepared` 8.04 %, `jit/baseline/bitstr::jit_bitstr`
-5.60 %, `matching::prepared::run_commands_prepared::{closure}` 5.18 %, `run_fast` 4.84 %,
-`runtime::enter_in_block` 4.61 %, `runtime::jit_refresh_y` 4.45 %, `create::exec` 3.69 %,
-`matching::exec_other` 3.08 %, `run_commands_prepared` 2.64 %, `create::exec::{closure}` 2.43 %,
-`match_ctx::read_ctx` 2.27 %, `CompiledModule::function` 2.09 %,
-`drop_glue::<(u64, Program)>` 1.75 % + `drop_glue::<Vec<(u64, Program)>>` 1.42 %,
-`jit_publish_y` 1.55 %, `matching::exec` 1.52 %, `run_prepared` 1.37 %, `call_store_impl` 1.23 %,
-`enter_match` 1.17 %, `create::prepared::prepare` 1.01 %, `jit_allocate` 0.98 %,
-`jit_return` 0.90 %, `jit_local_call` 0.67 %, `read_uint_be` 0.63 %.
-Summed by subsystem: **bitstring family ≈ 41 %**, tier glue (`enter_in_block`/`jit_refresh_y`/
-`jit_publish_y`/`jit_bitstr`/`jit_allocate`/`jit_return`/`jit_local_call`/`call_store_impl`/
-`CompiledModule::function` ≈ 18 %), allocator + `drop_glue` ≈ 5 %.
-**The mechanism this pins.** The hand-over seam `Machine::with_bitstr_programs` is entered on **every**
-`bs_match` and `bs_create_bin`; the two `drop_glue` rows (3.17 %) plus `malloc`/`cfree`/`_int_free_chunk`
-(≈1.5 %) are its `BitstrPrograms` placeholder swap and the 64-slot `Vec` it re-allocates when the table
-comes back empty, and `create::prepared::prepare` + `matching::prepared::prepare` + the atom-table
-`HashMap::get` rows (≈2.3 %) say the table **misses at a non-trivial rate** rather than answering a hit —
-i.e. the prepared program is being re-derived, not reused, on this shape. That (a hit-rate defect plus a
-per-instruction table swap) is the largest single identified lever on these four cases and it is
-`src/machine/**` + `src/families/bitstrings/programs.rs`, i.e. **outside this node**.
-**Not the lever** (measured): per-call setup on the in-crate harness is 3 driver round-trips, 0 deopts,
-0 interpreter steps and `block_entry_misses = 0`; `to_lower/1`'s 438 IR instructions for 30 bytes
-(14.6/byte) is steady state, and the earlier per-call entry/exit campaign already closed the transfer
-bookkeeping (§ above).
+**Profile the baseline tier alone, on the real `beam_rt` path, and exclude boot.** `src/bench/mod.rs`'s
+`selected_tiers` takes `interpreter|baseline|both`, **defaults to `baseline`** and **panics** on an
+unrecognised value. A `both` profile is never valid for an attribution profile: the interpreter leg is
+~2.2× slower per call (8 322.9 vs 3 734.6 ns/call on `to_lower/1` at `instr_per_call = 438.00`), so it
+owns ~69 % of the samples, and the rows a `both` profile puts in its top ten — `select::pair_eq`
+(5.60 %) + `select::first_match` (3.67 %) — are the **interpreter's** `select_val` ladder, which the
+native tier inlines (its `select_pairs_by_word_per_call` is `0.00`).
+The per-run boot cost must be excluded the same way: an in-crate batch that builds a fresh
+`Machine`/context per run folds `AtomTable::fork` / `register_context` / `switch_context` into the
+marginal, and that — not the table's hand-over — is what a `drop_glue::<(u64, Program)>` (1.75 %) +
+`drop_glue::<Vec<(u64, Program)>>` (1.42 %) or a `*::prepared::prepare` row in such a profile is.
+Measured on the runtime path instead — `to_lower/1` at N = 400 000, `cpu_core/cycles/u -F 2000`,
+`taskset -c 3`, self time — the table already **hits**: `bitstrings::exec` 21.4 %,
+`matching::exec` 16.4 %, `exec_other` 7.6 %, `create::exec::{closure}` 4.6 %, `jit_bitstr` 4.1 %, and
+**no `drop_glue` rows at all**. The per-instruction cost is inside the bitstring family, not in the
+hand-over: `exec`/`exec_other`/`create::exec` are ≈41 % of self time on `to_lower`, spread over ~20
+symbols with no single >10 % hotspot.
+**The hand-over itself measures neutral.** The table's placement — the registry's parallel `Vec` and
+the context-`0` field rather than a `RefCell` inside the shared `ModuleContext` — plus the run-entry
+retention rule read **+0.17 % to +0.34 %** retired-instruction slope against a control rebuilt from
+source at the base commit, alternated inside each round at load 1.35–1.36: code-layout noise. They are
+there for **mechanism** correctness (no atomic on the per-instruction path, no table destruction per
+run entry), never as a speedup, consistent with the neutral record at `../../../MEASURED.md`
+(`Measured (binary_append …)`, "Measured neutral, kept only as a simplification").
+**The next lever is the inline set, not a fast path**: extending the compiled-block inline set to
+`bs_match`/`bs_create_bin` so a prepared program runs inside a block instead of through a helper call.
+A per-instruction C-like fast path inside the family is not it — the family cost is already spread
+thin across the prepared walk, and the transfer bookkeeping on this shape is closed
+(`block_entry_misses = 0`, 3 driver round-trips, 0 deopts, 0 interpreter steps per call).
+
 ## See Also
 - `../CONTEXT.md` → the tier contract (the two artifact layouts, the block ABI, the driver loop, the routing table).
 - `../runtime/CONTEXT.md` → the block ABI, `JitRuntime` and the helpers the figures above price.

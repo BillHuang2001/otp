@@ -110,7 +110,7 @@ impl Machine {
         self.bind_entry_verdicts(module);
         // …and, for the same reason, context `0`'s prepared bitstring programs
         // (`Machine::entry_programs`): re-entering the image the table was filled from
-        // keeps every prepared program (`BitstrPrograms::describes`), any other image
+        // keeps every prepared program (`ProgramWitness::describes`), any other image
         // discards it.
         self.bind_entry_programs(module);
         if self.entry_call.is_none() {
