@@ -137,6 +137,7 @@ Every C enum-with-values type (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMa
 - A fixture must reference **only** the `enif_*`/`driver_*` slots the crate populates (`Some`), or `dlopen(RTLD_NOW)` fails on the unresolved import.
 - Adding a `cargo::rustc-link-arg-bins` instruction to `build.rs` **breaks the build** (no `[[bin]]` target in this package).
 - Ground truth for the two loaders is different C code: `erts_load_nif` in `erts/emulator/beam/erl_nif.c` for the NIF side (*`src/nif/CONTEXT.md`*) and `do_load_driver_entry`/`init_driver` for the driver side (*`src/driver/CONTEXT.md`*). Do not modify `erts/` or `tools/`.
+- **Test this crate in `--release` as well as in the default profile.** The repository CI (`.github/workflows/erts_rust.yml`) runs `cargo build`/`cargo test` on the **debug** profile only, and optimisation-dependent defects are invisible there: the aliasing trap above produced a silent 0 in `--release` while `debug` was green for as long as the crate existed. `erts_rust/scripts/cargo.sh test --release --manifest-path erts_rust/Cargo.toml -p beam_abi --no-fail-fast` is the gate for any change to a host seam or an env accessor.
 
 ## Status
 - **Both host layers are implemented**: `ErlNifApi` **176/176** and `ErlDrvApi` **111/111** slots populated, every `enif_*`/`driver_*` family carrying a real body over a host seam, and both dynamic loaders validating an entry in the oracle's exact order.
