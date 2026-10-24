@@ -195,6 +195,7 @@ The authoritative *measured* per-kind bytes are `census.rs::the_per_kind_emitted
 
 
 ## Test Strategy
+**A new `*_tests.rs` file has two declaration sites, and the choice is semantic**: `mod.rs`'s `#[cfg(test)]` block (or a `#[cfg(test)] #[path = "..."] mod x;` there — `bitstr_tests`/`census`/`cross_tests`/`tests`/`counters` plus the `#[path]`d `tail_exit_tests`/`y_operand_tests`/`divrem_tests`, `mod.rs:218-240`) makes the file a child of `baseline` — reaching `runtime::JitRuntime`'s `pub(crate)` fields, `block_entries`/`BlockEntries` and `counters` but **not** `tests.rs`'s private harness; `tests.rs`'s tail `#[path]` block (`tests.rs:6905-6926`: `call_tests`/`family_tests`/`operand_tests`/`bif_tests`/`raise_tier_tests`) makes it a child of `tests`, so `use super::tests::{assert_same_outcome, body_module, build_module, export_atom, run_counting, with_both_tiers}` resolves — what a per-lowering suite wants.
 Every suite in this node is `#[cfg(test)]`, in-node and enumerated in `testing/CONTEXT.md` (the `#[path]` submodules of `tests.rs`, the named-BIF/bitstring/family/tail-exit/raise-tier pins, and `emit/test/refusal_census.rs`).
 Tier equivalence on real modules is the crate's `tests/jit*.rs`, which drive the **lazy** path through `Machine::run_with_tier`.
 The measurement instruments and their gate commands are `census/CONTEXT.md`; a green run without the system `erl` proves nothing about corpus parity (those suites skip loudly).
