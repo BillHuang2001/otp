@@ -275,14 +275,81 @@ share is small — the `Process::deliver`/`Process::receive` floor itself is ≈
 classification ≈2 ns, the wake/drain ≈6 ns and the schedule-in ≈4 ns — and concentrated in
 `ptab.rs` (slot scan, wake list, signal servicing) and `scheduler.rs` (the slice).
 
+## The profiled end-to-end round trip (why the cross-runtime rows are not this crate's)
+
+The rows above are the harness's per-crate floor. They do **not** explain the published cross-runtime
+gap, and a profile says the gap is not in this crate. Instrument: `perf record -e cpu_core/cycles/`
+(self time, call graph) on a P-core, over a two-process Erlang ping-pong under the release
+`beam_rt`, driven by hand-built `.beam` fixtures (`erlc`) so the loop count is explicit. Two shapes:
+`gc_class`'s copy fixture (`{K, [{K,I,I+K} || I <- 1..64]}` — ~390 words, above the 233-word
+nursery) and a `copy_bound`-shaped small payload (~15 words, no codec call). Self times, % of total.
+
+| frame | 390-word | 15-word |
+|---|---|---|
+| the whole send hop (`families::dispatch` → `deliver_message*` → `deliver_into_mailbox`) | **52.0** | ~26 |
+| `beam_message::copy::copy_struct` | 49.0 | ~2 |
+| ⤷ `preflight_words` → `beam_term::size::size_object_bounded_with` → `sizing_walk` | **41.9** | — |
+| ⤷⤷ of which `HashSet<usize>` `insert` 23.7 · `hash_one` (SipHash-1-3) 8.0 · `reserve_rehash` 5.3 · `remove` 4.8 | | |
+| `ProcessTable::deliver` (this crate) | 27.3 | ~1 |
+| ⤷ the host `CollectionGate` walk (`beam_rt::context::gc_walk::process_roots_are_unscanned`) | **6.4** | — |
+| ⤷ `Process::deliver` → its own direct copy attempt | 20.8 | 1.8 |
+| `send_fragmented_message` → `mailbox::send_fragmented` (the **second** copy) | 24.8 | **19.6** |
+| ⤷ `enqueue_fragmented` / `CarrierAllocator::alloc_small` | — | 18.7 / **18.6** |
+| `beam_gc` collection (`collect_minor` / `Copier::run`) | ~2 | ~2 |
+| `Scheduler::run_slice_inner` (the slice around one hop) | — | 9.9 |
+
+Measured consequences:
+
+* **Collections are not the `gc_class/send_recv` mechanism.** `erlang:statistics(garbage_collection)`
+  reports 1.57 collections per round trip on the Rust side against the oracle's 1.17 (31 369 GCs /
+  20 000 rounds vs 23 336), and the profiler puts the whole collection at ~2 % of the op. A
+  "collect-less-often" lever would move ~1 % of that row; the copy path holds the rest.
+* **Every delivery is attempted twice.** `deliver_into_mailbox` reaches the fragment path only on the
+  copier's raw `AllocKind::Message` preflight refusal — which the profiler shows is the *common*
+  case, not the exception: the fragment branch costs 24.8 % while the direct copy costs 20.8 %. For a
+  15-word payload the direct copy is 1.8 % against a 19.6 % fragment branch, i.e. **essentially every
+  small message also becomes a malloc'd `HeapFragment`**, so each hop pays a carrier allocation
+  (`alloc_small` 18.6 %) and a second full copy.
+* **The preflight is the single most expensive thing in a large-payload hop**: 41.9 % of the whole
+  program, holding a per-call `HashSet<usize>` on-path set hashed with SipHash-1-3.
+* The mechanism chain is in the code, not inferred: `RuntimeRunner::park_window` gives a `receive`
+  park `ParkExemption::Always` (`../beam_rt/src/runner/run.rs`), so the parked receiver's
+  `Process::has_unpublished_roots()` is true, so `Process::deliver` returns its raw refusal instead
+  of collecting/growing that heap, so `deliver_into_mailbox` copies into a fresh fragment. A receiver
+  blocked in `receive` is the overwhelmingly common delivery target — it is the whole shape of a
+  ping-pong, and of every server loop.
+
+### The two changes the profile attributes outside this crate
+
+Neither belongs here; recorded with their anchors so a sibling node can land them.
+
+1. **`../beam_rt`, `src/runner/run.rs`'s `park_window`** — publish the parked machine's host-held
+   terms (`ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args`; the reason
+   `ParkExemption::Always` exists) through the `Registers::extra_roots` seam this crate already
+   gathers and scatters (`src/process.rs::gather_roots`/`scatter_roots`, pinned by
+   `run_rooted_collection_gathers_and_scatters_the_extra_roots`), and a `receive` park can then hold
+   `LiveFloats` instead of `Always`. A delivery to a blocked receiver then passes
+   `has_unpublished_roots`, so `Process::deliver` collects/grows its nursery and copies **straight
+   into it** — no fragment, no carrier allocation, no second copy, and the message is where the C
+   puts it.
+2. **`../beam_message`, `src/copy.rs::preflight_words` + `../beam_term`, `src/size.rs::sizing_walk`**
+   — the size preflight allocates a `HashSet<usize>` and a `Vec<Step>` **per call** and hashes every
+   object on the path with SipHash-1-3. A caller-owned reusable scratch (or a small on-path vector
+   that spills to the set only past a depth threshold) removes most of the 41.9 %; folding the
+   preflight into the copy (grow the destination as it is written) removes it entirely, and would
+   also let the fragment fallback stop re-walking: the refused preflight already reports the exact
+   flat word count in `BeamError::Alloc::requested`, which `deliver_into_mailbox` currently throws
+   away before `send_fragmented_message` walks the same graph again.
+
 ## What this file does not measure
 
 * `beam_engine`'s send/receive instruction cost (unreachable from this crate — see its own node).
 * Port delivery, cross-scheduler (SMP) wake/steal, and distribution-driven signals: this harness is
   single-threaded and local, matching the workload the end-to-end `send_recv` exercises.
 * Collections: the heap is rewound per iteration, so no row pays for a GC.
-* The end-to-end `send_recv` decomposition as a *measurement*: the three-way split above is the
-  harness's per-crate rows applied to the workload's structure, not a profiled end-to-end trace.
+* The end-to-end `send_recv` decomposition as a *harness* measurement: the three-way split above is
+  the harness's per-crate rows applied to the workload's structure. The *profiled* decomposition is
+  the section above — a real trace, and what those rows are made of.
 
 ## See Also
 
