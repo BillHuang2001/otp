@@ -63,7 +63,7 @@ use crate::interpreter::LabelMap;
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
 use super::link::{ExitSpill, Linker};
-use super::operands::{Loc, Y_ADDR_SCRATCH};
+use super::operands::{Loc, Y_ADDR_SCRATCH, Y_ADDR_SCRATCH_2};
 use super::{emit_step_and_continue, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // ---------------------------------------------------------------------------
