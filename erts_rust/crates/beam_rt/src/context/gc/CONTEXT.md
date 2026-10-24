@@ -139,6 +139,48 @@ The `heap_growth` control (`src/runner/tests.rs::the_heap_growth_workloads_per_c
 The `+ 1` is the collection the run takes before its first iteration — a fresh process starts on the collector's 233-word floor, smaller than a single 401-word request — and the boundary door adds nothing, because a slice prices exactly 800 iterations (a multiple of `K`) so a boundary collection lands where the following admission would have collected anyway.
 The relation re-derives from each row instead of a quoted count, so a `beam_gc` sizing change moves the settled capacity, `K` and the expected count together rather than breaking the pin silently.
 
+### Why the boot runs 427 collections — the shrink/grow oscillation (the count is a `beam_gc` policy artefact)
+The minimal run (`beam_rt -noshell -eval 'halt().'`) takes **427 collections, 100 % of them on the scheduled route** (the `-eval`/`-version` routes are structurally inert — table-less contexts never reach a door). The count is **not** a live-set property and **not** this node's to set; it is a two-step loop between the copy-out growth seam and the collector's post-collection sizing.
+1. **The trigger mix says so.** 262 of 427 admissions are `collection_debt`-driven with a mean **1 322 words free** in the current space, and 237 of 427 leave the capacity unchanged. `<0.10.0>` (the boot drive's process) owns **398** of the 427.
+2. **The growth seam manufactures the debt.** Every one of the **179** `[rt-heap] copy-out grow` firings (`BEAM_RT_GC_TRACE=1`) is that pid's, all with `chain_spaces=1`; `src/context/calls.rs::hint_grow_gate` grows before a copy-out that would not fit (`hint >= COPY_OUT_HINT_MIN_WORDS = 8`, request `= hint + max(hint/4, 32)`), and `Process::grow_nursery` is the **no-relocation** seam — it **retires** the space it replaces, so `collection_debt()` (`Nursery::retains_old_spaces()`, i.e. `space_count() > 1`) becomes true.
+3. **The debt is settled only by a collection, and that collection shrinks to the floor.** The next admission door collects; `Nursery::collapse` then installs `HeapPolicy::young_after_collection(capacity, live)` = `young_minor_target_words(live)` = **233** words, because the boot process's young live set is ~220 words. The observed capacity ladder between successive gate firings cycles down and back up — `2586 → 376 → 986 → 233 → 609 → 1596 → 376 → 1974 → …` (hints 8/10/92/138/180/182/186/194) — which is an oscillation, not a working set.
+4. **A 233-word nursery cannot fit the next copy-out, so the gate fires again** ⇒ new growth ⇒ new debt ⇒ another collection. 398 turns of that loop on one pid.
+5. **The legacy C refuses to shrink a small young heap; this runtime does not.** `erts/emulator/beam/erl_gc.c:1517-1529` (`do_minor`): `if ((HEAP_SIZE(p) > 3000) && (4 * need_after < HEAP_SIZE(p)) && …)` — *"Excessively large heaps should be shrunk, but don't even bother on reasonable small heaps … unless the heap size is substantial, we don't want to shrink."* `HeapPolicy::young_after_collection` (`beam_gc/src/policy.rs`) shrinks whenever `capacity_words > YOUNG_SHRINK_FACTOR (8) × target`, i.e. above **1 864** words at a 233-word target, with **no floor**. The file's own fullsweep rule already has one (`HeapPolicy::should_shrink` is gated by `heap_words > self.min_heap_words`); the minor's rule has none.
+
+**Measured cost of the count** (`taskset -c 2`, `cpu_core/instructions:u` only — the hybrid CPU emits two PMU instances — 5 alternating paired rounds per row, control spread ±0.15 %, new ±0.05 %, load 0.04–0.21; `VmHWM` from `RUSAGE_CHILDREN`). Each row floors the *same* quantity the C's rule preserves — the nursery's target — through `+hms`, which is a **surrogate** for the missing shrink floor:
+
+| `+hms` | collections | (debt-driven) | words copied | words reclaimed | instructions | Δ | `VmHWM` |
+|---|---|---|---|---|---|---|---|
+| none (control) | **427** | 262 | 128 316 | 661 006 | 1 980.5 M | — | 116.3 MB |
+| 1 000 | **91** | 50 | 66 721 | 689 104 | 1 714.8 M | **−13.48 %** | 114.0 MB |
+| 3 000 | **41** | 16 | 62 353 | 684 134 | 1 674.8 M | **−15.44 %** | 113.1 MB |
+| 8 000 | **13** | 5 | 45 900 | 634 739 | 1 644.6 M | **−16.96 %** | 114.0 MB |
+
+So the count is **not** the right policy: −13.5…−15.4 % of the whole minimal-run instruction floor, with **less** copying (128 316 → 62 353 words), essentially unchanged reclamation, and a slightly **lower** `VmHWM` (the win is copy + descent, not memory traded for speed). Cycles at 3 000: 736.9 M → 672.3 M (**−8.8 %**). The 1 000 row has the *patch's* dynamics (a grown capacity is **kept** — 2 586 words — because the gate moves to 8 000, instead of being forced up to a floor) and the 3 000 row its ceiling, so the C-faithful fix below is expected at **≈91 → ≈41 collections, −13.5…−15.4 %**; re-measure after landing rather than quoting either row as the result.
+
+**Why this node cannot fix it.** Nothing in `src/context/gc.rs` settles the debt without a copy or avoids the shrink:
+- `collection_debt()` is `retains_old_spaces()` and the **only** clearer is a collection; `Process::ensure_capacity(need)`'s post-collection growth is capped by `Nursery::grow`'s remembered `live_target_words` (`max(one_step, live_target)`), so the door cannot buy a larger space after the collapse;
+- inflating the door's `need` to do so would break `heap_exhausted(need)`'s fail-fast for a `+hmax` process (a spurious `system_limit` on a small request) **and** silently override a user's `+hms`, moving `heap_size` — an oracle-shaped answer;
+- a debt collection is never "nothing to collect" during the oscillation (a retired space holds live words by definition), and the genuinely empty case is already free: `Nursery::grow` re-adopts an empty retired space (`empty_retired_for`/`readopt_retired`), consuming no budget and adding no chain space;
+- deferring the debt term at the two admission doors is refuted outright by `context/tests.rs::the_collection_debt_forces_a_collection_the_occupancy_test_would_not`, and it lengthens the retired chain — every capacity figure quoted in this file is a **chain sum**, so a deferral moves `heap_size`/`total_heap_size` in N.
+
+**The change required, owned by `beam_gc/src/policy.rs`** (the C's floor, nothing else):
+```rust
+/// The C's own refusal to shrink a *small* young heap — `erl_gc.c:1527`, `do_minor`:
+/// `HEAP_SIZE(p) > 3000` gates the whole shrink branch ("Excessively large heaps should be
+/// shrunk, but don't even bother on reasonable small heaps").
+pub const MINOR_SHRINK_FLOOR_WORDS: usize = 3000;
+
+pub fn young_after_collection(&self, capacity_words: usize, live_words: usize) -> usize {
+    let target = self.young_minor_target_words(live_words);
+    let shrink = capacity_words > YOUNG_SHRINK_FACTOR.saturating_mul(target)
+        && capacity_words > MINOR_SHRINK_FLOOR_WORDS;
+    if shrink || capacity_words < target { target } else { capacity_words }
+}
+```
+plus the `young_after_collection` rustdoc amended ("a capacity above `YOUNG_SHRINK_FACTOR` × the target installs the target" → "… **and** above `MINOR_SHRINK_FLOOR_WORDS`"). `nursery_floor_words`' invariant ("no collection can leave a nursery below this figure") is untouched: the keep branch already requires `capacity >= target`.
+**Blast radius of that patch, by band:** a capacity ≤ 1 864 words was never shrinkable, so every figure below it stands unchanged — `233` (`src/runner/tests/slice_charging.rs`), `843` (`tests/foreign_root_loop.rs`, `src/runner/tests.rs`'s `heap_growth` control), `987` (`src/runner/tests/reds_door.rs`), and the differential corpus' only by-value case (`bif_extra/process_info_spawned_exact_item_values`, a fresh spawn's `{heap_size,233}`/`{total_heap_size,233}`). The band the patch changes is **(1 864, 3 000]**, which is exactly where `src/runner/tests/boundary_cost.rs`'s `MEASURED_YOUNG_CAPACITY = 2_585` sits — that row and its `MEASURED` count ladder must be re-derived by the node that owns them, as must the ratio-based `context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve`.
+
 ### Pins that depend on the doors' collection POLICY (read before changing the debt term)
 A door-policy change — deferring/skipping a `collection_debt()`-driven collection, changing which door collapses a retired chain — has a blast radius wider than this node; these are the sites to re-derive. Grouped by the property each one buys.
 - **The debt term exists at three sites, not two.** `ensure_heap` (`gc.rs` `let debt = process.collection_debt()`), `ensure_heap_full` (same), **and the reduction/yield-boundary door** `gc/reds_door.rs::collect_at_reds_boundary` (`if !occupied && !debt { return }`). The boundary door still collapses the chain once per pre-emption, so a deferral confined to the two admission doors leaves the `peak_young_spaces == 1` pins reachable; touching the boundary door breaks them harder.
