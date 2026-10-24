@@ -553,13 +553,15 @@ fn emit_function(
 /// when the small-int fast path lowers it, the whole guarded sequence plus its
 /// helper fallback ([`FAST_PATH_BYTES`]); a `get_list`/`get_hd`/`get_tl` likewise
 /// costs its guarded sequence plus the helper fallback it may still branch to
-/// ([`LIST_PATH_BYTES`]), and a `get_tuple_element`/`set_tuple_element`/
+/// ([`LIST_PATH_BYTES`]), a `get_tuple_element`/`set_tuple_element`/
 /// `select_tuple_arity` its own guarded sequence plus one spill-and-return stub per
-/// arity alternative ([`TUPLE_PATH_BYTES`]).
+/// arity alternative ([`TUPLE_PATH_BYTES`]), and a bitstring-path instruction its own
+/// guarded match-context sequence ([`BS_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
-/// *every* `gc_bif` and [`LIST_PATH_BYTES`] for every cons-cell read, whether or
-/// not the fast path claims it, and [`CodeBuffer::with_capacity`] rounds the total
+/// *every* `gc_bif`, [`LIST_PATH_BYTES`] for every cons-cell read and
+/// [`BS_PATH_BYTES`] for every bitstring-path instruction, whether or
+/// not the shape predicate claims it, and [`CodeBuffer::with_capacity`] rounds the total
 /// up to whole pages.
 fn code_capacity_estimate(module: &Module) -> usize {
     module
@@ -582,6 +584,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut cmp_bifs = 0usize;
     let mut list_reads = 0usize;
     let mut tuple_paths = 0usize;
+    let mut bs_paths = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -593,6 +596,19 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::GetTupleElement { .. } => tuple_paths += 1,
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
+            // Every bitstring-path instruction the tier inlines *in addition to* the
+            // per-instruction budget below: `bs_match`/`bs_get_integer2` stay on the
+            // family helper (the per-instruction budget already covers them), while the
+            // six guarded match-context shapes and the `bs_match`/`bs_get_integer2`
+            // paths reserve their own guarded sequence ([`BS_PATH_BYTES`]).
+            Instr::BsMatch { .. }
+            | Instr::BsGetInteger2(_)
+            | Instr::BsGetPosition { .. }
+            | Instr::BsSetPosition { .. }
+            | Instr::BsSkipBits2 { .. }
+            | Instr::BsTestTail2 { .. }
+            | Instr::BsStartMatch3 { .. }
+            | Instr::BsStartMatch4 { .. } => bs_paths += 1,
             _ => {}
         }
     }
@@ -602,6 +618,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + COMPARE_PATH_BYTES * cmp_bifs
         + LIST_PATH_BYTES * list_reads
         + TUPLE_PATH_BYTES * tuple_paths
+        + BS_PATH_BYTES * bs_paths
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -654,6 +671,19 @@ const LIST_PATH_BYTES: usize = 128;
 /// [`emit_step_and_continue`](super::emit_step_and_continue) fallback the guard may still branch to, which the
 /// per-instruction [`INSTRUCTION_BYTES`] already budgets.
 const TUPLE_PATH_BYTES: usize = 160;
+
+/// The code-size budget reserved for one bitstring-path instruction (see
+/// [`code_capacity_estimate`]): the guarded match-context sequence
+/// ([`super::bitstr_inline`]) plus the exits it may still branch to. The widest shape is
+/// `bs_start_match4`'s full classification — the destination's Y-window guard (~50 B), the
+/// subject load, the boxed/`HEADER_SUB_BITS` tests, the `orig`/`HEADER_BIN_REF` reuse test
+/// (~120 B) and the [`emit_step_and_continue`](super::emit_step_and_continue) fallback it
+/// branches to (~150 B, also covered by the per-instruction [`INSTRUCTION_BYTES`]) — so
+/// ≈190 B before that shared fallback. Budgeted for *every* bitstring-path instruction
+/// whether or not its shape predicate claims it, like the other path budgets:
+/// under-estimating would turn a large module into a `SystemLimit` compile error, so the
+/// figure is deliberately loose.
+const BS_PATH_BYTES: usize = 256;
 
 #[cfg(test)]
 mod tests {

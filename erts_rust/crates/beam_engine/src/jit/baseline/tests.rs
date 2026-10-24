@@ -2556,9 +2556,13 @@ fn the_prologue_position_store_is_emitted_inline() {
 /// the inline store the position would still name the block's `pc 0`).
 #[test]
 fn the_bitstring_arm_stores_the_instruction_position_inline() {
-    // One `bs_start_match3` at pc 1 of the block that starts at pc 0, so the instruction's
+    // One `bs_get_tail` at pc 1 of the block that starts at pc 0, so the instruction's
     // packed word (`pack_current_code(0, 1)`) is distinguishable from the prologue's
-    // (`pack_current_code(0, 0)`).
+    // (`pack_current_code(0, 0)`). `bs_get_tail` is one of the twenty variants the arm
+    // itself lowers: the six match-context shapes (`bs_start_match3`/`4`,
+    // `bs_get_position`, `bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`) have their
+    // own in-block lowerings ([`super::emit::bitstr_inline`]) and never reach the arm, so
+    // the arm's own store is pinned on a variant it still emits the helper for.
     let module = build_module(
         "inline_bitstr_position",
         &[],
@@ -2567,11 +2571,10 @@ fn the_bitstring_arm_stores_the_instruction_position_inline() {
             1,
             vec![
                 Instr::Label(Label(1)),
-                Instr::BsStartMatch3 {
-                    fail: NO_FAIL,
-                    bin: Operand::X(0),
+                Instr::BsGetTail {
+                    ctx: Operand::X(0),
                     live: 1,
-                    dst: Operand::X(0),
+                    dst: Operand::X(1),
                 },
                 Instr::Return,
             ],
@@ -2628,8 +2631,8 @@ fn the_bitstring_arm_stores_the_instruction_position_inline() {
          call at {call_at}) — the helper no longer stores the position itself"
     );
 
-    // The behavioural half: a `bs_start_match3` on a non-binary raises, and the tier leaves
-    // the machine parked on the **instruction**.
+    // The behavioural half: a `bs_get_tail` on a non-context fails, and the tier leaves the
+    // machine parked on the **instruction**.
     let name = export_atom(&module, "f");
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
@@ -2642,11 +2645,11 @@ fn the_bitstring_arm_stores_the_instruction_position_inline() {
             &mut ctx,
             Tier::BaselineJit,
         )
-        .expect_err("a `bs_start_match3` on a non-binary raises `{badmatch, Subject}`");
+        .expect_err("a `bs_get_tail` on a non-context is the family's typed error");
     assert_eq!(
         machine.current_code(),
         Some((0, 1)),
-        "the raise is parked on the `bs_start_match3` instruction, not on the block entry"
+        "the failure is parked on the `bs_get_tail` instruction, not on the block entry"
     );
 }
 

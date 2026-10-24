@@ -55,6 +55,7 @@ use super::aggregate::{
 };
 use super::arith::try_inline_gc_bif;
 use super::bif::try_inline_bif;
+use super::bitstr_inline;
 use super::compare::try_inline_comparison;
 use super::family::{self, emit_bitstr};
 use super::frame::{emit_deallocate, emit_deallocate_return, emit_return};
@@ -880,6 +881,127 @@ pub(crate) fn emit_block(
             | Instr::WaitTimeout { .. }
             | Instr::Timeout
             | Instr::RemoveMessage => emit_receive(buffer, allocation, done, func, pc)?,
+            // The bitstring family's **small, allocation-free match-context shapes**
+            // (see [`bitstr_inline`]): `bs_get_position`, `bs_set_position`,
+            // `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3` and `bs_start_match4`.
+            // Each has its own guarded native sequence with its own compile-time shape
+            // predicate, which **refuses** (emitting zero bytes) exactly the shapes whose
+            // run-time behaviour is not provable — an un-addressable operand, a `NO_FAIL`
+            // fail code that raises, an unresolved label, an undecodable fail atom — so a
+            // refusal falls back to the family arm below (`emit_bitstr`), i.e. exactly
+            // today's behaviour for the whole family. The arms must sit **above** the
+            // `_ if bitstrings::claimed(instr)` arm: a `match` arm after a `_ if` guard
+            // arm is unreachable.
+            //
+            // None of the six terminates the block. A shape's hit path continues in-block;
+            // its miss/fail/fallback paths leave through an exit that always transfers
+            // control (the linker's `emit_exit`, or `emit_step_and_continue`), so the
+            // block's own fall-through after the arm is still reachable and `terminated`
+            // stays false.
+            Instr::BsGetPosition { ctx, dst, .. } => {
+                if !bitstr_inline::try_inline_bs_get_position(
+                    buffer,
+                    ctx,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            Instr::BsSetPosition { ctx, pos } => {
+                if !bitstr_inline::try_inline_bs_set_position(
+                    buffer,
+                    ctx,
+                    pos,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            Instr::BsTestTail2 { fail, ctx, bits } => {
+                if !bitstr_inline::try_inline_bs_test_tail2(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *bits,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            Instr::BsSkipBits2 {
+                fail,
+                ctx,
+                size,
+                unit,
+                ..
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_bits2(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    size,
+                    *unit,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            Instr::BsStartMatch3 { fail, bin, dst, .. } => {
+                if !bitstr_inline::try_inline_bs_start_match3(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    bin,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
+            Instr::BsStartMatch4 { fail, src, dst, .. } => {
+                if !bitstr_inline::try_inline_bs_start_match4(
+                    buffer,
+                    module,
+                    labels,
+                    &linker,
+                    fail,
+                    src,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

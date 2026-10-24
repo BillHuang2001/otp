@@ -100,6 +100,10 @@ use super::aggregate::{
 };
 use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
+use super::bitstr_inline::{
+    get_position_shape, set_position_shape, skip_bits2_shape, start_match3_shape,
+    start_match4_shape, test_tail2_shape,
+};
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
 use super::select::select_val_plan;
@@ -472,6 +476,34 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
+        // The six bitstring match-context shapes the emitter lowers natively
+        // ([`super::bitstr_inline`]). Each is classified by the **same** shape predicate
+        // its `try_inline_*` entry consults — those predicates already refuse a
+        // `NO_FAIL` fail code, an unresolvable fail label, an undecodable fail atom and
+        // an un-addressable operand, i.e. exactly the emitter's own compile-time
+        // decision — so this mirror is exact rather than merely biased. The emitted
+        // sequence is fully inline: a shape's *hit* path continues in-block, and only
+        // its miss/fail/fallback *exit* leaves the block (the linker's `emit_exit`, or
+        // `emit_step_and_continue`), which is the same shape `Instr::Jump`'s resolved
+        // arm and the `jit_test` helper route already have.
+        Instr::BsGetPosition { ctx, dst, .. } => get_position_shape(ctx, dst).is_some(),
+        Instr::BsSetPosition { ctx, pos } => set_position_shape(ctx, pos).is_some(),
+        Instr::BsTestTail2 { fail, ctx, bits } => {
+            test_tail2_shape(labels, *fail, ctx, *bits).is_some()
+        }
+        Instr::BsSkipBits2 {
+            fail,
+            ctx,
+            size,
+            unit,
+            ..
+        } => skip_bits2_shape(labels, *fail, ctx, size, *unit).is_some(),
+        Instr::BsStartMatch3 { fail, bin, dst, .. } => {
+            start_match3_shape(labels, *fail, bin, dst).is_some()
+        }
+        Instr::BsStartMatch4 { fail, src, dst, .. } => {
+            start_match4_shape(module, labels, fail, src, dst).is_some()
+        }
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -650,6 +682,47 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
+        // The six bitstring match-context shapes are charged the x-registers their own
+        // native lowering references — and only when their `*_shape` claims them (an
+        // un-addressable operand keeps the whole instruction on the family arm, which
+        // contributes no native touch). A `Y` operand is a stack slot, **not** an
+        // x-register, so a shape's `registers()` never includes one.
+        Instr::BsGetPosition { ctx, dst, .. } => {
+            if let Some(shape) = get_position_shape(ctx, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsSetPosition { ctx, pos } => {
+            if let Some(shape) = set_position_shape(ctx, pos) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsTestTail2 { fail, ctx, bits } => {
+            if let Some((shape, _)) = test_tail2_shape(labels, *fail, ctx, *bits) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsSkipBits2 {
+            fail,
+            ctx,
+            size,
+            unit,
+            ..
+        } => {
+            if let Some((shape, _)) = skip_bits2_shape(labels, *fail, ctx, size, *unit) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsStartMatch3 { fail, bin, dst, .. } => {
+            if let Some((shape, _)) = start_match3_shape(labels, *fail, bin, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsStartMatch4 { fail, src, dst, .. } => {
+            if let Some((shape, _)) = start_match4_shape(module, labels, fail, src, dst) {
+                touches.extend(shape.registers());
+            }
+        }
         _ => {}
     }
     touches
@@ -744,6 +817,45 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 if let TestSrc::Reg(x) = plan.scrutinee {
                     reads.push(x);
                 }
+            }
+        }
+        // The six bitstring match-context shapes read the x-registers their own native
+        // lowering loads (a match context, a subject, a saved position) and only when
+        // their `*_shape` claims them.
+        Instr::BsGetPosition { ctx, dst, .. } => {
+            if let Some(shape) = get_position_shape(ctx, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSetPosition { ctx, pos } => {
+            if let Some(shape) = set_position_shape(ctx, pos) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsTestTail2 { fail, ctx, bits } => {
+            if let Some((shape, _)) = test_tail2_shape(labels, *fail, ctx, *bits) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsSkipBits2 {
+            fail,
+            ctx,
+            size,
+            unit,
+            ..
+        } => {
+            if let Some((shape, _)) = skip_bits2_shape(labels, *fail, ctx, size, *unit) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsStartMatch3 { fail, bin, dst, .. } => {
+            if let Some((shape, _)) = start_match3_shape(labels, *fail, bin, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsStartMatch4 { fail, src, dst, .. } => {
+            if let Some((shape, _)) = start_match4_shape(module, labels, fail, src, dst) {
+                reads.extend(shape.reads());
             }
         }
         _ => {}
@@ -846,7 +958,45 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
                 Vec::new()
             }
         }
-        // `Test`/`SelectVal` branch but write no x-register; everything else deopts.
+        // `Test`/`SelectVal` branch but write no x-register.
+        Instr::Test { .. } | Instr::SelectVal { .. } => Vec::new(),
+        // The six bitstring match-context shapes: only `bs_get_position` and the two
+        // `bs_start_match*` forms have an x-register destination, and each is charged
+        // exactly when its `*_shape` claims the instruction. Charging it is **mandatory**:
+        // a `bs_start_match*` hit stores the reused context word into `Dst`'s cache
+        // register, so a write set that omitted it would let a stale cache register
+        // survive a block exit — a wrong value, not a redundant store.
+        Instr::BsGetPosition { ctx, dst, .. } => get_position_shape(ctx, dst)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        Instr::BsStartMatch3 { fail, bin, dst, .. } => start_match3_shape(labels, *fail, bin, dst)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        Instr::BsStartMatch4 { fail, src, dst, .. } => {
+            start_match4_shape(module, labels, fail, src, dst)
+                .map(|(shape, _)| shape.writes())
+                .unwrap_or_default()
+        }
+        // `bs_set_position`/`bs_skip_bits2` commit into the context block's `start` word
+        // (a heap word) and `bs_test_tail2` only branches — their write sets are empty.
+        Instr::BsSetPosition { ctx, pos } => set_position_shape(ctx, pos)
+            .map(|shape| shape.writes())
+            .unwrap_or_default(),
+        Instr::BsTestTail2 { fail, ctx, bits } => {
+            test_tail2_shape(labels, *fail, ctx, *bits)
+                .map(|(shape, _)| shape.writes())
+                .unwrap_or_default()
+        }
+        Instr::BsSkipBits2 {
+            fail,
+            ctx,
+            size,
+            unit,
+            ..
+        } => skip_bits2_shape(labels, *fail, ctx, size, *unit)
+            .map(|(shape, _)| shape.writes())
+            .unwrap_or_default(),
+        // Everything else deopts.
         _ => Vec::new(),
     }
 }

@@ -398,6 +398,36 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
         // frame window the aggregate readers use, so a `Y` operand of one makes the
         // block publish it ([`super::bif::bif_uses_y`], purely syntactic).
         Instr::Bif { .. } => super::bif::bif_uses_y(module, instr),
+        // The six bitstring match-context shapes ([`super::bitstr_inline`]) read their
+        // operands through the same guarded frame window, so a `Y` operand of one makes
+        // the block publish it. Every one is classified through its shape's **label-free**
+        // constructor (`*Shape::of`), which is what the emitter's own predicate starts
+        // from: the fail label has no bearing on whether a `Y` operand is read, and a
+        // shape the emitter refuses deopts to the family helper, which reads the frame
+        // through `Machine` and needs no published window — so this is exact, never a
+        // subset of what the inlined code needs (the safe direction).
+        Instr::BsGetPosition { ctx, dst, .. } => {
+            super::bitstr_inline::get_position_shape(ctx, dst).map_or(false, |shape| shape.uses_y())
+        }
+        Instr::BsSetPosition { ctx, pos } => {
+            super::bitstr_inline::set_position_shape(ctx, pos).map_or(false, |shape| shape.uses_y())
+        }
+        Instr::BsTestTail2 { ctx, bits, .. } => {
+            super::bitstr_inline::TestTail2Shape::of(ctx, *bits)
+                .map_or(false, |shape| shape.uses_y())
+        }
+        Instr::BsSkipBits2 {
+            ctx, size, unit, ..
+        } => super::bitstr_inline::SkipBits2Shape::of(ctx, size, *unit)
+            .map_or(false, |shape| shape.uses_y()),
+        Instr::BsStartMatch3 { bin, dst, .. } => {
+            super::bitstr_inline::StartMatchShape::of(bin, dst)
+                .map_or(false, |shape| shape.uses_y())
+        }
+        Instr::BsStartMatch4 { src, dst, .. } => {
+            super::bitstr_inline::StartMatchShape::of(src, dst)
+                .map_or(false, |shape| shape.uses_y())
+        }
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }
