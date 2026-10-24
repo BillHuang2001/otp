@@ -31,7 +31,9 @@
 //! [`Process::admission_requires_collection`] is the crate's own answer: the occupancy test **OR**
 //! the debt. [`Process::collect_if_needed`] runs it, so one debt can never collect twice (a
 //! collection collapses the chain — the debt half is self-limiting) and a run of "grow then admit"
-//! rounds keeps the young capacity bounded instead of accumulating a retired space per round.
+//! rounds keeps the young capacity bounded instead of accumulating a retired space per round. What
+//! it settles onto is a bounded **cycle** of policy-derived sizes (period 3 under the current
+//! growth policy), not one fixed size — the property the bounded-capacity test below pins.
 
 use beam_common::Result;
 use beam_process::prelude::*;
@@ -43,6 +45,19 @@ fn pid(number: u64) -> ProcessId {
 
 /// "Grow then admit" rounds the bounded-capacity case runs.
 const ROUNDS: usize = 8;
+
+/// The number of rounds the settled young-capacity **loop** repeats over.
+///
+/// A round asks for twice the capacity it found and then collects, and `beam_gc`'s collapse keeps a
+/// capacity it finds inside the policy's band while handing it back to the live-set target once it
+/// leaves the band — so the installed capacity is a deterministic function of the capacity that
+/// went in, and that map's orbit closes after three rounds. The sizes themselves are policy-derived
+/// (the test names them in prose, never in an assertion); only the cycle length is fixed here.
+const CYCLE_ROUNDS: usize = 3;
+
+/// The periodic tail needs a full cycle plus the round that establishes it, so a reduced `ROUNDS`
+/// can never quietly empty the periodicity check below.
+const _: () = assert!(ROUNDS > CYCLE_ROUNDS + 1);
 
 /// The young nursery's current capacity in words.
 fn young_capacity(process: &Process) -> usize {
@@ -141,9 +156,15 @@ fn debt_makes_the_admission_collect_and_cannot_collect_twice() -> Result<()> {
 ///
 /// Each round asks for twice the current capacity — a request the current space cannot satisfy, so
 /// the growth really retires a space — and then admits one word. Because the admission honours the
-/// debt, every round ends with the chain collapsed to a single space and the capacity back at what
-/// the policy sizes from the (empty) live set, so it settles on one small curated size (90 words in
-/// the measured run) instead of climbing.
+/// debt, every round ends with the chain collapsed to a single space, so the capacity never
+/// accumulates a retired space per round. It does not settle on one fixed size either: `beam_gc`'s
+/// growth sizes the replacement nursery from the occupancy **plus** the request, and each round's
+/// request is twice the capacity the previous round installed, so the capacity follows a
+/// deterministic map whose orbit is a bounded **period-3 cycle** of policy-derived sizes. Measured
+/// ladder, one entry per round: `[843, 90, 323, 1310, 90, 323, 1310, 90]` — the first round's `843`
+/// is the chain the fresh process's own space plus its first growth makes, after which the loop
+/// `90 → 323 → 1310` repeats. The assertion below pins the **period of the cycle**, never the
+/// sizes, so a policy change that moves the sizes but keeps the cycle bounded still reads correctly.
 ///
 /// The bound is contrasted against the **old occupancy-only** premise, measured on a second process
 /// that runs the same growth rounds but *does not* collect: there `should_collect(1)` is `false`
@@ -212,11 +233,21 @@ fn growing_and_admitting_in_rounds_keeps_the_young_capacity_bounded() -> Result<
          {peak} words, per-round {capacities:?}) — without the debt half every round adds another \
          retired space and the capacity climbs"
     );
-    assert_eq!(
-        capacities[ROUNDS - 1], capacities[ROUNDS - 3],
-        "the last rounds settle on the same capacity, so the chain really is collapsing \
-         (per-round {capacities:?})"
-    );
+    // A **cycle**, not a fixed size: the growth sizes the replacement nursery from the occupancy
+    // plus the request, so the installed capacity steps up for three rounds in a row (`90 → 323 →
+    // 1310` in the measured ladder `[843, 90, 323, 1310, 90, 323, 1310, 90]`) before the collapse's
+    // shrink arm hands it back to the live-set target and the loop restarts. Asserting the *period*
+    // — from the round after the fresh one, which is where the loop starts — is the true statement
+    // the collapsing chain makes: the loop closes instead of climbing. No size is pinned, so a
+    // policy change that moves the sizes but keeps the cycle bounded still reads correctly.
+    for round in CYCLE_ROUNDS + 1..ROUNDS {
+        assert_eq!(
+            capacities[round],
+            capacities[round - CYCLE_ROUNDS],
+            "round {round}: the capacity must repeat every {CYCLE_ROUNDS} rounds, so the chain \
+             really is collapsing onto a bounded cycle (per-round {capacities:?})"
+        );
+    }
 
     // The control: the very same growth rounds under the OLD, occupancy-only premise (`grow_nursery`
     // only — the old admission answered "no collection" because `should_collect(1)` is false).
