@@ -394,14 +394,20 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // images. As with `contexts`, `resume_outcome` deliberately does **not** reset, and
         // a suspended machine's modules are still alive.
         self.entry_verdicts.clear();
-        // The prepared bitstring programs belong to the run that prepared them too: the
-        // entry module's table is re-pointed at whatever module this run names, so a
-        // fresh run must not answer a `(func, pc)` from a previous run's image. A
-        // registered context's table is dropped with `contexts.clear()` above, and
-        // `resume_outcome` deliberately does **not** reset (a suspended frame resumes in
-        // the module it blocked in).
-        self.entry_programs.clear();
-        // … and with it any **pending** invalidation the previous run armed: a fresh run
+        // The prepared bitstring programs are **not** cleared here. `reset` runs before
+        // the new run's entry module is known, and a host that runs one module many times
+        // (a benchmark loop, a batch harness recycling the machine) would otherwise
+        // re-prepare, re-allocate and drop the whole table once per run — the largest
+        // single bitstring cost on exactly that shape. `Machine::enter_run` re-binds the
+        // table instead (`Machine::bind_entry_programs`), keeping it only when the new
+        // entry module *is* the image it was filled from (address + content digest + atom
+        // namespace: `BitstrPrograms::describes`, the identity argument
+        // `label_cache.rs` makes) and discarding it otherwise — so a fresh run can never
+        // answer a `(func, pc)` from a previous run's image, and a synthetic image (all-zero
+        // checksum, no content identity) is never retained at all. A registered context's
+        // table is dropped with `contexts.clear()` above, and `resume_outcome` deliberately
+        // does **not** reset (a suspended frame resumes in the module it blocked in).
+        // Separately, any **pending** invalidation the previous run armed is cleared: a fresh run
         // dispatches no BIF before its first local call, so a flag left over from an
         // earlier run would only cost that run a redundant verdict clear.
         self.local_call_invalidation_pending.set(false);

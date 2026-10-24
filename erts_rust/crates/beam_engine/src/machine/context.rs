@@ -58,9 +58,7 @@
 //! context `Machine::context` names, so the local-call seam's lookup needs no module
 //! key at all — see `local_callee.rs` for the whole argument.
 
-use std::cell::RefCell;
 use std::sync::Arc;
-
 use beam_loader::Module;
 
 use crate::families::bitstrings::programs::BitstrPrograms;
@@ -96,24 +94,7 @@ pub(crate) struct ModuleContext {
     /// verdicts. The slots are `Cell`s, so the seam mutates the table through the
     /// shared `Arc`.
     pub(crate) verdicts: LocalVerdicts,
-    /// This module's **prepared bitstring programs**
-    /// (`crate::families::bitstrings::programs`): the pre-resolved `bs_create_bin`
-    /// segment / `bs_match` command programs, addressed by the instruction's
-    /// `(function, code offset)`.
-    ///
-    /// It lives **here**, beside the verdict table and for the same reason: a module
-    /// context *is* the module-image identity (`Arc::ptr_eq`-deduplicated), so a
-    /// prepared program sized/decode from *this* image can never answer for another.
-    /// A prepared program is a pure function of the loaded IR plus the atom/string
-    /// tables, so it cannot go stale while the image lives.
-    ///
-    /// A [`RefCell`] because the family **moves the table out** for the duration of one
-    /// instruction ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)) —
-    /// the executing code then holds it locally, which is what lets the segment writers take
-    /// `&mut Machine` without a borrow of the context. Nothing else reads it mid-instruction.
-    pub(crate) programs: RefCell<BitstrPrograms>,
 }
-
 impl ModuleContext {
     /// A context for `module` and its already-built label map.
     fn new(module: Arc<Module>, labels: Arc<LabelMap>) -> ModuleContext {
@@ -122,7 +103,6 @@ impl ModuleContext {
             module,
             labels,
             verdicts,
-            programs: RefCell::new(BitstrPrograms::empty()),
         }
     }
 }
@@ -132,8 +112,24 @@ impl ModuleContext {
 /// Context `0` is the run's **entry** module, which the machine never owns (the
 /// drive loop borrows it), so it has no entry here; the id of a registered context
 /// is its position in this list plus one ([`Contexts::register`]).
+///
+/// # The parallel prepared-program table
+///
+/// Beside the context handles sits one
+/// [`BitstrPrograms`](crate::families::bitstrings::programs::BitstrPrograms) per
+/// context (`programs[i]` belongs to `entries[i]`, and is pushed/cleared with it).
+/// It is a **separate `Vec`** rather than a field of [`ModuleContext`] because the
+/// executing family moves the table out for the duration of one instruction
+/// ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)) — and a
+/// `ModuleContext` is reached through a shared `Arc`, so a field there would cost an
+/// `Arc` clone/drop (two atomics) plus a `RefCell` borrow guard **per bitstring
+/// instruction**. Two plain moves out of and back into this table cost neither, and
+/// keeping the table out of the `Arc` also keeps it out of the shared, immutable
+/// module identity: it is one machine's run-scoped cache.
 pub(crate) struct Contexts {
     entries: Vec<Arc<ModuleContext>>,
+    /// The prepared bitstring programs, one per entry, in the same order.
+    programs: Vec<BitstrPrograms>,
 }
 
 impl Contexts {
@@ -141,14 +137,15 @@ impl Contexts {
     pub(crate) fn new() -> Contexts {
         Contexts {
             entries: Vec::new(),
+            programs: Vec::new(),
         }
     }
 
     /// Forget every registered module (a fresh run).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.programs.clear();
     }
-
     /// Register `module` with its already-built label map `labels` and return the
     /// context id (`>= 1`).
     ///
@@ -167,9 +164,44 @@ impl Contexts {
         }
         self.entries
             .push(Arc::new(ModuleContext::new(Arc::clone(module), labels)));
+        self.programs.push(BitstrPrograms::empty());
         self.entries.len() as u32
     }
 
+    /// Take context `id`'s prepared bitstring programs out of the registry, leaving an
+    /// empty table behind, or `None` for the entry context `0` / an id never registered.
+    ///
+    /// The pair [`Contexts::take_programs`]/[`Contexts::put_programs`] is the hand-over
+    /// [`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs) performs
+    /// around one instruction: the executing code then *owns* the table, which is what
+    /// lets it take `&mut Machine` without holding a borrow of it — and, because the
+    /// table lives in this `Vec` rather than behind the context's `Arc`, both halves are
+    /// a plain move of the (three-word) table with no reference count touched.
+    ///
+    /// `&mut self` is why the two halves cannot overlap a borrow of the machine.
+    #[inline]
+    pub(crate) fn take_programs(&mut self, id: u32) -> Option<BitstrPrograms> {
+        if id == 0 {
+            return None;
+        }
+        self.programs
+            .get_mut((id - 1) as usize)
+            .map(|table| std::mem::replace(table, BitstrPrograms::empty()))
+    }
+
+    /// File context `id`'s table back, replacing the placeholder
+    /// [`Contexts::take_programs`] left. A context that disappeared in between (the
+    /// registry was cleared) simply drops the table: it is a cache, so a lost one costs
+    /// a re-decode and nothing else.
+    #[inline]
+    pub(crate) fn put_programs(&mut self, id: u32, table: BitstrPrograms) {
+        if id == 0 {
+            return;
+        }
+        if let Some(slot) = self.programs.get_mut((id - 1) as usize) {
+            *slot = table;
+        }
+    }
     /// The handle for context `id`, or `None` for the entry context `0` / an id
     /// that was never registered.
     ///

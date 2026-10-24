@@ -108,6 +108,11 @@ impl Machine {
         // `ModuleContext` to hold it. Re-binding is a no-op — verdicts and all — when the
         // module is the one the table already describes, which is what a resume relies on.
         self.bind_entry_verdicts(module);
+        // …and, for the same reason, context `0`'s prepared bitstring programs
+        // (`Machine::entry_programs`): re-entering the image the table was filled from
+        // keeps every prepared program (`BitstrPrograms::describes`), any other image
+        // discards it.
+        self.bind_entry_programs(module);
         if self.entry_call.is_none() {
             if let Some(function) = module.functions.get(func as usize) {
                 self.entry_call = Some((func, function.arity));

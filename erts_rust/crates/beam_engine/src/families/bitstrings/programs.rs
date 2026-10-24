@@ -61,15 +61,26 @@
 //!
 //! # Where it lives, and why
 //!
-//! One [`BitstrPrograms`] per **module context** (`machine::ModuleContext`), plus the
-//! machine-owned one for context `0` (the run's entry module, which the machine never
-//! owns) — exactly the placement and lifetime of the local-call verdict table
-//! (`machine/local_callee.rs`), and for the same reason: a module context *is* the
-//! module-image identity, deduplicated by `Arc::ptr_eq`, so a `Module::clone` or a
+//! One [`BitstrPrograms`] per **module context**, held by the machine's context
+//! registry (`machine::Contexts`) in a table **parallel** to the contexts themselves,
+//! plus the machine-owned one for context `0` (the run's entry module, which the
+//! machine never owns) — exactly the placement and lifetime of the local-call verdict
+//! table (`machine/local_callee.rs`), and for the same reason: a module context *is*
+//! the module-image identity, deduplicated by `Arc::ptr_eq`, so a `Module::clone` or a
 //! separate load of the same `.beam` is a different context and therefore a different
-//! table. [`BitstrPrograms::owner`] additionally records the image address the table
-//! was filled for, so the entry table re-validates itself against whatever module the
-//! current run names.
+//! table.
+//!
+//! The table is **not** inside `ModuleContext`: it is handed to the executing family by
+//! value for the duration of one instruction, and a `ModuleContext` is reached through
+//! a shared `Arc` — so keeping it there costs an `Arc` clone/drop (two atomics) and a
+//! `RefCell` borrow guard *per bitstring instruction*. In a parallel `Vec` owned by the
+//! registry the hand-over is two plain struct moves, reached through `&mut self` with no
+//! reference count touched ([`Machine::with_bitstr_programs`]).
+//!
+//! [`BitstrPrograms::owner`] additionally records the image address the table was filled
+//! for, so the entry table re-validates itself against whatever module the current run
+//! names, and [`BitstrPrograms::describes`] extends that witness (digest + atom
+//! namespace) so a table can outlive one run when the run re-enters the same image.
 //!
 //! It is **machine-owned by construction**, never part of the cross-run compiled-block
 //! cache (`jit/cache/`): that cache is shared between machines and is filled by
@@ -95,10 +106,10 @@
 //! re-prepared.
 
 use beam_loader::Module;
+use beam_term::atom::AtomSnapshot;
 
 use super::create::prepared::CreateProgram;
 use super::matching::prepared::MatchProgram;
-
 /// The number of slots in one module's direct-mapped program table.
 ///
 /// One cache line's worth of entries covers every instruction a real module has that
@@ -141,6 +152,11 @@ pub(crate) struct BitstrPrograms {
     /// before its first use, so an entry can never answer for another image (the
     /// entry context `0` is re-pointed at a new module on the next run without the
     /// table being rebuilt by hand).
+    ///
+    /// One word, compared by every lookup: the table is handed over **by value** once
+    /// per bitstring instruction, so its size is a per-instruction cost — the
+    /// run-boundary witness that needs three fields lives outside it
+    /// ([`ProgramWitness`]).
     owner: usize,
     /// `PROGRAM_SLOTS` direct-mapped `(key, program)` slots, vacant until first
     /// allocation so a module with no bitstring instruction pays nothing.
@@ -148,8 +164,7 @@ pub(crate) struct BitstrPrograms {
 }
 
 impl BitstrPrograms {
-    /// An **empty** table — the state before a module's first bitstring instruction,
-    /// and what [`Machine::reset`](crate::Machine::reset) leaves the entry table in.
+    /// An **empty** table — the state before a module's first bitstring instruction.
     ///
     /// Every lookup on it prepares (there is nothing to answer with), which is exactly
     /// a cache that is not collecting.
@@ -163,6 +178,12 @@ impl BitstrPrograms {
     /// Drop every prepared program and the owner witness (a fresh run).
     pub(crate) fn clear(&mut self) {
         *self = BitstrPrograms::empty();
+    }
+
+    /// Whether the table holds any prepared program at all (only a filled table is
+    /// worth retaining across a run boundary).
+    pub(crate) fn is_filled(&self) -> bool {
+        !self.slots.is_empty()
     }
 
     /// The slot `key` hashes to.
@@ -201,12 +222,62 @@ impl BitstrPrograms {
         }
         &slot.1
     }
-
     /// The number of slots the table holds (`0` before its first allocation) —
     /// test-only, so a test can prove the table is allocated lazily.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn allocated_slots(&self) -> usize {
         self.slots.len()
+    }
+}
+
+/// The **image witness** of a prepared-program table that outlives one run — the
+/// identity its retention across a `reset` is justified by
+/// ([`Machine::bind_entry_programs`](crate::Machine)).
+///
+/// It is deliberately *not* stored inside [`BitstrPrograms`]: the table is handed over
+/// by value once per bitstring instruction, so it is kept to the one word
+/// ([`BitstrPrograms::owner`]) the hot lookup compares, while these three fields are read
+/// only at a run entry.
+///
+/// It is deliberately stricter than that one-word owner check, because a retained table
+/// is no longer guarded by "the run that filled it is still in flight":
+///
+/// * the **address** says the programs' numbers (function indices, code offsets) belong
+///   to this allocation, so a freed image's recycled address cannot answer;
+/// * the **digest** is [`Module::checksum`] — an MD5 over the
+///   `Atom`·`AtU8`·`Code`·`StrT`·`ImpT`·`ExpT`·`FunT`·`LitT`·`Meta`·`Recs`·`DbgB` chunk
+///   subset, i.e. **exactly** the chunks a prepared program is derived from (the
+///   descriptor list lives in `Code`, the segment/command type atoms in `AtU8`, a
+///   `string` segment's bytes in `StrT`, a literal width in `LitT`);
+/// * the **atom snapshot** says the descriptors resolve through the same index→name
+///   mapping — the same companion the label-map cache keys on, and for the same reason: a
+///   `Module::clone` (or a second load of one `.beam`) numbers atoms through its own
+///   table.
+///
+/// An image with **no** content identity (an all-zero [`Module::checksum`] — the synthetic
+/// shape a hand-built test image has, `machine/label_cache.rs`) is never retained:
+/// `(function, code offset)` is not an identity there, so the same key may name a
+/// different instruction's descriptor list from one run to the next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProgramWitness {
+    owner: usize,
+    digest: [u8; 16],
+    atoms: AtomSnapshot,
+}
+
+impl ProgramWitness {
+    /// The witness of `module`.
+    pub(crate) fn of(module: &Module) -> ProgramWitness {
+        ProgramWitness {
+            owner: module as *const Module as usize,
+            digest: module.checksum(),
+            atoms: module.atom_table.snapshot(),
+        }
+    }
+
+    /// Whether a table this witness was recorded for may still answer for `module`.
+    pub(crate) fn describes(&self, module: &Module) -> bool {
+        self.digest != [0u8; 16] && *self == ProgramWitness::of(module)
     }
 }

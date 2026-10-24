@@ -846,18 +846,29 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 /// The tiers `BENCH_TIER` selects, in canonical order (interpreter first).
+///
+/// The **default is the baseline tier alone**: it is the tier every `beam_rt` process
+/// entry runs on, so it is what a cross-runtime profile must describe. The interpreter
+/// leg is ~2.2× slower per call and would then own ~69 % of the samples, silently
+/// rewriting a profile's attribution (a `both` profile of the `foreign` byte-loop
+/// kernels puts the interpreter's `select_val` ladder in the top ten even though the
+/// native tier inlines it). Ask for `interpreter` or `both` explicitly when that is what
+/// you want to measure.
+///
+/// An **unrecognised** value is a loud error, never a silent coercion: a misspelt
+/// `BENCH_TIER=baseline-jit` used to fall back to `both` and quietly measure the wrong
+/// tier.
 fn selected_tiers() -> Vec<Tier> {
     match std::env::var("BENCH_TIER").unwrap_or_default().trim() {
+        "" | "baseline" => vec![Tier::BaselineJit],
         "interpreter" => vec![Tier::Interpreter],
-        "baseline" => vec![Tier::BaselineJit],
-        "both" | "" => vec![Tier::Interpreter, Tier::BaselineJit],
-        other => {
-            println!("note = BENCH_TIER={other:?} is not interpreter|baseline|both -- using both");
-            vec![Tier::Interpreter, Tier::BaselineJit]
-        }
+        "both" => vec![Tier::Interpreter, Tier::BaselineJit],
+        other => panic!(
+            "BENCH_TIER={other:?} is not one of interpreter|baseline|both \
+             (unset and empty mean baseline)"
+        ),
     }
 }
-
 /// Write `source` as `<module>.erl` into a unique temp directory and compile it with the
 /// system `erlc`.
 ///
