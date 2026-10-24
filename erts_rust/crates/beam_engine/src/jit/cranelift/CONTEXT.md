@@ -149,6 +149,15 @@ borrow is held across execution.
   key mixes the module content with the atom-table snapshot, exactly as the baseline cache does.
 - **Re-entrancy is uncached, never a panic**: `handle` uses `try_borrow_mut()`; on `Err` it compiles
   uncached and returns that artifact (mirroring `jit::cache::run_baseline_cached`'s re-entrant arm).
+- **No handle is held across a park.** `run_resume_outcome` re-calls `cache::handle(module)` at the resume, so
+  the artifact is looked up again by `CacheKey` — a hit for a module this thread already compiled, and a
+  recompile (never a wrong answer) for `clear`, another thread, or a reload whose `AtomTable::clone` minted a
+  fresh snapshot; the fresh `Rc` keeps the mapping alive for the resumed slice only.
+- **The retained label map is itself partly address-keyed.** It is `build_label_map(module)`'s `LabelMap`: the
+  dense `Vec<u64>` label→`(func,pc)` slots and the `Vec<Result<ImportTarget,&'static str>>` import table are
+  built at compile time, and `imports_owner: usize` is the **`Module`'s address at compile time**, so the
+  artifact's import fast path answers only for a run of that very `Module` value and otherwise falls back to
+  the per-call `import_target` (`src/interpreter/mod.rs:238-253`).
 - The test-gated `len`/`compile_count`/`clear` are `pub(super)` only — the in-module suite reaches them;
   nothing is re-exported from `jit/mod.rs`.
 
