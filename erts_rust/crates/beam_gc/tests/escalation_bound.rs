@@ -228,11 +228,7 @@ fn a_dead_inclusive_fill_keeps_selecting_minor() {
         0,
         "no fullsweep ran — the fill is not a live set"
     );
-    assert_eq!(
-        c.minor_gcs(),
-        ROUNDS as u32,
-        "the minors-since-major counter advanced"
-    );
+    assert_eq!(c.minor_gcs(), ROUNDS as u32, "the minors-since-major counter advanced");
 }
 
 // ---------------------------------------------------------------------------
@@ -308,17 +304,10 @@ fn a_pinned_minor_refuses_before_copying_when_the_promotion_cannot_fit() {
         young_before,
         "the nursery is untouched: nothing was evacuated"
     );
-    assert_eq!(
-        mature_words(&c),
-        mature_before,
-        "the mature space is untouched"
-    );
+    assert_eq!(mature_words(&c), mature_before, "the mature space is untouched");
     assert_eq!(
         (c.stats().minor_collections, c.stats().major_collections),
-        (
-            stats_before.minor_collections,
-            stats_before.major_collections
-        ),
+        (stats_before.minor_collections, stats_before.major_collections),
         "no counter advanced — no collection ran"
     );
     assert_eq!(

@@ -61,8 +61,8 @@
 
 use beam_common::BeamError;
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, GenImmixCollector, HeapPolicy, HeapSpace,
-    ImmixCounters, MatureKind, BLOCK_WORDS, LINES_PER_BLOCK, LINE_WORDS,
+    AnyCollector, CollectionKind, GcConfig, GenImmixCollector, HeapPolicy, HeapSpace, ImmixCounters,
+    MatureKind, BLOCK_WORDS, LINES_PER_BLOCK, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{
@@ -397,10 +397,7 @@ fn the_rolled_back_region_is_reproducible_and_reusable() {
     );
     assert_eq!(c.mature().free_lines(), 15);
     let placed = only_small[0];
-    assert!(
-        c.mature().contains_term(placed),
-        "the small root is mature now"
-    );
+    assert!(c.mature().contains_term(placed), "the small root is mature now");
     assert_tuple_is(placed, &[make_small(SMALL_VALUE)]);
     // It went into one of the leftover tail lines — the only holes the packed region has.
     let line_bytes = LINE_WORDS * core::mem::size_of::<Eterm>();

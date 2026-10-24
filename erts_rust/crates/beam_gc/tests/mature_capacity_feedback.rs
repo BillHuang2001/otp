@@ -80,8 +80,8 @@
 //! input (the term bounds the occupancy, it does not replace it with a constant).
 
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy, MatureKind, BLOCK_WORDS,
-    MATURE_TARGET_LIVE_MULTIPLE, YOUNG_SHRINK_FACTOR,
+    AnyCollector, CollectionKind, GcConfig, HeapObservable, HeapPolicy, MatureKind,
+    MATURE_TARGET_LIVE_MULTIPLE, BLOCK_WORDS, YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, signed_value, tuple_element, tuple_size, Eterm};
 
@@ -467,8 +467,7 @@ fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
                     occupancy.min(bound),
                 );
                 assert_eq!(
-                    capacity_after,
-                    derived,
+                    capacity_after, derived,
                     "{kind:?}: round {round} (dead {dead}, occupancy {occupancy}, bound {bound}) \
                      must install mature_after_fullsweep({capacity_before}, {LIVE_WORDS}, {}) = \
                      {derived}, got {capacity_after}",
@@ -511,9 +510,7 @@ fn consecutive_fullsweeps_stay_at_the_mature_fixed_point() {
         // of promotions (that is what `MATURE_TARGET_LIVE_MULTIPLE` buys).
         let target = expected_capacity(&policy, series[0].3.max(1), 0);
         assert!(
-            afters[2]
-                >= MATURE_TARGET_LIVE_MULTIPLE
-                    * policy.need_after_fullsweep(LIVE_WORDS, live_target),
+            afters[2] >= MATURE_TARGET_LIVE_MULTIPLE * policy.need_after_fullsweep(LIVE_WORDS, live_target),
             "{kind:?}: the fixed point ({}) must hold {MATURE_TARGET_LIVE_MULTIPLE} `need_after` \
              budgets (young bound {live_target}) so a run of minors fits",
             afters[2]
@@ -619,8 +616,7 @@ fn both_strategies_agree_on_the_live_set_figure() {
 #[test]
 fn a_dropped_live_set_gives_the_mature_capacity_back() {
     let policy = HeapPolicy::default();
-    let small_target =
-        policy.mature_target_words(LIVE_WORDS, policy.young_target_words(LIVE_WORDS));
+    let small_target = policy.mature_target_words(LIVE_WORDS, policy.young_target_words(LIVE_WORDS));
 
     for kind in STRATEGIES {
         let mut c = collector(kind, &policy);
@@ -635,8 +631,10 @@ fn a_dropped_live_set_gives_the_mature_capacity_back() {
             "{kind:?}: the whole big graph is live and resident"
         );
         let big_capacity = fullsweep(&mut c, &mut roots);
-        let big_expected =
-            policy.mature_target_words(big_live, big_live.min(policy.young_target_words(big_live)));
+        let big_expected = policy.mature_target_words(
+            big_live,
+            big_live.min(policy.young_target_words(big_live)),
+        );
         match kind {
             MatureKind::Copying => assert_eq!(
                 big_capacity, big_expected,

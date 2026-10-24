@@ -1636,14 +1636,7 @@ mod tests {
         assert_eq!(policy.young_after_collection(12, 400), 610);
 
         // --- (e) Still a fixed point, never a third value ------------------------------------
-        for capacity in [
-            4_185usize,
-            MINOR_SHRINK_FLOOR_WORDS + 1,
-            3_000,
-            721,
-            233,
-            12,
-        ] {
+        for capacity in [4_185usize, MINOR_SHRINK_FLOOR_WORDS + 1, 3_000, 721, 233, 12] {
             for live in [0usize, 13, 400, 1_000, 100_000] {
                 let target = policy.young_minor_target_words(live);
                 let after = policy.young_after_collection(capacity, live);
@@ -1903,9 +1896,7 @@ mod tests {
         // (the policy has no ceiling here), and it is a fixed point of the next fullsweep —
         // i.e. the capacity converges instead of ratcheting one growth-table step per
         // collection.
-        for &capacity in &[
-            12usize, 38, 90, 142, 233, 376, 610, 987, 1_598, 2_586, 100_000,
-        ] {
+        for &capacity in &[12usize, 38, 90, 142, 233, 376, 610, 987, 1_598, 2_586, 100_000] {
             for live in [0usize, 1, 60, 233, 464, 1_000, 10_000] {
                 let target = policy.young_target_words(live);
                 let once = policy.young_after_fullsweep(capacity, live);
@@ -1997,12 +1988,7 @@ mod tests {
             HeapPolicy::from_spawn_opts(0, 0, 65_535)
         );
 
-        for (hms, floor) in [
-            (100usize, 142usize),
-            (1000, 1598),
-            (4000, 4185),
-            (8000, 10958),
-        ] {
+        for (hms, floor) in [(100usize, 142usize), (1000, 1598), (4000, 4185), (8000, 10958)] {
             let global = HeapPolicy {
                 min_heap_words: next_heap_size(hms, 0),
                 ..HeapPolicy::default()
@@ -2016,10 +2002,7 @@ mod tests {
                 next_heap_size(20_000, 0)
             );
             // ... and the global's binary-vheap floor applies likewise.
-            assert_eq!(
-                global.spawn_policy(0, 100, None).min_bin_vheap_words,
-                46_422
-            );
+            assert_eq!(global.spawn_policy(0, 100, None).min_bin_vheap_words, 46_422);
             // An absent `fullsweep_after` inherits the global's; every other field too (the
             // C's `H_MAX_SIZE` included).
             let inherited = global.spawn_policy(0, 0, None);

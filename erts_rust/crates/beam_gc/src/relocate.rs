@@ -140,11 +140,7 @@ impl<'a> LinearDest<'a> {
     ///   made (the overlap is asserted in debug builds and is the caller's contract in release
     ///   builds).
     /// * `capacity_words == 0` is allowed and copies nothing.
-    pub unsafe fn new(
-        from: &'a FromSet,
-        base: *mut Eterm,
-        capacity_words: usize,
-    ) -> LinearDest<'a> {
+    pub unsafe fn new(from: &'a FromSet, base: *mut Eterm, capacity_words: usize) -> LinearDest<'a> {
         let dest = LinearDest {
             from,
             base,

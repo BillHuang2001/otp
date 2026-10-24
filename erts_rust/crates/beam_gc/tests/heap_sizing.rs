@@ -33,12 +33,9 @@
 //!    installed by whichever collection measured it: the **whole-heap** live set at a fullsweep
 //!    (`HeapPolicy::young_target_words`, `next_words(2 * live + reserve)`) or the **young** live
 //!    set a minor evacuated (its own promoted words, `HeapPolicy::young_minor_target_words`,
-//!    `next_words(live + reserve)`) — a grossly oversized space shrinks, and
-//!    `min_heap_words`/`max_heap_words` floor/cap the result. An explicit `ensure_capacity`
-//!    request is folded **into** the collection that serves it (`alloc_need`), so that
-//!    collection's target already has room for the request —
-//!    `next_words(live + need + reserve)` for a minor, `next_words(2 * (live + need) + reserve)`
-//!    for a fullsweep — and the growth step after it is normally a no-op;
+//!    `next_words(live + reserve)`) — an explicit `ensure_capacity` request grows it further, a
+//!    grossly oversized space shrinks, and `min_heap_words`/`max_heap_words` floor/cap the
+//!    result;
 //! 4. a **relocating** Immix fullsweep (the shrink half of the policy on the mark-region
 //!    mature generation) preserving a young→mature reference across the resize;
 //! 5. [`HeapInfo`] — the `garbage_collection`-shaped observables derived from a live
@@ -244,11 +241,9 @@ fn a_tiny_nursery_grows_under_allocation_pressure() {
     // Growth is decided from a **measured live set** at both doors: a *minor* sizes the nursery
     // from the young live set it evacuated — its copy volume
     // (`HeapPolicy::young_after_collection` over `young_minor_target_words`) — and an explicit
-    // request steps it up through `Collector::ensure_capacity`, whose collection is handed the
-    // request (`alloc_need`) so the capacity it installs already covers it
-    // (`HeapPolicy::young_minor_target_words_with_need`). Both halves are allocation pressure:
-    // the first lifts the 12-word birth nursery onto the live set's target, the second installs
-    // the live set's target *with the request folded in*.
+    // request steps it up through `Collector::ensure_capacity`. Both halves are allocation
+    // pressure: the first lifts the 12-word birth nursery onto the live set's target, the second
+    // installs the curated size the request itself needs.
     let policy = HeapPolicy {
         initial_young_words: 12,
         ..HeapPolicy::default()
@@ -286,10 +281,9 @@ fn a_tiny_nursery_grows_under_allocation_pressure() {
         );
         assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
 
-        // A nursery too small for the next round of allocation is what steps the growth table:
-        // `ensure_capacity` collects **with the 64-word request in hand**, so the capacity the
-        // collection installs is the need-aware live-set target
-        // (`next_words(live + 64 + need_reserve_words)`) and the growth step after it is a no-op.
+        // A nursery too small for the next round of allocation is what steps the growth table
+        // (or, on the minor above, the live-set target): `ensure_capacity` collects, then installs
+        // the curated size covering the request (`next_words(64) = 90`).
         let collection = c.ensure_capacity(64, &mut roots).expect("grow");
         assert_eq!(collection.kind, CollectionKind::Minor, "{kind:?}");
         assert!(
@@ -297,22 +291,10 @@ fn a_tiny_nursery_grows_under_allocation_pressure() {
             "{kind:?}: the nursery must grow under pressure, got {}",
             c.young().capacity_words()
         );
-        let live = collection.stats.words_copied;
-        let target = policy.young_minor_target_words_with_need(live, 64);
-        assert_eq!(
-            target,
-            policy.young_after_collection_with_need(target, live, 64),
-            "{kind:?}: the need-aware target is a fixed point of the collapse rule"
-        );
-        assert_eq!(
-            target, 142,
-            "{kind:?}: next_words({live} + 64 + 64) is the 142-word step that covers the request"
-        );
         assert_eq!(
             c.young().capacity_words(),
-            target,
-            "{kind:?}: the collection that serves the request installs the need-aware live-set \
-             target, so the capacity grows onto it and the request needs no further step"
+            policy.next_words(64, 0),
+            "{kind:?}: it grows to the curated size that covers the request, not further"
         );
         assert!(c.young().available_words() >= 64, "{kind:?}");
         assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);

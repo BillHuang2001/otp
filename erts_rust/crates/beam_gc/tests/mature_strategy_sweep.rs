@@ -533,10 +533,7 @@ impl Row {
             ("n", self.n as u128),
             ("rounds", self.rounds as u128),
             ("collections", self.collections as u128),
-            (
-                "reported_collections",
-                u128::from(self.reported_collections),
-            ),
+            ("reported_collections", u128::from(self.reported_collections)),
             ("minors", u128::from(self.minors)),
             ("majors", u128::from(self.majors)),
             ("words_copied", self.words_copied as u128),
@@ -546,15 +543,9 @@ impl Row {
             ("mature_peak_lines", self.mature_peak_lines as u128),
             ("mature_capacity", self.mature_capacity as u128),
             ("young_capacity", self.young_capacity as u128),
-            (
-                "young_current_capacity",
-                self.young_current_capacity as u128,
-            ),
+            ("young_current_capacity", self.young_current_capacity as u128),
             ("young_peak_used", self.young_peak_used as u128),
-            (
-                "footprint_capacity_bytes",
-                self.footprint_capacity_bytes as u128,
-            ),
+            ("footprint_capacity_bytes", self.footprint_capacity_bytes as u128),
             ("footprint_used_bytes", self.footprint_used_bytes as u128),
             ("footprint_entries", self.footprint_entries as u128),
             ("live_roots", self.live_roots as u128),
@@ -653,8 +644,8 @@ fn child_measure() -> Row {
     let class = env_value(ENV_CLASS);
     let class = canonical_class(&class);
     let arm_name = env_value(ENV_ARM);
-    let arm =
-        Arm::from_name(&arm_name).unwrap_or_else(|| panic!("{ENV_ARM}={arm_name} is not an arm"));
+    let arm = Arm::from_name(&arm_name)
+        .unwrap_or_else(|| panic!("{ENV_ARM}={arm_name} is not an arm"));
     let n = parse_env_usize(ENV_N);
     let round = parse_env_usize(ENV_ROUND);
 
@@ -906,16 +897,10 @@ fn run_child(job: &ChildJob<'_>) -> ChildRun {
             )
         });
     let row = Row::from_line(line.trim());
-    assert_eq!(
-        row.class, job.class,
-        "the child measured the class it was asked for"
-    );
+    assert_eq!(row.class, job.class, "the child measured the class it was asked for");
     assert_eq!(row.arm, job.arm, "the child ran the arm it was asked for");
     assert_eq!(row.n, job.n, "the child ran the N it was asked for");
-    assert_eq!(
-        row.round, job.round,
-        "the child reported the round it was asked for"
-    );
+    assert_eq!(row.round, job.round, "the child reported the round it was asked for");
     ChildRun {
         peak_rss_kib: row.self_kb.max(peak_kib),
         row,
@@ -1093,10 +1078,7 @@ fn assert_arm(class: &str, round: usize, run: &ChildRun) {
     );
 
     // 6. The live set is intact and has the geometry the class promises.
-    assert!(
-        row.intact,
-        "{where_}: the live set must survive every collection"
-    );
+    assert!(row.intact, "{where_}: the live set must survive every collection");
     let (expected_roots, expected_words) = expected_live_set(class, row.n);
     assert_eq!(
         row.live_roots, expected_roots,
@@ -1153,7 +1135,10 @@ fn assert_arm(class: &str, round: usize, run: &ChildRun) {
 /// frozen layout against the class's arithmetic rather than a restatement of it.
 fn expected_live_set(class: &str, n: usize) -> (usize, usize) {
     match class {
-        fixtures::CHURN => (fixtures::CHURN_PERSISTENT, fixtures::CHURN_PERSISTENT_WORDS),
+        fixtures::CHURN => (
+            fixtures::CHURN_PERSISTENT,
+            fixtures::CHURN_PERSISTENT_WORDS,
+        ),
         fixtures::COPY_OUT => (fixtures::TABLE_ROWS, fixtures::TABLE_WORDS),
         GROWTH => (n * GROWTH_KEEP, n * GROWTH_KEEP_WORDS),
         other => panic!("no live-set formula for class `{other}`"),
@@ -1411,11 +1396,7 @@ fn the_mature_strategy_sweep_over_the_workload_classes() {
          per class) fullsweep_after={FULLSWEEP_AFTER} rounds={} noise_repeats={NOISE_REPEATS} \
          profile={} loadavg={}",
         rounds(),
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        if cfg!(debug_assertions) { "debug" } else { "release" },
         loadavg(),
     );
     for class in CLASSES {
@@ -1527,14 +1508,8 @@ fn print_noise_floor(class: &'static str) {
         }
         runs.push(run);
     }
-    for metric in [
-        "wall_ms",
-        "peak_rss_kib",
-        "polled_kib",
-        "words_copied",
-        "objects_copied",
-        "footprint_used_bytes",
-    ] {
+    for metric in ["wall_ms", "peak_rss_kib", "polled_kib", "words_copied", "objects_copied", "footprint_used_bytes"]
+    {
         let mut values: Vec<f64> = runs.iter().map(|run| Paired::value(metric, run)).collect();
         let min = values.iter().copied().fold(f64::INFINITY, f64::min);
         let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);

@@ -372,7 +372,11 @@ where
 /// For a visitor that need not touch raw pointers, prefer
 /// [`for_each_reachable_in`], which reports the same objects as a safe [`ReachableObject`]. Like
 /// its safe sibling it walks the from-set already installed in `scratch`.
-pub(crate) fn for_each_reachable<F>(scratch: &mut Scratch, roots: &[Eterm], visit: F) -> Result<()>
+pub(crate) fn for_each_reachable<F>(
+    scratch: &mut Scratch,
+    roots: &[Eterm],
+    visit: F,
+) -> Result<()>
 where
     F: FnMut(Eterm, *const Eterm),
 {

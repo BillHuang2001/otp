@@ -342,24 +342,6 @@ impl GenImmixCollector {
     /// this method runs the major the plain check would have chosen had it seen the
     /// fragmentation.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
-        self.collect_with_alloc_need(roots, 0)
-    }
-
-    /// [`collect`](Self::collect) with the pending **allocation request** (`alloc_need` words)
-    /// the caller must be able to satisfy once the collection has run — the mark-region
-    /// counterpart of [`crate::Collector::collect`]'s own need-aware driver.
-    ///
-    /// The request folds into whichever nursery the chosen collection installs
-    /// ([`crate::nursery::Nursery::collapse`] /
-    /// `…_after_fullsweep_with_alloc_need`), so a collection run *because* the mutator must
-    /// allocate leaves that room behind and the growth step does not have to retire the space it
-    /// just installed. `alloc_need == 0` (every public entry point except
-    /// [`ensure_capacity`](Self::ensure_capacity)) is the live-set-only rule.
-    fn collect_with_alloc_need(
-        &mut self,
-        roots: &mut [Eterm],
-        alloc_need: usize,
-    ) -> Result<Collection> {
         let (needed, refs) = scan_young(roots, &self.nursery, &self.mature)?;
         let tight = self.mature.free_lines() < needed;
         let kind = if self.policy.fullsweep_due(self.minor_since_major) || tight {
@@ -368,20 +350,16 @@ impl GenImmixCollector {
             CollectionKind::Minor
         };
         let (kind, stats) = match kind {
-            CollectionKind::Minor => match self.run_minor(roots, alloc_need)? {
+            CollectionKind::Minor => match self.run_minor(roots)? {
                 PromoteOutcome::Done(stats) => (CollectionKind::Minor, stats),
                 // The region has the free lines but not the run an object of the promotion
                 // needs: the atomic attempt left nothing behind, so the same `needed`/`refs`
                 // drive the escalation the check above could not see.
-                PromoteOutcome::WouldNotFit => (
-                    CollectionKind::Major,
-                    self.run_major(roots, needed, refs, alloc_need)?,
-                ),
+                PromoteOutcome::WouldNotFit => {
+                    (CollectionKind::Major, self.run_major(roots, needed, refs)?)
+                }
             },
-            CollectionKind::Major => (
-                CollectionKind::Major,
-                self.run_major(roots, needed, refs, alloc_need)?,
-            ),
+            CollectionKind::Major => (CollectionKind::Major, self.run_major(roots, needed, refs)?),
         };
         self.accumulate(&stats, kind);
         Ok(Collection { kind, stats })
@@ -437,7 +415,7 @@ impl GenImmixCollector {
         if self.mature.free_lines() < needed {
             return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
         }
-        match self.run_minor(roots, 0)? {
+        match self.run_minor(roots)? {
             PromoteOutcome::Done(stats) => {
                 self.accumulate(&stats, CollectionKind::Minor);
                 Ok(stats)
@@ -453,7 +431,7 @@ impl GenImmixCollector {
     /// the nursery into it.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let (needed, refs) = scan_young(roots, &self.nursery, &self.mature)?;
-        let stats = self.run_major(roots, needed, refs, 0)?;
+        let stats = self.run_major(roots, needed, refs)?;
         self.accumulate(&stats, CollectionKind::Major);
         Ok(stats)
     }
@@ -483,7 +461,7 @@ impl GenImmixCollector {
         if self.policy.next_words(need_words, 0) < need_words {
             return Err(heap_exhausted(need_words));
         }
-        let collection = self.collect_with_alloc_need(roots, need_words)?;
+        let collection = self.collect(roots)?;
         self.nursery.grow(&self.policy, need_words)?;
         Ok(collection)
     }
@@ -633,7 +611,7 @@ impl GenImmixCollector {
     /// [`collect`](Self::collect) escalates to a fullsweep. Every space of a chained nursery
     /// is promoted out of, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
-    fn run_minor(&mut self, roots: &mut [Eterm], alloc_need: usize) -> Result<PromoteOutcome> {
+    fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<PromoteOutcome> {
         let nursery = &self.nursery;
         self.scratch.begin(|from| nursery.add_to_from_set(from));
         let from = PromoteFrom::new(self.scratch.from(), None);
@@ -653,8 +631,7 @@ impl GenImmixCollector {
         // used: it is line-granular (`used_lines() * LINE_WORDS`, up to `LINE_WORDS` too large for
         // one small object) and it holds the garbage the minors since the last fullsweep
         // promoted.
-        self.nursery
-            .collapse(&self.policy, stats.words_copied, alloc_need)?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(PromoteOutcome::Done(stats))
     }
     /// Reclaims the mature generation in place, then promotes the nursery into it.
@@ -672,7 +649,6 @@ impl GenImmixCollector {
         roots: &mut [Eterm],
         needed: usize,
         refs: Vec<(*mut Eterm, Eterm)>,
-        alloc_need: usize,
     ) -> Result<GcStats> {
         // The size this fullsweep should leave behind, from the **exact live graph** it
         // evacuates (nursery *and* mature, reachable-from-roots only) plus the **young heap's
@@ -712,7 +688,7 @@ impl GenImmixCollector {
             .policy
             .mature_after_fullsweep(capacity, live.words, young_occupancy);
         if target != capacity {
-            return self.relocate_major(roots, target, live.lines, live.words, alloc_need);
+            return self.relocate_major(roots, target, live.lines, live.words);
         }
 
         // The nursery's mature references, as additional roots: a mature object reachable
@@ -733,7 +709,7 @@ impl GenImmixCollector {
         if self.mature.free_lines() < needed {
             // Even after reclaiming the mature generation the *in-place* region cannot hold
             // the promotion: grow the region instead of failing — see [`Self::grow_major`].
-            return self.grow_major(roots, needed, live.lines, live.words, alloc_need);
+            return self.grow_major(roots, needed, live.lines, live.words);
         }
 
         // Attempt the promotion atomically. A line-granular destination can refuse it even
@@ -757,12 +733,10 @@ impl GenImmixCollector {
                 // whole-heap post-copy live set ([`HeapPolicy::young_after_fullsweep`]), exactly
                 // as the copying collector sizes it.
                 self.nursery
-                    .collapse_after_fullsweep(&self.policy, live.words, alloc_need)?;
+                    .collapse_after_fullsweep(&self.policy, live.words)?;
                 Ok(stats)
             }
-            PromoteOutcome::WouldNotFit => {
-                self.grow_major(roots, needed, live.lines, live.words, alloc_need)
-            }
+            PromoteOutcome::WouldNotFit => self.grow_major(roots, needed, live.lines, live.words),
         }
     }
     /// The **growth fallback** for a fullsweep whose **in-place** reclaim could not take the
@@ -807,7 +781,6 @@ impl GenImmixCollector {
         needed: usize,
         live_lines: usize,
         live_words: usize,
-        alloc_need: usize,
     ) -> Result<GcStats> {
         let capacity = self.mature.capacity_words();
         // The target must cover both the promotion the reclaim could not fit (`needed`) and
@@ -821,7 +794,7 @@ impl GenImmixCollector {
         // (or the growth table's own ceiling) forbids growing at all.
         let target = self.policy.next_words(want, 0);
         if target > capacity {
-            return self.relocate_major(roots, target, live_lines, live_words, alloc_need);
+            return self.relocate_major(roots, target, live_lines, live_words);
         }
         if live_lines <= self.mature.line_count() {
             // Growth is forbidden, but the *in-place* region's fragmentation is not the last
@@ -829,7 +802,7 @@ impl GenImmixCollector {
             // the promotion that found no run gets one. The capacity is a whole number of
             // blocks, so `line_count() * LINE_WORDS == capacity` and the target needs no
             // raising (and would be clamped back to the ceiling if it were raised).
-            return self.relocate_major(roots, capacity, live_lines, live_words, alloc_need);
+            return self.relocate_major(roots, capacity, live_lines, live_words);
         }
         Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)))
     }
@@ -868,7 +841,6 @@ impl GenImmixCollector {
         target: usize,
         live_lines: usize,
         live_words: usize,
-        alloc_need: usize,
     ) -> Result<GcStats> {
         let used = self.nursery.used_words();
         let before = self.mature.used_words().saturating_add(used);
@@ -920,7 +892,7 @@ impl GenImmixCollector {
         // whole-heap post-copy live set ([`HeapPolicy::young_after_fullsweep`]), exactly as the
         // in-place fullsweep and the copying collector size it.
         self.nursery
-            .collapse_after_fullsweep(&self.policy, live_words, alloc_need)?;
+            .collapse_after_fullsweep(&self.policy, live_words)?;
         Ok(stats)
     }
 }

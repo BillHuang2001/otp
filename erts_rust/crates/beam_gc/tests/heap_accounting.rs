@@ -147,8 +147,7 @@ fn allocator_live_bytes() -> usize {
 fn fill(collector: &mut Collector, cells: i64) {
     let heap = collector.young_mut().heap_mut();
     for i in 0..cells {
-        heap.cons(make_small(i), NIL)
-            .expect("the cell fits the space");
+        heap.cons(make_small(i), NIL).expect("the cell fits the space");
     }
 }
 
@@ -169,11 +168,7 @@ fn retired_nursery_spaces_are_accounted() {
     assert_eq!(first_used, 1_200, "600 cons cells are two words each");
 
     c.grow_nursery(20_000).expect("the nursery grows");
-    assert_eq!(
-        c.young_space_count(),
-        2,
-        "the growth retained the first space"
-    );
+    assert_eq!(c.young_space_count(), 2, "the growth retained the first space");
     assert_eq!(
         c.young().used_words(),
         0,
@@ -239,8 +234,7 @@ fn retired_nursery_spaces_are_accounted() {
 
         let heap = any.young_mut().heap_mut();
         for i in 0..600i64 {
-            heap.cons(make_small(i), NIL)
-                .expect("the cell fits the space");
+            heap.cons(make_small(i), NIL).expect("the cell fits the space");
         }
         let first_used = any.young().used_words();
         assert_eq!(first_used, 1_200, "{kind:?}");
@@ -249,8 +243,7 @@ fn retired_nursery_spaces_are_accounted() {
         assert_eq!(any.young_space_count(), 2, "{kind:?}");
         let heap = any.young_mut().heap_mut();
         for i in 0..200i64 {
-            heap.cons(make_small(i), NIL)
-                .expect("the cell fits the space");
+            heap.cons(make_small(i), NIL).expect("the cell fits the space");
         }
         let second_used = any.young().used_words();
         any.grow_nursery(60_000).expect("the nursery grows again");
@@ -266,16 +259,8 @@ fn retired_nursery_spaces_are_accounted() {
         );
 
         let footprint = HeapFootprint::of(&any, &OffHeap::new());
-        assert_eq!(
-            footprint.young_capacity_words,
-            any.heap_size_words(),
-            "{kind:?}"
-        );
-        assert_eq!(
-            footprint.young_used_words,
-            any.heap_used_words(),
-            "{kind:?}"
-        );
+        assert_eq!(footprint.young_capacity_words, any.heap_size_words(), "{kind:?}");
+        assert_eq!(footprint.young_used_words, any.heap_used_words(), "{kind:?}");
         assert_eq!(
             footprint.mature_capacity_words,
             any.mature_capacity_words(),
@@ -296,11 +281,7 @@ fn retired_nursery_spaces_are_accounted() {
             any.heap_used_words() + any.mature_used_words(),
             "{kind:?}"
         );
-        assert_eq!(
-            footprint.used_words(),
-            any.total_heap_used_words(),
-            "{kind:?}"
-        );
+        assert_eq!(footprint.used_words(), any.total_heap_used_words(), "{kind:?}");
         assert!(
             footprint.used_words() <= footprint.capacity_words(),
             "{kind:?}: occupancy can never exceed capacity"
@@ -322,11 +303,7 @@ fn accounted_bytes_track_the_allocators_live_bytes() {
     c.grow_nursery(20_000).expect("the nursery grows");
     fill(&mut c, 200);
     c.grow_nursery(60_000).expect("the nursery grows again");
-    assert_eq!(
-        c.young_space_count(),
-        3,
-        "the chain is what the capacity half reports"
-    );
+    assert_eq!(c.young_space_count(), 3, "the chain is what the capacity half reports");
 
     // (ii) A known number of off-heap refcounted binaries of a known payload length.
     let mut roster = OffHeap::new();
@@ -419,19 +396,13 @@ fn accounted_bytes_track_the_allocators_live_bytes() {
     );
 
     // The word/byte conversion is the single constant the footprint uses.
-    assert_eq!(
-        footprint.capacity_bytes(),
-        footprint.capacity_words() * WORD_BYTES
-    );
+    assert_eq!(footprint.capacity_bytes(), footprint.capacity_words() * WORD_BYTES);
     assert_eq!(footprint.used_bytes(), footprint.used_words() * WORD_BYTES);
     assert!(
         footprint.used_bytes() <= footprint.capacity_bytes(),
         "the used half is a sub-range of the reserved half"
     );
-    assert!(
-        WORD_BYTES * 8 == u64::BITS as usize,
-        "one term word per machine word"
-    );
+    assert!(WORD_BYTES * 8 == u64::BITS as usize, "one term word per machine word");
 
     // The record, for the report and for a reader of a failing run.
     println!(

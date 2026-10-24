@@ -408,11 +408,7 @@ fn the_reported_figures_are_the_installed_capacities() {
         let (_roots, base) = establish(&mut c, 0);
         let mature = c.mature_capacity_words();
         let mut installed = base;
-        assert_eq!(
-            c.heap_size_words(),
-            installed,
-            "{kind:?}: one space to start"
-        );
+        assert_eq!(c.heap_size_words(), installed, "{kind:?}: one space to start");
 
         for event in 0..12 {
             let (before, after) = growth_event(&mut c, SMALL_REQUEST);
@@ -457,11 +453,7 @@ fn the_reported_figures_are_the_installed_capacities() {
         let expected = policy.young_after_collection(c.heap_size_words(), 0);
         let stats = c.collect_minor(&mut []).expect("the collapse");
         assert_eq!(stats.words_copied, 0, "{kind:?}: nothing live");
-        assert_eq!(
-            c.young_space_count(),
-            1,
-            "{kind:?}: the collection collapses the chain"
-        );
+        assert_eq!(c.young_space_count(), 1, "{kind:?}: the collection collapses the chain");
         assert_eq!(
             c.heap_size_words(),
             expected,
@@ -515,12 +507,7 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
                 events,
                 "{kind:?}: nothing but a collection bounds the chain, so every event is granted"
             );
-            figures.push((
-                events,
-                granted.len(),
-                c.young_space_count(),
-                c.heap_size_words(),
-            ));
+            figures.push((events, granted.len(), c.young_space_count(), c.heap_size_words()));
             report.push_str(&format!(
                 "  {kind:?} {events:>3} -> ({}, {}, {})\n",
                 granted.len(),
@@ -532,21 +519,14 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
                 "{kind:?}: {events} growth events must grow the chain past the {base}-word \
                  collection target{report}"
             );
-            assert!(
-                c.collection_debt(),
-                "{kind:?}: the chain is collection debt"
-            );
+            assert!(c.collection_debt(), "{kind:?}: the chain is collection debt");
         }
     }
     // ... and it is the *event count* it tracks: the same live set at twice the events reports
     // strictly more capacity (the figure is not a live-set bound).
     let pairs: Vec<&(usize, usize, usize, usize)> = figures.iter().filter(|f| f.0 == 4).collect();
     for (i, small) in pairs.iter().enumerate() {
-        let large = figures
-            .iter()
-            .filter(|f| f.0 == 8)
-            .nth(i)
-            .expect("the 2N row");
+        let large = figures.iter().filter(|f| f.0 == 8).nth(i).expect("the 2N row");
         assert!(
             large.3 > small.3,
             "the reported capacity must grow with the event count (there is no cap): {small:?} vs \
@@ -565,10 +545,7 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
         let mut roots = roots;
         c.collect_minor(&mut roots).expect("the collapse");
         assert_eq!(c.young_space_count(), 1, "{kind:?}");
-        assert!(
-            !c.collection_debt(),
-            "{kind:?}: the collection settles the debt"
-        );
+        assert!(!c.collection_debt(), "{kind:?}: the collection settles the debt");
         assert_eq!(
             c.heap_size_words(),
             policy.young_minor_target_words(0),
@@ -663,32 +640,12 @@ fn a_refused_growth_is_inert_and_cheap() {
         for _ in 0..8 {
             let (before, after) = growth_event(&mut c, SMALL_REQUEST);
             assert!(after.is_none(), "{kind:?}: the ceiling keeps refusing");
-            assert_eq!(
-                before,
-                c.young().capacity_words(),
-                "{kind:?}: same current space"
-            );
+            assert_eq!(before, c.young().capacity_words(), "{kind:?}: same current space");
         }
-        assert_eq!(
-            c.young_space_count(),
-            spaces,
-            "{kind:?}: a refusal retires nothing"
-        );
-        assert_eq!(
-            c.heap_size_words(),
-            capacity,
-            "{kind:?}: a refusal consumes no capacity"
-        );
-        assert_eq!(
-            c.young().base(),
-            base_addr,
-            "{kind:?}: a refusal replaces no space"
-        );
-        assert_eq!(
-            c.heap_used_words(),
-            used,
-            "{kind:?}: a refusal grants no room"
-        );
+        assert_eq!(c.young_space_count(), spaces, "{kind:?}: a refusal retires nothing");
+        assert_eq!(c.heap_size_words(), capacity, "{kind:?}: a refusal consumes no capacity");
+        assert_eq!(c.young().base(), base_addr, "{kind:?}: a refusal replaces no space");
+        assert_eq!(c.heap_used_words(), used, "{kind:?}: a refusal grants no room");
 
         // (iii) 20 000 refusals: each is a couple of comparisons against the ceiling, so the loop
         // is fast and the reported figures do not move.
@@ -704,19 +661,11 @@ fn a_refused_growth_is_inert_and_cheap() {
         }
         let elapsed = start.elapsed();
         assert_eq!(
-            (
-                c.heap_size_words(),
-                c.total_heap_size_words(),
-                c.young_space_count()
-            ),
+            (c.heap_size_words(), c.total_heap_size_words(), c.young_space_count()),
             before_figures,
             "{kind:?}: 20 000 more refused growths must not move the reported figures"
         );
-        assert_eq!(
-            c.young_space_count(),
-            granted + 1,
-            "{kind:?}: the chain length is unchanged"
-        );
+        assert_eq!(c.young_space_count(), granted + 1, "{kind:?}: the chain length is unchanged");
         // A ceiling, not a benchmark: the loop is 20 000 refusals, and a whole-chain scan per
         // event would need minutes rather than the milliseconds it takes here.
         assert!(
@@ -783,11 +732,7 @@ fn an_empty_retired_space_is_re_adopted_rather_than_replaced() {
             c.young().capacity_words() > retired_capacity,
             "{kind:?}: and retired the smaller one (strict progress)"
         );
-        assert_eq!(
-            c.young_space_count(),
-            2,
-            "{kind:?}: one retired space, one current"
-        );
+        assert_eq!(c.young_space_count(), 2, "{kind:?}: one retired space, one current");
 
         // Fill the current space so its remaining room is below the request below, while the
         // retired space is still **provably empty** (nothing was ever allocated in it).

@@ -569,7 +569,8 @@ fn the_fullsweep_sizes_the_mature_generation_from_the_live_set_it_measured() {
             //    space is sized for a run of promotions and not for a single one.
             let need_after = policy.need_after_fullsweep(LIVE_WORDS, sweep.young_occupancy);
             assert!(
-                sweep.capacity_after >= MATURE_TARGET_LIVE_MULTIPLE * need_after,
+                sweep.capacity_after
+                    >= MATURE_TARGET_LIVE_MULTIPLE * need_after,
                 "{kind:?}: the mature capacity ({}) must hold {} x the {} words a fullsweep \
                  must leave behind: {sweep:?}",
                 sweep.capacity_after,
