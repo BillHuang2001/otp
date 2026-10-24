@@ -404,42 +404,38 @@ impl RuntimeContext<'_> {
         terms::make_tuple(self, &[starting, started])
     }
 
-    /// `init:script_id/0`: the `{Name, Vsn}` header of the **loaded** boot script, as a
-    /// 2-tuple of strings (contracts A.7/A.9).
+    /// `init:script_id/0`: the identity of the release this runtime **is**, as the
+    /// `{"Erlang/OTP", Release}` 2-tuple of strings the oracle answers (contracts A.7/A.9).
     ///
-    /// The oracle's `init` answers the id of the script it booted (`init.erl`'s
-    /// `script_id/0` returns the `Id` it read out of the `.boot` file). This runtime
-    /// records that header when it loads a script ([`Runtime::boot_from_script`]); before
-    /// any script has been loaded there is no id to report, which is a typed capability
-    /// gap — never a fabricated `{"Erlang/OTP", …}` literal.
+    /// The oracle's `init` reports the `Id` header of the `.boot` file it booted
+    /// (`init.erl`'s `script_id/0`). On the oracle those two facts coincide — the script it
+    /// boots *is* its own release's `start.boot` — but here they do not: the CLI prefers this
+    /// runtime's own committed `bootstrap/bin/start.boot` only while its source tree is
+    /// reachable (`CodeServer::own_bootstrap_boot_script`, handed to `cli`'s one boot-script
+    /// resolution) and otherwise falls back to the **consumed system installation's**
+    /// `<Root>/bin/start.boot`, whose header names *that* installation's release. Reporting
+    /// the loaded script's `Vsn` would therefore make the invariant every OTP release
+    /// satisfies — `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` —
+    /// false as soon as the binary runs outside its own tree (an out-of-tree/worktree build,
+    /// an installed `beam_rt`), i.e. the runtime would misdescribe its own release. So the
+    /// **version** is always this runtime's own OTP release, from the very source
+    /// `erlang:system_info(otp_release)` reads, never the incidental script header's; see
+    /// [`release_script_id`].
     ///
-    /// The value is the *real* header of the script this runtime actually loaded
-    /// ([`Runtime::boot_script_id`]), so it tracks the loaded script exactly as the
-    /// oracle's `init:script_id/0` does. With no `-boot` the CLI drives this runtime's
-    /// **own** release's script — the committed `bootstrap/bin/start.boot`, discovered from
-    /// the binary's source tree by `CodeServer::own_bootstrap_boot_script` and handed to
-    /// `cli`'s one boot-script resolution (`cli::boot_script_to_drive`) — so its header
-    /// `{"Erlang/OTP","30"}` agrees with the compile-time
-    /// `erlang:system_info(otp_release)` (`"30"`):
-    /// `init:script_id() =:= {"Erlang/OTP", otp_release}` is **true**, self-consistent
-    /// exactly as on the oracle. An explicit `-boot FILE` still wins and reports *that*
-    /// script's own header (e.g. the consumed OTP-29 installation's `{"Erlang/OTP","29"}`
-    /// when it is named).
+    /// A runtime that has loaded **no** script has no boot id at all — the typed capability
+    /// gap, never a fabricated id (a script's `{Name, Vsn}` is only ever reported for a script
+    /// that really was read and executed).
     ///
     /// [`Runtime::boot_from_script`]: crate::Runtime::boot_from_script
     /// [`Runtime::boot_script_id`]: crate::Runtime::boot_script_id
     pub(super) fn script_id_0(&mut self) -> Result<Eterm> {
-        let Some((name, vsn)) = self
-            .runtime
-            .boot_script_id()
-            .map(|(name, vsn)| (name.to_string(), vsn.to_string()))
-        else {
+        let Some(id) = self.runtime.boot_script_id().map(release_script_id) else {
             return Err(error::unsupported(
                 "init:script_id/0 (no boot script has been loaded)",
             ));
         };
-        let name = self.charlist(&name)?;
-        let vsn = self.charlist(&vsn)?;
+        let name = self.charlist(&id.0)?;
+        let vsn = self.charlist(&id.1)?;
         terms::make_tuple(self, &[name, vsn])
     }
 
@@ -466,6 +462,38 @@ impl RuntimeContext<'_> {
     pub(super) fn fetch_loaded(&mut self) -> Result<Eterm> {
         Ok(beam_term::NIL)
     }
+}
+
+/// The name an OTP release's boot script gives itself: the first element of the
+/// `{script,{"Erlang/OTP","<release>"},…}` header every OTP `start.script`/`start.boot`
+/// carries (`bootstrap/bin/start.script` here). It is the fallback for a script whose own
+/// header names nothing, and the answer `init:script_id/0` reports on any real OTP release.
+const RELEASE_NAME: &str = "Erlang/OTP";
+
+/// The `{Name, Vsn}` pair `init:script_id/0` reports for a runtime whose loaded boot script
+/// header is `(script_name, script_vsn)` — this runtime's **own** release identity, with the
+/// script's header supplying the parts the release identity cannot name.
+///
+/// The **version** is always this runtime's own OTP release, from the same source
+/// `erlang:system_info(otp_release)` answers from (`beam_common::otp_version().major`, see
+/// [`crate::info`]), and **never** `script_vsn`. A `.boot` header names the release of the
+/// installation the file belongs to, and the file this runtime loads is not always its own:
+/// outside an in-tree checkout the CLI's default resolution falls back to the consumed
+/// *system* installation's `<Root>/bin/start.boot` (`cli::resolve_boot_file`), so the header's
+/// `Vsn` would be that installation's release tag — an answer that contradicts the runtime's
+/// own `system_info(otp_release)`.
+///
+/// The **name** is the loaded script's own (`(script_name, _)`), because naming the boot
+/// artifact is exactly what the script header is for — an OTP script names itself
+/// [`RELEASE_NAME`], and a product's release names itself whatever its `start.script` says.
+/// An empty header name has nothing to say, so [`RELEASE_NAME`] is the fallback there.
+fn release_script_id((script_name, _script_vsn): (&str, &str)) -> (String, String) {
+    let name = if script_name.is_empty() {
+        RELEASE_NAME
+    } else {
+        script_name
+    };
+    (name.to_string(), beam_common::otp_version().major.to_string())
 }
 
 /// The name of the program that started this runtime — the value of
@@ -994,8 +1022,17 @@ mod tests {
         );
     }
 
+    /// The `Vsn` half `init:script_id/0` must report: this runtime's own OTP release, spelled
+    /// independently of the production derivation (the compile-time version constant
+    /// `erlang:system_info(otp_release)` is served from — `../../info/system.rs`). It is
+    /// deliberately **not** read back through [`release_script_id`], so the assertions below
+    /// cannot pass by construction.
+    fn release_vsn() -> String {
+        beam_common::otp_version().major.to_string()
+    }
+
     #[test]
-    fn script_id_is_the_loaded_boot_script_header() {
+    fn script_id_is_the_running_release_with_the_loaded_scripts_name() {
         // Before any script has been loaded there is no id: a typed capability gap, never
         // a fabricated `{"Erlang/OTP", …}`.
         let mut runtime = runtime();
@@ -1005,8 +1042,10 @@ mod tests {
             Some("init:script_id/0 (no boot script has been loaded)")
         );
 
-        // After loading the committed `start.boot`, the answer is its real `{Name, Vsn}`
-        // header — `{"Erlang/OTP","30"}` for this release.
+        // After loading the committed `start.boot`, the answer is `{"Erlang/OTP","30"}`: the
+        // script's own name with **this runtime's** release, which is the pair the oracle
+        // satisfies and the invariant `init:script_id() =:= {"Erlang/OTP",
+        // erlang:system_info(otp_release)}` states.
         let script_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../bootstrap/bin/start.boot"
@@ -1026,15 +1065,77 @@ mod tests {
             string_of(terms::tuple_element(answer, 0).unwrap()),
             expected.name
         );
+        // The version is the running release, not the header's — they happen to coincide for
+        // this checkout's own script (which is what makes the oracle's report reproducible).
         assert_eq!(
             string_of(terms::tuple_element(answer, 1).unwrap()),
-            expected.vsn
+            release_vsn()
         );
         assert_eq!(expected.name, "Erlang/OTP");
-        assert_eq!(expected.vsn, "30");
+        assert_eq!(expected.vsn, release_vsn(), "this checkout is its own release");
     }
 
     #[test]
+    fn script_id_never_reports_a_foreign_scripts_release() {
+        // The defect this derivation exists for: a boot script whose header names *another*
+        // release. `MINIMAL_SCRIPT`'s header is `{"T","1"}`, i.e. the release `1` of a script
+        // called `T` — precisely the shape the CLI's fallback resolution produces when this
+        // binary runs outside its own source tree and picks up the consumed system
+        // installation's `<Root>/bin/start.boot` (OTP 29's, on this host). `init:script_id/0`
+        // must still report the release this runtime **is** (`"30"` here), with the script's
+        // name — never the header's `"1"`, which would contradict
+        // `erlang:system_info(otp_release)` and break
+        // `init:script_id() =:= {"Erlang/OTP", otp_release}`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let (path, _stem) = write_minimal_script("foreign_vsn");
+        runtime.boot().expect("boot");
+        runtime
+            .boot_from_script(&path)
+            .expect("the minimal script executes");
+        // The Runtime really did record the foreign script's own header ...
+        assert_eq!(runtime.boot_script_id(), Some(("T", "1")));
+        // ... while the BIF reports our release, so the two can never be confused.
+        let answer = call(&mut runtime, "init", "script_id", &[]).expect("script_id/0");
+        assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2);
+        assert_eq!(
+            string_of(terms::tuple_element(answer, 0).expect("the name")),
+            "T",
+            "the loaded script's own name is reported"
+        );
+        assert_eq!(
+            string_of(terms::tuple_element(answer, 1).expect("the version")),
+            release_vsn(),
+            "the version is the running release, never the script header's"
+        );
+        assert_ne!(
+            release_vsn(),
+            "1",
+            "the fixture script's `Vsn` differs from this runtime's release"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn release_script_id_takes_its_release_from_this_runtime() {
+        // The pure derivation behind `init:script_id/0`, pinned without any boot, script file,
+        // system installation or build layout — so it cannot rot with the tree it runs in. The
+        // version half is always this runtime's own release (`otp_release`'s own source), for
+        // every header a script could carry; the name half is the script's, with the release
+        // name as the empty-header fallback.
+        for (name, vsn) in [
+            ("Erlang/OTP", "29"),
+            ("Erlang/OTP", "30"),
+            ("T", "1"),
+            ("SomeProduct", "1.2.3"),
+        ] {
+            let id = release_script_id((name, vsn));
+            assert_eq!(id.1, release_vsn(), "header {name}/{vsn} keeps our release");
+            assert_eq!(id.0, name, "the script's own name survives");
+        }
+        assert_eq!(release_script_id(("", "9")).0, RELEASE_NAME);
+    }    #[test]
     fn get_argument_still_reports_an_absent_flag_as_error() {
         // A flag the runtime has no value for is the atom `error` — the automatic flags
         // do not change that rule for any other name.
@@ -1235,7 +1336,8 @@ mod tests {
         let answer = call(&mut runtime, "init", "restart", &[]).expect("init:restart/0");
         assert_eq!(runtime.atom_name_of(answer), Some("ok"));
         // The script really ran a second time: the id it established is the one the floor
-        // reports, so the re-run did not drop (or replace) the loaded script.
+        // reports — its own name `T`, with this runtime's release as the version (the script
+        // header's `Vsn` is never reported; see [`release_script_id`]).
         let id = call(&mut runtime, "init", "script_id", &[]).expect("script_id/0");
         assert_eq!(
             string_of(terms::tuple_element(id, 0).expect("the name")),
@@ -1243,7 +1345,7 @@ mod tests {
         );
         assert_eq!(
             string_of(terms::tuple_element(id, 1).expect("the version")),
-            "1"
+            release_vsn()
         );
         let _ = std::fs::remove_file(&path);
     }
