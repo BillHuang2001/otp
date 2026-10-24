@@ -1488,7 +1488,78 @@ fn split_top_level<'a>(token: &'a str, inner: &'a str) -> Result<Vec<&'a str>> {
 /// order (`erts_exit_vv`, `erl_init.c:2751-2755`). A capability gap and a plain status
 /// halt write no dump, exactly as the oracle's `ERTS_ERROR_EXIT`/`ERTS_DUMP_EXIT` rules
 /// leave them alone.
+///
+/// # This is the **library** entry: it tears the runtime down
+///
+/// The runtime this invocation built is dropped here, exactly as an embedding host expects —
+/// every `Drop` (a NIF library's `unload`, a port's close, a table's release) really runs, and
+/// the crate's own suite builds many runtimes per process on that guarantee. The **binary**
+/// takes [`run_for_process`] instead, which leaks the whole-boot state on the way out of the
+/// process; see that function for why, and for the measured difference.
 pub fn run(args: Vec<String>) -> i32 {
+    run_with(args, ExitTeardown::Drop)
+}
+
+/// The **process-exit** entry point [`crate::main`](crate::cli) uses: the same driver as [`run`],
+/// but on the way out it **leaks** the runtime instead of dropping it.
+///
+/// # Why the teardown is skipped
+///
+/// A `beam_rt` invocation that has finished its work is about to become a dead process, so
+/// freeing the world first is pure cost: ERTS never does it either (`halt` reaps nothing; the
+/// kernel reclaims the address space). Measured on `beam_rt -noshell -eval 'halt().'`, the
+/// teardown is **7.68 % of the run — ≈152 M of 1.980 G instructions, ≈17 ms of a ≈220 ms
+/// invocation** (`perf record -e instructions:u -c 2000000 --call-graph dwarf`, folded; every
+/// instruction of it inside `__call_tls_dtors`, i.e. the thread-exit destructor walk).
+///
+/// It arrives in **two** places, so both are skipped:
+///
+/// * the [`Runtime`] this function's [`drive`] built (the code server's module map, the ETS
+///   tables, the heaps, the ports) — [`std::mem::forget`]ped here;
+/// * the thread-local request-path caches, which are the **last owner** of the loaded module
+///   images ([`crate::context::ir_cache`]) — emptied and leaked there, because otherwise the
+///   images (and the shared atom table's name map, whose last reference a `Module` holds) would
+///   be destroyed at thread exit anyway.
+///
+/// # What the exit contract keeps, in order
+///
+/// Nothing observable changes: the crash dump is written **before** the leak (the paths above
+/// return their status through the same `match`), stdout is **flushed** explicitly after it (a
+/// `print!` without a trailing newline must not be lost to the leak — nothing else here flushes
+/// it, and `std::process::exit` running Rust's own cleanup is not something to rely on), and the
+/// process status (`0`/`1`/`2`/`3`) is returned unchanged. [`crate::release_free_pages`] is still
+/// called by `main` after the driver thread joins; it simply finds less free now.
+///
+/// # What it costs
+///
+/// The process's **exit** resident set no longer falls to the post-trim floor (measured ~23 MB
+/// for a bare boot): nothing was freed, so there is nothing to return, and the `malloc_trim`
+/// after the join finds a live arena instead of a free one. Peak `VmHWM` is unchanged — it is the
+/// run's high-water mark and is reached long before exit — and neither figure is counted by
+/// anything in the runtime: the memory is handed back by the kernel when the process dies, one
+/// `exit_group` later. `src/malloc.rs`'s module docs carry the measured columns.
+///
+/// # Library and test callers must keep using [`run`]
+///
+/// This entry deletes the teardown for good, so a caller that keeps using the process afterwards
+/// (every `tests/*.rs`, every in-process `Runtime`) leaks a whole runtime per invocation and
+/// loses every `Drop`-time effect. It is the binary's alone.
+pub fn run_for_process(args: Vec<String>) -> i32 {
+    run_with(args, ExitTeardown::Leak)
+}
+
+/// What [`run_with`] does with the runtime it built once the action is over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitTeardown {
+    /// Drop everything — the library contract ([`run`]).
+    Drop,
+    /// Leak everything the process would otherwise free on its way out ([`run_for_process`]).
+    Leak,
+}
+
+/// The shared driver behind [`run`] and [`run_for_process`]: parse, run, report, and — per
+/// `teardown` — either drop the runtime it built or leak it on the way out of the process.
+fn run_with(args: Vec<String>, teardown: ExitTeardown) -> i32 {
     // The `-env VAR VALUE` pairs are applied to this process's environment by the `erl`
     // **launcher** (`erts/etc/common/erlexec.c:724`, `case 'e'` → `set_env`), before the
     // emulator reads anything out of that environment and before every OS child the
@@ -1546,7 +1617,10 @@ pub fn run(args: Vec<String>) -> i32 {
     // after an in-process compile) and this thread still holds its own share, so a trim here
     // returns ~16 MB of the 75 MB the process then exits with. The release point is the process
     // entry, once the driver thread has exited: `src/main.rs`, `crate::malloc`.
-    match outcome {
+    // The exit status is **computed** here rather than returned from each arm, so there is exactly
+    // one place the process leaves by (`finish_exit` below) and the crash-dump writers above all
+    // run before it. Each arm keeps its own reason for the status it produces.
+    let code = match outcome {
         // A successful action still exits with the status a **non-terminating** node stop
         // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
         // `ok` to a caller that keeps running, so the status is applied here — after the
@@ -1570,13 +1644,11 @@ pub fn run(args: Vec<String>) -> i32 {
         Err(error) => {
             if let Some(status) = error::halt_status(&error) {
                 // The program asked to terminate with this status: no diagnostic, no dump.
-                return status;
-            }
-            if let Some(reason) = error::unsupported_reason(&error) {
+                status
+            } else if let Some(reason) = error::unsupported_reason(&error) {
                 // A documented Milestone-1 capability gap is not a crash: no dump.
-                return report_unsupported(&reason);
-            }
-            if let Some(path) = error::config_failure_path(&error) {
+                report_unsupported(&reason)
+            } else if let Some(path) = error::config_failure_path(&error) {
                 // The unreadable `-config` boot failure: the oracle's own stderr text,
                 // byte-for-byte (`\r\n` endings included). Its half-started node — with
                 // the rest of the node up and only `application_controller` dead — really
@@ -1594,9 +1666,8 @@ pub fn run(args: Vec<String>) -> i32 {
                 eprint!(
                     "Could not start kernel pid (application_controller) (\"error in config file \\\"{path}\\\" (none): configuration file not found\")\r\n{dump_line}"
                 );
-                return EXIT_RUNTIME;
-            }
-            if let Some(slogan) = error::dump_slogan(&error) {
+                EXIT_RUNTIME
+            } else if let Some(slogan) = error::dump_slogan(&error) {
                 // `erlang:halt("Slogan")` — the oracle's `ERTS_DUMP_EXIT` (`bif.c:4393`):
                 // print the slogan, write the dump, exit 1. The tail is the emulator's own
                 // announcement (`erl_crash_dump.c:509`), rendered with the file's name.
@@ -1607,18 +1678,59 @@ pub fn run(args: Vec<String>) -> i32 {
                     "{slogan}\r\n\r\nCrash dump is being written to: {}...done\r\n",
                     path.display()
                 );
-                return EXIT_RUNTIME;
+                EXIT_RUNTIME
+            } else {
+                // Every other failure is an abnormal exit: the dump comes first, then the
+                // termination (`halt(abort)` ends in `abort()`, i.e. SIGABRT — `erl_init.c:2774`).
+                write_crash_dump(source.as_ref(), &env, "");
+                if error::is_abort(&error) {
+                    std::process::abort();
+                }
+                eprintln!("beam_rt: {error}");
+                EXIT_RUNTIME
             }
-            // Every other failure is an abnormal exit: the dump comes first, then the
-            // termination (`halt(abort)` ends in `abort()`, i.e. SIGABRT — `erl_init.c:2774`).
-            write_crash_dump(source.as_ref(), &env, "");
-            if error::is_abort(&error) {
-                std::process::abort();
-            }
-            eprintln!("beam_rt: {error}");
-            EXIT_RUNTIME
         }
+    };
+    finish_exit(code, source, teardown)
+}
+
+/// The **last** thing [`run_with`] does: hands the exit status back, either dropping the runtime
+/// it built (the library contract) or leaking it and everything the process would free on its way
+/// out (the binary's — see [`run_for_process`] for the measurement and the trade).
+///
+/// # The order is part of the exit contract
+///
+/// 1. the crash dump has already been written by the caller (an abnormal exit must never snapshot
+///    a torn-down runtime);
+/// 2. the runtime and the thread-local caches are **leaked** — no destructor runs for them;
+/// 3. stdout is **flushed**: the printing BIFs write through `io::stdout()`'s line buffer, so a
+///    `print!`/`io:format` without a trailing newline is still pending here, and this path must
+///    not depend on Rust's `exit`-time cleanup to happen to run it;
+/// 4. the status is returned and `main` turns it into the process status.
+///
+/// A failed flush changes nothing: the bytes that could not be written are gone either way, and
+/// the exit status is the *program's*, never the stream's (the oracle has the same rule — a
+/// closed stdout does not change `erl`'s status), so the error is deliberately not propagated.
+fn finish_exit(code: i32, source: Option<Runtime>, teardown: ExitTeardown) -> i32 {
+    if teardown == ExitTeardown::Leak {
+        if let Some(runtime) = source {
+            // Leaked **whole**: the code server's module map, the shared atom table, the ETS
+            // tables, the heaps, the ports. Nothing observes the process after this point.
+            std::mem::forget(runtime);
+        }
+        // The request-path caches are the last owner of the loaded module images, so they would
+        // otherwise destroy them (and the atom name map a module owns the last reference to) in
+        // the thread-exit destructor walk, which is exactly the cost being skipped.
+        crate::context::ir_cache::forget_at_process_exit();
+        flush_stdout();
     }
+    code
+}
+
+/// Flushes the process's standard output (see [`finish_exit`] step 3).
+fn flush_stdout() {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
 }
 
 /// Writes the environment-named crash dump for an abnormal exit, if dumping is enabled.
@@ -3839,6 +3951,53 @@ mod tests {
         assert_eq!(
             run(vec!["-noshell".to_string(), "-eval".to_string(), "2*3.".to_string()]),
             EXIT_OK
+        );
+    }
+    /// The **process-exit** entry point answers exactly what the library entry answers, for every
+    /// class of exit — the leak it takes instead of the teardown must not touch the status.
+    ///
+    /// The four classes are exercised through the same code the binary runs (`main.rs` calls
+    /// [`run_for_process`]): a **usage** error and a **capability gap**, neither of which builds a
+    /// runtime, and then the two that do — a program-requested **halt status**, which must survive
+    /// being handed back through the leaking path (`finish_exit`'s `Leak` arm), and a genuine
+    /// **runtime error** (an uncaught `badarith`). What the status cannot show — that the runtime
+    /// and the thread-local caches were really leaked rather than dropped — is pinned where the
+    /// mechanism lives: `context::ir_cache`'s
+    /// `forgetting_the_caches_at_process_exit_leaks_them_and_leaves_them_usable`.
+    ///
+    /// The halting case leaks one runtime into the test process on purpose: that is what the entry
+    /// point does, it is a few MB in a process that is about to exit anyway, and nothing after it
+    /// reads the leaked state.
+    #[test]
+    fn the_process_entry_point_reports_the_same_statuses() {
+        // A usage error builds no runtime at all.
+        assert_eq!(run_for_process(vec!["-eval".to_string()]), EXIT_USAGE);
+        // A capability gap likewise (an expression outside the `-eval` grammar).
+        assert_eq!(
+            run_for_process(vec!["-eval".to_string(), "1+".to_string()]),
+            EXIT_UNSUPPORTED
+        );
+        // The leaking runtime path: `halt(7)`'s requested status is still the answer …
+        assert_eq!(
+            run_for_process(vec![
+                "-noshell".to_string(),
+                "-eval".to_string(),
+                "halt(7).".to_string(),
+            ]),
+            7
+        );
+        // … and a genuine runtime failure is still exit 1 (the same answer `run` gives).
+        assert_eq!(
+            run_for_process(vec![
+                "-noshell".to_string(),
+                "-eval".to_string(),
+                "1/0.".to_string(),
+            ]),
+            EXIT_RUNTIME
+        );
+        assert_eq!(
+            run(vec!["-noshell".to_string(), "-eval".to_string(), "1/0.".to_string()]),
+            EXIT_RUNTIME
         );
     }
 

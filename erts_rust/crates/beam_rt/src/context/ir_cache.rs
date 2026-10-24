@@ -285,6 +285,29 @@ thread_local! {
     static DESCRIPTORS: RefCell<Option<DescriptorIndex>> = const { RefCell::new(None) };
 }
 
+/// **Skips this thread's cache teardown** — the second half of the binary's "do not free the
+/// world at halting" rule ([`crate::cli::run_for_process`]).
+///
+/// Both cells are emptied by `take` and the taken values are **leaked**, so the thread's
+/// destructor finds nothing to drop. That matters because this index is the **last owner** of the
+/// loaded module images at process exit: it holds an `Arc<Module>` per `(uniq, index)` and the
+/// fun-module snapshot `Rc`, so once a runtime has been leaked rather than dropped, the whole
+/// module set — and the shared atom table's name map with it — would still be destroyed here, at
+/// thread exit, in the middle of `pthread`'s TLS destructor walk. Measured on
+/// `beam_rt -noshell -eval 'halt().'`, that walk cost **7.68 %** of the run's instructions and
+/// **all** of it arrived through these two cells (the `by_key` map 5.16 %, the snapshot `Rc`
+/// 2.43 %; `perf record -e instructions:u -c 2000000 --call-graph dwarf`, folded cost).
+///
+/// Sound because the caller is the **process-exit** path only: nothing reads either cache again
+/// (the process is gone in a few instructions), and a leaked entry is a leak, never a dangle —
+/// the `Arc<Module>`/`Rc` targets simply outlive the leak with a strong count that never reaches
+/// zero. A host that keeps running must not call it; [`crate::cli::run`] (the library entry)
+/// never does, so `Drop` — and every behaviour that depends on it — is unchanged there.
+pub(crate) fn forget_at_process_exit() {
+    ADMISSIONS.with(|cache| std::mem::forget(std::mem::take(&mut *cache.borrow_mut())));
+    DESCRIPTORS.with(|cache| std::mem::forget(cache.borrow_mut().take()));
+}
+
 /// The caches' own event counts, for the pins in this module's suite.
 #[cfg(test)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -568,6 +591,46 @@ mod tests {
             ADMISSIONS.with(|cache| cache.borrow().len()),
             0,
             "a synthetic module must leave no entry behind"
+        );
+    }
+
+    /// [`forget_at_process_exit`] leaves **nothing** for the thread's TLS destructor to drop, and
+    /// the caches are still correct if anything were to ask again (the leak is a leak, not a
+    /// corrupted cache): the very next lookup rebuilds the index from the code server and answers
+    /// exactly what it answered before.
+    ///
+    /// This is the pin behind the process-exit win: the module images (and the shared atom name
+    /// map they own the last reference to) must not be destroyed in the TLS destructor walk.
+    #[test]
+    fn forgetting_the_caches_at_process_exit_leaks_them_and_leaves_them_usable() {
+        clear();
+        let server = code_server(vec![module_with_funs("first", &[(11, 0, 100)])]);
+        let (found, descriptor) =
+            local_fun_descriptor(&server, 11, 0).expect("the lambda resolves");
+        assert_eq!(descriptor.label, Label(100));
+        assert_eq!(descriptor_stats(), (1, 0, 1), "the index was built");
+        assert!(
+            DESCRIPTORS.with(|cache| cache.borrow().is_some()),
+            "the case has something to forget"
+        );
+        forget_at_process_exit();
+        assert!(
+            DESCRIPTORS.with(|cache| cache.borrow().is_none()),
+            "the index must be gone from the cell, so the destructor drops nothing"
+        );
+        assert_eq!(
+            ADMISSIONS.with(|cache| cache.borrow().len()),
+            0,
+            "the admission map must be gone from its cell too"
+        );
+        let (again, rebuilt) =
+            local_fun_descriptor(&server, 11, 0).expect("still resolves after the leak");
+        assert!(Arc::ptr_eq(&found, &again), "the same code-server handle");
+        assert_eq!(rebuilt.label, Label(100));
+        assert_eq!(
+            descriptor_stats(),
+            (2, 0, 2),
+            "the forgotten index is rebuilt, not remembered"
         );
     }
 }
