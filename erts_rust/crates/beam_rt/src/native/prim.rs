@@ -1157,6 +1157,7 @@ mod tests {
     use beam_term::{make_small, NIL};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -4072,5 +4073,62 @@ halt(0).
                 "{function} must raise the bare reason atom"
             );
         }
+    }
+    // -- the `open/2` atom-table pin ------------------------------------------
+    /// An `open/2` round must **not** clone the shared `AtomTable`.
+    ///
+    /// [`CodeServer::atoms_handle`](crate::codeserver::CodeServer::atoms_handle) is an `Rc`
+    /// clone and [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut) writes
+    /// through `Rc::make_mut`, so an intern taken while a handle is alive replaces the code
+    /// server's `Rc` with a deep copy of the whole shared table (one `Arc<str>` allocation
+    /// and one hash-map insertion per atom, ~9 500 of each) and the copy is dropped at once.
+    /// `build_descriptor` used to bind the handle and then intern `file_descriptor` and
+    /// `prim_file` **after** it, paying exactly that twice per `file:open/2`.
+    ///
+    /// `Rc::as_ptr` is the removed work: `make_mut` allocates a **fresh** table, so pointer
+    /// identity across the round is precisely "no clone happened" — deterministic and
+    /// load-independent, unlike any timing or instruction-count assertion.
+    #[test]
+    fn an_open_round_does_not_clone_the_shared_atom_table() {
+        let dir = scratch_dir("open_no_clone");
+        std::fs::write(dir.join("f"), b"").expect("seed an empty file");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let write = atom(&mut runtime, "write");
+        // `[read, write]` is the **read shape** (`prim_file.erl:512-527`), so the round
+        // interns every name `build_descriptor` interns: the three required data-map keys,
+        // the two read-shape ones, and the tag/module pair.
+        let modes = list(&mut runtime, &[read, write]);
+        let path = path_in(&mut runtime, &dir, "f");
+        let before = Rc::as_ptr(&runtime.code_server().atoms_handle());
+        let answer = prim_file(&mut runtime, "open", &[path, modes]);
+        let after = Rc::as_ptr(&runtime.code_server().atoms_handle());
+        assert_eq!(
+            before, after,
+            "an `open/2` round must not replace the shared AtomTable with a clone of itself \
+             (the handle must be taken after the last intern, never before it)"
+        );
+        // …and the round really did the work: the descriptor is still the right shape, so
+        // the pin above cannot pass by the open failing or short-circuiting.
+        let fd = ok_value(&runtime, answer);
+        let data = descriptor_data(&runtime, fd);
+        let mut names: Vec<&str> = data.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "fd_registry_id",
+                "handle",
+                "owner",
+                "r_ahead_size",
+                "r_buffer"
+            ],
+            "the read-shape descriptor's data-map keys"
+        );
+        assert!(
+            is_small(data_get(&data, "fd_registry_id").expect("the registry id key")),
+            "the registry id is the small integer the open-file table is keyed by"
+        );
+        assert_ok(&mut runtime, "close", &[fd]);
     }
 }

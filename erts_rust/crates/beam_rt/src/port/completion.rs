@@ -90,10 +90,11 @@ use beam_io::{
     TcpInetDriver,
 };
 use beam_process::{PortId, ProcessId};
-use beam_term::{make_atom, make_small, Atom, AtomTable, Eterm};
+use beam_term::{make_small, Atom, AtomTable, Eterm};
 
 use super::{
-    PortEvent, PortMeta, PortName, PortRegistry, RuntimeContext, StreamShape, StreamType,
+    intern_reuse, PortEvent, PortMeta, PortName, PortRegistry, RuntimeContext, StreamShape,
+    StreamType,
 };
 /// One drained completion, bound to the port that produced it **and** to everything its
 /// delivery still needs once that port's metadata may be gone.
@@ -469,19 +470,14 @@ impl RuntimeContext<'_> {
         caller_ref: Option<&[u8]>,
         reply: &InetReply,
     ) -> beam_common::Result<Eterm> {
-        let (tag, ok, error) = {
-            let atoms = self.runtime.code_server.atoms_mut();
-            (
-                make_atom(atoms.intern("inet_reply")),
-                make_atom(atoms.intern("ok")),
-                make_atom(atoms.intern("error")),
-            )
-        };
+        let tag = intern_reuse(&mut self.runtime.code_server, "inet_reply");
+        let ok = intern_reuse(&mut self.runtime.code_server, "ok");
+        let error = intern_reuse(&mut self.runtime.code_server, "error");
         let status = match reply {
             InetReply::Ok => ok,
             InetReply::Error(reason) => {
                 let name = reason.atom_name();
-                let reason = make_atom(self.runtime.code_server.atoms_mut().intern(&name));
+                let reason = intern_reuse(&mut self.runtime.code_server, &name);
                 terms_tuple(self, &[error, reason])?
             }
         };
@@ -511,14 +507,9 @@ impl RuntimeContext<'_> {
         result: &InetAsyncResult,
         stream: StreamType,
     ) -> beam_common::Result<Eterm> {
-        let (tag, ok, error) = {
-            let atoms = self.runtime.code_server.atoms_mut();
-            (
-                make_atom(atoms.intern("inet_async")),
-                make_atom(atoms.intern("ok")),
-                make_atom(atoms.intern("error")),
-            )
-        };
+        let tag = intern_reuse(&mut self.runtime.code_server, "inet_async");
+        let ok = intern_reuse(&mut self.runtime.code_server, "ok");
+        let error = intern_reuse(&mut self.runtime.code_server, "error");
         let answer = match result {
             InetAsyncResult::Ok => ok,
             InetAsyncResult::Data(read) => {
@@ -528,7 +519,7 @@ impl RuntimeContext<'_> {
             InetAsyncResult::Port(accepted) => terms_tuple(self, &[ok, accepted.to_eterm()])?,
             InetAsyncResult::Error(reason) => {
                 let name = reason.atom_name();
-                let reason = make_atom(self.runtime.code_server.atoms_mut().intern(&name));
+                let reason = intern_reuse(&mut self.runtime.code_server, &name);
                 terms_tuple(self, &[error, reason])?
             }
             InetAsyncResult::Accepted { fd } => {
@@ -538,7 +529,7 @@ impl RuntimeContext<'_> {
                 // fabricated `{ok, Port}`.
                 let fd = *fd;
                 discard_descriptor(fd);
-                let closed = make_atom(self.runtime.code_server.atoms_mut().intern("closed"));
+                let closed = intern_reuse(&mut self.runtime.code_server, "closed");
                 terms_tuple(self, &[error, closed])?
             }
         };

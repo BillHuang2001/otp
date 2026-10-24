@@ -96,13 +96,13 @@ use std::rc::Rc;
 use beam_common::Result;
 use beam_engine::terms;
 use beam_process::{MonitorRef, PortId, PortMonitor, ProcessId, ProcessTable};
-use beam_term::{make_atom, Eterm};
+use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::Runtime;
 
-use super::{PortEvent, PortRegistry};
+use super::{intern_reuse, PortEvent, PortRegistry};
 /// The **driver-failure channel**'s runtime half — the port-exit family's *other* closer.
 ///
 /// A port leaves this runtime through exactly two closers: [`PortRegistry::close`] (the Erlang
@@ -692,9 +692,11 @@ fn deliver_signal(
 ///
 /// The same rule [`RuntimeContext::port_data_message`](crate::port) follows:
 /// `beam_rt`'s live table is the single namespace every message, guard and printer reads, so
-/// a name interned here is nameable and matchable by a `receive` clause.
+/// a name interned here is nameable and matchable by a `receive` clause. The intern itself is
+/// [`intern_reuse`]'s, so a name the table already holds writes nothing (see there for the two
+/// long-lived table leases a write would copy).
 fn intern(ctx: &mut RuntimeContext<'_>, name: &str) -> Eterm {
-    make_atom(ctx.runtime.code_server_atoms_mut().intern(name))
+    intern_reuse(&mut ctx.runtime.code_server, name)
 }
 
 /// `reference` as the reference term a `{'DOWN', …}` carries.

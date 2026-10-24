@@ -109,11 +109,13 @@
 
 use beam_io::{ActiveInput, ActiveInputEvent, ReadMessage};
 use beam_process::{PortId, ProcessId};
-use beam_term::{make_atom, make_small, Eterm};
+use beam_term::{make_small, Eterm};
 
 use crate::error;
 use crate::port::completion::terms_tuple;
-use crate::port::{driver_path_name, PortMeta, PortRegistry, RuntimeContext, StreamType};
+use crate::port::{
+    driver_path_name, intern_reuse, PortMeta, PortRegistry, RuntimeContext, StreamType,
+};
 
 /// The address tag of an explicit IPv4 address in the packed-address record (`INET_AF_INET`,
 /// `erts/emulator/drivers/common/inet_drv.c:757`) — the only family
@@ -393,7 +395,7 @@ impl RuntimeContext<'_> {
     /// A socket-message tag atom (`tcp`, `udp`, `tcp_passive`, `udp_passive`) interned in the
     /// runtime's **one shared** table.
     fn socket_atom(&mut self, name: &str) -> Eterm {
-        make_atom(self.runtime.code_server.atoms_mut().intern(name))
+        intern_reuse(&mut self.runtime.code_server, name)
     }
 }
 

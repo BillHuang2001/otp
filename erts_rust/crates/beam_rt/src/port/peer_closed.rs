@@ -109,11 +109,11 @@ use std::rc::Rc;
 
 use beam_common::Result;
 use beam_process::{PortId, ProcessId, ProcessTable};
-use beam_term::{make_atom, Eterm};
+use beam_term::Eterm;
 
 use crate::error;
 use crate::port::completion::terms_tuple;
-use crate::port::{driver_path_name, PortMeta, PortRegistry, RuntimeContext};
+use crate::port::{driver_path_name, intern_reuse, PortMeta, PortRegistry, RuntimeContext};
 use crate::Runtime;
 
 use super::inet_opts::PortInetOptions;
@@ -599,7 +599,7 @@ impl RuntimeContext<'_> {
         report: &PeerCloseReport,
     ) -> beam_common::Result<Eterm> {
         let tag = report.kind.tag();
-        let tag = make_atom(self.runtime.code_server.atoms_mut().intern(tag));
+        let tag = intern_reuse(&mut self.runtime.code_server, tag);
         terms_tuple(self, &[tag, report.port.to_eterm()])
     }
 }

@@ -209,6 +209,7 @@ use beam_term::{
     Eterm, NIL,
 };
 
+use crate::codeserver::CodeServer;
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::Runtime;
@@ -393,16 +394,22 @@ const PORT_OPTION_TUPLES: &[&str] = &[
 /// Which `Name` the `open_port/2` call used — the driver that backs the port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortName {
-    /// `{spawn, Cmd}`: flatten `Cmd` and run it through `/bin/sh -c "exec Cmd"`.
+    /// `{spawn, Cmd}` whose `Cmd` does **not** name a driver: flatten `Cmd` and run it through
+    /// `/bin/sh -c "exec Cmd"`. A command whose first token *is* a driver takes one of the two
+    /// driver forms below instead ([`spawn_names_driver`], the C's lookup before any fork).
     Spawn,
     /// `{spawn_executable, Path}`: run `Path` directly with the `args` option.
     SpawnExecutable,
-    /// `{spawn_driver, Name}`: a **C driver** (contract A.4) `dlopen`ed from `Name` — no OS child.
+    /// `{spawn_driver, Name}` — or a `{spawn, Cmd}` whose first token names a driver
+    /// (`erts/emulator/beam/io.c:599-628`): a **C driver** (contract A.4) `dlopen`ed from `Name` — no
+    /// OS child.
     SpawnDriver,
-    /// `{spawn_driver, Name}` where `Name` is a **built-in** driver this runtime links in
+    /// A driver form naming a **built-in** driver this runtime links in
     /// (`fd`/`efile`/`tcp_inet` — the Rust analogue of the emulator's statically linked drivers,
     /// e.g. `tcp_inet` in `erts/emulator/drivers/common/inet_drv.c:1348`), resolved against
-    /// [`beam_io::DriverRegistry`] rather than `dlopen`ed.
+    /// [`beam_io::DriverRegistry`] rather than `dlopen`ed. Reached by
+    /// `open_port({spawn_driver, Name}, …)` *and* by `open_port({spawn, Cmd}, …)` when `Cmd`'s first
+    /// token is one of them — which is how `lib/kernel/src/ram_file.erl:383` opens `ram_file_drv`.
     ///
     /// Like [`PortName::SpawnDriver`] it is a **driver** port — so [`PortMeta::has_driver_control`]
     /// answers from the driver's own `control` capability, captured when the port is opened — but
@@ -3536,10 +3543,21 @@ impl RuntimePorts {
         let tag = self.atom_name(tag).ok_or(BeamError::BadArg)?;
         match (tag, arity) {
             ("spawn", 2) => {
-                let command = self.command_spec(terms::tuple_element(name, 1)?)?;
+                let command = checked_name(self.command_spec(terms::tuple_element(name, 1)?)?)?;
+                // A command whose **first token** is a registered driver is that **driver's** port:
+                // the C searches its loaded-driver list before it forks anything
+                // (`erts/emulator/beam/io.c:599-628`), which is how `ram_file.erl` opens the
+                // emulator's ram-file driver (`lib/kernel/src/ram_file.erl:383`). [`spawn_names_driver`]
+                // carries the rule and the membership gates; a non-matching command stays the shell
+                // command the spawn driver runs.
+                let kind = if spawn_names_driver(&command) {
+                    PortName::SpawnDriver
+                } else {
+                    PortName::Spawn
+                };
                 Ok(NameSpec {
-                    kind: PortName::Spawn,
-                    command: checked_name(command)?,
+                    kind,
+                    command,
                     fd: None,
                     inline_options: None,
                 })
@@ -4776,7 +4794,7 @@ impl RuntimeContext<'_> {
         stream: StreamType,
         shape: StreamShape,
     ) -> Result<Eterm> {
-        let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
+        let data = intern_reuse(&mut self.runtime.code_server, "data");
         let payload = self.make_stream_payload(read, stream, shape)?;
         let inner = terms::make_tuple(self, &[data, payload])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
@@ -4818,10 +4836,8 @@ impl RuntimeContext<'_> {
         stream: StreamType,
     ) -> Result<Eterm> {
         let tag = if eol { "eol" } else { "noeol" };
-        let (data, tag) = {
-            let atoms = self.runtime.code_server.atoms_mut();
-            (make_atom(atoms.intern("data")), make_atom(atoms.intern(tag)))
-        };
+        let data = intern_reuse(&mut self.runtime.code_server, "data");
+        let tag = intern_reuse(&mut self.runtime.code_server, tag);
         // The frame is a read whose body is the frame's bytes and whose header is the producing
         // read's prefix — the C's own shape (`deliver_linebuf_message` → `deliver_read_message`).
         let frame = ReadMessage {
@@ -4918,7 +4934,7 @@ impl RuntimeContext<'_> {
     /// exit twice. The sibling of [`Self::port_data_message`], with the same
     /// interned-atom/pointer-stable-arena rule.
     pub(crate) fn port_exit_message(&mut self, port: PortId, status: i32) -> Result<Eterm> {
-        let tag = make_atom(self.runtime.code_server.atoms_mut().intern("exit_status"));
+        let tag = intern_reuse(&mut self.runtime.code_server, "exit_status");
         let inner = terms::make_tuple(self, &[tag, make_small(i64::from(status))])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
@@ -4941,10 +4957,9 @@ impl RuntimeContext<'_> {
     ///
     /// The arena's allocation failure when the tuple does not fit.
     pub(crate) fn signal_notify_message(&mut self, name: &str) -> Result<(Eterm, Eterm)> {
-        let atoms = self.runtime.code_server.atoms_mut();
-        let notify = make_atom(atoms.intern("notify"));
-        let signal = make_atom(atoms.intern(name));
-        let sender = make_atom(atoms.intern("system"));
+        let notify = intern_reuse(&mut self.runtime.code_server, "notify");
+        let signal = intern_reuse(&mut self.runtime.code_server, name);
+        let sender = intern_reuse(&mut self.runtime.code_server, "system");
         let message = terms::make_tuple(self, &[notify, signal])?;
         Ok((sender, message))
     }
@@ -4981,13 +4996,12 @@ impl RuntimeContext<'_> {
         event: select::SelectEvent,
         handle: Eterm,
     ) -> Result<(Eterm, Eterm)> {
-        let atoms = self.runtime.code_server.atoms_mut();
-        let sender = make_atom(atoms.intern("system"));
+        let sender = intern_reuse(&mut self.runtime.code_server, "system");
         match payload {
             select::SelectPayload::Custom { message } => Ok((sender, *message)),
             select::SelectPayload::Plain { reference } => {
-                let select = make_atom(atoms.intern("select"));
-                let event_atom = make_atom(atoms.intern(event.name()));
+                let select = intern_reuse(&mut self.runtime.code_server, "select");
+                let event_atom = intern_reuse(&mut self.runtime.code_server, event.name());
                 let message =
                     terms::make_tuple(self, &[select, handle, *reference, event_atom])?;
                 Ok((sender, message))
@@ -4996,8 +5010,42 @@ impl RuntimeContext<'_> {
     }
 }
 
-/// The command a `{spawn_driver, Name}` `open_port/2` was given, truncated at the first blank —
-/// the C's own rule (`io.c` walks the name to the first blank before matching
+/// Resolves `name` in the runtime's **one shared** atom table by **looking it up first**, so a
+/// name the table already holds never reaches [`CodeServer::atoms_mut`] at all.
+///
+/// # Why the lookup comes first
+///
+/// [`CodeServer::atoms_mut`] is `Rc::make_mut`: **reaching** it while any other handle on the table
+/// is alive deep-clones the whole shared table — one `Arc<str>` per name (~9 500 once the runtime
+/// is booted) plus the index map — and the copy is dropped as soon as the borrow ends. The clone is
+/// a pure cost and never an observable difference (a clone preserves every index), and the
+/// port-message vocabulary is the workload shape that pays it over and over: exactly two holders
+/// live long enough to still be alive whenever a port message is built — a loaded NIF library's
+/// stored host (`crate::nif`'s `NifEntry::host`, one per `erlang:load_nif/2`) and a `dlopen`ed
+/// `{spawn_driver, Name}` port's host (`crate::port::driver`'s `DriverPort`, for the port's whole
+/// life). Meanwhile `data`, `eol`, `noeol`, `exit_status`, `notify`, `select`, `system`,
+/// `inet_reply`, `inet_async`, `ok`, `error`, the socket tags and the rest are landed by the
+/// **first** message of their kind, so on every later message the write finds the name already
+/// present and the clone buys nothing.
+///
+/// # What it does not change
+///
+/// Nothing: it removes no intern and relaxes no ownership rule — it only skips a `make_mut` for a
+/// name the live table already holds. A **miss** performs exactly the intern the code it replaced
+/// performed: the same append, at the same index (interning is append-only), with the same
+/// [`AtomTable::generation`] bump. So no atom index, no append order and no observable behaviour
+/// moves, and every term already built keeps its atom value. The hit path allocates **nothing**:
+/// [`AtomTable::lookup`] answers the index out of the name map, with no `String`/`Arc<str>` and no
+/// table write.
+pub(crate) fn intern_reuse(server: &mut CodeServer, name: &str) -> Eterm {
+    match server.atoms().lookup(name) {
+        Some(atom) => make_atom(atom),
+        None => make_atom(server.atoms_mut().intern(name)),
+    }
+}
+
+/// The command a `{spawn_driver, Name}` or `{spawn, Cmd}` `open_port/2` was given, truncated at the
+/// first blank — the C's own rule (`io.c` walks the name to the first blank before matching
 /// `ErlDrvEntry::driver_name`), so `"ram_file_drv extra args"` names the driver `ram_file_drv`.
 ///
 /// This is the driver **search**'s rule ([`driver_lookup`]); whether the resolved driver declares a
@@ -5005,6 +5053,31 @@ impl RuntimeContext<'_> {
 /// ([`PortMeta::driver_has_control`]), not anything read from this name.
 fn driver_path_name(command: &str) -> &str {
     command.split(' ').next().unwrap_or(command)
+}
+
+/// Whether a `{spawn, Cmd}` `open_port/2` name resolves to a **driver** — i.e. whether the C opens
+/// the port as that driver's port instead of forking a shell command.
+///
+/// The C's rule (`erts/emulator/beam/io.c:599-628`): for a non-`spawn_executable` spawn it walks
+/// the name to the first blank and searches the resulting token in the **loaded-driver list**,
+/// *before* anything is forked; a hit means the port is that driver's port. This is what makes
+/// `lib/kernel/src/ram_file.erl:383` work at all — `open_port({spawn, "ram_file_drv"}, Opts)` is the
+/// emulator's ram-file driver, not a shell program named `ram_file_drv` (nor a `{Port,{exit_status,…}}`
+/// reporter).
+///
+/// The token is [`driver_path_name`]'s (the same first-blank rule the driver search itself applies),
+/// and the membership gates are the emulator's own two: [`driver::is_static_driver`] (the
+/// `driver_tab.c` statics — `tcp_inet`, `udp_inet`, `ram_file_drv`) and [`driver::driver_is_loaded`]
+/// (a driver an `erl_ddll:load_driver/3`, or an earlier `open_port({spawn_driver, …})`, put on the
+/// loaded list). `fd`/`efile` are deliberately **not** members: OTP 21+ made them ordinary modules, so
+/// the oracle runs `{spawn,"fd"}` as a shell command (`port_info(Port, os_pid)` is a real pid) and
+/// accepts `[exit_status]` for it (verified against erts-17.1).
+///
+/// [`opens_a_driver_port`] — the `[exit_status]` refusal — reads the very same predicate, so the
+/// classification and the refusal cannot drift apart.
+fn spawn_names_driver(command: &str) -> bool {
+    let name = driver_path_name(command);
+    driver::is_static_driver(name) || driver::driver_is_loaded(name)
 }
 
 /// Whether `spec` names a port the C would open **through a driver** — the predicate behind the
@@ -5023,6 +5096,11 @@ fn driver_path_name(command: &str) -> &str {
 /// OTP 21+ made them ordinary modules, so the oracle runs `{spawn,"fd"}` as a shell command and
 /// accepts `[exit_status]` for it (verified against erts-17.1).
 ///
+/// The `PortName::Spawn` arm reads [`spawn_names_driver`] — the same lookup
+/// [`RuntimePorts::name_spec`] classifies a `{spawn, Cmd}` name with, so the two cannot drift. Since
+/// that classification already turns a driver-named command into [`PortName::SpawnDriver`], this arm
+/// is the belt to its braces: it keeps the refusal right for a `NameSpec` built anywhere else.
+///
 /// The `{fd, N}` **name form** is a driver port, and a different driver from `spawn_driver`: it is
 /// the emulator's own `fd_driver` (`erts/emulator/sys/unix/sys_drivers.c:257`, registered at
 /// `io.c:86`), so the same test refuses `[exit_status]` for it — measured on erts-17.1,
@@ -5033,10 +5111,7 @@ fn driver_path_name(command: &str) -> &str {
 fn opens_a_driver_port(spec: &NameSpec) -> bool {
     match spec.kind {
         PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
-        PortName::Spawn => {
-            let name = driver_path_name(&spec.command);
-            driver::is_static_driver(name) || driver::driver_is_loaded(name)
-        }
+        PortName::Spawn => spawn_names_driver(&spec.command),
         PortName::SpawnExecutable => false,
         PortName::Fd => true,
     }
