@@ -1031,6 +1031,29 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_match` with a fully **static** command list (`ensure_at_least` /
+            // `ensure_exactly` / `skip` / `integer` only): the shape a compiled binary
+            // comprehension re-enters on every element. It writes each `integer`
+            // destination, which is why `cacheable_writes` charges them, and it commits the
+            // context's `start` word command by command before each destination store.
+            Instr::BsMatch { fail, ctx, commands } => {
+                if !bitstr_inline::try_inline_bs_match(
+                    buffer,
+                    module,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    commands,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

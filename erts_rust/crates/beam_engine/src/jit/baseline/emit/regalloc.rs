@@ -101,7 +101,7 @@ use super::aggregate::{
 use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
 use super::bitstr_inline::{
-    get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
+    bs_match_shape, get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
     start_match3_shape, start_match4_shape, test_tail2_shape,
 };
 use super::compare::comparison_shape;
@@ -509,6 +509,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
             labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
         )
         .is_some(),
+        Instr::BsMatch { fail, ctx, commands } => {
+            bs_match_shape(labels, module, *fail, ctx, commands).is_some()
+        }
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -735,6 +738,11 @@ pub(crate) fn cacheable_touches(
                 touches.extend(shape.registers());
             }
         }
+        Instr::BsMatch { fail, ctx, commands } => {
+            if let Some((shape, _)) = bs_match_shape(labels, module, *fail, ctx, commands) {
+                touches.extend(shape.registers());
+            }
+        }
         _ => {}
     }
     touches
@@ -875,6 +883,11 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
             if let Some((shape, _)) = get_integer2_shape(
                 labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
             ) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsMatch { fail, ctx, commands } => {
+            if let Some((shape, _)) = bs_match_shape(labels, module, *fail, ctx, commands) {
                 reads.extend(shape.reads());
             }
         }
@@ -1026,6 +1039,13 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         )
         .map(|(shape, _)| shape.writes())
         .unwrap_or_default(),
+        // `bs_match` charges **every** `integer` destination: a dropped write is the one
+        // unsound failure mode (a stale cache register surviving a block exit).
+        Instr::BsMatch { fail, ctx, commands } => {
+            bs_match_shape(labels, module, *fail, ctx, commands)
+                .map(|(shape, _)| shape.writes())
+                .unwrap_or_default()
+        }
         // Everything else deopts.
         _ => Vec::new(),
     }

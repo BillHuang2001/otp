@@ -585,6 +585,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
     let mut list_reads = 0usize;
     let mut tuple_paths = 0usize;
     let mut bs_paths = 0usize;
+    let mut bs_match_commands = 0usize;
     for instr in code {
         match instr {
             Instr::Bif { .. } => cmp_bifs += 1,
@@ -601,8 +602,11 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             // per-instruction budget already covers it), while the six guarded
             // match-context shapes, `bs_get_integer2` and the `bs_match` path reserve
             // their own guarded sequence ([`BS_PATH_BYTES`]).
-            Instr::BsMatch { .. }
-            | Instr::BsGetInteger2(_)
+            Instr::BsMatch { commands, .. } => {
+                bs_paths += 1;
+                bs_match_commands += commands.len();
+            }
+            Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
             | Instr::BsSetPosition { .. }
             | Instr::BsSkipBits2 { .. }
@@ -619,6 +623,7 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
         + LIST_PATH_BYTES * list_reads
         + TUPLE_PATH_BYTES * tuple_paths
         + BS_PATH_BYTES * bs_paths
+        + BS_MATCH_COMMAND_BYTES * bs_match_commands
 }
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (the frame-register pushes, the
@@ -686,6 +691,14 @@ const TUPLE_PATH_BYTES: usize = 160;
 /// claims it, like the other path budgets: under-estimating would turn a large module into
 /// a `SystemLimit` compile error, so the figure is deliberately loose.
 const BS_PATH_BYTES: usize = 448;
+/// The code-size budget reserved for one `bs_match` **command** (see
+/// [`code_capacity_estimate`]) — the list length is not bounded, so the guarded sequence's
+/// per-command cost is budgeted separately from [`BS_PATH_BYTES`]'s per-instruction figure.
+/// The widest command is `integer`: the `remaining` guard (~35 B), the shared subject
+/// classification with its two arms (~130 B), the extractor's guard/load/shift/mask (~90 B)
+/// and the commit plus the tagged destination store (~45 B), i.e. ~300 B; `ensure_*`/`skip`
+/// are under 60 B. Deliberately loose (under-estimating is a `SystemLimit` compile error).
+const BS_MATCH_COMMAND_BYTES: usize = 320;
 
 #[cfg(test)]
 mod tests {

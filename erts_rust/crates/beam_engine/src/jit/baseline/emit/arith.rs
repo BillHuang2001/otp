@@ -434,6 +434,10 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             &b.ctx, &b.size, b.unit, b.flags, &b.dst,
         )
         .map_or(false, |shape| shape.uses_y()),
+        Instr::BsMatch { ctx, commands, .. } => {
+            super::bitstr_inline::BsMatchShape::of(module, ctx, commands)
+                .map_or(false, |shape| shape.uses_y())
+        }
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }
