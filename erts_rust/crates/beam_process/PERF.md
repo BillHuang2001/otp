@@ -1,4 +1,4 @@
-# `beam_process` — message-delivery performance
+# `beam_process` — message-delivery and per-collection performance
 
 ## Intent
 
@@ -17,6 +17,12 @@ against the system ERTS's 1 453.98 ns/op (54.7×). Three crates own slices of it
 measurable in isolation and attributes the cost between the three. It asserts **only correctness +
 structural invariants** — never a wall-clock threshold (this is a shared, loaded host).
 
+The crate's **other** recurring cost is the per-collection scaffolding — the root gather, the
+collector call, the write-back and the off-heap reclaim a rooted collection performs at every heap
+admission. `examples/perf_collection.rs` is its own dependency-free instrument (a counting
+`#[global_allocator]` plus two collection counts to difference), and § *The per-collection
+bookkeeping floor* below records what it measures. Every event figure in this file carries the same
+host/load caveat.
 ## Method
 
 **Host caveat.** Absolute `ns/op` is meaningless on its own here: this is a shared CI/dev host and
@@ -359,19 +365,144 @@ Neither belongs here; recorded with their anchors, their landing state and the s
    flat word count in `BeamError::Alloc::requested`, which `deliver_into_mailbox` currently throws
    away before `send_fragmented_message` walks the same graph again.
 
+## The per-collection bookkeeping floor
+
+A delivery is not the only thing this crate pays for at a heap admission: every collection runs the
+same scaffolding — `Process::collect` → `run_rooted_collection`, i.e. gather the root set into the
+flat root slice, run the collector over it, write the register/mailbox/dictionary/saved-argument/
+signal regions back, then reclaim the process-owned off-heap binaries. `examples/perf_collection.rs`
+is the instrument for exactly that path and only that path: it collects from a process whose live
+set is small and **constant** (four queued messages, each contributing a three-word envelope root,
+two dictionary entries, one saved BIF argument and one host-published extra root — plus, per
+iteration, twelve abandoned tuples as garbage and one live tuple published through
+`Registers::extra_roots_mut`), so the figure is this crate's scaffolding plus the copier's small,
+fixed share, never a workload's live-set size.
+
+**Command** (the file must stay identical between the two builds it compares; it touches only the
+crate's public API, so it compiles unchanged against an older `beam_process`):
+
+```text
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml --release \
+    -p beam_process --example perf_collection -- [collections] [warm-up]
+```
+
+Defaults are `collections = 2 000` and `warm-up = 200`; the warm-up is what makes the measured
+window steady state (the reused buffers' capacity and the nursery are already allocated by then).
+
+**The change/control discipline.** The **control** is a release build of the same harness source at
+base SHA `4fd422658d`, built in a detached worktree; the **patched** side is this worktree. The two
+binaries alternate **inside every round** (control, patched, control, patched, …), so ambient drift
+cancels instead of accumulating; 11 alternating rounds were taken, pinned with `taskset -c 1` (this
+is a hybrid host — the `cpu_core` P-cores are 0–3) with `/proc/loadavg` ≈ `2.09 4.20 6.63`
+before/after.
+
+### Retired instructions per collection
+
+Event `cpu_core/instructions/u` (not `instructions:u` — see the instrument pitfalls below). The
+figure is the **marginal**: two collection counts are timed (`n = 20 000` and `n = 40 000`, same
+200-collection warm-up) and the difference divided by the difference in counts, which cancels the
+process's fixed cost. Medians over the 11 alternating rounds:
+
+| side | instructions / collection |
+|---|---:|
+| control (base `4fd422658d`) | 5 005.7 |
+| patched (this tree) | 3 464.9 |
+
+| quantity | value |
+|---|---:|
+| paired ratio (control ÷ patched), median | **1.43888×** |
+| paired ratio, min … max over rounds | 1.41273× … 1.51328× |
+| round-to-round spread | **10.05 pp** |
+| change | **−30.50 %** |
+| absolute saving | **−1 526.8 instructions / collection** (median) |
+
+The saving is large, deterministic — a fixed count of instructions, not a cache-luck effect — and
+evenly distributed: 10.05 pp of round-to-round spread on a task pinned to one core.
+
+### Deterministic allocation counters
+
+The counting `#[global_allocator]` wrapping `std::alloc::System` reports exact integers, so these
+rows are load-immune (counts, not timings) and are the discriminating evidence for a buffer-reuse
+change:
+
+| per collection | control | patched |
+|---|---:|---:|
+| `allocs_per_collection` | 2.00 | **0.00** |
+| `reallocs_per_collection` | 3.00 | **0.00** |
+| `bytes_per_collection` | 960.0 | **0.0** |
+
+### Wall clock (quoted only for completeness)
+
+| per collection | control | patched |
+|---|---:|---:|
+| median `ns_per_collection` | 678.4 | 453.9 |
+
+Read this row as noise: on a shared host the wall clock moves with the load average by more than the
+effect. The instruction count above is the measurement and the allocation counters are exact.
+
+### Behavioural counters — identical on both arms
+
+| counter | control | patched |
+|---|---:|---:|
+| `words_reclaimed_total` | 52 514 100 810 | 52 514 100 810 |
+| `minor_gcs` | 42 | 42 |
+| `young_capacity_words` | 233 | 233 |
+
+Identical on every round: the change **alters no collection outcome**. It removes allocations from
+the scaffolding, and the same words are reclaimed by the same number of collections into the same
+nursery.
+
+### End to end: invisible, and why
+
+`../../tools/bench`'s driver on both builds (`run --runtime rust --quick --workloads
+gc_bound|gc_class`, 9 alternating rounds, `$BEAM_RT` selecting each binary):
+
+| workload | ratio (control ÷ patched) | change vs 1.0000 | round-to-round spread | counter evidence |
+|---|---:|---:|---:|---|
+| `gc_bound` | **1.0017×** | +0.167 % | 0.028 pp | `case_churn_ops = 10 000` on both arms |
+| `gc_class` | **0.9994×** | −0.062 % | 0.088 pp | `case_send_recv_ops = 25 000`, `case_ets_copy_ops = 40 000`, `case_compile_ops = 2` — identical |
+
+ns/op medians over the same 9 rounds (control / patched): `churn` 24 826.9 / 24 563.8, `send_recv`
+18 851.1 / 18 792.5, `ets_copy` 10 998.0 / 11 044.4.
+
+**The honest reading.** The change is **invisible in the end-to-end workloads** and **large,
+deterministic and evenly distributed on the collection path itself** (~1 500 instructions per
+collection, −30.50 %). Both statements hold because those rows are dominated by non-collection work,
+and `gc_bound`'s churn workload runs roughly one GC across the whole measured window (its rounds are
+pinned by `min_heap_size`), so a per-collection scaffolding saving has almost no per-op denominator
+to show up in. What this instrument proves is a **work reduction on a path that runs at every heap
+admission** — exactly the kind of change the end-to-end rows are least able to resolve.
+
+### Instrument pitfalls (what makes a run trustworthy)
+
+* **`cpu_core/instructions/u` is the accepted event.** On a hybrid host a task that migrates off a
+  P-core reports through the `cpu_atom/...` PMU and the run yields roughly **5 % of the true
+  count** — silently. A run must therefore be pinned (`taskset -c 1` here, on a P-core) **and**
+  sanity-checked: an unpinned or mis-landed run's "improvement" is the migration, not the change.
+* **Runs below ~0.02 s are unusable** — the PMU reading is at the wrong scale for the measured
+  window, so keep the collection count high enough that the timed region is well above that.
+* **`/usr/bin/time` is absent on this host**, so nothing here relies on it: the harness prints
+  `/proc/loadavg` itself and reports its own exact counters, and the event counts come from
+  `perf stat` around the harness.
+* Differencing **two collection counts** (rather than comparing two wall-clock runs) is what removes
+  the process's fixed cost; a single-count figure folds in start-up and first-touch allocations.
+
 ## What this file does not measure
 
 * `beam_engine`'s send/receive instruction cost (unreachable from this crate — see its own node).
 * Port delivery, cross-scheduler (SMP) wake/steal, and distribution-driven signals: this harness is
   single-threaded and local, matching the workload the end-to-end `send_recv` exercises.
-* Collections: the heap is rewound per iteration, so no row pays for a GC.
+* Collections in the **delivery** harness: the heap is rewound per iteration, so no delivery row
+  pays for a GC. The collection scaffolding has its own instrument and section above.
 * The end-to-end `send_recv` decomposition as a *harness* measurement: the three-way split above is
   the harness's per-crate rows applied to the workload's structure. The *profiled* decomposition is
   the section above — a real trace, and what those rows are made of.
 
 ## See Also
 
-* `examples/perf_delivery.rs` — the harness.
+* `examples/perf_delivery.rs` — the delivery-path harness.
+* `examples/perf_collection.rs` — the per-collection scaffolding harness (the section above); it
+  asserts structural invariants and reports exact allocation counts, never a wall-clock threshold.
 * `../../tools/bench/RESULTS.md` §3.6/§8 — the end-to-end `send_recv` figures this file splits.
 * `../beam_engine/MEASURED.md` — the engine node's own measurements; `../beam_message/CONTEXT.md`
   — the copy engine.
