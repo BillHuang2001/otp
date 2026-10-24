@@ -77,6 +77,7 @@ use super::{extract_bits, fail_step, is_all, make_small_checked, raw, read_size}
 
 mod commands;
 mod match_ctx;
+pub(super) mod prepared;
 mod reads;
 #[cfg(test)]
 mod rooted;
@@ -120,7 +121,6 @@ pub(super) fn exec(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let _ = (func, pc);
     // Hot-variant pre-test. `bs_match` is the variant a compiled binary
     // comprehension or match loop re-enters on **every** iteration (the compiler
     // fuses a fixed-size field read into one `bs_match` command list), so it is
@@ -128,6 +128,10 @@ pub(super) fn exec(
     // discriminant decode plus a bounds check and an indirect `jmp` through a jump
     // table on every call. A direct compare and a well-predicted branch replace it
     // for the common case.
+    //
+    // The command list is then executed through the **prepared program** cache
+    // (`prepared`), which resolves the command atoms, the size/unit operands and the
+    // flags once per instruction instead of once per element.
     //
     // The rest of the dispatch is **outlined** ([`exec_other`], `#[inline(never)]`)
     // on purpose: without a call boundary LLVM merges the pre-test back into the
@@ -140,7 +144,9 @@ pub(super) fn exec(
         commands,
     } = instr
     {
-        return run_commands(machine, module, labels, *fail, ctx_op, commands, ctx);
+        return prepared::run_commands_prepared(
+            machine, module, labels, *fail, ctx_op, commands, func, pc, ctx,
+        );
     }
     exec_other(machine, module, labels, instr, ctx)
 }

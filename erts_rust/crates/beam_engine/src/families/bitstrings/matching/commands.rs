@@ -122,7 +122,8 @@ pub(crate) fn run_commands(
             // `skip Stride` — advance without binding (`i_bs_skip`, which does
             // `sb->start += size`).
             "skip" => {
-                match skip_cmd(machine, ctx, ctx_op, commands, i, term, &mut pos, end)? {
+                let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
+                match skip_cmd(machine, ctx, ctx_op, stride, term, &mut pos, end)? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done | CmdFlow::Relocated => {}
                 }
@@ -153,7 +154,20 @@ pub(crate) fn run_commands(
             }
             // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
             "binary" => {
-                match binary_cmd(machine, module, ctx, commands, i, &mut pos, end, bytes, off, term, ctx_op)? {
+                // The generic route reads the unit operands *before* it looks at the
+                // size, so a malformed unit is refused even for an `all` field; the
+                // width is then resolved here (`all` or a runtime `size`).
+                let size_op = cmd_at(commands, i + 3)?;
+                let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
+                let dst = cmd_at(commands, i + 5)?;
+                let width = if is_all(module, size_op) {
+                    BinaryWidth::All
+                } else {
+                    BinaryWidth::Dynamic { size: size_op, unit }
+                };
+                match binary_cmd(
+                    machine, ctx, width, dst, &mut pos, end, bytes, off, term, ctx_op,
+                )? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
                     // `raw::make_binary` reserves on **every** build.
@@ -165,7 +179,8 @@ pub(crate) fn run_commands(
             // (`i_bs_get_tail`); the position is left unchanged (it is the last
             // command, `bs_translate_fixup`).
             "get_tail" => {
-                match get_tail_cmd(machine, ctx, commands, i, pos, end, bytes, off)? {
+                let dst = cmd_at(commands, i + 3)?;
+                match get_tail_cmd(machine, ctx, dst, pos, end, bytes, off)? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done => {}
                     CmdFlow::Relocated => stale = true,
@@ -180,7 +195,9 @@ pub(crate) fn run_commands(
             // `'=:='` are just the non-alphanumeric-atom notation and are not part
             // of the name).
             "=:=" => {
-                match eq_cmd(machine, ctx, commands, i, &mut pos, end, bytes, off, term, ctx_op)? {
+                let bits = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
+                let want = cmd_at(commands, i + 3)?;
+                match eq_cmd(machine, ctx, bits, want, &mut pos, end, bytes, off, term, ctx_op)? {
                     CmdFlow::Fail => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     CmdFlow::Done | CmdFlow::Relocated => {}
                 }
@@ -204,7 +221,12 @@ pub(crate) fn run_commands(
 /// cold bodies keeps that hot function small enough to stay resident instead of
 /// faulting cold instruction lines in on every call; semantics are unchanged
 /// because each body is still handed the same operands in the same order.
-enum CmdFlow {
+///
+/// Every body takes its operands **already resolved** ([`super::prepared`] resolves
+/// them once per instruction), so the two walks share one implementation of each
+/// command and cannot drift: the only difference between them is *where* the size/unit/
+/// destination operands were read.
+pub(super) enum CmdFlow {
     /// The command completed without allocating through the rooted seam, so the
     /// caller's `(term, bytes, off, end)` capture is still live.
     Done,
@@ -217,19 +239,27 @@ enum CmdFlow {
     Fail,
 }
 
+/// How a `binary` command's field width is determined.
+pub(super) enum BinaryWidth<'a> {
+    /// A resolved `size * unit` — the prepared route, where the C `$BS_SAFE_MUL` has
+    /// already been applied at prepare time.
+    Static(usize),
+    /// The whole remaining window (`binary … all …`).
+    All,
+    /// A runtime `size` operand and the (already read) unit — the generic route.
+    Dynamic { size: &'a Operand, unit: usize },
+}
+
 /// `skip Stride` — advance without binding (`i_bs_skip`, `sb->start += size`).
-#[inline(never)]
-fn skip_cmd(
+pub(super) fn skip_cmd(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     ctx_op: &Operand,
-    commands: &[Operand],
-    i: usize,
+    stride: usize,
     term: Eterm,
     pos: &mut usize,
     end: usize,
 ) -> Result<CmdFlow> {
-    let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
     let Some(next) = (*pos).checked_add(stride) else {
         return Ok(CmdFlow::Fail);
     };
@@ -244,12 +274,11 @@ fn skip_cmd(
 /// `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn binary_cmd(
+pub(super) fn binary_cmd(
     machine: &mut Machine,
-    module: &Module,
     ctx: &mut dyn ExecutionContext,
-    commands: &[Operand],
-    i: usize,
+    width: BinaryWidth<'_>,
+    dst: &Operand,
     pos: &mut usize,
     end: usize,
     bytes: &[u8],
@@ -257,16 +286,15 @@ fn binary_cmd(
     term: Eterm,
     ctx_op: &Operand,
 ) -> Result<CmdFlow> {
-    let size_op = cmd_at(commands, i + 3)?;
-    let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
-    let dst = cmd_at(commands, i + 5)?;
-    let nbits = if is_all(module, size_op) {
-        end.saturating_sub(*pos)
-    } else {
-        let size = read_size(machine, ctx, size_op)?;
-        match size.checked_mul(unit) {
-            Some(nbits) => nbits,
-            None => return Ok(CmdFlow::Fail),
+    let nbits = match width {
+        BinaryWidth::Static(nbits) => nbits,
+        BinaryWidth::All => end.saturating_sub(*pos),
+        BinaryWidth::Dynamic { size, unit } => {
+            let size = read_size(machine, ctx, size)?;
+            match size.checked_mul(unit) {
+                Some(nbits) => nbits,
+                None => return Ok(CmdFlow::Fail),
+            }
         }
     };
     if nbits > end.saturating_sub(*pos) {
@@ -291,17 +319,15 @@ fn binary_cmd(
 ///
 /// The position is left unchanged (it is the last command, `bs_translate_fixup`).
 #[inline(never)]
-fn get_tail_cmd(
+pub(super) fn get_tail_cmd(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
-    commands: &[Operand],
-    i: usize,
+    dst: &Operand,
     pos: usize,
     end: usize,
     bytes: &[u8],
     off: usize,
 ) -> Result<CmdFlow> {
-    let dst = cmd_at(commands, i + 3)?;
     let nbits = end.saturating_sub(pos);
     let out = extract_bits(bytes, pos + off, nbits)?;
     // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit), so the
@@ -315,11 +341,11 @@ fn get_tail_cmd(
 /// `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn eq_cmd(
+pub(super) fn eq_cmd(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
-    commands: &[Operand],
-    i: usize,
+    bits: usize,
+    want_op: &Operand,
     pos: &mut usize,
     end: usize,
     bytes: &[u8],
@@ -327,8 +353,7 @@ fn eq_cmd(
     term: Eterm,
     ctx_op: &Operand,
 ) -> Result<CmdFlow> {
-    let bits = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
-    let want_term = read_operand(machine, ctx, cmd_at(commands, i + 3)?)?;
+    let want_term = read_operand(machine, ctx, want_op)?;
     let Some(want) = small_value(want_term) else {
         return Err(error::unsupported("bs_match '=:=': non-integer value"));
     };
@@ -360,7 +385,7 @@ fn eq_cmd(
 /// `sb->start` first (`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_skip`/
 /// `i_bs_read_bits`) and `bs_match`'s `get_tail` binds the tail into the context's own
 /// register, so a destination binding can make the context operand unreadable.
-fn commit(
+pub(super) fn commit(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
     ctx_op: &Operand,
