@@ -421,9 +421,9 @@ impl Cadence {
 /// every op. Here, after each copy-out, the process's own admission predicate
 /// ([`beam_process::Process::collect_if_needed`] — the OR of the occupancy test and the
 /// collector's `collection_debt`, exactly what the engine's `ensure_heap`/`ensure_heap_full`
-/// doors consult) runs with a payload-sized request, so a nursery the copy-out grew is
-/// **collapsed back to the `233`-word floor** and the next copy-out meets a part-full node again.
-/// That is the measured `copy_bound/ets_copy` regime: one collection per ~3 ops, and the
+/// doors consult) runs with a payload-sized request, so the nursery the loop's own construction
+/// filled is **collected** and the next copy-out meets a destination at the barely-fits boundary
+/// again. That is the measured `copy_bound/ets_copy` regime: one collection per op, and the
 /// destination barely large enough.
 ///
 /// `clear_hint_every_op` zeroes the context's [`RuntimeContext::copy_out_hint`] before each copy,
@@ -451,12 +451,14 @@ fn drive_admission_cadence(clear_hint_every_op: bool, ops: usize) -> Cadence {
     // The 73-word payload is what the next admission must make room for — the same figure the
     // engine's `test_heap` carries into the door.
     const ADMISSION_NEED_WORDS: usize = 73;
-    // The loop's **own** term construction between copies: the `copy_bound` payload is a 5-key
-    // flat map over a 10-cell list, a 3-tuple, a 12-byte binary and a char list — ≈60 flat words,
-    // modelled here as 30 cons cells of `NIL`. This is what makes the loop refill the nursery
-    // between copy-outs, and it is why the real case refuses at all: 3 × 73 words alone still fit
-    // a 233-word nursery, 60 + 73 does twice and not three times.
-    const PAYLOAD_BUILD_CELLS: usize = 40;
+    // The loop's **own** term construction between copies: it fills the destination nursery, which
+    // is what puts the next copy-out at the barely-fits boundary the `copy_bound/ets_copy` case is
+    // measured in — the `Err` arm below is the terminator, and the budget is only a runaway guard.
+    // A fixed build cannot express the regime: the admission cadence leaves the nursery at a
+    // growth/shrink equilibrium (a collection hands back a `~90`-word nursery, each growth request
+    // steps it up by ~1 KiB), so the room the loop has to cover differs from op to op, and a build
+    // sized for one capacity leaves the next copy a destination it fits by a wide margin.
+    const PAYLOAD_BUILD_CELLS: usize = 1 << 16;
     let mut collections = 0usize;
     let mut copies = 0usize;
     {
@@ -519,11 +521,10 @@ fn drive_admission_cadence(clear_hint_every_op: bool, ops: usize) -> Cadence {
         collections,
     }
 }
-
 /// **The copy-out must not refuse against a default-policy process that really collects.**
 ///
 /// This is the `copy_bound/ets_copy` regression pin that the synthetic no-collect loops above
-/// cannot make: with the nursery collapsed to its `233`-word floor between copies and a 73-word
+/// cannot make: with the loop's own construction filling the nursery between copies and a 73-word
 /// result to re-home, the destination is under the result's size often enough that the pre-hint
 /// copy-out refused on ≈1 of every 3 ops (measured: 0.332 refusals/op over 250 000 ops). Every
 /// refusal pays the copier's whole sizing path (`try_copy_fast` → `preflight_words` → the bounded
@@ -537,8 +538,9 @@ fn drive_admission_cadence(clear_hint_every_op: bool, ops: usize) -> Cadence {
 /// back to ≈1 in 3 and fails here.
 #[test]
 fn a_collecting_default_process_copies_every_result_without_refusing() {
-    /// Long enough for ~100 modelled collections, short enough to stay a unit test.
-    const OPS: usize = 300;
+    /// The cadence collects on every op, so this many copy-outs are this many modelled
+    /// collections — enough for the refusal *rate* to mean something, and still a unit test.
+    const OPS: usize = 1200;
 
     notes::reset();
     let cadence = drive_admission_cadence(false, OPS);
@@ -572,16 +574,17 @@ fn a_collecting_default_process_copies_every_result_without_refusing() {
 /// **The hint is what keeps the refusal rate down — the control for the pin above.**
 ///
 /// The same cadence with [`RuntimeContext::copy_out_hint`] zeroed before every copy (i.e. the
-/// pre-hint behaviour) must refuse on a large fraction of the ops: the nursery is back at its
-/// `233`-word floor after each collection and the 73-word result meets a destination that is
-/// often too small. That is what the measured `0.332` refusals/op looked like, and asserting it
-/// here means the pin above cannot be satisfied by anything other than the hint: if the gate ever
-/// stops being the mechanism (e.g. the growth policy alone starts sizing the nursery large enough
-/// to survive the collection), this control fails and the claim is re-examined.
+/// pre-hint behaviour) must refuse on a large fraction of the ops: each collection hands the
+/// nursery back at the collector's own retained size and the 73-word result then meets a
+/// destination that is often too small. That is what the measured `0.332` refusals/op looked
+/// like, and asserting it here means the pin above cannot be satisfied by anything other than the
+/// hint: if the gate ever stops being the mechanism (e.g. the growth policy alone starts sizing
+/// the nursery large enough to survive the collection), this control fails and the claim is
+/// re-examined.
 #[test]
 fn without_the_learned_hint_the_same_cadence_refuses_again() {
     /// Same cadence as the pin above, so the two are directly comparable.
-    const OPS: usize = 300;
+    const OPS: usize = 1200;
 
     notes::reset();
     let cadence = drive_admission_cadence(true, OPS);
