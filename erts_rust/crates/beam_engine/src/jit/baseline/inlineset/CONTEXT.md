@@ -47,13 +47,17 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
   **exactly once** per execution with the instruction's own `heap_need`/`live`. Everything else is the `_`
   arm; `FuncInfo` is deliberately there (it must deopt so a failed head clause raises `function_clause`)
   and `CallExt*` crosses modules via a driver round-trip by design.
-- **The whole family-owned surface is one arm.** `emit_block` names every variant `crate::families::dispatch`
-  claims and the core arms above do not, and routes each to `emit/family.rs::emit_family` →
-  `family.rs::jit_family`, which runs the identical `crate::families::dispatch` call the interpreter's
-  per-instruction step runs — so the lowering is interpreter-identical by construction and can never produce
-  a different result. The emitted sequence is the shared helper contract (spill, call, continuation check),
-  so the family arm is exactly as cheap as the receive arm, and every un-lowered instruction keeps its
-  per-instruction deopt.
+- **The family-owned surface is one arm, except the bitstring family.** `emit_block` names every variant
+  `crate::families::dispatch` claims and the core arms above do not, and routes each to
+  `emit/family.rs::emit_family` → `family.rs::jit_family`, which runs the identical
+  `crate::families::dispatch` call the interpreter's per-instruction step runs — so the lowering is
+  interpreter-identical by construction and can never produce a different result. The emitted sequence is
+  the shared helper contract (spill, call, continuation check), so the family arm is exactly as cheap as
+  the receive arm, and every un-lowered instruction keeps its per-instruction deopt.
+  The bitstring family is the exception: `bitstrings::claimed` routes its variants to
+  `bitstr.rs::jit_bitstr` (a direct `families::bitstrings::exec` call, bypassing the router's variant
+  re-match) instead, and eight `Bs*` shapes get their own native in-block arms from
+  `../emit/bitstr_inline/` — the `## Bitstring matching` section below is their authoritative record.
 - **Comparison-`test` lowering (in-block, no interpreter step).** The `Test` arm's `emit/test.rs::try_inline_test` falls through to `emit_test_helper` for a comparison the inline word/header subset declines, emitting a call to the `test_helper.rs::jit_test(rt, func, pc)` helper instead of a `jit_step_one` round trip: the six comparison kinds (`is_eq_exact`/`is_ne_exact`/`is_eq`/`is_ne`/`is_lt`/`is_ge`) at exactly two operands with a resolvable non-`NO_FAIL` fail label, whatever the operand kinds (a Y slot, a float register, a literal-area pointer, an immediate, an in-bound x-register, boxed-vs-boxed) — because a comparison must route through `beam_term`'s own `cmp`/`cmp_arith` (a boxed pointer is never word-compared; `is_eq_exact` is exact equality while `is_eq`/`is_ne`/`is_lt`/`is_ge` are the arithmetic comparison). The helper answers `TEST_TRUE`/`TEST_FALSE`; the block refills its cached x-registers and continues in-block on `TEST_TRUE`, branches to the instruction's resolved fail label on `TEST_FALSE`, and leaves any other word (the `ERROR` of a propagating read error) for the driver. A `NO_FAIL` `test` (which raises `function_clause`), an unresolved fail label, a non-comparison kind and an operand count other than two are deliberately not this lowering's and keep `jit_step_one` (the interpreter's own step).
 - **Named-BIF lowering (`emit/bif.rs`, in-block, no interpreter step).** The `Instr::Bif` and `Instr::GcBif`
   arms try `emit/bif.rs::try_inline_bif` after the arithmetic and comparison shapes. Its predicates
