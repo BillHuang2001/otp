@@ -54,8 +54,9 @@
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand, NO_FAIL};
 use beam_term::{
-    Eterm, BITSTRING_TAG_MASK, HEADER_BIN_REF, HEADER_SUB_BITS, HEAP_BITS_SUBTAG, MAX_SMALL,
-    TAG_IMMED1_MASK, TAG_IMMED1_SMALL, TAG_PRIMARY_BOXED, TAG_PRIMARY_MASK, TAG_PTR_MASK,
+    Eterm, BITSTRING_TAG_MASK, ERL_SUB_BITS_FLAG_MASK, HEADER_BIN_REF, HEADER_SUB_BITS,
+    HEAP_BITS_SUBTAG, MAX_SMALL, TAG_IMMED1_MASK, TAG_IMMED1_SMALL, TAG_LITERAL_PTR,
+    TAG_PRIMARY_BOXED, TAG_PRIMARY_MASK, TAG_PTR_MASK,
 };
 
 use crate::interpreter::LabelMap;
@@ -90,6 +91,42 @@ const SUB_BITS_END_DISP: i32 = (3 * core::mem::size_of::<Eterm>()) as i32;
 /// the context was created over (`erts/emulator/beam/erl_bits.h:60-82`).
 const SUB_BITS_ORIG_DISP: i32 = (4 * core::mem::size_of::<Eterm>()) as i32;
 
+/// The byte offset of an `ErlSubBits`'s `base_flags` word (word index 1) — the low
+/// [`ERL_SUB_BITS_FLAG_MASK`] bits are flags and the rest is the subject's byte base
+/// pointer (`erl_sub_bits_get_base`, `erts/emulator/beam/erl_bits.h:124-125`).
+const SUB_BITS_BASE_DISP: i32 = (core::mem::size_of::<Eterm>()) as i32;
+
+/// `!ERL_SUB_BITS_FLAG_MASK` — the mask an `ErlSubBits::base_flags` word needs before it
+/// is usable as a pointer (`beam_term::bitstring::ERL_SUB_BITS_FLAG_MASK`).
+const SUB_BITS_BASE_MASK: i64 = !(ERL_SUB_BITS_FLAG_MASK as i64);
+
+/// The byte offset of an `ErlHeapBits`'s bit-`size` word (word index 1): the layout is
+/// `[thing_word, size_in_bits, data…]` (`erts/emulator/beam/erl_bits.h:150-164`).
+const HEAP_BITS_SIZE_DISP: i32 = (core::mem::size_of::<Eterm>()) as i32;
+
+/// The byte offset of an `ErlHeapBits`'s first data byte (word index
+/// `ERL_HEAP_BITS_SIZE` = 2) — `beam_term::bitstring_parts`' `p.add(ERL_HEAP_BITS_SIZE)`.
+const HEAP_BITS_DATA_DISP: i32 = (2 * core::mem::size_of::<Eterm>()) as i32;
+
+/// `TAG_LITERAL_PTR` — the literal-area marker ORed into a `BOXED` word's pointer tag.
+/// A subject term carrying it points into a module's **literal area**, which this tier
+/// deliberately leaves to the family (see [`try_inline_bs_get_integer2`]).
+const LITERAL_PTR_BIT: i64 = TAG_LITERAL_PTR as i64;
+
+/// `BSF_LITTLE` (`erts/emulator/beam/erl_bits.h:462`): the field is little-endian.
+///
+/// Re-declared here because the family's copy is `pub(super)` inside the private
+/// `families::bitstrings` subtree — a **derivation** of the frozen C constants, not a
+/// second policy: the values are pinned against the family's by
+/// `super::bitstr_inline::tests::the_flag_bits_match_the_familys_own_constants`.
+const BSF_LITTLE: u32 = 2;
+/// `BSF_SIGNED` (`erts/emulator/beam/erl_bits.h:463`): the field is signed (see
+/// [`BSF_LITTLE`] for why the value is re-declared).
+const BSF_SIGNED: u32 = 4;
+/// `BSF_NATIVE` (`erts/emulator/beam/erl_bits.h:465`): the field is in native
+/// endianness, which on this target means little-endian (see [`BSF_LITTLE`]).
+const BSF_NATIVE: u32 = 16;
+
 /// `_BITSTRING_TAG_MASK` — the header mask `beam_term::boxed::is_bitstring_header` tests,
 /// which both bitstring headers (`HEAP_BITS_SUBTAG`/`SUB_BITS_SUBTAG`) share.
 const BITSTRING_TAG_MASK_WORD: i64 = BITSTRING_TAG_MASK as i64;
@@ -113,7 +150,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 6;
+pub(crate) const SHAPE_COUNT: usize = 7;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -132,6 +169,9 @@ pub(crate) const SHAPE_START_MATCH3: usize = 4;
 /// The `bs_start_match4` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_START_MATCH4: usize = 5;
+/// The `bs_get_integer2` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_GET_INTEGER2: usize = 6;
 
 #[cfg(test)]
 thread_local! {
@@ -148,12 +188,7 @@ thread_local! {
 /// the emitter's decision — which is exactly what "the inline arm ran" means for a
 /// guard-only lowering. Pair it with a zero `deopts_by_variant` count for the same
 /// variant to prove the whole instruction stayed native.
-///
-/// No caller in the tree yet: the per-shape pins that consume it are the emitter
-/// suite's, which is a separate round — [`record_inlined`] already charges every
-/// emission, so the counter is live and this is its reader.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn inlined(shape: usize) -> u64 {
     INLINED.with(|counts| counts[shape].get())
 }
@@ -1186,5 +1221,490 @@ pub(crate) fn try_inline_bs_start_match4(
         pc,
         highest_touched,
     )?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// The shared bit-extraction emitter
+// ---------------------------------------------------------------------------
+
+/// Emit the extraction of a big-endian bit field of `nbits` bits at `bit_pos` into
+/// `scratch`, or jump to `fallback` when the field's shape is not one this sequence can
+/// read without leaving the subject's own bytes.
+///
+/// `base` holds the subject's byte base pointer, `bit_pos` the absolute bit position of
+/// the field's first bit **within that byte view**, `num_bytes` the number of readable
+/// bytes from `base` (the subject's own `ceil((off + size) / 8)` figure) and `nbits` the
+/// field width, a compile-time constant. Bit `i` of the view is bit
+/// `i % 8` (MSB first) of `base[i / 8]`, exactly as
+/// [`raw::subject_bytes`](crate::families::bitstrings::raw::subject_bytes) hands the
+/// interpreter's readers a `(bytes, off)` pair.
+///
+/// Two forms, chosen at run time from `bit_pos % 8`:
+///
+/// ```text
+///   test bit_pos, 7 ; jne granular        ; only when nbits is 8/16/32
+///   ; the byte-aligned form: ONE 1/2/4-byte load, no shift, no mask
+///   mov  rdi, bit_pos ; shr rdi, 3        ; j = bit_pos / 8
+///   lea  rcx, [rdi + W]                   ; the read's exclusive byte bound
+///   cmp  rcx, num_bytes ; ja fallback     ; j + W <= num_bytes, checked FIRST
+///   add  rdi, base
+///   movzx / movzx_word / mov_rm32  scratch, [rdi]
+///   jmp  done
+/// granular:
+///   mov  rdi, bit_pos ; and rdi, 7        ; rem = bit_pos % 8
+///   cmp  rdi, 16 - nbits ; ja fallback    ; rem + nbits <= 16
+///   mov  rcx, 16 - nbits ; sub rcx, rdi   ; the shift count 16 - rem - nbits
+///   mov  rdi, bit_pos ; shr rdi, 3        ; j
+///   lea  <tmp>, [rdi + 2]                 ; the two-byte window's exclusive bound
+///   cmp  <tmp>, num_bytes ; ja fallback   ; j + 2 <= num_bytes, checked FIRST
+///   add  rdi, base
+///   movzx_word  scratch, [rdi]            ; the 16-bit window holding the field
+///   shr  scratch, cl                      ; drop the low 16 - rem - nbits
+///   and  scratch, (1 << nbits) - 1        ; keep exactly nbits   (nbits < 16 only)
+/// done:
+/// ```
+///
+/// The **over-read guard is always emitted before the load**, so the sequence never reads
+/// a byte outside the subject's own buffer, and a field that would need one is the
+/// `fallback` interpreter step rather than a fabricated value. The `fallback` labels are
+/// the caller's, so its shared interpreter step is the single place the family's typed
+/// error comes from.
+///
+/// A width no form covers (`nbits > 16` that is not 8/16/32, or a 16/32-bit field seen
+/// off an 8-bit boundary) is an unconditional jump to `fallback` — a run-time rejection,
+/// never a wrong value; the caller's shape predicate refuses those widths at **compile**
+/// time anyway, so the emitted jump is only reachable through a caller that skipped it.
+///
+/// # Register contract
+///
+/// `base`, `bit_pos` and `num_bytes` are **read only** (the sequence works in
+/// [`Reg::Rcx`] and [`Reg::Rdi`]), `scratch` receives the value and may be used as one
+/// more work register before it does, and `scratch` must not be `base`, `bit_pos`,
+/// `num_bytes`, [`Reg::Rcx`] or [`Reg::Rdi`]. `cl` carries the granular form's shift
+/// count, exactly as [`CodeBuffer::shr_cl`] requires.
+pub(crate) fn emit_bit_extract(
+    buffer: &mut CodeBuffer,
+    base: Reg,
+    bit_pos: Reg,
+    nbits: usize,
+    num_bytes: Reg,
+    scratch: Reg,
+    fallback: CodeLabel,
+) -> Result<()> {
+    /// The one byte-aligned load width, in bytes, the aligned form implements.
+    fn aligned_width(nbits: usize) -> Option<i32> {
+        match nbits {
+            8 => Some(1),
+            16 => Some(2),
+            32 => Some(4),
+            _ => None,
+        }
+    }
+
+    // The compile-time shift/limit magnitudes. `nbits <= 16` is the granular form's
+    // precondition and `nbits <= 32` bounds every mask the aligned form's clears need.
+    if nbits > 32 {
+        // No form covers a wider field: an unconditional rejection (the caller's shape
+        // predicate already refuses it at compile time).
+        return buffer.jmp(fallback);
+    }
+
+    // The form choice's two labels. Both are always bound (a buffer with an unbound label
+    // cannot be sealed), even on the paths that never jump to one of them.
+    let granular: CodeLabel = buffer.label();
+    let done: CodeLabel = buffer.label();
+
+    if let Some(width) = aligned_width(nbits) {
+        // `bit_pos % 8 == 0` -> the byte-aligned form; otherwise the granular one.
+        buffer.mov_ri(Reg::Rcx, 7)?;
+        buffer.test_rr(bit_pos, Reg::Rcx)?;
+        buffer.jcc(Cond::Ne, granular)?;
+
+        // `j = bit_pos / 8`; the over-read guard `j + W <= num_bytes` comes FIRST.
+        buffer.mov_rr(Reg::Rdi, bit_pos)?;
+        buffer.shr_ri(Reg::Rdi, 3)?;
+        buffer.lea(Reg::Rcx, Reg::Rdi, width)?;
+        buffer.cmp_rr(Reg::Rcx, num_bytes)?;
+        buffer.jcc(Cond::A, fallback)?;
+        buffer.add_rr(Reg::Rdi, base)?;
+        match width {
+            1 => buffer.movzx_byte(scratch, Reg::Rdi, 0)?,
+            2 => buffer.movzx_word(scratch, Reg::Rdi, 0)?,
+            _ => buffer.mov_rm32(scratch, Reg::Rdi, 0)?,
+        }
+        buffer.jmp(done)?;
+    }
+
+    // The granular form: a 16-bit window load plus a variable shift. It covers
+    // `bit_pos % 8 + nbits <= 16`, so a 16- or 32-bit field reaching this label can never
+    // satisfy it (its `rem` is non-zero here, and `16 - nbits <= 0`), which is why such a
+    // width is a plain rejection instead.
+    buffer.bind(granular)?;
+    if nbits >= 16 {
+        buffer.jmp(fallback)?;
+    } else {
+        // `rem = bit_pos % 8`.
+        buffer.mov_rr(Reg::Rdi, bit_pos)?;
+        buffer.mov_ri(Reg::Rcx, 7)?;
+        buffer.and_rr(Reg::Rdi, Reg::Rcx)?;
+        // `rem + nbits <= 16`, i.e. `rem <= 16 - nbits`.
+        buffer.mov_ri(Reg::Rcx, (16 - nbits) as i64)?;
+        buffer.cmp_rr(Reg::Rdi, Reg::Rcx)?;
+        buffer.jcc(Cond::A, fallback)?;
+        // The shift count `16 - rem - nbits` into `cl`.
+        buffer.sub_rr(Reg::Rcx, Reg::Rdi)?;
+        // `j = bit_pos / 8`; the over-read guard `j + 2 <= num_bytes` comes FIRST.
+        buffer.mov_rr(Reg::Rdi, bit_pos)?;
+        buffer.shr_ri(Reg::Rdi, 3)?;
+        buffer.lea(scratch, Reg::Rdi, 2)?;
+        buffer.cmp_rr(scratch, num_bytes)?;
+        buffer.jcc(Cond::A, fallback)?;
+        buffer.add_rr(Reg::Rdi, base)?;
+        buffer.movzx_word(scratch, Reg::Rdi, 0)?;
+        buffer.shr_cl(scratch)?;
+        // Keep exactly `nbits` bits. A 16-bit window already bounds the field, so the mask
+        // is only needed below that (`nbits == 0` masks everything away, which is exactly
+        // the zero-bit field's value).
+        let mask = ((1u64 << nbits) - 1) as i64;
+        buffer.mov_ri(Reg::Rcx, mask)?;
+        buffer.and_rr(scratch, Reg::Rcx)?;
+    }
+    // The granular form (and, when no aligned form exists, the whole sequence) falls
+    // through to `done`.
+    buffer.bind(done)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shape 7: `bs_get_integer2 { fail, ctx, live, size, unit, flags, dst }`
+// ---------------------------------------------------------------------------
+
+/// The operands of a `bs_get_integer2` the tier lowers natively.
+#[derive(Clone, Copy)]
+pub(crate) struct GetInteger2Shape {
+    /// The match-context operand's location.
+    ctx: Loc,
+    /// The destination the extracted integer is written to.
+    dst: Loc,
+    /// `size * unit`, the compile-time field width in bits.
+    nbits: usize,
+}
+
+impl GetInteger2Shape {
+    /// The [`GetInteger2Shape`] the four operands name, or `None` when the whole
+    /// instruction must stay on the family.
+    ///
+    /// Purely syntactic and **label-free** — the fail-label resolution is the caller's —
+    /// so the block's Y gate ([`super::arith::uses_y`]) derives the same answer as the
+    /// emitter without needing the label map. The compile-time conditions are:
+    ///
+    /// * `ctx` and `dst` are an in-bound x-register or an addressable `Y` slot;
+    /// * `size` is a **constant** non-negative small integer — `Operand::Integer` in
+    ///   `0..=MAX_SMALL` or `Operand::Character`, exactly `read_size`'s accept rule — so
+    ///   the field width is known at emit time (a runtime `size` is a register compare the
+    ///   emitted sequence would not have);
+    /// * `nbits = size * unit` does not overflow and is at most `59` (so the extracted
+    ///   value is always `<= MAX_SMALL` and the result is a bare `make_small`, with no
+    ///   allocation) **and** is one of the widths [`emit_bit_extract`] covers —
+    ///   `nbits <= 16` or `nbits == 32`;
+    /// * `flags` asks for neither `signed` nor little/native endianness: a signed field
+    ///   needs a sign extension and a little-endian one a byte-swapping read, and both are
+    ///   the family's `erts_bs_get_integer_2` general path.
+    ///
+    /// `flags`' remaining bits (`BSF_ALIGNED`, `BSF_EXACT`) do not change the value this
+    /// family's reader produces — `read_integer_field` branches on `signed`/`little` only
+    /// — so they are ignored here exactly as the family ignores them.
+    pub(crate) fn of(
+        ctx: &Operand,
+        size: &Operand,
+        unit: u32,
+        flags: u32,
+        dst: &Operand,
+    ) -> Option<GetInteger2Shape> {
+        let size = match size {
+            Operand::Integer(n) if (0..=MAX_SMALL).contains(n) => *n as usize,
+            Operand::Character(c) => *c as usize,
+            _ => return None,
+        };
+        let nbits = size.checked_mul(unit as usize)?;
+        if nbits > MAX_SMALL as usize || !(nbits <= 16 || nbits == 32) {
+            return None;
+        }
+        if flags & BSF_SIGNED != 0 || field_is_little(flags) {
+            return None;
+        }
+        Some(GetInteger2Shape {
+            ctx: Loc::of(ctx)?,
+            dst: Loc::of(dst)?,
+            nbits,
+        })
+    }
+
+    /// The x-register indices the shape touches — the context and the destination.
+    pub(crate) fn registers(&self) -> Vec<u32> {
+        let mut registers = Vec::with_capacity(2);
+        registers.extend(self.ctx.register());
+        registers.extend(self.dst.register());
+        registers
+    }
+
+    /// The x-register indices the shape **writes** — the destination only. Charging it is
+    /// **mandatory**: the extracted integer lands in `Dst`'s cache register, so a block
+    /// that did not charge it would let a stale cache register survive a block exit — a
+    /// wrong value, not a redundant store. (The context's `start` word is a heap store,
+    /// not an x-register write.)
+    pub(crate) fn writes(&self) -> Vec<u32> {
+        self.dst.register().into_iter().collect()
+    }
+
+    /// The x-register indices the shape **reads through the block register cache** — the
+    /// context only.
+    pub(crate) fn reads(&self) -> Vec<u32> {
+        self.ctx.register().into_iter().collect()
+    }
+
+    /// Whether the lowering reads the current frame's Y window.
+    pub(crate) fn uses_y(&self) -> bool {
+        self.ctx.is_y() || self.dst.is_y()
+    }
+}
+
+/// Whether `flags` asks for **little-endian** byte order.
+///
+/// The family's `field_is_little`
+/// (`families::bitstrings::matching::reads::field_is_little`), re-derived: `BSF_LITTLE`
+/// directly, or `BSF_NATIVE` on a little-endian target (the C loader collapses `native`
+/// to the target's own order, `erts/emulator/beam/emu/generators.tab:43-55`).
+fn field_is_little(flags: u32) -> bool {
+    flags & BSF_LITTLE != 0 || (flags & BSF_NATIVE != 0 && cfg!(target_endian = "little"))
+}
+
+/// The inlinable shape of a `bs_get_integer2`, or `None` when the whole instruction must
+/// stay on the family.
+///
+/// A `NO_FAIL` fail code *raises* on a short subject, and by then the destination is
+/// unread — the raise is the family's `fail_step`, which is an interpreter step anyway
+/// ([`MatchFail::Family`]'s reasoning); only a real label is inlined, and it must resolve
+/// in the module's map because the fail transfer needs its `(function, code)` target. An
+/// unresolved label keeps the family's exact `unknown_label`.
+pub(crate) fn get_integer2_shape(
+    labels: &LabelMap,
+    fail: Label,
+    ctx: &Operand,
+    size: &Operand,
+    unit: u32,
+    flags: u32,
+    dst: &Operand,
+) -> Option<(GetInteger2Shape, (u32, u32))> {
+    let shape = GetInteger2Shape::of(ctx, size, unit, flags, dst)?;
+    if fail == NO_FAIL {
+        return None;
+    }
+    let target = labels.resolve(fail).ok()?;
+    Some((shape, target))
+}
+
+/// Emit `bs_get_integer2 Fail Ctx Live Size Unit Flags Dst` natively, or report that the
+/// block must helper it (see [`try_inline_bs_get_position`] for the return convention).
+///
+/// The guarded sequence, in this order:
+///
+/// ```text
+///   <Dst's Y-window guard>              ; before any store, so a rejection writes nothing
+///   <the match-context guard>           ; not a context -> fallback; r11 = the block base
+///   mov  rsi, [ctx + 16]                ; start
+///   mov  rax, [ctx + 24]                ; end
+///   rcx = end.saturating_sub(start)
+///   cmp  rcx, nbits ; jb fail_arm       ; end - start < nbits -> the FAIL label
+///   mov  rdx, [ctx + 32]                ; orig
+///   test rdx, 1 ; jne fallback          ;    not boxed
+///   test rdx, TAG_LITERAL_PTR ; jne fallback   ; a literal-area subject
+///   and  rdx, !TAG_PTR_MASK ; mov rdi, [rdx]   ; the subject's header
+///   cmp  rdi, HEADER_SUB_BITS ; je refc_arm
+///   (rdi & _BITSTRING_TAG_MASK) == HEAP_BITS_SUBTAG ?  on-heap : fallback
+/// on-heap:  r10 = rdx + 16 ; rax = [rdx + 8] ; rcx = 0
+/// refc_arm: the orig must be a BinRef, else fallback
+///           r10 = ([ctx + 8] & !ERL_SUB_BITS_FLAG_MASK) + (start / 8)
+///           rax = [ctx + 24] - start   (end < start -> fallback)
+///           rcx = start & 7
+///   rax = (rcx + rax + 7) >> 3          ; num_bytes
+///   rdx = start + rcx                   ; bit_pos
+///   <emit_bit_extract: the guarded load + shift/mask, or fallback>
+///   mov  [ctx + 16], start + nbits      ; the commit, BEFORE `Dst`
+///   r8 = (r8 << 4) | TAG_IMMED1_SMALL   ; make_small, zero allocation
+///   mov  <Dst>, r8
+///   jmp  fast_done
+/// fail_arm:
+///   <the linker's exit to the fail label>     ; a terminator on that path only
+/// fallback:
+///   <one interpreter step>              ; the family's own typed error
+/// ```
+///
+/// Two invariants hold by construction. **Nothing allocates** — the field is at most 32
+/// bits and always fits `MAX_SMALL` — so no moving collection can run part-way through,
+/// which is why the context operand is read exactly once and its block address reused. And
+/// the **commit precedes the destination write**: `beam_asm:filter_essentials/1` compiles
+/// `ctx == dst == x(3)`, so the family writes the context's `start` word before it binds
+/// `Dst`, and this sequence does the same.
+///
+/// The subject forms lowered natively are exactly `raw::heap_bits`' two readable ones: an
+/// on-heap `ErlHeapBits` and a refc-binary `ErlSubBits` window. A **match context**
+/// (an `ErlSubBits` whose `orig` is not a `BinRef`), a bare `BinRef`, a literal-area
+/// subject and every non-bitstring take `fallback`, i.e. the family's own typed error —
+/// never a fabricated value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_inline_bs_get_integer2(
+    buffer: &mut CodeBuffer,
+    labels: &LabelMap,
+    linker: &Linker<'_>,
+    fail: Label,
+    ctx: &Operand,
+    size: &Operand,
+    unit: u32,
+    flags: u32,
+    dst: &Operand,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some((shape, target)) = get_integer2_shape(labels, fail, ctx, size, unit, flags, dst)
+    else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    record_inlined(SHAPE_GET_INTEGER2);
+
+    let fallback: CodeLabel = buffer.label();
+    let fail_arm: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+    let sat: CodeLabel = buffer.label();
+    let refc_arm: CodeLabel = buffer.label();
+    let tail: CodeLabel = buffer.label();
+
+    // The destination's frame-window guard first: a rejection must leave nothing written.
+    shape
+        .dst
+        .guard_store(buffer, Y_ADDR_SCRATCH, MOVE_SCRATCH_2, fallback)?;
+    emit_ctx_guard(buffer, shape.ctx, allocation, fallback, highest_touched)?;
+
+    // `remaining = end.saturating_sub(start)`; a field wider than what is left is the
+    // FAIL label (the family's `fail_step`), never a raise and never a fallback.
+    buffer.mov_rm(Reg::Rsi, MOVE_SCRATCH, SUB_BITS_START_DISP)?;
+    buffer.mov_rm(Reg::Rax, MOVE_SCRATCH, SUB_BITS_END_DISP)?;
+    buffer.xor_rr(Reg::Rcx, Reg::Rcx)?;
+    buffer.cmp_rr(Reg::Rax, Reg::Rsi)?;
+    buffer.jcc(Cond::B, sat)?;
+    buffer.mov_rr(Reg::Rcx, Reg::Rax)?;
+    buffer.sub_rr(Reg::Rcx, Reg::Rsi)?;
+    buffer.bind(sat)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, shape.nbits as i64)?;
+    buffer.cmp_rr(Reg::Rcx, MOVE_SCRATCH_2)?;
+    buffer.jcc(Cond::B, fail_arm)?;
+
+    // Classify the inner subject (`orig`, word 4) exactly as `raw::heap_bits` does.
+    buffer.mov_rm(Reg::Rdx, MOVE_SCRATCH, SUB_BITS_ORIG_DISP)?;
+    buffer.mov_ri(Reg::Rax, NOT_BOXED_MASK)?;
+    buffer.test_rr(Reg::Rdx, Reg::Rax)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+    // A literal-area subject: the tier leaves it to the family (a documented choice, not a
+    // gap — the words are read-only and the family reads them the same way, but a literal
+    // subject never needs the copy-avoidance this sequence buys).
+    buffer.mov_ri(Reg::Rax, LITERAL_PTR_BIT)?;
+    buffer.test_rr(Reg::Rdx, Reg::Rax)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+    // `boxed_val(orig)`, then its header word.
+    buffer.mov_ri(Reg::Rax, POINTER_MASK)?;
+    buffer.and_rr(Reg::Rdx, Reg::Rax)?;
+    buffer.mov_rm(Reg::Rdi, Reg::Rdx, HEADER_DISP)?;
+    buffer.mov_ri(Reg::Rax, SUB_BITS_HEADER)?;
+    buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
+    buffer.jcc(Cond::E, refc_arm)?;
+    // Not an `ErlSubBits`: only an on-heap `ErlHeapBits` is a readable subject (a bare
+    // `BinRef`, a tuple, an atom, … is the family's typed error).
+    buffer.mov_ri(Reg::Rax, BITSTRING_TAG_MASK_WORD)?;
+    buffer.and_rr(Reg::Rdi, Reg::Rax)?;
+    buffer.mov_ri(Reg::Rax, HEAP_BITS_SUBTAG_WORD)?;
+    buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+    // The on-heap arm: base = the data region (word 2), size = the `size` word, off = 0.
+    buffer.lea(MOVE_SCRATCH_2, Reg::Rdx, HEAP_BITS_DATA_DISP)?;
+    buffer.mov_rm(Reg::Rax, Reg::Rdx, HEAP_BITS_SIZE_DISP)?;
+    buffer.xor_rr(Reg::Rcx, Reg::Rcx)?;
+    buffer.jmp(tail)?;
+
+    // The refc-window arm (`raw::heap_bits`' `ErlSubBits` + `BinRef` case): the `orig` must
+    // really be a `BinRef`, and the window is the context's own `base_flags`/`start`/`end`.
+    buffer.bind(refc_arm)?;
+    buffer.mov_rm(Reg::Rdi, Reg::Rdx, HEADER_DISP)?;
+    buffer.mov_ri(Reg::Rax, BIN_REF_HEADER)?;
+    buffer.cmp_rr(Reg::Rdi, Reg::Rax)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+    buffer.mov_rm(Reg::Rax, MOVE_SCRATCH, SUB_BITS_BASE_DISP)?;
+    buffer.mov_ri(Reg::Rdi, SUB_BITS_BASE_MASK)?;
+    buffer.and_rr(Reg::Rax, Reg::Rdi)?;
+    // `base + start / 8` — the byte holding the window's first bit.
+    buffer.mov_rr(MOVE_SCRATCH_2, Reg::Rsi)?;
+    buffer.shr_ri(MOVE_SCRATCH_2, 3)?;
+    buffer.add_rr(MOVE_SCRATCH_2, Reg::Rax)?;
+    // `size = end - start`, with `end < start` refused rather than wrapped (`saturating_sub`
+    // would make such a window empty, and an empty window can never hold the field).
+    buffer.mov_rm(Reg::Rax, MOVE_SCRATCH, SUB_BITS_END_DISP)?;
+    buffer.cmp_rr(Reg::Rax, Reg::Rsi)?;
+    buffer.jcc(Cond::B, fallback)?;
+    buffer.sub_rr(Reg::Rax, Reg::Rsi)?;
+    // `off = start & 7`.
+    buffer.mov_rr(Reg::Rcx, Reg::Rsi)?;
+    buffer.mov_ri(Reg::Rdi, 7)?;
+    buffer.and_rr(Reg::Rcx, Reg::Rdi)?;
+
+    // `num_bytes = (off + size + 7) >> 3` and `bit_pos = start + off` — the interpreter's
+    // own two figures (`raw::subject_bytes` and `start + off`), then the shared extractor.
+    buffer.bind(tail)?;
+    buffer.add_rr(Reg::Rax, Reg::Rcx)?;
+    buffer.mov_ri(Reg::Rdi, 7)?;
+    buffer.add_rr(Reg::Rax, Reg::Rdi)?;
+    buffer.shr_ri(Reg::Rax, 3)?;
+    buffer.mov_rr(Reg::Rdx, Reg::Rsi)?;
+    buffer.add_rr(Reg::Rdx, Reg::Rcx)?;
+    emit_bit_extract(
+        buffer,
+        MOVE_SCRATCH_2,
+        Reg::Rdx,
+        shape.nbits,
+        Reg::Rax,
+        Reg::R8,
+        fallback,
+    )?;
+
+    // The commit **before** the destination write (`ctx` may alias `dst`).
+    buffer.mov_ri(Reg::Rcx, shape.nbits as i64)?;
+    buffer.add_rr(Reg::Rsi, Reg::Rcx)?;
+    buffer.mov_mr(MOVE_SCRATCH, SUB_BITS_START_DISP, Reg::Rsi)?;
+    // `make_small(raw)` — `(raw << 4) | TAG_IMMED1_SMALL`, zero allocation.
+    buffer.shl_ri(Reg::R8, 4)?;
+    buffer.mov_ri(Reg::Rcx, SMALL_TAG)?;
+    buffer.or_rr(Reg::R8, Reg::Rcx)?;
+    shape
+        .dst
+        .store_at(buffer, Y_ADDR_SCRATCH, Reg::R8, allocation, highest_touched)?;
+    buffer.jmp(fast_done)?;
+
+    buffer.bind(fail_arm)?;
+    linker.emit_exit(
+        buffer,
+        allocation,
+        done,
+        target.0,
+        target.1,
+        pc,
+        ExitSpill::Required,
+    )?;
+
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
     Ok(true)
 }

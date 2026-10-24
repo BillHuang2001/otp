@@ -1002,6 +1002,35 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // The same family's first **field-extracting** shape: a constant-width,
+            // big-endian, unsigned integer segment of at most 32 bits, read out of either
+            // readable subject form (`raw::heap_bits`' on-heap `ErlHeapBits` and its
+            // refc-binary `ErlSubBits` window) by the shared bit-extraction emitter
+            // [`bitstr_inline::emit_bit_extract`]. Unlike the context-only shapes above it
+            // **writes** an x-register (`Dst`), which is why
+            // [`super::regalloc::cacheable_writes`] charges it; the context's `start` word
+            // is committed before the destination store, so the `ctx == dst == x(3)` shape
+            // `beam_asm:filter_essentials/1` compiles stays correct.
+            Instr::BsGetInteger2(b) => {
+                if !bitstr_inline::try_inline_bs_get_integer2(
+                    buffer,
+                    labels,
+                    &linker,
+                    b.fail,
+                    &b.ctx,
+                    &b.size,
+                    b.unit,
+                    b.flags,
+                    &b.dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

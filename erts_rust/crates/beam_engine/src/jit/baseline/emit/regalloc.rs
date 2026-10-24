@@ -101,8 +101,8 @@ use super::aggregate::{
 use super::arith::{fast_arith, uses_y};
 use super::bif::bif_shape;
 use super::bitstr_inline::{
-    get_position_shape, set_position_shape, skip_bits2_shape, start_match3_shape,
-    start_match4_shape, test_tail2_shape,
+    get_integer2_shape, get_position_shape, set_position_shape, skip_bits2_shape,
+    start_match3_shape, start_match4_shape, test_tail2_shape,
 };
 use super::compare::comparison_shape;
 use super::r#move::move_shape;
@@ -476,8 +476,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The six bitstring match-context shapes the emitter lowers natively
-        // ([`super::bitstr_inline`]). Each is classified by the **same** shape predicate
+        // The seven bitstring shapes the emitter lowers natively
+        // ([`super::bitstr_inline`]: the six match-context ones plus
+        // `bs_get_integer2`). Each is classified by the **same** shape predicate
         // its `try_inline_*` entry consults — those predicates already refuse a
         // `NO_FAIL` fail code, an unresolvable fail label, an undecodable fail atom and
         // an un-addressable operand, i.e. exactly the emitter's own compile-time
@@ -504,6 +505,10 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::BsStartMatch4 { fail, src, dst, .. } => {
             start_match4_shape(module, labels, fail, src, dst).is_some()
         }
+        Instr::BsGetInteger2(b) => get_integer2_shape(
+            labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
+        )
+        .is_some(),
         // A `jump` inlines iff its label resolves; an unresolved label falls to the
         // emitter's `emit_deopt`. (Its resolved arm exits through the linker with no helper
         // call at all, so the label test is the honest classification.)
@@ -682,7 +687,7 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
-        // The six bitstring match-context shapes are charged the x-registers their own
+        // The seven bitstring shapes are charged the x-registers their own
         // native lowering references — and only when their `*_shape` claims them (an
         // un-addressable operand keeps the whole instruction on the family arm, which
         // contributes no native touch). A `Y` operand is a stack slot, **not** an
@@ -720,6 +725,13 @@ pub(crate) fn cacheable_touches(
         }
         Instr::BsStartMatch4 { fail, src, dst, .. } => {
             if let Some((shape, _)) = start_match4_shape(module, labels, fail, src, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::BsGetInteger2(b) => {
+            if let Some((shape, _)) = get_integer2_shape(
+                labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
+            ) {
                 touches.extend(shape.registers());
             }
         }
@@ -819,8 +831,9 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The six bitstring match-context shapes read the x-registers their own native
-        // lowering loads (a match context, a subject, a saved position) and only when
+        // The seven bitstring shapes read the x-registers their own native
+        // lowering loads (a match context, a subject, a saved position, a field's
+        // source) and only when
         // their `*_shape` claims them.
         Instr::BsGetPosition { ctx, dst, .. } => {
             if let Some(shape) = get_position_shape(ctx, dst) {
@@ -855,6 +868,13 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
         }
         Instr::BsStartMatch4 { fail, src, dst, .. } => {
             if let Some((shape, _)) = start_match4_shape(module, labels, fail, src, dst) {
+                reads.extend(shape.reads());
+            }
+        }
+        Instr::BsGetInteger2(b) => {
+            if let Some((shape, _)) = get_integer2_shape(
+                labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
+            ) {
                 reads.extend(shape.reads());
             }
         }
@@ -996,6 +1016,16 @@ pub(crate) fn cacheable_writes(module: &Module, labels: &LabelMap, instr: &Instr
         } => skip_bits2_shape(labels, *fail, ctx, size, *unit)
             .map(|(shape, _)| shape.writes())
             .unwrap_or_default(),
+        // `bs_get_integer2` **does** write its destination: the extracted integer lands in
+        // `Dst`'s cache register. Charging it is mandatory for the same reason as
+        // `bs_get_position`'s / the two `bs_start_match*` forms' — an uncharged write lets a
+        // stale cache register survive a block exit, a wrong value rather than a redundant
+        // store. (Its context's `start` word is a heap store, not an x-register write.)
+        Instr::BsGetInteger2(b) => get_integer2_shape(
+            labels, b.fail, &b.ctx, &b.size, b.unit, b.flags, &b.dst,
+        )
+        .map(|(shape, _)| shape.writes())
+        .unwrap_or_default(),
         // Everything else deopts.
         _ => Vec::new(),
     }

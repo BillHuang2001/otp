@@ -428,6 +428,12 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             super::bitstr_inline::StartMatchShape::of(src, dst)
                 .map_or(false, |shape| shape.uses_y())
         }
+        // The family's field extractor reads its context and writes its destination
+        // through the same guarded frame window.
+        Instr::BsGetInteger2(b) => super::bitstr_inline::GetInteger2Shape::of(
+            &b.ctx, &b.size, b.unit, b.flags, &b.dst,
+        )
+        .map_or(false, |shape| shape.uses_y()),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }

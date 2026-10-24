@@ -597,10 +597,10 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
             // Every bitstring-path instruction the tier inlines *in addition to* the
-            // per-instruction budget below: `bs_match`/`bs_get_integer2` stay on the
-            // family helper (the per-instruction budget already covers them), while the
-            // six guarded match-context shapes and the `bs_match`/`bs_get_integer2`
-            // paths reserve their own guarded sequence ([`BS_PATH_BYTES`]).
+            // per-instruction budget below: `bs_match` stays on the family helper (the
+            // per-instruction budget already covers it), while the six guarded
+            // match-context shapes, `bs_get_integer2` and the `bs_match` path reserve
+            // their own guarded sequence ([`BS_PATH_BYTES`]).
             Instr::BsMatch { .. }
             | Instr::BsGetInteger2(_)
             | Instr::BsGetPosition { .. }
@@ -673,17 +673,19 @@ const LIST_PATH_BYTES: usize = 128;
 const TUPLE_PATH_BYTES: usize = 160;
 
 /// The code-size budget reserved for one bitstring-path instruction (see
-/// [`code_capacity_estimate`]): the guarded match-context sequence
+/// [`code_capacity_estimate`]): the guarded match-context / field-extraction sequence
 /// ([`super::bitstr_inline`]) plus the exits it may still branch to. The widest shape is
-/// `bs_start_match4`'s full classification — the destination's Y-window guard (~50 B), the
-/// subject load, the boxed/`HEADER_SUB_BITS` tests, the `orig`/`HEADER_BIN_REF` reuse test
-/// (~120 B) and the [`emit_step_and_continue`](super::emit_step_and_continue) fallback it
-/// branches to (~150 B, also covered by the per-instruction [`INSTRUCTION_BYTES`]) — so
-/// ≈190 B before that shared fallback. Budgeted for *every* bitstring-path instruction
-/// whether or not its shape predicate claims it, like the other path budgets:
-/// under-estimating would turn a large module into a `SystemLimit` compile error, so the
-/// figure is deliberately loose.
-const BS_PATH_BYTES: usize = 256;
+/// `bs_get_integer2`'s: the destination's Y-window guard (~50 B), the match-context guard
+/// (~40 B), the `remaining` computation and its fail arm (~60 B), the subject
+/// classification — the boxed/literal/subject-header tests and the two subject arms with
+/// their `base`/`size`/`off` derivation (~130 B) — the shared extractor's over-read guard,
+/// load, shift and mask (~60 B) and the tag/commit/destination store (~40 B), i.e. ≈380 B,
+/// in front of the [`emit_step_and_continue`](super::emit_step_and_continue) fallback it
+/// branches to (~150 B, also covered by the per-instruction [`INSTRUCTION_BYTES`]).
+/// Budgeted for *every* bitstring-path instruction whether or not its shape predicate
+/// claims it, like the other path budgets: under-estimating would turn a large module into
+/// a `SystemLimit` compile error, so the figure is deliberately loose.
+const BS_PATH_BYTES: usize = 448;
 
 #[cfg(test)]
 mod tests {
