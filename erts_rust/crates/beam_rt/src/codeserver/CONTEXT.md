@@ -32,6 +32,11 @@ set_configured_paths`/`add_system_paths` own them and append the tail after this
   a call with a different pair is derived on the spot and cached nowhere. It returns an
   **owned `Vec<PathBuf>` clone** of the cached list, so every call allocates 36 `PathBuf`s.
 
+* `src/codeserver.rs` → `CodeServer`: the **one** shared `Rc<AtomTable>` (copy-on-write on intern), module cache, the **one authoritative** code-path store, `module_handle`, `bindir()` and the *installation* resolution (`system_ebins`/`resolved_lib_root`, `$ERTS_STDLIB_DIR`, `erl_system_ebins`; `SYSTEM_APPS` is only that probe); its child `src/codeserver/path.rs` is the **release-layout derivation** (`choose_bundles`/`create_bundle`/`split_base`/`vsn_to_num`, `$ERL_LIBS`, the prim pair, `cached_system_path`) pinned element-wise and in order against the oracle by `tests/code_path.rs` — [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+  The module cache is `modules: HashMap<String, Arc<Module>>` (`codeserver.rs:124`) and it **retains every loaded module for the runtime's whole life** — nothing unloads code, and `forget_module` (`:820`, `erlang:delete_module/1`) is the only removal — so `module(name)`/`module_handle(name)` (`:610`/`:622`) are the LCA for any *cross-module* metadata, and an `Arc<Module>` is also the handle `ExecutionContext::resolve_external_call` hands the engine (so a cross-module frame keeps its module alive).
+  Two consumers read a **foreign** module's `Recs` chunk off that cache: `src/context/bridges.rs`'s `RecordBridge` (`records:get_definition/2`, `:722-761`, name-resolving through the module's own atom table) and `ExecutionContext::foreign_record_definition` (`src/context/records.rs`), the native-record instruction path for a foreign `put_record/6` create id.
+
+
 ## Cost shape (measured — do not re-derive)
 The whole-run floor for `beam_rt -noshell -eval 'halt().'` on this tree is **1.9807 G
 `cpu_core/instructions:u`** (`taskset -c 2`, spread ±0.05 % over 5 runs).

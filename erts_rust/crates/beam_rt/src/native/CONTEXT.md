@@ -165,6 +165,9 @@ The floor never copies out and never rewinds: `context/calls.rs::call_bif_routed
 - `../runtime.rs`, `../codeserver.rs`, `../boot.rs`, `../port.rs`, `../timers.rs`, `../dist.rs` → the runtime state these BIFs read (owned elsewhere)
 - `../error.rs` → `unsupported`/`undef`/`halt`/`live_reason_term` and the known-unimplemented list
 - `../../../../erts/emulator/beam/` → legacy C ground truth (read-only)
+
+* `src/native.rs` → the runtime-native BIF floor + its children, incl. the `file_server_2` service, the **registered `net_kernel` service** (a never-enqueued `Runnable` `Process` present only while distributed), `src/native/net/`'s node arms (incl. `erlang:monitor_node/2`) and `src/native/node.rs`'s identity/cookie one — [`src/native/CONTEXT.md`](src/native/CONTEXT.md) is the dispatch/see-the-whole-floor index and the per-family catalogs live one hop deeper in [`src/native/memory/CONTEXT.md`](src/native/memory/CONTEXT.md) (A.8 `process_info`), [`src/native/process/CONTEXT.md`](src/native/process/CONTEXT.md) (the process-control families), [`src/native/erts_internal/CONTEXT.md`](src/native/erts_internal/CONTEXT.md) and [`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md).
+
 ## Not implemented — the `erts_internal` / `prim_*` BIFs left falling through
 Every name not in a table above answers `None` and falls through to the `beam_bifs` registry then a real module load — an honest failure, never a fabricated value.
 This list is the one index of the unserved keys; the reasons for the `erts_internal` families are [`erts_internal/CONTEXT.md`](erts_internal/CONTEXT.md)'s and for the process/scheduler controls [`process/CONTEXT.md`](process/CONTEXT.md)'s.

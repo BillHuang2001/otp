@@ -477,6 +477,9 @@ The per-key roster and its C citations are in [`IMPLEMENTATION.md`](IMPLEMENTATI
 * [`IMPLEMENTATION.md`](IMPLEMENTATION.md) — companion detail for every pointer above, incl. the pinned root-set/relocation/cost sections.
 * [`calls/CONTEXT.md`](calls/CONTEXT.md) · [`gc/CONTEXT.md`](gc/CONTEXT.md) · [`pool/CONTEXT.md`](pool/CONTEXT.md) — the three subsystem children.
 
+* `src/context/` → the concrete `ExecutionContext` glue; the collection doors and the valve are split out under `gc/` (`reds_door.rs` the reduction/yield-boundary door, `bin_vheap.rs` the off-heap refc-binary reclamation point, `valve_bounds.rs` the word-classifier oracle, `refs_plateau.rs` the reference-minting heap plateau), plus the one shared `send.rs` send-destination classifier (`SendDestination`/`classify_send_destination`/`resolve_send_destination`/`deliver_remote`/`deliver_to_port`, used by all three send routes) — [`src/context/CONTEXT.md`](src/context/CONTEXT.md), whose per-subject children are [`src/context/calls/CONTEXT.md`](src/context/calls/CONTEXT.md) (the registered-call path), [`src/context/pool/CONTEXT.md`](src/context/pool/CONTEXT.md) (the BIF-result copy-out) and [`src/context/gc/CONTEXT.md`](src/context/gc/CONTEXT.md) (the collection doors and the prune points), with [`src/context/IMPLEMENTATION.md`](src/context/IMPLEMENTATION.md) holding the remaining dispatch/heap seam detail.
+
+
 
 ## The copy-out's reference walk is gated on `move_container`
 `RuntimeContext::graph_holds_reference` runs only where its answer is observable — i.e. only when

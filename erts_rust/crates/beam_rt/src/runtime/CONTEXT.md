@@ -228,6 +228,10 @@ The pass granularity is `RUN_STEP_SLICES = 1000` slices (`src/runtime/scheduler.
 - **Per round (cheap here):** `service_file_requests` allocates one `Vec::with_capacity(1+devices+retired)` (`src/native/file_server.rs:321`); `deliver_port_messages` early-returns `Ok(0)` on `has_nothing_to_poll()` with no live port (`src/port.rs:2566`, no poll sleep); each dist half is one `Option` match with no node.
 - **Out of this node:** the per-slice machine re-entry/resume (`beam_engine`'s `resume_outcome*`) is a sibling node's cost.
 
+`run_scheduled` (the CLI `run` action) drives **one** target pid after `boot_if_needed`, and a bare `spawn(fun …)` child is created *inside* a slice (`src/native/process.rs::spawn_in_pass`), so a synchronous two-process ping-pong stays in **one** `run_ready` call; the granularity is `RUN_STEP_SLICES = 1000` (`src/runtime/scheduler.rs`) with `DEFAULT_REDUCTIONS_PER_SLICE = CONTEXT_REDS = 4000` (`beam_process`), so per-pass costs amortize ×1000 while **per-slice** costs dominate a long run.
+The measured per-pass / per-slice / per-round inventory (the fresh `ProcessTable`, the progress-aware pass wait, the per-slice machine/context/timer churn, the `crate::hasher` maps, the occupancy short-circuit, each with its pinning test) is **[`src/runtime/CONTEXT.md`](src/runtime/CONTEXT.md)** *The scheduled path's fixed costs*, with the per-workload cost in [`src/runner/MEASURED.md`](src/runner/MEASURED.md).
+
+
 ## The arena allocation attribution census (`BEAM_RT_ARENA_TRACE`) — `arena_census.rs`
 `arena_census.rs` answers *which* requests produce `RetentionStats::arena_words`: a power-of-two size histogram (calls + words per `words.next_power_of_two()` bucket), the ten largest single requests with a `Backtrace::force_capture` each, a non-overlapping inside/outside-**nested-run-window** word split, and a per-window word-delta histogram.
 It is switched on by `BEAM_RT_ARENA_TRACE` only; `Runtime::new` latches the answer into `Runtime::arena_census` (`debug_trace::arena_enabled`), so with the variable unset `Runtime::alloc_words` pays one `bool` test and `Runtime::arena_census_report` is `None` — nothing else runs.
