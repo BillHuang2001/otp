@@ -2334,6 +2334,163 @@ fn an_idle_port_round_does_not_clone_the_shared_atom_table() {
     assert!(pending.is_empty(), "the commit empties the window");
 }
 
+/// Builds **one of every port-message shape** the crate's builders produce, exactly as the
+/// delivery sites do: the `{Port, {data, …}}` message on both streams, a line frame of each
+/// `eol`/`noeol` kind, the `{exit_status, …}` report, both `select` shapes and the
+/// `{notify, Signal}` signal message.
+///
+/// Used twice by [`a_port_message_build_does_not_clone_the_shared_atom_table_while_a_lease_is_held`]:
+/// once to land the vocabulary (the first message of a kind is what appends its atoms) and once
+/// under a held lease, where every name must be a pure lookup.
+fn build_every_port_message_shape(rt: &mut Runtime, port: PortId) {
+    // `{Port, {data, Bin}}` and `{Port, {data, "…"}}` — the `binary`/`list` streams.
+    {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        ctx.port_data_message(port, b"ab", StreamType::Binary)
+            .expect("a binary-stream read message");
+        ctx.port_data_message(port, b"ab", StreamType::List)
+            .expect("a list-stream read message");
+    }
+    // A line frame of each marker: `{Port, {data, {eol|noeol, Data}}}`.
+    {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        ctx.port_line_message(port, b"", b"a\n", true, StreamType::Binary)
+            .expect("an `eol` line frame");
+        ctx.port_line_message(port, b"", b"b", false, StreamType::Binary)
+            .expect("a `noeol` line frame");
+    }
+    // `{Port, {exit_status, Status}}`.
+    {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        ctx.port_exit_message(port, 7).expect("an exit-status message");
+    }
+    // Both `select` notification shapes.
+    {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        let reference = make_small(1);
+        ctx.select_message(
+            &super::select::SelectPayload::Plain { reference },
+            super::select::SelectEvent::ReadyInput,
+            make_small(2),
+        )
+        .expect("a plain select message");
+        ctx.select_message(
+            &super::select::SelectPayload::Custom { message: make_small(3) },
+            super::select::SelectEvent::ReadyOutput,
+            make_small(4),
+        )
+        .expect("a custom select message");
+    }
+    // `{notify, SignalName}`.
+    {
+        let mut ctx = RuntimeContext::new(&mut *rt);
+        ctx.signal_notify_message("usr1")
+            .expect("a signal-notify message");
+    }
+}
+
+/// A port-message build must not reach the shared atom table **at all** while any other handle on
+/// it is alive.
+///
+/// [`intern_reuse`] is the reason: the builders resolve `data`, `eol`/`noeol`, `exit_status`,
+/// `notify`/`system`, `select`/the event atom and the socket tags by **looking them up first**, so
+/// only a genuinely absent name ever reaches
+/// [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut) — which is `Rc::make_mut`
+/// and therefore deep-clones the whole shared table (every name plus the index map) whenever a
+/// second handle exists, dropping the copy at once.
+///
+/// The `lease` below stands in for the two holders a real runtime can have alive while it builds a
+/// port message and this test cannot cheaply reproduce: a loaded NIF library's stored host
+/// (`crate::nif`'s `NifEntry::host`) and an open `{spawn_driver, Name}` port's host
+/// (`crate::port::driver`'s `DriverPort`). Either keeps the table's strong count above one for a
+/// whole workload, which is exactly what turns a builder's write into a clone per delivered
+/// message. A plain `Rc<AtomTable>` handle is the same strong count with none of the setup.
+///
+/// The clone is observable directly, with no allocation instrumentation: `Rc::make_mut` replaces
+/// the code server's `Rc` with a **fresh allocation**, so a handle taken before a build stops
+/// sharing an allocation with the server's. Pointer identity (and, one step finer,
+/// [`AtomTable::generation`]) *is* the work the lookup removes — deterministic and load-independent
+/// (a counting `#[global_allocator]` would need `unsafe impl GlobalAlloc`, which this crate's
+/// `#![deny(unsafe_code)]` forbids).
+///
+/// Both halves are pinned: the **hit** path writes nothing, and a name that is genuinely absent
+/// still appends at the predicted index — the miss path is the same intern it always was, which is
+/// what keeps every atom index (and so every already-built term) valid.
+#[test]
+fn a_port_message_build_does_not_clone_the_shared_atom_table_while_a_lease_is_held() {
+    /// A signal name no boot seed and no builder spells, so the miss path is really exercised.
+    const FRESH: &str = "port_message_pin_fresh_signal";
+
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    let port = PortId::new(1);
+
+    // (0) Land the vocabulary: the first message of each kind is what appends its atoms (only
+    // `ok`/`error`/`system`… come from the boot seed), so every build below is a pure lookup.
+    build_every_port_message_shape(&mut rt, port);
+    assert!(
+        rt.atoms().lookup("data").is_some(),
+        "the first `{{data, …}}` message lands its tag"
+    );
+
+    // (1) Under the lease, a full sweep of the shapes writes nothing: not one `make_mut`, so not
+    // one clone of the shared table.
+    let lease = rt.code_server().atoms_handle();
+    let before = Rc::as_ptr(&rt.code_server().atoms_handle());
+    let generation = rt.atoms().generation();
+    build_every_port_message_shape(&mut rt, port);
+    let after = Rc::as_ptr(&rt.code_server().atoms_handle());
+    assert_eq!(
+        before, after,
+        "a port-message build must not replace the shared AtomTable with a clone of itself"
+    );
+    assert_eq!(
+        generation,
+        rt.atoms().generation(),
+        "a port-message build must not append to the shared table either"
+    );
+
+    // (2) ...and a name that really is absent still lands, at exactly the append-only index: the
+    // lookup skips a write for a present name, never the intern of a new one.
+    let predicted = rt.atoms().len();
+    assert!(
+        rt.atoms().lookup(FRESH).is_none(),
+        "`{FRESH}` must start absent for the miss path to be under test"
+    );
+    let (sender, message) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.signal_notify_message(FRESH)
+            .expect("a signal-notify message")
+    };
+    let landed = rt
+        .atoms()
+        .lookup(FRESH)
+        .expect("the miss path appends the name");
+    assert_eq!(
+        landed.raw() as usize,
+        predicted,
+        "the append lands at the index interning always gave it"
+    );
+    assert_eq!(
+        terms::tuple_element(message, 1).expect("the signal name"),
+        make_atom(landed),
+        "the delivered message names the appended atom"
+    );
+    assert_eq!(
+        sender,
+        make_atom(rt.atoms().lookup("system").expect("a landed `system`")),
+        "the sender is the same `system` the hit path resolved"
+    );
+    // The one genuine append *did* take the copy-on-write route — which is what makes (1)'s
+    // pointer assertion discriminating rather than vacuous: the lease is still alive, so the
+    // write allocates a fresh table (whose content is the old one plus the new name).
+    assert_ne!(
+        before,
+        Rc::as_ptr(&rt.code_server().atoms_handle()),
+        "a genuine append under a live lease is the copy-on-write the lookup avoids"
+    );
+    drop(lease);
+}
+
 /// A driver-emitted term is delivered into its recipient's mailbox by
 /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
 /// port's owner for `erl_drv_output_term` and to the named pid for `erl_drv_send_term`.

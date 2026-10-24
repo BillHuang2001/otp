@@ -209,6 +209,7 @@ use beam_term::{
     Eterm, NIL,
 };
 
+use crate::codeserver::CodeServer;
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::Runtime;
@@ -4793,7 +4794,7 @@ impl RuntimeContext<'_> {
         stream: StreamType,
         shape: StreamShape,
     ) -> Result<Eterm> {
-        let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
+        let data = intern_reuse(&mut self.runtime.code_server, "data");
         let payload = self.make_stream_payload(read, stream, shape)?;
         let inner = terms::make_tuple(self, &[data, payload])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
@@ -4835,10 +4836,8 @@ impl RuntimeContext<'_> {
         stream: StreamType,
     ) -> Result<Eterm> {
         let tag = if eol { "eol" } else { "noeol" };
-        let (data, tag) = {
-            let atoms = self.runtime.code_server.atoms_mut();
-            (make_atom(atoms.intern("data")), make_atom(atoms.intern(tag)))
-        };
+        let data = intern_reuse(&mut self.runtime.code_server, "data");
+        let tag = intern_reuse(&mut self.runtime.code_server, tag);
         // The frame is a read whose body is the frame's bytes and whose header is the producing
         // read's prefix — the C's own shape (`deliver_linebuf_message` → `deliver_read_message`).
         let frame = ReadMessage {
@@ -4935,7 +4934,7 @@ impl RuntimeContext<'_> {
     /// exit twice. The sibling of [`Self::port_data_message`], with the same
     /// interned-atom/pointer-stable-arena rule.
     pub(crate) fn port_exit_message(&mut self, port: PortId, status: i32) -> Result<Eterm> {
-        let tag = make_atom(self.runtime.code_server.atoms_mut().intern("exit_status"));
+        let tag = intern_reuse(&mut self.runtime.code_server, "exit_status");
         let inner = terms::make_tuple(self, &[tag, make_small(i64::from(status))])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
@@ -4958,10 +4957,9 @@ impl RuntimeContext<'_> {
     ///
     /// The arena's allocation failure when the tuple does not fit.
     pub(crate) fn signal_notify_message(&mut self, name: &str) -> Result<(Eterm, Eterm)> {
-        let atoms = self.runtime.code_server.atoms_mut();
-        let notify = make_atom(atoms.intern("notify"));
-        let signal = make_atom(atoms.intern(name));
-        let sender = make_atom(atoms.intern("system"));
+        let notify = intern_reuse(&mut self.runtime.code_server, "notify");
+        let signal = intern_reuse(&mut self.runtime.code_server, name);
+        let sender = intern_reuse(&mut self.runtime.code_server, "system");
         let message = terms::make_tuple(self, &[notify, signal])?;
         Ok((sender, message))
     }
@@ -4998,18 +4996,51 @@ impl RuntimeContext<'_> {
         event: select::SelectEvent,
         handle: Eterm,
     ) -> Result<(Eterm, Eterm)> {
-        let atoms = self.runtime.code_server.atoms_mut();
-        let sender = make_atom(atoms.intern("system"));
+        let sender = intern_reuse(&mut self.runtime.code_server, "system");
         match payload {
             select::SelectPayload::Custom { message } => Ok((sender, *message)),
             select::SelectPayload::Plain { reference } => {
-                let select = make_atom(atoms.intern("select"));
-                let event_atom = make_atom(atoms.intern(event.name()));
+                let select = intern_reuse(&mut self.runtime.code_server, "select");
+                let event_atom = intern_reuse(&mut self.runtime.code_server, event.name());
                 let message =
                     terms::make_tuple(self, &[select, handle, *reference, event_atom])?;
                 Ok((sender, message))
             }
         }
+    }
+}
+
+/// Resolves `name` in the runtime's **one shared** atom table by **looking it up first**, so a
+/// name the table already holds never reaches [`CodeServer::atoms_mut`] at all.
+///
+/// # Why the lookup comes first
+///
+/// [`CodeServer::atoms_mut`] is `Rc::make_mut`: **reaching** it while any other handle on the table
+/// is alive deep-clones the whole shared table — one `Arc<str>` per name (~9 500 once the runtime
+/// is booted) plus the index map — and the copy is dropped as soon as the borrow ends. The clone is
+/// a pure cost and never an observable difference (a clone preserves every index), and the
+/// port-message vocabulary is the workload shape that pays it over and over: exactly two holders
+/// live long enough to still be alive whenever a port message is built — a loaded NIF library's
+/// stored host (`crate::nif`'s `NifEntry::host`, one per `erlang:load_nif/2`) and a `dlopen`ed
+/// `{spawn_driver, Name}` port's host (`crate::port::driver`'s `DriverPort`, for the port's whole
+/// life). Meanwhile `data`, `eol`, `noeol`, `exit_status`, `notify`, `select`, `system`,
+/// `inet_reply`, `inet_async`, `ok`, `error`, the socket tags and the rest are landed by the
+/// **first** message of their kind, so on every later message the write finds the name already
+/// present and the clone buys nothing.
+///
+/// # What it does not change
+///
+/// Nothing: it removes no intern and relaxes no ownership rule — it only skips a `make_mut` for a
+/// name the live table already holds. A **miss** performs exactly the intern the code it replaced
+/// performed: the same append, at the same index (interning is append-only), with the same
+/// [`AtomTable::generation`] bump. So no atom index, no append order and no observable behaviour
+/// moves, and every term already built keeps its atom value. The hit path allocates **nothing**:
+/// [`AtomTable::lookup`] answers the index out of the name map, with no `String`/`Arc<str>` and no
+/// table write.
+pub(crate) fn intern_reuse(server: &mut CodeServer, name: &str) -> Eterm {
+    match server.atoms().lookup(name) {
+        Some(atom) => make_atom(atom),
+        None => make_atom(server.atoms_mut().intern(name)),
     }
 }
 
