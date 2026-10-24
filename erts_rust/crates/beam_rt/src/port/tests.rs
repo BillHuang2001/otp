@@ -668,6 +668,63 @@ fn a_builtin_driver_name_opens_a_live_driver_port() {
     }
 }
 
+/// A `{spawn, Cmd}` whose command **names a driver** is that driver's port: the C searches the
+/// command's first token in its loaded-driver list *before* it forks anything
+/// (`erts/emulator/beam/io.c:599-628`, [`super::spawn_names_driver`]).
+///
+/// This is what makes `lib/kernel/src/ram_file.erl:383` work at all —
+/// `open_port({spawn, "ram_file_drv"}, Opts)` has to open the emulator's ram-file driver. Classified
+/// as [`PortName::Spawn`] instead, the runtime forks `sh -c exec ram_file_drv`, the shell answers
+/// `exec: ram_file_drv: not found` (rc 127), `port_info(Port, os_pid)` becomes a real pid where the
+/// oracle answers `undefined`, and `ram_file:get_response/1`'s bare `receive` never returns.
+///
+/// Both `port_info/2` answers asserted here are the oracle's own (measured on erts-17.1:
+/// `{name,"ram_file_drv"}`, `{os_pid,undefined}`), and the `RAM_FILE_OPEN` reply proves the port
+/// really runs *that* driver rather than only being labelled one.
+#[test]
+fn a_driver_named_spawn_command_opens_that_drivers_port() {
+    let mut fx = fixture();
+    let name = fx.spawn("ram_file_drv");
+    let port = fx
+        .hook
+        .open_port(name, NIL)
+        .expect("open_port({spawn, \"ram_file_drv\"}, [])");
+
+    // The oracle's two answers for this exact name: the command as written, and no OS child.
+    assert_eq!(text_of(fx.item(port, "name")), "ram_file_drv");
+    assert_eq!(
+        fx.item(port, "os_pid"),
+        fx.atom("undefined"),
+        "a driver port owns no OS child"
+    );
+    // ...and it is the **built-in** form of that driver: resolved against `beam_io`'s static set
+    // with no `dlopen`, never the shell command the spawn driver would have run.
+    let kind = fx
+        .registry
+        .borrow()
+        .meta
+        .get(&port.number())
+        .map(|meta| meta.kind);
+    assert_eq!(kind, Some(PortName::SpawnDriverBuiltin));
+
+    // The driver itself answers: `RAM_FILE_OPEN` replies `[3,0,0,0,0]` (the `NUMBER` response 3
+    // followed by a big-endian zero) — a `{spawn, …}` port that had been forked could not.
+    fx.registry
+        .borrow_mut()
+        .write_command(port, &RAM_FILE_OPEN_ABC)
+        .expect("the RAM_FILE_OPEN command is written");
+    let reply = pump_data(&mut fx.registry.borrow_mut(), port);
+    assert_eq!(
+        reply,
+        RAM_FILE_OPEN_REPLY.to_vec(),
+        "ram_file_drv's OPEN reply, byte for byte"
+    );
+
+    // Never leak the port (or the driver behind it): the id is released.
+    fx.hook.close_port(port).expect("closing the driver port");
+    assert!(!fx.registry.borrow().contains(port));
+}
+
 // The **descriptor-less built-in** driver's reply path — the `ram_file_drv` regression.
 //
 // A `{spawn_driver, "ram_file_drv"}` port is a [`PortName::SpawnDriverBuiltin`]: it has no C

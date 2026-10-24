@@ -393,16 +393,22 @@ const PORT_OPTION_TUPLES: &[&str] = &[
 /// Which `Name` the `open_port/2` call used — the driver that backs the port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortName {
-    /// `{spawn, Cmd}`: flatten `Cmd` and run it through `/bin/sh -c "exec Cmd"`.
+    /// `{spawn, Cmd}` whose `Cmd` does **not** name a driver: flatten `Cmd` and run it through
+    /// `/bin/sh -c "exec Cmd"`. A command whose first token *is* a driver takes one of the two
+    /// driver forms below instead ([`spawn_names_driver`], the C's lookup before any fork).
     Spawn,
     /// `{spawn_executable, Path}`: run `Path` directly with the `args` option.
     SpawnExecutable,
-    /// `{spawn_driver, Name}`: a **C driver** (contract A.4) `dlopen`ed from `Name` — no OS child.
+    /// `{spawn_driver, Name}` — or a `{spawn, Cmd}` whose first token names a driver
+    /// (`erts/emulator/beam/io.c:599-628`): a **C driver** (contract A.4) `dlopen`ed from `Name` — no
+    /// OS child.
     SpawnDriver,
-    /// `{spawn_driver, Name}` where `Name` is a **built-in** driver this runtime links in
+    /// A driver form naming a **built-in** driver this runtime links in
     /// (`fd`/`efile`/`tcp_inet` — the Rust analogue of the emulator's statically linked drivers,
     /// e.g. `tcp_inet` in `erts/emulator/drivers/common/inet_drv.c:1348`), resolved against
-    /// [`beam_io::DriverRegistry`] rather than `dlopen`ed.
+    /// [`beam_io::DriverRegistry`] rather than `dlopen`ed. Reached by
+    /// `open_port({spawn_driver, Name}, …)` *and* by `open_port({spawn, Cmd}, …)` when `Cmd`'s first
+    /// token is one of them — which is how `lib/kernel/src/ram_file.erl:383` opens `ram_file_drv`.
     ///
     /// Like [`PortName::SpawnDriver`] it is a **driver** port — so [`PortMeta::has_driver_control`]
     /// answers from the driver's own `control` capability, captured when the port is opened — but
@@ -3536,10 +3542,21 @@ impl RuntimePorts {
         let tag = self.atom_name(tag).ok_or(BeamError::BadArg)?;
         match (tag, arity) {
             ("spawn", 2) => {
-                let command = self.command_spec(terms::tuple_element(name, 1)?)?;
+                let command = checked_name(self.command_spec(terms::tuple_element(name, 1)?)?)?;
+                // A command whose **first token** is a registered driver is that **driver's** port:
+                // the C searches its loaded-driver list before it forks anything
+                // (`erts/emulator/beam/io.c:599-628`), which is how `ram_file.erl` opens the
+                // emulator's ram-file driver (`lib/kernel/src/ram_file.erl:383`). [`spawn_names_driver`]
+                // carries the rule and the membership gates; a non-matching command stays the shell
+                // command the spawn driver runs.
+                let kind = if spawn_names_driver(&command) {
+                    PortName::SpawnDriver
+                } else {
+                    PortName::Spawn
+                };
                 Ok(NameSpec {
-                    kind: PortName::Spawn,
-                    command: checked_name(command)?,
+                    kind,
+                    command,
                     fd: None,
                     inline_options: None,
                 })
@@ -4996,8 +5013,8 @@ impl RuntimeContext<'_> {
     }
 }
 
-/// The command a `{spawn_driver, Name}` `open_port/2` was given, truncated at the first blank —
-/// the C's own rule (`io.c` walks the name to the first blank before matching
+/// The command a `{spawn_driver, Name}` or `{spawn, Cmd}` `open_port/2` was given, truncated at the
+/// first blank — the C's own rule (`io.c` walks the name to the first blank before matching
 /// `ErlDrvEntry::driver_name`), so `"ram_file_drv extra args"` names the driver `ram_file_drv`.
 ///
 /// This is the driver **search**'s rule ([`driver_lookup`]); whether the resolved driver declares a
@@ -5005,6 +5022,31 @@ impl RuntimeContext<'_> {
 /// ([`PortMeta::driver_has_control`]), not anything read from this name.
 fn driver_path_name(command: &str) -> &str {
     command.split(' ').next().unwrap_or(command)
+}
+
+/// Whether a `{spawn, Cmd}` `open_port/2` name resolves to a **driver** — i.e. whether the C opens
+/// the port as that driver's port instead of forking a shell command.
+///
+/// The C's rule (`erts/emulator/beam/io.c:599-628`): for a non-`spawn_executable` spawn it walks
+/// the name to the first blank and searches the resulting token in the **loaded-driver list**,
+/// *before* anything is forked; a hit means the port is that driver's port. This is what makes
+/// `lib/kernel/src/ram_file.erl:383` work at all — `open_port({spawn, "ram_file_drv"}, Opts)` is the
+/// emulator's ram-file driver, not a shell program named `ram_file_drv` (nor a `{Port,{exit_status,…}}`
+/// reporter).
+///
+/// The token is [`driver_path_name`]'s (the same first-blank rule the driver search itself applies),
+/// and the membership gates are the emulator's own two: [`driver::is_static_driver`] (the
+/// `driver_tab.c` statics — `tcp_inet`, `udp_inet`, `ram_file_drv`) and [`driver::driver_is_loaded`]
+/// (a driver an `erl_ddll:load_driver/3`, or an earlier `open_port({spawn_driver, …})`, put on the
+/// loaded list). `fd`/`efile` are deliberately **not** members: OTP 21+ made them ordinary modules, so
+/// the oracle runs `{spawn,"fd"}` as a shell command (`port_info(Port, os_pid)` is a real pid) and
+/// accepts `[exit_status]` for it (verified against erts-17.1).
+///
+/// [`opens_a_driver_port`] — the `[exit_status]` refusal — reads the very same predicate, so the
+/// classification and the refusal cannot drift apart.
+fn spawn_names_driver(command: &str) -> bool {
+    let name = driver_path_name(command);
+    driver::is_static_driver(name) || driver::driver_is_loaded(name)
 }
 
 /// Whether `spec` names a port the C would open **through a driver** — the predicate behind the
@@ -5023,6 +5065,11 @@ fn driver_path_name(command: &str) -> &str {
 /// OTP 21+ made them ordinary modules, so the oracle runs `{spawn,"fd"}` as a shell command and
 /// accepts `[exit_status]` for it (verified against erts-17.1).
 ///
+/// The `PortName::Spawn` arm reads [`spawn_names_driver`] — the same lookup
+/// [`RuntimePorts::name_spec`] classifies a `{spawn, Cmd}` name with, so the two cannot drift. Since
+/// that classification already turns a driver-named command into [`PortName::SpawnDriver`], this arm
+/// is the belt to its braces: it keeps the refusal right for a `NameSpec` built anywhere else.
+///
 /// The `{fd, N}` **name form** is a driver port, and a different driver from `spawn_driver`: it is
 /// the emulator's own `fd_driver` (`erts/emulator/sys/unix/sys_drivers.c:257`, registered at
 /// `io.c:86`), so the same test refuses `[exit_status]` for it — measured on erts-17.1,
@@ -5033,10 +5080,7 @@ fn driver_path_name(command: &str) -> &str {
 fn opens_a_driver_port(spec: &NameSpec) -> bool {
     match spec.kind {
         PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
-        PortName::Spawn => {
-            let name = driver_path_name(&spec.command);
-            driver::is_static_driver(name) || driver::driver_is_loaded(name)
-        }
+        PortName::Spawn => spawn_names_driver(&spec.command),
         PortName::SpawnExecutable => false,
         PortName::Fd => true,
     }
