@@ -10397,3 +10397,140 @@ fn the_nif_probe_counter_never_ticks_without_a_loaded_library() {
         "an empty NIF registry is answered by `is_empty` before the probe counter ticks"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The heap-fragment delivery route: the refusal's own price is the fragment's reservation
+// ---------------------------------------------------------------------------------------
+
+/// **The refusal's price really is the destination word count, and the fragment is reserved from
+/// it** — the premise [`RuntimeContext::deliver_into_mailbox`] relies on when it hands
+/// [`AllocFailure::requested`](beam_common::AllocFailure::requested) to
+/// [`RuntimeContext::send_fragmented_message_after_refusal`].
+///
+/// The route, end to end, on the one receiver shape that produces the raw refusal — a process that
+/// can neither hold the payload nor be relocated
+/// ([`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots):
+/// relocation-exempt, so `Process::deliver` returns its `AllocKind::Message` failure unchanged
+/// instead of collecting):
+///
+/// * `requested` is a whole number of term words and equals `size_object(payload)` — the figure the
+///   copier's own pricing walk produced, so the fragment route needs no second walk;
+/// * the delivery still lands, **fragment-resident**: one fragment, reserved at exactly that price
+///   (`capacity == used == price`, i.e. the single copy fills the reservation and nothing
+///   re-reserved it), carrying the whole payload intact;
+/// * the shared tail ran: the receiver was woken, and the descent gate opened
+///   ([`Runtime::note_foreign_reachable`](crate::runtime::Runtime::note_foreign_reachable)), because
+///   the payload lives in a region the receiver's collector does not scan.
+///
+/// A wrong price is a wrong heap size, which is what this pins: `capacity` is the reservation the
+/// refusal's figure bought.
+#[test]
+fn a_fragment_delivery_reserves_the_refusals_price_and_carries_the_payload_intact() {
+    let mut rt = runtime();
+    let pid = rt.processes.spawn_default().expect("a receiver");
+    // Unpublished roots AND a blocked state: `deliver` must refuse without moving a word, and the
+    // delivery's wake must be a real one (`Process::wake` answers `true` only for `Waiting`).
+    rt.processes
+        .set_relocation_exempt(pid, true)
+        .expect("the receiver is live");
+    rt.processes
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .set_state(beam_process::ProcessState::Waiting);
+
+    // A payload larger than the receiver's whole nursery, built on a pointer-stable arena (the
+    // copier reads the source words; only the reservation has to be sized).
+    let capacity = rt
+        .processes
+        .get(pid)
+        .expect("the receiver is live")
+        .collector()
+        .young()
+        .capacity_words();
+    let mut arena = beam_alloc::Heap::new(capacity + 8).expect("the source arena allocates");
+    let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+    let payload = arena.tuple(&elems).expect("the oversized payload fits the arena");
+
+    // -- The premise: the refusal's byte figure IS the copier's destination price in words. --
+    let no_off_heap = beam_message::OffHeapTable::new();
+    let failure = match rt.processes.deliver(pid, NIL, payload, &no_off_heap) {
+        Err(BeamError::Alloc(failure)) => failure,
+        other => panic!(
+            "a receiver that may not be relocated must return the raw refusal, got {other:?}"
+        ),
+    };
+    assert_eq!(
+        failure.kind,
+        beam_common::AllocKind::Message,
+        "the refusal is the message-heap class the fragment route keys on"
+    );
+    let word = std::mem::size_of::<Eterm>();
+    assert_eq!(
+        failure.requested % word,
+        0,
+        "the refusal reports a whole number of term words ({} bytes)",
+        failure.requested
+    );
+    let price_words = failure.requested / word;
+    assert_eq!(
+        price_words,
+        beam_term::size_object(payload),
+        "the refusal's price is the graph's own destination word count — `size_object`'s figure \
+         for this shape — so the fragment route needs no second pricing walk"
+    );
+    assert_eq!(
+        price_words,
+        capacity + 1,
+        "the tuple's own price: one arityval header plus its {capacity} element words"
+    );
+
+    // -- The route: the delivery lands through the refusal's price, not a re-priced figure. --
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.deliver_into_mailbox(pid, NIL, payload, &no_off_heap)
+            .expect("the refusal is retried through the heap-fragment route");
+    }
+
+    let process = rt.processes.get_mut(pid).expect("the receiver survived");
+    assert_eq!(
+        process.state(),
+        beam_process::ProcessState::Runnable,
+        "the shared tail woke the receiver the fragment delivery held"
+    );
+    let message = process.mailbox().peek().expect("the payload arrived");
+    let fragments = message
+        .fragments()
+        .expect("the payload is fragment-resident: the receiver's own heap was never involved");
+    assert_eq!(fragments.len(), 1, "one fragment holds the whole payload");
+    let fragment = fragments.iter().next().expect("the one fragment");
+    assert_eq!(
+        fragment.capacity(),
+        price_words,
+        "the fragment is reserved from the refusal's price — not from a floor and not from a \
+         second pricing walk"
+    );
+    assert_eq!(
+        fragment.used(),
+        price_words,
+        "the single copy fills exactly the reservation, so nothing re-reserved the fragment"
+    );
+
+    let queued = message.payload();
+    assert_eq!(
+        terms::tuple_arity(queued).expect("the payload is a tuple"),
+        capacity,
+        "the whole payload arrived"
+    );
+    for (index, expected) in elems.iter().enumerate() {
+        assert_eq!(
+            terms::tuple_element(queued, index).expect("in range"),
+            *expected,
+            "element {index} arrived byte-identically"
+        );
+    }
+    assert!(
+        rt.foreign_reachable(pid),
+        "the shared tail opens the receiver's descent gate: the payload sits where its collector \
+         does not scan"
+    );
+}
