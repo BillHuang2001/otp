@@ -55,9 +55,7 @@
 //! mark-region promotion): the nursery is the same barrier-free copying space in both, so the
 //! rule must be strategy-independent.
 
-use beam_gc::prelude::{
-    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind,
-};
+use beam_gc::prelude::{AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind};
 use beam_term::prelude::{make_small, ptr_val, Eterm};
 
 /// Both mature strategies, so every pin below is strategy-independent.

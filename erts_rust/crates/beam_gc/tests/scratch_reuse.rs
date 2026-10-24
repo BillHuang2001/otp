@@ -143,7 +143,11 @@ fn two_collections_over_one_collector_report_their_own_live_sets() {
             "{kind:?}: round two evacuates *its* graph and no trace of round one"
         );
         assert_eq!(c.minor_gcs(), 2, "{kind:?}: two minors ran");
-        assert_eq!(c.young().used_words(), 0, "{kind:?}: the nursery is empty again");
+        assert_eq!(
+            c.young().used_words(),
+            0,
+            "{kind:?}: the nursery is empty again"
+        );
 
         // Round one's graph is untouched by round two (a minor never rescans the mature
         // generation), and both graphs are reachable from their roots.
@@ -166,7 +170,9 @@ fn two_collections_over_one_collector_report_their_own_live_sets() {
         let fresh_b = build_b(&mut fresh);
         bury(&mut fresh, 90);
         let mut fresh_roots = [fresh_b];
-        let reference = fresh.collect_minor(&mut fresh_roots).expect("the reference minor");
+        let reference = fresh
+            .collect_minor(&mut fresh_roots)
+            .expect("the reference minor");
         assert_eq!(
             (second.words_copied, second.objects_copied),
             (reference.words_copied, reference.objects_copied),
@@ -218,7 +224,9 @@ fn a_fullsweep_between_minors_reinstalls_the_from_set_each_time() {
         // covered the whole heap.
         let after = build_b(&mut c);
         let mut roots = [after];
-        let minor = c.collect_minor(&mut roots).expect("the minor after the fullsweep");
+        let minor = c
+            .collect_minor(&mut roots)
+            .expect("the minor after the fullsweep");
         assert_eq!(
             (minor.words_copied, minor.objects_copied),
             ROUND_TWO,

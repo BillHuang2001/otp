@@ -675,7 +675,8 @@ impl GenImmixCollector {
         // size, which the next fullsweep measures again: a capacity feedback. See the identical
         // clamp, and its derivation, in [`crate::Collector::collect_major`] and the regression
         // gate `tests/mature_capacity_feedback.rs`.
-        let live = crate::live::live_full_with(&mut self.scratch, &self.nursery, &self.mature, roots);
+        let live =
+            crate::live::live_full_with(&mut self.scratch, &self.nursery, &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let young_capacity_after = self
             .policy

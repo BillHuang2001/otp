@@ -621,14 +621,8 @@ mod tests {
             .heap_mut()
             .tuple(&[make_small(7), make_small(8)])
             .expect("shared");
-        let a = space
-            .heap_mut()
-            .tuple(&[shared, make_small(1)])
-            .expect("a");
-        let b = space
-            .heap_mut()
-            .tuple(&[shared, make_small(2)])
-            .expect("b");
+        let a = space.heap_mut().tuple(&[shared, make_small(1)]).expect("a");
+        let b = space.heap_mut().tuple(&[shared, make_small(2)]).expect("b");
         let _garbage = space
             .heap_mut()
             .tuple(&[make_small(3), make_small(4)])
@@ -640,11 +634,8 @@ mod tests {
         // The three rounds, each its own root set: `A` alone (S is reached through it), `B` alone
         // (S is reached again — a *separate* walk counts it a separate time), and both together (S
         // once, because one walk deduplicates by address).
-        let rounds: [(&[Eterm], (usize, usize)); 3] = [
-            (&[a], (6, 2)),
-            (&[b], (6, 2)),
-            (&[a, b], (9, 3)),
-        ];
+        let rounds: [(&[Eterm], (usize, usize)); 3] =
+            [(&[a], (6, 2)), (&[b], (6, 2)), (&[a, b], (9, 3))];
 
         // One scratch, walked three times.
         let mut reused = Scratch::new();

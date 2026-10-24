@@ -56,8 +56,8 @@
 //! asserted.
 
 use beam_gc::prelude::{
-    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind, MINOR_SHRINK_FLOOR_WORDS,
-    YOUNG_SHRINK_FACTOR,
+    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind,
+    MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, ptr_val, Eterm};
 
