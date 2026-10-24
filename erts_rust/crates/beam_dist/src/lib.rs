@@ -90,7 +90,7 @@ pub use crate::handshake::{
 pub use crate::transport::{MemoryTransport, Transport};
 
 pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache, SegmentCache};
-pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest, SystemChallengeSource};
+pub use crate::auth::{gen_challenge, gen_digest, Md5Digest, SystemChallengeSource};
 pub use crate::connection::{
     accept_server, accept_server_with_decision, accept_server_with_flags, connect_client,
     connect_client_with_creation, connect_client_with_flags, connect_to_node,
