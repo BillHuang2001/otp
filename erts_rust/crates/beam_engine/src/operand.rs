@@ -170,7 +170,12 @@ pub(crate) fn read_operands_slack(
 
 /// The non-allocating arms of [`read_operand`] (everything but a non-small integer
 /// immediate), shared by [`read_operand_slack`].
-#[inline]
+///
+/// `#[inline(always)]` for the same reason as [`read_operand`]: the 72-byte
+/// `Result<Eterm, BeamError>` is returned through memory, so an out-of-line call
+/// costs a store/load round trip per operand — and this is the arm every
+/// `put_list`/`get_list` operand read takes.
+#[inline(always)]
 fn read_operand_pure(machine: &Machine, operand: &Operand) -> Result<Eterm> {
     match operand {
         Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
