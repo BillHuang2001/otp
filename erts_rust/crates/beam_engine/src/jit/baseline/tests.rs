@@ -518,6 +518,11 @@ fn fast_arith_recognizes_only_the_small_int_bifs() {
         ("erlang", "bor", 2),
         ("erlang", "bsr", 2),
         ("erlang", "bsl", 2),
+        ("erlang", "div", 2),
+        ("erlang", "rem", 2),
+        // `intdiv/2` is *floor* division (`-7 intdiv 2 == -4`), so the emitted
+        // truncating `idiv` would answer `-3`: it must never be admitted.
+        ("erlang", "intdiv", 2),
     ]);
     let args = vec![Operand::X(0), Operand::Integer(1)];
     for (index, expected) in [
@@ -530,6 +535,9 @@ fn fast_arith_recognizes_only_the_small_int_bifs() {
         (6, Some(SmallArith::Or)),
         (7, Some(SmallArith::Bsr)),
         (8, None),
+        (9, Some(SmallArith::Div)),
+        (10, Some(SmallArith::Rem)),
+        (11, None),
     ] {
         let instr = gc_bif(refs[index], args.clone(), Operand::X(0));
         assert_eq!(
@@ -629,8 +637,10 @@ fn allocation_caches_the_fast_path_operands_and_destination() {
     assert_eq!(allocation.slots, vec![(4, Reg::R12), (2, Reg::R13)]);
     assert_eq!(allocation.slot(2), Some(Reg::R13));
 
-    // A `gc_bif` outside the fast path caches nothing.
-    let (module, refs) = module_with_imports(&[("erlang", "div", 2)]);
+    // A `gc_bif` outside the fast path caches nothing. (`intdiv/2` is the
+    // adjacent arity-2 `erlang` shape the fast path refuses on **semantics**, so
+    // it is the one that proves the refusal rather than a shape mismatch.)
+    let (module, refs) = module_with_imports(&[("erlang", "intdiv", 2)]);
     let code = vec![gc_bif(
         refs[0],
         vec![Operand::X(4), Operand::Integer(1)],
