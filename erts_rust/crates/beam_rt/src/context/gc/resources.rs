@@ -216,7 +216,12 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     // Gate 5: the prune-only valve. A word reachable from the roots in a region the collector does
     // not scan may sit in a container whose children this walk must not trust, so *any* of them
     // declines the whole prune: the residual is a leak, never a dangling payload.
-    if super::reaches_an_unscanned_word(runtime.walk_scratch(), process, roots.iter()) {
+    if super::reaches_an_unscanned_word_at(
+        crate::context::gc_valve_trace::ValveDoor::ResourcePruneValve,
+        runtime.walk_scratch(),
+        process,
+        roots.iter(),
+    ) {
         runtime.note_foreign_reachable(pid);
         crate::debug_trace::trace(format_args!(
             "resource prune declined for {pid:?}: a root reaches a word outside the scanned region"
@@ -230,7 +235,8 @@ pub(crate) fn reclaim(runtime: &mut Runtime, table: &mut ProcessTable, pid: Proc
     // the same id, and it designates the same object. The host root sources are seeded into the same
     // walk, so a resource named **only** by a pending timer delivery (or a pending spawn, a
     // `seq_trace` token, an escaped closure's environment) is reached and kept.
-    let reached = super::super::gc_walk::reachable_resource_words(
+    let reached = super::super::gc_walk::reachable_resource_words_at(
+        crate::context::gc_valve_trace::ValveDoor::ResourceWalk,
         runtime.walk_scratch(),
         process,
         roots.iter(),

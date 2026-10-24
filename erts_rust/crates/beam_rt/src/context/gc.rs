@@ -163,7 +163,16 @@ use crate::RuntimeContext;
 ///
 /// It is re-exported here (rather than called by its own path at each site) so the three
 /// admission-point call sites and the runner's park arm cannot drift onto different valves.
-pub(crate) use super::gc_walk::{any_root_is_unscanned, reaches_an_unscanned_word, valve_verdict};
+// The door-tagged forms are what every production call site uses (each names its own
+// [`super::gc_valve_trace::ValveDoor`] so the invocation census can attribute the walk). The
+// un-doored forms are kept re-exported because the unit suites call them directly, and because the
+// per-site docs link to them; a production caller reaching for one of those would land in
+// `ValveDoor::Other` and show up unidentified in the census.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use super::gc_walk::{
+    any_root_is_unscanned, any_root_is_unscanned_at, reaches_an_unscanned_word,
+    reaches_an_unscanned_word_at, valve_verdict, valve_verdict_at,
+};
 mod reds_door;
 /// The **reduction/yield-boundary** collection point — the slice-end door a workload whose loop
 /// reaches no heap-admission point still gets collected at (see the module docs of
@@ -459,18 +468,31 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     // buys is that the per-word classification and the forwarding test can never read two
     // different geometries inside one decision.
     let bounds = process.collector().scanned_bounds();
-    root_is_unscanned_with(process, &bounds, term)
+    // The invocation census's flag ([`super::gc_valve_trace`]) is read here, once per
+    // classification, because this one-shot form has no walk to hoist it out of: its production
+    // caller is the BIF-result gate, which reaches it at most once per `call_bif` and only after
+    // the shape test has already admitted the result.
+    root_is_unscanned_with(
+        process,
+        &bounds,
+        term,
+        super::gc_valve_trace::enabled(),
+    )
 }
 
 /// [`root_is_unscanned`] against a [scanned-bounds](ScannedBounds) value the caller already read
 /// — the form the reachability walk uses, so one aggregate read serves a whole walk.
+///
+/// `traced` is the invocation census's flag, hoisted by the walk (read once per walk) and passed
+/// down so the per-word scanned test never probes the environment itself.
 pub(crate) fn root_is_unscanned_with(
     process: &Process,
     bounds: &ScannedBounds,
     term: Eterm,
+    traced: bool,
 ) -> bool {
-    match word_region(process, bounds, term) {
-        Some(WordRegion::Foreign) => forwards_scanned_word(process, bounds, term),
+    match word_region(process, bounds, term, traced) {
+        Some(WordRegion::Foreign) => forwards_scanned_word(process, bounds, term, traced),
         Some(WordRegion::Scanned) | None => false,
     }
 }
@@ -555,10 +577,20 @@ pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: E
 /// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only
 /// means "ask them".
 fn outside_bounds(collector: &AnyCollector, bounds: &ScannedBounds, ptr: usize) -> bool {
+    // The invocation census's tier split ([`super::gc_valve_trace`]), read as one hoisted flag so
+    // the untraced path pays a single predictable branch per tier instead of an env lookup.
+    let traced = super::gc_valve_trace::enabled();
     if bounds.definitely_unscanned(ptr as *const Eterm) {
+        if traced {
+            super::gc_valve_trace::note_tier1_foreign();
+        }
         return true;
     }
-    outside_scanned_exactly(collector, ptr)
+    let outside = outside_scanned_exactly(collector, ptr);
+    if traced {
+        super::gc_valve_trace::note_tier2(outside);
+    }
+    outside
 }
 
 /// **Tier two on its own**: whether `ptr` lies outside every region `collector` relocates,
@@ -1273,7 +1305,8 @@ pub(crate) fn ensure_heap(
     // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
     // container really did reach a live root, which is the event the gate records.
     let descend = runtime.foreign_reachable(pid);
-    let declined = any_root_is_unscanned(
+    let declined = any_root_is_unscanned_at(
+        super::gc_valve_trace::ValveDoor::EnsureHeap,
         runtime.walk_scratch(),
         process,
         x_regs.iter().chain(stack.iter()),
@@ -1583,7 +1616,13 @@ fn ensure_heap_full_commit(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict_at(
+        super::gc_valve_trace::ValveDoor::EnsureHeapFull,
+        runtime.walk_scratch(),
+        process,
+        machine_roots(),
+        descend,
+    );
     let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::EnsureHeapFull, descend, declined);
@@ -2092,7 +2131,13 @@ fn alloc_words_rooted_commit(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict_at(
+        super::gc_valve_trace::ValveDoor::AllocWordsRooted,
+        runtime.walk_scratch(),
+        process,
+        machine_roots(),
+        descend,
+    );
     let declined = verdict.declined;
     #[cfg(test)]
     valve_counters::note_valve(valve_counters::Door::AllocWordsRooted, descend, declined);

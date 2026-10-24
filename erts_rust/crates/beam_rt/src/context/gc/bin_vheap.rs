@@ -410,7 +410,13 @@ pub(crate) fn reclaim(
     // the walk the machine's whole root set as a *collection*, and this point does not change that
     // policy.
     let descend = runtime.foreign_reachable(pid);
-    let verdict = super::valve_verdict(runtime.walk_scratch(), process, roots.iter(), descend);
+    let verdict = super::valve_verdict_at(
+        crate::context::gc_valve_trace::ValveDoor::BinVheapCollection,
+        runtime.walk_scratch(),
+        process,
+        roots.iter(),
+        descend,
+    );
     if verdict.declined {
         runtime.note_foreign_reachable(pid);
         return Ok(0);
@@ -423,8 +429,12 @@ pub(crate) fn reclaim(
     // collector does not scan is *invisible* to it: freeing on that silence is a dangling pointer.
     // See [`super::reaches_an_unscanned_word`] for the criterion and why it declines strictly more
     // often than the collection does.
-    let unscanned =
-        super::reaches_an_unscanned_word(runtime.walk_scratch(), process, roots.iter());
+    let unscanned = super::reaches_an_unscanned_word_at(
+        crate::context::gc_valve_trace::ValveDoor::BinVheapPrune,
+        runtime.walk_scratch(),
+        process,
+        roots.iter(),
+    );
     if unscanned {
         runtime.note_foreign_reachable(pid);
         return Ok(0);

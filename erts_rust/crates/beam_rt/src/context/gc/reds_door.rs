@@ -59,7 +59,7 @@ use beam_process::ProcessTable;
 use crate::RuntimeContext;
 use super::{
     drain_max_heap_verdict, machine_root_bounds, publish_roots_full, scatter_roots_full,
-    valve_verdict,
+    valve_verdict_at,
 };
 /// How many reductions must have accumulated since this process's last boundary collection
 /// before the next pre-emption may collect.
@@ -261,7 +261,13 @@ pub(crate) fn collect_at_reds_boundary(
             .chain(roots.stack.iter())
             .chain(roots.fr[..fr_count].iter())
     };
-    let verdict = valve_verdict(runtime.walk_scratch(), process, machine_roots(), descend);
+    let verdict = valve_verdict_at(
+        crate::context::gc_valve_trace::ValveDoor::RedsBoundary,
+        runtime.walk_scratch(),
+        process,
+        machine_roots(),
+        descend,
+    );
     if verdict.declined {
         runtime.note_foreign_reachable(pid);
         return Ok(());
