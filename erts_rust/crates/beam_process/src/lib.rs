@@ -96,7 +96,7 @@ pub mod smp;
 pub mod timer;
 
 mod error; // pub(crate) constructors only — NOT public
-
+mod scratch; // pub(crate) collection buffers only — NOT public
 pub use crate::dict::*;
 pub use crate::dirty::*;
 pub use crate::exit_observer::*;
