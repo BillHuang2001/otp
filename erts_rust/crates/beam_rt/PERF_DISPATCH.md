@@ -415,22 +415,23 @@ The same census, run against `bench_foreign_driver` and a real `compile:file/2`,
 5. **A `String` clone removed from the per-call path.** The fun-caller/send bridges hold the caller module as `Option<&str>`, `enter_module` refills its buffer instead of allocating, and the BIF-result gate shape-tests before it probes the process table.
 6. **A real bug fixed:** the refactor had hoisted `RuntimePorts` (which holds `Rc::clone` of the shared atom table) out of the invoke block, so the atom commit's `Rc::get_mut` append-only fast path was lost and `make_mut` cloned the **whole table** — one `String` per atom, per interning call. `atom_table_commit_alloc` failed deterministically at 2041/8043 allocations; after dropping the provider before the commit it is 7 at both table sizes.
 ### Before/after — retired instructions (deterministic; the control rebuilt from its own source)
-`perf stat -e instructions:u`, pinned to a P-core, marginal estimator `(I(N) − I(0)) / N`:
+`perf stat -e instructions:u`, pinned to a P-core, three alternating reps per side (spread ≤0.1 %), cumulative across the whole cut:
 | fixture (N) | before | after | Δ |
 |---|---|---|---|
-| `bench_gc_bound:churn/1` (20 000) | 30 479.4 M | 26 038.6 M | **−14.6 %** |
-| `bench_foreign_driver:dec/1` (200 000) | 26 701.8 M | 24 402.9 M | **−8.6 %** |
-| `bench_foreign_driver:enc/1` (200 000) | 15 923.0 M | 15 023.5 M | −5.7 % |
-| `bench_foreign_driver:lower/1` (200 000) | 19 857.4 M | 19 678.0 M | −0.9 % |
-| `bench_foreign_driver:cap/1` (200 000) | 24 296.7 M | 24 122.3 M | −0.7 % |
-Wall clock agrees on the same two families (`churn` −9.8 % then −5.8 %, `dec` −9.2 % then −3.2 %) and is **not** evidence on `lower`/`cap`, whose ±2–4 % band is this host's two-build wall spread while their instructions *fell*.
+| `bench_gc_bound:churn/1` (20 000) | 30 477.8 M | 25 835.2 M | **−15.2 %** |
+| `bench_foreign_driver:dec/1` (200 000) | 26 697.9 M | 24 395.5 M | **−8.6 %** |
+| `bench_foreign_driver:enc/1` (200 000) | 15 925.8 M | 15 011.7 M | −5.7 % |
+| `bench_foreign_driver:lower/1` (200 000) | 19 867.7 M | 19 669.8 M | −1.0 % |
+| `bench_foreign_driver:cap/1` (200 000) | 24 297.8 M | 24 119.4 M | −0.7 % |
+Wall clock agrees on the two high-signal families (`churn` −9.8 % then −5.8 %, `dec` −9.2 % then −3.2 %) and is **not** evidence on `lower`/`cap`, whose ±2–4 % band is this host's two-build wall spread while their instructions *fell*.
+The last landing (`src/runtime/gc.rs`) is worth −0.78 % of `churn` on its own: `gc_request_pending` was inlined whole into both heap doors, so the ~40-instruction hashbrown probe loop **plus 6–7 callee-saved pushes** sat in each door's prologue although the probe only ever *executes* when the forced-request set is non-empty. It is now an inline length compare in front of an `#[inline(never)]` probe. **`#[inline(never)]` is the only outline that survives `lto = "thin"` + `codegen-units = 1`** — a plain private helper is re-inlined across crates, so any earlier "we outlined it" claim is only true where the attribute is present (check the binary, not the comment). Per-symbol `perf report` shares are **not** comparable across two builds here for the same reason: the door's inline set changes the symbol that owns its instructions, so use the run total.
 ### The per-call budget this cut leaves behind
 **≈430 instructions of this crate's own work** per registered BIF call: ≈83 routing (`call_bif`'s NIF → floor → memo draw), ≈223 `BifContext` build + arm selection, ≈127 tail. Everything else in a call is `beam_engine` (`families::dispatch`, `exec_bif`, `local_call_seam`, `alloc_rooted`, `jit_set_position`), `src/runner/budget.rs`'s forwarding triple, or the BIF body.
 ### What is left, ranked and owned (do not re-derive)
 1. **`src/runner/budget.rs`'s per-call forwarding triple** — 9.74 % of a churn run. Two borrowed stack fields and UFCS forwarding only, so this is *event* count (the engine charges `reduce(1)` per in-block transfer), not indirection: a maintenance win, not a speed one.
 2. **`beam_engine`'s baseline-JIT arith inlineset omits `rem`/`div`**, so `erlang:rem/2` takes the whole `call_bif` road and reaches `beam_bifs::arith::int_rem` → `Big::div_rem`, which allocates three heap `Vec`s. `N rem 256` vs `N band 255` over the same loop measures **≈50 % of churn's entire marginal** — the largest fixable per-call cost in the runtime.
 3. **`beam_engine`'s dispatch/bookkeeping symbols** (~18 % of a churn run in aggregate), then `beam_gc`/`beam_process`'s per-collection scratch (`malloc`/`free` 8.3 %).
-4. **`src/runtime/gc.rs::gc_request_pending`** — inlining `is_empty` and outlining the SipHash `contains` is worth ≈0.8 %; a safe `Heap` primitive that writes the header + placeholders and returns the base without a `Result` is worth ≈0.5–0.8 %.
+4. **`src/runtime/gc.rs::gc_request_pending`** — done (the split above, −0.78 %). What is left on this path is `src/context/gc.rs`'s `bump`/`plain_bump` (`:231`, `:300`) doing `let base = heap.hp(); heap.tuple(&fill[..n-1])?; Ok(base)` — building a complete tuple (arity header + NIL fill) and **discarding the `Eterm`** on every engine reservation; ~20 engine builders go through it and the dominant request is the one-cons-cell `n == 2`. A safe `Heap::reserve_terms(&mut self, n) -> Result<*mut Eterm>` (fill all `n` words with `NIL`, no arity header, no `MAX_ARITYVAL` check) plus a `pub(crate) unsafe fn fill_terms_at(..)` beside the three `beam_alloc/src/bump.rs` helpers is bound at **≤0.5 %** — `beam_alloc` is a sibling node. It **must fill**: `Heap::used_words_mut` is a safe `&mut [Eterm]` over `[0, used)`, so an uninitialised reservation would make UB reachable from safe code.
 ### Rejected on measurement (recorded so it is not retried)
 * **A floor-namespace gate in front of `try_native`'s 125-arm match** (`src/native.rs`): **+0.29 % instructions** — `erlang` is itself one of the floor's 14 namespace names and ~99 % of churn's calls, and the arm walk is already a well-predicted ~1 instruction.
 * **A thin `BifContext`**: ablating the whole `with_*` chain on the hooks-free arm is ≤1.5 instructions per dispatch and wrong-signed; `black_box`ing the five handles (a fair model of *not* getting SROA) costs 18.5 instructions, so thin LTO + one codegen unit already removes the struct moves.
