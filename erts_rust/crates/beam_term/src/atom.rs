@@ -163,6 +163,62 @@ impl Clone for AtomTable {
     }
 }
 
+impl AtomTable {
+    /// A second, independent table over the **same** names: every index resolves exactly as it
+    /// does in `self`, but nothing is copied except two container headers and one handle per entry.
+    ///
+    /// This is the constructor for a consumer that must be *allowed to append* (typically one
+    /// literal-only atom while lowering a module) without paying a whole-table deep copy: unlike
+    /// [`AtomTable::clone`] it allocates **no** name string — `names` clones as `Arc<str>` handles
+    /// and `index`'s keys share those same handles — so an `N`-atom fork costs exactly **two**
+    /// allocations (one `Vec`, one hash-table bucket array) and `Θ(N)` handle/word copies instead
+    /// of `Θ(N)` string allocations, `N` re-hashes and `N` string-byte copies.
+    ///
+    /// What is preserved, and why each half matters:
+    ///
+    /// * **Every index.** `names` is copied positionally and `index` maps the same handles to the
+    ///   same indices, so `fork.name(a) == self.name(a)` and `fork.lookup(n) == self.lookup(n)`
+    ///   for every atom of `self`. Indices are the only thing downstream code can observe
+    ///   (`Atom` is a bare, table-relative index), so this makes a fork a drop-in replacement for
+    ///   a clone in any "lower with a private table, then merge the appended tail back" protocol.
+    /// * **The generation**, so the fork's `generation - len` arithmetic means the same thing as
+    ///   the parent's. A producer that only needs a *prefix-stable* table can therefore hand a
+    ///   fork to a decoder whose memo was validated against the parent's last snapshot.
+    /// * **A fresh identity** ([`AtomTable::appended_since`]'s `instance`). A fork is not an
+    ///   extension of `self`: both sides may append independently, in different orders, so neither
+    ///   one's snapshot may ever validate against the other. That holds in **both** directions —
+    ///   `fork.appended_since(self.snapshot())` and `self.appended_since(fork.snapshot())` are
+    ///   both `false` — which is what keeps the O(1) witness sound.
+    ///
+    /// The two tables are otherwise fully independent (each has its own `Vec` and `HashMap`), so
+    /// appending to one leaves the other's `len`/`generation`/contents untouched: a name interned
+    /// into the fork after the fork is invisible to the parent and vice versa. A name that *both*
+    /// sides intern afterwards lands at the same index (both start at the same length) but is a
+    /// separate `Arc<str>` allocation — the fork shares only the handles it was born with.
+    ///
+    /// [`AtomTable::clone`] deliberately keeps its deep-copy meaning; use this only where the
+    /// copy's *independence of name storage* is not part of the contract. See the `Clone` impl's
+    /// rustdoc for the two suites that pin `clone`'s scaling.
+    pub fn fork(&self) -> AtomTable {
+        // Same invariant `clone` asserts: one index entry per interned name, in index order.
+        debug_assert_eq!(
+            self.index.len(),
+            self.names.len(),
+            "the index holds exactly one entry per interned name"
+        );
+        // `Vec<Arc<str>>::clone` is one allocation plus one refcount bump per entry; the strings
+        // themselves are shared. `HashMap::clone` is one bucket-array allocation; it clones the
+        // control bytes and re-places each entry, so the keys are *not* re-hashed (and the
+        // `Arc<str>` keys therefore stay pointer-identical to `self`'s).
+        AtomTable {
+            names: self.names.clone(),
+            index: self.index.clone(),
+            instance: next_instance(),
+            generation: self.generation,
+        }
+    }
+}
+
 /// An O(1) witness of an [`AtomTable`]'s state, for validating a memoized image
 /// of the table in constant time. Obtained from [`AtomTable::snapshot`].
 ///
@@ -822,5 +878,204 @@ atom nil no none
         assert_eq!(snap, copied);
         assert_eq!(snap.len(), t.len());
         assert_eq!(snap.generation(), t.generation());
+    }
+
+    // -----------------------------------------------------------------------
+    // `fork()` — the handle-sharing whole-table copy
+    // -----------------------------------------------------------------------
+
+    /// A table of `n` names, interned in index order.
+    fn table_of(n: usize) -> AtomTable {
+        let names: Vec<String> = (0..n).map(|i| format!("fork_test_atom_{i:05}")).collect();
+        let mut t = AtomTable::new();
+        t.seed(names.iter().map(String::as_str));
+        t
+    }
+
+    #[test]
+    fn fork_preserves_every_index_and_the_generation() {
+        let parent = table_of(300);
+        let fork = parent.fork();
+        assert_eq!(fork.len(), parent.len());
+        assert_eq!(fork.generation(), parent.generation());
+        assert!(!fork.is_empty());
+        for index in 0..parent.len() {
+            let atom = Atom::from_raw(index as u32);
+            assert_eq!(
+                fork.name(atom),
+                parent.name(atom),
+                "index {index} must resolve identically in a fork"
+            );
+            // `lookup` sees the same atom for the same name
+            let name = parent.name(atom).expect("in range");
+            assert_eq!(fork.lookup(name), Some(atom));
+        }
+        // a name the parent never interned is in neither table
+        assert_eq!(fork.lookup("fork_test_atom_99999"), None);
+        assert_eq!(fork.name(Atom::from_raw(300)), None);
+    }
+
+    #[test]
+    fn fork_shares_the_arc_handles_and_copies_no_string() {
+        let parent = table_of(200);
+        // A table on its own holds two handles per name: one in `names`, one as an `index` key.
+        let alone: Vec<usize> = parent
+            .names
+            .iter()
+            .map(|name| Arc::strong_count(name))
+            .collect();
+        assert!(alone.iter().all(|&count| count == 2), "{alone:?}");
+        let fork = parent.fork();
+        for index in 0..parent.len() {
+            assert!(
+                Arc::ptr_eq(&parent.names[index], &fork.names[index]),
+                "index {index}: a fork shares the name handle, it does not copy the string"
+            );
+            assert_eq!(
+                Arc::strong_count(&parent.names[index]),
+                alone[index] + 2,
+                "index {index}: a fork adds exactly two handles to the shared string — one for its \
+                 `names` slot and one for its `index` key — and copies no string"
+            );
+        }
+        // ... and the fork's `index` keys are those same handles, not re-materialized strings.
+        for name in &parent.names {
+            assert!(
+                Arc::ptr_eq(name, fork.index.get_key_value(&**name).expect("keyed").0),
+                "the fork's index must key on the shared handle"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fork_has_a_fresh_identity_in_both_directions() {
+        let mut parent = table_of(4);
+        let parent_snap = parent.snapshot();
+        let fork = parent.fork();
+        let fork_snap = fork.snapshot();
+        // identical content, identical generation — and still no mutual validation
+        assert_eq!(parent_snap.len(), fork_snap.len());
+        assert_eq!(parent_snap.generation(), fork_snap.generation());
+        assert_ne!(parent_snap, fork_snap, "the identity half differs");
+        assert!(!fork.appended_since(parent_snap));
+        assert!(!parent.appended_since(fork_snap));
+        // each side is append-valid against its own snapshot
+        assert!(parent.appended_since(parent_snap));
+        assert!(fork.appended_since(fork_snap));
+        // ... including after both have appended independently
+        parent.intern("after_fork_parent");
+        let mut fork = fork;
+        fork.intern("after_fork_fork");
+        assert!(parent.appended_since(parent_snap));
+        assert!(fork.appended_since(fork_snap));
+        assert!(!fork.appended_since(parent_snap));
+        assert!(!parent.appended_since(fork_snap));
+    }
+
+    #[test]
+    fn interning_into_either_side_leaves_the_other_untouched() {
+        let mut parent = table_of(5);
+        let fork = parent.fork();
+        let parent_len = parent.len();
+        let parent_generation = parent.generation();
+        let parent_snap = parent.snapshot();
+
+        // append to the fork: the parent's observable state is untouched
+        let mut fork = fork;
+        let forked_atom = fork.intern("only_in_the_fork");
+        assert_eq!(forked_atom.raw() as usize, parent_len);
+        assert_eq!(fork.len(), parent_len + 1);
+        assert_eq!(parent.len(), parent_len);
+        assert_eq!(parent.generation(), parent_generation);
+        assert_eq!(parent.snapshot(), parent_snap);
+        assert_eq!(parent.lookup("only_in_the_fork"), None);
+        assert_eq!(parent.name(forked_atom), None);
+        // `intern` appends in index order, so the fork is still a prefix extension of the parent
+        for index in 0..parent_len {
+            assert_eq!(
+                fork.name(Atom::from_raw(index as u32)),
+                parent.name(Atom::from_raw(index as u32))
+            );
+        }
+
+        // ... and the mirror direction: a name interned into the parent after the fork is
+        // invisible to the fork. Same index, different name — they are separate tables.
+        let parent_atom = parent.intern("only_in_the_parent");
+        assert_eq!(parent_atom.raw() as usize, parent_len);
+        assert_eq!(parent.name(parent_atom), Some("only_in_the_parent"));
+        assert_eq!(fork.name(parent_atom), Some("only_in_the_fork"));
+        assert_eq!(parent.lookup("only_in_the_fork"), None);
+        assert_eq!(fork.lookup("only_in_the_parent"), None);
+        assert_eq!(parent.len(), fork.len());
+    }
+
+    #[test]
+    fn fork_of_an_empty_table() {
+        let parent = AtomTable::new();
+        let fork = parent.fork();
+        assert!(fork.is_empty());
+        assert_eq!(fork.len(), 0);
+        assert_eq!(fork.generation(), 0);
+        assert_eq!(fork.lookup("anything"), None);
+        // the fork of an empty table still has its own identity
+        assert!(!fork.appended_since(parent.snapshot()));
+        assert!(!parent.appended_since(fork.snapshot()));
+        // and both can grow independently from index 0
+        let mut parent = parent;
+        let mut fork = fork;
+        assert_eq!(parent.intern("a").raw(), 0);
+        assert_eq!(fork.intern("b").raw(), 0);
+        assert_eq!(parent.name(Atom::from_raw(0)), Some("a"));
+        assert_eq!(fork.name(Atom::from_raw(0)), Some("b"));
+    }
+
+    #[test]
+    fn fork_of_a_fork_is_the_same_shape() {
+        let parent = table_of(64);
+        let alone = Arc::strong_count(&parent.names[0]);
+        let fork = parent.fork();
+        let grand = fork.fork();
+        assert_eq!(grand.len(), parent.len());
+        assert_eq!(grand.generation(), parent.generation());
+        for index in 0..parent.len() {
+            let atom = Atom::from_raw(index as u32);
+            assert_eq!(grand.name(atom), parent.name(atom));
+            assert!(
+                Arc::ptr_eq(&parent.names[index], &grand.names[index]),
+                "the handles stay shared across generations of forks"
+            );
+            assert_eq!(
+                Arc::strong_count(&parent.names[index]),
+                alone + 4,
+                "two extra handles per fork generation (a `names` slot and an `index` key)"
+            );
+        }
+        // three live tables, three distinct identities
+        assert_ne!(parent.snapshot(), fork.snapshot());
+        assert_ne!(fork.snapshot(), grand.snapshot());
+        assert_ne!(parent.snapshot(), grand.snapshot());
+        assert!(!grand.appended_since(parent.snapshot()));
+        assert!(!grand.appended_since(fork.snapshot()));
+    }
+
+    #[test]
+    fn fork_is_a_drop_in_for_the_lower_then_merge_protocol() {
+        // The `beam_rt` shape: lower with a private table that may append literal-only atoms at
+        // exactly `len..`, then merge that tail back into the shared table by index.
+        let mut shared = table_of(16);
+        let base = shared.len();
+        let mut lowered = shared.fork();
+        let literal_only = lowered.intern("only_in_a_literal");
+        assert_eq!(literal_only.raw() as usize, base);
+        assert_eq!(lowered.len(), base + 1);
+        for index in base..lowered.len() {
+            let name = lowered.name(Atom::from_raw(index as u32)).expect("in range");
+            let merged = shared.intern(name);
+            assert_eq!(merged.raw() as usize, index, "the tail merges back by index");
+        }
+        // the shared table now resolves that index to the same name, at the same index, as the
+        // private table the module was lowered against
+        assert_eq!(shared.name(literal_only), Some("only_in_a_literal"));
+        assert_eq!(shared.len(), lowered.len());
     }
 }

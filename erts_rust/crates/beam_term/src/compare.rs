@@ -153,7 +153,7 @@
 use core::cmp::Ordering;
 
 use crate::atom::AtomTable;
-use crate::bitstring::{bit_at, bitstring_parts, float_bits};
+use crate::bitstring::{bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, is_float};
 use crate::eterm::Eterm;
 use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
@@ -183,8 +183,15 @@ mod maps;
 /// field-by-field port/ref rules and their documented conventions live together.
 mod identity;
 
+/// The bitstring arm — `erts_cmp_bits`' byte-aligned fast path plus the bit loop its
+/// unaligned case needs. Split out because this arm's cost follows the *payload length*
+/// rather than the term count. See the module docs for why the three walks cannot
+/// disagree.
+mod bits;
+
 pub use identity::LocalNodeId;
 
+use bits::cmp_bits;
 use identity::{cmp_mixed, cmp_ref_ids};
 use maps::cmp_maps;
 use numbers::cmp_numbers;
@@ -285,7 +292,25 @@ pub fn cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
 ///
 /// A non-term word is exactly equal only to the identical word (never to a real
 /// term) — see [`cmp`].
+///
+/// # Atom equality is index equality
+///
+/// Two **different** atom words are never `=:=`. Within one [`AtomTable`] — which is
+/// the contract every entry point here already assumes (see the module `Known Issues`)
+/// — [`AtomTable::intern`] is name-unique, so distinct indices carry distinct names;
+/// [`cmp_atoms`] then compares those names and can only answer `Equal` for *equal*
+/// names, i.e. for one index. An index the table does not know falls back there to the
+/// raw-index comparison, the same verdict. So `a.raw() != b.raw()` with both operands
+/// atoms is `false` **without** either name lookup and without the `memcmp` — which is
+/// what a flat-map/`ETS` key scan over atom keys spends most of its time on.
+///
+/// This is an equality-only shortcut: [`cmp`] still orders atoms by name, exactly as
+/// `erts_cmp_atoms` (`utils.c:1715-1723`) specifies, because *ordering* needs the
+/// names and equality does not.
 pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
+    if a.raw() != b.raw() && is_atom(a) && is_atom(b) {
+        return false;
+    }
     cmp(a, b, atoms).is_eq()
 }
 
@@ -581,28 +606,29 @@ unsafe fn cmp_lists(a: Eterm, b: Eterm, ctx: CmpCtx<'_>) -> Ordering {
     }
 }
 
-/// `erts_cmp_bits` — compare two bitstrings bit-by-bit (most-significant first),
-/// then by bit size.
+/// `erts_cmp_bits` — compare two bitstrings over the `min(a_size, b_size)` common bits
+/// (most-significant first), then by bit size.
+///
+/// The common-bit prefix is compared by [`bits::cmp_bits`], which walks the same bit
+/// sequence byte-at-a-time when both bases are byte-aligned (the C's
+/// `if (((a_offs | b_offs | size) & 7) == 0) sys_memcmp(..)` fast path,
+/// `erl_bits.h:559-577`) and bit-by-bit otherwise. Both walks are the *same*
+/// lexicographic order over the same bits, so the verdict is unchanged.
 ///
 /// # Safety
 ///
 /// `a` and `b` must be live bitstring terms.
 unsafe fn cmp_bitstrings(a: Eterm, b: Eterm) -> Ordering {
-    // SAFETY: both are bitstrings.
-    let asz = unsafe { bitstring_parts(a) }.2;
+    // SAFETY: both are bitstrings, so each `bitstring_parts` reads only live header and
+    // base words and hands back that term's own base/bit-offset/bit-size.
+    let (a_base, a_off, asz) = unsafe { bitstring_parts(a) };
     // SAFETY: as above.
-    let bsz = unsafe { bitstring_parts(b) }.2;
+    let (b_base, b_off, bsz) = unsafe { bitstring_parts(b) };
     let n = asz.min(bsz);
-    let mut i = 0;
-    while i < n {
-        // SAFETY: bit `i` is within both bitstrings (`i < n <= asz, bsz`).
-        let abit = unsafe { bit_at(a, i) };
-        // SAFETY: as above.
-        let bbit = unsafe { bit_at(b, i) };
-        if abit != bbit {
-            return abit.cmp(&bbit);
-        }
-        i += 1;
+    // SAFETY: both bases cover `n` bits from their own offset (`n <= asz` and `n <= bsz`).
+    let ord = unsafe { cmp_bits(a_base, a_off, b_base, b_off, n) };
+    if ord != Ordering::Equal {
+        return ord;
     }
     asz.cmp(&bsz)
 }

@@ -341,11 +341,15 @@ pub unsafe fn bit_at(t: Eterm, i: usize) -> bool {
 
 /// Read bit `bit` (0 = most significant bit of the base byte) of a bitstring base.
 ///
+/// The one bit-level reader of the crate: [`bit_at`] applies it to a term's base and
+/// offset, and the comparison arm ([`crate::compare`]'s `erts_cmp_bits` port) applies
+/// it to a base/offset pair it already resolved.
+///
 /// # Safety
 ///
 /// `base` must point at bit data covering bit `bit`.
 #[inline]
-unsafe fn raw_bit(base: *const u8, bit: usize) -> u8 {
+pub(crate) unsafe fn raw_bit(base: *const u8, bit: usize) -> u8 {
     // SAFETY: the caller guarantees the byte is in range.
     unsafe { (*base.add(bit >> 3) >> (7 - (bit & 7))) & 1 }
 }

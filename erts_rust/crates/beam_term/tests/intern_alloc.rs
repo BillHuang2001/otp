@@ -40,6 +40,11 @@
 //!    `beam_rt/tests/atom_table_commit_alloc.rs` relies on: it uses `rt.atoms().clone()` as its
 //!    positive control and requires the control to scale with the table. A shared-`Arc` clone
 //!    would allocate O(1) and silently make that sibling pin vacuous.
+//! 5. **(e) `AtomTable::fork()` allocates two containers and nothing else**, at any table size —
+//!    the same copy made from shared name handles, which is what the per-module load of a
+//!    `beam_rt` boot uses. Its allocation count is *flat* in the table size while `clone`'s is
+//!    linear, and (d) and (e) are the two halves of that contrast: one pinning that `clone`
+//!    still scales, the other that `fork` does not.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -233,6 +238,10 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
     small_table.seed(small_names.iter().map(String::as_str));
     let (clone_small, _c1) = allocations_in(|| small_table.clone());
     let (clone_large, _c2) = allocations_in(|| seeded.clone());
+    // (e) `fork()` at the same two sizes, plus the empty table: two container allocations, flat.
+    let (fork_small, _f1) = allocations_in(|| small_table.fork());
+    let (fork_large, _f2) = allocations_in(|| seeded.fork());
+    let (fork_empty, _f3) = allocations_in(|| AtomTable::new().fork());
 
     // Print everything *before* asserting, so a pre-fix run still reports every figure.
     for line in [
@@ -243,6 +252,9 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
         reintern.line("(c) intern(existing)"),
         clone_small.line(&format!("(d) clone({SMALL})")),
         clone_large.line(&format!("(d) clone({NAMES})")),
+        fork_small.line(&format!("(e) fork({SMALL})")),
+        fork_large.line(&format!("(e) fork({NAMES})")),
+        fork_empty.line("(e) fork(empty)"),
     ] {
         println!("{line}");
     }
@@ -299,5 +311,31 @@ fn interning_allocates_one_string_per_novel_name_and_a_clone_scales() {
         "the clone must scale with the table: {NAMES} atoms cost {} allocations, {SMALL} atoms {}",
         clone_large.allocations,
         clone_small.allocations
+    );
+    // (e) `fork` shares the name handles: two containers (the `names` `Vec` and the `index`
+    // buckets), no string per entry — so the count is flat in the table size, and it is the
+    // *contrast* with (d) that makes each half meaningful: `clone` still scales, `fork` does not.
+    assert_eq!(
+        fork_large.allocations, 2,
+        "a fork of a {NAMES}-atom table must allocate exactly two containers (a `Vec` of handles \
+         and a hash-table bucket array), got {}",
+        fork_large.allocations
+    );
+    assert_eq!(
+        fork_small.allocations, fork_large.allocations,
+        "a fork must not scale with the table: {SMALL} atoms cost {} allocations, {NAMES} atoms {}",
+        fork_small.allocations,
+        fork_large.allocations
+    );
+    assert_eq!(
+        fork_empty.allocations, 0,
+        "a fork of an empty table allocates nothing"
+    );
+    assert!(
+        fork_large.bytes < clone_large.bytes,
+        "a fork must move fewer bytes than a deep clone (it copies handles and bucket slots, \
+         never the name bytes): {} vs {} bytes for {NAMES} atoms",
+        fork_large.bytes,
+        clone_large.bytes
     );
 }
