@@ -23,14 +23,14 @@
 //! `md5_final/1`.
 //!
 //! Ground truth (read-only): `../../erts/emulator/beam/erl_bif_chksum.c` (the
-//! `do_chksum` iolist walk and the `(OldChecksum, Data)` / `*_combine/3` wrappers),
-//! `../../erts/emulator/beam/erl_md5.c` + `erl_md5.h` (the `erts_md5_state` and its
-//! `init`/`update`/`finish`/`hash_part`/`pad`) and `../../erts/emulator/zlib/crc32.c` +
-//! `adler32.c` (the CRC-32/Adler-32 algorithms and the `*_combine` operator arithmetic).
-//! The two zlib checksums are **not** reproduced here: they are the workspace's
-//! `beam_deflate::checksum` port of those two files (the lowest common ancestor this
-//! crate and `beam_deflate`'s own gzip/zlib trailers share), and this module forwards to
-//! them. MD5 has no other consumer, so it stays here.
+//! `do_chksum` iolist walk and the `(OldChecksum, Data)` / `*_combine/3` wrappers) and
+//! `../../erts/emulator/zlib/crc32.c` + `adler32.c` (the CRC-32/Adler-32 algorithms and
+//! the `*_combine` operator arithmetic).
+//! None of the three digests is reproduced here: they are the workspace's single
+//! implementations at their lowest common ancestors — `beam_deflate::checksum`'s port of
+//! `crc32.c`/`adler32.c` (shared with `beam_deflate`'s own gzip/zlib trailers) and
+//! `beam_common::md5`'s RFC 1321 port of `erl_md5.c` (shared with the `.beam` chunk
+//! checksum and the distribution handshake digest) — and this module forwards to them.
 //!
 //! Every value pinned below was **probed against the system oracle** (OTP 29 /
 //! erts-17.1); `tests/checksum.rs` additionally cross-checks a corpus live.
@@ -76,7 +76,8 @@
 //! zero length" variant: `crc32_combine(C1, C2, 0)` is `C1 bxor C2` in erts-17.1.
 //! `adler32_combine/3` is zlib's `adler32_combine_` (`adler32.c:133`), with OTP's
 //! own `length == 0` workaround (`erl_bif_chksum.c:443`) that returns `C1`. Both are
-//! [`beam_deflate::checksum`]'s, so the arithmetic exists once in the workspace.
+//! [`beam_deflate::checksum`]'s and the MD5 rounds are `beam_common::md5`'s, so each
+//! digest's arithmetic exists exactly once in the workspace.
 
 use beam_common::Result;
 use beam_term::{signed_value, Eterm};
@@ -298,262 +299,78 @@ fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// MD5 (`erts_md5_state`, `erl_md5.c`)
+// MD5 (`erts_md5_state`, `erl_md5.h`)
 // ---------------------------------------------------------------------------
 
-/// `sizeof(erts_md5_state)` — the `md5_init/0` binary's length.
+/// `sizeof(erts_md5_state)` (`erl_md5.h:30-35`) — the `md5_init/0` binary's length.
 const MD5_STATE_LEN: usize = 96;
-/// `MD5_DIGEST_LENGTH` — the `md5/1` and `md5_final/1` binary's length.
-const MD5_DIGEST_LEN: usize = 16;
 
-/// The 64 per-round constants `sk[i].k` of `hash_part` (`erl_md5.c:161-177`).
-const MD5_K: [u32; 64] = [
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-];
-
-/// The 64 per-round left-rotation amounts `sk[i].shift` (`erl_md5.c:161-177`).
-const MD5_SHIFT: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
-    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
-    21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-/// The C `erts_md5_state` (`erl_md5.h:30-35`), the MD5 running context.
-#[derive(Clone)]
-struct Md5State {
-    a: u32,
-    b: u32,
-    c: u32,
-    d: u32,
-    tot_len: u64,
-    len: usize,
-    buf: [u8; 64],
+/// Decodes the 96-byte `erts_md5_state` image into a `beam_common::md5` context.
+///
+/// The MD5 arithmetic is the workspace's single implementation (`beam_common::md5`, the
+/// lowest common ancestor this crate shares with the `.beam`-checksum and distribution
+/// digest users); this module owns only the C struct's byte layout — a term/ABI concern,
+/// since the image is observable as a binary.
+///
+/// `a`/`b`/`c`/`d` are four little-endian `u32`s at offsets 0/4/8/12, `tot_len` a
+/// little-endian `u64` at 16, `len` a little-endian `u64` at 24, and the 64-byte block
+/// buffer at 32. All 64 buffer bytes are stored verbatim (not just `len` of them), so a
+/// hand-crafted image round-trips byte-exactly.
+///
+/// # Errors
+///
+/// [`badarg`] when the image is not exactly [`MD5_STATE_LEN`] bytes. [`unsupported_bif`]
+/// when the `len` field does not fit a `usize` or is outside `0..=64`: the oracle reads and
+/// writes past its 64-byte buffer for such an image (undefined behaviour,
+/// `erl_bif_chksum.c:562`/`:598` never produce one), which cannot be reproduced faithfully
+/// — the crate reports the gap instead of a fabricated digest.
+fn from_image(image: &[u8]) -> Result<beam_common::md5::Md5> {
+    if image.len() != MD5_STATE_LEN {
+        return Err(badarg());
+    }
+    let u32_at =
+        |o: usize| u32::from_le_bytes([image[o], image[o + 1], image[o + 2], image[o + 3]]);
+    let u64_at = |o: usize| {
+        u64::from_le_bytes([
+            image[o],
+            image[o + 1],
+            image[o + 2],
+            image[o + 3],
+            image[o + 4],
+            image[o + 5],
+            image[o + 6],
+            image[o + 7],
+        ])
+    };
+    let len = usize::try_from(u64_at(24)).map_err(|_| unsupported_bif())?;
+    if len > beam_common::md5::BLOCK_LEN {
+        return Err(unsupported_bif());
+    }
+    let mut buf = [0u8; beam_common::md5::BLOCK_LEN];
+    buf.copy_from_slice(&image[32..MD5_STATE_LEN]);
+    let state = [u32_at(0), u32_at(4), u32_at(8), u32_at(12)];
+    beam_common::md5::Md5::from_parts(state, u64_at(16), len, buf)
 }
 
-impl Md5State {
-    /// `erts_md5_init` (`erl_md5.c:76`): the MD5 IV, zeroed counters and buffer.
-    fn new() -> Md5State {
-        Md5State {
-            a: 0x67452301,
-            b: 0xefcdab89,
-            c: 0x98badcfe,
-            d: 0x10325476,
-            tot_len: 0,
-            len: 0,
-            buf: [0u8; 64],
-        }
+/// The 96-byte `erts_md5_state` image (the little-endian field order of the C struct).
+///
+/// The inverse of [`from_image`]: the four state words, `tot_len`, `len`, then all 64 bytes
+/// of the block buffer.
+fn to_image(state: &beam_common::md5::Md5) -> [u8; MD5_STATE_LEN] {
+    let mut image = [0u8; MD5_STATE_LEN];
+    for (index, word) in state.state().iter().enumerate() {
+        image[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-
-    /// Decodes the 96-byte `erts_md5_state` image.
-    ///
-    /// # Errors
-    ///
-    /// [`unsupported_bif`] when the `len` field is outside `0..=64`: the oracle
-    /// reads and writes past its 64-byte buffer for such an image (undefined
-    /// behaviour, `erl_bif_chksum.c:562`/`:598` never produce one), which cannot be
-    /// reproduced faithfully — the crate reports the gap instead of a fabricated
-    /// digest. A wrong length or a non-binary argument is [`badarg`].
-    fn from_image(image: &[u8]) -> Result<Md5State> {
-        if image.len() != MD5_STATE_LEN {
-            return Err(badarg());
-        }
-        let u32_at = |o: usize| {
-            u32::from_le_bytes([image[o], image[o + 1], image[o + 2], image[o + 3]])
-        };
-        let u64_at = |o: usize| {
-            u64::from_le_bytes([
-                image[o],
-                image[o + 1],
-                image[o + 2],
-                image[o + 3],
-                image[o + 4],
-                image[o + 5],
-                image[o + 6],
-                image[o + 7],
-            ])
-        };
-        let len = usize::try_from(u64_at(24)).map_err(|_| unsupported_bif())?;
-        if len > 64 {
-            return Err(unsupported_bif());
-        }
-        let mut buf = [0u8; 64];
-        buf.copy_from_slice(&image[32..MD5_STATE_LEN]);
-        Ok(Md5State {
-            a: u32_at(0),
-            b: u32_at(4),
-            c: u32_at(8),
-            d: u32_at(12),
-            tot_len: u64_at(16),
-            len,
-            buf,
-        })
-    }
-
-    /// The 96-byte `erts_md5_state` image (the little-endian field order of the C
-    /// struct).
-    fn to_image(&self) -> [u8; MD5_STATE_LEN] {
-        let mut image = [0u8; MD5_STATE_LEN];
-        image[0..4].copy_from_slice(&self.a.to_le_bytes());
-        image[4..8].copy_from_slice(&self.b.to_le_bytes());
-        image[8..12].copy_from_slice(&self.c.to_le_bytes());
-        image[12..16].copy_from_slice(&self.d.to_le_bytes());
-        image[16..24].copy_from_slice(&self.tot_len.to_le_bytes());
-        image[24..32].copy_from_slice(&(self.len as u64).to_le_bytes());
-        image[32..MD5_STATE_LEN].copy_from_slice(&self.buf);
-        image
-    }
-
-    /// `erts_md5_update` (`erl_md5.c:87`): appends `msg` to the context.
-    fn update(&mut self, msg: &[u8]) {
-        let mut part = 0usize;
-        let mut left = msg.len();
-
-        if self.len > 0 {
-            let copy_size = 64 - self.len;
-            if copy_size < left {
-                self.buf[self.len..64].copy_from_slice(&msg[part..part + copy_size]);
-                part += copy_size;
-                left -= copy_size;
-                let block = self.buf;
-                self.hash_part(&block);
-                self.len = 0;
-                self.tot_len += 64;
-            } else {
-                self.buf[self.len..self.len + left].copy_from_slice(&msg[part..part + left]);
-                self.len += left;
-                return;
-            }
-        }
-
-        while left >= 64 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&msg[part..part + 64]);
-            self.hash_part(&block);
-            part += 64;
-            left -= 64;
-            self.tot_len += 64;
-        }
-
-        if left > 0 {
-            self.buf[..left].copy_from_slice(&msg[part..part + left]);
-            self.len = left;
-        }
-    }
-
-    /// `erts_md5_finish` (`erl_md5.c:125`): pads, hashes, and returns the 16-byte
-    /// little-endian digest of the four state words.
-    fn finish(&self) -> [u8; MD5_DIGEST_LEN] {
-        let mut pad_buf = [0u8; 128];
-        let mut left = self.pad(&mut pad_buf);
-        let mut state = self.clone();
-        let mut off = 0usize;
-        while left > 0 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&pad_buf[off..off + 64]);
-            state.hash_part(&block);
-            left -= 64;
-            off += 64;
-        }
-        let mut out = [0u8; MD5_DIGEST_LEN];
-        out[0..4].copy_from_slice(&state.a.to_le_bytes());
-        out[4..8].copy_from_slice(&state.b.to_le_bytes());
-        out[8..12].copy_from_slice(&state.c.to_le_bytes());
-        out[12..16].copy_from_slice(&state.d.to_le_bytes());
-        out
-    }
-
-    /// `pad` (`erl_md5.c:222`): `0x80`, zeros to the 56-byte boundary, then the
-    /// 64-bit little-endian *bit* length. Returns the number of bytes written
-    /// (always a multiple of 64: 64 or 128).
-    ///
-    /// The zero run is `(56 - filled) mod 64` with `filled = (size + 1) % 64`. C
-    /// writes that as the unsigned `(64 - 8 - filled) & (64 - 1)`, which relies on the
-    /// subtraction *wrapping* for `filled > 56` (a message length of 56..=62 beyond a
-    /// whole number of blocks, where the 8-byte length field no longer fits the final
-    /// block) and on `2^64 % 64 == 0` to recover the remainder under the mask. A
-    /// checked `usize` subtraction cannot express that. Adding the modulus *before*
-    /// subtracting keeps every operand non-negative while the mask still reduces
-    /// `mod 64`: `(56 + 64 - filled) & (64 - 1) == (56 - filled).rem_euclid(64)`.
-    fn pad(&self, out: &mut [u8; 128]) -> usize {
-        let size = self.len;
-        let filled = (size + 1) % 64;
-        let zeroes = (56 + 64 - filled) & (64 - 1);
-        out[..size].copy_from_slice(&self.buf[..size]);
-        out[size] = 0x80;
-        // `out[size + 1 .. size + 1 + zeroes]` is already zero.
-        let pos = size + 1 + zeroes;
-        // The C's `ASSERT((pad_ptr - pad_buf) % 64 == 0)`: the padded message is a
-        // whole number of 64-byte blocks, so `pos + 8` is 64 or 128 and the 128-byte
-        // buffer holds the length field (`pos` is 56 or 120).
-        debug_assert!(
-            (pos + 8).is_multiple_of(64),
-            "the padded message must be block-aligned"
-        );
-        let tot_bit_size = (self.tot_len + size as u64).wrapping_mul(8);
-        out[pos..pos + 8].copy_from_slice(&tot_bit_size.to_le_bytes());
-        pos + 8
-    }
-
-    /// `hash_part` (`erl_md5.c:156`): folds one 64-byte block into the state.
-    fn hash_part(&mut self, block: &[u8; 64]) {
-        let mut a = self.a;
-        let mut b = self.b;
-        let mut c = self.c;
-        let mut d = self.d;
-
-        for i in 0..64usize {
-            let (f, g) = if i <= 15 {
-                (d ^ (b & (c ^ d)), i)
-            } else if i <= 31 {
-                (c ^ (d & (b ^ c)), (5 * i + 1) & 0xF)
-            } else if i <= 47 {
-                (b ^ c ^ d, (3 * i + 5) & 0xF)
-            } else {
-                (c ^ (b | !d), (7 * i) & 0xF)
-            };
-            let word = u32::from_le_bytes([
-                block[g * 4],
-                block[g * 4 + 1],
-                block[g * 4 + 2],
-                block[g * 4 + 3],
-            ]);
-            let f = f
-                .wrapping_add(a)
-                .wrapping_add(MD5_K[i])
-                .wrapping_add(word)
-                .rotate_left(MD5_SHIFT[i]);
-
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f);
-        }
-
-        self.a = self.a.wrapping_add(a);
-        self.b = self.b.wrapping_add(b);
-        self.c = self.c.wrapping_add(c);
-        self.d = self.d.wrapping_add(d);
-    }
-}
-
-/// `erts_md5` (`erl_md5.c:146`): the MD5 digest of a whole message.
-fn md5_digest(data: &[u8]) -> [u8; MD5_DIGEST_LEN] {
-    let mut state = Md5State::new();
-    state.update(data);
-    state.finish()
+    image[16..24].copy_from_slice(&state.total_len().to_le_bytes());
+    image[24..32].copy_from_slice(&(state.buffered_len() as u64).to_le_bytes());
+    image[32..MD5_STATE_LEN].copy_from_slice(state.buffer());
+    image
 }
 
 /// Decodes a context-image argument: a byte-aligned binary of exactly 96 bytes.
-fn decode_context(term: Eterm) -> Result<Md5State> {
+fn decode_context(term: Eterm) -> Result<beam_common::md5::Md5> {
     let image = bits::bytes(term)?;
-    Md5State::from_image(&image)
+    from_image(&image)
 }
 
 // ---------------------------------------------------------------------------
@@ -629,12 +446,12 @@ fn adler32_combine_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
 /// `md5(<<"abc">>)` is `<<144,1,80,152,60,210,79,176,214,150,63,125,40,225,127,114>>`.
 fn md5_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let input = collect_input(args[0])?;
-    bits::make_binary(ctx.heap(), &md5_digest(&input.bytes))
+    bits::make_binary(ctx.heap(), &beam_common::md5::digest(&input.bytes))
 }
 
 /// `md5_init()` (`erl_bif_chksum.c:538`) — a fresh 96-byte context image.
 fn md5_init_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    bits::make_binary(ctx.heap(), &Md5State::new().to_image())
+    bits::make_binary(ctx.heap(), &to_image(&beam_common::md5::Md5::new()))
 }
 
 /// `md5_update(Context, IoData)` (`erl_bif_chksum.c:550`) — the context image with
@@ -643,7 +460,7 @@ fn md5_update_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let mut state = decode_context(args[0])?;
     let input = collect_input(args[1])?;
     state.update(&input.bytes);
-    bits::make_binary(ctx.heap(), &state.to_image())
+    bits::make_binary(ctx.heap(), &to_image(&state))
 }
 
 /// `md5_final(Context)` (`erl_bif_chksum.c:589`) — the 16-byte digest of a context
@@ -730,18 +547,18 @@ mod tests {
     #[test]
     fn md5_known_vectors() {
         assert_eq!(
-            md5_digest(b"abc"),
+            beam_common::md5::digest(b"abc"),
             [
                 144, 1, 80, 152, 60, 210, 79, 176, 214, 150, 63, 125, 40, 225, 127, 114
             ]
         );
         assert_eq!(
-            md5_digest(b""),
+            beam_common::md5::digest(b""),
             [212, 29, 140, 217, 143, 0, 178, 4, 233, 128, 9, 152, 236, 248, 66, 126]
         );
         // >64 bytes exercise the whole-block path.
         assert_eq!(
-            md5_digest(&[b'A'; 100]),
+            beam_common::md5::digest(&[b'A'; 100]),
             [138, 220, 89, 55, 230, 53, 246, 201, 175, 100, 111, 11, 35, 86, 15, 174]
         );
     }
@@ -854,10 +671,10 @@ mod tests {
 
         for &(len, expected) in KNOWN {
             let data = patterned(len);
-            assert_eq!(hex(&md5_digest(&data)), expected, "md5/1 of a {len}-byte input");
+            assert_eq!(hex(&beam_common::md5::digest(&data)), expected, "md5/1 of a {len}-byte input");
             // `md5_init`/`md5_update`/`md5_final` pad through the same `pad`; an
             // irregular chunking must not change the digest.
-            let mut state = Md5State::new();
+            let mut state = beam_common::md5::Md5::new();
             for chunk in data.chunks(7) {
                 state.update(chunk);
             }
@@ -898,13 +715,13 @@ mod tests {
             (&[], "d41d8cd98f00b204e9800998ecf8427e"),
         ];
         for (data, expected) in cases {
-            assert_eq!(hex(&md5_digest(data)), expected, "md5/1 of {:?}", data);
+            assert_eq!(hex(&beam_common::md5::digest(data)), expected, "md5/1 of {:?}", data);
         }
 
         let million_a = vec![b'a'; 1_000_000];
-        assert_eq!(hex(&md5_digest(&million_a)), "7707d6ae4e027c70eea2a935c2296f21");
+        assert_eq!(hex(&beam_common::md5::digest(&million_a)), "7707d6ae4e027c70eea2a935c2296f21");
         // A split that leaves the last chunk at the pad boundary.
-        let mut state = Md5State::new();
+        let mut state = beam_common::md5::Md5::new();
         state.update(&million_a[..999_993]);
         state.update(&million_a[999_993..]);
         assert_eq!(hex(&state.finish()), "7707d6ae4e027c70eea2a935c2296f21");
@@ -913,7 +730,7 @@ mod tests {
     #[test]
     fn md5_context_round_trips() {
         // The initial image is the IV in little-endian, then 80 zero bytes.
-        let fresh = Md5State::new().to_image();
+        let fresh = to_image(&beam_common::md5::Md5::new());
         let mut expected = [0u8; MD5_STATE_LEN];
         expected[..16].copy_from_slice(&[
             1, 35, 69, 103, 137, 171, 205, 239, 254, 220, 186, 152, 118, 84, 50, 16,
@@ -921,40 +738,40 @@ mod tests {
         assert_eq!(fresh, expected);
 
         // update(init, "abc"): len = 3 in the buffer, IV untouched.
-        let mut state = Md5State::new();
+        let mut state = beam_common::md5::Md5::new();
         state.update(b"abc");
-        let image = state.to_image();
+        let image = to_image(&state);
         assert_eq!(image[..16], expected[..16], "a sub-block update keeps the IV");
         assert_eq!(&image[16..24], &[0u8; 8], "tot_len is still 0");
         assert_eq!(&image[24..32], &[3, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(&image[32..35], b"abc");
-        assert_eq!(state.finish(), md5_digest(b"abc"));
+        assert_eq!(state.finish(), beam_common::md5::digest(b"abc"));
 
         // A full block appends `tot_len` and leaves `len` at 0; 32 + 32 leaves 64.
-        let mut state = Md5State::new();
+        let mut state = beam_common::md5::Md5::new();
         state.update(&[b'A'; 64]);
-        let image = state.to_image();
+        let image = to_image(&state);
         assert_eq!(&image[16..24], &[64, 0, 0, 0, 0, 0, 0, 0], "one hashed block");
         assert_eq!(&image[24..32], &[0u8; 8], "the block buffer is empty");
-        assert_eq!(state.finish(), md5_digest(&[b'A'; 64]));
+        assert_eq!(state.finish(), beam_common::md5::digest(&[b'A'; 64]));
 
-        let mut state = Md5State::new();
+        let mut state = beam_common::md5::Md5::new();
         state.update(&[b'A'; 32]);
         state.update(&[b'B'; 32]);
-        let image = state.to_image();
+        let image = to_image(&state);
         assert_eq!(&image[16..24], &[0u8; 8], "the block is buffered, not hashed");
         assert_eq!(&image[24..32], &[64, 0, 0, 0, 0, 0, 0, 0]);
         let mut joined = vec![b'A'; 32];
         joined.extend_from_slice(&[b'B'; 32]);
-        assert_eq!(state.finish(), md5_digest(&joined));
+        assert_eq!(state.finish(), beam_common::md5::digest(&joined));
 
         // Any split of the same data gives the same digest.
         for split in [0usize, 1, 63, 64, 65, 100, 128] {
             let data: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
-            let mut state = Md5State::new();
+            let mut state = beam_common::md5::Md5::new();
             state.update(&data[..split.min(data.len())]);
             state.update(&data[split.min(data.len())..]);
-            assert_eq!(state.finish(), md5_digest(&data), "split at {split}");
+            assert_eq!(state.finish(), beam_common::md5::digest(&data), "split at {split}");
         }
     }
 
@@ -963,12 +780,12 @@ mod tests {
         // A hand-crafted image whose `len` field is 100: the oracle reads/writes
         // past its 64-byte buffer (undefined behaviour), which is reported as a
         // typed `unsupported_bif` rather than reproduced.
-        let mut image = Md5State::new().to_image();
+        let mut image = to_image(&beam_common::md5::Md5::new());
         image[24..32].copy_from_slice(&100u64.to_le_bytes());
-        assert!(matches!(Md5State::from_image(&image), Err(BeamError::Raise(_))));
+        assert!(matches!(from_image(&image), Err(BeamError::Raise(_))));
         // A `len` of 64 (which the oracle itself produces) is accepted.
         image[24..32].copy_from_slice(&64u64.to_le_bytes());
-        assert!(Md5State::from_image(&image).is_ok());
+        assert!(from_image(&image).is_ok());
     }
 
     #[test]
