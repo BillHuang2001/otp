@@ -301,6 +301,36 @@ The production instance is `beam_rt::Runtime::arena: MinimalContext` (`beam_rt/s
 - `beam_gc`'s walker is **region-generic in algorithm but crate-private in plumbing**, and has **no conservative word scan** (a fabricated object start is unsound); a foreign region grid is unreachable from it today (`beam_gc/CONTEXT.md`) — `Runtime::for_each_off_heap_region`'s former complaint about the arena's missing word-range accessor (`beam_rt/src/runtime.rs:3009-3012`) is now answered by `MinimalContext::for_each_heap_region`, which hands out exactly that prefix (it is still only a *prefix* walk: the visitor gets raw words, not terms).
 - **A nested-run watermark rewind does not bound this workload**: the `-eval` compile's whole 1.2e9-word demand is spent inside **one** run (`compile:file/2`'s machine; callees enter in-machine via `resolve_external_call`, and `beam_engine`'s fun/lists keys go through the pooled BIF heap), so a rewind at the run's exit is too late — the same compile on the **scheduled** route (a real process heap + the collector) reads `arena_words` **58 031** instead. See `MEASURED.md`.
 
+### The off-heap refc-binary reservoir's resident figure is the *host's* reclamation cadence, and that cadence is denominated in reductions
+`Machine::refc_binaries` is released only by a host decision
+(`Machine::retain_refc_binaries`, driven at `beam_rt`'s slice-boundary park —
+`crates/beam_rt/src/runner/run.rs`'s `Yield` arm → `gc::reclaim`), and a host slice is a **fixed
+reduction budget** (`beam_common::CONTEXT_REDS` = 4 000). This crate decides how many charged
+reductions a given piece of work costs: the **refusing** seams are the `test_heap`/`allocate_heap`
+doors (`ensure_heap`/`ensure_heap_full`) and `reduce` on an instruction the native tier hands back
+to the interpreter; a block that runs natively and reaches no admission door is charged **nothing**.
+So the *cheaper* a loop becomes, the **more iterations one slice spans**, and a host that prunes
+per slice retains proportionally more. Measured on `tools/bench`'s `binary_append` (16 384 appends
+of 4 bytes into one writable payload per call, so exactly one 64 KiB off-heap payload per call
+becomes garbage immediately):
+- at HEAD on the default native baseline tier the whole comprehension loop runs natively and costs
+  **~4 charged reductions per call** → one slice per **~1000 calls** → the reservoir holds ~1000
+  dead payloads at the sawtooth peak: `erlang:memory(binary)` 59 MB → 2.4 MB across the prune,
+  `process_info(P, binary)` 902 → 37, peak `VmHWM` 159.1 MB with a 92.5 MB boot floor;
+- the same module under `BEAM_RT_TIER=interpreter` (per-instruction charges) never exceeds **6**
+  payloads, and the pre-campaign tree `c2d31ebad8` on the same default tier charged ≥4000
+  reductions per call (its slice ended *inside* the comprehension loop once per call) and never
+  exceeded **7**.
+- The figure is therefore a **bounded per-slice window, not a leak**: `VmHWM` is flat from
+  N = 1 000 to N = 20 000 calls (159.09–159.36 MB), the same peak scales linearly with the payload
+  bytes per call (128 KiB payloads → +64 MB, exactly one more window), and the genuinely live
+  binary data is ~82 KB (the 16 KiB input + the 64 KiB accumulator).
+- **No rooting/lifetime rule may be relaxed to shrink it.** Only the reachability walk can tell a
+  dead payload from one a live term still names, and it needs the process's *complete* root set —
+  which exists at the host's park, and at the admission doors only as a `RootSet` while the engine
+  holds the machine. A byte-denominated bound is a new post-admission hook that re-borrows the
+  machine after the root hand-off, never a mid-append drop of the superseded payload.
+
 ## Heap admission & allocation wiring (the exact engine->host doors)
 - **`test_heap`/`allocate_heap` -> `Machine::ensure_heap` (`src/machine/frames.rs`) -> `ExecutionContext::ensure_heap_full`** with the whole `RootSet` (x, stack **and fr**); the interpreter's two arms and the native tier's `jit_allocate_heap`/`jit_test_heap` are the only call sites and **the two tiers do not differ**, so a collecting host sees one admission point per execution with the same operands. The narrow `ensure_heap` has **no** engine call site, and the `test_heap Live` operand is only a hint (`RootSet::live_len`).
 - **`Instr::Allocate` makes no heap request at all** (frame-only, `jit_allocate` -> `Machine::push_frame`), which also skips C's heap check (C's `allocate` can collect) -- a conservative divergence; `gc_bif`/`bif`/`bif0`/`call_ext*` likewise leave term allocation to the host's `call_bif`.
