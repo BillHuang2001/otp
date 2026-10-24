@@ -44,7 +44,7 @@ int beam_abi_probe(void) {
 fn env_carries_the_host_and_the_exception_slot() {
     let mut host = common::TestHost::new();
     let reason = host.atom("boom");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     assert_eq!(env.pending_exception(), None);
     env.set_exception(reason);
     assert_eq!(env.pending_exception(), Some(reason));
@@ -63,7 +63,7 @@ fn env_carries_the_host_and_the_exception_slot() {
 fn test_host_heap_is_reachable_through_the_env() {
     use beam_term::prelude::{is_list, make_small};
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let list = env
         .heap()
         .cons(make_small(1), make_small(2))

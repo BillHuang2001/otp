@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn make_new_binary_matches_the_oracle_at_or_below_the_on_heap_limit() {
         let mut host = BinaryHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         for size in [0usize, 1, 10, 64] {
             let mut term = ERL_NIF_TERM::default();
             // SAFETY: `env` is live for the whole test and `term` is a live local.
@@ -947,7 +947,7 @@ mod tests {
     #[test]
     fn make_new_binary_is_on_heap_above_the_limit_where_the_oracle_wraps_it_refc() {
         let mut host = BinaryHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         for size in [65usize, 100] {
             let mut term = ERL_NIF_TERM::default();
             // SAFETY: `env` is live for the whole test and `term` is a live local.
@@ -1081,7 +1081,7 @@ mod tests {
     /// Drive `enif_binary_to_term` over `bytes` on `host`, returning the C entry point's answer and
     /// the word it left in `*term` ([`UNTOUCHED`] when the call failed and wrote nothing).
     fn bin2term(host: &mut impl NifHost, bytes: &[u8], opts: c_uint) -> (usize, ERL_NIF_TERM) {
-        let mut env = NifEnv::new(host);
+        let env = NifEnv::new(host);
         let mut term = UNTOUCHED;
         // SAFETY: `env` is live for the whole call, `bytes` is a live local of exactly `bytes.len()`
         // readable bytes, and `term` is a live writable local.
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn a_null_data_or_term_answers_zero() {
         let mut host = UsedSeamHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut term = UNTOUCHED;
         // SAFETY: a null `data` is explicitly allowed by the contract (`sz` is then 0).
         let used = unsafe {
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn alloc_binary_hands_back_a_null_ref_bin_and_a_writable_payload() {
         let mut host = BinaryHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut bin = ErlNifBinary {
             size: 0,
             data: core::ptr::null_mut(),

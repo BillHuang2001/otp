@@ -562,12 +562,12 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     }
     assert!(lib.priv_data().is_null(), "`ERL_NIF_INIT(..., NULL, ...)` stores no priv");
 
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // --- enif_send: 1 for a live receiver, and the constructed message really left the NIF -------
     // ORACLE: `send_to_self(5) -> 1`, with `{5, self()}` delivered to the calling process.
     assert_eq!(
-        lib.call(&mut env, "send_to_self", 1, &[make_small(5)])
+        lib.call(&env, "send_to_self", 1, &[make_small(5)])
             .expect("send_to_self/1"),
         make_small(1)
     );
@@ -582,21 +582,21 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     // --- the liveness predicates -----------------------------------------------------------------
     // ORACLE: `alive() -> {1,1}`; `is_alive(self()) -> 1`; `is_alive(dead) -> 0`.
     assert_eq!(
-        tuple_smalls(lib.call(&mut env, "alive", 0, &[]).expect("alive/0")),
+        tuple_smalls(lib.call(&env, "alive", 0, &[]).expect("alive/0")),
         Some(vec![1, 1])
     );
     assert_eq!(
-        lib.call(&mut env, "is_alive", 1, &[pid(42)]).expect("is_alive/1"),
+        lib.call(&env, "is_alive", 1, &[pid(42)]).expect("is_alive/1"),
         make_small(1)
     );
     assert_eq!(
-        lib.call(&mut env, "is_alive", 1, &[pid(9)]).expect("is_alive/1"),
+        lib.call(&env, "is_alive", 1, &[pid(9)]).expect("is_alive/1"),
         make_small(0),
         "a pid the host does not know is the C's dead-process 0"
     );
     // ORACLE: `is_alive(42) -> error:badarg` (the fixture vetoes a non-pid argument).
     let not_a_pid = host.atom("not_a_pid");
-    match lib.call(&mut env, "is_alive", 1, &[not_a_pid]) {
+    match lib.call(&env, "is_alive", 1, &[not_a_pid]) {
         Err(NifCallError::Raised(reason)) => {
             assert_eq!(reason, env.host().intern_atom("badarg").expect("interns"))
         }
@@ -606,12 +606,12 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
 
     // ORACLE: `is_port_alive(live) -> 1`, `is_port_alive(closed) -> 0`.
     assert_eq!(
-        lib.call(&mut env, "is_port_alive", 1, &[port_term(3)])
+        lib.call(&env, "is_port_alive", 1, &[port_term(3)])
             .expect("is_port_alive/1"),
         make_small(1)
     );
     assert_eq!(
-        lib.call(&mut env, "is_port_alive", 1, &[port_term(4)])
+        lib.call(&env, "is_port_alive", 1, &[port_term(4)])
             .expect("is_port_alive/1"),
         make_small(0)
     );
@@ -620,7 +620,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     // ORACLE: `port_command_code(live) -> 1` and the port really received `"ping"`;
     //         `port_command_code(closed) -> 0` (`erlang:port_command/2` raises `badarg` there).
     assert_eq!(
-        lib.call(&mut env, "port_command_code", 1, &[port_term(3)])
+        lib.call(&env, "port_command_code", 1, &[port_term(3)])
             .expect("port_command_code/1"),
         make_small(1)
     );
@@ -633,7 +633,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     // SAFETY: `base` heads `bits // 8 == 4` readable bytes of a live term on the host's heap.
     assert_eq!(unsafe { core::slice::from_raw_parts(base, 4) }, b"ping");
     assert_eq!(
-        lib.call(&mut env, "port_command_code", 1, &[port_term(4)])
+        lib.call(&env, "port_command_code", 1, &[port_term(4)])
             .expect("port_command_code/1"),
         make_small(0),
         "a closed port is the C's 0"
@@ -644,17 +644,17 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     // The C's codes: 0 = established, 1 = the target is dead/undefined, 1 = the demonitor could not
     // identify the monitor (see the module docs for why the oracle cannot drive these two NIFs).
     assert_eq!(
-        lib.call(&mut env, "monitor_code", 1, &[pid(42)]).expect("monitor_code/1"),
+        lib.call(&env, "monitor_code", 1, &[pid(42)]).expect("monitor_code/1"),
         make_small(0)
     );
     assert_eq!(
-        lib.call(&mut env, "monitor_code", 1, &[pid(9)]).expect("monitor_code/1"),
+        lib.call(&env, "monitor_code", 1, &[pid(9)]).expect("monitor_code/1"),
         make_small(1),
         "a dead pid is the C's `return 1` (`erl_nif.c:4004`)"
     );
     assert_eq!(
         tuple_smalls(
-            lib.call(&mut env, "monitor_roundtrip", 1, &[pid(42)])
+            lib.call(&env, "monitor_roundtrip", 1, &[pid(42)])
                 .expect("monitor_roundtrip/1")
         ),
         Some(vec![0, 0, 1, 0, 1]),
@@ -662,7 +662,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     );
     assert_eq!(
         tuple_smalls(
-            lib.call(&mut env, "monitor_roundtrip", 1, &[pid(9)])
+            lib.call(&env, "monitor_roundtrip", 1, &[pid(9)])
                 .expect("monitor_roundtrip/1")
         ),
         Some(vec![1, -1, -1, -1, -1]),
@@ -675,7 +675,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     // --- enif_compare_monitors --------------------------------------------------------------------
     // ORACLE: `compare_monitors() -> {0,-1,1}`.
     assert_eq!(
-        tuple_smalls(lib.call(&mut env, "compare_monitors", 0, &[]).expect("compare_monitors/0")),
+        tuple_smalls(lib.call(&env, "compare_monitors", 0, &[]).expect("compare_monitors/0")),
         Some(vec![0, -1, 1])
     );
 
@@ -686,26 +686,26 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     let undefined = host.atom("undefined");
     // ORACLE: `whereis(registered) -> {1,<0.10.0>}`.
     let hit = lib
-        .call(&mut env, "whereis", 1, &[registered])
+        .call(&env, "whereis", 1, &[registered])
         .expect("whereis/1");
     assert_eq!(tuple_elements(hit), Some(vec![make_small(1), pid(7)]));
     // ORACLE: `whereis(unregistered) -> {0,undefined}` and `whereis(42) -> {0,undefined}` (the C's
     // `is_not_atom(name)` early return leaves the out-parameter untouched).
     let miss = lib
-        .call(&mut env, "whereis", 1, &[unregistered])
+        .call(&env, "whereis", 1, &[unregistered])
         .expect("whereis/1");
     assert_eq!(tuple_elements(miss), Some(vec![make_small(0), undefined]));
     let not_atom = lib
-        .call(&mut env, "whereis", 1, &[make_small(42)])
+        .call(&env, "whereis", 1, &[make_small(42)])
         .expect("whereis/1");
     assert_eq!(tuple_elements(not_atom), Some(vec![make_small(0), undefined]));
     // ORACLE: `whereis_port(registered) -> {1,#Port<0.3>}`, a pid-registered name `-> {0,undefined}`.
     let port_hit = lib
-        .call(&mut env, "whereis_port", 1, &[port_name])
+        .call(&env, "whereis_port", 1, &[port_name])
         .expect("whereis_port/1");
     assert_eq!(tuple_elements(port_hit), Some(vec![make_small(1), port_term(3)]));
     let wrong_kind = lib
-        .call(&mut env, "whereis_port", 1, &[registered])
+        .call(&env, "whereis_port", 1, &[registered])
         .expect("whereis_port/1");
     assert_eq!(tuple_elements(wrong_kind), Some(vec![make_small(0), undefined]));
 
@@ -716,7 +716,7 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     let dirty = host.atom("dirty");
     assert_eq!(
         tuple_elements(
-            lib.call(&mut env, "reschedule", 1, &[make_small(7)])
+            lib.call(&env, "reschedule", 1, &[make_small(7)])
                 .expect("reschedule/1")
         ),
         Some(vec![dirty, make_small(7)])
@@ -727,19 +727,19 @@ fn loads_and_calls_the_process_family_through_the_c_abi() {
     );
     // ORACLE: `do_work(7) -> {dirty,7}` — the continuation is an ordinary exported NIF too.
     assert_eq!(
-        tuple_elements(lib.call(&mut env, "do_work", 1, &[make_small(7)]).expect("do_work/1")),
+        tuple_elements(lib.call(&env, "do_work", 1, &[make_small(7)]).expect("do_work/1")),
         Some(vec![dirty, make_small(7)])
     );
 
     // --- a wrong arity is never callable ----------------------------------------------------------
     // ORACLE: `do_work(1,2) -> error:undef` — a NIF that is only declared as `/1` has no `/2`.
     assert!(matches!(
-        lib.call(&mut env, "do_work", 2, &[make_small(1), make_small(2)]),
+        lib.call(&env, "do_work", 2, &[make_small(1), make_small(2)]),
         Err(NifCallError::UnknownFunction { name, arity })
             if name == "do_work" && arity == 2
     ));
     assert!(matches!(
-        lib.call(&mut env, "does_not_exist", 1, &[]),
+        lib.call(&env, "does_not_exist", 1, &[]),
         Err(NifCallError::UnknownFunction { .. })
     ));
 

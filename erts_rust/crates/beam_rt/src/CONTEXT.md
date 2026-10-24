@@ -344,9 +344,11 @@ have no entry for). Verified by reading the fields, not inferred.
 - `nif.rs:696` `NifHostImpl.self_pid: Eterm` — a **pid immediate** (no heap word); lives as long as
   the host (library lifetime for the load host).
 - `nif.rs:702` / `nif/thread_env.rs:224` `envs: Vec<Box<NifEnv>>` — `NifEnv`'s own
-  `pending_exception: Option<Eterm>` (`beam_abi/src/nif/host.rs:603`) and its
+  `pending_exception: Cell<Option<Eterm>>` (`beam_abi/src/nif/host.rs:645`) and its
   `recorded_atoms: Rc<RefCell<Vec<(usize, String)>>>` (raw atom **word**, atoms are immediates,
-  `host.rs:496`); both are per env, and an env a NIF leaked lives as long as the host.
+  `host.rs:530`); both are per env and interior-mutable (a raise and an atom record are stores made
+  through a **shared** env reference, `beam_abi`'s *The aliasing contract*), and an env a NIF leaked
+  lives as long as the host.
 - `nif.rs:516` and `nif.rs:635` (`make_ref`, `monitor_process_result`) insert the minted reference
   **term** into `Runtime::references: HashMap<Eterm, Option<MonitorRef>>` (`runtime.rs:755`).
   `Eterm`'s `Hash` is the raw word (`beam_term/src/eterm.rs:36-37`), so those keys are the reference

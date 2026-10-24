@@ -67,7 +67,7 @@ impl RetainHost {
 ///
 /// Each test uses its own name: types are keyed by name and never freed (the C's global
 /// `resource_type_list`), and tests in one binary share this process-wide registry.
-fn open_type(env: &mut NifEnv, name: &str, dtor: ErlNifResourceDtor) -> *mut ErlNifResourceType {
+fn open_type(env: &NifEnv, name: &str, dtor: ErlNifResourceDtor) -> *mut ErlNifResourceType {
     use std::ffi::CString;
 
     let c_name = CString::new(name).expect("no interior NUL");
@@ -105,7 +105,7 @@ unsafe fn alloc_object(ty: *mut ErlNifResourceType, size: libc::size_t) -> *mut 
 /// # Safety
 ///
 /// `env` must be live and `obj` a live payload pointer (see [`alloc_object`]).
-unsafe fn make_resource_term(env: &mut NifEnv, obj: *mut c_void) -> Eterm {
+unsafe fn make_resource_term(env: &NifEnv, obj: *mut c_void) -> Eterm {
     // SAFETY: forwarded from the caller's contract.
     t(unsafe { enif_make_resource(env.as_ptr(), obj) })
 }
@@ -115,7 +115,7 @@ unsafe fn make_resource_term(env: &mut NifEnv, obj: *mut c_void) -> Eterm {
 /// # Safety
 ///
 /// `env` must be live and `ty` a type from [`open_type`] (or null).
-unsafe fn get_resource(env: &mut NifEnv, term: Eterm, ty: *mut ErlNifResourceType) -> (i32, *mut c_void) {
+unsafe fn get_resource(env: &NifEnv, term: Eterm, ty: *mut ErlNifResourceType) -> (i32, *mut c_void) {
     let mut objp: *mut c_void = core::ptr::null_mut();
     // SAFETY: `env` is live; `term` is a term; `ty` comes from `open_type`; `objp` is a live local.
     let matched = unsafe { enif_get_resource(env.as_ptr(), n(term), ty, &mut objp) };
@@ -128,7 +128,7 @@ unsafe fn get_resource(env: &mut NifEnv, term: Eterm, ty: *mut ErlNifResourceTyp
 ///
 /// `term` must be a live M1 internal-reference thing ([`prelude::is_internal_ref`]) whose block has
 /// exactly [`prelude::INTERNAL_REF_WORDS`] readable words.
-unsafe fn copy_reference(env: &mut NifEnv, term: Eterm) -> Eterm {
+unsafe fn copy_reference(env: &NifEnv, term: Eterm) -> Eterm {
     assert!(
         unsafe { prelude::is_internal_ref(term) },
         "the term must be an internal reference"
@@ -158,7 +158,7 @@ fn a_resource_term_keeps_the_object_alive_after_release() {
         heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
         atoms: beam_term::atom::AtomTable::new(),
     };
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = CString::new("retain_rt").expect("no interior NUL");
     let mut tried = ErlNifResourceFlags::from_bits(0);
     // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
@@ -227,7 +227,7 @@ fn an_object_with_no_term_is_destroyed_on_release() {
         heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
         atoms: beam_term::atom::AtomTable::new(),
     };
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = CString::new("no_term_rt").expect("no interior NUL");
     let mut tried = ErlNifResourceFlags::from_bits(0);
     // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
@@ -286,7 +286,7 @@ fn the_destructor_receives_a_live_environment_from_the_types_host() {
         heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
         atoms: beam_term::atom::AtomTable::new(),
     };
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let call_env = env.as_ptr();
     let name = CString::new("dtor_env_rt").expect("no interior NUL");
     let mut tried = ErlNifResourceFlags::from_bits(0);
@@ -356,7 +356,7 @@ fn a_keep_defers_the_destructor_until_the_last_release() {
         heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
         atoms: beam_term::atom::AtomTable::new(),
     };
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = CString::new("keep_rt").expect("no interior NUL");
     let mut tried = ErlNifResourceFlags::from_bits(0);
     // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
@@ -494,8 +494,8 @@ fn a_pruned_term_drops_the_terms_reference_and_runs_the_destructor_once() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_count_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_count_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     // SAFETY: `ty` came from `open_type`; the object is released exactly once below (after the term
@@ -504,7 +504,7 @@ fn a_pruned_term_drops_the_terms_reference_and_runs_the_destructor_once() {
     // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
     unsafe { *(obj as *mut u8) = 7 };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
     // Drop the allocator's reference: the term's own reference is all that is left.
     // SAFETY: `obj` still has the term's outstanding reference.
     unsafe { enif_release_resource(obj) };
@@ -547,19 +547,19 @@ fn a_pruned_term_drops_the_terms_reference_and_runs_the_destructor_once() {
 #[test]
 fn a_pruned_term_no_longer_resolves_through_enif_get_resource() {
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_binding_rt", silent_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_binding_rt", silent_dtor);
 
     // SAFETY: `ty` came from `open_type`; the term holds the only remaining reference.
     let obj = unsafe { alloc_object(ty, 1) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
     // SAFETY: the term keeps the object alive from here on.
     unsafe { enif_release_resource(obj) };
 
     // Before the prune the term designates the object (the oracle's behaviour).
     // SAFETY: `env` is live; `ty` is the object's type.
-    let (matched, got) = unsafe { get_resource(&mut env, term, ty) };
+    let (matched, got) = unsafe { get_resource(&env, term, ty) };
     assert_eq!((matched, got), (1, obj), "the term resolves before the prune");
 
     let word = term.raw();
@@ -593,8 +593,8 @@ fn a_resource_with_a_live_user_reference_survives_the_prune() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_live_user_ref_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_live_user_ref_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     // alloc (1) + keep (2) + term (3).
@@ -605,7 +605,7 @@ fn a_resource_with_a_live_user_reference_survives_the_prune() {
     // SAFETY: `obj` is a live payload pointer with an outstanding reference.
     unsafe { enif_keep_resource(obj) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
 
     // Prune the term: only its reference goes, so the object (alloc + keep ⇒ 2) survives untouched.
     let word = term.raw();
@@ -653,14 +653,14 @@ fn a_reachable_term_is_left_alone() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_reachable_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_reachable_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     // SAFETY: `ty` came from `open_type`; the term holds the only remaining reference.
     let obj = unsafe { alloc_object(ty, 2) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
     // SAFETY: the term keeps the object alive from here on.
     unsafe { enif_release_resource(obj) };
 
@@ -676,7 +676,7 @@ fn a_reachable_term_is_left_alone() {
         "and no destructor runs"
     );
     // SAFETY: `env` is live; `ty` is the object's type.
-    let (matched, got) = unsafe { get_resource(&mut env, term, ty) };
+    let (matched, got) = unsafe { get_resource(&env, term, ty) };
     assert_eq!((matched, got), (1, obj), "the term still resolves");
 
     // The same term, now called unreachable, is released — proving the predicate is the whole
@@ -699,8 +699,8 @@ fn two_terms_for_one_object_release_one_at_a_time() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_two_terms_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_two_terms_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     // alloc (1) + two terms (2, 3).
@@ -709,10 +709,10 @@ fn two_terms_for_one_object_release_one_at_a_time() {
     // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
     unsafe { *(obj as *mut u8) = 0x21 };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let first = unsafe { make_resource_term(&mut env, obj) };
+    let first = unsafe { make_resource_term(&env, obj) };
     // SAFETY: as above — a second, distinct term for the same object (the oracle mints a fresh magic
     // ref per call).
-    let second = unsafe { make_resource_term(&mut env, obj) };
+    let second = unsafe { make_resource_term(&env, obj) };
     // SAFETY: `obj` still has the two terms' references.
     unsafe { enif_release_resource(obj) };
 
@@ -724,7 +724,7 @@ fn two_terms_for_one_object_release_one_at_a_time() {
         "the second term still holds the object"
     );
     // SAFETY: `env` is live; `second` is still a live resource term; `ty` is the object's type.
-    let (matched, got) = unsafe { get_resource(&mut env, second, ty) };
+    let (matched, got) = unsafe { get_resource(&env, second, ty) };
     assert_eq!((matched, got), (1, obj), "the second term keeps resolving");
     // SAFETY: the object is alive (the second term's reference).
     assert_eq!(unsafe { *(obj as *const u8) }, 0x21, "the payload is intact");
@@ -751,15 +751,15 @@ fn resource_terms_reports_the_live_set_and_shrinks_after_the_prune() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "prune_snapshot_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "prune_snapshot_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     let before = resource_terms();
     // SAFETY: `ty` came from `open_type`; the allocator's reference is released below.
     let obj = unsafe { alloc_object(ty, 4) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
     let bytes = [9u8, 8, 7, 6];
     // SAFETY: `env` is live; `obj` is a live payload pointer; `bytes` is a readable 4-byte buffer.
     let term_bin = t(unsafe {
@@ -816,12 +816,12 @@ fn the_release_seam_is_publicly_reachable() {
     // running test can mint or prune a term between the two calls. Membership of a term this test
     // owns is the concurrency-proof observable.
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "seam_reachable_rt", noop_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "seam_reachable_rt", noop_dtor);
     // SAFETY: `ty` came from `open_type`; the allocator's reference is released below.
     let obj = unsafe { alloc_object(ty, 1) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let term = unsafe { make_resource_term(&mut env, obj) };
+    let term = unsafe { make_resource_term(&env, obj) };
     // SAFETY: the minted term holds the reference that keeps the object alive from here on.
     unsafe { enif_release_resource(obj) };
     assert!(
@@ -855,12 +855,12 @@ fn concurrent_prunes_release_a_term_exactly_once() {
 
     let mut host = RetainHost::new();
     let word = {
-        let mut env = NifEnv::new(&mut host);
-        let ty = open_type(&mut env, "prune_concurrent_rt", counting_dtor);
+        let env = NifEnv::new(&mut host);
+        let ty = open_type(&env, "prune_concurrent_rt", counting_dtor);
         // SAFETY: `ty` came from `open_type`; the term holds the only remaining reference.
         let obj = unsafe { alloc_object(ty, 1) };
         // SAFETY: `env` is live; `obj` is a live payload pointer.
-        let term = unsafe { make_resource_term(&mut env, obj) };
+        let term = unsafe { make_resource_term(&env, obj) };
         // SAFETY: the term keeps the object alive from here on.
         unsafe { enif_release_resource(obj) };
         term.raw()
@@ -913,8 +913,8 @@ fn a_copied_resource_term_resolves_to_the_same_object() {
     }
 
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "copied_term_rt", counting_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "copied_term_rt", counting_dtor);
     let base = RUNS.load(AtomicOrdering::Relaxed);
 
     // alloc (1) + the minted term (2); the allocator's reference is dropped below, so the term holds
@@ -924,13 +924,13 @@ fn a_copied_resource_term_resolves_to_the_same_object() {
     // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
     unsafe { *(obj as *mut u8) = 0x33 };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let minted = unsafe { make_resource_term(&mut env, obj) };
+    let minted = unsafe { make_resource_term(&env, obj) };
     // SAFETY: the term keeps the object alive from here on.
     unsafe { enif_release_resource(obj) };
 
     // The copy: four identical words at a different address — what `copy_struct` produces.
     // SAFETY: `minted` is the internal reference `mint_resource_ref` just built.
-    let copy = unsafe { copy_reference(&mut env, minted) };
+    let copy = unsafe { copy_reference(&env, minted) };
     assert_ne!(
         copy.raw(),
         minted.raw(),
@@ -943,13 +943,13 @@ fn a_copied_resource_term_resolves_to_the_same_object() {
     );
     // The minted term resolves (the C's behaviour, unchanged).
     // SAFETY: `env` is live; `ty` is the object's type.
-    let (matched, got) = unsafe { get_resource(&mut env, minted, ty) };
+    let (matched, got) = unsafe { get_resource(&env, minted, ty) };
     assert_eq!((matched, got), (1, obj), "the minted term resolves");
     // **The fix:** the copy resolves too. Before the identity key this answered `(0, null)` — the
     // registry was keyed by the term WORD, so the copy's distinct address missed — while the oracle
     // answers `1`.
     // SAFETY: `env` is live; `ty` is the object's type.
-    let (copied_matched, copied_got) = unsafe { get_resource(&mut env, copy, ty) };
+    let (copied_matched, copied_got) = unsafe { get_resource(&env, copy, ty) };
     assert_eq!(
         (copied_matched, copied_got),
         (1, obj),
@@ -980,8 +980,8 @@ fn a_copied_resource_term_resolves_to_the_same_object() {
     // After the prune neither term designates anything — the copy included, because it resolved
     // through the same binding.
     // SAFETY: `env` is live; both terms are still readable words (their host arena is alive).
-    let after_minted = unsafe { get_resource(&mut env, minted, ty) };
-    let after_copy = unsafe { get_resource(&mut env, copy, ty) };
+    let after_minted = unsafe { get_resource(&env, minted, ty) };
+    let after_copy = unsafe { get_resource(&env, copy, ty) };
     assert_eq!(after_minted.0, 0, "the pruned term no longer resolves");
     assert_eq!(after_copy.0, 0, "nor does its copy");
 }
@@ -991,14 +991,14 @@ fn a_copied_resource_term_resolves_to_the_same_object() {
 #[test]
 fn an_unminted_reference_identity_is_not_a_resource() {
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "unminted_ref_rt", silent_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "unminted_ref_rt", silent_dtor);
 
     // An ordinary internal reference (`erlang:make_ref/0`'s shape) whose id no `enif_make_resource`
     // ever minted.
     // SAFETY: `alloc` hands out exactly `INTERNAL_REF_WORDS` exclusively-owned words, which
     // `write_internal_ref` fully initialises with an id that fits a small integer.
-    let unminted = unsafe { alloc(&mut env, prelude::INTERNAL_REF_WORDS) }
+    let unminted = unsafe { alloc(&env, prelude::INTERNAL_REF_WORDS) }
         .expect("the test heap can fit a four-word reference");
     // SAFETY: `unminted` addresses the four words just reserved; the id fits the small-integer slot.
     let unminted = unsafe { prelude::write_internal_ref(unminted, 999_999) }
@@ -1032,19 +1032,19 @@ fn an_unminted_reference_identity_is_not_a_resource() {
 #[test]
 fn a_resource_term_of_another_type_does_not_resolve() {
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "type_check_rt", silent_dtor);
-    let other = open_type(&mut env, "type_check_other_rt", silent_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "type_check_rt", silent_dtor);
+    let other = open_type(&env, "type_check_other_rt", silent_dtor);
     assert_ne!(ty, other, "two distinct types");
 
     // SAFETY: `ty` came from `open_type`; the term holds the only remaining reference.
     let obj = unsafe { alloc_object(ty, 2) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let minted = unsafe { make_resource_term(&mut env, obj) };
+    let minted = unsafe { make_resource_term(&env, obj) };
     // SAFETY: the term keeps the object alive from here on.
     unsafe { enif_release_resource(obj) };
     // SAFETY: `minted` is the internal reference `mint_resource_ref` just built.
-    let copy = unsafe { copy_reference(&mut env, minted) };
+    let copy = unsafe { copy_reference(&env, minted) };
 
     let mut placeholder: u8 = 0;
     let sentinel: *mut c_void = (&mut placeholder as *mut u8).cast();
@@ -1058,7 +1058,7 @@ fn a_resource_term_of_another_type_does_not_resolve() {
         // The same term against its own type does resolve — the type is what made the difference.
         // SAFETY: `env` is live; `ty` is the object's real type.
         assert_eq!(
-            unsafe { get_resource(&mut env, term, ty) },
+            unsafe { get_resource(&env, term, ty) },
             (1, obj),
             "the same term resolves against its own type"
         );
@@ -1122,8 +1122,8 @@ fn resource_term_mints_a_resolving_term_that_holds_its_own_reference() {
 
     let mut host = RetainHost::new();
     let (ty, obj) = {
-        let mut env = NifEnv::new(&mut host);
-        let ty = open_type(&mut env, "select_term_rt", counting_dtor);
+        let env = NifEnv::new(&mut host);
+        let ty = open_type(&env, "select_term_rt", counting_dtor);
         // SAFETY: `ty` came from `open_type`; every reference taken here is released below.
         let obj = unsafe { alloc_object(ty, 4) };
         // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
@@ -1136,10 +1136,10 @@ fn resource_term_mints_a_resolving_term_that_holds_its_own_reference() {
     let term = resource_term(&mut host, obj).expect("a live object mints a term");
 
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `term` is the term just minted; `ty` is the object's own type.
         assert_eq!(
-            unsafe { get_resource(&mut env, term, ty) },
+            unsafe { get_resource(&env, term, ty) },
             (1, obj),
             "the minted term resolves to the very payload pointer that was allocated"
         );
@@ -1155,10 +1155,10 @@ fn resource_term_mints_a_resolving_term_that_holds_its_own_reference() {
         "the term's reference keeps the object alive, so no destructor has run"
     );
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `ty` is the object's own type; the block is still allocated.
         assert_eq!(
-            unsafe { get_resource(&mut env, term, ty) },
+            unsafe { get_resource(&env, term, ty) },
             (1, obj),
             "and it still resolves after the allocator's release"
         );
@@ -1177,10 +1177,10 @@ fn resource_term_mints_a_resolving_term_that_holds_its_own_reference() {
         "the term was the last reference, so the destructor ran exactly once"
     );
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `term` is a readable word on the still-live host heap.
         assert_eq!(
-            unsafe { get_resource(&mut env, term, ty) },
+            unsafe { get_resource(&env, term, ty) },
             (0, core::ptr::null_mut()),
             "the binding is gone, so the term no longer designates anything"
         );
@@ -1201,8 +1201,8 @@ fn two_mints_of_one_object_answer_two_distinct_terms() {
 
     let mut host = RetainHost::new();
     let (ty, obj) = {
-        let mut env = NifEnv::new(&mut host);
-        let ty = open_type(&mut env, "select_term_twice_rt", counting_dtor);
+        let env = NifEnv::new(&mut host);
+        let ty = open_type(&env, "select_term_twice_rt", counting_dtor);
         // SAFETY: `ty` came from `open_type`; every reference taken here is released below.
         let obj = unsafe { alloc_object(ty, 2) };
         (ty, obj)
@@ -1227,11 +1227,11 @@ fn two_mints_of_one_object_answer_two_distinct_terms() {
     assert_ne!(first_id, second_id, "each mint draws a fresh reference id");
 
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         for term in [first, second] {
             // SAFETY: `env` is live; `term` is one of the two mints; `ty` is the object's own type.
             assert_eq!(
-                unsafe { get_resource(&mut env, term, ty) },
+                unsafe { get_resource(&env, term, ty) },
                 (1, obj),
                 "both terms designate the same object"
             );
@@ -1260,16 +1260,16 @@ fn two_mints_of_one_object_answer_two_distinct_terms() {
 #[test]
 fn two_consecutive_mints_draw_distinct_strictly_increasing_ids() {
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "increasing_ids_rt", silent_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "increasing_ids_rt", silent_dtor);
     // SAFETY: `ty` came from `open_type`. The two minted terms keep their references (this test asserts
     // ids, not lifetimes, so leaving them outstanding is only a bounded leak); the allocator's own
     // reference is released at the end.
     let obj = unsafe { alloc_object(ty, 1) };
     // SAFETY: `env` is live; `obj` is a live payload pointer.
-    let first = unsafe { make_resource_term(&mut env, obj) };
+    let first = unsafe { make_resource_term(&env, obj) };
     // SAFETY: as above.
-    let second = unsafe { make_resource_term(&mut env, obj) };
+    let second = unsafe { make_resource_term(&env, obj) };
 
     // SAFETY: both are internal-reference blocks `write_resource_ref` just built, so their id words
     // are readable.
@@ -1310,7 +1310,7 @@ fn two_consecutive_mints_draw_distinct_strictly_increasing_ids() {
 /// too, so the window is retried (bounded) until it comes out tight. Each attempt mints a term whose
 /// reference is left outstanding — a bounded leak of a few words, and the test heap (4096 words) holds
 /// far more attempts than the retry budget needs in practice.
-fn mint_in_tight_window(env: &mut NifEnv, obj: *mut c_void) -> (u64, u64, u64, u64) {
+fn mint_in_tight_window(env: &NifEnv, obj: *mut c_void) -> (u64, u64, u64, u64) {
     // Bounded so a pathological scheduler cannot spin here (see the heap-budget note above): 256
     // attempts reserve at most 256 × `RESOURCE_REF_WORDS` words.
     for _ in 0..256 {
@@ -1344,13 +1344,13 @@ fn mint_in_tight_window(env: &mut NifEnv, obj: *mut c_void) -> (u64, u64, u64, u
 #[test]
 fn a_minted_id_is_the_next_draw_of_the_shared_reference_id_space() {
     let mut host = RetainHost::new();
-    let mut env = NifEnv::new(&mut host);
-    let ty = open_type(&mut env, "shared_id_space_rt", silent_dtor);
+    let env = NifEnv::new(&mut host);
+    let ty = open_type(&env, "shared_id_space_rt", silent_dtor);
     // SAFETY: `ty` came from `open_type`; the minted terms' references are left outstanding (a bounded
     // leak — this test asserts ids), and the allocator's own reference is released at the end.
     let obj = unsafe { alloc_object(ty, 1) };
 
-    let (minted_id, before1, before2, after) = mint_in_tight_window(&mut env, obj);
+    let (minted_id, before1, before2, after) = mint_in_tight_window(&env, obj);
 
     assert_eq!(before2, before1 + 1, "the two probe draws are contiguous");
     assert_eq!(

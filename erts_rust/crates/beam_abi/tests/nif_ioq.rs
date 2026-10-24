@@ -171,9 +171,9 @@ fn a_fresh_queue_is_empty_through_every_accessor() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "empty", 0, &[]).expect("empty/0");
+    let got = lib.call(&env, "empty", 0, &[]).expect("empty/0");
     let elems = tuple_of(got, 6);
     // {Size, IovLen, PeekIsNull, PeekHeadRet, HeadOutParamUntouched, HeadSizeOutParamUntouched}
     assert_eq!(
@@ -192,9 +192,9 @@ fn a_null_queue_handle_yields_the_cs_failure_codes_instead_of_faulting() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = lib.call(&mut env, "null_handles", 0, &[]).expect("null_handles/0");
+    let got = lib.call(&env, "null_handles", 0, &[]).expect("null_handles/0");
     let elems = tuple_of(got, 8);
     // {Size, PeekIsNull, PeekIovLen, PeekHeadRet, DeqRet, DeqSizeUntouched, EnqRet, BinSize}
     assert_eq!(
@@ -216,7 +216,7 @@ fn enq_binary_queues_the_bytes_after_the_skip_and_reports_them() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // (skip, ret, size, iovlen, bytes)
     let cases: [(i64, i64, i64, i64, &[u8]); 4] = [
@@ -229,7 +229,7 @@ fn enq_binary_queues_the_bytes_after_the_skip_and_reports_them() {
     ];
     for (skip, ret, size, iovlen, want) in cases {
         let got = lib
-            .call(&mut env, "enq_binary", 1, &[beam_term::prelude::make_small(skip)])
+            .call(&env, "enq_binary", 1, &[beam_term::prelude::make_small(skip)])
             .expect("enq_binary/1");
         let elems = tuple_of(got, 4);
         assert_eq!(int_of(elems[0]), ret, "enq_binary(skip={skip}) return");
@@ -248,7 +248,7 @@ fn enqv_queues_the_vectors_bytes_after_the_skip() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // The fixture's vector is `enif_inspect_iovec` over ["ab","cde"] (5 bytes, 2 vectors).
     // (skip, ret, size, iovlen, bytes)
@@ -262,7 +262,7 @@ fn enqv_queues_the_vectors_bytes_after_the_skip() {
     ];
     for (skip, ret, size, iovlen, want) in cases {
         let got = lib
-            .call(&mut env, "enqv", 1, &[beam_term::prelude::make_small(skip)])
+            .call(&env, "enqv", 1, &[beam_term::prelude::make_small(skip)])
             .expect("enqv/1");
         let elems = tuple_of(got, 4);
         assert_eq!(int_of(elems[0]), ret, "enqv(skip={skip}) return");
@@ -281,10 +281,10 @@ fn the_peek_view_has_one_vector_per_enqueued_buffer_and_a_head_binary() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // "abc" via enq_binary, ["de","f"] via enqv, "ghij" via enq_binary => 10 bytes in 4 buffers.
-    let got = lib.call(&mut env, "mixed", 0, &[]).expect("mixed/0");
+    let got = lib.call(&env, "mixed", 0, &[]).expect("mixed/0");
     let elems = tuple_of(got, 6);
     assert_eq!(int_of(elems[0]), 10, "queued byte count");
     assert_eq!(int_of(elems[1]), 4, "one SysIOVec per enqueued buffer");
@@ -307,7 +307,7 @@ fn deq_drops_from_the_head_in_fifo_order_including_a_partial_buffer() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // The fixture enqueues "abc" then "defgh" (8 bytes in 2 buffers) and removes `count`.
     // (count, ret, remaining, size, iovlen, bytes, head_ret, head)
@@ -324,7 +324,7 @@ fn deq_drops_from_the_head_in_fifo_order_including_a_partial_buffer() {
     ];
     for (count, ret, remaining, size, iovlen, bytes, head_ret, head) in cases {
         let got = lib
-            .call(&mut env, "deq", 1, &[beam_term::prelude::make_small(count)])
+            .call(&env, "deq", 1, &[beam_term::prelude::make_small(count)])
             .expect("deq/1");
         let elems = tuple_of(got, 7);
         let ctx = format!("deq({count})");
@@ -350,7 +350,7 @@ fn inspect_iovec_cuts_the_list_after_max_elements_and_reports_the_tail() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // The fixture inspects the three-binary list ["aa","bbb","c"] (6 bytes, 3 elements).
     // (max_length, tail_len, iovcnt, vec_size, bytes)
@@ -362,7 +362,7 @@ fn inspect_iovec_cuts_the_list_after_max_elements_and_reports_the_tail() {
     ];
     for (max_len, tail_len, iovcnt, vec_size, want) in cases {
         let got = lib
-            .call(&mut env, "inspect", 1, &[beam_term::prelude::make_small(max_len)])
+            .call(&env, "inspect", 1, &[beam_term::prelude::make_small(max_len)])
             .expect("inspect/1");
         let elems = tuple_of(got, 5);
         let ctx = format!("inspect(max_length={max_len})");
@@ -379,10 +379,10 @@ fn inspect_iovec_with_a_null_env_owns_its_storage_and_free_iovec_releases_it() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     let got = lib
-        .call(&mut env, "inspect_null_env", 0, &[])
+        .call(&env, "inspect_null_env", 0, &[])
         .expect("inspect_null_env/0");
     let elems = tuple_of(got, 4);
     assert_eq!(ints(&elems[..3]), vec![1, 0, 2], "return, tail length, vector count");
@@ -396,10 +396,10 @@ fn inspect_iovec_uses_a_caller_provided_preallocated_struct() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = load_path(&so) else { return };
     let (mut host, lib) = loaded(&path);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     let got = lib
-        .call(&mut env, "inspect_provided", 0, &[])
+        .call(&env, "inspect_provided", 0, &[])
         .expect("inspect_provided/0");
     let elems = tuple_of(got, 5);
     // {Ret, UsedCallerStruct, InlineIovUsed, IovCnt, Bytes} — an inline `small_iov` marks the

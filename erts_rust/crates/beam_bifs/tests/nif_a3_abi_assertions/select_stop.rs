@@ -217,7 +217,7 @@ fn open_stop_type(host: &mut WitnessHost, name: &str) -> *mut ErlNifResourceType
         ErlNifResourceFlags::CREATE.bits() | ErlNifResourceFlags::TAKEOVER.bits(),
     );
     let mut tried = ErlNifResourceFlags::from_bits(0);
-    let mut env = NifEnv::new(host);
+    let env = NifEnv::new(host);
     // SAFETY: `env` is live, `c_name` is NUL-terminated, `init` is a live local of the frozen shape
     // and `tried` is a live local. `host` outlives the type (the caller keeps it alive).
     let ty = unsafe { enif_init_resource_type(env.as_ptr(), c_name.as_ptr(), &init, flags, &mut tried) };
@@ -272,7 +272,7 @@ fn run_stop_case(
     assert!(!obj.is_null(), "the witness resource object allocates");
 
     let returned = {
-        let mut env = NifEnv::new(host);
+        let env = NifEnv::new(host);
         // SAFETY: `env` is live, `obj` is a live payload this test still references, `pid` is null
         // (the calling process) and the reference term is the empty list (irrelevant to STOP).
         unsafe {
@@ -497,7 +497,7 @@ fn enif_select_stop_verdicts_run_the_right_callback() {
             ErlNifResourceFlags::CREATE.bits() | ErlNifResourceFlags::TAKEOVER.bits(),
         );
         let mut tried = ErlNifResourceFlags::from_bits(0);
-        let mut env = NifEnv::new(&mut *hosts[0]);
+        let env = NifEnv::new(&mut *hosts[0]);
         // SAFETY: live env, NUL-terminated name, live `init`/`tried` locals.
         unsafe { enif_init_resource_type(env.as_ptr(), c_name.as_ptr(), &init, flags, &mut tried) }
     };

@@ -251,12 +251,12 @@ fn existing_atom_hit_miss_and_len_through_a_real_c_nif() {
     let Some(path) = load_path(&so) else { return };
 
     let (mut host, lib) = loaded(&path, None, false);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let hello = env.host().intern_atom("hello").expect("interns");
 
     // HIT: {1, hello}.
     let got = lib
-        .call(&mut env, "existing_hit", 0, &[])
+        .call(&env, "existing_hit", 0, &[])
         .expect("existing_hit/0");
     let want = env
         .heap()
@@ -266,7 +266,7 @@ fn existing_atom_hit_miss_and_len_through_a_real_c_nif() {
 
     // MISS: {0, 12345} — 0 *and* the out-pointer keeps the caller's sentinel.
     let got = lib
-        .call(&mut env, "existing_miss", 0, &[])
+        .call(&env, "existing_miss", 0, &[])
         .expect("existing_miss/0");
     let want = env
         .heap()
@@ -282,7 +282,7 @@ fn existing_atom_hit_miss_and_len_through_a_real_c_nif() {
 
     // `_len`: an explicit 5 bytes of "helloX" is the existing atom `hello` => {1, hello}.
     let got = lib
-        .call(&mut env, "existing_len", 0, &[])
+        .call(&env, "existing_len", 0, &[])
         .expect("existing_len/0");
     let want = env
         .heap()
@@ -303,19 +303,19 @@ fn select_reproduces_the_cs_invalid_event_and_failure_codes() {
     // A host that cannot service select (the trait default) => every valid request is -1.
     let (mut host, lib) = loaded(&path, None, false);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_same(
-            lib.call(&mut env, "select_bad", 0, &[]).expect("select_bad/0"),
+            lib.call(&env, "select_bad", 0, &[]).expect("select_bad/0"),
             invalid_event_code(),
             "enif_select(-1) is INT_MIN | ERL_NIF_SELECT_INVALID_EVENT",
         );
         assert_same(
-            lib.call(&mut env, "select_x_bad", 0, &[]).expect("select_x_bad/0"),
+            lib.call(&env, "select_x_bad", 0, &[]).expect("select_x_bad/0"),
             invalid_event_code(),
             "enif_select_x(-1) takes the same invalid-event path",
         );
         assert_same(
-            lib.call(&mut env, "select_noservice", 0, &[])
+            lib.call(&env, "select_noservice", 0, &[])
                 .expect("select_noservice/0"),
             make_small(-1),
             "an unserviceable select is negative (the C's `retval < 0` idiom)",
@@ -325,14 +325,14 @@ fn select_reproduces_the_cs_invalid_event_and_failure_codes() {
     // A host that services the request passes its code through verbatim.
     let (mut host, lib) = loaded(&path, Some(0), false);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_same(
-            lib.call(&mut env, "select_x_ok", 0, &[]).expect("select_x_ok/0"),
+            lib.call(&env, "select_x_ok", 0, &[]).expect("select_x_ok/0"),
             make_small(0),
             "a serviced enif_select_x returns the host's code",
         );
         assert_same(
-            lib.call(&mut env, "select_noservice", 0, &[])
+            lib.call(&env, "select_noservice", 0, &[])
                 .expect("select_noservice/0"),
             make_small(0),
             "a serviced enif_select returns 0",
@@ -353,14 +353,14 @@ fn priv_data_is_the_library_pointer_and_the_host_is_the_no_call_fallback() {
     // that pointer — `env->mod_nif->priv_data` — whatever the host hook says.
     let (mut host, lib) = loaded(&path, None, true);
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_same(
-            lib.call(&mut env, "priv_data", 0, &[]).expect("priv_data/0"),
+            lib.call(&env, "priv_data", 0, &[]).expect("priv_data/0"),
             make_small(1),
             "enif_priv_data reports the library's stored private pointer",
         );
         assert_same(
-            lib.call(&mut env, "make_copy", 0, &[]).expect("make_copy/0"),
+            lib.call(&env, "make_copy", 0, &[]).expect("make_copy/0"),
             make_small(0),
             "with no copy engine the answer is THE_NON_VALUE",
         );
@@ -372,7 +372,7 @@ fn priv_data_is_the_library_pointer_and_the_host_is_the_no_call_fallback() {
 
     // ...and NULL on a host without private data.
     let (mut host, _lib) = loaded(&path, None, false);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is a live env.
     assert!(
         unsafe { enif_priv_data(env.as_ptr()) }.is_null(),
@@ -403,9 +403,9 @@ fn alloc_env_reaches_the_current_host_through_a_real_c_nif() {
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
         .expect("the fixture must load: every enif_* it imports is defined by this crate");
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_same(
-            lib.call(&mut env, "alloc_env", 0, &[]).expect("alloc_env/0"),
+            lib.call(&env, "alloc_env", 0, &[]).expect("alloc_env/0"),
             make_small(0),
             "a host with no alloc_env support answers NULL",
         );
@@ -417,9 +417,9 @@ fn alloc_env_reaches_the_current_host_through_a_real_c_nif() {
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
         .expect("the fixture must load: every enif_* it imports is defined by this crate");
     {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         assert_same(
-            lib.call(&mut env, "alloc_env", 0, &[]).expect("alloc_env/0"),
+            lib.call(&env, "alloc_env", 0, &[]).expect("alloc_env/0"),
             make_small(want as usize as i64),
             "the host's env pointer comes back through the C ABI",
         );
@@ -446,7 +446,7 @@ fn enif_free_env_is_null_safe_and_never_frees_a_foreign_env() {
     // SAFETY: a null env is explicitly allowed by the contract.
     unsafe { enif_free_env(core::ptr::null_mut()) };
 
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     assert!(!env.as_ptr().is_null());
     // The per-call env is not owned by the host (`free_env` reports `false`), so this is a no-op:
     // the C would `erts_free` it, which here would corrupt the test's own stack.
@@ -481,13 +481,13 @@ fn message_env_lifecycle_alloc_use_free_and_the_no_op_protocol() {
     // itself through the public API), so the "use" step below is a genuine atom intern.
     let mut msg_host = EnvHost::new(None, false).owning();
     let msg_freed = msg_host.free_log();
-    let mut msg_env = NifEnv::new(&mut msg_host);
+    let msg_env = NifEnv::new(&mut msg_host);
     let msg_ptr = msg_env.as_ptr();
 
     // The call env's host is the one `enif_alloc_env` reaches; it does NOT own message envs.
     let mut host = EnvHost::new(None, false).with_alloc_env(msg_ptr);
     let call_freed = host.free_log();
-    let mut call_env = NifEnv::new(&mut host);
+    let call_env = NifEnv::new(&mut host);
     let call_ptr = call_env.as_ptr();
 
     // --- alloc: the current call's host hands out its own env -------------------------------

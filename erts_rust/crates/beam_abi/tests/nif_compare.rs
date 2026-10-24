@@ -163,7 +163,7 @@ impl Args {
 
     /// The term for one probe literal, built exactly as the C fixture builds it (a small integer, a
     /// boxed float, or one of the interned atoms).
-    fn build(&self, env: &mut NifEnv, literal: &str) -> Eterm {
+    fn build(&self, env: &NifEnv, literal: &str) -> Eterm {
         match literal {
             "alpha" => self.alpha,
             "beta" => self.beta,
@@ -177,7 +177,7 @@ impl Args {
 }
 
 /// A boxed float term on the env's heap (`enif_make_double`).
-fn float(env: &mut NifEnv, value: f64) -> Eterm {
+fn float(env: &NifEnv, value: f64) -> Eterm {
     // SAFETY: `env` is live for the whole test; `enif_make_double` only allocates on its heap.
     eterm_from_nif(unsafe { enif_make_double(env.as_ptr(), value) })
 }
@@ -192,7 +192,7 @@ fn small_int(term: Eterm) -> i64 {
 
 /// Call `compare/2` through the loaded library and return the `enif_compare` value.
 #[track_caller]
-fn compare(env: &mut NifEnv, lib: &NifLibrary, lhs: Eterm, rhs: Eterm) -> i64 {
+fn compare(env: &NifEnv, lib: &NifLibrary, lhs: Eterm, rhs: Eterm) -> i64 {
     let got = lib
         .call(env, "compare", 2, &[lhs, rhs])
         .unwrap_or_else(|err| panic!("compare/2 must be callable: {err:?}"));
@@ -213,7 +213,7 @@ fn tuple_ints(term: Eterm) -> Vec<i64> {
 
 /// `order_pairs/0` through the loaded library.
 #[track_caller]
-fn order_pairs(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
+fn order_pairs(env: &NifEnv, lib: &NifLibrary) -> Vec<i64> {
     let term = lib
         .call(env, "order_pairs", 0, &[])
         .unwrap_or_else(|err| panic!("order_pairs/0 must be callable: {err:?}"));
@@ -222,7 +222,7 @@ fn order_pairs(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
 
 /// `nested_atoms/0` through the loaded library: `{alpha}` vs `{beta}`, `[alpha]` vs `[beta]`.
 #[track_caller]
-fn nested_atoms(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
+fn nested_atoms(env: &NifEnv, lib: &NifLibrary) -> Vec<i64> {
     let term = lib
         .call(env, "nested_atoms", 0, &[])
         .unwrap_or_else(|err| panic!("nested_atoms/0 must be callable: {err:?}"));
@@ -232,7 +232,7 @@ fn nested_atoms(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
 /// `fresh_atoms/0` through the loaded library: `compare(alpha, beta)`, `compare(beta, alpha)` where
 /// **both** atoms are interned by the NIF itself, in this call.
 #[track_caller]
-fn fresh_atoms(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
+fn fresh_atoms(env: &NifEnv, lib: &NifLibrary) -> Vec<i64> {
     let term = lib
         .call(env, "fresh_atoms", 0, &[])
         .unwrap_or_else(|err| panic!("fresh_atoms/0 must be callable: {err:?}"));
@@ -310,36 +310,36 @@ fn the_fixed_order_points_round_trip_through_a_real_c_nif() {
     let args = Args::intern(&mut host);
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
         .expect("the fixture must load: every enif_* it imports is defined by this crate");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let one = args.build(&mut env, "1");
-    let two = args.build(&mut env, "2");
-    let one_float = args.build(&mut env, "1.0");
-    let one_five = args.build(&mut env, "1.5");
+    let one = args.build(&env, "1");
+    let two = args.build(&env, "2");
+    let one_float = args.build(&env, "1.0");
+    let one_five = args.build(&env, "1.5");
 
     // The arithmetic mode: the C `enif_compare` is `erts_cmp(lhs, rhs, exact = 0, eq_only = 0)`.
-    assert_eq!(compare(&mut env, &lib, one, one_float), 0, "1 == 1.0");
-    assert_eq!(compare(&mut env, &lib, one_float, one), 0, "1.0 == 1");
-    assert_eq!(compare(&mut env, &lib, one_five, one), 1, "1.5 > 1");
+    assert_eq!(compare(&env, &lib, one, one_float), 0, "1 == 1.0");
+    assert_eq!(compare(&env, &lib, one_float, one), 0, "1.0 == 1");
+    assert_eq!(compare(&env, &lib, one_five, one), 1, "1.5 > 1");
     // ... while an exact-mode comparison would have ordered them by class rank.
 
     // The atom pair is ordered by NAME (`erts_cmp_atoms`), not by the atom table's indices: the
     // host interned `beta` before `alpha` (see `Args::intern`), so an index fallback would answer
     // `1`/`-1` here — the exact opposite.
     assert_eq!(
-        compare(&mut env, &lib, args.alpha, args.beta),
+        compare(&env, &lib, args.alpha, args.beta),
         -1,
         "'alpha' sorts before 'beta' by name, not by atom index"
     );
-    assert_eq!(compare(&mut env, &lib, args.beta, args.alpha), 1);
+    assert_eq!(compare(&env, &lib, args.beta, args.alpha), 1);
 
     // Identical terms keep the raw-word fast path, and a name-free pair is unaffected.
-    assert_eq!(compare(&mut env, &lib, args.alpha, args.alpha), 0);
-    assert_eq!(compare(&mut env, &lib, one, two), -1);
+    assert_eq!(compare(&env, &lib, args.alpha, args.alpha), 0);
+    assert_eq!(compare(&env, &lib, one, two), -1);
 
     // The whole fixed lattice, built inside the NIF.
     assert_eq!(
-        order_pairs(&mut env, &lib),
+        order_pairs(&env, &lib),
         ORDER_PAIRS,
         "every order-lattice point must be the C's answer"
     );
@@ -354,13 +354,13 @@ fn the_same_fixture_agrees_under_the_erl_oracle() {
     let mut host = TestHost::new();
     let args = Args::intern(&mut host);
     let lib = load(&path, MODULE, &mut host, Eterm::nil()).expect("the fixture must load");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     let mut ours: Vec<String> = Vec::new();
     for probe in PROBES {
-        let lhs = args.build(&mut env, probe.lhs);
-        let rhs = args.build(&mut env, probe.rhs);
-        let got = compare(&mut env, &lib, lhs, rhs);
+        let lhs = args.build(&env, probe.lhs);
+        let rhs = args.build(&env, probe.rhs);
+        let got = compare(&env, &lib, lhs, rhs);
         assert_eq!(
             got, probe.want,
             "enif_compare({}, {}) must be {}",
@@ -368,7 +368,7 @@ fn the_same_fixture_agrees_under_the_erl_oracle() {
         );
         ours.push(got.to_string());
     }
-    ours.push(erl_tuple(&order_pairs(&mut env, &lib)));
+    ours.push(erl_tuple(&order_pairs(&env, &lib)));
 
     let exprs: Vec<String> = PROBES
         .iter()
@@ -397,9 +397,9 @@ fn atoms_interned_inside_the_nif_are_ordered_by_name() {
     // committed), so the pair can be ordered by name only through the env's per-call atom record.
     let mut host = DeferredHost::new();
     let lib = load(&path, MODULE, &mut host, Eterm::nil()).expect("the fixture must load");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = fresh_atoms(&mut env, &lib);
+    let got = fresh_atoms(&env, &lib);
     drop(env);
     assert_eq!(
         got,
@@ -446,9 +446,9 @@ fn a_nested_atom_pair_orders_by_name() {
     let _beta = host.atom("beta");
     let _alpha = host.atom("alpha");
     let lib = load(&path, MODULE, &mut host, Eterm::nil()).expect("the fixture must load");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
-    let got = nested_atoms(&mut env, &lib);
+    let got = nested_atoms(&env, &lib);
     assert_eq!(
         got,
         vec![-1, -1],

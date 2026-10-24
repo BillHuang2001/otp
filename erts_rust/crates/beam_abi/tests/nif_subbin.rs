@@ -95,7 +95,7 @@ fn window_bytes(bytes: &[u8], offset: usize, size_bits: usize) -> Vec<u8> {
 /// `env` must be live (its heap allocatable); `payload` must stay alive and unmoved while the
 /// returned term (and any view of it) is used, and `offset + size_bits` must not exceed its bits.
 unsafe fn window_term(
-    env: &mut NifEnv,
+    env: &NifEnv,
     payload: &RefcBinary,
     offset: usize,
     size_bits: usize,
@@ -123,7 +123,7 @@ unsafe fn window_term(
 /// # Safety
 ///
 /// `env` must be live; `bytes` must hold at least `ceil(n_bits / 8)` bytes.
-unsafe fn heap_bits_term(env: &mut NifEnv, bytes: &[u8], n_bits: usize) -> Eterm {
+unsafe fn heap_bits_term(env: &NifEnv, bytes: &[u8], n_bits: usize) -> Eterm {
     // SAFETY: `heap_bits_size_words` sizes the `[hdr][size][data…]` block for `n_bits` bits.
     let hp = unsafe { env.heap().alloc_words(prelude::heap_bits_size_words(n_bits)) }
         .expect("the test heap has room for the bitstring");
@@ -136,7 +136,7 @@ unsafe fn heap_bits_term(env: &mut NifEnv, bytes: &[u8], n_bits: usize) -> Eterm
 /// # Safety
 ///
 /// `env` must be live and `term` any term.
-unsafe fn sub(env: &mut NifEnv, term: Eterm, pos: usize, size: usize) -> ERL_NIF_TERM {
+unsafe fn sub(env: &NifEnv, term: Eterm, pos: usize, size: usize) -> ERL_NIF_TERM {
     let ptr = env.as_ptr();
     // SAFETY: `ptr` is the live env's C-facing pointer; the term is a live term word.
     unsafe { enif_make_sub_binary(ptr, nif_from_eterm(term), pos, size) }
@@ -148,7 +148,7 @@ unsafe fn sub(env: &mut NifEnv, term: Eterm, pos: usize, size: usize) -> ERL_NIF
 /// # Safety
 ///
 /// `env` must be live and `term` a live bitstring.
-unsafe fn inspect(env: &mut NifEnv, term: ERL_NIF_TERM) -> Vec<u8> {
+unsafe fn inspect(env: &NifEnv, term: ERL_NIF_TERM) -> Vec<u8> {
     let mut view = ErlNifBinary::default();
     let ptr = env.as_ptr();
     // SAFETY: `ptr` is the live env's pointer and `view` is a live local.
@@ -188,7 +188,7 @@ unsafe fn identical(a: ERL_NIF_TERM, b: ERL_NIF_TERM) -> bool {
 }
 
 /// The `badarg` atom term of `env` — the C's `enif_make_badarg` answer to a refused request.
-fn badarg(env: &mut NifEnv) -> ERL_NIF_TERM {
+fn badarg(env: &NifEnv) -> ERL_NIF_TERM {
     let atom = env
         .host()
         .intern_atom("badarg")
@@ -197,7 +197,7 @@ fn badarg(env: &mut NifEnv) -> ERL_NIF_TERM {
 }
 
 /// The atom `name` interned on `env` (a non-bitstring source for the refusal cases).
-fn atom_term(env: &mut NifEnv, name: &str) -> Eterm {
+fn atom_term(env: &NifEnv, name: &str) -> Eterm {
     env.host().intern_atom(name).expect("the host interns atoms")
 }
 
@@ -206,7 +206,7 @@ fn atom_term(env: &mut NifEnv, name: &str) -> Eterm {
 /// # Safety
 ///
 /// `env` must be live and `term` a live term.
-unsafe fn assert_empty(env: &mut NifEnv, term: ERL_NIF_TERM, what: &str) {
+unsafe fn assert_empty(env: &NifEnv, term: ERL_NIF_TERM, what: &str) {
     let t = eterm_from_nif(term);
     // SAFETY: `term` is a live term.
     assert!(
@@ -240,7 +240,7 @@ unsafe fn assert_empty(env: &mut NifEnv, term: ERL_NIF_TERM, what: &str) {
 /// # Safety
 ///
 /// `env` must be live and `term` a live byte-sized bitstring.
-unsafe fn assert_bits(env: &mut NifEnv, term: ERL_NIF_TERM, want: &[u8], what: &str) {
+unsafe fn assert_bits(env: &NifEnv, term: ERL_NIF_TERM, want: &[u8], what: &str) {
     // SAFETY: `env` is live and `term` a live bitstring.
     let got = unsafe { inspect(env, term) };
     assert_eq!(got, want, "{what}");
@@ -258,7 +258,7 @@ unsafe fn assert_bits(env: &mut NifEnv, term: ERL_NIF_TERM, want: &[u8], what: &
 /// # Safety
 ///
 /// `env` must be live and `term` a live bitstring.
-unsafe fn assert_sub(env: &mut NifEnv, term: Eterm, pos: usize, size: usize, want: &[u8], what: &str) {
+unsafe fn assert_sub(env: &NifEnv, term: Eterm, pos: usize, size: usize, want: &[u8], what: &str) {
     let got = unsafe { sub(env, term, pos, size) };
     unsafe { assert_bits(env, got, want, what) };
 }
@@ -268,7 +268,7 @@ unsafe fn assert_sub(env: &mut NifEnv, term: Eterm, pos: usize, size: usize, wan
 /// # Safety
 ///
 /// `env` must be live and `term` a live bitstring.
-unsafe fn assert_sub_empty(env: &mut NifEnv, term: Eterm, pos: usize, size: usize, what: &str) {
+unsafe fn assert_sub_empty(env: &NifEnv, term: Eterm, pos: usize, size: usize, what: &str) {
     let got = unsafe { sub(env, term, pos, size) };
     unsafe { assert_empty(env, got, what) };
 }
@@ -278,7 +278,7 @@ unsafe fn assert_sub_empty(env: &mut NifEnv, term: Eterm, pos: usize, size: usiz
 /// # Safety
 ///
 /// `env` must be live and `term` any term.
-unsafe fn assert_sub_badarg(env: &mut NifEnv, term: Eterm, pos: usize, size: usize, what: &str) {
+unsafe fn assert_sub_badarg(env: &NifEnv, term: Eterm, pos: usize, size: usize, what: &str) {
     let got = unsafe { sub(env, term, pos, size) };
     let want = badarg(env);
     // SAFETY: both are live terms.
@@ -298,20 +298,20 @@ unsafe fn assert_sub_badarg(env: &mut NifEnv, term: Eterm, pos: usize, size: usi
 #[test]
 fn a_bit_offset_source_windows_by_bits() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let payload = small_payload();
     let bin = RefcBinary::new(&payload).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test, `bin` outlives every term built from it, and the
     // windows below lie inside its 32 bits.
     unsafe {
         // `MisBin = <<_:3, X:2/binary, _/bitstring>>` of `<<1,2,3,4>>`: bit offset 3, 16 bits.
-        let mis = window_term(&mut env, &bin, 3, 16);
+        let mis = window_term(&env, &bin, 3, 16);
         assert!(is_bitstring(mis), "the source is a bitstring");
         assert_eq!(prelude::bitstring_size(mis), 16);
         assert!(is_binary(mis), "a 16-bit window is byte-sized");
 
         // (1, 1) — bits 11..19 of the payload. Measured oracle: `<<16>>`.
-        assert_sub(&mut env, mis, 1, 1, &[16], "MisBin (1, 1)");
+        assert_sub(&env, mis, 1, 1, &[16], "MisBin (1, 1)");
         assert_eq!(
             window_bytes(&payload, 11, 8),
             vec![16],
@@ -319,15 +319,15 @@ fn a_bit_offset_source_windows_by_bits() {
         );
 
         // (0, 2) — the whole 16-bit source, still a bit window (the source offset is kept).
-        assert_sub(&mut env, mis, 0, 2, &window_bytes(&payload, 3, 16), "MisBin (0, 2)");
+        assert_sub(&env, mis, 0, 2, &window_bytes(&payload, 3, 16), "MisBin (0, 2)");
         // Both `pos` boundaries with `size == 0`: the last byte and one past it (`total + 1`) are
         // accepted, and so is a nonsensical `pos` (measured; the C's bound ASSERT is off).
         for pos in [0usize, 1, 2, 3, 9, usize::MAX] {
-            assert_sub_empty(&mut env, mis, pos, 0, &format!("MisBin ({pos}, 0)"));
+            assert_sub_empty(&env, mis, pos, 0, &format!("MisBin ({pos}, 0)"));
         }
         // A `size > 0` window that runs past the source's last bit is refused.
-        assert_sub_badarg(&mut env, mis, 1, 2, "MisBin (1, 2)");
-        assert_sub_badarg(&mut env, mis, 2, 1, "MisBin (2, 1)");
+        assert_sub_badarg(&env, mis, 1, 2, "MisBin (1, 2)");
+        assert_sub_badarg(&env, mis, 2, 1, "MisBin (2, 1)");
     }
 }
 
@@ -336,34 +336,34 @@ fn a_bit_offset_source_windows_by_bits() {
 #[test]
 fn the_measured_rows_agree() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let payload = small_payload();
     let big = counting_payload(200);
     let big_bin = RefcBinary::new(&big).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test; both payloads outlive every term built from them.
     unsafe {
         // `<<1:3>>` — three bits in one byte (`0b0010_0000`), not a binary.
-        let three_bits = heap_bits_term(&mut env, &[0b0010_0000], 3);
+        let three_bits = heap_bits_term(&env, &[0b0010_0000], 3);
         assert!(!is_binary(three_bits), "three bits is not byte-sized");
-        assert_sub_empty(&mut env, three_bits, 0, 0, "`<<1:3>>` (0, 0)");
+        assert_sub_empty(&env, three_bits, 0, 0, "`<<1:3>>` (0, 0)");
         // Any `pos` with `size == 0` is accepted for a bit-sized source too (measured).
-        assert_sub_empty(&mut env, three_bits, 1, 0, "`<<1:3>>` (1, 0)");
+        assert_sub_empty(&env, three_bits, 1, 0, "`<<1:3>>` (1, 0)");
         // …but an 8-bit window does not fit in 3 bits (the C reads 5 bits past the source).
-        assert_sub_badarg(&mut env, three_bits, 0, 1, "`<<1:3>>` (0, 1)");
+        assert_sub_badarg(&env, three_bits, 0, 1, "`<<1:3>>` (0, 1)");
 
         // `<<1,2,3,4>>` — a 32-bit heap bitstring.
-        let four = heap_bits_term(&mut env, &payload, 32);
-        assert_sub(&mut env, four, 0, 4, &payload, "`<<1,2,3,4>>` (0, 4) — the whole binary");
-        assert_sub(&mut env, four, 3, 1, &[4], "`<<1,2,3,4>>` (3, 1) — the last byte");
-        assert_sub_empty(&mut env, four, 4, 0, "`<<1,2,3,4>>` (4, 0)");
-        assert_sub_empty(&mut env, four, 0, 0, "`<<1,2,3,4>>` (0, 0)");
+        let four = heap_bits_term(&env, &payload, 32);
+        assert_sub(&env, four, 0, 4, &payload, "`<<1,2,3,4>>` (0, 4) — the whole binary");
+        assert_sub(&env, four, 3, 1, &[4], "`<<1,2,3,4>>` (3, 1) — the last byte");
+        assert_sub_empty(&env, four, 4, 0, "`<<1,2,3,4>>` (4, 0)");
+        assert_sub_empty(&env, four, 0, 0, "`<<1,2,3,4>>` (0, 0)");
         // `pos == total_bytes + 1` with `size == 0` is accepted (measured).
-        assert_sub_empty(&mut env, four, 5, 0, "`<<1,2,3,4>>` (5, 0)");
+        assert_sub_empty(&env, four, 5, 0, "`<<1,2,3,4>>` (5, 0)");
 
         // `Big200` — the off-heap 200-byte binary (a byte-aligned whole-binary source).
-        let big200 = window_term(&mut env, &big_bin, 0, 200 * 8);
+        let big200 = window_term(&env, &big_bin, 0, 200 * 8);
         assert_sub(
-            &mut env,
+            &env,
             big200,
             3,
             100,
@@ -371,16 +371,16 @@ fn the_measured_rows_agree() {
             "Big200 (3, 100)",
         );
         assert_sub(
-            &mut env,
+            &env,
             big200,
             199,
             1,
             &window_bytes(&big, 199 * 8, 8),
             "Big200 (199, 1)",
         );
-        assert_sub_empty(&mut env, big200, 200, 0, "Big200 (200, 0)");
-        assert_sub_badarg(&mut env, big200, 200, 1, "Big200 (200, 1)");
-        assert_sub_badarg(&mut env, big200, 199, 2, "Big200 (199, 2)");
+        assert_sub_empty(&env, big200, 200, 0, "Big200 (200, 0)");
+        assert_sub_badarg(&env, big200, 200, 1, "Big200 (200, 1)");
+        assert_sub_badarg(&env, big200, 199, 2, "Big200 (199, 2)");
     }
 }
 
@@ -390,35 +390,35 @@ fn the_measured_rows_agree() {
 #[test]
 fn a_byte_sized_bit_offset_source_keeps_the_refc_window_shape() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let payload = counting_payload(160);
     let bin = RefcBinary::new(&payload).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test and `bin` outlives every term built from it.
     unsafe {
         // The 100-byte window at bit offset 5 — the same source `nif_bitslice.rs` measures.
-        let w = window_term(&mut env, &bin, 5, 800);
+        let w = window_term(&env, &bin, 5, 800);
         assert!(is_bitstring(w), "the source is a bitstring");
         assert!(is_binary(w), "100 bytes is byte-sized");
 
         // A 100-byte (800-bit) window: an `ErlSubBits` *window* onto the payload's storage, at the
         // absolute bit offset `source_offset + NBITS(pos)` — never a fresh heap blob.
-        let big = sub(&mut env, w, 0, 100);
+        let big = sub(&env, w, 0, 100);
         assert!(is_sub_bits(big), "a >512-bit window stays a sub-bits window");
         // SAFETY: `big` is a live bitstring (just checked).
         let (base, offset, size) = prelude::bitstring_parts(eterm_from_nif(big));
         assert_eq!(base as *mut u8, bin.data_ptr(), "the window borrows the payload");
         assert_eq!((offset, size), (5, 800), "source offset + pos * 8");
-        assert_bits(&mut env, big, &window_bytes(&payload, 5, 800), "W (0, 100)");
+        assert_bits(&env, big, &window_bytes(&payload, 5, 800), "W (0, 100)");
 
         // A byte-aligned *boundary* window of the same source, still above 512 bits: 65 bytes from
         // source byte 3 => bits 29..549 (a window again, at a different absolute offset).
-        let big_aligned = sub(&mut env, w, 3, 65);
+        let big_aligned = sub(&env, w, 3, 65);
         assert!(is_sub_bits(big_aligned));
         // SAFETY: `big_aligned` is a live bitstring (just checked).
         let (_, offset, size) = prelude::bitstring_parts(eterm_from_nif(big_aligned));
         assert_eq!((offset, size), (5 + 24, 520));
         assert_bits(
-            &mut env,
+            &env,
             big_aligned,
             &window_bytes(&payload, 29, 520),
             "W (3, 65)",
@@ -428,10 +428,10 @@ fn a_byte_sized_bit_offset_source_keeps_the_refc_window_shape() {
         // the result is no longer a view of the payload. `(0, 64)` is the exact 512-bit boundary,
         // `(90, 10)` the far end of the source.
         for (pos, size) in [(0usize, 10usize), (0, 64), (2, 4), (90, 10)] {
-            let small = sub(&mut env, w, pos, size);
+            let small = sub(&env, w, pos, size);
             assert!(!is_sub_bits(small), "W ({pos}, {size}) is copied");
             assert_bits(
-                &mut env,
+                &env,
                 small,
                 &window_bytes(&payload, 5 + pos * 8, size * 8),
                 &format!("W ({pos}, {size})"),
@@ -446,12 +446,12 @@ fn a_byte_sized_bit_offset_source_keeps_the_refc_window_shape() {
 #[test]
 fn out_of_range_and_non_bitstrings_are_refused() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let payload = small_payload();
     let bin = RefcBinary::new(&payload).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test; `bin` outlives the terms built from it.
     unsafe {
-        let four = heap_bits_term(&mut env, &payload, 32);
+        let four = heap_bits_term(&env, &payload, 32);
         // One byte (or more) past the end with `size > 0`, plus the overflowing byte counts.
         for (pos, size) in [
             (0usize, 5usize),
@@ -464,7 +464,7 @@ fn out_of_range_and_non_bitstrings_are_refused() {
             (usize::MAX / 8, 2),
         ] {
             assert_sub_badarg(
-                &mut env,
+                &env,
                 four,
                 pos,
                 size,
@@ -473,16 +473,16 @@ fn out_of_range_and_non_bitstrings_are_refused() {
         }
 
         // A non-bitstring source: an atom (with and without a window), an integer and `[]`.
-        let ok = atom_term(&mut env, "ok");
-        assert_sub_badarg(&mut env, ok, 0, 0, "the atom `ok` (0, 0)");
-        assert_sub_badarg(&mut env, ok, 0, 1, "the atom `ok` (0, 1)");
-        assert_sub_badarg(&mut env, make_small(42), 0, 0, "the integer 42");
-        assert_sub_badarg(&mut env, make_small(42), 1, 2, "the integer 42 (1, 2)");
-        assert_sub_badarg(&mut env, NIL, 0, 1, "`[]`");
+        let ok = atom_term(&env, "ok");
+        assert_sub_badarg(&env, ok, 0, 0, "the atom `ok` (0, 0)");
+        assert_sub_badarg(&env, ok, 0, 1, "the atom `ok` (0, 1)");
+        assert_sub_badarg(&env, make_small(42), 0, 0, "the integer 42");
+        assert_sub_badarg(&env, make_small(42), 1, 2, "the integer 42 (1, 2)");
+        assert_sub_badarg(&env, NIL, 0, 1, "`[]`");
 
         // A 16-bit source still refuses a 24-bit window (the source's own bit size bounds it).
-        let mis = window_term(&mut env, &bin, 3, 16);
-        assert_sub_badarg(&mut env, mis, 2, 2, "MisBin (2, 2)");
+        let mis = window_term(&env, &bin, 3, 16);
+        assert_sub_badarg(&env, mis, 2, 2, "MisBin (2, 2)");
     }
 }
 
@@ -567,17 +567,17 @@ fn the_expected_bits_agree_with_the_erl_oracle() {
 
     // And the crate's own answer for the same ten requests, over sources built with the writers.
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let bin4 = RefcBinary::new(&p4).expect("an off-heap payload");
     let bin200 = RefcBinary::new(&big).expect("an off-heap payload");
     let bin160 = RefcBinary::new(&big160).expect("an off-heap payload");
     // SAFETY: `env` is live for the whole test; the payloads outlive every term built from them.
     unsafe {
-        let mis = window_term(&mut env, &bin4, 3, 16);
-        let t3 = heap_bits_term(&mut env, &[0b0010_0000], 3);
-        let four = heap_bits_term(&mut env, &p4, 32);
-        let big200 = window_term(&mut env, &bin200, 0, 200 * 8);
-        let wterm = window_term(&mut env, &bin160, 5, 800);
+        let mis = window_term(&env, &bin4, 3, 16);
+        let t3 = heap_bits_term(&env, &[0b0010_0000], 3);
+        let four = heap_bits_term(&env, &p4, 32);
+        let big200 = window_term(&env, &bin200, 0, 200 * 8);
+        let wterm = window_term(&env, &bin160, 5, 800);
         let requests = [
             (mis, 1usize, 1usize),
             (t3, 0, 0),
@@ -593,8 +593,8 @@ fn the_expected_bits_agree_with_the_erl_oracle() {
         let got: Vec<Vec<u8>> = requests
             .into_iter()
             .map(|(term, pos, size)| {
-                let result = sub(&mut env, term, pos, size);
-                inspect(&mut env, result)
+                let result = sub(&env, term, pos, size);
+                inspect(&env, result)
             })
             .collect();
         assert_eq!(got, want, "the crate's answers must agree with the oracle's");

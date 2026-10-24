@@ -297,7 +297,7 @@ impl NifLibrary {
     /// module section "The in-flight library's private data").
     pub fn call(
         &self,
-        env: &mut NifEnv,
+        env: &NifEnv,
         name: &str,
         arity: u32,
         args: &[Eterm],
@@ -372,7 +372,7 @@ impl Drop for NifLibrary {
             } else {
                 // SAFETY: `self.host` was produced from a live `&mut dyn NifHost` in `load`; the
                 // caller keeps the host alive for as long as the library (documented contract).
-                let mut env = NifEnv::new(unsafe { &mut *self.host });
+                let env = NifEnv::new(unsafe { &mut *self.host });
                 // SAFETY: `unload` is the library's own `unload` callback; `env` outlives the call.
                 unsafe { unload(env.as_ptr(), self.priv_data) };
             }
@@ -496,7 +496,7 @@ pub fn load(
     if let Some(load_fn) = unsafe { (*entry).load } {
         // SAFETY: `host_ptr` was produced from a live `&mut dyn NifHost`; the borrow is reproduced
         // here for the duration of the callback only.
-        let mut env = NifEnv::new(unsafe { &mut *host_ptr });
+        let env = NifEnv::new(unsafe { &mut *host_ptr });
         // SAFETY: `load_fn` is the library's own `load` callback (C signature
         // `int (ErlNifEnv*, void**, ERL_NIF_TERM)`); `env` outlives the call.
         let veto = unsafe { load_fn(env.as_ptr(), &mut priv_data, nif_from_eterm(load_info)) };

@@ -50,7 +50,7 @@ fn atom(host: &mut common::TestHost, name: &str) -> Eterm {
 #[test]
 fn make_int_round_trips_through_get_int() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live for the whole test; the out-pointer is a live local.
     unsafe {
         let term = enif_make_int(env.as_ptr(), 5);
@@ -71,7 +71,7 @@ fn get_int_rejects_out_of_range_and_non_integers() {
     let mut host = common::TestHost::new();
     // Intern the atom *before* the env borrows the host (`NifEnv` holds the host mutably).
     let zzz = atom(&mut host, "zzz");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-pointers are live locals.
     unsafe {
         // A value wider than `int` (but a perfectly good small integer) must be rejected.
@@ -99,7 +99,7 @@ fn double_round_trip_and_non_finite_is_badarg() {
     let mut host = common::TestHost::new();
     // Intern the atom *before* the env borrows the host.
     let badarg = atom(&mut host, "badarg");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-pointers are live locals.
     unsafe {
         let term = enif_make_double(env.as_ptr(), 1.5);
@@ -122,7 +122,7 @@ fn atoms_make_get_length_round_trip() {
     let mut host = common::TestHost::new();
     // Intern the atom *before* the env borrows the host.
     let hello = atom(&mut host, "hello");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let name = std::ffi::CString::new("hello").unwrap();
     // SAFETY: `env` is live; `name` is a valid NUL-terminated string; buffers are live.
     unsafe {
@@ -184,7 +184,7 @@ fn atom_len_and_encoding_validation() {
     let mut host = common::TestHost::new();
     // Intern the atom *before* the env borrows the host.
     let abc = atom(&mut host, "abc");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; the byte slices are live.
     unsafe {
         let bytes = b"abc";
@@ -206,7 +206,7 @@ fn atom_len_and_encoding_validation() {
 #[test]
 fn tuples_from_array_and_back() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let arr = [make_small(1), make_small(2), make_small(3)].map(nif_from_eterm);
     // SAFETY: `env` is live; `arr` is a live 3-element array; out-params are live locals.
     unsafe {
@@ -243,7 +243,7 @@ fn tuples_from_array_and_back() {
 #[test]
 fn lists_cells_length_and_reverse() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let arr = [make_small(1), make_small(2), make_small(3)].map(nif_from_eterm);
     // SAFETY: `env` is live; `arr` is live; out-params are live locals.
     unsafe {
@@ -296,7 +296,7 @@ fn lists_cells_length_and_reverse() {
 #[test]
 fn strings_lists_and_lengths() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let text = std::ffi::CString::new("hi").unwrap();
     // SAFETY: `env` is live; `text` is NUL-terminated; buffers are live.
     unsafe {
@@ -343,7 +343,7 @@ fn strings_lists_and_lengths() {
 #[test]
 fn binaries_alloc_inspect_make_and_release() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; `bin` is a live struct; the malloc'd payload is written through `data`.
     unsafe {
         let mut bin = ErlNifBinary::default();
@@ -392,7 +392,7 @@ fn binaries_alloc_inspect_make_and_release() {
 #[test]
 fn iolist_inspection_flattens_to_an_owned_buffer() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; `arr` is live; `bin` is a live struct.
     unsafe {
         // `[<<"ab">>, 99]` == `<<"ab">> ++ [99]` == `<<"abc">>` (the head is emitted first).
@@ -470,7 +470,7 @@ fn badarg_raise_pending_exception_and_clear() {
     let mut host = common::TestHost::new();
     // The `badarg` atom must be resolvable through the host.
     let badarg_term = host.atom("badarg");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     assert_eq!(env.pending_exception(), None);
     // SAFETY: `env` is live; out-params are live locals.
     unsafe {
@@ -520,7 +520,7 @@ fn badarg_raise_pending_exception_and_clear() {
 fn make_ref_without_a_host_hook_raises_badarg() {
     let mut host = common::TestHost::new();
     let badarg_term = host.atom("badarg");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live.
     unsafe {
         // `TestHost` uses the default `make_ref` (unsupported) → `badarg` + a pending exception.
@@ -555,7 +555,7 @@ fn malformed_input_never_panics() {
     let mut host = common::TestHost::new();
     // Intern the atom *before* the env borrows the host.
     let badarg = atom(&mut host, "badarg");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let env_ptr = env.as_ptr();
     // SAFETY: every call below is deliberately handed garbage, nulls or wrong-kind terms. The
     // contract under test is *totality*: none of them may panic, and each returns a safe default.
@@ -618,7 +618,7 @@ fn alloc_free_realloc_round_trip() {
 #[test]
 fn maps_new_put_get_size_and_predicate() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-params are live locals.
     unsafe {
         let empty = enif_make_new_map(env.as_ptr());
@@ -689,7 +689,7 @@ fn maps_new_put_get_size_and_predicate() {
 #[test]
 fn maps_remove_existing_missing_and_non_map() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live for the whole test; every out-param is a live local.
     unsafe {
         // Build #{1 => 10, 2 => 20}.
@@ -766,7 +766,7 @@ fn maps_remove_existing_missing_and_non_map() {
 #[test]
 fn pid_port_and_term_type_helpers() {
     let mut host = common::TestHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-structs are live locals.
     unsafe {
         let pid = nif_from_eterm(make_internal_pid(make_pid_data(1, 5)));
@@ -884,7 +884,7 @@ struct ProbeCase {
     /// The Erlang source text of the term (the oracle driver's `probe/1` argument).
     erl: &'static str,
     /// The same term, built through `beam_term`'s writers.
-    build: fn(&mut NifEnv) -> Eterm,
+    build: fn(&NifEnv) -> Eterm,
     /// The measured oracle observation of that term.
     want: Observation,
 }
@@ -929,32 +929,32 @@ fn cons(heap: &mut beam_alloc::Heap, car: Eterm, cdr: Eterm) -> Eterm {
 }
 
 /// `[<<1:7>>]` — seven bits (`0000001`, packed MSB-first into `0b0000_0010`).
-fn seven_bit_in_list(env: &mut NifEnv) -> Eterm {
+fn seven_bit_in_list(env: &NifEnv) -> Eterm {
     let head = heap_bitstring(env.heap(), &[0b0000_0010], 7);
     cons(env.heap(), head, NIL)
 }
 
 /// `[<<1:8>>]` — the same value as a whole byte.
-fn eight_bit_in_list(env: &mut NifEnv) -> Eterm {
+fn eight_bit_in_list(env: &NifEnv) -> Eterm {
     let head = heap_bitstring(env.heap(), &[1], 8);
     cons(env.heap(), head, NIL)
 }
 
 /// `[65,66,67]`.
-fn byte_list(env: &mut NifEnv) -> Eterm {
+fn byte_list(env: &NifEnv) -> Eterm {
     let tail = cons(env.heap(), make_small(67), NIL);
     let tail = cons(env.heap(), make_small(66), tail);
     cons(env.heap(), make_small(65), tail)
 }
 
 /// `[1|<<2>>]` — a byte followed by a byte-aligned binary tail.
-fn byte_with_binary_tail(env: &mut NifEnv) -> Eterm {
+fn byte_with_binary_tail(env: &NifEnv) -> Eterm {
     let tail = heap_binary(env.heap(), &[2]);
     cons(env.heap(), make_small(1), tail)
 }
 
 /// The atom `nope` — not an iolist at all.
-fn atom_term(env: &mut NifEnv) -> Eterm {
+fn atom_term(env: &NifEnv) -> Eterm {
     env.host().intern_atom("nope").expect("the test host interns atoms")
 }
 
@@ -1004,23 +1004,23 @@ fn the_iolist_shape_rules_hold_through_a_real_c_nif() {
     // The host outlives the library (drop order), which the loaded fixture requires.
     let lib = load(&path, IOLIST_MODULE, &mut host, NIL)
         .expect("a real NIF library must load: its enif_* imports resolve from the test binary");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     for (selector, what, want) in MADE_CASES {
         // Each case builds its own terms, so rewinding the arena in between keeps the small test
         // heap enough for the 1500-byte large case (each result is read out before the rewind).
         env.heap().reset();
         let got = lib
-            .call(&mut env, "made", 1, &[make_small(*selector)])
+            .call(&env, "made", 1, &[make_small(*selector)])
             .unwrap_or_else(|err| panic!("made/{selector} ({what}) must be callable: {err:?}"));
         assert_eq!(result_ints(got), want.to_vec(), "made/{selector} ({what})");
     }
 
     for case in PROBE_CASES {
         env.heap().reset();
-        let arg = (case.build)(&mut env);
+        let arg = (case.build)(&env);
         let got = lib
-            .call(&mut env, "probe", 1, &[arg])
+            .call(&env, "probe", 1, &[arg])
             .unwrap_or_else(|err| panic!("probe/1 of {} must be callable: {err:?}", case.erl));
         assert_eq!(result_ints(got), case.want.to_vec(), "probe/1 of {}", case.erl);
     }

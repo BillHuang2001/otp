@@ -150,7 +150,7 @@ fn open_stop_type(
         dyncall: None,
     };
     let mut tried = ErlNifResourceFlags::from_bits(0);
-    let mut env = NifEnv::new(host);
+    let env = NifEnv::new(host);
     // SAFETY: `env` is live; `c_name` is NUL-terminated; `init` is a live local of the frozen shape;
     // `tried` is a live local. The type's environment source is this host, which outlives the test.
     let ty = unsafe {
@@ -176,7 +176,7 @@ fn select_call(
     obj: *mut c_void,
 ) -> c_int {
     host.code = Some(code);
-    let mut env = NifEnv::new(host);
+    let env = NifEnv::new(host);
     // SAFETY: `env` is live, `obj` is a live payload pointer (or a deliberately foreign handle in the
     // refusal tests), and `pid` is null (the calling process).
     unsafe {

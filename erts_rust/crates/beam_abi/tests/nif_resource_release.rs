@@ -165,9 +165,9 @@ fn load_path(so: &Path) -> Option<String> {
 /// Call a zero-arity fixture entry that answers a small integer.
 #[track_caller]
 fn call_int(lib: &NifLibrary, host: &mut ResourceHost, name: &str) -> i64 {
-    let mut env = NifEnv::new(host);
+    let env = NifEnv::new(host);
     let term = lib
-        .call(&mut env, name, 0, &[])
+        .call(&env, name, 0, &[])
         .unwrap_or_else(|err| panic!("{name}/0 must be callable: {err:?}"));
     assert!(is_small(term), "{name}/0 must answer a small integer");
     signed_value(term)
@@ -180,7 +180,7 @@ fn call_int(lib: &NifLibrary, host: &mut ResourceHost, name: &str) -> i64 {
 /// handle (and its destructor) is the fixture's own — the call only refreshes the host the destructor
 /// environment is built from.
 #[track_caller]
-fn reopen_type(env: &mut NifEnv) -> *mut ErlNifResourceType {
+fn reopen_type(env: &NifEnv) -> *mut ErlNifResourceType {
     let name = std::ffi::CString::new(TYPE_NAME).expect("the type name has no interior NUL");
     let mut tried = ErlNifResourceFlags::from_bits(0);
     // SAFETY: `env` is live, `name` is NUL-terminated and `tried` is a live local.
@@ -209,7 +209,7 @@ fn reopen_type(env: &mut NifEnv) -> *mut ErlNifResourceType {
 ///
 /// `env` must be live and `ty` a type this crate opened.
 #[track_caller]
-unsafe fn get_resource(env: &mut NifEnv, term: Eterm, ty: *mut ErlNifResourceType) -> i32 {
+unsafe fn get_resource(env: &NifEnv, term: Eterm, ty: *mut ErlNifResourceType) -> i32 {
     let mut objp: *mut core::ffi::c_void = std::ptr::null_mut();
     // SAFETY: forwarded from the caller's contract; `objp` is a live local.
     unsafe { enif_get_resource(env.as_ptr(), nif_from_eterm(term), ty, &mut objp) }
@@ -235,8 +235,8 @@ fn the_seam_reproduces_the_cs_reference_counts() {
 
     // (1) `probe/0` mints a term that holds the object's ONLY remaining reference.
     let target = {
-        let mut env = NifEnv::new(&mut host);
-        lib.call(&mut env, "probe", 0, &[])
+        let env = NifEnv::new(&mut host);
+        lib.call(&env, "probe", 0, &[])
             .expect("probe/0 must be callable")
     };
     assert_eq!(
@@ -258,11 +258,11 @@ fn the_seam_reproduces_the_cs_reference_counts() {
         "and no destructor runs"
     );
     {
-        let mut env = NifEnv::new(&mut host);
-        let ty = reopen_type(&mut env);
+        let env = NifEnv::new(&mut host);
+        let ty = reopen_type(&env);
         // SAFETY: `env` is live and `ty` is the fixture's own type.
         assert_eq!(
-            unsafe { get_resource(&mut env, target, ty) },
+            unsafe { get_resource(&env, target, ty) },
             1,
             "a reachable term still resolves through enif_get_resource"
         );
@@ -281,12 +281,12 @@ fn the_seam_reproduces_the_cs_reference_counts() {
         "the term's reference was the last one, so the destructor ran"
     );
     {
-        let mut env = NifEnv::new(&mut host);
-        let ty = reopen_type(&mut env);
+        let env = NifEnv::new(&mut host);
+        let ty = reopen_type(&env);
         // SAFETY: `env` is live and `ty` is the fixture's own type; the term's binding was removed,
         // so this only misses in the registry and never reads freed memory.
         assert_eq!(
-            unsafe { get_resource(&mut env, target, ty) },
+            unsafe { get_resource(&env, target, ty) },
             0,
             "a released term no longer resolves (the binding removal is the guard)"
         );

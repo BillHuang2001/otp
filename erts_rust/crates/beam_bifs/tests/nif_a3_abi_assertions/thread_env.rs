@@ -186,7 +186,7 @@ impl NifHost for FactoryHost {
     /// this way looks like a call env afterwards. That is a host artifact, not a seam one — which is
     /// why the test frees the env before it asserts anything about which path answered.
     fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
-        let mut env = Box::new(NifEnv::new(self));
+        let env = Box::new(NifEnv::new(self));
         let ptr = env.as_ptr();
         self.envs.push(env);
         let handle = Arc::clone(&self.shared);

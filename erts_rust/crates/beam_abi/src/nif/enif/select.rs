@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn a_negative_event_is_the_cs_invalid_event_code() {
         let (mut host, requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let flags = ErlNifSelectFlags::READ;
         // SAFETY: `env` is live, `obj` is non-null, `pid` is null (the calling process).
         let code = unsafe { enif_select(env.as_ptr(), -1, flags, obj(), core::ptr::null(), n(NIL)) };
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn a_serviced_request_passes_the_hook_code_through() {
         let (mut host, _requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: as above, with a valid (non-negative) event.
         let code =
             unsafe { enif_select(env.as_ptr(), 7, ErlNifSelectFlags::READ, obj(), core::ptr::null(), n(NIL)) };
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn an_unsupported_hook_is_minus_one() {
         let (mut host, _requests) = SelectHost::new(None);
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: as above.
         let code =
             unsafe { enif_select(env.as_ptr(), 7, ErlNifSelectFlags::READ, obj(), core::ptr::null(), n(NIL)) };
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn a_null_obj_is_refused_before_the_host_is_consulted() {
         let (mut host, requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: a null `obj` is explicitly refused by the contract; `env` is live.
         let code = unsafe {
             enif_select(
@@ -474,7 +474,7 @@ mod tests {
         let (mut host, requests) = SelectHost::new(Some(0));
         let pid = make_small(4711);
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             let erl_pid = ErlNifPid { pid: n(pid) };
             // SAFETY: `env` is live and `erl_pid` is a readable `ErlNifPid`.
             let code = unsafe {
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn select_x_forwards_the_message_and_ignores_the_message_env() {
         let (mut host, _requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let msg = make_small(99);
         // SAFETY: `env` is live; the `msg_env` operand is accepted and unused.
         let code = unsafe {
@@ -539,7 +539,7 @@ mod tests {
         ];
         let (mut host, requests) = SelectHost::new(Some(0));
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             for flags in all {
                 // SAFETY: `env` is live, `obj` is non-null, `pid` is null (the calling process).
                 let code =
@@ -578,7 +578,7 @@ mod tests {
 
         let (mut host, requests) = SelectHost::new(Some(0));
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             // SAFETY: `env` is live, `obj` is non-null, `pid` is null.
             let code = unsafe { enif_select(env.as_ptr(), 11, flags, obj(), core::ptr::null(), n(NIL)) };
             assert_eq!(code, 0);
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn a_zero_mask_is_refused_before_the_host_is_consulted() {
         let (mut host, requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let zero = ErlNifSelectFlags::from_bits(0);
         // SAFETY: `env` is live, `obj` is non-null, `pid` is null.
         let code = unsafe { enif_select(env.as_ptr(), 7, zero, obj(), core::ptr::null(), n(NIL)) };
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn an_undocumented_only_mask_is_refused() {
         let (mut host, requests) = SelectHost::new(Some(0));
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let stray = ErlNifSelectFlags::from_bits(1 << 10);
         // SAFETY: `env` is live, `obj` is non-null, `pid` is null.
         let code = unsafe { enif_select(env.as_ptr(), 7, stray, obj(), core::ptr::null(), n(NIL)) };
@@ -660,7 +660,7 @@ mod tests {
     fn a_stop_and_a_cancel_request_still_reach_the_host() {
         let (mut host, requests) = SelectHost::new(Some(ERL_NIF_SELECT_STOP_CALLED));
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             // SAFETY: `env` is live, `obj` is non-null, `pid` is null.
             let code = unsafe {
                 enif_select(
@@ -712,7 +712,7 @@ mod tests {
             atoms: AtomTable::new(),
         };
         {
-            let mut env = NifEnv::new(&mut host);
+            let env = NifEnv::new(&mut host);
             for flags in documented {
                 // SAFETY: the env is live, `obj` is non-null, `pid` is null.
                 let code =

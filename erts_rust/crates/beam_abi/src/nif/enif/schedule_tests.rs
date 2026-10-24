@@ -366,7 +366,7 @@ unsafe extern "C" fn cont_dirty_pair(
 #[test]
 fn a_continuations_value_reaches_the_caller() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     let argv = [n(make_small(2)), n(make_small(5))];
     // SAFETY: `env` is live, the name is NUL-terminated, `argv` is readable for 2 terms.
@@ -415,7 +415,7 @@ fn a_continuations_value_reaches_the_caller() {
 #[test]
 fn a_nested_schedule_answers_the_non_value_and_the_outermost_yields_the_value() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     OUTER_SEEN.with(|c| c.set((usize::MAX, false)));
     // SAFETY: `env` is live, the name is NUL-terminated, `argc` is 0 with a null `argv`.
@@ -466,7 +466,7 @@ fn a_nested_schedule_answers_the_non_value_and_the_outermost_yields_the_value() 
 #[test]
 fn a_self_rescheduling_chain_completes_with_a_constant_stack() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     CHAIN_ENTRIES.with(|c| c.set(0));
     const N: c_int = 100_000;
     let argv = [n(make_small(i64::from(N)))];
@@ -504,7 +504,7 @@ fn a_self_rescheduling_chain_completes_with_a_constant_stack() {
 #[test]
 fn a_raise_inside_a_continuation_ends_the_chain() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     TAIL_RUNS.with(|c| c.set(0));
     // SAFETY: `env` is live, the name is NUL-terminated, `argc` is 0 with a null `argv`.
@@ -548,7 +548,7 @@ fn a_raise_inside_a_continuation_ends_the_chain() {
 #[test]
 fn a_pending_exception_blocks_the_chain_before_it_runs() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     let boom = env
         .host()
@@ -594,7 +594,7 @@ fn a_pending_exception_blocks_the_chain_before_it_runs() {
 #[test]
 fn a_dirty_flagged_continuation_produces_the_oracle_tuple() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     let argv = [n(make_small(7))];
     // SAFETY: `env` is live, the name is NUL-terminated, `argv` is readable for 1 term.
@@ -657,7 +657,7 @@ fn a_dirty_flagged_continuation_reports_a_dirty_thread_type() {
         ),
     ];
     for (flags, expected, what) in cases {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live, the name is NUL-terminated, `argc` is 0 with a null `argv`.
         let term = unsafe {
             enif_schedule_nif(
@@ -692,7 +692,7 @@ fn a_dirty_flagged_continuation_reports_a_dirty_thread_type() {
 #[test]
 fn every_refusal_is_the_badarg_raise_in_the_cs_order() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     ENTRIES.with(|c| c.set(0));
     let argv = [n(make_small(1))];
     let name = c"cont_sum";
@@ -832,7 +832,7 @@ fn every_refusal_is_the_badarg_raise_in_the_cs_order() {
 #[test]
 fn a_null_argv_is_legal_when_there_are_no_arguments() {
     let mut host = SchedHost::new();
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `argc` is 0 with a null `argv`, so neither is read.
     let term = unsafe {
         enif_schedule_nif(

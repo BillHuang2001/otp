@@ -407,12 +407,12 @@ mod tests {
         let _factory = crate::nif::thread_env::lock_test_state();
         let mut msg_host = AllocEnvHost::new(None).owning();
         let msg_freed = msg_host.free_log();
-        let mut msg_env = NifEnv::new(&mut msg_host);
+        let msg_env = NifEnv::new(&mut msg_host);
         let msg_ptr = msg_env.as_ptr();
 
         let mut call_host = AllocEnvHost::new(Some(msg_ptr));
         let call_freed = call_host.free_log();
-        let mut call_env = NifEnv::new(&mut call_host);
+        let call_env = NifEnv::new(&mut call_host);
         let call_ptr = call_env.as_ptr();
 
         // alloc: the host of the current NIF call hands out its own env.
@@ -465,7 +465,7 @@ mod tests {
         // See `alloc_use_free_hands_the_env_back_to_its_owner`: the factory is process-global.
         let _factory = crate::nif::thread_env::lock_test_state();
         let mut msg_host = AllocEnvHost::new(None);
-        let mut msg_env = NifEnv::new(&mut msg_host);
+        let msg_env = NifEnv::new(&mut msg_host);
         let msg_ptr = msg_env.as_ptr();
 
         let mut call_host = AllocEnvHost::new(Some(msg_ptr));
@@ -658,7 +658,7 @@ mod tests {
             heap: Heap::new(256).expect("a small test heap is allocatable"),
             atoms: AtomTable::new(),
         };
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // The default hooks: no private data, no copy engine.
         // SAFETY: `env` is a live env.
         assert!(unsafe { enif_priv_data(env.as_ptr()) }.is_null());

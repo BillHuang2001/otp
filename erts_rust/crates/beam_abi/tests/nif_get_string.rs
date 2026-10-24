@@ -96,7 +96,7 @@ enum Input {
 
 impl Input {
     /// Build the term on `env`'s host heap.
-    fn build(self, env: &mut NifEnv) -> Eterm {
+    fn build(self, env: &NifEnv) -> Eterm {
         match self {
             Input::Nil => NIL,
             Input::Chars(codepoints) => {
@@ -323,7 +323,7 @@ fn decode_byte_list(term: Eterm) -> Vec<i64> {
 
 /// Call `probe/2` for one case and require the observation to equal the recorded oracle value.
 #[track_caller]
-fn assert_probe_case(env: &mut NifEnv, lib: &NifLibrary, case: &ProbeCase) {
+fn assert_probe_case(env: &NifEnv, lib: &NifLibrary, case: &ProbeCase) {
     let input = case.input.build(env);
     let len = make_small(case.len as i64);
     let got = lib
@@ -341,7 +341,7 @@ fn assert_probe_case(env: &mut NifEnv, lib: &NifLibrary, case: &ProbeCase) {
 
 /// Call `len/1` for one case and require the observation to equal the recorded oracle value.
 #[track_caller]
-fn assert_length_case(env: &mut NifEnv, lib: &NifLibrary, case: &LengthCase) {
+fn assert_length_case(env: &NifEnv, lib: &NifLibrary, case: &LengthCase) {
     let input = case.input.build(env);
     let got = lib
         .call(env, "len", 1, &[input])
@@ -377,13 +377,13 @@ fn the_utf8_arm_matches_the_measured_oracle() {
     let mut host = TestHost::new();
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
         .expect("the fixture must load: every enif_* it imports is defined by this crate");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     for case in PROBE_CASES {
-        assert_probe_case(&mut env, &lib, case);
+        assert_probe_case(&env, &lib, case);
     }
     for case in LENGTH_CASES {
-        assert_length_case(&mut env, &lib, case);
+        assert_length_case(&env, &lib, case);
     }
 }
 

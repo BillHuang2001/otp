@@ -115,7 +115,7 @@ pub unsafe extern "C" fn enif_make_uint(
 }
 
 /// `make_small` when the value fits, else a one-limb bignum of the right sign.
-fn small_or_big(env: &mut NifEnv, negative: bool, magnitude: u64) -> Eterm {
+fn small_or_big(env: &NifEnv, negative: bool, magnitude: u64) -> Eterm {
     let fits_small = if negative {
         magnitude <= prelude::MIN_SMALL.unsigned_abs()
     } else {
@@ -433,7 +433,7 @@ pub unsafe extern "C" fn enif_make_existing_atom_len(
 /// answered `0` with `*atom` left alone, exactly like the C's `i < 0 ? 0 : (*ap = …, 1)`. The env's
 /// per-call record is consulted first (see [`NifEnv::recorded_atom`]), the host hook second.
 fn existing_atom_out(
-    env: &mut NifEnv,
+    env: &NifEnv,
     bytes: &[u8],
     atom: *mut ERL_NIF_TERM,
     encoding: ErlNifCharEncoding,
@@ -588,7 +588,7 @@ pub unsafe extern "C" fn enif_make_reverse_list(
 }
 
 /// The list of small ints (LATIN1 bytes) or codepoints (UTF8) for `bytes`.
-fn string_list(env: &mut NifEnv, bytes: &[u8], encoding: ErlNifCharEncoding) -> Option<Eterm> {
+fn string_list(env: &NifEnv, bytes: &[u8], encoding: ErlNifCharEncoding) -> Option<Eterm> {
     let chars: Vec<i64> = match encoding {
         ErlNifCharEncoding::Latin1 => bytes.iter().map(|&b| b as i64).collect(),
         ErlNifCharEncoding::Utf8 => {
@@ -736,7 +736,7 @@ mod tests {
         let mut host = TestHost::new();
         let expected = host.intern_atom("hello").expect("interns");
         let name = CString::new("hello").unwrap();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
         // SAFETY: `env` is live, `name` is NUL-terminated and `out` is writable.
         let code = unsafe {
@@ -756,7 +756,7 @@ mod tests {
     fn a_miss_returns_0_and_leaves_the_out_pointer_untouched() {
         let mut host = TestHost::new();
         let name = CString::new("nope_not_interned").unwrap();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let sentinel = ERL_NIF_TERM::from_raw(0xdead_beef);
         let mut out = sentinel;
         // SAFETY: as above.
@@ -781,7 +781,7 @@ mod tests {
         let expected = host.intern_atom("hello").expect("interns");
         // `helloX`: an explicit length of 5 must look up `hello`, not `helloX`.
         let bytes = b"helloX";
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
         // SAFETY: `bytes` has 5 readable bytes and `out` is writable.
         let code = unsafe {
@@ -816,7 +816,7 @@ mod tests {
         let mut host = TestHost::new();
         let expected = host.intern_atom("é").expect("interns");
         let latin1 = [0xe9u8];
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
         // SAFETY: `latin1` has one readable byte and `out` is writable.
         let code = unsafe {
@@ -837,7 +837,7 @@ mod tests {
     fn null_arguments_are_refused_with_0() {
         let name = CString::new("hello").unwrap();
         let mut host = TestHost::new();
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
         // SAFETY: every null case is explicitly allowed by the contract.
         unsafe {

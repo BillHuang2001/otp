@@ -117,7 +117,7 @@ fn load_path(so: &Path) -> Option<String> {
 /// Call `name/0` through the loaded library and assert the returned tuple equals `want` (a tuple of
 /// small integers — no atoms are involved, so `compare::eq` is exact with an empty table).
 #[track_caller]
-fn assert_tuple(env: &mut NifEnv, lib: &NifLibrary, name: &str, want: &[i64]) {
+fn assert_tuple(env: &NifEnv, lib: &NifLibrary, name: &str, want: &[i64]) {
     let got = lib
         .call(env, name, 0, &[])
         .unwrap_or_else(|err| panic!("{name}/0 must be callable: {err:?}"));
@@ -144,16 +144,16 @@ fn the_thread_family_round_trips_through_a_real_c_nif() {
     let mut host = TestHost::new();
     let lib = load(&path, MODULE, &mut host, Eterm::nil())
         .expect("the fixture must load: every enif_* it imports is defined by this crate");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     for (name, want) in COMPARABLE {
-        assert_tuple(&mut env, &lib, name, want);
+        assert_tuple(&env, &lib, name, want);
     }
 
     // The one slot that legitimately differs from the oracle: this runtime has no scheduler threads,
     // so a NIF always reports `ERL_NIF_THR_UNDEFINED` (the C's answer for a non-scheduler thread).
     let ty = lib
-        .call(&mut env, "thread_type", 0, &[])
+        .call(&env, "thread_type", 0, &[])
         .expect("thread_type/0 must be callable");
     assert!(
         compare::eq(ty, make_small(0), &AtomTable::new()),

@@ -95,7 +95,7 @@ fn load_path(so: &Path) -> Option<String> {
 
 /// Call `name/0` through the loaded library and assert it returned the small integer `want`.
 #[track_caller]
-fn assert_small(env: &mut NifEnv, lib: &NifLibrary, name: &str, want: i64) {
+fn assert_small(env: &NifEnv, lib: &NifLibrary, name: &str, want: i64) {
     let got = lib
         .call(env, name, 0, &[])
         .unwrap_or_else(|err| panic!("{name}/0 must be callable: {err:?}"));
@@ -170,9 +170,9 @@ fn the_load_callbacks_private_pointer_reaches_the_c_nif() {
         "the fixture's `load` callback must have stored a pointer"
     );
 
-    let mut env = NifEnv::new(&mut host);
-    assert_small(&mut env, &lib, "priv_is_set", 1);
-    assert_small(&mut env, &lib, "priv_value", PRIV_VALUE);
+    let env = NifEnv::new(&mut host);
+    assert_small(&env, &lib, "priv_is_set", 1);
+    assert_small(&env, &lib, "priv_value", PRIV_VALUE);
     // SAFETY: `env` is a live env.
     let after = unsafe { enif_priv_data(env.as_ptr()) };
     assert!(
@@ -200,10 +200,10 @@ fn the_host_hook_does_not_override_the_library_pointer_during_a_call() {
         "the fixture stores its own pointer, so the host marker is a distinguishable value"
     );
 
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // The library's pointer, not the host's marker: `enif_priv_data` reads `env->mod_nif->priv_data`
     // inside the call, so `11` comes back through the library's own `&priv`.
-    assert_small(&mut env, &lib, "priv_value", PRIV_VALUE);
+    assert_small(&env, &lib, "priv_value", PRIV_VALUE);
     // The host hook still answers for a caller outside any library call.
     // SAFETY: `env` is a live env.
     let outside = unsafe { enif_priv_data(env.as_ptr()) };
@@ -217,14 +217,14 @@ fn the_host_hook_does_not_override_the_library_pointer_during_a_call() {
 fn outside_a_library_call_the_host_hook_is_the_source() {
     let marker = 0x7f7fusize as *mut c_void;
     let mut host = PrivHost::new(marker);
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is a live env.
     let got = unsafe { enif_priv_data(env.as_ptr()) };
     assert_eq!(got, marker, "with no library call, the host hook answers");
     drop(env);
 
     let mut host = PrivHost::new(core::ptr::null_mut());
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     // SAFETY: `env` is a live env.
     assert!(unsafe { enif_priv_data(env.as_ptr()) }.is_null());
 }

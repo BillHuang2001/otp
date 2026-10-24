@@ -555,7 +555,7 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
 ///
 /// `env` must be a live environment whose host outlives everything the returned pointer is stored in
 /// (the contract documented on [`ResourceType::host`]).
-unsafe fn host_pointer(env: &mut NifEnv) -> *mut dyn NifHost {
+unsafe fn host_pointer(env: &NifEnv) -> *mut dyn NifHost {
     // SAFETY: only the erased trait-object lifetime is reinterpreted — `&mut dyn NifHost` and
     // `*mut dyn NifHost` are layout-identical (data word + vtable word) and `mem::transmute` between
     // them is a bit-preserving cast, exactly as in `NifEnv::new`.
@@ -989,7 +989,7 @@ unsafe fn destroy(header: *mut ResourceHeader) {
                 // SAFETY: `host` was captured from a live `&mut dyn NifHost` when the type was opened,
                 // and the caller contract keeps it alive while resources can still be released
                 // (documented on `ResourceType::host`).
-                let mut env = NifEnv::new(unsafe { &mut *host });
+                let env = NifEnv::new(unsafe { &mut *host });
                 // SAFETY: the type's own destructor; `env` outlives the call.
                 unsafe { dtor(env.as_ptr(), payload) };
             }
@@ -1110,7 +1110,7 @@ fn narrow_ref_id(id: u64) -> Option<i64> {
 /// drawn id does not fit the block's small-integer id word ([`narrow_ref_id`], unreachable in
 /// practice). Either way **no reference is taken and no term is published**, so the caller's single
 /// release still frees the object.
-fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
+fn mint_resource_ref(e: &NifEnv) -> Option<Eterm> {
     // SAFETY: `alloc` hands out exactly `RESOURCE_REF_WORDS` exclusively-owned, writable words from
     // the host heap; `write_resource_ref` writes every one of them before the pointer escapes.
     let p = unsafe { alloc(e, RESOURCE_REF_WORDS) }?;

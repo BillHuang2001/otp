@@ -120,7 +120,7 @@ impl ArmingHost {
         let code = {
             // The env lives only for this call: the type's host pointer is this same `host`, and the
             // delivery path below re-borrows it, so the two `&mut` borrows must not overlap.
-            let mut env = NifEnv::new(self);
+            let env = NifEnv::new(self);
             // SAFETY: `env` is live; `obj` is a live payload pointer; `nif_pid`/`holder` are live
             // locals.
             unsafe { enif_monitor_process(env.as_ptr(), obj, &nif_pid, &mut holder) }
@@ -263,7 +263,7 @@ fn next_marker() -> usize {
 /// Each test uses its own name: types are keyed by name and never freed (the C's global
 /// `resource_type_list`), and every test in this binary shares the process-wide registry.
 fn open_down_type(
-    env: &mut NifEnv,
+    env: &NifEnv,
     name: &str,
     down: ErlNifResourceDown,
 ) -> *mut ErlNifResourceType {
@@ -314,8 +314,8 @@ fn type_and_object(
     down: ErlNifResourceDown,
 ) -> (*mut ErlNifResourceType, *mut c_void, usize) {
     let ty = {
-        let mut env = NifEnv::new(host);
-        open_down_type(&mut env, name, down)
+        let env = NifEnv::new(host);
+        open_down_type(&env, name, down)
     };
     // SAFETY: `ty` came from the open call above.
     let (obj, marker) = unsafe { alloc_tagged(ty) };
@@ -337,7 +337,7 @@ fn pid_term() -> Eterm {
 
 /// `enif_demonitor_process(env, obj, holder)` as the C's `0`/`1`.
 fn demonitor(host: &mut ArmingHost, obj: *mut c_void, holder: &ErlNifMonitor) -> c_int {
-    let mut env = NifEnv::new(host);
+    let env = NifEnv::new(host);
     // SAFETY: `env` is live; `holder` is a live local.
     unsafe { enif_demonitor_process(env.as_ptr(), obj, holder) }
 }
@@ -548,7 +548,7 @@ fn the_demonitor_codes_are_the_cs_once_our_tree_is_consulted() {
         "the rebuilt holder compares equal to the stored one"
     );
     let term = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `holder` is a live local.
         t(unsafe { enif_make_monitor_term(env.as_ptr(), &holder) })
     };
@@ -856,7 +856,7 @@ fn a_down_callback_may_re_enter_the_crate_without_deadlocking() {
     // Mint the resource term the callback resolves, before the delivery: the term lives on the host
     // heap, which outlives the delivery's env.
     let resource_term = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `obj` is a live payload pointer.
         t(unsafe { enif_make_resource(env.as_ptr(), obj) })
     };
@@ -923,7 +923,7 @@ fn an_object_destroyed_through_the_term_seam_cancels_its_monitors() {
     let (_ty, obj, marker) = type_and_object(&mut host, "down_term_cancel_rt", recording_down);
     let pid = pid_term();
     let resource_term = {
-        let mut env = NifEnv::new(&mut host);
+        let env = NifEnv::new(&mut host);
         // SAFETY: `env` is live; `obj` is a live payload pointer.
         t(unsafe { enif_make_resource(env.as_ptr(), obj) })
     };

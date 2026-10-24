@@ -208,11 +208,11 @@ fn loads_calls_and_unloads_a_working_library() {
         "the `load` callback ran and stored its priv pointer"
     );
 
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
     let x = make_small(4321);
-    assert_eq!(lib.call(&mut env, "echo", 1, &[x]).expect("echo/1"), x);
+    assert_eq!(lib.call(&env, "echo", 1, &[x]).expect("echo/1"), x);
     assert_eq!(
-        lib.call(&mut env, "const", 0, &[]).expect("const/0"),
+        lib.call(&env, "const", 0, &[]).expect("const/0"),
         make_small(12345)
     );
 
@@ -232,10 +232,10 @@ fn call_reports_unknown_functions_and_raised_exceptions() {
 
     let mut host = TestHost::new();
     let lib = load(&path, "t", &mut host, Eterm::nil()).expect("the fixture NIF library must load");
-    let mut env = NifEnv::new(&mut host);
+    let env = NifEnv::new(&mut host);
 
     // Unknown name.
-    match lib.call(&mut env, "nope", 2, &[]) {
+    match lib.call(&env, "nope", 2, &[]) {
         Err(NifCallError::UnknownFunction { name, arity }) => {
             assert_eq!(name, "nope");
             assert_eq!(arity, 2);
@@ -244,20 +244,20 @@ fn call_reports_unknown_functions_and_raised_exceptions() {
     }
     // Known name, wrong arity.
     assert!(matches!(
-        lib.call(&mut env, "echo", 2, &[]),
+        lib.call(&env, "echo", 2, &[]),
         Err(NifCallError::UnknownFunction { .. })
     ));
 
     // A recorded exception is surfaced after the call.
     let reason = env.host().intern_atom("badarg").expect("interns");
     env.set_exception(reason);
-    match lib.call(&mut env, "echo", 1, &[make_small(7)]) {
+    match lib.call(&env, "echo", 1, &[make_small(7)]) {
         Err(NifCallError::Raised(t)) => assert_eq!(t, reason),
         other => panic!("expected Raised, got {other:?}"),
     }
     env.clear();
     assert_eq!(
-        lib.call(&mut env, "echo", 1, &[make_small(7)]).unwrap(),
+        lib.call(&env, "echo", 1, &[make_small(7)]).unwrap(),
         make_small(7)
     );
 }

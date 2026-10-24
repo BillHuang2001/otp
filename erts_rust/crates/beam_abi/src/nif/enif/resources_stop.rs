@@ -170,7 +170,7 @@ pub fn call_resource_stop(obj: *mut c_void, event: ErlNifEvent, is_direct_call: 
         // SAFETY: `host` was captured from a live `&mut dyn NifHost` when the type was opened, and the
         // caller contract keeps it alive while resources of the type can still be stopped (documented
         // on `ResourceType::host`).
-        let mut env = NifEnv::new(unsafe { &mut *host });
+        let env = NifEnv::new(unsafe { &mut *host });
         // SAFETY: the type's own `stop`; `env` outlives the call.
         unsafe { stop(env.as_ptr(), obj, event, direct) };
     }

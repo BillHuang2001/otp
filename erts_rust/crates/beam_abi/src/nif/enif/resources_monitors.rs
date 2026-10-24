@@ -222,7 +222,7 @@ pub fn deliver_resource_down_id(monitor: MonitorId, pid: Eterm) -> bool {
                 // SAFETY: `host` was captured from a live `&mut dyn NifHost` when the type was opened,
                 // and the caller contract keeps it alive while resources of the type can be released
                 // (documented on `ResourceType::host`).
-                let mut env = NifEnv::new(unsafe { &mut *host });
+                let env = NifEnv::new(unsafe { &mut *host });
                 // SAFETY: the type's own `down`; `env` outlives the call.
                 unsafe { down(env.as_ptr(), obj, &mut nif_pid, &mut nif_monitor) };
             }
