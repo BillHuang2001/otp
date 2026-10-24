@@ -240,6 +240,7 @@ The OTP 29 native-record interior, two boxed things:
 - `examples/atom_witness.rs` → witness micro-benchmark (`run --release --example atom_witness`)
 - `examples/atom_fork_bench.rs` → the `clone`-vs-`fork` paired A/B in retired instructions (`atom_fork_bench <none|clone|fork> [size] [iters]`; `none` is the no-copy control, so `instructions/op = (mode − none)/iters`)
 - `examples/map_build_bench.rs` → in-process A/B benchmark of `map::write_map` against a frozen copy of the pre-sort-and-collapse builder, interleaved per map, reporting the load-independent `live/retired` ratio per key-count bucket (`run --release --example map_build_bench`)
+- `examples/cmp_lookup_bench.rs` → one-bucket-per-run micro-benchmark for the comparison/lookup path (`flat32_atom`, `flat32_int`, `hamt512_{atom,int}`, `payload_eq`, `payload_hash`, `bin_eq`, `tuple_eq`, `cmp_atoms`), shaped for `perf stat -e cpu_core/instructions/u` / `perf record` attribution: `--example cmp_lookup_bench -- <bucket> [ops]`
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **The M1 internal-reference seam.** A **local-node** reference decoded from the wire (`NEWER_REFERENCE_EXT`/`NEW_REFERENCE_EXT`) must be materialized by reserving `INTERNAL_REF_WORDS` words and calling `boxed::write_internal_ref` — never by hand-writing the words — and read back with `boxed::internal_ref_id` (never `internal_ref_numbers`, which describes the C layout only).
