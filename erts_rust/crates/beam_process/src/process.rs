@@ -469,9 +469,17 @@ pub struct Process {
 /// receiver.** It is OR-ed *after* the crate's own O(1) [`Process::has_unpublished_roots`] test at
 /// every site, so a receiver the crate already declines (relocation-exempt, or [`Running`](ProcessState::Running))
 /// is decided without the gate being consulted at all — which is what keeps a host implementation an
-/// `O(live objects)` reachability walk off the per-message hot path (the overwhelmingly common
-/// delivery target is a `receive`-parked process, exempt for its whole parked window). The ordering
-/// changes nothing about the answer: both sides are pure and the result is the OR.
+/// `O(live objects)` reachability walk off the per-message hot path, since the two cases the crate
+/// settles itself (a relocation-exempt receiver, a [`Running`](ProcessState::Running) one) need no
+/// host help. The ordering changes nothing about the answer: both sides are pure and the result is
+/// the OR.
+///
+/// **A `receive`-parked receiver is *not* one of the crate's two cases**, so it is a legal
+/// relocation target: `beam_rt`'s park publishes the parked machine's host-held terms through
+/// [`Registers::extra_roots`] (and its own resume adopts the relocated words back), and the park
+/// holds its exemption only for a **live float-register prefix**. An ordinary `receive` park
+/// therefore reports `has_unpublished_roots() == false`, and its existence is never a reason for a
+/// gate to be consulted.
 pub trait CollectionGate {
     /// Whether a **relocating** collection of `receiver`'s heap must be declined.
     ///
@@ -1557,6 +1565,14 @@ impl Process {
     /// nothing accumulates unboundedly. Only the **delivery-driven** entry points are gated:
     /// [`Process::collect`]/[`Process::ensure_capacity`] are the host's admission points, which
     /// publish the roots *before* calling them.
+    ///
+    /// A **`receive`-parked** process is deliberately **not** one of the two cases: the park
+    /// publishes the parked machine's host-held terms through
+    /// [`Registers::extra_roots`], and its own resume adopts the relocated words back, so an
+    /// ordinary park needs no exemption at all — the host takes one only for a **live
+    /// float-register prefix**, whose slots live in the machine's FR bank and are not published.
+    /// A delivery to a published parked receiver therefore collects and grows its nursery and
+    /// copies straight into it.
     pub fn has_unpublished_roots(&self) -> bool {
         self.relocation_exempt || self.state == ProcessState::Running
     }
