@@ -126,7 +126,7 @@ The ports' message vocabulary is the one place a per-message intern is unavoidab
 
 ## Design Decisions
 The design rationale and binding invariants of the runtime glue — the mature-GC `HeapPolicy` source, the one shared atom table, heap lifetime, exit-reason handling, off-heap payload resolution, the host-seam bridges, the timer min-heap, the persistent-term store, the fragment model, the collection sites with the relocation-exempt valve, the copy-out/rewind and the `receive` scan position — are in **[`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)**.
-## Known Issues
+## Known Issues / Intentional M1 gaps
 - **`NifHostImpl`'s callback-visible state is plain (not interior-mutable).** `heap`, `envs`,
   `load_sends` and `interner` are written through `&mut self` from the `enif_*` layer, which is sound
   **only** because this runtime never keeps a `&`/`&mut` to a host alive across a call into NIF code:
@@ -138,7 +138,6 @@ The design rationale and binding invariants of the runtime glue — the mature-G
   callback publishes (`beam_abi/src/nif/host.rs`'s *The aliasing contract* measures the lost store
   such a shape produces). Not a parity claim: it is a documented precondition, and `beam_abi`'s
   `host_aliasing_tests` is the release gate for the env-side half of it.
- / Intentional M1 gaps
 **Per-item detail is in [`M1_GAPS.md`](M1_GAPS.md), under the section named after each bullet or the sibling ledger that section's stub names; the contract-specific gaps are also in the owning child `CONTEXT.md`.** Every gap below is a typed capability gap or a measured own-state difference — never a wrong result.
 * **Fun application nested from a BIF is unbounded in depth; the driver thread's stack size is the only bound** — the nesting, its reproducer and the A.9 form are `M1_GAPS.md` *Scheduler / runner*.
 * **A `term_to_binary`/`binary_to_term` round-trip's cost is the codec's own per-call work, not `beam_rt`'s dispatch** — the wired path is allocation-free — `M1_GAPS.md` *Dispatch, atoms and module introspection*.
