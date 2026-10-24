@@ -234,11 +234,44 @@ source at the base commit, alternated inside each round at load 1.35–1.36: cod
 there for **mechanism** correctness (no atomic on the per-instruction path, no table destruction per
 run entry), never as a speedup, consistent with the neutral record at `../../../MEASURED.md`
 (`Measured (binary_append …)`, "Measured neutral, kept only as a simplification").
-**The next lever is the inline set, not a fast path**: extending the compiled-block inline set to
-`bs_match`/`bs_create_bin` so a prepared program runs inside a block instead of through a helper call.
-A per-instruction C-like fast path inside the family is not it — the family cost is already spread
-thin across the prepared walk, and the transfer bookkeeping on this shape is closed
-(`block_entry_misses = 0`, 3 driver round-trips, 0 deopts, 0 interpreter steps per call).
+**The lever was the inline set, and it is now measured.** Extending the compiled-block inline set to
+the `bs_*` shapes (`../inlineset/CONTEXT.md`, `../emit/bitstr_inline/CONTEXT.md`) so a shape runs
+inside a block instead of through one helper call per instruction, per byte of the subject.
+Measured as a **paired A/B inside one session**: two `beam_rt` binaries built from the same tree by
+reverting only `src/jit` to `2115f8d696` (`$BEAM_RT` selects the binary; the bench records which one
+it ran in `runtimes[].program`), the two legs **interleaved** round by round, 3 rounds,
+`taskset -c 3` + `setsid -w`, `BENCH_TIER=baseline BEAM_RT_TIER=baseline`, release, one process at a
+time, `/proc/loadavg` 1.92–3.74 recorded at every leg:
+
+| case (rust, matched N) | sys min ns | no-inline ns | inline ns | **A/B** | per-round A/B | ratio no-inline | ratio inline |
+|---|---|---|---|---|---|---|---|
+| `case_bstr_capitalize_token_ns_per_call` (N 40 000) | 336.7 | 3 739.2 | **2 834.9** | **1.319×** | 1.322 / 1.319 / 1.317 | 11.11 | **8.42** |
+| `case_bstr_to_lower_ns_per_call` (N 50 000) | 326.0 | 2 825.2 | **2 718.0** | **1.039×** | 1.028 / 1.042 / 1.040 | 8.67 | **8.34** |
+| `case_emqx_base62_decode_ns_per_call` (N 60 000) | 284.0 | 4 746.4 | **4 318.0** | **1.099×** | 1.099 / 1.080 / 1.083 | 16.72 | **15.21** |
+| `case_emqx_base62_encode_ns_per_call` (N 60 000) | 209.2 | 2 931.5 | **2 736.3** | **1.071×** | 1.075 / 1.078 / 1.067 | 14.01 | **13.08** |
+- Each case's A/B ratio reproduces to ≤0.6 % across the three paired rounds (spread 0.005 for
+  `capitalize_token`), so the effect is far outside this workload's round noise; the `sys` column is
+  the same round's oracle leg, and the ratio columns are the load-robust figures.
+- **`capitalize_token` gains 1.32× and `to_lower` only 1.04×** because `to_lower`'s inner loop was
+  already on the prepared fast form (one `integer` bind per byte) while `capitalize_token` spends its
+  cycles on `bs_get_position`/`bs_set_position` + three `bs_create_bin` shapes per element, exactly
+  the position/`bs_match` bookkeeping the inline set removes.
+- A **cross-session** before/after pair (the "before" round set at `/proc/loadavg` 48–65, the "after"
+  at 6–12) reads 13.38→8.86 / 8.96→8.34 / 16.30→15.28 / 12.47→12.98 — consistent with the paired A/B
+  on three cases and *wrong* on `encode`, because the oracle leg itself moved 32 % with the load
+  (309.2→208.9 ns). Use the paired A/B; a cross-date pair of ratios is not evidence on this host.
+- **`bs_create_bin` is still helper-backed**, which is why the construction-dominated cases
+  (`decode`, `encode`) move least: the in-place accumulator's capacity lives in the machine's
+  writable-payload registry (`raw::writable_append_target` takes `&Machine`) and
+  `create::{prepared, raw, BitWriter}` are private to `src/families/bitstrings/**`, so a native
+  lowering needs a new `pub(crate)` construction seam there first. That is the next lever on these
+  four cases.
+- A `bs_start_match3/4` **fresh** context is also still helper-backed (a rooted 5-word
+  `ErlSubBits` allocation); only the reuse/rebind path is inlined.
+- Method caveat: the bench's Rust-side `case_*_ns_per_call` is **N-dependent** (its own note records
+  this), so only same-N comparisons are valid — every row above used one fixed N per case on both
+  legs. A per-instruction C-like fast path inside the family remains the wrong lever: the family cost
+  is spread thin across the prepared walk.
 
 ## See Also
 - `../CONTEXT.md` → the tier contract (the two artifact layouts, the block ABI, the driver loop, the routing table).
