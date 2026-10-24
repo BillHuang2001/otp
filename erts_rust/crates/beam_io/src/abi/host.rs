@@ -76,8 +76,39 @@
 //! borrowed [`DriverContext`](crate::driver::DriverContext) from a raw pointer, records a driver's
 //! own static entry in the global table and calls a driver-supplied `async_free`. Every block
 //! carries a `// SAFETY:` rationale.
+//!
+//! # The aliasing contract (why [`AbiHost`] is interior-mutable and every accessor takes `&self`)
+//!
+//! A driver callback is **C**: it reaches this host through the `ErlDrvPort` it was handed
+//! ([`DriverEnv`]), and the Rust frame that started the callback is still on the stack at the same
+//! time. That is the C model, and it is not expressible with a `&mut`: a reference to the host that
+//! is live *across* a call into the driver lets the optimiser assume nothing else writes the host
+//! for that call, so the callback's stores through the environment become unobservable and are
+//! legally dropped. The failure is silent and **release-only** — measured on a sibling crate
+//! (`beam_abi`, contract A.4) as a host field the C fixture had written reading back unchanged,
+//! while `debug` kept every store.
+//!
+//! The full contract is [`beam_abi::driver::host`]'s module docs (*"The aliasing contract"*). The
+//! two rules this file must keep are:
+//!
+//! * **The callback-visible state is interior-mutable.** [`AbiHost::state`] is a
+//!   [`RefCell<DriverState>`](RefCell) and the installed-context slot is a `Cell`, so a caller's
+//!   `&AbiHost` can never be `noalias readonly`: it is *legal* for the callback to write through the
+//!   environment while the caller holds a shared borrow. **Do not** "simplify" `state` back into a
+//!   plain field (or the `Cell`s into plain fields): that makes `AbiHost` `Freeze`, which is exactly
+//!   the shape whose stores `--release` drops. It is an A.4 **correctness** regression, not a style
+//!   change. `abi::host_aliasing_tests` fails in `--release` if it happens.
+//! * **Every host accessor takes `&self`** ([`AbiHost::state`], [`AbiHost::state_mut`],
+//!   [`AbiHost::queue_head`], [`AbiHost::install`], [`AbiHost::clear`], …), so the port adapter can
+//!   drive a whole callback — context install, the callback itself, the context clear, the queued
+//!   `stop_select` drain — through a shared borrow of the host and derive **no** `&mut AbiHost` of
+//!   its own. The `&mut` a [`DriverHost`] hook receives is the one
+//!   [`DriverEnv::host`](beam_abi::driver::host::DriverEnv::host) reborrows from the environment's
+//!   own pointer inside the callback, which is the sanctioned route.
+//!
+//! [`DriverEnv`]: beam_abi::driver::host::DriverEnv
 
-use std::cell::Cell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -395,7 +426,12 @@ pub struct AbiHost {
     /// [`DriverHost::heap`](beam_abi::driver::host::DriverHost::heap).
     heap: Heap,
     /// The port's persistent C-ABI state (see [`DriverState`]).
-    state: DriverState,
+    ///
+    /// A [`RefCell`] **on purpose**, and the reason [`AbiHost`] is not `Freeze`: a driver callback
+    /// writes this state through the [`DriverEnv`](beam_abi::driver::host::DriverEnv) while the
+    /// Rust frame that started the callback may still hold `&AbiHost`. See the module docs →
+    /// *The aliasing contract*; do not replace it with a plain [`DriverState`].
+    state: RefCell<DriverState>,
     /// The port's registered driver identity, or `None` for a bare host (see [`DriverIdentity`]).
     driver: Option<DriverIdentity>,
     /// The [`DriverContext`](crate::driver::DriverContext) installed for the duration of one
@@ -412,7 +448,10 @@ pub struct AbiHost {
     /// driver just failed still resolves (it is `EXITING`, not yet `FREE`/`INITIALIZING`), so a
     /// `driver_output*` after a `driver_failure*` in the same callback must report success and reach
     /// nobody — see [`AbiHost::deliver_output`].
-    closing: bool,
+    ///
+    /// A [`Cell`] like the context slot, so this latch is written by the callback through a shared
+    /// borrow too (module docs → *The aliasing contract*).
+    closing: Cell<bool>,
 }
 
 impl AbiHost {
@@ -430,10 +469,10 @@ impl AbiHost {
         Ok(AbiHost {
             port_host,
             heap: Heap::new(DRIVER_HEAP_WORDS)?,
-            state: DriverState::new(),
+            state: RefCell::new(DriverState::new()),
             driver: None,
             ctx: Cell::new(core::ptr::null_mut()),
-            closing: false,
+            closing: Cell::new(false),
         })
     }
 
@@ -478,8 +517,13 @@ impl AbiHost {
     }
 
     /// The port's persistent state, read-only.
-    pub(crate) fn state(&self) -> &DriverState {
-        &self.state
+    ///
+    /// Takes `&self` (like every accessor here) so the port adapter can read host state through a
+    /// shared borrow while a driver callback is in flight — see the module docs → *The aliasing
+    /// contract*. The returned [`Ref`] is dropped by the caller, so a read never spans a call into
+    /// the driver.
+    pub(crate) fn state(&self) -> Ref<'_, DriverState> {
+        self.state.borrow()
     }
 
     /// Whether the port's `driver_async` job set has outstanding jobs.
@@ -490,7 +534,7 @@ impl AbiHost {
     /// port needs an async drive point (see
     /// [`crate::PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)).
     pub fn has_pending_async(&self) -> bool {
-        self.state.jobs.in_flight() > 0
+        self.state.borrow().jobs.in_flight() > 0
     }
 
     /// Whether the driver last marked this port **busy** through `set_busy_port` (the C's per-port
@@ -503,7 +547,7 @@ impl AbiHost {
     /// above it, [`crate::Port::is_busy`]/[`crate::PortRegistry::is_busy`] — reads it through this
     /// accessor. `false` until the driver marks the port busy.
     pub fn is_busy(&self) -> bool {
-        self.state.is_busy()
+        self.state.borrow().is_busy()
     }
     /// The head of the port's **driver queue** as a safe byte slice — the safe companion of
     /// [`DriverHost::peekq`], exactly as [`DriverState::queue_len`] is the safe companion of
@@ -515,22 +559,46 @@ impl AbiHost {
     /// bytes as a borrowed slice instead, and answers `None` for an empty queue (the raw hook's
     /// `NULL` view).
     ///
-    /// The slice borrows the queue's own buffer, so it stays valid only until the next
+    /// The bytes borrow the queue's own buffer, so they stay valid only until the next
     /// [`enq`](DriverHost::enq)/[`pushq`](DriverHost::pushq)/[`deq`](DriverHost::deq) — the lifetime
-    /// the C gives the pointer it returns — which is what the `&self` borrow enforces: every hook
-    /// that mutates the queue takes `&mut self`.
+    /// the C gives the pointer it returns. The returned [`Ref`] is what keeps that honest now that
+    /// the mutating hooks write through a shared borrow of the host: while it is alive a mutating
+    /// hook's `borrow_mut` would panic rather than let the view dangle, so drop it before touching
+    /// the queue again.
     ///
     /// Because this host's queue is one contiguous [`ByteQueue`], the slice is the queue's whole
     /// content — the raw view's single `vlen == 1` entry (see [`DriverHost::enq`] for that deviation
     /// from the C's per-enqueue chunking) — and [`DriverState::queue_len`] is its length.
-    pub fn queue_head(&self) -> Option<&[u8]> {
-        let front = self.state.ioq.front();
-        (!front.is_empty()).then_some(front)
+    pub fn queue_head(&self) -> Option<Ref<'_, [u8]>> {
+        // `Ref::filter_map` keeps the zero-copy view: the returned `Ref` *is* the state borrow,
+        // narrowed to the queue's head, so the borrow-check's lifetime rule above is unchanged.
+        Ref::filter_map(self.state.borrow(), |state| {
+            let front = state.ioq.front();
+            (!front.is_empty()).then_some(front)
+        })
+        .ok()
     }
 
-    /// The port's persistent state, mutably.
-    pub(crate) fn state_mut(&mut self) -> &mut DriverState {
-        &mut self.state
+    /// The port's persistent state, mutably — through `&self`, so a caller needs no exclusive
+    /// borrowing of the host (module docs → *The aliasing contract*).
+    ///
+    /// The returned [`RefMut`] is a borrow of the state *slot*, not of the whole host: hold it only
+    /// for the statement that uses it, and never across a call into the driver (which may re-enter
+    /// the host through the environment and borrow the same slot again).
+    pub(crate) fn state_mut(&self) -> RefMut<'_, DriverState> {
+        self.state.borrow_mut()
+    }
+
+    /// The `(poller token, ERL_DRV_USE release obligation)` of `fd`'s registration, if any.
+    ///
+    /// A snapshot taken under a state borrow that ends with this call, so a record is never held
+    /// across the `DriverContext` interaction that follows (module docs → *The aliasing contract*).
+    fn selected_record(&self, fd: RawFd) -> Option<(Token, bool)> {
+        self.state
+            .borrow()
+            .selected
+            .get(&fd)
+            .map(|selected| (selected.token, selected.wants_stop_select()))
     }
 
     /// The shared delivery path of `driver_output`/`driver_output2`: one read for the port owner,
@@ -565,7 +633,7 @@ impl AbiHost {
             // `erts_drvport2port_state` ⇒ `ERTS_INVALID_ERL_DRV_PORT` (the C's `-1`).
             return -1;
         }
-        if self.closing {
+        if self.closing.get() {
             // The C's `ERTS_PORT_SFLG_CLOSING` short-circuit: drop the bytes, report success.
             return 0;
         }
@@ -675,10 +743,10 @@ impl DriverHost for AbiHost {
             AbiFailure::Posix(errno) => DriverFailure::posix(errno),
             AbiFailure::Error(code) => DriverFailure::error(code),
         };
-        self.state.ioq.clear();
+        self.state.borrow_mut().ioq.clear();
         match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
             Some(Ok(())) => {
-                self.closing = true;
+                self.closing.set(true);
                 0
             }
             _ => -1,
@@ -698,10 +766,10 @@ impl DriverHost for AbiHost {
     /// answers the C's `0`, not `-1`.
     fn port_exit(&mut self, code: c_int) -> c_int {
         let failure = DriverFailure::exit(code);
-        self.state.ioq.clear();
+        self.state.borrow_mut().ioq.clear();
         match self.with_ctx(|ctx| ctx.signal_failure(failure)) {
             Some(Ok(())) => {
-                self.closing = true;
+                self.closing.set(true);
                 0
             }
             _ => -1,
@@ -754,7 +822,7 @@ impl DriverHost for AbiHost {
     /// binary/plain distinction (its `ErlDrvBinary` refcount dance, `io.c:6860-6866`) has no
     /// analogue. `0` = queued (the C's `-1` is an allocation failure, which a `Vec` cannot report).
     fn enq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
-        self.state.ioq.push(data);
+        self.state.borrow_mut().ioq.push(data);
         0
     }
 
@@ -767,10 +835,11 @@ impl DriverHost for AbiHost {
         if data.is_empty() {
             return 0; // The C's `len == 0` early return (`io.c:6881`).
         }
-        let tail = self.state.ioq.front().to_vec();
-        self.state.ioq.clear();
-        self.state.ioq.push(data);
-        self.state.ioq.push(&tail);
+        let mut state = self.state.borrow_mut();
+        let tail = state.ioq.front().to_vec();
+        state.ioq.clear();
+        state.ioq.push(data);
+        state.ioq.push(&tail);
         0
     }
 
@@ -791,7 +860,7 @@ impl DriverHost for AbiHost {
         if len < 0 {
             return -1;
         }
-        let dropped = self.state.ioq.consume(len as usize);
+        let dropped = self.state.borrow_mut().ioq.consume(len as usize);
         dropped.min(c_int::MAX as usize) as c_int
     }
 
@@ -801,7 +870,7 @@ impl DriverHost for AbiHost {
     /// (`io.c:6827-6834`), and `beam_abi` relies on a non-negative answer to let `driver_deq` and
     /// `driver_peekqv` take their normal path.
     fn sizeq(&mut self) -> c_int {
-        self.state.ioq.len().min(c_int::MAX as usize) as c_int
+        self.state.borrow().ioq.len().min(c_int::MAX as usize) as c_int
     }
 
     /// `driver_peekq`/`driver_peekqv`: a view of the head of the port's driver queue.
@@ -818,7 +887,10 @@ impl DriverHost for AbiHost {
     /// while `beam_abi` copies the vector of iovecs itself into the driver's call for the callback's
     /// duration.
     fn peekq(&mut self) -> Option<Vec<SysIOVec>> {
-        let front = self.state.ioq.front();
+        // `borrow_mut` (not `borrow`) so the published `iov_base` keeps the write provenance the
+        // driver's own `driver_deq` pairing expects; the borrow is released with this statement.
+        let state = self.state.borrow_mut();
+        let front = state.ioq.front();
         if front.is_empty() {
             return None;
         }
@@ -841,7 +913,7 @@ impl DriverHost for AbiHost {
     /// effect is the flag the C also keeps per port; what a command *does* with it is that decision
     /// table's.
     fn set_busy_port(&mut self, busy: bool) -> c_int {
-        self.state.busy = busy;
+        self.state.borrow_mut().busy = busy;
         0
     }
     /// `driver_select`: register, re-register or de-register interest in an OS handle.
@@ -871,18 +943,17 @@ impl DriverHost for AbiHost {
         let interest = interest_from_mode(mode);
 
         if on == 0 {
-            let Some(selected) = self.state.selected.get(&fd) else {
+            let Some((token, owes_stop_select)) = self.selected_record(fd) else {
                 return 0; // De-selecting an unknown fd is a no-op, not a failure.
             };
-            let token = selected.token;
-            let owes_stop_select = selected.wants_stop_select();
             return match self.with_ctx(|ctx| ctx.deregister(fd, token)) {
                 Some(Ok(())) => {
-                    self.state.selected.remove(&fd);
+                    let mut state = self.state.borrow_mut();
+                    state.selected.remove(&fd);
                     if owes_stop_select {
                         // Queued *after* the context borrow ends; the port fires it once this
                         // callback has returned (see `DriverState::queued_stop_select`).
-                        self.state.queued_stop_select.push(event);
+                        state.queued_stop_select.push(event);
                     }
                     0
                 }
@@ -893,12 +964,12 @@ impl DriverHost for AbiHost {
             };
         }
 
-        let existing = self.state.selected.get(&fd);
-        let token = existing.map(|selected| selected.token);
+        let existing = self.selected_record(fd);
+        let token = existing.map(|(token, _)| token);
         // A select that says nothing about `ERL_DRV_USE` leaves an earlier request in force (the
         // C's sticky `ERTS_EV_FLAG_USED`); one that carries the `_NO_CALLBACK` bit declines it.
         let owes_stop_select = match (mode & ERL_DRV_USE != 0, existing) {
-            (false, Some(selected)) => selected.wants_stop_select(),
+            (false, Some((_, owes))) => owes,
             (false, None) => false,
             (true, _) => (mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE,
         };
@@ -908,7 +979,7 @@ impl DriverHost for AbiHost {
         });
         match result {
             Some(Ok(token)) => {
-                self.state.selected.insert(
+                self.state.borrow_mut().selected.insert(
                     fd,
                     SelectedFd {
                         token,
@@ -934,12 +1005,12 @@ impl DriverHost for AbiHost {
     /// nothing to reject. An expired deadline reports `0` from
     /// [`DriverHost::read_timer`](beam_abi::driver::host::DriverHost::read_timer), as in the C.
     fn set_timer(&mut self, _port: ErlDrvPort, ms: c_ulong) -> c_int {
-        self.state.deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
+        self.state.borrow_mut().deadline = Some(Instant::now() + Duration::from_millis(ms as u64));
         0
     }
 
     fn cancel_timer(&mut self, _port: ErlDrvPort) -> c_int {
-        self.state.deadline = None;
+        self.state.borrow_mut().deadline = None;
         0
     }
 
@@ -949,7 +1020,7 @@ impl DriverHost for AbiHost {
     /// `beam_abi`'s `driver_read_timer` maps `None` to `-1` — its own documented deviation from
     /// `io.c:6936`, which answers `0` with `0` for "no timer".
     fn read_timer(&mut self, _port: ErlDrvPort) -> Option<c_ulong> {
-        self.state.deadline.map(|deadline| {
+        self.state.borrow().deadline.map(|deadline| {
             let remaining = deadline.saturating_duration_since(Instant::now());
             remaining.as_millis().min(c_ulong::MAX as u128) as c_ulong
         })
@@ -975,7 +1046,7 @@ impl DriverHost for AbiHost {
         data: *mut c_void,
         free: Option<unsafe extern "C" fn(*mut c_void)>,
     ) -> c_long {
-        match self.state.jobs.schedule(invoke, data, free) {
+        match self.state.borrow_mut().jobs.schedule(invoke, data, free) {
             Ok(id) => id as c_long,
             Err(()) => {
                 if let Some(free) = free {
@@ -1083,3 +1154,9 @@ mod tests;
 #[cfg(test)]
 #[path = "host_output_tests.rs"]
 mod host_output_tests;
+
+/// The **release-profile aliasing guard**: the callback's stores through the environment must
+/// survive a caller-side `&AbiHost` (see that file's docs for the measured failure it prevents).
+#[cfg(test)]
+#[path = "host_aliasing_tests.rs"]
+mod host_aliasing_tests;

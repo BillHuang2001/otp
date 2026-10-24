@@ -608,17 +608,18 @@ fn peeked_bytes(host: &mut AbiHost) -> Option<Vec<u8>> {
 }
 
 /// [`AbiHost::queue_head`] is the safe companion of `driver_peekq`: it hands out the same head
-/// bytes as a slice without `unsafe`, is `None` exactly when the raw view is, needs no installed
-/// `DriverContext` (the queue is the host's own state, as the C's `drvport2ioq(ix)` is), and is
-/// bounded to the queue-mutation lifetime by taking `&self` while every mutating hook takes
-/// `&mut self`.
+/// bytes as a borrow without `unsafe`, is `None` exactly when the raw view is, and needs no
+/// installed `DriverContext` (the queue is the host's own state, as the C's `drvport2ioq(ix)` is).
+/// The returned `Ref` is what bounds it to the queue-mutation lifetime now that the mutating hooks
+/// write through a shared borrow of the host (see `AbiHost`'s module docs → *The aliasing
+/// contract*): a mutation while the head is outstanding is a borrow panic, not a dangling view.
 #[test]
 fn the_queue_head_accessor_is_the_safe_peekq_view() {
     let mut host = new_host();
 
     // Nothing queued: the raw hook reports its `NULL` view and the accessor `None`.
     assert!(DriverHost::peekq(&mut host).is_none());
-    assert_eq!(host.queue_head(), None);
+    assert!(host.queue_head().is_none());
     assert_eq!(host.state().queue_len(), 0);
 
     // A queued head: the accessor returns the raw view's bytes, of the raw view's length, and
@@ -627,7 +628,7 @@ fn the_queue_head_accessor_is_the_safe_peekq_view() {
     let view = DriverHost::peekq(&mut host).expect("a non-empty queue has a view");
     assert_eq!(view.len(), 1, "the queue is one contiguous entry");
     let head = host.queue_head().expect("a non-empty queue has a head");
-    assert_eq!(head, b"hello");
+    assert_eq!(&*head, b"hello");
     assert_eq!(head.len(), view[0].iov_len);
     assert_eq!(
         head.as_ptr(),
@@ -639,16 +640,18 @@ fn the_queue_head_accessor_is_the_safe_peekq_view() {
         head.len(),
         "the `sizeq` companion agrees with the `peekq` companion"
     );
+    // Drop the head borrow before mutating the queue (see this test's doc).
+    drop(head);
 
     // The accessor follows the queue: `pushq` prepends and `deq` drops from the head.
     assert_eq!(DriverHost::pushq(&mut host, b"xy", false), 0);
-    assert_eq!(host.queue_head(), Some(&b"xyhello"[..]));
+    assert_eq!(host.queue_head().as_deref(), Some(&b"xyhello"[..]));
     assert_eq!(DriverHost::deq(&mut host, 2), 2);
-    assert_eq!(host.queue_head(), Some(&b"hello"[..]));
+    assert_eq!(host.queue_head().as_deref(), Some(&b"hello"[..]));
 
     // A full drain takes the accessor back to `None`, like the raw view.
     assert_eq!(DriverHost::deq(&mut host, 100), 5);
-    assert_eq!(host.queue_head(), None);
+    assert!(host.queue_head().is_none());
     assert!(DriverHost::peekq(&mut host).is_none());
 }
 

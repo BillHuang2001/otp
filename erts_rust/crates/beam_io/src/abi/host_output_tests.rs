@@ -272,7 +272,7 @@ fn a_delivery_after_a_failure_answers_the_c_zero_not_minus_one() {
             0,
             "the failure request itself answers the C's 0"
         );
-        assert!(host.closing, "the accepted failure closes the host");
+        assert!(host.closing.get(), "the accepted failure closes the host");
 
         // Post-failure deliveries: the C's `0`, and **nothing** is staged.
         assert_eq!(

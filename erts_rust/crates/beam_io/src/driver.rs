@@ -987,9 +987,13 @@ impl dyn Driver {
     /// This is a **read-only** downcast.
     /// A port owns its driver exclusively and its [`crate::PortRegistry`] hands out only shared borrows, so there is deliberately no `downcast_mut` — mutating a driver from outside would race the port-task round that drives it.
     pub fn downcast_ref<T: Driver + 'static>(&self) -> Option<&T> {
-        // Trait upcasting (`&dyn Driver` → `&dyn Any`) is a stable coercion since Rust 1.86 and
-        // this workspace is pinned at 1.98.1, so no `unsafe` transmute of the fat pointer is
-        // needed here.
+        // Trait upcasting (`&dyn Driver` → `&dyn Any`) is a **stable coercion** — stabilised in
+        // Rust 1.86 — so this workspace's pinned 1.98.1 accepts it with no feature gate and no
+        // `unsafe` fat-pointer transmute (verified: this line compiles as written under
+        // `rust-toolchain.toml`'s 1.98.1, which is therefore this crate's MSRV *for this line*).
+        // Below 1.86 the coercion is rejected; the replacement is then the object-safe helper
+        // `beam_abi` uses for its host (`AsAnyHost::as_any_mut`) plus a `downcast_ref` on the
+        // resulting `&dyn Any`, not a transmute.
         (self as &dyn core::any::Any).downcast_ref::<T>()
     }
 }

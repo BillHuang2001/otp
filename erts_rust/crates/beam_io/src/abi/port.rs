@@ -146,7 +146,7 @@ use std::time::Instant;
 
 use libc::{c_char, c_int, c_uint, c_void};
 
-use beam_abi::driver::host::{DriverEnv, DriverHost};
+use beam_abi::driver::host::DriverEnv;
 use beam_abi::driver::loader::{load, DriverLibrary};
 use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvData, ErlDrvEvent, ErlDrvMonitor, ErlDrvPort, ErlDrvSizeT,
@@ -314,42 +314,47 @@ impl DriverPort {
     /// Runs a driver callback with the port context installed, clearing it afterwards.
     ///
     /// `f` receives the loaded library and the driver's private data — never `&mut self`, so this
-    /// can hold an immutable borrow of the [`AbiHost`] for the cleanup guard's lifetime while the
-    /// callback runs.
+    /// holds only a **shared** borrow of the port (and of the [`AbiHost`] it boxes) while the
+    /// callback runs. That is the aliasing contract, not a convenience: a `&mut`/`&` to the host
+    /// live across a call into the driver lets the optimiser treat the callback's stores through the
+    /// [`DriverEnv`](beam_abi::driver::host::DriverEnv) as unobservable and drop them (a silent,
+    /// release-only no-op — see [`crate::abi::host`]'s module docs → *The aliasing contract*). Every
+    /// host accessor therefore takes `&self`.
     ///
     /// The cleanup is a `Drop` guard, so the context is cleared even if the callback body unwinds —
     /// the installed pointer must never outlive the [`DriverContext`] it came from.
     ///
     /// The port's host is **published** for the dynamic extent of the callback
-    /// ([`beam_abi::with_current_host`]), so the two frozen driver slots that carry no port operand
+    /// ([`beam_abi::with_current_host`], fed through [`DriverPort::publishing`] = the environment's
+    /// own pointer), so the two frozen driver slots that carry no port operand
     /// (`add_driver_entry`/`remove_driver_entry`) can reach it. This is the central publication
     /// point: every `call`-routed driver method (`start`/`output`/`ready_input`/`ready_output`/
     /// `control`/`timeout`/`port_exit`/`stop`) is covered by it.
     fn call<R>(
-        &mut self,
+        &self,
         ctx: &mut DriverContext<'_>,
         f: impl FnOnce(&DriverPort, ErlDrvPort) -> R,
     ) -> R {
         let port = self.env.as_port();
-        // SAFETY: `abi_ptr` is `&mut *self.abi` taken as a raw pointer; that temporary borrow ends
-        // at this statement, so nothing below re-borrows `self.abi` through it in the borrow
-        // checker. The `&mut dyn DriverHost` derived from it reaches only the `AbiHost`'s
-        // interior-mutable state (`Cell`/`DriverState`), which no other live borrow touches: `f`
-        // reads and writes only *other* `DriverPort` fields (`lib`/`data`). The publication is
-        // scoped to the `with_current_host` call, so the pointer is retired before the borrow ends.
-        // This mirrors the crate's existing raw-pointer re-entry (`AbiHost::with_ctx`,
-        // `DriverEnv::new`/`host`).
-        let abi_ptr: *mut AbiHost = &mut *self.abi;
         self.abi.install(ctx);
-        let _guard = CtxGuard(abi_ptr);
-        // SAFETY: `abi_ptr` is the address of the boxed `AbiHost` field (see above), live for the
-        // whole of this call.
-        let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
-        let result = beam_abi::with_current_host(host, || f(self, port));
+        let _guard = CtxGuard(&*self.abi as *const AbiHost);
+        let result = self.publishing(|| f(self, port));
         // A `driver_select(..., 0)` the driver just made queued its `ERL_DRV_USE` release (see
         // `AbiHost::select`); the callback runs now, after the driver's own call has returned.
         self.drain_queued_stop_select();
         result
+    }
+
+    /// Publishes this port's host as the thread's **current driver host** for `f`'s dynamic extent.
+    ///
+    /// The host comes from [`DriverEnv::host`](beam_abi::driver::host::DriverEnv::host) — the
+    /// environment's own pointer, the one sanctioned route (that module's *The aliasing contract*) —
+    /// and never from a `&mut` of [`DriverPort::abi`], so this adapter derives no exclusive
+    /// reference to the host at all. The `&mut` handed to
+    /// [`beam_abi::with_current_host`] is reborrowed from the environment's raw pointer inside this
+    /// call, exactly as a `driver_*` entry point's own recovery does.
+    fn publishing<R>(&self, f: impl FnOnce() -> R) -> R {
+        beam_abi::with_current_host(self.env.host(), f)
     }
 
     /// Fires the driver's `stop_select` callback for each `ErlDrvEvent` in `events`.
@@ -364,18 +369,14 @@ impl DriverPort {
     ///
     /// The host is published for the same reason [`DriverPort::call`] publishes it around every
     /// other callback: a driver may reach the two no-port registry slots from `stop_select` too.
-    fn fire_stop_select(&mut self, events: Vec<ErlDrvEvent>) {
+    fn fire_stop_select(&self, events: Vec<ErlDrvEvent>) {
         if events.is_empty() || self.lib.entry().stop_select.is_none() {
             return;
         }
-        let abi_ptr: *mut AbiHost = &mut *self.abi;
         let lib = &self.lib;
-        // SAFETY: `abi_ptr` is the address of the boxed `AbiHost` field (see `DriverPort::call`),
-        // live for the whole of this call; the closure below reads only `self.lib` (a disjoint
-        // field), so nothing re-borrows `*abi_ptr` through it, and the pointer is retired when
-        // `with_current_host` returns.
-        let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
-        beam_abi::with_current_host(host, || {
+        // `lib` and the host are disjoint (`lib` is a shared `Arc` handle, never the host's
+        // storage), so the closure can borrow the driver without naming `self.abi` at all.
+        let _ = self.publishing(|| {
             for event in events {
                 // Each `event` is a value the driver itself handed to `driver_select` (or its fd),
                 // so it is exactly the operand the C hands back. The `Result` is only the absent-
@@ -390,7 +391,7 @@ impl DriverPort {
     ///
     /// The C likewise calls `stop_select` after releasing the fd lock (`erl_check_io.c:1210-1216`),
     /// never re-entrantly into the driver's own `driver_select`.
-    fn drain_queued_stop_select(&mut self) {
+    fn drain_queued_stop_select(&self) {
         let queued = self.abi.state_mut().take_queued_stop_select();
         self.fire_stop_select(queued);
     }
@@ -514,14 +515,10 @@ impl DriverPort {
                 // path, `io.c:5406`). `async_free` carries no port, so it is one of the driver entry
                 // points that does not go through `DriverPort::call`; the host is published here for
                 // the same reason `call` publishes it — a driver may call the no-port registry slots
-                // (`add_driver_entry`/`remove_driver_entry`) from any of its callbacks.
-                let abi_ptr: *mut AbiHost = &mut *self.abi;
-                // SAFETY: see `DriverPort::call` — the published `&mut` reaches only the
-                // `AbiHost`'s interior-mutable state and is retired before this iteration's borrow
-                // ends; the closure touches only the completion (`job`), which is disjoint from the
-                // host.
-                let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
-                beam_abi::with_current_host(host, || job.release());
+                // (`add_driver_entry`/`remove_driver_entry`) from any of its callbacks. The
+                // publication goes through the environment's pointer like every other one (see
+                // `DriverPort::publishing`), so no `&mut AbiHost` is derived here either.
+                self.publishing(|| job.release());
             }
             processed += 1;
         }
@@ -534,18 +531,19 @@ impl DriverPort {
 
 /// Clears an [`AbiHost`]'s installed port context when a driver callback returns (or unwinds).
 ///
-/// Holds a **raw** pointer rather than a `&AbiHost`: [`DriverPort::call`] publishes the host as a
-/// `&mut dyn DriverHost` for the callback's dynamic extent, which a live shared borrow of the host
-/// would forbid — so the guard deliberately keeps no borrow, only the address of the boxed host the
-/// port owns.
-struct CtxGuard(*mut AbiHost);
+/// Holds a **raw pointer** rather than a `&AbiHost`: a shared reference to the host kept alive
+/// across the callback is the very shape the aliasing contract forbids (module docs →
+/// *The aliasing contract* in [`crate::abi::host`]), even though this host's state is
+/// interior-mutable and would survive it. The guard therefore keeps the address only, and reborrows
+/// it shared for the one store [`AbiHost::clear`] makes.
+struct CtxGuard(*const AbiHost);
 
 impl Drop for CtxGuard {
     fn drop(&mut self) {
         // SAFETY: the pointer is the address of the `AbiHost` this guard was created from in
         // `DriverPort::call`; that host is a `Box` owned by the live `DriverPort`, so it is valid
-        // for the guard's whole life (which is bounded by the same method), and `clear` only writes
-        // the host's own `Cell` slot.
+        // for the guard's whole life (which is bounded by the same method), and `clear` takes
+        // `&self` and only writes the host's own `Cell` slot.
         unsafe { (*self.0).clear() };
     }
 }
