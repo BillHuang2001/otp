@@ -1205,7 +1205,7 @@ pub(crate) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
     for id in [ChunkId::LITT, ChunkId::META, ChunkId::RECS, ChunkId::DBGB] {
         digest_input.extend_from_slice(chunk(id));
     }
-    Ok(beam_dist::md5(&digest_input))
+    Ok(beam_common::md5::digest(&digest_input))
 }
 
 /// Oracle proofs for the `NEW_FUN_EXT` (`112`) local-fun identity derivation.

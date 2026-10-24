@@ -1270,7 +1270,7 @@ mod in_process_compile {
                 artifact.display()
             )
         });
-        let digest = beam_loader::checksum::md5(&bytes)
+        let digest = beam_common::md5::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
