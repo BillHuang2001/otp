@@ -438,7 +438,7 @@ fn dynamic_symbols(binary: &Path) -> Option<String> {
 fn fixture_host(atoms: &Rc<AtomTable>) -> DriverPort {
     DriverPort::new(
         Heap::new(4096).expect("a driver heap is allocatable"),
-        Rc::clone(atoms),
+        atoms,
         ProcessId::new(1, 0),
     )
 }

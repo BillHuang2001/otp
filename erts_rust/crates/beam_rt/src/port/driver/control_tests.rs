@@ -543,7 +543,11 @@ fn load_adapter(fixture: &Fixture) -> DriverPortAdapter {
     // The same anchor `crate::port::PortRegistry::new` uses.
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let atoms = Rc::new(AtomTable::new());
-    let host = DriverPort::new(Heap::new(256).expect("a test heap"), atoms, ProcessId::new(1, 0));
+    let host = DriverPort::new(
+        Heap::new(256).expect("a test heap"),
+        &atoms,
+        ProcessId::new(1, 0),
+    );
     let command = format!(
         "{} {:x} {}",
         fixture.stem.with_extension("so").display(),

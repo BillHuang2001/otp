@@ -2784,6 +2784,12 @@ impl PortRegistry {
     /// past sits behind a term the driver has already built, so the caller reports it (see
     /// [`Runtime::deliver_port_messages`]).
     ///
+    /// The caller owns the **lease** rule around this: `atoms` is normally the code server's own
+    /// `Rc::make_mut` handle, so every driver port's table view must be released first
+    /// ([`PortRegistry::release_driver_atom_tables`]) and re-adopted after
+    /// ([`PortRegistry::adopt_driver_atom_tables`]) — otherwise the append deep-clones the table
+    /// and the hosts' views are orphaned.
+    ///
     /// # Errors
     ///
     /// None: the driver callback that interned the name has already returned, so there is nobody
@@ -2812,10 +2818,10 @@ impl PortRegistry {
     /// loop: the table is reached through
     /// [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut), which is
     /// `Rc::make_mut`. Merely *reaching* it while any other holder is alive — a
-    /// `{spawn_driver, Name}` port's host (which holds one for the port's whole life), a loaded
-    /// NIF library's stored host, a port open in flight — deep-clones the entire shared table
-    /// (thousands of names, and their `String`s, plus the index map) for a round that interns
-    /// nothing. A round with nothing pending must therefore not reach it at all.
+    /// `{spawn_driver, Name}` port's host (which is leased the table for the port's whole life), a
+    /// loaded NIF library's stored host, a port open in flight — deep-clones the entire shared
+    /// table (thousands of names, and their `String`s, plus the index map) for a round that
+    /// interns nothing. A round with nothing pending must therefore not reach it at all.
     ///
     /// The scan is one pass over the live ports — orders of magnitude below the clone it
     /// avoids, and the same pass `commit_driver_atoms` would make anyway.
@@ -2825,6 +2831,42 @@ impl PortRegistry {
                 .as_ref()
                 .is_some_and(|pending| !pending.is_empty())
         })
+    }
+
+    /// Takes every live driver port's view of the shared atom table away, so the commit that
+    /// follows appends **in place**.
+    ///
+    /// A driver host reaches the table through the [`driver::DriverAtoms`] record the port layer
+    /// shares with it ([`driver::DriverPort::pending_atoms`]), which is the only handle the commit
+    /// site can see — the host itself is boxed into its port. Releasing it is what makes the
+    /// commit's `Rc::make_mut` take `Rc::get_mut`'s in-place path instead of deep-cloning the
+    /// whole shared table (one `Arc<str>` + one index-map insertion per name): `Rc::get_mut`
+    /// refuses while **any** other reference exists, weak ones included, and `Rc::make_mut` then
+    /// replaces the allocation — which would also orphan the host's copy, leaving it stale enough
+    /// to hand a driver an index that names the wrong atom. See [`driver::DriverAtoms::release`].
+    ///
+    /// Nothing runs between this and [`PortRegistry::adopt_driver_atom_tables`]: the commit in
+    /// between is a pure append.
+    fn release_driver_atom_tables(&mut self) {
+        for meta in self.meta.values() {
+            if let Some(pending) = meta.driver_atoms.as_ref() {
+                pending.release();
+            }
+        }
+    }
+
+    /// Hands every live driver port back a view of the shared atom table — `atoms` must be the
+    /// table the code server holds **now**, i.e. the one the commit just appended to.
+    ///
+    /// Re-adopting the live handle (rather than restoring the released one) keeps the invariant
+    /// the next round needs: a host's view is the table the runtime owns, so a name it resolves is
+    /// a name the runtime really holds. See [`PortRegistry::release_driver_atom_tables`].
+    fn adopt_driver_atom_tables(&mut self, atoms: &Rc<beam_term::AtomTable>) {
+        for meta in self.meta.values() {
+            if let Some(pending) = meta.driver_atoms.as_ref() {
+                pending.adopt(atoms);
+            }
+        }
     }
     /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
     ///
@@ -3965,7 +4007,7 @@ impl PortHook for RuntimePorts {
             // fabricated port and never a silent no-op.
             let host = driver::DriverPort::new(
                 Heap::new(PORT_HEAP_WORDS)?,
-                Rc::clone(&self.atoms),
+                &self.atoms,
                 self.owner,
             )
             // The port's **state** stream flags, which `driver_get_port_flags` reports: the C reads
@@ -4259,7 +4301,18 @@ impl Runtime {
             // a loaded NIF library) deep-clones the whole table for a round that interns
             // nothing. See [`PortRegistry::has_pending_driver_atoms`].
             if registry.has_pending_driver_atoms() {
-                for (port, name) in registry.commit_driver_atoms(self.code_server.atoms_mut()) {
+                // Release every host's hold on the table *first*: the commit appends through
+                // `Rc::make_mut`, which keeps the existing allocation only while the code server
+                // is its sole owner (`Rc::get_mut` refuses while any other reference exists, weak
+                // ones included). A clone here would both cost the whole table and orphan the
+                // hosts' copies, and a stale view hands a driver an index that names the wrong
+                // atom — see [`PortRegistry::release_driver_atom_tables`].
+                registry.release_driver_atom_tables();
+                let dropped = registry.commit_driver_atoms(self.code_server.atoms_mut());
+                // Hand them the table the commit appended to, so every host's view is live again.
+                let live = self.code_server.atoms_handle();
+                registry.adopt_driver_atom_tables(&live);
+                for (port, name) in dropped {
                     // Never silent: the term the driver built already carries an index that now
                     // names a different atom, which no later commit can repair.
                     eprintln!(

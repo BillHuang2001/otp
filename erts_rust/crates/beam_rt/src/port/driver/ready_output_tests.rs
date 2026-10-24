@@ -451,7 +451,7 @@ fn open_port(fixture: &Fixture, stem: &str) -> (Poller, PortRegistry, PortId) {
     let atoms = Rc::new(AtomTable::new());
     let host = DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        atoms,
+        &atoms,
         ProcessId::new(1, 0),
     );
     let command = format!(

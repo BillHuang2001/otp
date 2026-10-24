@@ -270,17 +270,67 @@ struct DriverAtomsState {
     base: usize,
     /// The names recorded in this window, in order (deduplicated).
     names: Vec<String>,
+    /// The host's view of the runtime's **one shared** atom table — the table it resolves
+    /// existing names against and predicts new indices for.
+    ///
+    /// It lives here, on the record the port layer shares with the host, and not in a private
+    /// [`DriverPort`] field, because the commit site has to be able to reach it: the port layer
+    /// only ever sees the handles it seized **before** the host was boxed into its port
+    /// ([`DriverPort::pending_atoms`]), so a private field would be unreachable exactly when it
+    /// matters.
+    ///
+    /// # Why the handle is taken away and handed back
+    ///
+    /// The port round lands a driver's new names through
+    /// [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut), which is
+    /// `Rc::make_mut`, and **both** `make_mut` and `get_mut` append in place only while the code
+    /// server is the table's sole owner — a `Weak` in this slot would be no better, since
+    /// `Rc::get_mut` refuses while any *weak* reference exists and `make_mut` then replaces the
+    /// allocation (leaving a dead `Weak` behind). A strong handle kept here for the port's whole
+    /// life therefore made every committing round deep-clone the entire shared table (one
+    /// `Arc<str>` + one index-map insertion per name) — and since that clone installs a **fresh
+    /// allocation** in the code server, this host's copy went **stale**: a later
+    /// [`DriverAtoms::intern`] of a name the real table already held predicted an index past the
+    /// end of the copy, `AtomTable::intern` deduped it back to the existing index, and the term
+    /// the driver had already built named the **wrong atom**.
+    ///
+    /// So the slot is a *lease*: [`DriverAtoms::release`] drops it, the commit appends in place,
+    /// and [`DriverAtoms::adopt`] re-points it at the table the code server holds now. Between
+    /// those two calls nothing is running.
+    atoms: Option<Rc<AtomTable>>,
 }
 
 impl DriverAtoms {
-    /// A pending set rooted at `base` (the live table's current length).
+    /// A pending set rooted at `base` (the live table's current length), holding no table view.
     pub fn new(base: usize) -> DriverAtoms {
         DriverAtoms {
             inner: Rc::new(RefCell::new(DriverAtomsState {
                 base,
                 names: Vec::new(),
+                atoms: None,
             })),
         }
+    }
+
+    /// Takes `atoms` as this record's view of the shared table — what the host resolves through.
+    pub fn adopt(&self, atoms: &Rc<AtomTable>) {
+        self.inner.borrow_mut().atoms = Some(Rc::clone(atoms));
+    }
+
+    /// Drops the table view — the commit site's release, so the append lands **in place** (see
+    /// [`DriverAtoms`]' `atoms` slot). The host resolves nothing until the next
+    /// [`DriverAtoms::adopt`].
+    pub fn release(&self) {
+        self.inner.borrow_mut().atoms = None;
+    }
+
+    /// The table this record currently holds, if any.
+    ///
+    /// `None` only inside a commit window (between [`DriverAtoms::release`] and
+    /// [`DriverAtoms::adopt`], where nothing is running) or for a record no table was adopted on
+    /// — in which case every reader answers the honest "not resolvable here", never a guess.
+    pub fn table(&self) -> Option<Rc<AtomTable>> {
+        self.inner.borrow().atoms.clone()
     }
 
     /// Whether no name is awaiting a commit.
@@ -862,9 +912,10 @@ impl Default for PortTerms {
 
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
-/// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
-/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`DriverAtoms`]
-/// record a *new* atom is predicted on, and answers the port queries with the owning [`ProcessId`].
+/// It owns a private term arena (the heap the term-data decoder builds its terms on), carries the
+/// deferred-commit [`DriverAtoms`] record a *new* atom is predicted on — which is also where its
+/// **leased** view of the runtime's one shared [`AtomTable`] lives (see
+/// [`DriverAtoms::table`]) — and answers the port queries with the owning [`ProcessId`].
 ///
 /// See the module docs for the current scope: the output / term-data / pid services and the
 /// recorded `driver_select` / timer requests, the `driver_async` pool hook and the `ready_async`
@@ -876,9 +927,6 @@ pub struct DriverPort {
     /// and the driver may hold it after the callback returns (the same rule as
     /// [`crate::port::PortRegistry`]'s `port_info` arena).
     heap: Heap,
-    /// A handle to the runtime's shared atom table, used to resolve (never to mint *through*) an
-    /// existing atom.
-    atoms: Rc<AtomTable>,
     /// The deferred-commit record a **new** atom is predicted on (see
     /// [`DriverPort::commit_atoms`]).
     interner: DriverAtoms,
@@ -1031,11 +1079,16 @@ pub struct DriverPort {
 
 impl DriverPort {
     /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
-    pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
+    ///
+    /// The host keeps **no** private handle on the table: it adopts `atoms` on the
+    /// [`DriverAtoms`] record the port layer shares with it, which is the one handle the commit
+    /// site can take away and hand back (see [`DriverAtoms::adopt`] and
+    /// [`DriverPort::commit_atoms`]).
+    pub fn new(heap: Heap, atoms: &Rc<AtomTable>, owner: ProcessId) -> DriverPort {
         let interner = DriverAtoms::new(atoms.len());
+        interner.adopt(atoms);
         DriverPort {
             heap,
-            atoms,
             interner,
             owner,
             outputs: Vec::new(),
@@ -1188,7 +1241,9 @@ impl DriverPort {
     /// Taken **before** the host is boxed into a port, for the same reason as
     /// [`DriverPort::term_queue`]: the boxed driver exposes no host, so without this handle a name
     /// a driver interned inside a callback would stay *predicted* forever — its index would never
-    /// reach the live table (see [`DriverAtoms`]).
+    /// reach the live table (see [`DriverAtoms`]). It is also the only handle through which the
+    /// port round can reach the host's **leased** view of the shared table, which is why that view
+    /// lives on this record rather than in a private field (see [`DriverAtoms::table`]).
     pub fn pending_atoms(&self) -> DriverAtoms {
         self.interner.clone()
     }
@@ -1283,12 +1338,14 @@ impl DriverPort {
     ///
     /// A name recorded on the pending interner is not resolvable until
     /// [`DriverPort::commit_atoms`] lands it, so this answers `None` for it — the honest answer,
-    /// never a guessed name.
-    pub fn atom_name(&self, term: Eterm) -> Option<&str> {
+    /// never a guessed name. So does a record inside a commit window, where the table view is
+    /// released (see [`DriverAtoms::table`]).
+    pub fn atom_name(&self, term: Eterm) -> Option<String> {
         if !beam_term::is_atom(term) {
             return None;
         }
-        self.atoms.name(beam_term::atom_val(term))
+        let atoms = self.interner.table()?;
+        atoms.name(beam_term::atom_val(term)).map(str::to_string)
     }
 
     /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order, and
@@ -1296,8 +1353,12 @@ impl DriverPort {
     ///
     /// The same deferred-commit rule as the NIF host (`crate::nif`'s `NifHostImpl`): the runtime's
     /// atom table is held immutably while a driver callback runs, so a *new* name is given its
-    /// predicted index straight away and only materialised **after** the borrow is released. The
-    /// caller must pass the **same** table the host's `atoms` handle refers to.
+    /// predicted index straight away and only materialised **after** the borrow is released.
+    ///
+    /// The caller must pass the table the host's [`DriverAtoms`] record is leased to — and must
+    /// **release** that lease first when `atoms` is the code server's own `Rc::make_mut` handle,
+    /// or the append deep-clones the table and orphans the lease (see
+    /// [`DriverAtoms::release`]; [`crate::port::PortRegistry::commit_driver_atoms`] does both).
     pub fn commit_atoms(&self, atoms: &mut AtomTable) -> Vec<String> {
         self.interner.commit(atoms)
     }
@@ -1614,8 +1675,11 @@ impl DriverHost for DriverPort {
 
     /// An existing atom keeps the shared table's index; a new one is recorded on the pending
     /// interner at its predicted index (committed later by [`DriverPort::commit_atoms`]).
+    ///
+    /// The table is reached through the record's leased view ([`DriverAtoms::table`]), so a
+    /// released one falls through to the prediction path exactly as a lookup miss does.
     fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
-        if let Some(atom) = self.atoms.lookup(name) {
+        if let Some(atom) = self.interner.table().and_then(|atoms| atoms.lookup(name)) {
             return Some(make_atom(atom));
         }
         Some(make_atom(self.interner.intern(name)))
@@ -1648,10 +1712,13 @@ impl DriverHost for DriverPort {
     /// clone per call); nothing is ever minted *through* that image — a fresh name goes onto the
     /// interner — so this host can never hand out an index the runtime's own table cannot see.
     fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+        // The record's leased table view: a released one is the same honest answer as an
+        // undecodable image — the whole decode aborts (never a partial or wrong term).
+        let atoms = self.interner.table()?;
         // Disjoint field borrows: `heap` and `interner` are distinct fields of `self`.
         let heap = &mut self.heap;
         let interner = &mut self.interner;
-        crate::nif::with_decode_scratch(&self.atoms, |scratch| {
+        crate::nif::with_decode_scratch(&atoms, |scratch| {
             let known = scratch.len();
             let term = beam_codec::decode_term(bytes, heap, scratch).ok()?;
             // Record the names the decoder appended, in order, so the interner predicts the very
@@ -3645,7 +3712,7 @@ mod tests {
     fn host(atoms: &Rc<AtomTable>) -> DriverPort {
         DriverPort::new(
             Heap::new(256).expect("a test heap"),
-            Rc::clone(atoms),
+            atoms,
             ProcessId::new(1, 0),
         )
     }
@@ -3779,7 +3846,7 @@ mod tests {
         // A list of 400 cons cells needs more than the smoke-test arena.
         let mut host = DriverPort::new(
             Heap::new(4096).expect("a test heap"),
-            Rc::clone(&atoms),
+            &atoms,
             ProcessId::new(1, 0),
         );
         let mut list = beam_term::NIL;

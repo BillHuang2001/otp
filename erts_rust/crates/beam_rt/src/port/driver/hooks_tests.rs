@@ -73,9 +73,18 @@ use crate::port::StreamType;
 fn host() -> DriverPort {
     DriverPort::new(
         Heap::new(256).expect("a test heap"),
-        Rc::new(AtomTable::new()),
+        leak_table(),
         ProcessId::new(1, 0),
     )
+}
+/// An empty table that outlives the host built over it.
+///
+/// A [`DriverPort`] holds a `Weak` to the shared table (never a strong reference — see its `atoms`
+/// field), so a test host's table needs an owner of its own. These hosts never resolve or intern a
+/// name, so one leaked empty table per call is the cheapest way to keep the production lease shape
+/// without a test-only owning constructor.
+pub(super) fn leak_table() -> &'static Rc<AtomTable> {
+    Box::leak(Box::new(Rc::new(AtomTable::new())))
 }
 
 /// The `driver_peekq` view's entry lengths, in queue order: the only part of a `SysIOVec` this

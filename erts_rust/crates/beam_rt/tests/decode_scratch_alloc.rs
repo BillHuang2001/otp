@@ -241,7 +241,7 @@ fn run_case(table_size: usize, image: &[u8]) -> Case {
     // is large enough for them all.
     let mut host = DriverPort::new(
         Heap::new(1 << 16).expect("destination heap"),
-        Rc::clone(&atoms),
+        &atoms,
         ProcessId::new(1, 0),
     );
 
