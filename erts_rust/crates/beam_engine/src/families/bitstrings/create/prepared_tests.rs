@@ -115,10 +115,17 @@ fn atom(module: &Module) -> Operand {
     Operand::Atom(module.atom_table.lookup("all").expect("the all atom"))
 }
 
+/// The rendering of the oracle's **bare** `badarg` that [`outcome`] reports: a segment
+/// failure with no live catch frame propagates as the typed
+/// [`beam_common::BeamError::BadArg`], whose `as_atom()` *is* the atom the oracle
+/// raises, so the exact typed error — never a substituted atom — is the thing to pin.
+fn bare_badarg() -> String {
+    format!("{:?}", beam_common::BeamError::BadArg)
+}
 /// A small-integer term in register `index`.
 fn set_small(machine: &mut Machine, index: u32, value: i64) {
     let term = beam_term::try_make_small(value).expect("a small integer");
-    machine.set_x(index as usize, term).expect("register in range");
+    machine.set_x(index, term).expect("register in range");
 }
 
 /// Run one route over `segments` and reduce it to `(bytes, nbits)` or an error string.
@@ -292,10 +299,43 @@ fn a_bignum_into_a_narrow_byte_field_matches_the_generic_walk() {
     }
 }
 
+/// The direct store into a **writable accumulator** (the in-place destination) agrees with
+/// the generic walk at every specialised width and byte order, with an armed reservation
+/// and with a payload the field has to grow.
+#[test]
+fn an_in_place_byte_field_matches_the_generic_walk_in_both_byte_orders() {
+    for (names, unit, size, value, capacity) in [
+        (Vec::new(), 1i64, 8i64, 0x7Fi64, 64usize),
+        (vec!["little"], 1, 16, 0x1234, 64),
+        (vec!["little"], 1, 32, -5, 64),
+        (Vec::new(), 1, 64, i64::MIN, 64),
+        // No room at all: the reservation cannot cover the field, so the write grows the payload.
+        (Vec::new(), 1, 32, 0x00AB_CDEF, 0),
+    ] {
+        let module = case_module(&names);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let build = |machine: &mut Machine, ctx: &mut MinimalContext, module: &Module| {
+            accumulator(machine, ctx, capacity);
+            let mut segments = seg(module, "private_append", 1, acc_operand(), all(module));
+            segments.extend(seg(
+                module,
+                "integer",
+                unit,
+                Operand::Integer(value),
+                Operand::Integer(size),
+            ));
+            segments
+        };
+        let (bytes, nbits) = compare(&module, &mut machine, &mut ctx, &build);
+        assert_eq!(nbits, (size * unit) as usize, "the field's bit count");
+        assert_eq!(bytes.len(), nbits.div_ceil(8), "the byte count follows the bits");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. The integer family's remaining shapes
 // ---------------------------------------------------------------------------
-
 /// Bit-granular widths, an unaligned byte field behind one, a `dynamic` size, and the
 /// malformed (non-integer) value all behave as the generic walk does.
 #[test]
@@ -365,7 +405,7 @@ fn the_integer_family_matches_the_generic_walk() {
             seg(module, "integer", 1, value.clone(), Operand::Integer(8))
         };
         let error = compare_err(&module, &mut machine, &mut ctx, build);
-        assert!(error.contains("badarg"), "the oracle's bare badarg: {error}");
+        assert_eq!(error, bare_badarg(), "the oracle's bare badarg");
     }
 }
 
@@ -456,7 +496,7 @@ fn the_append_family_matches_the_generic_walk() {
             seg(module, "append", 1, value.clone(), all(module))
         };
         let error = compare_err(&module, &mut machine, &mut ctx, build);
-        assert!(error.contains("badarg"), "the oracle's bare badarg: {error}");
+        assert_eq!(error, bare_badarg(), "the oracle's bare badarg");
     }
 }
 
@@ -490,35 +530,46 @@ fn the_utf_family_matches_the_generic_walk() {
     }
 }
 
-/// The float segment's prepared shapes: a `dynamic` width over a non-float value, and
+/// The float segment's prepared shapes: a `dynamic` width over a non-number value, and
 /// the zero-width field, both rejected identically on the two routes.
+///
+/// An *integer* value is **not** a malformed float segment: `erts_bs_put_float` converts
+/// any number, so `<<0:64/float>>` is `<<0,0,0,0,0,0,0,0>>` and `<<3:16/float>>` is
+/// `<<66,0>>` on the oracle too — the same answer `float_source` gives.
 #[test]
 fn the_float_family_matches_the_generic_walk() {
-    // A runtime width, over an integer value (not a float).
+    // A runtime width, over a value that is no number at all.
     {
         let module = case_module(&[]);
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
+        let value = atom(&module);
         let build = |machine: &mut Machine, ctx: &mut MinimalContext, module: &Module| {
             accumulator(machine, ctx, 64);
             set_small(machine, 1, 64);
-            seg(module, "float", 1, Operand::Integer(0), Operand::X(1))
+            seg(module, "float", 1, value.clone(), Operand::X(1))
         };
         let error = compare_err(&module, &mut machine, &mut ctx, build);
-        assert!(error.contains("badarg"), "a non-float float segment: {error}");
+        assert_eq!(error, bare_badarg(), "a non-number float segment");
     }
 
-    // A zero-width float field (`<<1.0:0/float>>` is a `badarg` on the oracle).
+    // A zero-width float field (`<<1.0:0/float>>` is a `badarg` on the oracle). A width
+    // that is not 16/32/64 is one of the shapes `prepare` declines, so it keeps the
+    // generic walk and reports the same bare `badarg`.
     {
         let module = case_module(&[]);
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        let build = |machine: &mut Machine, ctx: &mut MinimalContext, module: &Module| {
-            accumulator(machine, ctx, 64);
-            seg(module, "float", 1, Operand::Integer(0), Operand::Integer(0))
-        };
-        let error = compare_err(&module, &mut machine, &mut ctx, build);
-        assert!(error.contains("badarg"), "a zero-width float field: {error}");
+        let float = crate::terms::test_support::make_float(&mut ctx, 1.0).expect("a float");
+        machine.set_x(1, float).expect("x(1) in range");
+        let segments = seg(&module, "float", 1, Operand::X(1), Operand::Integer(0));
+        assert!(
+            prepared::prepare(&module, &segments).is_none(),
+            "a width outside 16/32/64 is declined"
+        );
+        let error = outcome(Route::Generic, &module, &mut machine, &mut ctx, &segments)
+            .expect_err("a zero-width float field fails");
+        assert_eq!(error, bare_badarg(), "a zero-width float field");
     }
 }
 
@@ -583,10 +634,7 @@ fn the_binary_family_matches_the_generic_walk() {
             seg(module, "binary", 1, value.clone(), all(module))
         };
         let error = compare_err(&module, &mut machine, &mut ctx, build);
-        assert!(
-            error.contains("badarg"),
-            "a non-bitstring binary segment: {error}"
-        );
+        assert_eq!(error, bare_badarg(), "a non-bitstring binary segment");
     }
 }
 
@@ -662,7 +710,7 @@ fn declined_shapes_stay_on_the_generic_walk() {
 fn a_byte_field_takes_the_direct_store() {
     let module = case_module(&[]);
 
-    // (a) Aligned: four byte fields, four direct stores, no fallback.
+    // (a) Aligned: five byte fields (8/8/16/32/64 bits), five direct stores, no fallback.
     {
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
@@ -686,21 +734,9 @@ fn a_byte_field_takes_the_direct_store() {
                 .all(|s| matches!(s, prepared::PreparedSeg::ByteInt { .. })),
             "every static whole-byte width resolves to the direct-store kind"
         );
+        assert_eq!(program.segments.len(), 5, "5 byte fields in the program");
         let before_stores = byte_field_stores();
         let before_fallbacks = byte_field_fallbacks();
-        let segments = {
-            let mut segments = seg(&module, "integer", 1, Operand::Integer(1), Operand::Integer(8));
-            for size in [8i64, 16, 32, 64] {
-                segments.extend(seg(
-                    &module,
-                    "integer",
-                    1,
-                    Operand::Integer(0x0102_0304),
-                    Operand::Integer(size),
-                ));
-            }
-            segments
-        };
         let built = prepared::assemble_prepared(
             &mut machine,
             &module,
@@ -711,7 +747,11 @@ fn a_byte_field_takes_the_direct_store() {
         )
         .expect("assemble")
         .expect("the build succeeds");
-        assert_eq!(byte_field_stores() - before_stores, 4, "one store per field");
+        assert_eq!(
+            byte_field_stores() - before_stores,
+            program.segments.len(),
+            "one store per field"
+        );
         assert_eq!(
             byte_field_fallbacks() - before_fallbacks,
             0,
@@ -759,6 +799,11 @@ fn a_byte_field_takes_the_direct_store() {
             1,
             "the unaligned field takes the bit-exact writers"
         );
+        assert_eq!(
+            built_bytes(built).1,
+            12,
+            "4 unaligned bits plus the byte field behind them"
+        );
     }
 }
 
@@ -772,14 +817,7 @@ fn a_declined_shape_stores_no_byte_field() {
     let mut ctx = MinimalContext::new();
 
     // A runtime width: resolved as `Integer { width: Dynamic }`, never `ByteInt`.
-    let mut segments = seg(&module, "integer", 1, Operand::Integer(0x12), Operand::X(1));
-    segments.extend(seg(
-        &module,
-        "integer",
-        1,
-        Operand::Integer(0x34),
-        Operand::Integer(8),
-    ));
+    let segments = seg(&module, "integer", 1, Operand::Integer(0x12), Operand::X(1));
     let program = prepared::prepare(&module, &segments).expect("a prepared program");
     assert!(
         matches!(
@@ -793,7 +831,7 @@ fn a_declined_shape_stores_no_byte_field() {
     );
     set_small(&mut machine, 1, 8);
     let before_stores = byte_field_stores();
-    prepared::assemble_prepared(
+    let built = prepared::assemble_prepared(
         &mut machine,
         &module,
         &LabelMap::default(),
@@ -807,6 +845,28 @@ fn a_declined_shape_stores_no_byte_field() {
         byte_field_stores(),
         before_stores,
         "a dynamic width is not a direct store"
+    );
+    assert_eq!(built_bytes(built), (vec![0x12], 8), "the field really is written");
+
+    // A program `prepare` declines outright (an unknown segment type) runs the
+    // unchanged generic walk, so it cannot enter the byte-field path either.
+    let mut declined = seg(&module, "integer", 1, Operand::Integer(0x56), Operand::Integer(8));
+    declined[0] = Operand::Atom(module.atom_table.lookup("nonsense").expect("the atom"));
+    assert!(
+        prepared::prepare(&module, &declined).is_none(),
+        "an unknown segment type is declined"
+    );
+    let before_stores = byte_field_stores();
+    let error = outcome(Route::Generic, &module, &mut machine, &mut ctx, &declined)
+        .expect_err("an unknown segment type is the generic walk's typed error");
+    assert_eq!(
+        byte_field_stores(),
+        before_stores,
+        "a declined program never reaches a byte field"
+    );
+    assert!(
+        error.contains("nonsense"),
+        "the generic walk's own typed error names the segment type: {error}"
     );
 }
 
@@ -825,7 +885,7 @@ fn a_declined_shape_stores_no_byte_field() {
 fn one_reservation_matches_the_per_field_capacity_checks() {
     /// One accumulator chain of `count` byte fields, run on its own machine, reported as
     /// `(bytes, nbits, in_place_grows, moves, bytes_copied)`.
-    fn chain(route: Route, capacity: usize, count: usize) -> (Vec<u8>, usize, u64, u64, u64) {
+    fn chain(route: Route, capacity: usize, count: usize) -> (Vec<u8>, usize, usize, usize, usize) {
         let module = case_module(&[]);
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
