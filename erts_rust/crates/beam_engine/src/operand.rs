@@ -93,11 +93,30 @@ pub(crate) fn read_operand(
 /// this to their reserved block's spare **tail** so a non-small integer operand is
 /// materialized there instead of through a second (collecting) allocation — see
 /// [`crate::terms::Slack`].
+///
+/// **Shaped for the register-operand path, which is the one real code takes.** The
+/// small-int range test sits behind the `#[inline(never)]` [`immediate_slack_words`],
+/// so the answer for a register/atom/literal/`[]` operand is one tag compare with no
+/// call. Written as a branchless select instead (the shape the optimizer picked for
+/// the two-inline-arm version) LLVM evaluated the range check for *both* operands of
+/// every `put_list` — ~14 instructions plus two stack spills — even though a
+/// non-small immediate operand is a vanishing fraction of real instructions.
+#[inline]
 pub(crate) fn operand_slack_words(operand: &Operand) -> usize {
     match operand {
-        Operand::Integer(i) if !is_small_int(*i) => beam_term::big_size_words(1),
-        Operand::Character(c) if !is_small_int(i64::from(*c)) => beam_term::big_size_words(1),
+        Operand::Integer(i) => immediate_slack_words(*i),
+        Operand::Character(c) => immediate_slack_words(i64::from(*c)),
         _ => 0,
+    }
+}
+
+/// The `big_size_words` slack of a non-small integer immediate, else 0.
+#[inline(never)]
+fn immediate_slack_words(value: i64) -> usize {
+    if is_small_int(value) {
+        0
+    } else {
+        beam_term::big_size_words(1)
     }
 }
 

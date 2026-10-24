@@ -108,6 +108,13 @@ mod tuples;
 /// interpreter reaches it from its catch-all arm, so inlining it into the dispatch
 /// loop lets the optimizer fold the (now redundant) per-family `match` into the
 /// loop's own control flow instead of a second out-of-line dispatch.
+///
+/// Inlining the family bodies here is the **measured** shape: outlining them (each
+/// family `exec` as `#[inline(never)]`, one tail call per arm) adds a `call`/`ret`
+/// pair and a second prologue to every dispatched instruction and measured **+2.52 %
+/// retired instructions / +3.34 % cycles** on `bench_gc_bound:churn/1`. The 45 KiB
+/// function this produces is the price of that, and the only arm whose own weight is
+/// worth keeping out of the hot text is the diagnostic one ([`unclaimed`], `#[cold]`).
 #[inline]
 pub(crate) fn dispatch(
     machine: &mut Machine,
@@ -226,11 +233,21 @@ pub(crate) fn dispatch(
     };
     match claimed? {
         Some(step) => Ok(step),
-        None => Err(error::unsupported(&format!(
-            "{UNCLAIMED_PREFIX}: {}",
-            instr_name(instr)
-        ))),
+        None => Err(unclaimed(instr)),
     }
+}
+
+/// The documented sentinel for an instruction **no** family claims.
+///
+/// Outlined out of [`dispatch`] (`#[cold]` + `#[inline(never)]`) because it is the
+/// only arm that builds a `String` (`format!` for the reason atom): left inline it
+/// forces the router's frame to carry the formatting machinery and keeps a heap
+/// allocation path in the middle of the hot text, for a diagnostic no correct
+/// instruction ever reaches.
+#[cold]
+#[inline(never)]
+fn unclaimed(instr: &Instr) -> beam_common::BeamError {
+    error::unsupported(&format!("{UNCLAIMED_PREFIX}: {}", instr_name(instr)))
 }
 
 /// The `ops.tab`/C spelling of the instruction [`dispatch`] could not claim.

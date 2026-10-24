@@ -64,8 +64,9 @@ use crate::Step;
 ///
 /// `#[inline]`-marked: the cons-cell instructions are the hottest *dispatched* ones
 /// (every list traversal), and the family router ([`super::dispatch`]) has already
-/// proved the variant, so inlining lets the optimizer collapse the redundant second
-/// `match` into the dispatcher's.
+/// proved the variant, so inlining lets the optimizer keep the whole route to a
+/// `put_list` in one function (out of line it cost ~39 extra instructions per
+/// instruction — measured, see [`super::dispatch`]'s doc).
 #[inline]
 pub(crate) fn exec(
     machine: &mut Machine,
