@@ -43,6 +43,7 @@ use beam_loader::{Atom, FunDescriptor, Function, ImportRef, Instr, Label, Module
 use beam_term::Eterm;
 
 use super::bridges::descriptor_of;
+use super::dispatch::DispatchHooks;
 use super::ir_cache::CalleeAdmission;
 use super::runtime_context::RuntimeContext;
 
@@ -692,7 +693,8 @@ pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, ari
 /// times in one `compile:file/2`.
 ///
 /// What is **not** memoized is anything runtime-mutable: the seam's `host_serves` refusal (its
-/// NIF arm flips on a mid-run `erlang:load_nif/2`), the callee's name lookup and the
+/// NIF arm flips on a mid-run `erlang:load_nif/2`; its registered-`beam_bifs` leg does ride the
+/// dispatch memo, which is NIF-free by construction), the callee's name lookup and the
 /// `prim_tty` exemption all stay per-call at
 /// [`ExecutionContext::resolve_external_call`](beam_engine::ExecutionContext::resolve_external_call).
 /// This predicate's own two inputs are the only pure ones in that chain.
@@ -742,7 +744,8 @@ pub(super) fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bo
 
 /// Whether the cross-module call seam must prefer `module`'s **own code** over the host fast path
 /// for a key that applies a caller-supplied fun, given whether this context can re-enter the
-/// scheduler ([`RuntimeContext::may_pump_scheduler`], passed as `can_pump`).
+/// scheduler ([`RuntimeContext::may_pump_scheduler`], passed as `can_pump`) and the key's memoized
+/// dispatch roster (whose [`DispatchHooks::fun_caller`] bit is the *class*).
 ///
 /// # The two facts
 ///
@@ -773,28 +776,26 @@ pub(super) fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bo
 /// When the context **can** pump — the `-eval` route, the boot drive, a nested run outside a
 /// slice — the host route's nested run suspends and resumes correctly, so the fast path stays
 /// exactly as it is. Only a context that cannot re-enter the scheduler needs the module's code.
+/// The test is first and short-circuits, so a pumping context never even reads the bit.
 ///
 /// # Idempotence (required by the baseline JIT)
 ///
 /// [`RuntimeContext::may_pump_scheduler`] is fixed when the context is constructed (only
-/// [`RuntimeContext::for_process`] — a scheduler slice — answers `false`), so this predicate
-/// answers the same for the whole lifetime of one context. The native baseline tier consults the
-/// seam **twice** for one `call_ext*` (a fast attempt, then the whole instruction), and two
-/// disagreeing answers would enter a callee in-machine after the first consultation had declined
-/// it.
+/// [`RuntimeContext::for_process`] — a scheduler slice — answers `false`), and the bit is a pure
+/// function of the key, so this predicate answers the same for the whole lifetime of one context.
+/// The native baseline tier consults the seam **twice** for one `call_ext*` (a fast attempt, then
+/// the whole instruction), and two disagreeing answers would enter a callee in-machine after the
+/// first consultation had declined it.
 ///
-/// # One source of truth for the class
+/// # One source of truth for the class, read once per key
 ///
 /// [`beam_bifs::needs_fun_caller`] is the registry's own roster
 /// ([`beam_bifs::FUN_CALLER_BIFS`], a `binary_search`), so this predicate cannot drift from it: a
 /// key that starts or stops applying a caller-supplied fun is a `beam_bifs` change and this
-/// predicate follows it.
+/// predicate follows it. The roster is evaluated by [`DispatchHooks::of`] — the memo's single
+/// predicate-evaluation site — and rides in the memoized roster as one bit, so the seam pays it
+/// once per `(module, function, arity)` rather than once per `call_ext*`.
 #[must_use]
-pub(crate) fn prefers_module_code_for_fun_apply(
-    can_pump: bool,
-    module: &str,
-    function: &str,
-    arity: u32,
-) -> bool {
-    !can_pump && beam_bifs::needs_fun_caller(module, function, arity)
+pub(crate) fn prefers_module_code_for_fun_apply(can_pump: bool, hooks: DispatchHooks) -> bool {
+    !can_pump && hooks.fun_caller()
 }

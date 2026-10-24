@@ -87,8 +87,12 @@
 //!   ([`dispatch`](super::dispatch)) keeps the NIF registry out of its own answer too. Caching
 //!   the seam's answer would let an in-machine entry survive a `load_nif`, entering a module
 //!   body whose functions are now NIF-implemented — a wrong result.
-//! * `host_serves` itself, in any form: its floor/registry half is keyed on the *call's* strings,
-//!   so hashing a key for it costs about what looking it up costs.
+//! * `host_serves` **as a whole**: its floor and NIF halves must stay per call (see above).
+//!   The one leg that *is* memoized is the registered-`beam_bifs` one — the expensive string
+//!   hash lookup — because it is already the `bif` field of the dispatch memo's answer, which
+//!   the seam reads for its other two inputs anyway. That memo is keyed on the complete
+//!   `(module, function, arity)` and never holds anything from the NIF registry, so it cannot
+//!   carry the mutable half.
 //! * [`CodeServer::module_handle`](crate::codeserver::CodeServer::module_handle)'s name lookup:
 //!   different key (`&str`), and it must observe a reload.
 //!

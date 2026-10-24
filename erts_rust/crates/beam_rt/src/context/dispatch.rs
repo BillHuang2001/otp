@@ -27,6 +27,14 @@
 //! context, and [`DispatchHooks`] carries the per-key roster so `call_registered` selects its
 //! arm from one value and then invokes the memoized implementation directly (no second
 //! registry lookup).
+//!
+//! The same memo is what the **external-call** seam
+//! ([`RuntimeContext::resolve_external_call`]) consults on every `call_ext*`: the memoized
+//! [`DispatchAnswer::bif`] *is* `BifRegistry::contains`, i.e. the registered-BIF leg of
+//! [`RuntimeContext::host_serves`], and [`DispatchHooks::fun_caller`] is the fun-applying
+//! verdict both of that seam's fun-apply branches need. So one memo lookup replaces a
+//! registry hash lookup **and** two `beam_bifs` `needs_fun_caller` `binary_search`es per
+//! external call.
 
 use beam_bifs::BifFn;
 use beam_engine::terms;
@@ -91,7 +99,8 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
     (hash.wrapping_mul(MIX) >> (64 - DISPATCH_MEMO_SLOTS.trailing_zeros() as u64)) as usize
 }
 
-/// The `beam_bifs` hook roster one `(module, function, arity)` key needs.
+/// The `beam_bifs` hook roster one `(module, function, arity)` key needs — plus the one
+/// verdict that is not a hook ([`Self::FUN_CALLER`]).
 ///
 /// One **bit** per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
 /// build gates (`fun_identity`, `memory_hook`) — so [`RuntimeContext::call_registered`] can
@@ -101,7 +110,10 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 ///
 /// [`DispatchHooks::of`] is the **only** place the predicates are evaluated, and it calls the
 /// same `uses_*` functions the arms are documented against, so the roster can never drift from
-/// what `beam_bifs` routes through each seam.
+/// what `beam_bifs` routes through each seam. That is also why the twelfth bit
+/// ([`Self::FUN_CALLER`]) belongs here rather than on its own: it is a `beam_bifs` roster
+/// question, paid once per memo miss, that **two** seam branches would otherwise re-ask per
+/// call.
 ///
 /// # Why one `u16` and not eleven `bool` fields
 ///
@@ -115,7 +127,8 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 /// so the whole answer crosses both call boundaries **in registers** and
 /// [`DispatchHooks::any`]'s fold (measured as `dispatch.rs:150`'s `self.dict`, 1.41 % of a
 /// `bench_gc_bound:churn/1` run: the first of the eleven reloads attributed to one line)
-/// collapses to one `test` of a register.
+/// collapses to one `test` of a register. The twelfth bit is free in that word — the mask is a
+/// `u16`, nine bits of headroom — so it changes neither the layout nor the calling convention.
 ///
 /// # What keeps the roster honest
 ///
@@ -123,9 +136,11 @@ pub(super) fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
 ///   **exhaustively**, so an arm added to (or removed from) the roster changes the array's
 ///   length and fails to compile rather than silently missing a bit.
 /// * [`DispatchHooks::ALL`] lists every named bit and
-///   [`DispatchHooks::ANY_MASK`] folds it; the `const` assertion right after this type proves
+///   [`DispatchHooks::ALL_MASK`] folds it; the `const` assertions right after this type prove
 ///   the bits are pairwise distinct and together fill the low `ALL.len()` bits, so no named bit
-///   can alias another's slot or leave a gap a future bit would fall into.
+///   can alias another's slot or leave a gap a future bit would fall into — and that
+///   [`Self::FUN_CALLER`] is the **top** of them, so [`DispatchHooks::ANY_MASK`] is exactly the
+///   eleven hook-arm bits.
 /// * [`DispatchHooks::any`] tests the whole `ANY_MASK`, so a bit set for an arm the selector no
 ///   longer names is still "any" — a new arm can never be silently inert.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -154,10 +169,27 @@ impl DispatchHooks {
     const FUN_IDENTITY: u16 = 1 << 9;
     /// [`RuntimeContext::uses_memory_hook`] — the `erlang:memory/0,1` build gate.
     const MEMORY_HOOK: u16 = 1 << 10;
+    /// [`RuntimeContext::uses_fun_caller`] — the **fun-applying verdict**: whether the key
+    /// applies a caller-supplied fun back into the runtime
+    /// ([`beam_bifs::needs_fun_caller`]).
+    ///
+    /// Unlike the eleven bits above, this one selects **no** bridge arm: the fun-caller bridge
+    /// is [`RuntimeContext::call_registered`]'s fallback arm, installed for every key no gated
+    /// arm claims, so a set bit here names nothing to install and is deliberately **outside**
+    /// [`Self::ANY_MASK`] (including it would route the 24 roster keys through the cold arm
+    /// chain for no gain).
+    ///
+    /// It is memoized because the **external-call** seam asks the same question twice per
+    /// `call_ext*` and used to answer it with a `beam_bifs` `binary_search` each time:
+    /// [`RuntimeContext::resolve_external_call`]'s fun-apply preference
+    /// (`apply::prefers_module_code_for_fun_apply`) and its collection-debt gate
+    /// (`execution::nests_a_fun_apply`). One memo lookup now serves both, plus the registry leg of
+    /// [`RuntimeContext::host_serves`] (the sibling `apply`/`execution` modules own both
+    /// branches).
+    const FUN_CALLER: u16 = 1 << 11;
 
-    /// **Every** named bit, in declaration order — the one list the exhaustive assertion below
-    /// and [`Self::ANY_MASK`] are derived from.
-    const ALL: [u16; 11] = [
+    /// **Every** named bit, in declaration order — the one list [`Self::ALL_MASK`] folds.
+    const ALL: [u16; 12] = [
         Self::DICT,
         Self::PROCESS_HOOK,
         Self::NIF_LOADER,
@@ -169,11 +201,12 @@ impl DispatchHooks {
         Self::RUNTIME_HOOKS,
         Self::FUN_IDENTITY,
         Self::MEMORY_HOOK,
+        Self::FUN_CALLER,
     ];
 
-    /// The fold of [`Self::ALL`]: the set of bits [`Self::any`] tests, built from every named
-    /// bit rather than written out as a literal.
-    const ANY_MASK: u16 = {
+    /// The fold of [`Self::ALL`]: every named bit, built from the list rather than written out
+    /// as a literal.
+    const ALL_MASK: u16 = {
         let mut mask = 0;
         let mut i = 0;
         while i < Self::ALL.len() {
@@ -183,13 +216,17 @@ impl DispatchHooks {
         mask
     };
 
+    /// The **hook-arm** bits [`Self::any`] tests: [`Self::ALL_MASK`] minus [`Self::FUN_CALLER`],
+    /// the one bit that is a verdict rather than an arm. See [`Self::FUN_CALLER`].
+    const ANY_MASK: u16 = Self::ALL_MASK & !Self::FUN_CALLER;
+
     /// The roster's bit when `on`, nothing otherwise — [`Self::of`]'s only setter.
     const fn bit(bit: u16, on: bool) -> u16 {
         if on { bit } else { 0 }
     }
 
-    /// Whether **any** hook is set — the one-bit test [`RuntimeContext::call_registered`] makes to
-    /// pick between its hook-free fast path and its full (cold) one.
+    /// Whether **any** *hook* is set — the one-bit test [`RuntimeContext::call_registered`] makes
+    /// to pick between its hook-free fast path and its full (cold) one.
     ///
     /// The roster is *the* arm selector, so "no hook set" is exactly the state in which
     /// `call_registered` has nothing left to install beyond the handles every call gets (the atom
@@ -201,7 +238,9 @@ impl DispatchHooks {
     ///
     /// One `test` of one register against [`Self::ANY_MASK`]; no short-circuit and no per-arm
     /// branch, and the mask is a fold over [`Self::ALL`] rather than a literal, so the test cannot
-    /// lose an arm.
+    /// lose an arm. [`Self::FUN_CALLER`] is excluded on purpose — it is a **verdict**, not an arm
+    /// (the fallback arm is installed either way), so counting it would route the 24 roster keys
+    /// through the cold chain for nothing.
     #[inline]
     pub(super) fn any(&self) -> bool {
         self.0 & Self::ANY_MASK != 0
@@ -273,6 +312,14 @@ impl DispatchHooks {
         self.0 & Self::MEMORY_HOOK != 0
     }
 
+    /// [`RuntimeContext::uses_fun_caller`] — whether the key applies a caller-supplied fun back
+    /// into the runtime. The verdict `apply::prefers_module_code_for_fun_apply` and
+    /// `execution::nests_a_fun_apply` both read (see [`Self::FUN_CALLER`]).
+    #[inline]
+    pub(super) const fn fun_caller(&self) -> bool {
+        self.0 & Self::FUN_CALLER != 0
+    }
+
     /// The predicates for `(module, function, arity)`, evaluated once.
     ///
     /// The roster array and its **exhaustive destructure** are the compile-time guard: adding or
@@ -291,8 +338,9 @@ impl DispatchHooks {
             RuntimeContext::uses_runtime_hooks(module, function, arity),
             RuntimeContext::uses_fun_identity(module, function, arity),
             RuntimeContext::uses_memory_hook(module, function, arity),
+            RuntimeContext::uses_fun_caller(module, function, arity),
         ];
-        let [dict, process_hook, nif_loader, record_source, export_gate, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook] =
+        let [dict, process_hook, nif_loader, record_source, export_gate, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook, fun_caller] =
             roster;
         DispatchHooks(
             Self::bit(Self::DICT, dict)
@@ -305,14 +353,18 @@ impl DispatchHooks {
                 | Self::bit(Self::PERSISTENT_TERM, persistent_term)
                 | Self::bit(Self::RUNTIME_HOOKS, runtime_hooks)
                 | Self::bit(Self::FUN_IDENTITY, fun_identity)
-                | Self::bit(Self::MEMORY_HOOK, memory_hook),
+                | Self::bit(Self::MEMORY_HOOK, memory_hook)
+                | Self::bit(Self::FUN_CALLER, fun_caller),
         )
     }
 }
 
 /// The roster's bits are pairwise distinct and together fill the low `ALL.len()` bits, so
-/// [`DispatchHooks::ANY_MASK`] covers every arm and a future bit cannot alias an existing one.
-const _: () = assert!(DispatchHooks::ANY_MASK == (1 << DispatchHooks::ALL.len() as u16) - 1);
+/// [`DispatchHooks::ALL_MASK`] covers every named bit and a future bit cannot alias an existing
+/// one; and the one non-arm bit is the **top** of them, which is what makes
+/// [`DispatchHooks::ANY_MASK`] exactly the eleven hook-arm bits.
+const _: () = assert!(DispatchHooks::ALL_MASK == (1 << DispatchHooks::ALL.len() as u16) - 1);
+const _: () = assert!(DispatchHooks::FUN_CALLER == 1 << (DispatchHooks::ALL.len() as u16 - 1));
 
 /// The cachable part of a dispatch answer for one `(module, function, arity)` key.
 ///
@@ -761,6 +813,26 @@ impl<'a> RuntimeContext<'a> {
     /// read that seam.
     pub(super) fn uses_memory_hook(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_memory_hook(module, function, arity)
+    }
+
+    /// Whether `(module, function, arity)` is one of the **fun-applying** stdlib fast paths —
+    /// the keys whose `beam_bifs` implementation applies a caller-supplied fun back into the
+    /// runtime through the [`FunCaller`](beam_bifs::FunCaller) seam.
+    ///
+    /// This one is **not** an arm selector (the fun-caller bridge is
+    /// [`Self::call_registered`]'s fallback arm, installed for every key no gated arm claims).
+    /// It is memoized because the *external-call* seam asks the question on **every** `call_ext*`
+    /// and used to answer it with a `beam_bifs` `binary_search` twice over: once as
+    /// `apply::prefers_module_code_for_fun_apply`'s "this key applies a fun" leg and once
+    /// through `execution::nests_a_fun_apply`. Both now read [`DispatchHooks::fun_caller`] from
+    /// the memoized roster, so the roster is paid once per memo miss instead of twice per call —
+    /// and both keep `beam_bifs` as the one source of truth.
+    ///
+    /// The set is [`beam_bifs::FUN_CALLER_BIFS`] — `beam_bifs`' own roster of the BIFs that read
+    /// the seam (the 18 `lists` + 4 `maps` + 2 `ets` keys a `beam_bifs` test pins equal to the
+    /// registering modules' own roster).
+    pub(super) fn uses_fun_caller(module: &str, function: &str, arity: u32) -> bool {
+        beam_bifs::needs_fun_caller(module, function, arity)
     }
 
     /// Whether `(module, function, arity)` is one of the BIFs that consult the

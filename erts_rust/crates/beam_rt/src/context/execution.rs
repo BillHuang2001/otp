@@ -43,6 +43,7 @@ use beam_loader::{Label, Module};
 use beam_term::{Atom, AtomTable, Eterm};
 
 use super::apply::{self, callee_admission, LocalFunTarget};
+use super::dispatch::DispatchHooks;
 use super::gc;
 use super::runtime_context::RuntimeContext;
 use super::send::SendDestination;
@@ -357,13 +358,18 @@ impl ExecutionContext for RuntimeContext<'_> {
         // [`Self::host_serves`] — the single source of truth the runner's process-entry arm
         // asks directly (see that method for why this seam's own `Ok(None)` cannot be reused
         // there: it is overloaded with the module-unresolvable/missing-export cases).
-        // A **fun-applying** host key is the one exception: its host implementation applies the
-        // caller's fun through a nested run that cannot suspend, so inside a slice the module's
+        // This seam asks the same union through its memoized half: one
+        // [`Self::dispatch`] lookup supplies **both** the registered-BIF leg
+        // (`answer.bif.is_some()` *is* [`BifRegistry::contains`]) and the fun-applying verdict
+        // the two branches below need (`answer.hooks.fun_caller()`), so a `call_ext*` pays one
+        // memo lookup instead of a registry hash lookup plus two `beam_bifs`
+        // `needs_fun_caller` `binary_search`es. The floor and NIF legs stay per call — the NIF
+        // registry is runtime-mutable, and the floor's key list is cheap and unmemoized.
         // A **fun-applying** host key is the one exception: its host implementation applies the
         // caller's fun through a nested run that cannot suspend, so inside a slice the module's
         // own code is entered instead and the apply suspends the process —
         // [`apply::prefers_module_code_for_fun_apply`] carries the reasoning and the class
-        // (`beam_bifs::needs_fun_caller`, the registry's own roster).
+        // (`beam_bifs::needs_fun_caller`, the registry's own roster, read as one memoized bit).
         //
         // # The one exception: the fun-applying stdlib fast paths under collection debt
         //
@@ -406,23 +412,27 @@ impl ExecutionContext for RuntimeContext<'_> {
         // The native baseline tier consults this seam **twice** for one `call_ext*`
         // ([`jit::baseline`]'s `jit_ext_call`, then `jit_step_one`, see the guard below), so a
         // gate that answers differently on the two consultations would enter a callee the first
-        // refused. The debt bit cannot move between them: the two consultations are back-to-back
-        // inside one instruction step, and **nothing executes in between** — no Erlang code, no
-        // BIF, no allocation, hence no `Process::grow_nursery` (which is the only setter) and no
-        // collection (which is the only clearer). The bit is a function of the heap state the
-        // instruction was fetched under, so it is a constant for the instruction's duration.
+        // refused. Both halves of the predicate are constants for the instruction's duration:
+        //
+        // * the **memoized** bit is a pure function of the key (neither the rosters it is
+        //   evaluated over nor the boot-time-built registry can change), so a hit and a miss
+        //   answer the same and the second consultation can only ever be a hotter version of
+        //   the first; and
+        // * the **debt** bit cannot move between them either: the two consultations are
+        //   back-to-back inside one instruction step, and **nothing executes in between** — no
+        //   Erlang code, no BIF, no allocation, hence no `Process::grow_nursery` (which is the
+        //   only setter) and no collection (which is the only clearer). The bit is a function of
+        //   the heap state the instruction was fetched under, so it is a constant for the
+        //   instruction's duration.
         //
         // [`Process::grow_nursery`]: beam_process::Process::grow_nursery
         // [`Process::collection_debt`]: beam_process::Process::collection_debt
         // [`jit::baseline`]: beam_engine
-        if self.host_serves(module, function, arity)
-            && !apply::prefers_module_code_for_fun_apply(
-                self.may_pump_scheduler(),
-                module,
-                function,
-                arity,
-            )
-            && !(nests_a_fun_apply(module, function, arity)
+        // [`BifRegistry::contains`]: beam_bifs::BifRegistry::contains
+        let answer = self.dispatch(module, function, arity);
+        if self.host_serves_given(module, function, arity, answer.bif.is_some())
+            && !apply::prefers_module_code_for_fun_apply(self.may_pump_scheduler(), answer.hooks)
+            && !(nests_a_fun_apply(module, answer.hooks)
                 && self.calling_process_has_collection_debt())
         {
             return Ok(None);
@@ -1131,10 +1141,46 @@ impl RuntimeContext<'_> {
     ///
     /// The debug trace rides here so the condition is written once; it is a diagnostic only
     /// (`BEAM_RT_BOOT_TRACE`), and it fires for whichever site asks.
+    ///
+    /// The registered-`beam_bifs` leg ([`BifRegistry::contains`]) is the expensive one — a
+    /// string-keyed hash lookup per call — so a caller that already holds it can hand it in
+    /// through [`Self::host_serves_given`] instead.
+    ///
+    /// [`BifRegistry::contains`]: beam_bifs::BifRegistry::contains
     pub(crate) fn host_serves(&self, module: &str, function: &str, arity: u32) -> bool {
+        self.host_serves_given(
+            module,
+            function,
+            arity,
+            self.runtime.registry.contains(module, function, arity),
+        )
+    }
+    /// [`Self::host_serves`] with the registered-`beam_bifs` leg supplied by the caller.
+    ///
+    /// `registered` is the caller's [`BifRegistry::contains`] answer — memoized by
+    /// [`Self::dispatch`] as its `bif` field, which *is* that predicate (a `Some` `bif` is a
+    /// registry hit), so the external-call seam pays one memo lookup instead of a second
+    /// string-keyed hash lookup per `call_ext*`.
+    ///
+    /// The other two legs stay **per call** on purpose: the runtime-native floor's key list is
+    /// cheap and unmemoized, and [`Runtime::nifs`](crate::Runtime) is genuinely mutable
+    /// (`erlang:load_nif/2` installs a library mid-run), so its liveness must never be folded
+    /// into a cache.
+    ///
+    /// Keeping the union written once is why this exists: both sites trace through the same
+    /// place, so the diagnostic and the three legs cannot drift apart.
+    ///
+    /// [`BifRegistry::contains`]: beam_bifs::BifRegistry::contains
+    pub(crate) fn host_serves_given(
+        &self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        registered: bool,
+    ) -> bool {
         let served = crate::native::floor_shadows(module, function, arity)
             || self.runtime.nifs.borrow().is_loaded(module)
-            || self.runtime.registry.contains(module, function, arity);
+            || registered;
         if served && crate::debug_trace::enabled() {
             crate::debug_trace::trace(format_args!(
                 "host-served [{:?}] {module}:{function}/{arity}",
@@ -1195,7 +1241,12 @@ impl RuntimeContext<'_> {
 /// own allocation-free (binary-search) answer to "does this key read the `FunCaller` seam",
 /// backed by [`beam_bifs::FUN_CALLER_BIFS`] — the 18 `lists` + 4 `maps` + 2 `ets` keys that a
 /// `beam_bifs` test pins equal to the registering modules' roster, so this predicate cannot
-/// drift away from the implementations that actually nest.
+/// drift away from the implementations that actually nest. It reaches this function as
+/// [`DispatchHooks::fun_caller`], the memo's already-evaluated copy of that same predicate
+/// ([`RuntimeContext::uses_fun_caller`] is the one evaluator), so the seam pays the search once
+/// per `(module, function, arity)` instead of once per `call_ext*` — and this is the **second**
+/// of the seam's two consultations of it, the other being
+/// [`apply::prefers_module_code_for_fun_apply`].
 ///
 /// Only `lists` and `maps` are gated, deliberately:
 ///
@@ -1207,6 +1258,6 @@ impl RuntimeContext<'_> {
 ///   would relocate the nesting rather than remove it, while replacing the adopted
 ///   implementation (whose per-interior object ordering is pinned against the oracle) for no
 ///   gain.
-fn nests_a_fun_apply(module: &str, function: &str, arity: u32) -> bool {
-    matches!(module, "lists" | "maps") && beam_bifs::needs_fun_caller(module, function, arity)
+fn nests_a_fun_apply(module: &str, hooks: DispatchHooks) -> bool {
+    matches!(module, "lists" | "maps") && hooks.fun_caller()
 }

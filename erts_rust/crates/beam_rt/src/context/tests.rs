@@ -619,6 +619,7 @@ const DISPATCH_PROBE_KEYS: &[(&str, &str, u32)] = &[
     ("erlang", "term_to_binary", 1),
     ("erlang", "memory", 0),
     ("lists", "reverse", 1),
+    ("lists", "flatmap", 2),
     ("ets", "new", 2),
     ("erlang", "nope", 0),
     ("nosuchmod", "nope", 3),
@@ -744,6 +745,15 @@ fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
             hooks.memory_hook(),
             beam_bifs::needs_memory_hook(module, function, arity),
             "{module}:{function}/{arity} memory-hook gate"
+        );
+        // The fun-caller bit is a *verdict*, not an arm (`ANY_MASK` excludes it), but it rides
+        // in the same roster and the external-call seam reads it from a memo hit, so a
+        // mis-mapped bit would route a key's apply down the wrong path rather than merely
+        // slow it down.
+        assert_eq!(
+            hooks.fun_caller(),
+            beam_bifs::needs_fun_caller(module, function, arity),
+            "{module}:{function}/{arity} fun-caller verdict"
         );
         any_claimed |= hooks != DispatchHooks::default();
         any_unclaimed |= hooks == DispatchHooks::default();
@@ -9401,26 +9411,32 @@ fn each_callee_gets_its_own_slot() {
 /// **The predicate's own answers**: `true` only for a fun-applying key of a context that cannot
 /// re-enter the scheduler, so a non-fun-taking fast path (`lists:reverse/1`) and a name
 /// `beam_bifs` does not register both keep the host implementation.
+///
+/// The roster leg is the memo's own bit ([`DispatchHooks::of`]), which is where the seam reads
+/// it from — the predicate no longer takes the key's strings, so it cannot re-run the search.
 #[test]
 fn the_fun_applying_predicate_needs_both_a_fun_key_and_a_slice() {
     assert!(
-        prefers_module_code_for_fun_apply(false, "lists", "flatmap", 2),
+        prefers_module_code_for_fun_apply(false, DispatchHooks::of("lists", "flatmap", 2)),
         "`lists:flatmap/2` applies a caller-supplied fun, so a slice enters the module"
     );
     assert!(
-        !prefers_module_code_for_fun_apply(true, "lists", "flatmap", 2),
+        !prefers_module_code_for_fun_apply(true, DispatchHooks::of("lists", "flatmap", 2)),
         "a pumping context keeps the host fast path (its nested run suspends correctly)"
     );
     assert!(
-        !prefers_module_code_for_fun_apply(false, "lists", "reverse", 1),
+        !prefers_module_code_for_fun_apply(false, DispatchHooks::of("lists", "reverse", 1)),
         "a fast path that takes no fun is never displaced"
     );
     assert!(
-        !prefers_module_code_for_fun_apply(false, "maps", "get", 3),
+        !prefers_module_code_for_fun_apply(false, DispatchHooks::of("maps", "get", 3)),
         "an ordinary registry key is never displaced"
     );
     assert!(
-        !prefers_module_code_for_fun_apply(false, "no_such_module", "no_such_function", 7),
+        !prefers_module_code_for_fun_apply(
+            false,
+            DispatchHooks::of("no_such_module", "no_such_function", 7)
+        ),
         "a name `beam_bifs` does not register is never displaced"
     );
 }
@@ -9442,16 +9458,135 @@ fn every_fun_applying_registry_key_is_displaced_inside_a_slice() {
             "{module}:{function}/{arity} is a row of the roster"
         );
         assert!(
-            prefers_module_code_for_fun_apply(false, module, function, arity),
+            prefers_module_code_for_fun_apply(
+                false,
+                DispatchHooks::of(module, function, arity)
+            ),
             "{module}:{function}/{arity} must be entered as the module's own code inside a slice"
         );
         assert!(
-            !prefers_module_code_for_fun_apply(true, module, function, arity),
+            !prefers_module_code_for_fun_apply(
+                true,
+                DispatchHooks::of(module, function, arity)
+            ),
             "{module}:{function}/{arity} must keep the host fast path when the context can pump"
         );
     }
 }
-
+/// **The memoized fun-caller verdict is the `beam_bifs` roster — on a miss and on a hit.**
+///
+/// The external-call seam no longer searches [`beam_bifs::FUN_CALLER_BIFS`] per `call_ext*`: it
+/// reads [`DispatchHooks::fun_caller`] out of the dispatch memo
+/// ([`RuntimeContext::dispatch`]), which is where [`RuntimeContext::uses_fun_caller`] evaluates
+/// the roster. That substitution is only sound while the bit equals the registry's own answer
+/// for **every** key and while a **hit** is indistinguishable from a **miss**, so this pins all
+/// three of:
+///
+/// * every row of the roster answers `true`, and non-member keys answer `false` — a `lists`/
+///   `maps` fast path that takes no fun, an `ets` insert (the roster holds only the two folds),
+///   a plain `erlang:` BIF and a module no registry owns;
+/// * the immediate **hit** that follows a **cold miss** answers the miss's whole answer, not
+///   just the bit; and
+/// * a memo hit after an **intervening unrelated key** answers the same — both when the
+///   intervening key only displaces the one-entry MRU hint (a different slot) and when it
+///   **evicts** the key's own slot (a same-slot collision, so the answer is recomputed).
+///
+/// It is the anti-drift guard for the change that removed the per-call search: `beam_bifs`
+/// stays the one source of truth, and `beam_rt` cannot quietly answer a stale or mis-mapped bit.
+#[test]
+fn the_memoized_fun_caller_verdict_equals_the_roster_on_a_miss_and_on_a_hit() {
+    /// Keys the roster deliberately does **not** hold — the negative half of the guard.
+    const NON_MEMBERS: &[(&str, &str, u32)] = &[
+        ("erlang", "rem", 2),
+        ("ets", "insert", 2),
+        ("lists", "reverse", 1),
+        ("maps", "get", 3),
+        ("no_such_module", "no_such_function", 7),
+    ];
+    assert!(
+        !beam_bifs::FUN_CALLER_BIFS.is_empty(),
+        "the roster is the class the seam keys on"
+    );
+    let mut keys: Vec<(&str, &str, u32)> = beam_bifs::FUN_CALLER_BIFS.to_vec();
+    keys.extend_from_slice(NON_MEMBERS);
+    // Partner keys for the two intervening states, minted here rather than borrowed from the
+    // probe set so a same-slot partner for **every** key can be found. The pool is sized (and
+    // asserted) to cover every memo slot, otherwise the eviction half of the guard would be
+    // vacuous for the slots it misses.
+    let partners: Vec<(String, String, u32)> = (0..4096u32)
+        .map(|i| ("erlang".to_owned(), format!("memo_probe_{i}"), i % 9))
+        .collect();
+    let mut covered = [false; DISPATCH_MEMO_SLOTS];
+    for (m, f, a) in &partners {
+        covered[dispatch_slot(m, f, *a)] = true;
+    }
+    assert!(
+        covered.iter().all(|hit| *hit),
+        "the partner pool must reach every one of the {DISPATCH_MEMO_SLOTS} memo slots"
+    );
+    let mut rt = runtime();
+    let mut ctx = RuntimeContext::new(&mut rt);
+    for &(module, function, arity) in &keys {
+        let expected = beam_bifs::needs_fun_caller(module, function, arity);
+        assert_eq!(
+            expected,
+            beam_bifs::FUN_CALLER_BIFS.contains(&(module, function, arity)),
+            "{module}:{function}/{arity} — a roster row must be exactly a `needs_fun_caller` key"
+        );
+        // A cold miss evaluates the roster; the very next call is a hit and must answer the same
+        // whole answer (a mis-mapped bit would be a wrong seam, not just a slow one).
+        let miss = ctx.dispatch(module, function, arity);
+        assert_eq!(
+            miss.hooks.fun_caller(),
+            expected,
+            "{module}:{function}/{arity} fun-caller bit on the memo miss"
+        );
+        let hit = ctx.dispatch(module, function, arity);
+        assert_eq!(
+            shape((hit.bif, hit.hooks)),
+            shape((miss.bif, miss.hooks)),
+            "{module}:{function}/{arity} — a memo hit must equal the miss it follows"
+        );
+        // Intervening keys: one that leaves the key's own slot alone (only the MRU hint moves)
+        // and one that evicts it (same slot, different key), so both memo states are covered.
+        let slot = dispatch_slot(module, function, arity);
+        let other = partners
+            .iter()
+            .find(|(m, f, a)| dispatch_slot(m, f, *a) != slot)
+            .expect("a different slot exists");
+        let same = partners
+            .iter()
+            .find(|(m, f, a)| dispatch_slot(m, f, *a) == slot)
+            .expect("a same-slot partner exists");
+        ctx.dispatch(&other.0, &other.1, other.2);
+        assert_eq!(
+            ctx.dispatch_memo.slots[slot]
+                .as_ref()
+                .map(|entry| entry.function.as_str()),
+            Some(function),
+            "an unrelated key must leave {module}:{function}/{arity}'s entry in its slot"
+        );
+        assert_eq!(
+            ctx.dispatch(module, function, arity).hooks.fun_caller(),
+            expected,
+            "{module}:{function}/{arity} fun-caller bit on an MRU-displaced hit"
+        );
+        ctx.dispatch(&same.0, &same.1, same.2);
+        assert_eq!(
+            ctx.dispatch_memo.slots[slot]
+                .as_ref()
+                .map(|entry| entry.function.as_str()),
+            Some(same.1.as_str()),
+            "a same-slot key must evict {module}:{function}/{arity}'s entry"
+        );
+        let recomputed = ctx.dispatch(module, function, arity);
+        assert_eq!(
+            shape((recomputed.bif, recomputed.hooks)),
+            shape((miss.bif, miss.hooks)),
+            "{module}:{function}/{arity} — a recomputed answer must equal the cold miss"
+        );
+    }
+}
 /// **The seam's routing, on both context kinds.** Inside a slice ([`RuntimeContext::for_process`],
 /// `may_pump_scheduler() == false`) a fun-applying key resolves to the callee's real export label,
 /// so the engine enters `lists.beam` in the caller's machine; outside one
