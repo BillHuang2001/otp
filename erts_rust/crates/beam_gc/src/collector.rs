@@ -528,16 +528,19 @@ impl Collector {
     /// larger than the nursery could never be met by collecting alone. The
     /// returned [`Collection`] is the one it ran.
     ///
-    /// Afterwards `young().available_words() >= need_words`. If
-    /// [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth table's ceiling) makes
-    /// the request unreachable, the typed heap-exhaustion
-    /// [`BeamError`](beam_common::BeamError) is returned instead — the collector is left
+    /// Afterwards `young().available_words() >= need_words` — unless the remaining
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) budget cannot reach the request, in which
+    /// case the nursery is grown by the largest space that budget still affords (a **partial**
+    /// grant; the growth seam's ceiling arm). A request the growth table's own ceiling cannot
+    /// reach — or one the remaining budget cannot enlarge the space for — is the typed
+    /// heap-exhaustion [`BeamError`](beam_common::BeamError) instead: the collector is left
     /// consistent (never a half-forwarded heap) and, for a request the growth table itself
     /// cannot reach, untouched. The work is bounded, so this never loops forever.
     ///
     /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
     /// capacity, which is what the explicit [`grow_nursery`](Self::grow_nursery) step enforces:
-    /// a request the remaining budget cannot reach is refused there. That refusal comes *after*
+    /// a request the remaining budget cannot reach is granted only as far as that budget goes
+    /// (and refused when it can buy no larger space at all). That answer comes *after*
     /// the collection — deliberately, because the collection collapses the chain and therefore
     /// gives the budget back, so pre-checking the chain before collecting would refuse requests
     /// a collection makes reachable. Only the growth table's own ceiling (the single-space
@@ -567,8 +570,11 @@ impl Collector {
     /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
     /// collection evacuates them all). When the current space already has room this is a
     /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
-    /// cannot reach the request, the typed heap-exhaustion
+    /// cannot enlarge the space, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    /// A request the remaining budget covers only **partly** is not a refusal: the fresh space
+    /// is the largest one that budget affords (strictly larger than the space it retires), and
+    /// the caller's own refusal → grow → retry loop finishes the allocation.
     ///
     /// The ceiling bounds the chain's **summed** capacity ([`heap_size_words`](Self::heap_size_words)),
     /// not each individual space, so the fresh space may only claim the budget the chain has left

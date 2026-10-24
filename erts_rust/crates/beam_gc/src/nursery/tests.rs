@@ -641,6 +641,13 @@ fn a_chain_the_growth_seam_builds_keeps_the_index_and_the_aggregate_exact() {
 /// was given (room asked, room granted — the fresh space is sized from occupancy plus request,
 /// `erl_gc.c:1503-1509`), and the loop must end in the typed heap exhaustion — the budget, not
 /// an allocation accident — with the nursery byte-for-byte untouched by the refused call.
+///
+/// Every request here is the current space's **own remaining room plus one** (a few words), so it
+/// is always far below the budget that remains and the ceiling arms below are the *grantable* and
+/// the *nothing-left* ones. The third arm — a request the budget covers only **partly**, which is
+/// granted as the largest space the budget affords — is pinned on exact figures in
+/// `tests/growth_request_is_room.rs`
+/// (`a_ceiling_that_cannot_reach_the_request_still_grows_by_what_it_affords`).
 #[test]
 fn growth_stops_at_the_summed_capacity_ceiling() {
     let policy = budgeted();

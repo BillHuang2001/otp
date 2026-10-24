@@ -71,10 +71,12 @@
 //!    of events at a fixed live set, and every event is granted. This is the residual the module
 //!    doc states: the figure tracks the interval's allocation, not a live set.
 //! 5. **A refused growth changes nothing.** The two legitimate grounds — the growth table's
-//!    ceiling and a [`HeapPolicy::max_heap_words`] budget — leave
-//!    [`HeapObservable::heap_size_words`], the current space's base, the chain length and the
-//!    collection debt **exactly** as they were, so the caller can collect and retry; and the
-//!    refusal is `O(1)`-ish, so a long loop of refused growths stays fast.
+//!    ceiling and a [`HeapPolicy::max_heap_words`] budget that can no longer make the space any
+//!    larger; a budget that *can* still enlarge it is a partial grant, pinned in
+//!    `tests/growth_request_is_room.rs` — leave [`HeapObservable::heap_size_words`], the current
+//!    space's base, the chain length and the collection debt **exactly** as they were, so the
+//!    caller can collect and retry; and the refusal is `O(1)`-ish, so a long loop of refused
+//!    growths stays fast.
 //! 6. **A collection still collapses the chain onto its live-set target** (the green control) —
 //!    after [`AnyCollector::collect`] / [`AnyCollector::collect_minor`] the chain is exactly one
 //!    space ([`AnyCollector::young_space_count`] == 1), its capacity is what
@@ -556,8 +558,9 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
 // 4. A refused growth is inert, and cheap
 // ---------------------------------------------------------------------------
 
-/// The seam's two legitimate refusals — a [`HeapPolicy::max_heap_words`] budget that cannot reach
-/// the request, and the growth table's own ceiling — and the state a refusal leaves behind.
+/// The seam's two legitimate refusals — a [`HeapPolicy::max_heap_words`] budget that can no
+/// longer make the space any larger, and the growth table's own ceiling — and the state a refusal
+/// leaves behind.
 ///
 /// * **(i) strict progress** — every granted growth installs a space strictly larger than the one
 ///   it retires (and the chain gains exactly one space);

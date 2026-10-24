@@ -476,8 +476,10 @@ impl GenImmixCollector {
     /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
     /// collection evacuates them all). When the current space already has room this is a
     /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
-    /// cannot reach the request, the typed heap-exhaustion
+    /// cannot enlarge the space, the typed heap-exhaustion
     /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    /// A request the remaining budget covers only **partly** is granted as the largest space
+    /// that budget affords — a partial grant, not a refusal.
     ///
     /// The ceiling bounds the chain's **summed** capacity ([`heap_size_words`](Self::heap_size_words)),
     /// not each individual space, so the fresh space may only claim the budget the chain has left

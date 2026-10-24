@@ -348,9 +348,10 @@ impl AnyCollector {
     /// It is safe for a caller that holds no root set: the space it replaces is retained (the
     /// nursery becomes a chain of spaces), so every live word stays addressable at its original
     /// address. When the policy's [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth
-    /// table's ceiling) cannot reach the request the typed heap-exhaustion error is returned
-    /// instead. This is strategy-agnostic — the caller does not need to know which mature
-    /// generation is in use.
+    /// table's ceiling) cannot enlarge the space the typed heap-exhaustion error is returned
+    /// instead; a request the remaining budget covers only **partly** is granted as the largest
+    /// space that budget affords (a partial grant, never a refusal). This is strategy-agnostic —
+    /// the caller does not need to know which mature generation is in use.
     ///
     /// [`max_heap_words`](HeapPolicy::max_heap_words) bounds the nursery chain's **summed**
     /// capacity ([`heap_size_words`](Self::heap_size_words)), not each individual space, so the

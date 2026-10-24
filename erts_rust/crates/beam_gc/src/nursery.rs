@@ -57,8 +57,9 @@
 //! * **The chain's *summed* capacity obeys the ceiling.** [`capacity_words`](Nursery::capacity_words)
 //!   is what `HeapPolicy::max_heap_words` bounds — a fresh space may only claim the budget the
 //!   chain has left, so `capacity_words() <= max_heap_words` after every successful growth. A
-//!   request the remaining budget cannot reach is the typed heap exhaustion, returned before
-//!   anything is allocated or retired.
+//!   request the remaining budget cannot reach is granted as the largest space that budget still
+//!   affords (a partial, strictly larger space); only a budget that cannot enlarge the space at
+//!   all is the typed heap exhaustion, returned before anything is allocated or retired.
 //! * **A provably empty retired space is re-adopted, not replaced.** A space a growth retired
 //!   without ever handing out a word can serve a later request itself: the swap allocates
 //!   nothing and consumes none of the chain's capacity budget, which is the second reason the
@@ -338,9 +339,14 @@ impl Nursery {
     ///    grants a genuinely large request its own `one_step` size. Every size is bounded by
     ///    [`min_heap_words`](HeapPolicy::min_heap_words) through
     ///    [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
-    /// 4. **Refuse at the ceiling.** A [`max_heap_words`](HeapPolicy::max_heap_words) (or
-    ///    growth-table) ceiling that cannot reach the request — or that can reach it only by
-    ///    installing a space no larger than the current one — yields the typed
+    /// 4. **Spend what the ceiling still affords, then refuse.** A
+    ///    [`max_heap_words`](HeapPolicy::max_heap_words) ceiling caps the fresh space at the
+    ///    budget the chain has left. A budget that still buys a space **strictly larger** than
+    ///    the current one grants the growth at exactly that size — a *partial* grant (it may not
+    ///    cover `need_words`) rather than a refusal, because a sound, strictly larger space is
+    ///    worth more than no space at all and the caller's own refusal → grow → retry loop is
+    ///    what finishes the copy. Only a budget that cannot make **any** strict progress — or
+    ///    the growth table's own ceiling — yields the typed
     ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched:
     ///    the current space is not replaced and nothing is retired.
     ///
@@ -359,14 +365,14 @@ impl Nursery {
     ///
     /// [`capacity_words`](Nursery::capacity_words) is the chain's size, so that is what
     /// `max_heap_words` bounds: the fresh space of step 3 may only claim the **budget the chain
-    /// has left** (`max_heap_words - capacity_words()`), and once that budget cannot reach the
-    /// capacity the request needs (occupancy plus `need_words`, `want` below) the request is
-    /// refused for good — an allocate-and-abandon loop can no longer
-    /// append one ceiling-sized space per call. After every successful growth
-    /// `capacity_words() <= max_heap_words` whenever the ceiling is non-zero. A ceiling that *can*
-    /// cover the request but forbids a larger step installs the largest space it allows, which is
-    /// the only size left to it — and when that is no larger than the space it would replace the
-    /// growth is refused rather than installing a same-size space (a growth always makes room).
+    /// has left** (`max_heap_words - capacity_words()`), so after every successful growth
+    /// `capacity_words() <= max_heap_words` whenever the ceiling is non-zero. A ceiling that *is*
+    /// reached by the request installs the request at its full size; one that is **not** installs
+    /// the largest space the budget still affords, so long as that is genuinely larger than the
+    /// space it replaces (a partial grant — the request itself stays unsatisfied and the caller
+    /// grows or collects again). A budget that cannot enlarge the space at all is the typed
+    /// refusal, decided before anything is allocated: a growth always makes room, and an
+    /// allocate-and-abandon loop therefore cannot append one ceiling-sized space per call.
     /// `max_heap_words == 0` is "no upper bound", the crate's encoding
     /// for unbounded growth, and leaves the size of step 3 alone.
     ///
@@ -455,15 +461,18 @@ impl Nursery {
             return Err(heap_exhausted(need_words));
         }
         // The ceiling bounds the chain's **summed** capacity, so the fresh space may only claim
-        // the budget the chain has left. Refuse — before allocating or retiring anything —
-        // when that budget cannot reach a space that satisfies the request, or when it would
-        // leave the fresh space no larger than the one it replaces.
+        // the budget the chain has left — the clamp is applied whatever the budget is, because a
+        // budget short of `want` is not a refusal: the fresh space installs the largest size the
+        // ceiling can still afford, and only a budget that leaves **no** strict progress is the
+        // typed refusal. Refusing a partial growth instead would trade a sound, strictly larger
+        // space for no space at all, and the caller's own refusal → grow → retry loop is what
+        // finishes the copy (a `beam_rt` copy-out requests headroom, then the bare shortfall).
         if policy.max_heap_words != 0 {
             let budget = policy.max_heap_words.saturating_sub(self.capacity_words());
-            if budget < want {
-                return Err(heap_exhausted(need_words));
-            }
             target = target.min(budget);
+            // Nothing to install: a space no larger than the one it would replace is not a growth
+            // (it would strand a whole capacity on the chain while granting no room). Decided
+            // here, before anything is allocated or retired.
             if target <= capacity {
                 return Err(heap_exhausted(need_words));
             }
