@@ -1176,17 +1176,92 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> std::result::Result<Option<Step>, Box<BeamError>> {
-        // Phase 0 — every local call: consume a **pending** invalidation armed by the
-        // BIF-dispatch funnel (`erlang:load_nif/2` installs the NIF a module's unexported
-        // `*_nif` stub needs, so every memoized verdict must be re-asked). This is where
-        // the tables are cleared because the funnel is `&self` by design and this seam is
-        // `&mut self`; one cell read, and the store only happens on a `load_nif` run.
-        if self.local_call_invalidation_pending.get() {
-            self.invalidate_local_call_verdicts();
+        // Phases 0 and 1 — every local call: the memoized "enter in this machine" answer,
+        // which is where a declined callee (every ordinary local call) leaves this
+        // function. Inline, because it is one flag read plus one bounds-checked slot load
+        // and one range compare; everything else is out of line in
+        // [`Machine::local_call_seam_slow`], so the seam's entry is small enough to inline
+        // into the three interpreter arms and the two native-tier helpers alike.
+        if self.local_call_enters_in_machine(callee) {
+            return Ok(None);
         }
-        // Phase 1 — every local call: the table's answer for this callee, which is a
-        // **byte** (no borrow of `self` survives it, so the host consultation below can
-        // hold `&mut self` for its own bookkeeping afterwards).
+        self.local_call_seam_slow(
+            entry_module,
+            module,
+            callee,
+            nregs,
+            frame,
+            func,
+            pc,
+            ctx,
+        )
+    }
+    /// The local-call seam's **`Ok(None)` fast path**: does the executing context's table
+    /// answer "enter this callee in this machine" for `callee`?
+    ///
+    /// `true` means the seam's whole answer is `Ok(None)` — the caller's unchanged
+    /// in-machine jump, nothing mutated — so a caller may **skip the seam entirely** when
+    /// this answers `true`. That is what the native baseline tier does
+    /// ([`probe_local_call`](crate::jit)) and what [`Machine::local_call_seam`] itself does
+    /// as its first phase, so there is **one** definition of the decline decision, not two.
+    ///
+    /// It is deliberately not a *shortcut* around the seam: it performs Phase 0 too (a
+    /// **pending** invalidation armed by the BIF-dispatch funnel is consumed here, exactly
+    /// as the seam consumes it), so a caller that skips the seam on `true` can never
+    /// observe a stale verdict — the `erlang:load_nif/2` stub route keeps working through
+    /// the fast path. The clear itself is out of line: it runs once per `load_nif`, never
+    /// per call.
+    ///
+    /// Cost: one `Cell` flag read, then one bounds-checked slot load and one range compare
+    /// from the executing context's table — no host call, no allocation, no borrow of
+    /// `self` outliving it.
+    #[inline(always)]
+    pub(crate) fn local_call_enters_in_machine(&mut self, callee: u32) -> bool {
+        if self.local_call_invalidation_pending.get() {
+            self.consume_pending_local_call_invalidation();
+        }
+        match self.verdict_table() {
+            Some(table) => table.enters_in_machine(callee),
+            // No table (only a machine stepped outside a run entry): nothing is memoized,
+            // so the seam must ask the host.
+            None => false,
+        }
+    }
+    /// Clear every context's verdicts for a **pending** invalidation.
+    ///
+    /// Out of line (and never on the hot path): it is reached only from the first local
+    /// call after `erlang:load_nif/2` (or after a host called
+    /// [`Machine::invalidate_local_call_verdicts`] itself, which clears the flag) — one
+    /// sequential walk of one byte per function per context.
+    #[cold]
+    #[inline(never)]
+    fn consume_pending_local_call_invalidation(&mut self) {
+        self.invalidate_local_call_verdicts();
+    }
+    /// The local-call seam's **slow half**: the memoized `Served` dispatch, or the
+    /// once-per-callee identity derivation + host consultation and the answer it files.
+    ///
+    /// Out of line for the same reason [`Machine::ask_local_callee`] is: only a served
+    /// callee (a module's unexported `*_nif` stub) and a callee's **first** call reach it,
+    /// so it must not sit in the three interpreter arms' code or in the native tier's
+    /// helper.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn local_call_seam_slow(
+        &mut self,
+        entry_module: &Module,
+        module: &Module,
+        callee: u32,
+        nregs: u32,
+        frame: ImportFrame,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> std::result::Result<Option<Step>, Box<BeamError>> {
+        // Phase 1 — the table's answer for this callee, which is a **byte** (no borrow of
+        // `self` survives it, so the host consultation below can hold `&mut self` for its
+        // own bookkeeping afterwards). Only `Served` and `Unknown` reach here: the two
+        // enter-in-machine verdicts were answered by [`Machine::local_call_enters_in_machine`].
         let verdict = match self.verdict_table() {
             Some(table) => {
                 debug_assert!(
@@ -1200,10 +1275,8 @@ impl Machine {
             None => Verdict::Unknown,
         };
         match verdict {
-            // A memoized un-nameable callee (no function entry, or a name atom the module
-            // cannot resolve) is consulted **zero** times, and a memoized decline is the
-            // host's own earlier answer: both keep the caller's in-machine jump and mutate
-            // nothing.
+            // Unreachable by construction (the fast path answered them); keeping the arm
+            // means the slow half is still a total function of the table's value.
             Verdict::Unnameable | Verdict::Declined => Ok(None),
             // Phase 2 — the host serves this callee (memoized `true`): dispatch it.
             Verdict::Served => self.serve_local_callee(
