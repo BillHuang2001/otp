@@ -129,15 +129,17 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     }
 
     buffer.seal()?;
-    // The artifact records the module's content fingerprint (computed here once, at
-    // creation) so the cross-run cache can identify it without re-hashing the IR.
+    // The artifact records the module's content fingerprint when its load-time digest
+    // does not already identify it (`needed_fingerprint`), so the cross-run cache can
+    // identify a synthetic module without re-hashing the IR and a real `.beam` pays
+    // nothing.
     Ok(CompiledModule::eager(
         buffer,
         entries,
         sub_entries,
         summary,
         labels,
-        crate::jit::cache::module_fingerprint(module),
+        crate::jit::cache::needed_fingerprint(module),
     ))
 }
 

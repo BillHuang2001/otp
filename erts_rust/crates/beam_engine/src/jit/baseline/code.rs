@@ -60,7 +60,6 @@ use std::rc::Rc;
 
 use beam_loader::Module;
 
-use crate::jit::cache::module_fingerprint;
 use crate::jit::emitter::CodeBuffer;
 use crate::jit::CodeRegion;
 
@@ -82,15 +81,19 @@ pub struct CompiledModule {
     /// `compile_module`). `Module` is immutable once loaded, so the map is valid for
     /// the artifact's whole life.
     labels: crate::interpreter::LabelMap,
-    /// The content fingerprint of the module this artifact was compiled for
-    /// ([`module_fingerprint`]), computed **once** here at creation.
+    /// The content fingerprint of the module this artifact was compiled for, when its
+    /// load-time digest does **not** already identify it
+    /// ([`needed_fingerprint`](crate::jit::cache::needed_fingerprint)).
     ///
     /// The artifact *is* the cache's sound identity for a module — its content never
-    /// changes — so keeping the fingerprint next to the code removes the per-lookup
-    /// re-hash of the whole decoded IR that a [`CacheKey`](crate::jit::cache) built
-    /// from the `Module` alone would pay (see
+    /// changes — so a synthetic module's fingerprint is kept next to the code, which
+    /// removes the per-lookup re-hash of the whole decoded IR that a
+    /// [`CacheKey`](crate::jit::cache) built from the `Module` alone would pay (see
     /// [`CodeCache::compiled_handle`](crate::jit::cache::CodeCache::compiled_handle)).
-    fingerprint: u64,
+    /// A real `.beam` stores `None`: [`ModuleKey`](crate::jit::cache::ModuleKey) keys it
+    /// on its O(1) digest and never reads a fingerprint, so computing one at staging
+    /// would be a whole-module IR hash thrown away.
+    fingerprint: Option<u64>,
     /// Which compilation layout this artifact has (see the module docs).
     layout: Layout,
 }
@@ -233,7 +236,7 @@ impl CompiledModule {
         sub_entries: Vec<Vec<Option<*const u8>>>,
         summary: Summary,
         labels: crate::interpreter::LabelMap,
-        fingerprint: u64,
+        fingerprint: Option<u64>,
     ) -> CompiledModule {
         CompiledModule {
             labels,
@@ -251,14 +254,16 @@ impl CompiledModule {
     ///
     /// The module-wide label map is built here (once) so each on-demand function
     /// compilation can resolve its targets — and so every driver run of the artifact
-    /// can reuse it — without re-scanning the module. The module's content fingerprint
-    /// is likewise computed here, **once**, and kept on the artifact (see
+    /// can reuse it — without re-scanning the module. A synthetic module's content
+    /// fingerprint is likewise computed here, **once**, and kept on the artifact (see
     /// [`CompiledModule::fingerprint`]) so a cross-run cache can identify the module
-    /// without re-hashing its whole decoded IR on every lookup.
+    /// without re-hashing its whole decoded IR on every lookup; a real `.beam` keeps
+    /// `None`, because its load-time digest already identifies it
+    /// ([`needed_fingerprint`](crate::jit::cache::needed_fingerprint)).
     pub(crate) fn lazy(module: &Module) -> CompiledModule {
         CompiledModule {
             labels: crate::interpreter::build_label_map(module),
-            fingerprint: module_fingerprint(module),
+            fingerprint: crate::jit::cache::needed_fingerprint(module),
             layout: Layout::Lazy(LazyLayout {
                 functions: RefCell::new(vec![None; module.functions.len()]),
                 native_extent: Cell::new(None),
@@ -266,11 +271,12 @@ impl CompiledModule {
         }
     }
 
-    /// The content fingerprint of the module this artifact was compiled for.
+    /// The content fingerprint of the module this artifact was compiled for, or `None`
+    /// when its load-time digest makes one unnecessary.
     ///
-    /// Equal to [`module_fingerprint`] of that module, but read in O(1) from the
-    /// artifact instead of re-hashing the decoded IR.
-    pub(crate) fn fingerprint(&self) -> u64 {
+    /// `Some` is equal to [`module_fingerprint`] of that module, but read in O(1) from
+    /// the artifact instead of re-hashing the decoded IR.
+    pub(crate) fn fingerprint(&self) -> Option<u64> {
         self.fingerprint
     }
     /// The module-wide label map this artifact holds, built once at creation.

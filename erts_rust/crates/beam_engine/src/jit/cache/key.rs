@@ -272,22 +272,36 @@ impl ModuleKey {
         }
     }
 
-    /// The module half of `module`'s key whose **content fingerprint is already known**.
+    /// The module half of `module`'s key, reusing the artifact's stored fingerprint when
+    /// it has one.
     ///
-    /// The digest wins when the module has one (the passed `fingerprint` is then ignored
-    /// — it is the artifact's own one-time cold-staging hash, redundant with the O(1)
-    /// digest); a synthetic module keeps the caller's fingerprint, which is the one the
-    /// artifact recorded ([`CompiledModule::fingerprint`]) at its creation. Used when
-    /// the fingerprint comes from that compiled artifact.
-    pub(crate) fn with_fingerprint(module: &Module, fingerprint: u64) -> ModuleKey {
+    /// The digest wins when the module has one (the passed `fingerprint` is then
+    /// irrelevant — it is `None` for exactly those modules, see
+    /// [`needed_fingerprint`]); a synthetic module keeps the caller's fingerprint, which
+    /// is the one the artifact recorded ([`CompiledModule::fingerprint`]) at its
+    /// creation, and falls back to hashing the IR only if the caller has none to give.
+    /// Used when the fingerprint comes from that compiled artifact.
+    pub(crate) fn with_fingerprint(module: &Module, fingerprint: Option<u64>) -> ModuleKey {
         match digest_of(module) {
             Some(digest) => ModuleKey::Digest(digest),
             None => ModuleKey::Content {
                 name: module_name(module),
-                fingerprint,
+                fingerprint: fingerprint.unwrap_or_else(|| module_fingerprint(module)),
             },
         }
     }
+}
+/// The content fingerprint `module` needs as part of its cache key — `None` when its
+/// load-time digest already identifies it, i.e. for **every real `.beam`**.
+///
+/// [`module_fingerprint`] streams the module's whole decoded IR through a hasher (its
+/// `Debug` rendering, the atom names, the raw blobs), which is millions of instructions
+/// for a stdlib-sized module. Nothing consumes the value for a digest-carrying module:
+/// [`ModuleKey`] takes the O(1) digest, so a native artifact records `None` instead of
+/// paying that hash at every staging. Only a synthetic (zero-checksum) module — whose
+/// content hash *is* its identity — pays it, exactly once per staging.
+pub(crate) fn needed_fingerprint(module: &Module) -> Option<u64> {
+    digest_of(module).is_none().then(|| module_fingerprint(module))
 }
 
 /// The **complete cache key**: which module, **and** which atom namespace its compiled
@@ -333,15 +347,14 @@ impl CacheKey {
         }
     }
 
-    /// The key of `module` whose **content fingerprint is already known**
-    /// ([`CompiledModule::fingerprint`]).
+    /// The key of `module`, reusing the artifact's stored fingerprint when it has one
+    /// ([`CompiledModule::fingerprint`], i.e. [`needed_fingerprint`]).
     ///
     /// The single derivation the artifact-holding paths use
     /// ([`CodeCache::prime`](super::CodeCache)/[`CodeCache::remember`](super::CodeCache)):
-    /// the stored fingerprint is reused instead of re-hashing the IR, so a synthetic
-    /// module is keyed without a second hash while a real `.beam` still keys on its O(1)
-    /// digest.
-    pub(crate) fn with_fingerprint(module: &Module, fingerprint: u64) -> CacheKey {
+    /// a synthetic module is keyed from the artifact without a second hash, and a real
+    /// `.beam` keys on its O(1) digest with no hash at all.
+    pub(crate) fn with_fingerprint(module: &Module, fingerprint: Option<u64>) -> CacheKey {
         CacheKey {
             module: ModuleKey::with_fingerprint(module, fingerprint),
             atoms: module.atom_table.snapshot(),
