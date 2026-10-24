@@ -537,7 +537,7 @@ pool/arena heaps are `AllocType::Standard` and the `MemoryHook` excludes `Standa
 the last `VmRSS` sample after `src/malloc.rs`'s one `malloc_trim(0)`, and `Runtime::retention_stats()`
 (`BEAM_RT_MEM_TRACE=1`).
 
-| workload | peak `VmHWM` | peak `VmSize` | exit RSS | wall | exit `bif_regions` / `bif_words` |
+| workload | peak `VmHWM` | peak `VmSize` | exit RSS (**library path** — `cli::run` keeps the `Drop`) | wall | exit `bif_regions` / `bif_words` |
 |---|---|---|---|---|---|
 | bare `-eval 'halt(0).'` | 118 MB | 587 MB | 23.2 MB | 0.27 s | 3 / 136 MB |
 | `cerl_clauses` 13 793 B, in-process | 372 MB | 962 MB | 21–30 MB | 0.87–0.99 s | 27 / 161 MB |
@@ -546,6 +546,9 @@ the last `VmRSS` sample after `src/malloc.rs`'s one `malloc_trim(0)`, and `Runti
 | `inet_parse` 36 960 B, in-process `-eval` | 5 203 MB | — | 23.0 MB | 12.1 s (**completes**) | 34 / 169 MB |
 | `inet_parse` 36 960 B, `run` route | 222 MB in-process / 671 MB spawned child | — | — | never completes (`RUN_DEADLINE`, 60 s) | — |
 | `dbg_iload` 48 353 B, in-process | 17.4 GB at the 25 s cap (still growing) | — | — (killed at 25 s) | **does not complete** | — |
+**The `exit RSS` column is the library path's.** The `beam_rt` binary reaches `crate::cli::run_for_process`, which runs with `ExitTeardown::Leak`, so a process does **not** tear its runtime down before exiting and its exit RSS sits just under its peak: bare boot **113.1–114.6 MB** of a **118.7–119.1 MB** peak, `stdlib/src/orddict.erl` **303 376 kB** of a **310 044 kB** peak.
+`src/malloc.rs`'s one `malloc_trim(0)` therefore has its full effect only on the library path (`cli::run`, every test); peak `VmHWM` is unchanged on both paths, because the run's high-water is live at the time.
+
 The pool's capacity is **depth-sized now**: the outermost call gets `bif_heap_words` (1 << 24 words = 128 MiB) and every nested level gets `NESTED_BIF_HEAP_SEED_WORDS` (131 072 words = 1 MiB), self-tuned upward to `2 ×` an observed nested peak by `note_nested_heap_need`, with `bif_heaps_taken` the live depth.
 For `cerl_clauses` that is 27 regions / 20 185 088 words = **161 MB**, where seeding every level at `bif_heap_words` gave the same 27 regions 27 × 16 777 216 = **3.62 GB** — 22× less reservation at an identical region count, with `bif_nested_peak_words` 1 550 (23 372 for `inet_parse`), two orders of magnitude under the seed.
 `take_bif_frontier` grows a region **geometrically from its own capacity** (no `bif_heap_words` floor) and is capped by `max_heap_words` only when `+hmax` is set.
