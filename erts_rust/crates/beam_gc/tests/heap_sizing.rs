@@ -52,7 +52,7 @@ use std::process::Command;
 
 use beam_gc::prelude::{
     heap_sizes, next_heap_size, AnyCollector, CollectionKind, GcConfig, HeapInfo, HeapPolicy,
-    MatureKind, DEFAULT_MIN_HEAP_WORDS, GARBAGE_COLLECTION_KEYS,
+    MatureKind, DEFAULT_MIN_HEAP_WORDS, GARBAGE_COLLECTION_KEYS, MINOR_SHRINK_FLOOR_WORDS,
 };
 use beam_term::prelude::{arityval, boxed_val, is_arity_value, make_small, signed_value, Eterm};
 
@@ -335,9 +335,41 @@ fn a_tiny_nursery_of_a_fullsweeping_process_grows_to_the_live_set_target() {
 #[test]
 fn a_grossly_oversized_nursery_shrinks_after_a_collection() {
     let policy = HeapPolicy {
+        initial_young_words: 4_185,
+        ..HeapPolicy::default()
+    };
+    for kind in [MatureKind::Copying, MatureKind::Immix] {
+        let mut c = any(kind, policy.clone());
+        assert_eq!(c.young().capacity_words(), 4_185, "{kind:?}");
+
+        let t = build_tuple(&mut c, &[make_small(1), make_small(2)]);
+        let mut roots = vec![t];
+        c.collect(&mut roots).expect("collect");
+
+        // Three live words in a 4 185-word nursery is past `YOUNG_SHRINK_FACTOR` times the young
+        // live set's target (`next_words(3 + 64) = 90`) **and** past the minor-shrink floor
+        // (`MINOR_SHRINK_FLOOR_WORDS` = 3 000), so the nursery falls back to the target.
+        assert!(4_185 > MINOR_SHRINK_FLOOR_WORDS, "{kind:?}");
+        assert_eq!(c.young().capacity_words(), 90, "{kind:?}");
+        assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
+    }
+}
+
+/// The floor's other half, through a whole collection: a nursery that *is* far past
+/// [`YOUNG_SHRINK_FACTOR`] times its target but sits at or below the legacy C's
+/// `HEAP_SIZE(p) > 3000` gate (`erts/emulator/beam/erl_gc.c:1517-1529`) is **kept** — after
+/// tenuring a small heap always looks nearly empty, so handing the capacity back would only make
+/// the growth seam climb straight back.
+#[test]
+fn a_nursery_at_or_below_the_minor_shrink_floor_keeps_its_capacity() {
+    let policy = HeapPolicy {
         initial_young_words: 1_598,
         ..HeapPolicy::default()
     };
+    assert!(
+        1_598 <= MINOR_SHRINK_FLOOR_WORDS,
+        "the fixture must sit at or below the floor"
+    );
     for kind in [MatureKind::Copying, MatureKind::Immix] {
         let mut c = any(kind, policy.clone());
         assert_eq!(c.young().capacity_words(), 1_598, "{kind:?}");
@@ -346,9 +378,18 @@ fn a_grossly_oversized_nursery_shrinks_after_a_collection() {
         let mut roots = vec![t];
         c.collect(&mut roots).expect("collect");
 
-        // Three live words in a 1598-word nursery is far past `YOUNG_SHRINK_FACTOR` times the
-        // young live set's target (`next_words(3 + 64) = 90`), so the nursery falls back to it.
-        assert_eq!(c.young().capacity_words(), 90, "{kind:?}");
+        // `next_words(3 + 64) = 90` is the target and `8 * 90 = 720 < 1 598`, so only the floor
+        // keeps this capacity.
+        assert_eq!(
+            policy.young_minor_target_words(3),
+            90,
+            "{kind:?}: the live set's target"
+        );
+        assert_eq!(
+            c.young().capacity_words(),
+            1_598,
+            "{kind:?}: a nursery at or below the 3 000-word floor keeps its capacity"
+        );
         assert_eq!(tuple_smalls(roots[0]), vec![1, 2]);
     }
 }

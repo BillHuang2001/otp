@@ -97,7 +97,8 @@
 //! `-- --nocapture` for a human reader only.
 
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind, YOUNG_SHRINK_FACTOR,
+    AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind, MINOR_SHRINK_FLOOR_WORDS,
+    YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, signed_value, size_object, tuple_element, tuple_size, Eterm};
 
@@ -570,11 +571,17 @@ fn a_monotonically_growing_live_set_follows_the_live_set_target() {
                  {} -word floor",
                 policy.nursery_floor_words()
             );
-            // The shrink band holds: never more than `YOUNG_SHRINK_FACTOR` times the target.
+            // The shrink band holds: never more than `YOUNG_SHRINK_FACTOR` times the target — or,
+            // for a minor, never more than the larger of that and the legacy C's minor-shrink
+            // floor (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`).
+            let band = match collection.kind {
+                CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target),
+                CollectionKind::Major => YOUNG_SHRINK_FACTOR * target,
+            };
             assert!(
-                after <= YOUNG_SHRINK_FACTOR * target,
-                "{kind:?}: round {round} left the nursery at {after} words, past the \
-                 {YOUNG_SHRINK_FACTOR}x band around its {target}-word target"
+                after <= band,
+                "{kind:?}: round {round} left the nursery at {after} words, past the {band}-word \
+                 band around its {target}-word target"
             );
             // The rule is a fixed point at the live set it measured: re-applying it reproduces
             // the capacity, so it can never ratchet.

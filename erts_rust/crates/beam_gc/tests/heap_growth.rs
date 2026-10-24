@@ -51,7 +51,7 @@
 use beam_common::BeamError;
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, Collector, GcConfig, HeapObservable, HeapPolicy, MatureKind,
-    YOUNG_SHRINK_FACTOR,
+    MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{make_small, AtomTable, Eterm};
@@ -174,11 +174,19 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
             "round {round}: {cap} words is below the policy's {} -word nursery floor",
             policy.nursery_floor_words()
         );
-        // ... and a kept capacity is inside the hysteresis band around its target.
+        // ... and a kept capacity is inside the hysteresis band around its target. For a minor the
+        // band's upper edge is the larger of `YOUNG_SHRINK_FACTOR x target` and the legacy C's
+        // minor-shrink floor (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`); the
+        // fullsweep resizer has no such floor (`adjust_after_fullsweep` gates on `H_MIN_SIZE`).
+        let band = match collection.kind {
+            CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target),
+            CollectionKind::Major => YOUNG_SHRINK_FACTOR * target,
+        };
         assert!(
-            cap <= YOUNG_SHRINK_FACTOR * target,
-            "round {round}: {cap} words is past the {}x band around its {target}-word target",
-            YOUNG_SHRINK_FACTOR
+            cap <= band,
+            "round {round}: {cap} words is past the {band}-word band around its {target}-word \
+             target ({:?})",
+            collection.kind
         );
         // The rule is a fixed point at the live set it measured, so a live set that stopped
         // moving could never climb a growth-table step per collection.
@@ -247,22 +255,61 @@ fn sustained_allocation_grows_the_mature_generation_while_the_nursery_follows_th
         tail.iter().all(|cap| *cap == tail[0]),
         "the nursery capacity must plateau over the last {TAIL} rounds, got {young_caps:?}"
     );
+    let tail_target = *targets.last().expect("non-empty");
     assert_eq!(
+        tail_target,
+        policy.young_minor_target_words(BATCH as usize * 3),
+        "the trailing rounds promote the same young live set every time"
+    );
+    // The plateau is a live-set function, never a per-collection creep: it is the tail's own minor
+    // target, or a capacity the keep band retains around it. The band's upper edge is the larger of
+    // `YOUNG_SHRINK_FACTOR x target` and the legacy C's minor-shrink floor (`HEAP_SIZE(p) > 3000`,
+    // `erts/emulator/beam/erl_gc.c:1517-1529`) — which is why a small heap that once held a
+    // fullsweep's target keeps it instead of collapsing onto the 24-word batch's target.
+    assert!(
+        tail[0] == tail_target
+            || (tail[0] >= tail_target
+                && tail[0] <= MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * tail_target)),
+        "the plateau {} is neither the young live set's target {tail_target} nor a capacity the \
+         keep band around it retains",
+        tail[0]
+    );
+    assert_eq!(
+        policy.young_after_collection(tail[0], BATCH as usize * 3),
         tail[0],
-        *targets.last().expect("non-empty"),
-        "the plateau is the young live set's target ({} words promoted per round)",
+        "the plateau must be a fixed point of the minor rule ({} words promoted per round)",
         BATCH * 3
     );
     // Every step the capacity took landed on a target, and it took more than one: the growth is
     // real, and each step is a live-set step rather than an arbitrary growth-table step.
+    //
+    // The run's nursery crosses two distinct live-set targets as the accumulated live set grows
+    // (90 -> 233 -> 987), and it only ever climbs: every capacity here is at or below the legacy
+    // C's minor-shrink floor (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`), so
+    // no minor in this run hands one back. The step count is therefore a property of the rule at
+    // this fixed (randomness-free) geometry rather than a configured number — a floor-gated minor
+    // rule has no shrink-and-re-climb cycle left for it to count, which is what took it from three
+    // steps to two.
     let steps: Vec<usize> = young_caps
         .windows(2)
         .filter(|w| w[0] != w[1])
         .map(|w| w[1])
         .collect();
     assert!(
-        steps.len() >= 3,
-        "the nursery must climb in live-set steps, got {steps:?}"
+        young_caps
+            .iter()
+            .all(|cap| *cap <= MINOR_SHRINK_FLOOR_WORDS),
+        "this corpus must stay at or below the {MINOR_SHRINK_FLOOR_WORDS}-word minor-shrink floor, \
+         so that no minor can give a capacity back: {young_caps:?}"
+    );
+    assert!(
+        steps.len() >= 2,
+        "the nursery must climb in live-set steps, got {steps:?} over {young_caps:?}"
+    );
+    assert!(
+        young_caps.windows(2).all(|w| w[0] <= w[1]),
+        "a nursery at or below the minor-shrink floor only ever climbs (a minor never shrinks it \
+         there), got {young_caps:?}"
     );
     for step in &steps {
         assert!(

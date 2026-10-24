@@ -48,7 +48,8 @@
 //! deterministic count — **no timing is ever asserted**.
 
 use beam_gc::prelude::{
-    AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind, YOUNG_SHRINK_FACTOR,
+    AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind, MINOR_SHRINK_FLOOR_WORDS,
+    YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, Eterm};
 
@@ -267,17 +268,23 @@ fn a_live_heavy_round_grows_the_nursery_to_the_live_set_target() {
                 collection.kind
             );
             // The floor is a real lower bound on every installed capacity, and the band bounds
-            // how far a kept one may sit above its target.
+            // how far a kept one may sit above its target — for a minor the band's upper edge is
+            // the larger of `YOUNG_SHRINK_FACTOR x target` and the legacy C's minor-shrink floor
+            // (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`); the fullsweep
+            // resizer has no such floor.
             assert!(
                 cap >= policy.nursery_floor_words(),
                 "{kind:?} round {round}: {cap} words is below the policy's {} -word floor",
                 policy.nursery_floor_words()
             );
+            let band = match collection.kind {
+                CollectionKind::Minor => MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target),
+                CollectionKind::Major => YOUNG_SHRINK_FACTOR * target,
+            };
             assert!(
-                cap <= YOUNG_SHRINK_FACTOR * target,
-                "{kind:?} round {round}: {cap} words is past the {}x band around its \
-                 {target}-word target",
-                YOUNG_SHRINK_FACTOR
+                cap <= band,
+                "{kind:?} round {round}: {cap} words is past the {band}-word band around its \
+                 {target}-word target"
             );
             // The rule is a fixed point at the live set it measured: a collection can never be
             // the start of a per-collection ratchet.

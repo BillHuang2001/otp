@@ -80,7 +80,7 @@
 
 use beam_gc::prelude::{
     AnyCollector, CollectionKind, Collector, GcConfig, HeapObservable, HeapPolicy, HeapSpace,
-    MatureKind, YOUNG_SHRINK_FACTOR, YOUNG_TARGET_LIVE_MULTIPLE,
+    MatureKind, MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR, YOUNG_TARGET_LIVE_MULTIPLE,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{make_small, size_object, AtomTable, Eterm, NIL};
@@ -511,7 +511,9 @@ fn the_live_set_target_is_a_fixed_point_and_never_ratchets() {
 /// reached (both are ≈ the capacity at a collection, so such a rule steps the growth table once
 /// per collection), so the only two answers the rule has are "the capacity it already had" and
 /// "the live set's target". The result is never below the policy's nursery floor, never past the
-/// hysteresis band around its target, and is a fixed point of its own rule.
+/// hysteresis band around its target — whose upper edge is the larger of `YOUNG_SHRINK_FACTOR x
+/// target` and the legacy C's minor-shrink floor (`MINOR_SHRINK_FLOOR_WORDS` = 3 000 words,
+/// `erts/emulator/beam/erl_gc.c:1517-1529`) — and is a fixed point of its own rule.
 #[test]
 fn a_minor_may_grow_only_onto_the_live_set_target() {
     let policy = HeapPolicy::default();
@@ -549,12 +551,15 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
                 "young_after_collection({capacity}, {live}) = {got} is below the policy's \
                  {floor}-word nursery floor"
             );
-            // ... and the band bounds how far a kept capacity may sit above its target.
+            // ... and the band bounds how far a kept capacity may sit above its target: the larger
+            // of `YOUNG_SHRINK_FACTOR x target` and the legacy C's minor-shrink floor
+            // (`HEAP_SIZE(p) > 3000`, `erts/emulator/beam/erl_gc.c:1517-1529`), which is what
+            // stops a small heap's post-tenuring trough from shrinking.
+            let band = MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target);
             assert!(
-                got <= YOUNG_SHRINK_FACTOR * target,
-                "young_after_collection({capacity}, {live}) = {got} is past the {}x band around \
-                 its {target}-word target",
-                YOUNG_SHRINK_FACTOR
+                got <= band,
+                "young_after_collection({capacity}, {live}) = {got} is past the {band}-word band \
+                 around its {target}-word target"
             );
             // The growth branch is the live set's target, and it really is taller than what the
             // nursery had; the shrink branch lands on the target too.
