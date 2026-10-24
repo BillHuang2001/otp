@@ -149,6 +149,12 @@ instructions):
   is green on its own (`--lib -- codeserver::`, 32 passed).
 - `system_path` reads the **ambient** `$ERL_LIBS`, so a test that manipulates it must be
   serialized by the caller (the crate's env discipline).
+- **The cheapest end-to-end parity check of this module's output** (seconds, no differential
+  harness): compile `-module(gp). -export([go/0]). go() -> code:get_path().` with `erlc`, then
+  compare `erl -noshell -eval 'io:format("~w~n",[code:get_path()]),halt().'` with
+  `beam_rt run gp.beam gp:go/0` — the two `~w` renderings are **byte-identical** (36 entries,
+  11 140 bytes on this host). Any code-path change must keep that `cmp` clean; a path whose
+  *content* is right but whose order moved fails it.
 
 ## See Also
 - `../codeserver.rs` → the `CodeServer` façade (atom table, module cache, load routes, code path,
