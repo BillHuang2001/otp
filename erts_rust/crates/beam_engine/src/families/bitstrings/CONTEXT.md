@@ -121,6 +121,9 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   (`a_republish_writes_only_the_two_payload_words_and_leaves_a_split_pairs_neighbour_intact`,
   `a_split_pairs_payload_move_keeps_the_next_append_in_place`,
   `a_second_pair_over_the_payload_refuses_the_move`).
+- `programs.rs` → the **prepared bitstring program** cache: `Program::{Generic, Create, Match}`, `program_key(func, pc)` and `BitstrPrograms::{get_or_prepare, take, restore}`.
+  One table per **module context** (so a `Module::clone` or a second load of the same `.beam` is a different table), machine-owned by construction and never part of the cross-run compiled-block cache.
+  `prepare` is consulted once per `(function, code offset)` and its answer filed; a shape it declines is `Program::Generic`, and a synthetic image (all-zero checksum, no content identity) never caches a `Match` program.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
     `bs_match_string`/`bs_test_tail2` opcodes. `bs_get_integer2` commits its advance through
@@ -152,6 +155,13 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     `Instr::BsGetPosition` publishes a **small integer** (`position_term` → `make_small`), C's
     `$Dst = make_small(sb->start)` — zero allocation. The old whole-context snapshot survives
     only as the over-large-position fallback, and `position_of` accepts both forms.
+  - `prepared.rs` → the **pre-resolved** `bs_match` command program.
+    `prepare` folds the flat command list once per `(module image, function, code offset, descriptor list)` into a `MatchProgram` of `MatchCmd` variants: the command atom *is* the variant, the size/unit operands are plain `usize`s with `$BS_SAFE_MUL` already applied, and the flags are `BSF_*` bits.
+    The prepared walk calls the very bodies the generic walk calls (`ensure_at_least`, `skip_cmd`, `binary_cmd`, `get_tail_cmd`, `eq_cmd`, `commit`, `read_integer_field_tracked`), so the two routes cannot drift in semantics — only in where an operand was read.
+    The **straight-line `FastForm`** is derived at prepare time for a program made only of `ensure_at_least` + `integer` runs whose fields are **unsigned**, **big-endian** and a **whole number of bytes at most 8 wide**: one window bounds check, one whole-byte load, one `x(Dst)` store and one context-position store per element, plus the one re-read a field's own allocation forces.
+    The **prepared-but-not-fast** set — a signed field, a `little`/`native` field (`reads::field_is_little` decides the order), a non-byte width, a field wider than 8 bytes — keeps the prepared command walk, which is the generic body command for command.
+    Anything `prepare` declines (a non-atom command word, an unknown command name, a truncated list, a *dynamic* size/unit operand, an overflowing `$BS_SAFE_MUL`, a synthetic image with no content identity) stays `Program::Generic` and runs `commands::run_commands`, which keeps its exact typed error.
+    `prepared_tests.rs` is the prepared-versus-generic suite beside it.
   - `commands.rs` → the flattened `bs_match` command interpreter (`run_commands`:
     `ensure_at_least`/`ensure_exactly`/`skip`/`integer`/`binary`/`get_tail`/`'=:='`) and
     the `commit` write-back discipline. The four cold command bodies (`skip`, `binary`,
@@ -169,8 +179,9 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     `ensure_at_least`/`ensure_exactly`/`skip`/`'=:='` never. The rule is deliberately
     one-sided — a stale capture would be unsound, a redundant re-read only costs a read.
     **Per-element census of the hot shape** (`ensure_at_least 8 1` + a small `integer` over a
-    comprehension's context): the program is a load-time `Vec<Operand>` (there is no term-level
-    re-decode, and **no** pre-decoded/cached form either), so one element costs ~17 word loads
+    comprehension's context): the generic walk reads a load-time `Vec<Operand>` and decodes every
+    command itself (`prepared.rs` is the pre-resolved route a content-identified image takes instead),
+    so one element costs ~17 word loads
     (≈10 of them the context block), 1 subject byte read, 3 word writes (the `Dst` context, the
     context's `start`, the result register), 2 operand decodes, 2 `atom_name` classifications, 1
     out-of-line call (`exec_other` — the field's `{literal,[]}` flags are answered by
@@ -228,6 +239,12 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     `BadArg`/`Small`/`SystemLimit` discrimination) instead of `read_operand` →
     `make_integer_unrooted`; it pays on `long_append`/`decode` and costs `encode` ~0.8 %
     (whose sizes arrive as register shadows, never a literal).
+  - `prepared.rs` → the **pre-resolved** `bs_create_bin` segment program.
+    `prepare` folds the flat `[Type, Index, Unit, Flags, Value, Size]` list once per `(module image, function, code offset)` into a `CreateProgram` of `PreparedSeg` variants (`Integer`, `ByteInt`, `Binary`, `String`, `Float`, `Utf`, `Append`), with the type atom folded into the variant, the flags decoded to `BSF_*`, the width a plain `Width::{Imm, All, Dynamic}`, and a `string` segment's `StrT` window resolved and range-checked.
+    `assemble_prepared` executes it through the same bodies the generic walk uses, and `integer_non_small` is its `#[inline(never)]` cold half: a bignum masked into the field through `push_wide_int`, a non-integer the bare `badarg`.
+    `CreateProgram::reserve_after[i]` is the summed **static** bit width of every segment after position `i` (`None` as soon as one has a runtime width) — the figure `BitWriter::arm_room` needs.
+    A shape `prepare` declines (an unknown segment type, a truncated group, a *dynamic* unit, an `all`-sized `integer`, a `string` offset outside `StrT`, a width whose `$BS_SAFE_MUL` overflows, a `float` width outside 16/32/64) stays `Program::Generic` and runs `create::assemble`, which keeps its exact typed error.
+  - `prepared_tests.rs` → the prepared-versus-generic **equivalence** suite for `bs_create_bin`: every segment kind on both routes (same bytes, same bit count, same typed error), plus the pins that the direct store really runs for a byte field, really does not for an unaligned position, is never entered by a `dynamic`-width or a declined shape, and that the one-per-instruction reservation leaves `RefcBinary::growth_counters` untouched.
   - `tests.rs` → `#[cfg(test)]` unit tests for the segment encoders.
   - `wide_tests.rs` → `#[cfg(test)]` unit tests for the integer segment's value masking
     (a bignum into a narrow field, big/little endian, signed/unsigned, a literal-operand
@@ -523,6 +540,20 @@ capacity-vs-size answer (C's `apparent_size`) is absent, a copy-rebuild result i
 non-writable refc binary (so only an in-place result stays writable through the registry), and the
 payload's `as_bytes()` reports the whole reservation rather than the bytes written — a `beam_alloc`
 `set_len_written`/high-water-word API would close that.
+
+## The prepared `bs_create_bin` program and the byte-field store
+
+`create/prepared.rs` resolves the segment list **once per instruction** (`programs.rs`'s per-module-context cache, `Program::Create`) instead of walking `[Type, Index, Unit, Flags, Value, Size]` on every element.
+The execution path therefore carries no type-atom lookup, no `&str` match, no flags decode and no `$BS_SAFE_MUL`; only the value/destination operands are read per execution.
+`PreparedSeg::ByteInt` is the **direct-store** form of an `integer` segment: a static whole-byte width of 8/16/32/64 bits, both endiannesses, whose width *and* store shape are settled at prepare time.
+Executing one is a tag test on the value plus one native store, instead of `is_integer` + `big_parts_safe` + `small_value`, a `to_be_bytes` and a run-time-length slice copy.
+`BitWriter::push_byte_field` is its writer: a byte-aligned destination stores through `raw::InPlace::write_byte_field` (one store into the accumulator payload) or `store_byte_field_vec` (one const-length `extend_from_slice`), so every width lowers to a single store rather than a libc `memmove`.
+Only an **unaligned** position (a byte field behind a bit-granular segment) and a **short** in-place sink fall back to the bit-exact `push_uint`/`push_uint_le` — the same writers every other field uses, so the bytes cannot differ.
+`integer_non_small` is the out-of-line (`#[inline(never)]`) cold half of the `ByteInt` arm, and it is the same code the generic arm runs: a bignum masked into the field, a non-integer the bare `badarg`.
+`BitWriter::arm_room(bits)` arms the **one capacity reservation per instruction**: the summed static width of the remaining segments (`CreateProgram::reserve_after`), recorded in the writer's `reserved` field only when the payload already has that room.
+It **never grows**, so `ensure_room` simply early-returns while the reservation covers a write and otherwise falls through to the unchanged per-field `raw::InPlace::grow`.
+The growth schedule — and therefore `RefcBinary::growth_counters` — is exactly the per-field route's, which `create/prepared_tests.rs` pins in both the fits and the must-grow case.
+Every write spends its own bits from `reserved` (`push_bit` one bit, `push_whole_bytes`/`push_byte_field` their width), so the reservation can never overstate the room left, and a shortfall still reaches the same single growth door.
 
 ## The typed bitstring / binary gaps, in full (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
