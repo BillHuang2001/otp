@@ -122,6 +122,75 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
   Both passes consult their `entries` table **first** and `sub_entries` second (a real block start always wins), so `Summary::block_count`/`code_map`/`code_address_range` keep describing IR blocks only; a sub-block reserves **no** entry label (nothing branches to a continuation address — the driver re-enters there after a deopt or a `Wait`) and it starts with a full block prologue. An address that is already a block start, or at/past the end of the function, needs no sub-block. **Both** passes derive the allocation for the range they emit — `allocate_registers_with_labels(module, labels, code, start, end)` — because an `Allocation` is entry-point-relative (`block_start`, the per-`pc` fill/spill tables, the live-in set): a sub-block is a fresh native function whose prologue loads only its own live-in cache, so the containing IR block's allocation would leave a register the block writes before `start` unloaded and would carry its dirty bits. The lazy pass folds the sub-block touches into the function `Summary` as a **superset**; the eager pass discards them, so the whole-module `Summary` stays exactly the IR blocks'. Both add `emit::sub_blocks_capacity_estimate` to the buffer estimate, so the extra code can never under-allocate the `CodeBuffer` (an under-estimate would be a `SystemLimit` compile error).
 
 
+## The bitstring inline set (eight shapes)
+Eight `Bs*` shapes are lowered **natively in-block, with no helper call and no interpreter step**, by the shape module `../emit/bitstr_inline/` (`../emit/bitstr_inline/CONTEXT.md` owns its file layout and its shared emitters).
+Each `try_inline_bs_*` entry answers `Ok(false)` having emitted **zero bytes** when its `*_shape` predicate declines, and `emit/block.rs`'s eight arms sit **above** the `_ if bitstrings::claimed(instr) => emit_bitstr(...)` guard arm, so a decline falls through to `bitstr.rs::jit_bitstr` — the family's `jit_bitstr` helper, i.e. the behaviour every other `Bs*` variant keeps.
+No shape's sequence allocates and none raises, so no moving collection can interleave inside one, no path carries an `emit_position_store`, and the context block base is read once and reused.
+Every guard that can reject a destination write (`Loc::guard_store` for a `Y` destination, the match-context guard) is emitted **before** that write, and a context's `start` word is committed **before** the destination register, because `Dst` may be the context register itself (`beam_asm:filter_essentials/1` compiles `ctx == dst == x(3)`).
+The shape predicates are the single decision: `emit/block.rs`, `emit/regalloc.rs`'s `cacheable_touches`/`cacheable_reads`/`cacheable_writes`/`is_inlined`, `emit/arith.rs::uses_y` and `emit/test/refusal_census.rs` all consult the same `*_shape` function, so an emitted register set and its refusal cannot disagree with the code that runs.
+
+### `bs_get_position { ctx, dst }` — `position.rs::try_inline_bs_get_position`
+- Predicate `get_position_shape(ctx, dst)`: `ctx` and `dst` are each an in-bound x-register or an addressable `Y` slot (`Loc::of`); nothing else.
+- Run-time guards, in order: `dst`'s Y-window guard; the match-context guard (`is_boxed`, then `*boxed_val == HEADER_SUB_BITS`) → `fallback`; `start > MAX_SMALL` → `fallback`.
+- Lowering: `make_small([ctx+16])` (`shl 4`, `or TAG_IMMED1_SMALL`) stored to `dst`.
+- Fallback: one interpreter step — the family's whole-context snapshot, the only allocating `position_term` arm.
+
+### `bs_set_position { ctx, pos }` — `position.rs::try_inline_bs_set_position`
+- Predicate `set_position_shape(ctx, pos)`: `ctx` is a `Loc`; `pos` is a `Loc`, or a **constant** `Operand::Integer` in `0..=MAX_SMALL` or `Operand::Character` (`PosSource::{Loc, Constant}`) — a constant outside that range is `position_of`'s typed error.
+- Run-time guards: the match-context guard → `fallback`; for a `Loc` source, `pos` is either a match context (boxed, header `== HEADER_SUB_BITS`, new start = `[pos+16]`) or a non-negative small integer (`(pos & IMMED1_MASK) == SMALL_TAG` and the biased value `>= 0`, else `fallback`).
+- Commit: **one** word store to `[ctx+16]`, after every read (`ctx` may alias `pos`), with no destination register at all.
+- Fallback: one interpreter step — the family's typed raise for a non-position term.
+
+### `bs_test_tail2 { fail, ctx, bits }` — `tail.rs::try_inline_bs_test_tail2`
+- Predicate `test_tail2_shape(labels, fail, ctx, bits)`: `ctx` is a `Loc`, `fail` is not `NO_FAIL`, and it resolves in the module's label map (the miss transfer needs its `(func, pc)` target).
+- Run-time guards: the match-context guard → `fallback`; `end.saturating_sub(start) != bits` → `fail_arm`.
+- `fail_arm` is the linker's exit to the resolved label with `ExitSpill::Required` — a terminator on that path only; the hitting path continues in-block.
+- Fallback: one interpreter step — the family's `{badmatch,…}` raise, whose reason allocates, which is exactly why `NO_FAIL` is refused at compile time.
+
+### `bs_skip_bits2 { fail, ctx, size, unit, flags }` — `tail.rs::try_inline_bs_skip_bits2`
+- Predicate `skip_bits2_shape(...)`: `ctx` is a `Loc`; `size` is a **constant** `Operand::Integer` in `0..=MAX_SMALL` or `Operand::Character`; `size * unit` fits both `usize` and an `i64` immediate; `fail` is not `NO_FAIL` and resolves; `flags` is ignored because the family ignores it.
+- Run-time guards: the match-context guard → `fallback`; `start.checked_add(nbits)` overflow (the carry flag) → `fail_arm`; `next > end` (**not** `>=`) → `fail_arm`.
+- Commit: one word store to `[ctx+16]`; no destination register.
+- Fallback: one interpreter step — a runtime `size`/`unit` (a register compare the sequence would not have) or a `NO_FAIL` raise.
+
+### `bs_start_match3 { fail, bin, live, dst }` — `start_match.rs::try_inline_bs_start_match3`
+- Predicate `start_match3_shape(labels, fail, bin, dst)`: `bin` and `dst` are each a `Loc`; `fail` classifies as `MatchFail::{Label, Family}` — `NO_FAIL` is `Family` (its `{badmatch, Subject}` reason allocates) and an unresolved label refuses.
+- Run-time guards: `dst`'s Y-window guard **first**; then the subject classification — non-boxed → `miss`; header `== HEADER_SUB_BITS` → the `orig` check (a non-boxed `orig` is the hit; a boxed `orig` whose header is `HEADER_BIN_REF` is a refc window → `fallback`; anything else is the hit); header masked to `BITSTRING_TAG_MASK == HEAP_BITS_SUBTAG` → `fallback` (a fresh subject the family re-wraps through `make_ctx`); every other header → `miss`.
+- Lowering: `mov <Dst>, <the subject word>` — a plain move, no reservation, because the family's hit arm is `write_operand(dst, value)`.
+- `miss` takes the resolved label's linker exit, and a `MatchFail::Family` miss is the `fallback` step.
+
+### `bs_start_match4 { fail, live, src, dst }` — `start_match.rs::try_inline_bs_start_match4`
+- Predicate `start_match4_shape(module, labels, fail, src, dst)`: the same subject/destination `Loc` requirement; `fail` is decoded exactly as `resolve_match4_fail` decodes it — `Operand::Label` (`NO_FAIL` → `Family`, else resolved → `Label`), atom `"no_fail"` → `Family`, atom `"resume"` → `Resume`; any other atom, an unnameable atom id or another operand kind refuses.
+- Run-time guards: the same `emit_start_match` body as `bs_start_match3`; a `Resume` shape has the **short** form — a single `header == HEADER_SUB_BITS` compare, whose miss is the `fallback` step (the family's `NO_FAIL` raise).
+- Fallback: one interpreter step.
+
+### `bs_get_integer2 { fail, ctx, live, size, unit, flags, dst }` — `integer.rs::try_inline_bs_get_integer2`
+- Predicate `get_integer2_shape(...)`: `ctx` and `dst` are `Loc`; `size` is a **constant** (`Operand::Integer` in `0..=MAX_SMALL` or `Operand::Character`); `nbits = size * unit` passes `field_width_supported`; `flags` passes `field_is_unsupported`; `fail` is not `NO_FAIL` and resolves.
+- Run-time guards, in order: `dst`'s Y-window guard; the match-context guard; `end.saturating_sub(start) < nbits` → `fail_arm` (the family's `fail_step`, never a raise); `emit_subject_view`'s subject classification → `fallback`; `emit_bit_extract`'s over-read guard and width guard → `fallback`.
+- Lowering: `start + nbits` committed to `[ctx+16]` **before** `dst`, then `make_small` (zero allocation, the field is at most 32 bits) stored to `dst`.
+- Fallback: one interpreter step — a match-context subject, a bare `BinRef`, a literal-area subject and every non-bitstring, i.e. exactly the forms `raw::heap_bits` cannot read as a window.
+
+### `bs_match { fail, ctx, commands }` — `bs_match.rs::try_inline_bs_match`
+- Predicate `bs_match_shape(labels, module, fail, ctx, commands)`: a **fully static** command list of `ensure_at_least`/`ensure_exactly`/`skip`/`integer`, every size/unit/stride a compile-time constant, every `ensure_at_least` unit a power of two, every `integer` field passing the tier's width and flag rules, at most one `Y` destination; `ctx` is a `Loc`, `fail` is not `NO_FAIL` and resolves.
+- Run-time guards: each accepted `Y` destination's window guard first (at most one); the match-context guard; then per command in order — `ensure_at_least` tests `remaining % unit == 0` (masked) and `remaining >= size`, `ensure_exactly` tests `remaining == stride`, `skip` checks `checked_add` overflow then `> end`, and each `integer` repeats `bs_get_integer2`'s remaining/subject/extract guards.
+- Commit: command by command, so a rejected later command leaves the context at the last successful one — the family's own partial-progress semantics.
+- Fallback: one interpreter step for the whole instruction; `fail_arm` is the resolved label's linker exit.
+
+### Deliberately left on `jit_bitstr`
+A `bs_match` command list containing `binary`, `get_tail` or `=:=` declines the **whole** instruction: each builds a fresh term (`raw::make_binary` reserves unconditionally), so a moving collection could relocate the context block mid-list and the once-read block base would go stale.
+`binary` matters most — its command group has the **same width** as `integer`'s, so a fall-through would read it as an integer field and bind an integer where a sub-binary is due, a wrong value rather than a refusal.
+The tier's width rule `field_width_supported` accepts `nbits <= 16 || nbits == 32` (and `<= MAX_SMALL`), the widths `emit_bit_extract` covers — aligned 8/16/32 plus a bit-granular field under 16 bits — so a 17..=59-bit or a 64-bit field stays on the family.
+A **runtime** (non-constant) `size`/`unit`/`stride` stays on the family: it would be a register compare the emitted sequence does not have.
+An `ensure_at_least` **unit** that is not a power of two stays on the family: `remaining % unit` would no longer lower to a mask, and `unit == 0` is a division by zero.
+A **literal-area subject** (`TAG_LITERAL_PTR` set), a match-context subject, a bare `BinRef` and any non-bitstring subject stay on the family.
+A **signed**, **little-endian**, or `native`-on-a-little-endian-host `flags` word stays on the family — the family's `erts_bs_get_integer_2` general reader, which sign-extends or byte-swaps.
+`NO_FAIL` stays on the family wherever the shape has no `MatchFail::Family` arm (every field-extracting shape), because the raise's reason allocates; an **unresolved** fail label stays on the family and keeps its exact `unknown_label`.
+A `bs_match` list with **more than one** `Y` destination stays on the family, because the sequence keeps one live Y address.
+`bs_match_string`, `bs_create_bin`, the six UTF opcodes (`bs_get_utf8`/`bs_get_utf16`/`bs_get_utf32`/`bs_skip_utf8`/`bs_skip_utf16`/`bs_skip_utf32`), `bs_get_binary2`, `bs_get_tail`, `bs_init_writable` and the float ops (`bs_get_float2`, `bs_put_float`, `bs_get_float`) have **no arm at all**.
+Which refusals actually occur in the corpus is **measured**, not asserted here: `emit/test/refusal_census.rs` attributes every `Bs*` instance to inlined / refused-by-reason / no-arm, and `../census/CONTEXT.md` records the closed reason vocabulary and the accounting pin.
+The reasons above that the census can see are the allocating command, the runtime size/unit/stride, the width rule, the flag rule and the second `Y` destination; the rest are structural (they change the emitted sequence rather than its attribution).
+Each shape also has a `#[cfg(test)]` compile-time counter — `inlined(SHAPE_*)` in `../emit/bitstr_inline/mod.rs` — because an inlined shape calls no helper, so a run-time helper counter cannot observe it.
+
 ## See Also
 - `../CONTEXT.md` → the tier contract, the two artifact layouts, the routing table.
 - `../emit/CONTEXT.md` → the emitter contract; `../emit/shapes/CONTEXT.md` → the shape predicates.

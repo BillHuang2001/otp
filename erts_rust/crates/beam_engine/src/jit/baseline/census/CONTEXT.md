@@ -146,25 +146,59 @@ The three store models come from **one** recorded run, so they are directly comp
 
 ### Table 4 — per-kind emitted code size
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_per_kind_emitted_code_size_table_is_printed -- --nocapture`
-The reference is a block with ONE always-deopting `func_info`: **212 bytes**, whose `2x − 1x`
+The reference is a block with ONE always-deopting `func_info`: **195 bytes**, whose `2x − 1x`
 marginal — the fixed per-occurrence deopt sequence every un-lowered instruction costs — is
 **60 bytes**.
+Every row is asserted **lowered**, i.e. its block records `deopts == 0`, so a row cannot describe a
+shape that quietly went back to the helper.
 | shape | inlined block | vs deopt ref | per-occurrence | lowered |
 |---|---|---|---|---|
-| `Move x<-int` | 175 | −37 | +10 | yes |
-| `Move x<-literal` | 285 | +73 | +127 | yes |
-| `Test Y-src (is_nil)` | 308 | +96 | +177 | yes |
-| `SelectVal Y-src` | 243 | +31 | n/a (block ends) | yes |
-| `SelectTupleArity Y-src` | 349 | +137 | n/a (block ends) | yes |
-| `Call` (frame-preserving) | 187 | −25 | n/a (block ends) | yes |
-| `Family arm (put_tuple2)` | 212 | +0 | +60 | yes |
-| `CallLast` (unlinked exit) | 230 | +18 | n/a (block ends) | yes |
-Σ of the eight deltas, one occurrence each: **+293 B**. Both figures are **whole-block** sizes, so
+| `Move x<-int` | 158 | −37 | +10 | yes |
+| `Move x<-literal` | 268 | +73 | +127 | yes |
+| `Test Y-src (is_nil)` | 308 | +113 | +177 | yes |
+| `SelectVal Y-src` | 243 | +48 | n/a (block ends) | yes |
+| `SelectTupleArity Y-src` | 349 | +154 | n/a (block ends) | yes |
+| `Call` (frame-preserving) | 170 | −25 | n/a (block ends) | yes |
+| `Family arm (put_tuple2)` | 195 | +0 | +60 | yes |
+| `BsGetPosition` | 340 | +145 | +193 | yes |
+| `BsSetPosition` | 421 | +226 | +274 | yes |
+| `BsTestTail2` | 349 | +154 | +208 | yes |
+| `BsSkipBits2` | 347 | +152 | +206 | yes |
+| `BsStartMatch3` | 431 | +236 | +291 | yes |
+| `BsStartMatch4` | 431 | +236 | +291 | yes |
+| `BsGetInteger2` | 827 | +632 | +687 | yes |
+| `BsMatch (static cmds)` | 893 | +698 | +753 | yes |
+| `CallLast` (unlinked exit) | 213 | +18 | n/a (block ends) | yes |
+Σ of the sixteen deltas, one occurrence each: **+2823 B** (this is the current reading of the
+instrument named above, not a hand-edited figure). Both figures are **whole-block** sizes, so
 both carry the shared prologue/exit/epilogue; the `2N − N` **marginal** is the confound-free
 per-occurrence figure and only exists where a second copy fits in the block.
 An artifact-wide deopt-only figure would multiply each delta by that shape's occurrence count, which
 this table deliberately does not do; the whole-artifact `code_len` over the 38 fixtures is
-**294 590 B**.
+**330 290 B** (largest `bsmatch.beam` 39 994 B / 90 blocks / 385 emitted instances, `bssmall.beam`
+38 064 B / 102 / 359).
+The eight `Bs*` rows are the reason the bitstring arms are budgeted as their own code-size class:
+`emit/compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES` (448) per inlined bitstring
+instruction and `BS_MATCH_COMMAND_BYTES` (320) per accepted `bs_match` command, so an unbounded
+`bs_match` list can never under-allocate the `CodeBuffer`.
+
+### Table 4b — bitstring refusal attribution
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_refusal_attribution_census_is_printed -- --nocapture`
+The instrument is `emit/test/refusal_census.rs`; it walks the same corpus and classifies every `Bs*`
+instruction instance as inlined, refused by one closed reason, or having no arm at all.
+Current corpus reading (the run behind the rows above): **27 438** `Bs*` instructions —
+**15 346** inlined, **4 670** refused, **7 422** with no arm.
+The refuse rows: **3 247** `bs_match` allocating command, **1 077** `bs_skip_bits2` runtime
+size/unit/stride, **171** `bs_get_integer2` runtime size/unit/stride, **73** `bs_match` width rule,
+**61** `bs_get_integer2` signed/little/native field, **40** `bs_match` signed/little/native field,
+**1** `bs_match` >1 `Y` destination.
+The no-arm rows: `bs_get_tail` 3 694, `bs_create_bin` 1 922, `bs_get_binary2` 972, `bs_get_utf16` 487,
+`bs_get_utf8` 135, `bs_init_writable` 93, `bs_match_string` 69, `bs_skip_utf8` 18, `bs_get_float2` 15,
+`bs_get_utf32` 9, `bs_skip_utf16` 4, `bs_skip_utf32` 4.
+The reason vocabulary is a closed set of `const` strings (`BS_REASON_ALLOC`, `_LITERAL`, `_RUNTIME`,
+`_UNIT`, `_WIDTH`, `_NO_FAIL`, `_LABEL`, `_Y_DST`, `_FIELD`, `_OTHER`), so a new refusal must be named
+rather than folded into a catch-all, and the test pins the accounting
+`inlined + refused + no_arm == bs_instructions` so no instance can be dropped silently.
 
 ### Table 5 — runtime deopt and dynamic execution (the hot in-crate shapes)
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_runtime_deopt_census_over_the_hot_shapes_is_printed -- --nocapture`
