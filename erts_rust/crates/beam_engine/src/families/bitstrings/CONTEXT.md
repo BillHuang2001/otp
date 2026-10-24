@@ -467,10 +467,18 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   `Vec<PreparedCommand>` with the command tag, flags, size/unit and `Dst` already resolved, which
   deletes the per-element `atom_name` + `&str` match, the flags literal-area read (the empty-list
   arm's own work) and the two `read_size` decodes while the load-time cost stays amortised.
-- **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside
-  this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
-  (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
-  `pub(crate) mod families` (or targeted root re-exports) first.
+- **The reachability wall is this node's own `mod` declarations, not the crate root.** `src/lib.rs:109`
+  declares `pub(crate) mod families;`, so `crate::families::bitstrings::{exec, claimed}` and
+  `create::assemble` (already `pub(crate)`) ARE reachable from `src/jit/**` — `jit/baseline/bitstr.rs:58`
+  does exactly that. What is still private is `mod create; mod matching; mod raw;`
+  (`bitstrings/mod.rs:67-71`), which makes the `pub(crate)` bodies one level down unreachable despite
+  their declared visibility: `matching/match_ctx.rs` (`enter_match`, `read_ctx`/`reread_ctx`,
+  `position_term`/`position_of`), `raw::{heap_bits, ctx_parts, set_ctx_start}`, and
+  `create::prepared::{prepare, assemble_prepared, CreateProgram, PreparedSeg, Width}` (whose module is
+  `pub(super) mod prepared;`, `create/mod.rs:139`, and whose `pub(super)` items are visible only inside
+  `create`). A tier that wants one of those must first widen the enclosing declaration
+  (`pub(crate) mod raw;` / `pub(crate) mod prepared;` / `pub(crate) mod create;`) plus the item itself —
+  declaring the item `pub(crate)` alone changes nothing.
 - **`terms::number::make_integer_unrooted` at 2.61 % is CALL overhead, not allocation** — its
   small-value arm is `make_small` (no allocation), but the function is not inlined at its
   `src/operand.rs` call sites. **OWNER: the parent `src/` node.**
