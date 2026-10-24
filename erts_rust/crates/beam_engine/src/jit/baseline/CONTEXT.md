@@ -110,10 +110,17 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   own `families::bitstrings::claimed` predicate — the one function the router
   (`families/mod.rs`'s `_ if bitstrings::claimed(instr)` arm) routes on — and reaches
   `crate::families::bitstrings::exec` **directly**, skipping `crate::families::dispatch`'s variant
-  re-match: same position store, same resolve-or-decline to `jit_step_one` (also for a variant the
-  family answers `Ok(None)` for), same unconditional `with_uncaught_frames` raise decoration (with the
-  run's `entry_module`), same `fold_ok_step`/`fold_err` encoding. The `class_atoms_live` latch is the **family entry's** own (`bitstrings::exec` installs it
+  re-match: same resolve-or-decline to `jit_step_one` (also for a variant the family answers `Ok(None)`
+  for), same unconditional `with_uncaught_frames` raise decoration (with the run's `entry_module`),
+  same `fold_ok_step`/`fold_err` encoding. The `class_atoms_live` latch is the **family entry's** own (`bitstrings::exec` installs it
   before the variant check), so a direct caller gets it too and this helper performs no copy of it.
+  Unlike `jit_family` it does **no** position store: the emitted arm publishes the instruction's own
+  `(func, pc)` inline before the call (`emit/family.rs::emit_bitstr` → `emit_positioned_helper_call` →
+  the prologue's `emit_position_store`, 24 B / three instructions — both operands are compile-time
+  constants there, where the helper had to re-derive `pack_current_code` from two run-time arguments on
+  every execution). The position still names the instruction, not the block, **before** it runs, so a
+  pre-emption or a suspension parks exactly there; `tests.rs::the_bitstring_arm_stores_the_instruction_position_inline`
+  pins both halves (the emitted bytes and the parked position of a raising `bs_start_match3`).
   It runs **no** per-execution shape predicate: the route is decided at compile time (re-testing it
   per execution measured ≈⅓ of the win). `bitstr_calls()` is `#[cfg(test)]`-only — it proves the
   helper actually ran; the claim set itself has no test-build copy.

@@ -22,6 +22,9 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   frame's Y window in one call — then load each cached register in
   `Allocation::entry_fill` from `machine.x` (the block's **live-in** slots: a cached register the block
   writes before it reads is not loaded at entry, because that writing instruction sets it).
+  `emit_position_store` is the **one** encoder of an instruction position (`pub(super)`, so
+  `../family.rs`'s bitstring arm emits the same 24 B for each `Bs*` instruction before its helper call —
+  `jit_bitstr` no longer stores the position itself; see `../CONTEXT.md`).
   The frame is **variable-length**: `k = native_frame_regs(allocation).len()` is the block's own push count,
   so the reservation and the teardown's matching `lea rsp,[rsp+frame_slot_len(k)]` always agree
   (`emit/link.rs::emit_frame_teardown` derives both sides from the same `native_frame_regs`). Corpus
@@ -46,6 +49,11 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   argument words, and `call r11`; it does **not** spill after the call (the helper legitimately wrote
   `machine.x`) — `fill` reloads instead. `link.rs::emit_tail_exit` spills before `call jit_tail_call`.
   No emitted path in this node calls a helper without spilling first.
+  The spill/`rdi` halves are shared with `mod.rs::emit_positioned_helper_call(buf, alloc, helper, args,
+  func, pc)` — the same sequence **plus** `emit_position_store(func, pc)` between the `rdi` load and the
+  argument loads (the `Bs*` arm: its helper no longer stores the position itself, so the store costs
+  three instructions and reuses the same `rt` load). Both call one private `emit_helper_invoke`
+  (`rsi`/`rdx`/`rcx`/`r8`/`r9` argument `movabs`es + `call r11`), so the ABI sequence exists once.
 - **Every spill site passes the instruction's own `pc`.** `emit_helper_call` stores at the instruction's
   `pc`; `link.rs::emit_exit`/`emit_tail_exit`/`emit_tail_exit_to_driver` take a trailing `store_pc`
   **separate** from their branch target `(func, pc)` (a `jump`/`call`/`call_last`/`call_only` passes its

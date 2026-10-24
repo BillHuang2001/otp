@@ -111,11 +111,26 @@ pub(super) fn emit_block_prologue(
     Ok(())
 }
 
-/// Emit the prologue's position store **inline**: write this block's own
-/// `(func, pc)` — two compile-time constants — into `machine.current_code`.
+/// Emit an **inline position store**: write `(func, pc)` — two compile-time constants —
+/// into `machine.current_code`.
+///
+/// The one encoder, used at both sites that must record an instruction position
+/// without a helper call:
+///
+/// * the block prologue ([`emit_block_prologue`]), for the block's entry `(func, start)`
+///   — a linked branch never returns to the driver, so the position must still advance;
+/// * the bitstring arm ([`emit_bitstr`](super::family::emit_bitstr)), for each `Bs*`
+///   instruction, **before** its helper call: `jit_bitstr` used to store the position
+///   itself, re-deriving the packed word from its two run-time arguments on every
+///   execution. Sharing this function is what keeps one encoder (and
+///   [`crate::machine::pack_current_code`] underneath it) the only definition of the
+///   position word.
 ///
 /// The destination is the one `u64` word `Machine::set_current_code` writes, reached
-/// through the `rt` argument the block was entered with:
+/// through the `rt` argument the block was entered with (`rdi` at both sites: the
+/// prologue receives it, the bitstring arm reloads it from the block's `rt` slot —
+/// [`emit_positioned_helper_call`](super::emit_positioned_helper_call) does that load
+/// before calling this):
 ///
 /// ```text
 /// mov r10, [rdi + RUNTIME_CURRENT_CODE_DISP]   ; r10 = &machine.current_code
@@ -134,14 +149,15 @@ pub(super) fn emit_block_prologue(
 /// `r10`/`r11` are the caller-saved move scratch registers ([`super::MOVE_SCRATCH_2`]/
 /// [`super::MOVE_SCRATCH`]), never cache registers, and they are free here: a block's
 /// cache registers are loaded only *after* this point and no value survives into the
-/// next instruction. `rdi` still holds the block's `rt` argument (neither the frame
-/// push nor the `rt`-slot store above modifies it), so the load needs no stack slot.
-/// A position store cannot fail, so nothing is checked.
-fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
-    // Structural counter: one emitted (Y-free) block prologue position store. A
-    // **compile-time** count — the store is generated code now, so there is no helper
-    // call left runtime to record it; the count is the number of prologues that emit
-    // this sequence (the emission site is the only place that knows).
+/// next instruction. `rdi` must hold the block's `rt` argument (the prologue received it
+/// and never modifies it; the bitstring arm reloads it from the block's `rt` slot), so
+/// the load needs no stack slot. A position store cannot fail, so nothing is checked.
+pub(super) fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    // Structural counter: one emitted inline position store (a Y-free block prologue's
+    // entry, or one bitstring arm's instruction). A **compile-time** count — the store is
+    // generated code now, so there is no helper call left at run time to record it; the
+    // count is the number of sites that emit this sequence (the emission site is the only
+    // place that knows).
     #[cfg(test)]
     super::super::counters::record_set_position();
     buffer.mov_rm(Reg::R10, Reg::Rdi, RUNTIME_CURRENT_CODE_DISP)?;

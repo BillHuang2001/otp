@@ -43,11 +43,11 @@
 //!   [`jit_call_store_linked`](super::call::jit_call_store_linked), split into the taken
 //!   transfers (a driver round-trip the tier did not pay) and the declines (the honest
 //!   residual: the call kept the pre-existing round-trip).
-//! * **Prologue position/publish calls** — [`record_publish_y`] /
+//! * **Position / publish calls** — [`record_publish_y`] /
 //!   [`record_refresh_y`] from the two Y-window prologue helpers at **run** time, plus
-//!   [`record_set_position`] from the prologue **emitter** at **compile** time (the
-//!   plain position store is three generated instructions, so it has no runtime site
-//!   left to count).
+//!   [`record_set_position`] from the **emitter** at **compile** time (a plain position
+//!   store is three generated instructions and has no runtime site left to count): one per
+//!   Y-free block prologue and one per emitted `Bs*` arm.
 //! * **`Y`-window traffic** — [`record_y_access`] (every emitted guarded `Y`-slot read
 //!   or write, with its emitted byte length) and [`record_y_invalidation`] (every
 //!   in-block helper call after which a later instruction of the same block still
@@ -195,7 +195,7 @@ pub(crate) struct Counters {
     /// Each one paid the pre-existing driver round-trip, so this is the honest residual
     /// of [`in_block_calls`](Counters::in_block_calls).
     pub(crate) in_block_call_declines: u64,
-    /// Emitted **inline** block-entry position stores
+    /// Emitted **inline** position stores
     /// ([`emit_position_store`](super::emit::emit_position_store)) — the static twin of
     /// what used to be the `jit_set_position` **runtime** count.
     ///
@@ -203,8 +203,9 @@ pub(crate) struct Counters {
     /// through [`JitRuntime::current_code`](super::runtime::JitRuntime), so there is no
     /// helper left whose body could count the executions (the runtime figure is now
     /// structurally zero — nothing calls a position-store helper); the emission site is
-    /// the only place that knows how many prologues carry one, so this counts **emitted
-    /// sites** (i.e. one per Y-free block prologue), exactly as
+    /// the only place that knows how many sites carry one, so this counts **emitted
+    /// sites**: one per Y-free block prologue, plus one per emitted `Bs*` arm (the
+    /// bitstring helper's own store moved into the arm), exactly as
     /// [`y_prologue_publishes`](Counters::y_prologue_publishes) counts emitted publishes
     /// beside the runtime [`publish_y`](Counters::publish_y).
     pub(crate) set_position: u64,
@@ -463,9 +464,9 @@ pub(crate) fn record_in_block_call(taken: bool) {
         }
     });
 }
-/// One **emitted** inline block-entry position store — recorded from the prologue
-/// emitter at **compile** time, not from a helper call (see
-/// [`Counters::set_position`]).
+/// One **emitted** inline position store — a Y-free block prologue's entry store, or a
+/// `Bs*` arm's per-instruction store — recorded from the emitter at **compile** time, not
+/// from a helper call (see [`Counters::set_position`]).
 pub(crate) fn record_set_position() {
     with(|c| c.set_position += 1);
 }

@@ -139,7 +139,9 @@ by construction).
   — the canonical full callee-saved set — `CACHE_REGISTERS`/`RUNTIME_SLOT_DISP`/`MOVE_SCRATCH`/
   `MOVE_SCRATCH_2`), the variable-frame helpers `native_frame_regs`/`frame_slot_len`, `touch`,
   `emit_refresh_y`, `emit_helper_call` (which takes the instruction's own `pc` as the store pc),
-  `emit_step_and_continue`, `emit_continue_check`, `emit_continue_check_helper_refresh`; re-exports
+  `emit_positioned_helper_call` (the same sequence **plus** the bitstring arm's inline position store —
+  see `../CONTEXT.md`), the private `emit_helper_invoke` both share, `emit_step_and_continue`,
+  `emit_continue_check`, `emit_continue_check_helper_refresh`; re-exports
   `regs::{Allocation, SpillSite, FillSite}` and `pub(crate) use block::emit_block`, `compile_module`/
   `compile_function` (keeping every item path stable for `baseline/mod.rs`, `baseline/code.rs`, the
   sibling emitter files and the `#[cfg(test)]` names `baseline/tests.rs` reaches through `emit::*`), plus
@@ -150,8 +152,8 @@ by construction).
   `prologue.rs`.
 - `prologue.rs` -> the compiled-block prologue: `emit_block_prologue` (the frame-register pushes, the
   `rt`-slot reservation, the `machine.x` base load, the position store / Y-window publish and the
-  live-in cache load) plus the private `emit_position_store`/`emit_publish_y`/`emit_prologue_helper`
-  it uses.
+  live-in cache load) plus the `pub(super)` `emit_position_store`/private `emit_publish_y`/
+  `emit_prologue_helper` it uses (`emit_position_store`'s second user is `family.rs`'s bitstring arm).
 - `regs.rs` -> the block register cache: `Allocation` (`slots`/`written`/`spill_sets`/`y_last`/
   `y_first`/`frame_republish_first`/`block_start`/`fill_sets`/`entry_fill`,
   `slot`/`is_written`/`spill_slots`/`spill_slots_at`/`fill_slots`/`entry_loads`/`refresh_y_after`/
@@ -238,7 +240,9 @@ by construction).
   Y window), plus its unit tests (the spill-first call order, the frame-only-vs-heap-admitting refill
   split, and `a_frame_changing_helper_emits_no_separate_refresh_call`).
 - `family.rs` -> `emit_family` (the shared helper arm for every family-owned variant: an
-  `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`).
+  `emit_helper_call` to `../family.rs::jit_family` + `emit_continue_check`) and `emit_bitstr` (the same
+  arm for the `Bs*` family through `../bitstr.rs::jit_bitstr`, plus the inline position store its
+  helper no longer performs — `emit_positioned_helper_call`).
 - `../runtime.rs` -> `jit_step_one` / `jit_ext_call` / `jit_local_call` / `jit_tail_call` /
   `jit_deallocate` / `jit_return` / `jit_deallocate_return` / `jit_allocate` / `jit_allocate_heap` /
   `jit_test_heap` / `jit_trim` / `jit_publish_y` / `jit_refresh_y` / `JitRuntime`

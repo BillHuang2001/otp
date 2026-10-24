@@ -327,6 +327,12 @@ Every store is an instruction boundary, but **not** every store happens before t
   `jit_test_heap`, `jit_trim` — all in `jit/baseline/runtime.rs`. `resume_in_block` stores the address it
   is about to resume at, in the driver loop head's own order; a `jit_step_one` deopt reaches the store
   through `step_instruction_with_entry`.
+- Native `Bs*` arm (`jit/baseline/emit/family.rs::emit_bitstr`): the instruction's **own** pc, stored
+  **inline before the helper call** through the same `emit_position_store` encoder the prologue uses
+  (`emit_positioned_helper_call` places it after the `rdi = [rsp+RUNTIME_SLOT_DISP]` load and before the
+  argument loads — three instructions, no call, zero extra `rt` fetch), exactly like the prologue. So
+  `jit_bitstr` (`jit/baseline/bitstr.rs`) stores **nothing**: the position is emitted at compile time
+  instead of re-derived from the helper's `func`/`pc` arguments on every execution.
 - **Seam routes that store NOTHING**, so a host hook reached through them runs with a stale
   (block-entry-or-earlier) position: `jit_ext_call` (`resolve_ext_entry` asks
   `ctx.resolve_external_call` and hands the driver the `ENTER` word), `jit_local_call`/`probe_local_call`

@@ -34,11 +34,17 @@
 //! other member — not one hand-picked shape, and never a hand-maintained copy of the set.
 //!
 //! Everything else is deliberately identical to [`super::family::jit_family`]: the same
-//! position store, the same instruction fetch (declining to [`jit_step_one`] on an address
-//! that does not resolve), the same context-`0` raise decoration, and the same
+//! instruction fetch (declining to [`jit_step_one`] on an address that does not resolve),
+//! the same context-`0` raise decoration, and the same
 //! [`fold_ok_step`]/[`fold_err`] encoding of the outcome. The helper therefore cannot
 //! produce a result the interpreter's per-instruction step would not — only reach it one
 //! dispatch hop sooner.
+//!
+//! One thing it does **not** share with the generic family helper is the instruction-position
+//! store: that moved to the emitted arm ([`emit_bitstr`](super::emit::emit_bitstr) emits the
+//! prologue's three-instruction inline store for the instruction's own `(func, pc)` right
+//! before the call), because both operands are compile-time constants there and the helper
+//! had to re-derive the packed word from two run-time arguments on every execution.
 //!
 //! **The helper runs no per-execution shape predicate.** The emit side decided the route at
 //! compile time (the `emit_block` arm); re-deciding it here would hand back a large part of
@@ -73,11 +79,15 @@ thread_local! {
 ///
 /// The [`StepHelper`](super::runtime::StepHelper) signature, so the emitter drives it through
 /// the very emission sequence the generic family arm uses
-/// ([`emit_helper_call`](super::emit::emit_helper_call) +
-/// [`emit_continue_check`](super::emit::emit_continue_check)): a completed instruction reports
-/// [`Step::Next`](crate::Step::Next) and the block continues in-block, a fail-label branch
-/// reports a `Goto` and a raise/`Wait` leaves the block with that word for the driver —
-/// exactly what [`jit_family`](super::family::jit_family) would have produced.
+/// ([`emit_positioned_helper_call`](super::emit::emit_positioned_helper_call) +
+/// [`emit_continue_check`](super::emit::emit_continue_check)): a completed instruction
+/// reports [`Step::Next`](crate::Step::Next) and the block continues in-block, a fail-label
+/// branch reports a `Goto` and a raise/`Wait` leaves the block with that word for the
+/// driver — exactly what [`jit_family`](super::family::jit_family) would have produced.
+///
+/// The instruction position (`machine.current_code`) is **not** this helper's: the emitted
+/// arm stores it inline before the call, with both operands as compile-time constants (see
+/// the comment at the former store site below).
 pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it holds
@@ -92,9 +102,9 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // SAFETY: `runtime.module` points at the module the driver is running, which outlives
         // the loop.
         let module = unsafe { &*runtime.module };
-        // SAFETY: `runtime.entry_module` points at the run's entry module, which the driver
-        // holds alive for the whole loop.
-        let entry_module = unsafe { &*runtime.entry_module };
+        // `runtime.entry_module` is deliberately **not** loaded here: only the raise arm
+        // below needs it, and on the steady state every extra live pointer costs a load and
+        // a callee-saved register. See that arm for the read (and its own SAFETY note).
         // SAFETY: `runtime.labels` points at the driver's `labels` local, which outlives the
         // loop.
         let labels = unsafe { &*runtime.labels };
@@ -102,11 +112,18 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
         // raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
 
-        // The same position store `Machine::step_instruction` makes at entry: a `bs_match`
-        // raises `{badmatch, Subject}` at NO_FAIL and branches at a fail label, and
-        // `bs_create_bin`/`bs_init_writable` are allocation (move/raise) positions, so the
-        // machine's saved instruction pointer must name this instruction, not the block.
-        machine.set_current_code(func, pc);
+        // **No position store here.** The emitted arm publishes this instruction's own
+        // `(func, pc)` into `machine.current_code` inline, immediately before the call
+        // ([`emit_bitstr`](super::emit::emit_bitstr) through
+        // [`emit_positioned_helper_call`](super::emit::emit_positioned_helper_call)): both
+        // operands are compile-time constants at the emit site, so the store is the
+        // prologue's three instructions there instead of the packed word being re-derived
+        // from this call's two arguments on every execution. The contract is unchanged —
+        // the position names **this** instruction, not the block, *before* the instruction
+        // runs — which is what keeps a `bs_match`'s `{badmatch, Subject}` at NO_FAIL, a
+        // fail-label branch and an allocation (`bs_create_bin`/`bs_init_writable`)
+        // position exact, including under a pre-emption (`reduce`'s `Err`, leaving this
+        // instruction un-applied) and a suspension.
 
         // The instruction this block emitted the helper for. An address outside the module
         // cannot be here (the block was compiled from this very code), so it is handed to the
@@ -136,8 +153,14 @@ pub(crate) extern "C" fn jit_bitstr(rt: *mut JitRuntime<'_>, func: u32, pc: u32)
             // one place the raise is decorated — in the entry context and inside a
             // cross-module callee alike, with `func`/`pc` naming the raising instruction in
             // the active module and `entry_module` the module every context-`0` frame
-            // belongs to.
-            Err(err) => Err(machine.with_uncaught_frames(err, Some(entry_module), func, pc)),
+            // belongs to. The entry module is read **here** rather than beside the other
+            // pointers above: this is its only use, and a raise is the cold path.
+            Err(err) => {
+                // SAFETY: `runtime.entry_module` points at the run's entry module, which the
+                // driver holds alive for the whole loop.
+                let entry_module = unsafe { &*runtime.entry_module };
+                Err(machine.with_uncaught_frames(err, Some(entry_module), func, pc))
+            }
         }
     };
     match outcome {

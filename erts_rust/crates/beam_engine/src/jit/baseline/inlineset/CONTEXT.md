@@ -28,7 +28,8 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
   set, `make_fun3`/`call_fun`/`call_fun2`/`apply`/`apply_last`, the try/catch/raise set, the float set, the
   map set, `recv_marker_*` via `emit/family.rs::emit_family` → `family.rs::jit_family`; the whole bitstring
   family — the variants `families::bitstrings::claimed` names — via `emit/family.rs::emit_bitstr` →
-  `bitstr.rs::jit_bitstr`, its own arm),
+  `bitstr.rs::jit_bitstr`, its own arm, which additionally emits the instruction's inline position store
+  before the call because that helper does not store the position itself),
   the frame-discipline trio (`Deallocate` via `frame.rs::emit_deallocate`, `Return` via `::emit_return`,
   `DeallocateReturn` via `::emit_deallocate_return`), and the **heap / frame-admission** family
   (`allocate` via `heap.rs::emit_allocate`, `allocate_heap` via `::emit_allocate_heap`, `test_heap` via

@@ -2521,11 +2521,129 @@ fn the_prologue_position_store_is_emitted_inline() {
     );
 }
 
+/// The bitstring arm's position store is **generated code** too, and it names the
+/// instruction, not the block.
+///
+/// [`jit_bitstr`](super::bitstr::jit_bitstr) used to store `machine.current_code` itself
+/// on every execution — `pack_current_code(func, pc)` re-derived from its two run-time
+/// arguments, then a store through `runtime.machine`. Both operands are compile-time
+/// constants at the emit site, so the arm now emits the prologue's exact three-instruction
+/// sequence ([`emit_position_store`], **one** encoder) before the helper call:
+///
+/// ```text
+/// mov rdi,  [rsp + RUNTIME_SLOT_DISP]          ; rt            (the helper call's own load)
+/// mov r10,  [rdi + RUNTIME_CURRENT_CODE_DISP]  ; &machine.current_code
+/// mov r11,  movabs pack_current_code(func, pc) ; THE INSTRUCTION's packed position
+/// mov [r10], r11
+/// ```
+///
+/// This pins the emitted bytes of the store half — the `JitRuntime` field offset the
+/// driver publishes, the packed word for the *instruction's* own `(func, pc)` (the same
+/// [`pack_current_code`] `Machine::set_current_code` uses; a second encoder here would
+/// silently desynchronise every position and `process_info` item), and that the store
+/// precedes the helper call in the same arm — and the behavioural half: a raise from the
+/// `Bs*` instruction leaves the machine parked on **it**, not on the block entry (without
+/// the inline store the position would still name the block's `pc 0`).
+#[test]
+fn the_bitstring_arm_stores_the_instruction_position_inline() {
+    // One `bs_start_match3` at pc 1 of the block that starts at pc 0, so the instruction's
+    // packed word (`pack_current_code(0, 1)`) is distinguishable from the prologue's
+    // (`pack_current_code(0, 0)`).
+    let module = build_module(
+        "inline_bitstr_position",
+        &[],
+        vec![(
+            "f",
+            1,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::BsStartMatch3 {
+                    fail: NO_FAIL,
+                    bin: Operand::X(0),
+                    live: 1,
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 1, Label(1))],
+    );
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/1 compiles");
+    let code = function_code_bytes(&function);
+
+    // The store: `mov r10,[rdi + RUNTIME_CURRENT_CODE_DISP]` / `movabs r11, word` /
+    // `mov [r10 + 0], r11`.
+    let mut store = vec![
+        // mov r10, [rdi + RUNTIME_CURRENT_CODE_DISP]  (REX.W|R, 0x8B, modrm, disp32)
+        0x4Cu8, 0x8B, 0x97,
+    ];
+    store.extend_from_slice(&RUNTIME_CURRENT_CODE_DISP.to_le_bytes());
+    // movabs r11, pack_current_code(0, 1) — the instruction's own address.
+    store.extend_from_slice(&[0x49, 0xBB]);
+    store.extend_from_slice(&(pack_current_code(0, 1) as i64).to_le_bytes());
+    // mov [r10 + 0], r11  (REX.W|R|B, 0x89, modrm, disp32)
+    store.extend_from_slice(&[0x4D, 0x89, 0x9A, 0, 0, 0, 0]);
+    let at = code
+        .windows(store.len())
+        .position(|window| window == store.as_slice())
+        .unwrap_or_else(|| {
+            panic!(
+                "the bitstring arm must store its instruction's packed position inline \
+                 through `JitRuntime::current_code` (no helper-side re-derivation); the \
+                 emitted code was: {code:02X?}"
+            )
+        });
+    assert!(
+        at > 24,
+        "the prologue's own store (pc 0) comes first, so the instruction's store cannot be \
+         the block's entry store (found at byte {at})"
+    );
+
+    // …and it is emitted **in the arm**, immediately before the helper call: the helper's
+    // `movabs r11, jit_bitstr` follows it (the two `movabs` argument loads in between).
+    let mut call = vec![0x49u8, 0xBB];
+    call.extend_from_slice(
+        &(super::bitstr::jit_bitstr as extern "C" fn(*mut JitRuntime<'_>, u32, u32) -> i64
+            as *const () as u64)
+            .to_le_bytes(),
+    );
+    let call_at = code
+        .windows(call.len())
+        .position(|window| window == call.as_slice())
+        .expect("the arm calls the bitstring helper");
+    assert!(
+        call_at > at && call_at - at < 48,
+        "the position store must precede the helper call it belongs to (store at {at}, \
+         call at {call_at}) — the helper no longer stores the position itself"
+    );
+
+    // The behavioural half: a `bs_start_match3` on a non-binary raises, and the tier leaves
+    // the machine parked on the **instruction**.
+    let name = export_atom(&module, "f");
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    machine
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            1,
+            &[make_small(7)],
+            &mut ctx,
+            Tier::BaselineJit,
+        )
+        .expect_err("a `bs_start_match3` on a non-binary raises `{badmatch, Subject}`");
+    assert_eq!(
+        machine.current_code(),
+        Some((0, 1)),
+        "the raise is parked on the `bs_start_match3` instruction, not on the block entry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the register-file guard: whole-module for the eager layout, per-function for
 // the lazy one
 // ---------------------------------------------------------------------------
-
 /// A two-function module whose `f/0` **tail-calls** into `g/0`'s first block, and
 /// whose `g/0` touches a far higher x-register than `f/0` does.
 ///
@@ -5456,7 +5574,7 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.driver_interp_steps,
     );
     println!(
-        "  prologue: emitted_position_stores={} jit_publish_y={} jit_refresh_y={}",
+        "  position: emitted_stores={} jit_publish_y={} jit_refresh_y={}",
         counters.set_position, counters.publish_y, counters.refresh_y
     );
     println!(

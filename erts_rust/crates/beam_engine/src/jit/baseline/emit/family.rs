@@ -34,7 +34,7 @@ use crate::jit::emitter::{CodeBuffer, Label as CodeLabel};
 use super::super::bitstr::jit_bitstr;
 use super::super::family::jit_family;
 use super::super::runtime::StepHelper;
-use super::{emit_continue_check, emit_helper_call, Allocation};
+use super::{emit_continue_check, emit_helper_call, emit_positioned_helper_call, Allocation};
 
 /// Emit the native arm for one family-owned instruction: the
 /// [`jit_family`](super::super::family::jit_family) helper followed by the same
@@ -63,19 +63,28 @@ pub(super) fn emit_family(
     func: u32,
     pc: u32,
 ) -> Result<()> {
-    emit_step_helper(buffer, allocation, done, func, pc, jit_family)
+    emit_step_helper(buffer, allocation, done, func, pc, jit_family, false)
 }
 
 /// Emit the native arm for a **`Bs*`** instruction: the
 /// [`jit_bitstr`](super::super::bitstr::jit_bitstr) helper followed by the same
 /// continuation check a deopt uses.
 ///
-/// The emitted sequence is byte-for-byte [`emit_family`]'s — spill, call, continuation
-/// check — because the only thing the specialisation removes is the *routing* hop inside the
-/// helper (`crate::families::dispatch`'s variant match), not any emitted code. It is a
-/// distinct named entry, not a distinct emission, which is why both share
-/// [`emit_step_helper`]: a variant this arm does not claim keeps the generic family arm, and
-/// both reach the same family body.
+/// The emitted sequence is [`emit_family`]'s — spill, call, continuation check — plus one
+/// thing the generic family arm does not need: an **inline position store** for this
+/// instruction's own `(func, pc)` before the call (`position = true` below). The helper
+/// records `machine.current_code` itself no longer; both of its operands are compile-time
+/// constants here, so the shared three-instruction encoder
+/// ([`super::prologue::emit_position_store`], the prologue's) replaces the helper's own
+/// run-time re-derivation of the packed word. The position is still published **before**
+/// the instruction executes, so a pre-emption or a suspension parks on this very
+/// instruction.
+///
+/// The specialisation removes the *routing* hop inside the helper
+/// (`crate::families::dispatch`'s variant match), not any emitted code beyond that store.
+/// It is a distinct named entry, not a distinct emission, which is why both share
+/// [`emit_step_helper`]: a variant this arm does not claim keeps the generic family arm,
+/// and both reach the same family body.
 pub(super) fn emit_bitstr(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
@@ -83,12 +92,16 @@ pub(super) fn emit_bitstr(
     func: u32,
     pc: u32,
 ) -> Result<()> {
-    emit_step_helper(buffer, allocation, done, func, pc, jit_bitstr)
+    emit_step_helper(buffer, allocation, done, func, pc, jit_bitstr, true)
 }
 
 /// The one emission both family arms share: the helper call under the spill-then-call
 /// contract, then the continuation check that decides between "continue in-block" and
 /// "leave the word for the driver".
+///
+/// `position` selects [`emit_positioned_helper_call`] (the bitstring arm: the helper no
+/// longer stores the instruction position itself) over the plain
+/// [`emit_helper_call`] (the generic arm: its helper still does).
 fn emit_step_helper(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
@@ -96,13 +109,20 @@ fn emit_step_helper(
     func: u32,
     pc: u32,
     helper: StepHelper,
+    position: bool,
 ) -> Result<()> {
-    emit_helper_call(
-        buffer,
-        allocation,
-        helper as *const (),
-        &[i64::from(func), i64::from(pc)],
-        pc,
-    )?;
+    let args = [i64::from(func), i64::from(pc)];
+    if position {
+        emit_positioned_helper_call(
+            buffer,
+            allocation,
+            helper as *const (),
+            &args,
+            func,
+            pc,
+        )?;
+    } else {
+        emit_helper_call(buffer, allocation, helper as *const (), &args, pc)?;
+    }
     emit_continue_check(buffer, done, allocation, func, pc)
 }

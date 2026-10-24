@@ -325,9 +325,51 @@ pub(super) fn emit_helper_call(
     allocation: &Allocation,
     helper: *const (),
     args: &[i64],
-pc: u32) -> Result<()> {
+    pc: u32,
+) -> Result<()> {
     spill(buffer, allocation, SpillSite::Helper, pc)?;
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    emit_helper_invoke(buffer, helper, args)
+}
+
+/// Emit [`emit_helper_call`] with an **inline position store** for `(func, pc)` between
+/// the `rt` load and the argument loads — the same sequence, plus
+/// [`prologue::emit_position_store`]'s three instructions writing this instruction's own
+/// address into `machine.current_code` **before** the helper runs.
+///
+/// The one user is the bitstring arm ([`family::emit_bitstr`]): the helper it calls
+/// ([`jit_bitstr`](super::bitstr::jit_bitstr)) used to record the position itself, on
+/// every execution, re-deriving the packed word from its two run-time arguments. Both are
+/// compile-time constants at this site, so the store costs three instructions here and
+/// nothing in the helper — and the position is still published **before** the instruction
+/// executes, which is exactly what a pre-emption (`reduce`'s `Err`, leaving the
+/// instruction un-applied) and a suspension need.
+///
+/// `rdi` is loaded with the block's `rt` before the store (the store reads
+/// `JitRuntime::current_code` through it) and the visit sequence below reuses that load
+/// for the call, so the store costs no extra `rt` fetch.
+pub(super) fn emit_positioned_helper_call(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    helper: *const (),
+    args: &[i64],
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    spill(buffer, allocation, SpillSite::Helper, pc)?;
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    prologue::emit_position_store(buffer, func, pc)?;
+    emit_helper_invoke(buffer, helper, args)
+}
+
+/// The argument/call half of a helper sequence: `rdi` already holds `rt`, so load the
+/// helper's remaining integer arguments (the `rsi`/`rdx`/`rcx`/`r8`/`r9` ABI order, one
+/// `movabs` each) and call it through `r11`.
+///
+/// Split out of [`emit_helper_call`] so the positioned form above can emit its position
+/// store between the `rt` load and this invocation without a second copy of the ABI
+/// sequence.
+fn emit_helper_invoke(buffer: &mut CodeBuffer, helper: *const (), args: &[i64]) -> Result<()> {
     // The `rsi`/`rdx`/`rcx`/`r8`/`r9` argument registers, in ABI order.
     const ARG_REGISTERS: [Reg; 5] = [Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
     for (reg, value) in ARG_REGISTERS.iter().zip(args) {
