@@ -97,7 +97,6 @@ impl RuntimeContext<'_> {
         let connection_id_key = self.atom("connection_id")?;
         let node_type_key = self.atom("node_type")?;
         let mut entries = self.selected_node_entries(&types)?;
-        let atoms = self.runtime.code_server.atoms_handle();
         let mut tuples: Vec<Eterm> = Vec::with_capacity(entries.len());
         for (node, kind) in entries.drain(..) {
             let mut pairs: Vec<(Eterm, Eterm)> = Vec::with_capacity(2);
@@ -121,6 +120,14 @@ impl RuntimeContext<'_> {
             if info.node_type {
                 pairs.push((node_type_key, self.atom(kind.atom_name())?));
             }
+            // The table handle is taken **per entry, after** this entry's interns: an
+            // `atoms_handle` is an `Rc` clone and `atoms_mut` is `Rc::make_mut`, so an
+            // intern taken while a handle is alive deep-clones the whole shared table (one
+            // `Arc<str>` allocation + one hash-map insertion per atom) and drops the copy at
+            // once. Holding it across the loop cloned the table once per interned name — two
+            // clones per node entry. Taken last it is alive only for the map construction,
+            // and the code server stays the table's sole owner while the names are appended.
+            let atoms = self.runtime.code_server.atoms_handle();
             let info_map = terms::make_map(self, &pairs, &atoms)?;
             let tuple = terms::make_tuple(self, &[node, info_map])?;
             tuples.push(tuple);

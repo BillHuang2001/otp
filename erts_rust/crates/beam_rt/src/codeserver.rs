@@ -458,6 +458,12 @@ impl CodeServer {
     /// mutably borrowed by the fun-caller bridge. Interning still goes through
     /// [`CodeServer::intern_pending`] (a BIF's own names) or [`CodeServer::atoms_mut`] (the
     /// runtime's own seeding).
+    ///
+    /// **Never hold one across an intern.** This is an `Rc` clone and
+    /// [`CodeServer::atoms_mut`]/[`CodeServer::intern_pending`] write through `Rc::make_mut`,
+    /// so an intern taken while a handle is alive deep-clones the whole shared table (one
+    /// `Arc<str>` allocation + one hash-map insertion per atom) and the copy is dropped at
+    /// once. Take the handle **after** the last intern of the scope, never before it.
     pub(crate) fn atoms_handle(&self) -> Rc<AtomTable> {
         Rc::clone(&self.atoms)
     }
