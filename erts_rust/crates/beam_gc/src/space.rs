@@ -236,6 +236,31 @@ impl FromSet {
         self.ranges.len()
     }
 
+    /// Empties the set, **keeping its backing allocation** — the reuse seam a collection's
+    /// reusable walk scratch ([`crate::reachable::Scratch`]) drives, so a from-set rebuilt every
+    /// collection costs no allocation once its vector has grown to the chain's length.
+    ///
+    /// Dropping every range is not optional bookkeeping: a range names a region a collection
+    /// reads (and writes a forwarding marker into), so carrying one across collections would
+    /// evacuate a space a previous collection may already have freed. Only the scratch's
+    /// [`begin`](crate::reachable::Scratch::begin) — the sole holder of a mutable
+    /// [`FromSet`] inside a scratch — calls it, before any range is added.
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    /// Makes this set an exact copy of `other`, **keeping this set's backing allocation** — the
+    /// reuse seam for a caller that already holds the from-set it wants an equivalent of (a
+    /// one-shot walk over a range set its owner owns, e.g.
+    /// [`crate::live_words_in`](crate::live_words_in) over a foreign region): the copy is one
+    /// `extend_from_slice`, not a fresh vector.
+    ///
+    /// The result is the same set, so it carries the same hazard: the ranges are dropped and
+    /// replaced wholesale, never merged with what was there.
+    pub(crate) fn copy_from(&mut self, other: &FromSet) {
+        self.clear();
+        self.ranges.extend_from_slice(&other.ranges);
+    }
     /// Adds the live region of `space` as a range this set evacuates.
     pub fn add(&mut self, space: &HeapSpace) {
         self.insert(space.base() as usize, space.top() as usize);

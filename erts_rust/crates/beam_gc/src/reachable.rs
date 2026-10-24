@@ -57,8 +57,32 @@
 //! `unsafe` here is confined to reading the words the walk visits — the same guarantee the
 //! copier relies on ([`Target::Live`](crate::copy::Target::Live) dereferences them too) — and
 //! each block carries a `// SAFETY:` rationale. This module is crate-internal; the public
-//! collector methods that call [`for_each_reachable`] add no `unsafe` of their own and assume
+//! collector methods that call [`Scratch::for_each_view`] add no `unsafe` of their own and assume
 //! no interior layout beyond the canonical shape walk.
+//!
+//! # [`Scratch`] — the reused, and therefore clearable, walk state
+//!
+//! A walk needs three allocations: the visited bitmap (one bit per from-set word), the worklist,
+//! and the from-set's own range vector. A collector that walks at every collection would allocate
+//! all three again each round, so [`Scratch`] owns them once and reuses them
+//! ([`crate::Collector`] and [`crate::GenImmixCollector`] each hold one; the one-shot public
+//! wrappers — [`for_each_reachable_in`], [`crate::live_words_in`], the off-heap liveness scan and
+//! [`FromSet::new`](crate::FromSet::new) — allocate a fresh `Scratch` internally instead).
+//!
+//! **Reuse is keyed on addresses, so it is only sound if the state is cleared.** The bitmap is
+//! indexed by from-set *address*, so a stale set bit makes a second walk skip an object it has
+//! never visited (a wrong count, and — through the collector's room figures — a stranded live
+//! term), and a stale range makes a collection evacuate a space that may already be freed. The
+//! reset is therefore not optional bookkeeping and cannot be skipped:
+//!
+//! * there is **no `pub` constructor of a dirty scratch**: [`Scratch::new`] is empty, and
+//! * every walk entry point ([`Scratch::walk`], and the two enumerations built on it) zeroes the
+//!   **whole used prefix** of the bitmap and truncates the worklist *before* it admits anything,
+//!   while the range vector is only ever installed through [`Scratch::begin`] /
+//!   [`Scratch::begin_with`], which clear it first.
+//!
+//! `tests/scratch_reuse.rs` pins the consequence from outside: two consecutive walks over the
+//! **same** address range with **different** roots report exactly what a fresh scratch reports.
 
 use core::mem::size_of;
 
@@ -68,69 +92,155 @@ use beam_term::prelude::{is_header, primary_tag, ptr_val, Eterm, PrimaryTag};
 use crate::copy::{for_each_ref, move_size};
 use crate::space::FromSet;
 
-/// Walks the object graph reachable from `roots` out of the evacuated ranges of `from`,
-/// calling `on_object(first_word, ptr, total_words)` once per object — see the module docs.
-///
-/// `first_word` is the object's **first** heap word: a header word for a boxed object, or the
-/// `car` of a cons cell (which carries no header). `total_words` is the object's size in words
-/// (its [`move_size`](crate::copy::move_size), or `2` for a cons cell). `roots` is borrowed
-/// immutably — the walk never rewrites a term — and it never dereferences an address outside
-/// `from`'s ranges.
-///
-/// The only fallible step is the shared [`for_each_ref`](crate::copy::for_each_ref)
-/// enumeration, whose signature is fallible for its other callers (a copier's forwarding
-/// `visit` can fail); `on_object` itself is infallible, so in practice this never returns an
-/// error.
-pub(crate) fn walk_reachable<F>(from: &FromSet, roots: &[Eterm], mut on_object: F) -> Result<()>
-where
-    F: FnMut(Eterm, *const Eterm, usize),
-{
-    let mut visited = Visited::new(from);
-    let mut work: Vec<*mut Eterm> = Vec::new();
-
-    for &root in roots {
-        seed(root, from, &mut visited, &mut work);
-    }
-
-    // A worklist, so the traversal depth is bounded by the heap and not by the real stack:
-    // a 50 000-cell list is walked without recursing once.
-    while let Some(obj) = work.pop() {
-        // SAFETY: `obj` was admitted only through `Visited::index`, i.e. only when it
-        // addresses a word of one of the caller's from-space ranges — the same guarantee
-        // `Copier` relies on before it dereferences a reference word
-        // (`Target::Live`/`Target::Forwarded` both read `*ptr`). Its first word is therefore
-        // readable.
-        let first = unsafe { *obj };
-        // A cons cell carries no header word: its first word is the car, a term that never
-        // has the `Header` primary tag (`beam_term::tag::is_header`). That frozen shape test
-        // is the one `Copier::complete` and the mark-region `scan_young` use.
-        let total = if is_header(first) {
-            move_size(first, obj)
-        } else {
-            2
-        };
-        on_object(first, obj, total);
-
-        // SAFETY: `obj` addresses a live object of exactly `total` words, all readable and
-        // none of them written (this walk is read-only), so the canonical child-slot
-        // enumeration is covered by this block. `for_each_ref` yields the address of a live
-        // reference word inside the object `obj`, so reading it through `*slot` is covered
-        // too.
-        let walk: Result<()> = unsafe {
-            for_each_ref(obj, total, &mut |slot| {
-                let term = *slot;
-                if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
-                    admit(ptr_val(term) as *const Eterm, from, &mut visited, &mut work);
-                }
-                Ok(())
-            })
-        };
-        walk?;
-    }
-
-    Ok(())
+/// The reusable state of a reachability walk: the visited bitmap, the worklist and the from-set
+/// range vector — see the module docs for why every entry point clears what it reuses.
+pub(crate) struct Scratch {
+    /// One bit per word of the installed from-set, plus the per-range bit offsets.
+    visited: Visited,
+    /// The traversal worklist, reused across walks.
+    work: Vec<*mut Eterm>,
+    /// The from-set the walk (and, for a collection, the copier) reads.
+    from: FromSet,
 }
 
+impl Scratch {
+    /// An empty scratch: no ranges, no bits, no work — allocating nothing.
+    pub(crate) fn new() -> Scratch {
+        Scratch {
+            visited: Visited::default(),
+            work: Vec::new(),
+            from: FromSet::new(),
+        }
+    }
+
+    /// Installs a from-set for the next walk (or copy), **clearing the previous one** and letting
+    /// `build` fill it. The only way to put ranges into a scratch, so a stale range — a range
+    /// naming a region a previous collection may have freed — cannot survive into a later walk.
+    pub(crate) fn begin<F>(&mut self, build: F)
+    where
+        F: FnOnce(&mut FromSet),
+    {
+        self.from.clear();
+        build(&mut self.from);
+    }
+
+    /// Installs `from` as this scratch's from-set, **replacing** (never merging with) whatever was
+    /// there — the reuse form for a caller that already owns the range set it wants to walk.
+    pub(crate) fn begin_with(&mut self, from: &FromSet) {
+        self.from.copy_from(from);
+    }
+
+    /// The installed from-set (empty until [`begin`](Scratch::begin) or
+    /// [`begin_with`](Scratch::begin_with) filled it).
+    pub(crate) fn from(&self) -> &FromSet {
+        &self.from
+    }
+
+    /// Walks the object graph reachable from `roots` out of the installed from-set's ranges,
+    /// calling `on_object(first_word, ptr, total_words)` once per object — see the module docs.
+    ///
+    /// `first_word` is the object's **first** heap word: a header word for a boxed object, or the
+    /// `car` of a cons cell (which carries no header). `total_words` is the object's size in words
+    /// (its [`move_size`](crate::copy::move_size), or `2` for a cons cell). `roots` is borrowed
+    /// immutably — the walk never rewrites a term — and it never dereferences an address outside
+    /// the from-set's ranges.
+    ///
+    /// The visited bitmap and the worklist are **cleared** here, so a walk over the same
+    /// from-set may be repeated (with any roots) and reports exactly what a fresh scratch would.
+    ///
+    /// The only fallible step is the shared [`for_each_ref`](crate::copy::for_each_ref)
+    /// enumeration, whose signature is fallible for its other callers (a copier's forwarding
+    /// `visit` can fail); `on_object` itself is infallible, so in practice this never returns an
+    /// error.
+    pub(crate) fn walk<F>(&mut self, roots: &[Eterm], mut on_object: F) -> Result<()>
+    where
+        F: FnMut(Eterm, *const Eterm, usize),
+    {
+        // The whole reused state is reset *before* anything is admitted: the bitmap is keyed on
+        // addresses of the installed from-set, so a bit left over from a previous walk would skip
+        // an object this walk has never seen, and a worklist entry would point into a range that
+        // may be a different allocation by now.
+        self.visited.reset(&self.from);
+        self.work.clear();
+        let (visited, work) = (&mut self.visited, &mut self.work);
+        let from = &self.from;
+
+        for &root in roots {
+            seed(root, from, visited, work);
+        }
+
+        // A worklist, so the traversal depth is bounded by the heap and not by the real stack:
+        // a 50 000-cell list is walked without recursing once.
+        while let Some(obj) = work.pop() {
+            // SAFETY: `obj` was admitted only through `Visited::index`, i.e. only when it
+            // addresses a word of one of the caller's from-space ranges — the same guarantee
+            // `Copier` relies on before it dereferences a reference word
+            // (`Target::Live`/`Target::Forwarded` both read `*ptr`). Its first word is therefore
+            // readable.
+            let first = unsafe { *obj };
+            // A cons cell carries no header word: its first word is the car, a term that never
+            // has the `Header` primary tag (`beam_term::tag::is_header`). That frozen shape test
+            // is the one `Copier::complete` and the mark-region `scan_young` use.
+            let total = if is_header(first) {
+                move_size(first, obj)
+            } else {
+                2
+            };
+            on_object(first, obj, total);
+
+            // SAFETY: `obj` addresses a live object of exactly `total` words, all readable and
+            // none of them written (this walk is read-only), so the canonical child-slot
+            // enumeration is covered by this block. `for_each_ref` yields the address of a live
+            // reference word inside the object `obj`, so reading it through `*slot` is covered
+            // too.
+            let walk: Result<()> = unsafe {
+                for_each_ref(obj, total, &mut |slot| {
+                    let term = *slot;
+                    if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
+                        admit(ptr_val(term) as *const Eterm, from, visited, work);
+                    }
+                    Ok(())
+                })
+            };
+            walk?;
+        }
+
+        Ok(())
+    }
+
+    /// Visits every **boxed object** reachable from `roots` out of the installed from-set, each
+    /// exactly once, passing a safe read-only [`ReachableObject`] view of it — the safe sibling of
+    /// [`walk`](Scratch::walk), over the same walk and the same dedup.
+    ///
+    /// A cons cell is *traversed* (so the boxed objects behind it are reached) but is **not**
+    /// reported: it carries no header word.
+    pub(crate) fn for_each_view<F>(&mut self, roots: &[Eterm], mut visit: F) -> Result<()>
+    where
+        F: FnMut(ReachableObject<'_>),
+    {
+        self.walk(roots, |first, ptr, total| {
+            if is_header(first) {
+                // SAFETY: `ptr` heads a live boxed object of exactly `total` words — the walk
+                // admitted it only through `Visited::index`, i.e. only when it addresses a word of
+                // one of the caller's from-space ranges, and `total` is that object's
+                // `move_size`. Those `total` words are all readable and none is written (the walk
+                // is read-only), so they form a valid `&[Eterm]` for the duration of the visit.
+                let slice = unsafe { core::slice::from_raw_parts(ptr, total) };
+                visit(ReachableObject::new(slice));
+            }
+        })
+    }
+
+    /// Visits every **boxed object** reachable from `roots` out of the installed from-set, each
+    /// exactly once, passing the object's header word and a pointer to that header — the raw
+    /// sibling of [`for_each_view`](Scratch::for_each_view).
+    pub(crate) fn for_each_boxed<F>(&mut self, roots: &[Eterm], mut visit: F) -> Result<()>
+    where
+        F: FnMut(Eterm, *const Eterm),
+    {
+        self.for_each_view(roots, |obj| visit(obj.header(), obj.words().as_ptr()))
+    }
+}
 /// A **read-only view of one reachable boxed object** — the safe form of the `(header, ptr)`
 /// pair the raw reachability walk reports.
 ///
@@ -202,27 +312,21 @@ impl<'a> ReachableObject<'a> {
 /// [`ReachableObject`] instead of a raw pointer, so an inspection-only caller needs no
 /// `unsafe`. A cons cell is *traversed* (so the boxed objects behind it are reached) but is
 /// **not** reported — it carries no header word.
+///
+/// The from-set must already be installed in `scratch` ([`Scratch::begin`] /
+/// [`Scratch::begin_with`]), which is what lets a collector walk the same ranges twice without
+/// rebuilding them; the visited state is cleared per call, so repeated walks cannot contaminate
+/// one another.
 pub(crate) fn for_each_reachable_view<F>(
-    from: &FromSet,
+    scratch: &mut Scratch,
     roots: &[Eterm],
-    mut visit: F,
+    visit: F,
 ) -> Result<()>
 where
     F: FnMut(ReachableObject<'_>),
 {
-    walk_reachable(from, roots, |first, ptr, total| {
-        if is_header(first) {
-            // SAFETY: `ptr` heads a live boxed object of exactly `total` words — the walk
-            // admitted it only through `Visited::index`, i.e. only when it addresses a word of
-            // one of the caller's from-space ranges, and `total` is that object's
-            // `move_size`. Those `total` words are all readable and none is written (the walk
-            // is read-only), so they form a valid `&[Eterm]` for the duration of the visit.
-            let slice = unsafe { core::slice::from_raw_parts(ptr, total) };
-            visit(ReachableObject::new(slice));
-        }
-    })
+    scratch.for_each_view(roots, visit)
 }
-
 /// Visits every **boxed object** reachable from `roots` out of the ranges of a from-set, each
 /// exactly once, passing a safe read-only [`ReachableObject`] view of it — the **public** form of
 /// [`for_each_reachable_view`], for a host whose region is not a process heap.
@@ -239,13 +343,18 @@ where
 ///
 /// The visitor is `FnMut(ReachableObject<'_>)` (higher-ranked over the borrow), so it cannot
 /// retain the view past the callback.
+///
+/// This is a one-shot entry point: it owns a fresh [`Scratch`] for the call. A caller that walks
+/// repeatedly (a collector at every collection) holds a scratch and calls
+/// [`Scratch::for_each_view`] instead, which reuses the bitmap, the worklist and the range vector.
 pub fn for_each_reachable_in<F>(from: &FromSet, roots: &[Eterm], visit: F) -> Result<()>
 where
     F: FnMut(ReachableObject<'_>),
 {
-    for_each_reachable_view(from, roots, visit)
+    let mut scratch = Scratch::new();
+    scratch.begin_with(from);
+    for_each_reachable_view(&mut scratch, roots, visit)
 }
-
 /// Visits every **boxed object** reachable from `roots` out of the ranges of `from`, each
 /// exactly once, passing the object's header word and a pointer to that header.
 ///
@@ -261,14 +370,18 @@ where
 /// it needs no knowledge of, and no dependency on, another crate's container interior.
 ///
 /// For a visitor that need not touch raw pointers, prefer
-/// [`for_each_reachable_in`], which reports the same objects as a safe [`ReachableObject`].
-pub(crate) fn for_each_reachable<F>(from: &FromSet, roots: &[Eterm], mut visit: F) -> Result<()>
+/// [`for_each_reachable_in`], which reports the same objects as a safe [`ReachableObject`]. Like
+/// its safe sibling it walks the from-set already installed in `scratch`.
+pub(crate) fn for_each_reachable<F>(
+    scratch: &mut Scratch,
+    roots: &[Eterm],
+    visit: F,
+) -> Result<()>
 where
     F: FnMut(Eterm, *const Eterm),
 {
-    for_each_reachable_view(from, roots, |obj| visit(obj.header(), obj.words().as_ptr()))
+    scratch.for_each_boxed(roots, visit)
 }
-
 /// Admits `ptr` into the worklist when it names a from-space object that has not been
 /// visited yet — a reference outside every range (a literal, a foreign space, an off-heap
 /// pointer) is skipped, exactly as the copier's forwarding switch leaves its
@@ -292,6 +405,11 @@ fn seed(term: Eterm, from: &FromSet, visited: &mut Visited, work: &mut Vec<*mut 
 /// exactly once however many references reach it (a shared subterm, a cycle). Keying on the
 /// object's first word is the same identity the copier's in-place forwarding marker uses, so
 /// the two dedup in lockstep.
+///
+/// A [`Scratch`] reuses one across walks, so [`reset`](Visited::reset) must clear **every** bit
+/// the previous walk may have set: the bits are keyed on addresses, and the next from-set may
+/// cover the very same addresses with entirely different objects.
+#[derive(Default)]
 struct Visited {
     /// `first[k]` is the bit index range `from.ranges()[k]` starts at — the ranges (in
     /// [`FromSet::ranges`]'s order) are packed into one bit vector, so a range's `lo`/`hi` are
@@ -301,22 +419,25 @@ struct Visited {
 }
 
 impl Visited {
-    /// Indexes the ranges of `from` (`from.ranges()` is byte-addressed; a range added from a
-    /// space's live region spans a whole number of term words).
-    fn new(from: &FromSet) -> Visited {
+    /// Re-indexes the ranges of `from` (`from.ranges()` is byte-addressed; a range added from a
+    /// space's live region spans a whole number of term words) and **clears the whole bitmap**,
+    /// then truncates or grows it to the size those ranges need.
+    ///
+    /// The `fill(0)` is what makes reuse sound: it zeroes every bit of the *used* prefix,
+    /// including the tail bits of the last word, so a walk that reuses the vector can never see a
+    /// bit an earlier walk set. `resize` then drops the bits of a from-set that shrank and
+    /// zero-fills the ones a larger from-set added.
+    fn reset(&mut self, from: &FromSet) {
         let word = size_of::<Eterm>();
-        let mut first = Vec::with_capacity(from.ranges().len());
+        self.first.clear();
         let mut total = 0usize;
         for &(lo, hi) in from.ranges() {
-            first.push(total);
+            self.first.push(total);
             total += (hi - lo) / word;
         }
-        Visited {
-            first,
-            bits: vec![0; total.div_ceil(64)],
-        }
+        self.bits.fill(0);
+        self.bits.resize(total.div_ceil(64), 0);
     }
-
     /// The bit index of the word `ptr` addresses, or `None` when it lies outside every range.
     ///
     /// The range is resolved by [`FromSet::locate`] — the one place the range geometry is
@@ -374,7 +495,11 @@ mod tests {
             next = hi + word;
         }
 
-        let visited = Visited::new(&from);
+        let visited = {
+            let mut visited = Visited::default();
+            visited.reset(&from);
+            visited
+        };
         assert_eq!(visited.first.len(), RANGES, "one bit offset per range");
         let total_words: usize = ranges.iter().map(|&(lo, hi)| (hi - lo) / word).sum();
         assert_eq!(
@@ -430,7 +555,8 @@ mod tests {
         let mut from = FromSet::new();
         from.add_range(0x1000, 0x1000 + 4 * word);
         from.add_range(0x2000, 0x2000 + 2 * word);
-        let mut visited = Visited::new(&from);
+        let mut visited = Visited::default();
+        visited.reset(&from);
 
         // The first sighting of an address is new, every later one is not — the dedup the
         // traversal's "each object exactly once" rests on.

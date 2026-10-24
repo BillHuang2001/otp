@@ -637,15 +637,17 @@ fn a_chain_the_growth_seam_builds_keeps_the_index_and_the_aggregate_exact() {
 }
 
 /// **(a) The chain's summed capacity stops at the ceiling.** Under a bounded policy every
-/// successful growth keeps `capacity_words() <= max_heap_words`, and the loop must end in the
-/// typed heap exhaustion — the budget, not an allocation accident — with the nursery
-/// byte-for-byte untouched by the refused call.
+/// successful growth keeps `capacity_words() <= max_heap_words` **and** grants the request it
+/// was given (room asked, room granted — the fresh space is sized from occupancy plus request,
+/// `erl_gc.c:1503-1509`), and the loop must end in the typed heap exhaustion — the budget, not
+/// an allocation accident — with the nursery byte-for-byte untouched by the refused call.
 #[test]
 fn growth_stops_at_the_summed_capacity_ceiling() {
     let policy = budgeted();
     let mut nursery = Nursery::new(default_allocator().clone(), CAP).expect("nursery");
     let mut growths = 0usize;
-    let err = loop {
+    // The capacity the refused request needed — the request's occupancy plus its room.
+    let refusal = loop {
         // Fill what is left of the current space, so the growth is never a no-op.
         fill(nursery.current_mut());
         let need = nursery.current().available_words().saturating_add(1);
@@ -653,6 +655,7 @@ fn growth_stops_at_the_summed_capacity_ceiling() {
             nursery.current().available_words() < need,
             "the request outgrows the current space"
         );
+        let want = nursery.current().used_words().saturating_add(need);
         match nursery.grow(&policy, need) {
             Ok(()) => {
                 growths += 1;
@@ -662,26 +665,34 @@ fn growth_stops_at_the_summed_capacity_ceiling() {
                     nursery.capacity_words(),
                     policy.max_heap_words
                 );
+                assert!(
+                    nursery.current().available_words() >= need,
+                    "round {growths}: one growth grants the request (a {need}-word request \
+                     against {} used words of a {} word space left {} available)",
+                    nursery.current().used_words(),
+                    nursery.current().capacity_words(),
+                    nursery.current().available_words()
+                );
                 assert!(growths < 4096, "the growth ladder must terminate");
             }
-            Err(err) => break err,
+            Err(err) => break (err, want),
         }
     };
+    let (err, want) = refusal;
 
-    // The loop ended because the remaining budget could not cover the request — the typed
-    // refusal, never a panic and never a silently smaller space.
+    // The loop ended because the remaining budget could not cover the capacity the request
+    // needed — the typed refusal, never a panic and never a silently smaller space.
     assert_eq!(err.as_atom(), Some("out_of_memory"));
     assert!(
         growths >= 3,
         "the corpus must really climb the ladder, got {growths} growths"
     );
     assert!(
-        policy.max_heap_words - nursery.capacity_words() < nursery.current().available_words() + 1,
-        "the refusal is the exhausted budget: {} of {} words left",
+        policy.max_heap_words - nursery.capacity_words() < want,
+        "the refusal is the exhausted budget: {} of {} words left, {want} needed",
         policy.max_heap_words - nursery.capacity_words(),
         policy.max_heap_words
     );
-
     // The refused call left the nursery exactly as it was — same current space, same chain
     // length, same summed capacity — so a caller may retry it after collecting.
     let (spaces, capacity, base) = (
@@ -788,21 +799,28 @@ fn a_provably_empty_retired_space_is_reused_instead_of_reallocated() {
     );
 }
 
-/// The growth seam is bounded by the **live-set target the last collection derived**: a nursery
-/// that has collected never installs a space on the doubling's scale, while still never installing
-/// a space the size of the one it replaces and never refusing a request that fits. A fresh nursery
-/// — no measured live set yet — keeps the plain curated rule, and a request that genuinely outgrows
-/// the live set still gets its own one-step size (the bound is not a ceiling).
+/// The growth seam sizes from the **occupancy plus the request** and is still bounded above by the
+/// **live-set target the last collection derived**: a growth of a collected nursery installs the
+/// smallest curated space that grants the request — never a space on the doubling's scale, never a
+/// space the size of the one it replaces, and never a space above `max(one_step, live_target)`.
+/// A fresh nursery — no measured live set yet — keeps the plain curated rule, and a request that
+/// genuinely outgrows the live set still gets its own one-step size (the bound is not a ceiling).
 #[test]
 fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     let policy = HeapPolicy::default();
 
-    // A fresh nursery has no measured live set, so the plain rule applies: the one-step size.
+    // A fresh nursery has no measured live set, so the plain rule applies — sized from the
+    // space's occupancy **plus** the request (`erl_gc.c:1503-1509`), not from the request alone.
     let mut fresh = Nursery::new(default_allocator().clone(), 233).expect("nursery");
     assert_eq!(fresh.live_target_words, None);
     fill(fresh.current_mut());
+    let used = fresh.current().used_words();
     fresh.grow(&policy, 610).expect("the one-step growth");
-    assert_eq!(fresh.current().capacity_words(), policy.next_words(610, 0));
+    assert_eq!(
+        fresh.current().capacity_words(),
+        policy.next_words(used + 610, 0),
+        "the fresh space is sized from {used} used words plus the 610-word request"
+    );
 
     // A collected nursery remembers the target its round derived ...
     let live = 401;
@@ -817,67 +835,87 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
         "the minor target is what the collection installed"
     );
 
-    // ... and a constant request the space already covers would otherwise take the doubling
-    // (`next_words(2 * 610) = 1 598`): the bound narrows the fresh space to
-    // `max(one_step, live_target)` — here the current capacity itself — so nothing on the
-    // doubling's scale is installed. The bound only narrows, though: a growth must still make
-    // **strict progress** (`next_words_above`, the C's "never the same size when *growing*" rule,
-    // `erl_gc.c:310-338`), and since the bound lands exactly on the current capacity the
-    // one-table-step-above size is what gets installed — never a same-size space, which would
-    // append a whole capacity to the chain while granting no room.
+    // ... and the growth of that collected nursery takes the **one-step** size of occupancy plus
+    // request — the smallest curated size that grants it — rather than the doubling
+    // (`next_words(2 * 610) = 1 598`) a request-as-capacity reading would have produced. The
+    // live-set bound narrows that candidate from above at `max(one_step, live_target)`; here the
+    // one-step size already exceeds the target, so the bound cannot lower it, which is exactly the
+    // "may only narrow" contract. The growth must still make **strict progress**
+    // (`next_words_above`, the C's "never the same size when *growing*" rule, `erl_gc.c:310-338`):
+    // never a same-size space, which would append a whole capacity to the chain while granting no
+    // room.
     fill(nursery.current_mut());
     let collected = nursery.current().capacity_words();
+    let used = nursery.current().used_words();
+    let need = nursery.current().available_words() + 1;
     assert!(
         nursery.current().available_words() < collected,
         "the space is full again"
     );
-    nursery.grow(&policy, collected).expect("the bounded growth");
+    let want = used + need;
+    nursery.grow(&policy, need).expect("the bounded growth");
     let installed = nursery.current().capacity_words();
-    let one_step = policy.next_words(collected, 0).max(collected);
-    assert_eq!(one_step, collected, "the one-step size does not enlarge here");
+    let one_step = policy.next_words(want, 0).max(collected);
+    assert_eq!(
+        one_step,
+        policy.next_words(want, 0),
+        "the one-step size of {want} (occupancy plus request) really does enlarge the space"
+    );
     let bounded = one_step.max(live_target);
     assert_eq!(
-        bounded, collected,
-        "the live-set bound lands on the current capacity, so it can only narrow"
+        bounded, one_step,
+        "the live-set target ({live_target}) is below the one-step size, so the bound only \
+         narrows and cannot lower the space"
     );
     assert_eq!(
         installed,
         policy.next_words_above(collected),
-        "strict progress outranks the bound's landing point: one growth-table step above the \
-         space that was replaced"
+        "the installed space is one growth-table step above the space that was replaced"
+    );
+    assert_eq!(
+        installed, one_step,
+        "and it is exactly the one-step size of occupancy plus request"
     );
     assert!(
-        installed > bounded,
-        "the installed space is larger than the bound's landing point"
+        installed >= bounded,
+        "the installed space is never below the bound's landing point"
     );
     assert!(
         installed < policy.next_words(2 * collected, 0),
-        "the doubling the unbounded rule would take was suppressed"
+        "the doubling was never installed"
     );
     assert!(
         installed > collected,
         "a growth never installs a space the size of (or smaller than) the one it replaces"
     );
     assert!(
-        nursery.current().available_words() + nursery.current().used_words() >= collected,
-        "and the installed space really holds the request"
+        nursery.current().available_words() >= need,
+        "and the one growth really grants the request: {} available for {need} words",
+        nursery.current().available_words()
     );
 
-    // A request that genuinely outgrows the live set still sizes its own space: `one_step`
-    // alone grants it (`next_words(5 000) = 6 772`), so the bound is not a ceiling.
+    // A request that genuinely outgrows the live set still sizes its own space: the one-step size
+    // of occupancy plus request alone grants it (`next_words(606 + 5 000) = 6 772`), so the bound
+    // is not a ceiling.
     let mut large = Nursery::new(default_allocator().clone(), 233).expect("nursery");
     large.collapse(&policy, live).expect("the collapse");
     fill(large.current_mut());
+    let used = large.current().used_words();
     let need = 5_000;
     large.grow(&policy, need).expect("the large request");
-    let one_step = policy.next_words(need, 0).max(live_target);
-    assert_eq!(one_step, policy.next_words(need, 0));
+    let one_step = policy.next_words(used + need, 0).max(live_target);
+    assert_eq!(one_step, policy.next_words(used + need, 0));
     assert_eq!(
         large.current().capacity_words(),
         one_step,
         "the large request gets its own one-step size"
     );
     assert!(large.current().capacity_words() >= need);
+    assert!(
+        large.current().available_words() >= need,
+        "and it grants the request in one growth"
+    );
+    assert!(one_step > live_target, "the bound is not a ceiling");
     assert!(
         large.live_target_words == Some(live_target),
         "growing does not change the remembered live-set target"

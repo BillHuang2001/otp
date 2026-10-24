@@ -311,8 +311,17 @@ impl Nursery {
     ///    [`max_heap_words`](HeapPolicy::max_heap_words) budget of step 3. The **smallest**
     ///    adequate space wins (the oldest among equals), so the selection is deterministic and
     ///    leaves the largest retired spaces free for a later, bigger request.
-    /// 3. **Allocate a fresh space.** Its size is the **one-step** size the policy allows —
-    ///    `policy.next_words(need_words, 0)` floored by the current capacity — whenever that
+    /// 3. **Allocate a fresh space** sized from the **capacity that makes the request
+    ///    grantable** — the current space's occupancy **plus** `need_words`, never `need_words`
+    ///    alone. `need_words` is a *room* request ("that many words must become allocatable"), so
+    ///    sizing a fresh space from it as if it were a total capacity would install a space with
+    ///    far less new room than was asked for, and the caller would have to grow again
+    ///    immediately. The legacy C sizes the same quantity this way:
+    ///    `adjust_after_minor` grows with `grow_new_heap(p, next_heap_size(p, need_after, 0), …)`
+    ///    where `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + stack_size + S_RESERVED`
+    ///    (`erts/emulator/beam/erl_gc.c:1503-1509`, `:1553-1555`) — occupancy plus need.
+    ///    The size is the **one-step** size the policy allows —
+    ///    `policy.next_words(want, 0)` floored by the current capacity — whenever that
     ///    already enlarges the space (a genuinely larger request: the plain next-size rule).
     ///    Otherwise the candidate is at least a **doubling** (`policy.next_words(2 * capacity,
     ///    0)`). A nursery that has **collected** then narrows the candidate from **above** at
@@ -325,7 +334,7 @@ impl Nursery {
     ///    defeat: the bound narrows the choice, it cannot shrink the space below the current one
     ///    and it cannot install a same-size space, so the chain can never stack equally sized
     ///    spaces (each event would otherwise gain a whole capacity while granting no room).
-    ///    The bound also cannot refuse a request that fits (`one_step >= need_words`), and it still
+    ///    The bound also cannot refuse a request that fits (`one_step >= want`), and it still
     ///    grants a genuinely large request its own `one_step` size. Every size is bounded by
     ///    [`min_heap_words`](HeapPolicy::min_heap_words) through
     ///    [`next_words`](HeapPolicy::next_words) and by the growth table's ceiling.
@@ -335,12 +344,24 @@ impl Nursery {
     ///    [`BeamError::Alloc`](beam_common::BeamError::Alloc) and leaves the nursery untouched:
     ///    the current space is not replaced and nothing is retired.
     ///
+    /// # The request is ROOM, and only a resulting room can satisfy it
+    ///
+    /// `need_words` is a room request, so the acceptance test is the **resulting room**
+    /// (`target - current.used_words() >= need_words`), never the fresh space's total capacity:
+    /// a space of `need_words` total words that already holds `used_words` of them grants far
+    /// less than was asked for. Because the candidate is sized from occupancy plus need
+    /// (step 3), a granted request is met by **that one** growth — afterwards
+    /// `current.available_words() >= need_words`, i.e. the same request is a no-op (step 1)
+    /// and the caller never has to grow twice for one window. Only a ceiling can refuse it,
+    /// and that refusal comes before anything is allocated.
+    ///
     /// # The ceiling bounds the chain's SUMMED capacity
     ///
     /// [`capacity_words`](Nursery::capacity_words) is the chain's size, so that is what
     /// `max_heap_words` bounds: the fresh space of step 3 may only claim the **budget the chain
-    /// has left** (`max_heap_words - capacity_words()`), and once that budget cannot reach
-    /// `need_words` the request is refused for good — an allocate-and-abandon loop can no longer
+    /// has left** (`max_heap_words - capacity_words()`), and once that budget cannot reach the
+    /// capacity the request needs (occupancy plus `need_words`, `want` below) the request is
+    /// refused for good — an allocate-and-abandon loop can no longer
     /// append one ceiling-sized space per call. After every successful growth
     /// `capacity_words() <= max_heap_words` whenever the ceiling is non-zero. A ceiling that *can*
     /// cover the request but forbids a larger step installs the largest space it allows, which is
@@ -383,14 +404,27 @@ impl Nursery {
             return Ok(());
         }
         // A retired space nothing was ever allocated in can serve this request itself: it
-        // strands no live word, allocates nothing and consumes none of the capacity budget.
+        // strands no live word, allocates nothing and consumes none of the capacity budget. It
+        // never handed out a word, so its whole capacity *is* its room — the request key needs
+        // no occupancy adjustment here.
         if let Some(key) = self.empty_retired_for(need_words) {
             self.readopt_retired(key);
             return Ok(());
         }
         let capacity = self.current.capacity_words();
+        let used = self.current.used_words();
+        // The capacity that makes the request **grantable**: the space's occupancy plus the room
+        // the caller asked for. `need_words` is a room request, so sizing the fresh space from it
+        // alone would install a space with (capacity - used) words of new room where the caller
+        // asked for `need_words`, and the very next allocation in the same window would have to
+        // grow again — retiring another space and manufacturing more collection debt for no
+        // progress. The C sizes the same quantity this way: `adjust_after_minor` grows with
+        // `grow_new_heap(p, next_heap_size(p, need_after, 0), …)` where
+        // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + stack_size + S_RESERVED`
+        // (`erts/emulator/beam/erl_gc.c:1503-1509`, `:1553-1555`) — occupancy plus need.
+        let want = used.saturating_add(need_words);
         // The plain next-size rule, floored by the capacity it must not undercut.
-        let one_step = policy.next_words(need_words, 0).max(capacity);
+        let one_step = policy.next_words(want, 0).max(capacity);
         // Only a request that would hand back a space no larger than the one it replaces
         // needs the doubling.
         let mut target = if one_step > capacity {
@@ -402,7 +436,7 @@ impl Nursery {
         };
         // A nursery that has collected knows the live set's target, so its growths are bounded by
         // it: the seam has no live set of its own, and a space larger than that target is one the
-        // next collection would immediately give back. `one_step` (>= the request, >= the current
+        // next collection would immediately give back. `one_step` (>= `want`, >= the current
         // capacity) keeps the bound from ever refusing a fitting request or shrinking the space.
         if let Some(live_target) = self.live_target_words {
             target = target.min(one_step.max(live_target));
@@ -413,16 +447,20 @@ impl Nursery {
         // can no longer discard the progress (which is what used to make every post-collection
         // growth stack one whole same-size space onto the chain).
         target = target.max(policy.next_words_above(capacity));
-        if target < need_words {
+        // The request is **room**, so it is met only when the space that replaces this one has
+        // `need_words` words free — the fresh space's total capacity is not the quantity the
+        // caller asked for. (A space sized from `want` always passes; only a growth-table ceiling
+        // can fail it here.)
+        if target.saturating_sub(used) < need_words {
             return Err(heap_exhausted(need_words));
         }
         // The ceiling bounds the chain's **summed** capacity, so the fresh space may only claim
         // the budget the chain has left. Refuse — before allocating or retiring anything —
-        // when that budget cannot reach the request, or when it would leave the fresh space no
-        // larger than the one it replaces.
+        // when that budget cannot reach a space that satisfies the request, or when it would
+        // leave the fresh space no larger than the one it replaces.
         if policy.max_heap_words != 0 {
             let budget = policy.max_heap_words.saturating_sub(self.capacity_words());
-            if budget < need_words {
+            if budget < want {
                 return Err(heap_exhausted(need_words));
             }
             target = target.min(budget);
@@ -439,7 +477,6 @@ impl Nursery {
         self.widen_extent();
         Ok(())
     }
-
     /// The **smallest** retired space that never handed the mutator a word
     /// (`used_words() == 0`) and is still large enough for a `need_words` allocation — the space
     /// [`grow`](Nursery::grow) can re-adopt instead of allocating a fresh one — as the
