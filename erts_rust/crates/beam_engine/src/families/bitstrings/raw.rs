@@ -1010,6 +1010,62 @@ impl InPlace {
         self.cur += src.len() * 8;
     }
 
+    /// Store a **fixed-width** big- or little-endian integer field at the current
+    /// position in one native store.
+    ///
+    /// This is the writable-accumulator half of the prepared `bs_create_bin`
+    /// **byte-field** write (`BitWriter::push_byte_field`): the field is a whole number
+    /// of bytes (`nbytes` in `1 | 2 | 4 | 8`) written to a byte-aligned position, so the
+    /// bytes are exactly what the bit-granular `push_bit` loop produces for the same
+    /// value masked into the field width (the truncating cast *is* that mask) — but
+    /// without a `push_bit` per bit and without the dynamic-length copy
+    /// [`InPlace::copy_bytes`] has to make.
+    ///
+    /// The caller guarantees `self.cur % 8 == 0` and `nbytes * 8 <= remaining_bits()`
+    /// (its own capacity check, or the armed per-instruction reservation, which is the
+    /// same bound), so every byte written is inside the payload.
+    #[inline]
+    pub(super) fn write_byte_field(&mut self, value: u64, nbytes: usize, little: bool) {
+        debug_assert!(self.cur % 8 == 0, "the byte field is byte-aligned");
+        debug_assert!(matches!(nbytes, 1 | 2 | 4 | 8), "a specialised field width");
+        debug_assert!(
+            nbytes * 8 <= self.remaining_bits(),
+            "the caller checked the capacity"
+        );
+        // SAFETY: the destination byte `cur / 8` starts at `cur`, and the check above
+        // keeps `cur + nbytes * 8` inside `capacity`, so the `nbytes` bytes written are
+        // inside the payload the machine allocated and keeps alive for this window.
+        // `write_unaligned` because a payload byte address carries no alignment
+        // guarantee; every byte store is a plain `u8` store.
+        unsafe {
+            let dst = self.base.add(self.cur / 8);
+            match nbytes {
+                1 => *dst = value as u8,
+                2 => core::ptr::write_unaligned(
+                    dst.cast::<u16>(),
+                    if little {
+                        (value as u16).to_le()
+                    } else {
+                        (value as u16).to_be()
+                    },
+                ),
+                4 => core::ptr::write_unaligned(
+                    dst.cast::<u32>(),
+                    if little {
+                        (value as u32).to_le()
+                    } else {
+                        (value as u32).to_be()
+                    },
+                ),
+                _ => core::ptr::write_unaligned(
+                    dst.cast::<u64>(),
+                    if little { value.to_le() } else { value.to_be() },
+                ),
+            }
+        }
+        self.cur += nbytes * 8;
+    }
+
     /// Copy the accumulated bits out as `(bytes, bit count)` — the **promotion** half
     /// (the build outgrew the payload, or a segment source aliases it).
     ///

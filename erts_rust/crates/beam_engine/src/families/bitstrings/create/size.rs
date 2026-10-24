@@ -160,7 +160,7 @@ pub(super) fn seg_fail(
 }
 
 /// [`fail_seg`]'s `Step` half: branch, or raise the segment failure's reason atom.
-fn seg_fail_step(
+pub(super) fn seg_fail_step(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,

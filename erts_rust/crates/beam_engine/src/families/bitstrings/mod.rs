@@ -817,12 +817,26 @@ pub(super) enum Built {
 /// byte-identical to the copy-rebuild path, and the accumulator's window is left unbumped.
 pub(super) struct BitWriter {
     dest: Dest,
+    /// Bits of *already-verified* room ahead of the write position — the
+    /// **per-instruction reservation** [`BitWriter::arm_room`] establishes for a
+    /// prepared `bs_create_bin` program whose remaining segments are all statically
+    /// sized.
+    ///
+    /// The invariant is `dest.remaining_bits() >= reserved` ([`Dest::Vec`], whose room is
+    /// unbounded, keeps it `0`): [`BitWriter::arm_room`] only arms room the payload
+    /// already has, and **every** write consumes exactly what it writes
+    /// ([`BitWriter::push_bit`] one bit, [`BitWriter::push_whole_bytes`] its byte count),
+    /// so the reservation can never overstate the room left. A shortfall is therefore
+    /// still caught by [`BitWriter::ensure_room`], which grows through the same single
+    /// door (`raw::InPlace::grow`) it always did.
+    reserved: usize,
 }
 
 impl Default for BitWriter {
     fn default() -> BitWriter {
         BitWriter {
             dest: Dest::default(),
+            reserved: 0,
         }
     }
 }
@@ -832,9 +846,29 @@ impl BitWriter {
     pub(super) fn in_place(sink: raw::InPlace) -> BitWriter {
         BitWriter {
             dest: Dest::InPlace(sink),
+            reserved: 0,
         }
     }
 
+    /// Arm the **single** capacity check of a prepared segment program: `bits` is the
+    /// summed static width of every segment still to be written, so if the payload
+    /// already has that much room the per-field checks are skipped from here on.
+    ///
+    /// It deliberately **never grows**: a shortfall is left to the write-time
+    /// [`BitWriter::ensure_room`] (and through it `raw::InPlace::grow`), exactly as it
+    /// would have been without a reservation. That keeps the growth schedule — and
+    /// therefore `RefcBinary::growth_counters` — identical to the per-field route, which
+    /// `create/prepared_tests.rs` pins.
+    pub(super) fn arm_room(&mut self, bits: usize) {
+        if bits == 0 {
+            return;
+        }
+        if let Dest::InPlace(sink) = &self.dest {
+            if sink.remaining_bits() >= bits {
+                self.reserved = bits;
+            }
+        }
+    }
     /// Whether this build has written nothing yet (a writer that has not been switched
     /// to a payload, and has deposited no bits) — the `bs_create_bin` loop's gate for
     /// entering the in-place mode on its **first** segment.
@@ -850,6 +884,8 @@ impl BitWriter {
         };
         let (bytes, nbits) = sink.into_bytes();
         self.dest = Dest::Vec { bytes, nbits };
+        // A `Vec`'s room is unbounded, so no reservation is needed.
+        self.reserved = 0;
     }
 
     /// Make room for `bits` more bits, growing the writable accumulator's payload when it
@@ -858,9 +894,16 @@ impl BitWriter {
     ///
     /// The growth door is consulted ONLY on a shortfall: it scans the machine's payload
     /// roster, so a per-append call would be an O(#payloads) regression on exactly the
-    /// workload this exists to speed up.
+    /// workload this exists to speed up. An armed reservation that already covers the
+    /// request answers it instead; the bits are then consumed by the write that follows
+    /// ([`BitWriter::push_bit`] / [`BitWriter::push_whole_bytes`]), which keeps the
+    /// reservation exact.
     #[inline]
     fn ensure_room(&mut self, machine: &mut Machine, bits: usize) -> Result<()> {
+        if self.reserved >= bits {
+            return Ok(());
+        }
+        self.reserved = 0;
         let Dest::InPlace(sink) = &mut self.dest else {
             return Ok(());
         };
@@ -872,7 +915,6 @@ impl BitWriter {
         }
         Ok(())
     }
-
     /// The bits written so far — the **whole** result's bit count (for an in-place build,
     /// the accumulator's window end plus everything this build appended).
     #[inline]
@@ -896,12 +938,13 @@ impl BitWriter {
     /// Append a single bit (`0` or `1`).
     #[inline]
     pub(super) fn push_bit(&mut self, bit: u8) {
+        // One bit of the armed reservation is spent (see the field's invariant).
+        self.reserved = self.reserved.saturating_sub(1);
         if let Dest::InPlace(sink) = &self.dest {
             if sink.remaining_bits() == 0 {
                 self.promote();
             }
-        }
-        match &mut self.dest {
+        }        match &mut self.dest {
             Dest::Vec { bytes, nbits } => {
                 let byte = *nbits / 8;
                 if byte >= bytes.len() {
@@ -1055,12 +1098,14 @@ impl BitWriter {
     /// may use a non-overlapping copy.
     #[inline]
     fn push_whole_bytes(&mut self, bytes: &[u8]) {
+        // The bytes about to be written are spent from the armed reservation (see the
+        // field's invariant).
+        self.reserved = self.reserved.saturating_sub(bytes.len() * 8);
         if let Dest::InPlace(sink) = &self.dest {
             if sink.remaining_bits() < bytes.len() * 8 {
                 self.promote();
             }
-        }
-        match &mut self.dest {
+        }        match &mut self.dest {
             Dest::Vec {
                 bytes: buf,
                 nbits,
@@ -1069,6 +1114,72 @@ impl BitWriter {
                 *nbits += bytes.len() * 8;
             }
             Dest::InPlace(sink) => sink.copy_bytes(bytes),
+        }
+    }
+
+    /// Store a **fixed-width** integer field straight into the destination — the
+    /// prepared `bs_create_bin` program's `ByteInt` segment
+    /// (`create::prepared::PreparedSeg::ByteInt`).
+    ///
+    /// The width is decided at **prepare** time (`nbytes` in `1 | 2 | 4 | 8`, from the
+    /// segment's static `size * unit`), so this body is one native store through
+    /// [`raw::InPlace::write_byte_field`] on the writable accumulator, or one
+    /// const-length append on the copy-rebuild `Vec` — instead of the
+    /// `to_be_bytes`/`to_le_bytes` + **variable-length** slice copy
+    /// [`BitWriter::push_uint`]/[`BitWriter::push_uint_le`] make for the same field
+    /// (a `copy_from_slice` whose length is a run-time value reaches libc `memmove`).
+    ///
+    /// Two shapes still take that general route, and both stay exact because it is the
+    /// very code every other writer uses:
+    ///
+    /// * a destination that is **not byte-aligned** (a byte-wide field after a
+    ///   bit-granular segment). The width is static, the *position* is not — it is only
+    ///   known while executing, so the alignment test stays here;
+    /// * an in-place sink with no room, i.e. the program's armed reservation
+    ///   ([`BitWriter::arm_room`]) did not cover it, so the per-field growth check must
+    ///   run.
+    #[inline]
+    pub(super) fn push_byte_field(
+        &mut self,
+        value: u64,
+        nbytes: usize,
+        little: bool,
+        machine: &mut Machine,
+    ) -> Result<()> {
+        debug_assert!(
+            matches!(nbytes, 1 | 2 | 4 | 8),
+            "a prepared byte field is 1/2/4/8 bytes"
+        );
+        let bits = nbytes * 8;
+        if self.bit_len() % 8 == 0 {
+            let armed = self.reserved >= bits;
+            let stored = match &mut self.dest {
+                Dest::Vec { bytes, nbits } => {
+                    store_byte_field_vec(bytes, *nbits, value, nbytes, little);
+                    *nbits += bits;
+                    true
+                }
+                // `armed` short-circuits the remaining-room read: the reservation
+                // already answered it (see the field's invariant).
+                Dest::InPlace(sink) if armed || sink.remaining_bits() >= bits => {
+                    sink.write_byte_field(value, nbytes, little);
+                    true
+                }
+                Dest::InPlace(_) => false,
+            };
+            if stored {
+                self.reserved = self.reserved.saturating_sub(bits);
+                #[cfg(test)]
+                note_byte_field_store();
+                return Ok(());
+            }
+        }
+        #[cfg(test)]
+        note_byte_field_fallback();
+        if little {
+            self.push_uint_le(value, bits, machine)
+        } else {
+            self.push_uint(value, bits, machine)
         }
     }
 
@@ -1094,6 +1205,93 @@ impl BitWriter {
             Dest::InPlace(sink) => Built::Term(sink.finish()),
         }
     }
+}
+
+/// Append one fixed-width integer field to a copy-rebuild destination at the
+/// byte-aligned position `nbits`.
+///
+/// The caller guarantees `bytes.len() == nbits / 8` (the [`Dest::Vec`] invariant), so
+/// each arm extends by exactly its own const length — which the compiler lowers to a
+/// single store, never to a call with a run-time length.
+#[inline]
+fn store_byte_field_vec(
+    bytes: &mut Vec<u8>,
+    nbits: usize,
+    value: u64,
+    nbytes: usize,
+    little: bool,
+) {
+    debug_assert_eq!(
+        bytes.len(),
+        nbits / 8,
+        "a byte-aligned write extends the buffer by the field width"
+    );
+    match nbytes {
+        1 => bytes.extend_from_slice(&[value as u8]),
+        2 => {
+            let field = value as u16;
+            let field = if little {
+                field.to_le_bytes()
+            } else {
+                field.to_be_bytes()
+            };
+            bytes.extend_from_slice(&field);
+        }
+        4 => {
+            let field = value as u32;
+            let field = if little {
+                field.to_le_bytes()
+            } else {
+                field.to_be_bytes()
+            };
+            bytes.extend_from_slice(&field);
+        }
+        _ => {
+            let field = if little {
+                value.to_le_bytes()
+            } else {
+                value.to_be_bytes()
+            };
+            bytes.extend_from_slice(&field);
+        }
+    }
+}
+
+// Test-only tallies of [`BitWriter::push_byte_field`]'s two routes.
+//
+// The direct store and the bit-exact fallback produce the **same** bytes, so the only
+// way a test can observe *which* one ran is to count them. Thread-local because this
+// crate's unit tests run in parallel inside one process and each test asserts on its
+// **own** thread's delta. Compiled out entirely outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static BYTE_FIELD_STORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BYTE_FIELD_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one direct [`BitWriter::push_byte_field`] store (test builds only).
+#[cfg(test)]
+fn note_byte_field_store() {
+    BYTE_FIELD_STORES.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// Count one [`BitWriter::push_byte_field`] fallback to the bit-exact writers (test
+/// builds only).
+#[cfg(test)]
+fn note_byte_field_fallback() {
+    BYTE_FIELD_FALLBACKS.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// How many byte fields **this thread** has stored through the direct path so far.
+#[cfg(test)]
+pub(super) fn byte_field_stores() -> usize {
+    BYTE_FIELD_STORES.with(|calls| calls.get())
+}
+
+/// How many byte fields **this thread** has sent down the bit-exact fallback so far.
+#[cfg(test)]
+pub(super) fn byte_field_fallbacks() -> usize {
+    BYTE_FIELD_FALLBACKS.with(|calls| calls.get())
 }
 #[cfg(test)]
 mod tests {

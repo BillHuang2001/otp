@@ -69,7 +69,7 @@ use crate::predicates;
 use crate::Step;
 
 use super::segments::{float_source, put_float, put_utf16, put_utf32, put_utf8};
-use super::size::{fail_seg, float_nbits, seg_nbits, segment_size, SegReason, SegSize};
+use super::size::{fail_seg, float_nbits, seg_fail_step, seg_nbits, segment_size, SegReason, SegSize};
 use super::read_value;
 use crate::families::bitstrings::{
     decode_flags, is_all, push_wide_int, raw, small_value, BitWriter, Built, BSF_LITTLE,
@@ -88,7 +88,23 @@ pub(crate) enum PreparedSeg {
         value: Operand,
         width: Width,
     },
-    /// `binary Unit Flags Value Size` — a bitstring operand's bits.
+    /// `integer` whose static width is a **whole number of bytes** in `1 | 2 | 4 | 8` —
+    /// the direct-store form of [`PreparedSeg::Integer`].
+    ///
+    /// Both the width *and* the store shape are settled at prepare time, so execution is
+    /// one tag test on the value plus one native store per field
+    /// (`BitWriter::push_byte_field` → `raw::InPlace::write_byte_field`), instead of
+    /// `is_integer` + `big_parts_safe` + `small_value`, a `to_be_bytes` and a
+    /// variable-length slice copy. A **bignum** operand (or a non-integer) falls out to
+    /// [`integer_non_small`], which keeps the bignum-into-a-narrow-segment write and the
+    /// bare `badarg` exactly as [`PreparedSeg::Integer`] has them.
+    ByteInt {
+        value: Operand,
+        /// The field width in bytes: `1`, `2`, `4` or `8`.
+        bytes: u8,
+        /// `BSF_LITTLE` was set on the segment's flags.
+        little: bool,
+    },    /// `binary Unit Flags Value Size` — a bitstring operand's bits.
     Binary {
         unit: usize,
         value: Operand,
@@ -142,8 +158,52 @@ pub(crate) enum Width {
 /// A resolved `bs_create_bin` segment program.
 pub(crate) struct CreateProgram {
     pub(super) segments: Vec<PreparedSeg>,
+    /// `reserve_after[i]` is the summed **static** bit width of every segment after
+    /// position `i` — `None` as soon as one of them has a runtime width (a `Dynamic`
+    /// size, an `All` tail, an `Append` or a `Utf`). It is the single figure
+    /// [`BitWriter::arm_room`] needs to replace the per-field capacity checks with one
+    /// per instruction.
+    pub(super) reserve_after: Vec<Option<usize>>,
 }
 
+/// The bit width of a segment that is known at prepare time, or `None` for a runtime one.
+fn static_bits(segment: &PreparedSeg) -> Option<usize> {
+    match segment {
+        PreparedSeg::Integer {
+            width: Width::Imm(nbits),
+            ..
+        } => Some(*nbits),
+        PreparedSeg::ByteInt { bytes, .. } => Some(usize::from(*bytes) * 8),
+        PreparedSeg::Binary {
+            width: Width::Imm(nbits),
+            ..
+        } => Some(*nbits),
+        PreparedSeg::Float {
+            width: Width::Imm(nbits),
+            ..
+        } => Some(*nbits),
+        PreparedSeg::String { start, end } => Some((end - start) * 8),
+        PreparedSeg::Integer { .. }
+        | PreparedSeg::Binary { .. }
+        | PreparedSeg::Float { .. }
+        | PreparedSeg::Utf { .. }
+        | PreparedSeg::Append { .. } => None,
+    }
+}
+
+/// The [`CreateProgram::reserve_after`] table: one right-to-left running sum.
+fn reserve_after(segments: &[PreparedSeg]) -> Vec<Option<usize>> {
+    let mut table = vec![None; segments.len()];
+    let mut sum: Option<usize> = Some(0);
+    for (index, segment) in segments.iter().enumerate().rev() {
+        table[index] = sum;
+        sum = match (sum, static_bits(segment)) {
+            (Some(total), Some(bits)) => total.checked_add(bits),
+            _ => None,
+        };
+    }
+    table
+}
 /// Resolve `segments` into a program, or `None` when the shape must stay on the generic
 /// walk (see the module docs).
 ///
@@ -159,9 +219,12 @@ pub(super) fn prepare(module: &Module, segments: &[Operand]) -> Option<CreatePro
     for group in segments.chunks_exact(SEGMENT_OPERANDS) {
         prepared.push(prepare_segment(module, group)?);
     }
-    Some(CreateProgram { segments: prepared })
+    let reserve_after = reserve_after(&prepared);
+    Some(CreateProgram {
+        segments: prepared,
+        reserve_after,
+    })
 }
-
 /// The accept rule of a *static* size/unit operand: the value
 /// [`read_size`](crate::families::bitstrings::read_size) would produce for a literal
 /// (`Operand::Integer`/`Operand::Character`), or `None` for anything that needs a
@@ -199,13 +262,24 @@ fn prepare_segment(module: &Module, group: &[Operand]) -> Option<PreparedSeg> {
                     unit,
                 },
             };
+            // A static whole-byte width (the shape every real integer segment has) gets
+            // the direct-store form; every other width keeps `PreparedSeg::Integer`, so
+            // a bit-granular / 3..7-byte / dynamic field executes exactly as before.
+            if let Width::Imm(nbits) = width {
+                if matches!(nbits, 8 | 16 | 32 | 64) {
+                    return Some(PreparedSeg::ByteInt {
+                        value: value_op.clone(),
+                        bytes: (nbits / 8) as u8,
+                        little: flags & BSF_LITTLE != 0,
+                    });
+                }
+            }
             Some(PreparedSeg::Integer {
                 flags,
                 value: value_op.clone(),
                 width,
             })
-        }
-        "binary" => {
+        }        "binary" => {
             let width = if is_all(module, size_op) {
                 Width::All
             } else if let Some(size) = static_size(size_op) {
@@ -324,13 +398,49 @@ pub(super) fn assemble_prepared(
                             end_bits,
                             source,
                         ));
+                        // ONE capacity check for the whole rest of the instruction
+                        // (C sizes an append up front): the summed static width of the
+                        // remaining segments, armed as the writer's reservation when the
+                        // payload already has it. A shortfall is left to the per-field
+                        // checks, so the growth schedule is unchanged.
+                        if let Some(tail) = program.reserve_after[position] {
+                            writer.arm_room(tail);
+                        }
                         continue;
                     }
                 }
                 let (bytes, src_off) = raw::subject_bytes(source)?;
                 writer.push_bits_from(bytes, src_off, src_bits, machine)?;
             }
-            PreparedSeg::Integer {
+            PreparedSeg::ByteInt {
+                value,
+                bytes,
+                little,
+            } => {
+                let field = read_value(machine, module, ctx, value)?;
+                // The overwhelmingly common shape: an `IMMED1` small. Testing it FIRST
+                // is what keeps the bignum machinery (`is_integer` + `big_parts_safe`)
+                // off the per-field path; the non-small half is one out-of-line call.
+                match small_value(field) {
+                    Some(raw_value) => {
+                        writer.push_byte_field(raw_value as u64, usize::from(*bytes), *little, machine)?
+                    }
+                    None => {
+                        if let Some(step) = integer_non_small(
+                            machine,
+                            module,
+                            labels,
+                            fail,
+                            field,
+                            usize::from(*bytes) * 8,
+                            *little,
+                            &mut writer,
+                        )? {
+                            return Ok(Err(step));
+                        }
+                    }
+                }
+            }            PreparedSeg::Integer {
                 flags,
                 value,
                 width,
@@ -485,8 +595,49 @@ pub(super) fn assemble_prepared(
     Ok(Ok(writer.finish_built()))
 }
 
-/// The `binary` segment's source: the byte slice, window bit offset and bit count the
-/// value operand draws from, or `None` when it is not a bitstring (the C
+/// The **non-small** half of an `integer` segment: a bignum masked into the field, or
+/// the bare `badarg` for a value that is no integer at all.
+///
+/// This is the shared body of [`PreparedSeg::Integer`]'s classification tail and
+/// [`PreparedSeg::ByteInt`]'s cold arm, and it is deliberately the *same* code path
+/// [`super::assemble`] uses: `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`)
+/// write a bignum **modulo `2^nbits`** at any width, so a bignum in a narrow field is
+/// truncated, never rejected; a value that is neither a small nor a big is the bare
+/// `badarg` at every field width (C's `erts_bs_put_integer_be`/`_le` return 0 for a
+/// non-integer, `erl_bits.c:952-955`/`:1152-1155`).
+///
+/// `Ok(None)` means the field was written; `Ok(Some(step))` is the completed segment
+/// failure the caller returns verbatim. Out of line: a bignum operand is the cold case
+/// of every measured workload, and keeping it out of the arm is what leaves that arm a
+/// tag test plus a store.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn integer_non_small(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &LabelMap,
+    fail: Label,
+    value: beam_term::Eterm,
+    nbits: usize,
+    little: bool,
+    writer: &mut BitWriter,
+) -> Result<Option<Step>> {
+    if !predicates::is_integer(value) {
+        return Ok(Some(seg_fail_step(
+            machine,
+            module,
+            labels,
+            fail,
+            SegReason::BadArg,
+        )?));
+    }
+    // `is_integer` is exactly `is_small || is_big` and the caller already ruled out a
+    // small, so this is a bignum: mask it into the field.
+    push_wide_int(writer, value, nbits, little, machine)?;
+    Ok(None)
+}
+
+/// The `binary` segment's source: the byte slice, window bit offset and bit count the/// value operand draws from, or `None` when it is not a bitstring (the C
 /// `is_not_bitstring(Src)` arm).
 ///
 /// The prepared twin of `segments::segment_source`, kept here so the prepared path owns
