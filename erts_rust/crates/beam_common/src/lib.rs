@@ -47,8 +47,8 @@
 //!
 //! This crate is a **dependency sink**: it depends on `std` and `libc` only — no
 //! `thiserror`, no `tracing`, no `bitflags` — so that it can sit underneath everything
-//! else without pulling a dependency graph along. Its modules are private; every public
-//! item is re-exported at the crate root.
+//! else without pulling a dependency graph along. Its modules are private ([`safety`] and
+//! [`md5`] excepted); every public item is re-exported at the crate root.
 //!
 //! # Example
 //!
@@ -92,9 +92,12 @@ mod config;
 mod constants;
 mod error;
 mod logging;
-mod md5;
 mod refid;
 mod version;
+
+/// RFC 1321 MD5 — the workspace's single implementation (see the module docs for why it
+/// lives at the lowest common ancestor).
+pub mod md5;
 
 /// The workspace `unsafe` marker convention (documentation only).
 pub mod safety;

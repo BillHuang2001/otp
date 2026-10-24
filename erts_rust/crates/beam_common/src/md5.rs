@@ -57,11 +57,13 @@
 //! # Examples
 //!
 //! ```
-//! // The RFC 1321 Appendix A.5 `"abc"` vector.
+//! // The RFC 1321 Appendix A.5 `"abc"` vector. Both the module path and the crate-root
+//! // re-export reach the one-shot form.
 //! assert_eq!(
-//!     beam_common::digest(b"abc"),
+//!     beam_common::md5::digest(b"abc"),
 //!     [0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72]
 //! );
+//! assert_eq!(beam_common::md5::digest(b"abc"), beam_common::digest(b"abc"));
 //! ```
 
 use crate::error::{BeamError, Result};

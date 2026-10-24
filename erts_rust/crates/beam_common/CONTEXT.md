@@ -16,7 +16,8 @@ This is a **dependency sink**: it depends on `std` and on **nothing else** — d
 `../../CONTEXT.md` and `../../../CHANGE.md`.
 
 ## API Surface
-Re-exported at the crate root (`beam_common::…`); modules are private except `safety`.
+Re-exported at the crate root (`beam_common::…`); modules are private except `safety` and `md5`
+(the MD5 module is public so downstream crates can also write `beam_common::md5::{Md5, digest}`).
 
 - `error` — `BeamError` (the ONE workspace error type), `Result<T>`, and the term-independent
   exception machinery: `ExceptionClass`, `ExitReason`, `Raise`, `LiveReason`, `StackTrace`,
