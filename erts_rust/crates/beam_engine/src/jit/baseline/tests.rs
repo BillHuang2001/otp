@@ -829,6 +829,63 @@ fn the_export_entry_records_the_run_entry_call_like_the_interpreter() {
 // error), never a wrong result, never a panic and never a silent continue.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+/// Assemble one function's `code` into `module`: mint its name atom, decompose the
+/// label-delimited stream into the loader's [`Block`]s and push the [`Function`].
+///
+/// `entry_override` is the export's entry label when one names this function (a label
+/// *after* the function label, exactly as a real `.beam` is decomposed); `None` uses the
+/// function label itself. The new function's index in `module.functions` is returned.
+///
+/// `build_module` is the general form. This entry exists for a caller that must **mint the
+/// module's atoms first** — a `bs_match` command name is an `Operand::Atom`, so its id has
+/// to be known before the instruction stream is written — and only then assemble the code,
+/// without duplicating the block decomposition a second time.
+pub(crate) fn assemble_function(
+    module: &mut Module,
+    function_name: &str,
+    arity: u32,
+    code: Vec<Instr>,
+    entry_override: Option<Label>,
+) -> u32 {
+    let name_atom = module.atom_table.intern(function_name);
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ins)| match ins {
+            Instr::Label(l) => Some((*l, i)),
+            _ => None,
+        })
+        .collect();
+    let code_len = code.len();
+    let mut starts: Vec<(usize, Label)> = labels.iter().map(|(l, at)| (*at, *l)).collect();
+    starts.sort_by_key(|(at, _)| *at);
+    starts.dedup_by_key(|(at, _)| *at);
+    let mut blocks = Vec::with_capacity(starts.len());
+    for (index, (start, label)) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).map_or(code_len, |(at, _)| *at);
+        if *start < end {
+            blocks.push(Block {
+                label: *label,
+                start: *start,
+                end,
+            });
+        }
+    }
+    let func_label = starts.first().map(|(_, l)| *l).unwrap_or(Label(0));
+    let entry_label = entry_override.unwrap_or(func_label);
+    module.functions.push(Function {
+        func_label,
+        entry_label,
+        module: module.name,
+        name: name_atom,
+        arity,
+        code,
+        blocks,
+        labels,
+    });
+    module.functions.len() as u32 - 1
+}
 /// Build a module named `name` with `imports` from `(function_name, arity, code)`
 /// triples — each decomposed into the loader's label-delimited blocks, so the
 /// native tier compiles real blocks — exporting every
@@ -854,46 +911,11 @@ pub(crate) fn build_module(
         });
     }
     for (function_name, arity, code) in functions {
-        let name_atom = module.atom_table.intern(function_name);
-        let labels: BTreeMap<Label, usize> = code
-            .iter()
-            .enumerate()
-            .filter_map(|(i, ins)| match ins {
-                Instr::Label(l) => Some((*l, i)),
-                _ => None,
-            })
-            .collect();
-        let code_len = code.len();
-        let mut starts: Vec<(usize, Label)> = labels.iter().map(|(l, at)| (*at, *l)).collect();
-        starts.sort_by_key(|(at, _)| *at);
-        starts.dedup_by_key(|(at, _)| *at);
-        let mut blocks = Vec::with_capacity(starts.len());
-        for (index, (start, label)) in starts.iter().enumerate() {
-            let end = starts.get(index + 1).map_or(code_len, |(at, _)| *at);
-            if *start < end {
-                blocks.push(Block {
-                    label: *label,
-                    start: *start,
-                    end,
-                });
-            }
-        }
-        let func_label = starts.first().map(|(_, l)| *l).unwrap_or(Label(0));
-        let entry_label = exports
+        let entry_override = exports
             .iter()
             .find(|(n, a, _)| *n == function_name && *a == arity)
-            .map(|(_, _, l)| *l)
-            .unwrap_or(func_label);
-        module.functions.push(Function {
-            func_label,
-            entry_label,
-            module: module.name,
-            name: name_atom,
-            arity,
-            code,
-            blocks,
-            labels,
-        });
+            .map(|(_, _, l)| *l);
+        assemble_function(&mut module, function_name, arity, code, entry_override);
     }
     for (function_name, arity, label) in exports {
         let function_atom = module.atom_table.intern(function_name);

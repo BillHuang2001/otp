@@ -223,6 +223,8 @@ mod census;
 
 #[cfg(test)]
 mod bitstr_tests;
+#[cfg(test)]
+mod bitstr_inline_tests;
 
 #[cfg(test)]
 mod tests;

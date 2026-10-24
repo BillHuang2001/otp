@@ -123,7 +123,10 @@ use super::jit_step_one;
 mod aggregate;
 pub(super) mod arith;
 mod bif;
-mod bitstr_inline;
+// `pub(crate)` so the sibling `#[cfg(test)]` node `baseline::bitstr_inline_tests` can
+// reach the per-shape emission instrument (`inlined`/`SHAPE_*`) and the shape
+// predicates the emitter's arms choose on; production visibility is unchanged.
+pub(crate) mod bitstr_inline;
 mod block;
 mod compare;
 mod compile;
@@ -173,6 +176,8 @@ pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
 pub(crate) use r#move::{move_shape, MoveShape};
 #[cfg(test)]
 pub(crate) use regalloc::cacheable_touches;
+#[cfg(test)]
+pub(crate) use regalloc::cacheable_writes;
 #[cfg(test)]
 pub(crate) use regalloc::is_inlined;
 // The register allocator: `allocate_registers_with_labels` is the production entry (every
