@@ -41,8 +41,9 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::copy::{identity, is_shared, preflight_words, shallow_unshared, CopyContext, Fixup};
+use crate::copy::{identity, is_shared, shallow_unshared, CopyContext, Fixup};
 use crate::error;
+use crate::preflight::preflight_words;
 
 /// Copies `term`'s graph into `to`, returning the copied root, **sharing repeated subterms**.
 ///

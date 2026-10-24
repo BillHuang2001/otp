@@ -19,15 +19,16 @@
 // %CopyrightEnd%
 
 //! The **retired** destination-pricing walk of the copy engine, kept as the equivalence oracle for
-//! [`crate::copy::preflight_words`].
+//! [`crate::preflight::preflight_words`].
 //!
 //! This is `src/copy.rs`'s former self-contained sizing walk — the bounded DFS
 //! ([`bounded_words_reference`]), its visit predicate ([`needs_visit_reference`]), the acyclicity
 //! check it fell back to ([`is_acyclic_reference`]) and the preflight built on them
 //! ([`preflight_words_reference`]) — moved here verbatim. The shipped copier no longer walks
 //! anything itself: it supplies a [`beam_term::size::SizingPolicy`]
-//! ([`crate::copy::CopyPricing`](crate::copy)) to `beam_term::size`'s policy-parameterised walk, so
-//! the DFS, the per-object interior, the bound and the cycle verdict are one shared implementation.
+//! ([`crate::preflight::preflight_words`](crate::preflight)) to `beam_term::size`'s
+//! policy-parameterised walk, so the DFS, the per-object interior, the bound and the cycle verdict
+//! are one shared implementation.
 //!
 //! The module is `#[cfg(test)]`-gated (see `lib.rs`), so none of it ships. It exists because a
 //! refactor of a load-bearing cost model needs *evidence*, and the only evidence that the delegated
@@ -61,8 +62,9 @@ use beam_common::Result;
 use beam_term::layout::for_each_sizing_child_slot as sizing_child_slots;
 use beam_term::prelude::*;
 
-use crate::copy::{is_shared, refc_binary_words, CopyContext};
+use crate::copy::{is_shared, CopyContext};
 use crate::layout;
+use crate::preflight::refc_binary_words;
 
 /// Whether a word contributes a destination object the copier must descend into: a compound term
 /// that is **not** shared as-is. Immediates, literal-area terms (shared verbatim) and non-term
@@ -72,7 +74,7 @@ use crate::layout;
 /// `size_object_x` (`copy.c:105,119`), where a literal-area subterm is skipped. It is deliberately
 /// narrower than `beam_term::size::needs_visit`, which descends *into* literals because it counts
 /// the **source** graph's occupancy. It is the predicate the shipped policy
-/// ([`crate::copy::CopyPricing`]) expresses as `is_shared`.
+/// (`crate::preflight`'s `CopyPricing`) expresses as `is_shared`.
 #[inline]
 fn needs_visit_reference(term: Eterm) -> bool {
     !is_shared(term) && is_term_word(term)
@@ -312,9 +314,10 @@ mod tests {
     use beam_gc::Mso;
     use beam_term::prelude::*;
 
-    use crate::copy::{preflight_words, CopyContext};
+    use crate::copy::CopyContext;
     use crate::copy_reference::preflight_words_reference;
     use crate::off_heap::OffHeapTable;
+    use crate::preflight::preflight_words;
 
     /// Asserts that the shipped policy walk ([`preflight_words`]) and the retired walk
     /// ([`preflight_words_reference`]) agree **exactly** on `term` at every limit `0..=(count + 2)`

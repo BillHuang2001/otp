@@ -42,29 +42,29 @@
 //!
 //! # One traversal whenever the destination's off-heap table is empty (the single-pass fast path)
 //!
-//! The copier's default shape is **two traversals**: [`preflight_words`] prices the whole graph in
-//! one walk, then [`shallow`] + the worklist loop write it. A destination whose
-//! **off-heap table** holds nothing in any of its three lists (no MSO handle, no refc binary, no
-//! node reference) has no partially-built state a failed attempt could not wholly roll back, and is
-//! the shape the common case actually has (a fresh
-//! [`HeapFragment`](crate::HeapFragment) region, and — because the staging table is per-send and
-//! always fresh — every receiver heap a real `send` copies into), so for it the copier runs the
-//! writing traversal **alone**: [`try_copy_fast`] copies through a [`TrialTarget`] — a bump pointer
-//! over the destination heap's own *unwritten* words — and commits with a single `alloc_words`. A
-//! copy that turns out not to fit is abandoned and the preflight path below re-derives the same
-//! typed outcome, so nothing about the error contract (`AllocKind::Message` exhaustion, `BadArg`
-//! for a malformed/cyclic graph, send atomicity) changes. Because the trial never advances the
-//! destination's `used`/`peak`, a refused copy has provably written nothing at all — the strongest
-//! form of the crate's "no partial write on refusal" rule, and the one `tests/sizing.rs` pins.
+//! The copier's sized shape is **two traversals**: [`preflight_words`] prices the whole graph in one
+//! walk, then [`shallow`] + the worklist loop write it. A destination whose **off-heap table** holds
+//! nothing in any of its three lists (no MSO handle, no refc binary, no node reference) has no
+//! partially-built state a failed attempt could not wholly roll back, and is the shape the common
+//! case actually has (a fresh [`HeapFragment`](crate::HeapFragment) region, and — because the staging
+//! table is per-send and always fresh — every receiver heap a real `send` copies into), so for it the
+//! copier runs the writing traversal **alone**: [`try_copy_fast`] copies through a [`TrialTarget`] —
+//! a bump pointer over the destination heap's own *unwritten* words — and commits with a single
+//! `alloc_words`. A copy that turns out not to fit is abandoned and the preflight path below
+//! re-derives the same typed outcome, so nothing about the error contract (`AllocKind::Message`
+//! exhaustion, `BadArg` for a malformed/cyclic graph, send atomicity) changes. Because the trial
+//! never advances the destination's `used`/`peak`, a refused copy has provably written nothing at all
+//! — the strongest form of the crate's "no partial write on refusal" rule, and the one
+//! `tests/sizing.rs` pins.
 //!
 //! A destination heap that is merely **dirty** (`used() > 0`) is *not* excluded: the trial only ever
 //! writes into the heap's unused tail and commits once, so a failure needs no heap rewind at all.
 //! Only a **non-empty off-heap table** keeps the sized path, because rolling *that* back would
 //! discard entries that are not this copy's to release.
 //!
-//! # The sizing walk is `beam_term::size`'s policy-parameterised walk
+//! # The sizing walk is `beam_term::size`'s policy-parameterised walk, on a warm per-thread scratch
 //!
-//! [`preflight_words`] counts what [`shallow`]/[`copy_refc_binary`] will **write into the
+//! [`preflight_words`] counts what [`shallow`]/`copy_refc_binary` will **write into the
 //! destination** — the C's `size_object_litopt(obj, area)`: the `litopt != NULL` half of
 //! `size_object_x` (`erts/emulator/beam/copy.c:105,119`), the form the **message-heap charge** uses
 //! (`global.h:1136`; `erl_message.c:771,839`, whose reduction charge follows at `erl_message.c:881`
@@ -72,41 +72,34 @@
 //! (`global.h:1135`) [`beam_term::size_object`] publishes.
 //!
 //! That destination-pricing model **is delegated**: the DFS, the per-object interior
-//! (`beam_term::layout`), the bound and the cycle verdict are `beam_term::size`'s, driven by the
-//! [`SizingPolicy`] this crate supplies ([`CopyPricing`]). The copier keeps only the two axes on
-//! which its price differs from the source occupancy, one per policy method:
+//! (`beam_term::layout`), the bound and the cycle verdict are `beam_term::size`'s, driven by a
+//! [`SizingPolicy`] this crate supplies; the walk, its two pricing axes, its cycle verdict and the
+//! per-thread [`SizingScratch`](beam_term::size::SizingScratch) it runs on are [`crate::preflight`]'s.
+//! The copier keeps only the *call* to it, so the same figure sizes the destination and — on the
+//! fragment path — the message buffer.
 //!
-//! 1. **Sharing** — [`SizingPolicy::is_shared`] is the copier's own [`is_shared`], so a
-//!    **literal-area** subterm costs `0` destination words and is not descended into (the copy
-//!    shares it by identity, `copy.c:99,119`). The `beam_term` default policy would count its
-//!    interior and over-demand words the copy never writes; `tests/destination_pricing.rs` pins the
-//!    delta.
-//! 2. **Per-object pricing** — [`SizingPolicy::object_words`] overrides the one shape
-//!    `beam_term::layout::object_words` prices for the *source* heap: a **refc binary whose payload
-//!    no source off-heap handle owns** costs its *flattened* window ([`refc_binary_words`]),
-//!    because [`copy_refc_binary`] finds no payload to share and flattens it ([`copy_match_context`])
-//!    — `heap_bits_size_words(end - start)`, typically far more than the 8-word
-//!    `[BinRef(3)][ErlSubBits(5)]` pair the layout counts. The default policy would under-count and
-//!    the sized path would reserve too few words, failing *mid-copy* after a partial write; the
-//!    price depends on [`CopyContext`]'s **source** off-heap table, which is precisely why the
-//!    policy is a struct over the copy boundary rather than a term-only walk.
+//! The scratch is what makes the walk affordable: `beam_term::size` gives the caller the walk's two
+//! buffers as a reusable value which every walk **clears** rather than drops, and [`crate::preflight`]
+//! keeps one per thread, so a graph priced twice (every refused send, and every retried one) pays for
+//! the buffers once. `tests/traversals.rs` measures that: a warm preflight allocates nothing.
 //!
-//! Every other shape keeps the canonical answer, including a `SUB_BITS` **match context**, whose
-//! `beam_term::layout::object_words` already *is* the flattened window [`copy_match_context`] writes.
+//! # One sizing walk, the cycle guard on it, and one price per refusal
 //!
-//! # One sizing walk, and the cycle guard on it
-//!
-//! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap)
-//! can point back at one of its own ancestors, and a naive walk of such a graph would loop
-//! forever (or exhaust memory). [`preflight_words`] therefore runs the shared walk **unbounded**
+//! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap) can
+//! point back at one of its own ancestors, and a naive walk of such a graph would loop forever (or
+//! exhaust memory). [`preflight_words`] therefore runs the shared walk **unbounded**
 //! (`limit = usize::MAX`), the one mode in which the walk detects the back-edge itself through its
-//! DFS path set and reports [`TermError::TermGraphCyclic`] — which the copier maps to a typed
-//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) instead of hanging. That single walk is
-//! also **exact**: at `usize::MAX` the running total saturates rather than passing the limit, so
-//! the walk's over-limit arm is unreachable and an acyclic graph always comes back with its true
+//! DFS path set and reports
+//! [`TermError::TermGraphCyclic`](beam_term::error::TermError::TermGraphCyclic) — which the copier
+//! maps to a typed
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) instead of hanging. That single walk is also
+//! **exact**: at `usize::MAX` the running total saturates rather than passing the limit, so the
+//! walk's over-limit arm is unreachable and an acyclic graph always comes back with its true
 //! destination price. One walk is the whole gate: the caller compares that figure against the
 //! destination's free words, and — on the fragment path — reuses the very same figure to size the
-//! message buffer (see [`crate::send_fragmented`]). This is the C's shape, two walks per send
+//! message buffer, so a refusal is priced **once** and never re-walked (see
+//! [`crate::send_fragmented`] and [`crate::send_fragmented_after_refusal`], the latter for a host
+//! that already holds the refusal). This is the C's shape, two walks per send
 //! (`size_object_litopt` then `copy_struct_litopt`, `erl_message.c:771,797,839,860`).
 //!
 //! The fast path inherits the same guarantee from the other direction: its trial target hands out
@@ -116,13 +109,10 @@
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_term::error::TermError;
 use beam_term::prelude::*;
-use beam_term::size::{size_object_bounded_with, SizingPolicy};
-
 use crate::layout;
 use crate::off_heap::OffHeapTable;
-
+use crate::preflight::preflight_words;
 /// The **destination-word source** of a copy: the real destination heap, or — for
 /// [`copy_struct`]'s optimistic single-pass fast path — a [`TrialTarget`], a bump pointer over
 /// the destination heap's own unwritten words.
@@ -300,113 +290,6 @@ fn push_fixup(work: &mut Vec<Fixup>, slot: *mut Eterm, child: Eterm) {
     }
 }
 
-/// Prices `term`'s graph for a copy into `ctx`'s destination — the [`SizingPolicy`] that turns
-/// `beam_term::size`'s walk into the copier's own destination-pricing cost model.
-///
-/// The copier's price differs from `beam_term::size_object`'s source occupancy on exactly the two
-/// axes the trait exposes, one per method: the copy **shares** a literal-area subterm by identity
-/// ([`is_shared`], so it costs `0` destination words and is not descended into) and it **flattens**
-/// a refc binary whose payload no source off-heap handle owns ([`refc_binary_words`]). Every other
-/// object is priced by the canonical [`beam_term::layout::object_words`], while the DFS, the bound
-/// and the cycle verdict stay `beam_term::size`'s (see the module docs).
-struct CopyPricing<'a> {
-    ctx: &'a CopyContext<'a>,
-}
-
-impl SizingPolicy for CopyPricing<'_> {
-    fn is_shared(&self, t: Eterm) -> bool {
-        is_shared(t)
-    }
-
-    fn object_words(&self, header: Eterm, payload: *const Eterm) -> Option<usize> {
-        // Reconstructing the term from its header address is faithful here: `SizingPolicy`'s docs
-        // bless exactly this, and a literal-tagged word was already filtered out by `is_shared`
-        // before any pricing happened.
-        let t = make_boxed(payload);
-        if layout::is_refc_binary_term(t) {
-            // The one shape `beam_term::layout::object_words` prices for the *source* heap while
-            // the copier writes a flattened window, so its price depends on the copy boundary's
-            // source off-heap table.
-            return Some(refc_binary_words(t, self.ctx));
-        }
-        // SAFETY: the walk only prices a live, initialized object of `header`'s shape, which is
-        // exactly `object_words`'s caller contract.
-        Some(unsafe { layout::object_words(header, payload) })
-    }
-}
-
-/// Prices the **destination** for a copy of `term`, returning the flat word count to reserve — the
-/// copy engine's destination-capacity gate, in **exactly one traversal** of the graph.
-///
-/// The count is [`CopyPricing`]'s over `beam_term::size`'s walk, run **unbounded**
-/// (`size_object_bounded_with(term, usize::MAX, …)`), which is both exact and total in that one
-/// pass:
-///
-/// * an **acyclic** graph comes back exact — the walk's over-limit arm cannot fire at
-///   `usize::MAX` (the running total saturates instead of passing the limit), so `Complete(n)` is
-///   the true destination price for a graph that fits *and* for one that does not. That matters
-///   for the refusal: the typed [`AllocKind::Message`](beam_common::AllocKind) failure carries this
-///   exact figure as its `requested` byte count, and [`crate::send_fragmented`] sizes the message
-///   buffer from it, so a bounded accept/too-large split would only have to re-walk for the same
-///   number;
-/// * a **cyclic** or otherwise malformed graph is a typed
-///   [`BeamError::BadArg`](beam_common::BeamError::BadArg), never a hang: the unbounded walk is
-///   exactly the mode whose DFS path set is what detects a back-edge
-///   ([`TermError::TermGraphCyclic`]).
-///
-/// One walk costs `O(objects visited)` time and, like every `beam_term::size` walk, two heap
-/// allocations: the explicit-stack `Vec` (one frame per pending step) and the DFS path-set
-/// `HashSet`, which allocates on its first insert and holds one entry per object on the current
-/// path. It is *not* allocation-free, and there is no second or third traversal behind it — this is
-/// the whole gate.
-///
-/// The caller compares the returned figure against the destination's free words
-/// ([`copy_struct`] does: `to.available() < needed` ⇒ `heap_exhausted(needed)`, so the refusal is
-/// total and never leaves a partial write).
-///
-/// `limit` is the caller's capacity target and is **not consulted**, deliberately: the figure must
-/// be exact whether or not the graph fits, so bounding the walk could only buy an early refusal
-/// that then has to be re-priced. It stays in the signature because it is the capacity the caller
-/// is gating against, and because the recorded equivalence oracle (`copy_reference`) drives both
-/// this walk and the retired bounded one at every limit from `0` to past each graph's exact count.
-pub(crate) fn preflight_words(term: Eterm, _limit: usize, ctx: &CopyContext<'_>) -> Result<usize> {
-    let policy = CopyPricing { ctx };
-    match size_object_bounded_with(term, usize::MAX, &policy) {
-        Ok(words) => Ok(words),
-        // The only error the unbounded walk can report (see above): a back-edge, i.e. a forged or
-        // otherwise malformed graph.
-        Err(TermError::TermGraphCyclic) => Err(crate::error::bad_term()),
-        // Unreachable today (`usize::MAX` cannot be exceeded), kept so a future change to
-        // `beam_term::size`'s verdict machinery surfaces as a typed error rather than a wrong count.
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// The destination words the copier writes for the refc binary `t`.
-///
-/// A refc binary whose payload is owned by a handle in the source process's off-heap table is
-/// copied as the 8-word `[BinRef(3)][ErlSubBits(5)]` pair ([`ERL_REFC_BITS_SIZE`]) that **shares**
-/// the payload (see [`copy_refc_binary`]). One whose payload no held handle owns has no pair to
-/// share, so the copier **flattens** it into a fresh on-heap bitstring of the window's bits — the
-/// `heap_bits_size_words(end - start)` block [`copy_match_context`] writes.
-///
-/// This sizing lives beside the flag it mirrors (`layout::is_refc_binary_term`) so the preflight
-/// and [`shallow`] never disagree about what a refc binary costs. It is the one price
-/// [`CopyPricing`] overrides, and the retired walk kept by `copy_reference` prices through it too.
-pub(crate) fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> usize {
-    // SAFETY: `t` is a live refc binary (the caller's `is_refc_binary_term` guard), so its
-    // `ErlSubBits` words 1..4 are initialised and its `orig` slot is the live `BinRef` whose `val`
-    // is the payload's first data byte.
-    let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(t) };
-    // SAFETY: `orig` is the `BinRef` of a refc binary, so its two payload words are live.
-    let (val, _next) = unsafe { bin_ref_parts(orig) };
-    if ctx.src_off_heap().binary_by_data_ptr(val as *const u8).is_some() {
-        ERL_REFC_BITS_SIZE
-    } else {
-        heap_bits_size_words(end.raw().saturating_sub(start.raw()))
-    }
-}
-
 /// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
 /// the `ErlSubBits`) onto `to`, **sharing** its off-heap payload.
 ///
@@ -424,7 +307,8 @@ pub(crate) fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> usize {
 /// its payload's data pointer ([`beam_term::refc::write_refc_binary`]), so the window `start..end`
 /// reads the same bits and the result's data lives inside the destination, never aliasing the
 /// source payload. Nothing is registered in the destination off-heap table, and the cost is the
-/// flattened block — which [`refc_binary_words`] sizes, so the preflight and this copy agree.
+/// flattened block — which [`refc_binary_words`](crate::preflight::refc_binary_words) sizes, so the
+/// preflight and this copy agree.
 fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: Eterm) -> Result<Eterm> {
     // SAFETY: `src` is a live refc binary, so its `ErlSubBits` words 1..4 are initialised and its
     // `orig` slot is a live `BinRef` term.
@@ -719,8 +603,11 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
     //
     // `preflight_words` prices the graph in ONE walk with the copier's own `SizingPolicy` — not
     // `beam_term::size_object`, which sizes the source graph — and that walk is the one mode that
-    // also detects a forged cyclic graph (a typed error instead of a hang). The comparison below is
-    // the gate: the figure is exact, and the refusal carries it.
+    // also detects a forged cyclic graph (a typed error instead of a hang). It runs over this
+    // thread's warm `SizingScratch` (`crate::preflight`), so the walk itself allocates nothing once
+    // the thread has priced a graph of comparable size. The comparison below is the gate: the figure
+    // is exact, and the refusal carries it — which is the figure a fragmenting caller reuses, so an
+    // oversized payload is never priced twice.
     let needed = preflight_words(term, to.available(), ctx)?;
     if to.available() < needed {
         return Err(crate::error::heap_exhausted(needed));
@@ -754,8 +641,9 @@ pub fn copy_struct_simple(term: Eterm, to: &mut Heap) -> Result<Eterm> {
 /// graph with no literal-area subterm and no refc binary whose payload no source handle owns
 /// (`tests/sizing.rs`'s corpus). It is **not** the copier's own price for either of those two shapes
 /// — a shared literal costs 0 destination words to the copy and a no-handle refc binary costs its
-/// flattened window — so the copy engine prices through [`preflight_words`] instead, never through
-/// this function. `tests/destination_pricing.rs` pins the divergence.
+/// flattened window — so the copy engine prices through
+/// [`preflight_words`](crate::preflight::preflight_words) instead, never through this function.
+/// `tests/destination_pricing.rs` pins the divergence.
 pub fn size_of_copy(term: Eterm) -> usize {
     beam_term::size_object(term)
 }

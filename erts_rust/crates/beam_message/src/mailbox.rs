@@ -24,8 +24,10 @@
 //! `erts_queue_message`/`copy_struct` path (the scheduler-signalling half is `beam_process`);
 //! [`send_fragmented`] is the same for a payload that does **not** fit the receiver's heap — it
 //! copies the payload into a [`HeapFragment`] instead (the C `erts_try_alloc_message_on_heap`
-//! sender); [`receive`] is the selective-receive skeleton over a [`Queue`] (waiting, `after`
-//! timeouts, the save queue and signal ordering are `beam_process`'s).
+//! sender), and [`send_fragmented_after_refusal`] is that same delivery for a host that has already
+//! seen the refusal, so the refusal's price is used once and never re-derived; [`receive`] is the
+//! selective-receive skeleton over a [`Queue`] (waiting, `after` timeouts, the save queue and signal
+//! ordering are `beam_process`'s).
 //!
 //! # The host-facing contract (what a runtime relies on)
 //!
@@ -41,6 +43,9 @@
 //!   heap" signal. [`send_fragmented`] encodes that rule: it tries [`send`] first and falls back to
 //!   a fragment **only** on that one error kind, propagating every other failure unchanged (the
 //!   receiver heap, and the destination table since the failed attempt wrote nothing, stay untouched).
+//!   A host that ran the [`send`] itself and holds the refusal calls
+//!   [`send_fragmented_after_refusal`] instead, which is that same fallback with the trial and the
+//!   pricing walk removed — the refusal's own figure is the fragment's reservation.
 //! * **One fragment holds the whole payload.** [`send_fragmented`] sizes its fragment from the
 //!   refusal's own **exact destination price** in words (honouring a larger
 //!   `fragment_capacity_words` hint) and never splits a payload across a chain; a size-bounded split
@@ -62,6 +67,7 @@ use beam_term::prelude::*;
 use crate::copy::{copy_struct, CopyContext};
 use crate::fragment::{Fragments, HeapFragment};
 use crate::message::{Message, Queue};
+use crate::off_heap::OffHeapTable;
 
 /// Copies `term` into the receiver's heap `to_heap`, collects the off-heap objects it
 /// references, builds the [`Message`] and enqueues it on `to_queue`.
@@ -97,13 +103,18 @@ pub fn send(
 /// It first tries the ordinary receiver-heap copy; **only** a
 /// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) triggers the fragment
 /// path (any other failure is propagated unchanged, and `to_heap` is left untouched). That single
-/// refusal already carries the copier's **exact destination price** in words —
+/// refusal already carries the copier's **exact destination price** —
 /// [`AllocFailure::requested`](beam_common::AllocFailure::requested) divided by
 /// `size_of::<Eterm>()` — so the fragment is sized from it directly: one abandoned trial, one
 /// exact pricing walk, then **one** copy into the fragment. That is the C's shape
 /// (`size_object_litopt` then `copy_struct_litopt`, `erl_message.c:771,797,839,860`); nothing is
 /// re-copied and no second sizing walk is run. `fragment_capacity_words` is only a **floor** a
 /// caller may raise the reservation with, never a substitute for the price.
+///
+/// A caller that has **already** observed that refusal for this very `term` — the ordinary shape
+/// when a host tries [`send`] itself and hands the failure on — should call
+/// [`send_fragmented_after_refusal`] instead: it skips the trial and the walk entirely, keeping the
+/// one price the refusal already reported.
 ///
 /// The fragment is **one** fragment holding the whole payload, and a size-bounded split across a
 /// chain is not done here: that is the caller's concern. `term` is copied into the fragment's heap
@@ -129,21 +140,64 @@ pub fn send_fragmented(
             Ok(())
         }
         Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
-            // The refusal's own figure *is* the copier's destination price — the same number the
-            // fragment has to hold — so no re-sizing walk is needed.
-            let reserved = refused_words(failure.requested)
-                .unwrap_or_else(|| beam_term::size_object(term));
-            enqueue_fragmented(
+            send_fragmented_after_refusal(
                 from,
                 term,
                 to_queue,
                 ctx.src_off_heap(),
                 fragment_capacity_words,
-                reserved,
+                failure.requested,
             )
         }
         Err(other) => Err(other),
     }
+}
+
+/// Delivers `term` straight into a [`HeapFragment`], for a caller that has **already** seen a
+/// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) for a copy of this very
+/// `term` into the receiver heap it intended — the last step of the C
+/// `erts_try_alloc_message_on_heap` shape, without repeating the steps that produced the refusal.
+///
+/// `requested_bytes` is that refusal's [`AllocFailure::requested`](beam_common::AllocFailure::requested)
+/// figure; it converts to the copier's exact destination price in words (with
+/// [`beam_term::size_object`] as the defensive fallback for a byte count that is not a whole,
+/// nonzero number of words), so the fragment is reserved **once**, precisely, and the payload is
+/// copied into it **once**. No trial copy is attempted on a receiver heap, and **no pricing walk is
+/// run**: the price is the one the caller already paid for.
+///
+/// The **precondition** is that the caller really did observe that refusal for `term` and that no
+/// concurrent copy has since freed room in the heap it was refused against. It is not a correctness
+/// requirement, only an optimality one: `requested_bytes` only ever decides how big a fragment to
+/// reserve (`fragment_capacity_words` is a **floor** beneath it), the fragment path never touches a
+/// receiver heap, and a fragmented message is a legal home in its own right — the receiver moves the
+/// payload in on receive ([`Fragments::move_into`]). So a caller that passes a stale or absent figure
+/// still gets a **correct** delivery; it may simply reserve the fallback reservation and let the
+/// copy's own refusal re-reserve the fragment (see `enqueue_fragmented`).
+///
+/// The envelope and ownership rules are [`send_fragmented`]'s: one fragment holding the whole
+/// payload, `term` copied against the fragment's off-heap table so the fragment owns the payload's
+/// off-heap objects, and the enqueued [`Message`]'s [`payload`](Message::payload) pointing into the
+/// fragment.
+pub fn send_fragmented_after_refusal(
+    from: Eterm,
+    term: Eterm,
+    to_queue: &mut Queue,
+    src_off_heap: &OffHeapTable,
+    fragment_capacity_words: usize,
+    requested_bytes: usize,
+) -> Result<()> {
+    // The refusal's own figure *is* the copier's destination price — the same number the fragment
+    // has to hold — so no re-sizing walk is needed.
+    let reserved =
+        refused_words(requested_bytes).unwrap_or_else(|| beam_term::size_object(term));
+    enqueue_fragmented(
+        from,
+        term,
+        to_queue,
+        src_off_heap,
+        fragment_capacity_words,
+        reserved,
+    )
 }
 
 /// The word count a message-heap refusal reports, when its byte figure is a whole (nonzero) number
@@ -168,7 +222,7 @@ fn enqueue_fragmented(
     from: Eterm,
     term: Eterm,
     to_queue: &mut Queue,
-    src_off_heap: &crate::off_heap::OffHeapTable,
+    src_off_heap: &OffHeapTable,
     fragment_capacity_words: usize,
     reserved_words: usize,
 ) -> Result<()> {

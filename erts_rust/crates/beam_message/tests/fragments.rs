@@ -53,7 +53,8 @@ use beam_common::{AllocKind, BeamError};
 use beam_gc::Mso;
 use beam_message::off_heap::OffHeapTable;
 use beam_message::{
-    send, send_fragmented, size_of_copy, CopyContext, Fragments, HeapFragment, MsoHandle, Queue,
+    send, send_fragmented, send_fragmented_after_refusal, size_of_copy, CopyContext, Fragments,
+    HeapFragment, MsoHandle, Queue,
 };
 use beam_term::compare;
 use beam_term::prelude::*;
@@ -910,6 +911,87 @@ fn a_fragmented_send_is_reserved_from_the_refusals_own_exact_price() {
     );
     assert_eq!(to_heap.used(), 0, "the abandoned trial committed no receiver-heap word");
     assert!(dst_off.is_empty(), "the fragment path never touches the receiver's off-heap table");
+}
+
+/// A host that already holds the refusal delivers **straight into a fragment**: the same payload, the
+/// same off-heap ownership, the same single fragment sized from the same exact price — with no second
+/// trial copy and no second pricing walk.
+///
+/// `send_fragmented_after_refusal` takes no receiver heap at all, which is the structural statement
+/// of that: nothing on this route can write a receiver-heap word or re-price the graph. The
+/// reservation comes from the refusal's own `requested` figure (here the literal-carrying payload
+/// again, whose copy price 3 is strictly below its `size_object` 7, so the capacity is an observable
+/// witness of which figure sized it).
+#[test]
+fn a_host_that_holds_the_refusal_delivers_straight_into_a_fragment() {
+    let mut src = Heap::new(32).expect("source heap");
+    let payload = literal_child_payload(&mut src);
+    let from = make_small(0);
+    let price = 3;
+    assert_eq!(size_of_copy(payload), 7, "`size_object` over-counts this payload");
+
+    let src_off = OffHeapTable::new();
+    let mut dst_off = OffHeapTable::new();
+
+    // 1. The ordinary send's refusal: the price the caller holds from here on.
+    let mut to_heap = Heap::new(1).expect("far too small for the payload");
+    let mut scratch_queue = Queue::new();
+    let refusal = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        send(from, payload, &mut to_heap, &mut scratch_queue, &mut ctx)
+            .expect_err("the payload cannot fit")
+    };
+    let requested = refused_price_words(&refusal) * core::mem::size_of::<Eterm>();
+    assert_eq!(refused_price_words(&refusal), price, "the refusal carries the copy price");
+
+    // 2. Straight into a fragment, from that figure alone.
+    let mut queue = Queue::new();
+    send_fragmented_after_refusal(from, payload, &mut queue, &src_off, 0, requested)
+        .expect("the fragmented delivery succeeds");
+    let message = queue.peek().expect("one queued message");
+    let fragments = message.fragments().expect("a fragmented message");
+    assert_eq!(fragments.len(), 1, "one fragment, never a chain");
+    assert_eq!(fragments.total_used_words(), price, "one copy, the priced words");
+    let only = fragments.iter().next().expect("one fragment");
+    assert_eq!(only.capacity(), price, "reserved from the refusal's own figure");
+    assert_eq!(only.used(), price, "the whole payload, in one copy");
+    assert_eq!(only.available(), 0, "the reservation is exact");
+    assert_eq!(only.roots(), &[message.payload()], "the payload root is in the fragment");
+    assert!(only.contains(message.payload()), "the payload points into the fragment");
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "the fragment-resident payload is structurally equal to the source"
+    );
+    assert!(dst_off.is_empty(), "the fragment owns the payload, not the receiver's table");
+
+    // 3. `fragment_capacity_words` stays a **floor** on this route too.
+    let mut queue = Queue::new();
+    send_fragmented_after_refusal(from, payload, &mut queue, &src_off, 16, requested)
+        .expect("the fragmented delivery succeeds");
+    let only = queue
+        .peek()
+        .and_then(|m| m.fragments())
+        .and_then(|f| f.iter().next())
+        .expect("one fragment");
+    assert_eq!(only.capacity(), 16, "the caller's floor raises the reservation");
+    assert_eq!(only.used(), price, "and the copy still writes only the payload");
+
+    // 4. A figure that is not a whole number of words falls back to `size_object` — the delivery is
+    //    still correct, just less tightly reserved (a bigger fragment than the copy needs).
+    let mut queue = Queue::new();
+    send_fragmented_after_refusal(from, payload, &mut queue, &src_off, 0, 7)
+        .expect("a stale figure cannot make the delivery fail");
+    let message = queue.peek().expect("one queued message");
+    let only = message
+        .fragments()
+        .and_then(|f| f.iter().next())
+        .expect("one fragment");
+    assert_eq!(only.capacity(), size_of_copy(payload), "the `size_object` fallback");
+    assert_eq!(only.used(), price, "the payload is still copied whole");
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "a stale figure still delivers a correct payload"
+    );
 }
 
 /// A payload that **fits** the receiver heap still lands there: the fragment path is reached only by

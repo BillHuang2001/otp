@@ -99,10 +99,13 @@
 //!     --test traversals -- --nocapture
 //! ```
 //!
-//! # Why one `#[test]`
+//! # Why the tests here serialise
 //!
 //! The counting allocator is process-wide, so libtest's parallel test threads would interleave
-//! their allocations with a counter window (the same reason `tests/counters.rs` is one test).
+//! their allocations with a counter window (the same reason `tests/counters.rs` is one test). The
+//! two tests in this file therefore both hold [`MEASUREMENT_LOCK`] for their whole body: the
+//! structural table and the warm-preflight window each need the process to themselves, and holding
+//! one lock is what keeps them from measuring each other.
 //!
 //! The `Census` walk, the counting allocator and the payload builder mirror `tests/counters.rs`
 //! deliberately: each test file of this crate is its own binary, so a helper here cannot be shared
@@ -111,14 +114,23 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use beam_alloc::Heap;
 use beam_gc::policy::DEFAULT_MIN_HEAP_WORDS;
 use beam_message::off_heap::OffHeapTable;
-use beam_message::{is_message_heap_exhaustion, send, send_fragmented, CopyContext, Queue};
+use beam_message::{
+    is_message_heap_exhaustion, send, send_fragmented, shrink_warm_scratch, CopyContext, Queue,
+};
 use beam_term::prelude::*;
 use beam_term::{compare, size_object};
+
+/// Serialises the tests in this file: every one of them measures **global** allocation counters, so
+/// two running concurrently would each land in the other's counter window. A poisoned lock (another
+/// test panicked while holding it) is still taken — the measurements are independent, so there is
+/// nothing for a poison to invalidate.
+static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // 1. The counting global allocator (allocation events, bytes, size histogram)
@@ -717,6 +729,9 @@ struct Row {
 /// why this is one test.
 #[test]
 fn report_structural_traversals_per_shape() {
+    let _guard = MEASUREMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     println!(
         "traversals: /proc/loadavg at start = {}",
         loadavg()
@@ -992,4 +1007,112 @@ fn row(name: &'static str, term: Eterm, source: &Census, phase: Phase) -> Row {
         counters: phase.counters,
         ns_min: phase.ns_min,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. The warm-preflight window (the scratch's own allocation behaviour)
+// ---------------------------------------------------------------------------
+
+/// **A warm preflight allocates nothing** — the claim the copier's destination-pricing gate rests on.
+///
+/// The gate prices the whole graph before writing a word, so it runs on *every* refused send and
+/// again on every retry; the walk's two buffers (the DFS `Vec` and the path `HashSet`) come from the
+/// per-thread `SizingScratch` `beam_message::preflight` keeps, which every walk **clears** rather than
+/// drops. This test pins that mechanism at the boundary the crate exposes:
+///
+/// * with the scratch **cold** (`beam_message::shrink_warm_scratch()`), a refused send's window holds
+///   the walk's own allocations on top of the copy's fix-up worklist;
+/// * **warm**, the same window holds the copy's worklist only — strictly fewer blocks;
+/// * shrinking again returns the window to the *identical* cold figure, so the difference is the
+///   retained buffers and nothing else (no growth step, no one-time initialisation).
+///
+/// It cannot move onto the structural table's rows: those discard a warm-up run (so they measure the
+/// warm shape) and must agree across `REPEATS`, which is exactly the state this test must vary.
+#[test]
+fn report_a_warm_preflight_allocates_nothing() {
+    let _guard = MEASUREMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    println!("warm preflight: /proc/loadavg at start = {}", loadavg());
+
+    let mut src = Src::new();
+    let payload = copy_bound_payload(&mut src);
+    let term = src
+        .heap
+        .tuple(&[make_small(FROM), payload])
+        .expect("the request fits");
+    let price = write_census(term);
+    assert_eq!(
+        price.words,
+        size_object(term),
+        "the payload is the heap twin: its written price IS its census"
+    );
+    // One word short of the price: the send is refused, which is the shape that runs the gate.
+    let capacity = price.words - 1;
+
+    // Cold, warm, cold again. The first `shrink_warm_scratch` also initialises this thread's scratch,
+    // so the one-time thread-local setup cannot be mistaken for the walk's own allocations.
+    shrink_warm_scratch();
+    let cold_a = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
+    let warm = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
+    shrink_warm_scratch();
+    let cold_b = one_phase(Mode::Refused, term, &src, capacity, 0, 0);
+
+    println!();
+    println!("== refused send: allocation window, cold vs warm pricing scratch ==");
+    for (label, phase) in [
+        ("cold (fresh scratch)", &cold_a),
+        ("warm (retained)", &warm),
+        ("cold again (shrunk)", &cold_b),
+    ] {
+        println!(
+            "  {:<22} {:>3} blocks {:>7} B ({:>5.1} B/block)  {}",
+            label,
+            phase.counters.blocks,
+            phase.counters.bytes,
+            phase.counters.bytes_per_block(),
+            histogram_summary(&phase.counters, 6)
+        );
+    }
+
+    // The three windows are the same refusal, so they write the same (nothing).
+    for (label, phase) in [
+        ("cold (fresh scratch)", &cold_a),
+        ("warm (retained)", &warm),
+        ("cold again (shrunk)", &cold_b),
+    ] {
+        assert_eq!(phase.written_words, 0, "{label}: a refusal writes no word");
+        assert_eq!(phase.residency, "refused", "{label}: the send was refused");
+    }
+
+    // Shrinking restores the cold state *exactly* — same blocks, bytes and histogram — so the
+    // cold-to-warm delta is the retained buffers and nothing else.
+    assert_eq!(
+        cold_a.counters, cold_b.counters,
+        "a shrunk scratch must price exactly like a never-warmed one"
+    );
+    assert!(
+        warm.counters.blocks < cold_a.counters.blocks,
+        "a warm preflight must allocate strictly less than a cold one \
+         (warm {} blocks, cold {} blocks)",
+        warm.counters.blocks,
+        cold_a.counters.blocks
+    );
+    assert_eq!(
+        warm.counters.hist.iter().sum::<usize>(),
+        warm.counters.blocks,
+        "the warm histogram must account for every allocation event"
+    );
+    println!(
+        "  => the pricing walk's own {} block(s) / {} B are gone once warm; the {} warm block(s) \
+         are the copy's fix-up worklist",
+        cold_a.counters.blocks - warm.counters.blocks,
+        cold_a.counters.bytes - warm.counters.bytes,
+        warm.counters.blocks
+    );
+    println!();
+    println!(
+        "warm preflight: /proc/loadavg at end = {}",
+        loadavg()
+    );
 }
