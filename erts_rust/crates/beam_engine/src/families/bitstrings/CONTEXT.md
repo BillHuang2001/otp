@@ -484,6 +484,34 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   is the recorder's own body on a **census-recording** run. The instrument has no call site in
   this node.- **`tools/differential` corpus coverage hole** (see Test Strategy).
 
+## The four `foreign` bench workloads — exact `Bs*` shape inventory
+`tools/bench`'s `foreign` cases execute `cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`,
+`emqx_base62:encode/1`, `emqx_base62:decode/1`; inputs and loop counts: `tools/bench/src/workloads/foreign.rs:145-283`
+(30 B / 30 B / 12 B / 15 B). Plain `erlc -S` reproduces what the loader sees (the bench compiles with a bare
+`erlc -o dir`, and C's `gen.bs_match` expansion is a **load-time** step, `generators.tab:1096`), so the `.S` command
+lists ARE the `Instr::BsMatch { commands }` operands.
+Dynamic `Bs*` executions per call (hand-derived, cross-checked against the oracle's 30/30/16/11-byte outputs and the
+recorded `instr_per_call` 438/660/244/531 — i.e. 16-23 % of every loop body):
+`to_lower` **93** (`StartMatch3` 31, `Match` 31, `CreateBin` 30, `InitWritable` 1); `capitalize_token` **155**
+(`StartMatch3` 31, `GetPosition` 31, `Match` 62, `CreateBin` 30 = 26 `integer` + 4 `string "-"`, `InitWritable` 1);
+`encode` **38** (`StartMatch4` 5, `GetPosition` 13, `Match` 14, `CreateBin` 4, `SetPosition` 1, `InitWritable` 1);
+`decode` **110** (`StartMatch4` 31, `Match` 31, `GetPosition` 15, `CreateBin` 30, `SkipBits2` 1, `GetInteger2` 1,
+`InitWritable` 1). Loops: 30 + 1 terminating entry (`to_lower`, `capitalize_token`), 4 + 1 (`encode`, 4×6 bits),
+14 + 1 tail byte (`decode`, 14×6 + 4 bits).
+The recurring shapes (only 9 of the 20 `claimed()` variants occur; no `BsMatchString`/`BsTestTail2`/`BsGetBinary2`/
+`BsGetFloat2`/`BsGet*Utf*`): whole-byte unsigned BE `[ensure_at_least 8 1, integer … 8 1]` (= prepared `FastForm`);
+**6-bit** `integer … 6 1` (encode ×3, decode's `[ensure_exactly 8, skip 2, integer … 6 1]`); `[ensure_at_least 12 8,
+integer 6, integer 6]` (verify: 12 bits **and** `(remaining-12) mod 8 == 0`); `[ensure_exactly 0]`; and the four
+`bs_create_bin` families: append(`all`)+one static segment (`integer` 8 or 6, or the `string "-"` 8 bits),
+append(`all`)+`binary all` (encode), and a **single fully static 8-bit `integer` segment** (decode's `<<DecodeChar>>`
+temp — the only create in these workloads whose output size is known from the instruction alone; every other create
+starts with a `{atom,all}` append, so its total is dynamic). All four use `alloc = 0`, `Flags = nil`, an
+`{integer,256}` `bs_init_writable` hint, and append into a register (`x(1)`/`x(2)`) that the source lives in —
+`capitalize_token`'s dash arm reads **and writes the same `x(2)`**. Position ops: `encode` saves three positions per
+iteration and restores one on the failing entry; `decode`/`capitalize_token` save one per byte.
+Because every `Bs*` is currently one `jit_bitstr` helper call (`jit/baseline/emit/family.rs:88-96`), these four loop
+bodies are the workload set an inline `Bs*` lowering would target.
+
 ## `append` / `private_append` — in place while the payload is writable
 
 `create::assemble` walks the segment list into a `BitWriter` whose destination is either
