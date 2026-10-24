@@ -1040,12 +1040,20 @@ impl RuntimeContext<'_> {
             pairs.push((self.atom("r_buffer")?, buffer));
             pairs.push((self.atom("r_ahead_size")?, make_small(modes.read_ahead)));
         }
-        // The shared atom table is cloned as an `Rc` handle first, so the borrow of the
+        // Intern the two name atoms **before** taking the table handle below.
+        //
+        // `CodeServer::atoms_handle` is an `Rc` clone and `CodeServer::atoms_mut` is
+        // `Rc::make_mut`, so an intern taken while any handle is alive deep-clones the whole
+        // shared table (one `Arc<str>` allocation + one hash-map insertion per atom) and the
+        // copy is dropped at once. Interning first keeps the code server the table's sole
+        // owner, so every intern here takes `make_mut`'s in-place path instead of cloning
+        // ~9 500 atoms per `open/2`.
+        let tag = self.atom("file_descriptor")?;
+        let module = self.atom("prim_file")?;
+        // The shared atom table is cloned as an `Rc` handle last, so the borrow of the
         // runtime ends before `make_map` needs the context itself.
         let atoms = self.runtime.code_server.atoms_handle();
         let data = terms::make_map(self, &pairs, &atoms)?;
-        let tag = self.atom("file_descriptor")?;
-        let module = self.atom("prim_file")?;
         terms::make_tuple(self, &[tag, module, data])
     }
 
