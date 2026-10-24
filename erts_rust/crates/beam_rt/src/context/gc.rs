@@ -369,11 +369,115 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
 ///
 /// [`Heap::hp`] is the bump pointer and [`Heap::hend`] is one past the block, so the block's
 /// base is `hp - used` term words back from `hp`.
+///
+/// This is the **one-shot** form, kept for the `valve_bounds` suite's filter-less oracle
+/// ([`word_region_exactly`]); every production classifier inside a walk takes the block from a
+/// [`Geometry`] instead, so the descent reads these three fields once per walk rather than once
+/// per classified word (see [`Geometry`]).
+#[cfg(test)]
 fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
     let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
     let base = (heap.hp() as usize).wrapping_sub(words);
     let end = heap.hend() as usize;
     ptr >= base && ptr < end
+}
+
+/// The **two per-walk geometries** every per-word classification is decided against, read
+/// **once** per walk and carried as a `Copy` value:
+///
+/// * the mutator block's `[base, hend)` — what [`in_heap_block`] derives from three
+///   [`Heap`] reads (`used`, `hp`, `hend`) on **every** classified word;
+/// * the collector's aggregate geometry ([`ScannedBounds`]), which the walk already hoisted.
+///
+/// Nothing in a walk mutates either: a descent only reads the process's term graph, so the bump
+/// frontier, the block end and the collector's spaces are constant for its whole duration. That is
+/// what makes the hoist verdict-neutral — the values are the same ones the per-word form would
+/// read, read once. A caller that cannot promise immutability (anything that allocates or
+/// collects between two classifications) uses the one-shot free functions instead
+/// ([`word_region`], [`root_is_unscanned`]), which build a `Geometry` per call.
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    /// One past the mutator block's first word (`hp - used`).
+    base: usize,
+    /// The mutator block's end (`hend`).
+    end: usize,
+    /// The collector's aggregate scanned geometry.
+    bounds: ScannedBounds,
+}
+
+impl Geometry {
+    /// Reads both geometries off `process` — the form every walk entry point uses.
+    #[inline]
+    pub(crate) fn of(process: &Process) -> Geometry {
+        Geometry::from_bounds(process, process.collector().scanned_bounds())
+    }
+
+    /// Reads the mutator block off `process` and pairs it with a [`ScannedBounds`] the caller
+    /// already read — for a caller that keeps the two reads apart.
+    #[inline]
+    pub(crate) fn from_bounds(process: &Process, bounds: ScannedBounds) -> Geometry {
+        let heap = process.heap();
+        let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
+        Geometry {
+            base: (heap.hp() as usize).wrapping_sub(words),
+            end: heap.hend() as usize,
+            bounds,
+        }
+    }
+
+    /// [`in_heap_block`] against the hoisted block: two compares on values already in registers.
+    #[inline]
+    fn block_contains(&self, ptr: usize) -> bool {
+        ptr >= self.base && ptr < self.end
+    }
+
+    /// [`word_region`] against the hoisted geometry — the walk's per-word classifier.
+    #[inline]
+    pub(crate) fn word_region(
+        &self,
+        process: &Process,
+        word: Eterm,
+        traced: bool,
+    ) -> Option<WordRegion> {
+        let ptr = foreign_shape_pointer(word)?;
+        if self.block_contains(ptr) || !outside_bounds(process.collector(), &self.bounds, ptr, traced)
+        {
+            Some(WordRegion::Scanned)
+        } else {
+            Some(WordRegion::Foreign)
+        }
+    }
+
+    /// [`word_is_scanned`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn word_is_scanned(&self, process: &Process, word: Eterm, traced: bool) -> bool {
+        matches!(self.word_region(process, word, traced), Some(WordRegion::Scanned))
+    }
+
+    /// [`forwards_scanned_word`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn forwards_scanned_word(
+        &self,
+        process: &Process,
+        word: Eterm,
+        traced: bool,
+    ) -> bool {
+        forwards_word_matching(word, |child| self.word_is_scanned(process, child, traced))
+    }
+
+    /// [`root_is_unscanned_with`] against the hoisted geometry.
+    #[inline]
+    pub(crate) fn root_is_unscanned(
+        &self,
+        process: &Process,
+        term: Eterm,
+        traced: bool,
+    ) -> bool {
+        match self.word_region(process, term, traced) {
+            Some(WordRegion::Foreign) => self.forwards_scanned_word(process, term, traced),
+            Some(WordRegion::Scanned) | None => false,
+        }
+    }
 }
 
 /// Which side of the collector's scan boundary a heap pointer lies on — the classification
@@ -467,43 +571,24 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     // whole valve at 0.40 % of samples, and hoisting an aggregate load cannot move that. What it
     // buys is that the per-word classification and the forwarding test can never read two
     // different geometries inside one decision.
-    let bounds = process.collector().scanned_bounds();
-    // The invocation census's flag ([`super::gc_valve_trace`]) is read here, once per
+    //
+    // The invocation census's flag ([`super::gc_valve_trace`]) is read here too, once per
     // classification, because this one-shot form has no walk to hoist it out of: its production
     // caller is the BIF-result gate, which reaches it at most once per `call_bif` and only after
     // the shape test has already admitted the result.
-    root_is_unscanned_with(
-        process,
-        &bounds,
-        term,
-        super::gc_valve_trace::enabled(),
-    )
-}
-
-/// [`root_is_unscanned`] against a [scanned-bounds](ScannedBounds) value the caller already read
-/// — the form the reachability walk uses, so one aggregate read serves a whole walk.
-///
-/// `traced` is the invocation census's flag, hoisted by the walk (read once per walk) and passed
-/// down so the per-word scanned test never probes the environment itself.
-#[inline]
-pub(crate) fn root_is_unscanned_with(
-    process: &Process,
-    bounds: &ScannedBounds,
-    term: Eterm,
-    traced: bool,
-) -> bool {
-    match word_region(process, bounds, term, traced) {
-        Some(WordRegion::Foreign) => forwards_scanned_word(process, bounds, term, traced),
-        Some(WordRegion::Scanned) | None => false,
-    }
+    Geometry::of(process).root_is_unscanned(process, term, super::gc_valve_trace::enabled())
 }
 
 /// Which region `word` points into: `None` for a word no relocation touches (an immediate, a
 /// literal-area pointer, or a word whose pointer names no address a term can live at —
 /// [`dereferenceable_pointer`]), otherwise the side of the scan boundary the container lives on.
 ///
-/// This is the **one** place the scanned test is applied, so the per-word root classification,
-/// the walk's descent and the foreign-container expansion can never disagree about a word.
+/// This is the **one-shot** form, kept for the suites that classify a handful of words with no
+/// walk around them (it reads the [`Geometry`] itself); every production classifier is
+/// [`Geometry::word_region`], which is the one place the scanned test is applied, so the per-word
+/// root classification, the walk's descent and the foreign-container expansion can never disagree
+/// about a word.
+#[cfg(test)]
 #[inline]
 pub(crate) fn word_region(
     process: &Process,
@@ -511,17 +596,7 @@ pub(crate) fn word_region(
     word: Eterm,
     traced: bool,
 ) -> Option<WordRegion> {
-    // The three **term-only** tests, shared with [`result_may_be_foreign`] and handing back the
-    // address they already had to compute, so the placement test below needs no second
-    // `dereferenceable_pointer` call and the two entry points cannot drift apart.
-    let ptr = foreign_shape_pointer(word)?;
-    if in_heap_block(process.heap(), ptr)
-        || !outside_bounds(process.collector(), bounds, ptr, traced)
-    {
-        Some(WordRegion::Scanned)
-    } else {
-        Some(WordRegion::Foreign)
-    }
+    Geometry::from_bounds(process, *bounds).word_region(process, word, traced)
 }
 
 /// Whether `word` could name a container in a region the collector does **not** scan — the three
@@ -534,8 +609,8 @@ pub(crate) fn word_region(
 /// (`RuntimeContext::open_gate_for_foreign_result`), which runs once per successful `call_bif`
 /// and whose results are overwhelmingly immediates (a small int from `erlang:rem/2`): hoisting
 /// the shape test ahead of the process-table probe keeps that common case off the table entirely,
-/// with a verdict identical to the probe's own, because [`word_region`] answers `None` (and
-/// [`root_is_unscanned_with`] therefore `false`) for exactly these words.
+/// with a verdict identical to the probe's own, because [`Geometry::word_region`] answers `None`
+/// (and [`Geometry::root_is_unscanned`] therefore `false`) for exactly these words.
 #[inline]
 pub(crate) fn result_may_be_foreign(word: Eterm) -> bool {
     foreign_shape_pointer(word).is_some()
@@ -545,9 +620,10 @@ pub(crate) fn result_may_be_foreign(word: Eterm) -> bool {
 /// relocation never has to know: an immediate, a literal-area pointer, or a pointer naming no
 /// address a term can live at ([`dereferenceable_pointer`]).
 ///
-/// The single definition of "this word could be a foreign container" — [`word_region`] continues
-/// from the address it returns and [`result_may_be_foreign`] stops at its presence — so the two
-/// can never disagree about which words are worth a region test.
+/// The single definition of "this word could be a foreign container" —
+/// [`Geometry::word_region`] continues from the address it returns and [`result_may_be_foreign`]
+/// stops at its presence — so the two can never disagree about which words are worth a region
+/// test.
 #[inline]
 fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
     if !is_pointer_bearing(word) || beam_term::literal::is_literal(word) {
@@ -559,6 +635,9 @@ fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
 /// a collection must follow and update, and therefore the word that makes the foreign container
 /// holding it a hazard.
+///
+/// The one-shot form; the walk uses [`Geometry::word_is_scanned`].
+#[cfg(test)]
 #[inline]
 pub(crate) fn word_is_scanned(
     process: &Process,
@@ -566,10 +645,7 @@ pub(crate) fn word_is_scanned(
     word: Eterm,
     traced: bool,
 ) -> bool {
-    matches!(
-        word_region(process, bounds, word, traced),
-        Some(WordRegion::Scanned)
-    )
+    Geometry::from_bounds(process, *bounds).word_is_scanned(process, word, traced)
 }
 
 /// Whether `ptr` lies outside **every** region `collector` scans — the two-tier scanned test
@@ -689,6 +765,7 @@ pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<Word
 /// values of those words are then classified by [`word_is_scanned`]: a leaf forwards nothing, a
 /// shape whose cells are all immediates forwards nothing, and each one is exactly as safe in a
 /// foreign region as an immediate is.
+#[cfg(test)]
 #[inline]
 pub(crate) fn forwards_scanned_word(
     process: &Process,
@@ -696,7 +773,7 @@ pub(crate) fn forwards_scanned_word(
     term: Eterm,
     traced: bool,
 ) -> bool {
-    forwards_word_matching(term, |word| word_is_scanned(process, bounds, word, traced))
+    Geometry::from_bounds(process, *bounds).forwards_scanned_word(process, term, traced)
 }
 
 /// [`forwards_scanned_word`] against an arbitrary child-word predicate — the enumeration without

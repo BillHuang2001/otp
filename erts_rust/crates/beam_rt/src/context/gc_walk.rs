@@ -206,9 +206,8 @@ use beam_term::list::ptr_val;
 use beam_term::prelude::is_list;
 use beam_term::Eterm;
 
-use super::gc::{forwards_scanned_word, word_region, WordRegion};
+use super::gc::{Geometry, WordRegion};
 use super::gc_valve_trace::{RootFamily, ValveDoor};
-use beam_gc::ScannedBounds;
 
 // ============================ END TEMPORARY POLICY SWITCH ============================
 
@@ -345,11 +344,11 @@ pub(crate) fn valve_verdict_at<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    // The collector's aggregate geometry is read **once per call** and handed down to every
-    // per-word classification: hygiene, not a claimed win (the whole valve is 0.40 % of samples
-    // in a `beam_gc` peer's profile), but it keeps one decision on one geometry.
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin(scratch, bounds, Criterion::Collection);
+    // The two per-walk geometries (the mutator block and the collector's aggregate) are read
+    // **once per call** and handed down to every per-word classification: hygiene, not a claimed
+    // win (the whole valve is 0.40 % of samples in a `beam_gc` peer's profile), but it keeps one
+    // decision on one geometry — and the block's three `Heap` reads then cost nothing per word.
+    let mut walk = Walk::begin(scratch, process, Criterion::Collection);
     for &word in machine_roots {
         walk.seed(process, word);
         if walk.hit {
@@ -486,8 +485,7 @@ pub(crate) fn reaches_an_unscanned_word_at<'a, I>(
 where
     I: IntoIterator<Item = &'a Eterm>,
 {
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin(scratch, bounds, Criterion::PayloadPrune);
+    let mut walk = Walk::begin(scratch, process, Criterion::PayloadPrune);
     for &word in roots {
         walk.seed(process, word);
         if walk.hit {
@@ -679,9 +677,9 @@ enum Criterion {
 /// all has been reached.
 struct Walk<'a> {
     scratch: &'a mut WalkScratch,
-    /// The collector's aggregate scanned geometry, read once by the caller
-    /// ([`valve_verdict`]) and reused for every word of this walk.
-    bounds: ScannedBounds,
+    /// The two per-walk geometries — the mutator block and the collector's aggregate — read
+    /// once by [`Walk::begin`] and reused for every word of this walk ([`Geometry`]).
+    geometry: Geometry,
     /// The hazard this walk answers for (see [`Criterion`]).
     criterion: Criterion,
     /// A hazard was reached: a foreign container forwarding a scanned word (a collection), or any
@@ -927,15 +925,19 @@ impl Visited {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk over `scratch` against `bounds` and `criterion`, resetting the reused state in
-    /// `O(1)`.
-    fn begin(scratch: &'a mut WalkScratch, bounds: ScannedBounds, criterion: Criterion) -> Walk<'a> {
+    /// Starts a walk over `scratch` against `process`'s geometries and `criterion`, resetting the
+    /// reused state in `O(1)`.
+    fn begin(
+        scratch: &'a mut WalkScratch,
+        process: &Process,
+        criterion: Criterion,
+    ) -> Walk<'a> {
         scratch.pending.clear();
         scratch.visited.begin();
         Walk {
             traced: scratch.visited.traced,
             scratch,
-            bounds,
+            geometry: Geometry::of(process),
             criterion,
             hit: false,
             foreign_reached: false,
@@ -955,10 +957,10 @@ impl<'a> Walk<'a> {
     /// leak-never-dangle rule.
     fn begin_resource(
         scratch: &'a mut WalkScratch,
-        bounds: ScannedBounds,
+        process: &Process,
         candidates: &'a [usize],
     ) -> Walk<'a> {
-        let mut walk = Walk::begin(scratch, bounds, Criterion::ResourcePrune);
+        let mut walk = Walk::begin(scratch, process, Criterion::ResourcePrune);
         walk.candidates = Some(candidates);
         walk.resource_ids.reserve(candidates.len());
         for &word in candidates {
@@ -1028,7 +1030,7 @@ impl<'a> Walk<'a> {
         // (a small integer, an atom, `NIL`, an internal pid/port id — no children, and neither
         // this walk nor the collector descends into it) and for a literal-area pointer (a frozen
         // code constant; see the module docs).
-        match word_region(process, &self.bounds, word, self.traced) {
+        match self.geometry.word_region(process, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) => {
                 // A container the collector scans: descend into it (once — the visited set is what
@@ -1076,7 +1078,7 @@ impl<'a> Walk<'a> {
             // The copy is a leaf of the same shape: nothing below it can be a candidate either.
             return;
         }
-        match word_region(process, &self.bounds, word, self.traced) {
+        match self.geometry.word_region(process, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) | Some(WordRegion::Foreign) => {
                 if self.scratch.visited.insert(ptr_val(word) as usize) {
@@ -1100,7 +1102,7 @@ impl<'a> Walk<'a> {
             self.hit = true;
             return;
         }
-        if forwards_scanned_word(process, &self.bounds, word, self.traced) {
+        if self.geometry.forwards_scanned_word(process, word, self.traced) {
             self.hit = true;
             return;
         }
@@ -1342,8 +1344,7 @@ where
         candidates.windows(2).all(|pair| pair[0] < pair[1]),
         "the resource candidates must be sorted and deduplicated"
     );
-    let bounds = process.collector().scanned_bounds();
-    let mut walk = Walk::begin_resource(scratch, bounds, candidates);
+    let mut walk = Walk::begin_resource(scratch, process, candidates);
     for &word in roots {
         walk.seed(process, word);
     }
