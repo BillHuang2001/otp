@@ -136,6 +136,7 @@
 
 mod segments;
 mod size;
+pub(super) mod prepared;
 
 use crate::interpreter::LabelMap;
 
@@ -145,6 +146,7 @@ use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::families::bitstrings::programs::{program_key, Program};
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
@@ -184,7 +186,6 @@ pub(super) fn exec(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let _ = (func, pc);
     match instr {
         // `bs_init_writable` (`i_bs_init_writable`, `emu/bs_instrs.tab:285`) is the
         // compiler's accumulator opener: C does `x(0) = erts_bs_init_writable(c_p,
@@ -210,9 +211,35 @@ pub(super) fn exec(
             dst,
             segments,
         } => {
-            let built = match assemble(machine, module, labels, *fail, segments, ctx)? {
+            // The segment descriptors are **pre-resolved once per instruction**
+            // (`prepared.rs`) and executed thereafter: the flat
+            // `[Type, Index, Unit, Flags, Value, Size]` walk — an atom-name lookup and a
+            // `&str` match per segment, four bounds-checked operand reads, the flags
+            // decode and the `$BS_SAFE_MUL` validation — is what a compiled
+            // binary-comprehension loop would otherwise pay on **every** element.
+            //
+            // The table is handed over **by value** for the duration of this
+            // instruction, so the segment writers keep the `&mut Machine` they need
+            // without any borrow of it being held across them. A shape `prepare`
+            // declines is filed as `Program::Generic` and runs the unchanged generic
+            // walk below, so the typed-error surface is identical.
+            let mut programs = machine.take_bitstr_programs();
+            let program = programs.get_or_prepare(program_key(func, pc), module, || {
+                match prepared::prepare(module, segments) {
+                    Some(program) => Program::Create(Box::new(program)),
+                    None => Program::Generic,
+                }
+            });
+            let assembled = match program {
+                Program::Create(program) => {
+                    prepared::assemble_prepared(machine, module, labels, *fail, program, ctx)
+                }
+                Program::Generic => assemble(machine, module, labels, *fail, segments, ctx),
+            };
+            machine.restore_bitstr_programs(programs);
+            let built = match assembled? {
                 Ok(built) => built,
-                // `assemble` already produced the failure `Step`.
+                // The assembly already produced the failure `Step`.
                 Err(step) => return Ok(Some(step)),
             };
             let value = match built {

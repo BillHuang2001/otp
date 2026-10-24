@@ -394,6 +394,13 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // images. As with `contexts`, `resume_outcome` deliberately does **not** reset, and
         // a suspended machine's modules are still alive.
         self.entry_verdicts.clear();
+        // The prepared bitstring programs belong to the run that prepared them too: the
+        // entry module's table is re-pointed at whatever module this run names, so a
+        // fresh run must not answer a `(func, pc)` from a previous run's image. A
+        // registered context's table is dropped with `contexts.clear()` above, and
+        // `resume_outcome` deliberately does **not** reset (a suspended frame resumes in
+        // the module it blocked in).
+        self.entry_programs.clear();
         // … and with it any **pending** invalidation the previous run armed: a fresh run
         // dispatches no BIF before its first local call, so a flag left over from an
         // earlier run would only cost that run a redundant verdict clear.
