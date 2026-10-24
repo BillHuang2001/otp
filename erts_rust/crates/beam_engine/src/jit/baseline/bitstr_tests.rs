@@ -57,7 +57,7 @@ use crate::machine::{Machine, RunOutcome};
 use crate::terms::{make_heap_binary, make_integer};
 
 /// Load one of the committed `erlc` fixtures (`tests/fixtures/*.beam`).
-fn fixture(name: &str) -> Module {
+pub(crate) fn fixture(name: &str) -> Module {
     let path = format!("{}/tests/fixtures/{name}.beam", env!("CARGO_MANIFEST_DIR"));
     load_file(&path).unwrap_or_else(|error| panic!("load {path}: {error:?}"))
 }
@@ -432,7 +432,7 @@ fn other_family_instructions() -> Vec<Instr> {
 /// The one argument a case row passes to the exported function under test, built **per side**
 /// (each run owns its own `MinimalContext` heap).
 #[derive(Clone, Copy)]
-enum Arg {
+pub(crate) enum Arg {
     Bytes(&'static [u8]),
     Int(i64),
 }
@@ -450,7 +450,7 @@ impl Arg {
 ///
 /// Each run builds its own heap (a returned boxed term points into it), so the comparison
 /// happens *inside* this call.
-fn with_both_tiers_arg<R>(
+pub(crate) fn with_both_tiers_arg<R>(
     module: &Module,
     name: Atom,
     arg: Arg,
@@ -483,7 +483,7 @@ fn with_both_tiers_arg<R>(
 }
 
 /// The `name/1` of `module`, or a panic naming the fixture.
-fn export(module: &Module, fixture_name: &str, name: &str) -> Atom {
+pub(crate) fn export(module: &Module, fixture_name: &str, name: &str) -> Atom {
     module
         .atom_table
         .lookup(name)
