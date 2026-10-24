@@ -65,11 +65,12 @@ use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
 /// The nursery the workload allocates in, in words — the policy's `min_heap_words` and
 /// `initial_young_words`, so it is also the **initial heap** the collector is born with (the C's
 /// spawn rule `sz = heap_need < p->min_heap_size ? p->min_heap_size : …`,
-/// `erl_process.c:12586-12592`), *and* the live set's own
-/// [`young_target_words`](HeapPolicy::young_target_words), so no collection ever re-sizes it.
-/// A curated growth-table size (the `+hms`-style floor must be a fixed point,
-/// `erl_process.c:12575`). See [`RESERVE_WORDS`] for the fixed-point arithmetic.
-const NURSERY_WORDS: usize = 2586;
+/// `erl_process.c:12586-12592`), *and* the live set's own need-aware
+/// [`young_target_words_with_need`](HeapPolicy::young_target_words_with_need) at the door's
+/// [`GROW_REQUEST`], so no collection ever re-sizes it. A curated growth-table size (the
+/// `+hms`-style floor must be a fixed point, `erl_process.c:12575`). See [`RESERVE_WORDS`] for
+/// the fixed-point arithmetic.
+const NURSERY_WORDS: usize = 4185;
 /// The mature generation the workload is **born** with, in words — the policy's
 /// `initial_mature_words`. A whole number of mark-region blocks (32 × 256), so the mark-region
 /// space's block rounding lands on exactly this capacity too and both strategies *start* from
@@ -89,8 +90,9 @@ const TUPLE_ARITY: usize = 15;
 const TUPLE_WORDS: usize = TUPLE_ARITY + 1;
 const _: () = assert!(TUPLE_WORDS == LINE_WORDS);
 /// How many tuples the mutator writes per round — more than the [`NURSERY_WORDS`]-sized nursery
-/// holds (`NURSERY_WORDS / TUPLE_WORDS` = 161), so collections fire mid-burst.
-const BURST: usize = 200;
+/// holds (`NURSERY_WORDS / TUPLE_WORDS` = 261, so 280 × 16 = 4 480 words), so collections fire
+/// mid-burst.
+const BURST: usize = 280;
 /// The word count `ensure_capacity` is asked for on the growth rounds.
 const GROW_REQUEST: usize = 48;
 /// The policy's collection reserve, in words — the C's `S_RESERVED` role in
@@ -104,28 +106,33 @@ const GROW_REQUEST: usize = 48;
 /// spelling out because both halves matter:
 ///
 /// * **The nursery.** The workload's live set is the [`LIVE_TUPLES`] working set — 16 one-line
-///   tuples = 256 words — so its whole-heap target is `next_words(2 × 256 + 2048) =
-///   next_words(2560) = 2586` = [`NURSERY_WORDS`], and its young-live-set target is
-///   `next_words(256 + 2048) = next_words(2304) = 2586` as well. The nursery is born at that size
-///   and every sizing rule re-derives it: a fullsweep installs `young_target_words(live)` and
-///   `should_grow(2586, 2586)` asks for it (it fires, but for the same number), a minor installs
-///   `young_minor_target_words(promoted)` — the same number, so it keeps the capacity — and the
-///   explicit growth seam is a no-op because a collapsed nursery always has room for
-///   [`GROW_REQUEST`]. And because `2 × live + 2048 <= 2586` holds for every live set up to 269
-///   words (and `live + 2048 <= 2586` for every one up to 538), that stays true even at the
-///   transient live sets the working-set replacement produces; `min_heap_words` floors both
-///   targets at [`NURSERY_WORDS`] regardless.
+///   tuples = 256 words — and the heap-admission door
+///   ([`AnyCollector::ensure_capacity`]) collects **with its [`GROW_REQUEST`] of 48 words in
+///   hand**, so the rule that has to be a fixed point is the *need-aware* one: the fullsweep
+///   target is `next_words(2 × (256 + 48) + 2048) = next_words(2656) = 4185` =
+///   [`NURSERY_WORDS`], while the minor's own need-aware target is `next_words(256 + 48 + 2048) =
+///   next_words(2352) = 2586`, below it. The nursery is born at that size and every sizing rule
+///   re-derives it: a fullsweep installs `young_target_words_with_need(live, need)` and
+///   `should_grow(4185, 4185)` asks for the same number, a minor installs
+///   `young_minor_target_words_with_need(promoted, need)` — a smaller figure, inside whose keep
+///   band `[2586, max(3 000, 8 × 2586)]` the 4185-word capacity sits, so the minor keeps it — and
+///   the explicit growth seam is a no-op because a collapsed nursery always has room for
+///   [`GROW_REQUEST`]. And because `2 × (live + 48) + 2048 <= 4185` holds for every live set up
+///   to 1 044 words (and `live + 48 + 2048 <= 4185` for every one up to 2 089), that stays true
+///   even at the transient live sets the working-set replacement produces; `min_heap_words` floors
+///   both targets at [`NURSERY_WORDS`] regardless.
 /// * **The mature generation.** A fullsweep installs the live-set target
-///   [`HeapPolicy::mature_target_words`] — `next_words(2 × (live + young occupancy + reserve))`
-///   — so the capacity this workload runs at is *derived from its live set* rather than held at
+///   [`HeapPolicy::mature_target_words`] — `next_words(2 × (live + young occupancy + reserve))` —
+///   so the capacity this workload runs at is *derived from its live set* rather than held at
 ///   the initial [`MATURE_WORDS`] (the figure is [`COPYING_MATURE_WORDS`]). The cadence fires a
 ///   fullsweep at a **full** nursery (every collection is admitted at the heap-admission point,
 ///   and the nursery collapses back onto [`NURSERY_WORDS`] after each one), so the target is
 ///   re-derived as the same figure and the rule's `capacity < target` branch never fires: the
-///   capacity is a fixed point. The two fullsweeps `ensure_capacity` runs on an empty nursery
-///   derive the smaller growth-table entry for `256 + 0 + 2048` words instead, and the
-///   target-keyed rule keeps the larger capacity, because it only shrinks a space that exceeds
-///   four times its target (`HeapPolicy::should_shrink`).
+///   capacity is a fixed point. The fullsweeps `ensure_capacity` runs can see a partly-filled
+///   nursery instead and derive a smaller growth-table entry (an empty one gives
+///   `next_words(2 × (256 + 0 + 2048)) = next_words(4608) = 6772`), and the target-keyed rule
+///   keeps the larger capacity, because it only shrinks a space that exceeds four times its
+///   target (`HeapPolicy::should_shrink`: `4 × 6 772 = 27 088 > 17 731`).
 ///
 /// The mark-region space rounds its capacity up to whole [`BLOCK_WORDS`]-word blocks and the
 /// copying space does not, so once a fullsweep has sized the mature generation the strategies
@@ -142,7 +149,7 @@ const LIVE_WORDS: usize = LIVE_TUPLES * TUPLE_WORDS;
 /// The nursery's fill, in words, when a collection fires: the burst writes the working set and
 /// then whole [`TUPLE_WORDS`]-word tuples until [`AnyCollector::should_collect`] answers `true`,
 /// i.e. until fewer than one tuple's words are left (`NURSERY_WORDS - fill < TUPLE_WORDS`).
-/// `256 + 145 × 16 = 2576`, leaving 10 of the 2586 words free.
+/// `256 + 245 × 16 = 4176`, leaving 9 of the 4185 words free.
 const YOUNG_OCCUPANCY_WORDS: usize =
     LIVE_WORDS + (NURSERY_WORDS - LIVE_WORDS) / TUPLE_WORDS * TUPLE_WORDS;
 
@@ -151,42 +158,43 @@ const YOUNG_OCCUPANCY_WORDS: usize =
 /// fullsweep installs and every later one re-derives:
 ///
 /// ```text
-/// need_after = live + young occupancy + reserve = 256 + 2576 + 2048 = 4880
-/// target     = next_words(MATURE_TARGET_LIVE_MULTIPLE × 4880, 0) = next_words(9760) = 10958
+/// need_after = live + young occupancy + reserve = 256 + 4176 + 2048 = 6480
+/// target     = next_words(MATURE_TARGET_LIVE_MULTIPLE × 6480, 0) = next_words(12960) = 17731
 /// ```
 ///
 /// i.e. `workload_policy().mature_target_words(LIVE_WORDS, YOUNG_OCCUPANCY_WORDS)`; the copying
 /// space installs that figure verbatim, and the test re-derives it rather than trusting the
 /// literal.
-const COPYING_MATURE_WORDS: usize = 10958;
+const COPYING_MATURE_WORDS: usize = 17731;
 
 /// The mark-region space's mature capacity: the same target rounded **up to whole blocks**
 /// ([`ImmixSpace::with_allocator`](beam_gc::ImmixSpace::with_allocator) sizes the space as
-/// `block_count(target) × BLOCK_WORDS`), so `ceil(10958 / 256) = 43` blocks = **11008 words**.
+/// `block_count(target) × BLOCK_WORDS`), so `ceil(17731 / 256) = 70` blocks = **17920 words**.
 const IMMIX_MATURE_WORDS: usize = COPYING_MATURE_WORDS.div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
-const _: () = assert!(IMMIX_MATURE_WORDS == 11008);
+const _: () = assert!(IMMIX_MATURE_WORDS == 17920);
 
 /// The size of the process's **working set**: how many one-line [`TUPLE_WORDS`]-word tuples it
 /// keeps reachable across a round. Constant by design — the nursery's capacity is a fixed point
-/// of the live set (`HeapPolicy::young_target_words`), so a working set that grew every round
-/// would (correctly) step the nursery up a growth-table entry per fullsweep, and any
-/// line-rounding gap between the two strategies would then amplify into different cadences.
-/// 16 × 16 = **256 words**, comfortably inside the 269-word ceiling that keeps the nursery at
-/// [`NURSERY_WORDS`] (see [`RESERVE_WORDS`]).
+/// of the live set (`HeapPolicy::young_target_words_with_need`, at the door's [`GROW_REQUEST`]),
+/// so a working set that grew every round would (correctly) step the nursery up a growth-table
+/// entry per fullsweep, and any line-rounding gap between the two strategies would then amplify
+/// into different cadences. 16 × 16 = **256 words**, comfortably inside the 1 044-word ceiling
+/// that keeps the nursery at [`NURSERY_WORDS`] (see [`RESERVE_WORDS`]).
 const LIVE_TUPLES: usize = 16;
 
-/// A **fixed-geometry** policy: the nursery is born at, and held at, a fixed point of the sizing
-/// rules, and the mature generation is sized by the live set, so both strategies see the same
-/// cadence.
+/// A **fixed-geometry** policy: the nursery is born at, and held at, a fixed point of the
+/// need-aware sizing rules, and the mature generation is sized by the live set, so both
+/// strategies see the same cadence.
 ///
 /// The nursery is the policy's **initial heap** — [`HeapPolicy::initial_heap_words`], i.e. the
 /// C's `sz = heap_need < p->min_heap_size ? p->min_heap_size : …` at spawn
 /// (`erl_process.c:12586-12592`) — and [`NURSERY_WORDS`] is simultaneously its `min_heap_words`
-/// floor, its initial size *and* the live set's target, so it starts and stays there. The mature
-/// generation cannot be floored the same way (`min_heap_size` floors the *young* heap too,
-/// `next_words` raises every size to it, `erl_gc.c:347-352`), so it is *sized* by the live set
-/// instead: the first fullsweep installs [`COPYING_MATURE_WORDS`] and every later one keeps it.
-/// See [`RESERVE_WORDS`] for the arithmetic.
+/// floor, its initial size *and* the live set's need-aware target at the door's request, so it
+/// starts and stays there. The mature generation cannot be floored the same way
+/// (`min_heap_size` floors the *young* heap too, `next_words` raises every size to it,
+/// `erl_gc.c:347-352`), so it is *sized* by the live set instead: the first fullsweep installs
+/// [`COPYING_MATURE_WORDS`] and every later one keeps it. See [`RESERVE_WORDS`] for the
+/// arithmetic.
 fn workload_policy() -> HeapPolicy {
     HeapPolicy {
         min_heap_words: NURSERY_WORDS,
@@ -505,9 +513,9 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
 
     // Both fullsweeps reproduced the rule's target *is the capacity the run holds*: re-derive it
     // from the workload's live set and nursery occupancy instead of trusting the pin
-    // (`next_words(2 × (256 + 2576 + 2048))` = `next_words(9760)` = 10958), then take each
+    // (`next_words(2 × (256 + 4176 + 2048))` = `next_words(12960)` = 17731), then take each
     // strategy's own rounding of it — the copying space installs the target verbatim, the
-    // mark-region space rounds it up to whole blocks (11008).
+    // mark-region space rounds it up to whole blocks (17920).
     let rule_target = workload_policy().mature_target_words(LIVE_WORDS, YOUNG_OCCUPANCY_WORDS);
     assert_eq!(
         rule_target, COPYING_MATURE_WORDS,
@@ -515,7 +523,7 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     );
     assert_eq!(
         MATURE_TARGET_LIVE_MULTIPLE * (LIVE_WORDS + YOUNG_OCCUPANCY_WORDS + RESERVE_WORDS),
-        9760,
+        12960,
         "the un-multiplied room the target is `next_words` of"
     );
 
