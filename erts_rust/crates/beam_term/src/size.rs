@@ -97,6 +97,27 @@
 //! Both entry points share **one** walk (`sizing_walk`), whose per-object interior
 //! knowledge is the canonical [`crate::layout`] API.
 //!
+//! # Scratch buffers (the allocation-free form)
+//!
+//! Every walk needs three buffers: the explicit DFS stack, the set of objects on the
+//! current DFS path, and — only on the `OverLimit` arm of the bounded form — a `done` set
+//! for the acyclicity re-pass. The plain entry points
+//! ([`size_object`], [`size_object_with`], [`size_object_bounded`],
+//! [`size_object_bounded_with`]) build those buffers per call, so every one of them
+//! **allocates**. A caller that sizes graph after graph — a copier pricing every message
+//! it moves — should keep a [`SizingScratch`] instead and call
+//! [`size_object_with_scratch`] / [`size_object_bounded_with_scratch`]: the walk clears
+//! its buffers rather than dropping them, so after one warm-up call of comparable size a
+//! sizing call performs **no allocation at all**.
+//!
+//! A scratch carries no state between calls (each walk clears it first) and cannot change
+//! a result: the scratch-backed and scratch-free entry points are the same walk, and are
+//! pinned equal on the same corpus by `tests/size_scratch.rs`.
+//!
+//! The path set is a `usize` membership set and nothing else, so its hasher is a cheap
+//! multiplicative address mix rather than SipHash-1-3 (`src/size/address_hash.rs`): a
+//! collision costs a probe, never a wrong answer.
+//!
 //! # Internal layouts
 //!
 //! Like the C, every navigable interior is walked; the shapes and their word counts /
@@ -122,6 +143,13 @@ use crate::layout::{for_each_sizing_child_slot, object_words};
 use crate::list::{is_list, list_val};
 use crate::literal::is_literal;
 use crate::tag::{is_term_word, ARITYVAL_SUBTAG, TAG_HEADER_MASK};
+
+mod address_hash;
+mod scratch;
+
+use address_hash::AddressHashBuilder;
+
+pub use scratch::SizingScratch;
 
 /// Whether a word can contribute heap words, so the walk must enter it: a term word
 /// that is not an immediate.
@@ -322,8 +350,10 @@ unsafe fn classify(t: Eterm, policy: &dyn SizingPolicy) -> Option<Frame> {
         count,
     })
 }
-/// Pushes every navigable sizing child of `frame` onto a DFS `stack`.
-fn push_frame_children(frame: &Frame, stack: &mut Vec<Step>) {
+/// Pushes every navigable sizing child of `frame` onto a DFS `stack`, and reports how
+/// many were pushed.
+fn push_frame_children(frame: &Frame, stack: &mut Vec<Step>) -> usize {
+    let before = stack.len();
     match frame {
         Frame::Cons { head, tail, .. } => {
             if needs_visit(*tail) {
@@ -344,6 +374,35 @@ fn push_frame_children(frame: &Frame, stack: &mut Vec<Step>) {
             }
         }
     }
+    stack.len() - before
+}
+
+/// Opens `frame` on the DFS: pushes its object's [`Step::Exit`] marker and, **above** it,
+/// every child the walk will descend into. Returns how many children that was.
+///
+/// A return of `0` — every child slot holds an immediate, a non-term or nothing at all —
+/// pops the just-pushed `Exit` again and leaves the stack exactly as it was. Such an
+/// object is deliberately **not** recorded on the DFS path by the caller:
+///
+/// * it cannot be part of a cycle, because a cycle is a path of navigable edges returning
+///   to its start, so every object on one has at least one visitable child (the next
+///   object on the cycle);
+/// * its `Exit` marker would be the very next step popped, so its path membership would
+///   never be consulted in between.
+///
+/// So skipping it changes no verdict and no count — it only stops the walk from paying a
+/// hash-table probe, a slot and a set entry for a leaf such as a tuple of immediates,
+/// which is the single most common compound object in a message payload.
+fn descend(frame: &Frame, stack: &mut Vec<Step>) -> usize {
+    if !frame.has_children() {
+        return 0;
+    }
+    stack.push(Step::Exit(frame.addr()));
+    let pushed = push_frame_children(frame, stack);
+    if pushed == 0 {
+        stack.pop();
+    }
+    pushed
 }
 
 /// Where [`sizing_walk`] stopped, and the words it had counted by then.
@@ -378,53 +437,99 @@ enum Sizing {
 /// graph `OverLimit` means the true flat size really does exceed `limit`.
 ///
 /// The walk is iterative — a deep list cannot overflow the native stack — and uses
-/// `O(visited compound objects)` stack/`on_path` memory.
+/// `O(visited compound objects)` stack/`on_path` memory, held in the caller's
+/// [`SizingScratch`] (cleared, never re-`malloc`ed, on every call).
 ///
 /// `policy` prices every object and decides what is shared (see the
 /// [module docs](self#sizing-policies)); the sharing check is at the single entry point
 /// ([`Step::Enter`]), so no other site filters.
-fn sizing_walk(root: Eterm, limit: usize, policy: &dyn SizingPolicy) -> Sizing {
-    let mut total = 0usize;
-    let mut on_path: HashSet<usize> = HashSet::new();
-    let mut stack: Vec<Step> = vec![Step::Enter(root)];
+fn sizing_walk(
+    root: Eterm,
+    limit: usize,
+    policy: &dyn SizingPolicy,
+    scratch: &mut SizingScratch,
+) -> Sizing {
+    // `take` the buffers out of the scratch and put them back after the walk (see
+    // [`with_taken_buffers`] for why the walk wants them as frame locals).
+    with_taken_buffers(scratch, |stack, on_path, _done| {
+        // Reuse, don't reallocate: `clear` keeps the buffers' capacity, and it is also what
+        // makes the scratch stateless — a previous walk may have left entries behind (every
+        // early return does).
+        stack.clear();
+        on_path.clear();
+        let mut total = 0usize;
+        stack.push(Step::Enter(root));
 
-    while let Some(step) = stack.pop() {
-        match step {
-            Step::Exit(addr) => {
-                on_path.remove(&addr);
-            }
-            Step::Enter(t) => {
-                if !needs_visit(t) {
-                    // An immediate / non-term: 0 words.
-                    continue;
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Exit(addr) => {
+                    on_path.remove(&addr);
                 }
-                if policy.is_shared(t) {
-                    // The consumer reuses this subterm by identity: 0 words, no descent.
-                    continue;
-                }
-                // SAFETY: `t` is a live word that is not an immediate.
-                let Some(frame) = (unsafe { classify(t, policy) }) else {
-                    // The global empty-tuple literal, or a policy pricing it at nothing.
-                    continue;
-                };
-                let has_children = frame.has_children();
-                let addr = frame.addr();
-                if has_children && !on_path.insert(addr) {
-                    // A back-edge: the object is one of its own ancestors.
-                    return Sizing::Cyclic(total);
-                }
-                total = total.saturating_add(frame.word_count());
-                if total > limit {
-                    return Sizing::OverLimit(total);
-                }
-                if has_children {
-                    stack.push(Step::Exit(addr));
-                    push_frame_children(&frame, &mut stack);
+                Step::Enter(t) => {
+                    if !needs_visit(t) {
+                        // An immediate / non-term: 0 words.
+                        continue;
+                    }
+                    if policy.is_shared(t) {
+                        // The consumer reuses this subterm by identity: 0 words, no descent.
+                        continue;
+                    }
+                    // SAFETY: `t` is a live word that is not an immediate.
+                    let Some(frame) = (unsafe { classify(t, policy) }) else {
+                        // The global empty-tuple literal, or a policy pricing it at nothing.
+                        continue;
+                    };
+                    // Open the frame first (see [`descend`]): that both fixes the DFS order
+                    // — the `Exit` marker has to sit *under* the children — and says whether
+                    // the object has anything to descend into, which is exactly the
+                    // condition for it to belong on the DFS path at all.
+                    let pushed = descend(&frame, stack);
+                    if pushed > 0 && !on_path.insert(frame.addr()) {
+                        // A back-edge: the object is one of its own ancestors.
+                        return Sizing::Cyclic(total);
+                    }
+                    total = total.saturating_add(frame.word_count());
+                    if total > limit {
+                        return Sizing::OverLimit(total);
+                    }
                 }
             }
         }
-    }
-    Sizing::Complete(total)
+        Sizing::Complete(total)
+    })
+}
+
+/// Runs `body` with the scratch's three buffers moved **into the frame** as locals, and
+/// moves them back afterwards (whatever `body` returns, including through an early
+/// `return` inside it).
+///
+/// This is not cosmetic. Handing the walk `&mut scratch.stack` / `&mut scratch.on_path`
+/// makes every `Vec`/`HashSet` field access go through a pointer that LLVM cannot prove
+/// disjoint from the heap words the walk itself reads (a term's payload is raw
+/// `*mut Eterm`), so the hash table's hot state — table pointer, bucket mask, growth-left,
+/// item count — has to be reloaded and stored around **every** insert/remove instead of
+/// living in registers. Taking the buffers out costs three word moves per call and buys
+/// back exactly the code the per-call `HashSet::new()` form got, so the reusable-scratch
+/// path is never slower than the allocating one (measured: `examples/size_walk_bench.rs`).
+///
+/// `mem::take` leaves `Default` values behind (no allocation, no deallocation), and the
+/// buffers keep their capacity across the move, so the call stays allocation-free.
+fn with_taken_buffers<R>(
+    scratch: &mut SizingScratch,
+    body: impl FnOnce(
+        &mut Vec<Step>,
+        &mut HashSet<usize, AddressHashBuilder>,
+        &mut HashSet<usize, AddressHashBuilder>,
+    ) -> R,
+) -> R {
+    let mut stack = core::mem::take(&mut scratch.stack);
+    let mut on_path = core::mem::take(&mut scratch.on_path);
+    let mut done = core::mem::take(&mut scratch.done);
+    let out = body(&mut stack, &mut on_path, &mut done);
+    scratch.stack = stack;
+    scratch.on_path = on_path;
+    scratch.done = done;
+    out
 }
 
 /// Whether the term graph rooted at `root` is **acyclic**.
@@ -444,48 +549,53 @@ fn sizing_walk(root: Eterm, limit: usize, policy: &dyn SizingPolicy) -> Sizing {
 ///
 /// It takes the same `policy` as the sizing walk, so a graph a policy declares shared is
 /// not descended into here either (a shared subterm can never close a cycle the consumer
-/// would traverse).
-fn is_acyclic(root: Eterm, policy: &dyn SizingPolicy) -> bool {
-    let mut on_path: HashSet<usize> = HashSet::new();
-    let mut done: HashSet<usize> = HashSet::new();
-    let mut stack: Vec<Step> = vec![Step::Enter(root)];
+/// would traverse). It reuses the same [`SizingScratch`] — one more reason to hold one
+/// across the whole bounded call rather than paying three sets and a second stack.
+fn is_acyclic(root: Eterm, policy: &dyn SizingPolicy, scratch: &mut SizingScratch) -> bool {
+    // Same frame-local buffers as [`sizing_walk`] (see [`with_taken_buffers`]).
+    with_taken_buffers(scratch, |stack, on_path, done| {
+        stack.clear();
+        on_path.clear();
+        done.clear();
+        stack.push(Step::Enter(root));
 
-    while let Some(step) = stack.pop() {
-        match step {
-            Step::Exit(addr) => {
-                on_path.remove(&addr);
-                done.insert(addr);
-            }
-            Step::Enter(t) => {
-                if !needs_visit(t) {
-                    continue;
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Exit(addr) => {
+                    on_path.remove(&addr);
+                    done.insert(addr);
                 }
-                if policy.is_shared(t) {
-                    // Not descended into, so it cannot be on this walk's path.
-                    continue;
-                }
-                // SAFETY: `t` is a live word that is not an immediate.
-                let Some(frame) = (unsafe { classify(t, policy) }) else {
-                    continue;
-                };
-                if frame.has_children() {
-                    let addr = frame.addr();
-                    if on_path.contains(&addr) {
-                        // A back-edge: the object is one of its own ancestors.
-                        return false;
-                    }
-                    if done.contains(&addr) {
-                        // Fully explored already, with no cycle below it: skip.
+                Step::Enter(t) => {
+                    if !needs_visit(t) {
                         continue;
                     }
-                    on_path.insert(addr);
-                    stack.push(Step::Exit(addr));
+                    if policy.is_shared(t) {
+                        // Not descended into, so it cannot be on this walk's path.
+                        continue;
+                    }
+                    // SAFETY: `t` is a live word that is not an immediate.
+                    let Some(frame) = (unsafe { classify(t, policy) }) else {
+                        continue;
+                    };
+                    if frame.has_children() {
+                        let addr = frame.addr();
+                        if on_path.contains(&addr) {
+                            // A back-edge: the object is one of its own ancestors.
+                            return false;
+                        }
+                        if done.contains(&addr) {
+                            // Fully explored already, with no cycle below it: skip.
+                            continue;
+                        }
+                        on_path.insert(addr);
+                        stack.push(Step::Exit(addr));
+                    }
+                    push_frame_children(&frame, stack);
                 }
-                push_frame_children(&frame, &mut stack);
             }
         }
-    }
-    true
+        true
+    })
 }
 
 /// The flat number of heap words the term graph `a` occupies.
@@ -519,10 +629,37 @@ pub fn size_object(a: Eterm) -> usize {
 /// [`size_object`] documents holds unchanged: non-terms are `0` words, sharing between
 /// sibling positions is counted once per occurrence, and a cyclic graph yields the
 /// defined partial count.
+///
+/// This form allocates its walk buffers per call; a caller that sizes repeatedly should
+/// keep a [`SizingScratch`] and use [`size_object_with_scratch`] instead (the two are the
+/// same walk and always agree).
 pub fn size_object_with(a: Eterm, policy: &dyn SizingPolicy) -> usize {
+    size_object_with_scratch(a, policy, &mut SizingScratch::new())
+}
+
+/// [`size_object_with`] over a **caller-owned** [`SizingScratch`]: the same walk, the
+/// same count, with the walk's buffers (the DFS stack and the path set) borrowed from
+/// `scratch` and cleared rather than dropped.
+///
+/// The result is identical to [`size_object_with`] for every `(a, policy)` — the scratch
+/// changes *where the working memory comes from*, never what is counted — while a warm
+/// scratch that is already at least as large as this graph needs makes the call perform
+/// **no allocation at all**. Keep one scratch next to whatever loops over terms (a copier
+/// pricing every message it moves) and hand the same `&mut` to every call: it carries no
+/// state between calls, so a scratch reused on a cyclic graph and then on an acyclic one
+/// answers each one correctly.
+///
+/// Growth, when a graph is bigger than anything seen before, is the amortized part of the
+/// same story: the buffers grow once and the new capacity is retained (see
+/// [`SizingScratch::shrink_to_fit`] to give it back).
+pub fn size_object_with_scratch(
+    a: Eterm,
+    policy: &dyn SizingPolicy,
+    scratch: &mut SizingScratch,
+) -> usize {
     // The unbounded walk: only `Complete` and `Cyclic` can come back (the saturated
     // total of a real graph is `<= usize::MAX == limit`).
-    match sizing_walk(a, usize::MAX, policy) {
+    match sizing_walk(a, usize::MAX, policy, scratch) {
         Sizing::Complete(words) | Sizing::OverLimit(words) | Sizing::Cyclic(words) => words,
     }
 }
@@ -549,7 +686,9 @@ pub fn size_object_with(a: Eterm, policy: &dyn SizingPolicy) -> usize {
 /// *occurrences*, not distinct objects: like `size_object_x`, a subterm a valid graph
 /// shares between two sibling positions is sized once per occurrence.
 ///
-/// This is [`size_object_bounded_with`] under [`DefaultSizingPolicy`].
+/// This is [`size_object_bounded_with`] under [`DefaultSizingPolicy`], and it is
+/// [`size_object_bounded_with_scratch`] with a freshly built scratch — so it allocates
+/// the walk buffers per call.
 pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError> {
     size_object_bounded_with(a, limit, &DefaultSizingPolicy)
 }
@@ -562,17 +701,41 @@ pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError> {
 /// wins over `OverLimit` (the acyclicity re-pass takes the same policy), and a subterm
 /// the policy declares shared is neither priced nor descended into — so it can never
 /// contribute a cycle of its own.
+///
+/// This form allocates its walk buffers per call; see
+/// [`size_object_bounded_with_scratch`] for the reusable-scratch half of the same walk.
 pub fn size_object_bounded_with(
     a: Eterm,
     limit: usize,
     policy: &dyn SizingPolicy,
 ) -> Result<usize, TermError> {
-    match sizing_walk(a, limit, policy) {
+    size_object_bounded_with_scratch(a, limit, policy, &mut SizingScratch::new())
+}
+
+/// [`size_object_bounded_with`] over a **caller-owned** [`SizingScratch`]: the same
+/// verdict, the same `Ok`/`Err` split (`Cyclic` outranks `TooLarge`), the same count —
+/// with the walk's buffers borrowed from `scratch` and cleared rather than dropped.
+///
+/// This is the entry point a copier should gate on. A fitting graph is priced in **one**
+/// traversal, and even the `OverLimit` arm — which needs the acyclicity pass to tell
+/// `TermGraphTooLarge` from `TermGraphCyclic` — runs it over the *same* scratch, so the
+/// three traversals the plain form can cost are never three sets of allocations.
+///
+/// A warm scratch at least as large as this graph needs makes the call allocation-free;
+/// the scratch holds no state between calls, so reusing one across graphs (cyclic or not)
+/// cannot change any answer.
+pub fn size_object_bounded_with_scratch(
+    a: Eterm,
+    limit: usize,
+    policy: &dyn SizingPolicy,
+    scratch: &mut SizingScratch,
+) -> Result<usize, TermError> {
+    match sizing_walk(a, limit, policy, scratch) {
         Sizing::Complete(words) => Ok(words),
         // The back-edge was reached before the budget: unambiguously cyclic.
         Sizing::Cyclic(_) => Err(TermError::TermGraphCyclic),
         Sizing::OverLimit(_) => {
-            if is_acyclic(a, policy) {
+            if is_acyclic(a, policy, scratch) {
                 Err(TermError::TermGraphTooLarge)
             } else {
                 Err(TermError::TermGraphCyclic)
