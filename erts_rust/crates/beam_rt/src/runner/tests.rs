@@ -3143,6 +3143,333 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// The engine's host-held families: published, relocated by a collection, adopted back
+// ---------------------------------------------------------------------------------------
+/// **A term held ONLY by the parked engine's host-held families survives a moving collection.**
+///
+/// The machine's `x`/stack/FR files are not the whole parked root set: an engine whose first run
+/// has not happened yet also holds the spawn arguments ([`ProcessEngine::args`]) and a fun entry's
+/// fun term ([`ProcessEntry::Fun::fun`]), and *nothing else* names them — they are `Eterm` fields
+/// of a Rust struct, invisible to the collector. [`publish_parked_roots`] therefore appends them
+/// after the machine's own roots ([`ProcessEngine::append_parked_host_terms`]) and the resume
+/// writes the relocated words back ([`ProcessEngine::adopt_relocated_parked_roots`]).
+///
+/// The proof is by address **and by value**: both terms are two-element small-integer tuples built
+/// on the process's own young heap, so a collection that did not publish them would leave the
+/// fields pointing into the abandoned from-space (a wrong term, not merely a stale one). The
+/// nursery is then filled with unreachable tuples so the collection is a genuine evacuation.
+#[test]
+fn a_parked_engines_host_held_terms_survive_a_moving_collection() {
+    let mut table = table();
+    let mut state = RunnerState::default();
+    let pid = table.spawn_default().expect("a fresh process");
+    let (arg, fun) = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let arg = process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds {7,8}");
+        let fun = process
+            .heap_mut()
+            .tuple(&[make_small(9), make_small(10)])
+            .expect("the young heap builds {9,10}");
+        (arg, fun)
+    };
+    // A fun-bodied engine that has not run its first entry: that is the one shape in which the
+    // engine's own families are live (`!args_consumed`), i.e. exactly what
+    // `append_parked_host_terms` exists for.
+    state.spawn_fun(pid, fun, vec![arg]);
+    assert!(
+        !state
+            .engines
+            .get(&pid)
+            .expect("the engine is registered")
+            .args_consumed,
+        "a never-run engine holds its arguments and fun term as live roots"
+    );
+
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        publish_parked_roots(&mut table, pid, engine, 0);
+    }
+    let extra = table
+        .get(pid)
+        .expect("the process")
+        .registers()
+        .extra_roots()
+        .to_vec();
+    assert_eq!(
+        extra,
+        [arg, fun][..],
+        "the publication carries both host-held families, in order: the arguments first, then the \
+         fun entry's fun term"
+    );
+
+    // A genuinely full nursery: unreachable tuples, so the collection below must evacuate.
+    {
+        let process = table.get_mut(pid).expect("the process is in the table");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+    table
+        .get_mut(pid)
+        .expect("the process is in the table")
+        .collect()
+        .expect("the collection runs");
+
+    let relocated = table
+        .get(pid)
+        .expect("the process")
+        .registers()
+        .extra_roots()
+        .to_vec();
+    assert_eq!(
+        relocated.len(),
+        2,
+        "both published host-held words survive the collection, got {relocated:?}"
+    );
+    assert_tuple_relocated(
+        relocated[0],
+        arg,
+        [7, 8],
+        "the parked engine's published argument",
+    );
+    assert_tuple_relocated(
+        relocated[1],
+        fun,
+        [9, 10],
+        "the parked engine's published fun term",
+    );
+
+    // The resume half: the fields adopt the RELOCATED words, never the from-space ones.
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        engine.adopt_relocated_parked_roots(&relocated);
+        assert_eq!(
+            engine.args,
+            vec![relocated[0]],
+            "the engine's arguments adopt the relocated word"
+        );
+        match &engine.entry {
+            ProcessEntry::Fun { fun: adopted, .. } => assert_eq!(
+                *adopted, relocated[1],
+                "the fun entry's fun term adopts the relocated word"
+            ),
+            other => panic!("the engine is fun-bodied, got {other:?}"),
+        }
+    }
+}
+
+/// **A `receive`-parked process does NOT hand its roots over unpublished — the non-vacuity guard
+/// for every delivery-driven collection test in this module.**
+///
+/// [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots) is the single
+/// predicate [`Process::deliver`](beam_process::Process::deliver) refuses the relocating collection
+/// on (it is `relocation_exempt || Running`), and a refusal is exactly what
+/// [`deliver_into_mailbox`](crate::context::RuntimeContext::deliver_into_mailbox) turns into the
+/// `send_fragmented_message` fallback. It used to answer **`true`** for every parked receiver: the
+/// `Wait` arm parked under `ParkExemption::Always`, which set the relocation exemption for the
+/// whole window, so a delivery into a blocked process could never collect (or grow) its nursery
+/// and always took the fragment route — a carrier allocation plus a second full `copy_struct` of
+/// the payload, on the default path of every ping-pong and server loop.
+///
+/// The `Wait` arm now parks under [`ParkExemption::LiveFloats`] (`exempt = fr_count > 0`), so a
+/// dead-FR receiver publishes its whole root set into the process's [`Registers`] — the machine's
+/// files plus the engine's host-held families — and answers `false`, which is what makes the
+/// delivery-driven collection in [`a_receive_park_publishes_so_a_signal_collects_the_receivers_nursery`]
+/// and [`a_delivery_into_a_receive_parked_process_copies_straight_into_its_heap`] reachable at
+/// all. Without this assertion those tests could pass for the wrong reason (a fragment route that
+/// happens to carry the right value).
+#[test]
+fn a_receive_parked_process_hands_its_roots_over_published() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+    let process = table.get(pid).expect("the parked process");
+    assert!(
+        !process.is_relocation_exempt(),
+        "the `Wait` arm parks under `LiveFloats`, so a dead-FR receiver holds no exemption"
+    );
+    assert!(
+        !process.has_unpublished_roots(),
+        "a parked `receive` receiver published its roots: `deliver` may collect and grow its \
+         nursery instead of refusing the move (it answered `true` for every parked receiver while \
+         the `Wait` arm parked under `ParkExemption::Always`)"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .parked_published,
+        "the engine records the hand-off"
+    );
+}
+
+/// **A delivery into a `receive`-parked process copies straight into its heap: no fragment.**
+///
+/// The route is the assertion, not just the value. A published receiver passes
+/// `has_unpublished_roots` and its roots come from [`Registers`], so [`Process::deliver`]
+/// collects and grows the nursery and
+/// [`deliver_into_mailbox`](crate::context::RuntimeContext::deliver_into_mailbox) never reaches
+/// `send_fragmented_message`. A fragmented payload would instead live in the message's own
+/// `Fragments` (`Message::fragments()` is `Some`) and would **not** move with the receiver's heap,
+/// so the two observables below pin the route:
+///
+/// * `fragments().is_none()` — the payload is heap-resident, never in a heap-fragment chain;
+/// * the payload's address changes when the receiver's own heap is collected afterwards (and its
+///   elements survive by value), which is only true of a payload the receiver's heap owns.
+///
+/// The payload is larger than the receiver's **whole** nursery, so the delivery really has to
+/// collect **and grow**, which is the case a `Send`-side exemption used to refuse.
+#[test]
+fn a_delivery_into_a_receive_parked_process_copies_straight_into_its_heap() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+
+    // A payload larger than the receiver's whole nursery, built on a pointer-stable arena (the
+    // copier reads the source words; only the destination has to grow).
+    let capacity = table
+        .get(pid)
+        .expect("live")
+        .collector()
+        .young()
+        .capacity_words();
+    let mut src = beam_alloc::Heap::new(capacity + 8).expect("the source arena allocates");
+    let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+    let payload = src.tuple(&elems).expect("the oversized payload fits the arena");
+
+    let minor_before = table.get(pid).expect("live").collector().minor_gcs();
+    let base_before = table.get(pid).expect("live").collector().young().base();
+    table
+        .deliver_simple(pid, NIL, payload)
+        .expect("the published receiver accepts the delivery");
+
+    let process = table.get(pid).expect("the receiver is live");
+    assert!(
+        process.collector().minor_gcs() > minor_before,
+        "the delivery collected the receiver's nursery (was {minor_before}, now {})",
+        process.collector().minor_gcs()
+    );
+    assert_ne!(
+        process.collector().young().base(),
+        base_before,
+        "the payload exceeds the whole nursery, so the delivery had to grow it"
+    );
+    assert_eq!(process.mailbox().len(), 1, "exactly one message is queued");
+    let message = process.mailbox().peek().expect("the queued message");
+    assert!(
+        message.fragments().is_none(),
+        "the queued message carries NO fragment: the payload was copied into the receiver's own \
+         heap, so `send_fragmented_message` was never reached"
+    );
+    let queued = message.payload();
+    assert_ne!(
+        queued, payload,
+        "the queued payload is the receiver's own copy, not the source arena's term"
+    );
+    assert_eq!(
+        terms::tuple_arity(queued).expect("a tuple"),
+        capacity,
+        "the whole payload arrived"
+    );
+    assert_eq!(
+        terms::tuple_element(queued, 0).expect("in range"),
+        make_small(0),
+        "the first element survives by value"
+    );
+    assert_eq!(
+        terms::tuple_element(queued, capacity - 1).expect("in range"),
+        make_small(capacity as i64 - 1),
+        "the last element survives by value"
+    );
+
+    // Heap-resident, proven by ownership: a collection of the RECEIVER moves the queued payload
+    // (a fragmented payload would not move at all).
+    table
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .collect()
+        .expect("the collection runs");
+    let process = table.get(pid).expect("the receiver is live");
+    let after = process
+        .mailbox()
+        .peek()
+        .expect("the message survives the collection")
+        .payload();
+    assert_ne!(
+        after, queued,
+        "the queued payload is relocated with the receiver's heap, so that heap owns it"
+    );
+    assert_eq!(
+        terms::tuple_element(after, 0).expect("in range"),
+        make_small(0),
+        "and it is relocated intact"
+    );
+    assert_eq!(
+        terms::tuple_element(after, capacity - 1).expect("in range"),
+        make_small(capacity as i64 - 1),
+        "the tail of the payload survives the relocation too"
+    );
+}
+
 /// **A park whose FR *is* live SKIPS the hand-off and holds the inter-slice window's relocation
 /// exemption — never a permanent pin.**
 ///
