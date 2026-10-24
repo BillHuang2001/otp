@@ -688,8 +688,57 @@ impl HeapPolicy {
     /// live set (the mature generation is not part of it) — which is why the minor target is
     /// [`young_minor_target_words`](Self::young_minor_target_words) (one times the live set) and
     /// not the [`young_target_words`](Self::young_target_words) the fullsweep applies.
+    ///
+    /// # The `need` term — [`young_after_collection_with_need`](Self::young_after_collection_with_need)
+    ///
+    /// [`young_after_collection_with_need`](Self::young_after_collection_with_need) is the same
+    /// three-way rule with the legacy C's `need` term in the target; this method is its
+    /// `need == 0` case, so every figure documented above is unchanged.
     pub fn young_after_collection(&self, capacity_words: usize, live_words: usize) -> usize {
-        let target = self.young_minor_target_words(live_words);
+        self.young_after_collection_with_need(capacity_words, live_words, 0)
+    }
+
+    /// [`young_after_collection`](Self::young_after_collection) with the legacy C's `need` term:
+    /// the **allocation request that triggered the collection**, in words.
+    ///
+    /// The C never sizes a young heap from the live set alone. `adjust_after_minor`
+    /// (`erts/emulator/beam/erl_gc.c:1490-1555`) computes
+    ///
+    /// ```c
+    /// need_after = ((HEAP_TOP(p) - HEAP_START(p))   /* young occupancy after the collection */
+    ///               + need                          /* the pending allocation request */
+    ///               + stack_size);
+    /// ...
+    /// else if (need_after > HEAP_SIZE(p)) grow_new_heap(p, next_heap_size(p, need_after, 0), ...);
+    /// ```
+    ///
+    /// and `adjust_after_fullsweep` (`erl_gc.c:2061-2098`) has the same shape
+    /// (`need_after = (HEAP_TOP - HEAP_START) + need + stack_size + S_RESERVED`);
+    /// `erts_garbage_collect(p, need, objv, nobj)` carries that `need` **into** the collection. In
+    /// this crate the young occupancy *is* the live set a minor evacuated, and the C's
+    /// `stack_size + S_RESERVED` map onto this policy's
+    /// [`need_reserve_words`](Self::need_reserve_words), so the target's argument is
+    /// `live + need + need_reserve_words` — exactly the shape
+    /// [`size_after_fullsweep`](Self::size_after_fullsweep) already uses.
+    ///
+    /// `need_words` is the **allocation** request, unrelated to the promotion-room figure
+    /// `Collector::minor_room_words` computes from the mature space's free room. The term is
+    /// strictly **additive** (`need_words == 0` is
+    /// [`young_after_collection`](Self::young_after_collection), byte for byte) and the target
+    /// remains a function of the live set and **one** pending request — never of the call count —
+    /// so the fixed-point property survives: a repeated `ensure_capacity(n)` at a constant live
+    /// set and request reproduces the capacity it installed.
+    ///
+    /// The three-way rule, its keep band and [`MINOR_SHRINK_FLOOR_WORDS`] are **identical** to
+    /// [`young_after_collection`](Self::young_after_collection); only the target the capacity is
+    /// compared against gains the `need` term.
+    pub fn young_after_collection_with_need(
+        &self,
+        capacity_words: usize,
+        live_words: usize,
+        need_words: usize,
+    ) -> usize {
+        let target = self.young_minor_target_words_with_need(live_words, need_words);
         // The legacy C's `HEAP_SIZE(p) > 3000` conjunct (`erl_gc.c:1517`): a small young heap is
         // kept even when the round left it nearly empty. Strict, exactly like the C's `>`.
         let shrink_band = MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR.saturating_mul(target));
@@ -725,8 +774,48 @@ impl HeapPolicy {
     /// is therefore never below [`nursery_floor_words`](Self::nursery_floor_words):
     /// `live_words + need_reserve_words >= need_reserve_words` already goes through the same
     /// monotone lookup. `young_minor_target_words(0) == nursery_floor_words()`.
+    ///
+    /// # The `need` term — [`young_minor_target_words_with_need`](Self::young_minor_target_words_with_need)
+    ///
+    /// [`young_minor_target_words_with_need`](Self::young_minor_target_words_with_need) is the
+    /// same rule with the legacy C's `need` term added to the argument; this method is its
+    /// `need == 0` case, so every figure documented above is unchanged.
     pub fn young_minor_target_words(&self, live_words: usize) -> usize {
-        self.next_words(live_words.saturating_add(self.need_reserve_words), 0)
+        self.young_minor_target_words_with_need(live_words, 0)
+    }
+
+    /// [`young_minor_target_words`](Self::young_minor_target_words) with the legacy C's `need`
+    /// term: the **allocation request that triggered the collection**, in words.
+    ///
+    /// The C's minor resizer sizes from `need_after = (HEAP_TOP - HEAP_START) + need +
+    /// stack_size` — `(HEAP_TOP - HEAP_START)` is the young occupancy the collection leaves,
+    /// `need` the pending request, and `stack_size + S_RESERVED` map onto this policy's
+    /// [`need_reserve_words`](Self::need_reserve_words) — and grows onto
+    /// `next_heap_size(p, need_after, 0)` when `need_after > HEAP_SIZE(p)`
+    /// (`erts/emulator/beam/erl_gc.c:1490-1555`). This is that rule: `next_words(live +
+    /// need + need_reserve_words, 0)`.
+    ///
+    /// `need_words` is the **allocation** request that triggered the collection, unrelated to the
+    /// promotion-room figure `Collector::minor_room_words`
+    /// computes from the mature space's free room. The term is **additive**:
+    /// `need_words == 0` is exactly
+    /// [`young_minor_target_words`](Self::young_minor_target_words), so the documented figures
+    /// (`610` for a 401-word live set on the default policy) are unchanged, and the target is
+    /// still a function of the live set and **one** pending request — never of the call count —
+    /// so it stays a fixed point rather than a ratchet. Because
+    /// [`next_words`](Self::next_words) is monotone and the argument only grows, a positive
+    /// `need_words` never lowers the target.
+    pub fn young_minor_target_words_with_need(
+        &self,
+        live_words: usize,
+        need_words: usize,
+    ) -> usize {
+        self.next_words(
+            live_words
+                .saturating_add(need_words)
+                .saturating_add(self.need_reserve_words),
+            0,
+        )
     }
 
     /// The smallest capacity this policy's nursery rule can install, in words —
@@ -804,9 +893,39 @@ impl HeapPolicy {
     /// [`nursery_floor_words`](Self::nursery_floor_words) for any `live_words` — its argument
     /// `2 * live_words + need_reserve_words` is at least the reserve, and `next_words` is
     /// monotone — and an empty live set makes it *exactly* the floor.
+    ///
+    /// # The `need` term — [`young_target_words_with_need`](Self::young_target_words_with_need)
+    ///
+    /// [`young_target_words_with_need`](Self::young_target_words_with_need) is the same rule with
+    /// the legacy C's `need` term inside the multiple; this method is its `need == 0` case, so
+    /// every figure documented above is unchanged.
     pub fn young_target_words(&self, live_words: usize) -> usize {
+        self.young_target_words_with_need(live_words, 0)
+    }
+
+    /// [`young_target_words`](Self::young_target_words) with the legacy C's `need` term: the
+    /// **allocation request that triggered the collection**, in words.
+    ///
+    /// `adjust_after_fullsweep` (`erts/emulator/beam/erl_gc.c:2061-2098`) computes
+    /// `need_after = (HEAP_TOP - HEAP_START) + need + stack_size + S_RESERVED` and grows onto
+    /// `next_heap_size(p, need_after, 0)`; `erts_garbage_collect(p, need, objv, nobj)` carries
+    /// that `need` into the collection. `(HEAP_TOP - HEAP_START)` is the occupancy the collection
+    /// leaves (the live set here) and `stack_size + S_RESERVED` map onto this policy's
+    /// [`need_reserve_words`](Self::need_reserve_words). With the
+    /// [`YOUNG_TARGET_LIVE_MULTIPLE`] amortisation this is
+    /// `next_words(YOUNG_TARGET_LIVE_MULTIPLE * (live + need) + need_reserve_words, 0)`.
+    ///
+    /// `need_words` is the **allocation** request that triggered the collection, unrelated to the
+    /// promotion-room figure `Collector::minor_room_words`
+    /// computes. The term is **additive** — `need_words == 0` reproduces
+    /// [`young_target_words`](Self::young_target_words) exactly, so `987` for a 401-word live set
+    /// on the default policy is unchanged — and the target remains a function of the live set and
+    /// **one** pending request, never of the call count. `next_words` is monotone in an argument
+    /// that only grows, so a positive `need_words` never lowers it.
+    pub fn young_target_words_with_need(&self, live_words: usize, need_words: usize) -> usize {
         self.next_words(
             live_words
+                .saturating_add(need_words)
                 .saturating_mul(YOUNG_TARGET_LIVE_MULTIPLE)
                 .saturating_add(self.need_reserve_words),
             0,
@@ -848,8 +967,46 @@ impl HeapPolicy {
     /// capacity stays inside `[4/3 * target, YOUNG_SHRINK_FACTOR * target]`, where neither
     /// branch fires. The nursery therefore never exceeds [`YOUNG_SHRINK_FACTOR`] times its
     /// target, and a burst that outlived its data is corrected at the next fullsweep.
+    ///
+    /// # The `need` term — [`young_after_fullsweep_with_need`](Self::young_after_fullsweep_with_need)
+    ///
+    /// [`young_after_fullsweep_with_need`](Self::young_after_fullsweep_with_need) is the same
+    /// three-way rule with the legacy C's `need` term in the target; this method is its
+    /// `need == 0` case, so every figure documented above is unchanged.
     pub fn young_after_fullsweep(&self, capacity_words: usize, live_words: usize) -> usize {
-        let target = self.young_target_words(live_words);
+        self.young_after_fullsweep_with_need(capacity_words, live_words, 0)
+    }
+
+    /// [`young_after_fullsweep`](Self::young_after_fullsweep) with the legacy C's `need` term:
+    /// the **allocation request that triggered the collection**, in words.
+    ///
+    /// The C's `adjust_after_fullsweep` decision (`erts/emulator/beam/erl_gc.c:2061-2098`) is
+    /// keyed on `need_after = (HEAP_TOP - HEAP_START) + need + stack_size + S_RESERVED`, where
+    /// `(HEAP_TOP - HEAP_START)` is the occupancy the collection leaves (the live set here),
+    /// `need` the pending request, and `stack_size + S_RESERVED` map onto this policy's
+    /// [`need_reserve_words`](Self::need_reserve_words);
+    /// `erts_garbage_collect(p, need, objv, nobj)` carries that `need` into the collection.
+    ///
+    /// The three-way rule is **identical** to
+    /// [`young_after_fullsweep`](Self::young_after_fullsweep), including its floor-free
+    /// `[target, YOUNG_SHRINK_FACTOR × target]` band (the C's fullsweep gate is `H_MIN_SIZE`, not
+    /// the minor-only 3 000-word one) and its [`should_grow`](Self::should_grow) bracket; only the
+    /// `target` it compares against gains the `need` term
+    /// ([`young_target_words_with_need`](Self::young_target_words_with_need)).
+    ///
+    /// `need_words` is the **allocation** request, unrelated to the promotion-room figure
+    /// `Collector::minor_room_words` computes. The term is
+    /// **additive** — `need_words == 0` is
+    /// [`young_after_fullsweep`](Self::young_after_fullsweep) exactly — and the target stays a
+    /// function of the live set and **one** pending request, never of the call count, so the
+    /// capacity remains a fixed point.
+    pub fn young_after_fullsweep_with_need(
+        &self,
+        capacity_words: usize,
+        live_words: usize,
+        need_words: usize,
+    ) -> usize {
+        let target = self.young_target_words_with_need(live_words, need_words);
         if capacity_words > YOUNG_SHRINK_FACTOR.saturating_mul(target)
             || self.should_grow(capacity_words, target)
         {
@@ -1860,5 +2017,335 @@ mod tests {
             };
             assert_eq!(capped.spawn_policy(0, 0, None).max_heap_words, 12_345);
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The `need` term (the C's `need_after = occupancy + need + stack_size [+ S_RESERVED]`)
+    // -----------------------------------------------------------------------------------------
+
+    /// The policies the `need`-term tests sweep: the unconfigured default, a spawn policy (whose
+    /// floor is `DEFAULT_MIN_HEAP_WORDS`), a `+hms` policy (whose floor is its own minimum) and a
+    /// capped policy (whose ceiling clamps every target).
+    fn need_term_policies() -> [HeapPolicy; 4] {
+        [
+            HeapPolicy::default(),
+            HeapPolicy::from_spawn_opts(0, 0, 65_535),
+            HeapPolicy::from_min_max(4_185, 0),
+            HeapPolicy {
+                max_heap_words: 1_000,
+                ..HeapPolicy::default()
+            },
+        ]
+    }
+
+    /// **The blast-radius control.** At `need_words == 0` every `_with_need` method is *exactly*
+    /// its existing counterpart, so the pinned figures (`233`, `610`, `843`, `987`), the floor
+    /// band and every dependent's capacity pin are untouched: the new term is strictly additive.
+    #[test]
+    fn the_need_term_is_identically_zero_at_zero_need() {
+        let capacities = [
+            0usize, 12, 90, 142, 233, 376, 610, 720, 721, 842, 843, 987, 1_000, 1_598, 2_586,
+            2_999, 3_000, 3_001, 4_185, 7_896, 7_897, 12_784, 12_785, 100_000,
+        ];
+        let lives = [
+            0usize, 1, 12, 13, 60, 201, 233, 401, 464, 1_000, 10_000, 100_000,
+        ];
+
+        for policy in need_term_policies() {
+            for live in lives {
+                assert_eq!(
+                    policy.young_minor_target_words_with_need(live, 0),
+                    policy.young_minor_target_words(live),
+                    "{policy:?}: the minor target changed at live {live}"
+                );
+                assert_eq!(
+                    policy.young_target_words_with_need(live, 0),
+                    policy.young_target_words(live),
+                    "{policy:?}: the fullsweep target changed at live {live}"
+                );
+                for capacity in capacities {
+                    assert_eq!(
+                        policy.young_after_collection_with_need(capacity, live, 0),
+                        policy.young_after_collection(capacity, live),
+                        "{policy:?}: a minor at capacity {capacity} / live {live} changed"
+                    );
+                    assert_eq!(
+                        policy.young_after_fullsweep_with_need(capacity, live, 0),
+                        policy.young_after_fullsweep(capacity, live),
+                        "{policy:?}: a fullsweep at capacity {capacity} / live {live} changed"
+                    );
+                }
+            }
+        }
+
+        // The documented figures themselves, restated through the `_with_need` entry point.
+        let policy = HeapPolicy::default();
+        assert_eq!(policy.young_minor_target_words_with_need(401, 0), 610);
+        assert_eq!(policy.young_target_words_with_need(401, 0), 987);
+        assert_eq!(policy.young_minor_target_words_with_need(0, 0), 90);
+        assert_eq!(policy.young_target_words_with_need(0, 0), 90);
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(0, 0, 65_535).young_minor_target_words_with_need(0, 0),
+            233
+        );
+    }
+
+    /// The **motivating case**: a collection triggered by a 321-word copy-out installs the
+    /// capacity the copy-out actually needs, instead of one the next copy-out must immediately
+    /// grow again. The augmented argument is `live + need + need_reserve_words`, so a 401-word
+    /// live set plus a 321-word request lands on `next_words(786) = 987` — the very capacity the
+    /// un-augmented fullsweep target already needed for the live set alone.
+    #[test]
+    fn the_need_term_is_the_pending_allocation_request() {
+        let policy = HeapPolicy::default();
+        assert_eq!(policy.need_reserve_words, 64);
+
+        assert_eq!(policy.young_minor_target_words(401), 610);
+        assert_eq!(policy.young_minor_target_words_with_need(401, 321), 987);
+        assert_eq!(next_heap_size(401 + 321 + 64, 0), 987);
+        // The un-augmented 610-word nursery would have to grow again on exactly that request.
+        assert!(610 < 401 + 321);
+
+        // The fullsweep's 2x rule takes the same term inside the multiple.
+        assert_eq!(policy.young_target_words(401), 987);
+        assert_eq!(policy.young_target_words_with_need(401, 321), 1_598);
+        assert_eq!(next_heap_size(2 * (401 + 321) + 64, 0), 1_598);
+
+        // A spawn policy floors the result at its own minimum, need or no need.
+        let spawn = HeapPolicy::from_spawn_opts(0, 0, 65_535);
+        assert_eq!(spawn.young_minor_target_words_with_need(0, 0), 233);
+        assert_eq!(spawn.young_minor_target_words_with_need(0, 64), 233);
+        assert!(spawn.young_minor_target_words_with_need(0, 1_000) > 233);
+    }
+
+    /// **Monotone in `need`**: a positive request never lowers a target or an installed capacity —
+    /// `next_words` is monotone and the argument only grows, and the three-way rule can only move
+    /// *towards* a larger target.
+    #[test]
+    fn a_positive_need_never_lowers_a_target_or_a_capacity() {
+        let capacities = [0usize, 233, 610, 987, 1_598, 3_000, 7_896, 12_784, 100_000];
+        let lives = [0usize, 13, 401, 1_000, 10_000];
+        let needs = [1usize, 12, 64, 321, 1_000, 20_000];
+
+        for policy in need_term_policies() {
+            for live in lives {
+                for need in needs {
+                    assert!(
+                        policy.young_minor_target_words_with_need(live, need)
+                            >= policy.young_minor_target_words_with_need(live, 0),
+                        "{policy:?}: the minor target fell at live {live} / need {need}"
+                    );
+                    assert!(
+                        policy.young_target_words_with_need(live, need)
+                            >= policy.young_target_words_with_need(live, 0),
+                        "{policy:?}: the fullsweep target fell at live {live} / need {need}"
+                    );
+                    for capacity in capacities {
+                        assert!(
+                            policy.young_after_collection_with_need(capacity, live, need)
+                                >= policy.young_after_collection_with_need(capacity, live, 0),
+                            "{policy:?}: a minor at capacity {capacity} / live {live} shrank \
+                             when the need term grew to {need}"
+                        );
+
+                        // The fullsweep rule is monotone in the need term too, **except** for
+                        // one pre-existing (`need`-independent) corner: its grow branch is
+                        // `should_grow`, i.e. `3 * capacity < 4 * target`, which fires for a
+                        // capacity just *above* the target and installs the target — so a target
+                        // rising from below a kept capacity into that headroom window lowers the
+                        // installed capacity. That is the only way the term can lower a figure,
+                        // and the branch itself is untouched by this change.
+                        let swept = policy.young_after_fullsweep_with_need(capacity, live, need);
+                        let swept_zero = policy.young_after_fullsweep_with_need(capacity, live, 0);
+                        if swept < swept_zero {
+                            let target = policy.young_target_words_with_need(live, need);
+                            assert_eq!(
+                                swept, target,
+                                "{policy:?}: a fullsweep at capacity {capacity} / live {live} \
+                                 / need {need} answered neither the capacity nor the target"
+                            );
+                            assert!(
+                                capacity > target && 3 * capacity < 4 * target,
+                                "{policy:?}: the fullsweep shrank at capacity {capacity} / \
+                                 live {live} / need {need} outside the should_grow headroom \
+                                 window (target {target})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // The targets are monotone in the need term itself, not only against the `need == 0` row.
+        let policy = HeapPolicy::default();
+        let (mut previous_minor, mut previous_young) = (0usize, 0usize);
+        for need in [0usize, 1, 64, 128, 321, 1_000, 20_000] {
+            let minor = policy.young_minor_target_words_with_need(401, need);
+            let young = policy.young_target_words_with_need(401, need);
+            assert!(minor >= previous_minor, "minor target fell at need {need}");
+            assert!(
+                young >= previous_young,
+                "fullsweep target fell at need {need}"
+            );
+            assert!(young >= minor);
+            (previous_minor, previous_young) = (minor, young);
+        }
+    }
+
+    /// **Still a fixed point**: the result is still exactly the need-aware `target` or exactly the
+    /// capacity, never a third value, so `ensure_capacity(n)` repeated at a constant live set and a
+    /// constant request reproduces the capacity it installed instead of ratcheting.
+    #[test]
+    fn the_need_aware_rules_are_still_fixed_points() {
+        let capacities = [
+            0usize, 12, 233, 610, 842, 843, 987, 1_598, 3_000, 7_896, 100_000,
+        ];
+        let lives = [0usize, 13, 401, 1_000, 100_000];
+        let needs = [0usize, 321, 1_000];
+
+        for policy in need_term_policies() {
+            for live in lives {
+                for need in needs {
+                    let minor_target = policy.young_minor_target_words_with_need(live, need);
+                    let young_target = policy.young_target_words_with_need(live, need);
+                    for capacity in capacities {
+                        let minor = policy.young_after_collection_with_need(capacity, live, need);
+                        assert!(
+                            minor == capacity || minor == minor_target,
+                            "{policy:?}: minor {capacity}/{live}/{need} -> {minor} is neither \
+                             the capacity nor the target {minor_target}"
+                        );
+                        assert_eq!(
+                            policy.young_after_collection_with_need(minor, live, need),
+                            minor,
+                            "{policy:?}: minor {capacity}/{live}/{need} -> {minor} is not a \
+                             fixed point"
+                        );
+
+                        let young = policy.young_after_fullsweep_with_need(capacity, live, need);
+                        assert!(
+                            young == capacity || young == young_target,
+                            "{policy:?}: fullsweep {capacity}/{live}/{need} -> {young} is \
+                             neither the capacity nor the target {young_target}"
+                        );
+                        assert_eq!(
+                            policy.young_after_fullsweep_with_need(young, live, need),
+                            young,
+                            "{policy:?}: fullsweep {capacity}/{live}/{need} -> {young} is not a \
+                             fixed point"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The floor keeps winning where it already won.** `MINOR_SHRINK_FLOOR_WORDS` is still a
+    /// constant gate on the *capacity*, and the keep band's upper edge is still
+    /// `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × target)` with the **need-aware**
+    /// target; the fullsweep keeps its floor-free `[target, YOUNG_SHRINK_FACTOR × target]` shape.
+    #[test]
+    fn the_minor_floor_and_band_survive_the_need_term() {
+        let policy = HeapPolicy::default();
+
+        // `live = 401, need = 321` -> target 987, band `max(3000, 8 * 987) = 7896`.
+        let target = policy.young_minor_target_words_with_need(401, 321);
+        assert_eq!(target, 987);
+        let band = MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * target);
+        assert_eq!(band, 7_896);
+        // The band's edges: at the edge the capacity is kept, one word past it installs the
+        // target, one word below the target grows onto it, and the target is its own fixed point.
+        assert_eq!(
+            policy.young_after_collection_with_need(band, 401, 321),
+            band
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(band + 1, 401, 321),
+            target
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(target - 1, 401, 321),
+            target
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(target, 401, 321),
+            target
+        );
+
+        // A capacity at or below the 3 000-word floor is still **kept** — even when the band's
+        // factor edge would have handed it back: `8 * 233 = 1864 < 3000` and
+        // `8 * 90 = 720 < 3000`, and the huge-need rows keep it too because `target <= 3000`.
+        assert!(8 * policy.young_minor_target_words_with_need(0, 100) < MINOR_SHRINK_FLOOR_WORDS);
+        assert_eq!(
+            policy.young_after_collection_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 100),
+            MINOR_SHRINK_FLOOR_WORDS
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 0),
+            MINOR_SHRINK_FLOOR_WORDS
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(MINOR_SHRINK_FLOOR_WORDS, 401, 321),
+            MINOR_SHRINK_FLOOR_WORDS
+        );
+        // ... while the floor still never blocks a **growth**: a target above the capacity wins,
+        // even a capacity far below the floor.
+        assert_eq!(
+            policy.young_after_collection_with_need(233, 401, 321),
+            target
+        );
+        // A big-enough need does push the target past the floor, but that is a *growth* onto the
+        // need-aware target — the floor gates the shrink side only.
+        assert!(policy.young_minor_target_words_with_need(0, 4_000) > MINOR_SHRINK_FLOOR_WORDS);
+        assert_eq!(
+            policy.young_after_collection_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 4_000),
+            policy.young_minor_target_words_with_need(0, 4_000)
+        );
+
+        // The fullsweep's shape is unchanged: no 3 000-word floor, its band is the bare factor.
+        let young_target = policy.young_target_words_with_need(401, 321);
+        assert_eq!(young_target, 1_598);
+        let young_band = YOUNG_SHRINK_FACTOR * young_target;
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(young_band, 401, 321),
+            young_band
+        );
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(young_band + 1, 401, 321),
+            young_target
+        );
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(young_target, 401, 321),
+            young_target
+        );
+        // The 3 000-word floor is a **minor-only** rule and stays so with the need term: the same
+        // capacity the minor keeps, the fullsweep hands back.
+        // The 3 000-word floor is a **minor-only** rule and stays so: with `need == 0` the same
+        // capacity the minor keeps (3 000) is handed back by the fullsweep, whose band edge there
+        // is the bare `8 x 90 = 720` — no floor is involved on that side at all.
+        assert_eq!(
+            policy.young_after_collection_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 0),
+            MINOR_SHRINK_FLOOR_WORDS
+        );
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 0),
+            policy.young_target_words_with_need(0, 0)
+        );
+        // A need that lifts the fullsweep's target to 376 lifts its **band edge** to
+        // `8 x 376 = 3 008`, above the 3 000-word capacity: the band — not any floor — is what
+        // keeps that capacity there, exactly as the floor-free shape requires.
+        assert_eq!(policy.young_target_words_with_need(0, 100), 376);
+        assert_eq!(YOUNG_SHRINK_FACTOR * 376, 3_008);
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 100),
+            MINOR_SHRINK_FLOOR_WORDS
+        );
+        // ... and a need small enough to keep the fullsweep's target under a quarter of that
+        // capacity hands it back, exactly as the floor-free rule demands.
+        assert_eq!(policy.young_target_words_with_need(0, 20), 142);
+        assert_eq!(
+            policy.young_after_fullsweep_with_need(MINOR_SHRINK_FLOOR_WORDS, 0, 20),
+            policy.young_target_words_with_need(0, 20)
+        );
     }
 }
