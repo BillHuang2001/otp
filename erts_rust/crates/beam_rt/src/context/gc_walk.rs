@@ -809,11 +809,17 @@ impl Visited {
 
     /// Records `key`; answers whether it is **newly** recorded (`false` when the walk in
     /// progress already holds it — which is what makes a shared or cyclic graph terminate).
+    ///
+    /// The **room test is `O(1)` and the room *work* is out of line**. Creating the slot array on
+    /// a walk's first insert and doubling it when the current generation fills it are the only
+    /// two `O(len)` operations the descent performs, and they run ~7 times over a whole run
+    /// against ~1.9 M inserts; keeping them in this body made the function's frame carry the
+    /// spills of both (and made `insert` recurse through `grow`'s re-insert loop, which blocks
+    /// inlining it into its three callers). [`Visited::make_room`] is `#[cold]` +
+    /// `#[inline(never)]`, so the hot path is a compare-and-branch and the frame stays small.
     fn insert(&mut self, key: usize) -> bool {
-        if self.slots.is_empty() {
-            self.slots.resize(INITIAL_SLOTS, Slot::default());
-        } else if (self.len + 1) * 4 > self.slots.len() * 3 {
-            self.grow();
+        if self.slots.is_empty() || (self.len + 1) * 4 > self.slots.len() * 3 {
+            self.make_room();
         }
         let mask = self.slots.len() - 1;
         #[cfg(test)]
@@ -876,8 +882,22 @@ impl Visited {
         }
     }
 
+    /// Makes room for one more key: allocates the slot array on a walk's first insert, or doubles
+    /// it when the current generation occupies three quarters of it. The `#[cold]` half of
+    /// [`Visited::insert`] — see its docs for why the split is load-bearing.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self) {
+        if self.slots.is_empty() {
+            self.slots.resize(INITIAL_SLOTS, Slot::default());
+        } else {
+            self.grow();
+        }
+    }
     /// Doubles the table and re-inserts the current generation's keys (the only allocation the
     /// descent ever performs, and it amortises away).
+    #[cold]
+    #[inline(never)]
     fn grow(&mut self) {
         // The key buffer is taken out of `self` so the rebuild can borrow the table mutably;
         // it is returned at the end, so a warm table's grows allocate the slot array alone.
