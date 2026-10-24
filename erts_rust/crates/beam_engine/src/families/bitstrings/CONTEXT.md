@@ -132,7 +132,12 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     the context operand readers (`read_ctx`/`reread_ctx`) and the position ops
     (`position_term`/`position_of`).
     `enter_match`'s reuse arm returns the **same `Eterm`** the operand holds — C's
-    `$Dst = context` — so a re-entered match costs no reservation at all. The reuse predicate
+    `$Dst = context` — so a re-entered match costs no reservation at all.
+    That reuse arm is the **per-element** hot path of a binary comprehension: the compiler's loop
+    fun is `bs_start_match3 Ctx -> Dst` / `bs_match` / build / `move Dst -> Ctx` /
+    `call_only` back to itself (`erlc -S` of `<< <<C:8,C:8,C:8,C:8>> || <<C:8>> <= Bin >>`), so
+    x(0) *is* the context on every iteration after the first — hence `long_append:expand`'s
+    2 rooted calls / 13 words per call (1 × 8 for `bs_init_writable`, 1 × 5 for the first element). The reuse predicate
     is `raw::ctx_parts(value).is_some()` after a `raw::heap_bits` miss, which is exactly C's
     `erl_sub_bits_is_match_context` because this engine never builds a non-match-context,
     non-refc `ErlSubBits` (`make_binary` yields only an on-heap `ErlHeapBits` or the
