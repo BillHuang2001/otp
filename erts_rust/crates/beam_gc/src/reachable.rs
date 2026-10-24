@@ -470,10 +470,17 @@ mod tests {
     //! ranges **exactly** (no two addresses sharing a bit, no address without one), because a
     //! shared bit would silently drop an object a collection keeps alive and a missing bit would
     //! visit one twice.
+    //!
+    //! The last test is the **reuse soundness** half: one [`Scratch`] walked repeatedly over one
+    //! from-set with different root sets reports exactly what a fresh scratch reports, which is
+    //! what makes the collector-held scratch a pure allocation saving rather than a behaviour
+    //! change. A stale set bit would make the second walk skip an object it has never visited —
+    //! an under-count, and through the collector's room figures a stranded live term.
 
     use super::*;
     use beam_term::prelude::make_small;
 
+    use crate::space::HeapSpace;
     /// Ranges the test indexes — far more than a hand-written case would build, so the bit index
     /// is exercised across many ranges and many bit-vector words.
     const RANGES: usize = 1200;
@@ -581,5 +588,124 @@ mod tests {
             "the second range starts past the first's words"
         );
         assert!(visited.test_and_set(second));
+    }
+
+    /// Counts `(words, objects)` reachable from `roots` out of the scratch's installed from-set —
+    /// the raw [`Scratch::walk`], which is where the visited set is consumed.
+    fn count(scratch: &mut Scratch, roots: &[Eterm]) -> (usize, usize) {
+        let (mut words, mut objects) = (0usize, 0usize);
+        scratch
+            .walk(roots, |_first, _ptr, total| {
+                words += total;
+                objects += 1;
+            })
+            .expect("the counting closure never fails");
+        (words, objects)
+    }
+
+    /// **Reuse soundness**: one [`Scratch`] walked several times over the **same** from-set with
+    /// **different** root sets reports exactly what a fresh scratch reports each time.
+    ///
+    /// The from-set is a single nursery-shaped range, so every round walks the very same
+    /// addresses: a bit left over from the previous walk would make the next one skip an object at
+    /// an address it has already seen — an under-count. The graph is built so that a stale bit is
+    /// *unmistakable*: the subterm `S` is shared by both roots, so a scratch that failed to clear
+    /// would report `(3, 1)` (only `B`) on the second walk instead of `(6, 2)`, and `(6, 2)`
+    /// instead of `(9, 3)` on the joint one.
+    #[test]
+    fn a_reused_scratch_reports_what_a_fresh_one_does() {
+        let mut space = HeapSpace::new(64).expect("nursery");
+        // `S = {7,8}` (3 words), shared by `A = {S,1}` and `B = {S,2}` (3 words each), plus a
+        // garbage tuple nothing reaches.
+        let shared = space
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("shared");
+        let a = space
+            .heap_mut()
+            .tuple(&[shared, make_small(1)])
+            .expect("a");
+        let b = space
+            .heap_mut()
+            .tuple(&[shared, make_small(2)])
+            .expect("b");
+        let _garbage = space
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("garbage");
+
+        let mut from = FromSet::new();
+        from.add(&space);
+
+        // The three rounds, each its own root set: `A` alone (S is reached through it), `B` alone
+        // (S is reached again — a *separate* walk counts it a separate time), and both together (S
+        // once, because one walk deduplicates by address).
+        let rounds: [(&[Eterm], (usize, usize)); 3] = [
+            (&[a], (6, 2)),
+            (&[b], (6, 2)),
+            (&[a, b], (9, 3)),
+        ];
+
+        // One scratch, walked three times.
+        let mut reused = Scratch::new();
+        reused.begin_with(&from);
+        for (roots, expected) in rounds {
+            assert_eq!(
+                count(&mut reused, roots),
+                expected,
+                "the reused scratch must report the round's own live set"
+            );
+        }
+
+        // A fresh one-shot scratch per round: the reference figures.
+        for (roots, expected) in rounds {
+            let mut fresh = Scratch::new();
+            fresh.begin_with(&from);
+            assert_eq!(
+                count(&mut fresh, roots),
+                expected,
+                "the one-shot reference walk"
+            );
+        }
+
+        // And the reused scratch's answers equal the fresh ones round for round, whichever order
+        // the rounds run in: re-running the first round *after* the others must still count S.
+        reused.begin_with(&from); // re-installing the same ranges must not disturb anything
+        assert_eq!(count(&mut reused, &[a]), (6, 2));
+        assert_eq!(count(&mut reused, &[b]), (6, 2));
+    }
+
+    /// A reused scratch tolerates a **different** from-set between walks: `begin` replaces the
+    /// ranges (never merges them), and the next walk's bits belong to the new ranges only.
+    ///
+    /// This is the collector-level sequence in miniature — a collection installs its from-set,
+    /// walks, and the *next* collection installs a different one (a collapsed nursery at a new
+    /// base, a relocated mature space).
+    #[test]
+    fn a_reused_scratch_reinstalls_its_from_set() {
+        let mut space = HeapSpace::new(64).expect("nursery");
+        let a = space
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("a");
+        let mut from = FromSet::new();
+        from.add(&space);
+
+        let mut scratch = Scratch::new();
+        scratch.begin_with(&from);
+        assert_eq!(count(&mut scratch, &[a]), (3, 1));
+        assert_eq!(scratch.from().ranges().len(), 1, "one range installed");
+
+        // A second, distinct region: the reused scratch must forget the first entirely.
+        let mut other = HeapSpace::new(64).expect("second region");
+        let c = other
+            .heap_mut()
+            .tuple(&[make_small(5), make_small(6), make_small(7)])
+            .expect("c");
+        scratch.begin(|from| from.add(&other));
+        assert_eq!(scratch.from().ranges().len(), 1, "replaced, never merged");
+        assert_eq!(count(&mut scratch, &[c]), (4, 1));
+        // The first region's term is now *outside* the installed from-set: skipped whole.
+        assert_eq!(count(&mut scratch, &[a]), (0, 0));
     }
 }

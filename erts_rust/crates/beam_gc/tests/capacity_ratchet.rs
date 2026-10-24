@@ -566,18 +566,32 @@ fn the_chain_grows_with_the_interval_and_only_a_collection_bounds_it() {
 ///   knows to collect;
 /// * **(iii) a refusal is not a chain scan** — a long loop of refused growths against a chained
 ///   nursery completes in milliseconds, which the per-growth whole-chain scan the empty-retired
-///   index replaced could not do.
+///   index replaced could not do;
+/// * **(iv)** the budget must clear the legacy C's **minor-shrink floor**
+///   (`beam_gc::MINOR_SHRINK_FLOOR_WORDS` = 3 000 words, `HEAP_SIZE(p) > 3000` before a minor
+///   hands a young heap back): a collection only gives a capacity back once it is **above** the
+///   floor, so a ceiling below it would leave the collapsed chain pinned at the ceiling and the
+///   "the same request is grantable again after the collection" arm could never hold. That arm is
+///   therefore about a capacity the floor does **not** pin; the pinned-at-the-floor case is
+///   `HeapPolicy::young_after_collection`'s own regression gate
+///   (`tests/post_fullsweep_nursery.rs`) and the C behaviour it reproduces.
 #[test]
 fn a_refused_growth_is_inert_and_cheap() {
     /// A budget that reaches the first few growths and then bites, so the refusal path (not the
     /// allocation path) is what the loop below exercises.
+    ///
+    /// 4 096 clears `MINOR_SHRINK_FLOOR_WORDS` (3 000), so the collapse at the end of the test
+    /// really hands the chain back: measured on this fixture, the granted phase fills the chain to
+    /// 3 804 words and the collection collapses it to 142, which makes the same request grantable
+    /// again. A ceiling at or below the floor (2 048, this fixture's previous value) is **kept**
+    /// by the collapse — by design, exactly as the C keeps a 2 048-word young heap — so the chain
+    /// would stay at the ceiling and the re-grant arm could not hold.
     fn capped() -> HeapPolicy {
         HeapPolicy {
-            max_heap_words: 2048,
+            max_heap_words: 4096,
             ..HeapPolicy::default()
         }
     }
-
     for kind in KINDS {
         let policy = capped();
         let mut c = any_for(kind, policy.clone());

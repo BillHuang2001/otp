@@ -36,11 +36,19 @@
 //! This module provides that count. The traversal itself — the iterative worklist, its
 //! one-bit-per-word visited set and the per-object sizing/child enumeration driven by the
 //! shared [`move_size`](crate::copy::move_size) / [`for_each_ref`](crate::copy::for_each_ref)
-//! primitives — is [`crate::reachable::walk_reachable`], the *same* read-only walk the public
-//! reachability enumeration ([`crate::Collector::for_each_reachable_object`]) is built on, so
-//! the counter's per-object sizing and child enumeration cannot drift from either the copy it
-//! is sizing for or the enumeration. This module only accumulates the sizes the walk reports.
-//! The `#[cfg(test)]` module at the bottom of this file pins the count to a real collection.
+//! primitives — is [`Scratch::walk`](crate::reachable::Scratch::walk), the *same* read-only walk
+//! the public reachability enumeration ([`crate::Collector::for_each_reachable_object`]) is
+//! built on, so the counter's per-object sizing and child enumeration cannot drift from either
+//! the copy it is sizing for or the enumeration. This module only accumulates the sizes the walk
+//! reports. The `#[cfg(test)]` module at the bottom of this file pins the count to a real
+//! collection.
+//!
+//! Two forms of each entry point: the one-shot [`live`] / [`live_full`] own a fresh
+//! [`Scratch`](crate::reachable::Scratch) for the call, and [`live_with`] / [`live_full_with`]
+//! reuse a caller-held scratch — what a collector does at every collection, since the visited
+//! bitmap, the worklist and the range vector are otherwise re-allocated per walk. Reuse is only
+//! sound because every walk clears that state before it admits anything
+//! ([`Scratch::walk`](crate::reachable::Scratch::walk)'s reset-before-use).
 //!
 //! [`live`]'s contract inherits the walk's: it is **read-only** (it writes no forwarding
 //! marker, so it can run immediately before a collection over the very same from-spaces —
@@ -60,9 +68,8 @@ use beam_term::prelude::Eterm;
 
 use crate::immix::{lines_for, ImmixSpace};
 use crate::nursery::Nursery;
-use crate::reachable::walk_reachable;
+use crate::reachable::Scratch;
 use crate::space::FromSet;
-
 /// The exact size of the live graph a fullsweep has to evacuate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Live {
@@ -79,11 +86,27 @@ pub(crate) struct Live {
 
 /// Counts the live graph reachable from `roots` out of the evacuated ranges of `from` — see
 /// the module docs. `roots` is borrowed immutably: the count never rewrites a term.
+///
+/// One-shot: it owns a fresh [`Scratch`] for the call. A caller that counts repeatedly (a
+/// collector at every collection) holds a scratch and calls
+/// [`live_with`] instead.
 pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live {
+    let mut scratch = Scratch::new();
+    scratch.begin_with(from);
+    live_with(&mut scratch, roots)
+}
+
+/// [`live`] over a caller-held [`Scratch`], whose installed from-set it walks
+/// ([`Scratch::begin`] / [`Scratch::begin_with`]).
+///
+/// The walk clears its own visited bits and worklist before it admits a root, so a scratch may
+/// be walked any number of times — over the same ranges with different roots, or over different
+/// ranges entirely — and every walk reports exactly what a fresh one would.
+pub(crate) fn live_with(scratch: &mut Scratch, roots: &[Eterm]) -> Live {
     let mut words = 0usize;
     let mut lines = 0usize;
 
-    let walk = walk_reachable(from, roots, |_first, _ptr, total| {
+    let walk = scratch.walk(roots, |_first, _ptr, total| {
         words += total;
         lines += lines_for(total);
     });
@@ -93,7 +116,6 @@ pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live {
 
     Live { words, lines }
 }
-
 /// The **exact** number of words a relocation of `roots` out of `from` copies — the public form
 /// of [`live`], for a host whose region is not a process heap.
 ///
@@ -131,14 +153,32 @@ pub fn live_words_in(from: &FromSet, roots: &[Eterm]) -> usize {
 /// space of a chained nursery), plus the whole span of the mark-region mature space (that
 /// space's own `contains` covers its free lines as well, so its from-range is
 /// `base .. base + capacity`).
+///
+/// One-shot: it owns a fresh [`Scratch`] for the call, which is what a *test* wants (and the
+/// only caller today — a production collector counts over its own held scratch through
+/// [`live_full_with`]).
+#[cfg(test)]
 pub(crate) fn live_full(nursery: &Nursery, mature: &ImmixSpace, roots: &[Eterm]) -> Live {
-    let mut from = FromSet::new();
-    nursery.add_to_from_set(&mut from);
-    let base = mature.base() as usize;
-    from.add_range(base, base + mature.capacity_words() * size_of::<Eterm>());
-    live(&from, roots)
+    let mut scratch = Scratch::new();
+    live_full_with(&mut scratch, nursery, mature, roots)
 }
 
+/// [`live_full`] over a caller-held [`Scratch`], which this installs the mark-region from-set
+/// into — the nursery chain plus the mature region's `base .. base + capacity` span.
+pub(crate) fn live_full_with(
+    scratch: &mut Scratch,
+    nursery: &Nursery,
+    mature: &ImmixSpace,
+    roots: &[Eterm],
+) -> Live {
+    let base = mature.base() as usize;
+    let capacity_words = mature.capacity_words();
+    scratch.begin(|from| {
+        nursery.add_to_from_set(from);
+        from.add_range(base, base + capacity_words * size_of::<Eterm>());
+    });
+    live_with(scratch, roots)
+}
 #[cfg(test)]
 mod tests {
     //! The counter's tests, and the **invariant that makes an under-count impossible**: for

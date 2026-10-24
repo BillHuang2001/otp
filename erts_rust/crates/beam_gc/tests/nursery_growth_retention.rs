@@ -56,7 +56,8 @@
 //! asserted.
 
 use beam_gc::prelude::{
-    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind, YOUNG_SHRINK_FACTOR,
+    AnyCollector, GcConfig, HeapObservable, HeapPolicy, HeapSpace, MatureKind, MINOR_SHRINK_FLOOR_WORDS,
+    YOUNG_SHRINK_FACTOR,
 };
 use beam_term::prelude::{make_small, ptr_val, Eterm};
 
@@ -84,14 +85,24 @@ fn retained_words(c: &AnyCollector) -> usize {
     c.heap_size_words() - c.young().capacity_words()
 }
 
-/// The upper edge of the heap-size policy's **hysteresis band** for a live set of `live_words`: the
-/// largest nursery capacity a collection may settle on without giving the memory back
-/// (`YOUNG_SHRINK_FACTOR` × [`HeapPolicy::young_target_words`]).
+/// The upper edge of the heap-size policy's **minor** hysteresis band for a live set of
+/// `live_words`: the largest nursery capacity a *minor* may settle on without giving the memory
+/// back — `max(MINOR_SHRINK_FLOOR_WORDS, YOUNG_SHRINK_FACTOR × HeapPolicy::young_minor_target_words)`.
 ///
-/// It is the quantity the nursery's capacity is *bounded by*, and every term of it is a workload
-/// property — the live set — so a capacity checked against it cannot scale with the run length.
+/// The band is `[target, max(MINOR_SHRINK_FLOOR_WORDS, 8 × target)]`, so the legacy C's
+/// minor-shrink floor (`MINOR_SHRINK_FLOOR_WORDS` = 3 000 words, `HEAP_SIZE(p) > 3000` before a
+/// minor hands a young heap back) — not the 8× multiple — is the upper edge until
+/// `8 × minor_target > 3000`: at `live = 0` the multiple alone is `8 × 90 = 720`, well below the
+/// floor, and a capacity anywhere up to 3 000 words is *kept* by the collapse rather than being a
+/// policy violation. It is the quantity the nursery's capacity is *bounded by* after a **minor**,
+/// and every term of it is a workload property — the live set and two policy constants — so a
+/// capacity checked against it cannot scale with the run length.
+///
+/// A **fullsweep**'s band is the whole-heap one (`YOUNG_SHRINK_FACTOR ×
+/// HeapPolicy::young_target_words`, no floor): a fullsweep is the one collection that measures the
+/// whole live set exactly, and it installs that target whenever it is outside the band.
 fn band_edge(policy: &HeapPolicy, live_words: usize) -> usize {
-    YOUNG_SHRINK_FACTOR * policy.young_target_words(live_words)
+    MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * policy.young_minor_target_words(live_words))
 }
 
 // ---------------------------------------------------------------------------

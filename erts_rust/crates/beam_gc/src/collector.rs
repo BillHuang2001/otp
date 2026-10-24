@@ -38,8 +38,8 @@ use crate::error::heap_exhausted;
 use crate::heap_info::{old_heap_size, HeapObservable};
 use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
-use crate::reachable::ReachableObject;
-use crate::space::{FromSet, HeapSpace};
+use crate::reachable::{ReachableObject, Scratch};
+use crate::space::HeapSpace;
 use crate::stats::GcStats;
 /// Which collection a [`Collector`] ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,12 @@ pub struct Collector {
     /// [`HeapSpace`] never moves or resizes, so a replacement is the only event that can change
     /// the mature extent — and each one installs a *different* space at a different address.
     mature_generation: u64,
+    /// The reused walk state of every read-only whole-heap walk this collector runs: the
+    /// visited bitmap, the worklist and the from-set range vector. A collection walks (for the
+    /// promotion count, and for the off-heap liveness enumeration) every round, so owning the
+    /// state once keeps those walks allocation-free; reuse is sound only because every walk
+    /// clears that state before it admits anything ([`Scratch`]).
+    scratch: Scratch,
 }
 
 impl Collector {
@@ -95,6 +101,7 @@ impl Collector {
             minor_since_major: 0,
             stats: GcStats::default(),
             mature_generation: 0,
+            scratch: Scratch::new(),
         })
     }
 
@@ -182,12 +189,14 @@ impl Collector {
     /// [`GcStats::words_copied`] an evacuation of the same from-set and roots reports exactly;
     /// it is therefore both the escalation test's input ([`collect`](Self::collect)) and the
     /// minor's own room requirement ([`collect_minor`](Self::collect_minor)).
-    fn young_promotion_words(&self, roots: &[Eterm]) -> usize {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from);
-        crate::live::live(&from, roots).words
+    ///
+    /// The walk reuses the collector's [`Scratch`], whose from-set it installs from the whole
+    /// nursery chain, so repeated collections allocate no walk state.
+    fn young_promotion_words(&mut self, roots: &[Eterm]) -> usize {
+        let nursery = &self.nursery;
+        self.scratch.begin(|from| nursery.add_to_from_set(from));
+        crate::live::live_with(&mut self.scratch, roots).words
     }
-
     /// Whether the mature space can receive the nursery's promotion — the C's
     /// `mature_size <= OLD_HEND(p) - OLD_HTOP(p)` test (`erts/emulator/beam/erl_gc.c:1486-1488`;
     /// when it fails, `minor_collection` returns `-1` and `garbage_collect` runs a major,
@@ -213,10 +222,13 @@ impl Collector {
     /// set plus the young occupancy it clamps to the nursery capacity that collapse installs
     /// (`HeapPolicy::mature_after_fullsweep`), so the room a fullsweep leaves is always at
     /// least a live young set's worth — the collection after it is a minor.
-    fn minor_promotion_fits(&self, roots: &[Eterm]) -> bool {
-        self.mature.available_words() >= self.minor_room_words(roots)
+    ///
+    /// It takes the requirement (`need`) rather than computing it, so the kind choice and the
+    /// minor's own pre-copy refusal read **one** figure ([`minor_room_words`], computed once by
+    /// [`collect`](Self::collect)) instead of walking the live graph twice.
+    fn minor_promotion_fits(&self, need: usize) -> bool {
+        self.mature.available_words() >= need
     }
-
     /// The room a minor needs, in mature words — **the one decision input** of both the kind
     /// choice ([`minor_promotion_fits`](Self::minor_promotion_fits),
     /// [`collect`](Self::collect)) and the minor's own pre-copy refusal
@@ -237,7 +249,12 @@ impl Collector {
     ///
     /// The fill is consulted **first** as a cheap short-circuit: it is an upper bound on the live
     /// count, so when it already fits the answer is the same and the walk is skipped.
-    fn minor_room_words(&self, roots: &[Eterm]) -> usize {
+    ///
+    /// The result is computed **once** per collection and then *passed* into the minor
+    /// ([`collect_minor_with_need`](Self::collect_minor_with_need)), so `collect`'s kind choice
+    /// and the minor's pre-copy refusal cannot disagree: they compare the mature space's room
+    /// against the very same number, rather than each deriving one from its own walk.
+    fn minor_room_words(&mut self, roots: &[Eterm]) -> usize {
         let fill = self.nursery.used_words();
         if self.mature.available_words() >= fill {
             fill
@@ -255,21 +272,32 @@ impl Collector {
     /// promotion ([`minor_promotion_fits`] — the C `erl_gc.c:1486-1488` room test, whose failure
     /// sends the collection to `do_major_collection`, `erl_gc.c:1574-1577`, `:839-849`).
     /// Otherwise a minor runs.
+    ///
+    /// The room requirement ([`minor_room_words`]) is computed **exactly once** here and passed
+    /// into the minor ([`collect_minor_with_need`](Self::collect_minor_with_need)), so the kind
+    /// this method chooses and the minor's own pre-copy refusal provably cannot disagree — they
+    /// are two reads of one figure, not two independent walks. A fullsweep that is *due* is
+    /// taken first, so it walks nothing before it runs.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
-        let kind = if self.policy.fullsweep_due(self.minor_since_major)
-            || !self.minor_promotion_fits(roots)
-        {
-            CollectionKind::Major
-        } else {
+        if self.policy.fullsweep_due(self.minor_since_major) {
+            let stats = self.collect_major(roots)?;
+            return Ok(Collection {
+                kind: CollectionKind::Major,
+                stats,
+            });
+        }
+        let need = self.minor_room_words(roots);
+        let kind = if self.minor_promotion_fits(need) {
             CollectionKind::Minor
+        } else {
+            CollectionKind::Major
         };
         let stats = match kind {
-            CollectionKind::Minor => self.collect_minor(roots)?,
+            CollectionKind::Minor => self.collect_minor_with_need(roots, need)?,
             CollectionKind::Major => self.collect_major(roots)?,
         };
         Ok(Collection { kind, stats })
     }
-
     /// Runs a collection of **exactly** `kind` — the kind-pinned counterpart of
     /// [`collect`](Self::collect).
     ///
@@ -325,19 +353,39 @@ impl Collector {
     /// a promotion the live set fits into whenever the mutator had abandoned more words than the
     /// mature space has room for — permanently, because nothing ever buys room for a dead figure.
     ///
+    /// A **direct** caller derives the figure here; [`collect`](Self::collect) derives it once
+    /// for the kind choice and hands the very same number to
+    /// [`collect_minor_with_need`](Self::collect_minor_with_need), so the two paths cannot
+    /// disagree about whether the promotion fits.
+    ///
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space, sized from the **young
     /// live set** the round evacuated — its copy volume
     /// ([`HeapPolicy::young_after_collection`]).
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from);
         let need = self.minor_room_words(roots);
+        self.collect_minor_with_need(roots, need)
+    }
+
+    /// [`collect_minor`](Self::collect_minor) with the room requirement (`need`, the mature
+    /// words the promotion needs — the output of
+    /// [`minor_room_words`](Self::minor_room_words)) **supplied by the caller**.
+    ///
+    /// This is what lets [`collect`](Self::collect) compute the figure once and share it with
+    /// the refusal below: a `collect` that chose a minor has already established
+    /// `mature.available_words() >= need`, so its own minor cannot then be refused, and neither
+    /// path walks the live graph twice.
+    fn collect_minor_with_need(
+        &mut self,
+        roots: &mut [Eterm],
+        need: usize,
+    ) -> Result<GcStats> {
+        let nursery = &self.nursery;
+        self.scratch.begin(|from| nursery.add_to_from_set(from));
         if self.mature.available_words() < need {
             return Err(heap_exhausted(need));
         }
-        let stats = Copier::new(&from, &mut self.mature).run(roots)?;
-        // The room requirement is an upper bound on this copy by construction (the count and the
+        let stats = Copier::new(self.scratch.from(), &mut self.mature).run(roots)?;        // The room requirement is an upper bound on this copy by construction (the count and the
         // copy share their sizing and child-slot primitives); the equality pin lives in
         // `tests/minor_room_upper_bound.rs`.
         debug_assert!(
@@ -381,10 +429,11 @@ impl Collector {
     /// Every space of a chained nursery is evacuated, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse_after_fullsweep) back to one space.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from);
-        from.add(&self.mature);
-        // Size the fresh space from the **exact live word count** of the graph this
+        let (nursery, mature) = (&self.nursery, &self.mature);
+        self.scratch.begin(|from| {
+            nursery.add_to_from_set(from);
+            from.add(mature);
+        });        // Size the fresh space from the **exact live word count** of the graph this
         // fullsweep evacuates, plus the **young heap's occupancy** the C folds into the same
         // `need_after` — the C `adjust_after_fullsweep`'s
         // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`).
@@ -427,7 +476,7 @@ impl Collector {
         // term's purpose (a whole nursery's worth of promotion room, and therefore a *run* of
         // minors between fullsweeps) intact while making it independent of the allocation
         // history.
-        let live = crate::live::live(&from, roots).words;
+        let live = crate::live::live_with(&mut self.scratch, roots).words;
         let young_capacity_after = self
             .policy
             .young_after_fullsweep(self.nursery.capacity_words(), live);
@@ -448,7 +497,7 @@ impl Collector {
         if fresh.available_words() < live {
             return Err(heap_exhausted(live));
         }
-        let stats = Copier::new(&from, &mut fresh).run(roots)?;
+        let stats = Copier::new(self.scratch.from(), &mut fresh).run(roots)?;
         self.mature = fresh; // drops the old mature space
         self.mature_generation = self.mature_generation.saturating_add(1);
         self.minor_since_major = 0;
@@ -607,17 +656,19 @@ impl Collector {
     /// Returns the crate's typed [`Result`]; the walk can only fail through the shared
     /// reference-enumeration primitive, whose signature is fallible for its copier callers —
     /// this method's own callback is infallible.
+    ///
+    /// This takes `&self`, so it cannot borrow the collector's own reusable walk state: it
+    /// drives a one-shot [`Scratch`] owned by the call (the collection paths, which take
+    /// `&mut self`, reuse the filed one).
     pub fn for_each_reachable_object(
         &self,
         roots: &[Eterm],
         visit: impl FnMut(Eterm, *const Eterm),
     ) -> Result<()> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from); // every space of the chain
-        from.add(&self.mature); // the live region of the copying mature space
-        crate::reachable::for_each_reachable(&from, roots, visit)
+        let mut scratch = Scratch::new();
+        self.build_whole_heap_from_set(&mut scratch);
+        crate::reachable::for_each_reachable(&mut scratch, roots, visit)
     }
-
     /// The **safe** form of [`for_each_reachable_object`](Self::for_each_reachable_object):
     /// visits every **boxed object** reachable from `roots` across the **whole heap** (every
     /// space of the nursery chain plus the mature generation), each object **exactly once**,
@@ -636,10 +687,21 @@ impl Collector {
         roots: &[Eterm],
         visit: impl FnMut(ReachableObject<'_>),
     ) -> Result<()> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from); // every space of the chain
-        from.add(&self.mature); // the live region of the copying mature space
-        crate::reachable::for_each_reachable_view(&from, roots, visit)
+        let mut scratch = Scratch::new();
+        self.build_whole_heap_from_set(&mut scratch);
+        crate::reachable::for_each_reachable_view(&mut scratch, roots, visit)
+    }
+
+    /// Installs the **whole-heap** from-set — every space of the nursery chain plus the copying
+    /// mature space's live region — into `scratch`, the range set both
+    /// [`for_each_reachable_object`](Self::for_each_reachable_object) forms walk.
+    fn build_whole_heap_from_set(&self, scratch: &mut Scratch) {
+        let nursery = &self.nursery;
+        let mature = &self.mature;
+        scratch.begin(|from| {
+            nursery.add_to_from_set(from); // every space of the chain
+            from.add(mature); // the live region of the copying mature space
+        });
     }
 }
 
@@ -851,5 +913,115 @@ mod tests {
             .expect("the major makes room");
         assert_eq!(escalated.kind, CollectionKind::Major);
         assert_eq!(c.stats().major_collections, 1);
+    }
+
+    /// **The collector's walk scratch survives a collection boundary.**
+    ///
+    /// Two consecutive minors over **one** `Collector`, each with its **own** root set: the second
+    /// round's walk reuses the visited bitmap, the worklist and the range vector the first round
+    /// left dirty (a different from-set generation, and — because the collapse re-installs a space
+    /// of the same capacity — the very same addresses), and must still report exactly the live set
+    /// it evacuates. The first round's graph survives untouched in the mature space.
+    ///
+    /// The mature space is deliberately small (90 words) while each round's nursery fill is much
+    /// larger, so [`minor_room_words`](Collector::minor_room_words)'s fill short-circuit does
+    /// **not** apply and the live walk really runs in both rounds. A stale visited bit would make
+    /// the second walk under-count, and the `words_copied <= need` `debug_assert` in
+    /// [`collect_minor_with_need`](Collector::collect_minor_with_need) would fire before the
+    /// assertions below could.
+    #[test]
+    fn consecutive_minors_reuse_one_scratch_without_cross_contamination() {
+        /// A 5-word tuple `{1,2,3,4}` and a 4-word tuple `{5,6,7}`: one object each, distinct
+        /// sizes so a mis-attributed round is visible in `objects_copied` *and* `words_copied`.
+        fn build_a(c: &mut Collector) -> Eterm {
+            c.young_mut()
+                .heap_mut()
+                .tuple(&[make_small(1), make_small(2), make_small(3), make_small(4)])
+                .expect("a")
+        }
+        fn build_b(c: &mut Collector) -> Eterm {
+            c.young_mut()
+                .heap_mut()
+                .tuple(&[make_small(5), make_small(6), make_small(7)])
+                .expect("b")
+        }
+        /// Fills the current nursery with dead 2-word cons cells, so the round's fill exceeds the
+        /// mature space's room and the live walk (not the fill short-circuit) decides the room.
+        fn bury(c: &mut Collector, cells: usize) {
+            for i in 0..cells {
+                c.young_mut()
+                    .heap_mut()
+                    .cons(make_small(i as i64), beam_term::prelude::NIL)
+                    .expect("garbage cell");
+            }
+        }
+
+        let policy = HeapPolicy {
+            initial_young_words: 233,
+            initial_mature_words: 90,
+            ..HeapPolicy::default()
+        };
+
+        let mut c = Collector::new(policy.clone()).expect("collector");
+
+        // Round 1: `A` alone, buried in garbage.
+        let a = build_a(&mut c);
+        bury(&mut c, 90);
+        assert!(
+            c.young().used_words() > c.mature().available_words(),
+            "the fill must exceed the mature room, or the short-circuit would skip the walk"
+        );
+        let mut roots = [a];
+        let first = c.collect_minor(&mut roots).expect("the first minor");
+        assert_eq!(first.words_copied, 5, "round one evacuates A alone");
+        assert_eq!(first.objects_copied, 1);
+        let a = roots[0];
+        assert!(c.mature().contains_term(a), "A is promoted");
+        let a_header = {
+            // SAFETY: `a` is a live 5-word tuple in the mature space (asserted above).
+            unsafe { *boxed_val(a) }
+        };
+
+        // Round 2: `B` alone, over the same collector — the scratch is dirty from round one.
+        let b = build_b(&mut c);
+        bury(&mut c, 90);
+        let mut roots = [b];
+        let second = c.collect_minor(&mut roots).expect("the second minor");
+        assert_eq!(second.words_copied, 4, "round two evacuates B alone");
+        assert_eq!(second.objects_copied, 1);
+        assert_eq!(c.minor_gcs(), 2, "two minors ran");
+        assert_eq!(c.young().used_words(), 0, "the nursery is empty again");
+
+        // Round one's graph is untouched: a minor never rescans the mature generation.
+        assert!(c.mature().contains_term(a), "A survived round two");
+        assert_eq!(
+            // SAFETY: `a` is still the live 5-word tuple asserted above; the mature space has not
+            // been replaced (a minor never replaces it).
+            unsafe { *boxed_val(a) },
+            a_header,
+            "A's header word is byte-identical after the second collection"
+        );
+        // Both live sets are reachable from their (now mature) roots.
+        let both = [a, roots[0]];
+        let mut seen: Vec<usize> = Vec::new();
+        c.for_each_reachable_object(&both, |_header, ptr| seen.push(ptr as usize))
+            .expect("the whole-heap walk");
+        assert_eq!(seen.len(), 2, "exactly the two promoted tuples are reachable");
+        assert!(both.iter().all(|root| c.mature().contains_term(*root)));
+
+        // A **fresh** collector fed the same second-round heap and roots reports the same
+        // figures — the reused scratch is a pure allocation saving, never a behaviour change.
+        let mut fresh = Collector::new(policy).expect("collector");
+        let fresh_b = build_b(&mut fresh);
+        bury(&mut fresh, 90);
+        let mut fresh_roots = [fresh_b];
+        let reference = fresh
+            .collect_minor(&mut fresh_roots)
+            .expect("the reference minor");
+        assert_eq!(
+            (second.words_copied, second.objects_copied),
+            (reference.words_copied, reference.objects_copied),
+            "the reused scratch must report what a fresh one does"
+        );
     }
 }

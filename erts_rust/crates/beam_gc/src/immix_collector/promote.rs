@@ -70,29 +70,28 @@ use beam_term::prelude::{
 
 use crate::copy::{for_each_ref, move_size};
 use crate::immix::ImmixSpace;
-use crate::nursery::Nursery;
 use crate::space::FromSet;
 use crate::stats::GcStats;
 /// The from-space of a promotion: the copying nursery chain, plus — when a fullsweep is also
 /// **relocating** the mature generation into a differently-built region — the old mark-region
 /// mature space. A reference into neither is left verbatim.
+///
+/// The nursery half is a **borrowed** range set — the caller's own reusable walk scratch
+/// ([`crate::reachable::Scratch`]), built once per collection through
+/// [`Scratch::begin`](crate::reachable::Scratch::begin) — so a promotion neither allocates a
+/// range vector nor copies one.
 pub(super) struct PromoteFrom<'a> {
-    nursery: FromSet,
+    nursery: &'a FromSet,
     mature: Option<&'a ImmixSpace>,
 }
 
 impl<'a> PromoteFrom<'a> {
-    /// Collects the promotion's from-space: every space of `nursery`'s chain, plus `mature`
-    /// when this collection abandons that region too.
-    pub(super) fn new(nursery: &Nursery, mature: Option<&'a ImmixSpace>) -> PromoteFrom<'a> {
-        let mut nursery_from = FromSet::new();
-        nursery.add_to_from_set(&mut nursery_from);
-        PromoteFrom {
-            nursery: nursery_from,
-            mature,
-        }
+    /// Collects the promotion's from-space: every space of the nursery chain (`nursery`, the
+    /// caller's scratch-installed range set), plus `mature` when this collection abandons that
+    /// region too.
+    pub(super) fn new(nursery: &'a FromSet, mature: Option<&'a ImmixSpace>) -> PromoteFrom<'a> {
+        PromoteFrom { nursery, mature }
     }
-
     /// Whether `ptr` names an object a promotion must copy, i.e. one that lives in a space
     /// this collection is abandoning.
     fn contains(&self, ptr: *const Eterm) -> bool {

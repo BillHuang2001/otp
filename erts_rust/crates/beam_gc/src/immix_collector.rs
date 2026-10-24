@@ -109,8 +109,8 @@ use crate::heap_info::HeapObservable;
 use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
 use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
-use crate::reachable::ReachableObject;
-use crate::space::{FromSet, HeapSpace};
+use crate::reachable::{ReachableObject, Scratch};
+use crate::space::HeapSpace;
 use crate::stats::GcStats;
 
 mod promote;
@@ -199,6 +199,11 @@ pub struct GenImmixCollector {
     /// region never resizes or moves in place, so a relocation is the only event that can change
     /// its extent — an in-place reclaim keeps `base`/`capacity` and therefore the extent.
     mature_generation: u64,
+    /// The reused walk state of every from-set walk this collector runs: the promotions'
+    /// from-space and the whole-heap live count's. A collection builds one every round, so
+    /// owning it once keeps those walks allocation-free; reuse is sound only because every walk
+    /// clears that state before it admits anything ([`Scratch`]).
+    scratch: Scratch,
 }
 
 impl GenImmixCollector {
@@ -232,6 +237,7 @@ impl GenImmixCollector {
             stats: GcStats::default(),
             last_immix: None,
             mature_generation: 0,
+            scratch: Scratch::new(),
         })
     }
 
@@ -256,7 +262,8 @@ impl GenImmixCollector {
     }
 
     /// The nursery chain, crate-visibly — the collection and range-test half of the nursery
-    /// ([`crate::live`]'s tests size a fullsweep from it).
+    /// ([`crate::live`]'s tests and this module's own size a fullsweep from it).
+    #[cfg(test)]
     pub(crate) fn nursery(&self) -> &Nursery {
         &self.nursery
     }
@@ -543,16 +550,10 @@ impl GenImmixCollector {
         roots: &[Eterm],
         visit: impl FnMut(Eterm, *const Eterm),
     ) -> Result<()> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from); // every space of the chain
-        let base = self.mature.base() as usize;
-        from.add_range(
-            base,
-            base + self.mature.capacity_words() * core::mem::size_of::<Eterm>(),
-        );
-        crate::reachable::for_each_reachable(&from, roots, visit)
+        let mut scratch = Scratch::new();
+        self.build_whole_heap_from_set(&mut scratch);
+        crate::reachable::for_each_reachable(&mut scratch, roots, visit)
     }
-
     /// The **safe** form of [`for_each_reachable_object`](Self::for_each_reachable_object):
     /// visits every **boxed object** reachable from `roots` across the **whole heap** (every
     /// space of the nursery chain plus the mark-region mature generation), each object
@@ -570,16 +571,23 @@ impl GenImmixCollector {
         roots: &[Eterm],
         visit: impl FnMut(ReachableObject<'_>),
     ) -> Result<()> {
-        let mut from = FromSet::new();
-        self.nursery.add_to_from_set(&mut from); // every space of the chain
-        let base = self.mature.base() as usize;
-        from.add_range(
-            base,
-            base + self.mature.capacity_words() * core::mem::size_of::<Eterm>(),
-        );
-        crate::reachable::for_each_reachable_view(&from, roots, visit)
+        let mut scratch = Scratch::new();
+        self.build_whole_heap_from_set(&mut scratch);
+        crate::reachable::for_each_reachable_view(&mut scratch, roots, visit)
     }
 
+    /// Installs the **whole-heap** from-set — every space of the nursery chain plus the
+    /// mark-region mature space's `base .. base + capacity` span — into `scratch`, the range set
+    /// both [`for_each_reachable_object`](Self::for_each_reachable_object) forms walk.
+    fn build_whole_heap_from_set(&self, scratch: &mut Scratch) {
+        let nursery = &self.nursery;
+        let base = self.mature.base() as usize;
+        let end = base + self.mature.capacity_words() * core::mem::size_of::<Eterm>();
+        scratch.begin(|from| {
+            nursery.add_to_from_set(from); // every space of the chain
+            from.add_range(base, end);
+        });
+    }
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
     fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;
@@ -602,7 +610,9 @@ impl GenImmixCollector {
     /// is promoted out of, and the chain is then
     /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
     fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<PromoteOutcome> {
-        let from = PromoteFrom::new(&self.nursery, None);
+        let nursery = &self.nursery;
+        self.scratch.begin(|from| nursery.add_to_from_set(from));
+        let from = PromoteFrom::new(self.scratch.from(), None);
         let PromoteOutcome::Done(mut stats) = promote(&from, &mut self.mature, roots)? else {
             return Ok(PromoteOutcome::WouldNotFit);
         };
@@ -665,7 +675,7 @@ impl GenImmixCollector {
         // size, which the next fullsweep measures again: a capacity feedback. See the identical
         // clamp, and its derivation, in [`crate::Collector::collect_major`] and the regression
         // gate `tests/mature_capacity_feedback.rs`.
-        let live = crate::live::live_full(self.nursery(), &self.mature, roots);
+        let live = crate::live::live_full_with(&mut self.scratch, &self.nursery, &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let young_capacity_after = self
             .policy
@@ -705,11 +715,10 @@ impl GenImmixCollector {
         // reclaim's work is intact and the nursery is un-forwarded — so the same fallback
         // answers it.
         let used = self.nursery.used_words();
-        match promote(
-            &PromoteFrom::new(&self.nursery, None),
-            &mut self.mature,
-            roots,
-        )? {
+        let nursery = &self.nursery;
+        self.scratch.begin(|from| nursery.add_to_from_set(from));
+        let from = PromoteFrom::new(self.scratch.from(), None);
+        match promote(&from, &mut self.mature, roots)? {
             PromoteOutcome::Done(mut stats) => {
                 let nursery_garbage = used.saturating_sub(stats.words_copied);
                 // Total words reclaimed: the mature generation's in-place reclaim plus the
@@ -851,7 +860,9 @@ impl GenImmixCollector {
         // borrows (`root` via `from`, `fresh` via `to`) are disjoint, and the immutable
         // borrow of `self.mature` ends with the block below, before the field is replaced.
         let mut stats = {
-            let from = PromoteFrom::new(&self.nursery, Some(&self.mature));
+            let nursery = &self.nursery;
+            self.scratch.begin(|from| nursery.add_to_from_set(from));
+            let from = PromoteFrom::new(self.scratch.from(), Some(&self.mature));
             match promote(&from, &mut fresh, roots)? {
                 PromoteOutcome::Done(stats) => {
                     drop(from);
