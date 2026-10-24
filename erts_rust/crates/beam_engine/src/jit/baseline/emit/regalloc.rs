@@ -476,9 +476,9 @@ pub(crate) fn is_inlined(module: &Module, labels: &LabelMap, instr: &Instr) -> b
         Instr::SelectVal { value, fail, pairs } => {
             select_val_plan(labels, value, *fail, pairs).is_some()
         }
-        // The seven bitstring shapes the emitter lowers natively
-        // ([`super::bitstr_inline`]: the six match-context ones plus
-        // `bs_get_integer2`). Each is classified by the **same** shape predicate
+        // The eight bitstring shapes the emitter lowers natively
+        // ([`super::bitstr_inline`]: the six match-context ones, plus
+        // `bs_get_integer2` and `bs_match`). Each is classified by the **same** shape predicate
         // its `try_inline_*` entry consults — those predicates already refuse a
         // `NO_FAIL` fail code, an unresolvable fail label, an undecodable fail atom and
         // an un-addressable operand, i.e. exactly the emitter's own compile-time
@@ -690,7 +690,7 @@ pub(crate) fn cacheable_touches(
                 }
             }
         }
-        // The seven bitstring shapes are charged the x-registers their own
+        // The eight bitstring shapes are charged the x-registers their own
         // native lowering references — and only when their `*_shape` claims them (an
         // un-addressable operand keeps the whole instruction on the family arm, which
         // contributes no native touch). A `Y` operand is a stack slot, **not** an
@@ -839,7 +839,7 @@ pub(crate) fn cacheable_reads(module: &Module, labels: &LabelMap, instr: &Instr)
                 }
             }
         }
-        // The seven bitstring shapes read the x-registers their own native
+        // The eight bitstring shapes read the x-registers their own native
         // lowering loads (a match context, a subject, a saved position, a field's
         // source) and only when
         // their `*_shape` claims them.

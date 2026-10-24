@@ -598,10 +598,13 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             Instr::SetTupleElement { .. } => tuple_paths += 1,
             Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
             // Every bitstring-path instruction the tier inlines *in addition to* the
-            // per-instruction budget below: `bs_match` stays on the family helper (the
-            // per-instruction budget already covers it), while the six guarded
-            // match-context shapes, `bs_get_integer2` and the `bs_match` path reserve
-            // their own guarded sequence ([`BS_PATH_BYTES`]).
+            // per-instruction budget below: all eight shapes — the six guarded
+            // match-context ones, `bs_get_integer2` and `bs_match` — reserve their own
+            // guarded sequence ([`BS_PATH_BYTES`]), and `bs_match` additionally charges
+            // one [`BS_MATCH_COMMAND_BYTES`] per command, because its whole static
+            // command list is lowered inline. A shape the emitter's predicate declines
+            // emits zero bytes and falls through to `emit_bitstr`, so these budgets
+            // over-estimate for it — the safe direction for a capacity estimate.
             Instr::BsMatch { commands, .. } => {
                 bs_paths += 1;
                 bs_match_commands += commands.len();
