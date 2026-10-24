@@ -68,10 +68,15 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   materialise an integer term only to read that same value back — and forwards a runtime
   `size(Expr)` register, a literal-area term and every reject case to `read_size_slow`. Its
   reject case is the `#[cold] size_error`, shared by both halves. `decode_flags`'s shell answers
-  `Operand::Nil` (every flagless segment) with a plain zero and forwards a flag-atom list literal
-  to `decode_flags_slow`, which keeps the whole `flag_bit`/`native`-normalisation/`BSF_*` body
-  and the typed error unchanged. `is_all`/`flag_bit`/`small_value`/`sign_extend` and the hot
-  `BitWriter` methods carry `#[inline]`.
+  `Operand::Nil` with a plain zero and forwards a flag-atom list literal to `decode_flags_slow`,
+  which keeps the whole `flag_bit`/`native`-normalisation/`BSF_*` body and the typed error
+  unchanged. **A compiled `bs_match` `integer` command does NOT hit the shell**: the compiler emits
+  that command's flags as `{literal,[]}` — an `Operand::Literal` over the NIL literal (confirmed on
+  `tests/fixtures/{bitstrings,bsbig,bssmall}.beam` and on a fresh `erlc -S` of a binary
+  comprehension) — so every matched field takes the `#[inline(never)]` body plus a literal-area
+  read plus one `list_elements` call for an empty list. The `Nil` form (`a,0`) is what
+  `bs_create_bin`'s segment flags and `'=:='`'s carry. `is_all`/`flag_bit`/`small_value`/
+  `sign_extend` and the hot `BitWriter` methods carry `#[inline]`.
 - `raw.rs` → the family's **single** `#[allow(unsafe_code)]` module: `heap_bits` /
   `subject_bytes` (the subject triple), `ctx_parts`/`inner_orig`/`make_ctx`/
   `set_ctx_start` (the match context), `make_big`/`big_parts_safe` (bignums) and
