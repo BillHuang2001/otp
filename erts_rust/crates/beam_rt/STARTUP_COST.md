@@ -18,24 +18,38 @@ is far above the host's own spread.
 | point | retired instructions | wall p50 | ratio vs. the unmodified control |
 |---|---|---|---|
 | campaign start (the control) | 2 045 799 320 | ≈ 220 ms | 1.00 |
-| current | 1 776 M | ≈ 192.5 ms | 0.87 |
+| the atom-table fork's own control | 1 749.4 M | — | 0.855 |
+| current | 1 473.3 M | — | 0.720 |
 
 The control is the base commit **rebuilt from its own source**, never a stashed binary: a
 from-source rebuild of identical source is instruction-identical but 2–4 % apart in wall, so a
 kept binary cannot serve as a control.
-`−13.2 %` of the boot is what the changes below account for: their paired deltas sum to 13.5 % of the
-control, so they add up to the floor within the per-round spread, and the residual is dispatch, atom
-intern, the codec and the allocator (the profile below names each share).
+`−28.0 %` of the boot is what the changes below account for, and each of their deltas is a **paired**
+measurement against its own from-source rebuild — which is why the fork's control (1 749.4 M) is a
+row of its own and is not the campaign-start figure: the two are different rounds of the same tree
+lineage.
+The current rows quote no wall figure: the host's own spread on wall is 2–4 %, so retired
+instructions are the signal and a wall figure is only quoted where the effect is far above that
+spread (the campaign-start `≈ 220 ms` is the one such figure).
+What the floor still holds and no single change owns is the profile below: dispatch, atom intern,
+the codec and the allocator.
 
 ## The landed changes and their paired deltas
 
 | change | paired delta | instruction figures |
 |---|---|---|
+| the per-module atom-table **fork** adopted at the `CodeServer` callsite | **−15.78 %** | 1 749.4 M → 1 473.3 M (−276.1 M) |
 | the GC valve walk (four landings) | **−3.166 %** | 2 045.8 M → 1 981.0 M |
 | `CodeServer::add_system_paths` installed once per code server | **−2.40 %** | 47 588 853 instructions |
 | the process-exit teardown skipped on the binary's path | **−7.94 %** | ≈ 157 M / ≈ 25 ms |
 | `init:script_id/0` derived from the release | correctness, not cost | — |
 
+**The atom-table fork** is the largest single item the profile ever carried: `CodeServer::load_bytes`
+(`src/codeserver.rs:921`) hands `lower::build_module` `self.atoms.fork()` instead of a deep `Clone`,
+and `src/eval/mod.rs`'s `cook_supplied_trace` does the same, so a module load shares the `Arc<str>`
+name handles and preserves every index and the generation for a fresh `instance`.
+The paired measurement is the median of **6 alternating paired rounds**, `cpu_core/instructions/u`
+under `taskset -c 2`, noise band ±0.08 %; §(a) carries the mechanism and the callsite.
 **The GC valve walk's four landings** are, in order: the mature-first ordered scanned test with the
 single-nursery-space shortcut (`a36873b8f0`), the off-by-default invocation census plus the per-pid
 admissions/collections block (`f9e22744af`), the mutator block hoisted out into the walk's geometry
@@ -76,6 +90,8 @@ seals each module.
 
 ## `CodeServer::load_bytes` — the inclusive split (47.02 % of the run)
 
+Measured at the campaign-start tree, which is the tree that selected these items:
+
 | phase | inclusive |
 |---|---|
 | `lower::build_module` | 17.49 % |
@@ -83,13 +99,14 @@ seals each module.
 | `decode::decode_stream` | 9.00 % |
 | dropping the decoded `Vec<RawInstr>` | 4.04 % |
 
-The `AtomTable::clone` is the single largest removable item in the run: `build_module` takes a
-*cloned* atom table so it can append a literal-only atom without touching the shared one, and
-`Clone` is deliberately a **deep** copy, so every module load materializes one `Arc<str>` per atom
-in the table.
-`beam_term`'s `AtomTable::fork` — the handle-sharing whole-table copy, first ask below — is the
-answer; `src/codeserver.rs:919`'s one-word adoption of it is still outstanding, which is why the
-figure is still in this profile.
+The second row is no longer in the profile: `build_module` now takes a **fork** of the shared table
+(`src/codeserver.rs:921`) and appends a literal-only atom to that, so a module load shares the
+`Arc<str>` names instead of materializing one per atom — the fork's own paired measurement is
+**−276.1 M / −15.78 %** (§ the landed changes, §(a) below).
+`Clone` keeps its deliberate deep-copy meaning, which two sibling suites rely on as a positive
+control; the fork is the whole-table copy a load may take.
+What remains is the load's own shape: the lowering, the code decode and the `Vec<RawInstr>`
+teardown.
 
 ## Boot collection accounting — 384 collections per boot
 
@@ -119,7 +136,7 @@ oscillation**, not the live set asking to be collected.
 
 | `+hms` | collections | retired instructions | VmHWM |
 |---|---|---|---|
-| none | 427 | 1 980.5 M | 116.3 MB |
+| none (that round's control, taken before the floor landed) | 427 | 1 980.5 M | 116.3 MB |
 | 1000 | 91 | 1 714.8 M (−13.48 %) | — |
 | 3000 | 41 | 1 674.8 M (−15.44 %), cycles −8.8 % | — |
 | 8000 | 13 | 1 644.6 M (−16.96 %) | — |
@@ -150,9 +167,12 @@ independent appends, so neither snapshot may validate against the other).
 The fork's own evidence is `beam_term`'s unit suite plus `tests/atom_fork.rs` (public-API index and
 address identity, the clone sensitivity control, independent appends, the degenerate shapes) and the
 allocation pins in `tests/intern_alloc.rs`.
-**Value: −298 M instructions / −15.07 % of the boot**, priced at the profile row above.
-This crate's callsite is the one-word adoption, still to make: `src/codeserver.rs:919` hands
-`build_module` a `(*self.atoms).clone()`, so the figure is still in the current profile.
+**Value: −276.1 M instructions / −15.78 % of the boot**, measured as 1 749.4 M → 1 473.3 M.
+This crate's callsites adopt it: `CodeServer::load_bytes` (`src/codeserver.rs:921`) hands
+`lower::build_module` `self.atoms.fork()` and merges the fork's literal-only tail back in index
+order, and `src/eval/mod.rs`'s `cook_supplied_trace` takes the same fork, so neither path
+materializes a name string per atom.
+The figure is the median of six alternating paired rounds on the boot floor, noise band ±0.08 %.
 
 ### (b) `beam_gc`: a minor-shrink floor — landed
 

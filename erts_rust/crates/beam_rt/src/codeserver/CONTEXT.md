@@ -142,7 +142,7 @@ reader, so the guard is what makes those cheap.
   name), so removing them needs a `beam_term` API, i.e. a **sibling node's** surface. Not done
   here.
 - **The whole-table copy the load hands `lower::build_module` is `AtomTable::fork`**
-  (`codeserver.rs:919`): it shares the `Arc<str>` name handles and preserves every index and the
+  (`codeserver.rs:921`): it shares the `Arc<str>` name handles and preserves every index and the
   generation, so it costs two allocations (one `Vec` of handles, one index bucket array) and
   nothing per atom — it has no attributable share of its own in the census above. This is only a
   *copy* change: every index of the module's table names exactly what a deep clone named, because

@@ -196,8 +196,9 @@ may collect over those registers: `deliver_port_messages`, `fire_due_timers`, `d
 through `RuntimeContext::deliver_in_table` → `ProcessTable::deliver`
 (`../../beam_process/src/ptab.rs:858`) → `Process::deliver` (`../../beam_process/src/process.rs:1150`), gated by
 `Process::has_unpublished_roots()` (`relocation_exempt || state == Running`,
-`../../beam_process/src/process.rs:1439`) plus `RuntimeContext::delivery_collection_is_unsound`. A `Wait` park
-and a `Yield` park with a live FR prefix are exempt and publish nothing, so those sites refuse.
+`../../beam_process/src/process.rs:1439`) plus `RuntimeContext::delivery_collection_is_unsound`. An
+**exempt** park (a live FR prefix) publishes nothing, so those sites refuse; a dead-FR `Wait` park
+publishes its whole root set and is collectable like the `Yield` park above.
 Inside a slice the process is `Running`, so `slice_begin`'s `service_signals`
 (`../../beam_process/src/scheduler.rs:690`) and every in-slice delivery take the fragment route.
 **The machine is stale from the moment one of these doors collects** until the matching resume scatters
@@ -309,7 +310,7 @@ The `+29 MB` between those two `io_lib_fread` builds is **not** the pass: across
 ### What refuses the move — a parked machine's used extent, not a dictionary slot (measured)
 `store_move_hit` names `Family(ProcessDict, 1)` on the two-statement workload, and **that attribution is a measurement artifact**: `attribute_hit` reports the first corpus candidate whose descent records a range hit, while the `BEAM_RT_STORE_TRACE=1` diagnostic re-descends every slot and shows that the dictionary slot's own graph names **no** word inside a candidate range.
 What actually refuses is the walk meeting an unparseable word, reachable from exactly **two** corpus slots — `RootFamily::ParkedMachine[0]` and `[8]`, both holding the same word (`2` of `4 039` slots).
-`RunnerState::for_each_engine_census` names the holder's state: **31 engines, 31 in a park window** — `parked = Some(..)`, `parked_published = false`, `live_x = 12`, `stack = 9`, `fr = 0`, `roots = 21` — i.e. every idle blocked process (a `Wait` park publishes nothing and keeps the machine authoritative), and the words that refuse are `#Ref`-shaped residue at the **edge of the used extent** whose address a released region once occupied.
+`RunnerState::for_each_engine_census` names the holder's state: **31 engines, 31 in a park window** — `parked = Some(..)`, `parked_published = false`, `live_x = 12`, `stack = 9`, `fr = 0`, `roots = 21` — i.e. the idle blocked set, whose machines the corpus over-approximates and walks in full, and the words that refuse are `#Ref`-shaped residue at the **edge of the used extent** whose address a released region once occupied.
 Two consequences bound what the move can do on any route that hosts idle processes:
 - The corpus **over-approximates** a parked machine (the live `x` prefix, the whole Erlang stack, the FR prefix — **no frame liveness map**), so a dead word in that extent that coincides with a candidate range refuses the move for the whole pass. That is the Phase-2 blocker in its measured form, and it is not a missing writable slot: a parked machine's roots *are* in the corpus and *are* forwarded (`for_each_parked_machine_root_mut`), so the refusal is the honest answer to an extent the corpus cannot prove dead.
 - An "any engine is parked ⇒ decline the move" gate is **not** the fix and was reverted: every engine is parked at a statement boundary, so it made `store_compactions` structurally unreachable while buying no soundness the post-move verification does not already give. The verification is the gate, and its refusal outcome is `MoveOutcome::KeptBoth`.

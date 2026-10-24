@@ -61,13 +61,12 @@
 //!
 //! # The residual: a process that never runs again
 //!
-//! Only the **`Yield`** (pre-emption) arm calls this. The `Wait` arm deliberately does not: a
-//! `receive` park sets the process **relocation-exempt** and publishes nothing
-//! ([`crate::runner::run`]'s park), so the machine stays the authoritative root set and the roots
-//! this walk reads would be stale by construction — the first valve below declines it anyway. The
-//! consequence is a **leak, never a dangle**: a process that parks on `receive` and is never
-//! scheduled again keeps its reservoir until its machine drops with the process. A process that
-//! wakes up and yields again reclaims then.
+//! Only the **`Yield`** (pre-emption) arm calls this; the `Wait` arm does not, so a
+//! `receive`-parked process reaches no prune at all — a live-FR window publishes nothing (the
+//! machine stays the authoritative root set, which is gate 2 below), and a publishing window's
+//! roots would be readable but no caller asks. The consequence is a **leak, never a dangle**: a
+//! process that parks on `receive` and is never scheduled again keeps its reservoir until its
+//! machine drops with the process. A process that wakes up and pre-empts again reclaims then.
 //!
 //! # Why this is its own file
 //!
