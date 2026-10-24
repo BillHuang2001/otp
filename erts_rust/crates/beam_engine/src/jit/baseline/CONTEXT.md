@@ -143,7 +143,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 
 ## Key facts (summary — the authoritative per-shape record is `inlineset/CONTEXT.md`)
 - **Inline dispatch** is the per-instruction `match instr` in `emit_block`; every group it does not lower falls to the `_` arm's per-instruction deopt (`jit_step_one` = one `Machine::step_instruction_with_entry`), so a tier is interpreter-identical for every supported opcode. `FuncInfo` is deliberately never inlined (it is the failed-clause `function_clause` raise).
-- **The whole family-owned surface is one arm** (`emit/family.rs::emit_family` → `../family.rs::jit_family`), which runs the identical `crate::families::dispatch` call the interpreter's per-instruction step runs.
+- **The family-owned surface is one arm, except the bitstring family** — the rest is `emit/family.rs::emit_family` → `../family.rs::jit_family`, which runs the identical `crate::families::dispatch` call the interpreter's per-instruction step runs; the bitstring family routes through `bitstr.rs::jit_bitstr`, and `emit/bitstr_inline/` lowers eight of its shapes natively in-block (`inlineset/CONTEXT.md`).
 - **`CallExt*` executes natively but the cross-module transfer is a driver round-trip by design**; the frame-preserving local `Call`'s same-module callee is linked **in-block** through the shared `enter_in_block` resolver, as a tail transfer.
 - **The register cache is partial in both directions** (dirty-set `spill`, liveness `fill`, live-in prologue `entry_fill`); `emit/regs/CONTEXT.md` is its only owner.
 - **A `Y` slot is guarded at run time** by the published frame window; every Y operands' guard can only ever *reject* (branch to `jit_step_one`), never fabricate a result.
