@@ -105,7 +105,7 @@ Instrument: retired **user** instructions (`perf stat -x, -e instructions:u`, ma
 
 `list_walk`'s per-round `post/pre` ratios are **0.976676 / 0.976681 / 0.976684 / 0.976693 / 0.976695** — zero overlap between the legs (≈520 000 units apart, each leg's own spread ≤0.007 %), so the effect is ~330× the noise.
 `cowboy_bstr`'s are **0.997261 / 0.996398 / 0.996005 / 0.996766 / 0.996381**: sign-consistent with zero overlap but small, the entry-side saving diluted by the 1 098-instruction call body.
-Corpus-wide static split (the deterministic counter, whole installed-OTP corpus via `the_static_deopt_census_over_the_corpus_is_printed`: 1 358 modules / 103 066 functions): `blocks = 185 113` (`y_blocks`, every emitted range whose body touches a `Y` slot), `publish = 132 881` (`y_prologue_publishes`), **`elided = 52 232` — 28.2 % of `Y`-touching emitted ranges do not publish**; `y_invalidations = 544 248` (the in-block refresh gate is untouched).
+Corpus-wide static split (the deterministic counter, whole installed-OTP corpus via `the_static_deopt_census_over_the_corpus_is_printed`: 1 359 modules / 103 079 functions): `blocks = 185 141` (`y_blocks`, every emitted range whose body touches a `Y` slot), `publish = 132 908` (`y_prologue_publishes`), **`elided = 52 233` — 28.2 % of `Y`-touching emitted ranges do not publish**; `y_invalidations = 544 282` (the in-block refresh gate is untouched).
 Over the committed `erlc` fixtures the same split is **14** `Y`-touching blocks with **6** publishing prologues (**8** elided), `loads=4` / `stores=13` / `invalidations=19` (`../tests.rs::the_y_window_traffic_of_the_committed_fixtures_is_measured`).
 Both are deterministic structural counts, not measurements.
 

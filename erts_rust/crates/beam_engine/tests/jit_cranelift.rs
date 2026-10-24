@@ -1412,6 +1412,13 @@ fn arith_fixtures() -> Module {
 /// The shapes the tier must **not** inline — one per clause of the fast path's
 /// shape test: another BIF, a bignum constant, a float register, a static literal, a
 /// `Y` destination, a non-2 arity, and the right BIF name in the wrong module.
+///
+/// The "another BIF" shape is `erlang:intdiv/2`, the arity-2 `erlang` arithmetic BIF
+/// the fast path refuses **on semantics**: `intdiv` is floor division
+/// (`-7 intdiv 2 == -4`) where the emitted truncating `idiv` answers `-3`, so it can
+/// never be admitted. `erlang:div/2` and `erlang:rem/2` — the pair whose truncating
+/// semantics the `idiv` does match — are the baseline tier's **inlined** shapes
+/// (`src/jit/baseline/divrem_tests.rs`), so they cannot stand for a refused BIF here.
 fn non_inlinable_arith_module() -> Module {
     arith_module(
         "arith_helper",
@@ -1420,7 +1427,7 @@ fn non_inlinable_arith_module() -> Module {
                 "divide",
                 2,
                 "erlang",
-                "div",
+                "intdiv",
                 &[ArithSpec::X(0), ArithSpec::X(1)],
                 ArithSpec::X(0),
             ),
@@ -1895,7 +1902,8 @@ fn non_inlinable_gc_bif_shapes_stay_on_the_helper() {
         compiled.inlined_gc_bif_ops()
     );
 
-    // Another BIF: the floor raises `BadArg`, on every tier.
+    // Another BIF — `erlang:intdiv/2`, which the fast path refuses on semantics — so
+    // the floor raises `BadArg`, on every tier.
     let got = agree_arith(
         &backend,
         &compiled,
