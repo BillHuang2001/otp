@@ -285,7 +285,7 @@ fn already_inlined(module: &Module, instr: &Instr) -> bool {
 // ---------------------------------------------------------------------------
 // Bitstring inline refusals
 //
-// The tier natively lowers eight `Bs*` shapes (`emit/bitstr_inline.rs`); every other
+// The tier natively lowers eight `Bs*` shapes (`emit/bitstr_inline/`); every other
 // `Bs*` instruction goes to the family arm, and every one of the eight can still be
 // *refused* by its own shape predicate. This section attributes those refusals.
 //
