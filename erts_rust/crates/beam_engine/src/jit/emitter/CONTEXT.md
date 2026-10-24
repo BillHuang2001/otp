@@ -24,11 +24,12 @@ Files: `mod.rs` (buffer lifecycle, labels/fixups, raw byte emission, W^X), `enco
 ### Encoders (`encode.rs`, all `Result<()>`; every encoding `REX.W` unless noted)
 - move — `mov_rr` `:39`, `mov_ri` (movabs, 64-bit imm) `:46`, `mov_rm` (`[base+disp32]` load) `:53`, `mov_mr` (store) `:60`, `lea` `:67`.
 - arith/logic — `add_rr` `:84`, `sub_rr` `:89`, `cmp_rr` `:94`, `test_rr` `:99`, `and_rr` `:104`, `or_rr` `:109`, `xor_rr` `:114`, `imul_rr` `:127` (two-operand `0F AF /r`; sets OF/CF on 64-bit overflow — the `erlang:'*'/2` guard).
-- shifts — `sar_ri` `:137`, `shl_ri` `:142` (`C1 /n ib`, imm ≤ `u8::MAX` else `BadArg`).
+- divide — `cqo` `:141` (`REX.W 99`, sign-extend `rax` into `rdx:rax`) and `idiv_rr` `:158` (`F7 /7`, 64-bit signed divide: quotient in `rax`, remainder in `rdx`; a zero divisor or `i64::MIN / -1` traps `#DE`, so the caller must refuse both).
+- shifts — `sar_ri` `:167`, `shl_ri` `:172` (`C1 /n ib`, imm ≤ `u8::MAX` else `BadArg`); there is **no** `shr_ri` (logical right, `/5`).
 - stack — `push_r` `:164`, `pop_r` `:172`.
 - control flow — `jmp` (`rel32`) `:182`, `jcc` (`rel32`) `:188`, `call_label` (`rel32`) `:195`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:209`, `call_r` (indirect) `:218`, `ret` `:227`.
 - filler — `nop` `:234`, `int3` `:239`.
-Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, memory-operand arithmetic, indexed addressing, SSE/AVX, `syscall`.
+Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, **every `_ri` immediate arithmetic/logic form** (`add_ri`/`sub_ri`/`and_ri`/`or_ri`/`xor_ri`/`cmp_ri`/`test_ri` — synthesize as `mov_ri` into a scratch + the `_rr` form, 13 B for a 3 B op), `shr_ri`, `setcc` (a boolean in a register is `mov_ri 0` + `cmp`/`jcc` + `mov_ri 1`, or two labels), `movzx`/`movsx` (a sub-word load must be `mov_rm` + `and_rr` with a mask), `ud2`, `neg`/`not`, memory-operand arithmetic, indexed addressing (`[base + index*scale]` — no SIB index is ever emitted, so scale with `shl_ri` + `lea`/`add_rr`), SSE/AVX, `syscall`.
 
 ## W^X design (never RWX)
 `with_capacity` maps anonymous private `PROT_READ|PROT_WRITE` (`mod.rs:320-329`); `seal` flips the
