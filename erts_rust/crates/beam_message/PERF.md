@@ -25,10 +25,12 @@ threshold, a walk count or an allocation count**.
 unpinned run lands on either core type.
 Every release figure here is `taskset -c 3`.
 `/proc/loadavg` is recorded before and after every run; the host is *heavily* shared, so the load is part of the
-record, not noise to hide. Three sessions are quoted and must not be mixed:
+record, not noise to hide. Four sessions are quoted and must not be mixed:
 `m17` (the sibling bench record, `../tools/bench/RESULTS.md`; 1-min load 3.3–92.6) and **this pass**, which took
-(a) the structural traversals run at load **50.1**, (b) the both-runtimes bench pass at **103.4 → 96.0**, and
-(c) the old-vs-new runtime A/B at **83.7 → 37.6** and **67.6 → 39.7** (pinned, alternating order).
+(a) the structural traversals run at load **50.1**, (b) the both-runtimes bench pass at **103.4 → 96.0**,
+(c) the old-vs-new runtime A/B at **83.7 → 37.6** and **67.6 → 39.7** (pinned, alternating order), and
+(d) the warm-pricing-scratch pass — its structural table and preflight probe at **17.02 → 17.02**, its paired bench
+A/B at **2.09 → 8.14**.
 
 **Method.**
 
@@ -61,15 +63,15 @@ The payload is the exact `copy_bound` 5-key map (**70 words / 27 objects / 21 co
 outer tuple only: a literal-area subterm is shared by identity). Reproduction:
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message --test traversals -- --nocapture`.
 
-**The per-shape table** (this pass, `/proc/loadavg` 50.1 → 50.1, dev profile, identical across all 8 windows/row):
+**The per-shape table** (this pass, `/proc/loadavg` 17.02 → 17.02, dev profile, identical across all 8 windows/row):
 
 ```
 shape                       src_objs src_words   w_objs  w_words residency   blocks       bytes top-4 alloc sizes               ns_min
-literal {From,Lit} (fits)         28       73        1        3   on-heap        1         480 480-487B:1                         434
-heap twin {From,Map} (fits)       28       73       28       73   on-heap        3         672 64-71B:1 128-135B:1 480-487B:1       773
-heap twin, 1 word short           28       73        0        0   refused       10        1468 64-71B:2 128-135B:2 16-23B:1 48-55B:1      3047
-heap twin, full heap (frag)       28       73       28       73  fragment       13        2588 64-71B:2 128-135B:2 16-23B:1 32-39B:1     10310
-ets_copy 233-w nursery            28       73        0        0   refused       10        1468 64-71B:2 128-135B:2 16-23B:1 48-55B:1      2849
+literal {From,Lit} (fits)         28       73        1        3   on-heap        1         480 480-487B:1                         421
+heap twin {From,Map} (fits)       28       73       28       73   on-heap        3         672 64-71B:1 128-135B:1 480-487B:1       737
+heap twin, 1 word short           28       73        0        0   refused        2         192 64-71B:1 128-135B:1               1688
+heap twin, full heap (frag)       28       73       28       73  fragment        5        1312 32-39B:1 64-71B:1 128-135B:1 480-487B:1      4954
+ets_copy 233-w nursery            28       73        0        0   refused        2         192 64-71B:1 128-135B:1               1551
 ```
 
 **Reading:**
@@ -78,16 +80,33 @@ ets_copy 233-w nursery            28       73        0        0   refused       
   Their blocks are the copy's fix-up `Vec<Fixup>` ladder (64 B, 128 B) plus the enqueued message's queue buffer
   (480 B, once per mailbox); the literal row writes no child, so it has no fix-up allocation and pays the queue
   buffer alone.
-* **A refusal costs one abandoned optimistic trial plus one exact pricing walk**: **10 blocks / 1 468 B**.
-  The copy's own trial fix-up `Vec<Fixup>` is 2 blocks / 192 B — the same ladder a fit's copy half pays — and the
-  walk's own two ladders, a `Vec<Step>` stack and a SipHash `HashSet` path set, are the other **8 blocks / 1 276 B**.
-  The trial writes nothing (`used() == peak_used()`), the walk's count is exact, and the typed `Alloc(Message)`
-  refusal carries it — which is what lets a fragmenting caller size the fragment from that figure: the fragment row
-  is the same copy plus the fragment's own backing region (608 B = the 73-word payload plus the fragment header) and
-  the queue buffer (480 B), with nothing re-copied and no second sizing walk.
+  The per-row histograms the same run prints are `1 block / 480 B` (`480-487B:1`) for the literal row and
+  `3 / 672 B` (`64-71B:1 128-135B:1 480-487B:1`) for the heap twin.
+* **A refusal is 2 blocks / 192 B, all of it the copy's own trial fix-up `Vec<Fixup>`** — the same ladder a fit's
+  copy half pays (`64-71B:1 128-135B:1`).
+  The pricing walk runs on the calling thread's retained `SizingScratch` (`src/preflight.rs`) and **allocates
+  nothing when warm**, and it writes no term, so the abandoned trial still leaves `used() == peak_used()`.
+  The walk's count is exact and the typed `Alloc(Message)` refusal carries it.
+* **The fragment row adds exactly three allocations on top of that 192 B**: the fragment's `roots` vector
+  (32 B = 4 × `Eterm`), the fragment's backing region (608 B = the 73-word payload plus the fragment region's own
+  header), and the queue's first buffer (480 B) — 192 + 32 + 608 + 480 = **1 312 B**
+  (`32-39B:1 64-71B:1 128-135B:1 480-487B:1 608-615B:1`), with nothing re-copied and no second sizing walk.
 * Deterministic, not timing: every counter window is asserted **identical** across `REPEATS = 8` runs and the
   histogram is asserted to sum to the block count, so a stray concurrent allocation fails the run instead of
   inflating a published figure.
+
+**The pricing walk is allocation-free once the thread's scratch is warm** — `tests/traversals.rs`,
+`report_a_warm_preflight_allocates_nothing`, same run, `/proc/loadavg` 17.02:
+
+```
+cold (fresh scratch)     9 blocks   1452 B  64-71B:2 128-135B:2 48-55B:1 88-95B:1 160-167B:1 256-263B:1
+warm (retained)          2 blocks    192 B  64-71B:1 128-135B:1
+cold again (shrunk)      9 blocks   1452 B  (identical to the cold row)
+```
+
+The walk's own **7 blocks / 1 260 B** are gone once the thread's scratch is warm, and
+`beam_message::shrink_warm_scratch()` (then re-growing) reproduces the cold figure exactly — i.e. the win is the
+retained scratch, and a host that lets one thread's scratch grow pays 192 B per refusal rather than 1 452 B.
 
 **Traversals per send shape:**
 
@@ -97,11 +116,11 @@ ets_copy 233-w nursery            28       73        0        0   refused       
 | fits, destination off-heap table **non-empty** | 1 | **1** | the pricing walk sizes it, then the ordinary write loop runs (`tests/destination_pricing.rs` pins both routes). |
 | **refused** (destination too small) | 1 partial trial + 1 (the caller's retry, below) | **1** (exact price) | the optimistic trial is abandoned (nothing written: `used() == peak_used()`), **one** pricing walk yields the exact figure, the typed `Alloc(Message)` refusal carries it, and no word is copied. |
 | **refused, then fragmented** (`send_fragmented`) | the above **+ 1** copy into the fragment | **1** | the fragment is sized from the refusal's **own** figure (`AllocFailure::requested / size_of::<Eterm>()`), so nothing is re-copied and no second sizing walk runs; `fragment_capacity_words` is a floor, not the price. |
+| **refused, then fragmented through the refusal** (`send_fragmented_after_refusal`) | the trial copy + **1** copy into the fragment | **0** | a host that already holds the refusal passes `AllocFailure::requested` straight in, so there is no second trial and **no second pricing walk**; `fragment_capacity_words` is a floor. |
 
-A whole `beam_rt` delivery still attempts once in `Process::deliver` before `beam_message` is asked again, so a
-*refused delivery* is **2 copy attempts + 1 pricing walk** by contract — the runtime's pre-attempt, the copy, and
-the runtime's `grow_nursery` retry (or the fragment fallback). That first attempt is the residual owner's to remove
-(§10).
+A whole `beam_rt` delivery today still attempts once in `Process::deliver` and then calls `send_fragmented_message`,
+which re-runs `beam_message::send_fragmented` — one doomed trial plus a second pricing walk; adopting
+`send_fragmented_after_refusal` there makes a refused delivery 2 copy attempts + **1** pricing walk (§10).
 
 ## 3. Deterministic counters per message (the fits path)
 
@@ -203,13 +222,21 @@ mean across 4 runs of the same build at loadavg 8.1–16.7. Use these for their 
 | `send_recv` payload | 70 | 289.6–424.2 | 244–367 |
 
 **The sized path's pricing walk** (`tests/perf.rs`, `[single-pass]` = empty destination off-heap table vs
-`[sized]` = a non-empty one, which forces pricing-then-writing): the sized row costs more in every run but one, whose
-negative reading (−21 ns at loadavg 16.7) marks the measurement's floor.
-On `best_ns` the small tuple is 51–52 ns sized against 38–40 ns single-pass (+12–14 ns, ≈ +30 %); the flat map is
-77–119 ns sized against a 76 ns single-pass, so its share is at or below this host's noise in dev.
+`[sized]` = a non-empty one, which forces pricing-then-writing) — three runs per side this pass, dev profile,
+`/proc/loadavg` 5.96–6.61:
+on the **4-word tuple** the preflight's share is **17.8–20.2 ns** (69–79 % of the single-pass copy's
+25.6–26.0 ns), against **30.3–34.0 ns** (122–126 % of 24.6–27.1 ns) for a binary built before the retained scratch;
+sized 43.8–45.9 ns against single-pass 25.6–26.0 ns.
+The **flat map (8 keys)** reads 89.7–98.0 ns sized against 42.7–47.1 ns single-pass (share 47.0–51.1 ns), against
+117.3–131.9 ns against 46.2–49.6 ns (share 71.1–82.7 ns) for the pre-scratch binary.
 The share is **directional evidence, not a pinned percentage** — quote it only with its profile.
-The refusal path is priced deterministically instead (§2): **one** `beam_term` walk whose cost is that crate's
-`Vec<Step>` + `HashSet` (§10).
+The refusal path is priced deterministically instead (§2): **one** `beam_term` walk, allocation-free once the
+thread's scratch is warm.
+
+**Isolated instruction evidence:** `perf stat -e cpu_core/instructions/u` on the `perf` test binary alone (the
+preflight probe, `--exact`, release) retires **592 293 827 → 538 781 251 (−9.0 %)**; the `traversals` test binary is
+flat (7 811 176 → 7 799 220), i.e. the delta is the walk, not the harness.
+(`cpu_core/instructions/u` is the accepted spelling on this host — the colon form is rejected.)
 
 ## 6. This crate's share of `send_recv_plain`
 
@@ -226,7 +253,8 @@ Current record — this pass, `copy_bound`, both sides, the driver's paired esti
 The previous record (m17, 6 paired rounds/case, `../tools/bench/RESULTS.md` §3.3) read `etf_roundtrip` 2.21×,
 `ets_copy` 9.28×, `send_recv` 5.39×, `send_recv_plain` 3.16×. **The two sessions are not comparable in absolute terms**
 (m17's 1-min load band was 3.3–92.6, this pass's was 96–105, and the sys side alone moved 279.3 → 324.6 ns on
-`ets_copy`); every ratio above is paired within its own session, and §7.2 is this file's only binary-vs-binary A/B.
+`ets_copy`); every ratio above is paired within its own session, and §7.2/§7.3 are this file's only binary-vs-binary
+A/Bs.
 
 **The workload performs two payload sends per op, not one** — `send_recv_plain` sends `Worker ! {self(), T}` and the
 worker replies `From ! {self(), T}` — and each send is a 2-tuple (3 words) around the 70-word payload.
@@ -322,8 +350,51 @@ to add; until then `send_recv_plain` must not be quoted as either an improvement
 same case also reads 2 195.9 ns in m17 — i.e. it moves ±20 % across builds and sessions with no matching change in
 work, which makes it the least claim-worthy of the four rows.
 
-## 8. The fix-up worklist is a `Vec<Fixup>` — and that is the right call in release
+### 7.3 The warm-scratch A/B — `gc_class`, and `copy_bound` as the control workload
 
+Two release `beam_rt` binaries: the **control rebuilt from its own source at the base commit** in a detached
+worktree (never a stashed binary) and the new one from this tree. `--quick`, `taskset -c 3`, **6 alternating
+rounds** (`control,new` then `new,control`), `/proc/loadavg` 2.09–8.14.
+The paired figure is the **per-round ratio `control/new`**, quoted as its median beside min / max / spread, so a
+load ramp cancels inside each pair:
+
+| workload / case | control ns/op (median of 6) | new ns/op (median of 6) | paired median | min / max / spread | sys ns/op | control×sys → new×sys |
+|---|---|---|---|---|---|---|
+| `gc_class` / `send_recv` | 25 529.47 | 22 109.36 | **1.1706** | 1.0188 / 1.3282 / 0.3094 | 3 160.35 | 8.08× → **7.00×** |
+| `gc_class` / `ets_copy` | 12 484.73 | 11 976.33 | 1.0379 | 0.8709 / 1.1753 / 0.3044 | 1 684.79 | 7.41× → 7.11× |
+| `gc_class` / `compile` | 278 691 184 | 287 214 735 | 0.9671 | 0.8658 / 1.1774 / 0.3116 | 16 121 754 | 17.29× → 17.82× |
+| `copy_bound` / `send_recv` | 5 674.27 | 5 468.38 | 1.0395 | 1.0283 / 1.0993 / 0.0710 | 1 506.41 | 3.77× → 3.63× |
+| `copy_bound` / `send_recv_plain` | 2 563.76 | 2 567.66 | 0.9985 | 0.9887 / 1.0105 / 0.0217 | 673.60 | 3.81× → 3.81× |
+| `copy_bound` / `etf_roundtrip` | 1 246.47 | 1 283.27 | 0.9734 | 0.9457 / 1.0162 / 0.0705 | 659.28 | 1.89× → 1.95× |
+| `copy_bound` / `ets_copy` | 1 545.73 | 1 573.35 | 0.9937 | 0.9740 / 1.0735 / 0.0995 | 221.74 | 6.97× → 7.10× |
+
+`gc_class/send_recv` **wall_ms p50 848.59 → 749.88 (1.1316)**, startup **p50 208.35 → 197.02 (1.0575)**, peak RSS
+**254.22 → 254.25 MB**.
+Every deterministic companion counter is identical between and within sides (`gc_class`: `send_recv` 25 000 ops,
+`ets_copy` 40 000, `compile` 2; `copy_bound`: 90 000 / 300 000 / 500 000 / 250 000).
+
+**Caveats — read them before quoting any row.**
+
+* **Noise floor.** A same-binary null A/B (the control binary on both sides) reads paired median **0.9995**
+  (`copy_bound/send_recv`, spread 0.1054), **1.0097** (`send_recv_plain`, 0.1737), **1.0122** (`etf_roundtrip`,
+  0.0977) — but it was taken while the host's 1-min load ramped **4.47 → 64.37** (absolute ns/op rose 20–25 %
+  through it), so it is an **upper bound** on the noise floor, not a clean one.
+  Quote the `gc_class/send_recv` 1.17 alongside its own spread (0.31), whose worst round (round 6, 1.0188)
+  inverted while load rose 6.81 → 8.14.
+* `gc_class/send_recv` is the only case whose paired median **and** per-side median agree above the noise.
+  `compile` (0.9671) and `copy_bound/etf_roundtrip` (0.9734) sit inside a spread as wide as their own effect and
+  must not be quoted as a regression — `compile` runs 8 000 000 instructions per op (3 orders of magnitude above any
+  copy) and `etf_roundtrip` is `beam_codec`'s.
+  `copy_bound/send_recv` (1.0395) and `send_recv_plain` (0.9985) move through a 70-word **literal** payload whose
+  copies are 3 words and never preflight, so they are control-level readings, not the change.
+* **Build-layout confound.** The two binaries differ by **12 664 bytes** and embed different build-tree paths, so
+  code placement and inlining differ; that is why only ≥ 5 % effects are claimed.
+* **Absolute discrepancy.** This host reads `gc_class/send_recv` at 22–26 k ns/op against
+  `../tools/bench/RESULTS.md`'s ~51 k, and the resulting ratio here is 8.08×/7.00× against the recorded ~15.8×.
+  The session is not comparable in absolute terms: quote the paired ratio and the re-measured `sys` denominator,
+  and flag the gap rather than explaining it.
+
+## 8. The fix-up worklist is a `Vec<Fixup>` — and that is the right call in release
 The copy loop's per-call worklist is `Vec<Fixup>` (`src/copy.rs`), 16 B per entry, and §3 shows it is the **only**
 per-message allocation: 0 / 1 / 2 / 4 allocation events for the four shapes.
 
@@ -363,22 +434,27 @@ current measurement of the payload `send` (§4: ≈ 199 ns mean / 176 ns best) s
 
 ## 10. What remains (by owner)
 
-This crate's copy path is **one walk** on every shape it performs: no preflight for a fit, one exact pricing walk for a
-refusal, and the fragment sized from that same figure. Every remaining cost is somebody else's seam:
+This crate's copy path is **one walk** on every shape it performs: no preflight for a fit, one exact pricing walk for
+a refusal, with the refusal derived from that same walk, and the fragment sized from the same figure — a host that
+already holds the refusal takes `send_fragmented_after_refusal`, so the fragment path never re-walks.
+Every remaining cost is somebody else's seam:
 
-* **`beam_term` (`src/size.rs`) — the pricing walk's own allocations.** The walk is `sizing_walk` (`:386`) with a
-  `Vec<Step>` (`:389`) and a SipHash `HashSet<usize>` path set (`:388`); those two ladders are 8 of the 10 blocks a
-  refusal costs (§2) and they recur per walk. Two adoptable shapes, in `## Handoffs` of `CONTEXT.md`: a
-  **bounded-with** walk that latches "over limit" instead of returning early, so one walk yields both the exact price
-  and the fits/doesn't verdict (today a caller that wants *both* must pay `is_acyclic`'s two more hash tables); and a
-  bounded fixed-stack cycle check in place of the path set (the legacy C has no cycle check at all — it trusts acyclic
-  heaps).
-* **`beam_rt` (`src/context/calls.rs`, `src/runner/`) — the pre-attempt + `grow_nursery` retry.** A refused *delivery*
-  is 2 copy attempts + 1 pricing walk by contract (§2): the runtime attempts in `Process::deliver`, then retries. The
-  message-path analogue of the existing `copy_out_hint`/`hint_grow_gate` gate (`calls.rs:1313-1332`) is what would
-  stop the double attempt. That node's prose still describes a three-walk / five-traversal copy path (`calls.rs:1280`,
-  `:1316`, `:1389`, `context/runtime_context.rs:159`, `context/calls/tests.rs:190`, `:529`, `PERF_DISPATCH.md:252`,
-  `:279`, `:387`, `crates/beam_engine/src/bench/CONTEXT.md:242`, `:270`).
+* **`beam_term` (`src/size.rs`) — the shape of the walk itself.** The walk now runs on a caller-owned
+  `SizingScratch`, so **its own allocations are gone on the warm path** (§2's cold/warm pin). What remains in
+  `beam_term` is the shape of the walk: the bounded form still re-walks (`is_acyclic`'s two more hash tables) when a
+  caller wants an exact price **and** a work limit, and a bounded fixed-stack cycle check would replace the path set
+  entirely (the legacy C has no cycle check at all — it trusts acyclic heaps).
+  The adoptable shapes are in `## Handoffs` of `CONTEXT.md`.
+* **`beam_rt` (`src/context/send.rs`, `src/runner/`) — the pre-attempt + retry.** A refused *delivery* is still
+  2 copy attempts + 1 pricing walk: `src/context/send.rs::deliver_into_mailbox` attempts in `Process::deliver` and
+  then calls `send_fragmented_message` → `beam_message::send_fragmented` (one doomed trial + a second walk).
+  The callee-side route exists now: pass the refusal's own `AllocFailure::requested` to
+  **`beam_message::send_fragmented_after_refusal(from, message, mailbox, src_off_heap, 0, requested_bytes)`** — **0**
+  extra trials and **0** extra pricing walks. The message-path analogue of the existing
+  `copy_out_hint`/`hint_grow_gate` gate (`calls.rs:1313-1332`) is what would stop even the first attempt. That node's
+  prose still describes a three-walk / five-traversal copy path (`calls.rs:1280`, `:1316`, `:1389`,
+  `context/runtime_context.rs:159`, `context/calls/tests.rs:190`, `:529`, `PERF_DISPATCH.md:252`, `:279`, `:387`,
+  `crates/beam_engine/src/bench/CONTEXT.md:259`, `:298`).
 * **`beam_process` (`src/ptab.rs:284`) — control-signal fragments.** `HeapFragment::new(size_object(payload) + 8)`
   walks the graph once just to size the fragment; adopting this crate's refusal-derived exact price
   (`AllocFailure::requested / size_of::<Eterm>()`) removes that walk, exactly as `send_fragmented` already does.
