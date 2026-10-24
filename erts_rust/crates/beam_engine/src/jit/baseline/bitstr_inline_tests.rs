@@ -81,7 +81,7 @@ use crate::machine::RunOutcome;
 /// block decomposition is [`super::tests::assemble_function`]'s, i.e. the same one
 /// `tests::build_module` uses, so a hand-built module is cut into blocks exactly like a
 /// real `.beam`.
-fn bitstr_module(
+pub(crate) fn bitstr_module(
     name: &str,
     atoms: &[&str],
     arity: u32,
@@ -105,7 +105,7 @@ fn bitstr_module(
 }
 
 /// The atom `name` of `module` (interned by [`bitstr_module`]).
-fn atom(module: &Module, name: &str) -> Atom {
+pub(crate) fn atom(module: &Module, name: &str) -> Atom {
     module
         .atom_table
         .lookup(name)
@@ -113,7 +113,7 @@ fn atom(module: &Module, name: &str) -> Atom {
 }
 
 /// A `bs_match` `ensure_at_least` command group.
-fn ensure_at_least(module: &Module, size: i64, unit: i64) -> Vec<Operand> {
+pub(crate) fn ensure_at_least(module: &Module, size: i64, unit: i64) -> Vec<Operand> {
     vec![
         Operand::Atom(atom(module, "ensure_at_least")),
         Operand::Integer(size),
@@ -123,7 +123,7 @@ fn ensure_at_least(module: &Module, size: i64, unit: i64) -> Vec<Operand> {
 
 /// A `bs_match` `integer` command group: `{integer, Live, Flags, Size, Unit, Dst}` — the
 /// operand layout `families::bitstrings::prepared` reads (and `bs_match_shape` mirrors).
-fn integer_command(module: &Module, size: i64, unit: i64, dst: Operand) -> Vec<Operand> {
+pub(crate) fn integer_command(module: &Module, size: i64, unit: i64, dst: Operand) -> Vec<Operand> {
     vec![
         Operand::Atom(atom(module, "integer")),
         Operand::Integer(2),
@@ -136,7 +136,7 @@ fn integer_command(module: &Module, size: i64, unit: i64, dst: Operand) -> Vec<O
 
 /// `move -1 -> x(0); return` — a fail-label block whose answer is distinguishable from
 /// every real one, so "took the fail branch" is observable through the returned value.
-fn sentinel_block(label: Label) -> Vec<Instr> {
+pub(crate) fn sentinel_block(label: Label) -> Vec<Instr> {
     vec![
         Instr::Label(label),
         Instr::Move {
@@ -460,7 +460,7 @@ fn module_bs_match() -> Module {
 // ---------------------------------------------------------------------------
 /// Compile `module`'s function `index` with the counters on and **no** `CodeCache`
 /// involvement, so every inline arm re-emits (the counter the warm path cannot move).
-fn compile_cache_free(module: &Module, index: u32) -> counters::Counters {
+pub(crate) fn compile_cache_free(module: &Module, index: u32) -> counters::Counters {
     crate::jit::cache::clear_baseline_cache();
     counters::reset();
     counters::set_enabled(true);
@@ -490,7 +490,7 @@ pub(crate) fn emitted_shapes_for(
 }
 
 /// The shapes whose arm emitted during a **cache-free** compile of `module`'s `f`.
-fn emitted_shapes(module: &Module) -> (Vec<usize>, counters::Counters) {
+pub(crate) fn emitted_shapes(module: &Module) -> (Vec<usize>, counters::Counters) {
     emitted_shapes_for(module, 0)
 }
 
@@ -504,7 +504,7 @@ pub(crate) fn static_deopts(snapshot: &counters::Counters, variant: &str) -> u64
 /// The number of instruction instances the emitter visited for `variant` — the proof that
 /// `variant` is the name the census actually uses (so the `static_deopts == 0` assertions
 /// below cannot pass merely by naming a variant that never appears).
-fn visited_instances(snapshot: &counters::Counters, variant: &str) -> u64 {
+pub(crate) fn visited_instances(snapshot: &counters::Counters, variant: &str) -> u64 {
     snapshot.instr_instances.get(variant).copied().unwrap_or(0)
 }
 
