@@ -24,15 +24,17 @@
 //!
 //! [`emit_block`](super::block::emit_block) emits this sequence first, then the
 //! per-instruction body. The prologue saves the block's own frame registers, reserves
-//! the `rt` slot, loads the `machine.x` base, records the block's entry position (or
-//! publishes the frame's Y window) and loads the block's live-in cache registers.
+//! the `rt` slot, loads the `machine.x` base, **stores the block's entry position
+//! inline** (three instructions — no helper call; see [`emit_position_store`]) or
+//! publishes the frame's Y window, and loads the block's live-in cache registers.
 
 use beam_common::Result;
 
 use crate::jit::emitter::{CodeBuffer, Reg};
-
-use super::super::jit_set_position;
-use super::super::runtime::{jit_publish_y, PositionHelper, RUNTIME_XREGS_DISP};
+use crate::machine::pack_current_code;
+use super::super::runtime::{
+    jit_publish_y, PositionHelper, RUNTIME_CURRENT_CODE_DISP, RUNTIME_XREGS_DISP,
+};
 use super::operands::x_offset;
 #[cfg(test)]
 use super::FillSite;
@@ -64,16 +66,17 @@ pub(super) fn emit_block_prologue(
     buffer.lea(Reg::Rsp, Reg::Rsp, -frame_slot_len(frame.len()))?;
     buffer.mov_mr(Reg::Rsp, RUNTIME_SLOT_DISP, Reg::Rdi)?;
     // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
-    // Loaded **before** the position store below: `rbx` is callee-saved, so the helper
-    // call preserves it, and the cached x-registers are loaded only *after* the call,
-    // so nothing a block keeps live across the call sits in caller-saved scratch.
+    // Loaded **before** the position store below (which no longer calls out, but must
+    // still not read `rdi` after anything clobbers it): `rbx` is callee-saved and the
+    // cached x-registers are loaded only *after* the store, so nothing a block keeps
+    // live sits in caller-saved scratch.
     buffer.mov_rm(Reg::Rbx, Reg::Rdi, RUNTIME_XREGS_DISP)?;
     // Record this block's own `(func, pc)` as the machine's execution position, so
     // `Machine::current_code` (and the `process_info/2` position items built from it)
     // advances at block granularity even across a **linked** branch, which never
     // returns to the driver. A parked `receive` and a raise stay exact because both go
     // through the interpreted deopt (`jit_step_one`), which records the *instruction*
-    // address itself. See `jit_set_position`.
+    // address itself. See `emit_position_store`.
     //
     // A block that accesses a Y slot ([`Allocation::y_last`]) publishes the current
     // frame's Y window through `jit_publish_y` **instead**, which does the position
@@ -81,9 +84,10 @@ pub(super) fn emit_block_prologue(
     // accesses follows an in-block `allocate`/`allocate_heap`/`trim`, whose helper
     // re-published the window itself on its in-block continue arm
     // ([`Allocation::prologue_publishes_y`]): then the prologue's window is overwritten
-    // before anything reads it, and the block keeps the plain position store. A Y-free
-    // block always keeps the plain position store (it pays literally nothing). See
-    // `jit_publish_y` for why the prologue is the sound, cheapest publish point.
+    // before anything reads it, and the block keeps the plain (inline) position store.
+    // A Y-free block always keeps the plain position store (it pays nothing but the
+    // three instructions). See `jit_publish_y` for why the prologue is the sound,
+    // cheapest publish point.
     if allocation.prologue_publishes_y() {
         emit_publish_y(buffer, func, start as u32)?;
     } else {
@@ -107,20 +111,42 @@ pub(super) fn emit_block_prologue(
     Ok(())
 }
 
-/// Emit the prologue's position store: call `jit_set_position(rt, func, pc)` so the
-/// machine records this block's entry `(func, pc)` as its current execution position.
+/// Emit the prologue's position store **inline**: write this block's own
+/// `(func, pc)` — two compile-time constants — into `machine.current_code`.
 ///
-/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so
-/// this may be emitted anywhere after that slot is written. The helper clobbers only
-/// caller-saved registers, so a block must have loaded nothing it needs into them at
-/// the call; every cached x-register and `rbx` live in callee-saved registers, which
-/// the helper preserves ([`emit_block_prologue`] emits this before loading the cached
-/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`frame_slot_len`]). The helper returns nothing — a position store cannot
-/// fail — so `rax` is not consulted.
+/// The destination is the one `u64` word `Machine::set_current_code` writes, reached
+/// through the `rt` argument the block was entered with:
+///
+/// ```text
+/// mov r10, [rdi + RUNTIME_CURRENT_CODE_DISP]   ; r10 = &machine.current_code
+/// mov r11, movabs pack_current_code(func, pc)  ; the packed position word
+/// mov [r10], r11
+/// ```
+///
+/// Three instructions, no helper call: there is nothing for a helper to compute (both
+/// operands are known at compile time), so the call's `rt` slot load, two `movabs`
+/// argument loads, its own `movabs` of the helper address, the call and the helper's
+/// `rt`/`machine` derefs were all pure overhead. The packed word comes from
+/// [`crate::machine::pack_current_code`] — the single definition of the encoding
+/// (`CURRENT_CODE_NONE`/`unpack_current_code` are its other halves) — so the emitted
+/// store and every Rust-side store stay the same word by construction.
+///
+/// `r10`/`r11` are the caller-saved move scratch registers ([`super::MOVE_SCRATCH_2`]/
+/// [`super::MOVE_SCRATCH`]), never cache registers, and they are free here: a block's
+/// cache registers are loaded only *after* this point and no value survives into the
+/// next instruction. `rdi` still holds the block's `rt` argument (neither the frame
+/// push nor the `rt`-slot store above modifies it), so the load needs no stack slot.
+/// A position store cannot fail, so nothing is checked.
 fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
-    let helper: PositionHelper = jit_set_position;
-    emit_prologue_helper(buffer, func, pc, helper as *const ())
+    // Structural counter: one emitted (Y-free) block prologue position store. A
+    // **compile-time** count — the store is generated code now, so there is no helper
+    // call left runtime to record it; the count is the number of prologues that emit
+    // this sequence (the emission site is the only place that knows).
+    #[cfg(test)]
+    super::super::counters::record_set_position();
+    buffer.mov_rm(Reg::R10, Reg::Rdi, RUNTIME_CURRENT_CODE_DISP)?;
+    buffer.mov_ri(Reg::R11, pack_current_code(func, pc) as i64)?;
+    buffer.mov_mr(Reg::R10, 0, Reg::R11)
 }
 
 /// Emit the prologue's **Y-window publish**: call `jit_publish_y(rt, func, pc)`, which
@@ -129,18 +155,22 @@ fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()
 ///
 /// A block that must publish the window ([`Allocation::prologue_publishes_y`]: it
 /// accesses a Y slot, and not every one of those accesses follows a frame helper that
-/// re-published the window itself) emits this in place of [`emit_position_store`] — same
-/// three-argument call shape, so the block pays no extra call for publishing. The window
+/// re-published the window itself) emits this in place of [`emit_position_store`] — the
+/// one call does both halves, so publishing costs the block no extra call. The window
 /// must be live before the block's first Y access because the Erlang stack is a `Vec` a
 /// frame push may reallocate; see `jit_publish_y`.
+///
+/// This half stays a helper, unlike the position store: it must re-derive the window
+/// from **live** `Machine` state (`Machine::frames`/`Machine::stack`), which generated
+/// code cannot read.
 fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
     let helper: PositionHelper = jit_publish_y;
     emit_prologue_helper(buffer, func, pc, helper as *const ())
 }
 
-/// Emit the prologue's three-argument helper call — `helper(rt, func, pc)` — shared by
-/// [`emit_position_store`] and [`emit_publish_y`] (the two differ only in the helper's
-/// body).
+/// Emit the prologue's three-argument helper call — `helper(rt, func, pc)` — the shape
+/// [`emit_publish_y`] uses (the position-store half of that call's work is emitted
+/// inline by [`emit_position_store`]).
 ///
 /// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so this
 /// may be emitted anywhere after that slot is written. The helper clobbers only
@@ -148,7 +178,7 @@ fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
 /// the call; every cached x-register and `rbx` live in callee-saved registers, which
 /// the helper preserves ([`emit_block_prologue`] emits this before loading the cached
 /// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
-/// (see [`frame_slot_len`]). Neither helper returns a value, so `rax` is not consulted.
+/// (see [`frame_slot_len`]). The helper returns no value, so `rax` is not consulted.
 fn emit_prologue_helper(
     buffer: &mut CodeBuffer,
     func: u32,

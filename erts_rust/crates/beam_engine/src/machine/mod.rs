@@ -99,7 +99,7 @@ pub use self::run::RunOutcome;
 use crate::context::{ExecutionContext, RootSet};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
-pub(crate) use self::location::CURRENT_CODE_NONE;
+pub(crate) use self::location::{pack_current_code, CURRENT_CODE_NONE};
 
 mod catch;
 mod context;
@@ -758,7 +758,11 @@ pub struct Machine {
     /// the store three words wide. A function index and a code offset are both far
     /// below [`u32::MAX`], so the all-ones `func` cannot collide with a real position;
     /// the accessors [`Machine::current_code`]/[`Machine::set_current_code`] are the
-    /// only readers and writers.
+    /// only readers and writers — with one exception, the native baseline tier's block
+    /// prologue, which writes this word **directly** through the
+    /// [`JitRuntime::current_code`](crate::jit) pointer, encoding it with the very same
+    /// [`pack_current_code`](self::pack_current_code) (see
+    /// `jit/baseline/emit/prologue.rs::emit_position_store`).
     pub(crate) current_code: u64,
     /// The `(function index, arity)` this run was **entered** at — the engine's
     /// analogue of ERTS's `$initial_call`.

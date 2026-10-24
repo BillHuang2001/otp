@@ -31,13 +31,13 @@
 use super::emit::*;
 use super::runtime::{
     jit_deallocate, jit_deallocate_return, jit_publish_y, jit_refresh_y, jit_return, EXT_CALL,
-    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP, RUNTIME_YBASE_DISP,
-    RUNTIME_YEND_DISP,
+    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_CURRENT_CODE_DISP, RUNTIME_MACHINE_DISP,
+    RUNTIME_XREGS_DISP, RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP,
 };
 use super::*;
 use crate::jit::emitter::Reg;
 use crate::jit::Tier;
-use crate::machine::{Continuation, MAX_REGISTER};
+use crate::machine::{pack_current_code, Continuation, MAX_REGISTER};
 use crate::MinimalContext;
 use beam_loader::{
     Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, TestKind,
@@ -83,6 +83,9 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     let labels = LabelMap::new();
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
+    // The inline prologue position store's destination (see `emit_position_store`):
+    // taken before the `machine` borrow below, exactly as the driver does.
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
     let rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
@@ -100,6 +103,7 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -2359,8 +2363,9 @@ fn the_dirty_set_exit_spill_leaves_an_unwritten_cached_register_untouched() {
 
 /// A position recorded from a **natively executed block's own prologue**.
 ///
-/// Every compiled block opens by calling `jit_set_position(rt, func, pc)` with its
-/// own `(func, pc)`, so `Machine::current_code` advances at **block granularity**
+/// Every compiled block opens by storing its own `(func, pc)` into
+/// `machine.current_code` (`emit_position_store`, three generated instructions), so
+/// `Machine::current_code` advances at **block granularity**
 /// even when a linked branch carries control from one block to the next without ever
 /// returning to the driver. The observation uses a block whose execution ends through
 /// the linked tail call's **checked frame pop**: a `deallocate` that no longer matches
@@ -2446,6 +2451,74 @@ fn a_linked_chain_records_the_last_block_entry_as_the_position() {
     // The tier and the interpreter raise the identical error — only the recorded
     // position differs, exactly as the block-granularity contract intends.
     assert_eq!(error_reason(&baseline_err), error_reason(&interpreter_err));
+}
+
+/// The prologue's position store is **generated code**, not a helper call.
+///
+/// A compiled block used to open with `call jit_set_position(rt, func, pc)` — the `rt`
+/// slot load, two `movabs` argument loads, the `movabs` of the helper address, the call
+/// and the helper's own `rt`/`machine` derefs, all for a destination that is one `u64`
+/// written with two compile-time constants. The store is now emitted inline
+///
+/// ```text
+/// mov r10, [rdi + RUNTIME_CURRENT_CODE_DISP]   ; &machine.current_code
+/// mov r11, movabs pack_current_code(func, pc)  ; the packed position word
+/// mov [r10], r11
+/// ```
+///
+/// so this pins the exact bytes: the `JitRuntime` field offset the driver publishes, the
+/// packed word (the *same* [`pack_current_code`] `Machine::set_current_code` uses — a
+/// second encoder here would silently desynchronise every position/`process_info`
+/// item), and no call in between. The behavioural half — that the word a linked chain
+/// leaves behind really is the entry of the block it reached — is
+/// [`a_linked_chain_records_the_last_block_entry_as_the_position`].
+#[test]
+fn the_prologue_position_store_is_emitted_inline() {
+    let module = build_module(
+        "inline_position",
+        &[],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(7),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(1))],
+    );
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    let code = function_code_bytes(&function);
+    // The block starts at pc 0, so the stored word is `pack_current_code(0, 0)`.
+    let mut needle = vec![
+        // mov r10, [rdi + RUNTIME_CURRENT_CODE_DISP]  (REX.W|R, 0x8B, modrm, disp32)
+        0x4Cu8, 0x8B, 0x97,
+    ];
+    needle.extend_from_slice(&RUNTIME_CURRENT_CODE_DISP.to_le_bytes());
+    // movabs r11, pack_current_code(func, pc)
+    needle.extend_from_slice(&[0x49, 0xBB]);
+    needle.extend_from_slice(&(pack_current_code(0, 0) as i64).to_le_bytes());
+    // mov [r10 + 0], r11  (REX.W|R|B, 0x89, modrm, disp32)
+    needle.extend_from_slice(&[0x4D, 0x89, 0x9A, 0, 0, 0, 0]);
+    let at = code
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice());
+    let at = at.unwrap_or_else(|| {
+        panic!(
+            "the prologue must store its packed entry position inline through \
+             `JitRuntime::current_code` (no call); the emitted code was: {code:02X?}"
+        )
+    });
+    assert!(
+        at < 48,
+        "the store belongs to the block *prologue* (found at byte {at}); a later site \
+         would mean the prologue no longer records its own entry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,6 +2615,7 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
     assert_eq!(machine.x.len(), 1, "the register file covers only x0");
     let mut ctx = MinimalContext::new();
     let labels = LabelMap::new();
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
@@ -2559,6 +2633,7 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
     assert_eq!(
         enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
@@ -2941,6 +3016,7 @@ fn run_ext_call(
         .expect("the caller's zero-Y frame");
     let labels = crate::interpreter::build_label_map(caller);
     let x_regs = machine.x.as_mut_ptr();
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs,
@@ -2958,6 +3034,7 @@ fn run_ext_call(
         resume_entry: std::ptr::null(),
         tables: super::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
     // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
     let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
@@ -4255,16 +4332,23 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
 /// immediate — the `49 BB <imm64>` shape every helper call emits (the same probe
 /// `the_compiled_block_wires_the_ext_call_helper_into_native_code` uses).
 fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const ()) -> bool {
+    let code = function_code_bytes(function);
+    let mut needle = vec![0x49u8, 0xBB];
+    needle.extend_from_slice(&(helper as u64).to_le_bytes());
+    code.windows(needle.len())
+        .any(|window| window == needle.as_slice())
+}
+
+/// The sealed machine code of one compiled function, as bytes — the substrate every
+/// code-generation probe below searches (a helper's `movabs` immediate, the inline
+/// position store's encoding).
+fn function_code_bytes(function: &super::code::CompiledFunction) -> &[u8] {
     let start = function.buffer.code_ptr() as usize;
     let len = function.buffer.len();
     // SAFETY: `[start, start + len)` is the function's live, sealed executable mapping,
     // which `function` owns and keeps mapped for this borrow; reading it as bytes is
     // valid and does not execute it.
-    let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
-    let mut needle = vec![0x49u8, 0xBB];
-    needle.extend_from_slice(&(helper as u64).to_le_bytes());
-    code.windows(needle.len())
-        .any(|window| window == needle.as_slice())
+    unsafe { std::slice::from_raw_parts(start as *const u8, len) }
 }
 
 /// `Allocation::y_last` / `Allocation::refresh_y_after` gate both Y-window emissions,
@@ -4275,9 +4359,9 @@ fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const
 ///
 /// The code-generation probe searches the sealed machine code for each helper's
 /// `movabs r11, <helper>` immediate. The publish is a **substitution** for the plain
-/// position store `jit_set_position` — the two share the identical three-argument call
-/// shape, so their byte lengths are equal and a length comparison would not isolate the
-/// gate; the helper-address probe pins it exactly instead.
+/// position store — so a byte-length comparison would not isolate the gate (the publish
+/// is a long call shape and the store a 24-byte inline sequence); the helper-address probe
+/// pins it exactly instead.
 #[test]
 fn the_y_window_publication_is_gated_at_compile_time() {
     // Two `gc_bif`s in one block: the first's fallback (emitted on the **continue** arm)
@@ -5372,7 +5456,7 @@ fn print_probe_counters(label: &str, counters: &counters::Counters) {
         counters.driver_interp_steps,
     );
     println!(
-        "  prologue: jit_set_position={} jit_publish_y={} jit_refresh_y={}",
+        "  prologue: emitted_position_stores={} jit_publish_y={} jit_refresh_y={}",
         counters.set_position, counters.publish_y, counters.refresh_y
     );
     println!(

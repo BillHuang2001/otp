@@ -316,9 +316,11 @@ Every store is an instruction boundary, but **not** every store happens before t
   in the order `set_current_code(func, pc)` → the `Machine::reductions` bump → `ExecutionContext::reduce(1)`
   → `code.enter`, so a refusal parks at the block entry with the block unexecuted.
 - Native block prologue (`jit/baseline/emit/prologue.rs::emit_block_prologue`): the **block's entry** pc,
-  through `jit_set_position`, or — when `Allocation::prologue_publishes_y` holds — through
-  `jit_publish_y`, which makes the same store **and** re-publishes the frame's Y window in one call; so
-  mid-block the position is a block entry and a resume from it **re-executes the block prefix**.
+  stored **inline** (`emit_position_store`: `mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`;
+  `mov r11, movabs pack_current_code(func, pc)`; `mov [r10], r11` — three instructions, no helper call),
+  or — when `Allocation::prologue_publishes_y` holds — through `jit_publish_y`, which makes the same store
+  **and** re-publishes the frame's Y window in one call; so mid-block the position is a block entry and a
+  resume from it **re-executes the block prefix**.
 - Exact per-instruction helpers, each storing the instruction it is about to run: `jit_step_ext`,
   `jit_family` (shared with `jit_receive`, which is a thin wrapper) and `jit_test`, plus the frame/heap
   helpers `jit_deallocate`, `jit_return`, `jit_deallocate_return`, `jit_allocate`, `jit_allocate_heap`,

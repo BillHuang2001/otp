@@ -118,8 +118,8 @@ pub(crate) const CURRENT_CODE_NONE: u64 = u64::MAX;
 /// the all-ones `func` half is free to mean "no position", and the whole position
 /// becomes one word one store wide.
 #[inline]
-fn pack_current_code(func: u32, pc: u32) -> u64 {
-    ((func as u64) << 32) | u64::from(pc)
+pub(crate) const fn pack_current_code(func: u32, pc: u32) -> u64 {
+    ((func as u64) << 32) | pc as u64
 }
 
 /// The read half of [`pack_current_code`].

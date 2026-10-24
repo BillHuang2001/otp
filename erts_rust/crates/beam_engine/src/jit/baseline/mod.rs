@@ -246,7 +246,7 @@ pub use runtime::{
     decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, LOCAL_DECLINE,
     SUSPEND, WAIT_BIT,
 };pub(crate) use runtime::{
-    jit_ext_call, jit_local_call, jit_set_position, jit_step_one, JitRuntime,
+    jit_ext_call, jit_local_call, jit_step_one, JitRuntime,
 };
 
 use runtime::NativeBlock;
@@ -1119,6 +1119,13 @@ fn drive(
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
+    // The position word a block's prologue writes its own `(func, pc)` into, without a
+    // helper call (`emit/emit_position_store`). `Machine` is not `repr(C)`, so the field's
+    // address is taken here, where a real `&mut Machine` is in hand, and published in the
+    // runtime exactly like `x_regs`: `current_code` is a plain `u64` field, and the
+    // `Machine` itself never moves for the whole loop (the driver holds the only `&mut`),
+    // so the pointer stays valid until the loop returns.
+    let current_code: *mut u64 = std::ptr::addr_of_mut!(machine.current_code);
     let machine_ptr: *mut Machine = &mut *machine;
     let ctx_ptr = &mut *ctx as *mut dyn ExecutionContext;
     // The starting context: `0` for a fresh run; the context a suspended process
@@ -1167,6 +1174,7 @@ fn drive(
         resume_entry: std::ptr::null(),
         tables: runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
     // Publish the literal area the machine has bound (see `JitRuntime::refresh_literals`):
     // a `move` with an `Operand::Literal` source loads its word from this base at run

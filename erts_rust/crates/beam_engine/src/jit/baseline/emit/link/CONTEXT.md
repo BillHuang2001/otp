@@ -110,7 +110,7 @@ the −7-byte single-store saving the exit's `ExitSpill::Done` mode gives back (
 ### The dead prologue Y-window publish (measured)
 `emit/prologue.rs` emits `jit_publish_y` only when `Allocation::prologue_publishes_y` holds, so a block whose
 **every** `Y` access follows an in-block `allocate`/`allocate_heap`/`trim` (`emit/regalloc.rs`'s
-`y_first` vs `frame_republish_first`) emits the plain `jit_set_position` instead — the frame helper's own
+`y_first` vs `frame_republish_first`) emits the plain inline position store (`emit_position_store`) instead — the frame helper's own
 `JitRuntime::refresh_y_base` on its in-block continue arm makes the prologue's publish dead work (soundness:
 `## Spill/fill discipline` above; the full rule and its linear-control-flow argument in `../CONTEXT.md`).
 Two retired-user-instruction slopes, per-rep, two legs from the same tree with only this gate differing,

@@ -293,6 +293,17 @@ pub(crate) struct JitRuntime<'a> {
     ///
     /// [`CompiledModule::native_entry_tables`]: super::code::CompiledModule::native_entry_tables
     pub(crate) compiled: *const CompiledModule,
+    /// `&mut machine.current_code` — the position word a block's prologue stores its
+    /// own `(func, pc)` into **without a helper call**.
+    ///
+    /// The same rationale as [`Self::x_regs`]: `Machine` is not `repr(C)`, and the
+    /// field is a plain `u64` the driver never moves for the whole loop, so its
+    /// address is published once at [`JitRuntime`] construction and the emitted
+    /// prologue writes through it (`mov r11, movabs pack_current_code(func, pc)`;
+    /// `mov [r10], r11`). Read by generated code at [`RUNTIME_CURRENT_CODE_DISP`];
+    /// written **only** by generated code and by the driver (which still stores the
+    /// same field directly at its loop head — see `Machine::set_current_code`).
+    pub(crate) current_code: *mut u64,
 }
 
 /// The block-entry tables of one function, published to [`JitRuntime`] by the driver so a
@@ -564,11 +575,15 @@ pub(crate) type AllocateHeapHelper =
 /// instruction's own `(func, pc)`, the `ImportRef` index, the [`EXT_CALL`]-family
 /// kind and — for `call_ext_last` — the frame size to pop).
 pub(crate) type ExtCallHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> i64;
-/// The `jit_set_position` helper's native signature (the block ABI plus the block's
-/// own `(func, pc)`); it returns nothing — a position store cannot fail.
+/// The [`jit_publish_y`] helper's native signature (the block ABI plus the block's own
+/// `(func, pc)`); it returns nothing — a position store and a window re-derivation
+/// cannot fail.
 ///
-/// [`jit_publish_y`] shares it: the Y-window publish is the position store plus the
-/// window refresh, and is emitted through the same three-argument call sequence.
+/// The **only** user of this shape now: the plain position store is emitted inline
+/// (`mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`; `mov r11, movabs pack_current_code(..)`;
+/// `mov [r10], r11`), because both its operands are compile-time constants and a helper
+/// call was pure overhead. The Y publish stays a call because it must re-derive the
+/// window from live `Machine` state.
 pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32);
 
 /// The `jit_refresh_y` helper's native signature (the block ABI only); it returns
@@ -621,6 +636,20 @@ pub(crate) const RUNTIME_LITERALS_END_DISP: i32 =
 pub(crate) const RUNTIME_RESUME_DISP: i32 =
     mem::offset_of!(JitRuntime<'static>, resume_entry) as i32;
 
+/// The byte offset of [`JitRuntime::current_code`] — the address of
+/// `Machine::current_code`, the one word a block's prologue stores its own `(func, pc)`
+/// into.
+///
+/// The block prologue's position store used to be a call to a `jit_set_position` helper, which
+/// cost the `rt` slot load, two `movabs` argument loads, a `movabs` of the helper address
+/// and the call — for a destination that is one `u64` written with two compile-time
+/// constants. The emitted sequence now loads this field (`mov r10,[rdi+DISP]`), moves the
+/// packed word into a scratch register and stores it, so a block entry pays three
+/// instructions instead of a call. Computed with [`mem::offset_of!`] so the constant
+/// cannot drift from the field's real position (the field is **appended** so no earlier
+/// `RUNTIME_*_DISP` offset moves).
+pub(crate) const RUNTIME_CURRENT_CODE_DISP: i32 =
+    mem::offset_of!(JitRuntime<'static>, current_code) as i32;
 // ---------------------------------------------------------------------------
 // The helper
 // ---------------------------------------------------------------------------
@@ -1304,44 +1333,15 @@ fn decorate(
     }
 }
 
-/// The **position store** helper: record a compiled block's own `(func, pc)` as the
-/// machine's current execution position.
-///
-/// Every compiled block calls this from its **prologue**, so
-/// [`Machine::current_code`](crate::Machine::current_code) (and the derived
-/// `process_info/2` position items) reflect block-granularity position even across
-/// blocks reached by a *linked* branch — a linked jump/tail call never returns to the
-/// driver, so a store only in the driver's loop would miss exactly those. A parked
-/// `receive` and a raise stay exact because both go through the interpreter step
-/// ([`jit_step_one`] → [`Machine::step_instruction`](crate::Machine)), which records
-/// the *instruction* address itself.
-///
-/// This is [`Machine::set_current_code`](crate::Machine) — the accessor the setter
-/// exists for — reached through the block ABI. It is infallible and touches no
-/// register file, so it is safe to call with the block's cached x-registers live in
-/// the callee-saved registers; it clobbers only the caller-saved ones.
-pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
-    // Structural counter: one Y-free block prologue.
-    #[cfg(test)]
-    super::counters::record_set_position();
-    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
-    // `JitRuntime` and never aliases it for the duration of the call; `runtime.machine`
-    // points at the driver's live `Machine`, and no other `&mut Machine` exists while
-    // the helper runs (the driver is blocked in the block call that reached us).
-    let runtime = unsafe { &mut *rt };
-    // SAFETY: see above — `runtime.machine` is a non-null pointer to the driver's live
-    // `Machine`.
-    let machine = unsafe { &mut *runtime.machine };
-    machine.set_current_code(func, pc);
-}
-
 /// The **Y-window publish** helper: re-publish the current frame's Y window *and*
 /// record the block's entry position, in one call.
 ///
-/// It is [`jit_set_position`] plus [`JitRuntime::refresh_y_base`], and a block **whose
-/// body accesses a Y slot** calls it from its prologue *in place of* the position store
-/// — so such a block pays no extra call for publishing its window, and a block that
-/// never touches a Y slot keeps emitting the plain position store (it pays nothing).
+/// It is the prologue's position store ([`JitRuntime::current_code`], written inline by
+/// generated code — `emit::emit_position_store`) plus [`JitRuntime::refresh_y_base`], and
+/// a block **whose body accesses a Y slot** calls it from its prologue *in place of* the
+/// inline store — so such a block pays no extra call for publishing its window, and a
+/// block that never touches a Y slot keeps the three-instruction inline store (it pays
+/// nothing).
 ///
 /// The prologue is the cheapest sound publish point: **every** native entry runs one —
 /// a fresh driver entry, a linked branch, a linked tail call and a continuation
@@ -1353,7 +1353,7 @@ pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc
 /// ([`jit_refresh_y`]) gated to a block that still accesses a Y slot after that point.
 ///
 /// Infallible, and it clobbers only caller-saved registers, so it is emitted before the
-/// prologue loads the cached x-registers (exactly like [`jit_set_position`]).
+/// prologue loads the cached x-registers (the same reason the inline position store is).
 pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
     // Structural counter: one block prologue whose body accesses a `Y` slot.
     #[cfg(test)]

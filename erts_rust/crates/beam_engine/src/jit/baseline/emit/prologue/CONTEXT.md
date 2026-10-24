@@ -11,9 +11,11 @@ The cache itself (`Allocation`/`spill`/`fill`/`SpillSite`/`FillSite` and its mea
   (`native_frame_regs` — `rbx` plus the machine registers the block holds as cache slots),
   reserve the `frame_slot_len(k)`-byte `rt` slot (`8` when `k = 1 + slots.len()` is even,
   `16` when odd, so `rsp` stays 16-byte aligned at every helper call), `rbx = rt->x_regs`,
-  then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
-  position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
-  may sit in caller-saved scratch across the call) — or, when the block must publish the window
+  then store the block-entry position **inline** (`emit_position_store`:
+  `mov r10,[rdi+RUNTIME_CURRENT_CODE_DISP]`; `mov r11, movabs pack_current_code(func, block_start_pc)`;
+  `mov [r10], r11` — 24 B, three instructions, no helper call, emitted before the cached loads,
+  which is why nothing a block keeps live can sit in caller-saved scratch here) — or, when the block
+  must publish the window
   (`Allocation::prologue_publishes_y`: it accesses a Y slot and **not** every one of those accesses
   follows an in-block `allocate`/`allocate_heap`/`trim`, whose helper re-published the window itself),
   `jit_publish_y(rt, func, pc)`, which does that same position store **and** re-publishes the current

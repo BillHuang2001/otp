@@ -305,7 +305,7 @@ impl Allocation {
     }
     /// Whether the block's **prologue** must publish the current frame's Y window
     /// ([`super::super::runtime::jit_publish_y`]) instead of only recording the position
-    /// ([`super::super::jit_set_position`]).
+    /// ([`super::super::emit::prologue`]'s inline store).
     ///
     /// A block that accesses no Y slot publishes nothing. A block that does publishes
     /// **unless** every one of its Y accesses lies at or after an in-block helper that has
