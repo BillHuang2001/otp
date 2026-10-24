@@ -492,6 +492,21 @@ non-writable refc binary (so only an in-place result stays writable through the 
 payload's `as_bytes()` reports the whole reservation rather than the bytes written — a `beam_alloc`
 `set_len_written`/high-water-word API would close that.
 
+## No pre-decoded command/segment cache exists
+The flattened payload lists arrive from `beam_loader` as owned `Vec<Operand>` **inside the `Instr`**
+(`Instr::BsMatch { commands: Vec<Operand>, .. }`, `Instr::BsCreateBin { segments: Vec<Operand>, .. }`);
+the family re-walks the raw list on **every** execution — `matching/commands.rs::run_commands` takes
+`commands: &[Operand]`, and `create/mod.rs::assemble` steps `segments` six operands at a time
+(`[TypeAtom, Index, Unit, Flags, Value, Size]`, re-decoding the type atom through `Module::atom_name` and
+the flags through `decode_flags` per iteration). No decode of either list is memoized anywhere (engine or
+loader), and no per-list `.clone()`/`.to_vec()` exists at run time.
+A cache keyed on the list would be searching for: the buffers are **address-stable for the life of the
+owning `Module`** (lowered once into `Function::code`, never mutated after; the module is held as
+`Arc<Module>`), but `Instr`/`Operand` implement neither `Hash` nor `Eq`, so only a pointer/index is a legal
+key — and a value `Module::clone()` (bench/test harnesses only) deep-copies the buffers into new addresses.
+`matching/mod.rs` already spends its hot-path budget on a `bs_match` variant pre-test (`#[inline(never)]`
+`exec_other` keeps the 18-arm jump table off that path); anything added to `exec` is paid per iteration of
+a binary-comprehension loop.
 ## The typed bitstring / binary gaps, in full (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
 - **Bitstring gaps (each a typed result -- never a wrong value).** A refc-binary subject whose window is not byte-aligned **is** read: `raw::heap_bits` recovers `(base, size_bits, bit_off)` from the frozen `ErlSubBits` (`beam_term::bitstring_parts`), so the family reads the window's bits at whatever bit offset it starts (byte-aligned subjects start at offset 0 as before); the only subject it refuses is a match context or a bare off-heap binary reference (a typed `unsupported`). `bs_init_writable` builds a 0-bit refc binary over a capacity-carrying payload (`RefcBinary::with_capacity` behind a 4x `DEFAULT_RESERVATION_FACTOR` reservation, registered as writable **on the machine** — `Machine::writable_payloads`; the frozen term layout carries no capacity word), and a **first-position** `private_append` over such a payload appends **in place** -- the same term with `ErlSubBits.end` bumped, zero allocation (C's `erts_bs_private_append_checked` writable arm). Every other shape (plain `append`, a later position, `start != 0`, an on-heap/foreign/non-registered source) copy-rebuilds byte-identically. A build that outgrows the payload **grows it** (`InPlace::grow` -> `Machine::grow_writable_payload` -> `RefcBinary::ensure_capacity`: an in-place widen of the reservation, or a relocation whose two payload-naming words (`BinRef.val` and `ErlSubBits.base_flags` with its flag bits) are republished in place at each block's own live address — no adjacency assumed — and whose registry key follows), so the accumulator loop stays amortised rather than quadratic (64 KiB from a 1 KiB hint: 2 in-place grows + 4 moves, 61 440 bytes copied — `create/grow_tests.rs`); a payload `beam_alloc` will not relocate (shared, or past `max_capacity`), or one a second on-heap pair in this machine names, promotes to the copy-rebuild form losslessly. The `BIN_FLAG_*` flags, `binary:referenced_byte_size/1`'s capacity answer and the writable payload's `as_bytes()` high-water mark stay unmodelled (typed results only — a `beam_alloc` `set_len_written` API would close the last one); an `append`/`private_append` segment in **any** position still concatenates the source's bits at the point it appears. `system_limit` is modelled (`size*unit` overflow / the post-multiply sign bit / a positive-bignum size; a negative bignum is `badarg`); a `float` segment of width 0 or invalid raises `badarg` (`tests/bitstrings_create_fail.rs`).
