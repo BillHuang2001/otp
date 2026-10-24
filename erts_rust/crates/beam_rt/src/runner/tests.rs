@@ -2659,8 +2659,27 @@ fn machine_with_pending_reason(reason: Eterm) -> Machine {
     machine
 }
 
-/// Assert `relocated` is the two-element small-integer tuple `expected` **at a new address**: the
-/// term really moved (a copied term never keeps its from-space address) and the copy is intact.
+/// Registers `state`'s engine for `pid` and seats `machine` in it, with the engine's own
+/// host-held families marked **consumed**.
+///
+/// `publish_parked_roots` publishes an engine, not a bare machine: besides the machine's root set
+/// and its pending-exception reason it appends the engine's own families
+/// ([`ProcessEngine::append_parked_host_terms`]) — the first-run arguments, a fun entry's fun term
+/// and a resolved local fun's argument list. A process that has already run one slice has consumed
+/// all three (`ProcessEngine::args_consumed`), which is the shape every park arm in the runner
+/// opens, so that is the shape these publication tests need: the reason is then the only extra
+/// root, exactly as the assertions below require.
+fn seat_machine(state: &mut RunnerState, pid: ProcessId, machine: Machine) {
+    state.spawn_fun(pid, NIL, Vec::new());
+    let engine = state
+        .engines
+        .get_mut(&pid)
+        .expect("the engine is registered");
+    engine.machine = machine;
+    engine.args_consumed = true;
+}
+
+/// Assert `relocated` is the two-element small-integer tuple `expected` **at a new address**: the/// term really moved (a copied term never keeps its from-space address) and the copy is intact.
 fn assert_tuple_relocated(relocated: Eterm, stale: Eterm, expected: [i64; 2], what: &str) {
     assert_ne!(
         relocated, stale,
@@ -2697,6 +2716,7 @@ fn assert_tuple_relocated(relocated: Eterm, stale: Eterm, expected: [i64; 2], wh
 fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
     let mut rt = runtime();
     let mut table = table();
+    let mut state = RunnerState::default();
     let pid = table.spawn_default().expect("a fresh process");
 
     // The reason: a two-element tuple of small ints on the PROCESS's own young heap.
@@ -2708,10 +2728,16 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
             .expect("the young heap builds {7,8}")
     };
 
-    let mut machine = machine_with_pending_reason(reason);
+    seat_machine(&mut state, pid, machine_with_pending_reason(reason));
 
     // Publish the parked machine's roots: the reason rides the process's extra roots.
-    publish_parked_roots(&mut table, pid, &mut machine, 0);
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        publish_parked_roots(&mut table, pid, engine, 0);
+    }
     let extra = table.get(pid).expect("the process").registers().extra_roots();
     assert_eq!(
         extra.len(),
@@ -2760,11 +2786,20 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
 
     // Resume: the machine reads the relocated reason back, and the extra roots are consumed.
     {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
         let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
-        ctx.resync_parked_roots(pid, &mut machine, 0);
+        ctx.resync_parked_roots(pid, &mut engine.machine, 0);
     }
     assert_eq!(
-        machine.pending_exception(),
+        state
+            .engines
+            .get(&pid)
+            .expect("the engine is registered")
+            .machine
+            .pending_exception(),
         Some((ExceptionClass::Error, relocated)),
         "the resumed machine points at the RELOCATED reason, not the abandoned from-space word"
     );
@@ -2781,11 +2816,22 @@ fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
 #[test]
 fn publishing_a_machine_without_a_pending_exception_leaves_no_extra_root() {
     let mut table = table();
+    let mut state = RunnerState::default();
     let pid = table.spawn_default().expect("a fresh process");
-    let mut machine = Machine::new();
-    assert_eq!(machine.pending_exception(), None, "a fresh machine has no raise");
+    assert_eq!(
+        Machine::new().pending_exception(),
+        None,
+        "a fresh machine has no raise"
+    );
+    seat_machine(&mut state, pid, Machine::new());
 
-    publish_parked_roots(&mut table, pid, &mut machine, 0);
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        publish_parked_roots(&mut table, pid, engine, 0);
+    }
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "a machine with no pending exception publishes no extra root"
@@ -2800,6 +2846,7 @@ fn publishing_a_machine_without_a_pending_exception_leaves_no_extra_root() {
 #[test]
 fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extra_root() {
     let mut table = table();
+    let mut state = RunnerState::default();
     let pid = table.spawn_default().expect("a fresh process");
     let reason = {
         let process = table.get_mut(pid).expect("the spawned process");
@@ -2808,9 +2855,15 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
             .tuple(&[make_small(7), make_small(8)])
             .expect("the young heap builds {7,8}")
     };
-    let mut machine = machine_with_pending_reason(reason);
+    seat_machine(&mut state, pid, machine_with_pending_reason(reason));
 
-    publish_parked_roots(&mut table, pid, &mut machine, 0);
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        publish_parked_roots(&mut table, pid, engine, 0);
+    }
     assert_eq!(
         table.get(pid).expect("the process").registers().extra_roots(),
         &[reason][..],
@@ -2818,29 +2871,43 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
     );
 
     // The raise is handled: the machine has no pending exception any more.
-    machine.reset();
-    assert_eq!(machine.pending_exception(), None, "the raise is gone after a reset");
-
-    publish_parked_roots(&mut table, pid, &mut machine, 0);
+    {
+        let engine = state
+            .engines
+            .get_mut(&pid)
+            .expect("the engine is registered");
+        engine.machine.reset();
+        assert_eq!(
+            engine.machine.pending_exception(),
+            None,
+            "the raise is gone after a reset"
+        );
+        publish_parked_roots(&mut table, pid, engine, 0);
+    }
     assert!(
         table.get(pid).expect("the process").registers().extra_roots().is_empty(),
         "the stale extra root is cleared, never left as a leftover/NIL placeholder"
     );
 }
 
-/// **The park arm keeps a waiting process relocation-exempt for its whole parked window.**
+/// **A `receive` park publishes, so a signal-driven delivery collects and grows the receiver's
+/// nursery instead of being refused.**
 ///
-/// A signal to a *waiting* receiver whose heap cannot hold the payload must not relocate it: the
-/// runner marks the pid relocation-exempt at the park arm (`set_state(Waiting)` +
-/// `set_relocation_exempt(true)`) and clears the mark when the process is resumed. This is
-/// **additional** to the installed host collection gate
-/// ([`crate::context::gc_walk::RuntimeCollectionGate`]), which declines only when an unscanned
-/// container is reachable from the receiver's GATHERED roots — here nothing foreign is reachable,
-/// so the gate answers `false` and the park window's exemption is the sole decider. Removing the
-/// park arm's `set_relocation_exempt(true)` lets the signal collect and grow the parked heap, and
-/// this case then fails on its first assertion.
+/// A `receive` park whose slice ended with a **dead** FR prefix publishes the machine's whole
+/// root set (the x file, the Erlang stack, the empty FR prefix and the engine's extra roots) into
+/// the process's [`Registers`](beam_process::Registers) and holds **no** relocation exemption, so
+/// [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots) is `false`
+/// for it and a signal — the `beam_process` signal builders are not gated by
+/// `Runtime::gc_process_enabled` — really collects and grows the parked heap.
+///
+/// That is the whole point of the publication, and this case pins both halves of it: the
+/// relocation happens (a nursery growth for a reason larger than the whole nursery), and the
+/// notification is **not** lost. The installed host collection gate is carried by the table
+/// exactly as production carries it, and it is asserted to answer `false` here — the receiver's
+/// gathered roots reach nothing foreign — so the delivery route below is decided by the park's
+/// own state alone, never by the gate.
 #[test]
-fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
+fn a_receive_park_publishes_so_a_signal_collects_the_receivers_nursery() {
     let mut rt = runtime();
     let mut state = RunnerState::default();
     let mut table = table();
@@ -2872,14 +2939,26 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
     };
     assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
     assert!(
-        table.is_relocation_exempt(pid).expect("the pid is live"),
-        "the park arm marks the parked process relocation-exempt"
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a `receive` park with a dead FR prefix published its root set, so it holds no exemption"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .parked_published,
+        "the park really published (the machine is resumable against the process's registers)"
     );
 
-    // The gate does NOT decline for this receiver: nothing foreign is reachable from its
-    // gathered roots, so the park window's exemption — not the gate — is the deciding mechanism.
+    // Non-vacuity of the route below: the delivery-driven collection is *permitted* for this
+    // receiver, and the installed gate is not what decides it.
     {
         let process = table.get(pid).expect("the process is live");
+        assert!(
+            !process.has_unpublished_roots(),
+            "a published `receive` park does not hand its roots over unpublished"
+        );
         let mut gate = crate::context::gc_walk::RuntimeCollectionGate::new();
         assert!(
             !<crate::context::gc_walk::RuntimeCollectionGate as beam_process::CollectionGate>::declines_relocation(
@@ -2887,12 +2966,12 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
                 process
             ),
             "no foreign container is reachable from the parked process's gathered roots, so the \
-             gate answers `false` — the exemption is what refuses the move"
+             gate answers `false` — the park's own publication is what lets the move happen"
         );
     }
 
-    // A reason LARGER than the receiver's WHOLE nursery: only a decline keeps the on-enqueue copy
-    // from collecting and growing the parked heap.
+    // A reason LARGER than the receiver's WHOLE nursery: the on-enqueue copy must collect and
+    // grow the parked heap, which is exactly what a published window permits.
     let capacity = table
         .get(pid)
         .expect("live")
@@ -2912,23 +2991,22 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
         .expect("the trapping receiver takes the signal");
 
     let r = table.get(pid).expect("the receiver survived");
-    assert_eq!(
-        r.collector().minor_gcs(),
-        minor_before,
-        "the park window's exemption declined the signal-driven relocation"
+    assert!(
+        r.collector().minor_gcs() > minor_before,
+        "the signal-driven delivery collected the parked receiver's heap (was {minor_before}, \
+         now {})",
+        r.collector().minor_gcs()
     );
-    assert_eq!(
+    assert_ne!(
         r.collector().young().base(),
         base_before,
-        "a declined signal must not move or grow the parked process's nursery"
+        "the reason exceeds the whole nursery, so the delivery had to grow it and the nursery \
+         really moved"
     );
     assert_eq!(r.mailbox().len(), 1, "the notification is NOT lost");
-    assert!(
-        r.is_relocation_exempt(),
-        "the process stays relocation-exempt for the whole parked window"
-    );
 
-    // The resume clears the exemption, so the process's own admission point collects again.
+    // The resume re-syncs the machine from the process's (relocated) registers and takes the
+    // delivered exit message.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -2942,7 +3020,7 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
     );
     assert!(
         !table.is_relocation_exempt(pid).expect("the pid is live"),
-        "the resume cleared the park window's exemption, so the process collects normally again"
+        "no window left an exemption behind: the process collects normally at every later slice"
     );
 }
 
@@ -2953,11 +3031,10 @@ fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
 /// that follows it. The runner bounds that to the machine's **live leading prefix**, read once
 /// per slice from `Machine::fr_mark()`. For a process whose FR is entirely `NIL` (the
 /// overwhelming majority: it never touched a float) `fr_mark() == 0`, so the park appends no FR
-/// word at all: the FR reaction contributes **nothing** — no FR word published, no exemption
-/// *of its own*, no pin. (The parked process *is* relocation-exempt, but from the `Wait` arm's
-/// **parked-window** protection, which is set unconditionally for every parked process and has
-/// nothing to do with the FR prefix — the FR-specific signals are the zero `fr_published` and
-/// `gc_stats().pinned == 0` asserted below.)
+/// word at all: the FR reaction contributes **nothing** — no FR word in the published stack
+/// region, no exemption, no pin. The FR-specific signals are therefore the published stack length
+/// (exactly the machine's own stack, never that plus the 1024-slot file), the zero `fr_published`
+/// and `gc_stats().pinned == 0`.
 ///
 /// `recv_after.beam`'s `wait_forever/0` is `receive X -> X after infinity end` — no local
 /// variables, so its Erlang stack is shorter than the FR file — and it leaves no float register
@@ -3002,7 +3079,25 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
     assert!(
         machine_stack_len < beam_engine::machine::MAX_FLOAT_REGISTER as usize,
         "the fixture's `wait_forever/0` has no Y slots, so its stack is shorter than the FR file \
-         (got {machine_stack_len}); the equality below would otherwise be vacuous"
+         (got {machine_stack_len}); a `+ FR file` publication would be distinguishable below"
+    );
+    assert_eq!(
+        park_publish_counters().published,
+        1,
+        "a float-free `receive` park PUBLISHES — the hand-off is not skipped"
+    );
+    assert_eq!(
+        park_publish_counters().skipped,
+        0,
+        "and nothing skipped it"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .parked_published,
+        "the engine records that its roots really were handed over"
     );
     let published = table
         .get(pid)
@@ -3011,20 +3106,21 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
         .stack()
         .len();
     assert_eq!(
-        published, 0,
-        "a float-free `receive` park opens a **relocation-exempt** window, so it publishes \
-         nothing at all: the parked machine (whose own Erlang stack is {machine_stack_len} words) \
-         stays the authoritative root set"
+        published, machine_stack_len,
+        "the published stack region is exactly the machine's own Erlang stack \
+         ({machine_stack_len} words) — never that plus the 1024-slot FR file and never that plus \
+         the live prefix — so the `fr_mark` bound contributes no FR word at all"
     );
-    assert_eq!(
-        park_publish_counters().skipped,
-        1,
-        "the structural counter records the skipped publication"
-    );
-    assert_eq!(
-        park_publish_counters().published,
-        0,
-        "an exempt park publishes no machine root set"
+    assert!(
+        table
+            .get(pid)
+            .expect("the parked process")
+            .registers()
+            .x()
+            .live()
+            > 0,
+        "the publication really wrote the x file, so the equality above is a *bounded* \
+         publication rather than an absent one"
     );
     assert_eq!(
         state
@@ -3033,7 +3129,7 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
             .expect("the parked engine")
             .fr_published,
         0,
-        "the park still records a zero-length FR prefix on the engine"
+        "the park records a zero-length FR prefix on the engine"
     );
     assert_eq!(
         rt.gc_stats().pinned,
@@ -3041,31 +3137,30 @@ fn a_float_free_park_does_not_publish_the_fr_file() {
         "a process whose FR prefix is empty is not pinned"
     );
     assert!(
-        table.is_relocation_exempt(pid).expect("the pid is live"),
-        "the parked process is relocation-exempt — but from the `Wait` arm's **parked-window** \
-         protection, which is set unconditionally for every parked process, never from the FR \
-         reaction: a dead FR prefix contributes nothing of its own (the zero `fr_published` \
-         above and `gc_stats().pinned == 0` are the FR-specific signals)"
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a dead FR prefix opens no exemption: the window is collectable, so a delivery into this \
+         receiver copies straight into its nursery"
     );
 }
 
-/// **A park whose FR *is* live publishes exactly the live prefix (`fr_mark`) and opens the
-/// inter-slice window's relocation exemption — never a permanent pin.**
+/// **A park whose FR *is* live SKIPS the hand-off and holds the inter-slice window's relocation
+/// exemption — never a permanent pin.**
 ///
-/// The bounded-FR path must not weaken the live case: a process whose FR holds a term **and**
-/// whose live FR prefix must ride the process stack so a collection that does run — a
-/// `Yield`-window one, or a delivery-driven one — relocates it rather than leaving it on the
-/// abandoned from-space. The window is protected by the **relocation exemption** the post-slice
-/// `fr_mark` check opens (and the next slice's resume clears), not by a permanent runtime-level
-/// pin: a float-using process must still be collectable at its own heap-admission points.
+/// The live FR prefix is the one thing no publication can carry: the park publishes at most the
+/// live `fr_mark` prefix of the file, so a slot above it could be moved out from under the
+/// machine. A park that ends with a live prefix therefore skips the publication entirely and holds
+/// the process's **relocation exemption** for the window (the next slice's resume clears it), not
+/// a permanent runtime-level pin: a float-using process must still be collectable at its own
+/// heap-admission points.
 ///
 /// A parked machine is not reset on resume, so an FR slot written through the engine's own
 /// `Machine::set_fr` seam while the process is parked survives into the next slice and raises
 /// the mark: setting slot 0 stands in for a float computation that left a register set (the
 /// exact residue the post-slice `fr_mark` check exists to catch), and the *second* park then
-/// observes one live FR slot. This pins both halves of the design — the published FR length is
-/// the **one**-word live prefix, not the 1024-slot file, and `ProcessEngine::fr_published`
-/// records that same count for the resume — without needing compiled float code.
+/// observes one live FR slot. This pins the skipping branch and `ProcessEngine::fr_published`
+/// (which records the live prefix for the resume's bookkeeping) without needing compiled float
+/// code; the publication that *does* carry the live prefix is pinned by
+/// [`the_published_fr_prefix_round_trips_through_a_moving_collection`].
 #[test]
 fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
     let mut rt = runtime();
@@ -3087,7 +3182,7 @@ fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
         Vec::new(),
     );
 
-    // Slice 1: park with a dead FR — no FR word published, and the process is NOT pinned.
+    // Slice 1: a dead-FR `receive` park — the hand-off happens, and the process is NOT pinned.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -3099,7 +3194,7 @@ fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
 
     // Make FR slot 0 live while the machine is parked (a resume does not reset the machine).
     // `set_fr` is the seam the interpreter itself uses, so it raises the mark to 1 — the count
-    // the park below must publish and record.
+    // the park below records for the resume.
     state
         .engines
         .get_mut(&pid)
@@ -3110,7 +3205,7 @@ fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
 
     // Slice 2: resuming with an empty mailbox parks again — now with one live FR slot.
     // The structural counter is per-park, so it is zeroed before the measured slice (slice 1
-    // above is itself an exempt `Wait` park and would otherwise be counted too).
+    // above is a publishing `Wait` park and would otherwise be counted too).
     reset_park_publish_counters();
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
@@ -3368,7 +3463,7 @@ fn the_published_fr_prefix_round_trips_through_a_moving_collection() {
             !engine.parked_published,
             "the exempt park handed nothing over: the machine is still authoritative"
         );
-        publish_parked_roots(&mut table, pid, &mut engine.machine, 1);
+        publish_parked_roots(&mut table, pid, engine, 1);
         engine.parked_published = true;
     }
 
@@ -4013,11 +4108,17 @@ const PORT_SUSPEND_BEAM: &str = concat!(
 /// A park arm that passed `exempt = true` to the publication half without taking the exemption
 /// — the `Suspend` arm's shape before the entry point existed — left the parked machine (the
 /// only holder of the process's live `x`/stack once the slice is over) collectable with its
-/// roots unpublished. The three combinations below are the whole decision surface:
+/// roots unpublished. [`ParkExemption::LiveFloats`] is the whole decision surface, so the two
+/// combinations below are the whole set of branches:
 ///
 /// * `LiveFloats` with a **dead** FR prefix → publish, hold nothing;
-/// * `LiveFloats` with a **live** prefix → skip, hold the exemption;
-/// * `Always` → skip, hold the exemption.
+/// * `LiveFloats` with a **live** prefix → skip, hold the exemption.
+///
+/// Case (3) pins the *other* half of what a publication covers, on the shape a `receive` park
+/// (the overwhelmingly common delivery target) really has: a publishing window hands over the
+/// engine's host-held families as well as the machine's root files, so the `extra_roots` family
+/// is non-empty afterwards — and, being a publishing window, it holds no exemption, which is what
+/// makes a delivery into that receiver collect and grow its nursery.
 ///
 /// And a publishing park after an exempt one **clears** the flag: a stale `true` would make the
 /// very collections the publication exists for refuse the move.
@@ -4078,25 +4179,11 @@ fn park_window_holds_the_exemption_exactly_when_it_skips_the_publication() {
         }
     );
 
-    // (3) `Always` (the `receive` park): skips for a reason that has nothing to do with floats,
-    // and still holds the exemption.
-    assert!(
-        !park_window(&mut table, pid, engine, 0, ParkExemption::Always),
-        "the receive park always skips the publication"
-    );
-    assert!(
-        table.is_relocation_exempt(pid).expect("the pid is live"),
-        "the receive park's window is exempt for its whole duration"
-    );
-    assert_eq!(
-        park_publish_counters(),
-        ParkPublishCounters {
-            published: 1,
-            skipped: 2
-        }
-    );
-
-    // (4) Back to a publishing window from an exempt one: the flag is CLEARED, never inherited.
+    // (3) Back to a **dead** FR prefix from the exempt window: the flag is CLEARED, never
+    // inherited, and the publication covers more than the machine's root files — the engine's
+    // own host-held family (its first-run arguments, still live on a never-run engine) lands in
+    // the process's `extra_roots`. This is the `receive` park's shape, and holding no exemption
+    // is exactly what lets a delivery collect and grow that receiver's nursery.
     assert!(
         park_window(&mut table, pid, engine, 0, ParkExemption::LiveFloats),
         "a dead FR prefix publishes again"
@@ -4104,6 +4191,36 @@ fn park_window_holds_the_exemption_exactly_when_it_skips_the_publication() {
     assert!(
         !table.is_relocation_exempt(pid).expect("the pid is live"),
         "a publishing park clears the stale exemption, so its own collections are not refused"
+    );
+    assert_eq!(
+        table.get(pid).expect("the process").registers().extra_roots(),
+        &[make_small(PREEMPT_N)][..],
+        "the publication carries the engine's host-held families too: the never-run engine's \
+         first-run argument is the one extra root"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 2,
+            skipped: 1
+        }
+    );
+
+    // (4) A live FR prefix on that same engine skips again, and holds the exemption again.
+    assert!(
+        !park_window(&mut table, pid, engine, 1, ParkExemption::LiveFloats),
+        "a live FR prefix skips the publication whatever the previous window did"
+    );
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "a skipping park always holds the exemption — the invariant, in both directions"
+    );
+    assert_eq!(
+        park_publish_counters(),
+        ParkPublishCounters {
+            published: 2,
+            skipped: 2
+        }
     );
 }
 
@@ -4314,16 +4431,17 @@ fn a_served_gc_request_is_not_also_handed_to_the_boundary_door() {
 /// [`RunnerState::for_each_engine_census`](crate::runner::RunnerState::for_each_engine_census).
 /// Neither had a test, so this one pins all three claims they rest on:
 ///
-/// 1. an engine parked in a receive window (`parked = Some(..)`, `parked_published = false`)
-///    **is** handed over by the parked-machine door, and the words it hands over are exactly the
-///    ones the census reports for that pid;
+/// 1. an engine parked in a window that **skipped** the hand-off (`parked = Some(..)`,
+///    `parked_published = false` — a live FR-prefix park) **is** handed over by the
+///    parked-machine door, and the words it hands over are exactly the ones the census reports
+///    for that pid;
 /// 2. an engine that is **not** in a park window (`parked = None`, a process spawned and never run)
 ///    appears in the census as such — and contributes nothing to the door, whose three slices are
 ///    empty for it;
 /// 3. a window whose roots went to the process's own registers (`parked_published = true`, what a
-///    `Yield` park with a dead FR prefix does) is **skipped** by the door even though its machine
-///    still holds the same words: the published copy is the truth for that window, and handing the
-///    machine's copy over as well would be a second, stale root set.
+///    `receive` park with a dead FR prefix does) is **skipped** by the door even though its
+///    machine still holds the same words: the published copy is the truth for that window, and
+///    handing the machine's copy over as well would be a second, stale root set.
 ///
 /// Claim 2 is why the door's gate is *publication* rather than `parked.is_some()`: a never-run
 /// engine is unpublished with nothing to hand over, so it is a no-op rather than a skip. The
@@ -4361,8 +4479,9 @@ fn the_park_census_and_the_parked_machine_door_agree_with_the_park_state() {
         Vec::new(),
     );
 
-    // One slice parks the receive: `parked = Some(..)` and — the `receive` park is
-    // `ParkExemption::Always` — nothing was published, so the machine is the root set.
+    // One slice parks the receive: `parked = Some(..)` and — a `receive` park with a dead FR
+    // prefix — the machine's root set was published, so the process's registers are the truth
+    // for that window.
     let outcome = {
         let mut runner = RuntimeRunner::new(&mut rt, &mut state);
         runner
@@ -4370,6 +4489,14 @@ fn the_park_census_and_the_parked_machine_door_agree_with_the_park_state() {
             .expect("the slice runs")
     };
     assert_eq!(outcome, ProcOutcome::Wait, "the bare receive parks");
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .expect("the parked engine")
+            .parked_published,
+        "a `receive` park whose FR prefix is dead publishes its root set"
+    );
 
     // A live root word on the parked machine, so a visit is **observable**: a `{7,8}` tuple built
     // on the process's own young heap and published as FR slot 0 through the engine's `set_fr`
@@ -4389,6 +4516,17 @@ fn the_park_census_and_the_parked_machine_door_agree_with_the_park_state() {
             .expect("slot 0 is in the FR file");
         tuple
     };
+    // Re-park the same machine through the production entry point with that live FR prefix: the
+    // run's own post-slice reaction would do exactly this, and it is the **un-published** window
+    // shape the parked-machine door exists for (a live FR prefix is the one thing no publication
+    // can carry, so such a window skips the hand-off and holds the exemption instead).
+    {
+        let engine = state.engines.get_mut(&pid).expect("the parked engine");
+        assert!(
+            !park_window(&mut table, pid, engine, 1, ParkExemption::LiveFloats),
+            "a live FR prefix skips the publication"
+        );
+    }
 
     // ---- 1. the census reports the park state, per engine ------------------------------
     let mut parked_row = None;
@@ -4408,7 +4546,7 @@ fn the_park_census_and_the_parked_machine_door_agree_with_the_park_state() {
     );
     assert!(
         !published,
-        "an exempt (receive) park published nothing, so the machine is authoritative"
+        "a live-FR park skipped the hand-off, so the machine is authoritative for the window"
     );
     assert_eq!(fr_words, 1, "the live FR prefix the park would replay is one word");
     assert!(

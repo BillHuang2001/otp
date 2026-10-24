@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, RunOutcome as EngineRunOutcome};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 
 use crate::context::gc;
