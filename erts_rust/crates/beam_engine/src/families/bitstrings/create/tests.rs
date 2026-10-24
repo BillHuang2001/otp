@@ -28,8 +28,139 @@ use crate::context::MinimalContext;
 
 use super::segments::{f64_to_f16, put_float, put_utf16, put_utf32, put_utf8, string_source};
 use super::size::{float_nbits, raise_seg_fail, seg_nbits, segment_size, SegReason, SegSize};
+use super::wide_tests::{flags_etf, literal_module};
+use super::super::{decode_flags_slow_calls, BSF_NATIVE, BSF_SIGNED};
 
-// --- `string_source` (the `StrT` constant segment) ---------------------
+// --- `decode_flags` (the segment flags operand) ------------------------
+
+/// The typed reason atom of an engine diagnostic, for the exact-string pins below.
+fn reason_atom(error: BeamError) -> String {
+    match error {
+        BeamError::Raise(raise) => raise
+            .reason
+            .as_atom()
+            .expect("an engine diagnostic is a reason atom")
+            .to_string(),
+        other => panic!("expected an `unsupported` raise, got {other:?}"),
+    }
+}
+
+/// **`{literal,[]}` is answered by the inlined shell, exactly as `Nil` is.**
+///
+/// The OTP compiler spells a `bs_match` field's "no flags" as `{literal,[]}` — an
+/// `Operand::Literal` over the NIL literal (`{integer,4,{literal,[]},6,1,{x,4}}`,
+/// confirmed on `tests/fixtures/{bitstrings,bsbig,bssmall}.beam`) — while
+/// `bs_create_bin`'s segments and `'=:='` carry the `a,0`/`Operand::Nil` form. Both
+/// mean "no flags", so both are the shell's own arms: neither may enter the
+/// out-of-line `decode_flags_slow` body (a call, a literal-area read and a
+/// `list_elements` walk) merely to discover that.
+#[test]
+fn an_empty_list_literal_answers_no_flags_on_the_fast_path() {
+    let module = literal_module(&[flags_etf(&[])]);
+    let literal = Operand::Literal(0);
+    assert!(
+        module.literal(0).is_some_and(beam_term::is_nil),
+        "the fixture's literal 0 must be the empty list"
+    );
+
+    let before = decode_flags_slow_calls();
+    for _ in 0..8 {
+        assert_eq!(
+            decode_flags(&module, &literal).expect("no flags"),
+            0,
+            "`{{literal,[]}}` means no flags"
+        );
+    }
+    assert_eq!(
+        decode_flags_slow_calls(),
+        before,
+        "the empty-list literal must be answered by the shell, not the slow body"
+    );
+
+    // The `a,0` spelling of the same thing stays on the fast path too (and gives
+    // the same answer), so the two spellings are indistinguishable to a caller.
+    assert_eq!(decode_flags(&module, &Operand::Nil).expect("no flags"), 0);
+    assert_eq!(decode_flags_slow_calls(), before);
+}
+
+/// A **non-empty** flags literal keeps the slow body and the bits it already
+/// answered: `little`/`signed` contribute their own bit, `big`/`unsigned` are the
+/// defaults (zero) and `native` is the **target** order (`$NativeEndian`), i.e.
+/// `BSF_LITTLE` on this little-endian host and nothing on a big-endian one.
+#[test]
+fn a_non_empty_flags_literal_keeps_the_slow_path_and_its_bits() {
+    let native = if cfg!(target_endian = "little") {
+        BSF_LITTLE
+    } else {
+        0
+    };
+    let cases: &[(&[&str], u32)] = &[
+        (&["little"], BSF_LITTLE),
+        (&["signed"], BSF_SIGNED),
+        (&["big"], 0),
+        (&["unsigned"], 0),
+        (&["little", "signed"], BSF_LITTLE | BSF_SIGNED),
+        (&["native"], native),
+    ];
+    for (names, expected) in cases {
+        let module = literal_module(&[flags_etf(names)]);
+        let before = decode_flags_slow_calls();
+        assert_eq!(
+            decode_flags(&module, &Operand::Literal(0)).expect("a known flag list"),
+            *expected,
+            "{names:?}"
+        );
+        assert_eq!(
+            decode_flags_slow_calls(),
+            before + 1,
+            "{names:?}: a real flag list still reaches the slow body"
+        );
+        // `native` must never survive as a distinct `BSF_NATIVE` on this route.
+        assert_eq!(*expected & BSF_NATIVE, 0, "{names:?}");
+    }
+}
+
+/// A flags literal that is **not** a proper list of flag atoms keeps exactly the
+/// answer this route gave before the shell learned the empty-list arm — the shell's
+/// new guard only fires on the NIL literal.
+#[test]
+fn a_flags_literal_that_is_not_a_proper_list_keeps_its_answer() {
+    // A bare `SMALL_INTEGER_EXT` 5 …
+    let not_a_list = vec![131u8, 97, 5];
+    // … and an improper list: `flags_etf`'s trailing `NIL_EXT` replaced by a tail
+    // atom, i.e. `[little | big]`.
+    let mut improper = flags_etf(&["little"]);
+    assert_eq!(improper.pop(), Some(106), "`flags_etf` ends with NIL_EXT");
+    improper.extend_from_slice(&[100, 0, 3, b'b', b'i', b'g']); // ATOM_EXT "big"
+
+    for payload in [not_a_list, improper] {
+        let module = literal_module(&[payload]);
+        let err = decode_flags(&module, &Operand::Literal(0))
+            .expect_err("a non-list / improper-list flags literal is not readable");
+        assert!(
+            matches!(err, BeamError::BadArg),
+            "a non-proper-list flags literal stays `BadArg`, got {err:?}"
+        );
+    }
+
+    // An unknown flag atom inside an otherwise valid list is the family's own
+    // diagnostic.
+    let module = literal_module(&[flags_etf(&["sideways"])]);
+    assert_eq!(
+        reason_atom(
+            decode_flags(&module, &Operand::Literal(0)).expect_err("an unknown flag atom")
+        ),
+        "unsupported_opcode: bitstring: unknown segment flag"
+    );
+
+    // A literal index the module does not have is **not** swallowed by the shell's
+    // new arm: it still reaches the slow body's own out-of-range diagnostic.
+    let empty = literal_module(&[]);
+    assert_eq!(
+        reason_atom(decode_flags(&empty, &Operand::Literal(0)).expect_err("no literal 0")),
+        "unsupported_opcode: bitstring: flags literal index out of range"
+    );
+}// --- `string_source` (the `StrT` constant segment) ---------------------
 
 /// The fixture's `StrT` table (`bsstring.beam`, from
 /// `beam_lib:chunks(F, ["StrT"])`), used so the offsets are the oracle's.

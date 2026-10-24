@@ -22,7 +22,7 @@
 //! values are the system `erl` oracle's answers for the same bit patterns — plus
 //! [`empty_binary_bs_match_commands_and_the_writable_accumulator`], the
 //! instruction-level regression for the **empty-binary match** path itself.
-use super::super::BSF_LITTLE;
+use super::super::{decode_flags_slow_calls, BSF_LITTLE};
 use super::*;
 
 // The instruction-level regression drives whole instructions through the
@@ -36,7 +36,7 @@ use crate::interpreter::LabelMap;
 use crate::machine::Machine;
 use crate::terms::binary_bytes;
 use crate::Step;
-use beam_loader::{BsGetArgs, Instr, Label, Module, Operand, NO_FAIL};
+use beam_loader::{BsGetArgs, Instr, Label, LiteralArea, Module, Operand, NO_FAIL};
 
 // -- decode_utf8 (erts_bs_get_utf8) -------------------------------------
 #[test]
@@ -738,8 +738,113 @@ fn empty_binary_bs_match_commands_and_the_writable_accumulator() {
     );
 }
 
-// -- bs_match_string: the `StrT` offset guard ---------------------------
-/// The `fail` label every `bs_match_string` test below branches to (a live
+// -- the flags operand's two spellings ----------------------------------
+/// A `bs_match` field's flags reach [`decode_flags`](super::super::decode_flags) in
+/// **two** spellings that mean the same thing, and this is the end-to-end pin that
+/// they bind the identical field:
+///
+/// * `{literal,[]}` — an `Operand::Literal` over the module's NIL literal, which is
+///   what the OTP compiler emits for every matched field
+///   (`{integer,4,{literal,[]},6,1,{x,4}}`, `base64:encode_binary/4` above);
+/// * `nil`/`a,0` — the `Operand::Nil` form `bs_create_bin`'s segments carry.
+///
+/// Both are the always-inlined shell's own arms, so neither pays the out-of-line
+/// slow body (asserted through the family's test-only slow-entry tally) and both
+/// bind the subject's first byte and advance the context one byte.
+#[test]
+fn a_literal_empty_list_and_a_nil_flags_operand_bind_the_same_field() {
+    let mut observed = Vec::new();
+    for (spelling, flags) in [("nil", Operand::Nil), ("{literal,[]}", Operand::Literal(0))] {
+        let (mut machine, module, mut ctx) = flags_match_fixture();
+        // `{integer, Live, Flags, Size, Unit, Dst}` — one 8-bit field into `x(2)`.
+        let commands = vec![
+            Operand::Atom(
+                module
+                    .atom_table
+                    .lookup("integer")
+                    .expect("the fixture interns the command atom"),
+            ),
+            Operand::Integer(1), // Live
+            flags,
+            Operand::Integer(8), // Size
+            Operand::Integer(1), // Unit
+            Operand::X(2),       // Dst
+        ];
+        let before = decode_flags_slow_calls();
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &LabelMap::new(),
+            &Instr::BsMatch {
+                fail: NO_FAIL,
+                ctx: Operand::X(1),
+                commands,
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_match reports no raise")
+        .expect("the family claims bs_match");
+        assert_eq!(step, Step::Next, "{spelling}: the 8-bit field matches");
+        assert_eq!(
+            decode_flags_slow_calls(),
+            before,
+            "{spelling}: the flags decode must stay on the shell's fast path"
+        );
+
+        let value = machine.x(2).expect("the field value in x(2)");
+        assert_eq!(
+            value,
+            beam_term::make_small(0xAB),
+            "{spelling}: the field is the subject's first byte"
+        );
+        let (_, _, start, _) =
+            read_ctx(&machine, &mut ctx, &Operand::X(1), "test").expect("the context");
+        assert_eq!(start, 8, "{spelling}: the field advanced the context one byte");
+        observed.push((value, start));
+    }
+    assert_eq!(
+        observed[0], observed[1],
+        "the two flag spellings bind the identical field"
+    );
+}
+
+/// A 2-byte subject (`<<16#AB,16#CD>>`) in `x(0)` matched into `x(1)`, over a module
+/// whose literal 0 is the empty list (the `{literal,[]}` a compiled `bs_match`
+/// carries) and which names the `integer` command atom.
+fn flags_match_fixture() -> (Machine, Module, MinimalContext) {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let mut module = Module::default();
+    module.atom_table.intern("integer");
+    let area = LiteralArea::decode(&[vec![131u8, 106]], &mut module.atom_table)
+        .expect("the empty-list literal decodes");
+    module.literals = std::sync::Arc::new(area);
+    let subject =
+        raw::make_bits(&mut machine, &mut ctx, &[0xAB, 0xCD], 16).expect("a 2-byte subject");
+    machine.set_x(0, subject).expect("root the subject");
+    let step = family_exec(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        &Instr::BsStartMatch3 {
+            fail: NO_FAIL,
+            bin: Operand::X(0),
+            live: 1,
+            dst: Operand::X(1),
+        },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("bs_start_match3 reports no raise")
+    .expect("the family claims bs_start_match3");
+    assert_eq!(step, Step::Next);
+    (machine, module, ctx)
+}
+
+// -- bs_match_string: the `StrT` offset guard ---------------------------/// The `fail` label every `bs_match_string` test below branches to (a live
 /// label, so a plain match failure is distinguishable from the typed error).
 const FAIL: Label = Label(7);
 

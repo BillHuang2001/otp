@@ -350,28 +350,65 @@ pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
 
 /// Decode a segment *flags* operand into the `BSF_*` bits.
 ///
-/// The operand is `Nil` (no flags — `encode_arg` maps the empty list to `a,0`) or a
-/// `Literal` holding a flag-atom list (`little`/`signed`/`native`; `big`/`unsigned`
-/// are the defaults and contribute nothing). The comparison is by `make_atom` on
-/// this module's atom table, so it needs no index arithmetic.
+/// A flagless segment reaches here in **two** shapes, and both are the shell's own
+/// arms: `Nil` (the `a,0` form `encode_arg` maps the empty list to, which
+/// `bs_create_bin`'s segments and `'=:='` carry) and `Literal` whose literal area
+/// entry is the **empty list** — the `{literal,[]}` form the OTP compiler emits for
+/// every `bs_match` field's flags (`{integer,4,{literal,[]},6,1,{x,4}}`) and which a
+/// `bs_create_bin` segment can carry too. A `Literal` holding a flag-atom list
+/// (`little`/`signed`/`native`; `big`/`unsigned` are the defaults and contribute
+/// nothing) or any other term still goes to [`decode_flags_slow`] unchanged. The
+/// comparison is by `make_atom` on this module's atom table, so it needs no index
+/// arithmetic.
 ///
-/// The hot arm (`Nil`, every flagless segment the compiler emits) is kept in an
-/// `#[inline(always)]` shell whose only other work is a call to the out-of-line
-/// [`decode_flags_slow`], so the flags decode costs the caller one discriminant test
-/// instead of a call, a `Result` return through memory and a prologue.
+/// The hot arms are kept in an `#[inline(always)]` shell whose only other work is a
+/// call to the out-of-line [`decode_flags_slow`], so the flags decode costs the
+/// caller a discriminant test — plus, for the `{literal,[]}` form, one bounds-checked
+/// literal-area read and one `NIL` compare — instead of a call, a `Result` return
+/// through memory, a prologue and a `list_elements` walk over an empty list.
 #[inline(always)]
 pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
-    // The overwhelmingly common segment carries no flags (`encode_arg` maps the
-    // empty list to `a,0`), so the hot arm is a plain zero.
     match operand {
+        // `encode_arg` maps the empty list to `a,0`.
         Operand::Nil => Ok(0),
+        // `{literal,[]}`: the same "no flags", spelled as a literal-area index. An
+        // index the module does not have is **not** answered here — it falls through
+        // to the slow body's own out-of-range error, so this arm changes no answer.
+        Operand::Literal(index) if module.literal(*index).is_some_and(beam_term::is_nil) => Ok(0),
         other => decode_flags_slow(module, other),
     }
 }
 
-/// The non-`Nil` flags operands: a flag-atom list literal, or the typed error.
+// Test-only tally of [`decode_flags_slow`] entries.
+//
+// The always-inlined [`decode_flags`] shell answers a flagless segment without
+// entering the slow body, and the only way a test can observe *that* (rather than
+// the answer, which the two paths share) is to count entries. Thread-local because
+// this crate's unit tests run in parallel inside one process and each test asserts
+// on its **own** thread's delta. Compiled out entirely outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static DECODE_FLAGS_SLOW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one [`decode_flags_slow`] entry (test builds only).
+#[cfg(test)]
+fn note_decode_flags_slow_call() {
+    DECODE_FLAGS_SLOW_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// How many [`decode_flags_slow`] entries **this thread** has taken so far.
+#[cfg(test)]
+pub(super) fn decode_flags_slow_calls() -> usize {
+    DECODE_FLAGS_SLOW_CALLS.with(|calls| calls.get())
+}
+
+/// The flags operands the shell does **not** answer: a literal holding a flag-atom
+/// list, or the typed error.
 #[inline(never)]
 fn decode_flags_slow(module: &Module, operand: &Operand) -> Result<u32> {
+    #[cfg(test)]
+    note_decode_flags_slow_call();
     match operand {
         Operand::Literal(index) => {
             let term = module
@@ -383,7 +420,8 @@ fn decode_flags_slow(module: &Module, operand: &Operand) -> Result<u32> {
             }
             Ok(flags)
         }
-        // `Nil` is the fast shell's own arm, so it cannot reach here.
+        // `Nil` and the empty-list literal are the fast shell's own arms, so
+        // neither can reach here.
         _ => Err(error::unsupported("bitstring: unsupported flags operand")),
     }
 }

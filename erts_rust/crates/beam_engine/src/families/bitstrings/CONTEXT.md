@@ -68,15 +68,20 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   materialise an integer term only to read that same value back — and forwards a runtime
   `size(Expr)` register, a literal-area term and every reject case to `read_size_slow`. Its
   reject case is the `#[cold] size_error`, shared by both halves. `decode_flags`'s shell answers
-  `Operand::Nil` with a plain zero and forwards a flag-atom list literal to `decode_flags_slow`,
-  which keeps the whole `flag_bit`/`native`-normalisation/`BSF_*` body and the typed error
-  unchanged. **A compiled `bs_match` `integer` command does NOT hit the shell**: the compiler emits
-  that command's flags as `{literal,[]}` — an `Operand::Literal` over the NIL literal (confirmed on
+  **both** spellings of "no flags" with a plain zero: `Operand::Nil` (the `a,0` form, which is what
+  `bs_create_bin`'s segment flags and `'=:='` carry) and an `Operand::Literal` whose literal-area
+  entry is the empty list — the `{literal,[]}` the compiler emits for every `bs_match` field
+  (`{integer,4,{literal,[]},6,1,{x,4}}`, confirmed on
   `tests/fixtures/{bitstrings,bsbig,bssmall}.beam` and on a fresh `erlc -S` of a binary
-  comprehension) — so every matched field takes the `#[inline(never)]` body plus a literal-area
-  read plus one `list_elements` call for an empty list. The `Nil` form (`a,0`) is what
-  `bs_create_bin`'s segment flags and `'=:='`'s carry. `is_all`/`flag_bit`/`small_value`/
-  `sign_extend` and the hot `BitWriter` methods carry `#[inline]`.
+  comprehension). The second is resolved through `Module::literal` (no `Machine` needed), so a
+  matched field pays one discriminant test, one bounds-checked literal-area read and a `NIL`
+  compare instead of a call, a `Result` returned through memory plus a `list_elements` walk over an
+  empty list. **Every other operand keeps the previous answer exactly**: a non-empty flag-atom
+  list (`little`/`signed`/`native`) still reaches `decode_flags_slow`, which keeps the whole
+  `flag_bit`/`native`-normalisation/`BSF_*` body and its typed errors, and so do a literal index
+  the module does not have (`flags literal index out of range`) and a literal that is not a proper
+  list of flag atoms (`BadArg`). `is_all`/`flag_bit`/`small_value`/`sign_extend` and the hot
+  `BitWriter` methods carry `#[inline]`.
 - `raw.rs` → the family's **single** `#[allow(unsafe_code)]` module: `heap_bits` /
   `subject_bytes` (the subject triple), `ctx_parts`/`inner_orig`/`make_ctx`/
   `set_ctx_start` (the match context), `make_big`/`big_parts_safe` (bignums) and
@@ -167,8 +172,10 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     comprehension's context): the program is a load-time `Vec<Operand>` (there is no term-level
     re-decode, and **no** pre-decoded/cached form either), so one element costs ~17 word loads
     (≈10 of them the context block), 1 subject byte read, 3 word writes (the `Dst` context, the
-    context's `start`, the result register), 2 operand decodes, 2 `atom_name` classifications, 2
-    out-of-line calls (`exec_other`, `decode_flags_slow`+`list_elements`), and **zero** rooted
+    context's `start`, the result register), 2 operand decodes, 2 `atom_name` classifications, 1
+    out-of-line call (`exec_other` — the field's `{literal,[]}` flags are answered by
+    `decode_flags`'s inlined empty-literal arm: one bounds-checked literal-area read plus a `NIL`
+    compare, never a `decode_flags_slow`/`list_elements` call), and **zero** rooted
     allocations / `Vec` / `Box`. `bs_start_match3` beside it is the reuse arm (one operand read,
     two header probes, one write). The residual cost of a binary comprehension is therefore the
     enclosing **5–6 instructions per element** at the tier's per-instruction price, not this
@@ -438,8 +445,8 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   semantics-preserving **hoist**, not new semantics: `Instr::BsMatch { commands: Vec<Operand> }`
   (`crates/beam_loader/src/instr.rs:868`, built at `lower/instr.rs:487`) could carry a typed
   `Vec<PreparedCommand>` with the command tag, flags, size/unit and `Dst` already resolved, which
-  deletes the per-element `atom_name` + `&str` match, the `decode_flags_slow`/`list_elements`
-  call and the two `read_size` decodes while the load-time cost stays amortised.
+  deletes the per-element `atom_name` + `&str` match, the flags literal-area read (the empty-list
+  arm's own work) and the two `read_size` decodes while the load-time cost stays amortised.
 - **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside
   this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
   (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
