@@ -1263,6 +1263,18 @@ pub struct PortRegistry {
     /// about to run and is consumed by the failure that round reaps; a port that survives the
     /// round is simply re-read next time.
     pre_round_monitors: HashMap<u64, Vec<PortMonitor>>,
+    /// The atom-table handle the live driver ports have been lent for the **drive window** that is
+    /// currently open, or `None` between windows (see
+    /// [`PortRegistry::open_driver_atom_view`]).
+    ///
+    /// Remembering it here is what lets [`PortRegistry::close_driver_atom_view`] take no
+    /// parameter, so a *nested* open/close pair needs nothing threaded through it.
+    driver_atom_view: Option<Rc<beam_term::AtomTable>>,
+    /// How many [`PortRegistry::open_driver_atom_view`] calls are outstanding, so only the
+    /// outermost [`PortRegistry::close_driver_atom_view`] releases the ports' views — a nested
+    /// close must never release early, or the driver code still running inside the outer window
+    /// would lose its table.
+    driver_atom_view_depth: usize,
     /// The runtime's **async-job delivery handle** — the C async pool behind `driver_async` and the
     /// per-port completion queues (see [`AsyncReady`] and [`driver`]).
     ///
@@ -1302,6 +1314,8 @@ impl PortRegistry {
             pending_port_signals: exit::PendingPortSignals::default(),
             failed_read_recipients: HashMap::new(),
             pre_round_monitors: HashMap::new(),
+            driver_atom_view: None,
+            driver_atom_view_depth: 0,
             // The pool itself is built lazily, on the first `driver_async` (`AsyncReady::ensure_pool`),
             // but the worker count is stamped now: `+A`'s default is one thread, and `+A 0` — an
             // explicit zero — must stay distinguishable from "not configured yet".
@@ -2784,11 +2798,10 @@ impl PortRegistry {
     /// past sits behind a term the driver has already built, so the caller reports it (see
     /// [`Runtime::deliver_port_messages`]).
     ///
-    /// The caller owns the **lease** rule around this: `atoms` is normally the code server's own
-    /// `Rc::make_mut` handle, so every driver port's table view must be released first
-    /// ([`PortRegistry::release_driver_atom_tables`]) and re-adopted after
-    /// ([`PortRegistry::adopt_driver_atom_tables`]) — otherwise the append deep-clones the table
-    /// and the hosts' views are orphaned.
+    /// The caller owns the **window** rule around this: no drive window may be open when this
+    /// runs, so every driver port's table view is already released and `atoms` — the code server's
+    /// own `Rc::make_mut` handle — appends **in place** (see
+    /// [`PortRegistry::open_driver_atom_view`]).
     ///
     /// # Errors
     ///
@@ -2817,11 +2830,10 @@ impl PortRegistry {
     /// it has to be applied at the **site that owns the table borrow**, not inside the commit
     /// loop: the table is reached through
     /// [`CodeServer::atoms_mut`](crate::codeserver::CodeServer::atoms_mut), which is
-    /// `Rc::make_mut`. Merely *reaching* it while any other holder is alive — a
-    /// `{spawn_driver, Name}` port's host (which is leased the table for the port's whole life), a
-    /// loaded NIF library's stored host, a port open in flight — deep-clones the entire shared
-    /// table (thousands of names, and their `String`s, plus the index map) for a round that
-    /// interns nothing. A round with nothing pending must therefore not reach it at all.
+    /// `Rc::make_mut`. Merely *reaching* it while any other holder is alive — a loaded NIF
+    /// library's stored host, a port open in flight — deep-clones the entire shared table
+    /// (thousands of names, and their `String`s, plus the index map) for a round that interns
+    /// nothing. A round with nothing pending must therefore not reach it at all.
     ///
     /// The scan is one pass over the live ports — orders of magnitude below the clone it
     /// avoids, and the same pass `commit_driver_atoms` would make anyway.
@@ -2833,42 +2845,72 @@ impl PortRegistry {
         })
     }
 
-    /// Takes every live driver port's view of the shared atom table away, so the commit that
-    /// follows appends **in place**.
+    /// **Opens a drive window**: lends every live driver port a view of `atoms` — the runtime's
+    /// **one live** table — for as long as driver code can run.
     ///
-    /// A driver host reaches the table through the [`driver::DriverAtoms`] record the port layer
-    /// shares with it ([`driver::DriverPort::pending_atoms`]), which is the only handle the commit
-    /// site can see — the host itself is boxed into its port. Releasing it is what makes the
-    /// commit's `Rc::make_mut` take `Rc::get_mut`'s in-place path instead of deep-cloning the
-    /// whole shared table (one `Arc<str>` + one index-map insertion per name): `Rc::get_mut`
-    /// refuses while **any** other reference exists, weak ones included, and `Rc::make_mut` then
-    /// replaces the allocation — which would also orphan the host's copy, leaving it stale enough
-    /// to hand a driver an index that names the wrong atom. See [`driver::DriverAtoms::release`].
+    /// A [`driver::DriverPort`] reaches the table only from inside a driver callback
+    /// (`atom_name`/`intern_atom`/`binary_to_term`), and no intern can happen while driver code
+    /// runs: the runtime's table is mutably borrowed at the commit site and this crate is
+    /// `#![deny(unsafe_code)]`. So the lease is scoped to exactly that window.
     ///
-    /// Nothing runs between this and [`PortRegistry::adopt_driver_atom_tables`]: the commit in
-    /// between is a pure append.
-    fn release_driver_atom_tables(&mut self) {
-        for meta in self.meta.values() {
-            if let Some(pending) = meta.driver_atoms.as_ref() {
-                pending.release();
-            }
+    /// # The invariant
+    ///
+    /// **Between windows no driver port holds a handle on the shared table**, so an intern taken
+    /// anywhere appends in place (`Rc::get_mut`, which [`CodeServer::atoms_mut`] takes — it refuses
+    /// while *any* other reference exists, weak ones included) instead of deep-cloning the whole
+    /// table and orphaning the host's view. **Inside a window no intern can occur**, so the lease
+    /// costs nothing and can never cause a copy. The only process-lifetime lease left is a loaded
+    /// NIF library's stored host.
+    ///
+    /// Re-entrant: a nested open keeps the outermost window's handle and only bumps the depth, so a
+    /// nested [`PortRegistry::close_driver_atom_view`] cannot release early.
+    ///
+    /// [`CodeServer::atoms_mut`]: crate::codeserver::CodeServer::atoms_mut
+    pub(crate) fn open_driver_atom_view(&mut self, atoms: &Rc<beam_term::AtomTable>) {
+        self.driver_atom_view_depth += 1;
+        if self.driver_atom_view.is_some() {
+            return;
         }
-    }
-
-    /// Hands every live driver port back a view of the shared atom table — `atoms` must be the
-    /// table the code server holds **now**, i.e. the one the commit just appended to.
-    ///
-    /// Re-adopting the live handle (rather than restoring the released one) keeps the invariant
-    /// the next round needs: a host's view is the table the runtime owns, so a name it resolves is
-    /// a name the runtime really holds. See [`PortRegistry::release_driver_atom_tables`].
-    fn adopt_driver_atom_tables(&mut self, atoms: &Rc<beam_term::AtomTable>) {
+        self.driver_atom_view = Some(Rc::clone(atoms));
         for meta in self.meta.values() {
             if let Some(pending) = meta.driver_atoms.as_ref() {
                 pending.adopt(atoms);
             }
         }
     }
-    /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
+
+    /// **Closes the drive window** opened by [`PortRegistry::open_driver_atom_view`], taking every
+    /// live driver port's table view away again so the next intern taken anywhere appends in place.
+    ///
+    /// Only the outermost close acts (see the depth counter), and a close with no open window is a
+    /// no-op. Nothing runs between this and the next open, so no driver host ever observes the
+    /// released state — a driver that did would answer the honest "not resolvable here" from
+    /// [`driver::DriverAtoms::table`], never a guess.
+    pub(crate) fn close_driver_atom_view(&mut self) {
+        if self.driver_atom_view_depth == 0 {
+            return;
+        }
+        self.driver_atom_view_depth -= 1;
+        if self.driver_atom_view_depth > 0 {
+            return;
+        }
+        self.release_driver_atom_tables();
+        self.driver_atom_view = None;
+    }
+
+    /// Takes every live driver port's view of the shared atom table away — the close half of a
+    /// drive window (see [`PortRegistry::open_driver_atom_view`]).
+    ///
+    /// A driver host reaches the table through the [`driver::DriverAtoms`] record the port layer
+    /// shares with it ([`driver::DriverPort::pending_atoms`]), which is the only handle the port
+    /// layer can see — the host itself is boxed into its port. See [`driver::DriverAtoms::release`].
+    fn release_driver_atom_tables(&mut self) {
+        for meta in self.meta.values() {
+            if let Some(pending) = meta.driver_atoms.as_ref() {
+                pending.release();
+            }
+        }
+    }    /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
     ///
     /// A driver's callback decodes its term-data spec on the host's arena and queues the resulting
     /// term on the port's [`driver::TermQueue`] ([`driver::DriverPort::send_term`]); this drains
@@ -3489,7 +3531,13 @@ impl RuntimePorts {
         bytes: &[u8],
         options: PortCommandOptions,
     ) -> Result<PortCommandOutcome> {
-        self.registry_mut()?.command(port, bytes, options)
+        let mut registry = self.registry_mut()?;
+        // The accepted command's round runs the driver's `output` callback, so it is a drive
+        // window (see [`PortRegistry::open_driver_atom_view`]).
+        registry.open_driver_atom_view(&self.atoms);
+        let outcome = registry.command(port, bytes, options);
+        registry.close_driver_atom_view();
+        outcome
     }
     /// Hands a command to a port the way `erlang:port_command/2,3` does, converting the data
     /// **only once the port has accepted the command** — [`PortRegistry::command_with_data`], the
@@ -3514,8 +3562,13 @@ impl RuntimePorts {
     where
         F: FnOnce() -> Result<Vec<u8>>,
     {
-        self.registry_mut()?
-            .command_with_data(port, make_data, options)
+        let mut registry = self.registry_mut()?;
+        // The accepted command's round runs the driver's `output` callback, so it is a drive
+        // window (see [`PortRegistry::open_driver_atom_view`]).
+        registry.open_driver_atom_view(&self.atoms);
+        let outcome = registry.command_with_data(port, make_data, options);
+        registry.close_driver_atom_view();
+        outcome
     }
 
     /// `erts_internal:port_control(Port, Op, Data)` — deliver a port-control operation to the
@@ -3537,7 +3590,13 @@ impl RuntimePorts {
     /// As for [`PortRegistry::port_control`]; a nested borrow of the registry is the typed
     /// capability gap of [`RuntimePorts::registry_mut`], never a panic.
     pub fn port_control(&mut self, port: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
-        self.registry_mut()?.port_control(port, op, arg)
+        let mut registry = self.registry_mut()?;
+        // The driver's `control` callback is a drive window (see
+        // [`PortRegistry::open_driver_atom_view`]).
+        registry.open_driver_atom_view(&self.atoms);
+        let reply = registry.port_control(port, op, arg);
+        registry.close_driver_atom_view();
+        reply
     }
     /// The name of `term`, when `term` is an atom interned in the shared table.
     fn atom_name(&self, term: Eterm) -> Option<&str> {
@@ -3985,7 +4044,13 @@ impl PortHook for RuntimePorts {
                     held_lines: VecDeque::new(),
                     held_since: Cell::new(None),
                 };
-                return registry.register(driver, meta);
+                // `register` runs the driver's `start` callback, so it is a drive window; the close
+                // right after it is what keeps the freshly opened port from holding the table
+                // between rounds (see [`PortRegistry::open_driver_atom_view`]).
+                registry.open_driver_atom_view(&self.atoms);
+                let registered = registry.register(driver, meta);
+                registry.close_driver_atom_view();
+                return registered;
             }
             // A driver the runtime already **has loaded by name** is resolved against the
             // loaded-driver list first, exactly as the C matches the name against each loaded
@@ -4085,7 +4150,13 @@ impl PortHook for RuntimePorts {
                 held_lines: VecDeque::new(),
                 held_since: Cell::new(None),
             };
-            return registry.register(Box::new(adapter), meta);
+            // `register` runs the loaded driver's `start` callback, so it is a drive window — and the
+            // close right after it is what prevents the opened port from keeping the lease between
+            // rounds (see [`PortRegistry::open_driver_atom_view`]).
+            registry.open_driver_atom_view(&self.atoms);
+            let registered = registry.register(Box::new(adapter), meta);
+            registry.close_driver_atom_view();
+            return registered;
         }
         // The child-stream options (`stderr_to_stdout`) are applied in the child, so they are
         // handed to the driver's constructor rather than carried in `SpawnOptions`. Read before
@@ -4135,9 +4206,14 @@ impl PortHook for RuntimePorts {
             held_since: Cell::new(None),
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
-        // port operation, and a nested borrow is a typed error rather than a panic.
+        // port operation, and a nested borrow is a typed error rather than a panic. The window
+        // covers the `start` callback as it does for every other `register` (see
+        // [`PortRegistry::open_driver_atom_view`]).
         let mut registry = self.registry_mut()?;
-        registry.register(Box::new(driver), meta)
+        registry.open_driver_atom_view(&self.atoms);
+        let registered = registry.register(Box::new(driver), meta);
+        registry.close_driver_atom_view();
+        registered
     }
 
     fn close_port(&mut self, port: PortId) -> Result<()> {
@@ -4148,8 +4224,12 @@ impl PortHook for RuntimePorts {
         }
         // [`PortRegistry::close`] is also the port-exit path: it notifies the driver
         // ([`PortExitReason::Closed`], at most once) before the teardown, so this hook needs
-        // no notification of its own.
-        registry.close(port)
+        // no notification of its own. Both the `port_exit` notification and the teardown are
+        // drive windows (see [`PortRegistry::open_driver_atom_view`]).
+        registry.open_driver_atom_view(&self.atoms);
+        let closed = registry.close(port);
+        registry.close_driver_atom_view();
+        closed
     }
 
     fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
@@ -4268,6 +4348,7 @@ impl Runtime {
                 return Ok(0);
             }
         }
+        let view = self.code_server.atoms_handle();
         let events = {
             let mut registry = self
                 .ports
@@ -4279,8 +4360,20 @@ impl Runtime {
             // A process that died without disarming its select interest would otherwise keep the
             // runtime polling for ever (see [`PortRegistry::prune_dead_select`]).
             registry.prune_dead_select(|pid| table.contains(pid))?;
-            registry.pump(timeout)?
+            // The round is the drive window: every driver callback it runs (a `ready_input`,
+            // `timeout`, `ready_async`, `output` or `process_exit`) resolves the table through the
+            // lease this opens, and the close right after it means the **delivery** below and the
+            // commit after that run lease-free (see
+            // [`PortRegistry::open_driver_atom_view`]).
+            registry.open_driver_atom_view(&view);
+            let pumped = registry.pump(timeout);
+            registry.close_driver_atom_view();
+            pumped?
         };
+        // The round's lease must be gone before the commit: `code_server.atoms_mut()` is
+        // `Rc::make_mut`, so this handle — an `Rc` clone — would send the append down the
+        // copy-on-write path and orphan nothing but cost the whole table.
+        drop(view);
         if crate::debug_trace::enabled() {
             crate::debug_trace::trace(format_args!(
                 "deliver_port_messages: timeout={timeout:?} events={}",
@@ -4301,17 +4394,13 @@ impl Runtime {
             // a loaded NIF library) deep-clones the whole table for a round that interns
             // nothing. See [`PortRegistry::has_pending_driver_atoms`].
             if registry.has_pending_driver_atoms() {
-                // Release every host's hold on the table *first*: the commit appends through
-                // `Rc::make_mut`, which keeps the existing allocation only while the code server
-                // is its sole owner (`Rc::get_mut` refuses while any other reference exists, weak
-                // ones included). A clone here would both cost the whole table and orphan the
-                // hosts' copies, and a stale view hands a driver an index that names the wrong
-                // atom — see [`PortRegistry::release_driver_atom_tables`].
+                // No drive window is open here, so every host's hold on the table is already gone
+                // and the commit appends **in place** (`Rc::get_mut`) instead of paying for a
+                // clone of the whole table — see [`PortRegistry::open_driver_atom_view`]. The
+                // release is kept as a belt-and-braces guard for a caller that reaches this from
+                // inside a window; the *close* of every window is what makes it a no-op today.
                 registry.release_driver_atom_tables();
                 let dropped = registry.commit_driver_atoms(self.code_server.atoms_mut());
-                // Hand them the table the commit appended to, so every host's view is live again.
-                let live = self.code_server.atoms_handle();
-                registry.adopt_driver_atom_tables(&live);
                 for (port, name) in dropped {
                     // Never silent: the term the driver built already carries an index that now
                     // names a different atom, which no later commit can repair.
@@ -4603,6 +4692,7 @@ impl RuntimeContext<'_> {
         // are never built while the registry is borrowed (the same snapshot rule
         // `native.rs` follows).
         let registry = Rc::clone(&self.runtime.ports);
+        let view = self.runtime.code_server.atoms_handle();
         let events = {
             // Same rule as the scheduler path's round: the liveness view is refreshed from the
             // live table immediately before any driver callback can run (see
@@ -4615,8 +4705,16 @@ impl RuntimeContext<'_> {
             // Same as the scheduler path's round: a dead process's armed select is
             // dropped before the poll (see [`PortRegistry::prune_dead_select`]).
             registry.prune_dead_select(|pid| table.contains(pid))?;
-            registry.pump(timeout)?
+            // The drive window, exactly as on the scheduler route: the round's driver callbacks
+            // are the only code that may see the shared table (see
+            // [`PortRegistry::open_driver_atom_view`]).
+            registry.open_driver_atom_view(&view);
+            let pumped = registry.pump(timeout);
+            registry.close_driver_atom_view();
+            pumped?
         };
+        // The lease is closed before the messages are built, so nothing below holds the table.
+        drop(view);
         let mut messages = Vec::with_capacity(events.len());
         for event in events {
             match event {

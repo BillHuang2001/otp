@@ -562,7 +562,13 @@ impl NifHostServices for RuntimeNifServices<'_> {
             return Some(false);
         }
         let mut registry = self.runtime.ports.try_borrow_mut().ok()?;
-        Some(registry.write_command(id, &bytes).is_ok())
+        // The write runs the driver's `output` callback, so it is a drive window (see
+        // [`crate::port::PortRegistry::open_driver_atom_view`]).
+        let view = self.runtime.code_server.atoms_handle();
+        registry.open_driver_atom_view(&view);
+        let written = registry.write_command(id, &bytes).is_ok();
+        registry.close_driver_atom_view();
+        Some(written)
     }
 
     /// Delivers `msg` to `to` as `from` — the C's `enif_send` (`erl_nif.c:860-1093`) — through the

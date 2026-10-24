@@ -531,13 +531,20 @@ impl Runtime {
     /// failures, which are never swallowed.
     pub(crate) fn retire_peer_closed_port(&mut self, id: PortId) -> Result<()> {
         let cell = Rc::clone(&self.ports);
+        let view = self.code_server.atoms_handle();
         let mut registry = cell
             .try_borrow_mut()
             .map_err(|_| error::unsupported("the port table is already in use"))?;
         if !registry.is_live(id) {
             return Ok(());
         }
-        registry.retire_peer_closed(id)
+        // The retirement tears the port down, which runs the driver's own `port_exit`/`stop`
+        // callbacks: a drive window, exactly as on the `port_close/1` route (see
+        // [`PortRegistry::open_driver_atom_view`](super::PortRegistry::open_driver_atom_view)).
+        registry.open_driver_atom_view(&view);
+        let retired = registry.retire_peer_closed(id);
+        registry.close_driver_atom_view();
+        retired
     }
 }
 

@@ -439,7 +439,16 @@ impl RuntimeContext<'_> {
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             let mut bytes = Vec::new();
             self.iodata_bytes(data, &mut bytes)?;
-            let reply = registry.port_control(port, &operation.to_string(), &bytes)?;
+            // The driver's `control` callback is a drive window, so its host resolves the shared
+            // atom table only for its duration (see
+            // [`crate::port::PortRegistry::open_driver_atom_view`]).
+            let view = self.runtime.code_server.atoms_handle();
+            registry.open_driver_atom_view(&view);
+            // The window is closed on the error path too: leaving it open would keep the lease and
+            // force the next intern anywhere into a copy of the whole table.
+            let reply = registry.port_control(port, &operation.to_string(), &bytes);
+            registry.close_driver_atom_view();
+            let reply = reply?;
             let binary = registry.control_binary(port);
             let shape = registry.control_reply_shape(port);
             (reply, binary, shape)
