@@ -240,6 +240,12 @@ mod y_operand_tests;
 #[cfg(test)]
 #[path = "divrem_tests.rs"]
 mod divrem_tests;
+#[cfg(test)]
+#[path = "bs_match_deopt_tests.rs"]
+mod bs_match_deopt_tests;
+#[cfg(test)]
+#[path = "foreign_kernel_tests.rs"]
+mod foreign_kernel_tests;
 
 // The block ABI lives in `runtime` and the artifact in `code`; re-export their names
 // here so every item path outside this module (`crate::jit::baseline::…`) stays
