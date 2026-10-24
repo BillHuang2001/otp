@@ -95,10 +95,28 @@ instructions):
   duplicate checks with a `HashSet<PathBuf>` kept in lockstep with `paths`/`default_paths`
   (`Path`'s `Hash` normalises the same redundant separators `Eq` ignores, so membership answers
   identically). (a) alone removes ~99 % of the 52 M.
+- **`code:del_path/1` on a system `ebin` is undone before it can be observed.** The deletion is
+  `remove_path_where` (`src/native/code/path.rs:121`), which edits `paths` only; the next
+  `add_system_paths` call re-installs the entry from the (still intact) `default_paths` — and
+  `code:get_path/0` calls `add_system_paths` **first** (`src/native/code.rs:73`), so
+  `code:del_path(Sys), code:get_path()` lists the directory again where the oracle drops it.
+  The one-shot guard above moves this to the oracle's answer (`default_paths` is restored only by
+  `reset_paths_to_defaults`, i.e. by `init:restart/0`), so it is a **behaviour change to declare**
+  — and a differential case worth adding beside the guard.
 - **`load_bytes`'s two interning loops call `self.atoms_mut()` once per atom** (`codeserver.rs`
   `:847-849`, `:864-868`), i.e. two `Rc::get_mut` calls per atom where one hoisted borrow would
   do. It is a micro: the whole `AtomTable::intern` share is 26 M (1.31 %), dominated by the
   name→index hash lookup itself.
+  Both loops are also **load-bearing and not removable**: the `wire` pre-pass must intern every
+  module atom into the *shared* table because `build_module`'s clone has to start with an
+  identical prefix for the wire indices to mean anything, and the merge-back must intern the
+  literal-only atoms at exactly `base..` so the shared indices stay identical to the module's.
+  The merge-back's lookups are the only avoidable half — the names are appended in index order,
+  so an append-only `AtomTable` push would do — but that surface is `beam_term`'s.
+- **The single largest attributable item in the load path is not this file's to fix**:
+  `<AtomTable as Clone>::clone` at `codeserver.rs:862` (`lower::build_module(&chunks, &raw,
+  (*self.atoms).clone())`) is 298 M / 15.07 % of the floor, 7.38 % of it `Arc<str>::from(&str)`
+  re-copying every atom name. The seam is `beam_term`'s `fork()` handle (a sibling node).
 
 ## Notes for Agents
 - **Do not look for wins inside this module.** The measured share of `codeserver::path::*` is
