@@ -198,17 +198,28 @@ fn link_the_families() {
     core::hint::black_box(beam_abi::nif::enif::enif_api_table());
 }
 
+/// Every report the session's host has published so far, read **through the environment**.
+///
+/// The fixture's `driver_output` writes the same host through the same pointer, so a caller-held
+/// `&`/`&mut TestDriverHost` across the fixture call would let the optimiser treat those stores as
+/// unobservable (`beam_abi::driver::host` → *The aliasing contract*; it cost a release-only silent
+/// no-op once). Reading through the env keeps both ends on one pointer.
+fn outputs(env: &DriverEnv) -> Vec<Vec<u8>> {
+    env.with_host_as::<TestDriverHost, _>(|h| h.outputs().to_vec())
+        .expect("the session's environment carries the TestDriverHost")
+}
+
 /// Drive one `control` command and return the single report the fixture published through
 /// `driver_output`.
-fn drive(lib: &DriverLibrary, data: ErlDrvData, host: &TestDriverHost, cmd: u32) -> String {
-    let before = host.outputs().len();
+fn drive(lib: &DriverLibrary, data: ErlDrvData, env: &DriverEnv, cmd: u32) -> String {
+    let before = outputs(env).len();
     let mut reply: *mut c_char = std::ptr::null_mut();
     // SAFETY: `data` is the live state returned by `start`; the commands read no input buffer; a
     // null reply pointer with `rlen == 0` is the "length only" shape `port_control/3` uses.
     let n = lib
         .control(data, cmd, std::ptr::null_mut(), 0, &mut reply, 0)
         .expect("the fixture implements control");
-    let outputs = host.outputs();
+    let outputs = outputs(env);
     assert_eq!(
         outputs.len(),
         before + 1,
@@ -280,7 +291,7 @@ fn drives_a_real_c_driver_through_the_refcount_trio() {
     assert_eq!(lib.name(), FIXTURE_NAME);
 
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = std::ffi::CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.
@@ -295,7 +306,7 @@ fn drives_a_real_c_driver_through_the_refcount_trio() {
     // --- the four sequences, against the values measured on the real ERTS ----------------------
     let commands = [ALLOC, REALLOC, ZERO, DEC_TO_ZERO];
     for (i, (&cmd, &expected)) in commands.iter().zip(ORACLE_REPORTS.iter()).enumerate() {
-        let report = drive(&lib, data, &host, cmd);
+        let report = drive(&lib, data, &env, cmd);
         assert_eq!(
             report, expected,
             "sequence {} (control command {cmd}) must match the value measured on the real ERTS",
@@ -303,7 +314,7 @@ fn drives_a_real_c_driver_through_the_refcount_trio() {
         );
     }
     assert_eq!(
-        host.outputs().len(),
+        outputs(&env).len(),
         4,
         "every command publishes exactly one report"
     );

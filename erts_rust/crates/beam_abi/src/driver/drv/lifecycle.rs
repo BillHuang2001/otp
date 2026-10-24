@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn the_failure_family_routes_each_c_spelling_to_one_reason() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let name = c"enoent";
 
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn a_null_or_sentinel_port_is_the_c_failure_value_and_is_never_dereferenced() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let name = c"enoent";
         // `NULL` and the C's invalid-port sentinel (`ERTS_INVALID_ERL_DRV_PORT`, pointer `-1`,
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn a_null_or_non_utf8_atom_name_is_refused_not_faulted() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let bad = [0xffu8, 0];
 
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn driver_exit_hands_the_raw_code_to_the_host() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is live.
@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn the_busy_flag_is_forwarded_and_control_flags_round_trip() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is live.
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn busy_msgq_limits_are_forwarded_and_echoed_back() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut low: ErlDrvSizeT = 2;
         let mut high: ErlDrvSizeT = 8;
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn busy_msgq_limits_report_disabled_for_an_unreachable_or_bare_host() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut low: ErlDrvSizeT = 1;
         let mut high: ErlDrvSizeT = 2;
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn init_ack_acknowledges_success_and_closes_on_a_failure_result() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is live; the operands have the C's `ErlDrvData` shape.
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn set_os_pid_is_forwarded_and_refuses_an_unrepresentable_pid() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is live.
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn the_async_port_key_comes_from_the_host_and_zero_when_it_cannot() {
         let mut host = LifecycleHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is live.

@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn the_port_carrying_slots_forward_through_the_port_env() {
         let mut host = RegistryHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let name = c"regtest";
         let data: ErlDrvData = 0x55_isize as ErlDrvData;
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn a_null_creator_port_is_the_c_failure_value_and_is_never_dereferenced() {
         let mut host = RegistryHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let null = core::ptr::null_mut();
         let name = c"regtest";
 
@@ -512,7 +512,7 @@ mod tests {
     fn a_host_that_cannot_create_a_port_reports_the_invalid_port_sentinel() {
         // The trait default is the C's failure answer — never a fabricated handle.
         let mut host = BareHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let name = c"regtest";
 

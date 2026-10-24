@@ -500,7 +500,7 @@ fn loads_and_drives_a_real_c_driver() {
 
     // --- the one per-port environment + `start` -------------------------------------------------
     // `env` must outlive every use of `port`; `driver` is not moved, so its boxed host is stable.
-    let mut env = driver.host_mut().environment();
+    let env = driver.host_mut().environment();
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
 
@@ -580,7 +580,7 @@ fn the_unimplemented_host_services_report_the_c_failure_codes() {
     let atoms = Rc::new(table);
     let mut driver = Driver::new(library, fixture_host(&atoms));
 
-    let mut env = driver.host_mut().environment();
+    let env = driver.host_mut().environment();
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` is from a live environment; `command` is NUL-terminated.

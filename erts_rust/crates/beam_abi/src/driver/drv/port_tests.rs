@@ -305,7 +305,7 @@ impl DriverHost for SplitHost {
 #[test]
 fn driver_output_reaches_the_host_with_the_exact_bytes() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     assert!(!port.is_null(), "the port pointer is never null");
 
@@ -350,7 +350,7 @@ fn driver_output_reaches_the_host_with_the_exact_bytes() {
 #[test]
 fn driver_output_binary_slices_the_payload_and_refuses_an_over_read() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // SAFETY: the driver-binary allocator is a malloc wrapper; `bin` is freed below.
@@ -400,7 +400,7 @@ fn driver_output_binary_slices_the_payload_and_refuses_an_over_read() {
 #[test]
 fn driver_outputv_gathers_the_vectors_and_drops_skip_bytes() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     let mut first = *b"abcd";
@@ -470,7 +470,7 @@ fn driver_outputv_gathers_the_vectors_and_drops_skip_bytes() {
 #[test]
 fn erl_drv_output_term_decodes_and_forwards_a_tuple() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let name = CString::new("a").expect("no interior NUL");
 
@@ -571,7 +571,7 @@ fn erl_drv_output_term_decodes_and_forwards_a_tuple() {
     assert_eq!(rc, -1);
     // A host without an atom table cannot intern, so the spec cannot be built.
     let mut bare = MinimalDriverHost::new();
-    let mut bare_env = DriverEnv::new(&mut bare);
+    let bare_env = DriverEnv::new(&mut bare);
     let bare_port = bare_env.as_port();
     // SAFETY: `bare_env` is live and `spec` is a live six-word array.
     let rc = unsafe {
@@ -587,7 +587,7 @@ fn erl_drv_output_term_decodes_and_forwards_a_tuple() {
 #[test]
 fn driver_connected_and_caller_return_term_words_or_nil() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // A host with no known pid reports `nil`: the C's "no process" answer.
@@ -612,21 +612,21 @@ fn driver_connected_and_caller_return_term_words_or_nil() {
 #[test]
 fn driver_mk_atom_returns_a_pointer_the_atom_spec_interns() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let name = CString::new("ok").expect("no interior NUL");
 
     // SAFETY: `name` is a NUL-terminated C string.
     let td = unsafe { driver_mk_atom(name.as_ptr() as *mut c_char) };
     assert_eq!(td, name.as_ptr() as usize as ErlDrvTermData);
     // That is exactly the `ERL_DRV_ATOM` operand `decode_term_spec` interns.
-    let term = decode_term_spec(&mut env, &[ERL_DRV_ATOM, td]).expect("a valid atom spec");
+    let term = decode_term_spec(&env, &[ERL_DRV_ATOM, td]).expect("a valid atom spec");
     assert_eq!(host.atom_name(term), Some("ok"));
 }
 
 #[test]
 fn driver_mk_port_encodes_the_handle_and_nil_stays_nil() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     // SAFETY: `port` is a live handle; a null handle is only compared.
     unsafe {
@@ -638,7 +638,7 @@ fn driver_mk_port_encodes_the_handle_and_nil_stays_nil() {
 #[test]
 fn timers_select_and_async_delegate_to_the_host() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // SAFETY: `port` is live; no other pointer is dereferenced by these two calls.
@@ -688,7 +688,7 @@ fn timers_select_and_async_delegate_to_the_host() {
 #[test]
 fn defaulted_host_methods_report_the_c_failure_code() {
     let mut host = MinimalDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut left: c_ulong = 0;
     // SAFETY: `port` is live; every other operand is null or a local out-parameter.
@@ -822,7 +822,7 @@ fn driver_term_data_round_trips_through_the_table() {
     // through the table proves the frozen table and the `#[no_mangle]` symbol agree.
     let t = driver_api_table();
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     let output = t.driver_output.expect("driver_output is populated");
@@ -905,7 +905,7 @@ fn iovec(iov: &mut [libc::iovec], size: ErlDrvSizeT) -> ErlIOVec {
 #[test]
 fn driver_output2_keeps_the_header_and_body_split() {
     let mut host = SplitHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut head = *b"HDR";
     let mut body = *b"abc";
@@ -952,7 +952,7 @@ fn driver_output2_keeps_the_header_and_body_split() {
 #[test]
 fn driver_output_distinguishes_a_null_buffer_from_an_empty_one() {
     let mut host = SplitHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut body = *b"abc";
 
@@ -975,7 +975,7 @@ fn driver_output_distinguishes_a_null_buffer_from_an_empty_one() {
 #[test]
 fn driver_output_binary_keeps_the_header_split() {
     let mut host = SplitHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     // SAFETY: the driver-binary allocator is a malloc wrapper; `bin` is freed below.
     let bin = unsafe { driver_alloc_binary(8) };
@@ -1004,7 +1004,7 @@ fn driver_output_binary_keeps_the_header_split() {
 #[test]
 fn driver_outputv_keeps_the_last_vector_as_the_tail() {
     let mut host = SplitHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut head = *b"H";
     let mut first = *b"abcd";
@@ -1049,7 +1049,7 @@ fn driver_outputv_keeps_the_last_vector_as_the_tail() {
 #[test]
 fn the_default_output2_makes_exactly_one_output_call() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut head = *b"HDR";
     let mut body = *b"abc";
@@ -1089,7 +1089,7 @@ fn driver_async_with_a_pool_returns_the_job_id() {
     let mut host = PoolDriverHost::new(AsyncPool::new(2));
     // A clone, so the assertions below never alias the `&mut host` the env holds.
     let pool = host.pool.clone();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let data = 0x1234usize as *mut c_void;
     let mut key: c_uint = 5;
@@ -1129,7 +1129,7 @@ fn driver_async_with_a_pool_returns_the_job_id() {
 #[test]
 fn driver_async_without_a_pool_keeps_the_legacy_path() {
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut key: c_uint = 9;
 
@@ -1144,7 +1144,7 @@ fn driver_async_without_a_pool_keeps_the_legacy_path() {
 fn driver_async_with_a_pool_refuses_a_null_invoke() {
     let mut host = PoolDriverHost::new(AsyncPool::new(1));
     let pool = host.pool.clone();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // SAFETY: `port` is a live env handle; `None` invoke is exactly the operand under test.

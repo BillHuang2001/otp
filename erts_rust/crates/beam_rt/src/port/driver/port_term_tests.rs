@@ -443,7 +443,7 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
     // Seized before the environment exists, exactly as `DriverPortAdapter::start` does: the
     // environment is what hands the handle out, and the host is never told it.
     let terms = port_host.port_terms();
-    let mut env = port_host.environment();
+    let env = port_host.environment();
     let handle = env.as_port() as usize;
     terms.set_env(handle);
     let port = PortId::new(7);
@@ -455,7 +455,7 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
         "the hook must answer an internal port term"
     );
 
-    let term = decode_term_spec(&mut env, &[ERL_DRV_PORT, handle as u64])
+    let term = decode_term_spec(&env, &[ERL_DRV_PORT, handle as u64])
         .expect("a stamped handle resolves through the hook");
     assert_eq!(
         term, expected,
@@ -471,17 +471,17 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
     // A handle that is not this port's environment, a null handle, and a plain non-port word are
     // all refused — the C's `NIL`, never a fabricated port term.
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, 0x1000]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, 0x1000]),
         None,
         "a foreign handle is not this port"
     );
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, 0]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, 0]),
         None,
         "a null handle resolves to nothing"
     );
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, 1]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, 1]),
         None,
         "a low-nibble word that is not a port still goes through the hook"
     );
@@ -490,7 +490,7 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
     // term, and a refused handle aborts the whole spec (no partial delivery). The compound's own
     // shape is `decode_term_spec`'s business — this suite pins only that the operand resolved.
     let compound = decode_term_spec(
-        &mut env,
+        &env,
         &[ERL_DRV_PORT, handle as u64, ERL_DRV_NIL, ERL_DRV_TUPLE, 2],
     )
     .expect("a tuple of [port, []] builds");
@@ -500,7 +500,7 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
     );
     assert_eq!(
         decode_term_spec(
-            &mut env,
+            &env,
             &[ERL_DRV_PORT, 0x1000, ERL_DRV_NIL, ERL_DRV_TUPLE, 2]
         ),
         None,
@@ -514,11 +514,11 @@ fn the_host_resolves_its_own_environment_handle_to_its_port_term() {
 fn an_unstamped_host_answers_no_port_term() {
     let mut port_host = host();
     let terms = port_host.port_terms();
-    let mut env = port_host.environment();
+    let env = port_host.environment();
     let handle = env.as_port() as usize;
 
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, handle as u64]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, handle as u64]),
         None,
         "an unpublished handle is not a port"
     );
@@ -526,7 +526,7 @@ fn an_unstamped_host_answers_no_port_term() {
     // A stamped handle with **no** port id is still nothing: the lifecycle stamps the two together
     // (`DriverPortAdapter::start`), and half a pair must not fabricate the other half.
     terms.set_env(handle);
-    assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, handle as u64]), None);
+    assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, handle as u64]), None);
 }
 
 /// A port that has gone away answers nothing, even for the handle it published — the C's handle is
@@ -535,13 +535,13 @@ fn an_unstamped_host_answers_no_port_term() {
 fn a_gone_port_answers_no_port_term() {
     let mut port_host = host();
     let terms = port_host.port_terms();
-    let mut env = port_host.environment();
+    let env = port_host.environment();
     let handle = env.as_port() as usize;
     terms.set_env(handle);
     terms.set_port(PortId::new(3));
 
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, handle as u64]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, handle as u64]),
         Some(PortId::new(3).to_eterm()),
         "while the port is live its handle resolves"
     );
@@ -551,7 +551,7 @@ fn a_gone_port_answers_no_port_term() {
     // the very state the hook reads.
     port_host.clear_driver_state();
     assert_eq!(
-        decode_term_spec(&mut env, &[ERL_DRV_PORT, handle as u64]),
+        decode_term_spec(&env, &[ERL_DRV_PORT, handle as u64]),
         None,
         "a closed port's handle must not resolve to its old id term"
     );

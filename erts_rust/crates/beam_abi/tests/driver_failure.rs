@@ -356,7 +356,7 @@ fn a_real_c_driver_hands_every_spelling_to_one_host_hook() {
     let lib = load_fixture(&path);
     // The `DriverEnv` must outlive every driver call: the `ErlDrvPort` the C stores in `start` is
     // this env's own pointer, and `env_for` recovers the host from it.
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.
@@ -493,7 +493,7 @@ fn a_host_without_the_close_hooks_answers_minus_one_for_every_spelling() {
         atoms: AtomTable::new(),
     };
     let lib = load(&path, FIXTURE_NAME).expect("the fixture loads");
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.

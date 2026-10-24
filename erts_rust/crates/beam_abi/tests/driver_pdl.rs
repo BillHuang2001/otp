@@ -413,7 +413,7 @@ fn loads_and_drives_a_real_c_driver_through_the_pdl_family() {
 
     // --- the port/state and the commands --------------------------------------------------------
     let mut host = PdlHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command_line = CString::new("start").expect("no interior NUL");
 

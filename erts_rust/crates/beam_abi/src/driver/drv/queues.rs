@@ -544,7 +544,7 @@ pub unsafe extern "C" fn driver_sizeq(port: ErlDrvPort) -> ErlDrvSizeT {
 /// The `(vlen, supported)` answer for a `peekq` call that reported no view: `peekq` reports both
 /// "unsupported" and "empty" as `None`, so `sizeq` tells them apart (`-1` = unsupported, which is
 /// the C's null-queue path).
-fn peekq_len_when_empty(env: &mut DriverEnv) -> c_int {
+fn peekq_len_when_empty(env: &DriverEnv) -> c_int {
     if env.host().sizeq() < 0 {
         -1
     } else {
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn enq_appends_at_the_tail_and_pushq_prepends_at_the_head() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         let mut hello = *b"hello";
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn the_zero_length_enqueue_is_a_no_op_success() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // The C returns 0 for `len == 0` *before* it touches the port, so even a null port succeeds.
@@ -997,7 +997,7 @@ mod tests {
     fn enq_bin_and_pushq_bin_honour_the_offset_and_length() {
         let mut host = FifoHost::new();
         let bin = test_binary(b"0123");
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `bin` is a live 4-byte driver binary and `1 + 2 <= orig_size`.
@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn enqv_and_pushqv_honour_the_skip() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut iov = stored_iov();
         let mut ev = vector_over(&mut iov, 6);
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn sizeq_reports_the_queued_bytes() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` is a live handle with an empty queue.
@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn deq_removes_from_the_head_and_reports_the_remaining_size() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         let mut hello = *b"hello";
@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn peekq_views_the_queue_and_reports_nothing_when_empty() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         let mut vlen = 99;
@@ -1187,7 +1187,7 @@ mod tests {
     #[test]
     fn peekqv_fills_the_vector_and_returns_the_queued_size() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         let mut ev = ErlIOVec::default();
@@ -1275,7 +1275,7 @@ mod tests {
     #[test]
     fn a_host_without_queues_reports_the_c_failure_codes() {
         let mut host = BareHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut iov = stored_iov();
         let mut ev = vector_over(&mut iov, 6);
@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn a_host_failure_is_passed_through() {
         let mut host = FifoHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         host.fail_next = true;
 

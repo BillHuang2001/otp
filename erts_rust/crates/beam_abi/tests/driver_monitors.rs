@@ -369,12 +369,17 @@ fn identity_command(lib: &DriverLibrary, data: ErlDrvData, cmd: u32) -> Vec<u8> 
 ///
 /// The host must not move while the fixture is live: [`DriverEnv`] holds a raw pointer to it (the
 /// `ErlDrvPort` a driver callback receives *is* the env pointer), exactly as the C's `ErlDrvPort`
-/// is a pointer into emulator state. The closure therefore receives `&mut MonitorsHost` at its
-/// final address instead of a value to take ownership of.
+/// is a pointer into emulator state.
+///
+/// The closure therefore receives **the environment**, never a reference to the host: a live
+/// `&`/`&mut MonitorsHost` across a call into the fixture is the aliasing violation documented in
+/// `beam_abi::driver::host` (the optimiser may then treat the callback's stores to the host as
+/// unobservable — a release-only silent no-op), so the closure reads host state back through
+/// [`host_as`], i.e. through the same pointer the callbacks wrote through.
 ///
 /// `None` (after a loud skip) when the toolchain cannot build the fixture.
 fn with_session<R>(
-    f: impl FnOnce(&DriverLibrary, ErlDrvData, &mut MonitorsHost, &Path) -> R,
+    f: impl FnOnce(&DriverLibrary, ErlDrvData, &DriverEnv, &Path) -> R,
 ) -> Option<R> {
     link_the_family();
     let so = compile_fixture()?;
@@ -387,7 +392,7 @@ fn with_session<R>(
     // The C's `driver_caller`: the process the port is connected to. It must be a real internal pid,
     // because `driver_monitor_process` refuses an operand that cannot name a process.
     host.set_caller(Some(make_internal_pid(7)));
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command_line = CString::new("start").expect("no interior NUL");
     let data = lib
@@ -398,12 +403,20 @@ fn with_session<R>(
         "start must return the private state, not a failure code"
     );
 
-    let result = f(&lib, data, &mut host, &so);
+    let result = f(&lib, data, &env, &so);
 
     // `stop` frees the private state (no leak, no double free: it runs exactly once here).
     lib.stop(data).expect("the fixture implements stop");
     drop(lib);
     Some(result)
+}
+
+/// Reach the session's host **through the environment** — the one sound route while a driver
+/// callback may run (`beam_abi::driver::host` → *The aliasing contract*): the read goes through the
+/// same raw pointer the callback wrote through, so the optimiser cannot reorder the two.
+fn host_as<R>(env: &DriverEnv, f: impl FnOnce(&mut MonitorsHost) -> R) -> R {
+    env.with_host_as::<MonitorsHost, R>(f)
+        .expect("the session's environment carries the MonitorsHost")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -412,12 +425,12 @@ fn with_session<R>(
 
 #[test]
 fn the_monitor_identity_is_what_drives_the_whole_family() {
-    let Some(()) = with_session(|lib, data, host, _so| {
+    let Some(()) = with_session(|lib, data, env, _so| {
         // --- commands 1-2: two monitors armed on the port's connected process --------------------
         assert_eq!(command(lib, data, 1), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
         assert_eq!(command(lib, data, 2), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
-        assert_eq!(host.armed().len(), 2, "both monitors must be registered");
-        assert_eq!(host.armed()[0].1, make_internal_pid(7));
+        assert_eq!(host_as(env, |h| h.armed().len()), 2, "both monitors must be registered");
+        assert_eq!(host_as(env, |h| h.armed()[0].1), make_internal_pid(7));
 
         // --- commands 3-5: the refusal codes -----------------------------------------------------
         // A term that cannot name a process is the positive "no longer alive" code (`io.c:7031`); a
@@ -448,10 +461,10 @@ fn the_monitor_identity_is_what_drives_the_whole_family() {
         let mon2 = identity_command(lib, data, 11);
         assert_eq!(
             mon1,
-            host.identity_of(0).to_vec(),
+            host_as(env, |h| h.identity_of(0)).to_vec(),
             "the fixture's 24 bytes must be the host's identity verbatim"
         );
-        assert_eq!(mon2, host.identity_of(1).to_vec());
+        assert_eq!(mon2, host_as(env, |h| h.identity_of(1)).to_vec());
         assert_ne!(mon1, mon2, "two monitors are never byte-identical");
         assert_eq!(MONITOR_BYTES, 32, "sizeof(void *) * 4 on LP64");
 
@@ -480,7 +493,11 @@ fn the_monitor_identity_is_what_drives_the_whole_family() {
             ERL_DRV_MONITOR_OK as ErlDrvSSizeT,
             "the tail-perturbed copy must demonitor the original monitor"
         );
-        assert_eq!(host.armed().len(), 1, "only the first monitor was removed");
+        assert_eq!(
+            host_as(env, |h| h.armed().len()),
+            1,
+            "only the first monitor was removed"
+        );
 
         // --- commands 16-21: the removal contract -------------------------------------------------
         assert_eq!(
@@ -509,7 +526,7 @@ fn the_monitor_identity_is_what_drives_the_whole_family() {
             1,
             "a demonitored monitor no longer names a process"
         );
-        assert!(host.armed().is_empty(), "both monitors are gone");
+        assert!(host_as(env, |h| h.armed().is_empty()), "both monitors are gone");
         assert_eq!(command(lib, data, 99), -100, "an unknown command is -100");
     }) else {
         return;
@@ -535,36 +552,52 @@ fn the_monitor_identity_is_what_drives_the_whole_family() {
 /// test rather than a differential case.
 #[test]
 fn the_real_fixture_sees_all_three_monitor_outcomes() {
-    let Some(()) = with_session(|lib, data, host, _so| {
+    let Some(()) = with_session(|lib, data, env, _so| {
         // The host arms for real: the fixture's command 1 must return the C's `0`.
-        host.set_monitor_outcome(MonitorOutcome::Arm);
+        host_as(env, |h| h.set_monitor_outcome(MonitorOutcome::Arm));
         assert_eq!(command(lib, data, 1), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
-        assert_eq!(host.armed().len(), 1, "the armed case registered a monitor");
+        assert_eq!(
+            host_as(env, |h| h.armed().len()),
+            1,
+            "the armed case registered a monitor"
+        );
 
         // The host reports the process dead: the fixture must return the C's positive `1`, and the
         // refusal must not have written the fixture's holder (no monitor registered).
-        host.set_monitor_outcome(MonitorOutcome::NotAlive);
+        host_as(env, |h| h.set_monitor_outcome(MonitorOutcome::NotAlive));
         assert_eq!(
             command(lib, data, 1),
             ERL_DRV_MONITOR_NOT_ALIVE as ErlDrvSSizeT,
             "a not-alive host must surface the C's positive code"
         );
-        assert_eq!(host.armed().len(), 1, "a not-alive result installs no monitor");
+        assert_eq!(
+            host_as(env, |h| h.armed().len()),
+            1,
+            "a not-alive result installs no monitor"
+        );
 
         // The host cannot monitor: the fixture must return the C's negative `-1`.
-        host.set_monitor_outcome(MonitorOutcome::Error);
+        host_as(env, |h| h.set_monitor_outcome(MonitorOutcome::Error));
         assert_eq!(
             command(lib, data, 1),
             ERL_DRV_MONITOR_ERROR as ErlDrvSSizeT,
             "a failure the host cannot arm must surface the C's negative code"
         );
-        assert_eq!(host.armed().len(), 1, "a failure installs no monitor");
+        assert_eq!(
+            host_as(env, |h| h.armed().len()),
+            1,
+            "a failure installs no monitor"
+        );
 
         // Back to arming: the host is live again and command 1 succeeds once more (a second monitor,
         // distinct identity).
-        host.set_monitor_outcome(MonitorOutcome::Arm);
+        host_as(env, |h| h.set_monitor_outcome(MonitorOutcome::Arm));
         assert_eq!(command(lib, data, 1), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
-        assert_eq!(host.armed().len(), 2, "the recovered host arms again");
+        assert_eq!(
+            host_as(env, |h| h.armed().len()),
+            2,
+            "the recovered host arms again"
+        );
     }) else {
         return;
     };
@@ -735,18 +768,19 @@ fn oracle_reports(so: &Path) -> Option<Vec<String>> {
 
 #[test]
 fn the_oracle_agrees_on_the_monitor_comparison() {
-    let Some(()) = with_session(|lib, data, host, so| {
+    let Some(()) = with_session(|lib, data, env, so| {
         // Commands 30-33 publish the shared comparison report through `driver_output`, i.e. produced
         // by THIS crate's `driver_compare_monitors`.
         for cmd in 30..30 + COMPARE_CASES as u32 {
             let n = command(lib, data, cmd);
             assert!(n > 0, "command {cmd} must publish a report");
         }
-        let ours: Vec<String> = host
-            .outputs()
-            .iter()
-            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-            .collect();
+        let ours: Vec<String> = host_as(env, |h| {
+            h.outputs()
+                .iter()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .collect()
+        });
         assert_eq!(ours.len(), COMPARE_CASES, "one report per comparison case");
 
         // The measured shape of the reports, independent of the oracle: the tail is not compared

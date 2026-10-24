@@ -444,7 +444,7 @@ fn the_erl_drv_port_handle_a_driver_sees_is_the_same_pointer_through_the_ports_l
 #[test]
 fn a_driver_output_from_a_plain_thread_is_refused() {
     let mut host = Box::new(AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap"));
-    let mut env = Box::new(DriverEnv::new(&mut *host));
+    let env = Box::new(DriverEnv::new(&mut *host));
     let port = env.as_port();
 
     // On this (non-callback) thread the handle is already refused, so the refusal is about the

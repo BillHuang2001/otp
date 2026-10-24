@@ -215,7 +215,7 @@ fn a_real_c_driver_async_job_runs_through_the_safe_runner() {
     let lib = load(path, "tasync").expect("the fixture driver must load and validate");
 
     let mut host = InlineAsyncHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
 
@@ -258,7 +258,7 @@ fn a_real_c_driver_async_job_runs_through_the_safe_runner() {
 #[test]
 fn the_frozen_async_slot_with_a_null_invoke_is_refused() {
     let mut host = NullJobHost;
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let mut key: c_uint = 7;
 

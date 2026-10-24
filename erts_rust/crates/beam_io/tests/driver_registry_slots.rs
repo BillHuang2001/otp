@@ -200,7 +200,7 @@ fn the_registry_slots_answer_the_cs_codes_for_a_live_loaded_port() {
     let mut host = AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), name.clone(), true)
         .expect("a driver heap");
     {
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // `driver_lock_driver`: the C consults the port's own driver, which here is a `dlopen`ed
@@ -340,7 +340,7 @@ fn the_four_registry_slots_reproduce_the_oracles_0_1_0_minus_1_sequence() {
     let mut host = AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), name.clone(), true)
         .expect("a driver heap");
     {
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         // Step 1: `driver_lock_driver` = 0 — the port's own driver was `dlopen`ed.
         // SAFETY: `port` came from `DriverEnv::as_port` on the live `env` above.
@@ -434,7 +434,7 @@ fn the_port_carrying_slots_answer_their_defaults_without_a_port_or_a_loaded_driv
     // handle — the C's statically linked case.
     let mut bare = AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap");
     {
-        let mut env = DriverEnv::new(&mut bare);
+        let env = DriverEnv::new(&mut bare);
         let port = env.as_port();
         // SAFETY: `port` came from `DriverEnv::as_port` on the live `env` above.
         assert_eq!(
@@ -457,7 +457,7 @@ fn the_port_carrying_slots_answer_their_defaults_without_a_port_or_a_loaded_driv
         AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "host_driver", false)
             .expect("a driver heap");
     {
-        let mut env = DriverEnv::new(&mut statically);
+        let env = DriverEnv::new(&mut statically);
         let port = env.as_port();
         // SAFETY: as above.
         assert_eq!(

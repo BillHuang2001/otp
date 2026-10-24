@@ -445,7 +445,7 @@ fn the_registry_slots_drive_the_host_through_the_frozen_table() {
     assert_eq!(unsafe { remove(de) }, 0, "no current host => `0` (no such entry)");
 
     // The two port-carrying slots recover the port's own env.
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let name = c"lifecycle";
     let lock = table.driver_lock_driver.expect("populated");
@@ -536,7 +536,7 @@ fn loads_and_drives_a_real_c_driver_through_the_lifecycle_family() {
 
     // --- the port and the private state ---------------------------------------------------------
     let mut host = LifecycleTestHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command_line = std::ffi::CString::new("start").expect("no interior NUL");
 
@@ -697,7 +697,7 @@ fn a_host_without_the_hooks_still_survives_the_whole_fixture() {
     let mut host = BareHost {
         heap: beam_alloc::Heap::new(4096).expect("a test heap is allocatable"),
     };
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command_line = std::ffi::CString::new("start").expect("no interior NUL");
     // SAFETY: `port` is live and the command is NUL-ended.
@@ -748,7 +748,7 @@ fn driver_failure_of_zero_is_the_eof_route_and_a_nonzero_code_stays_an_integer()
     let failure_eof = table.driver_failure_eof.expect("populated");
     let failure = table.driver_failure.expect("populated");
     let mut host = LifecycleTestHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // SAFETY: `port` came from `DriverEnv::as_port` on a live env.
@@ -780,7 +780,7 @@ fn null_and_the_invalid_port_sentinel_are_refused_before_the_host_hook() {
     let exit = table.driver_exit.expect("populated");
 
     let mut host = LifecycleTestHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let live = env.as_port();
     let name = c"enoent";
 
