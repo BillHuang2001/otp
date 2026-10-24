@@ -64,7 +64,7 @@
 //! * a genuine M1 coverage edge is [`crate::error::unsupported`] with a precise
 //!   reason (see the `Known Issues` in the crate `CONTEXT.md`).
 
-mod create;
+pub(crate) mod create;
 mod matching;
 pub(crate) mod programs;
 #[allow(unsafe_code)]

@@ -77,7 +77,7 @@ use crate::families::bitstrings::{
 
 /// The six operands one segment group is made of (`[Type, Index, Unit, Flags, Value,
 /// Size]`).
-const SEGMENT_OPERANDS: usize = 6;
+pub(super) const SEGMENT_OPERANDS: usize = 6;
 
 /// One resolved segment of a `bs_create_bin`.
 pub(crate) enum PreparedSeg {

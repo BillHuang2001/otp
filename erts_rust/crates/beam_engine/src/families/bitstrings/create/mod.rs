@@ -136,7 +136,14 @@
 
 mod segments;
 mod size;
-pub(super) mod prepared;
+pub(crate) mod prepared;
+// The seam is the bitstring family's **exported** surface for a native lowering: its two
+// consumers are the baseline tier's `bs_create_bin` inline arm (outside this node) and
+// [`seam_tests`](seam_tests). Until the tier adopts it, nothing in a plain `--lib` build
+// refers to it, so the dead-code lint would fire on every item; the seam is deliberately
+// part of the contract, not dead weight.
+#[allow(dead_code)]
+pub(crate) mod seam;
 
 use crate::interpreter::LabelMap;
 
@@ -270,12 +277,12 @@ pub(super) fn exec(
 /// `Err(step)` is a completed failure `Step` (a branch to `fail`, or a raise) — the
 /// caller returns it verbatim.
 ///
-/// `pub(crate)` so a future native tier can lower a recognised `bs_create_bin` segment
-/// shape straight to this walk (the whole construction side of the family is reachable
-/// from outside this module: [`exec`] for the instruction, this for the assembly).
-/// Semantics are unchanged by the visibility.
+/// `pub(super)` — this walk stays inside the family. What a native tier consumes is the
+/// [`seam`]: [`seam::append_plan`] for the static shape and [`seam::open_append`] for the
+/// writable payload's room, so a lowering never re-derives either from this walk's
+/// arguments (and never reaches the [`Built`] form, which is family-private).
 #[allow(clippy::type_complexity)]
-pub(crate) fn assemble(
+pub(super) fn assemble(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,
@@ -541,3 +548,5 @@ mod inplace_tests;
 mod grow_tests;
 #[cfg(test)]
 mod prepared_tests;
+#[cfg(test)]
+mod seam_tests;
