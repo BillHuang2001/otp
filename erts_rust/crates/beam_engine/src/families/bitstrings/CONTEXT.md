@@ -121,8 +121,9 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
   (`a_republish_writes_only_the_two_payload_words_and_leaves_a_split_pairs_neighbour_intact`,
   `a_split_pairs_payload_move_keeps_the_next_append_in_place`,
   `a_second_pair_over_the_payload_refuses_the_move`).
-- `programs.rs` → the **prepared bitstring program** cache: `Program::{Generic, Create, Match}`, `program_key(func, pc)` and `BitstrPrograms::{get_or_prepare, take, restore}`.
+- `programs.rs` → the **prepared bitstring program** cache: `Program::{Generic, Create, Match}`, `program_key(func, pc)` and `BitstrPrograms::get_or_prepare`.
   One table per **module context** (so a `Module::clone` or a second load of the same `.beam` is a different table), machine-owned by construction and never part of the cross-run compiled-block cache.
+  The table reaches the executing family through the single seam `Machine::with_bitstr_programs`, which resolves the context's cell **once** per instruction (context `0` is a machine field, a registered context an `Arc` handle, an unregistered one a dropped throwaway) and files the table back on every ordinary exit.
   `prepare` is consulted once per `(function, code offset)` and its answer filed; a shape it declines is `Program::Generic`, and a synthetic image (all-zero checksum, no content identity) never caches a `Match` program.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/

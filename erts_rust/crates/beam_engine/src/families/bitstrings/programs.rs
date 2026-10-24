@@ -87,12 +87,12 @@
 //! after its own key was compared equal.
 //!
 //! The table is handed to the family **by value** for the duration of one instruction
-//! ([`Machine::take_bitstr_programs`](crate::Machine::take_bitstr_programs) /
-//! [`Machine::restore_bitstr_programs`](crate::Machine::restore_bitstr_programs)), so
+//! ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)), so
 //! the executing code holds the programs locally and the borrow checker allows the
 //! `&mut Machine` the segment writers need — no reference count is touched and no
-//! slot is borrowed across the call. Nothing else reads the table mid-instruction, and
-//! a program lost that way (an unwind) is simply re-prepared.
+//! slot is borrowed across the call. One call resolves the context's cell once and
+//! files the table back on every exit, so a table lost that way (an unwind) is simply
+//! re-prepared.
 
 use beam_loader::Module;
 

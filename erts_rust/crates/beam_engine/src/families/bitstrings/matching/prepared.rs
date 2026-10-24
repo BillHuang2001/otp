@@ -323,8 +323,9 @@ fn fast_eligible(flags: u32, nbits: usize) -> bool {
 ///
 /// The program is fetched from the current module context's
 /// [`BitstrPrograms`](super::super::programs::BitstrPrograms) table — handed over **by
-/// value** for the duration of this instruction, so the body keeps the `&mut Machine`
-/// the term builders need — and prepared on a miss.
+/// value** for the duration of this instruction
+/// ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)), so the body
+/// keeps the `&mut Machine` the term builders need — and prepared on a miss.
 ///
 /// A **synthetic** image (all-zero [`Module::checksum`], the documented marker of an
 /// image with no content identity — `machine/label_cache.rs`) takes the generic walk
@@ -345,34 +346,33 @@ pub(super) fn run_commands_prepared(
     if module.checksum() == [0u8; 16] {
         return super::commands::run_commands(machine, module, labels, fail, ctx_op, commands, ctx);
     }
-    let mut programs = machine.take_bitstr_programs();
-    let program = programs.get_or_prepare(program_key(func, pc), module, || {
-        match prepare(module, commands) {
-            Some(program) => Program::Match(Box::new(program)),
-            None => Program::Generic,
-        }
-    });
-    let outcome = match program {
-        Program::Match(program) => match &program.fast {
-            Some(fast) => {
-                #[cfg(test)]
-                note_fast_walk();
-                run_fast(machine, module, labels, fail, ctx_op, fast, ctx)
+    machine.with_bitstr_programs(|machine, programs| {
+        let program = programs.get_or_prepare(program_key(func, pc), module, || {
+            match prepare(module, commands) {
+                Some(program) => Program::Match(Box::new(program)),
+                None => Program::Generic,
             }
-            None => {
-                #[cfg(test)]
-                note_prepared_walk();
-                run_prepared(machine, module, labels, fail, ctx_op, &program.cmds, ctx)
+        });
+        match program {
+            Program::Match(program) => match &program.fast {
+                Some(fast) => {
+                    #[cfg(test)]
+                    note_fast_walk();
+                    run_fast(machine, module, labels, fail, ctx_op, fast, ctx)
+                }
+                None => {
+                    #[cfg(test)]
+                    note_prepared_walk();
+                    run_prepared(machine, module, labels, fail, ctx_op, &program.cmds, ctx)
+                }
+            },
+            // A shape the decode declined (or another family's program in this slot): the
+            // unchanged generic walk, which reproduces the exact typed error it always did.
+            Program::Generic | Program::Create(_) => {
+                super::commands::run_commands(machine, module, labels, fail, ctx_op, commands, ctx)
             }
-        },
-        // A shape the decode declined (or another family's program in this slot): the
-        // unchanged generic walk, which reproduces the exact typed error it always did.
-        Program::Generic | Program::Create(_) => {
-            super::commands::run_commands(machine, module, labels, fail, ctx_op, commands, ctx)
         }
-    };
-    machine.restore_bitstr_programs(programs);
-    outcome
+    })
 }
 
 /// Execute the **straight-line** fast form.

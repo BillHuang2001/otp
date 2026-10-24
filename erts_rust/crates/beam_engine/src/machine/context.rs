@@ -108,9 +108,9 @@ pub(crate) struct ModuleContext {
     /// tables, so it cannot go stale while the image lives.
     ///
     /// A [`RefCell`] because the family **moves the table out** for the duration of one
-    /// instruction (`Machine::take_bitstr_programs`) — the executing code then holds it
-    /// locally, which is what lets the segment writers take `&mut Machine` without a
-    /// borrow of the context. Nothing else reads it mid-instruction.
+    /// instruction ([`Machine::with_bitstr_programs`](crate::Machine::with_bitstr_programs)) —
+    /// the executing code then holds it locally, which is what lets the segment writers take
+    /// `&mut Machine` without a borrow of the context. Nothing else reads it mid-instruction.
     pub(crate) programs: RefCell<BitstrPrograms>,
 }
 
@@ -212,21 +212,7 @@ impl Contexts {
         }
     }
 
-    /// The prepared-bitstring-program cell of context `id`, or `None` for the entry
-    /// context `0` (whose table the machine owns —
-    /// [`Machine::entry_programs`](crate::Machine)) and for an id never registered.
-    ///
-    /// A borrow, not a clone: the caller exchanges the table's value for the duration of
-    /// one instruction, so a `&` handle and a `RefCell` are all it needs.
-    #[inline(always)]
-    pub(crate) fn programs(&self, id: u32) -> Option<&RefCell<BitstrPrograms>> {
-        if id == 0 {
-            return None;
-        }
-        self.entries
-            .get((id - 1) as usize)
-            .map(|entry| &entry.programs)
-    }    /// The number of registered contexts (not counting the entry context).
+    /// The number of registered contexts (not counting the entry context).
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

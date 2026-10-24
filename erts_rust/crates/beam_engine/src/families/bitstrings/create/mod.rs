@@ -219,28 +219,29 @@ pub(super) fn exec(
             // binary-comprehension loop would otherwise pay on **every** element.
             //
             // The table is handed over **by value** for the duration of this
-            // instruction, so the segment writers keep the `&mut Machine` they need
-            // without any borrow of it being held across them. A shape `prepare`
-            // declines is filed as `Program::Generic` and runs the unchanged generic
-            // walk below, so the typed-error surface is identical.
-            let mut programs = machine.take_bitstr_programs();
-            let program = programs.get_or_prepare(program_key(func, pc), module, || {
-                match prepared::prepare(module, segments) {
-                    Some(program) => Program::Create(Box::new(program)),
-                    None => Program::Generic,
+            // instruction (`Machine::with_bitstr_programs`, one context-cell resolution
+            // for the take and the restore together), so the segment writers keep the
+            // `&mut Machine` they need without any borrow of it being held across them.
+            // A shape `prepare` declines is filed as `Program::Generic` and runs the
+            // unchanged generic walk below, so the typed-error surface is identical.
+            let assembled = machine.with_bitstr_programs(|machine, programs| {
+                let program = programs.get_or_prepare(program_key(func, pc), module, || {
+                    match prepared::prepare(module, segments) {
+                        Some(program) => Program::Create(Box::new(program)),
+                        None => Program::Generic,
+                    }
+                });
+                match program {
+                    Program::Create(program) => {
+                        prepared::assemble_prepared(machine, module, labels, *fail, program, ctx)
+                    }
+                    // A `bs_match` program can only land in this slot through a table
+                    // collision; either way it is not this instruction's shape.
+                    Program::Generic | Program::Match(_) => {
+                        assemble(machine, module, labels, *fail, segments, ctx)
+                    }
                 }
             });
-            let assembled = match program {
-                Program::Create(program) => {
-                    prepared::assemble_prepared(machine, module, labels, *fail, program, ctx)
-                }
-                // A `bs_match` program can only land in this slot through a table
-                // collision; either way it is not this instruction's shape.
-                Program::Generic | Program::Match(_) => {
-                    assemble(machine, module, labels, *fail, segments, ctx)
-                }
-            };
-            machine.restore_bitstr_programs(programs);
             let built = match assembled? {
                 Ok(built) => built,
                 // The assembly already produced the failure `Step`.

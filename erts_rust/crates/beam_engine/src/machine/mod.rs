@@ -119,6 +119,8 @@ mod run;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod program_tests;
+#[cfg(test)]
 mod root_tests;
 #[cfg(test)]
 pub(crate) mod test_support;/// Process-state core: x-register file, Erlang stack and call-frame stack.
@@ -739,8 +741,7 @@ pub struct Machine {
     /// image lives; the table's own image witness discards it if the entry module
     /// changes, and [`Machine::reset`](crate::Machine::reset) drops it with the run.
     ///
-    /// Read/moved only by [`Machine::take_bitstr_programs`] /
-    /// [`Machine::restore_bitstr_programs`].
+    /// Read/moved only by [`Machine::with_bitstr_programs`], the single hand-over seam.
     pub(crate) entry_programs: BitstrPrograms,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
@@ -1351,41 +1352,58 @@ impl Machine {
         }
     }
 
-    /// Hand the current module context's **prepared bitstring programs** to the caller
-    /// for the duration of one instruction, leaving an empty table in their place.
+    /// Run `f` with the current module context's **prepared bitstring programs** — the
+    /// one hand-over seam, and the only reader/writer of those tables.
     ///
     /// The prepared-program cache (`crate::families::bitstrings::programs`) is per
-    /// module context — this machine's entry table for context `0`, a registered
-    /// [`ModuleContext`]'s cell otherwise — and the executing family needs it **while it
-    /// holds `&mut Machine`** (the segment writers allocate). Moving the table out for
-    /// the instruction is what makes those two borrows legal without a reference count,
-    /// a raw pointer or a slot borrowed across the call. Nothing else reads the table
-    /// mid-instruction, and the counterpart
-    /// [`Machine::restore_bitstr_programs`] files it back.
-    #[inline]
-    pub(crate) fn take_bitstr_programs(&mut self) -> BitstrPrograms {
-        if self.context == 0 {
-            std::mem::replace(&mut self.entry_programs, BitstrPrograms::empty())
-        } else {
-            match self.contexts.programs(self.context) {
-                Some(cell) => cell.replace(BitstrPrograms::empty()),
-                // An unregistered context has no module image, so it has no programs.
-                None => BitstrPrograms::empty(),
-            }
-        }
-    }
-
-    /// File `programs` back into the current module context's cell — the counterpart of
-    /// [`Machine::take_bitstr_programs`].
+    /// module context — this machine's [`Machine::entry_programs`] for context `0`, a
+    /// registered [`ModuleContext`]'s cell otherwise — and the executing family needs it
+    /// **while it holds `&mut Machine`** (the segment writers allocate). Handing the
+    /// table over for the duration of one instruction is what makes those two borrows
+    /// legal without a reference count, a raw pointer or a slot borrowed across the
+    /// call: the table is moved out, the closure receives it (and the machine, because
+    /// the family needs both) and it is filed back **on every exit, including an error
+    /// return**. Nothing else reads the table mid-instruction.
     ///
-    /// A table that cannot be filed back (the context was dropped mid-instruction) is
-    /// dropped: it is a cache, so the only consequence is a re-decode.
+    /// The context's cell is resolved **once** per instruction: the hot caller is a
+    /// compiled binary comprehension, which re-enters here once per element, so a take
+    /// and its matching restore must cost one resolution between them. Context `0` pays
+    /// no lookup at all (the table is a field), a registered context resolves its
+    /// handle once (an `Arc` clone, so the cell does not borrow `self` and the closure
+    /// can take the machine), and an **unregistered** context — no module image, hence
+    /// no programs — gets a throwaway empty table that is simply dropped, never filed
+    /// back.
+    ///
+    /// A table lost to an unwind is only a re-decode, never a wrong answer: it is a
+    /// cache of programs that are a pure function of the loaded image.
     #[inline]
-    pub(crate) fn restore_bitstr_programs(&mut self, programs: BitstrPrograms) {
+    pub(crate) fn with_bitstr_programs<R>(
+        &mut self,
+        f: impl FnOnce(&mut Machine, &mut BitstrPrograms) -> R,
+    ) -> R {
         if self.context == 0 {
+            let mut programs =
+                std::mem::replace(&mut self.entry_programs, BitstrPrograms::empty());
+            let out = f(self, &mut programs);
             self.entry_programs = programs;
-        } else if let Some(cell) = self.contexts.programs(self.context) {
-            cell.replace(programs);
+            out
+        } else {
+            match self.module_context(self.context) {
+                Some(handle) => {
+                    let mut programs = handle.programs.replace(BitstrPrograms::empty());
+                    let out = f(self, &mut programs);
+                    // Files the table back into the very cell it came from (the `Arc`
+                    // handle, not a fresh lookup of `self.context`, so a context switch
+                    // inside `f` cannot redirect it), and hands back the placeholder.
+                    handle.programs.replace(programs);
+                    out
+                }
+                // An unregistered context has no module image, so it has no programs.
+                None => {
+                    let mut programs = BitstrPrograms::empty();
+                    f(self, &mut programs)
+                }
+            }
         }
     }
     /// The module-wide label index of `module` — **the** label-map door.
