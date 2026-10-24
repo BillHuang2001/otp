@@ -434,7 +434,12 @@ whose tags are exactly the 7 `run_commands` covers, 1331 `bs_start_match3` and z
   Our loader preserves the raw list, so `run_commands` re-derives a load-time fact on **every**
   execution (a comprehension enters it once per byte). Doing it in the loader would remove the
   interpretation entirely; an in-family re-discovery of the shapes was measured a **regression**
-  (see `## Measured`), so this is the only route left.
+  (see `## Measured`), so this is the only route left — and the cheap first step is a pure,
+  semantics-preserving **hoist**, not new semantics: `Instr::BsMatch { commands: Vec<Operand> }`
+  (`crates/beam_loader/src/instr.rs:868`, built at `lower/instr.rs:487`) could carry a typed
+  `Vec<PreparedCommand>` with the command tag, flags, size/unit and `Dst` already resolved, which
+  deletes the per-element `atom_name` + `&str` match, the `decode_flags_slow`/`list_elements`
+  call and the two `read_size` decodes while the load-time cost stays amortised.
 - **`src/lib.rs` declares `families` as a private module**, so every `pub(crate)` entry point inside
   this node is currently unreachable from `src/jit/**` — a tier that wants a per-command entry
   (`matching::exec`, `matching::commands::run_commands`, `create::assemble`) needs
