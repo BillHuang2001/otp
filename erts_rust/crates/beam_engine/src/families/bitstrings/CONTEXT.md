@@ -163,6 +163,16 @@ a `-native` field big-endian — a wrong value, which is the defect this rule pr
     fit a small integer, `binary`/`get_tail` always (they build a bitstring every time), and
     `ensure_at_least`/`ensure_exactly`/`skip`/`'=:='` never. The rule is deliberately
     one-sided — a stale capture would be unsound, a redundant re-read only costs a read.
+    **Per-element census of the hot shape** (`ensure_at_least 8 1` + a small `integer` over a
+    comprehension's context): the program is a load-time `Vec<Operand>` (there is no term-level
+    re-decode, and **no** pre-decoded/cached form either), so one element costs ~17 word loads
+    (≈10 of them the context block), 1 subject byte read, 3 word writes (the `Dst` context, the
+    context's `start`, the result register), 2 operand decodes, 2 `atom_name` classifications, 2
+    out-of-line calls (`exec_other`, `decode_flags_slow`+`list_elements`), and **zero** rooted
+    allocations / `Vec` / `Box`. `bs_start_match3` beside it is the reuse arm (one operand read,
+    two header probes, one write). The residual cost of a binary comprehension is therefore the
+    enclosing **5–6 instructions per element** at the tier's per-instruction price, not this
+    decode — do not optimise the decode against a 16 ns/instruction floor.
   - `reads.rs` → the fixed field readers: `read_integer_field`/`read_wide_integer_field`,
     `read_float_field` + `f16_to_f32`, `decode_utf8`/`decode_utf16`/`decode_utf32`, the
     shared `field_is_little` endianness resolver, and the byte/bit helpers they share.
