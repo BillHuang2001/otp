@@ -284,6 +284,17 @@ gap, and a profile says the gap is not in this crate. Instrument: `perf record -
 `gc_class`'s copy fixture (`{K, [{K,I,I+K} || I <- 1..64]}` — ~390 words, above the 233-word
 nursery) and a `copy_bound`-shaped small payload (~15 words, no codec call). Self times, % of total.
 
+**What these rows measure now.** The capture was taken while a `receive` park held
+`ParkExemption::Always`, so the fragment branch was on-path for essentially every delivery and the
+`send_fragmented_message` / `alloc_small` rows are that route's cost. Today the park publishes the
+parked engine's host-held terms through `Registers::extra_roots` (`../beam_rt/src/runner/entry.rs`'s
+`append_parked_host_terms` / `adopt_relocated_parked_roots`), so `has_unpublished_roots()` is false
+for an ordinary `receive`-parked receiver and the delivery collects and grows into that receiver's
+own heap: the `Process::deliver` direct-copy row is the current default shape, and the fragment rows
+are reached only by the remaining refusal classes (a `Running` receiver, a relocation-exempt one, a
+destination still full after collection + growth). The `copy_struct` / `preflight_words` rows and
+the `CollectionGate`-walk row are unchanged — they sit on the direct copy.
+
 | frame | 390-word | 15-word |
 |---|---|---|
 | the whole send hop (`families::dispatch` → `deliver_message*` → `deliver_into_mailbox`) | **52.0** | ~26 |
@@ -304,34 +315,41 @@ Measured consequences:
   reports 1.57 collections per round trip on the Rust side against the oracle's 1.17 (31 369 GCs /
   20 000 rounds vs 23 336), and the profiler puts the whole collection at ~2 % of the op. A
   "collect-less-often" lever would move ~1 % of that row; the copy path holds the rest.
-* **Every delivery is attempted twice.** `deliver_into_mailbox` reaches the fragment path only on the
-  copier's raw `AllocKind::Message` preflight refusal — which the profiler shows is the *common*
-  case, not the exception: the fragment branch costs 24.8 % while the direct copy costs 20.8 %. For a
-  15-word payload the direct copy is 1.8 % against a 19.6 % fragment branch, i.e. **essentially every
-  small message also becomes a malloc'd `HeapFragment`**, so each hop pays a carrier allocation
-  (`alloc_small` 18.6 %) and a second full copy.
+* **A refused delivery is attempted twice.** `deliver_into_mailbox` reaches the fragment path only on
+  the copier's raw `AllocKind::Message` preflight refusal, and in the captured run that refusal was
+  the *common* case: the fragment branch costs 24.8 % against the direct copy's 20.8 % (for a 15-word
+  payload, 19.6 % against 1.8 %, so the message also became a `malloc`'d `HeapFragment` and the hop
+  paid a carrier allocation — `alloc_small` 18.6 % — plus a second full copy). Those rows are the
+  price of the fragment route, which today only a `Running` receiver, a relocation-exempt one, or a
+  destination still full after collection + growth reaches; an ordinary `receive`-parked receiver
+  takes the direct-copy rows.
 * **The preflight is the single most expensive thing in a large-payload hop**: 41.9 % of the whole
   program, holding a per-call `HashSet<usize>` on-path set hashed with SipHash-1-3.
-* The mechanism chain is in the code, not inferred: `RuntimeRunner::park_window` gives a `receive`
-  park `ParkExemption::Always` (`../beam_rt/src/runner/run.rs`), so the parked receiver's
-  `Process::has_unpublished_roots()` is true, so `Process::deliver` returns its raw refusal instead
-  of collecting/growing that heap, so `deliver_into_mailbox` copies into a fresh fragment. A receiver
-  blocked in `receive` is the overwhelmingly common delivery target — it is the whole shape of a
-  ping-pong, and of every server loop.
-
+* The mechanism chain is in the code, not inferred. A delivery to a receiver blocked in `receive` —
+  the whole shape of a ping-pong, and of every server loop — runs: `RuntimeRunner::park_window`
+  (`../beam_rt/src/runner/run.rs`) holds `ParkExemption::LiveFloats`, and only for a non-empty
+  float-register prefix; the parked engine publishes its host-held terms (`ProcessEngine::args`,
+  `ProcessEntry::Fun::fun`, `LocalFunTarget::args`) through `Registers::extra_roots`, so
+  `Process::has_unpublished_roots()` is false; `Process::deliver` collects and grows that heap; and
+  `deliver_into_mailbox` copies **straight into it** — no fragment, no carrier allocation, no second
+  copy. The raw refusal is left to a `Running` receiver, a relocation-exempt one and a destination
+  still full after collection + growth.
 ### The two changes the profile attributes outside this crate
-
-Neither belongs here; recorded with their anchors so a sibling node can land them.
-
-1. **`../beam_rt`, `src/runner/run.rs`'s `park_window`** — publish the parked machine's host-held
-   terms (`ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args`; the reason
-   `ParkExemption::Always` exists) through the `Registers::extra_roots` seam this crate already
-   gathers and scatters (`src/process.rs::gather_roots`/`scatter_roots`, pinned by
-   `run_rooted_collection_gathers_and_scatters_the_extra_roots`), and a `receive` park can then hold
-   `LiveFloats` instead of `Always`. A delivery to a blocked receiver then passes
-   `has_unpublished_roots`, so `Process::deliver` collects/grows its nursery and copies **straight
-   into it** — no fragment, no carrier allocation, no second copy, and the message is where the C
-   puts it.
+Neither belongs here; recorded with their anchors, their landing state and the seam each turns on.
+1. **`../beam_rt`, `src/runner/run.rs`'s `park_window`** — **landed**. The parked engine publishes
+   its host-held terms (`ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args`)
+   through the `Registers::extra_roots` seam this crate gathers and scatters
+   (`src/process.rs::gather_roots`/`scatter_roots`, pinned by
+   `run_rooted_collection_gathers_and_scatters_the_extra_roots`; the host side is
+   `../beam_rt/src/runner/entry.rs`'s `append_parked_host_terms` / `adopt_relocated_parked_roots`),
+   so a `receive` park holds only `ParkExemption::LiveFloats`, and only for a non-empty float
+   prefix. A delivery to a blocked receiver therefore passes `has_unpublished_roots`,
+   `Process::deliver` collects/grows its nursery and copies **straight into it** — no fragment, no
+   carrier allocation, no second copy — and the message is where the C puts it. `beam_rt`'s
+   `a_delivery_into_a_receive_parked_process_copies_straight_into_its_heap`
+   (`../beam_rt/src/runner/tests.rs`) pins the shape (`fragments().is_none()`, the payload moving
+   with the receiver's heap), and this crate's gate ordering still settles the residual refusal
+   classes through the O(1) crate-owned predicate before any host walk.
 2. **`../beam_message`, `src/copy.rs::preflight_words` + `../beam_term`, `src/size.rs::sizing_walk`**
    — the size preflight allocates a `HashSet<usize>` and a `Vec<Step>` **per call** and hashes every
    object on the path with SipHash-1-3. A caller-owned reusable scratch (or a small on-path vector

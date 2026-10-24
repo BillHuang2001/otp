@@ -1131,9 +1131,13 @@ impl ProcessTable {
     /// does not already decline: both sides are pure and OR-ed, so the decision is identical, but
     /// the host implementation is free to be an O(live objects) reachability walk (that is exactly
     /// what `beam_rt`'s unscanned-root valve is) and there is nothing for it to add once the
-    /// receiver already declines. This matters on the per-message hot path: the runner marks a
-    /// `receive`-parked process relocation-exempt for its whole parked window, so the overwhelmingly
-    /// common delivery target is one whose answer is already known.    ///
+    /// receiver already declines. This matters on the per-message hot path, where the cheap half
+    /// settles a `Running` receiver and one whose host holds live terms off the published root set
+    /// without the host's O(live objects) walk. A receiver suspended in `receive` — the
+    /// overwhelmingly common delivery target — is neither: its park publishes the engine's
+    /// host-held terms through `Registers::extra_roots`, so the delivery collects and grows into
+    /// that receiver's heap instead of declining, and the host gate is consulted (answering no).
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when `to` is unknown; propagates the copy engine's
@@ -1161,9 +1165,11 @@ impl ProcessTable {
         };
         // The crate-owned O(1) predicate first (relocation-exempt, or `Running`), the host gate
         // only when it does not already decline: `||` is commutative and both sides are pure, so
-        // the decision is unchanged, while the host's O(live objects) walk is skipped for the
-        // overwhelmingly common case — the runner marks a `receive`-parked process
-        // relocation-exempt for its whole parked window.
+        // the decision is unchanged, while the host's O(live objects) walk is skipped whenever the
+        // cheap half already answers — a `Running` receiver, or one whose host holds live terms
+        // off the published root set. A `receive`-parked receiver is neither (its park publishes
+        // the engine's host-held terms through `Registers::extra_roots`), so the delivery collects
+        // and grows into its heap and the gate is consulted, answering no.
         let decline = recipient.has_unpublished_roots()
             || collection_gate
                 .as_deref_mut()
@@ -5753,8 +5759,8 @@ mod tests {
 
     /// The **ordering** half of the delivery site: a receiver the crate's own O(1)
     /// `Process::has_unpublished_roots` predicate already declines (here: relocation-exempt — the
-    /// runner's shape for a `receive`-parked process, i.e. the overwhelmingly common delivery
-    /// target) is decided **without the host gate being consulted at all**, and the outcome is
+    /// shape of a host that holds live terms off the published root set) is decided **without the
+    /// host gate being consulted at all**, and the outcome is
     /// byte-identical: the raw `AllocKind::Heap`/`AllocKind::Message` refusal the caller's
     /// heap-fragment route keys on, no collection, no growth, nothing enqueued, and the receiver's
     /// own exemption flag kept.
