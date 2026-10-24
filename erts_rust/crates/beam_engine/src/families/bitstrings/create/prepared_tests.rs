@@ -118,7 +118,7 @@ fn atom(module: &Module) -> Operand {
 /// A small-integer term in register `index`.
 fn set_small(machine: &mut Machine, index: u32, value: i64) {
     let term = beam_term::try_make_small(value).expect("a small integer");
-    machine.set_x(index as usize, term).expect("register in range");
+    machine.set_x(index, term).expect("register in range");
 }
 
 /// Run one route over `segments` and reduce it to `(bytes, nbits)` or an error string.
@@ -688,7 +688,7 @@ fn a_byte_field_takes_the_direct_store() {
         );
         let before_stores = byte_field_stores();
         let before_fallbacks = byte_field_fallbacks();
-        let segments = {
+        let _segments = {
             let mut segments = seg(&module, "integer", 1, Operand::Integer(1), Operand::Integer(8));
             for size in [8i64, 16, 32, 64] {
                 segments.extend(seg(
@@ -739,7 +739,7 @@ fn a_byte_field_takes_the_direct_store() {
         );
         let before_stores = byte_field_stores();
         let before_fallbacks = byte_field_fallbacks();
-        let built = prepared::assemble_prepared(
+        let _built = prepared::assemble_prepared(
             &mut machine,
             &module,
             &LabelMap::default(),
@@ -864,9 +864,9 @@ fn one_reservation_matches_the_per_field_capacity_checks() {
         (
             bytes,
             nbits,
-            counters.in_place_grows,
-            counters.moves,
-            counters.bytes_copied,
+            counters.in_place_grows as u64,
+            counters.moves as u64,
+            counters.bytes_copied as u64,
         )
     }
 
