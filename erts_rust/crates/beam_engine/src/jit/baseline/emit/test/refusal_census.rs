@@ -19,14 +19,20 @@
 // %CopyrightEnd%
 
 //! A **test-only refusal census**: *why* the baseline tier's `test` / `select_val` /
-//! `select_tuple_arity` inliners refuse the shapes they still refuse, and which BIF
-//! names the `bif` / `gc_bif` / `bif0` deopt pool actually covers.
+//! `select_tuple_arity` inliners refuse the shapes they still refuse, which BIF
+//! names the `bif` / `gc_bif` / `bif0` deopt pool actually covers, and — in the
+//! `Bitstring refusals` section — why each `Bs*` bitstring shape the tier *has* an
+//! inline arm for was still not lowered (plus which `Bs*` opcodes have no arm at all).
 //!
 //! The sibling [`super::super::census`] counts *how many* refusals each variant has;
 //! this attributes every refusal to the exact predicate / operand shape that caused
 //! it, which is the evidence a follow-up inline-set widening is chosen from. It is
 //! declared behind `#[cfg(test)]` from [`super::test`], so it is absent from every
 //! production build (zero cost by construction).
+//!
+//! Every attribution is derived from the emitter's **own** predicate — the census
+//! asks the shape function first and only classifies a genuine refusal — so the
+//! report cannot drift from what the tier actually lowers.
 //!
 //! Run with `--nocapture`:
 //! `... cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine refusal -- --nocapture`
@@ -45,6 +51,7 @@ use crate::machine::MAX_REGISTER;
 
 use super::super::arith::{fast_arith, import_names};
 use super::super::bif::bif_shape;
+use super::super::bitstr_inline;
 use super::super::compare::comparison_shape;
 use super::super::operands::{constant_word, x_register, Loc};
 use super::{test_plan, test_src};
@@ -275,6 +282,401 @@ fn already_inlined(module: &Module, instr: &Instr) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bitstring inline refusals
+//
+// The tier natively lowers eight `Bs*` shapes (`emit/bitstr_inline.rs`); every other
+// `Bs*` instruction goes to the family arm, and every one of the eight can still be
+// *refused* by its own shape predicate. This section attributes those refusals.
+//
+// The vocabulary is closed: each reason string below is emitted from exactly one
+// place, so the table cannot grow an unlisted bucket, and every `Bs*` instruction the
+// corpus holds lands in exactly one of `inlined` / a reason / `no inline arm`.
+// ---------------------------------------------------------------------------
+
+/// (a) — a `bs_match` command list holding a command that builds a fresh term.
+const BS_REASON_ALLOC: &str = "allocating command (binary/get_tail/=:=)";
+/// (b) — a subject (or position/destination) operand that lives in the literal area.
+const BS_REASON_LITERAL: &str = "literal-area subject";
+/// (c) — a non-constant size/unit/stride operand (the register form).
+const BS_REASON_RUNTIME: &str = "runtime size/unit/stride";
+/// (d) — an `ensure_at_least` unit that is not a power of two (or is zero).
+const BS_REASON_UNIT: &str = "non-power-of-two ensure_at_least unit";
+/// (e) — the width rule: `nbits > MAX_SMALL`, or not `<= 16` and not `== 32`.
+const BS_REASON_WIDTH: &str = "width rule (nbits > MAX_SMALL or not <=16/==32)";
+/// (f) — `NO_FAIL` on a shape whose miss path has no `MatchFail::Family` arm.
+const BS_REASON_NO_FAIL: &str = "NO_FAIL with no MatchFail::Family arm";
+/// (g) — a real fail label that does not resolve in the module's label map.
+const BS_REASON_LABEL: &str = "unresolved fail label";
+/// (h) — more than one `Y` destination in one `bs_match` command list.
+const BS_REASON_Y_DST: &str = ">1 Y destination";
+/// (i) — a signed, little-endian or native-endian field.
+const BS_REASON_FIELD: &str = "signed/little/native field";
+/// The explicit catch-all: everything the nine rules above do not name (an unmodelled
+/// flag atom, a truncated command group, a non-`Loc` destination that is not a literal).
+const BS_REASON_OTHER: &str = "other";
+
+/// What the bitstring inline set does with one instruction.
+enum BsVerdict {
+    /// Not a `Bs*` variant at all.
+    NotBitstring,
+    /// A `Bs*` variant the tier has **no** inline arm for.
+    NoArm(&'static str),
+    /// A `Bs*` variant an arm covers, whose shape predicate accepted it.
+    Inlined(&'static str),
+    /// A `Bs*` variant an arm covers, whose shape predicate refused it.
+    Refused(&'static str, String),
+}
+
+/// The refusal reason for a shape whose only remaining objection is an operand that is
+/// neither an in-bound `x` register nor an addressable `Y` slot: a **literal-area** operand
+/// gets its own bucket, anything else the explicit catch-all.
+fn operand_refusal(operands: &[&Operand]) -> String {
+    if operands.iter().any(|op| matches!(op, Operand::Literal(_))) {
+        BS_REASON_LITERAL.to_string()
+    } else {
+        BS_REASON_OTHER.to_string()
+    }
+}
+
+/// (f)/(g) — the fail half every label-carrying shape shares, or `None` when the fail
+/// operand is one the shape can inline. Only the shapes with **no** `MatchFail::Family` arm
+/// come here: `bs_start_match3`/`4` accept `NO_FAIL` outright and classify it themselves.
+fn fail_refusal(labels: &LabelMap, fail: Label) -> Option<String> {
+    if fail == NO_FAIL {
+        return Some(BS_REASON_NO_FAIL.to_string());
+    }
+    if labels.resolve(fail).is_err() {
+        return Some(BS_REASON_LABEL.to_string());
+    }
+    None
+}
+
+/// (e) — the width rule over an already-decoded `size * unit`: `None` when the field is one
+/// [`bitstr_inline::emit_bit_extract`] covers, else the refusal. An overflowing product is
+/// the same refusal (no covered width can be that large).
+fn width_refusal(size: usize, unit: usize) -> Option<String> {
+    match size.checked_mul(unit) {
+        Some(nbits) if bitstr_inline::field_width_supported(nbits) => None,
+        _ => Some(BS_REASON_WIDTH.to_string()),
+    }
+}
+
+/// The field-decoding refusal of a `bs_get_integer2`, in the report's documented
+/// precedence:
+///
+/// 1. (i) the field form — `flags` is static, so a signed/little/native field is decidable
+///    before the size is;
+/// 2. (c) a runtime size — without a constant there is no `nbits` for (e) to test;
+/// 3. (e) the width rule. (`unit` is a plain immediate here, so it can never be runtime.)
+fn get_integer2_refusal(size: &Operand, unit: u32, flags: u32) -> Option<String> {
+    if bitstr_inline::field_is_unsupported(flags) {
+        return Some(BS_REASON_FIELD.to_string());
+    }
+    let Some(size) = bitstr_inline::bs_match_static_size(size) else {
+        return Some(BS_REASON_RUNTIME.to_string());
+    };
+    width_refusal(size, unit as usize)
+}
+
+/// The field-decoding refusal of a `bs_match` `integer` command — [`get_integer2_refusal`]'s
+/// precedence with one extra step, because the command's `unit` is an **operand** and can
+/// therefore itself be the runtime form.
+fn integer_command_refusal(size: &Operand, unit: &Operand, flags: u32) -> Option<String> {
+    if bitstr_inline::field_is_unsupported(flags) {
+        return Some(BS_REASON_FIELD.to_string());
+    }
+    let Some(size) = bitstr_inline::bs_match_static_size(size) else {
+        return Some(BS_REASON_RUNTIME.to_string());
+    };
+    let Some(unit) = bitstr_inline::bs_match_static_size(unit) else {
+        return Some(BS_REASON_RUNTIME.to_string());
+    };
+    width_refusal(size, unit)
+}
+
+/// (a) — the command **names** of a `bs_match` list, in program order, or `None` when the
+/// list cannot be walked at all (an unknown command name or a group running past the end):
+/// the family's own typed "invalid/truncated command list", which the report attributes
+/// `other`.
+fn match_command_names<'m>(module: &'m Module, commands: &[Operand]) -> Option<Vec<&'m str>> {
+    let mut names = Vec::with_capacity(commands.len() / 2 + 1);
+    let mut i = 0usize;
+    while i < commands.len() {
+        let Operand::Atom(atom) = &commands[i] else {
+            return None;
+        };
+        let name = module.atom_name(*atom)?;
+        let width = bitstr_inline::bs_match_group_len(name)?;
+        let end = i.checked_add(width)?;
+        if end > commands.len() {
+            return None;
+        }
+        names.push(name);
+        i = end;
+    }
+    Some(names)
+}
+
+/// (c)/(d)/(e)/(h) — the `bs_match` command walk, one group at a time, in program order, so
+/// the attribution names the first group that actually declines. `None` when every group is
+/// lowerable. A malformed list (an unknown command, a truncated group) is `other`.
+fn match_group_refusal(module: &Module, commands: &[Operand]) -> Option<String> {
+    let mut y_destinations = 0usize;
+    let mut i = 0usize;
+    while i < commands.len() {
+        let Operand::Atom(command) = &commands[i] else {
+            return Some(BS_REASON_OTHER.to_string());
+        };
+        let Some(name) = module.atom_name(*command) else {
+            return Some(BS_REASON_OTHER.to_string());
+        };
+        let Some(width) = bitstr_inline::bs_match_group_len(name) else {
+            return Some(BS_REASON_OTHER.to_string());
+        };
+        let Some(end) = i.checked_add(width) else {
+            return Some(BS_REASON_OTHER.to_string());
+        };
+        if end > commands.len() {
+            return Some(BS_REASON_OTHER.to_string());
+        }
+        match name {
+            "ensure_at_least" => {
+                let Some(size) = commands.get(i + 1) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                if bitstr_inline::bs_match_static_size(size).is_none() {
+                    return Some(BS_REASON_RUNTIME.to_string());
+                }
+                let Some(unit) = commands.get(i + 2) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                let Some(unit) = bitstr_inline::bs_match_static_size(unit) else {
+                    return Some(BS_REASON_RUNTIME.to_string());
+                };
+                // `remaining % unit` must lower to a mask; `unit == 0` is a division by zero.
+                if !unit.is_power_of_two() {
+                    return Some(BS_REASON_UNIT.to_string());
+                }
+            }
+            "ensure_exactly" | "skip" => {
+                let Some(stride) = commands.get(i + 1) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                if bitstr_inline::bs_match_static_size(stride).is_none() {
+                    return Some(BS_REASON_RUNTIME.to_string());
+                }
+            }
+            "integer" => {
+                let Some(flags) = commands.get(i + 2) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                let Some(flags) = bitstr_inline::bs_match_integer_flags(module, flags) else {
+                    // An unmodelled flag atom: the family decides, so the report cannot say
+                    // a signed/little field caused it.
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                let Some(size) = commands.get(i + 3) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                let Some(unit_op) = commands.get(i + 4) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                // Same precedence as `bs_get_integer2`, except a `bs_match` `integer`
+                // command's unit is an operand and so can itself be runtime.
+                if let Some(reason) = integer_command_refusal(size, unit_op, flags) {
+                    return Some(reason);
+                }
+                let Some(dst) = commands.get(i + 5) else {
+                    return Some(BS_REASON_OTHER.to_string());
+                };
+                let Some(loc) = Loc::of(dst) else {
+                    return Some(operand_refusal(&[dst]));
+                };
+                if loc.is_y() {
+                    y_destinations += 1;
+                    if y_destinations > 1 {
+                        return Some(BS_REASON_Y_DST.to_string());
+                    }
+                }
+            }
+            // The name pass already returned (a) for these; kept for totality.
+            "binary" | "get_tail" | "=:=" => return Some(BS_REASON_ALLOC.to_string()),
+            _ => return Some(BS_REASON_OTHER.to_string()),
+        }
+        i = end;
+    }
+    None
+}
+
+/// The reason a `bs_match` was refused, in the report's documented precedence: (a) the
+/// allocating command anywhere in the list wins outright — it makes the **whole** list
+/// unlowerable whatever else it holds — then the command walk, then (f)/(g), then (b).
+fn match_refusal(
+    module: &Module,
+    labels: &LabelMap,
+    fail: Label,
+    ctx: &Operand,
+    commands: &[Operand],
+) -> String {
+    match match_command_names(module, commands) {
+        Some(names) => {
+            if names
+                .iter()
+                .any(|name| matches!(*name, "binary" | "get_tail" | "=:="))
+            {
+                return BS_REASON_ALLOC.to_string();
+            }
+        }
+        None => return BS_REASON_OTHER.to_string(),
+    }
+    if let Some(reason) = match_group_refusal(module, commands) {
+        return reason;
+    }
+    if let Some(reason) = fail_refusal(labels, fail) {
+        return reason;
+    }
+    operand_refusal(&[ctx])
+}
+
+/// What the bitstring inline set does with one instruction: ask the emitter's own shape
+/// predicate first (a refusal the emitter would not make must never be reported), and only
+/// then classify the refusal.
+fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVerdict {
+    match instr {
+        Instr::BsGetPosition { ctx, dst, .. } => {
+            const OP: &str = "bs_get_position";
+            if bitstr_inline::get_position_shape(ctx, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            BsVerdict::Refused(OP, operand_refusal(&[ctx, dst]))
+        }
+        Instr::BsSetPosition { ctx, pos } => {
+            const OP: &str = "bs_set_position";
+            if bitstr_inline::set_position_shape(ctx, pos).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            BsVerdict::Refused(OP, operand_refusal(&[ctx, pos]))
+        }
+        Instr::BsTestTail2 { fail, ctx, bits } => {
+            const OP: &str = "bs_test_tail2";
+            if bitstr_inline::test_tail2_shape(labels, *fail, ctx, *bits).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason =
+                fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsSkipBits2 {
+            fail,
+            ctx,
+            size,
+            unit,
+            ..
+        } => {
+            const OP: &str = "bs_skip_bits2";
+            if bitstr_inline::skip_bits2_shape(labels, *fail, ctx, size, *unit).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason = runtime_size_refusal(size, *unit)
+                .or_else(|| fail_refusal(labels, *fail))
+                .unwrap_or_else(|| operand_refusal(&[ctx]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsStartMatch3 { fail, bin, dst, .. } => {
+            const OP: &str = "bs_start_match3";
+            if bitstr_inline::start_match3_shape(labels, *fail, bin, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // `NO_FAIL` IS this shape's `MatchFail::Family` arm, so it is accepted — only a
+            // real but unresolvable label is a label refusal.
+            let reason = if *fail != NO_FAIL && labels.resolve(*fail).is_err() {
+                BS_REASON_LABEL.to_string()
+            } else {
+                operand_refusal(&[bin, dst])
+            };
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsStartMatch4 {
+            fail, src, dst, ..
+        } => {
+            const OP: &str = "bs_start_match4";
+            if bitstr_inline::start_match4_shape(module, labels, fail, src, dst).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason = match fail {
+                Operand::Label(label) if *label != NO_FAIL && labels.resolve(*label).is_err() => {
+                    BS_REASON_LABEL.to_string()
+                }
+                Operand::Label(_) => operand_refusal(&[src, dst]),
+                // `no_fail` and `resume` are both accepted arms; any other atom — or an
+                // atom id the module cannot name — is the family's own typed refusal.
+                Operand::Atom(atom) => match module.atom_name(*atom) {
+                    Some("no_fail") | Some("resume") => operand_refusal(&[src, dst]),
+                    _ => BS_REASON_OTHER.to_string(),
+                },
+                _ => BS_REASON_OTHER.to_string(),
+            };
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsGetInteger2(args) => {
+            const OP: &str = "bs_get_integer2";
+            let inlined = bitstr_inline::get_integer2_shape(
+                labels,
+                args.fail,
+                &args.ctx,
+                &args.size,
+                args.unit,
+                args.flags,
+                &args.dst,
+            )
+            .is_some();
+            if inlined {
+                return BsVerdict::Inlined(OP);
+            }
+            let reason = get_integer2_refusal(&args.size, args.unit, args.flags)
+                .or_else(|| fail_refusal(labels, args.fail))
+                .unwrap_or_else(|| operand_refusal(&[&args.ctx, &args.dst]));
+            BsVerdict::Refused(OP, reason)
+        }
+        Instr::BsMatch { fail, ctx, commands } => {
+            const OP: &str = "bs_match";
+            if bitstr_inline::bs_match_shape(labels, module, *fail, ctx, commands).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            BsVerdict::Refused(OP, match_refusal(module, labels, *fail, ctx, commands))
+        }
+        // The remaining `Bs*` variants have no inline arm at all — reported so the corpus
+        // view is complete, never silently dropped.
+        Instr::BsMatchString { .. } => BsVerdict::NoArm("bs_match_string"),
+        Instr::BsGetTail { .. } => BsVerdict::NoArm("bs_get_tail"),
+        Instr::BsGetFloat2(_) => BsVerdict::NoArm("bs_get_float2"),
+        Instr::BsGetBinary2(_) => BsVerdict::NoArm("bs_get_binary2"),
+        Instr::BsGetUtf8 { .. } => BsVerdict::NoArm("bs_get_utf8"),
+        Instr::BsGetUtf16 { .. } => BsVerdict::NoArm("bs_get_utf16"),
+        Instr::BsGetUtf32 { .. } => BsVerdict::NoArm("bs_get_utf32"),
+        Instr::BsSkipUtf8 { .. } => BsVerdict::NoArm("bs_skip_utf8"),
+        Instr::BsSkipUtf16 { .. } => BsVerdict::NoArm("bs_skip_utf16"),
+        Instr::BsSkipUtf32 { .. } => BsVerdict::NoArm("bs_skip_utf32"),
+        Instr::BsInitWritable => BsVerdict::NoArm("bs_init_writable"),
+        Instr::BsCreateBin { .. } => BsVerdict::NoArm("bs_create_bin"),
+        _ => BsVerdict::NotBitstring,
+    }
+}
+
+/// (c) for `bs_skip_bits2`, whose `unit` is a plain immediate rather than an operand: a
+/// non-constant size, or a `size * unit` that cannot be an `i64` immediate (`other` — that
+/// is not the width rule, it is an unaddressable stride).
+fn runtime_size_refusal(size: &Operand, unit: u32) -> Option<String> {
+    let Some(size) = bitstr_inline::bs_match_static_size(size) else {
+        return Some(BS_REASON_RUNTIME.to_string());
+    };
+    match size.checked_mul(unit as usize) {
+        Some(nbits) if nbits <= i64::MAX as usize => None,
+        _ => Some(BS_REASON_OTHER.to_string()),
+    }
+}
+
 /// Every committed `*.beam` fixture (no hardcoded names).
 fn fixture_corpus() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -357,6 +759,12 @@ fn the_refusal_attribution_census_is_printed() {
     let mut bifs: BTreeMap<String, u64> = BTreeMap::new();
     let mut gcbifs: BTreeMap<String, u64> = BTreeMap::new();
     let mut bif0s: BTreeMap<String, u64> = BTreeMap::new();
+    // opcode -> reason -> count, and the two non-refusal buckets (see `BsVerdict`).
+    let mut bs_refusals: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut bs_inlined: BTreeMap<String, u64> = BTreeMap::new();
+    let mut bs_no_arm: BTreeMap<String, u64> = BTreeMap::new();
+    // Every `Bs*` instruction the walk met — the "never silently dropped" pin.
+    let mut bs_seen = 0u64;
     let mut modules_loaded = 0u64;
 
     for path in &paths {
@@ -410,7 +818,25 @@ fn the_refusal_attribution_census_is_printed() {
                     Instr::Bif0 { bif, .. } => {
                         *bif0s.entry(bif_name(&module, *bif)).or_insert(0) += 1;
                     }
-                    _ => {}
+                    _ => match bitstring_verdict(&module, &labels, instr) {
+                        BsVerdict::NotBitstring => {}
+                        BsVerdict::NoArm(op) => {
+                            bs_seen += 1;
+                            *bs_no_arm.entry(op.to_string()).or_insert(0) += 1;
+                        }
+                        BsVerdict::Inlined(op) => {
+                            bs_seen += 1;
+                            *bs_inlined.entry(op.to_string()).or_insert(0) += 1;
+                        }
+                        BsVerdict::Refused(op, reason) => {
+                            bs_seen += 1;
+                            *bs_refusals
+                                .entry(op.to_string())
+                                .or_default()
+                                .entry(reason)
+                                .or_insert(0) += 1;
+                        }
+                    },
                 }
             }
         }
@@ -478,4 +904,58 @@ fn the_refusal_attribution_census_is_printed() {
     for (name, count) in b0_rows.iter().take(40) {
         println!("{count:>7}  {name}");
     }
+
+    // ---- bitstring inline refusals (see `BsVerdict`) -----------------------
+    println!();
+    println!("-- bitstring inline refusals: opcode | reason | count --");
+    let mut bs_rows: Vec<(String, String, u64)> = Vec::new();
+    for (opcode, reasons) in &bs_refusals {
+        for (reason, count) in reasons {
+            bs_rows.push((opcode.clone(), reason.clone(), *count));
+        }
+    }
+    bs_rows.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    let bs_refused_total: u64 = bs_rows.iter().map(|r| r.2).sum();
+    let bs_inlined_total: u64 = bs_inlined.values().sum();
+    let bs_no_arm_total: u64 = bs_no_arm.values().sum();
+    println!(
+        "totals: bs_instructions={bs_seen} inlined={bs_inlined_total} \
+         refused={bs_refused_total} no_arm={bs_no_arm_total}"
+    );
+    for (opcode, reason, count) in &bs_rows {
+        println!("{count:>7}  {opcode:<20} {reason}");
+    }
+
+    // The `inlined` half, per opcode, so a refusal count reads against its denominator.
+    println!();
+    println!("-- bitstring inline accounting: inlined | refused | opcode --");
+    let mut bs_ops: Vec<String> = bs_inlined.keys().chain(bs_refusals.keys()).cloned().collect();
+    bs_ops.sort();
+    bs_ops.dedup();
+    for opcode in &bs_ops {
+        let inlined = bs_inlined.get(opcode).copied().unwrap_or(0);
+        let refused = bs_refusals.get(opcode).map(|r| r.values().sum::<u64>()).unwrap_or(0);
+        println!("{inlined:>7} {refused:>8}  {opcode}");
+    }
+
+    // Every other `Bs*` opcode: no arm at all (never silently dropped from the view).
+    println!();
+    println!("-- bitstring opcodes with no inline arm: count | opcode --");
+    let mut na_rows: Vec<(String, u64)> = bs_no_arm.into_iter().collect();
+    na_rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (opcode, count) in &na_rows {
+        println!("{count:>7}  {opcode}");
+    }
+
+    // The section's own pins: the corpus really does hold bitstring instructions, and every
+    // one of them landed in exactly one bucket (`seen` == inlined + refused + no-arm).
+    assert!(
+        bs_seen > 0,
+        "the corpus must contain at least one bitstring instruction"
+    );
+    assert_eq!(
+        bs_seen,
+        bs_inlined_total + bs_refused_total + bs_no_arm_total,
+        "every `Bs*` instruction must land in exactly one bitstring bucket"
+    );
 }

@@ -1462,10 +1462,10 @@ impl GetInteger2Shape {
             _ => return None,
         };
         let nbits = size.checked_mul(unit as usize)?;
-        if nbits > MAX_SMALL as usize || !(nbits <= 16 || nbits == 32) {
+        if !field_width_supported(nbits) {
             return None;
         }
-        if flags & BSF_SIGNED != 0 || field_is_little(flags) {
+        if field_is_unsupported(flags) {
             return None;
         }
         Some(GetInteger2Shape {
@@ -1502,6 +1502,26 @@ impl GetInteger2Shape {
     pub(crate) fn uses_y(&self) -> bool {
         self.ctx.is_y() || self.dst.is_y()
     }
+}
+
+/// Whether a field of `nbits` bits is one [`emit_bit_extract`] can read directly.
+///
+/// The single definition of the tier's **width rule**: the extracted value must fit a
+/// small integer (`<= MAX_SMALL`, so the result is a bare `make_small` with no allocation)
+/// **and** be one of the widths the extraction sequence covers (`<= 16`, or exactly `32`).
+/// Every field-extracting shape consults it, and so does the refusal census that attributes
+/// the fields the tier declines — one rule, so the two cannot drift apart.
+pub(crate) fn field_width_supported(nbits: usize) -> bool {
+    nbits <= MAX_SMALL as usize && (nbits <= 16 || nbits == 32)
+}
+
+/// Whether `flags` asks for a field form this family's inline readers do not model: a
+/// **signed** field (needs a sign extension) or a little/native-endian one (a byte-swapping
+/// read). Both are the family's `erts_bs_get_integer_2` general path, so every
+/// field-extracting shape declines them; the refusal census attributes them through this
+/// same test.
+pub(crate) fn field_is_unsupported(flags: u32) -> bool {
+    flags & BSF_SIGNED != 0 || field_is_little(flags)
 }
 
 /// Whether `flags` asks for **little-endian** byte order.
@@ -1804,7 +1824,10 @@ pub(crate) struct BsMatchShape {
 /// re-derivation of the family's `prepared::group_len` (which is `pub(super)` inside the
 /// private `families::bitstrings` subtree), pinned against it by
 /// [`tests::the_command_group_lengths_match_the_familys_own`].
-fn bs_match_group_len(name: &str) -> Option<usize> {
+///
+/// The steps below are the census' too: `emit/test/refusal_census.rs` walks a command list
+/// with them to attribute the commands this shape declines.
+pub(crate) fn bs_match_group_len(name: &str) -> Option<usize> {
     match name {
         "ensure_at_least" => Some(3),
         "ensure_exactly" => Some(2),
@@ -1819,7 +1842,7 @@ fn bs_match_group_len(name: &str) -> Option<usize> {
 
 /// The accept rule of a **static** size/unit/stride operand — a local re-derivation of the
 /// family's `prepared::static_size`: a non-negative small integer or a character literal.
-fn bs_match_static_size(operand: &Operand) -> Option<usize> {
+pub(crate) fn bs_match_static_size(operand: &Operand) -> Option<usize> {
     match operand {
         Operand::Integer(n) if *n >= 0 && beam_term::try_make_small(*n).is_ok() => Some(*n as usize),
         Operand::Character(c) => Some(*c as usize),
@@ -1832,7 +1855,7 @@ fn bs_match_static_size(operand: &Operand) -> Option<usize> {
 /// family's `decode_flags`/`flag_bit` over the two operand forms the compiler emits (`Nil`,
 /// or a literal holding the flag-atom list). Only the four bits that change the value are
 /// named; `integer`/`unsigned`/`big` are the zero default, exactly as `flag_bit` reads them.
-fn bs_match_integer_flags(module: &Module, operand: &Operand) -> Option<u32> {
+pub(crate) fn bs_match_integer_flags(module: &Module, operand: &Operand) -> Option<u32> {
     fn flags_of(module: &Module, elem: Eterm) -> Option<u32> {
         let named = |name: &str| module.atom_table.lookup(name).map(beam_term::make_atom);
         let eq = |name: &str| named(name) == Some(elem);
@@ -1940,10 +1963,10 @@ impl BsMatchShape {
                     let size = bs_match_static_size(commands.get(i + 3)?)?;
                     let unit = bs_match_static_size(commands.get(i + 4)?)?;
                     let nbits = size.checked_mul(unit)?;
-                    if nbits > MAX_SMALL as usize || !(nbits <= 16 || nbits == 32) {
+                    if !field_width_supported(nbits) {
                         return None;
                     }
-                    if flags & BSF_SIGNED != 0 || field_is_little(flags) {
+                    if field_is_unsupported(flags) {
                         return None;
                     }
                     let dst = Loc::of(commands.get(i + 5)?)?;
