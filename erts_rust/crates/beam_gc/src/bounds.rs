@@ -205,10 +205,7 @@ impl ScannedBounds {
 
     /// The same interval tagged with `generation`.
     pub(crate) fn with_generation(self, generation: u64) -> ScannedBounds {
-        ScannedBounds {
-            generation,
-            ..self
-        }
+        ScannedBounds { generation, ..self }
     }
 }
 
@@ -250,10 +247,17 @@ mod tests {
 
     #[test]
     fn the_empty_aggregate_rejects_every_address() {
-        for bounds in [ScannedBounds::EMPTY, ScannedBounds::new(0, 0), ScannedBounds::new(9, 3)] {
+        for bounds in [
+            ScannedBounds::EMPTY,
+            ScannedBounds::new(0, 0),
+            ScannedBounds::new(9, 3),
+        ] {
             assert!(bounds.is_empty(), "{bounds:?} covers nothing");
             for addr in [0, 1, 3, 8, WORD, 0x1000, usize::MAX] {
-                assert!(!bounds.may_contain(addr), "{bounds:?} must reject {addr:#x}");
+                assert!(
+                    !bounds.may_contain(addr),
+                    "{bounds:?} must reject {addr:#x}"
+                );
                 assert!(
                     bounds.definitely_unscanned(addr as *const Eterm),
                     "a rejected address is definitely unscanned"
@@ -285,7 +289,10 @@ mod tests {
         assert!(!c.may_contain(0x2400));
 
         // The empty aggregate is the identity.
-        assert_eq!(ScannedBounds::EMPTY.covering(a), ScannedBounds::new(a.base(), a.limit()));
+        assert_eq!(
+            ScannedBounds::EMPTY.covering(a),
+            ScannedBounds::new(a.base(), a.limit())
+        );
         assert_eq!(a.covering(ScannedBounds::EMPTY), a);
         assert!(ScannedBounds::EMPTY
             .covering(ScannedBounds::EMPTY)
@@ -299,7 +306,10 @@ mod tests {
 
     #[test]
     fn span_words_counts_term_words_not_bytes() {
-        assert_eq!(ScannedBounds::new(0x1000, 0x1000 + 12 * WORD).span_words(), 12);
+        assert_eq!(
+            ScannedBounds::new(0x1000, 0x1000 + 12 * WORD).span_words(),
+            12
+        );
         // A limit below the base cannot underflow.
         assert_eq!(ScannedBounds::new(0x1000, 0x10).span_words(), 0);
     }
@@ -307,7 +317,14 @@ mod tests {
     #[test]
     fn definitely_unscanned_is_the_negation_of_may_contain() {
         let bounds = ScannedBounds::at(0x1000, 0x1000 + 4 * WORD, 3);
-        for addr in [0, 0xFFF, 0x1000, 0x1000 + 3 * WORD, 0x1000 + 4 * WORD, usize::MAX] {
+        for addr in [
+            0,
+            0xFFF,
+            0x1000,
+            0x1000 + 3 * WORD,
+            0x1000 + 4 * WORD,
+            usize::MAX,
+        ] {
             assert_eq!(
                 bounds.definitely_unscanned(addr as *const Eterm),
                 !bounds.may_contain(addr),

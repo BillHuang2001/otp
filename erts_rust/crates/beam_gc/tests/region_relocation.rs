@@ -107,9 +107,9 @@ mod fixtures;
 use fixtures::{
     build_grid, copied_run, from_set, header, list_cells, tuple_elements, Region, DEAD_A, DEAD_B,
     DEAD_C, DEAD_WORDS, LIVE_WORDS, OBJECTS,
-};// ---------------------------------------------------------------------------
-// (a) structure survives
-// ---------------------------------------------------------------------------
+}; // ---------------------------------------------------------------------------
+   // (a) structure survives
+   // ---------------------------------------------------------------------------
 
 #[test]
 fn cross_region_graph_relocates_with_its_structure_intact() {
@@ -157,7 +157,10 @@ fn cross_region_graph_relocates_with_its_structure_intact() {
     let span = base..base + LIVE_WORDS * size_of::<Eterm>();
     for (index, &root) in roots.iter().enumerate() {
         assert_ne!(ptr_val(root) as usize, before[index], "root {index} moved");
-        assert!(!from.contains(ptr_val(root)), "root {index} left the from-set");
+        assert!(
+            !from.contains(ptr_val(root)),
+            "root {index} left the from-set"
+        );
         assert!(
             span.contains(&(ptr_val(root) as usize)),
             "root {index} names a destination word"
@@ -193,7 +196,11 @@ fn cross_region_graph_relocates_with_its_structure_intact() {
     let env = unsafe { fun_env(fun) }.expect("a local fun's environment");
     assert_eq!(env.len(), 2);
     assert_eq!(env[0], elements[1], "the shared subterm is one copy");
-    assert_eq!(env[1], make_small(5), "an immediate free variable is unchanged");
+    assert_eq!(
+        env[1],
+        make_small(5),
+        "an immediate free variable is unchanged"
+    );
     // SAFETY: `fun` is the live, copied local fun.
     unsafe {
         assert_eq!(fun_uniq(fun).expect("a local fun"), 0xDEAD_BEEF);
@@ -333,7 +340,11 @@ fn per_slice_forwarding_accumulates_and_repeats_are_no_ops() {
         .forward_roots(std::slice::from_mut(&mut registers.first))
         .expect("repeat 1");
     relocator.forward_roots(&mut stack.rest).expect("repeat 2");
-    assert_eq!(relocator.words_copied(), after_third, "no repeat copied a word");
+    assert_eq!(
+        relocator.words_copied(),
+        after_third,
+        "no repeat copied a word"
+    );
     assert_eq!(relocator.objects_copied(), 3, "nor an object");
     assert_eq!(
         [registers.first, stack.rest[0], stack.rest[1]],
@@ -423,22 +434,42 @@ fn refc_binary_pair_copies_as_two_blocks_and_keeps_its_payload() {
         "the BinRef is its own allocation right after the SubBits block"
     );
     // SAFETY: `orig` is the live, copied `BinRef`, so words 0..=2 are in bounds.
-    let (bin_ref_header, val, next) =
-        unsafe { (*boxed_val(orig), *boxed_val(orig).add(1), *boxed_val(orig).add(2)) };
-    assert_eq!(bin_ref_header, HEADER_BIN_REF, "`orig` names the copied BinRef");
+    let (bin_ref_header, val, next) = unsafe {
+        (
+            *boxed_val(orig),
+            *boxed_val(orig).add(1),
+            *boxed_val(orig).add(2),
+        )
+    };
+    assert_eq!(
+        bin_ref_header, HEADER_BIN_REF,
+        "`orig` names the copied BinRef"
+    );
 
     // (iv) `BinRef.val` — the off-heap payload pointer — is copied **verbatim**: the payload
     // never moves, and the refcount is not touched (a relocation is not a refcount event).
-    assert_eq!(val.raw() as *mut u8, payload_ptr, "`val` is the payload pointer");
+    assert_eq!(
+        val.raw() as *mut u8,
+        payload_ptr,
+        "`val` is the payload pointer"
+    );
     assert_eq!(next.raw(), 0, "the empty off-heap chain link is verbatim");
-    assert_eq!(payload.refcount(), refcount_before, "the refcount is unchanged");
+    assert_eq!(
+        payload.refcount(),
+        refcount_before,
+        "the refcount is unchanged"
+    );
     assert_eq!(payload.data_ptr(), payload_ptr, "the payload never moved");
 
     // The term still describes the same bytes.
     // SAFETY: `copied` is the live, copied refc binary and `payload` outlives the read.
     unsafe {
         assert!(is_refc_binary(copied));
-        assert_eq!(refc_bytes(copied), PAYLOAD, "the off-heap bytes are untouched");
+        assert_eq!(
+            refc_bytes(copied),
+            PAYLOAD,
+            "the off-heap bytes are untouched"
+        );
     }
 }
 
@@ -485,7 +516,10 @@ fn fun_descriptor_is_opaque_and_its_free_variables_relocate() {
         "the fun block heads the destination run"
     );
     assert_eq!(report.stats.words_copied, need);
-    assert_eq!(report.stats.objects_copied, 2, "the fun block + the env tuple");
+    assert_eq!(
+        report.stats.objects_copied, 2,
+        "the fun block + the env tuple"
+    );
 
     // (iii) The inlined descriptor is copied **verbatim and opaquely**: words 0..=2 (header,
     // `uniq`, `index`) are the source's, and only the env slots were forwarded. A scan that
@@ -496,7 +530,8 @@ fn fun_descriptor_is_opaque_and_its_free_variables_relocate() {
             source_word,
             "descriptor word {offset} is copied verbatim"
         );
-    }    let hdr = header(copied);
+    }
+    let hdr = header(copied);
     assert_eq!(fun_kind_of_header(hdr), FunKind::Local);
     assert_eq!(fun_arity(hdr), 3, "the header's arity field");
     assert_eq!(fun_num_free(hdr), 2);
@@ -506,7 +541,10 @@ fn fun_descriptor_is_opaque_and_its_free_variables_relocate() {
     );
     // SAFETY: `copied` is the live, copied local fun.
     unsafe {
-        assert_eq!(fun_uniq(copied).expect("a local fun"), 0x0123_4567_89AB_CDEF);
+        assert_eq!(
+            fun_uniq(copied).expect("a local fun"),
+            0x0123_4567_89AB_CDEF
+        );
         assert_eq!(fun_index(copied).expect("a local fun"), 7);
     }
 
@@ -522,7 +560,8 @@ fn fun_descriptor_is_opaque_and_its_free_variables_relocate() {
         "the env tuple is its own copy, right after the fun block"
     );
     assert_ne!(
-        ptr_val(env[0]) as usize, before,
+        ptr_val(env[0]) as usize,
+        before,
         "the free variable's address changed with the fun's"
     );
     assert_eq!(
@@ -530,7 +569,11 @@ fn fun_descriptor_is_opaque_and_its_free_variables_relocate() {
         vec![make_small(1), make_small(2)],
         "and the relocated tuple still holds its elements"
     );
-    assert_eq!(env[1], make_small(5), "an immediate free variable is unchanged");
+    assert_eq!(
+        env[1],
+        make_small(5),
+        "an immediate free variable is unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -576,8 +619,15 @@ fn a_root_outside_the_ranges_is_left_byte_identical() {
 
     // The three foreign roots are byte-identical, the region they name is untouched, and the
     // subtree they alone reach was neither copied nor descended into.
-    assert_eq!(roots[0], outside_root_before, "an out-of-range root is not rewritten");
-    assert_eq!(roots[1], make_small(1234), "an immediate is not a reference");
+    assert_eq!(
+        roots[0], outside_root_before,
+        "an out-of-range root is not rewritten"
+    );
+    assert_eq!(
+        roots[1],
+        make_small(1234),
+        "an immediate is not a reference"
+    );
     assert_eq!(roots[2], NIL);
     assert_eq!(
         outside.snapshot(),
@@ -595,10 +645,7 @@ fn a_root_outside_the_ranges_is_left_byte_identical() {
     // The one in-range root did move — so the refusal above is precision, not inaction.
     assert!(!from.contains(ptr_val(roots[3])));
     assert_eq!(ptr_val(roots[3]) as usize, target.base() as usize);
-    assert_eq!(
-        tuple_elements(roots[3]),
-        vec![make_small(1), make_small(2)]
-    );
+    assert_eq!(tuple_elements(roots[3]), vec![make_small(1), make_small(2)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +672,10 @@ fn walk_and_live_counters_agree_with_the_relocation() {
         words += object.len();
     })
     .expect("the walk's visitor never fails");
-    assert_eq!(objects, 3, "the tuple, the map head and the map's keys tuple");
+    assert_eq!(
+        objects, 3,
+        "the tuple, the map head and the map's keys tuple"
+    );
     assert_eq!(words, live_words_in(&from, &roots), "the exact live volume");
     assert_eq!(words, LIVE_BOXED_ONLY_WORDS);
 
@@ -784,7 +834,11 @@ fn dest_words_used_is_the_linear_copy_volume() {
         "pinned: `dest_words_used == words_copied` for a linear destination"
     );
     assert_eq!(dest.used_words(), need);
-    assert_eq!(dest.available_words(), 4, "the spare words were never touched");
+    assert_eq!(
+        dest.available_words(),
+        4,
+        "the spare words were never touched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -900,8 +954,14 @@ fn an_out_of_crate_evac_dest_drives_the_same_relocation() {
         );
     }
     let elements = tuple_elements(tuple);
-    assert_eq!(list_cells(elements[0]), vec![make_small(10), make_small(20)]);
-    assert_eq!(tuple_elements(elements[1]), vec![make_small(30), make_small(40)]);
+    assert_eq!(
+        list_cells(elements[0]),
+        vec![make_small(10), make_small(20)]
+    );
+    assert_eq!(
+        tuple_elements(elements[1]),
+        vec![make_small(30), make_small(40)]
+    );
     let atoms = AtomTable::new();
     assert_eq!(
         map_get(map, make_small(1), &atoms).expect("a flat map"),
@@ -964,7 +1024,10 @@ fn an_unwalkable_destination_is_refused_before_mutating() {
         "the preflighted form reports the shape error too"
     );
     assert!(
-        matches!(compact(&from, &mut roots, &mut dest), Err(BeamError::BadArg)),
+        matches!(
+            compact(&from, &mut roots, &mut dest),
+            Err(BeamError::BadArg)
+        ),
         "and so does the one-shot form"
     );
 

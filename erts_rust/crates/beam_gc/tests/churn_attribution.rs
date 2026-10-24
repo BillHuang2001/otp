@@ -38,9 +38,7 @@
 //! Run it with
 //! `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc --test churn_attribution -- --nocapture`.
 
-use beam_gc::prelude::{
-    Collection, CollectionKind, Collector, GcStats, HeapPolicy, HeapSpace,
-};
+use beam_gc::prelude::{Collection, CollectionKind, Collector, GcStats, HeapPolicy, HeapSpace};
 use beam_term::prelude::{make_small, Eterm, NIL};
 
 /// Elements per list/tuple/binary — `tools/bench/src/workloads/gc_bound.rs`'s `LEN`.
@@ -249,24 +247,72 @@ fn the_churn_shape_attributes_its_per_op_cost_to_collection_counts_not_to_copyin
     let per_op = |n: u64| n as f64 / total_ops;
     let ns = |n: u64| n as f64 / total_ops;
 
-    println!("\n=== gc_bound/churn attribution ({} ops, {} warm-up) ===", OPS, WARMUP);
+    println!(
+        "\n=== gc_bound/churn attribution ({} ops, {} warm-up) ===",
+        OPS, WARMUP
+    );
     println!("words allocated/op (shape)          {:>10}", WORDS_PER_OP);
-    println!("collections/op                      {:>10.3}", per_op(k.collections));
-    println!("  minor/op                          {:>10.3}", per_op(k.minors));
-    println!("  major/op                          {:>10.3}", per_op(k.majors));
-    println!("words copied/op                     {:>10.1}", per_op(k.words_copied));
-    println!("words reclaimed/op (junk)            {:>10.1}", per_op(k.words_reclaimed));
-    println!("objects copied/op                   {:>10.2}", per_op(k.objects_copied));
-    println!("growth events (space installs)/op    {:>10.4}", per_op(k.growths));
-    println!("debt admissions/op                  {:>10.4}", per_op(k.debt_admissions));
-    println!("words copied/collection             {:>10.1}", ns(k.words_copied) / (k.collections as f64 / total_ops));
-    println!("words reclaimed/collection          {:>10.1}", ns(k.words_reclaimed) / (k.collections as f64 / total_ops));
+    println!(
+        "collections/op                      {:>10.3}",
+        per_op(k.collections)
+    );
+    println!(
+        "  minor/op                          {:>10.3}",
+        per_op(k.minors)
+    );
+    println!(
+        "  major/op                          {:>10.3}",
+        per_op(k.majors)
+    );
+    println!(
+        "words copied/op                     {:>10.1}",
+        per_op(k.words_copied)
+    );
+    println!(
+        "words reclaimed/op (junk)            {:>10.1}",
+        per_op(k.words_reclaimed)
+    );
+    println!(
+        "objects copied/op                   {:>10.2}",
+        per_op(k.objects_copied)
+    );
+    println!(
+        "growth events (space installs)/op    {:>10.4}",
+        per_op(k.growths)
+    );
+    println!(
+        "debt admissions/op                  {:>10.4}",
+        per_op(k.debt_admissions)
+    );
+    println!(
+        "words copied/collection             {:>10.1}",
+        ns(k.words_copied) / (k.collections as f64 / total_ops)
+    );
+    println!(
+        "words reclaimed/collection          {:>10.1}",
+        ns(k.words_reclaimed) / (k.collections as f64 / total_ops)
+    );
     println!("peak nursery spaces                 {:>10}", k.peak_spaces);
-    println!("peak nursery capacity (words)       {:>10}", k.peak_young_capacity);
-    println!("peak nursery occupancy (words)      {:>10}", k.peak_young_used);
-    println!("peak mature capacity (words)        {:>10}", k.peak_mature_capacity);
-    println!("peak mature occupancy (words)       {:>10}", k.peak_mature_used);
-    println!("fullsweep live set (min/peak words) {:>10} / {}", k.major_live_min, k.major_live_max);
+    println!(
+        "peak nursery capacity (words)       {:>10}",
+        k.peak_young_capacity
+    );
+    println!(
+        "peak nursery occupancy (words)      {:>10}",
+        k.peak_young_used
+    );
+    println!(
+        "peak mature capacity (words)        {:>10}",
+        k.peak_mature_capacity
+    );
+    println!(
+        "peak mature occupancy (words)       {:>10}",
+        k.peak_mature_used
+    );
+    println!(
+        "fullsweep live set (min/peak words) {:>10} / {}",
+        k.major_live_min, k.major_live_max
+    );
     println!(
         "escalation: mature room min {} vs nursery occupancy max {}",
         k.escalate_available_min, k.escalate_used_max
@@ -274,7 +320,10 @@ fn the_churn_shape_attributes_its_per_op_cost_to_collection_counts_not_to_copyin
     println!(
         "end state: nursery cap {} used {}, mature cap {} used {}",
         end.peak_young_capacity,
-        Collector::new(policy()).expect("probe").young().used_words(),
+        Collector::new(policy())
+            .expect("probe")
+            .young()
+            .used_words(),
         end.peak_mature_capacity,
         end.peak_mature_used
     );

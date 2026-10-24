@@ -195,7 +195,10 @@ mod tests {
         assert_eq!(footprint.young_used_words, 0, "nothing was allocated");
         assert_eq!(footprint.mature_used_words, 0);
         assert_eq!(footprint.off_heap_payload_bytes, 0);
-        assert_eq!(footprint.off_heap_slot_bytes, 0, "an empty Vec reserves none");
+        assert_eq!(
+            footprint.off_heap_slot_bytes, 0,
+            "an empty Vec reserves none"
+        );
         assert_eq!(footprint.off_heap_entries, 0);
         assert_eq!(footprint.capacity_words(), 609);
         assert_eq!(footprint.capacity_bytes(), 609 * WORD_BYTES);
@@ -252,6 +255,10 @@ mod tests {
             after.capacity_bytes() + after.off_heap_slot_bytes,
             "the retained array is the only off-heap footprint left"
         );
-        assert_eq!(roster.slot_count(), 4, "the released slots are still positions");
+        assert_eq!(
+            roster.slot_count(),
+            4,
+            "the released slots are still positions"
+        );
     }
 }

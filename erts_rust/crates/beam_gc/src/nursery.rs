@@ -151,7 +151,8 @@ pub(crate) struct Nursery {
     empty_retired: BTreeSet<(usize, u64, usize)>,
     /// Monotone retirement counter — the "oldest among equals" tiebreak of
     /// [`empty_retired`](Nursery::empty_retired).
-    retired_serial: u64,    /// The covering interval of **every** space's reserved extent (`[base, limit)`), maintained
+    retired_serial: u64,
+    /// The covering interval of **every** space's reserved extent (`[base, limit)`), maintained
     /// incrementally — the chain-wide [`ScannedBounds`] the whole-collector aggregate is built
     /// from, so a host's fast-reject filter costs `O(1)` per address instead of the indexed
     /// per-space test.
@@ -199,7 +200,8 @@ impl Nursery {
             retired_serial: 0,
             extent,
             live_target_words: None,
-        })    }
+        })
+    }
 
     /// The space the mutator allocates in.
     pub(crate) fn current(&self) -> &HeapSpace {
@@ -587,10 +589,28 @@ impl Nursery {
     /// capacity instead of climbing one growth-table step per collection. The target is
     /// remembered ([`live_target_words`](Nursery::live_target_words)) so the growth seam
     /// ([`grow`](Nursery::grow)) is bounded by it too.
-    pub(crate) fn collapse(&mut self, policy: &HeapPolicy, live_words: usize) -> Result<()> {
+    ///
+    /// # The allocation request
+    ///
+    /// `alloc_need` is the **pending allocation request** the collection was triggered by — the
+    /// legacy C's `need` inside `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + stack_size`
+    /// (`erl_gc.c:1503-1509`). The term is additive: the installed capacity and the remembered
+    /// live-set target are [`HeapPolicy::young_after_collection_with_need`] /
+    /// `…_minor_target_words_with_need` of the round's live set plus `alloc_need`, so
+    /// `alloc_need == 0` is the live-set-only rule. A collection a host asked for *because* it
+    /// must allocate `alloc_need` words therefore installs a nursery that already has that room,
+    /// instead of a live-set-sized one the next allocation must immediately grow (a growth
+    /// retires the space and manufactures the `collection_debt` that triggers another collection).
+    pub(crate) fn collapse(
+        &mut self,
+        policy: &HeapPolicy,
+        live_words: usize,
+        alloc_need: usize,
+    ) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_collection(collected_capacity, live_words);
-        let live_target = policy.young_minor_target_words(live_words);
+        let target =
+            policy.young_after_collection_with_need(collected_capacity, live_words, alloc_need);
+        let live_target = policy.young_minor_target_words_with_need(live_words, alloc_need);
         self.install_collapsed(target, live_target)
     }
 
@@ -604,14 +624,21 @@ impl Nursery {
     /// growth decision belongs — and it shrinks a nursery the live set has outgrown back
     /// towards the target. That whole-heap target is also what the growth seam is bounded by
     /// afterwards ([`live_target_words`](Nursery::live_target_words)).
+    ///
+    /// `alloc_need` is the **pending allocation request** the fullsweep was triggered by — the C's
+    /// `need` in `adjust_after_fullsweep`'s `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need +
+    /// stack_size + S_RESERVED` (`erl_gc.c:2062-2075`) — folded in exactly as
+    /// [`collapse`](Self::collapse) folds it.
     pub(crate) fn collapse_after_fullsweep(
         &mut self,
         policy: &HeapPolicy,
         live_words: usize,
+        alloc_need: usize,
     ) -> Result<()> {
         let collected_capacity = self.capacity_words();
-        let target = policy.young_after_fullsweep(collected_capacity, live_words);
-        let live_target = policy.young_target_words(live_words);
+        let target =
+            policy.young_after_fullsweep_with_need(collected_capacity, live_words, alloc_need);
+        let live_target = policy.young_target_words_with_need(live_words, alloc_need);
         self.install_collapsed(target, live_target)
     }
 
@@ -633,8 +660,8 @@ impl Nursery {
         // the retired spaces' extents are gone and a stale widening would keep rejecting
         // addresses far outside the collapsed chain's neighbourhood. The epoch advances — the
         // set of spaces *and* the surviving space's live region both changed.
-        self.extent = space_extent(&self.current)
-            .with_generation(self.extent.generation().saturating_add(1));
+        self.extent =
+            space_extent(&self.current).with_generation(self.extent.generation().saturating_add(1));
         Ok(())
     }
 }

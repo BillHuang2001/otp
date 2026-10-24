@@ -356,7 +356,8 @@ fn the_churn_geometry_follows_the_live_set_target() {
     for (live, want) in [(464usize, 1_598usize), (900, 2_586), (1_353, 4_185)] {
         let target = policy.young_target_words(live);
         assert_eq!(
-            target, want,
+            target,
+            want,
             "next_words(2 * {live} + 64 = {}) = {want}",
             2 * live + policy.need_reserve_words
         );
@@ -575,7 +576,10 @@ fn a_minor_may_grow_only_onto_the_live_set_target() {
                 );
             }
             if got < capacity {
-                assert_eq!(got, target, "a shrunk nursery lands on the live set's target");
+                assert_eq!(
+                    got, target,
+                    "a shrunk nursery lands on the live set's target"
+                );
             }
             // A fixed point: re-applying the rule at its own result reproduces it, so a live set
             // that stops moving cannot climb the growth table one step per collection.
@@ -715,7 +719,9 @@ fn a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity() {
         assert!(
             tail.iter().all(|cap| *cap == tail[0]),
             "{kind:?}: a fixed demand must converge to ONE nursery capacity, got {:?}",
-            tail.iter().copied().collect::<std::collections::BTreeSet<usize>>()
+            tail.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<usize>>()
         );
         // ... and that constant is the live set's own target — a property of the workload, not a
         // function of the iteration count (a creep would show up as a rising tail above).
@@ -759,7 +765,10 @@ fn both_mature_strategies_size_the_nursery_identically() {
         let mut roots = vec![tuple_in(c.young_mut(), &elems)];
         fill_with_garbage_any(&mut c, 4);
         let stats = c.collect_major(&mut roots).expect("the fullsweep fits");
-        assert_eq!(stats.words_copied, 60, "{kind:?}: exactly the live set moved");
+        assert_eq!(
+            stats.words_copied, 60,
+            "{kind:?}: exactly the live set moved"
+        );
         results.push((kind, c.young().capacity_words()));
     }
     assert_eq!(
@@ -835,6 +844,9 @@ fn the_rule_constants_are_pinned() {
         );
     }
     // An empty live set answers the policy's floor under either target.
-    assert_eq!(policy.young_minor_target_words(0), policy.nursery_floor_words());
+    assert_eq!(
+        policy.young_minor_target_words(0),
+        policy.nursery_floor_words()
+    );
     assert_eq!(policy.nursery_floor_words(), EMPTY_LIVE_TARGET);
 }

@@ -78,8 +78,8 @@ pub mod mso;
 mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
 pub mod offheap;
 pub mod policy;
-pub mod relocate;
-pub(crate) mod reachable; // the read-only whole-heap reachability walk — the `*_in` helpers are public
+pub(crate) mod reachable;
+pub mod relocate; // the read-only whole-heap reachability walk — the `*_in` helpers are public
 pub use crate::reachable::{for_each_reachable_in, ReachableObject}; // the walk itself stays crate-internal
 pub mod selection;
 pub mod space;

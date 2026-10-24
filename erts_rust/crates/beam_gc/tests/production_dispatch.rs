@@ -526,7 +526,10 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
     let info_c: HeapInfo = copying.heap_info();
     let info_i: HeapInfo = immix.heap_info();
     assert_eq!(info_i.minor_gcs, info_c.minor_gcs, "minor_gcs");
-    assert_eq!(info_i.fullsweep_after, info_c.fullsweep_after, "fullsweep_after");
+    assert_eq!(
+        info_i.fullsweep_after, info_c.fullsweep_after,
+        "fullsweep_after"
+    );
     assert_eq!(info_i.min_heap_size, info_c.min_heap_size, "min_heap_size");
     assert_eq!(
         info_i.min_bin_vheap_size, info_c.min_bin_vheap_size,
@@ -554,7 +557,11 @@ fn the_strategy_seam_is_observationally_equivalent_apart_from_the_strategy() {
         COPYING_MATURE_WORDS.div_ceil(BLOCK_WORDS) * BLOCK_WORDS,
         "the mark-region capacity is the copying capacity rounded up to whole blocks"
     );
-    assert_eq!(IMMIX_MATURE_WORDS % BLOCK_WORDS, 0, "a whole number of blocks");
+    assert_eq!(
+        IMMIX_MATURE_WORDS % BLOCK_WORDS,
+        0,
+        "a whole number of blocks"
+    );
     assert!(IMMIX_MATURE_WORDS >= COPYING_MATURE_WORDS);
     assert!(IMMIX_MATURE_WORDS - COPYING_MATURE_WORDS < BLOCK_WORDS);
 

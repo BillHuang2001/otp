@@ -248,7 +248,10 @@ fn a_growth_retires_but_never_collects_moves_or_frees() {
     // The request outgrew the space, so the growth installed the smallest curated space that
     // covers it — and the chain's summed capacity is the two spaces', still within the
     // ceiling ([`growth_stops_at_the_summed_capacity_ceiling`] pins the other side of that).
-    assert_eq!(nursery.current().capacity_words(), policy.next_words(need, 0));
+    assert_eq!(
+        nursery.current().capacity_words(),
+        policy.next_words(need, 0)
+    );
     assert!(nursery.current().capacity_words() > CAP);
     assert_eq!(nursery.capacity_words(), CAP + policy.next_words(need, 0));
     assert!(nursery.capacity_words() <= policy.max_heap_words);
@@ -283,7 +286,10 @@ fn a_growth_takes_the_one_step_size_unless_it_would_not_enlarge_the_space() {
     );
     nursery.grow(&policy, 234).expect("the one-step growth");
     assert_eq!(nursery.current().capacity_words(), 376);
-    assert_eq!(nursery.current().capacity_words(), policy.next_words(234, 0));
+    assert_eq!(
+        nursery.current().capacity_words(),
+        policy.next_words(234, 0)
+    );
 
     // (b) The same nursery, now 376 words, and a request the space **already covers**: the
     // one-step rule would hand back the very space it replaces, so the rule takes at least a
@@ -295,7 +301,10 @@ fn a_growth_takes_the_one_step_size_unless_it_would_not_enlarge_the_space() {
     );
     nursery.grow(&policy, 376).expect("the doubling growth");
     assert_eq!(nursery.current().capacity_words(), 987);
-    assert_eq!(nursery.current().capacity_words(), policy.next_words(752, 0));
+    assert_eq!(
+        nursery.current().capacity_words(),
+        policy.next_words(752, 0)
+    );
     assert!(
         nursery.current().capacity_words() >= 2 * 376,
         "the doubling branch really doubles"
@@ -382,7 +391,9 @@ fn the_aggregate_extent_covers_every_space_and_tracks_the_geometry_epoch() {
     // A growth that finds room retires nothing, so the geometry does not change: neither the
     // interval nor the epoch may move.
     let room = nursery.current().available_words();
-    nursery.grow(&policy, room).expect("an exact fit is a no-op");
+    nursery
+        .grow(&policy, room)
+        .expect("an exact fit is a no-op");
     assert_eq!(
         nursery.bounds(),
         fresh,
@@ -470,7 +481,7 @@ fn the_aggregate_extent_covers_every_space_and_tracks_the_geometry_epoch() {
     // The collapse re-seeds the aggregate from the single remaining space — a stale
     // widening would keep claiming the retired spaces' neighbourhood — and advances the
     // epoch. The safety property holds again over the same neighbourhood.
-    nursery.collapse(&policy, 0).expect("the collapse");
+    nursery.collapse(&policy, 0, 0).expect("the collapse");
     assert_eq!(nursery.space_count(), 1, "the chain is one space again");
     let collapsed = nursery.bounds();
     assert_eq!(
@@ -547,7 +558,7 @@ fn the_aggregate_extent_stays_exact_over_a_chain_no_reachable_growth_produces() 
 
     // The collapse re-seeds the aggregate from the surviving space and keeps the safety
     // property over the retired neighbourhood.
-    nursery.collapse(&policy, 0).expect("the collapse");
+    nursery.collapse(&policy, 0, 0).expect("the collapse");
     assert_eq!(nursery.space_count(), 1, "the chain is one space again");
     let collapsed = nursery.bounds();
     assert_eq!(
@@ -625,10 +636,7 @@ fn a_chain_the_growth_seam_builds_keeps_the_index_and_the_aggregate_exact() {
     );
 
     // The aggregate covers every space of the grown chain.
-    let extents: Vec<(usize, usize)> = nursery
-        .spaces()
-        .map(reserved_extent)
-        .collect();
+    let extents: Vec<(usize, usize)> = nursery.spaces().map(reserved_extent).collect();
     assert_eq!(
         (nursery.bounds().base(), nursery.bounds().limit()),
         covering(&extents),
@@ -708,9 +716,20 @@ fn growth_stops_at_the_summed_capacity_ceiling() {
         nursery.current().base(),
     );
     let again = nursery.grow(&policy, nursery.current().available_words() + 1);
-    assert_eq!(again.expect_err("still capped").as_atom(), Some("out_of_memory"));
-    assert_eq!(nursery.space_count(), spaces, "a refused growth retires nothing");
-    assert_eq!(nursery.capacity_words(), capacity, "and consumes no capacity");
+    assert_eq!(
+        again.expect_err("still capped").as_atom(),
+        Some("out_of_memory")
+    );
+    assert_eq!(
+        nursery.space_count(),
+        spaces,
+        "a refused growth retires nothing"
+    );
+    assert_eq!(
+        nursery.capacity_words(),
+        capacity,
+        "and consumes no capacity"
+    );
     assert_eq!(nursery.current().base(), base, "and replaces no space");
 }
 
@@ -757,7 +776,11 @@ fn a_provably_empty_retired_space_is_reused_instead_of_reallocated() {
         capacity,
         "a re-adoption consumes no capacity"
     );
-    assert_eq!(nursery.space_count(), 2, "a re-adoption retires the old current");
+    assert_eq!(
+        nursery.space_count(),
+        2,
+        "a re-adoption retires the old current"
+    );
     assert_eq!(
         nursery.retired[0].base(),
         current_base,
@@ -832,7 +855,7 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     // A collected nursery remembers the target its round derived ...
     let live = 401;
     let mut nursery = Nursery::new(default_allocator().clone(), 233).expect("nursery");
-    nursery.collapse(&policy, live).expect("the collapse");
+    nursery.collapse(&policy, live, 0).expect("the collapse");
     let live_target = policy.young_minor_target_words(live);
     assert_eq!(live_target, 610);
     assert_eq!(nursery.live_target_words, Some(live_target));
@@ -905,7 +928,7 @@ fn a_collected_nursery_bounds_its_growth_by_the_live_target() {
     // of occupancy plus request alone grants it (`next_words(606 + 5 000) = 6 772`), so the bound
     // is not a ceiling.
     let mut large = Nursery::new(default_allocator().clone(), 233).expect("nursery");
-    large.collapse(&policy, live).expect("the collapse");
+    large.collapse(&policy, live, 0).expect("the collapse");
     fill(large.current_mut());
     let used = large.current().used_words();
     let need = 5_000;

@@ -335,9 +335,9 @@ pub fn run(class: &'static str, collector: &mut AnyCollector, rounds: usize) -> 
         tally.young_peak_used_words = tally
             .young_peak_used_words
             .max(collector.young().used_words());
-        let collection = collector
-            .collect(&mut roots)
-            .unwrap_or_else(|error| panic!("{class}: round {round}: the collection failed: {error:?}"));
+        let collection = collector.collect(&mut roots).unwrap_or_else(|error| {
+            panic!("{class}: round {round}: the collection failed: {error:?}")
+        });
         tally.record(collection.kind, collection.stats, collector);
         // The round's short-lived terms die here; a growth class keeps everything it allocated.
         roots.truncate(survivors);

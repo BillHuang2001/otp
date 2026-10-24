@@ -185,7 +185,13 @@ fn from_ranges_skips_zero_length_entries_and_sorts_by_lo() {
     // SAFETY: no word of any range is read here; the entries are fabricated addresses (the
     // constructor only records geometry). The test asserts the *bookkeeping*.
     let set = unsafe {
-        FromSet::from_ranges(&[(0x3000, 2), (0x1000, 1), (0x2000, 0), (0x1800, 3), (0x10, 0)])
+        FromSet::from_ranges(&[
+            (0x3000, 2),
+            (0x1000, 1),
+            (0x2000, 0),
+            (0x1800, 3),
+            (0x10, 0),
+        ])
     };
 
     assert_eq!(set.range_count(), 3, "the empty entries are skipped");
@@ -228,7 +234,10 @@ fn from_ranges_and_add_build_the_same_geometry() {
     let mut space = HeapSpace::new(16).expect("space");
     let mut tail = NIL;
     for value in [3, 2, 1] {
-        tail = space.heap_mut().cons(make_small(value), tail).expect("cons");
+        tail = space
+            .heap_mut()
+            .cons(make_small(value), tail)
+            .expect("cons");
     }
     assert!(space.contains_term(tail));
     let mut added = FromSet::new();
@@ -412,7 +421,11 @@ fn compact_moves_the_live_graph_and_rewrites_the_roots() {
     unsafe {
         assert!(is_header(*ptr_val(tuple)));
         assert_eq!(header_arity(*ptr_val(tuple)), 2);
-        assert_eq!(*ptr_val(tuple).add(1), list, "the shared subterm is one copy");
+        assert_eq!(
+            *ptr_val(tuple).add(1),
+            list,
+            "the shared subterm is one copy"
+        );
         assert_eq!(*ptr_val(tuple).add(2), make_small(42));
     }
     // Walk the copied list: 1, 2, 3, nil.

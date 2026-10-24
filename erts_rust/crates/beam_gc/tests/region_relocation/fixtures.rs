@@ -32,7 +32,8 @@ use beam_gc::prelude::FromSet;
 use beam_term::prelude::{
     boxed_val, flatmap_size_words, fun_words, header_arity, is_header, is_list, list_val,
     make_arityval, make_boxed, make_list, make_small, write_fun_local, write_map, AtomTable, Eterm,
-    FunKind, NIL,};
+    FunKind, NIL,
+};
 
 /// The two backings a host region really has: a pre-reserved `Vec<Eterm>` and a
 /// `beam_alloc::ReservedHeap` (the engine arena's shape). Both are handed to the copier the
@@ -118,7 +119,10 @@ impl Region {
 
     /// Word `offset` of the region (inside the allocation, written or not).
     pub fn word(&self, offset: usize) -> Eterm {
-        assert!(offset < self.capacity_words(), "offset {offset} is in bounds");
+        assert!(
+            offset < self.capacity_words(),
+            "offset {offset} is in bounds"
+        );
         // SAFETY: `offset` is inside this region's own allocation, whose every word was
         // initialised at construction and is written only through this region's pointers.
         unsafe { *self.base().add(offset) }

@@ -69,9 +69,9 @@ use beam_alloc::{default_allocator, RefcBinary};
 use beam_common::{AllocFailure, AllocKind, BeamError};
 use beam_gc::prelude::{CollectionKind, Collector, HeapPolicy};
 use beam_term::prelude::{
-    boxed_val, fun_words, make_small, map_words_capacity, write_fun_local, write_heap_bits,
-    heap_bits_size_words, write_map, write_refc_binary, write_sub_bits, AtomTable, Eterm, FunKind,
-    NIL, ERL_HEAP_BITS_SIZE, ERL_REFC_BITS_SIZE, ERL_SUB_BITS_FLAG_MUTABLE, ERL_SUB_BITS_SIZE,
+    boxed_val, fun_words, heap_bits_size_words, make_small, map_words_capacity, write_fun_local,
+    write_heap_bits, write_map, write_refc_binary, write_sub_bits, AtomTable, Eterm, FunKind,
+    ERL_HEAP_BITS_SIZE, ERL_REFC_BITS_SIZE, ERL_SUB_BITS_FLAG_MUTABLE, ERL_SUB_BITS_SIZE, NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -207,7 +207,9 @@ fn fun_sub_binary_and_refc(c: &mut Collector) -> (Vec<Eterm>, Option<RefcBinary>
     const INDEX: u32 = 7;
 
     let atoms = AtomTable::new();
-    let pairs: Vec<(Eterm, Eterm)> = (0..4i64).map(|i| (make_small(i), make_small(i + 100))).collect();
+    let pairs: Vec<(Eterm, Eterm)> = (0..4i64)
+        .map(|i| (make_small(i), make_small(i + 100)))
+        .collect();
     // SAFETY: as in `map_and_list` — a 4-key flat map writes exactly the `4 + 2 * 4` words the
     // capacity formula reserves.
     let map = unsafe {
@@ -419,7 +421,9 @@ fn probe(name: &str, shape: Shape, garbage_words: usize) {
             volume * core::mem::size_of::<Eterm>(),
             "{name} ({tag}): the refusal reports the words it wanted"
         ),
-        other => panic!("{name} ({tag}): the refusal must be the typed heap exhaustion, got {other:?}"),
+        other => {
+            panic!("{name} ({tag}): the refusal must be the typed heap exhaustion, got {other:?}")
+        }
     }
     assert_eq!(
         space_words(short.young()),
@@ -432,8 +436,14 @@ fn probe(name: &str, shape: Shape, garbage_words: usize) {
         "{name} ({tag}): the mature space is untouched — nothing was written"
     );
     assert_eq!(
-        (short.stats().minor_collections, short.stats().major_collections),
-        (stats_before.minor_collections, stats_before.major_collections),
+        (
+            short.stats().minor_collections,
+            short.stats().major_collections
+        ),
+        (
+            stats_before.minor_collections,
+            stats_before.major_collections
+        ),
         "{name} ({tag}): no counter advanced — no collection ran"
     );
     assert_eq!(

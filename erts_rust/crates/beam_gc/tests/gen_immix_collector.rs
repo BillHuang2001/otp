@@ -461,11 +461,8 @@ fn two_multi_block_objects_of_different_run_sizes_share_the_run_allocator() {
     };
     let mut c = GenImmixCollector::from_policy(policy).expect("collector");
     assert_eq!(
-        c.policy().mature_after_fullsweep(
-            c.mature().capacity_words(),
-            live_words,
-            0
-        ),
+        c.policy()
+            .mature_after_fullsweep(c.mature().capacity_words(), live_words, 0),
         c.mature().capacity_words(),
         "the fixture starts at an in-place fixed point of the mature rule"
     );

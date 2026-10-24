@@ -143,7 +143,7 @@ fn the_growth_fallback_grows_the_region_instead_of_failing() {
     );
 
     let stats = c
-        .grow_major(&mut roots, needed, live_lines, live_words)
+        .grow_major(&mut roots, needed, live_lines, live_words, 0)
         .expect("the fallback grows the region instead of failing");
 
     assert!(
@@ -225,7 +225,7 @@ fn the_growth_fallback_is_capped_by_max_heap_words_and_promotes_nothing() {
     let minor_gcs = c.minor_gcs();
 
     let err = c
-        .grow_major(&mut roots, needed, live_lines, live_words)
+        .grow_major(&mut roots, needed, live_lines, live_words, 0)
         .expect_err("the ceiling forbids growing the region");
 
     let failure = match err {

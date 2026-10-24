@@ -373,7 +373,10 @@ fn check<C: BoundsDoor>(label: &str, mut c: C, count: usize, grow: Grow) {
         expected,
         "{label}: the aggregate must be exactly the covering of the reserved extents"
     );
-    assert!(!bounds.is_empty(), "{label}: a live collector scans something");
+    assert!(
+        !bounds.is_empty(),
+        "{label}: a live collector scans something"
+    );
     assert_eq!(
         bounds.span_words(),
         (expected.1 - expected.0) / WORD,
@@ -544,7 +547,11 @@ fn growth_retire_and_collapse_move_the_bounds_and_the_epoch_together() {
 
         // A fresh collector is epoch 0 with one nursery space.
         let fresh = c.scanned_bounds();
-        assert_eq!(fresh.generation(), 0, "{kind:?}: a fresh collector is epoch 0");
+        assert_eq!(
+            fresh.generation(),
+            0,
+            "{kind:?}: a fresh collector is epoch 0"
+        );
         assert_eq!(
             (fresh.base(), fresh.limit()),
             covering(&[reserved_extent(c.young()), c.mature_extent()]),
@@ -626,7 +633,8 @@ fn growth_retire_and_collapse_move_the_bounds_and_the_epoch_together() {
             }
         }
     }
-}/// A mature **replacement** (a copying fullsweep's fresh space / a relocating mark-region
+}
+/// A mature **replacement** (a copying fullsweep's fresh space / a relocating mark-region
 /// fullsweep's fresh region) must be visible: the aggregate follows the new region exactly and
 /// the epoch advances.
 #[test]
@@ -674,7 +682,9 @@ fn a_mature_replacement_moves_the_aggregate_and_the_epoch() {
     let mut immix = GenImmixCollector::from_policy(shrinking).expect("collector");
     let before = immix.scanned_bounds();
     let old_mature = immix.mature_extent();
-    immix.collect_major(&mut []).expect("the relocating fullsweep");
+    immix
+        .collect_major(&mut [])
+        .expect("the relocating fullsweep");
     let after = immix.scanned_bounds();
     assert_ne!(
         immix.mature_extent(),
