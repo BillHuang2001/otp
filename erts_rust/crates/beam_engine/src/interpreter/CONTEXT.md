@@ -253,40 +253,53 @@ that owns a shared table.
 — the blocking-aware entries report `RunOutcome::Wait`; the non-blocking `run_export`/`run_label` fold it
 (Handoff #1, owner `beam_rt`).
 
-## The local-call seam's callee identity (the memo `Machine::local_callees`)
-The local-call arm (`dispatch.rs:413-515`, seams at `:421`/`:467`/`:496`) does **not** call
-`atom_name`/`atom_table.name` once per call: `atom_table.name` is a plain `Vec<Arc<str>>` index + deref
-(`beam_term/src/atom.rs:308-310`), but the three values it yields are **immutable for a loaded module**, so the
-derivation is memoized in `Machine::local_callees` (`../machine/local_callee.rs`, `LocalCallees`).
-`Machine::local_call_seam` (`dispatch.rs:1120-1174`) reads it in two phases.
-**Phase 1, every local call:** `self.local_callees.resolve(module, callee)` — a fixed `CAP = 8` array held
-as a compact 16-byte `keys` array (the only thing the scan reads) plus a parallel `targets` array of the owned
-identities. **A hit reorders nothing** (the entry keeps its slot) and only a **miss** inserts — at the front,
-dropping the oldest *insertion* — because the workloads this seam is priced on alternate two callees per element
-(an MRU move-to-front memmoved up to eight entries on *every* call; with the current policy the seam holds
-**1.85 %** of the interpreter's and **4.05 %** of the baseline tier's retired instructions, below the
-un-memoized derivation's 3.22 % / 7.93 %).
-The answer is the slot's `Option<CalleeTarget>` (`module`/`function` `Box<str>` + declared `arity`), whose inner
-`None` is the **memoized** "un-nameable callee" (no re-derivation, no consultation). Then the host's
-`resolve_local_call` is asked.
-**Phase 2, served only:** the rare path re-derives the names from the `module` **parameter** through
-`local_callee_identity` (`dispatch.rs:1270-1274`), so the `&str`s borrow the module and not `self` and the BIF
-dispatch keeps `&mut self` free; nothing is allocated on either path.
-The memo's key is `(module as *const Module as usize, func)` — the address plus the function index — which is why
-`Machine::reset` (`../machine/registers.rs`) clears it (the entries belong to the run that filled them, and every
-module a run entered is kept alive by the context registry, so no address can be recycled while the memo holds it);
-a resume does not reset.
-The in-crate empirical anchor for the derivation's price is the sibling `LabelMap` cache: ~**5 ns** per BIF call
-for resolving one import's two names against ~**0.5 ns** for the cached hit (`mod.rs:93-111`, `ImportTarget`,
-which stores the two names `Box<str>` **owned** because the map is reached through a bare pointer inside
-`JitRuntime` and cannot carry the module's lifetime) — the template `LocalCallees` follows.
+## The local-call seam's verdict table (`Machine::verdict_table`)
+The local-call arm (`dispatch.rs:413-515`, seams at `:429`/`:475`/`:504`) does **not** call the host once per
+call: the host's verdict is memoized **per callee function index** in the executing module context's table
+(`../machine/local_callee.rs`, `LocalVerdicts`; context `0` uses the machine-owned
+`Machine::entry_verdicts`).
+`Machine::local_call_seam` (`dispatch.rs:1149-1212`) reads it in phases.
+**Phase 0, every local call:** one `Cell` read of the lazily armed
+`Machine::local_call_invalidation_pending` (only `erlang:load_nif/2` sets it; the out-of-line
+`Machine::invalidate_local_call_verdicts` then clears every context's table).
+**Phase 1, every local call:** `self.verdict_table()` then `table.get(callee)` — **one bounds-checked slot
+load**, no scan, no key compare. The slot is a property of the *callee* rather than of the call history, so
+the alternating two-callee loop this seam is priced on (`sum/1`/`walk/3`) costs exactly what a single-callee
+loop costs; the MRU variant memmoved on every call, and the fixed `CAP = 8` key scan that replaced it still
+left one unpredictable branch per call. The answer is a **byte**: `Unnameable` (the memoized "no function
+entry / unresolvable name atom" — zero consultations) and `Declined` (the host's own earlier `false`) both
+take the caller's unchanged in-machine jump, `Served` goes straight to phase 2, and only `Unknown` asks.
+**Phase 1b, `Unknown` only (once per distinct callee per run, out of line in
+`Machine::ask_local_callee`):** the identity is derived from the `module` **parameter** through
+`local_callee_identity`, the host's `resolve_local_call` is asked and the answer recorded, so the hot path
+makes **no** `dyn` call, never runs the host's `&str` predicate and allocates nothing. A host **error** is
+propagated without recording anything, so the slot stays `Unknown` and the next call asks again — a failure
+is never memoized as a verdict.
+**Phase 2, served only (out of line in `Machine::serve_local_callee`):** the rare path dispatches the callee
+as a BIF under the arm's own frame discipline, which is the only place a `zlib`/`prim_tty` stub reaches
+`call_bif` through this seam.
+The tables belong to the run that filled them, which is why `Machine::reset` (`../machine/registers.rs`)
+clears them *and* the context registry; a resume does not reset. A registered context's table lives in its
+`ModuleContext`, so its identity (which module's functions the indices belong to) is structural — `Contexts`
+dedups by `Arc::ptr_eq`, so a second load of the same `.beam` is a different context with its own table —
+and `LocalVerdicts::describes` (owner image + function count) is re-validated at every `enter_run` and
+debug-asserted by the seam. Slots are `Cell`s because the seam reads the table while the machine holds
+`&Module` borrows and a registered context's table is reached through the shared `Arc`.
 **`Machine::local_call_seam` is the ONE definition of the seam both tiers drive** — the interpreter's three
 local-call arms, `jit/baseline/call.rs::store_continuation` and `jit/baseline/runtime.rs::probe_local_call` — so the
 memo inside it benefits the baseline tier with **zero** `../jit/baseline/**` edits.
-The host's **verdict** is never memoized: exactly one `resolve_local_call` consultation and one reduction spend per
-local call (`beam_rt/src/runner/budget.rs:482-485`), because `erlang:load_nif/2` can install a stub mid-run; an
-un-nameable callee is consulted zero times. Pinned by `../machine/tests.rs`'s seam tests (2 calls → 2
-consultations, 1 derivation) and `../machine/local_callee.rs`'s unit tests (hits, eviction, `clear`, `fill_count`).
+**Why the verdict may be cached here at all.** The host predicate is a pure function of the
+`(module, function, arity)` triple and ERTS charges **nothing** for an intra-module call, so a per-call
+consultation is the deviation, not the memo. What can change an answer mid-run is an *installation*, so there
+are exactly three invalidation doors: `erlang:load_nif/2` (the one BIF funnel `Machine::dispatch_bif_call`,
+`bif.rs`, **arms** a pending invalidation through a `Cell` when the dispatched triple is
+`("erlang","load_nif",2)` — the funnel is `&self` so it cannot clear the memo itself — and this seam, which is
+`&mut self` on every tier, clears the verdicts at its next local call), `Machine::reset`, and the public
+`Machine::invalidate_local_call_verdicts` a host with a stateful answer set calls itself.
+Pinned by `../machine/tests.rs`'s seam tests (2 calls → 1 consultation, 1 derivation; each door forces a
+re-consultation; an ordinary BIF dispatch does not; a served `call_last` pops its frame like the in-machine
+route) and `../machine/local_callee.rs`'s unit tests (hits, eviction, `clear`, `invalidate_verdicts`,
+`fill_count`, `ask_count`).
 ## Measured: interpreter hot-loop micro-optimizations
 The wall-clock record for every interpreter hot-path lever (the section is `MEASURED.md`'s `## Measured (interpreter hot-loop micro-optimizations)`, moved here because this node owns those levers).
 The `Machine`-side halves it cites (the `LabelMap` cache, the dirty-extent refill, the single-traversal `build_label_map`) are documented under `../machine/CONTEXT.md`.
@@ -337,7 +350,7 @@ Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside th
 
 ## The `resolve_local_call` seam: host contract and the `prim_tty`/`zlib` motivation (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.
-13. **A built-in / static NIF library is served through the `resolve_local_call` seam -- ADOPTED (owner `beam_rt`).** The three **local** call arms (`Instr::Call`/`CallOnly`/`CallLast`) now consult `ExecutionContext::resolve_local_call` before returning their in-machine `Step::Goto`, and the native baseline tier probes the same seam at run time in `jit_local_call`; on a hit the engine marshals `x(0..arity)` and dispatches the callee through `call_bif` under the arm's own frame discipline (see the seam bullet in the API-Surface section). The motivation is ERTS's split module shape: the OTP compiler emits a **local** `call`/`call_only`/`call_last` for a **non-exported** same-module function but a self-qualified `call_ext` for an **exported** one, so `lib/kernel/src/prim_tty.erl`'s Erlang wrappers `init/1`/`reader_read/2`/`writer_loop/2` chain **locally** into the non-exported NIF stubs `tty_create/1`/`setlocale/1`/`setupterm_nif/0`/`read_nif/3`/`write_nif/2`/... (bodies `erlang:nif_error(undef)`), while only the exported `isatty/1` is reached by the caller's `call_ext`. So such a module's own Erlang runs in-machine and the host intercepts only the NIF stubs. **Correctness constraint:** `Ok(false)`, an absent resolver, and an un-nameable/missing function entry all leave the arm byte-identical to the pre-seam path (same continuation store, same `pop_frame_checked`, same trace emission, same `Step::Goto`), and the interpreter and native baseline tiers are pinned equal on both the served and the declined route (`tests/local_call_seam.rs`, incl. the eager-layout probe and the `CallLast` frame pop). The host side is landed too: `beam_rt/src/context/execution.rs:83` (`resolve_local_call`) answers over **two** key sets -- `crate::native::prim_tty::serves_local_call` for `prim_tty`'s non-exported stubs, then `beam_bifs::serves_local_call` (a `module == "zlib"` equality plus its 19 `(name, arity)` rows) for `zlib`'s -- forwarded by `beam_rt/src/runner/budget.rs:482`; no engine work is outstanding. **The same keys also arrive as a fun, not a `call`:** `erts/preloaded/src/zlib.erl` keeps the stub in a `#zlib_opts{}` record and applies it (`fun deflate_nif/4`), so `deflate/3`/`inflate/3`/`safeInflate/2` reach it through a local `make_fun3` closure -- `beam_rt/src/context/apply.rs`'s `served_local_key` makes `local_fun_target` decline it (`Ok(None)`) and `apply_non_local_fun` dispatch it through `call_bif` over the same predicate.
+13. **A built-in / static NIF library is served through the `resolve_local_call` seam -- ADOPTED (owner `beam_rt`).** The three **local** call arms (`Instr::Call`/`CallOnly`/`CallLast`) now consult `ExecutionContext::resolve_local_call` before returning their in-machine `Step::Goto`, and the native baseline tier probes the same seam at run time in `jit_local_call`; on a hit the engine marshals `x(0..arity)` and dispatches the callee through `call_bif` under the arm's own frame discipline (see the seam bullet in the API-Surface section). The motivation is ERTS's split module shape: the OTP compiler emits a **local** `call`/`call_only`/`call_last` for a **non-exported** same-module function but a self-qualified `call_ext` for an **exported** one, so `lib/kernel/src/prim_tty.erl`'s Erlang wrappers `init/1`/`reader_read/2`/`writer_loop/2` chain **locally** into the non-exported NIF stubs `tty_create/1`/`setlocale/1`/`setupterm_nif/0`/`read_nif/3`/`write_nif/2`/... (bodies `erlang:nif_error(undef)`), while only the exported `isatty/1` is reached by the caller's `call_ext`. So such a module's own Erlang runs in-machine and the host intercepts only the NIF stubs. **Correctness constraint:** `Ok(false)`, an absent resolver, and an un-nameable/missing function entry all leave the arm byte-identical to the pre-seam path (same continuation store, same `pop_frame_checked`, same trace emission, same `Step::Goto`), and the interpreter and native baseline tiers are pinned equal on both the served and the declined route (`tests/local_call_seam.rs`, incl. the eager-layout probe and the `CallLast` frame pop). The host side is landed too: `beam_rt/src/context/execution.rs:83` (`resolve_local_call`) answers over **two** key sets -- `crate::native::prim_tty::serves_local_call` for `prim_tty`'s non-exported stubs, then `beam_bifs::serves_local_call` (a `module == "zlib"` equality plus its 19 `(name, arity)` rows) for `zlib`'s -- forwarded by `beam_rt/src/runner/budget.rs:542`; no engine work is outstanding. **The same keys also arrive as a fun, not a `call`:** `erts/preloaded/src/zlib.erl` keeps the stub in a `#zlib_opts{}` record and applies it (`fun deflate_nif/4`), so `deflate/3`/`inflate/3`/`safeInflate/2` reach it through a local `make_fun3` closure -- `beam_rt/src/context/apply.rs`'s `served_local_key` makes `local_fun_target` decline it (`Ok(None)`) and `apply_non_local_fun` dispatch it through `call_bif` over the same predicate.
 
 ## Hot-path inlining: which helpers carry which attribute, and the structural residual (from `INSTRUCTION_SURFACE.md`)
 Moved verbatim from `INSTRUCTION_SURFACE.md`; section cross-references inside the text name sections of that file unless stated otherwise.

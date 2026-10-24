@@ -63,10 +63,11 @@
 //!   ([`Machine::off_heap_overhead_bytes`] and [`Machine::retain_refc_binaries`]): the
 //!   reservoir is host-prunable by a reachability predicate, and its backing-store bytes
 //!   are the figure a host prices against `beam_gc`'s off-heap trigger.
-//! * `local_callee` — the **local-callee identity memo** ([`LocalCallees`]): the
-//!   `(module, function, arity)` derivation the local-call seam would otherwise repeat on
-//!   every local call, memoized per `(module address, function index)`. It memoizes the
-//!   *derivation* only, never the host's verdict.
+//! * `local_callee` — the **local-call verdict table** ([`LocalVerdicts`]): the host's
+//!   `resolve_local_call` answer for one same-module callee, addressed **by the callee's
+//!   function index** in its module context's table (so a repeat local call is one
+//!   bounds-checked load), invalidated by `erlang:load_nif/2`, [`Machine::reset`] and
+//!   [`Machine::invalidate_local_call_verdicts`].
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
@@ -90,7 +91,7 @@ pub use self::catch::CatchFrame;
 pub(crate) use self::catch::namespace_atom;pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
 pub(crate) use self::label_cache::LabelMaps;
-pub(crate) use self::local_callee::{CalleeTarget, LocalCallees};
+pub(crate) use self::local_callee::{LocalVerdicts, Verdict};
 pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
@@ -98,6 +99,7 @@ pub use self::run::RunOutcome;
 use crate::context::{ExecutionContext, RootSet};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
+pub(crate) use self::location::CURRENT_CODE_NONE;
 
 mod catch;
 mod context;
@@ -669,29 +671,61 @@ pub struct Machine {
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale `true` from an earlier counted run.
     pub(crate) census_on: bool,
-    /// The **local-callee identity memo** the local-call seam consults on every local
+    /// The **lazy half** of the local-call memo's invalidation: set by the BIF-dispatch
+    /// funnel ([`Machine::dispatch_bif_call`](crate::machine::Machine)) when it dispatches
+    /// `erlang:load_nif/2`, consumed by the seam at its next local call.
+    ///
+    /// `load_nif/2` is the one documented way a host's answer set changes **mid-run**: it
+    /// installs the NIF a module's unexported `*_nif` stub needs, so a verdict memoized
+    /// before the install would keep entering the in-machine `erlang:nif_error(undef)`
+    /// body. The verdicts therefore have to be cleared — but **not** from the dispatch
+    /// itself: the BIF door is `&self` (see the receiver note on
+    /// [`Machine::dispatch_bif_call`](crate::machine::Machine); a `&mut self` receiver
+    /// there costs +6.9 % cycles/element on `list_walk` for +1.2 % instructions), while
+    /// clearing the memo needs `&mut self`. So the dispatch only **arms** this flag
+    /// through the cell and [`Machine::local_call_seam`](crate::machine::Machine) — which
+    /// is `&mut self` on every tier — consumes it at its very next call, before it reads
+    /// the memo.
+    ///
+    /// A `Cell` write through `&self` leaves the dispatch's codegen untouched (no aliasing
+    /// answer changes), and one `Cell` read per local call is what the seam pays for it.
+    /// Cleared by [`Machine::reset`](crate::machine::Machine::reset) (a fresh run has no
+    /// dispatch in flight) and by
+    /// [`Machine::invalidate_local_call_verdicts`](crate::machine::Machine) itself, so an
+    /// explicit host invalidation never leaves a pending one behind.
+    pub(crate) local_call_invalidation_pending: std::cell::Cell<bool>,
+    /// The **local-call verdict table** of the run's **entry** module (module context
+    /// `0`), which the local-call seam consults on every local
     /// `call`/`call_only`/`call_last` ([`Machine::local_call_seam`]).
     ///
-    /// Naming the same-module callee costs the callee's function entry plus two atom
-    /// names, and all three are immutable for a loaded module, so the derivation is
-    /// memoized per `(module address, function index)` ([`LocalCallees`]).
+    /// The verdict — whether the host serves a same-module callee as a BIF
+    /// ([`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call))
+    /// — is memoized **per callee function index**, one slot per entry of
+    /// [`Module::functions`], because it cannot go stale on its own: the host's answer is a
+    /// pure function of the callee's `(module, function, arity)` triple for `beam_rt`
+    /// (`prim_tty`'s stubs and `beam_bifs`' `zlib` table read no run state), and the
+    /// function and atom tables it derives from are built once at load time. ERTS charges
+    /// nothing at all for an intra-module call, so paying one host consultation per call
+    /// was strictly *less* faithful than caching.
     ///
-    /// **Only the derivation is memoized — never the host's verdict.** The seam still
-    /// calls [`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)
-    /// exactly once per local call: a host spends one reduction unit per consultation,
-    /// and `erlang:load_nif/2` can install a stub mid-run that a later call must be
-    /// served from. An un-nameable callee is memoized as `None`, so it keeps costing the
-    /// host *zero* consultations.
+    /// A repeat local call is therefore **one bounds-checked slot load** — no loop, no key
+    /// comparison, no `dyn` call — because the slot is a property of the *callee*, not of
+    /// the call history (the earlier key-scan versions cost an unpredictable branch per
+    /// call on an alternating two-callee loop; see `local_callee.rs`).
     ///
-    /// **`pub(crate)`** so the seam (`crate::interpreter::dispatch`) can hold
-    /// `&mut self.local_callees` for the memo while `resolve_local_call`'s
-    /// `&mut dyn ExecutionContext` is a *separate* parameter — the two borrows never
-    /// overlap `self`.
+    /// **Context `0` only.** A module the machine entered through the cross-module call
+    /// seam owns its own table, in its [`ModuleContext`]
+    /// ([`Contexts::verdicts`]), which is what supplies the callee's module identity for
+    /// free. This table is the entry module's, so [`Machine::enter_run`] re-binds it to the
+    /// run's entry module ([`LocalVerdicts::describes`]) and the seam asserts their
+    /// agreement in debug builds.
     ///
-    /// Cleared by [`Machine::reset`] (the entries are address-keyed, so they are only
-    /// valid for the run that filled them — see [`LocalCallees`]); a resume deliberately
-    /// does not reset, and a suspended machine's modules are still alive.
-    pub(crate) local_callees: LocalCallees,
+    /// The verdicts are invalidated **lazily** by `erlang:load_nif/2` (the BIF-dispatch
+    /// funnel arms [`Machine::local_call_invalidation_pending`], and the seam clears every
+    /// context's table at its next local call), by [`Machine::reset`], and by the public
+    /// [`Machine::invalidate_local_call_verdicts`] door; an un-nameable callee is memoized
+    /// as such and keeps costing the host *zero* consultations.
+    pub(crate) entry_verdicts: LocalVerdicts,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -718,7 +752,14 @@ pub struct Machine {
     /// native baseline tier the driver publishes each **block entry** before it is
     /// entered, so mid-block the recorded address is that block's entry (the address a
     /// pre-empted machine resumes at), never a fabricated mid-block one.
-    pub(crate) current_code: Option<(u32, u32)>,
+    ///
+    /// **Packed into one word** ([`CURRENT_CODE_NONE`] = "no position yet", else
+    /// `func << 32 | pc`) rather than an `Option<(u32, u32)>`, whose missing niche made
+    /// the store three words wide. A function index and a code offset are both far
+    /// below [`u32::MAX`], so the all-ones `func` cannot collide with a real position;
+    /// the accessors [`Machine::current_code`]/[`Machine::set_current_code`] are the
+    /// only readers and writers.
+    pub(crate) current_code: u64,
     /// The `(function index, arity)` this run was **entered** at — the engine's
     /// analogue of ERTS's `$initial_call`.
     ///
@@ -758,6 +799,24 @@ pub struct Machine {
     pub(crate) reductions: u64,
 }
 
+/// The Erlang stack's initial capacity in words.
+///
+/// Reserving up front keeps the frame push/pop pair — the hot path of every non-tail
+/// call on every tier — off `RawVec`'s growth arm on the way in: `Machine::reset` only
+/// `clear`s the stack, so a machine that has run once keeps whatever capacity it grew
+/// to, and this is only the *first* run's floor. It is deliberately modest (2 KiB per
+/// machine): a deep recursion grows past it by the usual doubling, and a machine is one
+/// per process (recycled through the runtime's nested-run pool).
+const STACK_RESERVE_WORDS: usize = 256;
+
+/// The call-frame stack's initial capacity in frames (8 KiB per machine); see
+/// [`STACK_RESERVE_WORDS`] for why it is reserved at all and why it is this small.
+const FRAMES_RESERVE: usize = 256;
+
+/// The catch-frame stack's initial capacity. A raise path is not hot; this only keeps
+/// the first `try` of a run from reallocating.
+const CATCH_FRAMES_RESERVE: usize = 8;
+
 impl Machine {
     /// A machine with the default register file ([`MAX_REGISTER`] registers).
     pub fn new() -> Machine {
@@ -773,9 +832,9 @@ impl Machine {
             fr_mark: 0,
             x_dirty: 0,
             fr_dirty: 0,
-            refilled_words: 0,            stack: Vec::new(),
-            frames: Vec::new(),
-            catch_frames: Vec::new(),
+            refilled_words: 0,            stack: Vec::with_capacity(STACK_RESERVE_WORDS),
+            frames: Vec::with_capacity(FRAMES_RESERVE),
+            catch_frames: Vec::with_capacity(CATCH_FRAMES_RESERVE),
             pending_exception: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             class_atoms_live: false,            max_register,
@@ -800,8 +859,9 @@ impl Machine {
             reduce_on: false,
             bif_in_machine_on: false,
             census_on: false,
-            local_callees: LocalCallees::new(),
-            current_code: None,
+            local_call_invalidation_pending: std::cell::Cell::new(false),
+            entry_verdicts: LocalVerdicts::empty(),
+            current_code: CURRENT_CODE_NONE,
             entry_call: None,
             reductions: 0,
         };
@@ -1200,6 +1260,74 @@ impl Machine {
         live: u32,
     ) -> Result<*mut Eterm> {
         self.with_roots(live, |roots| ctx.alloc_words_rooted(n, roots))
+    }
+    /// Forget every memoized **host verdict** of the local-call seam, so the next local
+    /// call to each known callee consults
+    /// [`ExecutionContext::resolve_local_call`](crate::ExecutionContext::resolve_local_call)
+    /// again.
+    ///
+    /// The seam memoizes the host's answer per callee function index for the life of a run
+    /// (see [`LocalVerdicts`]), which is correct while the host's answer set is a pure
+    /// function of the `(module, function, arity)` triple — `beam_rt`'s is (`prim_tty`'s
+    /// NIF stubs plus `beam_bifs`' `zlib` table). This door is what a host whose answer set
+    /// **changes** mid-run calls to invalidate that assumption.
+    ///
+    /// Three things reach it, and a host that changes its answer set by any *other* means
+    /// (a plugin reload, a configuration toggle of its own) must call it explicitly:
+    ///
+    /// * the local-call seam ([`Machine::local_call_seam`](crate::machine::Machine)) calls
+    ///   it when [`Machine::local_call_invalidation_pending`] is set, i.e. at the first
+    ///   local call after a BIF dispatch **armed** the flag by dispatching
+    ///   `erlang:load_nif/2` — the one documented way a mid-run install makes a module's
+    ///   unexported `*_nif` stub reachable, so every tier gets this;
+    /// * [`Machine::reset`](crate::Machine) drops the whole set at the start of every run
+    ///   (the tables belong to the run that filled them);
+    /// * this method, for everything else.
+    ///
+    /// It clears **every** module context's table — the run's entry module's
+    /// ([`Machine::entry_verdicts`]) and each registered context's
+    /// ([`Contexts::verdicts`](crate::machine::Contexts)) — because the invalidation is
+    /// about the host's answer set, not about one module. Only verdicts are cleared: an
+    /// identity is never stored (it is re-derived from the callee's function entry, a pure
+    /// function of the loaded image), and an un-nameable callee keeps its verdict since
+    /// there is no name to ask about. One byte per function per context, allocating
+    /// nothing. It also clears any **pending** invalidation, so an explicit call is never
+    /// followed by a redundant one.
+    #[inline]
+    pub fn invalidate_local_call_verdicts(&mut self) {
+        self.local_call_invalidation_pending.set(false);
+        self.entry_verdicts.invalidate();
+        self.contexts.invalidate_verdicts();
+    }
+    /// The local-call verdict table of the module context currently executing
+    /// ([`Machine::context`]), or `None` when that context has no table.
+    ///
+    /// Context `0` is the run's entry module, whose table the machine owns
+    /// ([`Machine::entry_verdicts`]); every other id names a registered
+    /// [`ModuleContext`], which owns its own. The two can never be confused, and neither can
+    /// describe a different image: each table is sized from — and read only while executing
+    /// — the module it belongs to.
+    #[inline(always)]
+    pub(crate) fn verdict_table(&self) -> Option<&LocalVerdicts> {
+        if self.context == 0 {
+            Some(&self.entry_verdicts)
+        } else {
+            self.contexts.verdicts(self.context)
+        }
+    }
+
+    /// Bind the run's **entry** module to [`Machine::entry_verdicts`], sizing (or
+    /// discarding) the table when `module` is not the image it describes.
+    ///
+    /// Called from [`Machine::enter_run`](crate::machine::Machine) — the single prologue
+    /// every run entry and every resume passes through — so the entry table is always the
+    /// entry module's. A re-entry with the same module (`LocalVerdicts::describes`) keeps
+    /// the verdicts, so a resumed slice does not lose them.
+    #[inline]
+    pub(crate) fn bind_entry_verdicts(&mut self, module: &Module) {
+        if !self.entry_verdicts.describes(module) {
+            self.entry_verdicts = LocalVerdicts::for_module(module);
+        }
     }
     /// The module-wide label index of `module` — **the** label-map door.
     ///

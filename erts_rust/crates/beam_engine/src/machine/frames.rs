@@ -223,6 +223,20 @@ impl Machine {
     /// stack length is already the frame's `y_base`, so there is nothing to write.
     #[inline]
     pub(crate) fn push_frame(&mut self, y_count: u32) -> Result<()> {
+        self.push_frame_window(y_count).map(|_| ())
+    }
+
+    /// [`Machine::push_frame`] that also hands back the pushed frame's
+    /// `(y_base, y_count)` — the frame's Y window.
+    ///
+    /// The push has just materialised both figures, so a caller that must publish the
+    /// window (the native baseline tier's frame helpers, which keep
+    /// `[y_base, y_end)` as raw addresses for the emitted Y guard) can use them
+    /// instead of re-deriving them from `Machine::frames.last()` afterwards. The
+    /// returned pair describes the frame this call pushed — the machine's new top
+    /// frame — for as long as the caller does not push, pop or `trim` in between.
+    #[inline]
+    pub(crate) fn push_frame_window(&mut self, y_count: u32) -> Result<(usize, u32)> {
         let y_base = self.stack.len();
         if y_count != 0 {
             self.stack
@@ -233,10 +247,18 @@ impl Machine {
             y_base,
             y_count,
         });
-        Ok(())
+        Ok((y_base, y_count))
     }
 
     /// Pop the innermost frame (and its Y slots).
+    ///
+    /// `Frame` is `Copy` and has no `Drop`, so dropping it is a length store: the pop
+    /// reads the frame it needs (`y_base`) once and then truncates both vectors.
+    ///
+    /// Only the crate's own tests call this form directly — every production pop goes
+    /// through the size-checked [`Machine::pop_frame_checked`] — so it is
+    /// `dead_code`-allowed outside a test build, like [`Machine::continuation`].
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn pop_frame(&mut self) -> Result<()> {
         match self.frames.pop() {
@@ -252,16 +274,27 @@ impl Machine {
     ///
     /// Used by `deallocate`/`call_last`/`call_ext_last`; a mismatched size is a
     /// typed error, never a silent stack corruption.
+    ///
+    /// The frame is read **once** (`Vec::pop` is the read): a mismatch is the cold arm
+    /// and puts the frame back verbatim, so the success path — every return of every
+    /// non-tail call — pays a single frame read rather than the `last()` + `pop()` pair
+    /// that reads the top frame twice.
     #[inline]
     pub(crate) fn pop_frame_checked(&mut self, n: u32) -> Result<()> {
-        let y_count = match self.frames.last() {
-            Some(frame) => frame.y_count,
-            None => return Err(error::unsupported("deallocate: no frame")),
-        };
-        if y_count != n {
-            return Err(error::unsupported("deallocate: frame size mismatch"));
+        match self.frames.pop() {
+            Some(frame) => {
+                if frame.y_count != n {
+                    // Cold: nothing has been popped as far as any observer can tell —
+                    // `Frame` is `Copy`, so this restores the identical frame, and the
+                    // capacity is already there (`push` cannot reallocate here).
+                    self.frames.push(frame);
+                    return Err(error::unsupported("deallocate: frame size mismatch"));
+                }
+                self.stack.truncate(frame.y_base);
+                Ok(())
+            }
+            None => Err(error::unsupported("deallocate: no frame")),
         }
-        self.pop_frame()
     }
 
     /// `trim N` — shrink the current frame to its **highest** Y slots.

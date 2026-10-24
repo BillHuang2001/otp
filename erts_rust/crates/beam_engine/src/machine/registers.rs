@@ -387,13 +387,17 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // reset and a machine that runs one module repeatedly builds it once. A stale
         // entry can never answer for another module (`label_cache.rs`).
         //
-        // The local-callee identity memo is address-keyed, so its entries are only valid
-        // for the run that filled them: a fresh run must re-derive rather than answer
-        // with an image that is no longer the one being executed. This is also what keeps
-        // the key ABA-free (no address it holds can be recycled while it holds it). As
-        // with `contexts`, `resume_outcome` deliberately does **not** reset, and a
-        // suspended machine's modules are still alive.
-        self.local_callees.clear();
+        // The local-call verdict tables belong to the run that filled them (the cached
+        // `Arc<Module>`s behind the registered contexts are dropped by `contexts.clear()`
+        // above, and the entry module's table is re-bound by `enter_run`), so a fresh run
+        // must consult the host again rather than answer from a previous run's module
+        // images. As with `contexts`, `resume_outcome` deliberately does **not** reset, and
+        // a suspended machine's modules are still alive.
+        self.entry_verdicts.clear();
+        // … and with it any **pending** invalidation the previous run armed: a fresh run
+        // dispatches no BIF before its first local call, so a flag left over from an
+        // earlier run would only cost that run a redundant verdict clear.
+        self.local_call_invalidation_pending.set(false);
         // The raise-time snapshot belongs to the run that is starting too: it is the
         // pre-unwind frame chain of whichever raise last happened, and a fresh run
         // begins with no raise in flight. As with `contexts`, `resume_outcome`
@@ -423,7 +427,7 @@ impl Machine {    /// Read X register `n`, or `None` if it is outside the regist
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).
-        self.current_code = None;
+        self.current_code = crate::machine::CURRENT_CODE_NONE;
         self.entry_call = None;
         // The A.8 tracing gate is re-latched from the context at every run entry
         // (`run_loop_with_map` / the native driver). Clearing it here means a run

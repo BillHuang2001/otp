@@ -434,6 +434,33 @@ impl JitRuntime<'_> {
         }
     }
 
+    /// Re-publish the Y window of a frame the caller has **just pushed**, from the
+    /// `(y_base, y_count)` [`Machine::push_frame_window`] handed back.
+    ///
+    /// [`JitRuntime::refresh_y_base`] is the general form: it re-derives the window from
+    /// `Machine::frames.last()` and a fresh `machine.stack.as_mut_ptr()`. A frame-changing
+    /// helper's success arm has both figures in hand already, so it publishes through this
+    /// instead — the same two stores, without the frame-stack load, the index scaling and
+    /// the `y_base`/`y_count` reload that re-derivation costs.
+    ///
+    /// Soundness is exactly [`JitRuntime::refresh_y_base`]'s: the frame is the machine's
+    /// top frame (it was just pushed) and the stack is sized to `y_base + y_count`, so the
+    /// range is in bounds; the base pointer is taken *after* the push, so it follows any
+    /// reallocation the push made.
+    #[inline]
+    pub(crate) fn publish_y_window(&mut self, y_base: usize, y_count: u32) {
+        // SAFETY: `rt.machine` is a non-null pointer to the driver's live `Machine`;
+        // no other `&mut Machine` exists while a helper/driver frame runs (the driver
+        // is blocked in the block call that reached us).
+        let machine = unsafe { &mut *self.machine };
+        // SAFETY: `push_frame_window` sized the stack to `y_base + y_count`, so
+        // `[y_base, y_base + y_count]` is in bounds of the current allocation; the
+        // pointer is freshly taken, so it follows any earlier reallocation.
+        let start = unsafe { machine.stack.as_mut_ptr().add(y_base) };
+        self.y_base = start;
+        self.y_end = unsafe { start.add(y_count as usize) };
+    }
+
     /// Re-publish the literal area the machine has bound into
     /// [`Self::literals_base`]/[`Self::literals_end`].
     ///
@@ -1898,21 +1925,22 @@ pub(crate) extern "C" fn jit_allocate(
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
     let runtime = unsafe { &mut *rt };
-    let framed = {
+    let pushed = {
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
         // The same position store `Machine::step_instruction` makes at entry.
         machine.set_current_code(func, pc);
-        machine.push_frame(stack_need)
+        machine.push_frame_window(stack_need)
     };
-    match framed {
+    match pushed {
         // The push is a frame change (`machine.stack` may have been grown, and the window
-        // now belongs to the *new* frame), so re-publish it here: the block continues
+        // now belongs to the *new* frame), so publish it here: the block continues
         // in-block after an `allocate`, and the emitted continue arm no longer pays a
-        // separate `jit_refresh_y` call for it.
-        Ok(()) => {
-            runtime.refresh_y_base();
+        // separate `jit_refresh_y` call for it. The publish uses the `(y_base, y_count)`
+        // the push just computed rather than re-deriving them.
+        Ok((y_base, y_count)) => {
+            runtime.publish_y_window(y_base, y_count);
             encode_target(func, pc + 1)
         }
         Err(err) => report_frame_error(runtime, func, pc, err),
@@ -1945,7 +1973,7 @@ pub(crate) extern "C" fn jit_allocate_heap(
     // `JitRuntime` and never aliases it for the duration of the call; every pointer it
     // holds points at an object the driver owns and keeps alive for the whole loop.
     let runtime = unsafe { &mut *rt };
-    let framed = {
+    let pushed = {
         // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
         // `Machine`; no other `&mut Machine` exists while the helper runs.
         let machine = unsafe { &mut *runtime.machine };
@@ -1957,15 +1985,15 @@ pub(crate) extern "C" fn jit_allocate_heap(
         // The interpreter's own order: admit (`ensure_heap`), then push the frame.
         machine
             .ensure_heap(heap_need, live, ctx)
-            .and_then(|()| machine.push_frame(stack_need))
+            .and_then(|()| machine.push_frame_window(stack_need))
     };
-    match framed {
+    match pushed {
         // The push is a frame change and the admission before it may have collected, so
-        // re-publish the Y window here; the emitted continue arm keeps its register refill
+        // publish the window here; the emitted continue arm keeps its register refill
         // (a collecting host rewrote `machine.x`) but no longer pays a separate
         // `jit_refresh_y` call.
-        Ok(()) => {
-            runtime.refresh_y_base();
+        Ok((y_base, y_count)) => {
+            runtime.publish_y_window(y_base, y_count);
             encode_target(func, pc + 1)
         }
         Err(err) => report_frame_error(runtime, func, pc, err),

@@ -100,7 +100,7 @@ fn build_stacktrace_cooks_the_raise_snapshot_innermost_first() {
         })
         .unwrap();
     // The raising instruction: `run/0` at code offset 1.
-    machine.current_code = Some((0, 1));
+    machine.set_current_code(0, 1);
     // A catch frame owned by frame 1: landing there unwinds frame 2 (`outer`) away.
     machine.push_catch_frame(CatchFrame::new(1, 0, 1));
     machine.set_class_atom(ExceptionClass::Error, make_atom(Atom::from_raw(11)));
@@ -176,7 +176,7 @@ fn build_stacktrace_item_carries_the_source_location() {
     machine.push_frame(0).unwrap();
     // The snapshot's raising frame is the `line`-marked code offset 2: capture it
     // through an (uncaught) raise, which snapshots before unwinding.
-    machine.current_code = Some((0, 2));
+    machine.set_current_code(0, 2);
     let err = machine
         .throw(ExceptionClass::Error, Eterm::from_raw(1))
         .expect_err("no catch frame");
@@ -228,7 +228,7 @@ fn build_stacktrace_without_the_file_or_line_atom_is_a_typed_error() {
         machine.push_frame(0).unwrap();
         // A snapshot frame with a real location, so `location_shape` is reached:
         // capture it through an (uncaught) raise.
-        machine.current_code = Some((0, 2));
+        machine.set_current_code(0, 2);
         let err = machine
             .throw(ExceptionClass::Error, Eterm::from_raw(1))
             .expect_err("no catch frame");
@@ -252,7 +252,7 @@ fn build_stacktrace_of_an_unknown_function_index_is_a_typed_error() {
     machine.push_frame(0).unwrap();
     // The snapshot's raising frame names function index 3, absent from the empty
     // module. Capture it through an (uncaught) raise.
-    machine.current_code = Some((3, 0));
+    machine.set_current_code(3, 0);
     let err = machine
         .throw(ExceptionClass::Error, Eterm::from_raw(1))
         .expect_err("no catch frame");
@@ -331,7 +331,7 @@ fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
         })
         .unwrap();
     machine.switch_context(id).unwrap();
-    machine.current_code = Some((boom, 0));
+    machine.set_current_code(boom, 0);
 
     // An uncaught raise (no catch frame) still captures the snapshot.
     let err = machine

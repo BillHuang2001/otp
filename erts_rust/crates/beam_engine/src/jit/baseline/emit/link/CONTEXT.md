@@ -46,9 +46,10 @@ A `CallExt*` transfer stays a **driver round-trip by design** (separate executab
 
 ## Local calls — the frame-preserving `Call`, `CALL_STORED`, and the tail forms' baked probe
 `Instr::Call` is the one local call form that writes a continuation; `jit_call_store` does that store
-*and* consults the host's local-call seam (`ExecutionContext::resolve_local_call`) in one helper call, in
-the interpreter's own probe-then-store order (a served callee's own code never runs and must not be left
-a return address).
+*and* runs `Machine::local_call_seam` — which reads the executing module context's index-addressed
+verdict table and asks the host's `ExecutionContext::resolve_local_call` only once per distinct callee
+(`../../../../machine/CONTEXT.md`) — in one helper call, in the interpreter's own probe-then-store order
+(a served callee's own code never runs and must not be left a return address).
 Its answer is a block-ABI word: `CALL_STORED` (`-5`) means "the continuation is in place, transfer now",
 and every other word (a served callee's folded `Step`, or the interpreter's own typed diagnostic) leaves
 the block for the driver.

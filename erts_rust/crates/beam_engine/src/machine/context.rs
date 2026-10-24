@@ -49,12 +49,22 @@
 //! so the context list stays bounded by the number of distinct modules, not by the
 //! call count. Two `Arc`s with equal contents but different allocations are two
 //! contexts — wasteful but never wrong (they name the same code).
+//!
+//! # The per-context local-call verdict table
+//!
+//! A context also owns its module's **local-call verdict table**
+//! ([`LocalVerdicts`]), because a module context is exactly the granularity that
+//! identifies an image: the running module's table can only ever be the table of the
+//! context `Machine::context` names, so the local-call seam's lookup needs no module
+//! key at all — see `local_callee.rs` for the whole argument.
 
 use std::sync::Arc;
 
 use beam_loader::Module;
 
 use crate::interpreter::LabelMap;
+
+use super::LocalVerdicts;
 
 /// One enterable module: the host's module handle plus the label index the
 /// dispatch loop resolves module-local labels against.
@@ -71,12 +81,30 @@ pub(crate) struct ModuleContext {
     /// The module-wide `Label -> (func, pc)` index (and the per-run import table
     /// derived from it).
     pub(crate) labels: Arc<LabelMap>,
+    /// This module's **local-call verdict table**
+    /// ([`crate::machine::LocalVerdicts`]): one slot per function, read by the
+    /// callee's function index on every local call the module makes.
+    ///
+    /// It lives **here**, in the context, because that is what gives it the
+    /// callee's module identity for free: the table was sized from *this*
+    /// `Arc<Module>`'s function table and is only ever read while this context is
+    /// the one executing (`Machine::context`), so a `Module::clone` or a separate
+    /// load of the same `.beam` — a different `Arc`, hence (via `Arc::ptr_eq`
+    /// deduplication) a different context — can never read another image's
+    /// verdicts. The slots are `Cell`s, so the seam mutates the table through the
+    /// shared `Arc`.
+    pub(crate) verdicts: LocalVerdicts,
 }
 
 impl ModuleContext {
     /// A context for `module` and its already-built label map.
     fn new(module: Arc<Module>, labels: Arc<LabelMap>) -> ModuleContext {
-        ModuleContext { module, labels }
+        let verdicts = LocalVerdicts::for_module(&module);
+        ModuleContext {
+            module,
+            labels,
+            verdicts,
+        }
     }
 }
 
@@ -136,6 +164,34 @@ impl Contexts {
         self.entries.get((id - 1) as usize).map(Arc::clone)
     }
 
+    /// The local-call verdict table of context `id`, or `None` for the entry context
+    /// `0` (whose table the machine owns —
+    /// [`Machine::entry_verdicts`](crate::Machine)) and for an id never registered.
+    ///
+    /// A borrow, not a clone: this is the local-call seam's hot path, and the slots
+    /// are `Cell`s, so the table is mutable through it.
+    #[inline(always)]
+    pub(crate) fn verdicts(&self, id: u32) -> Option<&LocalVerdicts> {
+        if id == 0 {
+            return None;
+        }
+        self.entries
+            .get((id - 1) as usize)
+            .map(|entry| &entry.verdicts)
+    }
+
+    /// Reset every registered context's local-call verdicts to
+    /// [`Verdict::Unknown`](crate::machine::Verdict) — the other half of
+    /// [`Machine::invalidate_local_call_verdicts`](crate::Machine), which must cover
+    /// every context, not only the one the invalidation happened in.
+    ///
+    /// `&self` because the tables are `Cell`s; one byte per function per context, and
+    /// only ever reached from a BIF dispatch or the seam's next local call.
+    pub(crate) fn invalidate_verdicts(&self) {
+        for entry in &self.entries {
+            entry.verdicts.invalidate();
+        }
+    }
     /// The number of registered contexts (not counting the entry context).
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {

@@ -58,18 +58,24 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   context-0 frame) is threaded from the driver through `step_instruction_with_entry` → `exec_bif` /
   `call_bif_named` / `dispatch_wide` / `families::dispatch` → `dispatch_bif_call`, and on the native tier
   through `JitRuntime.entry_module` (a field generated code never reads).
-- **The local-call seam's callee identity is memoized; the host's verdict is not.** `Machine::local_call_seam`
-  (`interpreter/dispatch.rs`) names the same-module callee of every local `call`/`call_only`/`call_last` and asks
-  `ExecutionContext::resolve_local_call(module, function, arity)` once per call. The three-value identity is a pure
-  function of the immutable module image, so `Machine::local_callees` (`machine/local_callee.rs`) memoizes it per
-  `(module address, function index)`; `Machine::reset` clears it, which is what keeps an address key ABA-free.
-  The host is still consulted **exactly once per call** — a host spends one reduction unit per consultation, and
-  `erlang:load_nif/2` can install a stub that a later call must be served from — so no verdict may ever be cached;
-  an un-nameable callee is consulted zero times (a memoized sentinel), exactly as before the memo existed.
-  A hit never reorders the memo and the keys live in a flat `[CalleeKey; 8]` beside the payloads, so the scan is
-  inlined and stays inside two cache lines (a move-to-front policy was measured as an instruction regression: an
-  alternating two-callee loop memmoved on every call). Both tiers drive this one definition, so the memo needs no
-  `src/jit/**` change, and the interpreter's three local-call arms plus the baseline tier's probe stay identical.
+- **The local-call seam memoizes the host's verdict, per callee function index, per run.** `Machine::local_call_seam`
+  (`interpreter/dispatch.rs`) names the same-module callee of every local `call`/`call_only`/`call_last` and can ask
+  `ExecutionContext::resolve_local_call(module, function, arity)`. The identity and the verdict are pure functions of
+  the immutable module image plus the host's answer set, so `LocalVerdicts` (`machine/local_callee.rs`) holds both in
+  the executing module context's table — one `Cell<Verdict>` slot per entry of `Module::functions` — and a repeat local
+  call reads the callee's own slot; `resolve_local_call` is therefore consulted **once per distinct callee per run**,
+  and an un-nameable callee zero times (a memoized sentinel). Caching the verdict is the *faithful* choice: ERTS charges
+  nothing for an intra-module call, so a per-call consultation spends a reduction unit the oracle never charges.
+  Three doors invalidate — `Machine::reset` (which drops the contexts that own the tables, and clears the entry table
+  with them), the BIF-dispatch funnel `Machine::dispatch_bif_call` when it dispatches `erlang:load_nif/2` (the BIF
+  installs the stub a later local call must be served from; the funnel is `&self`, so it only **arms** a `Cell` flag
+  and the seam clears the verdicts at its next local call), and the public
+  `Machine::invalidate_local_call_verdicts` for a host whose answer set changes by any other means.
+  The hot path is the slot read alone: no scan, no key compare, no data-dependent branch. Both tiers drive this one
+  definition, so the memo needs no `src/jit/**` change. What is **not** legitimate is baking a verdict into
+  **compiled code**: `JitBackend::compile(&mut self, module: &Module)` is handed no `ExecutionContext`, and the
+  cross-run `CodeCache` is content-keyed and shared across runs, machines and hosts — the memo is a per-machine,
+  per-run, invalidatable cache and nothing the emitter generates may carry one.
 - **`ExecutionContext::atoms` is the live atom namespace, for comparison AND for every raise.** The
   defaulted `fn atoms<'m>(&'m self, module: &'m Module) -> &'m AtomTable` (default body:
   `&module.atom_table`) is the namespace every **comparison** resolves names through: guards/
@@ -299,8 +305,10 @@ recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md
 The position has **two** writers plus the `reset` clear: `Machine::step_instruction_with_entry`
 (`interpreter/dispatch.rs`) writes the field directly at every interpreted instruction's entry — the
 instruction-granular store every suspension and raise relies on — and `Machine::set_current_code`
-(`machine/location.rs`, a plain `self.current_code = Some(..)`) is the accessor `src/jit/**` reaches;
-`Machine::reset` clears it to `None`.
+(`machine/location.rs`) is the accessor `src/jit/**` reaches; `Machine::reset` sets it back to
+`CURRENT_CODE_NONE`. The field is **one packed `u64`** (`func << 32 | pc`, `pack_current_code`/
+`unpack_current_code`, with `u64::MAX` and the `func == u32::MAX` sentinel as "no position"), so a store is a
+single word write and every reader unpacks it.
 Every store is an instruction boundary, but **not** every store happens before the thing it names runs:
 - Interpreter: `Machine::drive` stores **before** the charge and the body, so a `reduce` refusal parks on
   the **not-yet-executed** instruction; then `step_instruction_with_entry` re-stores the same address.
