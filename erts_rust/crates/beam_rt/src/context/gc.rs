@@ -321,15 +321,19 @@ fn plain_bump(heap: &mut Heap, n: usize) -> Option<*mut Eterm> {
 }
 
 /// Whether `pid` has an **unserved** forced-collection request — the two full-root doors' peek
-/// at [`Runtime::gc_request_pending`], **outlined**.
+/// at [`Runtime::gc_request_pending`].
 ///
 /// The predicate is itself three instructions (an `is_empty` length compare in front of a hash
-/// probe), but the hash probe behind it is a call into the standard library's SipHash: keeping it
-/// inline forces the doors to hold the runtime, the pid, the heap request and the root-set
-/// pointer across that call, i.e. to push six callee-saved registers and a scratch area in their
-/// **prologue** — paid by every admission, though a requested collection is one admission in
-/// thousands. Outlining it here keeps the doors' hot path register-light; the call costs less
-/// than the spill it removes.
+/// probe), but the hash probe behind it is the standard library's SipHash: left inline it puts
+/// the probe's loop **and six or seven callee-saved pushes** in the doors' prologue — paid by
+/// every admission, though a requested collection is one admission in thousands.
+///
+/// **The outline is `#[inline(never)]` on [`crate::runtime::Runtime::gc_request_pending`]'s probe,
+/// not an attribute choice here.** Under this workspace's `lto = "thin"` + `codegen-units = 1` a
+/// plain private helper is inlined back across the crate boundary, so `#[inline]` on this wrapper
+/// changes nothing and the doors keep the spills; only an explicit `#[inline(never)]` states a
+/// boundary. Pinned by measurement (−0.78 % retired instructions on `bench_gc_bound:churn/1`) —
+/// [`PERF_DISPATCH.md`](../../../PERF_DISPATCH.md) *MEMO-HIT-CUT*.
 #[inline]
 fn forced_gc_request(runtime: &Runtime, pid: ProcessId) -> bool {
     runtime.gc_request_pending(pid)
