@@ -1068,9 +1068,21 @@ impl ProcessTable {
         self.collection_gate.is_some()
     }
 
-    /// Asks the installed collection gate whether a **relocating** collection of `pid`'s heap must
-    /// be declined. `false` when no gate is installed and `false` for a pid the table does not hold
-    /// (a receiver that died earlier in the same propagation has no heap left to move).
+    /// Whether a **relocating** collection of `pid`'s heap must be declined at a signal site:
+    /// the crate's own [`Process::has_unpublished_roots`] test, else the installed host
+    /// [`CollectionGate`]. `false` when neither answers `true` — i.e. for an ordinary receiver with
+    /// no gate installed — and `false` for a pid the table does not hold (a receiver that died
+    /// earlier in the same propagation has no heap left to move).
+    ///
+    /// # Ordering: the O(1) crate-owned predicate first
+    ///
+    /// The two halves are OR-ed, so the answer is the same in either order — but only if the
+    /// crate-owned predicate is consulted **first**: it is a two-field read
+    /// (`relocation_exempt` or [`ProcessState::Running`]), while a host gate is free to run an
+    /// O(live objects) reachability walk (`beam_rt`'s unscanned-root valve is exactly that). When
+    /// the receiver already declines, the host's answer cannot change the decision, so the walk is
+    /// skipped outright. A gate must therefore never be relied on for a side effect: it is not
+    /// consulted at all for a receiver the crate already declines.
     ///
     /// Split borrows of two disjoint fields (`slots` and `collection_gate`), so the gate can be
     /// handed the receiver's PCB while the slot table stays borrowed.
@@ -1083,9 +1095,10 @@ impl ProcessTable {
         let Some(process) = lookup(slots, pid) else {
             return false;
         };
-        collection_gate
-            .as_deref_mut()
-            .map_or(false, |gate| gate.declines_relocation(process))
+        process.has_unpublished_roots()
+            || collection_gate
+                .as_deref_mut()
+                .map_or(false, |gate| gate.declines_relocation(process))
     }
     // --- message delivery ----------------------------------------------------
 
@@ -1099,12 +1112,14 @@ impl ProcessTable {
     ///
     /// # The host collection gate
     ///
-    /// When the installed [`CollectionGate`] declines a relocating collection of `to`'s heap
-    /// (`declines_signal_collection`), the receiver is marked relocation-exempt for
-    /// the duration of **exactly one** [`Process::deliver`](crate::process::Process::deliver) call
-    /// and its prior flag is restored unconditionally afterwards. The delivery therefore behaves
-    /// exactly as it does for a receiver the crate already declines to move: a payload that fits
-    /// the current nursery is enqueued normally, and one that does not returns
+    /// When the receiver's own O(1) [`Process::has_unpublished_roots`] test answers `true`
+    /// (relocation-exempt, or [`ProcessState::Running`]) **or** the installed [`CollectionGate`]
+    /// declines a relocating collection of `to`'s heap (`declines_signal_collection`), the receiver
+    /// is marked relocation-exempt for the duration of **exactly one**
+    /// [`Process::deliver`](crate::process::Process::deliver) call and its prior flag is restored
+    /// unconditionally afterwards. The delivery therefore behaves exactly as it does for a receiver
+    /// the crate already declines to move: a payload that fits the current nursery is enqueued
+    /// normally, and one that does not returns
     /// [`Process::deliver`](crate::process::Process::deliver)'s **raw**
     /// `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)` refusal — the exact value the
     /// host's heap-fragment fallback keys on — with **no** collection, no growth and no word moved.
@@ -1112,6 +1127,13 @@ impl ProcessTable {
     /// it, and a no-relocation growth
     /// ([`Process::grow_nursery`](crate::process::Process::grow_nursery)) stays available.
     ///
+    /// The crate-owned predicate is tested **first**, and the host gate is consulted only when it
+    /// does not already decline: both sides are pure and OR-ed, so the decision is identical, but
+    /// the host implementation is free to be an O(live objects) reachability walk (that is exactly
+    /// what `beam_rt`'s unscanned-root valve is) and there is nothing for it to add once the
+    /// receiver already declines. This matters on the per-message hot path: the runner marks a
+    /// `receive`-parked process relocation-exempt for its whole parked window, so the overwhelmingly
+    /// common delivery target is one whose answer is already known.    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when `to` is unknown; propagates the copy engine's
@@ -1137,17 +1159,24 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(slots, to) else {
             return Err(error::unknown_process());
         };
-        let decline = collection_gate
-            .as_deref_mut()
-            .map_or(false, |gate| gate.declines_relocation(recipient));
+        // The crate-owned O(1) predicate first (relocation-exempt, or `Running`), the host gate
+        // only when it does not already decline: `||` is commutative and both sides are pure, so
+        // the decision is unchanged, while the host's O(live objects) walk is skipped for the
+        // overwhelmingly common case — the runner marks a `receive`-parked process
+        // relocation-exempt for its whole parked window.
+        let decline = recipient.has_unpublished_roots()
+            || collection_gate
+                .as_deref_mut()
+                .map_or(false, |gate| gate.declines_relocation(recipient));
         let outcome = if decline {
-            // The gate declines the move: refuse the relocating collection for the duration of
-            // this one delivery by marking the receiver relocation-exempt, so
-            // `Process::deliver` surfaces its raw `AllocKind::Heap`/`AllocKind::Message`
-            // refusal UNCHANGED (the caller's heap-fragment key) rather than collecting and
-            // moving the heap under the receiver's unscanned roots. The prior flag is restored
-            // unconditionally — before the `?` — so a host that exempts a process itself keeps
-            // its mark and an ordinary receiver is left exactly as it was.
+            // The crate's own predicate or the gate declines the move: refuse the relocating
+            // collection for the duration of this one delivery by marking the receiver
+            // relocation-exempt, so `Process::deliver` surfaces its raw
+            // `AllocKind::Heap`/`AllocKind::Message` refusal UNCHANGED (the caller's heap-fragment
+            // key) rather than collecting and moving the heap under the receiver's unscanned
+            // roots. The prior flag is restored unconditionally — before the `?` — so a host that
+            // exempts a process itself keeps its mark and an ordinary receiver is left exactly as
+            // it was.
             let prior = recipient.is_relocation_exempt();
             recipient.set_relocation_exempt(true);
             let delivered = recipient.deliver(from, term, src_off_heap);
@@ -5343,6 +5372,37 @@ mod tests {
         }
     }
 
+    /// A gate that **panics on any consultation** — the witness that a site short-circuits it.
+    ///
+    /// The crate-owned `Process::has_unpublished_roots` predicate is O(1) and is OR-ed *before* the
+    /// host gate, so a receiver it already declines (relocation-exempt, or `Running`) is decided
+    /// without the gate being asked. Because the two sides are OR-ed and pure, a gate's answer is
+    /// **not observable** in that case by design — the only thing a test can prove is that it was
+    /// never consulted, which is exactly what this gate makes loud.
+    struct MustNotBeAsked;
+
+    impl CollectionGate for MustNotBeAsked {
+        fn declines_relocation(&mut self, receiver: &Process) -> bool {
+            panic!(
+                "the host collection gate was consulted for a receiver the crate-owned predicate \
+                 already declines (pid {}) — the O(1) short-circuit did not happen",
+                receiver.pid().number()
+            );
+        }
+    }
+
+    /// A gate that counts its consultations and always declines — the counterpart witness: a
+    /// receiver the crate's own predicate does **not** decline still reaches the host.
+    struct CountingDeclines {
+        calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl CollectionGate for CountingDeclines {
+        fn declines_relocation(&mut self, _receiver: &Process) -> bool {
+            self.calls.set(self.calls.get() + 1);
+            true
+        }
+    }
     /// Spawns a receiver and drains its nursery to exactly **three free words** with a delivered
     /// filler message, returning the receiver and the filler's word count.
     ///
@@ -5688,6 +5748,208 @@ mod tests {
         assert!(
             r.collector().young().contains_term(delivered),
             "the retried build landed on the receiver's own (new) nursery"
+        );
+    }
+
+    /// The **ordering** half of the delivery site: a receiver the crate's own O(1)
+    /// `Process::has_unpublished_roots` predicate already declines (here: relocation-exempt — the
+    /// runner's shape for a `receive`-parked process, i.e. the overwhelmingly common delivery
+    /// target) is decided **without the host gate being consulted at all**, and the outcome is
+    /// byte-identical: the raw `AllocKind::Heap`/`AllocKind::Message` refusal the caller's
+    /// heap-fragment route keys on, no collection, no growth, nothing enqueued, and the receiver's
+    /// own exemption flag kept.
+    ///
+    /// The gate's *answer* is not observable here by design — the two predicates are OR-ed and
+    /// pure, so once the crate-owned half answers `true` the host's cannot change the decision.
+    /// `MustNotBeAsked` panics on any call, which is the strongest available witness that the
+    /// O(live objects) host walk was skipped.
+    #[test]
+    fn an_exempt_receivers_delivery_never_consults_the_host_gate() {
+        let mut table = table();
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        // One word more than the three free words the fixture left.
+        let mut src = Heap::new(16).expect("the source arena allocates");
+        let payload = src
+            .tuple(&[make_small(100), make_small(101), make_small(102)])
+            .expect("the payload fits the arena");
+        let from = ProcessId::new(998, 0).to_eterm();
+
+        table
+            .set_relocation_exempt(receiver, true)
+            .expect("the receiver is live");
+        assert!(
+            table.get(receiver).expect("live").has_unpublished_roots(),
+            "the fixture's receiver already declines through the crate-owned predicate"
+        );
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        table.set_collection_gate(Box::new(MustNotBeAsked));
+
+        match table.deliver_simple(receiver, from, payload) {
+            Err(BeamError::Alloc(failure)) => assert!(
+                matches!(failure.kind, AllocKind::Heap | AllocKind::Message),
+                "the raw refusal keeps its Heap/Message kind, got {:?}",
+                failure.kind
+            ),
+            other => panic!("expected the raw allocation refusal, got {other:?}"),
+        }
+
+        let r = table.get(receiver).expect("live");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "the declined delivery must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "the declined delivery must not move or grow the nursery"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the refused delivery wrote nothing on the receiver's heap"
+        );
+        assert_eq!(r.mailbox().len(), 1, "the refused delivery enqueued nothing");
+        assert!(
+            r.is_relocation_exempt(),
+            "the receiver's own exemption is restored, not cleared"
+        );
+        // The gate really is installed and reachable — the short-circuit, not a missing gate, is
+        // what kept it unasked.
+        assert!(table.has_collection_gate());
+    }
+
+    /// The same ordering at the **signal** sites (`declines_signal_collection`, the one funnel
+    /// every `ptab` signal builder and the apply-time `deliver_head_signal` use): an
+    /// already-exempt receiver's trapped exit reaches the heap-fragment route with the host gate
+    /// **never consulted**, and no collection, growth or heap write happens.
+    #[test]
+    fn an_exempt_receivers_signal_never_consults_the_host_gate() {
+        let mut table = table();
+        let signaller = table.spawn_default().expect("a fresh process");
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        // A trapping receiver survives the exit and queues it as a message.
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_trap_exit(true);
+        table
+            .set_relocation_exempt(receiver, true)
+            .expect("the receiver is live");
+        assert!(
+            table.get(receiver).expect("live").has_unpublished_roots(),
+            "the fixture's receiver already declines through the crate-owned predicate"
+        );
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        table.set_collection_gate(Box::new(MustNotBeAsked));
+
+        // The reason is an immediate, so the enqueue-time copy allocates nothing and both the
+        // enqueue-time and the apply-time `declines_signal_collection` calls are exercised.
+        table
+            .send_exit(signaller, receiver, make_small(42))
+            .expect("the trapping receiver takes the signal");
+
+        let r = table.get(receiver).expect("the receiver survived");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "an exempt receiver must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "an exempt receiver's heap must not move"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the fragment-built signal wrote nothing on the receiver's heap"
+        );
+        assert_eq!(r.mailbox().len(), 2, "the filler and the exit message");
+        let _filler = table
+            .get_mut(receiver)
+            .expect("live")
+            .receive(|_| true)
+            .expect("the filler");
+        let exit_msg = table
+            .get_mut(receiver)
+            .expect("live")
+            .receive(|_| true)
+            .expect("the exit message");
+        assert!(
+            exit_msg.fragments().is_some(),
+            "the exempt fallback still enqueued a fragment-resident message"
+        );
+        assert!(
+            table.get(receiver).expect("live").is_relocation_exempt(),
+            "the receiver's own exemption is untouched"
+        );
+    }
+
+    /// The counterpart: a receiver that is **neither** relocation-exempt nor `Running` — so the
+    /// crate-owned predicate declines nothing — still consults the installed host gate, and its
+    /// `true` answer is still honoured exactly as before (raw refusal, nothing collected or
+    /// enqueued).
+    #[test]
+    fn a_non_exempt_receiver_still_consults_a_host_gate_that_declines() {
+        let mut table = table();
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        let mut src = Heap::new(16).expect("the source arena allocates");
+        let payload = src
+            .tuple(&[make_small(100), make_small(101), make_small(102)])
+            .expect("the payload fits the arena");
+        let from = ProcessId::new(998, 0).to_eterm();
+
+        assert!(
+            !table.get(receiver).expect("live").has_unpublished_roots(),
+            "the fixture's receiver is neither exempt nor `Running`"
+        );
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        table.set_collection_gate(Box::new(CountingDeclines {
+            calls: std::rc::Rc::clone(&calls),
+        }));
+
+        match table.deliver_simple(receiver, from, payload) {
+            Err(BeamError::Alloc(failure)) => assert!(
+                matches!(failure.kind, AllocKind::Heap | AllocKind::Message),
+                "the raw refusal keeps its Heap/Message kind, got {:?}",
+                failure.kind
+            ),
+            other => panic!("expected the raw allocation refusal, got {other:?}"),
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "the host gate is consulted exactly once when the crate-owned predicate declines nothing"
+        );
+
+        let r = table.get(receiver).expect("live");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "a host-declined delivery must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "a host-declined delivery must not move or grow the nursery"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the refused delivery wrote nothing on the receiver's heap"
+        );
+        assert_eq!(r.mailbox().len(), 1, "the refused delivery enqueued nothing");
+        assert!(
+            !r.is_relocation_exempt(),
+            "the temporary exemption the gate implies is restored afterwards"
         );
     }
 }

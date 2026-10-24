@@ -455,6 +455,14 @@ pub struct Process {
 /// The predicate takes `&mut self` so a gate can keep its own state (a cache, a counter), and
 /// receives the receiver's PCB so it can consult the process itself (its pid, its heap, its
 /// collector's geometry) rather than only an id.
+///
+/// **A gate must not be relied on for a side effect, and must not assume it is called for every
+/// receiver.** It is OR-ed *after* the crate's own O(1) [`Process::has_unpublished_roots`] test at
+/// every site, so a receiver the crate already declines (relocation-exempt, or [`Running`](ProcessState::Running))
+/// is decided without the gate being consulted at all — which is what keeps a host implementation an
+/// `O(live objects)` reachability walk off the per-message hot path (the overwhelmingly common
+/// delivery target is a `receive`-parked process, exempt for its whole parked window). The ordering
+/// changes nothing about the answer: both sides are pure and the result is the OR.
 pub trait CollectionGate {
     /// Whether a **relocating** collection of `receiver`'s heap must be declined.
     ///
