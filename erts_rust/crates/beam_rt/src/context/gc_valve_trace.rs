@@ -1031,11 +1031,11 @@ mod tests {
             after.hist_descents[hist_bucket(40)],
             before.hist_descents[hist_bucket(40)] + 1
         );
-        // The per-pid twin of the same three calls: every call counted, the two descents
-        // counted, and the visited sum/peak per process.
+        // The per-pid twin of the same three calls: every call counted, the one real descent
+        // counted (the phase-1 hit is not one), and the visited sum/peak per process.
         let pid_after = pid_snapshot(pid);
         assert_eq!(pid_after.calls, before_pid.calls + 3);
-        assert_eq!(pid_after.descents, before_pid.descents + 2);
+        assert_eq!(pid_after.descents, before_pid.descents + 1);
         assert_eq!(pid_after.visited, before_pid.visited + 40);
         assert_eq!(pid_after.visited_peak.max(before_pid.visited_peak), 40);
     }
