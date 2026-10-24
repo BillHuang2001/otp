@@ -47,6 +47,18 @@
 //! dynamic behaviour) it produced before this cache existed. There is no fabricated
 //! program and no substituted result.
 //!
+//! # The key is an identity only for an image that has a content identity
+//!
+//! `(function, code offset)` names one instruction **of a loaded `.beam`** — one
+//! instruction occupies one code slot — so two executions of one key are two executions
+//! of one instruction. A *synthetic* image (`Module::default()`, the hand-built shape a
+//! test or an engine benchmark uses) has no such property: it freely re-uses `(0, 0)`
+//! for many different descriptor lists, and its all-zero `Module::checksum` is the
+//! documented marker of exactly that lack of content identity (`machine/label_cache.rs`).
+//! So `bs_match` caches a program only for an image whose checksum is not all-zero
+//! (`matching::prepared`); a synthetic image keeps the generic walk, where a hit on
+//! another instruction's program — a wrong answer, not merely a slow one — cannot arise.
+//!
 //! # Where it lives, and why
 //!
 //! One [`BitstrPrograms`] per **module context** (`machine::ModuleContext`), plus the
@@ -85,6 +97,7 @@
 use beam_loader::Module;
 
 use super::create::prepared::CreateProgram;
+use super::matching::prepared::MatchProgram;
 
 /// The number of slots in one module's direct-mapped program table.
 ///
@@ -110,6 +123,8 @@ pub(crate) enum Program {
     Generic,
     /// A `bs_create_bin` segment program.
     Create(Box<CreateProgram>),
+    /// A `bs_match` command program.
+    Match(Box<MatchProgram>),
 }
 
 /// The packed cache key of the instruction at `(func, pc)`.
@@ -190,6 +205,7 @@ impl BitstrPrograms {
     /// The number of slots the table holds (`0` before its first allocation) —
     /// test-only, so a test can prove the table is allocated lazily.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn allocated_slots(&self) -> usize {
         self.slots.len()
     }

@@ -234,7 +234,11 @@ pub(super) fn exec(
                 Program::Create(program) => {
                     prepared::assemble_prepared(machine, module, labels, *fail, program, ctx)
                 }
-                Program::Generic => assemble(machine, module, labels, *fail, segments, ctx),
+                // A `bs_match` program can only land in this slot through a table
+                // collision; either way it is not this instruction's shape.
+                Program::Generic | Program::Match(_) => {
+                    assemble(machine, module, labels, *fail, segments, ctx)
+                }
             };
             machine.restore_bitstr_programs(programs);
             let built = match assembled? {
