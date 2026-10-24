@@ -118,9 +118,10 @@ retained scratch, and a host that lets one thread's scratch grow pays 192 B per 
 | **refused, then fragmented** (`send_fragmented`) | the above **+ 1** copy into the fragment | **1** | the fragment is sized from the refusal's **own** figure (`AllocFailure::requested / size_of::<Eterm>()`), so nothing is re-copied and no second sizing walk runs; `fragment_capacity_words` is a floor, not the price. |
 | **refused, then fragmented through the refusal** (`send_fragmented_after_refusal`) | the trial copy + **1** copy into the fragment | **0** | a host that already holds the refusal passes `AllocFailure::requested` straight in, so there is no second trial and **no second pricing walk**; `fragment_capacity_words` is a floor. |
 
-A whole `beam_rt` delivery today still attempts once in `Process::deliver` and then calls `send_fragmented_message`,
-which re-runs `beam_message::send_fragmented` — one doomed trial plus a second pricing walk; adopting
-`send_fragmented_after_refusal` there makes a refused delivery 2 copy attempts + **1** pricing walk (§10).
+A `beam_rt` delivery attempts once in `Process::deliver` and, on a refusal, calls
+`send_fragmented_message_after_refusal` with that refusal's own `AllocFailure::requested` — so a refused
+delivery is one trial copy + **1** copy into the fragment and **0** extra pricing walks (§10).
+`send_fragmented` is the no-refusal shape (it re-prices) and has no in-crate caller.
 
 ## 3. Deterministic counters per message (the fits path)
 
@@ -445,19 +446,6 @@ Every remaining cost is somebody else's seam:
   caller wants an exact price **and** a work limit, and a bounded fixed-stack cycle check would replace the path set
   entirely (the legacy C has no cycle check at all — it trusts acyclic heaps).
   The adoptable shapes are in `## Handoffs` of `CONTEXT.md`.
-* **`beam_rt` (`src/context/send.rs`, `src/runner/`) — the pre-attempt + retry.** A refused *delivery* is still
-  2 copy attempts + 1 pricing walk: `src/context/send.rs::deliver_into_mailbox` attempts in `Process::deliver` and
-  then calls `send_fragmented_message` → `beam_message::send_fragmented` (one doomed trial + a second walk).
-  The callee-side route exists now: pass the refusal's own `AllocFailure::requested` to
-  **`beam_message::send_fragmented_after_refusal(from, message, mailbox, src_off_heap, 0, requested_bytes)`** — **0**
-  extra trials and **0** extra pricing walks. The message-path analogue of the existing
-  `copy_out_hint`/`hint_grow_gate` gate (`calls.rs:1313-1332`) is what would stop even the first attempt. That node's
-  prose still describes a three-walk / five-traversal copy path (`calls.rs:1280`, `:1316`, `:1389`,
-  `context/runtime_context.rs:159`, `context/calls/tests.rs:190`, `:529`, `PERF_DISPATCH.md:252`, `:279`, `:387`,
-  `crates/beam_engine/src/bench/CONTEXT.md:259`, `:298`).
-* **`beam_process` (`src/ptab.rs:284`) — control-signal fragments.** `HeapFragment::new(size_object(payload) + 8)`
-  walks the graph once just to size the fragment; adopting this crate's refusal-derived exact price
-  (`AllocFailure::requested / size_of::<Eterm>()`) removes that walk, exactly as `send_fragmented` already does.
 * **`beam_codec` — `send_recv` vs `send_recv_plain`.** The delta between those two cases (§6) is the worker's
   `binary_to_term(term_to_binary(T))` round trip; the plain case's copies are 3 words, so the copy is not part of it.
   Measure the codec's share before claiming any.
