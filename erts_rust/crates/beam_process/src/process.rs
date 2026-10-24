@@ -51,8 +51,8 @@ use crate::monitor::{MonitoredBy, Monitors, PortWatch};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
 use crate::run_queue::Priority;
+use crate::scratch::{CollectionScratch, ScratchBuffers};
 use crate::signal_queue::SignalQueue;
-
 // A test-only probe counting [`Process::owned_binary_slot`] resolutions — one unit of work per
 // `data_ptr → slot` lookup, i.e. one per [`Process::register_off_heap_binary`] call.
 //
@@ -389,6 +389,15 @@ pub struct Process {
     /// applied. A queued `reason` lives in this process's own heap, so it is an extra in-heap
     /// sub-rootset the collector must scan.
     signals: SignalQueue,
+    /// The **reused per-collection buffers** ([`CollectionScratch`], `crate::scratch`): the flat
+    /// root slice, the drained-mailbox list and the off-heap reachability set.
+    ///
+    /// Owned here so a steady-state collection allocates none of the three: every entry point clears
+    /// the buffers **before** it seeds them
+    /// ([`CollectionScratch::begin`](crate::scratch::CollectionScratch::begin)), which is what makes
+    /// the reuse invisible — a stale root word, message or payload pointer from a previous (or
+    /// failed) collection can never be admitted into the next one.
+    scratch: CollectionScratch,
     /// Reductions consumed in the current time slice.
     reductions: u64,
     /// Outgoing links.
@@ -535,6 +544,7 @@ impl Process {
             dict: Dict::new(),
             saved_args: SavedArgs::new(),
             signals: SignalQueue::new(),
+            scratch: CollectionScratch::new(),
             reductions: 0,
             links: Links::new(),
             monitors: Monitors::new(),
@@ -934,19 +944,40 @@ impl Process {
     /// process until the process dies (its `Drop` frees it) — see `DESIGN_DECISIONS.md` for the
     /// exact gap and its owner.
     pub fn sweep_off_heap_binaries(&mut self) -> usize {
+        Self::sweep_declared_dead_binaries(
+            &mut self.owned_binaries,
+            &mut self.owned_binary_index,
+            &mut self.dead_binaries,
+        )
+    }
+
+    /// The declared-dead sweep over the **disjoint** pieces of a collection — the shared body of
+    /// [`Process::sweep_off_heap_binaries`] and the conservative half of the off-heap step of
+    /// [`Process::run_rooted_collection`] (which holds `self` split into field borrows there, so it
+    /// cannot call the `&mut self` method).
+    ///
+    /// Releasing an entry is a two-step: the roster sweep drops the payload, and the live index
+    /// (`data_ptr` → slot) is pruned of exactly the released pointers, so a released slot can never
+    /// resolve and a later re-registration of the same payload takes a fresh slot.
+    fn sweep_declared_dead_binaries(
+        owned_binaries: &mut OffHeap,
+        owned_binary_index: &mut HashMap<usize, usize>,
+        declared_dead: &mut Vec<usize>,
+    ) -> usize {
         // Nothing declared dead: return before touching the roster. This is the conservative
         // second half of every rooted collection's off-heap step, so the empty case is the
         // overwhelmingly common one and must cost nothing — no `mem::take`, no sweep walk.
-        if self.dead_binaries.is_empty() {
+        if declared_dead.is_empty() {
             return 0;
         }
         // Take the declarations: this sweep is the single place they turn into releases (the list
         // is cleared by the move, so the same payload is never declared twice).
-        let dead = core::mem::take(&mut self.dead_binaries);
-        self.retain_off_heap_binaries(|binary| -> bool {
+        let dead = core::mem::take(declared_dead);
+        Self::retain_owned_off_heap_binaries(owned_binaries, owned_binary_index, |binary| -> bool {
             !dead.contains(&(binary.data_ptr() as usize))
         })
     }
+
     /// Reclaims every owned off-heap binary that **no reachable on-heap handle names** any more,
     /// and returns how many entries were released.
     ///
@@ -986,57 +1017,118 @@ impl Process {
     /// primitive, whose signature is fallible for its copier callers. Nothing is released when it
     /// errors, so the residual is a **leak, never a dangle**.
     pub fn sweep_off_heap_binaries_reachable(&mut self) -> Result<usize> {
-        let mut roots: Vec<Eterm> = Vec::new();
-        self.gather_scan_roots(&mut roots);
-        self.sweep_off_heap_binaries_reachable_from(&roots)
+        // Nothing owned: return before the scan gather. The shared body re-checks this (it is also
+        // the collection tail's entry point, where the roots are already gathered), so the predicate
+        // is single-sourced there; this is only the skip-the-gather fast path, and the reused root
+        // buffer needs no clear because nothing is written into it.
+        if self.owned_binaries.is_empty() {
+            return Ok(0);
+        }
+        // Whole-`self` predicate first, then one split into disjoint field borrows (the collector,
+        // the scan root regions and the reused collection scratch) — see
+        // [`Process::run_rooted_collection`] for the same shape.
+        let unpublished = self.has_unpublished_roots();
+        let Process {
+            collector,
+            regs,
+            mailbox,
+            dict,
+            saved_args,
+            signals,
+            owned_binaries,
+            owned_binary_index,
+            scratch,
+            ..
+        } = self;
+        // **Clear before seeding**, exactly as the collection path does: the scan gather writes into
+        // the reused root buffer, so a word left by a previous collection's gather must not be
+        // appended to.
+        let ScratchBuffers { roots, reachable, .. } = scratch.begin();
+        Self::gather_scan_roots(regs, mailbox, dict, saved_args, signals, roots);
+        Self::sweep_reachable_from(
+            collector,
+            owned_binaries,
+            owned_binary_index,
+            reachable,
+            roots,
+            unpublished,
+        )
     }
 
-    /// The reachability-driven sweep over an **already gathered** root set — the shared body of
+    /// The reachability-driven sweep over an **already gathered** root set and the **disjoint**
+    /// pieces of a collection — the shared body of
     /// [`Process::sweep_off_heap_binaries_reachable`] and the off-heap step of
     /// [`Process::run_rooted_collection`] (which reuses the roots its collection just gathered, so
     /// the walk can never disagree with the collection about what is reachable).
     ///
+    /// `unpublished` is the caller's read of [`Process::has_unpublished_roots`], taken **before** it
+    /// splits `self` into field borrows, so the predicate stays single-sourced on `Process`.
     /// Refuses (releasing nothing, `Ok(0)`) for a process whose root set is incomplete — see
     /// [`Process::sweep_off_heap_binaries_reachable`] for why.
-    fn sweep_off_heap_binaries_reachable_from(&mut self, roots: &[Eterm]) -> Result<usize> {
+    ///
+    /// `reachable` is the **reused** admission set ([`ScratchBuffers::reachable`]). It is cleared
+    /// here — belt and braces with the entry point's own clear — **before** this walk admits
+    /// anything, so a payload pointer a previous walk admitted can never retain a payload this one
+    /// does not see (a leak); the mirror hazard, a set cleared *after* the walk, would free a
+    /// payload that is still live (a dangle).
+    fn sweep_reachable_from(
+        collector: &AnyCollector,
+        owned_binaries: &mut OffHeap,
+        owned_binary_index: &mut HashMap<usize, usize>,
+        reachable: &mut HashSet<usize>,
+        roots: &[Eterm],
+        unpublished: bool,
+    ) -> Result<usize> {
         // Nothing owned: skip the walk entirely. The enumeration is O(heap), and a process that owns
         // no off-heap binary — the common case — must not pay for it on every collection.
-        if self.owned_binaries.is_empty() {
+        if owned_binaries.is_empty() {
             return Ok(0);
         }
-        if self.has_unpublished_roots() {
+        if unpublished {
             return Ok(0);
         }
-        let mut reachable: HashSet<usize> = HashSet::new();
-        self.collector
-            .for_each_reachable_object_view(roots, |object| {
-                if let Some(payload) = reachable_bin_ref_payload(&object) {
-                    reachable.insert(payload);
-                }
-            })?;
-        Ok(self.retain_off_heap_binaries(|binary| {
-            reachable.contains(&(binary.data_ptr() as usize))
-        }))
+        reachable.clear();
+        collector.for_each_reachable_object_view(roots, |object| {
+            if let Some(payload) = reachable_bin_ref_payload(&object) {
+                reachable.insert(payload);
+            }
+        })?;
+        Ok(Self::retain_owned_off_heap_binaries(
+            owned_binaries,
+            owned_binary_index,
+            |binary| reachable.contains(&(binary.data_ptr() as usize)),
+        ))
     }
 
-    /// Gathers the process root set **read-only** — the scan-side gather for
-    /// [`Process::sweep_off_heap_binaries_reachable`].
+    /// Gathers the process root set **read-only** into the reused root buffer — the scan-side gather
+    /// for [`Process::sweep_off_heap_binaries_reachable`].
     ///
     /// The region list must stay in sync with the one [`Process::run_rooted_collection`] gathers
     /// (registers/stack/extra roots, then each message's `payload`/`from`/`token`, then the
     /// dictionary, the saved args and the pending signals); the two differ only in *how* they read
     /// the mailbox — this one peeks each message in place, the collection one drains it because it
     /// must write the relocated envelope words back.
-    fn gather_scan_roots(&self, roots: &mut Vec<Eterm>) {
-        self.regs.gather_roots(roots);
-        for message in self.mailbox.iter() {
+    ///
+    /// The regions are passed **split** (rather than as `&self`) so the caller can hold the scratch's
+    /// root buffer and the reachability set borrowed at the same time — the same disjoint-borrow rule
+    /// the collection path follows.
+    fn gather_scan_roots(
+        regs: &Registers,
+        mailbox: &Queue,
+        dict: &Dict,
+        saved_args: &SavedArgs,
+        signals: &SignalQueue,
+        roots: &mut Vec<Eterm>,
+    ) {
+        regs.gather_roots(roots);
+        for message in mailbox.iter() {
             roots.push(message.payload());
             roots.push(message.from());
             roots.push(message.token());
         }
-        self.dict.gather_roots(roots);
-        self.saved_args.gather_roots(roots);
-        self.signals.gather_roots(roots);
+        dict.gather_roots(roots);
+        saved_args.gather_roots(roots);
+        signals.gather_roots(roots);
     }
     /// Reclaims every **live** owned off-heap binary `is_live` reports dead, and returns how many
     /// entries were released.
@@ -1053,14 +1145,36 @@ impl Process {
     /// [`declare_off_heap_binary_dead`](Process::declare_off_heap_binary_dead) for an asserted
     /// death and [`sweep_off_heap_binaries`](Process::sweep_off_heap_binaries) for the automatic
     /// conservative path.
-    pub fn retain_off_heap_binaries<F>(&mut self, mut is_live: F) -> usize
+    pub fn retain_off_heap_binaries<F>(&mut self, is_live: F) -> usize
+    where
+        F: FnMut(&RefcBinary) -> bool,
+    {
+        Self::retain_owned_off_heap_binaries(
+            &mut self.owned_binaries,
+            &mut self.owned_binary_index,
+            is_live,
+        )
+    }
+
+    /// The body of [`Process::retain_off_heap_binaries`] over the **disjoint** pieces it touches —
+    /// the roster and its live index — so the collection tail (which holds `self` split into field
+    /// borrows) can sweep without a `&mut self` method.
+    ///
+    /// Record every released payload pointer as the roster sweeps, then prune the live index of
+    /// exactly those, so a released slot can never resolve and a later re-registration of the same
+    /// payload takes a fresh slot.
+    fn retain_owned_off_heap_binaries<F>(
+        owned_binaries: &mut OffHeap,
+        owned_binary_index: &mut HashMap<usize, usize>,
+        mut is_live: F,
+    ) -> usize
     where
         F: FnMut(&RefcBinary) -> bool,
     {
         // Record the payload pointer of every entry this sweep releases, so the live index can be
         // pruned of exactly those — and only those — after the sweep returns.
         let mut released: Vec<usize> = Vec::new();
-        let count = self.owned_binaries.sweep(|entry| match entry.as_binary() {
+        let count = owned_binaries.sweep(|entry| match entry.as_binary() {
             Some(binary) => {
                 let live = is_live(binary);
                 if !live {
@@ -1074,11 +1188,10 @@ impl Process {
         // The index holds live entries only: drop the released payload pointers, so a released slot
         // can never resolve and a later re-registration of the same payload takes a fresh slot.
         for data_ptr in released {
-            self.owned_binary_index.remove(&data_ptr);
+            owned_binary_index.remove(&data_ptr);
         }
         count
     }
-
     /// The slot of the live owned binary whose payload starts at `data_ptr`, or `None`.
     ///
     /// This is an **O(1)** lookup in the live index [`Process::owned_binary_index`] — never a scan
@@ -1790,13 +1903,48 @@ impl Process {
     where
         F: FnOnce(&mut AnyCollector, &mut [Eterm]) -> Result<Collection>,
     {
+        // Whole-`self` predicates come FIRST, before `self` is split into field borrows, so the
+        // verdicts stay single-sourced on `Process` instead of being re-derived from the pieces
+        // below. The only one the collection needs is the off-heap reachability half's
+        // completeness test ([`Process::has_unpublished_roots`]: a relocation-exempt or currently
+        // `Running` process has live terms outside the crate root set).
+        let unpublished = self.has_unpublished_roots();
+
+        // Split `self` into disjoint borrows **once**, in safe Rust: the collector, every region the
+        // gather/scatter steps touch, the off-heap roster with its live index and declared-dead
+        // list, and the reused collection scratch. The compiler proves the borrows disjoint, so no
+        // raw pointer (and no `unsafe`) is needed to hold them at the same time.
+        let Process {
+            collector,
+            mailbox,
+            regs,
+            dict,
+            saved_args,
+            signals,
+            owned_binaries,
+            owned_binary_index,
+            dead_binaries,
+            scratch,
+            ..
+        } = self;
+
+        // **Clear before seeding**, unconditionally: `begin` empties all three reused buffers —
+        // the root slice, the drained-message list and the off-heap reachability set — and lends
+        // them back. This is the only way to reach them (`crate::scratch`), so a word, message or
+        // payload pointer left behind by a *previous* collection — including one whose action
+        // returned `Err`, which leaves the buffers populated — can never be admitted into this one.
+        let ScratchBuffers {
+            roots,
+            drained,
+            reachable,
+        } = scratch.begin();
+
         // 1. The flat register slice: `x[0..live)`, then the whole stack, then the
         //    host-published extra roots (`regs.extra_roots()` — a parked engine machine's live
         //    terms, e.g. its pending-exception reason), in that fixed order. `reg_words` is both
         //    where the mailbox roots start and the length of the register slice `scatter_roots`
         //    is handed back below.
-        let mut roots: Vec<Eterm> = Vec::new();
-        let x_live = self.regs.gather_roots(&mut roots);
+        let x_live = regs.gather_roots(roots);
         let reg_words = roots.len();
 
         // 2. Drain the mailbox, appending each message's `payload`, `from` and `token` as roots
@@ -1804,8 +1952,7 @@ impl Process {
         //    host may store a heap word in `from`/`token` (the C allows a heap `token` tuple and a
         //    heap `Info`-tuple `from`), and the payload is the message body. The drained messages
         //    are re-installed around their relocated words below.
-        let mut drained: Vec<Message> = Vec::new();
-        while let Some(message) = self.mailbox.dequeue() {
+        while let Some(message) = mailbox.dequeue() {
             roots.push(message.payload());
             roots.push(message.from());
             roots.push(message.token());
@@ -1818,19 +1965,19 @@ impl Process {
         //    heap (it is copied in at enqueue time), so it must be relocated with the rest.
         //    `dict_start`/`saved_start`/`signals_start` are the offsets their scatter steps
         //    take.
-        let dict_start = self.dict.gather_roots(&mut roots);
-        let saved_start = self.saved_args.gather_roots(&mut roots);
-        let signals_start = self.signals.gather_roots(&mut roots);
+        let dict_start = dict.gather_roots(roots);
+        let saved_start = saved_args.gather_roots(roots);
+        let signals_start = signals.gather_roots(roots);
 
         // 4. Run the collection action. Its result is returned *after* the write-back below,
         //    because the roots may already have been relocated in place even when it is `Err`.
-        let action = collect(&mut self.collector, &mut roots);
+        let action = collect(&mut *collector, roots.as_mut_slice());
 
         // 5. Write the (relocated) register, stack and extra-root words back. The slice handed
         //    in is exactly the register region `gather_roots` appended (`x` + stack + extra
         //    roots) — the mailbox/dict/saved-arg/signal regions that follow are written back by
         //    their own scatter steps, so the extra-root tail must not be confused with them.
-        self.regs.scatter_roots(&roots[..reg_words], x_live);
+        regs.scatter_roots(&roots[..reg_words], x_live);
 
         // 6. Re-install every message around its relocated envelope words, preserving FIFO order.
         //    A message's three roots are `[payload, from, token]` at `index * MESSAGE_ROOT_WORDS`,
@@ -1839,39 +1986,46 @@ impl Process {
         //    The off-heap handles, refc binaries, node entries and — for an oversized payload —
         //    its fragment chain all travel across the rebuild (a fragment-resident payload is
         //    outside the collected nursery, so the collector classified it `Foreign` and left it
-        //    untouched).
+        //    untouched). The reused list is drained (never dropped), so its capacity survives for
+        //    the next collection.
         let words = &roots[reg_words..mail_words];
-        for (index, mut message) in drained.into_iter().enumerate() {
+        for (index, mut message) in drained.drain(..).enumerate() {
             let base = index * MESSAGE_ROOT_WORDS;
             message.set_from(words[base + MESSAGE_ROOT_FROM]);
             message.set_token(words[base + MESSAGE_ROOT_TOKEN]);
-            self.mailbox
-                .enqueue(message.with_payload(words[base + MESSAGE_ROOT_PAYLOAD]));
+            mailbox.enqueue(message.with_payload(words[base + MESSAGE_ROOT_PAYLOAD]));
         }
 
         // 7. Write the relocated dictionary, saved-argument and pending-signal words back, in
         //    gather order.
-        self.dict.scatter_roots(&roots, dict_start);
-        self.saved_args.scatter_roots(&roots, saved_start);
-        self.signals.scatter_roots(&roots, signals_start);
+        dict.scatter_roots(roots, dict_start);
+        saved_args.scatter_roots(roots, saved_start);
+        signals.scatter_roots(roots, signals_start);
 
         // 8. Reclaim the off-heap binaries, over the roots gathered above. Two halves:
         //
-        //    * the **reachability** sweep (`sweep_off_heap_binaries_reachable_from`) releases every
-        //      owned payload no reachable on-heap `BinRef` names any more — sound only when the
-        //      root set is complete, so it refuses (signalling `Ok(0)` and releasing nothing) for a
-        //      process with unpublished roots (`has_unpublished_roots`), where the walk could miss
-        //      a live handle and release its payload — a dangle;
-        //    * the **conservative declared-dead** sweep (`sweep_off_heap_binaries`) always runs, so
-        //      a caller's asserted death is honoured whether or not the reachability half was sound
-        //      (its declarations are unreachable by definition, and an entry the reachability half
-        //      released is simply skipped as an already-released slot).
+        //    * the **reachability** sweep (`sweep_reachable_from`) releases every owned payload no
+        //      reachable on-heap `BinRef` names any more — sound only when the root set is
+        //      complete, so it refuses (signalling `Ok(0)` and releasing nothing) for a process
+        //      with unpublished roots (`unpublished`, read above), where the walk could miss a live
+        //      handle and release its payload — a dangle;
+        //    * the **conservative declared-dead** sweep (`sweep_declared_dead_binaries`) always
+        //      runs, so a caller's asserted death is honoured whether or not the reachability half
+        //      was sound (its declarations are unreachable by definition, and an entry the
+        //      reachability half released is simply skipped as an already-released slot).
         //
         //    Both are deliberately *after* the write-back: the roots are consistent again, and
         //    releasing a payload never moves a heap word. A no-op for a process that owns no
         //    off-heap binaries.
-        let reclamation = self.sweep_off_heap_binaries_reachable_from(&roots);
-        self.sweep_off_heap_binaries();
+        let reclamation = Self::sweep_reachable_from(
+            collector,
+            owned_binaries,
+            owned_binary_index,
+            reachable,
+            roots,
+            unpublished,
+        );
+        Self::sweep_declared_dead_binaries(owned_binaries, owned_binary_index, dead_binaries);
 
         // The collection's own result is what the caller asked for, and it is reported even when
         // it is `Err`; a reclamation failure only surfaces when the collection itself succeeded
