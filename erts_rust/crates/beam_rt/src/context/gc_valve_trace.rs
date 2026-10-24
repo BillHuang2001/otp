@@ -575,28 +575,19 @@ pub(crate) fn record_expand() {
 }
 
 /// Records one word the aggregate fast reject classified as **outside** every scanned region.
-pub(crate) fn note_tier1_foreign() {
-    if !enabled() {
-        return;
-    }
-    record_tier1_foreign();
-}
-
-/// The arithmetic of [`note_tier1_foreign`], without the switch.
+///
+/// Ungated on purpose: the scanned test's callers hoist the flag once per walk (`Walk::traced`,
+/// passed down into `gc::word_region`/`outside_bounds`), because this test runs once per
+/// classified *word* — millions of times per run — and an environment probe here was measured at
+/// +4.3 % of the whole run.
 #[inline]
 pub(crate) fn record_tier1_foreign() {
     Trace::with(|counts| counts.tier1_foreign += 1);
 }
 
 /// Records one word the aggregate could not decide, and what the exact per-region tests answered.
-pub(crate) fn note_tier2(outside: bool) {
-    if !enabled() {
-        return;
-    }
-    record_tier2(outside);
-}
-
-/// The arithmetic of [`note_tier2`], without the switch.
+///
+/// Ungated for the reason [`record_tier1_foreign`] states.
 #[inline]
 pub(crate) fn record_tier2(outside: bool) {
     Trace::with(|counts| {

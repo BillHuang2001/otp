@@ -507,12 +507,15 @@ pub(crate) fn word_region(
     process: &Process,
     bounds: &ScannedBounds,
     word: Eterm,
+    traced: bool,
 ) -> Option<WordRegion> {
     // The three **term-only** tests, shared with [`result_may_be_foreign`] and handing back the
     // address they already had to compute, so the placement test below needs no second
     // `dereferenceable_pointer` call and the two entry points cannot drift apart.
     let ptr = foreign_shape_pointer(word)?;
-    if in_heap_block(process.heap(), ptr) || !outside_bounds(process.collector(), bounds, ptr) {
+    if in_heap_block(process.heap(), ptr)
+        || !outside_bounds(process.collector(), bounds, ptr, traced)
+    {
         Some(WordRegion::Scanned)
     } else {
         Some(WordRegion::Foreign)
@@ -554,8 +557,16 @@ fn foreign_shape_pointer(word: Eterm) -> Option<usize> {
 /// Whether `word` is a heap pointer into a region the collector **relocates** — one of the words
 /// a collection must follow and update, and therefore the word that makes the foreign container
 /// holding it a hazard.
-pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: Eterm) -> bool {
-    matches!(word_region(process, bounds, word), Some(WordRegion::Scanned))
+pub(crate) fn word_is_scanned(
+    process: &Process,
+    bounds: &ScannedBounds,
+    word: Eterm,
+    traced: bool,
+) -> bool {
+    matches!(
+        word_region(process, bounds, word, traced),
+        Some(WordRegion::Scanned)
+    )
 }
 
 /// Whether `ptr` lies outside **every** region `collector` scans — the two-tier scanned test
@@ -576,19 +587,24 @@ pub(crate) fn word_is_scanned(process: &Process, bounds: &ScannedBounds, word: E
 /// free line of a mark-region mature generation. `may_contain == true` is never treated as
 /// containment (see [`beam_gc::ScannedBounds`] for why a fast accept would be unsound); it only
 /// means "ask them".
-fn outside_bounds(collector: &AnyCollector, bounds: &ScannedBounds, ptr: usize) -> bool {
-    // The invocation census's tier split ([`super::gc_valve_trace`]), read as one hoisted flag so
-    // the untraced path pays a single predictable branch per tier instead of an env lookup.
-    let traced = super::gc_valve_trace::enabled();
+fn outside_bounds(
+    collector: &AnyCollector,
+    bounds: &ScannedBounds,
+    ptr: usize,
+    traced: bool,
+) -> bool {
+    // The invocation census's tier split ([`super::gc_valve_trace`]), carried in as a flag the
+    // caller hoisted (the walk reads it once per walk), so the untraced path pays a single
+    // predictable branch per tier instead of an environment probe per classified word.
     if bounds.definitely_unscanned(ptr as *const Eterm) {
         if traced {
-            super::gc_valve_trace::note_tier1_foreign();
+            super::gc_valve_trace::record_tier1_foreign();
         }
         return true;
     }
     let outside = outside_scanned_exactly(collector, ptr);
     if traced {
-        super::gc_valve_trace::note_tier2(outside);
+        super::gc_valve_trace::record_tier2(outside);
     }
     outside
 }
@@ -638,8 +654,9 @@ pub(crate) fn forwards_scanned_word(
     process: &Process,
     bounds: &ScannedBounds,
     term: Eterm,
+    traced: bool,
 ) -> bool {
-    forwards_word_matching(term, |word| word_is_scanned(process, bounds, word))
+    forwards_word_matching(term, |word| word_is_scanned(process, bounds, word, traced))
 }
 
 /// [`forwards_scanned_word`] against an arbitrary child-word predicate — the enumeration without
@@ -3526,7 +3543,12 @@ mod tests {
                 "the fixture's nursery term must live in the process's mutator block"
             );
             assert!(
-                word_is_scanned(process, &process.collector().scanned_bounds(), self.young),
+                word_is_scanned(
+                    process,
+                    &process.collector().scanned_bounds(),
+                    self.young,
+                    false,
+                ),
                 "the fixture's nursery term must be a word the collector relocates"
             );
         }
@@ -3628,7 +3650,7 @@ mod tests {
                 "the non-value is inert, never a hazard"
             );
             assert_eq!(
-                word_region(process, &process.collector().scanned_bounds(), non_value),
+                word_region(process, &process.collector().scanned_bounds(), non_value, false),
                 None,
                 "the classifier must not even place it in a region"
             );

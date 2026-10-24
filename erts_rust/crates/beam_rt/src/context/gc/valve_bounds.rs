@@ -705,7 +705,7 @@ fn the_aggregate_span_is_reported_for_both_collector_kinds() {
             "{kind:?}: an address past the aggregate must be rejected"
         );
         assert!(
-            outside_bounds(collector, &bounds, far),
+            outside_bounds(collector, &bounds, far, false),
             "{kind:?}: a far address is outside every scanned space"
         );
     }
@@ -876,7 +876,7 @@ fn the_result_shape_test_is_the_region_classifiers_own_prelude() {
                 "{kind:?}: the shape test's verdict for {what}"
             );
             assert_eq!(
-                word_region(process, &bounds, term).is_some(),
+                word_region(process, &bounds, term, false).is_some(),
                 may_be_foreign,
                 "{kind:?}: the region classifier disagrees with the shape test on {what}"
             );

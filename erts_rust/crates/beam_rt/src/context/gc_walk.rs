@@ -1025,7 +1025,7 @@ impl<'a> Walk<'a> {
         // (a small integer, an atom, `NIL`, an internal pid/port id — no children, and neither
         // this walk nor the collector descends into it) and for a literal-area pointer (a frozen
         // code constant; see the module docs).
-        match word_region(process, &self.bounds, word) {
+        match word_region(process, &self.bounds, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) => {
                 // A container the collector scans: descend into it (once — the visited set is what
@@ -1073,7 +1073,7 @@ impl<'a> Walk<'a> {
             // The copy is a leaf of the same shape: nothing below it can be a candidate either.
             return;
         }
-        match word_region(process, &self.bounds, word) {
+        match word_region(process, &self.bounds, word, self.traced) {
             None => {}
             Some(WordRegion::Scanned) | Some(WordRegion::Foreign) => {
                 if self.scratch.visited.insert(ptr_val(word) as usize) {
@@ -1097,7 +1097,7 @@ impl<'a> Walk<'a> {
             self.hit = true;
             return;
         }
-        if forwards_scanned_word(process, &self.bounds, word) {
+        if forwards_scanned_word(process, &self.bounds, word, self.traced) {
             self.hit = true;
             return;
         }
