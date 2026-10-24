@@ -49,6 +49,24 @@
 //! [`HeapPolicy::young_after_collection`] / [`Nursery::collapse`]; a fullsweep's is
 //! [`HeapPolicy::young_after_fullsweep`] / [`Nursery::collapse_after_fullsweep`].
 //!
+//! **The request is folded into the collection that serves it.** Every *other* public entry
+//! (`collect`, `collect_minor`, `collect_major`, `collect_kind`, `grow_nursery`) collects with an
+//! allocation request of zero, so it obeys the two rules above verbatim. The heap-admission door
+//! [`Collector::ensure_capacity`] instead hands its request to the collection (`alloc_need`), so
+//! the capacity that collection installs **already covers the request** and the growth step after
+//! it is normally a no-op:
+//!
+//! ```text
+//! young_minor_target_words_with_need(live, need)   = next_words(live + need + reserve)
+//! young_target_words_with_need(live, need)         = next_words(2 * (live + need) + reserve)
+//! ```
+//!
+//! That is the same rule with the legacy C's `need` term (`adjust_after_minor` /
+//! `adjust_after_fullsweep`, `erts/emulator/beam/erl_gc.c:1490-1555`, `:2061-2098`) added to the
+//! live set, and `need == 0` reproduces the two rules above exactly. So on the `ensure_capacity`
+//! route the target carries **the workload's own request** as well as its live set — still a
+//! function of the workload (live set + one pending request), never of the iteration count.
+//!
 //! The two branches of the fullsweep rule are one band around the target: the capacity is
 //! **grown** to it whenever [`HeapPolicy::should_grow`] holds (`capacity < target`, or
 //! `3 * capacity < 4 * target`), **shrunk** back to it once the live set has fallen
@@ -72,7 +90,10 @@
 //!    ([`the_live_set_target_is_a_fixed_point_and_never_ratchets`],
 //!    [`a_minor_may_grow_only_onto_the_live_set_target`]).
 //! 5. **A fixed demand converges** to one constant capacity
-//!    ([`a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity`]).
+//!    ([`a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity`]): a fixed demand is a
+//!    fixed live set *and* a fixed request, so the constant the `ensure_capacity` route settles on
+//!    is the need-aware target `young_target_words_with_need(live, need)` — the fullsweep's target
+//!    itself, which the minors between fullsweeps keep because it sits inside their keep band.
 //! 6. **Both mature strategies answer identically** for the same geometry
 //!    ([`both_mature_strategies_size_the_nursery_identically`]).
 //!
@@ -724,13 +745,48 @@ fn a_fixed_demand_converges_to_one_constant_post_fullsweep_capacity() {
                 .collect::<std::collections::BTreeSet<usize>>()
         );
         // ... and that constant is the live set's own target — a property of the workload, not a
-        // function of the iteration count (a creep would show up as a rising tail above).
+        // function of the iteration count (a creep would show up as a rising tail above). The door
+        // collects with the op's request in hand (`ensure_capacity(OP_WORDS)`), so the target it
+        // settles on is the **need-aware** one: `next_words(2 * (live + OP_WORDS) + 64)`. That is
+        // the fullsweep's own target for this demand, and the minors in between keep it because it
+        // sits inside their keep band around the smaller need-aware minor target, so the value is
+        // a fixed point of both rules rather than a ratchet.
         let live = size_object(roots[0]);
-        let target = HeapPolicy::default().young_target_words(live);
+        let policy = HeapPolicy::default();
+        let target = policy.young_target_words_with_need(live, OP_WORDS);
+        assert_eq!(
+            target,
+            policy.next_words(
+                YOUNG_TARGET_LIVE_MULTIPLE * (live + OP_WORDS) + policy.need_reserve_words,
+                0
+            ),
+            "{kind:?}: the fullsweep target is `2 x (live + request)` plus the reserve, rounded up"
+        );
+        assert_eq!(
+            target, 1_598,
+            "{kind:?}: next_words(2 x (300 + 300) + 64) is the 1598-word growth-table step"
+        );
         assert_eq!(
             tail[0], target,
-            "{kind:?}: the converged capacity {} must be young_target_words({live}) = {target}",
+            "{kind:?}: the converged capacity {} must be \
+             young_target_words_with_need({live}, {OP_WORDS}) = {target}",
             tail[0]
+        );
+        // The minors between fullsweeps leave it alone: their own need-aware target is below it
+        // and the value sits inside their keep band, so the constant is a fixed point of the
+        // minor rule too, not only of the fullsweep rule that installed it.
+        let minor_target = policy.young_minor_target_words_with_need(live, OP_WORDS);
+        assert!(
+            minor_target <= tail[0]
+                && tail[0] <= MINOR_SHRINK_FLOOR_WORDS.max(YOUNG_SHRINK_FACTOR * minor_target),
+            "{kind:?}: the constant {} must sit inside the minor rule's keep band around \
+             {minor_target}",
+            tail[0]
+        );
+        assert_eq!(
+            policy.young_after_collection_with_need(tail[0], live, OP_WORDS),
+            tail[0],
+            "{kind:?}: the minor rule re-derives the converged constant unchanged"
         );
         assert!(
             tail[0] <= 8 * OP_WORDS,

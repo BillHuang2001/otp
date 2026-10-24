@@ -42,7 +42,10 @@
 //!    heap live and grows the space on demand.
 //! 4. **[`ensure_capacity`](beam_gc::Collector::ensure_capacity)** (the on-demand growth
 //!    seam) grows the nursery so a request far larger than its current size fits, and returns
-//!    a typed error when the policy's ceiling makes the request impossible. [`AnyCollector`]
+//!    a typed error when the policy's ceiling makes the request impossible. The collection it
+//!    runs is given the request (`alloc_need`), so the capacity that collection installs
+//!    **already covers it** — the need-aware live-set target, e.g. `next_words(live + 64 + 64)`
+//!    for a 64-word request — and the growth step after it is normally a no-op. [`AnyCollector`]
 //!    forwards it to either mature-generation strategy.
 //!
 //! Every corpus here is deterministic (no randomness), and every cross-collection comparison
@@ -543,8 +546,10 @@ fn ensure_capacity_reports_a_typed_error_when_growth_is_capped() {
     // The ceiling has to leave room for *one* admissible step, so the two halves of the contract
     // — "an unreachable request is a typed refusal" and "a reachable one still grows" — are
     // exercised by the same policy. A ceiling at the 233-word growth-table step above the birth
-    // nursery does that: `next_words(64) = 90` fits in the 182 words of budget the chain has
-    // left, while 4096 is three growth-table steps away.
+    // nursery does that: the collection serving the 64-word request installs its need-aware minor
+    // target — `next_words(live + 64 + 64)`, i.e. 142 for this round's 3 promoted words — which
+    // fits in the 182 words of budget the chain has left, while 4096 is three growth-table steps
+    // away.
     let policy = HeapPolicy {
         initial_young_words: 51,
         max_heap_words: 233,
@@ -569,9 +574,30 @@ fn ensure_capacity_reports_a_typed_error_when_growth_is_capped() {
         .expect("fits under the cap");
     assert!(collector.young().available_words() >= 64);
     assert!(matches!(collection.kind, CollectionKind::Minor));
-    // ... and it grew only as far as the request needed (`next_words(64) = 90`), never past the
-    // ceiling the previous request ran into.
-    assert_eq!(collector.young().capacity_words(), 90);
+    // ... and it grew only as far as the rule says for a request that size, never past the
+    // ceiling the previous request ran into. The collection ran **with the request in hand**, so
+    // the capacity it installed is the need-aware minor target of the live set it promoted
+    // (`young_minor_target_words_with_need(live, 64) = next_words(live + 64 + 64)`) — for this
+    // round's 3-word `{1,2}` tuple that is `next_words(131) = 142`, and the 51-word birth space is
+    // below it, so the collapse installs it verbatim (`young_after_collection_with_need`).
+    let live = collection.stats.words_copied;
+    assert_eq!(live, 3, "the two-element tuple it promoted is 3 words");
+    let target = policy.young_minor_target_words_with_need(live, 64);
+    assert_eq!(
+        target,
+        policy.next_words(live + 64 + policy.need_reserve_words, 0),
+        "the minor target is the live set plus the request plus the reserve, rounded up"
+    );
+    assert_eq!(
+        target, 142,
+        "next_words(3 + 64 + 64) is the 142-word growth-table step"
+    );
+    assert_eq!(
+        policy.young_after_collection_with_need(51, live, 64),
+        target,
+        "a 51-word capacity is below the need-aware target, so the collapse installs it"
+    );
+    assert_eq!(collector.young().capacity_words(), target);
     assert!(
         collector.heap_size_words() <= policy.max_heap_words,
         "the chain's summed capacity {} must honour the {}-word ceiling",
