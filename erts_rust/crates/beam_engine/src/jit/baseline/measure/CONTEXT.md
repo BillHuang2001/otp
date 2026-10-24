@@ -202,6 +202,47 @@ The reference point for any entry- or call-path change is `list_walk`'s **instru
 - The `tools/bench` `slice`-style system-module per-process rows drift with host load far more than the tier moves them: the baseline-vs-interpreter per-process effect is **1.0–1.3×** (`../../../MEASURED.md`, N=30 interleaved sampling; the `slice` workload itself read 31.97 ms default / 31.92 ms interpreter, min-of-3), and the untouched interpreter column drifted up to ~29 % across a fresh 7-run in-crate eager set. Quote a min-over-N and compare only figures from the same run set; a bare cross-date absolute on a shared host is not evidence.
 - **A foreign module needs `-pa <its dir>`** on the `beam_rt` command; without it the run is `error undef` and the counter measures boot only (a ~7.1e9 "per-call" figure is that failure, not a measurement).
 
+## The `foreign` byte-loop kernels: where the baseline tier's cycles actually go
+`tools/bench`'s four `foreign` cases (`cowboy_bstr:to_lower/1`, `cowboy_bstr:capitalize_token/1`,
+`emqx_base62:encode/1`, `emqx_base62:decode/1`) are **BIF-free compiled BEAM code**, not host
+dispatch: the in-crate decomposition harness reads `bif_calls_per_call = 0.00` for both Cowboy
+cases (`rooted_calls_per_call = 2.00`, `local_call_requests_per_call` 2–3,
+`driver_round_trips_per_call = 3.00`, `step_one`/`step_ext` `0`, `deopt_count` empty,
+`block_entry_misses = 0`). So the ratio is the **bitstring family's per-instruction cost**, and any
+"BIF-call gap" framing of these four cases is wrong.
+**Profile the baseline tier alone.** `src/bench/foreign.rs`'s `selected_tiers` takes
+`interpreter|baseline|both` and **defaults to `both`** when `BENCH_TIER` is unset or misspelt — the
+interpreter leg is ~2.2× slower per call (8 322.9 vs 3 734.6 ns/call on `to_lower/1` at
+`instr_per_call = 438.00`), so it owns ~69 % of the samples and silently rewrites the attribution:
+a `both` profile puts `select::pair_eq` (5.60 %) + `select::first_match` (3.67 %) in the top ten,
+but those are the **interpreter's** `select_val` ladder, which the native tier inlines (its
+`select_pairs_by_word_per_call` is `0.00`). Always set `BENCH_TIER=baseline` before recording.
+**Baseline-JIT profile** (`BENCH_TIER=baseline BENCH_ITERS=100000`, release, `taskset -c 3`,
+`perf record -e cpu_core/cycles/u -F 2000`, both Cowboy cases in one run, self time):
+`bitstrings::exec` 9.04 %, `create::prepared::assemble_prepared` 8.04 %, `jit/baseline/bitstr::jit_bitstr`
+5.60 %, `matching::prepared::run_commands_prepared::{closure}` 5.18 %, `run_fast` 4.84 %,
+`runtime::enter_in_block` 4.61 %, `runtime::jit_refresh_y` 4.45 %, `create::exec` 3.69 %,
+`matching::exec_other` 3.08 %, `run_commands_prepared` 2.64 %, `create::exec::{closure}` 2.43 %,
+`match_ctx::read_ctx` 2.27 %, `CompiledModule::function` 2.09 %,
+`drop_glue::<(u64, Program)>` 1.75 % + `drop_glue::<Vec<(u64, Program)>>` 1.42 %,
+`jit_publish_y` 1.55 %, `matching::exec` 1.52 %, `run_prepared` 1.37 %, `call_store_impl` 1.23 %,
+`enter_match` 1.17 %, `create::prepared::prepare` 1.01 %, `jit_allocate` 0.98 %,
+`jit_return` 0.90 %, `jit_local_call` 0.67 %, `read_uint_be` 0.63 %.
+Summed by subsystem: **bitstring family ≈ 41 %**, tier glue (`enter_in_block`/`jit_refresh_y`/
+`jit_publish_y`/`jit_bitstr`/`jit_allocate`/`jit_return`/`jit_local_call`/`call_store_impl`/
+`CompiledModule::function` ≈ 18 %), allocator + `drop_glue` ≈ 5 %.
+**The mechanism this pins.** The hand-over seam `Machine::with_bitstr_programs` is entered on **every**
+`bs_match` and `bs_create_bin`; the two `drop_glue` rows (3.17 %) plus `malloc`/`cfree`/`_int_free_chunk`
+(≈1.5 %) are its `BitstrPrograms` placeholder swap and the 64-slot `Vec` it re-allocates when the table
+comes back empty, and `create::prepared::prepare` + `matching::prepared::prepare` + the atom-table
+`HashMap::get` rows (≈2.3 %) say the table **misses at a non-trivial rate** rather than answering a hit —
+i.e. the prepared program is being re-derived, not reused, on this shape. That (a hit-rate defect plus a
+per-instruction table swap) is the largest single identified lever on these four cases and it is
+`src/machine/**` + `src/families/bitstrings/programs.rs`, i.e. **outside this node**.
+**Not the lever** (measured): per-call setup on the in-crate harness is 3 driver round-trips, 0 deopts,
+0 interpreter steps and `block_entry_misses = 0`; `to_lower/1`'s 438 IR instructions for 30 bytes
+(14.6/byte) is steady state, and the earlier per-call entry/exit campaign already closed the transfer
+bookkeeping (§ above).
 ## See Also
 - `../CONTEXT.md` → the tier contract (the two artifact layouts, the block ABI, the driver loop, the routing table).
 - `../runtime/CONTEXT.md` → the block ABI, `JitRuntime` and the helpers the figures above price.
