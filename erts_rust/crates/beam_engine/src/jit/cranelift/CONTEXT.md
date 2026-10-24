@@ -256,6 +256,13 @@ deliberately not quoted: its *interpreter* side carries a known super-linear `be
 elsewhere, so it is not a clean tier comparison.
 
 ## Known Issues
+- **`CompiledEntries` implements only `enter`, not `enter_cached`.** The `NativeCode` per-function resolution
+  memo (`ResolvedFunction`, the baseline tier's amortisation of a block entry staying inside one function) is
+  left at its default, which forwards to `enter`, so `is_enterable`'s `enter_pcs: HashMap<u32, Vec<u32>>` →
+  `Vec::contains` **linear walk runs on every driver-loop iteration**, over a set whose size is O(block starts
+  + non-tail-call continuations). A two-level `HashMap<(u32,u32), ()>`/`BTreeMap` or a sorted binary search
+  would answer the same predicate in O(log n); the tier is default-OFF, so it is correctness-preserving cost,
+  not a gate.
 - **A cross-module callee runs per-instruction here.** `NativeCode::module_blocks` keeps its default
   `None`, so a callee reached through `Step::Enter` (a cross-module `call_ext*`, or a raise landing in
   another context) executes through the per-instruction interpreter step rather than compiled blocks.
