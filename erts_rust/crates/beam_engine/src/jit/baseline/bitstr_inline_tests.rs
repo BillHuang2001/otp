@@ -63,7 +63,7 @@ use super::bitstr::bitstr_calls;
 use super::bitstr_tests::{export, fixture, with_both_tiers_arg, Arg};
 use super::counters;
 use super::emit::bitstr_inline::{
-    self, inlined, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_GET_INTEGER2, SHAPE_GET_POSITION,
+    self, inlined, MatchFail, SHAPE_BS_MATCH, SHAPE_COUNT, SHAPE_GET_INTEGER2, SHAPE_GET_POSITION,
     SHAPE_SET_POSITION, SHAPE_SKIP_BITS2, SHAPE_START_MATCH3, SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::emit::cacheable_writes;
@@ -1093,7 +1093,17 @@ fn a_no_fail_shape_still_goes_through_the_family() {
 fn every_deliberate_refusal_is_refused_by_the_shape_predicate() {
     let module = bitstr_module(
         "inline_refusals",
-        &["ensure_at_least", "integer", "get_tail", "binary", "=:=", "skip"],
+        &[
+            "ensure_at_least",
+            "integer",
+            "get_tail",
+            "binary",
+            "=:=",
+            "skip",
+            "no_fail",
+            "resume",
+            "something_else",
+        ],
         1,
         |_| vec![Instr::Label(Label(1)), Instr::Label(Label(2)), Instr::Return],
     );
@@ -1248,16 +1258,66 @@ fn every_deliberate_refusal_is_refused_by_the_shape_predicate() {
             .is_none(),
         "a non-label/non-atom `bs_start_match4` fail operand must refuse the arm"
     );
+    // `NO_FAIL` (and the `no_fail` atom) do **not** refuse the arm: they inline as
+    // `MatchFail::Family`, i.e. a *hit* is native and only the allocating
+    // `{badmatch, Subject}` **miss** routes to the interpreter step. Refusing here would
+    // throw away every well-formed `bs_start_match3` a compiler emits for a plain binary
+    // pattern match (the commonest shape in the corpus).
+    assert_eq!(
+        bitstr_inline::start_match4_shape(&module, &labels, &Operand::Label(NO_FAIL), &x1, &x0)
+            .map(|(_, fail)| fail),
+        Some(MatchFail::Family),
+        "`NO_FAIL` must inline `bs_start_match4` with every miss on the family"
+    );
+    assert_eq!(
+        bitstr_inline::start_match4_shape(
+            &module,
+            &labels,
+            &Operand::Atom(atom(&module, "no_fail")),
+            &x1,
+            &x0
+        )
+        .map(|(_, fail)| fail),
+        Some(MatchFail::Family),
+        "the `no_fail` atom must inline `bs_start_match4` with every miss on the family"
+    );
+    assert_eq!(
+        bitstr_inline::start_match4_shape(
+            &module,
+            &labels,
+            &Operand::Atom(atom(&module, "resume")),
+            &x1,
+            &x0
+        )
+        .map(|(_, fail)| fail),
+        Some(MatchFail::Resume),
+        "the `resume` atom must inline `bs_start_match4` as the `Resume` class"
+    );
+    // An atom the module cannot name, and an atom that is neither `no_fail` nor `resume`,
+    // are the family's typed `unsupported` — refused here so it reports them.
     assert!(
         bitstr_inline::start_match4_shape(
             &module,
             &labels,
-            &Operand::Label(NO_FAIL),
+            &Operand::Atom(atom(&module, "something_else")),
             &x1,
             &x0
         )
         .is_none(),
-        "`NO_FAIL` must refuse `bs_start_match4`"
+        "an unrelated fail atom must refuse the `bs_start_match4` arm"
+    );
+    // `bs_start_match3` shares the classification (it has no atom form).
+    assert_eq!(
+        bitstr_inline::start_match3_shape(&labels, NO_FAIL, &x1, &x0).map(|(_, fail)| fail),
+        Some(MatchFail::Family),
+        "`NO_FAIL` must inline `bs_start_match3` with every miss on the family"
+    );
+    assert_eq!(
+        bitstr_inline::start_match3_shape(&labels, Label(2), &x1, &x0).map(|(_, fail)| fail),
+        Some(MatchFail::Label(
+            labels.resolve(Label(2)).expect("label 2 resolves")
+        )),
+        "a resolved fail label must inline as a direct miss branch"
     );
 }
 
@@ -1462,12 +1522,22 @@ fn the_get_position_arm_emits_the_max_small_guard() {
     );
 }
 
-/// **The inline extraction is shorter than the helper call it replaces**, on the *same*
-/// operand shape: an 8-bit `bs_get_integer2` (inlined) emits fewer bytes than a 64-bit one
-/// (which the width rule sends to the family). Both are one block with the same operand
-/// count, so the difference is the lowering itself.
+/// **The inlined extract emits no `jit_bitstr` helper call at all** — the property that
+/// actually distinguishes the two routes on the *same* operand shape (an 8-bit
+/// `bs_get_integer2`, inlined, against a 64-bit one the width rule sends to the family).
+///
+/// This pin originally asserted the inlined block was **shorter**, and it is not: measured
+/// here at 1356 B inlined against 753 B on the helper route, and that is the correct
+/// outcome. The helper route replaces the whole extraction with one `emit_helper_call`
+/// (`movabs r11, jit_bitstr` + two argument loads + `call r11`, ~41 B) and the *family*
+/// pays the extraction, while the inline arm emits that extraction — plus its match-context
+/// test, bounds check, byte-wise big-endian assembly and mask — into the block. Code size is
+/// therefore the wrong axis; what the shape buys is that the extraction is **native**, so
+/// the surviving claim is the one asserted below: the inlined block carries **no** helper
+/// call, and the helper-routed block does. (Both byte figures are printed, not baked, so a
+/// future change to either route reports itself here.)
 #[test]
-fn an_inlined_extract_emits_less_code_than_the_helper_call_it_replaces() {
+fn an_inlined_extract_emits_no_helper_call_unlike_the_helper_routed_one() {
     let build = |size: i64| {
         bitstr_module("inline_extract_size", &[], 1, move |_| {
             let mut code = vec![
@@ -1494,33 +1564,43 @@ fn an_inlined_extract_emits_less_code_than_the_helper_call_it_replaces() {
             code
         })
     };
-    let inlined = build(8);
-    let (emitted, snapshot) = emitted_shapes(&inlined);
+    let inlined_module = build(8);
+    let (emitted, snapshot) = emitted_shapes(&inlined_module);
     assert!(
         emitted.contains(&SHAPE_GET_INTEGER2),
         "the 8-bit read must be inlined (emitted {emitted:?})"
     );
     assert_eq!(static_deopts(&snapshot, "BsGetInteger2"), 0);
-    let helper = build(64);
-    let (emitted, _) = emitted_shapes(&helper);
+    let helper_module = build(64);
+    let (emitted, _) = emitted_shapes(&helper_module);
     assert!(
         !emitted.contains(&SHAPE_GET_INTEGER2),
         "the 64-bit read must stay on the helper (emitted {emitted:?})"
     );
-    let labels = crate::interpreter::build_label_map(&inlined);
-    let inlined_len = super::emit::compile_function(&inlined, &labels, 0)
-        .expect("the block compiles")
-        .buffer
-        .len();
-    let labels = crate::interpreter::build_label_map(&helper);
-    let helper_len = super::emit::compile_function(&helper, &labels, 0)
-        .expect("the block compiles")
-        .buffer
-        .len();
+    // An **inline** arm never emits the family helper, and a helper-routed variant always
+    // does — that asymmetry is what "the shape is native" means at the byte level.
+    let helper_probe =
+        super::bitstr::jit_bitstr as extern "C" fn(*mut super::runtime::JitRuntime<'_>, u32, u32) -> i64
+            as *const ();
+    let labels = crate::interpreter::build_label_map(&inlined_module);
+    let inlined_function =
+        super::emit::compile_function(&inlined_module, &labels, 0).expect("the block compiles");
+    let inlined_len = inlined_function.buffer.len();
+    let labels = crate::interpreter::build_label_map(&helper_module);
+    let helper_function =
+        super::emit::compile_function(&helper_module, &labels, 0).expect("the block compiles");
+    let helper_len = helper_function.buffer.len();
+    eprintln!(
+        "bitstring inline vs helper route on one 8-bit/64-bit bs_get_integer2 block: \
+         inlined {inlined_len} B, helper {helper_len} B"
+    );
     assert!(
-        inlined_len < helper_len,
-        "the inlined extract ({inlined_len} B) must be smaller than the helper call \
-         ({helper_len} B)"
+        !super::tests::code_contains_helper(&inlined_function, helper_probe),
+        "an inlined extract must not call the bitstring helper (the extraction is native)"
+    );
+    assert!(
+        super::tests::code_contains_helper(&helper_function, helper_probe),
+        "a helper-routed extract must call the bitstring helper"
     );
 }
 

@@ -4484,7 +4484,10 @@ fn the_y_window_gate_covers_the_inlined_y_moves() {
 /// Whether the function's sealed machine code contains a `movabs r11, <helper>`
 /// immediate — the `49 BB <imm64>` shape every helper call emits (the same probe
 /// `the_compiled_block_wires_the_ext_call_helper_into_native_code` uses).
-fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const ()) -> bool {
+///
+/// `pub(crate)` so the sibling `bitstr_inline_tests` module's "the arm emits no helper call"
+/// pins reuse it rather than opening a second helper-address probe.
+pub(crate) fn code_contains_helper(function: &super::code::CompiledFunction, helper: *const ()) -> bool {
     let code = function_code_bytes(function);
     let mut needle = vec![0x49u8, 0xBB];
     needle.extend_from_slice(&(helper as u64).to_le_bytes());
