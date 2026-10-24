@@ -21,19 +21,9 @@
 //! The **libc allocator's free-page release** — the crate's marked `unsafe` module.
 //!
 //! glibc's `malloc` grows a per-thread *arena* and, when a chunk is freed, keeps the page in
-//! the arena's free lists instead of returning it to the kernel. For a short-lived process
-//! that is invisible; for this runtime it is the largest single item of *retained* resident
-//! memory, because both of its phases have a transient high-water much larger than their
-//! steady state:
-//!
-//! | phase | peak RSS | arena free at exit | live at exit |
-//! |---|---|---|---|
-//! | bare boot (`-eval 'halt(0).'`) | 115 MB | 77.2 MB | 211 kB |
-//! | in-process compile of `cerl_clauses.erl` (13.8 kB) | 314 MB | 201.1 MB | 219 kB |
-//!
-//! So ~99.9 % of the allocator's *system* bytes are free and unreachable. glibc never
-//! decrements that bookkeeping on its own from a `free` of a small chunk, and it exposes
-//! exactly one lever to return the pages: [`libc::malloc_trim`], which walks **every** arena
+//! the arena's free lists instead of returning it to the kernel. glibc never decrements that
+//! bookkeeping on its own from a `free` of a small chunk, and it exposes exactly one lever to
+//! return the pages: [`libc::malloc_trim`], which walks **every** arena
 //! (`__malloc_trim`'s arena list) and hands the free ranges back with `madvise`. Measured on
 //! this host (glibc 2.44): a 40 MB all-chunks-freed churn drops its RSS from 52 428 kB to
 //! 1 880 kB after one `malloc_trim(0)` — while `mallinfo2().arena` does **not** shrink, which
@@ -57,13 +47,27 @@
 //! both quiescent and complete: `src/main.rs`'s `run_on_driver_stack`, after the driver thread
 //! has been joined and before the process status is returned.
 //!
-//! Two earlier, "obvious" points were measured and rejected. At the boot→action boundary the
-//! arena is 97 681 kB **in use** of 97 948 kB — 266 kB free, so there is nothing to release. At
-//! the end of `crate::cli::run` the same holds (266 kB free on a bare boot, 1.8 MB after an
-//! in-process compile), and even with the runtime dropped there the thread still holds most of
-//! its arena: 88 840 kB resident after the call on a bare boot, versus ~18 MB for the post-join
-//! placement. `src/cli.rs` records the same finding next to that point.
+//! # What it returns now (the deliberate trade)
 //!
+//! The binary **does not tear its runtime down at process exit** (`crate::cli::run_for_process`
+//! → `ExitTeardown::Leak`): dropping the whole boot's retained state — every `Arc<Module>`, the
+//! JIT artifact cache, `LabelMap`s and the ~3 000 `Arc<str>` atom names — cost ~7.9 %
+//! (≈157 M instructions, ≈25 ms) of *every* invocation, and ERTS never frees the world at
+//! `halt` either. So this call now finds a largely **live** arena and returns little:
+//!
+//! | phase | peak RSS | exit RSS (after the trim) |
+//! |---|---|---|
+//! | bare boot (`-eval 'halt().'`) | 118.7–119.1 MB | 113.1–114.6 MB |
+//! | in-process compile of `orddict.erl` | 310 044 kB | 303 376 kB |
+//!
+//! Before the trade the same probes read 17.6–21.2 MB and 26 416 kB at exit, against an
+//! unchanged peak — the trim existed to give back a *dead* high-water, and there is no longer a
+//! dead high-water to give back. **Peak `VmHWM` is unchanged by the trade** (it is the run's
+//! high-water mark, reached while everything was live), which is the figure a workload pays;
+//! only the process's last-instant RSS changes. The one earlier, "obvious" placement was also
+//! measured and rejected: at the boot→action boundary the arena is 97 681 kB **in use** of
+//! 97 948 kB — 266 kB free, so there is nothing to release. `src/cli.rs` records the same
+//! finding next to that point.//!
 //! It is **not** on the scheduler pass, the runner's park arm, a BIF, a receive or any other
 //! per-call/per-slice path: nothing in the runtime's execution semantics may pay for it.
 //!

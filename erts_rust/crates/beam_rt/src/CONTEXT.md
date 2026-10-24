@@ -449,14 +449,16 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `malloc.rs` → the crate's marked `unsafe` module and its **one** allocator lever:
   `release_free_pages()` (`libc::malloc_trim(0)` on glibc, an honest `None` elsewhere), called once per
   process from `main.rs` **after the driver thread has been joined** — the only quiescent *and* complete
-  point, because the driver thread still holds most of the run's memory until it exits (a trim from inside
-  `cli::run`, even after the runtime it built has been dropped, recovers only ~16 MB of ~75 MB). Measured
-  exit RSS (glibc 2.44; arena `in_use` ≤ 218 kB at that point in every case): bare boot 90 760 → 18 400 kB,
-  `compiler/cerl_clauses.erl` 211 168 → 19 068 kB, `stdlib/orddict.erl` 218 544 → 22 240 kB. Peak `VmHWM`
-  is **unchanged** (115 / 314 / 305 MB) because during the run that memory is *live*, not slack (a bare
-  boot's idle arena is 97 681 kB in use of 97 948 kB) — the census, the arena/heap layout, the measured
-  non-effect of a trim at the boot→action boundary (266 kB free there) and the fragmentation limit are in
-  the module docs. `BEAM_RT_MEM_TRACE` prints the call's answer as one `[rt-mem] heap-release=…` line.
+  point. It now finds a largely **live** arena, because the binary skips its process-exit teardown
+  (`cli::run_for_process` → `ExitTeardown::Leak`: the whole-boot drop cost ~7.9 %, ≈157 M instructions,
+  ≈25 ms per invocation, and ERTS does not free the world at `halt` either), so it returns little:
+  measured exit RSS **113.1–114.6 MB** on a bare boot and **303 376 kB** after an in-process
+  `orddict.erl` compile, against **17.6–21.2 MB** / **26 416 kB** before the trade. **Peak `VmHWM` is
+  unchanged** (118.7–119.1 MB bare boot, 310 044 kB compile) — it is the run's high-water mark, reached
+  while everything was live, so the trade costs no peak memory and buys the startup latency. `cli::run`
+  itself keeps its normal `Drop` (library/test contract: NIF `unload`, drop assertions); only
+  `src/main.rs`'s path opts out. `BEAM_RT_MEM_TRACE` prints the call's answer as one
+  `[rt-mem] heap-release=…` line.
 - `mailbox.rs` → the per-pid scan state, and the **fragment lifetime invariant** that makes a received term usable after `remove_message`.
   A removed message's `Fragments` chain is *moved* into `MailboxState::retained_fragments` (`mailbox.rs:267-268`) — retention, never `Fragments::move_into`, which no site in the workspace calls.
   **There is no release point:** `Runtime::mailboxes` is only ever `entry()`/`get()`/`get_mut()`ed, never removed, so every fragment a process ever removed stays alive for the runtime's lifetime (the field's own doc, "released when the process's scan state is", cannot be reached).
