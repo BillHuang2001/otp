@@ -21,8 +21,11 @@ The crate's **other** recurring cost is the per-collection scaffolding — the r
 collector call, the write-back and the off-heap reclaim a rooted collection performs at every heap
 admission. `examples/perf_collection.rs` is its own dependency-free instrument (a counting
 `#[global_allocator]` plus two collection counts to difference), and § *The per-collection
-bookkeeping floor* below records what it measures. Every event figure in this file carries the same
-host/load caveat.
+bookkeeping floor* below records what it measures. Its third recurring cost is the **control-signal
+fragment reservation** — a signal delivered into a `HeapFragment` instead of the receiver's heap — which
+`examples/perf_signal_fragment.rs` instruments and § *The control-signal fragment reservation* records,
+including the evidence that the path is cold on ordinary workloads. Every event figure in this file
+carries the same host/load caveat.
 ## Method
 
 **Host caveat.** Absolute `ns/op` is meaningless on its own here: this is a shared CI/dev host and
@@ -487,6 +490,86 @@ admission** — exactly the kind of change the end-to-end rows are least able to
 * Differencing **two collection counts** (rather than comparing two wall-clock runs) is what removes
   the process's fixed cost; a single-count figure folds in start-up and first-touch allocations.
 
+## The control-signal fragment reservation, and whether that path is hot
+
+`src/ptab.rs::enqueue_fragment_payload` is the one place that puts a **control signal**
+(`{'EXIT', …}` / `{'DOWN', …}`) into a `beam_message::HeapFragment` instead of the receiver's heap, and
+the fragment's reservation is a graph-sizing decision. `examples/perf_signal_fragment.rs` is the
+dependency-free instrument for it; this section is its record.
+
+**The reservation has three routes.** *Retired*: `HeapFragment::new(beam_term::size_object(payload) + 8)`
+— a full source-occupancy walk (which itself allocates its three DFS buffers) and a one-shot
+`copy_root`, so an under-sized reservation propagated an `Err`. *Held* (the enqueue-time routes, where
+the caller already paid for a copy of the same graph and threw the figure away): the copy's own
+`AllocFailure.requested` word price, plus the message envelope's own words and a fixed slack, and the
+copy's refusal then re-reserves the fragment **monotonically** to the exact price. *Floor* (the
+apply-time routes, where the build refused on a single bumped allocation rather than on a copy of the
+payload): a `SIGNAL_FRAGMENT_FLOOR_WORDS = 64` reservation, then the same monotonic re-reserve.
+
+**No sizing walk remains on the path.** The copy engine preflights the whole graph in one traversal and
+reports the exact destination price in its refusal, so the reservation is priced by the copy itself
+(`beam_message`'s warm thread-local scratch) instead of by a second, independently-derived walk.
+
+### Is it hot? (temporary instrumentation, reverted before the commit)
+
+Counting entries to `enqueue_fragment_payload`, with `BEAM_TRACE_FRAG` gating an `eprintln!`:
+
+| workload | fragment signals |
+|---|---|
+| the whole `beam_process` suite (677 tests / 53 files) | **28**, of which 26 are the six files that deliberately force the route (`signal_fragment_fallback`, `decline_gate`, `decline_gate_builders`, `remote_reason_copy`, `receive_signals`) plus the two new sizing unit tests |
+| a real boot, `beam_rt -noshell -boot bootstrap/bin/start` (22 directives, kernel/logger/app-controller) | **0** |
+| `beam_rt -noshell -eval 'Ps = [spawn(fun() -> exit(boom) end) || _ <- lists:seq(1, 200)], timer:sleep(500), halt(0).'` | **276** (200 deaths; 98 for 50 — ≈1.4–2 per abnormal death, 0 at `N = 0`) |
+
+So the path is **cold on ordinary workloads and warm on abnormal-death bursts** — and what it carries
+there is tiny: every hit reported `requested=32` bytes, i.e. a 4-word `{'EXIT', From, boom}` delivered
+at schedule-in to a receiver that is `Running` (so the crate-owned predicate declines) and
+gate-declined. That is the *floor* route, which is why the apply-time branch is the one that matters in
+practice.
+
+### The unit effect (`perf_signal_fragment.rs`, median of 7 paired alternating rounds)
+
+Shapes: **1** = `{'EXIT', From, boom}` (4-word payload, the real shape above); **2** = a 40-element
+tuple reason (45 words); **3** = a 2 000-element tuple reason (2 005 words). `/proc/loadavg` 10.50
+before, 7.81 after; a second 5-round run at 5.96 → 4.86 reproduced the ratios.
+
+| shape | route | ns/signal | allocs | bytes | reserved |
+|---|---|---|---|---|---|
+| 1 | retired | 10 446.1 | 3 | 704 | 12 w |
+| 1 | floor (current, apply-time) | 4 626.9 | 2 | 640 | 64 w |
+| 1 | held (current, enqueue-time) | 10 413.8 | 2 | 640 | 12 w |
+| 2 | retired | 4 773.5 | 5 | 820 | 53 w |
+| 2 | floor | 4 666.7 | 3 | 704 | 64 w |
+| 2 | held | 4 667.0 | 3 | 704 | 53 w |
+| 3 | retired | 3 781.5 | 5 | 820 | 2 013 w |
+| 3 | floor | 6 141.3 | 4 | 768 | 2 005 w |
+| 3 | held | 3 326.1 | 3 | 704 | 2 013 w |
+
+Paired current/retired: shape 1 floor **0.443×**, held **0.997×**; shape 2 **0.978×** both; shape 3 floor
+**1.627×**, held **0.878×**. The like-for-like walk comparison is **retired vs held** (same reservation):
+removing the walk buys ≈**33 ns / 105 ns / 465 ns** per signal and **1–2 allocations + 64–116 bytes**,
+with 0 reallocs. `perf stat -e cpu_core/instructions/u` (pinned to core 1, 110 000 signals) confirms it
+at the instruction level: **86 732 → 86 274 instr/signal** on shape 1 (**−459**, exactly the walk plus
+its one 64-byte buffer) and **56 250 → 37 159** on shape 3 at scale 10 (**−19 091**).
+
+### What the numbers actually say
+
+* **The sizing route is now a rounding error; the allocator is the cost.** Per allocate + release:
+  `Heap::new(64)` (the per-signal scratch arena) **2.3 µs**, a fragment at 8 w **13.1 µs**, 13 w
+  **7.8 µs**, 53/64 w **2.3 µs**, 128 w (1 KiB) **1.34 µs**, ≥256 w (2 KiB) **0.18 µs** — while
+  `size_object` itself is 24–567 ns. So 95–99 % of a fragment signal is allocation, not sizing.
+* **`beam_alloc`'s block-size curve is the real lever here** (reported to that crate's owner, not changed
+  from this node): the per-block cost rises steeply as blocks shrink, ~∝ 1/block-size. It is what makes
+  shape 1's floor route look 2.25× faster than the retired route (a 512-byte reservation lands on a
+  cheaper path than a 96-byte one — nothing to do with the walk), and what makes shape 3's floor route
+  1.63× *slower* (its under-priced floor costs one extra 64-word fragment + preflight: +2.37 µs).
+  Whether the floor constant should be larger — trading ~4 KiB per queued fragment signal for an
+  allocator path ~12× cheaper — is an open experiment, and it belongs with the allocator's curve.
+* **End-to-end this change is not separable from noise.** The `-eval` death workload above costs
+  hundreds of milliseconds per spawn-and-death, i.e. 5–6 orders of magnitude more than the sub-µs
+  saving per fragment signal, so no target-project suite was run for it (they would only measure the
+  host). The change is kept as a **simplification**: one graph walk per fragment signal gone, and an
+  under-sized reservation now re-reserves monotonically instead of failing a delivery.
+
 ## What this file does not measure
 
 * `beam_engine`'s send/receive instruction cost (unreachable from this crate — see its own node).
@@ -503,6 +586,9 @@ admission** — exactly the kind of change the end-to-end rows are least able to
 * `examples/perf_delivery.rs` — the delivery-path harness.
 * `examples/perf_collection.rs` — the per-collection scaffolding harness (the section above); it
   asserts structural invariants and reports exact allocation counts, never a wall-clock threshold.
+* `examples/perf_signal_fragment.rs` — the control-signal fragment-reservation harness: three sizing
+  routes × three payload shapes, plus the per-allocate+release attribution of the fragment and the
+  scratch arena (`[scale] [rounds] [shape:route]` arguments so one block can be wrapped in `perf stat`).
 * `../../tools/bench/RESULTS.md` §3.6/§8 — the end-to-end `send_recv` figures this file splits.
 * `../beam_engine/MEASURED.md` — the engine node's own measurements; `../beam_message/CONTEXT.md`
   — the copy engine.
