@@ -490,33 +490,84 @@ pub(crate) fn export(module: &Module, fixture_name: &str, name: &str) -> Atom {
         .unwrap_or_else(|| panic!("{fixture_name}:{name}/1 must be exported"))
 }
 
-/// **The helper executes every claimed shape on the real fixtures and is interpreter-identical.**
+/// Which arm owns a claimed shape's **execution**, per input — the classification this pin
+/// asserts for every row.
+///
+/// A row cannot be classified by its fixture alone: `first8/1` succeeds with every `Bs*`
+/// instruction it *executes* natively inlined, while the same function on an empty subject
+/// reaches `bs_get_tail`, which has no inline arm and stays on the family. So the owning arm
+/// is a property of the (function, input) pair.
+#[derive(Clone, Copy)]
+enum Route {
+    /// Every `Bs*` instruction the row executes is natively inlined, so the family helper
+    /// (`jit_bitstr`) runs **not at all**: its run-time counter cannot move, and the honest
+    /// proof is the shapes' **compile-time** emission counter taken through a cache-free
+    /// [`emit::compile_function`](super::emit::compile_function)
+    /// (the `call_tests.rs::the_frame_preserving_local_call_records_no_static_deopt` route).
+    /// The process-wide content-keyed [`crate::jit::cache::CodeCache`] serves a warmed
+    /// artifact and re-emits nothing, so a normal tier run reads `0 -> 0` and proves nothing.
+    Inline(&'static [usize]),
+    /// At least one executed instruction has no inline arm (`bs_get_tail`,
+    /// `bs_match_string`, `bs_create_bin`, a >32-bit `bs_match` field), so the family helper
+    /// really does run and its run-time counter is the proof.
+    Helper,
+}
+
+/// **The owning arm executes every claimed shape on the real fixtures, and is interpreter-identical.**
 ///
 /// Each case is a committed `erlc`-compiled function whose body is a different member of the
-/// family — `bs_start_match3` + `bs_get_integer2` (`first8/1`), `bs_test_tail2` (`head16/1`),
-/// the fixed-width `bs_match` (`u64/1`), the standalone `bs_match_string` (`strlong/1`) and
-/// `bs_create_bin` (`u8/1`) — and each must return the interpreter's value on the baseline
-/// tier **with the helper's counter moving**, which is what proves the emitted arm (rather
-/// than the generic family arm) ran.
+/// family, paired with the arm that owns it (see [`Route`]):
+///
+/// * `first8/1` — `bs_start_match3` + `bs_get_position` + `bs_match` + `bs_set_position` on
+///   the success path, **all four natively inlined** (the fail-path `bs_get_tail` never
+///   runs), so the proof is the four `inlined(SHAPE_*)` counters through a cache-free
+///   compile, and the helper's run-time counter is asserted **unchanged**;
+/// * `head16/1` — the exhaustive `<<X:16>>` form, same four inlined shapes, same proof;
+/// * `bssmall:u64/1` — its `bs_match` reads 64 bits, outside the arm's width set, so the
+///   **helper** runs and its counter is the proof;
+/// * `bsmatch:strlong/1` — `bs_match_string` has no inline arm ⇒ **helper**;
+/// * `bscreate:u8/1` — `bs_create_bin` has no inline arm ⇒ **helper**.
+///
+/// Every row asserts tier agreement with [`Tier::Interpreter`] on the same input **and** the
+/// returned value's identity, so a wrong extraction inside an agreeing outcome still fails.
 #[test]
-fn every_claimed_shape_runs_through_the_helper_and_agrees_with_the_interpreter() {
+fn every_claimed_shape_runs_through_its_owning_arm_and_agrees_with_the_interpreter() {
     // `<<1,2,3,4,5,6,7,8,...>>`: `first8`/`u64` read its first byte/eight bytes.
     let subject: &'static [u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
     // `head16/1` is the exhaustive `<<X:16>>` form, so its subject must be exactly two bytes.
     let pair: &'static [u8] = &[1, 2];
     // `bsmatch:strlong/1` starts with the literal `<<"abcdefghij", R/binary>>`.
     let literal: &'static [u8] = b"abcdefghijk";
-    // (fixture, function, argument, the expected small-int result — `None` for a binary result,
-    // which the bit-exact cross-tier comparison covers on its own).
-    let cases: [(&str, &str, Arg, Option<i64>); 5] = [
-        ("bitstrings", "first8", Arg::Bytes(subject), Some(1)),
-        ("bitstrings", "head16", Arg::Bytes(pair), Some(0x0102)),
-        ("bssmall", "u64", Arg::Bytes(subject), Some(0x0102_0304_0506_0708)),
-        // `strlong/1` returns the tail **binary** after the 10-byte literal.
-        ("bsmatch", "strlong", Arg::Bytes(literal), None),
-        ("bscreate", "u8", Arg::Int(65), None),
+    // The four shapes `first8/1` and `head16/1` execute natively on their success path.
+    let inlined_four: &'static [usize] = &[
+        super::emit::bitstr_inline::SHAPE_GET_POSITION,
+        super::emit::bitstr_inline::SHAPE_SET_POSITION,
+        super::emit::bitstr_inline::SHAPE_START_MATCH3,
+        super::emit::bitstr_inline::SHAPE_BS_MATCH,
     ];
-    for (fixture_name, function, arg, expected) in cases {
+    // (fixture, function, argument, the expected small-int result — `None` for a binary
+    // result, which the bit-exact cross-tier comparison covers on its own — and the owner).
+    let cases: [(&str, &str, Arg, Option<i64>, Route); 5] = [
+        ("bitstrings", "first8", Arg::Bytes(subject), Some(1), Route::Inline(inlined_four)),
+        (
+            "bitstrings",
+            "head16",
+            Arg::Bytes(pair),
+            Some(0x0102),
+            Route::Inline(inlined_four),
+        ),
+        (
+            "bssmall",
+            "u64",
+            Arg::Bytes(subject),
+            Some(0x0102_0304_0506_0708),
+            Route::Helper,
+        ),
+        // `strlong/1` returns the tail **binary** after the 10-byte literal.
+        ("bsmatch", "strlong", Arg::Bytes(literal), None, Route::Helper),
+        ("bscreate", "u8", Arg::Int(65), None, Route::Helper),
+    ];
+    for (fixture_name, function, arg, expected, route) in cases {
         let module = fixture(fixture_name);
         let atom = export(&module, fixture_name, function);
         let before = bitstr_calls();
@@ -542,17 +593,62 @@ fn every_claimed_shape_runs_through_the_helper_and_agrees_with_the_interpreter()
             }
         });
         let after = bitstr_calls();
-        assert!(
-            after > before,
-            "{fixture_name}:{function}/1 must execute through the bitstring helper \
-             (counter {before} -> {after})"
-        );
+        match route {
+            Route::Helper => assert!(
+                after > before,
+                "{fixture_name}:{function}/1 must execute through the bitstring helper \
+                 (counter {before} -> {after})"
+            ),
+            Route::Inline(shapes) => {
+                // The negative half: nothing it executed stayed on the family.
+                assert_eq!(
+                    after, before,
+                    "{fixture_name}:{function}/1 is fully inlined, so the family helper must \
+                     not run (counter {before} -> {after})"
+                );
+                // The positive half: on a **cache-free** compile its own inline arms emitted.
+                let index = module
+                    .functions
+                    .iter()
+                    .position(|f| f.name == atom)
+                    .unwrap_or_else(|| {
+                        panic!("{fixture_name}: no compiled function named {function}/1")
+                    }) as u32;
+                let (emitted, snapshot) = super::bitstr_inline_tests::emitted_shapes_for(
+                    &module, index,
+                );
+                for shape in shapes {
+                    assert!(
+                        emitted.contains(shape),
+                        "{fixture_name}:{function}/1 must inline shape {shape} \
+                         (emitted {emitted:?})"
+                    );
+                }
+                for variant in [
+                    "BsGetPosition",
+                    "BsSetPosition",
+                    "BsStartMatch3",
+                    "BsMatch",
+                ] {
+                    assert_eq!(
+                        super::bitstr_inline_tests::static_deopts(&snapshot, variant),
+                        0,
+                        "{fixture_name}:{function}/1 must not deopt `{variant}`"
+                    );
+                }
+            }
+        }
     }
 }
 
 /// **A failing match takes the same path**: `first8/1` on an empty subject raises exactly
 /// what the interpreter raises, and the helper still ran (`bs_start_match3` succeeded, the
-/// `bs_get_integer2` failed into its fail label — a `Goto` the fold encodes for the driver).
+/// `bs_match` failed into its fail label — a `Goto` the fold encodes for the driver).
+///
+/// This row is [`Route::Helper`] **not because of its fixture but because of its input**: on
+/// the fail path `first8/1` executes `bs_set_position` (inlined) and then `bs_get_tail`,
+/// which has no inline arm, so the family helper really does run — the per-input
+/// classification [`Route`] exists to make that distinction honest.
 #[test]
 fn a_failing_match_agrees_with_the_interpreter_and_still_bypasses_the_router() {
     let module = fixture("bitstrings");

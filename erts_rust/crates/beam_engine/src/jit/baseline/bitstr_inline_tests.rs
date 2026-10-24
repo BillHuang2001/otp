@@ -470,19 +470,34 @@ fn compile_cache_free(module: &Module, index: u32) -> counters::Counters {
     counters::snapshot()
 }
 
-/// The shapes whose arm emitted during a **cache-free** compile of `module`'s `f`, beside
-/// the compile's counter snapshot.
-fn emitted_shapes(module: &Module) -> (Vec<usize>, counters::Counters) {
+/// The shapes whose arm emitted during a **cache-free** compile of `module`'s function
+/// `index`, beside the compile's counter snapshot.
+///
+/// `pub(crate)` because the sibling `bitstr_tests` module classifies its *real fixture* rows
+/// by exactly this measurement: a fixture whose executed `Bs*` instructions are all natively
+/// inlined never moves the family helper's **run-time** counter, so the only honest proof
+/// that its arm ran is this compile-time one.
+pub(crate) fn emitted_shapes_for(
+    module: &Module,
+    index: u32,
+) -> (Vec<usize>, counters::Counters) {
     let before: Vec<u64> = (0..SHAPE_COUNT).map(inlined).collect();
-    let snapshot = compile_cache_free(module, 0);
+    let snapshot = compile_cache_free(module, index);
     let moved = (0..SHAPE_COUNT)
         .filter(|shape| inlined(*shape) > before[*shape])
         .collect();
     (moved, snapshot)
 }
 
+/// The shapes whose arm emitted during a **cache-free** compile of `module`'s `f`.
+fn emitted_shapes(module: &Module) -> (Vec<usize>, counters::Counters) {
+    emitted_shapes_for(module, 0)
+}
+
 /// The static-deopt count `snapshot` recorded for the `Instr` variant `variant`.
-fn static_deopts(snapshot: &counters::Counters, variant: &str) -> u64 {
+///
+/// `pub(crate)` for the same reason as [`emitted_shapes_for`].
+pub(crate) fn static_deopts(snapshot: &counters::Counters, variant: &str) -> u64 {
     snapshot.instr_deopts.get(variant).copied().unwrap_or(0)
 }
 
