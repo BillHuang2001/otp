@@ -632,14 +632,13 @@ impl RunnerState {
     ///
     /// # The parked machine's root set — the live family
     ///
-    /// A process parked in a **relocation-exempt** window (every `receive` park, and a `Yield` park
-    /// whose slice ended with a live FR prefix) publishes **nothing** into its process
+    /// A process parked in a **relocation-exempt** window (a park whose slice ended with a live FR
+    /// prefix, at any arm — the only exemption there is) publishes **nothing** into its process
     /// [`Registers`](beam_process::Registers): nothing can relocate its heap for the window, so the
-    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). A
-    /// `receive` park therefore contributes nothing through the process's `registers()` — they are
-    /// empty for the window — and the parked machine's live terms are named by nothing but
+    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`) and
+    /// the parked machine's live terms are named by nothing but
     /// `machine.x`/`machine.stack`/`machine.fr` — exactly the `x(0)` a `receive` is about to match —
-    /// so a resource a parked child holds in a register is reachable **only** through this family.
+    /// so a resource such a child holds in a register is reachable **only** through this family.
     ///
     /// A machine parked in a **publishing** window is the opposite case: its roots were copied into
     /// the process's `Registers`, which a collection may then relocate, leaving the machine's own

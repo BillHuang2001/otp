@@ -1286,11 +1286,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // The guard is therefore **per slice**: a slice that ends with a live FR prefix parks
         // under `ParkExemption::LiveFloats`, which takes the relocation exemption for the window
         // that follows, and the **next slice entry** clears the mark again (`RuntimeRunner::run`'s
-        // parking branch), so a window that opens with a dead FR prefix is protected by nothing at
-        // all. The mark is decline-only and bounded: a delivery into the window takes the ordinary
-        // heap-fragment fallback (`Process::deliver`'s raw refusal), and the process's own
-        // admission point collects as soon as the resume has cleared the mark — so nothing grows
-        // unboundedly.
+        // parking branch), so a window that opens with a dead FR prefix publishes its roots and is
+        // protected by the collection itself. The mark is decline-only and bounded: a delivery into
+        // an **exempt** window takes the ordinary heap-fragment fallback (`Process::deliver`'s raw
+        // refusal) while a delivery into a publishing one copies straight onto the receiver's
+        // heap, and the process's own admission point collects as soon as the resume has cleared
+        // the mark — so nothing grows unboundedly.
         //
         // # Why `fr_mark` is the right — and exact — bound
         //
@@ -1549,9 +1550,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // `Process::has_unpublished_roots()` is `false` for it and a delivery — or a
                 // requested `garbage_collect` — really collects/grows its nursery and copies the
                 // payload **straight into it**, the way the C puts a message on the receiver's
-                // heap. That is the whole point of the publication: the alternative (`Always`)
-                // makes every delivery to a blocked receiver take the heap-fragment fallback,
-                // i.e. a carrier allocation plus a *second* full copy of the payload later.
+                // heap. That is the whole point of the publication: without it a dead-FR park
+                // would hold the window's exemption and every delivery to a blocked receiver
+                // would take the heap-fragment fallback, i.e. a carrier allocation plus a *second*
+                // full copy of the payload later.
                 //
                 // What the publication must cover, and why it does:
                 //
