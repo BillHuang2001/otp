@@ -8,7 +8,8 @@ failure is **return-based** — no `setjmp`/`longjmp`), the OTP/ERTS **version c
 runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**,
 the **canonical definitions of ERTS constants genuinely shared by two or more workspace crates**
 (`constants`, currently `CONTEXT_REDS`), the **one local reference-id space** every locally minted
-reference term draws from (`refid`), and the documented **`unsafe` marker convention**.
+reference term draws from (`refid`), the **single RFC 1321 MD5** the whole workspace shares
+(`md5`), and the documented **`unsafe` marker convention**.
 
 This is a **dependency sink**: it depends on `std` and on **nothing else** — deliberately no
 `thiserror`, no `tracing`, no `bitflags`. Adding any dependency here must be justified in
@@ -61,6 +62,13 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   `erlang:monitor/2,3`, `erlang:alias/1`, timer references, `seq_trace` references and the NIF
   **resource terms** of `enif_make_resource`. Term-independent by design (this crate names no term
   type) — the small-int encoding of an id is the *caller's* check. See *Cross-Crate Reference Ids*.
+- `md5` — the **single RFC 1321 MD5** of the workspace: `BLOCK_LEN` (`= 64`), `DIGEST_LEN` (`= 16`),
+  the one-shot `digest(&[u8]) -> [u8; DIGEST_LEN]` and the streaming `Md5`
+  (`new`/`update`/`finish`/`from_parts` plus the raw-state accessors
+  `state`/`total_len`/`buffered_len`/`buffer`; `Default`, `Clone`, `Debug`, `PartialEq`, `Eq`).
+  `finish(&self)` pads a *copy* of the state, so it is pure and re-finishable; `from_parts` stores
+  the full 64-byte buffer verbatim and rejects `len > BLOCK_LEN` with `BeamError::BadArg`. See
+  *Cross-Crate MD5*.
 - `logging` — dependency-free facade: `init_logging`, `init_from_env`, `set_level`, `level`,
   `enabled`, plus the `beam_trace!`/`beam_debug!`/`beam_info!`/`beam_warn!`/`beam_error!` macros.
 - `safety` — documentation-only module stating the `unsafe` convention (see Constraints).
@@ -85,7 +93,7 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   comment; any `unsafe` gains a Miri/fuzz or differential test where feasible. `beam_common` itself
   contains none (`#![forbid(unsafe_code)]`).
 - Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `constants`,
-  `refid`, `logging`).
+  `refid`, `logging`, `md5`).
 
 ## Cross-Crate Constant Ownership
 `constants` is the single owner of ERTS constants genuinely shared by **two or more** workspace
@@ -127,6 +135,26 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
   (`beam_abi/src/nif/enif/time.rs`, `beam_io/src/cpu_time.rs`); `WORD_BYTES` / `U32_PER_WORD`
   (recomputed from `size_of::<Eterm>()` per crate); `POS_BIG_SUBTAG` / `REF_SUBTAG`
   (canonical in `beam_term::tag`; only `#[cfg(test)]` copies elsewhere).
+
+## Cross-Crate MD5
+`md5` is the workspace's **one** RFC 1321 MD5. It lives here because this crate is the lowest common
+ancestor of its three consumers: the `.beam` code checksum of contract **A.2** (what
+`Module:module_info(md5)` reports, `erts/emulator/beam/beam_file.c:1753-1829`), the distribution
+handshake digest of **A.5** (`lib/erl_interface/src/connect/ei_connect.c`) and the
+`erlang:md5/*` BIF family of **A.7** (`md5/1`, `md5_init/0`, `md5_update/2`, `md5_final/1`).
+
+Only the arithmetic lives here: one-shot `digest`, streaming `Md5`, and the raw-state accessors
+(`state`/`total_len`/`buffered_len`/`buffer`) with their inverse `from_parts`, so `beam_bifs` can
+marshal the byte-exact 96-byte `erts_md5_state` image (`erts/emulator/beam/erl_md5.h:30-35`) in and
+out without duplicating a single round — the wire layout stays a BIF-layer concern. `Md5` is that
+struct field for field, including the C's buffering asymmetry (a whole 64-byte update on an empty
+buffer hashes immediately, two 32-byte updates leave a full *unhashed* buffer) and the `pad` zero
+run that only stays non-negative because it is written as `(56 + 64 - filled) & 63`. `finish` takes
+`&self` and pads a copy, which is what makes `erlang:md5_final/1` pure.
+
+Dependency-free (it does not even use this crate's `libc`), safe (`#![forbid(unsafe_code)]`),
+allocation-free (fixed arrays only) and panic-free; pinned by the RFC 1321 Appendix A.5 suite plus a
+length-`0..=130` / pad-boundary sweep whose goldens are oracle-derived.
 
 ## Cross-Crate Reference Ids
 A reference term is the on-heap block
@@ -205,6 +233,19 @@ those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *loc
     serialize on a private `TEST_LOCK` because they share the process-wide counter and assert exact
     draw counts.
   - `logging`: level round-trip (`set_level`/`level`/`enabled`); `init_from_env` default when unset.
+  - `md5`: the RFC 1321 Appendix A.5 suite (`""`, `"a"`, `"abc"`, `"message digest"`, the two
+    alphabets/numerals cases, the 10^6-`a` vector) plus the `b""`/`[b'A'; 64]`/`[b'A'; 100]` byte
+    anchors; the pad-boundary sweep over the `patterned` corpus (`i % 251`) at **every** length
+    `0..=130` plus `1000` and `4096`, one-shot *and* streamed in 7-byte chunks, with the coverage of
+    the `54..=63` window and the explicit `55/56/57/62/63/64/65/119/120/127/128/1000/4096` list
+    asserted; `digest(d) == Md5::new().update(d).finish()` at every one of those lengths; split
+    invariance over `[0, 1, 63, 64, 65, 100, 128, 199, 200]`; `finish` purity (twice-finishable, the
+    state untouched, a later `update` still counts); the `from_parts`/accessor round trip including
+    the `len == 64` image, the rebuilt-from-parts context, the verbatim non-zero buffer tail and the
+    `len > BLOCK_LEN` → `BeamError::BadArg` refusal; and the C buffering asymmetry (`len == 0` after
+    one 64-byte update, `len == 64` unhashed after two 32-byte ones).
+- Doctests: every public item carries a runnable example (`cargo test` runs them; do **not** pass
+  `--lib` to the crate gate, which would skip them).
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.
   Full-workspace `cargo test --workspace` must stay green as dependents land.
 
@@ -223,6 +264,8 @@ those with `node`/`serial`, which M1 keeps at `0`, so the guarantee is over *loc
 - `src/refid.rs` → the one local reference-id space (`next_ref_id`), shared by every locally minted
   reference term (plain refs, monitors/aliases, timers, `seq_trace`, NIF resource terms)
 - `src/logging.rs` → dependency-free logging facade + log macros
+- `src/md5.rs` → RFC 1321 MD5: one-shot `digest`, streaming `Md5` (`BLOCK_LEN`/`DIGEST_LEN`) and the
+  raw-state accessors + `from_parts` that let `beam_bifs` marshal the `erts_md5_state` image
 - `src/safety.rs` → the workspace `unsafe` marker convention (docs only)
 - `src/lib.rs` → crate docs, module wiring, root re-exports
 

@@ -40,6 +40,9 @@
 //! * a dependency-free **logging facade** ([`init_logging`], [`init_from_env`],
 //!   [`set_level`], [`level`], [`enabled`]) with the [`beam_trace!`], [`beam_debug!`],
 //!   [`beam_info!`], [`beam_warn!`] and [`beam_error!`] macros;
+//! * the workspace's **single RFC 1321 MD5** ([`digest`], [`Md5`]), one implementation serving the
+//!   `.beam` chunk checksum, the distribution handshake digest and the `erlang:md5/*` BIF family
+//!   with its byte-exact 96-byte context image;
 //! * the documented **`unsafe` marker convention** of the workspace ([`safety`]).
 //!
 //! This crate is a **dependency sink**: it depends on `std` and `libc` only — no
@@ -89,6 +92,7 @@ mod config;
 mod constants;
 mod error;
 mod logging;
+mod md5;
 mod refid;
 mod version;
 
@@ -99,5 +103,6 @@ pub use config::*;
 pub use constants::*;
 pub use error::*;
 pub use logging::{enabled, init_from_env, init_logging, level, set_level};
+pub use md5::{digest, Md5, BLOCK_LEN, DIGEST_LEN};
 pub use refid::next_ref_id;
 pub use version::*;
