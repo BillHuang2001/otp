@@ -1032,12 +1032,15 @@ mod tests {
             before.hist_descents[hist_bucket(40)] + 1
         );
         // The per-pid twin of the same three calls: every call counted, the one real descent
-        // counted (the phase-1 hit is not one), and the visited sum/peak per process.
+        // counted (the phase-1 hit is not one), and the visited sum/peak per process. The per-pid
+        // `visited` sum is over **every** call's reported set size (a phase-1-only call pays no
+        // descent but still reports the size it looked at), so the delta is 40 + 7; the peak is a
+        // max, so it only has to reach the largest of them.
         let pid_after = pid_snapshot(pid);
         assert_eq!(pid_after.calls, before_pid.calls + 3);
         assert_eq!(pid_after.descents, before_pid.descents + 1);
-        assert_eq!(pid_after.visited, before_pid.visited + 40);
-        assert_eq!(pid_after.visited_peak.max(before_pid.visited_peak), 40);
+        assert_eq!(pid_after.visited, before_pid.visited + 40 + 7);
+        assert!(pid_after.visited_peak >= before_pid.visited_peak.max(40));
     }
 
     /// The admission/collection pair is additive per process, and the two counters that separate a
