@@ -97,7 +97,7 @@ pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
 
 use crate::context::{ExecutionContext, RootSet};
-use crate::families::bitstrings::programs::BitstrPrograms;
+use crate::families::bitstrings::programs::{BitstrPrograms, ProgramWitness};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
 pub(crate) use self::location::{pack_current_code, CURRENT_CODE_NONE};
@@ -730,19 +730,29 @@ pub struct Machine {
     /// as such and keeps costing the host *zero* consultations.
     pub(crate) entry_verdicts: LocalVerdicts,
     /// The run's **entry** module's prepared bitstring programs
-    /// (`crate::families::bitstrings::programs`), the context-`0` twin of a
-    /// [`ModuleContext`]'s
-    /// [`programs`](crate::machine::ModuleContext::programs) cell.
+    /// (`crate::families::bitstrings::programs`), the context-`0` twin of the context
+    /// registry's parallel table (`Contexts::take_programs`).
     ///
     /// Context `0` is the run's entry module, which the machine never owns (the drive
     /// loop borrows it), so its program table lives here — exactly like
     /// [`Machine::entry_verdicts`]. A prepared program is a pure function of the loaded
     /// IR plus the atom/string tables, so nothing here can go stale while the module
-    /// image lives; the table's own image witness discards it if the entry module
-    /// changes, and [`Machine::reset`](crate::Machine::reset) drops it with the run.
+    /// image lives; [`Machine::bind_entry_programs`] (from
+    /// [`Machine::enter_run`]) keeps it only when the run re-enters the very image it was
+    /// filled from, and discards it otherwise.
     ///
     /// Read/moved only by [`Machine::with_bitstr_programs`], the single hand-over seam.
     pub(crate) entry_programs: BitstrPrograms,
+    /// The **image witness** of whatever filled [`Machine::entry_programs`], recorded at
+    /// the run entry that last bound it ([`Machine::bind_entry_programs`]).
+    ///
+    /// It is what lets the entry table survive a [`Machine::reset`] without risking a
+    /// stale answer: the table is retained only when the run re-enters the very image it
+    /// was filled from (same address, same content digest, same atom namespace —
+    /// [`ProgramWitness::describes`]). Kept here rather than in the table itself because
+    /// the table is handed over by value once per bitstring instruction, so it is kept to
+    /// the one owner word its lookup compares plus its slot `Vec`.
+    pub(crate) entry_programs_witness: Option<ProgramWitness>,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -883,6 +893,7 @@ impl Machine {
             local_call_invalidation_pending: std::cell::Cell::new(false),
             entry_verdicts: LocalVerdicts::empty(),
             entry_programs: BitstrPrograms::empty(),
+            entry_programs_witness: None,
             current_code: CURRENT_CODE_NONE,
             entry_call: None,
             reductions: 0,
@@ -1417,23 +1428,22 @@ impl Machine {
     /// one hand-over seam, and the only reader/writer of those tables.
     ///
     /// The prepared-program cache (`crate::families::bitstrings::programs`) is per
-    /// module context — this machine's [`Machine::entry_programs`] for context `0`, a
-    /// registered [`ModuleContext`]'s cell otherwise — and the executing family needs it
-    /// **while it holds `&mut Machine`** (the segment writers allocate). Handing the
-    /// table over for the duration of one instruction is what makes those two borrows
-    /// legal without a reference count, a raw pointer or a slot borrowed across the
-    /// call: the table is moved out, the closure receives it (and the machine, because
-    /// the family needs both) and it is filed back **on every exit, including an error
-    /// return**. Nothing else reads the table mid-instruction.
+    /// module context — this machine's [`Machine::entry_programs`] for context `0`, the
+    /// registry's parallel table otherwise (`Contexts::take_programs`) — and the
+    /// executing family needs it **while it holds `&mut Machine`** (the segment writers
+    /// allocate). Handing the table over for the duration of one instruction is what
+    /// makes those two borrows legal without a reference count, a raw pointer or a slot
+    /// borrowed across the call: the table is moved out, the closure receives it (and
+    /// the machine, because the family needs both) and it is filed back **on every
+    /// exit, including an error return**. Nothing else reads the table mid-instruction.
     ///
-    /// The context's cell is resolved **once** per instruction: the hot caller is a
-    /// compiled binary comprehension, which re-enters here once per element, so a take
-    /// and its matching restore must cost one resolution between them. Context `0` pays
-    /// no lookup at all (the table is a field), a registered context resolves its
-    /// handle once (an `Arc` clone, so the cell does not borrow `self` and the closure
-    /// can take the machine), and an **unregistered** context — no module image, hence
-    /// no programs — gets a throwaway empty table that is simply dropped, never filed
-    /// back.
+    /// Both arms are two moves of the table itself and nothing else: context `0` swaps
+    /// the machine's field, a registered context swaps its slot in the registry's
+    /// parallel `Vec`. Neither touches a reference count — the table deliberately does
+    /// *not* live inside the `ModuleContext` an instruction could only reach through an
+    /// `Arc` — so a compiled comprehension that re-enters here once per element pays no
+    /// atomic. An **unregistered** context — no module image, hence no programs — gets a
+    /// throwaway empty table that is simply dropped, never filed back.
     ///
     /// A table lost to an unwind is only a re-decode, never a wrong answer: it is a
     /// cache of programs that are a pure function of the loaded image.
@@ -1449,14 +1459,14 @@ impl Machine {
             self.entry_programs = programs;
             out
         } else {
-            match self.module_context(self.context) {
-                Some(handle) => {
-                    let mut programs = handle.programs.replace(BitstrPrograms::empty());
+            // The id is captured **once**, so the file-back lands in the very slot the
+            // table came from even if `f` switched context (a nested run) and switched
+            // back.
+            let id = self.context;
+            match self.contexts.take_programs(id) {
+                Some(mut programs) => {
                     let out = f(self, &mut programs);
-                    // Files the table back into the very cell it came from (the `Arc`
-                    // handle, not a fresh lookup of `self.context`, so a context switch
-                    // inside `f` cannot redirect it), and hands back the placeholder.
-                    handle.programs.replace(programs);
+                    self.contexts.put_programs(id, programs);
                     out
                 }
                 // An unregistered context has no module image, so it has no programs.
@@ -1466,6 +1476,40 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Bind the run's **entry** module to [`Machine::entry_programs`], dropping the table
+    /// unless it was filled from this very image.
+    ///
+    /// Called from [`Machine::enter_run`](crate::machine::Machine) — the prologue every
+    /// run entry and every resume passes through — instead of clearing the table in
+    /// [`Machine::reset`](crate::Machine::reset), because a host that runs one module
+    /// many times (the runtime's `run` route, a benchmark loop, a test corpus) would
+    /// otherwise re-prepare every `bs_match`/`bs_create_bin` program **per run**: the
+    /// 64-slot table would be allocated, filled and dropped once per entry, which is the
+    /// single largest bitstring cost on a batch harness that recycles the machine.
+    ///
+    /// The retention test is [`BitstrPrograms::describes`], which is exactly as strict as
+    /// a fresh prepare needs it to be: same image **address** (the `(function, code
+    /// offset)` key's numbers belong to that allocation), same content **digest** (the
+    /// chunk subset a prepared program is derived from) and same **atom namespace**
+    /// (the index→name mapping the descriptors resolve through) — the identity argument
+    /// `machine/label_cache.rs` makes for the label map. An image with no content
+    /// identity at all (an all-zero checksum, i.e. a hand-built/synthetic module) is
+    /// never retained: `(function, code offset)` is not an identity there, so a retained
+    /// entry could answer for a *different* instruction's descriptor list — a wrong
+    /// answer, not merely a stale one.
+    #[inline]
+    pub(crate) fn bind_entry_programs(&mut self, module: &Module) {
+        if self.entry_programs.is_filled()
+            && self
+                .entry_programs_witness
+                .is_some_and(|witness| witness.describes(module))
+        {
+            return;
+        }
+        self.entry_programs.clear();
+        self.entry_programs_witness = Some(ProgramWitness::of(module));
     }
     /// The module-wide label index of `module` — **the** label-map door.
     ///
