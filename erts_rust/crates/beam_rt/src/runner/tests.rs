@@ -3279,13 +3279,11 @@ fn a_parked_engines_host_held_terms_survive_a_moving_collection() {
 /// predicate [`Process::deliver`](beam_process::Process::deliver) refuses the relocating collection
 /// on (it is `relocation_exempt || Running`), and a refusal is exactly what
 /// [`deliver_into_mailbox`](crate::context::RuntimeContext::deliver_into_mailbox) turns into the
-/// `send_fragmented_message` fallback. It used to answer **`true`** for every parked receiver: the
-/// `Wait` arm parked under `ParkExemption::Always`, which set the relocation exemption for the
-/// whole window, so a delivery into a blocked process could never collect (or grow) its nursery
-/// and always took the fragment route — a carrier allocation plus a second full `copy_struct` of
-/// the payload, on the default path of every ping-pong and server loop.
+/// `send_fragmented_message` fallback, so an answer of `true` makes the fragment route (a carrier
+/// allocation plus a second full `copy_struct` of the payload) the default path of every ping-pong
+/// and server loop.
 ///
-/// The `Wait` arm now parks under [`ParkExemption::LiveFloats`] (`exempt = fr_count > 0`), so a
+/// The `Wait` arm parks under [`ParkExemption::LiveFloats`] (`exempt = fr_count > 0`), so a
 /// dead-FR receiver publishes its whole root set into the process's [`Registers`] — the machine's
 /// files plus the engine's host-held families — and answers `false`, which is what makes the
 /// delivery-driven collection in [`a_receive_park_publishes_so_a_signal_collects_the_receivers_nursery`]
@@ -3327,8 +3325,7 @@ fn a_receive_parked_process_hands_its_roots_over_published() {
     assert!(
         !process.has_unpublished_roots(),
         "a parked `receive` receiver published its roots: `deliver` may collect and grow its \
-         nursery instead of refusing the move (it answered `true` for every parked receiver while \
-         the `Wait` arm parked under `ParkExemption::Always`)"
+         nursery instead of refusing the move"
     );
     assert!(
         state
@@ -3608,9 +3605,8 @@ fn a_live_fr_park_skips_the_hand_off_and_opens_the_window_exemption() {
 /// `../context/tests.rs`, and it is impossible while the pid carries a permanent un-collectable mark.
 ///
 /// `preempt:spin/1` is the non-allocating tail loop: a tiny budget pre-empts it
-/// (`ProcOutcome::Yield`) so the slice ends while the process is still runnable — the *only* park
-/// arm whose exemption is not already set for other reasons (the `Wait` arm marks its parked
-/// process unconditionally). FR slot 0 is written through the engine's own `Machine::set_fr`
+/// (`ProcOutcome::Yield`) so the slice ends while the process is still runnable — a park arm whose
+/// window the FR prefix alone decides, exactly as at the `Wait` arm. FR slot 0 is written through the engine's own `Machine::set_fr`
 /// seam between the slices, standing in for a float computation that left a register live.
 #[test]
 fn the_live_fr_window_exemption_is_opened_per_slice_and_never_pinned() {

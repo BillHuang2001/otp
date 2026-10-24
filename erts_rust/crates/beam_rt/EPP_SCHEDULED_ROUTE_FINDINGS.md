@@ -74,7 +74,7 @@ The regression is `tests/compile_file.rs::a_scheduled_process_compiles_a_source_
 `a_scheduled_process_parses_a_source_file_like_the_oracle` covers the same class via `epp:parse_file/3`.
 The seam is pinned by
 `context::tests::the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver`
-and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
+and `runner::tests::a_receive_park_publishes_so_a_signal_collects_the_receivers_nursery`.
 
 **The durable invariant behind the E0 shape.** A registered BIF's container result is never left on the recyclable pooled BIF heap while running Erlang code can store it in a heap object.
 On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
