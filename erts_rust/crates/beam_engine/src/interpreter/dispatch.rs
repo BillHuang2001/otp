@@ -1160,9 +1160,13 @@ impl Machine {
     /// stateful answer set.
     ///
     /// Everything except the slot read is **out of line**
-    /// ([`Machine::ask_local_callee`], [`Machine::serve_local_callee`]): both are
+    /// ([`Machine::local_call_enters_in_machine`] is the `#[inline(always)]` phases-0+1
+    /// fast path, [`Machine::local_call_seam_slow`] the out-of-line rest,
+    /// [`Machine::ask_local_callee`] and [`Machine::serve_local_callee`] behind it): all are
     /// once-per-callee or NIF-stub-only paths, and keeping them out of the three
-    /// interpreter arms is what keeps the hot path — and the arms' code — small.
+    /// interpreter arms is what keeps the hot path — and the arms' code — small. The fast
+    /// path's test is a single range compare over [`Verdict`]'s ordered discriminants
+    /// (deliberately not a `match`, which lowers to a jump table here).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn local_call_seam(
