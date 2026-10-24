@@ -22,7 +22,11 @@
 //! bounded optimisation (the section comment below documents why it is exact).
 //!
 //! It lowers the small-int `erlang:` arithmetic BIFs — `'+'/2`, `'-'/2`, `'*'/2`,
-//! the bitwise `band/2`/`bor/2` and the immediate-count `bsr/2` — and nothing else.
+//! `div/2`, `rem/2`, the bitwise `band/2`/`bor/2` and the immediate-count `bsr/2` —
+//! and nothing else. This is a **baseline-tier-only** inlineset member: the
+//! interpreter and the (interpreter-backed) Cranelift tier send every `gc_bif`
+//! through `ExecutionContext::call_bif`, so the fast path adds a second lowering for
+//! these shapes, never a second semantic.
 
 use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Module, Operand};
@@ -42,8 +46,9 @@ use super::{emit_step_and_continue, touch, Allocation};
 // ---------------------------------------------------------------------------
 //
 // The tier's **one** bounded optimisation: `gc_bif` of `erlang:'+'/2`,
-// `erlang:'-'/2` and `erlang:'*'/2` over small integers, emitted natively behind
-// guards that can only ever *reject* (falling back to `jit_step_one`). It cannot
+// `erlang:'-'/2`, `erlang:'*'/2`, `erlang:div/2` and `erlang:rem/2` over small
+// integers, emitted natively behind guards that can only ever *reject* (falling
+// back to `jit_step_one`). It cannot
 // produce a value the interpreter step would not have produced:
 //
 // * the two operands must both be small integers — the same `is_small` the
@@ -87,6 +92,43 @@ use super::{emit_step_and_continue, touch, Allocation};
 // the magnitude, so the untagged range check never rejects here; it is kept so the
 // re-tag cannot wrap for any operand.
 //
+// ## The signed divide pair (`div`/`rem`)
+//
+// `erlang:div/2` truncates **toward zero** and `erlang:rem/2` takes the
+// **dividend's** sign — exactly the x86 (`cqo` + `idiv`) and C conventions, so one
+// divide yields both: the quotient lands in `rax` and the remainder in `rdx`. Like
+// `*`, the pair must **untag** both operands first (the encoding is affine, the
+// division is not), and it re-tags the half it wants.
+//
+// Three guards, each with a different reason:
+//
+// * **A zero divisor is refused before the `idiv`.** `idiv` by zero raises `#DE`, a
+//   CPU trap (SIGFPE) that would kill the process, where the interpreter raises the
+//   catchable `error:badarith` — so the divisor is compared against zero and a zero
+//   jumps to the same fallback as any other un-lowered shape.
+// * **`div` range-checks the untagged quotient.** The quotient of two smalls can be
+//   a bignum: `MIN_SMALL div -1 == 2^59`, one past `MAX_SMALL`. Only the untagged
+//   value is aliasing-free (the re-tag is `p * 16 + 15`, the same wrap `*` guards
+//   against), so an out-of-range quotient deopts and the helper produces the exact
+//   bignum.
+// * **No overflow guard.** `i64::MIN / -1` is the `idiv`'s only overflow fault, and
+//   it is unreachable: both untagged operands lie in `[-2^59, 2^59-1]`. That is what
+//   makes the guard-free divide sound.
+//
+// `rem` needs **no** range check: `|rem| < |divisor| <= 2^59` for two smalls, so the
+// remainder is always a small integer (`MIN_SMALL rem -1 == 0` is answered here,
+// fast-path, and exactly).
+//
+// A **float** operand (`5.0 div 2`, `5 div 2.0`, `5.0 rem 2`) and a **bignum**
+// operand are both rejected by the existing small-int guard and fall back to the
+// BIF, which raises `error:badarith` for the float and returns the exact bignum
+// otherwise. Neither is fabricated here.
+//
+// `erlang:intdiv/2` is deliberately **not** admitted: it is *floor* division
+// (`-7 intdiv 2 == -4`), the opposite rounding for a negative quotient, so the
+// `idiv` above would answer `-3` — a wrong result, not a slow one. It keeps the
+// whole `call_bif` road.
+//
 // Everything else (another BIF, another module, an operand that is a static literal,
 // a destination that is a literal or a float register, a register index outside the
 // engine's bound) keeps today's behaviour: one `jit_step_one` call.
@@ -122,9 +164,9 @@ use super::{emit_step_and_continue, touch, Allocation};
 // (`machine.x.len() > bound`), and raising it for a stack slot would wrongly refuse
 // native entry.
 
-/// The six BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2`,
-/// `erlang:'*'/2`, `erlang:band/2`, `erlang:bor/2` and `erlang:bsr/2`, and nothing
-/// else.
+/// The eight BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2`,
+/// `erlang:'*'/2`, `erlang:div/2`, `erlang:rem/2`, `erlang:band/2`,
+/// `erlang:bor/2` and `erlang:bsr/2`, and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SmallArith {
     /// `erlang:'+'/2`.
@@ -133,6 +175,11 @@ pub(crate) enum SmallArith {
     Sub,
     /// `erlang:'*'/2`.
     Mul,
+    /// `erlang:div/2` — a signed `idiv`, truncating toward zero (see the section
+    /// comment).
+    Div,
+    /// `erlang:rem/2` — the remainder of that same `idiv` (the dividend's sign).
+    Rem,
     /// `erlang:band/2` — a raw tagged-word `and` (see the section comment).
     And,
     /// `erlang:bor/2` — a raw tagged-word `or`.
@@ -207,7 +254,7 @@ pub(crate) enum FastDest {
 
 /// A `gc_bif` shape the fast path can lower.
 pub(crate) struct FastArith<'a> {
-    /// Which of the two BIFs is called.
+    /// Which of the BIFs is called.
     pub(crate) op: SmallArith,
     /// The first operand (an addressable `x(i)`/`y(k)` or a small-int constant).
     pub(crate) a: &'a Operand,
@@ -365,7 +412,8 @@ fn operand_uses_y(operand: &Operand) -> bool {
 /// consults the register allocation, so [`super::regalloc::allocate_registers`] and [`super::emit_block`]
 /// agree on which `gc_bif`s the fast path targets).
 ///
-/// The shape is the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2`/`band/2`/`bor/2`/`bsr/2`
+/// The shape is the small-int
+/// `erlang:'+'/2`/`'-'/2`/`'*'/2`/`div/2`/`rem/2`/`band/2`/`bor/2`/`bsr/2`
 /// of `args.len() == 2` whose every operand is an in-bound x-register, an addressable
 /// Y slot or a small-int constant and whose destination is an in-bound x-register or
 /// an addressable Y slot. `bsr/2` carries the extra, still purely syntactic,
@@ -387,9 +435,14 @@ pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastAr
         "+" => SmallArith::Add,
         "-" => SmallArith::Sub,
         "*" => SmallArith::Mul,
+        "div" => SmallArith::Div,
+        "rem" => SmallArith::Rem,
         "band" => SmallArith::And,
         "bor" => SmallArith::Or,
         "bsr" => SmallArith::Bsr,
+        // `intdiv/2` (floor division) and `bsl/2` (a growable left shift) are
+        // deliberately absent: their semantics differ from the shape the emitted
+        // sequence computes, so they keep the whole `call_bif` road.
         _ => return None,
     };
     let dst = destination(dst)?;
@@ -600,6 +653,19 @@ fn emit_y_store(buffer: &mut CodeBuffer, k: u32, fallback: CodeLabel) -> Result<
 ///   shl  r11, SMALL_SHIFT   ; make_small(p) == p * 16 + 15, safe after the check
 ///   mov  rcx, SMALL_TAG
 ///   or   r11, rcx
+///   ; --- erlang:div/2 and erlang:rem/2: untag, divide, re-tag the wanted half ---
+///   sar  rax, SMALL_SHIFT   ; va (the dividend, already in rax)
+///   sar  r8,  SMALL_SHIFT   ; vb (the divisor)
+///   test r8,  r8 ; jz fallback  ; a zero divisor would raise #DE (a trap)
+///   cqo                     ; sign-extend rax into rdx:rax (`idiv` is 128-bit)
+///   idiv r8                 ; rax = quotient (truncates toward zero), rdx = remainder
+///   div:  mov  r11, rax
+///         mov  rcx, MIN_SMALL ; cmp r11, rcx ; jl fallback  ; the UNTAGGED quotient
+///         mov  rcx, MAX_SMALL ; cmp r11, rcx ; jg fallback  ; (can be a bignum)
+///   rem:  mov  r11, rdx     ; no range check: |rem| < |divisor| <= 2^59
+///   shl  r11, SMALL_SHIFT
+///   mov  rcx, SMALL_TAG
+///   or   r11, rcx
 ///   ; --- erlang:band/2 and erlang:bor/2: a raw tagged-word and/or, no re-tag ---
 ///   mov  r11, rax
 ///   and  r11, r8            ; or for 'bor' — the low nibble stays TAG_IMMED1_SMALL,
@@ -726,6 +792,46 @@ pub(super) fn try_inline_gc_bif(
 
             // Re-tag: `make_small(p) == p * 16 + 15`, with the shift now provably
             // lossless (`|p| <= 2^59`).
+            buffer.shl_ri(FAST_R, SMALL_SHIFT)?;
+            buffer.mov_ri(FAST_C, SMALL_TAG)?;
+            buffer.or_rr(FAST_R, FAST_C)?;
+        }
+        // `div`/`rem`: one signed `idiv` yields both halves — Erlang's `div` truncates
+        // toward zero and `rem` takes the dividend's sign, exactly x86's (and C's)
+        // convention. Like `*`, the tagged words must be untagged first (`make_small` is
+        // affine, the divide is not); then the wanted half is re-tagged.
+        SmallArith::Div | SmallArith::Rem => {
+            buffer.sar_ri(FAST_A, SMALL_SHIFT)?;
+            buffer.sar_ri(FAST_B, SMALL_SHIFT)?;
+            // A **zero divisor** must be refused *before* the divide: `idiv` by zero
+            // raises `#DE` — a CPU trap that kills the process — where the interpreter
+            // raises the catchable `error:badarith`. `cqo` would also be pointless work.
+            buffer.test_rr(FAST_B, FAST_B)?;
+            buffer.jcc(Cond::E, fallback)?;
+            // `idiv` divides the 128-bit `rdx:rax`, so the `rax` dividend (already
+            // untagged in `FAST_A`) must be sign-extended into `rdx` first. It needs no
+            // overflow guard: `i64::MIN / -1` is unreachable because both untagged
+            // operands lie in `[-2^59, 2^59-1]` (see the section comment).
+            buffer.cqo()?;
+            buffer.idiv_rr(FAST_B)?;
+            if fast.op == SmallArith::Div {
+                // The quotient can be a bignum (`MIN_SMALL div -1 == 2^59`), so the
+                // **untagged** quotient is range-checked; the re-tag wraps otherwise
+                // (the same aliasing `*` guards against). An out-of-range quotient
+                // deopts and the helper computes the exact bignum.
+                buffer.mov_rr(FAST_R, FAST_A)?;
+                buffer.mov_ri(FAST_C, MIN_SMALL)?;
+                buffer.cmp_rr(FAST_R, FAST_C)?;
+                buffer.jcc(Cond::L, fallback)?;
+                buffer.mov_ri(FAST_C, MAX_SMALL)?;
+                buffer.cmp_rr(FAST_R, FAST_C)?;
+                buffer.jcc(Cond::G, fallback)?;
+            } else {
+                // `|rem| < |divisor| <= 2^59` for two smalls, so the remainder is always
+                // a small integer: no range check (and `MIN_SMALL rem -1 == 0` is
+                // answered here, exactly).
+                buffer.mov_rr(FAST_R, Reg::Rdx)?;
+            }
             buffer.shl_ri(FAST_R, SMALL_SHIFT)?;
             buffer.mov_ri(FAST_C, SMALL_TAG)?;
             buffer.or_rr(FAST_R, FAST_C)?;
