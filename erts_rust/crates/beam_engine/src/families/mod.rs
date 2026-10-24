@@ -108,6 +108,13 @@ mod tuples;
 /// interpreter reaches it from its catch-all arm, so inlining it into the dispatch
 /// loop lets the optimizer fold the (now redundant) per-family `match` into the
 /// loop's own control flow instead of a second out-of-line dispatch.
+///
+/// Inlining the family bodies here is the **measured** shape: outlining them (each
+/// family `exec` as `#[inline(never)]`, one tail call per arm) adds a `call`/`ret`
+/// pair and a second prologue to every dispatched instruction and measured **+2.52 %
+/// retired instructions / +3.34 % cycles** on `bench_gc_bound:churn/1`. The 45 KiB
+/// function this produces is the price of that, and the only arm whose own weight is
+/// worth keeping out of the hot text is the diagnostic one ([`unclaimed`], `#[cold]`).
 #[inline]
 pub(crate) fn dispatch(
     machine: &mut Machine,
@@ -159,8 +166,20 @@ pub(crate) fn dispatch(
         | Instr::UpdateRecordId(_) => {
             records::exec(machine, module, labels, instr, func, pc, ctx)
         }
-        // lists
-        Instr::PutList { .. } | Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
+        // lists — the two cons-cell instructions are the hottest *dispatched* ones in
+        // real code (every list build is a `put_list`, every list traversal a
+        // `get_list`), so they are routed **directly to their bodies** with the
+        // operands this pattern has already destructured. Routing them through
+        // `lists::exec` (as `GetHd`/`GetTl` still are) makes the family re-match the
+        // variant the router just proved — a second jump table — and re-derive the
+        // operand references the arm already has. `lists::exec` stays this family's
+        // complete ownership statement and calls the very same bodies, so a claim and
+        // its behaviour cannot drift apart.
+        Instr::PutList { head, tail, dst } => lists::put_list(machine, head, tail, dst, ctx),
+        Instr::GetList { source, head, tail } => {
+            lists::get_list(machine, module, source, head, tail, ctx)
+        }
+        Instr::GetHd { .. } | Instr::GetTl { .. } => {
             lists::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // funs
@@ -226,11 +245,21 @@ pub(crate) fn dispatch(
     };
     match claimed? {
         Some(step) => Ok(step),
-        None => Err(error::unsupported(&format!(
-            "{UNCLAIMED_PREFIX}: {}",
-            instr_name(instr)
-        ))),
+        None => Err(unclaimed(instr)),
     }
+}
+
+/// The documented sentinel for an instruction **no** family claims.
+///
+/// Outlined out of [`dispatch`] (`#[cold]` + `#[inline(never)]`) because it is the
+/// only arm that builds a `String` (`format!` for the reason atom): left inline it
+/// forces the router's frame to carry the formatting machinery and keeps a heap
+/// allocation path in the middle of the hot text, for a diagnostic no correct
+/// instruction ever reaches.
+#[cold]
+#[inline(never)]
+fn unclaimed(instr: &Instr) -> beam_common::BeamError {
+    error::unsupported(&format!("{UNCLAIMED_PREFIX}: {}", instr_name(instr)))
 }
 
 /// The `ops.tab`/C spelling of the instruction [`dispatch`] could not claim.
