@@ -305,8 +305,9 @@ by construction).
   is what makes the file cohesive — each arm is one `try_inline_*` call plus an `emit_deopt` fallback —
   so splitting it further would scatter one decision across files or require inventing a visitor/table
   abstraction the emitter does not need. The block prologue it emits first is `prologue.rs`; the other
-  files are under the ~1000-line guidance (`test.rs` 963, `compile.rs` 892, `mod.rs` 401, `aggregate.rs`
-  744, …).
+  files are near or under the ~1000-line guidance (`test.rs` 979, `compile.rs` 1009, `aggregate.rs` 761,
+  `link.rs` 1137, `move.rs` 774, `mod.rs` 442, `regs.rs` 385, `liveness.rs` 154) — `link.rs` and
+  `compile.rs` exceed it by a little; neither is a single-scatter candidate today.
 - **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
