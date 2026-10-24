@@ -24,7 +24,7 @@ Frozen widths: `SMALL_BITS=60` (`MAX_SMALL=(1<<59)-1`), `PID_NUM_SIZE=28`, `PID_
 
 ### `atom.rs`
 `pub struct Atom(u32)`; `ATOM_INDEX_BITS = 6`; `MAX_ATOM_INDEX = 2^58-1`; `Atom::MAX` = `u32::MAX`.
-`AtomTable` assigns indices **in insertion order from 0**, one per distinct name, reproducing `atom.names`, and exposes `hvalue` plus the witness `generation`/`snapshot`/`appended_since` ([contract below](#atom-table-snapshots--the-o1-append-only-memo-witness)).
+`AtomTable` assigns indices **in insertion order from 0**, one per distinct name, reproducing `atom.names`, and exposes `hvalue`, the witness `generation`/`snapshot`/`appended_since` ([contract below](#atom-table-snapshots--the-o1-append-only-memo-witness)), and `fork(&self) -> AtomTable` — the Θ(1)-allocation whole-table copy for a consumer that may append but must not deep-copy Θ(N) strings (`Clone` stays the deliberate deep copy).
 - `hvalue` is the C `atom_tab(a)->slot.bucket.hvalue` (Dragon-Book `hashpjw` over the UTF-8 name bytes + the latin1 clutch, `atom.c:82`) — the value `make_hash`/`make_hash2` mix for an atom; out-of-range falls back to `a.raw()`.
   The `atom.names` parser is a callback tokenizer, so seeding allocates one `Arc<str>` per name and no throw-away `Vec<String>`.
 - **Backing store** `{ names: Vec<Arc<str>>, index: HashMap<Arc<str>, Atom>, instance: u64, generation: u64 }`: a name is stored **once** as an `Arc<str>` (`Arc`, not `Rc`, so the table stays `Send + Sync`), so `name` is **O(1)**, `intern` allocates **exactly one** `Arc<str>` for a novel name and **nothing** for a known one, and `clone()` is a deliberate Θ(N) deep copy with a fresh `instance` (Design Decisions) — never on a hot path.
