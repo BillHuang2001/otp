@@ -51,8 +51,58 @@ impl CodeBuffer {
 
     /// `mov dst, [base + disp]` — a 64-bit load.
     pub fn mov_rm(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
-        self.emit_rex(true, ext(dst), 0, ext(base))?;
+        self.emit_mov_rm(true, dst, base, disp)
+    }
+
+    /// `mov dst32, [base + disp]` — a **32-bit** load that clears the destination's
+    /// upper 32 bits.
+    ///
+    /// Same `8B /r` opcode as [`Self::mov_rm`] with the `REX.W` bit **clear**: x86-64
+    /// defines every 32-bit register write to zero-extend into the 64-bit register,
+    /// so `dst` reads as `(loaded u32) as u64` — never a sign-extended or stale high
+    /// half. A `REX` prefix is still emitted when a register at or above `r8` is
+    /// involved (`REX.R`/`REX.B`), just without `W`.
+    pub fn mov_rm32(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_mov_rm(false, dst, base, disp)
+    }
+
+    /// `movzx dst, byte [base + disp]` — an 8-bit load zero-extended into the 64-bit
+    /// destination (`REX.W 0F B6 /r`).
+    ///
+    /// The point of the instruction is the **zero** extension: the byte is read
+    /// unsigned, so a source byte of `0xFF` yields `0xFF`, not `-1` (a sign-extending
+    /// `movsx` would produce `0xFFFF_FFFF_FFFF_FFFF`). The upper 56 bits of `dst` are
+    /// 0 afterwards, and only the addressed byte is read — the neighbouring bytes are
+    /// not touched (`REX.W` selects the 64-bit destination width; the `0F B6` opcode
+    /// fixes the 8-bit source width).
+    pub fn movzx_byte(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_movzx(0xB6, dst, base, disp)
+    }
+
+    /// `movzx dst, word [base + disp]` — a 16-bit load zero-extended into the 64-bit
+    /// destination (`REX.W 0F B7 /r`).
+    ///
+    /// As with [`Self::movzx_byte`] the extension is unsigned: a source word of
+    /// `0xFFFF` yields `0xFFFF`, not `-1`. The upper 48 bits of `dst` are 0
+    /// afterwards, and only the two addressed bytes are read.
+    pub fn movzx_word(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_movzx(0xB7, dst, base, disp)
+    }
+
+    /// Emits the register-from-memory `mov` (`8B /r`) in the width `w` selects:
+    /// `REX.W` for the 64-bit form, a bare `REX` (or none) for the 32-bit one.
+    fn emit_mov_rm(&mut self, w: bool, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_rex(w, ext(dst), 0, ext(base))?;
         self.emit_u8(0x8B)?;
+        self.emit_mem_modrm(dst, base, disp)
+    }
+
+    /// Emits the `movzx` family: `REX.W` + the `0F` opcode `op`
+    /// (`B6` = byte, `B7` = word) + the `ModRM`/`disp32` memory operand.
+    fn emit_movzx(&mut self, op: u8, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_rex(true, ext(dst), 0, ext(base))?;
+        self.emit_u8(0x0F)?;
+        self.emit_u8(op)?;
         self.emit_mem_modrm(dst, base, disp)
     }
 
@@ -168,24 +218,62 @@ impl CodeBuffer {
         self.emit_shift_ri(7, dst, imm)
     }
 
+    /// `shr dst, imm` — a **logical** (zero-filling) shift right by an immediate
+    /// (`REX.W C1 /5 ib`).
+    ///
+    /// The counterpart of [`Self::sar_ri`]: the vacated high bits are filled with 0,
+    /// so a negative value shifts as the unsigned bit pattern it is (a `shr` by 1 of
+    /// `-1` is `i64::MAX`, where a `sar` by 1 stays `-1`). The count is a `u8`
+    /// because the encoding's immediate is one byte.
+    pub fn shr_ri(&mut self, dst: Reg, imm: u8) -> Result<()> {
+        self.emit_shift_ri(5, dst, u32::from(imm))
+    }
+
     /// `shl dst, imm` — a logical shift left.
     pub fn shl_ri(&mut self, dst: Reg, imm: u32) -> Result<()> {
         self.emit_shift_ri(4, dst, imm)
     }
 
-    /// Emits the `C1 /n ib` shift form: `REX.W`, the opcode, a `ModRM` whose `reg`
-    /// field is the shift kind (`4` = left, `7` = arithmetic right), and the 8-bit
-    /// count.
+    /// `shr dst, cl` — a logical shift right by the count in `cl` (`REX.W D3 /5`).
     ///
-    /// Only this immediate form is supported: a count above `u8::MAX` would need
-    /// the `cl`-form (`D3 /n`), so it is rejected as an API misuse (`BadArg`)
-    /// rather than encoded.
+    /// The caller is responsible for the count: `cl`, the low byte of `rcx`, must
+    /// already hold it (the other 56 bits of `rcx` are ignored). The CPU masks the
+    /// count to 6 bits for a 64-bit operand, so a count of 64 shifts by 0 and a count
+    /// of 65 shifts by 1 — it is never out of range and never traps.
+    pub fn shr_cl(&mut self, dst: Reg) -> Result<()> {
+        self.emit_shift_cl(5, dst)
+    }
+
+    /// `shl dst, cl` — a logical shift left by the count in `cl` (`REX.W D3 /4`).
+    ///
+    /// Same count contract as [`Self::shr_cl`]: `cl` holds the count and the CPU masks
+    /// it to 6 bits for a 64-bit operand.
+    pub fn shl_cl(&mut self, dst: Reg) -> Result<()> {
+        self.emit_shift_cl(4, dst)
+    }
+
+    /// Emits the `C1 /n ib` shift form: `REX.W`, the opcode, a `ModRM` whose `reg`
+    /// field is the shift kind (`4` = left, `5` = logical right, `7` = arithmetic
+    /// right), and the 8-bit count.
+    ///
+    /// Only this immediate form is supported by this helper: a count above
+    /// `u8::MAX` would need the `cl`-form (`D3 /n`), so it is rejected as an API
+    /// misuse (`BadArg`) rather than encoded — [`Self::shr_cl`]/[`Self::shl_cl`] are
+    /// the encoders for a run-time count.
     fn emit_shift_ri(&mut self, op: u8, dst: Reg, imm: u32) -> Result<()> {
         let imm = u8::try_from(imm).map_err(|_| BeamError::BadArg)?;
         self.emit_rex(true, 0, 0, ext(dst))?;
         self.emit_u8(0xC1)?;
         self.emit_u8(0xC0 | ((op & 0x7) << 3) | (dst.code() & 0x7))?;
         self.emit_u8(imm)
+    }
+
+    /// Emits the `D3 /n` shift-by-`cl` form: `REX.W`, the opcode, and a `ModRM` whose
+    /// `reg` field is the shift kind and whose `r/m` field is the shifted register.
+    fn emit_shift_cl(&mut self, op: u8, dst: Reg) -> Result<()> {
+        self.emit_rex(true, 0, 0, ext(dst))?;
+        self.emit_u8(0xD3)?;
+        self.emit_u8(0xC0 | ((op & 0x7) << 3) | (dst.code() & 0x7))
     }
 
     // -- stack ---------------------------------------------------------------

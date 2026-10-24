@@ -566,3 +566,236 @@
         buf.int3().unwrap();
         assert_eq!(buf.len(), 2);
     }
+
+    #[test]
+    fn emits_shr_ri_as_a_logical_shift() {
+        // `g(a) = a >> 8` — a **logical** (zero-filling) right shift, so a negative
+        // value shifts as the unsigned bit pattern it is. `0xC1 /5 ib` with `REX.W`.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.shr_ri(Reg::Rax, 8).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let g: extern "C" fn(i64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(
+            g(0x1234_5678_9ABC_DEF0_u64 as i64),
+            0x0012_3456_789A_BCDE_u64 as i64,
+            "bits from the low byte go and the bytes above move down"
+        );
+        assert_eq!(g(0x00FF_0000_0000_0000), 0x0000_FF00_0000_0000);
+        // The whole point of `shr` versus `sar`: the vacated high bits are 0, so a
+        // negative operand becomes a huge **positive** one.
+        assert_eq!(g(-1), (u64::MAX >> 8) as i64);
+        assert_eq!(g(i64::MIN), 1 << 55, "the sign bit itself moves down");
+        // …where the arithmetic form keeps the sign.
+        let mut sar = CodeBuffer::new().unwrap();
+        sar.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        sar.sar_ri(Reg::Rax, 8).unwrap();
+        sar.ret().unwrap();
+        sar.seal().unwrap();
+        let arithmetic: extern "C" fn(i64) -> i64 = sar.as_fn_ptr();
+        assert_eq!(arithmetic(-1), -1);
+        assert_eq!(arithmetic(-256), -1);
+
+        // The encoding: `REX.W C1 /5 ib`, with `REX.B` for `r8`-`r15`.
+        let mut plain = CodeBuffer::new().unwrap();
+        plain.shr_ri(Reg::Rax, 8).unwrap();
+        assert_eq!(emitted(&plain), vec![0x48, 0xC1, 0xE8, 0x08]);
+        let mut extended = CodeBuffer::new().unwrap();
+        extended.shr_ri(Reg::R9, 1).unwrap();
+        assert_eq!(
+            emitted(&extended),
+            vec![0x49, 0xC1, 0xE9, 0x01],
+            "REX.B for r9"
+        );
+    }
+
+    #[test]
+    fn emits_shr_cl_and_shl_cl() {
+        // `g(v, n) = v >> n` and `h(v, n) = v << n` with the count in `cl` — the
+        // register-count forms (`D3 /5` and `D3 /4`), whose count the CPU masks to
+        // 6 bits for a 64-bit operand.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap(); // value
+        buf.mov_rr(Reg::Rcx, Reg::Rsi).unwrap(); // count -> cl
+        buf.shr_cl(Reg::Rax).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let shr: BinOp = buf.as_fn_ptr();
+        assert_eq!(shr(0x100, 4), 0x10);
+        assert_eq!(
+            shr(0x1234_5678_9ABC_DEF0_u64 as i64, 8),
+            0x0012_3456_789A_BCDE
+        );
+        assert_eq!(shr(-1, 1), i64::MAX, "logical, not arithmetic");
+        assert_eq!(shr(-8, 3), (u64::MAX >> 3) as i64);
+        // The count is masked mod 64: 64 shifts by 0, 65 by 1, 68 by 4.
+        assert_eq!(shr(1, 0), 1);
+        assert_eq!(shr(1, 64), 1);
+        assert_eq!(shr(1, 65), 0);
+        assert_eq!(shr(0x100, 68), 0x10);
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.mov_rr(Reg::Rcx, Reg::Rsi).unwrap();
+        buf.shl_cl(Reg::Rax).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let shl: BinOp = buf.as_fn_ptr();
+        assert_eq!(shl(1, 4), 16);
+        assert_eq!(shl(1, 60), 1 << 60);
+        assert_eq!(shl(-1, 1), -2);
+        assert_eq!(shl(1, 68), 16, "masked to 4");
+        assert_eq!(shl(0x5, 0), 0x5);
+
+        // The encodings: `REX.W D3 /n`, `REX.B` for `r8`-`r15`.
+        let mut plain = CodeBuffer::new().unwrap();
+        plain.shr_cl(Reg::Rax).unwrap();
+        assert_eq!(emitted(&plain), vec![0x48, 0xD3, 0xE8]);
+        let mut left = CodeBuffer::new().unwrap();
+        left.shl_cl(Reg::Rax).unwrap();
+        assert_eq!(emitted(&left), vec![0x48, 0xD3, 0xE0]);
+        let mut extended = CodeBuffer::new().unwrap();
+        extended.shr_cl(Reg::R15).unwrap();
+        assert_eq!(emitted(&extended), vec![0x49, 0xD3, 0xEF], "REX.B for r15");
+    }
+
+    #[test]
+    fn emits_movzx_byte_and_word_without_sign_extension() {
+        // A buffer whose every untouched byte is 0xFF, with one 0x80 byte at `[2]` and
+        // the word 0x1234 at `[3]`. An over-wide or sign-extending load cannot hide:
+        // 0x80 read unsigned is 128, and any neighbour byte would land in the result.
+        let mut bytes = [0xFF_u8; 16];
+        bytes[2] = 0x80;
+        bytes[3] = 0x34;
+        bytes[4] = 0x12;
+        let ptr = bytes.as_ptr();
+        // 8 bytes starting at `[2]`, little-endian: 0x80, 0x34, 0x12 then five 0xFF.
+        let wide = 0xFFFF_FFFF_FF12_3480_u64 as i64;
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.movzx_byte(Reg::Rax, Reg::Rdi, 2).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let byte_load: extern "C" fn(*const u8) -> i64 = buf.as_fn_ptr();
+        assert_eq!(byte_load(ptr), 0x80, "the 0x80 byte is zero-extended");
+        assert_ne!(byte_load(ptr), -128, "…not sign-extended");
+        assert_ne!(byte_load(ptr), wide, "…and no neighbour byte is read");
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.movzx_word(Reg::Rax, Reg::Rdi, 3).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let word_load: extern "C" fn(*const u8) -> i64 = buf.as_fn_ptr();
+        assert_eq!(word_load(ptr), 0x1234);
+        // The same address read as a word through an all-0xFF pair proves the size is
+        // honoured without a sign bit to confuse the picture: 0xFFFF comes back as
+        // 0xFFFF (65 535), not as -1.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.movzx_word(Reg::Rax, Reg::Rdi, 5).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let all_ones: extern "C" fn(*const u8) -> i64 = buf.as_fn_ptr();
+        assert_eq!(all_ones(ptr), 0xFFFF);
+
+        // The control: the 64-bit load at the same address *does* pick up the
+        // neighbours, so the narrow loads above are demonstrably narrower.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rm(Reg::Rax, Reg::Rdi, 2).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let full_load: extern "C" fn(*const u8) -> i64 = buf.as_fn_ptr();
+        assert_eq!(full_load(ptr), wide);
+
+        // The sources are untouched (the loads only read).
+        assert_eq!(bytes[2], 0x80);
+        assert_eq!(&bytes[0..2], &[0xFF, 0xFF]);
+        assert_eq!(bytes[5], 0xFF);
+
+        // The encodings: `REX.W 0F B6 /r` and `REX.W 0F B7 /r`, sharing the memory
+        // `ModRM`/`disp32` path (so an `r12` base still forces its `SIB` byte).
+        let mut plain = CodeBuffer::new().unwrap();
+        plain.movzx_byte(Reg::Rax, Reg::Rdi, 2).unwrap();
+        assert_eq!(
+            emitted(&plain),
+            vec![0x48, 0x0F, 0xB6, 0x87, 0x02, 0x00, 0x00, 0x00]
+        );
+        let mut word = CodeBuffer::new().unwrap();
+        word.movzx_word(Reg::Rax, Reg::Rdi, 3).unwrap();
+        assert_eq!(
+            emitted(&word),
+            vec![0x48, 0x0F, 0xB7, 0x87, 0x03, 0x00, 0x00, 0x00]
+        );
+        let mut extended = CodeBuffer::new().unwrap();
+        extended.movzx_byte(Reg::R9, Reg::R12, 0).unwrap();
+        assert_eq!(
+            emitted(&extended),
+            vec![0x4D, 0x0F, 0xB6, 0x8C, 0x24, 0x00, 0x00, 0x00, 0x00],
+            "REX.W+REX.R+REX.B and the SIB byte an r12 base forces"
+        );
+    }
+
+    #[test]
+    fn emits_mov_rm32_which_clears_the_upper_half() {
+        // A word whose low 32 bits are 0x60 and whose high 32 bits are garbage: the
+        // 32-bit load must return exactly 0x60 because x86-64 zero-extends every
+        // 32-bit register write.
+        let garbage = 0xFFFF_FFFF_0000_0060_u64;
+        let ptr = &garbage as *const u64;
+
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rm32(Reg::Rax, Reg::Rdi, 0).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let narrow: extern "C" fn(*const u64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(narrow(ptr), 0x60);
+        assert_eq!(narrow(ptr) as u64 & 0xFFFF_FFFF_0000_0000, 0);
+
+        // The same address through the 64-bit load keeps the garbage, so the two forms
+        // are demonstrably different widths of the same `8B /r` opcode.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rm(Reg::Rax, Reg::Rdi, 0).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let wide: extern "C" fn(*const u64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(wide(ptr) as u64, 0xFFFF_FFFF_0000_0060);
+
+        // The displacement is honoured too (a two-word array, second element read).
+        let words = [0xFFFF_FFFF_0000_0001_u64, 0xDEAD_BEEF_0000_002A_u64];
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rm32(Reg::Rax, Reg::Rdi, 8).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        let second: extern "C" fn(*const u64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(second(words.as_ptr()), 0x2A);
+
+        // The encoding: `8B /r` **without** `REX.W` — identical to `mov_rm`'s bytes
+        // minus the one `REX.W` prefix byte — and a bare `REX` (no `W`) whenever a
+        // register at or above `r8` is involved.
+        let mut narrow = CodeBuffer::new().unwrap();
+        narrow.mov_rm32(Reg::Rax, Reg::Rdi, 0).unwrap();
+        assert_eq!(emitted(&narrow), vec![0x8B, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        let mut wide = CodeBuffer::new().unwrap();
+        wide.mov_rm(Reg::Rax, Reg::Rdi, 0).unwrap();
+        assert_eq!(
+            emitted(&wide),
+            vec![0x48, 0x8B, 0x87, 0x00, 0x00, 0x00, 0x00],
+            "mov_rm keeps its own REX.W bytes"
+        );
+        assert_eq!(narrow.len() + 1, wide.len());
+        let mut dst_ext = CodeBuffer::new().unwrap();
+        dst_ext.mov_rm32(Reg::R9, Reg::Rdi, 0).unwrap();
+        assert_eq!(
+            emitted(&dst_ext),
+            vec![0x44, 0x8B, 0x8F, 0x00, 0x00, 0x00, 0x00],
+            "REX.R without REX.W for an r9 destination"
+        );
+        let mut base_ext = CodeBuffer::new().unwrap();
+        base_ext.mov_rm32(Reg::Rax, Reg::R12, 0).unwrap();
+        assert_eq!(
+            emitted(&base_ext),
+            vec![0x41, 0x8B, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00],
+            "REX.B without REX.W for an r12 base, plus its SIB byte"
+        );
+    }
