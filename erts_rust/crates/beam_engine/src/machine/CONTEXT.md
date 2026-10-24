@@ -334,7 +334,7 @@ What the root set is **made of** and what it provably leaves out — the invaria
   pinned by the `bif` unit test beside the wide-marshalling proof.
 - **Two root-enumeration doors, one parking implementation.** `Machine::for_each_root_mut` — the writable
   (relocating) door — IS one `with_roots` hand-off: same `used_x_extent`/`used_fr_extent` widths, same
-  `note_x_dirty`/`note_fr_dirty` notes, same `with_parked_loose_terms`/`seat_loose_heap_terms` discipline, and it
+  `x_dirty`/`fr_dirty` extent stores, same `with_parked_loose_terms`/`seat_loose_heap_terms` discipline, and it
   visits the `RootSet`'s three **disjoint** slices one at a time (so the visitor cannot alias one root file while
   it is handed another). Its error path is the parking's too: the walk stops at the failing slice (the later ones
   are never handed over), the stack is truncated and all five loose fields re-seated, and only then does the
