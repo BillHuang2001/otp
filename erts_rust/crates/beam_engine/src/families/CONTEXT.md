@@ -13,7 +13,10 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 (`mod.rs:206`), which is the family's own statement of its variant set (see API Surface).
 
 ## API Surface
-- `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
+- `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:124`.
+- `pub(crate) fn lists::put_list(machine, head, tail, dst, ctx)` / `lists::get_list(machine, module, source,
+  head, tail, ctx)` — both `-> Result<Option<Step>>`, the two bodies the router's hot fast-path arms call
+  directly (see Notes for Agents); `lists::exec` calls the same two, so ownership cannot drift.
 - `pub(crate) fn bitstrings::claimed(&Instr) -> bool` (`bitstrings/mod.rs:135`) — the bitstring family's **one**
   statement of the 20 `Bs*` variants it owns. `dispatch` routes on it, and so do the native baseline tier's
   emitted arm (`jit/baseline/emit/block.rs`) and its in-block helper (`jit/baseline/bitstr.rs`), so the
