@@ -281,7 +281,7 @@ fn loads_and_drives_a_real_c_driver_through_the_threads_family() {
 
     // --- the port and the private state ---------------------------------------------------------
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command_line = std::ffi::CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; the command is NUL-ended.

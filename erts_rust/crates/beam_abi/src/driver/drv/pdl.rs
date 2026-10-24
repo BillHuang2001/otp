@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn pdl_refcount_follows_the_c_sequence() {
         let mut host = TestHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` came from `env.as_port()` on this live env.
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn pdl_create_admits_one_pdl_per_port_and_rejects_a_duplicate_handle() {
         let mut host = TestHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` came from `env.as_port()` on this live env.
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn a_pdl_serialises_two_contending_threads() {
         let mut host = TestHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // SAFETY: `port` came from `env.as_port()` on this live env.
@@ -971,7 +971,7 @@ mod tests {
     fn driver_monitor_process_registers_and_reports_the_c_result_codes() {
         let mut host = TestHost::new();
         let pid = TestHost::pid();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut mon = monitor(0);
         let mut other = monitor(0);
@@ -1019,7 +1019,7 @@ mod tests {
     fn the_three_way_monitor_result_maps_onto_the_c_reason_codes() {
         let mut host = TestHost::new();
         let pid = TestHost::pid();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
 
         // --- `MonitorResult::Ok` -> the C's `0`, holder filled (`io.c:7037`) ---------------------
@@ -1069,7 +1069,7 @@ mod tests {
     fn driver_get_monitored_process_and_demonitor_round_trip() {
         let mut host = TestHost::new();
         let pid = TestHost::pid();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         let mut mon = monitor(0);
 

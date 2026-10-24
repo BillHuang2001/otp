@@ -267,7 +267,7 @@ fn loads_and_drives_a_real_c_driver() {
 
     // --- the port/state and the callbacks -------------------------------------------------------
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
 

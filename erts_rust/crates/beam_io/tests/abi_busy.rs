@@ -116,7 +116,7 @@ fn the_set_busy_port_hook_records_and_clears_the_flag_and_answers_zero() {
         .expect("a driver heap");
     assert!(!host.is_busy(), "a fresh port is idle");
 
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // `void set_busy_port(ErlDrvPort, int)` — the callback is `void`, so the hook's `0` is the only
@@ -159,7 +159,7 @@ fn the_fixture_sets_the_busy_state_at_start_and_through_its_control_verbs() {
     let mut host = AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "host_driver", true)
         .expect("a driver heap");
 
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
 
     // The `busy` start token: `host_start` runs `set_busy_port(port, 1)` itself, so the port is busy

@@ -41,6 +41,39 @@
 //! an `ErlDrvEntry *` (`io.c:7640`, `io.c:7698`) — so there is no [`DriverEnv`] to recover a host
 //! from. [`with_current_host`] (re-exported here from [`crate::driver::current_host`]) is the scoped
 //! publication the runtime wraps those entry points in, so they can reach a [`DriverHost`].
+//!
+//! # The aliasing contract (why every accessor here takes `&self`)
+//!
+//! A driver callback is C: it reaches emulator state through the `ErlDrvPort` it was handed, and the
+//! Rust side reaches the *same* host at the same time. That is the C model, and it is **not**
+//! expressible with a Rust `&mut`: a live `&mut dyn DriverHost` anywhere in the call graph (an
+//! argument of the enclosing Rust function, say) tells the optimiser that nothing else writes the
+//! host for the duration of that call, so the callback's stores through [`DriverEnv`]'s own pointer
+//! become *unobservable* and are legally dropped. Measured consequence (release profile only): a
+//! host field written by a real C fixture's `driver_output`/`erl_drv_monitor_process` read back as
+//! unchanged — a silent no-op, not a wrong value and not a crash (debug keeps the stores, because
+//! nothing is optimised).
+//!
+//! The rule, therefore, and the reason [`DriverEnv::host`], [`DriverEnv::heap`],
+//! [`DriverEnv::as_port`] and [`DriverEnv::from_port`] all take `&self`:
+//!
+//! * **the environment's pointer is the one sanctioned route to the host** — reach it with
+//!   [`DriverEnv::host`]/[`DriverEnv::heap`] (or the bound [`DriverEnv::with_host`], or
+//!   [`DriverEnv::with_host_as`] for the caller's concrete type) and treat the host as *interior
+//!   mutable* from then on;
+//! * **never hold a `&`/`&mut` to the host itself across a call into the driver.** Hand the host to
+//!   [`DriverEnv::new`], keep the env, and read host state back through the env (a `Box`ed host whose
+//!   *contents* the caller does not reference is fine, but the env route is the one that is sound by
+//!   construction);
+//! * the state a *callback* publishes must live behind interior mutability (`Cell`/`RefCell`/…, the
+//!   shape `beam_rt`'s `DriverPort` and `beam_io`'s `AbiHost` already use) — plain fields mutated
+//!   through the env's `&mut` view are visible to reads that also go through the env, which is all
+//!   [`DriverEnv::new`] can promise.
+//!
+//! `unsafe` stays confined to [`DriverEnv::host`] (the one raw deref), [`DriverEnv::from_port`] and
+//! [`decode_term_spec`]'s operand readers, each with a `# Safety` section / `// SAFETY:` rationale
+//! (workspace `CONTEXT.md` §3). [`DriverEnv::with_host_as`] recovers the caller's concrete host type
+//! **without** `unsafe`, through the object-safe [`AsAnyHost`] upcast.
 
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
@@ -151,8 +184,32 @@ pub enum MonitorResult {
     Error,
 }
 
+/// The object-safe `&mut dyn Any` upcast every [`DriverHost`] provides.
+///
+/// Rust's **trait upcasting** (`dyn Sub` → `dyn Super`) is not stable, so a `dyn DriverHost` cannot
+/// be cast to `dyn Any` to recover its concrete type — yet that recovery is exactly what a runtime
+/// (and every A.4 test host) needs: the caller hands its host to [`DriverEnv::new`], the C fixture
+/// drives callbacks into it, and the caller then reads *its own* state back through
+/// [`DriverEnv::with_host_as`]. This helper trait is the standard workaround: the blanket impl below
+/// covers every `'static` host, so no host writes a line of glue and the recovery stays `unsafe`-free
+/// (the consumers — `beam_rt`, `beam_io` and the A.4 tests — compile under `#![deny(unsafe_code)]`).
+///
+/// It is a *supertrait* of [`DriverHost`] only to make the coercion available inside the trait
+/// object's vtable; it carries no behaviour of its own.
+pub trait AsAnyHost {
+    /// `self` as a `dyn Any` trait object ([`downcast_mut`](core::any::Any::downcast_mut) recovers
+    /// the concrete type).
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+}
+
+impl<T: core::any::Any> AsAnyHost for T {
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
 /// Services the runtime provides to the `erl_drv_*` implementations of one port.
-pub trait DriverHost {
+pub trait DriverHost: AsAnyHost {
     /// The term-allocation arena for the duration of the current call. Must not reallocate while the
     /// driver holds a pointer into it (see [`beam_alloc::Heap`]).
     fn heap(&mut self) -> &mut Heap;
@@ -698,9 +755,12 @@ pub fn is_invalid_port_handle(port: ErlDrvPort) -> bool {
 /// The concrete per-port driver environment behind the C-facing opaque `*mut ErlDrvPort_`.
 ///
 /// Holds a raw pointer to the host, so the environment itself is lifetime-free and can be recovered
-/// from the opaque C pointer by [`DriverEnv::from_port`] (see the module docs).
+/// from the opaque C pointer by [`DriverEnv::from_port`] (see the module docs). The raw pointer is
+/// also what keeps the C's aliasing model intact: a driver callback reaches the host through **this**
+/// pointer, so no Rust reference to the host may be live while a callback can run (module docs →
+/// *The aliasing contract*).
 pub struct DriverEnv {
-    /// The host, borrowed for the lifetime of this environment.
+    /// The host, reached through this pointer only.
     ///
     /// A raw fat pointer rather than `&'a mut dyn DriverHost`: the C side only ever sees
     /// `*mut ErlDrvPort_`, and the recover path ([`DriverEnv::from_port`]) has no way to name the
@@ -712,6 +772,12 @@ pub struct DriverEnv {
 
 impl DriverEnv {
     /// Wrap `host` in a fresh per-port environment.
+    ///
+    /// Handing the host over here is the **last** time it may be touched through a Rust reference:
+    /// from now on every access goes through the environment (module docs → *The aliasing
+    /// contract*). The borrow itself ends with this call (the environment is lifetime-free), which is
+    /// what lets a caller keep using `host` *after* the session — a plain read with no callback in
+    /// flight is ordinary raw-pointer laundering and is sound.
     pub fn new(host: &mut dyn DriverHost) -> DriverEnv {
         // SAFETY: the only thing reinterpreted here is the erased trait-object lifetime. The
         // C-facing env has no lifetime parameter (`struct _erl_drv_port` is plain C), so the
@@ -722,27 +788,55 @@ impl DriverEnv {
         // word), and `mem::transmute` between them is a bit-preserving cast, so the caller's borrow
         // is reproduced exactly by `DriverEnv::host`. The caller must keep the host alive for as
         // long as the environment is used (`DriverEnv` is not `Clone`, so there is exactly one
-        // handle).
+        // handle), and must not hold a reference to the host itself while a driver callback can run.
         let host: *mut dyn DriverHost = unsafe { core::mem::transmute(host) };
         DriverEnv { host }
     }
 
-    /// Reborrow the host (the env borrows the host for its lifetime).
-    pub fn host(&mut self) -> &mut dyn DriverHost {
+    /// Reborrow the host through the environment's own pointer — the one sanctioned route.
+    ///
+    /// Takes `&self` on purpose: a `&mut self` receiver would force every caller (and every test
+    /// session) to hold a `&mut DriverEnv` across the driver call, and the whole point of the raw
+    /// pointer is that nothing exclusive is outstanding while C is running (module docs → *The
+    /// aliasing contract*). The returned borrow is tied to `&self`, so it cannot outlive the env.
+    ///
+    /// Do not hold two of these at once, and do not hold one across a call into the driver.
+    pub fn host(&self) -> &mut dyn DriverHost {
         // SAFETY: `host` was produced from a live `&mut dyn DriverHost` in `new` (or a previous
-        // `host`/`as_port`/`from_port` round-trip), and `DriverEnv` is not `Clone`, so this is the
-        // only outstanding handle to it; the returned reborrow is tied to `&mut self`.
+        // `host`/`as_port`/`from_port` round-trip) and carries write provenance for that host, and
+        // `DriverEnv` is not `Clone`, so this is the only outstanding handle to it. The borrow is
+        // tied to `&self`; the caller's contract (module docs) is that no *other* reference to the
+        // host is live at this point, which is exactly the condition for the reborrow to be sound.
         unsafe { &mut *self.host }
     }
 
     /// Convenience: `self.host().heap()`.
-    pub fn heap(&mut self) -> &mut Heap {
+    pub fn heap(&self) -> &mut Heap {
         self.host().heap()
     }
 
-    /// The C-facing opaque port pointer. Casts `self as *mut DriverEnv as *mut ErlDrvPort_`.
-    pub fn as_port(&mut self) -> ErlDrvPort {
-        self as *mut DriverEnv as *mut ErlDrvPort_
+    /// The caller's **concrete** host type, recovered through the environment's pointer.
+    ///
+    /// `None` when this environment's host is not a `T` (the environment belongs to another port).
+    /// This is the accessor a session that must read host state *back* after a driver callback uses:
+    /// the read goes through the same pointer the callback wrote through, so the two cannot be
+    /// reordered (module docs → *The aliasing contract*). `unsafe`-free — see [`AsAnyHost`].
+    pub fn host_as<T: DriverHost + 'static>(&self) -> Option<&mut T> {
+        self.host().as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Run `f` with exclusive access to the caller's concrete host type, then drop the borrow.
+    ///
+    /// The scoped form of [`DriverEnv::host_as`]: the `&mut T` never escapes, so it also cannot be
+    /// held across a driver call, and the alias-free window is the closure body. Prefer this when
+    /// reading host state between callback-drives.
+    pub fn with_host_as<T: DriverHost + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.host_as::<T>().map(f)
+    }
+
+    /// The C-facing opaque port pointer. Casts `self as *const DriverEnv as *mut ErlDrvPort_`.
+    pub fn as_port(&self) -> ErlDrvPort {
+        self as *const DriverEnv as *mut ErlDrvPort_
     }
 
     /// Recover the concrete env from an opaque port pointer.
@@ -753,14 +847,19 @@ impl DriverEnv {
     /// still alive (and whose host is still alive). Returns `None` for any operand that names no
     /// environment — `NULL` and the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`], the one
     /// predicate [`is_invalid_port_handle`] — so neither is ever dereferenced.
-    pub unsafe fn from_port<'a>(port: ErlDrvPort) -> Option<&'a mut DriverEnv> {
+    ///
+    /// A **shared** reference is returned on purpose: the C entry points only ever read the env (its
+    /// single field is fixed at construction) and reach the host through [`DriverEnv::host`], so a
+    /// `&mut DriverEnv` here would be a second exclusive borrow of an object a live caller may still
+    /// name — the aliasing hazard the module docs describe, one level down.
+    pub unsafe fn from_port<'a>(port: ErlDrvPort) -> Option<&'a DriverEnv> {
         if is_invalid_port_handle(port) {
             return None;
         }
         // SAFETY: the caller guarantees `port` came from `DriverEnv::as_port` on a live env, i.e. it
         // is a `*mut DriverEnv` with the provenance required to reborrow the same allocation; `'a`
         // is the caller's promise that the env outlives the returned reference.
-        Some(unsafe { &mut *(port as *mut DriverEnv) })
+        Some(unsafe { &*(port as *const DriverEnv) })
     }
 }
 
@@ -810,7 +909,7 @@ impl DriverEnv {
 ///   astronomically large copy. `ERL_DRV_BINARY`'s `size`/`offset` are read as full words and
 ///   bounds-checked against the binary's `orig_size`, and `ERL_DRV_EXT2TERM`'s `size` as a full-word
 ///   `Sint` rejected when `<= 0` — exactly as the C does (`io.c:5758`, `io.c:5834`).
-pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<Eterm> {
+pub fn decode_term_spec(env: &DriverEnv, spec: &[ErlDrvTermData]) -> Option<Eterm> {
     // The intermediate value stack (the C's `ESTACK_PUSH`/`ESTACK_POP`).
     let mut stack: Vec<Eterm> = Vec::new();
     let mut ix = 0usize;
@@ -1101,7 +1200,7 @@ unsafe fn driver_binary_bytes<'a>(
 }
 
 /// A list of small ints from `bytes` (unsigned, as the C's `buf_to_intlist`), ending in `tail`.
-fn byte_list(env: &mut DriverEnv, bytes: &[u8], tail: Eterm) -> Option<Eterm> {
+fn byte_list(env: &DriverEnv, bytes: &[u8], tail: Eterm) -> Option<Eterm> {
     let mut acc = tail;
     for &byte in bytes.iter().rev() {
         acc = env.heap().cons(prelude::make_small(byte as i64), acc).ok()?;
@@ -1110,7 +1209,7 @@ fn byte_list(env: &mut DriverEnv, bytes: &[u8], tail: Eterm) -> Option<Eterm> {
 }
 
 /// An on-heap byte-aligned binary term from `bytes` (`None` on heap exhaustion).
-fn binary_term(env: &mut DriverEnv, bytes: &[u8]) -> Option<Eterm> {
+fn binary_term(env: &DriverEnv, bytes: &[u8]) -> Option<Eterm> {
     let bits = bytes.len().checked_mul(8)?;
     // SAFETY: `heap_bits_size_words(n_bits)` sizes the `ErlHeapBits` block for `n_bits` bits.
     let hp = unsafe { env.heap().alloc_words(prelude::heap_bits_size_words(bits)) }.ok()?;
@@ -1119,7 +1218,7 @@ fn binary_term(env: &mut DriverEnv, bytes: &[u8]) -> Option<Eterm> {
 }
 
 /// A float term from `value` (`None` for a non-finite value, which the C rejects).
-fn float_term(env: &mut DriverEnv, value: f64) -> Option<Eterm> {
+fn float_term(env: &DriverEnv, value: f64) -> Option<Eterm> {
     if !value.is_finite() {
         return None;
     }
@@ -1138,7 +1237,7 @@ fn float_term(env: &mut DriverEnv, value: f64) -> Option<Eterm> {
 /// Ordering/hashing come from the terms themselves — atoms carry their runtime index — so the
 /// builder only needs a table to name atoms, and a fresh empty one is enough here (see the
 /// [`decode_term_spec`] deviations).
-fn map_term(env: &mut DriverEnv, pairs: &[(Eterm, Eterm)]) -> Option<Eterm> {
+fn map_term(env: &DriverEnv, pairs: &[(Eterm, Eterm)]) -> Option<Eterm> {
     let atoms = prelude::AtomTable::new();
     let mut keys: Vec<Eterm> = pairs.iter().map(|(key, _)| *key).collect();
     keys.sort_by(|a, b| prelude::cmp_flatmap_keys(*a, *b, &atoms));
@@ -1159,7 +1258,7 @@ fn map_term(env: &mut DriverEnv, pairs: &[(Eterm, Eterm)]) -> Option<Eterm> {
 ///
 /// Equivalent to `nif/enif.rs`'s `small_or_big`, which cannot be shared without touching that
 /// module (out of this step's scope); it is a pure function of `beam_term`'s public writers.
-fn small_or_big(env: &mut DriverEnv, negative: bool, magnitude: u64) -> Option<Eterm> {
+fn small_or_big(env: &DriverEnv, negative: bool, magnitude: u64) -> Option<Eterm> {
     let fits_small = if negative {
         magnitude <= prelude::MIN_SMALL.unsigned_abs()
     } else {
@@ -1180,7 +1279,7 @@ fn small_or_big(env: &mut DriverEnv, negative: bool, magnitude: u64) -> Option<E
 }
 
 /// An `ERL_DRV_INT` operand (`ErlDrvSInt`, a `long` on LP64) as a term.
-fn int_from_i64(env: &mut DriverEnv, value: i64) -> Option<Eterm> {
+fn int_from_i64(env: &DriverEnv, value: i64) -> Option<Eterm> {
     if value < 0 {
         small_or_big(env, true, value.unsigned_abs())
     } else {
@@ -1189,7 +1288,7 @@ fn int_from_i64(env: &mut DriverEnv, value: i64) -> Option<Eterm> {
 }
 
 /// An `ERL_DRV_UINT`/`ERL_DRV_UINT64` operand (`ErlDrvUInt`) as a term.
-fn int_from_u64(env: &mut DriverEnv, value: u64) -> Option<Eterm> {
+fn int_from_u64(env: &DriverEnv, value: u64) -> Option<Eterm> {
     small_or_big(env, false, value)
 }
 
@@ -1369,7 +1468,7 @@ mod tests {
     #[test]
     fn as_port_round_trips_through_from_port() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let port = env.as_port();
         assert!(!port.is_null(), "the port pointer is never null");
         // SAFETY: `port` came from `DriverEnv::as_port` on `env`, which is still alive here.
@@ -1398,10 +1497,10 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_an_atom() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let name = CString::new("hello").expect("no interior NUL");
         let spec = [ERL_DRV_ATOM, term_data(name.as_ptr() as usize)];
-        let term = decode_term_spec(&mut env, &spec).expect("a valid atom spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid atom spec");
         assert!(is_atom(term));
         assert_eq!(host.atoms().name(atom_val(term)).as_deref(), Some("hello"));
     }
@@ -1409,19 +1508,19 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_ints_and_bignums() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
-        let term = decode_term_spec(&mut env, &[ERL_DRV_INT, 42]).expect("a valid int spec");
+        let term = decode_term_spec(&env, &[ERL_DRV_INT, 42]).expect("a valid int spec");
         assert!(is_small(term));
         assert_eq!(signed_value(term), 42);
 
-        let term = decode_term_spec(&mut env, &[ERL_DRV_INT, (-1i64) as ErlDrvTermData])
+        let term = decode_term_spec(&env, &[ERL_DRV_INT, (-1i64) as ErlDrvTermData])
             .expect("a negative int is valid");
         assert_eq!(signed_value(term), -1);
 
         // A magnitude outside the 60-bit small range becomes a bignum.
         let term =
-            decode_term_spec(&mut env, &[ERL_DRV_UINT, u64::MAX]).expect("a valid uint spec");
+            decode_term_spec(&env, &[ERL_DRV_UINT, u64::MAX]).expect("a valid uint spec");
         // SAFETY: `term` is a valid boxed term (a bignum, never a small int here).
         assert!(unsafe { is_big(term) });
     }
@@ -1429,14 +1528,14 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_a_string() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let text = b"abc";
         let spec = [
             ERL_DRV_STRING,
             term_data(text.as_ptr() as usize),
             text.len() as ErlDrvTermData,
         ];
-        let term = decode_term_spec(&mut env, &spec).expect("a valid string spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid string spec");
         // "abc" is the list [97, 98, 99].
         assert!(is_list(term));
         // SAFETY: `term` is a live three-element list.
@@ -1455,7 +1554,7 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_a_tuple_and_a_list() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let name = CString::new("a").expect("no interior NUL");
 
         // {a, 1}
@@ -1467,7 +1566,7 @@ mod tests {
             ERL_DRV_TUPLE,
             2,
         ];
-        let term = decode_term_spec(&mut env, &spec).expect("a valid tuple spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid tuple spec");
         // SAFETY: `term` is a live tuple (asserted by the size check below).
         assert!(unsafe { is_tuple(term) });
         // SAFETY: as above.
@@ -1478,7 +1577,7 @@ mod tests {
         assert_eq!(signed_value(unsafe { tuple_element(term, 1) }), 1);
 
         // [1, 2]
-        let term = decode_term_spec(&mut env, &[ERL_DRV_INT, 1, ERL_DRV_INT, 2, ERL_DRV_LIST, 2])
+        let term = decode_term_spec(&env, &[ERL_DRV_INT, 1, ERL_DRV_INT, 2, ERL_DRV_LIST, 2])
             .expect("a valid list spec");
         assert!(is_list(term));
         // SAFETY: `term` is a live two-element list.
@@ -1493,7 +1592,7 @@ mod tests {
     #[test]
     fn decode_term_spec_rejects_malformed_specs() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let digits = CString::new("digits").expect("no interior NUL");
 
         // Every entry below is a spec the C's two-pass decoder fails (`ERTS_DDT_FAIL`): an empty
@@ -1529,43 +1628,43 @@ mod tests {
             &[ERL_DRV_EXT2TERM, term_data(digits.as_ptr() as usize), 6],
             &[99, 0], // An unknown tag (`erl_driver.h` stops at 17).
         ] {
-            assert_eq!(decode_term_spec(&mut env, spec), None, "spec {spec:?}");
+            assert_eq!(decode_term_spec(&env, spec), None, "spec {spec:?}");
         }
     }
     #[test]
     fn decode_term_spec_handles_a_pid_and_a_port_operand() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // The operand is the term itself, exactly as in the C (`mess = ptr[0]`, `io.c:6089`).
         let pid = prelude::make_internal_pid(prelude::make_pid_data(3, 42));
-        let term = decode_term_spec(&mut env, &[ERL_DRV_PID, term_data(pid.raw())])
+        let term = decode_term_spec(&env, &[ERL_DRV_PID, term_data(pid.raw())])
             .expect("an internal pid is a valid operand");
         assert_eq!(term, pid);
 
         let port = prelude::make_internal_port(prelude::make_port_data(9));
-        let term = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(port.raw())])
+        let term = decode_term_spec(&env, &[ERL_DRV_PORT, term_data(port.raw())])
             .expect("an internal port is a valid operand");
         assert_eq!(term, port);
 
         // `NIL` is the operand both `driver_term_nil` and `driver_connected` produce when there is
         // no port/pid; the C refuses it (`is_not_internal_pid`, `io.c:5816`), and so does this.
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PID, term_data(NIL.raw())]), None);
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(NIL.raw())]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PID, term_data(NIL.raw())]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, term_data(NIL.raw())]), None);
 
         // The C's `is_internal_port` is only `x & 0xF == 0x7` (`erl_term.h`), so the raw word `7`
         // *passes* it and the spec is accepted verbatim — the same tag-overlap quirk the C has.
         // (`is_internal_pid`'s tag is `0x3`, which `7 & 0xF` does not match, so `ERL_DRV_PID` is
         // unaffected.) Reproduced exactly rather than "fixed", since the C is the contract.
         assert_eq!(
-            decode_term_spec(&mut env, &[ERL_DRV_PORT, 7]).map(Eterm::raw),
+            decode_term_spec(&env, &[ERL_DRV_PORT, 7]).map(Eterm::raw),
             Some(7)
         );
 
         // A **handle**-encoded operand (what this crate's `driver_mk_port` answers) is not a port
         // term, so a host without the `port_term` hook — this one is at the trait default — refuses
         // it. `7` above passes only because it satisfies `is_internal_port`.
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(0x1000)]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, term_data(0x1000)]), None);
     }
 
     #[test]
@@ -1576,9 +1675,9 @@ mod tests {
         // delivered) — instead of a wrong term delivered where the ABI requires a port.
         let handle = 0x1000usize as ErlDrvPort;
         let mut host = PortTermHost::new(handle, make_small(42));
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         assert_eq!(
-            decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(handle as usize)]),
+            decode_term_spec(&env, &[ERL_DRV_PORT, term_data(handle as usize)]),
             None,
             "a hook answer that is not an internal port fails the whole spec"
         );
@@ -1592,20 +1691,20 @@ mod tests {
         let handle = 0x1000usize as ErlDrvPort;
         let port = prelude::make_internal_port(prelude::make_port_data(11));
         let mut host = PortTermHost::new(handle, port);
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // The handle encoding (`{ERL_DRV_PORT, driver_mk_port(port)}`, the C's own idiom) resolves
         // to the id term through the hook.
-        let term = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(handle as usize)])
+        let term = decode_term_spec(&env, &[ERL_DRV_PORT, term_data(handle as usize)])
             .expect("a live handle resolves through `port_term`");
         assert_eq!(term, port);
         assert_eq!(host.asked, vec![handle], "the hook is asked about the operand's handle");
 
         // An unknown handle, a null word and a plain non-port word are all refused (`None` from the
         // hook), never turned into a wrong term.
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(0x2000)]), None);
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, 0]), None);
-        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, 1]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, term_data(0x2000)]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, 0]), None);
+        assert_eq!(decode_term_spec(&env, &[ERL_DRV_PORT, 1]), None);
         assert_eq!(
             host.asked,
             vec![handle, 0x2000usize as ErlDrvPort, 0 as ErlDrvPort, 1usize as ErlDrvPort],
@@ -1613,7 +1712,7 @@ mod tests {
         );
 
         // A genuine port term still takes the C's own path: pushed as-is, with no hook query.
-        let direct = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(port.raw())])
+        let direct = decode_term_spec(&env, &[ERL_DRV_PORT, term_data(port.raw())])
             .expect("an internal port is a valid operand");
         assert_eq!(direct, port);
         assert_eq!(host.asked.len(), 4, "a port term never reaches the hook");
@@ -1628,7 +1727,7 @@ mod tests {
             ERL_DRV_TUPLE,
             2,
         ];
-        let term = decode_term_spec(&mut env, &spec).expect("a tuple of [atom, port handle]");
+        let term = decode_term_spec(&env, &spec).expect("a tuple of [atom, port handle]");
         // SAFETY: `term` is a live term the decoder just built; the tuple readers run only after
         // `is_tuple` confirms the shape.
         unsafe {
@@ -1645,11 +1744,11 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_a_zero_length_and_a_full_binary() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // `ERL_DRV_BUF2BINARY` with a NULL buffer and a zero length is the C's allowed empty binary
         // (`if (!bufp && size > 0) ERTS_DDT_FAIL`, `io.c:5773`).
-        let term = decode_term_spec(&mut env, &[ERL_DRV_BUF2BINARY, 0, 0])
+        let term = decode_term_spec(&env, &[ERL_DRV_BUF2BINARY, 0, 0])
             .expect("a zero-length buffer builds an empty binary");
         // SAFETY: `term` is a live binary.
         assert!(unsafe { binary_bytes_of(term) }.is_empty());
@@ -1660,7 +1759,7 @@ mod tests {
         // the malformed-spec test pins.
         let empty = b"";
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[ERL_DRV_STRING, term_data(empty.as_ptr() as usize), 0],
         )
         .expect("a zero-length string over a non-NULL buffer is valid");
@@ -1675,18 +1774,18 @@ mod tests {
         // SAFETY: the payload is 5 writable bytes, as requested above.
         unsafe { core::ptr::copy_nonoverlapping(b"hello".as_ptr(), payload, 5) };
 
-        let term = decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 5, 0])
+        let term = decode_term_spec(&env, &[ERL_DRV_BINARY, term_data(bin as usize), 5, 0])
             .expect("an in-bounds window is valid");
         // SAFETY: `term` is a live binary built from the 5 payload bytes.
         assert_eq!(unsafe { binary_bytes_of(term) }, b"hello");
         // A sub-window (`size` + `offset` still inside `orig_size`) is legal.
-        let term = decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 3, 2])
+        let term = decode_term_spec(&env, &[ERL_DRV_BINARY, term_data(bin as usize), 3, 2])
             .expect("an in-bounds sub-window is valid");
         // SAFETY: as above.
         assert_eq!(unsafe { binary_bytes_of(term) }, b"llo");
         // `size + offset > orig_size` is refused (the C's "outside the binary", `io.c:5758`).
         assert_eq!(
-            decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 4, 2]),
+            decode_term_spec(&env, &[ERL_DRV_BINARY, term_data(bin as usize), 4, 2]),
             None
         );
         // SAFETY: `bin` came from `driver_alloc_binary` and is freed exactly once.
@@ -1695,17 +1794,17 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_int64_and_uint64_operands() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // `ERL_DRV_INT64`/`ERL_DRV_UINT64` carry a *pointer* to the value (`Sint64*`/`Uint64*`).
         let signed: i64 = -5;
-        let term = decode_term_spec(&mut env, &[ERL_DRV_INT64, term_data(&signed as *const i64 as usize)])
+        let term = decode_term_spec(&env, &[ERL_DRV_INT64, term_data(&signed as *const i64 as usize)])
             .expect("a valid INT64 spec");
         assert_eq!(signed_value(term), -5);
 
         let unsigned: u64 = u64::MAX;
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[ERL_DRV_UINT64, term_data(&unsigned as *const u64 as usize)],
         )
         .expect("a valid UINT64 spec");
@@ -1716,11 +1815,11 @@ mod tests {
     #[test]
     fn decode_term_spec_handles_an_empty_tuple() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // The C accepts `ERL_DRV_TUPLE 0` (it yields the global empty-tuple literal, `io.c:6068`) —
         // unlike `ERL_DRV_LIST 0`, which it rejects.
-        let term = decode_term_spec(&mut env, &[ERL_DRV_TUPLE, 0]).expect("an empty tuple is valid");
+        let term = decode_term_spec(&env, &[ERL_DRV_TUPLE, 0]).expect("an empty tuple is valid");
         // SAFETY: `term` is the live empty tuple.
         assert!(unsafe { is_tuple(term) });
         // SAFETY: as above.
@@ -1730,7 +1829,7 @@ mod tests {
     #[test]
     fn decode_term_spec_cons_a_string_onto_a_stack_value() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let text = b"ab";
 
         // `ERL_DRV_STRING_CONS` builds the character list and uses the popped stack value as its
@@ -1738,7 +1837,7 @@ mod tests {
         // `io.c:6043-6045`), so it **prepends**: the characters come first and the popped value ends
         // the list — `"ab" ++ [1]` = `[97, 98 | 1]`, an improper list, exactly as the C builds it.
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[
                 ERL_DRV_INT,
                 1,
@@ -1759,7 +1858,7 @@ mod tests {
 
         // Consing onto `[]` is the plain character list, `[97, 98]`.
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[
                 ERL_DRV_NIL,
                 ERL_DRV_STRING_CONS,
@@ -1779,12 +1878,12 @@ mod tests {
     #[test]
     fn decode_term_spec_nests_a_list_inside_a_tuple() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // `{[1,2], 3}` — the list is built first (`ERL_DRV_LIST`) and the tuple pops it together
         // with the trailing int, exactly the reverse-Polish nesting the C specifies.
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[
                 ERL_DRV_INT,
                 1,
@@ -1818,7 +1917,7 @@ mod tests {
     #[test]
     fn decode_term_spec_builds_a_small_map() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let atoms = AtomTable::new();
         let b = CString::new("b").expect("no interior NUL");
         let a = CString::new("a").expect("no interior NUL");
@@ -1836,7 +1935,7 @@ mod tests {
             ERL_DRV_MAP,
             2,
         ];
-        let term = decode_term_spec(&mut env, &spec).expect("a valid map spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid map spec");
         // SAFETY: `term` is a live map written by `beam_term::map::write_map`.
         assert!(unsafe { prelude::is_map(term) });
         // SAFETY: as above — 2 <= MAP_SMALL_MAP_LIMIT, so the builder chose a flat map.
@@ -1852,12 +1951,12 @@ mod tests {
     #[test]
     fn decode_term_spec_builds_an_empty_map() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let atoms = AtomTable::new();
 
         // The C allows `ERL_DRV_MAP 0` (`if ((int) ptr[0] < 0) ERTS_DDT_FAIL`, then a flat map with
         // `size == 0` and the global empty-tuple keys, `io.c:6129-6142`).
-        let term = decode_term_spec(&mut env, &[ERL_DRV_MAP, 0]).expect("an empty map is valid");
+        let term = decode_term_spec(&env, &[ERL_DRV_MAP, 0]).expect("an empty map is valid");
         // SAFETY: `term` is the live empty flat map.
         assert!(unsafe { prelude::is_flatmap(term) });
         assert_eq!(prelude::map_size(term, &atoms).expect("a map"), 0);
@@ -1866,7 +1965,7 @@ mod tests {
     #[test]
     fn decode_term_spec_switches_a_map_to_a_hash_map_past_the_flat_map_limit() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let atoms = AtomTable::new();
 
         // `MAP_SMALL_MAP_LIMIT` + 1 pairs: the C takes the hash-map arm (`io.c:6118`), and
@@ -1882,7 +1981,7 @@ mod tests {
         spec.push(ERL_DRV_MAP);
         spec.push(n as ErlDrvTermData);
 
-        let term = decode_term_spec(&mut env, &spec).expect("a valid large map spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid large map spec");
         // SAFETY: `term` is a live map.
         assert!(unsafe { prelude::is_map(term) });
         // SAFETY: as above — more than `MAP_SMALL_MAP_LIMIT` pairs, so it is a HAMT.
@@ -1907,7 +2006,7 @@ mod tests {
         }
         spec.push(ERL_DRV_MAP);
         spec.push(prelude::MAP_SMALL_MAP_LIMIT as ErlDrvTermData);
-        let term = decode_term_spec(&mut env, &spec).expect("a valid limit-sized map spec");
+        let term = decode_term_spec(&env, &spec).expect("a valid limit-sized map spec");
         // SAFETY: `term` is a live flat map of exactly `MAP_SMALL_MAP_LIMIT` pairs.
         assert!(unsafe { prelude::is_flatmap(term) });
     }
@@ -1915,7 +2014,7 @@ mod tests {
     #[test]
     fn decode_term_spec_rejects_a_map_with_duplicate_keys() {
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
 
         // Identical keys: the C fails (`erts_validate_and_sort_flatmap` returns 0 on `c == 0`,
         // `erl_map.c:3202`).
@@ -1931,7 +2030,7 @@ mod tests {
             ERL_DRV_MAP,
             2,
         ];
-        assert_eq!(decode_term_spec(&mut env, &dup), None);
+        assert_eq!(decode_term_spec(&env, &dup), None);
 
         // `1` and `1.0` are *different* map keys (the C compares exact), so that spec is accepted
         // with two entries.
@@ -1948,19 +2047,19 @@ mod tests {
             ERL_DRV_MAP,
             2,
         ];
-        let term = decode_term_spec(&mut env, &mixed).expect("1 and 1.0 are distinct keys");
+        let term = decode_term_spec(&env, &mixed).expect("1 and 1.0 are distinct keys");
         assert_eq!(prelude::map_size(term, &AtomTable::new()).expect("a map"), 2);
     }
 
     #[test]
     fn decode_term_spec_routes_ext2term_through_the_host_hook() {
         let mut host = EtfHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let image = [42u8];
 
         // The hook decodes `[42]` to the small int 42 and is handed exactly the declared bytes.
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[
                 ERL_DRV_EXT2TERM,
                 term_data(image.as_ptr() as usize),
@@ -1975,7 +2074,7 @@ mod tests {
         let bad = [7u8, 7, 7];
         assert_eq!(
             decode_term_spec(
-                &mut env,
+                &env,
                 &[
                     ERL_DRV_EXT2TERM,
                     term_data(bad.as_ptr() as usize),
@@ -1988,7 +2087,7 @@ mod tests {
 
         // The decoded value nests like any other term: `{42, 7}`.
         let term = decode_term_spec(
-            &mut env,
+            &env,
             &[
                 ERL_DRV_EXT2TERM,
                 term_data(image.as_ptr() as usize),
@@ -2011,11 +2110,11 @@ mod tests {
         // `TestDriverHost` leaves `binary_to_term` at its trait default (`None`), which is the
         // `beam_rt`/`beam_io` situation until either installs the hook.
         let mut host = TestDriverHost::new();
-        let mut env = DriverEnv::new(&mut host);
+        let env = DriverEnv::new(&mut host);
         let image = [42u8];
         assert_eq!(
             decode_term_spec(
-                &mut env,
+                &env,
                 &[ERL_DRV_EXT2TERM, term_data(image.as_ptr() as usize), 1],
             ),
             None

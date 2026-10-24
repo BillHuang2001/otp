@@ -241,7 +241,7 @@ fn a_real_c_driver_resolves_a_port_handle_operand_to_the_port_term() {
     host.set_port_term(Some(port_term));
     host.set_connected(Some(pid));
 
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.
@@ -385,7 +385,7 @@ fn a_host_without_the_port_term_hook_still_refuses_the_handle_operand() {
     let lib = load(&path, FIXTURE_NAME).expect("the fixture loads");
 
     let mut host = NoPortTermHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.

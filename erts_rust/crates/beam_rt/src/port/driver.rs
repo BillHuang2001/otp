@@ -3095,7 +3095,7 @@ impl beam_io::Driver for DriverPortAdapter {
         // `DriverEnv` carries no lifetime, so the `&mut` borrow of the host ends with this call;
         // the environment (and so the handle) stays valid because the host lives in a `Box` that
         // never moves.
-        let mut env = Box::new(driver.host_mut().environment());
+        let env = Box::new(driver.host_mut().environment());
         let port = env.as_port();
         self.env = Some(env);
         // The only place the two facts the `ERL_DRV_PORT` hook needs first coexist: the environment's

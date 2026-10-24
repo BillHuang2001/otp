@@ -219,12 +219,18 @@ pub static driver_term_nil: ErlDrvTermData = NIL.raw() as ErlDrvTermData;
 /// sentinel (`-1`/`0`, as the C's own early return does) and for `NULL` (refused here instead of
 /// faulted) without dereferencing either.
 ///
+/// A **shared** reference, deliberately: no slot mutates the environment itself (its single field is
+/// fixed at construction) and every one of them reaches the host through
+/// [`DriverEnv::host`](crate::driver::host::DriverEnv::host), so asking for `&mut` here would take a
+/// second exclusive borrow of an object the caller may still be holding — the aliasing hazard
+/// [`crate::driver::host`]'s module docs spell out (it cost a release-only silent no-op once).
+///
 /// # Safety
 ///
 /// `port` must be `NULL`, the invalid-port sentinel, or a pointer previously returned by
 /// [`DriverEnv::as_port`] for an environment (and host) that is still alive — exactly
 /// [`DriverEnv::from_port`]'s own contract.
-unsafe fn env_for<'a>(port: ErlDrvPort) -> Option<&'a mut DriverEnv> {
+unsafe fn env_for<'a>(port: ErlDrvPort) -> Option<&'a DriverEnv> {
     if is_invalid_port_handle(port) {
         return None; // `NULL` or the sentinel: there is no environment to recover.
     }

@@ -196,7 +196,7 @@ fn a_real_c_driver_sees_the_posix_name_from_this_crates_erl_errno_id() {
     assert_eq!(lib.name(), FIXTURE_NAME);
 
     let mut host = TestDriverHost::new();
-    let mut env = DriverEnv::new(&mut host);
+    let env = DriverEnv::new(&mut host);
     let port = env.as_port();
     let command = CString::new("start").expect("no interior NUL");
     // SAFETY: `port` came from `env.as_port()` on the still-live `env`; `command` is NUL-terminated.

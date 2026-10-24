@@ -1003,8 +1003,16 @@ impl Runtime {
             // say "idle" while the port is in fact owed an answer that only a later round can
             // produce. Blocking on such a port is exactly what the wait is for — it is how a
             // nested `receive` on that operation reaches its completion without spinning.
-            let progressed = round_slices > 0;
-            let port_timeout = if progressed
+            //
+            // "Progress" is **not** only "a slice ran". A delivery whose message did not fit the
+            // receiver's heap takes the heap-fragment fallback, which owns its own wake channel
+            // ([`Runtime::note_fragment_wake`]) rather than the process table's wake list — so
+            // such a wake is absorbed *later in this round* and is invisible to `round_slices`.
+            // A round holding one still has runnable work to hand (the receiver of the port reply
+            // that just arrived), and blocking first costs it a full [`PORT_POLL_SLICE`] for
+            // nothing: that was the fixed ~12 ms/op sleep on the `run` route's RAM-file shape,
+            // where the reply lands as a fragment on about half the ops.
+            let progressed = round_slices > 0 || !self.fragment_wakes.is_empty();            let port_timeout = if progressed
                 || (matches!(wait, TimerWait::ImminentWithin(_))
                     && !self.awaits_port_reply()
                     && !self.ports_awaiting_async())
