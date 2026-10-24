@@ -12,9 +12,9 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
   boxed-term header kinds, with a `Y`-slot source accepted), `SelectVal` (all-immediate alternatives, with a
   `Y`-slot scrutinee accepted), `SelectTupleArity` (a `Loc` tuple), cons readers (`GetList`/`GetHd`/`GetTl`,
   all destinations a `Loc`), `GetTupleElement` (a `Loc` source/destination), the destructive
-  `SetTupleElement` (a `Loc` tuple), the small-int `gc_bif` arithmetic (`'+'/'-'/'*'` and the bitwise
-  `band`/`bor`/`bsr` — an x-register **or Y-slot** operand/destination, behind the run-time frame-window
-  guard), the 8 comparison BIFs, the named-BIF accessors (`erlang:hd/1`, `element/2` with a compile-time
+  `SetTupleElement` (a `Loc` tuple), the small-int `gc_bif` arithmetic (`'+'/'-'/'*'`, the bitwise
+  `band`/`bor`/`bsr`, and `div`/`rem` — an x-register **or Y-slot** operand/destination, behind the
+  run-time frame-window guard), the 8 comparison BIFs, the named-BIF accessors (`erlang:hd/1`, `element/2` with a compile-time
   small-int index `>= 1`, `tuple_size/1` lowered in block through the aggregate read guards, and
   `erlang:byte_size/1`/`length/1` evaluated by the `bif_helper.rs::jit_bif_value` helper), `Jump`, the local
   tail calls (`CallLast` via `emit_tail_exit` for a compiled successor and `emit_tail_exit_to_driver` for a
@@ -72,7 +72,13 @@ The emitter-side detail lives one level down in `../emit/CONTEXT.md` and `../emi
   proper-list count, each declining when the value would not fit a small integer. Small-int
   `band/2`/`bor/2`/`bsr/2` are lowered by `emit/arith.rs::fast_arith` instead (`band`/`bor` as a raw
   **tagged-word** `and_rr`/`or_rr`, exact for negatives with no untag/retag; `bsr` untag → `sar_ri` →
-  range-check → retag, claiming only an **immediate** small-int count in `0..64`). No lowering here
+  range-check → retag, claiming only an **immediate** small-int count in `0..64`). `div/2`/`rem/2` are
+  lowered by the same `emit/arith.rs::fast_arith` arm over the same tagged operand shapes: both untag
+  with `sar`, test the divisor for zero **before** the `#DE` (a zero divisor, a float operand or a
+  bignum falls back to the BIF), `cqo` + `idiv_rr`, then the quotient is range-checked against
+  `MIN_SMALL`/`MAX_SMALL` (so `MIN_SMALL div -1` deopts to the exact bignum result) while the
+  remainder is taken from `rdx` with no range check (`|rem| < |divisor|`). `intdiv/2` stays on the
+  BIF (it floors, truncating would be a wrong result). No lowering here
   modifies the driver, the block ABI or a helper; `erlang:self/0` and `erlang:node/0` (the `bif0` pool)
   are host-owned (`self_pid`/`local_node` behind `ExecutionContext`) and still deopt — the `Bif0`
   variant has no arm at all.

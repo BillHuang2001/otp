@@ -85,8 +85,8 @@ Why visited < ranges (the gap is **472 046 = 13.2 %**), in two mechanisms:
    are disjoint) for every frame-preserving call's continuation address — those instructions lie
    inside an IR block's range *and* in a sub-block's range, so the range total counts them twice.
 Neither mechanism is a defect — each is a deliberate property of the emitter — but they mean a deopt
-fraction is a fraction of the **visited** population, so `119 912 / 3 114 364 = 3.85 %` and
-`119 912 / 3 586 410 = 3.34 %` describe the same deopts on two different (both defensible, never
+fraction is a fraction of the **visited** population, so `119 189 / 3 114 364 = 3.83 %` and
+`119 189 / 3 586 410 = 3.32 %` describe the same deopts on two different (both defensible, never
 interchangeable) denominators.
 
 ### Table 1 — the static deopt census (the primary evidence)
@@ -95,20 +95,20 @@ interchangeable) denominators.
 |---|---|---|---|
 | `FuncInfo` | **103 079** | 103 079 | 1.0000 |
 | `Bif` | 10 014 | 17 356 | 0.5770 |
-| `GcBif` | 3 282 | 24 466 | 0.1341 |
+| `GcBif` | 2 559 | 24 466 | 0.1046 |
 | `Bif0` | 3 205 | 3 205 | 1.0000 |
 | `NifStart` | 300 | 300 | 1.0000 |
 | `Test(IsBoolean)` | 17 | 358 | 0.0475 |
 | `Test(IsFunction2)` | 9 | 331 | 0.0272 |
 | `OnLoad` | 6 | 6 | 1.0000 |
-Totals: **119 912** deopts / **3 114 364** visited instances (**3.85 %**) over **8** deopting variants
-out of **119** variants visited at all; every non-`FuncInfo` deopt together is **16 833 / 3 011 285 =
-0.56 %**, and `FuncInfo` alone is **86.0 %** of all deopts.
+Totals: **119 189** deopts / **3 114 364** visited instances (**3.83 %**) over **8** deopting variants
+out of **119** variants visited at all; every non-`FuncInfo` deopt together is **16 110 / 3 011 285 =
+0.54 %**, and `FuncInfo` alone is **86.5 %** of all deopts.
 `FuncInfo` deopts exactly once per compiled function (**103 079 = `functions_compiled`**, ratio
 1.0000) because it is the failed-head-clause `function_clause` raise and is deliberately never
 inlined — the *never-executed* shape, so its 86 % share of the count is 0 % of the run time.
-The Y-window split on the same run: `blocks=185 115 publish=132 881 elided=52 234` (71.8 % of
-Y-touching blocks publish) `invalidations=544 250`.
+The Y-window split on the same run: `blocks=185 141 publish=132 908 elided=52 233` (71.8 % of
+Y-touching blocks publish) `invalidations=544 282`.
 
 ### Table 2 — the deopting-variant set over the **committed fixtures** (corpus-independent)
 `ERTS_ORACLE=/nonexistent/erl erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
@@ -190,8 +190,11 @@ Corpus `paths=1359 modules_loaded=1359`.
 `erlang:=:=/2` 239, `erlang:node/1` 210, `erlang:max/2` 165, `erlang:and/2` 123,
 `erlang:is_map_key/2` 121, `erlang:not/1` 113, `erlang:tl/1` 111, then the `is_*/1` predicates and
 comparisons at ≤ 92 each.
-`gc_bif` pool **3 023** — `erlang:bit_size/1` 762, `erlang:bsl/2` 706, `erlang:div/2` 347,
-`erlang:rem/2` 296, `erlang:bxor/2` 149, `erlang:map_size/1` 138, `erlang:-/1` 125, `erlang:bsr/2` 120.
+`gc_bif` pool **2 381** — `erlang:bit_size/1` 762, `erlang:bsl/2` 706, `erlang:bxor/2` 149,
+`erlang:map_size/1` 138, `erlang:-/1` 125, `erlang:bsr/2` 120, `erlang:round/1` 91,
+`erlang:abs/1` 81, `erlang:binary_part/3` 77, then the narrow conversions and bit operators at
+≤ 51 each, and `erlang:div/2`/`erlang:rem/2` 1 apiece (the integer fast path admits both; each
+residual is one shape it declines).
 `bif0` pool — `erlang:self/0` 1 979, `erlang:node/0` 675 (no arm exists at all).
 These pools count each IR instruction **once** (the census walks `function.code`), while Table 1
 counts each **visited** instruction per emitted block; a `Bif` inside a continuation sub-block range
@@ -273,7 +276,7 @@ else follows the installed OTP tree and is recorded as method + figure, never as
   reference block and the per-kind rows, which compile hand-built single-block modules).
 - **Three different denominators are in circulation** (raw IR, Σ block ranges, visited instances) and
   no instrument prints the first. Quote a deopt fraction only against the **visited** total, and say
-  so; `3.85 %` (visited) and `3.34 %` (Σ ranges) are the same 119 912 deopts.
+  so; `3.83 %` (visited) and `3.32 %` (Σ ranges) are the same 119 189 deopts.
 - **The terminator sites are nine**: `../emit/block.rs` sets `terminated = true` and `break;`s on the
   next line, one such pair per terminator arm. The **per-site line enumeration lives only** in "The
   three instruction counting bases" above; every prose restatement elsewhere in the tree

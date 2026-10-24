@@ -131,6 +131,36 @@ impl CodeBuffer {
         self.emit_u8(modrm_rr(dst, src))
     }
 
+    /// `cqo` — sign-extend `rax` into `rdx:rax` (`REX.W` + `99`).
+    ///
+    /// The implicit-destination instruction the signed [`Self::idiv_rr`] requires:
+    /// it divides the **128-bit** `rdx:rax` by its operand, so the `rax` dividend
+    /// must first be sign-extended into `rdx`. A `mov rdx, 0` would be wrong (it
+    /// makes a negative dividend a huge unsigned one) and `sar rdx, 63` would
+    /// clobber the flags `cqo` also sets.
+    pub fn cqo(&mut self) -> Result<()> {
+        self.emit_rex(true, 0, 0, 0)?;
+        self.emit_u8(0x99)
+    }
+
+    /// `idiv reg` — the 64-bit signed divide (`REX.W` + `F7 /7`).
+    ///
+    /// Divides the 128-bit `rdx:rax` (sign-extended by [`Self::cqo`]) by `divisor`
+    /// and leaves the quotient, **truncated toward zero**, in `rax` and the
+    /// remainder — which takes the dividend's sign — in `rdx`. That is exactly
+    /// Erlang's `div`/`rem` pair, so one divide yields both.
+    ///
+    /// Two conditions make it raise `#DE` — a CPU trap (SIGFPE), not a flag:
+    /// a **zero divisor** and a quotient that does not fit in 64 bits (only
+    /// `i64::MIN / -1`). Neither is recoverable here, so the caller must refuse a
+    /// zero divisor itself and bound its operands; the arithmetic fast path's
+    /// small-int guard does both (see [`super::super::baseline::emit::arith`]).
+    pub fn idiv_rr(&mut self, divisor: Reg) -> Result<()> {
+        self.emit_rex(true, 0, 0, ext(divisor))?;
+        self.emit_u8(0xF7)?;
+        self.emit_u8(0xC0 | (0x7 << 3) | (divisor.code() & 0x7))
+    }
+
     // -- shifts --------------------------------------------------------------
 
     /// `sar dst, imm` — an arithmetic (sign-preserving) shift right.

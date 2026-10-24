@@ -13,7 +13,10 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 (`mod.rs:206`), which is the family's own statement of its variant set (see API Surface).
 
 ## API Surface
-- `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
+- `pub(crate) fn dispatch(machine, entry_module, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:124`.
+- `pub(crate) fn lists::put_list(machine, head, tail, dst, ctx)` / `lists::get_list(machine, module, source,
+  head, tail, ctx)` — both `-> Result<Option<Step>>`, the two bodies the router's hot fast-path arms call
+  directly (see Notes for Agents); `lists::exec` calls the same two, so ownership cannot drift.
 - `pub(crate) fn bitstrings::claimed(&Instr) -> bool` (`bitstrings/mod.rs:135`) — the bitstring family's **one**
   statement of the 20 `Bs*` variants it owns. `dispatch` routes on it, and so do the native baseline tier's
   emitted arm (`jit/baseline/emit/block.rs`) and its in-block helper (`jit/baseline/bitstr.rs`), so the
@@ -329,7 +332,25 @@ in either and read afterwards is the "dangling boxed argument" class of `../../.
 - **The census gate is the latched `Machine::census_on` field** — one load and a branch on the per-instruction
   funnel, the same latched-gate idiom as `trace_on`/`reduce_on`; a disabled census performs no thread-local
   access per instruction (figures: `../MEASURED.md`). **OWNER: the parent `src/` node.**## Notes for Agents
-- The router (`mod.rs:112`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
+- The router (`mod.rs:124`) and every family `exec` are **inlined into one function** — the measured shape
+  (outlining the family bodies with `#[inline(never)]` cost **+2.52 % instructions / +3.34 % cycles** on
+  `bench_gc_bound:churn/1`, since each dispatched instruction then pays a call/ret pair and a second
+  prologue). Two consequences:
+  - The **only** arm kept out of the hot text is the diagnostic one: `mod.rs`'s `unclaimed()` is
+    `#[cold] #[inline(never)]` so the `format!`/reason-atom path does not sit in the router's frame.
+  - The two hottest dispatched instructions are routed **straight to their bodies**: the router's
+    `Instr::PutList`/`Instr::GetList` arms call `lists::put_list`/`lists::get_list` with the already-bound
+    operands, because going through `lists::exec` re-matched the variant the router had just proved (a
+    second jump table) and re-derived the operand slice. `lists::exec` remains the family's complete
+    ownership statement and calls the same bodies; `GetHd`/`GetTl` still route through it.
+- `operand_slack_words` (`../operand.rs`) answers 0 for every operand kind but a non-small
+  `Integer`/`Character`; its 60-bit range test sits behind an `#[inline(never)]` helper so the
+  register-operand path is one tag compare (the branchless select it replaced evaluated the range check
+  for both `put_list` operands: **-2.12 % instructions** on the churn row). `read_operand_pure` is
+  `#[inline(always)]` because its 72-byte `Result` return otherwise round-trips through the caller's sret
+  slot per operand (**-2.84 % instructions**). Together with the `put_list`/`get_list` routing this is
+  **-6.03 % instructions / -4.17 % cycles** on `bench_gc_bound:churn/1`; measured rows and the A/A noise
+  floor are in `../PERF.md`.
 - A family's `Ok(None)` is **not** a silent no-op: it reaches the router's last arm and yields the sentinel.
   The only way to "claim then no-op" would be an arm returning `Ok(Some(Step::Next))` without doing the
   operation — none exists (verified across all families).

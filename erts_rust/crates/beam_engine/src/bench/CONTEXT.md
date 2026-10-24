@@ -144,19 +144,18 @@ Paired `walk(20) − walk(0)`: one `build/2` in both phases, so the build (9 018
 Whole-call `instr_per_element` is **8.471**, so the build is 5.3 % of the call.
 The baseline tier pays **2 driver round-trips per 20 000-element call** (not per element): the walk's `call_only` is linked in-block, so the loop runs without returning to the driver, and the interpreter's extra BIF call per element is the small-int `+` the baseline tier inlines.
 
-#### The per-element slope on hardware counters (deterministic, both tiers)
-A different instrument from the `ns_per_element` rows above: `perf stat -e cpu_core/cycles/u,cpu_core/instructions/u`, `taskset -c 3`, paired interleaved A/B (each round samples the N-op and the 0-op pass back to back and takes the median paired difference, `(c[N]-c[0])/N`, N = 50 000 elements, 3 reps), so absolute wall time never enters the figure.
+#### The per-element slope on hardware counters (deterministic)
+A different instrument from the `ns_per_element` rows above: `perf stat -e cpu_core/cycles/u,cpu_core/instructions/u`, `taskset -c 3`, a paired interleaved run (each round samples the N-op and the 0-op pass back to back and takes the median paired difference, `(c[N]-c[0])/N`, N = 50 000 elements, 3 reps), so absolute wall time never enters the figure.
 
-| tier | cycles/element | instructions/element | rounds on the winning side |
-|---|---|---|---|
-| default (native baseline JIT) | **68.58 → 66.68** (−2.8 %) | **452.1 → 443.0** (−2.2 %) | 4/4 |
-| interpreter | 610.3 → 609.5 (−0.16 %, inside its ±0.3 % A/A floor) | 2993 → 2984 (−0.36 %) | no move |
-| default tier, cumulative from the pre-optimisation base `601c054011` | **76.93 → 66.68** (−13.3 %) | **503.4 → 443.0** (−12.0 %) | — |
+| tier | cycles/element | instructions/element |
+|---|---|---|
+| default (native baseline JIT) | **57.27** | **399.19** |
 
-The system oracle's `list_walk` is **9.25 cycles/element**, so the cumulative row moves the headline gap **8.32× → 7.21×** on cycles.
+The default tier is the one this workload prices: `list_walk`'s loop is BIF-free there (the small-int `+` is inlined), its `call_only` is linked in-block and it reaches no heap-admission point, so the slope is the pure dispatch floor. The interpreter tier's per-element cost is BIF-dominated (~42 % of its cycles are `call_bif`), so it is not part of this record.
+The system oracle's `list_walk` is **9.25 cycles/element**, so the headline gap on this shape is **6.2×** on cycles.
 The mechanism in one sentence: the local-call seam reads the executing module context's **index-addressed** verdict slot — one bounds-checked `Cell<Verdict>` load, no loop and no key comparison — instead of scanning a small key array, so an alternating two-callee loop pays no data-dependent branch (`../../machine/CONTEXT.md`).
-The default tier's A/A noise floor is ±1.3 % on cycles, which is why the interpreter row reads as no move: that tier is neither fetch- nor mispredict-bound on this workload (~1 icache miss and ~1 branch miss per element), so removing a data-dependent branch buys it nothing.
-Still on the per-call path and **not** removed: `Machine::local_call_seam` is **3 336 bytes** of generated code because the rare `Machine::invalidate_local_call_verdicts` walk over every context's table is inlined into it; marking that door `#[cold]`/`#[inline(never)]` is the identified next step and is not landed.
+The default tier's A/A noise floor is ±1.3 % on cycles. The interpreter tier is neither fetch- nor mispredict-bound on this workload (~1 icache miss and ~1 branch miss per element), so removing a data-dependent branch buys it nothing there.
+The seam's rare arms are already out of line: `Machine::local_call_enters_in_machine` is the `#[inline(always)]` fast path, `Machine::local_call_seam_slow` is `#[inline(never)]`, and the pending-invalidation walk behind `consume_pending_local_call_invalidation` is `#[cold] #[inline(never)]`, so the per-call body is one flag read plus one bounds-checked slot load.
 As everywhere in this file, the host is shared — quote the paired ratio and its band, never a single absolute wall time.
 
 ### `long_append` — the growth path amortises

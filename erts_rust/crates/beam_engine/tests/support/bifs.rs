@@ -379,7 +379,12 @@ impl ModuleHost {
                     if y == 0 {
                         Err(BeamError::BadArith)
                     } else {
-                        Ok(make_small(x.div_euclid(y)))
+                        // Erlang's `div` truncates **toward zero** (Rust's `/`), not
+                        // `div_euclid`: `-7 div 2 == -3`. Both operands are smalls, so
+                        // the only `i64` overflow (`i64::MIN / -1`) is unreachable, and
+                        // a quotient outside the small range (`MIN_SMALL div -1`) is
+                        // materialised as an exact bignum, as the real BIF does.
+                        terms::make_integer(self, x / y)
                     }
                 }
             },

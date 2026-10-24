@@ -34,9 +34,9 @@ Every absolute in that table is that pass's, not today's. A fresh pass over the 
 `blocks`/`cache_slots`/`written_slots` are unchanged (neither lever changes register allocation): `cache_slots` **756 632**, `written_slots` **621 058** — that pass's figures, like every other number in this subsection.
 The census is deterministic and load-independent (it compiles modules directly, never through `CodeCache`), and its other recorded models are: whole-cache fill **3 950 215**, written-set spill stores **4 678 655**, whole-cache spill stores **5 578 219** (the before/after columns of one pass — see the reading note at the top).
 
-**Static deopt census, current corpus:** **119 912** deopts over **3 114 364** visited instruction instances = **3.85 %**.
-By variant: `FuncInfo` **103 079** (86.0 % of all deopts — exactly one per function, and never executed, so it is the only instruction that deopts unconditionally), `Bif` 10 014, `GcBif` 3 282, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6.
-Excluding `FuncInfo` the residual is **16 833 / 3 011 285 = 0.56 %**.
+**Static deopt census, current corpus:** **119 189** deopts over **3 114 364** visited instruction instances = **3.83 %**.
+By variant: `FuncInfo` **103 079** (86.5 % of all deopts — exactly one per function, and never executed, so it is the only instruction that deopts unconditionally), `Bif` 10 014, `GcBif` 2 559, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6.
+Excluding `FuncInfo` the residual is **16 110 / 3 011 285 = 0.54 %**.
 `Bif0`/`NifStart`/`OnLoad` have no baseline arm at all, and `Generic` is a typed `unsupported_opcode` error rather than a step, so it is not part of this census.
 For scale, the deopt reference block emits **212 B** of code, with a marginal **60 B per deopt**.
 **Denominator caveat — a deopt fraction may only use the visited-instance base.** Three bases exist and are not interchangeable: the raw IR size (`function.code.len()`, never printed here), the **3 586 410** instruction instances summed over the emitted block ranges, and the **3 114 364** visited instances.
@@ -87,7 +87,7 @@ The counters compute the **replaced** models alongside the shipped one **in the 
 3 083 977 redundant already-clean stores removed; emitted bytes **341 653 629 → 320 065 790 (−6.32 %)**, exactly 7 B × the removed store count.
 Fixtures only (the then-32 committed fixtures: 351 functions / 960 blocks / 3 650 IR instrs): spill stores 342 dirty / 1 035 written / 1 473 full-cache; `code_len` **253 272 → 248 288 B**.
 `fill` is **unchanged** by this batch: 3 695 119 liveness-restricted loads vs 3 950 215 whole-cache.
-The static deopt census is **unchanged by this batch** — **119 912** deopts over **3 114 364** visited instances (3.85 %) across 8 deopting variants (`FuncInfo` 103 079, `Bif` 10 014, `GcBif` 3 282, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6) — because the batch changes only *how many stores a spill emits*, never which instruction deopts.
+The static deopt census over the tree of this batch — **119 189** deopts over **3 114 364** visited instances (3.83 %) across 8 deopting variants (`FuncInfo` 103 079, `Bif` 10 014, `GcBif` 2 559, `Bif0` 3 205, `NifStart` 300, `Test(IsBoolean)` 17, `Test(IsFunction2)` 9, `OnLoad` 6) — is what the register-cache rule leaves untouched: the rule changes only *how many stores a spill emits*, never which instruction deopts.
 Two-process copy-bound probe (`src/jit/baseline/tests.rs::the_two_process_copy_bound_shape_is_measured_on_both_tiers`; 14 blocks / 70 IR instrs / 12 cached slots):
 
 | counter | before (written-set) | after (dirty-set) |

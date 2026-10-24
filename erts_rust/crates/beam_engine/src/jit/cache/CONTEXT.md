@@ -18,7 +18,7 @@ The key is the two-part `CacheKey { module: ModuleKey, atoms: AtomSnapshot }` �
 - `Digest([u8; 16])` — a real `.beam`'s **load-time MD5** (`beam_loader::Module::checksum()`), read as a plain `Copy`. O(1), no hash, no allocation. This is the point of the design.
 - `Content { name: String, fingerprint: u64 }` — the fallback for a synthetic/hand-built module (`Module::default()` carries an all-zero checksum, which no real `.beam` has): its name plus the `module_fingerprint` content hash.
 `atoms` is `Module::atom_table.snapshot()` — an O(1), allocation-free witness of the table's identity, its append generation and its length.
-`CacheKey::of` / `CacheKey::with_fingerprint` are the **single** derivation every entry and every `MemoEntry` goes through, so the two maps cannot disagree about a module's identity; `ModuleKey::of` / `with_fingerprint` and the helpers `digest_of`/`module_name` derive the module half, and the two variants hash their discriminant, so they can never cross-key. `module_fingerprint` stays `pub` (the fallback identity, re-exported by `mod.rs`).
+`CacheKey::of` / `CacheKey::with_fingerprint` are the **single** derivation every entry and every `MemoEntry` goes through, so the two maps cannot disagree about a module's identity; `ModuleKey::of` / `with_fingerprint` and the helpers `digest_of`/`module_name` derive the module half, and the two variants hash their discriminant, so they can never cross-key. `module_fingerprint` stays `pub` (the fallback identity, re-exported by `mod.rs`); `needed_fingerprint` is the artifact-staging entry that returns `None` for a digest-carrying module.
 The namespace half is load-bearing: the baseline tier bakes atom **indices** into its emitted code (`Operand::Atom(a)` → the `make_atom(a)` immediate), so the same `.beam` loaded against a second namespace (a second runtime in the same thread, which is how `beam_rt`'s code server loads every `.beam`) must **miss** instead of reusing the first runtime's blocks.
 
 ## The trade
@@ -34,11 +34,13 @@ Verified: no production path mutates a `Module`'s `functions`/`funs`/`records`/`
 **A post-load mutation would invalidate the key** — the accepted trade for O(1).
 
 ## Known Issues
-- The **one-time cold staging** hash is not exactly one `module_fingerprint` call for a synthetic
-  module: `CompiledModule::lazy` / the eager constructor (in `../baseline/`) compute the artifact's stored
-  `fingerprint` at creation, and the key derivation may hash the same module too, so the real cost is
-  **one or two** hashes per cold staging (`tests.rs::an_unprimed_entry_pays_the_content_hash_on_every_slice`
-  asserts `1..=2`). The digest key removes all **per-slice** cost, not that one-time construction cost.
+- **A synthetic module's cold staging** hashes once or twice: `CompiledModule::lazy` / the eager
+  constructor (in `../baseline/`) record the artifact's `fingerprint` at creation and the key derivation
+  may hash the same module too, so the real cost is **one or two** hashes per cold staging
+  (`tests.rs::an_unprimed_entry_pays_the_content_hash_on_every_slice` asserts `1..=2`).
+  `needed_fingerprint` makes that **zero for every real `.beam`** at staging and on the key path alike
+  (pinned by `tests.rs::staging_a_real_beam_records_no_fingerprint_and_never_hashes_the_ir`):
+  the digest-only modules are exactly the ones whose fingerprint nothing reads.
 - **No artifact/memo eviction or unload hook.** `CodeCache` never evicts: its API is
   `new`/`len`/`is_empty`/`compiles`/`contains`/`clear`/`get_or_compile`/`compiled_handle`/`prime`
   plus the run entries and `code_map`, and nothing removes a **single** module's artifacts or memos

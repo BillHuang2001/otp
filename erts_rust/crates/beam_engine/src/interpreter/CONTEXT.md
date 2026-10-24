@@ -258,17 +258,25 @@ The local-call arm (`dispatch.rs:413-515`, seams at `:429`/`:475`/`:504`) does *
 call: the host's verdict is memoized **per callee function index** in the executing module context's table
 (`../machine/local_callee.rs`, `LocalVerdicts`; context `0` uses the machine-owned
 `Machine::entry_verdicts`).
-`Machine::local_call_seam` (`dispatch.rs:1149-1212`) reads it in phases.
-**Phase 0, every local call:** one `Cell` read of the lazily armed
-`Machine::local_call_invalidation_pending` (only `erlang:load_nif/2` sets it; the out-of-line
-`Machine::invalidate_local_call_verdicts` then clears every context's table).
-**Phase 1, every local call:** `self.verdict_table()` then `table.get(callee)` — **one bounds-checked slot
-load**, no scan, no key compare. The slot is a property of the *callee* rather than of the call history, so
-the alternating two-callee loop this seam is priced on (`sum/1`/`walk/3`) costs exactly what a single-callee
-loop costs; the MRU variant memmoved on every call, and the fixed `CAP = 8` key scan that replaced it still
-left one unpredictable branch per call. The answer is a **byte**: `Unnameable` (the memoized "no function
-entry / unresolvable name atom" — zero consultations) and `Declined` (the host's own earlier `false`) both
-take the caller's unchanged in-machine jump, `Served` goes straight to phase 2, and only `Unknown` asks.
+`Machine::local_call_seam` reads it in phases.
+**Phases 0 and 1, every local call — the whole hot path, `#[inline(always)]` in
+`Machine::local_call_enters_in_machine`:** one `Cell` read of the lazily armed
+`Machine::local_call_invalidation_pending` (only `erlang:load_nif/2` sets it; the `#[cold] #[inline(never)]`
+`Machine::consume_pending_local_call_invalidation` then clears every context's table), then
+`self.verdict_table()` and `table.enters_in_machine(callee)` — **one bounds-checked slot load** and **one
+range compare**, no scan, no key compare, no jump table. The slot is a property of the *callee* rather than
+of the call history, so the alternating two-callee loop this seam is priced on (`sum/1`/`walk/3`) costs
+exactly what a single-callee loop costs; the MRU variant memmoved on every call, and the fixed `CAP = 8` key
+scan that replaced it still left one unpredictable branch per call. The answer is a **byte** with explicit,
+ordered discriminants: `Unnameable` (the memoized "no function entry / unresolvable name atom" — zero
+consultations) and `Declined` (the host's own earlier `false`) are the two lowest, so
+`Verdict::enters_in_machine` is `(v as u8) < FIRST_NOT_IN_MACHINE` and a four-way `match` here is avoided on
+purpose — it compiled to a dependent load plus an indirect jump, measured at ~64 % of the seam's own cycles
+on `gc_bound/churn`. Both take the caller's unchanged in-machine jump and answer `Ok(None)` before the slow
+half is entered; `Served` goes straight to phase 2, and only `Unknown` asks.
+**The slow half, out of line in `Machine::local_call_seam_slow` (`Served` and `Unknown` only):** phase 1 is
+re-read there (so the slow half stays a total function of the table's value), then the `Served` dispatch or
+the `Unknown` derivation.
 **Phase 1b, `Unknown` only (once per distinct callee per run, out of line in
 `Machine::ask_local_callee`):** the identity is derived from the `module` **parameter** through
 `local_callee_identity`, the host's `resolve_local_call` is asked and the answer recorded, so the hot path
@@ -286,8 +294,11 @@ and `LocalVerdicts::describes` (owner image + function count) is re-validated at
 debug-asserted by the seam. Slots are `Cell`s because the seam reads the table while the machine holds
 `&Module` borrows and a registered context's table is reached through the shared `Arc`.
 **`Machine::local_call_seam` is the ONE definition of the seam both tiers drive** — the interpreter's three
-local-call arms, `jit/baseline/call.rs::store_continuation` and `jit/baseline/runtime.rs::probe_local_call` — so the
-memo inside it benefits the baseline tier with **zero** `../jit/baseline/**` edits.
+local-call arms, `jit/baseline/call.rs::store_continuation` and `jit/baseline/runtime.rs::probe_local_call` — and
+both tiers test the same `#[inline(always)]` `Machine::local_call_enters_in_machine` predicate first, so a declined
+local call never enters the seam at all (the predicate *is* the seam's phases 0+1, including the pending-invalidation
+consume, not a bypass around them), while the once-per-callee derivation and the `Served` dispatch stay out of line
+and benefit both tiers with **zero** `../jit/baseline/**` emitter changes.
 **Why the verdict may be cached here at all.** The host predicate is a pure function of the
 `(module, function, arity)` triple and ERTS charges **nothing** for an intra-module call, so a per-call
 consultation is the deviation, not the memo. What can change an answer mid-run is an *installation*, so there

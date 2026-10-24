@@ -982,6 +982,20 @@ impl Machine {
     ///
     /// When no loose term is held the stack is untouched and this method is
     /// byte-identical to the pre-parking behavior.
+    ///
+    /// # Cost model (do not grow the fast path without measuring)
+    ///
+    /// This is the funnel behind **every** heap admission on **every** tier, so the
+    /// no-loose-term path — overwhelmingly the common one — is kept as small as possible
+    /// and is deliberately outlined-free, while everything the parking needs is behind
+    /// [`Machine::with_parked_loose_terms_then_seat`] (`#[inline(never)]`, so it does not
+    /// enlarge the fast path's frame or its caller). The fast path is: two extent
+    /// computations, two unconditional dirty-extent stores, one armed predicate over the
+    /// five loose fields, the [`RootSet`] construction and the caller's own closure — no
+    /// array is materialised there (the predicate is derived from
+    /// [`Machine::loose_heap_terms`], compiled to a bitwise fold over the five fields, so
+    /// the one-list rule is kept and no stack array is touched).
+    #[inline(always)]
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
         // The receiver is handed mutable slices of BOTH register files, but only the
         // **prefix that can hold a term**: every slot at or beyond the run's used extent
@@ -990,19 +1004,61 @@ impl Machine {
         // actually written, which is what keeps the next `reset` proportional to the run.
         let x_live = self.used_x_extent() as usize;
         let fr_live = self.used_fr_extent() as usize;
-        self.note_x_dirty(x_live as u32);
-        self.note_fr_dirty(fr_live as u32);
-        let loose = self.loose_heap_terms();
-        if loose.iter().all(Option::is_none) {
-            let roots = RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
+        // `x_live` IS `max(x_mark, x_dirty).min(len)`, and `x_dirty` is only ever written
+        // clamped to `len` (here and in `note_x_dirty`) or to `0` (`reset`), so
+        // `x_live >= x_dirty` always holds and `note_x_dirty(x_live)` would store exactly
+        // `x_live`. Storing it unconditionally is that store minus a compare-and-branch —
+        // and both consumers of `x_dirty` (`used_x_extent`, `reset`'s refill bound) read it
+        // through `max(x_mark, x_dirty)`, which is `x_live` before and after.
+        debug_assert!(x_live as u32 >= self.x_dirty);
+        debug_assert!(fr_live as u32 >= self.fr_dirty);
+        self.x_dirty = x_live as u32;
+        self.fr_dirty = fr_live as u32;
+        if !self.has_loose_heap_terms() {
+            let roots =
+                RootSet::new(&mut self.x[..x_live], &mut self.stack, &mut self.fr[..fr_live], live);
             return f(roots);
         }
         // The machine holds at least one heap term outside the root-set files: park them
         // so the host roots (and relocates) them, then re-seat them from the slots the
         // host wrote back through.
+        self.with_parked_loose_terms_then_seat(x_live, fr_live, live, f)
+    }
+
+    /// The **cold** half of [`Machine::with_roots`]: park the machine's loose heap terms at
+    /// the stack tail, hand `f` the [`RootSet`] that now carries them, and re-seat every
+    /// field from the slot the host wrote back through.
+    ///
+    /// Reached only when [`Machine::has_loose_heap_terms`] holds, so a machine holding no
+    /// loose term never pays for the parking code (it is `#[inline(never)]` so the fast
+    /// path's frame stays small and its closure is not duplicated into it).
+    ///
+    /// Deriving `loose` here rather than taking it from the caller keeps
+    /// [`Machine::loose_heap_terms`] the **one** list: the predicate and the parked array are
+    /// two readings of the same fields, never two enumerations of them.
+    #[inline(never)]
+    fn with_parked_loose_terms_then_seat<R>(
+        &mut self,
+        x_live: usize,
+        fr_live: usize,
+        live: u32,
+        f: impl FnOnce(RootSet<'_>) -> R,
+    ) -> R {
+        let loose = self.loose_heap_terms();
         let (result, reseated) = self.with_parked_loose_terms(x_live, fr_live, live, loose, f);
         self.seat_loose_heap_terms(reseated);
         result
+    }
+
+    /// Is at least one of the machine's loose heap terms
+    /// ([`Machine::loose_heap_terms`]) armed?
+    ///
+    /// [`Machine::with_roots`]'s fast-path predicate, and the reason the fast path touches
+    /// no stack array: it is a reading of the same five fields, which the optimizer folds
+    /// into one bitwise test on their raw words.
+    #[inline]
+    fn has_loose_heap_terms(&self) -> bool {
+        self.loose_heap_terms().iter().any(Option::is_some)
     }
 
     /// How many loose heap-term slots [`Machine::with_roots`] can park.
@@ -1018,6 +1074,11 @@ impl Machine {
     /// Erlang stack, and written back by [`Machine::seat_loose_heap_terms`] in the same
     /// order — so **adding a loose field means adding it here and nowhere else**. `None`
     /// means "this field holds no term right now" and parks (and re-seats) nothing.
+    ///
+    /// [`Machine::has_loose_heap_terms`] — the fast-path predicate of
+    /// [`Machine::with_roots`] — is derived from this array rather than enumerating the
+    /// fields a second time, so it cannot disagree with what actually gets parked.
+    #[inline]
     fn loose_heap_terms(&self) -> [Option<Eterm>; Self::LOOSE_HEAP_TERMS] {
         [
             self.raise_function_clause_args,

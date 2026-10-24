@@ -1257,6 +1257,15 @@ fn probe_local_call(
     ctx: &mut dyn ExecutionContext,
 ) -> Option<std::result::Result<Step, Box<BeamError>>> {
     let (callee, arity) = decode_local_call(callee_arity);
+    // The seam's **`Ok(None)` fast path, inline**: a memoized "enter this callee in this
+    // machine" verdict — every ordinary local call — is the seam's whole answer, so the
+    // slow half, the arm's frame construction and the debug-only self-check below are all
+    // skipped. It performs the seam's Phase 0 too (a pending `load_nif` invalidation), so
+    // it can never answer from a stale verdict; it is the same predicate the seam itself
+    // starts with (`Machine::local_call_enters_in_machine`), not a second definition of it.
+    if machine.local_call_enters_in_machine(callee) {
+        return None;
+    }
     let frame = match kind {
         LOCAL_CALL_ONLY => ImportFrame::Only,
         LOCAL_CALL_LAST => ImportFrame::Last(deallocate),

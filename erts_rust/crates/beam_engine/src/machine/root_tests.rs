@@ -325,9 +325,235 @@ fn with_roots_re_seats_the_two_supplied_trace_term_latches_from_their_parked_slo
 }
 
 // ---------------------------------------------------------------------------
-// The writable twin: `Machine::for_each_root_mut`
+// `Machine::with_roots`'s fast-path predicate: one loose field at a time
 // ---------------------------------------------------------------------------
 
+/// Read loose heap-term slot `slot` straight from its **field**, in
+/// [`Machine::loose_heap_terms`] / [`Machine::seat_loose_heap_terms`] order.
+///
+/// Written out field by field — deliberately not through `loose_heap_terms` — so the pins
+/// below compare the parked-and-re-seated *fields* with an independent reading of them, not
+/// with the engine's own array.
+fn loose_slot(machine: &Machine, slot: usize) -> Option<Eterm> {
+    match slot {
+        0 => machine.raise_function_clause_args,
+        1 => machine.pending_function_clause_args,
+        2 => machine.pending_exception.map(|(_class, reason)| reason),
+        3 => machine.pending_supplied_term,
+        4 => machine.raise_supplied_term,
+        _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
+    }
+}
+
+/// Arm loose heap-term slot `slot` with `term`, leaving every other loose field unarmed.
+fn arm_loose_slot(machine: &mut Machine, slot: usize, term: Eterm) {
+    match slot {
+        0 => machine.raise_function_clause_args = Some(term),
+        1 => machine.pending_function_clause_args = Some(term),
+        2 => machine.pending_exception = Some((ExceptionClass::Error, term)),
+        3 => machine.pending_supplied_term = Some(term),
+        4 => machine.raise_supplied_term = Some(term),
+        _ => unreachable!("the machine has exactly {} loose fields", Machine::LOOSE_HEAP_TERMS),
+    }
+}
+
+/// A machine with a 1-slot frame holding `NIL`, **no** loose term armed and nothing else
+/// rooted, so a test that arms one loose field can attribute every parked word to it.
+fn empty_roots_machine() -> Machine {
+    let mut machine = Machine::new();
+    machine.push_frame(1).expect("a 1-slot frame fits the stack");
+    machine.set_y(0, NIL).expect("y(0) is inside the frame");
+    assert_eq!(
+        machine.loose_heap_terms(),
+        [None; Machine::LOOSE_HEAP_TERMS],
+        "the machine must start with no loose heap term armed"
+    );
+    machine
+}
+
+/// Play a moving collector over the hand-off: assert `held` rides the handed root set,
+/// rewrite **every** occurrence of it in the stack slice with `moved`, and report how many
+/// slots it occupied.
+fn park_and_move(machine: &mut Machine, held: Eterm, moved: Eterm) -> usize {
+    let mut parked = 0;
+    machine.with_roots(RootSet::ALL_LIVE, |roots| {
+        assert!(
+            roots
+                .x
+                .iter()
+                .chain(roots.stack.iter())
+                .chain(roots.fr.iter())
+                .any(|word| *word == held),
+            "the armed loose term must ride the mutable root set with_roots hands over — a \
+             fast path that took its cheap branch with a loose term armed would leave the \
+             term unrooted, and a collecting host would strand it"
+        );
+        for slot in roots.stack.iter_mut() {
+            if *slot == held {
+                *slot = moved;
+                parked += 1;
+            }
+        }
+    });
+    parked
+}
+
+/// **The soundness pin for [`Machine::with_roots`]'s fast-path predicate.**
+///
+/// `with_roots` parks the machine's loose heap terms — and re-seats each field from the slot
+/// the host wrote back through — **iff** at least one of the five is armed. A predicate that
+/// reads the wrong field, or that forgets one, silently takes the cheap branch while a heap
+/// term is held outside the frozen [`RootSet`]: the visitor's relocation never reaches it and
+/// the field keeps the pre-hand-off word, i.e. a **dangling pointer** after a real
+/// collection. Nothing about that is visible without a visitor that actually moves things,
+/// which is what this test is.
+///
+/// Each of the five fields is armed **on its own** (every other loose field stays unarmed),
+/// so an enum-erated predicate that is right for "all armed" and wrong for "exactly one armed"
+/// fails here. The parked word must appear exactly once, the field must hold the *moved* word
+/// afterwards, the stack length must be restored, and both root-enumeration doors must report
+/// the moved word and nothing else.
+#[test]
+fn with_roots_parks_and_relocates_each_loose_field_armed_on_its_own() {
+    let mut ctx = MinimalContext::new();
+    for slot in 0..Machine::LOOSE_HEAP_TERMS {
+        // Distinct pointer-bearing words per slot, so a stale word from the previous
+        // iteration (or the wrong field) can never pass the assertions below.
+        let held = terms::make_list(&mut ctx, &[make_small(100 + slot as i64)])
+            .expect("a cons cell");
+        let moved = terms::make_tuple(&mut ctx, &[make_small(200 + slot as i64)])
+            .expect("a boxed tuple");
+        assert!(
+            pointer_bearing(held) && pointer_bearing(moved),
+            "both words must be relocatable for the move to be observable"
+        );
+
+        let mut machine = empty_roots_machine();
+        arm_loose_slot(&mut machine, slot, held);
+        assert_eq!(
+            machine
+                .loose_heap_terms()
+                .iter()
+                .filter(|term| term.is_some())
+                .count(),
+            1,
+            "slot {slot} is the only armed loose field"
+        );
+        let stack_before = machine.stack_mut().len();
+
+        let parked = park_and_move(&mut machine, held, moved);
+        assert_eq!(
+            parked, 1,
+            "slot {slot}: the armed loose term is parked exactly once"
+        );
+        assert_eq!(
+            loose_slot(&machine, slot),
+            Some(moved),
+            "slot {slot}: the field must be re-seated from the slot the host wrote back \
+             through — a fast path that skipped the parking leaves the stale word here"
+        );
+        assert_eq!(
+            machine.stack_mut().len(),
+            stack_before,
+            "slot {slot}: the parked word is truncated off the stack afterwards"
+        );
+
+        let mut walked = Vec::new();
+        machine.for_each_root(|term| walked.push(term));
+        assert_eq!(
+            walked,
+            vec![moved],
+            "slot {slot}: for_each_root reports the re-seated word, never the abandoned one"
+        );
+        let mut rooted = Vec::new();
+        machine.with_roots(RootSet::ALL_LIVE, |roots| {
+            for &word in roots
+                .x
+                .iter()
+                .chain(roots.stack.iter())
+                .chain(roots.fr.iter())
+            {
+                if pointer_bearing(word) {
+                    rooted.push(word);
+                }
+            }
+        });
+        assert_eq!(
+            raws(walked),
+            raws(rooted),
+            "slot {slot}: the two doors still agree after the relocation"
+        );
+    }
+}
+
+/// The other half of the pin: with **no** loose term armed, `with_roots` parks nothing — the
+/// handed stack is exactly the Erlang stack.
+///
+/// This is the shape the no-parking fast path must keep (its cheap branch is taken *iff* all
+/// five fields are unarmed), and it is what makes the fast path byte-identical to the
+/// pre-parking behavior.
+#[test]
+fn with_roots_parks_nothing_when_no_loose_field_is_armed() {
+    let mut machine = empty_roots_machine();
+    let stack_before = machine.stack_mut().len();
+    let handed = machine.with_roots(RootSet::ALL_LIVE, |roots| {
+        assert_eq!(
+            roots.stack.len(),
+            stack_before,
+            "an unarmed machine hands over the Erlang stack and nothing else"
+        );
+        roots.stack.len()
+    });
+    assert_eq!(handed, stack_before);
+    assert_eq!(machine.stack_mut().len(), stack_before);
+}
+
+/// The all-armed twin of the per-slot pin: every loose field armed at once must be parked and
+/// re-seated, in one hand-off, and none may be dropped or cross-seated.
+#[test]
+fn with_roots_relocates_all_five_loose_fields_in_one_hand_off() {
+    let mut ctx = MinimalContext::new();
+    let mut held = Vec::new();
+    let mut moved = Vec::new();
+    for slot in 0..Machine::LOOSE_HEAP_TERMS {
+        held.push(terms::make_list(&mut ctx, &[make_small(300 + slot as i64)]).expect("a cons"));
+        moved.push(
+            terms::make_tuple(&mut ctx, &[make_small(400 + slot as i64)]).expect("a tuple"),
+        );
+    }
+    let mut machine = empty_roots_machine();
+    for (slot, term) in held.iter().enumerate() {
+        arm_loose_slot(&mut machine, slot, *term);
+    }
+    let stack_before = machine.stack_mut().len();
+
+    let mut parked = 0;
+    machine.with_roots(RootSet::ALL_LIVE, |roots| {
+        for slot in roots.stack.iter_mut() {
+            if let Some(index) = held.iter().position(|word| *word == *slot) {
+                *slot = moved[index];
+                parked += 1;
+            }
+        }
+    });
+    assert_eq!(
+        parked,
+        Machine::LOOSE_HEAP_TERMS,
+        "every armed loose term is parked, in one hand-off"
+    );
+    for slot in 0..Machine::LOOSE_HEAP_TERMS {
+        assert_eq!(
+            loose_slot(&machine, slot),
+            Some(moved[slot]),
+            "slot {slot} must hold its own moved word (not another slot's, and not the stale one)"
+        );
+    }
+    assert_eq!(machine.stack_mut().len(), stack_before);
+}
+
+// ---------------------------------------------------------------------------
+// The writable twin: `Machine::for_each_root_mut`
+// ---------------------------------------------------------------------------
 /// **The parity gate between the two root doors.**
 ///
 /// [`Machine::for_each_root_mut`] must hand over exactly the root words

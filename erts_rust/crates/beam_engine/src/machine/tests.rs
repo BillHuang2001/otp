@@ -1097,6 +1097,97 @@ fn resetting_the_machine_forces_a_re_consultation_and_a_re_derivation() {
     );
 }
 
+/// **(f) The seam's inline decline predicate is the seam's own first phase, not a shortcut
+/// around it.** `Machine::local_call_enters_in_machine` is what a caller (the native
+/// baseline tier) tests to skip the seam, so it must answer exactly what the table holds,
+/// ask the host **nothing** itself (an `Unknown` callee still reaches the host through the
+/// seam), file no verdict — and consume a **pending** invalidation, so a caller that skips
+/// the seam on `true` can never answer from a stale verdict (the `erlang:load_nif/2` route).
+#[test]
+fn the_inline_decline_predicate_is_the_seams_own_first_phase() {
+    let module = two_call_module();
+    let observations = SeamObservations::default();
+    let mut machine = Machine::new();
+    machine.bind_entry_verdicts(&module);
+    // `helper` is function index 2 of the fixture.
+    const CALLEE: u32 = 2;
+    for (verdict, enters) in [
+        (Verdict::Declined, true),
+        (Verdict::Unnameable, true),
+        (Verdict::Served, false),
+        (Verdict::Unknown, false),
+    ] {
+        machine.verdict_table().expect("a table").set(CALLEE, verdict);
+        assert_eq!(
+            machine.local_call_enters_in_machine(CALLEE),
+            enters,
+            "the predicate's answer for a memoized {verdict:?} verdict"
+        );
+        assert_eq!(
+            verdict_of(&machine, CALLEE),
+            verdict,
+            "the predicate files nothing of its own"
+        );
+    }
+    // A callee the table has no slot for is never claimed to enter in machine.
+    assert!(
+        !machine.local_call_enters_in_machine(u32::MAX),
+        "a missing slot answers `false` (ask the seam), exactly like the full read"
+    );
+    assert_eq!(
+        observations.consultations.get(),
+        0,
+        "the predicate consults the host zero times, whatever it answers"
+    );
+    // A **pending** invalidation is consumed by the predicate itself, so a caller that
+    // skips the seam on `true` sees the cleared table and asks the host next time.
+    machine
+        .verdict_table()
+        .expect("a table")
+        .set(CALLEE, Verdict::Declined);
+    machine.local_call_invalidation_pending.set(true);
+    assert!(
+        !machine.local_call_enters_in_machine(CALLEE),
+        "the armed invalidation cleared the memoized decline before it was read"
+    );
+    assert_eq!(
+        verdict_of(&machine, CALLEE),
+        Verdict::Unknown,
+        "… through the same door `invalidate_local_call_verdicts` uses"
+    );
+    assert!(
+        !machine.local_call_invalidation_pending.get(),
+        "and the flag is cleared, so the next call does not clear again"
+    );
+}
+/// **(g) The seam agrees with the predicate on every verdict class, and the run-level
+/// behaviour is unchanged by the fold**: a declined callee runs in this machine (its own
+/// body's value flows out) and a served one is dispatched as a BIF — with the host asked
+/// once per distinct callee either way.
+#[test]
+fn the_seam_still_answers_every_verdict_class_after_the_fold() {
+    for (serve, expected, consultations, bif_calls) in [(false, 99, 1, 0), (true, 7, 1, 2)] {
+        let module = two_call_module();
+        let (outcome, observations, mut machine) = run_fixture(&module, "run", serve);
+        assert_eq!(outcome, RunOutcome::Returned(make_small(expected)));
+        assert_eq!(observations.consultations.get(), consultations);
+        assert_eq!(observations.bif_calls.get(), bif_calls);
+        assert_eq!(
+            verdict_of(&machine, 2),
+            if serve {
+                Verdict::Served
+            } else {
+                Verdict::Declined
+            },
+            "the filed verdict is the one the predicate reads afterwards"
+        );
+        assert_eq!(
+            machine.local_call_enters_in_machine(2),
+            !serve,
+            "and the predicate's answer matches it"
+        );
+    }
+}
 /// **(e) The seam is still consulted at least once, so a NIF-stub route still works** —
 /// and it is consulted exactly once per callee even though the callee is *served* twice.
 #[test]

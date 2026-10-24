@@ -110,8 +110,25 @@ use beam_loader::Module;
 /// It is `Copy` and one byte, so a slot hands it back by value with no borrow of the
 /// table (which is what lets the same method consult the host, a separate
 /// `&mut dyn ExecutionContext`, without fighting the borrow checker).
+///
+/// The discriminants are **explicit and ordered** for one reason: the two verdicts that
+/// leave the caller's in-machine jump are the two lowest, so
+/// [`Verdict::enters_in_machine`] — the seam's hot test, run on every local call — is a
+/// single range compare. Written as a `match`, the four-way test compiled to a
+/// **jump table** (a table load plus an indirect jump per local call, measured at ~64 % of
+/// the seam's own cycles on `gc_bound/churn`); the range test cannot be lowered that way,
+/// and [`Verdict::enters_in_machine_is_the_low_discriminant_range`] pins the ordering it
+/// depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum Verdict {
+    /// The host answered `false`: enter the callee in this machine.
+    Declined = 0,
+    /// The callee cannot be named (no function entry, or a name atom the module's atom
+    /// table does not resolve), so the host is **never** asked about it.
+    Unnameable = 1,
+    /// The host answered `true`: serve this callee as a BIF.
+    Served = 2,
     /// Nothing is known about this callee yet (its slot's value at creation, and what an
     /// **invalidated** verdict falls back to): the seam derives the callee's identity and
     /// consults the host once, then records the answer.
@@ -120,14 +137,22 @@ pub(crate) enum Verdict {
     /// machine stepped without a run entry) or a function index the module does not own.
     /// Neither can happen for a well-formed local call, and `Unknown` is the one answer
     /// that cannot fabricate a verdict: it can only re-ask.
-    Unknown,
-    /// The callee cannot be named (no function entry, or a name atom the module's atom
-    /// table does not resolve), so the host is **never** asked about it.
-    Unnameable,
-    /// The host answered `true`: serve this callee as a BIF.
-    Served,
-    /// The host answered `false`: enter the callee in this machine.
-    Declined,
+    Unknown = 3,
+}
+impl Verdict {
+    /// The first discriminant that does **not** enter the callee in this machine — the
+    /// upper bound of the range [`Verdict::enters_in_machine`] tests.
+    const FIRST_NOT_IN_MACHINE: u8 = Verdict::Served as u8;
+    /// Does this verdict keep the caller's unchanged **in-machine jump** (so the host
+    /// needs no dispatch and the seam answers `Ok(None)`)?
+    ///
+    /// `true` for the two verdicts that mean "run the callee's own code": a memoized
+    /// decline (the host's own earlier answer) and a memoized un-nameable callee (a callee
+    /// the host is never asked about). One range compare, no jump table.
+    #[inline(always)]
+    pub(crate) fn enters_in_machine(self) -> bool {
+        (self as u8) < Self::FIRST_NOT_IN_MACHINE
+    }
 }
 
 /// One module context's **index-addressed** local-call verdict table: one slot per entry
@@ -203,6 +228,19 @@ impl LocalVerdicts {
         match self.table.get(callee as usize) {
             Some(slot) => slot.get(),
             None => Verdict::Unknown,
+        }
+    }
+    /// Does the table's answer for `callee` keep the caller's **in-machine jump** —
+    /// [`Verdict::enters_in_machine`] folded into the slot read?
+    ///
+    /// This is the whole of the seam's hot path: one bounds-checked `Cell` load and one
+    /// range compare (a missing slot answers `false`, i.e. "ask the host", the same
+    /// [`Verdict::Unknown`] the full read would have answered).
+    #[inline(always)]
+    pub(crate) fn enters_in_machine(&self, callee: u32) -> bool {
+        match self.table.get(callee as usize) {
+            Some(slot) => slot.get().enters_in_machine(),
+            None => false,
         }
     }
 
@@ -295,6 +333,74 @@ mod tests {
         assert_eq!(table.slots(), module.functions.len());
         assert!((0..3).all(|func| table.get(func) == Verdict::Unknown));
         assert!(table.describes(&module));
+    }
+
+    /// The hot test is a **range** compare over the discriminants, so the two
+    /// enter-in-machine verdicts must stay the two lowest and every other verdict must stay
+    /// above them. This pins the ordering the lowering depends on: reorder or insert a
+    /// variant and this fails rather than silently turning a decline into a host call (or,
+    /// worse, a served callee into an in-machine jump).
+    #[test]
+    fn enters_in_machine_is_the_low_discriminant_range() {
+        assert!(Verdict::Declined.enters_in_machine(), "a decline runs the callee");
+        assert!(
+            Verdict::Unnameable.enters_in_machine(),
+            "an un-nameable callee runs the callee"
+        );
+        assert!(
+            !Verdict::Served.enters_in_machine(),
+            "a served callee is a BIF"
+        );
+        assert!(
+            !Verdict::Unknown.enters_in_machine(),
+            "an unknown callee must ask the host"
+        );
+        // The range bound is exactly the first verdict that does not enter in machine.
+        assert_eq!(
+            Verdict::FIRST_NOT_IN_MACHINE,
+            Verdict::Served as u8,
+            "the range test's bound is `Served`"
+        );
+        assert!(
+            (Verdict::Declined as u8) < (Verdict::Unnameable as u8)
+                && (Verdict::Unnameable as u8) < Verdict::FIRST_NOT_IN_MACHINE,
+            "the two enter-in-machine verdicts are the two lowest discriminants, in order"
+        );
+    }
+
+    /// The slot-read fold ([`LocalVerdicts::enters_in_machine`]) answers exactly what the
+    /// full read followed by [`Verdict::enters_in_machine`] answers — for every verdict,
+    /// and for a callee with no slot at all.
+    #[test]
+    fn the_folded_slot_read_agrees_with_the_full_read() {
+        let module = fixture(&["a", "b"]);
+        let table = LocalVerdicts::for_module(&module);
+
+        for verdict in [
+            Verdict::Declined,
+            Verdict::Unnameable,
+            Verdict::Served,
+            Verdict::Unknown,
+        ] {
+            table.set(1, verdict);
+            assert_eq!(
+                table.enters_in_machine(1),
+                table.get(1).enters_in_machine(),
+                "the folded read for a memoized {verdict:?} verdict"
+            );
+            assert_eq!(table.enters_in_machine(1), verdict.enters_in_machine());
+        }
+        assert_eq!(
+            table.enters_in_machine(1),
+            table.get(1).enters_in_machine(),
+            "… and the same agreement for the last value written"
+        );
+        // No slot: the fold answers `false` (ask the host), like the full read's `Unknown`.
+        assert!(!table.enters_in_machine(7));
+        assert_eq!(table.get(7), Verdict::Unknown);
+        // An unbuilt table never claims a callee enters in machine.
+        assert!(!LocalVerdicts::empty().enters_in_machine(0));
+        assert_eq!(table.derivation_count(), 0, "neither read asks anything");
     }
 
     /// The table is **index-addressed**: a callee's verdict is read back from the slot its

@@ -116,6 +116,75 @@
         assert!(buf.shl_ri(Reg::Rax, u32::MAX).is_err());
     }
 
+    /// The bytes emitted since the last `CodeBuffer::new` — the encoder-level view a
+    /// byte assertion needs (`as_fn_ptr` executes them, but only a byte comparison pins
+    /// the *encoding*).
+    fn emitted(buf: &CodeBuffer) -> Vec<u8> {
+        // SAFETY: `code_ptr` addresses the buffer's own mapping and `len` is the count
+        // of bytes written into it, so the region is valid, writable-and-read memory
+        // owned by `buf`; the slice borrows it only for this copy.
+        unsafe { std::slice::from_raw_parts(buf.code_ptr(), buf.len()) }.to_vec()
+    }
+
+    #[test]
+    fn emits_cqo_and_idiv() {
+        // `cqo` (sign-extend `rax` into `rdx:rax`) and `idiv` (the signed divide) are
+        // the two encoders the `erlang:div/2`/`erlang:rem/2` fast path's
+        // untag/divide/re-tag sequence is built from.
+        //
+        // The encoding first: `REX.W 99` for `cqo`, and `REX.W F7 /7` for a 64-bit
+        // `idiv` (the `/7` opcode extension with the divisor in the `ModRM` `r/m`
+        // field, `REX.B` set for a register at or above `r8`).
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.cqo().unwrap();
+        assert_eq!(emitted(&buf), vec![0x48, 0x99]);
+        buf.idiv_rr(Reg::Rsi).unwrap();
+        assert_eq!(emitted(&buf), vec![0x48, 0x99, 0x48, 0xF7, 0xFE]);
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.idiv_rr(Reg::R8).unwrap();
+        assert_eq!(emitted(&buf), vec![0x49, 0xF7, 0xF8], "REX.B for r8");
+
+        // Then the semantics: `q(a, b) = a idiv b` and `r(a, b) = a rem b`, each after
+        // the `cqo` the divide requires. The quotient truncates **toward zero** and the
+        // remainder takes the **dividend's** sign — the Erlang pair.
+        let quotient = {
+            let mut buf = CodeBuffer::new().unwrap();
+            buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+            buf.cqo().unwrap();
+            buf.idiv_rr(Reg::Rsi).unwrap();
+            buf.ret().unwrap();
+            buf.seal().unwrap();
+            let q: BinOp = buf.as_fn_ptr();
+            [q(7, 2), q(-7, 2), q(7, -2), q(-7, -2)]
+        };
+        assert_eq!(quotient, [3, -3, -3, 3]);
+        let remainder = {
+            let mut buf = CodeBuffer::new().unwrap();
+            buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+            buf.cqo().unwrap();
+            buf.idiv_rr(Reg::Rsi).unwrap();
+            buf.mov_rr(Reg::Rax, Reg::Rdx).unwrap();
+            buf.ret().unwrap();
+            buf.seal().unwrap();
+            let r: BinOp = buf.as_fn_ptr();
+            [r(7, 2), r(-7, 2), r(7, -2), r(-7, -2)]
+        };
+        assert_eq!(remainder, [1, -1, 1, -1]);
+        // The dividend's full 64-bit width survives the sign extension: without `cqo`
+        // (`rdx` holding 0) a negative dividend would divide as a huge unsigned value.
+        let signed = {
+            let mut buf = CodeBuffer::new().unwrap();
+            buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+            buf.cqo().unwrap();
+            buf.idiv_rr(Reg::Rsi).unwrap();
+            buf.ret().unwrap();
+            buf.seal().unwrap();
+            let q: BinOp = buf.as_fn_ptr();
+            [q(i64::MIN + 1, 2), q(-(1 << 40), 1 << 20)]
+        };
+        assert_eq!(signed, [(i64::MIN + 1) / 2, -(1 << 20)]);
+    }
+
     #[test]
     fn emits_writes_to_r8_and_r9() {
         let mut buf = CodeBuffer::new().unwrap();

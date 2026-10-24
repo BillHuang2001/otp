@@ -112,6 +112,7 @@ use key::module_address;
 // `crate::jit::cache::module_fingerprint` keeps resolving for the crate and its host.
 #[doc(inline)]
 pub use key::module_fingerprint;
+pub(crate) use key::needed_fingerprint;
 #[cfg(test)]
 pub(crate) use key::fingerprint_calls;
 

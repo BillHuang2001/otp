@@ -152,6 +152,18 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - The deopt / execution / code-size censuses and their gate commands: `census/CONTEXT.md`.
 - The test enumeration: `testing/CONTEXT.md`.
 
+## What is keyed by what (the tier's tables and caches)
+Nothing under `src/jit/baseline/**` is keyed by a **machine-code address**, and nothing indexes the IR by anything but `(func, pc)` / `pc` / a label id.
+- `CompiledModule`: `labels: LabelMap` (label id → packed `func<<32|code_index`), `fingerprint: u64`, `layout: Layout`.
+- `EagerLayout`: `buffer: CodeBuffer`, `entries`/`sub_entries: Vec<Vec<Option<*const u8>>>` indexed `[func][pc]`, `summary: Summary`.
+- `CompiledFunction` (lazy, one mapping per function): `buffer`, `entries`/`sub_entries: Vec<Option<*const u8>>` indexed `[pc]`, `summary`; probed by `lazy_entry` (entries first, sub_entries second) — two `Vec` loads, never a `HashMap`.
+- `Summary { block_count, cached_registers: Vec<u32>, highest_cached_register, highest_native_register }` — the register-file guard and the `Machine::note_x_dirty` extent.
+- `runtime::EntryTables`: raw `*const Option<*const u8>` + lengths over **the same** vectors, published into `JitRuntime::tables` so an in-block return resolves its own continuation without the artifact; `EntryTables::of` is the one builder and `EntryTables::NONE` (`func == u32::MAX`) the "no native code" value.
+- `emit/regs.rs::Allocation` (compile-time only, dropped with the block): `spill_sets`/`fill_sets: Vec<Vec<u32>>` indexed `pc - block_start` (`spill_sets` also covers the exit pc), `slots: Vec<(u32, Reg)>` scanned linearly, `written`, `y_last`/`y_first`/`frame_republish_first`, `entry_fill`.
+- `(func, pc) → CodeLabel` as a `BTreeMap` exists only **during** a compilation (`emit/compile.rs` → `emit/link.rs`'s `Linker`), never in the artifact.
+- Driver-side carries: `ResolvedFunction = Option<(u32, Rc<CompiledFunction>)>` (`DriverContext::entry_cached` for context 0, one per `CalleeCode`), and `DriverContext::callees: Vec<CalleeCode>` keyed by module **context** id.
+Interior mutability: `LazyLayout::functions: RefCell<Vec<Option<Rc<CompiledFunction>>>>` (compile-on-entry under `&self`) and `LazyLayout::native_extent: Cell<Option<u32>>` (running max) are the tier's only two; everything else is a `thread_local!` test instrument (`counters.rs`, `bitstr.rs`).
+
 ## Emitted-byte arithmetic (derived from the encoder, not measured)
 `emit_mem_modrm` (`../../emitter/mod.rs:532-541`) always emits `mod=10` `disp32` (+ a `SIB` byte only when the base is `rsp`/`r12`), so **every** code sequence's size is a closed-form constant — no case needs disassembly to price:
 `mov_mr/mov_rm` with base `rbx`/`rdi`/`r11` = **7** B, base `rsp` = **8** B, `mov_ri` (always `movabs`) = **10** B, `call_r`/`jmp_r`/`cmp_rr`/`test_rr` = **3** B, `jcc` = **6** B, `jmp` = **5** B, `lea rsp,[rsp±d]` = **8** B, `push_r`/`pop_r` = 1 B (`rbx`/`rbp`) or 2 B (`r12`-`r15`), `ret` = 1 B.

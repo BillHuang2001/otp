@@ -251,13 +251,33 @@ fn clear_drops_entries_and_resets_the_counter() {
 }
 
 #[test]
-fn the_artifact_records_the_modules_content_fingerprint() {
+fn staging_a_real_beam_records_no_fingerprint_and_never_hashes_the_ir() {
+    // A real `.beam` keys on its O(1) load-time digest, so the content fingerprint is
+    // never read: staging it must not pay the whole-module IR hash at all.
     let module = slice_module();
     let mut cache = CodeCache::new();
-    // `compiled_handle` stages a lazy artifact; it must carry the module's content
-    // fingerprint so a memoized resolution can rebuild the key without re-hashing.
+    let before = fingerprint_calls();
     let compiled = cache.compiled_handle(&module).expect("stage the artifact");
-    assert_eq!(compiled.fingerprint(), module_fingerprint(&module));
+    assert_eq!(
+        fingerprint_calls(),
+        before,
+        "staging a digest-carrying module must not hash its decoded IR"
+    );
+    assert_eq!(compiled.fingerprint(), None);
+}
+
+#[test]
+fn a_synthetic_modules_artifact_records_its_content_fingerprint() {
+    // A synthetic module's content hash *is* its identity, so the artifact carries it and
+    // a memoized resolution can rebuild the key without re-hashing.
+    let module = synthetic_module("synthetic_fingerprint");
+    let mut cache = CodeCache::new();
+    let compiled = cache.compiled_handle(&module).expect("stage the artifact");
+    assert_eq!(
+        compiled.fingerprint(),
+        Some(module_fingerprint(&module)),
+        "a synthetic module's artifact records the content fingerprint"
+    );
 }
 
 #[test]
