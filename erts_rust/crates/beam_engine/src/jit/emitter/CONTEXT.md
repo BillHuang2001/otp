@@ -29,7 +29,7 @@ Files: `mod.rs` (buffer lifecycle, labels/fixups, raw byte emission, W^X), `enco
 - stack — `push_r` `:164`, `pop_r` `:172`.
 - control flow — `jmp` (`rel32`) `:182`, `jcc` (`rel32`) `:188`, `call_label` (`rel32`) `:195`, `jmp_r` (indirect, `FF /4`, `0x41` REX.B for `r8`–`r15`, pinned by `tests.rs::jumps_through_a_register`) `:209`, `call_r` (indirect) `:218`, `ret` `:227`.
 - filler — `nop` `:234`, `int3` `:239`.
-Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, memory-operand arithmetic, indexed addressing, SSE/AVX, `syscall`.
+Absent on purpose (add a tested method, don't guess): `mov r/m64, imm32`, **every `_ri` immediate arithmetic/logic form** (`add_ri`/`sub_ri`/`and_ri`/`or_ri`/`xor_ri`/`cmp_ri`/`test_ri` — synthesize as `mov_ri` into a scratch + the `_rr` form, 13 B for a 3 B op), `shr_ri`, `setcc` (a boolean in a register is `mov_ri 0` + `cmp`/`jcc` + `mov_ri 1`, or two labels), `movzx`/`movsx` (a sub-word load must be `mov_rm` + `and_rr` with a mask), `ud2`, `neg`/`not`, memory-operand arithmetic, indexed addressing (`[base + index*scale]` — no SIB index is ever emitted, so scale with `shl_ri` + `lea`/`add_rr`), SSE/AVX, `syscall`.
 
 ## W^X design (never RWX)
 `with_capacity` maps anonymous private `PROT_READ|PROT_WRITE` (`mod.rs:320-329`); `seal` flips the
