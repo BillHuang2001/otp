@@ -102,7 +102,9 @@ pub mod seq_trace;
 mod timers;
 pub mod trace;
 pub use crate::boot::{boot_banner, PreloadedModules};
-pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE};
+pub use crate::cli::{
+    parse, run, run_for_process, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE,
+};
 pub use crate::codeserver::CodeServer;
 pub use crate::config::{
     Action, ArgTerm, EmulatorConfig, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS,
@@ -123,7 +125,7 @@ pub use crate::runtime::{RetentionStats, Runtime};
 /// points into scope.
 pub mod prelude {
     pub use crate::boot::{boot_banner, PreloadedModules};
-    pub use crate::cli::{parse, run, USAGE};
+    pub use crate::cli::{parse, run, run_for_process, USAGE};
     pub use crate::codeserver::CodeServer;
     pub use crate::config::{Action, ArgTerm, EmulatorConfig, InitArgs, RuntimeConfig};
     pub use crate::context::RuntimeContext;

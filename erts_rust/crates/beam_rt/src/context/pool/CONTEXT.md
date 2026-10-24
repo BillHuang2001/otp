@@ -92,6 +92,10 @@ Measured (`tools/bench`'s paired `case_ets_copy_ns_per_op`, 250 000 ops, one cor
 `etf_roundtrip` and `list_walk` show no move outside the ±4 % noise band; `send_recv`/`send_recv_plain`/`gc_bound` churn flip sign across rounds and are inconclusive — the shared host ran at 21–64 loadavg on 14 cores, so only 1 of 5 pre-registered rounds passes a strict load filter and the clean **level ranges** are the evidence, never a single round's ratio.
 Oracle evidence: all **95** differential `ets` corpus cases agree (`differential run <case-id>` per case, then `merge` — `total=95 agree=95 mismatch=0 unsupported=0`), and the crate gate `cargo test -p beam_rt --lib -- context::` passes.
 
+**Capacity is not RSS.** `beam_alloc::Heap::new` is a lazy `mmap` that touches only a 16-byte block header plus a 64-byte segment header, so a 128 MiB region sits at 12–48 kB RSS; region size shows up in `VmSize` and `erlang:system_info({allocator,std_alloc})`, and RSS moves only when pages are written.
+The pooled BIF heap is the demonstration: `cerl_clauses` ends with **27 regions / 20 185 088 words = 161 MB** of reservation against `bif_peak_used_words` = 28 916 words (**226 kB**) ever written — the same 27 regions cost **3.62 GB** when every level was seeded at `bif_heap_words`, so the depth-aware seed cut reservation **22×** while moving no RSS of its own.
+
+
 ## Known Issues
 
 Every entry is a typed capability gap, a measured own-state difference or a documented divergence, never a wrong

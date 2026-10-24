@@ -36,7 +36,6 @@ use crate::runtime::Runtime;
 
 use super::alias;
 use super::bridges::two_atom_tuple;
-use super::gc_walk::process_roots_are_unscanned;
 use super::runtime_context::RuntimeContext;
 
 /// A `send` destination, classified by [`classify_send_destination`].
@@ -579,7 +578,12 @@ impl<'a> RuntimeContext<'a> {
         // reached through a table that may be the runtime's own.
         let mut scratch = self.runtime.take_walk_scratch();
         let hit = match self.process_table().get(to) {
-            Some(process) => process_roots_are_unscanned(&mut scratch, process, false),
+            Some(process) => crate::context::gc_walk::process_roots_are_unscanned_at(
+                crate::context::gc_valve_trace::ValveDoor::SendDelivery,
+                &mut scratch,
+                process,
+                false,
+            ),
             None => false,
         };
         self.runtime.put_walk_scratch(scratch);

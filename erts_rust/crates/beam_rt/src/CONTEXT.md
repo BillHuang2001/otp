@@ -390,7 +390,7 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `src/port/driver.rs` 3 911 lines, 3 502 of production: the driver C-ABI host (`DriverPort`/`DriverPortAdapter` — the concrete `beam_abi::DriverHost` behind a driver's `ErlDrvPort`), with its suites as the sibling `port/driver/{control,control_reply_oracle,ddll,fire,hooks,liveness,monitor,port_attributes,port_term,ready_output,stop_select}_tests.rs` modules declared from its tail.
 - `src/context/gc.rs` 3 257 lines, 2 367 of production — the remainder is the test-only counters modules (`valve_counters`/`prefix_counters`) and the inline suites; its unit suite **belongs** in `context/gc/tests.rs` (still owed; the `port.rs`/`port/tests.rs` pattern).
 - `src/native/code.rs` 2 902 lines, 1 033 of production: the `code:*` floor (the path/load/name readers and the path mutators) with its oracle-cross-checked colocated suite in the remaining 1 869 lines.
-- `src/codeserver.rs` 1 869 lines, 1 306 of production: the shared `Rc<AtomTable>`, the module cache with both location maps, the code path, the file-load routes and the store's one removal op, plus its colocated unit suite (563 lines).
+- `src/codeserver.rs` 1 980 lines, 1 363 of production: the shared `Rc<AtomTable>`, the module cache with both location maps, the code path (incl. the one-shot `installed_tail` install marker), the file-load routes and the store's one removal op, plus its colocated unit suite (617 lines).
 - `src/context/gc_walk.rs` 2 156 lines: 1 159 of production (the valved reachability descent, whose module docs carry the soundness argument and the latch-clearing refutation), the test-only `seed_counters` module and the root-set pinning suite, which **must** stay colocated because it drives the module's private `Walk`/`WalkScratch` types.
 - `src/context/runtime_hooks.rs` 1 823 lines of production with no inline tests — the `RuntimeHooks` bridge, whose per-arm rustdoc blocks carry the oracle columns and the served/fixed/gap reasoning (suites `context/tests.rs` and `tests/runtime_hooks.rs`).
 - `src/context/calls.rs` 2 511 lines, 2 334 of production (the BIF-dispatch + BIF-result-copy-out machinery; the 177-line tail is the test-only dispatch notes plus the declaration of the suite in `context/calls/tests.rs`, 1 677 lines).
@@ -449,14 +449,16 @@ The `../CONTEXT.md` *Files ~1000 lines* constraint is not met by the pre-existin
 - `malloc.rs` → the crate's marked `unsafe` module and its **one** allocator lever:
   `release_free_pages()` (`libc::malloc_trim(0)` on glibc, an honest `None` elsewhere), called once per
   process from `main.rs` **after the driver thread has been joined** — the only quiescent *and* complete
-  point, because the driver thread still holds most of the run's memory until it exits (a trim from inside
-  `cli::run`, even after the runtime it built has been dropped, recovers only ~16 MB of ~75 MB). Measured
-  exit RSS (glibc 2.44; arena `in_use` ≤ 218 kB at that point in every case): bare boot 90 760 → 18 400 kB,
-  `compiler/cerl_clauses.erl` 211 168 → 19 068 kB, `stdlib/orddict.erl` 218 544 → 22 240 kB. Peak `VmHWM`
-  is **unchanged** (115 / 314 / 305 MB) because during the run that memory is *live*, not slack (a bare
-  boot's idle arena is 97 681 kB in use of 97 948 kB) — the census, the arena/heap layout, the measured
-  non-effect of a trim at the boot→action boundary (266 kB free there) and the fragmentation limit are in
-  the module docs. `BEAM_RT_MEM_TRACE` prints the call's answer as one `[rt-mem] heap-release=…` line.
+  point. It now finds a largely **live** arena, because the binary skips its process-exit teardown
+  (`cli::run_for_process` → `ExitTeardown::Leak`: the whole-boot drop cost ~7.9 %, ≈157 M instructions,
+  ≈25 ms per invocation, and ERTS does not free the world at `halt` either), so it returns little:
+  measured exit RSS **113.1–114.6 MB** on a bare boot and **303 376 kB** after an in-process
+  `orddict.erl` compile, against **17.6–21.2 MB** / **26 416 kB** before the trade. **Peak `VmHWM` is
+  unchanged** (118.7–119.1 MB bare boot, 310 044 kB compile) — it is the run's high-water mark, reached
+  while everything was live, so the trade costs no peak memory and buys the startup latency. `cli::run`
+  itself keeps its normal `Drop` (library/test contract: NIF `unload`, drop assertions); only
+  `src/main.rs`'s path opts out. `BEAM_RT_MEM_TRACE` prints the call's answer as one
+  `[rt-mem] heap-release=…` line.
 - `mailbox.rs` → the per-pid scan state, and the **fragment lifetime invariant** that makes a received term usable after `remove_message`.
   A removed message's `Fragments` chain is *moved* into `MailboxState::retained_fragments` (`mailbox.rs:267-268`) — retention, never `Fragments::move_into`, which no site in the workspace calls.
   **There is no release point:** `Runtime::mailboxes` is only ever `entry()`/`get()`/`get_mut()`ed, never removed, so every fragment a process ever removed stays alive for the runtime's lifetime (the field's own doc, "released when the process's scan state is", cannot be reached).

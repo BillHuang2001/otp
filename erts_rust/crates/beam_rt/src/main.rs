@@ -18,18 +18,20 @@
 //
 // %CopyrightEnd%
 
-//! The `beam_rt` executable: a thin shim over [`beam_rt::cli::run`].
+//! The `beam_rt` executable: a thin shim over [`beam_rt::cli::run_for_process`].
 //!
 //! Every piece of logic lives in the library so it is unit- and integration-testable;
 //! this file only forwards the command line (minus `argv[0]`) and turns the returned
 //! exit code into the process status. See `beam_rt::cli` for the supported switch
 //! subset (contract A.6) and `../CONTEXT.md` for the frozen surface.
 //!
-//! The shim owns two things the library deliberately does not: the **stack the runtime runs on**
+//! The shim owns three things the library deliberately does not: the **stack the runtime runs on**
 //! (the driver runs on a named thread with an explicit [`MAIN_STACK_BYTES`] stack instead of Rust's
-//! default 8 MiB main-thread stack — see the constant for why), and the **allocator's free-page
-//! release** ([`beam_rt::release_free_pages`], called once after that thread has been joined —
-//! see [`run_on_driver_stack`]).
+//! default 8 MiB main-thread stack — see the constant for why), the **process-exit teardown
+//! policy** ([`beam_rt::cli::run_for_process`] leaks the whole-boot state instead of freeing it, so
+//! a one-shot invocation does not spend ~7.7 % of itself taking the world down — see that
+//! function), and the **allocator's free-page release** ([`beam_rt::release_free_pages`], called
+//! once after that thread has been joined — see [`run_on_driver_stack`]).
 
 use std::thread;
 
@@ -81,9 +83,16 @@ fn main() {
     std::process::exit(run_on_driver_stack(args));
 }
 
-/// Runs [`beam_rt::cli::run`] on a named thread with [`MAIN_STACK_BYTES`] of stack and answers the
-/// process status: the driver's own exit code, or [`beam_rt::cli::EXIT_RUNTIME`] when the thread
-/// could not be started or panicked — a failed driver must never be reported as success.
+/// Runs [`beam_rt::cli::run_for_process`] on a named thread with [`MAIN_STACK_BYTES`] of stack and
+/// answers the process status: the driver's own exit code, or [`beam_rt::cli::EXIT_RUNTIME`] when
+/// the thread could not be started or panicked — a failed driver must never be reported as success.
+///
+/// [`beam_rt::cli::run_for_process`] — not `cli::run` — because this call *is* the end of the
+/// process: it leaks the runtime it built instead of dropping it, which is where ~7.7 % of a
+/// one-shot invocation's instructions used to go (a drop of the whole boot's retained state into
+/// `__call_tls_dtors`). The exit contract is unchanged (crash dump, then a flushed stdout, then the
+/// same status); the library entry `cli::run` keeps its normal `Drop` for every in-process caller,
+/// the crate's own suite included.
 ///
 /// # The one allocator release point
 ///
@@ -93,22 +102,25 @@ fn main() {
 ///
 /// * the driver thread has **exited**, so everything it owned — its thread-local state and,
 ///   crucially, the arena attachment it allocated through — is gone, and what the allocator still
-///   maps is free; measured, a bare boot holds 88.8 MB of resident set with 210 kB of arena in use
-///   at the moment the driver returns, and one trim here takes that 88.8 MB down to ~18 MB (an
-///   in-process compile of `cerl_clauses.erl`: 206 MB → ~20 MB);
+///   maps is free;
 /// * a trim from **inside** the driver — even after the runtime it built has been dropped — only
-///   recovers ~16 MB of that, because the thread itself still holds the rest until it exits, so
-///   the release is placed here rather than in `beam_rt::cli::run`.
+///   recovers a fraction, because the thread itself still holds the rest until it exits, so the
+///   release is placed here rather than in `beam_rt::cli::run`.
 ///
-/// It touches only the allocator's free-page bookkeeping (no term, heap, table or live
+/// Since [`beam_rt::cli::run_for_process`] deliberately frees nothing on the way out, this trim
+/// now finds a **live** arena rather than a free one: it is kept (it still returns whatever the
+/// run really did free — loaded `.beam` images, temporary buffers) but the exit resident set no
+/// longer drops to the post-trim floor. Peak `VmHWM` is unaffected either way; `src/malloc.rs`
+/// carries the measured columns and the reasoning.
+///
+/// The lever touches only the allocator's free-page bookkeeping (no term, heap, table or live
 /// allocation), so no result, exception or exit code can depend on it; the pages are re-faulted
-/// transparently if anything else in the process needs them. `src/malloc.rs` carries the census,
-/// the mechanism and the measurements.
+/// transparently if anything else in the process needs them.
 fn run_on_driver_stack(args: Vec<String>) -> i32 {
     let driver = thread::Builder::new()
         .name("beam_rt-driver".to_string())
         .stack_size(MAIN_STACK_BYTES)
-        .spawn(move || beam_rt::cli::run(args));
+        .spawn(move || beam_rt::cli::run_for_process(args));
     let driver = match driver {
         Ok(driver) => driver,
         Err(error) => {

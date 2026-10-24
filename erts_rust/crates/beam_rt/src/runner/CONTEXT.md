@@ -339,6 +339,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   check `tier_unavailable` — never a mode, and never an arm inside the selection).
 
 ## Test Strategy
+* **Where the collection-cadence invariants are pinned** (read these before changing any heap-admission policy in the sibling `../context/gc.rs`): the chain-collapse facts `peak_young_spaces == 1` live at [`tests/boundary_cost.rs:463`](tests/boundary_cost.rs), [`tests.rs:3819`](tests.rs) (bundled with `debt_boundaries == 0`) and [`tests/reds_door.rs:303`](tests/reds_door.rs); the per-row exact totals are [`tests/boundary_cost.rs`](tests/boundary_cost.rs)'s `MEASURED` table + `MEASURED_YOUNG_CAPACITY = 2_585`, and [`tests/slice_charging.rs:436`](tests/slice_charging.rs)'s saturated tuple; the growth relation `collections == 1 + N/K` (with `K` derived from the row's own peak capacity) is [`tests.rs:3797`](tests.rs) and [`tests/slice_charging.rs:560`](tests/slice_charging.rs).
+  This node asserts **no** exact `Runtime::gc_stats().reclaimed` figure and never `note_gc_reclaimed`; `gc_stats().collections` is read only as a before/after delta or an inequality. The direct `collection_debt()` assertions are the sibling `../context/` node's (`../context/tests.rs`, `../context/calls/exempt_window_tests.rs`).
 * `#[cfg(test)]` units in [`tests`]: `select_entry_tier` over the real tier fixtures — the default
   (`Auto`) and the explicit `Baseline` alias both select `BaselineJit` for **every** entry, including a
   cross-module-calling module (`stdlib_more_harness`) and a dynamic-`apply` one (`funs`), and an

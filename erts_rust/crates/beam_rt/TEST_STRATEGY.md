@@ -57,3 +57,22 @@ A bare `erl -noshell` never exits, so every oracle probe appends `-s init stop` 
 **Scratch temp dirs come from one place**: `crate::context::test_support::scratch_dir(label)` — unique per call (label + pid + an atomic sequence + a per-process nonce) and self-removing on drop; a hand-rolled `temp_dir().join(format!("…_{pid}"))` collides with a concurrent test *process*.
 **Oracle-order caveat:** `code:ensure_modules_loaded/1` is **parallel** in OTP, so its failure list's order is not stable (measured 117 × `c_m,b_m,a_m` vs 3 × `b_m,c_m,a_m` in 120 probes) — assert failure pairs as a **set**, never an ordered `vec!`.
 `tests/fixtures/` is never handed to the oracle as a single `-pa`: each suite compiles what it needs into its own scratch directory and passes that instead.
+
+## Known-red tests at this commit
+**Eight tests are red on an unmodified tree, and none of them is a startup or performance regression to chase.** All eight reproduce **identically** at the pre-campaign base commit `3a58f3da23` (verified by rebuilding that commit in a detached worktree), so they are inherited, not caused by any later change.
+They are all **collection-cadence or capacity** assertions — how many collections a shape pays, at what capacity, and which door sees them — so the heap-policy rule below is where to look, not the glue:
+* the lib suite `src/runner/` — `a_process_never_hands_out_off_heap_slots_across_slices`;
+* `src/runner/tests/boundary_cost.rs` — `the_boundary_door_is_a_preemption_watermarked_site_on_the_churn_shape` (asserts `MEASURED_YOUNG_CAPACITY = 2_585` and its collection counts);
+* `src/runner/tests/reds_door.rs` — `a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus`;
+* `src/runner/tests/slice_charging.rs` — `the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice`;
+* `tests/foreign_root_loop.rs` — `a_loop_holding_the_statistics_result_keeps_collecting`;
+* `tests/gc_immix_payload.rs` — `the_runtime_shaped_workload_under_both_strategies`;
+* `tests/gc_strategy.rs` — `a_live_payload_survives_a_fullsweep_on_the_immix_path`;
+* `tests/off_heap_reclaim.rs` — `memory_binary_does_not_grow_monotonically_over_the_loop`.
+The most likely single cause is the heap policy's shrink rule: [`STARTUP_COST.md`](STARTUP_COST.md) *Cross-node asks* **(b)** proposes a minor-shrink floor (`beam_gc`'s `MINOR_SHRINK_FLOOR_WORDS`) whose blast radius is exactly the capacities these assertions read, and its two named re-derivations are two of the eight above.
+Until that ask lands in `beam_gc`, treat the eight as a **known** baseline: a startup/perf pass must reproduce them, never "fix" them by relaxing an assertion here.
+
+## Measuring a long workload live
+How to watch a long compile (or any long workload) while it runs, without touching source — the recipe the crate's runtime investigations use.
+* **Measuring a long compile (or any long workload) live, without touching source.** Compile a throwaway driver with the system `erlc`, `spawn_opt(Fun, [monitor, {max_heap_size, Cap}])` the workload, and poll it from the parent — `process_info(P, [current_function, total_heap_size, heap_size])` really tracks the running module's progress (`beam_ssa:used_instr/1` → `beam_ssa_opt:record_opt/2` → `gb_trees:update_1/3`), so "slow" is distinguishable from "stuck"; then `beam_rt -noshell -pa bootstrap/lib/{compiler,kernel,stdlib}/ebin run <driver.beam> mod:fun/0`. `-eval`'s own process is *not* capped, while a `spawn_opt`ed/spawned process honours `max_heap_size` — the same compile therefore succeeds one way and raises `system_limit` the other.
+  Sample RSS from bash by polling `/proc/<pid>/status` (there is no `/usr/bin/time` on this host), always `ulimit -c 0`, one compile at a time; a helper script needs `#!/usr/bin/env bash` (only `bash` from the Nix store exists, not `/bin/bash`) and should avoid `date`/`awk` inside it (use `read` on `/proc/.../status`).
