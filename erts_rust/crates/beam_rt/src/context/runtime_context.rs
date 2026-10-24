@@ -371,8 +371,8 @@ impl<'a> RuntimeContext<'a> {
     /// an exhausted delivery returns the copier's **raw**
     /// [`Alloc(AllocKind::Message)`](BeamError::Alloc) refusal instead of collecting, and
     /// [`Self::deliver_message`] keys on exactly that to route the payload through the
-    /// heap-fragment fallback ([`Self::send_fragmented_message`]) — so the message still
-    /// arrives, with no word moved under the caller's feet.
+    /// heap-fragment fallback ([`Self::send_fragmented_message_after_refusal`]) — so the message
+    /// still arrives, with no word moved under the caller's feet.
     ///
     /// # Why the wrapped scopes need it
     ///

@@ -797,7 +797,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// "the destination pid is not live" — the *sender* is never looked up, and every other
     /// failure on the path has a disjoint cause ([`ProcessTable::deliver`] itself reports only
     /// the destination miss, `beam_process`'s table lookup, and the heap-fragment fallback
-    /// behind it only a copy/allocation failure, [`Self::send_fragmented_message`]). Every other
+    /// behind it only a copy/allocation failure, [`Self::send_fragmented_message_after_refusal`]). Every other
     /// error is propagated unchanged, so no crate-local error scope is widened.
     ///
     /// The `send` **trace event** still fires, because the C emits it *before* the destination

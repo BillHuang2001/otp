@@ -491,10 +491,10 @@ impl<'a> RuntimeContext<'a> {
     /// ([`Self::with_pid_relocation_exempt`]) for the duration of the delivery. `Process::deliver`
     /// then returns its raw [`AllocKind::Message`] refusal **unchanged** — no collection, no
     /// growth, no word moved — and the ordinary host fragment fallback below
-    /// ([`Self::send_fragmented_message`]) delivers the payload with no heap word moved, exactly
-    /// as it already does for a `Running` receiver. This is the runtime applying its *own* policy
-    /// consistently, not a special case: "do not relocate against a root set that reaches an
-    /// unscannable container".
+    /// ([`Self::send_fragmented_message_after_refusal`]) delivers the payload with no heap word
+    /// moved, exactly as it already does for a `Running` receiver. This is the runtime applying
+    /// its *own* policy consistently, not a special case: "do not relocate against a root set that
+    /// reaches an unscannable container".
     ///
     /// The receiver's mark is restored on every path, so a receiver the scheduler (or an outer
     /// scope) already had exempt keeps its mark.
@@ -518,6 +518,13 @@ impl<'a> RuntimeContext<'a> {
     /// One delivery attempt into `to`'s mailbox, with the heap-fragment fallback for the
     /// copier's raw [`AllocKind::Message`] refusal and the `error:system_limit` translation —
     /// the shared body of [`Self::deliver_message_with_off_heap_inner`].
+    ///
+    /// The refusal arm is the crate's one place that **holds a refusal**: `deliver` hands back
+    /// the copier's own [`AllocFailure`](beam_common::AllocFailure), whose
+    /// [`requested`](beam_common::AllocFailure::requested) figure *is* the exact destination price
+    /// in bytes, so the fragment is reserved from it directly
+    /// ([`Self::send_fragmented_message_after_refusal`]) instead of paying for a second pricing
+    /// walk of the same graph.
     pub(super) fn deliver_into_mailbox(
         &mut self,
         to: ProcessId,
@@ -527,7 +534,7 @@ impl<'a> RuntimeContext<'a> {
     ) -> Result<()> {
         match self.process_table_mut().deliver(to, from, message, src) {
             Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => self
-                .send_fragmented_message(to, from, message, src)
+                .send_fragmented_message_after_refusal(to, from, message, src, failure.requested)
                 .map_err(error::enforce_term_heap_limit),
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
@@ -631,8 +638,8 @@ impl<'a> RuntimeContext<'a> {
 
     /// Delivers `message` into `to`'s mailbox through the **heap-fragment** model — the
     /// sender half of the C `erts_try_alloc_message_on_heap`/`new_message_buffer` path
-    /// (`erl_message.c:622-691`), reached when the receiver's own heap cannot hold the
-    /// payload (`../../erts/emulator/beam/erl_message.c`).
+    /// (`erl_message.c:622-691`), for a caller that has **no refusal in hand**
+    /// (`../../erts/emulator/beam/erl_message.c`).
     ///
     /// The work is [`beam_message::send_fragmented`]`(from, message, heap, mailbox, ctx, 0)`
     /// driven straight into the receiver's own [`Process`](beam_process::Process) through
@@ -649,31 +656,41 @@ impl<'a> RuntimeContext<'a> {
     /// ([`Self::deliver_message_with_off_heap`]'s) — so an engine-built off-heap binary in an
     /// oversized payload is resolved exactly as on the ordinary path.
     ///
-    /// # The redundant preflight, and why it is harmless
+    /// # Which of the two fragment routes to use
     ///
-    /// `send_fragmented` first retries the ordinary receiver-heap copy and falls back to a
-    /// fragment only when *that* reports [`AllocKind::Message`]. This method is reached
-    /// from exactly that failure, so the retry fails identically — and the retry is
-    /// **side-effect free**: [`beam_message::copy_struct`] preflights the destination's
-    /// capacity and refuses a graph it cannot hold *before* writing a word, so the
-    /// receiver's heap is left byte for byte as it was (the composed body this replaced
-    /// skipped the retry and went straight to a fragment).
+    /// [`beam_message::send_fragmented`] still runs the ordinary receiver-heap copy first and
+    /// falls back to a fragment when *that* reports [`AllocKind::Message`], which is why it
+    /// re-prices the graph with one `preflight_words` walk before the fragment is reserved. That
+    /// is the right shape for a caller that has **not** tried the copy yet — which is this method.
+    /// A caller that already holds the refusal must use
+    /// [`Self::send_fragmented_message_after_refusal`] instead: it spends the refusal's own
+    /// exact figure and skips both the trial and the pricing walk.
     ///
-    /// The recipient is woken exactly as the ordinary path wakes it, except that the wake
-    /// cannot go through the process table's wake list (that list is filled by
-    /// `ProcessTable::deliver`, which this path deliberately bypasses): it is recorded on
-    /// [`Runtime::note_fragment_wake`] instead, and
-    /// [`Runtime::scheduler_pass`](crate::runtime::Runtime) absorbs it into the real run
-    /// queue at the same points it absorbs the table's own wake list.
+    /// Both routes end in the **same** tail ([`Self::finish_fragment_delivery`]): the recipient is
+    /// woken exactly as the ordinary path wakes it, and — because the wake cannot go through the
+    /// process table's wake list, which only `ProcessTable::deliver` fills — it is recorded on
+    /// [`Runtime::note_fragment_wake`] instead, which
+    /// [`Runtime::scheduler_pass`](crate::runtime::Runtime) absorbs into the real run queue at the
+    /// same points it absorbs the table's own wake list.
     ///
     /// # Errors
     ///
     /// The failures are **raw**: the fragment's host-allocation failure and the copy
-    /// engine's exhaustion ([`AllocKind::Message`]). The single caller
-    /// ([`Self::deliver_message_with_off_heap`]) translates a genuine exhaustion to
-    /// `error:system_limit` with [`error::enforce_term_heap_limit`]; that translation lives
-    /// at the call site because the `Message` kind must stay recognizable as the retry
-    /// trigger on the first `deliver` attempt.
+    /// engine's exhaustion ([`AllocKind::Message`]). The caller translates a genuine exhaustion to
+    /// `error:system_limit` with [`error::enforce_term_heap_limit`]; that translation lives at the
+    /// call site because the `Message` kind must stay recognizable as the retry trigger on the
+    /// first `deliver` attempt — observing it is what selects the fragment route.
+    ///
+    /// # Why it has no in-crate caller
+    ///
+    /// This is the only correct route for an oversized delivery where **no** refusal exists yet,
+    /// and it is the shape [`beam_message::send_fragmented`] composes for that case. Every delivery
+    /// in this crate runs through [`Self::deliver_into_mailbox`], which by construction holds the
+    /// refusal and so takes the `_after_refusal` sibling; the distribution inbound sink (which also
+    /// has no sibling-shaped context) drives `beam_message::send_fragmented` itself, because it
+    /// records the wake for its own caller to replay. Hence the `allow`: deleting the route would
+    /// only make the no-refusal shape unreachable rather than unnecessary.
+    #[allow(dead_code)]
     pub(super) fn send_fragmented_message(
         &mut self,
         to: ProcessId,
@@ -695,15 +712,88 @@ impl<'a> RuntimeContext<'a> {
             .ok_or(BeamError::TermNotFound)?;
         let (heap, mailbox) = process.heap_and_mailbox_mut();
         beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0)?;
-        let woken = process.wake();
-        // The payload now lives in a [`HeapFragment`](beam_message::HeapFragment) — a region the
-        // receiver's collector does not scan — so the receiver's **descent gate** opens here:
-        // `receive` hands that payload to the running code as a register value, and the code can
-        // nest it inside a container built on the receiver's *own* scanned heap, which is the
-        // shape only the gated descent finds. Recorded before the wake so a receiver that was
-        // already runnable (the wake's `false` arm) is gated too. A delivery that did **not**
-        // need a fragment — the ordinary receiver-heap copy — lands on the receiver's own heap
-        // and deliberately does not open the gate (see [`crate::context::gc_walk`]).
+        self.finish_fragment_delivery(to)
+    }
+
+    /// [`Self::send_fragmented_message`] for a caller that **already observed** the copier's
+    /// [`AllocKind::Message`] refusal for this very `message` — the route
+    /// [`Self::deliver_into_mailbox`] takes, since it is the crate's one delivery door and `deliver`
+    /// hands it the failure.
+    ///
+    /// It goes to [`beam_message::send_fragmented_after_refusal`], which is
+    /// [`send_fragmented`](beam_message::send_fragmented) minus the steps a caller holding the
+    /// refusal need not repeat: no trial copy on a receiver heap, and no `size_object`-class
+    /// destination-pricing walk. `requested_bytes` is the refusal's own
+    /// [`AllocFailure::requested`](beam_common::AllocFailure::requested) figure — the copier's exact
+    /// destination price, so nothing is re-priced and the fragment is reserved once, precisely.
+    ///
+    /// That single copy cannot reach a receiver heap at all, so — unlike
+    /// [`Self::send_fragmented_message`] — this route needs no [`CopyContext`] and no destination
+    /// off-heap table of its own: the callee takes the receiver's **queue** plus the sender's
+    /// **source** table `src` directly, refcounting the payload's off-heap objects into the
+    /// fragment's own table exactly as the trial-based route does.
+    ///
+    /// The precondition is the refusal itself (see the callee's rustdoc): it decides only how big a
+    /// fragment is reserved, never whether the delivery is correct — a stale or absent figure still
+    /// delivers, re-reserving from the copy's own refusal.
+    ///
+    /// `fragment_capacity_words` is passed as `0` — the callee's documented floor, not a substitute
+    /// for the price — so the reservation is the refusal's figure and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_fragmented_message`]: the raw fragment/copy exhaustion, translated at the
+    /// call site by [`error::enforce_term_heap_limit`].
+    pub(super) fn send_fragmented_message_after_refusal(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+        requested_bytes: usize,
+    ) -> Result<()> {
+        let process = self
+            .process_table_mut()
+            .get_mut(to)
+            .ok_or(BeamError::TermNotFound)?;
+        beam_message::send_fragmented_after_refusal(
+            from,
+            message,
+            process.mailbox_mut(),
+            src,
+            0,
+            requested_bytes,
+        )?;
+        self.finish_fragment_delivery(to)
+    }
+
+    /// The tail **both** heap-fragment routes share, once the fragment holds the payload: the
+    /// receiver's wake, then the runtime's two fragment notes.
+    ///
+    /// It re-resolves the process rather than taking the `&mut Process` the sibling routes already
+    /// borrowed — those borrows cover the whole of `self`, so the notes (which need
+    /// [`Self::runtime`]) could not be reached through them — and the pid is known live at every
+    /// call site, so the `TermNotFound` below is unreachable in practice (it is returned, never
+    /// unwrapped, per the crate's error strategy).
+    ///
+    /// **The order and the conditions are load-bearing, not stylistic:**
+    ///
+    /// * the receiver's **descent gate** opens here — unconditionally. The payload now lives in a
+    ///   [`HeapFragment`](beam_message::HeapFragment), a region the receiver's collector does not
+    ///   scan, so `receive` hands it to the running code as a register value that the code can nest
+    ///   inside a container built on the receiver's *own* scanned heap — the shape only the gated
+    ///   descent finds. It is recorded **before** the wake's note so a receiver that was already
+    ///   runnable (the wake's `false` arm) is gated too. A delivery that did **not** need a fragment
+    ///   — the ordinary receiver-heap copy — lands on the receiver's own heap and deliberately does
+    ///   not open the gate (see [`crate::context::gc_walk`]).
+    /// * the wake note is recorded **only on a real wake** (`Process::wake`'s `true`), because it
+    ///   substitutes for the wake list `ProcessTable::deliver` would have filled.
+    fn finish_fragment_delivery(&mut self, to: ProcessId) -> Result<()> {
+        let woken = self
+            .process_table_mut()
+            .get_mut(to)
+            .ok_or(BeamError::TermNotFound)?
+            .wake();
         self.runtime.note_foreign_reachable(to);
         if woken {
             self.runtime.note_fragment_wake(to);
