@@ -48,7 +48,6 @@ instructions):
 |---|---|---|---|
 | `CodeServer::load_bytes` | 47.02 % | 930 M | — |
 | · `beam_loader::lower::build_module` | 17.49 % | 346 M | `beam_loader` |
-| · `<AtomTable as Clone>::clone` (the explicit `.clone()` in `load_bytes`) | 15.07 % | 298 M | `beam_term` fork seam |
 | · `beam_loader::decode::decode_stream` | 9.00 % | 178 M | `beam_loader` |
 | · drop of the decoded `Vec<RawInstr>` | 4.04 % | 80 M | `beam_loader`'s data shape |
 | · `<AtomTable>::intern` (the `wire` pre-pass + merge-back) | 1.31 % | 26 M | `codeserver.rs` |
@@ -134,7 +133,7 @@ reader, so the guard is what makes those cheap.
   `AtomTable::intern` share is ~26 M (1.31 %, and below the ±20 M sampling noise of the census),
   dominated by the name→index hash lookup itself.
   Both loops are also **load-bearing and not removable**: the `wire` pre-pass must intern every
-  module atom into the *shared* table because `build_module`'s clone has to start with an
+  module atom into the *shared* table because `build_module`'s fork has to start with an
   identical prefix for the wire indices to mean anything, and the merge-back must intern the
   literal-only atoms at exactly `base..` so the shared indices stay identical to the module's.
   The merge-back's lookups are the only avoidable half — the names are appended in index order,
@@ -142,17 +141,24 @@ reader, so the guard is what makes those cheap.
   API (`beam_term/src/atom.rs`: a name-keyed `index.get` fast path, one `Arc<str>` per new
   name), so removing them needs a `beam_term` API, i.e. a **sibling node's** surface. Not done
   here.
-- **The single largest attributable item in the load path is not this file's to fix**:
-  `<AtomTable as Clone>::clone` at `codeserver.rs:862` (`lower::build_module(&chunks, &raw,
-  (*self.atoms).clone())`) is 298 M / 15.07 % of the floor, 7.38 % of it `Arc<str>::from(&str)`
-  re-copying every atom name. The seam is `beam_term`'s `fork()` handle (a sibling node).
+- **The whole-table copy the load hands `lower::build_module` is `AtomTable::fork`**
+  (`codeserver.rs:919`): it shares the `Arc<str>` name handles and preserves every index and the
+  generation, so it costs two allocations (one `Vec` of handles, one index bucket array) and
+  nothing per atom — it has no attributable share of its own in the census above. This is only a
+  *copy* change: every index of the module's table names exactly what a deep clone named, because
+  a fork starts at the same length and appends in index order, which is the protocol the
+  merge-back loop rides (`beam_term`'s `a_fork_serves_the_lower_then_merge_back_protocol`). The
+  fork's **fresh instance** is deliberate and unobserved here: `appended_since` is `false` in both
+  directions between a fork and its parent, and no memo in this crate witnesses a module's own
+  table (the two decode memos — `../nif.rs`'s `with_decode_scratch` and
+  `beam_bifs`'s — witness the **shared** table only).
 
 ## Notes for Agents
 - **Do not look for wins inside this module.** The measured share of `codeserver::path::*` is
   0 samples out of 989; a change here cannot move the startup floor. What used to be the per-call
-  money — `add_system_paths`'s re-insert loop — is now a one-shot install (above). The remaining
-  large item is the `.clone()` handed to `lower::build_module` (298 M, a `beam_term` fork seam
-  owned by another node).
+  money — `add_system_paths`'s re-insert loop — is now a one-shot install (above), and the
+  load's whole-table copy is `AtomTable::fork` (the `load_bytes` bullet above), so nothing here
+  pays per atom any more.
 - Measurement recipe that produced the table above (keep it identical when comparing):
   `perf record -e instructions:u -c 2000000 --call-graph dwarf,16384 -o X.data -- taskset -c 2
   erts_rust/target/release/beam_rt -noshell -eval 'halt().'`, then exact inclusive shares by
@@ -172,16 +178,25 @@ reader, so the guard is what makes those cheap.
   `system_path_is_prim_then_erl_libs_then_release_then_dot`), and the `CodeServer`-level ones
   (the path install/marker) at the tail of `../codeserver.rs`
   (`a_system_ebin_deleted_after_the_install_stays_deleted_until_a_restart`,
-  `a_pz_directory_configured_after_the_install_is_still_appended`). The end-to-end oracle
+  `a_pz_directory_configured_after_the_install_is_still_appended`), plus
+  `a_loaded_module_shares_the_shared_tables_name_allocations`, which pins that the load's copy is
+  a fork (every atom the shared table already held is the *same* name allocation in the module's
+  table, at the same index). The end-to-end oracle
   cross-check of the whole path is `../tests/code_path.rs` (plus `../tests/boot_code_path.rs`
   and `../tests/code_add_path.rs` for the mutators); the boot gates are
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt --test boot`
   and `beam_rt -noshell -boot bootstrap/bin/start` (exit 0, empty stdout/stderr).
-- **The full crate gate is `-p beam_rt --lib --no-fail-fast`**: 1978 passed / 4 failed / 7 ignored,
-  and the four are the pre-existing `src/runner/` *measured-table* pins
+- **The full crate gate is `-p beam_rt --lib --no-fail-fast`**: 1981 passed / 6 failed / 7 ignored.
+  Four are the inventorial `src/runner/` *measured-table* pins
   (`a_process_never_hands_out_off_heap_slots_across_slices`, `boundary_cost`, `reds_door`,
-  `slice_charging`) — number-drift pins owned by that node, not this one. The `codeserver::` slice
-  is green on its own (`--lib -- codeserver`, 34 passed, the marker's two cases included).
+  `slice_charging`) — number-drift pins owned by that node, not this one. The other two are
+  `context::calls`'s collection-cadence pins
+  (`a_collecting_default_process_copies_every_result_without_refusing`,
+  `without_the_learned_hint_the_same_cadence_refuses_again`), which reproduce identically on an
+  unmodified tree at this commit and are *not* in `../TEST_STRATEGY.md`'s known-red inventory
+  (same class — they assert `collections * 4 > OPS` for a heap-policy-driven cadence). The
+  `codeserver::` slice is green on its own (`--lib -- codeserver`, 35 passed, the marker's two
+  cases included).
 - `system_path` reads the **ambient** `$ERL_LIBS`, so a test that manipulates it must be
   serialized by the caller (the crate's env discipline).
 - **The cheapest end-to-end parity check of this module's output** (seconds, no differential

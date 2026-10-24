@@ -912,11 +912,13 @@ impl CodeServer {
             &chunks.types,
         )?;
 
-        // `build_module` owns (and may extend) a clone of the shared table while it
-        // decodes the `LitT` literals; any atom that appeared only in a literal is
-        // appended after the clone's prefix at exactly `atoms.len()..`, so merging
-        // them back in index order keeps the shared indices identical.
-        let module = lower::build_module(&chunks, &raw, (*self.atoms).clone())?;
+        // `build_module` owns (and may extend) a **fork** of the shared table while it
+        // decodes the `LitT` literals: a fork preserves every index and the generation
+        // while sharing the name handles, so it is index-identical to a clone at two
+        // allocations instead of one name string per atom. Any atom that appeared only in
+        // a literal is appended after the fork's prefix at exactly `atoms.len()..`, so
+        // merging them back in index order keeps the shared indices identical.
+        let module = lower::build_module(&chunks, &raw, self.atoms.fork())?;
         let base = self.atoms.len();
         for index in base..module.atom_table.len() {
             if let Some(name) = module.atom_table.name(Atom::from_raw(index as u32)) {
@@ -1638,6 +1640,47 @@ mod tests {
             }
         }
         assert_eq!(server.loaded(), vec!["lists".to_string(), "proplists".to_string()]);
+    }
+
+    /// The per-module load hands `lower::build_module` a **fork** of the shared table, not a
+    /// deep copy: every atom the shared table already held is the very same name allocation
+    /// in the module's own table, at the same index (a `clone` would have re-allocated one
+    /// `String` per atom). The literal-only atoms a fork may append stay its own — the
+    /// merge-back loop puts them back on the shared table afterwards.
+    #[test]
+    fn a_loaded_module_shares_the_shared_tables_name_allocations() {
+        let Some(mut server) = system_server() else {
+            return;
+        };
+        // A well-populated prefix, so the sharing assertion has real work to do.
+        for index in 0..64 {
+            server.atoms_mut().intern(&format!("codeserver_prefix_{index:02}"));
+        }
+        let addresses: Vec<usize> = (0..server.atoms().len())
+            .map(|index| {
+                let name = server.atoms().name(Atom::from_raw(index as u32));
+                name.expect("every index below `len` names an atom").as_ptr() as usize
+            })
+            .collect();
+        let lists = server.load("lists").expect("stdlib lists loads");
+        for (index, address) in addresses.iter().enumerate() {
+            let atom = Atom::from_raw(index as u32);
+            let shared = server.atoms().name(atom).expect("in range");
+            let module = lists
+                .atom_table
+                .name(atom)
+                .expect("a fork covers the whole shared prefix");
+            assert_eq!(module, shared, "index {index} must name the same atom");
+            assert_eq!(
+                module.as_ptr() as usize, *address,
+                "index {index}: the load must share the name handle, not copy the string"
+            );
+        }
+        // The merge-back still ran: the load's own new names are on the shared table.
+        assert_eq!(
+            lists.atom_table.lookup("reverse"),
+            server.atoms().lookup("reverse")
+        );
     }
 
     #[test]

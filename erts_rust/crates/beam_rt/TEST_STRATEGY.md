@@ -60,17 +60,17 @@ A bare `erl -noshell` never exits, so every oracle probe appends `-s init stop` 
 
 ## Known-red tests at this commit
 **Eight tests are red on an unmodified tree, and none of them is a startup or performance regression to chase.** All eight reproduce **identically** at the pre-campaign base commit `3a58f3da23` (verified by rebuilding that commit in a detached worktree), so they are inherited, not caused by any later change.
-They are all **collection-cadence or capacity** assertions — how many collections a shape pays, at what capacity, and which door sees them — so the heap-policy rule below is where to look, not the glue:
+They are all **collection-cadence or capacity** assertions — how many collections a shape pays, at what capacity, and which door sees them — so the heap policy is where to look, not the glue:
 * the lib suite `src/runner/` — `a_process_never_hands_out_off_heap_slots_across_slices`;
-* `src/runner/tests/boundary_cost.rs` — `the_boundary_door_is_a_preemption_watermarked_site_on_the_churn_shape` (asserts `MEASURED_YOUNG_CAPACITY = 2_585` and its collection counts);
+* `src/runner/tests/boundary_cost.rs` — `the_boundary_door_is_a_per_preemption_watermarked_site_on_the_churn_shape` (mind the `per_`: a filter without it matches **0** tests and prints a green; its `MEASURED` totals rows and its `MEASURED_YOUNG_CAPACITY = 2_585` are what are pinned);
 * `src/runner/tests/reds_door.rs` — `a_bif_only_loop_is_collected_at_the_yield_boundary_and_its_heap_size_plateaus`;
 * `src/runner/tests/slice_charging.rs` — `the_slice_budget_prices_native_work_and_a_refusing_seam_still_ends_the_slice`;
 * `tests/foreign_root_loop.rs` — `a_loop_holding_the_statistics_result_keeps_collecting`;
 * `tests/gc_immix_payload.rs` — `the_runtime_shaped_workload_under_both_strategies`;
 * `tests/gc_strategy.rs` — `a_live_payload_survives_a_fullsweep_on_the_immix_path`;
 * `tests/off_heap_reclaim.rs` — `memory_binary_does_not_grow_monotonically_over_the_loop`.
-The most likely single cause is the heap policy's shrink rule: [`STARTUP_COST.md`](STARTUP_COST.md) *Cross-node asks* **(b)** proposes a minor-shrink floor (`beam_gc`'s `MINOR_SHRINK_FLOOR_WORDS`) whose blast radius is exactly the capacities these assertions read, and its two named re-derivations are two of the eight above.
-Until that ask lands in `beam_gc`, treat the eight as a **known** baseline: a startup/perf pass must reproduce them, never "fix" them by relaxing an assertion here.
+The heap policy's shrink rule is **not** their cause: `beam_gc`'s minor-shrink floor (`MINOR_SHRINK_FLOOR_WORDS = 3000`, [`STARTUP_COST.md`](STARTUP_COST.md) *The two cross-node asks* (b)) is live and its two named re-derivations are settled — `boundary_cost`'s `MEASURED_YOUNG_CAPACITY = 2_585` is still the capacity this tree runs (its own row dump reports `peak_young_capacity: 2 585`, so that assertion holds — the row's collection totals above it are what is red), and `src/context/tests.rs::the_copy_bound_ping_pong_grows_the_nursery_instead_of_declining_the_valve` is green — while all eight above stay red with the floor in place.
+Treat the eight as a **known** baseline: a startup/perf pass must reproduce them, never "fix" them by relaxing an assertion here, and an entry leaves this list only when it has been **run and seen green**.
 
 ## Measuring a long workload live
 How to watch a long compile (or any long workload) while it runs, without touching source — the recipe the crate's runtime investigations use.
