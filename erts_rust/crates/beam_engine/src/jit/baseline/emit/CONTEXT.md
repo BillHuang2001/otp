@@ -68,6 +68,45 @@ context (`JitRuntime::refresh_literals`, called by the driver before the run loo
 cross-module switch). A rejection branches to the helper, whose interpreter step reads the literal area
 itself.
 
+## Compile-time tables the emitter builds (what is keyed by what)
+Nothing the per-instruction analysis produces is retained in the artifact: an `Allocation` exists only for
+the duration of one `emit_block` call (borrowed, then dropped — `CodeBuffer`/`CompiledModule` hold none).
+The only tables that outlive a compile are `compile.rs`'s entry tables and the `LabelMap`.
+- **`Allocation` (`regs.rs:104`)** — the one per-block table set; every table is a `Vec`-indexed by
+  `pc - block_start`: `spill_sets: Vec<Vec<u32>>` (dirty set per pc, `[start, end]` **including** the exit
+  pc `end`), `fill_sets: Vec<Vec<u32>>` (post-helper refill per pc, `[start, end)`),
+  `entry_fill: Option<Vec<u32>>` (live-in set); plus the scalars `slots: Vec<(u32, Reg)>`,
+  `written: Vec<u32>` (whole-block union = the conservative fallback), `block_start: u32` and
+  `y_last`/`y_first`/`frame_republish_first: Option<u32>`. An **empty** table means "no analysis"
+  (a synthetic allocation) and degenerates to the whole cache/written set.
+  Lookups: `spill_slots_at(pc)`/`fill_slots(pc)` (`regs.rs:232`/`:255`) each **allocate a fresh
+  `Vec<(u32, Reg)>` per call** (spill and fill sites are hot; the fan-out is ≤ `CACHE_REGISTERS`), and
+  `slot(x)`/`is_written(x)` (`:204`/`:212`) are **linear scans** over the ≤5-entry `slots`/`written`,
+  not lookup tables.
+- **Re-derived, never cached:** `cacheable_touches`/`cacheable_reads`/`cacheable_writes`/`is_inlined`
+  (`regalloc.rs:523`/`:666`/`:780`/`:422`) and the `uses_y` union (`arith.rs:361` + `bif.rs:323`) re-run
+  the shape predicates per instruction per call — there is no per-instruction verdict table. `regalloc`
+  runs `uses_y` **twice** over the block (once for `y_last`'s max, once for `y_first`'s min) and
+  `allocate_registers_with_labels` walks the block once for touches/writes, once for `written_set`, then
+  once for the fill walk and once for the dirty walk.
+- **Every continuation sub-block pays its own analysis** (`compile.rs:342` and `:450`): the range
+  `[start, end)` gets a fresh `allocate_registers_with_labels`, because `Allocation` is
+  entry-point-relative (`block_start` + the two per-pc tables + `entry_fill`).
+- **Keyed by `(func, pc)`, two different structures with the same key** (`compile.rs`):
+  `block_labels: BTreeMap<(u32, u32), CodeLabel>` (`:86` eager / `:179` lazy — a **label** per block
+  start, so a forward branch is an ordinary `rel32` fixup) and the driver-facing entry tables
+  `entries: Vec<Vec<Option<*const u8>>>` + `sub_entries` (`:65`/`:73`, lazy `:178`/`:189` — **flat
+  indexing**, chosen over a `HashMap` because the driver probes it on every cross-block jump).
+  `Linker` (`link.rs:229`) holds only `&BTreeMap<(u32, u32), CodeLabel>`; it owns no fixup table — the
+  `rel32` patching is the `CodeBuffer`'s own label machinery.
+- **`LabelMap`** (`../../interpreter/mod.rs:88`) is the one *pre-decoded* table stored **in** the
+  artifact (`code.rs` `CompiledModule::labels`): dense `Vec<u64>` indexed by **label id** (packed
+  `func << 32 | code_index`) or a sorted sparse `Vec<(u32, (u32, u32))>`, plus `imports: Vec<..>` indexed
+  by `ImportRef.0` (each import's names resolved once). Not pc-keyed.
+- **Sub-block discovery is linear, not indexed** (`compile.rs:244` `sub_block_end`, `:311`/`:415`): per
+  continuation pc the code does `blocks.iter().find(..)` plus a fresh scan for the next
+  `stores_continuation` pc, i.e. O(blocks · continuation-sites) with no precomputed pc→block index.
+
 ## Where the detail lives (this node's children)
 This file is the *contract*: the core model, the literal-area guard, the constraints, the constraints' register/budget rules, the routing table and the known issues.
 The rest is one level down, each child owning one mechanism:
@@ -266,8 +305,9 @@ by construction).
   is what makes the file cohesive — each arm is one `try_inline_*` call plus an `emit_deopt` fallback —
   so splitting it further would scatter one decision across files or require inventing a visitor/table
   abstraction the emitter does not need. The block prologue it emits first is `prologue.rs`; the other
-  files are under the ~1000-line guidance (`test.rs` 963, `compile.rs` 892, `mod.rs` 401, `aggregate.rs`
-  744, …).
+  files are near or under the ~1000-line guidance (`test.rs` 979, `compile.rs` 1009, `aggregate.rs` 761,
+  `link.rs` 1136, `move.rs` 774, `block.rs` 1116, `mod.rs` 442, `regs.rs` 384, `liveness.rs` 153) —
+  `link.rs` and `compile.rs` exceed it by a little; neither is a single-scatter candidate today.
 - **`test.rs` (963) and `aggregate.rs` (744) are under the guidance but still large**: `test.rs` keeps
   the plan machinery (`test_plan`/`TestPlan`/the mask constants) because both `try_inline_test` and the
   `test/header.rs` emitters read them; `aggregate.rs` keeps the tuple path while the cons-cell readers
