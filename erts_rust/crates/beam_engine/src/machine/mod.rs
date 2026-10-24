@@ -97,6 +97,7 @@ pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
 
 use crate::context::{ExecutionContext, RootSet};
+use crate::families::bitstrings::programs::BitstrPrograms;
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
 pub(crate) use self::location::CURRENT_CODE_NONE;
@@ -726,6 +727,21 @@ pub struct Machine {
     /// [`Machine::invalidate_local_call_verdicts`] door; an un-nameable callee is memoized
     /// as such and keeps costing the host *zero* consultations.
     pub(crate) entry_verdicts: LocalVerdicts,
+    /// The run's **entry** module's prepared bitstring programs
+    /// (`crate::families::bitstrings::programs`), the context-`0` twin of a
+    /// [`ModuleContext`]'s
+    /// [`programs`](crate::machine::ModuleContext::programs) cell.
+    ///
+    /// Context `0` is the run's entry module, which the machine never owns (the drive
+    /// loop borrows it), so its program table lives here — exactly like
+    /// [`Machine::entry_verdicts`]. A prepared program is a pure function of the loaded
+    /// IR plus the atom/string tables, so nothing here can go stale while the module
+    /// image lives; the table's own image witness discards it if the entry module
+    /// changes, and [`Machine::reset`](crate::Machine::reset) drops it with the run.
+    ///
+    /// Read/moved only by [`Machine::take_bitstr_programs`] /
+    /// [`Machine::restore_bitstr_programs`].
+    pub(crate) entry_programs: BitstrPrograms,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -861,6 +877,7 @@ impl Machine {
             census_on: false,
             local_call_invalidation_pending: std::cell::Cell::new(false),
             entry_verdicts: LocalVerdicts::empty(),
+            entry_programs: BitstrPrograms::empty(),
             current_code: CURRENT_CODE_NONE,
             entry_call: None,
             reductions: 0,
@@ -1327,6 +1344,44 @@ impl Machine {
     pub(crate) fn bind_entry_verdicts(&mut self, module: &Module) {
         if !self.entry_verdicts.describes(module) {
             self.entry_verdicts = LocalVerdicts::for_module(module);
+        }
+    }
+
+    /// Hand the current module context's **prepared bitstring programs** to the caller
+    /// for the duration of one instruction, leaving an empty table in their place.
+    ///
+    /// The prepared-program cache (`crate::families::bitstrings::programs`) is per
+    /// module context — this machine's entry table for context `0`, a registered
+    /// [`ModuleContext`]'s cell otherwise — and the executing family needs it **while it
+    /// holds `&mut Machine`** (the segment writers allocate). Moving the table out for
+    /// the instruction is what makes those two borrows legal without a reference count,
+    /// a raw pointer or a slot borrowed across the call. Nothing else reads the table
+    /// mid-instruction, and the counterpart
+    /// [`Machine::restore_bitstr_programs`] files it back.
+    #[inline]
+    pub(crate) fn take_bitstr_programs(&mut self) -> BitstrPrograms {
+        if self.context == 0 {
+            std::mem::replace(&mut self.entry_programs, BitstrPrograms::empty())
+        } else {
+            match self.contexts.programs(self.context) {
+                Some(cell) => cell.replace(BitstrPrograms::empty()),
+                // An unregistered context has no module image, so it has no programs.
+                None => BitstrPrograms::empty(),
+            }
+        }
+    }
+
+    /// File `programs` back into the current module context's cell — the counterpart of
+    /// [`Machine::take_bitstr_programs`].
+    ///
+    /// A table that cannot be filed back (the context was dropped mid-instruction) is
+    /// dropped: it is a cache, so the only consequence is a re-decode.
+    #[inline]
+    pub(crate) fn restore_bitstr_programs(&mut self, programs: BitstrPrograms) {
+        if self.context == 0 {
+            self.entry_programs = programs;
+        } else if let Some(cell) = self.contexts.programs(self.context) {
+            cell.replace(programs);
         }
     }
     /// The module-wide label index of `module` — **the** label-map door.

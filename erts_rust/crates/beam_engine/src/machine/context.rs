@@ -58,10 +58,12 @@
 //! context `Machine::context` names, so the local-call seam's lookup needs no module
 //! key at all — see `local_callee.rs` for the whole argument.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use beam_loader::Module;
 
+use crate::families::bitstrings::programs::BitstrPrograms;
 use crate::interpreter::LabelMap;
 
 use super::LocalVerdicts;
@@ -94,6 +96,22 @@ pub(crate) struct ModuleContext {
     /// verdicts. The slots are `Cell`s, so the seam mutates the table through the
     /// shared `Arc`.
     pub(crate) verdicts: LocalVerdicts,
+    /// This module's **prepared bitstring programs**
+    /// (`crate::families::bitstrings::programs`): the pre-resolved `bs_create_bin`
+    /// segment / `bs_match` command programs, addressed by the instruction's
+    /// `(function, code offset)`.
+    ///
+    /// It lives **here**, beside the verdict table and for the same reason: a module
+    /// context *is* the module-image identity (`Arc::ptr_eq`-deduplicated), so a
+    /// prepared program sized/decode from *this* image can never answer for another.
+    /// A prepared program is a pure function of the loaded IR plus the atom/string
+    /// tables, so it cannot go stale while the image lives.
+    ///
+    /// A [`RefCell`] because the family **moves the table out** for the duration of one
+    /// instruction (`Machine::take_bitstr_programs`) — the executing code then holds it
+    /// locally, which is what lets the segment writers take `&mut Machine` without a
+    /// borrow of the context. Nothing else reads it mid-instruction.
+    pub(crate) programs: RefCell<BitstrPrograms>,
 }
 
 impl ModuleContext {
@@ -104,6 +122,7 @@ impl ModuleContext {
             module,
             labels,
             verdicts,
+            programs: RefCell::new(BitstrPrograms::empty()),
         }
     }
 }
@@ -192,7 +211,22 @@ impl Contexts {
             entry.verdicts.invalidate();
         }
     }
-    /// The number of registered contexts (not counting the entry context).
+
+    /// The prepared-bitstring-program cell of context `id`, or `None` for the entry
+    /// context `0` (whose table the machine owns —
+    /// [`Machine::entry_programs`](crate::Machine)) and for an id never registered.
+    ///
+    /// A borrow, not a clone: the caller exchanges the table's value for the duration of
+    /// one instruction, so a `&` handle and a `RefCell` are all it needs.
+    #[inline(always)]
+    pub(crate) fn programs(&self, id: u32) -> Option<&RefCell<BitstrPrograms>> {
+        if id == 0 {
+            return None;
+        }
+        self.entries
+            .get((id - 1) as usize)
+            .map(|entry| &entry.programs)
+    }    /// The number of registered contexts (not counting the entry context).
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

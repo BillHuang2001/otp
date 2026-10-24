@@ -66,6 +66,7 @@
 
 mod create;
 mod matching;
+pub(crate) mod programs;
 #[allow(unsafe_code)]
 mod raw;
 #[cfg(test)]
