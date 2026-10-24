@@ -48,7 +48,7 @@
 use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Module};
+use beam_loader::{Instr, Module, Operand};
 use beam_term::Eterm;
 
 use crate::context::{ExecutionContext, RootSet};
@@ -62,11 +62,19 @@ use crate::Step;
 /// Returns `Ok(Some(step))` when `instr` is a list opcode this family executes,
 /// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
 ///
-/// `#[inline]`-marked: the cons-cell instructions are the hottest *dispatched* ones
-/// (every list traversal), and the family router ([`super::dispatch`]) has already
-/// proved the variant, so inlining lets the optimizer keep the whole route to a
-/// `put_list` in one function (out of line it cost ~39 extra instructions per
-/// instruction — measured, see [`super::dispatch`]'s doc).
+/// This is the family's complete **ownership statement** (all four cons-cell
+/// variants are claimed here and nowhere else). The router
+/// ([`super::dispatch`]) calls [`put_list`] and [`get_list`] **directly** with the
+/// operands its own pattern has already destructured — those two are the hottest
+/// dispatched instructions in real code (every list build, every list traversal) and
+/// re-matching the variant a second time cost a second jump table plus a re-derived
+/// operand slice per instruction. The remaining two variants come through here, and
+/// the duplicated arms below are the same bodies the router's fast path calls, so the
+/// claim and the behaviour cannot drift.
+///
+/// `#[inline]`-marked: the two remaining cons-cell variants are still traversals, and
+/// out of line this entry cost ~39 extra instructions per dispatched instruction
+/// (measured; see [`super::dispatch`]'s doc).
 #[inline]
 pub(crate) fn exec(
     machine: &mut Machine,
@@ -79,33 +87,9 @@ pub(crate) fn exec(
 ) -> Result<Option<Step>> {
     let _ = (labels, func, pc);
     match instr {
-        Instr::PutList { head, tail, dst } => {
-            let extra = operand_slack_words(head) + operand_slack_words(tail);
-            let cons = terms::make_cons_rooted(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
-                Ok((
-                    read_operand_slack(m, head, s)?,
-                    read_operand_slack(m, tail, s)?,
-                ))
-            })?;
-            write_operand(machine, dst, cons)?;
-            Ok(Some(Step::Next))
-        }
+        Instr::PutList { head, tail, dst } => put_list(machine, head, tail, dst, ctx),
 
-        Instr::GetList { source, head, tail } => {
-            let value = read_operand(machine, ctx, source)?;
-            match (terms::cons_head(value), terms::cons_tail(value)) {
-                (Ok(h), Ok(t)) => {
-                    write_operand(machine, head, h)?;
-                    write_operand(machine, tail, t)?;
-                    Ok(Some(Step::Next))
-                }
-                // `[]` or a non-list is not a cons cell.
-                _ => {
-                    let reason = badmatch(machine, ctx, module, source)?;
-                    machine.throw_error(reason).map(Some)
-                }
-            }
-        }
+        Instr::GetList { source, head, tail } => get_list(machine, module, source, head, tail, ctx),
 
         Instr::GetHd { source, head } => {
             let value = read_operand(machine, ctx, source)?;
@@ -136,6 +120,60 @@ pub(crate) fn exec(
         }
 
         _ => Ok(None),
+    }
+}
+
+/// `put_list Head Tail Dst` — build `[Head | Tail]` and store it in `Dst`.
+///
+/// One of the two bodies the router calls directly (see [`exec`]): the operands are
+/// bound by the caller's `Instr` pattern, so no second variant match and no operand
+/// re-derivation. `Tail` need not be a list — an improper list is a legal term.
+#[inline]
+pub(crate) fn put_list(
+    machine: &mut Machine,
+    head: &Operand,
+    tail: &Operand,
+    dst: &Operand,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let extra = operand_slack_words(head) + operand_slack_words(tail);
+    let cons = terms::make_cons_rooted(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
+        Ok((
+            read_operand_slack(m, head, s)?,
+            read_operand_slack(m, tail, s)?,
+        ))
+    })?;
+    write_operand(machine, dst, cons)?;
+    Ok(Some(Step::Next))
+}
+
+/// `get_list Source Head Tail` — split the cons cell in `Source`.
+///
+/// The other directly-routed body (see [`exec`]). `Source` must be a cons cell (a
+/// non-empty list; `[]` is *not* one): the C opcode trusts a preceding
+/// `is_nonempty_list` test and reads the cell unchecked, so this is the **safety
+/// net** — a non-cons source raises `{badmatch, Source}` (class `error`).
+#[inline]
+pub(crate) fn get_list(
+    machine: &mut Machine,
+    module: &Module,
+    source: &Operand,
+    head: &Operand,
+    tail: &Operand,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let value = read_operand(machine, ctx, source)?;
+    match (terms::cons_head(value), terms::cons_tail(value)) {
+        (Ok(h), Ok(t)) => {
+            write_operand(machine, head, h)?;
+            write_operand(machine, tail, t)?;
+            Ok(Some(Step::Next))
+        }
+        // `[]` or a non-list is not a cons cell.
+        _ => {
+            let reason = badmatch(machine, ctx, module, source)?;
+            machine.throw_error(reason).map(Some)
+        }
     }
 }
 

@@ -166,8 +166,20 @@ pub(crate) fn dispatch(
         | Instr::UpdateRecordId(_) => {
             records::exec(machine, module, labels, instr, func, pc, ctx)
         }
-        // lists
-        Instr::PutList { .. } | Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
+        // lists — the two cons-cell instructions are the hottest *dispatched* ones in
+        // real code (every list build is a `put_list`, every list traversal a
+        // `get_list`), so they are routed **directly to their bodies** with the
+        // operands this pattern has already destructured. Routing them through
+        // `lists::exec` (as `GetHd`/`GetTl` still are) makes the family re-match the
+        // variant the router just proved — a second jump table — and re-derive the
+        // operand references the arm already has. `lists::exec` stays this family's
+        // complete ownership statement and calls the very same bodies, so a claim and
+        // its behaviour cannot drift apart.
+        Instr::PutList { head, tail, dst } => lists::put_list(machine, head, tail, dst, ctx),
+        Instr::GetList { source, head, tail } => {
+            lists::get_list(machine, module, source, head, tail, ctx)
+        }
+        Instr::GetHd { .. } | Instr::GetTl { .. } => {
             lists::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // funs
