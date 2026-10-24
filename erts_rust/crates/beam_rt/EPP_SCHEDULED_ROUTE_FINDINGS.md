@@ -7,7 +7,7 @@ Sibling-owned dossier for the A.9 **scheduled (`run`) route** — the two differ
 own compiler process).
 The gate is authoritative and re-run, never quoted here: both cases agree with the oracle on both execution tiers — each prints `1` and exits 0.
 Present state, not a history.
-The current picture: the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites consult (`beam_rt`'s `RuntimeCollectionGate`), with the runner's park-window relocation exemption as the complementary mitigation.
+The current picture: the `beam_process` signal-driven collection site that would relocate a woken monitor watcher's heap against an incomplete root set is **declined by the host collection gate** the `ptab.rs` signal sites consult (`beam_rt`'s `RuntimeCollectionGate`), and the runner's park publishes the machine's root set — the live-FR prefix kept out of a relocation by its exemption (§3).
 
 ## 1. The pinned mover — the monitor-DOWN branch of the process-termination cascade
 A heap-move trace that watches the **mature base** (not only the nursery) pins the move to the
@@ -30,8 +30,8 @@ The collection would relocate the **monitor watcher's** heap. The watcher was ju
 `Waiting` → `Runnable` by a preceding delivery, so
 `Process::has_unpublished_roots()` (= `relocation_exempt || state == ProcessState::Running`,
 `beam_process/src/process.rs:1098`) is `false` — the crate-owned predicate alone passes — even though a
-woken-but-not-yet-resumed process's `regs` snapshot is **not** its whole live root set (the parked/
-woken machine's live terms are not all published). The signal site therefore consults the **host**
+woken-but-not-yet-resumed process's `regs` snapshot is **not** its whole live root set (a live FR
+prefix the park had to keep exempt, a term a host holds outside the published set). The signal site therefore consults the **host**
 `CollectionGate` beside that crate predicate (`ptab.rs`'s private `declines_signal_collection`, which
 OR-s the two), and `RuntimeCollectionGate` declines the relocation for a receiver whose gathered roots
 reach a container in an unscanned region, so the signal takes the heap-fragment route the cascade
@@ -58,13 +58,20 @@ site runs from a different borrow than an admission point and may even run mid-c
 the runtime's scratch would alias) and always descends (`descend = true` — a signal site has no
 in-flight machine to publish and cannot evaluate the per-pid descent latch), so it decides exactly as
 the runtime's admission-point valve does.
-**The runner's Wait park arm** (`src/runner/run.rs`) additionally marks the process
-**relocation-exempt** for the whole parked window, and the **resume** clears it. The two are
-**complementary**: the gate declines only when an unscanned container is reachable from the receiver's
-**gathered** roots, whereas the exemption refuses *any* relocation for the parked window — also
-covering a live term the host holds **outside** that published set (the runner's own entry terms —
-`ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args` — and any live `Eterm` in host
-Rust state), which the walk cannot see. The mitigation is **decline-only and bounded**: it never
+**The runner's park arm** (`src/runner/run.rs`) covers the same hazard from its own side: a park
+publishes the machine's root set — the `x`/stack files, the live FR prefix, and in
+`Registers::extra_roots` the runner's own host-held terms (`ProcessEngine::args`,
+`ProcessEntry::Fun::fun`, `LocalFunTarget::args`) on top of a live `Machine::pending_exception`
+reason — so a `Wait` park with a dead FR prefix is **not** relocation-exempt, and a delivery to the
+blocked receiver collects its nursery and copies straight in.
+The exemption (`ParkExemption::LiveFloats`, `exempt = fr_count > 0`) holds only where the slice
+ended with a live FR prefix, which is exactly the state no publication can carry, because the
+machine keeps those slots as roots of its own.
+The two halves are **complementary**: the gate declines only when an unscanned container is
+reachable from the receiver's **gathered** roots, while the park's publication is what puts the
+runner's own host-held terms into that gathered set — and the exemption is what keeps a live FR
+prefix out of a relocation for the parked window.
+The mitigation is **decline-only and bounded**: it never
 *allows* a collection, so an affected process's heap grows on that path only until it is resumed, and
 its own admission point then collects as usual.
 The regression is `tests/compile_file.rs::a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle`
@@ -74,7 +81,7 @@ The regression is `tests/compile_file.rs::a_scheduled_process_compiles_a_source_
 `a_scheduled_process_parses_a_source_file_like_the_oracle` covers the same class via `epp:parse_file/3`.
 The seam is pinned by
 `context::tests::the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver`
-and `runner::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
+and `runner::tests::a_receive_park_publishes_so_a_signal_collects_the_receivers_nursery`.
 
 **The durable invariant behind the E0 shape.** A registered BIF's container result is never left on the recyclable pooled BIF heap while running Erlang code can store it in a heap object.
 On a process route the copy-out moves such a result onto the process's own **scanned young heap**, where the engine's ordinary root set already publishes it (it lands in `x(0)` on return) and a later collection relocates it like any other heap object.
@@ -87,5 +94,6 @@ The invariant is [`DESIGN_DECISIONS.md`](DESIGN_DECISIONS.md)'s and [`src/contex
 `crates/beam_process/src/ptab.rs` owns the seam: `ProcessTable::set_collection_gate` /
 `take_collection_gate` / `has_collection_gate` install/take/test the host `CollectionGate`, and its
 private `declines_signal_collection(pid)` OR-s that gate with the crate's `has_unpublished_roots` at
-every signal site. The host half is `RuntimeCollectionGate`; the runner's park-window exemption
-remains the narrower, complementary cover for the host-held-outside-roots hazard described above.
+every signal site. The host half is `RuntimeCollectionGate`; the runner's park publishes the
+host-held terms the gate's walk cannot see and keeps the FR prefix out of a relocation (§3), so the
+two cover different halves of the same hazard.

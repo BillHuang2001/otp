@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, RunOutcome as EngineRunOutcome};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 
 use crate::context::gc;
@@ -560,11 +560,11 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 /// leave a stale word in the machine's `x` ([`crate::context::gc`] documents the hand-off).
 ///
 /// [`park_machine`] is the production caller and decides whether the hand-off is needed at all: a
-/// **relocation-exempt** window (every `receive` park, and a `Yield` park whose slice ended with a
-/// live FR prefix) refuses every relocation site for the window's whole duration, so the machine
-/// stays authoritative and both this publication and the resume's matching re-sync are skipped.
-/// This is what a **`Yield`** park with a dead FR prefix relies on — the one park window a
-/// collection may relocate over.
+/// **relocation-exempt** window (a park whose slice ended with a live FR prefix) refuses every
+/// relocation site for the window's whole duration, so the machine stays authoritative and both
+/// this publication and the resume's matching re-sync are skipped. Every other park — a `receive`
+/// whose FR prefix is dead (the overwhelmingly common delivery target), a pre-emption and a BIF
+/// suspend — publishes.
 ///
 /// The machine's **whole** root set is published — every x register, the whole Erlang stack,
 /// and the machine's **live leading float-register (FR) prefix**
@@ -574,19 +574,32 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 /// always *safe* (it can only keep a term alive, never free a live one), and the FR file holds
 /// `Eterm` term slots at Milestone 1 so a **live** float register is a root like any other.
 ///
-/// # The pending-exception reason is an extra root
+/// # The words outside the frozen root set are extra roots
 ///
-/// The machine's live **pending-exception reason** ([`Machine::pending_exception`]) is the one
-/// term a parked machine holds that the closed [`RootSet`] shape cannot carry: it is a machine
-/// *field*, not an `x`/stack/FR slot. It is therefore read out before the root-set borrow and
-/// published as the process's [`Registers::extra_roots`](beam_process::Registers::extra_roots)
-/// word — the host escape hatch `beam_process`'s `gather_roots`/`scatter_roots` relocate in
-/// place — so a collection that does run (a `Yield`-window one) moves it with the heap and the
-/// resume re-syncs it back into the machine. With **no** live pending exception the extra-root
-/// set is left **empty** (cleared, never a placeholder), so a stale root can never keep an
-/// otherwise-dead term alive.
+/// A parked engine holds terms the closed [`RootSet`] shape cannot carry, because they are
+/// *fields*, not `x`/stack/FR slots:
 ///
-/// The published word is a live term **by construction**, which is why it needs no liveness
+/// * the machine's live **pending-exception reason** ([`Machine::pending_exception`]);
+/// * the engine's own host-held families ([`ProcessEngine::append_parked_host_terms`]): the
+///   first-run arguments, a fun entry's fun term and a resolved local fun's argument list —
+///   each only while it is still live.
+///
+/// The reason is read out before the root-set borrow and published (first) as the process's
+/// [`Registers::extra_roots`](beam_process::Registers::extra_roots) — the host escape hatch
+/// `beam_process`'s `gather_roots`/`scatter_roots` relocate in place — so a collection that does
+/// run moves it with the heap and the resume re-syncs it back into the machine; the engine's
+/// families follow it, and [`resume_from_process_roots`] adopts each family back into the field
+/// it came from. With **no** live term of either kind the extra-root set is left **empty**
+/// (cleared, never a placeholder), so a stale root can never keep an otherwise-dead term alive.
+///
+/// The remaining machine-held terms need no extra root: the other four *loose* heap terms (the
+/// two failed-clause argument latches and the two supplied-trace term latches) ride the stack,
+/// because [`Machine::with_roots`] parks every armed one at the Erlang stack's tail and re-seats
+/// it from the word the host wrote back — so they are part of `roots.stack` here and are
+/// relocated with it. A [`Frame`](beam_engine::machine) and a catch frame are metadata (a
+/// continuation address and a Y-slot bound), and `class_atoms` holds atoms, i.e. immediates.
+///
+/// The published reason is a live term **by construction**, which is why it needs no liveness
 /// filter: `Machine::with_roots` parks the field on the Erlang stack for the duration of every
 /// allocation that may collect (`Machine::loose_heap_terms`) and re-seats it from the slot the
 /// host wrote back, and that funnel — behind `Machine::alloc_rooted` and `Machine::ensure_heap` —
@@ -638,41 +651,52 @@ fn describe_site(engine: &ProcessEngine) -> Option<String> {
 pub(super) fn publish_parked_roots(
     table: &mut ProcessTable,
     pid: ProcessId,
-    machine: &mut Machine,
+    engine: &mut ProcessEngine,
     fr_count: usize,
 ) {
     // Read the reason **before** the root-set borrow: `with_roots` takes `machine` mutably for
     // the duration of the closure, so `pending_exception()` cannot be reached inside it.
-    let reason = machine.pending_exception().map(|(_, reason)| reason);
+    let reason = engine.machine.pending_exception().map(|(_, reason)| reason);
     let Some(process) = table.get_mut(pid) else {
         return;
     };
     // The reason is a live word: `Machine::with_roots` re-seats the field after every collection
     // that runs inside a slice (see the root-hand-off section above), so it names either an
     // immediate/a literal or a container this process's collector relocates.
-    machine.with_roots(RootSet::ALL_LIVE, |roots| {
-        gc::publish_roots_full(process, &roots, fr_count)
-    });
-    // The extra-root set is exactly the live pending-exception reason: cleared first so a machine
-    // with none (or one whose exception was handled) never leaves a stale root behind.
+    engine
+        .machine
+        .with_roots(RootSet::ALL_LIVE, |roots| {
+            gc::publish_roots_full(process, &roots, fr_count)
+        });
+    // The extra-root set is exactly the terms this engine holds outside the machine's frozen root
+    // set: the live pending-exception reason first, then the engine's own host-held families
+    // ([`ProcessEngine::append_parked_host_terms`] — the first-run arguments, a fun entry's fun
+    // term and a resolved local fun's argument list, each only while it is still live). Cleared
+    // first, so a machine that holds none never leaves a stale root behind.
     let extra = process.registers_mut().extra_roots_mut();
     extra.clear();
     if let Some(reason) = reason {
         extra.push(reason);
     }
+    engine.append_parked_host_terms(extra);
 }
 
 /// Re-syncs a machine about to **resume** from the process's authoritative root set.
 ///
-/// The twin of [`publish_parked_roots`]: while the machine was out of the runner — a `Yield`
-/// pre-emption with a **dead** FR prefix (`fr_count == 0`), the one park window that is not
-/// marked relocation-exempt — a collection may have relocated the process's heap and rewritten
-/// the process's `regs` in place, leaving the parked machine's own `x`/`stack` pointing into the
-/// abandoned space. The process's root set — not the machine's stale copy — is therefore the
-/// truth a resume must run from; the context method reconciles them (including reading the
-/// relocated pending-exception reason back into the machine and consuming the process's extra
-/// roots) and halts the process's collection if their slices no longer match (see
+/// The twin of [`publish_parked_roots`]: while the machine was out of the runner — a park window
+/// with a **dead** FR prefix (`fr_count == 0`, the one shape that is not marked
+/// relocation-exempt) — a collection may have relocated the process's heap and rewritten the
+/// process's `regs` in place, leaving the parked machine's own `x`/`stack` pointing into the
+/// abandoned space. The process's root set — not the machine's stale copy — is therefore the truth
+/// a resume must run from; the context method reconciles them (including reading the relocated
+/// pending-exception reason back into the machine and consuming the process's extra roots) and
+/// halts the process's collection if their slices no longer match (see
 /// [`RuntimeContext::resync_parked_roots`]).
+///
+/// The engine's **own** host-held families are adopted back into the fields they were published
+/// from **before** that call runs, because the context's resume consumes and clears the whole
+/// extra-root set ([`ProcessEngine::adopt_relocated_parked_roots`] reads the words its own gate
+/// published, skipping the reason slot).
 ///
 /// `fr_count` is the count the matching park published the FR prefix with (the engine's
 /// `ProcessEngine::fr_published`); the resume must pass **the same** count so the relocated
@@ -681,10 +705,18 @@ pub(super) fn publish_parked_roots(
 pub(super) fn resume_from_process_roots(
     ctx: &mut RuntimeContext<'_>,
     pid: ProcessId,
-    machine: &mut Machine,
+    engine: &mut ProcessEngine,
     fr_count: usize,
 ) {
-    ctx.resync_parked_roots(pid, machine, fr_count);
+    // The engine's own host-held families first: the context's resume **consumes and clears** the
+    // whole extra-root set (the machine owns the relocated words afterwards), so the engine's
+    // words must be read back before it runs. `extra_roots()` is borrowed from the process in the
+    // table while `engine` is a separate binding, and the borrow ends with the call.
+    if let Some(process) = ctx.process_table().get(pid) {
+        let extra = process.registers().extra_roots();
+        engine.adopt_relocated_parked_roots(extra);
+    }
+    ctx.resync_parked_roots(pid, &mut engine.machine, fr_count);
 }
 
 /// The **publication half** of a park: writes `engine`'s machine root set into `pid`'s process root
@@ -705,9 +737,9 @@ pub(super) fn resume_from_process_roots(
 /// # Why an exempt window skips a copy that a plain window cannot
 ///
 /// The publication is an **identity round-trip** for an exempt window: nothing can move the
-/// heap, so `publish_parked_roots` writes the machine's whole x file
-/// ([`RootSet::ALL_LIVE`], 1024 words), its Erlang stack and its live FR prefix into the process's
-/// [`Registers`](beam_process::Registers), and the resume's
+/// heap, so `publish_parked_roots` writes the machine's whole used x prefix
+/// ([`RootSet::ALL_LIVE`]), its Erlang stack, its live FR prefix and its host-held extra roots
+/// into the process's [`Registers`](beam_process::Registers), and the resume's
 /// [`resync_parked_roots`](crate::context::RuntimeContext::resync_parked_roots) copies the very
 /// same words back — the machine's own root set *is* the truth throughout. Skipping it is sound
 /// because **every** site that could relocate a parked process's heap is refused for the window:
@@ -736,11 +768,11 @@ pub(super) fn resume_from_process_roots(
 ///   deliberately **not** gated on the exemption — relocates nothing (it retires the old space
 ///   onto a chain the next collection collapses).
 ///
-/// The pending-exception reason is carried by the machine itself
-/// ([`Machine::with_roots`](beam_engine::Machine::with_roots) parks the function-clause latches on
-/// the machine's own stack), so the extra-root half of the hand-off is not needed either: with no
-/// publication there is no extra root to set, and the resume's clear is a no-op that leaves the
-/// process's `extra_roots` exactly as empty as it was.
+/// The pending-exception reason and the engine's host-held families ride the machine itself
+/// ([`Machine::with_roots`](beam_engine::Machine::with_roots) parks the machine's own loose heap
+/// terms on the stack it hands over), so the extra-root half of the hand-off is not needed
+/// either: with no publication there is no extra root to set, and the resume's clear is a no-op
+/// that leaves the process's `extra_roots` exactly as empty as it was.
 fn park_machine(
     table: &mut ProcessTable,
     pid: ProcessId,
@@ -758,7 +790,7 @@ fn park_machine(
         return false;
     }
     engine.parked_published = true;
-    publish_parked_roots(table, pid, &mut engine.machine, fr_count);
+    publish_parked_roots(table, pid, engine, fr_count);
     #[cfg(test)]
     note_park_publish(true);
     true
@@ -768,15 +800,14 @@ fn park_machine(
 /// exemption and the publication are both derived from it by [`park_window`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ParkExemption {
-    /// The window always holds it: the `receive` park, whose window a delivery or a signal really
-    /// may enter — `Process::deliver`'s exit cascade is not gated by
-    /// [`Runtime::gc_process_enabled`](crate::runtime::Runtime) — and whose host-held terms
-    /// (`ProcessEngine::args`, `ProcessEntry::Fun::fun`, `LocalFunTarget::args`) are outside the
-    /// collector's gathered root set.
-    Always,
     /// The window holds it exactly when the slice ended with a **live** FR prefix
-    /// (`fr_count > 0`): a pre-emption or a BIF suspend, whose machine keeps those FR slots as
-    /// roots of its own for the window (see [`RuntimeRunner::run`]'s FR section).
+    /// (`fr_count > 0`): the machine keeps those FR slots as roots of its own for the window,
+    /// which is the one thing no publication can carry (the FR file holds `Eterm` slots, and the
+    /// park publishes only their live `fr_mark` prefix — the exemption is what keeps the
+    /// remaining slots from being moved out from under it). Every park arm — a `receive`, a
+    /// pre-emption and a BIF suspend — uses this, so a `receive` window whose FR prefix is dead
+    /// publishes and is collectable, and the engine's host-held terms are covered by the
+    /// publication instead of by the exemption (see [`publish_parked_roots`]).
     LiveFloats,
 }
 
@@ -810,7 +841,6 @@ pub(super) fn park_window(
     reason: ParkExemption,
 ) -> bool {
     let exempt = match reason {
-        ParkExemption::Always => true,
         ParkExemption::LiveFloats => fr_count > 0,
     };
     // The exemption is written **here**, from the same value that decides the publication below,
@@ -1009,7 +1039,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                     // (`ProcessEngine::fr_published`), so the relocated stack region is split
                     // exactly as the park appended it.
                     let fr_count = engine.fr_published;
-                    resume_from_process_roots(&mut ctx, pid, &mut engine.machine, fr_count);
+                    resume_from_process_roots(&mut ctx, pid, &mut engine, fr_count);
                 }
                 // The window is over however it published: clear the flag so a later park's
                 // answer is the one the next resume reads (a stale `true` would re-sync against
@@ -1256,11 +1286,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
         // The guard is therefore **per slice**: a slice that ends with a live FR prefix parks
         // under `ParkExemption::LiveFloats`, which takes the relocation exemption for the window
         // that follows, and the **next slice entry** clears the mark again (`RuntimeRunner::run`'s
-        // parking branch), so a window that opens with a dead FR prefix is protected by nothing at
-        // all. The mark is decline-only and bounded: a delivery into the window takes the ordinary
-        // heap-fragment fallback (`Process::deliver`'s raw refusal), and the process's own
-        // admission point collects as soon as the resume has cleared the mark — so nothing grows
-        // unboundedly.
+        // parking branch), so a window that opens with a dead FR prefix publishes its roots and is
+        // protected by the collection itself. The mark is decline-only and bounded: a delivery into
+        // an **exempt** window takes the ordinary heap-fragment fallback (`Process::deliver`'s raw
+        // refusal) while a delivery into a publishing one copies straight onto the receiver's
+        // heap, and the process's own admission point collects as soon as the resume has cleared
+        // the mark — so nothing grows unboundedly.
         //
         // # Why `fr_mark` is the right — and exact — bound
         //
@@ -1513,45 +1544,49 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         }
                     }
                 }
-                // This window is **exempt for its whole duration**, which is what makes skipping
-                // the root publication sound. While the process waits, a delivery or signal can
-                // drive a collection of its heap (`Process::deliver`'s exit cascade is not gated by
-                // `gc_process_enabled`) against the *machine's own* root set — the only snapshot
-                // there is — and the exemption is what makes every one of those sites refuse the
-                // move (see `park_window`, the one writer of the flag).
+                // This window publishes the machine's whole root set, and its exemption is
+                // therefore **dead-FR only** (`ParkExemption::LiveFloats`): a plain blocked
+                // receiver (the overwhelmingly common delivery target) publishes, so
+                // `Process::has_unpublished_roots()` is `false` for it and a delivery — or a
+                // requested `garbage_collect` — really collects/grows its nursery and copies the
+                // payload **straight into it**, the way the C puts a message on the receiver's
+                // heap. That is the whole point of the publication: without it a dead-FR park
+                // would hold the window's exemption and every delivery to a blocked receiver
+                // would take the heap-fragment fallback, i.e. a carrier allocation plus a *second*
+                // full copy of the payload later.
                 //
-                // That machine-local root set is not the whole truth of what the host holds, and
-                // the two protections are **not** equivalent. The installed host collection gate
-                // (`crate::context::gc_walk::RuntimeCollectionGate`) declines only when an
+                // What the publication must cover, and why it does:
+                //
+                // * the machine's `x`/stack/live FR prefix — [`publish_parked_roots`];
+                // * the machine's five loose heap terms — parked on the Erlang stack by
+                //   `Machine::with_roots` for the duration of that publication, so they ride
+                //   `roots.stack`;
+                // * the host-held families outside the machine — the pending-exception reason and
+                //   the engine's own ([`ProcessEngine::append_parked_host_terms`]) — pushed onto
+                //   the process's `extra_roots`, which `beam_process`'s `gather_roots` /
+                //   `scatter_roots` relocate in place.
+                //
+                // The installed host collection gate
+                // (`crate::context::gc_walk::RuntimeCollectionGate`) declines when an
                 // **unscanned container is reachable from the receiver's GATHERED roots**
-                // (`seed_process_roots`); this exemption refuses *any* relocation for the parked
-                // window. The gap it covers is a live term the host holds **outside** that gathered
-                // set — the runner's own entry terms (`ProcessEngine::args`,
-                // `ProcessEntry::Fun::fun`, `LocalFunTarget::args`) and any live `Eterm` in the
-                // host's Rust state — which the walk cannot see, plus
-                // `Runtime::serve_gc_request`, which gates its descent on the per-pid latch
-                // (`foreign_reachable`) rather than always descending, so it can miss a depth-≥2
-                // foreign container the gate's unconditional descent would catch. Exempting is
-                // **decline-only**: such a delivery takes the ordinary heap-fragment fallback
-                // (`Process::deliver`'s raw refusal), and the process's own next admission point —
-                // after it is resumed, where the exemption is cleared — collects as usual, so
-                // nothing grows unboundedly. Pinned by
-                // `super::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
+                // (`seed_process_roots`, which includes `extra_roots`), and
+                // `Runtime::serve_gc_request` gates its descent differently; both are decline-only,
+                // so a delivery they refuse still takes the fragment fallback and the process's
+                // next admission point — after it is resumed, where the exemption is clear —
+                // collects as usual. Nothing grows unboundedly.
                 if let Some(process) = table.get_mut(pid) {
                     process.set_state(ProcessState::Waiting);
                 }
-                // Park under `ParkExemption::Always`: nothing may relocate this heap for the whole
-                // window, so the machine stays the authoritative root set, the publication is
-                // skipped and the resume skips the matching re-sync (an identity round-trip over
-                // the whole x file, the stack and the live FR prefix, twice per message on a
-                // two-process ping-pong). The FR prefix bookkeeping is recorded all the same.
-                park_window(table, pid, &mut engine, fr_count, ParkExemption::Always);
-                // A pending `garbage_collect` request (see `Runtime::request_gc`) is **not**
-                // served here: the exemption set above declines it — `serve_gc_request`
-                // consults `Process::is_relocation_exempt` before committing to a collection —
-                // so the request is consumed and dropped like any other valve-refused one.
-                // The admission points and a publishing `Yield` window are the sites that serve
-                // it.
+                // Park under `ParkExemption::LiveFloats`: the root set is published (the machine
+                // stays resumable against the process's registers, which a delivery-driven
+                // collection rewrites in place) and the exemption is held only for a live FR
+                // prefix, which no publication can carry. The FR prefix bookkeeping is recorded
+                // all the same.
+                park_window(table, pid, &mut engine, fr_count, ParkExemption::LiveFloats);
+                // A pending `garbage_collect` request (see `Runtime::request_gc`) has already been
+                // served or declined by the publication above: `serve_gc_request` consults
+                // `Process::is_relocation_exempt`, which is `false` for a dead-FR window, so a
+                // requested collection really runs here and relocates the published roots.
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
                 // The **schedule-out net**: a process that still owes its own queue a signal may
@@ -1584,11 +1619,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 //   the pid at the next schedule-in, so one re-entry either matches the
                 //   materialised message (a trapped `{'EXIT', …}`, a DOWN) or parks again with an
                 //   empty queue, which takes the `Wait` below.
-                // * **The parked window stays sound** — the `Waiting` + relocation-exempt park
-                //   set above is overwritten to `Runnable` by the `Yield` arm, and no relocation
-                //   site can move this heap in between (the exemption is consulted by all of
-                //   them), so the machine stays the authoritative root set; a message delivered
-                //   into the window at worst takes the documented heap-fragment fallback.
+                // * **The parked window stays sound** — the `Waiting` park set above is
+                //   overwritten to `Runnable` by the `Yield` arm, and the window's publication
+                //   stands either way: a collection driven while the process sat parked
+                //   relocated the *process's* registers (the machine's own `x`/stack are re-synced
+                //   from them at the resume, `resume_from_process_roots`), so the re-entry runs on
+                //   moved words rather than dangling ones. A message delivered into the window
+                //   either lands on the receiver's heap (the direct route) or takes the documented
+                //   heap-fragment fallback when a valve declines the collection.
                 //
                 // The count is read **after** the bookkeeping above and **before** the outcome:
                 // any signal queued during this slice is seen, and a process with a quiet queue

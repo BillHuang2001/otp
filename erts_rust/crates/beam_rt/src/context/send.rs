@@ -472,8 +472,10 @@ impl<'a> RuntimeContext<'a> {
     /// the **receiver's** heap: a receiver that is neither `Running` nor relocation-exempt
     /// passes `has_unpublished_roots`, so `deliver` runs a rooted collection (and an on-demand
     /// growth) over *its* root set — the `Runnable` shape, a process woken by a delivery or
-    /// pre-empted at a yield. (A `Waiting` receiver is exempt for its whole parked window — the
-    /// runner's Wait park arm sets the mark and the resume clears it — so it refuses the move.)
+    /// pre-empted at a yield — plus a `Waiting` receiver parked in `receive` whose slice ended
+    /// with a dead FR prefix, which published its roots for exactly this purpose. Only a receiver
+    /// parked with a **live** FR prefix holds the window's relocation exemption and refuses the
+    /// move.
     /// The runtime's four admission doors
     /// (`gc::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and `Runtime::serve_gc_request`)
     /// refuse exactly that move when the receiver's roots reach a container the collector does

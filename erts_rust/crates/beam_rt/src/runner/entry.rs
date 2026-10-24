@@ -256,12 +256,12 @@ pub(super) struct ProcessEngine {
     /// could relocate the heap from.
     ///
     /// A park opens one of two windows ([`park_machine`](super::run)): a **relocation-exempt**
-    /// one — every `receive` park, and a `Yield` park whose slice ended with a live FR prefix —
-    /// where every relocation site refuses the move for the whole window, so the parked machine
-    /// itself stays the authoritative root set and the copy into the process would be an
-    /// identity round-trip that nothing ever reads; or a **plain** one (a `Yield` park with a
-    /// dead FR prefix), which a delivery-driven collection *can* relocate over, so the machine's
-    /// roots must be handed over.
+    /// one — a park whose slice ended with a live FR prefix ([`ParkExemption::LiveFloats`](super::run::ParkExemption))
+    /// — where every relocation site refuses the move for the whole window, so the parked machine
+    /// itself stays the authoritative root set and the copy into the process would be an identity
+    /// round-trip that nothing ever reads; or a **plain** one (a dead FR prefix: every `receive`
+    /// park, a pre-emption and a BIF suspend), which a delivery-driven collection *can* relocate
+    /// over, so the machine's roots must be handed over.
     ///
     /// The flag is written by the park arm and read by the resume, which re-syncs the machine
     /// from the process's root set
@@ -537,6 +537,83 @@ impl RunnerState {
         self.spawn(pid, ProcessEntry::Fun { fun, target: None }, args);
     }
 
+}
+impl ProcessEngine {
+    /// Appends the **heap terms this engine holds outside the machine's frozen root set** to
+    /// `out`, in the order [`publish_parked_roots`](super::run::publish_parked_roots) appends them
+    /// to the process's [`Registers::extra_roots`](beam_process::Registers::extra_roots) — the
+    /// publication's **third** family, after the machine's own root set and its live
+    /// pending-exception reason.
+    ///
+    /// The three families, in publish order:
+    ///
+    /// 1. [`ProcessEngine::args`] — the process's first-run arguments;
+    /// 2. [`ProcessEntry::Fun::fun`] — a fun-bodied process's fun term;
+    /// 3. [`ProcessEntry::Fun::target`]'s [`LocalFunTarget::args`] — an in-flight local-fun
+    ///    application's combined `free ++ call` argument list.
+    ///
+    /// All three are gated on [`ProcessEngine::args_consumed`], which is the condition under which
+    /// the runner reads any of them again: the first entry seeds them into `x(0..arity)` (and, for
+    /// a resolved fun target, enters the label with them), after which the machine's own registers
+    /// are the live roots — so a consumed set is dead state and publishing it would only keep a
+    /// dead term alive. That gate is `false` at every park arm the runner has (each one runs after
+    /// a slice has ended, and a slice's end always consumes them), so a park publishes nothing
+    /// through this family today; it exists so a future park that opens **during** an entry cannot
+    /// leave a live term of one of these fields outside the collector's reach. When in doubt the
+    /// direction is to publish: an over-published root is a leak, a missed one is a wrong result.
+    ///
+    /// A [`LocalFunTarget::module`] and every count in this family are metadata, never terms.
+    pub(super) fn append_parked_host_terms(&self, out: &mut Vec<Eterm>) {
+        if self.args_consumed {
+            return;
+        }
+        out.extend_from_slice(&self.args);
+        if let ProcessEntry::Fun { fun, target } = &self.entry {
+            out.push(*fun);
+            if let Some(target) = target {
+                out.extend_from_slice(&target.args);
+            }
+        }
+    }
+    /// The **resume half** of [`ProcessEngine::append_parked_host_terms`]: writes the words a
+    /// collection relocated back into the fields they were published from, in the same order.
+    ///
+    /// `extra` is the process's whole [`Registers::extra_roots`](beam_process::Registers::extra_roots)
+    /// set as the resume found it: slot `0` is the machine's pending-exception reason **when one is
+    /// armed** (the context's [`resync_parked_roots`](crate::context::RuntimeContext::resync_parked_roots)
+    /// re-seats it into the machine and clears the whole set), and this engine's families follow it.
+    ///
+    /// This half is what makes the publication sound rather than a use-after-free: a parked engine's
+    /// field words are *not* relocated in place by the collector (only the published copies in the
+    /// process's registers are), so a resume that skipped this would leave the field naming the
+    /// evacuated from-space. The gate is the publication's own
+    /// ([`ProcessEngine::args_consumed`]), so a resume adopts exactly the words a park published.
+    ///
+    /// The walk is defensive about length: a short slice leaves the uncovered fields exactly as
+    /// they were (the pre-collection word, the only candidate left) rather than truncating a
+    /// container, exactly as `beam_process`'s own `scatter_roots` clamps.
+    pub(super) fn adopt_relocated_parked_roots(&mut self, extra: &[Eterm]) {
+        if self.args_consumed {
+            return;
+        }
+        let skip = usize::from(self.machine.pending_exception().is_some());
+        let mut words = extra.get(skip..).unwrap_or(&[]);
+        let count = words.len().min(self.args.len());
+        self.args[..count].copy_from_slice(&words[..count]);
+        words = &words[count..];
+        if let ProcessEntry::Fun { fun, target } = &mut self.entry {
+            if let Some((word, rest)) = words.split_first() {
+                *fun = *word;
+                words = rest;
+            }
+            if let Some(target) = target {
+                let count = words.len().min(target.args.len());
+                target.args[..count].copy_from_slice(&words[..count]);
+            }
+        }
+    }
+}
+impl RunnerState {
     /// Appends every **stable** term a live engine still names to `out`, in **two** sub-families:
     /// the arguments (and the fun term) of a [`ProcessEngine::arena_args`] engine whose first run
     /// has **not** consumed them, and the root set of a machine parked in an **un-published**
@@ -555,14 +632,13 @@ impl RunnerState {
     ///
     /// # The parked machine's root set — the live family
     ///
-    /// A process parked in a **relocation-exempt** window (every `receive` park, and a `Yield` park
-    /// whose slice ended with a live FR prefix) publishes **nothing** into its process
+    /// A process parked in a **relocation-exempt** window (a park whose slice ended with a live FR
+    /// prefix, at any arm — the only exemption there is) publishes **nothing** into its process
     /// [`Registers`](beam_process::Registers): nothing can relocate its heap for the window, so the
-    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`). A
-    /// `receive` park therefore contributes nothing through the process's `registers()` — they are
-    /// empty for the window — and the parked machine's live terms are named by nothing but
+    /// machine stays the authoritative root set (`ProcessEngine::parked_published` is `false`) and
+    /// the parked machine's live terms are named by nothing but
     /// `machine.x`/`machine.stack`/`machine.fr` — exactly the `x(0)` a `receive` is about to match —
-    /// so a resource a parked child holds in a register is reachable **only** through this family.
+    /// so a resource such a child holds in a register is reachable **only** through this family.
     ///
     /// A machine parked in a **publishing** window is the opposite case: its roots were copied into
     /// the process's `Registers`, which a collection may then relocate, leaving the machine's own

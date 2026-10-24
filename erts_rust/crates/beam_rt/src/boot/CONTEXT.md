@@ -322,8 +322,10 @@ The boot is **not** sensitive to the byte length or the canonical form of the `-
 `$P/bootstrap/../bootstrap/bin/start` all carry the real script to completion (exit 0).
 **What guarantees it is the runner's parked-root publication.** A suspended process's machine lives
 in `RunnerState.engines`, and a machine's registers are only a *copy* of the process's root set; the
-runner therefore publishes the parked machine's whole live root set into `Process::regs` — and its
-live pending-exception reason as an extra root — at **both** park arms and re-syncs the machine from
+runner therefore publishes the parked machine's whole live root set into `Process::regs` — and the
+terms it holds outside that root set (the live pending-exception reason and the engine's host-held
+families) as extra roots — at **every** park arm whose slice ended with a dead float-register prefix
+and re-syncs the machine from
 the process's authoritative root set on resume (`../runner/run.rs::publish_parked_roots` /
 `resume_from_process_roots`). Without that pair a
 collection driven while the process was parked — `Process::deliver`'s exit cascade is **not** gated

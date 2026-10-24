@@ -454,7 +454,9 @@ impl Geometry {
         matches!(self.word_region(process, word, traced), Some(WordRegion::Scanned))
     }
 
-    /// [`forwards_scanned_word`] against the hoisted geometry.
+    /// Whether `word` forwards at least one word a relocation would have to follow, classified
+    /// against the hoisted geometry: a cons cell's two halves, or the canonical child slots of a
+    /// boxed object, each value tested by [`Geometry::word_is_scanned`].
     #[inline]
     pub(crate) fn forwards_scanned_word(
         &self,
@@ -756,27 +758,7 @@ pub(crate) fn word_region_exactly(process: &Process, word: Eterm) -> Option<Word
     }
 }
 
-/// Whether the container `term` names forwards at least one word a relocation would have to
-/// follow — a cons cell's two halves, or the canonical child slots of a boxed object.
-///
-/// [`beam_term::layout::for_each_child_slot`] is the enumeration both `beam_message`'s copier and
-/// the GC reachability walk drive, so the valve cannot disagree with the collector about which
-/// words an object forwards — notably `SUB_BITS_SUBTAG`, whose `orig` word *is* forwarded. The
-/// values of those words are then classified by [`word_is_scanned`]: a leaf forwards nothing, a
-/// shape whose cells are all immediates forwards nothing, and each one is exactly as safe in a
-/// foreign region as an immediate is.
-#[cfg(test)]
-#[inline]
-pub(crate) fn forwards_scanned_word(
-    process: &Process,
-    bounds: &ScannedBounds,
-    term: Eterm,
-    traced: bool,
-) -> bool {
-    Geometry::from_bounds(process, *bounds).forwards_scanned_word(process, term, traced)
-}
-
-/// [`forwards_scanned_word`] against an arbitrary child-word predicate — the enumeration without
+/// The forwarding enumeration against an arbitrary child-word predicate — the enumeration without
 /// the classifier, so a caller that needs a *different* scanned test (the `valve_bounds` suite's
 /// aggregate-free oracle) cannot drift from the shapes the valve walks.
 ///

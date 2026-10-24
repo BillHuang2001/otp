@@ -44,9 +44,10 @@
 //! process's **complete** root set, and the park is the one point that has it: `park_machine`
 //! published the machine's whole root set (`RootSet::ALL_LIVE` — every live x register, the whole
 //! Erlang stack, the FR file at its pointer-bearing prefix) into the process's registers
-//! immediately before this call. An **exempt** park (the `Wait`/receive arm) publishes nothing, so
+//! immediately before this call. An **exempt** park (a live FR prefix) publishes nothing, so
 //! `parked_published` is `false` there and the prune does not run — its terms stay leaked rather
-//! than being freed behind a live machine's back.
+//! than being freed behind a live machine's back. A `Wait`/receive park publishes like any other;
+//! this prune does not run there because the `Yield` arm is its only caller.
 //!
 //! The prune must **never** be called from:
 //!

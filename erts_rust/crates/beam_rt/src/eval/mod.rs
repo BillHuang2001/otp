@@ -1912,10 +1912,10 @@ impl Evaluator<'_, '_> {
     /// there is no `erl_eval` port here, and a fabricated frame would be a wrong term.
     ///
     /// The `module` argument is an **atom source only** — resolved by lookup, nothing is
-    /// interned — so it carries a **clone** of the runtime's shared atom table (built
-    /// after the raise's frame names were already interned by the `-eval` expression), and
-    /// a name the table cannot resolve surfaces as the typed `error::unsupported(...)`,
-    /// never a substituted atom.
+    /// interned — so it carries a **fork** of the runtime's shared atom table (built after
+    /// the raise's frame names were already interned by the `-eval` expression, so it names
+    /// exactly what the shared table names at every index), and a name the table cannot
+    /// resolve surfaces as the typed `error::unsupported(...)`, never a substituted atom.
     fn cook_supplied_trace(
         &mut self,
         origin: &Option<BeamError>,
@@ -1924,7 +1924,7 @@ impl Evaluator<'_, '_> {
         let mut trace = match origin {
             Some(BeamError::Raise(raise)) => {
                 let module = beam_loader::Module {
-                    atom_table: self.ctx.runtime.code_server.atoms().clone(),
+                    atom_table: self.ctx.runtime.code_server.atoms().fork(),
                     ..beam_loader::Module::default()
                 };
                 let ctx: &mut dyn ExecutionContext = &mut *self.ctx;
