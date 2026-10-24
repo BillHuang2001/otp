@@ -102,7 +102,6 @@ use beam_message::{Fragments, HeapFragment, Message, OffHeapTable};
 use beam_term::prelude::{
     atom_val, is_atom, is_boxed_term, is_immediate, is_list, is_literal, make_atom, Atom, Eterm,
 };
-use beam_term::size_object;
 
 use crate::error;
 use crate::exit_observer::{ProcessExit, ProcessExitObserver};
@@ -280,11 +279,20 @@ where
             }
             // The heap cannot take the payload without moving under unpublished live terms (or
             // cannot take it at all): build it — reason included — into a fragment, copying its
-            // graph from the very table the reason lives in.
+            // graph from the very table the reason lives in. The refusal's own figure is this
+            // payload's destination price (the copy that refused *was* a copy of it), so the
+            // fragment is reserved straight from it.
             Err(BeamError::Alloc(failure))
                 if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                enqueue_fragment_payload(recipient, from, reason, Some(table), &mut build)
+                enqueue_fragment_payload(
+                    recipient,
+                    from,
+                    reason,
+                    Some(table),
+                    refused_payload_words(failure),
+                    &mut build,
+                )
             }
             Err(error) => Err(error),
         };
@@ -312,6 +320,56 @@ where
     }
 }
 
+/// Term-word slack added on top of a caller-held refusal price when reserving a signal fragment,
+/// so the common case costs one copy attempt. It is an **optimisation**, never a correctness
+/// requirement: an under-sized reservation is re-reserved from the copy's own refusal (see
+/// [`enqueue_fragment_payload`]).
+const FRAGMENT_SLACK_WORDS: usize = 8;
+
+/// The reservation a signal fragment starts from when the caller holds **no** price for it — the
+/// apply-time route, where the payload build failed on a single bumped allocation of the receiver's
+/// own heap and therefore priced that allocation, not the payload.
+///
+/// It covers an immediate-reason envelope (`{'EXIT', From, Reason}` is 4 words; a `{'DOWN', …}` 6
+/// plus a 4-word boxed reference), so the common apply-time fragment is filled on the first attempt;
+/// anything larger is re-reserved exactly by the copy.
+const SIGNAL_FRAGMENT_FLOOR_WORDS: usize = 64;
+
+/// The words a signal **envelope** adds to the `reason` sub-graph it wraps: `{'EXIT', From, Reason}`
+/// is a header plus three elements ([`build_exit_message`](crate::signal::build_exit_message)).
+const EXIT_ENVELOPE_WORDS: usize = 4;
+
+/// The same for `{'DOWN', Ref, Kind, Target, Reason}` — a header plus five elements plus the
+/// 4-word boxed [`MonitorRef`] ([`MonitorRef::to_eterm`]) plus, for a named monitor, a `{Name, Node}`
+/// pair (4 words) in place of the target.
+const DOWN_ENVELOPE_WORDS: usize = 16;
+
+/// The word count a message-heap refusal reports, when its byte figure is a whole (nonzero) number
+/// of term words — `None` for any other figure.
+///
+/// The `AllocKind::Message` figure is the copier's **exact destination price** in bytes: the copy
+/// preflights the whole graph in one walk and refuses with that count
+/// (`beam_message::error::heap_exhausted`). The conversion is the same one `beam_message`'s private
+/// `refused_words` makes for its own fragmenting send path.
+fn refused_words(requested_bytes: usize) -> Option<usize> {
+    let word = core::mem::size_of::<Eterm>();
+    let words = requested_bytes / word;
+    (words > 0 && requested_bytes % word == 0).then_some(words)
+}
+
+/// The destination price, in words, of the payload a refusal refused — or `None` when the refusal
+/// carries no such price.
+///
+/// Only an [`AllocKind::Message`] refusal is the copier's preflight figure. A
+/// [`AllocKind::Heap`] one is some *other* allocation (an off-heap slot table growing, say) whose
+/// byte count says nothing about the payload, and is never used as a reservation.
+fn refused_payload_words(failure: AllocFailure) -> Option<usize> {
+    match failure.kind {
+        AllocKind::Message => refused_words(failure.requested),
+        _ => None,
+    }
+}
+
 /// Builds the signal payload on a scratch arena and copies the **whole** graph into a fresh
 /// [`HeapFragment`] that the enqueued [`Message`] owns — the local-receiver analogue of the send
 /// path's `send_fragmented` ([`beam_message`]), and the model the C always uses for signals
@@ -327,11 +385,30 @@ where
 /// receiver's heap at enqueue time) and the self-signal case; `Some` is a *signaller's* table,
 /// which the enqueue-time route passes because there the reason still lives in the signalling
 /// process's heap.
+///
+/// # Sizing
+///
+/// The reservation starts from `held_words` — a **lower bound** on the payload's destination price
+/// that the caller already paid for: the figure the copier reported when it refused to put this
+/// very graph on the receiver's heap ([`refused_payload_words`]). No sizing walk is run for it, so
+/// the route costs one graph traversal (the copy's own preflight) instead of two. The three
+/// enqueue-time call sites hold either the payload's exact price (the reason copy that produced the
+/// refusal *is* a copy of this payload) or the reason sub-graph's (the builders wrap it, hence
+/// [`EXIT_ENVELOPE_WORDS`]/[`DOWN_ENVELOPE_WORDS`]); only the apply-time route holds none and
+/// starts at [`SIGNAL_FRAGMENT_FLOOR_WORDS`].
+///
+/// A reservation can still be too small — a lower bound, a floor, and a copy price that exceeds
+/// `beam_term::size_object`'s source occupancy for a refc binary the copier has to flatten — so the
+/// copy's own refusal re-reserves the fragment **monotonically** to its exact figure and the copy
+/// is retried. A refused copy writes nothing (the preflight refuses before the first word), so the
+/// abandoned region is only garbage; the loop therefore terminates at the true price instead of
+/// failing a delivery.
 fn enqueue_fragment_payload<F>(
     recipient: &mut Process,
     from: Eterm,
     reason: Eterm,
     src_off_heap: Option<&OffHeapTable>,
+    held_words: Option<usize>,
     build: &mut F,
 ) -> Result<()>
 where
@@ -341,11 +418,27 @@ where
     // payload around it on a scratch arena, then copy the whole graph in one go.
     let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
     let payload = build(&mut scratch, reason)?;
-    let mut fragment = HeapFragment::new(size_object(payload) + 8)?;
+    let mut capacity = held_words.map_or(SIGNAL_FRAGMENT_FLOOR_WORDS, |words| {
+        words.saturating_add(FRAGMENT_SLACK_WORDS)
+    });
     // `copy_struct` walks the graph by pointer, so the heap-resident `reason` subtree is copied
     // in too; the source process's persistent off-heap table resolves its refc binaries/MSO.
     let src = src_off_heap.unwrap_or_else(|| recipient.off_heap());
-    let root = fragment.copy_root(payload, src)?;
+    let (fragment, root) = loop {
+        let mut candidate = HeapFragment::new(capacity)?;
+        match candidate.copy_root(payload, src) {
+            Ok(root) => break (candidate, root),
+            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
+                match refused_words(failure.requested) {
+                    // The copy priced the payload exactly: reserve that and retry (strictly larger,
+                    // so the loop terminates at the true price).
+                    Some(words) if words > capacity => capacity = words,
+                    _ => return Err(BeamError::Alloc(failure)),
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    };
     let mut fragments = Fragments::new();
     fragments.push(fragment);
     recipient
@@ -366,7 +459,10 @@ fn enqueue_fragment_signal<F>(
 where
     F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
 {
-    enqueue_fragment_payload(recipient, from, reason, None, build)
+    // No held price here: the build refused on one bumped allocation of the receiver's own heap
+    // rather than on a copy of the payload, so the reservation starts at the floor and the copy's
+    // own refusal re-reserves it exactly.
+    enqueue_fragment_payload(recipient, from, reason, None, None, build)
 }
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
@@ -3092,7 +3188,13 @@ impl ProcessTable {
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
                 if traps {
-                    self.deliver_exit_fragment(to, from, reason, src)
+                    self.deliver_exit_fragment(
+                        to,
+                        from,
+                        reason,
+                        src,
+                        refused_payload_words(failure),
+                    )
                 } else {
                     Err(BeamError::Alloc(failure))
                 }
@@ -3141,7 +3243,16 @@ impl ProcessTable {
                 if refuses_collect
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                self.deliver_down_fragment(to, reference, target, kind, tag, reason, src)
+                self.deliver_down_fragment(
+                    to,
+                    reference,
+                    target,
+                    kind,
+                    tag,
+                    reason,
+                    src,
+                    refused_payload_words(failure),
+                )
             }
             Err(error) => Err(error),
         }
@@ -3163,13 +3274,17 @@ impl ProcessTable {
         from: ProcessId,
         reason: Eterm,
         src: Option<&OffHeapTable>,
+        held_words: Option<usize>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let from_term = from.to_eterm();
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        enqueue_fragment_payload(recipient, from_term, reason, src, &mut |heap, reason| {
+        // The held figure prices the `reason` sub-graph (the copy that refused was a copy of the
+        // reason, not of the envelope), so `{'EXIT', From, Reason}`'s own words are added on top.
+        let held = held_words.map(|words| words.saturating_add(EXIT_ENVELOPE_WORDS));
+        enqueue_fragment_payload(recipient, from_term, reason, src, held, &mut |heap, reason| {
             build_exit_message(heap, &atoms, from, reason)
         })?;
         let woke = recipient.wake();
@@ -3201,6 +3316,7 @@ impl ProcessTable {
         tag: Option<Eterm>,
         reason: Eterm,
         src: Option<&OffHeapTable>,
+        held_words: Option<usize>,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         // Read before the recipient lookup borrows the table, exactly as `deliver_down_message`
@@ -3214,7 +3330,10 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        enqueue_fragment_payload(recipient, from_term, reason, src, &mut |heap, reason| {
+        // The held figure prices the `reason` sub-graph only, so the `{'DOWN', …}` envelope — the
+        // tuple, the boxed reference and a named target — is added on top.
+        let held = held_words.map(|words| words.saturating_add(DOWN_ENVELOPE_WORDS));
+        enqueue_fragment_payload(recipient, from_term, reason, src, held, &mut |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             let target_term = match named {
                 Some(nt) => heap.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
@@ -4425,6 +4544,7 @@ mod tests {
     //! ownership/link/monitor surface by `crate::port` and `tests/ports.rs`.
 
     use beam_term::compare;
+    use beam_term::size_object;
     use beam_term::prelude::{
         is_tuple, make_atom, make_small, tuple_element, tuple_size, AtomTable,
     };
@@ -5956,6 +6076,119 @@ mod tests {
         assert!(
             !r.is_relocation_exempt(),
             "the temporary exemption the gate implies is restored afterwards"
+        );
+    }
+
+    // --- the fragment-reservation sizing -------------------------------------
+
+    /// The one and only place a refusal's byte figure becomes a word price: only a
+    /// `Message`-kind refusal is the copier's preflight count, and only a whole (nonzero) number
+    /// of term words is a usable figure.
+    #[test]
+    fn a_refusal_price_is_used_only_when_the_copier_reported_a_whole_word_count() {
+        let word = core::mem::size_of::<Eterm>();
+        assert_eq!(
+            refused_payload_words(AllocFailure::new(AllocKind::Message, 44 * word)),
+            Some(44),
+            "the copier's own destination price converts exactly"
+        );
+        assert_eq!(
+            refused_payload_words(AllocFailure::new(AllocKind::Message, 44 * word + 1)),
+            None,
+            "a figure that is not a whole number of words is not a price"
+        );
+        assert_eq!(
+            refused_payload_words(AllocFailure::new(AllocKind::Message, 0)),
+            None,
+            "a zero figure is not a price"
+        );
+        assert_eq!(
+            refused_payload_words(AllocFailure::new(AllocKind::Heap, 44 * word)),
+            None,
+            "a `Heap` refusal is some other allocation, not the payload's destination price"
+        );
+    }
+
+    /// A fragment reserved from a **held** refusal price is sized from that figure — not from a
+    /// fresh ``size_object`` walk of the payload. The held figure here is deliberately far above the
+    /// payload's 3-word copy price, so the reservation (`held + FRAGMENT_SLACK_WORDS`) cannot be
+    /// mistaken for any walk-derived number.
+    #[test]
+    fn a_held_refusal_price_reserves_the_fragment_without_a_sizing_walk() {
+        let mut table = table();
+        let receiver = table.spawn_default().expect("a fresh process");
+        let off_heap = OffHeapTable::new();
+        let from = ProcessId::new(1, 0).to_eterm();
+        let process = table.get_mut(receiver).expect("live");
+        enqueue_fragment_payload(
+            process,
+            from,
+            make_small(7),
+            Some(&off_heap),
+            Some(20),
+            &mut |heap, reason| heap.tuple(&[make_small(1), reason]),
+        )
+        .expect("the fragment takes the three-word payload");
+        let message = process.receive(|_| true).expect("the fragment-resident message");
+        let fragment = message
+            .fragments()
+            .expect("the payload lives in a fragment")
+            .iter()
+            .next()
+            .expect("one fragment");
+        assert_eq!(
+            fragment.capacity(),
+            20 + FRAGMENT_SLACK_WORDS,
+            "the reservation is the caller's held price plus the slack (`size_object` of the \
+             payload is 3, so a sizing walk would have reserved 11)"
+        );
+        assert_eq!(fragment.used(), 3, "one copy filled exactly the payload's words");
+    }
+
+    /// A reservation that is **too small** — a lower bound, or the floor the apply-time route starts
+    /// from — never fails the delivery: the copy's own refusal carries the payload's exact
+    /// destination price, and the fragment is re-reserved monotonically to it.
+    #[test]
+    fn an_under_priced_reservation_re_reserves_monotonically_to_a_complete_delivery() {
+        let mut table = table();
+        let receiver = table.spawn_default().expect("a fresh process");
+        let off_heap = OffHeapTable::new();
+        let from = ProcessId::new(1, 0).to_eterm();
+        let mut src = Heap::new(64).expect("the source arena allocates");
+        let elems: Vec<Eterm> = (0..40).map(make_small).collect();
+        let reason = src.tuple(&elems).expect("the 41-word reason fits the arena");
+        let process = table.get_mut(receiver).expect("live");
+        enqueue_fragment_payload(
+            process,
+            from,
+            reason,
+            Some(&off_heap),
+            Some(1),
+            &mut |heap, reason| heap.tuple(&[make_small(1), reason]),
+        )
+        .expect("an under-priced reservation still delivers");
+        let message = process.receive(|_| true).expect("the fragment-resident message");
+        let fragment = message
+            .fragments()
+            .expect("the payload lives in a fragment")
+            .iter()
+            .next()
+            .expect("one fragment");
+        assert_eq!(
+            fragment.capacity(),
+            44,
+            "the re-reserve converged on the copier's exact price (envelope 3 + the 41-word \
+             reason), not on the 9-word initial reservation nor a walk's 52"
+        );
+        assert_eq!(fragment.used(), 44, "the retried copy filled it exactly");
+        // SAFETY: `payload` is the live two-element tuple the fragment holds.
+        let payload = message.payload();
+        let (size, head, delivered) =
+            unsafe { (tuple_size(payload), tuple_element(payload, 0), tuple_element(payload, 1)) };
+        assert_eq!((size, head), (2, make_small(1)));
+        assert!(
+            compare::eq(delivered, reason, &AtomTable::new()),
+            "the whole graph arrived (compared structurally: it now lives in the fragment)"
         );
     }
 }
