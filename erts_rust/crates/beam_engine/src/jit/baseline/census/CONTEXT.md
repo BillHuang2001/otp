@@ -39,8 +39,9 @@ This node owns the census *record*; the instruments' code lives in the files the
   emitted-code-size table.
 - `../emit/test/refusal_census.rs` (`#[cfg(test)] mod refusal_census` from `../emit/test.rs`) —
   `the_refusal_attribution_census_is_printed`, attributing `test`/`select_val`/`select_tuple_arity`
-  refusals to exact predicates/operand shapes and listing the `bif`/`gc_bif`/`bif0` deopt pools by BIF
-  name. The pools are **self-maintaining**: `already_inlined(module, instr)` consults the emitters'
+  refusals to exact predicates/operand shapes, listing the `bif`/`gc_bif`/`bif0` deopt pools by BIF
+  name, and classifying every `Bs*` instance as inlined / refused-by-one-closed-reason / no-arm
+  (Table 4b). The pools are **self-maintaining**: `already_inlined(module, instr)` consults the emitters'
   real shape predicates (`comparison_shape`/`fast_arith`/`bif_shape`) rather than a name allowlist,
   so a newly lowered name leaves its pool automatically (the `bif0` pool has no arm to consult —
   nothing lowers `Bif0`).
@@ -52,8 +53,8 @@ This node owns the census *record*; the instruments' code lives in the files the
   `../../../MEASURED.md` §Execution coverage.
 
 ## The evidence record (measured; never a gate)
-Recorded on the tree at `b8d55a1587` with the oracle `erl` at OTP **29.1.1 / erts-17.1**
-(`/nix/store/…-erlang-29.1.1`), 1-min load 0.5–1.9 across the runs.
+Recorded on the tree at `688b1a3ff2` with the oracle `erl` at OTP **29.1.1 / erts-17.1**
+(`/nix/store/…-erlang-29.1.1`), 1-min load sampled at 0.5–0.7 around the runs.
 These are **counts**, not timings: host load does not affect their validity (only their wall time),
 which is why a census may run beside a measurement pass.
 The corpus is discovered generically — **38** committed `tests/fixtures/*.beam` plus **1321**
@@ -107,8 +108,8 @@ out of **119** variants visited at all; every non-`FuncInfo` deopt together is *
 `FuncInfo` deopts exactly once per compiled function (**103 079 = `functions_compiled`**, ratio
 1.0000) because it is the failed-head-clause `function_clause` raise and is deliberately never
 inlined — the *never-executed* shape, so its 86 % share of the count is 0 % of the run time.
-The Y-window split on the same run: `blocks=185 141 publish=132 908 elided=52 233` (71.8 % of
-Y-touching blocks publish) `invalidations=544 282`.
+The Y-window split on the same run: `blocks=185 454 publish=133 230 elided=52 224` (71.8 % of
+Y-touching blocks publish) `invalidations=544 956`.
 
 ### Table 2 — the deopting-variant set over the **committed fixtures** (corpus-independent)
 `ERTS_ORACLE=/nonexistent/erl erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_static_deopt_census_over_the_corpus_is_printed -- --nocapture`
@@ -130,17 +131,17 @@ output — the always-deopting `FuncInfo` (one per function), the un-armed `Bif0
 `NifStart`/`OnLoad` deopt 1.0 as well but never occur in the fixtures, so they exist only in the OTP
 half of Table 1.
 The fixture corpus also gives the deterministic half of the register-cache totals:
-`modules=38 functions=422 blocks=1192 ir_instrs=4570 emitted_bytes=295 487`.
+`modules=38 functions=422 blocks=1192 ir_instrs=4570 emitted_bytes=330 645`.
 
 ### Table 3 — register-cache traffic
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_register_cache_traffic_census_over_the_corpus_is_printed -- --nocapture`
 Grand total over 1359 modules / 103 079 functions / 597 565 blocks / 3 586 410 Σ ranges:
-spill **stores** `dirty` **1 359 679**, `written` 4 334 675, `full-cache` 5 188 029 — the dirty-set
-rule removes **2 974 996** already-clean stores (**−68.6 %** of the written-set model), exactly
+spill **stores** `dirty` **1 389 278**, `written` 4 404 588, `full-cache` 5 285 140 — the dirty-set
+rule removes **3 015 310** already-clean stores (**−68.5 %** of the written-set model), exactly
 7 B per removed store.
 Fill **register loads**: observable (block-local liveness ∪ the instruction's own inline write set)
-**1 529 728** vs full-cache 3 950 513.
-Emitted bytes **303 053 318**; spill calls 2 511 967 (Helper 1 806 360 / Exit 705 607), fill calls
+**1 551 064** vs full-cache 4 013 945.
+Emitted bytes **299 806 315**; spill calls 2 519 270 (Helper 1 806 394 / Exit 712 876), fill calls
 2 024 746 (Helper 1 427 181 / Prologue 597 565).
 The three store models come from **one** recorded run, so they are directly comparable.
 
@@ -166,35 +167,47 @@ shape that quietly went back to the helper.
 | `BsSkipBits2` | 347 | +152 | +206 | yes |
 | `BsStartMatch3` | 431 | +236 | +291 | yes |
 | `BsStartMatch4` | 431 | +236 | +291 | yes |
-| `BsGetInteger2` | 827 | +632 | +687 | yes |
-| `BsMatch (static cmds)` | 893 | +698 | +753 | yes |
+| `BsGetInteger2` | 726 | +531 | +586 | yes |
+| `BsMatch (static cmds)` | 799 | +604 | +659 | yes |
 | `CallLast` (unlinked exit) | 213 | +18 | n/a (block ends) | yes |
-Σ of the sixteen deltas, one occurrence each: **+2823 B** (this is the current reading of the
+Σ of the sixteen deltas, one occurrence each: **+2628 B** (this is the current reading of the
 instrument named above, not a hand-edited figure). Both figures are **whole-block** sizes, so
 both carry the shared prologue/exit/epilogue; the `2N − N` **marginal** is the confound-free
 per-occurrence figure and only exists where a second copy fits in the block.
 An artifact-wide deopt-only figure would multiply each delta by that shape's occurrence count, which
 this table deliberately does not do; the whole-artifact `code_len` over the 38 fixtures is
-**330 290 B** (largest `bsmatch.beam` 39 994 B / 90 blocks / 385 emitted instances, `bssmall.beam`
-38 064 B / 102 / 359).
-The eight `Bs*` rows are the reason the bitstring arms are budgeted as their own code-size class:
-`emit/compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES` (448) per inlined bitstring
-instruction and `BS_MATCH_COMMAND_BYTES` (320) per accepted `bs_match` command, so an unbounded
-`bs_match` list can never under-allocate the `CodeBuffer`.
+**329 748 B** (largest `bsmatch.beam` 40 204 B / 90 blocks / 385 emitted instances, `bssmall.beam`
+37 876 B / 102 / 359).
+The eight `Bs*` rows are the reason the bitstring arms are budgeted as their own code-size class
+(the ninth arm, `bs_create_bin`, has no row of its own here):
+`emit/compile.rs::function_capacity_estimate` adds `BS_PATH_BYTES` (448) per bitstring-path
+instruction, `BS_MATCH_COMMAND_BYTES` (320) per accepted `bs_match` command and
+`CREATE_BIN_PATH_BYTES` (16 384) per `bs_create_bin`, so neither an unbounded `bs_match` list nor a
+maximum-width construction arm can under-allocate the `CodeBuffer`.
 
 ### Table 4b — bitstring refusal attribution
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_refusal_attribution_census_is_printed -- --nocapture`
 The instrument is `emit/test/refusal_census.rs`; it walks the same corpus and classifies every `Bs*`
 instruction instance as inlined, refused by one closed reason, or having no arm at all.
 Current corpus reading (the run behind the rows above): **27 438** `Bs*` instructions —
-**15 346** inlined, **4 670** refused, **7 422** with no arm.
-The refuse rows: **3 247** `bs_match` allocating command, **1 077** `bs_skip_bits2` runtime
-size/unit/stride, **171** `bs_get_integer2` runtime size/unit/stride, **73** `bs_match` width rule,
-**61** `bs_get_integer2` signed/little/native field, **40** `bs_match` signed/little/native field,
+**15 380** inlined, **6 558** refused, **5 500** with no arm.
+The refuse rows: **3 247** `bs_match` allocating command, **1 841** `bs_create_bin` `other`,
+**1 077** `bs_skip_bits2` runtime size/unit/stride, **171** `bs_get_integer2` runtime
+size/unit/stride, **73** `bs_match` width rule, **61** `bs_get_integer2` signed/little/native field,
+**47** `bs_create_bin` literal-area subject, **40** `bs_match` signed/little/native field,
 **1** `bs_match` >1 `Y` destination.
-The no-arm rows: `bs_get_tail` 3 694, `bs_create_bin` 1 922, `bs_get_binary2` 972, `bs_get_utf16` 487,
+The no-arm rows: `bs_get_tail` 3 694, `bs_get_binary2` 972, `bs_get_utf16` 487,
 `bs_get_utf8` 135, `bs_init_writable` 93, `bs_match_string` 69, `bs_skip_utf8` 18, `bs_get_float2` 15,
 `bs_get_utf32` 9, `bs_skip_utf16` 4, `bs_skip_utf32` 4.
+`bs_create_bin` is a **two-way** arm like the eight before it: of its **1 922** corpus instances
+**34** are inlined and **1 888** refused, split **1 841** `other` (the shape predicate's own
+declines — a plain/later-position or absent `private_append`, an append unit that does not divide 8,
+a `binary`/`float`/`utf*` segment, an `all` or runtime (`Dynamic`) size, a `little`/`signed`/`native`
+flag, a partial-byte or wider-than-a-word field, a `StrT` window the module cannot resolve, a `Y`
+accumulator or field value, a plan with no fields, a field list whose byte offsets do not sum to the
+plan's tail, the `MAX_FIELDS`/`MAX_TAIL_BYTES` caps) and **47** literal-area subject; the
+instrument's own `inlined | refused | opcode` table carries that accounting for every arm
+(`bs_get_integer2`'s 232 instances are all refused, `bs_skip_bits2`'s 3 of 1 080 inline).
 The reason vocabulary is a closed set of `const` strings (`BS_REASON_ALLOC`, `_LITERAL`, `_RUNTIME`,
 `_UNIT`, `_WIDTH`, `_NO_FAIL`, `_LABEL`, `_Y_DST`, `_FIELD`, `_OTHER`), so a new refusal must be named
 rather than folded into a catch-all, and the test pins the accounting
@@ -330,7 +343,7 @@ else follows the installed OTP tree and is recorded as method + figure, never as
   2 707 930` push/pop ops, `756 632 → 352 537` prologue loads). A single census run yields only the
   *current* absolute figure — re-measuring a pair means checking out both states, so a fresh absolute
   must never be substituted into a pair's row. The *ratios* are also corpus-dependent: the dirty-vs-written
-  store ratio reads **−68.6 %** on today's 1359-module corpus against the **−65.9 %** recorded on the
+  store ratio reads **−68.5 %** on today's 1359-module corpus against the **−65.9 %** recorded on the
   1353-module one, so neither the absolutes nor the percentage carries over.
 - **A `Bif` total differs between Table 1 and Table 6** (10 014 vs 8 633) because the static census
   counts a **visited** instruction per emitted block while the refusal census counts each IR
