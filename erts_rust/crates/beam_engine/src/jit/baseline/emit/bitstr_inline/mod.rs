@@ -23,8 +23,9 @@
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
-//! the construction shape calls one helper that **mutates nothing** and then writes the
-//! accumulator's payload bytes and its window end.
+//! the construction shape calls its route's append door — plus one `jit_write_bit_field` per
+//! field on the bit-granular route — every one of those helpers **mutating nothing**, and
+//! then writes the accumulator's payload bytes and its window end.
 //! A shape the module cannot prove safe is **refused at compile time** by its `*_shape`
 //! predicate — returning `Ok(false)` with **zero bytes emitted** — so `emit_block`'s
 //! existing `_ if bitstrings::claimed(instr) => emit_bitstr(...)` arm keeps handling it
@@ -234,19 +235,32 @@ pub(crate) const SHAPE_CREATE_BIN: usize = 8;
 
 #[cfg(test)]
 thread_local! {
-    /// How often each shape's native lowering was **emitted** (a compile-time count, so
-    /// it proves the inline arm ran even though the sequence calls no helper).
+    /// How often each shape's native lowering was **emitted** (a compile-time count, so it
+    /// proves the inline arm ran even where no run-time instrument could observe it).
     static INLINED: [std::cell::Cell<u64>; SHAPE_COUNT] =
         [const { std::cell::Cell::new(0) }; SHAPE_COUNT];
 }
 
 /// How many times `shape`'s native lowering has been emitted on this thread.
 ///
-/// A **compile-time** instrument: unlike [`super::super::bitstr::bitstr_calls`] it does
-/// not count run-time helper entries (an inlined shape calls no helper at all), it counts
-/// the emitter's decision — which is exactly what "the inline arm ran" means for a
-/// guard-only lowering. Pair it with a zero `deopts_by_variant` count for the same
-/// variant to prove the whole instruction stayed native.
+/// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
+/// entries. The two kinds of shape here need that count for different reasons.
+///
+/// For the **eight match-context shapes** the emission is the only observable there can
+/// be: such a shape calls no helper at all, so
+/// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
+/// the decision to emit.
+///
+/// For [`SHAPE_CREATE_BIN`] the sequence **does** call helpers — one append door, plus one
+/// `jit_write_bit_field` per field on the bit-granular route — so a run-time count would
+/// observe *a* helper but not the arm: which door it is, and how many calls follow it,
+/// depends on the route the plan's widths pick. The emission is therefore what proves the
+/// arm ran for **either** route, and it is also the proof that a plan
+/// `CreateBinShape::of` **refused** emitted zero bytes (the refusal happens before the
+/// first byte, so the counter cannot move).
+///
+/// Either way, pair it with a zero [`super::super::bitstr_inline_tests::static_deopts`]
+/// count for the same variant to prove the whole instruction stayed native.
 #[cfg(test)]
 pub(crate) fn inlined(shape: usize) -> u64 {
     INLINED.with(|counts| counts[shape].get())

@@ -174,10 +174,10 @@
 //! `emit_block`'s `_ if bitstrings::claimed(…)` arm keeps handling it:
 //!
 //! * anything [`seam::append_plan`] answers `None` for — a plain or later-position
-//!   append, an append unit that does not divide 8, a `binary`/`float`/`utf*` segment, an
-//!   `all` or runtime (`Dynamic`) size, a `little`/`signed`/`native` flag, a field of zero
-//!   width or wider than a machine word, a `StrT` window the module cannot resolve, a plan
-//!   with no fields;
+//!   append, an append `unit` outside `{1, 2, 4, 8}` (the units the run-time doors can
+//!   position-gate), a `binary`/`float`/`utf*` segment, an `all` or runtime (`Dynamic`)
+//!   size, a `little`/`signed`/`native` flag, a field of zero width or wider than a
+//!   machine word, a `StrT` window the module cannot resolve, a plan with no fields;
 //! * an accumulator or a field **value** operand that is neither an in-bound x-register nor
 //!   an addressable `Y` slot ([`super::Loc::of`] — a literal-area operand, an out-of-bound
 //!   register index, a `Y` index the emitted `lea`'s `disp32` could not address); both
@@ -195,6 +195,17 @@
 //!   unbounded instruction (the family's own loop is the right home for a very wide one);
 //! * a field list whose bit offsets do not sum to the plan's `tail_bits` — the
 //!   `end` commit would then publish a window over bits that were never written.
+//!
+//! Only the **compile-time** half of the append-unit rule is settled above. The other half
+//! is the run-time door's, on whichever route the plan's widths picked: the door applies C's
+//! append-**position** gate (`seam::append_unit_allows`) to the accumulator's window end —
+//! `unit == 8` needs `end_bits % 8 == 0`, any other `unit > 1` needs `end_bits % unit == 0`,
+//! and `unit <= 1` is ungated — so a window end the plan's own unit does not accept is that
+//! door's `0` refusal, i.e. the same one interpreter step every compile-time refusal above
+//! takes. The general door [`jit_open_append_bin_any`] / [`jit_open_append_bin_any_y`] is
+//! handed the plan's `unit` for exactly this test; the byte-aligned pair
+//! [`jit_open_append_bin`] / [`jit_open_append_bin_y`] applies the `unit == 8` form, because a
+//! byte cursor needs a byte-aligned window end.
 //!
 //! The `fail` arm is deliberately **not** part of this shape: `bs_create_bin`'s
 //! `NO_FAIL`-vs-label discrimination stays in the family, and every refusal above (and
