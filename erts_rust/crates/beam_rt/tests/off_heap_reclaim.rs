@@ -29,9 +29,12 @@
 //! returned term may still name a payload after the run that built it. Both the `binary_alloc`
 //! live-bytes figure — what `erlang:memory(binary)` reports, read **live** at each call
 //! (`src/context/memory_hook.rs`) — and RSS grow with the loop count where the oracle's stay
-//! flat. The prune closes that loop: at every slice-boundary park whose window **published** the
-//! machine's root set it walks the process's own roots
+//! flat. The prune closes that loop for the payloads **one** park built: at every slice-boundary
+//! park whose window **published** the machine's root set it walks the process's own roots
 //! (`beam_gc::for_each_reachable_binary_payload`) and releases the handles nothing reaches.
+//! Across **many** parks the retention is not idempotent — the residue keeps one payload per park,
+//! monotonically, up to a payload-count cap — which is the open defect the ladder test pins (see
+//! *Known issue* below).
 //!
 //! Only **compiled bitstring code** feeds the reservoir
 //! (`Machine::alloc_refc_binary`/`alloc_refc_binary_with_capacity`, whose callers are
@@ -48,32 +51,34 @@
 //! therefore drives `beam_rt run <file.beam> <m>:<f>/<a> <args…>`, whose result the CLI prints
 //! via `~w~n`.
 //!
-//! # The bound, and why the payload is 4 KiB (measured, not chosen for convenience)
+//! # The bound, and why the payload is 4 KiB (measured)
 //!
-//! The prune runs at a slice boundary, so the observable is a **sawtooth**, not a constant: the
-//! figure rises while the slice runs and falls back at the park. Its two ends are what the
-//! assertions pin:
+//! The prune runs at a slice boundary, so the observable is a **sawtooth**, not a constant, and a
+//! ladder rung's read follows a completed churn block — i.e. a park — so a rung reports the
+//! **trough**, the post-prune residue, never the in-window peak (the payloads built between two
+//! parks, which nothing here samples).
 //!
-//! * the **trough** is the bin-vheap floor, `HeapPolicy::min_bin_vheap_words` = 46 422 words
-//!   (≈371 KB) of *trigger*, i.e. at most a handful of payloads survive a prune;
-//! * the **peak** is one pre-emption window — the payloads built between two parks. On the
-//!   default (native baseline) tier a tight native loop crosses neither the per-instruction
-//!   reduction hook nor a heap-admission door, so its *whole* run can be one window; the
-//!   fixture's iteration therefore touches the heap and calls a BIF (`lists:seq/2` +
-//!   `length/1`), which is what a real Erlang loop does and what gives the runner a
-//!   **measured, deterministic** ~430-iteration window here.
+//! The trough is what the bound is stated against, and it is measured:
 //!
-//! With a 4 KiB payload one window is ≈1.4 MiB — measured, and stable across runs — so
-//! [`BOUND_BYTES`] (8 MiB) sits ~6× above the fixed peak and ~5× below what the *same*
-//! workload reports **without** the reclamation. That pre-fix pair was measured by disabling
-//! the one call site (`RuntimeRunner::reclaim_off_heap_binaries`) on this base commit:
-//! `discard(1000)` = 4 144 000 bytes and `discard(10000)` = 41 440 000 bytes — exactly
-//! `N × (4096 + 48)`, one 4 KiB payload plus its 48-byte handle per iteration, linear in N —
-//! the ladder rises monotonically 4 144 000 → 41 440 000 (spread 37 296 000), the churn around
-//! the retained payload never falls below 24 929 584 bytes, and peak RSS follows it (+37 MiB
-//! from N = 1 000 to N = 10 000, against a flat 120.6 MiB with the reclamation on). All three
-//! measurement tests below fail on that build and pass on this one; that pair is the
-//! discriminator.
+//! * with the churn run as **one** block and the figure read **once**, the residue is exactly one
+//!   payload — `discard(N, 4096)` = 4 144 bytes at N = 1 000, 128 000, 500 000 and 1 000 000 — so
+//!   the build-and-discard loop is genuinely closed for a single park;
+//! * with the same iterations split into blocks, the residue keeps **one payload per park** and
+//!   never falls back: rung `k` of the ladder is `k` payloads. That growth is the open defect
+//!   (*Known issue*), not a property of the loop.
+//!
+//! The payload is 4 KiB because it is far past `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`
+//! (64 bytes, so every iteration really builds an off-heap refc payload) while staying small
+//! enough to keep 1 000 iterations inside one run, and because a retained payload shows up in the
+//! figure as `Bytes + 48` — a payload-shaped block, ~85× the bare 48-byte handle a leak would
+//! otherwise have to be read as.
+//!
+//! The discriminator for the reclamation call site
+//! (`RuntimeRunner::reclaim_off_heap_binaries`) is the pair measured on the same workload with it
+//! disabled and enabled: disabled, `discard(1000)` = 4 144 000 and `discard(10000)` = 41 440 000
+//! bytes — exactly `N × (4096 + 48)`, one payload plus its handle per iteration, linear in N,
+//! with peak RSS following it; enabled, `discard(N)` is 4 144 bytes at every N above. That pair
+//! is what makes a non-flat ladder attributable to the reclamation and not to the loop.
 //!
 //! # What each test pins
 //!
@@ -83,9 +88,10 @@
 //! 2. [`memory_binary_does_not_grow_monotonically_over_the_loop`] — **one** process, 10 000
 //!    iterations, `erlang:memory(binary)` recorded every 1 000 (a 10-element ladder): the spread
 //!    (`max − min`) and the drift (`last − first`) must be within [`BOUND_BYTES`], *and* the
-//!    ladder must show the sawtooth — a peak of at least 100 payloads (the loop really
-//!    accumulates between parks) falling back to under 64 payloads (the prune really releases
-//!    them). That second half is what keeps the flatness assertion from being vacuous.
+//!    ladder must not be vacuous — its sampled maximum must reach [`MIN_PEAK_PAYLOADS`] payloads
+//!    and its minimum must stay under [`MAX_TROUGH_PAYLOADS`]. This test is **RED** on the
+//!    current product: the ladder is monotone, so the sampled maximum is ten payloads where the
+//!    guard asks for a hundred (*Known issue*).
 //! 3. [`a_retained_off_heap_binary_survives_every_prune_byte_exactly`] — the **safety** half:
 //!    a 64 KiB off-heap binary kept live across thousands of prunes must come back
 //!    **byte-exact** (MD5 unchanged, `=:=` a fresh rebuild, both ends of the payload read back,
@@ -95,6 +101,65 @@
 //! 4. [`a_missing_toolchain_is_a_loud_skip_never_a_silent_pass`] — the loud-skip guard: an
 //!    empty toolchain path resolves no compiler, and the suite's gate declines (printing the
 //!    shared `SKIPPED` / `NOT a pass` banner) instead of building a fixture or asserting.
+//!
+//! # Known issue — the residue retains one payload per park, so the ladder is monotone
+//!
+//! Measured on this tree with the system `erlc`-compiled fixture on the `run` route,
+//! `ladder(N, 1_000, Bytes)`: rung `k` is exactly `k` payloads of `Bytes + 48`, with **no
+//! sawtooth at all**, up to a cap of **999 payloads** followed by a reset to `0` on the next rung
+//! and a period of exactly 1 000 rungs.
+//!
+//! | `Bytes` | rung-to-rung | sampled maximum | at rung |
+//! |---|---|---|---|
+//! | 1 024 | `+1 072` | 1 070 928 = 999 × 1 072 | 998 |
+//! | 2 048 | `+2 096` | 2 093 904 = 999 × 2 096 | 998 |
+//! | 4 096 | `+4 144` | 4 139 856 = 999 × 4 144 | 998 |
+//!
+//! N = 10 000 (this suite's configuration) therefore reads `[4144, 8288, …, 41440]`; N = 200 000
+//! is 200 rungs with every difference `+4 144`; N = 2 000 000 is 2 000 rungs with 1 997 of 1 999
+//! differences `+4 144` and the two resets. The live oracle on the same fixture reports a flat
+//! band with no trend (`[87896, 29768, 125264, 29768, 133568, …]` — a ~100 KB sawtooth whose
+//! envelope does not move), so this is a divergence in the product, not in the workload.
+//!
+//! The growth is **per churn-block boundary, not per iteration**, and two controls isolate it to
+//! the park:
+//!
+//! * ten blocks of 1 000 iterations and ten blocks of 2 000 give the *same* ladder (topping at
+//!   103 600), four blocks of 5 000 give four rungs, twenty blocks of 1 000 give twenty — so the
+//!   increment tracks the number of blocks (parks), not the iteration count;
+//! * twelve consecutive reads after one `churn(2 000)` are flat (`[4144 × 12]`, and
+//!   `[65584 × 12]` at 65 536-byte payloads) — a read is not what leaks;
+//! * one `churn` block of 1 000 000 iterations read once is flat at 4 144, like every other
+//!   `discard(N)`.
+//!
+//! So one park is closed and each further park retains exactly one more payload: the retained set
+//! is monotone in the number of pre-emptions, and its size is payload-size proportional (capped at
+//! 999 payloads — 4.1 MB at 4 KiB, ~65 MB at 64 KiB).
+//!
+//! The seam the law points at is the retention predicate of the prune,
+//! `src/context/gc/bin_vheap.rs`'s `live ∪ shared` pair. `shared` is derived **from the reservoir
+//! being pruned** (every entry with `refcount() > 1`), so a payload that acquires a second owner
+//! is immortal across every later prune and the belt is fed back to itself; `live` covers the
+//! rest. Narrowing it is a product change with a hard constraint: a false accept is only a leak,
+//! a **false reject frees a payload a live `BinRef.val` names**, so the predicate may only be
+//! narrowed where ownership is proven elsewhere (the runtime's escaped store, the mailbox's
+//! retained families, the send path's destination tables).
+//!
+//! [`memory_binary_does_not_grow_monotonically_over_the_loop`] is **red** on this state, and its
+//! failure message is the honest one — the sampled maximum is ten payloads where the non-vacuity
+//! guard asks for a hundred. Neither that guard, nor [`MAX_TROUGH_PAYLOADS`], nor
+//! [`BOUND_BYTES`] may be re-derived to fit this residue: the product owes a residue that does
+//! not grow, and [`BOUND_BYTES`] (8 MiB) cannot discriminate the current shape in any case — the
+//! signal is 37 KB at N = 10 000 and 4.1 MB at the cap, both under it.
+//!
+//! The guard itself is mis-specified against the sampling it is given, independently of the
+//! residue: [`MIN_PEAK_PAYLOADS`] asks a rung to report an **in-window peak**, and a rung's read
+//! follows a completed churn block, so it reports the trough. A *healthy* ladder cannot reach the
+//! threshold either — the oracle's own ten-rung readings peak at 123 776–184 480 bytes (30–45
+//! payloads) against the guard's 409 600-byte (98.8-payload) threshold. The re-derived guard
+//! therefore has to be stated against the property the sampling can see, the residue's
+//! **monotonicity** (`last − first` bounded by a small multiple of one payload, and a trough far
+//! below the cap), so that a residue growing one payload per park still fails it.
 //!
 //! # Conventions
 //!
@@ -155,12 +220,17 @@ const RETAIN_CHURN_N: u64 = 6_000;
 const BOUND_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The peak a non-vacuous loop must reach: at least this many payloads outstanding between two
-/// parks (measured ≈345 at this payload size; a fixture that stopped feeding the reservoir —
-/// e.g. a compile-time-constant size folded into a literal — sits at one payload instead).
+/// parks. A ladder rung samples the **post-park residue**, not an in-window peak, so this
+/// threshold is unreachable by the sampling it is applied to — the current product reports 10
+/// payloads and a healthy runtime (the live oracle) reports 30–45. The guard is deliberately left
+/// at its value rather than re-derived to fit the residue; see the module docs' *Known issue* for
+/// the property it must be restated against (*monotonicity*, not peak height).
 const MIN_PEAK_PAYLOADS: u64 = 100;
 
 /// The trough a completing prune must reach: fewer than this many payloads outstanding
-/// (measured ≤9 at this payload size; an un-pruned reservoir never gets below N payloads).
+/// (the ladder's first rung is one payload at this payload size; an un-pruned reservoir never
+/// gets below N payloads). Unchanged by the *Known issue*: a trough that climbs is exactly what
+/// the product must stop doing.
 const MAX_TROUGH_PAYLOADS: u64 = 64;
 
 /// How long one `beam_rt run` child may live before it is killed and reported.
@@ -1021,12 +1091,15 @@ fn a_retained_off_heap_binary_survives_the_fun_loop_byte_exactly() {
 /// epilogue, against the run's own published root set (its X registers, its whole Erlang stack,
 /// its FR file and the term it is about to return).
 ///
-/// The store is bounded by `STORE_BUDGET_WORDS` (46 422 words, the C `BIN_VH_MIN_SIZE`), so the
-/// envelope is a converged capacity, not a function of N: measured **377 104** bytes at both
-/// N = 1 000 and N = 10 000 (4 096-byte payloads, ~91 payloads) against a linear
-/// `N × (Bytes + 48)` before that store had a prune. The assertion is structural on purpose --
-/// bounded, and no growth from the small to the large N -- never an exact byte figure and never
-/// a wall-clock claim.
+/// The store is budgeted by `STORE_BUDGET_WORDS` (46 422 words, the C `BIN_VH_MIN_SIZE`), so the
+/// intended envelope is a converged capacity, not a function of N. **Today the first prune is not
+/// reliably reached** (4 096-byte payloads, three repeats each): `foldl_discard(1 000)` reads
+/// **4 144 000** bytes — every payload of the run, the fully un-pruned figure — and so does
+/// `foldl_discard(3 000)` (4 160 576), while N = 2 000 and every N from 4 000 to 10 000 read
+/// **16 576**. Both a never-pruned and a converged run are therefore reachable, which is the same
+/// retention family as the module docs' *Known issue*, and it is why this assertion is structural
+/// on purpose — bounded, and no growth from the small to the large N — never an exact byte figure
+/// and never a wall-clock claim.
 #[test]
 fn the_fun_loop_envelope_is_bounded_by_the_bin_vheap_budget() {
     let Some(toolchain) = setup("foldl_discard") else {
