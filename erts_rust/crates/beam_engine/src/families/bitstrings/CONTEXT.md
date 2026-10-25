@@ -601,8 +601,10 @@ recorded `instr_per_call` 438/660/244/531 — i.e. 16-23 % of every loop body):
 `decode` **110** (`StartMatch4` 31, `Match` 31, `GetPosition` 15, `CreateBin` 30, `SkipBits2` 1, `GetInteger2` 1,
 `InitWritable` 1). Loops: 30 + 1 terminating entry (`to_lower`, `capitalize_token`), 4 + 1 (`encode`, 4×6 bits),
 14 + 1 tail byte (`decode`, 14×6 + 4 bits).
-The recurring shapes (only 9 of the 20 `claimed()` variants occur; no `BsMatchString`/`BsTestTail2`/`BsGetBinary2`/
-`BsGetFloat2`/`BsGet*Utf*`): whole-byte unsigned BE `[ensure_at_least 8 1, integer … 8 1]` (= prepared `FastForm`);
+The recurring shapes (only 9 of the 20 `claimed()` variants occur; `BsGetTail` is emitted on `capitalize_token/3`'s
+non-byte-aligned tail path but never executes for these inputs; nothing of `BsMatchString`/`BsTestTail2`/
+`BsGetBinary2`/`BsGetFloat2`/`BsGet*Utf*` occurs):
+whole-byte unsigned BE `[ensure_at_least 8 1, integer … 8 1]` (= prepared `FastForm`);
 **6-bit** `integer … 6 1` (encode ×3, decode's `[ensure_exactly 8, skip 2, integer … 6 1]`); `[ensure_at_least 12 8,
 integer 6, integer 6]` (verify: 12 bits **and** `(remaining-12) mod 8 == 0`); `[ensure_exactly 0]`.
 
@@ -626,7 +628,7 @@ is the only one that reads and writes the **same** `x(2)`.
 | `encode/2` 3-field | `{f,7}`·8 | `y(0)` → `x(1)` | `binary all` | **declined** — same |
 | `encode/2` 2-field | `{f,7}`·9 | `y(0)` → `x(1)` | `binary all` | **declined** — same |
 | `decode/2` temp `<<DecodeChar>>` | `{f,13}`·13/15/16 | none — the field **is** segment 0 | `integer` U1 `{x,0}` S`{integer,8}` | **declined** — not an append build at all (`seam::append_plan`'s first-segment `PreparedSeg::Append { private: true }` let-else), and a bare create allocates through `raw::make_binary` |
-| `decode/2` append | `{f,13}`·13/15/16 | `y(1)` → `x(1)` | `integer` U1 `{x,2}` S`{integer,6}` (clause 1), or S`{tr,{x,2}}` runtime (clause 2) | clause 1 **inlined**, `Route::BitGranular` (a 6-bit field); clause 2 declined at run time — a `Width::Dynamic` fixes no static offset |
+| `decode/2` append | `{f,13}`·13/15/16 | `y(1)` → `x(1)` | `integer` U1 `{x,2}` S`{integer,6}` (clause 1), or S`{tr,{x,2}}` runtime (clause 2) | clause 1's **two** sites (labels 13 and 15) **inlined**, `Route::BitGranular` (the 6-bit field); label 16 declined at run time — a `Width::Dynamic` fixes no static offset |
 
 Three refusals survive in these workloads, and none of them is the accumulator's operand class: a `binary
 all` segment (`seam::append_plan` has no `Field::Binary`, see the construction-seam section below), a create
@@ -643,8 +645,9 @@ dash **4** (four `-`), upper **5** (`t`, the initial `true` flag, plus one per d
 `bit_size(Rest)` < 24); `decode/2`'s clause-1 pair **14** and clause-2 pair **1** — the 15-byte input's last body has
 `bit_size(Rest) == 0`, so it takes clause 2 and is the single `bs_skip_bits2`/`bs_get_integer2` pair — 30 total. Position ops: `encode` saves three positions per
 iteration and restores one on the failing entry; `decode`/`capitalize_token` save one per byte.
-Because every `Bs*` is currently one `jit_bitstr` helper call (`jit/baseline/emit/family.rs:88-96`), these four loop
-bodies are the workload set an inline `Bs*` lowering would target.
+On the default (native baseline) tier nine of the 20 `claimed()` variants never reach `exec`: `bs_get_position`/`bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3`, `bs_start_match4`, `bs_get_integer2`, `bs_match` and `bs_create_bin` each carry a native in-block arm (`jit/baseline/emit/bitstr_inline/mod.rs`, `SHAPE_COUNT = 9`), the construction one reaching this family's `create::seam` doors rather than `exec`.
+The other eleven variants (`bs_init_writable`, `bs_get_tail`, `bs_get_binary2`, `bs_get_float2`, `bs_match_string` and the six UTF reads/skips), and every instruction one of the nine shapes refuses at compile time or declines through a run-time guard, still arrive at `exec` through the `jit_bitstr` helper (`jit/baseline/emit/family.rs:88-96`), which bypasses the router's variant re-match and nothing else.
+The per-shape predicates, guards and routes are the tier's own record: `jit/baseline/inlineset/CONTEXT.md`.
 
 ## `append` / `private_append` — in place while the payload is writable
 
