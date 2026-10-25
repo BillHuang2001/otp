@@ -634,12 +634,13 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
                 bs_paths += 1;
                 utf32_paths += 1;
             }
-            // The UTF-16 shape charges its own sequence ([`UTF16_PATH_BYTES`]) on top of the
+            // The UTF-16 shapes charge their own sequence ([`UTF16_PATH_BYTES`]) on top of the
             // generic [`BS_PATH_BYTES`]: it is the *variable-width* character, so it carries
             // a second big-endian word read, its own pair-window test and its own second
             // over-read guard, plus the branch structure that routes a BMP word and a
-            // surrogate pair to one shared commit.
-            Instr::BsSkipUtf16 { .. } => {
+            // surrogate pair to one shared commit — and the get form adds its destination
+            // guard, the decoded scalar on both paths and the bind.
+            Instr::BsSkipUtf16 { .. } | Instr::BsGetUtf16 { .. } => {
                 bs_paths += 1;
                 utf16_paths += 1;
             }

@@ -1225,6 +1225,40 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_get_utf16` — the same variable-width character, **bound**: identical word
+            // reads, guards, malformed-character transfers and the same one merged commit,
+            // plus the destination store. The destination's frame-window guard is emitted
+            // first and the bind follows the single `start` commit, because `Dst` may be `Ctx`
+            // (`beam_asm:filter_essentials/1` compiles that) and the commit goes through the
+            // block pointer the match-context guard left in `r11` rather than re-reading the
+            // operand. Refusals are the skip twin's — a `-little`/`-native` flags word, a
+            // `NO_FAIL` fail code, an unresolvable label — plus an un-addressable `Dst`; each
+            // emits **zero bytes** and takes the family's arm below. See
+            // [`bitstr_inline::utf16`].
+            Instr::BsGetUtf16 {
+                fail,
+                ctx,
+                live: _,
+                flags,
+                dst,
+            } => {
+                if !bitstr_inline::try_inline_bs_get_utf16(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    *flags,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

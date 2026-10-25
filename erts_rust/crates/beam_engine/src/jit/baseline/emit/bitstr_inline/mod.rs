@@ -21,8 +21,8 @@
 //! The baseline JIT's native lowerings for the bitstring family: eleven **small, safe**
 //! match-context shapes (the seven position/tail/start-match/integer extractors, the static
 //! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32`/`bs_get_utf32`
-//! character pair) plus `bs_skip_utf16` — the variable-width character — and the
-//! `bs_create_bin` private-append construction shape.
+//! character pair) plus the variable-width character duo `bs_skip_utf16`/`bs_get_utf16` and
+//! the `bs_create_bin` private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
@@ -47,12 +47,12 @@
 //!
 //! # The invariants these lowerings keep
 //!
-//! * **M before W where both happen.** Two shapes both advance the match context **and**
-//!   write a destination — `bs_get_integer2` and `bs_get_utf32` — and both store the
-//!   advanced `start` word **before** the destination write, because `Dst` may be the very
-//!   same location as `Ctx` (`beam_asm:filter_essentials/1` compiles that). The two
-//!   mutating shapes without a destination (`bs_set_position`, `bs_skip_bits2`,
-//!   `bs_skip_utf32`) have nothing to order against.
+//! * **M before W where both happen.** Three shapes both advance the match context **and**
+//!   write a destination — `bs_get_integer2`, `bs_get_utf32` and `bs_get_utf16` — and all
+//!   three store the advanced `start` word **before** the destination write, because `Dst`
+//!   may be the very same location as `Ctx` (`beam_asm:filter_essentials/1` compiles that).
+//!   The mutating shapes without a destination (`bs_set_position`, `bs_skip_bits2`,
+//!   `bs_skip_utf32`, `bs_skip_utf16`) have nothing to order against.
 //! * **No allocation, hence no re-read.** Every sequence below allocates nothing, so no
 //!   moving collection can run part-way through one, which is why the context operand is
 //!   read exactly once and its block address reused. The construction shape re-reads its
@@ -76,7 +76,7 @@
 //! * [`bs_match`] — `bs_match` over a fully static command list
 //! * [`match_string`] — `bs_match_string`
 //! * [`utf32`] — `bs_skip_utf32` + `bs_get_utf32`
-//! * [`utf16`] — `bs_skip_utf16`
+//! * [`utf16`] — `bs_skip_utf16` + `bs_get_utf16`
 //! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
@@ -157,8 +157,8 @@ pub(super) use tail::{try_inline_bs_skip_bits2, try_inline_bs_test_tail2};
 pub(crate) use tail::{skip_bits2_shape, test_tail2_shape, SkipBits2Shape, TestTail2Shape};
 pub(super) use utf32::{try_inline_bs_get_utf32, try_inline_bs_skip_utf32};
 pub(crate) use utf32::{get_utf32_shape, skip_utf32_shape, Utf32Shape};
-pub(super) use utf16::try_inline_bs_skip_utf16;
-pub(crate) use utf16::{skip_utf16_shape, Utf16Shape};
+pub(super) use utf16::{try_inline_bs_get_utf16, try_inline_bs_skip_utf16};
+pub(crate) use utf16::{get_utf16_shape, skip_utf16_shape, Utf16Shape};
 
 // ---------------------------------------------------------------------------
 // Constants (derived from the frozen layout owners, never re-derived)
@@ -241,7 +241,7 @@ const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The scan of the number of the last inlined shape, for the test-build instrument.
 #[cfg(test)]
-pub(crate) const SHAPE_COUNT: usize = 13;
+pub(crate) const SHAPE_COUNT: usize = 14;
 /// The `bs_get_position` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_GET_POSITION: usize = 0;
@@ -281,6 +281,9 @@ pub(crate) const SHAPE_GET_UTF32: usize = 11;
 /// The `bs_skip_utf16` shape index in the test-build instrument.
 #[cfg(test)]
 pub(crate) const SHAPE_SKIP_UTF16: usize = 12;
+/// The `bs_get_utf16` shape index in the test-build instrument.
+#[cfg(test)]
+pub(crate) const SHAPE_GET_UTF16: usize = 13;
 
 #[cfg(test)]
 thread_local! {
@@ -295,8 +298,9 @@ thread_local! {
 /// A **compile-time** instrument: it counts the emitter's decision, never run-time helper
 /// entries. The two kinds of shape here need that count for different reasons.
 ///
-/// For the **eleven match-context shapes** the emission is the only observable there can
-/// be: such a shape calls no helper at all, so
+/// For the **thirteen helper-free** shapes — the eleven small match-context shapes plus the
+/// variable-width `bs_skip_utf16`/`bs_get_utf16` pair — the emission is the only observable
+/// there can be: such a shape calls no helper at all, so
 /// [`super::super::bitstr::bitstr_calls`] never moves for it and "the inline arm ran" *is*
 /// the decision to emit.
 ///
