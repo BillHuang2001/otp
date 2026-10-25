@@ -80,7 +80,7 @@ use super::emit::bitstr_inline::{
     SHAPE_START_MATCH4, SHAPE_TEST_TAIL2,
 };
 use super::tests::assert_same_outcome;
-use crate::context::MinimalContext;
+use crate::context::{ExecutionContext, MinimalContext};
 use crate::jit::Tier;
 use crate::machine::{Machine, RunOutcome};
 use crate::terms::{make_heap_binary, make_integer};
@@ -920,18 +920,16 @@ fn bs_start_match4_resume_form_commits_once_and_declines() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. `bs_get_position` — a read-only shape; its guard is unreachable at run time
+// 8. `bs_get_position` — a read-only shape whose one guard needs an out-of-range start
 // ---------------------------------------------------------------------------
-/// **`bs_get_position` is read-only, and its only fallback guard is unreachable from a
-/// test.**
+/// **`bs_get_position` is read-only, so it is trivially re-execution safe.**
 ///
-/// The arm's single decline edge compares the context position against `MAX_SMALL`;
-/// reaching it needs a subject of at least 2^56 bytes, which no test can allocate (the
-/// byte-level pin for that guard is
-/// `bitstr_inline_tests.rs::the_get_position_arm_emits_the_max_small_guard`). What can
-/// be pinned here is the property the idempotency rule actually needs for a read-only
-/// shape: the instruction writes nothing, so it is trivially re-execution safe, and its
-/// answer is the position the *preceding* instruction committed — never one it moved.
+/// The arm's single decline edge compares the context position against `MAX_SMALL`; no
+/// *program* can reach it (see
+/// [`bs_get_position_declines_a_position_beyond_the_small_range`], which supplies the one
+/// input that does), so this row pins the property the idempotency rule actually needs for
+/// a read-only shape: the instruction writes nothing, and its answer is the position the
+/// *preceding* instruction committed — never one it moved.
 ///
 /// The row therefore asserts the value after each of the two preceding shapes whose
 /// commits it reads (a field read, and a skip), on both tiers.
@@ -976,6 +974,112 @@ fn bs_get_position_is_read_only() {
     );
     assert_still_native(
         "bs_get_position",
+        &module,
+        SHAPE_GET_POSITION,
+        "BsGetPosition",
+    );
+}
+
+/// A match-context term over `subject` whose `start` word is `start` bits, built in `ctx`'s
+/// own arena with `beam_term`'s `ErlSubBits` writer — the `[HEADER_SUB_BITS, base_flags,
+/// start, end, orig]` block a `bs_start_match3` would have produced, with a position no
+/// match advance can reach.
+fn context_at(ctx: &mut MinimalContext, subject: &[u8], start: usize) -> beam_term::Eterm {
+    let orig = make_heap_binary(ctx, subject).expect("the subject builds");
+    let hp = ctx
+        .alloc_words(5)
+        .expect("the context block reserves in the arena");
+    // SAFETY: `alloc_words` handed back five exclusively-owned, writable words in a
+    // pointer-stable arena that outlives the run (a `MinimalContext` never moves or
+    // reclaims its regions), and `beam_term`'s writer fills all five. `orig` is a live heap
+    // binary in the same arena and `end` is that binary's own bit size, so the block is a
+    // well-formed match context in every word but the deliberately out-of-range `start`.
+    unsafe {
+        beam_term::bitstring::write_sub_bits(
+            hp,
+            beam_term::Eterm::from_raw(0),
+            beam_term::Eterm::from_raw(start),
+            beam_term::Eterm::from_raw(subject.len() * 8),
+            orig,
+        )
+    }
+}
+
+/// **`bs_get_position`'s `MAX_SMALL` guard declines, and the decline is idempotent.**
+///
+/// No program can reach the guard: every writer of a context's `start` is bounded by
+/// `MAX_SMALL` (`bs_set_position` accepts a non-negative small — at most `MAX_SMALL` — or a
+/// context whose own start is bounded the same way), and a match advance is bounded by
+/// `end`, i.e. by the subject's real bit length. The row therefore supplies the one input
+/// that does reach it: [`context_at`] builds a match context over a real two-byte subject
+/// whose `start` is `2^60`, one bit past the 60-bit immediate range.
+///
+/// The two routes answer different observables:
+///
+/// * **guard intact** — the arm falls back, one interpreter step publishes the family's
+///   whole-context snapshot (a context carrying `2^60`), `bs_set_position` rewinds to it,
+///   and the 8-bit read then has no window left, so it takes its fail label and the module
+///   answers `42`;
+/// * **guard removed** — the arm would `shl` `2^60` by 4 (wrapping to `0`) and publish
+///   `make_small(0)`, the rewind would land at bit 0, and the same read would answer the
+///   subject's first byte, `7`.
+#[test]
+fn bs_get_position_declines_a_position_beyond_the_small_range() {
+    const HUGE: usize = 1 << 60;
+    let module = bitstr_module("deopt_get_position_max_small", &[], 1, |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::BsGetPosition {
+                ctx: Operand::X(0),
+                dst: Operand::X(1),
+                live: 2,
+            },
+            Instr::BsSetPosition {
+                ctx: Operand::X(0),
+                pos: Operand::X(1),
+            },
+            get_integer(&Module::default(), Operand::X(0), 8, 1, Operand::X(0)),
+            Instr::Return,
+            Instr::Label(Label(4)),
+            Instr::Move {
+                src: Operand::Integer(42),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    });
+    let name = atom(&module, "f");
+    with_both_tiers_args(
+        &module,
+        name,
+        1,
+        |ctx| vec![context_at(ctx, &[7, 9], HUGE)],
+        |interpreter, baseline| {
+            assert_same_outcome(
+                "bs_get_position MAX_SMALL",
+                interpreter,
+                baseline,
+                &module.atom_table,
+            );
+            let returned = baseline
+                .as_ref()
+                .unwrap_or_else(|error| panic!("bs_get_position MAX_SMALL: {error:?}"));
+            let RunOutcome::Returned(value) = returned else {
+                panic!("bs_get_position MAX_SMALL: unexpected outcome {returned:?}");
+            };
+            assert_eq!(
+                beam_term::signed_value(*value),
+                42,
+                "a position beyond `MAX_SMALL` must take the arm's `fallback`: the snapshot \
+                 the family publishes rewinds the context to 2^60, so the 8-bit read has no \
+                 window left and takes its fail label (an arm that published \
+                 `make_small(2^60 << 4)` would answer the subject's first byte instead)"
+            );
+        },
+    );
+    assert_still_native(
+        "bs_get_position (MAX_SMALL)",
         &module,
         SHAPE_GET_POSITION,
         "BsGetPosition",
