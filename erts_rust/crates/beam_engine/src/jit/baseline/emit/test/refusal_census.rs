@@ -717,7 +717,17 @@ fn bitstring_verdict(module: &Module, labels: &LabelMap, instr: &Instr) -> BsVer
             };
             BsVerdict::Refused(OP, reason)
         }
-        Instr::BsSkipUtf8 { .. } => BsVerdict::NoArm("bs_skip_utf8"),
+        Instr::BsSkipUtf8 { fail, ctx, .. } => {
+            const OP: &str = "bs_skip_utf8";
+            if bitstr_inline::skip_utf8_shape(labels, *fail, ctx).is_some() {
+                return BsVerdict::Inlined(OP);
+            }
+            // The shape has no field rule to report: UTF-8 has no endianness, so the family's
+            // `decode_utf8` takes no flags and the arm accepts every flags word. That leaves the
+            // shared fail half and the context operand's form.
+            let reason = fail_refusal(labels, *fail).unwrap_or_else(|| operand_refusal(&[ctx]));
+            BsVerdict::Refused(OP, reason)
+        }
         Instr::BsSkipUtf16 {
             fail, ctx, flags, ..
         } => {

@@ -1259,6 +1259,43 @@ pub(crate) fn emit_block(
                     emit_bitstr(buffer, allocation, done, func, pc)?;
                 }
             }
+            // `bs_skip_utf8` — the **self-describing** character: the lead byte announces how
+            // many continuation bytes follow (`0x00..=0x7F` none, `0xC0..=0xDF` one,
+            // `0xE0..=0xEF` two, `0xF0..=0xF4` three), so the length is decided at run time and
+            // the sequence classifies the lead byte into one of **four static paths**, each with
+            // its own window check, its own over-read guard and its own fixed continuation reads
+            // with static shift amounts. All four converge on **one** commit that advances
+            // `start` by the character's own bit length exactly once, after every guard, so a
+            // `fallback` deopt re-executes the instruction against an untouched context. Each of
+            // `decode_utf8`'s malformed characters — fewer than 8 bits remaining, a continuation
+            // byte as the lead, a byte above `0xF4`, a truncated 2/3/4-byte form, a
+            // non-continuation byte where one is required, an overlong form, a surrogate code
+            // point and a value above `0x10FFFF` — takes the **fail label** (the family's
+            // `fail_step`, which writes nothing), never a trap. UTF-8 has **no** endianness, so
+            // the family ignores `flags` (`decode_utf8` takes none) and this arm accepts every
+            // flags word; a `NO_FAIL` fail code that raises and an unresolvable label emit
+            // **zero bytes** and take the family's arm below. See [`bitstr_inline::utf8`].
+            Instr::BsSkipUtf8 {
+                fail,
+                ctx,
+                live: _,
+                flags: _,
+            } => {
+                if !bitstr_inline::try_inline_bs_skip_utf8(
+                    buffer,
+                    labels,
+                    &linker,
+                    *fail,
+                    ctx,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_bitstr(buffer, allocation, done, func, pc)?;
+                }
+            }
             // The **whole bitstring family** — exactly the variants the family's own
             // [`claimed`](crate::families::bitstrings::claimed) predicate names, which is
             // also what [`crate::families::dispatch`] routes on — reaches the family's own

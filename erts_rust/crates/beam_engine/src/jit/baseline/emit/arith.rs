@@ -469,6 +469,8 @@ pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
             ctx, flags, dst, ..
         } => super::bitstr_inline::Utf16Shape::of_get(ctx, *flags, dst)
             .map_or(false, |shape| shape.uses_y()),
+        Instr::BsSkipUtf8 { ctx, .. } => super::bitstr_inline::Utf8Shape::of(ctx)
+            .map_or(false, |shape| shape.uses_y()),
         _ => fast_arith(module, instr).map_or(false, |fast| fast.uses_y()),
     }
 }
