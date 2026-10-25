@@ -18,12 +18,11 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's native lowerings for the bitstring family: eleven **small, safe**
-//! match-context shapes (the seven position/tail/start-match/integer extractors, the static
-//! `bs_match` and `bs_match_string` compares, and the `bs_skip_utf32`/`bs_get_utf32`
-//! character pair) plus the variable-width character groups
-//! `bs_skip_utf16`/`bs_get_utf16` and `bs_skip_utf8`/`bs_get_utf8` and the `bs_create_bin`
-//! private-append construction shape.
+//! The baseline JIT's native lowerings for the bitstring family: fifteen **small, safe**
+//! match-context shapes — the seven position/tail/start-match/integer extractors, the static
+//! `bs_match` and `bs_match_string` compares, and the three fixed-width character pairs
+//! `bs_skip_utf32`/`bs_get_utf32`, `bs_skip_utf16`/`bs_get_utf16` and
+//! `bs_skip_utf8`/`bs_get_utf8` — plus the `bs_create_bin` private-append construction shape.
 //!
 //! Every lowering here is allocation-free and raises nothing of its own: the match-context
 //! shapes read the `ErlSubBits` words and (for the mutating ones) write one word back, while
@@ -48,9 +47,10 @@
 //!
 //! # The invariants these lowerings keep
 //!
-//! * **M before W where both happen.** Three shapes both advance the match context **and**
-//!   write a destination — `bs_get_integer2`, `bs_get_utf32` and `bs_get_utf16` — and all
-//!   three store the advanced `start` word **before** the destination write, because `Dst`
+//! * **M before W where both happen.** Four shapes both advance the match context **and**
+//!   write a destination — `bs_get_integer2`, `bs_get_utf32`, `bs_get_utf16` and
+//!   `bs_get_utf8` — and all four store the advanced `start` word **before** the destination
+//!   write, because `Dst`
 //!   may be the very same location as `Ctx` (`beam_asm:filter_essentials/1` compiles that).
 //!   The mutating shapes without a destination (`bs_set_position`, `bs_skip_bits2`,
 //!   `bs_skip_utf32`, `bs_skip_utf16`, `bs_skip_utf8`) have nothing to order against.
@@ -78,7 +78,7 @@
 //! * [`match_string`] — `bs_match_string`
 //! * [`utf32`] — `bs_skip_utf32` + `bs_get_utf32`
 //! * [`utf16`] — `bs_skip_utf16` + `bs_get_utf16`
-//! * [`utf8`] — `bs_skip_utf8`
+//! * [`utf8`] — `bs_skip_utf8` + `bs_get_utf8`
 //! * [`create`] — `bs_create_bin` over the private-append accumulator
 //! * [`tests`] — the in-crate unit suite
 //!
