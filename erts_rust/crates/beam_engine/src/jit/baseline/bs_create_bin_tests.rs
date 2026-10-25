@@ -2567,6 +2567,657 @@ fn a_binary_all_append_with_a_y_slot_accumulator_deopts_on_a_heap_source() {
     );
 }
 
+/// **A `Y`-slot source with a writable accumulator runs natively** — the door's
+/// `WRITE_VALUE_IN_Y` path.
+///
+/// The writable accumulator `A` is built natively in `x(0)` and then `move`d into the frame's
+/// `Y(0)`, so the second build's `binary all` source crosses the door as a **slot index with
+/// `WRITE_VALUE_IN_Y` set**. That flag is the row's whole point: a door that read the source
+/// out of the x-register file instead would resolve slot `0` to the *accumulator* itself (the
+/// overlap rule then refuses that, so nothing is corrupted — but every such build would
+/// deopt), and a door that read the right slot at the wrong time would copy garbage.
+///
+/// Pinned: both builds are planned and lowered with zero static deopts; the second build's
+/// shape really is the `Y` form (`uses_y` is `true` while its accumulator is an x-register,
+/// so the answer can only come from the source); the counted run records **no** `BsCreateBin`
+/// deopt and no `jit_step_one` step, i.e. the door served it instead of the family; and the
+/// payload is the interpreter's byte.
+#[test]
+fn a_binary_all_append_of_a_y_slot_source_runs_natively() {
+    let module = bin_module("bscb_bin_all_y_src", 2, &[], move |module| {
+        let mut first = append_seg(module, Operand::X(0));
+        first.extend(int_seg(module, Operand::X(3), 8));
+        let mut second = append_seg(module, Operand::X(0));
+        second.extend(bin_seg_all(module, Operand::Y(0)));
+        vec![
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 2,
+            },
+            // `x(0)` is the capacity hint and `x(1)` the integer field's value; the first
+            // build reads the value from `x(3)` so the hint survives in `x(1)` for the
+            // second build.
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(3),
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), first, 4),
+            // The one-byte source now lives in the frame: the door reaches it as `Y(0)`.
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), second, 4),
+            Instr::Deallocate(1),
+        ]
+    });
+
+    // (1) Both builds are planned and lowered, the second as the `Y`-source form.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(
+        builds.len(),
+        2,
+        "the fixture holds exactly two `bs_create_bin`s (found {})",
+        builds.len()
+    );
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "the arm must serve both builds; a `Y`-source refusal would show up here as a \
+         declined build"
+    );
+    let shapes: Vec<_> = module.functions[0]
+        .code
+        .iter()
+        .filter_map(|instr| match instr {
+            Instr::BsCreateBin { dst, segments, .. } => {
+                Some(bitstr_inline::CreateBinShape::of(&module, dst, segments))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shapes.len(), 2, "one shape per `bs_create_bin`");
+    assert_eq!(
+        shapes[0].as_ref().map(bitstr_inline::CreateBinShape::uses_y),
+        Some(false),
+        "the first build is all x-registers, so the second build's `uses_y` below is \
+         attributable to its source alone"
+    );
+    assert_eq!(
+        shapes[1].as_ref().map(bitstr_inline::CreateBinShape::uses_y),
+        Some(true),
+        "the second build's source is `Y(0)` (its accumulator is an x-register), so the \
+         emitted sequence must carry `WRITE_VALUE_IN_Y`"
+    );
+    assert_eq!(
+        shapes[1]
+            .as_ref()
+            .map(bitstr_inline::CreateBinShape::route),
+        Some(bitstr_inline::Route::Aligned),
+        "the whole-binary route is byte-aligned by construction"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        visited_instances(&snapshot, "BsCreateBin"),
+        2,
+        "the emitter must visit both `bs_create_bin`s under that name (visited {:?})",
+        snapshot.instr_instances
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "neither build may be statically deopted (deopts {:?})",
+        snapshot.instr_deopts
+    );
+
+    // (2) The value: the copy really moved the source's byte, on both tiers.
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Int(0x5A)];
+    assert_construction_row("binary all, `Y`-slot source", &module, &args, &[0x5A]);
+
+    // (3) The counted run: the door served the `Y` source, so nothing fell back.
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&[0x5A][..]),
+        "the baseline tier's payload"
+    );
+    assert_eq!(
+        report.counters.step_one, 0,
+        "a `Y` source must not cost an interpreter step (`jit_step_one` ran {} times): a \
+         door that read the wrong slot would refuse and land here",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert_eq!(
+        report.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable` and none for either `bs_create_bin`: the \
+         door performed the copy itself"
+    );
+}
+
+/// **An empty source binary runs natively and leaves the accumulator's window alone.**
+///
+/// `bs_init_writable` reports a **zero-length** window over a real capacity (`current_size =
+/// 0`), so the first accumulator is an empty off-heap refc binary: the door's source guards all
+/// pass (`src_start == 0`, `src_size == 0`, a non-null base) and the copy is a zero-byte one,
+/// which is the shape a door that blindly ran `copy_nonoverlapping` would fault on. The
+/// accumulator's `ErlSubBits.end` must also come out **unchanged** — a commit that added the
+/// source's size to the wrong figure (or committed twice) would widen the window here.
+///
+/// The row compares against a **reference fixture** that is identical except that it never
+/// appends the empty source at all: the built payload and the returned width must be the same
+/// bytes, which is what "the window is unchanged" means observably.
+#[test]
+fn an_empty_binary_all_source_runs_natively_and_leaves_the_window_alone() {
+    let build = |name: &str, with_the_empty_append: bool| {
+        bin_module(name, 2, &[], move |module| {
+            let mut first = append_seg(module, Operand::X(0));
+            first.extend(int_seg(module, Operand::X(3), 8));
+            let mut second = append_seg(module, Operand::X(0));
+            second.extend(bin_seg_all(module, Operand::X(2)));
+            let mut code = vec![
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(3),
+                },
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(1),
+                },
+                // The empty source: a writable payload whose window is still zero bits long.
+                Instr::BsInitWritable,
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(2),
+                },
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                // The destination: one integer byte, then the empty source.
+                Instr::BsInitWritable,
+                create_bin(Operand::X(0), first, 4),
+            ];
+            if with_the_empty_append {
+                code.push(create_bin(Operand::X(0), second, 4));
+            }
+            code
+        })
+    };
+    let module = build("bscb_bin_all_empty", true);
+    let reference = build("bscb_bin_all_empty_ref", false);
+
+    // (1) Both builds are lowered with zero static deopts, so the append really has an arm.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(
+        builds.len(),
+        2,
+        "the fixture holds the one-byte build and the empty append (found {})",
+        builds.len()
+    );
+    assert_eq!((lowered, declined), (2, 0), "both builds must be served");
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        visited_instances(&snapshot, "BsCreateBin"),
+        2,
+        "the emitter must visit both `bs_create_bin`s under that name (visited {:?})",
+        snapshot.instr_instances
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "an empty source is a run-time fact, never a compile-time refusal (deopts {:?})",
+        snapshot.instr_deopts
+    );
+
+    // (2) The value, the window and the payload, per tier.
+    let name = atom(&module, "f");
+    let args = [ArgKind::Int(64), ArgKind::Int(0x5A)];
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "binary all, empty source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            let value = returned("binary all, empty source", tier, outcome);
+            assert_eq!(
+                bit_size(value),
+                Some(8),
+                "{tier}: the empty append must not move the window end — anything but the \
+                 one byte the integer field wrote is a commit that ran when it should not have"
+            );
+            // SAFETY: `value` is the live bitstring term this run just returned and the run's
+            // heap is alive for the whole closure.
+            let (_, offset, size) = unsafe { beam_term::bitstring::bitstring_parts(value) };
+            assert_eq!(
+                (offset, size),
+                (0, 8),
+                "{tier}: the accumulator's window (start, `end - start`)"
+            );
+            assert_eq!(
+                returned_storage_bytes("binary all, empty source", tier, value),
+                vec![0x5A],
+                "{tier}: the payload the zero-byte copy must leave alone"
+            );
+        }
+    });
+
+    // (3) The counted run, against the reference fixture that never appends anything: the
+    //     arm served the empty source (no `BsCreateBin` deopt, no interpreter step) and the
+    //     result is byte-identical to the build without it.
+    let reference_report =
+        run_counting(&reference, atom(&reference, "f"), &args, Tier::Interpreter);
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes, reference_report.bytes,
+        "the empty append must be a no-op on the payload (got {:?}, reference {:?})",
+        report.bytes, reference_report.bytes
+    );
+    assert_eq!(
+        report.bits, reference_report.bits,
+        "the empty append must be a no-op on the window"
+    );
+    assert_eq!(report.bits, Some(8), "the built width");
+    assert_eq!(
+        report.counters.step_one, 0,
+        "an empty source must not cost an interpreter step (`jit_step_one` ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        0,
+        "the arm's own instruction must never deopt at run time (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert_eq!(
+        report.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable` and none for either `bs_create_bin`"
+    );
+}
+
+/// **A source whose size is not a multiple of the segment's `unit` refuses, and the family's own
+/// `badarg` is the answer.**
+///
+/// The source is a **four-bit** accumulator (`integer 4` on a writable payload), so `size % 8 !=
+/// 0` and the door's source-alignment guard refuses it — the arm must deopt, and the family is
+/// what raises: `erts_bs_put_binary_all` (`erl_bits.c:1311`) rejects a whole-tail segment whose
+/// bit size is not a multiple of the segment's `unit`, and the compiler spells a `<<B/binary>>`
+/// tail with `unit: 8`. That is the oracle's own answer (`<< <<0>>/binary, <<1:4>>/binary >>` is
+/// `badarg`), so the row pins the *reason*, not merely "both sides fail" — and it pins it
+/// against the interpreter tier, whose `badarg` comes from the family with no arm involved.
+#[test]
+fn a_non_byte_aligned_binary_all_source_deopts_to_the_familys_badarg() {
+    let module = bin_module("bscb_bin_all_bitgran_src", 2, &[], move |module| {
+        let mut nibble = append_seg(module, Operand::X(0));
+        nibble.extend(int_seg(module, Operand::X(3), 4));
+        let mut second = append_seg(module, Operand::X(0));
+        let mut tail = bin_seg_all(module, Operand::X(2));
+        // The `binary` group's `Unit` operand — the figure C tests the source's bit size
+        // against. The default `<<B/binary>>` unit is 8, which is what makes a mid-byte source
+        // a `badarg` rather than a legal 12-bit bitstring.
+        tail[2] = Operand::Integer(8);
+        second.extend(tail);
+        vec![
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(3),
+            },
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), nibble, 4),
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), second, 4),
+        ]
+    });
+    let name = atom(&module, "f");
+    // Capacity one byte for each accumulator, and the four-bit field value.
+    let args = [ArgKind::Int(1), ArgKind::Int(0b1011)];
+
+    // (1) The shape is lowered: a source's *width* is a run-time figure, so nothing at compile
+    //     time knows it is mid-byte — the refusal is the door's, per instruction.
+    let builds = super::foreign_kernel_tests::append_builds(&module, &module.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(builds.len(), 2, "the fixture holds two `bs_create_bin`s");
+    assert_eq!(
+        (lowered, declined),
+        (2, 0),
+        "both builds must be lowered — the mid-byte source must be a run-time refusal, not a \
+         compile-time one"
+    );
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "neither build may be statically deopted (deopts {:?})",
+        snapshot.instr_deopts
+    );
+
+    // (2) The counted run: exactly the second build deopts — the arm's own instruction, once —
+    //     and the family answers it.
+    let report = run_counting(&module, name, &args, Tier::BaselineJit);
+    assert!(
+        report.bytes.is_none() && report.bits.is_none(),
+        "a refused `binary all` raises; it must never yield a value (got bytes {:?}, bits {:?})",
+        report.bytes,
+        report.bits
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        1,
+        "exactly the mid-byte build must deopt (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert!(
+        report.counters.step_one >= 1,
+        "the refusal must really take the fallback (`jit_step_one` ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable`: the re-execution is the fallback's own \
+         interpreter step, so a build that silently stayed on the family would read more"
+    );
+
+    // (3) Both tiers raise the family's bare `badarg` — the oracle's own answer.
+    with_both_tiers_args(&module, name, &args, |interpreter, baseline| {
+        assert_same_outcome(
+            "binary all, mid-byte source",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            assert!(
+                matches!(outcome, Err(beam_common::BeamError::BadArg)),
+                "{tier}: a source whose bit size is not a multiple of `unit: 8` is the family's \
+                 bare `badarg` (got {outcome:?})"
+            );
+        }
+    });
+}
+
+/// **A source that overflows the payload's remaining room by exactly one byte refuses and writes
+/// nothing.**
+///
+/// The destination accumulator is filled to its whole nine-byte capacity, so a two-byte source is
+/// one byte past the room. The door's room guard is the last one before the copy, and the arm
+/// must leave `ErlSubBits.end` and every payload byte untouched: otherwise the fallback's
+/// interpreter step re-executes the instruction against an accumulator that already took the
+/// append, and the family publishes a window over the source once **plus** once again.
+///
+/// The observable is the accumulator itself, kept in `x(3)` (the build under test writes its
+/// result to `x(4)`): its window and payload after the run must be **byte-identical** to the
+/// reference run — the interpreter tier, where no arm was ever attempted — and both must be the
+/// family's own single build. The boundary-exact control (the same fixture with an eight-of-nine
+/// fill and a one-byte source, which fills the capacity exactly) is in the same row: it is served
+/// by the arm with **no** deopt, so the refusal above is the one-byte overflow and nothing else.
+#[test]
+fn a_binary_all_source_one_byte_past_the_capacity_refuses_and_writes_nothing() {
+    // One eleven-byte table serves both fixtures: `filled` is how much of it the destination
+    // accumulator already holds, and `(offset, len)` is the source accumulator's window.
+    let table: &[u8] = b"12345678901";
+    let build = |name: &str, filled: i64, offset: i64, len: i64| {
+        bin_module(name, 2, table, move |module| {
+            let mut source = append_seg(module, Operand::X(0));
+            source.extend(str_seg(module, offset, len));
+            let mut destination = append_seg(module, Operand::X(0));
+            destination.extend(str_seg(module, 0, filled));
+            let mut appended = append_seg(module, Operand::X(0));
+            appended.extend(bin_seg_all(module, Operand::X(2)));
+            vec![
+                // `x(0)` is the destination's capacity (nine bytes), `x(1)` the source's.
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(3),
+                },
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                Instr::BsInitWritable,
+                create_bin(Operand::X(0), source, 3),
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(2),
+                },
+                Instr::Move {
+                    src: Operand::X(3),
+                    dst: Operand::X(0),
+                },
+                Instr::BsInitWritable,
+                create_bin(Operand::X(0), destination, 3),
+                // The destination accumulator stays observable in `x(3)`: the build under
+                // test writes its result to `x(4)`.
+                Instr::Move {
+                    src: Operand::X(0),
+                    dst: Operand::X(3),
+                },
+                create_bin(Operand::X(4), appended, 4),
+                Instr::Move {
+                    src: Operand::X(4),
+                    dst: Operand::X(0),
+                },
+            ]
+        })
+    };
+    // Nine-byte capacity, filled to nine bytes, two-byte source: one byte past the room.
+    let overflow = build("bscb_bin_all_one_byte_past", 9, 9, 2);
+    let overflow_args = [ArgKind::Int(9), ArgKind::Int(2)];
+    // The boundary-exact control: eight of nine bytes filled, one-byte source.
+    let exact = build("bscb_bin_all_exactly_full", 8, 8, 1);
+    let exact_args = [ArgKind::Int(9), ArgKind::Int(1)];
+
+    // (1) Every build of the overflowing fixture is lowered, with zero static deopts: the
+    //     refusal is the door's room guard, at run time.
+    let builds = super::foreign_kernel_tests::append_builds(&overflow, &overflow.functions[0].code);
+    let lowered = builds.iter().filter(|build| build.lowered).count();
+    let declined = builds.len() - lowered;
+    assert_eq!(
+        builds.len(),
+        3,
+        "the fixture holds the source build, the destination build and the append (found {})",
+        builds.len()
+    );
+    assert_eq!(
+        (lowered, declined),
+        (3, 0),
+        "all three builds must be lowered, the append included"
+    );
+    let (emitted, snapshot) = emitted_shapes(&overflow);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the shape (emitted {emitted:?})"
+    );
+    assert_eq!(
+        visited_instances(&snapshot, "BsCreateBin"),
+        3,
+        "the emitter must visit all three `bs_create_bin`s (visited {:?})",
+        snapshot.instr_instances
+    );
+    assert_eq!(
+        static_deopts(&snapshot, "BsCreateBin"),
+        0,
+        "the capacity is a run-time figure, never a compile-time refusal (deopts {:?})",
+        snapshot.instr_deopts
+    );
+
+    // (2) The counted run: exactly the append deopts, and the family's single build answers.
+    let name = atom(&overflow, "f");
+    let report = run_counting(&overflow, name, &overflow_args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&b"12345678901"[..]),
+        "the family must append the source exactly once (a second, arm-committed append would \
+         read `1234567890101`)"
+    );
+    assert_eq!(
+        report.bits,
+        Some(88),
+        "the published window: nine filled bytes plus the two-byte source, once"
+    );
+    assert_eq!(
+        runtime_deopts(&report.counters, "BsCreateBin"),
+        1,
+        "exactly the overflowing build must deopt (per-variant deopts {:?})",
+        report.counters.deopts_by_variant
+    );
+    assert!(
+        report.counters.step_one >= 1,
+        "the refusal must really take the fallback (`jit_step_one` ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable`, and none for any `bs_create_bin`: the \
+         re-execution is the fallback's own interpreter step"
+    );
+    assert_construction_row(
+        "binary all, one byte past the capacity",
+        &overflow,
+        &overflow_args,
+        b"12345678901",
+    );
+
+    // (3) The idempotence pin: the accumulator's own window and payload, after each tier's run.
+    let observe = |module: &Module, args_spec: &[ArgKind], tier: Tier, label: &str| {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let args: Vec<Eterm> = args_spec.iter().map(|spec| spec.build(&mut ctx)).collect();
+        let outcome = machine.run_export_outcome_with_tier(
+            module,
+            atom(module, "f"),
+            args_spec.len() as u32,
+            &args,
+            &mut ctx,
+            tier,
+        );
+        assert!(
+            matches!(&outcome, Ok(RunOutcome::Returned(_))),
+            "{label}: {tier:?}: the build must complete (the room answer is a growth, never a \
+             raise), got {outcome:?}"
+        );
+        let accumulator = machine
+            .x(3)
+            .expect("the fixture keeps the destination accumulator in `x(3)`");
+        // SAFETY: `accumulator` is the live term `x(3)` holds and the run's heap (which owns
+        // its payload) is alive for the whole of this call; `bitstring_parts` only reads the
+        // term's own frozen storage, and `returned_storage_bytes` reads exactly the payload
+        // bytes the term's window spans.
+        let (_, offset, size) = unsafe { beam_term::bitstring::bitstring_parts(accumulator) };
+        (
+            offset,
+            size,
+            returned_storage_bytes(label, "the accumulator", accumulator),
+        )
+    };
+    assert_eq!(
+        observe(
+            &overflow,
+            &overflow_args,
+            Tier::Interpreter,
+            "one byte past the capacity"
+        ),
+        (0, 88, b"12345678901".to_vec()),
+        "the reference run — where no arm is ever attempted — must leave the accumulator with \
+         the family's own single build of the source"
+    );
+    assert_eq!(
+        observe(
+            &overflow,
+            &overflow_args,
+            Tier::BaselineJit,
+            "one byte past the capacity"
+        ),
+        (0, 88, b"12345678901".to_vec()),
+        "the native tier's accumulator must be byte-identical to the reference: an `end` \
+         committed (or a byte copied) before the room guard would publish a window over the \
+         source appended twice"
+    );
+
+    // (4) The boundary-exact control: the same fixture, filling the nine-byte capacity exactly,
+    //     is served by the arm with no deopt at all — so (2)'s refusal is the one-byte overflow.
+    let control = run_counting(&exact, atom(&exact, "f"), &exact_args, Tier::BaselineJit);
+    assert_eq!(
+        control.bytes.as_deref(),
+        Some(&b"123456789"[..]),
+        "the boundary-exact control's payload"
+    );
+    assert_eq!(control.bits, Some(72), "the boundary-exact control's window");
+    assert_eq!(
+        runtime_deopts(&control.counters, "BsCreateBin"),
+        0,
+        "a source that fits the remaining room exactly must be served (`BsCreateBin` deopts \
+         {:?})",
+        control.counters.deopts_by_variant
+    );
+    assert_eq!(
+        control.counters.step_one, 0,
+        "the boundary-exact control must not cost an interpreter step (`jit_step_one` ran {})",
+        control.counters.step_one
+    );
+    assert_eq!(
+        control.bitstr_calls, 2,
+        "one `jit_bitstr` call per `bs_init_writable` and none for any `bs_create_bin`"
+    );
+    assert_eq!(
+        observe(
+            &exact,
+            &exact_args,
+            Tier::BaselineJit,
+            "the boundary-exact fill"
+        ),
+        (0, 72, b"123456789".to_vec()),
+        "the served build fills the accumulator to its whole capacity, which is what the \
+         refused one must not have done"
+    );
+}
+
 /// A declined shape's row: its module plus the arguments it needs.
 struct DeclinedRow {
     label: &'static str,
