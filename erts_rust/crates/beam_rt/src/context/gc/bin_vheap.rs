@@ -362,16 +362,41 @@ pub(crate) fn reclaim(
     machine: &mut Machine,
     slot: &mut Option<OffHeapReclaimer>,
 ) -> Result<usize> {
+    let gate_probe = |tag: &str, machine: &Machine, runtime: &Runtime| {
+        static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let park = PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bin_live: u64 = beam_alloc::registry::all_stats()
+            .into_iter()
+            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
+            .map(|(_, stats)| stats.live_bytes as u64)
+            .sum();
+        let store_handles = runtime.eval_off_heap.binaries().len();
+        let store_bytes: usize = runtime
+            .eval_off_heap
+            .binaries()
+            .iter()
+            .map(beam_alloc::RefcBinary::reserved_bytes)
+            .sum();
+        crate::debug_trace::trace(format_args!(
+            "GATE park={park} pid={pid:?} tag={tag} reservoir={} overhead={} bin_live={bin_live} \
+             store_handles={store_handles} store_bytes={store_bytes}",
+            machine.refc_binaries().len(),
+            machine.off_heap_overhead_bytes(),
+        ));
+    };
     let Some(process) = table.get_mut(pid) else {
+        gate_probe("no-process", machine, runtime);
         return Ok(0);
     };
     // An exempt window published nothing: the parked machine is the authoritative root set, so the
     // process's registers are not this walk's business (and relocating against them would be the
     // very move the exemption declines).
     if process.is_relocation_exempt() {
+        gate_probe("exempt", machine, runtime);
         return Ok(0);
     }
     if !runtime.gc_process_enabled(pid) {
+        gate_probe("gc-disabled", machine, runtime);
         return Ok(0);
     }
     if slot.is_none() {
@@ -384,6 +409,7 @@ pub(crate) fn reclaim(
     };
     reclaimer.observe(machine);
     if !reclaimer.triggered() {
+        gate_probe("not-triggered", machine, runtime);
         return Ok(0);
     }
     // The process's **complete** root set, gathered exactly as
@@ -417,6 +443,7 @@ pub(crate) fn reclaim(
         descend,
     );
     if verdict.declined {
+        gate_probe("valve-declined", machine, runtime);
         runtime.note_foreign_reachable(pid);
         return Ok(0);
     }
@@ -435,6 +462,7 @@ pub(crate) fn reclaim(
         roots.iter(),
     );
     if unscanned {
+        gate_probe("unscanned", machine, runtime);
         runtime.note_foreign_reachable(pid);
         return Ok(0);
     }
@@ -495,8 +523,24 @@ pub(crate) fn reclaim(
             .map(|(_, stats)| stats.live_bytes as u64)
             .sum()
     };
+    // The allocator's own block census: `live_blocks` is the number of `RefcBinary` blocks
+    // currently allocated, so "one per park" is either a live handle somewhere or a
+    // counter/layout asymmetry.
+    let bin_blocks = || -> (u64, u64, u64) {
+        beam_alloc::registry::all_stats()
+            .into_iter()
+            .filter(|(ty, _)| *ty == beam_alloc::AllocType::Binary)
+            .fold((0u64, 0u64, 0u64), |acc, (_, stats)| {
+                (
+                    acc.0 + stats.live_blocks,
+                    acc.1 + stats.alloc_calls,
+                    acc.2 + stats.free_calls,
+                )
+            })
+    };
     let before_bytes = live_bin_bytes();
-    let store_handles: Vec<(usize, u32)> = runtime
+    let before_blocks = bin_blocks();
+    let store_handles: Vec<(usize, usize)> = runtime
         .eval_off_heap
         .binaries()
         .iter()
@@ -508,6 +552,7 @@ pub(crate) fn reclaim(
     });
     {
         let after_bytes = live_bin_bytes();
+        let after_blocks = bin_blocks();
         let store_bytes: usize = runtime
             .eval_off_heap
             .binaries()
@@ -518,9 +563,11 @@ pub(crate) fn reclaim(
         let park = PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::debug_trace::trace(format_args!(
             "PROBE2 park={park} pid={pid:?} released={released} bin_live_before={before_bytes} \
-             bin_live_after={after_bytes} delta={} store_handles={} store_bytes={store_bytes} \
-             store_ptrs={store_handles:?}",
+             bin_live_after={after_bytes} delta={} blocks_before={:?} blocks_after={:?} \
+             store_handles={} store_bytes={store_bytes} store_ptrs={store_handles:?}",
             after_bytes as i64 - before_bytes as i64,
+            before_blocks,
+            after_blocks,
             store_handles.len(),
         ));
     }
