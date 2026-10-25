@@ -155,10 +155,21 @@ fn create_bin(dst: Operand, segments: Vec<Operand>, live: u32) -> Instr {
 /// The unit is `8` and the size operand is `all`, exactly as
 /// [`bitstr_inline_tests::bitstr_module`]'s own `bs_create_bin` fixture spells it.
 fn append_seg(module: &Module, acc: Operand) -> Vec<Operand> {
+    append_seg_unit(module, acc, 8)
+}
+
+/// [`append_seg`] with an explicit append **unit**.
+///
+/// A unit of `1` is what a build appending to an **integer** accumulator emits, and it is the
+/// only unit C's append-*position* gate admits once the accumulator's window end is not a
+/// whole number of bytes (`append_unit_allows`: `unit == 8` requires `end_bits % 8 == 0`, a
+/// unit of ≤ 1 is ungated) — so a second build starting mid-byte must spell unit `1`. It is
+/// also the real `emqx_base62:decode/2` shape.
+fn append_seg_unit(module: &Module, acc: Operand, unit: i64) -> Vec<Operand> {
     vec![
         Operand::Atom(atom(module, "private_append")),
         Operand::Integer(1),
-        Operand::Integer(8),
+        Operand::Integer(unit),
         Operand::Nil,
         acc,
         Operand::Atom(atom(module, "all")),
@@ -754,6 +765,12 @@ fn every_in_scope_construction_shape_stays_native_on_a_cache_free_compile() {
             "integer 64",
             accumulator_module("bscb_native64", &[], |m| int_seg(m, Operand::X(1), 64)),
         ),
+        // The bit-granular route's shape (a field that is not a whole number of bytes) is
+        // lowered by its own sequence, so it carries the same non-vacuity claim.
+        (
+            "integer 6 (bit-granular)",
+            accumulator_module("bscb_native6", &[], |m| int_seg(m, Operand::X(1), 6)),
+        ),
         (
             "string constant",
             accumulator_module("bscb_nativestr", literal, |m| str_seg(m, 0, 3)),
@@ -983,6 +1000,237 @@ fn a_y_accumulator_with_two_y_field_values_writes_every_field_in_order() {
         "every field must land at its own offset"
     );
     assert_eq!(report.bitstr_calls, 1);
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(emitted.contains(&SHAPE_CREATE_BIN));
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A″. The bit-granular route: a field that is not a whole number of bytes
+// ---------------------------------------------------------------------------
+/// The **storage** bytes behind one side's returned bitstring, including the partial final
+/// byte whose bits past the term's own width are *not* part of the term.
+///
+/// [`crate::terms::binary_bytes`] refuses a non-byte-aligned bitstring, so a bit-granular row
+/// cannot use it — and it would not be enough if it could, because the property these rows
+/// exist to prove is what a wrongly masked write leaves in the bits **past** the field (the
+/// residue). [`beam_term::bitstring::bitstring_parts`] hands back the payload base, the
+/// window's start bit and its size, which is enough to read exactly the bytes the term spans.
+fn returned_storage_bytes(label: &str, tier: &str, value: Eterm) -> Vec<u8> {
+    // SAFETY: `value` is the live bitstring term this run just returned, and the run's heap
+    // (which owns the payload) is alive for the whole of this call; `bitstring_parts` only
+    // reads the term's own storage. The bytes read below are exactly the ones the term's
+    // window `[offset, offset + size)` spans, hence inside the payload the machine allocated.
+    let (base, offset, size) = unsafe { beam_term::bitstring::bitstring_parts(value) };
+    let first = offset / 8;
+    let count = (offset % 8 + size).div_ceil(8);
+    assert!(
+        count > 0,
+        "{label}: {tier}: the returned bitstring spans no payload byte at all"
+    );
+    (0..count)
+        .map(|i| {
+            // SAFETY: `first + i < first + count`, i.e. inside the payload bytes the term's
+            // own bit window covers (see above).
+            unsafe { *base.add(first + i) }
+        })
+        .collect()
+}
+
+/// The single payload byte a fresh accumulator's bit-granular build occupies, or a panic
+/// naming the row and the side.
+fn returned_first_payload_byte(
+    label: &str,
+    tier: &str,
+    outcome: &beam_common::Result<RunOutcome>,
+) -> u8 {
+    let value = returned(label, tier, outcome);
+    returned_storage_bytes(label, tier, value)[0]
+}
+
+/// **A″(1) `integer 6` — a bit-granular field — takes the general route and writes exactly
+/// six bits.**
+///
+/// This is the shape `emqx_base62:decode/2` appends per character (a 6-bit base62 digit), and
+/// it is the row that separates the two routes: it is *not* a whole number of bytes, so
+/// [`bitstr_inline::CreateBinShape::route`] must say [`bitstr_inline::Route::BitGranular`] and
+/// the aligned route's `cursor + byte_offset` byte stores cannot be used.
+///
+/// Three properties, each of which a plausible wrong implementation fails:
+///
+/// * the **route** is `BitGranular` (an arm that quietly took the aligned route would write a
+///   whole byte and shift every following field);
+/// * both tiers return a **6-bit** bitstring with the *same* bits as the interpreter — reached
+///   here through the family's own `write_bit_field`, so the two cannot disagree;
+/// * the payload's one byte is `(value & 0x3F) << 2`, i.e. the six bits land in the byte's
+///   **high** six bits and the low two stay zero. That last half is the residue check: the
+///   family's rule clears a byte it enters (`write_payload_bit`'s `position == 0` arm), so a
+///   write that OR-ed into a dirty byte would show up here.
+///
+/// The family helper must **not** run for the construction: `bs_init_writable` has no native
+/// arm (exactly one `jit_bitstr` call per baseline run), so the figure is asserted at exactly
+/// `1`, and `static_deopts` at `0` proves the arm was emitted rather than statically deopted.
+#[test]
+fn an_integer_6_field_takes_the_bit_granular_route_and_writes_exactly_six_bits() {
+    let module = accumulator_module("bscb_int6", &[], |module| {
+        int_seg(module, Operand::X(1), 6)
+    });
+
+    // (1) The one predicate accepts the shape, and it belongs to the general route.
+    let (dst, segments) = create_bin_operands(&module);
+    let shape = bitstr_inline::CreateBinShape::of(&module, &dst, &segments)
+        .expect("a 6-bit integer field must be an inlinable shape");
+    assert_eq!(
+        shape.route(),
+        bitstr_inline::Route::BitGranular,
+        "a field that is not a whole number of bytes must take the bit-granular route"
+    );
+
+    // (2) Value, bit width and payload byte, on both tiers.
+    // 0b10_1011 is the base62-digit shape; 0b11_0101 is a full six bits; 0x1FF proves the
+    // field truncates to its low six bits; 0b1100_0000 has zero low six bits, so a build that
+    // wrote the wrong end of the value shows up as a non-zero byte.
+    for value in [0b10_1011i64, 0b11_0101, 0x1FF, 0b1100_0000] {
+        let expected_byte = ((value & 0x3F) as u8) << 2;
+        let name = atom(&module, "f");
+        with_both_tiers_args(
+            &module,
+            name,
+            &[ArgKind::Int(64), ArgKind::Int(value)],
+            |interpreter, baseline| {
+                assert_same_outcome(
+                    &format!("integer 6 of {value:#b}"),
+                    interpreter,
+                    baseline,
+                    &module.atom_table,
+                );
+                for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                    assert_eq!(
+                        bit_size(returned("integer 6", tier, outcome)),
+                        Some(6),
+                        "{tier}: the build must publish a six-bit window"
+                    );
+                    assert_eq!(
+                        returned_first_payload_byte("integer 6", tier, outcome),
+                        expected_byte,
+                        "{tier}: the six bits must sit in the byte's high six bits, with the low \
+                         two left zero (value {value:#b})"
+                    );
+                }
+            },
+        );
+    }
+
+    // (3) The arm really ran natively: emitted, no static deopt, and the construction reached
+    // the family zero times (`bs_init_writable` alone costs one `jit_bitstr` call).
+    let (emitted, snapshot) = emitted_shapes(&module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the bit-granular shape must be emitted (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    let name = atom(&module, "f");
+    let report = run_counting(
+        &module,
+        name,
+        &[ArgKind::Int(64), ArgKind::Int(0b10_1011)],
+        Tier::BaselineJit,
+    );
+    assert_eq!(
+        report.bits,
+        Some(6),
+        "the counted run's own width (bytes {:?})",
+        report.bytes
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "the construction must take the native arm, never the family (exactly `bs_init_writable`'s \
+         own `jit_bitstr` call is expected)"
+    );
+}
+
+/// **A″(2) A second build starting mid-byte preserves the first build's bits.**
+///
+/// The real accumulator loop appends one 6-bit digit per character, so every build after the
+/// first starts at a bit position that is **not** a byte boundary. That is what
+/// `write_payload_bit`'s `cur_bit == start_bit` mask arm exists for: entering the shared byte
+/// must clear only the bits this build owns, never the ones the previous build already wrote.
+/// A lowering that passed `start_bit == 0` (or that re-derived the cursor as
+/// `end_bits / 8 * 8`) would either wipe the first build's bits or double-write them.
+///
+/// The two builds are `<<V1:6, V2:6>>` by construction, so the expectation is this row's own
+/// — an independent statement of the family's rule, not the implementation's output:
+/// `byte0 = (V1 << 2) | (V2 >> 4)`, `byte1 = (V2 & 0x0F) << 4`.
+///
+/// Both appends spell unit `1`: C's append-*position* gate refuses unit `8` once the window
+/// end is not a whole number of bytes, which is exactly the shape a mid-byte second build
+/// reaches (`emqx_base62:decode/2`).
+#[test]
+fn a_second_build_starting_mid_byte_preserves_the_first_builds_bits() {
+    let module = bin_module("bscb_int6_twice", 3, &[], |module| {
+        let mut first = append_seg_unit(module, Operand::X(0), 1);
+        first.extend(int_seg(module, Operand::X(1), 6));
+        let mut second = append_seg_unit(module, Operand::X(0), 1);
+        second.extend(int_seg(module, Operand::X(2), 6));
+        vec![
+            Instr::BsInitWritable,
+            create_bin(Operand::X(0), first, 2),
+            create_bin(Operand::X(0), second, 3),
+            Instr::Return,
+        ]
+    });
+
+    // Both instructions are the same bit-granular shape (the second one's append group is
+    // still unit 1, so `append_unit_allows(6, 1)` passes and the plan stays inlinable).
+    for instr in &module.functions[0].code {
+        if let Instr::BsCreateBin { dst, segments, .. } = instr {
+            let shape = bitstr_inline::CreateBinShape::of(&module, dst, segments)
+                .expect("a unit-1 6-bit append must be an inlinable shape at any window end");
+            assert_eq!(shape.route(), bitstr_inline::Route::BitGranular);
+        }
+    }
+
+    let name = atom(&module, "f");
+    for (first, second) in [
+        (0b10_1011i64, 0b11_0101i64),
+        (0b0000_0001, 0b1000_0000),
+        (0b111_111, 0b111_111),
+    ] {
+        let expected = vec![
+            (((first & 0x3F) as u8) << 2) | (((second >> 4) & 0x03) as u8),
+            (((second & 0x0F) as u8) << 4),
+        ];
+        with_both_tiers_args(
+            &module,
+            name,
+            &[
+                ArgKind::Int(64),
+                ArgKind::Int(first),
+                ArgKind::Int(second),
+            ],
+            |interpreter, baseline| {
+                let label = format!("{first:#b} then {second:#b}");
+                assert_same_outcome(&label, interpreter, baseline, &module.atom_table);
+                for (tier, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+                    assert_eq!(
+                        bit_size(returned(&label, tier, outcome)),
+                        Some(12),
+                        "{tier}: two six-bit builds make a twelve-bit window"
+                    );
+                    assert_eq!(
+                        returned_storage_bytes(
+                            &label,
+                            tier,
+                            returned(&label, tier, outcome)
+                        ),
+                        expected,
+                        "{tier}: the second build must preserve the first build's bits"
+                    );
+                }
+            },
+        );
+    }
+
     let (emitted, snapshot) = emitted_shapes(&module);
     assert!(emitted.contains(&SHAPE_CREATE_BIN));
     assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
@@ -1422,16 +1670,6 @@ fn declined_shapes_emit_nothing_and_run_on_the_family() {
             bits: 16,
             bytes: Some(subject.to_vec()),
         },
-        // A 6-bit integer — not a whole number of bytes.
-        DeclinedRow {
-            label: "integer 6",
-            module: accumulator_module("bscb_dec_int6", &[], |module| {
-                int_seg(module, Operand::X(1), 6)
-            }),
-            args: vec![ArgKind::Int(64), ArgKind::Int(0b10_1011)],
-            bits: 6,
-            bytes: None,
-        },
         // A float segment.
         DeclinedRow {
             label: "float 64",
@@ -1441,6 +1679,20 @@ fn declined_shapes_emit_nothing_and_run_on_the_family() {
             args: vec![ArgKind::Int(64), ArgKind::Float(1.5)],
             bits: 64,
             bytes: Some(1.5f64.to_be_bytes().to_vec()),
+        },
+        // A **mixed** plan whose route would be bit-granular: a constant `string` copy at a
+        // non-byte-aligned position has no straight-line form, so the whole plan stays on the
+        // family (`<<V:6, "a">>` is 14 bits).
+        DeclinedRow {
+            label: "integer 6 + string",
+            module: accumulator_module("bscb_dec_int6_str", b"a", |module| {
+                let mut fields = int_seg(module, Operand::X(1), 6);
+                fields.extend(str_seg(module, 0, 1));
+                fields
+            }),
+            args: vec![ArgKind::Int(64), ArgKind::Int(0b10_1011)],
+            bits: 14,
+            bytes: None,
         },
     ];
 

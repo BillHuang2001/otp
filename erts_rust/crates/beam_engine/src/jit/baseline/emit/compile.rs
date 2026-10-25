@@ -606,8 +606,9 @@ fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
             // reserve their own guarded sequence ([`BS_PATH_BYTES`]), `bs_match`
             // additionally charges one [`BS_MATCH_COMMAND_BYTES`] per command, because its
             // whole static command list is lowered inline, and `bs_create_bin` charges one
-            // [`CREATE_BIN_PATH_BYTES`] because its field stores are emitted one byte at a
-            // time. A shape the emitter's predicate declines
+            // [`CREATE_BIN_PATH_BYTES`] because its field writes are emitted one byte (aligned
+            // route) or one helper call (bit-granular route) at a time. A shape the emitter's
+            // predicate declines
             // emits zero bytes and falls through to `emit_bitstr`, so these budgets
             // over-estimate for it — the safe direction for a capacity estimate.
             Instr::BsMatch { commands, .. } => {
@@ -714,19 +715,32 @@ const BS_MATCH_COMMAND_BYTES: usize = 320;
 ///
 /// The emitted sequence is straight-line code whose length grows with the shape's fields
 /// and tail bytes, so its budget is one flat figure rather than [`BS_PATH_BYTES`]'s
-/// per-instruction one. Closed-form worst case: the shape caps at `MAX_FIELDS` (16) fields
-/// and `MAX_TAIL_BYTES` (256) tail bytes, so 16 × 33 B of `is_small` guards + 256 × (7 load
-/// + 4 shift + 7 store) B of field stores + the base sequence (the destination guard, the
-/// helper call — `7 + 8 + 20 + 13` B — the cursor test, the `end` commit ≈ 59 B, the
-/// destination store ≤ 12 B and the fallback interpreter step ≈ 150 B) ≈ 7.3 kB.
+/// per-instruction one. Both routes share the shape caps — `MAX_FIELDS` (16) fields and
+/// **`MAX_TAIL_BYTES` (256) tail bytes, i.e. `ceil(tail_bits / 8) <= 256`** (the cap is
+/// expressed in bytes so a bit-granular build whose fields sum to 6 bits costs one, not
+/// zero) — and therefore both fit inside this one figure:
 ///
-/// The `Y` forms add one **unguarded** address re-derivation (3 instructions ≈ 24 B) plus a
-/// load per post-helper use: at most `1 accumulator × 2 uses + MAX_FIELDS (16) field values ×
-/// 1 use + 1 destination × 1 use = 19` sites × 4 instructions ≈ 19 × 30 B ≈ 0.6 kB, against an
-/// up-front guard of ≈ 40 B per `Y` slot, so the `Y` increment stays under 1.6 kB. The total
-/// closed-form worst case is therefore ≈ 9 kB, still comfortably inside this figure. Also
-/// added to each instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating
-/// would turn a large module into a `SystemLimit` compile error.
+/// * **Aligned route** (every field a whole number of bytes: 16 × 33 B of `is_small` guards
+///   + 256 × (7 load + 4 shift + 7 store) B of byte stores + the base sequence (the
+///   destination guard, the append-door call — `7 + 8 + 20 + 13` B — the cursor test, the
+///   `end` commit ≈ 59 B, the destination store ≤ 12 B and the fallback interpreter step
+///   ≈ 150 B) ≈ 7.3 kB, and its `Y` forms add one **unguarded** address re-derivation (3
+///   instructions ≈ 24 B) plus a load per post-helper use: at most `1 accumulator × 2 uses +
+///   MAX_FIELDS (16) field values × 1 use + 1 destination × 1 use = 19` sites × 4
+///   instructions ≈ 0.6 kB, against an up-front guard of ≈ 40 B per `Y` slot, so the `Y`
+///   increment stays under 1.6 kB ⇒ ≈ **9 kB closed-form worst case**;
+/// * **General (bit-granular) route** (no byte stores, so no tail-byte term at all): the
+///   up-front guards (16 × ≈ 39 B of `is_small`, plus one ≈ 40 B window guard per `Y`
+///   operand — at most `1 accumulator + 16 field values + 1 destination = 18` ⇒ ≈ 1.4 kB) +
+///   one general-door call (`7S + 8 + 10·3 + 13` B) + 16 × one positioned five-argument
+///   helper call (`7S + 8 + 10·5 + 13` B, plus the inline position store's ≈ 24 B and its
+///   `test`/`jcc` pair's 9 B ⇒ `7S + 104` B) + the shared `end` commit and destination store
+///   + the ≈ 150 B fallback tail, i.e. ≈ 1.4 kB + 0.1 kB + 2.2 kB + 0.2 kB ≈ **4 kB closed
+///   form** (and a plan with fewer than 16 fields pays proportionally less).
+///
+/// The larger of the two, ≈ 9 kB, is still comfortably inside this figure. Also added to each
+/// instruction's own [`INSTRUCTION_BYTES`]. Deliberately loose: under-estimating would turn a
+/// large module into a `SystemLimit` compile error.
 const CREATE_BIN_PATH_BYTES: usize = 16_384;
 
 #[cfg(test)]
