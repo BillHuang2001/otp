@@ -393,8 +393,8 @@ Every expected byte vector in the newer suites was taken from the system `erl`
 (OTP 29.1.1 / erts-17.1) — never invented.
 Gate: the whole-crate suite is authoritative —
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
---no-fail-fast` must stay green (2201 passed / 0 failed / 9 ignored across its 85 targets).
-This family's subset is `... -p beam_engine --lib families::bitstrings` (138 passed), and the build
+--no-fail-fast` must stay green (2469 passed / 0 failed / 10 ignored across its 85 targets).
+This family's subset is `... -p beam_engine --lib families::bitstrings` (204 passed), and the build
 `... -p beam_engine --all-targets` is warning-free. Re-run these for the live counts.
 **Differential evidence:** `erts_rust/tools/differential` was run per-case over the whole `binary/`
 group plus every bitstring/binary-shaped corpus id

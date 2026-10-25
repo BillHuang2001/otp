@@ -144,6 +144,10 @@ fn the_compiled_function_runs_the_export_natively() {
 
     let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
+    // The inline prologue position store's destination: the one word the block writes its
+    // own `(func, pc)` into before executing its instruction. Taken before the `machine`
+    // borrow below, exactly as the driver does.
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
     let machine_ptr: *mut Machine = &mut machine;
     let ctx_ptr = &mut ctx as *mut dyn ExecutionContext;
     let mut rt = JitRuntime {
@@ -168,6 +172,7 @@ fn the_compiled_function_runs_the_export_natively() {
         resume_entry: std::ptr::null(),
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
 
     let word = code
@@ -693,6 +698,10 @@ fn a_native_entry_declares_the_register_write_extent() {
 
     let mut ctx = MinimalContext::new();
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
+    // The inline prologue position store's destination: the one word the block writes its
+    // own `(func, pc)` into before executing its instruction. Taken before the `machine`
+    // borrow below, exactly as the driver does.
+    let current_code = std::ptr::addr_of_mut!(machine.current_code);
     let machine_ptr: *mut Machine = &mut machine;
     let ctx_ptr = &mut ctx as *mut dyn ExecutionContext;
     let mut rt = JitRuntime {
@@ -712,6 +721,7 @@ fn a_native_entry_declares_the_register_write_extent() {
         resume_entry: std::ptr::null(),
         tables: crate::jit::baseline::runtime::EntryTables::NONE,
         compiled: std::ptr::null(),
+        current_code,
     };
 
     let word = code
