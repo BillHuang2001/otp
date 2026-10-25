@@ -412,7 +412,8 @@ A matched-N `ns_per_call` comparison against a runtime that never collects is no
   bounded-iterations-per-slice pre-emption of the allocating shape (`yields + 1 == slices`,
   `slices == ceil(reductions / budget)`, at most `4 000 / 3 = 1 333` iterations per slice),
   and the residual tuple `(slices, yields, waits, collections) == (2, 1, 0, 1)` on one young space, with
-  `major` deliberately **unpinned** (`0` on the native rows, `1` on the interpreter control: the door asks
+  `major` deliberately **unpinned** (`0` on the native rows, `1` / `1` / `3` on the interpreter control at
+  N = 798 / 2 000 / 20 000: the door asks
   for a young-only minor and escalates only when the promotion cannot fit the mature region, so the kind of
   that one firing is a consequence of the mature generation's sizing, not a property of the door). It
   asserts the native baseline tier (and fails loudly if `BEAM_RT_TIER` pins any other
