@@ -158,6 +158,10 @@
 //!    taken exactly when a boundary's promotion does not fit the region) and pins each of its two
 //!    branches, and the sampled rows are asserted to exercise **both**. The pre-emption rate does
 //!    not grow with N: the per-call figures are flat over a 4x step.
+//!    A pre-emption ends a slice but adds no collection of its own: the N = 20 000 row takes 15
+//!    boundaries and still reads exactly `1 + N/2 = 10 001` collections, so the boundary's firing
+//!    is not additional to the admission cadence — which is why the same `1 + N/K` law covers the
+//!    single-slice rows and the sliced ones.
 //! 4. **The honest residual: this shape's own work can never end a slice.** `native_reds` prices
 //!    its iterations through `spend` (a `spend` never refuses, and once the budget is gone it is a
 //!    silent no-op — it does not even count), so past the budget the loop keeps running
