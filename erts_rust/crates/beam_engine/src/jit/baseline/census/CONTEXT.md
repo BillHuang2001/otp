@@ -232,11 +232,12 @@ The no-arm rows: `bs_get_tail` 3 694, `bs_get_binary2` 972, `bs_get_utf16` 487,
 `bs_get_utf32` 9, `bs_skip_utf16` 4, `bs_skip_utf32` 4.
 `bs_create_bin` is a **two-way** arm like the eight before it: of its **1 922** corpus instances
 **84** are inlined and **1 838** refused, split **1 791** `other` (the shape predicate's own
-declines — a plain/later-position or absent `private_append`, an append unit that does not divide 8,
+declines — a plain/later-position or absent `private_append`, an append unit outside `1`/`2`/`4`/`8`,
 a `binary`/`float`/`utf*` segment, an `all` or runtime (`Dynamic`) size, a `little`/`signed`/`native`
-flag, a partial-byte or wider-than-a-word field, a `StrT` window the module cannot resolve, a `Y`
-accumulator or field value, a plan with no fields, a field list whose byte offsets do not sum to the
-plan's tail, the `MAX_FIELDS`/`MAX_TAIL_BYTES` caps) and **47** literal-area subject; the
+flag, a zero-width or wider-than-a-machine-word field, a `StrT` window the module cannot resolve, a
+plan with no fields, a field list whose **bit** offsets do not sum to the plan's `tail_bits`, a
+`Route::BitGranular` plan carrying a `string` (`Field::ConstBytes`) field, the
+`MAX_FIELDS`/`MAX_TAIL_BYTES` caps) and **47** literal-area subject; the
 instrument's own `inlined | refused | opcode` table carries that accounting for every arm
 (`bs_get_integer2`'s 232 instances are all refused, `bs_skip_bits2`'s 3 of 1 080 inline).
 **Re-derived at `b832285989`: the `bs_create_bin` row moved and nothing else did** — its inlined

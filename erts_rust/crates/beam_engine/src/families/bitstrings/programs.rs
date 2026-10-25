@@ -227,7 +227,6 @@ impl BitstrPrograms {
     /// The number of slots the table holds (`0` before its first allocation) —
     /// test-only, so a test can prove the table is allocated lazily.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn allocated_slots(&self) -> usize {
         self.slots.len()
     }
