@@ -17,7 +17,7 @@ The per-doc sections add only their suite's own specifics (which tools, the 30 s
 
 ## Committed `.beam` images
 
-All 27 committed images, by name (byte sizes are the committed files' own):
+All 28 committed images, by name (byte sizes are the committed files' own):
 
 | image | bytes | described under |
 |---|---|---|
@@ -48,6 +48,7 @@ All 27 committed images, by name (byte sizes are the committed files' own):
 | `pt_gc.beam` | 1 076 | `## GC fixtures` |
 | `churn.beam` | 1 000 | `## GC fixtures` |
 | `vp.beam` | 1 104 | `## GC fixtures` |
+| `pk.beam` | 864 | `../parked_exit_reclaim.rs` |
 
 ## Committed oracle fixtures
 
@@ -238,6 +239,13 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp reds_boundary.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic reds_boundary.erl )
 cp "$SCRATCH/gen/reds_boundary.beam" reds_boundary.beam
+
+# pk.beam (864 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_pk_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp pk.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic pk.erl )
+cp "$SCRATCH/gen/pk.beam" pk.beam
 ```
 `port_suspend.beam` and `reds_boundary.beam` need no option beyond `+deterministic`: each one's `Code` chunk is byte-identical to its earlier non-deterministic build.
 Only `CInf` (`[{version,"10.0.6"}]`), `Dbgi` (`{debug_info_v1,erl_abstract_code,{none,[deterministic]}}`) and — for `reds_boundary.beam` — the `Line` chunk's file-name entry change with the flag.
