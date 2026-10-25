@@ -23,8 +23,10 @@
 //! The `dist/` group pins the handshake, node visibility, one `erpc:call/4` term image, a
 //! UTF-8 atom and the first two-VM self-pair. This group widens that with the rest of the
 //! `DOP_*` traffic a real link carries — the message families (`DOP_SEND`/`DOP_REG_SEND`),
-//! repeated and ordered exchanges, pid externalization, payload round trips, and the
-//! **refusal** paths (`DOP` handshake rejections that must answer `pang` instead of hanging).
+//! repeated and ordered exchanges, pid externalization, payload round trips, the inbound signal
+//! families (`DOP_LINK`/`DOP_EXIT`/`DOP_EXIT2`, `DOP_MONITOR_P`/`DOP_MONITOR_P_EXIT`,
+//! `DOP_UNLINK_ID`/`DOP_UNLINK_ID_ACK`), and the **refusal** paths (`DOP` handshake rejections
+//! that must answer `pang` instead of hanging).
 //!
 //! # Mechanism: every case is a two-VM **self-pair**
 //!
@@ -68,6 +70,9 @@
 //! | `link_exit_crosses_the_wire` | the **inbound `DOP_EXIT` reply** really reaches a linked local process: the peer's worker dies `boom` and the trapping client gets `{'EXIT', Pid, boom}` with a pid of the peer's node |
 //! | `monitor_down_crosses_the_wire` | the **inbound `DOP_MONITOR_P_EXIT` reply** really reaches the watcher: the DOWN carries the client's **own** reference, a pid of the peer's node and the peer worker's compound reason |
 //! | `unlink_id_ack_is_consumed_without_retiring_the_link` | the **inbound `DOP_UNLINK_ID_ACK` reply** is consumed, not refused: the far side's link record drops, no EXIT arrives, and the node is still connected (`nodes()` is 1) and answering |
+//! | `inbound_link_exit_delivers_the_peers_reason` | the **inbound `DOP_LINK`** is recorded (the client's own `links` list gains a pid of the peer's node) and the linked peer's death delivers `{'EXIT', Pid, boom}` with the peer's real reason, never `noproc` |
+//! | `inbound_monitor_gets_a_down_when_the_watched_process_dies` | the **inbound `DOP_MONITOR_P`** on a client-side process yields `{'DOWN', Ref, process, Pid, {down_reason, 42}}` for the remote watcher, with the boxed reason intact |
+//! | `inbound_exit2_kill_is_untrappable_killed` | the **inbound `DOP_EXIT2`** with reason `kill` terminates a trapping client-side process that has **no** link to the peer: the watcher's `DOWN` reason is `killed` and no trappable exit is ever delivered |
 //!
 //! The payload identity check is deliberately *relational*: the peer computes `phash2/1` and
 //! `byte_size(term_to_binary/1)` of what it received and the client compares them with its
@@ -95,37 +100,50 @@
 //!
 //! # The measured signal families: what works, in which direction, and what cannot be pinned
 //!
-//! Every claim below was measured by hand as a two-VM self-pair (client + a peer of the same
-//! program) on OTP 29.1.1 / erts-17.1 and `beam_rt` (the `gate.sh` build). `divergences.md` §A.5
-//! is the ledger; this paragraph exists so no future agent re-measures it. The three inbound
-//! **reply** signals were re-measured when their cases landed and all three now agree — the
-//! `link`/`monitor`/`unlink` receipt paths were an older runtime's gaps:
+//! Every claim below was measured as a two-VM self-pair (client + a peer of the same program) on
+//! OTP 29.1.1 / erts-17.1 and `beam_rt` (the `gate.sh` build); `divergences.md` §A.5 is the
+//! ledger.
+//! All four inbound signal families are delivered and pinned, each by its own case, in **both**
+//! directions:
 //!
-//! * **`DOP_EXIT` (a link exit) is delivered.** Client links to a peer-side worker that then
-//!   dies `boom`: under `process_flag(trap_exit, true)` the client receives
-//!   `{'EXIT', Pid, boom}` with **a pid of the peer's node**, and `erlang:link/1` on the remote
-//!   pid returns `true`. Pinned by `link_exit_crosses_the_wire`. The *same* `process_info(self(),
-//!   links)` read is **VM-internal and differs** (2 entries on the oracle, 1 on the runtime for
-//!   the `-eval` process), which is why the case classifies the signal and never the link count.
-//!   Not re-measured, and therefore not pinned: the mirror direction (the *peer* linking to a
-//!   client-side process), a *spawned linker*, and an untrapped exit killing the far process.
-//! * **`DOP_MONITOR_P_EXIT` (a DOWN) is delivered.** A client monitoring a peer-side worker by
-//!   **pid** receives `{'DOWN', Ref, process, Pid, Reason}` whose reference is the client's
-//!   **own** monitor reference, whose object is a pid of the peer's node, and whose reason is the
-//!   compound term the worker died with (`{gone, 42}`). Pinned by
-//!   `monitor_down_crosses_the_wire`. Not re-measured, and therefore not pinned: a monitor of a
-//!   registered remote **name**, a monitor of an already-**dead** remote pid (the oracle's
-//!   immediate `noproc` DOWN), the mirror direction, and `demonitor`.
+//! * **`DOP_EXIT` (a link exit) is delivered.** Outbound: the client links a peer-side worker
+//!   that then dies `boom`, and under `process_flag(trap_exit, true)` it receives
+//!   `{'EXIT', Pid, boom}` with **a pid of the peer's node** (`link_exit_crosses_the_wire`).
+//!   Inbound: a peer-side *spawned linker* links to the client's own process, whose
+//!   `process_info(self(), links)` then holds a pid of the peer's node, and the linker's death
+//!   delivers `{'EXIT', Pid, boom}` with the peer's real reason, never `noproc`
+//!   (`inbound_link_exit_delivers_the_peers_reason`).
+//!   That `links` read is classified by **which pid it holds**, never by its length: the length
+//!   is VM-internal and differs (2 entries on the oracle, 1 on the runtime for the `-eval`
+//!   process).
+//! * **`DOP_MONITOR_P` / `DOP_MONITOR_P_EXIT` (a DOWN) are delivered.** Outbound: a client
+//!   monitoring a peer-side worker by **pid** receives `{'DOWN', Ref, process, Pid, Reason}`
+//!   whose reference is the client's **own** monitor reference, whose object is a pid of the
+//!   peer's node, and whose reason is the compound term the worker died with (`{gone, 42}`)
+//!   (`monitor_down_crosses_the_wire`).
+//!   Inbound: the peer monitors a **client-side** process (the `DOP_MONITOR_P` on the wire),
+//!   which then dies with the boxed reason `{down_reason, 42}`; the peer's DOWN carries its own
+//!   reference, a pid of the client's node and that reason intact, and the peer reports the
+//!   classification back (`inbound_monitor_gets_a_down_when_the_watched_process_dies`).
+//!   Still not pinned: a monitor of a registered remote **name**, `demonitor`, and an inbound
+//!   `DOP_DEMONITOR_P`.
+//!   A monitor of an **already-dead** remote pid stays a typed capability gap: its `noproc` DOWN
+//!   needs a reply channel that `beam_dist`'s `InboundSink` does not have.
+//! * **`DOP_EXIT2` (a remote `erlang:exit/2`) is delivered, and `kill` stays untrappable.** The
+//!   peer fires `erlang:exit(Pid, kill)` at a client-side process that traps exits and holds no
+//!   link to the peer, so only the plain exit signal can terminate it; the local monitor's DOWN
+//!   reason is `killed`, and a trappable exit would instead have left the process alive
+//!   reporting the signal it saw — `trapped=false` asserts that nothing arrived that way.
+//!   Pinned by `inbound_exit2_kill_is_untrappable_killed`.
 //! * **`DOP_UNLINK_ID` / `DOP_UNLINK_ID_ACK` round-trip.** The peer really records the inbound
 //!   link (`peer_saw_link`), the client's `erlang:unlink/1` really drops the **far** side's
 //!   record (`peer_dropped`, read back through the peer's own `process_info(self(), links)`),
 //!   no `'EXIT'` follows, and the node is still connected and answering afterwards
 //!   (`nodes=1`, a second question answered) — so the inbound ACK is consumed rather than
-//!   refused. Pinned by `unlink_id_ack_is_consumed_without_retiring_the_link`.
-//! * **`erlang:exit(RemotePid, Reason)` is not pinned here.** The wire family is `DOP_EXIT2`
-//!   (a plain exit signal, not the *link* exit `DOP_EXIT` this group pins), and the strongest
-//!   observable it offers — an **untrapped** remote process dying — is a peer-internal fact no
-//!   client-side script can read back, so there is no VM-stable line to compare.
+//!   refused.
+//!   Pinned by `unlink_id_ack_is_consumed_without_retiring_the_link`.
+//!   `unlink/1` has no other emittable ack form: the zero-id ACK below is unreachable from
+//!   either side's public API.
 //! * **A pid identity round trip.** `Pid =:= self()` after the pid went to the peer and came
 //!   back: `true` on the oracle, `false` on the Rust runtime, which is also why an `alias/0`
 //!   reference written by the peer is never delivered. `pid_crosses_the_wire_as_a_foreign_pid`
@@ -336,9 +354,47 @@ const SCRIPT_MONITOR_DOWN: &str = r#"try register(dxcli, self()), Peer = list_to
 /// did not cost the connection (`nodes()` is still one, and the second question was answered).
 const SCRIPT_UNLINK_ID: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, process_flag(trap_exit, true), erlang:send({dxpeer, Peer}, {hello, self()}), M0 = receive X -> X after 10000 -> timeout end, Got = is_tuple(M0) andalso tuple_size(M0) =:= 2 andalso element(1, M0) =:= list_to_atom("peer_pid"), Linked = case Got of true -> erlang:link(element(2, M0)); false -> no_peer end, timer:sleep(300), erlang:send({dxpeer, Peer}, {linksq, self()}), M1 = receive Y -> Y after 15000 -> timeout end, Before = is_tuple(M1) andalso tuple_size(M1) =:= 2 andalso element(1, M1) =:= list_to_atom("links_back") andalso element(2, M1), Unlinked = case Got of true -> erlang:unlink(element(2, M0)); false -> no_peer end, timer:sleep(300), erlang:send({dxpeer, Peer}, {linksq, self()}), M2 = receive Z -> Z after 15000 -> timeout end, AfterOk = is_tuple(M2) andalso tuple_size(M2) =:= 2 andalso element(1, M2) =:= list_to_atom("links_back"), After = AfterOk andalso element(2, M2), Nodes = length(nodes()), io:format("pong=~p got_peer=~p linked=~p peer_saw_link=~p unlinked=~p second_reply=~p peer_dropped=~p nodes=~p~n", [Pong, Got, Linked, Before, Unlinked, AfterOk, AfterOk andalso not After, Nodes]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
 
+/// The **inbound-link** peer: a spawned linker process links to the client (`DOP_LINK` on the
+/// wire *before* its ack, which carries `link/1`'s own return value), then — on the client's
+/// `{die}` — exits `boom`, so the trapping client's `'EXIT'` carries the peer's real reason. The
+/// spawned process keeps the exit signal's producer alive while it is written.
+const PEER_LINK_EXIT: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), receive {link_me, From} -> C = spawn(fun() -> L = erlang:link(From), erlang:send(From, {linked, L}), receive die -> exit(boom) after 25000 -> exit(no_die) end end), receive {die} -> erlang:send(C, die) after 25000 -> halt(2) end after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **inbound-link** client: trap exits, hand its pid over, wait for the peer's `link/1`
+/// ack, wait for its own `links` list to hold a pid of the **peer's** node (the recorded
+/// inbound `DOP_LINK`), then ask the peer's linker to die and classify the
+/// `{'EXIT', Pid, Reason}` — reason `boom`, pid foreign.
+const SCRIPT_LINK_EXIT_INBOUND: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, process_flag(trap_exit, true), erlang:send({dxpeer, Peer}, {link_me, self()}), Ack = receive A -> A after 10000 -> timeout end, Acked = is_tuple(Ack) andalso tuple_size(Ack) =:= 2 andalso element(1, Ack) =:= list_to_atom("linked") andalso element(2, Ack) =:= true, Linked = lists:any(fun(_) -> timer:sleep(50), case process_info(self(), links) of {links, L} -> lists:any(fun(X) -> is_pid(X) andalso erlang:node(X) =:= Peer end, L); _ -> false end end, lists:seq(1, 40)), erlang:send({dxpeer, Peer}, {die}), Msg = receive X -> X after 20000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 3, io:format("pong=~p acked=~p links=~p exit=~p tag=~p reason=~p foreign=~p~n", [Pong, Acked, Linked, Ok, Ok andalso element(1, Msg) =:= list_to_atom("EXIT"), Ok andalso element(3, Msg) =:= boom, Ok andalso is_pid(element(2, Msg)) andalso erlang:node(element(2, Msg)) =:= Peer]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **inbound-monitor** peer: arm a monitor on the client-side process (`DOP_MONITOR_P`),
+/// ack with the monitor's own reference check, then classify the `'DOWN'` it receives and send
+/// the booleans back to the client's registered name.
+const PEER_MONITOR_INBOUND: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), receive {watch, Pid} -> Ref = erlang:monitor(process, Pid), N = erlang:node(Pid), erlang:send({dxcli, N}, {watching, is_reference(Ref)}), D = receive X -> X after 10000 -> timeout end, Ok = is_tuple(D) andalso tuple_size(D) =:= 5, erlang:send({dxcli, N}, {saw_down, Ok, Ok andalso element(1, D) =:= list_to_atom("DOWN"), Ok andalso element(3, D) =:= process, Ok andalso is_reference(element(2, D)), Ok andalso is_pid(element(4, D)), Ok andalso element(5, D) =:= {down_reason, 42}}) after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **inbound-monitor** client: spawn a doomed process, hand its pid to the peer, wait for
+/// the peer's monitor ack, let the process die with a boxed reason, then print the peer's
+/// classification of the `'DOWN'` it got — every field a boolean.
+const SCRIPT_MONITOR_INBOUND: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Doomed = spawn(fun() -> receive {go} -> exit({down_reason, 42}) after 15000 -> ok end end), erlang:send({dxpeer, Peer}, {watch, Doomed}), Ack = receive A -> A after 10000 -> timeout end, Acked = is_tuple(Ack) andalso tuple_size(Ack) =:= 2 andalso element(1, Ack) =:= list_to_atom("watching") andalso element(2, Ack) =:= true, erlang:send(Doomed, {go}), Msg = receive X -> X after 20000 -> timeout end, Ok = is_tuple(Msg) andalso tuple_size(Msg) =:= 7 andalso element(1, Msg) =:= list_to_atom("saw_down"), io:format("pong=~p acked=~p down=~p tag=~p type=~p ref=~p pid=~p reason=~p~n", [Pong, Acked, Ok, Ok andalso element(3, Msg), Ok andalso element(4, Msg), Ok andalso element(5, Msg), Ok andalso element(6, Msg), Ok andalso element(7, Msg)]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **inbound-exit2** peer: fire `erlang:exit(Pid, kill)` at the client-side process — no
+/// link is ever made, so only the `DOP_EXIT2` path can terminate it.
+const PEER_KILL: &str = r#"try register(dxpeer, self()), timer:sleep(200), io:format("PEER-READY ~p~n", [node()]), receive {kill_it, Pid} -> erlang:exit(Pid, kill) after 25000 -> halt(2) end, timer:sleep(3000), halt(0) catch Cls:Rs -> io:format("PEEREXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
+/// The **inbound-exit2** client: a doomed process that traps exits (so a *trappable* signal
+/// would leave it alive and reporting the signal it saw), a **local** monitor on it, and the
+/// pid handed to the peer. The one message it classifies is either the `'DOWN'` (`kill` ⇒ the
+/// untrappable `killed`) or the doomed process's own report.
+///
+/// The report is tagged `doomed_report` (not `trapped`) and its payload is only called a trap
+/// when it really is a 3-tuple `'EXIT'`, so a *timeout* in the doomed process can never
+/// masquerade as a trapped exit; the doomed process's wait is shorter than the client's, so a
+/// lost signal is reported as `trapped=false down=false` rather than as a hang.
+const SCRIPT_KILL_INBOUND: &str = r#"try register(dxcli, self()), Peer = list_to_atom("dxpeer{nonce}" ++ lists:nthtail(length("dxcli{nonce}"), atom_to_list(node()))), Pong = case lists:any(fun(_) -> case net_adm:ping(Peer) of pong -> true; _ -> timer:sleep(50), false end end, lists:seq(1, 40)) of true -> pong; false -> pang end, Doomed = spawn(fun() -> process_flag(trap_exit, true), M = receive T -> T after 15000 -> no_signal end, erlang:send(dxcli, {doomed_report, M}) end), erlang:monitor(process, Doomed), erlang:send({dxpeer, Peer}, {kill_it, Doomed}), Msg = receive X -> X after 20000 -> timeout end, Down = is_tuple(Msg) andalso tuple_size(Msg) =:= 5 andalso element(1, Msg) =:= list_to_atom("DOWN"), Reported = case is_tuple(Msg) andalso tuple_size(Msg) =:= 2 andalso element(1, Msg) =:= list_to_atom("doomed_report") of true -> element(2, Msg); false -> none end, Trapped = is_tuple(Reported) andalso tuple_size(Reported) =:= 3 andalso element(1, Reported) =:= list_to_atom("EXIT"), io:format("pong=~p trapped=~p down=~p tag=~p type=~p ref=~p pid=~p reason=~p~n", [Pong, Trapped, Down, Down andalso element(1, Msg) =:= list_to_atom("DOWN"), Down andalso element(3, Msg) =:= process, Down andalso is_reference(element(2, Msg)), Down andalso is_pid(element(4, Msg)), Down andalso element(5, Msg) =:= killed]), halt(0) catch Cls:Rs -> io:format("EXC ~p ~p~n", [Cls, Rs]), halt(1) end."#;
+
 /// The widened A.5 live two-node group: self-pair cases over the `DOP_*` message families,
-/// the payload shapes, the refusal paths and the three inbound **reply** signals
-/// (`DOP_EXIT`, `DOP_MONITOR_P_EXIT`, `DOP_UNLINK_ID_ACK`).
+/// the payload shapes, the refusal paths, the three inbound **reply** signals
+/// (`DOP_EXIT`, `DOP_MONITOR_P_EXIT`, `DOP_UNLINK_ID_ACK`) and the three inbound **request**
+/// signals (`DOP_LINK`, `DOP_MONITOR_P`, `DOP_EXIT2`).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         Case {
@@ -806,6 +862,89 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "dist_extra/inbound_link_exit_delivers_the_peers_reason",
+            description: "a peer's inbound DOP_LINK is recorded (the client's own links list \
+                          gains a pid of the peer's node) and the linked peer's death delivers \
+                          {'EXIT',Pid,boom} with the peer's real reason, never noproc",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LINK_EXIT_INBOUND],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_LINK_EXIT_INBOUND],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_LINK_EXIT],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong acked=true links=true exit=true tag=true reason=true foreign=true",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/inbound_monitor_gets_a_down_when_the_watched_process_dies",
+            description: "an inbound DOP_MONITOR_P on a local process yields a \
+                          {'DOWN',Ref,process,Pid,Reason} for the remote watcher when that \
+                          process dies, with the boxed reason intact",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_MONITOR_INBOUND],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_MONITOR_INBOUND],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_MONITOR_INBOUND],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong acked=true down=true tag=true type=true ref=true pid=true \
+                     reason=true",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "dist_extra/inbound_exit2_kill_is_untrappable_killed",
+            description: "an inbound DOP_EXIT2 with reason kill terminates the local process \
+                          even though it traps exits: the watcher's DOWN reason is killed and \
+                          no trappable exit is ever delivered",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Command(CommandRun {
+                oracle: CommandSpec {
+                    program: CommandProgram::Oracle,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_KILL_INBOUND],
+                },
+                rust: CommandSpec {
+                    program: CommandProgram::Rust,
+                    args: &["-noshell", "-sname", CLIENT_NODE, "-eval", SCRIPT_KILL_INBOUND],
+                },
+                peer: Some(PeerRun {
+                    args: &["-noshell", "-sname", PEER_NODE, "-eval", PEER_KILL],
+                    ready_prefix: "PEER-READY",
+                }),
+            }),
+            golden: Golden {
+                stdout: Some(
+                    "pong=pong trapped=false down=true tag=true type=true ref=true pid=true \
+                     reason=true",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -867,6 +1006,18 @@ mod tests {
             "dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link",
             "pong=pong got_peer=true linked=true peer_saw_link=true unlinked=true second_reply=true peer_dropped=true nodes=1",
         ),
+        (
+            "dist_extra/inbound_link_exit_delivers_the_peers_reason",
+            "pong=pong acked=true links=true exit=true tag=true reason=true foreign=true",
+        ),
+        (
+            "dist_extra/inbound_monitor_gets_a_down_when_the_watched_process_dies",
+            "pong=pong acked=true down=true tag=true type=true ref=true pid=true reason=true",
+        ),
+        (
+            "dist_extra/inbound_exit2_kill_is_untrappable_killed",
+            "pong=pong trapped=false down=true tag=true type=true ref=true pid=true reason=true",
+        ),
     ];
 
     /// The ids in registry order (the corpus order is part of the report).
@@ -889,6 +1040,9 @@ mod tests {
         "dist_extra/link_exit_crosses_the_wire",
         "dist_extra/monitor_down_crosses_the_wire",
         "dist_extra/unlink_id_ack_is_consumed_without_retiring_the_link",
+        "dist_extra/inbound_link_exit_delivers_the_peers_reason",
+        "dist_extra/inbound_monitor_gets_a_down_when_the_watched_process_dies",
+        "dist_extra/inbound_exit2_kill_is_untrappable_killed",
     ];
 
     /// Every case is a `Command` **self-pair**: oracle side the resolved `erl`, Rust side the
@@ -1200,6 +1354,76 @@ mod tests {
         assert!(
             !client.contains("process_info(self(), links)"),
             "unlink_ack: the client must not observe its own link list (it differs per VM)"
+        );
+    }
+
+    /// The three inbound-**signal** cases really drive their signal: the link client traps
+    /// exits and waits for a **peer** pid to appear in its own `links` list (the recorded
+    /// inbound `DOP_LINK`) before asking the linker to die; the monitor client spawns the
+    /// watched process, hands it over and only then lets it die with the boxed reason; and the
+    /// kill client's doomed process traps exits (so a trappable signal would be reported) while
+    /// **no** `erlang:link/1` is ever made, so only the inbound `DOP_EXIT2` can end it.
+    /// A future edit that silently drops one of those steps would leave a case that still prints
+    /// the golden without exercising the signal — this test is what makes that impossible.
+    #[test]
+    fn the_inbound_signal_cases_drive_their_signal() {
+        let cases = group();
+        let expr_of = |id: &str| {
+            let case = cases.iter().find(|case| case.id == id).unwrap_or_else(|| panic!("{id}"));
+            let CaseKind::Command(run) = &case.kind else {
+                panic!("{id} must be a Command case");
+            };
+            let peer = run.peer.expect("every case here carries a peer leg");
+            (args_of(run.oracle.args, "-eval"), args_of(peer.args, "-eval"))
+        };
+
+        let (client, peer) = expr_of("dist_extra/inbound_link_exit_delivers_the_peers_reason");
+        for needle in [
+            "process_flag(trap_exit, true)",
+            "process_info(self(), links)",
+            "erlang:node(X) =:= Peer",
+            "element(3, Msg) =:= boom",
+        ] {
+            assert!(client.contains(needle), "inbound_link: the client must contain {needle:?}");
+        }
+        // The peer's **spawned** process makes the link (the inbound `DOP_LINK`), reports
+        // `link/1`'s own return value, and only then dies `boom` when asked.
+        for needle in ["spawn(fun() ->", "erlang:link(From)", "{linked, L}", "exit(boom)"] {
+            assert!(peer.contains(needle), "inbound_link: the peer must contain {needle:?}");
+        }
+
+        let (client, peer) = expr_of(
+            "dist_extra/inbound_monitor_gets_a_down_when_the_watched_process_dies",
+        );
+        for needle in ["spawn(fun() ->", "exit({down_reason, 42})", "{watch, Doomed}"] {
+            assert!(client.contains(needle), "inbound_monitor: the client must contain {needle:?}");
+        }
+        // The peer is the **watcher**: it arms the monitor on the client-side pid (the inbound
+        // `DOP_MONITOR_P`) and classifies the `'DOWN'` it receives.
+        for needle in [
+            "erlang:monitor(process, Pid)",
+            "element(5, D) =:= {down_reason, 42}",
+            "element(1, D) =:= list_to_atom(\"DOWN\")",
+        ] {
+            assert!(peer.contains(needle), "inbound_monitor: the peer must contain {needle:?}");
+        }
+
+        let (client, peer) = expr_of("dist_extra/inbound_exit2_kill_is_untrappable_killed");
+        for needle in [
+            "process_flag(trap_exit, true)",
+            "erlang:monitor(process, Doomed)",
+            "{kill_it, Doomed}",
+            "element(5, Msg) =:= killed",
+        ] {
+            assert!(client.contains(needle), "inbound_exit2: the client must contain {needle:?}");
+        }
+        assert!(
+            !client.contains("erlang:link("),
+            "inbound_exit2: the client must never link — only DOP_EXIT2 can end the process"
+        );
+        assert!(
+            peer.contains("erlang:exit(Pid, kill)"),
+            "inbound_exit2: the peer fires the untrappable kill"
         );
     }
 

@@ -97,13 +97,14 @@
 //! so a `enif_raise_exception` in `load` is swallowed and the load still succeeds (`1`).
 //!
 //! Every `nif_rt/…` golden is the integer the **oracle** prints, verified per case with
-//! `differential run <id>`. A **third** sub-block (selectors `16`-`29`) drives the stateful
+//! `differential run <id>`. A **third** sub-block (selectors `16`-`30`) drives the stateful
 //! families the A.3 C ABI also offers — `enif_send` in both the `NULL`-env and the `msg_env`
 //! form, `enif_monitor_process` with its `down` callback / `enif_demonitor_process` /
 //! `enif_compare_monitors` / `enif_make_monitor_term`, `enif_select` on a real pipe
 //! descriptor, the destructor of a term-exposed resource, `enif_make_map_from_arrays`'s
-//! duplicate-key refusal, `enif_binary_to_term`'s consumed-byte report and
-//! `enif_term_to_binary` of a local fun. Each is a live side effect, so the case waits for it
+//! duplicate-key refusal, `enif_binary_to_term`'s consumed-byte report,
+//! `enif_term_to_binary` of a local fun, and `enif_port_command` on a **live driver port** the
+//! Erlang side opened. Each is a live side effect, so the case waits for it
 //! (a deadlined `receive`, a bounded poll) and reduces the whole observation to one integer —
 //! the harness's two-signal `unsupported` classification still applies to the Rust side.
 //!
@@ -525,7 +526,7 @@ const NIF_RT_MODULE_SOURCE: &str = r#"-module(nif_rt).
          self_etf/0, send_null/2, send_msg/2, mon_make/0, mon_arm/1, mon_arm_b/1,
          mon_compare/0, mon_term/0, mon_demonitor/0, mon_downs/0, mon_down_pid_matches/1,
          sel_arm/0, sel_poke/0, gc_probe/0, gc_count/0, map_dup/0, map_nodup/0,
-         b2t_trailing/1]).
+         b2t_trailing/1, port_command_probe/2]).
 
 %% One stub per entry in the library's ErlNifFunc table: erlang:load_nif/2 refuses a library
 %% whose functions do not exist (and are not exported) in the loading module.
@@ -553,6 +554,10 @@ gc_count() -> erlang:nif_error(not_loaded).
 map_dup() -> erlang:nif_error(not_loaded).
 map_nodup() -> erlang:nif_error(not_loaded).
 b2t_trailing(_) -> erlang:nif_error(not_loaded).
+%% Named `port_command_probe` and not `port_command`: a local definition of the BIF's name is an
+%% overridden auto-import (a compiler warning), and the calls into the library are external
+%% anyway (`nif_rt:port_command_probe/2`).
+port_command_probe(_, _) -> erlang:nif_error(not_loaded).
 %% The `load`-callback case loads its own library (the only fixture in that case's dir), so it
 %% must be matched before the ordinary branch.
 classify(50) ->
@@ -641,7 +646,11 @@ dispatch(27) -> map_code({nif_rt:map_dup(), nif_rt:map_nodup()});
 dispatch(28) -> b2t_code(b2t_case());
 %% enif_term_to_binary of a local (closure) fun is the NEW_FUN_EXT image, byte-identical to
 %% the module's own term_to_binary/1.
-dispatch(29) -> fun_code(local_fun_case()).
+dispatch(29) -> fun_code(local_fun_case());
+%% enif_port_command from inside the NIF really commands a **live driver port** the Erlang side
+%% opened: the C's success `1` and a driver reply byte-identical to the one
+%% `erlang:port_command/2` gets for the same opcode.
+dispatch(30) -> port_command_code(port_command_case()).
 
 %% Every reduction maps one measured observation to a single integer, with a distinct code per
 %% failure mode, so a divergence is a diffable integer rather than a boolean. The goldens are
@@ -727,6 +736,18 @@ fun_code({112, {module, _}, {arity, 1}, false}) -> 2;
 fun_code({112, _, _, _}) -> 3;
 fun_code({Tag, _, _, _}) when is_integer(Tag) -> 4;
 fun_code(_) -> 9.
+
+%% `enif_port_command` on a live driver port: the C's `1` and a reply byte-identical to the one
+%% `erlang:port_command/2` gets for the same opcode — and non-empty, so agreement needs **both**
+%% routes to have really reached the driver. The bytes themselves are the driver's interior
+%% (`ram_file_drv`'s `NUMBER` reply for `RAM_FILE_SIZE`), so only the relation is pinned.
+port_command_code({1, Ref, Ref}) when is_binary(Ref), Ref =/= <<>> -> 1;
+port_command_code({1, _Ref, timeout}) -> 2;
+port_command_code({1, timeout, _ViaNif}) -> 3;
+port_command_code({1, <<>>, _ViaNif}) -> 4;
+port_command_code({1, _Ref, _ViaNif}) -> 5;
+port_command_code({_Code, _, _}) -> 6;
+port_command_code(_) -> 9.
 
 %% A child parks in `receive`, the parent sends to it through the NIF, and the child echoes
 %% what it got back: `{Sent, Delivered}`, with `timeout` when nothing arrived. Both receives
@@ -853,6 +874,26 @@ local_fun_case() ->
              Bin =:= term_to_binary(F)};
         Other -> Other
     end.
+
+%% Two **fresh** `ram_file_drv` ports command the same opcode — `RAM_FILE_SIZE`, one `NUMBER`
+%% reply — through the two routes: `erlang:port_command/2` (the reference bytes) and
+%% `enif_port_command` from inside the NIF. Answers `{C_success, Reference, ViaNif}`; each
+%% receive is deadlined, so a route that delivered nothing answers `timeout` instead of hanging.
+port_command_case() ->
+    Op = <<37>>,
+    RefPort = open_port({spawn_driver, "ram_file_drv"}, [binary]),
+    true = erlang:port_command(RefPort, Op),
+    Reference = receive {RefPort, {data, R}} -> iolist_to_binary(R)
+                after 5000 -> timeout
+                end,
+    _ = erlang:port_close(RefPort),
+    NifPort = open_port({spawn_driver, "ram_file_drv"}, [binary]),
+    Code = nif_rt:port_command_probe(NifPort, Op),
+    ViaNif = receive {NifPort, {data, N}} -> iolist_to_binary(N)
+             after 5000 -> timeout
+             end,
+    _ = erlang:port_close(NifPort),
+    {Code, Reference, ViaNif}.
 %% A raise inside the `load` callback is *not* a refusal: the C's nif_load_nif never consults
 %% the callback env's exception slot (erl_nif.c:5001-5008), so the load still returns `ok`.
 raise_code(ok) -> 1;
@@ -1492,6 +1533,20 @@ static ERL_NIF_TERM b2t_trailing(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     return enif_make_tuple_from_array(env, terms, 2);
 }
 
+/* ---- enif_port_command on a live driver port ------------------------------------------------ */
+
+/* `enif_port_command` on a **real** port the Erlang side opened (a `ram_file_drv` driver port),
+   with the message term in the calling env (the C's `msg_env == NULL` form). Answers the C's
+   success int: `1` accepted, `0` refused (a runtime that cannot answer maps its own refusal
+   here, so the module's reduction sees a plain integer either way). */
+static ERL_NIF_TERM port_command_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPort to;
+    (void) argc;
+    if (!enif_get_local_port(env, argv[0], &to))
+        return enif_make_atom(env, "not_a_local_port");
+    return enif_make_int(env, enif_port_command(env, &to, NULL, argv[1]) ? 1 : 0);
+}
+
 static ErlNifFunc nif_rt_funcs[] = {
     {"probe", 1, probe, 0},
     {"probe_term", 2, probe_term, 0},
@@ -1516,7 +1571,8 @@ static ErlNifFunc nif_rt_funcs[] = {
     {"gc_count", 0, gc_count, 0},
     {"map_dup", 0, map_dup, 0},
     {"map_nodup", 0, map_nodup, 0},
-    {"b2t_trailing", 1, b2t_trailing, 0}
+    {"b2t_trailing", 1, b2t_trailing, 0},
+    {"port_command_probe", 2, port_command_probe, 0}
 };
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_rt`), so this
    library may only be loaded as `nif_rt`. */
@@ -1984,6 +2040,13 @@ pub(crate) fn group() -> Vec<Case> {
             "nif_rt/term_to_binary_of_a_local_fun_is_new_fun_ext",
             "enif_term_to_binary of a closure emits the NEW_FUN_EXT image with the closure's module and arity, byte-identical to term_to_binary/1",
             &[29],
+            "1",
+            NIF_RT,
+        ),
+        rt_case(
+            "nif_rt/port_command_commands_a_live_driver_port",
+            "enif_port_command on a real ram_file_drv port the Erlang side opened answers 1 and the driver's reply is byte-identical to the one erlang:port_command/2 gets for the same opcode",
+            &[30],
             "1",
             NIF_RT,
         ),
