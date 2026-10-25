@@ -408,7 +408,7 @@ exit-3 gaps that no case pins are noted below alongside the divergences, for com
   divergence, not a capability gap. Owner: `beam_rt` / `beam_io`.
 - **The `inet:getstat/1` *send*-side counters are pinnable** — after two completed 3-byte writes both
   sides answer `{ok,[{send_cnt,2},{send_oct,6}]}` (`{ok,[{send_cnt,0},{send_oct,0}]}` before them) —
-  the **recv**-side pair measures a drain and not the write path: for one 3-byte write drained in
+  but the **recv**-side pair measures a drain and not the write path: for one 3-byte write drained in
   full the reader answers `{recv_cnt,1}`/`{recv_oct,3}` and the writer `{recv_cnt,0}`/`{recv_oct,0}`
   on both sides (measured 3 of 3 identical), but `recv_cnt` counts the driver's delivery events, so
   it moves with how the arriving bytes coalesce (6 bytes read 5-then-1 answered `{1,5}` then
