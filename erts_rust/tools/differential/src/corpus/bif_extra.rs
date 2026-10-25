@@ -46,18 +46,20 @@
 //! expected `%T` strings live in the expression. A golden of `ok [true,…]` still pins them:
 //! the *oracle* must reproduce it (`check_golden`), so a wrong rendering is corpus drift.
 //!
-//! # Why five `process_info` items are absent from this group
+//! # Why `backtrace` is the only absent item
 //!
-//! `parent`, `label`, `priority_messages`, `magic_ref`, `garbage_collection_info` (and
-//! `backtrace`) are **typed capability gaps** in the runtime — `UNSUPPORTED_ITEMS` in
-//! `crates/beam_rt/src/native/memory/mod.rs`, where each names the missing accessor — so the
-//! query exits `3` with a `beam_rt: unsupported: process_info: <item> (…)` diagnostic. A case
-//! over one of them would classify as `unsupported`, never as an agreement, and this group
-//! asks for agreements only. `last_calls` *is* answered (always `false`), which is why it is
-//! pinnable **only** in its no-buffer state: a process with an *armed* `save_calls` buffer
-//! (`[]` when nothing has been recorded yet, a list of `{M,F,A}`/`send`/`receive` entries
-//! otherwise) is a runtime-side gap too. Both are reported to the runtime, never recorded
-//! here and never allowlisted.
+//! `backtrace` is the one **typed capability gap** in the `process_info/2` item set —
+//! `UNSUPPORTED_ITEMS` in `crates/beam_rt/src/native/memory/mod.rs`, where it names the
+//! missing accessor — so a query over it exits `3` with a
+//! `beam_rt: unsupported: process_info: backtrace (…)` diagnostic. A case over it classifies
+//! as `unsupported`, never as an agreement, and this group asks for agreements only.
+//!
+//! Every other item probed here is served, `parent`, `label`, `priority_messages`,
+//! `magic_ref` and `garbage_collection_info` included, and so are all three `last_calls`
+//! states: `false` unarmed, a list while `save_calls` is armed, `false` again after the
+//! disarm. The armed ring's **contents** are still never pinned — only its shape per entry and
+//! the presence of the `send` pseudo entry — because the ring is a documented superset of the
+//! oracle's byte-code peephole (this runtime records every call it makes).
 //!
 //! # Why the module-run route (and not only `-eval`)
 //!
@@ -139,7 +141,7 @@ const SOURCE: &str = r#"-module(diff_bif_extra).
          pi_position/0, pi_location/0, pi_stack/0, pi_exact/0, pi_shape/0,
          pi_keys/0, pi_registered_keys/0, pi_messages/0, pi_dict/0,
          pi_links/0, pi_monitors/0, pi_dead/0, pi_badarg/0, pi_list_order/0,
-         mod_info/1]).
+         pi_last_calls_ring/0, mod_info/1]).
 
 agree(Obs, Exp) when length(Obs) =/= length(Exp) -> -1;
 agree(Obs, Exp) -> length([ok || {O, E} <- lists:zip(Obs, Exp), O =:= E]).
@@ -335,15 +337,41 @@ pi_list_order() ->
     agree(erlang:process_info(P, [priority, priority, trap_exit]),
           [{priority, normal}, {priority, normal}, {trap_exit, false}]).
 
+%% A parked child that armed a `save_calls` ring before it parked.
+armed() ->
+    Parent = self(),
+    P = spawn(fun() -> process_flag(save_calls, 20), Parent ! ready,
+                          receive stop -> ok end end),
+    ready = receive ready -> ready after 2000 -> timeout end,
+    P.
+
+entry_shape(E) when is_atom(E) ->
+    lists:member(E, [send, 'receive', timeout]);
+entry_shape(E) when is_tuple(E) ->
+    tuple_size(E) =:= 3 andalso is_atom(element(1, E))
+        andalso is_atom(element(2, E)) andalso is_integer(element(3, E));
+entry_shape(_) ->
+    false.
+
+pi_last_calls_ring() ->
+    P = armed(),
+    {last_calls, Ring} = erlang:process_info(P, last_calls),
+    P ! stop,
+    agree([is_list(Ring), lists:member(send, Ring),
+           lists:member({erlang, send, 2}, Ring),
+           lists:all(fun entry_shape/1, Ring)],
+          [true, true, true, true]).
+
 mod_info(0) ->
     agree(lists:sort(?MODULE:module_info(exports)),
           [{fun_captured_env, 0}, {fun_local_env, 0}, {fun_local_index_items, 0},
            {fun_local_items, 0}, {fun_pid_item, 0}, {fun_whole_list, 0},
            {mod_info, 1}, {module_info, 0}, {module_info, 1}, {pi_badarg, 0},
            {pi_dead, 0}, {pi_dict, 0}, {pi_exact, 0}, {pi_keys, 0},
-           {pi_links, 0}, {pi_list_order, 0}, {pi_location, 0},
-           {pi_messages, 0}, {pi_monitors, 0}, {pi_position, 0},
-           {pi_registered_keys, 0}, {pi_shape, 0}, {pi_stack, 0}]);
+           {pi_last_calls_ring, 0}, {pi_links, 0}, {pi_list_order, 0},
+           {pi_location, 0}, {pi_messages, 0}, {pi_monitors, 0},
+           {pi_position, 0}, {pi_registered_keys, 0}, {pi_shape, 0},
+           {pi_stack, 0}]);
 mod_info(1) ->
     agree([?MODULE:module_info(module)], [diff_bif_extra]);
 mod_info(2) ->
@@ -627,6 +655,17 @@ pub(crate) fn group() -> Vec<Case> {
             "pi_list_order",
             "3",
         ),
+        module_case0(
+            "bif_extra/process_info_last_calls_records_the_send_pseudo_entry",
+            "last_calls of an armed parked child — queried from its parent, so the query itself \
+             is the parent's call — is a ring holding the child's `Parent ! ready` send, both \
+             as the {erlang,send,2} triple and as the bare `send` pseudo entry, and every entry \
+             is an {M,F,A} triple or one of send/'receive'/timeout (the ring's exact contents \
+             are a documented superset of the oracle's, so they are never pinned)",
+            &[BeamAsm, OtpApps],
+            "pi_last_calls_ring",
+            "4",
+        ),
         // --- Module:module_info/1 of a compiled module (A.7) -------------------------------
         module_case(
             "bif_extra/module_info_exports_of_a_compiled_module",
@@ -636,7 +675,7 @@ pub(crate) fn group() -> Vec<Case> {
             "mod_info",
             1,
             &[0],
-            "23",
+            "24",
         ),
         module_case(
             "bif_extra/module_info_module_attribute",
@@ -713,12 +752,83 @@ pub(crate) fn group() -> Vec<Case> {
             "bif_extra/process_info_self_last_calls_without_a_buffer",
             "process_info/2's last_calls of a process with no saved-calls buffer is the atom \
              `false` — both for the default (never armed) state and after an explicit \
-             process_flag(save_calls, 0), which is the only last_calls state this runtime \
-             answers (an armed buffer's list of recorded calls is a runtime-side gap)",
+             process_flag(save_calls, 0) disarm",
             "{erlang:process_info(self(), last_calls), \
              begin process_flag(save_calls, 0), \
              erlang:process_info(self(), last_calls) end}",
             "ok {{last_calls,false},{last_calls,false}}",
+        ),
+        info_case(
+            "bif_extra/process_info_parent_is_init_and_never_self",
+            "process_info/2's parent item is the `init` process for the `-eval` root (so it is \
+             never the process itself) and the *spawner* for a spawned child (classified into \
+             booleans: a pid is per-VM-start)",
+            "(fun() -> {parent, Root} = erlang:process_info(self(), parent), \
+             RootIsInit = Root =:= whereis(init), \
+             RootIsSelf = element(2, erlang:process_info(self(), parent)) =:= self(), \
+             Parent = self(), \
+             P = spawn(fun() -> Parent ! ready, receive stop -> ok end end), \
+             ready = receive ready -> ready after 2000 -> timeout end, \
+             {parent, Spawner} = erlang:process_info(P, parent), \
+             {RootIsInit, RootIsSelf, Spawner =:= Parent, Spawner =:= P} end)()",
+            "ok {true,false,true,false}",
+        ),
+        info_case(
+            "bif_extra/process_info_label_follows_the_process_dictionary",
+            "process_info/2's label item is `undefined` for a process that never set one and \
+             answers the value put under the '$process_label' dictionary key",
+            "{erlang:process_info(self(), label), \
+             begin put('$process_label', my_label), \
+             erlang:process_info(self(), label) end}",
+            "ok {{label,undefined},{label,my_label}}",
+        ),
+        info_case(
+            "bif_extra/process_info_priority_messages_is_a_boolean",
+            "process_info/2's priority_messages item is the boolean `false` for a plain \
+             process — a boolean, never a 0/1 integer",
+            "{erlang:process_info(self(), priority_messages), \
+             is_boolean(element(2, erlang:process_info(self(), priority_messages))), \
+             is_integer(element(2, erlang:process_info(self(), priority_messages)))}",
+            "ok {{priority_messages,false},true,false}",
+        ),
+        info_case(
+            "bif_extra/process_info_magic_ref_is_empty",
+            "process_info/2's magic_ref item is the empty list in both the atom form and the \
+             item-list form (the /2 atom form is deliberately unwrapped)",
+            "{erlang:process_info(self(), magic_ref), \
+             erlang:process_info(self(), [magic_ref])}",
+            "ok {{magic_ref,[]},[{magic_ref,[]}]}",
+        ),
+        info_case(
+            "bif_extra/process_info_garbage_collection_info_key_order",
+            "process_info/2's garbage_collection_info item is the eleven-pair proplist in the \
+             emulator's documented order with an integer value per key (the figures themselves \
+             are per-VM and never pinned)",
+            "(fun() -> {garbage_collection_info, Info} = \
+             erlang:process_info(self(), garbage_collection_info), \
+             {length(Info), [K || {K, _} <- Info], [is_integer(Val) || {_, Val} <- Info]} \
+             end)()",
+            "ok {11,[old_heap_block_size,heap_block_size,mbuf_size,recent_size,stack_size,\
+             old_heap_size,heap_size,bin_vheap_size,bin_vheap_block_size,bin_old_vheap_size,\
+             bin_old_vheap_block_size],[true,true,true,true,true,true,true,true,true,true,true]}",
+        ),
+        info_case(
+            "bif_extra/process_info_last_calls_three_states",
+            "last_calls has three states — `false` unarmed, a *list* while process_flag \
+             (save_calls, N) is armed and `false` again after the save_calls, 0 disarm — and \
+             process_flag(save_calls, N) answers the previous ring size, refusing 10001 and -1 \
+             with error:badarg (the armed ring's contents are a superset of the oracle's, so \
+             only its list-ness is pinned)",
+            "(fun() -> Unarmed = erlang:process_info(self(), last_calls), \
+             Prev = process_flag(save_calls, 10), \
+             {last_calls, Armed} = erlang:process_info(self(), last_calls), \
+             Prev2 = process_flag(save_calls, 0), \
+             After = erlang:process_info(self(), last_calls), \
+             Bad = [try process_flag(save_calls, N) of Back -> Back \
+                    catch Cls:Rs -> {Cls, Rs} end || N <- [10001, -1, 10000]], \
+             {Unarmed, Prev, is_list(Armed), Prev2, After, Bad} end)()",
+            "ok {{last_calls,false},0,true,10,{last_calls,false},\
+             [{error,badarg},{error,badarg},0]}",
         ),
         bif_case(
             "bif_extra/function_exported_after_ensure_loaded",
@@ -878,6 +988,7 @@ mod tests {
         "bif_extra/process_info_dead_pid_answers_undefined",
         "bif_extra/process_info_refusals_are_badarg",
         "bif_extra/process_info_item_list_keeps_order_and_duplicates",
+        "bif_extra/process_info_last_calls_records_the_send_pseudo_entry",
         "bif_extra/module_info_exports_of_a_compiled_module",
         "bif_extra/module_info_module_attribute",
         "bif_extra/module_info_attributes_carry_the_vsn",
@@ -888,6 +999,12 @@ mod tests {
         "bif_extra/process_info_self_trap_exit_round_trip",
         "bif_extra/process_info_self_dictionary_after_put",
         "bif_extra/process_info_self_last_calls_without_a_buffer",
+        "bif_extra/process_info_parent_is_init_and_never_self",
+        "bif_extra/process_info_label_follows_the_process_dictionary",
+        "bif_extra/process_info_priority_messages_is_a_boolean",
+        "bif_extra/process_info_magic_ref_is_empty",
+        "bif_extra/process_info_garbage_collection_info_key_order",
+        "bif_extra/process_info_last_calls_three_states",
         "bif_extra/function_exported_after_ensure_loaded",
         "bif_extra/is_builtin_of_a_declared_and_a_bogus_bif",
         "bif_extra/get_module_info_module_attribute",
@@ -1016,7 +1133,8 @@ mod tests {
 
     /// Nothing in this group may block: no `timer:sleep/1` anywhere, no unbounded `receive` in an
     /// expression, and — in the embedded module — every `receive` other than the parked child's
-    /// own `receive stop -> ok end` must carry an `after` arm.
+    /// own `receive stop -> ok end` must carry an `after` arm. The quoted atom `'receive'` is a
+    /// `last_calls` ring entry name, not a receive expression, so it is not looked at.
     #[test]
     fn no_case_waits_on_a_message_without_a_timeout() {
         assert!(
@@ -1024,11 +1142,12 @@ mod tests {
             "the embedded module must not sleep"
         );
         for (idx, line) in SOURCE.lines().enumerate() {
-            if !line.contains("receive") {
+            let unquoted = line.replace("'receive'", "'ring-entry'");
+            if !unquoted.contains("receive") {
                 continue;
             }
             assert!(
-                line.contains(" after ") || line.contains("receive stop -> ok end"),
+                unquoted.contains(" after ") || unquoted.contains("receive stop -> ok end"),
                 "SOURCE line {}: an unbounded receive that is not the parked child: {line:?}",
                 idx + 1
             );
@@ -1072,7 +1191,7 @@ mod tests {
             .iter()
             .filter(|case| matches!(case.kind, CaseKind::Module(_)))
             .collect();
-        assert_eq!(modules.len(), 23, "the group's module-run half is pinned");
+        assert_eq!(modules.len(), 24, "the group's module-run half is pinned");
         for case in modules {
             let CaseKind::Module(run) = case.kind else {
                 unreachable!("filtered above")
