@@ -111,8 +111,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (~10,800 passed / 0 failed; ~45 min wall on a loaded
-  host, so run it in crate chunks when iterating).
+  --workspace --no-fail-fast`. The suite is green (**~13,300 passed / 0 failed** across all 15 crates;
+  ~45 min wall on a loaded host, so run it in crate chunks when iterating).
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
   toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
@@ -124,7 +124,10 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   → pass; `1` a real `mismatch` → fails the job; `2` env/usage error or an unparsable report → fails the
   job; `3` no mismatch but the **ratchet** must be updated (an unrecorded capability gap appeared, or a
   recorded one closed and went stale) → **fails the job**. Parity claims are therefore CI-checked, not
-  manual-only.
+  manual-only. Two further jobs close the blind spots of a debug-only run: `rust-erts-release` builds
+  and tests `beam_abi`/`beam_io`/`beam_rt` in `--release` (the profile where an `noalias`-driven lost
+  store is visible), and `rust-erts-cranelift` tests `-p beam_engine --features jit-cranelift` so a
+  target no default-feature build compiles cannot rot.
 - **Vertical slice WORKS and now spans real stdlib:** `beam_loader` + `beam_engine` + `beam_rt` load a
   real `.beam` (produced by the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` →
   `5`, `slice:fib/1 10` → `55`. Every non-obsolete `genop.tab` opcode is now modelled (the whole-OTP
@@ -132,7 +135,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3322 agree=3321 mismatch=0
+- **Compatibility gate (`tools/differential`) — PASSES: `summary: total=3463 agree=3462 mismatch=0
   unsupported=1 skipped=0`** → `gate.sh` exits 0. **No case disagrees.** The single recorded
   capability gap (`known-gaps.txt`, the ratchet allowlist) is `wire/new_fun_ext_encode` (A.5, an
   `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`). `gate.sh` is
@@ -145,21 +148,30 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   The full sweep is time-boxed: a serial `gate.sh` boots every CLI case (~2.5 s each, >100 min), so
   the gate-equivalent route is `differential run <case-id>` at 16-way parallelism
   (`compare.rs::verdict_with` folds the oracle-vs-golden drift check into every verdict).
-- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 648
-  keys = 556 declared + 92 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
-  `MemoryHook::memory`, …): **345 are served in-crate** and **211 are seam-backed** (a typed
-  `unsupported` until a host installs the hook); the seam union is 241 keys, 30 of them undeclared table
-  members. The census is re-derived from code and **pinned by `beam_bifs/tests/roster_audit.rs`**, so it
-  cannot drift again.
+- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry **667**
+  keys = 556 declared + 111 stdlib fast-path keys) through defaulted host seams (`RuntimeHooks::call`,
+  `MemoryHook::memory`, …): **367 are served in-crate** and **189 are seam-backed** (a typed
+  `unsupported` until a host installs the hook); the seam union is **222** keys (226 − 4 shared by two
+  crates), 33 of them undeclared table members. The census is re-derived from code and **pinned by
+  `beam_bifs/tests/roster_audit.rs` + `tests/seam_census.rs`**, so it cannot drift again.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
-  in `tools/bench/results/`, newest = `m15-*`) — read it there rather than duplicating numbers. The
-  current record is **m15** and names both sides (sys = OTP 29.1.1/erts-17.1; rust = `beam_rt` at its
-  default baseline-JIT tier). Its marginals use a **paired** estimator: each round samples the N-op and
-  the 0-op pass back to back and takes the median paired difference, which replaced a non-interleaved
-  schedule that had overstated every gap by up to ~56×. Headline rust/sys ratios: `etf_roundtrip`
-  **2.18×**, `send_recv_plain` **2.95×**, `send_recv` **5.26×**, `list_walk` **7.95×**, `ets_copy`
-  **11.22×**, `gc_bound churn` **15.18×**, `foreign` **34.8×–86.3×**, `slice` ≈**2.12×**; startup
-  p50 / p99 **2.53× / 2.12×**; `erlang:memory(total)` **2.74× lower** on rust. Measurable target
+  in `tools/bench/results/`) and in `BOTTLENECKS.md` §0, which names the **three non-interchangeable
+  records** and says which one is current — read it there rather than duplicating numbers. The current
+  record is **m20** and names both sides (sys = OTP 29.1.1/erts-17.1; rust = `beam_rt` at its default
+  baseline-JIT tier). Its marginals use a **paired** estimator: each round samples the N-op and the
+  0-op pass back to back and takes the median paired difference, which replaced a non-interleaved
+  schedule that had overstated every gap by up to ~56×. **m20 headline rust/sys ratios** (m19 in
+  parentheses): startup p50 **1.559×** (2.519) / p99 **1.553×** (2.513); compute loop **1.102×**
+  (1.706); `list_walk` **5.827×** (7.991); `gc_bound/churn` **5.564×** (14.114); `binary_append`
+  **11.340×** (16.250); `copy_bound` **1.785/6.477/3.080/2.890×**; `gc_class` **5.725/6.524/15.262×**;
+  `foreign` **8.572/11.595/13.906/16.976×** — **6.58/6.96/12.08/13.26×** after the bitstring inline
+  set landed; `file_io/handle_rw` **0.287×** (rust 3.5× faster) and `write_read` **0.458×** (rust
+  wins); `slice` wall **1.410×**, baseline peak RSS **0.949×** (rust's boot now peaks *below* the
+  oracle's), `erlang:memory(total)` **0.197×**. The honest residuals are published, not hidden: the
+  tier glue (`Machine::step_instruction_inner` / `enter_in_block` / `jit_step_one`, 18–25 % of
+  samples), allocator churn (14–22 %) and the GC root walk (14–27 %) are the next levers, and a
+  self-recursive BIF-free tail loop that never pre-empts grows its off-heap payload without a park
+  (bounded by `BEAM_RT_TIER=interpreter`) — see `BOTTLENECKS.md`. Measurable target
   projects: `cowboy` **198 476 req/s** (p99 0.75 ms), `erlc` **9.919 files/s**, `elixir`
   **4.709 files/s**, `khepri` (`rebar3 eunit` 81.0 s) and `plb` (dotnet 9 via the driver's
   version-aware scan, wall 67.7 s); `emqx` skips honestly (`skipped(emqx-requires-otp-28)` — the

@@ -14,16 +14,19 @@ entry says so explicitly — those are not cross-runtime ratios.
 
 ## 0. Which record is current (read this before quoting a number)
 
-Three records exist and they are **not interchangeable**. Two of them measure the same rows under
-very different host load, which is why the same workload can appear at two ratios.
+Four records exist and they are **not interchangeable**. They measure the same rows under
+very different host load, which is why the same workload can appear at several ratios.
 
 | record | where | when | 1-min load | authoritative for |
 |---|---|---|---|---|
-| **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | **the current rust-vs-sys ratios** for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
+| **m20** | `tools/bench/results/` + the m20 table in `CONTEXT.md` §Status | 2026-10-22 | 1.9–5.6 | **the current rust-vs-sys ratios for every `tools/bench` workload** (start-up, `slice`, `list_walk`, `copy_bound`, `gc_bound`, `gc_class`, `foreign`, `binary_append`, `file_io`, `ram_file`, the memory rows, the external targets), measured after the bitstring inline set, the atom-table `fork`, the `div`/`rem` inline and the port-timer fixes |
+| **Q** (quiet) | `crates/beam_engine/MEASURED.md` §*Cross-runtime record and the binary A/B* | 2026-10-20 | **1.02–2.37** | the quietest per-row ratios for `list_walk`, `etf_roundtrip`, `ets_copy`, `send_recv`, `send_recv_plain`, `churn`, all four `foreign/*`; and the code-change A/B |
 | **m17** | `tools/bench/RESULTS.md` (session `m17`, 2026-10-18) | 2026-10-18 | 3 → 92 | start-up p50/p99, `slice`, the memory rows, `binary_append`'s last **full-record** figure, the external targets |
 | **fresh** | measured by hand while writing this file (§1.3), **no `out/` copy archived** | now | 161 → 181 | only what it says: one `binary_append` single round on a heavily loaded host — a hand measurement, not a record |
 
-**Q supersedes m17 for the rows it measures.** Concrete examples of the difference, all
+**m20 supersedes m17 and Q for the rows it measures** (it is later, and it is the only record taken
+after the last four code changes); **Q stays authoritative only for the rows m20 did not re-run**.
+Concrete examples of the difference, all
 `rust`/`sys`:
 
 | row | m17 (loaded) | **Q (quiet, current)** |

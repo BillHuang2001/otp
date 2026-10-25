@@ -5,6 +5,68 @@ major data-structure refactorings, and algorithmic changes. It is a coarse, huma
 of *decisions and structural changes*, complementing `git log` (which holds every line-level change).
 
 Format: one entry per major change — date, area, what changed and why. Newest first.
+---
+## 2026-10-22 — The C-ABI aliasing contract, the bitstring inline set, the off-heap prune valve, and one shared MD5 core
+Scope: the batch that turned four measured hazards into structural rules. The headline
+**architectural/algorithmic** changes are (a) both foreign C-ABI environments (`DriverEnv`,
+`NifEnv`) now expose `&self` accessors over an interior-mutable host, because a transmuted
+`*mut dyn Host` held alongside a live caller reference lets LLVM's `noalias` **silently drop the
+foreign callback's store in `--release` only** (a lost store that survived a year of debug-only CI);
+(b) the baseline JIT inlines sixteen bitstring shapes, so the `foreign/*` kernels become compiled
+code rather than a generic per-instruction loop; (c) the off-heap reservoir's prune predicate now
+distinguishes an *inert* (childless) reference from a pointer-bearing hazard, and a parked process's
+machine is released at the scheduler pass boundary — two unbounded retentions, one of them hit by
+every `gen_server` that holds a monitor; (d) RFC 1321 MD5 collapsed from four independent copies into
+`beam_common::md5`. Run `tools/differential/gate.sh` for the live figure; the recorded state is
+`total=3463 agree=3462 mismatch=0 unsupported=1 skipped=0` with the single allowlisted gap
+`wire/new_fun_ext_encode` (A.5).
+- **Area:** `erts_rust/crates/beam_abi` (`src/driver/host.rs`, `src/nif/host.rs`) — **the frozen C ABI**
+- **Change:** A per-call environment handed to foreign code must never hold a `&mut` host: it takes a
+  shared handle, every accessor is `&self`, and any state a callback publishes lives in a `Cell`/
+  `RefCell`. `DriverEnv` was fixed first (an object-safe `AsAnyHost` upcast plus
+  `host_as`/`with_host_as`, no `unsafe`), and `NifEnv` follows it — `NifEnv::host(&mut self)` is
+  gone and `from_opaque` now yields a shared reference, closing the double-`&mut` shape that resource
+  `stop`/`dtor` callbacks and scheduled continuations could reach. `AsAnyHost` itself could **not** be
+  adopted on the NIF side (its blanket impl needs `'static`, and the runtime's per-call host borrows
+  the runtime), so `NifEnv::new_typed` + `host_as`/`with_host_as` is the sanctioned path. Both envs
+  carry a release-profile guard (`host_aliasing_tests`) that fails at `opt-level >= 1` only.
+- **Area:** `erts_rust/crates/beam_engine/src/jit/baseline/emit/bitstr_inline/**` — **the execution engine**
+- **Change:** Sixteen bitstring opcodes (`bs_match` with a static command list, `bs_get_integer2`,
+  `bs_get_position`/`bs_set_position`, `bs_test_tail2`, `bs_skip_bits2`, `bs_start_match3/4` on a
+  reused context, `bs_create_bin`'s append + constant-width integer + constant string + `binary all`
+  doors, `bs_match_string`, and the `get`/`skip` UTF-8/16/32 family) are now emitted as straight-line
+  native code; every other shape falls back to the generic path. The shapes that **allocate** inside
+  the instruction (`bs_get_binary2`, `bs_get_float2`, a fresh `bs_start_match3/4` context) are
+  deliberately declined: they are the `[BinRef(3)][ErlSubBits(5)]` rooting hazard that once wrote five
+  words past a three-word allocation. This introduces a binding invariant — a `jit_step_one` deopt
+  **re-executes the whole instruction**, so no inline arm may commit partial state before its last
+  fallback. Measured: the bitstring family fell from 41 % to 11–16 % of samples and the four
+  `foreign/*` kernels from 8.6–17.0× to 6.6–13.3× the oracle.
+- **Area:** `erts_rust/crates/beam_rt/src/context/gc_walk.rs`, `src/context/gc/bin_vheap.rs`, `src/runner` — **the memory model**
+- **Change:** `Walk::reach_foreign` used to treat *any* pointer-bearing word in a foreign region as a
+  reason to keep an off-heap reservoir, so a single live reference (monitor, alias, `make_ref/0`,
+  unnamed ETS tid) made the prune decline at every park and leak the reservoir for the process's life.
+  The predicate now consults a header-guarded `is_inert_reference` (a reference block is a childless
+  leaf), which is sound for the *prune criterion only*. Separately, `RunnerState::engines` never
+  released a machine whose process died while parked (the per-slice take-out re-inserts at every park
+  arm, and the exit/error arms did not), so each such process retained its heap for the runtime's
+  life; `RunnerState::prune_dead` now runs twice per scheduler pass. A/B: a 10-step append ladder
+  collapsed from `[4 144 000 … 41 440 000]` bytes to `[8 288 … 45 584]`; `VmHWM` 121.7 → 98.8 MiB.
+- **Area:** `erts_rust/crates/beam_common/src/md5.rs` — **dependency hygiene**
+- **Change:** Four independent RFC 1321 implementations (`beam_loader`'s chunk checksum, `beam_dist`'s
+  handshake digest, `beam_bifs`'s `erlang:md5/*` BIF state, `beam_rt`'s item) plus three test-local
+  copies became one dependency-free core (`digest` plus a streaming `Md5` whose `finish` takes
+  `&self`, so `erlang:md5_final/1` stays pure and the 96-byte state image round-trips verbatim). No
+  behaviour changed: the `.beam` chunk digest stays byte-identical to `beam_lib:md5/1`, the
+  distribution handshake still interops live with the system `erl`, and the BIF's context image is
+  byte-exact.
+- **Area:** `erts_rust/crates/beam_rt/src/port*` — **an invariant, not a structure**
+- **Change:** A driver port no longer owns an atom-table lease. `Rc::get_mut`/`make_mut` need
+  `weak_count == 0` too, so even a `Weak` field forces the copy — the fix is that the view is a
+  *lease* on the shared `DriverAtoms` record taken only inside a **drive window**, released before the
+  port round commits its interned atoms. That removes both a whole-table (≈9.5 k atom) deep copy per
+  new driver-interned name and, more importantly, a wrong-atom hazard: a callback could observe a
+  stale table.
 
 ---
 
