@@ -3235,3 +3235,80 @@ fn a_field_wider_than_the_inline_limit_keeps_the_per_field_helper() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The aligned route's **inline shape proof**
+// ---------------------------------------------------------------------------
+
+/// **The aligned door proves the accumulator's term shape inline**, so a whole-byte build is
+/// native on both accumulator locations: the `Y`-slot form (the frame-resident accumulator a
+/// real encoder loop reaches after a `call_last`) and the `x`-register form.
+///
+/// The evidence is the pair the arm's own counters give: the shape emitted
+/// (`SHAPE_CREATE_BIN` present, so the lowering — and therefore the inline proof — really
+/// ran) and `jit_step_one` at **zero** (so neither the proof nor the capacity lookup refused
+/// and no byte was written by an interpreter step), beside byte-for-byte agreement with the
+/// interpreter.
+#[test]
+fn the_aligned_door_proves_the_shape_inline_for_both_accumulator_locations() {
+    let value: i64 = 0x5A;
+    let expected = big_endian(value, 1);
+
+    // (a) The `Y`-slot accumulator — the `bstr_to_lower` / `capitalize_token` shape.
+    let y_module = frame_module("bscb_aligned_y_inline", &[], 2, true, 0, |module| {
+        int_seg(module, Operand::X(1), 8)
+    });
+    let name = atom(&y_module, "f");
+    let args = [ArgKind::Int(8), ArgKind::Int(value)];
+    let report = run_counting(&y_module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&expected[..]),
+        "the inline proof must leave the byte cursor the field store writes at"
+    );
+    assert_eq!(report.bits, Some(8), "one whole byte appended");
+    assert_eq!(
+        report.counters.step_one, 0,
+        "an aligned, writable accumulator with room must stay native (jit_step_one ran {} \
+         times)",
+        report.counters.step_one
+    );
+    assert_eq!(
+        report.bitstr_calls, 1,
+        "only `bs_init_writable` may reach the family helper"
+    );
+    let (emitted, snapshot) = emitted_shapes(&y_module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the construction shape (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    assert_construction_row("aligned, Y accumulator, integer 8", &y_module, &args, &expected);
+
+    // (b) The `x`-register accumulator.
+    let x_module = accumulator_module("bscb_aligned_x_inline", &[], |module| {
+        int_seg(module, Operand::X(1), 8)
+    });
+    let name = atom(&x_module, "f");
+    let args = [ArgKind::Int(8), ArgKind::Int(value)];
+    let report = run_counting(&x_module, name, &args, Tier::BaselineJit);
+    assert_eq!(
+        report.bytes.as_deref(),
+        Some(&expected[..]),
+        "the x-register form answers the same cursor"
+    );
+    assert_eq!(report.bits, Some(8));
+    assert_eq!(
+        report.counters.step_one, 0,
+        "the x-register form must stay native too (jit_step_one ran {} times)",
+        report.counters.step_one
+    );
+    assert_eq!(report.bitstr_calls, 1);
+    let (emitted, snapshot) = emitted_shapes(&x_module);
+    assert!(
+        emitted.contains(&SHAPE_CREATE_BIN),
+        "the arm must emit the construction shape (emitted {emitted:?})"
+    );
+    assert_eq!(static_deopts(&snapshot, "BsCreateBin"), 0);
+    assert_construction_row("aligned, x accumulator, integer 8", &x_module, &args, &expected);
+}
