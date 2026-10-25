@@ -192,7 +192,10 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `exceptions`, `floats`, `maps`, `bitstrings`), incl. each family's rooted tests
 - `jit/` → the tier seam (`Tier`/`JitBackend`), the cross-run `CodeCache`, the emitter, the native
   baseline tier and the feature-gated Cranelift hot tier — `jit/CONTEXT.md`, `jit/baseline/CONTEXT.md`,
-  `jit/baseline/emit/CONTEXT.md`, `jit/cranelift/CONTEXT.md`, `jit/bench/CONTEXT.md`
+  `jit/baseline/emit/CONTEXT.md` (its `bitstr_inline/` node owns the nine native `Bs*` shapes and the
+  `bs_create_bin` construction sequences), `jit/baseline/inlineset/CONTEXT.md` (the authoritative inline
+  set: which groups lower in-block, every run-time guard, and the two `bs_create_bin` construction
+  routes with their structural refusals), `jit/cranelift/CONTEXT.md`, `jit/bench/CONTEXT.md`
 - Other top-level files: `step.rs` (`Step`), `operand.rs`, `predicates.rs`, `error.rs`
   (`unsupported`/`blocked`/…), `generic.rs` (the `Instr::Generic` sentinel)
 
@@ -346,10 +349,11 @@ Every store is an instruction boundary, but **not** every store happens before t
 ## Long files (role-justified, beyond the ~1000-line guideline)
 The ~1000-line guideline holds for this node's own top-level files except the one below — one cohesive unit (the whole runtime seam), kept whole because its size follows from that single responsibility, not from unrelated code accumulating.
 Files inside a subtree with its own `CONTEXT.md` (`machine/`, `terms/`, `interpreter/`, `families/`, `jit/`, `context/`, `bench/`) are documented by that node's `CONTEXT.md` and not listed here.
-- `context.rs` (3 547 lines) — the entire runtime seam: `ExecutionContext` + `Mailbox` + `RootSet` +
+- `context.rs` (3 585 lines) — the entire runtime seam: `ExecutionContext` + `Mailbox` + `RootSet` +
   the `MinimalContext` region heap (its census/mark doors included; the two reclaim tiers are the child
   node `context/`).
-`exec_census.rs` (794) is the largest top-level file after it; every other `src/*.rs` is under 450.
+`exec_census.rs` (794) and `operand.rs` (465) are the largest top-level files after it; every other
+`src/*.rs` is under 250.
 
 ## Per-module unit-test coverage
 Every `src/**` module carries `#[cfg(test)]` unit tests beside the code they cover (the integration suites are the sibling node `../tests/`).
