@@ -1034,8 +1034,11 @@ pub(crate) fn emit_block(
             // `bs_match` with a fully **static** command list (`ensure_at_least` /
             // `ensure_exactly` / `skip` / `integer` only): the shape a compiled binary
             // comprehension re-enters on every element. It writes each `integer`
-            // destination, which is why `cacheable_writes` charges them, and it commits the
-            // context's `start` word command by command before each destination store.
+            // destination, which is why `cacheable_writes` charges them.
+            // The context's `start` word is committed exactly once on the accepted path and
+            // once on the `fail_arm`, never per command.
+            // Every guard that can take `fallback` runs before that commit, so a deopt
+            // re-executes the instruction against an untouched context.
             Instr::BsMatch { fail, ctx, commands } => {
                 if !bitstr_inline::try_inline_bs_match(
                     buffer,

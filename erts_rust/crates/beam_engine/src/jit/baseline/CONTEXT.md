@@ -124,6 +124,9 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   It runs **no** per-execution shape predicate: the route is decided at compile time (re-testing it
   per execution measured ≈⅓ of the win). `bitstr_calls()` is `#[cfg(test)]`-only — it proves the
   helper actually ran; the claim set itself has no test-build copy.
+  `bs_match`, the one shape whose sequence is a whole command list, commits its match context's `start`
+  word exactly once on the accepted path and once on its `fail_arm`, never per command, so a deopt
+  re-executes the instruction against an untouched context.
 - `test_helper.rs` — the comparison-`test` helper (`jit_test`, `TEST_TRUE`/`TEST_FALSE`): it resolves the instruction at `(func, pc)` in the active module and evaluates a two-operand comparison `test` through `beam_term`'s `cmp`/`cmp_arith`, reporting the outcome as a boolean (the block-ABI `ERROR` word on a propagating read error) and handing anything it does not own to `jit_step_one`.
 - `receive.rs` — `jit_receive`: the `send`/receive-control family's own body plus the interpreter step's position store and raise funnel.
 - `emit/` — `compile.rs` (the compilation entry points `compile_module`/`compile_function`, `emit_function`,
