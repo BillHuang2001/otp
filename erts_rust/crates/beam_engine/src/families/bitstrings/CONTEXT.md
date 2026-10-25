@@ -513,13 +513,38 @@ recorded `instr_per_call` 438/660/244/531 — i.e. 16-23 % of every loop body):
 The recurring shapes (only 9 of the 20 `claimed()` variants occur; no `BsMatchString`/`BsTestTail2`/`BsGetBinary2`/
 `BsGetFloat2`/`BsGet*Utf*`): whole-byte unsigned BE `[ensure_at_least 8 1, integer … 8 1]` (= prepared `FastForm`);
 **6-bit** `integer … 6 1` (encode ×3, decode's `[ensure_exactly 8, skip 2, integer … 6 1]`); `[ensure_at_least 12 8,
-integer 6, integer 6]` (verify: 12 bits **and** `(remaining-12) mod 8 == 0`); `[ensure_exactly 0]`; and the four
-`bs_create_bin` families: append(`all`)+one static segment (`integer` 8 or 6, or the `string "-"` 8 bits),
-append(`all`)+`binary all` (encode), and a **single fully static 8-bit `integer` segment** (decode's `<<DecodeChar>>`
-temp — the only create in these workloads whose output size is known from the instruction alone; every other create
-starts with a `{atom,all}` append, so its total is dynamic). All four use `alloc = 0`, `Flags = nil`, an
-`{integer,256}` `bs_init_writable` hint, and append into a register (`x(1)`/`x(2)`) that the source lives in —
-`capitalize_token`'s dash arm reads **and writes the same `x(2)`**. Position ops: `encode` saves three positions per
+integer 6, integer 6]` (verify: 12 bits **and** `(remaining-12) mod 8 == 0`); `[ensure_exactly 0]`.
+
+### The nine `bs_create_bin` builds — exact operand kinds (from the compiler's `.S`)
+`alloc = 0`, `Flags = nil` and an `{integer,256}` `bs_init_writable` hint on every one. The decisive column is the
+**accumulator (segment 0) operand kind**: only `capitalize_token/3`'s dash clause keeps it in an **x** register —
+every other build accumulates in a **`Y` slot** (the clause spilled it there before the `char_to_*` /
+`iolist_to_binary` call and the build re-loads it from there), and that one fact is what keeps all but one of these
+builds on the family helper. A build's `dst` is a separate operand (the publish target) and is usually `x` even when
+the accumulator is `y` — the dash clause is the only one that reads and writes the **same** `x(2)`.
+
+| build | fn/arity · label | accumulator (dst) | field segments | `CreateBinShape::of` |
+|---|---|---|---|---|
+| `capitalize_token/3` dash `<<Acc/binary,$->>` | `{f,4}`·5 | `x(2)` → `x(2)` | `string` U8 `{string,<<"-">>}` S`{integer,1}` | **accepted** (`ConstBytes`, 8 bits) |
+| `capitalize_token/3` upper | `{f,4}`·6 | `y(1)` → `x(2)` | `integer` U1 `{x,0}` S`{integer,8}` | refused: `seam.rs:177` `x_register(value)?` |
+| `capitalize_token/3` lower | `{f,4}`·7 | `y(1)` → `x(2)` | same as upper | refused: same clause |
+| `-to_lower/1-lbc$^0/2-0-/2` | `{f,80}`·80 | `y(1)` → `x(1)` | `integer` U1 `{x,0}` S`{integer,8}`; this build's accumulator segment is **Unit 1**, the others' **Unit 8** | refused: same clause |
+| `encode/2` 4-field | `{f,7}`·7 | `y(1)` → `x(1)` | `binary` U8 `{x,0}` S`{atom,all}` | refused: `x_register` fires first |
+| `encode/2` 3-field | `{f,7}`·8 | `y(0)` → `x(1)` | `binary all` | refused: same |
+| `encode/2` 2-field | `{f,7}`·9 | `y(0)` → `x(1)` | `binary all` | refused: same |
+| `decode/2` temp `<<DecodeChar>>` | `{f,13}`·13/15/16 | none — the field **is** segment 0 | `integer` U1 `{x,0}` S`{integer,8}` | refused: `append_plan`'s first-segment `PreparedSeg::Append{private:true}` let-else (`seam.rs:164`) |
+| `decode/2` append | `{f,13}`·13/15/16 | `y(1)` → `x(1)` | `integer` U1 `{x,2}` S`{integer,6}` (clause 1), or S`{tr,{x,2}}` runtime (clause 2) | refused: `x_register` |
+
+With the accumulator rule out of the way, the next refusal per family is `encode/2`'s `binary all` segment
+(`append_plan`'s `_ => return None`, `seam.rs:228`, `PreparedSeg::Binary`), then the 6-bit / runtime-size fields
+(`nbits % 8` at `seam.rs:213`; the whole-byte + `x`-value field rules at `create.rs:277`/`:282`). The temp build is
+the only create in these workloads whose output size is known from the instruction alone, which is why it is the one
+bare (non-append) create here.
+Per-call build executions (inputs 30 B / 30 B / 12 B / 15 B): `to_lower`'s loop build **30**; `capitalize_token`'s
+dash **4** (four `-`), upper **5** (`t`, the initial `true` flag, plus one per dash), lower **21** (30 total);
+`encode/2`'s 4-field clause **4** (96 bits = 4×24) and its 3-/2-field clauses **0** (this input never leaves
+`bit_size(Rest)` < 24); `decode/2`'s clause-1 pair **14** and clause-2 pair **1** — the 15-byte input's last body has
+`bit_size(Rest) == 0`, so it takes clause 2 and is the single `bs_skip_bits2`/`bs_get_integer2` pair — 30 total. Position ops: `encode` saves three positions per
 iteration and restores one on the failing entry; `decode`/`capitalize_token` save one per byte.
 Because every `Bs*` is currently one `jit_bitstr` helper call (`jit/baseline/emit/family.rs:88-96`), these four loop
 bodies are the workload set an inline `Bs*` lowering would target.
